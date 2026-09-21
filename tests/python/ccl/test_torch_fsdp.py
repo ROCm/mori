@@ -228,6 +228,9 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                 device = torch.device("cpu")
                 output = comm.allocate((4,), dtype=torch.float32, device=device)
                 consumer, packer, gather = MagicMock(), MagicMock(), MagicMock()
+                gather.device = device
+                group = MagicMock()
+                group.size.return_value = 2
                 with patch.object(torch.cuda, "current_stream", return_value=consumer):
                     comm.release_output()
                     comm.release_output()
@@ -240,15 +243,18 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                 order = []
                 gather.wait_event.side_effect = lambda e: order.append("wait")
                 collective = MagicMock()
-                collective.enqueue.side_effect = lambda *a, **kw: order.append("write")
+                collective.enqueue.side_effect = lambda source, *a, **kw: order.append(
+                    "ready" if source.numel() == 1 else "write"
+                )
                 with (
                     patch.object(torch.cuda, "current_stream", return_value=gather),
                     patch.object(comm, "_get_collective", return_value=collective),
                     patch.object(comm, "_validate_tensors"),
                     patch.object(torch.Tensor, "record_stream"),
                 ):
-                    comm(reused, torch.ones(2), MagicMock())
-                self.assertEqual(order, ["wait", "write"])
+                    comm(reused, torch.ones(2), group)
+                self.assertEqual(order, ["wait", "ready", "write"])
+                collective.register_output_buffer.assert_called_once_with(comm._ready_buffer)
                 gather.wait_event.assert_called_once_with(event)
                 packer.synchronize.assert_not_called()
                 gather.synchronize.assert_not_called()
@@ -259,6 +265,28 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             comm.release_output()
         current_stream.assert_not_called()
 
+    def test_backends_order_writes_on_the_same_process_group(self):
+        group = MagicMock()
+        streams = [MagicMock(), MagicMock()]
+        order = []
+        for index, stream in enumerate(streams):
+            comm = MoriSdmaAllGather()
+            collective = MagicMock()
+            stream.wait_event.side_effect = lambda event: order.append("wait")
+            collective.enqueue.side_effect = lambda *args, **kwargs: order.append("write")
+            with (
+                patch.object(comm, "_get_collective", return_value=collective),
+                patch.object(comm, "_wait_for_peer_consumers"),
+                patch.object(comm, "_validate_tensors"),
+                patch.object(torch.cuda, "current_stream", return_value=stream),
+                patch.object(torch.Tensor, "record_stream"),
+            ):
+                comm(torch.empty(4), torch.empty(2), group)
+            stream.record_event.assert_called_once()
+            if index:
+                stream.wait_event.assert_called_once_with(streams[0].record_event.return_value)
+        self.assertEqual(order, ["write", "wait", "write"])
+
     def test_sync_call_uses_original_enqueue_path(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
         collective = MagicMock()
@@ -268,6 +296,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         stream = MagicMock()
         with (
             patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_wait_for_peer_consumers"),
             patch.object(comm, "_validate_tensors"),
             patch.object(torch.cuda, "current_stream", return_value=stream),
             patch.object(torch.Tensor, "record_stream", autospec=True),
@@ -285,6 +314,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         work = MagicMock()
         with (
             patch.object(comm, "_validate_tensors"),
+            patch.object(torch.cuda, "current_stream"),
             patch.object(
                 torch.distributed, "all_gather_into_tensor", return_value=work
             ) as fallback,
@@ -309,6 +339,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         stream = MagicMock()
         with (
             patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_wait_for_peer_consumers"),
             patch.object(comm, "_validate_tensors"),
             patch.object(torch.cuda, "current_stream", return_value=stream),
             patch.object(torch.Tensor, "record_stream") as record_stream,
@@ -340,6 +371,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         collective.enqueue.side_effect = rank_major
         with (
             patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_wait_for_peer_consumers"),
             patch.object(comm, "_validate_tensors"),
             patch.object(torch.cuda, "current_stream", return_value=stream),
             patch.object(torch.Tensor, "record_stream"),
@@ -370,6 +402,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         order.attach_mock(stream.record_event, "record_event")
         with (
             patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_wait_for_peer_consumers"),
             patch.object(comm, "_validate_tensors"),
             patch.object(
                 torch.cuda, "current_stream",
@@ -402,6 +435,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         consumer = MagicMock()
         with (
             patch.object(comm, "_get_collective", return_value=collective),
+            patch.object(comm, "_wait_for_peer_consumers"),
             patch.object(comm, "_validate_tensors"),
             patch.object(torch.Tensor, "record_stream"),
             patch.object(torch.cuda, "current_stream", side_effect=[stream, consumer]),

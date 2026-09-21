@@ -79,8 +79,18 @@ performance measurements.
 
 FSDP does not manage MORI reuse events or pool state. The non-pooled adapter
 also records its last consumer on release and waits before subsequent packing
-and communication. FSDP retains its native post-forward shard synchronization
-and the generic parameter identity/version-counter protections.
+and communication. Before writing a registered output, it performs the same
+cross-rank readiness handshake using a small, separately registered control
+buffer. This prevents a faster peer from overwriting a slower peer's consumers;
+the handshake adds latency without a host completion wait. FSDP retains its
+native post-forward shard synchronization and parameter identity/version-counter
+protections.
+
+MORI instances on the same process group also order complete writes with a
+shared stream event because their SDMA transport state is shared. This applies
+across independent backends and pools, without a host completion wait. Async
+work reuses that completion event. Weak process-group keys do not retain a
+destroyed group, and the usual single-pool path reuses its existing event wait.
 
 Release is idempotent. Failed input preparation releases a lease on a stream
 ordered after the queued input work. If a collective may have partially started
@@ -92,6 +102,13 @@ The slots are slices of one arena in a dedicated PyTorch memory pool. Only the
 arena base is registered: the compatible MORI IPC path does not compensate for
 an ordinary caching-allocator suballocation's offset from its allocation base.
 Slot offsets are fixed, identical across ranks, and aligned to 16 bytes.
+
+Non-pooled outputs also use a fresh private allocator pool for each allocation
+or capacity growth, so even small buffers begin at their IPC allocation base.
+An index-less device is resolved before checking buffer reuse. Existing output
+views remain valid when capacity grows. The small non-pooled control buffer
+has its own private allocator pool; allocator reservation can exceed its tensor
+size due to segment rounding.
 
 The arena and its single IPC registration survive lease release. The
 steady-state arena size is the sum of 16-byte-rounded slot capacities plus a

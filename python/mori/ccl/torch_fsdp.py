@@ -27,6 +27,7 @@ import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed as dist
@@ -42,6 +43,8 @@ from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 
 
 _POOLED_RANK_MAJOR = object()
+# Backend instances share SDMA transport state within a process group.
+_LAST_WRITE_EVENTS: WeakKeyDictionary[dist.ProcessGroup, torch.Event] = WeakKeyDictionary()
 
 
 @dataclass
@@ -88,16 +91,11 @@ class MoriSdmaAllGatherPool:
         self._failed = False
         self._members: tuple[int, ...] = ()
         self._subgroups: set[dist.ProcessGroup] = set()
-        # MORI imports IPC allocation bases, not PyTorch suballocation offsets.
-        # A fresh private pool makes this arena its allocation's first address.
         capacities = [(size + 15) // 16 * 16 for size in buffer_sizes]
         ready_bytes = (group.size() * 4 + 15) // 16 * 16
-        with torch.cuda.device(self._device):
-            self._mem_pool = torch.cuda.MemPool()
-            with torch.cuda.use_mem_pool(self._mem_pool, device=self._device):
-                self._buffer = torch.empty(
-                    sum(capacities) + ready_bytes, dtype=torch.uint8, device=self._device
-                )
+        self._mem_pool, self._buffer = _allocate_registered_output(
+            (sum(capacities) + ready_bytes,), dtype=torch.uint8, device=self._device
+        )
         self._slots = []
         offset = 0
         for size, capacity in zip(buffer_sizes, capacities):
@@ -203,9 +201,10 @@ class MoriSdmaAllGatherPool:
         collective = self._collective_for(comm, self._group)
         collective.enqueue(self._ready_input, self._ready_output, 1, stream=stream)
 
-    def _after_write(self, stream) -> None:
+    def _after_write(self, stream) -> torch.Event:
         # One collective/arena is shared, including when callers change streams.
         self._last_write_event = stream.record_event()
+        return self._last_write_event
 
     def _release(self, comm) -> None:
         slot = self._slots[comm._buffer_index]
@@ -241,11 +240,11 @@ class MoriSdmaAllGatherPool:
 
 
 class _MoriSdmaAllGatherWork(dist.Work):
-    def __init__(self, collective: Any, stream: torch.Stream) -> None:
+    def __init__(self, collective: Any, stream: torch.Stream, event: torch.Event) -> None:
         super().__init__()
         self._collective = collective
         self._device = stream.device
-        self._event = stream.record_event()
+        self._event = event
 
     def wait(self, timeout: object | None = None) -> bool:
         torch.cuda.current_stream(self._device).wait_event(self._event)
@@ -382,6 +381,9 @@ class MoriSdmaAllGather(AllGather):
         self.layout = _MoriSdmaAllGatherLayout(self)
         self._collective: Any | None = None
         self._process_group: dist.ProcessGroup | None = None
+        self._mem_pool: torch.cuda.MemPool | None = None
+        self._ready_mem_pool: torch.cuda.MemPool | None = None
+        self._ready_buffer: torch.Tensor | None = None
         self._output_buffer: torch.Tensor | None = None
         self._output_active = False
         self._last_use_event: torch.Event | None = None
@@ -407,6 +409,9 @@ class MoriSdmaAllGather(AllGather):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         if self._output_pool is not None:
             self._output_pool._check_ready()
             if self._native_fallback:
@@ -431,7 +436,9 @@ class MoriSdmaAllGather(AllGather):
             self._output_active = True
             return output
         self._deregister_output_buffer_if_needed()
-        self._output_buffer = torch.empty(*size, dtype=dtype, device=device)
+        self._mem_pool, self._output_buffer = _allocate_registered_output(
+            size, dtype=dtype, device=device
+        )
         self._output_buffer_nbytes = _tensor_nbytes(self._output_buffer)
         self._registered_output_ptr = None
         self._output_active = True
@@ -466,11 +473,16 @@ class MoriSdmaAllGather(AllGather):
             self._clear_prepared_output()
 
     def _call_full_group(self, output_tensor, input_tensor, group, async_op):
+        stream = torch.cuda.current_stream(input_tensor.device)
+        previous = _LAST_WRITE_EVENTS.get(group)
+        if previous is not None and (
+            self._output_pool is None or previous is not self._output_pool._last_write_event
+        ):
+            stream.wait_event(previous)
         if self._output_pool is not None:
-            stream = torch.cuda.current_stream(input_tensor.device)
             self._output_pool._before_write(self, stream)
         elif self._last_use_event is not None:
-            torch.cuda.current_stream(input_tensor.device).wait_event(self._last_use_event)
+            stream.wait_event(self._last_use_event)
         if _tensor_nbytes(input_tensor) % 4 != 0:
             self._warn_unaligned_fallback(
                 "MORI SDMA allgather requires 4-byte-aligned input; falling "
@@ -482,13 +494,16 @@ class MoriSdmaAllGather(AllGather):
                 group=group,
                 async_op=async_op,
             )
-            if self._output_pool is not None:
+            _LAST_WRITE_EVENTS[group] = (
                 self._output_pool._after_write(stream)
+                if self._output_pool is not None else stream.record_event()
+            )
             return work
         collective = self._get_collective(group)
-        stream = torch.cuda.current_stream(input_tensor.device)
         count = input_tensor.numel()
         self._ensure_output_registered(collective, output_tensor)
+        if self._output_pool is None:
+            self._wait_for_peer_consumers(collective, group, stream)
         if self._can_call_param_contiguous(input_tensor):
             split_sizes = self._param_contiguous_split_sizes
             split_offsets = self._param_contiguous_split_offsets
@@ -512,11 +527,24 @@ class MoriSdmaAllGather(AllGather):
         # MORI uses raw pointers, so the allocator cannot track these uses.
         input_tensor.record_stream(stream)
         output_tensor.record_stream(stream)
-        if self._output_pool is not None:
+        event = (
             self._output_pool._after_write(stream)
+            if self._output_pool is not None else stream.record_event()
+        )
+        _LAST_WRITE_EVENTS[group] = event
         if async_op:
-            return _MoriSdmaAllGatherWork(collective, stream)
+            return _MoriSdmaAllGatherWork(collective, stream, event)
         return None
+
+    def _wait_for_peer_consumers(self, collective, group, stream) -> None:
+        if self._ready_buffer is None:
+            self._ready_mem_pool, self._ready_buffer = _allocate_registered_output(
+                (group.size() + 1,), dtype=torch.int32, device=stream.device
+            )
+            self._ready_buffer.zero_()
+            collective.register_output_buffer(self._ready_buffer)
+        # Local consumer events alone cannot prevent writes from a faster peer.
+        collective.enqueue(self._ready_buffer[:1], self._ready_buffer[1:], 1, stream=stream)
 
     def release_output(self) -> None:
         self._clear_prepared_output()
@@ -651,6 +679,18 @@ class MoriSdmaAllGather(AllGather):
             return
         self._collective.deregister_output_buffer(self._output_buffer)
         self._registered_output_ptr = None
+
+
+def _allocate_registered_output(size, *, dtype, device):
+    if device.type != "cuda":
+        return None, torch.empty(size, dtype=dtype, device=device)
+    # MORI imports IPC allocation bases, not PyTorch suballocation offsets.
+    # Use a fresh pool even on growth: old parameter views may still be alive.
+    with torch.cuda.device(device):
+        mem_pool = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(mem_pool, device=device):
+            output = torch.empty(size, dtype=dtype, device=device)
+    return mem_pool, output
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:

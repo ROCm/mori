@@ -1,5 +1,6 @@
 """Exercise FSDP buffer reuse and completion on separate GPU streams."""
 
+import gc
 import importlib
 import os
 import sys
@@ -12,6 +13,52 @@ import torch.distributed as dist
 from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherInputMetadata
 
 from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
+
+
+def _standalone_output_allocation_case(rank: int, world_size: int) -> None:
+    device = torch.device("cuda", rank)
+    outer_pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(outer_pool, device=device):
+        # Force ordinary small allocations away from their IPC allocation base.
+        prefix = torch.full((256,), -99.0, device=device)
+        for zero_copy in (False, True):
+            comm = MoriSdmaAllGather(zero_copy_output=zero_copy)
+            retained = []
+            for count in (4096, 8192):
+                output = comm.allocate(
+                    (count * world_size,), dtype=torch.float32, device=torch.device("cuda")
+                )
+                segment = next(
+                    segment for segment in torch.cuda.memory_snapshot()
+                    if segment["address"] <= output.data_ptr()
+                    < segment["address"] + segment["total_size"]
+                )
+                assert output.data_ptr() == segment["address"]
+                reused = comm.allocate(output.shape, dtype=output.dtype, device=device)
+                assert reused.data_ptr() == output.data_ptr()
+                splits = [count // 4, 3 * count // 4]
+                comm.layout.prepare_output(AllGatherInputMetadata(
+                    input_split_sizes=splits, input_numel=count, world_size=world_size,
+                    dtype=torch.float32, device=device,
+                    can_use_param_contiguous_output=True,
+                ))
+                source = torch.arange(count, device=device, dtype=torch.float32) + rank * count
+                comm(output, source, dist.group.WORLD, async_op=True).wait()
+                peer_inputs = [
+                    (torch.arange(count, device=device, dtype=torch.float32) + peer * count)
+                    .split(splits if zero_copy else [count])
+                    for peer in range(world_size)
+                ]
+                expected = torch.cat([
+                    peer_inputs[peer][i]
+                    for i in range(len(peer_inputs[0])) for peer in range(world_size)
+                ])
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                torch.testing.assert_close(prefix, torch.full_like(prefix, -99.0))
+                comm.release_output()
+                # Growing an output must remain safe while old parameter views survive.
+                retained.append(output)
+            comm._deregister_output_buffer_if_needed()
 
 
 def _metadata_cache_case(rank: int, world_size: int) -> None:
@@ -87,6 +134,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         shmem.shmem_torch_process_group_init("default")
         device = torch.device("cuda", rank)
         torch.cuda.set_device(device)
+        _standalone_output_allocation_case(rank, world_size)
+        gc.collect()
+        dist.barrier()
         _metadata_cache_case(rank, world_size)
         producer = torch.cuda.Stream()
         gather = torch.cuda.Stream()

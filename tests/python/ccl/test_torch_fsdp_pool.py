@@ -1,6 +1,7 @@
 """Distributed correctness and fixed-storage checks for shared FSDP outputs."""
 
 import copy
+import gc
 import os
 import socket
 from datetime import timedelta
@@ -133,12 +134,16 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
     pool.close()
 
 
-def _stream_reuse_case(rank, world_size):
+def _stream_reuse_case(rank, world_size, pooled=True):
     device = torch.device("cuda", rank)
     count = 4096
-    pool = MoriSdmaAllGatherPool([count * world_size * 4] * 2, group=dist.group.WORLD, device=device)
+    pool = (
+        MoriSdmaAllGatherPool([count * world_size * 4] * 2, group=dist.group.WORLD, device=device)
+        if pooled else None
+    )
     comms = [MoriSdmaAllGather(output_pool=pool, buffer_index=i) for i in range(2)]
-    pool.initialize()
+    if pool is not None:
+        pool.initialize()
     gathers = [torch.cuda.Stream(), torch.cuda.Stream()]
     consumer = torch.cuda.Stream()
     results = []
@@ -164,7 +169,11 @@ def _stream_reuse_case(rank, world_size):
             for peer in range(world_size)
         ])
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
-    pool.close()
+    if pool is not None:
+        pool.close()
+    else:
+        for comm in comms:
+            comm._deregister_output_buffer_if_needed()
 
 
 def _device_case(rank, world_size):
@@ -296,6 +305,12 @@ def _worker(rank, world_size, port):
     _configuration_case(rank)
     _subgroup_case(rank, world_size)
     _persistent_packing_case(rank)
+    gc.collect()
+    dist.barrier()
+    _stream_reuse_case(rank, world_size, pooled=False)
+    # Release private allocators before launching another case's collectives.
+    gc.collect()
+    dist.barrier()
     _stream_reuse_case(rank, world_size)
     for dtype in (torch.float32, torch.bfloat16):
         for async_op in (False, True):
