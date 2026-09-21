@@ -74,6 +74,26 @@ std::vector<std::string> Toolchain::Flags() const {
   // MoriDetectDevice.cmake, which likewise emits nothing for mlx5 -- the #else.
   if (nic == "bnxt") f.push_back("-DMORI_DEVICE_NIC_BNXT");
   if (nic == "ionic") f.push_back("-DMORI_DEVICE_NIC_IONIC");
+  // Variant A: the segmented landing zone in ep_intranode_1250x.hpp. One env var
+  // rather than making the caller swap a header, so using it needs no source or
+  // API change. It goes through Flags() deliberately -- compiler.cpp hashes
+  // Flags() into the JIT cache key, so stock and variant A land in different
+  // cache entries instead of one silently shadowing the other.
+  if (const char* va = std::getenv("MORI_EP_VARIANT_A")) {
+    const std::string v(va);
+    if (v == "1" || v == "true" || v == "yes" || v == "on" || v == "front") {
+      // The front rendezvous: the layout is agreed before any payload moves, so
+      // tokens land packed and the caller sees exactly the dense run stock
+      // produces. This is the only variant that is a drop-in, so it is what the
+      // plain "on" spelling selects.
+      f.push_back("-DMORI_EP_VARIANT_A=1");
+      f.push_back("-DMORI_EP_VA_FRONT=1");
+    } else if (v == "seg") {
+      // The original segmented landing zone. NOT a drop-in: it leaves per-source
+      // gaps in the payload and the caller has to compact them out itself.
+      f.push_back("-DMORI_EP_VARIANT_A=1");
+    }
+  }
   if (const char* extra = std::getenv("MORI_JIT_EXTRA_FLAGS")) {
     for (const std::string& tok : SplitWhitespace(extra)) f.push_back(tok);
   }

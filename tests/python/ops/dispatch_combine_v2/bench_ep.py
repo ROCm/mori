@@ -65,6 +65,7 @@ import torch
 import torch.distributed as dist
 
 import mori.cco as cco
+from mori.tensor_utils import from_gpu_ptr
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
 import _data
@@ -148,6 +149,20 @@ EPREMAP = int(os.environ.get("EPREMAP", "0"))
 # launch. Separately the two index passes cost 1.58us and 1.77us for 20 KB, which is
 # launch overhead, not work. Requires EPREMAP.
 EPFUSE = int(os.environ.get("EPFUSE", "0"))
+# The in-tree variant A (MORI_EP_VARIANT_A) persists its per-source counts into
+# an arena region of its own, so they no longer ride on scalesBuf and per-token
+# scales keep working. Read them from there rather than from a tensor we own.
+#
+# Only the SEGMENTED variant (MORI_EP_VARIANT_A=seg) leaves gaps for compaction to
+# close. The plain "on" spelling now selects the front rendezvous, which lands
+# packed: compacting that would read a dense run as if it were segmented.
+_VA = os.environ.get("MORI_EP_VARIANT_A", "").lower()
+VARIANT_A = _VA == "seg"
+if EPCOMPACT and _VA in ("1", "true", "yes", "on", "front"):
+    raise SystemExit(
+        "EPCOMPACT applies to MORI_EP_VARIANT_A=seg only; the front rendezvous "
+        "(MORI_EP_VARIANT_A=1) already lands packed and needs no compaction"
+    )
 # Diagnostic only: pass None for scales the way stock does, to isolate whether the
 # per-iteration device copy in the traces comes from handing dispatch a scales
 # buffer. Breaks the counts export, so CHECK must be 0.
@@ -309,7 +324,12 @@ def main():
         cap = recv.shape[0]
         stride, drowB = cap // world, recv.nbytes // cap
         crowB = comb.nbytes // comb.shape[0]
-        counts = torch.zeros(world, dtype=torch.int32, device=f"cuda:{rank}")
+        if VARIANT_A:
+            counts = from_gpu_ptr(
+                op.arena.local_ptr(op._region("src_counts")), (world,), torch.int32
+            )
+        else:
+            counts = torch.zeros(world, dtype=torch.int32, device=f"cuda:{rank}")
         # Raw bytes, not zeros_like: torch has no fill_cuda for fp4, and the
         # kernel wants a pointer and a row width regardless. (n, rowB) uint8 is
         # also exactly the shape check_dispatch compares against.
@@ -362,6 +382,30 @@ def main():
             # C[p][j] = counts_p[j] = tokens sender j put on receiver p
             C = torch.stack(got)
             prefix.copy_(C[:, :rank].sum(1).to(torch.int32).to(prefix.device))
+            if VARIANT_A:
+                # The kernel publishes the same quantity without a collective:
+                # each receiver scans the counts it received and stores every
+                # sender's prefix into that sender's slot. Compare the two.
+                kp = from_gpu_ptr(
+                    op.arena.local_ptr(op._region("dense_prefix")),
+                    (world,),
+                    torch.int32,
+                )
+                got, want = kp.cpu(), prefix.cpu()
+                if not torch.equal(got, want):
+                    print(
+                        f"  [rank {rank}] PREFIX MISMATCH kernel={got.tolist()} "
+                        f"all_gather={want.tolist()}",
+                        flush=True,
+                    )
+                else:
+                    # Print from EVERY rank: rank 0's prefix is all zeros by
+                    # definition (no sender below it), so confirming only there
+                    # proves nothing.
+                    print(
+                        f"  [prefix] rank {rank} kernel == all_gather {got.tolist()}",
+                        flush=True,
+                    )
 
         def remap(n_ent):
             if dest_map[0] is None:

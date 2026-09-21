@@ -75,6 +75,11 @@ _REGIONS = {
     "dispOut": "disp_out",
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
+    # Variant A only. Laid out unconditionally -- 4 B per rank each -- so the
+    # arena is identical whether or not MORI_EP_VARIANT_A is set, and switching
+    # the env var cannot change anyone's offsets.
+    "srcCounts": "src_counts",
+    "densePrefix": "dense_prefix",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
 }
 
@@ -480,6 +485,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("disp_out", cap * cfg.token_nbytes),
             ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
+            # index_t[world]: the per-source receive count variant A persists for
+            # compaction, and the offset each peer publishes telling this rank
+            # where its rows begin in that peer's compacted buffer.
+            ("src_counts", cfg.world_size * 4),
+            (
+                "dense_prefix",
+                cfg.world_size * cfg.world_size * 8 + 64,
+            ),  # also the FRONT count matrix,
         ]
         if self._scale_i32(cfg):
             # Sized by the DESTINATION stride, which is the caller's row padded to
@@ -1098,6 +1111,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "out_idx": ("out_idx", "out_indices"),
         "out_scales": ("out_scales", "out_scales"),
         "recv_to_src_token": ("recv_to_src_token", "disp_tok_id_to_src_tok_id"),
+        # Variant A, intranode only. The internode arena carries neither region,
+        # so the same name is mapped for both: asking for it on an internode op
+        # raises out of the arena, which is the right answer rather than a
+        # silent bind to some other region.
+        "src_counts": ("src_counts", "src_counts"),
+        "dense_prefix": ("dense_prefix", "dense_prefix"),
     }
 
     def _region(self, name):
@@ -1203,6 +1222,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 dest_pe_token_counter=self.dest_pe_counter,
                 total_recv_token_num=self.total_recv,
                 grid_barrier=self.dispatch_barrier,
+                # Read-only here: the FRONT rendezvous uses it as a generation tag,
+                # which needs a counter every rank advances in lockstep. Combine is
+                # what advances it; dispatch only reads.
+                xdb_flag=self.cross_device_flag,
                 num_tokens=num_tokens,
             )
 

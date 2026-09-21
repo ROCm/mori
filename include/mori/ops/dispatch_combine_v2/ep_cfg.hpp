@@ -132,6 +132,18 @@ struct EpArgs {
   // not carry the region otherwise, so this stays 0 and nothing dereferences it.
   unsigned long long offOutScales = 0;
 
+  // VARIANT A only; 0 and untouched on the stock path.
+  // offSrcCounts: index_t[worldSize]. The per-source receive count, which the
+  //   inbound loop already reads off the signal and used to throw away. The
+  //   segmented landing zone needs it to compact, and it has to outlive the
+  //   signal, which is cleared for the next call.
+  // offDensePrefix: index_t[worldSize]. offDensePrefix[p] is where MY rows begin
+  //   in peer p's COMPACTED buffer. It is a column sum over what senders below me
+  //   put on p, so I cannot compute it -- p can, it holds the whole row, so p
+  //   scans locally and writes one int back to each sender. No collective.
+  unsigned long long offSrcCounts = 0;
+  unsigned long long offDensePrefix = 0;
+
   // Which LSA rank this is. Runtime for the same reason: as a Cfg field it made
   // all eight ranks compile their own copy of an identical kernel.
   int rank = 0;
@@ -170,6 +182,8 @@ struct EpArgs {
   X(offOutTok, "u64")          \
   X(offXdb, "u64")             \
   X(offOutScales, "u64")       \
+  X(offSrcCounts, "u64")       \
+  X(offDensePrefix, "u64")     \
   X(rank, "i32")               \
   X(tokenIndices, "p")         \
   X(inpTokenBuf, "p")          \
@@ -206,7 +220,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 26,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

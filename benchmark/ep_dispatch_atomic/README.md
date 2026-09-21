@@ -157,14 +157,140 @@ per process, the same pass is 4.1us at 512 tokens and ranges 4.0 to 12.25us acro
 shapes in "The win is shape-dependent" above. Quote a compaction cost with the shape it
 was measured at; there is no single number.
 
-**Not measured: the prefix exchange.** `prefix[pe] = sum_{j<rank} counts_pe[j]` is a
-column sum over what OTHER senders put on pe, so the sender cannot compute it locally.
-Here it is built once during priming with an `all_gather` of `world` int32, which is
-legitimate only because the routing is fixed across iterations. A real implementation
-needs it per batch -- but not a collective: every sender knows its own send-count row
-before any payload moves, so the row can ride the existing signal path and land well
-inside dispatch's ~13us inbound wait. That is `world^2` ints, 64 B at EP4. Believed
-free, **not demonstrated**.
+### The front rendezvous: what actually shipped
+
+Everything above -- the segmented landing zone, the compaction pass, the dest-map
+remap, the tail prefix publish -- exists because variant A reserved slots before it
+knew what the other senders were sending. Exchange the send-count matrix FIRST and
+none of it is needed:
+
+    S[a][b] = tokens rank a sends to rank b        (a's own row; it already has it)
+    base(a -> p) = sum_{i<a} S[i][p]               (a's first row in p's buffer)
+
+Every sender can then write straight into its final packed row. No segments, so no
+compaction; no slide, so no remap; and the sender knows its own base, so no prefix
+publish. The cost is one grid rendezvous plus one cross-device round trip, which
+`evidence/xdev_barrier.hip` prices at 3.81us at EP4 against the 7.0us it removes.
+
+`MORI_EP_VARIANT_A=1` selects it. `=seg` still selects the old segmented path.
+
+**Drop-in test.** The only difference between the two arms is that one env var:
+no `EPCOMPACT`, no `EPREMAP`, no `EPFUSE`, no `MORI_JIT_EXTRA_FLAGS`, no
+`EPNOSCALES` -- per-token scales ON -- and `CHECK=1` throughout.
+
+| arm | dispatch | combine | |
+|---|---:|---:|---|
+| stock fp4 ct=512 | 34.29 | 40.91 | PASS |
+| **VARIANT_A=1** fp4 ct=512 | **30.65** | 40.96 | PASS, **-10.6%** |
+| stock fp4 ct=2048 | 65.38 | 118.21 | PASS |
+| **VARIANT_A=1** fp4 ct=2048 | **55.61** | 117.95 | PASS, **-14.9%** |
+| stock bf16 ct=512 | 51.08 | 40.86 | PASS |
+| **VARIANT_A=1** bf16 ct=512 | **45.77** | 40.90 | PASS, **-10.4%** |
+| stock bf16 ct=2048 | 122.65 | 118.22 | PASS |
+| **VARIANT_A=1** bf16 ct=2048 | **118.59** | 117.77 | PASS, **-3.3%** |
+
+Combine is untouched in every arm -- the packed layout leaves no residue.
+
+**It holds across shapes, which the compaction path did not.** One token count per
+process:
+
+| tok/rank | stock | old (compact) | FRONT | FRONT vs stock |
+|---:|---:|---:|---:|---:|
+| 256 | 29.86 | 32.80 | 29.69 | -0.6% |
+| 512 | 35.97 | 34.01 | 30.62 | **-14.9%** |
+| 1024 | 58.95 | 57.68 | 52.20 | **-11.4%** |
+| 2048 | 65.43 | 62.50 | 55.49 | **-15.2%** |
+| 4096 | 67.43 | 70.59 | 58.47 | **-13.3%** |
+
+The compaction path went NEGATIVE by 4096 because its cost grew with the payload
+(4.0 -> 12.25us) while variant A's contention win saturated. FRONT has no payload
+-sized pass at all, so the curve does not cross. At 256 it is a wash: the rendezvous
+is a fixed ~3.8us and there is less contention to win back.
+
+**Verified:** fp4 and bf16; ct 128/512/1024/2048/4096; graph and eager; scales on;
+300-iteration soak runs repeated, with `EPCOMPACT_LIB` pointed at a nonexistent file
+as a positive control that nothing reaches for the compaction library any more.
+Zero byte mismatches and zero injectivity failures throughout.
+
+**Not verified, and a reader should not assume it:** worldSize other than 4 (the
+code is generic and the loops are strided, but only EP4 was measured); internode
+(this is `ep_intranode_1250x.hpp` -- the flag is inert on the internode path);
+non-gfx1250; the flydsl backend; and any real MoE consumer.
+
+**Things a reviewer should push back on:**
+
+- The count matrix rides a resized `dense_prefix` arena region instead of its own
+  `EpArgs` field. Functional, deliberate -- it kept the experiment free of an ABI
+  bump -- but it wants a real field before this merges.
+- `hip_backend.py` now binds `xdb_flag` on the DISPATCH path too. FRONT uses it as
+  a generation tag, and it was previously combine-only.
+- Dispatch now advances `xdbFlag`, which the combine barrier also uses as its phase.
+  The two are coupled through that array; changing either means checking both.
+- **The rank-to-rank wait moved to the front of the kernel.** Stock waits only at the
+  end. Any path where ranks do not call dispatch the same number of times now hangs
+  earlier than it used to. Same class of hazard as stock, different position.
+- Row ORDER differs from stock. Both produce a dense run of `totalRecvTokenNum` rows,
+  but FRONT groups by source rank where stock's order falls out of the remote atomic.
+  Combine does not care -- it follows `dispDestTokIdMap` -- and neither does the
+  bench's layout-unaware expert. A consumer that depends on row order rather than on
+  the reverse map would see the difference.
+
+### The prefix exchange: measured, and it costs 2.7 to 3.1us
+
+`prefix[pe] = sum_{j<rank} counts_pe[j]` is a column sum over what OTHER senders put on
+pe, so the sender cannot compute it locally. The bench builds it once during priming
+with an `all_gather` of `world` int32, which is legitimate only because the routing is
+fixed across iterations; a real implementation needs it per batch. Variant A therefore
+publishes it from the kernel: the receiver holds the whole count row, scans it in one
+wavefront and stores one int into each sender's slot. That is `world^2` ints, 64 B at
+EP4.
+
+Full breakdown at ct=512, two runs each, spread <= 0.46, CHECK=0. `-DMORI_EP_VA_NOPREFIX`
+compiles the publish out:
+
+| | dispatch | delta |
+|---|---:|---|
+| variant A dispatch only, publish OFF | 27.16 | -- |
+| variant A dispatch only, publish ON | 29.85 | **+2.69 prefix** |
+| variant A + compact + remap, publish OFF | 31.02 | +3.86 compact |
+| variant A + compact + remap, publish ON (**shipped**) | 34.16 | **+3.14 prefix** |
+| stock (needs no compaction) | 34.88 | |
+
+So variant A wins **7.7us** on the dispatch kernel itself (34.88 against 27.16), and
+then spends **7.0us** of it making the result usable: 3.1us for a per-batch prefix and
+3.9us to compact the segments back into a dense run. Net **-0.7us, about -2%**.
+
+That is the honest number for the API-compatible path. The -14.2% in the shape table
+above is the same shape with the payload left segmented and the prefix supplied by the
+host -- neither of which a caller can use as-is.
+
+**Keep `MORI_EP_VA_NOPREFIX`.** An earlier cleanup deleted it, and a later session then
+built "publish off" arms with a flag that no longer existed. Every arm was the same
+binary, two identical numbers were read as "the publish is free", and that wrong
+conclusion reached a written report before the next measurement caught it. A guard that
+only exists to make a cost measurable is still load-bearing.
+
+**Do not try to hide the publish in the compaction kernel.** Publishing from compact's
+entry instead -- where ~5us of payload copying still lies ahead, and where the scan is
+already computed for free as `pre[]` -- was built, validated (PASS, 1/1) and measured.
+Two runs each, against the 31.02 "publish off" baseline:
+
+| | dispatch | delta |
+|---|---:|---|
+| no publish, remap restricted to block 0 | 36.43 | +5.41 restructure |
+| publish in compact, no wait | 38.86 | +2.43 publish |
+| publish in compact, publish + wait | 39.72 | +0.86 wait |
+
+5.6us worse than shipped. Two separate reasons, and only one of them was anticipated:
+
+- **The wait is genuinely cheap** -- 0.86us, covered by the copy exactly as intended.
+- **The publish is not hidden**, costing 2.43us in compact against 2.69-3.14us in
+  dispatch, i.e. no better. Same-stream kernels do not overlap: a kernel cannot retire
+  until its stores drain, so issuing them earlier inside the kernel buys nothing. Only
+  real work *behind* them in the same kernel would, and there is none at either site.
+- **Consuming it in compact forces the remap onto one block** (so it can clear the
+  slots without racing a sibling), which costs 5.41us on its own -- far more than the
+  wait it enables.
 
 Two things an isolated benchmark got wrong, both found only by measuring in flow:
 
@@ -196,6 +322,11 @@ shapes. Dispatch leg, one token count per process, two runs each, spread <= 0.4u
 | 1024 | 57.5 | 48.7 | 54.0 | -6.1% |
 | 2048 | 64.2 | 51.3 | 58.4 | -9.0% |
 | 4096 | 67.8 | 55.2 | 67.45 | **-0.5%** |
+
+The 512 row above is the segmented payload with a host-supplied prefix. For the
+API-compatible path -- packed payload, prefix published per batch by the kernel --
+re-measured 2026-09-21, two runs each: stock **34.88**, shipped **34.16**, a net of
+**-2%**, not -14.2%. Full breakdown in "The prefix exchange" below.
 
 Two curves in opposite directions. Variant A's own gain saturates -- 5.0, 9.2, 8.8, 12.9,
 12.6us -- because it removes contention and barrier queueing, a per-round cost that does
@@ -374,6 +505,10 @@ kernel still fails, so the gate has not simply gone blind.
   with an `all_gather`, which only works because the routing is fixed here. The argument
   that it rides the signal path for free is untested, and it is the one thing standing
   between this and a real integration.
+- **Hiding the prefix publish inside the compaction kernel was tried and it
+  regresses**, by 5.6us. The wait hides fine; the publish does not get cheaper for
+  being moved, and consuming it there forces the remap onto one block. See "The
+  prefix exchange" above.
 - **Folding compaction into dispatch's tail was tried and it regresses.** The epilogue
   version is correct but measures 37.3us against 30.5us for dispatch plus a separate
   compact kernel. A diagnostic build with the payload copy removed put 9.1 of the 11.6us

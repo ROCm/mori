@@ -30,6 +30,7 @@ The buffer rides in on `scales`: EpArgs.scalesBuf is dereferenced only under
 """
 import os
 import sys
+
 import torch
 import torch.distributed as dist
 
@@ -40,6 +41,10 @@ from mori.kernel_profiler import export_to_perfetto
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
 HIDDEN, TOPK, EPR, SEED = 7168, 6, 96, 1234
+
+# PROFTAG=F|S names the output eptrace{TAG}_rank*.json so two arms can coexist;
+# unset keeps the original eptrace_rank*.json names.
+TAG = os.environ.get("PROFTAG", "")
 M = int(os.environ.get("M", 512))
 PAIRS = int(os.environ.get("PAIRS", 5))
 WARMUP = int(os.environ.get("WARMUP", 20))
@@ -62,6 +67,7 @@ SLOTS = {
     8: "FenceAgent",
     9: "FenceSignal",
     10: "InboundWait",
+    11: "FrontRdv",  # profilerF.hpp only; older headers never emit it
 }
 
 
@@ -147,10 +153,10 @@ def main():
         parts.append(prof[base : base + o].cpu())
     live = len(parts)
     drained = torch.cat(parts) if parts else torch.zeros(0, dtype=torch.int64)
-    torch.save(drained, f"/tmp/eptrace_rank{rank}.pt")
+    torch.save(drained, f"/tmp/eptrace{TAG}_rank{rank}.pt")
     export_to_perfetto(
         drained,
-        filename=f"/tmp/eptrace_rank{rank}.json",
+        filename=f"/tmp/eptrace{TAG}_rank{rank}.json",
         slot_map=SLOTS,
         gpu_freq_ghz=MHZ / 1e3,
     )
