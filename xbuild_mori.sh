@@ -14,11 +14,7 @@ pushd build
 
 if [[ ${full} -eq 1 ]]; then
 
-#  apt-get install -y git ibverbs-utils libpci-dev libdw1 cython3 
-
-# NOTE this would screw up hipcc installation!!!
-# better install MPI manually
-#    apt-get install -y openmpi-bin libopenmpi-dev pybind11-dev
+#  apt-get install -y git ibverbs-utils libpci-dev libdw1 cython3 openmpi-bin libopenmpi-dev pybind11-dev libibverbs-dev libdrm-dev 
 
   rm -rf *
   DBG=0
