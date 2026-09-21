@@ -82,8 +82,7 @@ pushing C over xGMI, where the copy engines move the same bytes in 499.
 
 Read ``python/mori/ops/gemm_ar/kernels_fused.py`` before trusting any fused
 number from this benchmark: several of its options are intermittently wrong, and a single
-passing run proves nothing. Every ``raw-wt`` fence mode is known-racy and kept
-only to reproduce that.
+passing run proves nothing.
 """
 
 from __future__ import annotations
@@ -389,7 +388,6 @@ def run(args) -> int:
             direct_fence=args.direct_fence,
             rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
             n_stripe=args.n_stripe or None,
-            fence=args.fence,
             emit_put=not args.no_put,
             atomic_order=args.atomic,
         )
@@ -556,7 +554,6 @@ def run(args) -> int:
                 "swap_ab": args.swap_ab,
                 "permlane": args.permlane,
                 "lane_transpose": args.lane_transpose,
-                "fence": args.fence if fused else None,
                 "stop_after": args.stop_after,
                 # The wire and transport, which "mode" does not distinguish: an
                 # fp8/lsa and an fp8/sdma run both say mode="fused-sdma", and a
@@ -645,31 +642,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "rotated", "linear"),
         default="auto",
         help="auto = rotated when fusing, linear otherwise",
-    )
-    p.add_argument(
-        "--fence",
-        choices=(
-            "all",
-            "agent",
-            "agent-leader",
-            "nt-agent",
-            "leader",
-            "none",
-            "writethrough",
-            "wt-agent",
-            "raw-wt",
-            "raw-wt-agent",
-            "raw-wt-leader",
-        ),
-        default="none",
-        help="release issued before the epilogue hands a range to the copy "
-        "engines. The default is 'none'. Measured at m=16384 blockscale on 8 "
-        "ranks, twice each: 'none' 1143.5/1144.8us, 'writethrough' "
-        "1148.5/1145.4, 'agent' 1797.0/1798.5, 'all' 1936.1/1937.5 -- all four "
-        "at relL2 2.350e-3, i.e. the explicit fences cost 650-790us here and "
-        "did not move accuracy. Every 'raw-wt*' mode is known-racy and kept "
-        "only to reproduce that. See docs/MORI-GEMM-AR-BENCHMARK.md for how a "
-        "release can be paid in the store policy instead of in a fence",
     )
     p.add_argument(
         "--stop-after",
