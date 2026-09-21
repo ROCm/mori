@@ -73,10 +73,19 @@ DTYPES = {"bf16": 0, "fp32": 1, "fp8": 2, "fp4x2": 3}
 # Keyed by the snake_case region name: the region key comes from the C++ launch
 # argument (offOutScales -> "outScales") while an arena names it "out_scales",
 # so both are folded through _camel_to_snake before being looked up here.
-_OPTIONAL_REGIONS = frozenset({"out_scales"})
+_OPTIONAL_REGIONS = frozenset({"out_scales", "front_counts"})
 
 # ... and the Request field that makes each of them mandatory again.
 _REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes"}
+
+
+def _front_rdv_on() -> bool:
+    """front_counts is switched on by the environment, not a Request field:
+    MORI_EP_VARIANT_A compiles the front rendezvous in (toolchain.cpp, same
+    spellings), and that path dereferences the region unconditionally."""
+    v = os.environ.get("MORI_EP_VARIANT_A", "")
+    return v in ("1", "true", "yes", "on", "front")
+
 
 # The C ABI + the plan registry both live here; op-libraries register INTO it.
 _ABI_NAME = "libmori_jit.so"
@@ -530,6 +539,11 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                             raise KeyError(
                                 f"{kernel}: arena has no region {name!r}, but "
                                 f"{enabler}={req[enabler]} turns it on"
+                            ) from None
+                        if canon == "front_counts" and _front_rdv_on():
+                            raise KeyError(
+                                f"{kernel}: arena has no region {name!r}, but "
+                                f"MORI_EP_VARIANT_A turns the front rendezvous on"
                             ) from None
                         # Optional and genuinely off: the kernel's `if constexpr`
                         # is what keeps the 0 from being dereferenced.

@@ -131,6 +131,10 @@ struct EpArgs {
   // uint8[maxRecv*scaleBytes]. Only read when Cfg.scaleBytes > 0; the arena does
   // not carry the region otherwise, so this stays 0 and nothing dereferences it.
   unsigned long long offOutScales = 0;
+  // uint64[worldSize*worldSize] + one uint32 barrier word. Front rendezvous only
+  // (MORI_EP_VARIANT_A=1): every rank's send-count row, generation-tagged. The
+  // arena always carries it; the stock path never dereferences it.
+  unsigned long long offFrontCounts = 0;
 
   // Which LSA rank this is. Runtime for the same reason: as a Cfg field it made
   // all eight ranks compile their own copy of an identical kernel.
@@ -170,6 +174,7 @@ struct EpArgs {
   X(offOutTok, "u64")          \
   X(offXdb, "u64")             \
   X(offOutScales, "u64")       \
+  X(offFrontCounts, "u64")     \
   X(rank, "i32")               \
   X(tokenIndices, "p")         \
   X(inpTokenBuf, "p")          \
@@ -206,7 +211,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 25,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

@@ -303,6 +303,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   constexpr int kMaxNpes = kCfg.worldSize;
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
+#if MORI_EP_VA_FRONT
+  __shared__ index_t s_front[kMaxNpes];  // my base in each peer's packed buffer
+#endif
   __shared__ index_t s_run[kMaxNpes];
   int _preGszP2 = 1;
   {
@@ -375,13 +378,111 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     index_t n = s_N[p];
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
+#if MORI_EP_VA_FRONT
+      // Stock reserves from one index_t allocator in the PEER's memory, so every
+      // block of every rank does a SYSTEM-scope RMW on one remote word (11.3us
+      // mean, p95 20.4 at EP4 / hidden 7168 / topk 6 / 512 tok-rank on gfx1250).
+      // The AGENT-scope atomic stock already performs returns this block's offset
+      // within THIS RANK's contribution to p; the rendezvous below turns it into
+      // a global row once every sender's count is known.
+      s_base[p] = (index_t)atomicAdd(&args.destPeTokenCounter[p], (int)n);
+#else
       s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
+#endif
     }
   }
   __syncthreads();
+#if MORI_EP_VA_FRONT
+  // ---- FRONT RENDEZVOUS: exchange the send-count matrix before any payload ----
+  // Every sender can then place its rows in every peer's PACKED buffer directly:
+  //     base(me -> p) = sum_{i<me} S[i][p]
+  // so tokens land in their final rows and the caller sees exactly the dense run
+  // stock produces. Costs one grid rendezvous plus one cross-device round trip.
+  {
+    static_assert(npes <= kMaxNpes, "s_front is sized by kMaxNpes");
+    // xdbFlag holds EpXdbFlagSlots slots and each block reads and advances its own,
+    // so the dispatch grid must fit. Combine enforces the same bound on the host.
+    static_assert(kCfg.blockNum <= EpXdbFlagSlots,
+                  "the front rendezvous gives every dispatch block its own xdbFlag slot");
+    unsigned long long* cm = EpLocal<unsigned long long>(win, args.offFrontCounts);
+    unsigned int* fbar = reinterpret_cast<unsigned int*>(cm + npes * npes);
+    // Generation tag. xdbFlag advances in lockstep on every block of every rank,
+    // so it is the same number everywhere, and tagging each entry with it makes a
+    // stale one self-identifying -- which is what lets the matrix go uncleared.
+    const unsigned long long gen = args.xdbFlag[blockIdx.x] + 1ull;
+
+    if (thdId == 0) __hip_atomic_fetch_add(fbar, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    if (blockIdx.x == 0) {
+      // Only the publisher needs destPeTokenCounter to be final, so only block 0
+      // pays for the grid rendezvous; every other block goes straight to the spin
+      // below and overlaps it.
+      if (thdId == 0) {
+        while (__hip_atomic_load(fbar, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+               (unsigned int)gridDim.x)
+          __builtin_amdgcn_s_sleep(1);
+        __hip_atomic_store(fbar, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      }
+      __syncthreads();
+      // Broadcast my send row to every peer: npes*npes stores, issued in parallel
+      // by one wavefront, so they cost one round trip rather than npes of them.
+      // Strided, not `thdId < npes*npes`: at worldSize 32 that would be 1024
+      // pairs against a 256-thread block and the tail would silently not publish.
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      for (int t = thdId; t < npes * npes; t += blockDim.x) {
+        const int peer = t / npes;
+        const int dst = t % npes;
+        const unsigned long long v =
+            (gen << 32) |
+            (unsigned long long)(unsigned int)__hip_atomic_load(
+                args.destPeTokenCounter + dst, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(
+            EpPeer<unsigned long long>(win, peer, args.offFrontCounts) + (size_t)myPe * npes + dst,
+            v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
+    }
+
+    // Fold the columns below me. Rank 0 waits for nobody -- its base is 0 by
+    // definition -- which is correct and costs it nothing.
+    for (int q = thdId; q < npes; q += blockDim.x) {
+      const int col = q;
+      index_t acc = 0;
+      for (int i = 0; i < myPe; ++i) {
+        unsigned long long w;
+        while (((w = __hip_atomic_load(cm + (size_t)i * npes + col, __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_SYSTEM)) >>
+                32) != gen)
+          __builtin_amdgcn_s_sleep(1);
+        acc += (index_t)(unsigned int)w;
+      }
+      s_front[col] = acc;
+    }
+    __syncthreads();
+
+    // Slide this block's reservation from a rank-local offset to its final row.
+    for (int p = thdId; p < npes; p += blockDim.x) {
+      if (s_N[p] > 0) {
+        s_base[p] += s_front[p];
+        if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
+      }
+    }
+    __syncthreads();
+
+    // Advance the generation, exactly as the combine barrier does. Without this
+    // it only moves when combine runs, so two dispatches in a row share a tag and
+    // the second accepts the first's matrix. A fixed-routing benchmark cannot see
+    // that -- the stale counts are the same numbers -- so this is load-bearing on
+    // correctness grounds, not on any failing test.
+    if (thdId == 0) args.xdbFlag[blockIdx.x] = gen;
+    if (blockIdx.x == 0) {
+      for (int b = (int)gridDim.x + thdId; b < EpXdbFlagSlots; b += (int)blockDim.x)
+        args.xdbFlag[b] = gen;
+    }
+  }
+#endif
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
   if (args.tokenIndices && args.inpTokenBuf) {
     int _gszReq = topk;

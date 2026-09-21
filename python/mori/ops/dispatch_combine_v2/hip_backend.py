@@ -76,6 +76,10 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    # Front rendezvous (MORI_EP_VARIANT_A=1) only. Laid out unconditionally, so the
+    # arena is identical whether or not the env var is set and switching it cannot
+    # move anyone's offsets.
+    "frontCounts": "front_counts",
 }
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
@@ -480,6 +484,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("disp_out", cap * cfg.token_nbytes),
             ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
+            # u64[world*world] send-count matrix + a u32 grid-barrier word, padded.
+            ("front_counts", cfg.world_size * cfg.world_size * 8 + 64),
         ]
         if self._scale_i32(cfg):
             # Sized by the DESTINATION stride, which is the caller's row padded to
@@ -1203,6 +1209,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 dest_pe_token_counter=self.dest_pe_counter,
                 total_recv_token_num=self.total_recv,
                 grid_barrier=self.dispatch_barrier,
+                # Front rendezvous only: its generation tag, which needs a counter
+                # every rank advances in lockstep. Combine's barrier advances it and
+                # the front path advances it once more per dispatch; stock ignores it.
+                xdb_flag=self.cross_device_flag,
                 num_tokens=num_tokens,
             )
 
