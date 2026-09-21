@@ -65,6 +65,7 @@ from mori.cco import (
 )
 from mori.tensor_utils import from_gpu_ptr
 
+from mori.ops.gemm_ar import preshuffle_a_scale
 from mori.ops.gemm_a2a import (
     a2a_config,
     build_lsa_a2a,
@@ -73,6 +74,7 @@ from mori.ops.gemm_a2a import (
     counter_chunks,
     preshuffle_b,
 )
+from mori.ops.gemm_a2a.layout import DEFAULT_BLOCK_M, MXFP8_BLOCK_M
 from mori.ops.gemm_a2a.kernels_fused import (
     compile_fused_gemm_a2a,
     compile_gemm_local,
@@ -99,6 +101,24 @@ NOT_YET = ()
 #: fp8 block-scale group size along K. Fixed by the model's quantiser and by the
 #: kernel, whose BLOCK_K is already 128.
 SCALE_BK = 128
+
+#: ue8m0 group, on both operands: A per 32 K, B per 32x32.
+MXFP8_BK = 32
+
+
+def _ue8m0_bytes(shape, g, lo=120, hi=123):
+    """Random ue8m0 exponent bytes, i.e. scales 2**(byte-127) around 1e-2.
+
+    ue8m0 *is* the exponent: there is no mantissa, so every scale is exactly a
+    power of two and applying it is lossless. That is the whole reason the
+    scaled MFMA can take it as an operand rather than as epilogue arithmetic.
+    """
+    e = torch.randint(lo, hi, shape, generator=g, device="cuda", dtype=torch.int32)
+    return e.to(torch.uint8)
+
+
+def _ue8m0_value(e: torch.Tensor) -> torch.Tensor:
+    return torch.exp2(e.to(torch.float32) - 127.0)
 
 
 def _setup_distributed():
@@ -142,8 +162,19 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
             + 0.01
         )
         return a, b, sa, sb
+    if quant == "mxfp8":
+        # A per-32-K, B per-32x32, both ue8m0. Scales stay as exponent bytes all
+        # the way to the MFMA, which is what its scale operand reads. B is
+        # replicated like the fp8 weight itself, so it takes the shared seed.
+        kb = k // MXFP8_BK
+        return (
+            a,
+            b,
+            _ue8m0_bytes((m, kb), ga).contiguous(),
+            _ue8m0_bytes((n // MXFP8_BK, kb), gb).contiguous(),
+        )
     if quant != "blockscale":
-        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
     kb = k // SCALE_BK
     sa = (
         torch.rand(m, kb, generator=ga, device="cuda", dtype=torch.float32) * 0.01
@@ -162,6 +193,17 @@ def reference_gemm(a, b, sa, sb, quant: str) -> torch.Tensor:
     af, bf = a.float(), b.float()
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
+    if quant == "mxfp8":
+        sav, sbv = _ue8m0_value(sa), _ue8m0_value(sb)
+        out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
+        for i in range(a.shape[1] // MXFP8_BK):
+            ks = slice(i * MXFP8_BK, (i + 1) * MXFP8_BK)
+            out += (
+                (af[:, ks] @ bf[:, ks].T)
+                * sav[:, i][:, None]
+                * sbv[:, i].repeat_interleave(MXFP8_BK)[None, :]
+            )
+        return out
     out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
     for i in range(a.shape[1] // SCALE_BK):
         ks = slice(i * SCALE_BK, (i + 1) * SCALE_BK)
@@ -248,6 +290,10 @@ def run(args) -> int:
 
     # All three want the [dst][M][shard_n] slab; only two of them push it
     # with the copy engine.
+    if args.quant == "mxfp8" and args.block_m == DEFAULT_BLOCK_M:
+        # mxfp8's BLOCK_M is a property of the packed A scale, not a tuning
+        # choice, so take it rather than making every caller pass it.
+        args.block_m = MXFP8_BLOCK_M
     needs_staging = args.mode in (
         "split-sdma",
         "fused-sdma",
@@ -380,6 +426,14 @@ def run(args) -> int:
         if args.quant == "blockscale":
             sa_arg = sa.t().reshape(-1).contiguous()
             sb_arg = sb.reshape(-1).contiguous()
+        elif args.quant == "mxfp8":
+            # Exponent bytes widened to int32 with the byte in the low 8 bits:
+            # the MFMA's scale operand is a 32-bit register read at op_sel 0.
+            # A goes through gemm_ar's preshuffle_a_scale; B stays K-block major
+            # because a 16-column tile never straddles a 32-column group, so its
+            # load is already a broadcast.
+            sa_arg = preshuffle_a_scale(sa)
+            sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
         else:
             sa_arg, sb_arg = sa, sb
 
@@ -579,8 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-m", type=int, default=2048)
     p.add_argument("-n", type=int, default=18432)
     p.add_argument("-k", type=int, default=8192)
-    p.add_argument("--quant", choices=("ptpc", "blockscale"), default="ptpc")
-    p.add_argument("--block-m", type=int, default=128)
+    p.add_argument("--quant", choices=("ptpc", "blockscale", "mxfp8"), default="ptpc")
+    p.add_argument("--block-m", type=int, default=DEFAULT_BLOCK_M)
     p.add_argument("--block-n", type=int, default=256)
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)

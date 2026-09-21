@@ -89,6 +89,22 @@ PACK_BYTES = 16  # the 16B pack the copy kernels index in
 DEFAULT_BLOCK_M = 128
 DEFAULT_BLOCK_N = 256
 
+#: mxfp8's BLOCK_M, and it is not a preference. The kernel packs a lane's four
+#: M tiles into one dword and selects the byte with the MFMA's ``opsel``, which
+#: is four tiles only when ``BLOCK_M // 64 == 4``. gemm_ar's op.py states the
+#: same constant for the same reason.
+#: The M granule the mainloop is written for: it builds BLOCK_M/64 MFMA
+#: accumulators and the LDS staging halves the dimension, so a tile that is not
+#: a whole multiple of this does not describe a real schedule. DEFAULT_BLOCK_M
+#: and MXFP8_BLOCK_M are both multiples of it -- this is the rule, those are
+#: choices.
+TILE_M_GRANULE = 128
+
+MXFP8_BLOCK_M = 256
+
+#: The ue8m0 group, on both operands: A is 1x32, B is 32x32.
+MXFP8_BLOCK = 32
+
 # Grid cap for the LSA copy kernel. Same reasoning as gemm_ar's LSA_BLOCK_CAP --
 # these stores go over xGMI and over-subscribing the request queues costs time
 # rather than saving it -- but the number is deliberately not shared: that one
@@ -353,7 +369,7 @@ class A2aConfig:
         if self.m < 1 or self.n < 1:
             raise ValueError(f"m and n must be positive, got m={self.m} n={self.n}")
         for name, value, granule in (
-            ("block_m", self.block_m, DEFAULT_BLOCK_M),
+            ("block_m", self.block_m, TILE_M_GRANULE),
             ("block_n", self.block_n, DEFAULT_BLOCK_N),
         ):
             if value < granule or value % granule:
@@ -462,6 +478,8 @@ __all__ = [
     "counter_chunks",
     "DEFAULT_BLOCK_M",
     "DEFAULT_BLOCK_N",
+    "MXFP8_BLOCK",
+    "MXFP8_BLOCK_M",
     "LSA_BLOCK_CAP",
     "MAX_WORLD",
     "PACK_BYTES",

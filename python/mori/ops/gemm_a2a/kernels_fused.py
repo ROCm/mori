@@ -113,10 +113,16 @@ from ..gemm_ar._gemm_a8w8_8wave import (
 from ..gemm_ar.kernels_fused import (
     _acquire_peer_lock,
     _BlockScaleK,
+    _Mxfp8ScaleK,
     _PermlaneStoreC,
     _SwappedMfma,
 )
-from .layout import DEFAULT_BLOCK_M, DEFAULT_BLOCK_N  # noqa: F401
+from .layout import (  # noqa: F401
+    DEFAULT_BLOCK_M,
+    DEFAULT_BLOCK_N,
+    MXFP8_BLOCK,
+    MXFP8_BLOCK_M,
+)
 
 BLOCK_K = 128
 
@@ -297,8 +303,8 @@ def compile_fused_gemm_a2a(
             "staging_store only applies to transport='sdma'; the LSA path stores "
             "into a peer, which a copy atom's static descriptor cannot address"
         )
-    if quant not in ("ptpc", "blockscale"):
-        raise ValueError(f"quant must be ptpc or blockscale, got {quant!r}")
+    if quant not in ("ptpc", "blockscale", "mxfp8"):
+        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
     if (BLOCK_M, BLOCK_N) != (cfg.block_m, cfg.block_n):
         raise ValueError(
             f"tile ({BLOCK_M}, {BLOCK_N}) disagrees with the config's "
@@ -307,9 +313,26 @@ def compile_fused_gemm_a2a(
         )
     assert K % BLOCK_K == 0
     blockscale = quant == "blockscale"
+    mxfp8 = quant == "mxfp8"
+    if mxfp8:
+        # Not a preference: the packed A scale puts a lane's four M tiles in one
+        # dword and picks the byte with the MFMA's opsel, which is four tiles
+        # only at BLOCK_M//64 == 4. gemm_ar states the same constant.
+        if BLOCK_M != MXFP8_BLOCK_M:
+            raise ValueError(
+                f"quant='mxfp8' requires BLOCK_M={MXFP8_BLOCK_M}, got {BLOCK_M}"
+            )
+        if K % 128:
+            raise ValueError(f"mxfp8 needs K % 128 == 0, got K={K}")
 
     ws = cfg.world_size
     M, N = cfg.m, cfg.n
+    if mxfp8 and N % MXFP8_BLOCK:
+        # N by the 32-column scale group. shard_n = N/world and the layout
+        # already forces N to a multiple of world*block_n, so this can only
+        # fire on a config that bypassed a2a_config -- but it is the operand
+        # format's own rule and belongs next to the others.
+        raise ValueError(f"mxfp8 needs N % {MXFP8_BLOCK} == 0, got N={N}")
     shard_n = cfg.shard_n
     n_blocks_per_peer = cfg.n_blocks_per_peer
     my_recv_slot = cfg.recv_slot_off(rank)
@@ -350,7 +373,8 @@ def compile_fused_gemm_a2a(
     _kname = (
         f"mori_a2a_{transport if fuse else 'stage'}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
-        f"{'B' if blockscale else 'P'}{'r' if rotated else 'l'}s{n_stripe}"
+        f"{'B' if blockscale else ('X' if mxfp8 else 'P')}"
+        f"{'r' if rotated else 'l'}s{n_stripe}"
         f"c{chunks}q{sdma_queues}{'S' if self_to_recv else 'A'}"
         f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_r{rank}"
     )
@@ -443,7 +467,13 @@ def compile_fused_gemm_a2a(
             lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=b_preshuffled
         )
 
-        mfma = _SwappedMfma(Mfma16x16x128(N_TILES_B, N_TILES_A))
+        # opsel_b_per_tile goes with the packed A scale: _Mxfp8ScaleK(packed_a)
+        # puts four B-tile ue8m0 bytes in one dword, and the byte the
+        # instruction reads is an atom-time attribute, not a shift. Leaving it
+        # off makes all four tiles read byte 0 -- which still validates the GEMM
+        # alone at relL2 1.66e-3 because gemm-only takes gemm_ar's own kernel,
+        # and gives 0.58 here.
+        mfma = _SwappedMfma(Mfma16x16x128(N_TILES_B, N_TILES_A, opsel_b_per_tile=mxfp8))
         w_pre = cco.CachedWindow(win)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
@@ -544,6 +574,26 @@ def compile_fused_gemm_a2a(
         # rewriter, and names that only exist inside a branch are not reliably
         # visible to a nested def afterwards.
         bsk = nb0 = base_row_pre = None
+        msk = base_col_pre = None
+        if mxfp8:
+            # The scales are MFMA *operands*, not epilogue arithmetic: ue8m0 is
+            # exponent-only so the instruction dequantises losslessly and there
+            # is no second accumulator and no running rescale. The epilogue must
+            # not apply them again.
+            store_c._preapplied = True
+            msk = _Mxfp8ScaleK(
+                A_scale,
+                B_scale,
+                c_m,
+                N,
+                K,
+                n_tiles_a=N_TILES_A,
+                n_tiles_b=N_TILES_B,
+                row_major=False,
+                packed_a=True,
+            )
+            base_row_pre = block_m * BLOCK_M + wave_m * (N_TILES_A * 16)
+            base_col_pre = block_n * BLOCK_N + wave_n * (N_TILES_B * 16)
         if blockscale:
             store_c._preapplied = True
             bsk = _BlockScaleK(
@@ -586,24 +636,29 @@ def compile_fused_gemm_a2a(
                     n_tiles_b=N_TILES_B,
                     lds_block_m=LDS_BLOCK_M,
                 )
+            msa0 = msa1 = msb0 = msb1 = None
+            if mxfp8:
+                msa0, msa1, msb0, msb1 = msk.step(
+                    base_row_pre, base_col_pre, k, LDS_BLOCK_M, LDS_BLOCK_N
+                )
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
             rocdl.s_barrier()
 
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
             b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
             b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
             rocdl.s_barrier()
 
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
             rocdl.s_barrier()
 
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
             # N_LDS_STEPS_A + N_LDS_STEPS_B - 1, not aiter's
@@ -614,7 +669,7 @@ def compile_fused_gemm_a2a(
             # measured boundary; do not "restore" it.
             wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
@@ -633,27 +688,32 @@ def compile_fused_gemm_a2a(
                 n_tiles_b=N_TILES_B,
                 lds_block_m=LDS_BLOCK_M,
             )
+        msa0 = msa1 = msb0 = msb1 = None
+        if mxfp8:
+            msa0, msa1, msb0, msb1 = msk.step(
+                base_row_pre, base_col_pre, K_ITERS - 2, LDS_BLOCK_M, LDS_BLOCK_N
+            )
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
         rocdl.s_barrier()
 
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
         a1_frag = a_s2r.load(a_cur1)
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
         rocdl.s_barrier()
 
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
         b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
@@ -672,22 +732,31 @@ def compile_fused_gemm_a2a(
                 n_tiles_b=N_TILES_B,
                 lds_block_m=LDS_BLOCK_M,
             )
+        msa0 = msa1 = msb0 = msb1 = None
+        if mxfp8:
+            msa0, msa1, msb0, msb1 = msk.step(
+                base_row_pre, base_col_pre, K_ITERS - 1, LDS_BLOCK_M, LDS_BLOCK_N
+            )
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         rocdl.s_barrier()
 
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
         a1_frag = a_s2r.load(a_cur1)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
+        c10_frag = mfma.call(
+            a1_frag, b0_frag, c10_frag, set_prio=False, scale_a=msa1, scale_b=msb0
+        )
+        c11_frag = mfma.call(
+            a1_frag, b1_frag, c11_frag, set_prio=False, scale_a=msa1, scale_b=msb1
+        )
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
