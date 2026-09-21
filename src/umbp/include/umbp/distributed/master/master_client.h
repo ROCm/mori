@@ -223,7 +223,12 @@ class MasterClient {
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<bool> flush_requested_{false};
   std::atomic<bool> registered_{false};
-  uint64_t heartbeat_interval_ms_ = 5000;
+  // Master-advertised, and re-advertised on every HeartbeatResponse so a
+  // master-side change lands without re-registering.  Atomic because the
+  // heartbeat thread reads it at the top of each wait while a change arrives
+  // on whichever thread completed the RPC; the fallback below only applies
+  // until the first master response.
+  std::atomic<uint64_t> heartbeat_interval_ms_{5000};
 
   std::mutex hb_cv_mutex_;
   std::condition_variable hb_cv_;
