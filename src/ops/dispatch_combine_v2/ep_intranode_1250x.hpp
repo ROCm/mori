@@ -81,6 +81,22 @@ using tdm::TdmXferOk;
 #ifndef MORI_EP_MAX_RECV
 #define MORI_EP_MAX_RECV (MORI_EP_WORLD_SIZE * 32768)
 #endif
+// Front rendezvous only: each row's labels (expert ids, weights, source map, scale
+// row) go straight into the peer's buffers with plain stores, as the portable
+// kernel does. No staging copy, no MetaTdm bounce through LDS, and no dedicated
+// wait for the peer's write ack, which held warps 0..3 of every block ~5us while
+// 4..7 sat at the payload barrier (3.8us ceiling by ablation).
+// WHERE they are issued is the whole trick. From MetaStage it was SLOWER (a08-1,
+// 512 tok: 29.7-32.4us vs staged 28.0): a load issued behind peer stores is held
+// until they are acked (~6.5us under load; no wait instruction in the ISA), so
+// every warp paid it. So the payload loop issues them instead, after all of its
+// loads and next to its own stores, where the ack overlaps the payload's.
+// -DMORI_EP_VA_STAGEMETA=1 restores the staged path (to price this as a difference).
+#if MORI_EP_VA_FRONT && !MORI_EP_VA_STAGEMETA
+#define MORI_EP_DIRECT_META 1
+#else
+#define MORI_EP_DIRECT_META 0
+#endif
 
 template <typename T>
 __device__ __forceinline__ uint32_t MoriPackTo2(float a, float b) {
@@ -515,6 +531,21 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
 #endif
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
+#if MORI_EP_DIRECT_META
+  // The same bound MetaTdm applied to the runs it moved: the peer's recv capacity.
+  constexpr index_t _metaCap = (index_t)EpMaxRecv(kCfg);
+  // peer address = base + peer * stride + off. EpPeer reads base and stride from
+  // the window in global memory, and after a peer store the compiler must assume
+  // the window changed and reload it (measured: +2.2us). Read it once, here.
+  const uintptr_t _dmB = reinterpret_cast<uintptr_t>(EpPeer<char>(win, 0, 0));
+  const uintptr_t _dmS = reinterpret_cast<uintptr_t>(EpPeer<char>(win, 1, 0)) - _dmB;
+  const unsigned long long _dmOI = args.offOutIdx, _dmOW = args.offOutWts,
+                           _dmOR = args.offRecvToSrc, _dmOS = args.offOutScales;
+  // Global (address space 1), not generic: a generic pointer compiles to flat_*,
+  // which also counts against the LDS counter.
+#define _DM_PEER(T, p, f) \
+  ((__attribute__((address_space(1))) T*)(_dmB + (uintptr_t)(p) * _dmS + (uintptr_t)(_dmO##f)))
+#endif
   if (args.tokenIndices && args.inpTokenBuf) {
     int _gszReq = topk;
     if (_gszReq < 1) _gszReq = 1;
@@ -550,12 +581,15 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         myDestTokId = s_base[myDestPe] + j;
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
             EpFlatIndex<kCfg>(myDestPe, myDestTokId);
+#if !MORI_EP_DIRECT_META  // direct: the payload loop writes the labels
         if (myDestTokId < _stgCap)
           _cusplit_stgSrc[(size_t)myDestPe * _stgCap + myDestTokId] =
               EpSrcTokIndex<kCfg>(myPe, tok);
+#endif
       } else if (act) {
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] = EpNullFlat<kCfg>();
       }
+#if !MORI_EP_DIRECT_META  // direct: the payload loop writes the labels
       unsigned long long keepMask = __ballot(keep);
       while (keepMask) {
         int srcLane = -1;
@@ -612,12 +646,34 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           }
         }
       }
+#endif  // !MORI_EP_DIRECT_META
     }
   }
+#if MORI_EP_DIRECT_META
+  // No barrier: MetaStage wrote only dest-map rows, and the payload loop reads each
+  // row back on the same warp that wrote it (both loops walk tokens by aWarp).
+#else
   __syncthreads();
+#endif
 
+#if MORI_EP_DIRECT_META
+  // Nothing staged, nothing to move: the payload loop writes every label.
+  constexpr bool _ablMeta = false;
+#elif MORI_EP_ABL_NOMETA
+  // ABLATION ONLY -- WRONG RESULTS, CHECK=0 timing runs only. After the first
+  // MORI_EP_ABL_NOMETA_AFTER pairs the label copy below is skipped, so every peer
+  // keeps an earlier launch's labels: stale (slot order moves between launches)
+  // but in range, so combine cannot fault. Prices MetaTdm on the critical path.
+#ifndef MORI_EP_ABL_NOMETA_AFTER
+#define MORI_EP_ABL_NOMETA_AFTER 16
+#endif
+  const bool _ablMeta = args.xdbFlag[blockIdx.x < (unsigned)EpXdbFlagSlots ? blockIdx.x : 0] <
+                        (unsigned long long)MORI_EP_ABL_NOMETA_AFTER;
+#else
+  constexpr bool _ablMeta = true;
+#endif
   bool _mPend = false;
-  if (args.tokenIndices && args.inpTokenBuf) {
+  if (_ablMeta && args.tokenIndices && args.inpTokenBuf) {
     const int tkM = topk;
     const index_t recvCapM = (index_t)EpMaxRecv(kCfg);
     const index_t _stgCapM = (index_t)(CUSPLIT_POOL_SLOTS / npes);
@@ -771,6 +827,34 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         index_t peMe = EpPeFromFlat<kCfg>(flatMe);
         int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
         if (!__any(validMe)) continue;
+#if MORI_EP_DIRECT_META
+        // Loads first. Everything the labels need is read here, before this token
+        // issues a single peer store: a load issued behind peer stores was held
+        // until they were acked (~6.5us/warp when MetaStage wrote the labels).
+        const index_t _lIdx =
+            (laneId < topk) ? (index_t)args.tokenIndices[(size_t)tok * topk + laneId] : (index_t)0;
+        float _lWt = 0.f;
+        if constexpr (kCfg.useWeights) {
+          if (args.weightsBuf && laneId < topk) _lWt = args.weightsBuf[(size_t)tok * topk + laneId];
+        }
+        constexpr int kScDw = (kEpScaleStride > 0) ? kEpScaleStride / 4 : 1;  // padded row
+        constexpr int kScR = (kScDw + WS - 1) / WS;
+        unsigned int _lSc[kScR];
+#pragma unroll
+        for (int r = 0; r < kScR; ++r) _lSc[r] = 0u;  // the pad crosses to a peer: zero it
+        if constexpr (kEpScaleBytes > 0) {
+          if (args.scalesBuf) {
+            constexpr int kSrcDw = kEpScaleBytes / 4;
+            const unsigned int* srcS =
+                reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)tok * kSrcDw;
+#pragma unroll
+            for (int r = 0; r < kScR; ++r) {
+              const int e = laneId + r * WS;
+              if (e < kSrcDw) _lSc[r] = srcS[e];
+            }
+          }
+        }
+#endif
         TdmIssueLoad<T>(_tdmTile,
                         reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
                         _tdmG1);
@@ -789,10 +873,60 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
           TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
         }
+#if MORI_EP_DIRECT_META
+        // ...then the labels: after this token's payload stores, before the wait
+        // for them, so their acks overlap the payload's instead of holding a load.
+        // Same rows as the payload -- one per kept destination.
+        {
+          unsigned long long _lm = __ballot(validMe);
+          while (_lm) {
+            const int l = __ffsll((long long)_lm) - 1;
+            _lm &= _lm - 1;
+            const index_t flat = __shfl(flatMe, l);
+            const int dp = (int)EpPeFromFlat<kCfg>(flat);
+            const index_t dt = EpLocalTokFromFlat<kCfg>(flat);
+            if (dt < 0 || dt >= _metaCap) continue;
+            if (laneId < topk) {
+              _DM_PEER(index_t, dp, I)[(size_t)dt * topk + laneId] = _lIdx;
+              if constexpr (kCfg.useWeights) {
+                if (args.weightsBuf) _DM_PEER(float, dp, W)[(size_t)dt * topk + laneId] = _lWt;
+              }
+            }
+            if (laneId == 0) _DM_PEER(index_t, dp, R)[dt] = EpSrcTokIndex<kCfg>(myPe, tok);
+            if constexpr (kEpScaleBytes > 0) {
+              if (args.scalesBuf) {
+                auto* dstS = _DM_PEER(unsigned int, dp, S) + (size_t)dt * kScDw;
+#pragma unroll
+                for (int r = 0; r < kScR; ++r) {
+                  const int e = laneId + r * WS;
+                  if (e < kScDw) dstS[e] = _lSc[r];
+                }
+              }
+            }
+          }
+        }
+#endif
         __builtin_amdgcn_s_wait_tensorcnt(0);
       }
     }
   }
+#if MORI_EP_DIRECT_META
+#undef _DM_PEER
+  // The labels left as plain peer stores in the payload loop. Payload stores are
+  // retired by s_wait_tensorcnt above; these are not, so every wave retires its
+  // own here, before its block's arrival ticket can let the last block signal the
+  // peers. They were issued alongside the payload, so this mostly overlaps.
+  // MORI_EP_DM_FENCE (measurement): 1 = system release fence, 2 = retire this
+  // wave's own stores only (s_wait_storecnt), 0 = none (timing only, UNSAFE).
+#ifndef MORI_EP_DM_FENCE
+#define MORI_EP_DM_FENCE 1
+#endif
+#if MORI_EP_DM_FENCE == 1
+  __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#elif MORI_EP_DM_FENCE == 2
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#endif
+#endif
   __syncthreads();
 
   // Tickets on the arrival counter instead of a spin on it: every block draws

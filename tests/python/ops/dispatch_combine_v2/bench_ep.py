@@ -803,16 +803,44 @@ def main():
             skip = 1 if gevr > 1 else 0
             npair = gevr - skip
             ds, cs = [], []
+            it_d, it_c = [], []  # every iteration, this rank (GEV_DUMP)
             for _ in range(n_gev):
                 gg.replay()
                 lockstep()
-                ds.append(
-                    sum(el_us(gev[i][0], gev[i][1]) for i in range(skip, gevr)) / npair
-                )
-                cs.append(
-                    sum(el_us(gev[i][1], gev[i][2]) for i in range(skip, gevr)) / npair
-                )
+                dd = [el_us(gev[i][0], gev[i][1]) for i in range(skip, gevr)]
+                cc = [el_us(gev[i][1], gev[i][2]) for i in range(skip, gevr)]
+                it_d += dd
+                it_c += cc
+                ds.append(sum(dd) / npair)
+                cs.append(sum(cc) / npair)
             gd_us, gc_us = sum(ds) / n_gev, sum(cs) / n_gev
+            # GEV_DUMP=<path>: the numbers above are rank 0's alone. Gather every
+            # rank's per-iteration legs so the slowest rank of each pair is visible.
+            # Iteration k is the same collective on every rank: each pair ends in
+            # combine's cross-device barrier, so the graphs stay in step.
+            if os.environ.get("GEV_DUMP"):
+                got = [None] * world
+                dist.all_gather_object(got, {"d": it_d, "c": it_c})
+                if rank == 0:
+                    import json
+
+                    with open(os.environ["GEV_DUMP"], "w") as f:
+                        json.dump(
+                            {
+                                "variant": os.environ.get("MORI_EP_VARIANT_A", ""),
+                                "mode": mode,
+                                "gev_r": gevr,
+                                "gev_n": n_gev,
+                                "skip": skip,
+                                "ranks": got,
+                            },
+                            f,
+                        )
+                    print(
+                        f"[GEVDUMP] {len(it_d)} iters x {world} ranks -> "
+                        f"{os.environ['GEV_DUMP']}",
+                        flush=True,
+                    )
             gd_lo, gd_hi = min(ds), max(ds)
             gc_lo, gc_hi = min(cs), max(cs)
 
