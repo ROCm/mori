@@ -51,6 +51,7 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import os
+import warnings
 
 import torch
 
@@ -80,6 +81,8 @@ _REGIONS = {
     # the env var cannot change anyone's offsets.
     "srcCounts": "src_counts",
     "densePrefix": "dense_prefix",
+    # MORI_EP_BLKFLAGS dispatch tail; laid out unconditionally for the same reason.
+    "blkFlags": "blk_flags",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
 }
 
@@ -150,6 +153,10 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
+# Must match EpBlkFlagStride / EpBlkFlagHdr in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
+_BLK_FLAG_STRIDE = 512
+_BLK_FLAG_HDR = 16
+
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """C++/JIT-kernel EP op: gather combine, no quant, no replay.
@@ -202,6 +209,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.arena.zero()
 
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
+        # The BLKFLAGS receiver waits on ITS OWN gridDim.x flags per source, so
+        # every rank must launch the same dispatch grid. _pick() chooses per call
+        # from the LOCAL token count, so a schedule with more than one block
+        # count can diverge across ranks under DP attention. That is warned, not
+        # refused -- the default tuned schedule has two grids and equal token
+        # counts pick the same one -- because a divergent call fails loudly in
+        # the kernel (total_recv = -1) rather than hanging. The slot count is a
+        # hard limit. Same spelling as toolchain.cpp.
+        if not cfg.is_internode and os.environ.get("MORI_EP_BLKFLAGS") in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            grids = sorted({b for b, _ in self._dispatch_specs})
+            if grids[-1] > _BLK_FLAG_STRIDE:
+                raise ValueError(
+                    f"MORI_EP_BLKFLAGS: dispatch block_num {grids[-1]} exceeds the "
+                    f"{_BLK_FLAG_STRIDE} done-flag slots per source"
+                )
+            if len(grids) > 1:
+                warnings.warn(
+                    f"MORI_EP_BLKFLAGS assumes every rank launches the same dispatch "
+                    f"grid, but this op's schedule can launch {grids}; a call where "
+                    f"ranks pick different grids fails with total_recv=-1. Pin one "
+                    f"dispatch block_num when token counts differ across ranks.",
+                    stacklevel=2,
+                )
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
@@ -493,6 +528,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "dense_prefix",
                 cfg.world_size * cfg.world_size * 8 + 64,
             ),  # also the FRONT count matrix,
+            # uint64: an epoch header, then one done flag per (parity, source,
+            # sender block) for the MORI_EP_BLKFLAGS tail. ~32 KB at EP4.
+            (
+                "blk_flags",
+                (_BLK_FLAG_HDR + 2 * cfg.world_size * _BLK_FLAG_STRIDE) * 8,
+            ),
         ]
         if self._scale_i32(cfg):
             # Sized by the DESTINATION stride, which is the caller's row padded to

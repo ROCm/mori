@@ -68,6 +68,9 @@ SLOTS = {
     9: "FenceSignal",
     10: "InboundWait",
     11: "FrontRdv",  # profilerF.hpp only; older headers never emit it
+    12: "FlagSend",  # profilerB.hpp under MORI_EP_BLKFLAGS=1 only
+    13: "FlagPoll",
+    14: "FlagSum",
 }
 
 

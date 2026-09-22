@@ -94,6 +94,13 @@ std::vector<std::string> Toolchain::Flags() const {
       f.push_back("-DMORI_EP_VARIANT_A=1");
     }
   }
+  // Per-block done flags for the dispatch tail (ep_intranode_1250x.hpp). Through
+  // Flags() for the same reason as variant A: stock and BLKFLAGS get different
+  // JIT cache entries. hip_backend.py reads the same spellings.
+  if (const char* bf = std::getenv("MORI_EP_BLKFLAGS")) {
+    const std::string v(bf);
+    if (v == "1" || v == "true" || v == "yes" || v == "on") f.push_back("-DMORI_EP_BLKFLAGS=1");
+  }
   if (const char* extra = std::getenv("MORI_JIT_EXTRA_FLAGS")) {
     for (const std::string& tok : SplitWhitespace(extra)) f.push_back(tok);
   }

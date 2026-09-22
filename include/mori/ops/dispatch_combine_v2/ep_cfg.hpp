@@ -144,6 +144,13 @@ struct EpArgs {
   unsigned long long offSrcCounts = 0;
   unsigned long long offDensePrefix = 0;
 
+  // BLKFLAGS only (MORI_EP_BLKFLAGS); the stock tail never reads it.
+  // uint64[EpBlkFlagHdr + 2 * worldSize * EpBlkFlagStride]: word 0 is this
+  // rank's dispatch epoch, the rest one done flag per (parity, source, sender
+  // block). Optional: an arena without it binds 0 and the kernel keeps the
+  // stock tail, so a caller-built arena (aiter's MegaMoE) is unaffected.
+  unsigned long long offBlkFlags = 0;
+
   // Which LSA rank this is. Runtime for the same reason: as a Cfg field it made
   // all eight ranks compile their own copy of an identical kernel.
   int rank = 0;
@@ -184,6 +191,7 @@ struct EpArgs {
   X(offOutScales, "u64")       \
   X(offSrcCounts, "u64")       \
   X(offDensePrefix, "u64")     \
+  X(offBlkFlags, "u64")        \
   X(rank, "i32")               \
   X(tokenIndices, "p")         \
   X(inpTokenBuf, "p")          \
@@ -220,7 +228,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 26,
+static_assert(detail::kEpArgsFieldCount == 27,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -375,6 +383,13 @@ constexpr int EpCombine1250xLdsBudget = Ep1250xLdsBytes;
 // block is the only writer of its own epoch. 256 == the CU count, which caps the
 // combine block_num; the host allocates this many and every call keeps them in step.
 constexpr int EpXdbFlagSlots = 256;
+// BLKFLAGS dispatch tail: one uint64 done flag per sender block, so the stride
+// per (parity, source) is the most blocks a dispatch grid may have
+// (CUSPLIT_MAX_BLOCKS in ep_intranode_1250x.hpp). The first EpBlkFlagHdr words
+// are a header -- the epoch, plus a sticky error word -- on their own 128 B
+// line. Must match _BLK_FLAG_STRIDE / _BLK_FLAG_HDR in hip_backend.py.
+constexpr int EpBlkFlagStride = 512;
+constexpr int EpBlkFlagHdr = 16;
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
 // address, different phases), so its size bounds BOTH -- and the metadata batch

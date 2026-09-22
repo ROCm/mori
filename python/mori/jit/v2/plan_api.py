@@ -73,7 +73,9 @@ DTYPES = {"bf16": 0, "fp32": 1, "fp8": 2, "fp4x2": 3}
 # Keyed by the snake_case region name: the region key comes from the C++ launch
 # argument (offOutScales -> "outScales") while an arena names it "out_scales",
 # so both are folded through _camel_to_snake before being looked up here.
-_OPTIONAL_REGIONS = frozenset({"out_scales"})
+# blk_flags: the MORI_EP_BLKFLAGS dispatch tail. A caller-built arena without it
+# binds 0, and the kernel treats offBlkFlags == 0 as "keep the stock tail".
+_OPTIONAL_REGIONS = frozenset({"out_scales", "blk_flags"})
 
 # ... and the Request field that makes each of them mandatory again.
 _REGION_REQUIRED_WHEN = {"out_scales": "scaleBytes"}
