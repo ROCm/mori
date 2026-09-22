@@ -76,6 +76,13 @@ TOPK = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
+# Per-token scale row transported alongside the payload (the block-scale a quantized
+# MoE hands to dispatch). scale_bytes = SCALE_DIM * SCALE_TS must be a multiple of 4,
+# which hip_backend asserts. The effective SCALE_DIM is resolved once the dispatch
+# dtype is known (see below): fp8/fp4 default scales ON, bf16 OFF. An explicit
+# SCALE_DIM env value overrides that default (SCALE_DIM=0 forces scales off).
+_SCALE_DIM_ENV = os.environ.get("SCALE_DIM")
+SCALE_TS = int(os.environ.get("SCALE_TS", 1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
 # Comma-separated; MORI_V2_KERNEL_BACKEND still works for a single backend.
 BACKENDS = [
@@ -108,6 +115,17 @@ _DISP_DT = {
 }[_DISP]
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 _FP4 = _DISP_DT is torch.float4_e2m1fn_x2
+# Resolve the per-token scale width now that the dispatch dtype is known. Quantized
+# dispatch (fp8/fp4) carries a block-scale row, so default it on and exercise the
+# scale-transport path a real quantized pipeline uses; bf16 has no scales. Both fp8
+# and fp4 default to hidden/32 bytes/token (224 B at hidden=7168, E8M0-style,
+# SCALE_TS=1). An explicit SCALE_DIM env value wins, including SCALE_DIM=0 (off).
+if _SCALE_DIM_ENV is not None:
+    SCALE_DIM = int(_SCALE_DIM_ENV)
+elif _DISP_DT is torch.bfloat16:
+    SCALE_DIM = 0
+else:
+    SCALE_DIM = HIDDEN // 32
 # What the correctness gate covers, as one token. A bool cannot say it: fp4 and
 # an all-zero payload verify the dispatch bytes but never compare combine's
 # output, and a row claiming "verified" next to a combine_us nobody checked is
@@ -154,6 +172,21 @@ def main():
         .to(torch.int32)
         .to(dev)
     )
+    # Per-token scale rows, transported when SCALE_DIM>0 (fp8/fp4 by default). Shaped
+    # exactly as repro_epv2_topk9.py: sc_n_i32 int32 lanes viewed as bytes, trimmed to
+    # SCALE_DIM so scale_type_size=1 * scale_dim holds. Deterministic (arange + rank
+    # offset) so a run reproduces; dispatch moves them verbatim (opaque bytes).
+    scales = None
+    if SCALE_DIM:
+        sc_n_i32 = (SCALE_DIM + 3) // 4
+        scales = (
+            (torch.arange(M, dtype=torch.int32) + rank * 100003)
+            .view(M, 1)
+            .repeat(1, sc_n_i32)
+            .view(torch.uint8)[:, :SCALE_DIM]
+            .contiguous()
+            .to(dev)
+        )
     # Unique destination PEs per token: what an identity expert makes combine sum.
     U = (
         torch.zeros(M, world, dtype=torch.bool)
@@ -178,6 +211,8 @@ def main():
             data_type=torch.bfloat16,
             dispatch_data_type=None if _DISP_DT is torch.bfloat16 else _DISP_DT,
             combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
+            scale_dim=SCALE_DIM,
+            scale_type_size=SCALE_TS,
             kernel_backend=backend,
             dispatch_block_num=_G["DBN"],
             warp_num_per_block=_G["DWPB"],
@@ -191,7 +226,7 @@ def main():
     if rank == 0:
         print(
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
-            f"init={INIT} seed={SEED} "
+            f"init={INIT} seed={SEED} scale_dim={SCALE_DIM}x{SCALE_TS}B "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
             f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
             flush=True,
@@ -243,7 +278,7 @@ def main():
             )
         return int(n.item())
 
-    def prime(op, ct, i_, w_, x_):
+    def prime(op, ct, i_, w_, x_, s_=None):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
         same buffer -- so the gate covers exactly what gets timed, staged copy
@@ -251,7 +286,7 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+        *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -578,6 +613,8 @@ def main():
             "topk": TOPK,
             "experts_per_rank": EPR,
             "dispatch_dtype": _DISP,
+            "scale_dim": SCALE_DIM,
+            "scale_type_size": SCALE_TS,
             "combine_dtype": "bf16",
             "combine_in": COMBINE_IN,
             "data_init": INIT,
@@ -624,9 +661,10 @@ def main():
     failures = checked = points = 0
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
+        s_ = scales[:ct] if SCALE_DIM else None
         for name, op in ops.items():
             points += 1
-            total, buf, ok, was_checked = prime(op, ct, i_, w_, x_)
+            total, buf, ok, was_checked = prime(op, ct, i_, w_, x_, s_)
             checked += was_checked
             if not ok:
                 failures += 1
@@ -640,7 +678,7 @@ def main():
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 op.combine(buf, routing=r)
 
             def capture_pair():
@@ -649,7 +687,7 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, None, x_, return_routing=True)
+                    *_, r_cap = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
@@ -660,7 +698,7 @@ def main():
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 held[0] = r
 
             def eager_legs():
@@ -684,7 +722,12 @@ def main():
                 # time gave a row whose columns did not agree with each other,
                 # and recv counts vary between ranks with the routing. The legs
                 # differ whenever dispatch is narrower than combine.
-                d_bw = recv_m * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us_m / 1e6)
+                d_bw = (
+                    recv_m
+                    * (HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS)
+                    / (1000**3)
+                    / (d_us_m / 1e6)
+                )
                 c_bw = recv_m * HIDDEN * 2 / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
