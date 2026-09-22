@@ -87,6 +87,12 @@ PROFILE_DIR = os.environ.get("PROFILE_DIR", "mori_traces")
 # hipDeviceAttributeWallClockRate reports 0 on gfx1250, so the exporter's own probe
 # cannot be trusted here; wall_clock64 runs at 100 MHz.
 PROFILE_FREQ_GHZ = float(os.environ.get("PROFILE_FREQ_GHZ", 0.1))
+# Rounds captured, and untimed pairs run before the ring is cleared. prime() is a
+# single pair, so without a warmup here the traced launch is the second dispatch of
+# the process -- cold caches, cold clocks -- and one round gives no spread to judge
+# it by. Each round costs 9 slots x 2 events = 18 of a warp's 16384 ring words.
+PROFILE_PAIRS = int(os.environ.get("PROFILE_PAIRS", 5))
+PROFILE_WARMUP = int(os.environ.get("PROFILE_WARMUP", 20))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
 # Comma-separated; MORI_V2_KERNEL_BACKEND still works for a single backend.
 BACKENDS = [
@@ -635,21 +641,31 @@ def main():
         return out
 
     def profile_point(op, name, ct, i_, w_, x_, s_, buf):
-        """One extra pair with the trace ring cleared, written out as Perfetto JSON.
+        """PROFILE_PAIRS traced pairs, after PROFILE_WARMUP untimed ones.
 
-        Its own launch rather than one of the timed ones: the ring is circular and
-        keyed by warp, so a second dispatch appends to the first one's events and the
-        exporter reads the two as a timeline that never happened. A full pair, not a
-        bare dispatch -- dispatch accumulates into buf and only combine clears it.
-        Only the dispatch body carries trace points, so the trace holds its phases.
+        Its own launches rather than the timed ones: the ring is circular and keyed by
+        warp, so the exporter has to be handed a run of dispatches it can read as
+        consecutive rounds, not a mix of traced and untraced ones. The warmup happens
+        BEFORE the ring is cleared, so those launches leave nothing behind -- what is
+        exported is steady state, not the cold second launch of the process.
+
+        Full pairs, not bare dispatches: dispatch accumulates into buf and only combine
+        clears it. Only the dispatch body carries trace points, so each round
+        contributes one occurrence of each phase per warp.
         """
         from mori.kernel_profiler import export_to_perfetto
         from mori.ops.dispatch_combine_v2.hip_backend import EP_DISPATCH_1250X_SLOTS
 
+        for _ in range(PROFILE_WARMUP):
+            *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+            op.combine(buf, routing=r)
+        lockstep()
+
         op.profiler_reset()
         lockstep()
-        *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
-        op.combine(buf, routing=r)
+        for _ in range(PROFILE_PAIRS):  # no host sync inside: steady state
+            *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+            op.combine(buf, routing=r)
         torch.cuda.synchronize()
         lockstep()
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -663,7 +679,8 @@ def main():
             gpu_freq_ghz=PROFILE_FREQ_GHZ,
         )
         print(
-            f"[rank {rank}] trace {name} ct={ct}: events={drained.numel() // 2} -> {out}",
+            f"[rank {rank}] trace {name} ct={ct}: events={drained.numel() // 2} "
+            f"({PROFILE_PAIRS} rounds after {PROFILE_WARMUP} warmup pairs) -> {out}",
             flush=True,
         )
 

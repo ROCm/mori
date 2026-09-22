@@ -40,7 +40,12 @@ from collections import defaultdict
 
 
 def pair_events(path):
-    """-> {slot: [durations us]}, {warp: span us}. B/E per (warp, slot), in ts order."""
+    """-> {slot: [(round, duration us)]}, {warp: span us}.
+
+    B/E per (warp, slot) in ts order. A warp meets each phase once per traced round,
+    so the k-th time it closes a phase is round k -- which is what lets the caller
+    ask whether round 0 differs from the rest rather than averaging that away.
+    """
     with open(path) as f:
         doc = json.load(f)
     events = doc["traceEvents"] if isinstance(doc, dict) else doc
@@ -48,6 +53,7 @@ def pair_events(path):
     events.sort(key=lambda e: e["ts"])
 
     open_at = defaultdict(list)
+    seen = defaultdict(int)
     durs = defaultdict(list)
     first_last = {}
     for e in events:
@@ -57,7 +63,8 @@ def pair_events(path):
         else:
             if not open_at[key]:
                 continue  # an END whose BEGIN was dropped by the ring wrapping
-            durs[e["name"]].append(e["ts"] - open_at[key].pop())
+            durs[e["name"]].append((seen[key], e["ts"] - open_at[key].pop()))
+            seen[key] += 1
         lo, hi = first_last.get(e["tid"], (e["ts"], e["ts"]))
         first_last[e["tid"]] = (min(lo, e["ts"]), max(hi, e["ts"]))
     spans = {w: hi - lo for w, (lo, hi) in first_last.items()}
@@ -83,14 +90,23 @@ def main():
         help="comma-separated phase names to print in this order; "
         "default is by descending mean",
     )
+    ap.add_argument(
+        "--by-round",
+        action="store_true",
+        help="also print each phase's mean per traced round, which is how a warm-up "
+        "artefact shows itself: round 0 out of line with the rest",
+    )
     a = ap.parse_args()
 
+    rounds = defaultdict(lambda: defaultdict(list))  # phase -> round -> durations
     durs = defaultdict(list)
     spans = {}
     for i, p in enumerate(a.traces):
         d, s = pair_events(p)
         for k, v in d.items():
-            durs[k] += v
+            for rnd, dur in v:
+                durs[k].append(dur)
+                rounds[k][rnd].append(dur)
         for w, v in s.items():
             spans[(i, w)] = v  # warp ids repeat across ranks; file index separates them
 
@@ -120,6 +136,19 @@ def main():
             f"{n:14s} {len(v):6d} {sum(v)/len(v):8.3f} {pct(v,0.5):8.3f} "
             f"{pct(v,0.95):8.3f} {max(v):8.3f} {100*sum(v)/total:6.1f}%"
         )
+
+    if a.by_round:
+        n_rounds = max((max(r) for r in rounds.values() if r), default=-1) + 1
+        print(f"\nmean us per round (0 = first traced launch), {n_rounds} rounds")
+        print(
+            f"{'phase':14s} " + " ".join(f"{'r' + str(k):>8s}" for k in range(n_rounds))
+        )
+        for n in names:
+            cells = []
+            for k in range(n_rounds):
+                v = rounds[n].get(k, [])
+                cells.append(f"{sum(v)/len(v):8.3f}" if v else f"{'-':>8s}")
+            print(f"{n:14s} " + " ".join(cells))
 
 
 if __name__ == "__main__":
