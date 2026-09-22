@@ -76,6 +76,10 @@ TOPK = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
+# Per-token scale row. scale_bytes = SCALE_DIM * SCALE_TS must be a multiple of 4,
+# which hip_backend asserts. 0 keeps the old no-scale behaviour.
+SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))
+SCALE_TS = int(os.environ.get("SCALE_TS", 1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
 # Comma-separated; MORI_V2_KERNEL_BACKEND still works for a single backend.
 BACKENDS = [
@@ -183,6 +187,8 @@ def main():
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
+            scale_dim=SCALE_DIM,
+            scale_type_size=SCALE_TS,
         )
         return EpDispatchCombineOp(cfg, comm)
 
@@ -193,7 +199,8 @@ def main():
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
             f"init={INIT} seed={SEED} "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
-            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
+            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} "
+            f"scale_dim={SCALE_DIM}x{SCALE_TS}B",
             flush=True,
         )
 
@@ -243,7 +250,7 @@ def main():
             )
         return int(n.item())
 
-    def prime(op, ct, i_, w_, x_):
+    def prime(op, ct, i_, w_, x_, s_=None):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
         same buffer -- so the gate covers exactly what gets timed, staged copy
@@ -251,7 +258,7 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+        *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -622,11 +629,19 @@ def main():
 
     rows = []
     failures = checked = points = 0
+    scl = (
+        torch.randint(
+            0, 255, (inp.shape[0], SCALE_DIM), dtype=torch.uint8, device=inp.device
+        )
+        if SCALE_DIM > 0
+        else None
+    )
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
+        s_ = scl[:ct] if scl is not None else None
         for name, op in ops.items():
             points += 1
-            total, buf, ok, was_checked = prime(op, ct, i_, w_, x_)
+            total, buf, ok, was_checked = prime(op, ct, i_, w_, x_, s_)
             checked += was_checked
             if not ok:
                 failures += 1
@@ -640,7 +655,7 @@ def main():
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 op.combine(buf, routing=r)
 
             def capture_pair():
@@ -649,7 +664,7 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, None, x_, return_routing=True)
+                    *_, r_cap = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
@@ -660,7 +675,7 @@ def main():
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 held[0] = r
 
             def eager_legs():
