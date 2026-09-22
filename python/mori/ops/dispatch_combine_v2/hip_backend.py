@@ -158,6 +158,116 @@ _BLK_FLAG_STRIDE = 512
 _BLK_FLAG_HDR = 16
 
 
+class _TokOffExt:
+    """MORI_EP_TOKOFF_EXT: dispatch's slot allocator word outside the cco window.
+
+    One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory -- the
+    allocation the mori-shmem heap uses -- opened on every peer by IPC handle.
+    ``peers`` is the device array of world_size pointers the kernel indexes by PE
+    (EpArgs.tokOffPeers). The window's hipMemCreate mapping serializes returning
+    SYSTEM RMWs from several GPUs on one int: ~9-12 us per block at EP4 x 64 blocks
+    against ~4 us on this allocation (evidence/slot_atomic.hip).
+
+    PROTOTYPE: the 64-byte handles are exchanged over torch.distributed, which the
+    caller must have initialised. A real integration would use cco's bootstrap
+    all-gather, as ccoDevCommCreate does for the SDMA signal pool.
+    """
+
+    _BYTES = 4096
+    _UNCACHED = 0x3  # hipDeviceMallocUncached
+    _LAZY_PEER = 0x1  # hipIpcMemLazyEnablePeerAccess
+
+    def __init__(self, rank, world, dev):
+        import ctypes
+
+        import torch.distributed as dist
+
+        from mori.jit.hip_driver import _get_hip_lib
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError(
+                "MORI_EP_TOKOFF_EXT exchanges IPC handles over torch.distributed; "
+                "initialise a process group first"
+            )
+
+        class _Handle(ctypes.Structure):
+            _fields_ = [("reserved", ctypes.c_char * 64)]
+
+        hip = _get_hip_lib()
+        vp = ctypes.c_void_p
+        hip.hipExtMallocWithFlags.argtypes = [
+            ctypes.POINTER(vp),
+            ctypes.c_size_t,
+            ctypes.c_uint,
+        ]
+        hip.hipMemset.argtypes = [vp, ctypes.c_int, ctypes.c_size_t]
+        hip.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_Handle), vp]
+        hip.hipIpcOpenMemHandle.argtypes = [ctypes.POINTER(vp), _Handle, ctypes.c_uint]
+        hip.hipIpcCloseMemHandle.argtypes = [vp]
+        hip.hipFree.argtypes = [vp]
+        self._hip, self._dev, self._mine, self._opened = hip, dev, None, []
+
+        def chk(err, what):
+            if err != 0:
+                raise RuntimeError(
+                    f"MORI_EP_TOKOFF_EXT: {what} returned hipError {err}"
+                )
+
+        with torch.cuda.device(dev):
+            mine = vp()
+            chk(
+                hip.hipExtMallocWithFlags(
+                    ctypes.byref(mine), self._BYTES, self._UNCACHED
+                ),
+                "hipExtMallocWithFlags",
+            )
+            self._mine = mine.value
+            chk(hip.hipMemset(self._mine, 0, self._BYTES), "hipMemset")
+            chk(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
+            handle = _Handle()
+            chk(
+                hip.hipIpcGetMemHandle(ctypes.byref(handle), self._mine),
+                "hipIpcGetMemHandle",
+            )
+            # string_at, not .reserved: a c_char array field reads back cut at the first NUL.
+            raw = ctypes.string_at(ctypes.addressof(handle), 64)
+            handles = [None] * world
+            dist.all_gather_object(handles, raw)
+            ptrs = []
+            for pe in range(world):
+                if pe == rank:
+                    ptrs.append(self._mine)
+                    continue
+                peer = vp()
+                err = hip.hipIpcOpenMemHandle(
+                    ctypes.byref(peer),
+                    _Handle.from_buffer_copy(handles[pe]),
+                    self._LAZY_PEER,
+                )
+                # Lazy peer setup can leave hipErrorPeerAccessAlreadyEnabled sticky
+                # even on success (see ccoDevCommCreate); consume it.
+                hip.hipGetLastError()
+                chk(err, f"hipIpcOpenMemHandle(pe {pe})")
+                ptrs.append(peer.value)
+                self._opened.append(peer.value)
+            self.peers = torch.tensor(ptrs, dtype=torch.int64, device=dev)
+        dist.barrier()
+
+    def zero(self):
+        """Collective, like the op's reset(): every rank zeroes its own word."""
+        with torch.cuda.device(self._dev):
+            self._hip.hipMemset(self._mine, 0, 4)
+            self._hip.hipDeviceSynchronize()
+
+    def close(self):
+        for p in self._opened:
+            self._hip.hipIpcCloseMemHandle(p)
+        self._opened = []
+        if self._mine is not None:
+            self._hip.hipFree(self._mine)
+            self._mine = None
+
+
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     """C++/JIT-kernel EP op: gather combine, no quant, no replay.
 
@@ -253,6 +363,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._null_flat = cfg.world_size * cfg.effective_max_recv
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
         self.dest_pe_counter = torch.zeros(cfg.world_size, **i32)
+        # MORI_EP_TOKOFF_EXT=1: dispatch's slot allocator word lives in IPC-shared
+        # hipExtMallocWithFlags memory instead of the cco window (see _TokOffExt).
+        # gfx1250 intranode only -- the only kernel that reads tokOffPeers.
+        self._tokoff_ext = None
+        self.tok_off_peers = None
+        if self._is1250 and os.environ.get("MORI_EP_TOKOFF_EXT", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            self._tokoff_ext = _TokOffExt(cfg.rank, cfg.world_size, dev)
+            self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
@@ -1132,6 +1255,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
             plan.close()
+        ext = getattr(self, "_tokoff_ext", None)
+        if ext is not None:
+            self._tokoff_ext = None
+            self.tok_off_peers = None
+            ext.close()
         # After the plans: they embed the ccoDevComm by value and their kernels
         # dereference its QPs. The static args cache the host struct's address, so
         # it goes too -- nothing may re-read it once the handle is gone.
@@ -1261,6 +1389,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
+                # None -> 0 -> the window's offTokOff (MORI_EP_TOKOFF_EXT off)
+                tok_off_peers=getattr(self, "tok_off_peers", None),
                 total_recv_token_num=self.total_recv,
                 grid_barrier=self.dispatch_barrier,
                 # Read-only here: the FRONT rendezvous uses it as a generation tag,
