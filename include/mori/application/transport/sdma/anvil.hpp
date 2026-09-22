@@ -121,6 +121,11 @@ class AnvilLib {
   // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.
   bool isGfx1250(int deviceId);
 
+  // True for MI308X (PCI device_id 0x74A2), a 4-XCD harvest of the 8-XCD MI300X
+  // whose odd-numbered SDMA engine ids are fused off. connect() folds selected
+  // engine ids down to the backing even engine on this part.
+  bool isMi308x(int deviceId);
+
   struct PairHash {
     std::size_t operator()(const std::pair<int, int>& p) const {
       return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 16);
