@@ -396,22 +396,13 @@ constexpr int EpXdbFlagSlots = 256;
 // follows combine.
 constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const int payload = c.hiddenDim * EpElemSize(c.dtype);
-  if (c.dtype == EpDType::Fp4x2) {
-    constexpr int kFp4Pack = 4;
-    const long long packedTotal = (long long)c.warpPerBlock * kFp4Pack * payload;
-    return packedTotal <= Ep1250xLdsBytes ? kFp4Pack * payload : payload;
-  }
   if (c.scaleBytes <= 0) return payload;
   const int wide = c.hiddenDim * EpElemSize(EpDType::Bf16);
   const long long total = (long long)wide * c.warpPerBlock;
   return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
 }
-constexpr int EpDispatch1250xMetaSlabBytes(const EpCfg& c) {
-  const int slab = EpDispatch1250xSlabBytes(c);
-  return ((long long)c.warpPerBlock * 2 * slab <= Ep1250xLdsBytes) ? slab : 0;
-}
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
-  return c.warpPerBlock * (EpDispatch1250xSlabBytes(c) + EpDispatch1250xMetaSlabBytes(c));
+  return c.warpPerBlock * EpDispatch1250xSlabBytes(c);
 }
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
