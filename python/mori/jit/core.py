@@ -258,24 +258,15 @@ def _is_all_ionic_support_ccqe() -> bool:
 
 @functools.cache
 def is_ccqe_enabled() -> bool:
-    """Return True if CCQE should be enabled (cached after first call)."""
-    if os.environ.get("MORI_DISABLE_IONIC_CCQE", "").lower() in (
-        "1",
-        "true",
-        "on",
-        "yes",
-    ):
-        logger.info("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
+    """Use the same CQ-mode policy as host allocation and the C++ v2 compiler."""
+    if detect_nic_type() != "ionic":
         return False
-    lib_support = _lib_has_ionic_ccqe()
-    nic_support = _is_all_ionic_support_ccqe()
-    enabled = lib_support and nic_support
-    logger.info(
-        "Ionic _ccqe_enabled: %s lib_support %s nic_support: %s",
-        enabled,
-        lib_support,
-        nic_support,
-    )
+    # Lazy: importing mori.jit on a host without Ionic does not load a native
+    # library, and this C ABI query does not resolve the compiler or touch HIP.
+    from mori.jit.v2.plan_api import ionic_ccqe_enabled
+
+    enabled = ionic_ccqe_enabled()
+    logger.info("Ionic _ccqe_enabled: %s (shared host policy)", enabled)
     return enabled
 
 

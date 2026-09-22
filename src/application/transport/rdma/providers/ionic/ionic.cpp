@@ -37,6 +37,7 @@
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
+#include "mori/utils/ionic_ccqe.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -44,53 +45,6 @@ namespace application {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Device Attributes                                       */
 /* ---------------------------------------------------------------------------------------------- */
-
-namespace {
-
-using FwVersion = std::tuple<int, int, int, int>;
-constexpr FwVersion kCcqeMinFwVersion{1, 117, 5, 58};
-
-// Parse "1.117.5-a-58" or "1.117.5-a58" into (1,117,5,58).
-std::optional<FwVersion> ParseIonicFwVersion(const char* fw_ver) {
-  int major, minor, patch, build;
-  char tag;
-  if (sscanf(fw_ver, "%d.%d.%d-%c-%d", &major, &minor, &patch, &tag, &build) == 5 ||
-      sscanf(fw_ver, "%d.%d.%d-%c%d", &major, &minor, &patch, &tag, &build) == 5) {
-    return FwVersion{major, minor, patch, build};
-  }
-  return std::nullopt;
-}
-
-std::optional<FwVersion> ReadIonicFwVersion(const char* dev_name) {
-  char path[256];
-  snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
-
-  FILE* f = fopen(path, "r");
-  if (!f) return std::nullopt;
-
-  char buf[64] = {};
-  fgets(buf, sizeof(buf), f);
-  fclose(f);
-
-  // Strip trailing newline.
-  buf[strcspn(buf, "\n")] = '\0';
-  return ParseIonicFwVersion(buf);
-}
-
-bool IsCcqeSupported(ibv_context* context) {
-  const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");
-  if (disable_ccqe && std::strcmp(disable_ccqe, "1") == 0) return false;
-  if (IonicDvApi::Instance().create_cq_ex == nullptr) return false;
-
-  /* Minimum firmware version verified by MORI to support CCQE is 1.117.5-a-58. */
-  auto ver = ReadIonicFwVersion(context->device->name);
-  MORI_APP_TRACE("dev: {} fw_ver {}.{}.{}-a-{}", context->device->name,
-                 ver ? std::get<0>(*ver) : -1, ver ? std::get<1>(*ver) : -1,
-                 ver ? std::get<2>(*ver) : -1, ver ? std::get<3>(*ver) : -1);
-  return ver.has_value() && *ver >= kCcqeMinFwVersion;
-}
-
-}  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          IonicCqContainer                            */
@@ -104,7 +58,7 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
 
   cqeNum = config.maxCqeNum;
 
-  const bool ccqe_enabled = IsCcqeSupported(context);
+  const bool ccqe_enabled = mori::utils::IonicCcqeEnabled();
 
   memset(&cq_attr, 0, sizeof(struct ibv_cq_init_attr_ex));
   cq_attr.cq_context = nullptr;
