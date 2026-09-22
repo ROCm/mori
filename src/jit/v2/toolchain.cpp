@@ -24,6 +24,8 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -74,6 +76,17 @@ std::vector<std::string> Toolchain::Flags() const {
   // MoriDetectDevice.cmake, which likewise emits nothing for mlx5 -- the #else.
   if (nic == "bnxt") f.push_back("-DMORI_DEVICE_NIC_BNXT");
   if (nic == "ionic") f.push_back("-DMORI_DEVICE_NIC_IONIC");
+  // MORI-VIZ. Read from the same ENABLE_PROFILER that mori.jit.config.is_profiler_enabled
+  // reads, so the kernel that writes the trace ring and the host that allocates it
+  // cannot disagree -- an instrumented kernel handed a null ring stores off the end of
+  // nothing. Flags() is hashed into the JIT cache key, so toggling this recompiles
+  // instead of reusing an uninstrumented object.
+  if (const char* p = std::getenv("ENABLE_PROFILER"); p && *p) {
+    std::string v(p);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (v == "1" || v == "true" || v == "yes" || v == "on") f.push_back("-DENABLE_PROFILER");
+  }
   if (const char* extra = std::getenv("MORI_JIT_EXTRA_FLAGS")) {
     for (const std::string& tok : SplitWhitespace(extra)) f.push_back(tok);
   }

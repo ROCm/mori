@@ -80,6 +80,13 @@ ITERS = int(os.environ.get("ITERS", 50))
 # which hip_backend asserts. 0 keeps the old no-scale behaviour.
 SCALE_DIM = int(os.environ.get("SCALE_DIM", 0))
 SCALE_TS = int(os.environ.get("SCALE_TS", 1))
+# MORI-VIZ. Needs ENABLE_PROFILER=1 in the environment as well: that is what makes
+# the JIT compile the trace points in and the backend allocate the ring.
+PROFILE = os.environ.get("PROFILE", "").lower() in ("1", "true", "yes", "on")
+PROFILE_DIR = os.environ.get("PROFILE_DIR", "mori_traces")
+# hipDeviceAttributeWallClockRate reports 0 on gfx1250, so the exporter's own probe
+# cannot be trusted here; wall_clock64 runs at 100 MHz.
+PROFILE_FREQ_GHZ = float(os.environ.get("PROFILE_FREQ_GHZ", 0.1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
 # Comma-separated; MORI_V2_KERNEL_BACKEND still works for a single backend.
 BACKENDS = [
@@ -200,7 +207,7 @@ def main():
             f"init={INIT} seed={SEED} "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
             f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} "
-            f"scale_dim={SCALE_DIM}x{SCALE_TS}B",
+            f"scale_dim={SCALE_DIM}x{SCALE_TS}B profile={PROFILE}",
             flush=True,
         )
 
@@ -627,6 +634,39 @@ def main():
         out["smi_ranks"] = f"{len(med)}/{len(records)}"
         return out
 
+    def profile_point(op, name, ct, i_, w_, x_, s_, buf):
+        """One extra pair with the trace ring cleared, written out as Perfetto JSON.
+
+        Its own launch rather than one of the timed ones: the ring is circular and
+        keyed by warp, so a second dispatch appends to the first one's events and the
+        exporter reads the two as a timeline that never happened. A full pair, not a
+        bare dispatch -- dispatch accumulates into buf and only combine clears it.
+        Only the dispatch body carries trace points, so the trace holds its phases.
+        """
+        from mori.kernel_profiler import export_to_perfetto
+        from mori.ops.dispatch_combine_v2.hip_backend import EP_DISPATCH_1250X_SLOTS
+
+        op.profiler_reset()
+        lockstep()
+        *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+        op.combine(buf, routing=r)
+        torch.cuda.synchronize()
+        lockstep()
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        out = os.path.join(PROFILE_DIR, f"trace_{name}_ct{ct}_rank{rank}.json")
+        drained = op.profiler_drain()
+        torch.save(drained, out.replace(".json", ".pt"))
+        export_to_perfetto(
+            drained,
+            out,
+            EP_DISPATCH_1250X_SLOTS,
+            gpu_freq_ghz=PROFILE_FREQ_GHZ,
+        )
+        print(
+            f"[rank {rank}] trace {name} ct={ct}: events={drained.numel() // 2} -> {out}",
+            flush=True,
+        )
+
     rows = []
     failures = checked = points = 0
     scl = (
@@ -652,6 +692,9 @@ def main():
                     for mode in MODES
                 ]
                 continue  # never report bandwidth for a kernel computing garbage
+
+            if PROFILE:
+                profile_point(op, name, ct, i_, w_, x_, s_, buf)
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""

@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "mori/jit/v2/render.hpp"
@@ -151,12 +152,23 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
+  // MORI-VIZ per-warp trace ring, in the layout core/profiler/kernel_profiler.hpp
+  // writes and python/mori/kernel_profiler reads. Null unless the caller asked for
+  // a trace, and the MORI_TRACE_* macros compile to nothing without ENABLE_PROFILER,
+  // so an ordinary build neither writes nor reads them.
+  //
+  // Outside #ifdef on purpose: the binding reads this schema out of the library at
+  // runtime, so a struct whose shape depends on a build flag would silently write
+  // every later argument into the wrong slot when the two disagree.
+  int64_t* profTimeBuf = nullptr;       // [PROFILER_WARPS_PER_RANK * MAX_DEBUG_TIMESTAMP_PER_WARP]
+  unsigned int* profTimeOff = nullptr;  // [PROFILER_WARPS_PER_RANK] per-warp write cursor
+
   int numTokens = 0;  // tokens this rank contributes this call
 };
 
 // The wire schema, generated from the field list rather than kept parallel to it.
 // The binding builds its ctypes struct from `name:tag` in this order and checks
-// sizeof -- which cannot see two same-type fields swapped, and 9 of the 24 are
+// sizeof -- which cannot see two same-type fields swapped, and 14 of the 26 are
 // bare pointers. So the static_asserts below take the offsets in SCHEMA order:
 // any disagreement with the declaration order stops the sequence increasing.
 #define MORI_EP_ARGS_FIELDS(X) \
@@ -183,6 +195,8 @@ struct EpArgs {
   X(gridBarrier, "p")          \
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
+  X(profTimeBuf, "p")          \
+  X(profTimeOff, "p")          \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -206,7 +220,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 26,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

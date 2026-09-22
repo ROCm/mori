@@ -54,6 +54,7 @@ import os
 
 import torch
 
+from mori.jit.config import is_profiler_enabled
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
@@ -144,6 +145,34 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
+
+# MORI-VIZ trace ring, mirroring include/mori/core/profiler/constants.hpp. The
+# kernel's context macro strides the ring by warp id at exactly this pitch and
+# drops warps past PROFILER_WARPS_PER_RANK rather than clamping them, so a
+# smaller allocation here does not buy a smaller trace -- it buys a store past
+# the end of the tensor.
+_PROFILER_WARPS_PER_RANK = 4096
+_PROFILER_EVENTS_PER_WARP = 16384
+_PROFILER_INT64_PER_WARP = _PROFILER_EVENTS_PER_WARP * 2
+_PROFILER_RING_INT64 = _PROFILER_WARPS_PER_RANK * _PROFILER_INT64_PER_WARP  # 1 GiB
+
+# The gfx1250 dispatch body's phases, in EpDisp1250xSlot order
+# (src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp). Restated here rather than
+# generated: tools/profiler/generate_profiler_bindings.py writes its headers into
+# the CMake build tree, and that kernel is compiled by the v2 JIT, whose include
+# path is the source root -- the generated header would be reachable from the
+# library build and not from the kernel that needs it.
+EP_DISPATCH_1250X_SLOTS = {
+    "Setup": 0,
+    "Route": 1,
+    "SlotReserve": 2,
+    "StageMap": 3,
+    "PayloadHoist": 4,
+    "MetaSend": 5,
+    "PayloadSend": 6,
+    "Barrier": 7,
+    "RecvWait": 8,
+}
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
@@ -241,6 +270,70 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     "per-block xdb epoch slots the entry barrier owns"
                 )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
+
+        # MORI-VIZ ring for the gfx1250 dispatch body. Allocated off the same
+        # ENABLE_PROFILER the JIT compiles the kernel with (Toolchain::Flags in
+        # src/jit/v2/toolchain.cpp), because the two cannot be allowed to disagree:
+        # an instrumented kernel offsets this base by warp id before anything could
+        # test it, so a null ring is a wild store, not a disabled profiler. A gibibyte,
+        # hence only when asked for, and only on the path that has trace points.
+        self.prof_time_buf = None
+        self.prof_time_off = None
+        if self._is1250 and is_profiler_enabled():
+            self.prof_time_buf = torch.zeros(
+                _PROFILER_RING_INT64, dtype=torch.int64, device=dev
+            )
+            self.prof_time_off = torch.zeros(
+                _PROFILER_WARPS_PER_RANK, dtype=torch.uint32, device=dev
+            )
+
+    # -- profiling -------------------------------------------------------
+
+    def profiler_trace(self):
+        """The whole ring, mostly zeros. ``profiler_drain`` is what you want."""
+        if self.prof_time_buf is None:
+            raise RuntimeError(
+                "no MORI-VIZ ring on this op: it is allocated only for a gfx1250 "
+                "intranode config with ENABLE_PROFILER set at construction time"
+            )
+        return self.prof_time_buf
+
+    def profiler_drain(self):
+        """The events actually written, flat ``[ts, meta, ts, meta, ...]`` int64.
+
+        Feed it to ``mori.kernel_profiler.export_to_perfetto`` with
+        ``EP_DISPATCH_1250X_SLOTS`` as ``slot_map`` -- auto-discovery reads the
+        generated bindings, which do not carry this kernel's slots -- and with an
+        explicit ``gpu_freq_ghz``: hipDeviceAttributeWallClockRate reports 0 on
+        gfx1250, so the exporter's own probe has nothing to go on there.
+
+        Only each warp's written prefix is copied back. The ring is a gibibyte of
+        almost entirely zeros, and moving all of it per export costs more than the
+        launches being measured.
+        """
+        ring = self.profiler_trace()
+        offs = self.prof_time_off.cpu()
+        parts = []
+        for w in range(_PROFILER_WARPS_PER_RANK):
+            n = int(offs[w])
+            if n <= 0:
+                continue
+            base = w * _PROFILER_INT64_PER_WARP
+            parts.append(ring[base : base + n].cpu())
+        if not parts:
+            return torch.zeros(0, dtype=torch.int64)
+        return torch.cat(parts)
+
+    def profiler_reset(self):
+        """Zero the ring and the per-warp cursors. A no-op when not profiling.
+
+        Per profiled launch, not per process: the ring is circular and keyed by warp,
+        so a second dispatch appends to the first one's events and the exporter reads
+        the two as one timeline that never happened.
+        """
+        if self.prof_time_buf is not None:
+            self.prof_time_buf.zero_()
+            self.prof_time_off.zero_()
 
     # -- internode -------------------------------------------------------
     #
@@ -1203,6 +1296,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 dest_pe_token_counter=self.dest_pe_counter,
                 total_recv_token_num=self.total_recv,
                 grid_barrier=self.dispatch_barrier,
+                # None -> 0 -> an uninstrumented build, which never reads them
+                prof_time_buf=self.prof_time_buf,
+                prof_time_off=self.prof_time_off,
                 num_tokens=num_tokens,
             )
 

@@ -47,6 +47,8 @@
 #include <type_traits>
 
 #include "mori/cco/cco.hpp"
+#include "mori/core/profiler/constants.hpp"
+#include "mori/core/profiler/kernel_profiler.hpp"
 #include "mori/core/transport/p2p/device_primitives.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
 #include "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp"
@@ -260,6 +262,30 @@ static_assert(EpScaleAlign % kTdmRowBytes == 0,
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
+// ---------------------------------------------------------------------------
+// MORI-VIZ slots for the dispatch body.
+//
+// Declared here rather than left to tools/profiler/generate_profiler_bindings.py:
+// that generator writes its headers into the CMake build tree, and this file is
+// compiled by the v2 JIT, whose include path is the source root. A generated
+// header would be reachable from the library build and not from the kernel that
+// needs it. The names are re-stated once on the Python side (hip_backend's
+// EP_DISPATCH_1250X_SLOTS) and a test pins the two lists together.
+//
+// The order is the order the body runs in, so a trace reads top to bottom.
+enum class EpDisp1250xSlot : int {
+  Setup = 0,     // shared-memory init, before any peer traffic
+  Route,         // per-token expert -> dest PE, dedup, per-peer counts
+  SlotReserve,   // the returning SYSTEM fetch_add on each peer's allocator int
+  StageMap,      // slot -> source-token map into the _cusplit_ staging pool
+  PayloadHoist,  // fp4: the first payload group's TDM loads, issued early
+  MetaSend,      // idx/wts/srcmap stores (+ the hoisted payload store)
+  PayloadSend,   // the packed payload loop
+  Barrier,       // arrival + drain tickets, outbound recv-count signal
+  RecvWait,      // first arriver parked on the peers' signals
+  MAX_SLOTS
+};
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -283,6 +309,19 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const unsigned long long win = args.window;
   const int aWarp = globalWarpId;
   const int aWarps = (int)gridDim.x * warpNum;
+
+  // The ring must exist whenever this is compiled with ENABLE_PROFILER: the context
+  // macro offsets the base by warp id before anything could test it, so a null
+  // buffer is not a disabled profiler, it is a wild store. hip_backend allocates it
+  // off the same ENABLE_PROFILER the JIT compiles with, and refuses to launch
+  // otherwise, which is where that mismatch is caught.
+  IF_ENABLE_PROFILER(MORI_DECLARE_PROFILER_CONTEXT(
+      prof, EpDisp1250xSlot, mori::core::profiler::ProfilerContext,
+      mori::core::profiler::ProfilerContext(
+          mori::core::profiler::ProfilerConfig{args.profTimeBuf, args.profTimeOff}, globalWarpId,
+          laneId)));
+  MORI_TRACE_SEQ(seq, prof);
+  MORI_TRACE_NEXT(seq, Slot::Setup);
 
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
   const int _qTok = (aWarps > 0) ? (int)(((long long)args.numTokens + aWarps - 1) / aWarps) : _tpi;
@@ -329,6 +368,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     s_run[p] = 0;
   }
   __syncthreads();
+  MORI_TRACE_NEXT(seq, Slot::Route);
 
   const bool _dedupOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens);
   int _cDestPe = -1;
@@ -369,6 +409,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __syncthreads();
+  MORI_TRACE_NEXT(seq, Slot::SlotReserve);
   const int _bmPerTok = topk * 4 + topk * 4 + 4;
   const int _bmTileB = (int)(hiddenDim * sizeof(T));
   const bool _blkMapNeeded = !((_bmPerTok > 0) && (((_bmTileB - 384) / _bmPerTok) > 0));
@@ -383,6 +424,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __syncthreads();
+  MORI_TRACE_NEXT(seq, Slot::StageMap);
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
   if (args.tokenIndices && args.inpTokenBuf) {
     int _gszReq = topk;
@@ -484,6 +526,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __syncthreads();
+  MORI_TRACE_NEXT(seq, Slot::PayloadHoist);
 
   int _pfN = 0;
   index_t _pfSlot0 = 0;
@@ -527,6 +570,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
   }
+  MORI_TRACE_NEXT(seq, Slot::MetaSend);
   bool _mPend = false;
   if (args.tokenIndices && args.inpTokenBuf) {
     const int tkM = topk;
@@ -634,9 +678,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
             if (!_pfSent && _pfN > 0 && _pfDst != nullptr) {
               const int _mTokB = (int)(hiddenDim * sizeof(T));
-              TdmIssueStore<int>(
-                  reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
-                  reinterpret_cast<int*>(_tdmTile), TdmShape<int>(_pfN * (_mTokB / 4)));
+              TdmIssueStore<int>(reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
+                                 reinterpret_cast<int*>(_tdmTile),
+                                 TdmShape<int>(_pfN * (_mTokB / 4)));
               _pfSent = true;
             }
             _mPend = true;
@@ -680,11 +724,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __builtin_amdgcn_s_wait_tensorcnt(0);
+  MORI_TRACE_NEXT(seq, Slot::PayloadSend);
 
   if (args.tokenIndices && args.inpTokenBuf) {
     constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
-    constexpr bool kFp4Pack4 =
-        kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
+    constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
     constexpr int kPack = kFp4Pack4 ? 4 : 1;
     static_assert(!kFp4Pack4 || kTokB % 128 == 0,
                   "each packed FP4 token must occupy whole TDM rows");
@@ -700,8 +744,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         const index_t part = cntAll / (index_t)nUnits;
         const index_t rem = cntAll - part * (index_t)nUnits;
         const index_t myCnt = part + (((index_t)unit < rem) ? (index_t)1 : (index_t)0);
-        const index_t myBase = s_base[destPe] + (index_t)unit * part +
-                               (((index_t)unit < rem) ? (index_t)unit : rem);
+        const index_t myBase =
+            s_base[destPe] + (index_t)unit * part + (((index_t)unit < rem) ? (index_t)unit : rem);
         T* const dst = EpPeer<T>(win, destPe, args.offDispOut);
         const T* const src = reinterpret_cast<const T*>(args.inpTokenBuf);
         const index_t* const srcMap = _cusplit_stgSrc + (size_t)destPe * _stgCap;
@@ -714,14 +758,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           for (int k = 0; k < kPack; ++k) {
             if (k < n) {
               const int srcTok = (int)srcMap[slot0 + k] % kCfg.maxTokPerRank;
-              TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim,
-                              src + (size_t)srcTok * hiddenDim, _tdmG1);
+              TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim, src + (size_t)srcTok * hiddenDim,
+                              _tdmG1);
             }
           }
           __builtin_amdgcn_s_wait_tensorcnt(0);
           TdmIssueStore<int>(reinterpret_cast<int*>(dst + (size_t)slot0 * hiddenDim),
-                             reinterpret_cast<int*>(_tdmTile),
-                             TdmShape<int>(n * (kTokB / 4)));
+                             reinterpret_cast<int*>(_tdmTile), TdmShape<int>(n * (kTokB / 4)));
           __builtin_amdgcn_s_wait_tensorcnt(0);
         }
       }
@@ -759,6 +802,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __syncthreads();
+  MORI_TRACE_NEXT(seq, Slot::Barrier);
 
   // Tickets on the arrival counter instead of a spin on it: every block draws
   // one, the first arriver draws a second once its drain read is done, and the
@@ -806,6 +850,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // signals land. It cannot simply move above the outbound store on the same
   // warp: this rank would wait on a peer that is waiting on this rank, with
   // neither having sent. Separate tickets are what break that cycle.
+  MORI_TRACE_NEXT(seq, Slot::RecvWait);
   if (isFirstArriver) {
     index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
