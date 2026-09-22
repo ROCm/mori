@@ -83,3 +83,18 @@ def detect_model():
     _, gfx, did = topology()
     model = _DID_TO_MODEL.get(did)
     return model if model is not None else _ARCH_TO_MODEL.get(gfx)
+
+
+def arch_name():
+    """Arch name for the local GPU (e.g. 'gfx950'), or None if unavailable.
+
+    Decoded from KFD's gfx_target_version (90402 -> gfx942, 120500 -> gfx1250),
+    so it costs a sysfs read. mori.jit.config.detect_gpu_arch answers the same
+    question by shelling out to rocm_agent_enumerator/rocminfo, which is the
+    right thing when the answer has to match what the compiler will target; this
+    is for labelling a tuning table, where a subprocess per import is not.
+    """
+    version = topology()[1]
+    if not version:
+        return None
+    return f"gfx{version // 10000}{version // 100 % 100}{version % 100:x}"

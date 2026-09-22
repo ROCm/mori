@@ -593,44 +593,55 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];
 
+      // Allocate slots in parallel across distinct destination PEs after deduplication.
+      // Payload copies remain sequential per peer.
+      bool laneValid = false;
+      if (laneId < config.numExpertPerToken) {
+        // Validate the peer before GetAs/atomicAdd, including Release builds.
+        bool oob = (lanePe < 0) || (lanePe >= config.worldSize);
+        laneValid = !oob && (lanePe / config.gpuPerNode == myNode);
+      }
       for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destPe = __shfl(lanePe, e);
-        bool isSentinelSlot = (destPe < 0);
-        int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
+        int peOfE = __shfl(lanePe, e);
+        // Keep only the first expert slot for each destination PE.
+        bool dup = __any((laneId < e) && (peOfE == lanePe));
+        if (dup && laneId == e) laneValid = false;
+      }
 
-        // HSA-RCA Signature 1 guard: in Release builds NDEBUG strips the
-        // assert above, so an out-of-range expert id (e.g. EPLB physical id
-        // >= worldSize*numExpertPerRank, PR #254) yields destPe >= worldSize
-        // and an OOB GetAs/WarpCopy/atomicAdd -> HSA page fault. Treat any
-        // out-of-range destPe as a dropped token via the existing skip path.
-        bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
-        bool shouldSkip = peOutOfRange || isSentinelSlot || (destNode != myNode) ||
-                          __any((laneId < e) && (destPe == lanePe));
-        if (shouldSkip) {
-          if (!args.replayMode && laneId == 0)
-            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
-                NullFlatTokenIndex(config);
-          continue;
-        }
-        int destTokId = 0;
+      index_t laneDestTokId = 0;
+      if (laneId < config.numExpertPerToken) {
+        index_t* mapSlot =
+            args.interNodeDispDestTokIdMap + tokIdx * config.numExpertPerToken + laneId;
         if (!args.replayMode) {
-          if (laneId == 0) {
-            destTokId =
-                atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe), 1);
-            assert(destTokId < config.MaxNumTokensToRecv() &&
+          if (laneValid) {
+            laneDestTokId =
+                atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(lanePe), 1);
+            assert(laneDestTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
-            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
-                FlatTokenIndex(config, destPe, destTokId);
-            args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(destPe)[destTokId] =
+            *mapSlot = FlatTokenIndex(config, lanePe, laneDestTokId);
+            args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(lanePe)[laneDestTokId] =
                 srcTokId;
+          } else {
+            *mapSlot = NullFlatTokenIndex(config);
           }
-          destTokId = __shfl(destTokId, 0);
-        } else {
-          // Replay: pull cached recv-side slot.
-          index_t flat = args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e];
-          destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
+        } else if (laneValid) {
+          laneDestTokId = LocalTokIdFromFlatTokenIndex(config, *mapSlot);
         }
-        if (!args.replayMode && (destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
+      }
+
+      // Per-destination-PE counter. It is owned by lane (destPe % gpuPerNode),
+      // not by the lane that took the slot, so this stays a loop.
+      if (!args.replayMode) {
+        for (int e = 0; e < config.numExpertPerToken; e++) {
+          if (!__shfl(static_cast<int>(laneValid), e)) continue;
+          if ((__shfl(lanePe, e) % config.gpuPerNode) == laneId) localPeTokenCounter++;
+        }
+      }
+
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        if (!__shfl(static_cast<int>(laneValid), e)) continue;
+        int destPe = __shfl(lanePe, e);
+        index_t destTokId = __shfl(laneDestTokId, e);
         core::WarpCopy<uint8_t, 4>(args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) +
                                        destTokId * hiddenBytes,
                                    stagingPtr + tokIdx * xferBytes, hiddenBytes);
@@ -919,21 +930,21 @@ inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
 
 namespace combine_impl {
 
-// Gathering a token from its experts reads from up to numExpertPerToken peer
-// GPUs over xGMI, and peer-read *latency* -- not bandwidth -- is what caps it.
-// core::WarpAccum issues all AccumNum of those loads before accumulating any of
-// them so they overlap; moving 16B per lane instead of 4B puts 4x the bytes in
-// flight behind each outstanding read.
+// The LL gather uses 16-byte loads per lane. Gathering a token from its experts
+// can be limited by xGMI peer-read latency: core::WarpAccum issues AccumNum
+// loads before accumulating, and wider loads put more bytes in flight.
+// The ordinary path has a separate 4-byte load-first policy below.
 //
-// Two constraints come with it:
+// Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the
 //     hidden payload with the per-token weights, so its stride is only aligned
 //     for some topk/dtype combinations; CombineVecAligned() decides per launch
 //     and the caller falls back to the 4B path when it cannot.
-//   - The vector loop advances CombineVecStep() elements per iteration and drops
-//     to a per-lane scalar tail below that. A slice shorter than one step is
-//     *slower* than not vectorizing at all, so slices must be a whole multiple
-//     of it.
+//   - A partial vector step is handled by a per-lane scalar tail. LL slices are
+//     rounded to CombineVecStep() to avoid short scalar-only gathers. This is a
+//     performance choice; a tail does not make the gather incorrect.
+// CombineVecStep() controls how work is divided between warps for each token.
+// CombineGather() chooses the vector width from the alignment check.
 constexpr size_t kCombineVecBytes = 16;
 
 // How many vector steps of a token's hidden dimension go into one warp's slice.
@@ -966,6 +977,37 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
   } else {
     core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
   }
+}
+
+template <EpInterNodeKernelCfg kConfig>
+__forceinline__ __device__ constexpr bool UseCombineLoadFirst() {
+#if defined(__gfx950__)
+  return kConfig.maxNumInpTokenPerRank <= 256;
+#else
+  return false;
+#endif
+}
+
+// Ordinary gather selects the architecture policy at compile time.
+// Peer-memory gather does not depend on the NIC provider or QP count.
+// The LL gather uses its separate path.
+template <EpInterNodeKernelCfg kConfig, typename TokT>
+__forceinline__ __device__ void CombineGatherNormal(TokT* dest, TokT** srcPtrs, int accumNum,
+                                                    size_t nelems, size_t tokHiddenBytes,
+                                                    size_t tokCombXferBytes) {
+#if defined(__gfx942__) || defined(__gfx950__)
+  constexpr bool useSmallLoadFirst = UseCombineLoadFirst<kConfig>();
+#else
+  constexpr bool useSmallLoadFirst = false;
+#endif
+  if constexpr (useSmallLoadFirst) {
+    // Arena bases are aligned; require aligned row and staging strides.
+    if ((tokHiddenBytes % 4 == 0) && (tokCombXferBytes % 4 == 0)) {
+      core::WarpAccumLF<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);
+      return;
+    }
+  }
+  core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
@@ -1003,8 +1045,9 @@ __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs& arg
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<TokT, 4>(reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes),
-                             srcPtrs, nullptr, config.numExpertPerToken, hiddenDim);
+    CombineGatherNormal<kConfig, TokT>(
+        reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes), srcPtrs,
+        config.numExpertPerToken, hiddenDim, tokHiddenBytes, tokCombXferBytes);
     if (args.weightsBuf) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
@@ -1156,9 +1199,9 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
-              core::WarpAccum<TokT, 4>(
-                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs, nullptr,
-                  config.numExpertPerToken, hiddenDim);
+              CombineGatherNormal<kConfig, TokT>(
+                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
+                  config.numExpertPerToken, hiddenDim, tokHiddenBytes, tokCombXferBytes);
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(

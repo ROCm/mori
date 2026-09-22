@@ -85,7 +85,24 @@ CONFIG_STR_TO_DTYPE: dict[str, torch.dtype] = {r[1]: r[0] for r in _DTYPE_REGIST
 CONFIG_STR_TO_SHORT_NAME: dict[str, str] = {r[1]: r[2] for r in _DTYPE_REGISTRY}
 
 _KERNEL_TYPE_NAMES = frozenset(
-    {"IntraNode", "InterNode", "InterNodeV1", "InterNodeV1LL", "AsyncLL", "IntraNodeLL"}
+    {
+        "IntraNode",
+        "InterNode",
+        "InterNodeV1",
+        "InterNodeV1LL",
+        "AsyncLL",
+        "IntraNodeLL",
+        # v2 (CCO/GDA) internode. Two names because they are two separately
+        # compiled kernels picked per launch, exactly as InterNodeV1/V1LL are:
+        # a row measured on one says nothing about the other, and the filename
+        # is where that distinction is kept. Their rules live in
+        # mori/ops/dispatch_combine_v2/tuning_configs and are read through
+        # hip_tuning_configs.py, which adds the v2-only parts (CU
+        # clamping, and a bucket list for the compile-per-geometry backend) on
+        # top of this module's loading, lookup and merge-on-save.
+        "InterNodeV2",
+        "InterNodeV2LL",
+    }
 )
 
 # Single source for the quant-type mapping. Keyed by EpDispatchCombineQuantType
@@ -225,14 +242,16 @@ def _find_fallback_config(
     kernel_type: str,
     ep_size: int,
     phase: str,
+    directory: Path | None = None,
 ) -> Path | None:
     """Find any config file matching the same (arch, kernel, ep, phase)
     but different gpu_model."""
     suffix = f"_{kernel_type}_ep{ep_size}_{phase}.json"
     prefix = f"{gpu_arch}_"
-    if not _TUNING_CONFIGS_DIR.is_dir():
+    directory = directory or _TUNING_CONFIGS_DIR
+    if not directory.is_dir():
         return None
-    for f in sorted(_TUNING_CONFIGS_DIR.iterdir()):
+    for f in sorted(directory.iterdir()):
         if f.name.startswith(prefix) and f.name.endswith(suffix) and f.is_file():
             return f
     return None
@@ -244,18 +263,35 @@ def config_path_for(
     ep_size: int,
     gpu_model: str | None = None,
     phase: str = "dispatch",
+    directory: Path | None = None,
 ) -> Path:
     """Resolve config file path for a given phase.
 
     Priority:
-    1. MORI_EP_TUNING_CONFIG env var (exact path override, ignores phase)
+    1. MORI_EP_TUNING_CONFIG env var (exact path override, ignores phase) --
+       only when no ``directory`` was named, see below
     2. Exact match with gpu_model
     3. Fallback: any file with same (arch, kernel, ep, phase) but different model
+
+    ``directory`` overrides where to look, defaulting to this package's
+    ``tuning_configs``. It exists because the v2 internode tables follow this
+    same naming and are loaded by this same code, but ship beside their own
+    package (``dispatch_combine_v2/tuning_configs``) -- one loader, two
+    locations, rather than a second implementation of the format.
+
+    A named ``directory`` also SUPPRESSES the env override, and that is the
+    point rather than a detail: MORI_EP_TUNING_CONFIG names one exact file, so
+    honouring it for a caller that asked for a different table would hand the v2
+    internode lookup a v1 file whose rules match on dtype/hidden/num_tokens and
+    differ on everything that matters. One env var must not steer two tables.
+    Callers with their own location get their own knob (v2's is
+    MORI_EP_V2_TUNING_DIR); callers that name no directory keep v1's behaviour
+    exactly.
     """
     env_override = os.environ.get("MORI_EP_TUNING_CONFIG")
-    if env_override:
+    if env_override and directory is None:
         return Path(env_override)
-    exact = _TUNING_CONFIGS_DIR / build_config_filename(
+    exact = (directory or _TUNING_CONFIGS_DIR) / build_config_filename(
         gpu_arch,
         kernel_type,
         ep_size,
@@ -264,7 +300,9 @@ def config_path_for(
     )
     if exact.is_file():
         return exact
-    fallback = _find_fallback_config(gpu_arch, kernel_type, ep_size, phase)
+    fallback = _find_fallback_config(
+        gpu_arch, kernel_type, ep_size, phase, directory=directory
+    )
     if fallback is not None:
         logger.info(
             "No tuning config for gpu_model=%s phase=%s, using fallback: %s",
@@ -457,8 +495,14 @@ class TuningConfigManager:
         kernel_type: str,
         ep_size: int,
         gpu_model: str | None = None,
+        directory: Path | None = None,
     ) -> "TuningConfigManager":
         cache_key = f"{gpu_arch}_{gpu_model or ''}_{kernel_type}_ep{ep_size}"
+        if directory is not None:
+            # Part of the key, not just of the load: two directories can hold
+            # the same (arch, model, kernel, ep) and a shared key would serve
+            # whichever was asked for first.
+            cache_key = f"{directory}/{cache_key}"
         if cache_key in cls._cache:
             return cls._cache[cache_key]
 
@@ -468,6 +512,7 @@ class TuningConfigManager:
             ep_size,
             gpu_model,
             "dispatch",
+            directory=directory,
         )
         combine_path = config_path_for(
             gpu_arch,
@@ -475,6 +520,7 @@ class TuningConfigManager:
             ep_size,
             gpu_model,
             "combine",
+            directory=directory,
         )
         dispatch_rules = cls._load_phase_rules(
             dispatch_path,
@@ -717,12 +763,21 @@ class TuningConfigManager:
 
         rules: list[dict] = data.setdefault("rules", [])
 
+        # experts_per_rank participates in both keys, and like topk it is
+        # OPTIONAL: every rule written before it existed has no such field, so
+        # its key component is None and is unchanged by this. It is here for the
+        # same reason topk is -- two models can share (dtype, hidden, topk) and
+        # route a different NUMBER of experts (DeepSeek-V4 256 against
+        # V4-Pro 384), which changes the per-rank expert count and can move the
+        # geometry. Without it in the key, sweeping the second model silently
+        # overwrites the first model's rules instead of adding to them.
         def _dispatch_key(r):
             return (
                 r.get("dtype"),
                 r.get("num_tokens"),
                 r.get("hidden_dim"),
                 r.get("topk"),
+                r.get("experts_per_rank"),
             )
 
         def _combine_key(r):
@@ -731,6 +786,7 @@ class TuningConfigManager:
                 r.get("num_tokens"),
                 r.get("hidden_dim"),
                 r.get("topk"),
+                r.get("experts_per_rank"),
                 r.get("zero_copy"),
                 r.get("quant_type"),
             )

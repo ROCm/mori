@@ -125,7 +125,7 @@ struct EpInterNodeRegion {
 // Geometry is deliberately NOT here. blockNum and warpNumPerBlock come from
 // gridDim/blockDim, and rdmaBlockNum is a per-launch field of the args below --
 // not for tidiness, but because dispatch and combine are tuned to DIFFERENT
-// values for the same op (internode_tuning_configs: at 8 tokens dispatch runs
+// values for the same op (hip_tuning_configs: at 8 tokens dispatch runs
 // rdma=32/warp=8 while combine runs rdma=21/warp=6, and the table comment
 // records that the coupling is deliberate). Folding geometry into the config,
 // and thus later into the NTTP, would give the two phases disagreeing configs

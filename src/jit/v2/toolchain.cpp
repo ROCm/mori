@@ -27,9 +27,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 
 #include "mori/jit/v2/util.hpp"
+#include "mori/utils/ionic_ccqe.hpp"
 #include "mori/utils/mori_log.hpp"
 
 #ifdef __linux__
@@ -74,8 +76,55 @@ std::vector<std::string> Toolchain::Flags() const {
   // MoriDetectDevice.cmake, which likewise emits nothing for mlx5 -- the #else.
   if (nic == "bnxt") f.push_back("-DMORI_DEVICE_NIC_BNXT");
   if (nic == "ionic") f.push_back("-DMORI_DEVICE_NIC_IONIC");
+  if (nic == "ionic" && ionicCcqe) f.push_back("-DIONIC_CCQE");
   if (const char* extra = std::getenv("MORI_JIT_EXTRA_FLAGS")) {
-    for (const std::string& tok : SplitWhitespace(extra)) f.push_back(tok);
+    const auto tokens = SplitWhitespace(extra);
+    auto checkOverride = [this](const std::string& tok, const std::string& next) {
+      std::string macro;
+      const bool definesMacro = tok.rfind("-D", 0) == 0;
+      if (tok == "-D" || tok == "-U") {
+        macro = next;
+      } else if (tok.rfind("-D", 0) == 0 || tok.rfind("-U", 0) == 0) {
+        macro = tok.substr(2);
+      }
+      if (macro.substr(0, macro.find_first_of("=(")) == "IONIC_CCQE") {
+        // #ifdef treats -DIONIC_CCQE=0 as enabled too. Accept an existing
+        // workaround only when it agrees with the host-created CQ protocol.
+        if (definesMacro != (nic == "ionic" && ionicCcqe)) {
+          throw std::runtime_error(
+              "mori jit: IONIC_CCQE in MORI_JIT_EXTRA_FLAGS conflicts with host CQ mode. "
+              "Remove the override; set MORI_DISABLE_IONIC_CCQE=1 before initialization "
+              "to use normal CQs.");
+        }
+      }
+    };
+    // Check explicit macro operands within each driver/forwarding stream.
+    // In particular, -Xpreprocessor -D -Xpreprocessor IONIC_CCQE is one
+    // definition, despite the driver forwarding tokens between its operands.
+    // Keep the original argv for compilation and the cache key. This guard
+    // covers explicit -D/-U overrides; it does not interpret arbitrary source
+    // definitions or the contents of response files/forced includes.
+    std::vector<std::string> driverArgs, preprocessorArgs, frontendArgs;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+      const std::string& tok = tokens[i];
+      if ((tok == "-Xpreprocessor" || tok == "-Xclang") && i + 1 < tokens.size()) {
+        auto& forwarded = tok == "-Xpreprocessor" ? preprocessorArgs : frontendArgs;
+        forwarded.push_back(tokens[++i]);
+        continue;
+      }
+      if (tok.rfind("-Wp,", 0) == 0) {
+        std::istringstream stream(tok.substr(4));
+        for (std::string part; std::getline(stream, part, ',');) preprocessorArgs.push_back(part);
+      } else {
+        driverArgs.push_back(tok);
+      }
+    }
+    // Unrelated driver options such as -O2 must not become the operand of a
+    // forwarded bare -D/-U; each forwarding stream keeps its own operands.
+    for (const auto* stream : {&driverArgs, &preprocessorArgs, &frontendArgs})
+      for (size_t i = 0; i < stream->size(); ++i)
+        checkOverride((*stream)[i], i + 1 < stream->size() ? (*stream)[i + 1] : "");
+    f.insert(f.end(), tokens.begin(), tokens.end());
   }
   return f;
 }
@@ -222,6 +271,7 @@ const Toolchain& GetToolchain() {
     tc.rocmPath = EnvOr("ROCM_PATH", "/opt/rocm");
     tc.arch = DetectArch();
     tc.nic = DetectNic();
+    tc.ionicCcqe = tc.nic == "ionic" && mori::utils::IonicCcqeEnabled();
     tc.hipcc = DetectHipcc(tc.rocmPath);
     tc.sourceRoot = DetectSourceRoot();
     tc.signature = CompilerSignature(tc.hipcc);
@@ -231,8 +281,8 @@ const Toolchain& GetToolchain() {
 
     err = tc.Valid() ? "" : tc.Diagnose();
     if (err.empty()) {
-      MORI_INFO(mori::modules::OPS, "[jit] arch={} nic={} hipcc={} root={} cache={}", tc.arch,
-                tc.nic, tc.hipcc, tc.sourceRoot, tc.cacheRoot);
+      MORI_INFO(mori::modules::OPS, "[jit] arch={} nic={} ccqe={} hipcc={} root={} cache={}",
+                tc.arch, tc.nic, tc.ionicCcqe, tc.hipcc, tc.sourceRoot, tc.cacheRoot);
     }
   });
 

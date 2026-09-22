@@ -170,102 +170,17 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
         )
 
 
-def _lib_has_ionic_ccqe() -> bool:
-    """Check whether the ionic driver supports CCQE by probing the runtime library symbol."""
-    import ctypes
-    import ctypes.util
-
-    lib_name = ctypes.util.find_library("ionic")
-    if lib_name is None:
-        return False
-    try:
-        lib = ctypes.CDLL(lib_name)
-        return hasattr(lib, "ionic_dv_create_cq_ex")
-    except OSError:
-        return False
-
-
-_CCQE_MIN_FW_VERSION = (1, 117, 5, 58)
-
-
-def _parse_ionic_fw_version(fw_ver: str) -> tuple[int, ...] | None:
-    """Parse '1.117.5-a-58' → (1, 117, 5, 58). Returns None if unparseable."""
-    if not fw_ver:
-        return None
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)-a-?(\d+)$", fw_ver)
-    if not m:
-        return None
-    return tuple(int(x) for x in m.groups())
-
-
-def _is_firmware_support_ccqe(fw_ver: str) -> bool:
-    """Return True if the firmware version >= 1.117.5-a-58."""
-    ver = _parse_ionic_fw_version(fw_ver)
-    return ver is not None and ver >= _CCQE_MIN_FW_VERSION
-
-
-def _get_ionic_fw_versions() -> list[str]:
-    """Return fw_ver strings for every ionic IB device found in sysfs."""
-    ib_dir = "/sys/class/infiniband"
-    versions: list[str] = []
-    try:
-        for dev in os.listdir(ib_dir):
-            dev_path = os.path.join(ib_dir, dev)
-            driver_link = os.path.join(dev_path, "device", "driver")
-            try:
-                driver_name = os.path.basename(os.readlink(driver_link))
-            except OSError:
-                continue
-            if driver_name not in ("ionic_rdma", "ionic"):
-                continue
-            fw_path = os.path.join(dev_path, "fw_ver")
-            try:
-                fw_ver = Path(fw_path).read_text().strip()
-                versions.append(fw_ver)
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return versions
-
-
-def _is_all_ionic_support_ccqe() -> bool:
-    """Return True only when every ionic device has the same fw version and that version >= 58."""
-    versions = _get_ionic_fw_versions()
-    if not versions:
-        return False
-    if len(set(versions)) != 1:
-        return False
-
-    logger.debug("ionic ver: %s", versions[-1])
-
-    for ver in versions:
-        if not _is_firmware_support_ccqe(ver):
-            return False
-
-    return True
-
-
 @functools.cache
 def is_ccqe_enabled() -> bool:
-    """Return True if CCQE should be enabled (cached after first call)."""
-    if os.environ.get("MORI_DISABLE_IONIC_CCQE", "").lower() in (
-        "1",
-        "true",
-        "on",
-        "yes",
-    ):
-        logger.info("Ionic _ccqe_enabled: False (disabled by MORI_DISABLE_IONIC_CCQE)")
+    """Use the same CQ-mode policy as host allocation and the C++ v2 compiler."""
+    if detect_nic_type() != "ionic":
         return False
-    lib_support = _lib_has_ionic_ccqe()
-    nic_support = _is_all_ionic_support_ccqe()
-    enabled = lib_support and nic_support
-    logger.info(
-        "Ionic _ccqe_enabled: %s lib_support %s nic_support: %s",
-        enabled,
-        lib_support,
-        nic_support,
-    )
+    # Lazy: importing mori.jit on a host without Ionic does not load a native
+    # library, and this C ABI query does not resolve the compiler or touch HIP.
+    from mori.jit.v2.plan_api import ionic_ccqe_enabled
+
+    enabled = ionic_ccqe_enabled()
+    logger.info("Ionic _ccqe_enabled: %s (shared host policy)", enabled)
     return enabled
 
 
