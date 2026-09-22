@@ -1896,9 +1896,7 @@ def main(argv):
             # and it reads inpTokenBuf as T*, so handing it the fp8 dispatch
             # output unconverted reinterprets fp8 bytes as bf16.
             combine_input = (
-                recv_x.to(cfg.combine_dtype)
-                if cfg.is_asymmetric_dtype
-                else recv_x
+                recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
             )
             out, out_w = op.combine(combine_input, wts, routing=routing)
             torch.cuda.synchronize()
