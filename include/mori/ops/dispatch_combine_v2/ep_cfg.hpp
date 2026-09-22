@@ -151,6 +151,11 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
+  // MORI_EP_TOKOFF_EXT only: [worldSize] pointers, entry p = PE p's dispatch slot
+  // allocator word in hipExtMallocWithFlags(Uncached) memory shared by IPC handle,
+  // used instead of the window's offTokOff. Null (the default) keeps the window.
+  int* const* tokOffPeers = nullptr;
+
   int numTokens = 0;  // tokens this rank contributes this call
 };
 
@@ -183,6 +188,7 @@ struct EpArgs {
   X(gridBarrier, "p")          \
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
+  X(tokOffPeers, "p")          \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -206,7 +212,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 25,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

@@ -260,6 +260,15 @@ static_assert(EpScaleAlign % kTdmRowBytes == 0,
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
+// The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
+// moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
+// memory the ranks share by IPC handle, and binds args.tokOffPeers; otherwise it is
+// the window's offTokOff. Same word, same protocol -- only the memory differs.
+__device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
+  return args.tokOffPeers != nullptr ? args.tokOffPeers[pe]
+                                     : EpPeer<index_t>(args.window, pe, args.offTokOff);
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -375,7 +384,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     index_t n = s_N[p];
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
-      s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
+      s_base[p] = __hip_atomic_fetch_add(EpTokOff(args, p), n,
                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
@@ -722,7 +731,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
     if (laneId == 0) {
       *args.totalRecvTokenNum = myRecv;
-      EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+      EpTokOff(args, args.rank)[0] = 0;
     }
   }
 }
