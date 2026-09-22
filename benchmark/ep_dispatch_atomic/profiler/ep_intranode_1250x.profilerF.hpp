@@ -260,6 +260,18 @@ static_assert(EpScaleAlign % kTdmRowBytes == 0,
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
+// The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
+// moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
+// memory the ranks share by IPC handle, and binds args.tokOffPeers; otherwise it is
+// the window's offTokOff. Same word, same protocol -- only the memory differs. On
+// the window's hipMemCreate mapping the gridDim.x * npes returning SYSTEM RMWs that
+// land on one int serialize: ~9-12 us per block at EP4 x 64 blocks, against ~4 us
+// on the ext allocation (benchmark/ep_dispatch_atomic/evidence/slot_atomic.hip).
+__device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
+  return args.tokOffPeers != nullptr ? args.tokOffPeers[pe]
+                                     : EpPeer<index_t>(args.window, pe, args.offTokOff);
+}
+
 // ---- epv1-style trace profiler, ported to the v2 1250x dispatch body ----
 // Same device profiler and same on-wire format as dispatch_combine (v1):
 // per-warp ring of (timestamp, meta) int64 pairs, lane 0 writing, meta packed as
@@ -467,8 +479,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 #endif
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
 #else
-      s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
-                                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      s_base[p] =
+          __hip_atomic_fetch_add(EpTokOff(args, p), n, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
 #endif
@@ -971,7 +983,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
     if (laneId == 0) {
       *args.totalRecvTokenNum = myRecv;
-      EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+      EpTokOff(args, myPe)[0] = 0;
     }
   }
 }

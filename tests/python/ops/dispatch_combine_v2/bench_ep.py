@@ -158,6 +158,12 @@ EPFUSE = int(os.environ.get("EPFUSE", "0"))
 # packed: compacting that would read a dense run as if it were segmented.
 _VA = os.environ.get("MORI_EP_VARIANT_A", "").lower()
 VARIANT_A = _VA == "seg"
+# Segmented output, no compaction: the consumer follows the layout instead. Source
+# s's rows are [s*stride, s*stride + src_counts[s]), stride = recv_cap / world, with
+# src_counts the per-source receive counts dispatch exports. Nothing moves them into
+# a dense run, so the gate and the identity expert both walk those slots -- and the
+# gate checks the exported counts against host truth, since a consumer trusts them.
+SEGOUT = VARIANT_A and not EPCOMPACT
 if EPCOMPACT and _VA in ("1", "true", "yes", "on", "front"):
     raise SystemExit(
         "EPCOMPACT applies to MORI_EP_VARIANT_A=seg only; the front rendezvous "
@@ -214,11 +220,10 @@ def main():
         .to(dev)
     )
     # Unique destination PEs per token: what an identity expert makes combine sum.
-    U = (
-        torch.zeros(M, world, dtype=torch.bool)
-        .scatter_(1, (idx.cpu().long() // EPR), True)
-        .sum(1)
+    sent = torch.zeros(M, world, dtype=torch.bool).scatter_(
+        1, (idx.cpu().long() // EPR), True
     )
+    U = sent.sum(1)
 
     obj = [cco.Communicator.get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(obj, src=0)
@@ -494,7 +499,9 @@ def main():
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
             f"init={INIT} seed={SEED} "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
-            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
+            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} "
+            # MORI_EP_TOKOFF_EXT positive control: did the op bind the moved word?
+            f"tokoff_ext={any(getattr(o, 'tok_off_peers', None) is not None for o in ops.values())}",
             flush=True,
         )
 
@@ -502,7 +509,39 @@ def main():
         torch.cuda.synchronize()
         dist.barrier()
 
-    def check_dispatch(op, total, routing):
+    def seg_slots(op, ct):
+        """SEGOUT: the live slots and the source each should hold, read the way a
+        consumer would -- off the counts dispatch exported -- plus how many of
+        those counts disagree with host truth (the all_gathered routing)."""
+        cnt = (
+            from_gpu_ptr(
+                op.arena.local_ptr(op._region("src_counts")), (world,), torch.int32
+            )
+            .cpu()
+            .long()
+        )
+        mine = sent[:ct].sum(0).to(torch.int64)
+        g = [torch.zeros_like(mine) for _ in range(world)]
+        dist.all_gather(g, mine)
+        want = torch.stack(g)[:, rank]
+        stride = op.recv_tokens().shape[0] // world
+        # A count past the segment would index the next source's range; clamp it
+        # and let the mismatch against host truth report it.
+        n = cnt.clamp(0, stride)
+        slots = torch.cat(
+            [torch.arange(s * stride, s * stride + int(n[s])) for s in range(world)]
+        )
+        owner = torch.cat([torch.full((int(n[s]),), s) for s in range(world)])
+        bad = int((cnt != want).sum())
+        if bad:
+            print(
+                f"  [rank {rank}] SEGMENT COUNT MISMATCH kernel={cnt.tolist()} "
+                f"host={want.tolist()}",
+                flush=True,
+            )
+        return slots, owner, bad
+
+    def check_dispatch(op, total, routing, seg=None):
         """Every received row must equal, BYTE FOR BYTE, the source row it claims.
 
         dispatch only transports -- "mori does no quantizing here: fp8/fp4 payloads
@@ -520,6 +559,8 @@ def main():
         """
         if not CHECK or total == 0:
             return 0
+        if seg is not None:
+            return check_segments(op, total, routing, seg)
         # Under compaction the map is compacted alongside the payload, so both
         # are in dense order and index each other. Without it, both are raw.
         tis = (
@@ -571,6 +612,42 @@ def main():
             )
         return int(n.item())
 
+    def check_segments(op, total, routing, seg):
+        """check_dispatch for SEGOUT: the same byte-exact comparison, over the
+        slots the exported counts claim instead of [0, total). Also requires that
+        segment s holds ONLY source s's rows -- the property that lets the remote
+        slot allocator go -- and that the counts add up to total_recv."""
+        slots, owner, cnt_bad = seg
+        tis = routing.disp_tok_id_to_src_tok_id_local[slots.to(dev)].cpu()
+        src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
+        perm_bad = slots.numel() - int(torch.unique(tis).numel())
+        seg_bad = int((src_pe != owner).sum())
+        tot_bad = int(slots.numel() != total)
+        # Bytes first, THEN gather: torch has no advanced indexing for fp4.
+        got = op.recv_tokens().view(torch.uint8)[slots.to(dev)].cpu()
+        bad = 0
+        for pe in src_pe.unique().tolist():
+            sel = src_pe == pe
+            ref = _data.make_payload(
+                (M, HIDDEN),
+                INIT,
+                _data.make_generator(_data.seed_for(SEED, int(pe))),
+                _DISP_DT,
+                constant=CONST_VAL,
+            ).view(torch.uint8)
+            bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
+        n = torch.tensor([bad, seg_bad, perm_bad, cnt_bad, tot_bad])
+        dist.all_reduce(n)
+        if rank == 0:
+            print(
+                f"  [{op.backend_name}] segout: rows={slots.numel()} total={total} "
+                f"byte_mismatch={int(n[0])} wrong_segment={int(n[1])} "
+                f"dup={int(n[2])} count_mismatch={int(n[3])} "
+                f"total_mismatch={int(n[4])}  (summed over {world} ranks)",
+                flush=True,
+            )
+        return int(n.sum())
+
     def prime(op, ct, i_, w_, x_):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
@@ -598,7 +675,8 @@ def main():
             cp["compact_fused"](ct * TOPK)
         elif cp and EPREMAP:
             cp["remap"](ct * TOPK)
-        dispatch_bad = check_dispatch(op, total, r)
+        seg = seg_slots(op, ct) if SEGOUT else None
+        dispatch_bad = check_dispatch(op, total, r, seg)
         stage = op.combine_in_view()[:total]
         # An all-zero payload reduces the identity-expert check to 0 == 0, which
         # holds however wrong the kernel is. fp4 cannot go through combine at all
@@ -626,6 +704,15 @@ def main():
             if not EPREMAP:
                 cp["expand"]()
             base = op.combine_in_view()
+        elif seg is not None:
+            # Segment-aware identity expert: it reads and writes the segmented
+            # slots, so combine -- which gathers wherever dispDestTokIdMap points,
+            # i.e. those same slots -- gets the full view, not a [:total] slice.
+            stage = op.combine_in_view()
+            if checked:
+                sd = seg[0].to(dev)
+                stage[sd] = op.recv_tokens()[sd].to(stage.dtype)
+            base = stage
         else:
             if checked:  # identity expert: stage the dispatched tokens unchanged
                 stage.copy_(op.recv_tokens()[:total].to(stage.dtype))

@@ -165,6 +165,8 @@ def main():
     )
     print(
         f"[rank {rank}] warps traced={live}  events={drained.numel()//2}  "
+        # MORI_EP_TOKOFF_EXT positive control: did the op bind the moved word?
+        f"tokoff_ext={getattr(op, 'tok_off_peers', None) is not None}  "
         f"recv={total}",
         flush=True,
     )
