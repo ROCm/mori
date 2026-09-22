@@ -55,6 +55,11 @@ def pair_events(path):
     open_at = defaultdict(list)
     seen = defaultdict(int)
     durs = defaultdict(list)
+    # Span is per (warp, round), NOT per warp: across several rounds a warp's first
+    # and last event are separated by the gaps between launches, which would report a
+    # "span" of the whole capture. A round begins each time the warp re-enters the
+    # phase it entered first, so that name delimits them.
+    head = {}
     first_last = {}
     for e in events:
         key = (e["tid"], e["name"])
@@ -65,9 +70,14 @@ def pair_events(path):
                 continue  # an END whose BEGIN was dropped by the ring wrapping
             durs[e["name"]].append((seen[key], e["ts"] - open_at[key].pop()))
             seen[key] += 1
-        lo, hi = first_last.get(e["tid"], (e["ts"], e["ts"]))
-        first_last[e["tid"]] = (min(lo, e["ts"]), max(hi, e["ts"]))
-    spans = {w: hi - lo for w, (lo, hi) in first_last.items()}
+        head.setdefault(e["tid"], e["name"])
+        rnd = seen[(e["tid"], head[e["tid"]])]
+        if e["ph"] == "B" and e["name"] == head[e["tid"]]:
+            rnd = seen[key]  # the BEGIN that opens this round, before its END counts it
+        span_key = (e["tid"], rnd)
+        lo, hi = first_last.get(span_key, (e["ts"], e["ts"]))
+        first_last[span_key] = (min(lo, e["ts"]), max(hi, e["ts"]))
+    spans = {k: hi - lo for k, (lo, hi) in first_last.items()}
     return durs, spans
 
 
@@ -108,7 +118,7 @@ def main():
                 durs[k].append(dur)
                 rounds[k][rnd].append(dur)
         for w, v in s.items():
-            spans[(i, w)] = v  # warp ids repeat across ranks; file index separates them
+            spans[(i, w)] = v  # w is (warp, round); file index separates ranks
 
     if not durs:
         sys.exit("no paired B/E events found")
@@ -123,8 +133,8 @@ def main():
     warps = len(spans)
     span_mean = sum(spans.values()) / warps if warps else 0.0
     print(
-        f"{len(a.traces)} file(s), {warps} warps, "
-        f"per-warp span mean {span_mean:.2f} us, p95 {pct(list(spans.values()), 0.95):.2f} us"
+        f"{len(a.traces)} file(s), {warps} warp-rounds, "
+        f"per-warp-round span mean {span_mean:.2f} us, p95 {pct(list(spans.values()), 0.95):.2f} us"
     )
     print(
         f"{'phase':14s} {'n':>6s} {'mean':>8s} {'p50':>8s} {'p95':>8s} "
