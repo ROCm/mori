@@ -315,12 +315,18 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // buffer is not a disabled profiler, it is a wild store. hip_backend allocates it
   // off the same ENABLE_PROFILER the JIT compiles with, and refuses to launch
   // otherwise, which is where that mismatch is caught.
+  //
+  // The variable has to be called `profiler`, as every caller in v1 also calls it.
+  // MORI_TRACE_SEQ/SPAN/INSTANT name their parameter `profiler` and spell their own
+  // types `mori::core::profiler::...`, so the preprocessor substitutes the namespace
+  // component too: any other name here silently rewrites the qualifier and the
+  // compiler reports the variable, not the macro. `profiler` makes that a no-op.
   IF_ENABLE_PROFILER(MORI_DECLARE_PROFILER_CONTEXT(
-      prof, EpDisp1250xSlot, mori::core::profiler::ProfilerContext,
+      profiler, EpDisp1250xSlot, mori::core::profiler::ProfilerContext,
       mori::core::profiler::ProfilerContext(
           mori::core::profiler::ProfilerConfig{args.profTimeBuf, args.profTimeOff}, globalWarpId,
           laneId)));
-  MORI_TRACE_SEQ(seq, prof);
+  MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, Slot::Setup);
 
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
