@@ -60,6 +60,7 @@ SENTINEL_PATTERN=""
 ROUNDS=""
 SPAWN=""
 NPROC_PER_NODE=1
+PASSTHROUGH=()
 ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
 while [[ $# -gt 0 ]]; do
@@ -83,7 +84,12 @@ while [[ $# -gt 0 ]]; do
     --entry)            ENTRY="$2";                 shift 2 ;;
     --rounds)           ROUNDS="$2";                shift 2 ;;
     --spawn)            SPAWN="$2";                 shift 2 ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    # Everything after `--` goes to the entry verbatim. The named flags above
+    # are the subset both entries share; an entry-specific one (the v2 tuning
+    # knobs, say) would otherwise need a line here and a rebuild of this parser
+    # every time an entry grows an argument.
+    --)                 shift; PASSTHROUGH=("$@");  break ;;
+    *) echo "Unknown option: $1 (use -- to forward entry-specific flags)"; exit 1 ;;
   esac
 done
 
@@ -126,4 +132,5 @@ exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \
   --cmd "$CMD" \
   --num-qp "$NUM_QP" \
   --max-tokens "$MAX_TOKENS" \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" \
+  "${PASSTHROUGH[@]}"

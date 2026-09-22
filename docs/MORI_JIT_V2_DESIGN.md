@@ -290,7 +290,8 @@ expert → combine 整步捕成一张图，replay 反复复现同一结果。能
 `EpDispatchCombineOp(cfg, comm)` 按 `cfg.kernel_backend`（或 `MORI_V2_KERNEL_BACKEND`，默认
 `flydsl`）选出子类；也可直接实例化 `EpDispatchCombineOpHip`，`isinstance` 对两者都成立。
 
-**父类拥有 op 本身**——`dispatch()`/`combine()`/`_pick`/视图/生命周期各只有一份。子类填三样：
+**父类拥有 op 本身**——`dispatch()`/`combine()`/视图/生命周期各只有一份。
+默认 `_pick()` 服务 FlyDSL；HIP 覆盖它以选择统一的 `KernelConfig`。子类提供：
 
 ```python
 _regions(cfg)               # 这个后端要哪些 arena region
@@ -338,14 +339,33 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 取值规则：**性能接近时取更小的几何**，因为少占 CU 在与专家 GEMM 重叠时是真收益。这类 3% 以内的取舍是
 **策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
 
-internode 再是第三张表 `internode_tuning_configs.py`，键是 `(device_key, world_size, hidden_dim, topk)`
-再按 dispatch 的 dtype 分档，值是一串 `(max_tok_inclusive|None, disp_block, disp_rdma, disp_warp,
-comb_block, comb_rdma, comb_warp)`。它和上面两张的差别在 `rdma_block_num`：这一维把 grid 切成 RDMA 一半和
-node 内一半，kernel 对它有分支，所以**一套 pass 序列是按几何整套编出来的**，而不是编一份、launch 时挑；
-`HipBackend._internode_geometry_buckets` 在构建期把整张表走一遍，运行时的解析因此永远不会触发编译。也因为
-dispatch 和 combine 在同一个 token 数、同一块 arena 上调到不同的 rdma/warp，一个 bucket 一套几何表达不了，
-表里每档都是**成对**的行——不要单独重调其中一相。唯一硬不变量还是 `block_num <= CU 数`，`lookup()` 会 clamp。
-目前只有 MI308X EP16 / hidden 6144 / topk 8 一行是实测过的。
+HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 backend 入口，返回统一的
+`ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R 的 `KernelConfig`。
+单机保留 Python 表和显式 `cfg.schedule`；跨机保留 JSON。
+`op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果；
+绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
+HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyDSL 表。
+
+跨机的数据解析中，`internode_schedule(cfg)` 合并查表结果、手动覆盖和 token 边界，
+`internode_buckets()` 读取单个 family 的规则，
+`lookup_internode()` 解析单个 token 数，`save_internode_result()` 保存调优结果，
+`internode_kernel_family()` 解析本次调用的 kernel family。JSON 的命名、加载、lookup 和合并保存复用
+`mori.ops.tuning_config`；`MORI_EP_V2_TUNING_DIR` 可指定 JSON 目录。原有 MI308X 的 Python 回退行仍保留。
+
+JSON 按 dispatch/combine 和 `InterNodeV2`/`InterNodeV2LL` 分文件，各相按**自身 dtype**查找：
+fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
+ceiling，最大一档也服务更大的 token 数；同一上界的 `experts_per_rank` 精确匹配行覆盖 wildcard。
+两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
+
+internode 几何增加了 `rdma_block_num`，把 grid 分成 RDMA 和 node 内两部分。
+`internode_schedule()` 在构建期合并两相和 family 的桶边界，每桶保留独立的 dispatch/combine 几何。
+`resolve_schedule()` 将 family 分界写入统一 schedule；backend 为可选的配置建立 callable，
+按 `(pass, geometry)` 复用 plan，按阶段和 family 的 pass 顺序建立 launch group。
+shape/dtype 决定编译特化；B/R/W 只影响 plan 的启动配置，相同源码可以共享编译缓存。
+运行时选中的配置直接索引到已绑定的 group callable，不会触发编译。
+表中参数限制 `block_num <= CU 数`；手动参数保留指定的 grid，所有路径都限制 `rdma_block_num < block_num`。具体调优用法见
+[包 README](../python/mori/ops/dispatch_combine_v2/README.md#internode-geometry-tuned-by-default)，
+实验及带宽记录见 [dispatch.md](../dispatch.md) 和 [bw.md](../bw.md)。
 
 ## 6. Python 绑定
 
@@ -488,7 +508,7 @@ kernel**——独立的 JIT 模块、入口符号和缓存 key，不是一个 bo
 | `test_graph_capture.py` | EP8 | dispatch → identity expert → combine 整步捕成一张图并 replay |
 | `test_asym_dtype.py` | EP8 | fp8/fp4 dispatch + bf16 combine |
 | `test_internode_regions.py` | 单进程，不建 op、不碰 GPU | internode arena：region 名与 `_internode_static_args` 的契约（两侧独立转写），以及 kernel 索引算术蕴含的容量上界 |
-| `test_dispatch_combine_v2_internode.py` | 2 节点 × 8 GPU（EP16），torchrun 起，`gpu_per_node < world_size` 才建得起来 | identity expert 对解析 golden 的逐 rank 正确性；`--cmd bench` 对齐 v1 harness 的计时循环，`--cmd tuning` 是 `internode_tuning_configs` 的配对式 sweep；`--kernel-type auto\|v2\|v2_ll` |
+| `test_dispatch_combine_v2_internode.py` | 2 节点 × 8 GPU（EP16），torchrun 起，`gpu_per_node < world_size` 才建得起来 | identity expert 对解析 golden 的逐 rank 正确性；`--cmd bench` 对齐 v1 harness 的计时循环，`--cmd tuning` 通过 `hip_tuning_configs` 的 internode API 做配对式 sweep；`--kernel-type auto\|v2\|v2_ll` |
 | `bench_ep.py` | EP4/EP8 | 性能 bench（各后端通用）；`DBN`/`DWPB`/`CBN`/`CWPB` 钉住几何即用于 `hip_tuning_configs` 调优 |
 
 `test_jit_binding.py` 在 CI 里**从 `/tmp` 跑**，不是从 checkout 跑：建一个 plan 需要

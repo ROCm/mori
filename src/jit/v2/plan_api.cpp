@@ -34,6 +34,7 @@
 #include <stdexcept>
 
 #include "mori/jit/v2/toolchain.hpp"
+#include "mori/utils/ionic_ccqe.hpp"
 
 namespace mori {
 namespace jit {
@@ -174,6 +175,20 @@ extern "C" {
 #define MORI_JIT_API __attribute__((visibility("default")))
 
 MORI_JIT_API const char* mori_jit_last_error() { return mori::jit::v2::PlanError(); }
+
+// Also used by the Python v1 compiler. This query deliberately does not resolve
+// the toolchain, touch a GPU, or import application/CCO into libmori_jit.
+MORI_JIT_API int mori_jit_ionic_ccqe_enabled() {
+  try {
+    return mori::utils::IonicCcqeEnabled() ? 1 : 0;
+  } catch (const std::exception& e) {
+    SetPlanError(e.what());
+    return -1;
+  } catch (...) {
+    SetPlanError("unknown failure while detecting Ionic CQ mode");
+    return -1;
+  }
+}
 
 MORI_JIT_API const char* mori_jit_plan_args_schema(const char* kernel) {
   try {

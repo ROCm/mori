@@ -37,11 +37,14 @@ gpu_per_node; there is no kernel_type enum on the v2 side):
   ``internode_regions`` arena and a device communicator: copystaging +
   dispatch for a round of dispatch, combinesync + combinesyncbarrier + combine
   + combineall for a round of combine. Gather only, bf16/fp32/fp8 on either
-  leg (no fp4). "v2" and "v2_ll" are two distinct kernel families rather than
+  leg, plus packed fp4 dispatch with bf16/fp32 combine. FP4 combine is not
+  supported. "v2" and "v2_ll" are two distinct kernel families rather than
   a runtime branch: ``cfg.internode_kernel`` (auto | v2 | v2_ll) says which are
   compiled, and only "auto" compiles both and chooses per launch, at
-  ``cfg.internode_auto_ll_max_tokens``. Geometry is a compile-time identity on this
-  path, so every bucket of ``internode_tuning_configs`` is built up front.
+  ``cfg.internode_auto_ll_max_tokens``. ``hip_tuning_configs.resolve_schedule``
+  resolves both paths to the same kernel configurations before plans are built.
+  Internode geometry changes reuse the compiled module; each plan retains its
+  own grid, block and RDMA split.
   No other backend implements internode.
 
 Imports ``ep_plans`` (the C++/JIT plans) but never flydsl, so it works where
@@ -50,13 +53,12 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
+from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import EpDispatchCombineOp, KernelSet
 from .internode_regions import internode_regions
 from .symm_arena import SymmArena
@@ -91,25 +93,6 @@ _DISPATCH_DTYPES = {
 _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
 # Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _SCALE_ALIGN = 128
-
-# Which tuning-table dtype column a dispatch dtype reads.
-_FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
-
-
-def _geometry_from_env(name):
-    """``"block,rdma,warp"`` from the environment, or None.
-
-    Sweep-only. Read at build time (see _internode_geometry_buckets): the
-    internode plans are compiled per geometry, so a geometry cannot be chosen at
-    launch and a sweep has to pin it before the op is constructed.
-    """
-    raw = os.environ.get(name)
-    if not raw:
-        return None
-    parts = tuple(int(x) for x in raw.replace(" ", "").split(","))
-    if len(parts) != 3:
-        raise ValueError(f"{name}={raw!r}: want three ints, block,rdma,warp")
-    return parts
 
 
 def _raw_stream(device_index: int) -> int:
@@ -196,7 +179,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dev = self.dev
         self.arena.zero()
 
-        self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
@@ -234,7 +216,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # never touches it -> left None (binds as 0).
         self.combine_barrier_fan = None
         if self._is1250:
-            max_comb_blocks = max(b for b, _ in self._combine_specs)
+            max_comb_blocks = max(spec.block_num for spec in self._combine_specs)
             if max_comb_blocks > _XDB_FLAG_SLOTS:
                 raise ValueError(
                     f"combine block_num {max_comb_blocks} exceeds the {_XDB_FLAG_SLOTS} "
@@ -379,9 +361,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # struct -- so passing the whole schema each time cost a ctypes field
         # write per field per launch. Binding leaves six.
         static_args = self._internode_static_args()
-        for plans_by_pass in self._internode_plans.values():
-            for plan in plans_by_pass.values():
-                plan.bind(**static_args)
+        for plan in self._plans:
+            plan.bind(**static_args)
 
     def _internode_unsupported(self, cfg) -> tuple[str, ...]:
         bad = []
@@ -397,6 +378,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"{leg} dtype {leg_dtype} has no internode kernel "
                     f"(have {', '.join(self._INTERNODE_DTYPE.values())})"
                 )
+        if cfg.combine_dtype == torch.float4_e2m1fn_x2:
+            bad.append("fp4 combine is not supported on the internode path")
+        elif cfg.dispatch_dtype == torch.float4_e2m1fn_x2 and cfg.combine_dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
+            bad.append(
+                "fp4 dispatch requires bf16 or fp32 combine on the internode path"
+            )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the internode kernels gather)")
         if cfg.enable_std_moe:
@@ -538,39 +528,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         torch.float32: "f32",
         torch.float8_e4m3fnuz: "fp8_fnuz",
         torch.float8_e4m3fn: "fp8_ocp",
+        torch.float4_e2m1fn_x2: "fp4",  # packed dispatch only; see _internode_unsupported
     }
 
-    # Which leg each pass belongs to. The two legs are separate Plans and carry
-    # DIFFERENT element types, exactly as the intranode path does: the kernel's
-    # `T` is "elements of this leg's dtype", and `hiddenBytes = hiddenDim *
-    # sizeof(T)` sizes the dispatch payload in one and the combine output in the
-    # other. Compiling all eight with the dispatch dtype is what made an fp8
-    # dispatch write hidden*sizeof(fp8) bytes where the bf16 combine_out view
-    # reads hidden*sizeof(bf16) -- half the output left as whatever was there.
-    _INTERNODE_LEG = {
-        "copystaging": "dispatch",
-        "dispatch": "dispatch",
-        "dispatch_ll": "dispatch",
-        "combinesync": "combine",
-        "combinesyncbarrier": "combine",
-        "combine": "combine",
-        "combine_ll": "combine",
-        "combineall": "combine",
-    }
-
-    # (phase, low_latency) -> the pass sequence, in launch order. Two for
-    # dispatch, four for combine; the LL and non-LL members of each pair are
-    # separate compiled entries rather than a runtime branch.
+    # Pass order is the single source for both plan construction and launch.
+    # Common passes share a plan across families at the same geometry.
     _INTERNODE_SEQ = {
-        ("dispatch", False): ("copystaging", "dispatch"),
-        ("dispatch", True): ("copystaging", "dispatch_ll"),
-        ("combine", False): (
+        ("dispatch", "v2"): ("copystaging", "dispatch"),
+        ("dispatch", "v2_ll"): ("copystaging", "dispatch_ll"),
+        ("combine", "v2"): (
             "combinesync",
             "combinesyncbarrier",
             "combine",
             "combineall",
         ),
-        ("combine", True): (
+        ("combine", "v2_ll"): (
             "combinesync",
             "combinesyncbarrier",
             "combine_ll",
@@ -581,9 +553,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _internode_request(
         self, cfg, dtype_tag, block_num, warp_per_block, rdma_block_num
     ):
+        # Each phase uses its own dtype. FP4 dispatch counts packed bytes,
+        # while combine and the shared arena keep the logical hidden dimension.
         return dict(
             worldSize=cfg.world_size,
-            hiddenDim=cfg.hidden_dim,
+            hiddenDim=cfg.hidden_dim // 2 if dtype_tag == "fp4" else cfg.hidden_dim,
             scaleDim=cfg.scale_dim,
             scaleTypeSize=cfg.scale_type_size,
             maxTokenTypeSize=cfg.max_token_type_size,
@@ -663,276 +637,64 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         return self._internode_static_cache
 
-    def _internode_variants(self, phase):
-        """The kernel names of `phase` this config needs compiled.
-
-        "v2" and "v2_ll" are separate JIT modules, so naming one in the config
-        compiles one; only "auto" needs both, because only "auto" chooses per
-        launch. Returned as a tuple so it can be concatenated with the passes
-        that are common to both.
-        """
-        kernel_family = self.cfg.internode_kernel
-        plain, low_latency = phase, phase + "_ll"
-        if kernel_family == "v2":
-            return (plain,)
-        if kernel_family == "v2_ll":
-            return (low_latency,)
-        return (plain, low_latency)
-
-    def _internode_use_ll(self, num_tokens):
-        """Which of the two families this launch runs.
-
-        Fixed by the config unless it is "auto", where the token count decides at
-        the configured crossover. An explicit choice cannot fall back: the other
-        family was never compiled.
-        """
-        kernel_family = self.cfg.internode_kernel
-        if kernel_family == "v2":
-            return False
-        if kernel_family == "v2_ll":
-            return True
-        return num_tokens <= self.cfg.internode_auto_ll_max_tokens
-
-    _PIN_FIELDS = {
-        "dispatch": (
-            "dispatch_block_num",
-            "dispatch_rdma_block_num",
-            "warp_num_per_block",
-        ),
-        "combine": (
-            "combine_block_num",
-            "combine_rdma_block_num",
-            "combine_warp_num_per_block",
-        ),
-    }
-
-    def _overlay_pinned_geometry(self, cfg, phase, geometry):
-        """Overlay the caller's pinned geometry on a tuned triple, field by field.
-
-        A pinned field is a manual override and beats the table; an unpinned one
-        keeps what the table chose. cfg._pinned_geometry is the caller's original
-        input -- by this point every field holds a number, because
-        _resolve_geometry() filled the unpinned ones with the untuned fallback.
-        """
-        pinned = getattr(cfg, "_pinned_geometry", frozenset())
-        return tuple(
-            getattr(cfg, name) if name in pinned else tuned_value
-            for name, tuned_value in zip(self._PIN_FIELDS[phase], geometry)
-        )
-
-    @staticmethod
-    def _fit_internode_geometry(geometry):
-        """Force rdma_block_num < block_num.
-
-        The kernel splits the grid: blocks below rdmaBlockNum take the RDMA leg,
-        the rest take the intra-node one. rdma >= block leaves the intra-node
-        half with no blocks AND makes the dispatch fan-in wait for
-        rdmaBlockNum * warpNum arrivals that can never happen -- every peer then
-        spins forever, with no host-side error. internode_tuning_configs.lookup()
-        clamps on the table-hit path; this is the choke point that covers the
-        env-pin and untuned paths too.
-        """
-        block, rdma, warp = geometry
-        return (block, min(rdma, max(1, block - 1)), warp)
-
-    def _internode_geometry_buckets(self, cfg):
-        return [
-            (
-                max_tokens,
-                self._fit_internode_geometry(dispatch_geometry),
-                self._fit_internode_geometry(combine_geometry),
-            )
-            for max_tokens, dispatch_geometry, combine_geometry in (
-                self._internode_geometry_buckets_raw(cfg)
-            )
-        ]
-
-    def _internode_geometry_buckets_raw(self, cfg):
-        """``[(max_tokens | None, dispatch_geometry, combine_geometry)]``, coarsest
-        last.
-
-        Compilation happens at build time, so every geometry a launch could pick
-        has to be known now -- which is why this returns the whole schedule and
-        not just the one for the current token count. Same rule as the intranode
-        schedule: `_pick` must never be able to trigger a compile.
-
-        The table keeps dispatch and combine on DIFFERENT rdma/warp values for the
-        same token count, which a single geometry per bucket cannot express; that
-        is why a bucket carries two triples rather than one.
-        """
-        from .internode_tuning_configs import _TABLE, _device_key, lookup
-
-        # Sweep hook: pin one geometry for every token count, bypassing the table.
-        # A geometry is a compile-time identity here, so a sweep cannot select one
-        # at launch the way the intranode path can -- it has to be fixed before
-        # the plans are built, which is before the op exists. Hence an env var
-        # rather than a CLI flag threaded through the config.
-        pinned_dispatch = _geometry_from_env("MORI_EP_DISP_GEOM")
-        pinned_combine = _geometry_from_env("MORI_EP_COMB_GEOM")
-        if pinned_dispatch or pinned_combine:
-            config_dispatch = (
-                cfg.dispatch_block_num,
-                cfg.dispatch_rdma_block_num,
-                cfg.warp_num_per_block,
-            )
-            config_combine = (
-                cfg.combine_block_num,
-                cfg.combine_rdma_block_num,
-                cfg.combine_warp_num_per_block,
-            )
-            return [
-                (
-                    None,
-                    pinned_dispatch or config_dispatch,
-                    pinned_combine or config_combine,
-                )
-            ]
-
-        dtype = "fp8" if cfg.dispatch_dtype in _FP8_TUNING_DTYPES else "bf16"
-        key = (_device_key(), cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token)
-        entry = _TABLE.get(key)
-        if not entry:
-            # Untuned shape: one bucket, whatever the config resolved to.
-            return [
-                (
-                    None,
-                    (
-                        cfg.dispatch_block_num,
-                        cfg.dispatch_rdma_block_num,
-                        cfg.warp_num_per_block,
-                    ),
-                    (
-                        cfg.combine_block_num,
-                        cfg.combine_rdma_block_num,
-                        cfg.combine_warp_num_per_block,
-                    ),
-                )
-            ]
-        schedule = entry.get(dtype) or entry.get("fp8")
-        buckets = []
-        for row in schedule:
-            max_tokens = row[0]
-            geometry = lookup(
-                cfg.world_size,
-                cfg.hidden_dim,
-                cfg.num_experts_per_token,
-                max_tokens if max_tokens is not None else 1 << 30,
-                dtype=dtype,
-            )
-            buckets.append(
-                (
-                    max_tokens,
-                    self._overlay_pinned_geometry(
-                        cfg, "dispatch", geometry["dispatch"]
-                    ),
-                    self._overlay_pinned_geometry(cfg, "combine", geometry["combine"]),
-                )
-            )
-        return buckets
-
     def _build_internode_kernels(self, cfg) -> KernelSet:
-        # One tag per leg, not one for the op: see _INTERNODE_LEG. Both keys are
-        # present -- _internode_unsupported rejected the config otherwise.
-        leg_dtype = {
-            "dispatch": self._INTERNODE_DTYPE[cfg.dispatch_dtype],
-            "combine": self._INTERNODE_DTYPE[cfg.combine_dtype],
-        }
-
-        self._internode_buckets = self._internode_geometry_buckets(cfg)
-        self._plans = []
-        # Keyed by the geometry triple so two buckets that resolve to the same
-        # geometry share one compile -- the shipped table does exactly that for
-        # tokens 4 and 8.
-        self._internode_plans = {}
-        # Collect the passes each geometry has to serve BEFORE building any, and
-        # union them: a geometry is not owned by one phase. The shipped table
-        # gives tokens 16 the same triple for dispatch and combine, so keying on
-        # the triple alone and skipping an already-present one leaves that
-        # geometry holding only whichever phase was seen first -- a KeyError on
-        # the other phase's first launch, at run time, not build time.
-        passes_by_geometry = {}
-        for _, dispatch_geometry, combine_geometry in self._internode_buckets:
-            for geometry, names in (
-                (
-                    dispatch_geometry,
-                    ("copystaging",) + self._internode_variants("dispatch"),
-                ),
-                (
-                    combine_geometry,
-                    ("combinesync", "combinesyncbarrier")
-                    + self._internode_variants("combine")
-                    + ("combineall",),
-                ),
-            ):
-                passes_by_geometry.setdefault(geometry, set()).update(names)
-        for geometry, names in passes_by_geometry.items():
-            block, rdma, warp = geometry
-            plans_by_pass = {}
-            for pass_name in sorted(names):
-                request = self._internode_request(
-                    cfg, leg_dtype[self._INTERNODE_LEG[pass_name]], block, warp, rdma
-                )
-                plans_by_pass[pass_name] = cb.EP_INTERNODE_PLANS[pass_name](**request)
-                # Two launch arguments that never vary for THIS plan, so they
-                # belong on the plan rather than in every launch's dict:
-                #   rdmaBlockNum  a plan is compiled per geometry and lives in
-                #                 exactly one `_internode_plans[geometry]`, so the
-                #                 value a launch could pass is always geometry[1].
-                #   replayMode    this backend has no replay path (KernelSet
-                #                 carries dispatch_replay=None); it is always 0.
-                # bind() stores ints in the plan's cached struct, and _launch_buf
-                # re-writes only the per-call names and the non-int defaults --
-                # so a bound int is written once at bind time and never again,
-                # while a passed one costs a _set_arg every launch (~1.2us each,
-                # x2 args x2 launches per round).
-                plans_by_pass[pass_name].bind(rdmaBlockNum=rdma, replayMode=0)
-            self._internode_plans[geometry] = plans_by_pass
-            self._plans.extend(plans_by_pass.values())
-
-        # One bound launch group per (geometry, phase, low-latency). The set of
-        # plans a launch fires is fixed by that triple, so the validation and the
-        # ctypes handle array belong here rather than on the launch path. A
-        # geometry only carries the passes it actually serves, hence the subset
-        # test -- the shipped table gives dispatch and combine the same triple at
-        # 16 tokens but different ones elsewhere.
         from mori.jit.v2 import plan_api
 
-        self._internode_groups = {}
-        for geometry, plans_by_pass in self._internode_plans.items():
-            for sequence_key, names in self._INTERNODE_SEQ.items():
-                if all(name in plans_by_pass for name in names):
-                    self._internode_groups[(geometry, sequence_key)] = (
-                        plan_api.make_launch_group(
-                            [plans_by_pass[name] for name in names]
-                        )
+        plans = {}
+        kernels = {"dispatch": {}, "combine": {}}
+        for phase, dtype, specs in (
+            ("dispatch", cfg.dispatch_dtype, self._dispatch_specs),
+            ("combine", cfg.combine_dtype, self._combine_specs),
+        ):
+            for spec in specs:
+                request = self._internode_request(
+                    cfg,
+                    self._INTERNODE_DTYPE[dtype],
+                    spec.block_num,
+                    spec.warp_per_block,
+                    spec.rdma_block_num,
+                )
+                group_plans = []
+                for pass_name in self._INTERNODE_SEQ[phase, spec.family]:
+                    # Common passes share a plan across families at one geometry.
+                    key = (
+                        pass_name,
+                        spec.block_num,
+                        spec.warp_per_block,
+                        spec.rdma_block_num,
                     )
+                    if key not in plans:
+                        plan = cb.EP_INTERNODE_PLANS[pass_name](**request)
+                        self._plans.append(plan)
+                        plan.bind(rdmaBlockNum=spec.rdma_block_num, replayMode=0)
+                        plans[key] = plan
+                    group_plans.append(plans[key])
+                group = plan_api.make_launch_group(group_plans)
+                kernels[phase][spec] = self._wrap_internode(phase, group)
 
-        dispatch_spec = (cfg.dispatch_block_num, cfg.warp_num_per_block)
-        combine_spec = (cfg.combine_block_num, cfg.combine_warp_num_per_block)
         return KernelSet(
-            dispatch={dispatch_spec: self._wrap_internode("dispatch")},
-            combine={combine_spec: self._wrap_internode("combine")},
+            dispatch=kernels["dispatch"],
+            combine=kernels["combine"],
             dispatch_replay=None,
             stages_in_kernel=True,
-            # copystaging zeroes total_recv as its first act, so the host does not
-            # have to -- that zero_() was a fill kernel enqueued ahead of the
-            # dispatch sequence, delaying the kernels it protected.
+            # CopyToStaging resets total_recv; avoid a separate reset kernel.
             self_resets_counters=True,
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
-    def _internode_geom_for(self, phase, num_tokens):
-        """The tuned geometry for this token count. Buckets are ordered, coarsest
-        last, and a schedule with no None sentinel falls back to the last one --
-        exactly as `_pick` walks the intranode schedule."""
-        bucket = self._internode_buckets[-1]
-        for row in self._internode_buckets:
-            if row[0] is None or num_tokens <= row[0]:
-                bucket = row
-                break
-        return bucket[1] if phase == "dispatch" else bucket[2]
+    def kernel_config(self, num_tokens) -> tuning.ScheduleEntry:
+        """Selected HIP configurations for both phases, using this call's tokens.
 
-    def _wrap_internode(self, phase):
+        This reads the schedule prepared at construction: no table reload,
+        compilation or device query. Both intra and inter use this same path.
+        """
+        return tuning.pick_bucket(self._schedule, num_tokens)
+
+    def _pick(self, num_tokens):
+        selected = self.kernel_config(num_tokens)
+        return selected.dispatch, selected.combine
+
+    def _wrap_internode(self, phase, group):
         """One ABI crossing for the whole pass sequence.
 
         Every pass shares the schema and the same filled struct, so the arguments
@@ -941,33 +703,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
 
         def run(*, input, num_tokens, dest_map, **kwargs):
-            use_low_latency = self._internode_use_ll(num_tokens)
-            geometry = self._internode_geom_for(phase, num_tokens)
-            group = self._internode_groups[(geometry, (phase, use_low_latency))]
-
-            # Two of the kernel's arguments are set by dispatch and READ AGAIN by
-            # combine, but the base only hands them to dispatch -- combine's
-            # signature carries no indices and treats `weights` as a request
-            # rather than an input. v1 does not notice because its handle keeps
-            # both across the pair; here they have to be remembered explicitly.
-            #
-            #   tokenIndices  EpCombineAll dereferences it unconditionally
-            #                 (args.tokenIndices[tokenId * topk + laneId]), so a
-            #                 null is a fault, not a skipped branch.
-            #   weightsBuf    it is a DIFFERENT tensor in each phase, and its
-            #                 NULLNESS is the kernel's only gate on the fold. It
-            #                 also sets `combXferBytes = hidden + (weights ? wt :
-            #                 0)`, but only the four combine passes index that, so
-            #                 the phases need not agree on null-ness.
-            #
-            # Dispatch's weightsBuf is the caller's per-input-token weights and is
-            # indexed by source token id. Combine's is indexed by RECEIVED token
-            # id (`CombineSync` stages `weightsBuf + tokenId * topk` for tokenId in
-            # [0, totalRecvTokenNum)), so it must be the weights dispatch just
-            # delivered -- the `dispatch_out_weights` region, which is exactly the
-            # `dispatch_weights` output v1's callers hand back to `combine()`.
-            # Passing the input weights here does not fault: it folds the right
-            # number of node slots holding other tokens' weights.
+            # Combine reuses dispatch's indices and folds the RECEIVED weights
+            # from the arena. The input weights are indexed by source token and
+            # cannot serve as combine's weights buffer.
             if phase == "dispatch":
                 weights, indices = kwargs.get("weights"), kwargs.get("indices")
                 self._internode_has_weights = weights is not None
@@ -993,10 +731,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             held_indices = getattr(self, "_internode_indices", None)
             indices_ptr = 0 if held_indices is None else held_indices.data_ptr()
 
-            # Only what varies. The rest is bound on the plan; see
-            # _build_internode_kernels -- rdmaBlockNum and replayMode used to be
-            # passed here and are bound there now, since neither can differ
-            # between two launches that reach the same plan.
+            # Static pointers, rdmaBlockNum and replayMode are already bound.
             args = dict(
                 curRankNumToken=num_tokens,
                 dispDestTokIdMap=dest_map.data_ptr(),
@@ -1015,13 +750,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _build_kernels(self, cfg, arena) -> KernelSet:
         bad = self._unsupported(cfg)
-        if not bad and cfg.is_internode:
-            return self._build_internode_kernels(cfg)
         if bad:
-            # Build nothing when the config is out of range: constructing a Plan
-            # compiles, and compiling a kernel we are about to reject is both
-            # slow and misleading.
             return KernelSet(dispatch={}, combine={}, unsupported=bad)
+
+        self._schedule = tuning.resolve_schedule(cfg)
+        self._dispatch_specs = tuple(
+            dict.fromkeys(row.dispatch for row in self._schedule)
+        )
+        self._combine_specs = tuple(
+            dict.fromkeys(row.combine for row in self._schedule)
+        )
+        self._plans = []
+        if cfg.is_internode:
+            return self._build_internode_kernels(cfg)
 
         common = dict(
             world_size=cfg.world_size,
@@ -1048,19 +789,26 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
-        self._plans = []
-        for b, w in self._dispatch_specs:
+        for spec in self._dispatch_specs:
             plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w
+                **common,
+                **disp_cfg,
+                block_num=spec.block_num,
+                warp_per_block=spec.warp_per_block,
             )
-            plan.bind(rank=cfg.rank)
             self._plans.append(plan)
-            dispatch[(b, w)] = self._wrap_dispatch(plan)
-        for b, w in self._combine_specs:
-            plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
+            dispatch[spec] = self._wrap_dispatch(plan)
+        for spec in self._combine_specs:
+            plan = cb.EpCombinePlan(
+                **common,
+                **comb_cfg,
+                block_num=spec.block_num,
+                warp_per_block=spec.warp_per_block,
+            )
             self._plans.append(plan)
-            combine[(b, w)] = self._wrap_combine(plan)
+            plan.bind(rank=cfg.rank)
+            combine[spec] = self._wrap_combine(plan)
 
         return KernelSet(
             dispatch=dispatch,

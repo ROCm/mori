@@ -1057,6 +1057,7 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
+    "ops/dispatch_combine_v2/tuning_configs/*.json",
     "tools/*.sh",
     "tools/mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)

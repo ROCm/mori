@@ -19,29 +19,18 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Launch-geometry tuning for the HIP/JIT EP kernels — separate from FlyDSL's.
+"""HIP V2 configuration: resolve_schedule(cfg) -> ScheduleEntry rows.
 
-Different kernels, different optima, so never borrow FlyDSL's schedule. This module
-does not import ``tuning_configs``; it shares only ``mori.ops.utils`` for device
-detection.
-
-Dispatch and combine get INDEPENDENT tables: dispatch depends on the dtype it
-transports, combine does not (it only ever reduces the bf16/fp32 staging region).
-Both are keyed by (world_size, hidden_dim, topk, experts_per_rank); an
-``experts_per_rank`` of None is a wildcard, used only where a sweep showed the expert
-count does not move the optimum. A bucket is (max_tok_inclusive | None, block, warp),
-ascending, and ``lookup`` merges the two into the op's
-(max_tok, disp_block, disp_warp, comb_block, comb_warp) schedule.
-
-An unswept shape returns schedule=None and the single-shot default below. Add one by
-sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
-
-dtype keys are whatever ``EpDispatchCombineConfig.dtype_str`` produces, hence
-"fp4_disp_bf16_comb": hip rejects an fp4 combine outright, so an fp4 dispatch here is
-always paired with bf16 -- which is the configuration the sweep measured.
+Both paths use KernelConfig keys and pick_bucket() with inclusive token ceilings.
+The data sources retain their existing formats: intra lookup() uses Python
+tables; internode_buckets() reads JSON through mori.ops.tuning_config.
 """
 
 from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import NamedTuple
 
 from mori.ops import utils as _gpu
 
@@ -167,6 +156,87 @@ def _bucket_key(table, world_size, hidden_dim, topk, experts_per_rank):
     return None
 
 
+def pick_bucket(buckets, num_tokens):
+    """Pick an inclusive ceiling, clamping above the last bucket.
+
+    A None bound is open-ended; a None query requests the terminal bucket.
+    Empty tables return None so callers can apply their own fallback policy.
+    """
+    for row in buckets:
+        if row[0] is None or (num_tokens is not None and num_tokens <= row[0]):
+            return row
+    return buckets[-1] if buckets else None
+
+
+class KernelConfig(NamedTuple):
+    """One HIP kernel choice; intra has no RDMA split."""
+
+    family: str
+    block_num: int
+    warp_per_block: int
+    rdma_block_num: int | None = None
+
+
+class ScheduleEntry(NamedTuple):
+    max_tokens: int | None
+    dispatch: KernelConfig
+    combine: KernelConfig
+
+
+def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
+    """The HIP V2 schedule consumed by both construction and token selection.
+
+    Intra adapts the Python-table/explicit schedule resolved by Config. Inter
+    resolves JSON and overrides, then includes the family crossover in the
+    schedule. Loading and selection never depend on the declared token capacity.
+    """
+    if not cfg.is_internode:
+        rows = cfg.schedule or (
+            (
+                None,
+                cfg.dispatch_block_num,
+                cfg.warp_num_per_block,
+                cfg.combine_block_num,
+                cfg.combine_warp_num_per_block,
+            ),
+        )
+        return tuple(
+            ScheduleEntry(
+                ceiling, KernelConfig("intra", db, dw), KernelConfig("intra", cb, cw)
+            )
+            for ceiling, db, dw, cb, cw in rows
+        )
+
+    geometries = internode_schedule(cfg)
+    edges = {row[0] for row in geometries if row[0] is not None}
+    if cfg.internode_kernel == "auto":
+        # Keep a zero-token LL entry when the crossover is zero, too.
+        edges.add(cfg.internode_auto_ll_max_tokens)
+    entries = []
+    for ceiling in [*sorted(edges), None]:
+        probe = ceiling if ceiling is not None else max(edges, default=0) + 1
+        family = internode_kernel_family(cfg, probe)
+        _, dispatch, combine = pick_bucket(geometries, probe)
+        entries.append(
+            ScheduleEntry(
+                ceiling,
+                KernelConfig(
+                    family,
+                    block_num=dispatch[0],
+                    warp_per_block=dispatch[2],
+                    rdma_block_num=dispatch[1],
+                ),
+                KernelConfig(
+                    family,
+                    block_num=combine[0],
+                    warp_per_block=combine[2],
+                    rdma_block_num=combine[1],
+                ),
+            )
+        )
+    return tuple(entries)
+
+
 def _merge(disp, comb):
     """Interleave two independent bucket lists into the op's one schedule.
 
@@ -178,13 +248,10 @@ def _merge(disp, comb):
         | {b[0] for b in comb if b[0] is not None}
     ) + [None]
 
-    def pick(buckets, edge):
-        for mx, blk, wrp in buckets:
-            if mx is None or (edge is not None and edge <= mx):
-                return blk, wrp
-        return buckets[-1][1], buckets[-1][2]
-
-    return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
+    return tuple(
+        (edge,) + pick_bucket(disp, edge)[1:] + pick_bucket(comb, edge)[1:]
+        for edge in edges
+    )
 
 
 def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) -> dict:
@@ -210,3 +277,319 @@ def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) ->
         return base
     base["schedule"] = _merge(disp, comb)
     return base
+
+
+_INTERNODE_TABLE_DIR = Path(__file__).parent / "tuning_configs"
+_INTERNODE_KERNEL_TYPES = {"v2": "InterNodeV2", "v2_ll": "InterNodeV2LL"}
+_INTERNODE_PHASES = ("dispatch", "combine")
+_INTERNODE_GEOMETRY_FIELDS = (
+    ("dispatch_block_num", "dispatch_rdma_block_num", "warp_num_per_block"),
+    ("combine_block_num", "combine_rdma_block_num", "combine_warp_num_per_block"),
+)
+
+# Legacy MI308X FP8-dispatch/BF16-combine measurements. Preserve the historical
+# fallback across dtypes and families when JSON has no rules for the shape.
+# Rows: token ceiling, dispatch B/R/W, combine B/R/W.
+_LEGACY_INTERNODE_TABLE = {
+    ("mi308x", 16, 6144, 8): (
+        (4, 32, 16, 4, 32, 21, 6),
+        (8, 64, 32, 8, 32, 21, 6),
+        (16, 80, 40, 4, 80, 40, 4),
+        (None, 80, 48, 8, 64, 48, 6),
+    ),
+    ("mi308x", 16, 7168, 8): (
+        (4, 64, 42, 8, 32, 16, 16),
+        (8, 32, 21, 16, 32, 16, 4),
+        (16, 80, 40, 4, 80, 40, 4),
+        (None, 80, 48, 8, 64, 48, 6),
+    ),
+}
+
+
+def internode_kernel_family(cfg, num_tokens):
+    """Resolve auto using live tokens, independently of the declared capacity."""
+    if cfg.internode_kernel != "auto":
+        return cfg.internode_kernel
+    return "v2_ll" if num_tokens <= cfg.internode_auto_ll_max_tokens else "v2"
+
+
+def internode_kernel_families(cfg):
+    """Families to prepare before launch; only auto needs both."""
+    return (
+        ("v2", "v2_ll") if cfg.internode_kernel == "auto" else (cfg.internode_kernel,)
+    )
+
+
+def fit_internode_geometry(geometry, *, clamp_to_cu=False):
+    """Leave at least one intra-node block; optionally cap tuned grids to CUs."""
+    if geometry is None:
+        return None
+    block, rdma, warp = geometry
+    if clamp_to_cu:
+        block = min(block, _gpu.cu_count() or 80)
+    return (block, min(rdma, max(1, block - 1)), warp)
+
+
+def _geometry_from_env(name):
+    """Optional sweep override, read once when the op is built: B,R,W."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    geometry = tuple(int(x) for x in raw.replace(" ", "").split(","))
+    if len(geometry) != 3:
+        raise ValueError(f"{name}={raw!r}: want three ints, block,rdma,warp")
+    return geometry
+
+
+def internode_schedule(cfg):
+    """Resolve (inclusive token ceiling, dispatch B/R/W, combine B/R/W).
+
+    Either sweep env override bypasses both tables. Otherwise explicit config
+    fields override the selected family's table, with config defaults for an
+    untuned phase. Only table values are CU-clamped; all paths keep R < B.
+    """
+    defaults = [
+        tuple(getattr(cfg, name) for name in fields)
+        for fields in _INTERNODE_GEOMETRY_FIELDS
+    ]
+    overrides = [
+        _geometry_from_env("MORI_EP_DISP_GEOM"),
+        _geometry_from_env("MORI_EP_COMB_GEOM"),
+    ]
+    if any(overrides):
+        return [
+            (
+                None,
+                *(fit_internode_geometry(g or d) for g, d in zip(overrides, defaults)),
+            )
+        ]
+
+    tables = {
+        family: internode_buckets(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            cfg.dispatch_dtype,
+            cfg.combine_dtype,
+            kernel_family=family,
+            experts_per_rank=cfg.num_experts_per_rank,
+        )
+        or []
+        for family in internode_kernel_families(cfg)
+    }
+    edges = {row[0] for table in tables.values() for row in table if row[0] is not None}
+    if cfg.internode_kernel == "auto" and cfg.internode_auto_ll_max_tokens >= 1:
+        edges.add(cfg.internode_auto_ll_max_tokens)
+
+    pinned = getattr(cfg, "_pinned_geometry", frozenset())
+    rows = []
+    for ceiling in [*sorted(edges), None]:
+        # The terminal bucket uses the family selected past every finite edge.
+        probe = ceiling if ceiling is not None else max(edges, default=0) + 1
+        family = internode_kernel_family(cfg, probe)
+        tuned = pick_bucket(tables[family], probe)
+        geometries = []
+        for index, (fields, fallback) in enumerate(
+            zip(_INTERNODE_GEOMETRY_FIELDS, defaults), start=1
+        ):
+            geometry = tuned[index] if tuned and tuned[index] else fallback
+            geometry = tuple(
+                getattr(cfg, name) if name in pinned else value
+                for name, value in zip(fields, geometry)
+            )
+            geometries.append(fit_internode_geometry(geometry))
+        row = (ceiling, *geometries)
+        # Equal geometry can span a crossover here. resolve_schedule() restores
+        # the family boundary when producing the executable configurations.
+        if rows and rows[-1][1:] == row[1:]:
+            rows[-1] = row
+        else:
+            rows.append(row)
+    return rows
+
+
+def internode_table_dir():
+    """V2's explicit directory also isolates it from MORI_EP_TUNING_CONFIG."""
+    return Path(os.environ.get("MORI_EP_V2_TUNING_DIR") or _INTERNODE_TABLE_DIR)
+
+
+def _legacy_internode_buckets(world_size, hidden_dim, topk):
+    schedule = _LEGACY_INTERNODE_TABLE.get(
+        (_gpu.detect_model(), world_size, hidden_dim, topk)
+    )
+    if not schedule:
+        return None
+    return [
+        (
+            row[0],
+            fit_internode_geometry(row[1:4], clamp_to_cu=True),
+            fit_internode_geometry(row[4:7], clamp_to_cu=True),
+        )
+        for row in schedule
+    ]
+
+
+def internode_buckets(
+    world_size,
+    hidden_dim,
+    topk,
+    dispatch_dtype,
+    combine_dtype=None,
+    kernel_family="v2",
+    experts_per_rank=None,
+):
+    """Return (token ceiling, dispatch geometry, combine geometry) rows.
+
+    Each phase matches its own dtype. Exact expert counts override wildcards
+    only at the same token ceiling; other ceilings keep their wildcard rows.
+    An untuned phase is None, and a wholly untuned shape returns None.
+    """
+    from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR, TuningConfigManager
+
+    kernel_type = _INTERNODE_KERNEL_TYPES.get(kernel_family)
+    if kernel_type is None:
+        return None
+    model, arch = _gpu.detect_model(), _gpu.arch_name()
+    if model is None or arch is None:
+        return _legacy_internode_buckets(world_size, hidden_dim, topk)
+    manager = TuningConfigManager.get_instance(
+        arch, kernel_type, world_size, model, directory=internode_table_dir()
+    )
+    dtypes = {
+        "dispatch": dispatch_dtype,
+        "combine": combine_dtype if combine_dtype is not None else dispatch_dtype,
+    }
+    phase_rules = {
+        "dispatch": manager.dispatch_rules,
+        "combine": manager.combine_rules,
+    }
+    edges, matched = set(), {}
+    for phase, rules in phase_rules.items():
+        dtype_str = DTYPE_TO_CONFIG_STR.get(dtypes[phase])
+        # The shared loader permits broader shape fallback. Restrict its input
+        # here so internode never borrows another hidden dimension or top-k.
+        rules = [
+            rule
+            for rule in rules
+            if rule["dtype"] == dtype_str
+            and rule["hidden_dim"] == hidden_dim
+            and rule.get("topk") in (None, topk)
+            and (
+                experts_per_rank is None
+                or rule.get("experts_per_rank") in (None, experts_per_rank)
+            )
+        ]
+        exact = {
+            rule["num_tokens"]
+            for rule in rules
+            if rule.get("experts_per_rank") is not None
+        }
+        matched[phase] = [
+            rule
+            for rule in rules
+            if rule.get("experts_per_rank") is not None
+            or rule["num_tokens"] not in exact
+        ]
+        edges.update(rule["num_tokens"] for rule in matched[phase])
+    if not edges:
+        return _legacy_internode_buckets(world_size, hidden_dim, topk)
+
+    table = []
+    for num_tokens in sorted(edges):
+        geometries = []
+        for phase in _INTERNODE_PHASES:
+            filters = (
+                {"zero_copy": False, "quant_type": "none"} if phase == "combine" else {}
+            )
+            params = TuningConfigManager.lookup(
+                matched[phase],
+                dtype=dtypes[phase],
+                num_tokens=num_tokens,
+                hidden_dim=hidden_dim,
+                topk=topk,
+                **filters,
+            )
+            geometry = (
+                (params.block_num, params.rdma_block_num, params.warp_per_block)
+                if params is not None
+                else None
+            )
+            geometries.append(fit_internode_geometry(geometry, clamp_to_cu=True))
+        table.append((num_tokens, *geometries))
+    return table
+
+
+def lookup_internode(
+    world_size,
+    hidden_dim,
+    topk,
+    num_tokens,
+    dispatch_dtype,
+    combine_dtype=None,
+    kernel_family="v2",
+    experts_per_rank=None,
+):
+    """Resolve one token count; backend construction uses internode_buckets."""
+    table = internode_buckets(
+        world_size,
+        hidden_dim,
+        topk,
+        dispatch_dtype,
+        combine_dtype,
+        kernel_family,
+        experts_per_rank,
+    )
+    row = pick_bucket(table, num_tokens) if table else None
+    if row is None or (row[1] is None and row[2] is None):
+        return None
+    return {"dispatch": row[1], "combine": row[2]}
+
+
+def save_internode_result(
+    world_size,
+    phase,
+    entry,
+    *,
+    kernel_family="v2",
+    directory=None,
+    path=None,
+):
+    """Merge one phase's rule with the shared JSON writer and invalidate cache."""
+    from mori.ops.tuning_config import TuningConfigManager, build_config_filename
+
+    if phase not in _INTERNODE_PHASES:
+        raise ValueError(f"phase must be one of {_INTERNODE_PHASES}, got {phase!r}")
+    kernel_type = _INTERNODE_KERNEL_TYPES.get(kernel_family)
+    if kernel_type is None:
+        raise ValueError(f"unsupported internode kernel family: {kernel_family!r}")
+    model, arch = _gpu.detect_model(), _gpu.arch_name()
+    if path is None:
+        if model is None or arch is None:
+            raise RuntimeError(
+                "cannot save internode tuning for an unknown GPU; pass an explicit path"
+            )
+        path = Path(directory or internode_table_dir()) / build_config_filename(
+            arch, kernel_type, world_size, model, phase
+        )
+    else:
+        path = Path(path)
+    entry = dict(entry)
+    if phase == "combine":
+        entry.setdefault("zero_copy", False)
+        entry.setdefault("quant_type", "none")
+    TuningConfigManager.save_tuning_result(
+        path,
+        dict(
+            gpu_arch=arch,
+            gpu_model=model,
+            kernel_type=kernel_type,
+            ep_size=world_size,
+            phase=phase,
+        ),
+        entry,
+        phase=phase,
+    )
+    # Container sweeps may run as root; keep their output readable on the host.
+    os.chmod(path, 0o644)
+    TuningConfigManager._cache.clear()
+    return path
