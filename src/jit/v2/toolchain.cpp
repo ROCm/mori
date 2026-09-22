@@ -114,8 +114,7 @@ std::vector<std::string> Toolchain::Flags() const {
       }
       if (tok.rfind("-Wp,", 0) == 0) {
         std::istringstream stream(tok.substr(4));
-        for (std::string part; std::getline(stream, part, ',');)
-          preprocessorArgs.push_back(part);
+        for (std::string part; std::getline(stream, part, ',');) preprocessorArgs.push_back(part);
       } else {
         driverArgs.push_back(tok);
       }
