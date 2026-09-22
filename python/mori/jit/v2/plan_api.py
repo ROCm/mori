@@ -276,6 +276,29 @@ def _error() -> str:
     return msg.decode(errors="replace") if msg else "unknown error"
 
 
+def ionic_ccqe_enabled() -> bool:
+    """The host CQ policy, without resolving the toolchain or initializing HIP.
+
+    Bind lazily so an older library can still serve unrelated APIs. Requesting
+    this policy with an old library must fail clearly, rather than guessing a
+    CQ protocol that can leave a GPU polling forever.
+    """
+    lib = _load()
+    try:
+        query = lib.mori_jit_ionic_ccqe_enabled
+    except AttributeError as exc:
+        raise RuntimeError(
+            "libmori_jit.so lacks shared Ionic CQ-mode detection; rebuild or reinstall "
+            "matching MORI Python and native libraries"
+        ) from exc
+    query.restype = ctypes.c_int
+    query.argtypes = []
+    result = query()
+    if result < 0:
+        raise RuntimeError(f"Ionic CQ-mode detection failed: {_error()}")
+    return bool(result)
+
+
 def registered_plans() -> list[str]:
     raw = _load().mori_jit_registered_plans()
     return [s for s in (raw or b"").decode().split(",") if s]
