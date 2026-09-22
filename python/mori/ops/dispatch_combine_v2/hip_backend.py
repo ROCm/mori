@@ -147,7 +147,7 @@ _XDB_FLAG_SLOTS = 256
 
 
 class _TokOffExt:
-    """MORI_EP_TOKOFF_EXT: dispatch's slot allocator word outside the cco window.
+    """Dispatch's slot allocator word outside the cco window (always on, gfx1250).
 
     One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
     opened on every peer by IPC handle. ``peers`` is the device array of
@@ -172,7 +172,7 @@ class _TokOffExt:
 
         if not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError(
-                "MORI_EP_TOKOFF_EXT exchanges IPC handles over torch.distributed; "
+                "tokoff-ext exchanges IPC handles over torch.distributed; "
                 "initialise a process group first"
             )
 
@@ -321,17 +321,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._null_flat = cfg.world_size * cfg.effective_max_recv
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
         self.dest_pe_counter = torch.zeros(cfg.world_size, **i32)
-        # MORI_EP_TOKOFF_EXT=1: dispatch's slot allocator word lives in IPC-shared
-        # hipExtMallocWithFlags memory instead of the cco window (see _TokOffExt).
-        # gfx1250 intranode only -- the only kernel that reads tokOffPeers.
+        # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
+        # memory instead of the cco window (see _TokOffExt): the cco-window slot
+        # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
+        # only kernel that reads tokOffPeers -- and always on there.
         self._tokoff_ext = None
         self.tok_off_peers = None
-        if self._is1250 and os.environ.get("MORI_EP_TOKOFF_EXT", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
+        if self._is1250:
             self._tokoff_ext = _TokOffExt(cfg.rank, cfg.world_size, dev)
             self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
