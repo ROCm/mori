@@ -180,6 +180,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        if cfg.is_internode:
+            self._default_active_qps = self._resolve_active_qps(cfg)
+            self._compiled_active_qps = tuple(
+                sorted({self._default_active_qps, *(cfg.active_qp_counts or ())})
+            )
+            self._active_qps = self._default_active_qps
 
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
@@ -252,6 +258,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     # in a backend of its own.
 
     @staticmethod
+    def _resolve_active_qps(cfg):
+        return (
+            cfg.active_qps if cfg.active_qps is not None else min(2, cfg.num_qp_per_pe)
+        )
+
+    @staticmethod
     def _make_dev_comm(cfg, comm):
         """The communicator the internode kernels take by value.
 
@@ -261,10 +273,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         * RAIL rather than the CROSSNODE default. The kernels talk only to their
           own local rank on other nodes, so that is the only connection set they
           need, and asking for more costs QPs that never carry traffic.
-        * a context count of num_qp_per_pe. ccoGda picks its QP as
-          ``contextId % numQpPerPe``, so fewer contexts than QPs silently
-          collapses the stripes onto a subset of them -- no error, just less
-          bandwidth than the config asked for.
+        * num_qp_per_pe allocated contexts. Kernel variants use a prefix of
+          this set; the count stored in the DevComm stays fixed because it is
+          also the endpoint-array stride for world-rank addressing.
         """
         from mori.cco import cco as _cco
         from mori.cco.communicator import DevCommHandle
@@ -356,7 +367,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.inter_blocks_barrier = torch.zeros(4, dtype=torch.uint32, device=dev)
         # Zero, not one: the internode kernels start their cross-device epoch at
         # 0 (v1 seeds it that way for exactly these kernel types).
-        self.cross_device_flag = torch.zeros(1, dtype=torch.int64, device=dev)
+        # [local barrier epoch, cumulative remote QP notifications]. Keeping
+        # both in this buffer also makes reset() clear them together.
+        self.cross_device_flag = torch.zeros(2, dtype=torch.int64, device=dev)
 
         # Views onto the arena, NOT fresh tensors: EpCombineAll writes the
         # symmetric regions, so a local buffer here would be returned to the
@@ -579,7 +592,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     def _internode_request(
-        self, cfg, dtype_tag, block_num, warp_per_block, rdma_block_num
+        self, cfg, dtype_tag, block_num, warp_per_block, rdma_block_num, active_qps
     ):
         return dict(
             worldSize=cfg.world_size,
@@ -592,7 +605,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             numExpertPerToken=cfg.num_experts_per_token,
             maxTotalRecvTokens=cfg.max_total_recv_tokens,
             gpuPerNode=cfg.gpu_per_node,
-            numQpPerPe=cfg.num_qp_per_pe,
+            numQpPerPe=active_qps,
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -840,9 +853,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         self._internode_buckets = self._internode_geometry_buckets(cfg)
         self._plans = []
-        # Keyed by the geometry triple so two buckets that resolve to the same
-        # geometry share one compile -- the shipped table does exactly that for
-        # tokens 4 and 8.
+        # Keyed by (block, rdma, warp, active QPs). Buckets with the same variant
+        # share plans, while different active counts specialise different kernels.
         self._internode_plans = {}
         # Collect the passes each geometry has to serve BEFORE building any, and
         # union them: a geometry is not owned by one phase. The shipped table
@@ -864,13 +876,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     + ("combineall",),
                 ),
             ):
-                passes_by_geometry.setdefault(geometry, set()).update(names)
+                for active_qps in self._compiled_active_qps:
+                    variant = (*geometry, active_qps)
+                    passes_by_geometry.setdefault(variant, set()).update(names)
         for geometry, names in passes_by_geometry.items():
-            block, rdma, warp = geometry
+            block, rdma, warp, active_qps = geometry
             plans_by_pass = {}
             for pass_name in sorted(names):
                 request = self._internode_request(
-                    cfg, leg_dtype[self._INTERNODE_LEG[pass_name]], block, warp, rdma
+                    cfg,
+                    leg_dtype[self._INTERNODE_LEG[pass_name]],
+                    block,
+                    warp,
+                    rdma,
+                    active_qps,
                 )
                 plans_by_pass[pass_name] = cb.EP_INTERNODE_PLANS[pass_name](**request)
                 # Two launch arguments that never vary for THIS plan, so they
@@ -941,8 +960,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """
 
         def run(*, input, num_tokens, dest_map, **kwargs):
+            if phase == "dispatch":
+                self._dispatch_active_qps = self._active_qps
+            active_qps = self._dispatch_active_qps
             use_low_latency = self._internode_use_ll(num_tokens)
-            geometry = self._internode_geom_for(phase, num_tokens)
+            geometry = (*self._internode_geom_for(phase, num_tokens), active_qps)
             group = self._internode_groups[(geometry, (phase, use_low_latency))]
 
             # Two of the kernel's arguments are set by dispatch and READ AGAIN by
@@ -1188,6 +1210,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
 
     # -- ops ---------------------------------------------------------------
+
+    def set_active_qps(self, active_qps):
+        """Select a precompiled prefix for subsequent dispatch/combine pairs.
+
+        All ranks must select the same count. A pending combine retains the
+        count of its dispatch. Captured graphs retain their compiled selection.
+        """
+        if not self.cfg.is_internode:
+            raise ValueError("active_qps requires the internode HIP backend")
+        if type(active_qps) is not int or active_qps not in self._compiled_active_qps:
+            raise ValueError(f"active_qps={active_qps!r} was not compiled")
+        self._active_qps = active_qps
 
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 

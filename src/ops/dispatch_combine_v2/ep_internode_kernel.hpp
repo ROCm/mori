@@ -224,11 +224,17 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
 
 // Drains every stripe: flush(peer) only polls the QP belonging to its own
 // context, so flushing one would leave the puts issued on the other qpIds
-// outstanding. numQp is config.numQpPerPe, which is also what the devComm was
-// created with (gdaContextCount).
-__device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe,
-                                                 int numQp) {
-  for (int qpId = 0; qpId < numQp; ++qpId) {
+// outstanding. ActiveQps is the kernel's active QP count; the DevComm retains
+// its allocated count as the endpoint-array stride and owns inactive QP state.
+// Switching the active prefix does not destroy/reset endpoints or CQ progress.
+// Retain the established dispatch/combine completion protocol: ordered per-QP
+// combine markers confirm the returned payload, and the following dispatch
+// handshake precedes reuse of the next combine's per-peer staging slices. Thus
+// changing the prefix does not require an extra global arrival fence/CQ drain.
+template <int ActiveQps>
+__device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe) {
+  static_assert(ActiveQps > 0);
+  for (int qpId = 0; qpId < ActiveQps; ++qpId) {
     ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
     gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
   }
@@ -801,6 +807,10 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     if (laneId == 0) {
       args.reg(args.offDispTokOffset)->template GetAs<index_t*>()[0] = 0;
       atomicAdd(args.crossDeviceBarrierFlag, 1);
+      // Only GDA's notification target depends on the active prefix. Keep the
+      // ordinary LSA epoch in slot 0 independent of QP selection (also on replay).
+      // This lane is the only writer; the subsequent combine kernel consumes it.
+      args.crossDeviceBarrierFlag[1] += uint64_t{config.numQpPerPe};
     }
   }
 
@@ -815,7 +825,7 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     // why the original loop covered every node.
     if (i == myNode) continue;
     int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
-    EpInterNodeQuiet(comm, proxyPe, config.numQpPerPe);
+    EpInterNodeQuiet<kConfig.numQpPerPe>(comm, proxyPe);
   }
 }
 
@@ -1206,13 +1216,13 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
   __threadfence_system();
 
   int finishedWarp = 0;
-  uint64_t barrierFlag = 0;
+  uint64_t remoteTarget = 0;
   if (laneId == 0) {
     finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    remoteTarget = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag + 1);
   }
   finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
+  remoteTarget = __shfl(remoteTarget, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
@@ -1232,8 +1242,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) != remoteTarget) {
       }
     }
   }
@@ -1346,13 +1355,13 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
   // never observes a non-zero flag that is subsequently overwritten with zero
   __threadfence_system();
   int finishedWarp = 0;
-  uint64_t barrierFlag = 0;
+  uint64_t remoteTarget = 0;
   if (laneId == 0) {
     finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[0], 1);
-    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
+    remoteTarget = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag + 1);
   }
   finishedWarp = __shfl(finishedWarp, 0);
-  barrierFlag = __shfl(barrierFlag, 0);
+  remoteTarget = __shfl(remoteTarget, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
@@ -1374,8 +1383,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) != remoteTarget) {
       }
     }
   }

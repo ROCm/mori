@@ -65,7 +65,23 @@ the **hip** backend implements it.
 | `gpu_per_node` | `None` → `world_size`, i.e. one node | GPUs per physical node; `world_size` must be a positive multiple of it. Setting it smaller is what selects the internode path. It is EP's own idea of a node and is checked against the communicator's LSA team (`lsa_size`, `lsa_rank`) at construction |
 | `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch |
 | `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against **this call's** token count (`input.shape[0]` for dispatch, `routing.cur_rank_num_token` for combine): `<=` runs `v2_ll`, `>` runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
-| `num_qp_per_pe` | `2` | QPs per peer on the RDMA leg. Only the internode path reads it, and 1 starves it (~1.5x), so the default is what that path wants; the intranode path ignores it. Must be >= 1 |
+| `num_qp_per_pe` | `8` | Allocated QPs per connected peer, fixed for the EP DevComm's lifetime. Must be >= 1; unused by intranode kernels |
+| `active_qps` | `None` | Default active prefix: `min(2, num_qp_per_pe)`, or an explicit count within the allocation |
+| `active_qp_counts` | `None` | Additional counts to precompile, e.g. `(1, 2, 4, 8)`; the default active count is always compiled |
+
+The active count is a kernel compile-time constant. With
+`active_qp_counts=(1, 2, 4, 8)`, select a variant using
+`op.set_active_qps(4)` before dispatch; its paired `combine` uses the same count.
+Ordinary calls use the configured default. Selection never recompiles
+a kernel or recreates QPs. The allocation remains the CCO endpoint-array stride;
+the kernel sends and polls only the selected prefix, retaining inactive CQ state.
+
+All ranks must choose the same active count and kernel family for a cycle.
+Complete each dispatch/combine pair before starting the next; order arena reuse
+across streams and graph replays. Remote completion targets accumulate the active
+counts on the GPU so switches and graph replays agree; collective `reset()` clears
+them with the existing protocol state. This feature does not select QPs from token
+counts or change launch geometry.
 
 Two further internode-only rules `__post_init__` applies: `quant_type` must be
 `"none"` (the internode combine's fp8 staging path is incomplete and returns

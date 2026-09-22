@@ -330,6 +330,7 @@ struct EpInterNodeArgs {
   ep_index_t* totalRecvTokenNum{nullptr};
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* interNodeBlocksBarrier{nullptr};
+  // Two words: local barrier epoch, then cumulative active QPs for remote completion.
   uint64_t* crossDeviceBarrierFlag{nullptr};
 
   // An offset as something addressable. Built per access; the three members are

@@ -166,6 +166,8 @@ struct EpInterNodeKernelCfg {
   int numExpertPerToken{2};
   int maxTotalRecvTokens{0};
   int gpuPerNode{8};
+  // Active prefix of the DevComm's allocated QPs, specialised per kernel.
+  // Never use this as the endpoint-array stride; CCO owns that allocation count.
   int numQpPerPe{1};
   EpQuantType quantType{EpQuantType::None};
 };

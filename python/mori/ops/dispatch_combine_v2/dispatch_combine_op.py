@@ -130,10 +130,14 @@ class EpDispatchCombineConfig:
     # and must agree with the communicator's LSA team, which the op checks at
     # construction rather than assuming.
     gpu_per_node: int = None
-    # QPs per peer on the RDMA leg. Only read on the internode path, where 1
-    # starves it (~1.5x); the intranode path never reaches RDMA and ignores it,
-    # so the default is the value the only consumer wants.
-    num_qp_per_pe: int = 2
+    # Allocated QPs per peer on the RDMA leg, fixed for this op's lifetime.
+    # The intranode path does not use QPs. Kernel usage is selected separately.
+    num_qp_per_pe: int = 8
+    # Active prefix specialised into the kernel. None uses min(2, allocation).
+    active_qps: int = None
+    # Optional additional compile-time subsets, for explicit per-cycle overrides.
+    # Selected through op.set_active_qps(); the default is always compiled.
+    active_qp_counts: tuple = None
     # Widest transported element, which is what sizes the staging buffers. None
     # => max over the two legs, which is what the buffers actually have to hold.
     max_token_type_size: int = None
@@ -181,8 +185,35 @@ class EpDispatchCombineConfig:
                 "node * gpu_per_node + local rank and a partial node has no such "
                 "encoding"
             )
-        if self.num_qp_per_pe < 1:
-            raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
+        if type(self.num_qp_per_pe) is not int or self.num_qp_per_pe < 1:
+            raise ValueError(
+                f"num_qp_per_pe must be a positive integer, got {self.num_qp_per_pe}"
+            )
+        if self.active_qps is not None:
+            if (
+                type(self.active_qps) is not int
+                or not 1 <= self.active_qps <= self.num_qp_per_pe
+            ):
+                raise ValueError(
+                    "active_qps must be an integer between 1 and num_qp_per_pe"
+                )
+            if not self.is_internode:
+                raise ValueError("active_qps is only supported by the internode path")
+        if self.active_qp_counts is not None:
+            counts = tuple(self.active_qp_counts)
+            if not counts or any(
+                type(count) is not int or not 1 <= count <= self.num_qp_per_pe
+                for count in counts
+            ):
+                raise ValueError(
+                    "active_qp_counts must contain integers in "
+                    f"[1, num_qp_per_pe={self.num_qp_per_pe}]"
+                )
+            self.active_qp_counts = tuple(sorted(set(counts)))
+            if not self.is_internode:
+                raise ValueError(
+                    "active_qp_counts is only supported by the internode path"
+                )
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
