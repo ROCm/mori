@@ -381,8 +381,8 @@ function(_mori_detect_ionic_ccqe out_var)
     return()
   endif()
 
-  # Mirror DetectIonicCcqe(): an unclassified device may be an Ionic rail.
-  # Read the symlink itself, not its target; device names are not driver names.
+  # Mirror DetectIonicCcqe(): an unclassified device may be an Ionic rail. Read
+  # the symlink itself, not its target; device names are not driver names.
   file(GLOB _ib_devices "${_ib_root}/*")
   set(_fw_versions "")
   foreach(_dev ${_ib_devices})
@@ -418,7 +418,8 @@ function(_mori_detect_ionic_ccqe out_var)
     string(STRIP "${_fw}" _fw)
     _mori_ionic_fw_supports_ccqe("${_fw}" _fw_ok)
     if(NOT _fw_ok)
-      message(STATUS "Mori ionic CCQE: off (unsupported firmware '${_fw}': ${_dev})")
+      message(
+        STATUS "Mori ionic CCQE: off (unsupported firmware '${_fw}': ${_dev})")
       return()
     endif()
     list(APPEND _fw_versions "${_fw}")
