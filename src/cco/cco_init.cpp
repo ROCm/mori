@@ -148,7 +148,8 @@ ccoComm::~ccoComm() = default;
 
 static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
-static constexpr size_t kLargePageSize = 2ULL << 20;
+static constexpr size_t kMrPadThreshold = 2ULL << 30;
+static constexpr size_t kMrPadAlign = 2ULL << 20;
 
 // Symmetric-window VMM allocation type. Default = uncached (fine-grained),
 // matching mori-shmem's hipDeviceMallocUncached heap: P2P remote reads/writes
@@ -689,7 +690,7 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // reqs.gdaContextCount, so multiple DevComms can coexist with independent
   // QP state.
 
-  // Every peer is LSA-mapped on a single node, so windows need no MR until a GDA DevComm.
+  // Every peer is LSA-mapped on a single node, so windows need no MR until a FULL DevComm.
   comm->windowMrsEnabled = comm->lsaSize < comm->worldSize;
 
   MORI_SHMEM_INFO(
@@ -772,15 +773,16 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
   }
 
   // ionic MRs over a >2 GiB VMM allocation that is not a 2 MiB multiple fail with ENOMEM.
-  size_t allocAlign = size >= kLargePageSize ? std::max(comm->vmmGranularity, kLargePageSize)
-                                             : comm->vmmGranularity;
-  size_t alignedSize = AlignUp(size, allocAlign);
+  // Only the physical size is padded; the slot keeps vmmGranularity alignment, which is what
+  // keeps slotOffset identical across ranks (flatBase is only reserved at that alignment).
+  size_t alignedSize = AlignUp(size, comm->vmmGranularity);
+  if (size > kMrPadThreshold) alignedSize = AlignUp(alignedSize, kMrPadAlign);
 
   // Reserve a slot via first-fit in the per-rank HeapVAManager. The returned
   // address IS the local VA for this rank's slot — directly dereferenceable.
   // 0 is the failure sentinel; baseAddr was set to flatBase + lsaRank*perRankSize
   // which is non-zero, so 0 unambiguously means failure.
-  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, allocAlign);
+  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
   if (slotAddr == 0) {
     MORI_SHMEM_ERROR(
         "ccoMemAlloc: slot exhausted (no contiguous {} bytes free in perRankSize={}). "
@@ -1105,20 +1107,19 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
 /* ========================================================================== */
 
 // Collective: register wh's RDMA MR, Allgather rkeys, publish lkey/rkeys into its device struct.
-static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh) {
-  const auto& meta = comm->allocTable.at(wh->localPtr);
+static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh, bool isFabric, int shareFd) {
   uint32_t lkey = 0;
   uint32_t localRkey = 0;
 
   application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
   if (rdmaDevCtx) {
     application::RdmaMemoryRegion mr;
-    if (meta.isFabric) {
+    if (isFabric) {
       mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(wh->localPtr, wh->size);
     } else if (comm->iovaZeroMode) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, meta.shareFd);
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, shareFd);
     } else {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(wh->localPtr, wh->size, meta.shareFd);
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(wh->localPtr, wh->size, shareFd);
     }
     lkey = mr.lkey;
     localRkey = mr.rkey;
@@ -1408,19 +1409,21 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(ccoWindowDevice)));
   HIP_RUNTIME_CHECK(hipMemcpy(devPtr, &hostShadow, sizeof(ccoWindowDevice), hipMemcpyHostToDevice));
 
-  // Publish into the per-comm window table (drives findWindow lookups).
-  ccoComm::WindowTableEntry tableEntry;
-  tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
-  tableEntry.size = static_cast<uintptr_t>(size);
-  tableEntry.devPtr = devPtr;
-  comm->windowTableEntries.push_back(tableEntry);
-
   auto* wh = new ccoWindowHost();
   wh->localPtr = localPtr;
   wh->size = size;
   wh->devPtr = devPtr;
   wh->peerRkeys_gpu = peerRkeys_gpu;
   wh->peerImportedHandles = std::move(p2pImportedHandles);
+
+  if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh, useFabric, meta.shareFd);
+
+  // Publish into the per-comm window table (drives findWindow lookups).
+  ccoComm::WindowTableEntry tableEntry;
+  tableEntry.base = reinterpret_cast<uintptr_t>(localPtr);
+  tableEntry.size = static_cast<uintptr_t>(size);
+  tableEntry.devPtr = devPtr;
+  comm->windowTableEntries.push_back(tableEntry);
   comm->windows.push_back(wh);
 
   *outWin = devPtr;
@@ -1433,8 +1436,6 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
     MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={}", lsa, pe, peerVa);
   }
-
-  if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh);
   return 0;
 }
 
@@ -1655,10 +1656,22 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
     hostShadow.gdaConnType = connType;  // may have been collapsed above
   }
 
-  // First GDA DevComm on a single-node comm: back-fill MRs for windows registered without one.
-  if (connType != CCO_GDA_CONNECTION_NONE && !comm->windowMrsEnabled) {
+  // First FULL DevComm on a single-node comm: back-fill MRs for windows registered without one.
+  // Keyed on the requested type, not the per-rank resolved one, so every rank runs the same
+  // collectives (only FULL can resolve to non-NONE when lsaSize == worldSize).
+  if (reqs->gdaConnectionType == CCO_GDA_CONNECTION_FULL && !comm->windowMrsEnabled) {
     comm->windowMrsEnabled = true;
-    for (ccoWindowHost* wh : comm->windows) CcoWindowRegisterMr(comm, wh);
+    for (ccoWindowHost* wh : comm->windows) {
+      bool isFabric = false;
+      int shareFd = -1;
+      {
+        std::lock_guard<std::mutex> lock(comm->allocMutex);
+        const auto& meta = comm->allocTable.at(wh->localPtr);
+        isFabric = meta.isFabric;
+        shareFd = meta.shareFd;
+      }
+      CcoWindowRegisterMr(comm, wh, isFabric, shareFd);
+    }
   }
 
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
