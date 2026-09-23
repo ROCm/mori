@@ -495,6 +495,12 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
 
   int localPeTokenCounter = 0;
 
+  // Cache nodeRecvTokenNum[node]: unchanged once observed non-zero until
+  // combine resets it. One scalar + tag, not a per-node array -- nodeId only
+  // increases across this loop, so at most one node is ever "current".
+  int cachedNode = -1;
+  uint64_t cachedNodeFlag = 0;
+
   // expert -> token -> node
   for (int i = globalWarpId;
        i < config.MaxNumTokensToSendPerRank() * config.numExpertPerToken * (nNodes - 1);
@@ -509,18 +515,22 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
 
     // Poll completion flags
     uint64_t thisChunkTokenNum = 0;
-    index_t nodeFlag = 0;
     if (laneId == 0) {
-      uint64_t barrierFlag = args.crossDeviceBarrierFlag[0];
+      if (node != cachedNode) {
+        cachedNode = node;
+        cachedNodeFlag = 0;
+      }
       while (1) {
-        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
-        if (thisChunkTokenNum > 0) break;
-
-        nodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
-        if ((nodeFlag > 0) && (startTokenIdx >= (nodeFlag - 1))) {
+        if ((cachedNodeFlag > 0) && (startTokenIdx >= (cachedNodeFlag - 1))) {
           thisChunkTokenNum = 1;
           break;
         }
+        thisChunkTokenNum = core::AtomicLoadRelaxedSystem(&chunkFlag[node * maxChunkNum + k]);
+        if (thisChunkTokenNum > 0) break;
+
+        // Won't change again this round once observed; stop re-reading it.
+        if (cachedNodeFlag == 0)
+          cachedNodeFlag = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
       }
     }
     thisChunkTokenNum = __shfl(thisChunkTokenNum, 0) - 1;
