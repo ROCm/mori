@@ -536,5 +536,103 @@ TEST_F(BatchPutWarnTest, UnregisteredDeviceSourceIsRejectedNotHostStaged) {
   }
 }
 
+// RegisterMemory no longer holds registered_mem_mutex_ across the transfer
+// engine's pin -- that pin takes minutes for a real KV pool, and the region
+// table is consulted once per range by every concurrent transfer, so holding it
+// that long stalled the whole node's data plane. It holds registration_mutex_
+// instead, which is the exclusion IOEngine actually needs (its memory table and
+// backend map carry no lock of their own).
+//
+// This exercises the split: registrations racing each other and racing the
+// lookups that read the table. A regression shows up as a torn or lost region
+// (a failed lookup below), or as a crash inside the engine if the exclusion
+// between registrations were dropped instead of moved.
+TEST_F(BatchPutWarnTest, ConcurrentRegistrationsAndLookupsStayConsistent) {
+  constexpr int kThreads = 6;
+  constexpr int kRegionsPerThread = 8;
+  constexpr size_t kRegionSize = 64 * 1024;
+
+  // The buffer the concurrent writes below resolve through, so the region
+  // table is being read the whole time it is being written.
+  ASSERT_TRUE(caller_->RegisterMemory(registered_buf_, kCallerBuf));
+
+  std::vector<void*> regions(kThreads * kRegionsPerThread, nullptr);
+  for (auto& region : regions) {
+    region = std::malloc(kRegionSize);
+    ASSERT_NE(region, nullptr);
+    std::memset(region, 0x2b, kRegionSize);
+  }
+
+  std::atomic<int> register_failures{0};
+  std::atomic<bool> stop_lookups{false};
+  std::atomic<uint64_t> lookups{0};
+
+  // BatchPut resolves its srcs through FindRegisteredMemory, so this keeps a
+  // reader on the region table for the whole window the registrations below
+  // are in flight.
+  //
+  // Load generator only -- its RESULTS are deliberately not asserted. These
+  // batches route cross-node, which needs a working RDMA device; the two tests
+  // above that do assert a cross-node result already fail on a host without
+  // one. What this test is about is the region table, and that is checked below
+  // against every region directly.
+  std::thread lookup_thread([&]() {
+    uint64_t round = 0;
+    while (!stop_lookups.load(std::memory_order_acquire)) {
+      std::vector<std::string> keys;
+      std::vector<const void*> srcs;
+      std::vector<size_t> sizes;
+      MakeBatch(registered_buf_, /*n=*/2, &keys, &srcs, &sizes,
+                "churn-" + std::to_string(round++) + "-");
+      caller_->BatchPut(keys, srcs, sizes);
+      lookups.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t]() {
+      for (int i = 0; i < kRegionsPerThread; ++i) {
+        void* region = regions[t * kRegionsPerThread + i];
+        if (!caller_->RegisterMemory(region, kRegionSize)) {
+          register_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  stop_lookups.store(true, std::memory_order_release);
+  lookup_thread.join();
+
+  EXPECT_EQ(register_failures.load(std::memory_order_relaxed), 0);
+  EXPECT_GT(lookups.load(std::memory_order_relaxed), 0u);
+
+  // Every region has to be present, and present as ITSELF. The table is kept
+  // sorted and binary-searched, so an insert that landed at a stale position
+  // would leave some other region's entry under this base -- which these two
+  // calls separate: re-registering at the same size hits the idempotent path,
+  // and re-registering larger must be refused BY THIS REGION'S recorded size.
+  for (void* region : regions) {
+    EXPECT_TRUE(caller_->RegisterMemory(region, kRegionSize));
+    EXPECT_FALSE(caller_->RegisterMemory(region, kRegionSize + 1));
+  }
+
+  // Concurrent deregistration takes the same path in reverse.
+  std::vector<std::thread> deregister_threads;
+  deregister_threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    deregister_threads.emplace_back([&, t]() {
+      for (int i = 0; i < kRegionsPerThread; ++i) {
+        caller_->DeregisterMemory(regions[t * kRegionsPerThread + i]);
+      }
+    });
+  }
+  for (auto& thread : deregister_threads) thread.join();
+
+  caller_->DeregisterMemory(registered_buf_);
+  for (void* region : regions) std::free(region);
+}
+
 }  // namespace
 }  // namespace mori::umbp

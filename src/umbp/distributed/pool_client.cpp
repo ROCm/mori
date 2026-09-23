@@ -35,6 +35,7 @@
 #include <limits>
 #include <map>
 #include <msgpack.hpp>
+#include <mutex>
 #include <new>
 #include <numeric>
 #include <string>
@@ -1148,6 +1149,11 @@ void PoolClient::Shutdown() {
   registry_ = BackendRegistry{};
 
   if (transfer_engine_) {
+    // registration_mutex_ as well, so that every engine-level deregistration in
+    // this class goes through the same mutual exclusion. Uncontended here --
+    // DistributedClient::Close has already drained the data plane -- but the
+    // invariant is worth keeping local rather than argued from a caller.
+    std::lock_guard<std::mutex> registration_lock(registration_mutex_);
     std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
     for (auto& reg : registered_regions_) transfer_engine_->Deregister(reg.ref);
     registered_regions_.clear();
@@ -1221,20 +1227,32 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: invalid args ptr={}, size={}", ptr, size);
     return false;
   }
-  std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
-  const auto at = std::lower_bound(
-      registered_regions_.begin(), registered_regions_.end(), ptr,
-      [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
-  if (at != registered_regions_.end() && at->base == ptr) {
-    const RegisteredRegion& reg = *at;
-    // Re-registering the same base with a larger size is not idempotent: the
-    // existing registration covers fewer bytes, so FindRegisteredMemory would
-    // start rejecting the tail and silently fall back to unregistered bytes.
-    if (size <= reg.size) return true;
-    MORI_UMBP_ERROR(
-        "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {}<{}", ptr,
-        reg.size, size);
-    return false;
+  // Everything below runs under registration_mutex_, never under
+  // registered_mem_mutex_ except for the two table operations that need it.
+  // Concurrent transfers keep resolving their ranges while this pins.
+  std::lock_guard<std::mutex> registration_lock(registration_mutex_);
+
+  const auto find_existing = [&]() {
+    return std::lower_bound(registered_regions_.begin(), registered_regions_.end(), ptr,
+                            [](const RegisteredRegion& r, const void* p) {
+                              return std::less<const void*>{}(r.base, p);
+                            });
+  };
+
+  {
+    std::shared_lock<std::shared_mutex> lock(registered_mem_mutex_);
+    const auto at = find_existing();
+    if (at != registered_regions_.end() && at->base == ptr) {
+      const RegisteredRegion& reg = *at;
+      // Re-registering the same base with a larger size is not idempotent: the
+      // existing registration covers fewer bytes, so FindRegisteredMemory would
+      // start rejecting the tail and silently fall back to unregistered bytes.
+      if (size <= reg.size) return true;
+      MORI_UMBP_ERROR(
+          "[PoolClient] RegisterMemory: ptr={} already registered with smaller size {}<{}", ptr,
+          reg.size, size);
+      return false;
+    }
   }
 
   if (mode == MemoryRegistration::kLocalCopyOnly) {
@@ -1242,7 +1260,8 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     // local engine selection reads off it, and every engine's Deregister
     // no-ops on a ref without a descriptor.
     TransferRef ref = TransferRef::HostBytes(ptr, size, loc, device);
-    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+    registered_regions_.insert(find_existing(), RegisteredRegion{ptr, size, std::move(ref)});
     return true;
   }
 
@@ -1250,6 +1269,10 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
   // map).  A throw here would propagate out through the pybind boundary; the
   // documented contract is a bool.
   try {
+    // The slow step -- minutes for a large host KV pool -- and the reason the
+    // region table is not locked here. registration_mutex_ still makes it
+    // exclusive against any other registration, so no two callers can pin the
+    // same range and IOEngine's unlocked tables stay consistent.
     TransferRef ref = transfer_engine_->RegisterMemory(ptr, size, loc, device);
     // Validate what came back rather than trusting it. A ref whose location or
     // device disagrees with what the caller allocated would send every later
@@ -1265,7 +1288,12 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
       return false;
     }
     // Inserted in place rather than appended: lookups binary-search this.
-    registered_regions_.insert(at, RegisteredRegion{ptr, size, std::move(ref)});
+    // find_existing() is re-evaluated under the write lock because a concurrent
+    // DeregisterMemory of an unrelated region can have shifted the position;
+    // the entry for `ptr` itself cannot have appeared, registration_mutex_
+    // being held throughout.
+    std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+    registered_regions_.insert(find_existing(), RegisteredRegion{ptr, size, std::move(ref)});
   } catch (const std::exception& error) {
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory failed for ptr={}, size={}: {}", ptr, size,
                     error.what());
@@ -1280,14 +1308,26 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
 
 void PoolClient::DeregisterMemory(void* ptr) {
   if (ptr == nullptr) return;
-  std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
-  auto it = std::lower_bound(
-      registered_regions_.begin(), registered_regions_.end(), ptr,
-      [](const RegisteredRegion& r, const void* p) { return std::less<const void*>{}(r.base, p); });
-  if (it != registered_regions_.end() && it->base == ptr) {
-    if (transfer_engine_) transfer_engine_->Deregister(it->ref);
+  // Same split as RegisterMemory: the table is edited under its own lock, and
+  // the engine's teardown -- which unpins an MR and touches IOEngine's unlocked
+  // tables -- runs under registration_mutex_ only.
+  std::lock_guard<std::mutex> registration_lock(registration_mutex_);
+  TransferRef ref;
+  {
+    std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
+    auto it = std::lower_bound(registered_regions_.begin(), registered_regions_.end(), ptr,
+                               [](const RegisteredRegion& r, const void* p) {
+                                 return std::less<const void*>{}(r.base, p);
+                               });
+    if (it == registered_regions_.end() || it->base != ptr) return;
+    // Unpublished before it is torn down: a lookup that started earlier already
+    // holds its own copy of the ref, which is why the caller must keep the
+    // region alive until its in-flight transfers are done (see
+    // StandaloneServer::ReleaseRegisteredMemory).
+    ref = it->ref;
     registered_regions_.erase(it);
   }
+  if (transfer_engine_) transfer_engine_->Deregister(ref);
 }
 
 const PoolClient::RegisteredRegion* PoolClient::FindRegisteredRegionLocked(const void* ptr,

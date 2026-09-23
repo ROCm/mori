@@ -37,6 +37,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -167,11 +168,16 @@ std::chrono::milliseconds FdHandshakeTimeout() {
   return std::chrono::milliseconds(value);
 }
 
-// Keeps the read-handler bodies independent of the deployment-specific lock
+// Keeps the data-handler bodies independent of the deployment-specific lock
 // policy. Exactly one of the two deferred locks owns the mutex.
-class ConditionalReadLock {
+//
+// Used by reads AND writes. Every medium but SSD runs both concurrently and
+// relies on the per-region pin (see RegionPins) for mapping lifetime; SSD still
+// serializes everything here, because its manager serializes around a staging
+// arena that the pin says nothing about.
+class ConditionalDataLock {
  public:
-  ConditionalReadLock(std::shared_mutex& mutex, bool shared)
+  ConditionalDataLock(std::shared_mutex& mutex, bool shared)
       : shared_(mutex, std::defer_lock), exclusive_(mutex, std::defer_lock) {
     if (shared) {
       shared_.lock();
@@ -180,8 +186,8 @@ class ConditionalReadLock {
     }
   }
 
-  ConditionalReadLock(const ConditionalReadLock&) = delete;
-  ConditionalReadLock& operator=(const ConditionalReadLock&) = delete;
+  ConditionalDataLock(const ConditionalDataLock&) = delete;
+  ConditionalDataLock& operator=(const ConditionalDataLock&) = delete;
 
  private:
   std::shared_lock<std::shared_mutex> shared_;
@@ -580,10 +586,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Put(grpc::ServerContext*, const ::umbp::PutRequest* request,
                    ::umbp::BoolResponse* response) override {
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     uintptr_t ptr = 0;
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
-                      request->size(), &ptr)) {
+                      request->size(), &ptr, &pins)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
       return grpc::Status::OK;
     }
@@ -597,10 +604,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Get(grpc::ServerContext*, const ::umbp::GetRequest* request,
                    ::umbp::BoolResponse* response) override {
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     uintptr_t ptr = 0;
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
-                      request->size(), &ptr)) {
+                      request->size(), &ptr, &pins)) {
       SetBool(response, false, "unregistered or out-of-range shm buffer");
       return grpc::Status::OK;
     }
@@ -616,9 +624,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                         ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     std::vector<size_t> sizes = Sizes(*request);
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     std::vector<uintptr_t> ptrs;
-    if (!ResolveBatch(*request, &ptrs)) {
+    if (!ResolveBatch(*request, &ptrs, &pins)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -646,9 +655,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                          request->sizes(static_cast<int>(i))});
     }
 
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     std::vector<uintptr_t> flat_ptrs;
-    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
+    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true, &pins) ||
         shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -702,9 +712,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                          request->sizes(i)});
     }
 
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     std::vector<uintptr_t> ptrs;
-    if (!ResolveRanges(request->client_id(), queries, &ptrs, /*allow_zero=*/false)) {
+    if (!ResolveRanges(request->client_id(), queries, &ptrs, /*allow_zero=*/false, &pins)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -720,9 +731,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                         ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     std::vector<size_t> sizes = Sizes(*request);
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     std::vector<uintptr_t> ptrs;
-    if (!ResolveBatch(*request, &ptrs)) {
+    if (!ResolveBatch(*request, &ptrs, &pins)) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
@@ -785,9 +797,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                          request->sizes(static_cast<int>(i))});
     }
 
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
+    RegionPins pins(this);
     std::vector<uintptr_t> flat_ptrs;
-    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
+    if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true, &pins) ||
         shutdown_.load()) {
       FillFalse(static_cast<int>(key_count), response);
       return grpc::Status::OK;
@@ -815,7 +828,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Exists(grpc::ServerContext*, const ::umbp::KeyRequest* request,
                       ::umbp::BoolResponse* response) override {
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -827,7 +840,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchExists(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                            ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -839,7 +852,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchExistsConsecutive(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                                       ::umbp::CountResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    ConditionalDataLock lock(client_mu_, shared_reads_);
     if (shutdown_.load()) {
       response->set_count(0);
       return grpc::Status::OK;
@@ -893,8 +906,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       std::shared_lock<std::shared_mutex> lock(memory_mu_);
       auto it = memory_.find(request->client_id());
       if (it != memory_.end()) {
-        ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
-          return mem.worker_base == request->worker_base() && mem.size >= request->size();
+        ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegionPtr& region) {
+          return region->mem.worker_base == request->worker_base() &&
+                 region->mem.size >= request->size();
         });
       }
     }
@@ -981,7 +995,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (auto identity = GetExternalIdentity(request->client_id())) {
       matches = identity->MatchExternalKv(hashes, request->count_as_hit());
     } else {
-      ConditionalReadLock lock(client_mu_, shared_reads_);
+      ConditionalDataLock lock(client_mu_, shared_reads_);
       if (!shutdown_.load()) matches = client_->MatchExternalKv(hashes, request->count_as_hit());
     }
     FillExternalKvMatches(matches, response);
@@ -997,7 +1011,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (auto identity = GetExternalIdentity(request->client_id())) {
       entries = identity->GetExternalKvHitCounts(hashes);
     } else {
-      ConditionalReadLock lock(client_mu_, shared_reads_);
+      ConditionalDataLock lock(client_mu_, shared_reads_);
       if (!shutdown_.load()) entries = client_->GetExternalKvHitCounts(hashes);
     }
     FillExternalKvHitCounts(entries, response);
@@ -1016,6 +1030,92 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     uint64_t alloc_base = 0;
     std::string client_id;
   };
+
+  // A registered mapping, plus the number of data operations currently copying
+  // through it.
+  //
+  // Reached only through shared_ptr and never mutated after construction. That
+  // is what lets a handler keep a resolved pointer across the backend call:
+  // neither InsertOrReplaceRegion reshuffling the client's vector nor a
+  // concurrent UnmapClient can move or free the object it resolved against.
+  struct Region {
+    explicit Region(RegisteredMemory memory) : mem(std::move(memory)) {}
+    RegisteredMemory mem;
+    std::atomic<uint64_t> pins{0};
+  };
+  using RegionPtr = std::shared_ptr<Region>;
+
+  // Holds every mapping one data operation resolved into, for the operation's
+  // full duration -- which is what keeps the bytes under a raw pointer mapped
+  // while the backend copies them.
+  //
+  // This replaces holding client_mu_ exclusively across the backend call. That
+  // gave the same guarantee for free, but at the price of serializing every
+  // client on the node behind each other's copies (and behind each other's
+  // multi-minute memory registrations); a pin is scoped to the one mapping the
+  // copy actually touches.
+  //
+  // Pins are taken while memory_mu_ is held, which is what makes this
+  // race-free: a region reachable through memory_ has not started releasing,
+  // and ReleaseRegisteredMemory removes the region from memory_ before it waits
+  // for the count to fall to zero.
+  class RegionPins {
+   public:
+    explicit RegionPins(Impl* owner) : owner_(owner) {}
+    ~RegionPins() { Release(); }
+
+    RegionPins(const RegionPins&) = delete;
+    RegionPins& operator=(const RegionPins&) = delete;
+
+    // Linear dedup: a batch names one region per distinct worker_base, so this
+    // is a handful of pointer compares against what would otherwise be a heap
+    // allocation per call.
+    void Add(const RegionPtr& region) {
+      if (!region) return;
+      for (const RegionPtr& held : held_) {
+        if (held.get() == region.get()) return;
+      }
+      region->pins.fetch_add(1, std::memory_order_acq_rel);
+      held_.push_back(region);
+    }
+
+    void Release() {
+      for (const RegionPtr& region : held_) owner_->Unpin(*region);
+      held_.clear();
+    }
+
+   private:
+    Impl* owner_;
+    std::vector<RegionPtr> held_;
+  };
+
+  void Unpin(Region& region) {
+    if (region.pins.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    // The common case by far: nobody is tearing this mapping down, so the
+    // release costs one atomic and no lock at all.
+    if (unpin_waiters_.load(std::memory_order_acquire) == 0) return;
+    std::lock_guard<std::mutex> lock(unpin_mu_);
+    unpin_cv_.notify_all();
+  }
+
+  // Blocks until no data operation is using `region`.
+  //
+  // The caller must already have removed the region from memory_ under
+  // memory_mu_, so that no new pin can be taken while this waits. Holds neither
+  // client_mu_ nor memory_mu_ meanwhile -- an in-flight operation needs both to
+  // finish and drop its pin, so waiting under either would deadlock.
+  void WaitForPinsZero(Region& region) {
+    if (region.pins.load(std::memory_order_acquire) == 0) return;
+    // Published before the predicate is evaluated under unpin_mu_, so an Unpin
+    // racing with this either observes the waiter and notifies, or has already
+    // driven the count to zero for the predicate below to see. No wakeup lost.
+    unpin_waiters_.fetch_add(1, std::memory_order_release);
+    {
+      std::unique_lock<std::mutex> lock(unpin_mu_);
+      unpin_cv_.wait(lock, [&region] { return region.pins.load(std::memory_order_acquire) == 0; });
+    }
+    unpin_waiters_.fetch_sub(1, std::memory_order_release);
+  }
 
   struct RangeQuery {
     uint64_t region_base = 0;
@@ -1239,11 +1339,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.worker_base = static_cast<uint64_t>(msg.worker_base);
     entry.size = msg.size;
     entry.client_id = client_id;
-    std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(client_id, entry);
+    RegionPtr old_mem = InsertOrReplaceRegion(client_id, entry);
     // Release outside the lock, and via ReleaseRegisteredMemory so the backend
     // deregisters the region before its mapping is munmap'd (required by the
     // distributed backend; see design-standalone-process-mode.md §5.3/§6.3).
-    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
+    ReleaseRegisteredMemory(old_mem);
     MORI_UMBP_INFO("[StandaloneServer] registered shm client_id={} worker_base=0x{:x} size={}MB",
                    client_id, msg.worker_base, msg.size / (1024 * 1024));
     return true;
@@ -1253,26 +1353,31 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::shared_lock<std::shared_mutex> lock(memory_mu_);
     auto it = memory_.find(request.client_id());
     if (it == memory_.end()) return false;
-    return std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+    return std::any_of(it->second.begin(), it->second.end(), [&](const RegionPtr& region) {
+      const RegisteredMemory& mem = region->mem;
       return mem.kind == MemoryKind::kGpuIpc && mem.worker_base == request.worker_base() &&
              mem.size == request.size() && mem.device_id == request.device_id() &&
              mem.alloc_base == request.alloc_base();
     });
   }
 
-  std::optional<RegisteredMemory> InsertOrReplaceRegion(const std::string& client_id,
-                                                        const RegisteredMemory& entry) {
+  // Returns the region this one displaced, already unreachable through memory_,
+  // for the caller to hand to ReleaseRegisteredMemory. Replacing the vector
+  // slot rather than mutating the Region is what keeps an in-flight operation's
+  // resolved pointer and pin valid.
+  RegionPtr InsertOrReplaceRegion(const std::string& client_id, const RegisteredMemory& entry) {
+    auto region = std::make_shared<Region>(entry);
     std::unique_lock<std::shared_mutex> lock(memory_mu_);
     auto& regions = memory_[client_id];
-    auto existing = std::find_if(regions.begin(), regions.end(), [&](const RegisteredMemory& mem) {
-      return mem.worker_base == entry.worker_base;
+    auto existing = std::find_if(regions.begin(), regions.end(), [&](const RegionPtr& held) {
+      return held->mem.worker_base == entry.worker_base;
     });
     if (existing == regions.end()) {
-      regions.push_back(entry);
-      return std::nullopt;
+      regions.push_back(std::move(region));
+      return nullptr;
     }
-    RegisteredMemory old = *existing;
-    *existing = entry;
+    RegionPtr old = *existing;
+    *existing = std::move(region);
     return old;
   }
 
@@ -1365,8 +1470,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return;
     }
 
-    std::optional<RegisteredMemory> old_mem = InsertOrReplaceRegion(request.client_id(), entry);
-    if (old_mem.has_value()) ReleaseRegisteredMemory(*old_mem);
+    RegionPtr old_mem = InsertOrReplaceRegion(request.client_id(), entry);
+    ReleaseRegisteredMemory(old_mem);
     MORI_UMBP_INFO(
         "[StandaloneServer] registered GPU IPC client_id={} worker_base=0x{:x} size={}MB "
         "device={}",
@@ -1405,7 +1510,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   void UnmapClient(const std::string& client_id) {
-    std::vector<RegisteredMemory> mems;
+    std::vector<RegionPtr> mems;
     {
       std::unique_lock<std::shared_mutex> lock(memory_mu_);
       auto it = memory_.find(client_id);
@@ -1424,7 +1529,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   void UnmapAll() {
-    std::vector<RegisteredMemory> entries;
+    std::vector<RegionPtr> entries;
     {
       std::unique_lock<std::shared_mutex> lock(memory_mu_);
       for (auto& kv : memory_) {
@@ -1440,19 +1545,37 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   // device memory in this process too, and registering it as host memory would
   // send it down the inner client's host paths — a memcpy from device memory in
   // the local case, and a host staging bounce in the distributed one.
+  // SHARED, not exclusive. Pinning a region for RDMA is a one-time-per-buffer
+  // cost that the inner client measures in minutes for a large KV pool, and a
+  // node's ranks register at staggered times during warmup: holding client_mu_
+  // exclusively here stalled every other rank's data plane -- BatchExists
+  // included -- for the whole registration. The inner PoolClient serializes
+  // registrations against each other on its own, which is the mutual exclusion
+  // the unlocked IOEngine::RegisterMemory actually needs.
   bool RegisterBackendMemory(void* base, size_t size,
                              mori::io::MemoryLocationType loc = mori::io::MemoryLocationType::CPU,
                              int device = -1,
                              MemoryRegistration mode = MemoryRegistration::kPinned) {
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_.load()) return false;
     return client_->RegisterMemory(reinterpret_cast<uintptr_t>(base), size, loc, device, mode);
   }
 
-  void ReleaseRegisteredMemory(const RegisteredMemory& mem) {
-    if (!mem.base) return;
+  // PRECONDITION: `region` has already been made unreachable through memory_
+  // under memory_mu_ -- displaced by InsertOrReplaceRegion, or erased by
+  // UnmapClient/UnmapAll. Every caller does this, and it is what guarantees no
+  // new pin can appear while the wait below runs.
+  //
+  // Waiting for the pins to drain is what keeps this safe: it must outlast not
+  // just the munmap but the inner DeregisterMemory too, because the inner
+  // client hands out copies of a region's TransferRef and would otherwise tear
+  // down an RDMA MR underneath a transfer still using it.
+  void ReleaseRegisteredMemory(const RegionPtr& region) {
+    if (!region || !region->mem.base) return;
+    const RegisteredMemory& mem = region->mem;
+    WaitForPinsZero(*region);
     {
-      std::unique_lock<std::shared_mutex> lock(client_mu_);
+      std::shared_lock<std::shared_mutex> lock(client_mu_);
       client_->DeregisterMemory(reinterpret_cast<uintptr_t>(mem.base));
     }
     if (mem.kind == MemoryKind::kGpuIpc) {
@@ -1462,37 +1585,49 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
   }
 
-  // Resolves (client_id, region_base, offset) to a server-local pointer.
+  // Resolves (client_id, region_base, offset) to a server-local pointer, and
+  // pins the mapping it came from into `pins` so the bytes stay mapped for as
+  // long as the caller holds it. Pinning happens under memory_mu_, before any
+  // pointer escapes, which is what closes the race against a concurrent
+  // deregistration.
+  //
   // region_base selects which of the client's regions the offset is relative to;
   // 0 means legacy/single-region and falls back to the first region that fits.
   bool ResolveRange(const std::string& client_id, uint64_t region_base, uint64_t offset,
-                    uint64_t size, uintptr_t* out_ptr) {
+                    uint64_t size, uintptr_t* out_ptr, RegionPins* pins) {
     if (!out_ptr || size == 0) return false;
     std::shared_lock<std::shared_mutex> lock(memory_mu_);
     auto it = memory_.find(client_id);
     if (it == memory_.end()) return false;
-    return ResolveRangeInRegions(it->second, region_base, offset, size, out_ptr,
-                                 /*allow_zero=*/false);
+    RegionPtr region;
+    if (!ResolveRangeInRegions(it->second, region_base, offset, size, out_ptr, /*allow_zero=*/false,
+                               &region)) {
+      return false;
+    }
+    if (pins) pins->Add(region);
+    return true;
   }
 
-  static bool ResolveRangeInRegions(const std::vector<RegisteredMemory>& regions,
-                                    uint64_t region_base, uint64_t offset, uint64_t size,
-                                    uintptr_t* out_ptr, bool allow_zero) {
+  static bool ResolveRangeInRegions(const std::vector<RegionPtr>& regions, uint64_t region_base,
+                                    uint64_t offset, uint64_t size, uintptr_t* out_ptr,
+                                    bool allow_zero, RegionPtr* out_region) {
     if (!out_ptr || (!allow_zero && size == 0)) return false;
-    for (const auto& mem : regions) {
+    for (const auto& region : regions) {
+      const RegisteredMemory& mem = region->mem;
       if (region_base != 0 && mem.worker_base != region_base) continue;
       if (offset > mem.size || size > mem.size - offset) {
         if (region_base != 0) return false;
         continue;
       }
       *out_ptr = reinterpret_cast<uintptr_t>(mem.base) + static_cast<uintptr_t>(offset);
+      if (out_region) *out_region = region;
       return true;
     }
     return false;
   }
 
   bool ResolveRanges(const std::string& client_id, const std::vector<RangeQuery>& queries,
-                     std::vector<uintptr_t>* ptrs, bool allow_zero) {
+                     std::vector<uintptr_t>* ptrs, bool allow_zero, RegionPins* pins) {
     if (!ptrs) return false;
     ptrs->clear();
     ptrs->reserve(queries.size());
@@ -1504,17 +1639,20 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     for (const auto& query : queries) {
       uintptr_t ptr = 0;
+      RegionPtr region;
       if (!ResolveRangeInRegions(it->second, query.region_base, query.offset, query.size, &ptr,
-                                 allow_zero)) {
+                                 allow_zero, &region)) {
         ptrs->clear();
         return false;
       }
+      if (pins) pins->Add(region);
       ptrs->push_back(ptr);
     }
     return true;
   }
 
-  bool ResolveBatch(const ::umbp::BatchDataRequest& request, std::vector<uintptr_t>* ptrs) {
+  bool ResolveBatch(const ::umbp::BatchDataRequest& request, std::vector<uintptr_t>* ptrs,
+                    RegionPins* pins) {
     // region_bases is optional for legacy single-region callers; when present it
     // must be parallel to keys.
     const bool has_region_bases = request.region_bases_size() > 0;
@@ -1529,7 +1667,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       uint64_t region_base = has_region_bases ? request.region_bases(i) : 0;
       queries.push_back({region_base, request.shm_offsets(i), request.sizes(i)});
     }
-    return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false);
+    return ResolveRanges(request.client_id(), queries, ptrs, /*allow_zero=*/false, pins);
   }
 
   // `key_count` rather than request.keys_size(): a get may name its keys by a
@@ -1619,16 +1757,33 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   std::unique_ptr<grpc::Server> server_;
   std::atomic<bool> shutdown_{false};
 
-  // Data operations acquire client_mu_ before memory_mu_ and keep the client
-  // lock through the backend call, making it the lifetime barrier for resolved
-  // host/GPU mappings. Lifecycle paths never hold the two locks at once.
+  // client_mu_ answers one question only: is the inner client still usable?
+  // Everything that calls into it -- data operations, memory registration,
+  // deregistration -- holds it SHARED, because the inner DistributedClient
+  // already runs those concurrently by design (its own op_mutex_ has exactly
+  // this shape). Only Clear and shutdown take it exclusively.
+  //
+  // It is deliberately NOT the lifetime barrier for resolved host/GPU mappings
+  // any more. That job belongs to RegionPins, which scopes the guarantee to the
+  // one mapping a copy touches instead of to every client on the node -- see
+  // RegionPins and ReleaseRegisteredMemory.
+  //
+  // Lock order where both are taken: client_mu_ before memory_mu_. Lifecycle
+  // paths never hold the two at once, and never hold either while waiting for
+  // pins to drain.
   std::shared_mutex client_mu_;
   mutable std::shared_mutex memory_mu_;
   std::mutex ipc_mu_;
+  // Signals "a mapping you may be waiting on just went unpinned". Separate from
+  // the two locks above so that draining a region cannot block the very
+  // operations that have to finish for it to drain.
+  std::mutex unpin_mu_;
+  std::condition_variable unpin_cv_;
+  std::atomic<int> unpin_waiters_{0};
   // A worker registers N non-contiguous host regions (e.g. DeepSeek-V4's KV
   // side pools), so each client_id maps to a list of regions, resolved by
   // worker_base at data-op time.
-  std::map<std::string, std::vector<RegisteredMemory>> memory_;
+  std::map<std::string, std::vector<RegionPtr>> memory_;
   std::map<IpcKey, IpcMapping> ipc_maps_;
   std::mutex external_identity_lifecycle_mu_;
   std::mutex external_identity_mu_;
