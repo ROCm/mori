@@ -99,10 +99,9 @@ struct EvictionConfig {
   double low_watermark = 0.7;
   std::chrono::seconds check_interval{5};
   std::chrono::seconds lease_duration{2};
-  size_t evict_batch_size = 32;
 
-  // Only timing fields are env-overridable here; watermarks and batch size
-  // have dedicated tuning paths and are intentionally excluded.
+  // Only timing fields are env-overridable here; watermarks have dedicated
+  // tuning paths and are intentionally excluded.
   static EvictionConfig FromEnvironment() {
     EvictionConfig cfg;
     cfg.check_interval =
