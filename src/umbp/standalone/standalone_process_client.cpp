@@ -81,14 +81,30 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
 // Every data-plane RPC below used to construct a bare grpc::ClientContext with
 // no deadline, so a server-side stall (observed: BatchExists never returning
 // under real long-context load, standalone_server.cpp handler wedged) blocked
-// the calling scheduler rank forever with no way out. 10s is generous relative
-// to the sub-second round trips these calls normally take, including a
-// BatchExists/BatchGetRanges covering a long context's full page list; a
-// caller that hits this deadline sees the same grpc::Status as a genuine RPC
-// failure (already handled as "not found" / no-op, not an exception).
+// the calling scheduler rank forever with no way out. A caller that hits this
+// deadline sees the same grpc::Status as a genuine RPC failure (already
+// handled as "not found" / no-op, not an exception).
+//
+// 10s was the original value here and is NOT generous: standalone_server.cpp
+// holds client_mu_ exclusively for a BatchPutRanges/BatchPutWithDepth call's
+// full duration, including the actual bulk copy, and BatchExists/BatchGet
+// only get a shared lock on the same mutex -- so a rank's own burst of first-
+// time offloads at warmup start can queue that same rank's BatchExists calls
+// behind them. Measured directly (py-spy --native during the stall, single
+// node, TP8): 70-260s waits at CONC=24-48 before the queue drained on its
+// own. 300s leaves real margin above that measured ceiling for single-node,
+// and for a distributed/multi-node deployment (extra network RTT, a busier
+// peer, more concurrent ranks queuing on the same connection) the same
+// contention only gets worse, not better. This is a bound on a real
+// deadlock, not a tuned "typical latency" value -- raising it costs nothing
+// but a slower failure report on an actually-wedged server; setting it too
+// low costs silently misclassifying calls that were about to succeed as
+// failures. This is a stopgap against the deadlock, not a fix for the lock
+// itself -- the actual contention is standalone_server.cpp's client_mu_
+// serializing reads behind a write's full copy duration.
 int DataPlaneRpcTimeoutMs() {
   static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_DATA_PLANE_RPC_TIMEOUT_MS",
-                                                           std::chrono::milliseconds(10000),
+                                                           std::chrono::milliseconds(300000),
                                                            /*min_allowed=*/1)
                                             .count());
   return v;
