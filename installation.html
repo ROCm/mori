@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Install MORI &mdash; MORI development (9a0ad39a) documentation</title>
+  <title>Install MORI &mdash; MORI development (baa1e022) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=fdcb6a13"></script>
+      <script src="_static/documentation_options.js?v=e4015a61"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -632,10 +632,19 @@ Do not install both at the same time — uninstall one before installing the oth
 <h4>From source<a class="headerlink" href="#from-source" title="Link to this heading"></a></h4>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>clone<span class="w"> </span>--recursive<span class="w"> </span>https://github.com/ROCm/mori.git
 <span class="nb">cd</span><span class="w"> </span>mori
-<span class="c1"># NOTE: for venv build, add --no-build-isolation at the end</span>
 pip<span class="w"> </span>install<span class="w"> </span>.
 </pre></div>
 </div>
+<p>For a venv build, add <code class="docutils literal notranslate"><span class="pre">--no-build-isolation</span></code> — and install the build
+dependencies first, because that flag is exactly what stops pip from reading
+them out of <code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>requirements-build.txt
+pip<span class="w"> </span>install<span class="w"> </span>.<span class="w"> </span>--no-build-isolation
+</pre></div>
+</div>
+<p>Skipping the first line leaves the build without Cython, and it only <em>warns</em>
+before dropping the <code class="docutils literal notranslate"><span class="pre">mori.cco.cco</span></code> extension, taking the flydsl EP backend with
+it — on an install that otherwise reports success. <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">tools/verify_install.py</span></code> checks for exactly that.</p>
 <p>No hipcc needed at install time — host code compiles with a standard
 C++ compiler. GPU kernels are JIT-compiled on first use and cached to
 <code class="docutils literal notranslate"><span class="pre">~/.mori/jit/</span></code>. If a GPU is detected during install, kernel precompilation
