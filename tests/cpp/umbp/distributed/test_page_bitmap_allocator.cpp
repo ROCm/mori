@@ -82,6 +82,64 @@ TEST(PageBitmapAllocatorTest, AllocateZeroPagesReturnsNullopt) {
   EXPECT_EQ(alloc.AvailableBytes(), alloc.TotalBytes());
 }
 
+TEST(PageBitmapAllocatorTest, NumaPrefersLocalFragmentsOverRemoteContinuousPages) {
+  auto alloc = MakeAllocator(2, 8);
+  auto local = alloc.Allocate(8, 1);
+  ASSERT_TRUE(local);
+  alloc.Deallocate({(*local)[1], (*local)[3], (*local)[5]});
+  auto pages = alloc.Allocate(3, 1);
+  ASSERT_TRUE(pages);
+  for (const auto& page : *pages) EXPECT_EQ(page.buffer_index, 1u);
+}
+
+TEST(PageBitmapAllocatorTest, NumaUsesLocalRemainderBeforeRemoteBuffer) {
+  auto alloc = MakeAllocator(2, 20);
+  auto local = alloc.Allocate(17, 1);
+  ASSERT_TRUE(local);
+  auto pages = alloc.Allocate(10, 1);
+  ASSERT_TRUE(pages);
+  ASSERT_EQ(pages->size(), 10u);
+  for (size_t i = 0; i < pages->size(); ++i) {
+    EXPECT_EQ((*pages)[i].buffer_index, i < 3 ? 1u : 0u);
+  }
+  auto spill = alloc.Allocate(1, 1);
+  ASSERT_TRUE(spill);
+  EXPECT_EQ(spill->front().buffer_index, 0u);
+  EXPECT_EQ(alloc.Buffers()[0].cursor, 8u);
+}
+
+TEST(PageBitmapAllocatorTest, NumaNoSpaceDoesNotConsumeLocalRemainder) {
+  auto alloc = MakeAllocator(2, 4);
+  ASSERT_TRUE(alloc.Allocate(3, 1));
+  const auto before = alloc.Buffers();
+  EXPECT_FALSE(alloc.Allocate(6, 1));
+  for (size_t i = 0; i < before.size(); ++i) {
+    EXPECT_EQ(alloc.Buffers()[i].bitmap, before[i].bitmap);
+    EXPECT_EQ(alloc.Buffers()[i].free_count, before[i].free_count);
+    EXPECT_EQ(alloc.Buffers()[i].cursor, before[i].cursor);
+  }
+}
+
+TEST(PageBitmapAllocatorTest, NumaUnknownPreferencePreservesAllocationOrder) {
+  auto legacy = MakeAllocator(2, 8);
+  auto no_hint = MakeAllocator(2, 8);
+  auto invalid = MakeAllocator(2, 8);
+  for (uint32_t count : {3, 6, 5, 2, 1}) {
+    auto expected = legacy.Allocate(count);
+    auto a = no_hint.Allocate(count, std::nullopt);
+    auto b = invalid.Allocate(count, 99);
+    ASSERT_EQ(expected.has_value(), a.has_value());
+    ASSERT_EQ(expected.has_value(), b.has_value());
+    if (!expected) continue;
+    for (size_t i = 0; i < expected->size(); ++i) {
+      EXPECT_EQ((*expected)[i].buffer_index, (*a)[i].buffer_index);
+      EXPECT_EQ((*expected)[i].page_index, (*a)[i].page_index);
+      EXPECT_EQ((*expected)[i].buffer_index, (*b)[i].buffer_index);
+      EXPECT_EQ((*expected)[i].page_index, (*b)[i].page_index);
+    }
+  }
+}
+
 TEST(PageBitmapAllocatorTest, BasicAllocateSinglePageContinuous) {
   auto alloc = MakeAllocator(1, 4);
   uint64_t total = alloc.TotalBytes();

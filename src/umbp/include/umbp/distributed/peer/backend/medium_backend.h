@@ -124,6 +124,7 @@ enum class AllocateOutcome {
 struct AllocateRequest {
   std::string key;
   uint64_t size = 0;
+  int preferred_numa_node = -1;
 };
 
 // Populated fields below `outcome` are meaningful ONLY when

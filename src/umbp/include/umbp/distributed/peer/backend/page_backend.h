@@ -111,8 +111,10 @@ class HostPageMemorySource final : public PageMemorySource {
   struct Options {
     bool use_hugepages = false;
     uint64_t hugepage_size = 2ULL * 1024 * 1024;
-    int numa_node = -1;
+    std::vector<int> numa_nodes;
     bool prefault = true;
+    bool numa_strict = false;
+    int prefault_threads = 0;
   };
 
   explicit HostPageMemorySource(Options opts) : opts_(opts) {}
@@ -189,8 +191,10 @@ class PageBackend : public MediumBackend {
     std::vector<uint64_t> buffer_sizes;
     bool use_hugepages = false;
     uint64_t hugepage_size = 2ULL * 1024 * 1024;
-    int numa_node = -1;
+    std::vector<int> numa_nodes;
     bool prefault = true;
+    bool numa_strict = false;
+    int prefault_threads = 0;
   };
 
   // `pending_ttl` is the only TTL in the system.  After this elapses
@@ -441,7 +445,8 @@ class PageBackend : public MediumBackend {
     }
   }
 
-  AllocateResult AllocateLocked(const std::string& key, uint64_t size);
+  AllocateResult AllocateLocked(const std::string& key, uint64_t size,
+                                int preferred_numa_node = -1);
   bool CommitLocked(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed);
   bool AbortLocked(uint64_t slot_id);
 
@@ -510,6 +515,7 @@ class PageBackend : public MediumBackend {
   };
 
   TierType tier_;
+  std::vector<int> buffer_numa_nodes_;
   // Reader/writer, not exclusive: Resolve, BatchResolve and Contains are the
   // hot path of a 100%-hit restore and only read owned_/pending_, so they take
   // a shared lock and run concurrently.  Everything that mutates the index

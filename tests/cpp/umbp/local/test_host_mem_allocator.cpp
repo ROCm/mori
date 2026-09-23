@@ -364,12 +364,41 @@ void TestFreeInvalidatesHandle() {
 
 }  // namespace
 
+void TestNumaFailureAndParallelPrefault() {
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.numa_node = 9999;
+  opts.require_numa_binding = true;
+  auto bad = allocator.Alloc(4096, opts);
+  assert(!bad.valid());
+  opts.require_numa_binding = false;
+  opts.numa_bind_mode = NumaBindMode::kPreferred;
+  auto fallback = allocator.Alloc(4096, opts);
+  assert(fallback.valid());
+  allocator.Free(fallback);
+
+  opts.numa_node = -1;
+  opts.prefault_threads = 4;
+  constexpr size_t bytes = 256ULL << 20;
+  auto parallel = allocator.Alloc(bytes, opts);
+  assert(parallel.valid());
+  auto* data = static_cast<unsigned char*>(parallel.ptr);
+  for (size_t offset = 0; offset < bytes; offset += GetPageSize()) {
+    assert(data[offset] == 0);
+    data[offset] = 0xa5;
+  }
+  assert(data[bytes - 1] == 0);
+  allocator.Free(parallel);
+  std::printf("    NUMA failure policy / parallel prefault PASS\n");
+}
+
 int main() {
   std::printf("=== test_host_mem_allocator ===\n");
   TestAnonymousAllocFreeRoundTrip();
   TestAnonymousHugetlbWhenAvailable();
   TestHugetlbFallsBackToAnonymous();
   TestNumaBindingActuallyBinds();
+  TestNumaFailureAndParallelPrefault();
   TestNullHandleAfterAllocFailure();
   TestMappedSizeRoundsUp();
   TestDoubleFreeIsSafe();

@@ -43,6 +43,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "mori/application/utils/cpu_affinity.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
@@ -723,8 +724,10 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
       ownership.buffer_sizes = config.dram.buffer_sizes;
       ownership.use_hugepages = config.dram.use_hugepages;
       ownership.hugepage_size = config.dram.hugepage_size;
-      ownership.numa_node = config.dram.numa_node;
+      ownership.numa_nodes = config.dram.numa_nodes;
       ownership.prefault = config.dram.prefault;
+      ownership.numa_strict = config.dram.numa_strict;
+      ownership.prefault_threads = config.dram.prefault_threads;
       return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
                              /*pending_ttl=*/std::chrono::milliseconds{30000},
                              /*read_lease_ttl=*/DramReadLeaseTtl());
@@ -899,6 +902,25 @@ bool PoolClient::Init() {
     return false;
   }
   medium_ = backend_configs.front().tier;  // legacy default for paths without a routed tier
+  gpu_to_numa_.clear();
+  const bool numa_placement =
+      std::any_of(backend_configs.begin(), backend_configs.end(), [](const auto& backend) {
+        return backend.tier == TierType::DRAM && backend.dram.numa_nodes.size() > 1;
+      });
+  if (numa_placement) {
+    int count = 0;
+    if (hipGetDeviceCount(&count) == hipSuccess) {
+      for (int device = 0; device < count; ++device) {
+        int node = -1;
+        mori::application::detail::GpuLocalCpuList(device, node);
+        if (node >= 0) gpu_to_numa_.emplace(device, node);
+      }
+    }
+    if (gpu_to_numa_.empty()) {
+      MORI_UMBP_WARN(
+          "[PoolClient] NUMA tier configured but GPU affinity is unavailable; no steering");
+    }
+  }
   for (const auto& backend_config : backend_configs) {
     if (backend_config.name.empty() || registry_.Get(backend_config.name) != nullptr) {
       MORI_UMBP_ERROR("[PoolClient] backend instance name '{}' is empty or duplicated",
@@ -1320,6 +1342,14 @@ std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t siz
   return {ClassifiedUserBytes(ptr, size), 0};
 }
 
+int PoolClient::PreferredNumaNodeFor(void* ptr, size_t size) const {
+  if (gpu_to_numa_.empty()) return -1;
+  const auto ref = UserBufferRef(ptr, size).first;
+  if (ref.loc != mori::io::MemoryLocationType::GPU || ref.device < 0) return -1;
+  const auto it = gpu_to_numa_.find(ref.device);
+  return it == gpu_to_numa_.end() ? -1 : it->second;
+}
+
 // ---------------------------------------------------------------------------
 //  Self-target paths
 //
@@ -1383,6 +1413,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.size = size;
   request.tier = tier;
   request.logical_tier = logical_tier;
+  request.preferred_numa_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
   auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
@@ -1775,9 +1806,12 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     PhaseTimer alloc_timer(sinks.resolve);
     std::vector<PoolPlacementRequest> asks;
     asks.reserve(requests.size());
+    const auto& first_range = requests.front().ranges.front();
+    const int preferred_node = PreferredNumaNodeFor(first_range.user, first_range.size);
     for (const auto& request : requests) {
       asks.push_back(PoolPlacementRequest{*request.key, request.object_size, request.tier,
-                                          /*backend_name=*/{}, request.logical_tier});
+                                          /*backend_name=*/{}, request.logical_tier,
+                                          preferred_node});
     }
     allocations = default_pool_->BatchAllocate(asks);
     allocations.resize(requests.size());
