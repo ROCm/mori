@@ -6,19 +6,20 @@ the epilogue of mori's 8-wave fp8 GEMM.
 **Headline: at every shape measured here, fusing an all-gather is slower than
 not fusing it — and not because the fusion fails to overlap.** At
 `wkv_gate-r4 M=512`, `fused-sdma --chunks 4` cuts the exposed communication from
-50.9us to 21.8us, absorbing 57% of it. The transfer really is hidden. What
-happens instead is that the epilogue's publication cost roughly doubles the
-GEMM, from 53.6us to ~106us, which is more than the 29us it saved.
+50.6us to 20.8us, absorbing 59% of it. The transfer really is hidden. What
+happens instead is that *issuing* the puts roughly doubles the GEMM, from 52.8us
+to 105.8us, which is more than the 29.8us of communication it saved.
 
 So there are two separate findings here and they should not be conflated:
 
-* a **bound**, derived in *Why fusing does not pay*, which says all-gather has
+* a **bound**, derived in *The bound fusing runs into*, which says all-gather has
   less to gain from fusion than either sibling operator and gets worse as the
   world grows; and
-* a **cost**, the per-block whole-L2 writeback the fused epilogue needs before
-  it may publish a chunk, which is the same line `gemm_a2a` calls "the single
-  most expensive line in this epilogue". That one is an engineering target, not
-  a law.
+* a **cost**, which `--no-put` and `--fence none` between them pin down: not
+  the release fence (that is free at these grid sizes, unlike in `gemm_a2a`) and
+  not bookkeeping, but the 39–55us the epilogue spends *issuing* its SDMA puts
+  one thread at a time. That one is an engineering target, not a law, and
+  *Reading the tables* says what the fix is.
 
 The operator is worth having today for its split paths, which beat RCCL. The
 fused paths are documented as measured, not as hoped for.
@@ -76,7 +77,7 @@ bandwidth-bound member of the family.
 ## Conditions
 
 8x MI355X (gfx950), fp8 e4m3 in / bf16 out, CUDA graph replay, median of 21
-iterations after 30 warmups, max over ranks. Tile is 128x256 under `--quant
+iterations after 10 warmups, max over ranks. Tile is 128x256 under `--quant
 ptpc` and 256x256 under `--quant mxfp8`, which needs `BLOCK_M=256` for the scale
 operands. Every launch waits for an idle box; any sample taken with a neighbour
 present is discarded rather than averaged in, and clock and junction temperature
@@ -86,49 +87,190 @@ communicates nothing.
 
 ## Results
 
-<!-- FILLED FROM sweep_models.py -->
+`--quant ptpc`, `K = 7168`, `world = 8`. `gemm` and `comm` are the same-run
+phase split (`--phase-split`): the GEMM is re-timed inside the same process
+group, because "mode total minus a separate `gemm-only` run" charges the
+transfer for the clock ramp between two process groups. `fused-lsa` has no
+collective kernel to split against, so only its total is shown.
 
-## Why fusing does not pay
+### wkv_gate ratio-4 — `N=2048` — 14 MiB/rank on the wire at M=512, 56 at M=2048
+
+| mode | M=512 total | gemm | comm | M=2048 total | gemm | comm |
+|---|---:|---:|---:|---:|---:|---:|
+| `gemm-only` | 53.4 | — | — | 61.7 | — | — |
+| `split-rccl` | 117.4 | 52.5 | 64.9 | 233.4 | 56.3 | 175.2 |
+| `split-lsa-push` | **96.6** | 52.6 | 44.0 | 213.8 | 56.4 | 155.0 |
+| `split-lsa-pull` | 103.4 | 52.3 | 51.0 | 217.9 | 56.1 | 158.0 |
+| `split-sdma` | 105.3 | 52.8 | 50.6 | **211.2** | 56.6 | 153.9 |
+| `fused-lsa` | 114.6 | — | — | 268.2 | — | — |
+| `fused-sdma` `c4` | 127.2 | 105.8 | 20.8 | 235.4 | 117.2 | 115.4 |
+
+### wkv_gate ratio-128 — `N=1024` — 7 MiB/rank at M=512, 28 at M=2048
+
+A shape `gemm_a2a` cannot run at all: `a2a_config` requires `N` to be a
+multiple of `world*block_n = 2048`.
+
+| mode | M=512 total | gemm | comm | M=2048 total | gemm | comm |
+|---|---:|---:|---:|---:|---:|---:|
+| `gemm-only` | 41.4 | — | — | 53.6 | — | — |
+| `split-rccl` | 89.1 | 40.2 | 45.3 | 158.0 | 52.6 | 102.8 |
+| `split-lsa-push` | **67.3** | 40.6 | 26.7 | **137.8** | 53.1 | 84.7 |
+| `split-lsa-pull` | 77.7 | 40.0 | 37.8 | 143.5 | 52.9 | 87.6 |
+| `split-sdma` | 77.6 | 40.3 | 34.3 | 140.5 | 53.0 | 87.5 |
+| `fused-lsa` | 87.6 | — | — | 154.9 | — | — |
+| `fused-sdma` `c4` | 108.3 | 88.3 | 17.3 | 162.0 | 108.1 | 53.7 |
+
+### Where the fused epilogue's time goes
+
+`--no-put` runs the whole epilogue — the release fence, the completion counter,
+the submit lock — and simply does not post, so it prices the bookkeeping apart
+from the transfer. `--fence none` drops the release.
+
+| cell | split `gemm` | fused `gemm` | `--no-put` `gemm` | bookkeeping | the puts |
+|---|---:|---:|---:|---:|---:|
+| r4 @ M512 | 52.8 | 105.8 | 66.8 | +14.0 | **+39.0** |
+| r4 @ M2048 | 56.6 | 117.2 | 62.3 | +5.7 | **+54.9** |
+| r128 @ M512 | 40.3 | 88.3 | 42.2 | +1.9 | **+46.1** |
+| r128 @ M2048 | 53.0 | 108.1 | 55.2 | +2.2 | **+52.9** |
+
+`--fence none` moves the total by −2.5 to +0.5us — inside the noise at every
+cell. **The release fence is not the cost here**, which is worth saying because
+`gemm_a2a` calls it "the single most expensive line in this epilogue". The
+difference is grid size: a2a's fused path at M=16384 has 9216 blocks each doing
+a whole-L2 writeback, and these cells have 32 to 128.
+
+### The all-gather quantisation matrix
+
+Every mode under every quantisation, at `wkv_gate-r4 M=2048`. All validate at
+relL2 1.66e-3.
+
+| mode | ptpc | blockscale | mxfp8 |
+|---|---:|---:|---:|
+| `gemm-only` | 57.3 | 96.3 | 86.3 |
+| `gemm-to-window` | 57.5 | 96.1 | 92.7 |
+| `split-rccl` | 231.8 | 266.9 | 266.0 |
+| `split-lsa-push` | 212.6 | 248.3 | 244.2 |
+| `split-lsa-pull` | 217.0 | 251.0 | 248.8 |
+| `fused-lsa` | 265.8 | 328.1 | 292.4 |
+| `split-sdma` | 212.5 | 245.4 | 242.2 |
+| `fused-sdma` `c1` | 223.6 | 259.1 | 250.7 |
+
+`fused-sdma` chunk ladder at ptpc, three launches each, spread under 1.1%:
+`c1` 223.6, `c2` 227.2, `c4` 235.2, `c8` 249.2. Monotone the wrong way, for the
+reason the next section gives.
+
+## Reading the tables
+
+**Writing the window costs nothing.** `gemm-to-window` is within 0.4% of
+`gemm-only` at ptpc. The split paths' GEMM really is `gemm-only`'s kernel, so
+"split total minus GEMM" is a clean measure of the transport.
+
+**Every mori transport beats RCCL**, by 10–25%. That comparison is as clean as
+it gets: `split-rccl` and `split-sdma` run the same GEMM over the same bytes in
+the same layout, and only the collective differs.
+
+**Push beats pull, everywhere — the opposite of `gemm_ar`'s gather leg**, which
+found pull worth 5.6–10.5% over an SDMA push. The margin here is 2–29% on the
+comm phase and is largest at the small shapes. The GEMM phase is equal to within
+0.5us, so pull's mandatory `sc0|sc1` C store is not the cause. The likely reason
+is the obvious one: a push is a fire-and-forget store and a pull is a load that
+must round-trip, so pull pays fabric latency that push hides. gemm_ar's
+contrary result was against a *copy-engine* push, not an LSA one.
+
+This matters beyond the ranking, because pull is where a low-precision wire
+would want its dequantize — in registers on the consumer, which is where
+`gemm_ar` measured it as free against a 61.0us widen kernel. That trade is now
+quantified: choosing pull for the sake of a cheap dequantize starts 2–29% behind.
+
+**`fused-sdma` genuinely overlaps.** It cuts the exposed communication by 25–59%
+at every cell, which is the mechanism working as designed — better, in fraction,
+than `gemm_ar`'s all-reduce absorbs.
+
+**And it loses anyway, because issuing the puts costs the GEMM 39–55us.** That
+figure is nearly constant across four cells whose payloads differ by 8x, which
+rules out DMA bandwidth contention and points at a fixed per-packet cost. At
+`--chunks 4` and `world=8` the epilogue posts `4 * 7 = 28` puts, so 39–55us is
+1.4–2.0us each — and `gemm_ar`'s layout gives the constant independently:
+SDMA is *"~2us per packet regardless of size"*.
+
+**The 28 puts are issued serially by one thread, and they need not be.**
+`gemm_a2a` posts the same 28 from **28 different blocks** — its counter elects
+per `(destination, chunk)`, so an elected block owns one destination and posts
+exactly one put, and the 28 go out concurrently. That is why a2a measures its
+PUT at 0.8us total where this measures 39–55us. This operator's counter elects
+per chunk (a broadcast chunk arms every destination at once), so one thread
+posts all seven, under one submit lock, four times.
+
+That is the identified next step, and it is a change to the epilogue rather than
+to the design: elect on thread 0 as now, broadcast the election through LDS, and
+have lanes `0..world-2` of the elected wave each post one put on its own queue —
+which also removes the lock, since the collision the lock exists for is two
+chunks reaching the same queue. The chunk ladder going the wrong way
+(223.6 → 249.2 from `c1` to `c8`) is the same effect seen from the other end:
+more chunks means proportionally more serialised posts.
+
+**`fused-lsa` is the slowest mode at every cell**, 8–26% behind its own split
+baseline. Its epilogue stores each tile `world` times from inside the GEMM, so
+the CUs carry all `(world-1)*M*N*2` bytes of the transfer while also running the
+MFMA pipeline — where the split path hands that traffic to a kernel that is
+doing nothing else. This is the cost `peer_rsrcs` was added to minimise (one
+scale load, one convert, one shuffle, `world` stores) and minimising it is not
+enough.
+
+## The bound fusing runs into
+
+Separately from the per-packet cost above, there is a ceiling that no amount of
+epilogue work can lift, and it is worth having written down because it says
+where to spend effort next.
 
 Producer-side fusion overlaps the transfer with the compute that produces it, so
-the best it can do is replace `G₀ + C₀` with `max(G₀, C₀)`. Its ceiling is
-therefore
+the best it can do is replace `G₀ + C₀` with `max(G₀, C₀)`:
 
     saving ≤ min(G₀, C₀) / (G₀ + C₀)
 
-and for an all-gather that ratio is fixed by the shape, not by the code:
+For an all-gather the ratio inside that is fixed by the shape, not by the code:
 
     G₀ ∝ 2·M·N·K / FLOPS        C₀ ∝ M·N·(world−1)·2 / BW
 
     G₀ / C₀  ∝  K · BW / ((world−1) · FLOPS)
 
 `M` and `N` cancel. **The only levers are `K` and `world`** — more reduction
-depth per output element, or fewer peers to broadcast to. At `K = 7168` and
-`world = 8` the measured ratio is `57 / 155`, so the ceiling on any fusion of
-this collective at this shape is 27%, and the fused epilogue's own cost exceeds
-it.
+depth per output element, or fewer peers to broadcast to. Measured: at
+`r4 M=2048` the ratio is `56.6 / 153.9`, so the ceiling is 27%; at
+`r4 M=512` it is `52.8 / 50.6` and the ceiling is 49%. Neither is reached, but
+the first is not far above the 25% of communication that `fused-sdma` already
+absorbs there.
 
-Contrast the sibling operators, which is the useful part:
+Now do the same for the siblings, which is the useful part:
 
-| | bytes on the wire per rank | `G₀/C₀` scales as | measured fused gain |
-|---|---|---|---|
-| `gemm_ar` (all-reduce) | `2·M·N/world` per leg | `K·world` | absorbs ~37% of comm |
-| `gemm_a2a` (all-to-all) | `M·N·(world−1)/world` | `K·world` | 3.5–15.9% end to end |
-| `gemm_ag` (all-gather) | `M·N·(world−1)` | `K/world` | negative |
+| | bytes on the wire per rank | `G₀/C₀` scales as |
+|---|---|---|
+| `gemm_ar` (all-reduce) | `≈ 2·M·N` (both legs, shard cancels) | `K` |
+| `gemm_a2a` (all-to-all) | `M·N·(world−1)/world ≈ M·N` | `K` |
+| `gemm_ag` (all-gather) | `M·N·(world−1)` | `K / (world−1)` |
 
-All-gather is the only one of the three where **adding ranks makes fusion
-*less* attractive**: every extra rank adds a full copy of the payload to the
-wire while adding nothing to the compute. The other two shard the payload by
-`world`, so scaling out leaves the ratio flat or improves it.
+Both siblings shard the payload by `world`, so their ratio is
+**independent of the world size**: adding ranks adds compute and communication
+in step. All-gather does not shard anything, so every extra rank adds a full
+copy of the payload to the wire while adding nothing to the compute. It is the
+one member of the family where **scaling out makes fusion less attractive**, and
+the only one whose fused margin should be re-measured whenever `world` changes.
 
-This is the same structural reasoning as the "post-barrier phase" account of why
-all-reduce absorbs 37% and an EP combine absorbs 81%, applied one level up: that
-one asks what fraction of the collective is fusable, this one asks whether there
-is enough compute to fuse it into.
+Two consequences follow, and they are the recommendations this file exists to
+make:
 
-## Reading the tables
+* **`world < 8` is where the fused paths might come back.** At `world = 2` the
+  ratio is seven times better than measured here.
+* **A narrower wire moves this lever directly**, and moves it for the split
+  paths too. fp8 on the wire halves `C₀`, which at `r4 M=2048` would take the
+  split total from 211 to roughly 134 — a larger win than any fusion of the
+  bf16 wire can offer, and it compounds with fixing the put serialisation rather
+  than competing with it. That is the next thing to build.
 
-<!-- FILLED FROM sweep_models.py -->
+This is the same kind of reasoning as the "post-barrier phase" account of why an
+all-reduce absorbs ~37% of its communication and an EP combine absorbs ~81%,
+applied one level up: that one asks what fraction of the collective is fusable,
+this one asks whether there is enough compute to fuse it into.
 
 ## A correctness note worth keeping
 
@@ -220,4 +362,11 @@ launches and retry a lost race rather than recording it.
 * `world != 8`. The `G₀/C₀` derivation says fusion gets *more* attractive as
   `world` falls, so 2 and 4 ranks are the regime where the fused paths might
   come back.
-* `--chunks` past 8.
+* `--chunks` past 8, and the chunk ladder at anything but `r4 M=2048`.
+* The 70B (`N=10240 K=8192`) and 405B (`N=18432 K=16384`) shapes, which
+  `sweep_models.py` carries so this operator's table can be read against
+  `gemm_a2a`'s on the same box. They are the high-`K` end, where the bound says
+  fusion has the most room.
+* `--split-gemm epilogue`, `--peer-uncached`, `--push-unroll` and
+  `--copy-blocks`. All are wired into `sweep_ag.py` and none were swept; the
+  numbers above are at their defaults.
