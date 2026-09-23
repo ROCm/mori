@@ -540,7 +540,13 @@ class _SwapABStoreC(StoreC):
     """
 
     def __init__(
-        self, *args, peer_rsrc=None, elem_base=None, scales_preapplied=False, **kwargs
+        self,
+        *args,
+        peer_rsrc=None,
+        peer_rsrcs=None,
+        elem_base=None,
+        scales_preapplied=False,
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         # blockscale applies the scales per K-block in the mainloop, so by the
@@ -552,7 +558,23 @@ class _SwapABStoreC(StoreC):
         self.reg_bf16_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        # One destination (``peer_rsrc``) or several (``peer_rsrcs``). The
+        # plural exists for ``gemm_ag``, where the collective is a *broadcast*:
+        # one tile goes to every peer, so the scale loads, the convert and the
+        # permlane shuffle are done once and only the store repeats. Passing a
+        # list of single-resource store objects instead would redo all of that
+        # ``world`` times and price the epilogue rather than the transfer.
+        #
+        # ``_elem_base`` stays scalar because it is the same for every
+        # destination in that case: the base *address* differs per peer, the
+        # index into it does not.
+        if peer_rsrc is not None and peer_rsrcs is not None:
+            raise ValueError("pass peer_rsrc or peer_rsrcs, not both")
         self._peer_rsrc = peer_rsrc
+        if peer_rsrcs is not None:
+            self._peer_rsrcs = tuple(peer_rsrcs)
+        else:
+            self._peer_rsrcs = () if peer_rsrc is None else (peer_rsrc,)
         self._elem_base = elem_base
 
     def _scaled(self, v, a, b):
@@ -776,7 +798,7 @@ class _PermlaneStoreC(_SwapABStoreC):
                 col = base_col + (grp % 2) * 16 + (grp // 2) * 8
             oob = fx.Int32(self.c_rows * self.c_cols)
             idx = arith.select(col + 7 < self.c_cols, row * self.c_cols + col, oob)
-            if self._peer_rsrc is not None:
+            if self._peer_rsrcs:
                 # The store goes to a *peer*, so a cached one leaves the line
                 # dirty in whichever XCD's L2 this block ran on, where nothing
                 # downstream can reach it -- the barrier kernel is one block and
@@ -785,12 +807,15 @@ class _PermlaneStoreC(_SwapABStoreC):
                 # bf16 (a 2-byte partial-line write over the fabric loses
                 # updates), but the permlane stage makes it 16 bytes per lane and
                 # 64 contiguous per row, which is what makes it viable now.
-                buffer_store(
-                    out8,
-                    self._peer_rsrc,
-                    fx.Int32(idx) - self._elem_base,
-                    cache_modifier=CM_SC0_SC1 if self._peer_uncached else CM_CACHED,
-                )
+                # A single resource is one iteration and emits the IR this
+                # loop replaced; gemm_ar and gemm_a2a are unchanged by it.
+                for peer_rsrc in self._peer_rsrcs:
+                    buffer_store(
+                        out8,
+                        peer_rsrc,
+                        fx.Int32(idx) - self._elem_base,
+                        cache_modifier=CM_SC0_SC1 if self._peer_uncached else CM_CACHED,
+                    )
             else:
                 fx.memref_store_vec(out8, self.reg_bf16_8)
                 fx.copy(
