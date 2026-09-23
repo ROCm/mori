@@ -65,6 +65,15 @@ jobs:
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON BUILD_BENCHMARK=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
 
+      - name: Verify the install is complete
+        # This image is the only one built WITH_FLYDSL=1, so it is the only job
+        # that can assert both EP backends registered. A build that skips the
+        # mori.cco.cco extension loses flydsl with it and everything below still
+        # runs -- on the hip backend alone, silently halving the coverage.
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && python tools/verify_install.py"
+
       - name: Check internode arena region invariants
         run: |
           # Pure function of the config: no GPU, no process group, no RDMA, so it
