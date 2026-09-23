@@ -590,8 +590,34 @@ class CMakeBuild(build_ext):
         if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
             if self.compiler is None:
                 self.ensure_finalized()
-                from setuptools._distutils.ccompiler import new_compiler
-                from setuptools._distutils.sysconfig import customize_compiler
+                # Take new_compiler from the module holding the base build_ext
+                # super() reaches. `distutils` and `setuptools._distutils` load
+                # the same source as two separate modules, so each ends up with
+                # its own CCompiler class, and build_extension (setuptools >=
+                # 84) asserts isinstance against the one from its own module --
+                # a compiler built from the other copy fails that check even
+                # though it is otherwise fully configured.
+                from setuptools._distutils.ccompiler import (
+                    new_compiler as _default_new_compiler,
+                )
+                from setuptools._distutils.sysconfig import (
+                    customize_compiler as _default_customize_compiler,
+                )
+
+                bx_mod = next(
+                    (
+                        sys.modules[k.__module__]
+                        for k in type(self).__mro__
+                        if k.__module__.endswith("distutils.command.build_ext")
+                    ),
+                    None,
+                )
+                # getattr, not attribute access: a module that matched the name
+                # but re-exports neither helper must still fall back, not raise.
+                new_compiler = getattr(bx_mod, "new_compiler", _default_new_compiler)
+                customize_compiler = getattr(
+                    bx_mod, "customize_compiler", _default_customize_compiler
+                )
 
                 try:
                     # distutils / older setuptools signature
