@@ -389,6 +389,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._tokoff_wanted = (
             not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
         )
+
+        # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
+        # all dispatch schedule variants.  Must be set before _build_kernels
+        # because dispatch plans bind the pointer at construction time.
+        self.dispatch_staging = None
+        if self._is1250 and not cfg.is_internode:
+            raw_scale = self._scale_i32(cfg) * 4
+            stg_bytes = _ep_staging_bytes(
+                cfg.world_size, cfg.effective_max_recv, raw_scale
+            )
+            if stg_bytes > 0:
+                self.dispatch_staging = torch.zeros(
+                    stg_bytes, dtype=torch.uint8, device=dev
+                )
+
+
         self._kernels = self._build_kernels(cfg, self.arena)
 
         if cfg.is_internode:
@@ -442,17 +458,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     "per-block xdb epoch slots the entry barrier owns"
                 )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
-
-        self.dispatch_staging = None
-        if self._is1250:
-            raw_scale = self._scale_i32(cfg) * 4
-            stg_bytes = _ep_staging_bytes(
-                cfg.world_size, cfg.effective_max_recv, raw_scale
-            )
-            if stg_bytes > 0:
-                self.dispatch_staging = torch.zeros(
-                    stg_bytes, dtype=torch.uint8, device=dev
-                )
 
     # -- internode -------------------------------------------------------
     #
