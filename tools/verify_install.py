@@ -33,8 +33,9 @@ Two modes, because the two catch different things:
 ``--wheel PATH``  inspects the artifact that actually ships, before anything
                   installs it. No GPU and no ROCm needed, so it can gate a
                   publish step on the machine that built it.
-(no arguments)    inspects the installed package, which also covers a wheel that
-                  was complete but installed wrong.
+(no arguments)    inspects the installed package -- regular or editable --
+                  which also covers a wheel that was complete but installed
+                  wrong.
 """
 
 import argparse
@@ -73,26 +74,49 @@ def check_wheel(path: str) -> None:
     print(f"verify_install: {name} carries every required extension")
 
 
-def _leave_the_checkout() -> None:
-    """Drop the repo from sys.path and cwd before importing anything.
+def _drop_accidental_paths() -> str:
+    """Drop the paths that let a checkout answer ``import mori`` by accident.
 
-    Inside a checkout ``python/mori/`` can answer these imports on its own, so a
-    packaging miss would import fine and read as green.
+    The cwd, ``tools/`` and the repo root are never where an installer puts the
+    package, so anything resolving through them is the source tree standing in
+    for an install.
+
+    ``<repo>/python`` is deliberately kept: only ``pip install -e .`` puts it on
+    the path, through its own .pth file, so dropping it would fail this check on
+    every editable tree -- the layout README.md recommends for development, and
+    the one the gfx1250 images ship.
+
+    Returns the repo root so the caller can report which layout it found.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(here)
-    blocked = {os.getcwd(), here, repo, os.path.join(repo, "python")}
+    # Subtracted, not just omitted: the editable root has to survive even when
+    # it is also the cwd, and by then the two are the same string.
+    blocked = {os.getcwd(), here, repo} - {os.path.join(repo, "python")}
     sys.path[:] = [p for p in sys.path if p and os.path.abspath(p) not in blocked]
     os.chdir(tempfile.gettempdir())
+    return repo
 
 
 def check_install() -> None:
     """Assert the installed package exposes its extensions and EP backends."""
-    _leave_the_checkout()
+    repo = _drop_accidental_paths()
 
-    import mori
+    try:
+        import mori
+    except ImportError as exc:
+        _fail(
+            f"mori is not importable ({exc}). Nothing is installed -- the repo "
+            "itself is deliberately off sys.path here, so a checkout cannot "
+            "stand in for an install."
+        )
 
-    print(f"verify_install: mori {mori.__version__} from {mori.__file__}")
+    # An editable install resolves inside the checkout by design, so report the
+    # layout rather than treat it as suspect. Nothing below gets weaker: a
+    # source tree cannot produce the compiled extension either way.
+    editable = os.path.abspath(mori.__file__).startswith(repo + os.sep)
+    layout = "editable" if editable else "installed"
+    print(f"verify_install: mori {mori.__version__} ({layout}) from {mori.__file__}")
 
     # The package `mori.cco` imports cleanly from source; the submodule of the
     # same name is the compiled extension, and only it proves the build ran.

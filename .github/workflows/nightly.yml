@@ -930,6 +930,12 @@ jobs:
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:
+      # This job used to run off whatever an earlier job left in the workspace
+      # -- enough for `docker build -f docker/Dockerfile.dev .`, but not for
+      # tools/verify_install.py below, which a stale checkout would not have.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download PyPI wheel
         uses: actions/download-artifact@v4
         with:

@@ -597,6 +597,13 @@ class CMakeBuild(build_ext):
                 # 84) asserts isinstance against the one from its own module --
                 # a compiler built from the other copy fails that check even
                 # though it is otherwise fully configured.
+                from setuptools._distutils.ccompiler import (
+                    new_compiler as _default_new_compiler,
+                )
+                from setuptools._distutils.sysconfig import (
+                    customize_compiler as _default_customize_compiler,
+                )
+
                 bx_mod = next(
                     (
                         sys.modules[k.__module__]
@@ -605,12 +612,12 @@ class CMakeBuild(build_ext):
                     ),
                     None,
                 )
-                if bx_mod is not None:
-                    new_compiler = bx_mod.new_compiler
-                    customize_compiler = bx_mod.customize_compiler
-                else:
-                    from setuptools._distutils.ccompiler import new_compiler
-                    from setuptools._distutils.sysconfig import customize_compiler
+                # getattr, not attribute access: a module that matched the name
+                # but re-exports neither helper must still fall back, not raise.
+                new_compiler = getattr(bx_mod, "new_compiler", _default_new_compiler)
+                customize_compiler = getattr(
+                    bx_mod, "customize_compiler", _default_customize_compiler
+                )
 
                 try:
                     # distutils / older setuptools signature
