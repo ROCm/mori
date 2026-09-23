@@ -147,7 +147,7 @@ _XDB_FLAG_SLOTS = 256
 
 
 class _TokOffExt:
-    """Dispatch's slot allocator word outside the cco window (always on, gfx1250).
+    """Dispatch's slot allocator word outside the cco window (default-on gfx1250; MORI_EP_TOKOFF_EXT=0 opts out).
 
     One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
     opened on every peer by IPC handle. ``peers`` is the device array of
@@ -324,10 +324,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
         # memory instead of the cco window (see _TokOffExt): the cco-window slot
         # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
-        # only kernel that reads tokOffPeers -- and always on there.
+        # only kernel that reads tokOffPeers. Default-on; MORI_EP_TOKOFF_EXT=0
+        # (or false/no/off) opts back out to the cco-window path (tokOffPeers
+        # stays None -> kernel EpTokOff falls back to the VMM hipMemCreate window).
         self._tokoff_ext = None
         self.tok_off_peers = None
-        if self._is1250:
+        _tokoff_env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
+        _tokoff_on = _tokoff_env not in ("0", "false", "no", "off")
+        if self._is1250 and _tokoff_on:
             self._tokoff_ext = _TokOffExt(cfg.rank, cfg.world_size, dev)
             self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
