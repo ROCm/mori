@@ -294,6 +294,55 @@ TEST(MasterEvictionChain, TierBelowWatermarkIsLeftAlone) {
   }
 }
 
+// Records each EvictKey without executing it: the question here is how many
+// keys the master names in one round, not what the peer does with them.
+class RecordingDispatcher : public EvictKeyDispatcher {
+ public:
+  void DispatchEvictKey(const std::string& /*node_id*/, const std::string& /*peer_address*/,
+                        std::vector<std::string> keys) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    calls_.push_back(std::move(keys));
+  }
+  std::vector<std::vector<std::string>> Calls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return calls_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::vector<std::string>> calls_;
+};
+
+// One round must drain a full tier all the way to the low watermark.  A
+// per-bucket key cap (32, wired in by #540) freed a fixed handful of keys per
+// round instead, so a tier filled faster than that stayed at 100% and the
+// router refused every put -- "UMBP offload failed success=0/N" end to end.
+TEST(MasterEvictionChain, OneRoundDrainsAFullTierToTheLowWatermark) {
+  constexpr size_t kKeys = 1000;
+  std::vector<std::string> keys;
+  keys.reserve(kKeys);
+  for (size_t i = 0; i < kKeys; ++i) keys.push_back("k" + std::to_string(i));
+
+  InMemoryMasterMetadataStore store;
+  PublishNode(&store, keys, /*total_bytes=*/kKeys * kPageSize, /*used_bytes=*/kKeys * kPageSize);
+
+  RecordingDispatcher dispatcher;
+  EvictionManager manager(store, OneSecondRounds(), &dispatcher);
+  manager.Start();
+  const bool dispatched =
+      WaitFor([&] { return !dispatcher.Calls().empty(); }, std::chrono::seconds(8));
+  manager.Stop();
+  ASSERT_TRUE(dispatched) << "master never dispatched an EvictKey for a full tier";
+
+  // 100% -> 70% of 1000 one-page keys is 300 keys, all named by the first
+  // round in one EvictKey (well under the gRPC limit).  The watermark math is in
+  // doubles, so the budget can round one key past the exact 300; the old cap
+  // named 32.
+  const auto first = dispatcher.Calls().front();
+  EXPECT_GE(first.size(), kKeys * 3 / 10);
+  EXPECT_LE(first.size(), kKeys * 3 / 10 + 1);
+}
+
 // promote_mode=move deletes the cold copy once a key is promoted, but the
 // delete races the read lease the triggering read still holds, so it defers: the
 // source parks in draining_sources_ and the promotion reports success. Nothing
