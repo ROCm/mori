@@ -33,11 +33,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #include "mori/utils/mori_log.hpp"
@@ -127,33 +130,116 @@ void ArmDataPlaneDeadline(grpc::ClientContext& ctx) {
 // It was also shorter than the routine data-plane deadline, inverting the two
 // even though registration is the strictly slower operation.
 //
-// Firing here is worse than a data-plane deadline in a way that is easy to
-// miss. A data-plane call degrades a non-OK status to the same "not found"
-// the caller already handles. Registration has no such fallback: nothing that
-// follows can work on an unregistered buffer, and the two paths do not even
-// agree on how they say so -- RegisterHostShmMemory throws, while
-// RegisterDeviceMemory logs and returns false, which a caller that ignores the
-// bool turns into a silently dead cache rather than a stopped rank.
+// Firing here is worse than a data-plane deadline. A data-plane call degrades
+// a non-OK status to the same "not found" the caller already handles.
+// Registration has no such fallback: nothing that follows can work on an
+// unregistered buffer, and both paths now throw rather than let that become a
+// silently dead cache.
 //
-// So this is a liveness bound, not a latency budget: it should only ever fire
-// on a server that is genuinely wedged. 30 minutes clears the documented bulk
-// figure with room for the cross-rank serialization registrations now go
-// through (PoolClient's registration_mutex_, which is what IOEngine's unlocked
-// memory table needs), so a rank's observed latency is its own pin plus
-// whatever its peers are still doing. The knob is there for a deployment whose
-// pools are larger still; it must never be set below
-// UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
+// So this is a liveness bound, not a latency budget. It exists so that a
+// genuinely wedged server releases the rank -- and with it the allocation --
+// instead of holding both forever; it is NOT an estimate of how long
+// registration should take. Err high: a deadline that is too generous costs a
+// slower report on an already-broken server, while one that is too tight kills
+// a run that was about to succeed. Registration also serializes across a
+// node's ranks (PoolClient's registration_mutex_, which is what IOEngine's
+// unlocked memory table needs), so a rank's observed latency is its own pin
+// plus whatever its peers are still doing -- budget for the whole queue, not
+// for one buffer.
+//
+// An hour clears the documented figure many times over. Set the knob higher
+// for larger pools, or to 0 to disable the deadline entirely and let the call
+// block indefinitely. It must never be set below UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
 int RegisterMemoryRpcTimeoutMs() {
   static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS",
-                                                           std::chrono::milliseconds(1800000),
-                                                           /*min_allowed=*/1)
+                                                           std::chrono::milliseconds(3600000),
+                                                           /*min_allowed=*/0)
                                             .count());
   return v;
 }
 
+// Zero leaves the context without a deadline, which is gRPC's "wait forever".
 void ArmRegisterMemoryDeadline(grpc::ClientContext& ctx) {
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RegisterMemoryRpcTimeoutMs()));
+  const int timeout_ms = RegisterMemoryRpcTimeoutMs();
+  if (timeout_ms <= 0) return;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
+}
+
+// A registration that is merely slow and one that is wedged look identical
+// from the outside: a synchronous unary call says nothing at all until it
+// returns. That is exactly what forces the deadline above to be set so
+// generously -- and a generous deadline is only safe if "still working" is
+// visible before it fires. This makes it visible.
+//
+// Runs for the lifetime of the RPC and costs one thread per registration,
+// which is a once-per-buffer setup call, not a hot path.
+class RegistrationProgressLogger {
+ public:
+  RegistrationProgressLogger(const char* what, uintptr_t ptr, size_t size)
+      : what_(what), ptr_(ptr), size_(size) {
+    thread_ = std::thread([this] { Loop(); });
+  }
+
+  ~RegistrationProgressLogger() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      done_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+  }
+
+  RegistrationProgressLogger(const RegistrationProgressLogger&) = delete;
+  RegistrationProgressLogger& operator=(const RegistrationProgressLogger&) = delete;
+
+  int64_t ElapsedMs() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                 start_)
+        .count();
+  }
+
+ private:
+  static constexpr std::chrono::seconds kInterval{30};
+
+  void Loop() {
+    std::unique_lock<std::mutex> lock(mu_);
+    while (!cv_.wait_for(lock, kInterval, [this] { return done_; })) {
+      MORI_UMBP_INFO(
+          "[StandaloneProcessClient] still registering {} ptr=0x{:x} size={}MB, elapsed={}s "
+          "(deadline={}ms, 0=none)",
+          what_, ptr_, size_ / (1024 * 1024), ElapsedMs() / 1000, RegisterMemoryRpcTimeoutMs());
+    }
+  }
+
+  const char* what_;
+  uintptr_t ptr_;
+  size_t size_;
+  std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  std::thread thread_;
+};
+
+// The message a failed registration throws with.
+//
+// A bare "Deadline Exceeded" tells whoever hits it nothing about what to do
+// next, and the answer is usually "raise one env var". Naming the knob and the
+// value it currently holds is what turns a lost run into a rerun.
+std::string RegisterMemoryFailureMessage(const char* what, uintptr_t ptr, size_t size,
+                                         int64_t elapsed_ms, const grpc::Status& status,
+                                         const std::string& response_error) {
+  std::string message = fmt::format(
+      "standalone RegisterMemory failed for {} ptr=0x{:x} size={}MB after {}ms: {}", what, ptr,
+      size / (1024 * 1024), elapsed_ms, status.ok() ? response_error : status.error_message());
+  if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    message += fmt::format(
+        " -- this is the client-side deadline (UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS={}ms), not the "
+        "server refusing. If the registration was merely slow rather than wedged, raise it, or set "
+        "it to 0 to wait indefinitely.",
+        RegisterMemoryRpcTimeoutMs());
+  }
+  return message;
 }
 
 // Every routine data-plane call below degrades a non-OK grpc::Status to the
@@ -882,12 +968,27 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
   return RegisterHostShmMemory(ptr, size);
 }
 
+// Throws on every failure, matching RegisterHostShmMemory.
+//
+// This used to log and return false. Nothing downstream can work on a buffer
+// the server never mapped: the client's own regions_ table has no entry for
+// it, so OffsetFor rejects every later Put/Get before an RPC is even sent, and
+// each one reports the same false a genuine miss does. A caller that does not
+// check the bool therefore gets a cache that is silently and permanently empty
+// -- indistinguishable, from the outside, from a workload with no reuse. A
+// throw cannot be ignored that way, and registration is a once-per-buffer
+// setup call where failing loudly at startup beats running for hours on a
+// dead cache.
 bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
-  if (ptr == 0 || size == 0) return false;
+  if (ptr == 0 || size == 0) {
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: invalid GPU region ptr=0x{:x} size={}", ptr,
+        size));
+  }
   ScopedHipDevice device_guard(device_id);
   if (!device_guard.IsValid()) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] failed to select GPU device {}", device_id);
-    return false;
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: failed to select GPU device {}", device_id));
   }
 
   void* allocation_base = nullptr;
@@ -896,30 +997,33 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
       hipMemGetAddressRange(reinterpret_cast<hipDeviceptr_t*>(&allocation_base), &allocation_size,
                             reinterpret_cast<hipDeviceptr_t>(ptr));
   if (range_status != hipSuccess || allocation_base == nullptr) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] hipMemGetAddressRange failed for ptr=0x{:x}: {}",
-                    ptr, hipGetErrorString(range_status));
+    const std::string error = hipGetErrorString(range_status);
     (void)hipGetLastError();
-    return false;
+    throw std::runtime_error(
+        fmt::format("StandaloneProcessClient::RegisterMemory: hipMemGetAddressRange failed for "
+                    "ptr=0x{:x}: {}",
+                    ptr, error));
   }
 
   const uintptr_t allocation_address = reinterpret_cast<uintptr_t>(allocation_base);
-  if (ptr < allocation_address) return false;
-  const uint64_t ipc_offset = static_cast<uint64_t>(ptr - allocation_address);
-  if (ipc_offset > allocation_size || size > allocation_size - ipc_offset) {
-    MORI_UMBP_ERROR(
-        "[StandaloneProcessClient] GPU registration range exceeds allocation: ptr=0x{:x} "
+  const uint64_t ipc_offset =
+      ptr >= allocation_address ? static_cast<uint64_t>(ptr - allocation_address) : 0;
+  if (ptr < allocation_address || ipc_offset > allocation_size ||
+      size > allocation_size - ipc_offset) {
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: GPU range exceeds its allocation: ptr=0x{:x} "
         "size={} alloc_base=0x{:x} alloc_size={}",
-        ptr, size, allocation_address, allocation_size);
-    return false;
+        ptr, size, allocation_address, allocation_size));
   }
 
   hipIpcMemHandle_t handle{};
   const hipError_t handle_status = hipIpcGetMemHandle(&handle, allocation_base);
   if (handle_status != hipSuccess) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] hipIpcGetMemHandle failed for ptr=0x{:x}: {}", ptr,
-                    hipGetErrorString(handle_status));
+    const std::string error = hipGetErrorString(handle_status);
     (void)hipGetLastError();
-    return false;
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: hipIpcGetMemHandle failed for ptr=0x{:x}: {}",
+        ptr, error));
   }
 
   ::umbp::RegisterMemoryRequest req;
@@ -938,11 +1042,11 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   grpc::ClientContext ctx;
   ArmRegisterMemoryDeadline(ctx);
   ::umbp::BoolResponse resp;
+  RegistrationProgressLogger progress("GPU IPC", ptr, size);
   const grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
   if (!rpc_status.ok() || !resp.ok()) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] GPU RegisterMemory failed: {}",
-                    rpc_status.ok() ? resp.error() : rpc_status.error_message());
-    return false;
+    throw std::runtime_error(RegisterMemoryFailureMessage(
+        "GPU IPC", ptr, size, progress.ElapsedMs(), rpc_status, resp.error()));
   }
 
   std::lock_guard<std::mutex> lock(registration_mu_);
@@ -985,10 +1089,13 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
     req.set_worker_node_address(standalone_config_.worker_node_address);
     for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
     ::umbp::BoolResponse resp;
+    RegistrationProgressLogger progress("host shm", reinterpret_cast<uintptr_t>(allocation->base),
+                                        allocation->mapped_size);
     grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
     if (!rpc_status.ok() || !resp.ok()) {
-      throw std::runtime_error("standalone RegisterMemory RPC failed: " +
-                               (rpc_status.ok() ? resp.error() : rpc_status.error_message()));
+      throw std::runtime_error(RegisterMemoryFailureMessage(
+          "host shm", reinterpret_cast<uintptr_t>(allocation->base), allocation->mapped_size,
+          progress.ElapsedMs(), rpc_status, resp.error()));
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(allocation->base);
