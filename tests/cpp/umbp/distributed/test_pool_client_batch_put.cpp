@@ -576,15 +576,26 @@ TEST_F(BatchPutWarnTest, ConcurrentRegistrationsAndLookupsStayConsistent) {
   // above that do assert a cross-node result already fail on a host without
   // one. What this test is about is the region table, and that is checked below
   // against every region directly.
+  //
+  // Caught here rather than left to propagate: those sibling tests call
+  // BatchPut from the main thread, where gtest's exception handler turns a
+  // throw into a test failure. This call is on a std::thread of its own, where
+  // an uncaught exception is std::terminate -- it would take down the whole
+  // binary instead of just this test.
   std::thread lookup_thread([&]() {
     uint64_t round = 0;
     while (!stop_lookups.load(std::memory_order_acquire)) {
-      std::vector<std::string> keys;
-      std::vector<const void*> srcs;
-      std::vector<size_t> sizes;
-      MakeBatch(registered_buf_, /*n=*/2, &keys, &srcs, &sizes,
-                "churn-" + std::to_string(round++) + "-");
-      caller_->BatchPut(keys, srcs, sizes);
+      try {
+        std::vector<std::string> keys;
+        std::vector<const void*> srcs;
+        std::vector<size_t> sizes;
+        MakeBatch(registered_buf_, /*n=*/2, &keys, &srcs, &sizes,
+                  "churn-" + std::to_string(round++) + "-");
+        caller_->BatchPut(keys, srcs, sizes);
+      } catch (const std::exception&) {
+        // Same "not asserted" posture as a plain false result: expected on a
+        // host with no RDMA device, and orthogonal to what this test checks.
+      }
       lookups.fetch_add(1, std::memory_order_relaxed);
     }
   });
