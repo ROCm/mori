@@ -200,7 +200,15 @@ def _parse_args(argv):
     parser.add_argument(
         "--quant-type", default="none", choices=["none", "fp8_direct_cast"]
     )
+    # QPs ALLOCATED per peer (num_qp_per_pe). How many a kernel sends on is a
+    # separate choice: --active-qps, else the tuning table, else min(2, this).
     parser.add_argument("--num-qp", type=int, default=1)
+    # Pin the active QP count for every bucket and both phases (cfg.active_qps).
+    parser.add_argument("--active-qps", type=int, default=None)
+    # Extra counts compiled for op.set_active_qps(), comma-separated. Under
+    # --cmd test the rounds cycle through them, then through the table's own
+    # choice, so a switch between rounds is checked against the golden.
+    parser.add_argument("--active-qp-counts", default=None)
     # 30, matching _EP_ROUNDS in the examples harness. Lower is not a
     # small-sample caveat but a different estimator: at --rounds 3 with
     # --drop-rounds 1 the two kept rounds are the ones that harness documents as
@@ -220,8 +228,11 @@ def _parse_args(argv):
     # Validation mode: sweep exactly one named candidate against the shipped
     # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
     # with its own error; before it is written into the table it gets one long
-    # head-to-head against what it would replace.
+    # head-to-head against what it would replace. block,rdma,warp[,active_qps].
     parser.add_argument("--tuning-candidate", default=None)
+    # Active QP counts to cross with every geometry, e.g. 1,2,4,8. Each must be
+    # within --num-qp, the allocation. Unset keeps the shipped count.
+    parser.add_argument("--tuning-qps", default=None)
     # What a candidate is selected ON. "total" by default, and deliberately:
     # internode_tuning_configs.py records that the two phases are COUPLED -- a
     # dispatch with too few rdma blocks leaves the following combine ~18us slower
@@ -485,17 +496,21 @@ def _report_loop_alignment(args, rank):
 
 
 def _geometry_for_report(op, cfg, args):
-    """The (block, rdma, warp) each phase actually launched with, for the table
-    titles -- the point v1's `_launch_params_str` makes: a table that does not
-    name its launch config cannot be matched back to the run that produced it.
-    Read from the backend rather than from the config, because on the internode
-    path cfg.dispatch_block_num is a dict key and not a grid."""
+    """The (block, rdma, warp, active_qps) each phase actually launched with, for
+    the table titles -- the point v1's `_launch_params_str` makes: a table that
+    does not name its launch config cannot be matched back to the run that
+    produced it. Read from the backend rather than from the config, because on
+    the internode path cfg.dispatch_block_num is a dict key and not a grid."""
     try:
         # EpDispatchCombineOpHip IS the backend -- it subclasses the op.
-        return (
-            tuple(op._internode_geom_for("dispatch", args.max_tokens)),
-            tuple(op._internode_geom_for("combine", args.max_tokens)),
-        )
+        override = op._active_qps_override
+        geometries = []
+        for phase in ("dispatch", "combine"):
+            geometry = tuple(op._internode_geom_for(phase, args.max_tokens))
+            if override is not None:
+                geometry = geometry[:3] + (override,)
+            geometries.append(geometry)
+        return tuple(geometries)
     except Exception:
         from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
 
@@ -504,7 +519,7 @@ def _geometry_for_report(op, cfg, args):
         )
         if table_row:
             return tuple(table_row["dispatch"]), tuple(table_row["combine"])
-        return (0, 0, 0), (0, 0, 0)
+        return (0, 0, 0, 0), (0, 0, 0, 0)
 
 
 def _rdma_algo_token_count(idx, cfg, ll):
@@ -666,11 +681,12 @@ def _report_tables(
         f"topk={cfg.num_experts_per_token} kernel={'v2_ll' if ll else 'v2'} "
         f"world={cfg.world_size} nodes={nodes}x{cfg.gpu_per_node} "
         f"experts/rank={cfg.num_experts_per_rank} scale_dim={cfg.scale_dim} "
-        f"qp={cfg.num_qp_per_pe}",
+        f"qp_allocated={cfg.num_qp_per_pe}",
         flush=True,
     )
     print(
-        f"# CONFIG dispatch block/rdma/warp={geometry[0]}  combine={geometry[1]}  "
+        f"# CONFIG dispatch block/rdma/warp/active_qps={geometry[0]}  "
+        f"combine={geometry[1]}  "
         f"rounds={args.rounds} warmup={args.warmup}  "
         f"recv_tokens={total_recv} rdma_algo_tokens={rdma_tokens}",
         flush=True,
@@ -690,7 +706,7 @@ def _report_tables(
         _print_phase_table(
             f"{name} Performance ({str(phase_dtype).split('.')[-1]}) "
             f"block={phase_geometry[0]} warp={phase_geometry[2]} "
-            f"rdma={phase_geometry[1]} "
+            f"rdma={phase_geometry[1]} qps={phase_geometry[3]} "
             f"~{num_tokens * cfg.hidden_dim * elem_size / (1024 ** 2):.1f} MB/rank",
             _phase_stats(gathered[:, :, rdma_column]),
             xgmi_stats,
@@ -1076,8 +1092,8 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
         os.environ.get("MORI_EP_DISP_GEOM"),
         os.environ.get("MORI_EP_COMB_GEOM"),
     )
-    os.environ["MORI_EP_DISP_GEOM"] = "%d,%d,%d" % dispatch_geometry
-    os.environ["MORI_EP_COMB_GEOM"] = "%d,%d,%d" % combine_geometry
+    os.environ["MORI_EP_DISP_GEOM"] = ",".join(map(str, dispatch_geometry))
+    os.environ["MORI_EP_COMB_GEOM"] = ",".join(map(str, combine_geometry))
     try:
         return EpDispatchCombineOp(cfg, comm)
     finally:
@@ -1091,6 +1107,26 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
 def _median(values):
     ordered = sorted(values)
     return ordered[len(ordered) // 2]
+
+
+def _active_qp_schedule(cfg):
+    """The counts --active-qp-counts switches among, then None (back to the
+    table), or None when the flag is not given."""
+    return list(cfg.active_qp_counts) + [None] if cfg.active_qp_counts else None
+
+
+def _active_qp_for(schedule, round_index, cfg, phase_offset):
+    """The count this rank selects for one phase of one round.
+
+    Deliberately NOT in step. The combine barrier only carries markers between a
+    rank and its same-local-rank peer on each other node, so the offset is the
+    NODE index: those peers then always pick different counts (for two nodes and
+    any schedule longer than one). phase_offset 1 puts combine one step ahead of
+    its own dispatch, so a pair's two phases differ too. Those are the two cases
+    the combine barrier has to tolerate.
+    """
+    node = cfg.rank // cfg.gpu_per_node
+    return schedule[(round_index + node + phase_offset) % len(schedule)]
 
 
 def _stress(op, cfg, dist_handle, device, args, comm):
@@ -1134,16 +1170,23 @@ def _stress(op, cfg, dist_handle, device, args, comm):
             flush=True,
         )
 
+    # Active QP switching as in --cmd test, on top of the ragged per-rank token
+    # counts; see _active_qp_for.
+    qp_schedule = _active_qp_schedule(cfg)
     dist.barrier()
     started = time.time()
     for i in range(args.rounds):
         inp, idx, wts, sc = datasets[i % len(datasets)]
+        if qp_schedule:
+            op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 0))
         dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
         combine_input = (
             dispatch_out[0].to(cfg.combine_dtype)
             if cfg.is_asymmetric_dtype
             else dispatch_out[0]
         )
+        if qp_schedule:
+            op.set_active_qps(_active_qp_for(qp_schedule, i, cfg, 1))
         # None, not wts: v1's soak combines without weights
         # (run_combine(op, combine_input, None, indices)), and since want_weights
         # is now honoured, passing them would make this a different kernel path
@@ -1215,35 +1258,111 @@ def _tune(cfg, dist_handle, device, args, comm):
         )
         return sorted({count for count in fractions if 1 <= count < block_count})
 
-    candidates = [
+    from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
+
+    def incumbent(geometry):
+        # The count the op itself would run for this geometry, by the backend's
+        # own rules (_overlay_pinned_geometry, then _fit_internode_geometry): a
+        # configured --active-qps wins, an open count takes the default, and a
+        # table count is clamped to the allocation. Named explicitly, so the
+        # incumbent and the candidates compare like with like.
+        block, rdma, warp = geometry[:3]
+        active_qps = geometry[3] if len(geometry) > 3 else None
+        if cfg.active_qps is not None:
+            active_qps = cfg.active_qps
+        elif active_qps is None:
+            active_qps = EpDispatchCombineOpHip._resolve_active_qps(cfg)
+        return (block, rdma, warp, min(active_qps, cfg.num_qp_per_pe))
+
+    def checked(active_qps):
+        # A count the sweep was ASKED for is rejected, not clamped: a clamped
+        # candidate would report a winner it never ran. Same rule as the env pin.
+        if not 1 <= active_qps <= cfg.num_qp_per_pe:
+            raise SystemExit(
+                f"active QP count {active_qps} is outside the allocation "
+                f"[1, --num-qp={cfg.num_qp_per_pe}]"
+            )
+        return active_qps
+
+    table_row = lookup(
+        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
+    )
+    geometry_candidates = [
         (block, rdma, warp)
         for block in sorted(blocks)
         for warp in warps
         for rdma in rdma_block_counts(block)
     ]
-    if args.tuning_candidate:
-        candidates = [tuple(int(x) for x in args.tuning_candidate.split(","))]
-    elif args.tuning_limit:
-        candidates = candidates[: args.tuning_limit]
-
-    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
-
-    table_row = lookup(
-        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
-    )
     # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
-    incumbent_dispatch = tuple(table_row["dispatch"]) if table_row else candidates[0]
-    incumbent_combine = tuple(table_row["combine"]) if table_row else candidates[0]
+    incumbent_dispatch = incumbent(
+        table_row["dispatch"] if table_row else geometry_candidates[0]
+    )
+    incumbent_combine = incumbent(
+        table_row["combine"] if table_row else geometry_candidates[0]
+    )
     phase = args.tuning_phase
     shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
+
+    # --tuning-qps crosses every geometry with every active count. Without it the
+    # sweep keeps the shipped count and varies the geometry alone, as before.
+    active_qp_candidates = (
+        [checked(int(count)) for count in args.tuning_qps.split(",")]
+        if args.tuning_qps
+        else [shipped[3]]
+    )
+    candidates = [
+        geometry + (active_qps,)
+        for geometry in geometry_candidates
+        for active_qps in active_qp_candidates
+    ]
+    candidate_fields = ()
+    if args.tuning_candidate:
+        candidate_fields = tuple(int(x) for x in args.tuning_candidate.split(","))
+        # Three fields keep the shipped count, so a validation run changes the
+        # geometry alone; a fourth names the count.
+        candidates = [
+            candidate_fields[:3]
+            + (
+                (
+                    checked(candidate_fields[3])
+                    if len(candidate_fields) > 3
+                    else shipped[3]
+                ),
+            )
+        ]
+    elif args.tuning_limit:
+        candidates = candidates[: args.tuning_limit]
     if shipped in candidates:
         candidates.remove(shipped)
+    if not candidates:
+        if dist_handle.rank == 0:
+            print(
+                f"# TUNING tok={args.max_tokens}: nothing to compare -- every "
+                f"candidate is the shipped {shipped}",
+                flush=True,
+            )
+        return 0
+    # Whether the printed table row should carry the active QP columns: only
+    # when this sweep measured the count, or the shipped row already names one.
+    # Otherwise the count is just the resolved default for THIS run's
+    # allocation, and pasting it would pin production to it.
+    table_names_count = bool(
+        table_row
+        and (
+            table_row["dispatch"][3] is not None or table_row["combine"][3] is not None
+        )
+    )
+    report_active_qps = (
+        bool(args.tuning_qps) or len(candidate_fields) > 3 or table_names_count
+    )
 
     if dist_handle.rank == 0:
         print(
             f"# TUNING tok={args.max_tokens} phase={phase} "
             f"scope={args.tuning_scope} reps={args.tuning_reps} cus={num_cus} "
-            f"candidates={len(candidates)} shipped dispatch={incumbent_dispatch} "
+            f"candidates={len(candidates)} qp_allocated={cfg.num_qp_per_pe} "
+            f"shipped block/rdma/warp/active_qps dispatch={incumbent_dispatch} "
             f"combine={incumbent_combine}",
             flush=True,
         )
@@ -1463,13 +1582,23 @@ def _tune(cfg, dist_handle, device, args, comm):
     if dist_handle.rank == 0:
         dispatch_row = best if phase == "dispatch" else incumbent_dispatch
         combine_row = best if phase == "combine" else incumbent_combine
+        # One trailing count when both phases agree, else dispatch then combine
+        # -- the two forms internode_tuning_configs.lookup() reads. None when
+        # the sweep did not measure the count (see report_active_qps).
+        if not report_active_qps:
+            active_qps_columns = ""
+        elif dispatch_row[3] == combine_row[3]:
+            active_qps_columns = f", {dispatch_row[3]}"
+        else:
+            active_qps_columns = f", {dispatch_row[3]}, {combine_row[3]}"
         print(
             f"# TUNING RESULT tok={args.max_tokens} phase={phase}: "
-            f"block/rdma/warp={best} median {phase}={best_median:.1f}us "
-            f"(shipped was {shipped})\n"
+            f"block/rdma/warp/active_qps={best} median {phase}={best_median:.1f}us "
+            f"(shipped was {shipped}, tuned with qp_allocated={cfg.num_qp_per_pe})\n"
             f"#   table row: ({args.max_tokens}, {dispatch_row[0]}, "
             f"{dispatch_row[1]}, {dispatch_row[2]}, "
-            f"{combine_row[0]}, {combine_row[1]}, {combine_row[2]}),",
+            f"{combine_row[0]}, {combine_row[1]}, {combine_row[2]}"
+            f"{active_qps_columns}),",
             flush=True,
         )
     return 0
@@ -1569,6 +1698,12 @@ def main(argv):
             quant_type=args.quant_type,
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=args.num_qp,
+            active_qps=args.active_qps,
+            active_qp_counts=(
+                tuple(int(count) for count in args.active_qp_counts.split(","))
+                if args.active_qp_counts
+                else None
+            ),
             internode_kernel=args.kernel_type,
             internode_auto_ll_max_tokens=args.auto_ll_max_tokens,
             kernel_backend="hip",
@@ -1596,6 +1731,7 @@ def main(argv):
             dist_handle.shutdown()
             return return_code
 
+        qp_schedule = _active_qp_schedule(cfg)
         rng = torch.Generator(device=device)
         for round_index in range(args.rounds):
             rng.manual_seed(1234 + round_index * 977 + rank)
@@ -1604,6 +1740,8 @@ def main(argv):
                 rng, cfg, num_tokens, device, cfg.dispatch_dtype, args.routing
             )
 
+            if qp_schedule:
+                op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 0))
             recv_x, recv_w, recv_s, recv_i, total_recv, routing = op.dispatch(
                 inp, wts, sc, idx, return_routing=True
             )
@@ -1620,6 +1758,8 @@ def main(argv):
             combine_input = (
                 recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
             )
+            if qp_schedule:
+                op.set_active_qps(_active_qp_for(qp_schedule, round_index, cfg, 1))
             out, out_w = op.combine(combine_input, wts, routing=routing)
             torch.cuda.synchronize()
             comm.barrier()

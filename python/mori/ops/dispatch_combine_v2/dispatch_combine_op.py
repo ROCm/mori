@@ -110,8 +110,9 @@ class EpDispatchCombineConfig:
     # Pinning is per FIELD, not all-or-nothing: on the internode path a pinned
     # field overrides the tuning table for every token bucket while the fields
     # left None stay tuned, so you can fix one knob without hand-writing the
-    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override the whole triple
-    # for a leg and bypass the table entirely.
+    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override a leg's whole
+    # geometry and bypass the table entirely: block,rdma,warp, plus an optional
+    # fourth field for the active QP count that also beats active_qps.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -131,12 +132,15 @@ class EpDispatchCombineConfig:
     # construction rather than assuming.
     gpu_per_node: int = None
     # Allocated QPs per peer on the RDMA leg, fixed for this op's lifetime.
-    # The intranode path does not use QPs. Kernel usage is selected separately.
+    # The intranode path does not use QPs. How many a kernel sends on -- the
+    # active count, a compile-time constant of each kernel -- is chosen per
+    # phase and per token bucket by the tuning table, within this allocation.
     num_qp_per_pe: int = 8
-    # Active prefix specialised into the kernel. None uses min(2, allocation).
+    # Pin the active count for every bucket and both phases, over the table.
+    # None: the table's count, else min(2, num_qp_per_pe).
     active_qps: int = None
-    # Optional additional compile-time subsets, for explicit per-cycle overrides.
-    # Selected through op.set_active_qps(); the default is always compiled.
+    # Extra active counts compiled for every bucket geometry, so that
+    # op.set_active_qps() can switch to any of them without compiling.
     active_qp_counts: tuple = None
     # Widest transported element, which is what sizes the staging buffers. None
     # => max over the two legs, which is what the buffers actually have to hold.
@@ -185,9 +189,12 @@ class EpDispatchCombineConfig:
                 "node * gpu_per_node + local rank and a partial node has no such "
                 "encoding"
             )
-        if type(self.num_qp_per_pe) is not int or self.num_qp_per_pe < 1:
+        # 64 is kCombineBarrierMarkerTotal (ep_internode_cfg.hpp): QP 0 carries
+        # the remainder of that fixed per-combine total, so it caps how many QPs
+        # a kernel may send on, and so the most worth allocating.
+        if type(self.num_qp_per_pe) is not int or not 1 <= self.num_qp_per_pe <= 64:
             raise ValueError(
-                f"num_qp_per_pe must be a positive integer, got {self.num_qp_per_pe}"
+                f"num_qp_per_pe must be an integer in [1, 64], got {self.num_qp_per_pe}"
             )
         if self.active_qps is not None:
             if (

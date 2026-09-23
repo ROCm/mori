@@ -92,6 +92,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.maxTotalRecvTokens = request.maxTotalRecvTokens;
   cfg.kernelCfg.gpuPerNode = request.gpuPerNode;
   cfg.kernelCfg.numQpPerPe = request.numQpPerPe;
+  cfg.kernelCfg.numQpToDrain = request.numQpToDrain;
   cfg.kernelCfg.quantType = request.quantType;
 
   cfg.dtype = request.dtype;
@@ -110,6 +111,15 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   if (request.warpPerBlock > 0) cfg.warpPerBlock = request.warpPerBlock;
   if (request.rdmaBlockNum > 0) cfg.rdmaBlockNum = request.rdmaBlockNum;
   if (request.mpCount > 0) cfg.mpCount = request.mpCount;
+
+  // QP 0 carries the remainder of a fixed per-combine marker total, so the
+  // total bounds how many QPs a kernel may send on. Checked ahead of the
+  // generic validity test, which rejects it too but blames the divisors.
+  const int activeQps = cfg.kernelCfg.numQpPerPe;
+  if (activeQps < 1 || activeQps > kCombineBarrierMarkerTotal) {
+    throw std::runtime_error("mori ep internode v2: numQpPerPe " + std::to_string(activeQps) +
+                             " must be in [1, " + std::to_string(kCombineBarrierMarkerTotal) + "]");
+  }
 
   if (!EpInterNodeKernelCfgIsValid(cfg.kernelCfg)) {
     throw std::runtime_error(

@@ -129,6 +129,20 @@ inline std::string RenderValue(EpInterNodeDType dtype) {
   }
 }
 
+// What one combine adds to each peer's cross-device barrier slot, whatever the
+// number of QPs it sent on. Every active QP carries one marker, ordered behind
+// that QP's data by the RC responder, and the markers of one combine sum to this
+// constant: QP 0 carries the remainder, every other QP carries 1. Each marker is
+// positive, so the slot reaching epoch * total means every marker has landed.
+//
+// The total must not depend on the active count. Dispatch and combine pick their
+// counts independently, per rank, from each rank's own token count -- ragged
+// batches put different ranks in different buckets -- and a receiver has no way
+// to learn how many QPs its peer used. A per-count target (epoch * active) makes
+// any disagreement an exact-equality wait that never finishes. It also bounds
+// the active count: QP 0's marker must stay positive.
+inline constexpr int kCombineBarrierMarkerTotal = 64;
+
 // ---------------------------------------------------------------------------
 // The part of EpDispatchCombineConfig the kernel is specialised on -- what gets
 // rendered into the TU, the way EpCfg is for the intranode pair. The generated
@@ -166,9 +180,17 @@ struct EpInterNodeKernelCfg {
   int numExpertPerToken{2};
   int maxTotalRecvTokens{0};
   int gpuPerNode{8};
-  // Active prefix of the DevComm's allocated QPs, specialised per kernel.
-  // Never use this as the endpoint-array stride; CCO owns that allocation count.
+  // How many of the DevComm's allocated QPs this kernel sends on: QPs
+  // [0, numQpPerPe). Chosen per phase and per token bucket, and free to differ
+  // between ranks. Never use it as the endpoint-array stride; that is the
+  // allocation count, which CCO owns (ccoDevComm::ibgda.numQpPerPe).
   int numQpPerPe{1};
+  // How many QPs DispatchSync drains: every QP any kernel of this op may send
+  // on, which can exceed this kernel's own numQpPerPe -- a combine may use more
+  // QPs than the dispatch before it, and nothing else polls them. Flushing a QP
+  // that never carries traffic is not free, so this is the op's largest active
+  // count, not the allocation. 0 means numQpPerPe.
+  int numQpToDrain{0};
   EpQuantType quantType{EpQuantType::None};
 };
 
@@ -205,12 +227,13 @@ inline void VisitFields(Self& cfg, const EpInterNodeKernelCfg& defaults, Visit&&
   MORI_FIELD(maxTotalRecvTokens);
   MORI_FIELD(gpuPerNode);
   MORI_FIELD(numQpPerPe);
+  MORI_FIELD(numQpToDrain);
   MORI_FIELD(quantType);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeKernelCfg, 12,
+    EpInterNodeKernelCfg, 13,
     "added an EpInterNodeKernelCfg field -- update VisitFields(EpInterNodeKernelCfg) "
     "too, or the kernel silently compiles against its default");
 
@@ -236,8 +259,10 @@ inline std::string RenderValue(const EpInterNodeKernelCfg& cfg) { return Render(
 // diagnoses back to the caller that built it wrong.
 inline bool EpInterNodeKernelCfgIsValid(const EpInterNodeKernelCfg& cfg) {
   return cfg.worldSize > 0 && cfg.gpuPerNode > 0 && cfg.numQpPerPe > 0 &&
-         cfg.numExpertPerRank > 0 && cfg.numExpertPerToken > 0 && cfg.maxNumInpTokenPerRank > 0 &&
-         cfg.hiddenDim > 0 && (cfg.worldSize % cfg.gpuPerNode) == 0;
+         cfg.numQpPerPe <= kCombineBarrierMarkerTotal && cfg.numQpToDrain >= 0 &&
+         cfg.numQpToDrain <= kCombineBarrierMarkerTotal && cfg.numExpertPerRank > 0 &&
+         cfg.numExpertPerToken > 0 && cfg.maxNumInpTokenPerRank > 0 && cfg.hiddenDim > 0 &&
+         (cfg.worldSize % cfg.gpuPerNode) == 0;
 }
 
 // The args schema, in the form plan_api publishes.

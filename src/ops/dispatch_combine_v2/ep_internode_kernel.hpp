@@ -222,22 +222,17 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
       ::mori::cco::ccoCoopThread{});
 }
 
-// Drains every stripe: flush(peer) only polls the QP belonging to its own
-// context, so flushing one would leave the puts issued on the other qpIds
-// outstanding. ActiveQps is the kernel's active QP count; the DevComm retains
-// its allocated count as the endpoint-array stride and owns inactive QP state.
-// Switching the active prefix does not destroy/reset endpoints or CQ progress.
-// Retain the established dispatch/combine completion protocol: ordered per-QP
-// combine markers confirm the returned payload, and the following dispatch
-// handshake precedes reuse of the next combine's per-peer staging slices. Thus
-// changing the prefix does not require an extra global arrival fence/CQ drain.
-template <int ActiveQps>
-__device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe) {
-  static_assert(ActiveQps > 0);
-  for (int qpId = 0; qpId < ActiveQps; ++qpId) {
-    ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
-    gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
-  }
+// Drains one stripe: flush(peer) only polls the QP belonging to its own
+// context, so each QP a peer was sent on has to be flushed separately.
+__device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe,
+                                                 int qpId) {
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
+}
+
+// The value a combine adds on QP qpId; see kCombineBarrierMarkerTotal.
+__device__ __forceinline__ constexpr uint64_t CombineBarrierMarker(int qpId, int activeQps) {
+  return qpId == 0 ? uint64_t(kCombineBarrierMarkerTotal - (activeQps - 1)) : uint64_t{1};
 }
 
 // Spin on a local symmetric slot until a peer publishes a positive value. No
@@ -807,25 +802,35 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     if (laneId == 0) {
       args.reg(args.offDispTokOffset)->template GetAs<index_t*>()[0] = 0;
       atomicAdd(args.crossDeviceBarrierFlag, 1);
-      // Only GDA's notification target depends on the active prefix. Keep the
-      // ordinary LSA epoch in slot 0 independent of QP selection (also on replay).
-      // This lane is the only writer; the subsequent combine kernel consumes it.
-      args.crossDeviceBarrierFlag[1] += uint64_t{config.numQpPerPe};
     }
   }
 
-  for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
-    // The send loops above target only remote nodes ((myNode + 1 + i) % nNodes),
-    // so the local node never has GDA traffic to drain. Skipping it is not just
-    // an optimisation: endpoints is world-indexed but RAIL only connects
-    // cross-node same-rail peers, so a local proxyPe's slot is zero-filled --
-    // and on a single node the mask collapses to NONE and endpoints is null.
-    // flush() indexes it without a reachability check, so quieting the local
-    // node faults. shmem's ShmemQuietThread tolerated the self peer, which is
-    // why the original loop covered every node.
-    if (i == myNode) continue;
-    int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
-    EpInterNodeQuiet<kConfig.numQpPerPe>(comm, proxyPe);
+  // Every QP any kernel of this op may send on (kConfig.numQpToDrain), not just
+  // the ones this dispatch used. The combine before it may have used more --
+  // the two phases choose their counts independently -- and nothing else polls
+  // a QP no dispatch uses. Leaving those unpolled is not incorrect (the send
+  // path polls for itself once the queue is full), but it turns into a stall
+  // inside a later combine instead of a cost paid here. Not the whole
+  // allocation either: flushing a QP that never carries traffic still costs a
+  // system fence, which measurably slows dispatch. Capped by the allocation,
+  // because a qpId past it would address the next peer's endpoints.
+  //
+  // One (node, QP) pair per warp so different QPs drain concurrently, over the
+  // remote nodes only and numbered from warp 0. The send loops above target
+  // only remote nodes ((myNode + 1 + i) % nNodes), so the local node never has
+  // GDA traffic to drain. Skipping it is not just an optimisation: endpoints is
+  // world-indexed but RAIL only connects cross-node same-rail peers, so a local
+  // proxyPe's slot is zero-filled -- and on a single node the mask collapses to
+  // NONE and endpoints is null. flush() indexes it without a reachability
+  // check, so quieting the local node faults. Enumerating remote pairs directly
+  // also keeps the drains on the lowest warps rather than a later block.
+  constexpr int kDrainQps =
+      kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
+  const int drainQps = min(kDrainQps, comm.ibgda.numQpPerPe);
+  for (int pair = globalWarpId; pair < (nNodes - 1) * drainQps; pair += globalWarpNum) {
+    int node = (myNode + 1 + pair / drainQps) % nNodes;
+    int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
+    EpInterNodeQuiet(comm, proxyPe, pair % drainQps);
   }
 }
 
@@ -1216,13 +1221,13 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
   __threadfence_system();
 
   int finishedWarp = 0;
-  uint64_t remoteTarget = 0;
+  uint64_t barrierFlag = 0;
   if (laneId == 0) {
     finishedWarp = atomicAdd(args.interNodeBlocksBarrier, 1);
-    remoteTarget = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag + 1);
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
   }
   finishedWarp = __shfl(finishedWarp, 0);
-  remoteTarget = __shfl(remoteTarget, 0);
+  barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
@@ -1234,7 +1239,8 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t), 1, proxyPe, i);
+                             args.rank * sizeof(uint64_t),
+                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
       }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
@@ -1242,7 +1248,8 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) != remoteTarget) {
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
       }
     }
   }
@@ -1355,13 +1362,13 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
   // never observes a non-zero flag that is subsequently overwritten with zero
   __threadfence_system();
   int finishedWarp = 0;
-  uint64_t remoteTarget = 0;
+  uint64_t barrierFlag = 0;
   if (laneId == 0) {
     finishedWarp = atomicAdd(&args.interNodeBlocksBarrier[0], 1);
-    remoteTarget = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag + 1);
+    barrierFlag = core::AtomicLoadRelaxed(args.crossDeviceBarrierFlag);
   }
   finishedWarp = __shfl(finishedWarp, 0);
-  remoteTarget = __shfl(remoteTarget, 0);
+  barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
     if (laneId < nNodes) {
@@ -1373,7 +1380,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t), 1, proxyPe, i);
+                             args.rank * sizeof(uint64_t),
+                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
       }
       __threadfence_system();
     }
@@ -1383,7 +1391,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     uint64_t* localBarrierPtr = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) != remoteTarget) {
+      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
       }
     }
   }
