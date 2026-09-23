@@ -148,6 +148,8 @@ ccoComm::~ccoComm() = default;
 
 static size_t AlignUp(size_t x, size_t align) { return (x + align - 1) & ~(align - 1); }
 
+static constexpr size_t kLargePageSize = 2ULL << 20;
+
 // Symmetric-window VMM allocation type. Default = uncached (fine-grained),
 // matching mori-shmem's hipDeviceMallocUncached heap: P2P remote reads/writes
 // stay coherent over the fabric without coarse-grained L2 coherence handling.
@@ -687,6 +689,9 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
   // reqs.gdaContextCount, so multiple DevComms can coexist with independent
   // QP state.
 
+  // Every peer is LSA-mapped on a single node, so windows need no MR until a GDA DevComm.
+  comm->windowMrsEnabled = comm->lsaSize < comm->worldSize;
+
   MORI_SHMEM_INFO(
       "ccoCommCreate: rank={}/{} groupId={} flatBase={} perRankSize={} "
       "granularity={} defaultNumQpPerPe={} rdma={} fabric={}",
@@ -766,13 +771,16 @@ int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) {
     return 0;
   }
 
-  size_t alignedSize = AlignUp(size, comm->vmmGranularity);
+  // ionic MRs over a >2 GiB VMM allocation that is not a 2 MiB multiple fail with ENOMEM.
+  size_t allocAlign = size >= kLargePageSize ? std::max(comm->vmmGranularity, kLargePageSize)
+                                             : comm->vmmGranularity;
+  size_t alignedSize = AlignUp(size, allocAlign);
 
   // Reserve a slot via first-fit in the per-rank HeapVAManager. The returned
   // address IS the local VA for this rank's slot — directly dereferenceable.
   // 0 is the failure sentinel; baseAddr was set to flatBase + lsaRank*perRankSize
   // which is non-zero, so 0 unambiguously means failure.
-  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, comm->vmmGranularity);
+  uintptr_t slotAddr = comm->vaManager->Allocate(alignedSize, allocAlign);
   if (slotAddr == 0) {
     MORI_SHMEM_ERROR(
         "ccoMemAlloc: slot exhausted (no contiguous {} bytes free in perRankSize={}). "
@@ -1096,6 +1104,41 @@ int ccoMemFree(ccoComm* comm, void* ptr) {
 /*                         ccoWindowRegister (ptr)                         */
 /* ========================================================================== */
 
+// Collective: register wh's RDMA MR, Allgather rkeys, publish lkey/rkeys into its device struct.
+static void CcoWindowRegisterMr(ccoComm* comm, ccoWindowHost* wh) {
+  const auto& meta = comm->allocTable.at(wh->localPtr);
+  uint32_t lkey = 0;
+  uint32_t localRkey = 0;
+
+  application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
+  if (rdmaDevCtx) {
+    application::RdmaMemoryRegion mr;
+    if (meta.isFabric) {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(wh->localPtr, wh->size);
+    } else if (comm->iovaZeroMode) {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(wh->localPtr, wh->size, meta.shareFd);
+    } else {
+      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(wh->localPtr, wh->size, meta.shareFd);
+    }
+    lkey = mr.lkey;
+    localRkey = mr.rkey;
+  }
+
+  std::vector<uint32_t> peerRkeys(comm->worldSize, 0);
+  peerRkeys[comm->rank] = localRkey;
+  comm->bootNet->Allgather(&localRkey, peerRkeys.data(), sizeof(uint32_t));
+
+  HIP_RUNTIME_CHECK(hipMemcpy(wh->peerRkeys_gpu, peerRkeys.data(),
+                              sizeof(uint32_t) * comm->worldSize, hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(
+      hipMemcpy(&wh->devPtr->ibgdaWin.lkey, &lkey, sizeof(lkey), hipMemcpyHostToDevice));
+
+  MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} lkey={}", comm->rank, (void*)wh->devPtr, lkey);
+  for (int pe = 0; pe < comm->worldSize; pe++) {
+    MORI_SHMEM_INFO("  PE {}: rkey={}", pe, peerRkeys[pe]);
+  }
+}
+
 int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin) {
   auto it = comm->allocTable.find(ptr);
   if (it == comm->allocTable.end()) {
@@ -1347,45 +1390,19 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
     for (auto& mp : mappedPeers) p2pImportedHandles.push_back(mp.handle);
   }
 
-  // RDMA MR registration + rkey Allgather.
-  uint32_t lkey = 0;
-  uint32_t localRkey = 0;
-
-  application::RdmaDeviceContext* rdmaDevCtx = comm->ctx->GetRdmaDeviceContext();
-  if (rdmaDevCtx) {
-    application::RdmaMemoryRegion mr;
-    if (useFabric) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionAuto(localPtr, size);
-    } else if (comm->iovaZeroMode) {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabufIova0(localPtr, size, meta.shareFd);
-    } else {
-      mr = rdmaDevCtx->RegisterRdmaMemoryRegionDmabuf(localPtr, size, meta.shareFd);
-    }
-    lkey = mr.lkey;
-    localRkey = mr.rkey;
-  }
-
-  // Allgather rkeys into a std::vector so an exception in Allgather doesn't
-  // leak the host buffer (HIP_RUNTIME_CHECKs below abort the process anyway,
-  // but bootNet->Allgather is throwing).
-  std::vector<uint32_t> peerRkeys_host(worldSize, 0);
-  peerRkeys_host[rank] = localRkey;
-  comm->bootNet->Allgather(&localRkey, peerRkeys_host.data(), sizeof(uint32_t));
-
   // SDMA signal pool is per-DevComm (materialized by ccoDevCommCreate); kernels
   // look up signals via devComm->sdma.
 
+  // lkey/rkeys stay 0 until CcoWindowRegisterMr fills them in.
   uint32_t* peerRkeys_gpu = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&peerRkeys_gpu, sizeof(uint32_t) * worldSize));
-  HIP_RUNTIME_CHECK(hipMemcpy(peerRkeys_gpu, peerRkeys_host.data(), sizeof(uint32_t) * worldSize,
-                              hipMemcpyHostToDevice));
+  HIP_RUNTIME_CHECK(hipMemset(peerRkeys_gpu, 0, sizeof(uint32_t) * worldSize));
 
   ccoWindowDevice hostShadow = {};
   hostShadow.winBase = static_cast<char*>(comm->flatBase) + slotOffset;
   hostShadow.stride4G = static_cast<uint32_t>(comm->perRankSize >> 32);
   hostShadow.lsaRank = comm->lsaRank;
   hostShadow.ibgdaWin.peerRkeys = peerRkeys_gpu;
-  hostShadow.ibgdaWin.lkey = lkey;
 
   ccoWindowDevice* devPtr = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&devPtr, sizeof(ccoWindowDevice)));
@@ -1409,21 +1426,15 @@ int ccoWindowRegister(ccoComm* comm, void* ptr, size_t size, ccoWindow_t* outWin
   *outWin = devPtr;
 
   char* winBase = static_cast<char*>(comm->flatBase) + slotOffset;
-  MORI_SHMEM_INFO(
-      "ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} lkey={} fabric={}", rank,
-      (void*)devPtr, (void*)winBase, size, slotOffset, lkey, useFabric);
+  MORI_SHMEM_INFO("ccoWindowRegister: rank={} win={} winBase={} size={} slotOffset={} fabric={}",
+                  rank, (void*)devPtr, (void*)winBase, size, slotOffset, useFabric);
   for (int lsa = 0; lsa < comm->lsaSize; lsa++) {
     int pe = comm->myNodeStart + lsa;
     void* peerVa = winBase + static_cast<size_t>(lsa) * comm->perRankSize;
-    MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={} rkey={}", lsa, pe, peerVa, peerRkeys_host[pe]);
+    MORI_SHMEM_INFO("  LSA[{}] (PE {}): flatVA={}", lsa, pe, peerVa);
   }
-  // Peers outside the LSA team (different vPOD / host) are reached via RDMA.
-  for (int pe = 0; pe < worldSize; pe++) {
-    if (pe >= comm->myNodeStart && pe < comm->myNodeStart + comm->lsaSize) continue;
-    MORI_SHMEM_INFO("  XNODE PE {}: rkey={} (RDMA via iova=0)", pe, peerRkeys_host[pe]);
-  }
-  // peerRkeys_host is std::vector — destructs cleanly at scope exit.
 
+  if (comm->windowMrsEnabled) CcoWindowRegisterMr(comm, wh);
   return 0;
 }
 
@@ -1642,6 +1653,12 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
       peerMask.clear();
     }
     hostShadow.gdaConnType = connType;  // may have been collapsed above
+  }
+
+  // First GDA DevComm on a single-node comm: back-fill MRs for windows registered without one.
+  if (connType != CCO_GDA_CONNECTION_NONE && !comm->windowMrsEnabled) {
+    comm->windowMrsEnabled = true;
+    for (ccoWindowHost* wh : comm->windows) CcoWindowRegisterMr(comm, wh);
   }
 
   if (connType != CCO_GDA_CONNECTION_NONE && comm->ctx->RdmaTransportEnabled()) {
