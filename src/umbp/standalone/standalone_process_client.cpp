@@ -116,14 +116,36 @@ void ArmDataPlaneDeadline(grpc::ClientContext& ctx) {
 }
 
 // RegisterMemory is not a routine data-plane call: it is a one-time-per-buffer
-// setup RPC that can legitimately take 90-120+ seconds (observed directly:
+// setup RPC that can legitimately take many minutes (observed directly:
 // "[DRAMTier] host memory registered for GPU access: 1187840 MiB in 599.6 s"
 // for the bulk step, plus sequential per-GPU IPC handle registration each
-// well over a minute), so it needs its own, longer deadline rather than
-// DataPlaneRpcTimeoutMs()'s 10s.
+// well over a minute), so it needs its own, longer deadline than
+// DataPlaneRpcTimeoutMs().
+//
+// The default was 180s, which is SHORTER than the 599.6 s this very comment
+// records -- it would have fired on the case it was written to accommodate.
+// It was also shorter than the routine data-plane deadline, inverting the two
+// even though registration is the strictly slower operation.
+//
+// Firing here is worse than a data-plane deadline in a way that is easy to
+// miss. A data-plane call degrades a non-OK status to the same "not found"
+// the caller already handles. Registration has no such fallback: nothing that
+// follows can work on an unregistered buffer, and the two paths do not even
+// agree on how they say so -- RegisterHostShmMemory throws, while
+// RegisterDeviceMemory logs and returns false, which a caller that ignores the
+// bool turns into a silently dead cache rather than a stopped rank.
+//
+// So this is a liveness bound, not a latency budget: it should only ever fire
+// on a server that is genuinely wedged. 30 minutes clears the documented bulk
+// figure with room for the cross-rank serialization registrations now go
+// through (PoolClient's registration_mutex_, which is what IOEngine's unlocked
+// memory table needs), so a rank's observed latency is its own pin plus
+// whatever its peers are still doing. The knob is there for a deployment whose
+// pools are larger still; it must never be set below
+// UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
 int RegisterMemoryRpcTimeoutMs() {
   static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS",
-                                                           std::chrono::milliseconds(180000),
+                                                           std::chrono::milliseconds(1800000),
                                                            /*min_allowed=*/1)
                                             .count());
   return v;
