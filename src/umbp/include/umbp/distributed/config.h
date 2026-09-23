@@ -227,6 +227,8 @@ struct BackendInstanceConfig {
 };
 
 struct PoolClientConfig {
+  // Opt-in two-node DRAM replication; also set by UMBP_KV_REPLICATION=numa.
+  bool numa_replication = false;
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
 

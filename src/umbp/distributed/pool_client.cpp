@@ -829,6 +829,44 @@ bool PoolClient::Init() {
     }
   }
 
+  if (const char* value = std::getenv("UMBP_KV_REPLICATION")) {
+    const std::string_view mode(value);
+    if (mode != "none" && mode != "numa") {
+      MORI_UMBP_ERROR("[PoolClient] UMBP_KV_REPLICATION must be none or numa");
+      initialized_.store(false);
+      return false;
+    }
+    config_.numa_replication = mode == "numa";
+  }
+  replica_nodes_.clear();
+  if (config_.numa_replication) {
+    // Replication is local DRAM placement. File/device tiers and master routing
+    // do not have the host-copy semantics used by this mode.
+    const auto configs = EffectiveBackendConfigs(config_);
+    bool valid = config_.master_config.master_address.empty() && !configs.empty();
+    if (!configs.empty()) replica_nodes_ = configs.front().dram.numa_nodes;
+    valid = valid && replica_nodes_.size() == 2 && replica_nodes_[0] >= 0 &&
+            replica_nodes_[1] >= 0 && replica_nodes_[0] != replica_nodes_[1];
+    for (const auto& backend : configs) {
+      valid = valid && backend.tier == TierType::DRAM &&
+              backend.dram.numa_nodes == replica_nodes_ && backend.dram.buffer_sizes.size() == 2;
+    }
+    if (!valid) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] NUMA replication requires no master and DRAM backends "
+          "with the same two distinct NUMA nodes and two buffers");
+      initialized_.store(false);
+      return false;
+    }
+    for (size_t i = 0; i < replica_nodes_.size(); ++i) {
+      replica_suffixes_[i] = "#n" + std::to_string(replica_nodes_[i]);
+    }
+    MORI_UMBP_INFO(
+        "[PoolClient] NUMA replication enabled: nodes={},{}; "
+        "eager pending-slot copies, no read promotion",
+        replica_nodes_[0], replica_nodes_[1]);
+  }
+
   // No address, no master.  Everything below -- backends, transfer engine, peer
   // service -- is built either way; only routing, registration and the
   // heartbeat are skipped.  That is what lets one binary be a single node or a
@@ -1080,10 +1118,11 @@ bool PoolClient::Init() {
   }
 
   // Start the async re-cache worker only when something can feed it and this
-  // node has an exportable local medium to install into.  Two independent
-  // producers share it: cache_remote_fetches (whole-object BatchGet) and
+  // node has an exportable local medium to install into. Without a master
+  // there are no remote fetches to feed this worker. Two independent producers
+  // share it: cache_remote_fetches (whole-object BatchGet) and
   // ranged_locality_prefetch (remote ranged reads).
-  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch) &&
+  if (HasMaster() && (config_.cache_remote_fetches || config_.ranged_locality_prefetch) &&
       registry_.Get(medium_) != nullptr) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
@@ -1519,7 +1558,8 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
                                    const std::vector<size_t>& candidates,
                                    std::vector<MediumBackend*>* holders,
                                    std::vector<ResolvedEntry>* resolutions,
-                                   const std::function<bool(size_t)>& dst_is_device) {
+                                   const std::function<bool(size_t)>& dst_is_device,
+                                   const std::function<size_t(size_t)>& preferred_replica) {
   holders->assign(keys.size(), nullptr);
   if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
   if (candidates.empty() || default_pool_ == nullptr || registry_.Empty()) return;
@@ -1531,7 +1571,13 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   // A partial batch still has to be gathered.
   std::vector<std::string> gathered;
   const std::vector<std::string>* batch = &keys;
-  if (candidates.size() != keys.size()) {
+  if (config_.numa_replication) {
+    gathered.reserve(candidates.size());
+    for (size_t i : candidates) {
+      gathered.push_back(ReplicaKey(keys[i], preferred_replica ? preferred_replica(i) : 0));
+    }
+    batch = &gathered;
+  } else if (candidates.size() != keys.size()) {
     gathered.reserve(candidates.size());
     for (size_t i : candidates) gathered.push_back(keys[i]);
     batch = &gathered;
@@ -1544,6 +1590,25 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   auto found = ResolveLocalBatchWithBusyRetry(default_pool_.get(), *batch,
                                               /*include_descs=*/false,
                                               /*allow_file_refs=*/want_file_refs);
+
+  if (config_.numa_replication) {
+    std::vector<std::string> fallback;
+    std::vector<size_t> fallback_at;
+    for (size_t j = 0; j < candidates.size(); ++j) {
+      if (j < found.size() &&
+          EffectiveResolveOutcome(found[j].resolved) != ResolveOutcome::kMissing)
+        continue;
+      const size_t i = candidates[j];
+      const size_t first = preferred_replica ? preferred_replica(i) : 0;
+      fallback.push_back(ReplicaKey(keys[i], 1 - first));
+      fallback_at.push_back(j);
+    }
+    if (!fallback.empty()) {
+      auto other = ResolveLocalBatchWithBusyRetry(default_pool_.get(), fallback, false, false);
+      found.resize(candidates.size());
+      for (size_t j = 0; j < other.size(); ++j) found[fallback_at[j]] = std::move(other[j]);
+    }
+  }
 
   // A file ref is unreadable into HOST memory, and the medium cannot know the
   // destination at resolve time.  Re-resolve those keys with file refs off so
@@ -1786,6 +1851,214 @@ bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, 
   return transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
 }
 
+std::string PoolClient::ReplicaKey(const std::string& key, size_t replica) const {
+  std::string physical;
+  const auto& suffix = replica_suffixes_[replica];
+  physical.reserve(key.size() + suffix.size());
+  physical.append(key).append(suffix);
+  return physical;
+}
+
+size_t PoolClient::PreferredReplica(void* ptr, size_t size) const {
+  if (!config_.numa_replication) return 0;
+  return PreferredNumaNodeFor(ptr, size) == replica_nodes_[1] ? 1 : 0;
+}
+
+void PoolClient::ExecuteReplicatedPutBatch(const std::vector<LocalRangeWriteRequest>& requests,
+                                           std::vector<bool>* results, double* committed_bytes,
+                                           const RangedPhaseSinks& sinks,
+                                           std::vector<bool>* written) {
+  const size_t count = requests.size();
+  std::vector<PoolPlacementRequest> asks;
+  asks.reserve(2 * count);
+  std::vector<size_t> primary(count, 0);
+  for (size_t r = 0; r < count; ++r) {
+    const auto& request = requests[r];
+    for (const auto& range : request.ranges) {
+      if (range.size != 0) {
+        primary[r] = PreferredReplica(range.user, range.size);
+        break;
+      }
+    }
+    for (size_t replica = 0; replica < 2; ++replica) {
+      asks.push_back({ReplicaKey(*request.key, replica),
+                      request.object_size,
+                      request.tier,
+                      {},
+                      request.logical_tier,
+                      replica_nodes_[replica],
+                      static_cast<int64_t>(2 * r + 1 - replica)});
+    }
+  }
+
+  std::vector<PoolAllocateResult> allocations;
+  {
+    PhaseTimer timer(sinks.resolve);
+    allocations = default_pool_->BatchAllocate(asks);
+  }
+  std::vector<MediumBackend*> backends(allocations.size(), nullptr);
+  std::vector<PoolSlotRef> aborts;
+  aborts.reserve(allocations.size());
+  std::vector<TransferItem> items;
+  size_t range_count = 0;
+  for (const auto& request : requests) range_count += request.ranges.size();
+  items.reserve(range_count);
+  std::vector<bool> ready(allocations.size(), false);
+  auto slot = [&](size_t i) {
+    return PoolSlotRef{allocations[i].backend_id, allocations[i].allocation.slot_id};
+  };
+  for (size_t r = 0; r < count; ++r) {
+    const auto& request = requests[r];
+    const size_t first = 2 * r, second = first + 1;
+    const auto a = allocations[first].allocation.outcome;
+    const auto b = allocations[second].allocation.outcome;
+    if (a != AllocateOutcome::kSuccessAllocated || b != AllocateOutcome::kSuccessAllocated) {
+      if (a == AllocateOutcome::kSuccessAlreadyExists ||
+          b == AllocateOutcome::kSuccessAlreadyExists) {
+        (*results)[request.result_index] = true;
+      }
+      continue;
+    }
+    backends[first] = registry_.Get(allocations[first].backend_id);
+    backends[second] = registry_.Get(allocations[second].backend_id);
+    const size_t source = first + primary[r];
+    const auto& allocation = allocations[source].allocation;
+    const size_t before = items.size();
+    bool built = false;
+    {
+      PhaseTimer timer(sinks.build);
+      built = backends[first] != nullptr && backends[second] != nullptr &&
+              BuildLocalRangeTransfers(backends[source], allocation.pages, allocation.page_size,
+                                       request.object_size, request.ranges, true, source, &items,
+                                       sinks.classify);
+    }
+    if (built) {
+      ready[source] = true;
+    } else {
+      items.resize(before);
+    }
+  }
+  if (items.empty()) {
+    for (size_t i = 0; i < allocations.size(); ++i) {
+      if (allocations[i].allocation.outcome == AllocateOutcome::kSuccessAllocated) {
+        aborts.push_back(slot(i));
+      }
+    }
+    if (!aborts.empty()) default_pool_->BatchAbort(aborts);
+    return;
+  }
+  auto transfer = [&] {
+    if (items.empty()) return;
+    if (sinks.items != nullptr) *sinks.items += items.size();
+
+    std::vector<size_t> failed;
+    transfer_engine_->Transfer(items, &failed, sinks.steps);
+    for (size_t i : failed) ready[i] = false;
+    items.clear();
+  };
+  transfer();  // One batch of caller -> local replica transfers (one D2H).
+
+  // Source and destination are both our pending slots. Their existing lifetime
+  // and Clear generation checks apply; no committed object/pin is borrowed.
+  for (size_t r = 0; r < count; ++r) {
+    const size_t source = 2 * r + primary[r], target = 2 * r + 1 - primary[r];
+    if (!ready[source]) continue;
+    const auto& src = allocations[source].allocation;
+    const auto& dst = allocations[target].allocation;
+    const size_t before = items.size();
+    uint64_t copied = 0;
+    {
+      PhaseTimer timer(sinks.build);
+      while (copied < requests[r].object_size) {
+        const auto& sp = src.pages[copied / src.page_size];
+        const auto& dp = dst.pages[copied / dst.page_size];
+        TransferItem item;
+        item.tag = target;
+        item.src = backends[source]->BufferRef(sp.buffer_index);
+        item.dst = backends[target]->BufferRef(dp.buffer_index);
+        if (!item.src.Valid() || !item.dst.Valid()) break;
+        item.src_offset = sp.page_index * src.page_size + copied % src.page_size;
+        item.dst_offset = dp.page_index * dst.page_size + copied % dst.page_size;
+        item.size =
+            std::min({requests[r].object_size - copied, src.page_size - copied % src.page_size,
+                      dst.page_size - copied % dst.page_size});
+        copied += item.size;
+        items.push_back(std::move(item));
+      }
+    }
+    ready[target] = copied == requests[r].object_size;
+    if (!ready[target]) items.resize(before);
+  }
+  // These are diagnostic batch values, not client traffic: a replica copy
+  // never crossed the caller boundary. Reuse the existing opt-in trace; the
+  // masterless deployment cannot export through CountMetric.
+  const bool trace_copy = RangedDebugEnabled();
+  uint64_t copy_bytes_submitted = 0;
+  double copy_seconds = 0;
+  if (trace_copy) {
+    for (const auto& item : items) copy_bytes_submitted += item.size;
+  }
+  {
+    PhaseTimer timer(trace_copy ? &copy_seconds : nullptr);
+    transfer();  // One batch of host -> host transfers, before either commit.
+  }
+
+  std::vector<PoolCommitRequest> commits;
+  std::vector<size_t> commit_at;
+  commits.reserve(allocations.size());
+  commit_at.reserve(allocations.size());
+  for (size_t i = 0; i < allocations.size(); ++i) {
+    if (allocations[i].allocation.outcome != AllocateOutcome::kSuccessAllocated) continue;
+    if (!ready[i]) {
+      aborts.push_back(slot(i));
+      continue;
+    }
+    commits.push_back({slot(i), asks[i].key});
+    commit_at.push_back(i);
+  }
+  double bytes = 0;
+  size_t committed_objects = 0, committed_copies = 0;
+  {
+    PhaseTimer timer(sinks.commit);
+    auto committed = default_pool_->BatchCommit(commits);
+    for (size_t j = 0; j < commits.size(); ++j) {
+      const size_t i = commit_at[j], index = requests[i / 2].result_index;
+      if (j >= committed.size() || !committed[j].commit.success) {
+        aborts.push_back(commits[j].slot);
+        continue;
+      }
+      ++committed_copies;
+      if (!(*results)[index]) {
+        bytes += requests[i / 2].object_size;
+        ++committed_objects;
+      }
+      (*results)[index] = true;
+      if (written != nullptr) (*written)[index] = true;
+    }
+  }
+  if (!aborts.empty()) default_pool_->BatchAbort(aborts);
+  const size_t degraded = 2 * committed_objects - committed_copies;
+  if (degraded != 0) {
+    MORI_UMBP_WARN("[PoolClient] NUMA replication committed {} objects with only one copy",
+                   degraded);
+  }
+  if (trace_copy) {
+    MORI_UMBP_INFO(
+        "[NumaReplication][dbg] copy_bytes_submitted={} copy_us={:.1f} "
+        "committed_objects={} degraded_objects={}",
+        copy_bytes_submitted, copy_seconds * 1e6, committed_objects, degraded);
+  }
+  if (committed_bytes != nullptr) *committed_bytes += bytes;
+  if (bytes > 0) {
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                bytes);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
+                bytes);
+  }
+}
+
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
                                             std::vector<bool>* results, double* committed_bytes,
                                             const RangedPhaseSinks* sinks_or_null) {
@@ -1794,6 +2067,11 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
   if (requests.empty()) return;
   if (default_pool_ == nullptr || registry_.Empty()) {
     MORI_UMBP_ERROR("[PoolClient] Local ranged Put requested but no pool is initialized");
+    return;
+  }
+
+  if (config_.numa_replication) {
+    ExecuteReplicatedPutBatch(requests, results, committed_bytes, sinks);
     return;
   }
 
@@ -2347,6 +2625,27 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
       MORI_UMBP_ERROR("[PoolClient] Local Put requested but no default pool is initialized");
       return;
     }
+    if (config_.numa_replication) {
+      std::vector<LocalRangeWriteRequest> requests;
+      requests.reserve(local.size());
+      for (size_t i = 0; i < local.size(); ++i) {
+        const auto& item = local[i];
+        requests.push_back({i,
+                            item.key,
+                            item.size,
+                            {{const_cast<void*>(item.src), item.size, 0}},
+                            item.route.tier,
+                            item.route.logical_tier});
+      }
+      std::vector<bool> copied(local.size(), false), written(local.size(), false);
+      ExecuteReplicatedPutBatch(requests, &copied, nullptr, RangedPhaseSinks{}, &written);
+      for (size_t i = 0; i < local.size(); ++i) {
+        if (copied[i])
+          (*results)[local[i].index] =
+              written[i] ? PutEntryOutcome::kSucceeded : PutEntryOutcome::kAlreadyExists;
+      }
+      return;
+    }
     const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -2849,8 +3148,13 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
 
   std::vector<MediumBackend*> holders;
   std::vector<ResolvedEntry> resolutions;
-  ResolveLocalBatch(keys, indices, &holders, &resolutions,
-                    [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); });
+  std::function<size_t(size_t)> preferred_replica;
+  if (config_.numa_replication) {
+    preferred_replica = [&](size_t i) { return PreferredReplica(dsts[i], sizes[i]); };
+  }
+  ResolveLocalBatch(
+      keys, indices, &holders, &resolutions,
+      [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); }, preferred_replica);
 
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<TransferItem> items;
@@ -3231,18 +3535,30 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   }
   std::vector<MediumBackend*> holders;
   std::vector<ResolvedEntry> resolutions;
+  std::function<size_t(size_t)> preferred_replica;
+  if (config_.numa_replication) {
+    preferred_replica = [&](size_t i) {
+      for (size_t r = 0; r < sizes[i].size(); ++r) {
+        if (sizes[i][r] != 0) return PreferredReplica(dsts[i][r], sizes[i][r]);
+      }
+      return size_t{0};
+    };
+  }
   {
     PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
-    ResolveLocalBatch(keys, candidates, &holders, &resolutions, [&](size_t i) {
-      // One key's ranges normally share a caller allocation, but nothing
-      // guarantees it; a single host range makes the whole key unservable
-      // from a file ref, so require all of them.
-      const std::vector<void*>& key_dsts = dsts[i];
-      for (size_t r = 0; r < key_dsts.size(); ++r) {
-        if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
-      }
-      return !key_dsts.empty();
-    });
+    ResolveLocalBatch(
+        keys, candidates, &holders, &resolutions,
+        [&](size_t i) {
+          // One key's ranges normally share a caller allocation, but nothing
+          // guarantees it; a single host range makes the whole key unservable
+          // from a file ref, so require all of them.
+          const std::vector<void*>& key_dsts = dsts[i];
+          for (size_t r = 0; r < key_dsts.size(); ++r) {
+            if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+          }
+          return !key_dsts.empty();
+        },
+        preferred_replica);
   }
 
   for (size_t i = 0; i < n; ++i) {
@@ -4446,6 +4762,26 @@ bool PoolClient::Exists(const std::string& key) {
 
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {
   if (!initialized_ || keys.empty()) return std::vector<bool>(keys.size(), false);
+
+  if (config_.numa_replication) {
+    std::vector<std::string> physical;
+    physical.reserve(keys.size());
+    for (const auto& key : keys) physical.push_back(ReplicaKey(key, 0));
+    auto out = default_pool_->BatchContains(physical);
+    physical.clear();
+    std::vector<size_t> missing;
+    for (size_t i = 0; i < out.size(); ++i) {
+      if (!out[i]) {
+        physical.push_back(ReplicaKey(keys[i], 1));
+        missing.push_back(i);
+      }
+    }
+    if (!physical.empty()) {
+      auto other = default_pool_->BatchContains(physical);
+      for (size_t i = 0; i < other.size(); ++i) out[missing[i]] = other[i];
+    }
+    return out;
+  }
 
   // Local-first: this node's own backends answer conclusively for the keys they
   // hold, so a batch that is entirely local needs no master round trip at all.

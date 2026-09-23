@@ -74,4 +74,65 @@ GPU registration and the transfer path are unchanged.
 
 This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
-It does not migrate existing objects or replicate shared keys across sockets.
+Placement alone does not migrate existing objects or replicate shared keys.
+Shared-key replication is a separate opt-in mode described below.
+
+## Shared-key replication
+
+For a workload whose GPUs on both sockets read the same logical keys, opt in to
+one copy per NUMA node:
+
+```sh
+export UMBP_DRAM_NUMA_NODE=0,1
+export UMBP_KV_REPLICATION=numa  # default: none
+```
+
+This mode requires a masterless DRAM pool. Every configured backend must have
+two buffers and the same ordered pair of distinct NUMA nodes. Unsupported
+configurations and unknown replication modes fail initialization. The variable
+is read by the server's PoolClient, including an automatically started standalone
+server; clients continue sending the original keys. Direct C++ users can set
+`PoolClientConfig::numa_replication` (the environment, if set, takes precedence).
+
+Both physical keys are checked and reserved in one pool operation. An existing
+copy makes the logical Put a no-op; it neither overwrites that copy nor allocates
+the missing one. A concurrent reservation causes a retryable failure. New data
+moves from the caller to its preferred replica once, then between the two
+pending host allocations, before committing. This preserves one D2H transfer
+and the existing pending-slot/Clear lifetime rules. A completed copy can survive
+failure of its sibling. Whole and ranged puts use the same batched path.
+
+Get prefers the destination GPU's replica and falls back on a miss. CPU and
+unknown destinations prefer the first configured node. Exists checks either
+copy without renewing read leases. No background read promotion is performed;
+a surviving replica remains authoritative after its sibling is evicted.
+Internal suffixes are added to every key, including keys already ending in a
+NUMA-looking suffix. Enable or disable the mode with a fresh pool.
+
+Replication uses up to twice the storage for the same logical working set.
+It is intended for shared keys such as rank-replicated MLA/DSA KV, not keys whose
+contents are sharded per rank. The extra host copy and reduced cache capacity
+can offset the read-locality gain. Confirm the net benefit on the intended
+workload before enabling it in production; microbenchmark bandwidth alone does
+not establish serving throughput or latency improvements.
+
+For a short copy-cost diagnostic, enable the existing trace:
+
+```sh
+export UMBP_RANGED_CALL_DEBUG=1
+export MORI_UMBP_LOG_LEVEL=info
+```
+
+`[NumaReplication][dbg]` reports one line per batch that reaches copying:
+`copy_bytes_submitted` is the host-to-host payload submitted to the transfer
+layer, `copy_us` covers that call's planning, submission, and completion,
+`committed_objects` counts newly committed logical objects, and
+`degraded_objects` counts those for which only one replica committed. Sum the
+per-batch values for totals. Submitted bytes do not guarantee all bytes landed
+if the transfer failed; later eviction is not counted as a degraded commit.
+Deduplicated/no-copy batches contribute zero and do not emit this line.
+
+These diagnostics work without a master. They add no copy timing calls or log
+lines when the trace is off. Client Put traffic remains counted once; internal
+replica traffic is a separate quantity. Copy time helps attribute write cost,
+but queue growth and serving backpressure must still be checked at the caller.

@@ -48,6 +48,9 @@ struct PoolPlacementRequest {
   std::string backend_name;
   std::string logical_tier;
   int preferred_numa_node = -1;
+  // Reciprocal index in this BatchAllocate call, or -1 for an independent put.
+  // A pair is deduplicated/reserved together before either allocates pages.
+  int64_t paired_request = -1;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot
