@@ -46,6 +46,56 @@ so operators can audit the effective values.
 
 ---
 
+## RPC deadlines
+
+Every per-RPC gRPC client deadline in UMBP is resolved and armed in
+`common/rpc_deadline.h`. A call with no deadline waits forever, which is how a
+wedged standalone-server handler once blocked a scheduler rank until its whole
+TP group hung with it.
+
+| Env var | Default | Unit | Description |
+|---|---|---|---|
+| `UMBP_RPC_DEADLINES` | `1` | bool | Master switch. `0`, `off` or `false` disables every deadline below that has not been set explicitly. For a deployment that would rather see a call hang — where `py-spy` can point at it — than have it time out and be counted as a miss. |
+| `UMBP_MASTER_RPC_TIMEOUT_MS` | `30000` | ms | Routing and lookup against the master: `BatchLookup`, `BatchRoutePut`, `BatchRouteGet`, `RoutePut`, `RouteGet`, `RegisterClient`, `MatchExternalKv`, `GetExternalKvHitCounts`. One round trip each, issued before any slot exists. |
+| `UMBP_PEER_RPC_TIMEOUT_MS` | `10000` | ms | Peer slot lifecycle — `BatchAllocateSlots`, `BatchCommitSlots` — and the `GetPeerInfo` handshake. **Must stay well under the peer's 30 s `pending_ttl`**: the allocate returns before the transfer and commit that follow it, and all three have to fit inside that TTL or a slow-but-successful allocate comes back to slots the peer already reclaimed. Peer cleanup (`BatchAbortSlots`) is derived at 2× this value rather than given a knob of its own, so the two cannot drift apart. |
+| `UMBP_DATA_PLANE_RPC_TIMEOUT_MS` | `300000` | ms | Standalone-process client → standalone server, for every routine data-plane call (`BatchExists`, `BatchGet*`, `BatchPut*`, `Clear`, `Flush`, `DeregisterMemory`). A bound on a hang, not a tuned latency: a caller that hits it sees the same `grpc::Status` it already handles as a miss, and the failure is logged rather than silently degraded. |
+| `UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS` | `3600000` | ms | The one-time-per-buffer `RegisterMemory` RPC, which pins memory and is measured in minutes. A liveness bound so a wedged server releases the rank and its allocation; **not** a latency budget. Unlike a data-plane miss, a failed registration throws, so err high. Must never sit below `UMBP_DATA_PLANE_RPC_TIMEOUT_MS`. |
+| `UMBP_HEARTBEAT_RPC_TIMEOUT_MS` | `3000` | ms | The `Heartbeat` RPC from `MasterClient`'s heartbeat thread. |
+| `UMBP_RPC_SHUTDOWN_TIMEOUT_MS` | `3000` | ms | `UnregisterClient` and the last `Heartbeat` in `~MasterClient`, plus `ReportMetrics` and the external-KV mutation RPCs. Bounds `~MasterClient` worst-case at ≤ 2 × this value. |
+| `UMBP_EVICTKEY_DEADLINE_MS` | `1000` | ms | Master → peer `EvictKey` dispatch. |
+
+**The hierarchy.** An outbound deadline belongs below the deadline of whatever
+call it serves, so the inner call fails first and returns a real error instead
+of letting the outer one time out blind:
+
+```
+master / peer outbound  <  standalone client data plane
+```
+
+Keeping that ordering is what makes the client-side deadline a backstop rather
+than the only protection — with it in place, a server no longer needs the client
+to rescue it from its own stalled dependency.
+
+**`0` means "no deadline".** Setting any knob in this table to `0` leaves the
+gRPC context unarmed, i.e. wait forever. A knob set explicitly always wins over
+`UMBP_RPC_DEADLINES`, so "disable everything except this one" is expressible
+both ways. A malformed or negative value is **not** a disable — it warns once
+and falls back to the default, so a typo cannot quietly unbound an RPC.
+
+This convention applies to the table above and nowhere else. It does **not**
+apply to `UMBP_RESOLVE_BUSY_TIMEOUT_MS` (a retry budget, where `0` would break
+the retry loop rather than remove a bound), to
+`UMBP_STANDALONE_STARTUP_TIMEOUT_MS` (a poll-loop bound), or to the
+`UMBP_*_GRPC_SHUTDOWN_DEADLINE_SEC` family (server-side `Shutdown()`, where `0`
+means "cancel in-flight calls immediately").
+
+Two call sites are deliberately outside this scheme: `BatchResolveKeys`, whose
+deadline is computed from the remaining `UMBP_RESOLVE_BUSY_TIMEOUT_MS` retry
+budget, and `WaitReady`'s fixed 500 ms `Ping`, which sits inside its own outer
+wait bounded by `UMBP_STANDALONE_STARTUP_TIMEOUT_MS`.
+
+---
+
 ## Master / client registry
 
 Read by the **master process** (`bin/master_main.cpp` via
@@ -59,7 +109,6 @@ Read by the **master process** (`bin/master_main.cpp` via
 | `UMBP_EVICTION_CHECK_INTERVAL_SEC` | `5` | sec | `EvictionManager` loop period. |
 | `UMBP_LEASE_DURATION_SEC` | `2` | sec | Master-side read-lease length granted by `Router::RouteGet`: `IsLeased()` keys are skipped by the eviction scan, keeping a key alive from the moment the master returns its location until the reader connects to the owning peer. Only needs to cover the master→reader gRPC round trip + reach the peer (the actual RDMA transfer is covered peer-side by `UMBP_DRAM_READ_LEASE_MS`), so seconds is already generous; larger values pin actively-read (hot) keys against eviction. |
 | `UMBP_HEARTBEAT_INTERVAL_DIVISOR` | `2` | count | Recommended client heartbeat interval = `heartbeat_ttl / divisor`. `min_allowed=1` guards against div-by-zero. Read by the master and echoed in `RegisterClientResponse.heartbeat_interval_ms`. |
-| `UMBP_EVICTKEY_DEADLINE_MS` | `1000` | ms | Per-call gRPC deadline applied to outbound `EvictKey` RPCs from `MasterPeerStubPool`. |
 | `UMBP_HIT_INDEX_TTL_SEC` | `7200` | sec | External KV hit-count entry TTL. A hash with no counted match for longer than this is removed from the hit index. |
 | `UMBP_HIT_INDEX_GC_INTERVAL_SEC` | `60` | sec | External KV hit-count GC sweep interval. |
 | `UMBP_HIT_QUERY_MAX_BATCH` | `4096` | count | Maximum hashes accepted by one `GetExternalKvHitCounts` request. Oversized requests return gRPC `INVALID_ARGUMENT`; the server does not truncate. |
@@ -77,7 +126,6 @@ that has loaded `libmori_pybinds.so`).
 | `UMBP_DRAM_READ_LEASE_MS` | `500` | ms | Peer-side DRAM/HBM read lease: how long a single `PeerDramAllocator::Resolve` protects its key's pages from concurrent local `Evict`, covering one RDMA read of those pages. Only needs to exceed one DRAM RDMA round trip (sub-ms), so 500 ms is ~100x margin. Read once at `PoolClient::Init`; `min_allowed=1`. |
 | `UMBP_SSD_READ_LEASE_MS` | `3000` | ms | Peer-side SSD read-staging slot lease: how long a claimed staging slot is reserved before the peer reclaims it by TTL (the fallback when the reader's best-effort `ReleaseSsdLease` is lost), and, echoed back in `PrepareSsdReadResponse.lease_ttl_ms`, the reader's validity window anchored at `t_send`. Must exceed one SSD read + RDMA (slower than DRAM), but too long pins a configured staging slot on a lost release. Also the fallback for the `PrepareSsdRead` RPC deadline when `UMBP_SSD_PREPARE_TIMEOUT_MS` is unset. Read once at `PoolClient::Init`; `min_allowed=1`. Also the read lease of a policy-declared `SsdBackend`, where it governs how long a contiguous staging span stays claimed and so sets that backend's read concurrency against a fixed arena — see `staging_slots`. |
 | `UMBP_RESOLVE_BUSY_TIMEOUT_MS` | `30000` | ms | Overall deadline for retrying a peer-local or remote batch resolve that returned `BUSY` because SSD staging was temporarily full. Retries discard the whole response and use exponential backoff capped at 50 ms. A batch whose own working set exceeds the arena returns a permanent failure immediately and is not retried. Values above 300000 ms are clamped. |
-| `UMBP_RPC_SHUTDOWN_TIMEOUT_MS` | `3000` | ms | Deadline for `UnregisterClient` and the last `Heartbeat` in `~MasterClient`. Bounds `~MasterClient` worst-case at ≤ 2 × this value. |
 | `UMBP_GRPC_SHUTDOWN_DEADLINE_SEC` | `3` | sec | `server_->Shutdown(deadline)` budget, shared by master and peer service. |
 | `UMBP_METRICS_REPORT_INTERVAL_MS` | `1000` | ms | Cadence at which the pool client's `MasterClient` flushes buffered counters/gauges/histograms via `ReportMetrics`. |
 | `UMBP_RELEASE_LEASE_MAX_RETRIES` | `2` | count | `ReleaseSsdLease` RPC attempt cap on the SSD read path. `min_allowed=1`. |
