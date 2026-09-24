@@ -61,6 +61,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // Combine never carries scales: it moves post-expert tokens, which are already
   // in the combine dtype. Only dispatch gets the row.
   c.scaleBytes = (kind == EpKernelKind::Dispatch) ? req.scaleBytes : 0;
+  // Same shape of asymmetry as scaleBytes: the choice only exists on one leg, so
+  // the other leg pins it rather than rendering a Cfg whose flag the body ignores
+  // (that would split the cache in two for identical machine code).
+  c.combinePush = (kind == EpKernelKind::Combine) && req.combinePush;
+  c.combineQuant = (kind == EpKernelKind::Combine) ? req.combineQuant : 0;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -89,6 +94,28 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     throw std::runtime_error(
         "mori v2 ep: combine reduces its input, so it needs an arithmetic dtype; "
         "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");
+  }
+
+  // Wire quant needs a writer that holds a whole token, which only the push
+  // transport has. Throwing beats clamping to 0: a caller who asked for the
+  // compressed wire and got the full-width one back would see the right numbers
+  // at the wrong bandwidth, with nothing in the output saying why.
+  if (c.combineQuant != 0) {
+    if (!c.combinePush) {
+      throw std::runtime_error(
+          "mori v2 ep: combineQuant needs combinePush -- only the push transport "
+          "has a writer holding a whole token to compress");
+    }
+    if (c.combineQuant != 1 && c.combineQuant != 3) {
+      throw std::runtime_error(
+          "mori v2 ep: combineQuant must be 0 (off), 1 (fp8_direct_cast) or 3 (fp4), got " +
+          std::to_string(c.combineQuant));
+    }
+    if (c.dtype != EpDType::Bf16) {
+      throw std::runtime_error(
+          "mori v2 ep: combineQuant casts bf16 elements (e4m3 or e2m1); it is written "
+          "for a bf16 combine dtype only");
+    }
   }
 
   if (!EpCfgIsValid(c)) {

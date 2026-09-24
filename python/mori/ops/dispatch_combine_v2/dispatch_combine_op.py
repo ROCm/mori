@@ -60,7 +60,7 @@ _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 DEFAULT_BACKEND = "flydsl"
 
 
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise", "fp4")
 
 _DT = {
     torch.bfloat16: 2,

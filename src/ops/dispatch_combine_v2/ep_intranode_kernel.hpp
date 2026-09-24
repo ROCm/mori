@@ -102,6 +102,26 @@ template <EpCfg kCfg>
 __device__ __forceinline__ int EpSrcTokIndex(int pe, int srcTokId) {
   return pe * kCfg.maxTokPerRank + srcTokId;
 }
+// Decoders for the reverse map. The PUSH combine needs both halves: a rank
+// holding an expert result reads its own recvToSrc entry to learn which rank
+// owns the token and which of that rank's tokens it is, which is exactly the
+// (pe, localTok) pair a push slot is addressed by.
+template <EpCfg kCfg>
+__device__ __forceinline__ int EpPeFromSrcTok(int srcTok) {
+  return srcTok / kCfg.maxTokPerRank;
+}
+template <EpCfg kCfg>
+__device__ __forceinline__ int EpTokFromSrcTok(int srcTok) {
+  return srcTok % kCfg.maxTokPerRank;
+}
+// A push slot, in slots (multiply by EpCombinePushSlotBytes). Same shape as the
+// reverse map's encoding on purpose: the sender writes (myPe, destination token)
+// and the owner reads (source pe, its own token), so one formula serves both and
+// there is no second stride to keep in step. v1 spells this SendBufSlotOffset.
+template <EpCfg kCfg>
+__device__ __forceinline__ int EpPushSlot(int pe, int localTokId) {
+  return pe * kCfg.maxTokPerRank + localTokId;
+}
 template <EpCfg kCfg>
 __device__ __forceinline__ int EpPeFromFlat(int flat) {
   return flat / EpFlatStride<kCfg>();
@@ -118,6 +138,40 @@ __device__ __forceinline__ int EpNullFlat() {
   return kCfg.worldSize * EpFlatStride<kCfg>();
 }
 
+// CORRECT EITHER WAY. Rounds each warp's slice of the hidden dim up to 128
+// elements so the slice OFFSETS stay aligned. Without it the offsets are
+// multiples of ceil(hidden / warpsPerItem), which is aligned only when
+// warpsPerItem divides the hidden dim -- and when it does not, the combine
+// reduce's own alignment test fails and every element goes through its scalar
+// tail. Measured on gfx1250, EP4, hidden 7168, push combine at the shipped
+// 64x16 (so 1024 warps), 3 alternating rounds, CHECK=1:
+//
+// Combine us, push fp8 with the gate off and on, pull bf16 for scale:
+//
+//   ct     pull   off     on
+//   256    33.7   34.6   34.6    warpsPerItem 4, slice 1792, already aligned
+//   342    48.1   68.3   41.0    warpsPerItem 3, slice 2390 -> 2432
+//   384    48.6   74.0   44.4
+//   448    58.2   77.5   47.7
+//   511    49.6   79.6   49.8
+//   512    45.8   46.7   46.8    warpsPerItem 2, slice 3584, already aligned
+//
+// Nothing from 576 to 4096 moves by more than 0.1. warpsPerItem is 3 for every
+// ct in [342, 511] and no vector width divides 2390, so two of every three
+// warps ran the scalar tail and the band cost up to 30 us more than ct=512 does
+// with more work to do. Pull does not show it: at 64x8 it has 512 warps, so
+// warpsPerItem is 2 across that band and 3584 is aligned. See §23.15n.
+//
+// 0 turns it off. 1 means the default 128. Any larger value is used as the
+// alignment itself, which is how the gate gets checked: at hidden 7168 and
+// warpsPerItem 3, an alignment of 3584 leaves the third part with no work at
+// all, so a run that sets it and does not move is a run where the flag never
+// reached the compile -- and that has to be ruled out before a null result
+// here is read as "the offsets were not the problem".
+#ifndef MORI_COMB_PARTALIGN
+#define MORI_COMB_PARTALIGN 1
+#endif
+
 // Partitions numItems x hiddenDim across the grid's warps: several warps split
 // one token when warps outnumber tokens, one warp takes several otherwise.
 struct EpMultiWarpIter {
@@ -129,6 +183,16 @@ struct EpMultiWarpIter {
     warpsPerItem = (globalWarpNum + numItems - 1) / numItems;
     if (warpsPerItem < 1) warpsPerItem = 1;
     dimPerWarp = (dimSize + warpsPerItem - 1) / warpsPerItem;
+    // 128 elements, not 128 bytes: this struct does not know the element type,
+    // and 128 elements covers the widest requirement any caller has (a 128 B
+    // TDM row of 1-byte wire) while staying a multiple of every narrower one.
+    // Guarded on the dim being large enough that every part still gets work --
+    // rounding up is safe for correctness either way, since Decode already
+    // hands back a zero-length chunk for a part that starts past the end, but
+    // below this bound it would idle warps for nothing.
+    constexpr size_t kPartAlign = (MORI_COMB_PARTALIGN > 1) ? (size_t)MORI_COMB_PARTALIGN : 128;
+    if (MORI_COMB_PARTALIGN != 0 && dimSize >= kPartAlign * (size_t)warpsPerItem)
+      dimPerWarp = (dimPerWarp + kPartAlign - 1) & ~(kPartAlign - 1);
   }
 
   __device__ void Decode(int i, int& itemId, int& inItemPartId, size_t& dimOffset,
@@ -357,15 +421,59 @@ __device__ void EpCombineBody(EpArgs args) {
   const unsigned long long flag = args.xdbFlag[0];
   const int totalRecv = args.totalRecvTokenNum[0];
 
-  // Stage the post-expert tokens into the arena so peers can gather them --
-  // unless the caller already produced them there, which an expert op writing
-  // straight into combine_in_view does. Skipping is not a micro-optimisation:
-  // at 4k tokens x 7168 the copy is ~300 MB of pure self-copy.
-  T* const stage = EpLocal<T>(win, args.offOutTok);
-  if (reinterpret_cast<const T*>(args.inpTokenBuf) != stage) {
+  // Same expression the slot stride is built from, so the weights sit where the
+  // other side looks for them.
+  constexpr size_t kHiddenB = (size_t)EpCombineWireBytes(kCfg);
+  constexpr int kSlotB = EpCombinePushSlotBytes(kCfg);
+  // Wire quant lives in the gfx1250 body, where the narrow can happen inside the
+  // TDM tile and pay for itself. Implementing it here too would mean shipping a
+  // second version that no machine on hand can check, so hip_backend does not
+  // offer quant off gfx1250 and this catches it if that ever drifts.
+  static_assert(kCfg.combineQuant == 0,
+                "combineQuant is implemented in the gfx125x combine body only");
+
+  if constexpr (kCfg.combinePush) {
+    // PUSH: send each expert result straight into the owner's slot, so the
+    // owner's reduce reads only its own memory. No TDM here -- on these parts a
+    // peer vector store is not the slow path TDM exists for, which is the same
+    // reason dispatch above copies straight to the peer per token.
+    //
+    // recvToSrc[slot] is (owner rank, that rank's token id), which is exactly
+    // the pair a push slot is keyed by. The weights come from the LOCAL
+    // forwarded copy: offOutWts is indexed by recv slot, the same index this
+    // loop walks.
+    const int* const recvToSrc = EpLocal<int>(win, args.offRecvToSrc);
+    const T* const myToks = reinterpret_cast<const T*>(args.inpTokenBuf);
+    const float* const myWts = kCfg.useWeights ? EpLocal<float>(win, args.offOutWts) : nullptr;
     for (int i = globalWarpId; i < totalRecv; i += globalWarpNum) {
-      core::WarpCopy(stage + i * kHidden,
-                     reinterpret_cast<const T*>(args.inpTokenBuf) + i * kHidden, kHidden);
+      const int srcTok = recvToSrc[i];
+      const int destPe = EpPeFromSrcTok<kCfg>(srcTok);
+      const int destLocalTok = EpTokFromSrcTok<kCfg>(srcTok);
+      // Holds for any slot dispatch wrote. Checked because the arena starts
+      // zeroed, so a stale slot would decode to (rank 0, token 0) and corrupt a
+      // live token instead of faulting.
+      if (destPe >= kNpes || destLocalTok >= kCfg.maxTokPerRank) continue;
+      uint8_t* const dstSlot = EpPeer<uint8_t>(win, destPe, args.offCombPush) +
+                               (size_t)EpPushSlot<kCfg>(args.rank, destLocalTok) * kSlotB;
+      core::WarpCopy(reinterpret_cast<T*>(dstSlot), myToks + (size_t)i * kHidden, kHidden);
+      if constexpr (kCfg.useWeights) {
+        if (myWts) {
+          core::WarpCopy(reinterpret_cast<float*>(dstSlot + kHiddenB), myWts + (size_t)i * kTopk,
+                         kTopk);
+        }
+      }
+    }
+  } else {
+    // Stage the post-expert tokens into the arena so peers can gather them --
+    // unless the caller already produced them there, which an expert op writing
+    // straight into combine_in_view does. Skipping is not a micro-optimisation:
+    // at 4k tokens x 7168 the copy is ~300 MB of pure self-copy.
+    T* const stage = EpLocal<T>(win, args.offOutTok);
+    if (reinterpret_cast<const T*>(args.inpTokenBuf) != stage) {
+      for (int i = globalWarpId; i < totalRecv; i += globalWarpNum) {
+        core::WarpCopy(stage + i * kHidden,
+                       reinterpret_cast<const T*>(args.inpTokenBuf) + i * kHidden, kHidden);
+      }
     }
   }
 
@@ -395,11 +503,23 @@ __device__ void EpCombineBody(EpArgs args) {
       const int destPe = EpPeFromFlat<kCfg>(flat);
 
       if (destPe < kNpes) {
-        const int destLocalTokId = EpLocalTokFromFlat<kCfg>(flat);
-        srcPtrs[j] =
-            EpPeer<T>(win, destPe, args.offOutTok) + destLocalTokId * kHidden + hiddenOffset;
-        if constexpr (kCfg.useWeights) {
-          srcWeightPtrs[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * kTopk;
+        if constexpr (kCfg.combinePush) {
+          // All local: destPe wrote its result for our token here before the
+          // barrier, keyed by (source rank, our token) -- the mirror of what the
+          // sender wrote, (its own rank, our token id on us).
+          uint8_t* const slot = EpLocal<uint8_t>(win, args.offCombPush) +
+                                (size_t)EpPushSlot<kCfg>(destPe, tokenId) * kSlotB;
+          srcPtrs[j] = reinterpret_cast<T*>(slot) + hiddenOffset;
+          if constexpr (kCfg.useWeights) {
+            srcWeightPtrs[j] = reinterpret_cast<float*>(slot + kHiddenB);
+          }
+        } else {
+          const int destLocalTokId = EpLocalTokFromFlat<kCfg>(flat);
+          srcPtrs[j] =
+              EpPeer<T>(win, destPe, args.offOutTok) + destLocalTokId * kHidden + hiddenOffset;
+          if constexpr (kCfg.useWeights) {
+            srcWeightPtrs[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * kTopk;
+          }
         }
       } else {
         srcPtrs[j] = nullptr;

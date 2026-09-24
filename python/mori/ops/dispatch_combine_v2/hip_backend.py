@@ -24,15 +24,18 @@
 Same surface as the FlyDSL backend (``EpDispatchCombineOpFlyDSL``): same
 constructor, same ``dispatch``/``combine`` signatures and return shapes, same
 routing handle. What differs is where the kernels come from, and which configs
-can be served -- this backend implements the gather path with a bf16/fp32 combine
-and a bf16/fp32/fp8/fp4 dispatch, and rejects everything else at CONSTRUCTION
-rather than at launch.
+can be served -- this backend implements both combine transports (gather and
+scatter) with a bf16/fp32 combine and a bf16/fp32/fp8/fp4 dispatch, and rejects
+everything else at CONSTRUCTION rather than at launch.
 
 Imports ``ep_plans`` (the C++/JIT plans) but never flydsl, so it works where
 FlyDSL is not installed.
 """
 
 from __future__ import annotations
+
+import os
+import re
 
 import torch
 
@@ -57,7 +60,94 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    "combPush": "comb_push",  # only laid out for scatter combine; binds to 0 otherwise
+    "xdbBlk": "comb_block_barrier",
 }
+
+# Must match EpCombinePushSlotAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
+_PUSH_SLOT_ALIGN = 128
+
+# op-layer quant_type -> EpCfg::combineQuant. Only the modes this backend serves
+# appear here; _unsupported rejects the rest before a plan is ever built, so a
+# KeyError here would mean the gate and this table disagree.
+_QUANT_TO_INT = {"none": 0, "fp8_direct_cast": 1, "fp4": 3}
+
+
+def push_wire_nbytes(cfg) -> int:
+    """Per-token bytes a scatter combine puts ON THE WIRE: EpCombineWireBytes.
+
+    Equal to the token's own size unless quant compresses it, in which case one
+    byte per element. This is the slot's payload width, so it sizes the region;
+    the LDS tile is NOT this (see push_lds_need).
+    """
+    if cfg.quant_type == "fp4":
+        # e2m1 payload (2/byte) + one e8m0 scale byte per 8-element (pk8) group, the
+        # scale row padded to 16 B. Must equal EpCombineWireBytes in ep_cfg.hpp.
+        group = 8
+        raw_scale = (cfg.hidden_dim + group - 1) // group
+        scale = (raw_scale + 15) // 16 * 16
+        return cfg.hidden_dim // 2 + scale
+    if cfg.quant_type != "none":
+        return cfg.hidden_dim
+    return cfg.combine_token_nbytes
+
+
+def push_slot_bytes(wire_nbytes: int, topk: int) -> int:
+    """A scatter-combine slot's stride: EpCombinePushSlotBytes in ep_cfg.hpp.
+
+    The weights ride behind the payload (the reduce walks slots by source rank,
+    which is not how out_wts is indexed), and the whole thing is padded so every
+    slot starts on a 128 B row -- a TDM store's destination has to.
+
+    Mirrored from the C++ because the arena is sized before any kernel exists.
+    """
+    packed = wire_nbytes + topk * 4
+    return (packed + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
+
+
+# Must match Ep1250xLdsBytes / EpCombinePushRRTile in ep_cfg.hpp.
+_COMB_LDS_BUDGET = 327680
+_PUSH_RR_TILE = 512
+
+
+def push_lds_need(
+    warp_per_block: int,
+    topk: int,
+    world_size: int,
+    combine_token_nbytes: int,
+    use_weights: bool = True,
+    wire_nbytes: int = 0,
+    qpipe: int = 4,
+) -> int:
+    """LDS the scatter send phase needs: EpCombinePushLdsNeed in ep_cfg.hpp.
+
+    One whole token per warp, after the pointer arrays and the round-robin
+    bookkeeping. gfx1250 combine gets the whole budget as dynamic shared memory,
+    so the bookkeeping is in there too rather than in a static __shared__.
+
+    wire_nbytes identifies the second tile the quantized send phase converts
+    into; that tile also carries the appended weights and slot padding. It is 0
+    without quant. Pass it whenever quant is on even though the
+    kernel can be built to convert in place instead: this is the gate deciding
+    whether the TDM send path exists, so it must not come out under what the
+    kernel might ask for.
+    """
+    ptr = ((1 + int(bool(use_weights))) * warp_per_block * topk * 8 + 127) // 128 * 128
+    # Two _PUSH_RR_TILE arrays: slot ids, plus the recvToSrc entry the grouping
+    # pass read for each. Counted unconditionally for the same reason wire_nbytes
+    # is -- this sizes the arena before the device build exists.
+    rr = (2 * _PUSH_RR_TILE + 4 * world_size) * 4
+    wire_tile = push_slot_bytes(wire_nbytes, topk) if wire_nbytes else 0
+    # The narrow pipeline alternates two chunks. Non-quantized and unchunked
+    # sends still stage one whole token.
+    load_tile = (
+        2 * combine_token_nbytes // qpipe
+        if wire_nbytes and qpipe >= 2
+        else combine_token_nbytes
+    )
+    return (ptr + rr + 127) // 128 * 128 + warp_per_block * (
+        load_tile + wire_tile
+    )
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
 # for it, and advertising it here would alias onto another one. Dispatch only copies,
@@ -90,11 +180,18 @@ _XDB_FLAG_SLOTS = 256
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
-    """C++/JIT-kernel EP op: gather combine, no quant, no replay.
+    """C++/JIT-kernel EP op: gather or scatter combine, no replay.
 
     Dispatch transports bf16/fp32/fp8/fp4, combine reduces in bf16/fp32, and the
     two need not match -- an fp8-in/bf16-out op is just two plans with different
-    dtypes. mori does no quantizing here: fp8/fp4 payloads arrive already packed.
+    dtypes. On the dispatch leg mori does no quantizing: fp8/fp4 payloads arrive
+    already packed and move as opaque bytes.
+
+    The combine leg is where mori does quantize, and only there: quant_type=
+    fp8_direct_cast casts each element into the peer's slot on write and widens
+    it back in the reduce, which halves the bytes on the wire. It needs the
+    scatter transport (the sender has to hold a whole token) and gfx125x (the
+    cast happens inside the TDM tile).
     """
 
     def __init__(self, cfg, comm):
@@ -201,6 +298,34 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
             )
             regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
+        if cfg.is_scatter:
+            # Scatter's landing zone, one slot per (source rank, destination-local
+            # token). Sized by world_size * max_tok_per_rank, NOT by the recv cap:
+            # a slot is addressed by the DESTINATION's token id, so the recv cap
+            # (which can be smaller when max_total_recv_tokens is set) would leave
+            # the high slots off the end of the region.
+            assert SymmArena._ALIGN % _PUSH_SLOT_ALIGN == 0, (
+                f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep push slots "
+                f"{_PUSH_SLOT_ALIGN} B-aligned; the TDM store in the send phase needs that"
+            )
+            slot = push_slot_bytes(
+                push_wire_nbytes(cfg), cfg.num_experts_per_token
+            )
+            regions.append(
+                (
+                    "comb_push",
+                    cfg.world_size * cfg.max_num_inp_token_per_rank * slot,
+                )
+            )
+        # One arrival slot per (source rank, source block) for the gfx1250 combine
+        # entry barrier's MORI_COMB_BARDIRECT path. Appended LAST on purpose: every
+        # region before it keeps the offset it had, so a run with the gate off is
+        # measuring the same arena layout it measured before this existed.
+        # Strided by the compile-time slot count rather than by the largest
+        # block_num in the tuning table, because that constant is what the kernel
+        # indexes with -- sizing it from anything else makes the two disagree the
+        # first time the table changes.
+        regions.append(("comb_block_barrier", cfg.world_size * _XDB_FLAG_SLOTS * 8))
         return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -212,9 +337,33 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
-        if cfg.is_scatter:
-            bad.append("combine_mode='scatter' (gather only)")
-        if cfg.quant_type != "none":
+        # fp8_direct_cast is served, on gfx125x only and on the scatter transport
+        # only. Both restrictions are the kernel's: the narrow happens inside the
+        # TDM tile between the load and the store, so it needs the gfx125x body
+        # AND a transport whose sender holds a whole token. (The op layer already
+        # forces scatter for any quant_type, so the second one is belt and
+        # braces rather than a case a caller can reach.)
+        if cfg.quant_type in ("fp8_direct_cast", "fp4"):
+            if not self._is1250:
+                bad.append(f"quant_type={cfg.quant_type!r} off gfx125x")
+            elif not cfg.is_scatter:
+                bad.append(f"quant_type={cfg.quant_type!r} with combine_mode=gather")
+            elif cfg.combine_dtype is not torch.bfloat16:
+                bad.append(
+                    f"quant_type={cfg.quant_type!r} with combine dtype "
+                    f"{cfg.combine_dtype} (the cast is written for bf16)"
+                )
+            elif cfg.quant_type == "fp8_direct_cast" and cfg.hidden_dim % 4:
+                bad.append(
+                    f"quant_type={cfg.quant_type!r} at hidden_dim={cfg.hidden_dim}; "
+                    "the in-place narrow moves 4 elements at a time"
+                )
+            elif cfg.quant_type == "fp4" and cfg.hidden_dim % 8:
+                bad.append(
+                    f"quant_type={cfg.quant_type!r} at hidden_dim={cfg.hidden_dim}; "
+                    "fp4 packs 8 e2m1 elements (one pk8 scale group) at a time"
+                )
+        elif cfg.quant_type != "none":
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
@@ -269,7 +418,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # rejects a Cfg whose row is not a whole number of them.
             scale_bytes=self._scale_i32(cfg) * 4,
         )
-        comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
+        comb_cfg = dict(
+            hidden_dim=cfg.hidden_dim,
+            dtype=cfg.combine_dtype,
+            # Scatter: the rank holding the expert result writes it into the
+            # owner's slot. Dispatch has no such choice, so this is combine-only.
+            combine_push=cfg.is_scatter,
+            combine_quant=_QUANT_TO_INT[cfg.quant_type],
+        )
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
@@ -282,6 +438,41 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
         for b, w in self._combine_specs:
+            if cfg.is_scatter and self._is1250:
+                # The send phase stages one token per warp through TDM. Without
+                # the tile it still works, by lane copy -- which is the slow path
+                # TDM is here to avoid, and nothing downstream would report the
+                # difference. Refuse instead, and name the way out.
+                flags = os.environ.get("MORI_JIT_EXTRA_FLAGS", "")
+                qpipe_match = re.search(
+                    r"(?:^|\s)-DMORI_COMB_QPIPE=(\d+)(?:\s|$)", flags
+                )
+                qpipe = int(qpipe_match.group(1)) if qpipe_match else 4
+                if qpipe < 1 or (
+                    cfg.quant_type != "none" and cfg.hidden_dim % qpipe != 0
+                ):
+                    raise ValueError(
+                        f"MORI_COMB_QPIPE={qpipe} must be positive and divide "
+                        f"hidden_dim={cfg.hidden_dim}"
+                    )
+                need = push_lds_need(
+                    w,
+                    cfg.num_experts_per_token,
+                    cfg.world_size,
+                    cfg.combine_token_nbytes,
+                    wire_nbytes=(
+                        push_wire_nbytes(cfg) if cfg.quant_type != "none" else 0
+                    ),
+                    qpipe=qpipe,
+                )
+                if need > _COMB_LDS_BUDGET:
+                    raise ValueError(
+                        f"scatter combine at {w} warps/block needs {need} B of LDS for its "
+                        f"send tiles but only {_COMB_LDS_BUDGET} B exist "
+                        f"(hidden_dim={cfg.hidden_dim}, {cfg.combine_token_nbytes} B/token); "
+                        f"pin a smaller warp_per_block, at most "
+                        f"{(_COMB_LDS_BUDGET - (need - w * cfg.combine_token_nbytes)) // cfg.combine_token_nbytes}"
+                    )
             plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
@@ -297,7 +488,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # These are plain local buffers, not symmetric regions: the kernels
             # do not reset them, the op must.
             self_resets_counters=False,
-            capabilities=frozenset({"gather", "scales"}),
+            capabilities=frozenset(
+                {"gather", "scatter", "scales", "fp8_direct_cast"}
+            ),
         )
 
     def _close_backend(self):

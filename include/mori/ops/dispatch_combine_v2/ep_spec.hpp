@@ -51,6 +51,15 @@ struct EpRequest {
   int blockNum = 0;      // 0 = arch default
   int warpPerBlock = 0;  // 0 = arch default
   int scaleBytes = 0;    // per-token scale row carried with the payload; 0 = off
+  // Combine transport. False is the gather: every rank stages its expert results
+  // and the owner reads them across the fabric. True is the scatter, where the
+  // holder writes straight into the owner's slot and the owner only reduces
+  // locally. Ignored on the dispatch leg, which has no such choice.
+  bool combinePush = false;
+  // Compress the combine payload on the wire: 0 = off, 1 = fp8_direct_cast.
+  // Requires combinePush (see EpCfg::combineQuant for why gather cannot host it);
+  // MakeEpCfg rejects the pair rather than silently sending full-width tokens.
+  int combineQuant = 0;
 };
 
 template <typename Self, typename Visit>
@@ -67,10 +76,12 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(scaleBytes);
+  MORI_FIELD(combinePush);
+  MORI_FIELD(combineQuant);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 11,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 13,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

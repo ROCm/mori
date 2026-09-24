@@ -94,6 +94,10 @@ _G = {
     k: (int(os.environ[k]) if os.environ.get(k) else None)
     for k in ("DBN", "DWPB", "CBN", "CWPB")
 }
+# Combine wire: gather (bf16 default) vs scatter (PUSH); optional PUSH-side quant.
+# quant_type!=none forces scatter and needs combine_data_type=None (DISP=bf16).
+_COMB_MODE = os.environ.get("COMB_MODE", "gather")   # gather | scatter
+_COMB_QUANT = os.environ.get("COMB_QUANT", "none")   # none | fp8_direct_cast | fp8_blockwise
 
 
 def main():
@@ -151,6 +155,8 @@ def main():
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
+            combine_mode=_COMB_MODE,
+            quant_type=_COMB_QUANT,
         )
         return EpDispatchCombineOp(cfg, comm)
 

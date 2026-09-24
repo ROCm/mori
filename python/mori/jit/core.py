@@ -442,6 +442,15 @@ def _tunable_defines() -> list[str]:
     cache.get_cache_dir keys the build on, so a future value-carrying -D has one place to go and
     cannot end up in the compile without being in the key -- which is the bug that made a run with
     the quantise pass deleted load the full build's object and report the full build's time.
+
+    THIS IS THE v1 PATH ONLY. It reaches _compile_device_bc and _hipcc_genco, and nothing else.
+    dispatch_combine_v2 kernels are compiled entirely in C++ -- spec.hpp asks Compiler::Build,
+    which forks hipcc with src/jit/v2/toolchain.cpp::Toolchain::Flags() -- so a -D added here
+    never appears in a v2 compile. Putting a MORI_COMB_* gate here reads as though it works: the
+    env var is picked up, the flag is emitted, the key changes, and the v2 kernel is built from
+    the unmodified header anyway, so both arms of an A/B run the SAME object and the difference
+    comes out as zero. For v2 use MORI_JIT_EXTRA_FLAGS, which Flags() splits into the command
+    line and which CacheDirFor hashes.
     """
     defs: list[str] = []
     if os.environ.get("MORI_ENABLE_HOST_PROXY") == "1":

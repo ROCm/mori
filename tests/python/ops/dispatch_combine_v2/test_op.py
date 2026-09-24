@@ -332,6 +332,17 @@ def main():
                     ok = torch.allclose(
                         out.float().cpu(), exp.float(), atol=atol, rtol=rtol
                     )
+                    if not ok and rank == 0:
+                        _o = out.float().cpu(); _e = exp.float()
+                        _ad = (_o - _e).abs()
+                        _den = _e.abs().clamp_min(1e-3)
+                        _rel = (_ad / _den)
+                        print(f"#   DBG {COMBINE}-{QUANT} ct={ct}: max_abs={_ad.max():.4f} "
+                              f"mean_abs={_ad.mean():.4f} max_rel={_rel.max():.3f} "
+                              f"mean_rel={_rel.mean():.4f} "
+                              f"exp_amax={_e.abs().max():.3f} out_amax={_o.abs().max():.3f} "
+                              f"frac_bad={( _ad > (atol+rtol*_e.abs()) ).float().mean():.4f}",
+                              flush=True)
                 ok_w = torch.allclose(out_w.cpu(), exp_w, atol=2e-3, rtol=2e-3)
                 tag = f"OP-{COMBINE}" + (f"-{QUANT}" if QUANT != "none" else "")
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
