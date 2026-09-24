@@ -343,6 +343,17 @@ class PoolClient {
     size_t size;
     TransferRef ref;
   };
+  // Serializes RegisterMemory against DeregisterMemory, and each against
+  // itself. Held across the transfer engine's registration call, which is what
+  // IOEngine needs: its memory table and backend map carry no lock of their
+  // own, so two concurrent registrations would race.
+  //
+  // Deliberately NOT registered_mem_mutex_. Pinning a large KV pool for RDMA
+  // takes minutes, and holding the region-table lock for that long stalled
+  // every concurrent transfer on this node -- FindRegisteredMemory runs once
+  // per range. Lock order is always registration_mutex_ then
+  // registered_mem_mutex_; lookups take only the latter, so there is no cycle.
+  std::mutex registration_mutex_;
   mutable std::shared_mutex registered_mem_mutex_;
   std::vector<RegisteredRegion> registered_regions_;
 
