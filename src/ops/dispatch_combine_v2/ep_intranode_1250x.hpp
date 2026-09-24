@@ -203,25 +203,15 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
 #define CUSPLIT_POOL_SLOTS (MORI_EP_WORLD_SIZE * MORI_EP_MAX_RECV)
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
+static_assert(CUSPLIT_MAX_TOPK == EpStagingMaxTopk,
+              "CUSPLIT_MAX_TOPK and EpStagingMaxTopk must agree");
+static_assert(CUSPLIT_MAX_BLOCKS == EpStagingMaxBlocks,
+              "CUSPLIT_MAX_BLOCKS and EpStagingMaxBlocks must agree");
 
-alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-alignas(kTdmRowBytes) __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
-__device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
-__device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
-// Per-token scale rows, staged like the other meta fields so they ship to a peer as
-// one contiguous run rather than a 224 B transfer per (token, destination) -- the
-// size TDM is worst at. The array is at file scope, which the TU reaches before kCfg
-// exists, so its extent comes from a macro RenderEpSource emits only when the feature
-// is on; off, it degenerates to one byte. `if constexpr` discards the staging code
-// but still looks the name up, hence a declaration in both cases.
 #if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
-// Source row vs the stride we lay it down at; they differ by EpScaleStride's pad.
 constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
 constexpr int kEpScaleStride = MORI_EP_SCALE_STRIDE;
 constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
-// Per-peer stride. NOT _stgCap: that one sizes the idx/wt pool, which is a
-// different (larger) constant, and indexing this array with it walks off the end.
 constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
 constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
 #else
@@ -231,34 +221,8 @@ constexpr size_t kEpScaleSlots = 1;
 constexpr size_t kEpScaleRows = 1;
 constexpr int kMetaFields = 3;  // idx, weights, srcmap
 #endif
-// FOOTPRINT, and it is quadratic in world_size: kEpScaleSlots is
-// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank. That
-// is deliberate -- the per-peer stride has to be the peer's full recv capacity so
-// the destination slot id indexes it directly, which is also what lets the
-// existing `ab + cc > recvCapM` guard cover this array (_stgCap does NOT bound
-// it; the two cross over as world_size grows).
-//
-// It costs, at the 256 B STRIDE a 224 B row (hidden 7168) pads up to:
-//     EP4  maxTok 16384  ->   64 MiB
-//     EP8  maxTok  8192  ->  128 MiB
-//     EP8  maxTok 16384  ->  256 MiB
-// and this is a __device__ global, so it is one copy PER COMPILED VARIANT: a
-// three-entry (block, warp) schedule at EP8/16384 reserves ~672 MiB.
-//
-// The idx/wt pools next to it are world_size-independent (a fixed CUSPLIT_POOL
-// split per peer). Making this one match would need the staging to be indexed by
-// a block-local slot instead of the destination slot id, which is a bigger change
-// than it looks and wants hardware validation -- the guard would start dropping
-// tokens rather than merely skipping transfers. Until then, fail at compile time
-// rather than at the first launch on a big EP.
-static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (size_t)1 << 30,
-              "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
-              "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
-              "before going wider");
 static_assert(EpScaleAlign % kTdmRowBytes == 0,
               "the scale staging base must sit on a TDM row for the metadata tile to reach it");
-constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
-__device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
 // The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
 // moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
@@ -279,6 +243,18 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   static_assert(EpScaleStride(kCfg) == kEpScaleStride,
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
+
+  // Staging pointers from the dynamically-allocated base.  The EpStaging*Offset
+  // functions are constexpr on kCfg, so each is base + compile-time constant.
+  char* _stgBase = static_cast<char*>(args.stagingBase);
+  index_t* _cusplit_stgIdx = reinterpret_cast<index_t*>(_stgBase + EpStagingIdxOffset(kCfg));
+  float* _cusplit_stgWt = reinterpret_cast<float*>(_stgBase + EpStagingWtOffset(kCfg));
+  index_t* _cusplit_stgSrc = reinterpret_cast<index_t*>(_stgBase + EpStagingSrcOffset(kCfg));
+  index_t* _cusplit_blkBase = reinterpret_cast<index_t*>(_stgBase + EpStagingBlkBaseOffset(kCfg));
+  index_t* _cusplit_blkCount = reinterpret_cast<index_t*>(_stgBase + EpStagingBlkCountOffset(kCfg));
+  unsigned char* _cusplit_stgScale =
+      reinterpret_cast<unsigned char*>(_stgBase + EpStagingScaleOffset(kCfg));
+
   constexpr int WS = kCfg.waveSize;
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
