@@ -614,6 +614,18 @@ using tdm::TdmXferOk;
 #define MORI_COMB_EMPTY_PEERHIST 0
 #endif
 
+// Round-robin destination-aware scheduling for MORI_COMB_EMPTY, ported from
+// the production PUSH round-robin grouping (EpCombine1250xBody's kRRTile
+// loop below: count each batch's slots by destPe, prefix-sum, scatter into
+// an LDS array grouped by destPe, then have each warp start at a different
+// destPe and rotate). Same load/store/barrier per token as the flat-stride
+// arm -- only the ORDER concurrent warps visit slots in changes. Exists to
+// test whether flat-stride's peer concentration (see MORI_COMB_EMPTY_PEERSTAT
+// / MORI_COMB_EMPTY_PEERHIST findings) is actually what caps bandwidth.
+#ifndef MORI_COMB_EMPTY_RR
+#define MORI_COMB_EMPTY_RR 0
+#endif
+
 // MORI_EP_WORLD_SIZE and MORI_EP_MAX_RECV are emitted by RenderEpSource before
 // #include-ing this header, so the global arrays below are sized to the exact
 // config. The fallbacks are for bare C++ callers only.
@@ -1417,30 +1429,131 @@ __device__ __forceinline__ void EpCombineEmptySend(EpArgs args) {
     }
   }
 
-  for (index_t slot = globalWarpId; slot < totalRecvTokenNum; slot += globalWarpNum) {
-    const int srcTok = recvToSrc[slot];
-    const int destPe = EpPeFromSrcTok<kCfg>(srcTok);
-    const int destLocalTok = EpTokFromSrcTok<kCfg>(srcTok);
-    if (destPe >= npes || destLocalTok >= kCfg.maxTokPerRank) continue;
-    if constexpr (MORI_COMB_EMPTY_PEERSTAT) {
-      if (laneId == 0 && slot == (index_t)globalWarpId) {
-        printf("PEERSTAT pe=%d blk=%d warp=%d slot=%d destPe=%d\n", myPe, blockIdx.x, warpId,
-               (int)slot, destPe);
+  if constexpr (MORI_COMB_EMPTY_RR) {
+    constexpr int kRRTile = EpCombinePushRRTile;
+    int* const s_rrIdx = reinterpret_cast<int*>(sharedMem);
+    int* const s_rrCnt = s_rrIdx + kRRTile;
+    int* const s_rrOff = s_rrCnt + npes;
+    int* const s_rrFill = s_rrOff + npes;
+    int* const s_rrTake = s_rrFill + npes;
+    constexpr size_t kRRBytes = (size_t)(kRRTile + 4 * npes) * sizeof(int);
+    constexpr size_t kTileBase = (kRRBytes + 127) & ~(size_t)127;
+    TokT* const rrTile =
+        reinterpret_cast<TokT*>(sharedMem + kTileBase) + (size_t)warpId * kCfg.hiddenDim;
+    WireT* const rrQtile =
+        kQuant ? reinterpret_cast<WireT*>(sharedMem + kTileBase +
+                                          (size_t)kCfg.warpPerBlock * kLoadTileB) +
+                     (size_t)warpId * kCfg.hiddenDim
+               : nullptr;
+
+    auto _rrDest = [&](const int slot, int& srcTok) -> int {
+      srcTok = recvToSrc[slot];
+      const int pe = EpPeFromSrcTok<kCfg>(srcTok);
+      return (pe < npes) ? pe : -1;
+    };
+    auto _rrSend = [&](int slot) {
+      const int srcTok = recvToSrc[slot];
+      const int destPe = EpPeFromSrcTok<kCfg>(srcTok);
+      const int destLocalTok = EpTokFromSrcTok<kCfg>(srcTok);
+      if (destLocalTok >= kCfg.maxTokPerRank) return;
+      uint8_t* const dstSlot = EpPeer<uint8_t>(win, destPe, args.offCombPush) +
+                               (size_t)EpPushSlot<kCfg>(myPe, destLocalTok) * kSlotB;
+      TdmIssueLoad<TokT>(rrTile, myToks + (size_t)slot * kCfg.hiddenDim, gLd);
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+      if constexpr (kQuant) {
+        for (int e = laneId; e < kCfg.hiddenDim; e += kCfg.waveSize)
+          rrQtile[e] = WireT((float)rrTile[e]);
+        __builtin_amdgcn_wave_barrier();
+        TdmIssueStore<WireT>(reinterpret_cast<WireT*>(dstSlot), rrQtile, gSt);
+      } else {
+        TdmIssueStore<WireT>(reinterpret_cast<WireT*>(dstSlot), reinterpret_cast<WireT*>(rrTile),
+                              gSt);
       }
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+    };
+
+    const int _rrEnd = (int)totalRecvTokenNum;
+    const int _rrMine =
+        (_rrEnd > (int)blockIdx.x) ? ((_rrEnd - 1 - (int)blockIdx.x) / (int)gridDim.x + 1) : 0;
+    const int _rrNT = (_rrMine + kRRTile - 1) / kRRTile;
+    for (int _rrT = 0; _rrT < _rrNT; ++_rrT) {
+      const int _rrN = (_rrMine - _rrT + _rrNT - 1) / _rrNT;
+      for (int p = thdId; p < npes; p += (int)blockDim.x) {
+        s_rrCnt[p] = 0;
+        s_rrFill[p] = 0;
+        s_rrTake[p] = 0;
+      }
+      __syncthreads();
+      for (int i = thdId; i < _rrN; i += (int)blockDim.x) {
+        const int t = (int)blockIdx.x + (_rrT + i * _rrNT) * (int)gridDim.x;
+        int s;
+        const int p = _rrDest(t, s);
+        if (p >= 0) atomicAdd(&s_rrCnt[p], 1);
+      }
+      __syncthreads();
+      if (thdId == 0) {
+        int acc = 0;
+        for (int p = 0; p < npes; ++p) {
+          s_rrOff[p] = acc;
+          acc += s_rrCnt[p];
+        }
+      }
+      __syncthreads();
+      for (int i = thdId; i < _rrN; i += (int)blockDim.x) {
+        const int t = (int)blockIdx.x + (_rrT + i * _rrNT) * (int)gridDim.x;
+        int s;
+        const int p = _rrDest(t, s);
+        if (p >= 0) {
+          const int pos = s_rrOff[p] + atomicAdd(&s_rrFill[p], 1);
+          s_rrIdx[pos] = t;
+        }
+      }
+      __syncthreads();
+      for (int _rrIter = 0;; ++_rrIter) {
+        int _rrGot = -1;
+        if (laneId == 0) {
+          for (int s = 0; s < npes; ++s) {
+            const int p = (warpId + _rrIter + s) % npes;
+            const int e = atomicAdd(&s_rrTake[p], 1);
+            if (e < s_rrCnt[p]) {
+              _rrGot = s_rrOff[p] + e;
+              break;
+            }
+          }
+        }
+        _rrGot = __shfl(_rrGot, 0);
+        if (_rrGot < 0) break;
+        _rrSend(s_rrIdx[_rrGot]);
+      }
+      __syncthreads();
     }
-    uint8_t* const dstSlot = EpPeer<uint8_t>(win, destPe, args.offCombPush) +
-                             (size_t)EpPushSlot<kCfg>(myPe, destLocalTok) * kSlotB;
-    TdmIssueLoad<TokT>(tile, myToks + (size_t)slot * kCfg.hiddenDim, gLd);
-    __builtin_amdgcn_s_wait_tensorcnt(0);
-    if constexpr (kQuant) {
-      for (int e = laneId; e < kCfg.hiddenDim; e += kCfg.waveSize)
-        qtile[e] = WireT((float)tile[e]);
-      __builtin_amdgcn_wave_barrier();
-      TdmIssueStore<WireT>(reinterpret_cast<WireT*>(dstSlot), qtile, gSt);
-    } else {
-      TdmIssueStore<WireT>(reinterpret_cast<WireT*>(dstSlot), reinterpret_cast<WireT*>(tile), gSt);
+  } else {
+    for (index_t slot = globalWarpId; slot < totalRecvTokenNum; slot += globalWarpNum) {
+      const int srcTok = recvToSrc[slot];
+      const int destPe = EpPeFromSrcTok<kCfg>(srcTok);
+      const int destLocalTok = EpTokFromSrcTok<kCfg>(srcTok);
+      if (destPe >= npes || destLocalTok >= kCfg.maxTokPerRank) continue;
+      if constexpr (MORI_COMB_EMPTY_PEERSTAT) {
+        if (laneId == 0 && slot == (index_t)globalWarpId) {
+          printf("PEERSTAT pe=%d blk=%d warp=%d slot=%d destPe=%d\n", myPe, blockIdx.x, warpId,
+                 (int)slot, destPe);
+        }
+      }
+      uint8_t* const dstSlot = EpPeer<uint8_t>(win, destPe, args.offCombPush) +
+                               (size_t)EpPushSlot<kCfg>(myPe, destLocalTok) * kSlotB;
+      TdmIssueLoad<TokT>(tile, myToks + (size_t)slot * kCfg.hiddenDim, gLd);
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+      if constexpr (kQuant) {
+        for (int e = laneId; e < kCfg.hiddenDim; e += kCfg.waveSize)
+          qtile[e] = WireT((float)tile[e]);
+        __builtin_amdgcn_wave_barrier();
+        TdmIssueStore<WireT>(reinterpret_cast<WireT*>(dstSlot), qtile, gSt);
+      } else {
+        TdmIssueStore<WireT>(reinterpret_cast<WireT*>(dstSlot), reinterpret_cast<WireT*>(tile),
+                              gSt);
+      }
+      __builtin_amdgcn_s_wait_tensorcnt(0);
     }
-    __builtin_amdgcn_s_wait_tensorcnt(0);
   }
   __syncthreads();
   EpCrossDeviceBarrier1250x<kCfg>(args, true);
