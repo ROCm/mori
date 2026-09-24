@@ -724,8 +724,8 @@ class GemmAllReduceOp:
         """Verify that the collective actually moves bytes. Raises if it does not.
 
         The failure this exists for is silent. A mori built without
-        ``BUILD_CCO_SDMA=ON`` -- which is the *default*, and what SGLang's CI
-        image ships -- still has every symbol, still launches every kernel, and
+        ``BUILD_CCO_SDMA=ON`` -- which used to be the default, and is what older
+        images ship -- still has every symbol, still launches every kernel, and
         still returns from every put. The puts simply do nothing. The all-reduce
         then returns mostly the local slice, the model keeps answering fluently,
         the profile keeps showing all the kernels, and the fused path measures
@@ -773,8 +773,9 @@ class GemmAllReduceOp:
         # applied, so a percent is generous either way.
         if worst > 1e-2:
             hint = (
-                " mori was built with BUILD_CCO_SDMA=OFF (the default), so the "
-                "SDMA puts are compiled out and do nothing."
+                " mori was built with BUILD_CCO_SDMA=OFF, so the SDMA puts are "
+                "compiled out and do nothing. It is ON by default; this build "
+                "turned it off."
                 if built_without_sdma
                 else " Check that mori was built with BUILD_CCO_SDMA=ON and that "
                 "MORI_ENABLE_SDMA=1 is set: without either, every put silently "

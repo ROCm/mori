@@ -85,6 +85,23 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     }
   }
   if (!(comm->ctx->IsSdmaEnabled() && anySdmaCapable)) {
+    // Say so when the caller *asked* for queues (sdmaQueueCount > 0; 0 means
+    // "whatever the env wants"). Leaving this silent is how a run ends up with
+    // every SDMA put posting to no queue: nothing fails, nothing is logged, and
+    // the only symptom is wrong data -- which reads as a model quality problem,
+    // not a transport one.
+    //
+    // ERROR rather than WARN because the default global level *is* ERROR, so a
+    // warning here would be invisible to exactly the person this is for. Not
+    // fatal, though: a comm with no SDMA is legal and every other path works.
+    if (requestedChannels > 0) {
+      MORI_SHMEM_ERROR(
+          "sdmaQueueCount={} requested but no SDMA queues will be created ({}): "
+          "every ccoSdma put on this comm will move no bytes",
+          requestedChannels,
+          !comm->ctx->IsSdmaEnabled() ? "MORI_ENABLE_SDMA is not set"
+                                      : "no peer reports SDMA capability");
+    }
     comm->sdmaNumQueue = 0;
     return;
   }
