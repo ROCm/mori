@@ -594,6 +594,7 @@ def compile_bf16_gemm_ag(
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
     transport: str = "sdma",
+    wait_policy: str = "tuned",
     fuse: bool = False,
     chunks: int = 1,
     sdma_queues: int = 1,
@@ -632,6 +633,10 @@ def compile_bf16_gemm_ag(
     indistinguishable.
     """
     assert K % BLOCK_K == 0, f"K={K} must be a multiple of BLOCK_K={BLOCK_K}"
+    if wait_policy not in ("tuned", "safe", "conservative"):
+        raise ValueError(
+            f"wait_policy must be tuned, safe or conservative, got {wait_policy!r}"
+        )
     if transport not in ("lsa", "sdma"):
         raise ValueError(f"transport must be lsa or sdma, got {transport!r}")
     if post not in ("lanes", "serial"):
@@ -692,11 +697,48 @@ def compile_bf16_gemm_ag(
     K_ITERS = K // BLOCK_K
     assert K_ITERS >= 2, "the pipeline peels two K steps off the tail"
 
+    # How permissive the mainloop's `s_waitcnt vmcnt(N)` is allowed to be.
+    #
+    # Each G2SLoader.load() issues exactly one buffer_load_lds per step -- A =
+    # N_LDS_STEPS_A of them for an A tile, B for a B tile -- and vmcnt retires
+    # in issue order. Walking the mainloop: entering an iteration A+2B are
+    # outstanding, the iteration issues A1@k+1, B0@k+2, A0@k+2, B1@k+2, so 3A+4B
+    # are in flight at the wait. The next iteration reads a_cur1, which is
+    # A1@k+1 -- the 4th item -- so retirement has to reach 2A+2B and the wait
+    # must therefore be **at most A + 2B**.
+    #
+    # The inherited count is `2A + B`, and the two are equal only when A == B:
+    #
+    #     tile      A  B   2A+B   A+2B
+    #     256/256   2  2      6      6   exactly tight
+    #     128/256   1  2      4      5   has margin
+    #     256/128   2  1      5      4   INSUFFICIENT
+    #     128/128   1  1      3      3   exactly tight
+    #
+    # "Exactly tight" means zero slack against the compiler reordering the four
+    # loads among themselves, which it is free to do -- `wait_barrier` is a
+    # scheduling barrier but does not fix the order of what precedes it.
+    #
+    # "safe" uses the derived A+2B. "conservative" waits for everything, which
+    # is slow and unambiguously correct, and exists to answer "is it the waits?"
+    # without having to trust the derivation.
+    def _wb(tuned):
+        if wait_policy == "conservative":
+            return wait_barrier(0)
+        return wait_barrier(tuned)
+
+    _MAIN_WAIT = (
+        N_LDS_STEPS_A + 2 * N_LDS_STEPS_B
+        if wait_policy in ("safe", "conservative")
+        else 2 * N_LDS_STEPS_A + N_LDS_STEPS_B
+    )
+
     _kname = (
         f"mori_ag_bf16_{transport if fuse else 'plain'}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
         f"{'F32' if out_dtype == 'fp32' else 'B16'}_{waves_per_eu}x{xcd_swizzle}"
         f"_c{chunks}q{sdma_queues}{post[0]}{'U' if peer_uncached else 'C'}"
+        f"w{wait_policy[0]}"
         f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_k{K}_r{rank}"
     )
 
@@ -833,13 +875,13 @@ def compile_bf16_gemm_ag(
         if wave_m == 1:
             rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        _wb(N_LDS_STEPS_A + N_LDS_STEPS_B)
 
         b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        _wb(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
         for k in range_constexpr(K_ITERS - 2):
             b0_frag = b_s2r.load(b_cur0)
@@ -862,7 +904,7 @@ def compile_bf16_gemm_ag(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            _wb(_MAIN_WAIT)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
