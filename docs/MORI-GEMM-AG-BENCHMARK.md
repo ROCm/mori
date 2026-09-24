@@ -456,10 +456,72 @@ the failure rate at 128 is somewhere around a third of launches, and the "sound
 repetition** — `gemm-to-window` and `split-rccl` looked clean at 4/4 and 3/3 and
 then came back 1/2.
 
-The obvious suspect is the release fence: halving `BLOCK_M` doubles the number
-of blocks that must publish their stores. It is wrong. `--fence all` and
+### What it is not
+
+Four hypotheses, each killed by measurement rather than argument.
+
+**Not the release fence.** Halving `BLOCK_M` doubles the blocks that must
+publish their stores, which makes it the obvious suspect. `--fence all` and
 `--direct-fence all` — every lane issuing the release instead of one wave per
-block — are **0/3 each**. Unexplained.
+block — are **0/3 each**.
+
+**Not the `s_waitcnt vmcnt` count**, which was the best remaining candidate:
+`wait_barrier` is the only thing making a G2S load's LDS write visible before
+the next iteration reads it. Sweeping that one number at `BM=128`, `gemm-only`,
+six launches each:
+
+| `vmcnt` | | result | time |
+|---|---|---:|---:|
+| `2A+B` = 4 | inherited | 5/6 | 91 µs |
+| `A+2B` = 5 | derived | 4/6 | 90 µs |
+| `0` | everything | **6/6** | 150 µs |
+
+Waiting for everything does fix it — but the ISA says the count was already
+right. Dumped with `GPU_DUMP_CODE_OBJECT=1` and `llvm-objdump --mcpu=gfx950`:
+
+| | `BM=128` (fails) | `BM=256` (clean) |
+|---|---|---|
+| S2R loads | `ds_read_b128` ×16/iter | ×24/iter |
+| G2S loads | `buffer_load_dwordx4` ×6/iter | ×8/iter |
+| mainloop wait | `vmcnt(4)` ×110 | `vmcnt(6)` ×111 |
+| in flight at the wait | 10 → retires 6 → leaves 4 | 14 → retires 8 → leaves 6 |
+| VGPR / LDS | 152 / 96 KiB | 248 / 128 KiB |
+| spills | 0 | 0 |
+| workgroups per CU | 1 | 1 |
+
+The S2R loads are `ds_read`, so they are on **lgkmcnt and were never in this
+accounting at all** — that was the leading theory and it is simply wrong. Each
+`vmcnt` retires precisely one iteration's worth of G2S, leaving in flight
+exactly the `k+2` prefetches, which is correct. And the two skeletons are
+structurally identical —
+`W BB D…D G B L B D…D GG B L B D…D G B L B GG` — with 8 barriers per iteration
+in both and `s_waitcnt lgkmcnt(0)` correctly placed between the barrier pair
+that guards the write-after-read on each LDS buffer.
+
+**Not the compiler moving LDS accesses across an unmodelled barrier.**
+`gemm_ar.wait_barrier` puts `s_waitcnt` and `s_barrier` in one inline-asm string
+with `constraints=""` — no memory clobber — so the compiler is never told there
+is a barrier in there and could legally move an LDS access across it. Emitting
+the wait as asm and the barrier as `rocdl.s_barrier()` instead produces
+**byte-identical code**. It does not, at least not at this register pressure.
+
+**Not register spilling or occupancy**, per the table above.
+
+### So where is it
+
+The instruction stream gives no evidence of a bug at either tile, which means
+`vmcnt(0)` fixing the corruption is timing perturbation and not a corrected
+count. Put that next to the other end of the evidence — **0 wrong in 64
+single-GPU runs at every tile, no collective involved** — and the weight has
+moved off this kernel. What reproduces it is eight concurrent processes; what
+never reproduces it is one idle GPU running the same kernel on the same data.
+
+The next place to look is therefore the 8-process harness or the environment,
+not the GEMM: whether the benchmark's own reference can be corrupted under
+memory pressure, and whether the cco window's VMM allocation interacts with a
+plain `torch.empty` C (ROCm 7.2.x is known to route uncached VMM allocations to
+the coarse-grained pool). A `--wait-policy` knob is kept so the sweep above is
+reproducible.
 
 Shipping a wrong answer a third of the time to buy 24% is not a trade, so
 `pick_tile` returns the template's tile and **the GEMM speedup measured in this
@@ -659,10 +721,11 @@ launches and retry a lost race rather than recording it.
   `BLOCK_K` is still pinned to the template's 64 and was not swept: it would
   need a different LDS swizzle, since `swizzle_row128b`'s geometry is 128 bytes
   per row and `BLOCK_K=128` is 256.
-* **The `BLOCK_M=128` correctness bug.** This is the single highest-value open
-  item: finding it unlocks a measured 33% on the GEMM. It is not the release
-  fence. It is reproducible in about a third of launches at `M=2048` fp32 with
-  `--block-m 128`.
+* **The `BLOCK_M=128` correctness bug.** The single highest-value open item —
+  finding it unlocks a measured 33% on the GEMM, which under graph replay is
+  parity with `torch.matmul`. Four hypotheses are already eliminated with
+  evidence (see *What it is not*); the ISA is clean, so start on the harness and
+  the environment rather than the kernel.
 * The bf16 path at the `r128` shape, under `--chunks > 1`, or with
   `--post serial`. All are reachable; none were swept.
 * fp8 on the wire. This is the direction where it would help most — the
