@@ -82,30 +82,17 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
   return hash == 0 ? kPrime : hash;
 }
 
-// Every data-plane RPC below used to construct a bare grpc::ClientContext with
-// no deadline, so a server-side stall (observed: BatchExists never returning
-// under real long-context load, standalone_server.cpp handler wedged) blocked
-// the calling scheduler rank forever with no way out. A caller that hits this
-// deadline sees the same grpc::Status as a genuine RPC failure (already
-// handled as "not found" / no-op, not an exception).
+// These RPCs used to carry no deadline at all, so a wedged server handler
+// blocked the calling scheduler rank forever -- and with it the TP group, which
+// could no longer reach its next collective. Observed on Kimi-K3: a BatchExists
+// that never returned. A caller that hits this deadline sees the same
+// grpc::Status as any other RPC failure, which it already handles as a miss.
 //
-// 10s was the original value here and is NOT generous: standalone_server.cpp
-// holds client_mu_ exclusively for a BatchPutRanges/BatchPutWithDepth call's
-// full duration, including the actual bulk copy, and BatchExists/BatchGet
-// only get a shared lock on the same mutex -- so a rank's own burst of first-
-// time offloads at warmup start can queue that same rank's BatchExists calls
-// behind them. Measured directly (py-spy --native during the stall, single
-// node, TP8): 70-260s waits at CONC=24-48 before the queue drained on its
-// own. 300s leaves real margin above that measured ceiling for single-node,
-// and for a distributed/multi-node deployment (extra network RTT, a busier
-// peer, more concurrent ranks queuing on the same connection) the same
-// contention only gets worse, not better. This is a bound on a real
-// deadlock, not a tuned "typical latency" value -- raising it costs nothing
-// but a slower failure report on an actually-wedged server; setting it too
-// low costs silently misclassifying calls that were about to succeed as
-// failures. This is a stopgap against the deadlock, not a fix for the lock
-// itself -- the actual contention is standalone_server.cpp's client_mu_
-// serializing reads behind a write's full copy duration.
+// A bound on a hang, not a tuned latency: raising it only slows the report on
+// an already-wedged server, while setting it too low silently turns calls that
+// were about to succeed into misses. 300s is far above any healthy value --
+// waits of 70-260s were measured before the lock this once queued behind was
+// fixed.
 int DataPlaneRpcTimeoutMs() {
   static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_DATA_PLANE_RPC_TIMEOUT_MS",
                                                            std::chrono::milliseconds(300000),
@@ -119,38 +106,20 @@ void ArmDataPlaneDeadline(grpc::ClientContext& ctx) {
                    std::chrono::milliseconds(DataPlaneRpcTimeoutMs()));
 }
 
-// RegisterMemory is not a routine data-plane call: it is a one-time-per-buffer
-// setup RPC that can legitimately take many minutes (observed directly:
-// "[DRAMTier] host memory registered for GPU access: 1187840 MiB in 599.6 s"
-// for the bulk step, plus sequential per-GPU IPC handle registration each
-// well over a minute), so it needs its own, longer deadline than
-// DataPlaneRpcTimeoutMs().
+// A liveness bound for the one-time-per-buffer registration RPC, NOT a latency
+// budget: it exists so a wedged server releases the rank -- and its allocation
+// -- rather than holding both forever.
 //
-// The default was 180s, which is SHORTER than the 599.6 s this very comment
-// records -- it would have fired on the case it was written to accommodate.
-// It was also shorter than the routine data-plane deadline, inverting the two
-// even though registration is the strictly slower operation.
+// Err high. Too generous only delays the report on an already-broken server;
+// too tight kills a run that was about to succeed, and unlike a data-plane
+// call, which degrades to the "not found" its caller already handles, a failed
+// registration throws. The old 180 s default was shorter than the 599.6 s
+// bulk registration this file elsewhere records, and shorter than the routine
+// data-plane deadline -- inverted, for the strictly slower operation.
 //
-// Firing here is worse than a data-plane deadline. A data-plane call degrades
-// a non-OK status to the same "not found" the caller already handles.
-// Registration has no such fallback: nothing that follows can work on an
-// unregistered buffer, and both paths now throw rather than let that become a
-// silently dead cache.
-//
-// So this is a liveness bound, not a latency budget. It exists so that a
-// genuinely wedged server releases the rank -- and with it the allocation --
-// instead of holding both forever; it is NOT an estimate of how long
-// registration should take. Err high: a deadline that is too generous costs a
-// slower report on an already-broken server, while one that is too tight kills
-// a run that was about to succeed. Registration also serializes across a
-// node's ranks (PoolClient's registration_mutex_, which is what IOEngine's
-// unlocked memory table needs), so a rank's observed latency is its own pin
-// plus whatever its peers are still doing -- budget for the whole queue, not
-// for one buffer.
-//
-// An hour clears the documented figure many times over. Set the knob higher
-// for larger pools, or to 0 to disable the deadline entirely and let the call
-// block indefinitely. It must never be set below UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
+// Registrations also serialize across a node's ranks, so budget for the whole
+// queue rather than one buffer. Raise the knob for larger pools, or set 0 to
+// wait indefinitely; never set it below UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
 int RegisterMemoryRpcTimeoutMs() {
   static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS",
                                                            std::chrono::milliseconds(3600000),
@@ -191,11 +160,8 @@ class RegistrationProgressLogger {
   ScopedProgressLog log_;
 };
 
-// The message a failed registration throws with.
-//
-// A bare "Deadline Exceeded" tells whoever hits it nothing about what to do
-// next, and the answer is usually "raise one env var". Naming the knob and the
-// value it currently holds is what turns a lost run into a rerun.
+// A bare "Deadline Exceeded" says nothing about what to do next, and the answer
+// is usually "raise one env var". Naming the knob turns a lost run into a rerun.
 std::string RegisterMemoryFailureMessage(const char* what, uintptr_t ptr, size_t size,
                                          int64_t elapsed_ms, const grpc::Status& status,
                                          const std::string& response_error) {
