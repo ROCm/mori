@@ -401,7 +401,7 @@ class AgConfig:
             )
         for name, value, granule in (
             ("block_m", self.block_m, TILE_M_GRANULE),
-            ("block_n", self.block_n, DEFAULT_BLOCK_N),
+            ("block_n", self.block_n, 128),
         ):
             if value < granule or value % granule:
                 raise ValueError(
@@ -409,11 +409,19 @@ class AgConfig:
                     f"GEMM's MFMA tiling and LDS staging are written for that "
                     f"granule"
                 )
-        if self.block_n != DEFAULT_BLOCK_N:
+        if self.block_n not in (128, DEFAULT_BLOCK_N):
             raise ValueError(
-                f"block_n must be exactly {DEFAULT_BLOCK_N}: the epilogue always "
-                f"compiles with permlane, whose lane transpose is written for "
-                f"that width"
+                f"block_n must be 128 or {DEFAULT_BLOCK_N}, got {self.block_n}"
+            )
+        if self.block_n != DEFAULT_BLOCK_N and self.elem_bytes != 4:
+            # 128 exists for the bf16 GEMM's fp32 store, which is a plain
+            # dwordx4 of the accumulator. Every bf16 store -- the fp8 epilogue's
+            # and this op's -- reaches a 16-byte access by pairing two N tiles
+            # through permlane16_swap, and there is only one at this width.
+            raise ValueError(
+                f"block_n=128 needs elem_bytes=4 (an fp32 C), got "
+                f"{self.elem_bytes}: a bf16 store pairs two N tiles with "
+                f"permlane16_swap to reach a 16-byte access"
             )
         # Note what is *not* here: gemm_a2a requires n % (world_size*block_n) so
         # that a destination's column shard is a whole number of N tiles. No

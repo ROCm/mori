@@ -531,24 +531,40 @@ class AgStoreC:
 
 
 
-def tile_constants(BLOCK_M, BLOCK_N):
+def tile_constants(BLOCK_M, BLOCK_N, out_dtype="bf16"):
     """The derived tile geometry, shared by every caller of this GEMM.
 
     Every formula here is unchanged from ``_gemm_a8w8_8wave.py`` including
     ``N_LDS_STEPS_*``, which looks like it should depend on precision and does
     not: it is ``LDS_BLOCK * BLOCK_K / (512 * VEC)``, and bf16 halves ``BLOCK_K``
     and ``VEC`` together.
+
+    **The tile is the dominant tuning knob at these shapes, and not because of
+    the inner loop.** The template's ``256x256`` launches
+    ``ceil(M/256) * ceil(N/256)`` workgroups, which at the ``wkv_gate`` shape
+    (M=2048, N=2048) is 64 -- against 256 CUs on an MI355X, so three quarters of
+    the GPU is idle no matter how good the mainloop is. Halving a tile dimension
+    doubles the grid.
+
+    ``BLOCK_N=128`` is available **only for an fp32 C**, and the reason is the
+    store rather than the GEMM: the bf16 store reaches a 16-byte access by
+    pairing two N-tiles through ``permlane16_swap``, so it needs
+    ``n_tiles_b == 2``. An fp32 lane already holds 16 bytes of one tile and
+    stores each independently, so it does not care.
     """
-    if BLOCK_N != 256:
-        raise ValueError(
-            f"BLOCK_N must be 256, got {BLOCK_N}: the bf16 C store's permlane "
-            f"pairing is written for exactly two N tiles"
-        )
     if BLOCK_M not in (128, 256):
         raise ValueError(
             f"BLOCK_M must be 128 or 256, got {BLOCK_M}: 256 is the template's "
-            f"instantiation and 128 is the finer-chunking variant; other values "
-            f"have no validated pipeline"
+            f"instantiation and 128 doubles the grid; other values have no "
+            f"validated pipeline"
+        )
+    if BLOCK_N not in (128, 256):
+        raise ValueError(f"BLOCK_N must be 128 or 256, got {BLOCK_N}")
+    if BLOCK_N == 128 and out_dtype != "fp32":
+        raise ValueError(
+            f"BLOCK_N=128 needs out_dtype='fp32', got {out_dtype!r}: the bf16 "
+            f"store pairs two N tiles with permlane16_swap to reach a 16-byte "
+            f"access, and there is only one N tile at this width"
         )
     n_tiles_a = BLOCK_M // 64
     n_tiles_b = BLOCK_N // 128
@@ -643,6 +659,15 @@ def compile_bf16_gemm_ag(
             f"window offsets and the C store have to agree on the element width"
         )
     cfg.validate()
+    if fuse and (BLOCK_M, BLOCK_N) != (cfg.block_m, cfg.block_n):
+        # tiles_per_chunk counts this GEMM's N tiles through cfg.n_blocks, so a
+        # config describing a different tile makes the completion counter a
+        # number the epilogue never reaches -- a hang, not a wrong answer.
+        raise ValueError(
+            f"tile ({BLOCK_M}, {BLOCK_N}) disagrees with the config's "
+            f"({cfg.block_m}, {cfg.block_n}); the fused epilogue's completion "
+            f"counter is derived from the config's"
+        )
     ws = cfg.world_size
     N = cfg.n
     my_recv_slot = cfg.recv_slot_off(rank)
@@ -657,7 +682,7 @@ def compile_bf16_gemm_ag(
     m_tiles_per_chunk = cfg.m_tiles // chunks
     tiles_per_chunk = m_tiles_per_chunk * cfg.n_blocks
     chunk_bytes = m_tiles_per_chunk * BLOCK_M * N * cfg.elem_bytes
-    tc = tile_constants(BLOCK_M, BLOCK_N)
+    tc = tile_constants(BLOCK_M, BLOCK_N, out_dtype)
     N_TILES_A, N_TILES_B = tc["N_TILES_A"], tc["N_TILES_B"]
     N_ACCUMS = tc["N_ACCUMS"]
     LDS_BLOCK_M, LDS_BLOCK_N = tc["LDS_BLOCK_M"], tc["LDS_BLOCK_N"]
@@ -748,28 +773,52 @@ def compile_bf16_gemm_ag(
         # (for bf16) the shuffle once for all of them. Everywhere else it is a
         # single destination and the store takes the plain C tensor.
         if const_expr(fuse and direct_lsa):
-            peer_rsrcs = [
+            # Broadcast: `world` descriptors, so the convert and (for bf16) the
+            # shuffle happen once and only the 16-byte store repeats.
+            rsrcs = [
                 create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr((rank + j) % ws, my_recv_slot)),
                     num_records_bytes=slab_bytes,
                 )
                 for j in range(ws)
             ]
-            store_c = AgStoreC(
-                C,
-                c_m,
-                c_n,
-                mfma.idx,
-                N_TILES_A,
-                N_TILES_B,
-                out_dtype=out_dtype,
-                peer_rsrcs=peer_rsrcs,
-                peer_uncached=peer_uncached,
-            )
+        elif const_expr(fuse):
+            # One descriptor at this rank's own recv slot, reached through
+            # lsa_ptr(rank, ...) -- structurally what gemm_ar's fused-SDMA path
+            # does. Routing the fused-SDMA store through the C *tensor* instead
+            # measured as a wrong answer at M=2048 fp32 (relL2 6.9e-3 against
+            # 9.9e-7) and was clean through the buffer resource, so the two
+            # paths are not interchangeable even though they address the same
+            # bytes.
+            #
+            # `peer_uncached` is deliberately **not** honoured on the unfused
+            # path, and that is a known soft spot rather than a decision:
+            # sending the split pull baseline's C store with sc0|sc1 through
+            # this resource made it *worse*, not better -- relL2 5.9e-3 at
+            # BLOCK_M 128 and 256 alike, where the plain cached copy-atom store
+            # validates. So the bf16 pull baseline currently has no explicit
+            # system-scope publish and relies on the end-of-kernel release,
+            # which is not the discipline kernels_lsa's docstring asks for.
+            # See the benchmark doc; it is unresolved.
+            rsrcs = [
+                create_buffer_resource_from_addr(
+                    wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
+                    num_records_bytes=slab_bytes,
+                )
+            ]
         else:
-            store_c = AgStoreC(
-                C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, out_dtype=out_dtype
-            )
+            rsrcs = None
+        store_c = AgStoreC(
+            C,
+            c_m,
+            c_n,
+            mfma.idx,
+            N_TILES_A,
+            N_TILES_B,
+            out_dtype=out_dtype,
+            peer_rsrcs=rsrcs,
+            peer_uncached=peer_uncached,
+        )
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
@@ -996,10 +1045,117 @@ def compile_bf16_gemm_ag(
     return launch_gemm
 
 
+#: Tiles ``pick_tile`` will choose from, largest first.
+#:
+#: ``BLOCK_N=128`` is **deliberately absent**, and not because it is slow -- it
+#: is the fastest thing measured (116.5us at M=2048 against ``128/256``'s
+#: 134.2). It **races**: at ``BLOCK_M=128, BLOCK_N=128`` an fp32 C came out
+#: wrong once in 48 single-GPU runs (relL2 1.4e-2 against the usual 9.9e-7), and
+#: under an 8-rank bench roughly half the ranks failed per launch, a different
+#: half each time. ``BLOCK_N=256`` is 48/48 clean on the same probe.
+#:
+#: The suspected cause is the ``wait_barrier`` vmcnt thresholds: they are
+#: written as ``N_LDS_STEPS_A + N_LDS_STEPS_B`` and friends, which is only ever
+#: exercised at the step counts ``BLOCK_N=256`` produces. At ``BLOCK_N=128``
+#: both counts fall to 1 and the thresholds may admit one prefetch too many --
+#: which would be invisible until something perturbs the timing, exactly as
+#: observed. Unconfirmed; ``tile_constants`` still accepts the tile so the
+#: measurement stays reproducible behind an explicit ``--block-n 128``.
+#:
+#: ``BLOCK_M=128`` is **also absent, and that is the unhappy part of this
+#: file.** It is 24% faster at the target shape and it is not sound either: at
+#: ``M=2048`` fp32 it validated 4/4 on ``gemm-only`` and ``gemm-to-window`` and
+#: 3/3 on ``split-rccl`` and ``split-sdma``, then on a later pass the same
+#: ``gemm-to-window`` and ``split-rccl`` cells came back 1/2, and ``fused-lsa``
+#: is 0/4 throughout. ``BLOCK_M=256`` has not failed once across every repeat
+#: run here. So the failure rate at 128 is around a third of launches and
+#: depends on something not yet identified -- it is **not** the release fence,
+#: which was the obvious candidate and which ``--fence all`` and
+#: ``--direct-fence all`` both fail to fix (0/3 each).
+#:
+#: Shipping a wrong answer a third of the time to buy 24% is not a trade, so
+#: the default is the tile that validates. Everything measured is in
+#: ``pick_tile`` and both faster tiles stay reachable through an explicit
+#: ``--block-m`` / ``--block-n``, so the work is reproducible rather than lost.
+TILE_CANDIDATES = ((256, 256),)
+
+#: CUs on the part this was tuned on (MI355X). The grid heuristic wants the
+#: real number, so it is a parameter of ``pick_tile`` rather than a constant.
+DEFAULT_CUS = 256
+
+
+def pick_tile(m, n, out_dtype="bf16", cus=DEFAULT_CUS):
+    """Choose ``(BLOCK_M, BLOCK_N)`` for a shape. Measured, not guessed.
+
+    The template instantiates ``256x256``, and at the shapes this operator runs
+    that is the **single worst choice on the table** -- it launches
+    ``ceil(M/256) * ceil(N/256)`` workgroups, which at ``M=N=2048`` is 64
+    against an MI355X's 256 CUs. Three quarters of the GPU idles regardless of
+    how good the mainloop is, and no amount of ``waves_per_eu`` or
+    ``xcd_swizzle`` touches it (both measured inert, within 1%).
+
+    Measured at ``M=2048 N=2048 K=7168``, fp32 out, across every tile::
+
+        tile      grid      us    TF/s
+        256/256     64   176.0     342
+        256/128    128   139.6     431
+        128/256    128   134.2     448
+        128/128    256   116.5     516   (races -- see TILE_CANDIDATES)
+
+    and per shape at the best *sound* tile (``128/256``), against
+    ``torch.matmul``::
+
+          M   grid     us    TF/s   torch    ratio
+        512     32  128.4     117    39.0    3.29x
+       1024     64  128.4     234    53.1    2.42x
+       2048    128  134.2     448    84.8    1.58x
+       4096    256  155.2     775   122.9    1.26x
+
+    The rule that fits those measurements is **not** "maximise the grid": at
+    ``M=4096``, ``128/128`` gives 512 workgroups and measures 162.8us against
+    ``128/256``'s 256 workgroups at 155.2, so once there is at least one
+    workgroup per CU the larger tile amortises better. Hence **the largest tile
+    whose grid still covers the CUs, or the largest grid available if none
+    does**, which reproduces the measured best at every shape.
+
+    **That rule currently has one candidate to choose from.** Both tiles
+    smaller than the template's are measurably faster and neither validates
+    reliably -- see ``TILE_CANDIDATES`` -- so this returns ``(256, 256)`` today
+    and the logic is kept for when one of them is fixed. The measurements are
+    the deliverable here rather than the selection: they say the tile is worth
+    24-34%, and that ``waves_per_eu`` and ``xcd_swizzle`` are worth nothing,
+    which is where the next attempt should and should not look.
+    """
+    cands = [
+        (bm, bn)
+        for bm, bn in TILE_CANDIDATES
+        if m % bm == 0 and n % bn == 0 and (bn == 256 or out_dtype == "fp32")
+    ]
+    if not cands:
+        raise ValueError(
+            f"no validated tile divides m={m} n={n} for out_dtype={out_dtype!r}; "
+            f"candidates are {TILE_CANDIDATES} and BLOCK_N=128 is fp32-only"
+        )
+    grid = lambda t: (m // t[0]) * (n // t[1])  # noqa: E731
+    covering = [t for t in cands if grid(t) >= cus]
+    if covering:
+        # Largest area among those that fill the machine; TILE_CANDIDATES is
+        # ordered largest-first so the first match is it.
+        return covering[0]
+    return max(cands, key=grid)
+
+
+def tile_grid(m, n, tile):
+    """Workgroups a tile launches. Exposed because it is the whole story."""
+    return (-(-m // tile[0])) * (-(-n // tile[1]))
+
+
 __all__ = [
     "AgStoreC",
     "BLOCK_K",
     "compile_bf16_gemm_ag",
+    "pick_tile",
+    "TILE_CANDIDATES",
     "E_K",
     "MfmaBf16",
     "S2RLoaderBf16",

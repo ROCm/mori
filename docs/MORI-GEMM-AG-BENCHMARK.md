@@ -31,6 +31,15 @@ derived in *The bound fusing runs into* that is 27% at `M=2048` and falls as the
 world grows. **The lever worth pulling next is a narrower wire, not a better
 epilogue.**
 
+**A second precision was added afterwards — bf16 in, fp32 out, the one DeepSeek
+V4-Pro's `wkv_gate` actually uses.** Fusing **breaks even** there rather than
+losing, because the bf16 GEMM is larger and there is correspondingly more
+compute to hide behind. The ported GEMM is 28% behind `torch.matmul`, which
+makes the operator a net loss at the target shape; a tile sweep shows the cause
+is grid occupancy and that fixing it is worth 33% — but the tile that does so
+also exposes a latent correctness bug and therefore does not ship. See *BF16 in,
+FP32 out* and *Tuning the bf16 GEMM*.
+
 ## What the operator is
 
 Every rank holds its own `A [M, K]` — its shard of the tokens — and a replicated
@@ -360,7 +369,11 @@ the port being faithful; the kernel is simply untuned at this precision
 is at its default, and no tile sweep has been run). Against mori's best transport
 the total is 427.6 against A.4's 415.0, so **at this shape the operator is not
 yet a win over `torch.matmul` + RCCL, and the deficit is entirely in the GEMM.**
-Tuning it is the next thing worth doing, ahead of any further epilogue work.
+**The cause is now known — see *Tuning the bf16 GEMM*: the template's tile
+leaves three quarters of the GPU idle at this shape, and a smaller one takes the
+GEMM to 91.7us and the total to 424.3 against A.4's 415.0. It does not ship,
+because it also makes about a third of launches produce a wrong answer.** So
+this paragraph still stands as the shipped state.
 
 ### One intermittent failure, unresolved
 
@@ -376,6 +389,118 @@ so "did not reproduce in 13 tries" is not "is not there". Anyone taking this
 path to production should run the cell a few hundred times first; the
 `--chunks` ladder is the obvious place for a race to hide and was not swept on
 the bf16 path at all.
+
+## Tuning the bf16 GEMM: the tile is almost the whole story
+
+The section above closes on the bf16 GEMM being 28% behind `torch.matmul`,
+called out as the largest number on the table. The cause was not the mainloop.
+
+**The template's `256x256` tile launches 64 workgroups. An MI355X has 256 CUs.**
+Three quarters of the GPU idles at the `wkv_gate` shape regardless of how good
+the inner loop is, and nothing inside the loop can reach that. Measured at
+`M=2048 N=2048 K=7168`, fp32 out, one GPU, against `torch.matmul` at 84.8us:
+
+| tile | workgroups | us | TF/s |
+|---|---:|---:|---:|
+| `256/256` (the template's) | 64 | 176.0 | 342 |
+| `256/128` | 128 | 139.6 | 431 |
+| `128/256` | 128 | **134.2** | **448** |
+| `128/128` | 256 | 116.5 | 516 |
+
+`waves_per_eu` (1/2/4) and `xcd_swizzle` (0/1/4/8) are both **inert** — every
+cell within 1%, which is the noise floor. The tile is the knob.
+
+### The rule is not "maximise the grid"
+
+| M | grid at `128/256` | us | TF/s | `torch.matmul` | ratio |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 32 | 128.4 | 117 | 39.0 | 3.29x |
+| 1024 | 64 | 128.4 | 234 | 53.1 | 2.42x |
+| 2048 | 128 | 134.2 | 448 | 84.8 | 1.58x |
+| 4096 | 256 | 155.2 | 775 | 122.9 | 1.26x |
+
+At `M=4096`, `128/128` gives 512 workgroups and measures 162.8us against
+`128/256`'s 256 workgroups at 155.2. Once there is at least one workgroup per
+CU, the larger tile amortises better. So `pick_tile` takes **the largest tile
+whose grid still covers the CUs, or the largest grid available if none does**,
+which reproduces the measured best at every shape.
+
+### Two tiles that are faster and do not ship
+
+`128/128` is the fastest thing measured (116.5us, 516 TF/s) and is **excluded**.
+It races: one wrong fp32 C in 48 single-GPU runs (relL2 1.4e-2 against the usual
+9.9e-7), and under an 8-rank launch roughly half the ranks failed, a different
+half each time. `128/256` is 48/48 clean on the same probe. The suspected cause
+is the `wait_barrier` vmcnt thresholds, which are written in terms of
+`N_LDS_STEPS_A/B` and only ever exercised at the step counts `BLOCK_N=256`
+produces; at `BLOCK_N=128` both fall to 1. Unconfirmed.
+
+`BLOCK_M=128` does not ship either, and that is the unhappy part. It is 24%
+faster at the target shape and it is not reliable. Repeat counts at `M=2048`
+fp32, all at `BLOCK_M=128`, in the order they were taken:
+
+| mode | first pass | later pass |
+|---|---:|---:|
+| `gemm-only` | 4/4 | 2/2 |
+| `gemm-to-window` | 4/4 | **1/2** |
+| `split-rccl` | 3/3 | **1/2** |
+| `split-lsa-push` | 4/4 | — |
+| `split-sdma` | 3/3 | — |
+| `split-lsa-pull` | 3/4 | — |
+| `fused-sdma` | 1/3 | — |
+| `fused-lsa` | **0/4** | — |
+
+`BLOCK_M=256` has not failed once across every repeat run in this section. So
+the failure rate at 128 is somewhere around a third of launches, and the "sound
+/ unsound by mode" split that the first pass seemed to show **did not survive
+repetition** — `gemm-to-window` and `split-rccl` looked clean at 4/4 and 3/3 and
+then came back 1/2.
+
+The obvious suspect is the release fence: halving `BLOCK_M` doubles the number
+of blocks that must publish their stores. It is wrong. `--fence all` and
+`--direct-fence all` — every lane issuing the release instead of one wave per
+block — are **0/3 each**. Unexplained.
+
+Shipping a wrong answer a third of the time to buy 24% is not a trade, so
+`pick_tile` returns the template's tile and **the GEMM speedup measured in this
+section does not reach the default configuration.** Both faster tiles stay
+reachable through an explicit `--block-m` / `--block-n` so the measurements can
+be reproduced.
+
+One caution on reading any of this, which is the real lesson of the section: **a
+single launch is not evidence.** Four separate conclusions here were reversed by
+repeating a cell that had "clearly" passed or failed once — including this
+one.
+
+### What it would have bought, and what it actually bought
+
+At `BLOCK_M=128`, `gemm-only` at `M=2048` over 8 ranks under CUDA-graph replay
+measures **91.7us** against the shipped tile's 137.6 — a 33% cut that would have
+taken the operator from 11.5% behind the plan document's FP32 baseline to 2%
+better than it, and to 8% better through `split-sdma`. Those numbers are real
+and they are also unusable, for the reason above.
+
+**What ships is the knowledge, not a speedup.** The sweep establishes three
+things worth more than one tuned constant:
+
+* the tile is worth 24–34% at these shapes and is the *only* knob that is —
+  `waves_per_eu` and `xcd_swizzle` are inert to within 1%;
+* the mechanism is grid occupancy, not the inner loop, which says where the
+  next attempt should look (split-K, not scheduling);
+* and there is a **latent correctness bug that halving `BLOCK_M` exposes**,
+  which was not visible at the template's tile and is now a known, reproducible
+  target. Finding it is worth the 33%.
+
+### What is left
+
+The gap to `torch.matmul` itself is not closed, and it widens as M falls: 1.26x
+at M=4096, 1.58x at M=2048, 3.29x at M=512. The residue is the same problem one
+level down — at `M=512` even the smallest sound tile is 32 workgroups on 256
+CUs, and our time barely moves from M=512 to M=2048 despite four times the work,
+which is the signature of a kernel waiting on the machine rather than using it.
+**Split-K** is the answer there and is not implemented. After that, the store's
+coalescing: a 16-lane group writes 16 different rows at one column, which the
+gcnasm template's `shfl` stage exists to fix and this port does not carry.
 
 ## The bound fusing runs into
 
@@ -529,12 +654,17 @@ launches and retry a lost race rather than recording it.
 ## Not measured
 
 * Cross-node (GDA). Everything here is intra-node LSA/SDMA over xGMI.
-* **Tuning the bf16 GEMM.** `BLOCK_K` is pinned to the template's 64,
-  `xcd_swizzle` is off, `waves_per_eu` is at its default and no tile sweep has
-  been run. It is 28% behind `torch.matmul`, which is the single largest number
-  on the table and the one worth attacking first.
-* The bf16 path at the `r128` shape, at `--block-m 128`, under `--chunks > 1`,
-  or with `--post serial`. All are reachable; none were swept.
+* **Split-K**, and the C store's coalescing. The tile sweep is done; these are
+  what is left of the gap to `torch.matmul` — 1.26x at M=4096, 3.29x at M=512.
+  `BLOCK_K` is still pinned to the template's 64 and was not swept: it would
+  need a different LDS swizzle, since `swizzle_row128b`'s geometry is 128 bytes
+  per row and `BLOCK_K=128` is 256.
+* **The `BLOCK_M=128` correctness bug.** This is the single highest-value open
+  item: finding it unlocks a measured 33% on the GEMM. It is not the release
+  fence. It is reproducible in about a third of launches at `M=2048` fp32 with
+  `--block-m 128`.
+* The bf16 path at the `r128` shape, under `--chunks > 1`, or with
+  `--post serial`. All are reachable; none were swept.
 * fp8 on the wire. This is the direction where it would help most — the
   operator is bandwidth-bound by construction and a 2x narrower wire moves the
   `G₀/C₀` ratio directly — and the `pull` direction is built so the dequantize
