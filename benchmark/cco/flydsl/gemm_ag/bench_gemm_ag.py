@@ -92,6 +92,7 @@ from mori.ops.gemm_ag.kernels_fused import (
 from mori.ops.gemm_ag._gemm_a16w16_8wave import (
     BLOCK_K as BF16_BLOCK_K,
     compile_bf16_gemm_ag,
+    pick_tile,
 )
 
 MODES = (
@@ -359,10 +360,18 @@ def run(args) -> int:
             )
         if args.k % BF16_BLOCK_K:
             raise SystemExit(f"--in-dtype bf16 needs k % {BF16_BLOCK_K} == 0")
-        if args.block_m == DEFAULT_BLOCK_M and args.m % 256 == 0:
-            # The template's instantiation. 128 stays reachable with an
-            # explicit --block-m for the finer chunk granularity it buys.
-            args.block_m = 256
+        if args.block_m == 0 or args.block_n == 0:
+            # The tile is the dominant knob at these shapes and the template's
+            # 256x256 is the worst of them -- 64 workgroups against 256 CUs at
+            # M=N=2048. pick_tile's docstring carries the measurements.
+            bm, bn = pick_tile(args.m, args.n, args.out_dtype)
+            args.block_m = args.block_m or bm
+            args.block_n = args.block_n or bn
+    if not bf16_in:
+        # The fp8 path's tile is not a free choice: its epilogue is written for
+        # BLOCK_N=256, so only block_m moves.
+        args.block_m = args.block_m or DEFAULT_BLOCK_M
+        args.block_n = args.block_n or 256
     if not bf16_in and args.quant == "mxfp8" and args.block_m == DEFAULT_BLOCK_M:
         # mxfp8's BLOCK_M is a property of the packed A scale, not a tuning
         # choice, so take it rather than making every caller pass it.
@@ -706,8 +715,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(linear_bf16_fp32)",
     )
     p.add_argument("--quant", choices=("ptpc", "blockscale", "mxfp8"), default="ptpc")
-    p.add_argument("--block-m", type=int, default=DEFAULT_BLOCK_M)
-    p.add_argument("--block-n", type=int, default=256)
+    p.add_argument(
+        "--block-m",
+        type=int,
+        default=0,
+        help="0 picks the tile from the shape (see pick_tile); the fp8 path "
+        "falls back to its fixed 128",
+    )
+    p.add_argument("--block-n", type=int, default=0)
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)
     p.add_argument("--swap-ab", action=argparse.BooleanOptionalAction, default=True)

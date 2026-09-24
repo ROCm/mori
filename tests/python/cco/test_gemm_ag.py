@@ -228,6 +228,25 @@ def test_byte_swizzle_is_a_bijection_at_bf16_width():
     assert len(seen) == 16 * 64
 
 
+def test_pick_tile_only_returns_validated_tiles():
+    """``BLOCK_N=128`` is the fastest tile measured and is excluded anyway.
+
+    It produced a wrong fp32 C once in 48 single-GPU runs and failed about half
+    the ranks per 8-rank launch; ``BLOCK_N=256`` was 48/48 clean on the same
+    probe. ``tile_constants`` still accepts it so the measurement stays
+    reproducible behind an explicit flag, but nothing may pick it by default.
+    """
+    for m in (512, 1024, 2048, 4096, 8192):
+        for od in ("bf16", "fp32"):
+            assert bf16gemm.pick_tile(m, 2048, od)[1] == 256
+    # Both tiles smaller than the template's measure faster and neither
+    # validates reliably, so the only shippable candidate is the template's.
+    assert bf16gemm.TILE_CANDIDATES == ((256, 256),)
+    for m in (512, 2048, 4096, 8192):
+        assert bf16gemm.pick_tile(m, 2048, "fp32") == (256, 256)
+    assert bf16gemm.tile_grid(8192, 2048, (256, 256)) == 256
+
+
 def test_bf16_tile_constants_match_the_template():
     """``<512, 256, 256, 64>`` from gemm_a16w16_quad_subtile_kernel.cc."""
     tc = bf16gemm.tile_constants(256, 256)
@@ -244,6 +263,11 @@ def test_bf16_tile_constants_match_the_template():
             bf16gemm.tile_constants(bad, 256)
     with pytest.raises(ValueError, match="BLOCK_N must be"):
         bf16gemm.tile_constants(256, 512)
+    # BLOCK_N=128 doubles the grid again but only an fp32 store can take it:
+    # the bf16 one pairs two N tiles through permlane16_swap.
+    assert bf16gemm.tile_constants(128, 128, "fp32")["N_TILES_B"] == 1
+    with pytest.raises(ValueError, match="BLOCK_N=128 needs"):
+        bf16gemm.tile_constants(128, 128, "bf16")
 
 
 @pytest.mark.parametrize(
@@ -252,7 +276,12 @@ def test_bf16_tile_constants_match_the_template():
         (dict(world_size=1, m=2048, n=2048), "world_size must be"),
         (dict(world_size=9, m=2048, n=2048), "world_size must be"),
         (dict(world_size=8, m=0, n=2048), "must be positive"),
-        (dict(world_size=8, m=2048, n=2048, block_n=512), "block_n must be exactly"),
+        (dict(world_size=8, m=2048, n=2048, block_n=512), "block_n must be 128 or"),
+        # 128 is layout-legal but only under an fp32 C.
+        (
+            dict(world_size=8, m=2048, n=2048, block_n=128),
+            "block_n=128 needs elem_bytes=4",
+        ),
         (dict(world_size=8, m=2048, n=2048, block_m=64), "multiple of 128"),
         (dict(world_size=8, m=2048, n=2048, counter_chunks=0), "counter_chunks"),
         (
