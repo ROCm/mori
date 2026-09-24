@@ -866,6 +866,8 @@ struct ccoComm {
   // Default # of QPs per peer (from Context). Per-DevComm may override via reqs.
   int defaultNumQpPerPe{4};
   bool iovaZeroMode{true};
+  // Whether windows carry an RDMA MR. Off on a single-node comm until a FULL DevComm needs one.
+  bool windowMrsEnabled{false};
 
   // Handle type for VMM allocations. Fabric (0x8) when the runtime supports it
   // (probed at CommCreate); falls back to PosixFileDescriptor (0x1).
