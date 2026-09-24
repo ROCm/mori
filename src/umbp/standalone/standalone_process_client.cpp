@@ -49,6 +49,7 @@
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/progress_logger.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/common/rpc_deadline.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 
@@ -94,17 +95,12 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
 // waits of 70-260s were measured before the lock this once queued behind was
 // fixed.
 int DataPlaneRpcTimeoutMs() {
-  static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_DATA_PLANE_RPC_TIMEOUT_MS",
-                                                           std::chrono::milliseconds(300000),
-                                                           /*min_allowed=*/1)
-                                            .count());
+  static const int v =
+      ResolveDeadlineMs("UMBP_DATA_PLANE_RPC_TIMEOUT_MS", std::chrono::milliseconds(300000));
   return v;
 }
 
-void ArmDataPlaneDeadline(grpc::ClientContext& ctx) {
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(DataPlaneRpcTimeoutMs()));
-}
+void ArmDataPlaneDeadline(grpc::ClientContext& ctx) { ArmDeadline(ctx, DataPlaneRpcTimeoutMs()); }
 
 // A liveness bound for the one-time-per-buffer registration RPC, NOT a latency
 // budget: it exists so a wedged server releases the rank -- and its allocation
@@ -121,18 +117,13 @@ void ArmDataPlaneDeadline(grpc::ClientContext& ctx) {
 // queue rather than one buffer. Raise the knob for larger pools, or set 0 to
 // wait indefinitely; never set it below UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
 int RegisterMemoryRpcTimeoutMs() {
-  static const int v = static_cast<int>(GetEnvMilliseconds("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS",
-                                                           std::chrono::milliseconds(3600000),
-                                                           /*min_allowed=*/0)
-                                            .count());
+  static const int v =
+      ResolveDeadlineMs("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS", std::chrono::milliseconds(3600000));
   return v;
 }
 
-// Zero leaves the context without a deadline, which is gRPC's "wait forever".
 void ArmRegisterMemoryDeadline(grpc::ClientContext& ctx) {
-  const int timeout_ms = RegisterMemoryRpcTimeoutMs();
-  if (timeout_ms <= 0) return;
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
+  ArmDeadline(ctx, RegisterMemoryRpcTimeoutMs());
 }
 
 // A synchronous unary call says nothing until it returns, so slow and wedged
