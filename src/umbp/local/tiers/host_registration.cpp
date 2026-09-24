@@ -29,6 +29,7 @@
 #include <string>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/progress_logger.h"
 
 namespace mori::umbp {
 namespace {
@@ -88,8 +89,24 @@ void HostTierRegistration::Register() {
   //
   // hipHostRegisterPortable so every rank's device can reach the tier;
   // hipHostRegisterMapped so a kernel can dereference it directly.
-  const hipError_t status =
-      hipHostRegister(base_, bytes_, hipHostRegisterMapped | hipHostRegisterPortable);
+  //
+  // One call is also one black box: a terabyte-scale tier is minutes of silence
+  // and the only line here comes after it returns, so a server that fails to
+  // come up cannot be told apart from one still working. Hence the heartbeat,
+  // once a minute -- a healthy call here is itself measured in minutes.
+  const size_t mib = bytes_ >> 20;
+  hipError_t status = hipSuccess;
+  {
+    // Scoped to the one call, so a heartbeat can only ever mean that
+    // hipHostRegister itself has not returned -- never the alias pass below.
+    ScopedProgressLog progress(std::chrono::seconds(60), [mib](std::chrono::milliseconds elapsed) {
+      MORI_UMBP_INFO(
+          "[DRAMTier] still registering {} MiB for GPU access, "
+          "elapsed={}s (one hipHostRegister; it cannot be chunked)",
+          mib, elapsed.count() / 1000);
+    });
+    status = hipHostRegister(base_, bytes_, hipHostRegisterMapped | hipHostRegisterPortable);
+  }
   if (status != hipSuccess) {
     MORI_UMBP_WARN(
         "[DRAMTier] hipHostRegister of {} MiB failed: {}; the GPU gather path stays off and "

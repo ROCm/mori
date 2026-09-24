@@ -47,6 +47,7 @@
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/common/progress_logger.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
@@ -165,60 +166,29 @@ void ArmRegisterMemoryDeadline(grpc::ClientContext& ctx) {
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
 }
 
-// A registration that is merely slow and one that is wedged look identical
-// from the outside: a synchronous unary call says nothing at all until it
-// returns. That is exactly what forces the deadline above to be set so
-// generously -- and a generous deadline is only safe if "still working" is
-// visible before it fires. This makes it visible.
-//
-// Runs for the lifetime of the RPC and costs one thread per registration,
-// which is a once-per-buffer setup call, not a hot path.
+// A synchronous unary call says nothing until it returns, so slow and wedged
+// look identical -- which is what forces the deadline above to be generous, and
+// a generous deadline is only safe if "still working" is visible before it
+// fires.
 class RegistrationProgressLogger {
  public:
   RegistrationProgressLogger(const char* what, uintptr_t ptr, size_t size)
-      : what_(what), ptr_(ptr), size_(size) {
-    thread_ = std::thread([this] { Loop(); });
-  }
+      : log_(kInterval, [what, ptr, size](std::chrono::milliseconds elapsed) {
+          MORI_UMBP_INFO(
+              "[StandaloneProcessClient] still registering {} ptr=0x{:x} size={}MB, elapsed={}s "
+              "(deadline={}ms, 0=none)",
+              what, ptr, size / (1024 * 1024), elapsed.count() / 1000,
+              RegisterMemoryRpcTimeoutMs());
+        }) {}
 
-  ~RegistrationProgressLogger() {
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      done_ = true;
-    }
-    cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
-  }
-
-  RegistrationProgressLogger(const RegistrationProgressLogger&) = delete;
-  RegistrationProgressLogger& operator=(const RegistrationProgressLogger&) = delete;
-
-  int64_t ElapsedMs() const {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                 start_)
-        .count();
-  }
+  int64_t ElapsedMs() const { return log_.Elapsed().count(); }
 
  private:
-  static constexpr std::chrono::seconds kInterval{30};
+  // Once a minute. These calls are measured in minutes when they are healthy,
+  // so anything finer is noise rather than signal.
+  static constexpr std::chrono::seconds kInterval{60};
 
-  void Loop() {
-    std::unique_lock<std::mutex> lock(mu_);
-    while (!cv_.wait_for(lock, kInterval, [this] { return done_; })) {
-      MORI_UMBP_INFO(
-          "[StandaloneProcessClient] still registering {} ptr=0x{:x} size={}MB, elapsed={}s "
-          "(deadline={}ms, 0=none)",
-          what_, ptr_, size_ / (1024 * 1024), ElapsedMs() / 1000, RegisterMemoryRpcTimeoutMs());
-    }
-  }
-
-  const char* what_;
-  uintptr_t ptr_;
-  size_t size_;
-  std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
-  std::mutex mu_;
-  std::condition_variable cv_;
-  bool done_ = false;
-  std::thread thread_;
+  ScopedProgressLog log_;
 };
 
 // The message a failed registration throws with.
