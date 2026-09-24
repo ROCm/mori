@@ -463,6 +463,7 @@ def run(args) -> int:
                 waves_per_eu=args.waves_per_eu,
                 xcd_swizzle=args.xcd_swizzle if not fused else 0,
                 transport="lsa" if args.mode == "fused-lsa" else "sdma",
+                wait_policy=args.wait_policy,
                 fuse=fused,
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
@@ -487,6 +488,7 @@ def run(args) -> int:
                 quant=args.quant,
                 waves_per_eu=args.waves_per_eu,
                 transport="lsa" if args.mode == "fused-lsa" else "sdma",
+                wait_policy=args.wait_policy,
                 fuse=fused,
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
@@ -765,6 +767,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="how fused-sdma issues a chunk's world-1 packets: one per lane, "
         "or all from thread 0 back to back (the original, kept for "
         "attribution)",
+    )
+    p.add_argument(
+        "--wait-policy",
+        choices=("tuned", "safe", "conservative"),
+        default="tuned",
+        help="how permissive the bf16 mainloop's s_waitcnt vmcnt is: the "
+        "inherited 2A+B, the derived A+2B, or wait-for-everything",
     )
     p.add_argument("--sdma-queues", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
