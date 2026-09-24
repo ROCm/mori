@@ -385,8 +385,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     index_t n = s_N[p];
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
-      s_base[p] = __hip_atomic_fetch_add(EpTokOff(args, p), n,
-                                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      s_base[p] =
+          __hip_atomic_fetch_add(EpTokOff(args, p), n, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
     }
@@ -643,9 +643,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
             if (!_pfSent && _pfN > 0 && _pfDst != nullptr) {
               const int _mTokB = (int)(hiddenDim * sizeof(T));
-              TdmIssueStore<int>(
-                  reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
-                  reinterpret_cast<int*>(_tdmTile), TdmShape<int>(_pfN * (_mTokB / 4)));
+              TdmIssueStore<int>(reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
+                                 reinterpret_cast<int*>(_tdmTile),
+                                 TdmShape<int>(_pfN * (_mTokB / 4)));
               _pfSent = true;
             }
             _mPend = true;
@@ -692,8 +692,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   if (args.tokenIndices && args.inpTokenBuf) {
     constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
-    constexpr bool kFp4Pack4 =
-        kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
+    constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
     constexpr int kPack = kFp4Pack4 ? 4 : 1;
     static_assert(!kFp4Pack4 || kTokB % 128 == 0,
                   "each packed FP4 token must occupy whole TDM rows");
@@ -709,8 +708,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         const index_t part = cntAll / (index_t)nUnits;
         const index_t rem = cntAll - part * (index_t)nUnits;
         const index_t myCnt = part + (((index_t)unit < rem) ? (index_t)1 : (index_t)0);
-        const index_t myBase = s_base[destPe] + (index_t)unit * part +
-                               (((index_t)unit < rem) ? (index_t)unit : rem);
+        const index_t myBase =
+            s_base[destPe] + (index_t)unit * part + (((index_t)unit < rem) ? (index_t)unit : rem);
         T* const dst = EpPeer<T>(win, destPe, args.offDispOut);
         const T* const src = reinterpret_cast<const T*>(args.inpTokenBuf);
         const index_t* const srcMap = _cusplit_stgSrc + (size_t)destPe * _stgCap;
@@ -723,14 +722,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           for (int k = 0; k < kPack; ++k) {
             if (k < n) {
               const int srcTok = (int)srcMap[slot0 + k] % kCfg.maxTokPerRank;
-              TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim,
-                              src + (size_t)srcTok * hiddenDim, _tdmG1);
+              TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim, src + (size_t)srcTok * hiddenDim,
+                              _tdmG1);
             }
           }
           __builtin_amdgcn_s_wait_tensorcnt(0);
           TdmIssueStore<int>(reinterpret_cast<int*>(dst + (size_t)slot0 * hiddenDim),
-                             reinterpret_cast<int*>(_tdmTile),
-                             TdmShape<int>(n * (kTokB / 4)));
+                             reinterpret_cast<int*>(_tdmTile), TdmShape<int>(n * (kTokB / 4)));
           __builtin_amdgcn_s_wait_tensorcnt(0);
         }
       }
@@ -842,18 +840,21 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   const unsigned long long phase = args.xdbFlag[blockIdx.x];
 
   if (needGridRendezvous) {
-    if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+    unsigned _gridArvl = 0;
+    if (thdId == 0) _gridArvl = atomicAdd(args.gridBarrier, 1u);
     if constexpr (!EpIsWideEp(kCfg)) {
       if (globalThdId < npes) {
         EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
         __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       }
     } else {
-      // Wide EP: single-thread wait+reset avoids the race where warp 0 resets
-      // the barrier before warp 1 reads gridDim.x.
+      // Wide EP: last-arrival resets to avoid the inter-block race where a late
+      // block misses the transient gridDim.x value and deadlocks on 0.
       if (thdId == 0) {
-        EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-        __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        if (_gridArvl == static_cast<unsigned>(gridDim.x) - 1)
+          __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        else
+          EpWaitEq(args.gridBarrier, 0u);
       }
       __syncthreads();
     }
