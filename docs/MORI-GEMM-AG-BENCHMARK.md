@@ -265,6 +265,118 @@ doing nothing else. This is the cost `peer_rsrcs` was added to minimise (one
 scale load, one convert, one shuffle, `world` stores) and minimising it is not
 enough.
 
+## BF16 in, FP32 out — the precision the model actually uses
+
+Everything above is the fp8 GEMM, bf16 out. The layer this operator exists for
+is not that: `通算融合方向规划.md` A.4 records DeepSeek V4-Pro's `wkv_gate` going
+through `linear_bf16_fp32`, and says the first implementation must keep the
+original input precision and FP32 output convention rather than substituting the
+existing FP8 GEMM. `--in-dtype bf16 --out-dtype {bf16,fp32}` is that path:
+`mori.ops.gemm_ag._gemm_a16w16_8wave`, a port of gcnasm's
+`gemm_a16w16_quad_subtile_kernel_template.hpp` at its own instantiation
+`<512, 256, 256, 64, bf16, bf16, bf16, float>`.
+
+It is a small port because **`gemm_ar/_gemm_a8w8_8wave.py` is already a FlyDSL
+rendering of that same template** with fp8 operands — same 8 waves, same 2x2
+half-tiles, same swapped-AB MFMA, same permlane store. Four things change: the
+MFMA (`16x16x32 bf16`), `E_K = 2` instead of 1, `VEC = 8` instead of 16, and no
+scales at all. The LDS keeps mori's XOR swizzle, restated in bytes
+(`swizzle_row128b`), which is asserted to be the fp8 function value-for-value at
+`elem_bytes = 1`.
+
+### The FP32 store is the cheap one
+
+The A/B swap puts **four consecutive columns** in each lane. At two bytes that is
+8 B — too narrow, which is the entire reason the bf16 path pays for a
+`permlane16_swap` to pair two N-tiles into 16 B. At four bytes those same four
+columns are already 16 contiguous bytes, so the FP32 store is a
+`buffer_store_dwordx4` with **no shuffle and no convert**. Lane group
+`g = lane//16` takes `col = base_col + g*4`, and the four groups still cover 64
+contiguous bytes per row.
+
+### Accuracy
+
+| | relL2 vs exact fp32 |
+|---|---:|
+| fp8 in, bf16 out | 1.66e-3 |
+| bf16 in, bf16 out | 1.66e-3 |
+| **bf16 in, fp32 out** | **9.9e-7** |
+
+Three orders of magnitude, and it shows what the 1.66e-3 actually was: the *bf16
+output rounding*, not the fp8 input. Keeping fp32 all the way out is worth far
+more numerically than keeping fp8 out of the inputs — which is what
+`linear_bf16_fp32` is for.
+
+### Results, `K=7168 N=2048`, 8 ranks
+
+`gemm` / `comm` are the same-run phase split. Wire bytes per rank are in the
+heading; fp32 doubles them.
+
+| mode | M512 bf16 (14 MiB) | M512 fp32 (28 MiB) | M2048 bf16 (56 MiB) | M2048 fp32 (112 MiB) |
+|---|---|---|---|---|
+| `gemm-only` | 125.1 | 129.0 | 132.5 | 137.6 |
+| `split-rccl` | 187.9 / 123.9 / 64.0 | 230.6 / 127.8 / 100.3 | 305.5 / 129.2 / 176.3 | 462.9 / 132.4 / 327.8 |
+| `split-lsa-push` | **171.5** / 124.3 / 44.0 | 213.2 / 128.7 / 81.9 | 286.6 / 129.1 / 155.8 | 444.2 / 135.0 / 307.5 |
+| `split-lsa-pull` | 179.1 / 124.3 / 49.7 | 220.2 / 128.8 / 91.4 | 323.1 / 130.8 / 191.2 | 442.7 / 134.2 / 308.3 |
+| `split-sdma` | 176.1 / 124.6 / 51.3 | **217.2** / 130.2 / 83.7 | **284.4** / 131.9 / 152.5 | **427.6** / 134.1 / 293.4 |
+| `fused-lsa` | 202.0 | 245.8 | 344.5 | 616.4 |
+| `fused-sdma` | 176.1 / 128.4 / 46.7 | 217.7 / 132.9 / 81.8 | 285.2 / 136.6 / 146.0 | 429.5 / 138.1 / 290.7 |
+
+**The GEMM is 2.2x the fp8 one** (132.5 against 60.5 at M=2048) and that is
+expected rather than a defect: `16x16x32` consumes a quarter of the K per
+instruction that the fp8 `16x16x128` does. Output width barely touches it
+(132.5 → 137.6 for fp32), because the store is a small part of a K=7168 GEMM.
+
+**Fusing now breaks even instead of losing.** `fused-sdma` lands within 0.5% of
+`split-sdma` at all four cells, where under fp8 it was 3–7% behind — and its
+comm phase is consistently lower (46.7 vs 51.3, 81.8 vs 83.7, 146.0 vs 152.5,
+290.7 vs 293.4), so ~4–9% of the transfer really is absorbed, against an epilogue
+cost of ~4 µs. This is the `G₀/C₀` bound moving in the right direction for the
+reason *The bound fusing runs into* gives: a 2.2x larger GEMM is 2.2x more
+compute to hide behind, and it is the only lever besides `K` and `world`.
+
+**`fused-lsa` gets much worse, and fp32 makes it dramatically worse** — 616.4
+against `split-sdma`'s 427.6, 44% behind. Its epilogue pushes `world` copies of
+every output element through the CUs while they are also running MFMAs, so
+doubling the element width doubles exactly the traffic that was already the
+problem.
+
+### Cross-check against the plan document's FP32 baseline
+
+A.4's row for this exact configuration (`wkv_gate-r4`, 16384 tokens over 8
+ranks, FP32) is `torch.matmul` 107.2 µs + RCCL all-gather 339.2 µs = 415.0 µs.
+
+| | A.4 (`torch.matmul` + RCCL) | this operator (bf16 MFMA + RCCL) |
+|---|---:|---:|
+| GEMM | 107.2 | 137.6 |
+| all-gather | 339.2 | 327.8 |
+| total | **415.0** | **462.9** |
+
+**The collective leg agrees to 3.4%**, which is the check that matters — it says
+the two measurements are of the same thing. **The GEMM does not: ours is 28%
+slower than `torch.matmul`.** That is a real gap and it is not explained away by
+the port being faithful; the kernel is simply untuned at this precision
+(`BLOCK_K` is pinned to the template's 64, `xcd_swizzle` is off, `waves_per_eu`
+is at its default, and no tile sweep has been run). Against mori's best transport
+the total is 427.6 against A.4's 415.0, so **at this shape the operator is not
+yet a win over `torch.matmul` + RCCL, and the deficit is entirely in the GEMM.**
+Tuning it is the next thing worth doing, ahead of any further epilogue work.
+
+### One intermittent failure, unresolved
+
+`fused-sdma --in-dtype bf16 --out-dtype bf16` at `M=2048` failed validation once
+during the sweep and has not reproduced since: **13 subsequent runs of that exact
+cell all passed**, so it stands at 1 in 14. The other 31 cells of the matrix
+validated first time.
+
+It is recorded rather than dismissed. `gemm_ar` shipped two real races behind
+one-shot checks that passed repeatedly, and this path is new on three axes at
+once (per-(chunk, lane) counter, lock-free lane posting, a different mainloop),
+so "did not reproduce in 13 tries" is not "is not there". Anyone taking this
+path to production should run the cell a few hundred times first; the
+`--chunks` ladder is the obvious place for a race to hide and was not swept on
+the bf16 path at all.
+
 ## The bound fusing runs into
 
 Separately from the per-packet cost above, there is a ceiling that no amount of
@@ -366,6 +478,13 @@ from the ue8m0 operand format rather than from this operator.
 ## Reproducing
 
 ```bash
+# the bf16 / fp32 path -- the model's own precision
+MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+  python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  benchmark/cco/flydsl/gemm_ag/bench_gemm_ag.py \
+  --mode split-sdma --in-dtype bf16 --out-dtype fp32 \
+  -m 2048 --out-dim 2048 -k 7168 --warmup 10 --iters 21 --phase-split
+
 # one cell
 MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
   python -m torch.distributed.run --standalone --nproc_per_node=8 \
@@ -388,6 +507,15 @@ pytest tests/python/cco/test_gemm_ag.py -k "not validates and not deterministic"
 `-n` is `--out-dim` here, not `-n`: `torchrun` takes `--nproc_per_node` and
 argparse's abbreviation matching makes a bare `-n` ambiguous against it.
 
+FlyDSL caches compiled kernels under `~/.flydsl/cache`, keyed on the
+`@flyc.jit` **wrapper**'s name rather than the kernel body — so editing a kernel
+and re-running can silently execute the previous build. While porting the bf16
+GEMM that made a fixed bug look unfixed and produced a thoroughly convincing
+false signal (odd `K_ITERS` bit-exact, even `K_ITERS` broken, which looks exactly
+like a double-buffer parity bug and was not one). **If a kernel edit appears to
+have no effect, move `~/.flydsl/cache/launch_*` aside before concluding
+anything.**
+
 `BUILD_CCO_SDMA=ON` **and** `MORI_ENABLE_SDMA=1` are required for the SDMA
 modes. Without the environment variable every put is a silent no-op — the run
 completes, the timing looks plausible because it is the GEMM plus a barrier, and
@@ -401,6 +529,12 @@ launches and retry a lost race rather than recording it.
 ## Not measured
 
 * Cross-node (GDA). Everything here is intra-node LSA/SDMA over xGMI.
+* **Tuning the bf16 GEMM.** `BLOCK_K` is pinned to the template's 64,
+  `xcd_swizzle` is off, `waves_per_eu` is at its default and no tile sweep has
+  been run. It is 28% behind `torch.matmul`, which is the single largest number
+  on the table and the one worth attacking first.
+* The bf16 path at the `r128` shape, at `--block-m 128`, under `--chunks > 1`,
+  or with `--post serial`. All are reachable; none were swept.
 * fp8 on the wire. This is the direction where it would help most — the
   operator is bandwidth-bound by construction and a 2x narrower wire moves the
   `G₀/C₀` ratio directly — and the `pull` direction is built so the dequantize

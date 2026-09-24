@@ -64,8 +64,9 @@ they are the whole of this file's difference from ``gemm_a2a/layout.py``:
    equal. ``gemm_a2a``'s LSA kernel reads strided and writes compact; this one
    does neither.
 
-The price is on the wire: a rank sends ``(world-1) * M * N * 2`` bytes, which is
-``world`` times what the all-to-all sends. All-gather is the bandwidth-bound
+The price is on the wire: a rank sends ``(world-1) * M * N * elem_bytes``
+bytes, which is ``world`` times what the all-to-all sends at the same shape and
+precision -- and twice that again when the output is fp32. All-gather is the bandwidth-bound
 member of the family, which is also why it is the one where a low-precision wire
 would pay the most.
 
@@ -146,7 +147,12 @@ class AgConfig:
     world_size: int
     m: int
     n: int
-    elem_bytes: int = 2  # bf16 output
+    #: Bytes per output element: 2 for a bf16 C, 4 for fp32. The fp8 GEMM only
+    #: ever emits bf16; the bf16 GEMM emits either, and the model's `wkv_gate`
+    #: wants fp32 -- which doubles everything downstream of here, the wire
+    #: included. Every offset below is derived from this, so it is the single
+    #: place the output precision enters the layout.
+    elem_bytes: int = 2
     block_m: int = DEFAULT_BLOCK_M
     block_n: int = DEFAULT_BLOCK_N
     threads: int = THREADS
@@ -387,6 +393,12 @@ class AgConfig:
             )
         if self.m < 1 or self.n < 1:
             raise ValueError(f"m and n must be positive, got m={self.m} n={self.n}")
+        if self.elem_bytes not in (2, 4):
+            raise ValueError(
+                f"elem_bytes must be 2 (bf16) or 4 (fp32), got {self.elem_bytes}: "
+                f"the copy kernels move whole {PACK_BYTES}-byte packs and index "
+                f"them in elements, which needs elem_bytes to divide {PACK_BYTES}"
+            )
         for name, value, granule in (
             ("block_m", self.block_m, TILE_M_GRANULE),
             ("block_n", self.block_n, DEFAULT_BLOCK_N),

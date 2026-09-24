@@ -104,7 +104,13 @@ from .layout import MAX_WORLD
 #: whatever the payload dtype. Indexing a bf16 pack in elements would stride
 #: four times too far.
 I32_PER_PACK = 4
-PACK_ELEMS_BF16 = 8
+
+#: Bytes in a pack. Elements per pack is ``PACK_BYTES // cfg.elem_bytes`` -- 8
+#: for a bf16 output, 4 for fp32 -- and is derived per config rather than fixed,
+#: because this operator now carries both. Only the *count* changes: the copy
+#: still moves 16 bytes per lane either way, which is what keeps the peer-side
+#: store fully contiguous.
+PACK_BYTES = 16
 
 #: Packs a push thread keeps in flight. See the module docstring: push has one
 #: load feeding world-1 stores, so without this the loop body is a load, a
@@ -228,12 +234,13 @@ def build_lsa_ag(
 
     start_off, flag_off = cfg.start_off, cfg.flag_off
 
-    if (m * n) % PACK_ELEMS_BF16:
+    pack_elems = PACK_BYTES // cfg.elem_bytes
+    if (m * n) % pack_elems:
         raise ValueError(
-            f"m*n={m * n} must be a multiple of {PACK_ELEMS_BF16} so a slab is a "
-            f"whole number of 16B packs"
+            f"m*n={m * n} must be a multiple of {pack_elems} so a slab is a "
+            f"whole number of {PACK_BYTES}B packs at elem_bytes={cfg.elem_bytes}"
         )
-    slab_packs = m * n // PACK_ELEMS_BF16
+    slab_packs = m * n // pack_elems
     stride = blocks * threads
     # Only push benefits; pull already has world-1 independent loads in flight.
     unroll = _pick_unroll(slab_packs, stride, unroll if direction == "push" else 1)
