@@ -100,6 +100,21 @@ jobs:
           echo "=== produced ==="
           ls -lh ${{ runner.temp }}/dist/
 
+      - name: Verify wheel contents
+        # Gate on the artifact itself, before anything installs it: a wheel built
+        # without Cython ships no mori/cco/cco*.so, yet `pip wheel` exits 0 and
+        # every downstream `import mori` still succeeds. This is the last point
+        # where that is cheap to catch and the only one before publish.
+        run: |
+          $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -v ${{ runner.temp }}/dist:/tmp/dist -w $GITHUB_WORKSPACE \
+            $IMAGE bash -c "
+              set -e
+              for whl in /tmp/dist/*.whl; do
+                python3 tools/verify_install.py --wheel \$whl
+              done
+            "
+
       - name: Retag PyPI wheels (manylinux platform tag)
         run: |
           mkdir -p ${{ runner.temp }}/dist-pypi
@@ -287,7 +302,7 @@ jobs:
           $CT exec $CONTAINER bash -c "
             pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
             pip install prettytable pytest
-            python3 -c 'import mori; print(\"mori \" + mori.__version__ + \" imported OK\")'
+            python3 $GITHUB_WORKSPACE/tools/verify_install.py
           "
 
       - name: MORI-EP (intranode)
@@ -605,7 +620,7 @@ jobs:
             set -e
             pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
             pip install prettytable
-            python3 -c 'import mori; print(\"mori \" + mori.__version__ + \" imported OK\")'
+            python3 $GITHUB_WORKSPACE/tools/verify_install.py
           "
 
       - name: Install wheel (node2)
@@ -615,7 +630,7 @@ jobs:
               set -e
               pip install $GITHUB_WORKSPACE/_wheels/amd_mori-*.whl
               pip install prettytable
-              python3 -c \"import mori; print(\\\"mori \\\" + mori.__version__ + \\\" imported OK\\\")\"
+              python3 $GITHUB_WORKSPACE/tools/verify_install.py
             '"
 
       # The IO benchmark runner defaults to the native C++ engine
@@ -915,6 +930,12 @@ jobs:
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:
+      # This job used to run off whatever an earlier job left in the workspace
+      # -- enough for `docker build -f docker/Dockerfile.dev .`, but not for
+      # tools/verify_install.py below, which a stale checkout would not have.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download PyPI wheel
         uses: actions/download-artifact@v4
         with:
@@ -929,10 +950,14 @@ jobs:
           $CT run --rm --network=host \
             --device=/dev/kfd --device=/dev/dri \
             -v ${{ runner.temp }}/pypi-wheel:/tmp/wheel:ro \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             $IMAGE bash -c "
+              set -e
+              for whl in /tmp/wheel/*.whl; do
+                python3 $GITHUB_WORKSPACE/tools/verify_install.py --wheel \$whl
+              done
               pip install /tmp/wheel/*.whl
-              python3 -c 'import mori; print(\"amd-mori-nightly \" + mori.__version__ + \" OK\")'
-              python3 -c 'from mori import ops; print(\"mori.ops OK\")'
+              python3 $GITHUB_WORKSPACE/tools/verify_install.py
             "
 
   # ── Stage 4: Publish to PyPI ───────────────────────────────────────────────

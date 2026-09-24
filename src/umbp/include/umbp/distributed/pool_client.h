@@ -467,8 +467,12 @@ class PoolClient {
   //
   // `tag` is the caller's key index; a failure comes back through
   // Transfer's failed_tags so one bad object does not fail the batch.
-  bool BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, void* dst,
-                                    size_t object_size, size_t tag,
+  // `dst` is a REF plus a base offset rather than a raw pointer so the arena
+  // caller can name the whole registered arena once instead of one ref per
+  // slice; see BuildContiguousToRangesItems for what that costs when it does
+  // not happen.
+  bool BuildRangesToContiguousItems(const std::vector<ObjectRange>& ranges, const TransferRef& dst,
+                                    uint64_t dst_base, size_t object_size, size_t tag,
                                     std::vector<TransferItem>* items);
   bool BuildContiguousToRangesItems(const TransferRef& src, uint64_t src_base, size_t object_size,
                                     const std::vector<ObjectRange>& ranges, size_t tag,
@@ -601,16 +605,99 @@ class PoolClient {
   // that misses locally would queue another pull of bytes already in flight.
   std::unordered_set<std::string> prefetch_inflight_;
 
-  // Serializes users of each caller-owned ranged scratch arena.  Only the remote
-  // half of a ranged operation takes one — keys served by this node's own medium
-  // never touch an arena and stay fully concurrent.
+  // One caller-owned ranged scratch buffer, split into equal shards that are
+  // leased independently.  Only the remote half of a ranged operation takes a
+  // shard — keys served by this node's own medium never touch an arena and stay
+  // fully concurrent.
   //
-  // Separate GET and PUT arenas each get their own mutex, so a remote ranged GET
-  // and a remote ranged PUT run concurrently instead of serializing on one lock
-  // — the load/offload overlap sglang's direct linker wants.  (Two same-kind ops
-  // still serialize on their arena's mutex.)
-  std::mutex ranged_get_scratch_mutex_;
-  std::mutex ranged_put_scratch_mutex_;
+  // Separate GET and PUT arenas, so a remote ranged GET and a remote ranged PUT
+  // run concurrently — the load/offload overlap sglang's direct linker wants.
+  //
+  // Why shards and not one lock: every rank on a node shares one standalone
+  // server process, hence one PoolClient and one arena.  With a single mutex TP8
+  // made 7 of 8 remote ranged GETs wait, measured at 84–87% of call time (`lock=`
+  // in the UMBP_RANGED_CALL_DEBUG summary).  Shards split the SAME allocation, so
+  // a larger count means smaller shards and more arena rounds per call — raise
+  // UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES alongside it.
+  class ScratchArena {
+   public:
+    // Non-owning: the buffer belongs to the caller (DistributedClient).  A shard
+    // count of 0 or 1 keeps the original single-arena behaviour.
+    void Reset(void* base, size_t bytes, size_t shards);
+    size_t ShardBytes() const { return shard_bytes_; }
+
+    // Holds a shard for its lifetime and gives it back on destruction, so every
+    // early exit out of an arena loop releases it.
+    class Lease {
+     public:
+      Lease() = default;
+      Lease(ScratchArena* owner, size_t index, size_t count, char* base)
+          : owner_(owner), index_(index), count_(count), base_(base) {}
+      Lease(const Lease&) = delete;
+      Lease& operator=(const Lease&) = delete;
+      Lease(Lease&& other) noexcept { *this = std::move(other); }
+      Lease& operator=(Lease&& other) noexcept {
+        if (this != &other) {
+          if (owner_ != nullptr) owner_->Release(index_, count_);
+          owner_ = other.owner_;
+          index_ = other.index_;
+          count_ = other.count_;
+          base_ = other.base_;
+          other.owner_ = nullptr;
+          other.base_ = nullptr;
+        }
+        return *this;
+      }
+      ~Lease() {
+        if (owner_ != nullptr) owner_->Release(index_, count_);
+      }
+      char* base() const { return base_; }
+
+     private:
+      ScratchArena* owner_ = nullptr;
+      size_t index_ = 0;
+      size_t count_ = 0;
+      char* base_ = nullptr;
+    };
+
+    // Blocks until a shard is free, and until no AcquireAll is queued.  Empty
+    // lease if Reset never got a usable buffer; the caller rejects that upstream.
+    Lease Acquire();
+
+    // Blocks until EVERY shard is free, then leases the whole buffer.  Sharding
+    // must not shrink what a call can serve, so a call needing more than a shard
+    // takes the arena exclusively rather than failing.
+    Lease AcquireAll();
+
+   private:
+    void Release(size_t index, size_t count);
+    // Drop an admitted waiter from the arrival queue.
+    void Forget(uint64_t ticket);
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    // One arrival-ordered queue of everything not yet admitted, which is what
+    // makes both directions starvation-free:
+    //   * a shard waiter enters once no EXCLUSIVE waiter arrived ahead of it
+    //     and a shard is free -- so consecutive shard waiters still run
+    //     concurrently, which is the whole point of sharding;
+    //   * an exclusive waiter enters once it is the oldest waiter of EITHER
+    //     kind and every shard is free.
+    // Each is then blocked only by arrivals older than itself, and those are
+    // finite, so neither side can be passed over indefinitely.  Recording only
+    // one of the two kinds gets this wrong in whichever direction is left
+    // invisible.  An uncontended Acquire never touches the queue.
+    uint64_t next_ticket_ = 0;
+    std::deque<std::pair<uint64_t, bool>> waiters_;  // (ticket, is_exclusive)
+    std::vector<char*> bases_;
+    // Not vector<bool>: this is written under the mutex and read by index, and
+    // the proxy-reference specialisation buys nothing at these sizes.
+    std::vector<uint8_t> busy_;
+    size_t shard_bytes_ = 0;
+  };
+
+  ScratchArena ranged_get_scratch_;
+  ScratchArena ranged_put_scratch_;
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;

@@ -260,6 +260,15 @@ static_assert(EpScaleAlign % kTdmRowBytes == 0,
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
+// The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
+// moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
+// memory the ranks share by IPC handle, and binds args.tokOffPeers; otherwise it is
+// the window's offTokOff. Same word, same protocol -- only the memory differs.
+__device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
+  return args.tokOffPeers != nullptr ? args.tokOffPeers[pe]
+                                     : EpPeer<index_t>(args.window, pe, args.offTokOff);
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -297,6 +306,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // an fp8 payload would otherwise shrink the slab exactly when the metadata got
   // bigger. EpDispatch1250xSlabBytes owns that decision; both tiles must agree.
   constexpr int kSlabBytes = EpDispatch1250xSlabBytes(kCfg);
+  constexpr int kMetaSlabBytes = EpDispatch1250xMetaSlabBytes(kCfg);
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
@@ -375,7 +385,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     index_t n = s_N[p];
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
-      s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
+      s_base[p] = __hip_atomic_fetch_add(EpTokOff(args, p), n,
                                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
@@ -484,6 +494,48 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
   __syncthreads();
 
+  int _pfN = 0;
+  index_t _pfSlot0 = 0;
+  T* _pfDst = nullptr;
+  bool _pfSent = false;
+  {
+    constexpr int _pfTokB = kCfg.hiddenDim * (int)sizeof(T);
+    constexpr bool _pfFp4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * _pfTokB;
+    constexpr int _pfPack = _pfFp4 ? 4 : 1;
+    constexpr bool _pfGeom = _pfFp4 && npes == 4 && (kCfg.warpPerBlock % 4) == 0;
+    if constexpr (_pfGeom) {
+      if (args.tokenIndices && args.inpTokenBuf) {
+        const int _pfPe = warpId & 3;
+        const int _pfUnit = warpId >> 2;
+        constexpr int _pfUnits = kCfg.warpPerBlock / 4;
+        const index_t _pfAll = s_N[_pfPe];
+        if (_pfAll > 0) {
+          const index_t _pfPart = _pfAll / (index_t)_pfUnits;
+          const index_t _pfRem = _pfAll - _pfPart * (index_t)_pfUnits;
+          const index_t _pfCnt = _pfPart + (((index_t)_pfUnit < _pfRem) ? (index_t)1 : (index_t)0);
+          const index_t _pfBase = s_base[_pfPe] + (index_t)_pfUnit * _pfPart +
+                                  (((index_t)_pfUnit < _pfRem) ? (index_t)_pfUnit : _pfRem);
+          if (_pfCnt > 0 && _pfCnt <= (index_t)_pfPack && kMetaSlabBytes > 0) {
+            int _pfn = (int)_pfCnt;
+            if (_pfn > _pfPack) _pfn = _pfPack;
+            const T* const _pfSrc = reinterpret_cast<const T*>(args.inpTokenBuf);
+            const index_t* const _pfMap = _cusplit_stgSrc + (size_t)_pfPe * _stgCap;
+#pragma unroll
+            for (int k = 0; k < _pfPack; ++k) {
+              if (k < _pfn) {
+                const int _pfTok = (int)_pfMap[_pfBase + k] % kCfg.maxTokPerRank;
+                TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim,
+                                _pfSrc + (size_t)_pfTok * hiddenDim, _tdmG1);
+              }
+            }
+            _pfN = _pfn;
+            _pfSlot0 = _pfBase;
+            _pfDst = EpPeer<T>(win, _pfPe, args.offDispOut);
+          }
+        }
+      }
+    }
+  }
   bool _mPend = false;
   if (args.tokenIndices && args.inpTokenBuf) {
     const int tkM = topk;
@@ -497,9 +549,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // 128B of slack per field region for the rounding below.
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
-      uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
+      uint8_t* _m4 =
+          (kMetaSlabBytes > 0)
+              ? (reinterpret_cast<uint8_t*>(_tdmBatchSmem) +
+                 (size_t)kCfg.warpPerBlock * kSlabBytes + (size_t)warpId * kMetaSlabBytes)
+              : (reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM);
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
-      const int split = (aWarps > 0 && args.numTokens <= (index_t)aWarps * 2) ? 1 : _peerSplit;
+      const int split = _peerSplit;
       const int nRuns = npes * split;
       for (int r = warpId; r < nRuns; r += warpNum) {
         int peer = r / split;
@@ -585,6 +641,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             if (spW.body) TdmIssueStore<int>(reinterpret_cast<int*>(dW + spW.head), tW, gW);
             if (spR.body) TdmIssueStore<int>(reinterpret_cast<int*>(dR + spR.head), tR, gR);
             if (spS.body) TdmIssueStore<int>(reinterpret_cast<int*>(dS + spS.head), tS, gS);
+            if (!_pfSent && _pfN > 0 && _pfDst != nullptr) {
+              const int _mTokB = (int)(hiddenDim * sizeof(T));
+              TdmIssueStore<int>(
+                  reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
+                  reinterpret_cast<int*>(_tdmTile), TdmShape<int>(_pfN * (_mTokB / 4)));
+              _pfSent = true;
+            }
             _mPend = true;
           }
         }
@@ -625,39 +688,82 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
   }
-  if (_mPend) {
-    __builtin_amdgcn_s_wait_tensorcnt(0);
-  }
+  __builtin_amdgcn_s_wait_tensorcnt(0);
 
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
-      for (int _sub = 0; _sub < _etpi; ++_sub) {
-        int tok = tokBase + _sub;
-        if (tok >= args.numTokens) break;
-        index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
-                                         : EpNullFlat<kCfg>();
-        index_t peMe = EpPeFromFlat<kCfg>(flatMe);
-        int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
-        if (!__any(validMe)) continue;
-        TdmIssueLoad<T>(_tdmTile,
-                        reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
-                        _tdmG1);
-        bool loadWaited = false;
-        unsigned long long _vm = __ballot(validMe);
-        while (_vm) {
-          int l = __ffsll((long long)_vm) - 1;
-          _vm &= _vm - 1;
-          index_t flat = __shfl(flatMe, l);
-          index_t destPe = EpPeFromFlat<kCfg>(flat);
-          index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
-          if (!loadWaited) {
-            __builtin_amdgcn_s_wait_tensorcnt(0);
-            loadWaited = true;
+    constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
+    constexpr bool kFp4Pack4 =
+        kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
+    constexpr int kPack = kFp4Pack4 ? 4 : 1;
+    static_assert(!kFp4Pack4 || kTokB % 128 == 0,
+                  "each packed FP4 token must occupy whole TDM rows");
+    static_assert(!kFp4Pack4 || kPack * kTokB <= kSlabBytes,
+                  "four FP4 tokens must fit in the per-warp LDS slab");
+    constexpr bool kUnitGeom = kFp4Pack4 && npes == 4 && (kCfg.warpPerBlock % 4) == 0;
+    if constexpr (kUnitGeom) {
+      const int destPe = warpId & 3;
+      const int unit = warpId >> 2;
+      constexpr int nUnits = kCfg.warpPerBlock / 4;
+      const index_t cntAll = s_N[destPe];
+      if (cntAll > 0) {
+        const index_t part = cntAll / (index_t)nUnits;
+        const index_t rem = cntAll - part * (index_t)nUnits;
+        const index_t myCnt = part + (((index_t)unit < rem) ? (index_t)1 : (index_t)0);
+        const index_t myBase = s_base[destPe] + (index_t)unit * part +
+                               (((index_t)unit < rem) ? (index_t)unit : rem);
+        T* const dst = EpPeer<T>(win, destPe, args.offDispOut);
+        const T* const src = reinterpret_cast<const T*>(args.inpTokenBuf);
+        const index_t* const srcMap = _cusplit_stgSrc + (size_t)destPe * _stgCap;
+        const index_t _iStart = _pfSent ? (index_t)kPack : (index_t)0;
+        for (index_t i = _iStart; i < myCnt; i += kPack) {
+          int n = (int)(myCnt - i);
+          if (n > kPack) n = kPack;
+          const index_t slot0 = myBase + i;
+#pragma unroll
+          for (int k = 0; k < kPack; ++k) {
+            if (k < n) {
+              const int srcTok = (int)srcMap[slot0 + k] % kCfg.maxTokPerRank;
+              TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim,
+                              src + (size_t)srcTok * hiddenDim, _tdmG1);
+            }
           }
-          T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
-          TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+          TdmIssueStore<int>(reinterpret_cast<int*>(dst + (size_t)slot0 * hiddenDim),
+                             reinterpret_cast<int*>(_tdmTile),
+                             TdmShape<int>(n * (kTokB / 4)));
+          __builtin_amdgcn_s_wait_tensorcnt(0);
         }
-        __builtin_amdgcn_s_wait_tensorcnt(0);
+      }
+    } else {
+      for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
+        for (int _sub = 0; _sub < _etpi; ++_sub) {
+          int tok = tokBase + _sub;
+          if (tok >= args.numTokens) break;
+          index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
+                                           : EpNullFlat<kCfg>();
+          index_t peMe = EpPeFromFlat<kCfg>(flatMe);
+          int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
+          if (!__any(validMe)) continue;
+          TdmIssueLoad<T>(_tdmTile,
+                          reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
+                          _tdmG1);
+          bool loadWaited = false;
+          unsigned long long _vm = __ballot(validMe);
+          while (_vm) {
+            int l = __ffsll((long long)_vm) - 1;
+            _vm &= _vm - 1;
+            index_t flat = __shfl(flatMe, l);
+            index_t destPe = EpPeFromFlat<kCfg>(flat);
+            index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
+            if (!loadWaited) {
+              __builtin_amdgcn_s_wait_tensorcnt(0);
+              loadWaited = true;
+            }
+            T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
+            TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
+          }
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+        }
       }
     }
   }
@@ -679,8 +785,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // and its address depends only on destPe, so it needs nothing the barrier gives.
   unsigned drainTicket = kNoTicket;
   if (isFirstArriver) {
-    for (int destPe = laneId; destPe < npes; destPe += WS)
-      EpWaitEq(EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe, (index_t)0);
     __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     if (laneId == 0) drainTicket = atomicAdd(args.gridBarrier, 1u);
     drainTicket = (unsigned)__shfl((int)drainTicket, 0);
@@ -722,7 +826,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
     if (laneId == 0) {
       *args.totalRecvTokenNum = myRecv;
-      EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+      EpTokOff(args, args.rank)[0] = 0;
     }
   }
 }
