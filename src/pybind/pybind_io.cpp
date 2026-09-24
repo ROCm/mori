@@ -45,6 +45,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("RDMA", mori::io::BackendType::RDMA)
       .value("TCP", mori::io::BackendType::TCP)
       .value("FABRIC", mori::io::BackendType::FABRIC)
+      .value("OFI", mori::io::BackendType::OFI)
       .export_values();
 
   py::enum_<mori::io::MemoryLocationType>(m, "MemoryLocationType")
@@ -103,6 +104,14 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readwrite("num_streams", &mori::io::FabricBackendConfig::numStreams)
       .def_readwrite("num_events", &mori::io::FabricBackendConfig::numEvents);
 
+  py::class_<mori::io::OfiBackendConfig, mori::io::BackendConfig>(m, "OfiBackendConfig")
+      .def(py::init<>())
+      .def(py::init<const std::string&, int>(), py::arg("provider"), py::arg("cq_batch") = 64)
+      .def_readwrite("provider_hint", &mori::io::OfiBackendConfig::providerHint)
+      .def_readwrite("cq_read_batch", &mori::io::OfiBackendConfig::cqReadBatch)
+      .def_readwrite("mr_access_flags", &mori::io::OfiBackendConfig::mrAccessFlags)
+      .def_readwrite("threading_model", &mori::io::OfiBackendConfig::threadingModel);
+
   // Allocate/free GPU memory that is exportable over a UALink super-node fabric.
   // Returns the device pointer as an integer, suitable for register_memory().
   m.def(
@@ -142,6 +151,15 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("host", &mori::io::EngineDesc::host)
       .def_readonly("port", &mori::io::EngineDesc::port)
       .def_readonly("pid", &mori::io::EngineDesc::pid)
+      .def_property_readonly("backend_descs",
+                             [](const mori::io::EngineDesc& d) {
+                               py::dict out;
+                               for (const auto& [type, blob] : d.backendDescs) {
+                                 out[py::int_(static_cast<uint32_t>(type))] = py::bytes(
+                                     reinterpret_cast<const char*>(blob.data()), blob.size());
+                               }
+                               return out;
+                             })
       .def(pybind11::self == pybind11::self)
       .def("pack",
            [](const mori::io::EngineDesc& d) {

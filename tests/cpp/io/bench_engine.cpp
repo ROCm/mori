@@ -466,7 +466,7 @@ void PrintUsage(const char* argv0) {
       "\n"
       "Workload:\n"
       "  --op <write|read>        transfer direction (default: write)\n"
-      "  --backend <rdma|xgmi|fabric>  (default: rdma; fabric = UALink scale-up vPOD)\n"
+      "  --backend <rdma|xgmi|fabric|ofi>  (default: rdma; fabric = UALink scale-up vPOD; ofi = OpenFabrics Interfaces)\n"
       "  --buffer-size N          message size in bytes when not sweeping (default: 32768)\n"
       "  --transfer-batch-size N  transfers per iteration (default: 1)\n"
       "  --enable-batch-transfer  one N-descriptor batch request per iteration (default)\n"
@@ -644,8 +644,8 @@ void ValidateArgs(Args& a) {
   if (a.rank != 0 && a.rank != 1) {
     throw std::invalid_argument("--rank must be 0 (initiator) or 1 (target)");
   }
-  if (a.backend != "rdma" && a.backend != "xgmi" && a.backend != "fabric") {
-    throw std::invalid_argument("--backend must be rdma, xgmi or fabric (got " + a.backend + ")");
+  if (a.backend != "rdma" && a.backend != "xgmi" && a.backend != "fabric" && a.backend != "ofi") {
+    throw std::invalid_argument("--backend must be rdma, xgmi, fabric or ofi (got " + a.backend + ")");
   }
   if (a.op != "read" && a.op != "write") {
     throw std::invalid_argument("--op must be read or write (got " + a.op + ")");
@@ -753,17 +753,20 @@ size_t PlanBufferBytes(const Args& a, const std::vector<std::pair<size_t, int>>&
 // FABRIC over UALink between hosts in one vPOD, so both take stream/event depth
 // rather than QPs and chunking. The RDMA-only flags are simply unused there.
 void CreateBackendFor(IOEngine& engine, const Args& a) {
-  if (a.backend == "xgmi" || a.backend == "fabric") {
+  if (a.backend == "xgmi" || a.backend == "fabric" || a.backend == "ofi") {
     if (a.backend == "xgmi") {
       XgmiBackendConfig xgmiCfg{};
       xgmiCfg.numStreams = a.num_streams;
       xgmiCfg.numEvents = a.num_events;
       engine.CreateBackend(BackendType::XGMI, xgmiCfg);
-    } else {
+    } else if (a.backend == "fabric") {
       FabricBackendConfig fabricCfg{};
       fabricCfg.numStreams = a.num_streams;
       fabricCfg.numEvents = a.num_events;
       engine.CreateBackend(BackendType::FABRIC, fabricCfg);
+    } else if (a.backend == "ofi") {
+      OfiBackendConfig ofiCfg{"cxi", 64};
+      engine.CreateBackend(BackendType::OFI, ofiCfg);
     }
     return;
   }
