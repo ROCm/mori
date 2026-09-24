@@ -56,8 +56,10 @@ they are the whole of this file's difference from ``gemm_a2a/layout.py``:
 
 1. **There is no staging region.** The GEMM writes straight into this rank's own
    ``recv`` slot, and that slab is pushed unchanged. Nothing is ever re-laid-out.
-2. **Counters are per chunk, not per (destination, chunk).** A chunk completing
-   arms every destination's push at once, because they all get the same bytes.
+2. **A chunk completing arms every destination's push at once**, because they
+   all get the same bytes -- so, unlike the all-to-all, there is nothing to
+   decide per destination. (The counter region is still ``world`` wide per
+   chunk, but for a different reason: see ``counter_set_bytes``.)
 3. **The copy is flat on both sides.** Source index and destination index are
    equal. ``gemm_a2a``'s LSA kernel reads strided and writes compact; this one
    does neither.
@@ -156,9 +158,10 @@ class AgConfig:
     #: **M**, so a chunk is a contiguous byte range of ``[M, N]``.
     #:
     #: Note the transpose against gemm_a2a: there a chunk is contiguous inside
-    #: one destination's slab and there are ``world * chunks`` counters; here a
-    #: chunk is contiguous inside the single slab every destination receives,
-    #: and there are ``chunks``.
+    #: one destination's slab, and here it is contiguous inside the single slab
+    #: every destination receives. The counter geometry is the same shape in
+    #: both (``world * chunks``) but for different reasons -- see
+    #: ``counter_set_bytes``.
     counter_chunks: int = 1
     #: Chunks the counter *region* is sized for, as opposed to the number this
     #: config uses. Same rationale as gemm_ar and gemm_a2a: ``counter_chunks``
@@ -274,13 +277,29 @@ class AgConfig:
 
     @property
     def counter_region_off(self) -> int:
-        """Monotonic tile counters for the fused GEMM, one per chunk."""
+        """Monotonic tile counters for the fused GEMM, one per (chunk, lane)."""
         return _align_up(self.flag_off + self.max_blocks * 4, SIGNAL_ALIGN)
 
     @property
     def counter_set_bytes(self) -> int:
-        """No ``world_size`` factor -- see ``counter_chunks``."""
-        return self.counter_capacity_eff * 4
+        """``world_size`` per chunk, and the reason is the *posting*, not the
+        counting.
+
+        A broadcast chunk arms every destination at once, so one counter per
+        chunk would be enough to *decide*. But the thread that won a single
+        counter would then have to tell ``world-2`` other lanes that it won,
+        and broadcasting one dword through LDS costs a barrier and a copy atom.
+        One counter per (chunk, lane) instead: every block increments all
+        ``world-1`` of them in a single instruction, they cross the threshold
+        together, and each lane learns from its own atomic that its block won.
+        That is what lets ``world-1`` packets be issued at once rather than
+        back to back -- see ``kernels_fused``.
+
+        The slot is ``chunk * world_size + lane``, and lane ``world_size-1`` is
+        never used (a rank does not post to itself). Sizing by ``world_size``
+        rather than ``world_size-1`` keeps the index a shift.
+        """
+        return self.world_size * self.counter_capacity_eff * 4
 
     @property
     def counter_off(self) -> int:
@@ -297,13 +316,20 @@ class AgConfig:
 
     @property
     def lock_off(self) -> int:
-        """One submit lock per destination, for the fused epilogue.
+        """Submit locks for the fused epilogue's ``post="serial"`` path only.
 
-        Needed as soon as there is more than one chunk: the tile counter elects
-        one block per chunk, and that block posts to *every* destination's
-        queue, so two chunks electing at once collide on all of them rather than
-        on one. Shared across shapes -- a lock is taken and released inside one
-        kernel, so it carries nothing between calls.
+        There, one thread issues every destination's packet, so two chunks
+        electing at once collide on the queues and a single lock taken by a
+        single thread serialises them safely.
+
+        ``post="lanes"`` cannot use a lock at all: ``world-1`` lanes retire in
+        lockstep, so two waves each holding part of a lock set and spinning for
+        the rest could never reach their release. It separates the same
+        collision by queue instead (``chunk % sdma_queues``), which is why it
+        requires ``sdma_queues >= chunks``.
+
+        Shared across shapes -- a lock is taken and released inside one kernel,
+        so it carries nothing between calls.
         """
         return self.counter_region_off + self.counter_bytes
 

@@ -3,26 +3,33 @@
 Measurements for `mori.ops.gemm_ag`, the row-concatenating all-gather fused into
 the epilogue of mori's 8-wave fp8 GEMM.
 
-**Headline: at every shape measured here, fusing an all-gather is slower than
-not fusing it — and not because the fusion fails to overlap.** At
-`wkv_gate-r4 M=512`, `fused-sdma --chunks 4` cuts the exposed communication from
-50.6us to 20.8us, absorbing 59% of it. The transfer really is hidden. What
-happens instead is that *issuing* the puts roughly doubles the GEMM, from 52.8us
-to 105.8us, which is more than the 29.8us of communication it saved.
+**Headline: fusing an all-gather does not beat not fusing it, at any shape
+measured here.** The best fused configuration (`fused-sdma --chunks 1 --post
+lanes`) lands at 105.5us against `split-sdma`'s 104.1 at `r4 M=512`, and 217.2
+against 210.5 at `M=2048`. The split paths themselves are worth having — they
+beat RCCL by 10–25% — but the epilogue is not.
 
-So there are two separate findings here and they should not be conflated:
+Getting to that statement took two rounds, and the first round's explanation was
+wrong in an instructive way:
 
-* a **bound**, derived in *The bound fusing runs into*, which says all-gather has
-  less to gain from fusion than either sibling operator and gets worse as the
-  world grows; and
-* a **cost**, which `--no-put` and `--fence none` between them pin down: not
-  the release fence (that is free at these grid sizes, unlike in `gemm_a2a`) and
-  not bookkeeping, but the 39–55us the epilogue spends *issuing* its SDMA puts
-  one thread at a time. That one is an engineering target, not a law, and
-  *Reading the tables* says what the fix is.
+* The epilogue as first written issued a chunk's `world-1` SDMA packets back to
+  back from one thread, which cost the GEMM **39–55us** — SDMA's ~2us per packet,
+  reproduced here by being flat across payloads differing 8x. `--post lanes`
+  issues them from `world-1` lanes instead and removes that entirely: the fused
+  GEMM phase goes flat at 57–72us across every chunk count, against 105–169 for
+  the serial form. See *`--post lanes`*.
+* That fix also **invalidated the first round's headline claim.** With serial
+  posting the drain looked like it was shrinking as chunks grew — read as the
+  fusion absorbing 25–59% of the communication. It was not: the GEMM was stalled
+  posting, the copy engines got a head start, and the phase split booked that as
+  absorbed comm. With the posting fixed the drain stops shrinking and starts
+  growing, and the real overlap at the best setting is about 5%.
 
-The operator is worth having today for its split paths, which beat RCCL. The
-fused paths are documented as measured, not as hoped for.
+What is left is small, understood, and mostly structural: ~10us of epilogue
+bookkeeping against ~7.5us of genuine early-start on the wire, under a ceiling
+derived in *The bound fusing runs into* that is 27% at `M=2048` and falls as the
+world grows. **The lever worth pulling next is a narrower wire, not a better
+epilogue.**
 
 ## What the operator is
 
@@ -103,7 +110,8 @@ collective kernel to split against, so only its total is shown.
 | `split-lsa-pull` | 103.4 | 52.3 | 51.0 | 217.9 | 56.1 | 158.0 |
 | `split-sdma` | 105.3 | 52.8 | 50.6 | **211.2** | 56.6 | 153.9 |
 | `fused-lsa` | 114.6 | — | — | 268.2 | — | — |
-| `fused-sdma` `c4` | 127.2 | 105.8 | 20.8 | 235.4 | 117.2 | 115.4 |
+| `fused-sdma` `c4` `serial` | 127.2 | 105.8 | 20.8 | 235.4 | 117.2 | 115.4 |
+| `fused-sdma` `c1` `lanes` | 105.5 | 57.4 | 44.7 | 217.2 | 66.6 | 146.6 |
 
 ### wkv_gate ratio-128 — `N=1024` — 7 MiB/rank at M=512, 28 at M=2048
 
@@ -118,13 +126,14 @@ multiple of `world*block_n = 2048`.
 | `split-lsa-pull` | 77.7 | 40.0 | 37.8 | 143.5 | 52.9 | 87.6 |
 | `split-sdma` | 77.6 | 40.3 | 34.3 | 140.5 | 53.0 | 87.5 |
 | `fused-lsa` | 87.6 | — | — | 154.9 | — | — |
-| `fused-sdma` `c4` | 108.3 | 88.3 | 17.3 | 162.0 | 108.1 | 53.7 |
+| `fused-sdma` `c4` `serial` | 108.3 | 88.3 | 17.3 | 162.0 | 108.1 | 53.7 |
 
 ### Where the fused epilogue's time goes
 
 `--no-put` runs the whole epilogue — the release fence, the completion counter,
 the submit lock — and simply does not post, so it prices the bookkeeping apart
-from the transfer. `--fence none` drops the release.
+from the transfer. `--fence none` drops the release. Both are measured against
+`--post serial`, the original epilogue.
 
 | cell | split `gemm` | fused `gemm` | `--no-put` `gemm` | bookkeeping | the puts |
 |---|---:|---:|---:|---:|---:|
@@ -138,6 +147,53 @@ cell. **The release fence is not the cost here**, which is worth saying because
 `gemm_a2a` calls it "the single most expensive line in this epilogue". The
 difference is grid size: a2a's fused path at M=16384 has 9216 blocks each doing
 a whole-L2 writeback, and these cells have 32 to 128.
+
+### `--post lanes`: issuing the packets concurrently
+
+The 39–55us above is `world-1` SDMA packets issued back to back by one thread,
+at SDMA's ~2us each. `--post lanes` gives each of lanes `0..world-2` one packet.
+It needs one change to make that possible: a counter per `(chunk, lane)` rather
+than one per chunk, so each lane learns from **its own** atomic that its block
+won and no broadcast is needed. It also drops the submit lock — `world-1` lanes
+retire in lockstep, so two waves each holding part of a lock set could never
+reach their release — and separates concurrent chunks by queue instead, which is
+why it requires `sdma_queues >= chunks`.
+
+`--quant ptpc`, `r4` (`N=2048 K=7168`), `us` as total / GEMM phase / drain:
+
+| | M=512 serial | M=512 **lanes** | M=2048 serial | M=2048 **lanes** |
+|---|---|---|---|---|
+| `split-sdma` | 104.1 / 52.6 / 51.4 | — | 210.5 / 56.4 / 154.1 | — |
+| `c1` | 113.1 / 67.4 / 45.7 | **105.5** / 57.4 / 44.7 | 224.1 / 77.1 / 145.1 | **217.2** / 66.6 / 146.6 |
+| `c2` | 115.5 / 81.1 / 34.3 | 112.9 / 57.9 / 55.0 | 227.5 / 89.9 / 137.4 | 227.0 / 66.7 / 160.3 |
+| `c4` | 125.9 / 105.9 / 19.7 | 128.3 / 59.8 / 64.7 | 233.5 / 116.0 / 116.2 | 243.7 / 68.5 / 172.3 |
+| `c8` | 126.2 / 105.2 / 21.0 | 124.3 / 60.4 / 63.2 | 248.9 / 168.8 / 79.8 | 265.0 / 71.9 / 188.5 |
+
+**It does exactly what it was meant to.** The fused GEMM phase goes flat: 57.4 →
+60.4 across `c1..c8` at M=512 and 66.6 → 71.9 at M=2048, where serial climbs to
+105.2 and 168.8. At `M=2048 c8` that is **−96.9us of GEMM time**, and the whole
+39–55us penalty is gone at every chunk count. Best total improves 113.1 → 105.5
+(−6.7%) and 224.1 → 217.2 (−3.1%).
+
+**And it still does not beat `split-sdma`** — 105.5 against 104.1, and 217.2
+against 210.5. Two things are now visible that the serial numbers hid:
+
+* **The "absorbed communication" in the serial rows was largely an artifact.**
+  Serial's drain shrinks with chunk count (145.1 → 79.8 at M=2048) because its
+  GEMM was stalled ~100us posting, which gave the copy engines a head start that
+  the phase split books as absorbed comm. With the posting fixed, the drain
+  stops shrinking and starts *growing* (146.6 → 188.5). The earlier claim that
+  `fused-sdma` absorbs 25–59% of the transfer does not survive this: at `c1`,
+  the only configuration that wins, the real overlap is 154.1 → 146.6, about 5%.
+* **SDMA's ~2us per packet does not disappear when the packets are issued
+  concurrently — it moves from the issue side to the wire.** At `M=2048 c8`
+  there are `8 * 7 = 56` packets of 1 MiB each, and the drain is 188.5us against
+  `c1`'s 146.6 for exactly the same bytes. Chunking an all-gather multiplies the
+  packet count by `world-1` per chunk, because every peer gets the same slab.
+
+So the remaining gap at the best setting is small and fully accounted for: about
+10us of epilogue bookkeeping (GEMM 66.6 against `split-sdma`'s 56.4) against
+about 7.5us of genuine early-start on the wire.
 
 ### The all-gather quantisation matrix
 
@@ -155,9 +211,10 @@ relL2 1.66e-3.
 | `split-sdma` | 212.5 | 245.4 | 242.2 |
 | `fused-sdma` `c1` | 223.6 | 259.1 | 250.7 |
 
-`fused-sdma` chunk ladder at ptpc, three launches each, spread under 1.1%:
-`c1` 223.6, `c2` 227.2, `c4` 235.2, `c8` 249.2. Monotone the wrong way, for the
-reason the next section gives.
+All twelve `fused-sdma --post lanes` cells (three quantisations x `--chunks
+{1,2,4,8}`) validate at the same relL2 as every other mode, so the counter
+change that made lane-parallel posting possible is exercised across the matrix
+and not only on the default.
 
 ## Reading the tables
 
@@ -182,32 +239,23 @@ would want its dequantize — in registers on the consumer, which is where
 `gemm_ar` measured it as free against a 61.0us widen kernel. That trade is now
 quantified: choosing pull for the sake of a cheap dequantize starts 2–29% behind.
 
-**`fused-sdma` genuinely overlaps.** It cuts the exposed communication by 25–59%
-at every cell, which is the mechanism working as designed — better, in fraction,
-than `gemm_ar`'s all-reduce absorbs.
+**Issuing the puts cost the GEMM 39–55us, and that is fixed.** The figure was
+nearly constant across four cells whose payloads differ by 8x, which ruled out
+DMA bandwidth contention and pointed at a fixed per-packet cost — `gemm_ar`'s
+layout gives the constant independently, SDMA at *"~2us per packet regardless of
+size"*. `--post lanes` issues them concurrently and the penalty is gone; the
+table in *`--post lanes`* has the before and after.
 
-**And it loses anyway, because issuing the puts costs the GEMM 39–55us.** That
-figure is nearly constant across four cells whose payloads differ by 8x, which
-rules out DMA bandwidth contention and points at a fixed per-packet cost. At
-`--chunks 4` and `world=8` the epilogue posts `4 * 7 = 28` puts, so 39–55us is
-1.4–2.0us each — and `gemm_ar`'s layout gives the constant independently:
-SDMA is *"~2us per packet regardless of size"*.
+**Chunking still does not pay, but now for a different reason.** The ~2us per
+packet does not vanish when the packets are issued concurrently — it moves to
+the wire. Chunking an all-gather multiplies the packet count by `world-1` per
+chunk, because every peer receives the same slab, so `c8` at M=2048 puts 56
+packets of 1 MiB on the wire and the drain grows from 146.6us to 188.5us for
+identical bytes. `--chunks 1` is the best fused setting at every cell measured.
 
-**The 28 puts are issued serially by one thread, and they need not be.**
-`gemm_a2a` posts the same 28 from **28 different blocks** — its counter elects
-per `(destination, chunk)`, so an elected block owns one destination and posts
-exactly one put, and the 28 go out concurrently. That is why a2a measures its
-PUT at 0.8us total where this measures 39–55us. This operator's counter elects
-per chunk (a broadcast chunk arms every destination at once), so one thread
-posts all seven, under one submit lock, four times.
-
-That is the identified next step, and it is a change to the epilogue rather than
-to the design: elect on thread 0 as now, broadcast the election through LDS, and
-have lanes `0..world-2` of the elected wave each post one put on its own queue —
-which also removes the lock, since the collision the lock exists for is two
-chunks reaching the same queue. The chunk ladder going the wrong way
-(223.6 → 249.2 from `c1` to `c8`) is the same effect seen from the other end:
-more chunks means proportionally more serialised posts.
+**Which leaves the fused path at parity, not ahead.** About 10us of epilogue
+bookkeeping against about 7.5us of genuine early-start. Both are small, and the
+ceiling above them is 27% at M=2048 and falling with the world size.
 
 **`fused-lsa` is the slowest mode at every cell**, 8–26% behind its own split
 baseline. Its epilogue stores each tile `world` times from inside the GEMM, so
@@ -362,7 +410,14 @@ launches and retry a lost race rather than recording it.
 * `world != 8`. The `G₀/C₀` derivation says fusion gets *more* attractive as
   `world` falls, so 2 and 4 ranks are the regime where the fused paths might
   come back.
-* `--chunks` past 8, and the chunk ladder at anything but `r4 M=2048`.
+* `--chunks` past 8. `--post lanes` derives `sdma_queues = max(1, chunks)`, and
+  `gemm_a2a` records `hsaKmtCreateQueueExt` starting to fail once a process asks
+  for `world_size` queues per peer — `c8` already sits on that number and was
+  seen to lose the queue-creation race once in twelve back-to-back launches. It
+  succeeds with the settle the sweep drivers use, but `--chunks 1` is the best
+  setting anyway.
+* `--post lanes` at the `r128` shape and under the phase split at M other than
+  512/2048.
 * The 70B (`N=10240 K=8192`) and 405B (`N=18432 K=16384`) shapes, which
   `sweep_models.py` carries so this operator's table can be read against
   `gemm_a2a`'s on the same box. They are the high-`K` end, where the bound says

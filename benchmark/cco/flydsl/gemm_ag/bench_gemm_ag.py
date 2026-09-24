@@ -325,6 +325,11 @@ def run(args) -> int:
     # A chunk is a run of row tiles; the count has to divide them, and the
     # request is rounded down rather than rejected so a sweep stays usable.
     chunks = counter_chunks(args.m // args.block_m, args.chunks) if needs_sdma else 1
+    if args.mode == "fused-sdma" and args.post == "lanes" and chunks > 1:
+        # The lane-parallel epilogue has no submit lock, so two chunks of one
+        # destination are kept apart by queue instead. Derived, not a choice --
+        # compile_fused_gemm_ag rejects the combination otherwise.
+        args.sdma_queues = max(args.sdma_queues, chunks)
     cfg = ag_config(
         world_size=world_size,
         m=args.m,
@@ -393,6 +398,7 @@ def run(args) -> int:
                 fuse=fused,
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
+                post=args.post,
                 peer_uncached=(
                     pull_gemm or (args.peer_uncached and args.mode == "fused-lsa")
                 ),
@@ -632,6 +638,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="packs a split-lsa-push thread keeps in flight; ignored on pull, "
         "which has world-1 independent loads already",
+    )
+    p.add_argument(
+        "--post",
+        choices=("lanes", "serial"),
+        default="lanes",
+        help="how fused-sdma issues a chunk's world-1 packets: one per lane, "
+        "or all from thread 0 back to back (the original, kept for "
+        "attribution)",
     )
     p.add_argument("--sdma-queues", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)

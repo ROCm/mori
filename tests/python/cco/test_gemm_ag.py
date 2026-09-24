@@ -155,17 +155,20 @@ def test_m_must_be_whole_row_tiles_and_chunks_must_divide_them():
         layout.ag_config(**MODEL, counter_chunks=5)
 
 
-def test_counter_region_is_sized_by_chunks_alone():
-    """One counter per chunk, not per (destination, chunk).
+def test_counter_region_is_one_slot_per_chunk_and_lane():
+    """``world`` counters per chunk, sized for the *posting*, not the counting.
 
-    A chunk completing arms every destination's push at once, because they all
-    receive the same bytes. gemm_a2a needs ``world`` times as many because a
-    chunk of destination 0 says nothing about destination 1.
+    A broadcast chunk arms every destination at once, so one counter per chunk
+    would decide correctly -- and then the winning thread would have to tell
+    ``world-2`` other lanes, which costs a barrier and an LDS round trip for
+    one dword. A counter per (chunk, lane) lets each lane learn its own
+    election, which is what makes the ``world-1`` packets issue at once.
     """
     c = layout.ag_config(**MODEL, counter_chunks=4)
-    assert c.counter_set_bytes == 4 * 4
-    a2a_equivalent = 8 * 4 * 4
-    assert c.counter_set_bytes * 8 == a2a_equivalent
+    assert c.counter_set_bytes == 8 * 4 * 4
+    # Slot `chunk * world + lane` has to stay inside the set.
+    last = (4 - 1) * 8 + (8 - 1)
+    assert c.counter_off + (last + 1) * 4 <= c.lock_off
 
 
 @pytest.mark.parametrize(
