@@ -65,6 +65,23 @@ struct vmmProcessLock {
   std::lock_guard<std::recursive_mutex> guard{vmmProcessMutex()};
 };
 
+// Why a comm ended up with no SDMA queues. Outside the BUILD_CCO_SDMA guard on
+// purpose: the compiled-out build is the one that fails silently, so it is the
+// one that most needs to say so. ERROR, not WARN -- the default global level is
+// ERROR. Not fatal: a comm without SDMA is legal and every other path works.
+//
+// `asked` covers both ways of asking -- an explicit sdmaQueueCount and
+// MORI_ENABLE_SDMA -- because the count defaults to 0 and almost every caller
+// leaves it there. Nobody asking is the default configuration, and not wanting
+// SDMA is not an error, so that case stays silent.
+void ccoSdmaReportNoQueues(bool asked, int requestedChannels, const char* why) {
+  if (!asked) return;
+  MORI_SHMEM_ERROR(
+      "no SDMA queues will be created ({}; sdmaQueueCount={}): every ccoSdma put "
+      "on this comm will move no bytes",
+      why, requestedChannels);
+}
+
 void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
 #if BUILD_CCO_SDMA
   // Idempotent: first DevComm fixes the channel count; later ones reuse it.
@@ -85,23 +102,10 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     }
   }
   if (!(comm->ctx->IsSdmaEnabled() && anySdmaCapable)) {
-    // Say so when the caller *asked* for queues (sdmaQueueCount > 0; 0 means
-    // "whatever the env wants"). Leaving this silent is how a run ends up with
-    // every SDMA put posting to no queue: nothing fails, nothing is logged, and
-    // the only symptom is wrong data -- which reads as a model quality problem,
-    // not a transport one.
-    //
-    // ERROR rather than WARN because the default global level *is* ERROR, so a
-    // warning here would be invisible to exactly the person this is for. Not
-    // fatal, though: a comm with no SDMA is legal and every other path works.
-    if (requestedChannels > 0) {
-      MORI_SHMEM_ERROR(
-          "sdmaQueueCount={} requested but no SDMA queues will be created ({}): "
-          "every ccoSdma put on this comm will move no bytes",
-          requestedChannels,
-          !comm->ctx->IsSdmaEnabled() ? "MORI_ENABLE_SDMA is not set"
-                                      : "no peer reports SDMA capability");
-    }
+    bool envOn = comm->ctx->IsSdmaEnabled();
+    ccoSdmaReportNoQueues(
+        requestedChannels > 0 || envOn, requestedChannels,
+        !envOn ? "MORI_ENABLE_SDMA is not enabled" : "no peer reports SDMA capability");
     comm->sdmaNumQueue = 0;
     return;
   }
@@ -126,13 +130,22 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     for (int q = 0; q < comm->sdmaNumQueue; q++) {
       // anvil returns its own SdmaQueueDeviceHandle*; cco stores it as an opaque
       // ccoSdmaQueueDeviceHandle* (layout-compatible, byte-copied by sizeof).
-      auto* handle = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+      // getSdmaQueue returns null for a pair it never connected, or a channel
+      // past what that pair got; slot stays null rather than faulting here.
+      auto* queue = anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q);
+      if (queue == nullptr) {
+        MORI_SHMEM_ERROR("no SDMA queue for local peer {} channel {}; its puts move no bytes", lsa,
+                         q);
+        continue;
+      }
+      auto* handle = queue->deviceHandle();
       HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
                                   sizeof(handle), hipMemcpyHostToDevice));
     }
   }
 #else
-  (void)requestedChannels;
+  ccoSdmaReportNoQueues(requestedChannels > 0 || comm->ctx->IsSdmaEnabled(), requestedChannels,
+                        "this mori was built BUILD_CCO_SDMA=OFF");
   comm->sdmaNumQueue = 0;
 #endif  // BUILD_CCO_SDMA
 }
