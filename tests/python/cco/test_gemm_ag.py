@@ -39,6 +39,8 @@ import pytest
 import torch
 
 from mori.ops.gemm_ag import layout
+from mori.ops.gemm_ag import _gemm_a16w16_8wave as bf16gemm
+from mori.ops.gemm_ar import _gemm_a8w8_8wave as fp8gemm
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BENCH = REPO_ROOT / "benchmark" / "cco" / "flydsl" / "gemm_ag" / "bench_gemm_ag.py"
@@ -169,6 +171,79 @@ def test_counter_region_is_one_slot_per_chunk_and_lane():
     # Slot `chunk * world + lane` has to stay inside the set.
     last = (4 - 1) * 8 + (8 - 1)
     assert c.counter_off + (last + 1) * 4 <= c.lock_off
+
+
+@pytest.mark.parametrize("elem_bytes", [2, 4])
+def test_layout_holds_at_both_output_widths(elem_bytes):
+    """fp32 output doubles every payload offset; nothing may overlap or slip.
+
+    The control regions are fixed-size and the payload is not, so this is where
+    an fp32 C would show up as an aliased counter or an unaligned recv slot.
+    """
+    c = layout.ag_config(**MODEL, elem_bytes=elem_bytes, counter_chunks=4)
+    assert c.slab_bytes == 2048 * 2048 * elem_bytes
+    assert c.remote_bytes_per_rank == 7 * c.slab_bytes
+    for name in ("start_off", "flag_off", "counter_region_off", "lock_off", "recv_off"):
+        assert getattr(c, name) % layout.SIGNAL_ALIGN == 0, name
+    assert c.lock_off + c.lock_bytes <= c.recv_off
+    for src in range(8):
+        off = c.recv_slot_off(src)
+        assert off % layout.PACK_BYTES == 0
+        assert off + c.slab_bytes <= c.window_bytes
+    # A slab must be a whole number of 16B packs at either width.
+    assert c.slab_bytes % layout.PACK_BYTES == 0
+
+
+def test_elem_bytes_must_divide_a_pack():
+    with pytest.raises(ValueError, match="elem_bytes must be"):
+        layout.ag_config(**MODEL, elem_bytes=1)
+    with pytest.raises(ValueError, match="elem_bytes must be"):
+        layout.ag_config(**MODEL, elem_bytes=8)
+
+
+def test_byte_swizzle_reduces_to_the_fp8_one():
+    """``swizzle_row128b`` is ``swizzle_128`` in bytes, and must prove it.
+
+    The bf16 GEMM reuses gemm_ar's LDS swizzle at a different element width.
+    Restating it in bytes is only safe if it is the *same function* at
+    ``elem_bytes=1``, where an fp8 element is a byte -- so that is asserted
+    rather than assumed.
+    """
+    for row in range(64):
+        for col in range(128):
+            assert bf16gemm.swizzle_row128b(row, col, 1) == fp8gemm.swizzle_128(
+                row, col
+            )
+
+
+def test_byte_swizzle_is_a_bijection_at_bf16_width():
+    """A swizzle that collided would silently drop LDS rows."""
+    seen = set()
+    for row in range(16):
+        for col in range(64):
+            r, c = bf16gemm.swizzle_row128b(row, col, 2)
+            assert r == row, "the XOR must stay inside its 128-byte row"
+            assert 0 <= c < 64
+            seen.add((r, c))
+    assert len(seen) == 16 * 64
+
+
+def test_bf16_tile_constants_match_the_template():
+    """``<512, 256, 256, 64>`` from gemm_a16w16_quad_subtile_kernel.cc."""
+    tc = bf16gemm.tile_constants(256, 256)
+    assert bf16gemm.BLOCK_K == 64
+    assert bf16gemm.E_K == 2  # B_K / W_K
+    assert bf16gemm.VEC == 8  # 16B / 2B
+    assert tc["N_TILES_A"] == 4 and tc["N_TILES_B"] == 2  # E_M, E_N
+    assert tc["LDS_BLOCK_M"] == 128 and tc["LDS_BLOCK_N"] == 128  # HALF_B_M/N
+    # The finer-chunking variant, which the template does not instantiate.
+    tc128 = bf16gemm.tile_constants(128, 256)
+    assert tc128["N_TILES_A"] == 2 and tc128["N_LDS_STEPS_A"] == 1
+    for bad in (64, 192, 512):
+        with pytest.raises(ValueError, match="BLOCK_M must be"):
+            bf16gemm.tile_constants(bad, 256)
+    with pytest.raises(ValueError, match="BLOCK_N must be"):
+        bf16gemm.tile_constants(256, 512)
 
 
 @pytest.mark.parametrize(

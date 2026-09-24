@@ -40,6 +40,7 @@ from ..gemm_ar import preshuffle_b
 
 _LAZY = {
     "build_lsa_ag": "kernels_lsa",
+    "compile_bf16_gemm_ag": "_gemm_a16w16_8wave",
     "build_lsa_barrier": "kernels_lsa",
     "build_sdma_phases": "kernels_sdma",
     "compile_fused_gemm_ag": "kernels_fused",
@@ -53,6 +54,7 @@ __all__ = [
     "build_lsa_ag",
     "build_lsa_barrier",
     "build_sdma_phases",
+    "compile_bf16_gemm_ag",
     "compile_fused_gemm_ag",
     "compile_gemm_local",
     "counter_chunks",

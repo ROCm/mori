@@ -89,6 +89,10 @@ from mori.ops.gemm_ag.kernels_fused import (
     compile_fused_gemm_ag,
     compile_gemm_local,
 )
+from mori.ops.gemm_ag._gemm_a16w16_8wave import (
+    BLOCK_K as BF16_BLOCK_K,
+    compile_bf16_gemm_ag,
+)
 
 MODES = (
     "gemm-only",
@@ -205,6 +209,26 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
     return a, b, sa.t().contiguous().t(), sb.contiguous()
 
 
+def make_operands_bf16(rank: int, m: int, n: int, k: int):
+    """Per-rank A, **replicated** B, no scales.
+
+    Same seeding discipline as ``make_operands`` and the replication is
+    load-bearing for the same reason -- see its docstring. There is nothing to
+    quantise here: bf16 is the model's own input precision, which is the whole
+    point of this path.
+    """
+    ga = torch.Generator(device="cuda").manual_seed(1234 + rank)
+    gb = torch.Generator(device="cuda").manual_seed(9999)  # same on every rank
+    a = (torch.randn(m, k, generator=ga, device="cuda") / 8).to(torch.bfloat16)
+    b = (torch.randn(n, k, generator=gb, device="cuda") / 8).to(torch.bfloat16)
+    return a, b, None, None
+
+
+def reference_gemm_bf16(a, b) -> torch.Tensor:
+    """Exact fp32 reference. No quantisation recipe to mirror."""
+    return a.float() @ b.float().T
+
+
 def reference_gemm(a, b, sa, sb, quant: str) -> torch.Tensor:
     """This rank's fp32 ``[M, N]``, matching ``make_operands``' quantisation."""
     af, bf = a.float(), b.float()
@@ -277,10 +301,8 @@ def _validate_recv(recv, args, rank, world_size) -> tuple[float, bool]:
     worst = 0.0
     per_src = []
     for src in range(world_size):
-        a_src, b_src, sa_src, sb_src = make_operands(
-            src, args.m, args.n, args.k, args.quant
-        )
-        ref = reference_gemm(a_src, b_src, sa_src, sb_src, args.quant)
+        a_src, b_src, sa_src, sb_src = _operands(src, args)
+        ref = _reference(a_src, b_src, sa_src, sb_src, args)
         got = recv[src * args.m : (src + 1) * args.m].float()
         denom = ref.norm().item()
         rel = (got - ref).norm().item() / denom if denom else float("inf")
@@ -299,6 +321,18 @@ def _validate_recv(recv, args, rank, world_size) -> tuple[float, bool]:
     return worst, worst < args.tolerance
 
 
+def _operands(rank, args):
+    if args.in_dtype == "bf16":
+        return make_operands_bf16(rank, args.m, args.n, args.k)
+    return make_operands(rank, args.m, args.n, args.k, args.quant)
+
+
+def _reference(a, b, sa, sb, args):
+    if args.in_dtype == "bf16":
+        return reference_gemm_bf16(a, b)
+    return reference_gemm(a, b, sa, sb, args.quant)
+
+
 def run(args) -> int:
     local_rank, rank, world_size, uid = _setup_distributed()
     if args.mode in NOT_YET:
@@ -306,7 +340,30 @@ def run(args) -> int:
             print(f"--mode {args.mode} is not implemented yet", file=sys.stderr)
         return 2
 
-    if args.quant == "mxfp8" and args.block_m == DEFAULT_BLOCK_M:
+    bf16_in = args.in_dtype == "bf16"
+    out_t = torch.bfloat16 if args.out_dtype == "bf16" else torch.float32
+    elem_bytes = 2 if args.out_dtype == "bf16" else 4
+    if not bf16_in:
+        if args.out_dtype != "bf16":
+            raise SystemExit(
+                "--out-dtype fp32 needs --in-dtype bf16: the fp8 GEMM's "
+                "epilogue only emits bf16"
+            )
+        if args.block_m == 256 and args.quant != "mxfp8":
+            pass
+    if bf16_in:
+        if args.quant != "ptpc":
+            raise SystemExit(
+                "--quant is meaningless with --in-dtype bf16 and is rejected "
+                "rather than ignored: bf16 is not a quantised format"
+            )
+        if args.k % BF16_BLOCK_K:
+            raise SystemExit(f"--in-dtype bf16 needs k % {BF16_BLOCK_K} == 0")
+        if args.block_m == DEFAULT_BLOCK_M and args.m % 256 == 0:
+            # The template's instantiation. 128 stays reachable with an
+            # explicit --block-m for the finer chunk granularity it buys.
+            args.block_m = 256
+    if not bf16_in and args.quant == "mxfp8" and args.block_m == DEFAULT_BLOCK_M:
         # mxfp8's BLOCK_M is a property of the packed A scale, not a tuning
         # choice, so take it rather than making every caller pass it.
         args.block_m = MXFP8_BLOCK_M
@@ -334,13 +391,16 @@ def run(args) -> int:
         world_size=world_size,
         m=args.m,
         n=args.n,
+        elem_bytes=elem_bytes,
         block_m=args.block_m,
         block_n=args.block_n,
         counter_chunks=chunks,
         force_blocks=args.copy_blocks or None,
     )
-    a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
-    b_shuf = preshuffle_b(b)
+    a, b, sa, sb = _operands(rank, args)
+    # The bf16 GEMM reads a plain row-major [N, K]; the preshuffle is the fp8
+    # kernel's operand layout and does not apply.
+    b_shuf = b if bf16_in else preshuffle_b(b)
 
     # The window holds only what peers must reach: recv. And recv holds the
     # input too -- this rank's slot is where its GEMM writes -- which is what
@@ -351,9 +411,7 @@ def run(args) -> int:
         win = comm.register_window(mem.ptr, mem.size)
         from_gpu_ptr(mem.ptr + cfg.recv_off, (cfg.recv_bytes,), torch.uint8).zero_()
         recv = from_gpu_ptr(
-            mem.ptr + cfg.recv_off,
-            (world_size * args.m, args.n),
-            torch.bfloat16,
+            mem.ptr + cfg.recv_off, (world_size * args.m, args.n), out_t
         )
         if args.mode in WINDOW_C:
             # The GEMM's output slab *is* this rank's contribution to the
@@ -361,10 +419,10 @@ def run(args) -> int:
             # be written in place. No mode needs a re-layout, which is the
             # single biggest difference from the all-to-all.
             c = from_gpu_ptr(
-                mem.ptr + cfg.recv_slot_off(rank), (args.m, args.n), torch.bfloat16
+                mem.ptr + cfg.recv_slot_off(rank), (args.m, args.n), out_t
             )
         else:
-            c = torch.empty(args.m, args.n, device="cuda", dtype=torch.bfloat16)
+            c = torch.empty(args.m, args.n, device="cuda", dtype=out_t)
         torch.cuda.synchronize()
 
         reqs = CCODevCommRequirements()
@@ -382,7 +440,32 @@ def run(args) -> int:
         # publish with sc0|sc1. See build_lsa_ag's docstring; the symptom
         # without it is a relL2 that depends on the quantisation.
         pull_gemm = args.mode == "split-lsa-pull"
-        if fused or pull_gemm or (needs_sdma and args.split_gemm == "epilogue"):
+        if bf16_in:
+            # One factory for both, as gemm_ar does: fuse=False emits the same
+            # kernel minus the epilogue tail, so the split baseline and the
+            # fused kernel differ in exactly one thing.
+            gemm = compile_bf16_gemm_ag(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                out_dtype=args.out_dtype,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle if not fused else 0,
+                transport="lsa" if args.mode == "fused-lsa" else "sdma",
+                fuse=fused,
+                chunks=chunks,
+                sdma_queues=args.sdma_queues,
+                post=args.post,
+                peer_uncached=(
+                    pull_gemm or (args.peer_uncached and args.mode == "fused-lsa")
+                ),
+                direct_fence=args.direct_fence,
+                emit_put=not args.no_put,
+                fence=args.fence,
+            )
+        elif fused or pull_gemm or (needs_sdma and args.split_gemm == "epilogue"):
             # One builder for the fused path and, optionally, for its split
             # baseline: with fuse=False it runs the same kernel minus the
             # election and the put, so the pair differs in exactly one thing.
@@ -422,13 +505,23 @@ def run(args) -> int:
                 swap_ab=args.swap_ab,
                 permlane=args.permlane,
             )
-        a_i8 = a.contiguous().view(torch.int8).view(-1)
-        b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
+        if bf16_in:
+            # int16 views, not int8: make_bf16_buffer_tensor reuses the incoming
+            # tensor's layout, and a byte-counted one would describe twice as
+            # many bf16 elements as exist.
+            a_arg = a.contiguous().view(torch.int16).view(-1)
+            b_arg = b_shuf.contiguous().view(torch.int16).view(-1)
+        else:
+            a_arg = a.contiguous().view(torch.int8).view(-1)
+            b_arg = b_shuf.contiguous().view(torch.int8).view(-1)
         c_flat = c.reshape(-1)
         # The kernel indexes both scale buffers linearly, so it needs the
         # *physical* element order. sa is logically [M, K/128] but column-major,
         # so its physical order is sa.t().
-        if args.quant == "blockscale":
+        sa_arg = sb_arg = None
+        if bf16_in:
+            pass
+        elif args.quant == "blockscale":
             sa_arg = sa.t().reshape(-1).contiguous()
             sb_arg = sb.reshape(-1).contiguous()
         elif args.quant == "mxfp8":
@@ -468,20 +561,24 @@ def run(args) -> int:
         )
         rccl = args.mode == "split-rccl"
 
+        def call_gemm(stream):
+            # The two GEMMs differ by two arguments -- the bf16 one has no
+            # scales -- so the launch is adapted here rather than by giving the
+            # bf16 kernel two ignored tensors.
+            if bf16_in:
+                gemm(
+                    a_arg, b_arg, c_flat, args.m, args.n, dc.ptr, win.handle,
+                    stream=stream,
+                )
+            else:
+                gemm(
+                    a_arg, b_arg, c_flat, sa_arg, sb_arg, args.m, args.n,
+                    dc.ptr, win.handle, stream=stream,
+                )
+
         def once():
             stream = fx.Stream(torch.cuda.current_stream())
-            gemm(
-                a_i8,
-                b_i8,
-                c_flat,
-                sa_arg,
-                sb_arg,
-                args.m,
-                args.n,
-                dc.ptr,
-                win.handle,
-                stream=stream,
-            )
+            call_gemm(stream)
             if copy is not None:
                 copy(dc.ptr, win.handle, stream=stream)
             if barrier is not None:
@@ -521,7 +618,7 @@ def run(args) -> int:
                 # recv_slot_off(rank) were wrong, this mode writes the right
                 # bytes to the wrong place and every transport mode then fails
                 # in a way that looks like a transport bug.
-                ref = reference_gemm(a, b, sa, sb, args.quant)
+                ref = _reference(a, b, sa, sb, args)
                 denom = ref.norm().item()
                 rel_l2 = (c.float() - ref).norm().item() / denom if denom else 0.0
                 validated = rel_l2 < args.tolerance
@@ -546,19 +643,7 @@ def run(args) -> int:
         if args.phase_split and (copy is not None or parts is not None or rccl):
 
             def _gemm_only():
-                stream = fx.Stream(torch.cuda.current_stream())
-                gemm(
-                    a_i8,
-                    b_i8,
-                    c_flat,
-                    sa_arg,
-                    sb_arg,
-                    args.m,
-                    args.n,
-                    dc.ptr,
-                    win.handle,
-                    stream=stream,
-                )
+                call_gemm(fx.Stream(torch.cuda.current_stream()))
 
             comm.barrier()
             phase_us["compute"] = _median_us(
@@ -576,7 +661,10 @@ def run(args) -> int:
                 "m": args.m,
                 "n": args.n,
                 "k": args.k,
-                "quant": args.quant,
+                "quant": args.quant if args.in_dtype == "fp8" else None,
+                "in_dtype": args.in_dtype,
+                "out_dtype": args.out_dtype,
+                "elem_bytes": cfg.elem_bytes,
                 "world_size": world_size,
                 "chunks": chunks,
                 "us": max(g["us"] for g in gathered),
@@ -601,6 +689,22 @@ def build_parser() -> argparse.ArgumentParser:
     # a bare `-n` ambiguous against it.
     p.add_argument("--out-dim", "-N", dest="n", type=int, default=2048)
     p.add_argument("-k", type=int, default=7168)
+    p.add_argument(
+        "--in-dtype",
+        choices=("fp8", "bf16"),
+        default="fp8",
+        help="operand precision. fp8 is gemm_ar's 8-wave GEMM (the default, so "
+        "every earlier number stays reproducible); bf16 is the quad-subtile "
+        "port, which is what the model's wkv_gate actually uses",
+    )
+    p.add_argument(
+        "--out-dtype",
+        choices=("bf16", "fp32"),
+        default="bf16",
+        help="C and wire precision. fp32 needs --in-dtype bf16 and doubles the "
+        "bytes on the wire, which is the model's real traffic "
+        "(linear_bf16_fp32)",
+    )
     p.add_argument("--quant", choices=("ptpc", "blockscale", "mxfp8"), default="ptpc")
     p.add_argument("--block-m", type=int, default=DEFAULT_BLOCK_M)
     p.add_argument("--block-n", type=int, default=256)
