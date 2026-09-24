@@ -172,6 +172,7 @@ BF16_BYTES = 2
 PACK_BYTES = 16
 
 
+
 def swizzle_row128b(row, col, elem_bytes):
     """``gemm_ar.swizzle_128`` written in bytes instead of fp8 elements.
 
@@ -720,8 +721,40 @@ def compile_bf16_gemm_ag(
     # scheduling barrier but does not fix the order of what precedes it.
     #
     # "safe" uses the derived A+2B. "conservative" waits for everything, which
-    # is slow and unambiguously correct, and exists to answer "is it the waits?"
-    # without having to trust the derivation.
+    # is slow and exists to answer "is it the waits?" without having to trust
+    # the derivation.
+    #
+    # It is **not** the waits. The generated ISA says so directly
+    # (GPU_DUMP_CODE_OBJECT=1, llvm-objdump --mcpu=gfx950), at M=2048 N=2048
+    # K=7168 fp32:
+    #
+    #   * the S2R loads are `ds_read_b128` -- lgkmcnt, not vmcnt -- so they were
+    #     never in this accounting to begin with: 16 per iteration at BM=128,
+    #     24 at BM=256;
+    #   * the G2S loads are `buffer_load_dwordx4`, exactly A+B per load call, 6
+    #     per iteration at BM=128 and 8 at BM=256;
+    #   * `vmcnt(4)` / `vmcnt(6)` each retire precisely one iteration's worth,
+    #     leaving in flight exactly the k+2 prefetches, which is correct;
+    #   * the two kernels' instruction skeletons are structurally identical
+    #     (`W BB D..D G B L B D..D GG B L B D..D G B L B GG`), with 8 barriers
+    #     per iteration in both and `s_waitcnt lgkmcnt(0)` correctly between the
+    #     barrier pair that guards the write-after-read on each LDS buffer;
+    #   * neither spills (0 VGPR, 0 SGPR), and both get one workgroup per CU.
+    #
+    # The one asymmetry is 152 VGPRs and 96 KiB LDS at BM=128 against 248 and
+    # 128 KiB at BM=256, which is just the tile. `gemm_ar.wait_barrier` also
+    # puts `s_waitcnt` and `s_barrier` in one inline-asm string with
+    # `constraints=""` -- no memory clobber, so the compiler is not told there
+    # is a barrier in there and could legally move an LDS access across it.
+    # Emitting the wait as asm and the barrier as `rocdl.s_barrier()` instead
+    # produces **byte-identical** code here, so it does not, at least not at
+    # this register pressure.
+    #
+    # So the instruction stream gives no evidence of a bug at either tile, and
+    # `conservative` fixing the corruption is timing perturbation rather than a
+    # corrected count. Together with 0/64 clean on a single idle GPU, that
+    # points away from this kernel and toward the 8-process harness or the
+    # environment -- which is where the next person should start, not here.
     def _wb(tuned):
         if wait_policy == "conservative":
             return wait_barrier(0)
