@@ -592,6 +592,28 @@ using tdm::TdmXferOk;
 #define MORI_COMB_EMPTY 0
 #endif
 
+// DIAGNOSTIC, prints one line per warp (device printf) for the FIRST loop
+// iteration only -- i.e. one line per concurrently-launched warp in the
+// opening wave, before any of them block on a TDM wait. Answers "do the
+// warps racing at the same instant target the same destPe" without any
+// cross-block state (no atomics, no reset-before-run race): each warp
+// prints its own (blockIdx, warpId, destPe) independently. Post-process
+// with `grep PEERSTAT | awk '{print $NF}' | sort | uniq -c` to see whether
+// destPe is spread across peers or concentrated on one at any given moment.
+#ifndef MORI_COMB_EMPTY_PEERSTAT
+#define MORI_COMB_EMPTY_PEERSTAT 0
+#endif
+
+// DIAGNOSTIC, single thread (block 0 / thread 0) serially scans the WHOLE
+// recvToSrc table once and prints one histogram line per rank: how many of
+// this rank's totalRecvTokenNum combine-push targets land on each destPe.
+// Ground truth for "is the traffic actually balanced across peers overall",
+// independent of warp/launch scheduling (unlike MORI_COMB_EMPTY_PEERSTAT,
+// which only samples the first concurrently-launched wave).
+#ifndef MORI_COMB_EMPTY_PEERHIST
+#define MORI_COMB_EMPTY_PEERHIST 0
+#endif
+
 // MORI_EP_WORLD_SIZE and MORI_EP_MAX_RECV are emitted by RenderEpSource before
 // #include-ing this header, so the global arrays below are sized to the exact
 // config. The fallbacks are for bare C++ callers only.
@@ -1379,11 +1401,33 @@ __device__ __forceinline__ void EpCombineEmptySend(EpArgs args) {
   const gfx1250_TDM_GROUP1 gLd = TdmShape<TokT>(kCfg.hiddenDim);
   const gfx1250_TDM_GROUP1 gSt = TdmShape<WireT>(kCfg.hiddenDim);
 
+  if constexpr (MORI_COMB_EMPTY_PEERHIST) {
+    if (blockIdx.x == 0 && thdId == 0) {
+      int cnt[MORI_EP_WORLD_SIZE] = {0};
+      int invalid = 0;
+      for (index_t s = 0; s < totalRecvTokenNum; ++s) {
+        const int dp = EpPeFromSrcTok<kCfg>(recvToSrc[s]);
+        if (dp >= 0 && dp < npes)
+          cnt[dp]++;
+        else
+          invalid++;
+      }
+      printf("PEERHIST pe=%d npes=%d total=%d invalid=%d c0=%d c1=%d c2=%d c3=%d\n", myPe, npes,
+             (int)totalRecvTokenNum, invalid, cnt[0], cnt[1], cnt[2], cnt[3]);
+    }
+  }
+
   for (index_t slot = globalWarpId; slot < totalRecvTokenNum; slot += globalWarpNum) {
     const int srcTok = recvToSrc[slot];
     const int destPe = EpPeFromSrcTok<kCfg>(srcTok);
     const int destLocalTok = EpTokFromSrcTok<kCfg>(srcTok);
     if (destPe >= npes || destLocalTok >= kCfg.maxTokPerRank) continue;
+    if constexpr (MORI_COMB_EMPTY_PEERSTAT) {
+      if (laneId == 0 && slot == (index_t)globalWarpId) {
+        printf("PEERSTAT pe=%d blk=%d warp=%d slot=%d destPe=%d\n", myPe, blockIdx.x, warpId,
+               (int)slot, destPe);
+      }
+    }
     uint8_t* const dstSlot = EpPeer<uint8_t>(win, destPe, args.offCombPush) +
                              (size_t)EpPushSlot<kCfg>(myPe, destLocalTok) * kSlotB;
     TdmIssueLoad<TokT>(tile, myToks + (size_t)slot * kCfg.hiddenDim, gLd);
