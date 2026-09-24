@@ -823,8 +823,9 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
   // path polls for itself once the queue is full), but it turns into a stall
   // inside a later combine instead of a cost paid here. Not the whole
   // allocation either: flushing a QP that never carries traffic still costs a
-  // system fence, which measurably slows dispatch. Capped by the allocation,
-  // because a qpId past it would address the next peer's endpoints.
+  // system fence, which measurably slows dispatch. Capped by the allocation:
+  // ccoGda takes the context id modulo it, so a qpId past it would only flush
+  // one of the same peer's lower QPs a second time.
   //
   // One (node, QP) pair per warp so different QPs drain concurrently, over the
   // remote nodes only and numbered from warp 0. The send loops above target

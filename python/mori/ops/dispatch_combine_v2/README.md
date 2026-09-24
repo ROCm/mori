@@ -79,7 +79,9 @@ of one combine always sum to the same total (`kCombineBarrierMarkerTotal` in
 `ep_internode_cfg.hpp`).
 
 `op.set_active_qps(n)` overrides the count of every bucket, both phases, for the
-launches that follow, and `op.set_active_qps(None)` returns to the table; only
+launches that follow, and `op.set_active_qps(None)` returns to each bucket's own
+resolved count (`active_qps` if set, else the table's, else
+`min(2, num_qp_per_pe)`); only
 counts in `active_qp_counts` can be selected, and selecting one never compiles
 or recreates a QP. A sweep pins it per phase instead, as a fourth field of
 `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`block,rdma,warp,active_qps`).

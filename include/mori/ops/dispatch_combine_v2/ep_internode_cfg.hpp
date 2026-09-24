@@ -187,7 +187,7 @@ struct EpInterNodeKernelCfg {
   int numQpPerPe{1};
   // How many QPs DispatchSync drains: every QP any kernel of this op may send
   // on, which can exceed this kernel's own numQpPerPe -- a combine may use more
-  // QPs than the dispatch before it, and nothing else polls them. Flushing a QP
+  // QPs than the dispatch that follows it, and nothing else polls them. Flushing a QP
   // that never carries traffic is not free, so this is the op's largest active
   // count, not the allocation. 0 means numQpPerPe.
   int numQpToDrain{0};

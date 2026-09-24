@@ -313,3 +313,45 @@ def test_every_launch_key_is_built(monkeypatch, family, selectable):
     assert op._internode_geom_for("dispatch", 16)[3] == 1
     assert op._internode_geom_for("combine", 16)[3] == 4
     assert op._internode_geom_for("combine", 128)[3] == 2
+
+
+def test_launch_uses_the_override_then_the_bucket_count(monkeypatch):
+    # Drive the real launch closure, not a copy of its rule: record the key it
+    # looks its plan group up by, and stop there.
+    from mori.ops.dispatch_combine_v2 import internode_tuning_configs as table
+
+    rows = ((16, 80, 40, 4, 80, 40, 4, 1, 4), (None, 80, 48, 8, 64, 48, 6))
+    monkeypatch.setattr(table, "_device_key", lambda: "test-device")
+    monkeypatch.setattr(table, "_TABLE", {("test-device", 16, 1024, 4): {"fp8": rows}})
+    monkeypatch.setattr(table.gpu_utils, "cu_count", lambda: 80)
+
+    class Looked(Exception):
+        pass
+
+    class RecordingGroups(dict):
+        def __getitem__(self, key):
+            raise Looked(key)
+
+    cfg = config(internode_kernel="v2_ll", active_qp_counts=(8,))
+    op = object.__new__(EpDispatchCombineOpHip)
+    op.cfg = cfg
+    op._selectable_active_qps = (8,)
+    op._active_qps_override = None
+    op._internode_buckets = op._internode_geometry_buckets(cfg)
+    op._internode_groups = RecordingGroups()
+
+    def launched_count(phase, num_tokens):
+        with pytest.raises(Looked) as looked:
+            op._wrap_internode(phase)(input=None, num_tokens=num_tokens, dest_map=None)
+        geometry, _ = looked.value.args[0]
+        return geometry[3]
+
+    # The table's per-phase counts for the 16-token bucket, the default above it.
+    assert launched_count("dispatch", 16) == 1
+    assert launched_count("combine", 16) == 4
+    assert launched_count("combine", 64) == 2
+    op.set_active_qps(8)
+    assert launched_count("dispatch", 16) == 8
+    assert launched_count("combine", 64) == 8
+    op.set_active_qps(None)
+    assert launched_count("combine", 16) == 4

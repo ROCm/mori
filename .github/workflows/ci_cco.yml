@@ -491,12 +491,14 @@ jobs:
           # even compiles it. 128 is the LL band and 4096 the wide one, so each
           # family is exercised where it is the one a real caller would get.
           #
-          # The last case allocates 8 QPs and switches the active count every
+          # The last two cases allocate 8 QPs and switch the active count every
           # round, with the two nodes deliberately out of step and each combine
           # one step ahead of its own dispatch: the cases the combine barrier
-          # must tolerate, which the fixed-count cases above never reach.
+          # must tolerate, which the fixed-count cases above never reach. One
+          # per family, because v2 and v2_ll each have their own barrier.
           for CASE in "v2 128" "v2 4096" "v2_ll 128" \
-                      "v2 4096 --num-qp 8 --active-qp-counts 1,2,4,8"; do
+                      "v2 4096 --num-qp 8 --active-qp-counts 1,2,4,8" \
+                      "v2_ll 128 --num-qp 8 --active-qp-counts 1,2,4,8"; do
             set -- $CASE; KERNEL=$1; TOKENS=$2; shift 2; EXTRA="$*"
             echo "=== cco test kernel=$KERNEL max-tokens=$TOKENS $EXTRA port=$PORT ==="
             NODE2_CMD=(

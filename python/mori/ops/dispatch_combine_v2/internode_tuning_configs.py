@@ -66,7 +66,7 @@ from mori.ops import utils as gpu_utils
 # MI308X (gfx942, 80 CU) -- EP16, hidden 6144, topk 8. Tuned fp8-dispatch +
 # bf16-combine on a 2-node rig, block_num <= 80.
 #
-# Invariant: dispatch and combine are COUPLED -- same graph replay, same QP set, one
+# Invariant: dispatch and combine are COUPLED -- same graph replay, same QP allocation, one
 # shared arena -- so these rows are the best PAIR, not the per-phase argmins. Do
 # not re-tune one phase in isolation; the per-phase winners a sweep prints do not
 # reproduce once the two phases run at different geometries. The 4-token row is

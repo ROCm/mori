@@ -1120,10 +1120,12 @@ def _active_qp_for(schedule, round_index, cfg, phase_offset):
 
     Deliberately NOT in step. The combine barrier only carries markers between a
     rank and its same-local-rank peer on each other node, so the offset is the
-    NODE index: those peers then always pick different counts (for two nodes and
-    any schedule longer than one). phase_offset 1 puts combine one step ahead of
-    its own dispatch, so a pair's two phases differ too. Those are the two cases
-    the combine barrier has to tolerate.
+    NODE index: with two nodes, those peers take adjacent schedule entries, and
+    phase_offset 1 puts combine one entry ahead of its own dispatch. Those are
+    the two cases the combine barrier has to tolerate. They actually differ only
+    where adjacent entries resolve to different counts: the trailing None means
+    each bucket's own count, which can equal a neighbour (e.g. 2,4 with a
+    default of 2). 1,2,4,8 at the default of 2 differs at every step.
     """
     node = cfg.rank // cfg.gpu_per_node
     return schedule[(round_index + node + phase_offset) % len(schedule)]
@@ -1582,6 +1584,24 @@ def _tune(cfg, dist_handle, device, args, comm):
     if dist_handle.rank == 0:
         dispatch_row = best if phase == "dispatch" else incumbent_dispatch
         combine_row = best if phase == "combine" else incumbent_combine
+        # The phase that was NOT swept keeps the count the table ships, not the
+        # one this run resolved: that one is clamped to this run's --num-qp and
+        # replaced by --active-qps, so writing it back would quietly retune a
+        # phase nobody measured. Only a row that names no count has nothing to
+        # keep, and then the run's count is written with a warning.
+        unswept_count_unmeasured = False
+        if table_row:
+            other = "combine" if phase == "dispatch" else "dispatch"
+            shipped_count = table_row[other][3]
+            if shipped_count is not None:
+                if phase == "dispatch":
+                    combine_row = combine_row[:3] + (shipped_count,)
+                else:
+                    dispatch_row = dispatch_row[:3] + (shipped_count,)
+            else:
+                unswept_count_unmeasured = True
+        else:
+            unswept_count_unmeasured = True
         # One trailing count when both phases agree, else dispatch then combine
         # -- the two forms internode_tuning_configs.lookup() reads. None when
         # the sweep did not measure the count (see report_active_qps).
@@ -1591,6 +1611,15 @@ def _tune(cfg, dist_handle, device, args, comm):
             active_qps_columns = f", {dispatch_row[3]}"
         else:
             active_qps_columns = f", {dispatch_row[3]}, {combine_row[3]}"
+        if report_active_qps and unswept_count_unmeasured:
+            other = "combine" if phase == "dispatch" else "dispatch"
+            print(
+                f"# NOTE: the {other} count in the row below was not swept and "
+                f"the shipped row names none; it is this run's resolved count "
+                f"(--num-qp={cfg.num_qp_per_pe}, --active-qps={cfg.active_qps}). "
+                f"Check it before pasting.",
+                flush=True,
+            )
         print(
             f"# TUNING RESULT tok={args.max_tokens} phase={phase}: "
             f"block/rdma/warp/active_qps={best} median {phase}={best_median:.1f}us "

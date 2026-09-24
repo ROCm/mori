@@ -120,6 +120,13 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
     throw std::runtime_error("mori ep internode v2: numQpPerPe " + std::to_string(activeQps) +
                              " must be in [1, " + std::to_string(kCombineBarrierMarkerTotal) + "]");
   }
+  // Same bound for the drain count, which covers every count the op may send
+  // on; 0 means numQpPerPe.
+  const int drainQps = cfg.kernelCfg.numQpToDrain;
+  if (drainQps < 0 || drainQps > kCombineBarrierMarkerTotal) {
+    throw std::runtime_error("mori ep internode v2: numQpToDrain " + std::to_string(drainQps) +
+                             " must be in [0, " + std::to_string(kCombineBarrierMarkerTotal) + "]");
+  }
 
   if (!EpInterNodeKernelCfgIsValid(cfg.kernelCfg)) {
     throw std::runtime_error(
