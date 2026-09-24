@@ -538,6 +538,21 @@ set_target_properties(umbp_master PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/l
                                              INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
                                              BUILD_WITH_INSTALL_RPATH TRUE)
 
+# ---------- Admin CLI ---------------------------------------------------------
+# Drives the master's SetRuntimeConfig RPC so knobs seeded from UMBP_* env vars
+# (which are cached in statics and cannot change in a running process) can be
+# retuned without restarting a master.
+
+add_executable(umbp_admin distributed/bin/admin_main.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(umbp_admin PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(umbp_admin PRIVATE umbp_common ${_PROTOBUF_LIBS}
+                                         ${_GRPCPP_LIB})
+set_target_properties(umbp_admin PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+                                            INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+                                            BUILD_WITH_INSTALL_RPATH TRUE)
+
 # ---------- Client executable -------------------------------------------------
 
 add_executable(umbp_client distributed/bin/client_main.cpp)

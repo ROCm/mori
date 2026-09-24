@@ -74,6 +74,7 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
       std::lock_guard<std::mutex> lock(mu_);
       ++count_;
       last_time_ = std::chrono::steady_clock::now();
+      arrival_times_.push_back(last_time_);
       size_t event_count = 0;
       uint64_t highest_seq = 0;
       for (const auto& bundle : req->bundles()) {
@@ -83,6 +84,10 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
       heartbeat_event_counts_.push_back(event_count);
       resp->set_acked_seq(highest_seq);
       resp->set_status(::umbp::CLIENT_STATUS_ALIVE);
+      // A real master re-advertises the effective interval on every response;
+      // 0 (the default here) means "no opinion", which is also what a master
+      // predating the field sends.
+      resp->set_heartbeat_interval_ms(advertised_interval_ms_.load());
       entered_cv_.notify_all();
     }
     if (block_heartbeats_) {
@@ -107,6 +112,18 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
     std::lock_guard<std::mutex> lock(mu_);
     released_ = true;
     release_cv_.notify_all();
+  }
+
+  // Stand-in for SetRuntimeConfig on a real master: from the next response on,
+  // advertise `ms` as the effective interval.  Not guarded by mu_ — it is set
+  // from the test thread while the heartbeat handler reads it.
+  void SetAdvertisedInterval(uint64_t ms) { advertised_interval_ms_.store(ms); }
+
+  // Arrival timestamps, oldest first; lets a test measure the cadence rather
+  // than just the count.
+  std::vector<std::chrono::steady_clock::time_point> ArrivalTimes() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return arrival_times_;
   }
 
   // Block until at least `target` heartbeats have been received, or `timeout` elapses.
@@ -141,11 +158,14 @@ class RecordingMasterService final : public ::umbp::UMBPMaster::Service {
   const int interval_ms_;
   const bool block_heartbeats_;
 
+  std::atomic<uint64_t> advertised_interval_ms_{0};
+
   std::mutex mu_;
   std::condition_variable entered_cv_;
   std::condition_variable release_cv_;
   int count_ = 0;
   std::vector<size_t> heartbeat_event_counts_;
+  std::vector<std::chrono::steady_clock::time_point> arrival_times_;
   std::chrono::steady_clock::time_point last_time_;
   bool released_ = false;
 };
@@ -345,6 +365,86 @@ TEST_F(FlushHeartbeatTest, LargeEventBacklogIsSplitAcrossBoundedImmediateHeartbe
   EXPECT_LE(counts[0], kDefaultMaxEventsPerRpc);
   EXPECT_LE(counts[1], kDefaultMaxEventsPerRpc);
   EXPECT_EQ(counts[0] + counts[1], kEvents);
+}
+
+// --------------------------------------------------------------------------
+// Test 5: a master-advertised interval change takes effect without a
+// re-register.
+//
+// The peer joins with a 10-second interval, so left alone it would heartbeat
+// roughly never on a test's timescale.  The master then starts advertising
+// 150 ms on each response (what SetRuntimeConfig does in production).  The
+// peer must pick that up and settle into the faster cadence on its own — no
+// FlushHeartbeat, no re-register, no restart.
+//
+// Cadence, not just count, is what is asserted: a count alone would also pass
+// if something were firing heartbeats for an unrelated reason.
+// --------------------------------------------------------------------------
+TEST_F(FlushHeartbeatTest, MasterAdvertisedIntervalChangeTakesEffectWithoutReregister) {
+  constexpr int kJoinIntervalMs = 10'000;
+  constexpr uint64_t kFastIntervalMs = 150;
+  constexpr int kTargetHeartbeats = 5;
+
+  ASSERT_NO_FATAL_FAILURE(BuildServer(kJoinIntervalMs));
+  auto client = MakeRegisteredClient();
+  client->StartHeartbeat();
+
+  // One flush to deliver the first response; that response is what carries the
+  // new interval.  Everything after this must be self-sustaining.
+  service_->SetAdvertisedInterval(kFastIntervalMs);
+  client->FlushHeartbeat();
+
+  // 5 heartbeats at 150 ms is ~600 ms of cadence after the first; a generous
+  // 5 s budget keeps this from flaking on a loaded CI box while still being
+  // far below the 10 s join interval — if the change were ignored, only the
+  // single flushed heartbeat would ever arrive and this would time out.
+  ASSERT_TRUE(service_->WaitForCount(kTargetHeartbeats, std::chrono::milliseconds(5000)))
+      << "Only " << service_->Count()
+      << " heartbeat(s) arrived; the advertised interval change was not adopted";
+  client->StopHeartbeat();
+
+  const auto times = service_->ArrivalTimes();
+  ASSERT_GE(times.size(), static_cast<size_t>(kTargetHeartbeats));
+
+  // Skip the first gap: it spans the flush, not the new cadence.
+  for (size_t i = 2; i < times.size(); ++i) {
+    const auto gap_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(times[i] - times[i - 1]).count();
+    EXPECT_LT(gap_ms, kJoinIntervalMs / 2) << "Gap " << i << " was " << gap_ms
+                                           << " ms — peer still appears to be on the join interval";
+  }
+}
+
+// --------------------------------------------------------------------------
+// Test 6: an advertised 0 means "no opinion" and must not disturb the peer.
+//
+// A master that predates the HeartbeatResponse field leaves it at the proto3
+// default of 0.  Adopting that literally would collapse the wait to zero and
+// spin the heartbeat thread, so 0 has to be ignored.
+// --------------------------------------------------------------------------
+TEST_F(FlushHeartbeatTest, AdvertisedZeroIntervalIsIgnored) {
+  constexpr int kJoinIntervalMs = 400;
+
+  ASSERT_NO_FATAL_FAILURE(BuildServer(kJoinIntervalMs));
+  // Default advertised value is already 0; state it for the record.
+  service_->SetAdvertisedInterval(0);
+
+  auto client = MakeRegisteredClient();
+  client->StartHeartbeat();
+  ASSERT_TRUE(service_->WaitForCount(3, std::chrono::milliseconds(5000)));
+  client->StopHeartbeat();
+
+  const auto times = service_->ArrivalTimes();
+  ASSERT_GE(times.size(), 3u);
+  // Still on the join cadence: a spinning thread would have produced gaps near
+  // zero and a far higher count in the same window.
+  for (size_t i = 1; i < times.size(); ++i) {
+    const auto gap_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(times[i] - times[i - 1]).count();
+    EXPECT_GT(gap_ms, kJoinIntervalMs / 2)
+        << "Gap " << i << " was only " << gap_ms << " ms — an advertised 0 appears to have been "
+        << "adopted, collapsing the heartbeat wait";
+  }
 }
 
 }  // namespace
