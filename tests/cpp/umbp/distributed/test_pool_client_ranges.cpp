@@ -70,7 +70,9 @@ TEST(PoolClientNuma, RegisteredGpuWritesSteerAndCrossBufferReadsPreserveBytes) {
   cfg.dram_page_size = 4096;
   cfg.dram.buffer_sizes = {20 * 4096, 16 * 4096};
   cfg.dram.numa_nodes = nodes;
-  cfg.dram.numa_strict = true;
+  // Check logical buffer steering and byte transfers even when a container
+  // denies mbind. Physical placement and strict failures are tested separately
+  // in test_page_backend; keep the default best-effort policy here.
   PoolClient client(cfg);
   ASSERT_TRUE(client.Init());
   auto* backend = client.Backends().Get(TierType::DRAM);
