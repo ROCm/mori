@@ -49,6 +49,7 @@
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/common/rpc_deadline.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
@@ -2475,6 +2476,7 @@ std::unique_ptr<PoolClient::RemotePutInFlight> PoolClient::SubmitRemoteBatchPut(
     for (uint64_t slot_id : slot_ids) abort_req.add_slot_ids(slot_id);
     ::umbp::BatchAbortSlotsResponse abort_resp;
     grpc::ClientContext abort_ctx;
+    ArmDeadline(abort_ctx, PeerCleanupRpcTimeoutMs());
     // Best-effort: a failed abort just leaves the slots for the peer reaper to
     // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
     auto s = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
@@ -2568,6 +2570,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
   grpc::ClientContext alloc_ctx;
+  ArmDeadline(alloc_ctx, PeerRpcTimeoutMs());
   auto alloc_status = stub->BatchAllocateSlots(&alloc_ctx, alloc_req, &alloc_resp);
   if (!alloc_status.ok() || alloc_resp.entries_size() != static_cast<int>(items.size())) {
     MORI_UMBP_WARN("[PoolClient] BatchAllocateSlots failed on {}: {}", items.front().route.node_id,
@@ -2627,6 +2630,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
       for (uint64_t slot_id : *abort_slots) abort_req.add_slot_ids(slot_id);
       ::umbp::BatchAbortSlotsResponse abort_resp;
       grpc::ClientContext abort_ctx;
+      ArmDeadline(abort_ctx, PeerCleanupRpcTimeoutMs());
       // Best-effort: a failed abort just leaves the slots for the peer reaper to
       // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
       auto abort_status = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
@@ -2734,6 +2738,7 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
   if (!commit_indices.empty()) {
     ::umbp::BatchCommitSlotsResponse commit_resp;
     grpc::ClientContext commit_ctx;
+    ArmDeadline(commit_ctx, PeerRpcTimeoutMs());
     auto commit_status = stub->BatchCommitSlots(&commit_ctx, commit_req, &commit_resp);
     if (!commit_status.ok() ||
         commit_resp.success_size() != static_cast<int>(commit_indices.size())) {
@@ -2769,6 +2774,7 @@ void PoolClient::FinalizeRemotePutEntries(std::vector<RemotePutEntry>& entries,
     for (uint64_t slot_id : abort_slots) abort_req.add_slot_ids(slot_id);
     ::umbp::BatchAbortSlotsResponse abort_resp;
     grpc::ClientContext abort_ctx;
+    ArmDeadline(abort_ctx, PeerCleanupRpcTimeoutMs());
     // Best-effort: a failed abort just leaves the slots for the peer reaper to
     // reclaim at pending_ttl. Warn to aid diagnosis but do not propagate.
     auto abort_status = stub->BatchAbortSlots(&abort_ctx, abort_req, &abort_resp);
@@ -4546,6 +4552,7 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
     ::umbp::GetPeerInfoRequest req;
     ::umbp::GetPeerInfoResponse resp;
     grpc::ClientContext ctx;
+    ArmDeadline(ctx, PeerRpcTimeoutMs());
     auto status = stub->GetPeerInfo(&ctx, req, &resp);
     if (!status.ok()) {
       MORI_UMBP_ERROR("[PoolClient] GetPeerInfo failed for '{}': {}", peer.peer_address,
