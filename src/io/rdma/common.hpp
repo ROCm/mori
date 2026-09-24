@@ -159,7 +159,10 @@ struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
 
-  TransferStatus* status{nullptr};
+  // Claimed with exchange(nullptr) by whoever completes the transfer first, so a
+  // terminal update happens exactly once even though the CQ poller and the async
+  // event monitor can both reach the same meta concurrently.
+  std::atomic<TransferStatus*> status{nullptr};
   TransferUniqueId id{0};
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
@@ -183,13 +186,19 @@ struct SubmissionRecord {
 
 class SubmissionLedger {
  public:
+  // Record ids are allocated from wr_id Zone B, which starts at notifPerQp, so 0
+  // is never a valid record and can mean "refused".
+  static constexpr uint64_t kInvalidRecordId = 0;
+
   explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{notifPerQp} {}
 
-  // Allocate recordId, insert Posted record, return recordId.
+  // Allocate recordId, insert Posted record, return recordId. Returns
+  // kInvalidRecordId once the ledger is closed; the caller must then not post the
+  // WR, because nothing will ever reap a completion for it.
   uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
                   int batchSize);
 
-  // Insert an Orphaned record (partial post, no signaled tail).
+  // Insert an Orphaned record (partial post, no signaled tail). No-op once closed.
   void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
 
   // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
@@ -202,11 +211,43 @@ class SubmissionLedger {
 
   bool HasOrphaned() const;
 
+  // Terminal path: fail every record and erase them. Used when the QP or its CQ
+  // has died, so no CQE can ever arrive for the records left behind. Returns the
+  // number of transfers whose status this call moved to a failed state.
+  //
+  // This also closes the ledger for good. Closing matters as much as failing: a
+  // submitter that cleared the degraded check just before the event arrives is
+  // still on its way to Insert(), and a record accepted after this point would
+  // wait for a completion that can never come.
+  int FailAll(StatusCode code, const std::string& message, std::atomic<int>* sqDepth);
+
+  // True once FailAll() has run. A closed ledger never accepts another record, so
+  // it also tells the CQE path that this endpoint's degraded flag is terminal.
+  bool Closed() const;
+
  private:
   mutable std::mutex mu_;
   uint64_t nextId_;
   std::unordered_map<uint64_t, SubmissionRecord> records_;
+  bool closed_{false};
 };
+
+// A verbs async event that means outstanding work can never complete. Scope says
+// which endpoints are affected: a single QP moved to Error state, or a CQ/device
+// that died and took every endpoint sharing it with it.
+struct QpErrorEvent {
+  enum class Scope : uint8_t { kQueuePair, kCompletionQueue, kDevice };
+
+  Scope scope{Scope::kQueuePair};
+  uint32_t qpNum{0};
+  // CQ handle for kCompletionQueue. Compared by value only: the verbs object may
+  // already be acked and must never be dereferenced here.
+  const void* cq{nullptr};
+  ibv_context* context{nullptr};
+  const char* eventName{""};
+};
+
+using QpErrorHandler = std::function<void(const QpErrorEvent&)>;
 
 inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
 
@@ -231,6 +272,10 @@ struct EpPair {
   // Shared across EpPair copies that refer to the same QP.
   std::shared_ptr<SqAdmissionEvent> sqAdmission;
 };
+
+// Which endpoints a fatal async event takes down with it. A QP event hits one
+// endpoint; a CQ or device event hits everything sharing that CQ or context.
+bool EndpointAffectedByAsyncEvent(const QpErrorEvent& event, const EpPair& ep);
 
 using EndpointId = uint64_t;
 
