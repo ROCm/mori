@@ -146,7 +146,20 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("low_watermark", &UMBPDramConfig::low_watermark)
       .def_readwrite("use_hugepages", &UMBPDramConfig::use_hugepages)
       .def_readwrite("hugepage_size", &UMBPDramConfig::hugepage_size)
-      .def_readwrite("numa_node", &UMBPDramConfig::numa_node)
+      .def_property(
+          "numa_nodes", [](const UMBPDramConfig& cfg) { return cfg.numa_nodes; },
+          [](UMBPDramConfig& cfg, std::vector<int> nodes) {
+            cfg.numa_nodes = NormalizeNumaNodes(std::move(nodes));
+          })
+      .def_property(
+          "numa_node",
+          [](const UMBPDramConfig& cfg) {
+            return cfg.numa_nodes.empty() ? -1 : cfg.numa_nodes.front();
+          },
+          [](UMBPDramConfig& cfg, int node) { cfg.numa_nodes = NormalizeNumaNodes({node}); },
+          "Deprecated: use numa_nodes. Setting this property replaces the node list.")
+      .def_readwrite("numa_strict", &UMBPDramConfig::numa_strict)
+      .def_readwrite("prefault_threads", &UMBPDramConfig::prefault_threads)
       .def_readwrite("prefault", &UMBPDramConfig::prefault);
 
   py::class_<UMBPIoConfig>(m, "UMBPIoConfig")

@@ -329,14 +329,16 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
   std::vector<size_t> next_candidate(requests.size(), 0);
   std::vector<size_t> active;
   active.reserve(requests.size());
-  for (size_t i = 0; i < requests.size(); ++i) {
+  // Probe both members before publishing either reservation. In particular an
+  // existing sibling must not cause an otherwise unused allocation/eviction.
+  auto available = [&](size_t i) {
     auto existing = placements_.find(requests[i].key);
     if (existing != placements_.end()) {
       auto* existing_backend = backends_->Get(existing->second);
       if (existing_backend != nullptr && existing_backend->Contains(requests[i].key)) {
         out[i].backend_id = existing->second;
         out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
-        continue;
+        return false;
       }
       placements_.erase(existing);
     }
@@ -354,7 +356,7 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
         // reaches the same TTL as the backend slot. ALREADY_EXISTS would expose
         // uncommitted bytes.
         out[i].allocation.outcome = AllocateOutcome::kFailed;
-        continue;
+        return false;
       }
     }
 
@@ -365,16 +367,43 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       placements_[requests[i].key] = owner;
       out[i].backend_id = owner;
       out[i].allocation.outcome = AllocateOutcome::kSuccessAlreadyExists;
-      continue;
+      return false;
     }
 
-    put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
-    if (!put_orders[i].empty()) {
-      const uint32_t selected = put_orders[i].front();
-      pending_keys_[requests[i].key] =
-          PendingPlacement{selected, 0, std::chrono::steady_clock::time_point::max()};
-      active.push_back(i);
+    return true;
+  };
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const int64_t mate = requests[i].paired_request;
+    if (mate >= 0) {
+      if (static_cast<uint64_t>(mate) >= requests.size() || mate == static_cast<int64_t>(i) ||
+          requests[mate].paired_request != static_cast<int64_t>(i) ||
+          requests[mate].key == requests[i].key || requests[mate].size != requests[i].size) {
+        continue;  // malformed pair, reserve nothing
+      }
+      if (static_cast<size_t>(mate) < i) continue;
     }
+    const bool first_available = available(i);
+    const bool second_available = mate < 0 || available(static_cast<size_t>(mate));
+    if (mate >= 0) {
+      const size_t existing =
+          out[i].allocation.outcome == AllocateOutcome::kSuccessAlreadyExists ? i : mate;
+      if (out[existing].allocation.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+        out[i] = out[existing];
+        out[mate] = out[existing];
+        continue;
+      }
+    }
+    if (!first_available || !second_available) continue;
+    put_orders[i] = policy_->PutOrder(*backends_, requests[i]);
+    if (mate >= 0) put_orders[mate] = policy_->PutOrder(*backends_, requests[mate]);
+    if (put_orders[i].empty() || (mate >= 0 && put_orders[mate].empty())) continue;
+    auto reserve = [&](size_t index) {
+      pending_keys_[requests[index].key] = PendingPlacement{
+          put_orders[index].front(), 0, std::chrono::steady_clock::time_point::max()};
+      active.push_back(index);
+    };
+    reserve(i);
+    if (mate >= 0) reserve(static_cast<size_t>(mate));
   }
 
   // Each round batches the requests targeting the same candidate. Only
@@ -410,7 +439,8 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       std::vector<AllocateRequest> backend_requests;
       backend_requests.reserve(indices.size());
       for (size_t index : indices) {
-        backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size});
+        backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size,
+                                                   requests[index].preferred_numa_node});
       }
 
       auto results = backend->BatchAllocate(backend_requests);

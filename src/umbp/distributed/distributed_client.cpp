@@ -53,11 +53,14 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // (backend-agnostic refactor Phase 2b, design doc §1 item 4).  Only the
   // sizing/policy knobs cross this boundary now.
   DramOwnershipConfig dram_ownership;
-  dram_ownership.buffer_sizes = {config.dram.capacity_bytes};
+  dram_ownership.numa_nodes = NormalizeNumaNodes(config.dram.numa_nodes);
+  dram_ownership.buffer_sizes = SplitNumaCapacity(
+      config.dram.capacity_bytes, dram_ownership.numa_nodes.size(), dc.dram_page_size);
   dram_ownership.use_hugepages = config.dram.use_hugepages;
   dram_ownership.hugepage_size = config.dram.hugepage_size;
-  dram_ownership.numa_node = config.dram.numa_node;
   dram_ownership.prefault = config.dram.prefault;
+  dram_ownership.numa_strict = config.dram.numa_strict;
+  dram_ownership.prefault_threads = config.dram.prefault_threads;
 
   // SSD came back to the distributed data plane as a MediumBackend: Phase 0
   // unwired the old PeerSsdManager special case, and PoolClient::Init builds an
@@ -158,7 +161,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       medium_desc = "DRAM pool=" + mb(config_.dram.capacity_bytes) +
                     "MB hugepages=" + (config_.dram.use_hugepages ? "true" : "false") +
                     " hugepage_size=" + mb(config_.dram.hugepage_size) +
-                    "MB numa_node=" + std::to_string(config_.dram.numa_node);
+                    "MB numa_nodes=" + FormatNumaNodes(config_.dram.numa_nodes);
       break;
     case UMBPMedium::HBM:
       medium_desc =

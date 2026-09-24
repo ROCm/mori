@@ -37,6 +37,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "mori/application/utils/cpu_affinity.hpp"
 #include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
 #include "umbp/distributed/config.h"
@@ -47,6 +48,68 @@
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
+
+TEST(PoolClientNuma, RegisteredGpuWritesSteerAndCrossBufferReadsPreserveBytes) {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess || count < 2) GTEST_SKIP() << "requires GPUs";
+  std::vector<int> devices, nodes;
+  for (int device = 0; device < count && devices.size() < 2; ++device) {
+    int node = -1;
+    mori::application::detail::GpuLocalCpuList(device, node);
+    if (node >= 0 && (nodes.empty() || node != nodes.front())) {
+      devices.push_back(device);
+      nodes.push_back(node);
+    }
+  }
+  if (devices.size() < 2) GTEST_SKIP() << "requires GPUs on different NUMA nodes";
+  PoolClientConfig cfg;
+  cfg.master_config.node_id = "numa-roundtrip";
+  cfg.master_config.node_address = "127.0.0.1";
+  cfg.io_engine.port = 0;
+  cfg.auto_peer_service_port = true;
+  cfg.dram_page_size = 4096;
+  cfg.dram.buffer_sizes = {20 * 4096, 16 * 4096};
+  cfg.dram.numa_nodes = nodes;
+  // Check logical buffer steering and byte transfers even when a container
+  // denies mbind. Physical placement and strict failures are tested separately
+  // in test_page_backend; keep the default best-effort policy here.
+  PoolClient client(cfg);
+  ASSERT_TRUE(client.Init());
+  auto* backend = client.Backends().Get(TierType::DRAM);
+  ASSERT_NE(backend, nullptr);
+  for (int object = 0; object < 3; ++object) {
+    const int device = devices[object == 0 ? 0 : 1];
+    ASSERT_EQ(hipSetDevice(device), hipSuccess);
+    const size_t bytes = (object < 2 ? 12 : 8) * 4096;
+    const std::string key = "numa-" + std::to_string(object);
+    void* gpu = nullptr;
+    ASSERT_EQ(hipMalloc(&gpu, bytes), hipSuccess);
+    std::unique_ptr<void, decltype(&hipFree)> allocation(gpu, hipFree);
+    const std::vector<char> expected(bytes, static_cast<char>(0x31 + object));
+    ASSERT_EQ(hipMemcpy(gpu, expected.data(), bytes, hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_TRUE(client.RegisterMemory(gpu, bytes, mori::io::MemoryLocationType::GPU, device,
+                                      MemoryRegistration::kLocalCopyOnly));
+    if (object == 0) {
+      ASSERT_TRUE(client.Put(key, gpu, bytes));
+    } else {
+      ASSERT_EQ(client.BatchPutRanges({key}, {bytes}, {{gpu}}, {{bytes}}, {{0}}),
+                std::vector<bool>{true});
+    }
+    const auto resolved = backend->BatchResolve({key}, false).front();
+    ASSERT_TRUE(resolved.found);
+    for (size_t page = 0; page < resolved.pages.size(); ++page) {
+      EXPECT_EQ(resolved.pages[page].buffer_index,
+                object == 0 ? 0u : (object == 1 || page < 4 ? 1u : 0u));
+    }
+    ASSERT_EQ(hipMemset(gpu, 0xa5, bytes), hipSuccess);
+    ASSERT_EQ(client.BatchGetRanges({key}, {{gpu}}, {{bytes}}, {{0}}), std::vector<bool>{true});
+    std::vector<char> actual(bytes);
+    ASSERT_EQ(hipMemcpy(actual.data(), gpu, bytes, hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(actual, expected);
+    client.DeregisterMemory(gpu);
+  }
+  client.Shutdown();
+}
 namespace {
 
 constexpr size_t kPageSize = 4096;

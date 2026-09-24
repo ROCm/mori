@@ -32,6 +32,40 @@
 namespace mori::umbp {
 namespace {
 
+TEST(BackendPolicyConfig, NumaListParsingAndCapacitySplitting) {
+  EXPECT_TRUE(ParseNumaNodes("-1").empty());
+  EXPECT_EQ(ParseNumaNodes("0"), (std::vector<int>{0}));
+  EXPECT_EQ(ParseNumaNodes(" 0, 2 "), (std::vector<int>{0, 2}));
+  for (const auto* bad : {"", "0,", "0,,1", "0,0", "-1,0", "2x"}) {
+    EXPECT_THROW(ParseNumaNodes(bad), std::invalid_argument) << bad;
+  }
+  EXPECT_EQ(SplitNumaCapacity(11 * 4096 + 7, 2, 4096),
+            (std::vector<uint64_t>{5 * 4096, 6 * 4096 + 7}));
+  EXPECT_THROW(SplitNumaCapacity(4096, 2, 4096), std::invalid_argument);
+}
+
+TEST(BackendPolicyConfig, NumaPolicyPreservesHostOptionsAndSplitsBothNodes) {
+  const char* json = R"({"schema_version":1,"backends":{
+    "dram":{"type":"dram","capacity":"1GiB","numa_node":[0,1]}},
+    "tiers":[{"name":"host","backends":{"dram":100}}],"entry_tier":"host"})";
+  auto loaded = LoadBackendPolicyJson(json);
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+  PoolClientConfig output;
+  output.dram_page_size = 4096;
+  output.dram.use_hugepages = true;
+  output.dram.numa_strict = true;
+  output.dram.prefault_threads = 4;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  ASSERT_EQ(output.backends.size(), 1u);
+  const auto& dram = output.backends.front().dram;
+  EXPECT_EQ(dram.numa_nodes, (std::vector<int>{0, 1}));
+  EXPECT_EQ(dram.buffer_sizes, (std::vector<uint64_t>{1ULL << 29, 1ULL << 29}));
+  EXPECT_TRUE(dram.use_hugepages);
+  EXPECT_TRUE(dram.numa_strict);
+  EXPECT_EQ(dram.prefault_threads, 4);
+}
+
 // The three-tier example we ship, read from disk rather than copied here, so
 // that editing one without the other fails this test.
 TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
@@ -56,7 +90,7 @@ TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
     return nullptr;
   };
   ASSERT_NE(find_backend("dram"), nullptr);
-  EXPECT_EQ(find_backend("dram")->dram.numa_node, 0);
+  EXPECT_EQ(find_backend("dram")->dram.numa_nodes, (std::vector<int>{0}));
   ASSERT_NE(find_backend("hbm@0"), nullptr);
   ASSERT_NE(find_backend("hbm@1"), nullptr);
   EXPECT_EQ(find_backend("hbm@0")->hbm.buffer_sizes.front(), 40ULL << 30);

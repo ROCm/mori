@@ -655,3 +655,12 @@ endif()
 target_link_libraries(
   bench_umbp_gds_ssd_get
   PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+
+add_executable(test_umbp_numa_replication test_numa_replication.cpp)
+target_link_libraries(test_umbp_numa_replication PRIVATE umbp_core umbp_common
+                      ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB} gtest_main)
+add_test(NAME umbp_numa_replication COMMAND test_umbp_numa_replication
+         --gtest_filter=NumaReplication.*)
+add_test(NAME umbp_numa_replication_gpu COMMAND test_umbp_numa_replication
+         --gtest_filter=NumaReplicationGpu.*)
+set_tests_properties(umbp_numa_replication_gpu PROPERTIES LABELS "integration")

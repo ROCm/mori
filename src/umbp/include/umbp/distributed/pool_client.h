@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -250,6 +251,10 @@ class PoolClient {
 
  private:
   PoolClientConfig config_;
+  std::vector<int> replica_nodes_;
+  std::array<std::string, 2> replica_suffixes_;
+  std::string ReplicaKey(const std::string& key, size_t replica) const;
+  size_t PreferredReplica(void* ptr, size_t size) const;
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
@@ -331,6 +336,8 @@ class PoolClient {
   // offset triple, because whether a transfer needs staging is the transfer
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
+  int PreferredNumaNodeFor(void* ptr, size_t size) const;
+  std::unordered_map<int, int> gpu_to_numa_;
 
   // Zero-copy registered memory regions, kept sorted by `base`.
   //
@@ -386,7 +393,8 @@ class PoolClient {
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
                          std::vector<ResolvedEntry>* resolutions,
-                         const std::function<bool(size_t)>& dst_is_device = {});
+                         const std::function<bool(size_t)>& dst_is_device = {},
+                         const std::function<size_t(size_t)>& preferred_replica = {});
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -512,6 +520,10 @@ class PoolClient {
   void ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
                                   std::vector<bool>* results, double* committed_bytes = nullptr,
                                   const RangedPhaseSinks* sinks = nullptr);
+  void ExecuteReplicatedPutBatch(const std::vector<LocalRangeWriteRequest>& requests,
+                                 std::vector<bool>* results, double* committed_bytes,
+                                 const RangedPhaseSinks& sinks,
+                                 std::vector<bool>* written = nullptr);
   // After a successful remote DRAM fetch, if cache_remote_fetches is enabled and
   // the admission gate admits the block, enqueue it for asynchronous install into
   // this node's local DRAM tier (see ReCacheWorkerLoop). The install (DRAM
