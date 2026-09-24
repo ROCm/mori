@@ -222,16 +222,17 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
       ::mori::cco::ccoCoopThread{});
 }
 
-// Drains every stripe: flush(peer) only polls the QP belonging to its own
-// context, so flushing one would leave the puts issued on the other qpIds
-// outstanding. numQp is config.numQpPerPe, which is also what the devComm was
-// created with (gdaContextCount).
+// Drains one stripe: flush(peer) only polls the QP belonging to its own
+// context, so each QP a peer was sent on has to be flushed separately.
 __device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe,
-                                                 int numQp) {
-  for (int qpId = 0; qpId < numQp; ++qpId) {
-    ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
-    gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
-  }
+                                                 int qpId) {
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
+}
+
+// The value a combine adds on QP qpId; see kCombineBarrierMarkerTotal.
+__device__ __forceinline__ constexpr uint64_t CombineBarrierMarker(int qpId, int activeQps) {
+  return qpId == 0 ? uint64_t(kCombineBarrierMarkerTotal - (activeQps - 1)) : uint64_t{1};
 }
 
 // Spin on a local symmetric slot until a peer publishes a positive value. No
@@ -815,18 +816,33 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     }
   }
 
-  for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
-    // The send loops above target only remote nodes ((myNode + 1 + i) % nNodes),
-    // so the local node never has GDA traffic to drain. Skipping it is not just
-    // an optimisation: endpoints is world-indexed but RAIL only connects
-    // cross-node same-rail peers, so a local proxyPe's slot is zero-filled --
-    // and on a single node the mask collapses to NONE and endpoints is null.
-    // flush() indexes it without a reachability check, so quieting the local
-    // node faults. shmem's ShmemQuietThread tolerated the self peer, which is
-    // why the original loop covered every node.
-    if (i == myNode) continue;
-    int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
-    EpInterNodeQuiet(comm, proxyPe, config.numQpPerPe);
+  // Every QP any kernel of this op may send on (kConfig.numQpToDrain), not just
+  // the ones this dispatch used. The combine before it may have used more --
+  // the two phases choose their counts independently -- and nothing else polls
+  // a QP no dispatch uses. Leaving those unpolled is not incorrect (the send
+  // path polls for itself once the queue is full), but it turns into a stall
+  // inside a later combine instead of a cost paid here. Not the whole
+  // allocation either: flushing a QP that never carries traffic still costs a
+  // system fence, which measurably slows dispatch. Capped by the allocation:
+  // ccoGda takes the context id modulo it, so a qpId past it would only flush
+  // one of the same peer's lower QPs a second time.
+  //
+  // One (node, QP) pair per warp so different QPs drain concurrently, over the
+  // remote nodes only and numbered from warp 0. The send loops above target
+  // only remote nodes ((myNode + 1 + i) % nNodes), so the local node never has
+  // GDA traffic to drain. Skipping it is not just an optimisation: endpoints is
+  // world-indexed but RAIL only connects cross-node same-rail peers, so a local
+  // proxyPe's slot is zero-filled -- and on a single node the mask collapses to
+  // NONE and endpoints is null. flush() indexes it without a reachability
+  // check, so quieting the local node faults. Enumerating remote pairs directly
+  // also keeps the drains on the lowest warps rather than a later block.
+  constexpr int kDrainQps =
+      kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
+  const int drainQps = min(kDrainQps, comm.ibgda.numQpPerPe);
+  for (int pair = globalWarpId; pair < (nNodes - 1) * drainQps; pair += globalWarpNum) {
+    int node = (myNode + 1 + pair / drainQps) % nNodes;
+    int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
+    EpInterNodeQuiet(comm, proxyPe, pair % drainQps);
   }
 }
 
@@ -1235,7 +1251,8 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t), 1, proxyPe, i);
+                             args.rank * sizeof(uint64_t),
+                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
       }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
@@ -1244,7 +1261,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
       }
     }
   }
@@ -1375,7 +1392,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t), 1, proxyPe, i);
+                             args.rank * sizeof(uint64_t),
+                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
       }
       __threadfence_system();
     }
@@ -1386,7 +1404,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
       }
     }
   }

@@ -9,6 +9,7 @@
 #                         [--combine-dtype <bf16|...>] [--hidden-dim <N>] [--topk <N>] \
 #                         [--max-recv-total-tokens <N>] [--sentinel-pattern <p>] \
 #                         [--rounds <N>] [--spawn <N>] [--nproc-per-node <N>] \
+#                         [--active-qps <N>] [--active-qp-counts <a,b,...>] \
 #                         [--entry <path>]
 #
 # The optional shape/dtype flags are pass-throughs to the harness, which already
@@ -28,7 +29,7 @@
 # (no test_sentinel/sweep_bench/profile), --kernel-type is auto|v2|v2_ll
 # against v1's v1|v1_ll|async_ll (they are different kernels, not a renaming), and
 # it accepts neither --max-recv-total-tokens nor --sentinel-pattern. It is the
-# only entry that takes --rounds and --spawn.
+# only entry that takes --rounds, --spawn, --active-qps and --active-qp-counts.
 #
 # --spawn selects the v2 entry's process topology and has to be reachable from
 # here, because the two ways of getting 8 ranks per node are mutually exclusive:
@@ -59,6 +60,8 @@ MAX_RECV_TOTAL_TOKENS=""
 SENTINEL_PATTERN=""
 ROUNDS=""
 SPAWN=""
+ACTIVE_QPS=""
+ACTIVE_QP_COUNTS=""
 NPROC_PER_NODE=1
 ENTRY="examples/ops/dispatch_combine/test_dispatch_combine_internode.py"
 
@@ -83,6 +86,8 @@ while [[ $# -gt 0 ]]; do
     --entry)            ENTRY="$2";                 shift 2 ;;
     --rounds)           ROUNDS="$2";                shift 2 ;;
     --spawn)            SPAWN="$2";                 shift 2 ;;
+    --active-qps)       ACTIVE_QPS="$2";            shift 2 ;;
+    --active-qp-counts) ACTIVE_QP_COUNTS="$2";      shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
@@ -114,6 +119,8 @@ EXTRA_ARGS=()
 [[ -n "$SENTINEL_PATTERN" ]] && EXTRA_ARGS+=(--sentinel-pattern "$SENTINEL_PATTERN")
 [[ -n "$ROUNDS" ]]         && EXTRA_ARGS+=(--rounds "$ROUNDS")
 [[ -n "$SPAWN" ]]          && EXTRA_ARGS+=(--spawn "$SPAWN")
+[[ -n "$ACTIVE_QPS" ]]     && EXTRA_ARGS+=(--active-qps "$ACTIVE_QPS")
+[[ -n "$ACTIVE_QP_COUNTS" ]] && EXTRA_ARGS+=(--active-qp-counts "$ACTIVE_QP_COUNTS")
 [[ -n "$KERNEL_TYPE" ]]    && EXTRA_ARGS+=(--kernel-type "$KERNEL_TYPE")
 
 exec timeout "${MORI_INTERNODE_TIMEOUT:-120}" torchrun \

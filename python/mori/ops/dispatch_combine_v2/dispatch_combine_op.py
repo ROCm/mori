@@ -110,8 +110,9 @@ class EpDispatchCombineConfig:
     # Pinning is per FIELD, not all-or-nothing: on the internode path a pinned
     # field overrides the tuning table for every token bucket while the fields
     # left None stay tuned, so you can fix one knob without hand-writing the
-    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override the whole triple
-    # for a leg and bypass the table entirely.
+    # other five. MORI_EP_DISP_GEOM / MORI_EP_COMB_GEOM override a leg's whole
+    # geometry and bypass the table entirely: block,rdma,warp, plus an optional
+    # fourth field for the active QP count that also beats active_qps.
     dispatch_block_num: int = None
     combine_block_num: int = None
     warp_num_per_block: int = None
@@ -130,10 +131,17 @@ class EpDispatchCombineConfig:
     # and must agree with the communicator's LSA team, which the op checks at
     # construction rather than assuming.
     gpu_per_node: int = None
-    # QPs per peer on the RDMA leg. Only read on the internode path, where 1
-    # starves it (~1.5x); the intranode path never reaches RDMA and ignores it,
-    # so the default is the value the only consumer wants.
-    num_qp_per_pe: int = 2
+    # Allocated QPs per peer on the RDMA leg, fixed for this op's lifetime.
+    # The intranode path does not use QPs. How many a kernel sends on -- the
+    # active count, a compile-time constant of each kernel -- is chosen per
+    # phase and per token bucket by the tuning table, within this allocation.
+    num_qp_per_pe: int = 8
+    # Pin the active count for every bucket and both phases, over the table.
+    # None: the table's count, else min(2, num_qp_per_pe).
+    active_qps: int = None
+    # Extra active counts compiled for every bucket geometry, so that
+    # op.set_active_qps() can switch to any of them without compiling.
+    active_qp_counts: tuple = None
     # Widest transported element, which is what sizes the staging buffers. None
     # => max over the two legs, which is what the buffers actually have to hold.
     max_token_type_size: int = None
@@ -181,8 +189,38 @@ class EpDispatchCombineConfig:
                 "node * gpu_per_node + local rank and a partial node has no such "
                 "encoding"
             )
-        if self.num_qp_per_pe < 1:
-            raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
+        # 64 is kCombineBarrierMarkerTotal (ep_internode_cfg.hpp): QP 0 carries
+        # the remainder of that fixed per-combine total, so it caps how many QPs
+        # a kernel may send on, and so the most worth allocating.
+        if type(self.num_qp_per_pe) is not int or not 1 <= self.num_qp_per_pe <= 64:
+            raise ValueError(
+                f"num_qp_per_pe must be an integer in [1, 64], got {self.num_qp_per_pe}"
+            )
+        if self.active_qps is not None:
+            if (
+                type(self.active_qps) is not int
+                or not 1 <= self.active_qps <= self.num_qp_per_pe
+            ):
+                raise ValueError(
+                    "active_qps must be an integer between 1 and num_qp_per_pe"
+                )
+            if not self.is_internode:
+                raise ValueError("active_qps is only supported by the internode path")
+        if self.active_qp_counts is not None:
+            counts = tuple(self.active_qp_counts)
+            if not counts or any(
+                type(count) is not int or not 1 <= count <= self.num_qp_per_pe
+                for count in counts
+            ):
+                raise ValueError(
+                    "active_qp_counts must contain integers in "
+                    f"[1, num_qp_per_pe={self.num_qp_per_pe}]"
+                )
+            self.active_qp_counts = tuple(sorted(set(counts)))
+            if not self.is_internode:
+                raise ValueError(
+                    "active_qp_counts is only supported by the internode path"
+                )
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):

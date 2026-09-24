@@ -52,7 +52,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
 | `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
-| `internode_tuning_configs.py` | **hip** internode kernel geometry, a third table: token-count buckets keyed by device, shape, topk and dispatch dtype, carrying `(block_num, rdma_block_num, warp_num)` **per phase** — dispatch and combine are tuned to different values over one shared arena. The internode plans are compiled per geometry, so the backend walks the whole table at build time and `lookup` only picks a prebuilt bucket; `block_num` is clamped to the CU count |
+| `internode_tuning_configs.py` | **hip** internode kernel geometry, a third table: token-count buckets keyed by device, shape, topk and dispatch dtype, carrying `(block_num, rdma_block_num, warp_num)` **per phase**, optionally followed by the active QP count (one field for both phases, or dispatch then combine) — dispatch and combine are tuned to different values over one shared arena. The internode plans are compiled per geometry, so the backend walks the whole table at build time and `lookup` only picks a prebuilt bucket; `block_num` is clamped to the CU count |
 
 ## Internode config
 
@@ -65,7 +65,38 @@ the **hip** backend implements it.
 | `gpu_per_node` | `None` → `world_size`, i.e. one node | GPUs per physical node; `world_size` must be a positive multiple of it. Setting it smaller is what selects the internode path. It is EP's own idea of a node and is checked against the communicator's LSA team (`lsa_size`, `lsa_rank`) at construction |
 | `internode_kernel` | `"auto"` | Which internode kernel family runs. `"v2"` = the general path (chunked, deduplicating, sized for wide tokens); `"v2_ll"` = low latency (no dedup across expert slots, one entry per node per token). They are separate JIT modules, so naming one compiles only that one and it cannot fall back; `"auto"` compiles both and chooses per launch |
 | `internode_auto_ll_max_tokens` | `512` | The `"auto"` crossover, compared against **this call's** token count (`input.shape[0]` for dispatch, `routing.cur_rank_num_token` for combine): `<=` runs `v2_ll`, `>` runs `v2`. One op therefore alternates as the batch changes. Unrelated to `max_num_inp_token_per_rank`, which is the capacity. Read only when `internode_kernel == "auto"`; must be >= 0 |
-| `num_qp_per_pe` | `2` | QPs per peer on the RDMA leg. Only the internode path reads it, and 1 starves it (~1.5x), so the default is what that path wants; the intranode path ignores it. Must be >= 1 |
+| `num_qp_per_pe` | `8` | QPs **allocated** per connected peer, fixed for the DevComm's lifetime; at most 64. Unused by intranode kernels |
+| `active_qps` | `None` | Pin the **active** count -- how many of the allocated QPs a kernel sends on -- for every bucket and both phases. `None`: the tuning table's count, else `min(2, num_qp_per_pe)` |
+| `active_qp_counts` | `None` | Extra counts, e.g. `(1, 2, 4, 8)`, compiled for every bucket geometry so `op.set_active_qps()` can switch to them |
+
+The active count is a compile-time constant of each kernel, chosen like the
+geometry: per phase and per token bucket, from the tuning table, so a rank
+picks it from its own token count. Ranks therefore may run different counts in
+one cycle, and so may a dispatch and the combine that follows it. That is safe
+because a combine's contribution to the cross-node barrier does not depend on
+its count: every active QP carries one marker behind its data, and the markers
+of one combine always sum to the same total (`kCombineBarrierMarkerTotal` in
+`ep_internode_cfg.hpp`).
+
+`op.set_active_qps(n)` overrides the count of every bucket, both phases, for the
+launches that follow, and `op.set_active_qps(None)` returns to each bucket's own
+resolved count (`active_qps` if set, else the table's, else
+`min(2, num_qp_per_pe)`); only
+counts in `active_qp_counts` can be selected, and selecting one never compiles
+or recreates a QP. A sweep pins it per phase instead, as a fourth field of
+`MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`block,rdma,warp,active_qps`).
+Dispatch drains every QP the op can send on -- its largest active count over
+all buckets, both phases and `active_qp_counts`, not the whole allocation -- so
+QPs only a combine used are still polled once a cycle, while an op that never
+goes above two QPs pays for two.
+
+What the barrier still needs is pairing: exactly one combine per dispatch on
+every rank. The wait target is the rank's own dispatch count times that fixed
+total, so a dispatch without its combine, or a second combine, leaves a peer
+waiting for a value that never comes. Complete each dispatch/combine pair
+before starting the next, and order arena reuse across streams and graph
+replays. All ranks should also run the same kernel family in a cycle; the
+active count is the only per-cycle choice that may differ between them.
 
 Two further internode-only rules `__post_init__` applies: `quant_type` must be
 `"none"` (the internode combine's fp8 staging path is incomplete and returns
@@ -77,7 +108,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | file | role |
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
-| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (default 1), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
+| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (QPs allocated, default 1), `--active-qps`, `--active-qp-counts` (under `--cmd test`/`stress` the ranks switch among them, deliberately out of step), `--tuning-qps` (active counts crossed with the geometry sweep), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
 | `test_internode_regions.py` | pure-Python invariants of `internode_regions()`: the name contract with the backend and the capacity bounds the kernel's indexing implies. No GPU, no process group |
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels |
