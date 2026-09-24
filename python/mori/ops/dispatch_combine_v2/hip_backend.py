@@ -146,7 +146,7 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 _XDB_FLAG_SLOTS = 256
 
 
-class _TokOffExt:
+class TokOffExt:
     """Dispatch's slot allocator word outside the cco window (default-on gfx1250; MORI_EP_TOKOFF_EXT=0 opts out).
 
     One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
@@ -322,7 +322,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
         self.dest_pe_counter = torch.zeros(cfg.world_size, **i32)
         # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
-        # memory instead of the cco window (see _TokOffExt): the cco-window slot
+        # memory instead of the cco window (see TokOffExt): the cco-window slot
         # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
         # only kernel that reads tokOffPeers. Default-on; MORI_EP_TOKOFF_EXT=0
         # (or false/no/off) opts back out to the cco-window path (tokOffPeers
@@ -332,7 +332,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         _tokoff_env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
         _tokoff_on = _tokoff_env not in ("0", "false", "no", "off")
         if self._is1250 and _tokoff_on:
-            self._tokoff_ext = _TokOffExt(cfg.rank, cfg.world_size, dev)
+            self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
             self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
