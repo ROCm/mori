@@ -713,8 +713,20 @@ class CMakeBuild(build_ext):
             if build_xla_ffi_ops.upper() == "ON"
             else os.environ.get("BUILD_OPS_DEVICE", "OFF")
         )
-        BUILD_CCO_SDMA = os.environ.get(
-            "BUILD_CCO_SDMA", "ON" if build_benchmark.upper() == "ON" else "OFF"
+        # ON by default, matching CMakeLists.txt. See the comment there for why:
+        # the flag creates no queue on its own, and OFF produces a build whose
+        # SDMA puts silently move no bytes.
+        #
+        # Normalised, because this value is consumed twice and the two used to
+        # disagree: CMake takes 1/TRUE/yes as true, while the baked-in flag was
+        # `== "ON"`. `BUILD_CCO_SDMA=1` therefore built a host library with SDMA
+        # and JITted a device wrapper without it -- the same silent-zeros failure
+        # this default exists to prevent, from the other side.
+        BUILD_CCO_SDMA = (
+            "ON"
+            if os.environ.get("BUILD_CCO_SDMA", "ON").strip().upper()
+            in ("ON", "1", "TRUE", "YES", "Y")
+            else "OFF"
         )
         if build_benchmark.upper() == "ON" and BUILD_CCO_SDMA.upper() != "ON":
             print(

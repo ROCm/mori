@@ -205,8 +205,11 @@ def require_sdma() -> None:
     try:
         from mori.cco.device._build_flags import BUILD_CCO_SDMA
     except ImportError:
-        BUILD_CCO_SDMA = False
-    if not BUILD_CCO_SDMA:
+        # None, not False: the module is only written by setup.py's build_extension,
+        # so a source tree on PYTHONPATH has no opinion -- and ON is the default,
+        # so guessing OFF aborts a perfectly good build. Matches op.py.
+        BUILD_CCO_SDMA = None
+    if BUILD_CCO_SDMA is False:
         sys.exit(
             "BUILD_CCO_SDMA is OFF -- the SDMA path is compiled out, "
             "numbers would be fiction. Rebuild with BUILD_CCO_SDMA=ON."

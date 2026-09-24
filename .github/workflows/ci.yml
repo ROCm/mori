@@ -82,6 +82,14 @@ jobs:
       - name: Build and install mori
         run: $CT exec $CONTAINER pip install .
 
+      # BUILD_CCO_SDMA is ON by default, so without this nothing builds the
+      # compiled-out path any more: the `#else` in ccoSdmaSetupCommQueues, the
+      # `#ifndef BUILD_CCO_SDMA` fallback in cco.hpp, and the skip rule in
+      # tests/cpp/cco/CMakeLists.txt would only break for whoever sets the
+      # escape hatch. It used to be covered for free by being the default.
+      - name: Build and install mori (BUILD_CCO_SDMA=OFF)
+        run: $CT exec $CONTAINER bash -c "BUILD_CCO_SDMA=OFF pip install ."
+
       - name: Build and install mori (with examples)
         run: $CT exec $CONTAINER bash -c "BUILD_EXAMPLES=ON pip install ."
 
