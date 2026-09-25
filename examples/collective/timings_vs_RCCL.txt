@@ -111,6 +111,38 @@ all_reduce_test: mode=PUSH slices=4 blocks=256 (SMs=256)
 Rank 0: PASS | 2 warmup + 5 runs | avg 4.681 ms (114.680 GB/s) min 4.678 ms (114.760 GB/s) max 4.687 ms
 --------------------
 
+collectives_benchmark: coll=all_reduce npes=4 size=1048576 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=78643200 staging=3145728 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 0.095 ms (44.147 GB/s) min 0.089 ms (47.361 GB/s) max 0.106 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=2097152 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=90177536 staging=6291456 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 0.137 ms (61.059 GB/s) min 0.124 ms (67.825 GB/s) max 0.151 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=4194304 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=113246208 staging=12582912 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 0.228 ms (73.504 GB/s) min 0.194 ms (86.623 GB/s) max 0.252 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=8388608 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=159383552 staging=25165824 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 0.343 ms (97.724 GB/s) min 0.334 ms (100.354 GB/s) max 0.359 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=16777216 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=251658240 staging=50331648 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 0.639 ms (105.056 GB/s) min 0.628 ms (106.841 GB/s) max 0.650 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=33554432 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=436207616 staging=100663296 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 1.204 ms (111.436 GB/s) min 1.194 ms (112.440 GB/s) max 1.217 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=67108864 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=805306368 staging=201326592 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 2.394 ms (112.111 GB/s) min 2.371 ms (113.229 GB/s) max 2.417 ms
+--------------------
+collectives_benchmark: coll=all_reduce npes=4 size=134217728 dtype=F32 op=SUM mode=push logS=2
+collectives_benchmark: heap=1543503872 staging=402653184 perRankVmm=4294967296
+Rank 0: PASS op=SUM | 2 warmup + 5 runs | avg 4.664 ms (115.105 GB/s) min 4.658 ms (115.264 GB/s) max 4.674 ms
+
 RCCL all-reduce
 I0000 00:00:1785496353.368317    5679 gpu_collectives_test.cc:801] bytes: 4194304 ms: 0.0582726 alg_bw: 71.9773 GB/s  bus_bw: 107.966 GB/s
 I0000 00:00:1785496353.369468    5679 gpu_collectives_test.cc:801] bytes: 8388608 ms: 0.0903609 alg_bw: 92.8345 GB/s  bus_bw: 139.252 GB/s
