@@ -214,6 +214,47 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
           args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
     }
   }
+
+  // ---- Replay routing: reuse cached dispDestTokIdMap to scatter payload (backward dispatch) ----
+  // #532 (gfx1250 bring-up) split dispatch into the three !replayMode phases above and dropped the
+  // replay branch, so replay-mode dispatch (MoriCombine.backward's op.dispatch(routing=...)) moved
+  // no payload -> dispatchOut / grad_x stayed stale -> exploding grad norm while the forward (which
+  // uses cache-routing dispatch + replay-routing combine) stayed correct. Recover (destPe,
+  // destTokId) from the routing map written by the matching cache-routing dispatch -- exactly the
+  // pre-#532 else-branch -- and copy metadata + payload. destPeTokenCounter / dispTokOffset are
+  // left untouched: in replay mode the host takes total_recv from the routing handle, not the
+  // kernel's signal, and the completion handshake below is a pure ordering barrier.
+  if (args.tokenIndices && args.inpTokenBuf && args.replayMode) {
+    for (int i = globalWarpId; i < Npair; i += globalWarpNum) {
+      index_t flat = args.dispDestTokIdMap[i];
+      index_t destPe = PeFromFlatTokenIndex(config, flat);
+      if (destPe >= config.worldSize) continue;  // dropped/deduped by the cached dispatch
+      index_t destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
+      index_t srcTokId = i / topk;
+
+      if (args.weightsBuf) {
+        core::WarpCopy(args.shmemDispatchOutWeightsMemObj->template GetAs<float*>(destPe) +
+                           (size_t)destTokId * config.numExpertPerToken,
+                       args.weightsBuf + (size_t)srcTokId * config.numExpertPerToken,
+                       (size_t)config.numExpertPerToken);
+      }
+      core::WarpCopy(args.shmemOutIndicesMemObj->template GetAs<index_t*>(destPe) +
+                         (size_t)destTokId * config.numExpertPerToken,
+                     args.tokenIndices + (size_t)srcTokId * config.numExpertPerToken,
+                     (size_t)config.numExpertPerToken);
+      if (args.scalesBuf && (config.scaleDim > 0) && (config.scaleTypeSize > 0)) {
+        size_t destScaleOffset = (size_t)destTokId * config.scaleDim * config.scaleTypeSize;
+        size_t srcScaleOffset = (size_t)srcTokId * config.scaleDim * config.scaleTypeSize;
+        core::WarpCopy(
+            args.shmemOutScalesMemObj->template GetAs<uint8_t*>(destPe) + destScaleOffset,
+            args.scalesBuf + srcScaleOffset, config.scaleDim * config.scaleTypeSize);
+      }
+      size_t destTokOffset = (size_t)destTokId * hiddenDim;
+      core::WarpCopy<T, 2>(
+          args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+          args.inpTokenBuf + (size_t)srcTokId * hiddenDim, hiddenDim);
+    }
+  }
   __syncthreads();
   // ---- Completion: all blocks arrive, then per-peer release-signal ----------------------------
   // THESE TWO WAITS ARE INDEPENDENT, WHICH IS WHY THE SLOT ONE GOES FIRST.
