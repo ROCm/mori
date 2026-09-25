@@ -43,14 +43,14 @@ namespace anvil {
 
 namespace {
 
-#define CHECK_HSA_ERROR(cmd)                                                               \
-  do {                                                                                     \
-    if (auto s = (cmd); s != HSA_STATUS_SUCCESS) {                                         \
-      const char* hsa_err_msg;                                                             \
-      hsa_status_string(s, &hsa_err_msg);                                                  \
-      throw std::runtime_error{std::string("HSA error at " __FILE__ ":") +                 \
-                             std::to_string(__LINE__) + std::string(" - ") + hsa_err_msg}; \
-    }                                                                                      \
+#define CHECK_HSA_ERROR(cmd)                                                                 \
+  do {                                                                                       \
+    if (auto s = (cmd); s != HSA_STATUS_SUCCESS) {                                           \
+      const char* hsa_err_msg;                                                               \
+      hsa_status_string(s, &hsa_err_msg);                                                    \
+      throw std::runtime_error{std::string("HSA error at " __FILE__ ":") +                   \
+                               std::to_string(__LINE__) + std::string(" - ") + hsa_err_msg}; \
+    }                                                                                        \
   } while (0)
 
 #define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \

@@ -225,7 +225,7 @@ void Context::CollectHostNames() {
     my.kfdNodeId = -1;
   }
   my.railFlag =
-          env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL"),
+      env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL"),
   snprintf(my.nodeId, sizeof(my.nodeId), "%s", nodeId.c_str());
 
   std::vector<Pack> global(WorldSize());
@@ -486,11 +486,10 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
     if (!peerCaps[i].canSDMA) continue;
     int peerNode = KfdNodeId(i);
     if (peerNode < 0 || localNode < 0) {
-      MORI_APP_WARN("Local or peer {} KFD node id unresolved for rank {}", i,
-                       LocalRank());
+      MORI_APP_WARN("Local or peer {} KFD node id unresolved for rank {}", i, LocalRank());
       peerCaps[i].canSDMA = false;
-      transportTypes[i] = (!IsP2PDisabled() && peerCaps[i].canP2P) ? TransportType::P2P
-                                                                   : TransportType::RDMA;
+      transportTypes[i] =
+          (!IsP2PDisabled() && peerCaps[i].canP2P) ? TransportType::P2P : TransportType::RDMA;
       continue;
     }
     anvil::anvil.connect(localNode, peerNode, sdmaNumChannels);

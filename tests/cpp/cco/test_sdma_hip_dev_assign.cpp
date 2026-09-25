@@ -457,17 +457,15 @@ int main(int argc, char** argv) {
     }
   } else if (g_visibleDevices.empty()) {
     if (nProcesses > totalDevices / g_devicesPerProcess) {
-      fprintf(stderr,
-             "--n_processes(%d) * --n_local_devices(%d) exceeds available devices (%d)\n",
-             nProcesses, g_devicesPerProcess, totalDevices);
+      fprintf(stderr, "--n_processes(%d) * --n_local_devices(%d) exceeds available devices (%d)\n",
+              nProcesses, g_devicesPerProcess, totalDevices);
       return 1;
     }
   } else if (numVisible != nProcesses * g_devicesPerProcess) {
     fprintf(stderr,
             "--visible_devices has %d entries but --n_processes(%d) * --n_local_devices(%d) "
             "= %d\n",
-            numVisible, nProcesses, g_devicesPerProcess,
-            nProcesses * g_devicesPerProcess);
+            numVisible, nProcesses, g_devicesPerProcess, nProcesses * g_devicesPerProcess);
     return 1;
   }
 
