@@ -37,7 +37,7 @@
 //                                                                      [required]
 //   --dtype  f32|bf16|f16|s32|s64   (reduction collectives)            [f32]
 //   --op     sum|prod|min|max       (reduction collectives)            [sum]
-//   --mode   push|pull              (reduce_scatter)                   [push]
+//   --mode   push|pull              (reduce_scatter, all_reduce)       [push]
 //   --logS   push slice count log2                                     [0]
 //   --warmup <n>                                                       [2]
 //   --iters  <n>                                                       [5]
@@ -577,7 +577,8 @@ static bool ParseMode(const char* s, RsMode& m) {
 
 static void Usage(const char* prog) {
   XPUT("Usage: %s --coll <name> --npes <n> --size <num_elems> "
-       "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] [--mode push|pull] "
+       "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] "
+       "[--mode push|pull (reduce_scatter, all_reduce)] "
        "[--logS <n>] [--warmup <n>] [--iters <n>]\n"
        "  coll: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute "
        "(rs|ar|ag|a2a|cp)",
@@ -609,11 +610,13 @@ static void SizeHeap(Config& cfg) {
     case Collective::kCollectivePermute: bufBytes = 2 * N; break;
   }
 
-  // Only the reduce paths stage through peer-writable scratch. The others still
-  // get a token region: Create reads 0 as "use heapBytes / 4", so asking for
-  // nothing would silently burn a quarter of the heap.
+  // Only the reduce paths in PUSH mode stage through peer-writable scratch
+  // (pull reads the peers directly). The others still get a token region:
+  // Create reads 0 as "use heapBytes / 4", so asking for nothing would silently
+  // burn a quarter of the heap.
   const bool isReduce =
-      (cfg.coll == Collective::kReduceScatter || cfg.coll == Collective::kAllReduce);
+      (cfg.coll == Collective::kReduceScatter || cfg.coll == Collective::kAllReduce) &&
+      cfg.mode != RsMode::kPull;
   const size_t staging = isReduce ? (npes - 1) * chunkBytes : 0;
   cfg.stagingBytes = std::max<size_t>(staging, CollectivesFacade::kDefAlign);
 
