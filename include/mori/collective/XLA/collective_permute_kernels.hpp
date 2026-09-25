@@ -79,8 +79,9 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   const uint32_t want = (srcPe >= 0) ? 1u : 0u;
 
   if (threadIdx.x == 0 && want) {
-    auto* addr = Iglobal(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
+    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
     while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
+      __builtin_amdgcn_s_sleep(1);
     }
   }
   __syncthreads();

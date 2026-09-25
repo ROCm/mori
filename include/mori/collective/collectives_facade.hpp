@@ -93,8 +93,9 @@ class CollectivesFacade {
 
   CollectivesFacade() = default;
  public:
-  // Reduce-scatter algorithm selection (default push). Set at runtime via
-  // SetReduceMode(); the push slice count via SetPushLogSlices().
+  // Reduce algorithm selection for reduce-scatter and all-reduce (default
+  // push). Set at runtime via SetReduceMode(); the push slice count via
+  // SetPushLogSlices().
   enum class RsMode { kPush, kPull };
 
   static constexpr size_t kDefAlign = 256;
@@ -165,10 +166,23 @@ class CollectivesFacade {
       return -1;
     }
 
-    // Staging is the push path's peer-writable scratch (SDMA scatter target). It
-    // lives in the shared heap window as the facade's FIRST internal allocation,
-    // so its heap offset is identical on every rank (symmetric) since every rank
-    // runs the same Create. User Allocate calls follow it. Pull needs none.
+    // The facade's internal buffers are carved from the shared heap window
+    // BEFORE any user Allocate, so their heap offsets are identical on every
+    // rank (symmetric) since every rank runs the same Create.
+    //
+    // syncFlags is the pull all-reduce's closing cross-PE handshake: slot p is
+    // owned by producer p and written by p over XGMI. It goes first because it
+    // is unconditional, which keeps its offset independent of maxStagingBytes.
+    facade.syncFlags_ =
+        static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
+    if (facade.syncFlags_ == nullptr) {
+      FACADE_PRINTF("CollectivesFacade: failed to carve sync flags from heap");
+      return -1;
+    }
+    HIP_RUNTIME_CHECK(hipMemset(facade.syncFlags_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
+
+    // Staging is the push path's peer-writable scratch (SDMA scatter target).
+    // Pull needs none.
     if (maxStagingBytes > 0) {
       facade.staging_ = facade.Allocate(maxStagingBytes);
       if (facade.staging_ == nullptr) {
@@ -297,8 +311,10 @@ class CollectivesFacade {
 
   // All-reduce: input is the full N = npes*chunk vector (symmetric heap), output
   // is the full reduced N vector (symmetric heap). numElems is the TOTAL element
-  // count (chunk = numElems / npes). Push-only (npes in [1,8]). `dt`/`op` select
-  // the element type and reduction; F32/BF16/F16/S32/S64 support all four ops.
+  // count (chunk = numElems / npes). npes in [1,8]. SetReduceMode() selects
+  // push (sliced SDMA reduce-scatter + pipelined broadcast) or pull (two-shot:
+  // reduce-scatter pull then all-gather pull, no SDMA). `dt`/`op` select the
+  // element type and reduction; F32/BF16/F16/S32/S64 support all four ops.
   hipError_t RunAllReduce(const void* input, void* output, size_t numElems,
                           DataType dt, ReduceOpKind op, hipStream_t stream);
 
@@ -370,6 +386,7 @@ class CollectivesFacade {
   void* staging_{nullptr};
   size_t stagingBytes_{0};
   uint32_t* groupCounters_{nullptr};
+  uint64_t* syncFlags_{nullptr};  // symmetric, pull all-reduce inter-shot handshake
   AddressPair* pinnedPairs_{nullptr};  // host-pinned, device-readable
   mori::cco::ccoComm* ccoComm_{nullptr};
   // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -405,6 +422,27 @@ namespace detail {
 // CCO-backed facade. Callers currently barrier host-side via ccoBarrierAll; a
 // device-side CCO barrier can be wired here later if RunBarrier is needed.
 __global__ void BarrierKernel() {}
+
+// The pull kernels take the peer count as a template argument so their
+// per-peer register tile (M positions x NPES peers) stays in VGPRs, so the
+// runtime npes has to be turned into a compile-time constant. Only the team
+// sizes that actually ship are instantiated; any other count is REJECTED
+// rather than rounded up to the nearest instantiation, which would silently
+// read past the end of the team.
+template <class F>
+hipError_t DispatchNpes(int npes, F&& f) {
+#define FACADE_NPES_CASE(n) \
+  case n:                   \
+    return std::forward<F>(f)(std::integral_constant<int, n>{});
+  switch (npes) {
+    FACADE_NPES_CASE(4)
+    FACADE_NPES_CASE(8)
+    default:
+      FACADE_PRINTF("CollectivesFacade: pull mode supports npes 4 or 8, got %d", npes);
+      return hipErrorInvalidConfiguration;
+  }
+#undef FACADE_NPES_CASE
+}
 
 }  // namespace detail
 
@@ -443,19 +481,14 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   if (mode_ == RsMode::kPull) {
     // The kernel resolves peer pe's copy of `input` device-side by the same
     // flat-VA rank delta the push path uses: input + (pe - myPe)*stride4G<<32,
-    // with stride4G read from heapWin_. NPES is a compile-time template arg;
-    // dispatch on the real npes.
-    auto launch = [&](auto NPES_c) {
+    // with stride4G read from heapWin_.
+    return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       ReduceScatterPullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
           <<<blocks, kThreads, 0, stream>>>(myPe_, heapWin_,
                                   reinterpret_cast<const ComputeT*>(input),
                                   reinterpret_cast<ComputeT*>(output), chunkElemsC);
-    };
-    switch (nPes_) {
-      case 2: launch(std::integral_constant<int, 2>{}); break;
-      case 4: launch(std::integral_constant<int, 4>{}); break;
-      default: launch(std::integral_constant<int, 8>{}); break;
-    }
+      return hipGetLastError();
+    });
   } else {
     // Every block loops over all S slices (no block-to-slice mapping), so the
     // grid needs no rounding to a multiple of S.
@@ -490,27 +523,44 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   using ComputeT = typename detail::ReduceComputeType<T>::type;
   using ReduceOp = Op;
 
-  const size_t chunkElems = numElems / static_cast<size_t>(nPes_);
+  const size_t chunkElems = numElems / nPes_;
   const size_t chunkBytes = chunkElems * sizeof(T);
-  if ((nPes_ - 1) * chunkBytes > stagingBytes_) {
+  // Only the push path stages through peer-writable scratch; pull reads peers
+  // directly and gathers straight into output.
+  if (mode_ != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
     FACADE_PRINTF("AllReduce: staging too small; increase maxStagingBytes");
     return hipErrorInvalidConfiguration;
   }
 
   constexpr size_t kPack = sizeof(ComputeT) / sizeof(T);
   const size_t chunkElemsC = chunkElems / kPack;
-  constexpr int NumPushVecs = 8;
+  constexpr int NumPushVecs = 8, NumPullVecs = 8;
   constexpr int VecSize = VecBytes / sizeof(ComputeT);
   constexpr int kThreads = 256;
   size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
-  // Cap the grid to the SM count so all blocks are co-resident (required for the
-  // multi-producer broadcast submitPacket ordering).
+  // Cap the grid to the SM count so all blocks are co-resident, which push needs
+  // for the multi-producer broadcast submitPacket ordering. The fused pull no
+  // longer requires it (only its last block waits, and only after signalling),
+  // so uncapping that path is open as a tuning knob.
   int blocks = std::min(wantBlocks, std::max(1, MP_count_));
 
   int logS = logS_;
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
   while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
+
+  if (mode_ == RsMode::kPull) {
+    // Fused pull: reduce this PE's shard straight off the peers' inputs and fan
+    // the result out to every peer from registers, in one pass. No SDMA and no
+    // staging; syncFlags_ carries the single closing handshake.
+    return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
+      AllReducePullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
+          <<<blocks, kThreads, 0, stream>>>(myPe_, reinterpret_cast<const ComputeT*>(input),
+                                            reinterpret_cast<ComputeT*>(output), syncFlags_,
+                                            groupCounters_, chunkElemsC, heapWin_);
+      return hipGetLastError();
+    });
+  }
 
   // Sliced push reduce-scatter + pipelined per-slice broadcast, all in one kernel.
   // Every block loops over all S slices (no block-to-slice mapping), so the grid
