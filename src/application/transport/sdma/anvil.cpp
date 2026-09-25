@@ -342,7 +342,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // ringing its doorbell hangs, so fold every selected id down to its backing
   // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
   // budget is not double-charged.
-  if (isMi308x(srcDeviceId)) {
+  if (isMi308x(srcNode)) {
     uint32_t seen = 0;
     std::vector<uint32_t> evenEngines;
     for (uint32_t e : engines) {
@@ -422,9 +422,9 @@ bool AnvilLib::isGfx1250(int node) {
 // MI308X (PCI device_id 0x74A2) is a 4-XCD harvest of the 8-XCD MI300X. Both are
 // gfx942, so EngineId cannot tell them apart; match the PCI device id instead.
 // See connect() for why its odd SDMA engine ids must be avoided.
-bool AnvilLib::isMi308x(int deviceId) {
+bool AnvilLib::isMi308x(int node) {
   HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(getNodeId(deviceId), &props) != HSAKMT_STATUS_SUCCESS) return false;
+  if (hsaKmtGetNodeProperties(node, &props) != HSAKMT_STATUS_SUCCESS) return false;
   return props.DeviceId == 0x74A2;
 }
 
