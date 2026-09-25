@@ -33,6 +33,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/common/rpc_deadline.h"
 
 namespace mori::umbp::standalone {
 namespace {
@@ -66,16 +67,12 @@ TierType TierFromProto(::umbp::TierType tier) {
 }
 
 int RpcShutdownTimeoutMs() {
-  const char* raw = std::getenv("UMBP_RPC_SHUTDOWN_TIMEOUT_MS");
-  if (!raw || raw[0] == '\0') return 3000;
-  const int parsed = std::atoi(raw);
-  return parsed > 0 ? parsed : 3000;
+  static const int v =
+      ResolveDeadlineMs("UMBP_RPC_SHUTDOWN_TIMEOUT_MS", std::chrono::milliseconds(3000));
+  return v;
 }
 
-void SetDeadline(grpc::ClientContext* ctx) {
-  ctx->set_deadline(std::chrono::system_clock::now() +
-                    std::chrono::milliseconds(RpcShutdownTimeoutMs()));
-}
+void SetDeadline(grpc::ClientContext* ctx) { ArmDeadline(*ctx, RpcShutdownTimeoutMs()); }
 
 }  // namespace
 

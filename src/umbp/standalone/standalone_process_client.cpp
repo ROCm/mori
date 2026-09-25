@@ -33,17 +33,23 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
+#include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/common/progress_logger.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/common/rpc_deadline.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 
@@ -75,6 +81,106 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
     for (char c : key) mix(static_cast<unsigned char>(c));
   }
   return hash == 0 ? kPrime : hash;
+}
+
+// These RPCs used to carry no deadline at all, so a wedged server handler
+// blocked the calling scheduler rank forever -- and with it the TP group, which
+// could no longer reach its next collective. Observed on Kimi-K3: a BatchExists
+// that never returned. A caller that hits this deadline sees the same
+// grpc::Status as any other RPC failure, which it already handles as a miss.
+//
+// A bound on a hang, not a tuned latency: raising it only slows the report on
+// an already-wedged server, while setting it too low silently turns calls that
+// were about to succeed into misses. 300s is far above any healthy value --
+// waits of 70-260s were measured before the lock this once queued behind was
+// fixed.
+int DataPlaneRpcTimeoutMs() {
+  static const int v =
+      ResolveDeadlineMs("UMBP_DATA_PLANE_RPC_TIMEOUT_MS", std::chrono::milliseconds(300000));
+  return v;
+}
+
+void ArmDataPlaneDeadline(grpc::ClientContext& ctx) { ArmDeadline(ctx, DataPlaneRpcTimeoutMs()); }
+
+// A liveness bound for the one-time-per-buffer registration RPC, NOT a latency
+// budget: it exists so a wedged server releases the rank -- and its allocation
+// -- rather than holding both forever.
+//
+// Err high. Too generous only delays the report on an already-broken server;
+// too tight kills a run that was about to succeed, and unlike a data-plane
+// call, which degrades to the "not found" its caller already handles, a failed
+// registration throws. The old 180 s default was shorter than the 599.6 s
+// bulk registration this file elsewhere records, and shorter than the routine
+// data-plane deadline -- inverted, for the strictly slower operation.
+//
+// Registrations also serialize across a node's ranks, so budget for the whole
+// queue rather than one buffer. Raise the knob for larger pools, or set 0 to
+// wait indefinitely; never set it below UMBP_DATA_PLANE_RPC_TIMEOUT_MS.
+int RegisterMemoryRpcTimeoutMs() {
+  static const int v =
+      ResolveDeadlineMs("UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS", std::chrono::milliseconds(3600000));
+  return v;
+}
+
+void ArmRegisterMemoryDeadline(grpc::ClientContext& ctx) {
+  ArmDeadline(ctx, RegisterMemoryRpcTimeoutMs());
+}
+
+// A synchronous unary call says nothing until it returns, so slow and wedged
+// look identical -- which is what forces the deadline above to be generous, and
+// a generous deadline is only safe if "still working" is visible before it
+// fires.
+class RegistrationProgressLogger {
+ public:
+  RegistrationProgressLogger(const char* what, uintptr_t ptr, size_t size)
+      : log_(kInterval, [what, ptr, size](std::chrono::milliseconds elapsed) {
+          MORI_UMBP_INFO(
+              "[StandaloneProcessClient] still registering {} ptr=0x{:x} size={}MB, elapsed={}s "
+              "(deadline={}ms, 0=none)",
+              what, ptr, size / (1024 * 1024), elapsed.count() / 1000,
+              RegisterMemoryRpcTimeoutMs());
+        }) {}
+
+  int64_t ElapsedMs() const { return log_.Elapsed().count(); }
+
+ private:
+  // Once a minute. These calls are measured in minutes when they are healthy,
+  // so anything finer is noise rather than signal.
+  static constexpr std::chrono::seconds kInterval{60};
+
+  ScopedProgressLog log_;
+};
+
+// A bare "Deadline Exceeded" says nothing about what to do next, and the answer
+// is usually "raise one env var". Naming the knob turns a lost run into a rerun.
+std::string RegisterMemoryFailureMessage(const char* what, uintptr_t ptr, size_t size,
+                                         int64_t elapsed_ms, const grpc::Status& status,
+                                         const std::string& response_error) {
+  std::string message = fmt::format(
+      "standalone RegisterMemory failed for {} ptr=0x{:x} size={}MB after {}ms: {}", what, ptr,
+      size / (1024 * 1024), elapsed_ms, status.ok() ? response_error : status.error_message());
+  if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    message += fmt::format(
+        " -- this is the client-side deadline (UMBP_REGISTER_MEMORY_RPC_TIMEOUT_MS={}ms), not the "
+        "server refusing. If the registration was merely slow rather than wedged, raise it, or set "
+        "it to 0 to wait indefinitely.",
+        RegisterMemoryRpcTimeoutMs());
+  }
+  return message;
+}
+
+// Every routine data-plane call below degrades a non-OK grpc::Status to the
+// same "not found" / no-op return the caller already uses for a genuine miss,
+// so a deadline firing was previously silent -- indistinguishable, from the
+// logs, from the key really not being there. Log it, so DEADLINE_EXCEEDED
+// (the two ArmXxxDeadline() calls above are the only source of it here) reads
+// as what it is instead of vanishing into an unremarkable hit-rate dip.
+void LogDataPlaneRpcFailure(const char* call, const grpc::Status& status) {
+  if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    MORI_UMBP_WARN("[StandaloneProcessClient] {} timed out: {}", call, status.error_message());
+  } else {
+    MORI_UMBP_WARN("[StandaloneProcessClient] {} failed: {}", call, status.error_message());
+  }
 }
 
 ::umbp::TierType TierToProto(TierType tier) {
@@ -321,6 +427,7 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   uint64_t region_base = 0;
   if (!OffsetFor(src, size, &offset, &region_base)) return false;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::PutRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
@@ -329,7 +436,11 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Put(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Put", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t size) {
@@ -340,6 +451,7 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   uint64_t region_base = 0;
   if (!OffsetFor(dst, size, &offset, &region_base)) return false;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::GetRequest req;
   req.set_key(key);
   req.set_client_id(ClientId());
@@ -348,7 +460,11 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Get(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Get", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::Exists(const std::string& key) const {
@@ -356,11 +472,16 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::KeyRequest req;
   req.set_key(key);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Exists(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Exists", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::string>& keys,
@@ -385,9 +506,14 @@ std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::strin
     req.add_sizes(sizes[i]);
   }
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchPut", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -417,9 +543,14 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
     req.add_depths(i < depths.size() ? depths[i] : -1);
   }
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchPutWithDepth", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -447,9 +578,14 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
     req.add_sizes(sizes[i]);
   }
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchGet(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchGet", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -579,9 +715,13 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     }
 
     grpc::ClientContext ctx;
+    ArmDataPlaneDeadline(ctx);
     ::umbp::BatchBoolResponse resp;
     const grpc::Status status = stub_->BatchGetRanges(&ctx, req, &resp);
-    if (!status.ok()) return failed;
+    if (!status.ok()) {
+      LogDataPlaneRpcFailure("BatchGetRanges", status);
+      return failed;
+    }
     if (resp.key_handle_unknown()) {
       ForgetKeyHandle(handle);
       handle = 0;
@@ -628,9 +768,14 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
   }
 
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchBoolResponse resp;
   const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchPutRanges", status);
+    return failed;
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) return failed;
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
 
@@ -639,11 +784,16 @@ std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::st
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchExists(&ctx, req, &resp);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchExists", status);
+    return std::vector<bool>(keys.size(), false);
+  }
+  if (resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
@@ -654,11 +804,16 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   std::shared_lock lk(op_mutex_);
   if (closed_) return 0;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
   grpc::Status status = stub_->BatchExistsConsecutive(&ctx, req, &resp);
-  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("BatchExistsConsecutive", status);
+    return 0;
+  }
+  return static_cast<size_t>(resp.count());
 }
 
 bool StandaloneProcessClient::Clear() {
@@ -666,10 +821,15 @@ bool StandaloneProcessClient::Clear() {
   std::unique_lock lk(op_mutex_);
   if (closed_) return true;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Clear(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Clear", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::Flush() {
@@ -677,10 +837,15 @@ bool StandaloneProcessClient::Flush() {
   std::shared_lock lk(op_mutex_);
   if (closed_) return true;
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Flush(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("Flush", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 void StandaloneProcessClient::Close() {
@@ -730,12 +895,27 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
   return RegisterHostShmMemory(ptr, size);
 }
 
+// Throws on every failure, matching RegisterHostShmMemory.
+//
+// This used to log and return false. Nothing downstream can work on a buffer
+// the server never mapped: the client's own regions_ table has no entry for
+// it, so OffsetFor rejects every later Put/Get before an RPC is even sent, and
+// each one reports the same false a genuine miss does. A caller that does not
+// check the bool therefore gets a cache that is silently and permanently empty
+// -- indistinguishable, from the outside, from a workload with no reuse. A
+// throw cannot be ignored that way, and registration is a once-per-buffer
+// setup call where failing loudly at startup beats running for hours on a
+// dead cache.
 bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
-  if (ptr == 0 || size == 0) return false;
+  if (ptr == 0 || size == 0) {
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: invalid GPU region ptr=0x{:x} size={}", ptr,
+        size));
+  }
   ScopedHipDevice device_guard(device_id);
   if (!device_guard.IsValid()) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] failed to select GPU device {}", device_id);
-    return false;
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: failed to select GPU device {}", device_id));
   }
 
   void* allocation_base = nullptr;
@@ -744,30 +924,33 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
       hipMemGetAddressRange(reinterpret_cast<hipDeviceptr_t*>(&allocation_base), &allocation_size,
                             reinterpret_cast<hipDeviceptr_t>(ptr));
   if (range_status != hipSuccess || allocation_base == nullptr) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] hipMemGetAddressRange failed for ptr=0x{:x}: {}",
-                    ptr, hipGetErrorString(range_status));
+    const std::string error = hipGetErrorString(range_status);
     (void)hipGetLastError();
-    return false;
+    throw std::runtime_error(
+        fmt::format("StandaloneProcessClient::RegisterMemory: hipMemGetAddressRange failed for "
+                    "ptr=0x{:x}: {}",
+                    ptr, error));
   }
 
   const uintptr_t allocation_address = reinterpret_cast<uintptr_t>(allocation_base);
-  if (ptr < allocation_address) return false;
-  const uint64_t ipc_offset = static_cast<uint64_t>(ptr - allocation_address);
-  if (ipc_offset > allocation_size || size > allocation_size - ipc_offset) {
-    MORI_UMBP_ERROR(
-        "[StandaloneProcessClient] GPU registration range exceeds allocation: ptr=0x{:x} "
+  const uint64_t ipc_offset =
+      ptr >= allocation_address ? static_cast<uint64_t>(ptr - allocation_address) : 0;
+  if (ptr < allocation_address || ipc_offset > allocation_size ||
+      size > allocation_size - ipc_offset) {
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: GPU range exceeds its allocation: ptr=0x{:x} "
         "size={} alloc_base=0x{:x} alloc_size={}",
-        ptr, size, allocation_address, allocation_size);
-    return false;
+        ptr, size, allocation_address, allocation_size));
   }
 
   hipIpcMemHandle_t handle{};
   const hipError_t handle_status = hipIpcGetMemHandle(&handle, allocation_base);
   if (handle_status != hipSuccess) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] hipIpcGetMemHandle failed for ptr=0x{:x}: {}", ptr,
-                    hipGetErrorString(handle_status));
+    const std::string error = hipGetErrorString(handle_status);
     (void)hipGetLastError();
-    return false;
+    throw std::runtime_error(fmt::format(
+        "StandaloneProcessClient::RegisterMemory: hipIpcGetMemHandle failed for ptr=0x{:x}: {}",
+        ptr, error));
   }
 
   ::umbp::RegisterMemoryRequest req;
@@ -784,12 +967,13 @@ bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, i
   req.set_alloc_base(allocation_address);
 
   grpc::ClientContext ctx;
+  ArmRegisterMemoryDeadline(ctx);
   ::umbp::BoolResponse resp;
+  RegistrationProgressLogger progress("GPU IPC", ptr, size);
   const grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
   if (!rpc_status.ok() || !resp.ok()) {
-    MORI_UMBP_ERROR("[StandaloneProcessClient] GPU RegisterMemory failed: {}",
-                    rpc_status.ok() ? resp.error() : rpc_status.error_message());
-    return false;
+    throw std::runtime_error(RegisterMemoryFailureMessage(
+        "GPU IPC", ptr, size, progress.ElapsedMs(), rpc_status, resp.error()));
   }
 
   std::lock_guard<std::mutex> lock(registration_mu_);
@@ -823,6 +1007,7 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
     }
 
     grpc::ClientContext ctx;
+    ArmRegisterMemoryDeadline(ctx);
     ::umbp::RegisterMemoryRequest req;
     req.set_client_id(client_id);
     req.set_worker_base(reinterpret_cast<uintptr_t>(allocation->base));
@@ -831,10 +1016,13 @@ bool StandaloneProcessClient::RegisterHostShmMemory(uintptr_t ptr, size_t size) 
     req.set_worker_node_address(standalone_config_.worker_node_address);
     for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
     ::umbp::BoolResponse resp;
+    RegistrationProgressLogger progress("host shm", reinterpret_cast<uintptr_t>(allocation->base),
+                                        allocation->mapped_size);
     grpc::Status rpc_status = stub_->RegisterMemory(&ctx, req, &resp);
     if (!rpc_status.ok() || !resp.ok()) {
-      throw std::runtime_error("standalone RegisterMemory RPC failed: " +
-                               (rpc_status.ok() ? resp.error() : rpc_status.error_message()));
+      throw std::runtime_error(RegisterMemoryFailureMessage(
+          "host shm", reinterpret_cast<uintptr_t>(allocation->base), allocation->mapped_size,
+          progress.ElapsedMs(), rpc_status, resp.error()));
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(allocation->base);
@@ -872,6 +1060,7 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
   // One RPC tears down all of this client's regions server-side (UnmapClient),
   // so a single DeregisterMemory call covers every region.
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::DeregisterMemoryRequest req;
   req.set_client_id(client_id);
   ::umbp::Empty resp;
@@ -902,47 +1091,66 @@ void StandaloneProcessClient::DeregisterMemory(uintptr_t /*ptr*/) {
 bool StandaloneProcessClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,
                                                      TierType tier) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvMutationRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_tier(TierToProto(tier));
   req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->ReportExternalKvBlocks(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("ReportExternalKvBlocks", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::RevokeExternalKvBlocks(const std::vector<std::string>& hashes,
                                                      TierType tier) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvMutationRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_tier(TierToProto(tier));
   req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->RevokeExternalKvBlocks(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("RevokeExternalKvBlocks", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 bool StandaloneProcessClient::RevokeAllExternalKvBlocksAtTier(TierType tier) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvTierRequest req;
   req.set_tier(TierToProto(tier));
   req.set_client_id(ClientId());
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->RevokeAllExternalKvBlocksAtTier(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("RevokeAllExternalKvBlocksAtTier", status);
+    return false;
+  }
+  return resp.ok();
 }
 
 std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternalKv(
     const std::vector<std::string>& hashes, bool count_as_hit) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneMatchExternalKvRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_count_as_hit(count_as_hit);
   req.set_client_id(ClientId());
   ::umbp::StandaloneMatchExternalKvResponse resp;
   grpc::Status status = stub_->MatchExternalKv(&ctx, req, &resp);
-  if (!status.ok()) return {};
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("MatchExternalKv", status);
+    return {};
+  }
 
   std::vector<IUMBPClient::ExternalKvMatch> out;
   out.reserve(resp.matches_size());
@@ -962,12 +1170,16 @@ std::vector<IUMBPClient::ExternalKvMatch> StandaloneProcessClient::MatchExternal
 std::vector<IUMBPClient::ExternalKvHitCountEntry> StandaloneProcessClient::GetExternalKvHitCounts(
     const std::vector<std::string>& hashes) {
   grpc::ClientContext ctx;
+  ArmDataPlaneDeadline(ctx);
   ::umbp::StandaloneExternalKvHitCountsRequest req;
   for (const auto& hash : hashes) req.add_hashes(hash);
   req.set_client_id(ClientId());
   ::umbp::StandaloneExternalKvHitCountsResponse resp;
   grpc::Status status = stub_->GetExternalKvHitCounts(&ctx, req, &resp);
-  if (!status.ok()) return {};
+  if (!status.ok()) {
+    LogDataPlaneRpcFailure("GetExternalKvHitCounts", status);
+    return {};
+  }
   std::vector<IUMBPClient::ExternalKvHitCountEntry> out;
   out.reserve(resp.entries_size());
   for (const auto& e : resp.entries()) {

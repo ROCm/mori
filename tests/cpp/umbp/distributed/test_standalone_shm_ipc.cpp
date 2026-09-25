@@ -24,6 +24,7 @@
 // MIT License
 #include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime_api.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -222,6 +224,81 @@ TEST(StandaloneShmIpcTest, GpuRegistrationRejectsSsdBackedServer) {
   EXPECT_FALSE(response.ok());
   EXPECT_NE(response.error().find("SSD"), std::string::npos);
 
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+  std::filesystem::remove_all(ssd_path);
+}
+
+// The test above checks the server's refusal on the wire. This one checks what
+// the CLIENT does with it, which used to be the weaker half: the host path
+// threw, while the GPU path logged and returned false.
+//
+// A false that nobody checks is the worst of the three outcomes. The client's
+// own regions_ table never gets an entry, so OffsetFor rejects every later
+// Put/Get before an RPC is even sent, and each one returns the same false a
+// genuine miss does -- a permanently empty cache that is indistinguishable
+// from a workload with no reuse. Registration is a once-per-buffer setup call;
+// it has to fail in a way a caller cannot accidentally ignore.
+TEST(StandaloneShmIpcTest, RejectedGpuRegistrationThrowsInsteadOfReturningFalse) {
+  void* device_ptr = nullptr;
+  if (hipMalloc(&device_ptr, 1 << 20) != hipSuccess || device_ptr == nullptr) {
+    (void)hipGetLastError();
+    GTEST_SKIP() << "no usable GPU on this host";
+  }
+
+  const std::string suffix = std::to_string(getpid());
+  const std::string address = "unix:///tmp/umbp_standalone_gpu_throw_" + suffix + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  const std::string ssd_path = "/tmp/umbp_standalone_gpu_throw_ssd_" + suffix;
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+  std::filesystem::remove_all(ssd_path);
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 1 << 20;
+  config.ssd.enabled = true;
+  config.ssd.storage_dir = ssd_path;
+  config.ssd.capacity_bytes = 4 << 20;
+  config.ssd.segment_size_bytes = 1 << 20;
+  config = WithEmbeddedDefaults(config);
+  // An SSD medium refuses GPU IPC registration, which is the server-side
+  // rejection this needs; what it asserts is how the client reports it.
+  config.distributed->medium = UMBPMedium::SSD;
+
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  // The client only needs to reach the server; the medium that makes the
+  // server refuse is the server's business. Kept separate from `config` on
+  // purpose -- handing the client a config that also names a distributed
+  // backend is not what a worker does.
+  UMBPConfig client_config;
+  client_config.dram.capacity_bytes = 1 << 20;
+  client_config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  standalone_config.startup_timeout_ms = 5000;
+  client_config.standalone_process = standalone_config;
+
+  // Nothing below may let an exception escape the test body: server_thread is
+  // still joinable, and destroying a joinable thread is std::terminate.
+  std::string unexpected;
+  try {
+    auto client = CreateUMBPClient(client_config);
+    EXPECT_THROW(client->RegisterMemory(reinterpret_cast<uintptr_t>(device_ptr), 1 << 20,
+                                        mori::io::MemoryLocationType::GPU, 0),
+                 std::runtime_error);
+    client->Close();
+  } catch (const std::exception& error) {
+    unexpected = error.what();
+  }
+  EXPECT_TRUE(unexpected.empty()) << "client setup failed before the assertion: " << unexpected;
+
+  (void)hipFree(device_ptr);
   server.Shutdown();
   server_thread.join();
   unlink(grpc_path.c_str());

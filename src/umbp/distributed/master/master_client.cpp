@@ -36,6 +36,7 @@
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/common/rpc_deadline.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/master/rpc_latency_timer.h"
 #include "umbp/distributed/pool/peer_pool.h"
@@ -49,20 +50,14 @@ constexpr std::array<double, 14> kMasterClientRpcLatencyBucketsArr = {
 
 int RpcShutdownTimeoutMs() {
   static const int v =
-      static_cast<int>(GetEnvMilliseconds("UMBP_RPC_SHUTDOWN_TIMEOUT_MS",
-                                          std::chrono::milliseconds(3000), /*min_allowed=*/1)
-                           .count());
+      ResolveDeadlineMs("UMBP_RPC_SHUTDOWN_TIMEOUT_MS", std::chrono::milliseconds(3000));
   return v;
 }
 
 int HeartbeatRpcTimeoutMs() {
-  static const int timeout = [] {
-    const char* raw = std::getenv("UMBP_HEARTBEAT_RPC_TIMEOUT_MS");
-    if (!raw || raw[0] == '\0') return 3000;
-    const int parsed = std::atoi(raw);
-    return parsed > 0 ? parsed : 3000;
-  }();
-  return timeout;
+  static const int v =
+      ResolveDeadlineMs("UMBP_HEARTBEAT_RPC_TIMEOUT_MS", std::chrono::milliseconds(3000));
+  return v;
 }
 
 size_t HeartbeatEventsPerBundle() {
@@ -207,6 +202,7 @@ grpc::Status MasterClient::RegisterSelf(
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->RegisterClient(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) {
@@ -246,8 +242,7 @@ grpc::Status MasterClient::UnregisterSelf() {
   req.set_node_id(config_.node_id);
   ::umbp::UnregisterClientResponse resp;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  ArmDeadline(ctx, RpcShutdownTimeoutMs());
   auto status = GetStub(stub_.get())->UnregisterClient(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   registered_ = false;
@@ -271,6 +266,7 @@ grpc::Status MasterClient::RoutePut(const std::string& key, uint64_t block_size,
 
   ::umbp::RoutePutResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->RoutePut(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
@@ -312,6 +308,7 @@ grpc::Status MasterClient::RouteGet(const std::string& key,
 
   ::umbp::RouteGetResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->RouteGet(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
@@ -347,6 +344,7 @@ grpc::Status MasterClient::BatchRoutePut(const std::vector<std::string>& keys,
 
   ::umbp::BatchRoutePutResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->BatchRoutePut(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
@@ -391,6 +389,7 @@ grpc::Status MasterClient::BatchRouteGet(const std::vector<std::string>& keys,
 
   ::umbp::BatchRouteGetResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->BatchRouteGet(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
@@ -436,6 +435,7 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
 
   ::umbp::BatchLookupResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->BatchLookup(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
@@ -744,6 +744,7 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
     for (const auto& tag : config_.tags) re_req.add_tags(tag);
     ::umbp::RegisterClientResponse re_resp;
     grpc::ClientContext re_ctx;
+    ArmDeadline(re_ctx, MasterRpcTimeoutMs());
     grpc::Status re_status;
     {
       ScopedRpcTimer _rpc_timer(this, "RegisterClient");
@@ -781,8 +782,7 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
 grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
                                                   ::umbp::HeartbeatResponse* resp) {
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(HeartbeatRpcTimeoutMs()));
+  ArmDeadline(ctx, HeartbeatRpcTimeoutMs());
   grpc::Status status;
   {
     ScopedRpcTimer _rpc_timer(this, "Heartbeat");
@@ -1037,8 +1037,7 @@ void MasterClient::FlushMetricsOnce() {
 
   ::umbp::ReportMetricsResponse resp;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  ArmDeadline(ctx, RpcShutdownTimeoutMs());
   auto status = GetStub(stub_.get())->ReportMetrics(&ctx, req, &resp);
   if (!status.ok()) {
     MORI_UMBP_WARN("[Client] ReportMetrics RPC failed: node_id={}, error={}", config_.node_id,
@@ -1061,8 +1060,7 @@ grpc::Status MasterClient::ReportExternalKvBlocks(const std::string& node_id,
 
   ::umbp::ReportExternalKvBlocksResponse resp;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  ArmDeadline(ctx, RpcShutdownTimeoutMs());
   auto status = GetStub(stub_.get())->ReportExternalKvBlocks(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   return status;
@@ -1079,8 +1077,7 @@ grpc::Status MasterClient::RevokeExternalKvBlocks(const std::string& node_id,
 
   ::umbp::RevokeExternalKvBlocksResponse resp;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  ArmDeadline(ctx, RpcShutdownTimeoutMs());
   auto status = GetStub(stub_.get())->RevokeExternalKvBlocks(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   return status;
@@ -1095,8 +1092,7 @@ grpc::Status MasterClient::RevokeAllExternalKvBlocksAtTier(const std::string& no
 
   ::umbp::RevokeAllExternalKvBlocksAtTierResponse resp;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  ArmDeadline(ctx, RpcShutdownTimeoutMs());
   auto status = GetStub(stub_.get())->RevokeAllExternalKvBlocksAtTier(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   return status;
@@ -1109,8 +1105,7 @@ grpc::Status MasterClient::RevokeAllExternalKvBlocksForNode(const std::string& n
 
   ::umbp::RevokeAllExternalKvBlocksForNodeResponse resp;
   grpc::ClientContext ctx;
-  ctx.set_deadline(std::chrono::system_clock::now() +
-                   std::chrono::milliseconds(RpcShutdownTimeoutMs()));
+  ArmDeadline(ctx, RpcShutdownTimeoutMs());
   auto status = GetStub(stub_.get())->RevokeAllExternalKvBlocksForNode(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   return status;
@@ -1125,6 +1120,7 @@ grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashe
   req.set_count_as_hit(count_as_hit);
   ::umbp::MatchExternalKvResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;
@@ -1150,6 +1146,7 @@ grpc::Status MasterClient::GetExternalKvHitCounts(
   for (const auto& h : hashes) req.add_hashes(h);
   ::umbp::GetExternalKvHitCountsResponse resp;
   grpc::ClientContext ctx;
+  ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->GetExternalKvHitCounts(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) return status;

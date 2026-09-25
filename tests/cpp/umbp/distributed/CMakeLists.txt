@@ -135,6 +135,20 @@ add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
 
+# test_progress_logger — ScopedProgressLog (common/progress_logger.h): the
+# heartbeat that makes a multi-minute blocking registration distinguishable
+# from a hang. Header-only, so this needs nothing but gtest and threads.
+add_executable(test_umbp_progress_logger test_progress_logger.cpp)
+target_link_libraries(test_umbp_progress_logger PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_progress_logger COMMAND test_umbp_progress_logger)
+
+# test_rpc_deadline — the UMBP_RPC_DEADLINES resolution matrix
+# (common/rpc_deadline.h). Needs gRPC for ClientContext.
+add_executable(test_umbp_rpc_deadline test_rpc_deadline.cpp)
+target_link_libraries(test_umbp_rpc_deadline PRIVATE umbp_common ${_TEST_GRPCPP_LIB}
+                                                     gtest_main)
+add_test(NAME umbp_rpc_deadline COMMAND test_umbp_rpc_deadline)
+
 add_executable(test_umbp_backend_policy_config test_backend_policy_config.cpp)
 target_link_libraries(test_umbp_backend_policy_config PRIVATE umbp_common
                                                               gtest_main)
