@@ -483,7 +483,7 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
   // device list.
   int localNode = LocalKfdNode();
   for (int i = 0; i < WorldSize(); i++) {
-    // KFD node ids are only host-unique; never key an anvil queue on a 
+    // KFD node ids are only host-unique; never key an anvil queue on a
     // cross-host peer (defensive same-host guard)
     if (!(peerCaps[i].canSDMA && peerCaps[i].sameHost)) continue;
     int peerNode = KfdNodeId(i);
