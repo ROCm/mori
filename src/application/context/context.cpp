@@ -204,8 +204,6 @@ void Context::CollectHostNames() {
   gethostname(hostname, HOST_NAME_MAX);
   myHostname = std::string(hostname);
 
-  int hipDev = 0;
-  HIP_RUNTIME_CHECK(hipGetDevice(&hipDev));
   // Key co-location on node id, not hostname: identical hostnames would mark
   // cross-node ranks as co-located, over-counting rankInNode (trips assert below).
   std::string nodeId = ResolveNodeId(myHostname);
@@ -217,9 +215,15 @@ void Context::CollectHostNames() {
     char nodeId[256];
   } my = {};
   my.pid = static_cast<int32_t>(getpid());
-      // Local GPU's KFD node id (host-global, HIP_VISIBLE_DEVICES-independent). Used
-      // as the stable key for wiring SDMA queues to same-host peers.
-  my.kfdNodeId = anvil::anvil.kfdNodeIdForHipDevice(hipDev);
+  // Local GPU's KFD node id (host-global, HIP_VISIBLE_DEVICES-independent). Used
+  // as the stable key for wiring SDMA queues to same-host peers.
+  if (sdmaEnabled) {
+    int hipDev = 0;
+    HIP_RUNTIME_CHECK(hipGetDevice(&hipDev));
+    my.kfdNodeId = anvil::anvil.kfdNodeIdForHipDevice(hipDev);
+  } else {
+    my.kfdNodeId = -1;
+  }
   my.railFlag =
           env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL"),
   snprintf(my.nodeId, sizeof(my.nodeId), "%s", nodeId.c_str());
