@@ -86,8 +86,9 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   if (threadIdx.x == 0) {
     const uint32_t want = static_cast<uint32_t>(npes);  // self-copy included
     // 32-bit ADD into the low dword -> poll 32 bits of the single counter.
-    auto* addr = Iglobal(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
+    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
     while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
+      __builtin_amdgcn_s_sleep(1);
     }
   }
   __syncthreads();

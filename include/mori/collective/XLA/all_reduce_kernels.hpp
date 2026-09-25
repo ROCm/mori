@@ -191,13 +191,146 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       if ((ownedMask & (1u << s)) == 0) continue;
       // Wait for every peer's copy of slice s to land in my output[myPe] slice.
       // 32-bit ADD into the low dword -> poll 32 bits of this slice's counter.
-      auto* addr = Iglobal(reinterpret_cast<uint32_t*>(&signalBuf[kBcastSlot + s]));
+      auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[kBcastSlot + s]));
       while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
+        __builtin_amdgcn_s_sleep(1);
       }
       // System scope again: peers ADD into this slot from their Phase 4.
       StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kBcastSlot + s], 0);
     }
   }
+}
+
+// ===========================================================================
+// Fused all-reduce ("pull"). No SDMA, no staging: every byte moves as a plain
+// vector load or store off the LSA flat VA.
+//
+// The reduce and the redistribution are a single pass. Each PE reduces shard
+// myPe by reading it out of every peer's input, and the finished vector goes
+// from the accumulator registers straight into my own output[myPe] AND, over
+// XGMI, into every peer's output[myPe]:
+//
+//   output_q[ myPe*chunkElems + j ] = REDUCE_p( input_p[ myPe*chunkElems + j ] )
+//                                                                for every q
+// Fusing is only legal because the reduce and the redistribution visit the same
+// indices in the same thread. PullReduceShard is grid-strided (thread t owns
+// {gtid + n*gstride}), so the value a thread is about to publish is one it just
+// computed -- there is no cross-block dependency, and therefore no mid-kernel
+// barrier of any kind.
+//
+// That leaves one synchronization, at the very end: I must not return until
+// every peer has finished writing into MY output. `syncFlags` is a symmetric
+// array of one uint64 per PE, slot p owned by producer p, and the whole
+// handshake runs in the single block that closes out the grid -- kernel
+// completion already implies every block retired, so one waiter is enough to
+// make "kernel done" mean "output complete". Every other block returns the
+// moment it has counted in, freeing its CU.
+// ===========================================================================
+
+// Stored into a peer's flag slot once I have finished writing into that peer's
+// output. Any non-zero value works: the slots are zeroed again at the end of
+// every launch.
+static constexpr uint64_t kARPullReady = 1;
+
+//   input     : raw symmetric-heap pointer, N = npes*chunkElems elements
+//   output    : raw symmetric-heap pointer, N = npes*chunkElems elements (on
+//               exit every slot p holds the reduction over all PEs of shard p)
+//   syncFlags : raw symmetric-heap pointer, >= npes uint64 slots, zero on entry
+//   groupCounters : plain device buffer (>= 1 uint32), zeroed once by the host.
+//               [0] elects the block that runs the closing handshake, and is
+//               reset by that same block.
+template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
+__global__ void __launch_bounds__(256, 1)
+AllReducePullKernel(int myPe, const T* __restrict__ input, T* __restrict__ output,
+                    uint64_t* __restrict__ syncFlags, uint32_t* __restrict__ groupCounters,
+                    size_t chunkElems, mori::cco::ccoWindow_t heapWin) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // My reduced shard lives in output slot myPe, exactly as in the push kernel.
+  T* __restrict__ myShard = output + static_cast<size_t>(myPe) * chunkElems;
+
+  // === Reduce + fan out, in one pass =========================================
+  // Every finished position goes to my own slot and to all NPES-1 peers' copies
+  // of that same slot. Peer p's copy of a local heap pointer sits at that
+  // pointer + (p - myPe)*stride4G<<32, the same rank delta the loads use.
+  //
+  // Local store is agent scope: nobody reads my shard remotely any more (they
+  // are handed it), so it may sit in L2 for whoever consumes the output next.
+  // Remote stores are system scope, and are what carries the collective.
+  auto store = [myShard, myPe, stride4G](size_t elemIdx, auto v) {
+    constexpr int B = sizeof(v);
+    T* __restrict__ mine = myShard + elemIdx;
+    StreamStore<EAgentScope, B>(mine, v);
+#pragma unroll
+    for (int k = 1; k < NPES; k++) {
+      // Peer (myPe + k) % NPES, written as a delta so the modulo stays out of
+      // the address math. Loop-invariant, so it hoists out of the grid stride.
+      const int32_t delta = (k < NPES - myPe) ? k : k - NPES;
+      const int32_t diff = delta * static_cast<int32_t>(stride4G);
+      StreamStore<ESystemScope, B>(
+          reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(mine) +
+                               (static_cast<uint64_t>(diff) << 32)),
+          v);
+    }
+  };
+  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store, chunkElems);
+
+  // === Closing handshake =====================================================
+  // Release my remote stores, then count in. Everyone but the last block out is
+  // finished and gives its CU back; the last block alone signals, waits and
+  // clears, which is enough because the kernel cannot complete until it exits.
+  __threadfence_system();
+  __shared__ bool isGridLast;
+  if (threadIdx.x == 0) {
+    isGridLast = (atomicAdd(&groupCounters[0], 1u) + 1 == gridDim.x);
+  }
+  __syncthreads();
+  if (!isGridLast) return;  // block-uniform: isGridLast is shared
+
+  {
+    const int peer = static_cast<int>(threadIdx.x);
+    const bool isPeerLane = peer < NPES && peer != myPe;
+    // Tell peer p I am done writing into it: one lane per peer, one 8-byte
+    // remote store each.
+    if (isPeerLane) {
+      const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+      auto* slot = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(syncFlags + myPe) +
+                                               (static_cast<uint64_t>(diff) << 32));
+      StreamStore<ESystemScope, sizeof(uint64_t)>(cco::impl::global(slot), kARPullReady);
+    }
+    // Push those tokens out before parking on the peers', or every PE could sit
+    // waiting on a signal still held in its own write path.
+    __threadfence_system();
+    // Then wait for the same from everyone. Signalling strictly precedes
+    // waiting on every PE, so this cannot deadlock however the grids interleave.
+    // The poll is local (peers write my slots over XGMI); system scope because
+    // the writer is another device.
+    if (isPeerLane) {
+      auto* addr = cco::impl::global(&syncFlags[peer]);
+      while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    // Acquire half only (not the full seq_cst __threadfence_system): we publish
+    // nothing after this, we only need the peers' stores visible to my consumer.
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+    // Clear for the next launch. The tokens are dead by now -- every peer that
+    // wrote one is past its own wait -- so zeroing cannot drop an unseen signal.
+    // System scope: peers write these slots from another device, so a plain
+    // store would leave a dirty line that could evict on top of a later token.
+    //
+    // As with AllGatherPushKernel this clears at kernel END and so relies on the
+    // caller barriering between launches (the benchmark does hipStreamSynchronize
+    // + ccoBarrierAll per iteration); without one, a peer's NEXT launch token can
+    // arrive before this store and be overwritten by it, no matter the scope.
+    if (peer < NPES) {
+      StreamStore<ESystemScope, sizeof(uint64_t)>(&syncFlags[peer], 0);
+    }
+  }
+  // Re-arm the arrival counter. Safe here: isGridLast means every block of this
+  // grid has already counted, so no arrival can be lost.
+  if (threadIdx.x == 0) groupCounters[0] = 0;
 }
 } // namespace collective
 } // namespace mori
