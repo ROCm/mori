@@ -111,7 +111,12 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     for (int q = 0; q < comm->sdmaNumQueue; q++) {
       // anvil returns its own SdmaQueueDeviceHandle*; cco stores it as an opaque
       // ccoSdmaQueueDeviceHandle* (layout-compatible, byte-copied by sizeof).
-      auto* handle = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)->deviceHandle();
+      anvil::SdmaQueueDeviceHandle* handle = nullptr;
+      if (auto* queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)) {
+        handle = queue->deviceHandle();
+      } else {
+        MORI_SHMEM_ERROR("SDMA queue missing for node pair {} -> {}: idx={}", srcNode, dstNode, q);
+      }
       HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
                                   sizeof(handle), hipMemcpyHostToDevice));
     }

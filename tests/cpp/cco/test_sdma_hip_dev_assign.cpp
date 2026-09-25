@@ -244,13 +244,6 @@ struct ThreadResult {
 // must bind its own device before making any other HIP call.
 static void RunLocalRank(int localDevice, int rank, int nranks, const mori::cco::ccoUniqueId& uid,
                          ThreadResult* result) {
-  // cco_test_harness.hpp's HIP_CHECK macro reports failures via the
-  // process-wide g_rank global (not thread-local). Setting it here is
-  // best-effort for diagnostics only: under concurrent threads the printed
-  // rank in a HIP_CHECK failure message can race, but HIP_CHECK always
-  // _exit(1)s the whole process immediately regardless, so this never
-  // affects correctness — only which rank number an error message blames.
-  g_rank = rank;
   result->rank = rank;
   result->passed = false;
 
@@ -258,8 +251,8 @@ static void RunLocalRank(int localDevice, int rank, int nranks, const mori::cco:
 
   SdmaAllGatherCtx ctx;
   if (SdmaAllGatherSetup(rank, nranks, uid, &ctx) != 0) {
-    snprintf(result->detail, sizeof(result->detail), "setup failed");
-    return;
+    fprintf(stderr, "[rank %d] setup failed\n", rank);
+    std::exit(1);
   }
 
   if (ctx.hasSdma) {
@@ -413,11 +406,16 @@ static bool ParseVisibleDevicesList(const char* s, std::vector<int>* out) {
 int main(int argc, char** argv) {
   int nProcesses = -1;
 
+  g_devicesPerProcess = 1;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--n_processes") && i + 1 < argc) {
       nProcesses = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--n_local_devices") && i + 1 < argc) {
-      g_devicesPerProcess = std::max(1, atoi(argv[++i]));
+      g_devicesPerProcess = atoi(argv[++i]);
+      if (g_devicesPerProcess < 1) {
+        fprintf(stderr, "--n_local_devices must be >= 1\n");
+        return 1;
+      }
     } else if (!strcmp(argv[i], "--visible_devices") && i + 1 < argc) {
       if (!ParseVisibleDevicesList(argv[++i], &g_visibleDevices)) {
         fprintf(stderr,
@@ -436,14 +434,13 @@ int main(int argc, char** argv) {
     }
   }
 
-  const int totalDevices =
-      g_visibleDevices.empty() ? DetectTotalGpuCount() : static_cast<int>(g_visibleDevices.size());
+  const int numVisible = static_cast<int>(g_visibleDevices.size());
+  const int totalDevices = numVisible > 0 ? numVisible : DetectTotalGpuCount();
 
   if (nProcesses < 0) {
     // --torch_style ignores --n_local_devices (always 1 GPU/process), so the
     // "use every visible GPU" default is just totalDevices, not divided.
-    nProcesses =
-        g_torchStyle ? std::max(1, totalDevices) : std::max(1, totalDevices / g_devicesPerProcess);
+    nProcesses = totalDevices / g_devicesPerProcess;
   } else if (nProcesses < 1) {
     fprintf(stderr, "--n_processes must be >= 1\n");
     return 1;
@@ -458,12 +455,18 @@ int main(int argc, char** argv) {
               nProcesses, totalDevices);
       return 1;
     }
-  } else if (!g_visibleDevices.empty() &&
-             static_cast<int>(g_visibleDevices.size()) != nProcesses * g_devicesPerProcess) {
+  } else if (g_visibleDevices.empty()) {
+    if (nProcesses > totalDevices / g_devicesPerProcess) {
+      fprintf(stderr,
+             "--n_processes(%d) * --n_local_devices(%d) exceeds available devices (%d)\n",
+             nProcesses, g_devicesPerProcess, totalDevices);
+      return 1;
+    }
+  } else if (numVisible != nProcesses * g_devicesPerProcess) {
     fprintf(stderr,
-            "--visible_devices has %zu entries but --n_processes(%d) * --n_local_devices(%d) "
+            "--visible_devices has %d entries but --n_processes(%d) * --n_local_devices(%d) "
             "= %d\n",
-            g_visibleDevices.size(), nProcesses, g_devicesPerProcess,
+            numVisible, nProcesses, g_devicesPerProcess,
             nProcesses * g_devicesPerProcess);
     return 1;
   }

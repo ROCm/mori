@@ -211,18 +211,17 @@ void Context::CollectHostNames() {
   std::string nodeId = ResolveNodeId(myHostname);
   // Allgather a fixed-layout {pid, kfdNodeId, railFlag, nodeId} record.
   struct Pack {
-    pid_t pid;
+    int32_t pid;
     int32_t kfdNodeId;
     bool railFlag;
     char nodeId[256];
-  } my = {
-      .pid = getpid(),
+  } my = {};
+  my.pid = static_cast<int32_t>(getpid());
       // Local GPU's KFD node id (host-global, HIP_VISIBLE_DEVICES-independent). Used
       // as the stable key for wiring SDMA queues to same-host peers.
-      .kfdNodeId = anvil::anvil.kfdNodeIdForHipDevice(hipDev),
-      .railFlag =
+  my.kfdNodeId = anvil::anvil.kfdNodeIdForHipDevice(hipDev);
+  my.railFlag =
           env::IsEnvVarEnabled("MORI_ENABLE_RAIL_ONLY") || env::IsEnvVarEnabled("MORI_ENABLE_RAIL"),
-  };
   snprintf(my.nodeId, sizeof(my.nodeId), "%s", nodeId.c_str());
 
   std::vector<Pack> global(WorldSize());
@@ -479,17 +478,16 @@ void Context::EnsureSdmaTransport(int requestedChannels) {
   // sliced HIP_VISIBLE_DEVICES, where a peer GPU is not in this process's HIP
   // device list.
   int localNode = LocalKfdNode();
-  if (localNode < 0) {
-    MORI_APP_ERROR("EnsureSdmaTransport: local KFD node id unresolved for rank {}", LocalRank());
-    std::abort();
-  }
   for (int i = 0; i < WorldSize(); i++) {
     if (!peerCaps[i].canSDMA) continue;
     int peerNode = KfdNodeId(i);
-    if (peerNode < 0) {
-      MORI_APP_ERROR("EnsureSdmaTransport: peer {} KFD node id unresolved for rank {}", i,
-                     LocalRank());
-      std::abort();
+    if (peerNode < 0 || localNode < 0) {
+      MORI_APP_WARN("Local or peer {} KFD node id unresolved for rank {}", i,
+                       LocalRank());
+      peerCaps[i].canSDMA = false;
+      transportTypes[i] = (!IsP2PDisabled() && peerCaps[i].canP2P) ? TransportType::P2P
+                                                                   : TransportType::RDMA;
+      continue;
     }
     anvil::anvil.connect(localNode, peerNode, sdmaNumChannels);
   }

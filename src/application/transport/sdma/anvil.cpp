@@ -44,12 +44,14 @@ namespace anvil {
 namespace {
 
 #define CHECK_HSA_ERROR(cmd)                                                               \
-  if (auto s = (cmd); s != HSA_STATUS_SUCCESS) {                                           \
-    const char* hsa_err_msg;                                                               \
-    hsa_status_string(s, &hsa_err_msg);                                                    \
-    throw std::runtime_error{std::string("HSA error at " __FILE__ ":") +                   \
+  do {                                                                                     \
+    if (auto s = (cmd); s != HSA_STATUS_SUCCESS) {                                         \
+      const char* hsa_err_msg;                                                             \
+      hsa_status_string(s, &hsa_err_msg);                                                  \
+      throw std::runtime_error{std::string("HSA error at " __FILE__ ":") +                 \
                              std::to_string(__LINE__) + std::string(" - ") + hsa_err_msg}; \
-  }
+    }                                                                                      \
+  } while (0)
 
 #define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
   do {                                                                                        \
@@ -120,11 +122,12 @@ uint32_t getBusId(int deviceId, uint32_t* pdomain = nullptr) {
   return ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7);
 }
 
-std::pair<uint32_t, uint32_t> locIdAndDomainForNode(int node) {
-  uint32_t locId = ~0u, domain = ~0u;
-  std::string path = "/sys/class/kfd/kfd/topology/nodes/" + std::to_string(node) + "/properties";
+std::tuple<uint32_t, uint32_t, bool> locIdAndDomainForNode(int node) {
+  char path[128];
+  snprintf(path, sizeof(path), "/sys/class/kfd/kfd/topology/nodes/%d/properties", node);
   std::ifstream f(path);
-  if (!f.is_open()) return std::pair{locId, domain};
+  if (!f.is_open()) return std::tuple{0, 0, false};
+  uint32_t locId = ~0u, domain = ~0u;
   std::string key, valStr;
   // Read tokens as strings: some KFD properties (e.g. hive_id) are 64-bit values
   // that would fail a numeric extraction and abort the scan early.
@@ -134,7 +137,7 @@ std::pair<uint32_t, uint32_t> locIdAndDomainForNode(int node) {
     else if (key == "domain")
       domain = std::strtol(valStr.c_str(), nullptr, 0);
   }
-  return std::pair{locId, domain};
+  return std::tuple{locId, domain, true};
 }
 
 // hsa_iterate_agents (SetUp) enumerates ALL physical GPU agents in HSA order,
@@ -287,15 +290,18 @@ void AnvilLib::init() {
 // Resolve the KFD topology node id of the given HIP device WITHOUT initializing HSA.
 /*static*/ int AnvilLib::kfdNodeIdForHipDevice(int hipDev) {
   uint32_t wantDomain = 0, wantLocId = getBusId(hipDev, &wantDomain);
-  // KFD node ids are contiguous from 0; stop at the first gap.
+  // N in /sys/class/kfd/kfd/topology/nodes/N is the counter the KFD driver
+  // assigns while walking topology_device_list (kfd_build_sysfs_node_tree in
+  // kfd_topology.c: kobject "%d", i++). It's the enumeration index, not a
+  // sparse gpu_id/domain, so node ids are always contiguous 0..N-1 (CPU NUMA
+  // nodes occupy the low indices). Stop at the first missing directory.
   for (int node = 0;; node++) {
-    auto [locId, domain] = locIdAndDomainForNode(node);
-    if (locId == ~0u && domain == ~0u) break;
+    auto [locId, domain, valid] = locIdAndDomainForNode(node);
+    if (!valid) break;
     if (locId == wantLocId && domain == wantDomain) {
       return node;
     }
   }
-  MORI_APP_ERROR("Failed to find KFD node for device {}", hipDev);
   return -1;
 }
 
@@ -428,17 +434,14 @@ bool AnvilLib::isMi308x(int node) {
   return props.DeviceId == 0x74A2;
 }
 
-SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int channel_idx) {
+SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int idx) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
   auto key = std::make_pair(srcNode, dstNode);
   auto it = sdma_channels_.find(key);
-  if (it == sdma_channels_.end()) {
+  if (it == sdma_channels_.end() || idx >= static_cast<int>(it->second.size())) {
     return nullptr;
   }
-  if (!(channel_idx < static_cast<int>(it->second.size()))) {
-    return nullptr;
-  }
-  return it->second[channel_idx].get();
+  return it->second[idx].get();
 }
 
 AnvilLib& AnvilLib::getInstance() {
@@ -452,17 +455,17 @@ AnvilLib& AnvilLib::getInstance() {
 }
 
 int AnvilLib::getOamId(int node) {
-  auto [locId, domain] = locIdAndDomainForNode(node);
+  auto [locId, domain, valid] = locIdAndDomainForNode(node);
   uint32_t bus = (locId >> 8) & 0xFF, dev = (locId >> 3) & 0x1F, func = locId & 0x7;
 
   char fpath[128];
   std::snprintf(fpath, sizeof(fpath), "/sys/bus/pci/devices/%04x:%02x:%02x.%01x/xgmi_physical_id",
                 domain, bus, dev, func);
   std::ifstream file(fpath);
-  int xgmi_physical_id;
-  if (!file.is_open()) {
-    throw std::runtime_error("Failed to open file: " + std::string(fpath));
+  if (!(valid && file.is_open())) {
+    throw std::runtime_error("Unable to open xGMI physical id file: " + std::string(fpath));
   }
+  int xgmi_physical_id;
   if (!(file >> xgmi_physical_id)) {
     throw std::runtime_error("Failed to read xGMI physical id from file: " + std::string(fpath));
   }
