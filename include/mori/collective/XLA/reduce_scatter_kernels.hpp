@@ -243,7 +243,7 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   if (threadIdx.x == 0) {
     // Self-copy is skipped, so exactly npes-1 senders bump this slice's counter.
     const uint32_t want = static_cast<uint32_t>(npes - 1);
-    auto* addr = Iglobal(reinterpret_cast<uint32_t*>(&signalBuf[slice]));
+    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[slice]));
     while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
       __builtin_amdgcn_s_sleep(1);
     }
@@ -333,10 +333,15 @@ __device__ __forceinline__ void WaitAndReduceSlice(
 // VGPRs and the M*NPES loads issue back-to-back, so the long remote-load latency is
 // paid once and the per-position reductions overlap with still-in-flight loads.
 // Callers guarantee every member index (g + m*gstride) is in-bounds.
-template <int M, int NPES, class ReduceOp, StreamScope Scope, class SrcBaseFn, 
+//
+// The reduced vector is handed to store(elemIdx, vec) rather than written to a
+// fixed destination: reduce-scatter drops it in one local buffer, while the fused
+// all-reduce fans the same registers out to every peer, which is what lets it skip
+// a second pass over the shard entirely.
+template <int M, int NPES, class ReduceOp, StreamScope LoadScope, class SrcBaseFn, class StoreFn,
           class T = typename ReduceOp::Type>
-__device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __restrict__ output,
-                                                    size_t g, size_t gstride) {
+__device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, StoreFn store, size_t g,
+                                                    size_t gstride) {
   constexpr int vecSize = VecBytes / sizeof(T);
   using Vec = TVecType<VecBytes>;
   using AccType = typename AccumulatorType<T>::type;
@@ -344,10 +349,10 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
   Vec regs[M][NPES];
 #pragma unroll
   for (int m = 0; m < M; m++) {
-    size_t idx = g + static_cast<size_t>(m) * gstride;
+    size_t idx = g + m * gstride;
 #pragma unroll
     for (int pe = 0; pe < NPES; pe++)
-      regs[m][pe] = StreamLoad<Scope>(srcBase(pe) + idx * vecSize);
+      regs[m][pe] = StreamLoad<LoadScope>(srcBase(pe) + idx * vecSize);
   }
 #pragma unroll
   for (int m = 0; m < M; m++) {
@@ -366,8 +371,68 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, T* __rest
     Data o;
 #pragma unroll
     for (int j = 0; j < vecSize; j++) o[j] = DowncastF<T>(acc[j]);
-    StreamStore<Scope>(output + (g + static_cast<size_t>(m) * gstride) * vecSize,
-                       __builtin_bit_cast(Vec, o));
+    store((g + m * gstride) * vecSize, __builtin_bit_cast(Vec, o));
+  }
+}
+
+// Core of the pull collectives: reduce THIS PE's shard by reading it straight
+// out of every peer's input over the P2P fabric (XGMI), with no staging buffer,
+// no SDMA and no cross-block handoff:
+//
+//   store( j, REDUCE_p( input_p[ myPe*chunkElems + j ] ) )
+//
+// The fast path uses ReduceAllPeersGroup: each group reduces M = NumVecs/NPES
+// output positions and issues all M*NPES remote loads up front, for maximum
+// memory-level parallelism across peers (the long XGMI read latency is paid once
+// per group instead of once per peer). NPES is a compile-time template arg so the
+// per-position/per-peer register tile stays in VGPRs.
+//
+// Where the reduced vector goes is the caller's business: store(elemIdx, v) is
+// handed each finished position, with v either a 16-byte vector or a single T on
+// the scalar tail, so one generic lambda covers both. Reduce-scatter stores once
+// at system scope (its caller reads the shard remotely); the fused all-reduce
+// stores locally at agent scope and fans the same registers out to every peer.
+template <int NumVecs, int NPES, class ReduceOp, class StoreFn,
+          class T = typename ReduceOp::Type>
+__device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
+                                                const T* __restrict__ input, StoreFn store,
+                                                size_t chunkElems) {
+  constexpr int vecSize = VecBytes / sizeof(T);
+  constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
+  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  const size_t totalVecs = chunkElems / vecSize;
+
+  const T* __restrict__ myShard = input + static_cast<size_t>(myPe) * chunkElems;
+  auto srcBase = [myShard, myPe, stride4G](int pe) -> const T* {
+    int32_t diff = (pe - myPe) * static_cast<int32_t>(stride4G);
+    return reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(myShard) +
+                                      (static_cast<uint64_t>(diff) << 32));
+  };
+
+  // Fast path: M positions per group, all M*NPES loads issued up front.
+  size_t g = gtid;
+  for (; g + (M - 1) * gstride < totalVecs; g += gstride * M) {
+    ReduceAllPeersGroup<M, NPES, ReduceOp, ESystemScope>(srcBase, store, g, gstride);
+  }
+  // Trailing in-bounds vectors for this thread (fewer than M left). Reuse the
+  // all-peers primitive with M=1 (one position, NPES loads up front) so the pull
+  // path stays on a single reduction path and needs no runtime-npes helper.
+  for (size_t idx = g; idx < totalVecs; idx += gstride) {
+    ReduceAllPeersGroup<1, NPES, ReduceOp, ESystemScope>(srcBase, store, idx, gstride);
+  }
+
+  // Scalar tail for elements not covered by the vectorized loop.
+  for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
+    using Vec = TVecType<sizeof(T)>;
+    using AccType = typename AccumulatorType<T>::type;
+    auto V = StreamLoad<ESystemScope, sizeof(T)>(srcBase(0) + i);
+    AccType a = UpcastF<T>(__builtin_bit_cast(T, V));
+    for (int pe = 1; pe < NPES; pe++) {
+      V = StreamLoad<ESystemScope, sizeof(T)>(srcBase(pe) + i);
+      a = ReduceOp()(a, UpcastF<T>(__builtin_bit_cast(T, V)));
+    }
+    store(i, __builtin_bit_cast(Vec, DowncastF<T>(a)));
   }
 }
 
@@ -434,27 +499,11 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 // ---------------------------------------------------------------------------
 // Direct "pull" reduce-scatter kernel (no staging, no SDMA scatter) — CCO/LSA.
 //
-// Each PE reads its shard directly from every peer's input buffer over the P2P
-// fabric (XGMI) and reduces in one pass:
-//
-//   output[j] = REDUCE_p( input_p[ myPe*chunkElems + j ] )
-//
-// input_p's base is resolved device-side by the same flat-VA rank-delta math the
-// push path uses for its SDMA destinations: peer pe's copy of a local heap
-// pointer sits at that pointer + (pe - myPe)*stride4G<<32, so shifting my own
-// shard pointer (input + myPe*chunkElems) lands on peer pe's contribution to my
-// shard. peer==myPe resolves back to the local input. This is the direct
-// analogue of the old shmem peerPtrs[pe] lookup and assumes nothing about
-// `input`'s offset within the heap window. There is no staging buffer and no
-// cross-block flag handoff, so every block is independent (no co-residency cap)
-// and the kernel is a single fused grid-strided reduce.
-//
-// The fast path uses ReduceAllPeersGroup: each group reduces M = NumVecs/NPES
-// output positions and issues all M*NPES remote loads up front, for maximum
-// memory-level parallelism across peers (the long XGMI read latency is paid once
-// per group instead of once per peer). NPES is a compile-time template arg so the
-// per-position/per-peer register tile stays in VGPRs; the host dispatches on the
-// real npes.
+// A thin wrapper over detail::PullReduceShard, which is the whole collective
+// here: every PE reads its shard out of every peer's input over XGMI and
+// reduces it in one fused grid-strided pass. There is no staging buffer and no
+// cross-block flag handoff, so every block is independent (no co-residency cap).
+// The all-reduce pull kernel runs the same core as its shot 1.
 //
 // Correctness requires all PEs to have produced their input before launch; the
 // host issues a ccoBarrierAll() before timing.
@@ -464,54 +513,13 @@ __global__ void ReduceScatterPullKernel(int myPe,
                                         mori::cco::ccoWindow_t heapWin,
                                         const T* __restrict__ input,
                                         T* __restrict__ output, size_t chunkElems) {
-  constexpr int vecSize = VecBytes / sizeof(T);
-  constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
-  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
-  const size_t totalVecs = chunkElems / vecSize;
-
-  // Peer addressing, same signed-delta form the push path uses for its SDMA
-  // destinations (Phase 1 of ReduceScatterPushKernel): all rank slots in the LSA
-  // flat VA have identical size, so a local pointer maps to the same object in
-  // peer pe's slot by adding (pe - myPe)*stride4G<<32. That is the canonical
-  // ccoGetLsaPeerPtr(heapWin, pe, input - ccoGetLocalPtr(heapWin)) with winBase
-  // cancelled out, so it needs neither the window-base load nor the intra-heap
-  // offset round trip, and it keeps no "input at heap offset 0" assumption.
-  // Shifting my own shard pointer gives peer pe's contribution to my shard
-  // directly; pe == myPe yields diff 0, i.e. the local input.
-  const uint32_t stride4G = heapWin->stride4G;
-  const T* __restrict__ myShard = input + static_cast<size_t>(myPe) * chunkElems;
-  auto srcBase = [myShard, myPe, stride4G](int pe) -> const T* {
-    int32_t diff = (pe - myPe) * static_cast<int32_t>(stride4G);
-    return reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(myShard) +
-                                      (static_cast<uint64_t>(diff) << 32));
+  // System scope: the caller hands output to a remote reader after the kernel,
+  // so it must not linger in a local cache line.
+  auto store = [output](size_t elemIdx, auto v) {
+    StreamStore<ESystemScope, sizeof(v)>(output + elemIdx, v);
   };
-
-  // Fast path: M positions per group, all M*NPES loads issued up front.
-  size_t g = gtid;
-  for (; g + static_cast<size_t>(M - 1) * gstride < totalVecs; g += gstride * M) {
-    detail::ReduceAllPeersGroup<M, NPES, ReduceOp, ESystemScope>(srcBase, output, g, gstride);
-  }
-  // Trailing in-bounds vectors for this thread (fewer than M left). Reuse the
-  // all-peers primitive with M=1 (one position, NPES loads up front) so the pull
-  // kernel stays on a single reduction path and needs no runtime-npes helper.
-  for (size_t idx = g; idx < totalVecs; idx += gstride) {
-    detail::ReduceAllPeersGroup<1, NPES, ReduceOp, ESystemScope>(srcBase, output, idx, gstride);
-  }
-
-  // Scalar tail for elements not covered by the vectorized loop.
-  for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
-    using Vec = TVecType<sizeof(T)>;
-    using AccType = typename detail::AccumulatorType<T>::type;
-    AccType a = detail::UpcastF<T>(__builtin_bit_cast(T, 
-                  StreamLoad<ESystemScope, sizeof(T)>(srcBase(0) + i)));
-    for (int pe = 1; pe < NPES; pe++) {
-      auto V = StreamLoad<ESystemScope, sizeof(T)>(srcBase(pe) + i);
-      a = ReduceOp()(a, detail::UpcastF<T>(__builtin_bit_cast(T, V)));
-    }
-    Vec V = __builtin_bit_cast(Vec, detail::DowncastF<T>(a));
-    StreamStore<ESystemScope, sizeof(T)>(output + i, V);
-  }
+  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, heapWin->stride4G, input, store,
+                                                   chunkElems);
 }
 
 } // namespace collective

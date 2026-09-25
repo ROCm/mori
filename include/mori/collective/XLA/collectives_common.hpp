@@ -73,20 +73,14 @@ struct AddressPair {
 
 constexpr uint32_t VecBytes = 16;
 
-using V128 = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
-using V128_GLOBAL = GLOBAL_SPACE V128*;
+using V128_GLOBAL = GLOBAL_SPACE cco::ccoUint4*;
 template <int TVecBytes>
 using TVecType = std::conditional_t<
     TVecBytes == 1, uint8_t,
         std::conditional_t<TVecBytes == 2, uint16_t,
         std::conditional_t<TVecBytes == 4, uint32_t,
         std::conditional_t<TVecBytes == 8, uint64_t,
-        std::conditional_t<TVecBytes == 16, V128, void>>>>>;
-
-template <typename T>
-__device__ __host__ inline static T* Iglobal(T* ptr) {
-  return (T*)(GLOBAL_SPACE T*)reinterpret_cast<uintptr_t>(ptr);
-}
+        std::conditional_t<TVecBytes == 16, cco::ccoUint4, void>>>>>;
 
 enum StreamScope {
   ESystemScope = 0,
@@ -97,15 +91,17 @@ template <StreamScope Scope, int Bytes = VecBytes>
 __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
                 "StreamLoad supports 1/2/4/8/16 byte accesses");
-  auto ptr = reinterpret_cast<const TVecType<Bytes>*>(p); 
+  // Intrinsic takes a non-const pointer
+  auto non_const = const_cast<void*>(p);
+  auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(non_const)); 
 #if USE_NONTEMPORAL_LOAD
-  return __builtin_nontemporal_load(MemSpace(ptr));
+  return __builtin_nontemporal_load(ptr);
 #else
   if constexpr (Bytes == 16) {
     if constexpr (Scope == ESystemScope) {
-      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "");
+      return __builtin_amdgcn_global_load_b128(ptr, "");
     } else {
-      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)p, "agent");
+      return __builtin_amdgcn_global_load_b128(ptr, "agent");
     }
   } else {
     return __hip_atomic_load(ptr, __ATOMIC_RELAXED,
@@ -119,15 +115,15 @@ template <StreamScope Scope, int Bytes = VecBytes>
 __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
                 "StreamStore supports 1/2/4/8/16 byte accesses");
-  auto ptr = reinterpret_cast<TVecType<Bytes>*>(p);
+  auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(p));
 #if USE_NONTEMPORAL_LOAD
-  __builtin_nontemporal_store(v, MemSpace(ptr));
+  __builtin_nontemporal_store(v, ptr);
 #else
   if constexpr (Bytes == 16) {
     if constexpr (Scope == ESystemScope) {
-      __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, v, "");
+      __builtin_amdgcn_global_store_b128(ptr, v, "");
     } else {
-      __builtin_amdgcn_global_store_b128((V128_GLOBAL)p, v, "agent");
+      __builtin_amdgcn_global_store_b128(ptr, v, "agent");
     }
   } else {
     __hip_atomic_store(ptr, v, __ATOMIC_RELAXED,
@@ -187,12 +183,12 @@ __device__ __forceinline__ BufRsrc MakeRawRsrc(const void* base, uint32_t numByt
   return r;
 }
 
-__device__ __forceinline__ V128 BufferLoad128(BufRsrc r, uint32_t voff) {
+__device__ __forceinline__ cco::ccoUint4 BufferLoad128(BufRsrc r, uint32_t voff) {
   BufRsrc v = llvm_amdgcn_raw_buffer_load_v4i32(r, static_cast<int>(voff), /*soffset=*/0, RS_BUF_AUX);
-  return __builtin_bit_cast(V128, v);
+  return __builtin_bit_cast(cco::ccoUint4, v);
 }
 
-__device__ __forceinline__ void BufferStore128(BufRsrc r, V128 v, uint32_t voff) {
+__device__ __forceinline__ void BufferStore128(BufRsrc r, cco::ccoUint4 v, uint32_t voff) {
   llvm_amdgcn_raw_buffer_store_v4i32(__builtin_bit_cast(BufRsrc, v), r, static_cast<int>(voff),
                                      /*soffset=*/0, RS_BUF_AUX);
 }
@@ -246,7 +242,7 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
     dw[2] = (uint32_t)(uintptr_t)dstBuf & mask;
     dw[3] = (uint32_t)((uintptr_t)dstBuf >> 32) & mask;
   }
-  const V128 v = {dw[0], dw[1], dw[2], dw[3]};
+  const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
   StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
 } 
 
