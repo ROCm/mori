@@ -181,6 +181,15 @@ class CollectivesFacade {
     }
     HIP_RUNTIME_CHECK(hipMemset(facade.syncFlags_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
 
+    // Monotonic entry-barrier counter of the SDMA push collectives (see
+    // PushEntryBarrier). Only PE 0's copy is used; never reset after this.
+    facade.barrierCtr_ = static_cast<uint64_t*>(facade.Allocate(sizeof(uint64_t)));
+    if (facade.barrierCtr_ == nullptr) {
+      FACADE_PRINTF("CollectivesFacade: failed to carve barrier counter from heap");
+      return -1;
+    }
+    HIP_RUNTIME_CHECK(hipMemset(facade.barrierCtr_, 0, sizeof(uint64_t)));
+
     // Staging is the push path's peer-writable scratch (SDMA scatter target).
     // Pull needs none.
     if (maxStagingBytes > 0) {
@@ -387,6 +396,7 @@ class CollectivesFacade {
   size_t stagingBytes_{0};
   uint32_t* groupCounters_{nullptr};
   uint64_t* syncFlags_{nullptr};  // symmetric, pull all-reduce inter-shot handshake
+  uint64_t* barrierCtr_{nullptr};  // symmetric, push collectives' entry barrier
   AddressPair* pinnedPairs_{nullptr};  // host-pinned, device-readable
   mori::cco::ccoComm* ccoComm_{nullptr};
   // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -496,7 +506,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
         myPe_, nPes_, logS, reinterpret_cast<ComputeT*>(output),
         groupCounters_, chunkElemsC, devComm_, heapWin_,
         reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(staging_));
+        reinterpret_cast<ComputeT*>(staging_), barrierCtr_);
   }
   return hipGetLastError();
 }
@@ -570,7 +580,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   AllReducePushKernel<NumPushVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<const ComputeT*>(input),
         reinterpret_cast<ComputeT*>(output), groupCounters_, chunkElemsC, devComm_,
-        reinterpret_cast<ComputeT*>(staging_), heapWin_);
+        reinterpret_cast<ComputeT*>(staging_), heapWin_, barrierCtr_);
   return hipGetLastError();
 }
 
@@ -593,7 +603,7 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
   constexpr int kThreads = 256;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
-                                                  devComm_, heapWin_);
+                                                  devComm_, heapWin_, barrierCtr_);
   return hipGetLastError();
 }
 
@@ -609,7 +619,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   constexpr int kThreads = 256;
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, pinnedPairs_, chunkBytes, devComm_,
-                                                 heapWin_);
+                                                 heapWin_, barrierCtr_);
   return hipGetLastError();
 }
 
