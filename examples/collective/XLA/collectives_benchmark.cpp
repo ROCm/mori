@@ -289,8 +289,9 @@ static int BenchAndVerify(const Config& cfg, ccoComm* comm, int myPe, hipStream_
 
   float totalMs = 0, minMs = 1e9f, maxMs = 0;
   hipError_t launchErr = hipSuccess;
+  // No per-iteration host barrier: the push kernels synchronize with their peers
+  // on entry (PushEntryBarrier).
   for (int iter = 0; iter < nWarmup + nRuns; iter++) {
-    ccoBarrierAll(comm);
     HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
     launchErr = runOnce();
     HIP_RUNTIME_CHECK(hipEventRecord(tStop, stream));
