@@ -506,6 +506,34 @@ __device__ __forceinline__ void StartSdmaScatter(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Entry barrier for the SDMA push collectives: executed by ONE thread before its
+// block issues any SDMA, followed by a __syncthreads(). A peer that has arrived
+// has entered this launch, so its previous kernel on its stream has retired:
+// it no longer reads the staging / recv slots we are about to overwrite, and
+// its end-of-kernel signalBuf resets have landed, so our ADDs cannot be erased.
+//
+// `ctr` is a symmetric-heap uint64 (zeroed once at facade creation); every PE
+// increments PE 0's copy exactly once per launch and waits for the end of its
+// round. The counter is monotonic and never reset. Rounds cannot overlap for
+// the collectives using it: a PE only increments again after its launch
+// completes, which requires data from every peer, which each peer sends only
+// after leaving this wait. `>= target` (rather than `% npes == 0`) stays correct
+// even for a user whose completion does not depend on all peers. Requires npes > 1.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void PushEntryBarrier(uint64_t* ctr, int myPe, int npes,
+                                                 uint32_t stride4G) {
+  const int32_t diff = -myPe * static_cast<int32_t>(stride4G);
+  auto* c = cco::impl::global(reinterpret_cast<uint64_t*>(
+      reinterpret_cast<uint8_t*>(ctr) + (static_cast<uint64_t>(diff) << 32)));
+  const uint64_t A =
+      1 + __hip_atomic_fetch_add(c, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  const uint64_t target = ((A + npes - 1) / npes) * npes;
+  while (__hip_atomic_load(c, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < target) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
 #endif  // __HIPCC__ || __HIP__
 
 }  // namespace collective
