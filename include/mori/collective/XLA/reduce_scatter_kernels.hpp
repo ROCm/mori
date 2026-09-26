@@ -189,6 +189,8 @@ __device__ __forceinline__ void ReduceVecGroupBuffered(SrcRsrcFn srcRsrc, BufRsr
 //   staging       : raw symmetric-heap pointer, npes slots of chunkElems elements
 //   output        : raw symmetric-heap pointer, chunkElems elements
 //   groupCounters : plain device buffer (>= 1 uint32), local-only arrival counter
+//   barrierCtr    : symmetric-heap uint64 for PushEntryBarrier (block 0, before
+//                   Phase 1), so back-to-back launches need no host barrier
 //
 // Each shard is split into S slices. A sender issues S separate SDMA copies; copy
 // s bumps the receiver's per-slice completion counter signalPtrs[s] via an SDMA
@@ -443,10 +445,16 @@ __global__ void __launch_bounds__(256, 1)
 ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
                                     uint32_t* __restrict__ groupCounters, size_t chunkElems,
                                     mori::cco::ccoDevComm devComm, mori::cco::ccoWindow_t heapWin,
-                                    const T* __restrict__ input, T* __restrict__ staging) {
+                                    const T* __restrict__ input, T* __restrict__ staging,
+                                    uint64_t* __restrict__ barrierCtr) {
 
     // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
+    // Finishing the previous launch only proves peers SENT to us, not that they
+    // are done reducing what we sent them: gate our writes into their staging /
+    // signalBuf until every PE has entered this launch.
+    if (threadIdx.x == 0) PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
+    __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a

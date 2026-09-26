@@ -58,7 +58,14 @@ namespace collective {
 // with npes <= 8 (SDMA fast path).
 __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __restrict__ pairs,
                                    size_t chunkBytes, mori::cco::ccoDevComm devComm,
-                                   mori::cco::ccoWindow_t heapWin) {
+                                   mori::cco::ccoWindow_t heapWin,
+                                   uint64_t* __restrict__ barrierCtr) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // A peer finishing its previous launch only proves our chunk reached it; gate
+  // our writes into its recv slot / signalBuf[0] until every PE entered this one.
+  if (threadIdx.x == 0) PushEntryBarrier(barrierCtr, myPe, npes, stride4G);
+  __syncthreads();
+
   // Phase 1: push each send slot p to peer p's recv slot for sender myPe (self
   // included). My recv slot has the SAME byte offset within the heap window on
   // every peer (all ranks Allocate identically), so peer p's copy of my recv
@@ -68,7 +75,6 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   // needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip. The source is an
   // arbitrary per-peer local pointer (SDMA reads local VA directly).
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(pairs[myPe].dest);
-  const uint32_t stride4G = heapWin->stride4G;
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0, chunkBytes,
       [](int) { return true; },
@@ -101,10 +107,9 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   // evict on top of a later ADD and swallow it. That is also why no release fence
   // follows: there is nothing left in L2 to write back.
   //
-  // NOTE: this clears at kernel END, so it still relies on the caller barriering
-  // between launches (the benchmark does hipStreamSynchronize + ccoBarrierAll per
-  // iteration); without one, a peer's NEXT launch's ADD can arrive before this
-  // store and be overwritten by it, no matter the scope.
+  // Clearing at kernel END is safe without a host barrier: a peer's NEXT launch
+  // only ADDs here after passing its PushEntryBarrier, which needs us to have
+  // entered that launch too, i.e. after this kernel has retired.
   if (threadIdx.x == 0) {
     StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[0], 0);
   }

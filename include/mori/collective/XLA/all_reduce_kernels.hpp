@@ -61,6 +61,8 @@ namespace collective {
 //                   counters. Zeroed once by the host; each slice's elected block
 //                   self-resets its slot. Used to detect the last block to finish
 //                   a slice, so exactly one block broadcasts that slice.
+//   barrierCtr    : symmetric-heap uint64 for PushEntryBarrier (block 0, before
+//                   Phase 1)
 //
 // Phase 1-3 are the reduce-scatter push algorithm: block 0 SDMA-scatters each
 // peer's source slice into that peer's staging slot, then every block loops the S
@@ -85,10 +87,17 @@ __global__ void __launch_bounds__(256, 1)
 AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                     T* __restrict__ output, uint32_t* __restrict__ groupCounters,
                     size_t chunkElems, mori::cco::ccoDevComm devComm,
-                    T* __restrict__ staging, mori::cco::ccoWindow_t heapWin) {
+                    T* __restrict__ staging, mori::cco::ccoWindow_t heapWin,
+                    uint64_t* __restrict__ barrierCtr) {
 
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
+    // Back-to-back all-reduce is safe on its own (a peer finishes only after our
+    // broadcasts, i.e. after we are done with staging and reset signalBuf[s]),
+    // but staging/signalBuf are shared with the other push collectives, whose
+    // completion implies no such thing. Gate on every PE entering this launch.
+    if (threadIdx.x == 0) PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
+    __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
