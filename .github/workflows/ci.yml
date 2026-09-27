@@ -36,6 +36,17 @@ env:
   CT: docker
 
 jobs:
+  rdna4-policy-test:
+    name: RDNA4 EP policy (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/python/test_rdna4_ep.py
+
   build:
     name: mori build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
@@ -91,6 +102,13 @@ jobs:
         # mori.cco.cco still imports and this job stayed green while the flydsl
         # EP backend was gone from the package.
         run: $CT exec $CONTAINER python tools/verify_install.py
+
+      - name: RDNA4 EP host integration (CPU)
+        # Requires the installed native library, but mocks device discovery and
+        # stops before JIT/collectives. Safe on the existing CDNA runners.
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER \
+            python -m pytest -q tests/python/test_rdna4_ep_integration.py
 
       - name: Cleanup
         if: always()
