@@ -652,7 +652,9 @@ struct UMBPConfig {
     cfg.dram.use_hugepages =
         getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
     cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
-    if (const char* nodes = std::getenv("UMBP_DRAM_NUMA_NODE")) {
+    // Blank counts as unset, like -1: launch scripts often export VAR=${X:-}.
+    if (const char* nodes = std::getenv("UMBP_DRAM_NUMA_NODE");
+        nodes != nullptr && std::string(nodes).find_first_not_of(" \t\r\n") != std::string::npos) {
       cfg.dram.numa_nodes = ParseNumaNodes(nodes);
     }
     cfg.dram.numa_strict = getenv_int("UMBP_DRAM_NUMA_STRICT", 0) != 0;

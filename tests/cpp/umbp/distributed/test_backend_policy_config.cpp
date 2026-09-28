@@ -24,8 +24,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <string>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/pool/policy_config.h"
 
@@ -42,6 +44,18 @@ TEST(BackendPolicyConfig, NumaListParsingAndCapacitySplitting) {
   EXPECT_EQ(SplitNumaCapacity(11 * 4096 + 7, 2, 4096),
             (std::vector<uint64_t>{5 * 4096, 6 * 4096 + 7}));
   EXPECT_THROW(SplitNumaCapacity(4096, 2, 4096), std::invalid_argument);
+}
+
+TEST(BackendPolicyConfig, BlankNumaEnvironmentMeansNoBinding) {
+  for (const char* blank : {"", "  "}) {
+    ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", blank, 1), 0);
+    EXPECT_TRUE(UMBPConfig::FromEnvironment().dram.numa_nodes.empty()) << "'" << blank << "'";
+  }
+  ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", "1,0", 1), 0);
+  EXPECT_EQ(UMBPConfig::FromEnvironment().dram.numa_nodes, (std::vector<int>{1, 0}));
+  ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", "0,", 1), 0);
+  EXPECT_THROW(UMBPConfig::FromEnvironment(), std::invalid_argument);
+  unsetenv("UMBP_DRAM_NUMA_NODE");
 }
 
 TEST(BackendPolicyConfig, NumaPolicyPreservesHostOptionsAndSplitsBothNodes) {
