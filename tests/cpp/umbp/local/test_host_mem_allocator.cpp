@@ -29,6 +29,8 @@
 #include <sys/syscall.h>
 #endif
 
+// The checks below are plain asserts; keep them live in Release test builds.
+#undef NDEBUG
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
