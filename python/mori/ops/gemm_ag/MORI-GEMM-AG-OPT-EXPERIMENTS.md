@@ -43,7 +43,7 @@ their declared checks. The lossy cases additionally check that the widened
 received data exactly matches the encoded/decoded source tensors from all
 ranks; their numerical approximation error is reported separately.
 
-The maintained [benchmark entry points](../benchmark/cco/flydsl/gemm_ag/README.md)
+The maintained [benchmark entry points](../../../../benchmark/cco/flydsl/gemm_ag/README.md)
 call the MORI kernels directly. Selected functionality now lives in
 `compile_bf16_gemm_ag(split_k=...)`, `build_sdma_chunk_post`, and the fused
 producer's `fence="release"` option. The historical `sc_release` variant maps
@@ -291,7 +291,7 @@ path, and are close to native Torch. These backend comparisons are the first
 pass of five rounds, not independently paired backend repeats. No gain against
 a native Torch whole-matrix control is claimed for this new environment.
 
-The [benchmark README](../benchmark/cco/flydsl/gemm_ag/README.md) shows the
+The [benchmark README](../../../../benchmark/cco/flydsl/gemm_ag/README.md) shows the
 single-stream, two-stream and native Torch commands. Set `-m` to each local
 row count and `--chunks` to the candidate under test. Raw historical results
 remain in the archived run directory rather than the committed source tree.
