@@ -352,12 +352,16 @@ static std::optional<uint8_t> ReadBoundedQpAttrEnv(const char* name, uint8_t max
 
 // IO QPs read MORI_IO_QP_* first; when that is unset, fall back to a
 // transport-wide MORI_RDMA_QP_* so the same knob also tunes the shmem/CCO QPs
-// that share this ibverbs path but never see the IO-specific name. The IO name
-// wins when both are set.
+// that share this ibverbs path but never see the IO-specific name.
+//
+// Presence of the IO name decides, not whether it parsed: an explicitly set but
+// invalid MORI_IO_QP_* falls back to the built-in default like any other bad
+// override. Falling through to the transport-wide value instead would silently
+// apply a knob the operator did not aim at this QP.
 static std::optional<uint8_t> ReadQpRetryAttrEnv(const char* ioName, const char* rdmaName,
                                                  uint8_t maxValue) {
-  if (std::optional<uint8_t> io = ReadBoundedQpAttrEnv(ioName, maxValue); io.has_value()) {
-    return io;
+  if (std::getenv(ioName) != nullptr) {
+    return ReadBoundedQpAttrEnv(ioName, maxValue);
   }
   return ReadBoundedQpAttrEnv(rdmaName, maxValue);
 }
