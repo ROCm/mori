@@ -50,3 +50,6 @@ core.*
 
 # Tuning/bench tool output (tools/*_tuning.sh, tools/verify_tuned_config.sh)
 /logs/
+
+# Local GEMM + AG experiment archives are not maintained benchmark sources.
+/benchmark/cco/flydsl/gemm_ag/experiments/

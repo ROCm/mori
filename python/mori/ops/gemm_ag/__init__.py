@@ -43,6 +43,7 @@ _LAZY = {
     "compile_bf16_gemm_ag": "_gemm_a16w16_8wave",
     "build_lsa_barrier": "kernels_lsa",
     "build_sdma_phases": "kernels_sdma",
+    "build_sdma_chunk_post": "kernels_sdma",
     "compile_fused_gemm_ag": "kernels_fused",
     "compile_gemm_local": "kernels_fused",
 }
@@ -54,6 +55,7 @@ __all__ = [
     "build_lsa_ag",
     "build_lsa_barrier",
     "build_sdma_phases",
+    "build_sdma_chunk_post",
     "compile_bf16_gemm_ag",
     "compile_fused_gemm_ag",
     "compile_gemm_local",

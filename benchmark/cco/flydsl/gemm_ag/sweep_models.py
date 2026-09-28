@@ -37,13 +37,14 @@ every sample for the same reason.
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 import statistics
 import subprocess
 import sys
 import time
 
-REPO = os.environ.get("MORI_REPO", "/workspace/reports/mori")
+REPO = os.environ.get("MORI_REPO", str(Path(__file__).resolve().parents[4]))
 BENCH = f"{REPO}/benchmark/cco/flydsl/gemm_ag/bench_gemm_ag.py"
 PY = os.environ.get("MORI_PYTHON", sys.executable)
 OVERLAY = os.environ.get("PYTHONPATH", "")
@@ -223,13 +224,9 @@ def main():
 
     models = args.models.split(",") if args.models else list(MODELS)
     ms = [int(x) for x in args.ms.split(",")] if args.ms else MS
-    shapes = {
-        f"{name}@M{m}": dict(m=m, **MODELS[name]) for m in ms for name in models
-    }
+    shapes = {f"{name}@M{m}": dict(m=m, **MODELS[name]) for m in ms for name in models}
     configs = (
-        [c for c in CONFIGS if c[0] in args.modes.split(",")]
-        if args.modes
-        else CONFIGS
+        [c for c in CONFIGS if c[0] in args.modes.split(",")] if args.modes else CONFIGS
     )
     if not shapes or not configs:
         raise SystemExit("--models/--ms/--modes selected nothing")

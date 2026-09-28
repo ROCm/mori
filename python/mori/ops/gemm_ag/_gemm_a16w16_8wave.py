@@ -611,6 +611,7 @@ def compile_bf16_gemm_ag(
     direct_fence: str = "leader",
     emit_put: bool = True,
     fence: str = "leader",
+    split_k: int = 1,
 ):
     """The bf16 GEMM, with or without the all-gather fused into its epilogue.
 
@@ -633,6 +634,16 @@ def compile_bf16_gemm_ag(
     following pull kernel can then publish arrival and read peer HBM. This
     also works with a plain C tensor and null CCO handles.
 
+    ``split_k=2/4/8`` partitions K across the grid's second dimension and
+    writes FP32 partials to contiguous ``[split_k, M, N]`` storage. A and B
+    retain their original row stride K. The caller reduces these partials
+    before consuming or communicating C; split-K requires local, unfused
+    FP32 output.
+
+    ``fence="release"`` retains system-scope publication while omitting the
+    acquire half of the fused SDMA producer fence. Together with
+    ``peer_uncached=True`` it selects the measured publication optimization.
+
     **The fused epilogue below is the twin of the fp8 one in ``kernels_fused.py``
     and the two must be changed together.** They are not shared because FlyDSL's
     rewriter only lowers ``if`` inside a ``@flyc.kernel`` function's own AST, so
@@ -647,6 +658,12 @@ def compile_bf16_gemm_ag(
     indistinguishable.
     """
     assert K % BLOCK_K == 0, f"K={K} must be a multiple of BLOCK_K={BLOCK_K}"
+    if split_k not in (1, 2, 4, 8):
+        raise ValueError("split_k must be 1, 2, 4 or 8")
+    if split_k > 1 and (fuse or peer_uncached or out_dtype != "fp32"):
+        raise ValueError("split-K requires local, unfused FP32 partial output")
+    if K % (split_k * BLOCK_K):
+        raise ValueError("K must be divisible by split_k * BLOCK_K")
     if wait_policy not in ("tuned", "safe", "conservative"):
         raise ValueError(
             f"wait_policy must be tuned, safe or conservative, got {wait_policy!r}"
@@ -655,8 +672,8 @@ def compile_bf16_gemm_ag(
         raise ValueError(f"transport must be lsa or sdma, got {transport!r}")
     if post not in ("lanes", "serial"):
         raise ValueError(f"post must be lanes or serial, got {post!r}")
-    if fence not in ("none", "leader", "all"):
-        raise ValueError(f"fence must be none, leader or all, got {fence!r}")
+    if fence not in ("none", "leader", "all", "release"):
+        raise ValueError(f"invalid producer fence: {fence!r}")
     if direct_fence not in ("leader", "all"):
         raise ValueError(f"direct_fence must be leader or all, got {direct_fence!r}")
     if transport == "lsa" and not fuse:
@@ -708,7 +725,7 @@ def compile_bf16_gemm_ag(
     N_LDS_STEPS_A, N_LDS_STEPS_B = tc["N_LDS_STEPS_A"], tc["N_LDS_STEPS_B"]
     N_LDS_ROUNDS = max(N_LDS_STEPS_A, N_LDS_STEPS_B)
     a_lds_size, b_lds_size = tc["a_lds_size"], tc["b_lds_size"]
-    K_ITERS = K // BLOCK_K
+    K_ITERS = K // (split_k * BLOCK_K)
     assert K_ITERS >= 2, "the pipeline peels two K steps off the tail"
 
     # G2S uses vmcnt; S2R uses lgkmcnt. With A/B load instructions per
@@ -739,7 +756,7 @@ def compile_bf16_gemm_ag(
         f"{'F32' if out_dtype == 'fp32' else 'B16'}_{waves_per_eu}x{xcd_swizzle}"
         f"_c{chunks}q{sdma_queues}{post[0]}{'U' if peer_uncached else 'C'}"
         f"w{wait_policy[0]}"
-        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_k{K}_r{rank}"
+        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_k{K}_sk{split_k}_r{rank}"
     )
 
     @fx.struct
@@ -794,6 +811,12 @@ def compile_bf16_gemm_ag(
         B_K_STEP = BLOCK_K
         B0_gl_offset = (block_n * BLOCK_N) * K
         B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        if const_expr(split_k > 1):
+            split_offset = fx.block_idx.y * fx.Int32(K // split_k)
+            A0_gl_offset += split_offset
+            A1_gl_offset += split_offset
+            B0_gl_offset += split_offset
+            B1_gl_offset += split_offset
 
         gA = make_bf16_buffer_tensor(A)
         gB = make_bf16_buffer_tensor(B_T)
@@ -826,13 +849,8 @@ def compile_bf16_gemm_ag(
                 for j in range(ws)
             ]
         elif const_expr(fuse):
-            # One descriptor at this rank's own recv slot, reached through
-            # lsa_ptr(rank, ...) -- structurally what gemm_ar's fused-SDMA path
-            # does. Routing the fused-SDMA store through the C *tensor* instead
-            # measured as a wrong answer at M=2048 fp32 (relL2 6.9e-3 against
-            # 9.9e-7) and was clean through the buffer resource, so the two
-            # paths are not interchangeable even though they address the same
-            # bytes.
+            # The fused output is anchored to this rank's registered recv
+            # slot. SDMA reads that slot, independently of the caller's C view.
             rsrcs = [
                 create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
@@ -853,7 +871,7 @@ def compile_bf16_gemm_ag(
             rsrcs = None
         store_c = AgStoreC(
             C,
-            c_m,
+            c_m * split_k,
             c_n,
             mfma.idx,
             N_TILES_A,
@@ -978,6 +996,8 @@ def compile_bf16_gemm_ag(
         wave_n_offset = wave_n * (N_TILES_B * 16)
         wave_m_offset = wave_m * (N_TILES_A * 16)
         base_row = block_m * BLOCK_M + wave_m_offset
+        if const_expr(split_k > 1):
+            base_row += fx.block_idx.y * c_m
         base_col = block_n * BLOCK_N + wave_n_offset
 
         # Close the half-wave barrier the prologue opened. Its
@@ -1021,6 +1041,10 @@ def compile_bf16_gemm_ag(
                 # pair is closed above, so wait_barrier(0) really does mean
                 # every wave's stores have retired into this CU's L2.
                 raw_cco.cco_system_fence(fx.Int32(1))
+
+            elif const_expr(fence == "release"):
+                if fx.thread_idx.x == fx.Int32(0):
+                    _llvm.fence(_llvm.AtomicOrdering.release, syncscope="")
 
             ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
             lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
@@ -1098,7 +1122,7 @@ def compile_bf16_gemm_ag(
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": "512,512",
             },
-        ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, split_k, 1), block=(512, 1, 1), stream=stream)
 
     return launch_gemm
 

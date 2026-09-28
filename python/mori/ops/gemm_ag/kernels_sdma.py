@@ -192,4 +192,47 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
     }
 
 
-__all__ = ["build_sdma_phases", "PUSH_THREADS"]
+def build_sdma_chunk_post(cfg, rank):
+    """Submit one completed row chunk to all peers on queue 0.
+
+    Calls must be serialized on a submission stream. This only posts copies;
+    finish with ``build_sdma_phases(cfg, rank, queues=1)["drain"]``.
+    """
+    cfg.validate()
+    world = cfg.world_size
+    base = cfg.recv_slot_off(rank)
+
+    @flyc.kernel(name=f"mori_ag_chunk_post_r{rank}", known_block_size=[64, 1, 1])
+    def post(dev_comm: Int64, win: Int64, offset: Int64, nbytes: Int64):
+        tid = fx.thread_idx.x
+        sdma = cco.DevComm(dev_comm).sdma()
+        if tid < world:
+            if tid != rank:
+                sdma.put(
+                    tid,
+                    win,
+                    fx.Int64(base) + offset,
+                    win,
+                    fx.Int64(base) + offset,
+                    nbytes,
+                    fx.Int32(0),
+                    coop=cco.CoopScope.THREAD,
+                    signal=False,
+                )
+
+    @flyc.jit
+    def launch(
+        dev_comm: Int64,
+        win: Int64,
+        offset: Int64,
+        nbytes: Int64,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        post(dev_comm, win, offset, nbytes).launch(
+            grid=(1, 1, 1), block=[64, 1, 1], stream=stream
+        )
+
+    return launch
+
+
+__all__ = ["build_sdma_phases", "build_sdma_chunk_post", "PUSH_THREADS"]
