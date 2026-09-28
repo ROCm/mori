@@ -101,8 +101,8 @@ received tensor immediately before constructing references. The pipeline
 also poisons partial storage between replays. Nonfinite peer output fails
 validation. FP8 transport runs retain their initial precision-specific check.
 
-The [benchmark report](../../../../python/mori/ops/gemm_ag/MORI-GEMM-AG-BENCHMARK.md) and
-[optimization report](../../../../python/mori/ops/gemm_ag/MORI-GEMM-AG-OPT-EXPERIMENTS.md) retain
+The [benchmark report](../../../../python/mori/ops/gemm_ag/README.md) and
+[optimization report](../../../../python/mori/ops/gemm_ag/EXPERIMENTS.md) retain
 the measured findings. Historical generators, run plans and raw datasets are
 archived separately from the maintained source tree.
 
