@@ -98,6 +98,20 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
   static std::string RenderSource(const Cfg& cfg);
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
   static const std::vector<std::string>& SourceDeps();
+
+  // Shadows KernelSpec::LaunchRaw to fail on the host instead of faulting on the
+  // device. Only the gfx125x body reads stagingBase, and it is the only body with
+  // an LDS budget -- sharedBytes is that same EpArchIs1250() decision, taken once
+  // at Prepare and carried on the plan, so no second arch query is needed here.
+  static void LaunchRaw(const Plan& plan, const void* argBuf, size_t argSize, hipStream_t stream) {
+    if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase) {
+      throw std::runtime_error(
+          "ep_dispatch on gfx125x: staging_base was not bound. Allocate "
+          "ep_staging_bytes(world_size, max_recv, scale_bytes) bytes and "
+          "plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
+    }
+    mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg>::LaunchRaw(plan, argBuf, argSize, stream);
+  }
 };
 
 class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {

@@ -142,7 +142,7 @@ def scale_stride_bytes(scale_bytes: int) -> int:
     return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
 
 
-def _ep_staging_bytes(world_size: int, max_recv: int, scale_bytes: int) -> int:
+def ep_staging_bytes(world_size: int, max_recv: int, scale_bytes: int) -> int:
     """Total bytes for the gfx1250 dispatch staging buffer.
 
     Mirrors EpStagingTotalBytes in ep_cfg.hpp.
@@ -396,7 +396,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.dispatch_staging = None
         if self._is1250 and not cfg.is_internode:
             raw_scale = self._scale_i32(cfg) * 4
-            stg_bytes = _ep_staging_bytes(
+            stg_bytes = ep_staging_bytes(
                 cfg.world_size, cfg.effective_max_recv, raw_scale
             )
             if stg_bytes > 0:
