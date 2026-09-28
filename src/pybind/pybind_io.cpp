@@ -68,6 +68,22 @@ void RegisterMoriIo(pybind11::module_& m) {
       .value("POLLING", mori::io::PollCqMode::POLLING)
       .value("EVENT", mori::io::PollCqMode::EVENT);
 
+  py::enum_<mori::io::PeerFailureReason>(m, "PeerFailureReason")
+      .value("UNKNOWN", mori::io::PeerFailureReason::UNKNOWN)
+      .value("QP_FATAL", mori::io::PeerFailureReason::QP_FATAL)
+      .value("PORT_DOWN", mori::io::PeerFailureReason::PORT_DOWN)
+      .value("DEVICE_FATAL", mori::io::PeerFailureReason::DEVICE_FATAL)
+      .value("CQ_ERROR", mori::io::PeerFailureReason::CQ_ERROR)
+      .export_values();
+
+  py::class_<mori::io::PeerFailureEvent>(m, "PeerFailureEvent")
+      .def(py::init<>())
+      .def_readonly("remote_engine_key", &mori::io::PeerFailureEvent::remoteEngineKey)
+      .def_readonly("reason", &mori::io::PeerFailureEvent::reason)
+      .def_readonly("qp_num", &mori::io::PeerFailureEvent::qpNum)
+      .def_readonly("device_name", &mori::io::PeerFailureEvent::deviceName)
+      .def_readonly("detail", &mori::io::PeerFailureEvent::detail);
+
   py::class_<mori::io::BackendConfig>(m, "BackendConfig");
 
   py::class_<mori::io::RdmaBackendConfig, mori::io::BackendConfig>(m, "RdmaBackendConfig")
@@ -214,6 +230,14 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("Write", &mori::io::IOEngine::Write, py::call_guard<py::gil_scoped_release>())
       .def("BatchWrite", &mori::io::IOEngine::BatchWrite, py::call_guard<py::gil_scoped_release>())
       .def("CreateSession", &mori::io::IOEngine::CreateSession)
+      .def(
+          "PopPeerFailure",
+          [](mori::io::IOEngine& self) -> std::optional<mori::io::PeerFailureEvent> {
+            mori::io::PeerFailureEvent event;
+            if (!self.PopPeerFailure(&event)) return std::nullopt;
+            return event;
+          },
+          py::call_guard<py::gil_scoped_release>())
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
            py::call_guard<py::gil_scoped_release>())
       .def("WaitAll", &mori::io::IOEngine::WaitAll, py::arg("statuses"), py::arg("timeout_ms") = -1,

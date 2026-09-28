@@ -29,6 +29,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <unordered_set>
 
 namespace mori {
@@ -99,6 +100,28 @@ EventDescriptor DescribeAsyncEvent(ibv_event_type type) {
   }
 }
 
+// Maps an async event onto a peer-failure reason. Returns nullopt for events
+// that do not mean a peer is unusable — including IBV_EVENT_PORT_ACTIVE, which
+// is a recovery notification, and the informational QP lifecycle events. A peer
+// that is simply slow produces no async event at all and so is never classified
+// here, which is what keeps "slow" from being confused with "dead".
+std::optional<PeerFailureReason> ClassifyPeerFailure(ibv_event_type type) {
+  switch (type) {
+    case IBV_EVENT_QP_FATAL:
+    case IBV_EVENT_QP_REQ_ERR:
+    case IBV_EVENT_QP_ACCESS_ERR:
+      return PeerFailureReason::QP_FATAL;
+    case IBV_EVENT_PORT_ERR:
+      return PeerFailureReason::PORT_DOWN;
+    case IBV_EVENT_DEVICE_FATAL:
+      return PeerFailureReason::DEVICE_FATAL;
+    case IBV_EVENT_CQ_ERR:
+      return PeerFailureReason::CQ_ERROR;
+    default:
+      return std::nullopt;
+  }
+}
+
 class AsyncEventAckGuard {
  public:
   explicit AsyncEventAckGuard(ibv_async_event* event) noexcept : event_(event) {}
@@ -114,12 +137,14 @@ class AsyncEventAckGuard {
 }  // namespace
 
 std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
-    const application::RdmaDeviceList& devices, std::shared_ptr<spdlog::logger> logger) {
+    const application::RdmaDeviceList& devices, std::shared_ptr<spdlog::logger> logger,
+    PeerFailureCallback onPeerFailure) {
   // Thread creation and allocations can throw; a failed monitor must degrade to
   // "no observability", never abort RDMA backend construction. On any throw the
   // in-scope unique_ptr unwinds through Shutdown() and releases monitor fds.
   try {
-    std::unique_ptr<RdmaAsyncEventMonitor> monitor(new RdmaAsyncEventMonitor(std::move(logger)));
+    std::unique_ptr<RdmaAsyncEventMonitor> monitor(
+        new RdmaAsyncEventMonitor(std::move(logger), std::move(onPeerFailure)));
     if (!monitor->Start(devices)) return nullptr;
     return monitor;
   } catch (...) {
@@ -127,8 +152,9 @@ std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
   }
 }
 
-RdmaAsyncEventMonitor::RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger)
-    : logger_(std::move(logger)) {}
+RdmaAsyncEventMonitor::RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger,
+                                             PeerFailureCallback onPeerFailure)
+    : logger_(std::move(logger)), onPeerFailure_(std::move(onPeerFailure)) {}
 
 RdmaAsyncEventMonitor::~RdmaAsyncEventMonitor() { Shutdown(); }
 
@@ -288,7 +314,39 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
     }
   }
   DescribeAndLog(watch, info);
+  ReportPeerFailureIfFatal(watch, info);
   return GetResult::kEvent;
+}
+
+void RdmaAsyncEventMonitor::ReportPeerFailureIfFatal(const Watch& watch,
+                                                     const EventInfo& info) noexcept {
+  if (!onPeerFailure_) return;
+
+  std::optional<PeerFailureReason> reason = ClassifyPeerFailure(info.type);
+  if (!reason.has_value()) return;
+
+  // The callback and the string building below allocate; this runs on the
+  // monitor thread inside a noexcept boundary, so nothing may escape.
+  try {
+    EventDescriptor desc = DescribeAsyncEvent(info.type);
+    PeerFailureEvent event;
+    event.reason = *reason;
+    // Only QP-scoped events carry a meaningful QP number. Port and device
+    // events are left at 0 so the consumer treats them as affecting every peer
+    // reached through this device rather than one QP.
+    event.qpNum = desc.category == Category::kQp ? info.qpNum : 0;
+    event.deviceName = watch.deviceName;
+    event.detail = std::string(desc.name != nullptr ? desc.name : "IBV_EVENT_UNKNOWN") +
+                   " on device " + watch.deviceName;
+    if (event.qpNum != 0) {
+      event.detail += " qpn=" + std::to_string(event.qpNum);
+    }
+    onPeerFailure_(event);
+  } catch (...) {
+    SafeLog(spdlog::level::err,
+            "RDMA async monitor: failed to report peer failure for event type {} on {}",
+            static_cast<int>(info.type), watch.deviceName);
+  }
 }
 
 void RdmaAsyncEventMonitor::DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept {

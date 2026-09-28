@@ -235,5 +235,14 @@ class IOEngine:
             return transfer_status
         return None
 
+    def pop_peer_failure(self):
+        """Take the oldest pending peer failure, or None if nothing has failed.
+
+        None means no failure has been observed, not that every peer is healthy.
+        A peer that is slow but reachable never appears here, so a caller can
+        wait on it indefinitely and still react as soon as one dies.
+        """
+        return self._engine.PopPeerFailure()
+
     def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
         return self._engine.WaitAll(statuses, timeout_ms)

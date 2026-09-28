@@ -30,20 +30,26 @@
 #include <vector>
 
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/io/peer_failure.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace io {
 
 // Consumes verbs async events from each unique ibv_context owned by MORI-IO's
-// persistent RdmaContext and reports them through the cached IO logger. One
-// epoll thread drains all async fds plus an eventfd used for shutdown. The
-// monitor holds non-owning ibv_context* references and must be destroyed before
-// ibv_close_device().
+// persistent RdmaContext and reports them through the cached IO logger, and —
+// for the subset that means a peer or its path has died — through an optional
+// callback. One epoll thread drains all async fds plus an eventfd used for
+// shutdown. The monitor holds non-owning ibv_context* references and must be
+// destroyed before ibv_close_device() and before any state its callback touches.
 class RdmaAsyncEventMonitor {
  public:
+  // onPeerFailure is invoked on the monitor thread for fatal events only, and is
+  // taken at construction so it is visible to the thread without synchronization.
+  // It may be empty, in which case events are logged and nothing else.
   static std::unique_ptr<RdmaAsyncEventMonitor> Create(const application::RdmaDeviceList& devices,
-                                                       std::shared_ptr<spdlog::logger> logger);
+                                                       std::shared_ptr<spdlog::logger> logger,
+                                                       PeerFailureCallback onPeerFailure = {});
   ~RdmaAsyncEventMonitor();
 
   RdmaAsyncEventMonitor(const RdmaAsyncEventMonitor&) = delete;
@@ -72,12 +78,16 @@ class RdmaAsyncEventMonitor {
 
   enum class GetResult { kEvent, kDrained, kError };
 
-  explicit RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger);
+  RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger, PeerFailureCallback onPeerFailure);
 
   bool Start(const application::RdmaDeviceList& devices);
   void MainLoop() noexcept;
   GetResult ProcessOneEvent(Watch& watch) noexcept;
   void DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept;
+  // Classifies the event and, when it is fatal, hands it to onPeerFailure_.
+  // Benign and recovery events (e.g. PORT_ACTIVE, COMM_EST) report nothing: a
+  // slow-but-alive peer must never surface as a failure.
+  void ReportPeerFailureIfFatal(const Watch& watch, const EventInfo& info) noexcept;
   void RemoveWatch(Watch& watch) noexcept;
   void RestoreWatchFd(Watch& watch) noexcept;
   void DrainWake() noexcept;
@@ -97,6 +107,9 @@ class RdmaAsyncEventMonitor {
   }
 
   std::shared_ptr<spdlog::logger> logger_;
+  // Set at construction and never mutated, so the monitor thread reads it
+  // without synchronization.
+  PeerFailureCallback onPeerFailure_;
   std::vector<Watch> watches_;
   int epollFd_{-1};
   int wakeFd_{-1};

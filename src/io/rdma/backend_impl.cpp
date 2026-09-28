@@ -265,7 +265,8 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   env::Override("MORI_IO_ENABLE_ASYNC_EVENTS", enableAsyncEvents, mori::env::detail::ParseBool);
   if (enableAsyncEvents) {
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
-    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger);
+    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(
+        devices, logger, [this](const PeerFailureEvent& event) { peerFailures_.Record(event); });
     if (!asyncEventMonitor_ && logger) {
       logger->error("Failed to start RDMA async event monitor; continuing without it");
     }
@@ -273,14 +274,16 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 }
 
 RdmaManager::~RdmaManager() {
+  // Stop the monitor first: its thread records into peerFailures_, so it must be
+  // joined before any state that callback touches goes away.
+  asyncEventMonitor_.reset();
+
   for (auto* devCtx : deviceCtxs) {
     if (devCtx != nullptr) {
       delete devCtx;
     }
   }
   deviceCtxs.clear();
-
-  asyncEventMonitor_.reset();
 
   if (ctx != nullptr) {
     delete ctx;
@@ -592,8 +595,16 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   endpointsEpoch_.fetch_add(1, std::memory_order_release);
+
+  // Remember who this QP talks to so a later async event, which carries only a
+  // QP number, can name the peer it affects.
+  peerFailures_.RegisterQp(local.handle.qpn, remoteKey, availDevices[devId].first->Name());
   return id;
 }
+
+bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.Pop(out); }
+
+bool RdmaManager::IsQpAlive(uint32_t qpNum) const { return peerFailures_.IsQpAlive(qpNum); }
 
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
@@ -1344,13 +1355,14 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        std::vector<application::RdmaMemoryRegion> localMrPerEp,
                                        std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
-                                       const EpPairVec& e, Executor* exec,
+                                       const EpPairVec& e, Executor* exec, RdmaManager* rdma,
                                        MemoryLocationType localLoc)
     : config(config),
       localMrPerEp(std::move(localMrPerEp)),
       remoteMrPerEp(std::move(remoteMrPerEp)),
       eps(e),
       executor(exec),
+      rdma_(rdma),
       localLoc_(localLoc) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
@@ -1476,7 +1488,16 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 }
 
-bool RdmaBackendSession::Alive() const { return true; }
+bool RdmaBackendSession::Alive() const {
+  // Reports liveness of the transport, not progress of a transfer: a peer that
+  // is slow but reachable is alive. Only an observed fatal event makes this
+  // false, so this never has to guess from elapsed time.
+  if (rdma_ == nullptr) return true;
+  for (const auto& ep : eps) {
+    if (!rdma_->IsQpAlive(ep.local.handle.qpn)) return false;
+  }
+  return true;
+}
 
 /* ----------------------------------------------------------------------------------------------
  */
@@ -1718,12 +1739,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
-                            executor.get(), local.loc);
+                            executor.get(), rdma, local.loc);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                            TransferStatus* status) {
   return notif->PopInboundTransferStatus(remote, id, status);
+}
+
+bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
+  if (!rdma) return false;
+  return rdma->PopPeerFailure(out);
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
