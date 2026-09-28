@@ -54,6 +54,7 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import torch
+import os
 
 from mori.tensor_utils import from_gpu_ptr
 
