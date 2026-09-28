@@ -43,7 +43,7 @@ deliberate: the two must use the same queue map and the same barrier slots, and
 a second copy of that would be a second thing to keep in step.
 
 Protocol is gcnasm's, ``gemm_ar``'s and ``gemm_a2a``'s: **no per-PUT signal**,
-``quiet_queue`` on the sender, then an LSA atomic to publish arrival. A trailing
+drain on the sender, then an LSA atomic to publish arrival. A trailing
 signal packet costs about what a copy packet does and nothing here polls it.
 """
 
@@ -88,6 +88,10 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
     Asking for ``world_size`` would create ``world_size`` queues per peer and
     touch one of them; inside a process that already holds SDMA engines,
     ``hsaKmtCreateQueueExt`` then starts failing (``anvil.cpp:237``).
+
+    The fused lane-parallel producer assigns chunks to ``chunk % queues``.
+    Its drain must therefore wait for every queue to a peer before publishing
+    arrival; completion on one queue does not order transfers on another.
 
     ``signal`` selects ``put``'s trailing local ATOMIC, off by default:
     ``quiet_queue`` drains the queue's read pointer independently of signals and
@@ -155,7 +159,14 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
                             coop=cco.CoopScope.THREAD,
                             signal=signal,
                         )
-                    sdma.quiet_queue(tid, tid % fx.Int32(queues))
+                    if const_expr(pushes or queues == 1):
+                        # The split kernel submitted only this queue. The
+                        # single-queue fused path has the same completion set.
+                        sdma.quiet_queue(tid, tid % fx.Int32(queues))
+                    else:
+                        # Different chunks may finish in any order and use
+                        # different queues. Cover every producer submission.
+                        sdma.quiet(tid, coop=cco.CoopScope.THREAD)
                 # Release before publishing arrival. The bytes were moved by the
                 # copy engine rather than by this CU, so there is nothing of ours
                 # to flush; the fence keeps the flag store from being hoisted
@@ -177,7 +188,7 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
 
     return {
         "gather": _push_kernel(True, f"mori_ag_sdma_gather_r{rank}_q{queues}"),
-        "drain": _push_kernel(False, f"mori_ag_sdma_drain_r{rank}_q{queues}"),
+        "drain": _push_kernel(False, f"mori_ag_sdma_drain_allq_r{rank}_q{queues}"),
     }
 
 
