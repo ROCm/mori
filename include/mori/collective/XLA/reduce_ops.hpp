@@ -36,9 +36,11 @@
 #include <algorithm>
 #include <cstdint>
 
+#if defined(MORI_KERNELS_IMPL)
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
+#endif
 
 #define FACADE_REDUCE_USE_ALL_TYPES 0
 
@@ -107,6 +109,7 @@ inline const char* ReduceOpName(ReduceOpKind op) {
 #undef ITEM
 }
 
+#if defined(MORI_KERNELS_IMPL)
 template <DataType dt>
 struct ReduceTypeMap;  // primary left undefined: unmapped dt -> compile error
 #define ITEM(name, ctype) \
@@ -116,6 +119,7 @@ struct ReduceTypeMap;  // primary left undefined: unmapped dt -> compile error
 
 template <DataType dt>
 using ReduceType = typename ReduceTypeMap<dt>::type;
+#endif // MORI_KERNELS_IMPL
 
 #if defined(__HIPCC__) || defined(__HIP__)
 
