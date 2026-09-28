@@ -92,6 +92,7 @@ from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
 
 import mori.cco.device.flydsl as cco
+from flydsl._mlir.dialects import llvm as _llvm
 from mori.cco.device.flydsl import _bindings as raw_cco
 
 from ..gemm_ar._compat import (
@@ -303,8 +304,8 @@ def compile_fused_gemm_ag(
             f"between them cannot be released), so two chunks of one "
             f"destination have to be separated by queue instead"
         )
-    if fence not in ("none", "leader", "all"):
-        raise ValueError(f"fence must be none, leader or all, got {fence!r}")
+    if fence not in ("none", "leader", "all", "release"):
+        raise ValueError(f"invalid producer fence: {fence!r}")
     if direct_fence not in ("leader", "all"):
         raise ValueError(f"direct_fence must be leader or all, got {direct_fence!r}")
     if quant not in ("ptpc", "blockscale", "mxfp8"):
@@ -497,9 +498,7 @@ def compile_fused_gemm_ag(
             # where -- every tile goes everywhere.
             peer_rsrcs = [
                 create_buffer_resource_from_addr(
-                    wave_uniform_i64(
-                        w_pre.lsa_ptr((rank + j) % ws, my_recv_slot)
-                    ),
+                    wave_uniform_i64(w_pre.lsa_ptr((rank + j) % ws, my_recv_slot)),
                     num_records_bytes=slab_bytes,
                 )
                 for j in range(ws)
@@ -794,6 +793,9 @@ def compile_fused_gemm_ag(
                 # really does mean every wave's stores have retired into this
                 # CU's L2 and one wave writing it back covers all eight.
                 raw_cco.cco_system_fence(fx.Int32(1))
+            elif const_expr(fuse and fence == "release"):
+                if fx.thread_idx.x == fx.Int32(0):
+                    _llvm.fence(_llvm.AtomicOrdering.release, syncscope="")
             # "none": gemm_ar's own default here. Its stores go through the
             # same L2 the copy engine reads, and it measured the fence as
             # unnecessary on that path -- but it also measured dropping it as

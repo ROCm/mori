@@ -45,13 +45,14 @@ failure that only shows up as a wrong answer.
 import argparse
 import json
 import os
+from pathlib import Path
 import re
 import statistics
 import subprocess
 import sys
 import time
 
-REPO = os.environ.get("MORI_REPO", "/workspace/reports/mori")
+REPO = os.environ.get("MORI_REPO", str(Path(__file__).resolve().parents[4]))
 BENCH = f"{REPO}/benchmark/cco/flydsl/gemm_ag/bench_gemm_ag.py"
 PY = os.environ.get("MORI_PYTHON", sys.executable)
 OVERLAY = os.environ.get("PYTHONPATH", "")

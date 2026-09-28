@@ -3,6 +3,28 @@
 Measurements for `mori.ops.gemm_ag`, the row-concatenating all-gather fused into
 the epilogue of mori's 8-wave fp8 GEMM.
 
+**BF16 performance update (2026-09-28):** the repaired pure GEMM has now been
+compared directly with native BF16-input/FP32-output `torch.mm`. At
+M=N=2048, K=7168, Torch takes 71.1 µs; MORI takes 131.9 µs at the default
+`256x256` tile, 88.6 µs at `128x256`, and 72.0 µs at `128x128`.
+See *Native BF16-to-FP32 GEMM comparison after repair* for the paired protocol.
+The historical 107.2 µs Torch baseline below includes a BF16-to-FP32 output
+conversion and is not the native FP32-output baseline.
+
+**BF16 GEMM + AG update (2026-09-28):** at that same shape, the fastest
+measured path is `128x128` GEMM followed by SDMA, **364.0 µs**, against native
+Torch GEMM + RCCL at **397.5 µs**. Fusing SDMA takes **377.0 µs** even at its
+best chunk count. See *GEMM + all-gather comparison after repair* for the full
+matrix and the multi-queue completion correction included in these results.
+
+**Follow-up optimization experiments:** single-counter election and metadata
+changes did not materially improve end-to-end time. System-scope C stores
+with a release-only fence reduced monolithic fused SDMA to about 365–366 µs.
+A four-chunk MORI split-K pipeline showed a 1.43% gain in two final paired
+repeats; a Torch small-M pipeline reached about 350 µs. These are experimental
+alternatives, detailed in [the optimization report](MORI-GEMM-AG-OPT-EXPERIMENTS.md),
+which also separates the lossy-wire results from the same-precision comparison.
+
 **Headline: fusing an all-gather does not beat not fusing it, at any shape
 measured here.** The best fused configuration (`fused-sdma --chunks 1 --post
 lanes`) lands at 105.5us against `split-sdma`'s 104.1 at `r4 M=512`, and 217.2
@@ -602,7 +624,117 @@ PYTHONPATH=python .venv/bin/python -m pytest -q tests/python/cco/test_gemm_ag.py
   -k 'bf16_pull_publishes or pull_initializes or bf16_gemm_pipeline_numerics'
 ```
 
-### What it would have bought, and what it actually bought
+### Native BF16-to-FP32 GEMM comparison after repair
+
+Measured on 2026-09-28 at commit `f1397867`, after confirming all eight MI355X
+GPUs were idle. Each rank uses M=N=2048, K=7168 and the same BF16 A `[M,K]`
+and B `[N,K]` for all implementations. The Torch operation is
+`torch.mm(a, b.T, out_dtype=torch.float32, out=c)` on
+`2.10.0+rocm7.2.0.gitb6ee5fde`; it writes FP32 directly. Outputs are preallocated.
+MORI uses `fuse=False, peer_uncached=False`, so these are pure GEMM times.
+
+Every implementation is compiled and checked against a FP32 reference before
+timing. Each measurement captures one GEMM in a CUDA graph, uses 100 warmups
+and the median of 101 event samples, and takes the maximum across eight ranks.
+Five rounds rotate implementation order; the headline is the median of those
+five maxima. Compilation, validation, and host barriers are outside timing.
+
+| Implementation | Median µs | Five-round range µs | Latency vs native Torch |
+|---|---:|---:|---:|
+| Torch BF16 → FP32 | **71.1** | 70.6–72.1 | baseline |
+| MORI `256x256` (default) | **131.9** | 131.8–132.0 | **+85.5%** |
+| MORI `128x256` | **88.6** | 88.2–88.7 | **+24.6%** |
+| MORI `128x128` | **72.0** | 71.8–73.7 | **+1.3%** |
+
+All four implementations pass on all eight ranks, with worst
+`relL2=9.95e-7` against the reference. The `128x128` result is effectively
+parity at the observed timing variation; it does not establish a speedup over
+Torch. The default tile remains `256x256`, and these pure-GEMM measurements
+do not include the pull producer's publication or any all-gather transport.
+
+This supersedes the earlier estimate against 107.2 µs for the question of
+native BF16-to-FP32 GEMM performance. That older number consists of 81.5 µs
+for a BF16-output matrix multiply plus 25.6 µs to widen the result. Widening
+does not recover the precision lost when the output was rounded to BF16.
+
+The maintained [GEMM comparison](../benchmark/cco/flydsl/gemm_ag/compare_gemm.py)
+runs native Torch and MORI kernels directly with the same paired protocol.
+Historical per-rank records are archived separately from the source tree.
+
+### GEMM + all-gather comparison after repair
+
+Measured on 2026-09-28: 8x MI355X, M=N=2048, K=7168, BF16 operands and
+FP32 output/wire. Each rank produces 16 MiB and sends 112 MiB to its peers.
+These are end-to-end times for one GEMM followed by its complete all-gather,
+including the final cross-rank synchronization. The native Torch baseline is
+`torch.mm(..., out_dtype=torch.float32)` followed by RCCL
+`all_gather_into_tensor`: **397.5 µs**.
+
+| Mode | Default `256x256`, µs | `128x128`, µs |
+|---|---:|---:|
+| GEMM + RCCL | 462.7 | 403.7 |
+| GEMM + LSA push | 444.6 | 379.0 |
+| GEMM + LSA pull | 448.3 | 406.3 |
+| Fused LSA, cached stores | 542.4 | 509.2 |
+| Fused LSA, `peer_uncached=True` | 470.4 | 420.8 |
+| **GEMM + SDMA** | **427.8** | **364.0** |
+| Fused SDMA, 1 chunk | 429.0 | 377.0 |
+| Fused SDMA, 2 chunks | 440.6 | 388.6 |
+| Fused SDMA, 4 chunks | 462.2 | 409.9 |
+
+SDMA uses lane-parallel posting. The split path uses one queue per peer;
+fused SDMA uses one queue per chunk per peer. All fused cases retain the
+default leader fence. LSA copy kernels retain their default uncached policy;
+both fused-LSA store policies are shown rather than choosing only the faster
+one.
+
+**Fusion does not improve the best split result at this shape.** With the
+default tile, one-chunk fused SDMA is effectively tied with split SDMA
+(+0.3% measured latency); with `128x128`, it is **3.6% slower**. Two and four
+chunks increase latency by **6.8% and 12.6%** respectively on the smaller tile.
+Even the faster fused-LSA policy is **5.8% slower** than split LSA push at
+`256x256` and **11.0% slower** at `128x128`.
+
+The practical improvement is the smaller tile plus the split SDMA transport:
+364.0 µs is **8.4% less latency than native Torch + RCCL** and **14.9% less
+than the default-tile split SDMA path**. Those gains must not be reported as
+fusion gains. At this shape, the 64- or 256-workgroup grid fits in one round
+on 256 CUs, so chunking does not imply a long sequence of progressively ready
+outputs. The measurements show additional chunks increasing total latency.
+
+Each configuration ran five rounds with 50 warmups and the median of 101
+CUDA-graph event samples per rank. Take the maximum across ranks in each
+round, then the median across rounds. Configurations ran sequentially with
+no other GPU processes before or after each run. Allocation, compilation,
+capture, and validation are outside timing. This is a repeated measurement
+within one process group per configuration, not five independent process
+launches. No subtraction of a separately timed GEMM is used to claim overlap.
+
+All 19 final configurations passed the initial numerical check and two
+changed-input replays of the same captured graph. Each replay poisons recv,
+changes the sign of A, and clones recv immediately after graph completion,
+before constructing the reference. This catches stale results and prevents
+reference-GEMM work from hiding a transfer still in flight. Every rank checks
+finite output and `relL2 < 1e-5`; the worst observed replay error was
+`9.94e-7`.
+
+**Multi-queue drain correction.** The sweep exposed a protocol gap in
+`kernels_sdma.py`: the fused producer assigns chunks to `chunk % queues`,
+but the drain waited only for `peer % queues`. Completion of one queue does
+not cover the others. The fused multi-queue drain now uses
+`sdma.quiet(peer, coop=THREAD)` to wait for all of that peer's queues before
+publishing arrival. Split and single-queue paths keep their existing wait.
+The kernel symbol includes `drain_allq` to avoid reusing the old compiled
+drain. A model executing the real kernel body failed nine multi-queue cases
+before this correction; all 24 split/fused/rank/queue cases now pass. The
+table uses the corrected drain for every fused multi-queue measurement;
+the earlier `128x128` samples were replaced by fresh measurements.
+
+The maintained [benchmark entry points](../benchmark/cco/flydsl/gemm_ag/README.md)
+run these transport comparisons directly, including repeated graph timing
+and changed-input validation. Historical raw records are archived separately.
+
+### What it would have bought, and what it actually bought (historical)
 
 At `BLOCK_M=128`, `gemm-only` at `M=2048` over 8 ranks under CUDA-graph replay
 measures **91.7us** against the shipped tile's 137.6 — a 33% cut that would have

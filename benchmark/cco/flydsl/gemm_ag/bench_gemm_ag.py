@@ -63,6 +63,8 @@ import os
 import statistics
 import sys
 
+from _bench_utils import measure, positive_int
+
 import flydsl.expr as fx
 import torch
 import torch.distributed as dist
@@ -287,7 +289,7 @@ def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
     return statistics.median(samples)
 
 
-def _validate_recv(recv, args, rank, world_size) -> tuple[float, bool]:
+def _validate_recv(recv, args, rank, world_size, *, sign=1) -> tuple[float, bool]:
     """Check what *arrived*, rank by source rank.
 
     Reads the received buffer, never the local one. A transport that silently
@@ -303,10 +305,12 @@ def _validate_recv(recv, args, rank, world_size) -> tuple[float, bool]:
     per_src = []
     for src in range(world_size):
         a_src, b_src, sa_src, sb_src = _operands(src, args)
-        ref = _reference(a_src, b_src, sa_src, sb_src, args)
+        ref = _reference(a_src, b_src, sa_src, sb_src, args) * sign
         got = recv[src * args.m : (src + 1) * args.m].float()
         denom = ref.norm().item()
         rel = (got - ref).norm().item() / denom if denom else float("inf")
+        if not bool(torch.isfinite(got).all().item()):
+            rel = float("inf")
         worst = max(worst, rel)
         per_src.append(rel)
         del a_src, b_src, sa_src, sb_src, ref
@@ -342,6 +346,18 @@ def run(args) -> int:
         return 2
 
     bf16_in = args.in_dtype == "bf16"
+    if not bf16_in and args.wait_policy != "tuned":
+        raise SystemExit("--wait-policy applies only to --in-dtype bf16")
+    if args.torch_gemm and (
+        not bf16_in
+        or args.out_dtype != "fp32"
+        or args.mode not in ("gemm-only", "split-rccl", "split-sdma")
+    ):
+        raise SystemExit(
+            "--torch-gemm requires BF16/FP32 gemm-only, split-rccl or split-sdma"
+        )
+    if args.fence == "release" and args.mode != "fused-sdma":
+        raise SystemExit("--fence release applies only to fused-sdma")
     out_t = torch.bfloat16 if args.out_dtype == "bf16" else torch.float32
     elem_bytes = 2 if args.out_dtype == "bf16" else 4
     if not bf16_in:
@@ -430,9 +446,7 @@ def run(args) -> int:
             # collective, at exactly the shape and stride recv wants, so it can
             # be written in place. No mode needs a re-layout, which is the
             # single biggest difference from the all-to-all.
-            c = from_gpu_ptr(
-                mem.ptr + cfg.recv_slot_off(rank), (args.m, args.n), out_t
-            )
+            c = from_gpu_ptr(mem.ptr + cfg.recv_slot_off(rank), (args.m, args.n), out_t)
         else:
             c = torch.empty(args.m, args.n, device="cuda", dtype=out_t)
         torch.cuda.synchronize()
@@ -452,7 +466,9 @@ def run(args) -> int:
         # publish with sc0|sc1. See build_lsa_ag's docstring; the symptom
         # without it is a relL2 that depends on the quantisation.
         pull_gemm = args.mode == "split-lsa-pull"
-        if bf16_in:
+        if args.torch_gemm:
+            gemm = None
+        elif bf16_in:
             # One factory for both, as gemm_ar does: fuse=False emits the same
             # kernel minus the epilogue tail, so the split baseline and the
             # fused kernel differ in exactly one thing.
@@ -471,9 +487,7 @@ def run(args) -> int:
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
                 post=args.post,
-                peer_uncached=(
-                    pull_gemm or (args.peer_uncached and args.mode == "fused-lsa")
-                ),
+                peer_uncached=(pull_gemm or (args.peer_uncached and fused)),
                 direct_fence=args.direct_fence,
                 emit_put=not args.no_put,
                 fence=args.fence,
@@ -491,14 +505,11 @@ def run(args) -> int:
                 quant=args.quant,
                 waves_per_eu=args.waves_per_eu,
                 transport="lsa" if args.mode == "fused-lsa" else "sdma",
-                wait_policy=args.wait_policy,
                 fuse=fused,
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
                 post=args.post,
-                peer_uncached=(
-                    pull_gemm or (args.peer_uncached and args.mode == "fused-lsa")
-                ),
+                peer_uncached=(pull_gemm or (args.peer_uncached and fused)),
                 direct_fence=args.direct_fence,
                 emit_put=not args.no_put,
                 fence=args.fence,
@@ -579,15 +590,31 @@ def run(args) -> int:
             # The two GEMMs differ by two arguments -- the bf16 one has no
             # scales -- so the launch is adapted here rather than by giving the
             # bf16 kernel two ignored tensors.
-            if bf16_in:
+            if args.torch_gemm:
+                torch.mm(a, b.T, out_dtype=torch.float32, out=c)
+            elif bf16_in:
                 gemm(
-                    a_arg, b_arg, c_flat, args.m, args.n, dc.ptr, win.handle,
+                    a_arg,
+                    b_arg,
+                    c_flat,
+                    args.m,
+                    args.n,
+                    dc.ptr,
+                    win.handle,
                     stream=stream,
                 )
             else:
                 gemm(
-                    a_arg, b_arg, c_flat, sa_arg, sb_arg, args.m, args.n,
-                    dc.ptr, win.handle, stream=stream,
+                    a_arg,
+                    b_arg,
+                    c_flat,
+                    sa_arg,
+                    sb_arg,
+                    args.m,
+                    args.n,
+                    dc.ptr,
+                    win.handle,
+                    stream=stream,
                 )
 
         def once():
@@ -645,7 +672,36 @@ def run(args) -> int:
                     flush=True,
                 )
 
-        us = _median_us(once, args.warmup, args.iters, graph=not args.no_graph)
+        us, timing, replay = measure(
+            once, args.warmup, args.iters, args.rounds, graph=not args.no_graph
+        )
+        replay_errors = []
+        if bf16_in and not args.skip_validation and not args.no_put:
+            local_only = args.mode in ("gemm-only", "gemm-to-window")
+            for sign in (-1, 1):
+                a.neg_()
+                (c if local_only else recv).fill_(float("nan"))
+                torch.cuda.synchronize()
+                dist.barrier()
+                replay()
+                # Snapshot before reference work can conceal a late transfer.
+                snapshot = (c if local_only else recv).clone()
+                torch.cuda.synchronize()
+                if local_only:
+                    ref = _reference(a, b, sa, sb, args)
+                    rel = ((snapshot.float() - ref).norm() / ref.norm()).item()
+                    ok = rel < args.tolerance
+                else:
+                    rel, ok = _validate_recv(
+                        snapshot, args, rank, world_size, sign=sign
+                    )
+                ok = ok and bool(torch.isfinite(snapshot).all().item())
+                validated = validated and ok
+                replay_errors.append(rel)
+                rel_l2 = max(rel_l2, rel)
+                del snapshot
+        timing["changed_input_rel_l2"] = replay_errors
+        del replay
         # Same-run phase split, as gcnasm's strict_timing does. The headline
         # `us` stays the whole thing; these two are only for attribution, and
         # they exist because "mode E2E minus a separate gemm-only run" charges
@@ -668,8 +724,12 @@ def run(args) -> int:
         comm.barrier()
 
         gathered = [None] * world_size
-        dist.all_gather_object(gathered, {"rank": rank, "us": us, "ok": validated})
+        dist.all_gather_object(
+            gathered, {"rank": rank, "us": us, "ok": validated, "rel_l2": rel_l2}
+        )
+        validated = all(g["ok"] for g in gathered)
         if rank == 0:
+            print("TIMING_JSON " + json.dumps(timing), flush=True)
             result = {
                 "mode": args.mode,
                 "m": args.m,
@@ -682,8 +742,9 @@ def run(args) -> int:
                 "world_size": world_size,
                 "chunks": chunks,
                 "us": max(g["us"] for g in gathered),
-                "rel_l2": rel_l2,
-                "validated": all(g["ok"] for g in gathered),
+                "rel_l2": max(g["rel_l2"] for g in gathered),
+                "validated": validated,
+                "torch_gemm": args.torch_gemm,
                 "remote_bytes_per_rank": cfg.remote_bytes_per_rank,
                 **{f"phase_{k}": v for k, v in phase_us.items()},
             }
@@ -743,7 +804,9 @@ def build_parser() -> argparse.ArgumentParser:
         "one thing at the cost of no longer being gemm-only's kernel",
     )
     p.add_argument("--direct-fence", choices=("leader", "all"), default="leader")
-    p.add_argument("--fence", choices=("none", "leader", "all"), default="leader")
+    p.add_argument(
+        "--fence", choices=("none", "leader", "all", "release"), default="leader"
+    )
     p.add_argument("--copy-blocks", type=int, default=0)
     p.add_argument(
         "--lsa-uncached", action=argparse.BooleanOptionalAction, default=True
@@ -780,7 +843,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--sdma-queues", type=int, default=1)
     p.add_argument("--warmup", type=int, default=3)
-    p.add_argument("--iters", type=int, default=20)
+    p.add_argument("--iters", type=positive_int, default=20)
+    p.add_argument("--rounds", type=positive_int, default=1)
+    p.add_argument(
+        "--torch-gemm", action="store_true", help="native BF16-to-FP32 GEMM baseline"
+    )
     p.add_argument("--no-graph", action="store_true")
     p.add_argument("--phase-split", action="store_true")
     p.add_argument(

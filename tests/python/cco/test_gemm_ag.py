@@ -604,3 +604,86 @@ def test_bf16_gemm_pipeline_numerics(bm, bn, out_dtype, k, peer_uncached):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 launch()
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"split_k": 3}, "split_k must"),
+        ({"split_k": 4, "fuse": True}, "local, unfused FP32"),
+        ({"split_k": 4, "peer_uncached": True}, "local, unfused FP32"),
+        ({"split_k": 4, "out_dtype": "bf16"}, "local, unfused FP32"),
+        ({"split_k": 4, "K": 320}, "divisible"),
+    ],
+)
+def test_split_k_rejects_incompatible_output(kwargs, match):
+    cfg = layout.ag_config(
+        world_size=8, m=256, n=256, elem_bytes=4, block_m=128, block_n=128
+    )
+    options = dict(K=7168, BLOCK_M=128, BLOCK_N=128, out_dtype="fp32")
+    options.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        bf16gemm.compile_bf16_gemm_ag(cfg, 0, **options)
+
+
+@pytest.mark.parametrize("bm,bn", [(128, 128), (256, 256)])
+@pytest.mark.parametrize("splits,k", [(2, 256), (4, 768), (8, 7168)])
+def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
+    """Check every partial plane against a CPU oracle, including row strides."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a gfx950 GPU")
+    if "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
+        pytest.skip("requires gfx950 BF16 MFMA")
+    import flydsl.expr as fx
+
+    m, n = 2 * bm, 2 * bn
+    cfg = layout.ag_config(world_size=8, m=m, n=n, elem_bytes=4, block_m=bm, block_n=bn)
+    gemm = bf16gemm.compile_bf16_gemm_ag(
+        cfg, 0, K=k, BLOCK_M=bm, BLOCK_N=bn, out_dtype="fp32", split_k=splits
+    )
+    a = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    partials = torch.empty((splits, m, n), dtype=torch.float32, device="cuda")
+    a_arg = a.view(torch.int16).view(-1)
+    b_arg = b.view(torch.int16).view(-1)
+    c_arg = partials.view(-1)
+
+    def launch():
+        gemm(
+            a_arg,
+            b_arg,
+            c_arg,
+            m,
+            n,
+            0,
+            0,
+            stream=fx.Stream(torch.cuda.current_stream()),
+        )
+
+    generator = torch.Generator().manual_seed(9028)
+    graph = None
+    for _ in range(2):
+        ah = torch.randint(-2, 3, (m, k), generator=generator).float()
+        bh = torch.randint(-2, 3, (n, k), generator=generator).float()
+        step = k // splits
+        expected = torch.stack(
+            [
+                ah[:, i * step : (i + 1) * step] @ bh[:, i * step : (i + 1) * step].T
+                for i in range(splits)
+            ]
+        )
+        a.copy_(ah)
+        b.copy_(bh)
+        partials.fill_(float("nan"))
+        torch.cuda.synchronize()
+        if graph is None:
+            launch()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+        else:
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(partials.cpu(), expected)
+        assert torch.equal(partials.sum(dim=0).cpu(), ah @ bh.T)

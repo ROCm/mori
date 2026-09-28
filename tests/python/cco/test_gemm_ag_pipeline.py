@@ -157,6 +157,8 @@ def trace_pipeline(source, bm, bn, k_iters, policy):
         wave = Wave(wave_id, bm, bn)
         env = dict(
             K_ITERS=k_iters,
+            split_k=1,
+            const_expr=lambda value: value,
             BLOCK_K=64,
             B_K_STEP=64,
             BLOCK_M=bm,
