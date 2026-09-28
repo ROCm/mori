@@ -26,11 +26,10 @@
 // Fused "push" all-reduce built on top of the reduce-scatter push kernel. The
 // kernel runs the reduce-scatter phases (fused SDMA scatter into staging +
 // receiver-side completion wait + grid-strided vectorized reduce) to produce
-// THIS PE's reduced shard, sliced into S = 1<<logS slices. Each slice is
-// broadcast to every peer the moment the grid finishes reducing it -- a
-// pipelined per-slice broadcast that overlaps with the reduce of the later
-// slices (no device-wide barrier). After the collective every PE holds the full
-// reduced vector.
+// THIS PE's reduced shard, sliced into S = 1<<logS slices. The shard is then
+// broadcast to every peer in two copies: slices [0, S-1) as one copy once slice
+// S-2 is reduced (overlapping the reduce of the last slice), then the last slice.
+// After the collective every PE holds the full reduced vector.
 //
 // This header reuses the reduce-scatter building blocks (ReduceVecGroup, the Op
 // functors, ReduceComputeType) and the shared StartSdmaScatter. Phase 1-3 (the
@@ -70,16 +69,23 @@ namespace collective {
 // (detail::WaitAndReduceSlice), which waits on that slice's completion counter and
 // reduces it with the whole grid into output[myPe] (= myShard).
 //
-// Phase 4 (pipelined per-slice broadcast) is the rest of that same loop iteration.
-// As soon as a block finishes reducing slice s it does a system fence (publishing
-// its reduce stores) and bumps groupCounters[s]. The block that reads the full count
-// gridDim.x is the last one out of slice s -- it knows the slice is complete -- and
-// ISSUES a broadcast of JUST slice s into every peer's output[myPe] slice via a
-// multi-producer-safe SDMA scatter (CAS reserve, since several slices' elected
-// blocks may share a per-peer queue). Each copy trails an ADD32(1) into the
-// receiver's DEDICATED per-slice broadcast counter signalPtrs[kBcastSlot+s] --
-// distinct from the reduce-scatter slice counters [0..S-1] AND from other slices'
-// broadcast counters, so no ADD can be miscounted by any other wait.
+// Phase 4 (two-copy broadcast) is the rest of that same loop iteration. As soon
+// as a block finishes reducing slice s it does a system fence (publishing its
+// reduce stores) and bumps groupCounters[s]. The block that reads the full count
+// gridDim.x is the last one out of slice s and resets that slice's counters. The
+// elected block of slice S-2 then broadcasts slices [0, S-1) as ONE copy, and the
+// elected block of slice S-1 broadcasts the last slice, into every peer's
+// output[myPe] via a multi-producer-safe SDMA scatter (CAS reserve, since both
+// may hit a per-peer queue concurrently). Each copy trails an ADD32(1) into the
+// receiver's DEDICATED broadcast counter signalPtrs[kBcastSlot+b] (b = 0 big
+// copy, 1 last slice) -- distinct from the reduce-scatter slice counters
+// [0..S-1], so no ADD can be miscounted by any other wait.
+//
+// Why not one broadcast per slice: all packets to a peer share one SDMA queue
+// (one engine per peer pair), so no broadcast can start before the S scatter
+// packets to that peer drain, by which time slices [0, S-1) are normally reduced.
+// Per-slice copies only added packets; the scatter and broadcast also share the
+// same link direction, so they could not overlap usefully anyway.
 static constexpr int kBcastSlot = kRSPushMaxSlices;
 
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
@@ -121,7 +127,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   T* __restrict__ myShard = output + myPe * chunkElems;
   uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
 
-  // Slices this block broadcast, and therefore owes a completion wait. Deferring
+  // Broadcasts (bit b) this block issued, and therefore owes a completion wait. Deferring
   // that wait to the tail below keeps the elected block reducing the remaining
   // slices instead of stalling on XGMI in the middle of the loop.
   uint32_t ownedMask = 0;
@@ -134,8 +140,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
 
   for (uint32_t s = 0; s < S; s++) {
-    // Slice s covers [sOfs, sOfs+sCnt) of my shard -- Phase 3 reduces that range
-    // and Phase 4 broadcasts exactly the same range.
+    // Slice s covers [sOfs, sOfs+sCnt) of my shard -- Phase 3 reduces that range.
     const size_t sOfs = FORCE_SGPR(s * sliceLen);
     const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
 
@@ -144,7 +149,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     detail::WaitAndReduceSlice<NumVecs, ReduceOp>(signalBuf, s, myPe, npes, input, staging,
                                                  myShard, sOfs, sCnt, chunkElems, lstride);
 
-    // === Phase 4: this slice is reduced -- elect one block to broadcast it =====
+    // === Phase 4: this slice is reduced -- elect its last block ================
     // Publish this block's reduce stores to slice s before announcing arrival, so
     // once the counter hits gridDim.x every block's stores are globally visible to
     // the elected block's DMA read of the slice.
@@ -159,31 +164,44 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
         StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[s], 0);
         groupCounters[s] = 0;  // reset slice s's arrival counter
       }
-      // That reset must have landed before any doorbell below rings: once a
-      // broadcast lands, its receiver can finish this collective and its NEXT
-      // launch's Phase-1 SDMA starts ADDing to my signalBuf[s]. __syncthreads()
-      // carries an s_waitcnt vmcnt(0) that drains thread 0's store, and it orders
-      // that store before the doorbells of ALL lanes, not just thread 0's.
-      __syncthreads();
+      // Only slices S-2 and S-1 broadcast. The elected blocks of slices 0..S-3
+      // just reset: thread 0's store above is ordered by the __threadfence_system()
+      // preceding its count into every later slice, so it is visible before the
+      // S-2 elected block rings any doorbell.
+      if (s + 2 >= S) {
+        // b=0 (elected by S-2): slices [0, S-1). Every block reduces slices in
+        // order and fences before counting in, so the last block into S-2 knows
+        // all of [0, S-1) is reduced and published. b=1 (elected by S-1): the
+        // last slice. At S==1 only b=1 exists and covers the whole shard.
+        const uint32_t b = (s == S - 1) ? 1u : 0u;
+        const size_t bOfs = (s == S - 1) ? sOfs : 0;
+        const size_t bCnt = sOfs + sCnt - bOfs;
 
-      // Destination slot is myPe on every peer, so the source (my reduced slice)
-      // and the symmetric destination address are the same for all peers. Self
-      // already holds it.
-      // Warp 0 issues slice s to all peers, each copy trailing an ADD32(1) into
-      // that peer's DEDICATED per-slice broadcast counter signalBuf[kBcastSlot+s].
-      // The CAS reserve keeps it correct even when two slices' elected blocks
-      // share a queue. No wait here -- see the tail.
-      if (threadIdx.x < warpSize) {
-        SdmaBroadcastSliceWarp(
-            devComm.sdma, myShard + sOfs,
-            [=](int peer) -> uint8_t* {
-              int32_t diff = (peer - myPe) * static_cast<int32_t>(heapWin->stride4G);
-              return reinterpret_cast<uint8_t*>(myShard + sOfs) +
-                     (static_cast<uint64_t>(diff) << 32);
-            },
-            sCnt * sizeof(T), myPe, npes, kBcastSlot + static_cast<int>(s), /*qId=*/0);
+        // The resets must have landed before any doorbell below rings: once a
+        // broadcast lands, its receiver can finish this collective and its NEXT
+        // launch's Phase-1 SDMA starts ADDing to my signalBuf[s]. __syncthreads()
+        // carries an s_waitcnt vmcnt(0) that drains thread 0's store, and it
+        // orders that store before the doorbells of ALL lanes, not just thread 0's.
+        __syncthreads();
+
+        // Destination slot is myPe on every peer, so the source (my reduced
+        // range) and the symmetric destination address are the same for all
+        // peers. Self already holds it. Warp 0 issues the range to all peers,
+        // each copy trailing an ADD32(1) into that peer's DEDICATED broadcast
+        // counter signalBuf[kBcastSlot+b]. The CAS reserve keeps it correct when
+        // both elected blocks hit a queue concurrently. No wait here -- see the tail.
+        if (threadIdx.x < warpSize) {
+          SdmaBroadcastSliceWarp(
+              devComm.sdma, myShard + bOfs,
+              [=](int peer) -> uint8_t* {
+                int32_t diff = (peer - myPe) * static_cast<int32_t>(heapWin->stride4G);
+                return reinterpret_cast<uint8_t*>(myShard + bOfs) +
+                       (static_cast<uint64_t>(diff) << 32);
+              },
+              bCnt * sizeof(T), myPe, npes, kBcastSlot + static_cast<int>(b), /*qId=*/0);
+        }
+        ownedMask |= (1u << b);
       }
-      ownedMask |= (1u << s);
     }
   }
 
@@ -196,16 +214,16 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // whoever consumes them acquires at its own kernel boundary.
   if (threadIdx.x == 0 && ownedMask != 0) {
     const uint32_t want = static_cast<uint32_t>(npes - 1);  // no self-copy
-    for (uint32_t s = 0; s < S; s++) {
-      if ((ownedMask & (1u << s)) == 0) continue;
-      // Wait for every peer's copy of slice s to land in my output[myPe] slice.
-      // 32-bit ADD into the low dword -> poll 32 bits of this slice's counter.
-      auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[kBcastSlot + s]));
+    for (uint32_t b = 0; b < 2; b++) {
+      if ((ownedMask & (1u << b)) == 0) continue;
+      // Wait for every peer's copy of broadcast b to land in my output.
+      // 32-bit ADD into the low dword -> poll 32 bits of this counter.
+      auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[kBcastSlot + b]));
       while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
         __builtin_amdgcn_s_sleep(1);
       }
       // System scope again: peers ADD into this slot from their Phase 4.
-      StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kBcastSlot + s], 0);
+      StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kBcastSlot + b], 0);
     }
   }
 }
