@@ -82,6 +82,22 @@ gRPC context unarmed, i.e. wait forever. A knob set explicitly always wins over
 both ways. A malformed or negative value is **not** a disable — it warns once
 and falls back to the default, so a typo cannot quietly unbound an RPC.
 
+> **Changed semantics for `0`.** `UMBP_HEARTBEAT_RPC_TIMEOUT_MS` and
+> `UMBP_RPC_SHUTDOWN_TIMEOUT_MS` used to parse their own environment with
+> `std::atoi` and `parsed > 0 ? parsed : 3000`, so an explicit `0` silently
+> resolved to 3000 ms — and so did a malformed value, with no warning either
+> way. Under the table above, `0` now means what it says: no deadline. A
+> deployment that had set either of these to `0` expecting the old fallback
+> should set the value it actually wants.
+
+**Every timeout is reported.** A deadline that fires is logged at WARN, naming
+the call and the elapsed budget, because several callers absorb a failed RPC
+into an answer that looks ordinary — a timed-out `BatchLookup` reads as "no peer
+holds this key", which is indistinguishable from a cache miss once it reaches
+the hit rate. Without the log, a deadline would trade an obvious hang for an
+unexplained drop in hit rate. Note that `UMBP_LOG_LEVEL` defaults to WARN, so
+these are visible out of the box.
+
 This convention applies to the table above and nowhere else. It does **not**
 apply to `UMBP_RESOLVE_BUSY_TIMEOUT_MS` (a retry budget, where `0` would break
 the retry loop rather than remove a bound), to
