@@ -453,7 +453,8 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // Finishing the previous launch only proves peers SENT to us, not that they
     // are done reducing what we sent them: gate our writes into their staging /
     // signalBuf until every PE has entered this launch.
-    if (threadIdx.x == 0) PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
+    int stride4G = heapWin->stride4G;
+    if (threadIdx.x == 0) PushEntryBarrier(barrierCtr, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -467,7 +468,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
         },
         [=](int peer) -> uint8_t* {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
-          int32_t diff = (peer - myPe)*static_cast<int32_t>(heapWin->stride4G);
+          int32_t diff = (peer - myPe)*stride4G;
           return reinterpret_cast<uint8_t*>(staging + slot * chunkElems) + 
              (static_cast<uint64_t>(diff)<<32);
         });
