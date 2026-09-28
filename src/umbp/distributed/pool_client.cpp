@@ -2817,8 +2817,9 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     std::vector<PoolPlacementRequest> asks;
     asks.reserve(local.size());
     for (const auto& item : local) {
-      asks.push_back(PoolPlacementRequest{*item.key, item.size, item.route.tier,
-                                          /*backend_name=*/{}, item.route.logical_tier});
+      asks.push_back(PoolPlacementRequest{
+          *item.key, item.size, item.route.tier, /*backend_name=*/{}, item.route.logical_tier,
+          PreferredNumaNodeFor(const_cast<void*>(item.src), item.size)});
     }
     auto allocations = default_pool_->BatchAllocate(asks);
     allocations.resize(local.size());

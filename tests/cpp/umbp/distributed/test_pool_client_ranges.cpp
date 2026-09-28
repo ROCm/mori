@@ -110,6 +110,69 @@ TEST(PoolClientNuma, RegisteredGpuWritesSteerAndCrossBufferReadsPreserveBytes) {
   }
   client.Shutdown();
 }
+
+// Whole-object Put/BatchPut take the ExecuteBatchPutPlan path, not the ranged
+// one. The second node's writer goes first so that an unsteered allocation
+// (buffer 0, the no-preference order) cannot pass.
+TEST(PoolClientNuma, WholeObjectPutsSteerToWriterBuffer) {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess || count < 2) GTEST_SKIP() << "requires GPUs";
+  std::vector<int> devices, nodes;
+  for (int device = 0; device < count && devices.size() < 2; ++device) {
+    int node = -1;
+    mori::application::detail::GpuLocalCpuList(device, node);
+    if (node >= 0 && (nodes.empty() || node != nodes.front())) {
+      devices.push_back(device);
+      nodes.push_back(node);
+    }
+  }
+  if (devices.size() < 2) GTEST_SKIP() << "requires GPUs on different NUMA nodes";
+  PoolClientConfig cfg;
+  cfg.master_config.node_id = "numa-whole-object";
+  cfg.master_config.node_address = "127.0.0.1";
+  cfg.io_engine.port = 0;
+  cfg.auto_peer_service_port = true;
+  cfg.dram_page_size = 4096;
+  cfg.dram.buffer_sizes = {16 * 4096, 16 * 4096};
+  cfg.dram.numa_nodes = nodes;
+  PoolClient client(cfg);
+  ASSERT_TRUE(client.Init());
+  auto* backend = client.Backends().Get(TierType::DRAM);
+  ASSERT_NE(backend, nullptr);
+  constexpr size_t kObject = 3 * 4096;
+  for (const size_t writer : {size_t{1}, size_t{0}}) {
+    ASSERT_EQ(hipSetDevice(devices[writer]), hipSuccess);
+    void* gpu = nullptr;
+    ASSERT_EQ(hipMalloc(&gpu, 3 * kObject), hipSuccess);
+    std::unique_ptr<void, decltype(&hipFree)> allocation(gpu, hipFree);
+    std::vector<char> expected(3 * kObject);
+    for (size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<char>(i * 7 + writer);
+    ASSERT_EQ(hipMemcpy(gpu, expected.data(), expected.size(), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_TRUE(client.RegisterMemory(gpu, 3 * kObject, mori::io::MemoryLocationType::GPU,
+                                      devices[writer], MemoryRegistration::kLocalCopyOnly));
+    char* base = static_cast<char*>(gpu);
+    const std::string prefix = "whole-" + std::to_string(writer) + "-";
+    const std::vector<std::string> keys{prefix + "a", prefix + "b", prefix + "c"};
+    ASSERT_TRUE(client.Put(keys[0], base, kObject));
+    ASSERT_EQ(client.BatchPut({keys[1], keys[2]}, {base + kObject, base + 2 * kObject},
+                              {kObject, kObject}),
+              (std::vector<bool>{true, true}));
+    for (const auto& key : keys) {
+      const auto resolved = backend->BatchResolve({key}, false).front();
+      ASSERT_TRUE(resolved.found) << key;
+      for (const auto& page : resolved.pages) EXPECT_EQ(page.buffer_index, writer) << key;
+    }
+    ASSERT_EQ(hipMemset(gpu, 0x5a, 3 * kObject), hipSuccess);
+    ASSERT_EQ(client.BatchGet(keys, {base, base + kObject, base + 2 * kObject},
+                              {kObject, kObject, kObject}),
+              (std::vector<bool>{true, true, true}));
+    std::vector<char> actual(3 * kObject);
+    ASSERT_EQ(hipMemcpy(actual.data(), gpu, actual.size(), hipMemcpyDeviceToHost), hipSuccess);
+    EXPECT_EQ(actual, expected);
+    client.DeregisterMemory(gpu);
+  }
+  client.Shutdown();
+}
 namespace {
 
 constexpr size_t kPageSize = 4096;
