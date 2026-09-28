@@ -1,9 +1,11 @@
 # GEMM + All-Gather optimization results
 
-These measurements were collected on 2026-09-28 on eight MI355X GPUs, using
-N=2048, K=7168 and 128x128 tiles. M is **per rank**. Except for the explicitly
+The Pro measurements below were collected on 2026-09-28 on eight MI355X GPUs,
+using the **DeepSeek-V4-Pro ratio-4 main compressor** dimensions N=2048, K=7168,
+and 128x128 tiles. M is **per rank**. Except for the explicitly
 lossy-wire cases, inputs are BF16 and accumulation, output and wire are FP32.
-The [operator README](README.md) contains the main transport comparison and
+The separate [Flash subgraph](#flash-ratio-2-projection-order) uses its own
+model dimensions and conditions. The [operator README](README.md) contains the main transport comparison and
 correctness requirements; [benchmark commands](../../../../benchmark/cco/flydsl/gemm_ag/README.md)
 use the maintained kernel interfaces directly.
 
@@ -150,6 +152,53 @@ dynamic scaling, saturation coverage or model-quality evaluation. The
 four-chunk split-K versions were slower: 270.2 µs for BF16 and 292.9 µs for
 FP8. These are separate accuracy/performance tradeoffs, not same-precision
 fusion wins.
+
+## Flash ratio-2 projection order
+
+This separate test uses **DeepSeek-V4.1-Flash** dimensions K=5120 and
+head_dim=512 on v2-015 (ROCm 7.2.4, PyTorch 2.11.0+rocm7.2, FlyDSL 0.2.4).
+There are eight ranks, local M=2048 and total S=16384, with synthetic BF16
+inputs and replicated weights. Each rank must finish with two separate,
+contiguous FP32 `[S,512]` KV and gate buffers in global token order.
+
+The input-AG-first order matches the structure of SGLang's low-ratio CP
+branch, but this is an isolated subgraph using **CCO/SDMA for every AG** and
+native `torch.mm` for the Torch projections. It does not profile SGLang's
+collective implementation or full runtime. Compression pooling, normalization,
+RoPE, cache writes and scheduling are excluded.
+
+All schedules include explicit uniform-interleave row restoration. The two
+local Torch GEMMs also include packing their outputs before AG. Combined
+projections include splitting/reordering the gathered `[S,1024]` output into
+the same contiguous KV/gate buffers. Weights and buffers are prepared outside
+timing. The protocol is five rounds, 50 warmups and 101 samples, with immediate
+output snapshots and changed-input validation against the same reference.
+
+| Schedule | GEMM rows × calls per rank | Sent per rank | Total, µs |
+|---|---|---:|---:|
+| Gather BF16 inputs, then two global Torch projections | 16384 × 2 | 140 MiB | 657.3 |
+| Two local Torch projections, pack, then output AG | 2048 × 2 | 56 MiB | 255.0 |
+| One local combined Torch projection, then output AG | 2048 × 1 | 56 MiB | 238.2 |
+| One local combined MORI projection, then output AG | 2048 × 1 | 56 MiB | 257.3 |
+| Combined MORI GEMM + fused SDMA, four chunks | 2048 × 1 | 56 MiB | 280.5 |
+
+Moving the two projections before AG reduced this subgraph's latency by
+61.2%. It reduces per-rank communication from 140 to 56 MiB and avoids
+repeating the global projection on every rank. Combining the local Torch
+projections reduces the total further to 238.2 µs. These benefits change the
+operation order, GEMM workload and packing; they are not pure kernel-fusion
+gains and must not be reported as model-level speedups.
+
+The adjacent same-backend MORI comparison was **257.3 → 280.5 µs**:
+four-chunk fusion was **9.0% slower** at local M=2048. Its separate first
+pass measured 281.6 µs and agreed with the repeat. All five schedules passed
+initial and changed-input checks, with relative L2 error below 1e-5.
+
+The [Flash shape tables](README.md#bf16-benchmarks-deepseek-v41-flash) separately
+report N=512 per projection and N=1024 combined candidates over several M.
+Their larger-M fusion benefit must not be transferred to this S=16384,
+local-M=2048 case. Raw commands, scripts, source hashes and logs are archived at
+`v2-015:/mnt/m2m_nobackup/feiyzhai/mori-gemm-ag-m-sweep-20260928/v41-flash/`.
 
 ## Reproduction and scope
 

@@ -49,6 +49,15 @@ counts 1/2/4/8. `--peer-uncached --fence release` selects the publication
 optimization previously called `sc_release`; omit both for the original
 cached-store/leader-fence configuration. Defaults are unchanged.
 
+These K=7168, N=2048 examples use DeepSeek-V4-Pro's ratio-4 main compressor
+dimensions. For **DeepSeek-V4.1-Flash ratio 2**, set `-k 5120` and
+`--out-dim 512` for one KV/gate projection, or `--out-dim 1024` for a combined
+candidate. The N=512 result is one of the two projections. These commands
+measure projection followed by AG; Flash's current low-ratio CP implementation
+gathers inputs before projection. See the operator report's
+[model shapes](../../../../python/mori/ops/gemm_ag/README.md#model-shapes) and
+[projection-order comparison](../../../../python/mori/ops/gemm_ag/EXPERIMENTS.md#flash-ratio-2-projection-order).
+
 `--torch-gemm` uses native `torch.mm(..., out_dtype=torch.float32)` for
 BF16/FP32 `gemm-only`, `split-rccl` or `split-sdma` controls. The other existing
 transport modes, FP8 precision/quantization options and phase diagnostics
