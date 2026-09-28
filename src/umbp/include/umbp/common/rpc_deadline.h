@@ -58,6 +58,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 
 namespace mori::umbp {
@@ -105,6 +106,31 @@ inline int ResolveDeadlineMs(const char* name, std::chrono::milliseconds def,
 inline void ArmDeadline(grpc::ClientContext& ctx, int timeout_ms) {
   if (timeout_ms <= 0) return;
   ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms));
+}
+
+// Reports a failed RPC, naming the deadline when that is what fired.
+//
+// A deadline turns a hang into a failure, and several of the callers here
+// absorb a failure into an ordinary-looking answer: a timed-out BatchLookup
+// reads as "the key is not on any peer", which is exactly what a cache miss
+// looks like. A failure nobody logged is a quieter hang, not a fixed one, so
+// every armed call site that does not already report for itself routes through
+// here.
+//
+// Naming the timeout matters as much as reporting it: DEADLINE_EXCEEDED on its
+// own says nothing about whether the peer refused or the caller gave up, and
+// the answer is usually "raise one env var, or set it to 0".
+inline void LogRpcTimeoutOrFailure(const char* call, const grpc::Status& status, int timeout_ms) {
+  if (status.ok()) return;
+  if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+    MORI_UMBP_WARN(
+        "[RPC] {} hit its client-side deadline after {}ms and was treated as a failure. If the "
+        "call was merely slow, raise the deadline or set it to 0 to wait indefinitely "
+        "(UMBP_RPC_DEADLINES=0 disables the whole family).",
+        call, timeout_ms);
+    return;
+  }
+  MORI_UMBP_WARN("[RPC] {} failed: {}", call, status.error_message());
 }
 
 // Routing and lookup against the master. One round trip, issued before any slot

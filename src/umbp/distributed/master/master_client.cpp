@@ -438,7 +438,13 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->BatchLookup(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
-  if (!status.ok()) return status;
+  // Reported here because the caller cannot: PoolClient::BatchExists absorbs a
+  // failed lookup into "not held anywhere", which is indistinguishable from an
+  // ordinary miss once it reaches the hit rate.
+  if (!status.ok()) {
+    LogRpcTimeoutOrFailure("BatchLookup", status, MasterRpcTimeoutMs());
+    return status;
+  }
 
   out->reserve(static_cast<size_t>(resp.found_size()));
   for (int i = 0; i < resp.found_size(); ++i) out->push_back(resp.found(i));
@@ -1123,7 +1129,10 @@ grpc::Status MasterClient::MatchExternalKv(const std::vector<std::string>& hashe
   ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->MatchExternalKv(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    LogRpcTimeoutOrFailure("MatchExternalKv", status, MasterRpcTimeoutMs());
+    return status;
+  }
   if (out_matches != nullptr) {
     for (const auto& m : resp.matches()) {
       ExternalKvNodeMatch out;
@@ -1149,7 +1158,10 @@ grpc::Status MasterClient::GetExternalKvHitCounts(
   ArmDeadline(ctx, MasterRpcTimeoutMs());
   auto status = GetStub(stub_.get())->GetExternalKvHitCounts(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    LogRpcTimeoutOrFailure("GetExternalKvHitCounts", status, MasterRpcTimeoutMs());
+    return status;
+  }
   if (out_entries != nullptr) {
     out_entries->clear();
     out_entries->reserve(static_cast<size_t>(resp.entries_size()));

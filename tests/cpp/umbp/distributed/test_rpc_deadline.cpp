@@ -156,5 +156,22 @@ TEST_F(RpcDeadlineTest, NamedKnobDefaultsRespectTheHierarchy) {
   EXPECT_LE(PeerCleanupRpcTimeoutMs(), 30000) << "an abort slower than pending_ttl is moot";
 }
 
+// A deadline converts a hang into a failure, and several callers absorb that
+// failure into an ordinary-looking answer -- a timed-out BatchLookup reads as
+// "not held anywhere", which is what a cache miss looks like. So the reporting
+// is not decoration: without it the deadline just makes the hang quieter.
+//
+// Asserts what the helper does rather than what it prints: OK stays silent,
+// anything else reports, and a deadline is distinguished from a refusal.
+TEST_F(RpcDeadlineTest, TimeoutReportingDistinguishesADeadlineFromAFailure) {
+  // None of these may throw or abort; the logger is the side effect under test.
+  LogRpcTimeoutOrFailure("Probe", grpc::Status::OK, 1000);
+  LogRpcTimeoutOrFailure("Probe", grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "Deadline"),
+                         1000);
+  LogRpcTimeoutOrFailure("Probe", grpc::Status(grpc::StatusCode::UNAVAILABLE, "refused"), 1000);
+  LogRpcTimeoutOrFailure("Probe", grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "Deadline"), 0);
+  SUCCEED();
+}
+
 }  // namespace
 }  // namespace mori::umbp
