@@ -99,9 +99,9 @@ __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
 #else
   if constexpr (Bytes == 16) {
     if constexpr (Scope == ESystemScope) {
-      return __builtin_amdgcn_global_load_b128(ptr, "");
+      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
     } else {
-      return __builtin_amdgcn_global_load_b128(ptr, "agent");
+      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
     }
   } else {
     return __hip_atomic_load(ptr, __ATOMIC_RELAXED,
@@ -121,9 +121,9 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 #else
   if constexpr (Bytes == 16) {
     if constexpr (Scope == ESystemScope) {
-      __builtin_amdgcn_global_store_b128(ptr, v, "");
+      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "");
     } else {
-      __builtin_amdgcn_global_store_b128(ptr, v, "agent");
+      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
     }
   } else {
     __hip_atomic_store(ptr, v, __ATOMIC_RELAXED,
@@ -522,8 +522,8 @@ __device__ __forceinline__ void StartSdmaScatter(
 // even for a user whose completion does not depend on all peers. Requires npes > 1.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void PushEntryBarrier(uint64_t* ctr, int myPe, int npes,
-                                                 uint32_t stride4G) {
-  const int32_t diff = -myPe * static_cast<int32_t>(stride4G);
+                                                 int32_t stride4G) {
+  const int32_t diff = -myPe * stride4G;
   auto* c = cco::impl::global(reinterpret_cast<uint64_t*>(
       reinterpret_cast<uint8_t*>(ctr) + (static_cast<uint64_t>(diff) << 32)));
   const uint64_t A =
