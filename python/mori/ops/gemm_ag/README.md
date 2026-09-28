@@ -253,6 +253,16 @@ uniform interleave token order. It compares input-AG-first with local
 projection-then-output-AG at total S=16384 and local M=2048. It uses CCO/SDMA
 for every collective and is not an end-to-end SGLang measurement.
 
+### Smaller-tile follow-up
+
+An isolated [smaller-tile study](EXPERIMENTS.md#smaller-tile-study) tested
+64×128, 128×64, 64×64, 32×64 and 32×32 layouts with fewer waves. At local
+M=2048, the selected Flash non-fused paths improved by 7.7% (N=512) and 2.4%
+(N=1024) in adjacent repeats. Fusion did not beat the tuned non-fused path.
+A 96 KiB LDS reservation demonstrated a gain relative to its own slower
+baseline, but still lost overall. These prototypes are archived separately;
+they do not extend the production API's supported tile sizes.
+
 ## Correctness requirements
 
 The repaired implementation depends on three distinct ordering contracts:
