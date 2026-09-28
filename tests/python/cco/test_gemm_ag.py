@@ -465,3 +465,142 @@ def test_fused_sdma_is_deterministic_across_chunk_counts():
         "That is an ordering bug in the epilogue, not numerical noise."
     )
     assert all(v < 3e-3 for v in seen), seen
+
+
+def _run_pull_worker(*args):
+    if torch.cuda.device_count() < 8:
+        pytest.skip("requires 8 GPUs")
+    if "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
+        pytest.skip("requires gfx950 BF16 MFMA")
+    env = os.environ.copy()
+    env.setdefault("MORI_SOCKET_IFNAME", "lo")
+    env["MORI_ENABLE_SDMA"] = "0"  # This regression uses only LSA.
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(REPO_ROOT / "python"), env.get("PYTHONPATH")))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=8",
+            str(Path(__file__).with_name("_gemm_ag_pull_worker.py")),
+            *args,
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    return output
+
+
+def test_pull_initializes_recycled_window():
+    output = _run_pull_worker("--dirty-window-benchmark")
+    records = [
+        json.loads(line.removeprefix("RESULT_JSON "))
+        for line in output.splitlines()
+        if line.startswith("RESULT_JSON ")
+    ]
+    assert len(records) == 1, output
+    assert records[0]["validated"] is True, output
+
+
+@pytest.mark.parametrize("bm", [128, 256])
+@pytest.mark.parametrize("out_dtype", ["fp32", "bf16"])
+def test_bf16_pull_publishes_every_replay(bm, out_dtype):
+    """Remote HBM must contain the current generation at both tile sizes."""
+    output = _run_pull_worker("--block-m", str(bm), "--out-dtype", out_dtype)
+    assert f"PULL_OK bm={bm} out={out_dtype} ranks=8 eager=1 replays=16" in output
+
+
+@pytest.mark.parametrize(
+    "bm,bn,out_dtype",
+    [
+        (128, 128, "fp32"),
+        (256, 128, "fp32"),
+        (128, 256, "fp32"),
+        (256, 256, "fp32"),
+        (128, 256, "bf16"),
+        (256, 256, "bf16"),
+    ],
+)
+@pytest.mark.parametrize("k", [128, 192, 256, 7168])
+@pytest.mark.parametrize("peer_uncached", [False, True])
+def test_bf16_gemm_pipeline_numerics(bm, bn, out_dtype, k, peer_uncached):
+    """Exercise both tail parities, the empty mainloop, and graph replay.
+
+    Small integer operands make FP32 accumulation exact. Build the oracle on
+    the CPU before launching any GEMM, and change inputs between replays so a
+    stale LDS tile cannot match the previous launch's answer by accident.
+    No CCO window, communicator, or GPU reference GEMM is involved.
+    The pull producer must also honor a plain C pointer with null CCO handles.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a gfx950 GPU")
+    if "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
+        pytest.skip("requires gfx950 BF16 MFMA")
+    import flydsl.expr as fx
+
+    m, n = 2 * bm, 2 * bn
+    dtype = torch.float32 if out_dtype == "fp32" else torch.bfloat16
+    cfg = layout.ag_config(
+        world_size=8,
+        m=m,
+        n=n,
+        elem_bytes=4 if out_dtype == "fp32" else 2,
+        block_m=bm,
+        block_n=bn,
+    )
+    gemm = bf16gemm.compile_bf16_gemm_ag(
+        cfg,
+        0,
+        K=k,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        out_dtype=out_dtype,
+        peer_uncached=peer_uncached,
+    )
+    a = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    c = torch.empty((m, n), dtype=dtype, device="cuda")
+    a_arg, b_arg, c_arg = (
+        a.view(torch.int16).view(-1),
+        b.view(torch.int16).view(-1),
+        c.view(-1),
+    )
+
+    def launch():
+        gemm(
+            a_arg,
+            b_arg,
+            c_arg,
+            m,
+            n,
+            0,
+            0,
+            stream=fx.Stream(torch.cuda.current_stream()),
+        )
+
+    generator = torch.Generator().manual_seed(1234)
+    graph = None
+    for generation in range(4):
+        ah = torch.randint(-2, 3, (m, k), generator=generator).float()
+        bh = torch.randint(-2, 3, (n, k), generator=generator).float()
+        expected = (ah @ bh.T).to(dtype)
+        a.copy_(ah)
+        b.copy_(bh)
+        c.fill_(float("nan"))
+        if graph is None:
+            launch()
+        else:
+            graph.replay()
+        torch.testing.assert_close(c.cpu(), expected, rtol=0, atol=0)
+        if generation == 0:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()

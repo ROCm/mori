@@ -192,7 +192,13 @@ def build_lsa_ag(
       ``__threadfence_system()``, which orders the calling thread's own writes
       and cannot write back lines another kernel left behind.
 
-      Concretely: compile the GEMM with
+      The window's control region must also be zero-initialized before the
+      first launch. Allocation alone does not do this: a stale positive
+      arrival flag satisfies the first ``>=`` comparison and lets a block
+      read a peer before its GEMM finishes. Keep these flags monotonic across
+      subsequent launches; do not reset them during graph replay.
+
+      Concretely: compile the fp8 GEMM with
       ``compile_fused_gemm_ag(..., transport="sdma", fuse=False,
       peer_uncached=True)``, whose epilogue stores through a buffer descriptor
       with ``sc0|sc1``. Handing this kernel ``compile_gemm_local``'s output
@@ -201,6 +207,10 @@ def build_lsa_ag(
       blockscale GEMM is 96us against ptpc's 57 and the wider rank skew widens
       the window with it. That is why the mode matrix is run across all three
       quantisations rather than spot-checked on the default.
+
+      The bf16 counterpart is ``compile_bf16_gemm_ag(..., fuse=False,
+      peer_uncached=True)``: it uses ``sc0|sc1`` stores and an explicit
+      system fence from every producer lane before returning.
 
     ``uncached`` sends the fabric-crossing access with ``sc0|sc1`` instead of
     letting it sit in a cache. It is on by default for two reasons, and the
@@ -278,8 +288,7 @@ def build_lsa_ag(
     # after; the counter is monotonic so they cannot be confused.
     entry_barrier = direction == "pull"
     kname = (
-        f"mori_ag_lsa_{direction}_r{rank}_w{ws}_"
-        f"{'u' if uncached else 'c'}x{unroll}"
+        f"mori_ag_lsa_{direction}_r{rank}_w{ws}_" f"{'u' if uncached else 'c'}x{unroll}"
     )
 
     @flyc.kernel(name=kname, known_block_size=[threads, 1, 1])
@@ -387,9 +396,7 @@ def build_lsa_ag(
                         at,
                         # ...and the write crosses it only on push.
                         cache_modifier=(
-                            fabric_cm
-                            if const_expr(direction == "push")
-                            else CM_CACHED
+                            fabric_cm if const_expr(direction == "push") else CM_CACHED
                         ),
                     )
 
