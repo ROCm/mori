@@ -1,6 +1,6 @@
 # GEMM + All-Gather optimization results
 
-The Pro measurements below were collected on 2026-09-28 on eight MI355X GPUs,
+The original Pro measurements below were collected on 2026-09-28 on eight MI355X GPUs,
 using the **DeepSeek-V4-Pro ratio-4 main compressor** dimensions N=2048, K=7168,
 and 128x128 tiles. M is **per rank**. Except for the explicitly
 lossy-wire cases, inputs are BF16 and accumulation, output and wire are FP32.
@@ -199,6 +199,101 @@ report N=512 per projection and N=1024 combined candidates over several M.
 Their larger-M fusion benefit must not be transferred to this S=16384,
 local-M=2048 case. Raw commands, scripts, source hashes and logs are archived at
 `v2-015:/mnt/m2m_nobackup/feiyzhai/mori-gemm-ag-m-sweep-20260928/v41-flash/`.
+
+## Smaller tile study
+
+Tested on 2026-09-28 on v2-015, eight MI355X GPUs, ROCm 7.2.4, PyTorch
+2.11.0+rocm7.2 and FlyDSL 0.2.4. Local M=2048 throughout. Flash uses
+N=512/1024, K=5120; the Pro spot check uses N=2048, K=7168. All inputs are
+BF16 and output/wire are FP32. These are projection-then-AG tests, excluding
+consumer layout conversion and full model execution.
+
+The prototypes retain the repaired quad-subtile pipeline and SDMA protocol,
+while changing wave geometry, cooperative LDS loading and output mapping.
+The base sweep tests 128×128 with 8/4 waves, 64×128 and 128×64 with 4 waves,
+64×64 with 4/2 waves, 32×64 with 2 waves, and 32×32 with 1 wave. The shipped
+128×128 / 8-wave kernel is the control. No split-K is used. Fused paths use
+uncached C stores and a release-only fence.
+
+All 78 benchmark cases/repeats passed initial and changed-input checks,
+using five rounds, 50 warmups and 101 samples, with the usual maximum across
+ranks and median across rounds. Pure GEMM is timed separately. Validation
+also covers 150 CPU dependency cases and 40 variant/K configurations on GPU
+(K=128/192/5120/7168), each with three exact small-integer input generations.
+
+### Normal small tiles
+
+Representative screening results below include selected chunk tuning. The
+initial screen uses four fused chunks for every geometry, preserving the
+same 28 PUTs per rank; selected candidates also test one and two chunks.
+Split SDMA sends the whole slab with seven PUTs. No tile comparison changes
+the output bytes for its shape.
+
+| Flash N | Tile | Waves | GEMM, µs | GEMM + SDMA, µs | Fused, µs | Fused chunks |
+|---:|---|---:|---:|---:|---:|---:|
+| 512 | 128×128 | 8 | 50.6 | 139.5 | 163.4 | 4 |
+| 512 | 64×128 | 4 | 48.9 | 136.7 | 166.2 | 4 |
+| 512 | 64×64 | 4 | 43.8 | 131.0 | 134.1 | 1 |
+| 512 | 32×64 | 2 | 45.8 | 139.1 | 169.3 | 4 |
+| 1024 | 128×128 | 8 | 53.1 | 214.2 | 248.9 | 4 |
+| 1024 | 128×64 | 4 | 47.9 | 214.0 | 209.8 | 1 |
+| 1024 | 64×64 | 2 | 49.8 | 208.6 | 221.7 | 1 |
+| 1024 | 32×32 | 1 | 64.2 | 223.2 | 288.0 | 4 |
+
+Independent adjacent comparisons of the original tile's non-fused path with
+the selected smaller tile's non-fused path confirmed:
+
+- N=512: **143.4 → 132.3 µs (7.7% lower latency)**, with 64×64 / 4 waves.
+- N=1024: **214.1 → 208.9 µs (2.4% lower latency)**, with 64×64 / 2 waves.
+
+The small-tile fused paths did not beat the best non-fused result. At N=1024,
+128×64 / 4-wave fusion with one chunk (209.8 µs) is close to the 64×64 / 2-wave
+non-fused result, without an established advantage. Reducing only wave count
+at 128×128 did not help. At N=1024, 32×32 / 1 wave slowed pure GEMM to 64.2 µs
+and four-chunk fusion to 288.0 µs.
+
+The Pro spot check also did not improve: the original tile measured
+GEMM/split/fused-c4 at 71.5/377.5/408.6 µs; 64×64 / 2-wave measured
+89.3/393.3/457.3 µs. This is a targeted check, not a complete Pro tile search.
+
+### Forcing additional execution rounds
+
+The device reports **160 KiB LDS per CU**. Smaller tiles also reduce per-CTA
+LDS: 64 KiB at 128×128, 48 KiB at the asymmetric tiles, 32 KiB at 64×64,
+24 KiB at 32×64 and 16 KiB at 32×32. More CTAs therefore do not automatically
+mean more serial rounds; multiple CTAs may reside on a CU.
+
+Two diagnostic variants reserve **96 KiB per CTA**, limiting residency to
+at most one CTA per CU. A/B LDS offsets and GEMM arithmetic are unchanged;
+a single volatile write touches the last padding dword so the allocation
+cannot disappear. These reservations deliberately sacrifice concurrency and
+are not proposed as a production optimization. Emitted ISA confirms the LDS
+sizes and no register spills for all ten prototype configurations.
+
+| Shape | Tile / waves, 96 KiB LDS | GEMM, µs | Split SDMA, µs | Fused c4, µs |
+|---|---|---:|---:|---:|
+| Flash N=512 | 32×64 / 2 | 76.5 | 165.5 | 160.6 |
+| Flash N=1024 | 32×64 / 2 | 137.4 | 297.2 | 241.4 |
+| Flash N=1024 | 64×64 / 4 | 72.4 | 231.7 | 237.5 |
+| Pro N=2048 | 32×64 / 2 | 364.4 | 668.7 | 509.4 |
+
+For Flash N=1024, the 32×64 reservation increases pure GEMM from 56.4 to
+137.4 µs. Fusion nevertheless improves against that same slow configuration:
+an independent pair measured **297.0 → 243.8 µs (17.9% lower latency)**.
+It remains **16.7% slower** than the tuned non-fused 208.9 µs path. The Pro
+reservation likewise benefits from fusion relative to its own 668.7 µs split
+control, but its 509.4 µs fused result loses to the original 377.5 µs split path.
+
+This supports the local tradeoff: more computation can give communication
+more opportunity to overlap. It does not make the communication itself
+smaller, and delaying output readiness or reducing compute throughput can
+outweigh the overlap. These are net end-to-end comparisons; no timing trace
+was captured to assign an exact amount of hidden communication.
+
+The practical gain in this study is the faster Flash **non-fused** small-tile
+path. The prototypes and full records are archived outside the repository;
+the production kernel's supported tiles and defaults are unchanged. Archive:
+`v2-015:/mnt/m2m_nobackup/feiyzhai/mori-gemm-ag-m-sweep-20260928/small-tile/`.
 
 ## Reproduction and scope
 
