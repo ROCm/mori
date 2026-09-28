@@ -14,8 +14,8 @@ export UMBP_DRAM_NUMA_STRICT=1
 export UMBP_DRAM_PREFAULT_THREADS=0
 ```
 
-With no NUMA node configured (or `-1`), the tier keeps the original single-buffer
-layout and allocation order. A single node retains `MPOL_BIND`. Multiple nodes
+With no NUMA node configured (unset, blank, or `-1`), the tier keeps the original
+single-buffer layout and allocation order. A single node retains `MPOL_BIND`. Multiple nodes
 use `MPOL_PREFERRED` unless strict mode is enabled. Duplicate nodes, negative
 nodes mixed into a list, and capacities too small for one allocator page per
 node are rejected.
@@ -35,6 +35,13 @@ claim strict placement on a system that cannot bind memory. A successful BIND
 still restricts physical pages to the selected node even when STRICT is zero;
 STRICT controls error handling, not whether that policy can spill on a fault.
 
+With `UMBP_DRAM_USE_HUGEPAGES=1`, reserve huge pages per node, not only in
+total. The hugetlb reservation made at `mmap` time is global, but a fault under
+BIND takes pages only from the bound node, so a node whose own pool is short
+fails the fault even though the global count looked sufficient. Reserve at
+least each buffer's size on its node, for example
+`echo N > /sys/devices/system/node/node<i>/hugepages/hugepages-2048kB/nr_hugepages`.
+
 The capacity is split evenly in whole allocator pages, with the remainder in
 the final buffer. The policy JSON's DRAM `numa_node` also accepts a list:
 
@@ -53,7 +60,8 @@ allocator, keeps its scalar API and existing best-effort `MPOL_BIND` behavior.
 
 ## Allocation and startup
 
-The local write path derives one advisory NUMA hint per ranged batch. CPU
+The local write path derives one advisory NUMA hint per ranged batch and one per
+object for whole-object `Put`/`BatchPut`. CPU
 buffers and unknown GPUs have no preference. If the preferred buffer can
 satisfy a request, contiguous pages are preferred over scattered pages within
 that buffer. Otherwise, a global capacity check precedes allocation of the
