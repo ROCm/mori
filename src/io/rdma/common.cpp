@@ -425,8 +425,17 @@ static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, con
         "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
         reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
     if (eps[otherEpId].ledger) {
-      eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
-                                            static_cast<int>(epMergedSinceSignal[otherEpId]));
+      if (!eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
+                                                 static_cast<int>(epMergedSinceSignal[otherEpId]))) {
+        // A fatal event already closed this sibling. FailAll() cannot have
+        // released these WRs -- they were never in its ledger -- so the
+        // reservation is ours to give back, or the depth is lost for good.
+        MORI_IO_WARN(
+            "EP {} ledger is closed; reclaiming {} pending unsignaled WRs directly instead of "
+            "parking them as orphaned",
+            otherEpId, epWrsSinceSignal[otherEpId]);
+        ReleaseSqDepth(eps[otherEpId], epWrsSinceSignal[otherEpId]);
+      }
     } else {
       MORI_IO_WARN(
           "EP {} has pending unsignaled WRs but no submission ledger; "
@@ -982,15 +991,19 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
 
     struct ibv_send_wr& last = mergedWrs[end - 1].wr;
     uint64_t recordId = 0;
+    // Keeps the record in Posting state across ibv_post_send below, so a fatal
+    // async event cannot retire it while the WR is still on its way to the wire.
+    SubmissionLedger::PostGuard postGuard;
     if (needSignal) {
       if (!eps[epId].ledger) {
         ReleaseSqDepth(eps[epId], batchWrNum);
         return {StatusCode::ERR_RDMA_OP,
                 "submission ledger is not initialized for signaled WR tracking"};
       }
-      recordId = eps[epId].ledger->Insert(epWrsSinceSignal[epId], true, callbackMeta,
-                                          static_cast<int>(epMergedSinceSignal[epId]));
-      if (recordId == SubmissionLedger::kInvalidRecordId) {
+      postGuard = eps[epId].ledger->InsertForPost(epWrsSinceSignal[epId], callbackMeta,
+                                                  static_cast<int>(epMergedSinceSignal[epId]));
+      recordId = postGuard.RecordId();
+      if (!postGuard) {
         // A fatal async event retired this endpoint while we were mid-post. The
         // signaled WR must not go out: its CQE is what would complete everything
         // unsignaled behind it, and this QP/CQ can no longer produce one. Give
@@ -1049,9 +1062,13 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
       const bool lastWasPosted = (postedCount == batchWrNum);
       if (needSignal && lastWasPosted) {
         // Signaled WR was posted; CQ path (ledger->ReleaseByCqe) owns the release.
+        postGuard.MarkPosted();
+        postGuard.Commit();
       } else if (needSignal) {
-        int dummy = 0;
-        eps[epId].ledger->ReleaseByCqe(recordId, nullptr, &dummy);
+        // The signaled WR never reached the wire, so no CQE will arrive for it.
+        // Committing un-posted drops the record before the orphan bookkeeping
+        // below re-accounts the same WRs.
+        postGuard.Commit();
         if (roctxTransferEnabled) {
           // The signaled WR never posted, so no CQE will arrive. Stop its async
           // range here to avoid a leaked range.
@@ -1065,8 +1082,14 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
             "marking EP {} as degraded until recovery",
             postedCount, batchWrNum, epId);
         if (eps[epId].ledger) {
-          eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
-                                           static_cast<int>(epMergedSinceSignal[epId]));
+          if (!eps[epId].ledger->InsertOrphaned(epWrsSinceSignal[epId], callbackMeta,
+                                                static_cast<int>(epMergedSinceSignal[epId]))) {
+            // Closed ledger: nothing will ever reclaim these through recovery,
+            // so release the reservation here and stop counting them.
+            ReleaseSqDepth(eps[epId], epWrsSinceSignal[epId]);
+            epWrsSinceSignal[epId] = 0;
+            epMergedSinceSignal[epId] = 0;
+          }
         }
         if (eps[epId].degraded) {
           eps[epId].degraded->store(true, kSqAdmissionOrder);
@@ -1086,6 +1109,10 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
 
     if (needSignal) {
+      // The whole chain is on the wire; the CQE for this record now owns the
+      // sqDepth release. Releasing the guard lets a pending FailAll() proceed.
+      postGuard.MarkPosted();
+      postGuard.Commit();
       epWrsSinceSignal[epId] = 0;
       epMergedSinceSignal[epId] = 0;
       if (roctxTransferEnabled) epBytesSinceSignal[epId] = 0;

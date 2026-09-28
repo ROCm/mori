@@ -34,13 +34,49 @@ uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
   return id;
 }
 
-void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
+SubmissionLedger::PostGuard SubmissionLedger::InsertForPost(int postedWr,
+                                                            std::shared_ptr<CqCallbackMeta> meta,
+                                                            int batchSize) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return PostGuard{};
+  uint64_t id = nextId_++;
+  records_[id] =
+      SubmissionRecord{id, postedWr, true, SubmissionState::Posting, std::move(meta), batchSize};
+  // Counted before the lock drops, so a FailAll() that wins the race to closed_
+  // still sees this post as outstanding and waits for it.
+  ++posting_;
+  return PostGuard{this, id};
+}
+
+void SubmissionLedger::CommitPost(uint64_t recordId, bool posted) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = records_.find(recordId);
+    if (it != records_.end() && it->second.state == SubmissionState::Posting) {
+      if (posted) {
+        it->second.state = SubmissionState::Posted;
+      } else {
+        // The WR never reached the wire, so no CQE will arrive for it. The
+        // submitter still holds the sqDepth reservation and releases it itself.
+        records_.erase(it);
+      }
+    }
+    // A missing record means the CQ poller already reaped this completion, or
+    // it is simply gone; either way only the in-flight count is left to settle.
+    --posting_;
+    if (posting_ > 0) return;
+  }
+  postingDrained_.notify_all();
+}
+
+bool SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
                                       int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
-  if (closed_) return;
+  if (closed_) return false;
   uint64_t id = nextId_++;
   records_[id] =
       SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
+  return true;
 }
 
 std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId,
@@ -81,8 +117,13 @@ int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
   std::vector<TransferStatus*> claimed;
   int total = 0;
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
+    // Close first so no further record is admitted, then let the posts already
+    // admitted settle. Without this wait a record could be retired and its
+    // postedWr subtracted while its ibv_post_send is still running, which either
+    // double-releases the reservation or leaves the WR on the wire untracked.
     closed_ = true;
+    postingDrained_.wait(lock, [this] { return posting_ == 0; });
     for (auto& [id, rec] : records_) {
       total += rec.postedWr;
       if (!rec.meta) continue;

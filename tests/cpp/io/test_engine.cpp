@@ -232,7 +232,7 @@ void CaseSubmissionLedgerBasic() {
   auto meta2 = std::make_shared<CqCallbackMeta>(&status, 202, 16);
   uint64_t postedId = ledger2.Insert(4, true, meta2, 10);
   Require(postedId == kNotifPerQp, "posted record id should respect notifPerQp offset");
-  ledger2.InsertOrphaned(3, meta2, 6);
+  Require(ledger2.InsertOrphaned(3, meta2, 6), "an open ledger must accept an orphaned record");
   Require(ledger2.HasOrphaned(), "expected orphaned record in ledger");
   int recovered = ledger2.ReleaseOrphanedByRecovery(&sqDepth2);
   // Only Orphaned record (3 WRs) should be released; Posted record (4 WRs) preserved.
@@ -261,7 +261,7 @@ void CaseSubmissionLedgerFailAll() {
   auto metaB = std::make_shared<CqCallbackMeta>(&statusB, 302, 2);
   const uint64_t idA1 = ledger.Insert(3, true, metaA, 2);
   ledger.Insert(2, true, metaA, 2);
-  ledger.InsertOrphaned(1, metaB, 2);
+  Require(ledger.InsertOrphaned(1, metaB, 2), "an open ledger must accept an orphaned record");
 
   const int failed = ledger.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepth);
   Require(failed == 2, "FailAll should fail each distinct transfer exactly once");
@@ -302,11 +302,137 @@ void CaseSubmissionLedgerClosedAfterFailAll() {
   auto lateMeta = std::make_shared<CqCallbackMeta>(&lateStatus, 402, 1);
   const uint64_t lateId = ledger.Insert(3, true, lateMeta, 1);
   Require(lateId == SubmissionLedger::kInvalidRecordId, "a closed ledger must refuse new records");
-  ledger.InsertOrphaned(3, lateMeta, 1);
+  // The refusal has to be visible to the caller: those WRs were reserved and
+  // posted by the submitter and were never in this ledger, so FailAll() could not
+  // have released them. Silently dropping the insert would strand the reservation.
+  Require(!ledger.InsertOrphaned(3, lateMeta, 1),
+          "a closed ledger must report orphaned records as refused");
   Require(!ledger.HasOrphaned(), "a closed ledger must refuse orphaned records too");
   Require(sqDepth.load(std::memory_order_relaxed) == 6, "a refused record must not touch sq depth");
   Require(lateStatus.Code() == StatusCode::IN_PROGRESS,
           "refusing a record leaves the status for the submitter to fail");
+}
+
+// Notifications disabled is a valid configuration (enableNotification=false), and
+// it leaves notifPerQp free to be 0. Record ids start at the Zone B boundary, so
+// a ledger built that way would hand out 0 for its first record -- which is also
+// kInvalidRecordId, making every first submission look refused.
+void CaseSubmissionLedgerNotifDisabled() {
+  SubmissionLedger ledger(0);
+  std::atomic<int> sqDepth{6};
+  TransferStatus status;
+  status.SetCode(StatusCode::IN_PROGRESS);
+  auto meta = std::make_shared<CqCallbackMeta>(&status, 501, 1);
+
+  const uint64_t id = ledger.Insert(2, true, meta, 1);
+  Require(id != SubmissionLedger::kInvalidRecordId,
+          "an open ledger with notifPerQp==0 must not return the invalid sentinel");
+  Require(!ledger.Closed(), "the ledger is open; the refusal path must not have been taken");
+
+  int batchSize = 0;
+  auto releasedMeta = ledger.ReleaseByCqe(id, &sqDepth, &batchSize);
+  Require(releasedMeta != nullptr, "the first record must be resolvable by its own id");
+  Require(releasedMeta->id == 501, "unexpected transfer id from ledger release");
+  Require(sqDepth.load(std::memory_order_relaxed) == 4, "unexpected sq depth after release");
+
+  // wr_id 0 stays reserved for unsignaled WRs, so no record may ever claim it.
+  SubmissionLedger fresh(0);
+  auto guard = fresh.InsertForPost(1, meta, 1);
+  Require(guard.RecordId() != 0, "record ids must skip wr_id 0 even when Zone A is empty");
+}
+
+// The window Copilot and maning00 both flagged: a fatal async event landing after
+// Insert() but before ibv_post_send(). FailAll() must not be able to retire the
+// record while the post is still in flight, or the reservation is released twice
+// (once by FailAll, once by the submitter's reject path) or the WR goes out on a
+// dead QP with nothing left to account for it.
+void CaseSubmissionLedgerPostCommitRace() {
+  constexpr uint32_t kNotifPerQp = 16;
+
+  // Variant 1: the post lands. FailAll() must wait for the commit, then fail the
+  // record exactly once and release its depth exactly once.
+  {
+    SubmissionLedger ledger(kNotifPerQp);
+    std::atomic<int> sqDepth{10};
+    TransferStatus status;
+    status.SetCode(StatusCode::IN_PROGRESS);
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 601, 1);
+
+    auto guard = ledger.InsertForPost(3, meta, 1);
+    Require(static_cast<bool>(guard), "an open ledger must admit the record");
+
+    std::atomic<bool> failAllReturned{false};
+    std::atomic<int> failed{-1};
+    std::thread failer([&]() {
+      failed.store(ledger.FailAll(StatusCode::ERR_RDMA_OP, "qp died mid-post", &sqDepth));
+      failAllReturned.store(true, std::memory_order_release);
+    });
+
+    // FailAll() closes the ledger immediately but must block in the drain. Give
+    // it room to get there and confirm it has not resolved the record.
+    for (int i = 0; i < 200 && !ledger.Closed(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Require(ledger.Closed(), "FailAll must close the ledger before draining");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Require(!failAllReturned.load(std::memory_order_acquire),
+            "FailAll must block while a post is still outstanding");
+    Require(!status.Failed(), "the transfer must not be failed while its WR may still post");
+    Require(sqDepth.load(std::memory_order_relaxed) == 10,
+            "sq depth must not move until the post outcome is known");
+
+    guard.MarkPosted();
+    guard.Commit();
+    failer.join();
+
+    Require(failed.load() == 1, "FailAll must fail the committed record exactly once");
+    Require(status.Failed(), "a posted record on a dead QP must be failed");
+    Require(sqDepth.load(std::memory_order_relaxed) == 7,
+            "the posted record's depth must be released exactly once");
+  }
+
+  // Variant 2: the post never reaches the wire. The record must vanish without
+  // FailAll() touching sqDepth -- the submitter still owns that reservation and
+  // releases it on its own reject path.
+  {
+    SubmissionLedger ledger(kNotifPerQp);
+    std::atomic<int> sqDepth{10};
+    TransferStatus status;
+    status.SetCode(StatusCode::IN_PROGRESS);
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 602, 1);
+
+    auto guard = ledger.InsertForPost(3, meta, 1);
+    std::thread failer(
+        [&]() { ledger.FailAll(StatusCode::ERR_RDMA_OP, "qp died mid-post", &sqDepth); });
+    for (int i = 0; i < 200 && !ledger.Closed(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    guard.Commit();  // not posted
+    failer.join();
+
+    Require(sqDepth.load(std::memory_order_relaxed) == 10,
+            "an unposted record must leave sq depth to the submitter");
+    Require(!ledger.HasOrphaned(), "an unposted record must not linger in the ledger");
+  }
+
+  // The destructor is the backstop: a submitter that returns early without an
+  // explicit Commit() must still release FailAll() from its drain.
+  {
+    SubmissionLedger ledger(kNotifPerQp);
+    std::atomic<int> sqDepth{4};
+    TransferStatus status;
+    status.SetCode(StatusCode::IN_PROGRESS);
+    auto meta = std::make_shared<CqCallbackMeta>(&status, 603, 1);
+
+    std::thread failer([&]() {
+      // Let the guard go out of scope first in the common case; either order is
+      // fine, the point is that FailAll() always returns.
+      ledger.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepth);
+    });
+    { auto guard = ledger.InsertForPost(2, meta, 1); }
+    failer.join();
+    Require(ledger.Closed(), "FailAll must complete once the guard is destroyed");
+  }
 }
 
 EpPair MakeAsyncEventEp(ibv_qp* qp, ibv_cq* cq, uint32_t qpn) {
@@ -357,12 +483,17 @@ void CaseSubmissionLedgerCloseRaceStress() {
       auto meta = std::make_shared<CqCallbackMeta>(&statuses[tid],
                                                    static_cast<TransferUniqueId>(1000 + tid), 1);
       for (int r = 0; r < kRecordsPerSubmitter; ++r) {
-        const uint64_t id = ledger.Insert(1, true, meta, 1);
-        if (id == SubmissionLedger::kInvalidRecordId) {
+        // Mirror the real submitter: admit, "post", commit. The guard is what
+        // FailAll() drains on, so this is the interleaving that matters.
+        auto guard = ledger.InsertForPost(1, meta, 1);
+        if (!guard) {
           refusedCount.fetch_add(1, std::memory_order_relaxed);
-        } else {
-          acceptedIds[tid].push_back(id);
+          continue;
         }
+        acceptedIds[tid].push_back(guard.RecordId());
+        // Alternate posted/unposted so both commit outcomes race FailAll().
+        if ((r & 1) == 0) guard.MarkPosted();
+        guard.Commit();
       }
     };
 
@@ -415,6 +546,10 @@ void CaseSubmissionLedgerCloseRaceStress() {
     auto lateMeta = std::make_shared<CqCallbackMeta>(&lateStatus, 9999, 1);
     Require(ledger.Insert(1, true, lateMeta, 1) == SubmissionLedger::kInvalidRecordId,
             "a closed ledger must keep refusing records after the race resolves");
+    Require(!ledger.InsertForPost(1, lateMeta, 1),
+            "a closed ledger must keep refusing post admissions after the race resolves");
+    Require(sqDepth.load(std::memory_order_relaxed) >= 0,
+            "sq depth must never be driven negative by the close race");
   }
 }
 
@@ -2026,6 +2161,8 @@ int main(int argc, char* argv[]) {
       {"submission_ledger_basic", CaseSubmissionLedgerBasic},
       {"submission_ledger_fail_all", CaseSubmissionLedgerFailAll},
       {"submission_ledger_closed_after_fail_all", CaseSubmissionLedgerClosedAfterFailAll},
+      {"submission_ledger_notif_disabled", CaseSubmissionLedgerNotifDisabled},
+      {"submission_ledger_post_commit_race", CaseSubmissionLedgerPostCommitRace},
       {"submission_ledger_close_race_stress", CaseSubmissionLedgerCloseRaceStress},
       {"async_event_scope_matching", CaseAsyncEventScopeMatching},
       {"sq_admission_release_wakes_waiter", CaseSqAdmissionReleaseWakesWaiter},
