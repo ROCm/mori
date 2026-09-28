@@ -418,7 +418,10 @@ def run(args) -> int:
     with Communicator.init(world_size, rank, uid, per_rank_vmm=vmm) as comm:
         mem = comm.alloc_mem(cfg.window_bytes)
         win = comm.register_window(mem.ptr, mem.size)
-        from_gpu_ptr(mem.ptr + cfg.recv_off, (cfg.recv_bytes,), torch.uint8).zero_()
+        # Allocation does not initialize memory. In particular, stale positive
+        # start flags can satisfy pull's first entry barrier before a peer has
+        # finished its GEMM. Initialize control state as well as the payload.
+        from_gpu_ptr(mem.ptr, (cfg.window_bytes,), torch.uint8).zero_()
         recv = from_gpu_ptr(
             mem.ptr + cfg.recv_off, (world_size * args.m, args.n), out_t
         )

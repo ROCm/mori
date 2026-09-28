@@ -456,75 +456,89 @@ the failure rate at 128 is somewhere around a third of launches, and the "sound
 repetition** — `gemm-to-window` and `split-rccl` looked clean at 4/4 and 3/3 and
 then came back 1/2.
 
-### What it is not
+### What the earlier ISA audit established — and missed
 
-Four hypotheses, each killed by measurement rather than argument.
+The initial wait-policy sweep at `BM=128`, `gemm-only`, six independent launches
+per policy, found 5/6 passing at `vmcnt(4)`, 4/6 at `vmcnt(5)`, and 6/6 at
+`vmcnt(0)`. Full draining cost about 150 µs against 90–91 µs for the partial
+waits. `--fence all` and `--direct-fence all` did not fix the failure.
 
-**Not the release fence.** Halving `BLOCK_M` doubles the blocks that must
-publish their stores, which makes it the obvious suspect. `--fence all` and
-`--direct-fence all` — every lane issuing the release instead of one wave per
-block — are **0/3 each**.
+Disassembling `835783c7` established these facts at M=N=2048, K=7168, FP32 out:
 
-**Not the `s_waitcnt vmcnt` count**, which was the best remaining candidate:
-`wait_barrier` is the only thing making a G2S load's LDS write visible before
-the next iteration reads it. Sweeping that one number at `BM=128`, `gemm-only`,
-six launches each:
-
-| `vmcnt` | | result | time |
-|---|---|---:|---:|
-| `2A+B` = 4 | inherited | 5/6 | 91 µs |
-| `A+2B` = 5 | derived | 4/6 | 90 µs |
-| `0` | everything | **6/6** | 150 µs |
-
-Waiting for everything does fix it — but the ISA says the count was already
-right. Dumped with `GPU_DUMP_CODE_OBJECT=1` and `llvm-objdump --mcpu=gfx950`:
-
-| | `BM=128` (fails) | `BM=256` (clean) |
-|---|---|---|
-| S2R loads | `ds_read_b128` ×16/iter | ×24/iter |
-| G2S loads | `buffer_load_dwordx4` ×6/iter | ×8/iter |
-| mainloop wait | `vmcnt(4)` ×110 | `vmcnt(6)` ×111 |
-| in flight at the wait | 10 → retires 6 → leaves 4 | 14 → retires 8 → leaves 6 |
+| | BM=128 | BM=256 |
+|---|---:|---:|
+| S2R | 16 `ds_read_b128` / iteration | 24 / iteration |
+| G2S | 6 `buffer_load_dwordx4 ... lds` / iteration | 8 / iteration |
+| mainloop threshold | `vmcnt(4)` | `vmcnt(6)` |
 | VGPR / LDS | 152 / 96 KiB | 248 / 128 KiB |
-| spills | 0 | 0 |
-| workgroups per CU | 1 | 1 |
+| register spills | 0 | 0 |
 
-The S2R loads are `ds_read`, so they are on **lgkmcnt and were never in this
-accounting at all** — that was the leading theory and it is simply wrong. Each
-`vmcnt` retires precisely one iteration's worth of G2S, leaving in flight
-exactly the `k+2` prefetches, which is correct. And the two skeletons are
-structurally identical —
-`W BB D…D G B L B D…D GG B L B D…D G B L B GG` — with 8 barriers per iteration
-in both and `s_waitcnt lgkmcnt(0)` correctly placed between the barrier pair
-that guards the write-after-read on each LDS buffer.
+S2R belongs to **lgkmcnt**, not vmcnt. Changing the combined wait/barrier asm
+to a builtin barrier produced identical ISA in that experiment. Neither fact
+proves that the *placement* of the waits is correct. In particular, the previous
+conclusion that “the ISA clears the kernel” was too strong: it counted one
+wave's instructions without checking the rendezvous of the two staggered wave
+groups, and did not check the peeled tail's read-after-write dependencies.
 
-**Not the compiler moving LDS accesses across an unmodelled barrier.**
-`gemm_ar.wait_barrier` puts `s_waitcnt` and `s_barrier` in one inline-asm string
-with `constraints=""` — no memory clobber — so the compiler is never told there
-is a barrier in there and could legally move an LDS access across it. Emitting
-the wait as asm and the barrier as `rocdl.s_barrier()` instead produces
-**byte-identical code**. It does not, at least not at this register pressure.
+### Two missing ordering edges
 
-**Not register spilling or occupancy**, per the table above.
+**B0 reuse in the mainloop.** Waves 4–7 execute an extra prologue barrier, so
+waves 0–3 stay one barrier ahead. The barrier following `c00` in waves 0–3 meets
+the barrier following the B0/A0 S2R issues in waves 4–7. On release, waves 0–3
+can issue `B0@k+2` into the old B0 buffer while waves 4–7 still have B0 reads in
+flight. LLVM's `lgkmcnt` waits inside `mfma.call` come *after* that rendezvous.
+They protect MFMA operand use, but are too late to protect the LDS buffer from
+an overwrite by another wave. The C++ template has an explicit LDS wait at this
+boundary; the combined B0/A0-read port did not.
 
-### So where is it
+The repair waits for `lgkmcnt(0)` **before** releasing that existing barrier.
+It drains A0 as well, so correctness does not depend on LLVM preserving the
+relative instruction order of B0 and A0 reads. The wait has a memory clobber.
+No extra workgroup barrier is introduced.
 
-The instruction stream gives no evidence of a bug at either tile, which means
-`vmcnt(0)` fixing the corruption is timing perturbation and not a corrected
-count. Put that next to the other end of the evidence — **0 wrong in 64
-single-GPU runs at every tile, no collective involved** — and the weight has
-moved off this kernel. What reproduces it is eight concurrent processes; what
-never reproduces it is one idle GPU running the same kernel on the same data.
+**The last K tile.** The last mainloop wait intentionally leaves final-tile
+prefetches in flight. In the old tail, B0 and A0 of that final tile were read
+before the remaining `vmcnt(0)`. In the saved BM=128 ISA, B0 reads start at
+`0x120a4`, A0 reads at `0x12118`, and the drain is only at `0x12138`. Waiting
+there cannot repair values already read from LDS. Move this drain to the
+existing barrier immediately after issuing the last A1 prefetch. The next
+barrier after `c10` then also rendezvous with the other group's drain, before
+either group reads the final B0/A0. Barrier count and the wave staggering stay
+unchanged.
 
-The next place to look is therefore the 8-process harness or the environment,
-not the GEMM: whether the benchmark's own reference can be corrupted under
-memory pressure, and whether the cco window's VMM allocation interacts with a
-plain `torch.empty` C (ROCm 7.2.x is known to route uncached VMM allocations to
-the coarse-grained pool). A `--wait-policy` knob is kept so the sweep above is
-reproducible.
+There is also a threshold bound for the explicit `256x128` tile: after
+`A1@k+1`, the newly issued `B0/A0/B1@k+2` account for `A+2B` instructions.
+`tuned` now uses `min(2A+B, A+2B)`, which changes this tile's threshold from 5
+to 4 and preserves the values at `128x256` and `256x256`. The `safe` and
+`conservative` diagnostic choices remain available.
 
-Shipping a wrong answer a third of the time to buy 24% is not a trade, so
-`pick_tile` returns the template's tile and **the GEMM speedup measured in this
+`test_gemm_ag_pipeline.py` traces the actual Python pipeline and checks G2S
+completion before S2R issue, and S2R completion before buffer reuse, using
+barrier **ordinals** across all eight waves. It assumes FIFO G2S completion;
+it is a dependency check, not a latency simulator or a substitute for hardware
+validation. The old source exposes both hazards even under that favorable FIFO
+assumption. The repaired source passes all four tile geometries, K iteration
+counts 2 through 6, and all three wait policies. Mutation controls remove each
+repair and confirm that its corresponding hazard returns.
+
+The repaired BM=128 ISA retains 110 mainloop `vmcnt(4)` instructions, 152 VGPRs,
+96 KiB LDS, and zero spills. The kernel symbol includes `sync2` so that the old
+FlyDSL disk cache cannot silently substitute a pre-repair kernel.
+
+### Post-repair validation
+
+The CPU dependency checks and GPU numerical checks are separate. The latter
+use small integer BF16 operands and a CPU reference computed before the kernel,
+so FP32 accumulation is exact and neither VMM windows nor a GPU reference GEMM
+can explain a mismatch. They cover all supported input/output tile combinations,
+K=128/192/256/7168, and changing inputs under graph replay.
+
+Hardware benchmark results are recorded below after the independent-process
+and transport-mode sweep completes. The shipped default remains `256x256`;
+`--block-m 128 --block-n 256` selects the repaired smaller tile explicitly.
+
+Before the synchronization repair, `pick_tile` was restricted to the template's
+tile. That default is retained, and **the GEMM speedup measured in this
 section does not reach the default configuration.** Both faster tiles stay
 reachable through an explicit `--block-m` / `--block-n` so the measurements can
 be reproduced.
@@ -533,6 +547,60 @@ One caution on reading any of this, which is the real lesson of the section: **a
 single launch is not evidence.** Four separate conclusions here were reversed by
 repeating a cell that had "clearly" passed or failed once — including this
 one.
+
+### BF16 split-pull publication and initial barrier state
+
+The remaining `split-lsa-pull` failure is separate from the LDS ordering
+repair. Its producer and its first cross-rank barrier both need attention:
+
+* The unfused BF16 GEMM previously ignored `peer_uncached=True`. It now builds
+  a buffer descriptor from the caller's **C pointer**, with `slab_bytes` as
+  the bound (including the FP32 element width), and emits `sc0|sc1` stores.
+  Every producer lane completes its stores and executes a system fence before
+  returning. This path also accepts an ordinary C tensor with null CCO handles.
+  The generated BM=128 ISA contains the 16 `buffer_store_dwordx4 ... sc0 sc1`
+  instructions followed by `vmcnt(0)`, the block barrier, `buffer_wbl2 sc0 sc1`,
+  another `vmcnt(0)`, and `buffer_inv sc0 sc1`. It still uses 152 VGPRs and
+  has no register spills. The kernel symbol includes `sync2_pub2` to separate
+  it from cached versions without publication.
+* The benchmark initialized only `recv`, leaving the control region at the
+  contents returned by `alloc_mem`. A diagnostic read found nonzero words in
+  the initial arrival slots while the local epoch counters were zero. These
+  stale positive flags satisfy pull's first `>= 1` wait before the producer
+  finishes. A failed FP32 run had correct local C and `relL2=0.2044` on some
+  peers reading the same source, consistent with one of 24 copy blocks reading
+  early (`sqrt(1/24) ~= 0.2041`). The benchmark now zeros the **entire window**
+  once before use. Flags remain monotonic across subsequent graph replays.
+
+The regression suite checks both BM=128/256 and BF16/FP32 output on eight
+gfx950 GPUs. It uses random small-integer inputs, an exact CPU oracle, a
+different answer and poisoned output on each replay, and a rotating delayed
+producer. A separate test runs the real benchmark with deliberately dirty
+arrival slots and a delayed rank 0, so initialization is exercised even when
+the allocator happens to return clean pages. The existing single-GPU numerical
+matrix also covers `peer_uncached=True` with plain tensors and null CCO handles.
+
+On 2026-09-28, at M=N=2048, K=7168, BN=256, five independent eight-rank
+benchmark launches per configuration all validated:
+
+| BM | FP32 output | BF16 output |
+|---:|---:|---:|
+| 128 | 5/5 (`relL2=9.93e-7`) | 5/5 (`relL2=1.66e-3`) |
+| 256 | 5/5 (`relL2=9.93e-7`) | 5/5 (`relL2=1.66e-3`) |
+
+These are correctness repetitions (`--warmup 5 --iters 20`), not a new
+performance sweep. Unused SDMA resources were disabled for the LSA runs.
+The dirty-window mutation control, which restores recv-only initialization
+while retaining the producer's publication, fails with `relL2=1.0` on peers
+that read the delayed producer. The unmodified regression passes.
+The final checks passed 98 layout/dependency cases, 48 single-GPU numerical
+cases, and five eight-rank tests (four replay configurations plus the dirty
+window case).
+
+```bash
+PYTHONPATH=python .venv/bin/python -m pytest -q tests/python/cco/test_gemm_ag.py \
+  -k 'bf16_pull_publishes or pull_initializes or bf16_gemm_pipeline_numerics'
+```
 
 ### What it would have bought, and what it actually bought
 
@@ -637,6 +705,11 @@ with `peer_uncached=True`, whose epilogue stores through a buffer descriptor
 with `sc0|sc1`. At this shape that costs nothing measurable (217.0us against
 217.1us before the change).
 
+The later BF16 audit above also found uninitialized arrival flags in the
+benchmark. Zero the whole window before attributing a pull failure to cache
+publication: both faults can let a peer read incomplete C, and the numerical
+error alone does not distinguish them.
+
 The general lesson is the one the mode matrix is built around: **a transport bug
 that only one quantisation exposes is not found by spot-checking the default.**
 `tests/python/cco/test_gemm_ag.py` parametrises every mode over all three.
@@ -721,11 +794,10 @@ launches and retry a lost race rather than recording it.
   `BLOCK_K` is still pinned to the template's 64 and was not swept: it would
   need a different LDS swizzle, since `swizzle_row128b`'s geometry is 128 bytes
   per row and `BLOCK_K=128` is 256.
-* **The `BLOCK_M=128` correctness bug.** The single highest-value open item —
-  finding it unlocks a measured 33% on the GEMM, which under graph replay is
-  parity with `torch.matmul`. Four hypotheses are already eliminated with
-  evidence (see *What it is not*); the ISA is clean, so start on the harness and
-  the environment rather than the kernel.
+* **Smaller-tile tuning after the synchronization repair.** The previous
+  “ISA is clean” conclusion missed the two ordering edges described above.
+  Keep correctness and performance validation separate when extending
+  `pick_tile` beyond the current `256x256` default.
 * The bf16 path at the `r128` shape, under `--chunks > 1`, or with
   `--post serial`. All are reachable; none were swept.
 * fp8 on the wire. This is the direction where it would help most — the

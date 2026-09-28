@@ -46,9 +46,10 @@ template                                ``_gemm_a8w8_8wave.py``
 ``E_N = HALF_B_N / 64``                 ``N_TILES_B = BLOCK_N // 128``
 ======================================  ====================================
 
-So the pipeline -- the ``s_barrier`` ladder, the ``wait_barrier`` counts, the
-double-buffered tic/toc, the tail's two unrolled K steps -- is *not* re-derived
-here. It is the same schedule with four things changed:
+The pipeline retains the staggered waves, double-buffered tic/toc, and two
+peeled K steps. Its synchronization is checked separately from the template:
+the combined B0/A0 read needs an explicit LDS completion wait, and the tail
+must drain prefetches before reading the final tile. The precision changes are:
 
 1. **The MFMA** is ``v_mfma_f32_16x16x32_bf16`` instead of the scaled fp8
    ``16x16x128``. An operand fragment is 8 bf16 = 16 B = four dwords, against
@@ -118,6 +119,7 @@ path reaches only after the shuffle.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
@@ -171,6 +173,16 @@ VEC = 8
 BF16_BYTES = 2
 PACK_BYTES = 16
 
+
+def _wait_lds_reads():
+    """Finish S2R reads before the other half of the block can reuse LDS."""
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt lgkmcnt(0)",
+        constraints="~{memory}",
+        has_side_effects=True,
+    )
 
 
 def swizzle_row128b(row, col, elem_bytes):
@@ -446,9 +458,7 @@ class AgStoreC:
                 )
                 self.reg_out = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
             else:
-                self.out_atom = fx.make_copy_atom(
-                    fx.rocdl.BufferCopy128b(), fx.Float32
-                )
+                self.out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
                 self.reg_out = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
 
     def _emit(self, value, idx):
@@ -493,9 +503,7 @@ class AgStoreC:
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
                 col = base_col + tj * 16 + grp * 4
                 oob = fx.Int32(self.c_rows * self.c_cols)
-                idx = arith.select(
-                    col + 3 < self.c_cols, row * self.c_cols + col, oob
-                )
+                idx = arith.select(col + 3 < self.c_cols, row * self.c_cols + col, oob)
                 self._emit(vec_f32, idx)
 
     def _store_bf16(self, c_frag, base_row, base_col):
@@ -529,7 +537,6 @@ class AgStoreC:
             oob = fx.Int32(self.c_rows * self.c_cols)
             idx = arith.select(col + 7 < self.c_cols, row * self.c_cols + col, oob)
             self._emit(out8, idx)
-
 
 
 def tile_constants(BLOCK_M, BLOCK_N, out_dtype="bf16"):
@@ -620,8 +627,14 @@ def compile_bf16_gemm_ag(
     exactly one thing. ``dev_comm`` and ``win`` are unread on that path but stay
     in the signature so the launch path does not change either.
 
-    **The epilogue below is the twin of the fp8 one in ``kernels_fused.py`` and
-    the two must be changed together.** They are not shared because FlyDSL's
+    With ``fuse=False, peer_uncached=True``, C is a pull source: store it
+    through a descriptor with ``sc0|sc1``, drain those stores, and issue a
+    system fence from every producer lane before the kernel returns. The
+    following pull kernel can then publish arrival and read peer HBM. This
+    also works with a plain C tensor and null CCO handles.
+
+    **The fused epilogue below is the twin of the fp8 one in ``kernels_fused.py``
+    and the two must be changed together.** They are not shared because FlyDSL's
     rewriter only lowers ``if`` inside a ``@flyc.kernel`` function's own AST, so
     the election and the barriers cannot move into a helper. What differs
     between them is the mainloop and the store; the transport logic -- release
@@ -698,63 +711,14 @@ def compile_bf16_gemm_ag(
     K_ITERS = K // BLOCK_K
     assert K_ITERS >= 2, "the pipeline peels two K steps off the tail"
 
-    # How permissive the mainloop's `s_waitcnt vmcnt(N)` is allowed to be.
-    #
-    # Each G2SLoader.load() issues exactly one buffer_load_lds per step -- A =
-    # N_LDS_STEPS_A of them for an A tile, B for a B tile -- and vmcnt retires
-    # in issue order. Walking the mainloop: entering an iteration A+2B are
-    # outstanding, the iteration issues A1@k+1, B0@k+2, A0@k+2, B1@k+2, so 3A+4B
-    # are in flight at the wait. The next iteration reads a_cur1, which is
-    # A1@k+1 -- the 4th item -- so retirement has to reach 2A+2B and the wait
-    # must therefore be **at most A + 2B**.
-    #
-    # The inherited count is `2A + B`, and the two are equal only when A == B:
-    #
-    #     tile      A  B   2A+B   A+2B
-    #     256/256   2  2      6      6   exactly tight
-    #     128/256   1  2      4      5   has margin
-    #     256/128   2  1      5      4   INSUFFICIENT
-    #     128/128   1  1      3      3   exactly tight
-    #
-    # "Exactly tight" means zero slack against the compiler reordering the four
-    # loads among themselves, which it is free to do -- `wait_barrier` is a
-    # scheduling barrier but does not fix the order of what precedes it.
-    #
-    # "safe" uses the derived A+2B. "conservative" waits for everything, which
-    # is slow and exists to answer "is it the waits?" without having to trust
-    # the derivation.
-    #
-    # It is **not** the waits. The generated ISA says so directly
-    # (GPU_DUMP_CODE_OBJECT=1, llvm-objdump --mcpu=gfx950), at M=2048 N=2048
-    # K=7168 fp32:
-    #
-    #   * the S2R loads are `ds_read_b128` -- lgkmcnt, not vmcnt -- so they were
-    #     never in this accounting to begin with: 16 per iteration at BM=128,
-    #     24 at BM=256;
-    #   * the G2S loads are `buffer_load_dwordx4`, exactly A+B per load call, 6
-    #     per iteration at BM=128 and 8 at BM=256;
-    #   * `vmcnt(4)` / `vmcnt(6)` each retire precisely one iteration's worth,
-    #     leaving in flight exactly the k+2 prefetches, which is correct;
-    #   * the two kernels' instruction skeletons are structurally identical
-    #     (`W BB D..D G B L B D..D GG B L B D..D G B L B GG`), with 8 barriers
-    #     per iteration in both and `s_waitcnt lgkmcnt(0)` correctly between the
-    #     barrier pair that guards the write-after-read on each LDS buffer;
-    #   * neither spills (0 VGPR, 0 SGPR), and both get one workgroup per CU.
-    #
-    # The one asymmetry is 152 VGPRs and 96 KiB LDS at BM=128 against 248 and
-    # 128 KiB at BM=256, which is just the tile. `gemm_ar.wait_barrier` also
-    # puts `s_waitcnt` and `s_barrier` in one inline-asm string with
-    # `constraints=""` -- no memory clobber, so the compiler is not told there
-    # is a barrier in there and could legally move an LDS access across it.
-    # Emitting the wait as asm and the barrier as `rocdl.s_barrier()` instead
-    # produces **byte-identical** code here, so it does not, at least not at
-    # this register pressure.
-    #
-    # So the instruction stream gives no evidence of a bug at either tile, and
-    # `conservative` fixing the corruption is timing perturbation rather than a
-    # corrected count. Together with 0/64 clean on a single idle GPU, that
-    # points away from this kernel and toward the 8-process harness or the
-    # environment -- which is where the next person should start, not here.
+    # G2S uses vmcnt; S2R uses lgkmcnt. With A/B load instructions per
+    # subtile, the prefetches issued AFTER A1@k+1 are B0, A0, B1@k+2:
+    # A+2B instructions may remain when the next iteration starts. Preserve
+    # the tighter inherited threshold where it is safe, but cap it for the
+    # asymmetric 256x128 tile (2A+B=5 would leave A1 unfinished; A+2B=4).
+    # These counts only protect read-after-write. The staggered waves also
+    # need _wait_lds_reads() below to protect B0 from an early overwrite.
+    # "conservative" remains a diagnostic that drains G2S at every wait.
     def _wb(tuned):
         if wait_policy == "conservative":
             return wait_barrier(0)
@@ -763,11 +727,14 @@ def compile_bf16_gemm_ag(
     _MAIN_WAIT = (
         N_LDS_STEPS_A + 2 * N_LDS_STEPS_B
         if wait_policy in ("safe", "conservative")
-        else 2 * N_LDS_STEPS_A + N_LDS_STEPS_B
+        else min(
+            2 * N_LDS_STEPS_A + N_LDS_STEPS_B,
+            N_LDS_STEPS_A + 2 * N_LDS_STEPS_B,
+        )
     )
 
     _kname = (
-        f"mori_ag_bf16_{transport if fuse else 'plain'}_8w_"
+        f"mori_ag_bf16_{transport if fuse else 'plain'}_8w_sync2_pub2_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
         f"{'F32' if out_dtype == 'fp32' else 'B16'}_{waves_per_eu}x{xcd_swizzle}"
         f"_c{chunks}q{sdma_queues}{post[0]}{'U' if peer_uncached else 'C'}"
@@ -846,7 +813,8 @@ def compile_bf16_gemm_ag(
         # Where C goes. On the fused-LSA path the collective is a *broadcast*,
         # so the store is handed `world` descriptors and does the convert and
         # (for bf16) the shuffle once for all of them. Everywhere else it is a
-        # single destination and the store takes the plain C tensor.
+        # single destination; the pull producer needs an explicit descriptor
+        # for its C tensor so it can set the system-scope cache policy.
         if const_expr(fuse and direct_lsa):
             # Broadcast: `world` descriptors, so the convert and (for bf16) the
             # shuffle happen once and only the 16-byte store repeats.
@@ -865,19 +833,19 @@ def compile_bf16_gemm_ag(
             # 9.9e-7) and was clean through the buffer resource, so the two
             # paths are not interchangeable even though they address the same
             # bytes.
-            #
-            # `peer_uncached` is deliberately **not** honoured on the unfused
-            # path, and that is a known soft spot rather than a decision:
-            # sending the split pull baseline's C store with sc0|sc1 through
-            # this resource made it *worse*, not better -- relL2 5.9e-3 at
-            # BLOCK_M 128 and 256 alike, where the plain cached copy-atom store
-            # validates. So the bf16 pull baseline currently has no explicit
-            # system-scope publish and relies on the end-of-kernel release,
-            # which is not the discipline kernels_lsa's docstring asks for.
-            # See the benchmark doc; it is unresolved.
             rsrcs = [
                 create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
+                    num_records_bytes=slab_bytes,
+                )
+            ]
+        elif const_expr(peer_uncached):
+            # Publish the caller's C, which need not be a CCO window. Copy
+            # atoms cannot express sc0|sc1. slab_bytes includes the output
+            # element width, so an FP32 descriptor covers the entire slab.
+            rsrcs = [
+                create_buffer_resource_from_addr(
+                    wave_uniform_i64(fx.ptrtoint(fx.get_iter(C))),
                     num_records_bytes=slab_bytes,
                 )
             ]
@@ -920,6 +888,12 @@ def compile_bf16_gemm_ag(
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+            # Waves 0-3 are one barrier ahead of waves 4-7. When the latter
+            # reach this barrier, the former can already issue B0@k+2 below.
+            # Waiting only inside mfma.call is too late: finish B0's LDS reads
+            # BEFORE releasing that rendezvous. Drain A0 too so this does not
+            # depend on LLVM's ordering of the two sets of ds_read instructions.
+            _wait_lds_reads()
             rocdl.s_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
@@ -963,7 +937,11 @@ def compile_bf16_gemm_ag(
         # K_ITERS - 1 tile here or c10 / c11 read stale A1. gemm_ar carries the
         # same line with the same note.
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-        rocdl.s_barrier()
+        # No mainloop wait follows this last prefetch. Retire the final tile
+        # before either wave group reads b_next0 / a_next0 below. The barrier
+        # after c10 pairs with this wait in the lagging group. Waiting after
+        # the final a0 S2R load cannot repair a value already read from LDS.
+        wait_barrier(0)
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
@@ -977,9 +955,9 @@ def compile_bf16_gemm_ag(
         b_cur0, b_next0 = b_next0, b_cur0
         b_cur1, b_next1 = b_next1, b_cur1
 
-        # Step k = K_ITERS - 1
+        # Step k = K_ITERS - 1; the prefetches were drained above.
         a0_frag = a_s2r.load(a_cur0)
-        wait_barrier(0)
+        rocdl.s_barrier()
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
@@ -1016,8 +994,15 @@ def compile_bf16_gemm_ag(
         store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
-        # ---- the all-gather epilogue; twin of kernels_fused.py's fp8 one ----
-        if const_expr(fuse and direct_lsa):
+        # ---- producer publication and the all-gather epilogue ----
+        if const_expr(not fuse and peer_uncached):
+            # Complete the sc0|sc1 stores, then explicitly release C at
+            # system scope before the next kernel signals peers. The CCO
+            # fence with leaderOnly=1 orders only thread 0's writes; every
+            # lane here is a producer. A consumer fence cannot replace this.
+            wait_barrier(0)
+            raw_cco.cco_system_fence(fx.Int32(0))
+        elif const_expr(fuse and direct_lsa):
             # Publish the peer stores from the blocks that made them. The
             # barrier kernel that follows is one block, hence one XCD's L2 out
             # of eight; the other seven would keep their peer-homed lines dirty
@@ -1050,9 +1035,7 @@ def compile_bf16_gemm_ag(
                 j = fx.thread_idx.x
                 slot = chunk * fx.Int32(ws) + j
                 ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
-                seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(
-                    1
-                )
+                seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
                 if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
                     if const_expr(emit_put):
                         if const_expr(post == "lanes"):
@@ -1120,38 +1103,11 @@ def compile_bf16_gemm_ag(
     return launch_gemm
 
 
-#: Tiles ``pick_tile`` will choose from, largest first.
-#:
-#: ``BLOCK_N=128`` is **deliberately absent**, and not because it is slow -- it
-#: is the fastest thing measured (116.5us at M=2048 against ``128/256``'s
-#: 134.2). It **races**: at ``BLOCK_M=128, BLOCK_N=128`` an fp32 C came out
-#: wrong once in 48 single-GPU runs (relL2 1.4e-2 against the usual 9.9e-7), and
-#: under an 8-rank bench roughly half the ranks failed per launch, a different
-#: half each time. ``BLOCK_N=256`` is 48/48 clean on the same probe.
-#:
-#: The suspected cause is the ``wait_barrier`` vmcnt thresholds: they are
-#: written as ``N_LDS_STEPS_A + N_LDS_STEPS_B`` and friends, which is only ever
-#: exercised at the step counts ``BLOCK_N=256`` produces. At ``BLOCK_N=128``
-#: both counts fall to 1 and the thresholds may admit one prefetch too many --
-#: which would be invisible until something perturbs the timing, exactly as
-#: observed. Unconfirmed; ``tile_constants`` still accepts the tile so the
-#: measurement stays reproducible behind an explicit ``--block-n 128``.
-#:
-#: ``BLOCK_M=128`` is **also absent, and that is the unhappy part of this
-#: file.** It is 24% faster at the target shape and it is not sound either: at
-#: ``M=2048`` fp32 it validated 4/4 on ``gemm-only`` and ``gemm-to-window`` and
-#: 3/3 on ``split-rccl`` and ``split-sdma``, then on a later pass the same
-#: ``gemm-to-window`` and ``split-rccl`` cells came back 1/2, and ``fused-lsa``
-#: is 0/4 throughout. ``BLOCK_M=256`` has not failed once across every repeat
-#: run here. So the failure rate at 128 is around a third of launches and
-#: depends on something not yet identified -- it is **not** the release fence,
-#: which was the obvious candidate and which ``--fence all`` and
-#: ``--direct-fence all`` both fail to fix (0/3 each).
-#:
-#: Shipping a wrong answer a third of the time to buy 24% is not a trade, so
-#: the default is the tile that validates. Everything measured is in
-#: ``pick_tile`` and both faster tiles stay reachable through an explicit
-#: ``--block-m`` / ``--block-n``, so the work is reproducible rather than lost.
+#: Keep the previously validated default while the repaired smaller tiles get
+#: broader performance coverage. Explicit BLOCK_M/BLOCK_N still select them.
+#: The former intermittent failures were compatible with two missing LDS
+#: ordering edges, now covered by test_gemm_ag_pipeline.py; ISA instruction
+#: counts alone had incorrectly been taken as evidence that the kernel was safe.
 TILE_CANDIDATES = ((256, 256),)
 
 #: CUs on the part this was tuned on (MI355X). The grid heuristic wants the
@@ -1177,7 +1133,7 @@ def pick_tile(m, n, out_dtype="bf16", cus=DEFAULT_CUS):
         128/256    128   134.2     448
         128/128    256   116.5     516   (races -- see TILE_CANDIDATES)
 
-    and per shape at the best *sound* tile (``128/256``), against
+    and per shape at ``128/256`` (before the synchronization repair), against
     ``torch.matmul``::
 
           M   grid     us    TF/s   torch    ratio
@@ -1193,13 +1149,10 @@ def pick_tile(m, n, out_dtype="bf16", cus=DEFAULT_CUS):
     whose grid still covers the CUs, or the largest grid available if none
     does**, which reproduces the measured best at every shape.
 
-    **That rule currently has one candidate to choose from.** Both tiles
-    smaller than the template's are measurably faster and neither validates
-    reliably -- see ``TILE_CANDIDATES`` -- so this returns ``(256, 256)`` today
-    and the logic is kept for when one of them is fixed. The measurements are
-    the deliverable here rather than the selection: they say the tile is worth
-    24-34%, and that ``waves_per_eu`` and ``xcd_swizzle`` are worth nothing,
-    which is where the next attempt should and should not look.
+    The candidate set remains ``((256, 256),)`` to preserve the shipped
+    default. The timing table predates the synchronization repair and is not
+    evidence of correctness. Smaller tiles are available through explicit
+    arguments; see the benchmark document for post-fix validation.
     """
     cands = [
         (bm, bn)
