@@ -657,7 +657,7 @@ native BF16-to-FP32 GEMM performance. That older number consists of 81.5 µs
 for a BF16-output matrix multiply plus 25.6 µs to widen the result. Widening
 does not recover the precision lost when the output was rounded to BF16.
 
-The maintained [GEMM comparison](../benchmark/cco/flydsl/gemm_ag/compare_gemm.py)
+The maintained [GEMM comparison](../../../../benchmark/cco/flydsl/gemm_ag/compare_gemm.py)
 runs native Torch and MORI kernels directly with the same paired protocol.
 Historical per-rank records are archived separately from the source tree.
 
@@ -730,7 +730,7 @@ before this correction; all 24 split/fused/rank/queue cases now pass. The
 table uses the corrected drain for every fused multi-queue measurement;
 the earlier `128x128` samples were replaced by fresh measurements.
 
-The maintained [benchmark entry points](../benchmark/cco/flydsl/gemm_ag/README.md)
+The maintained [benchmark entry points](../../../../benchmark/cco/flydsl/gemm_ag/README.md)
 run these transport comparisons directly, including repeated graph timing
 and changed-input validation. Historical raw records are archived separately.
 
