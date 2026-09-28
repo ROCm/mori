@@ -10,13 +10,28 @@ See [benchmark commands](../../../../benchmark/cco/flydsl/gemm_ag/README.md)
 for setup and execution, and [EXPERIMENTS.md](EXPERIMENTS.md) for optimization
 results. The retained measurements show:
 
-- At M=N=2048, K=7168, BF16-to-FP32 GEMM with an explicit `128x128` tile is
+- For the DeepSeek-V4-Pro ratio-4 main compressor, at M=N=2048, K=7168,
+  BF16-to-FP32 GEMM with an explicit `128x128` tile is
   close to native Torch: **72.0 vs 71.1 µs**. The default remains `256x256`.
 - At that shape, non-fused GEMM + SDMA takes **364.0 µs**; original fused
   SDMA takes **377.0 µs** with one chunk.
 - In the separate v2-015 sweep, four-chunk single-stream fusion reduces
   latency by **about 5% at M=8192** and **11% at M=16384**, with no benefit
   at M=4096. Fusion performance depends on shape and chunk size.
+
+## Model shapes
+
+| Model / projection | K | N | Source |
+|---|---:|---:|---|
+| DeepSeek-V4-Pro, ratio-4 main `compressor.wkv_gate` | 7168 | 2048 | `hidden_size=7168`; output `2 * coff * head_dim`, with `coff=2`, `head_dim=512` |
+| DeepSeek-V4.1-Flash, ratio-2 KV or gate projection | 5120 | 512 each | Two separate projections in the current SGLang ROCm path |
+| DeepSeek-V4.1-Flash, combined KV/gate candidate | 5120 | 1024 | Concatenate the two 512-row weight matrices; the consumer still needs separate KV/gate outputs |
+
+M is selected from the runtime token count, not the model configuration.
+These are synthetic-input operator benchmarks at model-derived dimensions,
+not end-to-end SGLang serving measurements. SGLang's Flash low-ratio CP path
+currently gathers hidden states before projection. Its GEMMs use the gathered
+global row count; a local GEMM followed by AG is a reordered candidate.
 
 ## Execution paths
 
@@ -63,9 +78,10 @@ its `serial` control retains those streams but disables compute/transfer overlap
   one queue per chunk per peer; the benchmark derives that queue count.
   `build_sdma_chunk_post` instead uses queue 0 and requires serialized submissions.
 
-## BF16 benchmarks after the correctness fixes
+## BF16 benchmarks: DeepSeek-V4-Pro
 
-Measured on 2026-09-28 on eight MI355X GPUs, M=N=2048, K=7168, with BF16
+Model shape: **DeepSeek-V4-Pro ratio-4 main compressor**. Measured on
+2026-09-28 on eight MI355X GPUs, M=N=2048, K=7168, with BF16
 inputs and FP32 output, using PyTorch `2.10.0+rocm7.2.0.gitb6ee5fde` and
 FlyDSL 0.2.4.
 Use the separate [v2-015 controls](EXPERIMENTS.md#larger-m-on-v2-015) when
@@ -93,7 +109,7 @@ All implementations passed on all ranks, with worst relative L2 error
 establish a speedup. Select it explicitly with `--block-m 128 --block-n 128`.
 BF16 output followed by widening is not an equivalent FP32-output reference.
 
-### GEMM + AG
+### GEMM + AG — DeepSeek-V4-Pro
 
 Each rank produces 16 MiB and sends 112 MiB. Times include the complete AG
 and final cross-rank synchronization. Native Torch + RCCL takes **397.5 µs**.
@@ -125,12 +141,14 @@ At this shape, the benefit comes from tile selection and SDMA transport:
 364.0 µs is 8.4% below native Torch + RCCL. The publication optimization and
 larger-M fusion results are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-### Earlier FP8 reference
+### Earlier FP8 reference — DeepSeek-V4-Pro dimensions
 
 These FP8-input/BF16-output measurements used eight MI355X GPUs,
 M=N=2048, K=7168, and 21 graph samples after 10 warmups, taking the maximum
 across ranks. PTPC uses `128x256`; MXFP8 uses `256x256`. This older protocol
-is separate from the BF16/FP32 measurements above. Times are µs.
+is separate from the BF16/FP32 measurements above. Only the dimensions come
+from the Pro compressor; this FP8-input path is not its native BF16 projection.
+Times are µs.
 
 | Mode | PTPC | Blockscale | MXFP8 |
 |---|---:|---:|---:|
@@ -145,6 +163,95 @@ is separate from the BF16/FP32 measurements above. Times are µs.
 All modes validated at about `1.66e-3` relative L2 error against the
 precision-specific reference. These results do not establish a fusion win
 for that shape or a precision-equivalent replacement for BF16-to-FP32 GEMM.
+
+## BF16 benchmarks: DeepSeek-V4.1-Flash
+
+Measured on 2026-09-28 on **v2-015, eight MI355X GPUs**, using ROCm 7.2.4,
+PyTorch `2.11.0+rocm7.2`, FlyDSL 0.2.4 and 128x128 tiles. K=5120 comes from
+Flash's hidden size. **N=512 is one KV or gate projection** in the ratio-2
+path; **N=1024 is a combined KV/gate candidate**. Both use BF16 input and
+FP32 output/wire. The N=512 timings must not be read as the total for both
+projections.
+
+Each case uses five rounds, 50 warmups and 101 graph samples per round, with
+the same rank/round aggregation and changed-input validation described above.
+All 40 unique shape configurations passed; the complete study contains 52
+accepted configurations/repeats, with worst relative L2 error `8.04e-07`.
+These are local-projection-then-AG tests; token-order restoration and KV/gate
+unpacking are excluded from these tables. A separate ratio-2 subgraph test
+includes those steps.
+
+### GEMM + AG at local M=2048
+
+| Mode | N=512, µs | N=1024, µs |
+|---|---:|---:|
+| Native Torch + RCCL | 141.0 | 227.8 |
+| MORI GEMM + RCCL | 156.8 | 239.0 |
+| MORI GEMM + LSA push | 137.2 | 222.8 |
+| MORI GEMM + LSA pull | 150.6 | 241.3 |
+| Fused LSA, uncached | 141.4 | 236.1 |
+| MORI GEMM + SDMA | 139.2 | 212.6 |
+| Fused SDMA, 1 chunk | 138.5 | 215.3 |
+| Fused SDMA, 4 chunks | 166.2 | 247.4 |
+
+Fused SDMA uses `--peer-uncached --fence release`; fused LSA uses uncached
+stores. RCCL uses thread-local graph capture to allow its watchdog's event
+queries on another thread. One global-capture RCCL attempt aborted before
+producing a result and was excluded; the RCCL comparisons were rerun.
+
+For N=512, the leading single-stream paths are close (about 137–141 µs),
+without a material fusion win. N=1024 split SDMA is 212.6 µs; four-chunk
+fusion at this small M is slower. Do not compare these numbers directly with
+the Pro table's different host/runtime, K, N and communication volume.
+
+### Larger local M, SDMA
+
+First-pass times in µs, with the same K and tile:
+
+| Local M | N=512 split | N=512 fused c4 | N=1024 split | N=1024 fused c4 |
+|---|---:|---:|---:|---:|
+| 4096 | 214.3 | 245.2 | 363.4 | 397.7 |
+| 8192 | 366.5 | 398.1 | 703.5 | 733.7 |
+| 16384 | 700.2 | 736.2 | 1371.5 | 1308.1 |
+
+Four chunks do not help the individual N=512 projection in this sweep.
+The N=1024 combined candidate first shows a useful four-chunk gain at M=16384;
+smaller M does not show that benefit. One-chunk candidates were also measured
+at all four M values; differences below 1% at the small N=512 shapes are not
+treated as established speedups.
+
+Independent adjacent pairs confirmed the SDMA comparison (N=512 uses one
+fused chunk; N=1024 uses four):
+
+| N | Local M | Repeat | Split SDMA, µs | Fused SDMA, µs | Latency reduction |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 2048 | 1 | 138.0 | 140.4 | -1.68% |
+| 1024 | 16384 | 1 | 1370.1 | 1308.5 | 4.50% |
+| 1024 | 16384 | 2 | 1369.6 | 1308.0 | 4.49% |
+
+Thus the small N=512 result does not establish a fusion win, while the
+combined N=1024 projection at M=16384 has a repeatable **about 4.5%** benefit.
+
+### Two-stream pipeline at local M=2048
+
+| Four-chunk, two-stream backend | N=512, µs | N=1024, µs |
+|---|---:|---:|
+| MORI | 253.0 | 272.2 |
+| MORI, four-way split-K | 176.1 | 210.3 |
+| Native Torch | 145.2 | 201.4 |
+
+These are total GEMM+AG pipeline times, not isolated GEMM times. The N=512
+pipeline does not improve the better whole-matrix paths. The N=1024 Torch
+pipeline is faster than MORI split SDMA here, but that comparison changes the
+GEMM backend as well as the scheduling; it does not isolate overlap alone.
+
+### Complete ratio-2 projection subgraph
+
+The separate [Flash projection-order comparison](EXPERIMENTS.md#flash-ratio-2-projection-order)
+times both 512-dimensional outputs, includes packing/unpacking and restores
+uniform interleave token order. It compares input-AG-first with local
+projection-then-output-AG at total S=16384 and local M=2048. It uses CCO/SDMA
+for every collective and is not an end-to-end SGLang measurement.
 
 ## Correctness requirements
 

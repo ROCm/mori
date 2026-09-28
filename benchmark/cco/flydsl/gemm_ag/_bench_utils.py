@@ -41,7 +41,7 @@ def positive_int(value):
     return number
 
 
-def measure(fn, warmup, iters, rounds=1, *, graph=True):
+def measure(fn, warmup, iters, rounds=1, *, graph=True, capture_error_mode="global"):
     """Time complete operations; return duration, rank/round data, and replay.
 
     Capture and allocation are excluded. The result is the median of the
@@ -66,7 +66,7 @@ def measure(fn, warmup, iters, rounds=1, *, graph=True):
     barrier()
     if graph:
         captured = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(captured):
+        with torch.cuda.graph(captured, capture_error_mode=capture_error_mode):
             fn()
         replay = captured.replay
     else:

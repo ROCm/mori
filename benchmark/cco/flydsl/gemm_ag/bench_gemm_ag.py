@@ -673,7 +673,14 @@ def run(args) -> int:
                 )
 
         us, timing, replay = measure(
-            once, args.warmup, args.iters, args.rounds, graph=not args.no_graph
+            once,
+            args.warmup,
+            args.iters,
+            args.rounds,
+            graph=not args.no_graph,
+            # RCCL's watchdog may query completed events on another thread.
+            # HIP global capture rejects those unrelated event queries.
+            capture_error_mode="thread_local" if rccl else "global",
         )
         replay_errors = []
         if bf16_in and not args.skip_validation and not args.no_put:
@@ -865,4 +872,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    sys.exit(run(build_parser().parse_args()))
+    try:
+        sys.exit(run(build_parser().parse_args()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
