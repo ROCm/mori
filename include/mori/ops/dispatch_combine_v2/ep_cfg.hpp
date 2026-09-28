@@ -151,6 +151,11 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
+  // MORI_EP_TOKOFF_EXT only: [worldSize] pointers, entry p = PE p's dispatch slot
+  // allocator word in hipExtMallocWithFlags(Uncached) memory shared by IPC handle,
+  // used instead of the window's offTokOff. Null (the default) keeps the window.
+  int* const* tokOffPeers = nullptr;
+
   int numTokens = 0;  // tokens this rank contributes this call
 };
 
@@ -183,6 +188,7 @@ struct EpArgs {
   X(gridBarrier, "p")          \
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
+  X(tokOffPeers, "p")          \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -206,7 +212,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 25,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -382,13 +388,22 @@ constexpr int EpXdbFlagSlots = 256;
 // follows combine.
 constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const int payload = c.hiddenDim * EpElemSize(c.dtype);
+  if (c.dtype == EpDType::Fp4x2) {
+    constexpr int kFp4Pack = 4;
+    const long long packedTotal = (long long)c.warpPerBlock * kFp4Pack * payload;
+    return packedTotal <= Ep1250xLdsBytes ? kFp4Pack * payload : payload;
+  }
   if (c.scaleBytes <= 0) return payload;
   const int wide = c.hiddenDim * EpElemSize(EpDType::Bf16);
   const long long total = (long long)wide * c.warpPerBlock;
   return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
 }
+constexpr int EpDispatch1250xMetaSlabBytes(const EpCfg& c) {
+  const int slab = EpDispatch1250xSlabBytes(c);
+  return ((long long)c.warpPerBlock * 2 * slab <= Ep1250xLdsBytes) ? slab : 0;
+}
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
-  return c.warpPerBlock * EpDispatch1250xSlabBytes(c);
+  return c.warpPerBlock * (EpDispatch1250xSlabBytes(c) + EpDispatch1250xMetaSlabBytes(c));
 }
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
