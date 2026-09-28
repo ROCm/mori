@@ -40,6 +40,8 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <cassert>
+
 // AFTER hip_runtime.h, and in its own block so clang-format cannot sort it up:
 // it pulls in driver_types.h, which uses hipMemoryType without declaring it.
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
@@ -246,6 +248,14 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 
   // Staging pointers from the dynamically-allocated base.  The EpStaging*Offset
   // functions are constexpr on kCfg, so each is base + compile-time constant.
+  //
+  // EpDispatchSpec::LaunchRaw rejects a null base on the host, but it only shadows
+  // the base LaunchRaw -- a C++ caller reaching KernelSpec::Launch names the base
+  // one and slips past. Assert rather than dereference: the fault would otherwise
+  // land at null + a staging sub-offset, which names neither the argument nor the
+  // caller that left it unbound.
+  assert(args.stagingBase != nullptr &&
+         "ep_dispatch: stagingBase is null -- bind staging_base (EpStagingTotalBytes)");
   char* _stgBase = static_cast<char*>(args.stagingBase);
   index_t* _cusplit_stgIdx = reinterpret_cast<index_t*>(_stgBase + EpStagingIdxOffset(kCfg));
   float* _cusplit_stgWt = reinterpret_cast<float*>(_stgBase + EpStagingWtOffset(kCfg));
