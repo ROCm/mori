@@ -112,13 +112,11 @@ class RdmaManager {
   bool HasIonicDevice() const;
 
   /* -------------------------------- Peer failure -------------------------------- */
-  // Takes the oldest recorded peer failure, if any. Returns false when none is
-  // pending. Intended to be polled by an application thread; failures are
-  // recorded on the async-event monitor thread.
+  // Takes the oldest recorded peer failure. Polled by an application thread;
+  // failures are recorded on the async-event monitor thread.
   bool PopPeerFailure(PeerFailureEvent* out);
-  // False once a fatal event has been observed for this QP, or for the device it
-  // was created on. A QP that is merely slow stays alive: absence of a fatal
-  // event is reported as alive, never as dead.
+  // False once a fatal event has been observed for this QP or its device. A QP
+  // that is merely slow stays alive.
   bool IsQpAlive(uint32_t qpNum) const;
 
  private:
@@ -141,9 +139,8 @@ class RdmaManager {
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
 
-  // Written by the async-event monitor thread, read by application threads; it
-  // is self-synchronizing, so it is intentionally not guarded by `mu`. Keeping
-  // it off `mu` also keeps the monitor thread off the transfer hot path's lock.
+  // Self-synchronizing, so deliberately not guarded by `mu`; that also keeps the
+  // monitor thread off the transfer hot path's lock.
   PeerFailureTracker peerFailures_;
 
   // Declared last so it is the first member destroyed, and explicitly reset at

@@ -45,9 +45,8 @@ void PeerFailureTracker::Record(PeerFailureEvent event) {
     auto it = qpOwners_.find(event.qpNum);
     if (it != qpOwners_.end()) {
       event.remoteEngineKey = it->second.remoteEngineKey;
-      // Prefer the device the QP was created on: the event's own device name is
-      // where the event surfaced, which is the same thing for a QP-scoped event
-      // but leaves the field populated even if the monitor could not name it.
+      // Fall back to the device the QP was created on, so the field is populated
+      // even when the monitor could not name it.
       if (event.deviceName.empty()) event.deviceName = it->second.deviceName;
     }
   } else if (!event.deviceName.empty()) {

@@ -37,16 +37,14 @@ namespace mori {
 namespace io {
 
 // Consumes verbs async events from each unique ibv_context owned by MORI-IO's
-// persistent RdmaContext and reports them through the cached IO logger, and —
-// for the subset that means a peer or its path has died — through an optional
-// callback. One epoll thread drains all async fds plus an eventfd used for
-// shutdown. The monitor holds non-owning ibv_context* references and must be
-// destroyed before ibv_close_device() and before any state its callback touches.
+// persistent RdmaContext, reports them through the cached IO logger, and hands
+// fatal ones to an optional callback. One epoll thread drains all async fds plus
+// an eventfd used for shutdown. The monitor holds non-owning ibv_context*
+// references and must be destroyed before ibv_close_device().
 class RdmaAsyncEventMonitor {
  public:
-  // onPeerFailure is invoked on the monitor thread for fatal events only, and is
-  // taken at construction so it is visible to the thread without synchronization.
-  // It may be empty, in which case events are logged and nothing else.
+  // onPeerFailure fires on the monitor thread for fatal events only; taken here
+  // so the thread reads it without synchronization. May be empty.
   static std::unique_ptr<RdmaAsyncEventMonitor> Create(const application::RdmaDeviceList& devices,
                                                        std::shared_ptr<spdlog::logger> logger,
                                                        PeerFailureCallback onPeerFailure = {});
@@ -84,9 +82,8 @@ class RdmaAsyncEventMonitor {
   void MainLoop() noexcept;
   GetResult ProcessOneEvent(Watch& watch) noexcept;
   void DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept;
-  // Classifies the event and, when it is fatal, hands it to onPeerFailure_.
-  // Benign and recovery events (e.g. PORT_ACTIVE, COMM_EST) report nothing: a
-  // slow-but-alive peer must never surface as a failure.
+  // Classifies the event and hands fatal ones to onPeerFailure_. Benign and
+  // recovery events (PORT_ACTIVE, COMM_EST) report nothing.
   void ReportPeerFailureIfFatal(const Watch& watch, const EventInfo& info) noexcept;
   void RemoveWatch(Watch& watch) noexcept;
   void RestoreWatchFd(Watch& watch) noexcept;

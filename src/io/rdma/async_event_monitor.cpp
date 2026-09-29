@@ -100,11 +100,8 @@ EventDescriptor DescribeAsyncEvent(ibv_event_type type) {
   }
 }
 
-// Maps an async event onto a peer-failure reason. Returns nullopt for events
-// that do not mean a peer is unusable — including IBV_EVENT_PORT_ACTIVE, which
-// is a recovery notification, and the informational QP lifecycle events. A peer
-// that is simply slow produces no async event at all and so is never classified
-// here, which is what keeps "slow" from being confused with "dead".
+// Maps an async event onto a peer-failure reason. Returns nullopt for events that
+// do not mean a peer is unusable, including the PORT_ACTIVE recovery event.
 std::optional<PeerFailureReason> ClassifyPeerFailure(ibv_event_type type) {
   switch (type) {
     case IBV_EVENT_QP_FATAL:
@@ -331,9 +328,8 @@ void RdmaAsyncEventMonitor::ReportPeerFailureIfFatal(const Watch& watch,
     EventDescriptor desc = DescribeAsyncEvent(info.type);
     PeerFailureEvent event;
     event.reason = *reason;
-    // Only QP-scoped events carry a meaningful QP number. Port and device
-    // events are left at 0 so the consumer treats them as affecting every peer
-    // reached through this device rather than one QP.
+    // Only QP-scoped events carry a QP number; port and device events are left at
+    // 0 so the consumer treats them as device-wide.
     event.qpNum = desc.category == Category::kQp ? info.qpNum : 0;
     event.deviceName = watch.deviceName;
     event.detail = std::string(desc.name != nullptr ? desc.name : "IBV_EVENT_UNKNOWN") +

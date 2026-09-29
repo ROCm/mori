@@ -21,9 +21,8 @@
 // SOFTWARE.
 #pragma once
 
-// Peer liveness signalling. Deliberately free of any dependency on the verbs,
-// msgpack and transport headers so that code which only needs to react to a peer
-// failure — and the tests for that logic — need not pull in the IO data plane.
+// Peer liveness signalling. Kept free of the verbs, msgpack and transport headers
+// so consumers and their tests need not pull in the IO data plane.
 
 #include <cstddef>
 #include <cstdint>
@@ -37,11 +36,8 @@
 namespace mori {
 namespace io {
 
-// Why a peer became unusable. Kept distinct from StatusCode because StatusCode
-// describes the fate of one transfer, while this describes the fate of the link
-// to a peer: it can be raised when no transfer is outstanding, and it must let
-// callers separate "peer/path is gone" from "peer is merely slow" (which is not
-// a failure and is therefore never reported here).
+// Why a peer became unusable. Distinct from StatusCode, which describes the fate
+// of one transfer: this describes the link, and can be raised with none pending.
 enum class PeerFailureReason : uint32_t {
   UNKNOWN = 0,
   // QP transitioned to an unrecoverable error state (IBV_EVENT_QP_FATAL /
@@ -56,14 +52,11 @@ enum class PeerFailureReason : uint32_t {
   CQ_ERROR = 4,
 };
 
-// An asynchronous notification that a peer, or the local resource used to reach
-// it, has failed. Raised independently of any in-flight transfer, so a caller
-// parked waiting on data that has not started arriving can still learn that it
-// will never arrive, without imposing a wall-clock timeout of its own.
+// Asynchronous notification that a peer, or the resource reaching it, has failed.
+// Raised independently of any in-flight transfer, so no timeout is needed.
 struct PeerFailureEvent {
-  // EngineKey of the peer this failure is attributed to. Empty when the event is
-  // not tied to a single QP (PORT_DOWN and DEVICE_FATAL affect every peer on the
-  // device) or when the QP was already torn down and could not be resolved.
+  // EngineKey of the attributed peer. Empty for device-wide events (PORT_DOWN,
+  // DEVICE_FATAL) or when the QP could not be resolved.
   std::string remoteEngineKey;
   PeerFailureReason reason{PeerFailureReason::UNKNOWN};
   // QP number the event arrived on; 0 when the event is not QP-scoped.
@@ -74,23 +67,16 @@ struct PeerFailureEvent {
   std::string detail;
 };
 
-// Invoked on the async-event monitor thread. Implementations must not block and
-// must not re-enter the engine; the intended use is to record the event so an
-// application thread can pick it up later.
+// Invoked on the async-event monitor thread. Must not block or re-enter the
+// engine; record the event so an application thread can pick it up later.
 using PeerFailureCallback = std::function<void(const PeerFailureEvent&)>;
 
-// Records peer failures reported asynchronously and answers liveness questions
-// about individual QPs. Written by the async-event monitor thread and read by
-// application threads, so every method is internally synchronized.
-//
-// The asymmetry here is deliberate: a QP is reported dead only once a fatal
-// event has actually been observed for it. Silence means alive, so a slow peer
-// is never mistaken for a dead one and no elapsed-time heuristic is needed.
+// Records asynchronous peer failures and answers QP liveness; thread-safe. A QP
+// is dead only once a fatal event is observed for it, so silence means alive.
 class PeerFailureTracker {
  public:
-  // Bound on unclaimed failures. A caller that never drains must not be able to
-  // grow this without limit; the oldest events are the diagnostic ones, so
-  // overflow drops the newest and counts it.
+  // Bound on unclaimed failures. Overflow drops the newest and counts it, since
+  // the oldest events are the diagnostic ones.
   static constexpr size_t kMaxPending = 1024;
 
   // Associates a local QP with the peer and device it belongs to, so an event
@@ -100,9 +86,8 @@ class PeerFailureTracker {
   // pending event stays drainable after the endpoint is gone.
   void ForgetQp(uint32_t qpNum);
 
-  // Records a failure, filling in remoteEngineKey when the QP can be resolved.
-  // QP-scoped events mark that QP dead; events with no QP mark the whole device
-  // dead rather than guessing which peer was affected.
+  // Records a failure, resolving remoteEngineKey when possible. QP-scoped events
+  // mark that QP dead; events with no QP mark the whole device dead.
   void Record(PeerFailureEvent event);
 
   // Takes the oldest pending failure. False when none is pending.

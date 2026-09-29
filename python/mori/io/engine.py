@@ -238,9 +238,7 @@ class IOEngine:
     def pop_peer_failure(self):
         """Take the oldest pending peer failure, or None if nothing has failed.
 
-        None means no failure has been observed, not that every peer is healthy.
-        A peer that is slow but reachable never appears here, so a caller can
-        wait on it indefinitely and still react as soon as one dies.
+        None means nothing has been observed to fail, not that peers are healthy.
         """
         return self._engine.PopPeerFailure()
 

@@ -1489,9 +1489,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 }
 
 bool RdmaBackendSession::Alive() const {
-  // Reports liveness of the transport, not progress of a transfer: a peer that
-  // is slow but reachable is alive. Only an observed fatal event makes this
-  // false, so this never has to guess from elapsed time.
+  // Liveness of the transport, not progress of a transfer: only an observed fatal
+  // event makes this false, so a slow but reachable peer stays alive.
   if (rdma_ == nullptr) return true;
   for (const auto& ep : eps) {
     if (!rdma_->IsQpAlive(ep.local.handle.qpn)) return false;

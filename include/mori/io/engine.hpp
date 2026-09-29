@@ -104,11 +104,8 @@ class IOEngine {
                   TransferUniqueIdVec& ids);
   // Take the transfer status of an inbound op
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id, TransferStatus* status);
-  // Take the oldest pending peer failure across all backends, if any. Returns
-  // false when nothing is pending, which is the common case and does not mean
-  // peers are healthy — it means nothing has been observed to fail. A peer that
-  // is slow but reachable never appears here, which is what lets a caller wait
-  // on a slow peer indefinitely while still reacting promptly to a dead one.
+  // Takes the oldest pending peer failure across all backends. False means
+  // nothing has been observed to fail, not that peers are healthy.
   bool PopPeerFailure(PeerFailureEvent* out);
   // Wait for all statuses with failure-wins precedence. Empty input succeeds.
   StatusCode WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs = -1);
