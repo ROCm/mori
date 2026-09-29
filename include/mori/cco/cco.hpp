@@ -365,7 +365,7 @@ struct ccoSdmaContext {
   // Written by a put's trailing ATOMIC (localSignal → own pool; remoteSignal →
   // peer's pool via peerSignalPtrs). Polled by waitSignal. Not used by quiet
   // (quiet drains via rptr/wptr).
-  uint64_t* signalBuf;        // [lsaSize * sdmaNumQueue], local
+  uint64_t* signalBuf;        // [max(lsaSize * sdmaNumQueue, reqs.sdmaSignalCount)], local
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
 
@@ -482,6 +482,11 @@ struct ccoDevCommRequirements {
   // Hybrid barrier (LSA + GDA-Rail two-stage). Drives BOTH
   // hybridLsaBarrier and hybridRailGdaBarrier with the same N.
   int barrierCount;
+
+  // Minimum # of uint64 slots in the per-DevComm SDMA signal pool
+  // (sdma.signalBuf). The pool is max(lsaSize * sdmaNumQueue, this).
+  // 0 = no floor.
+  int sdmaSignalCount;
 };
 
 #define CCO_DEV_COMM_REQUIREMENTS_INITIALIZER                                   \
@@ -500,6 +505,7 @@ struct ccoDevCommRequirements {
       0,                                         /* railGdaBarrierCount*/       \
       0,                                         /* sdmaQueueCount     */       \
       0,                                         /* barrierCount       */       \
+      0,                                         /* sdmaSignalCount    */       \
   }
 
 /* ════════════════════════════════════════════════════════════════════════════
