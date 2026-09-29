@@ -218,6 +218,9 @@ class CollectivesFacade {
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
     reqs.sdmaQueueCount = 0; // Use the context's SDMA queue count
+    // RS per-slice counters [0..S-1] + AR broadcast counters
+    // [kRSPushMaxSlices .. 2*kRSPushMaxSlices-1] (kBcastSlot == kRSPushMaxSlices).
+    reqs.sdmaSignalCount = 2 * kRSPushMaxSlices;
     int ret = mori::cco::ccoDevCommCreate(comm, &reqs, &facade.devComm_);
     if (ret != 0 || facade.devComm_.sdma.sdmaNumQueue == 0) {
       FACADE_PRINTF("CollectivesFacade: ccoDevCommCreate failed or "
@@ -496,7 +499,8 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
       ReduceScatterPullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
           <<<blocks, kThreads, 0, stream>>>(myPe_, heapWin_,
                                   reinterpret_cast<const ComputeT*>(input),
-                                  reinterpret_cast<ComputeT*>(output), chunkElemsC);
+                                  reinterpret_cast<ComputeT*>(output), chunkElemsC,
+                                  groupCounters_, barrierCtr_);
       return hipGetLastError();
     });
   } else {
