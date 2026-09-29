@@ -246,10 +246,46 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
   StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
 } 
 
+// SDMA re-reads the flag every `interval` clocks while parked on a POLL_REGMEM.
+#ifndef RS_BCAST_POLL_INTERVAL
+#define RS_BCAST_POLL_INTERVAL 4
+#endif
+static_assert(sizeof(SDMA_PKT_POLL_REGMEM) == 6 * sizeof(uint32_t),
+              "POLL_REGMEM must be 6 DW so the 64B slot pads with 10 NOPs");
+
+// One POLL_REGMEM (6 DW) padded with single-DW NOPs (zero dwords) to a full
+// 64B ring slot, so every ring reservation stays kSDMACopyAtomicPktSize. The
+// engine stalls this queue until *flag == value; retry_count 0xfff = forever.
+// Four consecutive lanes each write one b128, like WriteFusedPacket.
+__device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, uint32_t value,
+                                                uint32_t* outBasePtr) {
+  uint32_t dw[4] = {0, 0, 0, 0};
+  if (lane == 0) {
+    decltype(SDMA_PKT_POLL_REGMEM::HEADER_UNION) hdr;
+    hdr.DW_0_DATA = 0;
+    hdr.op = SDMA_OP_POLL_REGMEM;
+    hdr.mem_poll = 1;
+    hdr.func = 3;  // equal
+    dw[0] = hdr.DW_0_DATA;
+    dw[1] = (uint32_t)((uintptr_t)flag);
+    dw[2] = (uint32_t)((uintptr_t)flag >> 32);
+    dw[3] = value;
+  } else if (lane == 1) {
+    decltype(SDMA_PKT_POLL_REGMEM::DW5_UNION) d5;
+    d5.DW_5_DATA = 0;
+    d5.interval = RS_BCAST_POLL_INTERVAL;
+    d5.retry_count = 0xfff;
+    dw[0] = 0xffffffffu;  // mask: compare the whole dword
+    dw[1] = d5.DW_5_DATA;
+  }
+  const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
+  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
+}
+
 // Broadcast `v` from `srcLane` of this wave. ds_bpermute is lane-addressed;
 // srcLane must be < warpSize (64 on gfx950, 32 on gfx1250).
 template <typename T>
-__device__ __forceinline__ T broadcast_warp(T v, int srcLane) {
+__device__ __forceinline__ T BroadcastWarp(T v, int srcLane) {
   static_assert(sizeof(T) % sizeof(uint32_t) == 0, 
                         "T must be a multiple of uint32_t");
   union {
@@ -283,36 +319,14 @@ struct SdmaCollectiveHandle : mori::cco::ccoSdmaQueueDeviceHandle {
     return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
   }
 
-  // Multi-producer CAS reserve. Packets are always kSDMACopyAtomicPktSize and
-  // the ring is a multiple of that, so a reservation never straddles the wrap.
-  __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes) {
-    uint64_t cur_index;
-    long long retries = 0;
-
-    while (true) {
-      cur_index = __hip_atomic_load(cachedWptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      uint64_t new_index = cur_index + size_in_bytes;
-
-      if (CanWriteUpto(new_index)) {
-        if (__hip_atomic_compare_exchange_strong(cachedWptr, &cur_index, new_index,
-                                                 __ATOMIC_RELAXED, __ATOMIC_RELAXED,
-                                                 __HIP_MEMORY_SCOPE_AGENT)) {
-          break;
-        }
-      }
-      // Never return an unreserved index: fail loud rather than corrupt the queue.
-      if (++retries > mori::cco::CCO_SDMA_MAX_RETRIES) __builtin_trap();
-    }
-    return cur_index;
-  }
-
   // Sole-producer reservation: no CAS. Valid only when this queue has exactly
   // one producing thread for the lifetime of the reservation (e.g. one leader
   // lane per distinct queue). Claim-then-wait like cco ReserveSlot: fetch_add
   // first, then poll rptr if occupancy exceeds the ring.
   //
-  // Packets are always kSDMACopyAtomicPktSize and the ring is a multiple of that,
-  // so a reservation never straddles the wrap.
+  // Reservations are multiples of kSDMACopyAtomicPktSize and the ring is a
+  // multiple of that, so a multi-packet reservation may span the wrap but no
+  // single 64B packet straddles it: wrap each packet's offset separately.
   //
   // cachedHwReadIndex is by-value. The caller snapshots the handle once and
   // reuses it across packets so a refreshed rptr stays in the local copy;
@@ -338,68 +352,10 @@ struct SdmaCollectiveHandle : mori::cco::ccoSdmaQueueDeviceHandle {
   }
 };
 
-static_assert(sizeof(SdmaCollectiveHandle) == sizeof(mori::cco::ccoSdmaQueueDeviceHandle));
+static_assert(sizeof(SdmaCollectiveHandle) == sizeof(cco::ccoSdmaQueueDeviceHandle));
 
-// One warp broadcasts a single slice to every peer's destination slice,
-// trailing an ADD32(1) into peer signalPtrs[signalSlot]. The per-peer
-// destination pointer is supplied by the caller via dstOf(peer) -> uint8_t*
-// (warp-uniform at peer granularity), mirroring StartSdmaScatter's dstOf. Four
-// consecutive lanes write one fused 64B packet via WriteFusedPacket.
-// Multi-producer-safe: other slice-groups' last blocks may hit the same
-// per-peer queue concurrently, so this uses the CAS-based ReserveQueueSpace +
-// ordered submitPacket (NOT the single-producer CAS-free fast path). The leader
-// copies the handle (VGPR pointer fields for submitPacket) and writes
-// cachedHwReadIndex back if CanWriteUpto refreshed it. sub==0 of each peer group
-// reserves/rings; the whole warp must execute the barriers.
-template <class DstFn>
-inline __device__ void SdmaBroadcastSliceWarp(
-  mori::cco::ccoSdmaContext sdma,
-  const void* src, DstFn dstOf, size_t sliceBytes,
-                                              int myPe, int npes, int signalSlot, int qId) {
-  const uint32_t numSdmaQ = sdma.sdmaNumQueue;
-  constexpr int W = warpSize;
-  const int lane = static_cast<int>(threadIdx.x) % W;
-  const int nWork = npes << 2;
-
-  for (int i = lane; i < nWork; i += W) {
-    const int peer = i >> 2, sub = i & 3, leader = lane & ~3;
-    const bool active = peer != myPe;
-
-    uint64_t base = 0;
-    SdmaCollectiveHandle handle;
-    uint32_t* queueBuf = nullptr;
-    if (active && sub == 0) {
-      auto* shared = static_cast<SdmaCollectiveHandle*>(
-          *(sdma.deviceHandles + peer * numSdmaQ + qId));
-      handle = *shared;
-      const uint64_t hint = handle.cachedHwReadIndex;
-      base = handle.ReserveQueueSpace(kSDMACopyAtomicPktSize);  // CAS: multi-producer safe
-      if (handle.cachedHwReadIndex != hint) {
-        __hip_atomic_store(&shared->cachedHwReadIndex, handle.cachedHwReadIndex,
-                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      }
-      queueBuf = handle.queueBuf;
-    }
-    base = broadcast_warp(base, leader);
-    queueBuf = broadcast_warp(queueBuf, leader);
-
-    if (active) {
-      // Peer's destination slice, computed by the caller-supplied dstOf(peer).
-      uint8_t* dst = dstOf(peer);
-      auto* signal = sdma.peerSignalPtrs[peer] + signalSlot;
-      const uint64_t Xbase =
-          SdmaCollectiveHandle::WrapIntoRing(base) / sizeof(uint32_t);
-      WriteFusedPacket(sub, src, dst, sliceBytes, signal, queueBuf + Xbase);
-    }
-
-    mori::cco::ccoSdmaPublishStores();
-    __builtin_amdgcn_wave_barrier();
-
-    if (active && sub == 0) {
-      handle.submitPacket(base, base + kSDMACopyAtomicPktSize);
-    }
-  }
-  __syncwarp();
+inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceHandle **table) {
+  return reinterpret_cast<SdmaCollectiveHandle *>(*cco::impl::global(table));
 }
 
 // ---------------------------------------------------------------------------
@@ -466,20 +422,19 @@ __device__ __forceinline__ void StartSdmaScatter(
     uint32_t* queueBuf = nullptr;
     uint64_t hint0 = 0;
     if (active && sub == 0) {
-      shared = static_cast<SdmaCollectiveHandle*>(
-          *(sdma.deviceHandles + peer * numSdmaQ));
-      handle = *shared;
+      shared = GetSharedHandle(sdma.deviceHandles + peer * numSdmaQ);
+      handle = *cco::impl::global(shared);
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
     }
-    queueBuf = broadcast_warp(queueBuf, leader);
+    queueBuf = BroadcastWarp(queueBuf, leader);
 
     for (int s = 0; s < S; s++) {
       uint64_t pktBase = 0;
       if (active && sub == 0) {
         pktBase = handle.ReserveSingleProducer(kSDMACopyAtomicPktSize);
       }
-      pktBase = broadcast_warp(pktBase, leader);
+      pktBase = BroadcastWarp(pktBase, leader);
 
       if (active) {
         auto* srcp = srcOf(peer) + s * sliceBytes;
@@ -497,6 +452,73 @@ __device__ __forceinline__ void StartSdmaScatter(
       if (active && sub == 0) {
         handle.submitPacket(pktBase, pktBase + kSDMACopyAtomicPktSize);
       }
+    }
+
+    if (active && sub == 0 && handle.cachedHwReadIndex != hint0) {
+      __hip_atomic_store(&shared->cachedHwReadIndex, handle.cachedHwReadIndex,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+}
+
+// Writes one pre-posted broadcast into the two 64B ring slots starting at pktBase:
+// [POLL *flag == value][COPY src->dst + ADD32(1) into signal]. The copy reads src
+// only once its poll passes, so src need not be ready yet. Each slot wraps on its
+// own: the reservation may span the ring end, a 64B packet never does.
+__device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf, uint64_t pktBase,
+                                                    const void* src, const void* dst, size_t bytes,
+                                                    HSAuint64* signal, const uint32_t* flag,
+                                                    uint32_t value) {
+  WritePollPacket(sub, flag, value,
+                  queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
+  WriteFusedPacket(sub, src, dst, bytes, signal,
+                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopyAtomicPktSize) /
+                                  sizeof(uint32_t));
+}
+
+// Per peer queue 0: one reservation of nSlots*64B, filled by
+// writeFn(peer, sub, queueBuf, pktBase), then one publish and one doorbell.
+// Uses the same lane-to-peer mapping as StartSdmaScatter, so when called right
+// after it by the same block, each queue keeps a single producing lane and these
+// packets land behind that peer's scatter packets.
+template <class WriteFn>
+__device__ __forceinline__ void SdmaPostPerPeer(mori::cco::ccoSdmaContext sdma, int npes,
+                                                int myPe, int nSlots, WriteFn writeFn) {
+  constexpr int W = warpSize;
+  const int tid = static_cast<int>(threadIdx.x), B = static_cast<int>(blockDim.x);
+  const uint32_t numSdmaQ = sdma.sdmaNumQueue;
+  const int nWork = npes << 2, lane = tid % W;
+
+  for (int i = tid; i < nWork; i += B) {
+    const int peer = i >> 2, sub = i & 3, leader = lane & ~3;
+    const bool active = peer != myPe;
+
+    SdmaCollectiveHandle handle;
+    SdmaCollectiveHandle* shared = nullptr;
+    uint32_t* queueBuf = nullptr;
+    uint64_t hint0 = 0;
+    if (active && sub == 0) {
+      shared = GetSharedHandle(sdma.deviceHandles + peer * numSdmaQ);
+      handle = *cco::impl::global(shared);
+      hint0 = handle.cachedHwReadIndex;
+      queueBuf = handle.queueBuf;
+    }
+    queueBuf = BroadcastWarp(queueBuf, leader);
+
+    const uint64_t bytes = static_cast<uint64_t>(nSlots) * kSDMACopyAtomicPktSize;
+    uint64_t pktBase = 0;
+    if (active && sub == 0) {
+      pktBase = handle.ReserveSingleProducer(bytes);
+    }
+    pktBase = BroadcastWarp(pktBase, leader);
+
+    if (active) writeFn(peer, sub, queueBuf, pktBase);
+
+    mori::cco::ccoSdmaPublishStores();
+    __builtin_amdgcn_wave_barrier();
+
+    if (active && sub == 0) {
+      handle.submitPacket(pktBase, pktBase + bytes);
     }
 
     if (active && sub == 0 && handle.cachedHwReadIndex != hint0) {
