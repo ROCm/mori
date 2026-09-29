@@ -525,6 +525,12 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     const char* src = static_cast<const char*>(plan.src.host_ptr);
     char* dst = static_cast<char*>(plan.dst.host_ptr);
     const bool host_is_src = kind == hipMemcpyHostToDevice;
+    // Plan() bounds-checked every segment against its endpoint, so when one
+    // registration covers the whole host endpoint its alias base serves every
+    // segment: one locked lookup per plan instead of one per segment.
+    const TransferRef& host_ref = host_is_src ? plan.src : plan.dst;
+    char* const alias_base =
+        static_cast<char*>(HostRegionDeviceAddress(host_ref.host_ptr, host_ref.size, device_id));
 
     std::vector<DeviceGatherFragment> fragments;
     fragments.reserve(plan.sizes.size());
@@ -537,7 +543,10 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       // A kernel cannot dereference plain mmap memory — it faults the GPU — so
       // an uncovered host side disqualifies the whole plan. Nor can it use the
       // host address: only the host side is replaced by its per-device alias.
-      void* const host_alias = HostRegionDeviceAddress(host_side, plan.sizes[i], device_id);
+      void* const host_alias =
+          alias_base != nullptr
+              ? alias_base + (host_is_src ? plan.src_offsets[i] : plan.dst_offsets[i])
+              : HostRegionDeviceAddress(host_side, plan.sizes[i], device_id);
       if (host_alias == nullptr) {
         eligible = false;
         break;
