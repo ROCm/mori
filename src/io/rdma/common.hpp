@@ -198,8 +198,7 @@ class SubmissionLedger {
   // starting there would hand out 0 -- kInvalidRecordId -- for the first record,
   // making every first submission on this ledger look refused. Skip it; that id
   // is unused in that configuration anyway.
-  explicit SubmissionLedger(uint32_t notifPerQp)
-      : nextId_{std::max<uint64_t>(notifPerQp, 1)} {}
+  explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{std::max<uint64_t>(notifPerQp, 1)} {}
 
   // RAII handle for the window between admission and ibv_post_send. The record
   // exists in Posting state for as long as the guard is alive, which is what

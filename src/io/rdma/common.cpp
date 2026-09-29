@@ -425,8 +425,9 @@ static void OrphanPendingWrsOnOtherEps(const EpPairVec& eps, int failedEpId, con
         "(wrCount={}, mergedReq={}) to orphaned and marking degraded",
         reason, failedEpId, otherEpId, epWrsSinceSignal[otherEpId], epMergedSinceSignal[otherEpId]);
     if (eps[otherEpId].ledger) {
-      if (!eps[otherEpId].ledger->InsertOrphaned(epWrsSinceSignal[otherEpId], callbackMeta,
-                                                 static_cast<int>(epMergedSinceSignal[otherEpId]))) {
+      if (!eps[otherEpId].ledger->InsertOrphaned(
+              epWrsSinceSignal[otherEpId], callbackMeta,
+              static_cast<int>(epMergedSinceSignal[otherEpId]))) {
         // A fatal event already closed this sibling. FailAll() cannot have
         // released these WRs -- they were never in its ledger -- so the
         // reservation is ours to give back, or the depth is lost for good.

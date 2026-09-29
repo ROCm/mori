@@ -429,7 +429,9 @@ void CaseSubmissionLedgerPostCommitRace() {
       // fine, the point is that FailAll() always returns.
       ledger.FailAll(StatusCode::ERR_RDMA_OP, "qp died", &sqDepth);
     });
-    { auto guard = ledger.InsertForPost(2, meta, 1); }
+    {
+      auto guard = ledger.InsertForPost(2, meta, 1);
+    }
     failer.join();
     Require(ledger.Closed(), "FailAll must complete once the guard is destroyed");
   }
