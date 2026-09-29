@@ -239,7 +239,23 @@ Use paired feature results and observed round spread before changing defaults.
 
 ## Measured results
 
-The completed target run contains 28 standalone jobs (98 implementation
+### Coverage of this retest
+
+This batch completed the primary workload matrices and selected optimization
+comparisons. The full target test plan below remains partially covered.
+The 166 completed jobs count this batch; each planned row and metric still
+requires matching evidence before it can be marked complete.
+
+| Area | Completed in this batch | Still unmeasured |
+|---|---|---|
+| L1/K1/A/D | Both standalone targets' main M ladder, both collective mode matrices, and summaries derived from those points | Tile/admission boundary points are tracked separately in B |
+| C — short tails | C1 M=11264/13312, baseline versus chunk_bands=2 | Remaining C1 band/M combinations and all C2 short-tail combinations |
+| P/B — padding and contracts | Both targets' five P points and B5 | B1–B4 and B6–B7 boundary/invalid-input checks |
+| W — workspace | Layout comparisons, tail guards and separate physical window allocation measurements | Torch peaks, allocation counts, full operator initialization and mixed-M lifecycle checks |
+| F/Q — communication and quantization | Random-input mathematical/actual-wire checks; grouped quantization whole-call timings | Special input families, invalid combinations and Q phase timings |
+| T/S — diagnostics and specialization | Six T grid-remainder points reuse existing K1 timings/reference checks | Remaining diagnostic sweeps, profiler metrics and specialization/graph stress checks |
+
+The completed retest batch contains 28 standalone jobs (98 implementation
 configurations), 102 collective configurations, 28 paired feature jobs and
 8 allocation-only layout measurements. All final jobs completed successfully.
 The supervised runs contain 2,913 GPU-ownership samples, with no foreign GPU
@@ -675,22 +691,27 @@ Both target quantizations require swapped operands. Do not benchmark the unsuppo
 
 ##### Grid remainder: G1/G2, fixed N/K, vary M
 
+The M=1024/2048/4096 cold timings and numerical checks below are reused from
+K1, with the same N128/N256 implementations and target dimensions. They are
+references to existing cases, not six additional measurements. The tile/remainder
+analysis and other M values have not been recorded for this study.
+
 | Target | M | Tiles/remainder | N128 µs | N256 µs | Reference |
 |---|---|---|---|---|---|
-| G1 | 1024 | 待测 | 待测 | 待测 | 待测 |
+| G1 | 1024 | 待测 | 25.16 (K1) | 27.50 (K1) | PASS in K1; relL2 ≤0.00166 |
 | G1 | 1280 | 待测 | 待测 | 待测 | 待测 |
 | G1 | 1536 | 待测 | 待测 | 待测 | 待测 |
 | G1 | 1792 | 待测 | 待测 | 待测 | 待测 |
-| G1 | 2048 | 待测 | 待测 | 待测 | 待测 |
+| G1 | 2048 | 待测 | 44.62 (K1) | 29.67 (K1) | PASS in K1; relL2 ≤0.00166 |
 | G1 | 2304 | 待测 | 待测 | 待测 | 待测 |
-| G1 | 4096 | 待测 | 待测 | 待测 | 待测 |
-| G2 | 1024 | 待测 | 待测 | 待测 | 待测 |
+| G1 | 4096 | 待测 | 66.30 (K1) | 53.50 (K1) | PASS in K1; relL2 ≤0.00166 |
+| G2 | 1024 | 待测 | 20.64 (K1) | 21.75 (K1) | PASS in K1; relL2 ≤0.00166 |
 | G2 | 1280 | 待测 | 待测 | 待测 | 待测 |
 | G2 | 1536 | 待测 | 待测 | 待测 | 待测 |
 | G2 | 1792 | 待测 | 待测 | 待测 | 待测 |
-| G2 | 2048 | 待测 | 待测 | 待测 | 待测 |
+| G2 | 2048 | 待测 | 35.51 (K1) | 25.10 (K1) | PASS in K1; relL2 ≤0.00166 |
 | G2 | 2304 | 待测 | 待测 | 待测 | 待测 |
-| G2 | 4096 | 待测 | 待测 | 待测 | 待测 |
+| G2 | 4096 | 待测 | 64.56 (K1) | 44.77 (K1) | PASS in K1; relL2 ≤0.00166 |
 
 ##### Aligned chunks: C1/C2, M=16384, target BLOCK_M
 
@@ -1077,15 +1098,18 @@ library merely because it is outside this document's optimization scope.
 
 Only C1/C2/G1/G2 are optimization targets. Reuse existing relevant correctness
 checks without adding model layers or TP variants to the performance matrix.
-The tables are an inventory for later work, not a request to run sweeps now.
+The state column below records this retest batch. Completed primary matrices
+do not imply completion of the boundary, lifecycle or diagnostic plans.
 
 | Tier | Trigger | Target coverage | State |
 |---|---|---|---|
-| Core correctness | Relevant code/API changes | References, packing, B boundaries, S caching, W serial lifecycle and F wire checks | 待测 |
-| Representative performance | Kernel/dispatch/transport changes | G1/G2 tile boundaries; C1/C2 ragged M, awkward chunks and large prefill | 待测 |
-| Target performance matrix | Before changing defaults or a target-specific audit | L1/K1 and A; only the four registry entries | 待测 |
-| Targeted diagnostics | Related mapping/publish/layout changes | C/P/W/F/Q/T at fixed target N/K/TP | 待测 |
+| Core correctness | Relevant code/API changes | References, packing, B boundaries, S caching, W serial lifecycle and F wire checks | Partial — measured references/packing, P and random-input F passed; remaining B/S and full W lifecycle pending |
+| Representative performance | Kernel/dispatch/transport changes | G1/G2 tile boundaries; C1/C2 ragged M, awkward chunks and large prefill | Partial — main M ladder, P and two C1 tail points measured; tile boundaries and C2 tails pending |
+| Target performance matrix | Before changing defaults or a target-specific audit | L1/K1 and A; only the four registry entries | Complete — L1/K1 and A |
+| Targeted diagnostics | Related mapping/publish/layout changes | C/P/W/F/Q/T at fixed target N/K/TP | Partial — selected C/P/W/F/Q comparisons measured; T studies pending beyond the reused K1 points |
 | Deferred work | Separate explicit request | Decode and model evaluation | Deferred |
+
+Standing checklist for future changes (separate from the completed-batch states above):
 
 - [ ] Record the target ID, revisions, scope and effective configuration.
 - [ ] Validate the corresponding independent mathematical/wire reference.
@@ -1095,7 +1119,7 @@ The tables are an inventory for later work, not a request to run sweeps now.
 - [ ] Preserve target historical results; fill `待测` only from matching measurements.
 - [ ] Do not promote a target-specific result to a general all-layer heuristic.
 
-Future measurement entry points (reference only):
+Measurement entry points for completed work and future checks:
 
 | Target | Entry point and fixed selection |
 |---|---|
