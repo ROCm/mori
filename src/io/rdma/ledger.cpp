@@ -64,7 +64,11 @@ void SubmissionLedger::CommitPost(uint64_t recordId, bool posted) {
     // A missing record means the CQ poller already reaped this completion, or
     // it is simply gone; either way only the in-flight count is left to settle.
     --posting_;
-    if (posting_ > 0) return;
+    // Only FailAll() waits here, and it sets closed_ under this same lock before
+    // waiting. Seeing an open ledger therefore means no waiter exists and none
+    // can appear without re-reading posting_ under the lock, so the healthy path
+    // never pays for a broadcast.
+    if (posting_ > 0 || !closed_) return;
   }
   postingDrained_.notify_all();
 }
