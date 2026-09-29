@@ -83,3 +83,30 @@ GPU registration and the transfer path are unchanged.
 This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
 It does not migrate existing objects or replicate shared keys across sockets.
+
+## Measured effect
+
+One MI355X node (two sockets, eight GPUs), DeepSeek-V4-Pro at TP8, SGLang with
+the UMBP linker and an agentx replay. Split tier (`UMBP_DRAM_NUMA_NODE=0,1`)
+against the single-buffer tier:
+
+| Concurrency | DRAM tier | Window | Runs (single / split) | Total token throughput | TTFT p50 |
+|---|---|---|---|---|---|
+| 16 | 512 GiB, 4K pages | 900 s | 3 / 5 | within 1% | no consistent difference |
+| 128 | 740 GB, hugetlb, STRICT | 3600 s | 2 / 2 | +0.2% | -0.4% |
+
+Placement does not change serving throughput at these points. At concurrency 16
+tier reads overlap compute. At 128 the load wait that reaches the critical path
+is about 1.3% of forward time with or without the split. A hugetlb tier
+reserved to capacity already fills node 0 and then node 1.
+
+The split does shorten startup. A standalone server with a 740 GB tier is ready
+in 64-81 s instead of 274 s with 4K pages, and in 10-13 s instead of 36 s with
+hugetlb. The single-buffer tier is prefaulted by one thread, which places the
+whole tier on that thread's node, and registering it for GPU access then takes
+several times longer. The split prefaults both halves at once, each on its own
+node.
+
+Replicating shared keys on both nodes was measured at concurrency 128 and not
+adopted. Throughput fell by 10.9%: storing each shared key twice raised
+recomputed prefill by 25%, and exposed load wait rose by 30%.
