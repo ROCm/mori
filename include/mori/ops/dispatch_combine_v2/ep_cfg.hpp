@@ -219,6 +219,52 @@ static_assert(detail::EpArgsOffsetsAscend(),
               "MORI_EP_ARGS_FIELDS is not in EpArgs declaration order -- the binding would "
               "write each argument into the wrong slot");
 
+// The push-send combine's (ep_combine_push) kernel argument: EpArgs, then what only that kernel
+// reads. Not more EpArgs fields: EpArgs is every other kernel's argument too, and growing it
+// moves their implicit kernel arguments, a different binary for an unchanged kernel.
+struct EpPushArgs {
+  EpArgs base;
+  // uint8[worldSize*maxRecv*EpCombinePushSlotBytes]: the landing zone, indexed by (sender pe,
+  // sender's recv slot).
+  unsigned long long offCombPush = 0;
+  // A counter line per source rank, the epoch line, then the per-block report and release slots.
+  unsigned long long offCombPushSig = 0;
+  // Kernel trace buffers, read only when the TU is compiled with -DENABLE_PROFILER
+  // (mori/core/profiler/kernel_profiler.hpp). [warps * 2 * events] timestamps/meta
+  // and [warps] ring offsets; the per-warp event count is the kernel's constant.
+  long long* profTimeBuf = nullptr;
+  unsigned int* profTimeOffset = nullptr;
+};
+
+// The binding lays base's fields out flat and these after them, so the first must sit at
+// sizeof(EpArgs) -- where a flat struct puts the next 8-byte field -- and the rest ascend.
+#define MORI_EP_PUSH_ARGS_FIELDS(X) \
+  X(offCombPush, "u64")             \
+  X(offCombPushSig, "u64")          \
+  X(profTimeBuf, "p")               \
+  X(profTimeOffset, "p")
+#define MORI_EP_PUSH_ARGS_SCHEMA \
+  MORI_EP_ARGS_SCHEMA MORI_EP_PUSH_ARGS_FIELDS(MORI_EP_ARGS_SCHEMA_ENTRY)
+
+namespace detail {
+
+#define MORI_EP_PUSH_ARGS_OFFSET(name, tag) offsetof(::mori::ops::v2::EpPushArgs, name),
+inline constexpr size_t kEpPushArgsOffsets[] = {MORI_EP_PUSH_ARGS_FIELDS(MORI_EP_PUSH_ARGS_OFFSET)};
+#undef MORI_EP_PUSH_ARGS_OFFSET
+
+constexpr bool EpPushArgsLaidOutFlat() {
+  if (offsetof(EpPushArgs, base) != 0 || kEpPushArgsOffsets[0] != sizeof(EpArgs)) return false;
+  for (size_t i = 1; i < sizeof(kEpPushArgsOffsets) / sizeof(kEpPushArgsOffsets[0]); ++i)
+    if (kEpPushArgsOffsets[i] <= kEpPushArgsOffsets[i - 1]) return false;
+  return true;
+}
+
+}  // namespace detail
+
+static_assert(detail::EpPushArgsLaidOutFlat(),
+              "EpPushArgs is not EpArgs followed by MORI_EP_PUSH_ARGS_FIELDS in order -- the "
+              "binding would write each push argument into the wrong slot");
+
 // ---------------------------------------------------------------------------
 // Cfg. Shared by dispatch and combine: they run over the same arena and the
 // same shape, and only the launch geometry differs. Two Specs, one Cfg.
@@ -336,6 +382,27 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 }
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
+
+// Push-send combine (ep_combine_push). Built with MORI_PUSH_QUANT=0 its wire carries a
+// quarter of the bf16 row, verbatim from the front of the row -- an fp4 token's weight;
+// the quantized wire (the default) is sized in the kernel. hip_backend.py mirrors both
+// to size the comb_push region.
+constexpr int EpCombinePushWireBytes(const EpCfg& c) { return EpTokenBytes(c) / 4; }
+// Slot stride on the destination. 128 B because a TDM transfer's rows start on one.
+constexpr int EpCombinePushSlotAlign = 128;
+constexpr int EpCombinePushSlotBytes(const EpCfg& c) {
+  return (EpCombinePushWireBytes(c) + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign *
+         EpCombinePushSlotAlign;
+}
+// Indexed by (sender pe, the SENDER's recv slot), so a run of consecutive recv
+// slots on the sender is one contiguous range on the destination. The destination
+// finds its copies through its own dispDestTokIdMap, whose flat value is
+// pe * maxRecv + slot -- the same pair.
+// Bytes of one line of the comb_push_sig region: a counter per source rank, then the epoch.
+constexpr int EpCombinePushSigLine = 64;
+constexpr long long EpCombinePushSlots(const EpCfg& c) {
+  return (long long)c.worldSize * EpMaxRecv(c);
+}
 
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part

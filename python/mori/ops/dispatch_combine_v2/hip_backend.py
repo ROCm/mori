@@ -51,6 +51,7 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import os
+import re
 
 import torch
 
@@ -76,6 +77,8 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    "combPush": "comb_push",  # EpPushArgs only: the push-send combine's arena
+    "combPushSig": "comb_push_sig",  # likewise
 }
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
@@ -144,6 +147,102 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
+
+# Must match EpCombinePushSlotAlign in ep_cfg.hpp.
+_PUSH_SLOT_ALIGN = 128
+# Must match EpCombinePushSigLine in ep_cfg.hpp: a counter line per source rank, then the epoch.
+_PUSH_SIG_LINE = 64
+# Must match kEpPushSigBlocks in ep_intranode_1250x.hpp: report slots per source rank, one per
+# combine block, after the lines above. _XDB_FLAG_SLOTS caps block_num at the same 256.
+_PUSH_SIG_BLOCKS = 256
+# Must match kEpPushSigSlotDw * 4: each report slot has its own cache line, and so does each of
+# the _PUSH_SIG_BLOCKS release lines that follow the slots.
+_PUSH_SIG_SLOT_B = 128
+# Must match kEpPushProfEvents in ep_intranode_1250x.hpp: each warp's trace ring.
+PUSH_PROF_EVENTS = 256
+# Must match the MORI_PUSH_DEFAULTS block in ep_intranode_1250x.hpp: what each of these
+# knobs compiles to when MORI_JIT_EXTRA_FLAGS leaves it unset.
+_PUSH_DEFAULTS = {
+    "TDMCPOL": 0x18,
+    "SIGNAL": 3,
+    "QUANT": 1,
+    "QLOAD": 1,
+    "RTDM": 1,
+    "RPK": 1,
+    "RSPLIT": 2,
+    "SPEC": 2,
+    "SPREAD": 1,
+    "SPECSTRIDE": 1,
+    "SPREADX": 1,
+    "RPRE": 1,
+    "POLLFIT": 1,
+    "GOFIRST": 1,
+    "GOFAST": 1,
+    "QCVT": 2,
+    "QLEAN": 1,
+    "QMX": 1,
+    "QTDM": 1,
+    "RSKIP": 1,
+}
+
+
+def _push_flag(flags: str, name: str):
+    m = re.search(rf"(?:^|\s)-D\s*MORI_PUSH_{name}(?:=(\S*))?(?:\s|$)", flags)
+    if m is None:
+        return None
+    return int(m.group(1) or "1", 0)
+
+
+def push_knob(name: str) -> int:
+    """What MORI_PUSH_<name> compiles to in the push-send kernel, for a knob whose off
+    value is 0: its -D in MORI_JIT_EXTRA_FLAGS if there is one, else _PUSH_DEFAULTS
+    unless the flags hold -DMORI_PUSH_DEFAULTS=0, else 0."""
+    flags = os.environ.get("MORI_JIT_EXTRA_FLAGS", "")
+    v = _push_flag(flags, name)
+    if v is not None:
+        return v
+    if _push_flag(flags, "DEFAULTS") == 0:
+        return 0
+    return _PUSH_DEFAULTS.get(name, 0)
+
+
+def push_quant_group() -> int:
+    """Elements per e8m0 scale byte of the push-send kernel's quantized wire, 0 when it
+    does not quantize. Must match kQGroup in ep_intranode_1250x.hpp: MORI_PUSH_QUANT=1
+    is 32, =2 is 128. The knob reaches the JIT through MORI_JIT_EXTRA_FLAGS, and the slot
+    stride has to follow it."""
+    return {1: 32, 2: 128}.get(push_knob("QUANT"), 0)
+
+
+def push_wire_nbytes(cfg) -> int:
+    """Bytes per token the push-send combine moves. Unquantized: EpCombinePushWireBytes,
+    a quarter of the bf16 row -- an fp4 token's weight. MORI_PUSH_QUANT: e2m1 two to a
+    byte, then one e8m0 byte per push_quant_group() elements, padded to a 128 B TDM row.
+    """
+    group = push_quant_group()
+    if group:
+        h = cfg.hidden_dim
+        wire = h // 2 + h // group
+        return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
+    return cfg.combine_token_nbytes // 4
+
+
+def push_slot_bytes(cfg) -> int:
+    """Slot stride of the comb_push region: EpCombinePushSlotBytes."""
+    wire = push_wire_nbytes(cfg)
+    return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
+
+
+def profiler_enabled() -> bool:
+    """The kernels trace only when their TU is built with -DENABLE_PROFILER, and
+    that flag reaches the JIT through MORI_JIT_EXTRA_FLAGS (it is in the cache key).
+    The host allocates the trace buffers under the same condition, and a traced
+    kernel with no buffer writes through a null pointer -- so this must match every
+    spelling the compiler accepts, "-D ENABLE_PROFILER" included."""
+    flags = os.environ.get("MORI_JIT_EXTRA_FLAGS", "")
+    return (
+        re.search(r"(?:^|\s)-D\s*ENABLE_PROFILER(?:=\S*)?(?:\s|$)", flags) is not None
+    )
 
 
 class TokOffExt:
@@ -362,6 +461,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     "per-block xdb epoch slots the entry barrier owns"
                 )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
+        # Trace rings of kernels built with -DENABLE_PROFILER, one per combine warp:
+        # PUSH_PROF_EVENTS [ts, meta] pairs plus a write offset that persists across
+        # launches, so a reader zeroes both before the launch it wants. None binds as 0.
+        self.prof_time_buf = None
+        self.prof_time_offset = None
+        if profiler_enabled():
+            max_warps = max(b * w for b, w in self._combine_specs)
+            self.prof_time_buf = torch.zeros(
+                max_warps * 2 * PUSH_PROF_EVENTS, dtype=torch.int64, device=dev
+            )
+            self.prof_time_offset = torch.zeros(max_warps, **i32)
 
     # -- internode -------------------------------------------------------
     #
@@ -613,6 +723,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
             )
             regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
+        if cfg.is_scatter:
+            # landing[srcPe][recvSlot]: a sender writes only its own column, at the
+            # recv slot it got the token in, so no slot is contended.
+            regions.append(("comb_push", cfg.world_size * cap * push_slot_bytes(cfg)))
+            regions.append(
+                (
+                    "comb_push_sig",
+                    (cfg.world_size + 1) * _PUSH_SIG_LINE
+                    + cfg.world_size * _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B
+                    + _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B,
+                )
+            )
         return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -627,7 +749,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         if cfg.is_scatter:
-            bad.append("combine_mode='scatter' (gather only)")
+            # scatter = the push-send combine: TDM kernel only, bf16 rows in, and its
+            # wire row must itself be whole 128 B TDM rows.
+            if not self._is1250:
+                bad.append("combine_mode='scatter' (push-send combine is gfx125x only)")
+            if cfg.combine_dtype != torch.bfloat16:
+                bad.append(
+                    f"combine_mode='scatter' with combine dtype {cfg.combine_dtype} (bf16 only)"
+                )
+            elif push_wire_nbytes(cfg) % _PUSH_SLOT_ALIGN:
+                bad.append(
+                    f"combine_mode='scatter' with hidden_dim={cfg.hidden_dim}: "
+                    f"a {push_wire_nbytes(cfg)} B wire row is not whole 128 B TDM rows"
+                )
         if cfg.quant_type != "none":
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
@@ -1177,11 +1311,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
+        plan_cls = cb.EpCombinePushPlan if cfg.is_scatter else cb.EpCombinePlan
+        wrap = self._wrap_combine_push if cfg.is_scatter else self._wrap_combine
         for b, w in self._combine_specs:
-            plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
+            plan = plan_cls(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
-            combine[(b, w)] = self._wrap_combine(plan)
+            combine[(b, w)] = wrap(plan)
 
         return KernelSet(
             dispatch=dispatch,
@@ -1193,7 +1329,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # These are plain local buffers, not symmetric regions: the kernels
             # do not reset them, the op must.
             self_resets_counters=False,
-            capabilities=frozenset({"gather", "scales"}),
+            capabilities=frozenset(
+                {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
+            ),
         )
 
     def _close_backend(self):
@@ -1353,3 +1491,37 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
 
         return run
+
+    def _wrap_combine_push(self, plan):
+        """Push-send combine: each rank writes its post-expert rows, quantized, into the
+        owners' push_landing(), and each owner reduces what landed for its own tokens into
+        combine_out (MORI_PUSH_SIGNAL=3, the default build; with it off the kernel only
+        sends). want_weights is accepted and ignored: the reduce folds no weights."""
+
+        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
+            plan.launch(
+                stream=torch.cuda.current_stream().cuda_stream,
+                inp_token_buf=input,
+                out_token_buf=self.combine_out,
+                disp_dest_tok_id_map=dest_map,
+                total_recv_token_num=total_recv,
+                num_tokens=num_tokens,
+                prof_time_buf=self.prof_time_buf,
+                prof_time_offset=self.prof_time_offset,
+            )
+
+        return run
+
+    def push_landing(self):
+        """What the push-send combine delivered to this rank: (world, recv_cap,
+        slot_bytes) uint8, [srcPe][srcRecvSlot] -> the first push_wire_nbytes of
+        the post-expert row srcPe held in that recv slot."""
+        view = self._views.get("push_landing")
+        if view is None:
+            view = from_gpu_ptr(
+                self.arena.local_ptr("comb_push"),
+                (self.cfg.world_size, self._recv_cap, push_slot_bytes(self.cfg)),
+                torch.uint8,
+            )
+            self._views["push_landing"] = view
+        return view

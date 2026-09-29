@@ -256,8 +256,19 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
+            # hip's scatter is the push-send combine, which reads its rows from
+            # out_tok exactly as gather does; FlyDSL's scatter does not.
+            push_send = (
+                self.combine_mode == "scatter"
+                and (
+                    self.kernel_backend
+                    or os.environ.get("MORI_V2_KERNEL_BACKEND")
+                    or _default_backend()
+                )
+                == "hip"
+            )
             if (
-                self.combine_mode != "gather"
+                (self.combine_mode != "gather" and not push_send)
                 or self.quant_type != "none"
                 or self.enable_std_moe
             ):

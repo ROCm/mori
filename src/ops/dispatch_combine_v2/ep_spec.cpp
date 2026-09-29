@@ -142,7 +142,7 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
 // (--offload-arch), so host and device cannot disagree, and the choice is in the
 // rendered text and therefore in the cache key.
 std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
-                           const char* gfx1250Body) {
+                           const char* gfx1250Body, const char* argsType = "EpArgs") {
   const bool is1250 = EpArchIs1250();
   const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
                               : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
@@ -177,7 +177,7 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
          EpDTypeName(cfg.dtype) +
          ";\n"
          "extern \"C\" __global__ void __launch_bounds__(EpBlockThreads(kCfg))\n" +
-         entry + "(EpArgs args) { " + body + "<kCfg, TokT>(args); }\n";
+         entry + "(" + argsType + " args) { " + body + "<kCfg, TokT>(args); }\n";
 }
 
 const std::vector<std::string>& EpSourceDeps() {
@@ -190,6 +190,9 @@ const std::vector<std::string>& EpSourceDeps() {
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "combine"); }
+std::string EpCombinePushSpec::EntryName(const Cfg& cfg) {
+  return EpEntryName(cfg, "combine_push");
+}
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
   return RenderEpSource(cfg, EntryName(cfg), "EpDispatchBody", "EpDispatch1250xBody");
@@ -199,8 +202,18 @@ std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }
 
+std::string EpCombinePushSpec::RenderSource(const Cfg& cfg) {
+  if (!EpArchIs1250()) {
+    throw std::runtime_error(
+        "mori v2 ep: the push-send combine is gfx125x only (it moves every token through TDM)");
+  }
+  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xPushSendBody",
+                        "EpPushArgs");
+}
+
 const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }
 const std::vector<std::string>& EpCombineSpec::SourceDeps() { return EpSourceDeps(); }
+const std::vector<std::string>& EpCombinePushSpec::SourceDeps() { return EpSourceDeps(); }
 
 mori::jit::v2::LaunchGeometry EpDispatchSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
@@ -220,6 +233,16 @@ mori::jit::v2::LaunchGeometry EpCombineSpec::Geometry(const Cfg& cfg) {
   // paths size their tiles against the whole LDS budget at runtime.
   g.sharedBytes = EpArchIs1250() ? static_cast<unsigned>(EpCombine1250xLdsBudget)
                                  : static_cast<unsigned>(EpCombineSharedBytes(cfg));
+  return g;
+}
+
+mori::jit::v2::LaunchGeometry EpCombinePushSpec::Geometry(const Cfg& cfg) {
+  mori::jit::v2::LaunchGeometry g;
+  g.gridX = static_cast<unsigned>(cfg.blockNum);
+  g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
+  // The whole budget: it is split evenly into one token tile per warp, and the
+  // tile's capacity is what bounds how many tokens a warp sends in one round.
+  g.sharedBytes = static_cast<unsigned>(EpCombine1250xLdsBudget);
   return g;
 }
 
@@ -269,3 +292,7 @@ MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromF
 MORI_JIT_DEFINE_PLAN(ep_combine, mori::ops::v2::EpCombineSpec, EpCombineFromFields,
                      mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)
+
+MORI_JIT_DEFINE_PLAN(ep_combine_push, mori::ops::v2::EpCombinePushSpec, EpCombineFromFields,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpPushArgs, MORI_EP_PUSH_ARGS_SCHEMA)
