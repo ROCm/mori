@@ -4,9 +4,10 @@ GEMM + all-reduce optimization for `wo_b`, and standalone MXFP8 GEMM optimizatio
 for the two Flash TP4 attention projections below. The target list is fixed.
 General API support and earlier broad surveys do not expand this work's scope.
 
-**Document preparation only:** result cells remain `待测`. No benchmarks are
-launched by this edit. GEMV/decode, model-server/end-to-end evaluation and model
-quality are deferred. Other layers and other TP configurations are outside the
+**2026-09-29 operator retest on `v2-015`:** measured cells below use this run's
+results; `待测` still means unmeasured. GEMV/decode, model-server/end-to-end
+evaluation and model quality are deferred. Other layers and other TP
+configurations are outside the
 current optimization and test plan.
 
 ## Optimization targets
@@ -25,7 +26,7 @@ G1/G2 run on one GPU per invocation; TP4 identifies the model's weight shard.
 - [API and constraints](#api-and-constraints)
 - [Validation protocol](#validation-protocol)
 - [Current decisions](#current-decisions)
-- [Pending target matrices](#measured-results)
+- [Target measurement matrices](#measured-results)
 - [Target historical records](#historical-records)
 - [Regression checklist](#regression-checklist)
 
@@ -149,7 +150,7 @@ The scatter prototype reads completed BF16 GEMM tiles and quantizes one row and
 | Scope | Timed work | Required reference / comparison |
 |---|---|---|
 | GEMM kernel | Prequantized, prepacked operands; state physical M explicitly | Independent dequantized FP32 product |
-| Linear operator | Activation quantization, padding, dispatch and multiply | Independently validated conversion/packing plus product reference |
+| Linear operator | Activation quantization, padding and multiply on the resolved GPU route | Independently validated conversion/packing plus product reference |
 | GEMM + collective | Stated compute and communication phases | Per-rank partial reference plus independent ordered communication reference |
 | FP8 communication | Exact scatter/gather choice and scale grouping | Mathematical error and actual payload+scale wire reference reported separately |
 | Workspace/lifecycle | Initialization, allocations, steady-state calls and release | Output correctness across reuse and actual memory accounting |
@@ -175,19 +176,19 @@ is measured once per compute configuration; varying unused gather flags is not
 a separate communication test. The shared FP8 rows of the old `fused-fp8` and
 `fused-wire` sweeps belong to one canonical matrix below.
 
-| Record field | Value for the next measurement |
+| Record field | v2-015 measurement record |
 |---|---|
-| MORI / comparator revisions and any compatibility patch | 待测 |
-| GPU architecture, count, clocks and background activity | 待测 |
-| Torch / HIP / FlyDSL / compiler / FFI versions | 待测 |
-| Logical M, physical M, N, K, TP, operand and wire dtypes | 待测 |
-| GEMM tile, chunks, padding, workspace and transport | 待测 |
-| Scope, graph calls, warmup, replays and independent rounds | 待测 |
-| Weight ring sizes and every rotated weight representation | 待测 |
-| Reference definition, tolerances and numerical results | 待测 |
-| Per-rank times, paired round medians, spread / confidence interval | 待测 |
-| Window bytes, Torch allocation peak and external allocation accounting | 待测 |
-| Exact command, raw log/result paths and final outcome | 待测 |
+| MORI / comparator revisions and any compatibility patch | MORI `fd35a5ec79d8`; SGLang operator source `e29ebcd051`; optional `out=` adapter affects only the deferred GEMV path |
+| GPU architecture, count, clocks and background activity | `crsuse2-m2m-v2-015`, 8 × MI355X / gfx950; default clocks, no locking; idle preflight (~0.28 GiB/card); GPU process ownership sampled every 2 seconds; no foreign process in the published run; default clocks |
+| Torch / HIP / FlyDSL / compiler / FFI versions | Torch 2.11.0+rocm7.2 / ROCm 7.2.4 / FlyDSL 0.2.4; exact HIP, compiler, Triton and FFI versions in `environment.json` |
+| Logical M, physical M, N, K, TP, operand and wire dtypes | Four-target registry and row keys below; L1/K1 M is already aligned; P states logical and physical M |
+| GEMM tile, chunks, padding, workspace and transport | Per-case JSON and exact argv; SDMA uses one queue; public dispatch/allocation defaults unchanged |
+| Scope, graph calls, warmup, replays and independent rounds | 4 warmup calls before each graph; L1/K1: hot 32 calls, cold 39 calls, 21 replays, 3 alternating rounds; A: 8 calls × 21 replays × 3 rounds; feature pairs: 8 calls × 21 replays × 3 rounds (short tails: 5) |
+| Weight ring sizes and every rotated weight representation | L1/K1: 39 copies, 390 MiB of FP8 weights; SG also rotates its 780 MiB BF16 copy (1170 MiB total). A/features reuse one weight (hot) |
+| Reference definition, tolerances and numerical results | Independent dequantized FP32 products; L1 also checks activation bytes/scales and changed inputs. MORI GEMM relL2 ≤0.0024, SG ≤0.003; BF16 collective <0.003; A random FP8 uses 0.005–0.04; FP8 features <0.045; wire checks separate |
+| Per-rank times, paired round medians, spread / confidence interval | L1/K1: median of 3 round medians. A/features: median across round max-rank medians. All rank/round values retained; feature variants alternate; separate A modes are not paired |
+| Window bytes, Torch allocation peak and external allocation accounting | W: logical/backing capacity for paired timing; separate one-layout-per-process HIP physical-allocation deltas. Full peaks and operator initialization remain 待测 |
+| Exact command, raw log/result paths and final outcome | External archive `/workspace/reports/gemm-ar-v2-015-20260929/`; `results/manifest.json`, `jobs.jsonl`, per-case logs/JSON, scripts and source archives |
 
 Use one frozen record for published results. Keep live progress, setup failures
 and retry logs in the external archive. Record failed attempts and unsupported
@@ -204,7 +205,7 @@ configurations explicitly; do not silently filter them out.
 - Use 3–5 paired alternating A/B rounds for decisions near the observed noise level.
   Report round-to-round spread; do not assume one universal 2% noise bound.
 - Keep GPU measurements sequential. Preserve the established CCO queue-reclaim
-  interval between independent multi-rank jobs when those jobs are run later.
+  interval between independent multi-rank jobs (20 seconds in this run).
 - Check the requested route actually ran. An overlapped drain's time is only
   exposed wait time and cannot be used as a whole-transfer bandwidth estimate.
 
@@ -224,21 +225,85 @@ remain historical until recalculated under this definition.
 
 ## Current decisions
 
-The current defaults remain unchanged. Historical directions identify what to
-check next on the target workloads; they are not newly measured results.
+The current defaults remain unchanged. Historical directions and this machine's measurements are kept separate.
+Use paired feature results and observed round spread before changing defaults.
 
 | Topic | Target | Historical direction | Required confirmation | New result |
 |---|---|---|---|---|
-| Short final chunks | C1/C2 | Promising at awkward band counts | Tail/count/transfer coverage | 待测 |
-| Reduced padding | C1/C2 | Promising at ragged M | Owner/chunk intersections | 待测 |
-| Workspace reuse | C1/C2 | Reduced window requirement | Serial lifecycle and actual peak allocation | 待测 |
-| FP8 scatter/gather | C1/C2 | Lossy performance option | Wire reference and numerical error | 待测 |
-| Grouped reduce/quantize | C1/C2 | Negative control | Same-shape time and correctness | 待测 |
-| GEMM tile / scale layout | G1/G2 | Internal tile and packing choices | Target-specific boundaries and references | 待测 |
+| Short final chunks | C1/C2 | Promising at awkward band counts | Tail/count/transfer coverage | C1 bands=2: M=11264 -22.2%, M=13312 -23.8%; C2/tail-boundary ladder pending |
+| Reduced padding | C1/C2 | Promising at ragged M | Owner/chunk intersections | C1: -0.6% / -2.9%; C2: -13.7% / -7.2% (M=4200 / 8200, align64; small changes require spread checks) |
+| Workspace reuse | C1/C2 | Reduced window requirement | Serial lifecycle and actual peak allocation | C1: logical bytes −40.0%, latency -0.2%; C2: logical bytes −46.2%, latency -0.1%; physical allocation is checked separately in W |
+| FP8 scatter/gather | C1/C2 | Lossy performance option | Wire reference and numerical error | C1: +3.0% / +2.5%; C2: -21.1% / -26.6% (M=16384, BF16 / FP8 gather; lossy) |
+| Grouped reduce/quantize | C1/C2 | Negative control | Same-shape time and correctness | C1: +4.2% to +4.3%; C2: +2.4% to +2.5%; separate phases remain preferable |
+| GEMM tile / scale layout | G1/G2 | Internal tile and packing choices | Target-specific boundaries and references | G1/G2 main ladder and D measured; padding/tile boundaries and scale-layout study pending |
 
 ## Measured results
 
-These are empty templates for the four targets only. `待测` is not zero, a pass,
+The completed target run contains 28 standalone jobs (98 implementation
+configurations), 102 collective configurations, 28 paired feature jobs and
+8 allocation-only layout measurements. All final jobs completed successfully.
+The supervised runs contain 2,913 GPU-ownership samples, with no foreign GPU
+process observed and a maximum within-run sampling gap of 2.24 seconds.
+Seven unsuccessful attempts in this supervised queue remain in the archive:
+five multi-window setup attempts, the predicted-gather reference mismatch and
+the immediate-reclamation assertion. They are not counted as successful results.
+The source machine was unavailable for this run: all eight visible GPUs held
+257–259 GiB each despite 0% utilization during the samples. `v2-015` was idle
+before launch. Its Torch/ROCm environment differs from the historical run, so
+historical values below are preserved and are not pooled with this measurement.
+
+The earlier attempt completed the standalone ladder but encountered intermittent
+external GPU work and a Docker stop (exit 137, no OOM). Its timings are excluded
+from the current tables. Raw logs, the provisional README snapshot and stop
+records remain in the external archive's `results/` and
+`interruption-evidence.log`. The replacement run uses `results-monitored/`,
+starts after six idle checks and samples GPU process ownership every two
+seconds; the supervisor stops this task if a foreign GPU process is observed.
+This is sampled evidence, not a reservation of the host.
+
+L1 and K1 use cold medians; hot timing and all round values are in the archive.
+L1 compares the same FP8-quantized mathematical product: SGLang's BF16 GEMM
+route also quantizes and dequantizes activations before multiplying. MORI's
+activation bytes and packed scales are checked against an independent PyTorch
+conversion. SG and MORI use separate numerical limits, not each other as the
+reference. The first SG reference incorrectly used unquantized activations;
+that failed attempt and the preliminary smoke logs are retained, excluded from
+published results, and the corrected reference is used for the full ladder.
+
+The feature harness initially failed CCO `hipMemSetAccess` when allocating or
+registering multiple windows of different capacities (C1 M=1025). Retrying,
+disabling GDR, adding 2 MiB padding and preallocating alone did not resolve it;
+those attempts remain in the archive. Published feature pairs allocate equal
+backing capacities (the largest variant rounded to 2 MiB), then register all
+windows before preparing per-variant temporaries. Each variant retains its own
+logical M, layout and transfer lengths. Tail guards beyond each logical layout
+are checked on every rank after timing. GDR retains its default setting.
+
+W reports logical layout requirements and equal backing requests for its
+paired timings. Its physical column comes from separate fresh processes with
+one layout per process, measuring the HIP free-memory decrease across window
+allocation/registration; it is not a full operator/process allocation peak.
+Feature baselines are measured within each pair and are not borrowed from A.
+
+Collective numerical-error columns report rank 0; every rank must pass the
+correctness gate. Timing uses all ranks as described above.
+
+A reports whole prequantized GEMM + collective calls (GEMM-only is its control),
+using multi-call graphs; it excludes activation quantization/padding and weight
+packing. It cannot be substituted for L1 or for historical single-call graphs.
+A's FP8 PASS is a random-input mathematical check; actual payload/scale
+checks are reported separately in F. For two FP8 legs, F checks the local
+reduction independently, validates each quantizer (allowing adjacent codes only
+at rounding midpoints), then reconstructs the output from both actual wires.
+The earlier predicted second quantization failed at FP8 midpoint choices in
+C2 M=4096; the revised check retained the 1e-3 communication-error gate and
+matched the actual reduction and gathered output exactly. That failed attempt
+is retained in the archive. F reports errors against the FP32 product
+sum; p99 uses a deterministic sample of about one million output elements.
+Unmeasured diagnostics, phase profiles, full lifecycle/contract matrices and
+special input families retain `待测`; successful random inputs do not fill them.
+
+These matrices cover the four targets only. `待测` is not zero, a pass,
 or a historical value. N/K/TP and operand quantization come from the target
 registry. Keep M and a relevant implementation knob as the sweep axes.
 
@@ -249,26 +314,27 @@ matrix and no small-M GEMM performance sweep intended to stand in for GEMV.
 <details>
 <summary>L1 — Target linear-operator matrix (14 shape/M points)</summary>
 
-Flash TP4 only. Quantization, padding and dispatch are inside linear scope.
+Flash TP4 only. Quantization, padding and multiply are inside the GPU graph scope.
+The Python route decision and graph construction happen outside timed replay.
 Cells are cold median µs; the per-case record also stores hot timing, spread,
 resolved tile, physical M and the independent-reference result.
 
 | Target | Layer | N | K | M | Expected M_pad | SG linear | MORI auto | MORI N128 | MORI N256 | Reference |
 |---|---|---|---|---|---|---|---|---|---|---|
-| G1 | wo_b | 5120 | 2048 | 64 | 64 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 256 | 256 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 1024 | 1024 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 2048 | 2048 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 4096 | 4096 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 8192 | 8192 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 16384 | 16384 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 64 | 64 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 256 | 256 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 1024 | 1024 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 2048 | 2048 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 4096 | 4096 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 8192 | 8192 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 16384 | 16384 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| G1 | wo_b | 5120 | 2048 | 64 | 64 | 12.56 | 23.84 | 23.88 | 28.46 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 256 | 256 | 19.62 | 27.16 | 27.16 | 29.73 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 1024 | 1024 | 33.38 | 30.21 | 30.15 | 32.29 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 2048 | 2048 | 52.94 | 35.88 | 50.88 | 35.53 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 4096 | 4096 | 82.22 | 61.35 | 74.34 | 61.39 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 8192 | 8192 | 140.69 | 97.50 | 124.06 | 97.81 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 16384 | 16384 | 248.95 | 179.68 | 243.06 | 179.04 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 64 | 64 | 10.20 | 18.60 | 18.62 | 21.57 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 256 | 256 | 12.07 | 21.16 | 21.20 | 22.62 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 1024 | 1024 | 24.67 | 24.46 | 24.55 | 25.71 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 2048 | 2048 | 42.42 | 30.25 | 39.73 | 30.42 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 4096 | 4096 | 74.62 | 51.47 | 71.17 | 51.09 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 8192 | 8192 | 135.02 | 91.98 | 132.16 | 91.32 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 16384 | 16384 | 313.51 | 185.21 | 260.36 | 187.02 | PASS; relL2 ≤0.00166 |
 
 </details>
 
@@ -281,20 +347,20 @@ C1's blockscale multiply is measured only as the GEMM-only control in A.
 
 | Target | Layer | N | K | M | MORI auto | MORI N128 | MORI N256 | Reference |
 |---|---|---|---|---|---|---|---|---|
-| G1 | wo_b | 5120 | 2048 | 64 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 256 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 1024 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 2048 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 4096 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 8192 | 待测 | 待测 | 待测 | 待测 |
-| G1 | wo_b | 5120 | 2048 | 16384 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 64 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 256 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 1024 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 2048 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 4096 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 8192 | 待测 | 待测 | 待测 | 待测 |
-| G2 | wq_b | 8192 | 1280 | 16384 | 待测 | 待测 | 待测 | 待测 |
+| G1 | wo_b | 5120 | 2048 | 64 | 21.73 | 21.75 | 26.00 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 256 | 24.18 | 24.19 | 26.54 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 1024 | 25.06 | 25.16 | 27.50 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 2048 | 29.27 | 44.62 | 29.67 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 4096 | 53.69 | 66.30 | 53.50 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 8192 | 83.83 | 110.25 | 83.99 | PASS; relL2 ≤0.00166 |
+| G1 | wo_b | 5120 | 2048 | 16384 | 151.46 | 214.57 | 151.78 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 64 | 16.41 | 16.38 | 19.48 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 256 | 18.91 | 18.96 | 20.45 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 1024 | 20.56 | 20.64 | 21.75 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 2048 | 25.26 | 35.51 | 25.10 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 4096 | 44.18 | 64.56 | 44.77 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 8192 | 82.29 | 123.09 | 82.79 | PASS; relL2 ≤0.00166 |
+| G2 | wq_b | 8192 | 1280 | 16384 | 168.51 | 240.74 | 166.35 | PASS; relL2 ≤0.00166 |
 
 </details>
 
@@ -307,7 +373,7 @@ C1's blockscale multiply is measured only as the GEMM-only control in A.
 | B2 | G2 | M=1023,1024,1025,1088 | Both sides of the 140-grid tile switch | 待测 |
 | B3 | G1 | M=1535,1536,1537,1600 | Both sides of the 140-grid tile switch | 待测 |
 | B4 | G1/G2 | Nearest reachable M around admission grid 48/64/80/128 | Admission and tile choice scored separately | 待测 |
-| B5 | C1/C2 | M=1023,1024,1025,4200,8200 | Target padding/owner boundaries | 待测 |
+| B5 | C1/C2 | M=1023,1024,1025,4200,8200 | Target padding/owner boundaries | PASS in P; FP32, repeat, changed inputs and guards |
 | B6 | All four targets | Wrong operand/scale dtype, shape or stride | Host rejection; no timing of invalid inputs | 待测 |
 | B7 | C1/C2 | Invalid communication/option combinations | Host rejection without silently changing route | 待测 |
 
@@ -319,21 +385,30 @@ C1's blockscale multiply is measured only as the GEMM-only control in A.
 Derived only from G1/G2. Earlier all-layer aggregate scores are not reused
 as evidence for these target-specific thresholds.
 
+Derived from the 14 main-ladder points only; boundary points remain pending.
+Wide grid = `ceil(M_pad / 256) * (N / 256)`. Tile Δ uses K1 cold
+`100 * (N128 / N256 - 1)`. A win requires non-overlapping three-round ranges;
+points counted in neither win column are ties. These ranges are observed spread,
+not confidence intervals. Empty bins have no target point on this ladder.
+Admission selects MORI auto when wide grid ≥ threshold, otherwise SG; the
+penalty uses median latency for all 14 points, including ties. This summary
+measures the candidate rule and does not change public dispatch.
+
 | Wide-grid bin | Target points | N128 faster | N256 faster | Mean Δ% | Spread |
 |---|---|---|---|---|---|
-| 1–16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 17–32 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 33–64 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 65–128 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 129–192 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| >192 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 1–16 | 0 | — | — | — | — |
+| 17–32 | 4 | 4 | 0 | -12.1% | max round range 1.1% |
+| 33–64 | 0 | — | — | — | — |
+| 65–128 | 2 | 2 | 0 | -6.8% | max round range 1.0% |
+| 129–192 | 1 | 0 | 1 | +50.4% | max round range 0.6% |
+| >192 | 7 | 0 | 7 | +39.4% | max round range 1.7% |
 
 | Admission grid threshold | G1/G2 points | Wrong-choice rate | Mean latency penalty | Tie/noise rule |
 |---|---|---|---|---|
-| 48 | 待测 | 待测 | 待测 | 待测 |
-| 64 | 待测 | 待测 | 待测 | 待测 |
-| 80 | 待测 | 待测 | 待测 | 待测 |
-| 128 | 待测 | 待测 | 待测 | 待测 |
+| 48 | 14 | 0/14 (0.0%) | 0.00% | Overlapping round ranges = tie |
+| 64 | 14 | 0/14 (0.0%) | 0.00% | Overlapping round ranges = tie |
+| 80 | 14 | 0/14 (0.0%) | 0.00% | Overlapping round ranges = tie |
+| 128 | 14 | 1/14 (7.1%) | 0.75% | Overlapping round ranges = tie |
 
 </details>
 
@@ -348,45 +423,45 @@ create additional compute cases. Shared FP8 configurations have one case ID.
 
 | Mode | Gather dtype | Actual gather transport | Fused quantize | M=4096 µs | M=8192 µs | M=16384 µs | Reference |
 |---|---|---|---|---|---|---|---|
-| gemm-only | none | none | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | bf16 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| split-lsa | bf16 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | bf16 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | bf16 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | sdma | on | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | lsa | on | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | sdma | on | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | lsa | on | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | sdma | on | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | lsa | on | 待测 | 待测 | 待测 | 待测 |
+| gemm-only | none | none | off | 105.46 | 179.89 | 340.54 | PASS; rank0 ≤0.00166 |
+| split-sdma | bf16 | sdma | off | 390.23 | 722.92 | 1487.51 | PASS; rank0 ≤0.00235 |
+| split-lsa | bf16 | lsa | off | 386.60 | 726.90 | 1507.56 | PASS; rank0 ≤0.00235 |
+| fused-sdma | bf16 | sdma | off | 339.20 | 611.74 | 1165.85 | PASS; rank0 ≤0.00235 |
+| fused-lsa | bf16 | sdma | off | 516.18 | 878.98 | 1673.49 | PASS; rank0 ≤0.00235 |
+| split-sdma | fp8 | sdma | off | 374.26 | 668.61 | 1314.18 | PASS math; rank0 ≤0.0249 |
+| split-sdma | fp8 | sdma | on | 403.68 | 692.99 | 1337.43 | PASS math; rank0 ≤0.0249 |
+| split-sdma | fp8 | lsa | off | 337.77 | 629.34 | 1266.60 | PASS math; rank0 ≤0.0249 |
+| split-sdma | fp8 | lsa | on | 366.54 | 655.49 | 1289.19 | PASS math; rank0 ≤0.0249 |
+| fused-sdma | fp8 | sdma | off | 321.57 | 545.95 | 1013.10 | PASS math; rank0 ≤0.0249 |
+| fused-sdma | fp8 | sdma | on | 350.56 | 571.37 | 1029.51 | PASS math; rank0 ≤0.0249 |
+| fused-sdma | fp8 | lsa | off | 286.04 | 506.52 | 961.92 | PASS math; rank0 ≤0.0249 |
+| fused-sdma | fp8 | lsa | on | 314.70 | 530.27 | 982.75 | PASS math; rank0 ≤0.0249 |
+| fused-lsa | fp8 | sdma | off | 499.38 | 869.70 | 1495.53 | PASS math; rank0 ≤0.0249 |
+| fused-lsa | fp8 | sdma | on | 515.12 | 861.11 | 1515.65 | PASS math; rank0 ≤0.0249 |
+| fused-lsa | fp8 | lsa | off | 463.71 | 794.85 | 1440.13 | PASS math; rank0 ≤0.0249 |
+| fused-lsa | fp8 | lsa | on | 478.76 | 804.10 | 1465.93 | PASS math; rank0 ≤0.0249 |
 
 ##### C2: V4.1 Flash, TP4, wo_b, mxfp8, N=5120, K=2048
 
 | Mode | Gather dtype | Actual gather transport | Fused quantize | M=4096 µs | M=8192 µs | M=16384 µs | Reference |
 |---|---|---|---|---|---|---|---|
-| gemm-only | none | none | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | bf16 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| split-lsa | bf16 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | bf16 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | bf16 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | sdma | on | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| split-sdma | fp8 | lsa | on | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | sdma | on | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| fused-sdma | fp8 | lsa | on | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | sdma | off | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | sdma | on | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | lsa | off | 待测 | 待测 | 待测 | 待测 |
-| fused-lsa | fp8 | lsa | on | 待测 | 待测 | 待测 | 待测 |
+| gemm-only | none | none | off | 57.02 | 91.94 | 162.03 | PASS; rank0 ≤0.00166 |
+| split-sdma | bf16 | sdma | off | 446.93 | 843.70 | 1639.26 | PASS; rank0 ≤0.00237 |
+| split-lsa | bf16 | lsa | off | 439.63 | 841.65 | 1686.82 | PASS; rank0 ≤0.00237 |
+| fused-sdma | bf16 | sdma | off | 440.17 | 816.57 | 1548.88 | PASS; rank0 ≤0.00237 |
+| fused-lsa | bf16 | sdma | off | 541.50 | 1003.45 | 1911.96 | PASS; rank0 ≤0.00237 |
+| split-sdma | fp8 | sdma | off | 379.84 | 696.13 | 1375.45 | PASS math; rank0 ≤0.0231 |
+| split-sdma | fp8 | sdma | on | 386.82 | 700.91 | 1392.02 | PASS math; rank0 ≤0.0231 |
+| split-sdma | fp8 | lsa | off | 367.23 | 683.14 | 1352.05 | PASS math; rank0 ≤0.0231 |
+| split-sdma | fp8 | lsa | on | 373.90 | 689.19 | 1371.79 | PASS math; rank0 ≤0.0231 |
+| fused-sdma | fp8 | sdma | off | 374.23 | 668.88 | 1257.35 | PASS math; rank0 ≤0.0231 |
+| fused-sdma | fp8 | sdma | on | 380.06 | 675.18 | 1273.56 | PASS math; rank0 ≤0.0231 |
+| fused-sdma | fp8 | lsa | off | 361.01 | 656.31 | 1234.04 | PASS math; rank0 ≤0.0231 |
+| fused-sdma | fp8 | lsa | on | 367.41 | 661.72 | 1252.04 | PASS math; rank0 ≤0.0231 |
+| fused-lsa | fp8 | sdma | off | 476.41 | 850.83 | 1575.56 | PASS math; rank0 ≤0.0231 |
+| fused-lsa | fp8 | sdma | on | 477.55 | 854.00 | 1613.87 | PASS math; rank0 ≤0.0231 |
+| fused-lsa | fp8 | lsa | off | 462.32 | 835.83 | 1571.08 | PASS math; rank0 ≤0.0231 |
+| fused-lsa | fp8 | lsa | on | 462.84 | 840.93 | 1593.47 | PASS math; rank0 ≤0.0231 |
 
 </details>
 
@@ -408,9 +483,9 @@ Check no missing/duplicate rows, transfer lengths and repeated calls.
 | 7 | 7168 | 待测 | 待测 | 待测 | 待测 | 待测 |
 | 8 | 8192 | 待测 | 待测 | 待测 | 待测 | 待测 |
 | 10 | 10240 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 11 | 11264 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 11 | 11264 | 1074.44 | 待测 | 835.64 | 待测 | PASS; bitwise + FP32 + changed inputs (bands=2) |
 | 12 | 12288 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| 13 | 13312 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| 13 | 13312 | 1273.25 | 待测 | 969.71 | 待测 | PASS; bitwise + FP32 + changed inputs (bands=2) |
 | 14 | 14336 | 待测 | 待测 | 待测 | 待测 | 待测 |
 | 16 | 16384 | 待测 | 待测 | 待测 | 待测 | 待测 |
 
@@ -444,41 +519,53 @@ instead of launching relaxed rows.
 
 | True M | Baseline M_pad | Align256 M_pad | Align64 M_pad | Baseline µs | Align256 µs | Align64 µs | Reference |
 |---|---|---|---|---|---|---|---|
-| 1023 | 1024 | 1024 | 1024 | 待测 | 待测 | 待测 | 待测 |
-| 1024 | 1024 | 1024 | 1024 | 待测 | 待测 | 待测 | 待测 |
-| 1025 | 2048 | 1280 | 1088 | 待测 | 待测 | 待测 | 待测 |
-| 4200 | 5120 | 4352 | 4224 | 待测 | 待测 | 待测 | 待测 |
-| 8200 | 9216 | 8448 | 8256 | 待测 | 待测 | 待测 | 待测 |
+| 1023 | 1024 | 1024 | 1024 | 125.43 | 125.67 | 125.71 | PASS; repeat + changed inputs |
+| 1024 | 1024 | 1024 | 1024 | 126.95 | 126.62 | 126.82 | PASS; repeat + changed inputs |
+| 1025 | 2048 | 1280 | 1088 | 198.33 | 168.80 | 141.36 | PASS; repeat + changed inputs |
+| 4200 | 5120 | 4352 | 4224 | 408.35 | 410.42 | 405.97 | PASS; repeat + changed inputs |
+| 8200 | 9216 | 8448 | 8256 | 728.86 | 710.08 | 707.91 | PASS; repeat + changed inputs |
 
 ##### C2: mxfp8, TP4, BLOCK_M=256
 
 | True M | Baseline M_pad | Align256 M_pad | Align64 M_pad | Baseline µs | Align256 µs | Align64 µs | Reference |
 |---|---|---|---|---|---|---|---|
-| 1023 | 1024 | 1024 | 1024 | 待测 | 待测 | 待测 | 待测 |
-| 1024 | 1024 | 1024 | 1024 | 待测 | 待测 | 待测 | 待测 |
-| 1025 | 2048 | 1280 | 1088 | 待测 | 待测 | 待测 | 待测 |
-| 4200 | 5120 | 4352 | 4224 | 待测 | 待测 | 待测 | 待测 |
-| 8200 | 9216 | 8448 | 8256 | 待测 | 待测 | 待测 | 待测 |
+| 1023 | 1024 | 1024 | 1024 | 145.42 | 145.74 | 145.81 | PASS; repeat + changed inputs |
+| 1024 | 1024 | 1024 | 1024 | 144.95 | 145.85 | 145.71 | PASS; repeat + changed inputs |
+| 1025 | 2048 | 1280 | 1088 | 241.82 | 173.19 | 155.79 | PASS; repeat + changed inputs |
+| 4200 | 5120 | 4352 | 4224 | 533.56 | 472.00 | 460.27 | PASS; repeat + changed inputs |
+| 8200 | 9216 | 8448 | 8256 | 894.46 | 847.41 | 830.37 | PASS; repeat + changed inputs |
 
 </details>
 
 <details>
 <summary>W — Target workspace and serial lifecycle</summary>
 
+The physical column is a separate allocation-only measurement, using one fresh
+process per target/layout and the layout's own capacity. All ranks reported the
+same window deltas shown. The steady-state timings use the equal backing buffers
+above. Full Torch peaks, allocation counts and operator initialization are pending.
+
+Immediate HIP snapshots after window/memory close still showed the window's
+allocation delta (282–702 MiB/rank). After communicator destruction,
+the residual versus the pre-communicator snapshot was 36 MiB for C1
+and 20 MiB for C2, independent of layout. These snapshots do not establish
+immediate physical reclamation or a full operator lifecycle pass. The initial
+probe's immediate-reclamation assertion failed and its log is retained.
+
 C1/C2, capacity M=16384. Separate window requirements, actual allocator
-peaks and initialization. Serial mixed-M sequences are checked on these same
+peaks and initialization. Serial mixed-M sequences remain pending on these same
 N/K/TP targets; do not expand the model/parallelism matrix.
 
-| Target | Layout | Window MiB/rank | Torch peak MiB | External physical MiB | Allocations | Init µs | Steady µs | Reference |
+| Target | Layout | Logical / backing MiB/rank | Torch peak MiB | External physical MiB | Allocations | Init µs | Steady µs | Reference |
 |---|---|---|---|---|---|---|---|---|
-| C1 | baseline | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | no unused tmp | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | compact receive | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | input/output alias | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | baseline | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | no unused tmp | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | compact receive | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | input/output alias | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| C1 | baseline | 700.006 / 702 | 待测 | 702 | 待测 | 待测 | 1165.69 | PASS; repeat + changed inputs |
+| C1 | no unused tmp | 672.006 / 702 | 待测 | 674 | 待测 | 待测 | 1165.54 | PASS; repeat + changed inputs |
+| C1 | compact receive | 644.006 / 702 | 待测 | 646 | 待测 | 待测 | 1166.18 | PASS; repeat + changed inputs |
+| C1 | input/output alias | 420.006 / 702 | 待测 | 422 | 待测 | 待测 | 1163.93 | PASS; repeat + changed inputs |
+| C2 | baseline | 520.006 / 522 | 待测 | 522 | 待测 | 待测 | 1549.09 | PASS; repeat + changed inputs |
+| C2 | no unused tmp | 480.006 / 522 | 待测 | 482 | 待测 | 待测 | 1548.73 | PASS; repeat + changed inputs |
+| C2 | compact receive | 440.006 / 522 | 待测 | 442 | 待测 | 待测 | 1547.04 | PASS; repeat + changed inputs |
+| C2 | input/output alias | 280.006 / 522 | 待测 | 282 | 待测 | 待测 | 1548.02 | PASS; repeat + changed inputs |
 
 | Lifecycle | Targets | Result |
 |---|---|---|
@@ -498,25 +585,25 @@ no model-quality claim follows from these operator tests.
 
 | Target | M | Gather | BF16 scatter µs | FP8 scatter µs | FP32 relL2 | Max abs/p99 error | Wire reference |
 |---|---|---|---|---|---|---|---|
-| C1 | 4096 | bf16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | 4096 | fp8/lsa | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | 8192 | bf16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | 8192 | fp8/lsa | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | 16384 | bf16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | 16384 | fp8/lsa | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | 4096 | bf16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | 4096 | fp8/lsa | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | 8192 | bf16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | 8192 | fp8/lsa | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | 16384 | bf16 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | 16384 | fp8/lsa | 待测 | 待测 | 待测 | 待测 | 待测 |
+| C1 | 4096 | bf16 | 338.57 | 342.65 | 0.02621 | 7.7e-05 / 3.33e-05 (sampled p99) | PASS; relL2 0 |
+| C1 | 4096 | fp8/lsa | 286.48 | 285.41 | 0.03608 | 0.000131 / 5.02e-05 (sampled p99) | PASS; relL2 0 |
+| C1 | 8192 | bf16 | 612.52 | 631.49 | 0.02620 | 8.18e-05 / 3.29e-05 (sampled p99) | PASS; relL2 0 |
+| C1 | 8192 | fp8/lsa | 505.08 | 508.80 | 0.03607 | 0.000134 / 4.94e-05 (sampled p99) | PASS; relL2 0 |
+| C1 | 16384 | bf16 | 1167.11 | 1201.84 | 0.02621 | 8.93e-05 / 3.32e-05 (sampled p99) | PASS; relL2 0 |
+| C1 | 16384 | fp8/lsa | 966.39 | 990.95 | 0.03607 | 0.000158 / 4.98e-05 (sampled p99) | PASS; relL2 0 |
+| C2 | 4096 | bf16 | 440.07 | 367.70 | 0.02617 | 0.000111 / 4.49e-05 (sampled p99) | PASS; relL2 0 |
+| C2 | 4096 | fp8/lsa | 360.64 | 285.36 | 0.03482 | 0.00017 / 6.45e-05 (sampled p99) | PASS; relL2 0 |
+| C2 | 8192 | bf16 | 816.21 | 663.12 | 0.02618 | 0.000116 / 4.48e-05 (sampled p99) | PASS; relL2 0 |
+| C2 | 8192 | fp8/lsa | 655.43 | 500.65 | 0.03482 | 0.000194 / 6.44e-05 (sampled p99) | PASS; relL2 0 |
+| C2 | 16384 | bf16 | 1548.42 | 1221.29 | 0.02618 | 0.00012 / 4.48e-05 (sampled p99) | PASS; relL2 0 |
+| C2 | 16384 | fp8/lsa | 1234.39 | 906.40 | 0.03482 | 0.000189 / 6.44e-05 (sampled p99) | PASS; relL2 0 |
 
 | Input/protocol case | Required check | Result |
 |---|---|---|
 | All zero / exact FP8 values | Absolute error and finite scales; no positive-relL2 floor | 待测 |
 | Per-rank constants / impulse / cancellation | Correct owners and contributors, including near-zero references | 待测 |
 | Supported magnitudes, outliers and rounding midpoints | Payload/scales, error distribution and saturation behavior | 待测 |
-| Both FP8 legs | Separate multiply, scatter reduction and gather error | 待测 |
+| Both FP8 legs | Separate multiply, scatter reduction and gather error | PASS on random inputs; math and both actual wires checked |
 | Unsupported layout/transport/fusion combinations | Host rejection on C1/C2 | 待测 |
 
 </details>
@@ -529,14 +616,14 @@ fewer launches alone do not justify promotion.
 
 | Target | Quantization | Reduce µs | Quantize µs | Gather/pull µs | Whole call µs | relL2 | Reference |
 |---|---|---|---|---|---|---|---|
-| C1 | separate per-row | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | fused group128 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | fused group256 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C1 | fused group512 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | separate per-row | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | fused group128 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | fused group256 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
-| C2 | fused group512 | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 |
+| C1 | separate per-row | 待测 | 待测 | 待测 | 964.51 | 0.02491 | PASS math; repeat + changed inputs |
+| C1 | fused group128 | 待测 | 待测 | 待测 | 1005.04 | 0.02422 | PASS math; repeat + changed inputs |
+| C1 | fused group256 | 待测 | 待测 | 待测 | 1005.00 | 0.02458 | PASS math; repeat + changed inputs |
+| C1 | fused group512 | 待测 | 待测 | 待测 | 1005.75 | 0.02477 | PASS math; repeat + changed inputs |
+| C2 | separate per-row | 待测 | 待测 | 待测 | 1233.42 | 0.02309 | PASS math; repeat + changed inputs |
+| C2 | fused group128 | 待测 | 待测 | 待测 | 1262.56 | 0.02243 | PASS math; repeat + changed inputs |
+| C2 | fused group256 | 待测 | 待测 | 待测 | 1264.07 | 0.02276 | PASS math; repeat + changed inputs |
+| C2 | fused group512 | 待测 | 待测 | 待测 | 1264.41 | 0.02294 | PASS math; repeat + changed inputs |
 
 </details>
 
