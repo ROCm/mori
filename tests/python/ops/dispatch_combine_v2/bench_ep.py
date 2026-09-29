@@ -152,6 +152,8 @@ CHECK = int(os.environ.get("CHECK", 1))
 # CHECK_REPEAT=n (push, quantized reduce): after the checked pair, n more dispatch + combine pairs
 # with the staged rows times 2, 4, ..., each checked, the landing never cleared in between.
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
+# PUSH_QCHECK_DEV=1: the quantized-reduce check also runs on the device (see check_push_quant).
+PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # Payload distribution and RNG seed: DATA_INIT=zero|constant|uniform|norm, SEED,
 # CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
 # describe the same input. Defaults reproduce this file's previous behaviour.
@@ -455,53 +457,82 @@ def main():
         sc_byte = torch.pow(2.0, (byte - 127).float())
         return torch.sign(x) * fp4_rne(x.abs() / sc_conv) * sc_byte
 
-    def check_push_quant(out, ct, scale=1.0):
-        """out[t] must be U * dequant(quant(x[t])). Per _PUSH_QGROUP group the sender divides
-        by step = 2^(e-128), e the biased exponent of the group's |max|, so a code is within
-        half a step of the value under round-to-nearest and within one step under
-        truncation; the bound here is one step plus bf16 rounding of the sum. Reading
-        zeros, a wrong scale, or a wrong nibble order breaks it at the group's largest
-        element. max_err is printed in steps: ~0.5 means round-to-nearest. scale: the
-        power of two the staged rows were multiplied by, which the codes carry exactly.
-        """
-        grp = _PUSH_QGROUP
-        x = (
-            (bf16_payload(rank)[:ct].float() * scale)
-            .to(dev)
-            .view(ct, HIDDEN // grp, grp)
-        )
-        u = U[:ct].to(dev).float().view(ct, 1, 1)
-        got = out[:ct].float().view(ct, HIDDEN // grp, grp)
+    def push_quant_stats(x, u, got, t0=0):
+        """[bad rows, inexact rows, non-finite outputs], max error in steps, and the first
+        inexact element described, for got against U * x; [tokens, groups, group] tensors
+        on one device, token t0 first. Per group the sender divides by step = 2^(e-128), e
+        the biased exponent of the group's |max|, so a code is within half a step of the
+        value under round-to-nearest and within one step under truncation; the bound is one
+        step plus bf16 rounding of the sum. Reading zeros, a wrong scale, or a wrong nibble
+        order breaks it at the group's largest element. Inexact: U copies of one decoded
+        row, each a small multiple of a power of two, sum and round to bf16 without loss,
+        so the output must equal the reference bit for bit."""
+        grp = x.shape[-1]
         amax = x.abs().amax(dim=2, keepdim=True)
         _, ex = torch.frexp(amax)  # amax = m * 2^ex, m in [0.5, 1)
         step = torch.ldexp(torch.ones_like(amax), (ex - 2).clamp(min=-127))
         err = (got - u * x).abs()
         tol = u * step + (u * x).abs() * 2.0**-8 + 1e-30
-        bad_rows = int((err > tol).flatten(1).any(dim=1).sum())
-        max_err = float((err / (u * step)).max())
-        # Exact: U copies of one decoded row, each a small multiple of a power of two, sum and
-        # round to bf16 without loss, so the output must equal the reference bit for bit.
-        exact_rows = 0
-        first = ""
+        # Not err > tol: a NaN compares false to everything and would pass as in bounds.
+        bad = int((~(err <= tol)).flatten(1).any(dim=1).sum())
+        nonfinite = int((~torch.isfinite(got)).sum())
+        max_err = float(torch.nan_to_num(err / (u * step), nan=float("inf")).max())
+        inexact, first = 0, ""
         if grp == 32:
             ref = (u * push_quant_deq(x)).to(torch.bfloat16).float()
             miss = got != ref
-            exact_rows = int(miss.flatten(1).any(dim=1).sum())
-            if exact_rows:
+            inexact = int(miss.flatten(1).any(dim=1).sum())
+            if inexact:
                 i = int(miss.flatten().nonzero()[0])
+                t, g = i // (x.shape[1] * grp), (i // grp) % x.shape[1]
                 first = (
-                    f" first@{i}: x={float(x.flatten()[i]):.6g} got={float(got.flatten()[i]):.6g}"
-                    f" ref={float(ref.flatten()[i]):.6g} u={float(u.flatten()[i // HIDDEN]):g}"
+                    f" first@rank{rank}:tok{t0 + t}:grp{g}:el{i % grp}"
+                    f" x={float(x.flatten()[i]):.6g} got={float(got.flatten()[i]):.6g}"
+                    f" ref={float(ref.flatten()[i]):.6g} u={float(u.flatten()[t]):g}"
+                    f" amax={float(amax[t, g, 0]):.6g}"
+                    f" row_miss={int(miss[t].sum())} grp_miss={int(miss[t, g].sum())}"
+                    f" grps_miss={int(miss[t].any(dim=1).sum())}"
                 )
-        n = torch.tensor([bad_rows, ct, exact_rows], dtype=torch.float64)
+        return [bad, inexact, nonfinite], max_err, first
+
+    def check_push_quant(out, ct, scale=1.0):
+        """out[t] must be U * dequant(quant(x[t])); see push_quant_stats. max_err is printed
+        in steps: ~0.5 means round-to-nearest. scale: the power of two the staged rows were
+        multiplied by, which the codes carry exactly.
+
+        Computed on the host, a chunk of tokens at a time. PUSH_QCHECK_DEV=1 runs the same
+        arithmetic on the device as well and prints how far its counts are from the host's
+        (dev_diff)."""
+        grp = _PUSH_QGROUP
+        x_all = (bf16_payload(rank)[:ct].float() * scale).view(ct, HIDDEN // grp, grp)
+        u_all = U[:ct].float().view(ct, 1, 1)
+        got_all = out[:ct].cpu().float().view(ct, HIDDEN // grp, grp)
+        tot, max_err, first = [0, 0, 0], 0.0, ""
+        for t0 in range(0, ct, 1024):
+            sl = slice(t0, min(ct, t0 + 1024))
+            c, e, f = push_quant_stats(x_all[sl], u_all[sl], got_all[sl], t0)
+            tot = [a + b for a, b in zip(tot, c)]
+            max_err = max(max_err, e)
+            first = first or f
+        devdiff = 0
+        if PUSH_QCHECK_DEV:
+            c, _, _ = push_quant_stats(x_all.to(dev), u_all.to(dev), got_all.to(dev))
+            devdiff = sum(abs(a - b) for a, b in zip(c, tot))
+        n = torch.tensor([tot[0], ct, tot[1], tot[2], devdiff], dtype=torch.float64)
         dist.all_reduce(n)
         m = torch.tensor([max_err], dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
+        # Every rank's first mismatch, printed by rank 0 alone: the row that fails is
+        # usually not rank 0's, and ranks printing at once tear each other's lines.
+        firsts = [None] * world
+        dist.all_gather_object(firsts, first)
         if rank == 0:
             print(
                 f"  [PUSHQUANT] ct={ct} x{scale:g} rows={int(n[1])} bad={int(n[0])} "
                 f"max_err={float(m[0]):.3f} steps rule={_PUSH_QRULE} exact_bad={int(n[2])}"
-                f"{first}",
+                f" nonfinite={int(n[3])}"
+                + (f" dev_diff={int(n[4])}" if PUSH_QCHECK_DEV else "")
+                + "".join(f for f in firsts if f),
                 flush=True,
             )
         return int(n[0]) + int(n[2])
