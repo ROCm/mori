@@ -76,6 +76,7 @@ in step 3.
 from __future__ import annotations
 
 import os
+import hashlib
 
 
 import flydsl.compiler as flyc
@@ -254,6 +255,27 @@ def build_sdma_phases(
     """
     cfg.validate()
     ws = cfg.world_size
+    gather_group = getattr(cfg, "gather_group", 0)
+    specialization = hashlib.sha256(
+        repr(
+            (
+                cfg,
+                rank,
+                queues,
+                signal,
+                reduce_blocks,
+                reduce_self_from_recv,
+                recv_uncached,
+                fuse_quantize,
+                fuse_reduce_push,
+                publish,
+            )
+        ).encode()
+    ).hexdigest()[:16]
+    if gather_group and (not cfg.lsa_gather or gather_group not in (128, 256, 512)):
+        raise ValueError(
+            "group quantization requires FP8 LSA gather and group 128/256/512"
+        )
     if cfg.recv_slots < ws:
         raise ValueError(
             f"SDMA needs a landing slot per peer: build the ArConfig with "
@@ -261,16 +283,13 @@ def build_sdma_phases(
         )
     if queues < 1:
         raise ValueError(f"queues must be >= 1, got {queues}")
-    if cfg.fp8_scatter:
+    if cfg.fp8_scatter and (fuse_quantize or fuse_reduce_push):
         # The regions exist (layout.py sizes them), but nothing writes the
         # quantised payload yet: on the fused path that is the GEMM epilogue's
         # job, and on the standalone path it needs its own kernel. Refuse
         # rather than read an fp8-sized region that still holds bf16, which
         # faults somewhere unrelated.
-        raise NotImplementedError(
-            "scatter_dtype='fp8' is not wired yet; the gather leg is "
-            "(gather_dtype='fp8'), and it is where the time is"
-        )
+        raise NotImplementedError("FP8 scatter prototype uses the separate reduce")
 
     threads = cfg.threads
     # The reduce is a *local HBM* kernel, so it must not inherit the grid the LSA
@@ -330,7 +349,10 @@ def build_sdma_phases(
         pushes = dst_off_of_peer is not None
         put_bytes = slice_bytes if nbytes is None else nbytes
 
-        @flyc.kernel(known_block_size=[PUSH_THREADS, 1, 1])
+        @flyc.kernel(
+            name=f"mori_sdma_push_{specialization}_{arr_off}_{int(pushes)}",
+            known_block_size=[PUSH_THREADS, 1, 1],
+        )
         def push(dev_comm: Int64, win: Int64):
             tid = fx.thread_idx.x
             w = cco.CachedWindow(win)
@@ -346,7 +368,11 @@ def build_sdma_phases(
                         sdma.put(
                             tid,
                             win,
-                            fx.Int64(dst_off_of_peer),
+                            (
+                                dst_off_of_peer(tid)
+                                if callable(dst_off_of_peer)
+                                else fx.Int64(dst_off_of_peer)
+                            ),
                             win,
                             src_off_expr(tid),
                             fx.Int64(put_bytes),
@@ -383,14 +409,24 @@ def build_sdma_phases(
     # Scatter. Peer p owns slice p, so what p needs from me is *p's* slice range
     # of my input -- the source offset moves with the lane. It lands in the slot p
     # reserves for me, which is at the same byte offset in every rank's window.
+    scatter_dst = my_recv_slot
+    if getattr(cfg, "compact_recv", False):
+
+        def scatter_dst(peer):
+            return fx.Int64(cfg.recv_off) + fx.Int64(
+                (fx.Int32(rank) < peer).select(fx.Int32(rank), fx.Int32(rank - 1))
+            ) * fx.Int64(cfg._cap.scatter_slice_bytes)
+
     scatter = _push_kernel(
         start_off,
-        dst_off_of_peer=my_recv_slot,
+        dst_off_of_peer=scatter_dst,
         src_off_expr=lambda tid: fx.Int64(in_off)
         + fx.Int64(tid) * fx.Int64(slice_bytes),
     )
 
-    @flyc.kernel(known_block_size=[threads, 1, 1])
+    @flyc.kernel(
+        name=f"mori_sdma_reduce_{specialization}", known_block_size=[threads, 1, 1]
+    )
     def sdma_reduce(dev_comm: Int64, win: Int64):
         """Sum my own slice plus the P-1 landed slices into my part of output.
 
@@ -408,6 +444,8 @@ def build_sdma_phases(
         self_off = (
             cfg.recv_slot_off(rank) if reduce_self_from_recv else in_off + my_slice_off
         )
+        if const_expr(cfg.fp8_scatter):
+            self_off = in_off + rank * cfg.scatter_slice_bytes
         srcs = [
             create_buffer_resource_from_addr(
                 wave_uniform_i64(w.lsa_ptr(rank, self_off))
@@ -421,6 +459,35 @@ def build_sdma_phases(
         out = create_buffer_resource_from_addr(
             wave_uniform_i64(w.lsa_ptr(rank, out_off + my_slice_off))
         )
+        scale_srcs = None
+        if const_expr(cfg.fp8_scatter):
+            scale_srcs = [
+                create_buffer_resource_from_addr(
+                    wave_uniform_i64(
+                        w.lsa_ptr(
+                            rank,
+                            cfg.input_scale_off + rank * cfg.scatter_scale_slice_bytes,
+                        )
+                    )
+                )
+            ] + [
+                create_buffer_resource_from_addr(
+                    wave_uniform_i64(
+                        w.lsa_ptr(rank, cfg.recv_scale_slot_off((rank + j) % ws))
+                    )
+                )
+                for j in range(1, ws)
+            ]
+        group_out = group_scale = None
+        if const_expr(gather_group > 0):
+            group_out = create_buffer_resource_from_addr(
+                wave_uniform_i64(
+                    w.lsa_ptr(rank, cfg.gout_off + rank * cfg.slice_rows * cfg.n)
+                )
+            )
+            group_scale = create_buffer_resource_from_addr(
+                wave_uniform_i64(w.lsa_ptr(rank, cfg.gout_scale_slice_off(rank)))
+            )
 
         gtid = bid * threads + tid
         for pk in range(gtid, part, red_stride):
@@ -431,20 +498,36 @@ def build_sdma_phases(
                 # lines are coherent, but when a peer's CUs stored into it over
                 # xGMI our own L2 is never invalidated, so a cached load here can
                 # return the previous iteration's bytes. SC1 skips L2 for those.
-                raw = fx.Vector(
-                    buffer_load(
-                        srcs[j],
-                        i32_off,
-                        vec_width=4,
-                        dtype=i32_type(),
-                        cache_modifier=CM_SC1 if recv_uncached else CM_CACHED,
+                if const_expr(cfg.fp8_scatter):
+                    raw = fx.Vector(
+                        buffer_load(srcs[j], pk * 2, vec_width=2, dtype=i32_type())
                     )
-                )
-                v = (
-                    raw.bitcast(fx.Float32)
-                    if elem_dtype is fx.Float32
-                    else raw.bitcast(elem_dtype).to(fx.Float32)
-                )
+                    scale = fx.Float32(
+                        buffer_load(
+                            scale_srcs[j],
+                            pk * 8 // cfg.scatter_scale_n,
+                            vec_width=1,
+                            dtype=fx.Float32,
+                        )
+                    )
+                    v = fx.Vector.from_elements(
+                        [x * scale for x in _unpack8_fp8(raw)], fx.Float32
+                    )
+                else:
+                    raw = fx.Vector(
+                        buffer_load(
+                            srcs[j],
+                            i32_off,
+                            vec_width=4,
+                            dtype=i32_type(),
+                            cache_modifier=CM_SC1 if recv_uncached else CM_CACHED,
+                        )
+                    )
+                    v = (
+                        raw.bitcast(fx.Float32)
+                        if elem_dtype is fx.Float32
+                        else raw.bitcast(elem_dtype).to(fx.Float32)
+                    )
                 acc = v if acc is None else acc + v
             packed = (
                 acc.bitcast(fx.Int32)
@@ -452,6 +535,21 @@ def build_sdma_phases(
                 else acc.to(elem_dtype).bitcast(fx.Int32)
             )
             buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
+            if const_expr(gather_group > 0):
+                values = packed.bitcast(fx.BFloat16).to(fx.Float32)
+                amax = fx.Float32(0.0)
+                for ee in range_constexpr(8):
+                    amax = amax.maximumf(values[ee].maximumf(-values[ee]))
+                for shift in range_constexpr((gather_group // 8).bit_length() - 1):
+                    amax = amax.maximumf(_bpermute_f32(amax, (tid % 64) ^ (1 << shift)))
+                scale = (amax == fx.Float32(0.0)).select(
+                    fx.Float32(1.0), amax / fx.Float32(448.0)
+                )
+                inv = fx.Float32(1.0) / scale
+                q = _pack8_fp8([values[ee] * inv for ee in range_constexpr(8)])
+                buffer_store(q, group_out, pk * 2)
+                if tid % (gather_group // 8) == 0:
+                    buffer_store(scale, group_scale, pk * 8 // gather_group)
 
     # --- reduce with the gather's puts fired from inside it -------------------
     #
@@ -1035,6 +1133,19 @@ def build_sdma_phases(
                 ]
                 for c in range_constexpr(chunks_per_row):
                     off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
+                    if const_expr(gather_group > 0):
+                        scales = [
+                            fx.Float32(
+                                buffer_load(
+                                    scas[i],
+                                    off // gather_group,
+                                    vec_width=1,
+                                    dtype=fx.Float32,
+                                    cache_modifier=CM_SC1,
+                                )
+                            )
+                            for i in range_constexpr(ws - 1)
+                        ]
                     vals = [
                         buffer_load(
                             srcs[i],
@@ -1097,8 +1208,13 @@ def build_sdma_phases(
     drain = _push_kernel(start_off)
 
     def _phase(kern, grid, blk):
+        phase_specialization = f"{specialization}:{kern._name}:{grid}:{blk}"
+
         @flyc.jit
         def go(dev_comm: Int64, win: Int64, stream=fx.Stream(None)):
+            # Factory configuration objects are not scalar closure captures.
+            # Keep the complete specialization in the persisted JIT identity.
+            assert const_expr(len(phase_specialization) > 0)
             kern(dev_comm, win).launch(
                 grid=(grid, 1, 1), block=[blk, 1, 1], stream=stream
             )
@@ -1141,7 +1257,11 @@ def build_sdma_phases(
         # Folding the narrowing into the reduce replaces two phases with one.
         # `fuse_quantize=False` keeps them split, which is how the two are
         # compared.
-        head = ("reduce_quant",) if fuse_quantize else ("reduce", "quantize")
+        head = (
+            ("reduce",)
+            if gather_group
+            else (("reduce_quant",) if fuse_quantize else ("reduce", "quantize"))
+        )
         tail = head + (
             ("gather_barrier", "pull") if cfg.lsa_gather else ("gather", "dequantize")
         )

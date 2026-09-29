@@ -93,6 +93,7 @@ from ._compat import (
     atomic_store_u32,
     atomic_xchg_u32,
     buffer_store,
+    buffer_load,
     create_buffer_resource_from_addr,
     i32_type,
     signal_ptr,
@@ -938,6 +939,8 @@ def compile_fused_gemm_scatter(
     transport: str = "sdma",
     emit_put: bool = True,
     atomic_order: str = "acq_rel",
+    chunk_bands: int = 0,
+    relaxed_rows: bool = False,
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
 
@@ -983,6 +986,8 @@ def compile_fused_gemm_scatter(
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``.
     """
+    from ._quant_experiment import _pack8_fp8, _bpermute_f32
+
     cfg.validate()
     ws = cfg.world_size
     M, N = cfg.m, cfg.n
@@ -1098,7 +1103,7 @@ def compile_fused_gemm_scatter(
             "destination has to be a compile-time constant for the modulo test"
         )
     slice_rows = M // ws
-    if rotated and slice_rows % BLOCK_M:
+    if rotated and not relaxed_rows and slice_rows % BLOCK_M:
         raise ValueError(
             f"each peer's row slice ({slice_rows}) must be a whole number of "
             f"BLOCK_M={BLOCK_M} tiles, so M must be a multiple of "
@@ -1121,26 +1126,57 @@ def compile_fused_gemm_scatter(
     # Compile-time tile accounting for the completion counters.
     n_blocks_const = N // BLOCK_N
     m_tiles_per_peer = slice_rows // BLOCK_M if slice_rows % BLOCK_M == 0 else 0
+    if relaxed_rows:
+        if not fuse or direct_lsa or slice_rows < BLOCK_M or not chunk_bands:
+            raise ValueError(
+                "relaxed rows requires fused SDMA, a full tile per peer, and chunk_bands"
+            )
+        m_tiles_per_peer = ceildiv(slice_rows, BLOCK_M)
+    relaxed_order = (
+        sorted(
+            range(ceildiv(M, BLOCK_M)),
+            key=lambda t: (
+                ((t * BLOCK_M) % slice_rows) // BLOCK_M,
+                ((t * BLOCK_M) // slice_rows - rank) % ws,
+            ),
+        )
+        if relaxed_rows
+        else []
+    )
 
     # Push granularity. A destination's slice is `m_tiles_per_peer` row-bands of
     # BLOCK_M rows; pushing each band as it completes is what lets every link
     # start streaming early instead of waiting for its whole slice.
     chunks = cfg.counter_chunks if fuse else 1
-    if fuse and m_tiles_per_peer % chunks:
+    if chunk_bands and (not fuse or direct_lsa):
+        raise ValueError("chunk_bands requires fused SDMA")
+    if chunk_bands and chunks != ceildiv(m_tiles_per_peer, chunk_bands):
+        raise ValueError("counter_chunks must cover the short-tail chunks")
+    if fuse and not chunk_bands and m_tiles_per_peer % chunks:
         raise ValueError(
             f"counter_chunks={chunks} must divide the {m_tiles_per_peer} "
             f"BLOCK_M={BLOCK_M} row-bands in each peer's slice"
         )
-    m_tiles_per_chunk = max(1, m_tiles_per_peer // chunks)
+    m_tiles_per_chunk = chunk_bands or max(1, m_tiles_per_peer // chunks)
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
-    chunk_bytes = cfg.slice_bytes // chunks
+    chunk_bytes = m_tiles_per_chunk * BLOCK_M * N * cfg.scatter_elem_bytes
 
-    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}"
+    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}b{chunk_bands}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
     my_recv_slot = cfg.recv_slot_off(rank) if cfg.recv_slots else 0
-    slice_bytes = cfg.slice_bytes
+    slice_bytes = cfg.scatter_slice_bytes
+    compact_recv = getattr(cfg, "compact_recv", False)
+    recv_base_off = cfg.recv_off
+    recv_slot_stride = cfg._cap.scatter_slice_bytes
+    fp8_scatter = cfg.fp8_scatter
+    if fp8_scatter and (not fuse or direct_lsa or relaxed_rows or compact_recv):
+        raise ValueError(
+            "FP8 scatter prototype requires aligned, non-compact fused SDMA"
+        )
+    if fp8_scatter and BLOCK_N != cfg.scatter_scale_n:
+        raise ValueError("scatter scale tile must match BLOCK_N")
 
     _kname = (
         f"mori_fused_{(transport if fuse else 'split')}_8w_"
@@ -1190,7 +1226,14 @@ def compile_fused_gemm_scatter(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        if const_expr(rotated):
+        if const_expr(relaxed_rows and rotated):
+            raw_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)
+            block_m = fx.Int32(relaxed_order[-1])
+            for ii in range_constexpr(len(relaxed_order) - 1):
+                block_m = (raw_m == fx.Int32(ii)).select(
+                    fx.Int32(relaxed_order[ii]), block_m
+                )
+        elif const_expr(rotated):
             # Destination-rotated, chunk-major tile order. Linear order finishes
             # destination 0's whole slice, then 1's, ...  -- so the last
             # destination's link only starts at the end of the GEMM and the
@@ -1627,6 +1670,57 @@ def compile_fused_gemm_scatter(
             store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
 
+        if const_expr(fp8_scatter):
+            # Prototype: reuse the BF16 output region as GEMM staging, then
+            # compress each completed tile before electing its SDMA producer.
+            # Sixteen lanes own a 256-column row segment; no inter-CTA amax.
+            wait_barrier(0)
+            qsrc = create_buffer_resource_from_addr(
+                wave_uniform_i64(w_pre.lsa_ptr(rank, cfg.output_off))
+            )
+            qdst = create_buffer_resource_from_addr(
+                wave_uniform_i64(w_pre.lsa_ptr(rank, cfg.input_off))
+            )
+            qscale = create_buffer_resource_from_addr(
+                wave_uniform_i64(w_pre.lsa_ptr(rank, cfg.input_scale_off))
+            )
+            qlane = fx.thread_idx.x % 16
+            qrow = fx.thread_idx.x // 16
+            for rr in range_constexpr(BLOCK_M // 32):
+                row = block_m * BLOCK_M + qrow + rr * 32
+                col = block_n * BLOCK_N + qlane * 16
+                pos = row * N + col
+                halves = [
+                    Vec(
+                        buffer_load(
+                            qsrc, pos // 2 + hh * 4, vec_width=4, dtype=i32_type()
+                        )
+                    )
+                    .bitcast(fx.BFloat16)
+                    .to(fx.Float32)
+                    for hh in range_constexpr(2)
+                ]
+                amax = fx.Float32(0.0)
+                for hh in range_constexpr(2):
+                    for ee in range_constexpr(8):
+                        v = halves[hh][ee]
+                        amax = amax.maximumf(v.maximumf(-v))
+                for delta in (1, 2, 4, 8):
+                    amax = amax.maximumf(
+                        _bpermute_f32(amax, (fx.thread_idx.x % 64) ^ delta)
+                    )
+                scale = (amax == fx.Float32(0.0)).select(
+                    fx.Float32(1.0), amax / fx.Float32(448.0)
+                )
+                inv = fx.Float32(1.0) / scale
+                words = []
+                for hh in range_constexpr(2):
+                    q = _pack8_fp8([halves[hh][ee] * inv for ee in range_constexpr(8)])
+                    words += [q[0], q[1]]
+                buffer_store(fx.Vector.from_elements(words, fx.Int32), qdst, pos // 4)
+                if qlane == 0:
+                    buffer_store(scale, qscale, row * (N // BLOCK_N) + block_n)
+
         if const_expr(direct_lsa):
             # Publish the peer stores from the blocks that made them. This is the
             # one thing Direct LSA cannot inherit from the split path: in the LSA
@@ -1644,7 +1738,70 @@ def compile_fused_gemm_scatter(
             # what made it look like a per-wave release was mandatory.
             raw_cco.cco_system_fence(fx.Int32(1 if direct_fence == "leader" else 0))
 
-        if const_expr(fuse and not direct_lsa):
+        if const_expr(fuse and not direct_lsa and relaxed_rows):
+            # A tile can contribute to two owners and to two chunk boundaries.
+            # Count tile/segment intersections instead of requiring row slices
+            # to be multiples of BLOCK_M. Only boundary tiles publish twice.
+            wait_barrier(0)
+            ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
+            lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                row_lo = block_m * fx.Int32(BLOCK_M)
+                row_end = row_lo + fx.Int32(BLOCK_M)
+                row_hi = (row_end < fx.Int32(M)).select(row_end, fx.Int32(M))
+                dest_begin = row_lo // fx.Int32(slice_rows)
+                dest_end = (row_hi - 1) // fx.Int32(slice_rows)
+                for dest in range(dest_begin, dest_end + 1):
+                    local_lo = row_lo - dest * fx.Int32(slice_rows)
+                    local_lo = (local_lo > 0).select(local_lo, fx.Int32(0))
+                    local_hi = row_hi - dest * fx.Int32(slice_rows)
+                    local_hi = (local_hi < fx.Int32(slice_rows)).select(
+                        local_hi, fx.Int32(slice_rows)
+                    )
+                    first_chunk = local_lo // fx.Int32(m_tiles_per_chunk * BLOCK_M)
+                    last_chunk = (local_hi - 1) // fx.Int32(m_tiles_per_chunk * BLOCK_M)
+                    for chunk in range(first_chunk, last_chunk + 1):
+                        seg_lo = chunk * fx.Int32(m_tiles_per_chunk * BLOCK_M)
+                        seg_end = seg_lo + fx.Int32(m_tiles_per_chunk * BLOCK_M)
+                        seg_hi = (seg_end < fx.Int32(slice_rows)).select(
+                            seg_end, fx.Int32(slice_rows)
+                        )
+                        global_lo = dest * fx.Int32(slice_rows) + seg_lo
+                        global_hi = dest * fx.Int32(slice_rows) + seg_hi
+                        expected = (
+                            (global_hi + BLOCK_M - 1) // BLOCK_M - global_lo // BLOCK_M
+                        ) * fx.Int32(n_blocks_const)
+                        slot = dest * fx.Int32(chunks) + chunk
+                        ctr = signal_ptr(ctr_base + fx.Int64(slot) * 4)
+                        seq = (
+                            fx.Int32(atomic_add_u32(ctr, 1, ordering=atomic_order)) + 1
+                        )
+                        if seq % expected == 0:
+                            if dest != fx.Int32(rank):
+                                lock = signal_ptr(lock_base + fx.Int64(dest) * 4)
+                                _acquire_peer_lock(lock)
+                                byte_off = fx.Int64(seg_lo) * fx.Int64(
+                                    N * cfg.elem_bytes
+                                )
+                                sdma.put(
+                                    dest,
+                                    win,
+                                    fx.Int64(my_recv_slot) + byte_off,
+                                    win,
+                                    fx.Int64(in_off)
+                                    + fx.Int64(global_lo)
+                                    * fx.Int64(N * cfg.elem_bytes),
+                                    fx.Int64(seg_hi - seg_lo)
+                                    * fx.Int64(N * cfg.elem_bytes),
+                                    dest % fx.Int32(sdma_queues),
+                                    coop=cco.CoopScope.THREAD,
+                                    signal=False,
+                                )
+                                atomic_store_u32(lock, 0)
+            fgpu.barrier()
+
+        if const_expr(fuse and not direct_lsa and not relaxed_rows):
             # Retire every lane's C stores, then agree block-wide that they are
             # retired. `wait_barrier` is aiter's own `s_waitcnt vmcnt(0);
             # s_barrier` pair, reused so the tail matches the main loop's idiom.
@@ -1681,7 +1838,20 @@ def compile_fused_gemm_scatter(
                 # chunk, this epoch" is a modulo test rather than a compare. Same
                 # reason the barrier flags in ar/kernels_lsa are never reset -- it
                 # is what makes graph replay behave like a fresh launch.
-                if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
+                ready_tiles = fx.Int32(tiles_per_chunk)
+                put_bytes = fx.Int64(chunk_bytes)
+                if const_expr(chunk_bands > 0):
+                    remaining_bands = fx.Int32(m_tiles_per_peer) - chunk * fx.Int32(
+                        m_tiles_per_chunk
+                    )
+                    live_bands = (remaining_bands < fx.Int32(m_tiles_per_chunk)).select(
+                        remaining_bands, fx.Int32(m_tiles_per_chunk)
+                    )
+                    ready_tiles = live_bands * fx.Int32(n_blocks_const)
+                    put_bytes = fx.Int64(live_bands) * fx.Int64(
+                        BLOCK_M * N * cfg.scatter_elem_bytes
+                    )
+                if seq % ready_tiles == fx.Int32(0):
                     if const_expr(emit_put) and dest != fx.Int32(rank):
                         # One queue per destination. Two chunks of the same
                         # destination can be elected at nearly the same moment and
@@ -1689,18 +1859,26 @@ def compile_fused_gemm_scatter(
                         # short issue only, and they share one xGMI link either
                         # way, so a queue each would buy nothing.
                         off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
+                        remote_recv_slot = fx.Int64(my_recv_slot)
+                        if const_expr(compact_recv):
+                            remote_index = (fx.Int32(rank) < dest).select(
+                                fx.Int32(rank), fx.Int32(rank - 1)
+                            )
+                            remote_recv_slot = fx.Int64(recv_base_off) + fx.Int64(
+                                remote_index
+                            ) * fx.Int64(recv_slot_stride)
                         lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
                         if const_expr(chunks > 1):
                             _acquire_peer_lock(lock)
                         sdma.put(
                             dest,
                             win,
-                            fx.Int64(my_recv_slot) + off,
+                            remote_recv_slot + off,
                             win,
                             fx.Int64(in_off)
                             + fx.Int64(dest) * fx.Int64(slice_bytes)
                             + off,
-                            fx.Int64(chunk_bytes),
+                            put_bytes,
                             # Queues are per (source, destination) pair, so
                             # every peer gets its own even at sdma_queues=1;
                             # allocating one per peer *per pair* only wastes
@@ -1709,6 +1887,24 @@ def compile_fused_gemm_scatter(
                             coop=cco.CoopScope.THREAD,
                             signal=False,
                         )
+                        if const_expr(fp8_scatter):
+                            scale_off = fx.Int64(
+                                chunk * m_tiles_per_chunk * BLOCK_M
+                            ) * fx.Int64((N // BLOCK_N) * 4)
+                            sdma.put(
+                                dest,
+                                win,
+                                fx.Int64(cfg.recv_scale_slot_off(rank)) + scale_off,
+                                win,
+                                fx.Int64(cfg.input_scale_off)
+                                + fx.Int64(dest)
+                                * fx.Int64(cfg.scatter_scale_slice_bytes)
+                                + scale_off,
+                                put_bytes * fx.Int64(4) // fx.Int64(BLOCK_N),
+                                dest % fx.Int32(sdma_queues),
+                                coop=cco.CoopScope.THREAD,
+                                signal=False,
+                            )
                         if const_expr(chunks > 1):
                             atomic_store_u32(lock, 0)
             # gcnasm closes its ChunkFused epilogue with a barrier here; its
