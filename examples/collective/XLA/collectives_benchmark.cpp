@@ -142,7 +142,7 @@ __global__ void VerifyReduceKernel(const ElemT* output, size_t count, size_t glo
     float acc = static_cast<float>(1 + static_cast<int>(globalIdx % 8));  // PE 0 seed
     for (int p = 1; p < npes; p++) {
       float term = static_cast<float>((p + 1) + static_cast<int>(globalIdx % 8));
-      auto err = detail::DispatchReduceOp<ElemT>(op, [&acc, term](auto reduceOp) {
+      auto err = detail::DispatchReduceOp<float>(op, [&acc, term](auto reduceOp) {
         acc = reduceOp(acc, term);
         return hipSuccess;
       });
