@@ -519,7 +519,9 @@ __device__ __forceinline__ void StartSdmaScatter(
 // the collectives using it: a PE only increments again after its launch
 // completes, which requires data from every peer, which each peer sends only
 // after leaving this wait. `>= target` (rather than `% npes == 0`) stays correct
-// even for a user whose completion does not depend on all peers. Requires npes > 1.
+// even for a user whose completion does not depend on all peers. The pull
+// reduce-scatter calls it twice per launch (entry + exit); that is fine as long
+// as every PE issues the same sequence of calls. Requires npes > 1.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void PushEntryBarrier(uint64_t* ctr, int myPe, int npes,
                                                  int32_t stride4G) {
