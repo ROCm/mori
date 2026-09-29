@@ -511,24 +511,57 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 // A thin wrapper over detail::PullReduceShard, which is the whole collective
 // here: every PE reads its shard out of every peer's input over XGMI and
 // reduces it in one fused grid-strided pass. There is no staging buffer and no
-// cross-block flag handoff, so every block is independent (no co-residency cap).
-// The all-reduce pull kernel runs the same core as its shot 1.
+// cross-block data handoff. The all-reduce pull kernel runs the same core as its
+// shot 1.
 //
-// Correctness requires all PEs to have produced their input before launch; the
-// host issues a ccoBarrierAll() before timing.
+// Two PushEntryBarrier rounds per launch make back-to-back launches and input
+// reuse safe without a host barrier:
+//   * entry: no block may read a peer's input before that peer has entered this
+//     launch (its producer kernels have retired). Block 0 runs the barrier and
+//     releases the other blocks through groupCounters[1]; all blocks must be
+//     co-resident (grid <= CU count).
+//   * exit: the last block out waits until every peer has finished reading MY
+//     input, so the kernel completing means the caller may overwrite it.
+//
+//   groupCounters : plain device buffer (>= 2 uint32), zeroed once by the host.
+//                   [0] elects the last block, [1] is the entry go-flag; both
+//                   are reset by the last block.
+//   barrierCtr    : symmetric-heap uint64 shared with the push collectives.
 // ---------------------------------------------------------------------------
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
-__global__ void ReduceScatterPullKernel(int myPe,
-                                        mori::cco::ccoWindow_t heapWin,
-                                        const T* __restrict__ input,
-                                        T* __restrict__ output, size_t chunkElems) {
+__global__ void __launch_bounds__(256, 1)
+ReduceScatterPullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
+                        const T* __restrict__ input, T* __restrict__ output,
+                        size_t chunkElems, uint32_t* __restrict__ groupCounters,
+                        uint64_t* __restrict__ barrierCtr) {
+  const uint32_t stride4G = heapWin->stride4G;
+  if (threadIdx.x == 0) {
+    auto* go = cco::impl::global(&groupCounters[1]);
+    if (blockIdx.x == 0) {
+      PushEntryBarrier(barrierCtr, myPe, NPES, stride4G);
+      __hip_atomic_store(go, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+      while (__hip_atomic_load(go, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
+         //__builtin_amdgcn_s_sleep(1);
+      }
+    }
+  }
+  __syncthreads();
+
   // System scope: the caller hands output to a remote reader after the kernel,
   // so it must not linger in a local cache line.
   auto store = [output](size_t elemIdx, auto v) {
     StreamStore<ESystemScope, sizeof(v)>(output + elemIdx, v);
   };
-  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, heapWin->stride4G, input, store,
-                                                   chunkElems);
+  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store, chunkElems);
+
+  // __threadfence_system();
+  if (threadIdx.x == 0 && atomicAdd(&groupCounters[0], 1u) + 1 == gridDim.x) {
+    PushEntryBarrier(barrierCtr, myPe, NPES, stride4G);
+    // Every block has counted in, so all are past the go-flag wait.
+    groupCounters[0] = 0;
+    groupCounters[1] = 0;
+  }
 }
 
 } // namespace collective
