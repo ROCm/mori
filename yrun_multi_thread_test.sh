@@ -56,7 +56,6 @@ export MORI_DISABLE_P2P=0
 export MORI_ENABLE_SDMA=1
 # it looks like 1 channel gives the best performance
 export MORI_SDMA_NUM_CHANNELS=1
-export RS_MIN_SIGNAL_SLOTS_PER_DEV=2
 
 # CCO socket rendezvous (single host, one process, one thread per GPU).
 export MORI_SOCKET_IFNAME=lo
