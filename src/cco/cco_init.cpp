@@ -134,13 +134,13 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
       // ccoSdmaQueueDeviceHandle* (layout-compatible, byte-copied by sizeof).
       // getSdmaQueue returns null for a pair it never connected, or a channel
       // past what that pair got; slot stays null rather than faulting here.
-      anvil::SdmaQueueDeviceHandle* handle = nullptr;
-      if (auto* queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)) {
-        handle = queue->deviceHandle();
-      } else {
+      auto* queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q);
+      if (queue == nullptr) {
         MORI_SHMEM_ERROR("no SDMA queue for local peer {} channel {}; its puts move no bytes", lsa,
                          q);
+        continue;
       }
+      auto* handle = queue->deviceHandle();
       HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
                                   sizeof(handle), hipMemcpyHostToDevice));
     }
