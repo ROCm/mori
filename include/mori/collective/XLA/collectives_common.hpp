@@ -55,6 +55,19 @@ static constexpr int kRSPushMaxSlices = 8;
 // never exceeds kRSPushMaxPeers-1 < 256, so no add carries into the next slice's
 // byte -- the bytes are independent and a torn 2x32-bit read is still exact.
 static constexpr int kSliceSignalSlot = 0;
+// Signal slots the push collectives touch: the slice counter plus all-reduce's
+// packed broadcast counter. The default pool is lsaSize * sdmaNumQueue, which
+// the facade checks is at least this.
+static constexpr int kSdmaSignalSlotsUsed = 2;
+// All-reduce's packed broadcast counter: byte b counts peers whose broadcast b
+// has landed.
+static constexpr int kBcastSlot = kSliceSignalSlot + 1;
+static_assert(kBcastSlot < kSdmaSignalSlotsUsed, "broadcast counter must be a checked slot");
+
+// groupCounters layout (local uint32 buffer): [0, kRSPushMaxSlices) per-slice
+// arrival counters, then all-reduce's two broadcast release flags.
+static constexpr int kBcastFlagIdx = kRSPushMaxSlices;
+static constexpr int kGroupCounterCount = kBcastFlagIdx + 2;
 static_assert(kRSPushMaxSlices * 8 <= 64 && kRSPushMaxPeers - 1 < 256,
               "slice counters must fit one byte each of a uint64");
 
@@ -481,16 +494,16 @@ __device__ __forceinline__ void StartSdmaScatter(
 }
 
 // Writes one pre-posted broadcast into the two 64B ring slots starting at pktBase:
-// [POLL *flag == value][COPY src->dst + ADD64(1) into signal]. The copy reads src
-// only once its poll passes, so src need not be ready yet. Each slot wraps on its
+// [POLL *flag == value][COPY src->dst + ADD64(addValue) into signal]. The copy reads
+// src only once its poll passes, so src need not be ready yet. Each slot wraps on its
 // own: the reservation may span the ring end, a 64B packet never does.
 __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf, uint64_t pktBase,
                                                     const void* src, const void* dst, size_t bytes,
-                                                    HSAuint64* signal, const uint32_t* flag,
-                                                    uint32_t value) {
+                                                    HSAuint64* signal, uint64_t addValue,
+                                                    const uint32_t* flag, uint32_t value) {
   WritePollPacket(sub, flag, value,
                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
-  WriteFusedPacket(sub, src, dst, bytes, signal, /*addValue=*/1,
+  WriteFusedPacket(sub, src, dst, bytes, signal, addValue,
                    queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopyAtomicPktSize) /
                                   sizeof(uint32_t));
 }
