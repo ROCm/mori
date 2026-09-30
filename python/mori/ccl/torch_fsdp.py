@@ -19,7 +19,9 @@ sized ``MoriSdmaAllGatherPool`` with fixed slot assignments.
 Without a pool, every instance retains a full output after reshard, including
 when zero-copy is disabled. A pool retains only its configured slot capacities;
 reshard returns a slot lease without unregistering or reallocating its storage.
-Both modes follow FSDP's logical reshard and backward all-gather policy.
+Post-forward resharding to a strict subgroup requires a pool, for example
+``reshard_after_forward=2`` with four ranks. Without a pool, an instance is
+bound to one process group and cannot serve a backward subgroup gather.
 """
 
 import importlib
@@ -355,7 +357,9 @@ class MoriSdmaAllGather(AllGather):
             uses in place, skipping the rank-major copy-out wherever the
             parameter group is eligible. Defaults to ``True``.
         output_pool: Optional shared registered storage. Each backend retains a
-            separate layout/owner; only its output memory is shared.
+            separate layout/owner; only its output memory is shared. Required
+            when post-forward resharding uses a strict subgroup, such as
+            ``reshard_after_forward=2`` with four ranks.
         buffer_index: Fixed slot in ``output_pool``. Assign groups that may be
             unsharded concurrently to distinct slots.
         group_key: Optional unique name for cross-rank binding validation.

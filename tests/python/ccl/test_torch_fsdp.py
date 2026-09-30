@@ -57,7 +57,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         )
         self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
         self.assertIsInstance(selected_layout, DefaultAllGatherLayout)
-        self.assertIsNone(metadata)
+        self.assertEqual(metadata, [2, 4])
         self.assertIsNone(comm._param_contiguous_split_sizes)
 
     def test_uses_safe_base_copy_in(self):
@@ -784,15 +784,16 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         self._initialize(pool)
         stream = torch.cpu.current_stream()
 
-        def prepare(params, group, device, backend):
-            backend.allocate((4,), dtype=torch.float32, device=device).fill_(1)
-            raise RuntimeError("copy-in failed")
-
-        with patch.object(torch.cuda, "current_stream"):
+        with patch.object(torch.cuda, "current_stream"), patch(
+            "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_param_all_gather_inputs",
+            return_value=[[torch.ones(2)]],
+        ), patch.object(
+            comm.layout, "copy_in", side_effect=RuntimeError("copy-in failed")
+        ):
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, "copy-in failed"):
                     foreach_all_gather([], pool._group, False, stream, stream,
-                                       torch.device("cpu"), comm, all_gather_input_fn=prepare)
+                                       torch.device("cpu"), comm)
                 self.assertIsNone(pool._slots[0].owner)
                 self.assertFalse(pool._failed)
             comm.release_output()

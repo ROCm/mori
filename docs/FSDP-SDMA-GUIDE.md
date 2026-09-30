@@ -124,10 +124,15 @@ Automatic garbage collection does not perform collective cleanup.
 
 Requires the matching PyTorch layout interface and `AllGather.release_output`
 hook. Supports eager training; CUDA graphs are rejected. Unsupported layouts
-use the rank-major copy-out fallback. Integer post-forward reshard gathers use
-the native subgroup collective, then restore the same parameter storage. The
-fallback is correct but is not zero-copy. The default adapter without an
-explicit pool retains the previous per-group allocation behavior.
+use the rank-major copy-out fallback. Post-forward resharding to a strict
+subgroup requires `output_pool`, for example `reshard_after_forward=2` with
+four ranks. The pooled adapter uses the native subgroup collective, then
+restores the same parameter storage; this fallback is not zero-copy. Without
+a pool, each adapter is bound to one process group and cannot serve a backward
+subgroup gather. Integer values `1` and the full shard-group size normalize
+to `False` and `True`, respectively, and do not create this subgroup case.
+The default adapter without an explicit pool retains the previous per-group
+allocation behavior.
 In particular, non-pooled `zero_copy_output=False` is a legacy resident-buffer
 mode, not a memory-saving mode. Use an explicitly shared pool for bounded
 registered output capacity; this change does not silently switch it to Native
