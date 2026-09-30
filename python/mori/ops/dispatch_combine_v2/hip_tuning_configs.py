@@ -287,24 +287,6 @@ _INTERNODE_GEOMETRY_FIELDS = (
     ("combine_block_num", "combine_rdma_block_num", "combine_warp_num_per_block"),
 )
 
-# Legacy MI308X FP8-dispatch/BF16-combine measurements. Preserve the historical
-# fallback across dtypes and families when JSON has no rules for the shape.
-# Rows: token ceiling, dispatch B/R/W, combine B/R/W.
-_LEGACY_INTERNODE_TABLE = {
-    ("mi308x", 16, 6144, 8): (
-        (4, 32, 16, 4, 32, 21, 6),
-        (8, 64, 32, 8, 32, 21, 6),
-        (16, 80, 40, 4, 80, 40, 4),
-        (None, 80, 48, 8, 64, 48, 6),
-    ),
-    ("mi308x", 16, 7168, 8): (
-        (4, 64, 42, 8, 32, 16, 16),
-        (8, 32, 21, 16, 32, 16, 4),
-        (16, 80, 40, 4, 80, 40, 4),
-        (None, 80, 48, 8, 64, 48, 6),
-    ),
-}
-
 
 def internode_kernel_family(cfg, num_tokens):
     """Resolve auto using live tokens, independently of the declared capacity."""
@@ -378,7 +360,7 @@ def internode_schedule(cfg):
         for family in internode_kernel_families(cfg)
     }
     edges = {row[0] for table in tables.values() for row in table if row[0] is not None}
-    if cfg.internode_kernel == "auto" and cfg.internode_auto_ll_max_tokens >= 1:
+    if cfg.internode_kernel == "auto":
         edges.add(cfg.internode_auto_ll_max_tokens)
 
     pinned = getattr(cfg, "_pinned_geometry", frozenset())
@@ -413,22 +395,6 @@ def internode_table_dir():
     return Path(os.environ.get("MORI_EP_V2_TUNING_DIR") or _INTERNODE_TABLE_DIR)
 
 
-def _legacy_internode_buckets(world_size, hidden_dim, topk):
-    schedule = _LEGACY_INTERNODE_TABLE.get(
-        (_gpu.detect_model(), world_size, hidden_dim, topk)
-    )
-    if not schedule:
-        return None
-    return [
-        (
-            row[0],
-            fit_internode_geometry(row[1:4], clamp_to_cu=True),
-            fit_internode_geometry(row[4:7], clamp_to_cu=True),
-        )
-        for row in schedule
-    ]
-
-
 def internode_buckets(
     world_size,
     hidden_dim,
@@ -440,10 +406,14 @@ def internode_buckets(
 ):
     """Return (token ceiling, dispatch geometry, combine geometry) rows.
 
-    Each phase matches its own dtype. Exact expert counts override wildcards
-    only at the same token ceiling; other ceilings keep their wildcard rows.
+    Each phase matches its own dtype and stored width (packed for FP4 dispatch).
+    Top-k and experts per rank must match explicitly; missing fields are not
+    wildcards. Total experts are world_size * experts_per_rank.
     An untuned phase is None, and a wholly untuned shape returns None.
     """
+    if topk is None or experts_per_rank is None:
+        return None
+
     from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR, TuningConfigManager
 
     kernel_type = _INTERNODE_KERNEL_TYPES.get(kernel_family)
@@ -451,13 +421,20 @@ def internode_buckets(
         return None
     model, arch = _gpu.detect_model(), _gpu.arch_name()
     if model is None or arch is None:
-        return _legacy_internode_buckets(world_size, hidden_dim, topk)
+        return None
     manager = TuningConfigManager.get_instance(
         arch, kernel_type, world_size, model, directory=internode_table_dir()
     )
     dtypes = {
         "dispatch": dispatch_dtype,
         "combine": combine_dtype if combine_dtype is not None else dispatch_dtype,
+    }
+    packed_dispatch = DTYPE_TO_CONFIG_STR.get(dispatch_dtype) == "fp4"
+    if packed_dispatch and hidden_dim % 2:
+        return None
+    hidden_dims = {
+        "dispatch": hidden_dim // 2 if packed_dispatch else hidden_dim,
+        "combine": hidden_dim,
     }
     phase_rules = {
         "dispatch": manager.dispatch_rules,
@@ -467,32 +444,18 @@ def internode_buckets(
     for phase, rules in phase_rules.items():
         dtype_str = DTYPE_TO_CONFIG_STR.get(dtypes[phase])
         # The shared loader permits broader shape fallback. Restrict its input
-        # here so internode never borrows another hidden dimension or top-k.
-        rules = [
-            rule
-            for rule in rules
-            if rule["dtype"] == dtype_str
-            and rule["hidden_dim"] == hidden_dim
-            and rule.get("topk") in (None, topk)
-            and (
-                experts_per_rank is None
-                or rule.get("experts_per_rank") in (None, experts_per_rank)
-            )
-        ]
-        exact = {
-            rule["num_tokens"]
-            for rule in rules
-            if rule.get("experts_per_rank") is not None
-        }
+        # here so V2 never borrows another hidden dimension or expert/top-k shape.
         matched[phase] = [
             rule
             for rule in rules
-            if rule.get("experts_per_rank") is not None
-            or rule["num_tokens"] not in exact
+            if rule["dtype"] == dtype_str
+            and rule["hidden_dim"] == hidden_dims[phase]
+            and rule.get("topk") == topk
+            and rule.get("experts_per_rank") == experts_per_rank
         ]
         edges.update(rule["num_tokens"] for rule in matched[phase])
     if not edges:
-        return _legacy_internode_buckets(world_size, hidden_dim, topk)
+        return None
 
     table = []
     for num_tokens in sorted(edges):
@@ -505,7 +468,7 @@ def internode_buckets(
                 matched[phase],
                 dtype=dtypes[phase],
                 num_tokens=num_tokens,
-                hidden_dim=hidden_dim,
+                hidden_dim=hidden_dims[phase],
                 topk=topk,
                 **filters,
             )
@@ -554,7 +517,7 @@ def save_internode_result(
     directory=None,
     path=None,
 ):
-    """Merge one phase's rule with the shared JSON writer and invalidate cache."""
+    """Save an explicitly keyed expert/top-k rule and invalidate the cache."""
     from mori.ops.tuning_config import TuningConfigManager, build_config_filename
 
     if phase not in _INTERNODE_PHASES:
@@ -562,6 +525,11 @@ def save_internode_result(
     kernel_type = _INTERNODE_KERNEL_TYPES.get(kernel_family)
     if kernel_type is None:
         raise ValueError(f"unsupported internode kernel family: {kernel_family!r}")
+    entry = dict(entry)
+    for name in ("topk", "experts_per_rank"):
+        value = entry.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"V2 internode tuning requires a positive integer {name}")
     model, arch = _gpu.detect_model(), _gpu.arch_name()
     if path is None:
         if model is None or arch is None:
@@ -573,7 +541,6 @@ def save_internode_result(
         )
     else:
         path = Path(path)
-    entry = dict(entry)
     if phase == "combine":
         entry.setdefault("zero_copy", False)
         entry.setdefault("quant_type", "none")

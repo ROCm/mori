@@ -110,8 +110,12 @@ merge-on-save; `hip_tuning_configs.py` adds the HIP schedule and CU limits.
 - `num_tokens` is an inclusive ceiling; the largest matching rule also serves
   larger token counts. Dispatch/combine bucket edges are combined into a schedule,
   while a phase without matching rules keeps its default geometry.
-- A matching `experts_per_rank` rule overrides a wildcard at the same token
-  ceiling. Rules without that field remain applicable to other expert counts.
+- Both `topk` and `experts_per_rank` must be recorded and match exactly. Missing
+  fields are not wildcards in V2: unknown combinations use the default geometry.
+  Total experts equal `ep_size * experts_per_rank`; at EP16, 256/8 means
+  `experts_per_rank=16, topk=8`, while 384/6 means `experts_per_rank=24, topk=6`.
+  Saving also requires both fields, so different combinations coexist without
+  overwriting each other. V1's legacy wildcard lookup is unchanged.
 - `InterNodeV2` and `InterNodeV2LL` have separate files. In `auto` mode the family
   crossover is also a bucket edge, so each launch uses its own family's rules.
 

@@ -2,7 +2,64 @@
 
 本文按两个OP记录本次尝试、效果和是否采用；**带宽、延迟及前后对照统一放在 [bw.md](bw.md)**。
 
-## 当前实现与最新复测（2026-09-22 整理）
+## 测试方法更新（2026-09-30）
+
+本节记录当前工作区对 V2 调优结果入表方法的修改，适用于 [test_dispatch_combine_v2_internode.py](tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py) 的 `--cmd tuning --tuning-save` 路径。最终指标由 `_row_metrics()` 采样、[_grand_mean_metrics.py](tests/python/ops/dispatch_combine_v2/_grand_mean_metrics.py) 汇总，与 V1 的 grand mean 口径对齐；**搜索选优与最终入表测量仍是两个独立步骤**。下文9月的既有实验保留当时冻结版本、配置和统计口径，不按本节的新定义改写旧数值。
+
+### 计时与采样
+
+1. 选定配置后，用实际将写入表的 Dispatch/Combine 配对建立一个 op，重新测量最终指标，不复用候选对照时的搜索分数。
+2. 每个 `--tuning-reps` pass 独立执行 warmup，随后 `torch.cuda.synchronize()`、`dist.barrier()`，再记录首个 GPU event。屏障位于计时循环之前，循环内不加逐轮屏障。
+3. 每轮分别记录 Dispatch、显式 dtype 转换、Combine 的 event 边界。两阶段延迟及其和不包含中间的转换区间，但它们是 GPU event 区间，不等于纯 kernel 指令时间，也不等于完整端到端 wall time。
+4. 每个 pass 都丢弃前 `--drop-rounds` 轮，再汇总保留样本。当前默认参数为 `--warmup 20 --rounds 30 --drop-rounds 1 --tuning-reps 3`，即每个 rank、每阶段保留87个样本。
+5. 所有 pass 完成后，进行一次 CPU `all_gather_rows`，收集各 rank 的 payload 字节数依据和原始延迟。读取设备上的接收 token 数、跨 rank 汇总均不放入计时循环。
+
+### Grand Mean 与字节口径
+
+旧 `_row_metrics()` 先计算每个 pass 的 rank/round 平均延迟，再对 pass 取 median；带宽是 rank 0 的字节数除以该延迟，`bandwidth_gbps` 使用接收 payload 口径。现在先对**每个 rank、每个保留轮次**计算带宽，再跨所有 pass、rank、round 求算术平均，不再使用“字节数除以平均延迟”代替平均带宽。
+
+设 `r` 为 rank、`p` 为 pass、`i` 为保留轮次，`t[r,p,i]` 为该阶段延迟，单位为微秒。`recv[r]` 为本 rank 接收 token 数，`rdma[r]` 为 `_rdma_algo_token_count()` 按所测 family 计算的算法 token 数，`width[r]` 为该 rank、该阶段实际存储的每 token payload 字节数：
+
+```text
+avg_latency_us         = mean(t[r,p,i])
+avg_rdma_bandwidth_gbps = mean(rdma[r] * width[r] / (1000 * t[r,p,i]))
+avg_xgmi_bandwidth_gbps = mean(recv[r] * width[r] / (1000 * t[r,p,i]))
+ll_scale_rank0          = max_tokens * topk / (recv[0] + 1)
+avg_ll_bandwidth_gbps   = avg_xgmi_bandwidth_gbps * ll_scale_rank0
+```
+
+这里的 `mean` 覆盖全部保留样本。LL 与 V1 保存的 Average 行一致：**先求全局 XGMI 带宽均值，再乘 rank 0 的缩放比**，不是各 rank 单独缩放后再平均，也不是另测一条 LL 链路。结果仅在写入指标时保留两位小数。
+
+| 入表字段 | 新定义 |
+|---|---|
+| `bandwidth_metric` | `grand_mean` |
+| `bandwidth_gbps`，普通 `v2` | `avg_rdma_bandwidth_gbps` |
+| `bandwidth_gbps`，`v2_ll` | `avg_ll_bandwidth_gbps` |
+| `avg_rdma_bandwidth_gbps` / `avg_xgmi_bandwidth_gbps` / `avg_ll_bandwidth_gbps` | 分别保留上式三个指标，不把 XGMI 接收带宽当作普通 V2 的主指标 |
+
+Dispatch 的 `width[r]` 来自输入张量的 `shape[-1] * element_size()`；Combine 来自转换后张量的实际存储宽度。因此 packed FP4 Dispatch 按 packed bytes 计数，BF16 Combine 按解包后的字节数计数，不能两阶段都套用逻辑 hidden dimension 与同一个 dtype。以上是 hidden payload 带宽，不额外把 scale、weights 或控制信息加入字节分子。RDMA 使用 V1 兼容的算法计数，并非 NIC 实测流量：普通 V2 对每个 token 的目标 node 去重，计数可包含本节点；LL 则按 `tokens * node_count` 计数，不能将此列解释为严格的跨节点物理字节率。
+
+`_row_metrics(..., evidence_callback=...)` 可以返回所有 rank 的原始样本、字节数依据和采样参数供离线复算；这些证据不加入精简调优规则。普通 `--tuning-save` **不会自动归档这份 evidence**，需要调用方另行保存。旧表只有汇总值时，不能据此恢复逐 rank、逐轮样本，也不能仅把 `bandwidth_metric` 改名就视为完成迁移。
+
+### 选优与只刷新指标
+
+搜索仍使用 `_timed_pass()`：每个 pass 先求 rank/round 平均延迟，候选与基准配对重复测试，再使用 median、配对差值及最差轮次约束判断。默认 `--tuning-metric total` 比较 Dispatch+Combine 的延迟和；`phase` 只用于单阶段诊断。**本次没有修改这条搜索评分路径**，也没有把最终 `_metric_timing_pass()` 新增的循环前屏障加到搜索路径中。不能把搜索分数直接称为新入表带宽，或把默认 total 分数当成某个阶段的延迟。
+
+只更新已选配置的指标时，先清除 `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM`，在原双机启动命令中使用 `--cmd tuning --tuning-save --tuning-phase dispatch`（或 `combine`），并把 `--tuning-candidate B,R,W` 设为该形状当前解析出的对应阶段 geometry。脚本会排除与基准相同的候选，输出 `no candidate measured (refresh of the shipped geometry)`，保留 geometry 并重新测量；若指定 geometry 与基准不同，则是单候选调优，不是纯刷新。一次运行只保存指定阶段的规则，两个阶段都要更新时分别运行。
+
+使用 `--tuning-config-dir` 时，脚本会同时从该目录读取基准并写入结果；独立复测目录应先放入待验证的两阶段表，不能把空目录当成只改变输出位置。复测必须记录实际 dtype、H、token/capacity、专家数、Top-k、kernel family、QP、CCQE、weights/scale 和采样参数；固定 `--kernel-type v2` 或 `v2_ll`，避免 `auto` 在小 token 档切换 family。双机运行前确认无竞争负载；已有性能结论不外推到不同负载或网络条件。
+
+### MI355X 复测与专家组合
+
+MI355X 的旧 JSON 指标尚未用本次方法重测。例如普通 V2 Dispatch 的 BF16/H7168/T128/K6/epr16 行，`bandwidth_gbps=84.57`、`avg_rdma_bandwidth_gbps=30.58`；前者符合旧的 rank 0 接收字节数除以延迟，而不是新定义的 RDMA 主指标。即便旧行已经标注 `grand_mean`，也不能据此认定与本节可比。
+
+另外，当前 [ep_internode_kernel.hpp](src/ops/dispatch_combine_v2/ep_internode_kernel.hpp) 对普通 V2/V2LL Combine 增加了生产者同步与发布顺序修复，LL 还增加了等待最终 node count 的逻辑；这些修改也覆盖 gfx950。应使用新内核先跑正确性，再刷新现有配置的性能指标，并对代表形状做配对复核。统计口径变化本身不要求从零全量搜索；出现显著回退或候选优势变化时，再重扫受影响项。此前数值验收不代替新内核的 MI355X 硬件回归。
+
+V2 当前要求 `topk`、`experts_per_rank` 显式精确匹配，不再把缺字段规则当 wildcard；下文保留 wildcard 的描述仅是历史记录。EP16 下，总专家数为 `16 * experts_per_rank`：256/8 对应 `--experts-per-rank 16 --topk 8`，384/6 对应 `--experts-per-rank 24 --topk 6`。现有 MI355X Top-k 6 表记录的是256/6，不能作为384/6的实测结果；未覆盖的组合使用默认 geometry，须独立补调优后才能落表。
+
+**本次仅记录方法变更，未执行新的 MI355X GPU 复测，也未据此更新旧表的性能数值。** 后续新旧对照、复测结论及证据入口仍统一追加到 [bw.md](bw.md)。
+
+## 实现与复测快照（2026-09-22 整理）
 
 当前普通 v2 的 Dispatch 在去重后并行分配目标 slot。普通 Combine 在 gfx950、声明 capacity≤256 且行/staging stride 均为4字节整数倍时，直接调用已有的 `WarpAccumLF<T,4,2>`；其余情况使用 `WarpAccum<T,4>`。当前实现没有独立的向量尾部 helper，也没有额外的类型、topk 或节点拓扑选择条件；其它架构不启用这条 LF 路径。具体代码见 [ep_internode_kernel.hpp](src/ops/dispatch_combine_v2/ep_internode_kernel.hpp)。
 
