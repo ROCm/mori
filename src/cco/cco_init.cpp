@@ -132,6 +132,8 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
     for (int q = 0; q < comm->sdmaNumQueue; q++) {
       // anvil returns its own SdmaQueueDeviceHandle*; cco stores it as an opaque
       // ccoSdmaQueueDeviceHandle* (layout-compatible, byte-copied by sizeof).
+      // getSdmaQueue returns null for a pair it never connected, or a channel
+      // past what that pair got; slot stays null rather than faulting here.
       anvil::SdmaQueueDeviceHandle* handle = nullptr;
       if (auto* queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)) {
         handle = queue->deviceHandle();
