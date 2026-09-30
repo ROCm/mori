@@ -26,11 +26,13 @@
 #ifdef __linux__
 #include <dirent.h>
 #include <linux/mempolicy.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #endif
 
 // The checks below are plain asserts; keep them live in Release test builds.
 #undef NDEBUG
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -255,6 +257,84 @@ void TestNumaBindingActuallyBinds() {
   std::printf("    PASS\n");
 }
 
+// Nodes on which this process may run (a container cpuset can exclude some).
+int CountNodesWithAllowedCpus() {
+#ifdef __linux__
+  cpu_set_t allowed;
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return 0;
+  int count = 0;
+  for (int node = 0; node < 256; ++node) {
+    std::ifstream input("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+    std::string token;
+    bool usable = false;
+    while (input && std::getline(input, token, ',') && !usable) {
+      std::istringstream part(token);
+      int first = -1, last = -1;
+      char dash = 0;
+      if (!(part >> first)) continue;
+      last = first;
+      if (part >> dash) part >> last;
+      for (int cpu = first; cpu <= last && cpu < CPU_SETSIZE; ++cpu)
+        usable |= CPU_ISSET(cpu, &allowed);
+    }
+    count += usable;
+  }
+  return count;
+#else
+  return 0;
+#endif
+}
+
+double NodeMemFreeGiB(int node) {
+  std::ifstream input("/sys/devices/system/node/node" + std::to_string(node) + "/meminfo");
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto at = line.find("MemFree:");
+    if (at != std::string::npos) return std::stod(line.substr(at + 8)) / (1024.0 * 1024.0);
+  }
+  return 0;
+}
+
+// Worker i of an interleaved prefault runs on node i % N, so on a two-node host
+// the four 80 MiB chunks of this mapping alternate between the nodes.  First
+// touch falls back to the other node when the local one is near its watermark
+// (zone_reclaim_mode=0), so a host full of page cache cannot judge placement.
+void TestInterleavedPrefaultSplitsUnboundPagesEvenly() {
+  std::printf("  InterleavedPrefaultSplitsUnboundPagesEvenly...\n");
+  if (CountNodesWithAllowedCpus() != 2) {
+    std::printf("    SKIPPED (needs exactly two NUMA nodes this process may run on)\n");
+    return;
+  }
+  if (NodeMemFreeGiB(0) < 32 || NodeMemFreeGiB(1) < 32) {
+    std::printf("    SKIPPED (a node has under 32 GiB free; first touch would spill)\n");
+    return;
+  }
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.prefault = true;
+  // An odd budget: alternating five workers would put three chunks on one node.
+  opts.prefault_threads = 5;
+  opts.interleave_prefault = true;
+  constexpr size_t kBytes = 320ULL << 20;
+  constexpr size_t kSamples = 256;
+  auto handle = allocator.Alloc(kBytes, opts);
+  assert(handle.valid());
+  std::vector<void*> probes;
+  for (size_t i = 0; i < kSamples; ++i) {
+    probes.push_back(static_cast<char*>(handle.ptr) + kBytes / kSamples * i);
+  }
+  const auto nodes = QueryNodesForPages(probes);
+  allocator.Free(handle);
+  if (!nodes.has_value() ||
+      std::any_of(nodes->begin(), nodes->end(), [](int n) { return n < 0; })) {
+    std::printf("    SKIPPED (move_pages query unavailable on this host)\n");
+    return;
+  }
+  const auto on_first = std::count(nodes->begin(), nodes->end(), (*nodes)[0]);
+  assert(on_first >= 120 && on_first <= 136);
+  std::printf("    PASS (%td/%zu samples on node %d)\n", on_first, kSamples, (*nodes)[0]);
+}
+
 void TestNullHandleAfterAllocFailure() {
   std::printf("  NullHandleAfterAllocFailure...\n");
   HostMemAllocator allocator;
@@ -400,6 +480,7 @@ int main() {
   TestAnonymousHugetlbWhenAvailable();
   TestHugetlbFallsBackToAnonymous();
   TestNumaBindingActuallyBinds();
+  TestInterleavedPrefaultSplitsUnboundPagesEvenly();
   TestNumaFailureAndParallelPrefault();
   TestNullHandleAfterAllocFailure();
   TestMappedSizeRoundsUp();

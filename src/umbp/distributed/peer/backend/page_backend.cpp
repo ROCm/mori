@@ -62,7 +62,10 @@ uint32_t SizeToPages(uint64_t size, uint64_t page_size) {
   return static_cast<uint32_t>(pages);
 }
 
-void LogNumaPlacement(size_t index, const HostBufferHandle& handle) {
+// Unbound buffers log under a different prefix: launch scripts identify a NUMA
+// tier by the "tier layout" lines.
+void LogNumaPlacement(size_t index, const HostBufferHandle& handle, bool bound) {
+  const char* what = bound ? "tier layout (actual sampled)" : "tier placement (unbound, sampled)";
 #if defined(__linux__) && defined(__NR_move_pages)
   const size_t stride = std::max<size_t>(handle.actual_alignment, sysconf(_SC_PAGESIZE));
   const size_t pages = handle.mapped_size / stride;
@@ -74,17 +77,22 @@ void LogNumaPlacement(size_t index, const HostBufferHandle& handle) {
     addresses[i] = static_cast<char*>(handle.ptr) + (pages / samples * i) * stride;
   }
   if (syscall(__NR_move_pages, 0, samples, addresses.data(), nullptr, status.data(), 0) < 0) {
-    MORI_UMBP_WARN("[HostPageMemorySource] tier layout (actual): buffer={} query unavailable: {}",
-                   index, std::strerror(errno));
+    if (bound) {
+      MORI_UMBP_WARN("[HostPageMemorySource] tier layout (actual): buffer={} query unavailable: {}",
+                     index, std::strerror(errno));
+    }
     return;
   }
   std::map<int, size_t> counts;
   for (int node : status) ++counts[node];
   for (const auto& [node, count] : counts) {
-    MORI_UMBP_INFO(
-        "[HostPageMemorySource] tier layout (actual sampled): buffer={} node={} pages={}/{}", index,
-        node, count, samples);
+    MORI_UMBP_INFO("[HostPageMemorySource] {}: buffer={} node={} pages={}/{}", what, index, node,
+                   count, samples);
   }
+#else
+  (void)index;
+  (void)handle;
+  (void)what;
 #endif
 }
 
@@ -299,8 +307,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
   const int thread_budget =
       opts_.prefault_threads > 0
           ? opts_.prefault_threads
-          : (nodes.size() > 1 ? std::max(1u, std::min(16u, std::thread::hardware_concurrency()))
-                              : 1);
+          : static_cast<int>(std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
   const bool parallel =
       opts_.prefault && std::any_of(sizes.begin(), sizes.end(),
                                     [](uint64_t bytes) { return bytes >= (64ULL << 20); });
@@ -318,6 +325,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
     opts.require_numa_binding = !nodes.empty() && opts_.numa_strict;
     opts.prefault = opts_.prefault;
     opts.prefault_threads = std::max(1, thread_budget / buffer_workers);
+    opts.interleave_prefault = nodes.empty();
     if (!nodes.empty()) {
       MORI_UMBP_INFO(
           "[HostPageMemorySource] tier layout (target): buffer={} node={} bytes={} policy={} "
@@ -340,7 +348,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
     }
     // mapped_size, not the request: hugepage rounding makes the extra usable.
     staged.push_back(Buffer{handle.ptr, handle.mapped_size});
-    if (!nodes.empty()) LogNumaPlacement(i, handle);
+    if (!nodes.empty() || opts_.prefault) LogNumaPlacement(i, handle, !nodes.empty());
   }
 
   handles_.insert(handles_.end(), taken.begin(), taken.end());
