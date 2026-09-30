@@ -228,16 +228,16 @@ void PrefaultPages(void* ptr, size_t mapped_size, size_t stride, const HostBuffe
   const size_t pages = mapped_size / stride;
   size_t workers = std::min<size_t>(std::clamp(opts.prefault_threads, 1, 16),
                                     std::max<size_t>(1, mapped_size / (64ULL << 20)));
-  const auto& spread = NodesWithCpus();
-  const bool interleave = opts.numa_node < 0 && opts.interleave_prefault && spread.size() > 1;
+  const auto& nodes = NodesWithCpus();
+  const bool spread = opts.numa_node < 0 && opts.spread_prefault_across_nodes && nodes.size() > 1;
   // Whole rounds over the nodes, so first touch splits the mapping evenly.
-  if (interleave && workers >= spread.size()) workers -= workers % spread.size();
+  if (spread && workers >= nodes.size()) workers -= workers % nodes.size();
   if (workers == 1) {
     PrefaultRange(ptr, mapped_size, stride);
     return;
   }
   ParallelFor(workers, workers, [&](size_t i) {
-    ScopedNumaAffinity affinity(interleave ? spread[i % spread.size()] : opts.numa_node);
+    ScopedNumaAffinity affinity(spread ? nodes[i % nodes.size()] : opts.numa_node);
     const size_t begin = (pages / workers * i + std::min(i, pages % workers)) * stride;
     const size_t count = (pages / workers + (i < pages % workers)) * stride;
     PrefaultRange(static_cast<char*>(ptr) + begin, count, stride);

@@ -49,7 +49,7 @@ struct HostBufferOptions {
   int prefault_threads = 1;
   // Unbound mappings only: run prefault worker i on NUMA node i % N, so first
   // touch spreads the chunks evenly instead of filling one node first.
-  bool interleave_prefault = false;
+  bool spread_prefault_across_nodes = false;
 };
 
 struct HostBufferHandle {
