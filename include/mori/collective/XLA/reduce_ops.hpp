@@ -42,7 +42,7 @@
 #include <hip/hip_fp8.h>
 #endif
 
-#define FACADE_REDUCE_USE_ALL_TYPES 0
+#define FACADE_REDUCE_USE_ALL_TYPES 1
 
 #if defined(__HIPCC__) || defined(__HIP__)
 #include "mori/core/transport/p2p/device_primitives.hpp"  // Bf16BitsToF32
