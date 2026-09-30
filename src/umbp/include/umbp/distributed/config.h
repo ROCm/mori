@@ -168,8 +168,10 @@ struct DramOwnershipConfig {
   std::vector<uint64_t> buffer_sizes;
   bool use_hugepages = false;
   uint64_t hugepage_size = 2ULL * 1024 * 1024;
-  int numa_node = -1;
+  std::vector<int> numa_nodes;
   bool prefault = true;
+  bool numa_strict = false;
+  int prefault_threads = 0;
 };
 
 // HBM-tier ownership knobs.  Deliberately NOT a superset of the DRAM ones:
