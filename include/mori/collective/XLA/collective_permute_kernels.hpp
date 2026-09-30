@@ -47,7 +47,7 @@ namespace collective {
 //   srcPe    : peer that sends into our recvBuf, or -1 if nobody does
 //
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
-// dstPe == myPe), trailed by an ADD32 of 1 into the receiver's signalPtrs[0].
+// dstPe == myPe), trailed by an ADD64 of 1 into the receiver's signalPtrs[0].
 // Phase 2: if srcPe >= 0, thread 0 waits until the counter reaches 1, then an
 // acquire fence makes the peer SDMA write visible. Finally thread 0 resets the
 // counter for the next launch.
