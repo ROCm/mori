@@ -193,11 +193,11 @@ __device__ __forceinline__ void ReduceVecGroupBuffered(SrcRsrcFn srcRsrc, BufRsr
 //                   Phase 1), so back-to-back launches need no host barrier
 //
 // Each shard is split into S slices. A sender issues S separate SDMA copies; copy
-// s bumps the receiver's per-slice completion counter signalPtrs[s] via an SDMA
-// ADD64 of 1 (one copy + one atomic per (sender,slice)). On the receive side EVERY
-// block loops the S slices itself and calls the shared per-slice reduce
-// (detail::WaitAndReduceSlice): for slice s it spins on slice s's counter until it
-// reaches npes-1 senders, then the WHOLE grid reduces slice s. Slice order matches
+// s bumps byte s of the receiver's packed completion counter
+// signalPtrs[kSliceSignalSlot] via an SDMA ADD64 of 1 << 8s (one copy + one atomic
+// per (sender,slice)). On the receive side EVERY block loops the S slices itself
+// and calls the shared per-slice reduce (detail::WaitAndReduceSlice): for slice s
+// it spins until byte s of that counter reaches npes-1 senders, then the WHOLE grid reduces slice s. Slice order matches
 // the senders' packet order, so the waits are satisfied in the order they are
 // performed and each slice's reduce overlaps the still-in-flight transfer of the
 // later slices (pipelining). The last block to finish the loop zeroes every slice
@@ -228,9 +228,13 @@ __device__ __forceinline__ void ReduceVecGroupBuffered(SrcRsrcFn srcRsrc, BufRsr
 //
 // The pointers are taken by value, so advancing them by the slice offset is
 // local to this call and the caller passes the same bases on every slice.
+//
+// `seen` is the last packed counter value thread 0 read. It is only meaningful
+// in thread 0 and must start at 0 before slice 0; the caller keeps it across the
+// slice loop so a slice that was already complete at an earlier read needs no load.
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __device__ __forceinline__ void WaitAndReduceSlice(
-    uint64_t* signalBuf, uint32_t slice, int myPe, int npes,
+    uint64_t* signalBuf, uint64_t& seen, uint32_t slice, int myPe, int npes,
     const T* __restrict__ input, const T* __restrict__ staging,
     T* __restrict__ shardOut, size_t sOfs, size_t sCnt, size_t chunkElems,
     uint32_t lstride) {
@@ -238,16 +242,20 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   const uint32_t BlockDimX = blockDim.x;
   constexpr int vecSize = VecBytes / sizeof(T);
 
-  // === Phase 2: wait until this slice's counter reaches all npes-1 senders =====
-  // Each slice's counter lives in my local HBM (bumped by remote SDMA ADD64s).
-  // One thread per block polls signalPtrs[slice]; every block does its own
+  // === Phase 2: wait until this slice's byte reaches all npes-1 senders ========
+  // The packed counter lives in my local HBM (bumped by remote SDMA ADD64s of
+  // 1 << 8*slice). One thread per block polls it; every block does its own
   // wait+acquire (read-only -> L2 hits). At npes==1 want==0, so no spin.
   if (threadIdx.x == 0) {
-    // Self-copy is skipped, so exactly npes-1 senders bump this slice's counter.
+    // Self-copy is skipped, so exactly npes-1 senders bump this slice's byte.
     const uint32_t want = static_cast<uint32_t>(npes - 1);
-    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[slice]));
-    while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
-      __builtin_amdgcn_s_sleep(1);
+    auto* addr = cco::impl::global(&signalBuf[kSliceSignalSlot]);
+    if (SliceSignalCount(seen, slice) < want) {
+      while (SliceSignalCount(seen = __hip_atomic_load(addr, __ATOMIC_RELAXED,
+                                                       __HIP_MEMORY_SCOPE_AGENT),
+                              slice) < want) {
+        __builtin_amdgcn_s_sleep(1);
+      }
     }
   }
   __syncthreads();
@@ -476,30 +484,30 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   
   // Phase 2-3: walk all S slices in the order the senders queued them, reducing
   // each into this PE's shard-sized output buffer. Nothing happens per slice --
-  // the counters are cleared once below, after every slice is done.
+  // the packed counter is cleared once below, after every slice is done.
   constexpr int vecSize = VecBytes / sizeof(T);
   const uint32_t S = 1u << logS;
   // vecSize-aligned slice length; the last slice absorbs the remainder.
   const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
+  uint64_t seen = 0;
   for (uint32_t s = 0; s < S; s++) {
     const size_t sOfs = FORCE_SGPR(s * sliceLen);
     const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
-    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(devComm.sdma.signalBuf, s, myPe, npes,
-                                                 input, staging, output, sOfs, sCnt,
+    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(devComm.sdma.signalBuf, seen, s, myPe,
+                                                 npes, input, staging, output, sOfs, sCnt,
                                                  chunkElems, lstride);
   }
 
-  // === Reset: the last block of the grid zeroes every slice counter ============
+  // === Reset: the last block of the grid zeroes the packed slice counter =======
   // A block only reaches here after passing the Phase-2 wait on EVERY slice, so
-  // when the arrival counter hits gridDim.x all S slice counters are dead and
-  // clearing them cannot drop an unseen signal.
+  // when the arrival counter hits gridDim.x every sender's add has landed and
+  // clearing the counter cannot drop an unseen signal.
   if (threadIdx.x == 0) {
     uint32_t z = atomicAdd(&groupCounters[0], 1u);
     if (z + 1 == gridDim.x) {
-      for (uint32_t s = 0; s < S; s++) {  // clear slice s's completion counter
-        StreamStore<ESystemScope, sizeof(uint64_t)>(&devComm.sdma.signalBuf[s], 0);
-      }
+      StreamStore<ESystemScope, sizeof(uint64_t)>(
+          &devComm.sdma.signalBuf[kSliceSignalSlot], 0);
       groupCounters[0] = 0;  // clear the grid-wide arrival counter
     }
   }

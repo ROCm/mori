@@ -50,6 +50,19 @@ static_assert(mori::cco::CCO_SDMA_QUEUE_SIZE % kSDMACopyAtomicPktSize == 0,
 static constexpr int kRSPushMaxPeers = 16;
 static constexpr int kRSPushMaxSlices = 8;
 
+// All slice completions land in ONE 64-bit counter, signalBuf[kSliceSignalSlot]:
+// byte s counts the senders whose slice s has landed (each adds 1 << 8s). A byte
+// never exceeds kRSPushMaxPeers-1 < 256, so no add carries into the next slice's
+// byte -- the bytes are independent and a torn 2x32-bit read is still exact.
+static constexpr int kSliceSignalSlot = 0;
+static_assert(kRSPushMaxSlices * 8 <= 64 && kRSPushMaxPeers - 1 < 256,
+              "slice counters must fit one byte each of a uint64");
+
+constexpr uint64_t SliceSignalInc(uint32_t slice) { return 1ull << (8 * slice); }
+constexpr uint32_t SliceSignalCount(uint64_t v, uint32_t slice) {
+  return static_cast<uint32_t>(v >> (8 * slice)) & 0xffu;
+}
+
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
 struct AddressPair {
   const void* source;
@@ -193,9 +206,11 @@ __device__ __forceinline__ void BufferStore128(BufRsrc r, cco::ccoUint4 v, uint3
                                      /*soffset=*/0, RS_BUF_AUX);
 }
 
+// Fused 64B packet: [NOP][COPY_LINEAR src->dst][ATOMIC ADD64(addValue) into *signal].
+// Lane k writes dwords [4k, 4k+4): lane 2 carries SRC_DATA_LO, lane 3 SRC_DATA_HI.
 __device__ __forceinline__ void WriteFusedPacket(int lane, 
      const void* srcBuf, const void* dstBuf, size_t packetSize, HSAuint64* signal,
-     uint32_t* outBasePtr) {
+     uint64_t addValue, uint32_t* outBasePtr) {
   
   uint32_t dw[4];
   // if (lane == 0) {
@@ -211,11 +226,13 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
   //   decltype(SDMA_PKT_ATOMIC::HEADER_UNION) hdr;
   //   hdr.DW_0_DATA = 0;
   //   hdr.op = SDMA_OP_ATOMIC;
-  //   hdr.operation = SDMA_ATOMIC_ADD32;
+  //   hdr.operation = SDMA_ATOMIC_ADD64;
   //   dw[0] = hdr.DW_0_DATA;
   //   dw[1] = (uint32_t)((uintptr_t)signal);
   //   dw[2] = (uint32_t)((uintptr_t)signal >> 32);
-  //   dw[3] = 1;
+  //   dw[3] = (uint32_t)addValue;
+  // } else if (lane == 3) {
+  //   dw[0] = (uint32_t)(addValue >> 32);  // dw[1..3] = 0
   if (lane % 2 == 0) {
   // Header depends only on constants; a scalar-replaceable local keeps the
   // bitfield layout authoritative and constant-folds (no address taken).
@@ -226,18 +243,18 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
     decltype(SDMA_PKT_ATOMIC::HEADER_UNION) inc;
     inc.DW_0_DATA = 0;
     inc.op = SDMA_OP_ATOMIC;
-    inc.operation = SDMA_ATOMIC_ADD32;
+    inc.operation = SDMA_ATOMIC_ADD64;
 
     uint32_t flag = lane >> 1;
     dw[0] = inc.DW_0_DATA & -flag;
     dw[1] = flag == 0 ? cp.DW_0_DATA : (uint32_t)((uintptr_t)signal);
     dw[2] = flag == 0 ? static_cast<uint32_t>(packetSize) - 1 : 
                         (uint32_t)((uintptr_t)signal >> 32);
-    dw[3] = flag;
+    dw[3] = static_cast<uint32_t>(addValue) & -flag;
   } else {
-    // lane 1 - real addresses, lane 3 - all zeros
+    // lane 1 - real addresses, lane 3 - SRC_DATA_HI then zero CMP_DATA / LOOP
     uint32_t mask = lane == 1 ? ~0u : 0;
-    dw[0] = (uint32_t)(uintptr_t)srcBuf & mask;
+    dw[0] = lane == 1 ? (uint32_t)(uintptr_t)srcBuf : static_cast<uint32_t>(addValue >> 32);
     dw[1] = (uint32_t)((uintptr_t)srcBuf >> 32) & mask;
     dw[2] = (uint32_t)(uintptr_t)dstBuf & mask;
     dw[3] = (uint32_t)((uintptr_t)dstBuf >> 32) & mask;
@@ -370,8 +387,9 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // written back once if it moved.
 //
 // Each shard is split into S = 1<<logS slices. Slice s is an SDMA copy from
-// srcOf(peer) into dstOf(peer), followed by an ADD32(1) into peer's per-slice
-// completion counter signalPtrs[s]. The atomic targets the *receiver's* counter,
+// srcOf(peer) into dstOf(peer), followed by an ADD64(1 << 8s) into byte s of
+// peer's packed completion counter signalPtrs[kSliceSignalSlot] (S=1 adds 1).
+// The atomic targets the *receiver's* counter,
 // so completion is observed on the receive side -- fire-and-forget, no local
 // quiet, no cross-PE barrier.
 //
@@ -440,10 +458,11 @@ __device__ __forceinline__ void StartSdmaScatter(
         auto* srcp = srcOf(peer) + s * sliceBytes;
         auto* dstp = dstOf(peer) + s * sliceBytes;
         const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
-        auto* signal = sdma.peerSignalPtrs[peer] + s;
+        auto* signal = sdma.peerSignalPtrs[peer] + kSliceSignalSlot;
         const uint64_t ringDw =
             SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t);
-        WriteFusedPacket(sub, srcp, dstp, sz, signal, queueBuf + ringDw);
+        WriteFusedPacket(sub, srcp, dstp, sz, signal, SliceSignalInc(s),
+                         queueBuf + ringDw);
       }
 
       mori::cco::ccoSdmaPublishStores();
@@ -462,7 +481,7 @@ __device__ __forceinline__ void StartSdmaScatter(
 }
 
 // Writes one pre-posted broadcast into the two 64B ring slots starting at pktBase:
-// [POLL *flag == value][COPY src->dst + ADD32(1) into signal]. The copy reads src
+// [POLL *flag == value][COPY src->dst + ADD64(1) into signal]. The copy reads src
 // only once its poll passes, so src need not be ready yet. Each slot wraps on its
 // own: the reservation may span the ring end, a 64B packet never does.
 __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf, uint64_t pktBase,
@@ -471,7 +490,7 @@ __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf,
                                                     uint32_t value) {
   WritePollPacket(sub, flag, value,
                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
-  WriteFusedPacket(sub, src, dst, bytes, signal,
+  WriteFusedPacket(sub, src, dst, bytes, signal, /*addValue=*/1,
                    queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopyAtomicPktSize) /
                                   sizeof(uint32_t));
 }
