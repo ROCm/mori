@@ -674,14 +674,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 bad.append(
                     f"combine_mode='scatter' with combine dtype {cfg.combine_dtype} (bf16 only)"
                 )
-            else:
-                from .dispatch_combine_op import WAVE
-
-                if cfg.hidden_dim % (32 * WAVE):
-                    bad.append(
-                        f"combine_mode='scatter' with hidden_dim={cfg.hidden_dim} "
-                        f"(needs a multiple of {32 * WAVE})"
-                    )
+            elif cfg.hidden_dim % 1024:
+                bad.append(
+                    f"combine_mode='scatter' with hidden_dim={cfg.hidden_dim} "
+                    "(needs a multiple of 1024)"
+                )
         if cfg.quant_type != "none":
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
