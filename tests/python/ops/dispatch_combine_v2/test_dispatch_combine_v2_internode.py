@@ -120,10 +120,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
-
+from _grand_mean_metrics import summarize_metric_samples
 from mori.cco import Communicator
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
-from mori.ops.tuning_config import BANDWIDTH_METRIC_KEY
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
@@ -1086,39 +1085,75 @@ def _median(values):
     return ordered[len(ordered) // 2]
 
 
-def _row_metrics(op, cfg, args, dist_handle, rng_data, convert, ll):
-    """Per-phase tuning metrics, measured on `op` exactly as configured.
+def _metric_timing_pass(
+    op, inp, idx, wts, sc, combine_weights, convert, num_rounds, num_warmup
+):
+    """Local event timings with v1's barrier before, not inside, the timed loop."""
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
+    warmup_combine_input = None
+    for _ in range(num_warmup):
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        warmup_combine_input = convert(dispatch_out[0])
+        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
+    del warmup_combine_input
+    torch.cuda.synchronize()
+    dist.barrier()
+    events[0].record()
+    for i in range(num_rounds):
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        events[3 * i + 1].record()
+        combine_input = convert(dispatch_out[0])
+        events[3 * i + 2].record()
+        op.combine(combine_input, combine_weights, routing=dispatch_out[5])
+        events[3 * i + 3].record()
+    torch.cuda.synchronize()
+    return [
+        (
+            events[3 * i].elapsed_time(events[3 * i + 1]) * 1e3,
+            events[3 * i + 2].elapsed_time(events[3 * i + 3]) * 1e3,
+        )
+        for i in range(num_rounds)
+    ]
 
-    Each timing pass averages latency over ranks and retained rounds.
-    ``avg_latency_us`` is the median of those means across ``tuning_reps``.
-    Rank 0 saves the row and supplies the token counts used by:
 
-      bandwidth_gbps            received payload bytes / avg_latency_us
-      avg_rdma_bandwidth_gbps   cross-node payload bytes / avg_latency_us
-      avg_ll_bandwidth_gbps     the corresponding hypothetical fixed-slot LL
-                                rate, scaled by slots per (token, expert)
+def _row_metrics(
+    op, cfg, args, dist_handle, rng_data, convert, ll, *, evidence_callback=None
+):
+    """Final metrics with v1's grand mean, separate from search estimators.
 
-    ``bandwidth_metric`` identifies rank-0 bytes divided by this median
-    latency, distinct from the mean of per-rank, per-round bandwidths.
+    Each rank computes bandwidth with its own payload and each retained round's
+    latency, then all samples across passes, ranks, and rounds are averaged.
+    The headline is RDMA for v2 and LL for v2_ll. LL uses the global XGMI mean
+    times rank 0's scale, exactly as v1's saved Average row does.
 
-    ``avg_xgmi_bandwidth_gbps`` is omitted because it would duplicate
-    ``bandwidth_gbps`` for this latency-based tuner. Per-rank and per-round
-    bandwidth statistics belong in benchmark reports, outside the tuning table.
+    One CPU all-gather follows all synchronized timing passes. An optional
+    callback receives every rank's byte counts and raw rounds for replay;
+    those evidence fields are not added to tuning JSON entries.
     """
+    if (
+        args.tuning_reps < 1
+        or args.rounds < 1
+        or not 0 <= args.drop_rounds < args.rounds
+    ):
+        raise ValueError("Metric sampling requires passes and retained rounds")
+    if args.warmup < 0:
+        raise ValueError("Metric warmup must be nonnegative")
     inp, idx, wts, sc, combine_weights = rng_data
-    # total_recv is a device tensor and .item() synchronises, so it is read once
-    # here rather than anywhere near a timed loop.
     dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
     torch.cuda.synchronize()
-    total_recv = int(dispatch_out[4][0].item())
-    op.combine(convert(dispatch_out[0]), combine_weights, routing=dispatch_out[5])
+    total_recv = int(dispatch_out[4].item())
+    combine_input = convert(dispatch_out[0])
+    # Actual storage widths handle packed FP4 dispatch and unpacked BF16 combine.
+    dispatch_bytes = inp.shape[-1] * inp.element_size()
+    combine_bytes = combine_input.shape[-1] * combine_input.element_size()
+    op.combine(combine_input, combine_weights, routing=dispatch_out[5])
     torch.cuda.synchronize()
-
-    passes = [
-        _timed_pass(
+    del combine_input, dispatch_out
+    rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
+    row = [total_recv, rdma_tokens, dispatch_bytes, combine_bytes]
+    for _ in range(args.tuning_reps):
+        samples = _metric_timing_pass(
             op,
-            dist_handle,
-            args,
             inp,
             idx,
             wts,
@@ -1128,44 +1163,20 @@ def _row_metrics(op, cfg, args, dist_handle, rng_data, convert, ll):
             args.rounds,
             args.warmup,
         )
-        for _ in range(args.tuning_reps)
-    ]
-    latency = {
-        "dispatch": _median([p[0] for p in passes]),
-        "combine": _median([p[1] for p in passes]),
-    }
-
-    elem_size = {
-        "dispatch": torch.tensor([], dtype=cfg.dispatch_dtype).element_size(),
-        "combine": torch.tensor([], dtype=cfg.combine_dtype).element_size(),
-    }
-    rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
-    ll_scale = args.max_tokens * cfg.num_experts_per_token / (total_recv + 1)
-
-    def bandwidth(num_bytes, microseconds):
-        return num_bytes / (1000.0 * microseconds) if microseconds > 0 else 0.0
-
-    metrics = {}
-    for phase in ("dispatch", "combine"):
-        microseconds = latency[phase]
-        xgmi = bandwidth(total_recv * cfg.hidden_dim * elem_size[phase], microseconds)
-        metrics[phase] = {
-            "bandwidth_gbps": round(xgmi, 2),
-            "avg_rdma_bandwidth_gbps": round(
-                bandwidth(
-                    rdma_tokens * cfg.hidden_dim * elem_size[phase], microseconds
-                ),
-                2,
-            ),
-            "avg_ll_bandwidth_gbps": round(xgmi * ll_scale, 2),
-            "avg_latency_us": round(microseconds, 2),
-            BANDWIDTH_METRIC_KEY: "rank0_bytes_over_median_grand_mean_latency",
-            # The byte counts both bandwidths came from, so a reader can redo
-            # the arithmetic instead of trusting it -- including the ll column,
-            # which is derived rather than measured.
-            "recv_tokens": total_recv,
-            "rdma_algo_tokens": rdma_tokens,
-        }
+        row.extend(value for sample in samples for value in sample)
+    gathered = dist_handle.all_gather_rows(row).tolist()
+    metrics, evidence = summarize_metric_samples(
+        gathered,
+        num_passes=args.tuning_reps,
+        num_rounds=args.rounds,
+        num_warmup=args.warmup,
+        drop_rounds=args.drop_rounds,
+        max_tokens=args.max_tokens,
+        topk=cfg.num_experts_per_token,
+        ll=ll,
+    )
+    if evidence_callback is not None:
+        evidence_callback(evidence)
     return metrics
 
 

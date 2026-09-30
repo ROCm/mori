@@ -1243,12 +1243,17 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
               }
             }
 
+            // Join the producers before the leader's release publishes their stores.
+            ::mori::cco::ccoCoopWarp{}.sync();
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
             index_t finished = 0;
             if (laneId == 0)
               finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
             finished = __shfl(finished, 0);
             if ((finished + 1) >= (numRecvBlock * warpNum)) {
               if (laneId == 0) {
+                // Acquire all producers through the completion-counter RMW chain.
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
                 core::AtomicStoreSeqCstSystem(
                     args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum +
                         k,
@@ -1336,8 +1341,15 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
   int rdmaWarpNum = args.rdmaBlockNum * warpNum;
   for (int n = 0; n < (nNodes - 1); n++) {
     int node = (myNode + n + 1) % nNodes;
-    uint64_t nodeCount = nodeRecvTokenNum[node];
-    if (nodeCount > 0) nodeCount -= 1;
+    // Full chunk flags can arrive before the final node count. Zero means
+    // unpublished, whereas one is the completed empty-node sentinel.
+    uint64_t nodeCount = 0;
+    if (laneId == 0) {
+      do {
+        nodeCount = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+      } while (nodeCount == 0);
+    }
+    nodeCount = __shfl(nodeCount, 0) - 1;
     if (nodeCount == 0) continue;
 
     // One whole vector step per warp: the split never hands a warp less than one
@@ -1393,12 +1405,17 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
         }
       }
 
+      // Join the producers before the leader's release publishes their stores.
+      ::mori::cco::ccoCoopWarp{}.sync();
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
       index_t finished = 0;
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
       if ((finished + 1) >= (warpsPerToken * warpSize)) {
         if (laneId == 0) {
+          // Acquire all producers through the completion-counter RMW chain.
+          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
           core::AtomicStoreSeqCstSystem(
               args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum + k,
               uint64_t{0});

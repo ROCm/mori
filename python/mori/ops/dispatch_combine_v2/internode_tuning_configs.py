@@ -20,25 +20,56 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility lookup for the historical MI308X internode table.
+"""Compatibility lookup backed by the HIP V2 internode JSON rules.
 
-The active HIP backend uses hip_tuning_configs.resolve_schedule(). Keep this
-older import path without maintaining a second copy of the fallback rules.
+The active HIP backend uses hip_tuning_configs.resolve_schedule(). This older
+entry point keeps its fp8-dispatch/bf16-combine defaults.
 """
 
-from .hip_tuning_configs import _legacy_internode_buckets
+import torch
+
+from mori.ops import utils as _gpu
+from mori.ops.tuning_config import CONFIG_STR_TO_DTYPE
+
+from .hip_tuning_configs import lookup_internode
 
 
-def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
-    """Return historical dispatch/combine B/R/W, or None for an untuned shape.
+def lookup(
+    world_size,
+    hidden_dim,
+    topk,
+    num_tokens,
+    dtype="fp8",
+    *,
+    kernel_family="v2",
+    experts_per_rank=None,
+):
+    """Return dispatch/combine B/R/W from the selected family's JSON rules.
 
-    The legacy table has only fp8-dispatch/bf16-combine measurements and has
-    always used them as the fallback for every dtype.
+    ``dtype`` accepts a torch dtype, a shared config string, or ``"fp8"``
+    (FNUZ on gfx942, OCP elsewhere). Combine remains BF16. Missing rules use
+    the same None result as lookup_internode(), without borrowing another dtype.
+    ``experts_per_rank`` must be supplied to match a measured expert/top-k shape;
+    leaving it unknown returns None rather than selecting another model's rule.
     """
-    table = _legacy_internode_buckets(world_size, hidden_dim, topk)
-    if not table:
-        return None
-    row = next(
-        (row for row in table if row[0] is None or num_tokens <= row[0]), table[-1]
+    if isinstance(dtype, str):
+        if dtype == "fp8":
+            dtype = (
+                torch.float8_e4m3fnuz
+                if _gpu.arch_name() == "gfx942"
+                else torch.float8_e4m3fn
+            )
+        else:
+            dtype = CONFIG_STR_TO_DTYPE.get(dtype)
+            if dtype is None:
+                return None
+    return lookup_internode(
+        world_size,
+        hidden_dim,
+        topk,
+        num_tokens,
+        dtype,
+        torch.bfloat16,
+        kernel_family=kernel_family,
+        experts_per_rank=experts_per_rank,
     )
-    return {"dispatch": row[1], "combine": row[2]}
