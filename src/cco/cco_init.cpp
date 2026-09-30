@@ -139,7 +139,7 @@ void ccoSdmaSetupCommQueues(ccoComm* comm, int requestedChannels) {
         handle = queue->deviceHandle();
       } else {
         MORI_SHMEM_ERROR("no SDMA queue for local peer {} channel {}; its puts move no bytes", lsa,
-          q);
+                         q);
       }
       HIP_RUNTIME_CHECK(hipMemcpy(&comm->sdmaDevHandles[lsa * comm->sdmaNumQueue + q], &handle,
                                   sizeof(handle), hipMemcpyHostToDevice));
