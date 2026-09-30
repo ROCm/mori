@@ -141,7 +141,7 @@ class HbmCopyEngine final : public TransferEngine {
                                   // registered but unreachable from this device
     kNoFragments,                 // plan contributed no segments
     kTooFewFragments,             // < 2 in the bucket; one segment is hipMemcpy's best case
-    kFragmentAtOrAboveThreshold,  // mean segment >= kGatherFragmentThreshold
+    kFragmentAtOrAboveThreshold,  // mean offload segment >= kGatherD2HFragmentThreshold
     kSetDeviceFailed,
     kNoStream,
     kLaunchFailed,

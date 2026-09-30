@@ -30,13 +30,17 @@
 
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
+#include <sys/mman.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <thread>
 #include <vector>
 
+#include "umbp/common/device_gather.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
@@ -280,6 +284,253 @@ TEST(HbmCopyEngine, CopiesDeviceToDevice) {
 
   ASSERT_EQ(hipMemcpy(dst.data(), b.get(), kBytes, hipMemcpyDeviceToHost), hipSuccess);
   EXPECT_EQ(std::memcmp(src.data(), dst.data(), kBytes), 0);
+}
+
+// Page-aligned host memory, as HostTierRegistration expects.  Declare it before
+// the engine that registers it: the engine unregisters on destruction.
+class HostPages {
+ public:
+  explicit HostPages(size_t bytes) : size_(bytes) {
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ptr_ = p == MAP_FAILED ? nullptr : static_cast<char*>(p);
+  }
+  ~HostPages() {
+    if (ptr_ != nullptr) munmap(ptr_, size_);
+  }
+  HostPages(const HostPages&) = delete;
+  HostPages& operator=(const HostPages&) = delete;
+
+  char* get() const { return ptr_; }
+  size_t size() const { return size_; }
+
+ private:
+  char* ptr_ = nullptr;
+  size_t size_ = 0;
+};
+
+constexpr size_t kRestoreSegment = 8448;  // median restore fragment in production
+
+// Host offset of segment i of a permuted, gapped layout: nothing coalesces.
+size_t ScatteredOffset(size_t i, size_t segments, size_t stride) {
+  return ((i * stride) % segments) * 2 * kRestoreSegment;
+}
+
+// A registered host region takes the gather kernel in both directions: one
+// launch per batch however many scattered segments it holds.
+TEST(HbmCopyEngine, GatherKernelRoundTripsScatteredSegments) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kSegments = 64;
+  HostPages up(4 << 20), down(4 << 20);
+  ASSERT_NE(up.get(), nullptr);
+  ASSERT_NE(down.get(), nullptr);
+  for (size_t i = 0; i < up.size(); ++i) up.get()[i] = static_cast<char>(i * 131 + 7);
+  DeviceBuffer device(kSegments * kRestoreSegment);
+  ASSERT_TRUE(device.valid());
+
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(up.get(), up.size());
+  engine.AddHostGatherRegion(down.get(), down.size());
+  const TransferRef u = HostRef(up.get(), up.size());
+  const TransferRef g = GpuRef(device.get(), device.size());
+  const TransferRef d = HostRef(down.get(), down.size());
+
+  std::vector<TransferItem> to_gpu, to_host;
+  for (size_t i = 0; i < kSegments; ++i) {
+    const size_t host = ScatteredOffset(i, kSegments, 37);
+    to_gpu.push_back(MakeItem(u, host, g, i * kRestoreSegment, kRestoreSegment, i));
+    to_host.push_back(MakeItem(g, i * kRestoreSegment, d, host, kRestoreSegment, i));
+  }
+  const uint64_t launches = DeviceGatherLaunchCount();
+  std::vector<size_t> failed;
+  ASSERT_TRUE(engine.Transfer(to_gpu, &failed));
+  ASSERT_TRUE(engine.Transfer(to_host, &failed));
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches + 2);
+  for (size_t i = 0; i < kSegments; ++i) {
+    const size_t host = ScatteredOffset(i, kSegments, 37);
+    EXPECT_EQ(std::memcmp(up.get() + host, down.get() + host, kRestoreSegment), 0)
+        << "segment " << i;
+  }
+}
+
+// Submit runs on many threads at once (PoolClient executors, the standalone
+// server's gRPC threads).  Concurrent gather batches draw their own stream and
+// descriptor staging, so no batch may copy another batch's segments.
+TEST(HbmCopyEngine, ConcurrentGatherBatchesStayIndependent) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kThreads = 8;
+  constexpr size_t kSegments = 32;
+  constexpr size_t kRounds = 20;
+  constexpr size_t kSlice = kSegments * 2 * kRestoreSegment;
+  HostPages up(kThreads * kSlice), down(kThreads * kSlice);
+  ASSERT_NE(up.get(), nullptr);
+  ASSERT_NE(down.get(), nullptr);
+  for (size_t i = 0; i < up.size(); ++i) up.get()[i] = static_cast<char>(i * 29 + 3);
+  std::vector<std::unique_ptr<DeviceBuffer>> devices;
+  for (size_t t = 0; t < kThreads; ++t) {
+    devices.push_back(std::make_unique<DeviceBuffer>(kSegments * kRestoreSegment));
+    ASSERT_TRUE(devices.back()->valid());
+  }
+
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(up.get(), up.size());
+  engine.AddHostGatherRegion(down.get(), down.size());
+  const TransferRef u = HostRef(up.get(), up.size());
+  const TransferRef d = HostRef(down.get(), down.size());
+
+  std::atomic<size_t> mismatches{0}, failures{0};
+  std::vector<std::thread> threads;
+  for (size_t t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t] {
+      const TransferRef g = GpuRef(devices[t]->get(), devices[t]->size());
+      std::vector<char> seen(kSegments * kRestoreSegment);
+      for (size_t round = 0; round < kRounds; ++round) {
+        // A different odd stride each round is a different permutation of the
+        // slice, so a batch that picked up stale or foreign descriptors lands
+        // the wrong bytes.
+        const size_t stride = 2 * round + 1;
+        std::vector<TransferItem> to_gpu, to_host;
+        for (size_t i = 0; i < kSegments; ++i) {
+          const size_t host = t * kSlice + ScatteredOffset(i, kSegments, stride);
+          to_gpu.push_back(MakeItem(u, host, g, i * kRestoreSegment, kRestoreSegment, i));
+          to_host.push_back(MakeItem(g, i * kRestoreSegment, d, host, kRestoreSegment, i));
+        }
+        std::vector<size_t> failed;
+        if (!engine.Transfer(to_gpu, &failed)) ++failures;
+        (void)hipSetDevice(0);
+        if (hipMemcpy(seen.data(), devices[t]->get(), seen.size(), hipMemcpyDeviceToHost) !=
+            hipSuccess) {
+          ++failures;
+          continue;
+        }
+        for (size_t i = 0; i < kSegments; ++i) {
+          const size_t host = t * kSlice + ScatteredOffset(i, kSegments, stride);
+          if (std::memcmp(seen.data() + i * kRestoreSegment, up.get() + host, kRestoreSegment) !=
+              0) {
+            ++mismatches;
+          }
+        }
+        if (!engine.Transfer(to_host, &failed)) ++failures;
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(failures.load(), 0u);
+  EXPECT_EQ(mismatches.load(), 0u);
+  // Every slot's first segment went up and came back; the gaps stay untouched.
+  for (size_t slot = 0; slot < kThreads * kSegments; ++slot) {
+    const size_t host = slot * 2 * kRestoreSegment;
+    EXPECT_EQ(std::memcmp(up.get() + host, down.get() + host, kRestoreSegment), 0)
+        << "slot " << slot;
+  }
+}
+
+// Copies `segments` fragments of `bytes` each between a registered host
+// region and a device buffer, in the direction given, and reports how many
+// gather kernels the transfer launched.  Fails the test on wrong bytes.
+uint64_t GatherLaunchesFor(size_t segments, size_t bytes, bool to_device) {
+  HostPages host(segments * bytes * 2);
+  EXPECT_NE(host.get(), nullptr);
+  if (host.get() == nullptr) return 0;
+  DeviceBuffer device(segments * bytes);
+  EXPECT_TRUE(device.valid());
+  if (!device.valid()) return 0;
+  std::vector<char> pattern(segments * bytes);
+  for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<char>(i * 13 + 5);
+
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(host.get(), host.size());
+  const TransferRef h = HostRef(host.get(), host.size());
+  const TransferRef g = GpuRef(device.get(), device.size());
+  // Every other slot of the host region, in reverse, so nothing coalesces.
+  std::vector<TransferItem> items;
+  for (size_t i = 0; i < segments; ++i) {
+    const size_t host_offset = (segments - 1 - i) * 2 * bytes;
+    items.push_back(to_device ? MakeItem(h, host_offset, g, i * bytes, bytes, i)
+                              : MakeItem(g, i * bytes, h, host_offset, bytes, i));
+  }
+  if (to_device) {
+    for (size_t i = 0; i < segments; ++i) {
+      std::memcpy(host.get() + (segments - 1 - i) * 2 * bytes, pattern.data() + i * bytes, bytes);
+    }
+  } else {
+    EXPECT_EQ(hipMemcpy(device.get(), pattern.data(), pattern.size(), hipMemcpyHostToDevice),
+              hipSuccess);
+  }
+
+  const uint64_t before = DeviceGatherLaunchCount();
+  std::vector<size_t> failed;
+  EXPECT_TRUE(engine.Transfer(items, &failed));
+  const uint64_t launches = DeviceGatherLaunchCount() - before;
+
+  std::vector<char> seen(pattern.size());
+  if (to_device) {
+    EXPECT_EQ(hipMemcpy(seen.data(), device.get(), seen.size(), hipMemcpyDeviceToHost), hipSuccess);
+  } else {
+    for (size_t i = 0; i < segments; ++i) {
+      std::memcpy(seen.data() + i * bytes, host.get() + (segments - 1 - i) * 2 * bytes, bytes);
+    }
+  }
+  EXPECT_EQ(std::memcmp(seen.data(), pattern.data(), pattern.size()), 0);
+  return launches;
+}
+
+// The engine resolves a plan's device alias once, for the whole host endpoint.
+// An endpoint larger than the registration that covers its segments fails that
+// lookup and must fall back to one lookup per segment, still on the kernel.
+TEST(HbmCopyEngine, GatherResolvesSegmentsWhenTheEndpointOutgrowsItsRegistration) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kSegments = 16;
+  HostPages host(4 << 20);
+  ASSERT_NE(host.get(), nullptr);
+  for (size_t i = 0; i < host.size(); ++i) host.get()[i] = static_cast<char>(i * 17 + 1);
+  DeviceBuffer device(kSegments * kRestoreSegment);
+  ASSERT_TRUE(device.valid());
+
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(host.get(), host.size() / 2);  // segments live in this half
+  const TransferRef h = HostRef(host.get(), host.size());   // the endpoint names all of it
+  const TransferRef g = GpuRef(device.get(), device.size());
+  std::vector<TransferItem> items;
+  for (size_t i = 0; i < kSegments; ++i) {
+    items.push_back(
+        MakeItem(h, ScatteredOffset(i, kSegments, 5), g, i * kRestoreSegment, kRestoreSegment, i));
+  }
+  const uint64_t before = DeviceGatherLaunchCount();
+  std::vector<size_t> failed;
+  ASSERT_TRUE(engine.Transfer(items, &failed));
+  EXPECT_EQ(DeviceGatherLaunchCount(), before + 1);
+
+  std::vector<char> seen(kSegments * kRestoreSegment);
+  ASSERT_EQ(hipMemcpy(seen.data(), device.get(), seen.size(), hipMemcpyDeviceToHost), hipSuccess);
+  for (size_t i = 0; i < kSegments; ++i) {
+    EXPECT_EQ(std::memcmp(seen.data() + i * kRestoreSegment,
+                          host.get() + ScatteredOffset(i, kSegments, 5), kRestoreSegment),
+              0)
+        << "segment " << i;
+  }
+}
+
+// Restores of large per-layer state keep the kernel: with every GPU copying at
+// once it outruns the copy engine at every fragment size measured.
+TEST(HbmCopyEngine, LargeRestoreFragmentsStayOnTheGatherKernel) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+  EXPECT_EQ(GatherLaunchesFor(4, 1 << 20, /*to_device=*/true), 1u);
+  EXPECT_EQ(GatherLaunchesFor(3, 4 << 20, /*to_device=*/true), 1u);
+}
+
+// Offloads switch to the copy engine once the mean fragment reaches 4 MiB.
+TEST(HbmCopyEngine, LargeOffloadFragmentsGoToTheCopyEngine) {
+  if (!HaveGpu()) GTEST_SKIP() << "no GPU visible";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+  EXPECT_EQ(GatherLaunchesFor(4, 1 << 20, /*to_device=*/false), 1u);
+  EXPECT_EQ(GatherLaunchesFor(3, 4 << 20, /*to_device=*/false), 0u);
 }
 
 // ---------------------------------------------------------------------------
