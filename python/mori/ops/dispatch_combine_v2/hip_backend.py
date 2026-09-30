@@ -51,7 +51,6 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import os
-import re
 
 import torch
 
@@ -77,8 +76,6 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
-    "combPush": "comb_push",
-    "combPushSig": "comb_push_sig",
 }
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
@@ -148,25 +145,19 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
+# Must match EpCombinePushSlotAlign (ep_cfg.hpp) and EpFp4Wire's kQGroup, kSigBlocks
+# and kSigSlotDw (ep_intranode_1250x.hpp).
 _PUSH_SLOT_ALIGN = 128
-_PUSH_SIG_LINE = 64
+PUSH_QGROUP = 32
 _PUSH_SIG_BLOCKS = 256
 _PUSH_SIG_SLOT_B = 128
-PUSH_PROF_EVENTS = 256
-PUSH_QGROUP = 32
 
 
 def push_wire_nbytes(cfg) -> int:
+    """One landing row of the fp4 combine: the MXFP4 payload, then its e8m0 scales."""
     h = cfg.hidden_dim
     wire = h // 2 + h // PUSH_QGROUP
     return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
-
-
-def profiler_enabled() -> bool:
-    flags = os.environ.get("MORI_JIT_EXTRA_FLAGS", "")
-    return (
-        re.search(r"(?:^|\s)-D\s*ENABLE_PROFILER(?:=\S*)?(?:\s|$)", flags) is not None
-    )
 
 
 class TokOffExt:
@@ -385,14 +376,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     "per-block xdb epoch slots the entry barrier owns"
                 )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
-        self.prof_time_buf = None
-        self.prof_time_offset = None
-        if profiler_enabled():
-            max_warps = max(b * w for b, w in self._combine_specs)
-            self.prof_time_buf = torch.zeros(
-                max_warps * 2 * PUSH_PROF_EVENTS, dtype=torch.int64, device=dev
-            )
-            self.prof_time_offset = torch.zeros(max_warps, **i32)
 
     # -- internode -------------------------------------------------------
     #
@@ -623,6 +606,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # only forms that are right for fp4, where 2 values share a byte.
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
+        out_tok = cap * cfg.combine_token_nbytes
+        if cfg.quant_type == "fp4_blockwise":
+            # The fp4 combine's landing rows, landing[src_pe][recv_slot], then its
+            # report and release slots sit behind the staging rows: the kernel
+            # addresses them from offOutTok.
+            out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
+            out_tok += (cfg.world_size + 1) * _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B
         regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),
@@ -630,7 +620,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("out_idx", cap * topk * 4),
             ("out_wts", cap * topk * 4),
             ("disp_out", cap * cfg.token_nbytes),
-            ("out_tok", cap * cfg.combine_token_nbytes),
+            ("out_tok", out_tok),
             ("cross_device_barrier", cfg.world_size * 8),
         ]
         if self._scale_i32(cfg):
@@ -644,16 +634,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
             )
             regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
-        if cfg.is_scatter:
-            regions.append(("comb_push", cfg.world_size * cap * push_wire_nbytes(cfg)))
-            regions.append(
-                (
-                    "comb_push_sig",
-                    (cfg.world_size + 1) * _PUSH_SIG_LINE
-                    + cfg.world_size * _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B
-                    + _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B,
-                )
-            )
         return regions
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
@@ -667,20 +647,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
-        if cfg.is_scatter:
+        fp4 = cfg.quant_type == "fp4_blockwise"
+        if cfg.is_scatter and not fp4:
+            bad.append(
+                "combine_mode='scatter' (gather only, except quant_type='fp4_blockwise')"
+            )
+        if cfg.quant_type not in ("none", "fp4_blockwise"):
+            bad.append(f"quant_type={cfg.quant_type!r}")
+        if fp4:
             if not self._is1250:
-                bad.append("combine_mode='scatter' (push-send combine is gfx125x only)")
+                bad.append(
+                    "quant_type='fp4_blockwise' (the fp4 combine is gfx125x only)"
+                )
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
-                    f"combine_mode='scatter' with combine dtype {cfg.combine_dtype} (bf16 only)"
+                    f"quant_type='fp4_blockwise' with combine dtype {cfg.combine_dtype} "
+                    "(bf16 only)"
                 )
             elif cfg.hidden_dim % 1024:
                 bad.append(
-                    f"combine_mode='scatter' with hidden_dim={cfg.hidden_dim} "
+                    f"quant_type='fp4_blockwise' with hidden_dim={cfg.hidden_dim} "
                     "(needs a multiple of 1024)"
                 )
-        if cfg.quant_type != "none":
-            bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
             bad.append("enable_std_moe")
         # The kernel walks the source scale rows with the PADDED dword stride, so
@@ -1217,6 +1205,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             scale_bytes=self._scale_i32(cfg) * 4,
         )
         comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
+        if cfg.quant_type == "fp4_blockwise":
+            comb_cfg["combine_fp4"] = True
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
@@ -1228,13 +1218,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
-        plan_cls = cb.EpCombinePushPlan if cfg.is_scatter else cb.EpCombinePlan
-        wrap = self._wrap_combine_push if cfg.is_scatter else self._wrap_combine
         for b, w in self._combine_specs:
-            plan = plan_cls(**common, **comb_cfg, block_num=b, warp_per_block=w)
+            plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
-            combine[(b, w)] = wrap(plan)
+            combine[(b, w)] = self._wrap_combine(plan)
 
         return KernelSet(
             dispatch=dispatch,
@@ -1392,7 +1380,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan):
+        fp4 = self.cfg.quant_type == "fp4_blockwise"
+
         def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
+            if want_weights and fp4:
+                raise NotImplementedError(
+                    "quant_type='fp4_blockwise' folds no weights; call combine with weights=None"
+                )
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 inp_token_buf=input,
@@ -1409,26 +1403,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         return run
 
-    def _wrap_combine_push(self, plan):
-        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
-            plan.launch(
-                stream=torch.cuda.current_stream().cuda_stream,
-                inp_token_buf=input,
-                out_token_buf=self.combine_out,
-                disp_dest_tok_id_map=dest_map,
-                total_recv_token_num=total_recv,
-                num_tokens=num_tokens,
-                prof_time_buf=self.prof_time_buf,
-                prof_time_offset=self.prof_time_offset,
-            )
-
-        return run
-
     def push_landing(self):
+        """The fp4 combine's landing rows, [src_pe, recv_slot, wire bytes] (tests)."""
+        if self.cfg.quant_type != "fp4_blockwise":
+            raise ValueError("no landing rows: quant_type is not 'fp4_blockwise'")
         view = self._views.get("push_landing")
         if view is None:
             view = from_gpu_ptr(
-                self.arena.local_ptr("comb_push"),
+                self.arena.local_ptr("out_tok")
+                + self._recv_cap * self.cfg.combine_token_nbytes,
                 (self.cfg.world_size, self._recv_cap, push_wire_nbytes(self.cfg)),
                 torch.uint8,
             )

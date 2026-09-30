@@ -56,7 +56,6 @@ plan_api.load_library(_LIB_NAME, extra_dirs=_extra_dirs())
 
 EpDispatchPlan = make_plan("ep_dispatch")
 EpCombinePlan = make_plan("ep_combine")
-EpCombinePushPlan = make_plan("ep_combine_push")
 
 # The internode sequence. Eight plans rather than two: its dispatch and combine
 # are several passes each, and each pass is its own module. Both name tables must

@@ -219,41 +219,6 @@ static_assert(detail::EpArgsOffsetsAscend(),
               "MORI_EP_ARGS_FIELDS is not in EpArgs declaration order -- the binding would "
               "write each argument into the wrong slot");
 
-struct EpPushArgs {
-  EpArgs base;
-  unsigned long long offCombPush = 0;
-  unsigned long long offCombPushSig = 0;
-  long long* profTimeBuf = nullptr;
-  unsigned int* profTimeOffset = nullptr;
-};
-
-#define MORI_EP_PUSH_ARGS_FIELDS(X) \
-  X(offCombPush, "u64")             \
-  X(offCombPushSig, "u64")          \
-  X(profTimeBuf, "p")               \
-  X(profTimeOffset, "p")
-#define MORI_EP_PUSH_ARGS_SCHEMA \
-  MORI_EP_ARGS_SCHEMA MORI_EP_PUSH_ARGS_FIELDS(MORI_EP_ARGS_SCHEMA_ENTRY)
-
-namespace detail {
-
-#define MORI_EP_PUSH_ARGS_OFFSET(name, tag) offsetof(::mori::ops::v2::EpPushArgs, name),
-inline constexpr size_t kEpPushArgsOffsets[] = {MORI_EP_PUSH_ARGS_FIELDS(MORI_EP_PUSH_ARGS_OFFSET)};
-#undef MORI_EP_PUSH_ARGS_OFFSET
-
-constexpr bool EpPushArgsLaidOutFlat() {
-  if (offsetof(EpPushArgs, base) != 0 || kEpPushArgsOffsets[0] != sizeof(EpArgs)) return false;
-  for (size_t i = 1; i < sizeof(kEpPushArgsOffsets) / sizeof(kEpPushArgsOffsets[0]); ++i)
-    if (kEpPushArgsOffsets[i] <= kEpPushArgsOffsets[i - 1]) return false;
-  return true;
-}
-
-}  // namespace detail
-
-static_assert(detail::EpPushArgsLaidOutFlat(),
-              "EpPushArgs is not EpArgs followed by MORI_EP_PUSH_ARGS_FIELDS in order -- the "
-              "binding would write each push argument into the wrong slot");
-
 // ---------------------------------------------------------------------------
 // Cfg. Shared by dispatch and combine: they run over the same arena and the
 // same shape, and only the launch geometry differs. Two Specs, one Cfg.
@@ -279,6 +244,9 @@ struct EpCfg {
   // is free: Render omits default-valued fields, so the Cfg text -- which IS the
   // JIT cache key -- is byte-identical to a build without this feature.
   int scaleBytes = 0;
+  // Combine only, gfx125x only: quantize to MXFP4 and push (UseP2PRead == false).
+  // Off by default, so an unquantized combine renders the same Cfg text.
+  bool combineFp4 = false;
 };
 
 template <typename Self, typename Visit>
@@ -296,10 +264,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(waveSize);
   MORI_FIELD(useWeights);
   MORI_FIELD(scaleBytes);
+  MORI_FIELD(combineFp4);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 12, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 13, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -373,7 +342,6 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
 constexpr int EpCombinePushSlotAlign = 128;
-constexpr int EpCombinePushSigLine = 64;
 
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part

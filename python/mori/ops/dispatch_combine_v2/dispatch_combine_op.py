@@ -70,7 +70,7 @@ def _default_backend() -> str:
     return "hip" if _is_gfx125x() else "flydsl"
 
 
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise", "fp4_blockwise")
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
 
@@ -102,7 +102,8 @@ class EpDispatchCombineConfig:
     scale_type_size: int = 0
     # "gather" (UseP2PRead) or "scatter" (mori _nop2p, fp8 compression home).
     combine_mode: str = "gather"
-    quant_type: str = "none"  # none | fp8_direct_cast | fp8_blockwise
+    # none | fp8_direct_cast | fp8_blockwise (flydsl) | fp4_blockwise (hip, gfx125x)
+    quant_type: str = "none"
     # Geometry: None => the tuned schedule for this device/shape/dtype; pin any of
     # these to opt out. Combine keeps its own warp count -- its K-deep per-lane MLP
     # saturates sooner than dispatch's copy.
@@ -160,9 +161,10 @@ class EpDispatchCombineConfig:
     # capacity. Read only when internode_kernel == "auto".
     internode_auto_ll_max_tokens: int = 512
     # Which kernel backend serves this op: "flydsl" (default, full intranode
-    # feature set) or "hip" (HIP/JIT: gather only, no quant, no StdMoE, no
-    # routing replay; dispatch transports bf16/fp32/fp8/fp4 and combine reduces
-    # in bf16/fp32). "hip" is the only backend with an internode path -- flydsl's
+    # feature set) or "hip" (HIP/JIT: gather only, and the only quant is
+    # fp4_blockwise on gfx125x, which scatters; no StdMoE, no routing replay;
+    # dispatch transports bf16/fp32/fp8/fp4 and combine reduces in bf16/fp32).
+    # "hip" is the only backend with an internode path -- flydsl's
     # _unsupported rejects any config whose gpu_per_node < world_size -- so a
     # multi-node config must name it. None = MORI_V2_KERNEL_BACKEND, else the
     # default. Only consulted when constructing the BASE class; naming a
@@ -255,24 +257,17 @@ class EpDispatchCombineConfig:
         if self.is_asymmetric_dtype:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
-            # non-StdMoE only (the asymmetric path is implemented for gather).
-            push_send = (
-                self.combine_mode == "scatter"
-                and (
-                    self.kernel_backend
-                    or os.environ.get("MORI_V2_KERNEL_BACKEND")
-                    or _default_backend()
-                )
-                == "hip"
-            )
+            # non-StdMoE only (the asymmetric path is implemented for gather, and
+            # for the hip backend's fp4_blockwise scatter).
+            fp4 = self.quant_type == "fp4_blockwise"
             if (
-                (self.combine_mode != "gather" and not push_send)
-                or self.quant_type != "none"
+                (self.combine_mode != "gather" and not fp4)
+                or self.quant_type not in ("none", "fp4_blockwise")
                 or self.enable_std_moe
             ):
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    "quant_type=none, enable_std_moe=False"
+                    "quant_type=none (or fp4_blockwise), enable_std_moe=False"
                 )
             # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
             # supported; fp4 on the combine side is not.

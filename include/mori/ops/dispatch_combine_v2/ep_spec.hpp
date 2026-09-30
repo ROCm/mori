@@ -51,6 +51,8 @@ struct EpRequest {
   int blockNum = 0;      // 0 = arch default
   int warpPerBlock = 0;  // 0 = arch default
   int scaleBytes = 0;    // per-token scale row carried with the payload; 0 = off
+  // Combine quantizes to MXFP4 and pushes (gfx125x only).
+  bool combineFp4 = false;
 };
 
 template <typename Self, typename Visit>
@@ -67,10 +69,11 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(scaleBytes);
+  MORI_FIELD(combineFp4);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 11,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 12,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();
@@ -98,16 +101,6 @@ class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
  public:
   using Args = EpArgs;
   static constexpr const char* kName = "ep_combine";
-  static std::string EntryName(const Cfg& cfg);
-  static std::string RenderSource(const Cfg& cfg);
-  static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
-  static const std::vector<std::string>& SourceDeps();
-};
-
-class EpCombinePushSpec : public mori::jit::v2::KernelSpec<EpCombinePushSpec, EpCfg> {
- public:
-  using Args = EpPushArgs;
-  static constexpr const char* kName = "ep_combine_push";
   static std::string EntryName(const Cfg& cfg);
   static std::string RenderSource(const Cfg& cfg);
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);

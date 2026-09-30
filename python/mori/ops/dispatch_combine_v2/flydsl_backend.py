@@ -68,6 +68,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 "selects the internode path, which only the 'hip' backend "
                 "implements; pass kernel_backend='hip'",
             )
+        if cfg.quant_type == "fp4_blockwise":
+            return (
+                "quant_type='fp4_blockwise' is the hip backend's gfx125x combine; "
+                "pass kernel_backend='hip'",
+            )
         return ()
 
     def __init__(self, cfg: EpDispatchCombineConfig, comm):
