@@ -96,18 +96,11 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # "inplace": the expert already wrote into the staging view, so combine elides the
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
-# COMB_MODE=push: the push-send combine (combine_mode="scatter", gfx125x only). It
-# writes each received row to landing[srcPe][recvSlot] on the owner -- quantized in the
-# default build -- and the owner reduces from there, so CHECK compares what landed and,
-# for a build that reduces, the output; which checks apply follows the build (below).
 COMB_MODE = os.environ.get("COMB_MODE", "pull")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
 _PUSH_WIRE = HIDDEN * 2 // 4
-# The knobs below are read as the kernel compiles them (push_knob): the -D flags in
-# MORI_JIT_EXTRA_FLAGS, else the shipped defaults unless -DMORI_PUSH_DEFAULTS=0. The push
-# kernel is the hip backend's alone, so a pull-only run does not import it.
 if _PUSH:
     from mori.ops.dispatch_combine_v2.hip_backend import push_knob
 else:
@@ -116,43 +109,23 @@ else:
         return 0
 
 
-# MORI_PUSH_SIGNAL=3: the kernel also reduces, so CHECK compares the first _PUSH_WIRE bytes
-# of each output row, too.
 _PUSH_REDUCE = _PUSH and push_knob("SIGNAL") == 3
-# MORI_PUSH_QUANT=1|2: the kernel quantizes whole bf16 rows (e2m1 + one e8m0 per 32 | 128
-# elements), so CHECK stages real bf16 rows and bounds the reduce's output by the rounding.
 _PUSH_QGROUP = {1: 32, 2: 128}.get(push_knob("QUANT"), 0) if _PUSH else 0
 _PUSH_QUANT = _PUSH_QGROUP > 0
 if _PUSH_QUANT:
     _PUSH_WIRE = (HIDDEN // 2 + HIDDEN // _PUSH_QGROUP + 127) // 128 * 128
-# The scale rule the kernel was built with, for the exact check (QUANT=1 only):
-#   mx    MORI_PUSH_QMX=1: MXFP4 RoundUp, e8m0 = ceil(log2(amax / 6)) (aiter's default)
-#   lean  MORI_PUSH_QLEAN=1: 2^(floor(log2 amax) - 1), exponent floor -126
-#   old   the same, exponent floor -127 (the conversion itself stops at -126)
-# PUSH_QRULE overrides it: a negative control, a rule the kernel was not built with must fail.
 _PUSH_QRULE = os.environ.get("PUSH_QRULE") or (
     "mx" if push_knob("QMX") else "lean" if push_knob("QLEAN") else "old"
 )
-# PROFILE=1 (push only): after a point's timing, trace PROF_N combines through the
-# kernel's IF_ENABLE_PROFILER hooks and print per-phase times. The kernel only
-# traces when built with MORI_JIT_EXTRA_FLAGS=-DENABLE_PROFILER. PROF_OUT=<dir>
-# also writes one Perfetto trace per rank.
 PROFILE = int(os.environ.get("PROFILE", 0))
 PROF_N = int(os.environ.get("PROF_N", 5))
 PROF_GAP = float(os.environ.get("PROF_GAP", 0.2))
-# PROF_MODE=graph (default): trace inside the timed loop's shape -- PROF_R (dispatch, combine)
-# pairs in one warmed-up graph -- and analyse the last combine of each replay.
-# PROF_MODE=cold: one traced combine per host-synced step; PROF_WARM picks what precedes it:
-#   0 an idle gap, 1 an untraced launch of the same kernel, 2 its dispatch with no host sync.
 PROF_MODE = os.environ.get("PROF_MODE", "graph")
 PROF_R = int(os.environ.get("PROF_R", 20))
 PROF_WARM = int(os.environ.get("PROF_WARM", 0))
 PROF_OUT = os.environ.get("PROF_OUT", "")
 CHECK = int(os.environ.get("CHECK", 1))
-# CHECK_REPEAT=n (push, quantized reduce): after the checked pair, n more dispatch + combine pairs
-# with the staged rows times 2, 4, ..., each checked, the landing never cleared in between.
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
-# PUSH_QCHECK_DEV=1: the quantized-reduce check also runs on the device (see check_push_quant).
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # Payload distribution and RNG seed: DATA_INIT=zero|constant|uniform|norm, SEED,
 # CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
@@ -337,14 +310,6 @@ def main():
         return int(n.item())
 
     def check_push(op, ct, routing):
-        """Every landed slot must hold the first _PUSH_WIRE bytes of this rank's own
-        input token that went there, and every other slot must still be zero.
-
-        prime() fills each staged row's wire quarter with the bytes that slot
-        received in dispatch, i.e. the owner's input row. The owner's dest map
-        says which (pe, slot) each of its tokens went to, and the push lands at
-        landing[pe][slot] -- so the whole region is predictable locally.
-        """
         cap = op.cfg.effective_max_recv
         land = op.push_landing()
         dm = routing.disp_dest_tok_id_map[: ct * TOPK].long()
@@ -373,11 +338,6 @@ def main():
         return bad + stray
 
     def check_push_reduce(out, ct):
-        """Each token's rows are all its own input's wire bytes (check_push), one per
-        distinct destination rank, so the reduce must give U * row, rounded to bf16 once.
-        The kernel adds in fp32 and U * a bf16 is exact in fp32, so the match is exact;
-        wire bytes that decode to NaN must decode to NaN on both sides, and values below the
-        smallest normal may be flushed to zero by either side."""
         n_el = _PUSH_WIRE // 2
         got = (
             out.view(torch.uint8)[:ct, :_PUSH_WIRE]
@@ -409,7 +369,6 @@ def main():
         return bad
 
     def bf16_payload(pe):
-        """Rank pe's payload as bf16: a pure function of (SEED, pe), like check_dispatch's."""
         return _data.make_payload(
             (M, HIDDEN),
             INIT,
@@ -419,8 +378,6 @@ def main():
         )
 
     def push_quant_rows(total, routing):
-        """The combine input an identity expert would leave: recv slot i holds its source
-        token's row, regenerated from the source rank's seed."""
         tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
         src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
         rows = torch.empty(total, HIDDEN, dtype=torch.bfloat16)
@@ -432,7 +389,6 @@ def main():
     _FP4_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
     def fp4_rne(v):
-        """|v| to the nearest e2m1 magnitude, ties to the even code, saturating at 6."""
         g = _FP4_GRID.to(v.device)
         v = v.clamp(max=6.0).contiguous()
         idx = torch.searchsorted(g, v).clamp(1, 7)
@@ -441,10 +397,6 @@ def main():
         return torch.where(up, hi, lo)
 
     def push_quant_deq(x):
-        """What the wire decodes to for bf16 values x [..., group], under _PUSH_QRULE: the e8m0
-        byte from the group's |max| bits, the codes from x / 2^(conv - 127) rounded to nearest
-        even, decoded as code * 2^(byte - 127). conv differs from byte only for the old rule's
-        smallest groups, where the conversion stops at 2^-126 and the byte does not."""
         m15 = (x.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0x7FFF).amax(
             dim=-1, keepdim=True
         )
@@ -458,22 +410,12 @@ def main():
         return torch.sign(x) * fp4_rne(x.abs() / sc_conv) * sc_byte
 
     def push_quant_stats(x, u, got, t0=0):
-        """[bad rows, inexact rows, non-finite outputs], max error in steps, and the first
-        inexact element described, for got against U * x; [tokens, groups, group] tensors
-        on one device, token t0 first. Per group the sender divides by step = 2^(e-128), e
-        the biased exponent of the group's |max|, so a code is within half a step of the
-        value under round-to-nearest and within one step under truncation; the bound is one
-        step plus bf16 rounding of the sum. Reading zeros, a wrong scale, or a wrong nibble
-        order breaks it at the group's largest element. Inexact: U copies of one decoded
-        row, each a small multiple of a power of two, sum and round to bf16 without loss,
-        so the output must equal the reference bit for bit."""
         grp = x.shape[-1]
         amax = x.abs().amax(dim=2, keepdim=True)
-        _, ex = torch.frexp(amax)  # amax = m * 2^ex, m in [0.5, 1)
+        _, ex = torch.frexp(amax)
         step = torch.ldexp(torch.ones_like(amax), (ex - 2).clamp(min=-127))
         err = (got - u * x).abs()
         tol = u * step + (u * x).abs() * 2.0**-8 + 1e-30
-        # Not err > tol: a NaN compares false to everything and would pass as in bounds.
         bad = int((~(err <= tol)).flatten(1).any(dim=1).sum())
         nonfinite = int((~torch.isfinite(got)).sum())
         max_err = float(torch.nan_to_num(err / (u * step), nan=float("inf")).max())
@@ -496,13 +438,6 @@ def main():
         return [bad, inexact, nonfinite], max_err, first
 
     def check_push_quant(out, ct, scale=1.0):
-        """out[t] must be U * dequant(quant(x[t])); see push_quant_stats. max_err is printed
-        in steps: ~0.5 means round-to-nearest. scale: the power of two the staged rows were
-        multiplied by, which the codes carry exactly.
-
-        Computed on the host, a chunk of tokens at a time. PUSH_QCHECK_DEV=1 runs the same
-        arithmetic on the device as well and prints how far its counts are from the host's
-        (dev_diff)."""
         grp = _PUSH_QGROUP
         x_all = (bf16_payload(rank)[:ct].float() * scale).view(ct, HIDDEN // grp, grp)
         u_all = U[:ct].float().view(ct, 1, 1)
@@ -522,8 +457,6 @@ def main():
         dist.all_reduce(n)
         m = torch.tensor([max_err], dtype=torch.float64)
         dist.all_reduce(m, op=dist.ReduceOp.MAX)
-        # Every rank's first mismatch, printed by rank 0 alone: the row that fails is
-        # usually not rank 0's, and ranks printing at once tear each other's lines.
         firsts = [None] * world
         dist.all_gather_object(firsts, first)
         if rank == 0:
@@ -571,8 +504,6 @@ def main():
         if COMBINE_IN == "staged":
             buf = stage.clone()
         elif COMBINE_IN == "cached":
-            # Ordinary (cached) device memory rather than the symmetric window, which cco maps
-            # uncached; full max_recv rows, since the push kernel may read rows past total.
             buf = op.combine_in_view().clone()[:total]
         else:
             buf = stage
@@ -581,14 +512,10 @@ def main():
         if dispatch_bad:
             return total, buf, False, True
         if push_checked and _PUSH_QUANT:
-            # The landed bytes are quantized, so only the reduce's output can be checked.
             if not _PUSH_REDUCE:
                 return total, buf, True, False
             ok = check_push_quant(out, ct) == 0
             for k in range(1, CHECK_REPEAT + 1):
-                # Another pair with every staged row times 2^k and the landing left as the last
-                # combine wrote it: a launch released before its own rows landed would reduce the
-                # previous launch's rows, off by a factor of two.
                 *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 lockstep()
                 assert int(total_t.cpu().item()) == total, (
@@ -962,8 +889,6 @@ def main():
         out["smi_ranks"] = f"{len(med)}/{len(records)}"
         return out
 
-    # Sequential phases, then the INSTANTs: Entry at the kernel's first statement, and
-    # kEpPushSmSlot0 (8192) + CU id, which the Perfetto export names Unknown_Slot_<n>.
     _PROF_SEQ = {
         0: "Prologue",
         1: "Meta",
@@ -985,16 +910,6 @@ def main():
     }
 
     def profile_push(op, ct, i_, w_, x_, s_, buf):
-        """PROF_N traced push combines. PROF_MODE=graph traces the last combine of a
-        warmed-up PROF_R-pair graph replay; PROF_MODE=cold traces one combine per
-        host-synced step, the ranks lock-stepped in between.
-
-        wall_clock64 is a constant-rate clock whose rate gfx1250 does not report
-        (hipDeviceAttributeWallClockRate reads 0), so it is timed against the host:
-        consecutive traced launches are PROF_GAP s of host sleep apart, and the
-        rate is first-event ticks over host seconds between the first and the
-        last launch. Launch jitter is microseconds against that spread.
-        """
         import numpy as np
 
         from mori.ops.dispatch_combine_v2.hip_backend import PUSH_PROF_EVENTS
@@ -1013,9 +928,6 @@ def main():
         wpb = op._pick(ct)[1][1]
 
         def split_replay(a):
-            """One replay's ring [warps, E, 2] -> (the last launch's events only, block entry
-            ticks [launch, block]). Every warp opens every launch with an Entry INSTANT, and
-            the offset starts at 0 with no wrap, so ring order is launch order."""
             last = np.zeros_like(a)
             nb = a.shape[0] // wpb
             bent = np.full((PROF_R, nb), np.iinfo(np.int64).max, dtype=np.int64)
@@ -1024,7 +936,7 @@ def main():
                 if n == 0:
                     continue
                 if n >= PUSH_PROF_EVENTS:
-                    return None, None  # the ring may have wrapped: launches overlap
+                    return None, None
                 meta = a[w, :n, 1]
                 starts = np.nonzero(
                     ((meta & 0x3) == 2) & (((meta >> 2) & 0x3FFF) == 5)
@@ -1037,9 +949,6 @@ def main():
             return last, bent
 
         if PROF_MODE == "graph":
-            # The timed loop's own shape: PROF_R (dispatch, combine) pairs in one graph, warmed
-            # up, then replayed with the rings zeroed first. The last combine of a replay is the
-            # one analysed -- by then the pipeline is hot, as in the bench's timing.
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
                 for _ in range(PROF_R):
@@ -1067,7 +976,6 @@ def main():
                 traces.append(last)
                 bents.append(bent)
                 lockstep()
-            # Every rank takes the same exit, or the ones that stay wait on the others forever.
             flag = torch.tensor([1 if failed else 0])
             dist.all_reduce(flag)
             if flag.item():
@@ -1079,8 +987,6 @@ def main():
                 return
         for k in range(PROF_N if PROF_MODE != "graph" else 0):
             if PROF_WARM == 2:
-                # As in the pipeline: the traced combine follows its dispatch on the stream,
-                # with no host sync or idle gap between them. The gap goes before the dispatch.
                 lockstep()
                 if k:
                     time.sleep(PROF_GAP)
@@ -1103,8 +1009,6 @@ def main():
                 time.sleep(PROF_GAP)
             host_t.append(time.perf_counter())
             if PROF_WARM:
-                # The same kernel right before, on the same stream: its code and arguments are
-                # warm when the traced launch starts. Only the trace-buffer resets sit between.
                 op.combine(buf, routing=r)
                 tb.zero_()
                 to.zero_()
@@ -1121,14 +1025,9 @@ def main():
         if PROF_N >= 2:
             rate = (first_ts(traces[-1]) - first_ts(traces[0])) / (
                 (host_t[-1] - host_t[0]) * 1e6
-            )  # ticks per us
+            )
 
         def stats(a):
-            """Per-warp BEGIN/END pairs -> (span, send, {slot: (mean, max)}) ticks.
-
-            INSTANT events (Entry, the CU id) are dropped before pairing. A phase's
-            mean is over the warps that ran it: a warp with no slots never reaches
-            Meta, and counting it as 0 dilutes every phase after the prologue."""
             wl = []
             for w in range(a.shape[0]):
                 used = a[w, :, 0] != 0
@@ -1146,8 +1045,6 @@ def main():
                 )
             if not wl:
                 return None
-            # A sequential trace is B,E,B,E,... from slot Prologue; anything else
-            # means the ring wrapped or an event was lost.
             ok = all(
                 len(t) > 0
                 and len(t) % 2 == 0
@@ -1179,8 +1076,6 @@ def main():
             return t_end - t0, send, per, ok, len(wl), max(n for *_, n in wl)
 
         rows_ = [stats(a) for a in traces]
-        # Graph mode: per launch of every replay, the blocks entering > 1 us after the median
-        # block. Launch 1 follows the ring reset and the host's idle gap; 2..R are the hot ones.
         late = None
         if bents and rate:
             per, worst_hot = [], 0.0
@@ -1199,7 +1094,7 @@ def main():
             )
         mine = None
         if rate and all(x is not None for x in rows_):
-            med = lambda xs: float(np.median(xs))  # noqa: E731
+            med = lambda xs: float(np.median(xs))
             mine = dict(
                 rank=rank,
                 rate=rate,
@@ -1257,8 +1152,6 @@ def main():
                     f"last replay, late blocks per launch 1..{PROF_R}: {lt['last']}",
                     flush=True,
                 )
-        # The traced launch's first event on each rank, against the first rank's. Only a time if
-        # the ranks' wall clocks share an origin; the trace files each start at their own zero.
         got = [m for m in every if m is not None]
         if got:
             base = got[0]["t0"] / got[0]["rate"]

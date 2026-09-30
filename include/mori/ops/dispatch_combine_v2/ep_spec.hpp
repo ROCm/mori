@@ -104,9 +104,6 @@ class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
   static const std::vector<std::string>& SourceDeps();
 };
 
-// The push-send combine: each rank writes its post-expert tokens, quantized to MXFP4, into
-// the owners' comb_push slots, and each owner reduces what landed for its own tokens.
-// gfx125x only (it is TDM throughout); same Cfg as the gather combine, its own Args.
 class EpCombinePushSpec : public mori::jit::v2::KernelSpec<EpCombinePushSpec, EpCfg> {
  public:
   using Args = EpPushArgs;

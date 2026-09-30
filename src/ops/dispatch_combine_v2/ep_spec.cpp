@@ -240,8 +240,6 @@ mori::jit::v2::LaunchGeometry EpCombinePushSpec::Geometry(const Cfg& cfg) {
   mori::jit::v2::LaunchGeometry g;
   g.gridX = static_cast<unsigned>(cfg.blockNum);
   g.blockX = static_cast<unsigned>(EpBlockThreads(cfg));
-  // The whole budget: it is split evenly into one token tile per warp, and the
-  // tile's capacity is what bounds how many tokens a warp sends in one round.
   g.sharedBytes = static_cast<unsigned>(EpCombine1250xLdsBudget);
   return g;
 }

@@ -172,7 +172,6 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeGather(int rowElems, int n
   g1.tileDim1(nRows);
   return g1;
 }
-// CPOL is the instruction's cache-policy immediate: TH in bits 0-2, SCOPE in 3-4 (3 = system).
 template <typename T, int TH = 0, int SCOPE = 0, int CPOL = 0>
 __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_TDM_GROUP1& g1) {
   MORI_TDM_CHECK_ADDR(dst);
@@ -1439,24 +1438,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Push-send combine (ep_combine_push): the send half of a PUSH combine and
-// nothing else -- no staging copy, no cross-device barrier, no reduce, no
-// completion signal. Each rank writes, for every token it received in dispatch,
-// EpCombinePushWireBytes of the post-expert row into
-// landing[myPe][recvSlot] on the token's owner.
-//
-// Work split: warp w owns the recv slots [w*per, (w+1)*per), per = ceil(T/warps).
-// A round moves up to kCap of them: ONE strided TDM load of the rows into the
-// warp's tile, then ONE contiguous TDM store per run of slots bound for the same
-// pe (the landing index is the sender's own recv slot, so a run is contiguous on
-// the destination too). Two waits per round. kCap is the LDS budget split per
-// warp, so a shape whose per-warp share fits is sent in a single round.
-// ---------------------------------------------------------------------------
-
-// Trace slots; bench_ep.py decodes them by value. Entry is an INSTANT stamped by the
-// kernel's first statement; a second INSTANT at the same time carries the CU id as
-// kEpPushSmSlot0 + __smid(), so a trace says where every warp ran.
 enum class EpPushSlot : int {
   Prologue = 0,
   Meta = 1,
@@ -1469,33 +1450,18 @@ enum class EpPushSlot : int {
   Reduce = 8,
   Signal = 9,
   Timeout = 10,
-  // INSTANTs of the receiver's polls: source rank s's report slots / landed rows all seen.
   SigSrc0 = 11,
   DataSrc0 = 19,
   GoPoll = 27
 };
 constexpr int kEpPushSmSlot0 = 8192;
-// MORI_PUSH_SIGNAL=2 report slots per source rank in comb_push_sig: the most combine blocks any
-// plan launches (hip_backend.py caps block_num at _XDB_FLAG_SLOTS = 256), and the region is
-// sized with the same constant (_PUSH_SIG_BLOCKS).
 constexpr int kEpPushSigBlocks = 256;
-// One 128 B line per report slot (_PUSH_SIG_SLOT_B): with 16-32 slots per line, the 64 blocks'
-// stores and the poller's loads met on two or three lines per source, and same-line accesses
-// serialize (HANDOFF-F01-2 23.17: repeated same-address writes; 64 pollers on one line 6.5x).
 constexpr int kEpPushSigSlotDw = 32;
-// Events each warp keeps in its trace ring: 2 + 8 per round, so up to 31 rounds
-// before it wraps. hip_backend.py sizes profTimeBuf as warps * 2 * this, so the
-// two must agree.
 constexpr int kEpPushProfEvents = 256;
 #ifdef ENABLE_PROFILER
-// An alias so IF_ENABLE_PROFILER's single macro argument carries no bare comma.
 using EpPushProfiler = ::mori::core::profiler::TraceProfiler<EpPushSlot, kEpPushProfEvents>;
 #endif
 
-// MORI_PUSH_DEFAULTS (default 1): a build that leaves one of these knobs unset gets the value
-//   here; together they are the push-send combine as it ships. =0 leaves every knob at its off
-//   value below, the baseline the measurement builds spell out knob by knob. hip_backend.py
-//   mirrors this list in _PUSH_DEFAULTS, since it sizes the landing slots from MORI_PUSH_QUANT.
 #ifndef MORI_PUSH_DEFAULTS
 #define MORI_PUSH_DEFAULTS 1
 #endif
@@ -1562,16 +1528,9 @@ using EpPushProfiler = ::mori::core::profiler::TraceProfiler<EpPushSlot, kEpPush
 #endif
 #endif
 
-// Deletion knobs for pricing the send segment by segment; the defaults compile none of them in.
-// MORI_PUSH_STOPAT: 0 returns at entry, 1 after reading the recv total, 2 after reading the slot
-// map, 3 once the TDM load has landed. MORI_PUSH_LOCAL: every store lands in this rank's own
-// landing region (same count and size of stores, no fabric). MORI_PUSH_NOLOAD: skip the TDM
-// load and store whatever the tile holds.
 #ifndef MORI_PUSH_STOPAT
 #define MORI_PUSH_STOPAT 99
 #endif
-// MORI_PUSH_TOTREAD=1 (with MORI_PUSH_STOPAT=1): only warp 0 of each block reads the recv total, so
-// one warp a block rather than every warp loads those same 4 bytes at once.
 #ifndef MORI_PUSH_TOTREAD
 #define MORI_PUSH_TOTREAD 0
 #endif
@@ -1581,52 +1540,24 @@ using EpPushProfiler = ::mori::core::profiler::TraceProfiler<EpPushSlot, kEpPush
 #ifndef MORI_PUSH_NOLOAD
 #define MORI_PUSH_NOLOAD 0
 #endif
-// MORI_PUSH_STORE2D: each run goes out as a rows x row-bytes descriptor instead of one flat span
-// (same bytes, same count of stores). MORI_PUSH_ROWFRAC=k (needs STORE2D): only the first 1/k of
-// every row is written -- fewer bytes, nothing else changed; the landed bytes are then not valid.
 #ifndef MORI_PUSH_STORE2D
 #define MORI_PUSH_STORE2D 0
 #endif
 #ifndef MORI_PUSH_ROWFRAC
 #define MORI_PUSH_ROWFRAC 1
 #endif
-// MORI_PUSH_ONLYWARPS=N: only global warps 0..N-1 store; the rest stop after their load.
-// MORI_PUSH_FORCEPEER=1: every store goes to rank (rank + 1) % world, whatever the slot map says.
 #ifndef MORI_PUSH_ONLYWARPS
 #define MORI_PUSH_ONLYWARPS 0
 #endif
 #ifndef MORI_PUSH_FORCEPEER
 #define MORI_PUSH_FORCEPEER 0
 #endif
-// Pricing the completion protocol; all off by default.
-// MORI_PUSH_SIGNAL=1: after its stores complete, each warp does a system-scope release fence and
-//   adds its row count to the destination's counter for this source (comb_push_sig). Warp 0 of
-//   the last block then polls its own counters up to the counts its dest map implies, and zeroes
-//   them. Measured: ~210 warps per source add to one address, and those atomics serialize.
-// MORI_PUSH_SIGNAL=2: no atomics. Each warp leaves its per-destination row counts in LDS; after a
-//   block barrier, thread d sums them, fences, and stores rows + 1 into its own slot
-//   [source][block] on destination d. The receiver polls every slot until none is 0, then zeroes.
-// MORI_PUSH_SIGNAL=3: the whole combine without overlap. SIGNAL=2's report and poll, then the
-//   last block stores a release line per other block; each block's warp 0 waits on its own line,
-//   fences (system acquire), and after a block barrier every warp reduces as REDUCEONLY does.
-// MORI_PUSH_DATASEEN: every sent row carries kEpPushSeenTag in its last dword (overwriting
-//   payload); the receiver block polls until each row it expects shows it, then zeroes the tags --
-//   before polling signals. No epoch: a per-launch value read by every warp from one address
-//   stretched the prologue to 65 us mean / 129 us max (seen_r1).
-// MORI_PUSH_SIGFENCE=1: the SIGNAL=2 report fences with __threadfence_system() (global_wb +
-//   global_inv at system scope, as the pull combine does after staging) instead of a release
-//   fence, which compiles to s_wait_storecnt alone. seen_r3: without it the receiver saw its own
-//   rank's rows 8-12 us after their TDM stores completed, later than every remote rank's rows.
-// MORI_PUSH_REDUCEONLY: no send; warps sum each local token's landed rows into outTokenBuf.
-// MORI_PUSH_MAXSPIN bounds every poll loop; a poll that runs out logs a Timeout instant.
 #ifndef MORI_PUSH_SIGNAL
 #define MORI_PUSH_SIGNAL 0
 #endif
 #ifndef MORI_PUSH_SIGFENCE
 #define MORI_PUSH_SIGFENCE 0
 #endif
-// MORI_PUSH_TDMCPOL: the push stores' cache-policy immediate (TdmIssueStore CPOL); 0x18 =
-// SCOPE_SYS.
 #ifndef MORI_PUSH_TDMCPOL
 #define MORI_PUSH_TDMCPOL 0
 #endif
@@ -1639,143 +1570,66 @@ using EpPushProfiler = ::mori::core::profiler::TraceProfiler<EpPushSlot, kEpPush
 #ifndef MORI_PUSH_MAXSPIN
 #define MORI_PUSH_MAXSPIN 65536
 #endif
-// MORI_PUSH_QUANT=1: the sender quantizes each bf16 row to e2m1 with one e8m0 scale per 32
-//   elements (hip_backend.py sizes the slots from the same flag), and the reduce dequantizes and
-//   writes the whole bf16 row. Both conversion builtins get a scale of one; the group's power of
-//   two is applied with a multiply, so no per-lane scale operand is handed to the hardware.
-// MORI_PUSH_QUANT=2: the same wire and reduce skeleton with the 0920 branch's quantizer
-//   (wip/epv2-combine-fp4-reduce-opt-0920 at c281d243, all four of its switches on): one scale
-//   per 128 elements, eight elements a lane, the group max over 16 lanes by DPP, and the scale
-//   handed to both conversion builtins, the decode's through its lane layout (Q4SBCAST=2).
-//   Here only to price the two quantizers against each other.
 #ifndef MORI_PUSH_QUANT
 #define MORI_PUSH_QUANT 0
 #endif
-// MORI_PUSH_RSPLIT=1 (with MORI_PUSH_QUANT): the reduce hands out one pass of one token per work
-//   item instead of a whole token.
 #ifndef MORI_PUSH_RSPLIT
 #define MORI_PUSH_RSPLIT 0
 #endif
-// MORI_PUSH_QLOAD=1 (with MORI_PUSH_QUANT=1): the sender's loads are coalesced -- each one is
-//   512 contiguous bytes, eight elements a lane -- and a scale group is four lanes, its max taken
-//   over two DPP steps. The default gives each lane its own group as four 16 B loads 64 B apart,
-//   so every load touches sixteen 128 B lines for a quarter of each. Same wire either way.
 #ifndef MORI_PUSH_QLOAD
 #define MORI_PUSH_QLOAD 0
 #endif
-// MORI_PUSH_QROWS=1 (with MORI_PUSH_QLOAD=1 and MORI_PUSH_SPEC, whose runs are a compile-time C
-//   rows): the quantizer's row loop is unrolled too, so the next row's loads can go out under this
-//   row's arithmetic; rolled, each row waited out its own loads before the next row's began.
 #ifndef MORI_PUSH_QROWS
 #define MORI_PUSH_QROWS 0
 #endif
-// MORI_PUSH_QCVT=1|2 (with MORI_PUSH_QLOAD=1): each eight-element load is packed by
-//   v_cvt_scalef32_pk8_fp4_bf16 straight from bf16 with the group's scale as its operand, not
-//   widened to fp32 and multiplied first (sixteen instructions an eight). 1 passes 2^-se, 2 passes
-//   2^se; the check tells which the hardware divides by.
 #ifndef MORI_PUSH_QCVT
 #define MORI_PUSH_QCVT 0
 #endif
-// MORI_PUSH_QSTREAM=1 (with MORI_PUSH_SPEC and MORI_PUSH_QUANT): each of a run's rows is stored the
-//   moment it is quantized, not after the whole run. Measured before it (kf4400068): quantizing
-//   and the fabric added up, 4.8 + 4.8 us -- every warp quantized both rows, then all the rows went
-//   out at once.
 #ifndef MORI_PUSH_QSTREAM
 #define MORI_PUSH_QSTREAM 0
 #endif
-// MORI_PUSH_SPECMIX=1 (with MORI_PUSH_SPEC=C >= 2): a block's warps 0..3/4 take runs of C rows and
-//   the last quarter runs of one, so each SIMD holds 3C + 1 rows rather than 4C. The quantized send
-//   is bounded per SIMD (kf4400068 profile: quantize time steps up with each wave a SIMD holds;
-//   128 blocks at C=2 kept 4C a SIMD and gained nothing, at C=1 gained 1.8 us).
-//   SPECMIX=2 (quantized): the one-row warps run the C-row code with their row read C times, so
-//   every warp shares the C-row schedule (with QROWS, a separate one-row copy came out with two
-//   loads in flight).
-//   SPECMIX=3 (quantized, with QROWS): C-row warps take the unrolled copy, one-row warps a rolled
-//   loop over a count the compiler cannot see is one.
 #ifndef MORI_PUSH_SPECMIX
 #define MORI_PUSH_SPECMIX 0
 #endif
-// MORI_PUSH_QLEAN=1 (QLOAD=1): three fewer VALU ops a scale group in the quantizer -- the half-word
-//   max without clearing the upper half, one scale floor (-126) for the byte and the conversion,
-//   and the scale byte's index in a form whose per-iteration part folds into the LDS offset.
 #ifndef MORI_PUSH_QLEAN
 #define MORI_PUSH_QLEAN 0
 #endif
-// MORI_PUSH_QMX=1 (QUANT=1, QLOAD=1): MXFP4 scale rule as aiter's combine wire uses it
-//   (emit_mx_e8m0_scale, default RoundUp): e8m0 = ceil(log2(amax / 6)), so the largest element
-//   lands in (3, 6] and the 6 code is used. Without it the scale is 2^(floor(log2 amax) - 1), the
-//   largest element in [2, 4). Same wire, same byte meaning (2^(byte - 127)), same decode.
 #ifndef MORI_PUSH_QMX
 #define MORI_PUSH_QMX 0
 #endif
-// MORI_PUSH_QPRE=1 (SPEC, quantized, QLOAD=1; with SPECSTRIDE, or SPECMIX=1 without QROWS): a
-//   run's first row is loaded into registers before the window's fields and the slot map are read.
 #ifndef MORI_PUSH_QPRE
 #define MORI_PUSH_QPRE 0
 #endif
-// MORI_PUSH_QNEXT=1 (QPRE, SPECMIX=1): a two-row warp's second row goes to LDS by TDM at the start
-//   of the run, so its load overlaps the first row's quantize instead of following it, and it
-//   leaves the vector-load path; it is quantized from LDS in place.
 #ifndef MORI_PUSH_QNEXT
 #define MORI_PUSH_QNEXT 0
 #endif
-// MORI_PUSH_QTDM=1 (SPECMIX=1 without QROWS): every row reaches the quantizer by TDM into LDS, not
-//   by vector loads; the run's first row at its start, each next one as soon as the previous row
-//   is in registers.
 #ifndef MORI_PUSH_QTDM
 #define MORI_PUSH_QTDM 0
 #endif
-// MORI_PUSH_SEGSTORE=1 (SPECMIX=1, QTDM): the send follows the dispatch's layout. Each (source
-//   rank, dispatch block) pair's rows sit contiguous in the recv buffer and land at contiguous
-//   slots on that rank, so the block quantizes its rows into one run of wire rows in LDS (bf16
-//   staged by half rows, 7 KB a warp) and sends each maximal same-rank stretch with one TDM store,
-//   issued by the warp that completes it -- about 5 stores a block instead of about 16.
 #ifndef MORI_PUSH_SEGSTORE
 #define MORI_PUSH_SEGSTORE 0
 #endif
-// MORI_PUSH_QTDMW=1 (QTDM): a run's last row is quantized as its LDS reads return, instead of after
-//   all of them; only a row followed by another row's TDM load waits for its reads first.
 #ifndef MORI_PUSH_QTDMW
 #define MORI_PUSH_QTDMW 0
 #endif
-// MORI_PUSH_SPECSTRIDE=1 (SPEC=C >= 2, SPREAD, quantized, QLOAD=1): a warp's run holds rows
-//   base, base + W, .., base + (C-1)W (W = warps in the grid, base = the SPREAD run index), so row
-//   k lands on SIMD k mod SIMDs whatever the total: each SIMD holds ceil(total / SIMDs) rows or one
-//   fewer. The first row is loaded before the total arrives; each later one only if it is below
-//   the total, tested after the row before it. Rows go out one store each.
 #ifndef MORI_PUSH_SPECSTRIDE
 #define MORI_PUSH_SPECSTRIDE 0
 #endif
-// MORI_PUSH_SPREADX=1 (SPREAD): rows go to the first blockNum - 1 blocks only, so the receiver
-//   block (the last) polls the reports from the start instead of after quantizing its own rows.
 #ifndef MORI_PUSH_SPREADX
 #define MORI_PUSH_SPREADX 0
 #endif
-// MORI_PUSH_RSKIP=1 (QUANT, RTDM): the reduce reads and decodes only a token's landed rows, not the
-//   copies of row 0 at weight zero that pad it to npes (E[rows] = 3.29 of 4 at topk 6 over 4
-//   ranks).
 #ifndef MORI_PUSH_RSKIP
 #define MORI_PUSH_RSKIP 0
 #endif
-// Diagnostic only: MORI_PUSH_ROWSTORE=1 sends every row with a store of its own, as SPECSTRIDE
-//   must, where adjacent rows for one rank would share one.
 #ifndef MORI_PUSH_ROWSTORE
 #define MORI_PUSH_ROWSTORE 0
 #endif
-// MORI_PUSH_TDEFER=1 (SPEC, quantized, QLOAD=1): a warp's runs rotate over its tile slots and do
-//   not wait for their stores; the warp waits once, after its last run. Without it every run waits
-//   for its stores to land before the next run starts, one remote round trip per extra run
-//   (SPEC=1 SPREAD=1 at ct=512: two runs a warp, 25.6 against SPECMIX's 22.0).
 #ifndef MORI_PUSH_TDEFER
 #define MORI_PUSH_TDEFER 0
 #endif
-// Diagnostic only (MORI_PUSH_SPEC): rank 0, blocks 0-1, prints each warp's HW_ID1 SIMD and slot.
 #ifndef MORI_PUSH_HWID
 #define MORI_PUSH_HWID 0
 #endif
-// Pricing only, with MORI_PUSH_SPEC and MORI_PUSH_STOPAT=3 (nothing is sent, the tile holds junk):
-// MORI_PUSH_TDMW=k: the unquantized TDM row load reads k times the wire bytes of each row.
-// MORI_PUSH_QNOP=1: the quantizer keeps its loads and drops its arithmetic, one word a row out.
 #ifndef MORI_PUSH_TDMW
 #define MORI_PUSH_TDMW 1
 #endif
@@ -1787,75 +1641,39 @@ using EpPushProfiler = ::mori::core::profiler::TraceProfiler<EpPushSlot, kEpPush
 #else
 #define EP_PUSH_QROWS_UNROLL
 #endif
-// MORI_PUSH_RTDM=1 (with MORI_PUSH_QUANT): the reduce brings each token's landed rows into the
-//   warp's LDS tile with one TDM load per row and a single wait, then decodes from LDS.
 #ifndef MORI_PUSH_RTDM
 #define MORI_PUSH_RTDM 0
 #endif
-// MORI_PUSH_RPK=1 (with MORI_PUSH_QUANT): the reduce rounds its fp32 sums to bf16 with
-//   v_cvt_pk_bf16_f32 (MoriPackTo2), two elements an instruction, instead of the hand-written
-//   round-to-nearest-even, about four instructions an element. Measured on 64x16: one active
-//   warp spent 6-8 us on one token with or without RTDM, so the reduce is instruction-bound.
 #ifndef MORI_PUSH_RPK
 #define MORI_PUSH_RPK 0
 #endif
-// MORI_PUSH_RHALF=1 (with MORI_PUSH_RTDM and MORI_PUSH_RSPLIT=2): each half-token item TDM-loads
-//   only its passes' bytes of every row, not the whole row it used half of.
 #ifndef MORI_PUSH_RHALF
 #define MORI_PUSH_RHALF 0
 #endif
-// MORI_PUSH_SPEC=C (1 <= C <= the tile's rows): warp w sends rows [w*C, w*C + C), then every
-//   gridWarps*C further on, instead of an equal share of the recv total. Its first run's slot-map
-//   read and row load then need no total and go out together with it; the total only trims the
-//   run. Rows up to kMaxRecv are read, so the input must span kMaxRecv rows (combine_in does).
 #ifndef MORI_PUSH_SPEC
 #define MORI_PUSH_SPEC 0
 #endif
-// MORI_PUSH_SPREAD=1 (with MORI_PUSH_SPEC): run k goes to warp k / blocks of block k % blocks, not
-//   to the k-th warp in block order. At ct=512 the ~844 runs then give every block 13-14 of them;
-//   in block order they filled blocks 0-52 and left 53-63 without rows, and a block's CU reads
-//   every row its warps quantize.
 #ifndef MORI_PUSH_SPREAD
 #define MORI_PUSH_SPREAD 0
 #endif
-// MORI_PUSH_MAPSRC (pricing, with MORI_PUSH_SPEC and MORI_PUSH_STOPAT=3 only; the values read are
-//   wrong): 1 reads the slot map's words from args.dispDestTokIdMap, a kernel argument, so the
-//   window's fields no longer come first -- one read where there were two in series; 2 reads none.
 #ifndef MORI_PUSH_MAPSRC
 #define MORI_PUSH_MAPSRC 0
 #endif
-// MORI_PUSH_RPRE=1 (with MORI_PUSH_SIGNAL=3): each warp works out its first reduce item's routing
-//   -- the dest-map read, the dedup, the landed rows' addresses -- right after its block's report
-//   goes out, instead of after the release: after it, those were a global read and ten shuffles
-//   in series ahead of the rows' TDM loads.
 #ifndef MORI_PUSH_RPRE
 #define MORI_PUSH_RPRE 0
 #endif
-// MORI_PUSH_POLLFIT=1 (SIGNAL>=2): the receiver's report poll reads the grid's blocks' slots only,
-//   npes * blockNum lines a spin, not npes * kEpPushSigBlocks (1024, of which 768 no block writes).
-// MORI_PUSH_GOFIRST=1 (SIGNAL=3): once every report is seen, the release lines are written before
-//   the report slots are zeroed rather than after.
 #ifndef MORI_PUSH_POLLFIT
 #define MORI_PUSH_POLLFIT 0
 #endif
 #ifndef MORI_PUSH_GOFIRST
 #define MORI_PUSH_GOFIRST 0
 #endif
-// MORI_PUSH_POLLSPLIT=1 (SIGNAL>=2): warp s of the receiver block polls source s's slots, and after
-//   a block barrier warp 0 releases before the slots are zeroed; otherwise warp 0 polls every
-//   source.
 #ifndef MORI_PUSH_POLLSPLIT
 #define MORI_PUSH_POLLSPLIT 0
 #endif
-// MORI_PUSH_GOFAST=1 (SIGNAL=3): after the release, warp 0's acquire is the cache invalidate alone
-//   and the block barrier a bare s_barrier, so neither waits on stores still in flight; the release
-//   line is zeroed after the barrier.
 #ifndef MORI_PUSH_GOFAST
 #define MORI_PUSH_GOFAST 0
 #endif
-// MORI_PUSH_NOZERO=1 (tests only; results are wrong from the second launch on): the report slots
-//   are never zeroed, so every launch after the first is released at once, on the previous
-//   launch's rows. The negative control for bench_ep.py's CHECK_REPEAT.
 #ifndef MORI_PUSH_NOZERO
 #define MORI_PUSH_NOZERO 0
 #endif
@@ -1896,8 +1714,6 @@ typedef float EpF32x8 __attribute__((ext_vector_type(8)));
 typedef __bf16 EpBf16x8 __attribute__((ext_vector_type(8)));
 typedef unsigned short EpU16x2 __attribute__((ext_vector_type(2)));
 
-// MORI_PUSH_QUANT=2 only: the 0920 branch's EpQ4ScaleOperand (MORI_COMB_Q4SBCAST=2). Its
-// measurement: with scale_sel 0 a wave32 lane L reads byte L/16 of lane (L mod 16)'s operand.
 __device__ __forceinline__ unsigned EpPushQ4ScaleOperand(unsigned b, int lane) {
   const unsigned p = (unsigned)__shfl_xor((int)b, 16, 32);
   const unsigned lo = (lane & 16) ? p : b;
@@ -1905,13 +1721,11 @@ __device__ __forceinline__ unsigned EpPushQ4ScaleOperand(unsigned b, int lane) {
   const unsigned v = lo | (hi << 8);
   return v | (v << 16);
 }
-// A macro: the DPP control has to be a literal where the builtin is written.
 #define EP_PUSH_DPPMAX(_v, _ctrl)                                                               \
   __builtin_fmaxf(                                                                              \
       _v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, _v), \
                                                                 _ctrl, 0xf, 0xf, false)))
 
-// Bit s set when any lane of the warp has bit s set, for s < N.
 template <int N>
 __device__ __forceinline__ unsigned EpWarpOrBits(unsigned bits) {
   unsigned r = 0;
@@ -1927,7 +1741,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
   static_assert(sizeof(T) == 2, "the push-send combine sends the front quarter of a bf16 row");
   constexpr int WS = kCfg.waveSize;
   constexpr int kTokB = EpTokenBytes(kCfg);
-  // MORI_PUSH_QUANT wire: [kPayB e2m1, two a byte][kScB e8m0, one per kQGroup][pad to 128 B].
   constexpr int kQGroup = MORI_PUSH_QUANT == 2 ? 128 : 32;
   constexpr int kPayB = kCfg.hiddenDim / 2;
   constexpr int kScB = kCfg.hiddenDim / kQGroup;
@@ -1963,8 +1776,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           EpPushSlot::Entry, ::mori::core::profiler::EventType::INSTANT, _epEntryTs);
       profiler.log_with_time(static_cast<EpPushSlot>(kEpPushSmSlot0 + (_epSm & 0x1FFF)),
                              ::mori::core::profiler::EventType::INSTANT, _epEntryTs););
-  // MORI_TRACE_SEQ substitutes its second argument into the namespace path
-  // mori::core::profiler:: as well, so the variable has to be named profiler.
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, EpPushSlot::Prologue);
   if constexpr (MORI_PUSH_STOPAT == 0) return;
@@ -1976,20 +1787,11 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
 
   extern __shared__ char sharedMem[];
 
-  // Each local token's landed rows, one per distinct destination rank, summed as bf16 into the
-  // first kWireB bytes of its output row. A (token, rank) pair's flat dest-map value
-  // rank * maxRecv + slot is also its landing index, landing[rank][slot].
-  // MORI_PUSH_RSPLIT: a work item is one pass (=1) or half the passes (=2) of one token rather
-  // than a whole token, so every warp has work (512 tokens over 1024 or 2048 warps left half or
-  // three quarters of them idle).
   constexpr int kItemPass = !MORI_PUSH_QUANT        ? 1
                             : MORI_PUSH_RSPLIT == 1 ? kCfg.hiddenDim / (32 * WS)
                             : MORI_PUSH_RSPLIT == 2 ? 2
                                                     : 1;
   const int nItems = args.numTokens * kItemPass;
-  // A reduce work item's routing: its token, its part of the token, and one landed row per
-  // distinct destination rank. All of it comes from the dispatch's dest map and none from the
-  // landed rows, so MORI_PUSH_RPRE works it out before the release.
   struct EpPushRItem {
     int t, pOnly, flat;
     unsigned long long mask;
@@ -2009,8 +1811,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       if (k < laneId && pk == rpe) ok = false;
     }
     r.mask = __ballot(ok);
-    // Up to npes rows. An absent one repeats the first with a weight of zero, so every load
-    // is unconditional: a load under a condition waits at the join (see the signal poll).
     const int l0 = r.mask ? __ffsll((long long)r.mask) - 1 : 0;
     unsigned long long mm = r.mask;
 #pragma unroll
@@ -2029,14 +1829,11 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       const int flat = r.flat;
       unsigned long long mask = r.mask;
       if constexpr (MORI_PUSH_QUANT) {
-        // A pass is 32 elements a lane, [32g, 32g + 32): 16 B of e2m1 plus the e8m0 byte of
-        // their group per row, 64 B of bf16 out. One group per lane when kQGroup is 32.
         constexpr int kPass = kCfg.hiddenDim / (32 * WS);
         static_assert(kCfg.hiddenDim % (32 * WS) == 0 && kQGroup % 32 == 0,
                       "a pass is 32 elements a lane, inside one scale group");
         unsigned char* const orow =
             reinterpret_cast<unsigned char*>(args.outTokenBuf) + (size_t)t * kTokB;
-        // This item's passes: all of them, one (RSPLIT=1), or half (RSPLIT=2).
         constexpr int kPerItem = (kPass + kItemPass - 1) / kItemPass;
         const int pBeg = pOnly * kPerItem;
         const int pEnd = min(kPass, pBeg + kPerItem);
@@ -2050,20 +1847,15 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         }
         const auto& rp = r.rp;
         const auto& on = r.on;
-        // One pass of this lane's 32 elements: the rows' e2m1 words and scale bytes in, the bf16
-        // sum out to the token's output row.
         auto accStore = [&](const int g, const uint4(&pk)[npes], const unsigned (&sb)[npes]) {
           float acc[32];
 #pragma unroll
           for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
           for (int j = 0; j < npes; ++j) {
-            // RSKIP: rows past the token's count are copies of row 0 at weight zero; the count is
-            // the same in every lane, so this is a scalar branch.
             if (MORI_PUSH_RSKIP && j >= __popcll(mask)) break;
             const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
             if constexpr (MORI_PUSH_QUANT == 2) {
-              // 0920: the scale goes through the decode, in its lane layout.
               const unsigned so = EpPushQ4ScaleOperand(sb[j], laneId);
 #pragma unroll
               for (int i = 0; i < 4; ++i) {
@@ -2074,10 +1866,9 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
               }
               continue;
             }
-            const float s = on[j] * __uint_as_float(sb[j] << 23);  // 2^(sb - 127)
+            const float s = on[j] * __uint_as_float(sb[j] << 23);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-              // Scale byte 127 (one) in every byte: whichever byte a lane's decode reads.
               const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
 #pragma unroll
               for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
@@ -2090,8 +1881,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
               if constexpr (MORI_PUSH_RPK) {
-                // MoriPackTo2 returns 0 for any other type; the static_assert keeps that
-                // from turning into silent zeros.
                 static_assert(std::is_same_v<T, hip_bfloat16>, "RPK packs bf16 only");
                 w[e] = MoriPackTo2<T>(acc[i * 8 + 2 * e], acc[i * 8 + 2 * e + 1]);
               } else {
@@ -2103,16 +1892,11 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           }
         };
         if constexpr (MORI_PUSH_RTDM) {
-          // The token's rows come into this warp's tile with one TDM load each and one wait, and
-          // the passes read LDS: from global, each pass's loads waited behind the previous
-          // pass's output stores (landing and out may alias as far as the compiler knows).
           static_assert((kItemPass == 1 || MORI_PUSH_RSPLIT == 2) && kCap >= npes,
                         "RTDM reduces a whole or half token per warp from a tile of npes rows");
           const int nRow = __popcll(mask);
           const size_t tileOff = (size_t)warpId * kCap * kWireB;
-          asm volatile("s_wait_dscnt 0x0" ::: "memory");  // the previous token's reads are done
-          // MORI_PUSH_RHALF: only this item's passes -- their e2m1 bytes, and the 128 B of scale
-          // bytes around theirs -- at the same offsets in the tile; otherwise the whole row.
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
           constexpr int kPassB = WS * 16;
           const int payB = MORI_PUSH_RHALF ? pBeg * kPassB : 0;
           const int payN = MORI_PUSH_RHALF ? (pEnd - pBeg) * kPassB : kWireB;
@@ -2204,23 +1988,12 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
     for (int it = globalWarpId; it < nItems; it += globalWarpNum) reduceItem(reducePrep(it));
   };
 
-  // bf16 rows to the MORI_PUSH_QUANT wire, into the tile. A lane owns one scale group (32
-  // elements, 64 B of bf16) per pass, so the group max needs no other lane.
-  // srcStride: bytes from one source row to the next (QLOAD=1 only); 0 re-reads the first row.
-  // rolled (QLOAD=1 only, a constant at each call): keep the row loop rolled under QROWS.
-  // gate (QLOAD=1, a constant at each call; rolled): row r > 0 runs only while
-  // rowBase + r * rowStep < rowsTot, tested after row r - 1, so the first row never waits on it.
-  // pre (QLOAD=1, used when usePre, a constant at each call): row 0 as already loaded, 16 B per
-  // pass. Not tested against null: a private array's address cannot be proven non-null on
-  // AMDGPU, and the compare left the array in scratch.
   auto pushQuantRows = [&](unsigned char* dstTile, const unsigned char* srcRows, int nRows,
                            size_t srcStride = (size_t)EpTokenBytes(kCfg), bool rolled = false,
                            bool gate = false, int rowsTot = 0, int rowBase = 0, int rowStep = 0,
                            bool usePre = false, const uint4* pre = nullptr, bool r1Lds = false,
                            int tdmAll = 0, unsigned char* stg = nullptr) {
     if constexpr (MORI_PUSH_QUANT == 2) {
-      // The 0920 _cQuantTile4 with MORI_COMB_Q4DPP=1 and a 128-element group: eight elements a
-      // lane, so 16 lanes share a scale and reduce its max over one DPP row.
       constexpr int kVecs = kCfg.hiddenDim / 8;
       static_assert(kVecs % WS == 0 && kQGroup == 16 * 8, "one group per 16-lane row");
       for (int r = 0; r < nRows; ++r) {
@@ -2240,12 +2013,12 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           float amax = 0.0f;
 #pragma unroll
           for (int k = 0; k < 8; ++k) amax = __builtin_fmaxf(amax, __builtin_fabsf(v[k]));
-          amax = EP_PUSH_DPPMAX(amax, 0xb1);   // xor 1
-          amax = EP_PUSH_DPPMAX(amax, 0x4e);   // xor 2
-          amax = EP_PUSH_DPPMAX(amax, 0x141);  // row_half_mirror
-          amax = EP_PUSH_DPPMAX(amax, 0x140);  // row_mirror
+          amax = EP_PUSH_DPPMAX(amax, 0xb1);
+          amax = EP_PUSH_DPPMAX(amax, 0x4e);
+          amax = EP_PUSH_DPPMAX(amax, 0x141);
+          amax = EP_PUSH_DPPMAX(amax, 0x140);
           const int se = (int)((__float_as_uint(amax) >> 23) & 0xFFu) - 128;
-          const float div = __uint_as_float((unsigned)(se + 127) << 23);  // the builtin divides
+          const float div = __uint_as_float((unsigned)(se + 127) << 23);
           *reinterpret_cast<unsigned*>(d + (e0 >> 1)) =
               (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, div);
           if ((laneId & 15) == 0) d[kPayB + e0 / kQGroup] = (unsigned char)(se + 127);
@@ -2257,18 +2030,14 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       constexpr int kLd = kCfg.hiddenDim / (8 * WS);
       static_assert(kCfg.hiddenDim % (8 * WS) == 0 && kQGroup == 4 * 8,
                     "a coalesced load is eight elements a lane, a group four lanes");
-      // One pass i of a row into wire row d: this lane's 8 elements x, [8u, 8u + 8) with
-      // u = i * WS + laneId, and their group's scale byte (the group is 4 lanes).
       auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
         {
-          const int u = i * WS + laneId;  // elements [8u, 8u + 8), group u / 4
+          const int u = i * WS + laneId;
           const unsigned w[4] = {x.x, x.y, x.z, x.w};
           EpU16x2 mx = {0, 0};
 #pragma unroll
           for (int e = 0; e < 4; ++e)
             mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
-          // QLEAN: both halves take the max, so the 32-bit compares below order lanes by it
-          // exactly, and nothing has to clear the upper half.
           unsigned amax;
           if constexpr (MORI_PUSH_QLEAN) {
             mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
@@ -2277,30 +2046,20 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
             amax = mx.x > mx.y ? (unsigned)mx.x : (unsigned)mx.y;
           }
           const unsigned a1 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf,
-                                                                    false);  // xor 1
+                                                                    false);
           amax = amax > a1 ? amax : a1;
           const unsigned a2 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf,
-                                                                    false);  // xor 2
+                                                                    false);
           amax = amax > a2 ? amax : a2;
           int se = (int)((amax >> 7) & 0xFFu) - 128;
-          // QLEAN stores the -126 floor the QCVT=2 scale is held to, so the byte and the scale
-          // the codes were made with agree for the smallest groups too.
           se = se < (MORI_PUSH_QLEAN ? -126 : -127) ? (MORI_PUSH_QLEAN ? -126 : -127) : se;
           if constexpr (MORI_PUSH_QMX) {
-            // MXFP4 RoundUp: e8m0 = ceil(log2(amax / 6)). On the bf16 bits M of |max|, amax / 6
-            // stays in the binade below amax's exponent less two while the mantissa is <= 1.5
-            // (0x40 of 0x7F), and moves up one above it: ((M + 0x3F) >> 7) - 2. Floor at 1 so
-            // the scale operand is a normal number; only an all-zero group then differs from
-            // aiter's byte (1 against 0), and it decodes to zeros either way.
             const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
             se = (e8 < 1 ? 1 : e8) - 127;
           }
-          const float inv = __uint_as_float((unsigned)(127 - se) << 23);  // 2^-se
+          const float inv = __uint_as_float((unsigned)(127 - se) << 23);
           unsigned q;
           if constexpr (MORI_PUSH_QCVT) {
-            // The eight bf16 go in as loaded, the group's power of two as the conversion's scale:
-            // 2^-se (QCVT=1) or 2^se (QCVT=2), whichever the hardware applies as a divisor. The
-            // latter stops at 2^-126: at -127 its exponent field would read as zero.
             const float sc = MORI_PUSH_QCVT == 1
                                  ? inv
                                  : __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
@@ -2316,15 +2075,10 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
             q = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, 1.0f);
           }
           *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
-          // All four lanes of the group store the same byte: a store under a lane condition is
-          // a branch, and the loads of the next iterations stayed behind it (50.95 us, ql16_chk).
-          // QLEAN: the index split in two, so i * (WS / 4) folds into the store's offset (u / 4
-          // is a signed division, and each i took a register and an add of its own).
           d[MORI_PUSH_QLEAN ? kPayB + i * (WS / 4) + (laneId >> 2) : kPayB + u / 4] =
               (unsigned char)(se + 127);
         }
       };
-      // ldx(s, i, u): the i-th 16 B of this lane's row -- s[u] from memory, or pre[i] loaded ahead.
       auto quantRow = [&](int r, auto ldx) {
         const uint4* const s = reinterpret_cast<const uint4*>(srcRows + (size_t)r * srcStride);
         unsigned char* const d = dstTile + (size_t)r * kWireB;
@@ -2343,9 +2097,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       };
       const auto ldMem = [](const uint4* s, int, int u) { return s[u]; };
       if (tdmAll == 2) {
-        // MORI_PUSH_SEGSTORE: half rows through this warp's staging stg (the caller put row 0's
-        // first half there); each next half is loaded as soon as the current one is in registers,
-        // so it overlaps that half's quantize.
         constexpr int kH = kLd / 2;
         constexpr int kHalfB = kH * WS * 16;
         const uint4* const l = reinterpret_cast<const uint4*>(stg);
@@ -2368,10 +2119,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           for (int k = 0; k < kH; ++k) qgrp(d, iB + k, xs[k]);
         }
       } else if (tdmAll) {
-        // MORI_PUSH_QTDM: row r sits in LDS behind the first wire row (row 0 put there by the
-        // caller). Once it is in registers the next row's TDM load reuses the space, so that load
-        // overlaps this row's quantize; the last row is quantized in place.
-        // Under gate the next row is loaded only if it is below rowsTot, known by then.
         const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
         bool next = true;
         for (int r = 0; r < nRows && next; ++r) {
@@ -2380,10 +2127,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
 #pragma unroll
           for (int i = 0; i < kLd; ++i) xs[i] = l[i * WS + laneId];
           next = r + 1 < nRows && (!gate || rowBase + (r + 1) * rowStep < rowsTot);
-          // The next row's TDM load overwrites these LDS bytes and is not ordered with this wave's
-          // LDS reads, so it waits for them. Without a next load (QTDMW) nothing does: the in-place
-          // writes of the last row follow its reads in program order, and one wave's LDS
-          // operations execute in order.
           if (!MORI_PUSH_QTDMW || next) asm volatile("s_wait_dscnt 0x0" ::: "memory");
           if (next)
             TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kWireB),
@@ -2395,8 +2138,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         quantRow(0, [&](const uint4*, int i, int) { return pre[i]; });
         for (int r = 1; r < nRows && (!gate || rowBase + r * rowStep < rowsTot); ++r) {
           if (r1Lds && r == 1) {
-            // Row 1 was put in LDS by TDM at the run's start (MORI_PUSH_QNEXT), where its wire
-            // row goes: every read lands before the first in-place write.
             __builtin_amdgcn_s_wait_tensorcnt(0);
             const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
             uint4 xs[kLd];
@@ -2431,7 +2172,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         uint4 x[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) x[i] = s[g * 4 + i];
-        // With the sign cleared, bf16 bit patterns order as their magnitudes do.
         EpU16x2 mx = {0, 0};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -2441,11 +2181,9 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
             mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
         }
         const unsigned amax = mx.x > mx.y ? (unsigned)mx.x : (unsigned)mx.y;
-        // amax / 2^se lands in [2, 4): e2m1 tops out at 6, so nothing saturates. An all-zero
-        // group gets the smallest scale rather than e8m0's NaN (255).
         int se = (int)((amax >> 7) & 0xFFu) - 128;
         se = se < -127 ? -127 : se;
-        const float inv = __uint_as_float((unsigned)(127 - se) << 23);  // 2^-se
+        const float inv = __uint_as_float((unsigned)(127 - se) << 23);
         unsigned q[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -2478,7 +2216,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
   const int s0 = globalWarpId * per;
   const int s1 = min(s0 + per, total);
   if constexpr (MORI_PUSH_STOPAT == 1) {
-    // Never true; keeps the load of total from being dropped as dead.
     if (s1 < -1000000) *args.totalRecvTokenNum = 0;
     return;
   }
@@ -2487,23 +2224,14 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kCap * kWireB;
   const int* const recvToSrc = EpLocal<int>(win, args.offRecvToSrc);
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
-  // This rank's column on every destination.
   const size_t myColB = (size_t)args.rank * EpMaxRecv(kCfg) * kSlotB;
-  // comb_push_sig: [npes] counter lines indexed by source rank, then a spare line.
-  // Only dereferenced under MORI_PUSH_SIGNAL.
   unsigned* const sigLocal = EpLocal<unsigned>(win, pargs.offCombPushSig);
-  // MORI_PUSH_SIGNAL=2 report slots follow the counter and epoch lines: [npes][kEpPushSigBlocks].
   constexpr int kSlot0Dw = (npes + 1) * kSigDw;
-  // MORI_PUSH_SIGNAL=3 release lines, one per block of this rank, follow the report slots.
   constexpr int kGo0Dw = kSlot0Dw + npes * kEpPushSigBlocks * kEpPushSigSlotDw;
   int rowsTo[npes];
   for (int q = 0; q < npes; ++q) rowsTo[q] = 0;
   constexpr unsigned kEpPushSeenTag = 0x5EE17A65u;
 
-  // Sends the first n rows of tile tl -- input rows r0, r0 + rowStep, .. -- each to its
-  // destination's landing column, and waits for them (not under MORI_PUSH_TDEFER). Lane i's pe is
-  // row i's destination rank. landOf(p) is rank p's landing region; laneVal(v, i) is lane i's v,
-  // for a warp-uniform i. Rows that are not adjacent (rowStep > 1) go out one store each.
   auto sendTile = [&](unsigned char* tl, int r0, int n, int pe, auto landOf, auto laneVal,
                       int rowStep = 1) {
     MORI_TRACE_NEXT(seq, EpPushSlot::Store);
@@ -2530,8 +2258,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
     MORI_TRACE_NEXT(seq, EpPushSlot::StoreWait);
     if constexpr (!MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(0);
     if constexpr (MORI_PUSH_SIGNAL == 1) {
-      // The stores have completed (tensorcnt); the release fence orders them before the counts.
-      // It must come after the wait: a fence does not wait on tensorcnt.
       MORI_TRACE_NEXT(seq, EpPushSlot::Signal);
       __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
       for (int i = 0; i < n;) {
@@ -2553,53 +2279,33 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         C >= 1 && C <= kCap && kMaxRecv % C == 0 && !MORI_PUSH_NOLOAD && !MORI_PUSH_DATASEEN,
         "MORI_PUSH_SPEC: a run must fit the tile and tile kMaxRecv, and the row load "
         "must be there");
-    // MORI_PUSH_SPECMIX: the youngest wave on each SIMD (the last quarter of the block's warps)
-    // takes one row and the rest take C, so a block covers kMixR rows.
     constexpr int kMixLo = kCfg.warpPerBlock / 4;
     constexpr int kMixHi = kCfg.warpPerBlock - kMixLo;
     constexpr int kMixR = kMixHi * C + kMixLo;
     static_assert(!MORI_PUSH_SPECMIX || (C >= 2 && kCfg.warpPerBlock % 4 == 0 &&
                                          !MORI_PUSH_SPREAD && !MORI_PUSH_QSTREAM),
                   "MORI_PUSH_SPECMIX mixes runs of C and 1 over a block's four SIMDs");
-    // MORI_PUSH_SPREADX: the receiver block (the last) takes no rows, so it polls from the start.
     const int nbRows = (int)gridDim.x - (MORI_PUSH_SPREADX ? 1 : 0);
     const int stride = MORI_PUSH_SPECMIX ? (int)gridDim.x * kMixR : nbRows * kCfg.warpPerBlock * C;
-    // MORI_PUSH_TDEFER: runs take the warp's tile slots in turn, kRing of C rows, and a run waits
-    // only until at most kRing - 1 stores are in flight before it writes its slot. With stores
-    // retiring in issue order and every run but the last sending at least one, those are the
-    // later runs' stores, so the slot's previous store has completed.
     constexpr int kRing = !MORI_PUSH_TDEFER ? 1 : kCap / C >= 4 ? 4 : kCap / C >= 2 ? 2 : 1;
     static_assert(!MORI_PUSH_TDEFER || (kRing >= 2 && MORI_PUSH_QUANT && MORI_PUSH_QLOAD == 1 &&
                                         !MORI_PUSH_QSTREAM && MORI_PUSH_SIGNAL != 1),
                   "MORI_PUSH_TDEFER: two C-row slots, quantized coalesced loads (no TDM load)");
     int ringIx = 0;
-    // MORI_PUSH_SPECSTRIDE: a run's C rows are one grid of warps apart, not adjacent.
     static_assert(!MORI_PUSH_SPECSTRIDE ||
                       (C >= 2 && MORI_PUSH_SPREAD && MORI_PUSH_QUANT && MORI_PUSH_QLOAD == 1 &&
                        !MORI_PUSH_SPECMIX && !MORI_PUSH_QSTREAM && !MORI_PUSH_STORE2D),
                   "MORI_PUSH_SPECSTRIDE: SPEC >= 2 with SPREAD, quantized coalesced loads");
     const int rowStep = MORI_PUSH_SPECSTRIDE ? nbRows * kCfg.warpPerBlock : 1;
-    // One run of cnt rows (C, or 1 under MORI_PUSH_SPECMIX). The row load, the slot-map read and
-    // the recv total all go out before any of them is waited on; the sched barriers stop the
-    // compiler pulling a use of one -- and so its wait -- ahead of another's issue. Returns whether
-    // the warp has a further run.
     auto specRun = [&](int r0, int cnt) {
       unsigned char* const tl = tile + (size_t)(ringIx & (kRing - 1)) * C * kWireB;
       ++ringIx;
-      // A run past kMaxRecv loads the last run in the input instead of branching round the load
-      // (the branch split the kernel-argument loads in two, one wait each); its n comes out <= 0.
-      // Below kMaxRecv, rl == r0: C divides kMaxRecv, and a run of C starts on a multiple of C.
       const int rl = MORI_PUSH_SPECSTRIDE ? min(r0, kMaxRecv - 1) : min(r0, kMaxRecv - cnt);
-      // The pointers the reads below start from join the kernel-argument loads the row load waits
-      // on anyway; left to the compiler they were a second batch, waited on behind the row load.
       asm volatile("" ::"s"(win), "s"(args.totalRecvTokenNum), "s"(args.offRecvToSrc),
                    "s"(pargs.offCombPush));
-      // MORI_PUSH_QPRE: the first row's loads go out here, ahead of the window's fields and the
-      // map; inside the quantizer they came after both, one wait on the window in front of them.
       constexpr int kPreLd = MORI_PUSH_QPRE ? kCfg.hiddenDim / (8 * WS) : 1;
       uint4 pre[kPreLd];
       if constexpr (MORI_PUSH_QTDM) {
-        // The run's first row, whole, into tile slot 1 onwards (pushQuantRows' tdmAll).
         static_assert(kCap * kWireB >= kWireB + kTokB,
                       "MORI_PUSH_QTDM: a bf16 row must fit behind the first wire row");
         TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kWireB),
@@ -2607,7 +2313,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
                           TdmShape<int>((int)(kTokB / 4)));
       }
       if constexpr (MORI_PUSH_QNEXT) {
-        // The run's second row, whole, into tile slot 1 onwards, where its wire row will go.
         static_assert(C == 2 && kCap * kWireB >= kWireB + kTokB,
                       "MORI_PUSH_QNEXT: a bf16 row must fit behind the first wire row");
         if (cnt >= 2)
@@ -2630,10 +2335,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         __builtin_amdgcn_sched_barrier(0);
       }
       MORI_TRACE_NEXT(seq, EpPushSlot::Meta);
-      // The window's three fields are read once, here behind the row load's issue, and kept in
-      // registers: EpLocal / EpPeer read them again at each use, and after the TDM wait that was
-      // one more load in series. The map is read by every lane from a clamped index: a load under
-      // a lane condition becomes a branch whose join waits on it.
       const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
       char* const wBase = wd->winBase;
       const uint64_t wStride = (uint64_t)wd->stride4G << 32;
@@ -2643,7 +2344,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           MORI_PUSH_MAPSRC == 2 ? 0
           : MORI_PUSH_MAPSRC == 1
               ? args.dispDestTokIdMap[min(rl + laneId, args.numTokens * topk - 1)]
-              // SPECSTRIDE: lanes past C read row 0's entry, so the read touches C lines, not 32.
               : map[min(rl + (MORI_PUSH_SPECSTRIDE ? (laneId < C ? laneId : 0) * rowStep : laneId),
                         kMaxRecv - 1)];
       const int tot = args.totalRecvTokenNum[0];
@@ -2658,7 +2358,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
 #pragma unroll
         for (int i = 0; i < C; ++i) {
           pushQuantRows(tile + (size_t)i * kWireB, src + (size_t)(rl + i) * kTokB, 1);
-          asm volatile("s_wait_dscnt 0x0" ::: "memory");  // the TDM store reads the tile behind us
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
           if (i < n) {
             const int p = __builtin_amdgcn_readlane(pe, i);
             const int dpe = MORI_PUSH_LOCAL       ? args.rank
@@ -2679,8 +2379,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       }
       if constexpr (MORI_PUSH_QUANT) {
         if constexpr (MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(kRing - 1);
-        // SPECMIX without QROWS: one rolled row loop for either count. With QROWS the one-row
-        // copy came out with two loads in flight at a time (ISA, kb5d904ab), 8 us slower.
         if constexpr (MORI_PUSH_SPECSTRIDE && MORI_PUSH_QTDM)
           pushQuantRows(tl, src + (size_t)rl * kTokB, C, (size_t)rowStep * kTokB, true, true, tot,
                         r0, rowStep, false, nullptr, false, true);
@@ -2697,10 +2395,8 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           pushQuantRows(tl, src + (size_t)rl * kTokB, cnt, (size_t)kTokB, true, false, 0, 0, 0,
                         true, pre, MORI_PUSH_QNEXT);
         else if constexpr (MORI_PUSH_SPECMIX == 2)
-          // One copy for every warp: a one-row warp quantizes its row twice and sends it once.
           pushQuantRows(tl, src + (size_t)rl * kTokB, C, cnt == C ? (size_t)kTokB : 0);
         else if constexpr (MORI_PUSH_SPECMIX == 3)
-          // C-row warps unrolled; one-row warps pass cnt, not 1, so the loop stays rolled.
           cnt == C ? pushQuantRows(tl, src + (size_t)rl * kTokB, C)
                    : pushQuantRows(tl, src + (size_t)rl * kTokB, cnt, (size_t)kTokB, true);
         else if constexpr (MORI_PUSH_SPECMIX && !MORI_PUSH_QROWS)
@@ -2709,7 +2405,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           pushQuantRows(tl, src + (size_t)rl * kTokB, C);
         else
           pushQuantRows(tl, src + (size_t)rl * kTokB, 1);
-        asm volatile("s_wait_dscnt 0x0" ::: "memory");  // the TDM store reads the tile behind us
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
       }
       int n = min(cnt, tot - r0);
       if constexpr (MORI_PUSH_SPECSTRIDE) {
@@ -2721,7 +2417,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       if constexpr (!MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(0);
       bool send = true;
       if constexpr (MORI_PUSH_STOPAT == 3) {
-        if (pe < -1) *args.totalRecvTokenNum = 0;  // never true; keeps the slot-map read live
+        if (pe < -1) *args.totalRecvTokenNum = 0;
         send = false;
       }
       if constexpr (MORI_PUSH_ONLYWARPS > 0) send = send && globalWarpId < MORI_PUSH_ONLYWARPS;
@@ -2735,8 +2431,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
             [](int v, int i) { return __builtin_amdgcn_readlane(v, i); }, rowStep);
       return r0 + stride < tot;
     };
-    // The first run is peeled off the loop: inside it, total - r0 became an induction variable
-    // set up ahead of the loop, which put the wait on the total ahead of the row load.
     const int runId = MORI_PUSH_SPREAD ? warpId * nbRows + (int)blockIdx.x : globalWarpId;
     const int cnt = MORI_PUSH_SPECMIX && warpId >= kMixHi ? 1 : C;
     int r0 = MORI_PUSH_SPECMIX ? (int)blockIdx.x * kMixR +
@@ -2744,17 +2438,12 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
              : MORI_PUSH_SPECSTRIDE ? runId
                                     : runId * C;
     if constexpr (MORI_PUSH_HWID) {
-      // HW_ID1 (hwreg 23, all 32 bits): wave slot [4:0], SIMD [9:8], WGP [13:10].
       const unsigned hw = __builtin_amdgcn_s_getreg(23 | (31 << 11));
       if (args.rank == 0 && blockIdx.x < 2 && laneId == 0)
         printf("[HWID] b=%d w=%d simd=%u slot=%u wgp=%u raw=0x%08x\n", (int)blockIdx.x, warpId,
                (hw >> 8) & 3u, hw & 31u, (hw >> 10) & 15u, hw);
     }
     if constexpr (MORI_PUSH_SEGSTORE) {
-      // The block's kMixR consecutive rows go into one run of wire rows in LDS, in row order,
-      // and every maximal stretch of them bound for one rank -- the dispatch wrote each (source
-      // rank, block) pair's rows as one contiguous segment, landing at contiguous slots -- goes out
-      // as one TDM store, issued by the warp whose rows complete the stretch.
       static_assert(MORI_PUSH_SPECMIX == 1 && !MORI_PUSH_QROWS && !MORI_PUSH_QPRE &&
                         !MORI_PUSH_QNEXT && C == 2 && !MORI_PUSH_TDEFER && !MORI_PUSH_ROWSTORE &&
                         !MORI_PUSH_STORE2D && MORI_PUSH_STOPAT > 3 && kMixR <= WS &&
@@ -2781,7 +2470,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         const uint64_t wStride = (uint64_t)wd->stride4G << 32;
         const int* const map = reinterpret_cast<const int*>(
             wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
-        const int slotJ = map[min(base + laneId, kMaxRecv - 1)];  // lane j: row base + j
+        const int slotJ = map[min(base + laneId, kMaxRecv - 1)];
         const int tot = args.totalRecvTokenNum[0];
         if constexpr (MORI_PUSH_SEGSTORE == 1) {
           if (warpId == 0 && laneId < kMixR) segCnt[laneId] = 0;
@@ -2793,12 +2482,11 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         else
           pushQuantRows(outB + (size_t)jw * kWireB, src + (size_t)rl * kTokB, cntw, (size_t)kTokB,
                         true);
-        asm volatile("s_wait_dscnt 0x0" ::: "memory");  // this warp's rows are in LDS
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
         const int nv = max(0, min(kMixR, tot - base));
         const int peJ = laneId < nv ? slotJ / kCfg.maxTokPerRank : -1;
         const int peUp = __shfl_up(peJ, 1);
         const unsigned long long starts = __ballot(laneId < nv && (laneId == 0 || peJ != peUp));
-        // SEGSTORE=2 (diagnostic): the same layout, but each warp sends its own rows at once.
         for (int k = 0; k < cntw && MORI_PUSH_SEGSTORE == 2; ++k) {
           const int jr = jw + k;
           if (jr >= nv) break;
@@ -2827,7 +2515,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           if (laneId == 0) old = atomicAdd(&segCnt[s0], 1);
           old = __shfl(old, 0);
           if (old + 1 == e0 - s0) {
-            // Every row of the stretch is in LDS: its writers waited dscnt before counting.
             const int p = __builtin_amdgcn_readlane(peJ, s0);
             const int dpe = MORI_PUSH_LOCAL       ? args.rank
                             : MORI_PUSH_FORCEPEER ? (args.rank + 1) % kCfg.worldSize
@@ -2843,7 +2530,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         }
         __builtin_amdgcn_s_wait_tensorcnt(0);
         if (base + stride >= tot) break;
-        __syncthreads();  // every stretch of this round has been sent before its LDS is reused
+        __syncthreads();
       }
     } else {
       if (!MORI_PUSH_SPREADX || (int)blockIdx.x < nbRows) {
@@ -2859,14 +2546,14 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
     MORI_TRACE_NEXT(seq, EpPushSlot::Meta);
     const int pe = (laneId < n) ? recvToSrc[r0 + laneId] / kCfg.maxTokPerRank : -1;
     if constexpr (MORI_PUSH_STOPAT == 2) {
-      if (pe < -1) *args.totalRecvTokenNum = 0;  // never true; keeps the slot-map read live
+      if (pe < -1) *args.totalRecvTokenNum = 0;
       continue;
     }
 
     MORI_TRACE_NEXT(seq, EpPushSlot::Load);
     if constexpr (MORI_PUSH_QUANT) {
       pushQuantRows(tile, src + (size_t)r0 * kTokB, n);
-      asm volatile("s_wait_dscnt 0x0" ::: "memory");  // the TDM store reads the tile behind us
+      asm volatile("s_wait_dscnt 0x0" ::: "memory");
     } else if constexpr (!MORI_PUSH_NOLOAD) {
       TdmIssueLoad<int>(reinterpret_cast<int*>(tile),
                         reinterpret_cast<const int*>(src + (size_t)r0 * kTokB),
@@ -2880,7 +2567,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
     if constexpr (MORI_PUSH_DATASEEN) {
       if (laneId < n)
         *reinterpret_cast<unsigned*>(tile + (size_t)laneId * kWireB + kWireB - 4) = kEpPushSeenTag;
-      asm volatile("s_wait_dscnt 0x0" ::: "memory");  // the TDM store reads the tile behind us
+      asm volatile("s_wait_dscnt 0x0" ::: "memory");
     }
     sendTile(
         tile, r0, n, pe, [&](int p) { return EpPeer<unsigned char>(win, p, pargs.offCombPush); },
@@ -2888,12 +2575,10 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
   }
 
   if constexpr (MORI_PUSH_SIGNAL >= 2) {
-    // Per-block report. Every warp's stores have completed (tensorcnt) before the barrier; the
-    // system release fence after it is main's combine staging pattern (barrier, then fence).
     constexpr int kTilesB = kCfg.warpPerBlock * kCap * kWireB;
     static_assert(EpCombine1250xLdsBudget - kTilesB >= kCfg.warpPerBlock * npes * 4,
                   "the per-warp row counts must fit in the LDS the tiles leave free");
-    int* const wrows = reinterpret_cast<int*>(sharedMem + kTilesB);  // [warpPerBlock][npes]
+    int* const wrows = reinterpret_cast<int*>(sharedMem + kTilesB);
     MORI_TRACE_NEXT(seq, EpPushSlot::Signal);
     int mine = 0;
     for (int q = 0; q < npes; ++q) mine = (laneId == q) ? rowsTo[q] : mine;
@@ -2918,27 +2603,19 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
   }
 
   if constexpr (MORI_PUSH_SIGNAL || MORI_PUSH_DATASEEN) {
-    // The receiver side runs on the last block: at small token counts it has no slots to send,
-    // so it starts almost at once. With SIGNAL=2 and DATASEEN together, warp 0 polls the report
-    // slots while the other warps poll the landed rows, so the two arrival times are comparable.
-    // Every poll issues all of a spin's loads before waiting on any: with one dependent load per
-    // address, a spin cost one round trip per address (flat_load + s_wait_loadcnt_dscnt each).
     if (blockIdx.x == gridDim.x - 1) {
-      // SIGNAL=2 needs no expectation: a slot per source block says it all.
       constexpr bool kNeedList = MORI_PUSH_SIGNAL == 1 || MORI_PUSH_DATASEEN;
       int timedOut = 0;
       int nl = 0;
       int expect = 0;
       unsigned* const list = reinterpret_cast<unsigned*>(sharedMem) + 64;
       if constexpr (kNeedList) {
-        __syncthreads();  // this block's own stores have completed, so all of its LDS is free
+        __syncthreads();
         int* const blk =
-            reinterpret_cast<int*>(sharedMem);  // [npes] rows per source, [npes] list size
+            reinterpret_cast<int*>(sharedMem);
         constexpr int kListCap = (EpCombine1250xLdsBudget - 256) / 4;
         constexpr int kEntPer = 8;
         if ((int)threadIdx.x <= npes) blk[threadIdx.x] = 0;
-        // Every valid (token, k) entry is one landed row: dispatch leaves a token's duplicate
-        // destinations null, so no row is counted twice (the byte check's landed == recv total).
         const int nEnt = args.numTokens * topk;
         timedOut |= nEnt > kEntPer * (int)blockDim.x ? 16 : 0;
         int fv[kEntPer];
@@ -2987,15 +2664,13 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           unsigned has = 0;
 #pragma unroll
           for (int j = 0; j < kDataPer; ++j) {
-            // An unused entry reads a slot of its own, never one shared address: the poll loads
-            // are unconditional (see the signal poll), and same-address loads serialize.
             const int q = dt + j * dn;
             const unsigned f = q < nl ? list[q] : (unsigned)q % (unsigned)(npes * kMaxRecv);
             sq[j] = q < nl ? (int)(f / kMaxRecv) : -1;
             w[j] = reinterpret_cast<unsigned*>(land + (size_t)f * kSlotB + kWireB - 4);
             has |= sq[j] >= 0 ? 1u << sq[j] : 0u;
           }
-          unsigned left = EpWarpOrBits<npes>(has);  // sources with a row this warp has not seen
+          unsigned left = EpWarpOrBits<npes>(has);
           for (int spin = 0; left && spin < MORI_PUSH_MAXSPIN; ++spin) {
             unsigned v[kDataPer];
 #pragma unroll
@@ -3013,7 +2688,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
             left &= still;
           }
           timedOut |= left ? 1 : 0;
-          // Zeroed for the next launch on the same grounds as the signal slots.
 #pragma unroll
           for (int j = 0; j < kDataPer; ++j)
             if (sq[j] >= 0)
@@ -3021,16 +2695,12 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         }
       }
       if constexpr (MORI_PUSH_SIGNAL >= 2) {
-        unsigned* const slots = sigLocal + kSlot0Dw;  // [source][kEpPushSigBlocks] lines
+        unsigned* const slots = sigLocal + kSlot0Dw;
         const int nb = (int)gridDim.x;
-        // Each spin reads kPollB slots of every source. MORI_PUSH_POLLFIT: only the grid's blocks'
-        // (kCfg.blockNum, the launch's gridDim.x); otherwise all kEpPushSigBlocks, most of them
-        // lines no block writes.
         constexpr int kPollB =
             MORI_PUSH_POLLFIT ? (kCfg.blockNum + WS - 1) / WS * WS : kEpPushSigBlocks;
         static_assert(kPollB % WS == 0 && kPollB <= kEpPushSigBlocks,
                       "a load of WS slots must stay in one source");
-        // MORI_PUSH_POLLSPLIT: warp s polls source s alone; otherwise warp 0 polls them all.
         constexpr int kPollW = MORI_PUSH_POLLSPLIT ? npes : 1;
         static_assert(kPollW <= kCfg.warpPerBlock, "a polling warp per source");
         constexpr int kSrcW = npes / kPollW;
@@ -3043,10 +2713,8 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         };
         if (warpId < kPollW) {
           MORI_TRACE_NEXT(seq, EpPushSlot::SigPoll);
-          unsigned left = ((1u << kSrcW) - 1u) << s0;  // sources with a report slot still 0
+          unsigned left = ((1u << kSrcW) - 1u) << s0;
           for (int spin = 0; left && spin < MORI_PUSH_MAXSPIN; ++spin) {
-            // Unconditional loads (a slot past the grid is a real, never-written line): a load
-            // under a per-lane condition became its own branch, and each join waited on it.
             unsigned v[kPer];
 #pragma unroll
             for (int i = 0; i < kPer; ++i)
@@ -3067,15 +2735,12 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         }
         auto release = [&]() {
           if constexpr (MORI_PUSH_SIGNAL == 3) {
-            // Released even after a timeout, so every block's wait ends; the Timeout instant says
-            // so.
             __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
             for (int b = laneId; b < nb - 1; b += WS)
               __hip_atomic_store(sigLocal + kGo0Dw + b * kEpPushSigSlotDw, 1u, __ATOMIC_RELAXED,
                                  __HIP_MEMORY_SCOPE_SYSTEM);
           }
         };
-        // Zeroed for the next launch; see the SIGNAL=1 note on why that cannot race.
         auto zeroSlots = [&]() {
           if constexpr (MORI_PUSH_NOZERO) return;
 #pragma unroll
@@ -3084,12 +2749,10 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
               __hip_atomic_store(slotAt(i), 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         };
         if constexpr (MORI_PUSH_POLLSPLIT) {
-          __syncthreads();  // every polling warp has seen its source's slots
+          __syncthreads();
           if (warpId == 0) release();
           if (warpId < kPollW) zeroSlots();
         } else if (warpId == 0) {
-          // MORI_PUSH_GOFIRST: the release lines go out ahead of the slot zeroing, not behind it.
-          // The zeroing is for the next launch only, and no block reads the slots once released.
           if constexpr (MORI_PUSH_GOFIRST) release();
           zeroSlots();
           if constexpr (!MORI_PUSH_GOFIRST) release();
@@ -3106,20 +2769,15 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
           pending = __any(miss);
         }
         timedOut |= pending ? 4 : 0;
-        // Zeroed for the next launch, whose senders only start after the next dispatch -- which
-        // cannot finish before this rank's stream has run past this kernel.
         if (laneId < npes) __hip_atomic_store(c, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       }
       IF_ENABLE_PROFILER(if (timedOut) profiler.log(EpPushSlot::Timeout,
                                                     ::mori::core::profiler::EventType::INSTANT););
-      if (timedOut < -1) *args.totalRecvTokenNum = 0;  // never true; keeps timedOut live
+      if (timedOut < -1) *args.totalRecvTokenNum = 0;
     }
   }
 
   if constexpr (MORI_PUSH_SIGNAL == 3) {
-    // Every other block waits on its own release line (the last block's warp 0 already polled the
-    // report slots). The acquire runs on the one warp that saw the release, before the barrier
-    // that hands the data to the block's other warps.
     unsigned* const g = sigLocal + kGo0Dw + blockIdx.x * kEpPushSigSlotDw;
     if (warpId == 0) {
       int timedOut = 0;
@@ -3129,27 +2787,19 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
         for (int spin = 0; pending && spin < MORI_PUSH_MAXSPIN; ++spin)
           pending = __hip_atomic_load(g, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0u;
         timedOut = pending ? 32 : 0;
-        // Zeroed for the next launch: its release needs every rank's next reports, and this rank's
-        // next blocks start only after this kernel ends.
         if constexpr (!MORI_PUSH_GOFAST)
           if (laneId == 0) __hip_atomic_store(g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       }
       if constexpr (MORI_PUSH_GOFAST) {
-        // The invalidate the system-scope acquire fence compiles to, waited on by itself: the fence
-        // also waits out every store this warp has in flight -- the release line's zeroing and the
-        // report to each peer, whose completion is a round trip -- and none of them is data the
-        // reduce reads.
         asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
       } else {
         __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
       }
       IF_ENABLE_PROFILER(if (timedOut) profiler.log(EpPushSlot::Timeout,
                                                     ::mori::core::profiler::EventType::INSTANT););
-      if (timedOut < -1) *args.totalRecvTokenNum = 0;  // never true; keeps timedOut live
+      if (timedOut < -1) *args.totalRecvTokenNum = 0;
     }
     if constexpr (MORI_PUSH_GOFAST) {
-      // A bare barrier: __syncthreads also waits out every wave's stores in flight. The other warps
-      // only need warp 0's invalidate to be done, which its s_wait_loadcnt covers.
       __builtin_amdgcn_s_barrier();
       if (warpId == 0 && laneId == 0 && blockIdx.x != gridDim.x - 1)
         __hip_atomic_store(g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
