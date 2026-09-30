@@ -951,6 +951,73 @@ plus a fill guard.
 > These numbers are only meaningful because `_PinnedLaunch` exists -- see
 > [Measurement traps](#measurement-traps).
 
+#### Operator phase breakdown (2026-09-30)
+
+Flash TP4 `wo_b`, **M=16384, N=5120, K=2048, MXFP8**, on `v2-015` using
+Mori `f3bff0ae`. These are fresh operator measurements; the earlier Pro TP8
+SGLang phase table describes a different workload. All configurations use
+256x256 GEMM tiles, one SDMA queue per peer where applicable, eight fused
+scatter chunks, and separate reduce/quantize.
+
+BF16 gather in every column; only the last column uses FP8 scatter:
+
+| Phase (µs) | split-LSA | split-SDMA | fused-SDMA | fused-SDMA, FP8 scatter |
+|---|---:|---:|---:|---:|
+| GEMM / GEMM+scatter | 184.0 | 149.9 | 202.2 | 257.1 |
+| Scatter / drain | — | 728.0 | 587.3 | 211.4 |
+| Reduce | — | 32.4 | 32.5 | 22.4 |
+| SDMA gather | — | 727.8 | 727.7 | 728.6 |
+| LSA AR (single kernel) | 1501.1 | — | — | — |
+| Whole call, tracing off | **1686.4** | **1638.8** | **1549.6** | **1219.7** |
+
+FP8 gather in every column below. `split` means split-SDMA, `fused` means
+fused-SDMA; `/ SDMA` or `/ LSA` identifies the **gather** transport. Scatter
+is BF16 except in the last column:
+
+| Phase (µs) | split / SDMA | split / LSA | fused / SDMA | fused / LSA | fused, both FP8 / LSA |
+|---|---:|---:|---:|---:|---:|
+| GEMM / GEMM+scatter | 184.5 | 182.0 | 229.9 | 228.3 | 268.3 |
+| Scatter / drain | 729.4 | 728.9 | 563.8 | 566.1 | 204.0 |
+| Reduce | 32.9 | 32.2 | 33.6 | 32.4 | 22.3 |
+| Quantize gather | 16.4 | 15.9 | 15.8 | 15.8 | 15.8 |
+| SDMA gather | 373.6 | — | 373.5 | — | — |
+| Gather barrier | — | 5.8 | — | 5.5 | 5.7 |
+| Dequantize gather | 40.2 | — | 39.8 | — | — |
+| LSA pull + dequantize | — | 388.0 | — | 386.4 | 385.2 |
+| Whole call, tracing off | **1376.6** | **1353.4** | **1257.0** | **1234.9** | **901.4** |
+
+The changes can be attributed as follows:
+
+- BF16 split-SDMA → fused-SDMA: the GEMM grows by **52.3 µs**,
+  while scatter/drain shrinks by **140.7 µs**. The combined
+  GEMM+scatter prefix saves **88.4 µs**; reduce/gather are
+  essentially unchanged. The whole call saves **89.2 µs**.
+- Fused BF16 → FP8/LSA gather: gather including conversion and its barrier
+  changes from **727.7 to 407.7 µs**, saving
+  **319.9 µs**. The whole call saves **314.7 µs**.
+- On top of FP8/LSA gather, FP8 scatter adds **40.0 µs** to the
+  GEMM/epilogue, saves **362.2 µs** of drain and **10.1 µs**
+  of reduce. The whole call saves another **333.5 µs**.
+
+`—` means no separate kernel. Split-LSA performs its reduction and gather in
+one `ar_2stage` kernel. Fused GEMM includes scatter submission and any scatter
+quantization; drain is only the remaining transfer wait and synchronization.
+GEMM times are measured inside each complete pipeline, whose preceding work
+and cache state differ; a standalone GEMM time cannot be substituted here.
+
+Phase entries are rocprofv3 kernel-duration means: each round uses all phases
+from the same rank (selected by the largest median trace-on whole-call time),
+then averages three rounds. Whole-call times are independently measured with
+tracing off: 8 calls/graph, 21 replays/round, median of three rank-max rounds.
+The two aggregations need not sum exactly. Trace-on total perturbation was
+at most **0.12%** across these configurations.
+
+All nine configurations passed independent FP32-reference, changed-input,
+graph-replay and guard checks; FP8 scatter also passed the actual-wire checks.
+Both FP8 legs give about **3.48% relL2**; model quality was not tested.
+Raw timings, 88,704 kernel records, per-rank breakdowns and reproduction commands
+are in [the phase archive](</workspace/reports/gemm-ar-phases-20260930/README.md>).
+
 ### End to end, in SGLang
 
 Prefill throughput, tok/s, `bench_one_batch_server`, TP4 on V4.1-Flash, one
