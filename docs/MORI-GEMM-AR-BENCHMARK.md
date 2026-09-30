@@ -77,14 +77,15 @@ evaluation, and the threshold derivations are in
 
 ## Running the benchmark
 
-Needs a mori built with `BUILD_CCO_SDMA=ON`. Setting `MORI_ENABLE_SDMA` in the
-environment only rebuilds the *device* bitcode -- a host library built without
-the flag has no SDMA queues, every put silently does nothing, and the all-reduce
-quietly produces zeros.
+Needs a mori built with `BUILD_CCO_SDMA=ON`, which is the default -- worth
+checking on an older image, because setting `MORI_ENABLE_SDMA` does not make up
+for it: that only rebuilds the *device* bitcode, and a host library built
+without the flag has no SDMA queues, so every put silently does nothing and the
+all-reduce quietly produces zeros.
 
 ```bash
 cd /path/to/mori
-BUILD_CCO_SDMA=ON pip install .
+pip install .
 
 # DeepSeek-V4-Pro, TP8
 MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \

@@ -678,8 +678,8 @@ def test_mxfp8_quant_runs_end_to_end(worker_results):
 def test_self_test_passes_and_can_fail(worker_results):
     """The guard against a mori whose SDMA puts were compiled out.
 
-    That build is the default (`BUILD_CCO_SDMA` is OFF unless BUILD_BENCHMARK is
-    ON) and it fails silently: every symbol is there, every kernel launches,
+    That build used to be the default (`BUILD_CCO_SDMA` was OFF unless
+    BUILD_BENCHMARK was ON) and it fails silently: every symbol is there, every kernel launches,
     every put returns, and nothing moves. The all-reduce then yields mostly the
     local slice, the model still answers fluently, and the fused path measures
     *faster* than it is. An end-to-end campaign read -6.8% instead of -2.3% that

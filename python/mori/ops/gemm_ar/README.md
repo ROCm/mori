@@ -84,8 +84,9 @@ internally valid but is not a claim about DSV4 as shipped.
 
 ### Fused GEMM + all-reduce
 
-Needs a mori built with `BUILD_CCO_SDMA=ON` and `MORI_ENABLE_SDMA=1` in the
-environment. Setting the variable alone is not enough: a host library built
+Needs `MORI_ENABLE_SDMA=1` in the environment, and a mori built with
+`BUILD_CCO_SDMA=ON` -- the default since this was turned on, but check it on an
+older image. Setting the variable alone is not enough: a host library built
 without the flag has no queues, so every put silently does nothing and the
 all-reduce quietly produces zeros. (The two standalone ops below need neither --
 they move no data between ranks.)
@@ -281,10 +282,10 @@ MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo python -m torch.distributed.run \
   --mode fused-sdma --quant blockscale -m 16384 -n 7168 -k 2048
 ```
 
-Requires a mori built with `BUILD_CCO_SDMA=ON`. Setting `MORI_ENABLE_SDMA` in
-the environment only rebuilds the device bitcode -- a host library built without
-the flag has no queues, so every put silently does nothing and the all-reduce
-quietly produces zeros.
+Requires a mori built with `BUILD_CCO_SDMA=ON`, which is the default. Setting
+`MORI_ENABLE_SDMA` in the environment only rebuilds the device bitcode -- a host
+library built without the flag has no queues, so every put silently does nothing
+and the all-reduce quietly produces zeros.
 
 Every flag, every sweep driver, and how to drive the whole thing from a server
 are in
