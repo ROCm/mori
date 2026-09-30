@@ -47,6 +47,9 @@ struct HostBufferOptions {
   NumaBindMode numa_bind_mode = NumaBindMode::kBind;
   bool require_numa_binding = false;  // Preserve best-effort binding for existing callers.
   int prefault_threads = 1;
+  // Unbound mappings only: run prefault worker i on NUMA node i % N, so first
+  // touch spreads the chunks evenly instead of filling one node first.
+  bool interleave_prefault = false;
 };
 
 struct HostBufferHandle {

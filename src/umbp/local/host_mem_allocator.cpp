@@ -207,18 +207,37 @@ class ScopedNumaAffinity {
 #endif
 };
 
+// Nodes that have CPUs to run a prefault worker on (memory-only nodes have an
+// empty cpulist).
+const std::vector<int>& NodesWithCpus() {
+  static const std::vector<int> nodes = [] {
+    std::vector<int> found;
+    for (int node = 0; node < 256; ++node) {
+      std::ifstream input("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+      std::string cpus;
+      if (input && std::getline(input, cpus) && !cpus.empty()) found.push_back(node);
+    }
+    return found;
+  }();
+  return nodes;
+}
+
 void PrefaultPages(void* ptr, size_t mapped_size, size_t stride, const HostBufferOptions& opts) {
   // Avoid creating threads for small pools. Chunk boundaries respect hugetlb
   // alignment as well as base pages, so MADV_POPULATE_WRITE can serve both.
   const size_t pages = mapped_size / stride;
-  const size_t workers = std::min<size_t>(std::clamp(opts.prefault_threads, 1, 16),
-                                          std::max<size_t>(1, mapped_size / (64ULL << 20)));
+  size_t workers = std::min<size_t>(std::clamp(opts.prefault_threads, 1, 16),
+                                    std::max<size_t>(1, mapped_size / (64ULL << 20)));
+  const auto& spread = NodesWithCpus();
+  const bool interleave = opts.numa_node < 0 && opts.interleave_prefault && spread.size() > 1;
+  // Whole rounds over the nodes, so first touch splits the mapping evenly.
+  if (interleave && workers >= spread.size()) workers -= workers % spread.size();
   if (workers == 1) {
     PrefaultRange(ptr, mapped_size, stride);
     return;
   }
   ParallelFor(workers, workers, [&](size_t i) {
-    ScopedNumaAffinity affinity(opts.numa_node);
+    ScopedNumaAffinity affinity(interleave ? spread[i % spread.size()] : opts.numa_node);
     const size_t begin = (pages / workers * i + std::min(i, pages % workers)) * stride;
     const size_t count = (pages / workers + (i < pages % workers)) * stride;
     PrefaultRange(static_cast<char*>(ptr) + begin, count, stride);
