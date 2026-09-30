@@ -1919,11 +1919,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ccoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
-    // Read the floor only if the caller's struct is new enough to carry it.
-    const size_t minSlotsOff = offsetof(ccoDevCommRequirements, sdmaSignalCount);
-    const int minSlots = (reqs->size >= minSlotsOff + sizeof(int)) ? reqs->sdmaSignalCount : 0;
-    size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
-    numSlots = std::max(numSlots, static_cast<size_t>(std::max(minSlots, 0)));
+    const size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
     size_t poolBytes = numSlots * sizeof(uint64_t);
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.signalBuf, poolBytes));
     HIP_RUNTIME_CHECK(hipMemset(sdma.signalBuf, 0, poolBytes));
