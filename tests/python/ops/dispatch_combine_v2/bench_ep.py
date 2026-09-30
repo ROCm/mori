@@ -100,23 +100,8 @@ COMB_MODE = os.environ.get("COMB_MODE", "pull")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
-_PUSH_WIRE = HIDDEN * 2 // 4
-if _PUSH:
-    from mori.ops.dispatch_combine_v2.hip_backend import push_knob
-else:
-
-    def push_knob(name):
-        return 0
-
-
-_PUSH_REDUCE = _PUSH and push_knob("SIGNAL") == 3
-_PUSH_QGROUP = {1: 32, 2: 128}.get(push_knob("QUANT"), 0) if _PUSH else 0
-_PUSH_QUANT = _PUSH_QGROUP > 0
-if _PUSH_QUANT:
-    _PUSH_WIRE = (HIDDEN // 2 + HIDDEN // _PUSH_QGROUP + 127) // 128 * 128
-_PUSH_QRULE = os.environ.get("PUSH_QRULE") or (
-    "mx" if push_knob("QMX") else "lean" if push_knob("QLEAN") else "old"
-)
+_PUSH_QGROUP = 32
+_PUSH_WIRE = (HIDDEN // 2 + HIDDEN // _PUSH_QGROUP + 127) // 128 * 128
 PROFILE = int(os.environ.get("PROFILE", 0))
 PROF_N = int(os.environ.get("PROF_N", 5))
 PROF_GAP = float(os.environ.get("PROF_GAP", 0.2))
@@ -309,65 +294,6 @@ def main():
             )
         return int(n.item())
 
-    def check_push(op, ct, routing):
-        cap = op.cfg.effective_max_recv
-        land = op.push_landing()
-        dm = routing.disp_dest_tok_id_map[: ct * TOPK].long()
-        valid = (dm >= 0) & (dm < world * cap)
-        flat = dm[valid]
-        tok = torch.arange(ct * TOPK, device=dm.device)[valid] // TOPK
-        pe, slot = flat // cap, flat % cap
-        got = land[pe, slot, :_PUSH_WIRE]
-        exp = inp.view(torch.uint8)[tok, :_PUSH_WIRE]
-        hit = torch.zeros(world, cap, dtype=torch.bool, device=land.device)
-        hit[pe, slot] = True
-        n = torch.tensor(
-            [
-                int((got != exp).any(dim=1).sum()),
-                int(land[~hit].any(dim=1).sum()),
-                int(flat.numel()),
-            ]
-        )
-        dist.all_reduce(n)
-        bad, stray, landed = (int(v) for v in n.tolist())
-        if rank == 0:
-            print(
-                f"  [PUSHCHECK] ct={ct} landed={landed} bad={bad} stray={stray}",
-                flush=True,
-            )
-        return bad + stray
-
-    def check_push_reduce(out, ct):
-        n_el = _PUSH_WIRE // 2
-        got = (
-            out.view(torch.uint8)[:ct, :_PUSH_WIRE]
-            .contiguous()
-            .view(torch.bfloat16)
-            .float()
-        )
-        row = (
-            inp.view(torch.uint8)[:ct, :_PUSH_WIRE]
-            .contiguous()
-            .view(torch.bfloat16)
-            .float()
-        )
-        exp = (
-            (U[:ct].to(row.device).view(ct, 1).float() * row).to(torch.bfloat16).float()
-        )
-        tiny = torch.finfo(torch.float32).tiny
-        same = (
-            (got == exp)
-            | (torch.isnan(got) & torch.isnan(exp))
-            | ((got.abs() < tiny) & (exp.abs() < tiny))
-        )
-        assert same.shape == (ct, n_el), same.shape
-        n = torch.tensor([int((~same).any(dim=1).sum()), ct])
-        dist.all_reduce(n)
-        bad, rows = (int(v) for v in n.tolist())
-        if rank == 0:
-            print(f"  [PUSHREDUCE] ct={ct} rows={rows} bad={bad}", flush=True)
-        return bad
-
     def bf16_payload(pe):
         return _data.make_payload(
             (M, HIDDEN),
@@ -400,10 +326,7 @@ def main():
         m15 = (x.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0x7FFF).amax(
             dim=-1, keepdim=True
         )
-        if _PUSH_QRULE == "mx":
-            byte = torch.clamp(((m15 + 0x3F) >> 7) - 2, min=1)
-        else:
-            byte = torch.clamp((m15 >> 7) - 1, min=1 if _PUSH_QRULE == "lean" else 0)
+        byte = torch.clamp(((m15 + 0x3F) >> 7) - 2, min=1)
         conv = byte.clamp(min=1)
         sc_conv = torch.pow(2.0, (conv - 127).float())
         sc_byte = torch.pow(2.0, (byte - 127).float())
@@ -419,22 +342,21 @@ def main():
         bad = int((~(err <= tol)).flatten(1).any(dim=1).sum())
         nonfinite = int((~torch.isfinite(got)).sum())
         max_err = float(torch.nan_to_num(err / (u * step), nan=float("inf")).max())
-        inexact, first = 0, ""
-        if grp == 32:
-            ref = (u * push_quant_deq(x)).to(torch.bfloat16).float()
-            miss = got != ref
-            inexact = int(miss.flatten(1).any(dim=1).sum())
-            if inexact:
-                i = int(miss.flatten().nonzero()[0])
-                t, g = i // (x.shape[1] * grp), (i // grp) % x.shape[1]
-                first = (
-                    f" first@rank{rank}:tok{t0 + t}:grp{g}:el{i % grp}"
-                    f" x={float(x.flatten()[i]):.6g} got={float(got.flatten()[i]):.6g}"
-                    f" ref={float(ref.flatten()[i]):.6g} u={float(u.flatten()[t]):g}"
-                    f" amax={float(amax[t, g, 0]):.6g}"
-                    f" row_miss={int(miss[t].sum())} grp_miss={int(miss[t, g].sum())}"
-                    f" grps_miss={int(miss[t].any(dim=1).sum())}"
-                )
+        first = ""
+        ref = (u * push_quant_deq(x)).to(torch.bfloat16).float()
+        miss = got != ref
+        inexact = int(miss.flatten(1).any(dim=1).sum())
+        if inexact:
+            i = int(miss.flatten().nonzero()[0])
+            t, g = i // (x.shape[1] * grp), (i // grp) % x.shape[1]
+            first = (
+                f" first@rank{rank}:tok{t0 + t}:grp{g}:el{i % grp}"
+                f" x={float(x.flatten()[i]):.6g} got={float(got.flatten()[i]):.6g}"
+                f" ref={float(ref.flatten()[i]):.6g} u={float(u.flatten()[t]):g}"
+                f" amax={float(amax[t, g, 0]):.6g}"
+                f" row_miss={int(miss[t].sum())} grp_miss={int(miss[t, g].sum())}"
+                f" grps_miss={int(miss[t].any(dim=1).sum())}"
+            )
         return [bad, inexact, nonfinite], max_err, first
 
     def check_push_quant(out, ct, scale=1.0):
@@ -462,7 +384,7 @@ def main():
         if rank == 0:
             print(
                 f"  [PUSHQUANT] ct={ct} x{scale:g} rows={int(n[1])} bad={int(n[0])} "
-                f"max_err={float(m[0]):.3f} steps rule={_PUSH_QRULE} exact_bad={int(n[2])}"
+                f"max_err={float(m[0]):.3f} steps rule=mx exact_bad={int(n[2])}"
                 f" nonfinite={int(n[3])}"
                 + (f" dev_diff={int(n[4])}" if PUSH_QCHECK_DEV else "")
                 + "".join(f for f in firsts if f),
@@ -493,12 +415,7 @@ def main():
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
         if push_checked:
-            if _PUSH_QUANT:
-                stage.copy_(push_quant_rows(total, r))
-            else:
-                recv_b = op.recv_tokens()[:total].view(torch.uint8)
-                assert recv_b.shape[1] >= _PUSH_WIRE, (recv_b.shape, _PUSH_WIRE)
-                stage.view(torch.uint8)[:, :_PUSH_WIRE].copy_(recv_b[:, :_PUSH_WIRE])
+            stage.copy_(push_quant_rows(total, r))
             op.push_landing().zero_()
             lockstep()
         if COMBINE_IN == "staged":
@@ -511,9 +428,7 @@ def main():
         lockstep()
         if dispatch_bad:
             return total, buf, False, True
-        if push_checked and _PUSH_QUANT:
-            if not _PUSH_REDUCE:
-                return total, buf, True, False
+        if push_checked:
             ok = check_push_quant(out, ct) == 0
             for k in range(1, CHECK_REPEAT + 1):
                 *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
@@ -527,11 +442,6 @@ def main():
                 out, _ = op.combine(buf, routing=r)
                 lockstep()
                 ok = check_push_quant(out, ct, float(2**k)) == 0 and ok
-            return total, buf, ok, True
-        if push_checked:
-            ok = check_push(op, ct, r) == 0
-            if _PUSH_REDUCE:
-                ok = check_push_reduce(out, ct) == 0 and ok
             return total, buf, ok, True
         if not checked:
             return total, buf, True, bool(CHECK)
@@ -895,7 +805,6 @@ def main():
         2: "Load",
         3: "Store",
         4: "StoreWait",
-        6: "DataPoll",
         7: "SigPoll",
         8: "Reduce",
         9: "Signal",
@@ -906,7 +815,6 @@ def main():
         5: "Entry",
         10: "Timeout",
         **{11 + s: f"SigSrc{s}" for s in range(8)},
-        **{19 + s: f"DataSrc{s}" for s in range(8)},
     }
 
     def profile_push(op, ct, i_, w_, x_, s_, buf):
@@ -1094,7 +1002,10 @@ def main():
             )
         mine = None
         if rate and all(x is not None for x in rows_):
-            med = lambda xs: float(np.median(xs))
+
+            def med(xs):
+                return float(np.median(xs))
+
             mine = dict(
                 rank=rank,
                 rate=rate,
@@ -1278,7 +1189,7 @@ def main():
         # Say what was actually verified. fp4 skips the identity-expert check
         # (hip has no fp4 combine) but its dispatch bytes ARE compared.
         if _PUSH and CHECK and not _data.verifies_nothing(INIT):
-            why = " (push: dispatch bytes + landed push bytes)"
+            why = " (push: dispatch bytes + fp4 combine output)"
         elif _FP4:
             why = " (fp4: dispatch bytes only, combine not compared)"
         elif not CHECK:

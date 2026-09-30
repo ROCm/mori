@@ -153,62 +153,12 @@ _PUSH_SIG_LINE = 64
 _PUSH_SIG_BLOCKS = 256
 _PUSH_SIG_SLOT_B = 128
 PUSH_PROF_EVENTS = 256
-_PUSH_DEFAULTS = {
-    "TDMCPOL": 0x18,
-    "SIGNAL": 3,
-    "QUANT": 1,
-    "QLOAD": 1,
-    "RTDM": 1,
-    "RPK": 1,
-    "RSPLIT": 2,
-    "SPEC": 2,
-    "SPREAD": 1,
-    "SPECSTRIDE": 1,
-    "SPREADX": 1,
-    "RPRE": 1,
-    "POLLFIT": 1,
-    "GOFIRST": 1,
-    "GOFAST": 1,
-    "QCVT": 2,
-    "QLEAN": 1,
-    "QMX": 1,
-    "QTDM": 1,
-    "RSKIP": 1,
-}
-
-
-def _push_flag(flags: str, name: str):
-    m = re.search(rf"(?:^|\s)-D\s*MORI_PUSH_{name}(?:=(\S*))?(?:\s|$)", flags)
-    if m is None:
-        return None
-    return int(m.group(1) or "1", 0)
-
-
-def push_knob(name: str) -> int:
-    flags = os.environ.get("MORI_JIT_EXTRA_FLAGS", "")
-    v = _push_flag(flags, name)
-    if v is not None:
-        return v
-    if _push_flag(flags, "DEFAULTS") == 0:
-        return 0
-    return _PUSH_DEFAULTS.get(name, 0)
-
-
-def push_quant_group() -> int:
-    return {1: 32, 2: 128}.get(push_knob("QUANT"), 0)
+PUSH_QGROUP = 32
 
 
 def push_wire_nbytes(cfg) -> int:
-    group = push_quant_group()
-    if group:
-        h = cfg.hidden_dim
-        wire = h // 2 + h // group
-        return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
-    return cfg.combine_token_nbytes // 4
-
-
-def push_slot_bytes(cfg) -> int:
-    wire = push_wire_nbytes(cfg)
+    h = cfg.hidden_dim
+    wire = h // 2 + h // PUSH_QGROUP
     return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
 
 
@@ -695,7 +645,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
             regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         if cfg.is_scatter:
-            regions.append(("comb_push", cfg.world_size * cap * push_slot_bytes(cfg)))
+            regions.append(("comb_push", cfg.world_size * cap * push_wire_nbytes(cfg)))
             regions.append(
                 (
                     "comb_push_sig",
@@ -724,11 +674,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 bad.append(
                     f"combine_mode='scatter' with combine dtype {cfg.combine_dtype} (bf16 only)"
                 )
-            elif push_wire_nbytes(cfg) % _PUSH_SLOT_ALIGN:
-                bad.append(
-                    f"combine_mode='scatter' with hidden_dim={cfg.hidden_dim}: "
-                    f"a {push_wire_nbytes(cfg)} B wire row is not whole 128 B TDM rows"
-                )
+            else:
+                from .dispatch_combine_op import WAVE
+
+                if cfg.hidden_dim % (32 * WAVE):
+                    bad.append(
+                        f"combine_mode='scatter' with hidden_dim={cfg.hidden_dim} "
+                        f"(needs a multiple of {32 * WAVE})"
+                    )
         if cfg.quant_type != "none":
             bad.append(f"quant_type={cfg.quant_type!r}")
         if cfg.enable_std_moe:
@@ -1479,7 +1432,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if view is None:
             view = from_gpu_ptr(
                 self.arena.local_ptr("comb_push"),
-                (self.cfg.world_size, self._recv_cap, push_slot_bytes(self.cfg)),
+                (self.cfg.world_size, self._recv_cap, push_wire_nbytes(self.cfg)),
                 torch.uint8,
             )
             self._views["push_landing"] = view

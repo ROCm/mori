@@ -248,7 +248,7 @@ constexpr bool EpPushArgsLaidOutFlat() {
   return true;
 }
 
-}
+}  // namespace detail
 
 static_assert(detail::EpPushArgsLaidOutFlat(),
               "EpPushArgs is not EpArgs followed by MORI_EP_PUSH_ARGS_FIELDS in order -- the "
@@ -372,16 +372,8 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
-constexpr int EpCombinePushWireBytes(const EpCfg& c) { return EpTokenBytes(c) / 4; }
 constexpr int EpCombinePushSlotAlign = 128;
-constexpr int EpCombinePushSlotBytes(const EpCfg& c) {
-  return (EpCombinePushWireBytes(c) + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign *
-         EpCombinePushSlotAlign;
-}
 constexpr int EpCombinePushSigLine = 64;
-constexpr long long EpCombinePushSlots(const EpCfg& c) {
-  return (long long)c.worldSize * EpMaxRecv(c);
-}
 
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part

@@ -1445,13 +1445,11 @@ enum class EpPushSlot : int {
   Store = 3,
   StoreWait = 4,
   Entry = 5,
-  DataPoll = 6,
   SigPoll = 7,
   Reduce = 8,
   Signal = 9,
   Timeout = 10,
   SigSrc0 = 11,
-  DataSrc0 = 19,
   GoPoll = 27
 };
 constexpr int kEpPushSmSlot0 = 8192;
@@ -1462,269 +1460,9 @@ constexpr int kEpPushProfEvents = 256;
 using EpPushProfiler = ::mori::core::profiler::TraceProfiler<EpPushSlot, kEpPushProfEvents>;
 #endif
 
-#ifndef MORI_PUSH_DEFAULTS
-#define MORI_PUSH_DEFAULTS 1
-#endif
-#if MORI_PUSH_DEFAULTS
-#ifndef MORI_PUSH_TDMCPOL
-#define MORI_PUSH_TDMCPOL 0x18
-#endif
-#ifndef MORI_PUSH_SIGNAL
-#define MORI_PUSH_SIGNAL 3
-#endif
-#ifndef MORI_PUSH_QUANT
-#define MORI_PUSH_QUANT 1
-#endif
-#ifndef MORI_PUSH_QLOAD
-#define MORI_PUSH_QLOAD 1
-#endif
-#ifndef MORI_PUSH_RTDM
-#define MORI_PUSH_RTDM 1
-#endif
-#ifndef MORI_PUSH_RPK
-#define MORI_PUSH_RPK 1
-#endif
-#ifndef MORI_PUSH_RSPLIT
-#define MORI_PUSH_RSPLIT 2
-#endif
-#ifndef MORI_PUSH_SPEC
-#define MORI_PUSH_SPEC 2
-#endif
-#ifndef MORI_PUSH_SPREAD
-#define MORI_PUSH_SPREAD 1
-#endif
-#ifndef MORI_PUSH_SPECSTRIDE
-#define MORI_PUSH_SPECSTRIDE 1
-#endif
-#ifndef MORI_PUSH_SPREADX
-#define MORI_PUSH_SPREADX 1
-#endif
-#ifndef MORI_PUSH_RPRE
-#define MORI_PUSH_RPRE 1
-#endif
-#ifndef MORI_PUSH_POLLFIT
-#define MORI_PUSH_POLLFIT 1
-#endif
-#ifndef MORI_PUSH_GOFIRST
-#define MORI_PUSH_GOFIRST 1
-#endif
-#ifndef MORI_PUSH_GOFAST
-#define MORI_PUSH_GOFAST 1
-#endif
-#ifndef MORI_PUSH_QCVT
-#define MORI_PUSH_QCVT 2
-#endif
-#ifndef MORI_PUSH_QLEAN
-#define MORI_PUSH_QLEAN 1
-#endif
-#ifndef MORI_PUSH_QMX
-#define MORI_PUSH_QMX 1
-#endif
-#ifndef MORI_PUSH_QTDM
-#define MORI_PUSH_QTDM 1
-#endif
-#ifndef MORI_PUSH_RSKIP
-#define MORI_PUSH_RSKIP 1
-#endif
-#endif
-
-#ifndef MORI_PUSH_STOPAT
-#define MORI_PUSH_STOPAT 99
-#endif
-#ifndef MORI_PUSH_TOTREAD
-#define MORI_PUSH_TOTREAD 0
-#endif
-#ifndef MORI_PUSH_LOCAL
-#define MORI_PUSH_LOCAL 0
-#endif
-#ifndef MORI_PUSH_NOLOAD
-#define MORI_PUSH_NOLOAD 0
-#endif
-#ifndef MORI_PUSH_STORE2D
-#define MORI_PUSH_STORE2D 0
-#endif
-#ifndef MORI_PUSH_ROWFRAC
-#define MORI_PUSH_ROWFRAC 1
-#endif
-#ifndef MORI_PUSH_ONLYWARPS
-#define MORI_PUSH_ONLYWARPS 0
-#endif
-#ifndef MORI_PUSH_FORCEPEER
-#define MORI_PUSH_FORCEPEER 0
-#endif
-#ifndef MORI_PUSH_SIGNAL
-#define MORI_PUSH_SIGNAL 0
-#endif
-#ifndef MORI_PUSH_SIGFENCE
-#define MORI_PUSH_SIGFENCE 0
-#endif
-#ifndef MORI_PUSH_TDMCPOL
-#define MORI_PUSH_TDMCPOL 0
-#endif
-#ifndef MORI_PUSH_DATASEEN
-#define MORI_PUSH_DATASEEN 0
-#endif
-#ifndef MORI_PUSH_REDUCEONLY
-#define MORI_PUSH_REDUCEONLY 0
-#endif
-#ifndef MORI_PUSH_MAXSPIN
-#define MORI_PUSH_MAXSPIN 65536
-#endif
-#ifndef MORI_PUSH_QUANT
-#define MORI_PUSH_QUANT 0
-#endif
-#ifndef MORI_PUSH_RSPLIT
-#define MORI_PUSH_RSPLIT 0
-#endif
-#ifndef MORI_PUSH_QLOAD
-#define MORI_PUSH_QLOAD 0
-#endif
-#ifndef MORI_PUSH_QROWS
-#define MORI_PUSH_QROWS 0
-#endif
-#ifndef MORI_PUSH_QCVT
-#define MORI_PUSH_QCVT 0
-#endif
-#ifndef MORI_PUSH_QSTREAM
-#define MORI_PUSH_QSTREAM 0
-#endif
-#ifndef MORI_PUSH_SPECMIX
-#define MORI_PUSH_SPECMIX 0
-#endif
-#ifndef MORI_PUSH_QLEAN
-#define MORI_PUSH_QLEAN 0
-#endif
-#ifndef MORI_PUSH_QMX
-#define MORI_PUSH_QMX 0
-#endif
-#ifndef MORI_PUSH_QPRE
-#define MORI_PUSH_QPRE 0
-#endif
-#ifndef MORI_PUSH_QNEXT
-#define MORI_PUSH_QNEXT 0
-#endif
-#ifndef MORI_PUSH_QTDM
-#define MORI_PUSH_QTDM 0
-#endif
-#ifndef MORI_PUSH_SEGSTORE
-#define MORI_PUSH_SEGSTORE 0
-#endif
-#ifndef MORI_PUSH_QTDMW
-#define MORI_PUSH_QTDMW 0
-#endif
-#ifndef MORI_PUSH_SPECSTRIDE
-#define MORI_PUSH_SPECSTRIDE 0
-#endif
-#ifndef MORI_PUSH_SPREADX
-#define MORI_PUSH_SPREADX 0
-#endif
-#ifndef MORI_PUSH_RSKIP
-#define MORI_PUSH_RSKIP 0
-#endif
-#ifndef MORI_PUSH_ROWSTORE
-#define MORI_PUSH_ROWSTORE 0
-#endif
-#ifndef MORI_PUSH_TDEFER
-#define MORI_PUSH_TDEFER 0
-#endif
-#ifndef MORI_PUSH_HWID
-#define MORI_PUSH_HWID 0
-#endif
-#ifndef MORI_PUSH_TDMW
-#define MORI_PUSH_TDMW 1
-#endif
-#ifndef MORI_PUSH_QNOP
-#define MORI_PUSH_QNOP 0
-#endif
-#if MORI_PUSH_QROWS
-#define EP_PUSH_QROWS_UNROLL _Pragma("unroll")
-#else
-#define EP_PUSH_QROWS_UNROLL
-#endif
-#ifndef MORI_PUSH_RTDM
-#define MORI_PUSH_RTDM 0
-#endif
-#ifndef MORI_PUSH_RPK
-#define MORI_PUSH_RPK 0
-#endif
-#ifndef MORI_PUSH_RHALF
-#define MORI_PUSH_RHALF 0
-#endif
-#ifndef MORI_PUSH_SPEC
-#define MORI_PUSH_SPEC 0
-#endif
-#ifndef MORI_PUSH_SPREAD
-#define MORI_PUSH_SPREAD 0
-#endif
-#ifndef MORI_PUSH_MAPSRC
-#define MORI_PUSH_MAPSRC 0
-#endif
-#ifndef MORI_PUSH_RPRE
-#define MORI_PUSH_RPRE 0
-#endif
-#ifndef MORI_PUSH_POLLFIT
-#define MORI_PUSH_POLLFIT 0
-#endif
-#ifndef MORI_PUSH_GOFIRST
-#define MORI_PUSH_GOFIRST 0
-#endif
-#ifndef MORI_PUSH_POLLSPLIT
-#define MORI_PUSH_POLLSPLIT 0
-#endif
-#ifndef MORI_PUSH_GOFAST
-#define MORI_PUSH_GOFAST 0
-#endif
-#ifndef MORI_PUSH_NOZERO
-#define MORI_PUSH_NOZERO 0
-#endif
-static_assert(!MORI_PUSH_SPREAD || MORI_PUSH_SPEC, "MORI_PUSH_SPREAD needs MORI_PUSH_SPEC");
-static_assert(!MORI_PUSH_SPREADX || MORI_PUSH_SPREAD, "MORI_PUSH_SPREADX needs MORI_PUSH_SPREAD");
-static_assert(!MORI_PUSH_QTDM ||
-                  (MORI_PUSH_SPEC && MORI_PUSH_QUANT && MORI_PUSH_QLOAD == 1 &&
-                   (MORI_PUSH_SPECMIX == 1 || MORI_PUSH_SPECSTRIDE) && !MORI_PUSH_QROWS &&
-                   !MORI_PUSH_QPRE && !MORI_PUSH_QNEXT && !MORI_PUSH_TDEFER),
-              "MORI_PUSH_QTDM: SPECMIX=1 or SPECSTRIDE, without QROWS, QPRE, QNEXT or TDEFER");
-static_assert(!MORI_PUSH_QNEXT || (MORI_PUSH_QPRE && MORI_PUSH_SPECMIX == 1 && !MORI_PUSH_TDEFER),
-              "MORI_PUSH_QNEXT: with QPRE and SPECMIX=1; its LDS row overlaps TDEFER's slots");
-static_assert(!MORI_PUSH_QMX || (MORI_PUSH_QUANT == 1 && MORI_PUSH_QLOAD == 1),
-              "MORI_PUSH_QMX: the 32-element quantizer with coalesced loads");
-static_assert(!MORI_PUSH_QPRE ||
-                  (MORI_PUSH_SPEC && MORI_PUSH_QUANT && MORI_PUSH_QLOAD == 1 &&
-                   (MORI_PUSH_SPECSTRIDE || (MORI_PUSH_SPECMIX == 1 && !MORI_PUSH_QROWS))),
-              "MORI_PUSH_QPRE: SPECSTRIDE or SPECMIX=1 without QROWS, quantized coalesced loads");
-static_assert((MORI_PUSH_TDMW == 1 && !MORI_PUSH_QNOP) || (MORI_PUSH_SPEC && MORI_PUSH_STOPAT == 3),
-              "MORI_PUSH_TDMW / MORI_PUSH_QNOP price loads only: MORI_PUSH_SPEC with STOPAT=3");
-static_assert(!MORI_PUSH_RHALF || (MORI_PUSH_RTDM && MORI_PUSH_RSPLIT == 2 && MORI_PUSH_QUANT == 1),
-              "MORI_PUSH_RHALF splits the TDM row loads of MORI_PUSH_RTDM's half-token items");
-static_assert(!MORI_PUSH_QROWS || (MORI_PUSH_SPEC && MORI_PUSH_QLOAD == 1),
-              "MORI_PUSH_QROWS unrolls a compile-time row count: MORI_PUSH_SPEC with QLOAD=1");
-static_assert(
-    !MORI_PUSH_MAPSRC || (MORI_PUSH_SPEC && MORI_PUSH_STOPAT == 3),
-    "MORI_PUSH_MAPSRC reads wrong values: only with MORI_PUSH_SPEC and MORI_PUSH_STOPAT=3");
-static_assert(!MORI_PUSH_RPRE || MORI_PUSH_SIGNAL == 3, "MORI_PUSH_RPRE needs MORI_PUSH_SIGNAL=3");
-static_assert(MORI_PUSH_SIGNAL != 3 || (!MORI_PUSH_DATASEEN && !MORI_PUSH_REDUCEONLY),
-              "MORI_PUSH_SIGNAL=3 is the whole combine; the probes would change what it times");
-
-__device__ __forceinline__ unsigned EpBf16RoundBits(float f) {
-  unsigned u = __float_as_uint(f);
-  return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
-}
-
 typedef float EpF32x8 __attribute__((ext_vector_type(8)));
 typedef __bf16 EpBf16x8 __attribute__((ext_vector_type(8)));
 typedef unsigned short EpU16x2 __attribute__((ext_vector_type(2)));
-
-__device__ __forceinline__ unsigned EpPushQ4ScaleOperand(unsigned b, int lane) {
-  const unsigned p = (unsigned)__shfl_xor((int)b, 16, 32);
-  const unsigned lo = (lane & 16) ? p : b;
-  const unsigned hi = (lane & 16) ? b : p;
-  const unsigned v = lo | (hi << 8);
-  return v | (v << 16);
-}
-#define EP_PUSH_DPPMAX(_v, _ctrl)                                                               \
-  __builtin_fmaxf(                                                                              \
-      _v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, _v), \
-                                                                _ctrl, 0xf, 0xf, false)))
 
 template <int N>
 __device__ __forceinline__ unsigned EpWarpOrBits(unsigned bits) {
@@ -1738,27 +1476,20 @@ template <EpCfg kCfg, typename T>
 __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
   IF_ENABLE_PROFILER(const int64_t _epEntryTs = wall_clock64(); const int _epSm = (int)__smid(););
   const EpArgs& args = pargs.base;
-  static_assert(sizeof(T) == 2, "the push-send combine sends the front quarter of a bf16 row");
+  static_assert(std::is_same_v<T, hip_bfloat16>, "the push-send combine quantizes bf16 rows");
   constexpr int WS = kCfg.waveSize;
   constexpr int kTokB = EpTokenBytes(kCfg);
-  constexpr int kQGroup = MORI_PUSH_QUANT == 2 ? 128 : 32;
+  constexpr int kQGroup = 32;
   constexpr int kPayB = kCfg.hiddenDim / 2;
   constexpr int kScB = kCfg.hiddenDim / kQGroup;
-  constexpr int kWireB = MORI_PUSH_QUANT ? (kPayB + kScB + EpCombinePushSlotAlign - 1) /
-                                               EpCombinePushSlotAlign * EpCombinePushSlotAlign
-                                         : EpCombinePushWireBytes(kCfg);
-  constexpr int kSlotB = MORI_PUSH_QUANT ? kWireB : EpCombinePushSlotBytes(kCfg);
+  constexpr int kWireB =
+      (kPayB + kScB + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
   static_assert(kWireB % kTdmRowBytes == 0 && kTokB % kTdmRowBytes == 0,
                 "every row a TDM transfer touches must start on a 128 B row");
-  static_assert(kSlotB == kWireB, "a multi-slot store needs the slots back to back");
   constexpr int kWireDw = kWireB / 4;
-  constexpr int kTokDw = kTokB / 4;
   constexpr int kCap = (EpCombine1250xLdsBudget / kCfg.warpPerBlock) / kWireB;
-  static_assert(kCap >= 1, "a warp's LDS share must hold one wire token");
-  static_assert(kCap <= WS, "each slot of a round is read by its own lane");
-  static_assert((MORI_PUSH_STORE2D || MORI_PUSH_ROWFRAC == 1) && MORI_PUSH_ROWFRAC >= 1 &&
-                    (kWireB / MORI_PUSH_ROWFRAC) % kTdmRowBytes == 0,
-                "MORI_PUSH_ROWFRAC needs MORI_PUSH_STORE2D and must leave whole 128 B rows");
+  constexpr int kCpolScopeSys = 3 << 3;
+  constexpr int kMaxSpin = 65536;
 
   const int laneId = threadIdx.x & (WS - 1);
   const int warpId = threadIdx.x / WS;
@@ -1778,7 +1509,6 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
                              ::mori::core::profiler::EventType::INSTANT, _epEntryTs););
   MORI_TRACE_SEQ(seq, profiler);
   MORI_TRACE_NEXT(seq, EpPushSlot::Prologue);
-  if constexpr (MORI_PUSH_STOPAT == 0) return;
 
   constexpr int topk = kCfg.numExpertPerToken;
   constexpr int npes = kCfg.worldSize;
@@ -1787,10 +1517,7 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
 
   extern __shared__ char sharedMem[];
 
-  constexpr int kItemPass = !MORI_PUSH_QUANT        ? 1
-                            : MORI_PUSH_RSPLIT == 1 ? kCfg.hiddenDim / (32 * WS)
-                            : MORI_PUSH_RSPLIT == 2 ? 2
-                                                    : 1;
+  constexpr int kItemPass = 2;
   const int nItems = args.numTokens * kItemPass;
   struct EpPushRItem {
     int t, pOnly, flat;
@@ -1818,1003 +1545,296 @@ __device__ void EpCombine1250xPushSendBody(EpPushArgs pargs) {
       const int l = mm ? __ffsll((long long)mm) - 1 : l0;
       r.on[j] = mm ? 1.0f : 0.0f;
       mm &= mm - 1;
-      r.rp[j] = land + (size_t)__shfl(r.flat, l) * kSlotB;
+      r.rp[j] = land + (size_t)__shfl(r.flat, l) * kWireB;
     }
     return r;
   };
   auto reduceItem = [&](const EpPushRItem& r) {
-    {
-      const int t = r.t;
-      const int pOnly = r.pOnly;
-      const int flat = r.flat;
-      unsigned long long mask = r.mask;
-      if constexpr (MORI_PUSH_QUANT) {
-        constexpr int kPass = kCfg.hiddenDim / (32 * WS);
-        static_assert(kCfg.hiddenDim % (32 * WS) == 0 && kQGroup % 32 == 0,
-                      "a pass is 32 elements a lane, inside one scale group");
-        unsigned char* const orow =
-            reinterpret_cast<unsigned char*>(args.outTokenBuf) + (size_t)t * kTokB;
-        constexpr int kPerItem = (kPass + kItemPass - 1) / kItemPass;
-        const int pBeg = pOnly * kPerItem;
-        const int pEnd = min(kPass, pBeg + kPerItem);
-        if (!mask) {
-          const int gBeg = pBeg * WS;
-          const int gEnd = pEnd * WS;
-          for (int g = gBeg + laneId; g < gEnd; g += WS)
-            for (int i = 0; i < 4; ++i)
-              reinterpret_cast<uint4*>(orow + (size_t)g * 64)[i] = make_uint4(0u, 0u, 0u, 0u);
-          return;
-        }
-        const auto& rp = r.rp;
-        const auto& on = r.on;
-        auto accStore = [&](const int g, const uint4(&pk)[npes], const unsigned (&sb)[npes]) {
-          float acc[32];
-#pragma unroll
-          for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
-#pragma unroll
-          for (int j = 0; j < npes; ++j) {
-            if (MORI_PUSH_RSKIP && j >= __popcll(mask)) break;
-            const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
-            if constexpr (MORI_PUSH_QUANT == 2) {
-              const unsigned so = EpPushQ4ScaleOperand(sb[j], laneId);
-#pragma unroll
-              for (int i = 0; i < 4; ++i) {
-                const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], so, 0);
-#pragma unroll
-                for (int k = 0; k < 8; ++k)
-                  acc[i * 8 + k] = __builtin_fmaf(d[k], on[j], acc[i * 8 + k]);
-              }
-              continue;
-            }
-            const float s = on[j] * __uint_as_float(sb[j] << 23);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-              const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
-#pragma unroll
-              for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
-            }
-          }
-          uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
-#pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            unsigned w[4];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-              if constexpr (MORI_PUSH_RPK) {
-                static_assert(std::is_same_v<T, hip_bfloat16>, "RPK packs bf16 only");
-                w[e] = MoriPackTo2<T>(acc[i * 8 + 2 * e], acc[i * 8 + 2 * e + 1]);
-              } else {
-                w[e] = EpBf16RoundBits(acc[i * 8 + 2 * e]) |
-                       (EpBf16RoundBits(acc[i * 8 + 2 * e + 1]) << 16);
-              }
-            }
-            o[i] = make_uint4(w[0], w[1], w[2], w[3]);
-          }
-        };
-        if constexpr (MORI_PUSH_RTDM) {
-          static_assert((kItemPass == 1 || MORI_PUSH_RSPLIT == 2) && kCap >= npes,
-                        "RTDM reduces a whole or half token per warp from a tile of npes rows");
-          const int nRow = __popcll(mask);
-          const size_t tileOff = (size_t)warpId * kCap * kWireB;
-          asm volatile("s_wait_dscnt 0x0" ::: "memory");
-          constexpr int kPassB = WS * 16;
-          const int payB = MORI_PUSH_RHALF ? pBeg * kPassB : 0;
-          const int payN = MORI_PUSH_RHALF ? (pEnd - pBeg) * kPassB : kWireB;
-          const int scB = (kPayB + pBeg * WS * 32 / kQGroup) / kTdmRowBytes * kTdmRowBytes;
-          const int scE = min(kWireB, (kPayB + pEnd * WS * 32 / kQGroup + kTdmRowBytes - 1) /
-                                          kTdmRowBytes * kTdmRowBytes);
-#pragma unroll
-          for (int j = 0; j < npes; ++j)
-            if (j < nRow) {
-              char* const trow = sharedMem + tileOff + (size_t)j * kWireB;
-              TdmIssueLoad<int>(reinterpret_cast<int*>(trow + payB),
-                                reinterpret_cast<const int*>(rp[j] + payB),
-                                TdmShape<int>(payN / 4));
-              if constexpr (MORI_PUSH_RHALF)
-                TdmIssueLoad<int>(reinterpret_cast<int*>(trow + scB),
-                                  reinterpret_cast<const int*>(rp[j] + scB),
-                                  TdmShape<int>((scE - scB) / 4));
-            }
-          __builtin_amdgcn_s_wait_tensorcnt(0);
-#pragma unroll
-          for (int q = 0; q < kPerItem; ++q) {
-            const int p = pBeg + q;
-            if (p >= pEnd) break;
-            const int g = p * WS + laneId;
-            uint4 pk[npes];
-            unsigned sb[npes];
-#pragma unroll
-            for (int j = 0; j < npes; ++j) {
-              if (MORI_PUSH_RSKIP && j >= nRow) break;
-              const char* const row = sharedMem + tileOff + (size_t)(j < nRow ? j : 0) * kWireB;
-              pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
-              sb[j] = (unsigned char)row[kPayB + g * 32 / kQGroup];
-            }
-            accStore(g, pk, sb);
-          }
-          return;
-        }
-        auto onePass = [&](const int p) {
-          const int g = p * WS + laneId;
-          uint4 pk[npes];
-          unsigned sb[npes];
-#pragma unroll
-          for (int j = 0; j < npes; ++j) {
-            pk[j] = *reinterpret_cast<const uint4*>(rp[j] + (size_t)g * 16);
-            sb[j] = rp[j][kPayB + g * 32 / kQGroup];
-          }
-          accStore(g, pk, sb);
-        };
-        if constexpr (kItemPass > 1) {
-          for (int p = pBeg; p < pEnd; ++p) onePass(p);
-        } else {
-#pragma unroll
-          for (int p = 0; p < kPass; ++p) onePass(p);
-        }
-        return;
-      }
-      const unsigned char* const land = EpLocal<unsigned char>(win, pargs.offCombPush);
-      constexpr int kVec = kWireB / 16 / WS;
-      static_assert(MORI_PUSH_QUANT || kWireB % (16 * WS) == 0,
-                    "a landed row must split into whole uint4 per lane");
-      float acc[kVec][8];
-      for (int v = 0; v < kVec; ++v)
-        for (int e = 0; e < 8; ++e) acc[v][e] = 0.f;
-      while (mask) {
-        const int l = __ffsll((long long)mask) - 1;
-        mask &= mask - 1;
-        const uint4* const row =
-            reinterpret_cast<const uint4*>(land + (size_t)__shfl(flat, l) * kSlotB);
-        for (int v = 0; v < kVec; ++v) {
-          const uint4 x = row[v * WS + laneId];
-          const unsigned w[4] = {x.x, x.y, x.z, x.w};
-          for (int e = 0; e < 4; ++e) {
-            acc[v][2 * e] += __uint_as_float(w[e] << 16);
-            acc[v][2 * e + 1] += __uint_as_float(w[e] & 0xFFFF0000u);
-          }
-        }
-      }
-      uint4* const out = reinterpret_cast<uint4*>(
-          reinterpret_cast<unsigned char*>(args.outTokenBuf) + (size_t)t * kTokB);
-      for (int v = 0; v < kVec; ++v) {
-        unsigned w[4];
-        for (int e = 0; e < 4; ++e)
-          w[e] = EpBf16RoundBits(acc[v][2 * e]) | (EpBf16RoundBits(acc[v][2 * e + 1]) << 16);
-        out[v * WS + laneId] = make_uint4(w[0], w[1], w[2], w[3]);
-      }
+    constexpr int kPass = kCfg.hiddenDim / (32 * WS);
+    static_assert(kCfg.hiddenDim % (32 * WS) == 0,
+                  "a pass is 32 elements a lane, inside one scale group");
+    static_assert(kCap >= npes, "a token's landed rows are staged in the warp's tile");
+    const int t = r.t;
+    const unsigned long long mask = r.mask;
+    unsigned char* const orow =
+        reinterpret_cast<unsigned char*>(args.outTokenBuf) + (size_t)t * kTokB;
+    constexpr int kPerItem = (kPass + kItemPass - 1) / kItemPass;
+    const int pBeg = r.pOnly * kPerItem;
+    const int pEnd = min(kPass, pBeg + kPerItem);
+    if (!mask) {
+      const int gBeg = pBeg * WS;
+      const int gEnd = pEnd * WS;
+      for (int g = gBeg + laneId; g < gEnd; g += WS)
+        for (int i = 0; i < 4; ++i)
+          reinterpret_cast<uint4*>(orow + (size_t)g * 64)[i] = make_uint4(0u, 0u, 0u, 0u);
+      return;
     }
-  };
-  auto pushReduce = [&]() {
-    for (int it = globalWarpId; it < nItems; it += globalWarpNum) reduceItem(reducePrep(it));
+    const auto& rp = r.rp;
+    const auto& on = r.on;
+    auto accStore = [&](const int g, const uint4(&pk)[npes], const unsigned (&sb)[npes]) {
+      float acc[32];
+#pragma unroll
+      for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
+#pragma unroll
+      for (int j = 0; j < npes; ++j) {
+        if (j >= __popcll(mask)) break;
+        const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
+        const float s = on[j] * __uint_as_float(sb[j] << 23);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
+#pragma unroll
+          for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
+        }
+      }
+      uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        unsigned w[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          w[e] = MoriPackTo2<T>(acc[i * 8 + 2 * e], acc[i * 8 + 2 * e + 1]);
+        o[i] = make_uint4(w[0], w[1], w[2], w[3]);
+      }
+    };
+    const int nRow = __popcll(mask);
+    const size_t tileOff = (size_t)warpId * kCap * kWireB;
+    asm volatile("s_wait_dscnt 0x0" ::: "memory");
+#pragma unroll
+    for (int j = 0; j < npes; ++j)
+      if (j < nRow)
+        TdmIssueLoad<int>(reinterpret_cast<int*>(sharedMem + tileOff + (size_t)j * kWireB),
+                          reinterpret_cast<const int*>(rp[j]), TdmShape<int>(kWireDw));
+    __builtin_amdgcn_s_wait_tensorcnt(0);
+#pragma unroll
+    for (int q = 0; q < kPerItem; ++q) {
+      const int p = pBeg + q;
+      if (p >= pEnd) break;
+      const int g = p * WS + laneId;
+      uint4 pk[npes];
+      unsigned sb[npes];
+#pragma unroll
+      for (int j = 0; j < npes; ++j) {
+        if (j >= nRow) break;
+        const char* const row = sharedMem + tileOff + (size_t)(j < nRow ? j : 0) * kWireB;
+        pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
+        sb[j] = (unsigned char)row[kPayB + g * 32 / kQGroup];
+      }
+      accStore(g, pk, sb);
+    }
   };
 
   auto pushQuantRows = [&](unsigned char* dstTile, const unsigned char* srcRows, int nRows,
-                           size_t srcStride = (size_t)EpTokenBytes(kCfg), bool rolled = false,
-                           bool gate = false, int rowsTot = 0, int rowBase = 0, int rowStep = 0,
-                           bool usePre = false, const uint4* pre = nullptr, bool r1Lds = false,
-                           int tdmAll = 0, unsigned char* stg = nullptr) {
-    if constexpr (MORI_PUSH_QUANT == 2) {
-      constexpr int kVecs = kCfg.hiddenDim / 8;
-      static_assert(kVecs % WS == 0 && kQGroup == 16 * 8, "one group per 16-lane row");
-      for (int r = 0; r < nRows; ++r) {
-        const uint4* const s = reinterpret_cast<const uint4*>(srcRows + (size_t)r * kTokB);
-        unsigned char* const d = dstTile + (size_t)r * kWireB;
-        for (int base = 0; base < kVecs; base += WS) {
-          const int u = base + laneId;
-          const int e0 = u * 8;
-          const uint4 x = s[u];
-          const unsigned pw[4] = {x.x, x.y, x.z, x.w};
-          EpF32x8 v;
+                           size_t srcStride, int rowsTot, int rowBase, int rowStep) {
+    constexpr int kLd = kCfg.hiddenDim / (8 * WS);
+    static_assert(kCfg.hiddenDim % (8 * WS) == 0,
+                  "a coalesced load is eight elements a lane, a group four lanes");
+    auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
+      const int u = i * WS + laneId;
+      const unsigned w[4] = {x.x, x.y, x.z, x.w};
+      EpU16x2 mx = {0, 0};
 #pragma unroll
-          for (int k = 0; k < 4; ++k) {
-            v[2 * k] = __uint_as_float(pw[k] << 16);
-            v[2 * k + 1] = __uint_as_float(pw[k] & 0xFFFF0000u);
-          }
-          float amax = 0.0f;
+      for (int e = 0; e < 4; ++e)
+        mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
+      mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
+      unsigned amax = __builtin_bit_cast(unsigned, mx);
+      const unsigned a1 =
+          (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
+      amax = amax > a1 ? amax : a1;
+      const unsigned a2 =
+          (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
+      amax = amax > a2 ? amax : a2;
+      const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
+      const int se = (e8 < 1 ? 1 : e8) - 127;
+      const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
+      const unsigned q =
+          (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
+      *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
+      d[kPayB + i * (WS / 4) + (laneId >> 2)] = (unsigned char)(se + 127);
+    };
+    const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
+    bool next = true;
+    for (int r = 0; r < nRows && next; ++r) {
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+      uint4 xs[kLd];
 #pragma unroll
-          for (int k = 0; k < 8; ++k) amax = __builtin_fmaxf(amax, __builtin_fabsf(v[k]));
-          amax = EP_PUSH_DPPMAX(amax, 0xb1);
-          amax = EP_PUSH_DPPMAX(amax, 0x4e);
-          amax = EP_PUSH_DPPMAX(amax, 0x141);
-          amax = EP_PUSH_DPPMAX(amax, 0x140);
-          const int se = (int)((__float_as_uint(amax) >> 23) & 0xFFu) - 128;
-          const float div = __uint_as_float((unsigned)(se + 127) << 23);
-          *reinterpret_cast<unsigned*>(d + (e0 >> 1)) =
-              (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, div);
-          if ((laneId & 15) == 0) d[kPayB + e0 / kQGroup] = (unsigned char)(se + 127);
-        }
-      }
-      return;
-    }
-    if constexpr (MORI_PUSH_QLOAD == 1) {
-      constexpr int kLd = kCfg.hiddenDim / (8 * WS);
-      static_assert(kCfg.hiddenDim % (8 * WS) == 0 && kQGroup == 4 * 8,
-                    "a coalesced load is eight elements a lane, a group four lanes");
-      auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
-        {
-          const int u = i * WS + laneId;
-          const unsigned w[4] = {x.x, x.y, x.z, x.w};
-          EpU16x2 mx = {0, 0};
-#pragma unroll
-          for (int e = 0; e < 4; ++e)
-            mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
-          unsigned amax;
-          if constexpr (MORI_PUSH_QLEAN) {
-            mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
-            amax = __builtin_bit_cast(unsigned, mx);
-          } else {
-            amax = mx.x > mx.y ? (unsigned)mx.x : (unsigned)mx.y;
-          }
-          const unsigned a1 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf,
-                                                                    false);
-          amax = amax > a1 ? amax : a1;
-          const unsigned a2 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf,
-                                                                    false);
-          amax = amax > a2 ? amax : a2;
-          int se = (int)((amax >> 7) & 0xFFu) - 128;
-          se = se < (MORI_PUSH_QLEAN ? -126 : -127) ? (MORI_PUSH_QLEAN ? -126 : -127) : se;
-          if constexpr (MORI_PUSH_QMX) {
-            const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
-            se = (e8 < 1 ? 1 : e8) - 127;
-          }
-          const float inv = __uint_as_float((unsigned)(127 - se) << 23);
-          unsigned q;
-          if constexpr (MORI_PUSH_QCVT) {
-            const float sc = MORI_PUSH_QCVT == 1
-                                 ? inv
-                                 : __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
-            q = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(
-                __builtin_bit_cast(EpBf16x8, x), sc);
-          } else {
-            EpF32x8 v;
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-              v[2 * e] = __uint_as_float(w[e] << 16) * inv;
-              v[2 * e + 1] = __uint_as_float(w[e] & 0xFFFF0000u) * inv;
-            }
-            q = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, 1.0f);
-          }
-          *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
-          d[MORI_PUSH_QLEAN ? kPayB + i * (WS / 4) + (laneId >> 2) : kPayB + u / 4] =
-              (unsigned char)(se + 127);
-        }
-      };
-      auto quantRow = [&](int r, auto ldx) {
-        const uint4* const s = reinterpret_cast<const uint4*>(srcRows + (size_t)r * srcStride);
-        unsigned char* const d = dstTile + (size_t)r * kWireB;
-        if constexpr (MORI_PUSH_QNOP) {
-          unsigned acc = 0;
-#pragma unroll
-          for (int i = 0; i < kLd; ++i) {
-            const uint4 x = s[i * WS + laneId];
-            acc ^= x.x ^ x.y ^ x.z ^ x.w;
-          }
-          *reinterpret_cast<unsigned*>(d + (size_t)laneId * 4) = acc;
-          return;
-        }
-#pragma unroll
-        for (int i = 0; i < kLd; ++i) qgrp(d, i, ldx(s, i, i * WS + laneId));
-      };
-      const auto ldMem = [](const uint4* s, int, int u) { return s[u]; };
-      if (tdmAll == 2) {
-        constexpr int kH = kLd / 2;
-        constexpr int kHalfB = kH * WS * 16;
-        const uint4* const l = reinterpret_cast<const uint4*>(stg);
-        const int nParts = 2 * nRows;
-        for (int p = 0; p < nParts; ++p) {
-          __builtin_amdgcn_s_wait_tensorcnt(0);
-          uint4 xs[kH];
-#pragma unroll
-          for (int k = 0; k < kH; ++k) xs[k] = l[k * WS + laneId];
-          asm volatile("s_wait_dscnt 0x0" ::: "memory");
-          if (p + 1 < nParts)
-            TdmIssueLoad<int>(
-                reinterpret_cast<int*>(stg),
-                reinterpret_cast<const int*>(srcRows + (size_t)((p + 1) >> 1) * srcStride +
-                                             (size_t)((p + 1) & 1) * kHalfB),
-                TdmShape<int>(kHalfB / 4));
-          unsigned char* const d = dstTile + (size_t)(p >> 1) * kWireB;
-          const int iB = (p & 1) * kH;
-#pragma unroll
-          for (int k = 0; k < kH; ++k) qgrp(d, iB + k, xs[k]);
-        }
-      } else if (tdmAll) {
-        const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
-        bool next = true;
-        for (int r = 0; r < nRows && next; ++r) {
-          __builtin_amdgcn_s_wait_tensorcnt(0);
-          uint4 xs[kLd];
-#pragma unroll
-          for (int i = 0; i < kLd; ++i) xs[i] = l[i * WS + laneId];
-          next = r + 1 < nRows && (!gate || rowBase + (r + 1) * rowStep < rowsTot);
-          if (!MORI_PUSH_QTDMW || next) asm volatile("s_wait_dscnt 0x0" ::: "memory");
-          if (next)
-            TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kWireB),
-                              reinterpret_cast<const int*>(srcRows + (size_t)(r + 1) * srcStride),
-                              TdmShape<int>((int)(EpTokenBytes(kCfg) / 4)));
-          quantRow(r, [&](const uint4*, int i, int) { return xs[i]; });
-        }
-      } else if (usePre) {
-        quantRow(0, [&](const uint4*, int i, int) { return pre[i]; });
-        for (int r = 1; r < nRows && (!gate || rowBase + r * rowStep < rowsTot); ++r) {
-          if (r1Lds && r == 1) {
-            __builtin_amdgcn_s_wait_tensorcnt(0);
-            const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
-            uint4 xs[kLd];
-#pragma unroll
-            for (int i = 0; i < kLd; ++i) xs[i] = l[i * WS + laneId];
-            asm volatile("s_wait_dscnt 0x0" ::: "memory");
-            quantRow(1, [&](const uint4*, int i, int) { return xs[i]; });
-          } else {
-            quantRow(r, ldMem);
-          }
-        }
-      } else if (gate) {
-        int r = 0;
-        do {
-          quantRow(r, ldMem);
-        } while (++r < nRows && rowBase + r * rowStep < rowsTot);
-      } else if (rolled) {
-        for (int r = 0; r < nRows; ++r) quantRow(r, ldMem);
-      } else {
-        EP_PUSH_QROWS_UNROLL
-        for (int r = 0; r < nRows; ++r) quantRow(r, ldMem);
-      }
-      return;
-    }
-    constexpr int kPass = kCfg.hiddenDim / (kQGroup * WS);
-    for (int r = 0; r < nRows; ++r) {
-      const uint4* const s = reinterpret_cast<const uint4*>(srcRows + (size_t)r * kTokB);
+      for (int i = 0; i < kLd; ++i) xs[i] = l[i * WS + laneId];
+      next = r + 1 < nRows && rowBase + (r + 1) * rowStep < rowsTot;
+      asm volatile("s_wait_dscnt 0x0" ::: "memory");
+      if (next)
+        TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kWireB),
+                          reinterpret_cast<const int*>(srcRows + (size_t)(r + 1) * srcStride),
+                          TdmShape<int>((int)(kTokB / 4)));
       unsigned char* const d = dstTile + (size_t)r * kWireB;
 #pragma unroll
-      for (int p = 0; p < kPass; ++p) {
-        const int g = p * WS + laneId;
-        uint4 x[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) x[i] = s[g * 4 + i];
-        EpU16x2 mx = {0, 0};
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const unsigned w[4] = {x[i].x, x[i].y, x[i].z, x[i].w};
-#pragma unroll
-          for (int e = 0; e < 4; ++e)
-            mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
-        }
-        const unsigned amax = mx.x > mx.y ? (unsigned)mx.x : (unsigned)mx.y;
-        int se = (int)((amax >> 7) & 0xFFu) - 128;
-        se = se < -127 ? -127 : se;
-        const float inv = __uint_as_float((unsigned)(127 - se) << 23);
-        unsigned q[4];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const unsigned w[4] = {x[i].x, x[i].y, x[i].z, x[i].w};
-          EpF32x8 v;
-#pragma unroll
-          for (int e = 0; e < 4; ++e) {
-            v[2 * e] = __uint_as_float(w[e] << 16) * inv;
-            v[2 * e + 1] = __uint_as_float(w[e] & 0xFFFF0000u) * inv;
-          }
-          q[i] = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(v, 1.0f);
-        }
-        *reinterpret_cast<uint4*>(d + (size_t)g * 16) = make_uint4(q[0], q[1], q[2], q[3]);
-        d[kPayB + g] = (unsigned char)(se + 127);
-      }
+      for (int i = 0; i < kLd; ++i) qgrp(d, i, xs[i]);
     }
   };
 
-  if constexpr (MORI_PUSH_REDUCEONLY) {
-    MORI_TRACE_NEXT(seq, EpPushSlot::Reduce);
-    pushReduce();
-    return;
-  }
-
-  if constexpr (MORI_PUSH_STOPAT == 1 && MORI_PUSH_TOTREAD) {
-    if (warpId != 0) return;
-  }
-  const int total = args.totalRecvTokenNum[0];
-  const int per = (total + globalWarpNum - 1) / globalWarpNum;
-  const int s0 = globalWarpId * per;
-  const int s1 = min(s0 + per, total);
-  if constexpr (MORI_PUSH_STOPAT == 1) {
-    if (s1 < -1000000) *args.totalRecvTokenNum = 0;
-    return;
-  }
-
   unsigned char* const tile =
       reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kCap * kWireB;
-  const int* const recvToSrc = EpLocal<int>(win, args.offRecvToSrc);
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
-  const size_t myColB = (size_t)args.rank * EpMaxRecv(kCfg) * kSlotB;
+  const size_t myColB = (size_t)args.rank * EpMaxRecv(kCfg) * kWireB;
   unsigned* const sigLocal = EpLocal<unsigned>(win, pargs.offCombPushSig);
   constexpr int kSlot0Dw = (npes + 1) * kSigDw;
   constexpr int kGo0Dw = kSlot0Dw + npes * kEpPushSigBlocks * kEpPushSigSlotDw;
   int rowsTo[npes];
   for (int q = 0; q < npes; ++q) rowsTo[q] = 0;
-  constexpr unsigned kEpPushSeenTag = 0x5EE17A65u;
 
   auto sendTile = [&](unsigned char* tl, int r0, int n, int pe, auto landOf, auto laneVal,
-                      int rowStep = 1) {
+                      int rowStep) {
     MORI_TRACE_NEXT(seq, EpPushSlot::Store);
     for (int i = 0; i < n;) {
       const int p = laneVal(pe, i);
       int j = i + 1;
-      while (rowStep == 1 && !MORI_PUSH_ROWSTORE && j < n && laneVal(pe, j) == p) ++j;
-      const int dpe = MORI_PUSH_LOCAL       ? args.rank
-                      : MORI_PUSH_FORCEPEER ? (args.rank + 1) % kCfg.worldSize
-                                            : p;
-      unsigned char* const dst = landOf(dpe) + myColB + (size_t)(r0 + i * rowStep) * kSlotB;
-      if constexpr (MORI_PUSH_STORE2D) {
-        TdmIssueStore<int, 0, 0, MORI_PUSH_TDMCPOL>(
-            reinterpret_cast<int*>(dst), reinterpret_cast<int*>(tl + (size_t)i * kWireB),
-            TdmShapeGather<int>(kWireDw / MORI_PUSH_ROWFRAC, j - i, kWireDw));
-      } else {
-        TdmIssueStore<int, 0, 0, MORI_PUSH_TDMCPOL>(reinterpret_cast<int*>(dst),
-                                                    reinterpret_cast<int*>(tl + (size_t)i * kWireB),
-                                                    TdmShape<int>((j - i) * kWireDw));
-      }
+      while (rowStep == 1 && j < n && laneVal(pe, j) == p) ++j;
+      unsigned char* const dst = landOf(p) + myColB + (size_t)(r0 + i * rowStep) * kWireB;
+      TdmIssueStore<int, 0, 0, kCpolScopeSys>(reinterpret_cast<int*>(dst),
+                                              reinterpret_cast<int*>(tl + (size_t)i * kWireB),
+                                              TdmShape<int>((j - i) * kWireDw));
       for (int q = 0; q < npes; ++q) rowsTo[q] += (p == q) ? (j - i) : 0;
       i = j;
     }
     MORI_TRACE_NEXT(seq, EpPushSlot::StoreWait);
-    if constexpr (!MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(0);
-    if constexpr (MORI_PUSH_SIGNAL == 1) {
-      MORI_TRACE_NEXT(seq, EpPushSlot::Signal);
-      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      for (int i = 0; i < n;) {
-        const int p = __shfl(pe, i);
-        int j = i + 1;
-        while (j < n && __shfl(pe, j) == p) ++j;
-        if (laneId == 0)
-          __hip_atomic_fetch_add(
-              EpPeer<unsigned>(win, p, pargs.offCombPushSig) + args.rank * kSigDw,
-              (unsigned)(j - i), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        i = j;
-      }
-    }
+    __builtin_amdgcn_s_wait_tensorcnt(0);
   };
 
-  if constexpr (MORI_PUSH_SPEC > 0) {
-    constexpr int C = MORI_PUSH_SPEC;
-    static_assert(
-        C >= 1 && C <= kCap && kMaxRecv % C == 0 && !MORI_PUSH_NOLOAD && !MORI_PUSH_DATASEEN,
-        "MORI_PUSH_SPEC: a run must fit the tile and tile kMaxRecv, and the row load "
-        "must be there");
-    constexpr int kMixLo = kCfg.warpPerBlock / 4;
-    constexpr int kMixHi = kCfg.warpPerBlock - kMixLo;
-    constexpr int kMixR = kMixHi * C + kMixLo;
-    static_assert(!MORI_PUSH_SPECMIX || (C >= 2 && kCfg.warpPerBlock % 4 == 0 &&
-                                         !MORI_PUSH_SPREAD && !MORI_PUSH_QSTREAM),
-                  "MORI_PUSH_SPECMIX mixes runs of C and 1 over a block's four SIMDs");
-    const int nbRows = (int)gridDim.x - (MORI_PUSH_SPREADX ? 1 : 0);
-    const int stride = MORI_PUSH_SPECMIX ? (int)gridDim.x * kMixR : nbRows * kCfg.warpPerBlock * C;
-    constexpr int kRing = !MORI_PUSH_TDEFER ? 1 : kCap / C >= 4 ? 4 : kCap / C >= 2 ? 2 : 1;
-    static_assert(!MORI_PUSH_TDEFER || (kRing >= 2 && MORI_PUSH_QUANT && MORI_PUSH_QLOAD == 1 &&
-                                        !MORI_PUSH_QSTREAM && MORI_PUSH_SIGNAL != 1),
-                  "MORI_PUSH_TDEFER: two C-row slots, quantized coalesced loads (no TDM load)");
-    int ringIx = 0;
-    static_assert(!MORI_PUSH_SPECSTRIDE ||
-                      (C >= 2 && MORI_PUSH_SPREAD && MORI_PUSH_QUANT && MORI_PUSH_QLOAD == 1 &&
-                       !MORI_PUSH_SPECMIX && !MORI_PUSH_QSTREAM && !MORI_PUSH_STORE2D),
-                  "MORI_PUSH_SPECSTRIDE: SPEC >= 2 with SPREAD, quantized coalesced loads");
-    const int rowStep = MORI_PUSH_SPECSTRIDE ? nbRows * kCfg.warpPerBlock : 1;
-    auto specRun = [&](int r0, int cnt) {
-      unsigned char* const tl = tile + (size_t)(ringIx & (kRing - 1)) * C * kWireB;
-      ++ringIx;
-      const int rl = MORI_PUSH_SPECSTRIDE ? min(r0, kMaxRecv - 1) : min(r0, kMaxRecv - cnt);
-      asm volatile("" ::"s"(win), "s"(args.totalRecvTokenNum), "s"(args.offRecvToSrc),
-                   "s"(pargs.offCombPush));
-      constexpr int kPreLd = MORI_PUSH_QPRE ? kCfg.hiddenDim / (8 * WS) : 1;
-      uint4 pre[kPreLd];
-      if constexpr (MORI_PUSH_QTDM) {
-        static_assert(kCap * kWireB >= kWireB + kTokB,
-                      "MORI_PUSH_QTDM: a bf16 row must fit behind the first wire row");
-        TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kWireB),
-                          reinterpret_cast<const int*>(src + (size_t)rl * kTokB),
-                          TdmShape<int>((int)(kTokB / 4)));
-      }
-      if constexpr (MORI_PUSH_QNEXT) {
-        static_assert(C == 2 && kCap * kWireB >= kWireB + kTokB,
-                      "MORI_PUSH_QNEXT: a bf16 row must fit behind the first wire row");
-        if (cnt >= 2)
-          TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kWireB),
-                            reinterpret_cast<const int*>(src + (size_t)(rl + 1) * kTokB),
-                            TdmShape<int>((int)(kTokB / 4)));
-      }
-      if constexpr (MORI_PUSH_QPRE) {
-        const uint4* const s0 = reinterpret_cast<const uint4*>(src + (size_t)rl * kTokB);
-#pragma unroll
-        for (int i = 0; i < kPreLd; ++i) pre[i] = s0[i * WS + laneId];
-        __builtin_amdgcn_sched_barrier(0);
-      }
-      MORI_TRACE_NEXT(seq, EpPushSlot::Load);
-      if constexpr (!MORI_PUSH_QUANT) {
-        static_assert(C * MORI_PUSH_TDMW <= kCap, "MORI_PUSH_TDMW rows must fit the tile");
-        TdmIssueLoad<int>(reinterpret_cast<int*>(tile),
-                          reinterpret_cast<const int*>(src + (size_t)rl * kTokB),
-                          TdmShapeGather<int>(kWireDw * MORI_PUSH_TDMW, cnt, kTokDw));
-        __builtin_amdgcn_sched_barrier(0);
-      }
-      MORI_TRACE_NEXT(seq, EpPushSlot::Meta);
-      const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
-      char* const wBase = wd->winBase;
-      const uint64_t wStride = (uint64_t)wd->stride4G << 32;
-      const int* const map =
-          reinterpret_cast<const int*>(wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
-      const int slot =
-          MORI_PUSH_MAPSRC == 2 ? 0
-          : MORI_PUSH_MAPSRC == 1
-              ? args.dispDestTokIdMap[min(rl + laneId, args.numTokens * topk - 1)]
-              : map[min(rl + (MORI_PUSH_SPECSTRIDE ? (laneId < C ? laneId : 0) * rowStep : laneId),
-                        kMaxRecv - 1)];
-      const int tot = args.totalRecvTokenNum[0];
-      __builtin_amdgcn_sched_barrier(0);
-      if constexpr (MORI_PUSH_QSTREAM) {
-        static_assert(MORI_PUSH_QUANT && MORI_PUSH_SIGNAL != 1 && MORI_PUSH_STOPAT != 3 &&
-                          !MORI_PUSH_ONLYWARPS && !MORI_PUSH_STORE2D,
-                      "MORI_PUSH_QSTREAM stores quantized rows one by one, SIGNAL=1 counts aside");
-        const int n = min(C, tot - r0);
-        const int pe = (laneId < n) ? slot / kCfg.maxTokPerRank : -1;
-        MORI_TRACE_NEXT(seq, EpPushSlot::Store);
-#pragma unroll
-        for (int i = 0; i < C; ++i) {
-          pushQuantRows(tile + (size_t)i * kWireB, src + (size_t)(rl + i) * kTokB, 1);
-          asm volatile("s_wait_dscnt 0x0" ::: "memory");
-          if (i < n) {
-            const int p = __builtin_amdgcn_readlane(pe, i);
-            const int dpe = MORI_PUSH_LOCAL       ? args.rank
-                            : MORI_PUSH_FORCEPEER ? (args.rank + 1) % kCfg.worldSize
-                                                  : p;
-            unsigned char* const dst = reinterpret_cast<unsigned char*>(
-                                           wBase + (uint64_t)dpe * wStride + pargs.offCombPush) +
-                                       myColB + (size_t)(r0 + i) * kSlotB;
-            TdmIssueStore<int, 0, 0, MORI_PUSH_TDMCPOL>(
-                reinterpret_cast<int*>(dst), reinterpret_cast<int*>(tile + (size_t)i * kWireB),
-                TdmShape<int>(kWireDw));
-            for (int q = 0; q < npes; ++q) rowsTo[q] += (p == q) ? 1 : 0;
-          }
-        }
-        MORI_TRACE_NEXT(seq, EpPushSlot::StoreWait);
-        __builtin_amdgcn_s_wait_tensorcnt(0);
-        return r0 + stride < tot;
-      }
-      if constexpr (MORI_PUSH_QUANT) {
-        if constexpr (MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(kRing - 1);
-        if constexpr (MORI_PUSH_SPECSTRIDE && MORI_PUSH_QTDM)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, C, (size_t)rowStep * kTokB, true, true, tot,
-                        r0, rowStep, false, nullptr, false, true);
-        else if constexpr (MORI_PUSH_SPECSTRIDE && MORI_PUSH_QPRE)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, C, (size_t)rowStep * kTokB, true, true, tot,
-                        r0, rowStep, true, pre);
-        else if constexpr (MORI_PUSH_SPECSTRIDE)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, C, (size_t)rowStep * kTokB, true, true, tot,
-                        r0, rowStep);
-        else if constexpr (MORI_PUSH_QTDM)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, cnt, (size_t)kTokB, true, false, 0, 0, 0,
-                        false, nullptr, false, true);
-        else if constexpr (MORI_PUSH_SPECMIX == 1 && !MORI_PUSH_QROWS && MORI_PUSH_QPRE)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, cnt, (size_t)kTokB, true, false, 0, 0, 0,
-                        true, pre, MORI_PUSH_QNEXT);
-        else if constexpr (MORI_PUSH_SPECMIX == 2)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, C, cnt == C ? (size_t)kTokB : 0);
-        else if constexpr (MORI_PUSH_SPECMIX == 3)
-          cnt == C ? pushQuantRows(tl, src + (size_t)rl * kTokB, C)
-                   : pushQuantRows(tl, src + (size_t)rl * kTokB, cnt, (size_t)kTokB, true);
-        else if constexpr (MORI_PUSH_SPECMIX && !MORI_PUSH_QROWS)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, cnt, (size_t)kTokB, true);
-        else if (!MORI_PUSH_SPECMIX || cnt == C)
-          pushQuantRows(tl, src + (size_t)rl * kTokB, C);
-        else
-          pushQuantRows(tl, src + (size_t)rl * kTokB, 1);
-        asm volatile("s_wait_dscnt 0x0" ::: "memory");
-      }
-      int n = min(cnt, tot - r0);
-      if constexpr (MORI_PUSH_SPECSTRIDE) {
-        n = 0;
-#pragma unroll
-        for (int i = 0; i < C; ++i) n += r0 + i * rowStep < tot ? 1 : 0;
-      }
-      const int pe = (laneId < n) ? slot / kCfg.maxTokPerRank : -1;
-      if constexpr (!MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(0);
-      bool send = true;
-      if constexpr (MORI_PUSH_STOPAT == 3) {
-        if (pe < -1) *args.totalRecvTokenNum = 0;
-        send = false;
-      }
-      if constexpr (MORI_PUSH_ONLYWARPS > 0) send = send && globalWarpId < MORI_PUSH_ONLYWARPS;
-      if (send)
-        sendTile(
-            tl, r0, n, pe,
-            [&](int p) {
-              return reinterpret_cast<unsigned char*>(wBase + (uint64_t)p * wStride +
-                                                      pargs.offCombPush);
-            },
-            [](int v, int i) { return __builtin_amdgcn_readlane(v, i); }, rowStep);
-      return r0 + stride < tot;
-    };
-    const int runId = MORI_PUSH_SPREAD ? warpId * nbRows + (int)blockIdx.x : globalWarpId;
-    const int cnt = MORI_PUSH_SPECMIX && warpId >= kMixHi ? 1 : C;
-    int r0 = MORI_PUSH_SPECMIX ? (int)blockIdx.x * kMixR +
-                                     (warpId < kMixHi ? warpId * C : kMixHi * C + warpId - kMixHi)
-             : MORI_PUSH_SPECSTRIDE ? runId
-                                    : runId * C;
-    if constexpr (MORI_PUSH_HWID) {
-      const unsigned hw = __builtin_amdgcn_s_getreg(23 | (31 << 11));
-      if (args.rank == 0 && blockIdx.x < 2 && laneId == 0)
-        printf("[HWID] b=%d w=%d simd=%u slot=%u wgp=%u raw=0x%08x\n", (int)blockIdx.x, warpId,
-               (hw >> 8) & 3u, hw & 31u, (hw >> 10) & 15u, hw);
-    }
-    if constexpr (MORI_PUSH_SEGSTORE) {
-      static_assert(MORI_PUSH_SPECMIX == 1 && !MORI_PUSH_QROWS && !MORI_PUSH_QPRE &&
-                        !MORI_PUSH_QNEXT && C == 2 && !MORI_PUSH_TDEFER && !MORI_PUSH_ROWSTORE &&
-                        !MORI_PUSH_STORE2D && MORI_PUSH_STOPAT > 3 && kMixR <= WS &&
-                        kSlotB == kWireB,
-                    "MORI_PUSH_SEGSTORE: SPECMIX=1, one lane per row of the block");
-      constexpr int kHalfB = kTokB / 2;
-      constexpr int kOutB = kMixR * kWireB;
-      static_assert(
-          kOutB + kCfg.warpPerBlock * kHalfB + kMixR * 4 <= kCfg.warpPerBlock * kCap * kWireB,
-          "MORI_PUSH_SEGSTORE: rows, half-row staging and counters within the tiles");
-      unsigned char* const outB = reinterpret_cast<unsigned char*>(sharedMem);
-      unsigned char* const stg = outB + kOutB + (size_t)warpId * kHalfB;
-      int* const segCnt = reinterpret_cast<int*>(outB + kOutB + kCfg.warpPerBlock * kHalfB);
-      const int jw = warpId < kMixHi ? warpId * C : kMixHi * C + warpId - kMixHi;
-      const int cntw = warpId < kMixHi ? C : 1;
-      const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
-      for (int base = (int)blockIdx.x * kMixR;; base += stride) {
-        const int rl = min(base + jw, kMaxRecv - cntw);
-        if constexpr (MORI_PUSH_QTDM)
-          TdmIssueLoad<int>(reinterpret_cast<int*>(stg),
-                            reinterpret_cast<const int*>(src + (size_t)rl * kTokB),
-                            TdmShape<int>(kHalfB / 4));
-        char* const wBase = wd->winBase;
-        const uint64_t wStride = (uint64_t)wd->stride4G << 32;
-        const int* const map = reinterpret_cast<const int*>(
-            wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
-        const int slotJ = map[min(base + laneId, kMaxRecv - 1)];
-        const int tot = args.totalRecvTokenNum[0];
-        if constexpr (MORI_PUSH_SEGSTORE == 1) {
-          if (warpId == 0 && laneId < kMixR) segCnt[laneId] = 0;
-          __syncthreads();
-        }
-        if constexpr (MORI_PUSH_QTDM)
-          pushQuantRows(outB + (size_t)jw * kWireB, src + (size_t)rl * kTokB, cntw, (size_t)kTokB,
-                        true, false, 0, 0, 0, false, nullptr, false, 2, stg);
-        else
-          pushQuantRows(outB + (size_t)jw * kWireB, src + (size_t)rl * kTokB, cntw, (size_t)kTokB,
-                        true);
-        asm volatile("s_wait_dscnt 0x0" ::: "memory");
-        const int nv = max(0, min(kMixR, tot - base));
-        const int peJ = laneId < nv ? slotJ / kCfg.maxTokPerRank : -1;
-        const int peUp = __shfl_up(peJ, 1);
-        const unsigned long long starts = __ballot(laneId < nv && (laneId == 0 || peJ != peUp));
-        for (int k = 0; k < cntw && MORI_PUSH_SEGSTORE == 2; ++k) {
-          const int jr = jw + k;
-          if (jr >= nv) break;
-          const int p = __builtin_amdgcn_readlane(peJ, jr);
-          const bool join =
-              k + 1 < cntw && jr + 1 < nv && __builtin_amdgcn_readlane(peJ, jr + 1) == p;
-          const int n2 = join ? 2 : 1;
-          const int dpe = MORI_PUSH_LOCAL ? args.rank : p;
-          unsigned char* const dst = reinterpret_cast<unsigned char*>(
-                                         wBase + (uint64_t)dpe * wStride + pargs.offCombPush) +
-                                     myColB + (size_t)(base + jr) * kSlotB;
-          TdmIssueStore<int, 0, 0, MORI_PUSH_TDMCPOL>(
-              reinterpret_cast<int*>(dst), reinterpret_cast<int*>(outB + (size_t)jr * kWireB),
-              TdmShape<int>(n2 * kWireDw));
-          for (int q = 0; q < npes; ++q) rowsTo[q] += (p == q) ? n2 : 0;
-          k += n2 - 1;
-        }
-        for (int k = 0; k < cntw && MORI_PUSH_SEGSTORE == 1; ++k) {
-          const int jr = jw + k;
-          if (jr >= nv) break;
-          const unsigned long long below = starts & ((2ull << jr) - 1);
-          const int s0 = 63 - __clzll((long long)below);
-          const unsigned long long above = starts >> (jr + 1);
-          const int e0 = above ? jr + __ffsll((long long)above) : nv;
-          int old = 0;
-          if (laneId == 0) old = atomicAdd(&segCnt[s0], 1);
-          old = __shfl(old, 0);
-          if (old + 1 == e0 - s0) {
-            const int p = __builtin_amdgcn_readlane(peJ, s0);
-            const int dpe = MORI_PUSH_LOCAL       ? args.rank
-                            : MORI_PUSH_FORCEPEER ? (args.rank + 1) % kCfg.worldSize
-                                                  : p;
-            unsigned char* const dst = reinterpret_cast<unsigned char*>(
-                                           wBase + (uint64_t)dpe * wStride + pargs.offCombPush) +
-                                       myColB + (size_t)(base + s0) * kSlotB;
-            TdmIssueStore<int, 0, 0, MORI_PUSH_TDMCPOL>(
-                reinterpret_cast<int*>(dst), reinterpret_cast<int*>(outB + (size_t)s0 * kWireB),
-                TdmShape<int>((e0 - s0) * kWireDw));
-            for (int q = 0; q < npes; ++q) rowsTo[q] += (p == q) ? (e0 - s0) : 0;
-          }
-        }
-        __builtin_amdgcn_s_wait_tensorcnt(0);
-        if (base + stride >= tot) break;
-        __syncthreads();
-      }
-    } else {
-      if (!MORI_PUSH_SPREADX || (int)blockIdx.x < nbRows) {
-        bool more = specRun(r0, cnt);
-        for (r0 += stride; more; r0 += stride) more = specRun(r0, cnt);
-      }
-    }
-    if constexpr (MORI_PUSH_TDEFER) __builtin_amdgcn_s_wait_tensorcnt(0);
-  }
-
-  for (int r0 = s0; r0 < s1 && !MORI_PUSH_SPEC; r0 += kCap) {
-    const int n = min(kCap, s1 - r0);
-    MORI_TRACE_NEXT(seq, EpPushSlot::Meta);
-    const int pe = (laneId < n) ? recvToSrc[r0 + laneId] / kCfg.maxTokPerRank : -1;
-    if constexpr (MORI_PUSH_STOPAT == 2) {
-      if (pe < -1) *args.totalRecvTokenNum = 0;
-      continue;
-    }
-
+  constexpr int C = 2;
+  static_assert(C <= kCap && kMaxRecv % C == 0, "a run must fit the tile and tile kMaxRecv");
+  static_assert(kCap * kWireB >= kWireB + kTokB, "a bf16 row must fit behind the first wire row");
+  static_assert(kCfg.blockNum >= 2, "the last block only receives");
+  const int nbRows = (int)gridDim.x - 1;
+  const int stride = nbRows * kCfg.warpPerBlock * C;
+  const int rowStep = nbRows * kCfg.warpPerBlock;
+  auto specRun = [&](int r0) {
+    const int rl = min(r0, kMaxRecv - 1);
+    asm volatile("" ::"s"(win), "s"(args.totalRecvTokenNum), "s"(args.offRecvToSrc),
+                 "s"(pargs.offCombPush));
+    TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kWireB),
+                      reinterpret_cast<const int*>(src + (size_t)rl * kTokB),
+                      TdmShape<int>((int)(kTokB / 4)));
     MORI_TRACE_NEXT(seq, EpPushSlot::Load);
-    if constexpr (MORI_PUSH_QUANT) {
-      pushQuantRows(tile, src + (size_t)r0 * kTokB, n);
-      asm volatile("s_wait_dscnt 0x0" ::: "memory");
-    } else if constexpr (!MORI_PUSH_NOLOAD) {
-      TdmIssueLoad<int>(reinterpret_cast<int*>(tile),
-                        reinterpret_cast<const int*>(src + (size_t)r0 * kTokB),
-                        TdmShapeGather<int>(kWireDw, n, kTokDw));
-      __builtin_amdgcn_s_wait_tensorcnt(0);
-    }
-    if constexpr (MORI_PUSH_STOPAT == 3) continue;
-    if constexpr (MORI_PUSH_ONLYWARPS > 0) {
-      if (globalWarpId >= MORI_PUSH_ONLYWARPS) continue;
-    }
-    if constexpr (MORI_PUSH_DATASEEN) {
-      if (laneId < n)
-        *reinterpret_cast<unsigned*>(tile + (size_t)laneId * kWireB + kWireB - 4) = kEpPushSeenTag;
-      asm volatile("s_wait_dscnt 0x0" ::: "memory");
-    }
+    MORI_TRACE_NEXT(seq, EpPushSlot::Meta);
+    const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
+    char* const wBase = wd->winBase;
+    const uint64_t wStride = (uint64_t)wd->stride4G << 32;
+    const int* const map =
+        reinterpret_cast<const int*>(wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
+    const int slot = map[min(rl + (laneId < C ? laneId : 0) * rowStep, kMaxRecv - 1)];
+    const int tot = args.totalRecvTokenNum[0];
+    __builtin_amdgcn_sched_barrier(0);
+    pushQuantRows(tile, src + (size_t)rl * kTokB, C, (size_t)rowStep * kTokB, tot, r0, rowStep);
+    asm volatile("s_wait_dscnt 0x0" ::: "memory");
+    int n = 0;
+#pragma unroll
+    for (int i = 0; i < C; ++i) n += r0 + i * rowStep < tot ? 1 : 0;
+    const int pe = (laneId < n) ? slot / kCfg.maxTokPerRank : -1;
+    __builtin_amdgcn_s_wait_tensorcnt(0);
     sendTile(
-        tile, r0, n, pe, [&](int p) { return EpPeer<unsigned char>(win, p, pargs.offCombPush); },
-        [](int v, int i) { return __shfl(v, i); });
+        tile, r0, n, pe,
+        [&](int p) {
+          return reinterpret_cast<unsigned char*>(wBase + (uint64_t)p * wStride +
+                                                  pargs.offCombPush);
+        },
+        [](int v, int i) { return __builtin_amdgcn_readlane(v, i); }, rowStep);
+    return r0 + stride < tot;
+  };
+  if ((int)blockIdx.x < nbRows) {
+    int r0 = warpId * nbRows + (int)blockIdx.x;
+    bool more = specRun(r0);
+    for (r0 += stride; more; r0 += stride) more = specRun(r0);
   }
 
-  if constexpr (MORI_PUSH_SIGNAL >= 2) {
-    constexpr int kTilesB = kCfg.warpPerBlock * kCap * kWireB;
-    static_assert(EpCombine1250xLdsBudget - kTilesB >= kCfg.warpPerBlock * npes * 4,
-                  "the per-warp row counts must fit in the LDS the tiles leave free");
-    int* const wrows = reinterpret_cast<int*>(sharedMem + kTilesB);
-    MORI_TRACE_NEXT(seq, EpPushSlot::Signal);
-    int mine = 0;
-    for (int q = 0; q < npes; ++q) mine = (laneId == q) ? rowsTo[q] : mine;
-    if (laneId < npes) wrows[warpId * npes + laneId] = mine;
-    __syncthreads();
-    if ((int)threadIdx.x < npes) {
-      int sum = 0;
-      for (int w = 0; w < kCfg.warpPerBlock; ++w) sum += wrows[w * npes + threadIdx.x];
-      if constexpr (MORI_PUSH_SIGFENCE)
-        __threadfence_system();
-      else
-        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      __hip_atomic_store(EpPeer<unsigned>(win, threadIdx.x, pargs.offCombPushSig) + kSlot0Dw +
-                             (args.rank * kEpPushSigBlocks + blockIdx.x) * kEpPushSigSlotDw,
-                         (unsigned)(sum + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
+  constexpr int kTilesB = kCfg.warpPerBlock * kCap * kWireB;
+  static_assert(EpCombine1250xLdsBudget - kTilesB >= kCfg.warpPerBlock * npes * 4,
+                "the per-warp row counts must fit in the LDS the tiles leave free");
+  int* const wrows = reinterpret_cast<int*>(sharedMem + kTilesB);
+  MORI_TRACE_NEXT(seq, EpPushSlot::Signal);
+  int mine = 0;
+  for (int q = 0; q < npes; ++q) mine = (laneId == q) ? rowsTo[q] : mine;
+  if (laneId < npes) wrows[warpId * npes + laneId] = mine;
+  __syncthreads();
+  if ((int)threadIdx.x < npes) {
+    int sum = 0;
+    for (int w = 0; w < kCfg.warpPerBlock; ++w) sum += wrows[w * npes + threadIdx.x];
+    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(EpPeer<unsigned>(win, threadIdx.x, pargs.offCombPushSig) + kSlot0Dw +
+                           (args.rank * kEpPushSigBlocks + blockIdx.x) * kEpPushSigSlotDw,
+                       (unsigned)(sum + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
   }
 
   EpPushRItem rFirst{};
-  if constexpr (MORI_PUSH_RPRE) {
-    if (globalWarpId < nItems) rFirst = reducePrep(globalWarpId);
-  }
+  if (globalWarpId < nItems) rFirst = reducePrep(globalWarpId);
 
-  if constexpr (MORI_PUSH_SIGNAL || MORI_PUSH_DATASEEN) {
-    if (blockIdx.x == gridDim.x - 1) {
-      constexpr bool kNeedList = MORI_PUSH_SIGNAL == 1 || MORI_PUSH_DATASEEN;
-      int timedOut = 0;
-      int nl = 0;
-      int expect = 0;
-      unsigned* const list = reinterpret_cast<unsigned*>(sharedMem) + 64;
-      if constexpr (kNeedList) {
-        __syncthreads();
-        int* const blk =
-            reinterpret_cast<int*>(sharedMem);
-        constexpr int kListCap = (EpCombine1250xLdsBudget - 256) / 4;
-        constexpr int kEntPer = 8;
-        if ((int)threadIdx.x <= npes) blk[threadIdx.x] = 0;
-        const int nEnt = args.numTokens * topk;
-        timedOut |= nEnt > kEntPer * (int)blockDim.x ? 16 : 0;
-        int fv[kEntPer];
-#pragma unroll
-        for (int j = 0; j < kEntPer; ++j) {
-          const int e = (int)threadIdx.x + j * (int)blockDim.x;
-          fv[j] = e < nEnt ? args.dispDestTokIdMap[e] : -1;
-        }
-        __syncthreads();
-        int cnt[npes];
-        for (int q = 0; q < npes; ++q) cnt[q] = 0;
-#pragma unroll
-        for (int j = 0; j < kEntPer; ++j) {
-          const int f = fv[j];
-          const bool ok = f >= 0 && f < npes * kMaxRecv;
-          const int q = ok ? f / kMaxRecv : -1;
-          for (int r = 0; r < npes; ++r) cnt[r] += (q == r) ? 1 : 0;
-          const unsigned long long m = __ballot(ok);
-          int base = 0;
-          if (laneId == 0 && m) base = atomicAdd(&blk[npes], __popcll(m));
-          base = __shfl(base, 0);
-          if (ok) {
-            const int pos = base + __popcll(m & ((1ull << laneId) - 1ull));
-            if (pos < kListCap) list[pos] = (unsigned)f;
-          }
-        }
-        for (int r = 0; r < npes; ++r) {
-          int v = cnt[r];
-          for (int off = WS / 2; off > 0; off >>= 1) v += __shfl_xor(v, off);
-          if (laneId == 0 && v) atomicAdd(&blk[r], v);
-        }
-        __syncthreads();
-        nl = min(blk[npes], kListCap);
-        expect = laneId < npes ? blk[laneId] : 0;
-      }
-      if constexpr (MORI_PUSH_DATASEEN) {
-        constexpr int kDataPer = 8;
-        const int dt = MORI_PUSH_SIGNAL == 2 ? (int)threadIdx.x - WS : (int)threadIdx.x;
-        const int dn = MORI_PUSH_SIGNAL == 2 ? (int)blockDim.x - WS : (int)blockDim.x;
-        timedOut |= nl > kDataPer * dn ? 8 : 0;
-        if (dt >= 0) {
-          MORI_TRACE_NEXT(seq, EpPushSlot::DataPoll);
-          unsigned char* const land = EpLocal<unsigned char>(win, pargs.offCombPush);
-          unsigned* w[kDataPer];
-          int sq[kDataPer];
-          unsigned has = 0;
-#pragma unroll
-          for (int j = 0; j < kDataPer; ++j) {
-            const int q = dt + j * dn;
-            const unsigned f = q < nl ? list[q] : (unsigned)q % (unsigned)(npes * kMaxRecv);
-            sq[j] = q < nl ? (int)(f / kMaxRecv) : -1;
-            w[j] = reinterpret_cast<unsigned*>(land + (size_t)f * kSlotB + kWireB - 4);
-            has |= sq[j] >= 0 ? 1u << sq[j] : 0u;
-          }
-          unsigned left = EpWarpOrBits<npes>(has);
-          for (int spin = 0; left && spin < MORI_PUSH_MAXSPIN; ++spin) {
-            unsigned v[kDataPer];
-#pragma unroll
-            for (int j = 0; j < kDataPer; ++j)
-              v[j] = __hip_atomic_load(w[j], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-            unsigned miss = 0;
-#pragma unroll
-            for (int j = 0; j < kDataPer; ++j)
-              miss |= sq[j] >= 0 && v[j] != kEpPushSeenTag ? 1u << sq[j] : 0u;
-            const unsigned still = EpWarpOrBits<npes>(miss);
-            IF_ENABLE_PROFILER(
-                for (int s = 0; s < npes; ++s) if (((left & ~still) >> s) & 1u)
-                    profiler.log(static_cast<EpPushSlot>((int)EpPushSlot::DataSrc0 + s),
-                                 ::mori::core::profiler::EventType::INSTANT););
-            left &= still;
-          }
-          timedOut |= left ? 1 : 0;
-#pragma unroll
-          for (int j = 0; j < kDataPer; ++j)
-            if (sq[j] >= 0)
-              __hip_atomic_store(w[j], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        }
-      }
-      if constexpr (MORI_PUSH_SIGNAL >= 2) {
-        unsigned* const slots = sigLocal + kSlot0Dw;
-        const int nb = (int)gridDim.x;
-        constexpr int kPollB =
-            MORI_PUSH_POLLFIT ? (kCfg.blockNum + WS - 1) / WS * WS : kEpPushSigBlocks;
-        static_assert(kPollB % WS == 0 && kPollB <= kEpPushSigBlocks,
-                      "a load of WS slots must stay in one source");
-        constexpr int kPollW = MORI_PUSH_POLLSPLIT ? npes : 1;
-        static_assert(kPollW <= kCfg.warpPerBlock, "a polling warp per source");
-        constexpr int kSrcW = npes / kPollW;
-        constexpr int kPer = kSrcW * kPollB / WS;
-        const int s0 = warpId * kSrcW;
-        auto slotAt = [&](int i) {
-          return slots +
-                 ((s0 + (i * WS) / kPollB) * kEpPushSigBlocks + (i * WS) % kPollB + laneId) *
-                     kEpPushSigSlotDw;
-        };
-        if (warpId < kPollW) {
-          MORI_TRACE_NEXT(seq, EpPushSlot::SigPoll);
-          unsigned left = ((1u << kSrcW) - 1u) << s0;
-          for (int spin = 0; left && spin < MORI_PUSH_MAXSPIN; ++spin) {
-            unsigned v[kPer];
-#pragma unroll
-            for (int i = 0; i < kPer; ++i)
-              v[i] = __hip_atomic_load(slotAt(i), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-            unsigned miss = 0;
-#pragma unroll
-            for (int i = 0; i < kPer; ++i)
-              miss |=
-                  v[i] == 0u && (i * WS) % kPollB + laneId < nb ? 1u << (s0 + i * WS / kPollB) : 0u;
-            const unsigned still = EpWarpOrBits<npes>(miss);
-            IF_ENABLE_PROFILER(
-                for (int s = 0; s < npes; ++s) if (((left & ~still) >> s) & 1u)
-                    profiler.log(static_cast<EpPushSlot>((int)EpPushSlot::SigSrc0 + s),
-                                 ::mori::core::profiler::EventType::INSTANT););
-            left &= still;
-          }
-          timedOut |= left ? 2 : 0;
-        }
-        auto release = [&]() {
-          if constexpr (MORI_PUSH_SIGNAL == 3) {
-            __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-            for (int b = laneId; b < nb - 1; b += WS)
-              __hip_atomic_store(sigLocal + kGo0Dw + b * kEpPushSigSlotDw, 1u, __ATOMIC_RELAXED,
-                                 __HIP_MEMORY_SCOPE_SYSTEM);
-          }
-        };
-        auto zeroSlots = [&]() {
-          if constexpr (MORI_PUSH_NOZERO) return;
-#pragma unroll
-          for (int i = 0; i < kPer; ++i)
-            if ((i * WS) % kPollB + laneId < nb)
-              __hip_atomic_store(slotAt(i), 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        };
-        if constexpr (MORI_PUSH_POLLSPLIT) {
-          __syncthreads();
-          if (warpId == 0) release();
-          if (warpId < kPollW) zeroSlots();
-        } else if (warpId == 0) {
-          if constexpr (MORI_PUSH_GOFIRST) release();
-          zeroSlots();
-          if constexpr (!MORI_PUSH_GOFIRST) release();
-        }
-      }
-      if (MORI_PUSH_SIGNAL == 1 && warpId == 0) {
-        MORI_TRACE_NEXT(seq, EpPushSlot::SigPoll);
-        unsigned* const c = sigLocal + laneId * kSigDw;
-        bool pending = true;
-        for (int spin = 0; pending && spin < MORI_PUSH_MAXSPIN; ++spin) {
-          const int miss =
-              laneId < npes &&
-              __hip_atomic_load(c, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < (unsigned)expect;
-          pending = __any(miss);
-        }
-        timedOut |= pending ? 4 : 0;
-        if (laneId < npes) __hip_atomic_store(c, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      }
-      IF_ENABLE_PROFILER(if (timedOut) profiler.log(EpPushSlot::Timeout,
-                                                    ::mori::core::profiler::EventType::INSTANT););
-      if (timedOut < -1) *args.totalRecvTokenNum = 0;
-    }
-  }
-
-  if constexpr (MORI_PUSH_SIGNAL == 3) {
-    unsigned* const g = sigLocal + kGo0Dw + blockIdx.x * kEpPushSigSlotDw;
+  if (blockIdx.x == gridDim.x - 1) {
+    int timedOut = 0;
+    unsigned* const slots = sigLocal + kSlot0Dw;
+    const int nb = (int)gridDim.x;
+    constexpr int kPollB = (kCfg.blockNum + WS - 1) / WS * WS;
+    static_assert(kPollB <= kEpPushSigBlocks, "a report slot per combine block");
+    constexpr int kPer = npes * kPollB / WS;
+    const int s0 = warpId * npes;
+    auto slotAt = [&](int i) {
+      return slots + ((s0 + (i * WS) / kPollB) * kEpPushSigBlocks + (i * WS) % kPollB + laneId) *
+                         kEpPushSigSlotDw;
+    };
     if (warpId == 0) {
-      int timedOut = 0;
-      if (blockIdx.x != gridDim.x - 1) {
-        MORI_TRACE_NEXT(seq, EpPushSlot::GoPoll);
-        bool pending = true;
-        for (int spin = 0; pending && spin < MORI_PUSH_MAXSPIN; ++spin)
-          pending = __hip_atomic_load(g, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0u;
-        timedOut = pending ? 32 : 0;
-        if constexpr (!MORI_PUSH_GOFAST)
-          if (laneId == 0) __hip_atomic_store(g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      MORI_TRACE_NEXT(seq, EpPushSlot::SigPoll);
+      unsigned left = ((1u << npes) - 1u) << s0;
+      for (int spin = 0; left && spin < kMaxSpin; ++spin) {
+        unsigned v[kPer];
+#pragma unroll
+        for (int i = 0; i < kPer; ++i)
+          v[i] = __hip_atomic_load(slotAt(i), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        unsigned miss = 0;
+#pragma unroll
+        for (int i = 0; i < kPer; ++i)
+          miss |= v[i] == 0u && (i * WS) % kPollB + laneId < nb ? 1u << (s0 + i * WS / kPollB) : 0u;
+        const unsigned still = EpWarpOrBits<npes>(miss);
+        IF_ENABLE_PROFILER(for (int s = 0; s < npes; ++s) if (((left & ~still) >> s) & 1u)
+                               profiler.log(static_cast<EpPushSlot>((int)EpPushSlot::SigSrc0 + s),
+                                            ::mori::core::profiler::EventType::INSTANT););
+        left &= still;
       }
-      if constexpr (MORI_PUSH_GOFAST) {
-        asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
-      } else {
-        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-      }
-      IF_ENABLE_PROFILER(if (timedOut) profiler.log(EpPushSlot::Timeout,
-                                                    ::mori::core::profiler::EventType::INSTANT););
-      if (timedOut < -1) *args.totalRecvTokenNum = 0;
+      timedOut |= left ? 2 : 0;
     }
-    if constexpr (MORI_PUSH_GOFAST) {
-      __builtin_amdgcn_s_barrier();
-      if (warpId == 0 && laneId == 0 && blockIdx.x != gridDim.x - 1)
-        __hip_atomic_store(g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    } else {
-      __syncthreads();
+    if (warpId == 0) {
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      for (int b = laneId; b < nb - 1; b += WS)
+        __hip_atomic_store(sigLocal + kGo0Dw + b * kEpPushSigSlotDw, 1u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+#pragma unroll
+      for (int i = 0; i < kPer; ++i)
+        if ((i * WS) % kPollB + laneId < nb)
+          __hip_atomic_store(slotAt(i), 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
-    MORI_TRACE_NEXT(seq, EpPushSlot::Reduce);
-    if constexpr (MORI_PUSH_RPRE) {
-      if (globalWarpId < nItems) reduceItem(rFirst);
-      for (int it = globalWarpId + globalWarpNum; it < nItems; it += globalWarpNum)
-        reduceItem(reducePrep(it));
-    } else {
-      pushReduce();
-    }
+    IF_ENABLE_PROFILER(if (timedOut) profiler.log(EpPushSlot::Timeout,
+                                                  ::mori::core::profiler::EventType::INSTANT););
+    if (timedOut < -1) *args.totalRecvTokenNum = 0;
   }
+
+  unsigned* const g = sigLocal + kGo0Dw + blockIdx.x * kEpPushSigSlotDw;
+  if (warpId == 0) {
+    int timedOut = 0;
+    if (blockIdx.x != gridDim.x - 1) {
+      MORI_TRACE_NEXT(seq, EpPushSlot::GoPoll);
+      bool pending = true;
+      for (int spin = 0; pending && spin < kMaxSpin; ++spin)
+        pending = __hip_atomic_load(g, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0u;
+      timedOut = pending ? 32 : 0;
+    }
+    asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
+    IF_ENABLE_PROFILER(if (timedOut) profiler.log(EpPushSlot::Timeout,
+                                                  ::mori::core::profiler::EventType::INSTANT););
+    if (timedOut < -1) *args.totalRecvTokenNum = 0;
+  }
+  __builtin_amdgcn_s_barrier();
+  if (warpId == 0 && laneId == 0 && blockIdx.x != gridDim.x - 1)
+    __hip_atomic_store(g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  MORI_TRACE_NEXT(seq, EpPushSlot::Reduce);
+  if (globalWarpId < nItems) reduceItem(rFirst);
+  for (int it = globalWarpId + globalWarpNum; it < nItems; it += globalWarpNum)
+    reduceItem(reducePrep(it));
 }
 
 }  // namespace v2
