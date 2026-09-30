@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI GEMM + All-Reduce Benchmark &mdash; MORI development (78b7a5f3) documentation</title>
+  <title>MORI GEMM + All-Reduce Benchmark &mdash; MORI development (4af610cd) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=233aace2"></script>
+      <script src="_static/documentation_options.js?v=54458af0"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -645,12 +645,13 @@ evaluation, and the threshold derivations are in
 </section>
 <section id="running-the-benchmark">
 <h2>Running the benchmark<a class="headerlink" href="#running-the-benchmark" title="Link to this heading"></a></h2>
-<p>Needs a mori built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>. Setting <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code> in the
-environment only rebuilds the <em>device</em> bitcode – a host library built without
-the flag has no SDMA queues, every put silently does nothing, and the all-reduce
-quietly produces zeros.</p>
+<p>Needs a mori built with <code class="docutils literal notranslate"><span class="pre">BUILD_CCO_SDMA=ON</span></code>, which is the default – worth
+checking on an older image, because setting <code class="docutils literal notranslate"><span class="pre">MORI_ENABLE_SDMA</span></code> does not make up
+for it: that only rebuilds the <em>device</em> bitcode, and a host library built
+without the flag has no SDMA queues, so every put silently does nothing and the
+all-reduce quietly produces zeros.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>/path/to/mori
-<span class="nv">BUILD_CCO_SDMA</span><span class="o">=</span>ON<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>.
+pip<span class="w"> </span>install<span class="w"> </span>.
 
 <span class="c1"># DeepSeek-V4-Pro, TP8</span>
 <span class="nv">MORI_ENABLE_SDMA</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">MORI_SOCKET_IFNAME</span><span class="o">=</span>lo<span class="w"> </span><span class="se">\</span>
@@ -892,7 +893,7 @@ regression</strong> that did not exist.</p>
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-09-24.
+      <span class="lastupdated">Last updated on 2026-09-30.
       </span></p>
   </div>
 
