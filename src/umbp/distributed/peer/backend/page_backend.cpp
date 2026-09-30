@@ -325,7 +325,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
     opts.require_numa_binding = !nodes.empty() && opts_.numa_strict;
     opts.prefault = opts_.prefault;
     opts.prefault_threads = std::max(1, thread_budget / buffer_workers);
-    opts.interleave_prefault = nodes.empty();
+    opts.spread_prefault_across_nodes = nodes.empty();
     if (!nodes.empty()) {
       MORI_UMBP_INFO(
           "[HostPageMemorySource] tier layout (target): buffer={} node={} bytes={} policy={} "

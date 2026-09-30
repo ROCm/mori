@@ -295,12 +295,12 @@ double NodeMemFreeGiB(int node) {
   return 0;
 }
 
-// Worker i of an interleaved prefault runs on node i % N, so on a two-node host
-// the four 80 MiB chunks of this mapping alternate between the nodes.  First
+// Worker i of a spread prefault runs on node i % N, so on a two-node host the
+// four 80 MiB chunks of this mapping alternate between the nodes.  First
 // touch falls back to the other node when the local one is near its watermark
 // (zone_reclaim_mode=0), so a host full of page cache cannot judge placement.
-void TestInterleavedPrefaultSplitsUnboundPagesEvenly() {
-  std::printf("  InterleavedPrefaultSplitsUnboundPagesEvenly...\n");
+void TestSpreadPrefaultSplitsUnboundPagesEvenly() {
+  std::printf("  SpreadPrefaultSplitsUnboundPagesEvenly...\n");
   if (CountNodesWithAllowedCpus() != 2) {
     std::printf("    SKIPPED (needs exactly two NUMA nodes this process may run on)\n");
     return;
@@ -314,7 +314,7 @@ void TestInterleavedPrefaultSplitsUnboundPagesEvenly() {
   opts.prefault = true;
   // An odd budget: alternating five workers would put three chunks on one node.
   opts.prefault_threads = 5;
-  opts.interleave_prefault = true;
+  opts.spread_prefault_across_nodes = true;
   constexpr size_t kBytes = 320ULL << 20;
   constexpr size_t kSamples = 256;
   auto handle = allocator.Alloc(kBytes, opts);
@@ -480,7 +480,7 @@ int main() {
   TestAnonymousHugetlbWhenAvailable();
   TestHugetlbFallsBackToAnonymous();
   TestNumaBindingActuallyBinds();
-  TestInterleavedPrefaultSplitsUnboundPagesEvenly();
+  TestSpreadPrefaultSplitsUnboundPagesEvenly();
   TestNumaFailureAndParallelPrefault();
   TestNullHandleAfterAllocFailure();
   TestMappedSizeRoundsUp();
