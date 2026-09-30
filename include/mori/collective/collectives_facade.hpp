@@ -218,7 +218,7 @@ class CollectivesFacade {
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
     reqs.sdmaQueueCount = 0; // Use the context's SDMA queue count
-    // RS per-slice counters [0..S-1] + AR broadcast counters
+    // Packed RS slice counter [kSliceSignalSlot] (slots 1..S-1 unused) + AR broadcast counters
     // [kRSPushMaxSlices .. 2*kRSPushMaxSlices-1] (kBcastSlot == kRSPushMaxSlices).
     reqs.sdmaSignalCount = 2 * kRSPushMaxSlices;
     int ret = mori::cco::ccoDevCommCreate(comm, &reqs, &facade.devComm_);
