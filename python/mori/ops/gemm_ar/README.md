@@ -162,11 +162,10 @@ stream rules apply to the result.
 to keep it. `pad_rows` returns a reused buffer with the same caveat. One
 instance is not usable concurrently.
 
-**Distinct M values.** Each M compiles its own kernel and takes its own counter
-set, capped by `max_shapes`. That defaults to *every* legal M under `m_max`
-(`m_max / (world_size * block_m)`), so the cap is not something a caller
-normally meets; a ninth distinct shape used to raise. Warm each M up once before
-capturing a graph.
+**Distinct plans.** Each padded-M/chunk plan compiles its own kernel and takes
+its own counter set, capped by `max_shapes`. The default reserves every legacy
+M under `m_max`, plus the fitted plans when enabled. Two logical M values with
+the same padding can need different counters. Warm each plan before graph capture.
 
 **Cleanup.** `close()` (or the `with` above) releases the window and its memory
 -- at the model shape about 700 MiB per rank. The communicator holds a strong
@@ -178,6 +177,41 @@ communicator. Synchronise first if anything may still be in flight.
 **dtype.** A and B must be `torch.float8_e4m3fn`. `float8_e4m3fnuz` is the same
 width but a different exponent bias, and the MMA atom implements OCP's, so it is
 rejected rather than silently returning a result 4x too large.
+
+**Optional `wo_b` schedule.** `schedule="wo_b"` selects the measured MI355X
+padding/chunk profile for Pro TP8 `(N=7168, K=2048, quant="blockscale")` and
+Flash TP4 `(N=5120, K=2048, quant="mxfp8")`. The default is `"default"`.
+Pass the original `logical_m` at launch; `padded_m()` does not save call state.
+For Flash, on a TP4 communicator with MXFP8 weights:
+
+```python
+from mori.ops.gemm_ar import preshuffle_a_scale
+
+settings = dict(n=5120, k=2048, m_max=16384, quant="mxfp8", schedule="wo_b")
+window_bytes = GemmAllReduceOp.window_bytes_for(world, **settings)
+# Use window_bytes when sizing the communicator's per_rank_vmm, then:
+b_shuffled = preshuffle_b(w_fp8)
+b_scale = w_exps.t().contiguous().to(torch.int32).reshape(-1)
+with GemmAllReduceOp(comm, **settings) as op:
+    logical_m = x.shape[0]
+    a_fp8, a_exps = quantize_mxfp8(op.pad_rows(x, op.padded_m(logical_m)))
+    out = op(a_fp8, b_shuffled, preshuffle_a_scale(a_exps), b_scale,
+             logical_m=logical_m)[:logical_m]
+    torch.cuda.synchronize()
+    out = out.clone()
+```
+
+For BF16 communication, Pro selects band2 at logical M=8200 and band1 at
+M=11264/13312; Flash selects align64/band1 at M=4200/8200 and band2 at
+M=11264. Other M, weight shapes and quantizations retain the legacy policy.
+This is a finite measured profile, not an interpolation rule.
+
+`scatter_dtype="fp8"` explicitly enables lossy scatter with separate reduction.
+On Flash TP4, the profile also selects align64/band1 at M=4200/8200 with BF16
+gather or `gather_dtype="fp8", gather_transport="lsa"`. Other FP8 combinations
+retain legacy scheduling. Pass identical settings to `window_bytes_for()` and
+the constructor. FP8 scatter retains BF16 staging; see the error measurements
+and limitations in the [follow-up results](#follow-up-experiments-2026-09-30).
 
 ### The GEMM without a collective
 
@@ -281,13 +315,19 @@ The first version launched 512 -- the quantize grid -- and lost to SDMA by 17%.
 # numerics
 BUILD_CCO_SDMA=ON MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
   pytest tests/python/cco/test_gemm_ar.py tests/python/cco/test_flydsl_ar.py \
-         tests/python/cco/test_gemm_ar_op.py
+         tests/python/cco/test_gemm_ar_op.py tests/python/cco/test_gemm_ar_schedule.py
 
 # the full mode comparison at the model's shape
 BUILD_CCO_SDMA=ON MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo python -m torch.distributed.run \
   --standalone --nproc_per_node=8 benchmark/cco/flydsl/gemm_ar/bench_gemm_ar.py \
   --mode fused-sdma --quant blockscale -m 16384 -n 7168 -k 2048
 ```
+
+The public `wo_b` regression is `tests/python/cco/gemm_ar_schedule_worker.py`:
+run with `torch.distributed.run --standalone --nproc_per_node=8` and
+`--quant blockscale`, or TP4 and `--quant mxfp8`. Add `--schedule default` for
+the legacy control, or `--scatter fp8 [--gather fp8]` for Flash's lossy paths.
+It checks mixed-M graphs, changed inputs, guards and actual FP8 wire semantics.
 
 Requires a mori built with `BUILD_CCO_SDMA=ON`. Setting `MORI_ENABLE_SDMA` in
 the environment only rebuilds the device bitcode -- a host library built without
@@ -321,8 +361,9 @@ are kept apart rather than averaged:
 ### Follow-up experiments (2026-09-30)
 
 The same two `wo_b` targets were evaluated on `v2-015` with isolated prototype
-modules; repository execution defaults are unchanged. All 27 experiment jobs
-and four strict finite-value rechecks passed their numerical/guard checks,
+modules. The positive joint profile and relaxed-row FP8 scatter are now
+available through the public op's opt-in settings above; defaults are unchanged.
+All 27 experiment jobs and four strict finite-value rechecks passed their numerical/guard checks,
 including post-graph output checks and mixed-M graph validations. Paired timings use 8 calls per graph and 21 replays:
 3 alternating rounds, or 5 for the independent Pro tail confirmations and
 macro-pipeline comparisons. No external GPU process was observed by the monitor.
@@ -335,7 +376,7 @@ macro-pipeline comparisons. No external GPU process was observed by the monitor.
 | BF16 pull gather | Both, M=4096/16384 | No win over SDMA with 16/24/32/64/128 blocks; retain the existing gather path |
 | Two macro partitions on two streams | Both, M=16384 | **10.1% slower** on Pro TP8 and **5.6% slower** on Flash TP4; serial splitting was already 8.5% / 4.0% slower |
 
-The joint-planner adapter selects only among measured points, with a 2% margin
+The joint profile selects only among measured points, with a 2% margin
 over baseline; this is not a general dispatch policy. Mixed-M, changed-input
 and cached-graph checks passed with fixed window offsets, disjoint plan slots
 and counter capacity 16 (the one-band Pro tails require 11/13 chunks).
@@ -352,6 +393,13 @@ monolithic GEMM launch. All timings exclude activation preparation and use equal
 backing capacities with logical tail guards, as in the 2026-09-29 retest.
 Prototype code, patches, paired results and reproduction commands are archived
 in [`gemm-ar-followup-20260930`](</workspace/reports/gemm-ar-followup-20260930/README.md>).
+
+Public integration was checked separately on `v2-015`: 65 host checks and all
+six TP8/TP4 public-op jobs passed, covering default/profile scheduling,
+changed-input graph replay, guards, self-test and both FP8 communication legs.
+The kernel timings above remain the prototype measurements; no new latency or
+model-quality claim is added. Integration logs and source hashes are in
+[`gemm-ar-integration-20260930`](</workspace/reports/gemm-ar-integration-20260930/README.md>).
 
 ### Target operator update (2026-09-29)
 
@@ -1522,12 +1570,12 @@ against a transfer that shrinks with M, so on the standalone all-reduce it is
 +2.4% at M=4096 and -11.2% at M=16384. Per phase at M=16384: quantize 12.4us,
 dequantize 88.2us, against ~218us saved on the push.
 
-The public operator's scatter leg remains BF16. A low-level FP8 scatter
-prototype now supports aligned fused-SDMA with separate reduction; it rejects
-relaxed rows, compact receive storage, direct LSA scatter and fused
-reduce/quantize or reduce-triggered gather. Its benefit depends on the target,
-and its additional quantization error needs separate evaluation; see the
-[target update](#target-operator-update-2026-09-29).
+The public operator defaults to BF16 scatter; `scatter_dtype="fp8"` opts into
+FP8 fused-SDMA with separate reduction, including the measured relaxed-row
+Flash plans. Compact receive storage, direct LSA scatter and fused
+reduce/quantize or reduce-triggered gather remain unsupported with FP8 scatter.
+Its additional quantization error needs separate evaluation; see the
+[follow-up results](#follow-up-experiments-2026-09-30).
 
 ### Firing the gather's puts from inside the reduce
 

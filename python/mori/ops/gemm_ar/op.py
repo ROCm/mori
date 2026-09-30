@@ -151,6 +151,77 @@ def counter_chunks(m_pad: int, world_size: int, block_m: int = DEFAULT_BLOCK_M) 
     return max(c for c in range(1, min(MAX_CHUNKS, bands) + 1) if bands % c == 0)
 
 
+class _RowPlan(NamedTuple):
+    """Physical rows and completion protocol; together they key the cache."""
+
+    m_pad: int
+    chunk_bands: int = 0
+    relaxed_rows: bool = False
+
+
+class _Schedule:
+    """Finite MI355X wo_b profile, with legacy dispatch for unmeasured inputs.
+
+    Keys are logical M, before padding/quantization. Never infer logical M from
+    the previous padded_m() call: preparation and graph replay can interleave.
+    """
+
+    def __init__(
+        self,
+        world_size,
+        n,
+        k,
+        block_m,
+        block_n,
+        quant,
+        schedule,
+        scatter_dtype,
+        gather_dtype,
+        gather_transport,
+    ):
+        if schedule not in ("default", "wo_b"):
+            raise ValueError(f"unknown schedule={schedule!r}; use 'default' or 'wo_b'")
+        self.world_size, self.block_m = world_size, block_m
+        self.overrides = {}
+        if schedule == "wo_b" and block_n == 256:
+            target = (world_size, n, k, block_m, quant)
+            bf16 = scatter_dtype == gather_dtype == "bf16"
+            if target == (8, 7168, 2048, 128, "blockscale") and bf16:
+                self.overrides = {
+                    8200: _RowPlan(9216, 2),
+                    11264: _RowPlan(11264, 1),
+                    13312: _RowPlan(13312, 1),
+                }
+            if target == (4, 5120, 2048, 256, "mxfp8"):
+                # Both FP8 wire combinations were measured with LSA gather;
+                # BF16 scatter + FP8 gather has no fitted joint profile.
+                fp8 = scatter_dtype == "fp8" and (
+                    gather_dtype == "bf16" or gather_transport == "lsa"
+                )
+                if bf16 or fp8:
+                    self.overrides = {
+                        4200: _RowPlan(4224, 1, True),
+                        8200: _RowPlan(8256, 1, True),
+                    }
+                    if bf16:
+                        self.overrides[11264] = _RowPlan(11264, 2)
+        self.counter_capacity = 16 if self.overrides else MAX_CHUNKS
+
+    def plan(self, m: int) -> _RowPlan:
+        if m < 1:
+            raise ValueError(f"M must be positive, got {m}")
+        return self.overrides.get(
+            m, _RowPlan(padded_m(m, self.world_size, self.block_m))
+        )
+
+    def max_shapes(self, capacity: int) -> int:
+        # Reserve the legacy M slots plus the fitted plans. In particular,
+        # logical 8200 and physical 9216 can use different chunk protocols.
+        return default_max_shapes(capacity, self.world_size, self.block_m) + sum(
+            p.m_pad <= capacity for p in self.overrides.values()
+        )
+
+
 def _tile_constraints(
     block_m: int, block_n: int, n_granule: int | None = None
 ) -> str | None:
@@ -229,6 +300,8 @@ def _build_cfg(
     shape_slots: int,
     shape_index: int,
     capacity_m: int = 0,
+    scatter_dtype: str = "bf16",
+    chunk_bands: int = 0,
 ) -> ArConfig:
     """The one place an ``ArConfig`` is built, so every caller agrees.
 
@@ -241,13 +314,18 @@ def _build_cfg(
         m=m_pad,
         n=n,
         recv_slots=world_size,
-        counter_chunks=counter_chunks(m_pad, world_size, block_m),
+        counter_chunks=(
+            (m_pad // world_size + block_m * chunk_bands - 1) // (block_m * chunk_bands)
+            if chunk_bands
+            else counter_chunks(m_pad, world_size, block_m)
+        ),
         counter_capacity=counter_capacity,
         counter_shape_slots=shape_slots,
         counter_shape_index=shape_index,
         capacity_m=capacity_m,
         gather_dtype=gather_dtype,
         gather_transport=gather_transport,
+        scatter_dtype=scatter_dtype,
     )
     cfg.validate()
     return cfg
@@ -264,6 +342,8 @@ def supports(
     gather_dtype: str = "bf16",
     gather_transport: str = "lsa",
     quant: str = "blockscale",
+    scatter_dtype: str = "bf16",
+    schedule: str = "default",
 ) -> bool:
     """Whether this shape is *expressible*, which is not whether it is faster.
 
@@ -287,14 +367,29 @@ def supports(
     if m <= 0 or _gemm_constraints(n, k, block_n, quant) is not None:
         return False
     try:
+        planner = _Schedule(
+            world_size,
+            n,
+            k,
+            block_m,
+            block_n,
+            quant,
+            schedule,
+            scatter_dtype,
+            gather_dtype,
+            gather_transport,
+        )
+        plan = planner.plan(m)
         _build_cfg(
             world_size=world_size,
-            m_pad=padded_m(m, world_size, block_m),
+            m_pad=plan.m_pad,
+            chunk_bands=plan.chunk_bands,
+            scatter_dtype=scatter_dtype,
             n=n,
             block_m=block_m,
             gather_dtype=gather_dtype,
             gather_transport=gather_transport,
-            counter_capacity=MAX_CHUNKS,
+            counter_capacity=planner.counter_capacity,
             shape_slots=default_max_shapes(
                 padded_m(m, world_size, block_m), world_size, block_m
             ),
@@ -502,6 +597,8 @@ class GemmAllReduceOp:
         gather_transport: str = "lsa",
         quant: str = "blockscale",
         max_shapes: int | None = None,
+        scatter_dtype: str = "bf16",
+        schedule: str = "default",
     ):
         # Cleanup state before anything can raise. The rollback below calls
         # close(), which clears these; initialising them after the try block
@@ -509,7 +606,7 @@ class GemmAllReduceOp:
         # masking the real error and skipping the handle release it exists for.
         self._closed = True  # so a failed constructor leaves close() a no-op
         self.mem = self.win = self.dev_comm = None
-        self._cache: dict[int, _Plan] = {}
+        self._cache: dict[_RowPlan, _Plan] = {}
         self._pad_in: torch.Tensor | None = None
 
         if quant not in QUANTS:
@@ -522,6 +619,10 @@ class GemmAllReduceOp:
         why = _quant_tile_constraint(quant, block_m)
         if why is not None:
             raise ValueError(why)
+        if scatter_dtype not in WIRE_DTYPES:
+            raise ValueError(
+                f"scatter_dtype={scatter_dtype!r} is not one of {WIRE_DTYPES}"
+            )
         if gather_dtype not in WIRE_DTYPES:
             raise ValueError(
                 f"gather_dtype={gather_dtype!r} is not one of {sorted(WIRE_DTYPES)}"
@@ -544,9 +645,23 @@ class GemmAllReduceOp:
                 f"m_max and sdma_queues must both be >= 1; got m_max={m_max} "
                 f"sdma_queues={sdma_queues}"
             )
+        if comm.nranks < 1:
+            raise ValueError("world_size must be positive")
+        self._schedule = _Schedule(
+            comm.nranks,
+            n,
+            k,
+            block_m,
+            block_n,
+            quant,
+            schedule,
+            scatter_dtype,
+            gather_dtype,
+            gather_transport,
+        )
         if max_shapes is None:
-            max_shapes = default_max_shapes(
-                padded_m(m_max, comm.nranks, block_m), comm.nranks, block_m
+            max_shapes = self._schedule.max_shapes(
+                padded_m(m_max, comm.nranks, block_m)
             )
         if max_shapes < 1:
             raise ValueError(f"max_shapes must be >= 1; got {max_shapes}")
@@ -566,6 +681,8 @@ class GemmAllReduceOp:
         #: It costs relL2 ~2.1e-2 against a bf16 wire that is exact -- e4m3's
         #: mantissa, not a tuning knob -- so it is off unless asked for.
         self.gather_dtype = gather_dtype
+        self.scatter_dtype = scatter_dtype
+        self.schedule = schedule
         #: Only meaningful with fp8. "lsa" pulls each peer's slice over xGMI and
         #: widens it on the way in -- one kernel instead of an SDMA push plus a
         #: dequantise, and it does not read the landed fp8 back out of HBM.
@@ -575,7 +692,7 @@ class GemmAllReduceOp:
         self.m_max = padded_m(m_max, self.world_size, block_m)
         #: Which counter set each M uses, assigned in first-seen order. The sets
         #: are disjoint, so two M values never elect on each other's residue.
-        self._shape_slot: dict[int, int] = {}
+        self._shape_slot: dict[_RowPlan, int] = {}
 
         self.window_bytes = self._make_cfg(self.m_max).window_bytes
         try:
@@ -612,37 +729,83 @@ class GemmAllReduceOp:
         *,
         m_max: int,
         n: int,
-        block_m: int = DEFAULT_BLOCK_M,
+        block_m: int | None = None,
         gather_dtype: str = "bf16",
         gather_transport: str = "lsa",
         max_shapes: int | None = None,
+        k: int | None = None,
+        quant: str = "blockscale",
+        scatter_dtype: str = "bf16",
+        schedule: str = "default",
     ) -> int:
-        """Symmetric-window bytes an op for this shape will allocate.
+        """Window bytes, using the same scheduling/capacity rules as the op.
 
-        Needed before the op exists: the window comes out of the communicator's
-        VMM reservation, so ``Communicator.init(per_rank_vmm=...)`` has to be
-        sized first. Same arithmetic the constructor uses.
+        Pass the constructor's quant, schedule and wire modes here too. ``k``
+        is required for a fitted schedule, since it identifies the target.
         """
+        if quant not in QUANTS:
+            raise ValueError(f"unknown quant={quant!r}")
+        if schedule != "default" and k is None:
+            raise ValueError("k is required for a non-default schedule")
+        block_m = _default_block_m(quant) if block_m is None else block_m
+        why = _tile_constraints(block_m, DEFAULT_BLOCK_N) or _quant_tile_constraint(
+            quant, block_m
+        )
+        if why is not None:
+            raise ValueError(why)
+        if world_size < 1 or m_max < 1 or (max_shapes is not None and max_shapes < 1):
+            raise ValueError("world_size, m_max and max_shapes must be positive")
+        planner = _Schedule(
+            world_size,
+            n,
+            k,
+            block_m,
+            DEFAULT_BLOCK_N,
+            quant,
+            schedule,
+            scatter_dtype,
+            gather_dtype,
+            gather_transport,
+        )
+        capacity = padded_m(m_max, world_size, block_m)
+        plan = planner.plan(capacity)
         return _build_cfg(
             world_size=world_size,
-            m_pad=padded_m(m_max, world_size, block_m),
+            m_pad=capacity,
             n=n,
             block_m=block_m,
             gather_dtype=gather_dtype,
             gather_transport=gather_transport,
-            counter_capacity=MAX_CHUNKS,
-            shape_slots=max_shapes
-            or default_max_shapes(
-                padded_m(m_max, world_size, block_m), world_size, block_m
+            scatter_dtype=scatter_dtype,
+            chunk_bands=plan.chunk_bands,
+            counter_capacity=planner.counter_capacity,
+            shape_slots=(
+                max_shapes if max_shapes is not None else planner.max_shapes(capacity)
             ),
             shape_index=0,
+            capacity_m=capacity,
         ).window_bytes
 
     def padded_m(self, m: int) -> int:
-        """``m`` rounded up to what :meth:`__call__` accepts."""
-        return padded_m(m, self.world_size, self.block_m)
+        """Physical rows for logical ``m``; pass ``logical_m=m`` when calling.
 
-    def _slot_for(self, m: int) -> int:
+        With schedule="wo_b", padding and chunk selection are a joint plan.
+        This method is stateless and can be called in any preparation order.
+        """
+        return self._schedule.plan(m).m_pad
+
+    def _row_plan(self, m: int, logical_m: int | None = None) -> _RowPlan:
+        plan = self._schedule.plan(m if logical_m is None else logical_m)
+        if plan.m_pad != m:
+            raise ValueError(
+                f"M={m} does not match planned padded M={plan.m_pad}; "
+                "use padded_m()/pad_rows() and pass the original logical_m"
+            )
+        if m > self.m_max:
+            raise ValueError(f"M={m} exceeds the window's m_max={self.m_max}")
+        return plan
+
+    def _slot_for(self, m: _RowPlan) -> int:
         """This M's counter set, assigned on first sight and then fixed."""
         slot = self._shape_slot.get(m)
         if slot is None:
@@ -656,32 +819,36 @@ class GemmAllReduceOp:
             self._shape_slot[m] = slot
         return slot
 
-    def _make_cfg(self, m: int) -> ArConfig:
+    def _make_cfg(self, m: int, logical_m: int | None = None) -> ArConfig:
+        plan = self._row_plan(m, logical_m)
         return _build_cfg(
             world_size=self.world_size,
             m_pad=m,
             n=self.n,
             block_m=self.block_m,
             gather_dtype=self.gather_dtype,
+            scatter_dtype=self.scatter_dtype,
+            chunk_bands=plan.chunk_bands,
             gather_transport=self.gather_transport,
             # Pinned to the capacity, not to this M's chunk count: the control
             # region has to sit at the same offsets for every M the instance
             # serves, or one shape reads the previous shape's payload as locks.
-            counter_capacity=MAX_CHUNKS,
+            counter_capacity=self._schedule.counter_capacity,
             shape_slots=self.max_shapes,
-            shape_index=self._slot_for(m),
+            shape_index=self._slot_for(plan),
             # Every M this instance serves gets the same map. Without it the
             # regions of two shapes overlap and a call reads the previous
             # shape's leftovers -- see ArConfig.capacity_m.
             capacity_m=self.m_max,
         )
 
-    def _compiled(self, m: int):
+    def _compiled(self, m: int, logical_m: int | None = None):
         """Kernel plus SDMA phases for this M, compiled on first sight."""
-        hit = self._cache.get(m)
+        row_plan = self._row_plan(m, logical_m)
+        hit = self._cache.get(row_plan)
         if hit is not None:
             return hit
-        cfg = self._make_cfg(m)
+        cfg = self._make_cfg(m, logical_m)
         gemm = compile_fused_gemm_scatter(
             cfg,
             self.rank,
@@ -692,6 +859,8 @@ class GemmAllReduceOp:
             fuse=True,
             transport="sdma",
             quant=self.quant,
+            chunk_bands=row_plan.chunk_bands,
+            relaxed_rows=row_plan.relaxed_rows,
             sdma_queues=self.sdma_queues,
             # The three C-store stages are off by default in
             # compile_fused_gemm_scatter, and blockscale requires swap_ab.
@@ -711,13 +880,15 @@ class GemmAllReduceOp:
             tail=tail,
             parts=parts,
             input=from_gpu_ptr(
-                self.mem.ptr + cfg.input_off, (m, self.n), torch.bfloat16
+                self.mem.ptr + (cfg.output_off if cfg.fp8_scatter else cfg.input_off),
+                (m, self.n),
+                torch.bfloat16,
             ),
             output=from_gpu_ptr(
                 self.mem.ptr + cfg.output_off, (m, self.n), torch.bfloat16
             ),
         )
-        self._cache[m] = hit
+        self._cache[row_plan] = hit
         return hit
 
     def self_test(self, m: int | None = None) -> None:
@@ -748,7 +919,8 @@ class GemmAllReduceOp:
         """
         if self.mem is None:
             raise RuntimeError("this GemmAllReduceOp has been closed")
-        m = m or self.m_max
+        logical_m = self.m_max if m is None else m
+        m = self.padded_m(logical_m)
 
         try:
             from mori.cco.device._build_flags import BUILD_CCO_SDMA
@@ -756,9 +928,20 @@ class GemmAllReduceOp:
             BUILD_CCO_SDMA = None
         built_without_sdma = BUILD_CCO_SDMA is False
 
-        plan = self._compiled(m)
+        plan = self._compiled(m, logical_m)
+        cfg = self._make_cfg(m, logical_m)
         want = self.world_size * (self.world_size + 1) / 2
-        plan.input.fill_(float(self.rank + 1))
+        if cfg.fp8_scatter:
+            from_gpu_ptr(
+                self.mem.ptr + cfg.input_off, (m, self.n), torch.float8_e4m3fn
+            ).fill_(float(self.rank + 1))
+            from_gpu_ptr(
+                self.mem.ptr + cfg.input_scale_off,
+                (m, cfg.scatter_tiles_per_row),
+                torch.float32,
+            ).fill_(1.0)
+        else:
+            plan.input.fill_(float(self.rank + 1))
         plan.output.zero_()
 
         stream = fx.Stream(torch.cuda.current_stream())
@@ -771,7 +954,7 @@ class GemmAllReduceOp:
         # The bf16 wire is exact on small integers; the fp8 gather rounds, but
         # e4m3 represents integers this small exactly once the row scale is
         # applied, so a percent is generous either way.
-        if worst > 1e-2:
+        if not worst <= 1e-2:
             hint = (
                 " mori was built with BUILD_CCO_SDMA=OFF (the default), so the "
                 "SDMA puts are compiled out and do nothing."
@@ -864,6 +1047,8 @@ class GemmAllReduceOp:
         b_preshuffled: torch.Tensor,
         a_scale: torch.Tensor,
         b_scale: torch.Tensor,
+        *,
+        logical_m: int | None = None,
     ) -> torch.Tensor:
         """One fused GEMM + all-reduce; returns a view of the window's output.
 
@@ -888,24 +1073,19 @@ class GemmAllReduceOp:
             K-block major and widened, i.e. ``e.t().contiguous().to(int32)``,
             flat. Both int32.
 
+        ``logical_m`` is the original row count before padding. Pass it when
+        using the fitted schedule so chunk selection matches padded_m().
+        The result still includes padding; slice it to logical_m if needed.
+
         The returned tensor aliases the window and is overwritten by the next
         call. Clone it to keep it. One instance is not usable concurrently: the
         window, the kernel cache and the padding buffer are all shared, and the
         phases run on the current stream.
         """
         m = a_fp8.shape[0]
-        if m > self.m_max:
-            raise ValueError(
-                f"M={m} exceeds the window's m_max={self.m_max}; the window "
-                f"cannot grow after construction"
-            )
-        if m % (self.world_size * self.block_m):
-            raise ValueError(
-                f"M={m} must be a multiple of world_size * block_m = "
-                f"{self.world_size * self.block_m}; use padded_m()/pad_rows()"
-            )
+        self._row_plan(m, logical_m)
         self._check_operands(a_fp8, b_preshuffled, a_scale, b_scale, m)
-        plan = self._compiled(m)
+        plan = self._compiled(m, logical_m)
         stream = fx.Stream(torch.cuda.current_stream())
         plan.gemm(
             a_fp8.contiguous().view(torch.int8).view(-1),

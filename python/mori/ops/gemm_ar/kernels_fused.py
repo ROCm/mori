@@ -73,6 +73,8 @@ see the comment at that line. The bug is still live in aiter.
 # the string "fx.Array[fx.Float8E4M3FN, a_lds_size, 16]" -- whose size operands
 # are locals of this factory and so cannot be resolved from the module globals.
 
+import hashlib
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -1171,12 +1173,15 @@ def compile_fused_gemm_scatter(
     recv_base_off = cfg.recv_off
     recv_slot_stride = cfg._cap.scatter_slice_bytes
     fp8_scatter = cfg.fp8_scatter
-    if fp8_scatter and (not fuse or direct_lsa or relaxed_rows or compact_recv):
-        raise ValueError(
-            "FP8 scatter prototype requires aligned, non-compact fused SDMA"
-        )
+    if fp8_scatter and (not fuse or direct_lsa or compact_recv):
+        raise ValueError("FP8 scatter requires non-compact fused SDMA")
     if fp8_scatter and BLOCK_N != cfg.scatter_scale_n:
         raise ValueError("scatter scale tile must match BLOCK_N")
+
+    # Window offsets, wire formats and row masks are compile-time constants.
+    _kname_tag += (
+        "_cfg_" + hashlib.sha256(repr((cfg, relaxed_rows)).encode()).hexdigest()[:12]
+    )
 
     _kname = (
         f"mori_fused_{(transport if fuse else 'split')}_8w_"
@@ -1671,7 +1676,7 @@ def compile_fused_gemm_scatter(
         # ---- end pinned copy ----
 
         if const_expr(fp8_scatter):
-            # Prototype: reuse the BF16 output region as GEMM staging, then
+            # Reuse the BF16 output region as GEMM staging, then
             # compress each completed tile before electing its SDMA producer.
             # Sixteen lanes own a 256-column row segment; no inter-CTA amax.
             wait_barrier(0)
@@ -1688,38 +1693,43 @@ def compile_fused_gemm_scatter(
             qrow = fx.thread_idx.x // 16
             for rr in range_constexpr(BLOCK_M // 32):
                 row = block_m * BLOCK_M + qrow + rr * 32
-                col = block_n * BLOCK_N + qlane * 16
-                pos = row * N + col
-                halves = [
-                    Vec(
-                        buffer_load(
-                            qsrc, pos // 2 + hh * 4, vec_width=4, dtype=i32_type()
+                if row < M:
+                    col = block_n * BLOCK_N + qlane * 16
+                    pos = row * N + col
+                    halves = [
+                        Vec(
+                            buffer_load(
+                                qsrc, pos // 2 + hh * 4, vec_width=4, dtype=i32_type()
+                            )
                         )
+                        .bitcast(fx.BFloat16)
+                        .to(fx.Float32)
+                        for hh in range_constexpr(2)
+                    ]
+                    amax = fx.Float32(0.0)
+                    for hh in range_constexpr(2):
+                        for ee in range_constexpr(8):
+                            v = halves[hh][ee]
+                            amax = amax.maximumf(v.maximumf(-v))
+                    for delta in (1, 2, 4, 8):
+                        amax = amax.maximumf(
+                            _bpermute_f32(amax, (fx.thread_idx.x % 64) ^ delta)
+                        )
+                    scale = (amax == fx.Float32(0.0)).select(
+                        fx.Float32(1.0), amax / fx.Float32(448.0)
                     )
-                    .bitcast(fx.BFloat16)
-                    .to(fx.Float32)
-                    for hh in range_constexpr(2)
-                ]
-                amax = fx.Float32(0.0)
-                for hh in range_constexpr(2):
-                    for ee in range_constexpr(8):
-                        v = halves[hh][ee]
-                        amax = amax.maximumf(v.maximumf(-v))
-                for delta in (1, 2, 4, 8):
-                    amax = amax.maximumf(
-                        _bpermute_f32(amax, (fx.thread_idx.x % 64) ^ delta)
+                    inv = fx.Float32(1.0) / scale
+                    words = []
+                    for hh in range_constexpr(2):
+                        q = _pack8_fp8(
+                            [halves[hh][ee] * inv for ee in range_constexpr(8)]
+                        )
+                        words += [q[0], q[1]]
+                    buffer_store(
+                        fx.Vector.from_elements(words, fx.Int32), qdst, pos // 4
                     )
-                scale = (amax == fx.Float32(0.0)).select(
-                    fx.Float32(1.0), amax / fx.Float32(448.0)
-                )
-                inv = fx.Float32(1.0) / scale
-                words = []
-                for hh in range_constexpr(2):
-                    q = _pack8_fp8([halves[hh][ee] * inv for ee in range_constexpr(8)])
-                    words += [q[0], q[1]]
-                buffer_store(fx.Vector.from_elements(words, fx.Int32), qdst, pos // 4)
-                if qlane == 0:
-                    buffer_store(scale, qscale, row * (N // BLOCK_N) + block_n)
+                    if qlane == 0:
+                        buffer_store(scale, qscale, row * (N // BLOCK_N) + block_n)
 
         if const_expr(direct_lsa):
             # Publish the peer stores from the blocks that made them. This is the
@@ -1782,7 +1792,7 @@ def compile_fused_gemm_scatter(
                                 lock = signal_ptr(lock_base + fx.Int64(dest) * 4)
                                 _acquire_peer_lock(lock)
                                 byte_off = fx.Int64(seg_lo) * fx.Int64(
-                                    N * cfg.elem_bytes
+                                    N * cfg.scatter_elem_bytes
                                 )
                                 sdma.put(
                                     dest,
@@ -1791,13 +1801,30 @@ def compile_fused_gemm_scatter(
                                     win,
                                     fx.Int64(in_off)
                                     + fx.Int64(global_lo)
-                                    * fx.Int64(N * cfg.elem_bytes),
+                                    * fx.Int64(N * cfg.scatter_elem_bytes),
                                     fx.Int64(seg_hi - seg_lo)
-                                    * fx.Int64(N * cfg.elem_bytes),
+                                    * fx.Int64(N * cfg.scatter_elem_bytes),
                                     dest % fx.Int32(sdma_queues),
                                     coop=cco.CoopScope.THREAD,
                                     signal=False,
                                 )
+                                if const_expr(fp8_scatter):
+                                    sdma.put(
+                                        dest,
+                                        win,
+                                        fx.Int64(cfg.recv_scale_slot_off(rank))
+                                        + fx.Int64(seg_lo)
+                                        * fx.Int64((N // BLOCK_N) * 4),
+                                        win,
+                                        fx.Int64(cfg.input_scale_off)
+                                        + fx.Int64(global_lo)
+                                        * fx.Int64((N // BLOCK_N) * 4),
+                                        fx.Int64(seg_hi - seg_lo)
+                                        * fx.Int64((N // BLOCK_N) * 4),
+                                        dest % fx.Int32(sdma_queues),
+                                        coop=cco.CoopScope.THREAD,
+                                        signal=False,
+                                    )
                                 atomic_store_u32(lock, 0)
             fgpu.barrier()
 

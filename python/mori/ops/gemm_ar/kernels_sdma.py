@@ -284,12 +284,9 @@ def build_sdma_phases(
     if queues < 1:
         raise ValueError(f"queues must be >= 1, got {queues}")
     if cfg.fp8_scatter and (fuse_quantize or fuse_reduce_push):
-        # The regions exist (layout.py sizes them), but nothing writes the
-        # quantised payload yet: on the fused path that is the GEMM epilogue's
-        # job, and on the standalone path it needs its own kernel. Refuse
-        # rather than read an fp8-sized region that still holds bf16, which
-        # faults somewhere unrelated.
-        raise NotImplementedError("FP8 scatter prototype uses the separate reduce")
+        # These fused reducers still consume BF16 receive data. FP8 decoding
+        # and scale application are implemented in the separate reduce only.
+        raise NotImplementedError("FP8 scatter requires the separate reduce")
 
     threads = cfg.threads
     # The reduce is a *local HBM* kernel, so it must not inherit the grid the LSA
@@ -350,7 +347,7 @@ def build_sdma_phases(
         put_bytes = slice_bytes if nbytes is None else nbytes
 
         @flyc.kernel(
-            name=f"mori_sdma_push_{specialization}_{arr_off}_{int(pushes)}",
+            name=f"mori_sdma_push_{specialization}_{arr_off}_{int(pushes)}_b{put_bytes}_s{int(extra is not None)}",
             known_block_size=[PUSH_THREADS, 1, 1],
         )
         def push(dev_comm: Int64, win: Int64):
@@ -421,7 +418,21 @@ def build_sdma_phases(
         start_off,
         dst_off_of_peer=scatter_dst,
         src_off_expr=lambda tid: fx.Int64(in_off)
-        + fx.Int64(tid) * fx.Int64(slice_bytes),
+        + fx.Int64(tid) * fx.Int64(cfg.scatter_slice_bytes),
+        nbytes=cfg.scatter_slice_bytes,
+        # The split scatter (also used by the public self-test) must carry
+        # the same payload/scales as the fused epilogue. Source slices follow
+        # this call's M; only receive-slot bases use the window capacity.
+        extra=(
+            (
+                cfg.recv_scale_slot_off(rank),
+                lambda tid: fx.Int64(cfg.input_scale_off)
+                + fx.Int64(tid) * fx.Int64(cfg.scatter_scale_slice_bytes),
+                cfg.scatter_scale_slice_bytes,
+            )
+            if cfg.fp8_scatter
+            else None
+        ),
     )
 
     @flyc.kernel(
