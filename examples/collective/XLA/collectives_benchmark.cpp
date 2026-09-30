@@ -105,19 +105,33 @@ struct Config {
 // ---------------------------------------------------------------------------
 // Fill / verify kernels (templated on the element type)
 // ---------------------------------------------------------------------------
-// Common per-PE pattern: buf[i] = (myPe + 1) + (i % 8). Small integers, exact in
-// float/bf16 storage. Used by reduce-scatter/all-reduce (input), all-gather (my
-// shard) and collective-permute (send buffer).
+// Common per-PE pattern, shared by fill and the gather/permute/reduce checkers.
+// Float dtypes store 1, 1/2, or 1/4. Every partial product is a power of two, so
+// bf16/f16/f32 prod (which rounds after every op) does not depend on peer order.
+// Integer dtypes cannot hold a reciprocal (it would truncate to 0 and make prod
+// identically zero); they store the denominator 1, 2, or 4, which has the same
+// order-independent property. Used by reduce-scatter/all-reduce (input),
+// all-gather (my shard) and collective-permute (send buffer).
+template <class ElemT>
+__host__ __device__ __forceinline__ float PatternValue(int pe, size_t idx) {
+  const int exp = (pe + static_cast<int>(idx % 8)) % 3;  // 0, 1, 2
+  if constexpr (std::is_integral_v<ElemT>) {
+    return static_cast<float>(1 << exp);
+  } else {
+    return 1.0f / static_cast<float>(1 << exp);
+  }
+}
+
 template <class ElemT>
 __global__ void FillCommonKernel(ElemT* buf, size_t numElements, int myPe) {
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < numElements;
        i += (size_t)gridDim.x * blockDim.x) {
-    buf[i] = static_cast<ElemT>(static_cast<float>((myPe + 1) + static_cast<int>(i % 8)));
+    buf[i] = static_cast<ElemT>(PatternValue<ElemT>(myPe, i));
   }
 }
 
 // All-to-all send pattern: slot dest holds (sender=myPe, dest, j) encoded as
-// myPe*100 + dest*10 + j%8 (float-exact for myPe,dest < 10).
+// myPe*100 + dest*10 + j%8 (float-exact for myPe,dest < 10; rounded in bf16).
 template <class ElemT>
 __global__ void FillA2AKernel(ElemT* send, size_t chunkElems, int npes, int myPe) {
   const size_t N = static_cast<size_t>(npes) * chunkElems;
@@ -131,17 +145,18 @@ __global__ void FillA2AKernel(ElemT* send, size_t chunkElems, int npes, int myPe
 }
 
 // Reduce-scatter / all-reduce verify: expected[i] is the fold (seed PE 0, then
-// 1..npes-1) of ((p+1) + (globalIdx % 8)) at globalIdx = globalOffset + i, with a
-// round-trip through ElemT after each op (matches packed per-op rounding).
+// 1..npes-1) of PatternValue(p, globalIdx) at globalIdx = globalOffset + i, with
+// a round-trip through ElemT after each op (matches packed per-op rounding).
 template <class ElemT>
 __global__ void VerifyReduceKernel(const ElemT* output, size_t count, size_t globalOffset,
                                    int npes, ReduceOpKind op, uint32_t* errorCount) {
+  
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
        i += (size_t)gridDim.x * blockDim.x) {
     const size_t globalIdx = globalOffset + i;
-    float acc = static_cast<float>(1 + static_cast<int>(globalIdx % 8));  // PE 0 seed
+    float acc = PatternValue<ElemT>(0, globalIdx);  // PE 0 seed
     for (int p = 1; p < npes; p++) {
-      float term = static_cast<float>((p + 1) + static_cast<int>(globalIdx % 8));
+      float term = PatternValue<ElemT>(p, globalIdx);
       auto err = detail::DispatchReduceOp<float>(op, [&acc, term](auto reduceOp) {
         acc = reduceOp(acc, term);
         return hipSuccess;
@@ -155,7 +170,7 @@ __global__ void VerifyReduceKernel(const ElemT* output, size_t count, size_t glo
   }
 }
 
-// All-gather verify: output[p*chunk + j] == (p + 1) + (j % 8).
+// All-gather verify: output[p*chunk + j] == PatternValue(p, j).
 template <class ElemT>
 __global__ void VerifyGatherKernel(const ElemT* output, size_t chunkElems, int npes,
                                    uint32_t* errorCount) {
@@ -164,7 +179,7 @@ __global__ void VerifyGatherKernel(const ElemT* output, size_t chunkElems, int n
        g += (size_t)gridDim.x * blockDim.x) {
     const int p = static_cast<int>(g / chunkElems);
     const size_t j = g % chunkElems;
-    float expected = static_cast<float>((p + 1) + static_cast<int>(j % 8));
+    float expected = PatternValue<ElemT>(p, j);
     if (fabsf(static_cast<float>(output[g]) - expected) > 1e-3f) {
       atomicAdd(errorCount, 1u);
     }
@@ -180,20 +195,22 @@ __global__ void VerifyA2AKernel(const ElemT* recv, size_t chunkElems, int npes, 
        g += (size_t)gridDim.x * blockDim.x) {
     const int s = static_cast<int>(g / chunkElems);
     const size_t j = g % chunkElems;
-    float expected = static_cast<float>(s * 100 + myPe * 10 + static_cast<int>(j % 8));
+    // Round through ElemT like the fill did: bf16 cannot hold e.g. 777 exactly.
+    float expected = static_cast<float>(static_cast<ElemT>(
+        static_cast<float>(s * 100 + myPe * 10 + static_cast<int>(j % 8))));
     if (fabsf(static_cast<float>(recv[g]) - expected) > 1e-3f) {
       atomicAdd(errorCount, 1u);
     }
   }
 }
 
-// Collective-permute (ring) verify: recv[i] == (srcPe + 1) + (i % 8).
+// Collective-permute (ring) verify: recv[i] == PatternValue(srcPe, i).
 template <class ElemT>
 __global__ void VerifyPermuteKernel(const ElemT* recv, size_t numElements, int srcPe,
                                     uint32_t* errorCount) {
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < numElements;
        i += (size_t)gridDim.x * blockDim.x) {
-    float expected = static_cast<float>((srcPe + 1) + static_cast<int>(i % 8));
+    float expected = PatternValue<ElemT>(srcPe, i);
     if (fabsf(static_cast<float>(recv[i]) - expected) > 1e-3f) {
       atomicAdd(errorCount, 1u);
     }
@@ -680,19 +697,22 @@ int main(int argc, char* argv[]) {
   // Buffer-size validation (per-collective element size from dtype).
   const size_t elemSize = DtypeSize(cfg.dt);
   if (cfg.coll == Collective::kCollectivePermute) {
-    const size_t nb = cfg.numElems * elemSize;
-    if (nb < 16 || (nb % 16) != 0) {
-      XPUT("ERROR: per-rank bytes (size * sizeof) must be a multiple of 16");
+    // collective_permute is a plain byte-granular SDMA copy (StartSdmaScatter
+    // with ElemBytes=1), so any positive size is valid.
+    if (cfg.numElems == 0) {
+      XPUT("ERROR: --size must be > 0");
       return 1;
     }
   } else {
-    if (cfg.numElems % static_cast<size_t>(cfg.npes) != 0) {
+    if (cfg.numElems % cfg.npes != 0) {
       XPUT("ERROR: --size must be divisible by --npes");
       return 1;
     }
+
     const size_t chunkBytes = (cfg.numElems / cfg.npes) * elemSize;
-    if (chunkBytes < 16 || (chunkBytes % 16) != 0) {
-      XPUT("ERROR: per-shard bytes (size/npes * sizeof) must be a multiple of 16");
+    XPUT("numElems = %zu, npes = %d, chunkBytes = %zu, elemSize = %zu", cfg.numElems, cfg.npes, chunkBytes, elemSize);
+    if (chunkBytes < 4 || (chunkBytes % 4) != 0) {
+      XPUT("ERROR: per-shard bytes (size/npes * sizeof) must be a multiple of 4");
       return 1;
     }
   }
