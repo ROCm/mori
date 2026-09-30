@@ -202,8 +202,8 @@ class CollectivesFacade {
       facade.stagingBytes_ = maxStagingBytes;
     }
     HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&facade.groupCounters_),
-                                kRSPushMaxSlices * sizeof(uint32_t)));
-    HIP_RUNTIME_CHECK(hipMemset(facade.groupCounters_, 0, kRSPushMaxSlices * sizeof(uint32_t)));
+                                kGroupCounterCount * sizeof(uint32_t)));
+    HIP_RUNTIME_CHECK(hipMemset(facade.groupCounters_, 0, kGroupCounterCount * sizeof(uint32_t)));
     // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
     // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
     // device alloc/copy). Sized for the max supported peer count.
@@ -218,13 +218,21 @@ class CollectivesFacade {
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
     reqs.sdmaQueueCount = 0; // Use the context's SDMA queue count
-    // Packed RS slice counter [kSliceSignalSlot] (slots 1..S-1 unused) + AR broadcast counters
-    // [kRSPushMaxSlices .. 2*kRSPushMaxSlices-1] (kBcastSlot == kRSPushMaxSlices).
-    reqs.sdmaSignalCount = 2 * kRSPushMaxSlices;
     int ret = mori::cco::ccoDevCommCreate(comm, &reqs, &facade.devComm_);
     if (ret != 0 || facade.devComm_.sdma.sdmaNumQueue == 0) {
       FACADE_PRINTF("CollectivesFacade: ccoDevCommCreate failed or "
                     "no SDMA queues allocated.");
+      return -1;
+    }
+    // The push collectives use signal slots [0, kSdmaSignalSlotsUsed) of the
+    // lsaSize * sdmaNumQueue pool.
+    const size_t signalSlots =
+        static_cast<size_t>(facade.devComm_.lsaSize) * facade.devComm_.sdma.sdmaNumQueue;
+    if (signalSlots < static_cast<size_t>(kSdmaSignalSlotsUsed)) {
+      FACADE_PRINTF("CollectivesFacade: SDMA signal pool has %zu slots, need %d "
+                    "(lsaSize=%d, sdmaNumQueue=%u)",
+                    signalSlots, kSdmaSignalSlotsUsed, facade.devComm_.lsaSize,
+                    facade.devComm_.sdma.sdmaNumQueue);
       return -1;
     }
     return 0;
