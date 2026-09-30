@@ -50,6 +50,10 @@ struct Toolchain {
   // (mori.jit.config.detect_nic_type -> MORI_DEVICE_NIC), not here: one detector.
   std::string nic;
 
+  // Host CQ creation and the generated poller must agree. Frozen with the
+  // toolchain; Flags() adds the define and the compiler hashes it into the key.
+  bool ionicCcqe{false};
+
   // -I flags, derived from sourceRoot.
   std::vector<std::string> IncludeDirs() const;
 

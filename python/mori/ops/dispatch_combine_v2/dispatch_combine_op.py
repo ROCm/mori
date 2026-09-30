@@ -41,9 +41,9 @@ A subclass supplies four hooks -- two with no default, two with one::
 That is the HIP backend's route. The FlyDSL one overrides ``__init__`` and builds
 its own arena and KernelSet there, so ``_unsupported`` is the only hook it defines.
 
-Everything else -- arena, scratch buffers, variant selection, lifecycle -- is here.
-Behavioural differences between the backends are *data* on the KernelSet, not
-methods to override, after aiter's ``MOEMetadata``.
+The shared dispatch/combine body and lifecycle live here. HIP overrides _pick()
+to select its KernelConfig keys; the default selector serves FlyDSL's B/W keys.
+KernelSet flags describe staging, counter reset and optional capabilities.
 """
 
 from __future__ import annotations
@@ -139,7 +139,7 @@ class EpDispatchCombineConfig:
     max_token_type_size: int = None
     # RDMA-block split of the grid, per phase. Runtime, never compiled in:
     # dispatch and combine are deliberately tuned to DIFFERENT values (see
-    # internode_tuning_configs), so one compiled-in value cannot serve both.
+    # hip_tuning_configs), so one compiled-in value cannot serve both.
     # Pinnable like the block/warp fields above, and clamped to < block_num.
     dispatch_rdma_block_num: int = None
     combine_rdma_block_num: int = None
@@ -315,16 +315,12 @@ class EpDispatchCombineConfig:
         self._resolve_geometry()
 
     def _resolve_geometry(self):
-        """Fill block/warp/schedule. Tuned-by-default: when the caller pinned
-        neither a schedule nor any block/warp, pull the tuned geometry for this
-        device/shape/dtype from the SELECTED BACKEND's tuning table (so the plain
-        constructor is tuned automatically — EpDispatchCombineConfig.tuned() is now
-        just an explicit alias). If any field is pinned, honor it and fill the rest
-        with the single-shot fallback (no schedule).
+        """Fill defaults and the intranode schedule for the selected backend.
 
-        Each backend tunes its OWN kernel: the hip and flydsl kernels are different
-        implementations with different optima, so hip reads hip_tuning_configs and
-        flydsl reads tuning_configs -- they never share a table."""
+        Internode only gets fallback values here. Its backend builds the full
+        schedule via hip_tuning_configs.resolve_schedule(), retaining any
+        fields the caller pinned in _pinned_geometry.
+        """
         pinned = self.schedule is not None or any(
             g is not None
             for g in (
@@ -335,13 +331,8 @@ class EpDispatchCombineConfig:
             )
         )
         if self.is_internode:
-            # The intranode tables are keyed on a single node's geometry and
-            # carry no rdma_block_num, so they have nothing to say about this
-            # config. Internode geometry comes from internode_tuning_configs,
-            # which the backend applies per phase and per token count. A
-            # `schedule` bucket already carries per-phase block and warp counts,
-            # but it has no rdma_block_num field at all, so it cannot carry the
-            # DIFFERENT rdma values dispatch and combine are tuned to.
+            # cfg.schedule describes intranode block/warp pairs only. Internode
+            # needs an independent RDMA split for each phase as well.
             self.schedule = None
             if self.dispatch_block_num is None:
                 self.dispatch_block_num = 96
@@ -459,10 +450,16 @@ class EpDispatchCombineConfig:
 
     @classmethod
     def tuned(cls, **kwargs):
-        """Build a config with block/warp geometry pulled from tuning_configs
-        (unless explicitly overridden in kwargs). Kept for back-compat and to
-        force per-field tuning even when some geometry is overridden; the plain
-        constructor is now also tuned-by-default (see _resolve_geometry)."""
+        """HIP uses the normal tuned-by-default constructor. FlyDSL retains its
+        legacy table prefill, with explicit kwargs taking precedence."""
+        backend = (
+            kwargs.get("kernel_backend")
+            or os.environ.get("MORI_V2_KERNEL_BACKEND")
+            or _default_backend()
+        )
+        if backend == "hip":
+            return cls(**kwargs)
+
         from .tuning_configs import lookup
 
         dt = kwargs.get("data_type", torch.bfloat16)
@@ -475,7 +472,7 @@ class EpDispatchCombineConfig:
         # keyed on a single node's geometry and carry no rdma_block_num -- and
         # pre-filling here would be indistinguishable from a caller pin, which
         # the internode backend honours over its own table. Leave it alone and
-        # let _resolve_geometry / internode_tuning_configs do the work.
+        # let _resolve_geometry / hip_tuning_configs do the work.
         gpu_per_node = kwargs.get("gpu_per_node") or kwargs["world_size"]
         if kwargs["world_size"] // gpu_per_node > 1:
             return cls(**kwargs)
@@ -586,12 +583,12 @@ class KernelSet:
     with a new quirk adds a flag here, not a method to every subclass.
     """
 
-    # (block_num, warp_num) -> callable. Keys must cover every spec the op's
-    # schedule can select; the op clamps to what is present.
-    dispatch: dict[tuple[int, int], Callable]
-    combine: dict[tuple[int, int], Callable]
+    # Backend selection key -> callable. HIP uses KernelConfig; FlyDSL uses
+    # (block_num, warp_num). _pick() returns keys from these same maps.
+    dispatch: dict[tuple, Callable]
+    combine: dict[tuple, Callable]
     # Replay-routing dispatch. None = this backend has no replay.
-    dispatch_replay: dict[tuple[int, int], Callable] | None = None
+    dispatch_replay: dict[tuple, Callable] | None = None
 
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
@@ -735,10 +732,9 @@ class EpDispatchCombineOp:
 
     # -- hooks a subclass must supply --------------------------------------
     #
-    # Exactly four, and no more: the arena layout, the kernels, and (optionally)
-    # what the backend cannot do and which arena region a shared view reads.
-    # Everything a caller touches -- dispatch(), combine(), the views, _pick,
-    # close -- is implemented once, here.
+    # Arena layout, kernel construction, supported features and region names.
+    # Dispatch/combine and lifecycle are shared. HIP also overrides _pick() for
+    # its unified intra/inter kernel configuration keys.
 
     def _regions(self, cfg) -> list[tuple[str, int]]:
         """[(region_name, nbytes)] this backend needs carved out of the arena.

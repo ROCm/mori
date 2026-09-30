@@ -306,13 +306,12 @@ endfunction()
 # ---------------------------------------------------------------------------
 # Ionic collapsed-CQE (CCQE) detection
 #
-# The host picks the CQ layout at runtime (IsCcqeSupported() in
-# transport/rdma/providers/ionic/ionic.cpp) while the device-side poller picks
-# it at compile time (#ifdef IONIC_CCQE). Both sides must agree or a kernel
-# polls a collapsed CQ as a normal CQE ring, misses completions and hangs in
-# quiet, so this mirrors the runtime and Python JIT (jit/core.py) checks:
-# userspace provider exports ionic_dv_create_cq_ex, and every ionic device runs
-# the same firmware, at least 1.117.5-a-58.
+# The host picks the CQ layout through IonicCcqeEnabled() in
+# mori/utils/ionic_ccqe.hpp, also used by both JIT compilers. The AOT poller
+# picks it at compile time (#ifdef IONIC_CCQE), so AUTO must follow the same
+# policy: the provider exports ionic_dv_create_cq_ex, every IB device has a
+# readable driver link, and every Ionic device runs the same firmware, at least
+# 1.117.5-a-58. Disagreeing on the CQ layout can hang completion polling.
 # ---------------------------------------------------------------------------
 function(_mori_ionic_fw_supports_ccqe fw_ver out_var)
   set(_min_version "1;117;5;58")
@@ -345,6 +344,11 @@ function(_mori_detect_ionic_ccqe out_var)
   set(${out_var}
       FALSE
       PARENT_SCOPE)
+  # Optional sysfs root for CPU tests of the CMake/runtime policy agreement.
+  set(_ib_root "/sys/class/infiniband")
+  if(ARGC GREATER 1)
+    set(_ib_root "${ARGV1}")
+  endif()
 
   if(DEFINED ENV{MORI_DISABLE_IONIC_CCQE})
     string(TOLOWER "$ENV{MORI_DISABLE_IONIC_CCQE}" _disable)
@@ -377,32 +381,48 @@ function(_mori_detect_ionic_ccqe out_var)
     return()
   endif()
 
-  # Firmware support: every ionic device must run the same new-enough firmware.
-  file(GLOB _ib_devices "/sys/class/infiniband/*")
+  # Mirror DetectIonicCcqe(): an unclassified device may be an Ionic rail. Read
+  # the symlink itself, not its target; device names are not driver names.
+  file(GLOB _ib_devices "${_ib_root}/*")
   set(_fw_versions "")
   foreach(_dev ${_ib_devices})
-    get_filename_component(_name ${_dev} NAME)
-    set(_is_ionic FALSE)
-    if(_name MATCHES "^ionic")
-      set(_is_ionic TRUE)
-    else()
-      execute_process(
-        COMMAND readlink -f "${_dev}/device/driver"
-        OUTPUT_VARIABLE _drv
-        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
-        RESULT_VARIABLE _drv_rc)
-      if(_drv_rc EQUAL 0)
-        get_filename_component(_drv_name "${_drv}" NAME)
-        if(_drv_name MATCHES "^ionic")
-          set(_is_ionic TRUE)
-        endif()
-      endif()
+    execute_process(
+      COMMAND readlink "${_dev}/device/driver"
+      OUTPUT_VARIABLE _drv
+      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+      RESULT_VARIABLE _drv_rc)
+    if(NOT _drv_rc EQUAL 0)
+      message(STATUS "Mori ionic CCQE: off (unreadable driver link: ${_dev})")
+      return()
     endif()
-    if(_is_ionic AND EXISTS "${_dev}/fw_ver")
-      file(READ "${_dev}/fw_ver" _fw)
-      string(STRIP "${_fw}" _fw)
-      list(APPEND _fw_versions "${_fw}")
+    get_filename_component(_drv_name "${_drv}" NAME)
+    if(NOT _drv_name STREQUAL "ionic" AND NOT _drv_name STREQUAL "ionic_rdma")
+      continue()
     endif()
+
+    # Missing, unreadable or empty firmware must not silently drop a rail.
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" -E cat "${_dev}/fw_ver"
+      OUTPUT_VARIABLE _fw
+      ERROR_QUIET
+      RESULT_VARIABLE _fw_rc)
+    if(NOT _fw_rc EQUAL 0)
+      message(STATUS "Mori ionic CCQE: off (unreadable firmware: ${_dev})")
+      return()
+    endif()
+    # The shared runtime detector reads one line with std::getline.
+    string(FIND "${_fw}" "\n" _newline)
+    if(NOT _newline EQUAL -1)
+      string(SUBSTRING "${_fw}" 0 ${_newline} _fw)
+    endif()
+    string(STRIP "${_fw}" _fw)
+    _mori_ionic_fw_supports_ccqe("${_fw}" _fw_ok)
+    if(NOT _fw_ok)
+      message(
+        STATUS "Mori ionic CCQE: off (unsupported firmware '${_fw}': ${_dev})")
+      return()
+    endif()
+    list(APPEND _fw_versions "${_fw}")
   endforeach()
 
   if(NOT _fw_versions)
@@ -416,11 +436,6 @@ function(_mori_detect_ionic_ccqe out_var)
     return()
   endif()
   list(GET _fw_versions 0 _fw)
-  _mori_ionic_fw_supports_ccqe("${_fw}" _fw_ok)
-  if(NOT _fw_ok)
-    message(STATUS "Mori ionic CCQE: off (firmware ${_fw} below 1.117.5-a-58)")
-    return()
-  endif()
 
   message(STATUS "Mori ionic CCQE: on (firmware ${_fw})")
   set(${out_var}
