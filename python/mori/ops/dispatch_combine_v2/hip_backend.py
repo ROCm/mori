@@ -145,12 +145,10 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-# Must match EpCombinePushSlotAlign (ep_cfg.hpp) and EpFp4Wire's kQGroup, kSigBlocks
-# and kSigSlotDw (ep_intranode_1250x.hpp).
+# Must match EpCombinePushSlotAlign (ep_cfg.hpp) and EpFp4Wire::kQGroup
+# (ep_intranode_1250x.hpp).
 _PUSH_SLOT_ALIGN = 128
 PUSH_QGROUP = 32
-_PUSH_SIG_BLOCKS = 256
-_PUSH_SIG_SLOT_B = 128
 
 
 def push_wire_nbytes(cfg) -> int:
@@ -608,11 +606,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         topk = cfg.num_experts_per_token
         out_tok = cap * cfg.combine_token_nbytes
         if cfg.quant_type == "fp4_blockwise":
-            # The fp4 combine's landing rows, landing[src_pe][recv_slot], then its
-            # report and release slots sit behind the staging rows: the kernel
-            # addresses them from offOutTok.
+            # The fp4 combine's landing rows, landing[src_pe][recv_slot], sit behind
+            # the staging rows: the kernel addresses them from offOutTok.
             out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
-            out_tok += (cfg.world_size + 1) * _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B
         regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),

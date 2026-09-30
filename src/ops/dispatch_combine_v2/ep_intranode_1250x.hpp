@@ -833,6 +833,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 template <EpCfg kCfg>
 __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool needGridRendezvous) {
   constexpr int npes = kCfg.worldSize;
+  // The fp4 combine's rows travel as system-scope TDM stores and stage 3 invalidates before it
+  // reads them, so on that path the signal only has to be ordered after them.
+  constexpr bool kReleaseOnly = kCfg.combineFp4;
   const int thdId = threadIdx.x;
   const int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned long long win = args.window;
@@ -840,15 +843,53 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   if (needGridRendezvous) __syncthreads();
   const unsigned long long phase = args.xdbFlag[blockIdx.x];
 
-  if (needGridRendezvous) {
-    unsigned _gridArvl = 0;
-    if (thdId == 0) _gridArvl = atomicAdd(args.gridBarrier, 1u);
-    if constexpr (!EpIsWideEp(kCfg)) {
-      if (globalThdId < npes) {
-        EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-        __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  auto signalPeer = [&](int pe, bool fence) {
+    if (fence) {
+      if constexpr (kReleaseOnly)
+        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      else
+        __threadfence_system();
+    }
+    __hip_atomic_store(EpPeer<unsigned long long>(win, pe, args.offXdb) + args.rank, phase,
+                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  };
+  auto bumpEpochs = [&]() {
+    if (thdId == 0) args.xdbFlag[blockIdx.x] = phase + 1;
+    if (blockIdx.x == 0) {
+      for (int b = (int)gridDim.x + thdId; b < EpXdbFlagSlots; b += (int)blockDim.x)
+        args.xdbFlag[b] = phase + 1;
+    }
+  };
+
+  if constexpr (!EpIsWideEp(kCfg)) {
+    // The last block to arrive signals the peers, and every block waits on the peers' signals
+    // itself: nobody polls the arrival count and block 0 releases nobody.
+    if (needGridRendezvous) {
+      if (thdId < kCfg.waveSize) {
+        unsigned arrived = 0;
+        if (thdId == 0) arrived = atomicAdd(args.gridBarrier, 1u);
+        arrived = __shfl(arrived, 0);
+        if (arrived == static_cast<unsigned>(gridDim.x) - 1) {
+          if (thdId == 0)
+            __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          if (thdId < npes) signalPeer(thdId, true);
+        }
       }
-    } else {
+    } else if (globalThdId < npes) {
+      signalPeer(globalThdId, false);
+    }
+    bumpEpochs();
+    if (thdId < npes) {
+      unsigned long long* slot = EpLocal<unsigned long long>(win, args.offXdb) + thdId;
+      while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < phase)
+        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      if constexpr (!kReleaseOnly) __threadfence();
+    }
+    __syncthreads();
+  } else {
+    if (needGridRendezvous) {
+      unsigned _gridArvl = 0;
+      if (thdId == 0) _gridArvl = atomicAdd(args.gridBarrier, 1u);
       // Wide EP: last-arrival resets to avoid the inter-block race where a late
       // block misses the transient gridDim.x value and deadlocks on 0.
       if (thdId == 0) {
@@ -859,52 +900,42 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
       }
       __syncthreads();
     }
-  }
+    if (globalThdId < npes) signalPeer(globalThdId, needGridRendezvous);
+    bumpEpochs();
 
-  if (globalThdId < npes) {
-    if (needGridRendezvous) __threadfence_system();
-    __hip_atomic_store(EpPeer<unsigned long long>(win, globalThdId, args.offXdb) + args.rank, phase,
-                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  }
-  if (thdId == 0) args.xdbFlag[blockIdx.x] = phase + 1;
-  if (blockIdx.x == 0) {
-    for (int b = (int)gridDim.x + thdId; b < EpXdbFlagSlots; b += (int)blockDim.x)
-      args.xdbFlag[b] = phase + 1;
-  }
-
-  unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);
-  const unsigned int fanEpoch = static_cast<unsigned int>(phase);
-  if (blockIdx.x == 0) {
-    if (thdId < npes) {
-      unsigned long long* slot = EpLocal<unsigned long long>(win, args.offXdb) + thdId;
-      while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < phase)
-        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
-    }
-    __syncthreads();
-    __threadfence();
-    for (int b = thdId; b < (int)gridDim.x; b += (int)blockDim.x)
-      __hip_atomic_store(fanLines + (size_t)b * MORI_COMB_BARSPREAD, fanEpoch, __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
-  } else {
-    if (thdId == 0) {
-      while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD,
-                               __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch)
-        __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+    unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);
+    const unsigned int fanEpoch = static_cast<unsigned int>(phase);
+    if (blockIdx.x == 0) {
+      if (thdId < npes) {
+        unsigned long long* slot = EpLocal<unsigned long long>(win, args.offXdb) + thdId;
+        while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < phase)
+          __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+      __syncthreads();
+      if constexpr (!kReleaseOnly) __threadfence();
+      for (int b = thdId; b < (int)gridDim.x; b += (int)blockDim.x)
+        __hip_atomic_store(fanLines + (size_t)b * MORI_COMB_BARSPREAD, fanEpoch, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+    } else {
+      if (thdId == 0) {
+        while (__hip_atomic_load(fanLines + (size_t)blockIdx.x * MORI_COMB_BARSPREAD,
+                                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != fanEpoch)
+          __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+      __syncthreads();
     }
     __syncthreads();
   }
-  __syncthreads();
 }
 
 // ---------------------------------------------------------------------------
 // fp4 combine: the UseP2PRead == false stages of EpCombine1250xBody, selected by
 // kCfg.combineFp4. Stage 1 quantizes every received row to MXFP4 (32-element
 // groups, e8m0 scales) and TDM-stores it into the owner's landing row; stage 2
-// has every block report to every peer and the last block of each rank release
-// the others once all reports are in; stage 3 reduces the rows that landed for
-// this rank's tokens. The landing rows (landing[srcPe][recvSlot]) and then the
-// signal words sit in out_tok behind its maxRecv staging rows, so EpArgs carries
-// no field for them.
+// is the same EpCrossDeviceBarrier1250x the gather uses; stage 3 reduces the rows
+// that landed for this rank's tokens. The landing rows (landing[srcPe][recvSlot])
+// sit in out_tok behind its maxRecv staging rows, so EpArgs carries no field for
+// them.
 // ---------------------------------------------------------------------------
 typedef float EpF32x8 __attribute__((ext_vector_type(8)));
 typedef __bf16 EpBf16x8 __attribute__((ext_vector_type(8)));
@@ -922,11 +953,6 @@ struct EpFp4Wire {
   static constexpr int kCap = (EpCombine1250xLdsBudget / kCfg.warpPerBlock) / kWireB;
   static constexpr int kItemPass = 2;
   static constexpr size_t kLandOff = (size_t)EpMaxRecv(kCfg) * kTokB;
-  // Stage 2: a report slot per (source rank, block), then a release slot per block.
-  static constexpr int kSigBlocks = 256;
-  static constexpr int kSigSlotDw = 32;
-  static constexpr int kGo0Dw = kCfg.worldSize * kSigBlocks * kSigSlotDw;
-  static constexpr size_t kSigOff = kLandOff + (size_t)kCfg.worldSize * EpMaxRecv(kCfg) * kWireB;
   static_assert(kWireB % kTdmRowBytes == 0 && kTokB % kTdmRowBytes == 0,
                 "every row a TDM transfer touches must start on a 128 B row");
 };
@@ -1030,8 +1056,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   constexpr int C = 2;
   static_assert(C <= kCap && kMaxRecv % C == 0, "a run must fit the tile and tile kMaxRecv");
   static_assert(kCap * kWireB >= kWireB + kTokB, "a bf16 row must fit behind the first wire row");
-  static_assert(kCfg.blockNum >= 2, "the last block only collects the reports");
-  const int nbRows = (int)gridDim.x - 1;
+  const int nbRows = (int)gridDim.x;
   const int stride = nbRows * kCfg.warpPerBlock * C;
   const int rowStep = nbRows * kCfg.warpPerBlock;
   auto specRun = [&](int r0) {
@@ -1065,79 +1090,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         [](int v, int i) { return __builtin_amdgcn_readlane(v, i); }, rowStep);
     return r0 + stride < tot;
   };
-  if ((int)blockIdx.x >= nbRows) return;
   int r0 = warpId * nbRows + (int)blockIdx.x;
   bool more = specRun(r0);
   for (r0 += stride; more; r0 += stride) more = specRun(r0);
-}
-
-template <EpCfg kCfg>
-__device__ __forceinline__ void EpFp4Barrier(const EpArgs& args) {
-  using W = EpFp4Wire<kCfg>;
-  constexpr int WS = kCfg.waveSize;
-  constexpr int npes = kCfg.worldSize;
-  constexpr int kBlocks = W::kSigBlocks;
-  constexpr int kSlotDw = W::kSigSlotDw;
-  constexpr int kMaxSpin = 65536;
-  static_assert(npes < 32, "the collector keeps a bit per source rank");
-  const int laneId = threadIdx.x & (WS - 1);
-  const int warpId = threadIdx.x / WS;
-  const int nb = (int)gridDim.x;
-  const unsigned long long win = args.window;
-  unsigned* const reports =
-      reinterpret_cast<unsigned*>(EpLocal<unsigned char>(win, args.offOutTok) + W::kSigOff);
-  unsigned* const go = reports + W::kGo0Dw;
-
-  if ((int)threadIdx.x < npes) {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-    unsigned* const peer = reinterpret_cast<unsigned*>(
-        EpPeer<unsigned char>(win, threadIdx.x, args.offOutTok) + W::kSigOff);
-    __hip_atomic_store(peer + (args.rank * kBlocks + blockIdx.x) * kSlotDw, 1u, __ATOMIC_RELAXED,
-                       __HIP_MEMORY_SCOPE_SYSTEM);
-  }
-  if (blockIdx.x == gridDim.x - 1 && warpId == 0) {
-    constexpr int kPollB = (kCfg.blockNum + WS - 1) / WS * WS;
-    static_assert(kPollB <= kBlocks, "a report slot per combine block");
-    constexpr int kPer = npes * kPollB / WS;
-    auto slotAt = [&](int i) {
-      return reports + ((i * WS) / kPollB * kBlocks + (i * WS) % kPollB + laneId) * kSlotDw;
-    };
-    unsigned left = (1u << npes) - 1u;
-    for (int spin = 0; left && spin < kMaxSpin; ++spin) {
-      unsigned v[kPer];
-#pragma unroll
-      for (int i = 0; i < kPer; ++i)
-        v[i] = __hip_atomic_load(slotAt(i), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      unsigned miss = 0;
-#pragma unroll
-      for (int i = 0; i < kPer; ++i)
-        miss |= v[i] == 0u && (i * WS) % kPollB + laneId < nb ? 1u << (i * WS / kPollB) : 0u;
-      unsigned still = 0;
-#pragma unroll
-      for (int s = 0; s < npes; ++s) still |= __any((miss >> s) & 1u) ? 1u << s : 0u;
-      left &= still;
-    }
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-    for (int b = laneId; b < nb - 1; b += WS)
-      __hip_atomic_store(go + b * kSlotDw, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-#pragma unroll
-    for (int i = 0; i < kPer; ++i)
-      if ((i * WS) % kPollB + laneId < nb)
-        __hip_atomic_store(slotAt(i), 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  }
-  unsigned* const g = go + blockIdx.x * kSlotDw;
-  if (warpId == 0) {
-    if (blockIdx.x != gridDim.x - 1) {
-      bool pending = true;
-      for (int spin = 0; pending && spin < kMaxSpin; ++spin)
-        pending = __hip_atomic_load(g, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0u;
-    }
-    // The landed rows were written by peers: drop this CU's cached copies before stage 3 reads.
-    asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
-  }
-  __builtin_amdgcn_s_barrier();
-  if (warpId == 0 && laneId == 0 && blockIdx.x != gridDim.x - 1)
-    __hip_atomic_store(g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 // Routing of one reduce item: which landed rows hold its token. Reads only
@@ -1270,6 +1225,9 @@ __device__ __forceinline__ void EpFp4CombineReduce(const EpArgs& args,
   const int warpId = threadIdx.x / kCfg.waveSize;
   const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + warpId;
   const int globalWarpNum = (int)gridDim.x * kCfg.warpPerBlock;
+  // The landed rows were written by peers: drop this CU's cached copies before reading them.
+  if (warpId == 0) asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
+  __builtin_amdgcn_s_barrier();
   const int nItems = args.numTokens * EpFp4Wire<kCfg>::kItemPass;
   if (globalWarpId < nItems) EpFp4ReduceItem<kCfg, T>(args, rFirst);
   for (int it = globalWarpId + globalWarpNum; it < nItems; it += globalWarpNum)
@@ -1313,14 +1271,14 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   }
   if (staged) {
     __syncthreads();
-    if constexpr (UseP2PRead) {
-      if (warpId == 0) __threadfence_system();
+    if (warpId == 0) {
+      if constexpr (UseP2PRead)
+        __threadfence_system();
+      else
+        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   }
-  if constexpr (UseP2PRead)
-    EpCrossDeviceBarrier1250x<kCfg>(args, staged);
-  else
-    EpFp4Barrier<kCfg>(args);
+  EpCrossDeviceBarrier1250x<kCfg>(args, staged);
   if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
   if (args.numTokens == 0) return;
   if constexpr (!UseP2PRead) {
