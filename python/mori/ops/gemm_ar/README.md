@@ -7,7 +7,7 @@ Current optimization targets are V4 Pro TP8 `wo_b` GEMM + AR (blockscale,
 N=7168, K=2048), and V4.1 Flash TP4 `wo_b` GEMM + AR / standalone MXFP8 GEMM
 (N=5120, K=2048) plus `wq_b` standalone MXFP8 GEMM (N=8192, K=1280).
 Dimensions are per rank. Existing all-shape, GEMV and model-level results below
-are historical records from `main`; the dated update covers only these targets.
+are historical records from `main`; the dated updates cover only these targets.
 
 | op | for | what it does |
 |---|---|---|
@@ -39,6 +39,7 @@ Every full table lives here, next to the code it is about.
   - [fp8 on the wire](#fp8-on-the-wire)
   - [Benchmarks and tests](#benchmarks-and-tests)
 - [Measured results](#measured-results)
+  - [Follow-up experiments (2026-09-30)](#follow-up-experiments-2026-09-30)
   - [Target operator update (2026-09-29)](#target-operator-update-2026-09-29)
   - [The mxfp8 GEMM, on its own](#the-mxfp8-gemm-on-its-own)
   - [The mxfp8 GEMM against SGLang, across every shape](#the-mxfp8-gemm-against-sglang-across-every-shape)
@@ -316,6 +317,41 @@ are kept apart rather than averaged:
 | `--quant` | `blockscale` | `mxfp8` |
 | fusing, best wire | **-25%** at M=16384 | **-25%** at M=16384 |
 | what dominates it | the overlap | the fp8 wire and the GEMM |
+
+### Follow-up experiments (2026-09-30)
+
+The same two `wo_b` targets were evaluated on `v2-015` with isolated prototype
+modules; repository execution defaults are unchanged. All 27 experiment jobs
+and four strict finite-value rechecks passed their numerical/guard checks,
+including post-graph output checks and mixed-M graph validations. Paired timings use 8 calls per graph and 21 replays:
+3 alternating rounds, or 5 for the independent Pro tail confirmations and
+macro-pipeline comparisons. No external GPU process was observed by the monitor.
+
+| Direction | Target | Result |
+|---|---|---|
+| Joint padding/chunk selection | Pro TP8 | M=8200: original padding with `chunk_bands=2` measured **702.48 µs**, versus **707.30 µs** for align64/band1 and **728.82 µs** for the original policy |
+| One-band short tails, independent confirmation | Pro TP8 | M=11264: **1074.35 → 819.42 µs** (−23.7%); M=13312: **1274.86 → 957.80 µs** (−24.9%). About **1.9% / 1.2%** faster than band2 in the same paired runs |
+| FP8 scatter + reduced padding | Flash TP4 | Versus FP8 scatter with original padding, align64/band1 saved another **12.2% / 11.0%** at M=4200 and **4.5% / 2.3%** at M=8200, for BF16 / FP8 gather respectively |
+| BF16 pull gather | Both, M=4096/16384 | No win over SDMA with 16/24/32/64/128 blocks; retain the existing gather path |
+| Two macro partitions on two streams | Both, M=16384 | **10.1% slower** on Pro TP8 and **5.6% slower** on Flash TP4; serial splitting was already 8.5% / 4.0% slower |
+
+The joint-planner adapter selects only among measured points, with a 2% margin
+over baseline; this is not a general dispatch policy. Mixed-M, changed-input
+and cached-graph checks passed with fixed window offsets, disjoint plan slots
+and counter capacity 16 (the one-band Pro tails require 11/13 chunks).
+
+The ragged FP8 prototype masks partial quantization tiles and transfers scales
+with the same owner/chunk boundaries as the payload. Both actual communication
+legs passed the existing wire checks. Rank-0 FP32-reference relL2 was about
+2.62% with BF16 gather and 3.48% with both FP8 legs; every rank passed the gates.
+This retains BF16 staging and does not implement register-direct quantization.
+
+The pipeline result applies to the tested macro split with separate queue lanes
+and joined streams; it does not evaluate receiver-ready reduction during one
+monolithic GEMM launch. All timings exclude activation preparation and use equal
+backing capacities with logical tail guards, as in the 2026-09-29 retest.
+Prototype code, patches, paired results and reproduction commands are archived
+in [`gemm-ar-followup-20260930`](</workspace/reports/gemm-ar-followup-20260930/README.md>).
 
 ### Target operator update (2026-09-29)
 
