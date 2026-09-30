@@ -1052,7 +1052,7 @@ def _torch_symm_extension():
         library_dirs=[f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
         libraries=["amdhip64", "c10_hip", "torch_hip", "mori_cco"],
         runtime_library_dirs=["$ORIGIN"],
-        extra_compile_args=["-std=c++17"],
+        # No -std here: torch's BuildExtension adds the standard its headers need.
     )
     ext._mori_torch_ext = True
     return [ext]
