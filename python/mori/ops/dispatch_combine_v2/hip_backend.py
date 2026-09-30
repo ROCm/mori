@@ -57,7 +57,7 @@ import torch
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
-from .dispatch_combine_op import EpDispatchCombineOp, KernelSet
+from .dispatch_combine_op import _FP4_QUANT_TYPES, EpDispatchCombineOp, KernelSet
 from .internode_regions import internode_regions
 from .symm_arena import SymmArena
 
@@ -145,16 +145,15 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-# Must match EpCombinePushSlotAlign (ep_cfg.hpp) and EpFp4Wire::kQGroup
-# (ep_intranode_1250x.hpp).
 _PUSH_SLOT_ALIGN = 128
-PUSH_QGROUP = 32
+PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128}
+_PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4}
 
 
 def push_wire_nbytes(cfg) -> int:
-    """One landing row of the fp4 combine: the MXFP4 payload, then its e8m0 scales."""
     h = cfg.hidden_dim
-    wire = h // 2 + h // PUSH_QGROUP
+    q = cfg.quant_type
+    wire = h // 2 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
     return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
 
 
@@ -311,6 +310,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._close_backend()
             self.arena.close()
             raise
+
+    @staticmethod
+    def _specs_from(cfg):
+        disp, comb = EpDispatchCombineOp._specs_from(cfg)
+        if cfg.schedule and cfg.quant_type in _FP4_QUANT_TYPES:
+            comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
+        return disp, comb
 
     def _build(self, cfg, comm):
         dev = self.dev
@@ -605,9 +611,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
         out_tok = cap * cfg.combine_token_nbytes
-        if cfg.quant_type == "fp4_blockwise":
-            # The fp4 combine's landing rows, landing[src_pe][recv_slot], sit behind
-            # the staging rows: the kernel addresses them from offOutTok.
+        if cfg.quant_type in _FP4_QUANT_TYPES:
             out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
         regions = [
             ("tok_off", 4),
@@ -643,26 +647,26 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
-        fp4 = cfg.quant_type == "fp4_blockwise"
+        q = cfg.quant_type
+        fp4 = q in _FP4_QUANT_TYPES
         if cfg.is_scatter and not fp4:
             bad.append(
-                "combine_mode='scatter' (gather only, except quant_type='fp4_blockwise')"
+                "combine_mode='scatter' (gather only, except the fp4 quant types "
+                f"{_FP4_QUANT_TYPES})"
             )
-        if cfg.quant_type not in ("none", "fp4_blockwise"):
-            bad.append(f"quant_type={cfg.quant_type!r}")
+        if q != "none" and not fp4:
+            bad.append(f"quant_type={q!r}")
         if fp4:
             if not self._is1250:
-                bad.append(
-                    "quant_type='fp4_blockwise' (the fp4 combine is gfx125x only)"
-                )
+                bad.append(f"quant_type={q!r} (the fp4 combine is gfx125x only)")
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
-                    f"quant_type='fp4_blockwise' with combine dtype {cfg.combine_dtype} "
+                    f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "
                     "(bf16 only)"
                 )
             elif cfg.hidden_dim % 1024:
                 bad.append(
-                    f"quant_type='fp4_blockwise' with hidden_dim={cfg.hidden_dim} "
+                    f"quant_type={q!r} with hidden_dim={cfg.hidden_dim} "
                     "(needs a multiple of 1024)"
                 )
         if cfg.enable_std_moe:
@@ -1201,8 +1205,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             scale_bytes=self._scale_i32(cfg) * 4,
         )
         comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type == "fp4_blockwise":
+        if cfg.quant_type in _FP4_QUANT_TYPES:
             comb_cfg["combine_fp4"] = True
+        if cfg.quant_type == "fp4_blockwise_fp32":
+            comb_cfg["combine_fp4_f32_scale"] = True
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
@@ -1226,7 +1232,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dispatch_replay=None,  # no replay path in this backend
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
-            stages_in_kernel=True,
+            stages_in_kernel=cfg.quant_type not in _FP4_QUANT_TYPES,
             # These are plain local buffers, not symmetric regions: the kernels
             # do not reset them, the op must.
             self_resets_counters=False,
@@ -1376,16 +1382,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan):
-        fp4 = self.cfg.quant_type == "fp4_blockwise"
+        fp4 = self.cfg.quant_type in _FP4_QUANT_TYPES
 
         def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
             if want_weights and fp4:
                 raise NotImplementedError(
-                    "quant_type='fp4_blockwise' folds no weights; call combine with weights=None"
+                    f"quant_type={self.cfg.quant_type!r} folds no weights; call combine "
+                    "with weights=None"
                 )
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
-                inp_token_buf=input,
+                inp_token_buf=self.combine_in_view() if fp4 else input,
                 out_token_buf=self.combine_out,
                 # Null == "skip the weight fold" (the kernel's only gate on it).
                 out_weights_buf=self.combine_out_weights if want_weights else None,
@@ -1400,9 +1407,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def push_landing(self):
-        """The fp4 combine's landing rows, [src_pe, recv_slot, wire bytes] (tests)."""
-        if self.cfg.quant_type != "fp4_blockwise":
-            raise ValueError("no landing rows: quant_type is not 'fp4_blockwise'")
+        if self.cfg.quant_type not in _FP4_QUANT_TYPES:
+            raise ValueError(
+                f"no landing rows: quant_type {self.cfg.quant_type!r} is not an fp4 one"
+            )
         view = self._views.get("push_landing")
         if view is None:
             view = from_gpu_ptr(

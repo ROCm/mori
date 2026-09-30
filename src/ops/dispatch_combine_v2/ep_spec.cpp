@@ -62,6 +62,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // in the combine dtype. Only dispatch gets the row.
   c.scaleBytes = (kind == EpKernelKind::Dispatch) ? req.scaleBytes : 0;
   c.combineFp4 = (kind == EpKernelKind::Combine) && req.combineFp4;
+  if (req.combineFp4F32Scale && !req.combineFp4) {
+    throw std::runtime_error(
+        "mori v2 ep: combineFp4F32Scale picks the fp4 combine's scale format, so it needs "
+        "combineFp4");
+  }
+  c.combineFp4F32Scale = c.combineFp4 && req.combineFp4F32Scale;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -191,7 +197,8 @@ const std::vector<std::string>& EpSourceDeps() {
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
-  return EpEntryName(cfg, cfg.combineFp4 ? "combine_fp4" : "combine");
+  if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
+  return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {

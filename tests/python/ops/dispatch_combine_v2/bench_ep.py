@@ -100,8 +100,18 @@ COMB_MODE = os.environ.get("COMB_MODE", "pull")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
-_PUSH_QGROUP = 32
-_PUSH_WIRE = (HIDDEN // 2 + HIDDEN // _PUSH_QGROUP + 127) // 128 * 128
+PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
+if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32"):
+    raise ValueError(
+        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32"
+    )
+PUSH_QRULE = os.environ.get("PUSH_QRULE")
+if not PUSH_QRULE:
+    PUSH_QRULE = "mx" if PUSH_QUANT == "fp4_blockwise" else "blk"
+if PUSH_QRULE not in ("mx", "blk"):
+    raise ValueError(f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk")
+_PUSH_QGROUP = 32 if PUSH_QRULE == "mx" else 128
+_PUSH_WIRE = (HIDDEN // 2 + HIDDEN // 32 + 127) // 128 * 128
 CHECK = int(os.environ.get("CHECK", 1))
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
@@ -226,7 +236,7 @@ def main():
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
-            quant_type="fp4_blockwise" if _PUSH else "none",
+            quant_type=PUSH_QUANT if _PUSH else "none",
         )
         return EpDispatchCombineOp(cfg, comm)
 
@@ -237,7 +247,8 @@ def main():
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
             f"init={INIT} seed={SEED} scale_dim={SCALE_DIM}x{SCALE_TS}B "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
-            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} comb_mode={COMB_MODE}",
+            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} comb_mode={COMB_MODE}"
+            + (f" push_quant={PUSH_QUANT} rule={PUSH_QRULE}" if _PUSH else ""),
             flush=True,
         )
 
@@ -325,6 +336,24 @@ def main():
         sc_byte = torch.pow(2.0, (byte - 127).float())
         return torch.sign(x) * fp4_rne(x.abs() / sc_conv) * sc_byte
 
+    def push_quant_blk(x):
+        amax = x.abs().amax(dim=-1, keepdim=True).double()
+        pos = amax > 0
+        six = torch.full_like(amax, 6.0)
+        sc = torch.where(pos, amax / six, torch.ones_like(amax)).float()
+        inv = torch.where(pos, six / amax, torch.zeros_like(amax)).float()
+        return torch.sign(x) * fp4_rne(x.abs() * inv), sc
+
+    def push_quant_ref(x, u):
+        if PUSH_QRULE == "mx":
+            return (u * push_quant_deq(x)).to(torch.bfloat16).float()
+        q, sc = push_quant_blk(x)
+        qs = q.double() * sc.double()
+        acc = torch.zeros_like(x)
+        for k in range(1, int(u.max()) + 1):
+            acc = torch.where(u >= k, (acc.double() + qs).float(), acc)
+        return acc.to(torch.bfloat16).float()
+
     def push_quant_stats(x, u, got, t0=0):
         grp = x.shape[-1]
         amax = x.abs().amax(dim=2, keepdim=True)
@@ -336,7 +365,7 @@ def main():
         nonfinite = int((~torch.isfinite(got)).sum())
         max_err = float(torch.nan_to_num(err / (u * step), nan=float("inf")).max())
         first = ""
-        ref = (u * push_quant_deq(x)).to(torch.bfloat16).float()
+        ref = push_quant_ref(x, u)
         miss = got != ref
         inexact = int(miss.flatten(1).any(dim=1).sum())
         if inexact:
@@ -377,7 +406,7 @@ def main():
         if rank == 0:
             print(
                 f"  [PUSHQUANT] ct={ct} x{scale:g} rows={int(n[1])} bad={int(n[0])} "
-                f"max_err={float(m[0]):.3f} steps rule=mx exact_bad={int(n[2])}"
+                f"max_err={float(m[0]):.3f} steps rule={PUSH_QRULE} exact_bad={int(n[2])}"
                 f" nonfinite={int(n[3])}"
                 + (f" dev_diff={int(n[4])}" if PUSH_QCHECK_DEV else "")
                 + "".join(f for f in firsts if f),

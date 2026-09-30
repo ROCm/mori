@@ -28,10 +28,9 @@
 // EpMultiWarpIter helpers are reused; the TDM machinery (amd_gfx1250_TDM.h
 // builtins, the Tdm*/Mori* helpers, the _cusplit_* staging pools) is v1 verbatim.
 //
-// SCOPE: combine keeps the UseP2PRead PULL + QUAD gather for unquantized tokens;
-// kCfg.combineFp4 selects the PUSH (UseP2PRead == false) stages instead, which
-// quantize to MXFP4. The convert paths are dropped. Same arena as the portable
-// body; the only extra EpArgs field is combineBarrierFan (local barrier scratch).
+// SCOPE: unquantized only. Combine keeps the UseP2PRead PULL + QUAD gather and
+// drops the PUSH/_nop2p and convert paths. Same arena as the portable body; the
+// only extra EpArgs field is combineBarrierFan (local barrier scratch).
 //
 // Unlike the portable body this TU does carry device globals (the _cusplit_*
 // pools); they are pure scratch and need no host init.
@@ -833,8 +832,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
 template <EpCfg kCfg>
 __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool needGridRendezvous) {
   constexpr int npes = kCfg.worldSize;
-  // The fp4 combine's rows travel as system-scope TDM stores and stage 3 invalidates before it
-  // reads them, so on that path the signal only has to be ordered after them.
   constexpr bool kReleaseOnly = kCfg.combineFp4;
   const int thdId = threadIdx.x;
   const int globalThdId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -862,8 +859,6 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   };
 
   if constexpr (!EpIsWideEp(kCfg)) {
-    // The last block to arrive signals the peers, and every block waits on the peers' signals
-    // itself: nobody polls the arrival count and block 0 releases nobody.
     if (needGridRendezvous) {
       if (thdId < kCfg.waveSize) {
         unsigned arrived = 0;
@@ -928,25 +923,17 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
   }
 }
 
-// ---------------------------------------------------------------------------
-// fp4 combine: the UseP2PRead == false stages of EpCombine1250xBody, selected by
-// kCfg.combineFp4. Stage 1 quantizes every received row to MXFP4 (32-element
-// groups, e8m0 scales) and TDM-stores it into the owner's landing row; stage 2
-// is the same EpCrossDeviceBarrier1250x the gather uses; stage 3 reduces the rows
-// that landed for this rank's tokens. The landing rows (landing[srcPe][recvSlot])
-// sit in out_tok behind its maxRecv staging rows, so EpArgs carries no field for
-// them.
-// ---------------------------------------------------------------------------
 typedef float EpF32x8 __attribute__((ext_vector_type(8)));
 typedef __bf16 EpBf16x8 __attribute__((ext_vector_type(8)));
 typedef unsigned short EpU16x2 __attribute__((ext_vector_type(2)));
 
 template <EpCfg kCfg>
 struct EpFp4Wire {
+  static constexpr bool kF32Scale = kCfg.combineFp4F32Scale;
   static constexpr int kTokB = EpTokenBytes(kCfg);
-  static constexpr int kQGroup = 32;
+  static constexpr int kQGroup = kF32Scale ? 128 : 32;
   static constexpr int kPayB = kCfg.hiddenDim / 2;
-  static constexpr int kScB = kCfg.hiddenDim / kQGroup;
+  static constexpr int kScB = kCfg.hiddenDim / kQGroup * (kF32Scale ? 4 : 1);
   static constexpr int kWireB =
       (kPayB + kScB + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
   static constexpr int kWireDw = kWireB / 4;
@@ -991,8 +978,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     constexpr int kLd = kCfg.hiddenDim / (8 * WS);
     static_assert(kCfg.hiddenDim % (8 * WS) == 0,
                   "a coalesced load is eight elements a lane, a group four lanes");
-    auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
-      const int u = i * WS + laneId;
+    auto grpAmax = [&](const uint4 x) {
       const unsigned w[4] = {x.x, x.y, x.z, x.w};
       EpU16x2 mx = {0, 0};
 #pragma unroll
@@ -1005,7 +991,11 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       amax = amax > a1 ? amax : a1;
       const unsigned a2 =
           (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
-      amax = amax > a2 ? amax : a2;
+      return amax > a2 ? amax : a2;
+    };
+    auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
+      const int u = i * WS + laneId;
+      const unsigned amax = grpAmax(x);
       const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
       const int se = (e8 < 1 ? 1 : e8) - 127;
       const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
@@ -1013,6 +1003,54 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
       *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
       d[kPayB + i * (WS / 4) + (laneId >> 2)] = (unsigned char)(se + 127);
+    };
+    auto qrowF32 = [&](unsigned char* const d, const uint4(&xs)[kLd]) {
+      constexpr int kBpl = WS / 16;
+      constexpr int kBlk = kLd * kBpl;
+      constexpr int kBr = (kBlk + WS - 1) / WS;
+      unsigned* const slot = reinterpret_cast<unsigned*>(d + kPayB);
+#pragma unroll
+      for (int i = 0; i < kLd; ++i) {
+        unsigned a = grpAmax(xs[i]);
+        const unsigned a3 =
+            (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
+        a = a > a3 ? a : a3;
+        const unsigned a4 =
+            (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
+        a = a > a4 ? a : a4;
+        if ((laneId & 15) == 0) slot[(i * WS + laneId) >> 4] = a;
+      }
+      asm volatile("" ::: "memory");
+      float inv[kBr];
+#pragma unroll
+      for (int j = 0; j < kBr; ++j) {
+        const int b = j * WS + laneId;
+        const unsigned a = b < kBlk ? slot[b] : 0u;
+        const float am = __uint_as_float((a & 0x7FFFu) << 16);
+        inv[j] = am > 0.0f ? 6.0f / am : 0.0f;
+        if (b < kBlk) slot[b] = __float_as_uint(am > 0.0f ? am / 6.0f : 1.0f);
+      }
+#pragma unroll
+      for (int i = 0; i < kLd; ++i) {
+        float iv = __int_as_float(
+            __builtin_amdgcn_readlane(__float_as_int(inv[i * kBpl / WS]), i * kBpl % WS));
+#pragma unroll
+        for (int k = 1; k < kBpl; ++k) {
+          const int b = i * kBpl + k;
+          const float o =
+              __int_as_float(__builtin_amdgcn_readlane(__float_as_int(inv[b / WS]), b % WS));
+          iv = laneId >= 16 * k ? o : iv;
+        }
+        const unsigned w[4] = {xs[i].x, xs[i].y, xs[i].z, xs[i].w};
+        EpF32x8 y;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          y[2 * e] = __uint_as_float(w[e] << 16) * iv;
+          y[2 * e + 1] = __uint_as_float(w[e] & 0xFFFF0000u) * iv;
+        }
+        *reinterpret_cast<unsigned*>(d + (size_t)(i * WS + laneId) * 4) =
+            (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(y, 1.0f);
+      }
     };
     const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
     bool next = true;
@@ -1028,8 +1066,12 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                           reinterpret_cast<const int*>(srcRows + (size_t)(r + 1) * srcStride),
                           TdmShape<int>((int)(kTokB / 4)));
       unsigned char* const d = dstTile + (size_t)r * kWireB;
+      if constexpr (W::kF32Scale) {
+        qrowF32(d, xs);
+      } else {
 #pragma unroll
-      for (int i = 0; i < kLd; ++i) qgrp(d, i, xs[i]);
+        for (int i = 0; i < kLd; ++i) qgrp(d, i, xs[i]);
+      }
     }
   };
 
@@ -1095,8 +1137,6 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   for (r0 += stride; more; r0 += stride) more = specRun(r0);
 }
 
-// Routing of one reduce item: which landed rows hold its token. Reads only
-// dispatch's map, so the first item is worked out before the barrier.
 template <EpCfg kCfg>
 __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, int it) {
   using W = EpFp4Wire<kCfg>;
@@ -1175,7 +1215,7 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
     for (int j = 0; j < npes; ++j) {
       if (j >= __popcll(mask)) break;
       const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
-      const float s = on[j] * __uint_as_float(sb[j] << 23);
+      const float s = on[j] * __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
@@ -1213,7 +1253,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       if (j >= nRow) break;
       const char* const row = sharedMem + tileOff + (size_t)(j < nRow ? j : 0) * kWireB;
       pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
-      sb[j] = (unsigned char)row[kPayB + g * 32 / kQGroup];
+      if constexpr (W::kF32Scale)
+        sb[j] = *reinterpret_cast<const unsigned*>(row + kPayB + (size_t)(g * 32 / kQGroup) * 4);
+      else
+        sb[j] = (unsigned char)row[kPayB + g * 32 / kQGroup];
     }
     accStore(g, pk, sb);
   }
@@ -1225,7 +1268,6 @@ __device__ __forceinline__ void EpFp4CombineReduce(const EpArgs& args,
   const int warpId = threadIdx.x / kCfg.waveSize;
   const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + warpId;
   const int globalWarpNum = (int)gridDim.x * kCfg.warpPerBlock;
-  // The landed rows were written by peers: drop this CU's cached copies before reading them.
   if (warpId == 0) asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
   __builtin_amdgcn_s_barrier();
   const int nItems = args.numTokens * EpFp4Wire<kCfg>::kItemPass;

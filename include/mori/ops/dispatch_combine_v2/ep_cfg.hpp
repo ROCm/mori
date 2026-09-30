@@ -244,9 +244,8 @@ struct EpCfg {
   // is free: Render omits default-valued fields, so the Cfg text -- which IS the
   // JIT cache key -- is byte-identical to a build without this feature.
   int scaleBytes = 0;
-  // Combine only, gfx125x only: quantize to MXFP4 and push (UseP2PRead == false).
-  // Off by default, so an unquantized combine renders the same Cfg text.
   bool combineFp4 = false;
+  bool combineFp4F32Scale = false;
 };
 
 template <typename Self, typename Visit>
@@ -265,10 +264,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(useWeights);
   MORI_FIELD(scaleBytes);
   MORI_FIELD(combineFp4);
+  MORI_FIELD(combineFp4F32Scale);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 13, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 14, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
