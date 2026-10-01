@@ -22,7 +22,7 @@ endif()
 # as local, so none are re-exported (no symbol leakage / interposition). cco's
 # own cco* symbols live in this target's object file, not an archive, so they
 # stay exported. The static archive's INTERFACE brings the external link deps
-# (hip/dl/pci/hsa/hsakmt[/mpi]); the ibverbs dlopen shim is embedded, so cco
+# (hip/dl/hsa/hsakmt[/mpi]); the ibverbs dlopen shim is embedded, so cco
 # links neither libmori_application.so nor libibverbs directly.
 target_link_libraries(mori_cco PRIVATE
                       -Wl,--whole-archive mori_application_static -Wl,--no-whole-archive)
