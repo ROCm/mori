@@ -189,6 +189,15 @@ class CollectivesFacade {
       return -1;
     }
     HIP_RUNTIME_CHECK(hipMemset(facade.barrierCtr_, 0, sizeof(uint64_t)));
+    // Collective-permute ready tokens. Slot p of my copy is written only by PE p
+    // ("p has entered the permute and may receive from me"); I clear it on use.
+    facade.permuteReady_ =
+        static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
+    if (facade.permuteReady_ == nullptr) {
+      FACADE_PRINTF("CollectivesFacade: failed to carve permute ready tokens from heap");
+      return -1;
+    }
+    HIP_RUNTIME_CHECK(hipMemset(facade.permuteReady_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
 
     // Staging is the push path's peer-writable scratch (SDMA scatter target).
     // Pull needs none.
@@ -408,6 +417,7 @@ class CollectivesFacade {
   uint32_t* groupCounters_{nullptr};
   uint64_t* syncFlags_{nullptr};  // symmetric, pull all-reduce inter-shot handshake
   uint64_t* barrierCtr_{nullptr};  // symmetric, push collectives' entry barrier
+  uint64_t* permuteReady_{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
   AddressPair* pinnedPairs_{nullptr};  // host-pinned, device-readable
   mori::cco::ccoComm* ccoComm_{nullptr};
   // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -668,7 +678,8 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
   }
   constexpr int kThreads = 256;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(nPes_, dstPe, srcPe, sendBuf, recvBuf,
-                                                          numBytes, devComm_, heapWin_);
+                                                          numBytes, devComm_, heapWin_,
+                                                          permuteReady_);
   return hipGetLastError();
 }
 
