@@ -115,6 +115,14 @@ _PUSH_WIRE = (HIDDEN // 2 + HIDDEN // 32 + 127) // 128 * 128
 CHECK = int(os.environ.get("CHECK", 1))
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
+# ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
+# ROUTE=ring: ATOM's --fake-eplb placement, where position p = token * TOPK + j lands
+# on rank p % world. With TOPK >= world every token reaches every rank, so the
+# largest SWEEP point fills each receive buffer to exactly its capacity -- the case
+# that overwrites anything parked at the end of the landing zone.
+# ROUTE=noself: rand without the experts of the token's own rank, so no rank
+# receives from itself.
+ROUTE = os.environ.get("ROUTE", "rand")
 # Payload distribution and RNG seed: DATA_INIT=zero|constant|uniform|norm, SEED,
 # CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
 # describe the same input. Defaults reproduce this file's previous behaviour.
@@ -185,11 +193,24 @@ def main():
         dev
     )
     wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
-    idx = (
-        torch.stack([torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)])
-        .to(torch.int32)
-        .to(dev)
-    )
+    if ROUTE == "ring":
+        pos = (rank + torch.arange(M) * world).unsqueeze(1) * TOPK + torch.arange(TOPK)
+        idx = ((pos % world) * EPR + (pos // world) % EPR).to(torch.int32).to(dev)
+    elif ROUTE == "rand":
+        idx = (
+            torch.stack(
+                [torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)]
+            )
+            .to(torch.int32)
+            .to(dev)
+        )
+    elif ROUTE == "noself":
+        idx = torch.stack(
+            [torch.randperm(n_experts - EPR, generator=gr)[:TOPK] for _ in range(M)]
+        )
+        idx = (idx + (idx >= rank * EPR).long() * EPR).to(torch.int32).to(dev)
+    else:
+        raise ValueError(f"ROUTE={ROUTE!r}: expected rand, ring or noself")
     # Per-token scale rows, transported when SCALE_DIM>0 (fp8/fp4 by default). Shaped
     # exactly as repro_epv2_topk9.py: sc_n_i32 int32 lanes viewed as bytes, trimmed to
     # SCALE_DIM so scale_type_size=1 * scale_dim holds. Deterministic (arange + rank
@@ -248,6 +269,7 @@ def main():
             f"init={INIT} seed={SEED} scale_dim={SCALE_DIM}x{SCALE_TS}B "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
             f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} comb_mode={COMB_MODE}"
+            f" route={ROUTE}"
             + (f" push_quant={PUSH_QUANT} rule={PUSH_QRULE}" if _PUSH else ""),
             flush=True,
         )
@@ -617,9 +639,34 @@ def main():
                     raise RuntimeError(f"hipEventElapsedTime rc={r}")
                 return ms.value * 1000.0
 
+            # LATE_US: rank 0 reaches every dispatch that much after the others, as
+            # the last rank to arrive does in serving. Its gd then runs from the
+            # last arrival to its own end -- the tail the others cannot hide.
+            late_us = float(os.environ.get("LATE_US", "0") or 0)
+            late_cyc = 0
+            if late_us > 0:
+                # torch.cuda._sleep counts device clock cycles; take the rate here.
+                cal = 2_000_000
+                e0 = torch.cuda.Event(enable_timing=True)
+                e1 = torch.cuda.Event(enable_timing=True)
+                torch.cuda._sleep(cal)
+                e0.record()
+                torch.cuda._sleep(cal)
+                e1.record()
+                torch.cuda.synchronize()
+                per_us = cal / (e0.elapsed_time(e1) * 1000.0)
+                late_cyc = int(late_us * per_us)
+                if rank == 0:
+                    print(
+                        f"[LATE] rank 0 sleeps {late_us:g} us = {late_cyc} cycles "
+                        f"({per_us:.1f}/us) before every dispatch",
+                        flush=True,
+                    )
             gg = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gg):
                 for i in range(gevr):
+                    if late_cyc and rank == 0:
+                        torch.cuda._sleep(late_cyc)
                     rec_ext(gev[i][0])
                     rd()
                     rec_ext(gev[i][1])

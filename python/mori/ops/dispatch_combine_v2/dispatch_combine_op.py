@@ -1050,6 +1050,10 @@ class EpDispatchCombineOp:
         tokoff_ext = getattr(self, "_tokoff_ext", None)
         if tokoff_ext is not None:
             tokoff_ext.zero()
+        # So does MORI_EP_SELF_FIRST its per-call state (ep_plans.SelfFirstState).
+        self_first = getattr(self, "_self_first_state", None)
+        if self_first is not None:
+            self_first.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()

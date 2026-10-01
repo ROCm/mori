@@ -1220,6 +1220,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
+        # Outside the arena, so reset() has to zero it itself.
+        self._self_first_state = cb.SelfFirstState.of(arena)
         for b, w in self._combine_specs:
             plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
@@ -1242,6 +1244,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def _close_backend(self):
+        # The plans hold the references; the last one to close frees it.
+        self._self_first_state = None
         for plan in getattr(self, "_plans", ()):
             plan.close()
         ext = getattr(self, "_tokoff_ext", None)

@@ -131,6 +131,14 @@ struct EpArgs {
   // uint8[maxRecv*scaleBytes]. Only read when Cfg.scaleBytes > 0; the arena does
   // not carry the region otherwise, so this stays 0 and nothing dereferences it.
   unsigned long long offOutScales = 0;
+  // Not arena offsets: where the Cfg.selfFirst state lives, EpSelfFirstBytes(worldSize)
+  // laid out from byte 0 of a window of its own, so that whoever lays out the arena
+  // never has to know it exists; mori allocates it per arena (ep_plans.SelfFirstState).
+  // PE p's copy is at sfBase + p * sfStride: the cco flat-VA layout, resolved on the
+  // host so the kernel never loads that window's descriptor on the way to its atomics.
+  // Only read when Cfg.selfFirst, 0 otherwise.
+  unsigned long long sfBase = 0;
+  unsigned long long sfStride = 0;
 
   // Which LSA rank this is. Runtime for the same reason: as a Cfg field it made
   // all eight ranks compile their own copy of an identical kernel.
@@ -175,6 +183,8 @@ struct EpArgs {
   X(offOutTok, "u64")          \
   X(offXdb, "u64")             \
   X(offOutScales, "u64")       \
+  X(sfBase, "u64")             \
+  X(sfStride, "u64")           \
   X(rank, "i32")               \
   X(tokenIndices, "p")         \
   X(inpTokenBuf, "p")          \
@@ -212,7 +222,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 25,
+static_assert(detail::kEpArgsFieldCount == 27,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -246,6 +256,14 @@ struct EpCfg {
   int scaleBytes = 0;
   bool combineFp4 = false;
   bool combineFp4F32Scale = false;
+  // Dispatch only, gfx125x only (MakeEpCfg): this rank never RMWs its own slot
+  // allocator word. On memory mapped MTYPE_RW, a local RMW on the word the peers'
+  // remote RMWs also hit costs several microseconds per call. The peers' slots are
+  // what their RMWs return, [0, R), with no wait on this rank; its own tokens go to
+  // [R, R + own), R being the sum of what every peer publishes, through the state at
+  // EpArgs::sfBase, once all its blocks have reserved. A late rank therefore holds up
+  // no sender. Off is free for the same reason as scaleBytes.
+  bool selfFirst = false;
 };
 
 template <typename Self, typename Visit>
@@ -265,10 +283,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(scaleBytes);
   MORI_FIELD(combineFp4);
   MORI_FIELD(combineFp4F32Scale);
+  MORI_FIELD(selfFirst);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 14, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 15, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -360,6 +379,37 @@ constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
 }
 
+// The Cfg.selfFirst state, at EpArgs::sfBase: symmetric memory of its own, so
+// nothing else is ever written there, whatever the receive count.
+//   [EpSelfFirstInboxStride * src]  inbox, written by peer src: (call number << 32)
+//                                   | the slots src took in this rank that call
+//   [EpSelfFirstCtrOff]             (arrived blocks << 20) | own tokens reserved so
+//                                   far; this rank's blocks only
+//   [EpSelfFirstSeqOff]             calls completed; equal on every rank because
+//                                   every rank runs every call on the arena
+//   [EpSelfFirstPubOff]             blocks past their reservations this call; the
+//                                   last one publishes to the peers
+// The counter and the ticket each start a 128 B line of their own, so their RMWs
+// never share a line with each other or with the stores peers make into the inbox.
+// The state must be zero when it is allocated and after every collective reset
+// (ep_plans.SelfFirstState does both). self_first_state_bytes() in ep_plans.py is
+// the host-side copy of EpSelfFirstBytes.
+constexpr unsigned long long EpSelfFirstInboxStride = 64;
+constexpr unsigned long long EpSelfFirstLine = 128;
+constexpr unsigned long long EpSelfFirstCtrOff(int worldSize) {
+  return (EpSelfFirstInboxStride * (unsigned long long)worldSize + EpSelfFirstLine - 1) /
+         EpSelfFirstLine * EpSelfFirstLine;
+}
+constexpr unsigned long long EpSelfFirstSeqOff(int worldSize) {
+  return EpSelfFirstCtrOff(worldSize) + 64;
+}
+constexpr unsigned long long EpSelfFirstPubOff(int worldSize) {
+  return EpSelfFirstCtrOff(worldSize) + EpSelfFirstLine;
+}
+constexpr unsigned long long EpSelfFirstBytes(int worldSize) {
+  return EpSelfFirstPubOff(worldSize) + EpSelfFirstLine;
+}
+
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
 // engine; combine reserves the whole budget and sizes its tiles at runtime.
 // EpCombine1250xLdsBudget must match MORI_COMB_LDS_BUDGET in ep_intranode_1250x.hpp.
@@ -430,7 +480,12 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // WarpCopy moves whole 16 B chunks.
          (EpTokenBytes(c) % 16) == 0 &&
          // Scale rows are copied as dwords, so the row must be dword-sized.
-         c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0;
+         c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0 &&
+         // selfFirst: warp 1 takes this rank's own-token step while warp 0 issues
+         // the remote reservations, and one lane per peer publishes what this rank
+         // took there. The arrival count packs into 12 bits of the counter word.
+         (!c.selfFirst ||
+          (c.warpPerBlock >= 2 && c.worldSize <= c.waveSize && c.blockNum < 4096));
 }
 
 }  // namespace v2

@@ -269,6 +269,45 @@ __device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
                                      : EpPeer<index_t>(args.window, pe, args.offTokOff);
 }
 
+// Cfg.selfFirst state, laid out by EpSelfFirstBytes (ep_cfg.hpp); PE pe's copy is at
+// args.sfBase + pe * args.sfStride. Intranode, so the world rank is the LSA rank.
+template <typename T>
+__device__ __forceinline__ T* EpSelfFirstAt(const EpArgs& args, int pe, unsigned long long off) {
+  return reinterpret_cast<T*>(args.sfBase + (unsigned long long)pe * args.sfStride + off);
+}
+// Inbox slot `src` of PE `pe`: where src publishes, each call, how many slots it took
+// in pe.
+__device__ __forceinline__ unsigned long long* EpSelfFirstInbox(const EpArgs& args, int pe,
+                                                                int src) {
+  return EpSelfFirstAt<unsigned long long>(args, pe, EpSelfFirstInboxStride * (unsigned)src);
+}
+template <int kWorldSize>
+__device__ __forceinline__ unsigned* EpSelfFirstCtr(const EpArgs& args) {
+  return EpSelfFirstAt<unsigned>(args, args.rank, EpSelfFirstCtrOff(kWorldSize));
+}
+template <int kWorldSize>
+__device__ __forceinline__ unsigned* EpSelfFirstSeq(const EpArgs& args) {
+  return EpSelfFirstAt<unsigned>(args, args.rank, EpSelfFirstSeqOff(kWorldSize));
+}
+template <int kWorldSize>
+__device__ __forceinline__ unsigned* EpSelfFirstPub(const EpArgs& args) {
+  return EpSelfFirstAt<unsigned>(args, args.rank, EpSelfFirstPubOff(kWorldSize));
+}
+
+// The slots PE `pe` took in this rank in call `seq`, from this rank's inbox.
+// Unbounded like every other wait in this kernel: without it the own tokens' slots
+// are unknown, and any guess would land two tokens in one slot.
+__device__ __forceinline__ index_t EpSelfFirstPeerSent(const EpArgs& args, int pe, unsigned seq) {
+  unsigned long long* w =
+      EpSelfFirstAt<unsigned long long>(args, args.rank, EpSelfFirstInboxStride * (unsigned)pe);
+  unsigned long long v = __hip_atomic_load(w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  while ((unsigned)(v >> 32) != seq) {
+    __builtin_amdgcn_s_sleep(1);
+    v = __hip_atomic_load(w, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  return (index_t)(v & 0xffffffffull);
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -381,17 +420,63 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const int _bmPerTok = topk * 4 + topk * 4 + 4;
   const int _bmTileB = (int)(hiddenDim * sizeof(T));
   const bool _blkMapNeeded = !((_bmPerTok > 0) && (((_bmTileB - 384) / _bmPerTok) > 0));
+  // selfFirst: the call number this call publishes under. A plain load on purpose:
+  // every thread runs it, and an atomic load would queue the whole grid on one
+  // address; the previous call's store is visible across the kernel boundary.
+  [[maybe_unused]] unsigned sfSeq = 0;
+  if constexpr (kCfg.selfFirst) {
+    static_assert(npes <= WS, "one lane per peer publishes what this rank sent it");
+    sfSeq = *EpSelfFirstSeq<npes>(args) + 1u;
+    // Own tokens on warp 1, overlapping warp 0's remote reservations: `rel` is this
+    // block's offset among the own tokens, relative to R, the slots the peers take
+    // here -- which is only known in the own pass. The last arrival resets the counter.
+    if (warpId == 1) {
+      const index_t n = s_N[myPe];
+      unsigned prev = 0;
+      if (laneId == 0)
+        prev = __hip_atomic_fetch_add(EpSelfFirstCtr<npes>(args), (1u << 20) | (unsigned)n,
+                                      __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      prev = (unsigned)__shfl((int)prev, 0);
+      const index_t rel = (index_t)(prev & 0xfffffu);
+      if ((prev >> 20) == gridDim.x - 1u && laneId == 0)
+        __hip_atomic_store(EpSelfFirstCtr<npes>(args), 0u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      if (laneId == 0) {
+        if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + myPe] = n;
+        if (n > 0) {
+          s_base[myPe] = rel;
+          if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + myPe] = rel;
+          atomicAdd(&args.destPeTokenCounter[myPe], n);
+        }
+      }
+    }
+  }
   for (int p = thdId; p < npes; p += blockDim.x) {
+    if constexpr (kCfg.selfFirst) {
+      if (p == myPe) continue;
+    }
     index_t n = s_N[p];
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) {
+      // With selfFirst the word counts the peers' tokens only and p's own ones go
+      // above them, so the slot is final as returned: no sender waits on p.
       s_base[p] =
           __hip_atomic_fetch_add(EpTokOff(args, p), n, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
       atomicAdd(&args.destPeTokenCounter[p], n);
     }
   }
+  // selfFirst: one ticket per block once its reservations are in destPeTokenCounter.
+  // The lanes that added are this wave's, so the release orders their adds before
+  // the ticket. Drawn after the barrier and read only after the assignment pass,
+  // so its round trip overlaps that pass instead of holding the barrier.
+  [[maybe_unused]] unsigned pubTicket = 0;
   __syncthreads();
+  if constexpr (kCfg.selfFirst) {
+    if (warpId == 0 && laneId == 0)
+      pubTicket = __hip_atomic_fetch_add(EpSelfFirstPub<npes>(args), 1u, __ATOMIC_RELEASE,
+                                         __HIP_MEMORY_SCOPE_AGENT);
+  }
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
   if (args.tokenIndices && args.inpTokenBuf) {
     int _gszReq = topk;
@@ -426,8 +511,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       if (keep) {
         index_t j = atomicAdd(&s_run[myDestPe], 1);
         myDestTokId = s_base[myDestPe] + j;
+        // selfFirst: an own token is staged at its slot relative to R and mapped
+        // only once R is known; until then no copy pass may pick it up.
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
-            EpFlatIndex<kCfg>(myDestPe, myDestTokId);
+            (kCfg.selfFirst && myDestPe == myPe) ? EpNullFlat<kCfg>()
+                                                 : EpFlatIndex<kCfg>(myDestPe, myDestTokId);
         if (myDestTokId < _stgCap)
           _cusplit_stgSrc[(size_t)myDestPe * _stgCap + myDestTokId] =
               EpSrcTokIndex<kCfg>(myPe, tok);
@@ -493,6 +581,27 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __syncthreads();
+  // selfFirst: the last block past its reservations tells every peer how many slots
+  // this rank took in it -- that peer's R is the sum of these. Published even when
+  // zero: the peer waits for every rank's number before placing its own tokens.
+  if constexpr (kCfg.selfFirst) {
+    if (warpId == 0) {
+      pubTicket = (unsigned)__shfl((int)pubTicket, 0);
+      if (pubTicket == gridDim.x - 1u) {
+        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        if (laneId == 0)
+          __hip_atomic_store(EpSelfFirstPub<npes>(args), 0u, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_AGENT);
+        if (laneId < npes && laneId != myPe) {
+          const index_t sent = __hip_atomic_load(args.destPeTokenCounter + laneId,
+                                                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          __hip_atomic_store(EpSelfFirstInbox(args, laneId, myPe),
+                             ((unsigned long long)sfSeq << 32) | (unsigned)sent, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+      }
+    }
+  }
 
   int _pfN = 0;
   index_t _pfSlot0 = 0;
@@ -530,7 +639,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             }
             _pfN = _pfn;
             _pfSlot0 = _pfBase;
-            _pfDst = EpPeer<T>(win, _pfPe, args.offDispOut);
+            // selfFirst: the own rows are loaded here all the same, but their slot is
+            // R above _pfBase; no destination, so only the own pass stores them.
+            _pfDst = (kCfg.selfFirst && _pfPe == myPe) ? nullptr
+                                                       : EpPeer<T>(win, _pfPe, args.offDispOut);
           }
         }
       }
@@ -557,9 +669,16 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
       const int split = _peerSplit;
       const int nRuns = npes * split;
+      // selfFirst numbers the runs peer-minor when the warps divide evenly, so warp w
+      // takes peer w % npes -- the destination it also carries in the payload pass.
+      // The warps of the own run, which is skipped here, are then the ones the own
+      // pass needs, and they start it at once instead of after a remote run: at 512
+      // tokens that ordering is worth ~2 us of the dispatch.
+      const bool _runPeerMinor = kCfg.selfFirst && (warpNum % npes) == 0;
       for (int r = warpId; r < nRuns; r += warpNum) {
-        int peer = r / split;
-        int part = r - peer * split;
+        int peer = _runPeerMinor ? (r % npes) : (r / split);
+        int part = _runPeerMinor ? (r / npes) : (r - peer * split);
+        if (kCfg.selfFirst && peer == myPe) continue;  // the own pass ships it, after R
         index_t cntAll = s_N[peer];
         if (cntAll <= 0) continue;
         index_t baseAll = s_base[peer];
@@ -652,11 +771,22 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           }
         }
       }
+      // selfFirst skips the own run, which may be the one that would have shipped
+      // this warp's prefetched tile; ship it here rather than load it again.
+      if (kCfg.selfFirst && !_pfSent && _pfN > 0 && _pfDst != nullptr) {
+        __builtin_amdgcn_s_wait_tensorcnt(0);
+        TdmIssueStore<int>(reinterpret_cast<int*>(_pfDst + (size_t)_pfSlot0 * hiddenDim),
+                           reinterpret_cast<int*>(_tdmTile),
+                           TdmShape<int>(_pfN * ((int)(hiddenDim * sizeof(T)) / 4)));
+        _pfSent = true;
+        _mPend = true;
+      }
     } else {
       const int nItems = npes * kMetaFields;
       for (int item = warpId; item < nItems; item += warpNum) {
         int peer = item / kMetaFields;
         int field = item - peer * kMetaFields;
+        if (kCfg.selfFirst && peer == myPe) continue;  // the own pass ships it, after R
         if (field == 1 && !(kCfg.useWeights && args.weightsBuf)) continue;
         index_t cnt = _cusplit_blkCount[(size_t)blockIdx.x * npes + peer];
         if (cnt <= 0) continue;
@@ -699,11 +829,114 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     static_assert(!kFp4Pack4 || kPack * kTokB <= kSlabBytes,
                   "four FP4 tokens must fit in the per-warp LDS slab");
     constexpr bool kUnitGeom = kFp4Pack4 && npes == 4 && (kCfg.warpPerBlock % 4) == 0;
+    // selfFirst: part `part` of `nParts` of this block's own run. It was staged at
+    // s_base[myPe] relative to R, the slots the peers took here; only destinations
+    // move -- the payload rows, the metadata rows, and the map entries the
+    // assignment pass left null. R needs every peer's number, so this is the one
+    // wait of the call that a late peer can stretch, and nothing remote is behind it.
+    // `pre`: rows of the first batch the prefetch already put in this warp's tile.
+    // Everything that does not need R is issued before it is awaited, and the
+    // copies after it are one round trip each rather than one per slot: at 512
+    // tokens this chain, not the bytes, is what the call waits for.
+    [[maybe_unused]] auto ownPass = [&](int part, int nParts, int pre) {
+      const index_t nOwn = s_N[myPe];
+      const index_t q = nOwn / (index_t)nParts, rm = nOwn - q * (index_t)nParts;
+      const index_t cnt = q + (((index_t)part < rm) ? (index_t)1 : (index_t)0);
+      if (cnt <= 0) return;
+      const index_t s0 =
+          s_base[myPe] + (index_t)part * q + (((index_t)part < rm) ? (index_t)part : rm);
+      const size_t stg = (size_t)myPe * _stgCap;
+      const index_t* __restrict__ const sR = _cusplit_stgSrc + stg + s0;
+      const T* const src = reinterpret_cast<const T*>(args.inpTokenBuf);
+      auto loadBatch = [&](index_t i, int n) {
+#pragma unroll
+        for (int k = 0; k < kPack; ++k) {
+          if (k < n) {
+            const int srcTok = (int)sR[i + k] % kCfg.maxTokPerRank;
+            TdmIssueLoad<T>(_tdmTile + (size_t)k * hiddenDim, src + (size_t)srcTok * hiddenDim,
+                            _tdmG1);
+          }
+        }
+      };
+      const int n0 = (int)((cnt < (index_t)kPack) ? cnt : (index_t)kPack);
+      if (pre != n0) loadBatch(0, n0);
+      index_t r =
+          (laneId < npes && laneId != myPe) ? EpSelfFirstPeerSent(args, laneId, sfSeq) : 0;
+      for (int off = WS / 2; off > 0; off >>= 1) r += __shfl_xor(r, off);
+      const index_t d0 = r + s0;
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+      if (d0 + cnt > (index_t)EpMaxRecv(kCfg)) return;  // dropped, as the meta pass drops it
+      T* const dst = EpPeer<T>(win, myPe, args.offDispOut);
+      auto storeBatch = [&](index_t i, int n) {
+        if constexpr (kPack > 1)
+          TdmIssueStore<int>(reinterpret_cast<int*>(dst + (size_t)(d0 + i) * hiddenDim),
+                             reinterpret_cast<int*>(_tdmTile), TdmShape<int>(n * (kTokB / 4)));
+        else
+          TdmIssueStore<T>(dst + (size_t)(d0 + i) * hiddenDim, _tdmTile, _tdmG1);
+      };
+      storeBatch(0, n0);
+      {
+        const index_t* __restrict__ sI =
+            _cusplit_stgIdx + stg * CUSPLIT_MAX_TOPK + (size_t)s0 * topk;
+        const float* __restrict__ sW = _cusplit_stgWt + stg * CUSPLIT_MAX_TOPK + (size_t)s0 * topk;
+        index_t* __restrict__ dI = EpPeer<index_t>(win, myPe, args.offOutIdx) + (size_t)d0 * topk;
+        float* __restrict__ dW = EpPeer<float>(win, myPe, args.offOutWts) + (size_t)d0 * topk;
+        const bool wts = kCfg.useWeights && args.weightsBuf;
+        for (int i = laneId; i < (int)cnt * topk; i += WS) {
+          const index_t a = sI[i];
+          const float b = wts ? sW[i] : 0.0f;
+          dI[i] = a;
+          if (wts) dW[i] = b;
+        }
+      }
+      if constexpr (kEpScaleStride > 0) {
+        if (args.scalesBuf) {
+          constexpr int kSdw = kEpScaleStride / 4;
+          const unsigned int* __restrict__ sS = reinterpret_cast<const unsigned int*>(
+              _cusplit_stgScale + ((size_t)myPe * kEpScaleRows + (size_t)s0) * kEpScaleStride);
+          unsigned int* __restrict__ dS =
+              EpPeer<unsigned int>(win, myPe, args.offOutScales) + (size_t)d0 * kSdw;
+          for (int i = laneId; i < (int)cnt * kSdw; i += WS) dS[i] = sS[i];
+        }
+      }
+      // One slot per lane: its reverse-map entry, and the map entry of the (token, k)
+      // the assignment pass kept -- the lowest k whose expert lives on this rank, by
+      // the same rule it used to pick one per token.
+      {
+        index_t* __restrict__ dR = EpPeer<index_t>(win, myPe, args.offRecvToSrc) + d0;
+        for (int i = laneId; i < (int)cnt; i += WS) {
+          const index_t sv = sR[i];
+          dR[i] = sv;
+          const int tok = (int)sv % kCfg.maxTokPerRank;
+          const index_t* __restrict__ ti = args.tokenIndices + (size_t)tok * topk;
+          int kk = -1;
+#pragma unroll
+          for (int k = topk - 1; k >= 0; --k) {
+            const index_t e = ti[k];
+            if (e >= 0 && (int)(e / kCfg.numExpertPerRank) == myPe) kk = k;
+          }
+          if (kk >= 0)
+            args.dispDestTokIdMap[(size_t)tok * topk + kk] = EpFlatIndex<kCfg>(myPe, d0 + i);
+        }
+      }
+      for (index_t i = n0; i < cnt; i += kPack) {
+        int n = (int)(cnt - i);
+        if (n > kPack) n = kPack;
+        __builtin_amdgcn_s_wait_tensorcnt(0);
+        loadBatch(i, n);
+        __builtin_amdgcn_s_wait_tensorcnt(0);
+        storeBatch(i, n);
+      }
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+    };
     if constexpr (kUnitGeom) {
       const int destPe = warpId & 3;
       const int unit = warpId >> 2;
       constexpr int nUnits = kCfg.warpPerBlock / 4;
-      const index_t cntAll = s_N[destPe];
+      const index_t cntAll = (kCfg.selfFirst && destPe == myPe) ? (index_t)0 : s_N[destPe];
+      if constexpr (kCfg.selfFirst) {
+        if (destPe == myPe) ownPass(unit, nUnits, _pfN);
+      }
       if (cntAll > 0) {
         const index_t part = cntAll / (index_t)nUnits;
         const index_t rem = cntAll - part * (index_t)nUnits;
@@ -763,6 +996,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           __builtin_amdgcn_s_wait_tensorcnt(0);
         }
       }
+      if constexpr (kCfg.selfFirst) ownPass(warpId, warpNum, 0);
     }
   }
   __syncthreads();
@@ -795,6 +1029,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       (warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket);
   if (holdsHighestTicket) {
     __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // Every block of this rank is past its reads of the call number, so this is
+    // the one store of it. The inbox needs no reset: a peer publishes its next
+    // number only after it has this rank's signal of this call, which the loop
+    // below sends once every block here is past its own pass, the only reader.
+    if constexpr (kCfg.selfFirst) {
+      if (laneId == 0) *EpSelfFirstSeq<npes>(args) = sfSeq;
+    }
 
     for (int destPe = laneId; destPe < npes; destPe += WS) {
       index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;

@@ -54,6 +54,19 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
 | `internode_tuning_configs.py` | **hip** internode kernel geometry, a third table: token-count buckets keyed by device, shape, topk and dispatch dtype, carrying `(block_num, rdma_block_num, warp_num)` **per phase** — dispatch and combine are tuned to different values over one shared arena. The internode plans are compiled per geometry, so the backend walks the whole table at build time and `lookup` only picks a prebuilt bucket; `block_num` is clamped to the CU count |
 
+## gfx125x dispatch: `MORI_EP_SELF_FIRST`
+
+On by default. The hip dispatch on gfx125x then never makes a rank RMW its own
+slot allocator word: on memory mapped MTYPE_RW, that local RMW on the word the
+peers' remote RMWs also hit costs microseconds per call. A sender's slot in a peer
+is what its remote RMW returns, with no wait on that peer; once all of a rank's
+blocks have reserved, it publishes to every peer how many slots it took there,
+and each rank places its own tokens above the sum of those. The state this needs
+is a few hundred bytes of symmetric memory per arena that `EpDispatchPlan`
+allocates on the arena's communicator itself, so an arena built outside this
+package needs nothing for it. `MORI_EP_SELF_FIRST=0` selects the original
+protocol, the better one where local memory is not mapped MTYPE_RW.
+
 ## Internode config
 
 There is no kernel-type enum: the internode path is selected by
@@ -80,12 +93,12 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (default 1), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
 | `test_internode_regions.py` | pure-Python invariants of `internode_regions()`: the name contract with the backend and the capacity bounds the kernel's indexing implies. No GPU, no process group |
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
-| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels |
+| `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
-| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR` |
+| `bench_ep.py` | the perf bench, for every backend. Alternating dispatch/combine pairs, eager + CUDA graph, each point gated on an identity-expert check and non-zero exit on failure. Envs: `BACKENDS=flydsl,hip`, `MODES=eager,graph`, `SWEEP`, `ITERS`, `DISP=bf16\|fp8\|fp4`, `COMBINE_IN=inplace\|staged`, `CHECK=0`, `DBN`/`DWPB`/`CBN`/`CWPB` to pin geometry, `HIDDEN`/`TOPK`/`EPR`, `ROUTE=rand\|ring\|noself`, `LATE_US` (rank 0 reaches every timed dispatch that many µs after the others) |
 
 (Each script inlines a tiny torchrun/gloo `Dist` bootstrap — gloo only carries the cco unique-id and pass/fail counts.)
 
