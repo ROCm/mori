@@ -1133,6 +1133,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     return r0 + stride < tot;
   };
   int r0 = warpId * nbRows + (int)blockIdx.x;
+  if (r0 >= args.totalRecvTokenNum[0]) return;
   bool more = specRun(r0);
   for (r0 += stride; more; r0 += stride) more = specRun(r0);
 }

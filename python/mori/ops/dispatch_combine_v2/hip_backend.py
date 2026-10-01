@@ -1232,7 +1232,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dispatch_replay=None,  # no replay path in this backend
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
-            stages_in_kernel=cfg.quant_type not in _FP4_QUANT_TYPES,
+            stages_in_kernel=True,
             # These are plain local buffers, not symmetric regions: the kernels
             # do not reset them, the op must.
             self_resets_counters=False,
@@ -1392,7 +1392,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
-                inp_token_buf=self.combine_in_view() if fp4 else input,
+                inp_token_buf=input,
                 out_token_buf=self.combine_out,
                 # Null == "skip the weight fold" (the kernel's only gate on it).
                 out_weights_buf=self.combine_out_weights if want_weights else None,
