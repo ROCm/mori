@@ -286,12 +286,12 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
     for (int dstPe : sdmaPeers) {
       int dstNode = context.KfdNodeId(dstPe);  // KFD node id -> anvil queue key
       for (size_t q = 0; q < numOfQueuesPerDevice; q++) {
-        anvil::SdmaQueueDeviceHandle* handle = nullptr;
-        if (auto* queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)) {
-          handle = queue->deviceHandle();
-        } else {
+        auto* queue = anvil::anvil.getSdmaQueue(srcNode, dstNode, q);
+        if (queue == nullptr) {
           MORI_APP_ERROR("SDMA queue missing for node pair {} -> {}: idx={}", srcNode, dstNode, q);
+          continue;
         }
+        auto* handle = queue->deviceHandle();
         HIP_RUNTIME_CHECK(hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
                                     &handle, sizeof(handle), hipMemcpyHostToDevice));
       }
