@@ -67,6 +67,15 @@ allocates on the arena's communicator itself, so an arena built outside this
 package needs nothing for it. `MORI_EP_SELF_FIRST=0` selects the original
 protocol, the better one where local memory is not mapped MTYPE_RW.
 
+With it on, a call small enough to give every block at most 8 warp work units
+(512 tokens on the default 64 × 16 geometry at top-k 6) is spread over all the
+blocks instead of filling the low half: block b takes units [8b, 8b + 8) on its
+first 8 warps. Where the payload pass walks the token map, the warps left without
+a token then send all of the metadata, so the token warps go straight to the
+payload. Geometries with at most 8 warps per
+block, such as EP4's tuned 64 × 8, compile to the same code as without it;
+`MORI_JIT_EXTRA_FLAGS=-DMORI_EP_TOKCHUNK=0` turns it off.
+
 ## Internode config
 
 There is no kernel-type enum: the internode path is selected by

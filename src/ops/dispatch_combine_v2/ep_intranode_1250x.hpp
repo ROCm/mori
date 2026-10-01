@@ -308,6 +308,44 @@ __device__ __forceinline__ index_t EpSelfFirstPeerSent(const EpArgs& args, int p
   return (index_t)(v & 0xffffffffull);
 }
 
+// The plain token map fills block b with its warpPerBlock consecutive work units, so a
+// call with fewer units than warps leaves the high blocks empty: 512 tokens on 64 x 16
+// run on 32 blocks. When the call's units fit in gridDim.x * T (T = MORI_EP_TOKCHUNK),
+// block b takes units [b * T, b * T + T) on its first T warps instead, and the warps at
+// or past T take the ids left over, so the map stays a bijection onto
+// [0, gridDim.x * warpPerBlock) and every stride loop still covers each token once.
+// Larger calls keep the plain map (768 tokens as 64 x 12 measured slower than 48 x 16
+// at EP8), and so does every geometry with at most T warps per block. selfFirst only:
+// under the original protocol every block that holds tokens also RMWs this rank's own
+// slot word, and there the chunked map measured slower than the plain one at 512
+// tokens on EP8. 0 turns it off.
+#ifndef MORI_EP_TOKCHUNK
+#define MORI_EP_TOKCHUNK 8
+#endif
+template <EpCfg kCfg>
+__device__ __forceinline__ bool EpTokChunked(int numTokens, int etpi) {
+  constexpr int T = MORI_EP_TOKCHUNK;
+  if constexpr (!kCfg.selfFirst || T <= 0 || kCfg.warpPerBlock <= T) {
+    return false;
+  } else {
+    if (numTokens <= 0) return false;
+    const unsigned units = (unsigned)((numTokens + etpi - 1) / etpi);
+    return units <= gridDim.x * (unsigned)T;
+  }
+}
+template <EpCfg kCfg>
+__device__ __forceinline__ int EpTokChunkWarp(int warpId, int globalWarpId, bool chunked) {
+  constexpr int W = kCfg.warpPerBlock;
+  constexpr int T = MORI_EP_TOKCHUNK;
+  if constexpr (!kCfg.selfFirst || T <= 0 || W <= T) {
+    return globalWarpId;
+  } else {
+    if (!chunked) return globalWarpId;
+    const int b = (int)blockIdx.x;
+    return (warpId < T) ? (b * T + warpId) : ((int)gridDim.x * T + b * (W - T) + (warpId - T));
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -329,12 +367,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const size_t hiddenDim = (size_t)kCfg.hiddenDim;
   constexpr int topk = kCfg.numExpertPerToken;
   const unsigned long long win = args.window;
-  const int aWarp = globalWarpId;
   const int aWarps = (int)gridDim.x * warpNum;
 
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
   const int _qTok = (aWarps > 0) ? (int)(((long long)args.numTokens + aWarps - 1) / aWarps) : _tpi;
   const int _etpi = (_tpi > 1 && _qTok >= 1 && _qTok < _tpi) ? _qTok : _tpi;
+  const bool _tokChunk = EpTokChunked<kCfg>((int)args.numTokens, _etpi);
+  const int aWarp = EpTokChunkWarp<kCfg>(warpId, globalWarpId, _tokChunk);
   const int _sLane = (_etpi > 1) ? (laneId / topk) : 0;
   const int _eLane = (_etpi > 1) ? (laneId - _sLane * topk) : laneId;
   const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
@@ -346,6 +385,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // bigger. EpDispatch1250xSlabBytes owns that decision; both tiles must agree.
   constexpr int kSlabBytes = EpDispatch1250xSlabBytes(kCfg);
   constexpr int kMetaSlabBytes = EpDispatch1250xMetaSlabBytes(kCfg);
+  constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
+  constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
+  // The payload pass splits each destination's run across warp units instead of
+  // walking the token map.
+  constexpr bool kUnitGeom = kFp4Pack4 && npes == 4 && (kCfg.warpPerBlock % 4) == 0;
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
@@ -667,15 +711,24 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                  (size_t)kCfg.warpPerBlock * kSlabBytes + (size_t)warpId * kMetaSlabBytes)
               : (reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM);
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
-      const int split = _peerSplit;
+      // Under the chunked map the warps at or past MORI_EP_TOKCHUNK hold no token, and
+      // where the payload pass walks the token map that leaves them no payload either.
+      // They take every metadata run, a whole peer per warp, and the token warps none:
+      // the tensorcnt wait after this pass counts every TDM op of the wave, so a token
+      // warp that sent metadata would issue no payload until those stores completed.
+      const bool _metaHi = !kUnitGeom && _tokChunk;
+      const int _metaWarps = _metaHi ? (warpNum - MORI_EP_TOKCHUNK) : warpNum;
+      const int split = _metaHi ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1) : _peerSplit;
       const int nRuns = npes * split;
       // selfFirst numbers the runs peer-minor when the warps divide evenly, so warp w
       // takes peer w % npes -- the destination it also carries in the payload pass.
       // The warps of the own run, which is skipped here, are then the ones the own
       // pass needs, and they start it at once instead of after a remote run: at 512
       // tokens that ordering is worth ~2 us of the dispatch.
-      const bool _runPeerMinor = kCfg.selfFirst && (warpNum % npes) == 0;
-      for (int r = warpId; r < nRuns; r += warpNum) {
+      const bool _runPeerMinor = kCfg.selfFirst && (_metaWarps % npes) == 0;
+      const int _run0 =
+          _metaHi ? ((warpId >= MORI_EP_TOKCHUNK) ? (warpId - MORI_EP_TOKCHUNK) : nRuns) : warpId;
+      for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
         if (kCfg.selfFirst && peer == myPe) continue;  // the own pass ships it, after R
@@ -821,14 +874,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   __builtin_amdgcn_s_wait_tensorcnt(0);
 
   if (args.tokenIndices && args.inpTokenBuf) {
-    constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
-    constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
     constexpr int kPack = kFp4Pack4 ? 4 : 1;
     static_assert(!kFp4Pack4 || kTokB % 128 == 0,
                   "each packed FP4 token must occupy whole TDM rows");
     static_assert(!kFp4Pack4 || kPack * kTokB <= kSlabBytes,
                   "four FP4 tokens must fit in the per-warp LDS slab");
-    constexpr bool kUnitGeom = kFp4Pack4 && npes == 4 && (kCfg.warpPerBlock % 4) == 0;
     // selfFirst: part `part` of `nParts` of this block's own run. It was staged at
     // s_base[myPe] relative to R, the slots the peers took here; only destinations
     // move -- the payload rows, the metadata rows, and the map entries the
