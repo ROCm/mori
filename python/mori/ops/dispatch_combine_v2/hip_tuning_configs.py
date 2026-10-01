@@ -148,6 +148,19 @@ _COMBINE_TABLE: dict = {
     },
 }
 
+_COMBINE_FP4_TABLE: dict = {
+    "fp4_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): ((256, 64, 8), (None, 64, 16)),
+        },
+    },
+    "fp4_blockwise_fp32": {
+        "gfx1250": {
+            (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
+    },
+}
+
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are
 # consumed per warp-iteration, so one round covers block*warp*_tpi tokens and coming up
 # short costs more than any geometry difference (gfx1250 fp4 at ct=4096: 64x8 121.4us
@@ -187,7 +200,14 @@ def _merge(disp, comb):
     return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
 
 
-def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) -> dict:
+def lookup(
+    world_size,
+    hidden_dim,
+    topk,
+    dtype="bf16",
+    experts_per_rank=None,
+    quant_type="none",
+) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
     An unswept shape gets the HIP single-shot default (schedule=None). A swept one
@@ -199,9 +219,19 @@ def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) ->
     disp = _bucket_key(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
-    comb = _bucket_key(
-        _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-    )
+    comb = None
+    if quant_type in _COMBINE_FP4_TABLE:
+        comb = _bucket_key(
+            _COMBINE_FP4_TABLE[quant_type].get(dev, {}),
+            world_size,
+            hidden_dim,
+            topk,
+            experts_per_rank,
+        )
+    if comb is None:
+        comb = _bucket_key(
+            _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
+        )
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.

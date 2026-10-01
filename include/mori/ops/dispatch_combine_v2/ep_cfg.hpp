@@ -244,6 +244,8 @@ struct EpCfg {
   // is free: Render omits default-valued fields, so the Cfg text -- which IS the
   // JIT cache key -- is byte-identical to a build without this feature.
   int scaleBytes = 0;
+  bool combineFp4 = false;
+  bool combineFp4F32Scale = false;
 };
 
 template <typename Self, typename Visit>
@@ -261,10 +263,12 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(waveSize);
   MORI_FIELD(useWeights);
   MORI_FIELD(scaleBytes);
+  MORI_FIELD(combineFp4);
+  MORI_FIELD(combineFp4F32Scale);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 12, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 14, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -336,6 +340,8 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 }
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
+
+constexpr int EpCombinePushSlotAlign = 128;
 
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part

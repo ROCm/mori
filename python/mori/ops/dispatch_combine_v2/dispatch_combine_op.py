@@ -70,7 +70,8 @@ def _default_backend() -> str:
     return "hip" if _is_gfx125x() else "flydsl"
 
 
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+_FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
+_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
 
@@ -256,14 +257,15 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
+            fp4 = self.quant_type in _FP4_QUANT_TYPES
             if (
-                self.combine_mode != "gather"
-                or self.quant_type != "none"
+                (self.combine_mode != "gather" and not fp4)
+                or (self.quant_type != "none" and not fp4)
                 or self.enable_std_moe
             ):
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    "quant_type=none, enable_std_moe=False"
+                    "quant_type=none (or an fp4 type), enable_std_moe=False"
                 )
             # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
             # supported; fp4 on the combine side is not.
@@ -374,6 +376,7 @@ class EpDispatchCombineConfig:
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
                     experts_per_rank=self.num_experts_per_rank,
+                    quant_type=self.quant_type,
                 )
             else:
                 from .tuning_configs import lookup
