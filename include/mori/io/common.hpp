@@ -25,10 +25,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <msgpack.hpp>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "mori/application/transport/p2p/p2p.hpp"
 #include "mori/application/transport/rdma/rdma.hpp"
@@ -70,7 +73,19 @@ struct BackendBitmap {
 };
 
 using EngineKey = std::string;
-using DescBlob = std::vector<std::byte>;
+// Per-backend descriptor payload, kept as an opaque byte vector on purpose:
+//   * Backend-agnostic: common.hpp must not depend on OFI/RDMA/XGMI-specific
+//     types (MR keys, fabric addr_names, IPC handles), so the payload stays a
+//     blob and each backend defines/parses its own struct privately.
+//   * Forward/backward compatible: adding or changing a backend's fields never
+//     touches this shared struct's wire layout; unknown blobs are simply carried
+//     through untouched by nodes that don't own that backend.
+//   * Efficient + portable: msgpack serializes std::vector<uint8_t> as a compact
+//     BIN field (not an int array), and uint8_t==unsigned char has an
+//     unconditional msgpack adaptor on every platform.
+// The cost is that consumers must reinterpret the bytes (raw handle or a
+// msgpack-decoded struct); this is done once and cached, never per transfer.
+using DescBlob = std::vector<uint8_t>;
 using BackendDescBlobMap = std::unordered_map<BackendType, DescBlob>;
 
 struct EngineDesc {
@@ -80,13 +95,18 @@ struct EngineDesc {
   std::string host;
   int port;
   int pid{0};
+  // Backend-supplied descriptor blobs, captured by IOEngine after each backend
+  // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
+  BackendDescBlobMap backendDescs;
 
-  constexpr bool operator==(const EngineDesc& rhs) const noexcept {
+  bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
-           (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid);
+           (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid) &&
+           (backendDescs == rhs.backendDescs);
   }
 
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid);
+  // Append-only: new fields MUST go at the end to preserve wire compatibility.
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs);
 };
 
 using MemoryUniqueId = uint32_t;
@@ -125,15 +145,23 @@ struct MemoryDesc {
   // and offsets to the right address.
   uint64_t fabricOffset{0};     // data - allocation base
   uint64_t fabricAllocSize{0};  // full size of the exported allocation
+  // Per-backend inline memory metadata as opaque bytes (see DescBlob for why a
+  // byte vector). OFI publishes its MR key here so peers skip the control-plane
+  // fetch; base/size come from data/size.
+  BackendDescBlobMap backendDescs;
 
-  constexpr bool operator==(const MemoryDesc& rhs) const noexcept {
+  // Not constexpr: comparing backendDescs (unordered_map) is not a constant expr.
+  bool operator==(const MemoryDesc& rhs) const noexcept {
     return (engineKey == rhs.engineKey) && (id == rhs.id) && (deviceId == rhs.deviceId) &&
            (deviceBusId == rhs.deviceBusId) && (data == rhs.data) && (size == rhs.size) &&
-           (loc == rhs.loc) && (numaNode == rhs.numaNode) && (ipcOffset == rhs.ipcOffset);
+           (loc == rhs.loc) && (numaNode == rhs.numaNode) && (ipcOffset == rhs.ipcOffset) &&
+           (backendDescs == rhs.backendDescs);
   }
 
+  // Append-only: new fields MUST go at the end to preserve wire compatibility.
   MSGPACK_DEFINE(engineKey, id, deviceId, deviceBusId, data, size, loc, ipcHandle, numaNode,
-                 ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize);
+                 ipcOffset, fabricHandle, vpodId, vpodPpodId, fabricOffset, fabricAllocSize,
+                 backendDescs);
 };
 
 using TransferUniqueId = uint64_t;

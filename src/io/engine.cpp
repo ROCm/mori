@@ -42,6 +42,9 @@
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX-gated host-send roctx markers
 #include "src/io/xgmi/backend_impl.hpp"
+#ifdef MORI_USE_LIBFABRIC
+#include "src/io/ofi/backend_impl.hpp"
+#endif
 
 namespace mori {
 namespace io {
@@ -219,6 +222,7 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
       auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
       backends.insert({BackendType::XGMI, std::move(backend)});
       InvalidateRouteCache();
+      CaptureBackendDesc(BackendType::XGMI);
       return;
     }
 
@@ -251,17 +255,31 @@ void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
 
     backends.insert({type, std::move(backend)});
     InvalidateRouteCache();
+    CaptureBackendDesc(type);
     EnsureXgmiBackendCreatedIfSupported();
   } else if (type == BackendType::XGMI) {
     auto backend = std::make_unique<XgmiBackend>(desc.key, config,
                                                  static_cast<const XgmiBackendConfig&>(beConfig));
     backends.insert({type, std::move(backend)});
     InvalidateRouteCache();
+    CaptureBackendDesc(type);
   } else if (type == BackendType::FABRIC) {
     auto backend = std::make_unique<FabricBackend>(
         desc.key, config, static_cast<const FabricBackendConfig&>(beConfig));
     backends.insert({type, std::move(backend)});
     InvalidateRouteCache();
+    CaptureBackendDesc(type);
+  } else if (type == BackendType::OFI) {
+#ifdef MORI_USE_LIBFABRIC
+    const auto& ofiCfg = static_cast<const OfiBackendConfig&>(beConfig);
+    auto be = std::make_unique<OfiBackend>(desc.key, config, ofiCfg);
+    // OFI carries peer addresses inline in EngineDesc; no control-plane port.
+    backends.insert({type, std::move(be)});
+    InvalidateRouteCache();
+    CaptureBackendDesc(type);
+#else
+    throw std::runtime_error("MORI was built without libfabric support (MORI_USE_LIBFABRIC=OFF)");
+#endif
   } else {
     assert(false && "not implemented");
   }
@@ -331,6 +349,7 @@ void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
     auto backend = std::make_unique<XgmiBackend>(desc.key, config, xgmiConfig);
     backends.insert({BackendType::XGMI, std::move(backend)});
     InvalidateRouteCache();
+    CaptureBackendDesc(BackendType::XGMI);
     MORI_IO_INFO("Auto-created XGMI backend after RDMA initialization");
   } catch (const std::exception& e) {
     MORI_IO_WARN("Auto-create XGMI backend failed: {}", e.what());
@@ -342,6 +361,13 @@ void IOEngine::EnsureXgmiBackendCreatedIfSupported() {
 void IOEngine::RemoveBackend(BackendType type) {
   backends.erase(type);
   InvalidateRouteCache();
+}
+
+void IOEngine::CaptureBackendDesc(BackendType type) {
+  auto it = backends.find(type);
+  if (it != backends.end()) {
+    desc.backendDescs[type] = it->second->GetEngineDescBlob();
+  }
 }
 
 void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
@@ -436,6 +462,14 @@ Backend* IOEngine::SelectBackend(const MemoryDesc& local, const MemoryDesc& remo
     UpdateRouteCache(routeKey, BackendType::RDMA);
     return rdmaIt->second.get();
   }
+
+#ifdef MORI_USE_LIBFABRIC
+  auto ofiIt = backends.find(BackendType::OFI);
+  if (ofiIt != backends.end() && ofiIt->second->CanHandle(local, remote)) {
+    UpdateRouteCache(routeKey, BackendType::OFI);
+    return ofiIt->second.get();
+  }
+#endif
 
   // No backend can handle this pair (e.g. cross-node under XGMI-only fallback).
   return nullptr;

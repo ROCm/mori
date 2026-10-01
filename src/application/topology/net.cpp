@@ -23,8 +23,11 @@
 
 #include <filesystem>
 #include <regex>
+#include <string>
+#include <utility>
 
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
@@ -46,19 +49,34 @@ PciBusId ParseBusIdFromSysfs(std::filesystem::path path) {
 }
 
 void TopoSystemNet::Load() {
-  application::RdmaContext rdma(application::RdmaBackendType::IBVerbs);
-  auto devices = rdma.GetRdmaDeviceList();
+  // Verbs (ibverbs) NICs. Non-verbs fabrics (e.g. HPE Slingshot/CXI) are
+  // discovered by their transport backend and injected via AddNic().
+  try {
+    application::RdmaContext rdma(application::RdmaBackendType::IBVerbs);
+    auto devices = rdma.GetRdmaDeviceList();
 
-  for (auto& dev : devices) {
-    // TODO: finish nic plane
-    TopoNodeNic* nic = new TopoNodeNic();
-    auto rPath = std::filesystem::canonical(dev->GetIbvDevice()->ibdev_path);
-    nic->name = dev->Name();
-    nic->busId = ParseBusIdFromSysfs(rPath);
-    nic->totalGbps = dev->TotalActiveGbps();
+    for (auto& dev : devices) {
+      // TODO: finish nic plane
+      auto nic = std::make_unique<TopoNodeNic>();
+      auto rPath = std::filesystem::canonical(dev->GetIbvDevice()->ibdev_path);
+      nic->name = dev->Name();
+      nic->busId = ParseBusIdFromSysfs(rPath);
+      nic->totalGbps = dev->TotalActiveGbps();
 
-    nics.emplace_back(nic);
+      nics.emplace_back(std::move(nic));
+    }
+  } catch (const std::exception& e) {
+    MORI_APP_WARN("TopoSystemNet: ibverbs enumeration failed ({}); continuing without verbs NICs",
+                  e.what());
   }
+}
+
+void TopoSystemNet::AddNic(std::string name, PciBusId busId, double totalGbps) {
+  auto nic = std::make_unique<TopoNodeNic>();
+  nic->name = std::move(name);
+  nic->busId = busId;
+  nic->totalGbps = totalGbps;
+  nics.emplace_back(std::move(nic));
 }
 
 std::vector<TopoNodeNic*> TopoSystemNet::GetNics() const {
