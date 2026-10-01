@@ -148,6 +148,9 @@ _XDB_FLAG_SLOTS = 256
 _PUSH_SLOT_ALIGN = 128
 PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128}
 _PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4}
+# Must match EpFp4Wire::kSigBlocks and kSigSlotDw in ep_intranode_1250x.hpp.
+_PUSH_SIG_BLOCKS = 256
+_PUSH_SIG_SLOT_B = 128
 
 
 def push_wire_nbytes(cfg) -> int:
@@ -378,6 +381,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 raise ValueError(
                     f"combine block_num {max_comb_blocks} exceeds the {_XDB_FLAG_SLOTS} "
                     "per-block xdb epoch slots the entry barrier owns"
+                )
+            comb_blocks = sorted({b for b, _ in self._combine_specs})
+            if cfg.quant_type in _FP4_QUANT_TYPES and len(comb_blocks) > 1:
+                raise ValueError(
+                    f"quant_type={cfg.quant_type!r}: every combine variant must "
+                    f"launch the same block_num (have {comb_blocks}); each rank's "
+                    "last block waits for a report from every block of every peer"
                 )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
 
@@ -613,6 +623,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         out_tok = cap * cfg.combine_token_nbytes
         if cfg.quant_type in _FP4_QUANT_TYPES:
             out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
+            out_tok += (cfg.world_size + 1) * _PUSH_SIG_BLOCKS * _PUSH_SIG_SLOT_B
         regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),
