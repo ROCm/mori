@@ -124,7 +124,7 @@ add_library(mori_application_objs OBJECT ${MORI_APP_SOURCES})
 target_include_directories(mori_application_objs PUBLIC ${CMAKE_SOURCE_DIR}/include
                                                         ${CMAKE_SOURCE_DIR})
 set_target_properties(mori_application_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(mori_application_objs PUBLIC hip::host dl pci mori_logging
+target_link_libraries(mori_application_objs PUBLIC hip::host dl mori_logging
                                                    ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 if(WITH_MPI)
   target_compile_definitions(mori_application_objs PUBLIC MORI_WITH_MPI)
@@ -134,7 +134,7 @@ endif()
 add_library(mori_application SHARED $<TARGET_OBJECTS:mori_application_objs>)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_include_directories(mori_application PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(mori_application PUBLIC hip::host dl pci mori_logging
+target_link_libraries(mori_application PUBLIC hip::host dl mori_logging
                                               ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 # Embed the libibverbs dlopen shim (object library, hidden visibility).
 target_link_libraries(mori_application PRIVATE mori_ibv_shim)
@@ -144,7 +144,7 @@ target_link_libraries(mori_application PRIVATE mori_ibv_shim)
 # so mori_cco resolves the absorbed code without depending on libmori_application.
 add_library(mori_application_static STATIC $<TARGET_OBJECTS:mori_application_objs>
                                            $<TARGET_OBJECTS:mori_ibv_shim>)
-target_link_libraries(mori_application_static INTERFACE hip::host dl pci mori_logging
+target_link_libraries(mori_application_static INTERFACE hip::host dl mori_logging
                                                         ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
 
 if(WITH_MPI)
