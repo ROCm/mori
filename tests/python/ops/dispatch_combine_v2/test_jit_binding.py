@@ -355,11 +355,14 @@ def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monke
 def test_self_first_default_comes_from_the_environment(monkeypatch):
     monkeypatch.delenv("MORI_EP_SELF_FIRST", raising=False)
     assert cb.self_first_enabled()
+    # Unset follows where the slot word lives; it only pays in the cco window.
+    assert not cb.self_first_enabled(slot_word_in_window=False)
     for off in ("0", "false", "no", "off", " OFF "):
         monkeypatch.setenv("MORI_EP_SELF_FIRST", off)
         assert not cb.self_first_enabled()
     monkeypatch.setenv("MORI_EP_SELF_FIRST", "1")
     assert cb.self_first_enabled()
+    assert cb.self_first_enabled(slot_word_in_window=False)
 
 
 def test_self_first_state_size_matches_the_device_layout():

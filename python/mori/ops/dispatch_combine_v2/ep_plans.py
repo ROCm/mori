@@ -167,15 +167,19 @@ class SelfFirstState:
         mem.close()
 
 
-def self_first_enabled() -> bool:
-    """MORI_EP_SELF_FIRST, default on.
+def self_first_enabled(slot_word_in_window: bool = True) -> bool:
+    """MORI_EP_SELF_FIRST; unset, it follows where the slot allocator word lives.
 
-    0/false/no/off selects the original protocol, in which each rank also RMWs its
-    own slot allocator word. That is the right choice where local memory is not
-    mapped MTYPE_RW (f01-1, for one): there the local atomic costs nothing and the
-    per-call publish is pure overhead.
+    selfFirst saves the RMW each rank makes on its own slot word, which costs
+    microseconds when the word is in the cco window on memory mapped MTYPE_RW. Where
+    it is not -- TokOffExt's separate allocation (the hip backend's single-host
+    default), or local memory not mapped MTYPE_RW (f01-1, for one) -- that local
+    atomic costs nothing and the per-call publish is pure overhead. So unset resolves
+    to ``slot_word_in_window``; 1/true/yes/on and 0/false/no/off force either protocol.
     """
-    v = os.environ.get("MORI_EP_SELF_FIRST", "1").strip().lower()
+    v = os.environ.get("MORI_EP_SELF_FIRST", "").strip().lower()
+    if not v:
+        return slot_word_in_window
     return v not in ("0", "false", "no", "off")
 
 

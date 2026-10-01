@@ -56,7 +56,13 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 
 ## gfx125x dispatch: `MORI_EP_SELF_FIRST`
 
-On by default. The hip dispatch on gfx125x then never makes a rank RMW its own
+On by default wherever the slot allocator word lives in the cco window: an EP
+spanning hosts, whose ranks cannot open each other's hipIpc handles, or
+`MORI_EP_TOKOFF_EXT=0`. A single-host EP keeps the word in a separate allocation by
+default (`TokOffExt` in `hip_backend.py`), where the local RMW costs nothing, so
+there it stays off unless `MORI_EP_SELF_FIRST=1`.
+
+With it on, the hip dispatch on gfx125x never makes a rank RMW its own
 slot allocator word: on memory mapped MTYPE_RW, that local RMW on the word the
 peers' remote RMWs also hit costs microseconds per call. A sender's slot in a peer
 is what its remote RMW returns, with no wait on that peer; once all of a rank's
