@@ -46,6 +46,13 @@ namespace collective {
 //   dstPe    : peer that receives our sendBuf (may be myPe)
 //   srcPe    : peer that sends into our recvBuf, or -1 if nobody does
 //
+//   ready    : symmetric-heap uint64[>= npes] ready tokens, zeroed once. Slot p of
+//              my copy is written only by PE p and cleared only by me.
+//
+// Phase 0: pairwise handshake, no global barrier -- only the PEs of a send/recv
+// pair synchronize, so PEs that do not launch this kernel are never waited on.
+// The receiver posts a token into its source's ready[myPe]; the sender waits for
+// its destination's token and consumes it before writing anything into it.
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
 // dstPe == myPe), trailed by an ADD64 of 1 into the receiver's signalPtrs[0].
 // Phase 2: if srcPe >= 0, thread 0 waits until the counter reaches 1, then an
@@ -57,15 +64,42 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             const void* __restrict__ sendBuf,
                                             void* __restrict__ recvBuf, size_t numBytes,
                                             mori::cco::ccoDevComm devComm,
-                                            mori::cco::ccoWindow_t heapWin) {
+                                            mori::cco::ccoWindow_t heapWin,
+                                            uint64_t* __restrict__ ready) {
+  const int myLsaRank = heapWin->lsaRank;
+  const uint32_t stride4G = heapWin->stride4G;
+  // dstPe's token proves it has entered this launch, so by its stream order its
+  // previous kernel (of any collective) is done with recvBuf and has cleared
+  // signalBuf[0]. Without it, my copy could overwrite recvBuf before dstPe
+  // consumed it, or my ADD could land before its end-of-launch reset and be lost.
+  // Every PE posts its token before waiting, so a ring cannot deadlock. A
+  // self-send needs no handshake: stream order covers it.
+  if (threadIdx.x == 0) {
+    if (srcPe >= 0 && srcPe != myLsaRank) {
+      int32_t diff = (srcPe - myLsaRank) * static_cast<int32_t>(stride4G);
+      auto* tok = cco::impl::global(reinterpret_cast<uint64_t*>(
+          reinterpret_cast<uint8_t*>(&ready[myLsaRank]) + (static_cast<uint64_t>(diff) << 32)));
+      __hip_atomic_store(tok, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    if (dstPe != myLsaRank) {
+      auto* mine = cco::impl::global(&ready[dstPe]);
+      while (__hip_atomic_load(mine, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == 0) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      // dstPe re-arms only after my copy below lands, so this clear cannot
+      // swallow its next token -- provided it is visible before the doorbell.
+      StreamStore<ESystemScope, sizeof(uint64_t)>(&ready[dstPe], 0);
+      __threadfence_system();
+    }
+  }
+  __syncthreads();
+
   // recvBuf's byte offset within the heap window is identical on every rank
   // (symmetric layout), so my local recvBuf pointer maps to peer p's copy by the
   // flat-VA rank delta (pe - lsaRank)*stride4G<<32 -- the same inline LSA
   // addressing the reduce-scatter/all-reduce push kernels use. winBase cancels
   // out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip.
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
-  const int myLsaRank = heapWin->lsaRank;
-  const uint32_t stride4G = heapWin->stride4G;
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0, numBytes,
       [=](int peer) { return peer == dstPe; },
@@ -96,10 +130,8 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // it. That is also why no release fence follows: there is nothing left in L2 to
   // write back.
   //
-  // NOTE: this clears at kernel END, so it still relies on the caller barriering
-  // between launches (the benchmark does hipStreamSynchronize + ccoBarrierAll per
-  // iteration); without one, srcPe's NEXT launch's ADD can arrive before this
-  // store and be overwritten by it, no matter the scope.
+  // Clearing at kernel END is safe: srcPe's next ADD only follows my next
+  // token, which I post only once my next launch has started.
   if (threadIdx.x == 0) {
     StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[0], 0);
   }
