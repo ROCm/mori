@@ -147,6 +147,12 @@ message HeartbeatResponse {
   ClientStatus status            = 1;
   uint64       acked_seq         = 2;  // master applied up to this seq
   bool         request_full_sync = 3;  // master detected gap; peer reships
+  // Currently-effective heartbeat interval, re-advertised on every response so
+  // a master-side change reaches already-registered peers without a
+  // re-register (RegisterClientResponse only delivers it once, at join).
+  // `0` = unchanged; the peer keeps whatever it is already using.  Same
+  // "0 means no opinion" convention as RegisterClientResponse's field.
+  uint64       heartbeat_interval_ms = 4;
 }
 
 // ============================================================
@@ -360,6 +366,39 @@ message GetExternalKvHitCountsResponse {
   repeated HitCountEntry entries = 1;
 }
 
+// ============================================================
+//  Runtime configuration (admin)
+// ============================================================
+
+// Mutate master-side knobs without restarting the process.  Restarting a
+// master is not free — every peer must re-register and re-ship a full-sync
+// snapshot before routing is whole again — so knobs that only tune reporting
+// cadence are changed in place instead.
+//
+// Only fields explicitly set are applied; `0` means "leave alone".  The
+// environment variables that seed these values are read once at startup and
+// cannot be changed in a running process, which is what this RPC exists for.
+message SetRuntimeConfigRequest {
+  // Overrides the heartbeat interval derived from
+  // UMBP_HEARTBEAT_TTL_SEC / UMBP_HEARTBEAT_INTERVAL_DIVISOR.  Takes effect
+  // for every peer within one (old) heartbeat period, via HeartbeatResponse.
+  // Clamped to the expiry window (heartbeat_ttl x max_missed_heartbeats) so a
+  // careless value cannot make live peers look dead to the reaper.
+  // `0` = clear the override and fall back to the derived value.
+  uint64 heartbeat_interval_ms = 1;
+  // Distinguishes "clear the override" (set, value 0) from "do not touch"
+  // (not set), which a bare uint64 cannot express in proto3.
+  bool   set_heartbeat_interval = 2;
+}
+message SetRuntimeConfigResponse {
+  // Values actually in effect after the call, post-clamping — echo these back
+  // rather than the requested ones so a clamped request is visibly clamped.
+  uint64 heartbeat_interval_ms = 1;
+  // Human-readable note when a value was clamped or rejected; empty on a
+  // clean apply.
+  string note = 2;
+}
+
 
 // ============================================================
 //  Service
@@ -396,4 +435,7 @@ service UMBPMaster {
 
   // Client-side metrics reporting
   rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);
+
+  // Runtime configuration (admin); see SetRuntimeConfigRequest.
+  rpc SetRuntimeConfig(SetRuntimeConfigRequest) returns (SetRuntimeConfigResponse);
 }
