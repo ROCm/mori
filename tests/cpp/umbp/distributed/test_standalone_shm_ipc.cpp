@@ -1141,5 +1141,452 @@ TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
   unlink(fd_path.c_str());
 }
 
+// --------------------------------------------------------------------------
+// The four tests below cover the per-region pin that replaced holding
+// client_mu_ exclusively across a backend call.
+//
+// The old design got mapping lifetime for free: nothing could unmap a region
+// while a copy was running, because the copy held the one lock a teardown also
+// needed. The price was that every client on the node queued behind every other
+// client's copies -- and behind their multi-minute memory registrations, which
+// is what wedged BatchExists for whole minutes at warmup. A pin scopes the
+// guarantee to the mapping a copy actually touches; these tests are what says
+// the guarantee survived the narrowing.
+// --------------------------------------------------------------------------
+
+// The pin has to cover EVERY mapping an operation resolved into, not just the
+// first. A ranged call is the case that distinguishes them: one object is
+// assembled from ranges that belong to different registered regions, so a pin
+// that tracked a single region would leave the others free to be unmapped
+// mid-copy.
+TEST(StandaloneShmIpcTest, DeregistrationWaitsForAnInFlightRangedOperationAcrossRegions) {
+  constexpr size_t kHalf = 16ULL << 20;  // per-region source half
+  constexpr size_t kObject = 2 * kHalf;  // assembled from both regions
+  const std::string suffix = std::to_string(getpid());
+  const std::string address =
+      "unix:///tmp/umbp_standalone_ranged_deregister_race_" + suffix + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 4 * kObject;
+  config.ssd.enabled = false;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  // Two separate regions under ONE client_id, the shape a worker registering
+  // several host KV pools per rank produces. Each holds a source half followed
+  // by a destination half.
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+  constexpr char kClientId[] = "ranged-deregister-race-client";
+
+  std::vector<HostBufferHandle> regions;
+  for (int i = 0; i < 2; ++i) {
+    HostBufferHandle handle = allocator.Alloc(2 * kHalf, options);
+    ASSERT_TRUE(handle.valid());
+    auto* bytes = static_cast<unsigned char*>(handle.ptr);
+    std::memset(bytes, 0x40 + i, kHalf);
+    std::memset(bytes + kHalf, 0, kHalf);
+    auto allocation = HostMemAllocator::LookupShmAllocation(reinterpret_cast<uintptr_t>(handle.ptr),
+                                                            handle.mapped_size);
+    ASSERT_TRUE(allocation.has_value());
+    std::string registration_error;
+    ASSERT_EQ(standalone::SendFdRegistration(fd_path, allocation->fd, kClientId,
+                                             reinterpret_cast<uintptr_t>(handle.ptr),
+                                             allocation->mapped_size, 5000, &registration_error),
+              0)
+        << registration_error;
+    regions.push_back(handle);
+  }
+
+  auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
+  auto stub = ::umbp::UMBPStandalone::NewStub(channel);
+  for (const HostBufferHandle& handle : regions) {
+    grpc::ClientContext context;
+    ::umbp::RegisterMemoryRequest request;
+    request.set_kind(::umbp::MEMORY_KIND_HOST_SHM);
+    request.set_client_id(kClientId);
+    request.set_worker_base(reinterpret_cast<uintptr_t>(handle.ptr));
+    request.set_size(handle.mapped_size);
+    ::umbp::BoolResponse response;
+    ASSERT_TRUE(stub->RegisterMemory(&context, request, &response).ok());
+    ASSERT_TRUE(response.ok()) << response.error();
+  }
+
+  const auto base_of = [&](size_t i) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(regions[i].ptr));
+  };
+
+  // Assemble one object from the source half of each region.
+  {
+    grpc::ClientContext context;
+    ::umbp::BatchRangeDataRequest request;
+    request.set_client_id(kClientId);
+    request.add_keys("ranged-race-value");
+    request.add_range_counts(2);
+    request.add_object_sizes(kObject);
+    for (size_t i = 0; i < 2; ++i) {
+      request.add_region_bases(base_of(i));
+      request.add_shm_offsets(0);
+      request.add_sizes(kHalf);
+      request.add_object_offsets(i * kHalf);
+    }
+    ::umbp::BatchBoolResponse response;
+    ASSERT_TRUE(stub->BatchPutRanges(&context, request, &response).ok());
+    ASSERT_EQ(response.ok_size(), 1);
+    ASSERT_TRUE(response.ok(0));
+  }
+
+  // Read it back into the destination half of each region, and race a
+  // deregistration against the copy. Both regions are pinned for the call, so
+  // neither may be unmapped until it returns.
+  std::atomic<bool> get_started{false};
+  grpc::Status get_status;
+  ::umbp::BatchBoolResponse get_response;
+  std::thread getter([&]() {
+    grpc::ClientContext context;
+    ::umbp::BatchRangeDataRequest request;
+    request.set_client_id(kClientId);
+    request.add_keys("ranged-race-value");
+    request.add_range_counts(2);
+    // Ranges deliberately listed LAST-REGION-FIRST. A teardown releases a
+    // client's regions in registration order, so a pin that only covered the
+    // first region an operation resolved would still be shielded by that
+    // ordering -- the release would block on the region that happened to be
+    // pinned before reaching the one that was not. Resolving in the opposite
+    // order removes that accident and leaves the pin as the only thing
+    // standing between this copy and an unmapped buffer.
+    for (size_t j = 0; j < 2; ++j) {
+      const size_t i = 1 - j;
+      request.add_region_bases(base_of(i));
+      request.add_shm_offsets(kHalf);
+      request.add_sizes(kHalf);
+      request.add_object_offsets(i * kHalf);
+    }
+    get_started.store(true, std::memory_order_release);
+    get_status = stub->BatchGetRanges(&context, request, &get_response);
+  });
+
+  while (!get_started.load(std::memory_order_acquire)) std::this_thread::yield();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  grpc::Status deregister_status;
+  {
+    grpc::ClientContext context;
+    ::umbp::DeregisterMemoryRequest request;
+    request.set_client_id(kClientId);
+    ::umbp::Empty response;
+    deregister_status = stub->DeregisterMemory(&context, request, &response);
+  }
+  getter.join();
+
+  ASSERT_TRUE(deregister_status.ok());
+  ASSERT_TRUE(get_status.ok());
+  // The read may legitimately lose the race and fail resolution; what it may
+  // not do is read through a mapping that was torn down under it.
+  if (get_response.ok_size() == 1 && get_response.ok(0)) {
+    for (size_t i = 0; i < 2; ++i) {
+      const auto* bytes = static_cast<const unsigned char*>(regions[i].ptr);
+      EXPECT_EQ(std::memcmp(bytes, bytes + kHalf, kHalf), 0) << "region " << i;
+    }
+  }
+
+  for (HostBufferHandle& handle : regions) allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+// Concurrent writers are new: they used to be serialized by the exclusive lock
+// and now run through the inner client side by side. This is the test that says
+// the inner client tolerates that -- every put lands, and every value reads back
+// as the writer wrote it rather than as some interleaving of two.
+TEST(StandaloneShmIpcTest, ConcurrentPutsToDistinctKeysAllSucceed) {
+  constexpr int kWriterCount = 4;
+  constexpr int kKeysPerWriter = 16;
+  constexpr size_t kValueSize = 256ULL << 10;
+  const std::string address =
+      "unix:///tmp/umbp_standalone_concurrent_puts_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 4 * kWriterCount * kKeysPerWriter * kValueSize;
+  config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  standalone_config.startup_timeout_ms = 5000;
+  config.standalone_process = standalone_config;
+
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+
+  std::vector<std::unique_ptr<IUMBPClient>> writers;
+  std::vector<HostBufferHandle> buffers;
+  for (int i = 0; i < kWriterCount; ++i) {
+    // Source half then readback half, so a writer never reads into its source.
+    buffers.push_back(allocator.Alloc(2 * kValueSize, options));
+    ASSERT_TRUE(buffers.back().valid());
+    auto client = CreateUMBPClient(config);
+    ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(buffers.back().ptr),
+                                       buffers.back().mapped_size));
+    writers.push_back(std::move(client));
+  }
+
+  std::vector<int> failures(kWriterCount, 0);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < kWriterCount; ++i) {
+    threads.emplace_back([&, i]() {
+      auto* bytes = static_cast<unsigned char*>(buffers[i].ptr);
+      std::memset(bytes, 0x10 + i, kValueSize);
+      for (int k = 0; k < kKeysPerWriter; ++k) {
+        const std::string key = "w" + std::to_string(i) + "-k" + std::to_string(k);
+        if (!writers[i]->Put(key, reinterpret_cast<uintptr_t>(bytes), kValueSize)) {
+          ++failures[i];
+        }
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  for (int i = 0; i < kWriterCount; ++i) EXPECT_EQ(failures[i], 0) << "writer " << i;
+
+  // Read back serially: a concurrent put must not have corrupted another's
+  // bytes, which a shared staging buffer without its own mutex would do.
+  for (int i = 0; i < kWriterCount; ++i) {
+    auto* bytes = static_cast<unsigned char*>(buffers[i].ptr);
+    for (int k = 0; k < kKeysPerWriter; ++k) {
+      const std::string key = "w" + std::to_string(i) + "-k" + std::to_string(k);
+      std::memset(bytes + kValueSize, 0, kValueSize);
+      ASSERT_TRUE(writers[i]->Get(key, reinterpret_cast<uintptr_t>(bytes + kValueSize), kValueSize))
+          << key;
+      EXPECT_EQ(std::memcmp(bytes, bytes + kValueSize, kValueSize), 0) << key;
+    }
+  }
+
+  for (int i = 0; i < kWriterCount; ++i) {
+    writers[i]->DeregisterMemory(reinterpret_cast<uintptr_t>(buffers[i].ptr));
+    writers[i]->Close();
+    allocator.Free(buffers[i]);
+  }
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+// Registration and deregistration now run with only a SHARED hold on
+// client_mu_, and a teardown waits on a pin count instead. Both halves of that
+// have a failure mode that a single-shot test cannot see: a pin that is leaked
+// makes the teardown wait forever, and a wakeup that is lost makes it wait
+// forever even after the count reaches zero. Either one hangs this test rather
+// than failing an assertion, which is why the whole body runs under a deadline
+// on a detached-in-spirit worker rather than inline.
+TEST(StandaloneShmIpcTest, RepeatedRegistrationChurnUnderLoadNeverWedges) {
+  constexpr int kRounds = 24;
+  constexpr size_t kValueSize = 512ULL << 10;
+  const std::string address =
+      "unix:///tmp/umbp_standalone_registration_churn_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 64 * kValueSize;
+  config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  standalone_config.startup_timeout_ms = 5000;
+  config.standalone_process = standalone_config;
+
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+
+  // A steady client whose data operations must keep pinning and unpinning
+  // throughout, so every churn round below lands on a live data plane.
+  HostBufferHandle steady_buffer = allocator.Alloc(2 * kValueSize, options);
+  ASSERT_TRUE(steady_buffer.valid());
+  auto steady = CreateUMBPClient(config);
+  ASSERT_TRUE(steady->RegisterMemory(reinterpret_cast<uintptr_t>(steady_buffer.ptr),
+                                     steady_buffer.mapped_size));
+  auto* steady_bytes = static_cast<unsigned char*>(steady_buffer.ptr);
+  std::memset(steady_bytes, 0x5e, kValueSize);
+  ASSERT_TRUE(
+      steady->Put("churn-steady-key", reinterpret_cast<uintptr_t>(steady_bytes), kValueSize));
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> reads{0};
+  std::thread reader([&]() {
+    while (!stop.load(std::memory_order_acquire)) {
+      steady->Get("churn-steady-key", reinterpret_cast<uintptr_t>(steady_bytes + kValueSize),
+                  kValueSize);
+      steady->Exists("churn-steady-key");
+      reads.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  std::atomic<bool> churn_done{false};
+  std::atomic<int> completed_rounds{0};
+  std::thread churn([&]() {
+    for (int round = 0; round < kRounds; ++round) {
+      HostBufferHandle buffer = allocator.Alloc(kValueSize, options);
+      if (!buffer.valid()) break;
+      auto client = CreateUMBPClient(config);
+      if (client->RegisterMemory(reinterpret_cast<uintptr_t>(buffer.ptr), buffer.mapped_size)) {
+        client->Put("churn-key-" + std::to_string(round), reinterpret_cast<uintptr_t>(buffer.ptr),
+                    kValueSize);
+        // The call under test: it must drain this region's pins and return,
+        // without waiting on the unrelated traffic the reader is generating.
+        client->DeregisterMemory(reinterpret_cast<uintptr_t>(buffer.ptr));
+      }
+      client->Close();
+      allocator.Free(buffer);
+      completed_rounds.fetch_add(1, std::memory_order_release);
+    }
+    churn_done.store(true, std::memory_order_release);
+  });
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (!churn_done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_TRUE(churn_done.load(std::memory_order_acquire))
+      << "registration churn wedged after " << completed_rounds.load(std::memory_order_acquire)
+      << "/" << kRounds << " rounds";
+  churn.join();
+  stop.store(true, std::memory_order_release);
+  reader.join();
+  EXPECT_GT(reads.load(std::memory_order_relaxed), 0u);
+
+  steady->DeregisterMemory(reinterpret_cast<uintptr_t>(steady_buffer.ptr));
+  steady->Close();
+  allocator.Free(steady_buffer);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
+// The symptom this whole change exists for: an existence probe is a hash-map
+// lookup, and it used to wait behind whatever bulk copy or memory registration
+// held client_mu_ first.
+//
+// What this can and cannot show: a unit test's registrations and copies are
+// milliseconds, not the minutes a real KV pool takes, so a bound met here does
+// not by itself prove the production stall is gone -- that needs the end-to-end
+// repro. What it does lock down is the lock SHAPE: reintroduce an exclusive
+// hold anywhere on the put or registration path and probes start queueing
+// behind a saturated writer pool again, which this notices.
+TEST(StandaloneShmIpcTest, ExistsStaysResponsiveUnderConcurrentWriteLoad) {
+  constexpr int kWriterCount = 6;
+  constexpr size_t kValueSize = 8ULL << 20;
+  const std::string address =
+      "unix:///tmp/umbp_standalone_exists_liveness_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig config;
+  config.dram.capacity_bytes = 16 * kValueSize;
+  config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  standalone_config.startup_timeout_ms = 5000;
+  config.standalone_process = standalone_config;
+
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  options.prefault = false;
+
+  std::vector<std::unique_ptr<IUMBPClient>> writers;
+  std::vector<HostBufferHandle> buffers;
+  for (int i = 0; i < kWriterCount; ++i) {
+    buffers.push_back(allocator.Alloc(kValueSize, options));
+    ASSERT_TRUE(buffers.back().valid());
+    auto client = CreateUMBPClient(config);
+    ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(buffers.back().ptr),
+                                       buffers.back().mapped_size));
+    writers.push_back(std::move(client));
+  }
+
+  auto prober = CreateUMBPClient(config);
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> writers_started{0};
+  std::vector<std::thread> writer_threads;
+  for (int i = 0; i < kWriterCount; ++i) {
+    writer_threads.emplace_back([&, i]() {
+      writers_started.fetch_add(1, std::memory_order_release);
+      uint64_t round = 0;
+      while (!stop.load(std::memory_order_acquire)) {
+        writers[i]->Put("load-w" + std::to_string(i) + "-" + std::to_string(round++),
+                        reinterpret_cast<uintptr_t>(buffers[i].ptr), kValueSize);
+      }
+    });
+  }
+  while (writers_started.load(std::memory_order_acquire) != kWriterCount) {
+    std::this_thread::yield();
+  }
+  // Let the writers reach a steady RPC loop; otherwise this could accidentally
+  // probe an idle server.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  const std::vector<std::string> probe_keys = {"absent-a", "absent-b", "absent-c"};
+  std::atomic<bool> probe_done{false};
+  std::thread probe_thread([&]() {
+    for (int i = 0; i < 8; ++i) prober->BatchExists(probe_keys);
+    probe_done.store(true, std::memory_order_release);
+  });
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!probe_done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool probed_in_time = probe_done.load(std::memory_order_acquire);
+  stop.store(true, std::memory_order_release);
+  probe_thread.join();
+  for (auto& thread : writer_threads) thread.join();
+  EXPECT_TRUE(probed_in_time) << "BatchExists queued behind concurrent bulk writes";
+
+  prober->Close();
+  for (int i = 0; i < kWriterCount; ++i) {
+    writers[i]->DeregisterMemory(reinterpret_cast<uintptr_t>(buffers[i].ptr));
+    writers[i]->Close();
+    allocator.Free(buffers[i]);
+  }
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp
