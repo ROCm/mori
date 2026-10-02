@@ -1439,12 +1439,44 @@ inline __device__ void ccoSdmaFillLane(uint32_t* queueBuf, uint64_t slot, HSAuin
 }
 
 // Ring the doorbell for everything placed-but-not-rung on this queue.
+//
+// A commit owns no reservation -- it rings for whatever is already placed --
+// so it must not hand its snapshot of committedWptr to submitPacket as if it
+// were a chain position. Doing so deadlocks the moment two waves commit one
+// queue: both read base == C, the first publishes and moves committedWptr past
+// C, and the second waits forever for a monotonic counter to return to C.
+//
+// Claim the range with a CAS and let only the winner ring. Winners advance
+// committedWptr in strictly increasing steps, so the doorbell never walks
+// backwards -- which matters, because a doorbell below the read pointer reads
+// as a wrap and sends the engine through the whole ring. A loser retries from
+// where the winner left off, so its own packets still get rung.
+//
+// Store order is load-bearing: wptr must be stored before the CAS, and the
+// doorbell after it.
 inline __device__ void ccoSdmaRingQueueDbr(ccoSdmaQueueDeviceHandle& handle) {
   uint64_t base = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
                                     __HIP_MEMORY_SCOPE_AGENT);
-  uint64_t pending = __hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED,
-                                       __HIP_MEMORY_SCOPE_AGENT);
-  if (pending != base) handle.submitPacket(base, pending);
+  for (;;) {
+    const uint64_t pending = __hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED,
+                                               __HIP_MEMORY_SCOPE_AGENT);
+    if (base >= pending) return;  // a winner already rang past everything we placed
+    ccoSdmaPublishStores();
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __hip_atomic_store(impl::global(handle.wptr), pending, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_AGENT);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    uint64_t seen = base;
+    if (__hip_atomic_compare_exchange_strong(impl::global(handle.committedWptr), &seen, pending,
+                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                             __HIP_MEMORY_SCOPE_AGENT)) {
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      __hip_atomic_store(impl::global(handle.doorbell), pending, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_SYSTEM);
+      return;
+    }
+    base = seen;  // lost; re-check what is still unrung and try again
+  }
 }
 
 // Queue this lane/thread drives for warp/block scope, or -1 when beyond queNum.
@@ -1587,11 +1619,69 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
     return;
   }
 
-  // Every lane on its own queue: no chain to share, so post independently. One
-  // postSolo site, so the function carries a single copy of the commit spin.
   const uint64_t mine = impl::waveMatchAny(queueKey, keyBits);
   if (!impl::waveBallot(__builtin_popcountll(mine) > 1)) {
-    postSolo();
+    // Every lane on its own queue. Reserving in parallel is fine; what is not is
+    // running submitPacket in parallel, the way a plain postSolo here would.
+    // Its spin is divergent, so without independent thread scheduling the stores
+    // after it -- committedWptr among them -- wait for every lane of the wave to
+    // leave the loop. The wave then holds nActive un-published reservations that
+    // it can only publish all at once, and two waves posting to the same queues
+    // deadlock whenever their reservations interleave: if wave A reserved first
+    // on queue i and wave B first on queue j, A's lane j waits for B to commit on
+    // j while B's lane i waits for A to commit on i.
+    //
+    // So keep the parallel reserve and release the publishes one at a time
+    // instead: each pass, whichever lanes already own the head of their chain
+    // publish and drop out, the rest come back next pass. The head of a queue's
+    // chain is by definition unblocked, so some lane always makes progress and
+    // no lane's publish can be held hostage by a sibling's wait.
+    ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
+    const uint64_t bytes = ccoSdmaGroupBytes<localSignal, remoteSignal, kPerCopy>(1);
+    const uint64_t base = handle.ReserveSlot(bytes, shared);
+    ccoSdmaWriteCopy(handle.queueBuf, base, srcBuf, dstBuf, copy_size);
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + CCO_SDMA_UNIT,
+                                                   localTarget, remoteTarget);
+    if constexpr (!kRing) {
+      // Aggregate: nobody rings here, so publish the packet dwords now (same
+      // reason as postSolo's aggregate branch).
+      ccoSdmaPublishStores();
+      return;
+    }
+    const uint64_t pendingWptr = base + bytes;
+    const unsigned myLane = impl::waveLaneId();
+    // Uniform loop: `left` is a ballot result, identical in every lane.
+    uint64_t left = impl::waveBallot(true);
+    [[maybe_unused]] int retries = 0;
+    while (left) {
+      const bool ready = ((left >> myLane) & 1ull) &&
+                         __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_AGENT) == base;
+      const uint64_t go = impl::waveBallot(ready);
+      if (ready) {
+        // Same publish order as submitPacket: packet dwords, then wptr and the
+        // doorbell, then committedWptr to hand the chain to the next reserver.
+        ccoSdmaPublishStores();
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        __hip_atomic_store(impl::global(handle.wptr), pendingWptr, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(impl::global(handle.doorbell), pendingWptr, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        __hip_atomic_store(impl::global(handle.committedWptr), pendingWptr, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      }
+      left &= ~go;
+      if (left) {
+        __builtin_amdgcn_s_sleep(1);
+        if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+          if (retries++ == CCO_SDMA_MAX_RETRIES) {
+            __builtin_trap();  // multi-queue publish: retry limit exceeded
+            break;
+          }
+        }
+      }
+    }
     return;
   }
 
