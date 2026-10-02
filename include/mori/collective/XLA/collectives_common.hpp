@@ -65,9 +65,13 @@ static constexpr int kBcastSlot = kSliceSignalSlot + 1;
 static_assert(kBcastSlot < kSdmaSignalSlotsUsed, "broadcast counter must be a checked slot");
 
 // groupCounters layout (local uint32 buffer): [0, kRSPushMaxSlices) per-slice
-// arrival counters, then all-reduce's two broadcast release flags.
+// arrival counters, then all-reduce's two broadcast release counters, then the
+// pull reduce-scatter's launch epoch (see FlagBarrierSignal / FlagBarrierWait),
+// then all-reduce's per-launch b=1 release target (elects the tail owner).
 static constexpr int kBcastFlagIdx = kRSPushMaxSlices;
-static constexpr int kGroupCounterCount = kBcastFlagIdx + 2;
+static constexpr int kPullEpochIdx = kBcastFlagIdx + 2;
+static constexpr int kBcastTargetIdx = kPullEpochIdx + 1;
+static constexpr int kGroupCounterCount = kBcastTargetIdx + 1;
 static_assert(kRSPushMaxSlices * 8 <= 64 && kRSPushMaxPeers - 1 < 256,
               "slice counters must fit one byte each of a uint64");
 
