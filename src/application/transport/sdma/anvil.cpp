@@ -29,6 +29,7 @@
 
 #include "mori/application/transport/sdma/anvil.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,11 @@
 #include <stdexcept>
 #include <unordered_map>
 namespace anvil {
+
+// How many SDMA queues this process has built, for the failure message below:
+// it separates "mori asked for an unreasonable number" from "the box was
+// already full when we asked for our first".
+std::atomic<int> queuesCreated_{0};
 
 auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int line) {
   if (s != HSA_STATUS_SUCCESS) {
@@ -50,13 +56,18 @@ auto checkHsaError = [](hsa_status_t s, const char* msg, const char* file, int l
 
 #define CHECK_HSA_ERROR(cmd) checkHsaError((cmd), #cmd, __FILE__, __LINE__)
 
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
-  do {                                                                                        \
-    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                    \
-      std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__ \
-                << ", Line: " << __LINE__ << ")" << std::endl;                                \
-      exit(EXIT_FAILURE);                                                                     \
-    }                                                                                         \
+// `call` is evaluated once. It used to appear a second time in the message, so
+// every failing hsaKmt call was issued twice on the way out: a second
+// CreateQueueExt against a node that had just refused one, a second AllocMemory
+// that leaks, a double DestroyQueue.
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                  \
+  do {                                                                                   \
+    HSAKMT_STATUS _hsakmt_status = (call);                                               \
+    if (_hsakmt_status != HSAKMT_STATUS_SUCCESS) {                                       \
+      std::cout << "ERROR code: " << std::dec << _hsakmt_status << " " << msg            \
+                << " (File: " << __FILE__ << ", Line: " << __LINE__ << ")" << std::endl; \
+      exit(EXIT_FAILURE);                                                                \
+    }                                                                                    \
   } while (0)
 
 #if 0
@@ -231,10 +242,47 @@ SdmaQueue::SdmaQueue(int localDeviceId, int remoteDeviceId, hsa_agent_t& localAg
   // TODO needed here?
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
-  CHECK_HSAKMT_SUCCESS(
+  // Two very different failures arrive here with nothing to tell them apart, and
+  // the difference decides who has to act. Measured on MI355X (gfx950), which has
+  // 2 PCIe + 14 XGMI SDMA engines and 8 queues per engine:
+  //
+  //   HSAKMT_STATUS_ERROR (1)      the kernel refused. Every form of "no queue
+  //                                for you" lands here: the per-engine cap
+  //                                (verified at 8/engine, and at the full 128 on
+  //                                a node), and an engine id the node does not
+  //                                have. A dead process's slots come back before
+  //                                a new process can reach this call, so a retry
+  //                                buys nothing.
+  //   HSAKMT_STATUS_NO_MEMORY (6)  libhsakmt could not allocate for the queue in
+  //                                THIS process's address space. Reproduced by
+  //                                constraining RLIMIT_AS: the refusal moves to
+  //                                the 11th, 5th, 3rd queue as the limit drops,
+  //                                while an unconstrained process reaches 128.
+  //                                Nothing about SDMA is exhausted; the process
+  //                                or the box is out of memory.
+  //
+  // Say which one it is, with the numbers needed to size it, so this does not
+  // have to be re-derived from a bare error code. See ROCm/mori#685.
+  HSAKMT_STATUS queueStatus =
       hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
-                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
-      "Failed");
+                           engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_);
+  if (queueStatus != HSAKMT_STATUS_SUCCESS) {
+    HsaNodeProperties props{};
+    bool haveProps = hsaKmtGetNodeProperties(localNodeId, &props) == HSAKMT_STATUS_SUCCESS;
+    std::cout << "SDMA queue creation failed: status=" << std::dec << queueStatus << " ("
+              << (queueStatus == HSAKMT_STATUS_NO_MEMORY
+                      ? "NO_MEMORY: out of memory in this process, not out of SDMA queues"
+                      : "ERROR: the kernel refused this engine")
+              << ")\n  node=" << localNodeId << " engine=" << engineId
+              << " queues_created_by_this_process=" << queuesCreated_.load();
+    if (haveProps) {
+      std::cout << "\n  node has " << props.NumSdmaEngines << " PCIe + " << props.NumSdmaXgmiEngines
+                << " XGMI SDMA engines, " << props.NumSdmaQueuesPerEngine << " queues per engine";
+    }
+    std::cout << std::endl;
+  }
+  CHECK_HSAKMT_SUCCESS(queueStatus, "Failed");
+  queuesCreated_.fetch_add(1);
 
   // Populate Device Handle
   // TODO uncached
