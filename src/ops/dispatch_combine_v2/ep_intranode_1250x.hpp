@@ -1293,6 +1293,24 @@ struct EpFp4Wire {
                 "every row a TDM transfer touches must start on a 128 B row");
 };
 
+// s_wait_tensorcnt takes an immediate. Past the table the wait is for at most 10 in flight, which
+// is stricter than asked and so still correct.
+__device__ __forceinline__ void EpWaitTensorAtMost(int n) {
+  switch (n) {
+    case 0: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+    case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
+    case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
+    case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
+    case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
+    case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
+    case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
+    case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
+    case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
+    case 9: __builtin_amdgcn_s_wait_tensorcnt(9); break;
+    default: __builtin_amdgcn_s_wait_tensorcnt(10); break;
+  }
+}
+
 template <EpCfg kCfg>
 struct EpFp4Item {
   int t, pOnly, flat;
@@ -1316,92 +1334,127 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   constexpr int kCap = W::kCap;
   constexpr int kMaxRecv = EpMaxRecv(kCfg);
   constexpr int kCpolScopeSys = 3 << 3;
+  // Rows per run: a run's stores go out together and their completion is waited once. The bf16
+  // row is staged behind the run's wire rows; at two rows it overlaps the second, which is free
+  // until that row is quantized out of registers -- the only layout a 16-warp tile (five wire
+  // rows) can hold.
+  constexpr bool kRun4 =
+      4 <= kCap && kMaxRecv % 4 == 0 && (size_t)kCap * kWireB >= (size_t)4 * kWireB + kTokB;
+  constexpr int C = kRun4 ? 4 : 2;
+  constexpr size_t kStageOff = (C > 2) ? (size_t)C * kWireB : (size_t)kWireB;
+
+  // Split send, for 8-warp blocks at eight ranks and up: the first kSegP warps of a block load and
+  // quantize, the others only store. A block owns one contiguous range of received rows, cut into
+  // chunks of kSegK rows that pass through a ring of LDS slots; a store warp merges the rows of a
+  // chunk that return to one rank into one store and keeps up to kSegL chunks in flight. Loads and
+  // stores then retire on different waves' tensorcnt, so no load waits behind a store -- one warp
+  // that loads, quantizes and stores waits for its stores before its next load lands. Below
+  // kSegMin rows a block, fewer warps quantizing costs more than the merged stores save, and the
+  // per-warp runs below take over.
+  constexpr int kSegK = (kCfg.worldSize >= 8 && kCfg.warpPerBlock == 8) ? 6 : 0;
+  constexpr int kSegP = kCfg.warpPerBlock / 2;
+  constexpr int kSegS = kCfg.warpPerBlock - kSegP;
+  constexpr int kSegL = 4;
+  constexpr int kSegMin = 64;
+  constexpr int kSegNb =
+      kSegK > 0 ? (EpCombine1250xLdsBudget - kSegP * kTokB) / (kSegK * kWireB + (2 + kSegK) * 4)
+                : 0;
+  constexpr bool kSeg = kSegK > 0 && kSegK <= 15 && kSegL <= 8 && kSegNb >= 2;
 
   const int laneId = threadIdx.x & (WS - 1);
   const int warpId = threadIdx.x / WS;
   const unsigned long long win = args.window;
   extern __shared__ char sharedMem[];
 
+  constexpr int kLd = kCfg.hiddenDim / (8 * WS);
+  static_assert(kCfg.hiddenDim % (8 * WS) == 0,
+                "a coalesced load is eight elements a lane, a group four lanes");
+  auto grpAmax = [&](const uint4 x) {
+    const unsigned w[4] = {x.x, x.y, x.z, x.w};
+    EpU16x2 mx = {0, 0};
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
+    mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
+    unsigned amax = __builtin_bit_cast(unsigned, mx);
+    const unsigned a1 =
+        (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
+    amax = amax > a1 ? amax : a1;
+    const unsigned a2 =
+        (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
+    return amax > a2 ? amax : a2;
+  };
+  auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
+    const int u = i * WS + laneId;
+    const unsigned amax = grpAmax(x);
+    const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
+    const int se = (e8 < 1 ? 1 : e8) - 127;
+    const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
+    const unsigned q =
+        (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
+    *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
+    d[kPayB + i * (WS / 4) + (laneId >> 2)] = (unsigned char)(se + 127);
+  };
+  auto qrowF32 = [&](unsigned char* const d, const uint4(&xs)[kLd]) {
+    constexpr int kBpl = WS / 16;
+    constexpr int kBlk = kLd * kBpl;
+    constexpr int kBr = (kBlk + WS - 1) / WS;
+    unsigned* const slot = reinterpret_cast<unsigned*>(d + kPayB);
+#pragma unroll
+    for (int i = 0; i < kLd; ++i) {
+      unsigned a = grpAmax(xs[i]);
+      const unsigned a3 =
+          (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
+      a = a > a3 ? a : a3;
+      const unsigned a4 =
+          (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
+      a = a > a4 ? a : a4;
+      if ((laneId & 15) == 0) slot[(i * WS + laneId) >> 4] = a;
+    }
+    asm volatile("" ::: "memory");
+    float inv[kBr];
+#pragma unroll
+    for (int j = 0; j < kBr; ++j) {
+      const int b = j * WS + laneId;
+      const unsigned a = b < kBlk ? slot[b] : 0u;
+      const float am = __uint_as_float((a & 0x7FFFu) << 16);
+      inv[j] = am > 0.0f ? 6.0f / am : 0.0f;
+      if (b < kBlk) slot[b] = __float_as_uint(am > 0.0f ? am / 6.0f : 1.0f);
+    }
+#pragma unroll
+    for (int i = 0; i < kLd; ++i) {
+      float iv = __int_as_float(
+          __builtin_amdgcn_readlane(__float_as_int(inv[i * kBpl / WS]), i * kBpl % WS));
+#pragma unroll
+      for (int k = 1; k < kBpl; ++k) {
+        const int b = i * kBpl + k;
+        const float o =
+            __int_as_float(__builtin_amdgcn_readlane(__float_as_int(inv[b / WS]), b % WS));
+        iv = laneId >= 16 * k ? o : iv;
+      }
+      const unsigned w[4] = {xs[i].x, xs[i].y, xs[i].z, xs[i].w};
+      EpF32x8 y;
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        y[2 * e] = __uint_as_float(w[e] << 16) * iv;
+        y[2 * e + 1] = __uint_as_float(w[e] & 0xFFFF0000u) * iv;
+      }
+      *reinterpret_cast<unsigned*>(d + (size_t)(i * WS + laneId) * 4) =
+          (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(y, 1.0f);
+    }
+  };
+  auto quantRow = [&](unsigned char* const d, const uint4(&xs)[kLd]) {
+    if constexpr (W::kF32Scale) {
+      qrowF32(d, xs);
+    } else {
+#pragma unroll
+      for (int i = 0; i < kLd; ++i) qgrp(d, i, xs[i]);
+    }
+  };
+
   auto pushQuantRows = [&](unsigned char* dstTile, const unsigned char* srcRows, int nRows,
                            size_t srcStride, int rowsTot, int rowBase, int rowStep) {
-    constexpr int kLd = kCfg.hiddenDim / (8 * WS);
-    static_assert(kCfg.hiddenDim % (8 * WS) == 0,
-                  "a coalesced load is eight elements a lane, a group four lanes");
-    auto grpAmax = [&](const uint4 x) {
-      const unsigned w[4] = {x.x, x.y, x.z, x.w};
-      EpU16x2 mx = {0, 0};
-#pragma unroll
-      for (int e = 0; e < 4; ++e)
-        mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
-      mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
-      unsigned amax = __builtin_bit_cast(unsigned, mx);
-      const unsigned a1 =
-          (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
-      amax = amax > a1 ? amax : a1;
-      const unsigned a2 =
-          (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
-      return amax > a2 ? amax : a2;
-    };
-    auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
-      const int u = i * WS + laneId;
-      const unsigned amax = grpAmax(x);
-      const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
-      const int se = (e8 < 1 ? 1 : e8) - 127;
-      const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
-      const unsigned q =
-          (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
-      *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
-      d[kPayB + i * (WS / 4) + (laneId >> 2)] = (unsigned char)(se + 127);
-    };
-    auto qrowF32 = [&](unsigned char* const d, const uint4(&xs)[kLd]) {
-      constexpr int kBpl = WS / 16;
-      constexpr int kBlk = kLd * kBpl;
-      constexpr int kBr = (kBlk + WS - 1) / WS;
-      unsigned* const slot = reinterpret_cast<unsigned*>(d + kPayB);
-#pragma unroll
-      for (int i = 0; i < kLd; ++i) {
-        unsigned a = grpAmax(xs[i]);
-        const unsigned a3 =
-            (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
-        a = a > a3 ? a : a3;
-        const unsigned a4 =
-            (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
-        a = a > a4 ? a : a4;
-        if ((laneId & 15) == 0) slot[(i * WS + laneId) >> 4] = a;
-      }
-      asm volatile("" ::: "memory");
-      float inv[kBr];
-#pragma unroll
-      for (int j = 0; j < kBr; ++j) {
-        const int b = j * WS + laneId;
-        const unsigned a = b < kBlk ? slot[b] : 0u;
-        const float am = __uint_as_float((a & 0x7FFFu) << 16);
-        inv[j] = am > 0.0f ? 6.0f / am : 0.0f;
-        if (b < kBlk) slot[b] = __float_as_uint(am > 0.0f ? am / 6.0f : 1.0f);
-      }
-#pragma unroll
-      for (int i = 0; i < kLd; ++i) {
-        float iv = __int_as_float(
-            __builtin_amdgcn_readlane(__float_as_int(inv[i * kBpl / WS]), i * kBpl % WS));
-#pragma unroll
-        for (int k = 1; k < kBpl; ++k) {
-          const int b = i * kBpl + k;
-          const float o =
-              __int_as_float(__builtin_amdgcn_readlane(__float_as_int(inv[b / WS]), b % WS));
-          iv = laneId >= 16 * k ? o : iv;
-        }
-        const unsigned w[4] = {xs[i].x, xs[i].y, xs[i].z, xs[i].w};
-        EpF32x8 y;
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          y[2 * e] = __uint_as_float(w[e] << 16) * iv;
-          y[2 * e + 1] = __uint_as_float(w[e] & 0xFFFF0000u) * iv;
-        }
-        *reinterpret_cast<unsigned*>(d + (size_t)(i * WS + laneId) * 4) =
-            (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_f32(y, 1.0f);
-      }
-    };
-    const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kWireB);
+    const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kStageOff);
     bool next = true;
     for (int r = 0; r < nRows && next; ++r) {
       __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -1411,16 +1464,10 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       next = r + 1 < nRows && rowBase + (r + 1) * rowStep < rowsTot;
       asm volatile("s_wait_dscnt 0x0" ::: "memory");
       if (next)
-        TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kWireB),
+        TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kStageOff),
                           reinterpret_cast<const int*>(srcRows + (size_t)(r + 1) * srcStride),
                           TdmShape<int>((int)(kTokB / 4)));
-      unsigned char* const d = dstTile + (size_t)r * kWireB;
-      if constexpr (W::kF32Scale) {
-        qrowF32(d, xs);
-      } else {
-#pragma unroll
-        for (int i = 0; i < kLd; ++i) qgrp(d, i, xs[i]);
-      }
+      quantRow(dstTile + (size_t)r * kWireB, xs);
     }
   };
 
@@ -1444,17 +1491,146 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     __builtin_amdgcn_s_wait_tensorcnt(0);
   };
 
-  constexpr int C = 2;
   static_assert(C <= kCap && kMaxRecv % C == 0, "a run must fit the tile and tile kMaxRecv");
-  static_assert(kCap * kWireB >= kWireB + kTokB, "a bf16 row must fit behind the first wire row");
+  static_assert((size_t)kCap * kWireB >= kStageOff + kTokB, "the staged bf16 row must fit the tile");
   const int nbRows = (int)gridDim.x;
   const int stride = nbRows * kCfg.warpPerBlock * C;
   const int rowStep = nbRows * kCfg.warpPerBlock;
+  auto segSend = [&](auto segTot, const int perBlk) {
+    const int tot = segTot;
+    const int rb = (int)blockIdx.x * perBlk;
+    const int re = min(rb + perBlk, tot);
+    const int nCh = rb < re ? (re - rb + kSegK - 1) / kSegK : 0;
+    unsigned char* const ringB = reinterpret_cast<unsigned char*>(sharedMem);
+    unsigned char* const stgB = ringB + (size_t)kSegNb * kSegK * kWireB;
+    int* const rdy = reinterpret_cast<int*>(stgB + (size_t)kSegP * kTokB);
+    int* const fre = rdy + kSegNb;
+    int* const cpe = fre + kSegNb;
+    static_assert((size_t)kSegNb * kSegK * kWireB + (size_t)kSegP * kTokB +
+                          (size_t)(2 + kSegK) * kSegNb * 4 <=
+                      (size_t)EpCombine1250xLdsBudget,
+                  "the split send's ring, staging rows and flags must fit the LDS budget");
+    // Slot flags hold chunk + 1: rdy once the chunk is quantized, fre once its stores are done.
+    for (int i = (int)threadIdx.x; i < 2 * kSegNb; i += (int)blockDim.x) rdy[i] = 0;
+    __syncthreads();
+    const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
+    char* const wBase = wd->winBase;
+    const uint64_t wStride = (uint64_t)wd->stride4G << 32;
+    // Every wait below is on a chunk with a lower index, so a stall this long is a broken
+    // handoff, not a slow peer: fail the launch instead of hanging it.
+    constexpr unsigned kSpinMax = 1u << 26;
+    if (warpId < kSegP) {
+      const int* const map = reinterpret_cast<const int*>(
+          wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
+      unsigned char* const stg = stgB + (size_t)warpId * kTokB;
+      auto loadRow = [&](int r) {
+        TdmIssueLoad<int>(reinterpret_cast<int*>(stg),
+                          reinterpret_cast<const int*>(src + (size_t)r * kTokB),
+                          TdmShape<int>((int)(kTokB / 4)));
+      };
+      if (warpId < nCh) loadRow(rb + warpId * kSegK);
+      for (int c = warpId; c < nCh; c += kSegP) {
+        const int r0 = rb + c * kSegK;
+        const int n = min(kSegK, re - r0);
+        const int slot = c % kSegNb;
+        const int pe = laneId < n ? map[r0 + laneId] / kCfg.maxTokPerRank : -1;
+        if (c >= kSegNb) {
+          unsigned spin = 0;
+          while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                     fre + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) !=
+                 c - kSegNb + 1) {
+            __builtin_amdgcn_s_sleep(1);
+            if (++spin > kSpinMax) __builtin_trap();
+          }
+        }
+        unsigned char* const ring = ringB + (size_t)slot * kSegK * kWireB;
+        const int cNext = c + kSegP;
+        for (int i = 0; i < n; ++i) {
+          uint4 xs[kLd];
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+          const uint4* const l = reinterpret_cast<const uint4*>(stg);
+#pragma unroll
+          for (int k = 0; k < kLd; ++k) xs[k] = l[k * WS + laneId];
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
+          if (i + 1 < n)
+            loadRow(r0 + i + 1);
+          else if (cNext < nCh)
+            loadRow(rb + cNext * kSegK);
+          quantRow(ring + (size_t)i * kWireB, xs);
+        }
+        if (laneId < kSegK) cpe[slot * kSegK + laneId] = pe;
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        if (laneId == 0)
+          __hip_atomic_store(rdy + slot, c + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+      }
+    } else {
+      const int s = warpId - kSegP;
+      // Stores of the chunks in flight, 4 bits a chunk at nibble (chunk % kSegL); stores retire in
+      // issue order, so the oldest chunk is done once no more than the newer ones' are in flight.
+      unsigned ops = 0;
+      int inflight = 0, head = 0, x = 0;
+      auto retire = [&]() {
+        const int sh = 4 * (head % kSegL);
+        inflight -= (int)((ops >> sh) & 15u);
+        EpWaitTensorAtMost(inflight);
+        const int ch = s + head * kSegS;
+        if (laneId == 0)
+          __hip_atomic_store(fre + ch % kSegNb, ch + 1, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_WORKGROUP);
+        ++head;
+      };
+      for (int c = s; c < nCh; c += kSegS, ++x) {
+        const int slot = c % kSegNb;
+        unsigned spin = 0;
+        while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                   rdy + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) != c + 1) {
+          if (head < x) {
+            retire();
+          } else {
+            __builtin_amdgcn_s_sleep(1);
+            if (++spin > kSpinMax) __builtin_trap();
+          }
+        }
+        if (x - head >= kSegL) retire();
+        const int r0 = rb + c * kSegK;
+        const int n = min(kSegK, re - r0);
+        const int pe = laneId < kSegK ? cpe[slot * kSegK + laneId] : -1;
+        unsigned char* const ring = ringB + (size_t)slot * kSegK * kWireB;
+        int nops = 0;
+        for (int i = 0; i < n;) {
+          const int p = __builtin_amdgcn_readlane(pe, i);
+          int j = i + 1;
+          while (j < n && __builtin_amdgcn_readlane(pe, j) == p) ++j;
+          unsigned char* const dst =
+              reinterpret_cast<unsigned char*>(wBase + (uint64_t)p * wStride + args.offOutTok +
+                                               W::kLandOff) +
+              myColB + (size_t)(r0 + i) * kWireB;
+          TdmIssueStore<int, 0, 0, kCpolScopeSys>(reinterpret_cast<int*>(dst),
+                                                  reinterpret_cast<int*>(ring + (size_t)i * kWireB),
+                                                  TdmShape<int>((j - i) * kWireDw));
+          ++nops;
+          i = j;
+        }
+        const int sh = 4 * (x % kSegL);
+        ops = (ops & ~(15u << sh)) | ((unsigned)nops << sh);
+        inflight += nops;
+      }
+      while (head < x) retire();
+    }
+  };
+  if constexpr (kSeg) {
+    const int tot = args.totalRecvTokenNum[0];
+    const int perBlk = (tot + (int)gridDim.x - 1) / (int)gridDim.x;
+    if (perBlk >= kSegMin) {
+      segSend(tot, perBlk);
+      return;
+    }
+  }
   auto specRun = [&](int r0) {
     const int rl = min(r0, kMaxRecv - 1);
     asm volatile("" ::"s"(win), "s"(args.totalRecvTokenNum), "s"(args.offRecvToSrc),
                  "s"(args.offOutTok));
-    TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kWireB),
+    TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kStageOff),
                       reinterpret_cast<const int*>(src + (size_t)rl * kTokB),
                       TdmShape<int>((int)(kTokB / 4)));
     const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
@@ -1487,13 +1663,24 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   for (r0 += stride; more; r0 += stride) more = specRun(r0);
 }
 
+// The fp4 reduce at eight ranks and up, once every warp has a token: an item is a whole token, so a
+// token's rows are staged and its route prepared once rather than once per half, and the next
+// item's route is prepared while this item's rows load.
 template <EpCfg kCfg>
+__device__ __forceinline__ bool EpFp4WholeTok(const EpArgs& args) {
+  return kCfg.worldSize >= 8 && args.numTokens >= (int)gridDim.x * kCfg.warpPerBlock;
+}
+struct EpNoHook {
+  __device__ __forceinline__ void operator()() const {}
+};
+
+template <EpCfg kCfg, int kIpt = EpFp4Wire<kCfg>::kItemPass>
 __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, int it) {
   using W = EpFp4Wire<kCfg>;
   constexpr int topk = kCfg.numExpertPerToken;
   constexpr int npes = kCfg.worldSize;
   constexpr int kMaxRecv = EpMaxRecv(kCfg);
-  constexpr int kItemPass = W::kItemPass;
+  constexpr int kItemPass = kIpt;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
   const unsigned char* const land =
       EpLocal<unsigned char>(args.window, args.offOutTok) + W::kLandOff;
@@ -1520,8 +1707,9 @@ __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, i
   return r;
 }
 
-template <EpCfg kCfg, typename T>
-__device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4Item<kCfg>& r) {
+template <EpCfg kCfg, typename T, int kIpt = EpFp4Wire<kCfg>::kItemPass, typename Hook = EpNoHook>
+__device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4Item<kCfg>& r,
+                                                Hook hook = Hook{}) {
   using W = EpFp4Wire<kCfg>;
   constexpr int WS = kCfg.waveSize;
   constexpr int npes = kCfg.worldSize;
@@ -1531,7 +1719,7 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   constexpr int kWireB = W::kWireB;
   constexpr int kWireDw = W::kWireDw;
   constexpr int kCap = W::kCap;
-  constexpr int kItemPass = W::kItemPass;
+  constexpr int kItemPass = kIpt;
   constexpr int kPass = kCfg.hiddenDim / (32 * WS);
   static_assert(kCfg.hiddenDim % (32 * WS) == 0,
                 "a pass is 32 elements a lane, inside one scale group");
@@ -1548,6 +1736,7 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   const int pBeg = r.pOnly * kPerItem;
   const int pEnd = min(kPass, pBeg + kPerItem);
   if (!mask) {
+    hook();
     const int gBeg = pBeg * WS;
     const int gEnd = pEnd * WS;
     for (int g = gBeg + laneId; g < gEnd; g += WS)
@@ -1590,6 +1779,7 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
     if (j < nRow)
       TdmIssueLoad<int>(reinterpret_cast<int*>(sharedMem + tileOff + (size_t)j * kWireB),
                         reinterpret_cast<const int*>(rp[j]), TdmShape<int>(kWireDw));
+  hook();
   __builtin_amdgcn_s_wait_tensorcnt(0);
 #pragma unroll
   for (int q = 0; q < kPerItem; ++q) {
@@ -1612,6 +1802,20 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   }
 }
 
+template <EpCfg kCfg, typename T, int kIpt>
+__device__ __forceinline__ void EpFp4ReduceLoop(const EpArgs& args, EpFp4Item<kCfg> cur, const int gw,
+                                                const int gn) {
+  const int nItems = args.numTokens * kIpt;
+  for (int it = gw; it < nItems; it += gn) {
+    const int nx = it + gn;
+    EpFp4Item<kCfg> nxt;
+    EpFp4ReduceItem<kCfg, T, kIpt>(args, cur, [&] {
+      if (nx < nItems) nxt = EpFp4ReducePrep<kCfg, kIpt>(args, nx);
+    });
+    cur = nxt;
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpFp4CombineReduce(const EpArgs& args,
                                                    const EpFp4Item<kCfg>& rFirst) {
@@ -1620,6 +1824,12 @@ __device__ __forceinline__ void EpFp4CombineReduce(const EpArgs& args,
   const int globalWarpNum = (int)gridDim.x * kCfg.warpPerBlock;
   if (warpId == 0) asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
   __builtin_amdgcn_s_barrier();
+  if constexpr (kCfg.worldSize >= 8) {
+    if (EpFp4WholeTok<kCfg>(args)) {
+      EpFp4ReduceLoop<kCfg, T, 1>(args, rFirst, globalWarpId, globalWarpNum);
+      return;
+    }
+  }
   const int nItems = args.numTokens * EpFp4Wire<kCfg>::kItemPass;
   if (globalWarpId < nItems) EpFp4ReduceItem<kCfg, T>(args, rFirst);
   for (int it = globalWarpId + globalWarpNum; it < nItems; it += globalWarpNum)
@@ -1651,8 +1861,11 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   [[maybe_unused]] EpFp4First<kCfg> rFirst{};
   if constexpr (!UseP2PRead) {
     EpFp4CombineSend<kCfg, T>(args);
-    if (globalWarpId < args.numTokens * EpFp4Wire<kCfg>::kItemPass)
+    if (EpFp4WholeTok<kCfg>(args)) {
+      if (globalWarpId < args.numTokens) rFirst = EpFp4ReducePrep<kCfg, 1>(args, globalWarpId);
+    } else if (globalWarpId < args.numTokens * EpFp4Wire<kCfg>::kItemPass) {
       rFirst = EpFp4ReducePrep<kCfg>(args, globalWarpId);
+    }
     staged = true;
   } else if (reinterpret_cast<const T*>(args.inpTokenBuf) != stage) {
     for (int i = globalWarpId; i < totalRecvTokenNum; i += globalWarpNum) {
@@ -1716,10 +1929,19 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                                   ? (((int)hiddenDim + _cPullTileCap - 1) / _cPullTileCap)
                                   : MORI_COMB_TDM;
   const int _cPullChunks = (MORI_COMB_TDM > _cPullFitChunks) ? MORI_COMB_TDM : _cPullFitChunks;
+  // Rounded to the fold's stride (one 16 B vector per lane) where that still fits; whatever a
+  // chunk has past a whole stride is folded by a 2-byte scalar loop.
+  const int _cPullFoldElems = WS * (16 / (int)sizeof(TokT));
+  const int _cPullTileFold =
+      (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullFoldElems - 1) /
+       _cPullFoldElems) *
+      _cPullFoldElems;
   const int _cPullTileElems =
-      (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
-       _cPullRowElems) *
-      _cPullRowElems;
+      (_cPullTileFold <= _cPullTileCap)
+          ? _cPullTileFold
+          : (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
+             _cPullRowElems) *
+                _cPullRowElems;
   const size_t _cPullLdsNeed =
       _cPullPtrBytes + (size_t)warpNum * _cPullSrcMax * _cPullTileElems * sizeof(TokT);
   const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems) &&
@@ -2069,7 +2291,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             const int _nRed = _rowCnt;
 #define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
             __threadfence_block();
-            constexpr int _cRedSrcMax = 4;
+            // Rows up to this count are loaded together before folding; past it each row's LDS
+            // read is waited on alone, so it must cover every source a token can have.
+            constexpr int _cSrcMaxC = (npes < topk) ? npes : topk;
+            constexpr int _cRedSrcMax = (_cSrcMaxC > 4) ? _cSrcMaxC : 4;
             constexpr int _cOutVB = 16;
             constexpr int _cV = _cOutVB / (int)sizeof(T);
             constexpr int _cVB = _cV * (int)sizeof(TokT);
