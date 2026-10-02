@@ -44,6 +44,8 @@ hipDataType IntToHipDataType(int dtype) {
       return HIP_R_32F;
     case 1:
       return HIP_R_16BF;
+    case 6:
+      return HIP_R_16F;
     case 2:
       return HIP_R_8F_E4M3;
     case 3:
