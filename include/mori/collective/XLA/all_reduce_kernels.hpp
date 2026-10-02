@@ -56,11 +56,11 @@ namespace collective {
 //   output        : raw symmetric-heap pointer, N = npes*chunkElems elements
 //                   (the FULL reduced vector; on exit every slot p holds the
 //                    reduction over all PEs of shard p)
-//   groupCounters : plain device buffer (>= kBcastFlagIdx + 2 uint32), zeroed once
-//                   by the host. [0, S): per-slice arrival counters; each slice's
-//                   elected block self-resets its slot. Used to detect the last
-//                   block to finish a slice, so exactly one block broadcasts that
-//                   slice. [kBcastFlagIdx + b]: broadcast b's release flag.
+//   groupCounters : plain device buffer (kGroupCounterCount uint32), zeroed once
+//                   by the host. [kBcastFlagIdx + b]: broadcast b's release
+//                   counter (every block counts in once per launch, never
+//                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
+//                   which elects the tail owner.
 //   barrierCtr    : symmetric-heap uint64 for PushEntryBarrier (block 0, before
 //                   Phase 1)
 //
@@ -70,16 +70,15 @@ namespace collective {
 // (detail::WaitAndReduceSlice), which waits on that slice's completion counter and
 // reduces it with the whole grid into output[myPe] (= myShard).
 //
-// Phase 4 (two-copy broadcast) is the rest of that same loop iteration. As soon
-// as a block finishes reducing slice s it does a system fence (publishing its
-// reduce stores) and bumps groupCounters[s]. The block that reads the full count
-// gridDim.x is the last one out of slice s and resets that slice's counters.
-// Both broadcast copies (b=0: slices [0, S-1), b=1: the last slice) into every
-// peer's output[myPe] are pre-posted by block 0 in Phase 1, right behind the
-// scatter, each preceded by a POLL_REGMEM (padded to 64B with NOPs) on a local
-// flag groupCounters[kBcastFlagIdx+b]. Phase 4 then only has to store the flag:
-// the elected block of slice S-2 releases b=0 and that of slice S-1 releases b=1
-// -- no packet build or doorbell on the critical path. Each copy trails an
+// Phase 4 (two-copy broadcast) is the rest of that same loop iteration. Both
+// broadcast copies (b=0: slices [0, S-1), b=1: the last slice) into every peer's
+// output[myPe] are pre-posted by block 0 in Phase 1, right behind the scatter,
+// each preceded by a POLL_REGMEM (padded to 64B with NOPs) on a local counter
+// groupCounters[kBcastFlagIdx+b]. Once a block has reduced slice S-2 (resp.
+// S-1) it does a system fence (publishing its reduce stores) and adds 1 to
+// counter b=0 (resp. b=1); the add that brings the counter to its target
+// releases the copy -- no election, packet build or doorbell on the critical
+// path. Slices 0..S-3 need no count. Each copy trails an
 // ADD64(1 << 8b) into byte b of the receiver's DEDICATED packed broadcast counter
 // signalPtrs[kBcastSlot] -- distinct from the packed reduce-scatter slice
 // counter, so no ADD can be miscounted by any other wait.
@@ -90,11 +89,17 @@ namespace collective {
 // Per-slice copies only added packets; the scatter and broadcast also share the
 // same link direction, so they could not overlap usefully anyway.
 //
-// The release flags live in groupCounters, not signalBuf: they are plain local
-// stores, and sharing a uint64 with a counter that peers' SDMA ADD64s rewrite in
-// full could lose a flag update. Only this PE's own SDMA engine polls them.
-// The flags are epochs, never reset: the queue polls for the value Phase 1 read
-// + 1. kBcastSlot / kBcastFlagIdx are defined in collectives_common.hpp.
+// The release counters live in groupCounters, not signalBuf: they are local
+// atomics, and sharing a uint64 with a counter that peers' SDMA ADD64s rewrite
+// in full could lose an update. Only this PE's own SDMA engine polls them.
+// They are never reset: the queue polls for == (value Phase 1 read + gridDim.x),
+// exact modulo 2^32. A reset could not be ordered after the engine's last poll
+// sample, and an equality poll that misses its value hangs. The counter cannot
+// overshoot its target while polled: the next launch's adds need peers' next
+// scatters, which follow the entry barrier, which follows this launch's b=1
+// (and, in queue order, b=0) landing at every peer.
+// kBcastSlot / kBcastFlagIdx / kBcastTargetIdx are defined in
+// collectives_common.hpp.
 
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
@@ -118,17 +123,23 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   if (blockIdx.x == 0) {
     __shared__ uint32_t flagEpoch[2];
     if (threadIdx.x == 0) {
-      // Read the flags BEFORE arriving: no block of this launch can bump one until
-      // peers scatter to me, which needs my arrival. The previous launch's bump is
-      // visible across the kernel boundary.
+      // Read the counters BEFORE arriving: no block of this launch can count in
+      // until peers scatter to me, which needs my arrival. The previous launch's
+      // counts are visible across the kernel boundary.
       for (uint32_t b = 0; b < 2; b++) {
         flagEpoch[b] = __hip_atomic_load(cco::impl::global(bcastFlag(b)), __ATOMIC_RELAXED,
-                                         __HIP_MEMORY_SCOPE_SYSTEM) + 1;
+                                         __HIP_MEMORY_SCOPE_SYSTEM) + gridDim.x;
       }
-      // Back-to-back all-reduce is safe on its own (a peer finishes only after our
-      // broadcasts, i.e. after we are done with staging and reset the slice counter),
-      // but staging/signalBuf are shared with the other push collectives, whose
-      // completion implies no such thing. Gate on every PE entering this launch.
+      // Blocks of this launch read the b=1 target only after their last slice
+      // wait, which is causally behind the barrier below; the release fence
+      // orders this store before my arrival.
+      __hip_atomic_store(&groupCounters[kBcastTargetIdx], flagEpoch[1], __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+      // Gate on every PE entering this launch: staging/signalBuf are shared with
+      // the other push collectives, and the slice counter is cleared only after
+      // the b=1 release, so a peer may finish before my previous launch is done
+      // with them.
       PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
     }
     __syncthreads();
@@ -150,8 +161,8 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
              (static_cast<uint64_t>(diff)<<32);
         });
 
-    // Pre-post both broadcasts behind the scatter, each parked on its flag until
-    // Phase 4 bumps it. b=0: slices [0, S-1); b=1: the last slice (the whole
+    // Pre-post both broadcasts behind the scatter, each parked on its counter
+    // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole
     // shard at S==1, where b=0 does not exist).
     // Both broadcasts go out per peer as one reservation and one doorbell.
     const bool hasB0 = S > 1;
@@ -176,11 +187,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
         });
   }
 
-  // Whether this block released b=1 and so owes the completion wait for BOTH
-  // broadcasts. Deferring that wait to the tail below keeps the elected block
-  // reducing the remaining slices instead of stalling on XGMI mid-loop.
+  // Whether this block's count released b=1, so it owes the slice-counter reset
+  // and the completion wait for BOTH broadcasts. Only meaningful in thread 0.
   bool ownsTail = false;
-  __shared__ bool isSliceLast;
 
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
   uint64_t seen = 0;
@@ -196,65 +205,51 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                                                  staging, myShard, sOfs, sCnt, chunkElems,
                                                  lstride);
 
-    // === Phase 4: this slice is reduced -- elect its last block ================
-    // Publish this block's reduce stores to slice s before announcing arrival, so
-    // once the counter hits gridDim.x every block's stores are globally visible to
-    // the elected block's DMA read of the slice.
-    __threadfence_system();
-    if (threadIdx.x == 0) {
-      isSliceLast = (atomicAdd(&groupCounters[s], 1u) + 1 == gridDim.x);
-    }
-    __syncthreads();
-
-    if (isSliceLast) {  // block-uniform: isSliceLast is shared
+    // === Phase 4: count in for slices S-2 (b=0) and S-1 (b=1) ==================
+    // b=0 covers slices [0, S-1): every block reduces slices in order, so its
+    // count at S-2 vouches for all of them. b=1 covers the last slice (the whole
+    // shard at S==1, where b=0 does not exist). Slices 0..S-3 need no count.
+    if (s + 2 >= S) {
+      const uint32_t b = (s == S - 1) ? 1u : 0u;
+      // Every wave publishes its reduce stores before thread 0 counts the block
+      // in, so once the counter reaches its target all blocks' stores are
+      // visible to the SDMA read of the broadcast.
+      __threadfence_system();
+      __syncthreads();
+      // The SDMA engine polls this counter for == target directly, so the last
+      // count releases the pre-posted copy with no further step. System scope:
+      // the SDMA engine must observe the RMW.
       if (threadIdx.x == 0) {
-        groupCounters[s] = 0;  // reset slice s's arrival counter
-        // The packed slice counter is shared by every slice, so it can only be
-        // cleared once no add is still in flight: the last block out of slice
-        // S-1 is that point (every block has passed every slice's wait). It must
-        // land before the b=1 release below, which lets peers finish and start
-        // their next launch's scatter into this counter.
-        if (s == S - 1) {
-          StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kSliceSignalSlot], 0);
+        const uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
+                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (b == 1) {
+          ownsTail = (old + 1 == __hip_atomic_load(&groupCounters[kBcastTargetIdx],
+                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
         }
-      }
-      // Only slices S-2 and S-1 release a broadcast; the elected blocks of slices
-      // 0..S-3 just reset their arrival counter.
-      if (s + 2 >= S) {
-        // b=0 (elected by S-2): slices [0, S-1). Every block reduces slices in
-        // order and fences before counting in, so the last block into S-2 knows
-        // all of [0, S-1) is reduced and published. b=1 (elected by S-1): the
-        // last slice. At S==1 only b=1 exists and covers the whole shard.
-        const uint32_t b = (s == S - 1) ? 1u : 0u;
-
-        // The copies were pre-posted in Phase 1 behind a POLL on this flag; bump
-        // it to the epoch they wait for. This block is the flag's only writer in
-        // the launch, so load+store is enough. Release orders thread 0's resets
-        // above before it: once a broadcast lands, its receiver can finish and
-        // its NEXT launch's scatter starts ADDing to my packed slice counter.
-        if (threadIdx.x == 0) {
-          auto* flag = cco::impl::global(bcastFlag(b));
-          const uint32_t e = __hip_atomic_load(flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-          __hip_atomic_store(flag, e + 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-        }
-        ownsTail = (b == 1);
       }
     }
   } // for s
 
-  // === Tail: collect every peer's broadcasts into my output ===================
+  // === Tail: reset the slice counter, collect every peer's broadcasts =========
+  // The block whose count completed b=1 is the last one out of every slice wait,
+  // so no add to the packed slice counter is still unseen and it may clear it.
+  // That need not precede the b=1 release: peers only ADD into it again from
+  // their next launch's scatter, behind PushEntryBarrier, which needs my next
+  // launch to have started.
+  //
   // Both broadcasts share one packed counter, so it can only be cleared once
-  // both bytes are complete; the b=1 owner waits for both (b=0 does not exist at
-  // S==1). Each peer's queue carries b=0 ahead of b=1, so byte 0 is normally
+  // both bytes are complete; the tail owner waits for both (b=0 does not exist
+  // at S==1). Each peer's queue carries b=0 ahead of b=1, so byte 0 is normally
   // complete by the time byte 1 is.
   //
-  // No fence closes the kernel. The reset is a system-scope store, so it needs no
-  // writeback, and nothing beyond the kernel boundary races it: this slot is only
-  // touched again by a peer's Phase 4, which cannot run before my NEXT launch's
-  // scatter. Nor is an acquire needed -- no thread here reads the slices peers
-  // DMA'd into output, and whoever consumes them acquires at its own kernel
-  // boundary.
+  // No fence closes the kernel. The resets are system-scope stores, so they need
+  // no writeback, and nothing beyond the kernel boundary races them: these slots
+  // are only touched again by a peer's next scatter or broadcast, which cannot
+  // run before my NEXT launch's entry barrier. Nor is an acquire needed -- no
+  // thread here reads the slices peers DMA'd into output, and whoever consumes
+  // them acquires at its own kernel boundary.
   if (threadIdx.x == 0 && ownsTail) {
+    StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kSliceSignalSlot], 0);
     const uint32_t want = static_cast<uint32_t>(npes - 1);  // no self-copy
     auto* addr = cco::impl::global(&signalBuf[kBcastSlot]);
     auto done = [=](uint64_t v) {
