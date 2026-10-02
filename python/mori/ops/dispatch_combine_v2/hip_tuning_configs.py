@@ -123,9 +123,40 @@ _DISPATCH_TABLE: dict = {
         #   1024   75.8    68.8   68.1   69.4  |  68.0 55.2 55.6 54.7 | 66.6 50.6 50.8 51.3
         #   2048  101.3   103.5  102.3  101.7  |  86.5 78.5 76.6 76.2 | 85.8 67.9 64.2 64.5
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
+        # fp8 gets its own row because the None row is really bf16's answer. Two
+        # ways it differs. (i) THE ROUND RULE reaches further down than the None
+        # row's first edge admits: topk 6 on wave32 gives _tpi = 1, so one round is
+        # block*warp tokens and the ~39us rendezvous floor is held the moment total
+        # warps >= ct -- blocks past that sit idle, so each small bucket spends the
+        # fewest that still cover its top end. Latency is flat across those; the
+        # smaller grid is for whatever overlaps dispatch, the same trade the combine
+        # table above makes. (ii) 16 warps/block, not 8: same warps, half the
+        # blocks, and fp8 shows no per-block warp penalty where bf16 does -- bf16
+        # 64x16 runs 3-4us behind 64x8 at every small ct, which is why bf16 keeps
+        # the None row.
+        #   ct    4x16  8x16 16x16 32x16 | 64x8 64x16 128x16
+        #   64    39.1  39.4  39.3  39.4 | 39.1  38.9
+        #   128   50.7  39.4  39.1  39.5 | 39.1  39.5
+        #   256   77.1  50.8  39.7  40.0 | 39.3  39.2
+        #   512  124.1  76.9  51.5  40.7 | 40.7  40.8
+        #   1024                         | 53.0  43.8
+        #   2048                         |       61.0  57.9
+        #   4096                         |       96.6  87.7
+        #   8192                         |      162.2 145.4
+        #  16384                         |             261.3
+        # Coming up short of a round is a cliff, not a slope: 4x16 is +30% at ct=128
+        # and +96% at ct=256, which is the rule's edge showing itself.
         (4, 7168, 6, None): {
             None: ((512, 64, 8), (4096, 64, 16), (None, 128, 16)),
             "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+            "fp8": (
+                (64, 4, 16),
+                (128, 8, 16),
+                (256, 16, 16),
+                (512, 32, 16),
+                (1024, 64, 16),
+                (None, 128, 16),
+            ),
         },
     },
 }
