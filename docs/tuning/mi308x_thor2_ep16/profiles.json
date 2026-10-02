@@ -1,0 +1,2598 @@
+{
+  "schema_version": 1,
+  "manifest": "manifest.json",
+  "profiles": [
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2",
+      "dispatch": [
+        16,
+        10,
+        4
+      ],
+      "combine": [
+        16,
+        10,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        4
+      ],
+      "combine": [
+        64,
+        42,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2",
+      "dispatch": [
+        32,
+        21,
+        4
+      ],
+      "combine": [
+        32,
+        21,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2_ll",
+      "dispatch": [
+        32,
+        21,
+        8
+      ],
+      "combine": [
+        64,
+        42,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        8,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        10,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2_ll",
+      "dispatch": [
+        32,
+        21,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        40,
+        8
+      ],
+      "combine": [
+        64,
+        32,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        32,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        10,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 8,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        32,
+        16
+      ],
+      "combine": [
+        64,
+        42,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        42,
+        4
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2",
+      "dispatch": [
+        8,
+        5,
+        4
+      ],
+      "combine": [
+        32,
+        21,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        32,
+        4
+      ],
+      "combine": [
+        32,
+        21,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        10,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        64,
+        32,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        4
+      ],
+      "combine": [
+        16,
+        8,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2",
+      "dispatch": [
+        32,
+        21,
+        16
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 4,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        8,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        53,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 4096,
+      "topk": 6,
+      "experts_per_rank": 16,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 32,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2",
+      "dispatch": [
+        8,
+        4,
+        4
+      ],
+      "combine": [
+        16,
+        8,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        42,
+        4
+      ],
+      "combine": [
+        32,
+        21,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        10,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 1,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 4,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        42,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        16
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 8,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        80,
+        48,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "bf16",
+      "combine_dtype": "bf16",
+      "scale_dim": 0,
+      "scale_type_size": 0,
+      "num_qp": 2,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2",
+      "dispatch": [
+        8,
+        5,
+        4
+      ],
+      "combine": [
+        8,
+        5,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 4,
+      "max_num_inp_token_per_rank": 4,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        40,
+        4
+      ],
+      "combine": [
+        64,
+        42,
+        4
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16,
+      "max_num_inp_token_per_rank": 16,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 64,
+      "max_num_inp_token_per_rank": 64,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 4,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2",
+      "dispatch": [
+        64,
+        42,
+        16
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 1,
+      "tokens": 256,
+      "max_num_inp_token_per_rank": 256,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        48,
+        8
+      ],
+      "combine": [
+        16,
+        10,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 1024,
+      "max_num_inp_token_per_rank": 1024,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2",
+      "dispatch": [
+        64,
+        42,
+        8
+      ],
+      "combine": [
+        80,
+        64,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 4096,
+      "max_num_inp_token_per_rank": 4096,
+      "kernel": "v2_ll",
+      "dispatch": [
+        80,
+        53,
+        8
+      ],
+      "combine": [
+        32,
+        21,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2",
+      "dispatch": [
+        32,
+        21,
+        16
+      ],
+      "combine": [
+        64,
+        32,
+        16
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 8,
+      "tokens": 8192,
+      "max_num_inp_token_per_rank": 8192,
+      "kernel": "v2_ll",
+      "dispatch": [
+        64,
+        42,
+        16
+      ],
+      "combine": [
+        32,
+        16,
+        8
+      ],
+      "tuned": true
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    },
+    {
+      "device": "mi308x",
+      "network": "skyriver07-skyriver04-thor2-2x200",
+      "world_size": 16,
+      "hidden_size": 7168,
+      "topk": 6,
+      "experts_per_rank": 24,
+      "dispatch_dtype": "fp8_e4m3fnuz",
+      "combine_dtype": "bf16",
+      "scale_dim": 56,
+      "scale_type_size": 4,
+      "num_qp": 2,
+      "tokens": 16384,
+      "max_num_inp_token_per_rank": 16384,
+      "kernel": "v2_ll",
+      "dispatch": [
+        96,
+        64,
+        8
+      ],
+      "combine": [
+        96,
+        64,
+        8
+      ],
+      "tuned": false
+    }
+  ]
+}
