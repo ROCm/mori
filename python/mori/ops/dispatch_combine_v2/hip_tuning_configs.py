@@ -127,8 +127,35 @@ _DISPATCH_TABLE: dict = {
             None: ((512, 64, 8), (4096, 64, 16), (None, 128, 16)),
             "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
+        # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
+        # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
+        # past 1024 tokens 64x16 gives some warps a second token, and its metadata split
+        # (kPlainMeta in ep_intranode_1250x.hpp) up to four a payload warp, while 64x24 holds
+        # 1536 and 64x32 2048 at one each. Past 2048 64x16 wins again up to about 2900, 64x32
+        # from there to 4096 (its metadata warps borrow the payload warps' metadata slabs), and
+        # 64x16 above that; 8192 is the one point past 4096 where 64x32 is ahead (-2). Dispatch
+        # us, graph, mean over the ranks, 3 alternating rounds (up to 2304 with 4096 tokens a
+        # rank allocated, past it 8192):
+        #   ct     64x16  64x24  64x32
+        #   1088    63.6   54.0   56.3
+        #   1536    66.6   62.4   63.7
+        #   1792    72.4   76.5   69.6
+        #   2048    78.8   79.6   74.8
+        #   2304    82.5   83.0   86.8
+        #   2816    91.1          92.1
+        #   3328   109.5         100.7
+        #   4096   123.2         119.9
+        #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((None, 64, 16),),
+            "fp4_disp_bf16_comb": (
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (2048, 64, 32),
+                (2944, 64, 16),
+                (4096, 64, 32),
+                (None, 64, 16),
+            ),
         },
     },
 }
@@ -148,6 +175,8 @@ _COMBINE_TABLE: dict = {
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
+        # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
+        (8, 7168, 6, None): ((None, 64, 8),),
     },
 }
 

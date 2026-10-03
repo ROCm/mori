@@ -310,7 +310,7 @@ __device__ __forceinline__ index_t EpSelfFirstPeerSent(const EpArgs& args, int p
 
 // The plain token map fills block b with its warpPerBlock consecutive work units, so a
 // call with fewer units than warps leaves the high blocks empty: 512 tokens on 64 x 16
-// run on 32 blocks. When the call's units fit in gridDim.x * T (T = MORI_EP_TOKCHUNK),
+// run on 32 blocks. When the call's units fit in gridDim.x * T (T = kEpTokChunk),
 // block b takes units [b * T, b * T + T) on its first T warps instead, and the warps at
 // or past T take the ids left over, so the map stays a bijection onto
 // [0, gridDim.x * warpPerBlock) and every stride loop still covers each token once.
@@ -318,14 +318,12 @@ __device__ __forceinline__ index_t EpSelfFirstPeerSent(const EpArgs& args, int p
 // at EP8), and so does every geometry with at most T warps per block. selfFirst only:
 // under the original protocol every block that holds tokens also RMWs this rank's own
 // slot word, and there the chunked map measured slower than the plain one at 512
-// tokens on EP8. 0 turns it off.
-#ifndef MORI_EP_TOKCHUNK
-#define MORI_EP_TOKCHUNK 8
-#endif
+// tokens on EP8.
+constexpr int kEpTokChunk = 8;
 template <EpCfg kCfg>
 __device__ __forceinline__ bool EpTokChunked(int numTokens, int etpi) {
-  constexpr int T = MORI_EP_TOKCHUNK;
-  if constexpr (!kCfg.selfFirst || T <= 0 || kCfg.warpPerBlock <= T) {
+  constexpr int T = kEpTokChunk;
+  if constexpr (!kCfg.selfFirst || kCfg.warpPerBlock <= T) {
     return false;
   } else {
     if (numTokens <= 0) return false;
@@ -336,8 +334,8 @@ __device__ __forceinline__ bool EpTokChunked(int numTokens, int etpi) {
 template <EpCfg kCfg>
 __device__ __forceinline__ int EpTokChunkWarp(int warpId, int globalWarpId, bool chunked) {
   constexpr int W = kCfg.warpPerBlock;
-  constexpr int T = MORI_EP_TOKCHUNK;
-  if constexpr (!kCfg.selfFirst || T <= 0 || W <= T) {
+  constexpr int T = kEpTokChunk;
+  if constexpr (!kCfg.selfFirst || W <= T) {
     return globalWarpId;
   } else {
     if (!chunked) return globalWarpId;
@@ -408,6 +406,20 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool _metapreOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens) &&
                           (_etpi == 1) && (_preGsz >= topk) && (_preTok < (int)args.numTokens) &&
                           args.tokenIndices && args.inpTokenBuf;
+  constexpr int kPM = npes;
+  // Past gridDim * warpPerBlock tokens the token map gives every warp two or more tokens and a
+  // metadata run, and one wave's TDM ops complete in issue order, so each warp's payload waited for
+  // its own metadata stores to be acknowledged: at EP8 4096 tokens the metadata held the critical
+  // path ~15 us with a tenth of the payload's bytes. There the block's top npes warps take its
+  // metadata, a peer each, and send no payload, and the other warps carry the block's tokens. Past
+  // twice that many tokens those metadata warps, done early, also take the whole own pass. With at
+  // most one token a warp it stays off: the payload warps would run two tokens back to back where
+  // every warp ran one (EP8 768 / 1024 tokens: +10 us). selfFirst only. A call never holds more
+  // than maxTokPerRank tokens, so a grid with a warp for each of them never takes the split, and
+  // its code is left out.
+  constexpr bool kPlainMeta = kCfg.selfFirst && !kUnitGeom && kCfg.warpPerBlock >= 2 * kPM &&
+                              kCfg.maxTokPerRank > kCfg.blockNum * kCfg.warpPerBlock;
+  const bool _metaPlain = kPlainMeta && !_tokChunk && _etpi == 1 && (int)args.numTokens > aWarps;
   index_t _pIdx = 0;
   float _pWt = 0.0f;
   if (_metapreOk && _preE < topk) {
@@ -692,13 +704,34 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
   }
+  // Below the kPlainMeta range the warps whose metadata run is the own one skip it and sit idle
+  // through the metadata pass, while the own pass was split over every warp after its payload.
+  // Those warps take the whole own pass instead, after their own payload, so it runs while the
+  // other warps still wait on their metadata stores (EP8 fp4: 16 tokens -2.0 us, 512 -1.7, 1024
+  // -1.9, 2048 -0.5). Before their payload it waits for R up front and is slower past 1024 tokens.
+  // fp4 dispatch only, by the dtype the JIT renders into kCfg: the own pass moves fp4 rows four
+  // to a transfer where the slab holds four and every other dtype one at a time, and on so few
+  // warps EP8 fp8 at 512 tokens came out 1.2 us slower. The warps are found from warpId, so the
+  // runs must be peer-minor and one a warp in both maps.
+  constexpr int kOwnW = kCfg.warpPerBlock, kOwnT = kEpTokChunk;
+  constexpr bool kOwnHi =
+      kCfg.selfFirst && !kUnitGeom && kCfg.dtype == EpDType::Fp4x2 && kOwnW % npes == 0 &&
+      (kOwnW <= kOwnT || ((kOwnW - kOwnT) % npes == 0 && kOwnW - kOwnT >= npes));
+  const bool _ownHi = kOwnHi && !_metaPlain;
   bool _mPend = false;
   if (args.tokenIndices && args.inpTokenBuf) {
     const int tkM = topk;
     const index_t recvCapM = (index_t)EpMaxRecv(kCfg);
     const index_t _stgCapM = (index_t)(CUSPLIT_POOL_SLOTS / npes);
     // One warp owns a whole (peer, sub-range) run, moving idx+wt+srcmap through one tile.
-    const int mtileBytesM = kSlabBytes;  // the whole slab, see above
+    // Under kPlainMeta a metadata warp ships a whole peer's run of the block. Past 22 warps
+    // the fp4 slab is one token and the metadata tile one slab of that size, so a 4096-token run
+    // went out in three or four round trips (EP8 4096 tokens at 64 x 32: 188 us against 122 at
+    // 64 x 16). The payload warps do no metadata there, so metadata warp m takes the W / npes
+    // metadata slabs from m * W / npes, theirs included.
+    constexpr int kPmG = (kPlainMeta && kMetaSlabBytes > 0) ? (kCfg.warpPerBlock / kPM) : 1;
+    const bool _pmTile = (kPmG > 1) && _metaPlain && (warpId >= warpNum - kPM);
+    const int mtileBytesM = _pmTile ? kPmG * kMetaSlabBytes : kSlabBytes;  // the whole slab, see above
     // idx + weights + srcmap + the scale row, at the stride it is really moved at:
     // sizing this from the unpadded row would under-size the tile it then holds.
     const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
@@ -706,19 +739,25 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
       uint8_t* _m4 =
-          (kMetaSlabBytes > 0)
+          _pmTile ? (reinterpret_cast<uint8_t*>(_tdmBatchSmem) +
+                     (size_t)kCfg.warpPerBlock * kSlabBytes +
+                     (size_t)(warpId - (warpNum - kPM)) * kPmG * kMetaSlabBytes)
+          : (kMetaSlabBytes > 0)
               ? (reinterpret_cast<uint8_t*>(_tdmBatchSmem) +
                  (size_t)kCfg.warpPerBlock * kSlabBytes + (size_t)warpId * kMetaSlabBytes)
               : (reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM);
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
-      // Under the chunked map the warps at or past MORI_EP_TOKCHUNK hold no token, and
+      // Under the chunked map the warps at or past kEpTokChunk hold no token, and
       // where the payload pass walks the token map that leaves them no payload either.
       // They take every metadata run, a whole peer per warp, and the token warps none:
       // the tensorcnt wait after this pass counts every TDM op of the wave, so a token
       // warp that sent metadata would issue no payload until those stores completed.
+      // Past the chunked range kPlainMeta gives the runs to the top kPM warps, a peer each.
       const bool _metaHi = !kUnitGeom && _tokChunk;
-      const int _metaWarps = _metaHi ? (warpNum - MORI_EP_TOKCHUNK) : warpNum;
-      const int split = _metaHi ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1) : _peerSplit;
+      const int _metaWarps =
+          _metaHi ? (warpNum - kEpTokChunk) : (_metaPlain ? kPM : warpNum);
+      const int split = (_metaHi || _metaPlain) ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1)
+                                                : _peerSplit;
       const int nRuns = npes * split;
       // selfFirst numbers the runs peer-minor when the warps divide evenly, so warp w
       // takes peer w % npes -- the destination it also carries in the payload pass.
@@ -727,7 +766,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // tokens that ordering is worth ~2 us of the dispatch.
       const bool _runPeerMinor = kCfg.selfFirst && (_metaWarps % npes) == 0;
       const int _run0 =
-          _metaHi ? ((warpId >= MORI_EP_TOKCHUNK) ? (warpId - MORI_EP_TOKCHUNK) : nRuns) : warpId;
+          _metaHi ? ((warpId >= kEpTokChunk) ? (warpId - kEpTokChunk) : nRuns)
+          : _metaPlain ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
+                       : warpId;
       for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
@@ -1016,7 +1057,44 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         }
       }
     } else {
-      for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
+      if constexpr (kPlainMeta) {
+        if (_metaPlain) {
+          // The block's tokens are (b * W + w) + k * aWarps, the set the count and assignment
+          // passes walked; the warps below the metadata ones share them out.
+          const int nPay = warpNum - kPM;
+          const int qEnd = warpNum * (int)((args.numTokens + aWarps - 1) / aWarps);
+          for (int q = warpId; warpId < nPay && q < qEnd; q += nPay) {
+            const int tok = ((int)blockIdx.x * warpNum + (q % warpNum)) + (q / warpNum) * aWarps;
+            if (tok >= args.numTokens) continue;
+            index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
+                                             : EpNullFlat<kCfg>();
+            index_t peMe = EpPeFromFlat<kCfg>(flatMe);
+            int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
+            if (!__any(validMe)) continue;
+            TdmIssueLoad<T>(_tdmTile,
+                            reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
+                            _tdmG1);
+            bool loadWaited = false;
+            unsigned long long _vm = __ballot(validMe);
+            while (_vm) {
+              int l = __ffsll((long long)_vm) - 1;
+              _vm &= _vm - 1;
+              index_t flat = __shfl(flatMe, l);
+              index_t destPe = EpPeFromFlat<kCfg>(flat);
+              index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
+              if (!loadWaited) {
+                __builtin_amdgcn_s_wait_tensorcnt(0);
+                loadWaited = true;
+              }
+              T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
+              TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
+            }
+            __builtin_amdgcn_s_wait_tensorcnt(0);
+          }
+        }
+      }
+      for (int tokBase = aWarp * _etpi; !(kPlainMeta && _metaPlain) && tokBase < args.numTokens;
+           tokBase += aWarps * _etpi) {
         for (int _sub = 0; _sub < _etpi; ++_sub) {
           int tok = tokBase + _sub;
           if (tok >= args.numTokens) break;
@@ -1046,7 +1124,19 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           __builtin_amdgcn_s_wait_tensorcnt(0);
         }
       }
-      if constexpr (kCfg.selfFirst) ownPass(warpId, warpNum, 0);
+      if constexpr (kCfg.selfFirst) {
+        if (_ownHi) {
+          // The own run of part p went to metadata warp p * npes + myPe.
+          const int _ownWarp = _tokChunk ? (warpId - kEpTokChunk) : warpId;
+          const int _ownWarps = _tokChunk ? (warpNum - kEpTokChunk) : warpNum;
+          if (_ownWarp >= 0 && _ownWarp % npes == myPe)
+            ownPass(_ownWarp / npes, _ownWarps / npes, 0);
+        } else if (_metaPlain && (int)args.numTokens > 2 * aWarps) {
+          if (warpId >= warpNum - kPM) ownPass(warpId - (warpNum - kPM), kPM, 0);
+        } else {
+          ownPass(warpId, warpNum, 0);
+        }
+      }
     }
   }
   __syncthreads();
