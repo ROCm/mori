@@ -416,8 +416,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // most one token a warp it stays off: the payload warps would run two tokens back to back where
   // every warp ran one (EP8 768 / 1024 tokens: +10 us). selfFirst only. A call never holds more
   // than maxTokPerRank tokens, so a grid with a warp for each of them never takes the split, and
-  // its code is left out.
-  constexpr bool kPlainMeta = kCfg.selfFirst && !kUnitGeom && kCfg.warpPerBlock >= 2 * kPM &&
+  // its code is left out. Eight peers and up only: at four the split measured slower for fp8
+  // (EP4 64x16, 1536 / 4096 tokens: +3.9 / +12.8 us) though faster for bf16 (-1.8 / -3.9).
+  constexpr bool kPlainMeta = kCfg.selfFirst && !kUnitGeom && npes >= 8 &&
+                              kCfg.warpPerBlock >= 2 * kPM &&
                               kCfg.maxTokPerRank > kCfg.blockNum * kCfg.warpPerBlock;
   const bool _metaPlain = kPlainMeta && !_tokChunk && _etpi == 1 && (int)args.numTokens > aWarps;
   index_t _pIdx = 0;
