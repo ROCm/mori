@@ -645,6 +645,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         out_tok = cap * cfg.combine_token_nbytes
         if cfg.quant_type in _FP4_QUANT_TYPES:
             out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
+            if cfg.world_size >= 8:
+                out_tok += cfg.world_size * cap * 8
         regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),
