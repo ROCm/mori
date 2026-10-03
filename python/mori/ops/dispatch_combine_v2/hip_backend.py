@@ -158,7 +158,7 @@ def push_wire_nbytes(cfg) -> int:
 
 
 class TokOffExt:
-    """Dispatch's slot allocator word outside the cco window (default-on for a single-host gfx1250 EP; MORI_EP_TOKOFF_EXT=0 opts out).
+    """Dispatch's slot allocator word outside the cco window (single-host gfx1250 EP, opt-in: MORI_EP_TOKOFF_EXT=1).
 
     One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
     opened on every peer by IPC handle. ``peers`` is the device array of
@@ -176,14 +176,14 @@ class TokOffExt:
 
     @staticmethod
     def wanted(world) -> bool:
-        """MORI_EP_TOKOFF_EXT (default on), and every rank on this host.
+        """MORI_EP_TOKOFF_EXT=1 (default off), and every rank on this host.
 
         The peers' words are opened by hipIpc handle, which no other host can open;
         an EP spanning hosts keeps the word in the cco window, which is mapped across
         them. Collective over the default process group, like the constructor.
         """
-        v = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
-        if v in ("0", "false", "no", "off"):
+        v = os.environ.get("MORI_EP_TOKOFF_EXT", "").strip().lower()
+        if v not in ("1", "true", "yes", "on"):
             return False
         import socket
 
@@ -375,10 +375,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
         # memory instead of the cco window (see TokOffExt): the cco-window slot
         # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
-        # only kernel that reads tokOffPeers. Default-on for a single-host EP;
-        # MORI_EP_TOKOFF_EXT=0 (or false/no/off) opts back out to the cco-window
-        # path, and an EP spanning hosts always takes it (tokOffPeers stays None ->
-        # kernel EpTokOff falls back to the VMM hipMemCreate window).
+        # only kernel that reads tokOffPeers. Opt-in for a single-host EP with
+        # MORI_EP_TOKOFF_EXT=1; otherwise, and always for an EP spanning hosts, the
+        # word stays in the cco window (tokOffPeers stays None -> kernel EpTokOff
+        # falls back to the VMM hipMemCreate window).
         self._tokoff_ext = None
         self.tok_off_peers = None
         if self._tokoff_wanted:

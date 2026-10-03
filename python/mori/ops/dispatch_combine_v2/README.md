@@ -54,13 +54,13 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
 | `internode_tuning_configs.py` | **hip** internode kernel geometry, a third table: token-count buckets keyed by device, shape, topk and dispatch dtype, carrying `(block_num, rdma_block_num, warp_num)` **per phase** — dispatch and combine are tuned to different values over one shared arena. The internode plans are compiled per geometry, so the backend walks the whole table at build time and `lookup` only picks a prebuilt bucket; `block_num` is clamped to the CU count |
 
-## gfx125x dispatch: `MORI_EP_SELF_FIRST`
+## gfx125x dispatch: selfFirst
 
-On by default wherever the slot allocator word lives in the cco window: an EP
-spanning hosts, whose ranks cannot open each other's hipIpc handles, or
-`MORI_EP_TOKOFF_EXT=0`. A single-host EP keeps the word in a separate allocation by
-default (`TokOffExt` in `hip_backend.py`), where the local RMW costs nothing, so
-there it stays off unless `MORI_EP_SELF_FIRST=1`.
+On wherever the slot allocator word lives in the cco window, which is the
+default. `MORI_EP_TOKOFF_EXT=1` moves the word of a single-host EP into a separate
+allocation (`TokOffExt` in `hip_backend.py`), where the local RMW costs nothing, and
+there the original protocol runs; an EP spanning hosts always keeps the word in the
+window, since its ranks cannot open each other's hipIpc handles.
 
 With it on, the hip dispatch on gfx125x never makes a rank RMW its own
 slot allocator word: on memory mapped MTYPE_RW, that local RMW on the word the
@@ -70,8 +70,7 @@ blocks have reserved, it publishes to every peer how many slots it took there,
 and each rank places its own tokens above the sum of those. The state this needs
 is a few hundred bytes of symmetric memory per arena that `EpDispatchPlan`
 allocates on the arena's communicator itself, so an arena built outside this
-package needs nothing for it. `MORI_EP_SELF_FIRST=0` selects the original
-protocol, the better one where local memory is not mapped MTYPE_RW.
+package needs nothing for it.
 
 With it on, a call small enough to give every block at most 8 warp work units
 (512 tokens on the default 64 × 16 geometry at top-k 6) is spread over all the
@@ -79,8 +78,7 @@ blocks instead of filling the low half: block b takes units [8b, 8b + 8) on its
 first 8 warps. Where the payload pass walks the token map, the warps left without
 a token then send all of the metadata, so the token warps go straight to the
 payload. Geometries with at most 8 warps per
-block, such as EP4's tuned 64 × 8, compile to the same code as without it;
-`MORI_JIT_EXTRA_FLAGS=-DMORI_EP_TOKCHUNK=0` turns it off.
+block, such as EP4's tuned 64 × 8, compile to the same code as without it.
 
 ## Internode config
 

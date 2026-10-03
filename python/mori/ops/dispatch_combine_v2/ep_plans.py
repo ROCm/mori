@@ -168,25 +168,20 @@ class SelfFirstState:
 
 
 def self_first_enabled(slot_word_in_window: bool = True) -> bool:
-    """MORI_EP_SELF_FIRST; unset, it follows where the slot allocator word lives.
+    """selfFirst wherever the slot allocator word lives in the cco window, the default.
 
     selfFirst saves the RMW each rank makes on its own slot word, which costs
-    microseconds when the word is in the cco window on memory mapped MTYPE_RW. Where
-    it is not -- TokOffExt's separate allocation (the hip backend's single-host
-    default), or local memory not mapped MTYPE_RW (f01-1, for one) -- that local
-    atomic costs nothing and the per-call publish is pure overhead. So unset resolves
-    to ``slot_word_in_window``; 1/true/yes/on and 0/false/no/off force either protocol.
+    microseconds when the word is in the cco window on memory mapped MTYPE_RW. In
+    TokOffExt's separate allocation (hip backend, single host, MORI_EP_TOKOFF_EXT=1)
+    that local atomic costs nothing and the per-call publish is pure overhead.
     """
-    v = os.environ.get("MORI_EP_SELF_FIRST", "").strip().lower()
-    if not v:
-        return slot_word_in_window
-    return v not in ("0", "false", "no", "off")
+    return slot_word_in_window
 
 
 class EpDispatchPlan(_EpDispatchPlanBase):
     # The generated signature stays the documentation; this only adds the default.
     __doc__ = (_EpDispatchPlanBase.__doc__ or "") + (
-        "\n\n``self_first`` defaults to MORI_EP_SELF_FIRST (on). When the resolved Cfg"
+        "\n\n``self_first`` defaults to on. When the resolved Cfg"
         "\nhas it (gfx125x dispatch) and an arena is given, the plan binds the arena's"
         "\nSelfFirstState, allocating it on first use; an arena whose window mori.cco"
         "\ncannot trace to a communicator makes construction raise."
