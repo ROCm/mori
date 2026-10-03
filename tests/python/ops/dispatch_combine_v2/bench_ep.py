@@ -52,7 +52,7 @@ time for the same kernel. That replay is a window of its own, AFTER warmup and
 graph capture, because ITERS pairs are ~10 ms against a 50 ms sampling tick.
 
     torchrun --standalone --nproc_per_node=8 bench_ep.py
-    BACKENDS=flydsl,hip SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
+    BACKENDS=flydsl,hip COMB_MODE=pull SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
     MORI_SMI_MONITOR=1 MORI_SMI_DURATION=1.0 torchrun ... bench_ep.py
 """
 
@@ -96,7 +96,7 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # "inplace": the expert already wrote into the staging view, so combine elides the
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
-COMB_MODE = os.environ.get("COMB_MODE", "pull")
+COMB_MODE = os.environ.get("COMB_MODE", "push")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
@@ -175,8 +175,9 @@ _G = {
 def main():
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
-    torch.cuda.set_device(rank)
-    dev = torch.device("cuda", rank)
+    local = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local)
+    dev = torch.device("cuda", local)
 
     n_experts = world * EPR
     M = max(SWEEP)
