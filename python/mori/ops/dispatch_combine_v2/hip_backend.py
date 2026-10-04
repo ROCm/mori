@@ -338,6 +338,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._close_backend()
             self.arena.close()
             raise
+        # _build zeroes this rank's arena and selfFirst state, and a peer's first
+        # call already writes into both (its selfFirst count lands in this rank's
+        # inbox). A zero that runs after that write wipes it, and this rank's first
+        # dispatch then waits forever for the count. Every rank finishes its zeroes
+        # before any rank can make a call.
+        torch.cuda.synchronize(dev)
+        comm.barrier()
 
     @staticmethod
     def _specs_from(cfg):

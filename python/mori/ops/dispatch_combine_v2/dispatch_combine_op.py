@@ -1071,6 +1071,12 @@ class EpDispatchCombineOp:
             counter = getattr(self, name, None)
             if counter is not None:
                 counter.zero_()
+        # A peer's next call writes into the state zeroed above, so, as when the op
+        # is built, every rank finishes its zeroes before any rank goes on.
+        torch.cuda.synchronize()
+        comm = getattr(self, "comm", None)
+        if comm is not None:
+            comm.barrier()
 
     def __repr__(self):
         return (
