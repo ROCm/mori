@@ -1544,12 +1544,18 @@ constexpr size_t EpFp4PendOff() {
 }
 typedef __attribute__((address_space(1))) unsigned long long EpGU64;
 
+// A token lands one row per distinct destination rank of its top-k experts.
+template <EpCfg kCfg>
+constexpr int EpFp4Rows() {
+  return kCfg.worldSize < kCfg.numExpertPerToken ? kCfg.worldSize : kCfg.numExpertPerToken;
+}
+
 template <EpCfg kCfg>
 struct EpFp4Item {
   int t, pOnly, flat;
   unsigned long long mask;
-  const unsigned char* rp[kCfg.worldSize];
-  float on[kCfg.worldSize];
+  const unsigned char* rp[EpFp4Rows<kCfg>()];
+  float on[EpFp4Rows<kCfg>()];
 };
 
 template <EpCfg kCfg>
@@ -2042,7 +2048,7 @@ __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, i
   const int l0 = r.mask ? __ffsll((long long)r.mask) - 1 : 0;
   unsigned long long mm = r.mask;
 #pragma unroll
-  for (int j = 0; j < npes; ++j) {
+  for (int j = 0; j < EpFp4Rows<kCfg>(); ++j) {
     const int l = mm ? __ffsll((long long)mm) - 1 : l0;
     r.on[j] = mm ? 1.0f : 0.0f;
     mm &= mm - 1;
@@ -2063,11 +2069,12 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   constexpr int kWireB = W::kWireB;
   constexpr int kWireDw = W::kWireDw;
   constexpr int kCap = W::kCap;
+  constexpr int kRows = EpFp4Rows<kCfg>();
   constexpr int kItemPass = kIpt;
   constexpr int kPass = kCfg.hiddenDim / (32 * WS);
   static_assert(kCfg.hiddenDim % (32 * WS) == 0,
                 "a pass is 32 elements a lane, inside one scale group");
-  static_assert(kCap >= npes, "a token's landed rows are staged in the warp's tile");
+  static_assert(kCap >= kRows, "a token's landed rows are staged in the warp's tile");
   const int laneId = threadIdx.x & (WS - 1);
   const int warpId = threadIdx.x / WS;
   extern __shared__ char sharedMem[];
@@ -2090,12 +2097,12 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   }
   const auto& rp = r.rp;
   const auto& on = r.on;
-  auto accStore = [&](const int g, const uint4(&pk)[npes], const unsigned (&sb)[npes]) {
+  auto accStore = [&](const int g, const uint4(&pk)[kRows], const unsigned (&sb)[kRows]) {
     float acc[32];
 #pragma unroll
     for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
-    for (int j = 0; j < npes; ++j) {
+    for (int j = 0; j < kRows; ++j) {
       if (j >= __popcll(mask)) break;
       const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
       const float s = on[j] * __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
@@ -2119,7 +2126,7 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   const size_t tileOff = (size_t)warpId * kCap * kWireB;
   asm volatile("s_wait_dscnt 0x0" ::: "memory");
 #pragma unroll
-  for (int j = 0; j < npes; ++j)
+  for (int j = 0; j < kRows; ++j)
     if (j < nRow)
       TdmIssueLoad<int>(reinterpret_cast<int*>(sharedMem + tileOff + (size_t)j * kWireB),
                         reinterpret_cast<const int*>(rp[j]), TdmShape<int>(kWireDw));
@@ -2132,10 +2139,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       const int p = pBeg + q;
       if (p >= pEnd) break;
       const int g = p * WS + laneId;
-      uint4 pk[npes];
-      unsigned sb[npes];
+      uint4 pk[kRows];
+      unsigned sb[kRows];
 #pragma unroll
-      for (int j = 0; j < npes; ++j) {
+      for (int j = 0; j < kRows; ++j) {
         if (j >= nr) break;
         const char* const row = sharedMem + tileOff + (size_t)j * kWireB;
         pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
@@ -2148,7 +2155,7 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
 #pragma unroll
       for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
-      for (int j = 0; j < npes; ++j) {
+      for (int j = 0; j < kRows; ++j) {
         if (j >= nr) break;
         const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
         const float s = __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
@@ -2175,10 +2182,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       const int p = pBeg + q;
       if (p >= pEnd) break;
       const int g = p * WS + laneId;
-      uint4 pk[npes];
-      unsigned sb[npes];
+      uint4 pk[kRows];
+      unsigned sb[kRows];
 #pragma unroll
-      for (int j = 0; j < npes; ++j) {
+      for (int j = 0; j < kRows; ++j) {
         if (j >= nRow) break;
         const char* const row = sharedMem + tileOff + (size_t)(j < nRow ? j : 0) * kWireB;
         pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
@@ -2208,7 +2215,7 @@ __device__ __forceinline__ void EpFp4ReduceLoop(const EpArgs& args, EpFp4Item<kC
 
 template <EpCfg kCfg>
 constexpr bool EpFp4RedWs() {
-  return EpFp4Wire<kCfg>::kCap < kCfg.worldSize;
+  return EpFp4Wire<kCfg>::kCap < EpFp4Rows<kCfg>();
 }
 
 __device__ __forceinline__ void EpWaitTensorFloor(int n) {
@@ -2243,10 +2250,11 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
   constexpr int kRingL = (EpCombine1250xLdsBudget - kCtrlB) / kWireB / kNl;
   constexpr int kQL = kQ / kNl;
   constexpr int kFly = 6;
+  constexpr int kRows = EpFp4Rows<kCfg>();
   constexpr unsigned kSpinMax = 1u << 26;
   static_assert(kNl < kCfg.warpPerBlock, "a loading warp and a reducing warp at least");
   static_assert(kQ % kNl == 0, "every loader reuses only its own token entries");
-  static_assert(kRingL >= npes, "a loader's part of the ring holds a token's rows");
+  static_assert(kRingL >= kRows, "a loader's part of the ring holds a token's rows");
   static_assert((size_t)kNl * kRingL * kWireB + kCtrlB <= (size_t)EpCombine1250xLdsBudget,
                 "the ring and the control area fit the LDS budget");
   static_assert((kQ * 4 + 2 * kQ + 1) * 4 <= kCtrlB, "the token entries fit the control area");
@@ -2373,10 +2381,10 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
 #pragma unroll
       for (int p = 0; p < kPass; ++p) {
         const int g = p * WS + laneId;
-        uint4 pk[npes];
-        unsigned sb[npes];
+        uint4 pk[kRows];
+        unsigned sb[kRows];
 #pragma unroll
-        for (int j = 0; j < npes; ++j) {
+        for (int j = 0; j < kRows; ++j) {
           if (j >= nr) break;
           const int s = s0 + j < kRingL ? s0 + j : s0 + j - kRingL;
           const char* const row = sub + (size_t)s * kWireB;
@@ -2391,7 +2399,7 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
 #pragma unroll
         for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
-        for (int j = 0; j < npes; ++j) {
+        for (int j = 0; j < kRows; ++j) {
           if (j >= nr) break;
           const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
           const float s = __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
@@ -2466,7 +2474,7 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
                                               const int t) {
   using W = EpFp4Wire<kCfg>;
   constexpr int WS = kCfg.waveSize;
-  constexpr int npes = kCfg.worldSize;
+  constexpr int kRows = EpFp4Rows<kCfg>();
   constexpr int kPass = kCfg.hiddenDim / (32 * WS);
   static_assert(!W::kF32Scale && W::kQGroup == 32 && W::kPayB % 4 == 0,
                 "one e8m0 scale byte a 32-element group, after the payload");
@@ -2477,10 +2485,10 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
 #pragma unroll 1
   for (int p = 0; p < kPass; ++p) {
     const int g = p * WS + laneId;
-    uint4 pk[npes];
-    unsigned sb[npes];
+    uint4 pk[kRows];
+    unsigned sb[kRows];
 #pragma unroll
-    for (int j = 0; j < npes; ++j) {
+    for (int j = 0; j < kRows; ++j) {
       if (j >= nr) break;
       EpGU64* const q = (EpGU64*)(r.rp[j] + (size_t)g * 16);
       const unsigned long long a = __hip_atomic_load(q, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -2496,7 +2504,7 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
 #pragma unroll
     for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
-    for (int j = 0; j < npes; ++j) {
+    for (int j = 0; j < kRows; ++j) {
       if (j >= nr) break;
       const unsigned wv[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
       const float s = __uint_as_float(sb[j] << 23);
