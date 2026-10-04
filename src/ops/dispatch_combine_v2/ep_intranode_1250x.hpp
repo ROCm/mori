@@ -2046,6 +2046,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           __hip_atomic_store(rdy + slot, c + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
       }
     } else {
+      // A store wave frees the ring slots the producers wait on: let it issue ahead of the two
+      // producers that share its SIMD.
+      if constexpr (kSegL == 1) __builtin_amdgcn_s_setprio(3);
       const int s = warpId - kSegP;
       // Stores of the chunks in flight, 4 bits a chunk at nibble (chunk % kSegL); stores retire in
       // issue order, so the oldest chunk is done once no more than the newer ones' are in flight.
@@ -2121,6 +2124,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         inflight += nops;
       }
       while (head < x) retire();
+      if constexpr (kSegL == 1) __builtin_amdgcn_s_setprio(0);
     }
   };
   if constexpr (kSeg) {
