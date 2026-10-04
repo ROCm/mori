@@ -1537,7 +1537,7 @@ constexpr size_t EpFp4FlagOff() {
   return EpFp4Wire<kCfg>::kLandOff +
          (size_t)kCfg.worldSize * EpMaxRecv(kCfg) * EpFp4Wire<kCfg>::kWireB;
 }
-constexpr int EpFp4PermMax = 1024;
+constexpr int EpFp4PermMax = 2048;
 template <EpCfg kCfg>
 constexpr size_t EpFp4PendOff() {
   return (size_t)EpCombine1250xLdsBudget - (size_t)EpFp4PermMax * 2 - (size_t)kCfg.warpPerBlock * 4;
@@ -1760,6 +1760,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                                     (size_t)(2 + kSegK) * kSegNb * 4 <=
                                 EpFp4PendOff<kCfg>(),
                   "the sort table and pending words must fit behind the split send's LDS");
+    static_assert(!kOvlp || (size_t)kSegNb * kSegK * kWireB >= (size_t)kPermMax,
+                  "the ring holds a group byte for every row the sort can take");
     [[maybe_unused]] unsigned short* const perm =
         reinterpret_cast<unsigned short*>(sharedMem + kPermOff);
     [[maybe_unused]] const bool sorted = kOvlp && re - rb <= kPermMax;
@@ -1774,41 +1776,81 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
 #pragma unroll
         for (int k = 0; k < kG; ++k) off[k] = 0;
         const unsigned long long below = (1ull << laneId) - 1ull;
-        constexpr int kIt = kPermMax / WS;
+        constexpr int kIt = 1024 / WS;
         const int nIt = (re - rb + WS - 1) / WS;
-        int gv[kIt];
-#pragma unroll
-        for (int it = 0; it < kIt; ++it) {
-          const int r = rb + it * WS + laneId;
-          gv[it] = it < nIt && r < re ? map0[r] : -1;
-        }
         const float gMul = (float)kG / (float)max(1, args.numTokens);
-#pragma unroll
-        for (int it = 0; it < kIt; ++it)
-          gv[it] =
-              gv[it] < 0 ? kG : min(kG - 1, (int)((float)(gv[it] % kCfg.maxTokPerRank) * gMul));
-#pragma unroll
-        for (int it = 0; it < kIt; ++it) {
-          if (it >= nIt) break;
-#pragma unroll
-          for (int k = 0; k < kG; ++k) off[k] += __popcll(__ballot(gv[it] == k));
-        }
-        int run = 0;
-#pragma unroll
-        for (int k = 0; k < kG; ++k) {
-          const int c = off[k];
-          off[k] = run;
-          run += c;
-        }
-#pragma unroll
-        for (int it = 0; it < kIt; ++it) {
-          if (it >= nIt) break;
+        auto grpOf = [&](const int src) {
+          return src < 0 ? kG : min(kG - 1, (int)((float)(src % kCfg.maxTokPerRank) * gMul));
+        };
+        auto scan = [&]() {
+          int run = 0;
 #pragma unroll
           for (int k = 0; k < kG; ++k) {
-            const unsigned long long m = __ballot(gv[it] == k);
-            if (gv[it] == k)
-              perm[off[k] + __popcll(m & below)] = (unsigned short)(it * WS + laneId);
+            const int c = off[k];
+            off[k] = run;
+            run += c;
+          }
+        };
+        auto place = [&](const int g, const int row) {
+#pragma unroll
+          for (int k = 0; k < kG; ++k) {
+            const unsigned long long m = __ballot(g == k);
+            if (g == k) perm[off[k] + __popcll(m & below)] = (unsigned short)row;
             off[k] += __popcll(m);
+          }
+        };
+        if (nIt <= kIt) {
+          int gv[kIt];
+#pragma unroll
+          for (int it = 0; it < kIt; ++it) {
+            const int r = rb + it * WS + laneId;
+            gv[it] = it < nIt && r < re ? map0[r] : -1;
+          }
+#pragma unroll
+          for (int it = 0; it < kIt; ++it) gv[it] = grpOf(gv[it]);
+#pragma unroll
+          for (int it = 0; it < kIt; ++it) {
+            if (it >= nIt) break;
+#pragma unroll
+            for (int k = 0; k < kG; ++k) off[k] += __popcll(__ballot(gv[it] == k));
+          }
+          scan();
+#pragma unroll
+          for (int it = 0; it < kIt; ++it) {
+            if (it >= nIt) break;
+            place(gv[it], it * WS + laneId);
+          }
+        } else {
+          // Past kIt chunks the rows' sources are read kIt chunks at a time, every load of a batch
+          // in flight at once, and each row's group is kept at the head of the ring -- which no row
+          // reaches before the sort is done -- for the scatter to read back.
+          unsigned char* const grp = ringB;
+          for (int b0 = 0; b0 < nIt; b0 += kIt) {
+            int gv[kIt];
+#pragma unroll
+            for (int it = 0; it < kIt; ++it) {
+              const int r = rb + (b0 + it) * WS + laneId;
+              gv[it] = b0 + it < nIt && r < re ? map0[r] : -1;
+            }
+#pragma unroll
+            for (int it = 0; it < kIt; ++it) {
+              if (b0 + it >= nIt) break;
+              const int g = grpOf(gv[it]);
+              grp[(b0 + it) * WS + laneId] = (unsigned char)g;
+#pragma unroll
+              for (int k = 0; k < kG; ++k) off[k] += __popcll(__ballot(g == k));
+            }
+          }
+          scan();
+          for (int b0 = 0; b0 < nIt; b0 += kIt) {
+            int gq[kIt];
+#pragma unroll
+            for (int it = 0; it < kIt; ++it) gq[it] = grp[(b0 + it) * WS + laneId];
+#pragma unroll
+            for (int it = 0; it < kIt; ++it) {
+              if (b0 + it >= nIt) break;
+              place(gq[it], (b0 + it) * WS + laneId);
+            }
           }
         }
       }
