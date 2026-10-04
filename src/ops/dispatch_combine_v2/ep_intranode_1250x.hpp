@@ -1741,7 +1741,10 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   constexpr int kSegP =
       kOvlp ? kCfg.warpPerBlock / 2 - 4 : kCfg.warpPerBlock == 16 ? 6 : kCfg.warpPerBlock / 2;
   constexpr int kSegS = kSegWarps - kSegP;
-  constexpr int kSegL = 4;
+  // Chunks a store wave keeps in flight. With eight producers (24 warps) the stores bound the push,
+  // and chunks behind the first only queue: one in flight pushes faster than four. With four
+  // producers (16 warps) the producers bound it and the depth does not matter.
+  constexpr int kSegL = (kOvlp && kCfg.warpPerBlock == 24) ? 1 : 4;
   constexpr int kSegMin = 64;
   constexpr int kSegNb =
       kSegK > 0 ? (EpCombine1250xLdsBudget - kSegP * kTokB) / (kSegK * kWireB + (2 + kSegK) * 4)
