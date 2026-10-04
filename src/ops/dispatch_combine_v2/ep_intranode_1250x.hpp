@@ -311,14 +311,17 @@ __device__ __forceinline__ index_t EpSelfFirstPeerSent(const EpArgs& args, int p
 // The plain token map fills block b with its warpPerBlock consecutive work units, so a
 // call with fewer units than warps leaves the high blocks empty: 512 tokens on 64 x 16
 // run on 32 blocks. When the call's units fit in gridDim.x * T (T = kEpTokChunk),
-// block b takes units [b * T, b * T + T) on its first T warps instead, and the warps at
-// or past T take the ids left over, so the map stays a bijection onto
-// [0, gridDim.x * warpPerBlock) and every stride loop still covers each token once.
-// Larger calls keep the plain map (768 tokens as 64 x 12 measured slower than 48 x 16
-// at EP8), and so does every geometry with at most T warps per block. selfFirst only:
-// under the original protocol every block that holds tokens also RMWs this rank's own
-// slot word, and there the chunked map measured slower than the plain one at 512
-// tokens on EP8.
+// block b takes t = ceil(units / gridDim.x) units, [b * t, b * t + t), on its first t
+// warps instead, and the warps at or past t take the ids left over, so the map stays a
+// bijection onto [0, gridDim.x * warpPerBlock) and every stride loop still covers each
+// token once. t rather than T because a block's tokens leave through its own CU: with T
+// a block, 16 tokens ran eight to a block on two blocks, and the call waited on those two
+// (EP16 bf16 64.3 us against 32.0 at one a block, fp4 40.2 against 29.7; EP8 52.3 / 31.7
+// against 26.1 / 25.2). Larger calls keep the plain map (768 tokens as 64 x 12 measured
+// slower than 48 x 16 at EP8), and so does every geometry with at most T warps per block.
+// selfFirst only: under the original protocol every block that holds tokens also RMWs
+// this rank's own slot word, and there the chunked map measured slower than the plain one
+// at 512 tokens on EP8.
 constexpr int kEpTokChunk = 8;
 template <EpCfg kCfg>
 __device__ __forceinline__ bool EpTokChunked(int numTokens, int etpi) {
@@ -332,7 +335,8 @@ __device__ __forceinline__ bool EpTokChunked(int numTokens, int etpi) {
   }
 }
 template <EpCfg kCfg>
-__device__ __forceinline__ int EpTokChunkWarp(int warpId, int globalWarpId, bool chunked) {
+__device__ __forceinline__ int EpTokChunkWarp(int warpId, int globalWarpId, bool chunked,
+                                              int numTokens, int etpi) {
   constexpr int W = kCfg.warpPerBlock;
   constexpr int T = kEpTokChunk;
   if constexpr (!kCfg.selfFirst || W <= T) {
@@ -340,7 +344,11 @@ __device__ __forceinline__ int EpTokChunkWarp(int warpId, int globalWarpId, bool
   } else {
     if (!chunked) return globalWarpId;
     const int b = (int)blockIdx.x;
-    return (warpId < T) ? (b * T + warpId) : ((int)gridDim.x * T + b * (W - T) + (warpId - T));
+    const int g = (int)gridDim.x;
+    const int units = (numTokens + etpi - 1) / etpi;
+    int t = (units + g - 1) / g;
+    t = (t < 1) ? 1 : ((t > T) ? T : t);
+    return (warpId < t) ? (b * t + warpId) : ((int)gridDim.x * t + b * (W - t) + (warpId - t));
   }
 }
 
@@ -371,7 +379,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const int _qTok = (aWarps > 0) ? (int)(((long long)args.numTokens + aWarps - 1) / aWarps) : _tpi;
   const int _etpi = (_tpi > 1 && _qTok >= 1 && _qTok < _tpi) ? _qTok : _tpi;
   const bool _tokChunk = EpTokChunked<kCfg>((int)args.numTokens, _etpi);
-  const int aWarp = EpTokChunkWarp<kCfg>(warpId, globalWarpId, _tokChunk);
+  const int aWarp =
+      EpTokChunkWarp<kCfg>(warpId, globalWarpId, _tokChunk, (int)args.numTokens, _etpi);
   const int _sLane = (_etpi > 1) ? (laneId / topk) : 0;
   const int _eLane = (_etpi > 1) ? (laneId - _sLane * topk) : laneId;
   const bool _laneAct = (_etpi > 1) ? (_sLane < _etpi) : (laneId < topk);
