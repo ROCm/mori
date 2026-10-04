@@ -1573,13 +1573,14 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   constexpr int kCap = W::kCap;
   constexpr int kMaxRecv = EpMaxRecv(kCfg);
   constexpr int kCpolScopeSys = 3 << 3;
-  // Rows per run: a run's stores go out together and their completion is waited once. The bf16
-  // row is staged behind the run's wire rows; at two rows it overlaps the second, which is free
-  // until that row is quantized out of registers -- the only layout a 16-warp tile (five wire
-  // rows) can hold.
-  constexpr bool kRun4 =
-      4 <= kCap && kMaxRecv % 4 == 0 && (size_t)kCap * kWireB >= (size_t)4 * kWireB + kTokB;
-  constexpr int C = kRun4 ? 4 : 2;
+  // Rows per run: a run's stores go out together and their completion is waited once, and every
+  // further run of a warp waits once more, so a run holds as many rows as the tile leaves room for.
+  // The bf16 row is staged behind the run's wire rows; at two rows it overlaps the second, which is
+  // free until that row is quantized out of registers -- the only layout a 16-warp tile (five wire
+  // rows) can hold. A run's stores and the next row's load stay within the 11 TDM ops a wave keeps
+  // in flight.
+  constexpr int kRunFit = (kCap * kWireB - kTokB) / kWireB;
+  constexpr int C = kRunFit > 2 ? (kRunFit < 10 ? kRunFit : 10) : 2;
   constexpr size_t kStageOff = (C > 2) ? (size_t)C * kWireB : (size_t)kWireB;
 
   // Split send, for 8-warp blocks at eight ranks and up: the first kSegP warps of a block load and
@@ -1733,7 +1734,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     __builtin_amdgcn_s_wait_tensorcnt(0);
   };
 
-  static_assert(C <= kCap && kMaxRecv % C == 0, "a run must fit the tile and tile kMaxRecv");
+  static_assert(C <= kCap, "a run must fit the tile");
   static_assert((size_t)kCap * kWireB >= kStageOff + kTokB, "the staged bf16 row must fit the tile");
   const int nbRows = (int)gridDim.x;
   const int stride = nbRows * kCfg.warpPerBlock * C;
