@@ -1530,7 +1530,7 @@ __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
 template <EpCfg kCfg>
 constexpr bool EpFp4Ovl() {
   return kCfg.combineFp4 && !kCfg.combineFp4F32Scale && kCfg.worldSize >= 8 &&
-         kCfg.warpPerBlock == 16 && !EpIsWideEp(kCfg);
+         (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24) && !EpIsWideEp(kCfg);
 }
 template <EpCfg kCfg>
 constexpr size_t EpFp4FlagOff() {
@@ -1593,9 +1593,14 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // per-warp runs below take over.
   constexpr bool kOvlp = EpFp4Ovl<kCfg>();
   constexpr int kSegK =
-      (kCfg.worldSize >= 8 && (kCfg.warpPerBlock == 8 || kCfg.warpPerBlock == 16)) ? 6 : 0;
+      (kCfg.worldSize >= 8 && (kCfg.warpPerBlock == 8 || kCfg.warpPerBlock == 16 || kOvlp)) ? 6
+                                                                                            : 0;
+  // The overlapped path sends with half the block, four of them store waves: a 24-warp block runs
+  // a second producer on every SIMD -- a producer is bound by its own dependent chains and LDS
+  // reads, not by the SIMD's issue rate -- and twelve reducing waves.
   constexpr int kSegWarps = kOvlp ? kCfg.warpPerBlock / 2 : kCfg.warpPerBlock;
-  constexpr int kSegP = kOvlp ? 4 : kCfg.warpPerBlock == 16 ? 6 : kCfg.warpPerBlock / 2;
+  constexpr int kSegP =
+      kOvlp ? kCfg.warpPerBlock / 2 - 4 : kCfg.warpPerBlock == 16 ? 6 : kCfg.warpPerBlock / 2;
   constexpr int kSegS = kSegWarps - kSegP;
   constexpr int kSegL = 4;
   constexpr int kSegMin = 64;
@@ -1734,8 +1739,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     __builtin_amdgcn_s_wait_tensorcnt(0);
   };
 
-  static_assert(C <= kCap, "a run must fit the tile");
-  static_assert((size_t)kCap * kWireB >= kStageOff + kTokB, "the staged bf16 row must fit the tile");
+  static_assert(kOvlp || C <= kCap, "a run must fit the tile");
+  static_assert(kOvlp || (size_t)kCap * kWireB >= kStageOff + kTokB,
+                "the staged bf16 row must fit the tile");
   const int nbRows = (int)gridDim.x;
   const int stride = nbRows * kCfg.warpPerBlock * C;
   const int rowStep = nbRows * kCfg.warpPerBlock;

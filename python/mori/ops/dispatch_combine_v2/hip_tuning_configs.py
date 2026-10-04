@@ -184,7 +184,9 @@ _COMBINE_FP4_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): ((256, 64, 8), (None, 64, 16)),
-            (8, 7168, 6, None): ((1536, 64, 8), (16384, 64, 16), (None, 64, 8)),
+            # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
+            # 329.6 -> 314.8 us at 16384 tokens a rank, a tie with 64x16 at 4096.
+            (8, 7168, 6, None): ((1536, 64, 8), (4096, 64, 16), (16384, 64, 24), (None, 64, 8)),
         },
     },
     "fp4_blockwise_fp32": {
