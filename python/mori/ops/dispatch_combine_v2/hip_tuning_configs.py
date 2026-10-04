@@ -220,8 +220,9 @@ _COMBINE_FP4_TABLE: dict = {
         "gfx1250": {
             (4, 7168, 6, None): ((256, 64, 8), (None, 64, 16)),
             # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
-            # 329.6 -> 314.8 us at 16384 tokens a rank, a tie with 64x16 at 4096.
-            (8, 7168, 6, None): ((1536, 64, 8), (4096, 64, 16), (16384, 64, 24), (None, 64, 8)),
+            # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
+            # waves kept one chunk in flight; since then it is ahead at 2048 (-0.4) and 4096 (-1.7).
+            (8, 7168, 6, None): ((1536, 64, 8), (16384, 64, 24), (None, 64, 8)),
             # EP12 at 16 to 2048 tokens: 64x16 costs 0.7-6.9 us more than 64x8 at every count;
             # EP16 measured only to 512 (64x4 / 64x16 no better).
             (12, 7168, 6, None): ((None, 64, 8),),
