@@ -1761,97 +1761,73 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                                     (size_t)(2 + kSegK) * kSegNb * 4 <=
                                 EpFp4PendOff<kCfg>(),
                   "the sort table and pending words must fit behind the split send's LDS");
-    static_assert(!kOvlp || (size_t)kSegNb * kSegK * kWireB >= (size_t)kPermMax,
-                  "the ring holds a group byte for every row the sort can take");
+    constexpr int kG = 8;
+    constexpr int kSortW = kCfg.warpPerBlock;
+    static_assert(!kOvlp || (size_t)kSegNb * kSegK * kWireB >= (size_t)kSortW * kG * 4,
+                  "the ring holds every warp's group counts for the sort");
     [[maybe_unused]] unsigned short* const perm =
         reinterpret_cast<unsigned short*>(sharedMem + kPermOff);
     [[maybe_unused]] const bool sorted = kOvlp && re - rb <= kPermMax;
     if constexpr (kOvlp) {
-      if (sorted && warpId == 0 && rb < re) {
+      // Every warp sorts one contiguous run of the block's 32-row chunks: it counts its rows a
+      // group, the counts of all warps meet at the head of the ring -- which no row reaches before
+      // the sort is done -- and each warp scatters its rows from the offsets the warps before it
+      // leave, so a row lands where one warp walking every chunk in turn would put it.
+      if (sorted && rb < re) {
         const auto* const wd0 = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
         const int* const map0 = reinterpret_cast<const int*>(
             wd0->winBase + (uint64_t)wd0->lsaRank * ((uint64_t)wd0->stride4G << 32) +
             args.offRecvToSrc);
-        constexpr int kG = 8;
+        constexpr int kItW = (kPermMax + WS * kSortW - 1) / (WS * kSortW);
+        const int nIt = (re - rb + WS - 1) / WS;
+        const int per = (nIt + kSortW - 1) / kSortW;
+        const int c0 = __builtin_amdgcn_readfirstlane(warpId) * per;
+        const int c1 = min(c0 + per, nIt);
+        const float gMul = (float)kG / (float)max(1, args.numTokens);
+        int g[kItW];
+#pragma unroll
+        for (int j = 0; j < kItW; ++j) {
+          const int r = rb + (c0 + j) * WS + laneId;
+          g[j] = c0 + j < c1 && r < re ? map0[r] : -1;
+        }
         int off[kG];
 #pragma unroll
         for (int k = 0; k < kG; ++k) off[k] = 0;
+#pragma unroll
+        for (int j = 0; j < kItW; ++j) {
+          g[j] = g[j] < 0 ? kG : min(kG - 1, (int)((float)(g[j] % kCfg.maxTokPerRank) * gMul));
+#pragma unroll
+          for (int k = 0; k < kG; ++k) off[k] += __popcll(__ballot(g[j] == k));
+        }
+        int* const hist = reinterpret_cast<int*>(ringB);
+        int mine = 0;
+#pragma unroll
+        for (int k = 0; k < kG; ++k) mine = laneId == k ? off[k] : mine;
+        if (laneId < kG) hist[warpId * kG + laneId] = mine;
+        __syncthreads();
+        int tot = 0, pre = 0;
+#pragma unroll
+        for (int ow = 0; ow < kSortW; ++ow) {
+          const int c = hist[ow * kG + (laneId & (kG - 1))];
+          tot += c;
+          pre += ow < warpId ? c : 0;
+        }
+        int run = 0;
+#pragma unroll
+        for (int k = 0; k < kG; ++k) {
+          off[k] = run + __builtin_amdgcn_readlane(pre, k);
+          run += __builtin_amdgcn_readlane(tot, k);
+        }
         const unsigned long long below = (1ull << laneId) - 1ull;
-        constexpr int kIt = 1024 / WS;
-        const int nIt = (re - rb + WS - 1) / WS;
-        const float gMul = (float)kG / (float)max(1, args.numTokens);
-        auto grpOf = [&](const int src) {
-          return src < 0 ? kG : min(kG - 1, (int)((float)(src % kCfg.maxTokPerRank) * gMul));
-        };
-        auto scan = [&]() {
-          int run = 0;
+#pragma unroll
+        for (int j = 0; j < kItW; ++j) {
+          if (c0 + j >= c1) break;
 #pragma unroll
           for (int k = 0; k < kG; ++k) {
-            const int c = off[k];
-            off[k] = run;
-            run += c;
-          }
-        };
-        auto place = [&](const int g, const int row) {
-#pragma unroll
-          for (int k = 0; k < kG; ++k) {
-            const unsigned long long m = __ballot(g == k);
-            if (g == k) perm[off[k] + __popcll(m & below)] = (unsigned short)row;
+            const unsigned long long m = __ballot(g[j] == k);
+            if (g[j] == k)
+              perm[off[k] + __popcll(m & below)] = (unsigned short)((c0 + j) * WS + laneId);
             off[k] += __popcll(m);
-          }
-        };
-        if (nIt <= kIt) {
-          int gv[kIt];
-#pragma unroll
-          for (int it = 0; it < kIt; ++it) {
-            const int r = rb + it * WS + laneId;
-            gv[it] = it < nIt && r < re ? map0[r] : -1;
-          }
-#pragma unroll
-          for (int it = 0; it < kIt; ++it) gv[it] = grpOf(gv[it]);
-#pragma unroll
-          for (int it = 0; it < kIt; ++it) {
-            if (it >= nIt) break;
-#pragma unroll
-            for (int k = 0; k < kG; ++k) off[k] += __popcll(__ballot(gv[it] == k));
-          }
-          scan();
-#pragma unroll
-          for (int it = 0; it < kIt; ++it) {
-            if (it >= nIt) break;
-            place(gv[it], it * WS + laneId);
-          }
-        } else {
-          // Past kIt chunks the rows' sources are read kIt chunks at a time, every load of a batch
-          // in flight at once, and each row's group is kept at the head of the ring -- which no row
-          // reaches before the sort is done -- for the scatter to read back.
-          unsigned char* const grp = ringB;
-          for (int b0 = 0; b0 < nIt; b0 += kIt) {
-            int gv[kIt];
-#pragma unroll
-            for (int it = 0; it < kIt; ++it) {
-              const int r = rb + (b0 + it) * WS + laneId;
-              gv[it] = b0 + it < nIt && r < re ? map0[r] : -1;
-            }
-#pragma unroll
-            for (int it = 0; it < kIt; ++it) {
-              if (b0 + it >= nIt) break;
-              const int g = grpOf(gv[it]);
-              grp[(b0 + it) * WS + laneId] = (unsigned char)g;
-#pragma unroll
-              for (int k = 0; k < kG; ++k) off[k] += __popcll(__ballot(g == k));
-            }
-          }
-          scan();
-          for (int b0 = 0; b0 < nIt; b0 += kIt) {
-            int gq[kIt];
-#pragma unroll
-            for (int it = 0; it < kIt; ++it) gq[it] = grp[(b0 + it) * WS + laneId];
-#pragma unroll
-            for (int it = 0; it < kIt; ++it) {
-              if (b0 + it >= nIt) break;
-              place(gq[it], (b0 + it) * WS + laneId);
-            }
           }
         }
       }
