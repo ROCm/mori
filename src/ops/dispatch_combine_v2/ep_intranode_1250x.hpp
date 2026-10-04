@@ -402,10 +402,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   }
   const int _preGsz = (_preGszP2 <= WS) ? _preGszP2 : WS;
   const int _preE = laneId & (_preGsz - 1);
-  const int _preTok = aWarp * _etpi;
-  const bool _metapreOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens) &&
-                          (_etpi == 1) && (_preGsz >= topk) && (_preTok < (int)args.numTokens) &&
-                          args.tokenIndices && args.inpTokenBuf;
   constexpr int kPM = npes;
   // Past gridDim * warpPerBlock tokens the token map gives every warp two or more tokens and a
   // metadata run, and one wave's TDM ops complete in issue order, so each warp's payload waited for
@@ -422,28 +418,65 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                               kCfg.warpPerBlock >= 2 * kPM &&
                               kCfg.maxTokPerRank > kCfg.blockNum * kCfg.warpPerBlock;
   const bool _metaPlain = kPlainMeta && !_tokChunk && _etpi == 1 && (int)args.numTokens > aWarps;
-  index_t _pIdx = 0;
-  float _pWt = 0.0f;
-  if (_metapreOk && _preE < topk) {
-    _pIdx = args.tokenIndices[(size_t)_preTok * topk + _preE];
-    if constexpr (kCfg.useWeights) {
-      if (args.weightsBuf) _pWt = args.weightsBuf[(size_t)_preTok * topk + _preE];
-    }
-  }
+  constexpr int kPreK = 4;
+  const bool _preKOk = (_etpi == 1) && (_preGsz >= topk) && (args.numTokens > 0) &&
+                       ((long long)aWarps * kPreK >= (long long)args.numTokens) &&
+                       args.tokenIndices && args.inpTokenBuf;
+  index_t _pIdxK[kPreK] = {};
+  float _pWtK[kPreK] = {};
   constexpr int kScK = kEpScaleBytes > 0 ? kEpScaleStride / (4 * WS) : 0;
   constexpr bool kScWave = kEpScaleBytes > 0 && kScK >= 1 && kScK <= 4 &&
                            kScK * 4 * WS == kEpScaleStride && (kEpScaleBytes / 4) % kScK == 0;
-  [[maybe_unused]] unsigned _pSc[kScWave ? kScK : 1] = {};
-  const bool _scWave = kScWave && _metapreOk && args.scalesBuf != nullptr;
-  if constexpr (kScWave) {
-    if (_scWave) {
-      const unsigned int* s = reinterpret_cast<const unsigned int*>(args.scalesBuf) +
-                              (size_t)_preTok * (kEpScaleBytes / 4);
+  [[maybe_unused]] unsigned _pScK[kPreK][kScWave ? kScK : 1] = {};
+  const bool _scWave = kScWave && _preKOk && args.scalesBuf != nullptr;
+  if (_preKOk) {
+    const float* const wSrc = (kCfg.useWeights && args.weightsBuf)
+                                  ? args.weightsBuf
+                                  : reinterpret_cast<const float*>(args.tokenIndices);
+    const int e = (_preE < topk) ? _preE : 0;
 #pragma unroll
-      for (int k = 0; k < kScK; ++k)
-        if (laneId * kScK + k < kEpScaleBytes / 4) _pSc[k] = s[laneId * kScK + k];
+    for (int k = 0; k < kPreK; ++k) {
+      const int t = aWarp + k * aWarps;
+      const size_t tc = (size_t)((t < (int)args.numTokens) ? t : 0);
+      _pIdxK[k] = args.tokenIndices[tc * topk + e];
+      _pWtK[k] = wSrc[tc * topk + e];
+    }
+    if constexpr (kScWave) {
+      if (_scWave) {
+#pragma unroll
+        for (int k = 0; k < kPreK; ++k) {
+          const int t = aWarp + k * aWarps;
+          const size_t tc = (size_t)((t < (int)args.numTokens) ? t : 0);
+          const unsigned int* s =
+              reinterpret_cast<const unsigned int*>(args.scalesBuf) + tc * (kEpScaleBytes / 4);
+#pragma unroll
+          for (int j = 0; j < kScK; ++j)
+            _pScK[k][j] = s[(laneId * kScK + j < kEpScaleBytes / 4) ? laneId * kScK + j : 0];
+        }
+      }
     }
   }
+  auto pickIdx = [&](int k) {
+    index_t r = _pIdxK[0];
+#pragma unroll
+    for (int i = 1; i < kPreK; ++i)
+      if (k == i) r = _pIdxK[i];
+    return r;
+  };
+  auto pickWt = [&](int k) {
+    float r = _pWtK[0];
+#pragma unroll
+    for (int i = 1; i < kPreK; ++i)
+      if (k == i) r = _pWtK[i];
+    return r;
+  };
+  [[maybe_unused]] auto pickSc = [&](int k, int j) {
+    unsigned r = _pScK[0][j];
+#pragma unroll
+    for (int i = 1; i < kPreK; ++i)
+      if (k == i) r = _pScK[i][j];
+    return (laneId * kScK + j < kEpScaleBytes / 4) ? r : 0u;
+  };
   for (int p = thdId; p < npes; p += blockDim.x) {
     s_N[p] = 0;
     s_run[p] = 0;
@@ -456,11 +489,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool _bdOk = (_etpi == 1);
 
   if (args.tokenIndices && args.inpTokenBuf) {
-    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
+    for (int tokBase = aWarp * _etpi, _k = 0; tokBase < args.numTokens;
+         tokBase += aWarps * _etpi, ++_k) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
       index_t myExpert =
-          act ? (_metapreOk ? _pIdx : args.tokenIndices[(size_t)tok * topk + _eLane]) : (index_t)-1;
+          act ? (_preKOk ? pickIdx(_k) : args.tokenIndices[(size_t)tok * topk + _eLane])
+              : (index_t)-1;
       int myDestPe = -1;
       if (myExpert >= 0) {
         int d = (int)(myExpert / kCfg.numExpertPerRank);
@@ -569,7 +604,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     const int ngrp = WS / gsz;
     const int myGrp = laneId / gsz;
     const int myE = laneId - myGrp * gsz;
-    for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
+    for (int tokBase = aWarp * _etpi, _k = 0; tokBase < args.numTokens;
+         tokBase += aWarps * _etpi, ++_k) {
       int tok = tokBase + _sLane;
       bool act = _laneAct && (tok < args.numTokens);
       int myDestPe = -1;
@@ -578,7 +614,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         myDestPe = _cDestPe;
         keep = _cKeep;
       } else {
-        index_t myExpert = act ? args.tokenIndices[(size_t)tok * topk + _eLane] : (index_t)-1;
+        index_t myExpert =
+            act ? (_preKOk ? pickIdx(_k) : args.tokenIndices[(size_t)tok * topk + _eLane])
+                : (index_t)-1;
         myDestPe = -1;
         if (myExpert >= 0) {
           int d = (int)(myExpert / kCfg.numExpertPerRank);
@@ -625,11 +663,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         index_t* sIdx =
             _cusplit_stgIdx + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
         float* sWt = _cusplit_stgWt + (size_t)d * _stgCap * CUSPLIT_MAX_TOPK + (size_t)dt * topk;
-        if (_metapreOk) {
+        if (_preKOk) {
           if (myE < topk) {
-            sIdx[myE] = _pIdx;
+            sIdx[myE] = pickIdx(_k);
             if constexpr (kCfg.useWeights) {
-              if (args.weightsBuf) sWt[myE] = _pWt;
+              if (args.weightsBuf) sWt[myE] = pickWt(_k);
             }
           }
         } else {
@@ -673,7 +711,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                                        ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleStride) +
                                    laneId * kScK;
 #pragma unroll
-              for (int k = 0; k < kScK; ++k) dstS[k] = _pSc[k];
+              for (int j = 0; j < kScK; ++j) dstS[j] = pickSc(_k, j);
             }
           }
         }
