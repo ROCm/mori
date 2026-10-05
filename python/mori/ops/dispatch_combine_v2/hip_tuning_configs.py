@@ -157,27 +157,6 @@ _DISPATCH_TABLE: dict = {
                 (None, 64, 16),
             ),
         },
-        # EP16 across four 4-GPU hosts, topk 6, 2026-10-04. Up to 1536 tokens 64x24 holds one
-        # token a warp; past it 24 warps give some warps two tokens and run slower than 64x16.
-        # 64x32 is ahead only for fp4 at 2048 (-2.0) and is left out. Dispatch us, graph, rank
-        # 0's median over replays, 3 alternating rounds, each geometry pinned:
-        #   ct     64x16  64x24  64x32 (fp8) |  64x16  64x24  64x32 (fp4)
-        #   1024    94.9   98.5  123.9       |   68.9   74.0   89.0
-        #   1280   137.8  110.2  127.4       |   93.5   78.1   92.1
-        #   1536   141.1  128.3  133.2       |   95.2   83.5   93.4
-        #   2048   166.1  201.4  167.4       |  105.4  130.3  103.4
-        # bf16 holds at most 22 warps a block, one token each up to 1408; past that 64x22 loses
-        # 45-66 us to 64x16 (1536 / 2048):
-        #   ct     64x16  64x22 (bf16)
-        #   1024   156.2  156.5
-        #   1280   235.0  190.4
-        #   1408   238.7  205.7
-        (16, 7168, 6, None): {
-            None: ((None, 64, 16),),
-            "bf16": ((1024, 64, 16), (1408, 64, 22), (None, 64, 16)),
-            "fp8": ((1024, 64, 16), (1536, 64, 24), (None, 64, 16)),
-            "fp4_disp_bf16_comb": ((1024, 64, 16), (1536, 64, 24), (None, 64, 16)),
-        },
     },
 }
 
@@ -196,9 +175,8 @@ _COMBINE_TABLE: dict = {
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
-        # The single-shot default, listed so the EP8 / EP16 dispatch schedules have a combine half.
+        # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
-        (16, 7168, 6, None): ((None, 64, 8),),
     },
 }
 
