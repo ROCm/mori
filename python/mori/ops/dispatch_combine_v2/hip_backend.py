@@ -652,7 +652,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         out_tok = cap * cfg.combine_token_nbytes
         if cfg.quant_type in _FP4_QUANT_TYPES:
             out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
-            if cfg.world_size >= 8:
+            # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
+            # which runs from four ranks up.
+            if cfg.world_size >= 4:
                 out_tok += cfg.world_size * cap * 8
         regions = [
             ("tok_off", 4),

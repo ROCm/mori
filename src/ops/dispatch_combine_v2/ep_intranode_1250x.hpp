@@ -1666,10 +1666,14 @@ __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
   }
 }
 
+// At four ranks only 24-warp blocks take the overlapped path: the 8- and 16-warp units the table
+// runs below them keep the per-warp send. The host sizes the row flags for every world size the
+// path can run at (hip_backend.py, out_tok).
 template <EpCfg kCfg>
 constexpr bool EpFp4Ovl() {
-  return kCfg.combineFp4 && !kCfg.combineFp4F32Scale && kCfg.worldSize >= 8 &&
-         (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24) && !EpIsWideEp(kCfg);
+  return kCfg.combineFp4 && !kCfg.combineFp4F32Scale && !EpIsWideEp(kCfg) &&
+         (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
+                              : (kCfg.worldSize >= 4 && kCfg.warpPerBlock == 24));
 }
 template <EpCfg kCfg>
 constexpr size_t EpFp4FlagOff() {
@@ -1732,8 +1736,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // per-warp runs below take over.
   constexpr bool kOvlp = EpFp4Ovl<kCfg>();
   constexpr int kSegK =
-      (kCfg.worldSize >= 8 && (kCfg.warpPerBlock == 8 || kCfg.warpPerBlock == 16 || kOvlp)) ? 6
-                                                                                            : 0;
+      (kOvlp || (kCfg.worldSize >= 8 && (kCfg.warpPerBlock == 8 || kCfg.warpPerBlock == 16))) ? 6
+                                                                                              : 0;
   // The overlapped path sends with half the block, four of them store waves: a 24-warp block runs
   // a second producer on every SIMD -- a producer is bound by its own dependent chains and LDS
   // reads, not by the SIMD's issue rate -- and twelve reducing waves.

@@ -183,7 +183,10 @@ _COMBINE_TABLE: dict = {
 _COMBINE_FP4_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): ((256, 64, 8), (None, 64, 16)),
+            # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
+            # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
+            # behind (+0.7 at 1792, +4.0 at 1536, +8.1 at 1024).
+            (4, 7168, 6, None): ((256, 64, 8), (2047, 64, 16), (16384, 64, 24), (None, 64, 16)),
             # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
             # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
             # waves kept one chunk in flight; since then it is ahead at 2048 (-0.4) and 4096 (-1.7).
