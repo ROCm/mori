@@ -954,8 +954,26 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // warp that sent metadata would issue no payload until those stores completed.
       // Past the chunked range kPlainMeta gives the runs to the top kPM warps, a peer each.
       const bool _metaHi = !kUnitGeom && _tokChunk;
+      // Where that leaves fewer warps past kEpTokChunk than remote peers (EP16 at 64 x 16: eight
+      // for fifteen), the warps below kEpTokChunk that hold no token take runs too -- the chunked
+      // map gives tokens to the first t warps of a block only. A wave issues its remote stores one
+      // after another and the stores of one run take a few us to issue, so a wave with two runs
+      // set the length of the metadata pass. Only where a block has a warp for every peer: EP32 at
+      // 64 x 16 would keep two runs a wave, and it has not been measured.
+      constexpr bool kMetaLo = kCfg.selfFirst && !kUnitGeom && kCfg.warpPerBlock > kEpTokChunk &&
+                               npes - 1 > kCfg.warpPerBlock - kEpTokChunk &&
+                               npes <= kCfg.warpPerBlock;
+      static_assert(!(kMetaLo && kOwnHi), "the own pass of kOwnHi assumes the runs start at warp kEpTokChunk");
+      int _metaW0 = kEpTokChunk;
+      if constexpr (kMetaLo) {
+        if (_metaHi) {
+          const int u = ((int)args.numTokens + _etpi - 1) / _etpi;
+          const int t = (u + (int)gridDim.x - 1) / (int)gridDim.x;
+          _metaW0 = (t < 1) ? 1 : ((t > kEpTokChunk) ? kEpTokChunk : t);
+        }
+      }
       const int _metaWarps =
-          _metaHi ? (warpNum - kEpTokChunk) : (_metaPlain ? kPM : warpNum);
+          _metaHi ? (warpNum - _metaW0) : (_metaPlain ? kPM : warpNum);
       const int split = (_metaHi || _metaPlain) ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1)
                                                 : _peerSplit;
       const int nRuns = npes * split;
@@ -966,12 +984,17 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // tokens that ordering is worth ~2 us of the dispatch.
       const bool _runPeerMinor = kCfg.selfFirst && (_metaWarps % npes) == 0;
       const int _run0 =
-          _metaHi ? ((warpId >= kEpTokChunk) ? (warpId - kEpTokChunk) : nRuns)
+          _metaHi ? ((warpId >= _metaW0) ? (warpId - _metaW0) : nRuns)
           : _metaPlain ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
                        : warpId;
       for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
+        if constexpr (kMetaLo) {
+          // Peer numbering starts past this rank, so the own run is the last and the remote
+          // ones fill the first npes - 1 warps, one each.
+          if (_metaHi && !_runPeerMinor) peer = (peer + myPe + 1) % npes;
+        }
         if (kCfg.selfFirst && peer == myPe) continue;  // the own pass ships it, after R
         index_t cntAll = s_N[peer];
         if (cntAll <= 0) continue;
