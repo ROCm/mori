@@ -61,7 +61,7 @@ namespace collective {
 //                   counter (every block counts in once per launch, never
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
 //                   which elects the tail owner.
-//   barrierCtr    : symmetric-heap uint64 for PushEntryBarrier (block 0, before
+//   barrierCtr    : symmetric-heap uint64[npes] flags for PushEntryBarrier (block 0, before
 //                   Phase 1)
 //
 // Phase 1-3 are the reduce-scatter push algorithm: block 0 SDMA-scatters each
@@ -136,12 +136,12 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       __hip_atomic_store(&groupCounters[kBcastTargetIdx], flagEpoch[1], __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-      // Gate on every PE entering this launch: staging/signalBuf are shared with
-      // the other push collectives, and the slice counter is cleared only after
-      // the b=1 release, so a peer may finish before my previous launch is done
-      // with them.
-      PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
     }
+    // Gate on every PE entering this launch: staging/signalBuf are shared with
+    // the other push collectives, and the slice counter is cleared only after
+    // the b=1 release, so a peer may finish before my previous launch is done
+    // with them. Lane 0 enters after its stores above, in program order.
+    if (threadIdx.x < warpSize) PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).

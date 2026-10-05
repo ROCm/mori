@@ -181,14 +181,16 @@ class CollectivesFacade {
     }
     HIP_RUNTIME_CHECK(hipMemset(facade.syncFlags_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
 
-    // Monotonic entry-barrier counter of the SDMA push collectives (see
-    // PushEntryBarrier). Only PE 0's copy is used; never reset after this.
-    facade.barrierCtr_ = static_cast<uint64_t*>(facade.Allocate(sizeof(uint64_t)));
+    // Entry-barrier flags of the push collectives (see PushEntryBarrier): slot p
+    // of every copy is written only by PE p with its monotonic epoch; never
+    // reset after this.
+    facade.barrierCtr_ =
+        static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
     if (facade.barrierCtr_ == nullptr) {
-      FACADE_PRINTF("CollectivesFacade: failed to carve barrier counter from heap");
+      FACADE_PRINTF("CollectivesFacade: failed to carve barrier flags from heap");
       return -1;
     }
-    HIP_RUNTIME_CHECK(hipMemset(facade.barrierCtr_, 0, sizeof(uint64_t)));
+    HIP_RUNTIME_CHECK(hipMemset(facade.barrierCtr_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
     // Collective-permute ready tokens. Slot p of my copy is written only by PE p
     // ("p has entered the permute and may receive from me"); I clear it on use.
     facade.permuteReady_ =
@@ -416,7 +418,7 @@ class CollectivesFacade {
   size_t stagingBytes_{0};
   uint32_t* groupCounters_{nullptr};
   uint64_t* syncFlags_{nullptr};  // symmetric, pull all-reduce inter-shot handshake
-  uint64_t* barrierCtr_{nullptr};  // symmetric, push collectives' entry barrier
+  uint64_t* barrierCtr_{nullptr};  // symmetric, entry-barrier flags (slot p written by PE p)
   uint64_t* permuteReady_{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
   AddressPair* pinnedPairs_{nullptr};  // host-pinned, device-readable
   mori::cco::ccoComm* ccoComm_{nullptr};
