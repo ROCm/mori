@@ -157,33 +157,21 @@ _DISPATCH_TABLE: dict = {
                 (None, 64, 16),
             ),
         },
-        # EP12 / EP16 across three / four 4-GPU hosts, topk 6, 2026-10-04. Up to 1536 tokens
-        # 64x24 holds one token a warp; past it 24 warps reach the metadata split at EP12 and
-        # two tokens a warp at EP16, both slower than 64x16. 64x32 is ahead only for EP16 fp4 at
-        # 2048 (-2.0) and is left out. Dispatch us, graph, rank 0's median over replays, 3
-        # alternating rounds, each geometry pinned (EP16 / EP12, -- not measured):
-        #   ct     64x16          64x24          64x32       (fp8)
-        #   1024   94.9 / 84.2    98.5 / 96.4   123.9 / 115.6
-        #   1280  137.8 / --     110.2 / --     127.4 / --
-        #   1536  141.1 / 126.2  128.3 / 114.1  133.2 / 123.7
-        #   2048  166.1 / 144.9  201.4 / 182.8  167.4 / 146.6
-        #   ct     64x16          64x24          64x32       (fp4)
-        #   1024   68.9 / 65.6    74.0 / 70.1    89.0 / 83.3
-        #   1280   93.5 / --      78.1 / --      92.1 / --
-        #   1536   95.2 / 86.1    83.5 / 76.6    93.4 / 87.4
-        #   2048  105.4 / 89.9   130.3 / 118.6  103.4 / 96.4
+        # EP16 across four 4-GPU hosts, topk 6, 2026-10-04. Up to 1536 tokens 64x24 holds one
+        # token a warp; past it 24 warps give some warps two tokens and run slower than 64x16.
+        # 64x32 is ahead only for fp4 at 2048 (-2.0) and is left out. Dispatch us, graph, rank
+        # 0's median over replays, 3 alternating rounds, each geometry pinned:
+        #   ct     64x16  64x24  64x32 (fp8) |  64x16  64x24  64x32 (fp4)
+        #   1024    94.9   98.5  123.9       |   68.9   74.0   89.0
+        #   1280   137.8  110.2  127.4       |   93.5   78.1   92.1
+        #   1536   141.1  128.3  133.2       |   95.2   83.5   93.4
+        #   2048   166.1  201.4  167.4       |  105.4  130.3  103.4
         # bf16 holds at most 22 warps a block, one token each up to 1408; past that 64x22 loses
-        # 45-66 us to 64x16 (EP16 1536 / 2048):
-        #   ct     64x16          64x22       (bf16)
-        #   1024  156.2 / 136.2  156.5 / 145.2
-        #   1280  235.0 / 208.5  190.4 / 166.5
-        #   1408  238.7 / 211.8  205.7 / 186.3
-        (12, 7168, 6, None): {
-            None: ((None, 64, 16),),
-            "bf16": ((1024, 64, 16), (1408, 64, 22), (None, 64, 16)),
-            "fp8": ((1024, 64, 16), (1536, 64, 24), (None, 64, 16)),
-            "fp4_disp_bf16_comb": ((1024, 64, 16), (1536, 64, 24), (None, 64, 16)),
-        },
+        # 45-66 us to 64x16 (1536 / 2048):
+        #   ct     64x16  64x22 (bf16)
+        #   1024   156.2  156.5
+        #   1280   235.0  190.4
+        #   1408   238.7  205.7
         (16, 7168, 6, None): {
             None: ((None, 64, 16),),
             "bf16": ((1024, 64, 16), (1408, 64, 22), (None, 64, 16)),
@@ -208,9 +196,8 @@ _COMBINE_TABLE: dict = {
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
-        # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
+        # The single-shot default, listed so the EP8 / EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
-        (12, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
     },
 }
@@ -223,10 +210,6 @@ _COMBINE_FP4_TABLE: dict = {
             # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
             # waves kept one chunk in flight; since then it is ahead at 2048 (-0.4) and 4096 (-1.7).
             (8, 7168, 6, None): ((1536, 64, 8), (16384, 64, 24), (None, 64, 8)),
-            # EP12 at 16 to 2048 tokens: 64x16 costs 0.7-6.9 us more than 64x8 at every count;
-            # EP16 measured only to 512 (64x4 / 64x16 no better).
-            (12, 7168, 6, None): ((None, 64, 8),),
-            (16, 7168, 6, None): ((None, 64, 8),),
         },
     },
     "fp4_blockwise_fp32": {
