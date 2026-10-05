@@ -63,7 +63,7 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   const uint32_t stride4G = heapWin->stride4G;
   // A peer finishing its previous launch only proves our chunk reached it; gate
   // our writes into its recv slot / signalBuf[0] until every PE entered this one.
-  if (threadIdx.x == 0) PushEntryBarrier(barrierCtr, myPe, npes, stride4G);
+  if (threadIdx.x < warpSize) PushEntryBarrier(barrierCtr, myPe, npes, stride4G);
   __syncthreads();
 
   // Phase 1: push each send slot p to peer p's recv slot for sender myPe (self
