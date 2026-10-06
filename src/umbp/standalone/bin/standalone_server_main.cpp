@@ -246,7 +246,8 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
-  if (dist.dram_page_size == 0) {
+  // Local pools can use MORI's default. Cluster members must agree on a page size.
+  if (has_master && dist.dram_page_size == 0) {
     *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
     return false;
   }

@@ -187,8 +187,8 @@ void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
 
   if (!config.backend_policy_path.empty()) {
     SetEnv("UMBP_BACKEND_POLICY", config.backend_policy_path);
-    SetEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", config.page_size.value_or(2ULL * 1024 * 1024));
-  } else if (config.page_size.has_value()) {
+  }
+  if (config.page_size.has_value()) {
     SetEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", *config.page_size);
   }
 }
