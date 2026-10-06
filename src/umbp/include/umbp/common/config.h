@@ -487,6 +487,40 @@ struct UMBPConfig {
   // not the cross-node master/RDMA path.
   std::optional<UMBPStandaloneProcessConfig> standalone_process;
 
+  // Storage settings shared by embedded, distributed, and auto-started servers.
+  // Unset values preserve the existing deployment-specific defaults.
+  std::string backend_policy_path;
+  std::optional<uint64_t> page_size;
+
+  bool ValidateStorageConfig(std::string* error_message = nullptr) const {
+    if (page_size.has_value() && *page_size == 0) {
+      if (error_message) *error_message = "page_size must be > 0 when supplied";
+      return false;
+    }
+    if (distributed.has_value()) {
+      const auto& d = *distributed;
+      if (!backend_policy_path.empty() && !d.backend_policy_path.empty() &&
+          backend_policy_path != d.backend_policy_path) {
+        if (error_message)
+          *error_message = "backend_policy_path conflicts with distributed.backend_policy_path";
+        return false;
+      }
+      if (page_size.has_value() && d.dram_page_size != 0 && *page_size != d.dram_page_size) {
+        if (error_message) *error_message = "page_size conflicts with distributed.dram_page_size";
+        return false;
+      }
+    }
+    if (standalone_process.has_value() && !standalone_process->auto_start &&
+        (!backend_policy_path.empty() || page_size.has_value())) {
+      if (error_message)
+        *error_message =
+            "standalone storage settings require auto_start; configure an existing "
+            "server separately";
+      return false;
+    }
+    return true;
+  }
+
   UMBPRole ResolveRole() const {
     if (role != UMBPRole::Standalone) {
       return role;
@@ -501,6 +535,7 @@ struct UMBPConfig {
   }
 
   bool Validate(std::string* error_message = nullptr) const {
+    if (!ValidateStorageConfig(error_message)) return false;
     if (dram.capacity_bytes == 0) {
       if (error_message) *error_message = "dram.capacity_bytes must be > 0";
       return false;
@@ -555,8 +590,8 @@ struct UMBPConfig {
       }
       // Only the selected medium's sizing is checked: a node that serves HBM
       // still carries a defaulted dram/ssd block it never allocates from.
-      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::HBM &&
-          d.hbm.capacity_bytes == 0) {
+      if (backend_policy_path.empty() && d.backend_policy_path.empty() &&
+          d.medium == UMBPMedium::HBM && d.hbm.capacity_bytes == 0) {
         if (error_message)
           *error_message =
               "distributed.hbm.capacity_bytes must be > 0 when distributed.medium is HBM";
@@ -565,7 +600,8 @@ struct UMBPConfig {
       // Not ssd.Validate(): that returns early on ssd.enabled == false, and
       // selecting SSD here IS the opt-in (DistributedClient enables the tier
       // from `medium`, so an unset ssd.enabled must not skip the sizing check).
-      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::SSD) {
+      if (backend_policy_path.empty() && d.backend_policy_path.empty() &&
+          d.medium == UMBPMedium::SSD) {
         if (ssd.capacity_bytes == 0) {
           if (error_message)
             *error_message = "ssd.capacity_bytes must be > 0 when distributed.medium is SSD";

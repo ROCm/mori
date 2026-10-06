@@ -132,8 +132,13 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   // medium counts: a pure-SSD server is configured by naming SSD and nothing
   // else, which is the whole command for a node that serves storage locally.
   static const std::vector<const char*> kDistributedSelectorEnv = {
-      "UMBP_MASTER_ADDRESS", "UMBP_NODE_ADDRESS",       "UMBP_NODE_ID",
-      "UMBP_IO_ENGINE_HOST", "UMBP_DISTRIBUTED_MEDIUM",
+      "UMBP_MASTER_ADDRESS",
+      "UMBP_NODE_ADDRESS",
+      "UMBP_NODE_ID",
+      "UMBP_IO_ENGINE_HOST",
+      "UMBP_DISTRIBUTED_MEDIUM",
+      "UMBP_BACKEND_POLICY",
+      "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE",
   };
 
   *distributed_requested = AnyEnv(kDistributedSelectorEnv);

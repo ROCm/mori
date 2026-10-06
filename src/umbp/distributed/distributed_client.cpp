@@ -38,7 +38,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient requires UMBPConfig::distributed to be set");
   }
 
-  const auto& dc = config.distributed.value();
+  std::string config_error;
+  if (!config.ValidateStorageConfig(&config_error)) {
+    throw std::runtime_error("invalid UMBP storage config: " + config_error);
+  }
+  auto dc = config.distributed.value();
+  if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
+  if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;
   local_only_ = dc.master_config.master_address.empty();
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
