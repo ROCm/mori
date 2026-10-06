@@ -1779,7 +1779,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   constexpr bool kSeg = kSegK > 0 && kSegK <= 15 && kSegL <= 8 && kSegNb >= 2;
 
   const int laneId = threadIdx.x & (WS - 1);
-  const int warpId = threadIdx.x / WS;
+  const int warpId = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS));
   const unsigned long long win = args.window;
   extern __shared__ char sharedMem[];
 
@@ -2081,6 +2081,12 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       // issue order, so the oldest chunk is done once no more than the newer ones' are in flight.
       unsigned ops = 0;
       int inflight = 0, head = 0, x = 0;
+      constexpr bool kKeep = kOvlp && kSegL == 1;
+      [[maybe_unused]] int peF = -1, rwF = 0;
+      [[maybe_unused]] const __attribute__((address_space(1))) int* const mapG =
+          kKeep ? (const __attribute__((address_space(1))) int*)(
+                      wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc)
+                : nullptr;
       auto retire = [&]() {
         const int sh = 4 * (head % kSegL);
         inflight -= (int)((ops >> sh) & 15u);
@@ -2089,11 +2095,12 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         if constexpr (kOvlp) {
           const int r0c = rb + ch * kSegK;
           if (laneId < min(kSegK, re - r0c)) {
-            const int pe = cpe[(ch % kSegNb) * kSegK + laneId];
+            const int pe = kKeep ? peF : cpe[(ch % kSegNb) * kSegK + laneId];
+            const int row = kKeep ? rwF : rowOf(r0c + laneId);
             EpGU64* const f = (EpGU64*)(reinterpret_cast<unsigned long long*>(
                                             wBase + (uint64_t)pe * wStride + args.offOutTok +
                                             EpFp4FlagOff<kCfg>()) +
-                                        (size_t)args.rank * kMaxRecv + rowOf(r0c + laneId));
+                                        (size_t)args.rank * kMaxRecv + row);
             __hip_atomic_store(f, ovlEp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
           }
         }
@@ -2104,6 +2111,14 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       };
       for (int c = s; c < nCh; c += kSegS, ++x) {
         const int slot = c % kSegNb;
+        [[maybe_unused]] int rwN = 0, srcN = 0;
+        if constexpr (kKeep) {
+          const int r0p = rb + c * kSegK;
+          if (laneId < min(kSegK, re - r0p)) {
+            rwN = rowOf(r0p + laneId);
+            srcN = mapG[rwN];
+          }
+        }
         unsigned spin = 0;
         while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
                    rdy + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) != c + 1) {
@@ -2115,10 +2130,17 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           }
         }
         if (x - head >= kSegL) retire();
+        if constexpr (kKeep) asm volatile("" : "+v"(srcN));
         const int r0 = rb + c * kSegK;
         const int n = min(kSegK, re - r0);
-        const int pe = laneId < kSegK ? cpe[slot * kSegK + laneId] : -1;
-        [[maybe_unused]] const int rw = kOvlp && laneId < n ? rowOf(r0 + laneId) : 0;
+        const int pe = kKeep ? (laneId < n ? srcN / kCfg.maxTokPerRank : -1)
+                             : (laneId < kSegK ? cpe[slot * kSegK + laneId] : -1);
+        [[maybe_unused]] const int rw =
+            kKeep ? rwN : (kOvlp && laneId < n ? rowOf(r0 + laneId) : 0);
+        if constexpr (kKeep) {
+          peF = pe;
+          rwF = rw;
+        }
         unsigned char* const ring = ringB + (size_t)slot * kSegK * kWireB;
         int nops = 0;
         for (int i = 0; i < n;) {
