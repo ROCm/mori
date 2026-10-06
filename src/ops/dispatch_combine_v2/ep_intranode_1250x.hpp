@@ -318,11 +318,8 @@ __device__ __forceinline__ index_t EpSelfFirstPeerSent(const EpArgs& args, int p
 // block b takes t = ceil(units / gridDim.x) units, [b * t, b * t + t), on its first t
 // warps instead, and the warps at or past t take the ids left over, so the map stays a
 // bijection onto [0, gridDim.x * warpPerBlock) and every stride loop still covers each
-// token once. t rather than T because a block's tokens leave through its own CU: with T
-// a block, 16 tokens ran eight to a block on two blocks, and the call waited on those two
-// (EP16 bf16 64.3 us against 32.0 at one a block, fp4 40.2 against 29.7; EP8 52.3 / 31.7
-// against 26.1 / 25.2). Larger calls keep the plain map (768 tokens as 64 x 12 measured
-// slower than 48 x 16 at EP8), and so does every geometry with at most T warps per block.
+// token once. Larger calls keep the plain map (768 tokens as 64 x 12 measured slower than
+// 48 x 16 at EP8), and so does every geometry with at most T warps per block.
 // selfFirst only: under the original protocol every block that holds tokens also RMWs
 // this rank's own slot word, and there the chunked map measured slower than the plain one
 // at 512 tokens on EP8.
@@ -958,12 +955,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // warp that sent metadata would issue no payload until those stores completed.
       // Past the chunked range kPlainMeta gives the runs to the top kPM warps, a peer each.
       const bool _metaHi = !kUnitGeom && _tokChunk;
-      // Where that leaves fewer warps past kEpTokChunk than remote peers (EP16 at 64 x 16: eight
-      // for fifteen), the warps below kEpTokChunk that hold no token take runs too -- the chunked
-      // map gives tokens to the first t warps of a block only. A wave issues its remote stores one
-      // after another and the stores of one run take a few us to issue, so a wave with two runs
-      // set the length of the metadata pass. Only where a block has a warp for every peer: EP32 at
-      // 64 x 16 would keep two runs a wave, and it has not been measured.
       constexpr bool kMetaLo = kCfg.selfFirst && !kUnitGeom && kCfg.warpPerBlock > kEpTokChunk &&
                                npes - 1 > kCfg.warpPerBlock - kEpTokChunk &&
                                npes <= kCfg.warpPerBlock;
@@ -995,8 +986,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
         if constexpr (kMetaLo) {
-          // Peer numbering starts past this rank, so the own run is the last and the remote
-          // ones fill the first npes - 1 warps, one each.
           if (_metaHi && !_runPeerMinor) peer = (peer + myPe + 1) % npes;
         }
         if (kCfg.selfFirst && peer == myPe) continue;  // the own pass ships it, after R
