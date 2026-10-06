@@ -124,7 +124,7 @@ _DISPATCH_TABLE: dict = {
         #   2048  101.3   103.5  102.3  101.7  |  86.5 78.5 76.6 76.2 | 85.8 67.9 64.2 64.5
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
         (4, 7168, 6, None): {
-            None: ((512, 64, 8), (4096, 64, 16), (None, 128, 16)),
+            None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
             "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
@@ -147,14 +147,12 @@ _DISPATCH_TABLE: dict = {
         #   4096   123.2         119.9
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
-            None: ((None, 64, 16),),
+            None: ((2048, 64, 16), (None, 128, 16)),
             "fp4_disp_bf16_comb": (
                 (1024, 64, 16),
                 (1536, 64, 24),
                 (2048, 64, 32),
-                (2944, 64, 16),
-                (4096, 64, 32),
-                (None, 64, 16),
+                (None, 128, 16),
             ),
         },
     },
@@ -186,11 +184,22 @@ _COMBINE_FP4_TABLE: dict = {
             # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
             # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
             # behind (+0.7 at 1792, +4.0 at 1536, +8.1 at 1024).
-            (4, 7168, 6, None): ((256, 64, 8), (2047, 64, 16), (16384, 64, 24), (None, 64, 16)),
+            (4, 7168, 6, None): (
+                (256, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
             # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
             # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
             # waves kept one chunk in flight; since then it is ahead at 2048 (-0.4) and 4096 (-1.7).
-            (8, 7168, 6, None): ((1536, 64, 8), (16384, 64, 24), (None, 64, 8)),
+            (8, 7168, 6, None): (
+                (1536, 64, 8),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 8),
+            ),
         },
     },
     "fp4_blockwise_fp32": {
