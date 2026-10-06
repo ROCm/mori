@@ -139,8 +139,8 @@ UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config) {
   // the common case is a cluster member.
   dist.master_config.auto_heartbeat = false;
 
-  // Legacy page size, where 0 means "no opinion".  Both the default and an explicit
-  // value are fitted to the pool: the cliff FitPageSizeToPool guards against --
+  // distributed.dram_page_size uses 0 to mean unspecified. Default and
+  // explicit values are fitted to the pool: the cliff FitPageSizeToPool guards against --
   // a page bigger than the pool means ZERO pages and every put failing with
   // NO_SPACE, silently -- does not care who chose the number, and honouring a
   // deliberate-but-impossible value literally would be a worse answer than
@@ -153,7 +153,7 @@ UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config) {
   // an agreed size must survive untouched.  peer_service_port == 0 means no
   // gRPC peer service is bound, hence no peers to disagree with.
   // A shared page_size is explicit and stays unchanged. A policy defines its
-  // own capacities, so fitting to the legacy DRAM capacity would be incorrect.
+  // own capacities, so fitting to config.dram.capacity_bytes would be incorrect.
   if (dist.peer_service_port == 0 && !config.page_size.has_value()) {
     const uint64_t requested = dist.dram_page_size > 0 ? dist.dram_page_size : EmbeddedPageSize();
     dist.dram_page_size = config.backend_policy_path.empty() && dist.backend_policy_path.empty()

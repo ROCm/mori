@@ -94,7 +94,7 @@ TEST(StorageConfig, RejectsConflictingDistributedPageSize) {
   EXPECT_EQ(error, "page_size conflicts with distributed.dram_page_size");
 }
 
-TEST(StorageConfig, AllowsMatchingLegacySettings) {
+TEST(StorageConfig, AllowsMatchingSharedAndDistributedSettings) {
   UMBPConfig config;
   config.distributed = UMBPDistributedConfig{};
   config.backend_policy_path = "/tmp/shared.json";
