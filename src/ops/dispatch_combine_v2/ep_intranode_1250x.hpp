@@ -143,12 +143,6 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
 #define MORI_TDM_CHECK_XFER(src, dst, n, sp) ((void)0)
 #endif
 
-// A branch right after a tensor op misbehaves on gfx1250: in the EP16 fp4 dispatch the back edge of
-// the metadata loop, issued straight after the run's last tensor_store_from_lds, skipped the loop
-// latch and the wave stopped with ILLEGAL_INSTRUCTION, in about one bench run in three at ct 2048
-// and 4096. With an s_nop between the two it did not happen again, so every tensor op here is
-// followed by one; a branch that ends the block can then only come after it. The compiler treats
-// the asm as touching memory, so loads are not moved across it (see EpWinC).
 __device__ __forceinline__ void TdmSeparateFromBranch() { asm volatile("s_nop 0"); }
 
 template <typename T, int TH = 0, int SCOPE = 0>
