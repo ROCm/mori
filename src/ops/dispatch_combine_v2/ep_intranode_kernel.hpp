@@ -64,6 +64,33 @@ __device__ __forceinline__ T* EpLocal(unsigned long long win, unsigned long long
       reinterpret_cast<::mori::cco::ccoWindow_t>(win), static_cast<size_t>(off)));
 }
 
+// A window handle whose fields EpPeer / EpLocal read as constant memory (address space 4). The
+// window does not change while a kernel runs, and through a generic pointer its fields are
+// reloaded after every call the compiler cannot see into (an asm statement, a builtin with side
+// effects), even inside a loop; constant loads are invariant, so they are reused across such
+// calls, and they are scalar. The gfx1250 dispatch uses it; the combine keeps the generic reads,
+// which measured 0.1-0.3 us faster there at small ct.
+struct EpWinC {
+  unsigned long long h;
+};
+
+using EpWinConstPtr = const __attribute__((address_space(4))) ::mori::cco::ccoWindowDevice*;
+
+template <typename T>
+__device__ __forceinline__ T* EpPeer(EpWinC win, int peer, unsigned long long off) {
+  const EpWinConstPtr w = reinterpret_cast<EpWinConstPtr>(win.h);
+  return reinterpret_cast<T*>(w->winBase + ((static_cast<uint64_t>(peer) * w->stride4G) << 32) +
+                              static_cast<size_t>(off));
+}
+
+template <typename T>
+__device__ __forceinline__ T* EpLocal(EpWinC win, unsigned long long off) {
+  const EpWinConstPtr w = reinterpret_cast<EpWinConstPtr>(win.h);
+  return reinterpret_cast<T*>(w->winBase +
+                              ((static_cast<uint64_t>(w->lsaRank) * w->stride4G) << 32) +
+                              static_cast<size_t>(off));
+}
+
 // Spin helpers. SYSTEM scope is load-bearing: the dispatch notify loop spins on
 // a *peer's* signal word, and AGENT scope there hangs.
 template <typename T>

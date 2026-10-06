@@ -143,6 +143,14 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape(int hiddenDim) {
 #define MORI_TDM_CHECK_XFER(src, dst, n, sp) ((void)0)
 #endif
 
+// A branch right after a tensor op misbehaves on gfx1250: in the EP16 fp4 dispatch the back edge of
+// the metadata loop, issued straight after the run's last tensor_store_from_lds, skipped the loop
+// latch and the wave stopped with ILLEGAL_INSTRUCTION, in about one bench run in three at ct 2048
+// and 4096. With an s_nop between the two it did not happen again, so every tensor op here is
+// followed by one; a branch that ends the block can then only come after it. The compiler treats
+// the asm as touching memory, so loads are not moved across it (see EpWinC).
+__device__ __forceinline__ void TdmSeparateFromBranch() { asm volatile("s_nop 0"); }
+
 template <typename T, int TH = 0, int SCOPE = 0>
 __device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src,
                                              const gfx1250_TDM_GROUP1& g1) {
@@ -157,6 +165,7 @@ __device__ __forceinline__ void TdmIssueLoad(T* ldsTile, const T* src,
   _tdm_v4i z4{0, 0, 0, 0};
   _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
   __builtin_amdgcn_tensor_load_to_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, 0);
+  TdmSeparateFromBranch();
 }
 template <typename T>
 __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShapeGather(int rowElems, int nRows,
@@ -184,6 +193,7 @@ __device__ __forceinline__ void TdmIssueStore(T* dst, T* ldsTile, const gfx1250_
   _tdm_v4i z4{0, 0, 0, 0};
   _tdm_v8i z8{0, 0, 0, 0, 0, 0, 0, 0};
   __builtin_amdgcn_tensor_store_from_lds(g0.m_bitfield, g1.m_bitfield, z4, z4, z8, CPOL);
+  TdmSeparateFromBranch();
 }
 __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmShape2D(int dim0, int dim1) {
   gfx1250_TDM_GROUP1 g1;
@@ -266,7 +276,7 @@ __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBy
 // the window's offTokOff. Same word, same protocol -- only the memory differs.
 __device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
   return args.tokOffPeers != nullptr ? args.tokOffPeers[pe]
-                                     : EpPeer<index_t>(args.window, pe, args.offTokOff);
+                                     : EpPeer<index_t>(EpWinC{args.window}, pe, args.offTokOff);
 }
 
 // Cfg.selfFirst state, laid out by EpSelfFirstBytes (ep_cfg.hpp); PE pe's copy is at
@@ -372,7 +382,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   constexpr int npes = kCfg.worldSize;
   const size_t hiddenDim = (size_t)kCfg.hiddenDim;
   constexpr int topk = kCfg.numExpertPerToken;
-  const unsigned long long win = args.window;
+  const EpWinC win{args.window};
   const int aWarps = (int)gridDim.x * warpNum;
 
   const int _tpi = (topk > 0 && topk <= WS && (WS % topk) == 0) ? (WS / topk) : 1;
