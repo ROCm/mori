@@ -115,7 +115,13 @@ _DISPATCH_TABLE: dict = {
         #   4096  163.4   158.0  161.1  156.4  | 127.3 99.0 99.3 98.4 |121.4 80.5 81.0 80.7
         #   16384 560.3   552.4  516.8  507.4  | 428.6 307. 278. 282.9|418.8 243. 174.6 172.1
         (4, 7168, 8, None): {
-            None: ((2048, 64, 8), (4096, 64, 16), (None, 128, 16)),
+            None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
+        },
+        # topk 9 = 8 routed + 1 shared (what ATOM dispatches: kernel name k9).
+        # The engine selects this key, not topk 8; block 64 default starves the
+        # 256-CU GPU at the ~3456-recv operating point. Block 256 saturates it.
+        (4, 7168, 9, None): {
+            None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
         },
         # topk 6 (384 experts at EP4). The edges move in: 64x8 stops paying at 512.
         #   ct     64x8   64x16  128x16 256x16      (bf16 / fp8 / fp4)
@@ -172,6 +178,11 @@ _COMBINE_TABLE: dict = {
     },
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
+        # topk 9 = 8 routed + 1 shared (ATOM's actual dispatch key). Needed so the
+        # dispatch schedule has a combine half -- lookup() returns the block-64
+        # single-shot default unless BOTH halves exist. Combine geometry mirrors
+        # topk 8 (unchanged); only the dispatch half is retuned to block 256.
+        (4, 7168, 9, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
         # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
