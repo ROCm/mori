@@ -624,7 +624,7 @@ hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size
 
 hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size_t chunkBytes,
                                            hipStream_t stream) {
-  constexpr int kThreads = 256;
+  constexpr int kThreads = 64;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
                                                   devComm_, heapWin_, barrierCtr_);
@@ -640,7 +640,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     pinnedPairs_[p].source = addrs[p].first;
     pinnedPairs_[p].dest = addrs[p].second;
   }
-  constexpr int kThreads = 256;
+  constexpr int kThreads = 64;
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, pinnedPairs_, chunkBytes, devComm_,
                                                  heapWin_, barrierCtr_);
@@ -678,7 +678,7 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
                   nPes_);
     return hipErrorInvalidValue;
   }
-  constexpr int kThreads = 256;
+  constexpr int kThreads = 64;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(nPes_, dstPe, srcPe, sendBuf, recvBuf,
                                                           numBytes, devComm_, heapWin_,
                                                           permuteReady_);
