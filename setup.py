@@ -57,11 +57,6 @@ _MPI_SYSTEM_DEPS = [
 
 _REQUIRED_HEADERS = [
     (
-        ["/usr/include/pci/pci.h", "/usr/include/x86_64-linux-gnu/pci/pci.h"],
-        ("libpci-dev", "pciutils-devel"),
-        "PCI library headers (needed for topology detection)",
-    ),
-    (
         ["/usr/include/infiniband/verbs.h"],
         ("libibverbs-dev", "rdma-core-devel"),
         "InfiniBand verbs headers (needed for RDMA transport)",

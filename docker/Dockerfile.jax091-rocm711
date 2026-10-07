@@ -59,8 +59,7 @@ RUN python${PYTHON_VERSION} -m pip install --break-system-packages \
         numpy scipy cmake pybind11 pytest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libibverbs-dev \
-        libpci-dev && \
+        libibverbs-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Sanity check (CPU-only at build time, GPU visible at runtime)
