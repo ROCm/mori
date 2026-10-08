@@ -404,7 +404,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     stg_bytes, dtype=torch.uint8, device=dev
                 )
 
-
         self._kernels = self._build_kernels(cfg, self.arena)
 
         if cfg.is_internode:
