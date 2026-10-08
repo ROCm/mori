@@ -230,41 +230,41 @@ constexpr int kMetaFields = 3;  // idx, weights, srcmap
 static_assert(EpScaleAlign % kTdmRowBytes == 0,
               "the scale staging base must sit on a TDM row for the metadata tile to reach it");
 
-// Staging lives in the caller's buffer (EpArgs::stagingBase) by default. Under
-// MORI_EP_STATIC_STAGING (EpStaticStaging(), ep_spec.cpp) the module ALSO carries the
-// original .bss arrays and a launch picks between the two layouts on whether that
-// pointer is null -- same protocol, same indexing, only the memory differs.
+// Staging lives in the caller's buffer (EpArgs::stagingBase). TEMPORARILY, the module
+// also carries it as .bss arrays, and a launch picks between the two layouts on whether
+// that pointer is null -- same protocol, same indexing, only the memory differs. See
+// EpHasStaticStaging in ep_cfg.hpp for why they are here and when to delete them.
 //
-// Gated rather than always present because .bss is reserved per COMPILED VARIANT, not
-// per op: a three-entry (block, warp) dispatch schedule pays for it three times. The
-// scale array dominates and is quadratic in world_size -- kEpScaleSlots is
-// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank -- so at the
-// 256 B stride a 224 B row (hidden 7168) pads up to:
-//     EP4  maxTok 16384  ->   64 MiB      EP8  maxTok  8192  ->  128 MiB
-//     EP8  maxTok 16384  ->  256 MiB      (times the schedule: ~672 MiB)
-// The per-peer stride has to be the peer's full recv capacity so the destination slot
-// id indexes it directly, which is also what lets the existing `ab + cc > recvCapM`
-// guard cover the array. Making it world_size-independent, like the idx/wt pools,
-// needs block-local slot indexing -- a bigger change than it looks, and one where the
-// guard would start dropping tokens rather than merely skipping transfers.
-#if defined(MORI_EP_STATIC_STAGING) && MORI_EP_STATIC_STAGING
+// The fit test is EpStaticStagingBytes <= EpStaticStagingBudget, spelled in macros
+// because this is file scope: the TU reaches it before kCfg exists, the same reason
+// MORI_EP_SCALE_* are macros. Preprocessor arithmetic is intmax_t, so the products do
+// not wrap the way a plain int would. EpDispatch1250xBody static_asserts that this
+// arrives at the same answer the Cfg does.
+#if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
+#define MORI_EP_STG_SCALE_BYTES (MORI_EP_SCALE_SLOTS * MORI_EP_SCALE_STRIDE)
+#else
+#define MORI_EP_STG_SCALE_BYTES 0
+#endif
+#define MORI_EP_STG_BYTES                                               \
+  (CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK * 8 + CUSPLIT_POOL_SLOTS * 4 + \
+   CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE * 8 + MORI_EP_STG_SCALE_BYTES)
+
+#if MORI_EP_STG_BYTES <= (1 << 30)
+#define MORI_EP_HAS_STATIC_STAGING 1
 alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx_dev[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 alignas(kTdmRowBytes) __device__ float _cusplit_stgWt_dev[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc_dev[CUSPLIT_POOL_SLOTS];
 __device__ index_t _cusplit_blkBase_dev[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 __device__ index_t _cusplit_blkCount_dev[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
-// Fail at compile time rather than at the first launch on a big EP; the dynamic
-// layout has no such ceiling, so unsetting the flag is the way out.
-static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (size_t)1 << 30,
-              "EP scale staging exceeds 1 GiB per compiled variant -- unset "
-              "MORI_EP_STATIC_STAGING, or re-index it block-locally before going wider");
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale_dev[kEpScaleStgBytes];
 // The base is a kernel argument, so the select is wave-uniform and folds to a scalar
 // cmov hoisted out of every loop that follows.
 #define MORI_EP_STG_PICK(dyn, dev) (_stgBase != nullptr ? (dyn) : (dev))
 #else
-// The `dev` token never reaches the compiler, so the arrays need no declaration here.
+// Over budget: the dynamic layout alone. The `dev` token never reaches the compiler, so
+// the arrays need no declaration here, and a null base has nothing to fall back to --
+// EpDispatchSpec::LaunchRaw rejects one for exactly these Cfgs.
 #define MORI_EP_STG_PICK(dyn, dev) (dyn)
 #endif
 
@@ -368,20 +368,32 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
 
+  // The macros above size the arrays, the Cfg answers the same question for the host.
+  // They must agree: the host decides from the Cfg whether a null base is legal, and
+  // the module it decides for is this one.
+#if defined(MORI_EP_HAS_STATIC_STAGING) && MORI_EP_HAS_STATIC_STAGING
+  static_assert(EpHasStaticStaging(kCfg),
+                "the rendered macros kept the .bss staging but the Cfg says it is over "
+                "budget -- LaunchRaw would reject a null base the kernel can serve");
+#else
+  static_assert(!EpHasStaticStaging(kCfg),
+                "the rendered macros dropped the .bss staging but the Cfg says it fits "
+                "-- LaunchRaw would pass a null base to a kernel with no fallback");
+#endif
+
   // Staging pointers. The EpStaging*Offset functions are constexpr on kCfg, so each
   // dynamic one is base + a compile-time constant; MORI_EP_STG_PICK falls back to the
-  // .bss array of the same shape when the module was rendered with
-  // MORI_EP_STATIC_STAGING and this launch left the base null.
+  // .bss array of the same shape when this launch left the base null.
   char* _stgBase = static_cast<char*>(args.stagingBase);
-#if !(defined(MORI_EP_STATIC_STAGING) && MORI_EP_STATIC_STAGING)
-  // Without the .bss arrays there is nothing to fall back to. EpDispatchSpec::LaunchRaw
-  // rejects a null base on the host, but it only shadows the base LaunchRaw -- a C++
-  // caller reaching KernelSpec::Launch names the base one and slips past. Assert rather
-  // than dereference: the fault would otherwise land at null + a staging sub-offset,
-  // which names neither the argument nor the caller that left it unbound.
+#if !(defined(MORI_EP_HAS_STATIC_STAGING) && MORI_EP_HAS_STATIC_STAGING)
+  // Over budget, so there is nothing to fall back to. EpDispatchSpec::LaunchRaw rejects
+  // a null base on the host, but it only shadows the base LaunchRaw -- a C++ caller
+  // reaching KernelSpec::Launch names the base one and slips past. Assert rather than
+  // dereference: the fault would otherwise land at null + a staging sub-offset, which
+  // names neither the argument nor the caller that left it unbound.
   assert(args.stagingBase != nullptr &&
-         "ep_dispatch: stagingBase is null -- bind staging_base (EpStagingTotalBytes), "
-         "or build with MORI_EP_STATIC_STAGING=1 to use the .bss staging");
+         "ep_dispatch: stagingBase is null and this Cfg is past EpStaticStagingBudget, "
+         "so the module has no .bss staging -- bind staging_base (EpStagingTotalBytes)");
 #endif
   index_t* _cusplit_stgIdx = MORI_EP_STG_PICK(
       reinterpret_cast<index_t*>(_stgBase + EpStagingIdxOffset(kCfg)), _cusplit_stgIdx_dev);

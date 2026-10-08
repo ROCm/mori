@@ -142,19 +142,6 @@ def scale_stride_bytes(scale_bytes: int) -> int:
     return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
 
 
-def ep_static_staging() -> bool:
-    """MORI_EP_STATIC_STAGING=1 (default off): stage in the module's .bss.
-
-    Mirrors EpStaticStaging() in ep_spec.cpp, which renders the arrays into the TU and
-    reads the same spellings. On, this op leaves staging_base unbound and the kernel
-    takes the .bss path; off, it allocates and binds the shared buffer. The two sides
-    must agree on the value -- a null base against a module rendered without the arrays
-    has nothing to fall back to.
-    """
-    v = os.environ.get("MORI_EP_STATIC_STAGING", "").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
 def ep_staging_bytes(world_size: int, max_recv: int, scale_bytes: int) -> int:
     """Total bytes for the gfx1250 dispatch staging buffer.
 
@@ -405,11 +392,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
-        # because dispatch plans bind the pointer at construction time.
-        # Left None under MORI_EP_STATIC_STAGING, which is how the kernel is asked
-        # for the .bss arrays the same flag rendered into it.
+        # because dispatch plans bind the pointer at construction time.  This op
+        # always binds it; the kernel's .bss fallback is for callers that drive
+        # EpDispatchPlan directly and never do.
         self.dispatch_staging = None
-        if self._is1250 and not cfg.is_internode and not ep_static_staging():
+        if self._is1250 and not cfg.is_internode:
             raw_scale = self._scale_i32(cfg) * 4
             stg_bytes = ep_staging_bytes(
                 cfg.world_size, cfg.effective_max_recv, raw_scale

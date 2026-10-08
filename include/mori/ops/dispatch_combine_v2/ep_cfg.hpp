@@ -487,6 +487,34 @@ constexpr size_t EpStagingTotalBytes(const EpCfg& c) {
   return tail > 0 ? EpAlignUp128(tail) : 0;
 }
 
+// TEMPORARY. The gfx125x dispatch body also carries the staging as __device__ arrays,
+// so a caller that never binds stagingBase still runs -- aiter's MegaMoE drives
+// EpDispatchPlan directly and does not bind it. Delete the arrays, this predicate and
+// its uses once every caller binds the buffer; nothing else depends on them.
+//
+// Not unconditional, because .bss is reserved per COMPILED VARIANT and every pool here
+// is quadratic in world_size (EpStagingPoolSlots is worldSize * EpMaxRecv, and
+// EpMaxRecv is itself worldSize * maxTokPerRank). Past the budget the module carries
+// the dynamic layout alone and a null base is an error rather than a fallback:
+//     EP8  maxTok   128  ->   3 MiB      EP32 maxTok   128  ->   48 MiB
+//     EP8  maxTok 16384  -> 388 MiB      EP32 maxTok  4096  -> 1.3 GiB  (over)
+constexpr size_t EpStaticStagingBudget = (size_t)1 << 30;
+
+// What the arrays reserve. Their own sizes, NOT EpStagingTotalBytes: the buffer pads
+// each sub-array to 128 B, the arrays are declared individually and are not padded.
+constexpr size_t EpStaticStagingBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * EpStagingMaxTopk * (sizeof(int32_t) + sizeof(float)) +
+         EpStagingPoolSlots(c) * sizeof(int32_t) +
+         (size_t)EpStagingMaxBlocks * c.worldSize * sizeof(int32_t) * 2 + EpStagingScaleBytes(c);
+}
+
+// Whether this Cfg's module has the arrays. ep_intranode_1250x.hpp decides the same
+// thing from the rendered macros (it is reached before kCfg exists) and static_asserts
+// the two agree, so this stays the single answer the host may rely on.
+constexpr bool EpHasStaticStaging(const EpCfg& c) {
+  return EpStaticStagingBytes(c) <= EpStaticStagingBudget;
+}
+
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
 // address, different phases), so its size bounds BOTH -- and the metadata batch
 // size is (slab - headroom) / bytes-per-token.
