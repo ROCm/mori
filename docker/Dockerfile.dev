@@ -23,7 +23,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     git ibverbs-utils libibverbs-dev \
     openmpi-bin libopenmpi-dev \
-    libdw1 locales \
+    libpci-dev libdw1 locales \
     libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
     libnuma-dev libdrm-dev \
     cmake && \
