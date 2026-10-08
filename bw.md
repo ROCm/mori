@@ -4,6 +4,163 @@
 
 本文保留各次实验的独立基线、配置及版本说明。原始样本与日志归档未包含在本仓库中；指向 `../mori_epv2_recheck_20260917/` 的证据链接用于本地工作区查阅。
 
+<!-- BEGIN EPV2 RESCAN 20260930 -->
+<a id="epv2-rescan-20260930"></a>
+
+## MI355X 普通 HIP V2：新方法重扫记录（2026-09-30）
+
+生成时间：2026-10-08T02:40:29.172708+00:00。基线已有效采样 **36/36** 个 shape，其中 **36/36** 已与独立审计及原始样本核对；数值门槛 **12/12**。
+
+扫描进度（2026-10-08 03:48 UTC）：BF16/K6、T16–1024共 **7/36** 个形状完成Dispatch、Combine扫描及三轮现有数值检查，合计 **21/108** 个阶段有效。T2048 Dispatch因外部作业占用被中断，无效尝试均保留并排除。当前没有本轮已确认的新配置，独立确认及最终表严格验证仍待执行。
+源码 commit `33ae5bf9a49df66a966523a10a7ae2f41684017b`；g17 + g09，EP16（每节点 8×MI355X/gfx950）、Ionic，H7168、总 experts 256、QP2、uniform routing，CCQE off，SL3/TC104。
+全部性能路径显式指定普通 `v2`，包括小 token；T16/T32 的声明容量为 64，其余本矩阵容量等于 T。没有用 `auto` 切换到 `v2_ll`。
+表中带宽按 2026-09-30 changelog：先对每个 rank、每个保留 round 计算各自算法 payload bytes / latency，再求 grand mean；延迟也取全部保留样本的均值。RDMA/xGMI 是算法有效负载带宽，不是物理 NIC 链路吞吐，不能与旧测试方法的数值直接混用。
+基线与候选扫描为 warmup20、3 passes×30 rounds，每 pass 丢弃首轮，每 phase 保留 16×3×29=1392 个样本。独立确认每 arm 为 3×100 rounds，同样 warmup20/drop1，每 phase 保留 4752 个样本。
+独立审计状态：`passed`，采集时间 `2026-10-08T02:38:55.879977+00:00`；accepted 36，rejected 0。状态文件可能比审计更新，尚未同步审计的数值不填入下表。
+
+**代表性待复核：FP8→BF16 / K8 / T2048 的原始基线是异常慢运行。** 该点采于2026-09-30；Dispatch/Combine均值8266.95/10169.08µs的算术与结构审计仍通过，但保留样本的中位数也达到7277.95/9224.62µs，三个pass后段均持续偏慢，不能仅解释为首轮尖峰。下表保留其全部原数值与证据，**不将此点当作代表性能基线，也不据此计算优化收益**。同一完整配置的一次独立3×100刷新待执行，失败/污染最多重试一次；不择最快、不覆盖旧记录。其余35点未见同量级强异常。详见[原样本分布与有界复核计划](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/baseline_representativeness_20261008.md>)；原因尚未确定，不能由“无已识别竞争”推断CPU调度无扰动。
+正确性：这里的 campaign gate 只表示现有数值门槛，通过范围是四组 dtype/topk 的 T16/T256/T4096；严格逐字节 Dispatch / 参考值 Combine 验证另行记录，本报告不把这些 gate 称为完整 strict 验证。
+
+### 数据层级
+
+1. **基线**：冻结旧配置（包含已有调参结果）+ 本次新 kernel，在新方法下重新采样；它不是旧 kernel 的性能。FP8→FP8 没有既有 Combine 规则时使用普通 V2 默认 geometry。
+2. **有限 grid 候选（provisional）**：先扫 Dispatch，再固定其选择扫 Combine，优化指标为 D+C；两阶段完成并通过该 shape 的三轮 test 后才算扫描完成。其选择尚不能称为独立确认的最优配置。
+3. **独立 A-B-A 确认**：每个 geometry 变化的候选跑三组 A0-B-A1。三组都改善、改善中位数达到 max(1.5μs, 2% baseline pair mean 中位数)，且每组 B 最差同 rank/同 round D+C ≤ max(A0 worst, A1 worst)+10% 本组 baseline mean，才标 qualified。仅称有限搜索集合中的已确认配置对。
+
+### 冻结旧配置 / 新 kernel 基线
+
+### Baseline · BF16 → BF16 · topk6
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | 16/8/8 | 79.32 | 5.84 | 15.54 | 16/10/8 | 76.84 | 6.04 | 15.98 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t16_a001/node0/rank0_pid8985_call0001_1790740103118434746.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t16_a001/metadata.json>) |
+| 32 | 16/8/8 | 88.53 | 10.51 | 27.76 | 16/10/8 | 86.46 | 10.77 | 28.36 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t32_a001/node0/rank0_pid9167_call0001_1790740137862432025.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t32_a001/metadata.json>) |
+| 64 | 16/8/8 | 109.64 | 16.59 | 43.90 | 16/10/8 | 102.51 | 17.76 | 47.01 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t64_a001/node0/rank0_pid9348_call0001_1790740172338680220.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t64_a001/metadata.json>) |
+| 128 | 32/16/8 | 118.36 | 30.71 | 81.01 | 96/64/8 | 110.33 | 32.98 | 87.00 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t128_a001/node0/rank0_pid9530_call0001_1790740210623437772.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t128_a001/metadata.json>) |
+| 256 | 96/64/8 | 158.92 | 46.58 | 122.80 | 64/32/8 | 166.10 | 44.47 | 117.24 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t256_a001/node0/rank0_pid10064_call0001_1790740245338439681.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t256_a001/metadata.json>) |
+| 512 | 96/64/8 | 230.77 | 62.99 | 165.46 | 64/32/8 | 258.35 | 56.20 | 147.64 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t512_a001/node0/rank0_pid10246_call0001_1790740281433873044.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t512_a001/metadata.json>) |
+| 1024 | 256/128/8 | 422.50 | 68.58 | 180.61 | 64/32/8 | 437.17 | 66.27 | 174.51 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t1024_a001/node0/rank0_pid10846_call0001_1790740317600733704.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t1024_a001/metadata.json>) |
+| 2048 | 256/128/8 | 794.66 | 72.99 | 191.73 | 64/32/8 | 808.18 | 71.77 | 188.50 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t2048_a001/node0/rank0_pid11380_call0001_1790740369660007461.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t2048_a001/metadata.json>) |
+| 4096 | 256/128/8 | 1573.33 | 73.82 | 193.97 | 64/32/8 | 1561.13 | 74.40 | 195.48 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k6_t4096_a001/node0/rank0_pid11937_call0001_1790740405392327221.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k6_t4096_a001/metadata.json>) |
+
+### Baseline · BF16 → BF16 · topk8
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | 64/32/8 | 88.35 | 5.28 | 17.30 | 16/10/8 | 79.68 | 5.88 | 19.29 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t16_a001/node0/rank0_pid12119_call0001_1790740438239447973.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t16_a001/metadata.json>) |
+| 32 | 64/32/8 | 97.85 | 9.73 | 31.88 | 16/10/8 | 89.71 | 10.70 | 35.01 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t32_a001/node0/rank0_pid12301_call0001_1790740471640191509.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t32_a001/metadata.json>) |
+| 64 | 64/32/8 | 116.88 | 15.84 | 52.09 | 16/10/8 | 107.79 | 17.22 | 56.53 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t64_a001/node0/rank0_pid12483_call0001_1790740506672349361.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t64_a001/metadata.json>) |
+| 128 | 32/16/8 | 129.57 | 28.21 | 92.49 | 64/32/8 | 111.04 | 32.95 | 108.05 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t128_a001/node0/rank0_pid12665_call0001_1790740542608118835.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t128_a001/metadata.json>) |
+| 256 | 96/64/8 | 167.43 | 44.27 | 145.35 | 64/42/8 | 168.88 | 43.87 | 144.03 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t256_a001/node0/rank0_pid13276_call0001_1790740576905584049.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t256_a001/metadata.json>) |
+| 512 | 96/64/8 | 239.14 | 61.33 | 201.04 | 64/32/8 | 273.13 | 53.66 | 175.89 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t512_a001/node0/rank0_pid13458_call0001_1790740616591441995.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t512_a001/metadata.json>) |
+| 1024 | 256/128/8 | 428.75 | 68.45 | 224.49 | 64/32/8 | 456.06 | 64.33 | 210.96 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t1024_a001/node0/rank0_pid14026_call0001_1790740652917284339.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t1024_a001/metadata.json>) |
+| 2048 | 256/128/8 | 787.78 | 74.39 | 243.04 | 64/32/8 | 826.11 | 70.94 | 231.77 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t2048_a001/node0/rank0_pid14615_call0001_1790740689177440270.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t2048_a001/metadata.json>) |
+| 4096 | 256/128/8 | 1542.59 | 76.02 | 248.88 | 64/32/8 | 1589.04 | 73.80 | 241.62 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_bf16_to_bf16_k8_t4096_a001/node0/rank0_pid15171_call0001_1790740722268268179.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_bf16_to_bf16_k8_t4096_a001/metadata.json>) |
+
+### Baseline · FP8 E4M3 → BF16 · topk8
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | 64/32/8 | 75.54 | 3.10 | 10.15 | 16/10/8 | 79.41 | 5.87 | 19.28 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t16_a001/node0/rank0_pid15353_call0001_1790740756778443141.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t16_a001/metadata.json>) |
+| 32 | 64/32/8 | 80.79 | 5.88 | 19.25 | 16/10/8 | 89.04 | 10.59 | 34.65 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t32_a001/node0/rank0_pid15535_call0001_1790740792806438420.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t32_a001/metadata.json>) |
+| 64 | 64/32/8 | 89.51 | 10.49 | 34.47 | 16/10/8 | 107.61 | 17.30 | 56.82 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t64_a001/node0/rank0_pid15717_call0001_1790740827269213281.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t64_a001/metadata.json>) |
+| 128 | 32/16/8 | 95.83 | 19.11 | 62.66 | 64/32/8 | 111.85 | 32.73 | 107.32 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t128_a001/node0/rank0_pid15899_call0001_1790740861090440468.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t128_a001/metadata.json>) |
+| 256 | 96/64/8 | 117.96 | 31.73 | 104.19 | 64/42/8 | 169.25 | 43.68 | 143.40 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t256_a001/node0/rank0_pid16158_call0001_1790740894116187069.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t256_a001/metadata.json>) |
+| 512 | 96/64/8 | 156.45 | 46.82 | 153.48 | 64/32/8 | 275.25 | 53.17 | 174.27 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t512_a001/node0/rank0_pid16341_call0001_1790740927957432167.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t512_a001/metadata.json>) |
+| 1024 | 256/128/8 | 247.48 | 59.28 | 194.42 | 64/32/8 | 459.02 | 63.79 | 209.21 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t1024_a001/node0/rank0_pid16589_call0001_1790740961665439737.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t1024_a001/metadata.json>) |
+| 2048 | 256/128/8 | 8266.95 | 12.65 | 41.42 | 64/32/8 | 10169.08 | 15.62 | 51.07 | **异常，代表性待复核；不用于收益计算**（算术审计通过）；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t2048_a001/node0/rank0_pid16860_call0001_1790741000328436282.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t2048_a001/metadata.json>) |
+| 4096 | 256/128/8 | 872.67 | 67.25 | 220.18 | 64/32/8 | 1600.55 | 73.18 | 239.59 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_bf16_k8_t4096_a001/node0/rank0_pid17141_call0001_1790741034032447660.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_bf16_k8_t4096_a001/metadata.json>) |
+
+### Baseline · FP8 E4M3 → FP8 E4M3 · topk8
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | 64/32/8 | 91.72 | 2.59 | 8.47 | 96/64/8 | 130.95 | 1.77 | 5.81 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t16_a063/node0/rank0_pid17505_call0001_1790748537407033499.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t16_a063/metadata.json>) |
+| 32 | 64/32/8 | 93.76 | 5.02 | 16.46 | 96/64/8 | 136.44 | 3.39 | 11.07 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t32_a001/node0/rank0_pid17687_call0001_1790748572632584685.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t32_a001/metadata.json>) |
+| 64 | 64/32/8 | 100.75 | 9.53 | 31.25 | 96/64/8 | 146.63 | 6.37 | 20.95 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t64_a001/node0/rank0_pid17869_call0001_1790748606886765136.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t64_a001/metadata.json>) |
+| 128 | 32/16/8 | 104.88 | 17.57 | 57.62 | 96/64/8 | 145.31 | 12.63 | 41.40 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t128_a060/node0/rank0_pid198_call0001_1791426940715298190.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t128_a060/metadata.json>) |
+| 256 | 96/64/8 | 122.94 | 30.09 | 98.78 | 96/64/8 | 163.87 | 22.44 | 73.68 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t256_a001/node0/rank0_pid380_call0001_1791426976019868340.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t256_a001/metadata.json>) |
+| 512 | 96/64/8 | 163.66 | 44.78 | 146.79 | 96/64/8 | 213.46 | 34.31 | 112.46 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t512_a001/node0/rank0_pid562_call0001_1791427014866625822.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t512_a001/metadata.json>) |
+| 1024 | 256/128/8 | 251.81 | 58.21 | 190.91 | 96/64/8 | 369.89 | 39.58 | 129.78 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t1024_a001/node0/rank0_pid1184_call0001_1791427051378725299.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t1024_a001/metadata.json>) |
+| 2048 | 256/128/8 | 459.75 | 63.82 | 208.50 | 96/64/8 | 693.86 | 42.21 | 137.91 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t2048_a001/node0/rank0_pid1762_call0001_1791427087488733382.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t2048_a001/metadata.json>) |
+| 4096 | 256/128/8 | 880.40 | 66.72 | 218.42 | 96/64/8 | 1342.71 | 43.62 | 142.82 | 已独立审计；[样本](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917/rescan_20260930/evidence/baseline_fp8_e4m3_to_fp8_e4m3_k8_t4096_a001/node0/rank0_pid2340_call0001_1791427120800847975.json>) [meta](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/logs/baseline_fp8_e4m3_to_fp8_e4m3_k8_t4096_a001/metadata.json>) |
+
+### 有限 grid 候选（provisional）
+
+扫描已暂停：7/36个形状完成，共21/108个有效阶段。下表同步各形状当前状态；候选指标尚未汇入本表，也未写入共享配置表。
+
+### 候选 · BF16 → BF16 · topk6
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 32 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 64 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 128 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 256 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 512 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 1024 | — | — | — | — | — | — | — | — | 扫描及数值检查完成；待独立确认 |
+| 2048 | — | — | — | — | — | — | — | — | Dispatch受外部作业影响中断；等待续跑 |
+| 4096 | — | — | — | — | — | — | — | — | 待扫描 |
+
+### 候选 · BF16 → BF16 · topk8
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | — | — | — | — | — | — | — | — | 待扫描 |
+| 32 | — | — | — | — | — | — | — | — | 待扫描 |
+| 64 | — | — | — | — | — | — | — | — | 待扫描 |
+| 128 | — | — | — | — | — | — | — | — | 待扫描 |
+| 256 | — | — | — | — | — | — | — | — | 待扫描 |
+| 512 | — | — | — | — | — | — | — | — | 待扫描 |
+| 1024 | — | — | — | — | — | — | — | — | 待扫描 |
+| 2048 | — | — | — | — | — | — | — | — | 待扫描 |
+| 4096 | — | — | — | — | — | — | — | — | 待扫描 |
+
+### 候选 · FP8 E4M3 → BF16 · topk8
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | — | — | — | — | — | — | — | — | 待扫描 |
+| 32 | — | — | — | — | — | — | — | — | 待扫描 |
+| 64 | — | — | — | — | — | — | — | — | 待扫描 |
+| 128 | — | — | — | — | — | — | — | — | 待扫描 |
+| 256 | — | — | — | — | — | — | — | — | 待扫描 |
+| 512 | — | — | — | — | — | — | — | — | 待扫描 |
+| 1024 | — | — | — | — | — | — | — | — | 待扫描 |
+| 2048 | — | — | — | — | — | — | — | — | 待扫描 |
+| 4096 | — | — | — | — | — | — | — | — | 待扫描 |
+
+### 候选 · FP8 E4M3 → FP8 E4M3 · topk8
+
+| T/rank | D B/R/W | D μs | D RDMA GB/s | D xGMI GB/s | C B/R/W | C μs | C RDMA GB/s | C xGMI GB/s | 状态 / 证据 |
+|---:|:---|---:|---:|---:|:---|---:|---:|---:|:---|
+| 16 | — | — | — | — | — | — | — | — | 待扫描 |
+| 32 | — | — | — | — | — | — | — | — | 待扫描 |
+| 64 | — | — | — | — | — | — | — | — | 待扫描 |
+| 128 | — | — | — | — | — | — | — | — | 待扫描 |
+| 256 | — | — | — | — | — | — | — | — | 待扫描 |
+| 512 | — | — | — | — | — | — | — | — | 待扫描 |
+| 1024 | — | — | — | — | — | — | — | — | 待扫描 |
+| 2048 | — | — | — | — | — | — | — | — | 待扫描 |
+| 4096 | — | — | — | — | — | — | — | — | 待扫描 |
+
+### 独立 A-B-A 确认
+
+确认状态：`尚无 confirmation.json`。geometry 没有变化的 shape 标记 unchanged，不制造 gain。
+
+### 共享 phase 配置与原始证据
+
+本轮原始证据仍保存在 `/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/` 及其引用的运行归档中。以下本地证据链接使用绝对路径，不依赖当前代码工作区的位置。
+
+共享 phase row 冲突尚未裁决：逐 shape 的 Dispatch/Combine 最佳候选可能竞争同一个共享 JSON key；当前报告不把独立 shape 结果自动合并成共享表。冲突裁决和最终 row 验证由后续流程处理。
+原始样本的 receive/RDMA token counts 已做一致性与边界检查；本次样本未归档 routing indices，无法从原始路由独立重建这些计数。rank 顺序采用 harness 的 CPU all-gather 顺序。
+报告来源：[manifest.json](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/manifest.json>)；[campaign_gate_baseline.json](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/campaign_gate_baseline.json>)；[scan_state.json](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/scan_state.json>)；[audit.json](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/audit.json>)；[samples_summary.csv](</home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/samples_summary.csv>)。
+
+进度（2026-10-08）：36/36 个现有配置基线完成并通过逐样本离线复算；前30点于9月30日完成，FP8→FP8 的 T128–4096 六点于10月8日完成。续跑前双机源码、MORI 包、入口、配置表、CPU绑定、Python/Torch/HIP/ABI均与冻结记录核对一致，10月8日新增六点无竞争记录。基线是新内核配原有 geometry，不是旧内核 A/B。有限配置扫描已开始；新配置的独立 A–B–A、严格 GPU 验证与共享规则合并尚未完成。此前受竞争或容器停止影响的尝试全部排除并保留原始记录，默认 JSON 尚未更新。
+
+<!-- END EPV2 RESCAN 20260930 -->
+
 <!-- BEGIN EPV2 DEFAULT BRANCH AB 20260921 -->
 <a id="epv2-default-branch-20260921"></a>
 
