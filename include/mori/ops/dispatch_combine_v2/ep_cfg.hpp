@@ -224,7 +224,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 27,
+static_assert(detail::kEpArgsFieldCount == 28,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -547,8 +547,7 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // selfFirst: warp 1 takes this rank's own-token step while warp 0 issues
          // the remote reservations, and one lane per peer publishes what this rank
          // took there. The arrival count packs into 12 bits of the counter word.
-         (!c.selfFirst ||
-          (c.warpPerBlock >= 2 && c.worldSize <= c.waveSize && c.blockNum < 4096));
+         (!c.selfFirst || (c.warpPerBlock >= 2 && c.worldSize <= c.waveSize && c.blockNum < 4096));
 }
 
 }  // namespace v2
