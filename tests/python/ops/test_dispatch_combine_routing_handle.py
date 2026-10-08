@@ -222,6 +222,29 @@ def _replay_correctness(rank, world_size, kernel, gpu_per_node=None):
     )
     assert combine_out is not None
 
+    # Replay-mode dispatch must actually scatter the payload.
+    # Route the same grad payload through a fresh cache-routing op as the reference and
+    # compare downstream combine outputs, which are in source-token order and therefore
+    # invariant to the recv-slot assignment that differs across ops.
+    rep_grad_combine, _ = _do_combine(op, rep_disp, rank_idx, routing=R)
+    tc.sync()
+    # Reference: a fresh op on the fully independent default path (no routing handle).
+    # Default dispatch populates the op-owned routing maps, so the matching combine reads
+    # them directly -- the most bug-independent oracle for the scattered payload.
+    ref_op = mori.ops.EpDispatchCombineOp(config)
+    ref_disp, _ = _do_dispatch(ref_op, grad_test_data)
+    tc.sync()
+    ref_grad_combine, _ = _do_combine(ref_op, ref_disp, rank_idx)
+    tc.sync()
+    assert torch.allclose(
+        rep_grad_combine.float(), ref_grad_combine.float(), atol=1e-3, rtol=1e-3
+    ), (
+        f"rank {rank}: replay-dispatch payload mismatch vs cache-routing reference "
+        f"(max diff = "
+        f"{(rep_grad_combine.float() - ref_grad_combine.float()).abs().max().item()}); "
+        f"replay-mode dispatch did not scatter the payload correctly"
+    )
+
 
 def _stale_symmetric_buffer_guard(rank, world_size):
     """Verify the disp_tok_id_to_src_tok_id_local snapshot is layer-private (IntraNode only)."""
