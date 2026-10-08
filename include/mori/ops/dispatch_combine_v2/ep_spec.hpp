@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -114,6 +115,17 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
           "EpStaticStagingBudget so the module carries no .bss staging to fall back on. "
           "Allocate ep_staging_bytes(world_size, max_recv, scale_bytes) bytes and "
           "plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
+    }
+    // EpStaging*Offset are EpScaleAlign multiples OF THE BASE, so the base owns the
+    // alignment the .bss arrays used to declare themselves. A caller carving staging
+    // out of a pool at an arbitrary offset -- the reason this argument exists -- gets
+    // no fault from a misaligned one, just every staging TDM run off its row. A null
+    // base has remainder 0, so this leaves the fallback above alone.
+    if (plan.geom.sharedBytes > 0 &&
+        reinterpret_cast<uintptr_t>(static_cast<const Args*>(argBuf)->stagingBase) % EpScaleAlign) {
+      throw std::runtime_error(
+          "ep_dispatch on gfx125x: staging_base must be " + std::to_string(EpScaleAlign) +
+          " B aligned -- it is the base every staging sub-array is placed against.");
     }
     mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg>::LaunchRaw(plan, argBuf, argSize, stream);
   }
