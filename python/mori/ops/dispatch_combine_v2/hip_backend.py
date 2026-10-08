@@ -1334,6 +1334,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._self_first_state = None
         for plan in getattr(self, "_plans", ()):
             plan.close()
+        # After the plans: they carry staging_base by value, so nothing may still be
+        # able to launch when the tensor behind it goes.
+        self.dispatch_staging = None
         ext = getattr(self, "_tokoff_ext", None)
         if ext is not None:
             self._tokoff_ext = None
