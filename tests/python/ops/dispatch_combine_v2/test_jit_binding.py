@@ -240,10 +240,10 @@ def test_arena_offsets_are_launch_defaults_not_part_of_the_key():
         def offset(self, name):
             return self._base + 256 * (len(name) % 7)
 
-    # self_first=0: with it on, the plan would also want a communicator behind
+    # tok_off_ext=1: under selfFirst the plan would also want a communicator behind
     # the window (see the selfFirst tests below); this test is about offsets.
-    a = _plan(arena=FakeArena(0), self_first=0)
-    b = _plan(arena=FakeArena(4096), self_first=0)
+    a = _plan(arena=FakeArena(0), tok_off_ext=1)
+    b = _plan(arena=FakeArena(4096), tok_off_ext=1)
     assert a.info["cacheDir"] == b.info["cacheDir"], "offsets must not be in the key"
     assert a._defaults["offTokOff"] != b._defaults["offTokOff"], "offsets must be bound"
     a.close()
@@ -256,7 +256,7 @@ def test_arena_offsets_are_launch_defaults_not_part_of_the_key():
 
 
 def _self_first_or_skip():
-    p = _plan(self_first=1)
+    p = _plan()
     on = p.info["selfFirst"]
     p.close()
     if not on:
@@ -302,8 +302,8 @@ def test_self_first_needs_a_communicator_behind_the_arena_window():
     kernel against window 0."""
     _self_first_or_skip()
     with pytest.raises(RuntimeError, match="communicator"):
-        _plan(arena=_Arena(0xDEAD0000), self_first=1)
-    p = _plan(arena=_Arena(0xDEAD0000), self_first=0)
+        _plan(arena=_Arena(0xDEAD0000))
+    p = _plan(arena=_Arena(0xDEAD0000), tok_off_ext=1)
     assert p._defaults.get("sfBase", 0) == 0
     p.close()
 
@@ -320,8 +320,8 @@ def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
     monkeypatch.setattr(
         mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
     )
-    a = _plan(arena=arena, self_first=1, block_num=32, warp_per_block=4)
-    b = _plan(arena=arena, self_first=1, block_num=64, warp_per_block=4)
+    a = _plan(arena=arena, block_num=32, warp_per_block=4)
+    b = _plan(arena=arena, block_num=64, warp_per_block=4)
     assert len(comm.allocs) == 1, "one state per arena, not one per plan"
     base = comm.allocs[0].data_ptr() - _Comm.STRIDE
     assert a._defaults["sfBase"] == b._defaults["sfBase"] == base
@@ -347,15 +347,17 @@ def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monke
         mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
     )
     with pytest.raises(RuntimeError, match="does not locate"):
-        _plan(arena=arena, self_first=1)
+        _plan(arena=arena)
     assert sorted(comm.closed) == ["mem", "win"], "a failed allocation must not leak"
     assert cb.SelfFirstState.of(arena) is None
 
 
 def test_self_first_follows_the_slot_word():
-    assert cb.self_first_enabled()
+    _self_first_or_skip()
     # It only pays where the slot word is in the cco window.
-    assert not cb.self_first_enabled(slot_word_in_window=False)
+    p = _plan(tok_off_ext=1)
+    assert not p.info["selfFirst"]
+    p.close()
 
 
 def test_self_first_state_size_matches_the_device_layout():

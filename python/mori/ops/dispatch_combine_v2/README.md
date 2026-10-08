@@ -56,8 +56,9 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 
 ## gfx125x dispatch: selfFirst
 
-On wherever the slot allocator word lives in the cco window, which is the
-default. `MORI_EP_TOKOFF_EXT=1` moves the word of a single-host EP into a separate
+Always on wherever the slot allocator word lives in the cco window, which is the
+default; there is no switch for it. `MORI_EP_TOKOFF_EXT=1` (default off) moves the
+word of a single-host EP into a separate
 allocation (`TokOffExt` in `hip_backend.py`), where the local RMW costs nothing, and
 there the original protocol runs; an EP spanning hosts always keeps the word in the
 window, since its ranks cannot open each other's hipIpc handles.
