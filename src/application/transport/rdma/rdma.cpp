@@ -524,6 +524,34 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
     *offset = off;
     return fd;
   }
+  // VMM memory (hipMemCreate + hipMemMap): hipMemGetHandleForAddressRange keeps
+  // a reference to the backing allocation after the fd is closed, so the memory
+  // is never freed when its owner unmaps and releases it (e.g. vLLM sleep mode).
+  // Exporting the allocation handle does not; it needs the allocation to have
+  // been created with the POSIX fd handle type, otherwise fall through.
+  hipMemGenericAllocationHandle_t handle;
+  if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
+    // On ROCm (verified 7.2.3) the retained handle is the owner's handle and
+    // does not add a reference, so it must not be released here: that would
+    // drop the owner's reference and its own hipMemRelease would then fail.
+    hipError_t exportErr =
+        hipMemExportToShareableHandle(&fd, handle, hipMemHandleTypePosixFileDescriptor, 0);
+    if (exportErr == hipSuccess && fd >= 0) {
+      hipDeviceptr_t base = 0;
+      size_t rangeSize = 0;
+      if (hipMemGetAddressRange(&base, &rangeSize, reinterpret_cast<hipDeviceptr_t>(ptr)) ==
+              hipSuccess &&
+          base != 0) {
+        *offset = reinterpret_cast<uint64_t>(ptr) - reinterpret_cast<uint64_t>(base);
+      } else {
+        (void)hipGetLastError();
+        *offset = 0;
+      }
+      return fd;
+    }
+  }
+  (void)hipGetLastError();
+  fd = -1;
   hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
                                                   hipMemRangeHandleTypeDmaBufFd, 0);
   if (err != hipSuccess) {
