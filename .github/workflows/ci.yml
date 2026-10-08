@@ -33,7 +33,7 @@ jobs:
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
           - platform: MI300X_MLX
             runner: [self-hosted, 300_mlx_p19_29]
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - name: Fix workspace permissions
         run: |
@@ -70,7 +70,8 @@ jobs:
           rm -rf $LOG_DIR
 
       # Each group runs even if an earlier one failed, so one broken kernel does
-      # not hide the state of the others. Push runs use S = 1 << logS = 4 slices.
+      # not hide the state of the others. Default push coverage is S = 4
+      # (logS = 2) over f32/bf16/f16, sum/prod, 1M-128M plus EXTRA_SIZES.
       - name: reduce_scatter push (S=4)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: $CT exec -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode push --logS 2
@@ -86,6 +87,31 @@ jobs:
       - name: all_reduce pull
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: $CT exec -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode pull
+
+      # Extra push coverage: S = 1,2,4,8 (logS 0..3), bf16/f32 sum, 16M-512M elems.
+      - name: reduce_scatter push (S=1,2,4,8; 16M-512M)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          fail=0
+          for logS in 0 1 2 3; do
+            $CT exec -e DTYPES="f32 bf16" -e OPS=sum \
+              -e MIN_SIZE=16777216 -e MAX_SIZE=536870912 \
+              -e RUN_TIMEOUT=180 \
+              $CONTAINER bash $BENCH --coll reduce_scatter --mode push --logS $logS || fail=1
+          done
+          exit $fail
+
+      - name: all_reduce push (S=1,2,4,8; 16M-512M)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          fail=0
+          for logS in 0 1 2 3; do
+            $CT exec -e DTYPES="f32 bf16" -e OPS=sum \
+              -e MIN_SIZE=16777216 -e MAX_SIZE=536870912 \
+              -e RUN_TIMEOUT=180 \
+              $CONTAINER bash $BENCH --coll all_reduce --mode push --logS $logS || fail=1
+          done
+          exit $fail
 
       - name: all_gather
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
