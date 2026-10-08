@@ -2,6 +2,160 @@
 
 本文按两个OP记录本次尝试、效果和是否采用；**带宽、延迟及前后对照统一放在 [bw.md](bw.md)**。
 
+<!-- BEGIN EPV2 HANDOFF 20261008 -->
+## 运行进度与换机交接（2026-10-08 06:43 UTC）
+
+**已按用户要求停止扫描。** 控制器已退出，未完成的 trial 保留为 interrupted，不计入有效数据。g17 临时暂停的 MORI CI listener 已恢复；其守护进程和 g09 竞争任务守护均已退出。两机 benchmark 容器保留，方便继续使用。此次只更新交接文档，没有采用新的最优配置或更新默认 JSON。
+
+### 停止时的准确进度
+
+- 数值门槛：12/12；新口径原配置 baseline：36/36，逐样本离线复算通过。数值门槛不等于最终严格正确性验收。
+- 全量扫描：**22/36 个完整形状，67/108 个有效阶段**。每个形状包含 Dispatch 扫描、Combine 扫描和该轮检查三个阶段。
+- 停在 **FP8 E4M3 → BF16 / K8 / T256 的 Combine**。该形状 Dispatch 已通过；Combine a001 被用户停止，续跑时重新完成 Combine，然后检查，不能采用这次中断的数据。
+- 尚未执行完整 shortlist 筛选、独立三组 A0/B/A1 确认、共享配置合并及全36 fresh metric + 全36 strict 验收。**目前没有本轮已确认的新最优配置。**
+
+| 组合（总专家数256） | 已完整扫完的 tokens | 剩余 |
+|---|---|---|
+| BF16 → BF16，TopK 6 | 16、32、64、128、256、512、1024、2048、4096 | 无 |
+| BF16 → BF16，TopK 8 | 16、32、64、128、256、512、1024、2048、4096 | 无 |
+| FP8 E4M3 → BF16，TopK 8 | 16、32、64、128 | T256 Combine/检查；T512–4096 全流程 |
+| FP8 E4M3 → FP8 E4M3，TopK 8 | 无 | T16–4096 全流程 |
+
+冻结条件：commit `33ae5bf9a49df66a966523a10a7ae2f41684017b`，MI355X/gfx950，g17+g09、EP16、H7168、experts/rank16、QP2、Ionic、CCQE关闭、uniform routing。所有 token 档均显式 `--kernel-type v2`，不是 auto/v2_ll。T16/T32 的 capacity 为64，其余 capacity=T。性能阶段 Combine weights=None；baseline/search 为3×30、warmup20、drop1，每阶段1392个保留样本；确认/final为3×100、每阶段4752个样本。D+C 不含 dtype 转换，主带宽是逐样本平均的 RDMA 算法 payload GB/s。
+
+FP8→BF16/K8/T2048 的异常原基线已另做一次固定原配置刷新：D **457.90 µs / 64.08 RDMA GB/s**，C **834.10 µs / 70.24 RDMA GB/s**，4752样本/阶段。原异常值 D8266.95/C10169.08 µs 保留，不能用它计算优化收益。刷新只更新描述性 baseline，不是新配置收益确认。
+
+### 目录、机器与证据
+
+| 用途 | 实际位置 |
+|---|---|
+| 用户查看/提交 PR 的仓库 | `/var/zqz/mori`，分支 `dev/analyze_v1` |
+| 扫描控制脚本、状态、日志 | `/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930` |
+| 共享实验归档（宿主机） | `/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917` |
+| 本轮 runtime（宿主机） | 上述归档下的 `rescan_20260930/` |
+| 容器内实验根目录 | `/experiment/rescan_20260930` |
+| 本轮实际冻结源码 | `/experiment/rescan_20260930/source` |
+| 容器本地运行包 / JIT cache | `/opt/mori-20260930/pkg` / `/opt/mori-20260930/jit-cache` |
+| 两机与 node rank | g17=`pit2-p03-g17`/`10.19.0.117`/node0；g09=`pit2-p03-g09`/`10.19.0.109`/node1 |
+| 两机容器名 | `mori_epv2_recheck_0917` |
+
+控制目录中的直接入口：
+
+- [scan_state.json](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/scan_state.json)：逐项进度、每次 attempt、metadata 路径及 SHA；[pipeline_state.json](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/pipeline_state.json)：控制器阶段状态。
+- [最后一轮队列日志](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/pipeline_logs/scans_a015.log)；每次 trial 的 `logs/<tag>/metadata.json`、`node0.log`、`node1.log`；共享 runtime 下的 `evidence/`、`scan_tables/`、`scan_table_history/`。
+- [冻结的36格 baseline audit](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/baseline_audit_20261008.json)；[成功的异常点刷新](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/baseline_refresh_fp8_to_bf16_k8_t2048_after_preflight_20261008.json)。最终报告使用这份冻结 baseline audit，不能改用后续累计的 `audit.json`。
+- [完整后续命令](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/post_scan_handoff_commands_20261008.md)：扫完108个有效阶段并完成 audit 后，依次执行 shortlist、独立确认、共享表选择、merged validation 和最终报告。
+- [停止及清理核验](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/user_stop_verified_20261008.json)；[CI恢复记录](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/ci_listener_resume_user_stop_20261008.json)；[CPU绑核清理核对](/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930/cpu_isolation_restoration_inventory_20261008_final.json)。此前修改过的131个临时容器已全部删除，无残留绑核需要恢复；当前 observer index 为 `{"schema":1,"hosts":{}}`，两机均使用严格竞争检查。
+
+`bw.md` 保留基线和历史数据，其中旧的7/36进度尚未同步；**当前停止进度以本节和 scan_state.json 为准**。控制脚本、原始大样本不加入 PR，换机时需要保留上述归档目录；只带走仓库无法恢复这些实验状态。
+
+### 原 g17/g09：启动已有容器与续跑
+
+以下是操作方法，本次停止后没有自动执行续跑。容器目前保留；若已停止，在登录机执行：
+
+```bash
+mori_ssh=(ssh -F /dev/null
+  -i /home/qizhou.zhang@amd.com/.ssh/cluster_id_ed25519
+  -o UserKnownHostsFile=/home/qizhou.zhang@amd.com/.ssh/known_hosts
+  -o BatchMode=yes -o ConnectTimeout=10 -l qizhou.zhang@amd.com)
+for mori_host in pit2-p03-g17 pit2-p03-g09; do
+  "${mori_ssh[@]}" "$mori_host" 'docker start mori_epv2_recheck_0917'
+done
+```
+
+在 **g17 宿主机**，确认两机没有竞争任务后，使用原控制目录续跑；锁和身份校验会阻止重复启动或冻结输入漂移：
+
+```bash
+cd /home/qizhou.zhang@amd.com/mori_epv2_recheck_20260930
+# 只查看计划，不启动 GPU：
+taskset -c 4-7 python3 -B continue_after_baseline.py --resume --stop-after audit_after_scans --dry-run
+# 真正续跑；仅在决定继续时执行：
+taskset -c 4-7 python3 -B continue_after_baseline.py --resume --stop-after audit_after_scans
+```
+
+该命令跳过已有67个有效阶段，从中断的 T256 Combine 继续；不要删除 state/lock/evidence，也不要启动第二个队列。若需停止，在前台 Ctrl-C，让 controller/runner 清理带本次 run ID 的进程。不要用宽泛的 `pkill python` 或删除容器代替清理。
+
+### 新机器：容器创建模板
+
+以下还原自两机实际 inspect。基镜像为 `rocm/mori:ci`，已核实的 image ID 为 `sha256:dbc63edd7fd1dfa879aec8b460b3430fe22fb9e578614ea24800bf7936c0d055`。现有容器使用 root、host network/IPC、`sleep infinity`，未启用 privileged。新机先准备同一镜像和共享归档；不要依赖可变的 `:ci` tag 恰好仍指向该版本。镜像不在新机时，可先在旧机 `docker save` 此 image ID，再在新机 `docker load`。
+
+```bash
+mori_image=sha256:dbc63edd7fd1dfa879aec8b460b3430fe22fb9e578614ea24800bf7936c0d055
+mori_workspace=/var/zqz/mori
+mori_archive=/home/qizhou.zhang@amd.com/mori_epv2_recheck_20260917
+
+docker image inspect "$mori_image" --format '{{.Id}}'
+docker run -d --name mori_epv2_recheck_0917 \
+  --network host --ipc host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add video --security-opt label=disable \
+  --ulimit nproc=100000:100000 \
+  --mount "type=bind,src=$mori_workspace,dst=/workspace/mori,readonly" \
+  --mount "type=bind,src=$mori_archive,dst=/experiment" \
+  --mount type=bind,src=/usr/lib/x86_64-linux-gnu/libibverbs.so.1.14.39.0,dst=/lib/x86_64-linux-gnu/libibverbs.so.1 \
+  --mount type=bind,src=/usr/lib/x86_64-linux-gnu/libionic.so.1.1.54.0-187,dst=/usr/lib/x86_64-linux-gnu/libionic.so.1.1.54.0-187 \
+  --mount type=bind,src=/usr/lib/x86_64-linux-gnu/libionic.so,dst=/usr/lib/x86_64-linux-gnu/libionic.so \
+  --mount type=bind,src=/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so,dst=/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so \
+  --mount type=bind,src=/etc/libibverbs.d,dst=/etc/libibverbs.d,readonly \
+  -e MORI_RDMA_DEVICES=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7 \
+  -e MORI_RDMA_SL=3 -e MORI_RDMA_TC=104 \
+  -e MORI_SOCKET_IFNAME=eno1 -e GLOO_SOCKET_IFNAME=eno1 \
+  -w /experiment "$mori_image" sleep infinity
+```
+
+Ionic/ibverbs 库路径和版本必须按新机实际安装情况核实；设备、驱动或 NIC 类型不同，不能直接套用这组挂载。`/workspace/mori` 只是只读工作区；本次实际源码位于 `/experiment/rescan_20260930/source`。
+
+### 新容器：恢复运行包和实际 benchmark 环境
+
+**`/opt/mori-20260930` 在容器可写层，不是宿主机 bind mount。只用上述镜像创建容器不会恢复这份包。** 冻结 wheel 在共享归档 `rescan_20260930/wheels/amd_mori-0.1.0-cp312-cp312-linux_x86_64.whl`，SHA256 为 `cedc72ea35f1789ae358a67b219ffda76b7d88a6af138ba0d3416c5aa7e006ad`。仅对 package 目录不存在的新容器执行：
+
+```bash
+docker exec -i mori_epv2_recheck_0917 python3 - <<'PY_RUNTIME'
+from pathlib import Path
+import hashlib, zipfile
+wheel = Path('/experiment/rescan_20260930/wheels/amd_mori-0.1.0-cp312-cp312-linux_x86_64.whl')
+assert hashlib.sha256(wheel.read_bytes()).hexdigest() == 'cedc72ea35f1789ae358a67b219ffda76b7d88a6af138ba0d3416c5aa7e006ad'
+pkg = Path('/opt/mori-20260930/pkg')
+assert not pkg.exists(), '已有 package，先核对身份，不覆盖'
+pkg.mkdir(parents=True)
+with zipfile.ZipFile(wheel) as archive:
+    archive.extractall(pkg)
+Path('/opt/mori-20260930/jit-cache').mkdir(exist_ok=True)
+print('Package extracted; validate source/runtime/ABI before GPU tests.')
+PY_RUNTIME
+```
+
+旧 runtime 已审计为 Python3.12.3、Torch `2.12.0+rocm7.14.0`、HIP `7.14.60850`、CXX11 ABI=true。新机重新核对源码/包/表/入口及 ABI；空 JIT cache 需要重新编译、预热和验证。不要原样重跑旧 `deploy_pkg.py` 覆盖共享的 `deployment_node0.json` / `deployment_node1.json`，新机校验记录写入新实验目录。
+
+本轮 `run_trial.py` 每次通过 `docker exec` 注入下列环境；**容器默认网卡是 eno1，正式测试覆盖为 eno0**。手工排查时可在容器 shell 中设置，正式扫描仍交给 runner 管理：
+
+```bash
+export PATH=/opt/venv/bin:$PATH
+export PYTHONPATH=/opt/mori-20260930/pkg
+export MORI_SOURCE_ROOT=/experiment/rescan_20260930/source
+export MORI_JIT_CACHE_DIR=/opt/mori-20260930/jit-cache
+export MORI_RESCAN_AFFINITY_DIR=/experiment/rescan_20260930/affinity
+export MORI_GPU_ARCHS=gfx950 MORI_JIT_ARCH=gfx950 MORI_DEVICE_NIC=ionic
+export MORI_SKIP_PRECOMPILE=1 MORI_DISABLE_IONIC_CCQE=1
+export MORI_SHMEM_HEAP_SIZE=16G OMP_NUM_THREADS=1 GPU_PER_NODE=8
+export MORI_SOCKET_IFNAME=eno0 GLOO_SOCKET_IFNAME=eno0
+export MORI_RDMA_DEVICES=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+export MORI_RDMA_SL=3 MORI_RDMA_TC=104
+export MORI_APP_LOG_LEVEL=warn PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+export MORI_JIT_EXTRA_FLAGS=-ffile-prefix-map=/experiment/rescan_20260930/source=/mori-rescan
+unset MORI_EP_TUNING_CONFIG MORI_EP_DISP_GEOM MORI_EP_COMB_GEOM MORI_EP_ROUND_SERIES
+```
+
+`MORI_EP_V2_TUNING_DIR` 由每次 trial 指向对应的两阶段表；不能统一指向空目录。旧双机每 GPU 的 CPU mask 是 `0–3、16–19、32–35、48–51、64–67、80–83、96–99、112–115`，新机器须按 PCI/NUMA 重新生成 affinity。
+
+### 换登录机与换测试节点的区别
+
+只换登录/开发机器、仍在 g17/g09 测试：保留共享目录，登录 g17 后按上面的原队列命令续跑即可。
+
+替换 g17/g09 任一 GPU 节点：在**新的实验/证据目录**建立新 campaign，调整 HOSTS、SSH、master IP（旧值10.19.0.117）、socket/RDMA接口、设备与驱动挂载、NUMA/affinity，并重新跑正确性和同机 baseline。旧 observer/隔离记录绑定旧主机，不能作为新机核验结果；不能修改旧 manifest 后直接 `--resume`，也不能把新机器测量混入旧的 A0/B/A1 配对。保留本节67个有效阶段供参考，待新机独立确认后再决定采用。
+
+<!-- END EPV2 HANDOFF 20261008 -->
+
 ## 测试方法更新（2026-09-30）
 
 本节记录当前工作区对 V2 调优结果入表方法的修改，适用于 [test_dispatch_combine_v2_internode.py](tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py) 的 `--cmd tuning --tuning-save` 路径。最终指标由 `_row_metrics()` 采样、[_grand_mean_metrics.py](tests/python/ops/dispatch_combine_v2/_grand_mean_metrics.py) 汇总，与 V1 的 grand mean 口径对齐；**搜索选优与最终入表测量仍是两个独立步骤**。下文9月的既有实验保留当时冻结版本、配置和统计口径，不按本节的新定义改写旧数值。
@@ -51,13 +205,13 @@ Dispatch 的 `width[r]` 来自输入张量的 `shape[-1] * element_size()`；Com
 
 ### MI355X 复测与专家组合
 
-MI355X 的旧 JSON 指标尚未用本次方法重测。例如普通 V2 Dispatch 的 BF16/H7168/T128/K6/epr16 行，`bandwidth_gbps=84.57`、`avg_rdma_bandwidth_gbps=30.58`；前者符合旧的 rank 0 接收字节数除以延迟，而不是新定义的 RDMA 主指标。即便旧行已经标注 `grand_mean`，也不能据此认定与本节可比。
+MI355X 默认 JSON 仍保留本次重测前的指标，尚未回填新数据。下面是旧表的历史示例：普通 V2 Dispatch 的 BF16/H7168/T128/K6/epr16 行，`bandwidth_gbps=84.57`、`avg_rdma_bandwidth_gbps=30.58`；前者符合旧的 rank 0 接收字节数除以延迟，而不是新定义的 RDMA 主指标。即便旧行已经标注 `grand_mean`，也不能据此认定与本节可比。
 
 另外，当前 [ep_internode_kernel.hpp](src/ops/dispatch_combine_v2/ep_internode_kernel.hpp) 对普通 V2/V2LL Combine 增加了生产者同步与发布顺序修复，LL 还增加了等待最终 node count 的逻辑；这些修改也覆盖 gfx950。应使用新内核先跑正确性，再刷新现有配置的性能指标，并对代表形状做配对复核。统计口径变化本身不要求从零全量搜索；出现显著回退或候选优势变化时，再重扫受影响项。此前数值验收不代替新内核的 MI355X 硬件回归。
 
 V2 当前要求 `topk`、`experts_per_rank` 显式精确匹配，不再把缺字段规则当 wildcard；下文保留 wildcard 的描述仅是历史记录。EP16 下，总专家数为 `16 * experts_per_rank`：256/8 对应 `--experts-per-rank 16 --topk 8`，384/6 对应 `--experts-per-rank 24 --topk 6`。现有 MI355X Top-k 6 表记录的是256/6，不能作为384/6的实测结果；未覆盖的组合使用默认 geometry，须独立补调优后才能落表。
 
-**本次仅记录方法变更，未执行新的 MI355X GPU 复测，也未据此更新旧表的性能数值。** 后续新旧对照、复测结论及证据入口仍统一追加到 [bw.md](bw.md)。
+**2026-10-08 MI355X 复测已完成12/12个数值门槛和36/36个新口径原配置 baseline；按用户要求于06:43 UTC停止。** 全量扫描保留22/36个完整形状、67/108个有效阶段，具体停止点、证据、容器及换机方法见本文顶部“运行进度与换机交接”。尚无独立确认的新最优配置，默认JSON未更新。FP8→BF16/K8/T2048的固定原配置刷新已完成，原异常数据保留；不能据此计算优化收益。完整原始baseline与历史数据见 [bw.md](bw.md#epv2-rescan-20260930)。
 
 ## 实现与复测快照（2026-09-22 整理）
 
