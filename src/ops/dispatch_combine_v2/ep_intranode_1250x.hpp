@@ -230,6 +230,44 @@ constexpr int kMetaFields = 3;  // idx, weights, srcmap
 static_assert(EpScaleAlign % kTdmRowBytes == 0,
               "the scale staging base must sit on a TDM row for the metadata tile to reach it");
 
+// Staging lives in the caller's buffer (EpArgs::stagingBase) by default. Under
+// MORI_EP_STATIC_STAGING (EpStaticStaging(), ep_spec.cpp) the module ALSO carries the
+// original .bss arrays and a launch picks between the two layouts on whether that
+// pointer is null -- same protocol, same indexing, only the memory differs.
+//
+// Gated rather than always present because .bss is reserved per COMPILED VARIANT, not
+// per op: a three-entry (block, warp) dispatch schedule pays for it three times. The
+// scale array dominates and is quadratic in world_size -- kEpScaleSlots is
+// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank -- so at the
+// 256 B stride a 224 B row (hidden 7168) pads up to:
+//     EP4  maxTok 16384  ->   64 MiB      EP8  maxTok  8192  ->  128 MiB
+//     EP8  maxTok 16384  ->  256 MiB      (times the schedule: ~672 MiB)
+// The per-peer stride has to be the peer's full recv capacity so the destination slot
+// id indexes it directly, which is also what lets the existing `ab + cc > recvCapM`
+// guard cover the array. Making it world_size-independent, like the idx/wt pools,
+// needs block-local slot indexing -- a bigger change than it looks, and one where the
+// guard would start dropping tokens rather than merely skipping transfers.
+#if defined(MORI_EP_STATIC_STAGING) && MORI_EP_STATIC_STAGING
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx_dev[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
+alignas(kTdmRowBytes) __device__ float _cusplit_stgWt_dev[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc_dev[CUSPLIT_POOL_SLOTS];
+__device__ index_t _cusplit_blkBase_dev[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
+__device__ index_t _cusplit_blkCount_dev[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
+// Fail at compile time rather than at the first launch on a big EP; the dynamic
+// layout has no such ceiling, so unsetting the flag is the way out.
+static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (size_t)1 << 30,
+              "EP scale staging exceeds 1 GiB per compiled variant -- unset "
+              "MORI_EP_STATIC_STAGING, or re-index it block-locally before going wider");
+constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
+__device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale_dev[kEpScaleStgBytes];
+// The base is a kernel argument, so the select is wave-uniform and folds to a scalar
+// cmov hoisted out of every loop that follows.
+#define MORI_EP_STG_PICK(dyn, dev) (_stgBase != nullptr ? (dyn) : (dev))
+#else
+// The `dev` token never reaches the compiler, so the arrays need no declaration here.
+#define MORI_EP_STG_PICK(dyn, dev) (dyn)
+#endif
+
 // The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
 // moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
 // memory the ranks share by IPC handle, and binds args.tokOffPeers; otherwise it is
@@ -330,24 +368,34 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
 
-  // Staging pointers from the dynamically-allocated base.  The EpStaging*Offset
-  // functions are constexpr on kCfg, so each is base + compile-time constant.
-  //
-  // EpDispatchSpec::LaunchRaw rejects a null base on the host, but it only shadows
-  // the base LaunchRaw -- a C++ caller reaching KernelSpec::Launch names the base
-  // one and slips past. Assert rather than dereference: the fault would otherwise
-  // land at null + a staging sub-offset, which names neither the argument nor the
-  // caller that left it unbound.
-  assert(args.stagingBase != nullptr &&
-         "ep_dispatch: stagingBase is null -- bind staging_base (EpStagingTotalBytes)");
+  // Staging pointers. The EpStaging*Offset functions are constexpr on kCfg, so each
+  // dynamic one is base + a compile-time constant; MORI_EP_STG_PICK falls back to the
+  // .bss array of the same shape when the module was rendered with
+  // MORI_EP_STATIC_STAGING and this launch left the base null.
   char* _stgBase = static_cast<char*>(args.stagingBase);
-  index_t* _cusplit_stgIdx = reinterpret_cast<index_t*>(_stgBase + EpStagingIdxOffset(kCfg));
-  float* _cusplit_stgWt = reinterpret_cast<float*>(_stgBase + EpStagingWtOffset(kCfg));
-  index_t* _cusplit_stgSrc = reinterpret_cast<index_t*>(_stgBase + EpStagingSrcOffset(kCfg));
-  index_t* _cusplit_blkBase = reinterpret_cast<index_t*>(_stgBase + EpStagingBlkBaseOffset(kCfg));
-  index_t* _cusplit_blkCount = reinterpret_cast<index_t*>(_stgBase + EpStagingBlkCountOffset(kCfg));
+#if !(defined(MORI_EP_STATIC_STAGING) && MORI_EP_STATIC_STAGING)
+  // Without the .bss arrays there is nothing to fall back to. EpDispatchSpec::LaunchRaw
+  // rejects a null base on the host, but it only shadows the base LaunchRaw -- a C++
+  // caller reaching KernelSpec::Launch names the base one and slips past. Assert rather
+  // than dereference: the fault would otherwise land at null + a staging sub-offset,
+  // which names neither the argument nor the caller that left it unbound.
+  assert(args.stagingBase != nullptr &&
+         "ep_dispatch: stagingBase is null -- bind staging_base (EpStagingTotalBytes), "
+         "or build with MORI_EP_STATIC_STAGING=1 to use the .bss staging");
+#endif
+  index_t* _cusplit_stgIdx = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingIdxOffset(kCfg)), _cusplit_stgIdx_dev);
+  float* _cusplit_stgWt = MORI_EP_STG_PICK(
+      reinterpret_cast<float*>(_stgBase + EpStagingWtOffset(kCfg)), _cusplit_stgWt_dev);
+  index_t* _cusplit_stgSrc = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingSrcOffset(kCfg)), _cusplit_stgSrc_dev);
+  index_t* _cusplit_blkBase = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingBlkBaseOffset(kCfg)), _cusplit_blkBase_dev);
+  index_t* _cusplit_blkCount = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingBlkCountOffset(kCfg)), _cusplit_blkCount_dev);
   unsigned char* _cusplit_stgScale =
-      reinterpret_cast<unsigned char*>(_stgBase + EpStagingScaleOffset(kCfg));
+      MORI_EP_STG_PICK(reinterpret_cast<unsigned char*>(_stgBase + EpStagingScaleOffset(kCfg)),
+                       _cusplit_stgScale_dev);
 
   constexpr int WS = kCfg.waveSize;
   const int thdId = threadIdx.x;

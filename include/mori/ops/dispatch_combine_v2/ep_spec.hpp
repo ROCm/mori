@@ -87,6 +87,17 @@ enum class EpKernelKind { Dispatch, Combine };
 
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind);
 
+// MORI_EP_STATIC_STAGING=1: compile the gfx125x dispatch staging into the module's
+// .bss as well as reading it from EpArgs::stagingBase, and let each launch pick on
+// whether that pointer is null. Off (the default) renders the dynamic layout alone,
+// because the .bss copy is one PER COMPILED VARIANT and its scale array grows as
+// world_size^2 * maxTokPerRank -- the reason the buffer became dynamic.
+//
+// Read once per process. The flag reaches the device only as a #define in the
+// rendered text, so it is already part of that text's sha256 cache key and flipping
+// it cannot hand back the other setting's module.
+bool EpStaticStaging();
+
 // ---------------------------------------------------------------------------
 // The two Specs. Same Cfg, same Args, different body and different geometry.
 // ---------------------------------------------------------------------------
@@ -103,8 +114,13 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
   // device. Only the gfx125x body reads stagingBase, and it is the only body with
   // an LDS budget -- sharedBytes is that same EpArchIs1250() decision, taken once
   // at Prepare and carried on the plan, so no second arch query is needed here.
+  //
+  // Under EpStaticStaging() a null base is the documented way to ask for the .bss
+  // arrays, so there is nothing to reject: the module rendered under the same flag
+  // has them.
   static void LaunchRaw(const Plan& plan, const void* argBuf, size_t argSize, hipStream_t stream) {
-    if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase) {
+    if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase &&
+        !EpStaticStaging()) {
       throw std::runtime_error(
           "ep_dispatch on gfx125x: staging_base was not bound. Allocate "
           "ep_staging_bytes(world_size, max_recv, scale_bytes) bytes and "

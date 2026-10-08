@@ -25,6 +25,7 @@
 
 #include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -177,8 +178,13 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
+  // Same reason as scaleDefs: the .bss arrays are at file scope in the header, which
+  // the TU reaches before kCfg exists. Emitted only when on, so an off TU is
+  // byte-identical to one built before this existed -- same text, same cache entry.
+  std::string stagingDef;
+  if (is1250 && EpStaticStaging()) stagingDef = "#define MORI_EP_STATIC_STAGING 1\n";
   return std::string("// mori jit v2 — generated, do not edit.\n") + worldDef + scaleDefs +
-         "#include \"" + header +
+         stagingDef + "#include \"" + header +
          "\"\n"
          "using namespace mori::ops::v2;\n"
          "constexpr EpCfg kCfg = " +
@@ -198,6 +204,24 @@ const std::vector<std::string>& EpSourceDeps() {
 }
 
 }  // namespace
+
+// The accepted spellings must match ep_static_staging() in hip_backend.py exactly: that
+// side decides whether to allocate, this side whether the module has arrays to fall back
+// to, and a value only one of them reads as "on" leaves a null base with no .bss behind
+// it.
+bool EpStaticStaging() {
+  static const bool kOn = [] {
+    const char* v = std::getenv("MORI_EP_STATIC_STAGING");
+    if (!v) return false;
+    std::string s(v);
+    size_t b = s.find_first_not_of(" \t\n\r");
+    if (b == std::string::npos) return false;
+    s = s.substr(b, s.find_last_not_of(" \t\n\r") - b + 1);
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+  }();
+  return kOn;
+}
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
