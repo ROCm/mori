@@ -127,6 +127,9 @@ _DISPATCH_TABLE: dict = {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
             "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
+        (4, 7168, 9, None): {
+            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+        },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
         # past 1024 tokens 64x16 gives some warps a second token, and its metadata split
@@ -173,6 +176,7 @@ _COMBINE_TABLE: dict = {
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
+        (4, 7168, 9, None): ((None, 64, 8),),
         # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
     },
@@ -185,6 +189,13 @@ _COMBINE_FP4_TABLE: dict = {
             # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
             # behind (+0.7 at 1792, +4.0 at 1536, +8.1 at 1024).
             (4, 7168, 6, None): (
+                (256, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+            (4, 7168, 9, None): (
                 (256, 64, 8),
                 (2047, 64, 16),
                 (2048, 64, 24),

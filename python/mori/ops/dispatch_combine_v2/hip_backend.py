@@ -361,8 +361,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
-        # Decided before the kernels are built: the dispatch plans' selfFirst default
-        # follows where the slot allocator word lives (see TokOffExt below).
+        # Decided before the kernels are built: the dispatch plans run selfFirst only
+        # while the slot allocator word lives in the cco window (see TokOffExt below).
         self._tokoff_wanted = (
             not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
         )
@@ -1256,16 +1256,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
         self._plans = []
-        # selfFirst saves the RMW a rank makes on its own slot word, which only costs
-        # anything when the word is in the cco window.
-        self_first = int(
-            cb.self_first_enabled(
-                slot_word_in_window=not getattr(self, "_tokoff_wanted", False)
-            )
-        )
+        ext = int(getattr(self, "_tokoff_wanted", False))
         for b, w in self._dispatch_specs:
             plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w, self_first=self_first
+                **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
             )
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)

@@ -79,7 +79,7 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   const bool isDispatch = kind == EpKernelKind::Dispatch;
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
-  c.selfFirst = isDispatch && req.selfFirst && arch.rfind("gfx125", 0) == 0;
+  c.selfFirst = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 

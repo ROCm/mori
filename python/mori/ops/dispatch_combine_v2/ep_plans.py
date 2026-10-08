@@ -110,7 +110,7 @@ class SelfFirstState:
                 raise RuntimeError(
                     "selfFirst dispatch: the arena's window was not registered through "
                     "mori.cco, so there is no communicator to allocate the selfFirst "
-                    "state on (or pass self_first=0)"
+                    "state on"
                 )
             st = cls(comm, self_first_state_bytes(world_size), key)
             cls._by_window[key] = st
@@ -167,29 +167,16 @@ class SelfFirstState:
         mem.close()
 
 
-def self_first_enabled(slot_word_in_window: bool = True) -> bool:
-    """selfFirst wherever the slot allocator word lives in the cco window, the default.
-
-    selfFirst saves the RMW each rank makes on its own slot word, which costs
-    microseconds when the word is in the cco window on memory mapped MTYPE_RW. In
-    TokOffExt's separate allocation (hip backend, single host, MORI_EP_TOKOFF_EXT=1)
-    that local atomic costs nothing and the per-call publish is pure overhead.
-    """
-    return slot_word_in_window
-
-
 class EpDispatchPlan(_EpDispatchPlanBase):
-    # The generated signature stays the documentation; this only adds the default.
+    # The generated signature stays the documentation; this only adds the binding.
     __doc__ = (_EpDispatchPlanBase.__doc__ or "") + (
-        "\n\n``self_first`` defaults to on. When the resolved Cfg"
-        "\nhas it (gfx125x dispatch) and an arena is given, the plan binds the arena's"
-        "\nSelfFirstState, allocating it on first use; an arena whose window mori.cco"
-        "\ncannot trace to a communicator makes construction raise."
+        "\n\nThe gfx125x dispatch runs selfFirst unless ``tok_off_ext`` says the slot"
+        "\nallocator word lives outside the cco window. With it and an arena, the plan"
+        "\nbinds the arena's SelfFirstState, allocating it on first use; an arena whose"
+        "\nwindow mori.cco cannot trace to a communicator makes construction raise."
     )
 
     def __init__(self, **kwargs):
-        if "self_first" not in kwargs and "selfFirst" not in kwargs:
-            kwargs["self_first"] = int(self_first_enabled())
         arena = kwargs.get("arena")
         self._self_first_state = None
         super().__init__(**kwargs)
