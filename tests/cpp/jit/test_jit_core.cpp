@@ -75,7 +75,17 @@ TEST(FieldCount, NestedCountsAsOne) { EXPECT_EQ(FieldCount<Nested>(), 3u); }
 
 // The Cfg's own count: if this ever disagrees with VisitFields(EpCfg), a field is
 // silently missing from the rendered text -- a wrong kernel, not a stale one.
-TEST(FieldCount, MatchesEpCfg) { EXPECT_EQ(FieldCount<EpCfg>(), 12u); }
+TEST(FieldCount, MatchesEpCfg) {
+  // Counted, not written down. A literal here is a third number next to the two
+  // that matter, and it goes stale on every added field -- which is how this
+  // assertion came to report its own staleness instead of the invariant. The two
+  // real sources are independent: FieldCount probes the struct, VisitFields walks
+  // the hand-written MORI_FIELD list and calls the visitor once per entry.
+  size_t walked = 0;
+  EpCfg c;
+  VisitFields(c, EpCfg{}, [&](const char*, auto&, auto&) { ++walked; });
+  EXPECT_EQ(FieldCount<EpCfg>(), walked);
+}
 #endif
 
 // --------------------------------------------------------------------------
