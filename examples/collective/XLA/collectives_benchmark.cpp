@@ -37,8 +37,9 @@
 //                                                                      [required]
 //   --dtype  f32|bf16|f16|s32|s64   (reduction collectives)            [f32]
 //   --op     sum|prod|min|max       (reduction collectives)            [sum]
-//   --mode   push|pull              (reduce_scatter, all_reduce)       [push]
-//   --logS   push slice count log2                                     [0]
+//   --mode   push|pull|auto         (reduce_scatter, all_reduce)
+//            omitted: facade default (auto, or MORI_COLL_FORCE_PUSH/PULL)
+//   --logS   push slice count log2, -1 = auto                          [0]
 //   --warmup <n>                                                       [2]
 //   --iters  <n>                                                       [5]
 //
@@ -92,6 +93,7 @@ struct Config {
   DataType dt{DataType::F32};
   ReduceOpKind op{ReduceOpKind::SUM};
   RsMode mode{RsMode::kPush};
+  bool modeSet{false};  // --mode given; otherwise keep the facade default
   int logS{0};
   int warmup{2};
   int iters{5};
@@ -522,7 +524,8 @@ static void RunThreaded(const Config& cfg, const ccoUniqueId& uid, ThreadInfo& i
     auto* facade = CollectivesFacade::Get();
     if (facade == nullptr) {
       XPUT("ERROR: No CollectivesFacade for device %d", info.deviceId);
-    } else if (facade->SetReduceMode(cfg.mode) && facade->SetPushLogSlices(cfg.logS)) {
+    } else if ((!cfg.modeSet || facade->SetReduceMode(cfg.mode)) &&
+               facade->SetPushLogSlices(cfg.logS)) {
       rc = RunCollective(cfg, facade, comm, myPe, npes, stream);
     }
   }
@@ -589,15 +592,24 @@ static bool ParseOp(const char* s, ReduceOpKind& op) {
 static bool ParseMode(const char* s, RsMode& m) {
   if (!std::strcmp(s, "push")) m = RsMode::kPush;
   else if (!std::strcmp(s, "pull")) m = RsMode::kPull;
+  else if (!std::strcmp(s, "auto")) m = RsMode::kAuto;
   else return false;
   return true;
+}
+static const char* ModeName(RsMode m) {
+  switch (m) {
+    case RsMode::kPush: return "push";
+    case RsMode::kPull: return "pull";
+    case RsMode::kAuto: return "auto";
+  }
+  return "?";
 }
 
 static void Usage(const char* prog) {
   XPUT("Usage: %s --coll <name> --npes <n> --size <num_elems> "
        "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] "
-       "[--mode push|pull (reduce_scatter, all_reduce)] "
-       "[--logS <n>] [--warmup <n>] [--iters <n>]\n"
+       "[--mode push|pull|auto (reduce_scatter, all_reduce)] "
+       "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>]\n"
        "  coll: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute "
        "(rs|ar|ag|a2a|cp)",
        prog);
@@ -668,6 +680,7 @@ int main(int argc, char* argv[]) {
       if (!ParseOp(need("--op"), cfg.op)) { XPUT("ERROR: bad --op"); return 1; }
     } else if (!std::strcmp(argv[i], "--mode")) {
       if (!ParseMode(need("--mode"), cfg.mode)) { XPUT("ERROR: bad --mode"); return 1; }
+      cfg.modeSet = true;
     } else if (!std::strcmp(argv[i], "--logS")) {
       cfg.logS = std::atoi(need("--logS"));
     } else if (!std::strcmp(argv[i], "--warmup")) {
@@ -738,7 +751,7 @@ int main(int argc, char* argv[]) {
 
   XPUT("collectives_benchmark: coll=%s npes=%d size=%zu dtype=%s op=%s mode=%s logS=%d",
        CollName(cfg.coll), cfg.npes, cfg.numElems, detail::DataTypeName(cfg.dt),
-       detail::ReduceOpName(cfg.op), cfg.mode == RsMode::kPull ? "pull" : "push", cfg.logS);
+       detail::ReduceOpName(cfg.op), cfg.modeSet ? ModeName(cfg.mode) : "default", cfg.logS);
   XPUT("collectives_benchmark: heap=%zu staging=%zu perRankVmm=%zu", cfg.heapBytes,
        cfg.stagingBytes, cfg.perRankVmm);
 

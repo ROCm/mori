@@ -94,11 +94,23 @@ class CollectivesFacade {
   CollectivesFacade() = default;
  public:
   // Reduce algorithm selection for reduce-scatter and all-reduce (default
-  // push). Set at runtime via SetReduceMode(); the push slice count via
-  // SetPushLogSlices().
-  enum class RsMode { kPush, kPull };
+  // auto: pull or push chosen per call by message size). MORI_COLL_FORCE_PUSH=1
+  // or MORI_COLL_FORCE_PULL=1 (read in Create) replaces that default. Set at
+  // runtime via SetReduceMode(); the push slice count via SetPushLogSlices()
+  // (-1 = auto).
+  enum class RsMode { kPush, kPull, kAuto };
 
   static constexpr size_t kDefAlign = 256;
+  // Auto tuning: pull wins below kAutoPullMaxBytes of total input, except
+  // 4-PE all-reduce where the crossover is kAutoPullMaxBytesAr4 (pull is only
+  // instantiated for npes 4 and 8); push reduce-scatter keeps each slice
+  // >= kAutoMinSliceBytes with at most 1<<kAutoMaxLogS slices; push all-reduce
+  // always uses 1<<kAutoAllReduceLogS slices.
+  static constexpr size_t kAutoPullMaxBytes = 32ull << 20;
+  static constexpr size_t kAutoPullMaxBytesAr4 = 16ull << 20;
+  static constexpr size_t kAutoMinSliceBytes = 8ull << 20;
+  static constexpr int kAutoMaxLogS = 2;
+  static constexpr int kAutoAllReduceLogS = 1;
 
   // Per-peer all-to-all endpoints: addrs[p] = {chunk sent to peer p, recv slot
   // for sender p}. The facade copies these into its pinned AddressPair buffer.
@@ -159,8 +171,22 @@ class CollectivesFacade {
     HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, dev));
     facade.MP_count_ = prop.multiProcessorCount;
 
-    // Tuning (reduce-scatter mode / push slice count) defaults to push, logS=0.
+    // Tuning (reduce-scatter mode / push slice count) defaults to auto for both;
+    // MORI_COLL_FORCE_PUSH / MORI_COLL_FORCE_PULL replace the mode default.
     // Callers override at runtime via SetReduceMode() / SetPushLogSlices().
+    // Reset here: a device's facade is reused across Create/TearDown.
+    const bool forcePush = EnvFlag("MORI_CCL_FORCE_PUSH"),
+               forcePull = EnvFlag("MORI_CCL_FORCE_PULL");
+    facade.mode_ = RsMode::kAuto;
+    if (forcePush) {
+      facade.mode_ = RsMode::kPush;
+    } else if (forcePull) {
+      if (facade.nPes_ == 4 || facade.nPes_ == 8) {
+        facade.mode_ = RsMode::kPull;
+      } else {
+        FACADE_PRINTF("CollectivesFacade: MORI_COLL_FORCE_PULL needs npes 4 or 8; using auto");
+      }
+    }
     if (facade.nPes_ > kRSPushMaxPeers) {
       FACADE_PRINTF("CollectivesFacade: npes too large (max %d)", kRSPushMaxPeers);
       return -1;
@@ -309,13 +335,14 @@ class CollectivesFacade {
     mode_ = mode;
     return true;
   }
+  // logS < 0 selects the slice count automatically per call.
   bool SetPushLogSlices(int logS) {
-    if (logS < 0 || (1 << logS) > kRSPushMaxSlices) {
-      FACADE_PRINTF("CollectivesFacade: logS out of range (0..%d)",
+    if (logS >= 0 && (1 << logS) > kRSPushMaxSlices) {
+      FACADE_PRINTF("CollectivesFacade: logS out of range (-1..%d)",
                     kRSPushMaxSlices > 0 ? 31 : 0);
       return false;
     }
-    logS_ = logS;
+    logS_ = logS < 0 ? -1 : logS;
     return true;
   }
   RsMode GetReduceMode() const { return mode_; }
@@ -394,8 +421,28 @@ class CollectivesFacade {
     }
     return *inst;
   }
+  
+  // Set means non-empty and not "0".
+  static bool EnvFlag(const char* name) {
+    const char* e = std::getenv(name);
+    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+  }
 
- private:
+  RsMode resolveMode(size_t totalBytes, bool allReduce) const {
+    if (mode_ != RsMode::kAuto) return mode_;
+    if (nPes_ != 4 && nPes_ != 8) return RsMode::kPush;
+    const size_t pullMax =
+        (allReduce && nPes_ == 4) ? kAutoPullMaxBytesAr4 : kAutoPullMaxBytes;
+    return totalBytes < pullMax ? RsMode::kPull : RsMode::kPush;
+  }
+  int resolveLogS(size_t chunkBytes, bool allReduce) const {
+    if (logS_ >= 0) return logS_;
+    if (allReduce) return kAutoAllReduceLogS;
+    int logS = 0;
+    while (logS < kAutoMaxLogS && (chunkBytes >> (logS + 1)) >= kAutoMinSliceBytes) logS++;
+    return logS;
+  }
+
   // Real reduce implementations, keyed by element type T and reduction Op. Defined
   // only in the MORI_KERNELS_IMPL TU; the enum Run* entry points dispatch to them.
   template <class T, class Op>
@@ -403,6 +450,7 @@ class CollectivesFacade {
   template <class T, class Op>
   hipError_t allReduceImpl(const void* input, void* output, size_t numElems, hipStream_t stream);
 
+private:
   void* staging_{nullptr};
   size_t stagingBytes_{0};
   uint32_t* groupCounters_{nullptr};
@@ -418,11 +466,8 @@ class CollectivesFacade {
   // CCO-backed push: staging_ (above) is a sub-region of heapWin_ (peer-writable
   // SDMA target); devComm_ is the SDMA device comm.
   mori::cco::ccoDevComm devComm_{};
-  int myPe_{0};
-  int nPes_{0};
-  int logS_{0};
-  int MP_count_{0};
-  RsMode mode_{RsMode::kPush};
+  int myPe_{0}, nPes_{0}, logS_{-1}, MP_count_{0};
+  RsMode mode_{RsMode::kAuto};
 };
 
 // ---------------------------------------------------------------------------
@@ -477,8 +522,9 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
 
   const size_t chunkElems = count;
   const size_t chunkBytes = chunkElems * sizeof(T);
+  const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/false);
   // Staging is only needed by the push path; pull reads peers directly (no staging).
-  if (mode_ != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
+  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
     FACADE_PRINTF("ReduceScatter: staging too small; increase maxStagingBytes");
     return hipErrorInvalidConfiguration;
   }
@@ -495,11 +541,11 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, MP_count_));
 
-  int logS = logS_;
+  int logS = resolveLogS(chunkBytes, /*allReduce=*/false);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
   while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
 
-  if (mode_ == RsMode::kPull) {
+  if (mode == RsMode::kPull) {
     // The kernel resolves peer pe's copy of `input` device-side by the same
     // flat-VA rank delta the push path uses: input + (pe - myPe)*stride4G<<32,
     // with stride4G read from heapWin_.
@@ -547,9 +593,10 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
 
   const size_t chunkElems = numElems / nPes_;
   const size_t chunkBytes = chunkElems * sizeof(T);
+  const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/true);
   // Only the push path stages through peer-writable scratch; pull reads peers
   // directly and gathers straight into output.
-  if (mode_ != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
+  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
     FACADE_PRINTF("AllReduce: staging too small; increase maxStagingBytes");
     return hipErrorInvalidConfiguration;
   }
@@ -566,11 +613,11 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // entry go-flag spin.
   int blocks = std::min(wantBlocks, std::max(1, MP_count_));
 
-  int logS = logS_;
+  int logS = resolveLogS(chunkBytes, /*allReduce=*/true);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
   while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
 
-  if (mode_ == RsMode::kPull) {
+  if (mode == RsMode::kPull) {
     // Fused pull: reduce this PE's shard straight off the peers' inputs and fan
     // the result out to every peer from registers, in one pass. No SDMA and no
     // staging; entry and exit PushEntryBarrier rounds on barrierCtr_.
