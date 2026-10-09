@@ -580,8 +580,9 @@ __device__ __forceinline__ void SdmaPostPerPeer(mori::cco::ccoSdmaContext sdma, 
 // posts to and polls for PE p, so one load + wave vote checks every slot.
 // `>= epoch` is safe against a fast peer: it can only post epoch e+1 after its
 // launch e completes, which requires data from me, which I send only after
-// leaving this wait. The pull reduce-scatter calls it twice per launch (entry +
-// exit); that is fine as long as every PE issues the same sequence of calls.
+// leaving this wait. The pull reduce-scatter and all-reduce call it twice per
+// launch (entry + exit); that is fine as long as every PE issues the same
+// sequence of calls.
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void PushEntryBarrier(uint64_t* ctr, int myPe, int npes,
                                                  int32_t stride4G) {
