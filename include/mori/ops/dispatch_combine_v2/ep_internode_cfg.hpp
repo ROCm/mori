@@ -74,7 +74,7 @@ inline std::string RenderValue(EpQuantType quantType) {
 
 // ---------------------------------------------------------------------------
 // Transported element type. v1 keeps the two fp8 encodings and fp4 apart, which
-// is why this is not EpDType: the intranode pair folds all three into Byte8
+// is why this is not EpDType: the intranode pair folds fp8 and fp4 into byte
 // because dispatch only copies bytes, whereas the v1 bodies hand T on to
 // convert.hpp and to the quant paths.
 // ---------------------------------------------------------------------------

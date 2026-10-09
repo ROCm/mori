@@ -4,7 +4,8 @@
 # caller's scope: MORI_GPU_ARCH          — GPU architecture string (e.g.
 # "gfx942") MORI_DEVICE_NIC        — NIC type: "mlx5", "bnxt", or "ionic"
 # MORI_DEVICE_NIC_DEFINE — Compile definition (e.g. "MORI_DEVICE_NIC_BNXT"),
-# empty for mlx5 (the default provider)
+# empty for mlx5 (the default provider) MORI_IONIC_CCQE_DEFINE — "IONIC_CCQE"
+# when the ionic collapsed-CQE device path must be compiled in, empty otherwise
 #
 # mori_add_device_target(<target>) Convenience function that applies
 # MORI_DEVICE_NIC_DEFINE and include dirs to an existing HIP target. Call
@@ -19,6 +20,12 @@
 include_guard(GLOBAL)
 
 set(_MORI_SUPPORTED_ARCHS "gfx942;gfx950")
+
+set(MORI_IONIC_CCQE
+    "AUTO"
+    CACHE STRING
+          "Ionic collapsed CQE device path: AUTO (probe firmware), ON, or OFF")
+set_property(CACHE MORI_IONIC_CCQE PROPERTY STRINGS AUTO ON OFF)
 
 # ---------------------------------------------------------------------------
 # GPU architecture detection
@@ -297,16 +304,155 @@ function(_mori_detect_device_nic out_var)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# Ionic collapsed-CQE (CCQE) detection
+#
+# The host picks the CQ layout at runtime (IsCcqeSupported() in
+# transport/rdma/providers/ionic/ionic.cpp) while the device-side poller picks
+# it at compile time (#ifdef IONIC_CCQE). Both sides must agree or a kernel
+# polls a collapsed CQ as a normal CQE ring, misses completions and hangs in
+# quiet, so this mirrors the runtime and Python JIT (jit/core.py) checks:
+# userspace provider exports ionic_dv_create_cq_ex, and every ionic device runs
+# the same firmware, at least 1.117.5-a-58.
+# ---------------------------------------------------------------------------
+function(_mori_ionic_fw_supports_ccqe fw_ver out_var)
+  set(_min_version "1;117;5;58")
+  set(${out_var}
+      FALSE
+      PARENT_SCOPE)
+  if(NOT fw_ver MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)-a-?([0-9]+)$")
+    return()
+  endif()
+  set(_ver
+      "${CMAKE_MATCH_1};${CMAKE_MATCH_2};${CMAKE_MATCH_3};${CMAKE_MATCH_4}")
+  foreach(_i RANGE 3)
+    list(GET _ver ${_i} _have)
+    list(GET _min_version ${_i} _want)
+    if(_have GREATER _want)
+      set(${out_var}
+          TRUE
+          PARENT_SCOPE)
+      return()
+    elseif(_have LESS _want)
+      return()
+    endif()
+  endforeach()
+  set(${out_var}
+      TRUE
+      PARENT_SCOPE)
+endfunction()
+
+function(_mori_detect_ionic_ccqe out_var)
+  set(${out_var}
+      FALSE
+      PARENT_SCOPE)
+
+  if(DEFINED ENV{MORI_DISABLE_IONIC_CCQE})
+    string(TOLOWER "$ENV{MORI_DISABLE_IONIC_CCQE}" _disable)
+    if(_disable MATCHES "^(1|true|on|yes)$")
+      message(STATUS "Mori ionic CCQE: off (MORI_DISABLE_IONIC_CCQE env)")
+      return()
+    endif()
+  endif()
+
+  # Userspace provider support: the collapsed CQ is created through
+  # ionic_dv_create_cq_ex, which older libionic builds do not export.
+  if(NOT _mori_ionic_lib)
+    message(STATUS "Mori ionic CCQE: off (libionic not found)")
+    return()
+  endif()
+  find_program(_mori_nm NAMES nm)
+  if(NOT _mori_nm)
+    message(
+      STATUS "Mori ionic CCQE: off (nm not available to inspect libionic)")
+    return()
+  endif()
+  execute_process(
+    COMMAND "${_mori_nm}" --dynamic --defined-only "${_mori_ionic_lib}"
+    OUTPUT_VARIABLE _ionic_syms
+    ERROR_QUIET
+    RESULT_VARIABLE _rc)
+  if(NOT _rc EQUAL 0 OR NOT _ionic_syms MATCHES "ionic_dv_create_cq_ex")
+    message(
+      STATUS "Mori ionic CCQE: off (libionic has no ionic_dv_create_cq_ex)")
+    return()
+  endif()
+
+  # Firmware support: every ionic device must run the same new-enough firmware.
+  file(GLOB _ib_devices "/sys/class/infiniband/*")
+  set(_fw_versions "")
+  foreach(_dev ${_ib_devices})
+    get_filename_component(_name ${_dev} NAME)
+    set(_is_ionic FALSE)
+    if(_name MATCHES "^ionic")
+      set(_is_ionic TRUE)
+    else()
+      execute_process(
+        COMMAND readlink -f "${_dev}/device/driver"
+        OUTPUT_VARIABLE _drv
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+        RESULT_VARIABLE _drv_rc)
+      if(_drv_rc EQUAL 0)
+        get_filename_component(_drv_name "${_drv}" NAME)
+        if(_drv_name MATCHES "^ionic")
+          set(_is_ionic TRUE)
+        endif()
+      endif()
+    endif()
+    if(_is_ionic AND EXISTS "${_dev}/fw_ver")
+      file(READ "${_dev}/fw_ver" _fw)
+      string(STRIP "${_fw}" _fw)
+      list(APPEND _fw_versions "${_fw}")
+    endif()
+  endforeach()
+
+  if(NOT _fw_versions)
+    message(STATUS "Mori ionic CCQE: off (no ionic fw_ver in sysfs)")
+    return()
+  endif()
+  list(REMOVE_DUPLICATES _fw_versions)
+  list(LENGTH _fw_versions _num_versions)
+  if(NOT _num_versions EQUAL 1)
+    message(STATUS "Mori ionic CCQE: off (mixed firmware: ${_fw_versions})")
+    return()
+  endif()
+  list(GET _fw_versions 0 _fw)
+  _mori_ionic_fw_supports_ccqe("${_fw}" _fw_ok)
+  if(NOT _fw_ok)
+    message(STATUS "Mori ionic CCQE: off (firmware ${_fw} below 1.117.5-a-58)")
+    return()
+  endif()
+
+  message(STATUS "Mori ionic CCQE: on (firmware ${_fw})")
+  set(${out_var}
+      TRUE
+      PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Public API: mori_detect_device_config()
 # ---------------------------------------------------------------------------
 function(mori_detect_device_config)
   _mori_detect_gpu_arch(_gpu_arch)
   _mori_detect_device_nic(_device_nic)
 
+  set(_ccqe_define "")
   if(_device_nic STREQUAL "bnxt")
     set(_nic_define "MORI_DEVICE_NIC_BNXT")
   elseif(_device_nic STREQUAL "ionic")
     set(_nic_define "MORI_DEVICE_NIC_IONIC")
+    string(TOUPPER "${MORI_IONIC_CCQE}" _ccqe_mode)
+    if(_ccqe_mode STREQUAL "AUTO")
+      _mori_detect_ionic_ccqe(_ccqe_detected)
+      if(_ccqe_detected)
+        set(_ccqe_define "IONIC_CCQE")
+      endif()
+    elseif(_ccqe_mode)
+      set(_ccqe_define "IONIC_CCQE")
+      message(STATUS "Mori ionic CCQE: on (MORI_IONIC_CCQE=${MORI_IONIC_CCQE})")
+    else()
+      message(
+        STATUS "Mori ionic CCQE: off (MORI_IONIC_CCQE=${MORI_IONIC_CCQE})")
+    endif()
   else()
     set(_nic_define "")
   endif()
@@ -320,10 +466,13 @@ function(mori_detect_device_config)
   set(MORI_DEVICE_NIC_DEFINE
       "${_nic_define}"
       PARENT_SCOPE)
+  set(MORI_IONIC_CCQE_DEFINE
+      "${_ccqe_define}"
+      PARENT_SCOPE)
 
   message(
     STATUS
-      "Mori device config: arch=${_gpu_arch}, nic=${_device_nic}, define=${_nic_define}"
+      "Mori device config: arch=${_gpu_arch}, nic=${_device_nic}, define=${_nic_define} ${_ccqe_define}"
   )
 endfunction()
 
@@ -339,6 +488,9 @@ function(mori_add_device_target target)
 
   if(MORI_DEVICE_NIC_DEFINE)
     target_compile_definitions(${target} PRIVATE ${MORI_DEVICE_NIC_DEFINE})
+  endif()
+  if(MORI_IONIC_CCQE_DEFINE)
+    target_compile_definitions(${target} PRIVATE ${MORI_IONIC_CCQE_DEFINE})
   endif()
   target_compile_definitions(${target} PRIVATE HIP_ENABLE_WARP_SYNC_BUILTINS)
 

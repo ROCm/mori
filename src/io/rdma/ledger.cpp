@@ -27,18 +27,60 @@ namespace io {
 uint64_t SubmissionLedger::Insert(int postedWr, bool hasSignaledTail,
                                   std::shared_ptr<CqCallbackMeta> meta, int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return kInvalidRecordId;
   uint64_t id = nextId_++;
   records_[id] = SubmissionRecord{
       id, postedWr, hasSignaledTail, SubmissionState::Posted, std::move(meta), batchSize};
   return id;
 }
 
-void SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
+SubmissionLedger::PostGuard SubmissionLedger::InsertForPost(int postedWr,
+                                                            std::shared_ptr<CqCallbackMeta> meta,
+                                                            int batchSize) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return PostGuard{};
+  uint64_t id = nextId_++;
+  records_[id] =
+      SubmissionRecord{id, postedWr, true, SubmissionState::Posting, std::move(meta), batchSize};
+  // Counted before the lock drops, so a FailAll() that wins the race to closed_
+  // still sees this post as outstanding and waits for it.
+  ++posting_;
+  return PostGuard{this, id};
+}
+
+void SubmissionLedger::CommitPost(uint64_t recordId, bool posted) {
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = records_.find(recordId);
+    if (it != records_.end() && it->second.state == SubmissionState::Posting) {
+      if (posted) {
+        it->second.state = SubmissionState::Posted;
+      } else {
+        // The WR never reached the wire, so no CQE will arrive for it. The
+        // submitter still holds the sqDepth reservation and releases it itself.
+        records_.erase(it);
+      }
+    }
+    // A missing record means the CQ poller already reaped this completion, or
+    // it is simply gone; either way only the in-flight count is left to settle.
+    --posting_;
+    // Only FailAll() waits here, and it sets closed_ under this same lock before
+    // waiting. Seeing an open ledger therefore means no waiter exists and none
+    // can appear without re-reading posting_ under the lock, so the healthy path
+    // never pays for a broadcast.
+    if (posting_ > 0 || !closed_) return;
+  }
+  postingDrained_.notify_all();
+}
+
+bool SubmissionLedger::InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
                                       int batchSize) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (closed_) return false;
   uint64_t id = nextId_++;
   records_[id] =
       SubmissionRecord{id, postedWr, false, SubmissionState::Orphaned, std::move(meta), batchSize};
+  return true;
 }
 
 std::shared_ptr<CqCallbackMeta> SubmissionLedger::ReleaseByCqe(uint64_t recordId,
@@ -72,6 +114,41 @@ int SubmissionLedger::ReleaseOrphanedByRecovery(std::atomic<int>* sqDepth) {
   }
   if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
   return total;
+}
+
+int SubmissionLedger::FailAll(StatusCode code, const std::string& message,
+                              std::atomic<int>* sqDepth) {
+  std::vector<TransferStatus*> claimed;
+  int total = 0;
+  {
+    std::unique_lock<std::mutex> lock(mu_);
+    // Close first so no further record is admitted, then let the posts already
+    // admitted settle. Without this wait a record could be retired and its
+    // postedWr subtracted while its ibv_post_send is still running, which either
+    // double-releases the reservation or leaves the WR on the wire untracked.
+    closed_ = true;
+    postingDrained_.wait(lock, [this] { return posting_ == 0; });
+    for (auto& [id, rec] : records_) {
+      total += rec.postedWr;
+      if (!rec.meta) continue;
+      // Records of one batch share a meta; exchange() makes the first one win and
+      // also stops a racing CQE from reporting a different outcome afterwards.
+      TransferStatus* status = rec.meta->status.exchange(nullptr, std::memory_order_acq_rel);
+      if (status != nullptr) claimed.push_back(status);
+    }
+    records_.clear();
+    if (sqDepth && total > 0) sqDepth->fetch_sub(total, kSqAdmissionOrder);
+  }
+
+  // Update() wakes WaitFor() sleepers, so run it outside the ledger lock to keep
+  // woken threads from contending on a lock this call still holds.
+  for (TransferStatus* status : claimed) status->Update(code, message);
+  return static_cast<int>(claimed.size());
+}
+
+bool SubmissionLedger::Closed() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return closed_;
 }
 
 bool SubmissionLedger::HasOrphaned() const {

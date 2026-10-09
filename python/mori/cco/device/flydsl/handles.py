@@ -111,6 +111,75 @@ class Window:
         return raw.cco_lsa_ptr(self.handle, peer_lsa_rank, offset)
 
 
+class CachedWindow:
+    """A :class:`Window` that reads its geometry once, at construction.
+
+    Drop-in for ``Window`` at the top of a kernel::
+
+        w = cco.CachedWindow(win)       # instead of cco.Window(win)
+
+    and every ``w.lsa_ptr(...)`` after it becomes arithmetic instead of an
+    extern call. Nothing else about the kernel changes.
+
+    ``cco_lsa_ptr`` is ``winBase + peer*stride + offset`` and loads *both*
+    fields out of the window descriptor on every call. It is opaque to FlyDSL's
+    tracer, and although it is ``always_inline`` -- so LLVM does see the loads --
+    a kernel that stores through addresses derived from that same base gives
+    LLVM no way to prove they are not clobbered, so it reloads them.
+
+    The two reads here go through ``cco_lsa_win_base`` / ``cco_lsa_stride``,
+    which take an ``address_space(1)`` pointer so each is a single
+    ``global_load``. ``cco_lsa_ptr`` casts to a *generic* pointer, and a generic
+    access has to be a ``flat_load`` -- the compiler cannot rule out LDS -- so it
+    counts against ``lgkmcnt`` as well as ``vmcnt``, giving any following
+    ``s_waitcnt`` one more counter to wait on.
+
+    **What it is worth depends on how often the kernel builds an address, not on
+    how many call sites it has.** A/B at ``m=16384 n=7168 k=2048`` on 8x MI355X,
+    max_rank_time_us, three alternating repeats::
+
+        mode                Window                    CachedWindow
+        split-lsa    1264.69 1264.23 1264.85    1250.25 1256.85 1254.53   -10.7us
+        fused-sdma   1110.45 1109.77 1112.85    1110.53 1113.69 1112.61     null
+
+    ``split-lsa`` wins 0.85%, against a Window spread of 0.6us across its three
+    runs. Its ``ar_1stage``/``ar_2stage`` build nine peer addresses in *every
+    block* of a short kernel, so the extern calls are a real fraction of it.
+    ``fused-sdma`` gains nothing: its ``lsa_ptr`` calls are per kernel launch,
+    once, against a body that runs for a millisecond -- and the same was true of
+    ``kernels_sdma``, where converting all 21 sites moved nothing.
+
+    So: count address constructions per launch, not ``grep -c lsa_ptr``.
+
+    Measure A/B in one session if you revisit this, and pin ``--quant``. The
+    benchmark defaults to ``ptpc``, which is ~3% faster than the ``blockscale``
+    the model actually uses and that the headline numbers are quoted in; reading
+    one against the other looks exactly like a machine that drifts overnight.
+
+    Unlike :class:`Window` this is a plain Python object, not a ``cco_struct``,
+    so it cannot cross an ``scf.if``/``scf.for`` boundary -- and neither would a
+    ``cco_struct`` version, because FlyDSL captures every variable a dynamic
+    ``if`` body reads as state and requires each to be a *single* MLIR value.
+    ``Window`` qualifies only by having one field; a three-field struct fails the
+    same check ("state variable 'w' is list, not an MLIR Value").
+
+    Usually the way out is neither: compute the addresses *before* the branch and
+    let the ``if`` capture plain ``Int64``. That works whenever the offsets do
+    not depend on the branch, which in practice they rarely do.
+    """
+
+    __slots__ = ("handle", "base", "stride")
+
+    def __init__(self, win):
+        self.handle = fx.Int64(win)
+        self.base = fx.Int64(raw.cco_lsa_win_base(self.handle))
+        self.stride = fx.Int64(raw.cco_lsa_stride(self.handle))
+
+    def lsa_ptr(self, peer_lsa_rank, offset=0):
+        """Same contract as :meth:`Window.lsa_ptr`, with no extern call."""
+        return self.base + fx.Int64(peer_lsa_rank) * self.stride + fx.Int64(offset)
+
+
 @cco_struct
 class Gda:
     """GDA handle bound to a ccoDevComm device pointer + context index.
@@ -259,8 +328,9 @@ class Sdma:
         signal,
         aggregate,
     ):
-        # coop/signal are compile-time; "_ns" (no-signal) is fire-and-forget and
-        # cannot be drained by quiet. aggregate skips the doorbell — call commit().
+        # coop/signal are compile-time. "_ns" (no-signal) only drops the trailing
+        # ATOMIC; quiet()/quietQueue() drain the queue's read pointer and work on
+        # it either way (cco.hpp:1707). aggregate skips the doorbell — call commit().
         tag = _COOP_TAG[_const(coop, "coop")]
         if not signal:
             tag += "_ns"

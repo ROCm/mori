@@ -41,13 +41,12 @@ option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_CCO "Whether to build cco library" ON)
 
-if(BUILD_BENCHMARK)
-  set(_cco_sdma_default ON)
-else()
-  set(_cco_sdma_default OFF)
-endif()
-option(BUILD_CCO_SDMA "Compile the cco SDMA intra-node copy-engine path"
-       ${_cco_sdma_default})
+# ON by default. It costs ~6 KB of libmori_cco.so and no measurable build time,
+# it adds no dependency (anvil.cpp and find_package(hsakmt REQUIRED) are both
+# unconditional), and it creates no queue on its own -- MORI_ENABLE_SDMA still
+# gates that at runtime, in ccoSdmaSetupCommQueues. What OFF buys is a build
+# whose SDMA puts compile away to nothing and then silently move no bytes.
+option(BUILD_CCO_SDMA "Compile the cco SDMA intra-node copy-engine path" ON)
 if(BUILD_BENCHMARK AND NOT BUILD_CCO_SDMA)
   message(WARNING
     "BUILD_BENCHMARK=ON requires BUILD_CCO_SDMA=ON (cco benchmarks use ccoSdma); "
@@ -104,6 +103,12 @@ endif()
 # ---------------------------------------------------------------------------
 include(${CMAKE_SOURCE_DIR}/cmake/MoriDetectDevice.cmake)
 mori_detect_device_config()
+# Device-side CQ layout is a compile-time choice but the host picks it at
+# runtime from the firmware, so every target in the build must agree with what
+# mori_detect_device_config() found.
+if(MORI_IONIC_CCQE_DEFINE)
+  add_compile_definitions(${MORI_IONIC_CCQE_DEFINE})
+endif()
 # Bridge: if user didn't set GPU_TARGETS explicitly, use the detected arch
 if(NOT DEFINED GPU_TARGETS AND MORI_GPU_ARCH)
   set(GPU_TARGETS

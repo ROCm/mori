@@ -22,7 +22,9 @@
 # Configuration file for the Sphinx documentation builder.
 
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(".."))
 
@@ -30,14 +32,35 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "MORI"
 copyright = "2026, AMD"
 author = "AMD ROCm Team"
-release = "0.1.0"
+# Read version metadata without importing MORI or requiring a GPU toolchain.
+_repo_root = Path(__file__).resolve().parent.parent
+
+
+def _git(*args):
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(_repo_root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+_source_commit = _git("rev-parse", "--short", "HEAD")
+_release_tag = _git("describe", "--tags", "--exact-match", "HEAD")
+release = _release_tag or f"development ({_source_commit or 'source archive'})"
+version = release
+html_title = f"MORI {release} documentation"
+html_last_updated_fmt = "%Y-%m-%d"
 
 # -- General configuration ---------------------------------------------------
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
-    "sphinx.ext.intersphinx",
     "sphinx.ext.mathjax",
     "myst_parser",
 ]
@@ -57,7 +80,6 @@ html_static_path = ["_static"]
 
 html_theme_options = {
     "logo_only": False,
-    "display_version": True,
     "prev_next_buttons_location": "bottom",
     "style_external_links": False,
     "style_nav_header_background": "#C00000",  # AMD Red
@@ -77,14 +99,11 @@ html_favicon = None
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True
 
-# Intersphinx configuration
-intersphinx_mapping = {
-    "python": ("https://docs.python.org/3", None),
-    "torch": ("https://pytorch.org/docs/stable/", None),
-}
-
 # MyST parser settings
 myst_enable_extensions = [
     "colon_fence",
     "deflist",
 ]
+
+# Resolve Markdown heading links in the guides, including nested headings.
+myst_heading_anchors = 6

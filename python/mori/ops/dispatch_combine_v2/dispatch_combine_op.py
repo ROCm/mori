@@ -63,10 +63,15 @@ WAVE = detect_wave_size()
 # Where each backend lives. Imported lazily, on selection only.
 _BACKEND_MODULES = {"flydsl": "flydsl_backend", "hip": "hip_backend"}
 
-DEFAULT_BACKEND = "flydsl"
+
+def _default_backend() -> str:
+    from mori.ops.dispatch_combine import _is_gfx125x
+
+    return "hip" if _is_gfx125x() else "flydsl"
 
 
-_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+_FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
+_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
 
@@ -252,14 +257,15 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
+            fp4 = self.quant_type in _FP4_QUANT_TYPES
             if (
-                self.combine_mode != "gather"
-                or self.quant_type != "none"
+                (self.combine_mode != "gather" and not fp4)
+                or (self.quant_type != "none" and not fp4)
                 or self.enable_std_moe
             ):
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    "quant_type=none, enable_std_moe=False"
+                    "quant_type=none (or an fp4 type), enable_std_moe=False"
                 )
             # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
             # supported; fp4 on the combine side is not.
@@ -356,7 +362,7 @@ class EpDispatchCombineConfig:
             backend = (
                 self.kernel_backend
                 or os.environ.get("MORI_V2_KERNEL_BACKEND")
-                or DEFAULT_BACKEND
+                or _default_backend()
             )
             if backend == "hip":
                 from .hip_tuning_configs import lookup
@@ -370,6 +376,7 @@ class EpDispatchCombineConfig:
                     self.num_experts_per_token,
                     dtype=self.dtype_str,
                     experts_per_rank=self.num_experts_per_rank,
+                    quant_type=self.quant_type,
                 )
             else:
                 from .tuning_configs import lookup
@@ -712,7 +719,7 @@ class EpDispatchCombineOp:
             name = (
                 getattr(cfg, "kernel_backend", None)
                 or os.environ.get("MORI_V2_KERNEL_BACKEND")
-                or DEFAULT_BACKEND
+                or _default_backend()
             )
             cls = EpDispatchCombineOp._resolve_backend(name)
         return super().__new__(cls)
@@ -1039,6 +1046,14 @@ class EpDispatchCombineOp:
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)
         self.dest_pe_counter.zero_()
+        # tokoff-ext keeps the slot allocator outside the arena (gfx1250).
+        tokoff_ext = getattr(self, "_tokoff_ext", None)
+        if tokoff_ext is not None:
+            tokoff_ext.zero()
+        # So does selfFirst its per-call state (ep_plans.SelfFirstState).
+        self_first = getattr(self, "_self_first_state", None)
+        if self_first is not None:
+            self_first.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
@@ -1056,6 +1071,12 @@ class EpDispatchCombineOp:
             counter = getattr(self, name, None)
             if counter is not None:
                 counter.zero_()
+        # A peer's next call writes into the state zeroed above, so, as when the op
+        # is built, every rank finishes its zeroes before any rank goes on.
+        torch.cuda.synchronize()
+        comm = getattr(self, "comm", None)
+        if comm is not None:
+            comm.barrier()
 
     def __repr__(self):
         return (

@@ -22,12 +22,24 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#include <linux/filter.h>
+#include <linux/mempolicy.h>
+#include <linux/seccomp.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "umbp/distributed/peer/backend/page_backend.h"
 
@@ -68,6 +80,110 @@ std::optional<AllocateResult> AllocateOk(PageBackend& a, const std::string& key,
 }  // namespace
 
 // ---- Allocate / Commit / Resolve happy path ---------------------------------
+
+TEST(PageBackend, NumaBindingAndPreferredAllocationAgree) {
+#if defined(__linux__) && defined(__NR_move_pages)
+  if (!std::ifstream("/sys/devices/system/node/node1/meminfo"))
+    GTEST_SKIP() << "requires two NUMA nodes";
+  // Probe permissions directly, rather than treating a failure of the code
+  // under test as an environmental skip. Docker/cpusets may expose node1 in
+  // sysfs while disallowing mbind or placement queries.
+  void* probe = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(probe, MAP_FAILED);
+  bool available = true;
+  for (int node : {0, 1}) {
+    const unsigned long mask = 1UL << node;
+    available =
+        available && syscall(__NR_mbind, probe, 4096, MPOL_BIND, &mask, sizeof(mask) * 8, 0) == 0;
+  }
+  *static_cast<volatile char*>(probe) = 0;
+  int probe_node = -1;
+  available = available && syscall(__NR_move_pages, 0, 1UL, &probe, nullptr, &probe_node, 0) == 0;
+  munmap(probe, 4096);
+  if (!available) GTEST_SKIP() << "NUMA policy/query unavailable in this environment";
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {64 * 4096, 64 * 4096};
+  cfg.numa_nodes = {1, 0};  // Node id must be translated, not used as a buffer index.
+  cfg.numa_strict = true;
+  PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  ASSERT_TRUE(backend.Init(nullptr));
+  for (uint32_t i = 0; i < 2; ++i) {
+    void* address = backend.BufferRef(i).host_ptr;
+    int node = -1;
+    ASSERT_EQ(syscall(__NR_move_pages, 0, 1UL, &address, nullptr, &node, 0), 0);
+    EXPECT_EQ(node, cfg.numa_nodes[i]);
+  }
+  auto first = backend.BatchAllocate({AllocateRequest{"node1", 61 * 4096, 1}}).front();
+  ASSERT_EQ(first.outcome, AllocateOutcome::kSuccessAllocated);
+  for (const auto& page : first.pages) EXPECT_EQ(page.buffer_index, 0u);
+  auto split = backend.BatchAllocate({AllocateRequest{"spill", 10 * 4096, 1}}).front();
+  ASSERT_EQ(split.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_EQ(split.pages.size(), 10u);
+  for (size_t i = 0; i < split.pages.size(); ++i)
+    EXPECT_EQ(split.pages[i].buffer_index, i < 3 ? 0u : 1u);
+#else
+  GTEST_SKIP() << "requires Linux move_pages";
+#endif
+}
+
+TEST(PageBackend, NumaRejectsMismatchedLayoutBeforeAllocating) {
+  HostPageMemorySource::Options opts;
+  opts.numa_nodes = {0, 1};
+  HostPageMemorySource source(opts);
+  std::vector<PageMemorySource::Buffer> buffers;
+  EXPECT_FALSE(source.Allocate({4096}, &buffers));
+  EXPECT_TRUE(buffers.empty());
+}
+
+#if defined(__linux__) && defined(__NR_mbind)
+// Deny only mbind, in a death-test child. This exercises the actual allocation
+// and cleanup paths without adding a production syscall hook or needing NUMA
+// hardware. The filter cannot affect the parent or any other test.
+[[noreturn]] static void CheckNumaBindingFailure(int error) {
+  sock_filter filter[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mbind, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | static_cast<uint32_t>(error)),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+  sock_fprog program{static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0])), filter};
+  if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+      prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program) != 0) {
+    _exit(77);
+  }
+  for (const auto& nodes : {std::vector<int>{}, std::vector<int>{0}, std::vector<int>{0, 1}}) {
+    for (bool strict : {false, true}) {
+      HostPageMemorySource::Options opts;
+      opts.numa_nodes = nodes;
+      opts.numa_strict = strict;
+      opts.prefault_threads = 1;
+      HostPageMemorySource source(opts);
+      std::vector<PageMemorySource::Buffer> buffers;
+      const size_t count = std::max<size_t>(1, nodes.size());
+      const bool allocated = source.Allocate(std::vector<uint64_t>(count, 4096), &buffers);
+      const bool expected = nodes.empty() || !strict;
+      if (allocated != expected || buffers.size() != (expected ? count : 0)) _exit(1);
+      if (allocated) {
+        for (const auto& buffer : buffers) {
+          if (buffer.base == nullptr || *static_cast<const char*>(buffer.base) != 0) _exit(2);
+        }
+      }
+    }
+  }
+  _exit(0);
+}
+#endif
+
+TEST(PageBackend, NumaBindingFailureFollowsExplicitStrictFlag) {
+#if defined(__linux__) && defined(__NR_mbind)
+  for (int error : {ENOSYS, EPERM}) {
+    SCOPED_TRACE(error);
+    EXPECT_EXIT(CheckNumaBindingFailure(error), ::testing::ExitedWithCode(0), "");
+  }
+#else
+  GTEST_SKIP() << "requires Linux seccomp";
+#endif
+}
 
 TEST(PageBackend, CommitMakesKeyResolvable) {
   auto a = MakeAllocator();

@@ -50,6 +50,14 @@ class AllgatherSdma {
   application::SymmMemObjPtr flagsObj_;
   std::unique_ptr<uint64_t[], ShmemDeleter> flags_;
 
+  // Generation counter for the completion flags, read and advanced by the
+  // kernel rather than the host so that a captured graph derives a fresh
+  // generation on every replay. Local to this PE: no peer ever touches it, the
+  // kernel bumps it once per collective, and ranks stay in step because they
+  // all issue the same sequence of collectives. Its own allocation, so peer
+  // AMO_SET traffic into `flags_` does not share its cacheline.
+  std::unique_ptr<uint64_t, ShmemDeleter> gen_;
+
   // Input transit buffer
   void* input_transit_buffer_;
   size_t input_transit_buffer_size_;
@@ -64,14 +72,14 @@ class AllgatherSdma {
 
   // ================ NEW: Async state variables ================
   std::atomic<bool> async_in_progress_;       // Flag indicating async operation is active
-  std::atomic<uint64_t> call_seq_;            // Monotonic generation token for flag synchronization
   T* async_input_;                            // Saved input pointer for async operation
   T* async_output_;                           // Saved output pointer for async operation
   size_t async_total_count_;                  // Saved element count for async operation
   hipStream_t async_stream_;                  // Saved stream for async operation
   application::SymmMemObjPtr async_dst_obj_;  // Destination symm object used by async PUT
   double async_start_time_;                   // Start time for async operation
-  uint64_t async_flag_token_;                 // Generation token for current async op
+  // No host-side generation token: the WAIT kernel derives and advances the
+  // generation itself, so nothing has to be carried from START to WAIT.
   // ============================================================
 
   // Copy mode flag: if true, copy output_transit_buffer to user output buffer
@@ -232,7 +240,11 @@ class AllgatherSdma {
   }
 
   /**
-   * @brief Resets flags (sets to 0)
+   * @brief Resets the completion flags and the generation counter (both to 0).
+   * @note The two must be reset together. Zeroing the counter while stale flag
+   *       values survive makes the next kernel derive generation 1 and find
+   *       every flag already above it, so the wait passes before any data has
+   *       landed. Collective — all ranks must call it at the same point.
    */
   void resetFlags();
 
@@ -240,7 +252,19 @@ class AllgatherSdma {
   int64_t prepare_sync_param_contiguous(T* input, T* output, size_t total_count,
                                         const size_t* split_sizes, const size_t* split_offsets,
                                         size_t split_count, hipStream_t stream);
-  double finish_sync(T* output, size_t total_count, hipStream_t stream);
+  // `capturing`: skip the host-side stream syncs, as AllreduceSdma already
+  // allows. The SDMA transfer, the wait kernel and the copy-out are all
+  // stream-ordered anyway, so a consumer enqueued on the same stream still
+  // sees complete data. The syncs only make the returned duration meaningful,
+  // and blocking the launch thread for the whole transfer stops the caller
+  // from queueing work into the window where the copy engines are busy but the
+  // CUs are idle (and is illegal during graph capture).
+  // `capturing` is the caller's assertion, not something checked here: a torch
+  // capture always hands us a real side stream, while an eager caller may well
+  // pass the default stream (handle 0) with `capturing` already hardcoded on.
+  // The return is always 0.0, as in AllreduceSdma -- nothing here is timed
+  // either way, so `capturing` does not change it.
+  double finish_sync(T* output, size_t total_count, hipStream_t stream, bool capturing = false);
   int64_t prepare_async_start(T* input, T* output, size_t total_count, hipStream_t stream);
   int64_t prepare_async_start_param_contiguous(T* input, T* output, size_t total_count,
                                                const size_t* split_sizes,
@@ -248,7 +272,7 @@ class AllgatherSdma {
                                                hipStream_t stream);
   void after_async_start();
   int64_t prepare_async_wait(hipStream_t stream);
-  double finish_async_wait(hipStream_t stream);
+  double finish_async_wait(hipStream_t stream, bool capturing = false);
 };
 
 }  // namespace collective

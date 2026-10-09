@@ -125,6 +125,13 @@ _add(
     pure=True,
     family="lsa",
 )
+# Window geometry, for callers that need many addresses from one window.
+# Both read through an address_space(1) pointer so the access is a global_load
+# (vmcnt only) rather than the flat_load a generic pointer forces (vmcnt and
+# lgkmcnt). See cco_lsa_win_base in the device wrapper.
+_add("lsa_win_base", "cco_lsa_win_base", [_U64], _U64, pure=True, family="lsa")
+_add("lsa_stride", "cco_lsa_stride", [_U64], _U64, pure=True, family="lsa")
+
 # Benchmark-only publication primitive. It is not a cooperative barrier:
 # leaderOnly=1 fences thread 0 only, so producers must synchronize first and
 # must not use it as a substitute for a per-lane release fence.

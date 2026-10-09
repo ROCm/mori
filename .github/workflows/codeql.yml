@@ -41,7 +41,7 @@ env:
 jobs:
   codeql:
     name: CodeQL scan (MI355X_AINIC)
-    runs-on: [self-hosted, MI355X-AINIC-TW]
+    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     timeout-minutes: 120
     steps:
       - name: Checkout

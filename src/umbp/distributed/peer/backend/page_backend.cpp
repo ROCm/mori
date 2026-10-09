@@ -23,13 +23,23 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <msgpack.hpp>
 #include <stdexcept>
+#include <thread>
 #include <utility>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/numa_config.h"
+#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
@@ -50,6 +60,32 @@ uint32_t SizeToPages(uint64_t size, uint64_t page_size) {
     return 0;
   }
   return static_cast<uint32_t>(pages);
+}
+
+void LogNumaPlacement(size_t index, const HostBufferHandle& handle) {
+#if defined(__linux__) && defined(__NR_move_pages)
+  const size_t stride = std::max<size_t>(handle.actual_alignment, sysconf(_SC_PAGESIZE));
+  const size_t pages = handle.mapped_size / stride;
+  const size_t samples = std::min<size_t>(256, pages);
+  if (samples == 0) return;
+  std::vector<void*> addresses(samples);
+  std::vector<int> status(samples);
+  for (size_t i = 0; i < samples; ++i) {
+    addresses[i] = static_cast<char*>(handle.ptr) + (pages / samples * i) * stride;
+  }
+  if (syscall(__NR_move_pages, 0, samples, addresses.data(), nullptr, status.data(), 0) < 0) {
+    MORI_UMBP_WARN("[HostPageMemorySource] tier layout (actual): buffer={} query unavailable: {}",
+                   index, std::strerror(errno));
+    return;
+  }
+  std::map<int, size_t> counts;
+  for (int node : status) ++counts[node];
+  for (const auto& [node, count] : counts) {
+    MORI_UMBP_INFO(
+        "[HostPageMemorySource] tier layout (actual sampled): buffer={} node={} pages={}/{}", index,
+        node, count, samples);
+  }
+#endif
 }
 
 }  // namespace
@@ -81,9 +117,11 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig owne
                          std::chrono::milliseconds reaper_interval)
     : PageBackend(tier, page_size,
                   std::make_unique<HostPageMemorySource>(HostPageMemorySource::Options{
-                      ownership.use_hugepages, ownership.hugepage_size, ownership.numa_node,
-                      ownership.prefault}),
-                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval) {}
+                      ownership.use_hugepages, ownership.hugepage_size, ownership.numa_nodes,
+                      ownership.prefault, ownership.numa_strict, ownership.prefault_threads}),
+                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval) {
+  buffer_numa_nodes_ = NormalizeNumaNodes(std::move(ownership.numa_nodes));
+}
 
 PageBackend::PageBackend(TierType tier, uint64_t page_size,
                          std::unique_ptr<PageMemorySource> source,
@@ -249,20 +287,52 @@ void PageBackend::Shutdown() {
 
 bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vector<Buffer>* out) {
   HostMemAllocator allocator;
-  HostBufferOptions opts;
-  opts.backing =
-      opts_.use_hugepages ? HostBufferBacking::kAnonymousHugetlb : HostBufferBacking::kAnonymous;
-  opts.hugepage_size = opts_.hugepage_size;
-  opts.numa_node = opts_.numa_node;
-  opts.prefault = opts_.prefault;
+  const auto nodes = NormalizeNumaNodes(opts_.numa_nodes);
+  if ((!nodes.empty() && nodes.size() != sizes.size()) || opts_.prefault_threads < 0 ||
+      opts_.prefault_threads > 16 ||
+      (!nodes.empty() && std::find(sizes.begin(), sizes.end(), 0) != sizes.end())) {
+    MORI_UMBP_ERROR(
+        "[HostPageMemorySource] invalid NUMA buffer sizes/nodes or prefault thread count");
+    return false;
+  }
+  const bool preferred = nodes.size() > 1 && !opts_.numa_strict;
+  const int thread_budget =
+      opts_.prefault_threads > 0
+          ? opts_.prefault_threads
+          : (nodes.size() > 1 ? std::max(1u, std::min(16u, std::thread::hardware_concurrency()))
+                              : 1);
+  const bool parallel =
+      opts_.prefault && std::any_of(sizes.begin(), sizes.end(),
+                                    [](uint64_t bytes) { return bytes >= (64ULL << 20); });
+  const int buffer_workers =
+      parallel ? std::max<size_t>(1, std::min<size_t>(sizes.size(), thread_budget)) : 1;
+  std::vector<HostBufferHandle> taken(sizes.size());
+  ParallelFor(sizes.size(), buffer_workers, [&](size_t i) {
+    if (sizes[i] == 0) return;
+    HostBufferOptions opts;
+    opts.backing =
+        opts_.use_hugepages ? HostBufferBacking::kAnonymousHugetlb : HostBufferBacking::kAnonymous;
+    opts.hugepage_size = opts_.hugepage_size;
+    opts.numa_node = nodes.empty() ? -1 : nodes[i];
+    opts.numa_bind_mode = preferred ? NumaBindMode::kPreferred : NumaBindMode::kBind;
+    opts.require_numa_binding = !nodes.empty() && opts_.numa_strict;
+    opts.prefault = opts_.prefault;
+    opts.prefault_threads = std::max(1, thread_budget / buffer_workers);
+    if (!nodes.empty()) {
+      MORI_UMBP_INFO(
+          "[HostPageMemorySource] tier layout (target): buffer={} node={} bytes={} policy={} "
+          "prefault_threads={}",
+          i, opts.numa_node, sizes[i], preferred ? "preferred" : "bind", opts.prefault_threads);
+    }
+    taken[i] = allocator.Alloc(sizes[i], opts);
+  });
 
-  std::vector<HostBufferHandle> taken;
   std::vector<Buffer> staged;
-  for (uint64_t size : sizes) {
-    if (size == 0) continue;
-    HostBufferHandle handle = allocator.Alloc(size, opts);
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    if (sizes[i] == 0) continue;
+    const auto& handle = taken[i];
     if (!handle.valid()) {
-      MORI_UMBP_ERROR("[HostPageMemorySource] host allocation failed for size={}", size);
+      MORI_UMBP_ERROR("[HostPageMemorySource] host allocation failed for size={}", sizes[i]);
       // All-or-nothing: unwind only what THIS call took, leaving any earlier
       // successful Allocate (and `out`) untouched.
       for (auto& h : taken) allocator.Free(h);
@@ -270,7 +340,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
     }
     // mapped_size, not the request: hugepage rounding makes the extra usable.
     staged.push_back(Buffer{handle.ptr, handle.mapped_size});
-    taken.push_back(handle);
+    if (!nodes.empty()) LogNumaPlacement(i, handle);
   }
 
   handles_.insert(handles_.end(), taken.begin(), taken.end());
@@ -302,7 +372,8 @@ AllocateResult PageBackend::Allocate(const std::string& key, uint64_t size) {
   return out;
 }
 
-AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size) {
+AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size,
+                                           int preferred_numa_node) {
   auto fail = [&](AllocateOutcome outcome, const char* reason) {
     MORI_UMBP_WARN("[PageBackend] Allocate reason={} key='{}' size={} tier={}", reason, key, size,
                    static_cast<int>(tier_));
@@ -329,7 +400,13 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
   }
 
   if (!allocator_) return fail(AllocateOutcome::kFailed, "NOT_CONFIGURED");
-  auto pages = allocator_->Allocate(num_pages);
+  std::optional<size_t> preferred_buffer;
+  if (preferred_numa_node >= 0) {
+    const auto it =
+        std::find(buffer_numa_nodes_.begin(), buffer_numa_nodes_.end(), preferred_numa_node);
+    if (it != buffer_numa_nodes_.end()) preferred_buffer = it - buffer_numa_nodes_.begin();
+  }
+  auto pages = allocator_->Allocate(num_pages, preferred_buffer);
   if (!pages) return fail(AllocateOutcome::kFailedNoSpace, "NO_SPACE");
 
   PendingSlot slot;
@@ -360,7 +437,7 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
   {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     for (size_t i = 0; i < entries.size(); ++i) {
-      out[i] = AllocateLocked(entries[i].key, entries[i].size);
+      out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node);
       if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
         out[i].descs = BuildBufferDescsLocked(out[i].pages);
       }

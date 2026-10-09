@@ -9,9 +9,9 @@ The 1P1D case is just N=1; the 2P1D case is N=2. Set `PREFILL_NODES` /
 
 For the architecture this benchmark exercises (master-as-advisor,
 heartbeat-event index, peer-owned allocator), see
-[`src/umbp/doc/design-master-control-plane.md`](../src/umbp/doc/design-master-control-plane.md).
+[`src/umbp/doc/design-master-control-plane.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/design-master-control-plane.md).
 Every `UMBP_*` env var referenced below is documented in
-[`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+[`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
 
 ## Table of Contents
 

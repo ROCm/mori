@@ -75,7 +75,13 @@ TEST(FieldCount, NestedCountsAsOne) { EXPECT_EQ(FieldCount<Nested>(), 3u); }
 
 // The Cfg's own count: if this ever disagrees with VisitFields(EpCfg), a field is
 // silently missing from the rendered text -- a wrong kernel, not a stale one.
-TEST(FieldCount, MatchesEpCfg) { EXPECT_EQ(FieldCount<EpCfg>(), 12u); }
+// Compared against the walk itself, not a literal, so adding a field cannot stale it.
+TEST(FieldCount, MatchesEpCfg) {
+  const EpCfg c{};
+  size_t visited = 0;
+  VisitFields(c, c, [&visited](const char*, const auto&, const auto&) { ++visited; });
+  EXPECT_EQ(FieldCount<EpCfg>(), visited);
+}
 #endif
 
 // --------------------------------------------------------------------------
@@ -414,7 +420,7 @@ TEST(EntryName, DistinguishesWhatAProfileNeedsToTellApart) {
   renamed([](EpCfg& c) { c.worldSize = 4; }, "worldSize");
   renamed([](EpCfg& c) { c.hiddenDim = 1024; }, "hiddenDim");
   renamed([](EpCfg& c) { c.numExpertPerToken = 4; }, "numExpertPerToken");
-  renamed([](EpCfg& c) { c.dtype = mori::ops::v2::EpDType::Byte8; }, "dtype");
+  renamed([](EpCfg& c) { c.dtype = mori::ops::v2::EpDType::Fp8; }, "dtype");
 }
 
 TEST(EntryName, IsALegalSymbol) {

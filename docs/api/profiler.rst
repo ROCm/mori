@@ -89,4 +89,4 @@ Available via ``mori.cpp`` when built with ``ENABLE_PROFILER=ON``:
    * - ``get_cur_device_wall_clock_freq_mhz()``
      - Get GPU wall clock frequency in MHz
 
-See `PROFILER.md <../PROFILER.md>`_ for full profiler documentation.
+See :doc:`PROFILER.md <../PROFILER>` for full profiler documentation.

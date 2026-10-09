@@ -61,6 +61,13 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // Combine never carries scales: it moves post-expert tokens, which are already
   // in the combine dtype. Only dispatch gets the row.
   c.scaleBytes = (kind == EpKernelKind::Dispatch) ? req.scaleBytes : 0;
+  c.combineFp4 = (kind == EpKernelKind::Combine) && req.combineFp4;
+  if (req.combineFp4F32Scale && !req.combineFp4) {
+    throw std::runtime_error(
+        "mori v2 ep: combineFp4F32Scale picks the fp4 combine's scale format, so it needs "
+        "combineFp4");
+  }
+  c.combineFp4F32Scale = c.combineFp4 && req.combineFp4F32Scale;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -70,6 +77,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // sooner; 64x8 measured best for combine at every token count and topk on
   // mi355x, so it replaces v1's 80x4.
   const bool isDispatch = kind == EpKernelKind::Dispatch;
+  // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
+  // the rendered source and its cache key, stays exactly what it was without it.
+  c.selfFirst = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
@@ -82,10 +92,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   c.blockNum = EnvInt(blkVar, c.blockNum);
   c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
 
-  // Byte8 is transport-only. Dispatch copies its payload untouched, but combine
-  // sums across sources, so a byte type there would compile and silently reduce
-  // garbage. Reject it here rather than let a Cfg like that reach hipcc.
-  if (!isDispatch && c.dtype == EpDType::Byte8) {
+  // The byte types are transport-only. Dispatch copies its payload untouched,
+  // but combine sums across sources, so a byte type there would compile and
+  // silently reduce garbage. Reject it here rather than let a Cfg like that
+  // reach hipcc.
+  if (!isDispatch && EpDTypeIsByte(c.dtype)) {
     throw std::runtime_error(
         "mori v2 ep: combine reduces its input, so it needs an arithmetic dtype; "
         "fp8/fp4 are dispatch-transport only (pair them with a bf16/fp32 combine)");
@@ -96,9 +107,10 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
-        " blocks=" + std::to_string(c.blockNum) +
+        " blocks=" + std::to_string(c.blockNum) + " selfFirst=" + std::to_string(c.selfFirst) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
-        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize)");
+        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
+        "selfFirst needs warpPerBlock >= 2, worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }
@@ -188,13 +200,20 @@ const std::vector<std::string>& EpSourceDeps() {
 }  // namespace
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
-std::string EpCombineSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "combine"); }
+std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
+  return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
+}
 
 std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
   return RenderEpSource(cfg, EntryName(cfg), "EpDispatchBody", "EpDispatch1250xBody");
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
+  if (cfg.combineFp4 && !EpArchIs1250()) {
+    throw std::runtime_error(
+        "mori v2 ep: the fp4 combine is gfx125x only (it moves every token through TDM)");
+  }
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }
 

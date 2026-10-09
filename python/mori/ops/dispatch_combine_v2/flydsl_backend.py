@@ -41,6 +41,7 @@ from .intranode_kernels import (
 )
 from .dispatch_combine_op import (  # noqa: F401
     _DT,
+    _FP4_QUANT_TYPES,
     _FP8_DTYPES,
     _QUANT_TYPES,
     EpDispatchCombineConfig,
@@ -67,6 +68,11 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 f"gpu_per_node={cfg.gpu_per_node} < world_size={cfg.world_size} "
                 "selects the internode path, which only the 'hip' backend "
                 "implements; pass kernel_backend='hip'",
+            )
+        if cfg.quant_type in _FP4_QUANT_TYPES:
+            return (
+                f"quant_type={cfg.quant_type!r} is the hip backend's gfx125x combine; "
+                "pass kernel_backend='hip'",
             )
         return ()
 

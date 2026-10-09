@@ -27,6 +27,10 @@
 
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
 // If the system mlx5dv.h is available, use it directly.
 // Otherwise, provide our own minimal definitions.
 #if __has_include(<infiniband/mlx5dv.h>)
@@ -113,3 +117,21 @@ enum mlx5dv_obj_type {
 #endif
 
 #endif  // __has_include(<infiniband/mlx5dv.h>)
+
+// Input for the dlsym'd mlx5dv_devx_umem_reg_ex. Declared MORI-side, matching
+// rdma-core's ABI: older rdma-core lacks dmabuf_fd and MLX5DV_UMEM_MASK_DMABUF even
+// when <infiniband/mlx5dv.h> is present, so its type cannot carry the dmabuf fd.
+// With the mask set, `addr` is the dmabuf-relative offset; a libmlx5 too old for
+// dmabuf rejects the comp_mask and the caller falls back to peermem.
+struct MoriMlx5DevxUmemIn {
+  void* addr;
+  size_t size;
+  uint32_t access;
+  uint64_t pgsz_bitmap;
+  uint64_t comp_mask;
+  int dmabuf_fd;
+};
+
+enum MoriMlx5DevxUmemMask {
+  MORI_MLX5DV_UMEM_MASK_DMABUF = 1 << 0,
+};

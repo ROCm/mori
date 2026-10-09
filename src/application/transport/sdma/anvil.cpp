@@ -339,6 +339,29 @@ bool AnvilLib::connect(int srcDeviceId, int dstDeviceId, int numChannels) {
       engines.push_back(e);
     }
   }
+
+  // MI308X is a 4-XCD harvest of the 8-XCD MI300X: only 4 physical SDMA engines
+  // exist, exposed at the even KFD logical engine ids (0,2,4,6); the odd ids
+  // (1,3,5,7) name fused-off engines. IP-discovery firmware still advertises the
+  // full MI300X layout (2 general + 6 xGMI = 8) and recommended_sdma_engine_id_mask
+  // points at odd ids for many links (this box lacks the upstream amdkfd
+  // "rec SDMA engines with limited XGMI" fix). Creating a queue on an odd id and
+  // ringing its doorbell hangs, so fold every selected id down to its backing
+  // even engine (id & ~1) and dedup, preserving order, so the per-engine queue
+  // budget is not double-charged.
+  if (isMi308x(srcDeviceId)) {
+    uint32_t seen = 0;
+    std::vector<uint32_t> evenEngines;
+    for (uint32_t e : engines) {
+      uint32_t backing = e & ~1u;
+      if (!(seen & (1u << backing))) {
+        seen |= (1u << backing);
+        evenEngines.push_back(backing);
+      }
+    }
+    engines.swap(evenEngines);
+  }
+
   int numEngines = static_cast<int>(engines.size());
 
   // Queues live in this process-global singleton and are shared across every
@@ -412,6 +435,15 @@ bool AnvilLib::isGfx1250(int deviceId) {
   HsaNodeProperties props{};
   if (hsaKmtGetNodeProperties(getNodeId(deviceId), &props) != HSAKMT_STATUS_SUCCESS) return false;
   return props.EngineId.ui32.Major == 12 && props.EngineId.ui32.Minor == 5;
+}
+
+// MI308X (PCI device_id 0x74A2) is a 4-XCD harvest of the 8-XCD MI300X. Both are
+// gfx942, so EngineId cannot tell them apart; match the PCI device id instead.
+// See connect() for why its odd SDMA engine ids must be avoided.
+bool AnvilLib::isMi308x(int deviceId) {
+  HsaNodeProperties props{};
+  if (hsaKmtGetNodeProperties(getNodeId(deviceId), &props) != HSAKMT_STATUS_SUCCESS) return false;
+  return props.DeviceId == 0x74A2;
 }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcDeviceId, int dstDeviceId, int channel_idx) {

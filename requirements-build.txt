@@ -1,7 +1,14 @@
 cmake>=3.19
 setuptools>=65
 setuptools-scm>=8
+wheel
 pybind11
 ninja
+# Builds the mori.cco.cco extension. pyproject.toml pulls it in under build
+# isolation, but a --no-build-isolation build takes this file instead -- and
+# setup.py only warns when Cython is missing, so leaving it out drops the cco
+# extension, and with it the flydsl backend, from an install that still reports
+# success.
+Cython>=3.0
 prettytable
 pytest-assume

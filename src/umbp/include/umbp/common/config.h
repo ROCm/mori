@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include "umbp/common/numa_config.h"
+
 namespace mori::umbp {
 
 enum class UMBPRole : int {
@@ -62,8 +64,10 @@ struct UMBPDramConfig {
   // Host memory options (ignored when use_shared_memory=true).
   bool use_hugepages = false;
   size_t hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
-  int numa_node = -1;                         // -1 = no NUMA binding
+  std::vector<int> numa_nodes;                // Empty = no NUMA binding.
   bool prefault = true;
+  bool numa_strict = false;
+  int prefault_threads = 0;  // 0 = automatic (up to 16 for multi-node tiers), 1 = serial.
 };
 
 struct UMBPIoConfig {
@@ -342,6 +346,10 @@ struct UMBPDistributedConfig {
   size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
   uint16_t peer_service_port = 0;  // gRPC peer service port
+
+  // Start the peer service on a gRPC-selected port instead of a caller-supplied
+  // one. See PoolClientConfig::auto_peer_service_port.
+  bool auto_peer_service_port = false;
 
   bool cache_remote_fetches = true;  // cache remotely-fetched blocks locally
 
@@ -644,7 +652,16 @@ struct UMBPConfig {
     cfg.dram.use_hugepages =
         getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
     cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
-    cfg.dram.numa_node = getenv_int("UMBP_DRAM_NUMA_NODE", cfg.dram.numa_node);
+    // Blank counts as unset, like -1: launch scripts often export VAR=${X:-}.
+    if (const char* nodes = std::getenv("UMBP_DRAM_NUMA_NODE");
+        nodes != nullptr && std::string(nodes).find_first_not_of(" \t\r\n") != std::string::npos) {
+      cfg.dram.numa_nodes = ParseNumaNodes(nodes);
+    }
+    cfg.dram.numa_strict = getenv_int("UMBP_DRAM_NUMA_STRICT", 0) != 0;
+    cfg.dram.prefault_threads = getenv_int("UMBP_DRAM_PREFAULT_THREADS", 0);
+    if (cfg.dram.prefault_threads < 0 || cfg.dram.prefault_threads > 16) {
+      throw std::invalid_argument("UMBP_DRAM_PREFAULT_THREADS must be between 0 and 16");
+    }
     cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
     cfg.ssd.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd.ssd_backend);

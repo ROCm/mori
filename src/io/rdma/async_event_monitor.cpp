@@ -139,13 +139,13 @@ class AsyncEventAckGuard {
 
 std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
     const application::RdmaDeviceList& devices, std::shared_ptr<spdlog::logger> logger,
-    PeerFailureCallback onPeerFailure) {
+    QpErrorHandler errorHandler, PeerFailureCallback onPeerFailure) {
   // Thread creation and allocations can throw; a failed monitor must degrade to
   // "no observability", never abort RDMA backend construction. On any throw the
   // in-scope unique_ptr unwinds through Shutdown() and releases monitor fds.
   try {
-    std::unique_ptr<RdmaAsyncEventMonitor> monitor(
-        new RdmaAsyncEventMonitor(std::move(logger), std::move(onPeerFailure)));
+    std::unique_ptr<RdmaAsyncEventMonitor> monitor(new RdmaAsyncEventMonitor(
+        std::move(logger), std::move(errorHandler), std::move(onPeerFailure)));
     if (!monitor->Start(devices)) return nullptr;
     return monitor;
   } catch (...) {
@@ -154,8 +154,11 @@ std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
 }
 
 RdmaAsyncEventMonitor::RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger,
+                                             QpErrorHandler errorHandler,
                                              PeerFailureCallback onPeerFailure)
-    : logger_(std::move(logger)), onPeerFailure_(std::move(onPeerFailure)) {}
+    : logger_(std::move(logger)),
+      errorHandler_(std::move(errorHandler)),
+      onPeerFailure_(std::move(onPeerFailure)) {}
 
 RdmaAsyncEventMonitor::~RdmaAsyncEventMonitor() { Shutdown(); }
 
@@ -315,6 +318,7 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
     }
   }
   DescribeAndLog(watch, info);
+  ReportUncompletableIfNeeded(watch, info);
   ReportTransportEvent(watch, info);
   return GetResult::kEvent;
 }
@@ -382,6 +386,47 @@ void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
     SafeLog(spdlog::level::err,
             "RDMA async monitor: failed to report transport event type {} on {}",
             static_cast<int>(info.type), watch.deviceName);
+  }
+}
+
+void RdmaAsyncEventMonitor::ReportUncompletableIfNeeded(const Watch& watch,
+                                                        const EventInfo& info) noexcept {
+  if (!errorHandler_) return;
+
+  QpErrorEvent event;
+  event.context = watch.context;
+  event.eventName = DescribeAsyncEvent(info.type).name;
+  if (event.eventName == nullptr) event.eventName = "IBV_EVENT_UNKNOWN";
+
+  switch (info.type) {
+    case IBV_EVENT_QP_FATAL:
+    case IBV_EVENT_QP_REQ_ERR:
+    case IBV_EVENT_QP_ACCESS_ERR:
+      // A null element.qp leaves no way to identify the endpoint; the flush
+      // cascade still covers this case, so drop it rather than guess.
+      if (info.objPtr == nullptr) return;
+      event.scope = QpErrorEvent::Scope::kQueuePair;
+      event.qpNum = info.qpNum;
+      break;
+    case IBV_EVENT_CQ_ERR:
+      if (info.objPtr == nullptr) return;
+      event.scope = QpErrorEvent::Scope::kCompletionQueue;
+      event.cq = info.objPtr;
+      break;
+    case IBV_EVENT_DEVICE_FATAL:
+      event.scope = QpErrorEvent::Scope::kDevice;
+      break;
+    default:
+      // PORT_ERR and friends can recover (a PORT_ACTIVE usually follows) and the
+      // QP survives, so failing transfers on them would be wrong.
+      return;
+  }
+
+  try {
+    errorHandler_(event);
+  } catch (...) {
+    SafeLog(spdlog::level::err, "RDMA async monitor: error handler threw on {}; ignoring",
+            event.eventName);
   }
 }
 

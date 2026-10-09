@@ -61,10 +61,12 @@ __all__ = [
 ]
 
 # Must match mori::ops::v2::EpDType; an enum-tagged request field accepts a name
-# from here as well as an int. "byte8" is the transport type fp8 and fp4 both map
-# to -- dispatch only copies, so one byte covers fp8 directly and fp4 as 2 e2m1
-# (the caller halves hiddenDim). Combine cannot use it; C++ rejects that.
-DTYPES = {"bf16": 0, "fp32": 1, "byte8": 2}
+# from here as well as an int. fp8 and fp4x2 are both transport types -- dispatch
+# only copies, so both move one byte per ELEMENT and compile to the same kernel
+# body. They are distinct names so the kernel symbol says which it is: an fp4x2
+# element is 2 e2m1, so hiddenDim counts BYTES there and the caller halves it.
+# Combine cannot use either; C++ rejects that.
+DTYPES = {"bf16": 0, "fp32": 1, "fp8": 2, "fp4x2": 3}
 
 # Arena regions a caller is allowed not to carry. Everything else missing is a
 # bug in the caller, not a configuration: see the bind loop in make_plan.
@@ -396,9 +398,9 @@ def _enum_code(value) -> int:
         "float32": "fp32",
         "float": "fp32",
         # every sub-16-bit dtype is transported as raw bytes; see DTYPES
-        "float8_e4m3fn": "byte8",
-        "float8_e4m3fnuz": "byte8",
-        "float4_e2m1fn_x2": "byte8",
+        "float8_e4m3fn": "fp8",
+        "float8_e4m3fnuz": "fp8",
+        "float4_e2m1fn_x2": "fp4x2",
     }.get(name, name)
     if name not in DTYPES:
         raise ValueError(

@@ -59,7 +59,7 @@ struct PolicyBackendSpec {
   TierType tier = TierType::UNKNOWN;
   uint64_t capacity_bytes = 0;
   std::vector<int> devices;
-  int numa_node = -1;
+  std::vector<int> numa_nodes;
   std::string path;
   // SSD only. The backend's staging arena is staging_slots * page_size, and a
   // read that cannot claim a slot is reported as a miss rather than as
