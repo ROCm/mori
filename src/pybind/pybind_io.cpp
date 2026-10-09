@@ -70,10 +70,11 @@ void RegisterMoriIo(pybind11::module_& m) {
 
   py::enum_<mori::io::PeerFailureReason>(m, "PeerFailureReason")
       .value("UNKNOWN", mori::io::PeerFailureReason::UNKNOWN)
-      .value("QP_FATAL", mori::io::PeerFailureReason::QP_FATAL)
-      .value("PORT_DOWN", mori::io::PeerFailureReason::PORT_DOWN)
-      .value("DEVICE_FATAL", mori::io::PeerFailureReason::DEVICE_FATAL)
-      .value("CQ_ERROR", mori::io::PeerFailureReason::CQ_ERROR)
+      .value("PEER_UNREACHABLE", mori::io::PeerFailureReason::PEER_UNREACHABLE)
+      .value("LOCAL_QP_ERROR", mori::io::PeerFailureReason::LOCAL_QP_ERROR)
+      .value("LOCAL_PORT_DOWN", mori::io::PeerFailureReason::LOCAL_PORT_DOWN)
+      .value("LOCAL_DEVICE_FATAL", mori::io::PeerFailureReason::LOCAL_DEVICE_FATAL)
+      .value("LOCAL_CQ_ERROR", mori::io::PeerFailureReason::LOCAL_CQ_ERROR)
       .export_values();
 
   py::class_<mori::io::PeerFailureEvent>(m, "PeerFailureEvent")
@@ -81,6 +82,7 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("remote_engine_key", &mori::io::PeerFailureEvent::remoteEngineKey)
       .def_readonly("reason", &mori::io::PeerFailureEvent::reason)
       .def_readonly("qp_num", &mori::io::PeerFailureEvent::qpNum)
+      .def_readonly("port_num", &mori::io::PeerFailureEvent::portNum)
       .def_readonly("device_name", &mori::io::PeerFailureEvent::deviceName)
       .def_readonly("detail", &mori::io::PeerFailureEvent::detail);
 

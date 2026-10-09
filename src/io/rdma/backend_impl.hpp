@@ -112,12 +112,18 @@ class RdmaManager {
   bool HasIonicDevice() const;
 
   /* -------------------------------- Peer failure -------------------------------- */
-  // Takes the oldest recorded peer failure. Polled by an application thread;
-  // failures are recorded on the async-event monitor thread.
+  // Takes the oldest recorded failure. Polled by an application thread;
+  // failures are recorded on the async-event monitor and CQ poller threads.
   bool PopPeerFailure(PeerFailureEvent* out);
-  // False once a fatal event has been observed for this QP or its device. A QP
-  // that is merely slow stays alive.
-  bool IsQpAlive(uint32_t qpNum) const;
+  // False once a failure covering this QP has been observed. A QP that is
+  // merely slow stays alive.
+  bool IsQpAlive(int devId, uint32_t qpNum) const;
+  // Records that a peer stopped acknowledging, from IBV_WC_RETRY_EXC_ERR on one
+  // of its completions. The only place peer death is actually observable.
+  void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
+  // Name of an available device, or empty for an out-of-range id. availDevices
+  // is fixed after construction, so this takes no lock.
+  std::string DeviceName(int devId) const;
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -139,8 +145,8 @@ class RdmaManager {
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
 
-  // Self-synchronizing, so deliberately not guarded by `mu`; that also keeps the
-  // monitor thread off the transfer hot path's lock.
+  // Written by the monitor thread and the CQ poller, which ~RdmaBackend joins
+  // before this manager dies. Self-synchronizing, so not guarded by `mu`.
   PeerFailureTracker peerFailures_;
 
   // Declared last so it is the first member destroyed, and explicitly reset at

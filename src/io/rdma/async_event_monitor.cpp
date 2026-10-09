@@ -100,20 +100,27 @@ EventDescriptor DescribeAsyncEvent(ibv_event_type type) {
   }
 }
 
-// Maps an async event onto a peer-failure reason. Returns nullopt for events that
-// do not mean a peer is unusable, including the PORT_ACTIVE recovery event.
-std::optional<PeerFailureReason> ClassifyPeerFailure(ibv_event_type type) {
+struct PeerFailureClass {
+  PeerFailureReason reason;
+  FailureScope scope;
+};
+
+// Maps an async event onto a failure reason and the scope of the resource it
+// invalidates. Returns nullopt for events that leave the transport usable,
+// including PORT_ACTIVE, which is handled as a recovery instead. None of these
+// mean the peer died; that arrives as a completion error, not an async event.
+std::optional<PeerFailureClass> ClassifyPeerFailure(ibv_event_type type) {
   switch (type) {
     case IBV_EVENT_QP_FATAL:
     case IBV_EVENT_QP_REQ_ERR:
     case IBV_EVENT_QP_ACCESS_ERR:
-      return PeerFailureReason::QP_FATAL;
+      return PeerFailureClass{PeerFailureReason::LOCAL_QP_ERROR, FailureScope::kQp};
     case IBV_EVENT_PORT_ERR:
-      return PeerFailureReason::PORT_DOWN;
+      return PeerFailureClass{PeerFailureReason::LOCAL_PORT_DOWN, FailureScope::kPort};
     case IBV_EVENT_DEVICE_FATAL:
-      return PeerFailureReason::DEVICE_FATAL;
+      return PeerFailureClass{PeerFailureReason::LOCAL_DEVICE_FATAL, FailureScope::kDevice};
     case IBV_EVENT_CQ_ERR:
-      return PeerFailureReason::CQ_ERROR;
+      return PeerFailureClass{PeerFailureReason::LOCAL_CQ_ERROR, FailureScope::kCq};
     default:
       return std::nullopt;
   }
@@ -311,36 +318,75 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
     }
   }
   DescribeAndLog(watch, info);
-  ReportPeerFailureIfFatal(watch, info);
+  ReportTransportEvent(watch, info);
   return GetResult::kEvent;
 }
 
-void RdmaAsyncEventMonitor::ReportPeerFailureIfFatal(const Watch& watch,
-                                                     const EventInfo& info) noexcept {
+void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
+                                                 const EventInfo& info) noexcept {
   if (!onPeerFailure_) return;
 
-  std::optional<PeerFailureReason> reason = ClassifyPeerFailure(info.type);
-  if (!reason.has_value()) return;
+  const bool portScoped = DescribeAsyncEvent(info.type).category == Category::kPort;
+  const bool portKnown = portScoped && info.portNum >= 1 &&
+                         static_cast<uint32_t>(info.portNum) <= watch.physicalPortCount;
+  const uint32_t portNum = portKnown ? static_cast<uint32_t>(info.portNum) : 0;
 
-  // The callback and the string building below allocate; this runs on the
+  // The callbacks and the string building below allocate; this runs on the
   // monitor thread inside a noexcept boundary, so nothing may escape.
   try {
-    EventDescriptor desc = DescribeAsyncEvent(info.type);
-    PeerFailureEvent event;
-    event.reason = *reason;
-    // Only QP-scoped events carry a QP number; port and device events are left at
-    // 0 so the consumer treats them as device-wide.
-    event.qpNum = desc.category == Category::kQp ? info.qpNum : 0;
-    event.deviceName = watch.deviceName;
-    event.detail = std::string(desc.name != nullptr ? desc.name : "IBV_EVENT_UNKNOWN") +
-                   " on device " + watch.deviceName;
-    if (event.qpNum != 0) {
-      event.detail += " qpn=" + std::to_string(event.qpNum);
+    // PORT_ACTIVE is the counterpart of PORT_ERR; reporting it withdraws the
+    // port's failure so a link flap does not condemn the NIC for good.
+    if (info.type == IBV_EVENT_PORT_ACTIVE) {
+      if (!portKnown) return;
+      PeerFailureReport report;
+      report.recovery = true;
+      report.scope = FailureScope::kPort;
+      report.event.reason = PeerFailureReason::LOCAL_PORT_DOWN;
+      report.event.deviceName = watch.deviceName;
+      report.event.portNum = portNum;
+      onPeerFailure_(report);
+      return;
     }
-    onPeerFailure_(event);
+
+    std::optional<PeerFailureClass> failure = ClassifyPeerFailure(info.type);
+    if (!failure.has_value()) return;
+    // A port event we cannot place has no scope: widening it to the device
+    // would condemn unrelated ports, so leave it to the log.
+    if (failure->scope == FailureScope::kPort && !portKnown) {
+      SafeLog(spdlog::level::warn,
+              "RDMA async monitor: port event type {} on {} has no usable port number; not "
+              "reported as a failure",
+              static_cast<int>(info.type), watch.deviceName);
+      return;
+    }
+
+    EventDescriptor desc = DescribeAsyncEvent(info.type);
+    PeerFailureReport report;
+    report.scope = failure->scope;
+    report.event.reason = failure->reason;
+    report.event.deviceName = watch.deviceName;
+    // Each field is filled only where ProcessOneEvent actually captured it.
+    report.event.qpNum = desc.category == Category::kQp ? info.qpNum : 0;
+    report.event.portNum = portNum;
+    report.cqHandle = desc.category == Category::kCq ? info.objPtr : nullptr;
+    // Without the CQ handle there is no telling which QPs lose completions, so
+    // widen to the device rather than scope the failure to nothing.
+    if (report.scope == FailureScope::kCq && report.cqHandle == nullptr) {
+      report.scope = FailureScope::kDevice;
+    }
+
+    report.event.detail = std::string(desc.name != nullptr ? desc.name : "IBV_EVENT_UNKNOWN") +
+                          " on device " + watch.deviceName;
+    if (report.event.qpNum != 0) {
+      report.event.detail += " qpn=" + std::to_string(report.event.qpNum);
+    }
+    if (report.event.portNum != 0) {
+      report.event.detail += " port=" + std::to_string(report.event.portNum);
+    }
+    onPeerFailure_(report);
   } catch (...) {
     SafeLog(spdlog::level::err,
-            "RDMA async monitor: failed to report peer failure for event type {} on {}",
+            "RDMA async monitor: failed to report transport event type {} on {}",
             static_cast<int>(info.type), watch.deviceName);
   }
 }

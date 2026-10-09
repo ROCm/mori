@@ -26,38 +26,66 @@
 namespace mori {
 namespace io {
 
-void PeerFailureTracker::RegisterQp(uint32_t qpNum, std::string remoteEngineKey,
-                                    std::string deviceName) {
+void PeerFailureTracker::RegisterQp(const QpKey& qp, std::string remoteEngineKey, uint32_t portNum,
+                                    const void* cqHandle) {
   std::lock_guard<std::mutex> lock(mu_);
-  qpOwners_[qpNum] = QpOwner{std::move(remoteEngineKey), std::move(deviceName)};
+  qpOwners_[qp] = QpOwner{std::move(remoteEngineKey), portNum, cqHandle};
 }
 
-void PeerFailureTracker::ForgetQp(uint32_t qpNum) {
+void PeerFailureTracker::ForgetQp(const QpKey& qp) {
   std::lock_guard<std::mutex> lock(mu_);
-  qpOwners_.erase(qpNum);
+  qpOwners_.erase(qp);
 }
 
-void PeerFailureTracker::Record(PeerFailureEvent event) {
-  std::lock_guard<std::mutex> lock(mu_);
-
-  if (event.qpNum != 0) {
-    failedQpns_.insert(event.qpNum);
-    auto it = qpOwners_.find(event.qpNum);
-    if (it != qpOwners_.end()) {
-      event.remoteEngineKey = it->second.remoteEngineKey;
-      // Fall back to the device the QP was created on, so the field is populated
-      // even when the monitor could not name it.
-      if (event.deviceName.empty()) event.deviceName = it->second.deviceName;
-    }
-  } else if (!event.deviceName.empty()) {
-    failedDevices_.insert(event.deviceName);
-  }
-
+void PeerFailureTracker::Enqueue(PeerFailureEvent event) {
   if (pending_.size() >= kMaxPending) {
     dropped_++;
     return;
   }
   pending_.push_back(std::move(event));
+}
+
+void PeerFailureTracker::Report(const PeerFailureReport& report) {
+  PeerFailureEvent event = report.event;
+  std::lock_guard<std::mutex> lock(mu_);
+
+  if (report.recovery) {
+    // Withdraws the port-wide verdict so sessions that died only to a link flap
+    // work again. QPs that failed in their own right stay failed: a QP in the
+    // error state does not heal.
+    failedPorts_.erase(PortKey{event.deviceName, event.portNum});
+    return;
+  }
+
+  bool firstForResource = false;
+  switch (report.scope) {
+    case FailureScope::kQp: {
+      QpKey key{event.deviceName, event.qpNum};
+      firstForResource = failedQps_.insert(key).second;
+      auto it = qpOwners_.find(key);
+      if (it != qpOwners_.end()) {
+        // Attribution from the reporter wins; the registry only fills in what
+        // the event could not carry.
+        if (event.remoteEngineKey.empty()) event.remoteEngineKey = it->second.remoteEngineKey;
+        if (event.portNum == 0) event.portNum = it->second.portNum;
+      }
+      break;
+    }
+    case FailureScope::kPort:
+      firstForResource = failedPorts_.insert(PortKey{event.deviceName, event.portNum}).second;
+      break;
+    case FailureScope::kDevice:
+      firstForResource = failedDevices_.insert(event.deviceName).second;
+      break;
+    case FailureScope::kCq:
+      firstForResource = failedCqs_.insert(CqKey{event.deviceName, report.cqHandle}).second;
+      break;
+  }
+
+  // A repeat for a resource already known bad adds nothing, and a CQE error
+  // burst would otherwise fill the queue with copies of one failure.
+  if (!firstForResource) return;
+  Enqueue(std::move(event));
 }
 
 bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
@@ -69,14 +97,23 @@ bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
   return true;
 }
 
-bool PeerFailureTracker::IsQpAlive(uint32_t qpNum) const {
+bool PeerFailureTracker::IsQpAlive(const QpKey& qp) const {
   std::lock_guard<std::mutex> lock(mu_);
-  if (failedQpns_.count(qpNum) != 0) return false;
-  if (failedDevices_.empty()) return true;
-  auto it = qpOwners_.find(qpNum);
-  // An unregistered QP cannot be tied to a failed device, so it stays alive.
+  if (failedQps_.count(qp) != 0) return false;
+  // Device-wide, so it applies whether or not this QP was ever registered.
+  if (failedDevices_.count(qp.deviceName) != 0) return false;
+
+  // An unregistered QP cannot be tied to a port or a CQ, so nothing else here
+  // can condemn it.
+  auto it = qpOwners_.find(qp);
   if (it == qpOwners_.end()) return true;
-  return failedDevices_.count(it->second.deviceName) == 0;
+
+  if (failedPorts_.count(PortKey{qp.deviceName, it->second.portNum}) != 0) return false;
+  if (it->second.cqHandle != nullptr &&
+      failedCqs_.count(CqKey{qp.deviceName, it->second.cqHandle}) != 0) {
+    return false;
+  }
+  return true;
 }
 
 uint64_t PeerFailureTracker::Dropped() const {

@@ -266,7 +266,7 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   if (enableAsyncEvents) {
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
     asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(
-        devices, logger, [this](const PeerFailureEvent& event) { peerFailures_.Record(event); });
+        devices, logger, [this](const PeerFailureReport& report) { peerFailures_.Report(report); });
     if (!asyncEventMonitor_ && logger) {
       logger->error("Failed to start RDMA async event monitor; continuing without it");
     }
@@ -559,7 +559,13 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
       MORI_IO_WARN("DestroyEndpointNoThrow: invalid devId={} for qpn={}", devId, ep.handle.qpn);
       return false;
     }
-    return deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
+    const bool destroyed = deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
+    // Drop the association once the QP is really gone, so its number cannot be
+    // reused under a stale owner. Recorded failures stay drainable.
+    if (destroyed) {
+      peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
+    }
+    return destroyed;
   } catch (const std::exception& e) {
     MORI_IO_ERROR("DestroyEndpointNoThrow caught exception for devId={} qpn={}: {}", devId,
                   ep.handle.qpn, e.what());
@@ -596,15 +602,38 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   endpointsById_[id] = rt;
   endpointsEpoch_.fetch_add(1, std::memory_order_release);
 
-  // Remember who this QP talks to so a later async event, which carries only a
-  // QP number, can name the peer it affects.
-  peerFailures_.RegisterQp(local.handle.qpn, remoteKey, availDevices[devId].first->Name());
+  // Remember who this QP talks to, and which port and CQ it depends on, so a
+  // later failure of any of them can be resolved back to this peer.
+  peerFailures_.RegisterQp(
+      PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
+      local.handle.portId, local.ibvHandle.cq);
   return id;
+}
+
+std::string RdmaManager::DeviceName(int devId) const {
+  if (devId < 0 || devId >= static_cast<int>(availDevices.size())) return {};
+  return availDevices[devId].first->Name();
 }
 
 bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.Pop(out); }
 
-bool RdmaManager::IsQpAlive(uint32_t qpNum) const { return peerFailures_.IsQpAlive(qpNum); }
+bool RdmaManager::IsQpAlive(int devId, uint32_t qpNum) const {
+  return peerFailures_.IsQpAlive(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
+}
+
+void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText) {
+  PeerFailureReport report;
+  report.scope = FailureScope::kQp;
+  report.event.reason = PeerFailureReason::PEER_UNREACHABLE;
+  report.event.remoteEngineKey = ep.remoteEngineKey;
+  report.event.qpNum = ep.local.handle.qpn;
+  report.event.portNum = ep.local.handle.portId;
+  report.event.deviceName = DeviceName(ep.ldevId);
+  report.event.detail = std::string("completion status ") +
+                        (statusText != nullptr ? statusText : "unknown") +
+                        ": peer did not acknowledge within the transport retry budget";
+  peerFailures_.Report(report);
+}
 
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
@@ -757,6 +786,13 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                 "vendor_err={}",
                 wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
                 wc[i].qp_num, wc[i].vendor_err);
+          }
+
+          // Retries exhausted without an ack: the one completion status that
+          // says something about the peer rather than about us. Repeat reports
+          // for the same QP fold into the first.
+          if (wc[i].status == IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
+            rdma->RecordPeerUnreachable(ep, failureAdvice.statusText);
           }
         }
 
@@ -1489,11 +1525,11 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 }
 
 bool RdmaBackendSession::Alive() const {
-  // Liveness of the transport, not progress of a transfer: only an observed fatal
-  // event makes this false, so a slow but reachable peer stays alive.
+  // Liveness of the transport, not progress of a transfer: only an observed
+  // failure makes this false, so a slow but reachable peer stays alive.
   if (rdma_ == nullptr) return true;
   for (const auto& ep : eps) {
-    if (!rdma_->IsQpAlive(ep.local.handle.qpn)) return false;
+    if (!rdma_->IsQpAlive(ep.ldevId, ep.local.handle.qpn)) return false;
   }
   return true;
 }
