@@ -105,10 +105,7 @@ struct PeerFailureClass {
   FailureScope scope;
 };
 
-// Maps an async event onto a failure reason and the scope of the resource it
-// invalidates. Returns nullopt for events that leave the transport usable,
-// including PORT_ACTIVE, which is handled as a recovery instead. None of these
-// mean the peer died; that arrives as a completion error, not an async event.
+// Maps an async event onto a failure reason and scope; nullopt if still usable.
 std::optional<PeerFailureClass> ClassifyPeerFailure(ibv_event_type type) {
   switch (type) {
     case IBV_EVENT_QP_FATAL:
@@ -331,11 +328,10 @@ void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
                          static_cast<uint32_t>(info.portNum) <= watch.physicalPortCount;
   const uint32_t portNum = portKnown ? static_cast<uint32_t>(info.portNum) : 0;
 
-  // The callbacks and the string building below allocate; this runs on the
+  // The callback and the string building below allocate; this runs on the
   // monitor thread inside a noexcept boundary, so nothing may escape.
   try {
-    // PORT_ACTIVE is the counterpart of PORT_ERR; reporting it withdraws the
-    // port's failure so a link flap does not condemn the NIC for good.
+    // Counterpart of PORT_ERR: withdraws the failure a link flap raised.
     if (info.type == IBV_EVENT_PORT_ACTIVE) {
       if (!portKnown) return;
       PeerFailureReport report;
@@ -350,8 +346,7 @@ void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
 
     std::optional<PeerFailureClass> failure = ClassifyPeerFailure(info.type);
     if (!failure.has_value()) return;
-    // A port event we cannot place has no scope: widening it to the device
-    // would condemn unrelated ports, so leave it to the log.
+    // Unplaceable, and widening to the device would condemn unrelated ports.
     if (failure->scope == FailureScope::kPort && !portKnown) {
       SafeLog(spdlog::level::warn,
               "RDMA async monitor: port event type {} on {} has no usable port number; not "
@@ -369,8 +364,7 @@ void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
     report.event.qpNum = desc.category == Category::kQp ? info.qpNum : 0;
     report.event.portNum = portNum;
     report.cqHandle = desc.category == Category::kCq ? info.objPtr : nullptr;
-    // Without the CQ handle there is no telling which QPs lose completions, so
-    // widen to the device rather than scope the failure to nothing.
+    // No CQ handle means no way to tell which QPs are affected; widen to the device.
     if (report.scope == FailureScope::kCq && report.cqHandle == nullptr) {
       report.scope = FailureScope::kDevice;
     }

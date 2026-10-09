@@ -138,8 +138,19 @@ void CaseQpFailureIsAttributed() {
   Require(!tracker.Pop(&event), "queue must be drained after one pop");
 }
 
-// QP numbers are handed out per device and collide across NICs, so a failure on
-// one device must not touch the same-numbered QP on another.
+// An event for a QP we never registered is still reported, just unattributed.
+// Losing the event would be worse than losing the peer's name.
+void CaseUnknownQpStillReported() {
+  PeerFailureTracker tracker;
+  tracker.Report(QpFailure(77));
+
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event), "failure for unknown QP must still be reported");
+  Require(event.remoteEngineKey.empty(), "unresolvable peer key must be left empty");
+  Require(!tracker.IsQpAlive(Qp(77)), "unknown QP that failed must be dead");
+}
+
+// A failure on one NIC must not touch the same-numbered QP on another.
 void CaseQpNumbersAreScopedPerDevice() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(2048, "ionic_0"), "decode-0", kPort1, kCqA);
@@ -158,8 +169,7 @@ void CaseQpNumbersAreScopedPerDevice() {
       "attribution must pick the owner on the failing device, got '" + event.remoteEngineKey + "'");
 }
 
-// A device-fatal event is not tied to one QP, so it kills every QP on that
-// device — including ones never registered, since the HCA itself is gone.
+// The HCA is gone, so every QP on it dies, including unregistered ones.
 void CaseDeviceFatalAffectsWholeDevice() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(10, "mlx5_0"), "decode-0", kPort1, kCqA);
@@ -180,8 +190,7 @@ void CaseDeviceFatalAffectsWholeDevice() {
   Require(event.reason == PeerFailureReason::LOCAL_DEVICE_FATAL, "reason must be preserved");
 }
 
-// A port going down takes out only the QPs on that port. Condemning the whole
-// NIC would kill healthy sessions on its other ports.
+// Condemning the whole NIC would kill healthy sessions on its other ports.
 void CasePortFailureScopedToPort() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
@@ -193,9 +202,7 @@ void CasePortFailureScopedToPort() {
   Require(tracker.IsQpAlive(Qp(11)), "QP on another port of the same device must stay alive");
 }
 
-// A link flap must not condemn the NIC for the rest of the process: once the
-// port is back, sessions on it are usable again, as are sessions created while
-// it was down.
+// A link flap must not condemn the NIC for the rest of the process.
 void CasePortRecoveryRevivesSessions() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
@@ -211,16 +218,14 @@ void CasePortRecoveryRevivesSessions() {
   Require(tracker.IsQpAlive(Qp(10)), "port recovery must revive QPs the port had condemned");
   Require(tracker.IsQpAlive(Qp(11)), "port recovery must revive QPs created while it was down");
 
-  // The failure still happened, so it stays drainable; recovery withdraws the
-  // verdict, not the history.
+  // Recovery withdraws the verdict, not the history.
   PeerFailureEvent event;
   Require(tracker.Pop(&event), "the port failure must still be reported after recovery");
   Require(event.reason == PeerFailureReason::LOCAL_PORT_DOWN, "reason must be preserved");
   Require(!tracker.Pop(&event), "recovery itself must not enqueue an event");
 }
 
-// A QP that failed in its own right does not come back when its port does: a QP
-// in the error state stays there until it is torn down and rebuilt.
+// A QP in the error state stays there until it is torn down and rebuilt.
 void CaseQpFailureSurvivesPortRecovery() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
@@ -248,8 +253,7 @@ void CaseCqFailureScopedToCq() {
   Require(tracker.IsQpAlive(Qp(12, "mlx5_1")), "a CQ pointer is only meaningful within its device");
 }
 
-// Peer death reaches us as a completion error, not an async event. The reporter
-// already knows the peer, so its attribution is kept rather than re-derived.
+// The reporter already knows the peer, so its attribution is kept.
 void CasePeerUnreachableIsAttributed() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(10), "prefill-0", kPort1, kCqA);
@@ -265,8 +269,7 @@ void CasePeerUnreachableIsAttributed() {
   Require(event.remoteEngineKey == "prefill-0", "the reporter's attribution must be kept");
 }
 
-// CQE errors arrive in bursts for one root cause. Folding repeats keeps a single
-// dead peer from flushing every other pending failure out of the queue.
+// One dead peer must not flush every other pending failure out of the queue.
 void CaseRepeatFailuresFoldIntoFirst() {
   PeerFailureTracker tracker;
   tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
@@ -284,21 +287,7 @@ void CaseRepeatFailuresFoldIntoFirst() {
   Require(tracker.Pop(&event) && event.qpNum == 11, "an unrelated QP must still be reported");
 }
 
-// An event for a QP we never registered is still reported, just unattributed.
-// Losing the event would be worse than losing the peer's name.
-void CaseUnknownQpStillReported() {
-  PeerFailureTracker tracker;
-  tracker.Report(QpFailure(77));
-
-  PeerFailureEvent event;
-  Require(tracker.Pop(&event), "failure for unknown QP must still be reported");
-  Require(event.remoteEngineKey.empty(), "unresolvable peer key must be left empty");
-  Require(!tracker.IsQpAlive(Qp(77)), "unknown QP that failed must be dead");
-}
-
-// Attribution happens when the failure is recorded, not when it is drained, so
-// an owner registered afterwards cannot name it. This is why ConnectEndpoint
-// registers before transitioning the QP, which can itself raise a fatal event.
+// Attribution is at record time, which is why ConnectEndpoint registers early.
 void CaseLateRegistrationCannotAttribute() {
   PeerFailureTracker tracker;
   tracker.Report(QpFailure(10));
@@ -369,9 +358,8 @@ void CasePopNullptrIsSafe() {
   Require(!tracker.Pop(nullptr), "Pop(nullptr) must return false rather than crash");
 }
 
-// The monitor and the CQ poller record from their own threads while the
-// application drains from another; run both and require every event to be
-// accounted for.
+// The monitor records from its own thread while the application drains from
+// another; run both concurrently and require every event to be accounted for.
 void CaseConcurrentRecordAndPop() {
   PeerFailureTracker tracker;
   const uint32_t total = 500;
@@ -416,6 +404,7 @@ int main() {
   std::vector<TestCase> cases = {
       {"SilenceMeansAlive", CaseSilenceMeansAlive},
       {"QpFailureIsAttributed", CaseQpFailureIsAttributed},
+      {"UnknownQpStillReported", CaseUnknownQpStillReported},
       {"QpNumbersAreScopedPerDevice", CaseQpNumbersAreScopedPerDevice},
       {"DeviceFatalAffectsWholeDevice", CaseDeviceFatalAffectsWholeDevice},
       {"PortFailureScopedToPort", CasePortFailureScopedToPort},
@@ -424,7 +413,6 @@ int main() {
       {"CqFailureScopedToCq", CaseCqFailureScopedToCq},
       {"PeerUnreachableIsAttributed", CasePeerUnreachableIsAttributed},
       {"RepeatFailuresFoldIntoFirst", CaseRepeatFailuresFoldIntoFirst},
-      {"UnknownQpStillReported", CaseUnknownQpStillReported},
       {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
       {"FifoOrder", CaseFifoOrder},

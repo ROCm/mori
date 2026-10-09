@@ -236,11 +236,9 @@ class IOEngine:
         return None
 
     def pop_peer_failure(self):
-        """Take the oldest pending transport failure, or None if none is pending.
+        """Take the oldest pending peer failure, or None if nothing has failed.
 
         None means nothing has been observed to fail, not that peers are healthy.
-        PEER_UNREACHABLE is the only reason that is evidence about the peer; the
-        LOCAL_* reasons report faults in this host's own RDMA resources.
         """
         return self._engine.PopPeerFailure()
 

@@ -50,9 +50,7 @@ void PeerFailureTracker::Report(const PeerFailureReport& report) {
   std::lock_guard<std::mutex> lock(mu_);
 
   if (report.recovery) {
-    // Withdraws the port-wide verdict so sessions that died only to a link flap
-    // work again. QPs that failed in their own right stay failed: a QP in the
-    // error state does not heal.
+    // Withdraws only the port's verdict; a QP in the error state does not heal.
     failedPorts_.erase(PortKey{event.deviceName, event.portNum});
     return;
   }
@@ -64,8 +62,7 @@ void PeerFailureTracker::Report(const PeerFailureReport& report) {
       firstForResource = failedQps_.insert(key).second;
       auto it = qpOwners_.find(key);
       if (it != qpOwners_.end()) {
-        // Attribution from the reporter wins; the registry only fills in what
-        // the event could not carry.
+        // The reporter's attribution wins; the registry only fills in the gaps.
         if (event.remoteEngineKey.empty()) event.remoteEngineKey = it->second.remoteEngineKey;
         if (event.portNum == 0) event.portNum = it->second.portNum;
       }
@@ -82,8 +79,7 @@ void PeerFailureTracker::Report(const PeerFailureReport& report) {
       break;
   }
 
-  // A repeat for a resource already known bad adds nothing, and a CQE error
-  // burst would otherwise fill the queue with copies of one failure.
+  // Repeats add nothing, and a CQE burst would fill the queue with one failure.
   if (!firstForResource) return;
   Enqueue(std::move(event));
 }
@@ -103,8 +99,7 @@ bool PeerFailureTracker::IsQpAlive(const QpKey& qp) const {
   // Device-wide, so it applies whether or not this QP was ever registered.
   if (failedDevices_.count(qp.deviceName) != 0) return false;
 
-  // An unregistered QP cannot be tied to a port or a CQ, so nothing else here
-  // can condemn it.
+  // An unregistered QP has no port or CQ, so nothing else here can condemn it.
   auto it = qpOwners_.find(qp);
   if (it == qpOwners_.end()) return true;
 

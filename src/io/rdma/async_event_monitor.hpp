@@ -40,13 +40,11 @@ namespace io {
 // persistent RdmaContext, reports them through the cached IO logger, and hands
 // fatal ones to an optional callback. One epoll thread drains all async fds plus
 // an eventfd used for shutdown. The monitor holds non-owning ibv_context*
-// references and must be destroyed before ibv_close_device(). This stream
-// carries only what the local HCA sees about its own resources: a dead peer
-// produces no event here, and is reported from the CQ poller instead.
+// references and must be destroyed before ibv_close_device().
+// A dead peer raises nothing here; the CQ poller reports that instead.
 class RdmaAsyncEventMonitor {
  public:
-  // onPeerFailure fires on the monitor thread for failures and for the
-  // PORT_ACTIVE recovery; taken here so the thread needs no synchronization.
+  // onPeerFailure fires on the monitor thread; taken here so it needs no locking.
   static std::unique_ptr<RdmaAsyncEventMonitor> Create(const application::RdmaDeviceList& devices,
                                                        std::shared_ptr<spdlog::logger> logger,
                                                        PeerFailureCallback onPeerFailure = {});
@@ -84,8 +82,7 @@ class RdmaAsyncEventMonitor {
   void MainLoop() noexcept;
   GetResult ProcessOneEvent(Watch& watch) noexcept;
   void DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept;
-  // Scopes the event to the resource it invalidates and hands it, or the
-  // PORT_ACTIVE recovery that withdraws one, to onPeerFailure_.
+  // Scopes the event to the resource it invalidates and reports it.
   void ReportTransportEvent(const Watch& watch, const EventInfo& info) noexcept;
   void RemoveWatch(Watch& watch) noexcept;
   void RestoreWatchFd(Watch& watch) noexcept;

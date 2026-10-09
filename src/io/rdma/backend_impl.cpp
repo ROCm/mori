@@ -560,8 +560,7 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
       return false;
     }
     const bool destroyed = deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
-    // Drop the association once the QP is really gone, so its number cannot be
-    // reused under a stale owner. Recorded failures stay drainable.
+    // Drop it only once gone, so the number cannot be reused under a stale owner.
     if (destroyed) {
       peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
     }
@@ -582,10 +581,7 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
                                         int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
 
-  // Remember who this QP talks to, and which port and CQ it depends on, before
-  // the transition below: moving the QP to RTR/RTS can itself raise a fatal
-  // event, which the monitor attributes at record time. A failed setup unwinds
-  // into DestroyEndpointNoThrow, which drops the association again.
+  // Before the transition below, which can itself raise a fatal event.
   peerFailures_.RegisterQp(
       PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
       local.handle.portId, local.ibvHandle.cq);
@@ -791,9 +787,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                 wc[i].qp_num, wc[i].vendor_err);
           }
 
-          // Retries exhausted without an ack: the one completion status that
-          // says something about the peer rather than about us. Repeat reports
-          // for the same QP fold into the first.
+          // Retries exhausted: the one status that is about the peer, not us.
           if (wc[i].status == IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
             rdma->RecordPeerUnreachable(ep, failureAdvice.statusText);
           }
@@ -1528,8 +1522,8 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
 }
 
 bool RdmaBackendSession::Alive() const {
-  // Liveness of the transport, not progress of a transfer: only an observed
-  // failure makes this false, so a slow but reachable peer stays alive.
+  // Liveness of the transport, not progress of a transfer: only an observed fatal
+  // event makes this false, so a slow but reachable peer stays alive.
   if (rdma_ == nullptr) return true;
   for (const auto& ep : eps) {
     if (!rdma_->IsQpAlive(ep.ldevId, ep.local.handle.qpn)) return false;
