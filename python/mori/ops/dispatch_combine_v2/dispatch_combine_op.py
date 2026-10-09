@@ -172,6 +172,41 @@ class EpDispatchCombineConfig:
     # default. Only consulted when constructing the BASE class; naming a
     # subclass directly wins.
     kernel_backend: str = None
+    # Opt in to the AsyncLL kernel family (hip backend only). It is not a member
+    # of internode_kernel because it is not an internode-only choice: AsyncLL runs
+    # on one node too, which is where it is validated, and hanging it off a field
+    # named "internode" would say otherwise.
+    #
+    # What it buys is the send/recv split -- dispatch_send/dispatch_recv and
+    # combine_send/combine_recv become separate launches, so the caller can run
+    # its own work in the seam while the transfers drain. Every other family does
+    # send and recv in one kernel and has no such seam.
+    #
+    # Intranode it moves tokens with ccoSdma, the copy engine, rather than with
+    # peer stores: that is the v1 AsyncLL protocol transcribed onto cco, and it is
+    # what the cross-node leg will reuse. It is therefore NOT the fastest way to
+    # dispatch on a single node -- the ordinary v2 intranode kernels are, by about
+    # 2x on MI355X -- and it is off by default for that reason.
+    async_ll: bool = False
+    # How AsyncLL's transfer passes move bytes between same-node peers.
+    #
+    #   "sdma" (default) -- ccoSdma, the copy engine. The transfer occupies no
+    #       CUs, so it can drain under whatever the caller runs in the send/recv
+    #       seam, and it is the shape the cross-node (ccoGda) leg will reuse.
+    #   "lsa" -- peer stores over the flat symmetric VA. A little faster on one
+    #       node, because the engine is latency-bound at these sizes, but it
+    #       spends the grid on the copy, so there is nothing left to overlap.
+    #
+    # Measured on MI355X, EP8, hidden 7168, bf16, dispatch+combine as a graph:
+    # sdma 103.0 / 133.8 us at 64 / 128 tokens per rank, lsa 96.4 / 135.0. The
+    # difference is small because the transport is not what dominates -- AsyncLL
+    # stages each payload through an extra buffer so an RDMA leg can reuse the
+    # protocol, and that cost is the same either way.
+    #
+    # Pick "lsa" when the seam is empty and you just want the latency; keep
+    # "sdma" when the point is the overlap, or when this op will later run
+    # across nodes.
+    async_ll_transport: str = "sdma"
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -613,6 +648,15 @@ class KernelSet:
     # Replay-routing dispatch. None = this backend has no replay.
     dispatch_replay: dict[tuple[int, int], Callable] | None = None
 
+    # The AsyncLL split. Each is the same (block_num, warp_num) -> callable shape
+    # as `dispatch`, but launching only half the pass sequence, so the caller can
+    # put its own work between the two. None = this backend runs send and recv in
+    # one launch and has no seam to expose.
+    dispatch_send: dict[tuple[int, int], Callable] | None = None
+    dispatch_recv: dict[tuple[int, int], Callable] | None = None
+    combine_send: dict[tuple[int, int], Callable] | None = None
+    combine_recv: dict[tuple[int, int], Callable] | None = None
+
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
     stages_in_kernel: bool = False
@@ -698,6 +742,14 @@ class EpDispatchCombineOp:
 
     _BACKENDS: dict[str, type] = {}
     backend_name: str | None = None
+
+    # What the AsyncLL recv halves need from their send halves. Class-level so
+    # every backend has them whether or not it implements the split, and so a
+    # recv without a send raises rather than hitting a missing attribute.
+    _async_pending_dispatch_tokens = None
+    _async_pending_dispatch_input = None
+    _async_pending_dispatch_map = None
+    _async_pending_combine = None
 
     # -- registration / selection -----------------------------------------
 
@@ -930,6 +982,26 @@ class EpDispatchCombineOp:
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
         """
+        return self._dispatch_impl(
+            input,
+            weights,
+            scales,
+            indices,
+            routing=routing,
+            return_routing=return_routing,
+            kernels=self._kernels.dispatch,
+        )
+
+    def _dispatch_impl(
+        self, input, weights, scales, indices, *, routing, return_routing, kernels
+    ):
+        """The body of dispatch(), parameterised by which kernel table runs.
+
+        dispatch() passes the whole-phase table; dispatch_send() passes the send
+        half. Everything else -- the capacity check, the replay choice, the views
+        returned -- is identical, which is why this is one function and not two
+        that drift.
+        """
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either routing= (replay) or return_routing=True, not both"
@@ -953,7 +1025,7 @@ class EpDispatchCombineOp:
                 )
             kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
-            kern = self._kernels.dispatch[disp_spec]
+            kern = kernels[disp_spec]
             if return_routing:
                 dest_map = self.routing_dest_map
             else:
@@ -967,6 +1039,12 @@ class EpDispatchCombineOp:
             dest_map=dest_map,
             num_tokens=n,
         )
+        # What dispatch_recv() needs to launch the other half. Set unconditionally:
+        # a plain dispatch() leaves it as harmless bookkeeping, and only
+        # dispatch_recv() reads it.
+        self._async_pending_dispatch_tokens = n
+        self._async_pending_dispatch_input = input
+        self._async_pending_dispatch_map = dest_map
 
         base = (
             self.recv_tokens(),
@@ -1012,6 +1090,13 @@ class EpDispatchCombineOp:
         the same null pointer.
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
+        return self._combine_impl(
+            input, weights, indices, routing=routing, kernels=self._kernels.combine
+        )
+
+    def _combine_impl(self, input, weights, indices, *, routing, kernels):
+        """The body of combine(), parameterised by which kernel table runs. See
+        _dispatch_impl."""
         ct = routing.cur_rank_num_token
         _, comb_spec = self._pick(ct)
 
@@ -1027,12 +1112,18 @@ class EpDispatchCombineOp:
         # [0, ct), so the prior contents of the returned slice never leak.
 
         want_weights = weights is not None
-        self._kernels.combine[comb_spec](
+        kernels[comb_spec](
             input=input,
             dest_map=routing.disp_dest_tok_id_map,
             total_recv=routing.total_recv_token_num,
             num_tokens=ct,
             want_weights=want_weights,
+        )
+        self._async_pending_combine = (
+            input,
+            routing.disp_dest_tok_id_map,
+            ct,
+            want_weights,
         )
 
         cdt = self.cfg.combine_dtype
@@ -1051,6 +1142,87 @@ class EpDispatchCombineOp:
             else None
         )
         return out, outw
+
+    # -- the AsyncLL seam ------------------------------------------------
+    #
+    # dispatch() and combine() above run a whole phase in one call. On the
+    # AsyncLL family each splits in two, and the point of the split is what the
+    # caller does in between:
+    #
+    #     out, ..., routing = op.dispatch_send(x, w, s, idx, return_routing=True)
+    #     ...                       # anything; the SDMA copies drain under it
+    #     op.dispatch_recv()        # now the tokens are in `out`
+    #
+    # The send half returns the same tuple dispatch() does, but the output buffers
+    # are NOT populated until the matching recv call has run. Reading them in the
+    # seam reads the previous round.
+
+    def _async_half(self, which):
+        table = getattr(self._kernels, which)
+        if table is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no {which}: it runs send and "
+                "recv in one launch. Build the op with async_ll=True (hip backend) "
+                "to get the split."
+            )
+        return table
+
+    def dispatch_send(
+        self, input, weights, scales, indices, *, routing=None, return_routing=False
+    ):
+        """Enqueue the send half of a dispatch and return immediately.
+
+        Same arguments and same return as :meth:`dispatch`. The returned views are
+        only valid after :meth:`dispatch_recv`.
+        """
+        return self._dispatch_impl(
+            input,
+            weights,
+            scales,
+            indices,
+            routing=routing,
+            return_routing=return_routing,
+            kernels=self._async_half("dispatch_send"),
+        )
+
+    def dispatch_recv(self):
+        """Run the recv half of the dispatch the last :meth:`dispatch_send` began."""
+        n = self._async_pending_dispatch_tokens
+        if n is None:
+            raise RuntimeError("dispatch_recv without a preceding dispatch_send")
+        self._async_pending_dispatch_tokens = None
+        spec, _ = self._pick(n)
+        self._async_half("dispatch_recv")[spec](
+            input=self._async_pending_dispatch_input,
+            dest_map=self._async_pending_dispatch_map,
+            num_tokens=n,
+        )
+
+    def combine_send(self, input, weights=None, indices=None, *, routing):
+        """Enqueue the send half of a combine and return immediately."""
+        return self._combine_impl(
+            input,
+            weights,
+            indices,
+            routing=routing,
+            kernels=self._async_half("combine_send"),
+        )
+
+    def combine_recv(self):
+        """Run the recv half of the combine the last :meth:`combine_send` began."""
+        state = self._async_pending_combine
+        if state is None:
+            raise RuntimeError("combine_recv without a preceding combine_send")
+        self._async_pending_combine = None
+        inp, dest_map, ct, want_weights = state
+        _, spec = self._pick(ct)
+        self._async_half("combine_recv")[spec](
+            input=inp,
+            dest_map=dest_map,
+            total_recv=None,
+            num_tokens=ct,
+            want_weights=want_weights,
+        )
 
     def reset(self):
         """Zero the arena staging + per-rank counters (mori LaunchReset). The

@@ -58,7 +58,7 @@ from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .internode_regions import internode_regions
+from .internode_regions import asyncll_regions, internode_regions
 from .symm_arena import SymmArena
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
@@ -407,11 +407,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
-        self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
+        # AsyncLL needs one on a single node too -- ccoSdma hangs off the device
+        # communicator, not off the window -- which is why the test is not just
+        # is_internode.
+        self._dev_comm = (
+            self._make_dev_comm(cfg, comm)
+            if (cfg.is_internode or cfg.async_ll)
+            else None
+        )
         # Decided before the kernels are built: how the dispatch plans reserve slots
         # follows where the slot allocator word lives (see TokOffExt below).
         self._tokoff_wanted = (
-            not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
+            not cfg.is_internode
+            and not cfg.async_ll
+            and self._is1250
+            and TokOffExt.wanted(cfg.world_size)
         )
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
@@ -430,7 +440,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         self._kernels = self._build_kernels(cfg, self.arena)
 
-        if cfg.is_internode:
+        if cfg.is_internode or cfg.async_ll:
             self._alloc_internode_buffers(cfg)
             return
 
@@ -515,6 +525,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         requirements = _cco.DevCommRequirements()
         requirements.gda_connection_type = _cco.GDA_CONNECTION_RAIL
         requirements.gda_context_count = max(1, cfg.num_qp_per_pe)
+        if cfg.async_ll and cfg.async_ll_transport == "sdma":
+            # One SDMA queue per peer. The transfer kernels run one issuing warp
+            # per destination and the queue is picked as destPe % sdmaNumQueue, so
+            # fewer queues than peers folds two warps onto one queue -- correct,
+            # but they then serialise on its in-order commit chain. Eight is the
+            # hardware cap; above it cco clamps with a warning.
+            requirements.sdma_queue_count = min(8, max(1, cfg.gpu_per_node))
         handle = DevCommHandle(comm, requirements=requirements)
 
         # A rejected handle still owns its QPs, so every exit below its
@@ -593,6 +610,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         self.dest_pe_counter = torch.zeros(world_size, **i32)
         self.block_flag_counter = torch.zeros(n_nodes, **i32)
+        # AsyncLL only: recv slot -> the send-buffer slot it arrived in, written by
+        # dispatch's RecvCopy and read by combine's SendCopy. One entry per slot
+        # this rank can receive into.
+        self.disp_receiver_idx_map = (
+            torch.zeros(cfg.effective_max_recv, **i32) if cfg.async_ll else None
+        )
         self.total_recv = torch.zeros(1, **i32)
         self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
@@ -622,7 +645,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # struct -- so passing the whole schema each time cost a ctypes field
         # write per field per launch. Binding leaves six.
         static_args = self._internode_static_args()
-        for plans_by_pass in self._internode_plans.values():
+        # AsyncLL keeps its plans in a flat dict rather than per geometry: it has
+        # one geometry, derived in the spec from mpCount and worldSize.
+        plan_groups = (
+            [self._asyncll_plans]
+            if self.cfg.async_ll
+            else list(self._internode_plans.values())
+        )
+        for plans_by_pass in plan_groups:
             for plan in plans_by_pass.values():
                 plan.bind(**static_args)
 
@@ -693,7 +723,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         (`destTokId * ScaleBytes`, ScaleBytes = scaleDim * scaleTypeSize) and
         internode_regions sizes out_scales that way, so there it is the row itself.
         Use the module-level function when there is no op yet (sizing an arena)."""
-        if self.cfg.is_internode:
+        # AsyncLL stages scales the same packed way the internode kernels do
+        # (destTokId * ScaleBytes), so it reads the row unchanged too.
+        if self.cfg.is_internode or self.cfg.async_ll:
             return self._scale_row_bytes()
         return scale_stride_bytes(self._scale_row_bytes())
 
@@ -703,6 +735,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
 
     def _regions(self, cfg):
+        if cfg.async_ll:
+            # Same names, per-rank send extents. See asyncll_regions.
+            return asyncll_regions(cfg)
         if cfg.is_internode:
             # Sized exactly, region by region. v1 sizes its arena with a 256 MB
             # slack term on a rough estimate; this is the exact sum, which is both
@@ -748,8 +783,58 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         return regions
 
+    def _asyncll_unsupported(self, cfg) -> tuple[str, ...]:
+        """AsyncLL's own range. Checked before the arena or the communicator is
+        taken, like every other gate here."""
+        bad = []
+        # Shares the internode kernels' dtype and feature range -- it reduces the
+        # same way and stages through the same slots.
+        for leg, leg_dtype in (
+            ("dispatch", cfg.dispatch_dtype),
+            ("combine", cfg.combine_dtype),
+        ):
+            if leg_dtype not in self._INTERNODE_DTYPE:
+                bad.append(
+                    f"{leg} dtype {leg_dtype} has no AsyncLL kernel "
+                    f"(have {', '.join(self._INTERNODE_DTYPE.values())})"
+                )
+        if cfg.is_scatter:
+            bad.append("combine_mode='scatter' (the AsyncLL combine gathers)")
+        if cfg.enable_std_moe:
+            bad.append("enable_std_moe (not implemented on the AsyncLL path)")
+        if cfg.quant_type != "none":
+            bad.append(
+                f"quant_type={cfg.quant_type!r} (AsyncLL transports unquantized)"
+            )
+        if cfg.async_ll_transport not in ("sdma", "lsa"):
+            bad.append(
+                f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
+            )
+        if cfg.nodes > 1:
+            bad.append(
+                f"gpu_per_node={cfg.gpu_per_node} with world_size={cfg.world_size}: "
+                "the AsyncLL transfer legs are ccoSdma, which is intra-node only. "
+                "The cross-node branches are present but unimplemented "
+                "(TODO(internode) in ep_asyncll_kernel.hpp)"
+            )
+        # Without this the communicator comes back with zero SDMA queues and every
+        # put is a silent no-op -- the tokens never move and the receiver spins on
+        # a count that never arrives. A hang with no message is the worst way to
+        # learn about an unset environment variable.
+        if cfg.async_ll_transport == "sdma" and os.environ.get(
+            "MORI_ENABLE_SDMA", ""
+        ) not in ("1", "true", "True"):
+            bad.append(
+                "MORI_ENABLE_SDMA is not set: cco creates no SDMA queues without "
+                "it and every AsyncLL transfer would be a no-op (or use "
+                "async_ll_transport='lsa', which needs no engine)"
+            )
+        return tuple(bad)
+
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
+        if cfg.async_ll:
+            return self._asyncll_unsupported(cfg)
         if cfg.is_internode:
             return self._internode_unsupported(cfg)
         bad = []
@@ -926,6 +1011,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # Absent, not zero-sized, when the transport is off; the kernel gates
             # on cfg.scaleDim and never dereferences it.
             offOutScales=offset("out_scales") if has_scales else 0,
+            # AsyncLL's SDMA source word for the small count/epoch writes. Absent
+            # from the other families' arenas, where the kernels never read it.
+            offSendCount=offset("send_count") if arena.has("send_count") else 0,
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map
@@ -938,6 +1026,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dispatchGridBarrier=ptr(self.dispatch_barrier),
             interNodeBlocksBarrier=ptr(self.inter_blocks_barrier),
             crossDeviceBarrierFlag=ptr(self.cross_device_flag),
+            dispReceiverIdxMap=ptr(self.disp_receiver_idx_map),
             # The HOST struct, not DevCommHandle.ptr (the device-side copy): the args
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
@@ -1110,6 +1199,160 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             )
         return buckets
+
+    # -- AsyncLL ---------------------------------------------------------
+    #
+    # Nine passes in four groups. The grouping IS the feature: dispatch_send
+    # returns as soon as its three kernels are enqueued, and the ccoSdma copies
+    # they posted drain while the caller runs whatever comes next.
+    # The two transfer passes are named per transport; everything else is shared.
+    _ASYNCLL_SEQ_TEMPLATE = {
+        "dispatch_send": (
+            "dispatch_slotassign",
+            "dispatch_sendcopy",
+            "dispatch_sendtransfer{sfx}",
+        ),
+        "dispatch_recv": ("dispatch_recvtransfer{sfx}", "dispatch_recvcopy"),
+        "combine_send": ("combine_sendcopy", "combine_sendtransfer{sfx}"),
+        "combine_recv": ("combine_recvtransfer{sfx}", "combine_recvcopy"),
+    }
+
+    @classmethod
+    def _asyncll_seq(cls, cfg):
+        sfx = "_lsa" if cfg.async_ll_transport == "lsa" else ""
+        return {
+            group: tuple(n.format(sfx=sfx) for n in names)
+            for group, names in cls._ASYNCLL_SEQ_TEMPLATE.items()
+        }
+
+    # Which leg's dtype each pass is compiled for. Same rule as _INTERNODE_LEG:
+    # compiling a combine pass with the dispatch dtype is how an fp8 dispatch ends
+    # up writing half the bytes a bf16 combine view reads.
+    @staticmethod
+    def _asyncll_leg(group):
+        return "dispatch" if group.startswith("dispatch") else "combine"
+
+    def _asyncll_request(self, cfg, dtype_tag, block_num, warp_per_block):
+        request = self._internode_request(
+            cfg, dtype_tag, block_num, warp_per_block, rdma_block_num=0
+        )
+        # The AsyncLL specs derive every grid themselves -- the copy passes from
+        # mpCount, the transfer passes from worldSize -- so the device's CU count
+        # has to reach them. The internode request never carries it because its
+        # geometry table supplies grids directly.
+        request["mpCount"] = self._multi_processor_count
+        return request
+
+    def _build_asyncll_kernels(self, cfg) -> KernelSet:
+        from mori.jit.v2 import plan_api
+
+        leg_dtype = {
+            "dispatch": self._INTERNODE_DTYPE[cfg.dispatch_dtype],
+            "combine": self._INTERNODE_DTYPE[cfg.combine_dtype],
+        }
+        block_num = cfg.dispatch_block_num
+        warp_per_block = cfg.warp_num_per_block
+
+        self._plans = []
+        plans_by_pass = {}
+        sequences = self._asyncll_seq(cfg)
+        for group, names in sequences.items():
+            for name in names:
+                request = self._asyncll_request(
+                    cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
+                )
+                plan = cb.EP_ASYNCLL_PLANS[name](**request)
+                # Neither varies for AsyncLL: there is one geometry per op, and
+                # this backend has no replay path. Bound rather than passed so the
+                # value is written into the plan's struct once instead of per
+                # launch.
+                plan.bind(rdmaBlockNum=0, replayMode=0)
+                plans_by_pass[name] = plan
+                self._plans.append(plan)
+        self._asyncll_plans = plans_by_pass
+        self._asyncll_groups = {
+            group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
+            for group, names in sequences.items()
+        }
+
+        # Every spec the schedule can select maps to the SAME callable. AsyncLL
+        # compiles one geometry -- its specs derive each pass's grid from mpCount
+        # and worldSize, so (block, warp) only sets the block width and there is
+        # nothing to sweep -- but _pick still returns whatever the token count
+        # selects, and it clamps only against `dispatch`/`combine`, not against the
+        # four split tables. Answering for all of them keeps the lookup total.
+        def table(group):
+            specs = (
+                self._dispatch_specs
+                if group.startswith("dispatch")
+                else self._combine_specs
+            )
+            fn = self._wrap_asyncll(group)
+            return {spec: fn for spec in specs}
+
+        both = {
+            "dispatch": self._wrap_asyncll("dispatch_send", "dispatch_recv"),
+            "combine": self._wrap_asyncll("combine_send", "combine_recv"),
+        }
+        return KernelSet(
+            # dispatch()/combine() stay available and simply run both halves back
+            # to back, so a caller that does not want the seam sees the ordinary
+            # API and the parity tests need no special case.
+            dispatch={spec: both["dispatch"] for spec in self._dispatch_specs},
+            combine={spec: both["combine"] for spec in self._combine_specs},
+            dispatch_send=table("dispatch_send"),
+            dispatch_recv=table("dispatch_recv"),
+            combine_send=table("combine_send"),
+            combine_recv=table("combine_recv"),
+            dispatch_replay=None,
+            stages_in_kernel=True,
+            self_resets_counters=False,
+            capabilities=frozenset({"gather", "scales", "async_ll"}),
+        )
+
+    def _wrap_asyncll(self, *groups):
+        """Launch one or more AsyncLL pass groups against one filled arg struct.
+
+        Same two-field memory as _wrap_internode and for the same reason: combine
+        reads `tokenIndices` and the weights region that DISPATCH was handed, but
+        the base's combine signature carries neither.
+        """
+
+        def run(*, input, num_tokens, dest_map, **kwargs):
+            phase = "dispatch" if groups[0].startswith("dispatch") else "combine"
+            if phase == "dispatch":
+                weights, indices = kwargs.get("weights"), kwargs.get("indices")
+                self._asyncll_has_weights = weights is not None
+                self._asyncll_indices = indices
+                weights_ptr = 0 if weights is None else weights.data_ptr()
+            else:
+                weights_ptr = (
+                    self.arena.local_ptr(self._region("dispatch_out_weights"))
+                    if kwargs.get("want_weights", False)
+                    and getattr(self, "_asyncll_has_weights", False)
+                    else 0
+                )
+                indices = getattr(self, "_asyncll_indices", None)
+
+            # Only what varies; everything fixed for the op's lifetime was bound
+            # onto the plans in _alloc_internode_buffers.
+            args = dict(
+                curRankNumToken=num_tokens,
+                dispDestTokIdMap=dest_map.data_ptr(),
+                tokenIndices=0 if indices is None else indices.data_ptr(),
+                inpTokenBuf=input.data_ptr(),
+                weightsBuf=weights_ptr,
+                scalesBuf=(
+                    kwargs["scales"].data_ptr()
+                    if kwargs.get("scales") is not None
+                    else 0
+                ),
+            )
+            stream = _raw_stream(self._device_index)
+            for group in groups:
+                self._asyncll_groups[group].launch(stream, **args)
+
+        return run
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
         # One tag per leg, not one for the op: see _INTERNODE_LEG. Both keys are
@@ -1296,6 +1539,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _build_kernels(self, cfg, arena) -> KernelSet:
         bad = self._unsupported(cfg)
+        if not bad and cfg.async_ll:
+            return self._build_asyncll_kernels(cfg)
         if not bad and cfg.is_internode:
             return self._build_internode_kernels(cfg)
         if bad:
@@ -1404,8 +1649,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "recv_to_src_token": ("recv_to_src_token", "disp_tok_id_to_src_tok_id"),
     }
 
+    # AsyncLL overrides where it differs from the internode layout. Only one
+    # region does: the combine input needs to be somewhere peers never write.
+    # See asyncll_regions.
+    _ASYNCLL_VIEW_REGION = {"out_tok": "inter_dispatch_staging"}
+
     def _region(self, name):
         intranode, internode = self._VIEW_REGION[name]
+        # AsyncLL's arena is the internode one with different extents, so it uses
+        # the internode names even on a single node.
+        if self.cfg.async_ll:
+            return self._ASYNCLL_VIEW_REGION.get(name, internode)
         return internode if self.cfg.is_internode else intranode
 
     def recv_tokens(self):

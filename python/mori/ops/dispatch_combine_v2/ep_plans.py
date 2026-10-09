@@ -85,3 +85,28 @@ EP_INTERNODE_PLANS = {
         "combineall",
     )
 }
+
+# AsyncLL. Same Request and Args schema as the internode passes -- it is
+# specialised on the same shape and launched against the same struct -- so the
+# same enum map applies. Nine passes: five for dispatch (three of them the send
+# half, two the recv half) and four for combine.
+EP_ASYNCLL_PLANS = {
+    name: make_plan(f"ep_asyncll_{name}", enums=_INTERNODE_ENUMS)
+    for name in (
+        "dispatch_slotassign",
+        "dispatch_sendcopy",
+        "dispatch_sendtransfer",
+        "dispatch_recvtransfer",
+        "dispatch_recvcopy",
+        "combine_sendcopy",
+        "combine_sendtransfer",
+        "combine_recvtransfer",
+        "combine_recvcopy",
+        # The LSA transport's transfer passes. Same protocol, peer stores instead
+        # of the copy engine; the op picks one set or the other at build time.
+        "dispatch_sendtransfer_lsa",
+        "dispatch_recvtransfer_lsa",
+        "combine_sendtransfer_lsa",
+        "combine_recvtransfer_lsa",
+    )
+}
