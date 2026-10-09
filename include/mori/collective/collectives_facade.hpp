@@ -170,20 +170,9 @@ class CollectivesFacade {
     // BEFORE any user Allocate, so their heap offsets are identical on every
     // rank (symmetric) since every rank runs the same Create.
     //
-    // syncFlags is the pull all-reduce's closing cross-PE handshake: slot p is
-    // owned by producer p and written by p over XGMI. It goes first because it
-    // is unconditional, which keeps its offset independent of maxStagingBytes.
-    facade.syncFlags_ =
-        static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
-    if (facade.syncFlags_ == nullptr) {
-      FACADE_PRINTF("CollectivesFacade: failed to carve sync flags from heap");
-      return -1;
-    }
-    HIP_RUNTIME_CHECK(hipMemset(facade.syncFlags_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
-
-    // Entry-barrier flags of the push collectives (see PushEntryBarrier): slot p
-    // of every copy is written only by PE p with its monotonic epoch; never
-    // reset after this.
+    // Entry/exit-barrier flags of the push and pull collectives (see
+    // PushEntryBarrier): slot p of every copy is written only by PE p with its
+    // monotonic epoch; never reset after this.
     facade.barrierCtr_ =
         static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
     if (facade.barrierCtr_ == nullptr) {
@@ -417,7 +406,6 @@ class CollectivesFacade {
   void* staging_{nullptr};
   size_t stagingBytes_{0};
   uint32_t* groupCounters_{nullptr};
-  uint64_t* syncFlags_{nullptr};  // symmetric, pull all-reduce inter-shot handshake
   uint64_t* barrierCtr_{nullptr};  // symmetric, entry-barrier flags (slot p written by PE p)
   uint64_t* permuteReady_{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
   AddressPair* pinnedPairs_{nullptr};  // host-pinned, device-readable
@@ -573,10 +561,9 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   constexpr int kThreads = 256;
   size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
-  // Cap the grid to the SM count so all blocks are co-resident, which push needs
-  // for the multi-producer broadcast submitPacket ordering. The fused pull no
-  // longer requires it (only its last block waits, and only after signalling),
-  // so uncapping that path is open as a tuning knob.
+  // Cap the grid to the SM count so all blocks are co-resident: push needs it
+  // for the multi-producer broadcast submitPacket ordering, pull for the
+  // entry go-flag spin.
   int blocks = std::min(wantBlocks, std::max(1, MP_count_));
 
   int logS = logS_;
@@ -586,12 +573,13 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   if (mode_ == RsMode::kPull) {
     // Fused pull: reduce this PE's shard straight off the peers' inputs and fan
     // the result out to every peer from registers, in one pass. No SDMA and no
-    // staging; syncFlags_ carries the single closing handshake.
+    // staging; entry and exit PushEntryBarrier rounds on barrierCtr_.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllReducePullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
-          <<<blocks, kThreads, 0, stream>>>(myPe_, reinterpret_cast<const ComputeT*>(input),
-                                            reinterpret_cast<ComputeT*>(output), syncFlags_,
-                                            groupCounters_, chunkElemsC, heapWin_);
+          <<<blocks, kThreads, 0, stream>>>(myPe_, heapWin_,
+                                            reinterpret_cast<const ComputeT*>(input),
+                                            reinterpret_cast<ComputeT*>(output), chunkElemsC,
+                                            groupCounters_, barrierCtr_);
       return hipGetLastError();
     });
   }
