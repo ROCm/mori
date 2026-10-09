@@ -256,10 +256,23 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
                                     args.interNodeTokBufs.staging, localOffset,
                                     thisChunkTokenNum * xferBytes, destPe, qpId);
       }
-      // TODO(ditian12): index value is wrong if signal completion here, investigate the reason
-      // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-      //     args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
-      //     static_cast<uint64_t>(tokenNum + 1), core::AMO_ADD, destPe, qpId);
+      // Fused signal: same (destPe, qpId) as the put above, so RC message ordering
+      // places it at the responder after the payload -- no local CQE drain needed.
+      //
+      // UNCONDITIONAL on thisChunkTokenNum: the receiver's poll loop below waits on
+      // every (pe, qpId) slot, so a skipped signal hangs that peer forever. The put
+      // above is conditional; this must not be.
+      //
+      // A plain WRITE, not an atomic: every (destPe, qpId) pair is owned by exactly
+      // one warp here (destPe == blockId with blockNum == worldSize, qpId strided by
+      // warpId), so there is no accumulation to do -- and keeping the signal in the
+      // same opcode class as the payload is the conservative choice. The historical
+      // attempt this replaces used an AMO_ADD *and* skipped the RDMA-only guard.
+      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
+        shmem::ShmemPutUint64ImmNbiThread(
+            args.recvTokenNumMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+            static_cast<uint64_t>(tokenNum + 1), destPe, qpId);
+      }
     }
   }
 
@@ -278,7 +291,9 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvTransfer);
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0) {
+      // Fused peers already signalled from SendTransfer; everyone else keeps the
+      // drain-then-signal path, which is the only ordering they have.
+      if ((laneId == 0) && !EpAsyncLlFuseSignal(args, destPe)) {
         if (destPe / config.gpuPerNode == myNode && config.enableSdma) {
           shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
               destPe, args.interNodeTokBufs.dispatchInp);
@@ -299,6 +314,22 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
     if (laneId < config.numQpPerPe) {
       (void)shmem::ShmemUint64WaitUntilGreaterThan(
           recvTokenNums + destPe * config.numQpPerPe + laneId, 0);
+    }
+  }
+
+  // Deferred quiet. The drain is not removed, only moved past the poll: it still
+  // upholds the staging-reuse invariant -- EpCombineLowLatencyAsyncSendCopy_body
+  // overwrites the same interNodeTokBufs.staging our NIC reads from in
+  // SendTransfer. Our own ACKs have had the entire poll window to return by now,
+  // so this is expected to exit on the drain loop's first comparison.
+  //
+  // No deadlock: every peer posts its signal unconditionally in SendTransfer, so
+  // the poll above cannot depend on anyone reaching this point.
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
+        shmem::ShmemQuietThread(destPe, qpId);
+      }
     }
   }
 }
@@ -499,11 +530,15 @@ __device__ void EpCombineLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs<
         shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.combineInp, remoteOffset,
                                     args.interNodeTokBufs.staging, localOffset,
                                     thisChunkTokenNum * tokHiddenBytes, destPe, qpId);
-      // if (laneId == 0)
-      // shmem::ShmemQuietThread(destPe, qpId);
-      // shmem::ShmemAtomicTypeNonFetchWarp<uint64_t>(
-      //     args.crossDeviceBarrierMemObj, myPe * sizeof(uint64_t), 1, core::AMO_ADD, destPe,
-      //     qpId);
+      // Fused barrier signal on the same QP; see the dispatch-side comment. The
+      // value is the epoch from crossDeviceBarrierFlag (bumped by dispatch's
+      // RecvCopyMultiBlock), not a counter, so the receiver's WaitUntilEquals is
+      // immune to a stale slot from the previous round. Unconditional, as above.
+      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
+        shmem::ShmemPutUint64ImmNbiThread(
+            args.crossDeviceBarrierMemObj, (myPe * config.numQpPerPe + qpId) * sizeof(uint64_t),
+            args.crossDeviceBarrierFlag[0], destPe, qpId);
+      }
     }
   }
 }
@@ -525,7 +560,9 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0) {
+      // Fused peers already signalled from SendTransfer; everyone else keeps the
+      // drain-then-signal path, which is the only ordering they have.
+      if ((laneId == 0) && !EpAsyncLlFuseSignal(args, destPe)) {
         if (destPe / config.gpuPerNode == myNode && config.enableSdma) {
           shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
               destPe, args.interNodeTokBufs.combineInp);
@@ -546,6 +583,18 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
       shmem::ShmemUint64WaitUntilEquals(args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>() +
                                             destPe * config.numQpPerPe + i,
                                         barrierFlag);
+    }
+  }
+
+  // Deferred quiet; see the dispatch-side RecvTransfer comment for the invariant
+  // this upholds (staging-reuse: dispatch's next-round SendTransfer reads from the
+  // same interNodeTokBufs.staging this round's EpCombineLowLatencyAsyncSendCopy_body
+  // wrote). No deadlock: every peer posts its signal unconditionally above.
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
+        shmem::ShmemQuietThread(destPe, qpId);
+      }
     }
   }
 }
