@@ -25,11 +25,7 @@ Every backend is driven through EpDispatchCombineOp, so one script covers all of
 them and BACKENDS=flydsl,hip compares them in a single process on one input.
 
 dispatch and combine ALTERNATE, one pair per iteration, because that is the order
-a layer runs them in. Timing N dispatches and then N combines instead leaves
-combine's staging copy unmeasured: combine reads totalRecvTokenNum to size that
-copy and clears it on the way out (ep_intranode_kernel.hpp:343, and
-intranode_kernels.py:1209 for flydsl), so with no dispatch in between only the
-first combine of the loop copies anything.
+a layer runs them in.
 
 dispatch is called with return_routing=True, the way a serving stack calls it, so
 the routing handle is inside the measured window. Each leg gets its own cuda event

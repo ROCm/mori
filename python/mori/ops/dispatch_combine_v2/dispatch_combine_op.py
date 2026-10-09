@@ -599,10 +599,6 @@ class KernelSet:
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
     stages_in_kernel: bool = False
-    # True  -> the kernels reset their own counters/barriers; the op must not
-    #          memset them, and on symmetric regions it MUST NOT (a peer may have
-    #          already delivered a signal, and wiping it hangs both ranks).
-    self_resets_counters: bool = True
 
     # Advertised feature names, for callers that want to probe before asking.
     capabilities: frozenset[str] = frozenset()
@@ -613,7 +609,21 @@ class KernelSet:
 
 
 class EpDispatchRoutingHandle:
-    """Per-call routing snapshot (mori EpDispatchRoutingHandle parity).
+    """Per-call routing (mori EpDispatchRoutingHandle parity).
+
+    Lifetime: by default the handle ALIASES op-owned buffers -- its
+    disp_dest_tok_id_map is the op's routing_dest_map and its total_recv_token_num
+    is the op's total_recv -- so it is valid only until the next
+    dispatch(return_routing=True) on the same op, which overwrites both. That keeps
+    the serving path (dispatch -> experts -> combine) free of allocations. A caller
+    that holds several handles at once (one per MoE layer, then the backward in
+    reverse) passes dispatch(..., snapshot=True): the handle then owns its dest map
+    and count, and combine / replay with it stay correct after later dispatches.
+
+    Either way only the routing is the handle's. What dispatch delivered into the
+    arena (recv tokens, weights, indices, scales, and the reverse map below until
+    its first access clones it) is overwritten by the next dispatch, and combine's
+    weight fold reads the forwarded weights from there.
 
     disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (v2 tok_map).
     disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
@@ -894,7 +904,15 @@ class EpDispatchCombineOp:
     # -- shared: the ops ---------------------------------------------------
 
     def dispatch(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        snapshot=False,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
@@ -904,6 +922,13 @@ class EpDispatchCombineOp:
         exclusive. Returns (out, out_weights, out_scales, out_indices,
         total_recv[, routing]); out == arena disp_out, safe to read without
         .clone() because combine stages into a separate out_tok buffer.
+
+        snapshot=: with return_routing=True, give the handle its own dest map
+        (the kernel writes it directly, no copy) and its own copy of total_recv,
+        so it outlives later return_routing dispatches on this op. Without it the
+        handle is valid only until the next one; see EpDispatchRoutingHandle.
+        Intranode gather combine only: the internode and scatter combines also
+        read routing state the op keeps in the arena.
 
         out_scales is [max_recv, scale_dim_i32] on both backends but is not always
         CONTIGUOUS -- a backend may lay the rows down wider and return a strided
@@ -917,16 +942,20 @@ class EpDispatchCombineOp:
             raise ValueError(
                 "pass either routing= (replay) or return_routing=True, not both"
             )
+        if snapshot and not return_routing:
+            raise ValueError(
+                "snapshot=True applies to the handle return_routing=True returns"
+            )
+        if snapshot and (self.cfg.is_internode or self.cfg.is_scatter):
+            raise ValueError(
+                "snapshot=True is intranode gather only: the internode and scatter "
+                "combines also read routing state the op keeps in the arena"
+            )
         n = input.shape[0]
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
         disp_spec, _ = self._pick(n)
-
-        if not self._kernels.self_resets_counters:
-            # Only this one: the kernels self-clear dest_pe_counter and the grid
-            # barrier, but total_recv is cleared in COMBINE, not in dispatch.
-            self.total_recv.zero_()
 
         if routing is not None:
             table = self._kernels.dispatch_replay
@@ -937,7 +966,11 @@ class EpDispatchCombineOp:
             kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
             kern = self._kernels.dispatch[disp_spec]
-            if return_routing:
+            if snapshot:
+                # No fill: dispatch writes every (tok, k) entry below n, and
+                # nothing reads past n.
+                dest_map = torch.empty_like(self.routing_dest_map)
+            elif return_routing:
                 dest_map = self.routing_dest_map
             else:
                 dest_map = self.token_dest_map
@@ -978,7 +1011,12 @@ class EpDispatchCombineOp:
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
             inter_node_disp_send_map=self._empty_i32,
-            total_recv_token_num=self.total_recv,
+            # A copy rather than a buffer handed to the kernel: total_recv is
+            # also read through the op (local_expert_count, StdMoE convert), so
+            # the kernel keeps writing the op's.
+            total_recv_token_num=(
+                self.total_recv.clone() if snapshot else self.total_recv
+            ),
             cur_rank_num_token=n,
             reverse_src_view=reverse,
         )

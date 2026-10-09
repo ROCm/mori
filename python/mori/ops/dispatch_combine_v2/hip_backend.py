@@ -1117,10 +1117,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine={combine_spec: self._wrap_internode("combine")},
             dispatch_replay=None,
             stages_in_kernel=True,
-            # copystaging zeroes total_recv as its first act, so the host does not
-            # have to -- that zero_() was a fill kernel enqueued ahead of the
-            # dispatch sequence, delaying the kernels it protected.
-            self_resets_counters=True,
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
@@ -1279,9 +1275,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
-            # These are plain local buffers, not symmetric regions: the kernels
-            # do not reset them, the op must.
-            self_resets_counters=False,
             capabilities=frozenset(
                 {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
             ),

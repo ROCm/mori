@@ -932,7 +932,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // metadata slabs from m * W / npes, theirs included.
     constexpr int kPmG = (kPlainMeta && kMetaSlabBytes > 0) ? (kCfg.warpPerBlock / kPM) : 1;
     const bool _pmTile = (kPmG > 1) && _metaPlain && (warpId >= warpNum - kPM);
-    const int mtileBytesM = _pmTile ? kPmG * kMetaSlabBytes : kSlabBytes;  // the whole slab, see above
+    const int mtileBytesM =
+        _pmTile ? kPmG * kMetaSlabBytes : kSlabBytes;  // the whole slab, see above
     // idx + weights + srcmap + the scale row, at the stride it is really moved at:
     // sizing this from the unpadded row would under-size the tile it then holds.
     const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
@@ -958,7 +959,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       constexpr bool kMetaLo = kCfg.selfFirst && !kUnitGeom && kCfg.warpPerBlock > kEpTokChunk &&
                                npes - 1 > kCfg.warpPerBlock - kEpTokChunk &&
                                npes <= kCfg.warpPerBlock;
-      static_assert(!(kMetaLo && kOwnHi), "the own pass of kOwnHi assumes the runs start at warp kEpTokChunk");
+      static_assert(!(kMetaLo && kOwnHi),
+                    "the own pass of kOwnHi assumes the runs start at warp kEpTokChunk");
       int _metaW0 = kEpTokChunk;
       if constexpr (kMetaLo) {
         if (_metaHi) {
@@ -967,10 +969,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           _metaW0 = (t < 1) ? 1 : ((t > kEpTokChunk) ? kEpTokChunk : t);
         }
       }
-      const int _metaWarps =
-          _metaHi ? (warpNum - _metaW0) : (_metaPlain ? kPM : warpNum);
-      const int split = (_metaHi || _metaPlain) ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1)
-                                                : _peerSplit;
+      const int _metaWarps = _metaHi ? (warpNum - _metaW0) : (_metaPlain ? kPM : warpNum);
+      const int split =
+          (_metaHi || _metaPlain) ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1) : _peerSplit;
       const int nRuns = npes * split;
       // selfFirst numbers the runs peer-minor when the warps divide evenly, so warp w
       // takes peer w % npes -- the destination it also carries in the payload pass.
@@ -978,10 +979,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // pass needs, and they start it at once instead of after a remote run: at 512
       // tokens that ordering is worth ~2 us of the dispatch.
       const bool _runPeerMinor = kCfg.selfFirst && (_metaWarps % npes) == 0;
-      const int _run0 =
-          _metaHi ? ((warpId >= _metaW0) ? (warpId - _metaW0) : nRuns)
-          : _metaPlain ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
-                       : warpId;
+      const int _run0 = _metaHi ? ((warpId >= _metaW0) ? (warpId - _metaW0) : nRuns)
+                        : _metaPlain
+                            ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
+                            : warpId;
       for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
@@ -1200,8 +1201,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       index_t hE[topk];
 #pragma unroll
       for (int k = 0; k < topk; ++k) hE[k] = args.tokenIndices[(size_t)hTok * topk + k];
-      index_t r =
-          (laneId < npes && laneId != myPe) ? EpSelfFirstPeerSent(args, laneId, sfSeq) : 0;
+      index_t r = (laneId < npes && laneId != myPe) ? EpSelfFirstPeerSent(args, laneId, sfSeq) : 0;
       for (int off = WS / 2; off > 0; off >>= 1) r += __shfl_xor(r, off);
       const index_t d0 = r + s0;
       __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -1668,17 +1668,39 @@ struct EpFp4Wire {
 // is stricter than asked and so still correct.
 __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
   switch (n) {
-    case 0: __builtin_amdgcn_s_wait_tensorcnt(0); break;
-    case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
-    case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
-    case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
-    case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
-    case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
-    case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
-    case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
-    case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
-    case 9: __builtin_amdgcn_s_wait_tensorcnt(9); break;
-    default: __builtin_amdgcn_s_wait_tensorcnt(10); break;
+    case 0:
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+      break;
+    case 1:
+      __builtin_amdgcn_s_wait_tensorcnt(1);
+      break;
+    case 2:
+      __builtin_amdgcn_s_wait_tensorcnt(2);
+      break;
+    case 3:
+      __builtin_amdgcn_s_wait_tensorcnt(3);
+      break;
+    case 4:
+      __builtin_amdgcn_s_wait_tensorcnt(4);
+      break;
+    case 5:
+      __builtin_amdgcn_s_wait_tensorcnt(5);
+      break;
+    case 6:
+      __builtin_amdgcn_s_wait_tensorcnt(6);
+      break;
+    case 7:
+      __builtin_amdgcn_s_wait_tensorcnt(7);
+      break;
+    case 8:
+      __builtin_amdgcn_s_wait_tensorcnt(8);
+      break;
+    case 9:
+      __builtin_amdgcn_s_wait_tensorcnt(9);
+      break;
+    default:
+      __builtin_amdgcn_s_wait_tensorcnt(10);
+      break;
   }
 }
 
@@ -1758,8 +1780,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // a second producer on every SIMD -- a producer is bound by its own dependent chains and LDS
   // reads, not by the SIMD's issue rate -- and twelve reducing waves.
   constexpr int kSegWarps = kOvlp ? kCfg.warpPerBlock / 2 : kCfg.warpPerBlock;
-  constexpr int kSegP =
-      kOvlp ? kCfg.warpPerBlock / 2 - 4 : kCfg.warpPerBlock == 16 ? 6 : kCfg.warpPerBlock / 2;
+  constexpr int kSegP = kOvlp                     ? kCfg.warpPerBlock / 2 - 4
+                        : kCfg.warpPerBlock == 16 ? 6
+                                                  : kCfg.warpPerBlock / 2;
   constexpr int kSegS = kSegWarps - kSegP;
   // Chunks a store wave keeps in flight. With eight producers (24 warps) the stores bound the push,
   // and chunks behind the first only queue: one in flight pushes faster than four. With four
@@ -1787,11 +1810,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
     mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
     unsigned amax = __builtin_bit_cast(unsigned, mx);
-    const unsigned a1 =
-        (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
+    const unsigned a1 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
     amax = amax > a1 ? amax : a1;
-    const unsigned a2 =
-        (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
+    const unsigned a2 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
     return amax > a2 ? amax : a2;
   };
   auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
@@ -1813,11 +1834,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
 #pragma unroll
     for (int i = 0; i < kLd; ++i) {
       unsigned a = grpAmax(xs[i]);
-      const unsigned a3 =
-          (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
+      const unsigned a3 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
       a = a > a3 ? a : a3;
-      const unsigned a4 =
-          (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
+      const unsigned a4 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
       a = a > a4 ? a : a4;
       if ((laneId & 15) == 0) slot[(i * WS + laneId) >> 4] = a;
     }
@@ -2018,8 +2037,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     // handoff, not a slow peer: fail the launch instead of hanging it.
     constexpr unsigned kSpinMax = 1u << 26;
     if (warpId < kSegP) {
-      const int* const map = reinterpret_cast<const int*>(
-          wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
+      const int* const map =
+          reinterpret_cast<const int*>(wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
       unsigned char* const stg = stgB + (size_t)warpId * kTokB;
       auto loadRow = [&](int r) {
         TdmIssueLoad<int>(reinterpret_cast<int*>(stg),
@@ -2035,8 +2054,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         [[maybe_unused]] const int rw = kOvlp && laneId < n ? rowOf(r0 + laneId) : 0;
         if (c >= kSegNb) {
           unsigned spin = 0;
-          while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
-                     fre + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) !=
+          while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(fre + slot, __ATOMIC_RELAXED,
+                                                                  __HIP_MEMORY_SCOPE_WORKGROUP)) !=
                  c - kSegNb + 1) {
             __builtin_amdgcn_s_sleep(1);
             if (++spin > kSpinMax) __builtin_trap();
@@ -2077,8 +2096,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       constexpr bool kKeep = kOvlp && kSegL == 1;
       [[maybe_unused]] int peF = -1, rwF = 0;
       [[maybe_unused]] const __attribute__((address_space(1))) int* const mapG =
-          kKeep ? (const __attribute__((address_space(1))) int*)(
-                      wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc)
+          kKeep ? (const __attribute__((address_space(1))) int*)(wBase +
+                                                                 (uint64_t)wd->lsaRank * wStride +
+                                                                 args.offRecvToSrc)
                 : nullptr;
       auto retire = [&]() {
         const int sh = 4 * (head % kSegL);
@@ -2413,8 +2433,8 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
 }
 
 template <EpCfg kCfg, typename T, int kIpt>
-__device__ __forceinline__ void EpFp4ReduceLoop(const EpArgs& args, EpFp4Item<kCfg> cur, const int gw,
-                                                const int gn) {
+__device__ __forceinline__ void EpFp4ReduceLoop(const EpArgs& args, EpFp4Item<kCfg> cur,
+                                                const int gw, const int gn) {
   const int nItems = args.numTokens * kIpt;
   for (int it = gw; it < nItems; it += gn) {
     const int nx = it + gn;
@@ -2905,7 +2925,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0);
     }
     EpFp4OvlWait<kCfg>(args, phase);
-    if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
     __builtin_amdgcn_s_wait_tensorcnt(0);
     return;
   }
@@ -2951,7 +2970,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     EpCrossDeviceBarrier1250x<kCfg>(args, staged);
   else
     EpFp4CrossDeviceBarrier1250x<kCfg>(args, staged);
-  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
   if (args.numTokens == 0) return;
   if constexpr (!UseP2PRead) {
     EpFp4CombineReduce<kCfg, T>(args, rFirst);

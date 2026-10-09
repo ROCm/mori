@@ -349,6 +349,12 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
+      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
+
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
         run: |
           # bench_ep.py gates every point on an identity-expert check and exits
