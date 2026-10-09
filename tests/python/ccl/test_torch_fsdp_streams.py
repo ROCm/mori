@@ -10,9 +10,10 @@ from unittest.mock import patch
 import pytest
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherInputMetadata
-
 from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
+from torch.distributed.fsdp._fully_shard._all_gather_layout import (
+    AllGatherInputMetadata,
+)
 
 
 def _standalone_output_allocation_case(rank: int, world_size: int) -> None:
@@ -26,33 +27,51 @@ def _standalone_output_allocation_case(rank: int, world_size: int) -> None:
             retained = []
             for count in (4096, 8192):
                 output = comm.allocate(
-                    (count * world_size,), dtype=torch.float32, device=torch.device("cuda")
+                    (count * world_size,),
+                    dtype=torch.float32,
+                    device=torch.device("cuda"),
                 )
                 segment = next(
-                    segment for segment in torch.cuda.memory_snapshot()
-                    if segment["address"] <= output.data_ptr()
+                    segment
+                    for segment in torch.cuda.memory_snapshot()
+                    if segment["address"]
+                    <= output.data_ptr()
                     < segment["address"] + segment["total_size"]
                 )
                 assert output.data_ptr() == segment["address"]
                 reused = comm.allocate(output.shape, dtype=output.dtype, device=device)
                 assert reused.data_ptr() == output.data_ptr()
                 splits = [count // 4, 3 * count // 4]
-                comm.layout.prepare_output(AllGatherInputMetadata(
-                    input_split_sizes=splits, input_numel=count, world_size=world_size,
-                    dtype=torch.float32, device=device,
-                    can_use_param_contiguous_output=True,
-                ))
-                source = torch.arange(count, device=device, dtype=torch.float32) + rank * count
+                comm.layout.prepare_output(
+                    AllGatherInputMetadata(
+                        input_split_sizes=splits,
+                        input_outer_sizes=[1] * len(splits),
+                        input_numel=count,
+                        world_size=world_size,
+                        dtype=torch.float32,
+                        device=device,
+                        can_use_param_contiguous_output=True,
+                    )
+                )
+                source = (
+                    torch.arange(count, device=device, dtype=torch.float32)
+                    + rank * count
+                )
                 comm(output, source, dist.group.WORLD, async_op=True).wait()
                 peer_inputs = [
-                    (torch.arange(count, device=device, dtype=torch.float32) + peer * count)
-                    .split(splits if zero_copy else [count])
+                    (
+                        torch.arange(count, device=device, dtype=torch.float32)
+                        + peer * count
+                    ).split(splits if zero_copy else [count])
                     for peer in range(world_size)
                 ]
-                expected = torch.cat([
-                    peer_inputs[peer][i]
-                    for i in range(len(peer_inputs[0])) for peer in range(world_size)
-                ])
+                expected = torch.cat(
+                    [
+                        peer_inputs[peer][i]
+                        for i in range(len(peer_inputs[0]))
+                        for peer in range(world_size)
+                    ]
+                )
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
                 torch.testing.assert_close(prefix, torch.full_like(prefix, -99.0))
                 comm.release_output()
@@ -64,7 +83,9 @@ def _standalone_output_allocation_case(rank: int, world_size: int) -> None:
 def _metadata_cache_case(rank: int, world_size: int) -> None:
     device = torch.device("cuda", rank)
     count = 4096
-    pool = MoriSdmaAllGatherPool([count * world_size * 4], group=dist.group.WORLD, device=device)
+    pool = MoriSdmaAllGatherPool(
+        [count * world_size * 4], group=dist.group.WORLD, device=device
+    )
     comm = MoriSdmaAllGather(output_pool=pool)
     pool.initialize()
     producers = [torch.cuda.Stream(), torch.cuda.Stream()]
@@ -72,11 +93,17 @@ def _metadata_cache_case(rank: int, world_size: int) -> None:
     consumer = torch.cuda.Stream()
 
     def prepare(splits, requested_device=device):
-        return comm.layout.prepare_output(AllGatherInputMetadata(
-            input_split_sizes=splits, input_numel=count, world_size=world_size,
-            dtype=torch.float32, device=requested_device,
-            can_use_param_contiguous_output=True,
-        ))
+        return comm.layout.prepare_output(
+            AllGatherInputMetadata(
+                input_split_sizes=splits,
+                input_outer_sizes=[1] * len(splits),
+                input_numel=count,
+                world_size=world_size,
+                dtype=torch.float32,
+                device=requested_device,
+                can_use_param_contiguous_output=True,
+            )
+        )
 
     first = prepare([1024, 3072], torch.device("cuda"))
     with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
@@ -91,11 +118,17 @@ def _metadata_cache_case(rank: int, world_size: int) -> None:
         splits = [1024, 3072] if step % 2 == 0 else [2048, 2048]
         with torch.cuda.stream(producer):
             metadata = prepare(splits)
-            with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
+            with patch.object(
+                torch, "tensor", side_effect=AssertionError("cache miss")
+            ):
                 hit = prepare(splits)
             assert hit[0] is metadata[0] and hit[1] is metadata[1]
-            output = comm.allocate((count * world_size,), dtype=torch.float32, device=device)
-            source = torch.arange(count, device=device, dtype=torch.float32) + rank * count
+            output = comm.allocate(
+                (count * world_size,), dtype=torch.float32, device=device
+            )
+            source = (
+                torch.arange(count, device=device, dtype=torch.float32) + rank * count
+            )
         gather.wait_stream(producer)
         with torch.cuda.stream(gather):
             torch.cuda._sleep(20_000_000)
@@ -105,24 +138,79 @@ def _metadata_cache_case(rank: int, world_size: int) -> None:
         with torch.cuda.stream(producers[(step + 1) % 2]):
             prepare([512, 3584])
             comm._clear_prepared_output()
-            churn = [torch.full((2,), -999, device=device, dtype=torch.int64) for _ in range(32)]
+            churn = [
+                torch.full((2,), -999, device=device, dtype=torch.int64)
+                for _ in range(32)
+            ]
         with torch.cuda.stream(consumer):
             work.wait()
             result = output.clone()
             comm.release_output()
         torch.cuda.synchronize()
         peer_inputs = [
-            (torch.arange(count, device=device, dtype=torch.float32) + peer * count).split(splits)
+            (
+                torch.arange(count, device=device, dtype=torch.float32) + peer * count
+            ).split(splits)
             for peer in range(world_size)
         ]
-        expected = torch.cat([peer_inputs[peer][i] for i in range(2) for peer in range(world_size)])
+        expected = torch.cat(
+            [peer_inputs[peer][i] for i in range(2) for peer in range(world_size)]
+        )
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
         del churn
     pool.close()
 
 
+def _capture_rejection_case(rank: int, world_size: int) -> None:
+    device = torch.device("cuda", rank)
+    for fsdp_owned in (False, True):
+        pool = (
+            None
+            if fsdp_owned
+            else MoriSdmaAllGatherPool(
+                [world_size * 16], group=dist.group.WORLD, device=device
+            )
+        )
+        comm = MoriSdmaAllGather(fsdp_owned_output=fsdp_owned, output_pool=pool)
+        if pool is not None:
+            pool.initialize()
+        source = torch.ones(4, device=device)
+        output = comm.allocate((world_size * 4,), dtype=source.dtype, device=device)
+        output.fill_(7)
+        observed = torch.empty_like(output)
+        consumer, capture, retry = (torch.cuda.Stream() for _ in range(3))
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.stream(consumer):
+            torch.cuda._sleep(200_000_000)
+            observed.copy_(output)
+            comm.release_output()
+        # Unlike torch.cuda.graph(), capture_begin() does not drain consumers.
+        with torch.cuda.stream(capture):
+            graph.capture_begin()
+            try:
+                output = comm.allocate(output.shape, dtype=output.dtype, device=device)
+                with pytest.raises(
+                    RuntimeError, match="does not support graph capture"
+                ):
+                    comm(output, source, dist.group.WORLD)
+            finally:
+                graph.capture_end()
+        # Discard the rejected graph and resume eager use on another stream.
+        with torch.cuda.stream(retry):
+            output = comm.allocate(output.shape, dtype=output.dtype, device=device)
+            output.fill_(13)
+            comm.release_output()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            observed, torch.full_like(observed, 7), rtol=0, atol=0
+        )
+        if pool is not None:
+            pool.close()
+
+
 def _worker(rank: int, world_size: int, port: int) -> None:
-    import mori.shmem as shmem
+    from mori import shmem
 
     try:
         utils = importlib.import_module("tests.python.utils")
@@ -134,6 +222,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
         shmem.shmem_torch_process_group_init("default")
         device = torch.device("cuda", rank)
         torch.cuda.set_device(device)
+        _capture_rejection_case(rank, world_size)
         _standalone_output_allocation_case(rank, world_size)
         gc.collect()
         dist.barrier()
@@ -153,7 +242,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             enqueue_name = "enqueue_param_contiguous" if zero_copy else "enqueue"
             enqueue = getattr(collective, enqueue_name)
 
-            def delayed_enqueue(*args, **kwargs):
+            def delayed_enqueue(*args, enqueue=enqueue, **kwargs):
                 torch.cuda._sleep(200_000_000)
                 return enqueue(*args, **kwargs)
 
@@ -169,14 +258,19 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     source = torch.full((count,), float(rank + 1), device=device)
                     comm.layout.prepare_output(
                         AllGatherInputMetadata(
-                            input_split_sizes=splits, input_numel=count,
-                            world_size=world_size, dtype=torch.float32, device=device,
+                            input_split_sizes=splits,
+                            input_outer_sizes=[1] * len(splits),
+                            input_numel=count,
+                            world_size=world_size,
+                            dtype=torch.float32,
+                            device=device,
                             can_use_param_contiguous_output=True,
                         )
                     )
                 gather.wait_stream(producer)
-                with torch.cuda.stream(gather), patch.object(
-                    collective, enqueue_name, side_effect=delayed_enqueue
+                with (
+                    torch.cuda.stream(gather),
+                    patch.object(collective, enqueue_name, side_effect=delayed_enqueue),
                 ):
                     work = comm(output, source, dist.group.WORLD, async_op=async_op)
                     done = gather.record_event()
@@ -190,11 +284,15 @@ def _worker(rank: int, world_size: int, port: int) -> None:
                     with torch.cuda.stream(consumer):
                         if async_op:
                             if not isinstance(work, dist.Work):
-                                raise AssertionError("async all-gather must return Work")
+                                raise AssertionError(
+                                    "async all-gather must return Work"
+                                )
                             work.wait()
                         else:
                             if work is not None:
-                                raise AssertionError("sync all-gather must use stream order")
+                                raise AssertionError(
+                                    "sync all-gather must use stream order"
+                                )
                             consumer.wait_event(done)
                         results.append(output.clone())
                 torch.cuda.synchronize()

@@ -7,7 +7,8 @@ with::
 
     from mori.ccl.torch_fsdp import MoriSdmaAllGather
 
-    model.set_custom_all_gather(MoriSdmaAllGather(zero_copy_output=True))
+    comm = MoriSdmaAllGather(zero_copy_output=True)
+    model.set_all_gather_layout(comm.layout, recurse=False)
 
 When ``zero_copy_output`` is set the backend produces a parameter-contiguous
 output that FSDP can use in place, avoiding the rank-major copy-out. The
@@ -27,14 +28,16 @@ bound to one process group and cannot serve a backward subgroup gather.
 import importlib
 import warnings
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 from weakref import WeakKeyDictionary
 
 import torch
 import torch.distributed as dist
-
+from torch.distributed.fsdp._fully_shard import _all_gather_layout as _layout_api
 from torch.distributed.fsdp._fully_shard._all_gather_layout import (
+    AllGatherFinalizeMetadata,
     AllGatherInputMetadata,
     AllGatherLayout,
     AllGatherOutputs,
@@ -43,10 +46,11 @@ from torch.distributed.fsdp._fully_shard._all_gather_layout import (
 )
 from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
 
-
 _POOLED_RANK_MAJOR = object()
 # Backend instances share SDMA transport state within a process group.
-_LAST_WRITE_EVENTS: WeakKeyDictionary[dist.ProcessGroup, torch.Event] = WeakKeyDictionary()
+_LAST_WRITE_EVENTS: WeakKeyDictionary[dist.ProcessGroup, torch.Event] = (
+    WeakKeyDictionary()
+)
 
 
 @dataclass
@@ -63,9 +67,9 @@ class MoriSdmaAllGatherPool:
     Each backend has a fixed slot so saved parameter views keep their storage.
     Assign concurrently unsharded groups, including a non-resharding root, to
     different slots. Slot conflicts raise instead of overwriting live outputs.
-    FSDP must call ``AllGather.release_output`` after reshard. This pool requires
-    the matching FSDP layout/lifetime contract and supports eager execution;
-    CUDA graph capture is not supported.
+    FSDP calls the backend-owned layout's ``release_output`` after reshard.
+    This pool requires the matching FSDP layout/lifetime contract and supports
+    eager execution. CUDA graph capture is not supported.
 
     A small SDMA all-gather orders slot reuse across ranks without a host
     completion wait. The arena stays registered until collective ``close()``.
@@ -80,8 +84,6 @@ class MoriSdmaAllGatherPool:
     ) -> None:
         if not buffer_sizes or any(size <= 0 or size % 4 for size in buffer_sizes):
             raise ValueError("pool sizes must be positive multiples of four bytes")
-        if not hasattr(AllGather, "release_output"):
-            raise RuntimeError("shared outputs require FSDP AllGather.release_output")
         self._group = group
         self._device = torch.device(device)
         if self._device.type == "cuda" and self._device.index is None:
@@ -105,10 +107,13 @@ class MoriSdmaAllGatherPool:
             offset += capacity
         self._collective: Any | None = None
         self._ready_input = torch.zeros(1, dtype=torch.int32, device=self._device)
-        self._ready_output = self._buffer.narrow(0, offset, group.size() * 4).view(torch.int32)
+        self._ready_output = self._buffer.narrow(0, offset, group.size() * 4).view(
+            torch.int32
+        )
         self._last_write_event: torch.Event | None = (
             torch.cuda.current_stream(self._device).record_event()
-            if self._device.type == "cuda" else None
+            if self._device.type == "cuda"
+            else None
         )
         self._closed = False
 
@@ -120,9 +125,13 @@ class MoriSdmaAllGatherPool:
         if self._initialized or self._closed:
             raise RuntimeError("bind all adapters before pool.initialize()")
         if self._mode is not None and self._mode != comm._zero_copy_output:
-            raise ValueError("all adapters in a MORI pool must use the same zero_copy_output")
+            raise ValueError(
+                "all adapters in a MORI pool must use the same zero_copy_output"
+            )
         key = str(len(self._bindings)) if key is None else key
-        if not isinstance(key, str) or any(binding[0] == key for binding in self._bindings):
+        if not isinstance(key, str) or any(
+            binding[0] == key for binding in self._bindings
+        ):
             raise ValueError("pool group_key values must be unique strings")
         self._mode = comm._zero_copy_output
         self._bindings.append((key, comm._buffer_index, comm._zero_copy_output))
@@ -138,15 +147,21 @@ class MoriSdmaAllGatherPool:
         configs = [None] * self._group.size()
         dist.all_gather_object(configs, config, group=self._group)
         if not self._bindings or any(peer != config for peer in configs):
-            raise ValueError("MORI pool capacities, group mappings, or adapter assignments differ across ranks")
+            raise ValueError(
+                "MORI pool capacities, group mappings, or adapter assignments differ across ranks"
+            )
         self._members = members
         self._initialized = True
 
     def _check_ready(self) -> None:
         if self._closed or self._failed:
-            raise RuntimeError("MORI output pool is closed or failed; failed communication cannot be reused")
+            raise RuntimeError(
+                "MORI output pool is closed or failed; failed communication cannot be reused"
+            )
         if not self._initialized:
-            raise RuntimeError("call pool.initialize() collectively after binding all adapters")
+            raise RuntimeError(
+                "call pool.initialize() collectively after binding all adapters"
+            )
 
     def _validate_group(self, group) -> bool:
         self._check_ready()
@@ -159,7 +174,9 @@ class MoriSdmaAllGatherPool:
                 or not set(members).issubset(self._members)
                 or members[group.rank()] != self._members[self._group.rank()]
             ):
-                raise ValueError("MORI pool requires its bound process group or a valid strict subgroup")
+                raise ValueError(
+                    "MORI pool requires its bound process group or a valid strict subgroup"
+                )
             self._subgroups.add(group)
         return True
 
@@ -213,13 +230,15 @@ class MoriSdmaAllGatherPool:
         if slot.owner is not comm:
             raise RuntimeError("MORI output slot released by a different group")
         if not self._failed:
-            slot.last_use = torch.cuda.current_stream(self._device).record_event()
+            slot.last_use = _record_last_use(self._device, slot.last_use)
         slot.owner = None
 
     def _collective_for(self, comm, group):
         self._check_ready()
         if group is not self._group:
-            raise ValueError("only the bound process group may use the MORI pool collective")
+            raise ValueError(
+                "only the bound process group may use the MORI pool collective"
+            )
         if self._collective is None:
             self._collective = comm._make_collective(group)
             self._collective.register_output_buffer(self._buffer)
@@ -230,7 +249,9 @@ class MoriSdmaAllGatherPool:
         if self._closed:
             return
         if self._failed:
-            raise RuntimeError("cannot close a failed MORI pool safely; terminate the distributed workers")
+            raise RuntimeError(
+                "cannot close a failed MORI pool safely; terminate the distributed workers"
+            )
         if any(slot.owner is not None for slot in self._slots):
             raise RuntimeError("reshard all groups before closing the MORI output pool")
         torch.cuda.synchronize(self._device)
@@ -242,7 +263,9 @@ class MoriSdmaAllGatherPool:
 
 
 class _MoriSdmaAllGatherWork(dist.Work):
-    def __init__(self, collective: Any, stream: torch.Stream, event: torch.Event) -> None:
+    def __init__(
+        self, collective: Any, stream: torch.Stream, event: torch.Event
+    ) -> None:
         super().__init__()
         self._collective = collective
         self._device = stream.device
@@ -255,7 +278,7 @@ class _MoriSdmaAllGatherWork(dist.Work):
 
 class _MoriSdmaAllGatherLayout(AllGatherLayout):
     def __init__(self, comm: "MoriSdmaAllGather") -> None:
-        self._comm = comm
+        self.comm = self._comm = comm
         self._metadata_key: tuple | None = None
         self._cached_metadata: tuple[torch.Tensor, torch.Tensor, int] | None = None
 
@@ -269,11 +292,23 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
         dtype, device = input_metadata.dtype, input_metadata.device
         self._comm._clear_prepared_output()
         pool = self._comm._output_pool
-        self._comm._native_fallback = pool is not None and world_size != pool._group.size()
-        fallback = _POOLED_RANK_MAJOR if pool is not None else None
+        self._comm._native_fallback = (
+            pool is not None and world_size != pool._group.size()
+        )
+        fallback = (
+            _POOLED_RANK_MAJOR
+            if pool is not None or self._comm._fsdp_owned_output
+            else None
+        )
         if pool is not None and world_size != pool._group.size():
             return fallback
-        if not self._comm._zero_copy_output or not input_metadata.can_use_param_contiguous_output:
+        eligible = (
+            input_metadata.dtype != torch.uint8
+            and all(n == 1 for n in input_metadata.input_outer_sizes)
+            if self._comm._fsdp_owned_output
+            else input_metadata.can_use_param_contiguous_output
+        )
+        if not self._comm._zero_copy_output or not eligible:
             return fallback
         if not input_split_sizes:
             raise RuntimeError("MORI zero-copy allgather requires non-empty splits")
@@ -322,31 +357,76 @@ class _MoriSdmaAllGatherLayout(AllGatherLayout):
             self._comm._param_contiguous_split_offsets,
         )
 
-    def finalize_outputs(
-        self,
-        all_gather_output: torch.Tensor,
-        param_metadata: list[AllGatherParamMetadata],
-        world_size: int,
-        output_metadata: object | None,
-    ) -> AllGatherOutputs:
-        if output_metadata is _POOLED_RANK_MAJOR:
-            outputs = DefaultAllGatherLayout().finalize_outputs(
-                all_gather_output, param_metadata, world_size, None
-            )
-            # Existing zero-copy parameters can still alias this slot on fallback.
-            if not any(param.backend_owned for param in param_metadata):
+    def finalize_outputs(self, metadata: AllGatherFinalizeMetadata) -> AllGatherOutputs:
+        output, params = metadata.all_gather_output, metadata.param_metadata
+        world_size, selection = metadata.world_size, metadata.output_metadata
+        if self._comm._fsdp_owned_output:
+            try:
+                if selection is _POOLED_RANK_MAJOR:
+                    return DefaultAllGatherLayout().finalize_outputs(metadata)
+                if not metadata.buffers:
+                    buffer = torch.empty_like(output)
+                    buffer.copy_(output)
+                    return AllGatherOutputs(
+                        _param_contiguous_views(buffer, params, world_size), [buffer]
+                    )
+                if (
+                    len(metadata.buffers) == 1
+                    and metadata.buffers[0].numel() == output.numel()
+                ):
+                    metadata.buffers[0].copy_(output)
+                else:
+                    # Cached outputs may be larger than the current payloads.
+                    views = _param_contiguous_views(output, params, world_size)
+                    for param, new_views in zip(params, views):
+                        for target, source in zip(param.outputs, new_views):
+                            target.narrow(0, 0, source.numel()).copy_(source)
+                return AllGatherOutputs(
+                    [param.outputs for param in params], metadata.buffers
+                )
+            finally:
+                self._comm.release_output()
+        if selection is _POOLED_RANK_MAJOR:
+            outputs = DefaultAllGatherLayout().finalize_outputs(metadata)
+            if not any(param.backend_owned for param in params):
                 self._comm.release_output()
             return outputs
         if self._comm._output_pool is not None:
             self._comm._aliases_pool = any(
-                not param.outputs or param.backend_owned for param in param_metadata
+                not param.outputs or param.backend_owned for param in params
             )
-        return AllGatherOutputs(
-            self.param_contiguous_output_views(
-                all_gather_output, [param.input_numels for param in param_metadata], world_size
-            ),
-            backend_owned=True,
+        return AllGatherOutputs(_param_contiguous_views(output, params, world_size))
+
+
+class _MoriBackendOwnedAllGatherLayout(
+    _MoriSdmaAllGatherLayout,
+    getattr(_layout_api, "BackendOwnedAllGatherLayout", AllGatherLayout),
+):
+    def release_output(self) -> None:
+        self._comm.release_output()
+
+
+def _param_contiguous_views(
+    output: torch.Tensor, params: list[AllGatherParamMetadata], world_size: int
+) -> list[list[torch.Tensor]]:
+    views = []
+    offset = 0
+    for param in params:
+        param_views = []
+        for numel, dtype in zip(param.input_numels, param.input_dtypes):
+            if dtype != output.dtype:
+                raise ValueError(
+                    "MORI parameter-contiguous payloads must match the wire dtype"
+                )
+            count = numel * world_size
+            param_views.append(output.narrow(0, offset, count).data)
+            offset += count
+        views.append(param_views)
+    if offset != output.numel():
+        raise ValueError(
+            "MORI parameter-contiguous output sizes do not match collective output"
         )
+    return views
 
 
 class MoriSdmaAllGather(AllGather):
@@ -356,6 +436,9 @@ class MoriSdmaAllGather(AllGather):
         zero_copy_output (bool): produce a parameter-contiguous output that FSDP
             uses in place, skipping the rank-major copy-out wherever the
             parameter group is eligible. Defaults to ``True``.
+        fsdp_owned_output: Copy parameter-contiguous communication output into
+            FSDP-owned storage, which FSDP frees on reshard. This mode works
+            with the base layout contract without the backend-owned extension.
         output_pool: Optional shared registered storage. Each backend retains a
             separate layout/owner; only its output memory is shared. Required
             when post-forward resharding uses a strict subgroup, such as
@@ -366,23 +449,41 @@ class MoriSdmaAllGather(AllGather):
             Without a name, adapters are identified by their construction order.
     """
 
-    reuses_output_storage = True
-
     def __init__(
-        self, zero_copy_output: bool = True, *,
+        self,
+        zero_copy_output: bool = True,
+        *,
+        fsdp_owned_output: bool = False,
         output_pool: MoriSdmaAllGatherPool | None = None,
         buffer_index: int = 0,
         group_key: str | None = None,
     ) -> None:
         if output_pool is not None and not 0 <= buffer_index < len(output_pool._slots):
             raise ValueError("buffer_index is outside the MORI output pool")
+        if not fsdp_owned_output and not hasattr(
+            _layout_api, "BackendOwnedAllGatherLayout"
+        ):
+            raise RuntimeError(
+                "MORI backend-owned outputs require FSDP BackendOwnedAllGatherLayout; "
+                "use fsdp_owned_output=True with the FSDP-owned layout contract"
+            )
+        if fsdp_owned_output and output_pool is not None:
+            raise ValueError(
+                "FSDP-owned outputs use private staging; shared pools require backend-owned layouts"
+            )
+        self._fsdp_owned_output = fsdp_owned_output
         self._output_pool = output_pool
         self._buffer_index = buffer_index
         self._pool_active = False
         self._native_fallback = False
         self._aliases_pool = False
         self._zero_copy_output = zero_copy_output
-        self.layout = _MoriSdmaAllGatherLayout(self)
+        layout_type = (
+            _MoriSdmaAllGatherLayout
+            if fsdp_owned_output
+            else _MoriBackendOwnedAllGatherLayout
+        )
+        self.layout = layout_type(self)
         self._collective: Any | None = None
         self._process_group: dist.ProcessGroup | None = None
         self._mem_pool: torch.cuda.MemPool | None = None
@@ -399,7 +500,7 @@ class MoriSdmaAllGather(AllGather):
         self._warned_unaligned = False
         if output_pool is not None:
             output_pool._bind(self, group_key)
-        elif not zero_copy_output:
+        elif not zero_copy_output and not fsdp_owned_output:
             warnings.warn(
                 "MORI without output_pool retains a full output per group even with "
                 "zero_copy_output=False; use a shared pool for bounded output storage",
@@ -460,27 +561,51 @@ class MoriSdmaAllGather(AllGather):
         try:
             subgroup = pool._validate_group(group) if pool is not None else False
             self._validate_tensors(output_tensor, input_tensor, group)
-            if subgroup and output_tensor.untyped_storage().data_ptr() == pool._buffer.data_ptr():
-                raise ValueError("subgroup fallback requires independent staging from layout preparation")
-            may_have_launched = True
-            if subgroup:
-                return dist.all_gather_into_tensor(
-                    output_tensor, input_tensor, group=group, async_op=async_op
+            device_context = (
+                torch.cuda.device(input_tensor.device)
+                if input_tensor.is_cuda
+                else nullcontext()
+            )
+            with device_context:
+                if input_tensor.is_cuda and torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "MORI FSDP SDMA allgather does not support graph capture"
+                    )
+                if (
+                    subgroup
+                    and output_tensor.untyped_storage().data_ptr()
+                    == pool._buffer.data_ptr()
+                ):
+                    raise ValueError(
+                        "subgroup fallback requires independent staging from layout preparation"
+                    )
+                may_have_launched = True
+                if subgroup:
+                    return dist.all_gather_into_tensor(
+                        output_tensor, input_tensor, group=group, async_op=async_op
+                    )
+                return self._call_full_group(
+                    output_tensor, input_tensor, group, async_op
                 )
-            return self._call_full_group(output_tensor, input_tensor, group, async_op)
         except BaseException:
             if may_have_launched and pool is not None:
                 pool._failed = True
             self.release_output()
             raise
         finally:
-            self._clear_prepared_output()
+            if self._fsdp_owned_output:
+                # FSDP may discard a prefetch without calling finalize_outputs.
+                # Staging is transient; both writes and later copies order reuse.
+                self.release_output()
+            else:
+                self._clear_prepared_output()
 
     def _call_full_group(self, output_tensor, input_tensor, group, async_op):
         stream = torch.cuda.current_stream(input_tensor.device)
         previous = _LAST_WRITE_EVENTS.get(group)
         if previous is not None and (
-            self._output_pool is None or previous is not self._output_pool._last_write_event
+            self._output_pool is None
+            or previous is not self._output_pool._last_write_event
         ):
             stream.wait_event(previous)
         if self._output_pool is not None:
@@ -498,9 +623,13 @@ class MoriSdmaAllGather(AllGather):
                 group=group,
                 async_op=async_op,
             )
+            if self._fsdp_owned_output and async_op:
+                # Native Work completes on its own stream; order staging reuse.
+                work.wait()
             _LAST_WRITE_EVENTS[group] = (
                 self._output_pool._after_write(stream)
-                if self._output_pool is not None else stream.record_event()
+                if self._output_pool is not None
+                else stream.record_event()
             )
             return work
         collective = self._get_collective(group)
@@ -533,7 +662,8 @@ class MoriSdmaAllGather(AllGather):
         output_tensor.record_stream(stream)
         event = (
             self._output_pool._after_write(stream)
-            if self._output_pool is not None else stream.record_event()
+            if self._output_pool is not None
+            else stream.record_event()
         )
         _LAST_WRITE_EVENTS[group] = event
         if async_op:
@@ -548,7 +678,9 @@ class MoriSdmaAllGather(AllGather):
             self._ready_buffer.zero_()
             collective.register_output_buffer(self._ready_buffer)
         # Local consumer events alone cannot prevent writes from a faster peer.
-        collective.enqueue(self._ready_buffer[:1], self._ready_buffer[1:], 1, stream=stream)
+        collective.enqueue(
+            self._ready_buffer[:1], self._ready_buffer[1:], 1, stream=stream
+        )
 
     def release_output(self) -> None:
         self._clear_prepared_output()
@@ -556,8 +688,12 @@ class MoriSdmaAllGather(AllGather):
             if self._pool_active:
                 self._output_pool._release(self)
                 self._pool_active = False
-        elif self._output_active and self._output_buffer is not None:
-            self._last_use_event = torch.cuda.current_stream(self._output_buffer.device).record_event()
+        elif self._output_buffer is not None and (
+            self._output_active or self._fsdp_owned_output
+        ):
+            self._last_use_event = _record_last_use(
+                self._output_buffer.device, self._last_use_event
+            )
             self._output_active = False
 
     def _clear_prepared_output(self) -> None:
@@ -611,7 +747,9 @@ class MoriSdmaAllGather(AllGather):
             return self._output_pool._collective_for(self, group)
         if self._collective is not None:
             if group is not self._process_group:
-                raise ValueError("a MORI adapter cannot reuse its collective with a different process group")
+                raise ValueError(
+                    "a MORI adapter cannot reuse its collective with a different process group"
+                )
             return self._collective
 
         self._collective = self._make_collective(group)
@@ -655,7 +793,9 @@ class MoriSdmaAllGather(AllGather):
     ) -> None:
         if self._output_pool is not None:
             if not collective.is_output_registered(output_tensor):
-                raise RuntimeError("MORI output does not belong to a registered pool slot")
+                raise RuntimeError(
+                    "MORI output does not belong to a registered pool slot"
+                )
             return
         ptr = output_tensor.data_ptr()
         nbytes = _tensor_nbytes(output_tensor)
@@ -683,6 +823,15 @@ class MoriSdmaAllGather(AllGather):
             return
         self._collective.deregister_output_buffer(self._output_buffer)
         self._registered_output_ptr = None
+
+
+def _record_last_use(device, previous):
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                # A rejected capture never runs; retain the eager consumer event.
+                return previous
+    return torch.cuda.current_stream(device).record_event()
 
 
 def _allocate_registered_output(size, *, dtype, device):

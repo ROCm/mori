@@ -9,12 +9,13 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.fsdp._fully_shard._all_gather_layout import AllGatherInputMetadata
+from torch.distributed.fsdp._fully_shard._all_gather_layout import (
+    AllGatherInputMetadata,
+)
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import DefaultAllGather
-
-from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
 
 
 class _Block(torch.nn.Module):
@@ -48,7 +49,8 @@ def _group(module):
 def _bytes(module, dtype):
     group = _group(module)
     return sum(p.padded_sharded_param_size.numel() for p in group.fsdp_params) * (
-        group.mesh_info.shard_process_group.size() * torch.empty((), dtype=dtype).element_size()
+        group.mesh_info.shard_process_group.size()
+        * torch.empty((), dtype=dtype).element_size()
     )
 
 
@@ -61,20 +63,26 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
     policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
     for model in (native, shared):
         for block in model.blocks:
-            fully_shard(block, mesh=mesh, mp_policy=policy, reshard_after_forward=reshard)
+            fully_shard(
+                block, mesh=mesh, mp_policy=policy, reshard_after_forward=reshard
+            )
         fully_shard(model, mesh=mesh, mp_policy=policy, reshard_after_forward=False)
         model._set_unshard_async_op(async_op)
     block_bytes = max(_bytes(block, dtype) for block in shared.blocks)
     pool = MoriSdmaAllGatherPool(
-        [block_bytes, block_bytes, _bytes(shared, dtype)], group=dist.group.WORLD,
+        [block_bytes, block_bytes, _bytes(shared, dtype)],
+        group=dist.group.WORLD,
         device=device,
     )
     modules = list(shared.blocks) + [shared]
     comms = []
     for index, module in enumerate(modules):
-        comm = MoriSdmaAllGather(zero_copy_output=zero_copy, output_pool=pool,
-                                buffer_index=index % 2 if index < 6 else 2)
-        module.set_custom_all_gather(comm)
+        comm = MoriSdmaAllGather(
+            zero_copy_output=zero_copy,
+            output_pool=pool,
+            buffer_index=index % 2 if index < 6 else 2,
+        )
+        module.set_all_gather_layout(comm.layout, recurse=False)
         comms.append(comm)
     pool.initialize()
 
@@ -83,8 +91,12 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
         if rank == 0:
             torch.cuda._sleep(100_000)
 
-    handles = [block.register_forward_pre_hook(delayed_consumer) for block in shared.blocks]
-    optimizers = [torch.optim.SGD(model.parameters(), lr=0.01) for model in (native, shared)]
+    handles = [
+        block.register_forward_pre_hook(delayed_consumer) for block in shared.blocks
+    ]
+    optimizers = [
+        torch.optim.SGD(model.parameters(), lr=0.01) for model in (native, shared)
+    ]
     expected_pointers = None
     for p, q in zip(native.parameters(), shared.parameters()):
         torch.testing.assert_close(p.to_local(), q.to_local(), rtol=0, atol=0)
@@ -99,7 +111,9 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
             losses.append(loss.detach())
         torch.testing.assert_close(losses[0], losses[1], rtol=0, atol=0)
         for p, q in zip(native.parameters(), shared.parameters()):
-            torch.testing.assert_close(p.grad.to_local(), q.grad.to_local(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                p.grad.to_local(), q.grad.to_local(), rtol=0, atol=0
+            )
         for optimizer in optimizers:
             optimizer.step()
         for p, q in zip(native.parameters(), shared.parameters()):
@@ -110,22 +124,33 @@ def _training_case(rank, world_size, dtype, async_op, reshard, zero_copy=True):
             assert slot.owner is None
             for param in _group(module).fsdp_params:
                 if not zero_copy:
-                    assert not param._keep_all_gather_output_storage
+                    # The custom fallback returns FSDP-owned persistent buffers.
+                    group = _group(module)
+                    assert group._all_gather_buffers is not None
+                    for output in param.all_gather_outputs:
+                        assert (
+                            output.untyped_storage()._cdata
+                            != pool._buffer.untyped_storage()._cdata
+                        )
+                        assert output.untyped_storage().size() == 0
                     continue
                 assert param._keep_all_gather_output_storage
                 for output in param.all_gather_outputs:
-                    assert output.untyped_storage().data_ptr() == pool._buffer.data_ptr()
+                    assert (
+                        output.untyped_storage().data_ptr() == pool._buffer.data_ptr()
+                    )
                     assert slot.buffer.data_ptr() <= output.data_ptr()
-                    assert output.data_ptr() + output.numel() * output.element_size() <= (
-                        slot.buffer.data_ptr() + slot.buffer.numel()
+                    assert (
+                        output.data_ptr() + output.numel() * output.element_size()
+                        <= (slot.buffer.data_ptr() + slot.buffer.numel())
                     )
                     pointers.append(output.data_ptr())
         if expected_pointers is None:
             expected_pointers = pointers
         assert pointers == expected_pointers
         if zero_copy:
-            shared.blocks[0].set_custom_all_gather(comms[0])
-            with pytest.raises(ValueError, match="cannot replace.*all-gather"):
+            shared.blocks[0].set_all_gather_layout(comms[0].layout, recurse=False)
+            with pytest.raises(ValueError, match="bound to its comm"):
                 shared.blocks[0].set_custom_all_gather(DefaultAllGather())
     for handle in handles:
         handle.remove()
@@ -138,8 +163,11 @@ def _stream_reuse_case(rank, world_size, pooled=True):
     device = torch.device("cuda", rank)
     count = 4096
     pool = (
-        MoriSdmaAllGatherPool([count * world_size * 4] * 2, group=dist.group.WORLD, device=device)
-        if pooled else None
+        MoriSdmaAllGatherPool(
+            [count * world_size * 4] * 2, group=dist.group.WORLD, device=device
+        )
+        if pooled
+        else None
     )
     comms = [MoriSdmaAllGather(output_pool=pool, buffer_index=i) for i in range(2)]
     if pool is not None:
@@ -151,7 +179,9 @@ def _stream_reuse_case(rank, world_size, pooled=True):
         comm = comms[step % 2]
         gather = gathers[step % 2]
         with torch.cuda.stream(gather):
-            output = comm.allocate((count * world_size,), dtype=torch.float32, device=device)
+            output = comm.allocate(
+                (count * world_size,), dtype=torch.float32, device=device
+            )
             # Input packing may write the output before the collective starts.
             output.fill_(-1)
             source = torch.full((count,), float(step * 10 + rank), device=device)
@@ -164,10 +194,12 @@ def _stream_reuse_case(rank, world_size, pooled=True):
             comm.release_output()
     torch.cuda.synchronize()
     for step, result in enumerate(results):
-        expected = torch.cat([
-            torch.full((count,), float(step * 10 + peer), device=device)
-            for peer in range(world_size)
-        ])
+        expected = torch.cat(
+            [
+                torch.full((count,), float(step * 10 + peer), device=device)
+                for peer in range(world_size)
+            ]
+        )
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
     if pool is not None:
         pool.close()
@@ -181,7 +213,9 @@ def _device_case(rank, world_size):
     for requested in (torch.device("cuda"), target):
         current = rank if requested.index is None else (rank + 1) % world_size
         with torch.cuda.device(current):
-            pool = MoriSdmaAllGatherPool([128], group=dist.group.WORLD, device=requested)
+            pool = MoriSdmaAllGatherPool(
+                [128], group=dist.group.WORLD, device=requested
+            )
             assert torch.cuda.current_device() == current
         assert pool._device == target
         assert pool._buffer.device == target
@@ -210,7 +244,9 @@ def _persistent_packing_case(rank):
                 comm.release_output()
         torch.cuda.synchronize()
         for step, result in enumerate(results):
-            torch.testing.assert_close(result, torch.full_like(result, step), rtol=0, atol=0)
+            torch.testing.assert_close(
+                result, torch.full_like(result, step), rtol=0, atol=0
+            )
 
 
 def _subgroup_case(rank, world_size):
@@ -223,31 +259,52 @@ def _subgroup_case(rank, world_size):
     comm = MoriSdmaAllGather(output_pool=pool)
     pool.initialize()
     if rank < 2:
-        comm.layout.prepare_output(AllGatherInputMetadata(
-            input_split_sizes=[4], input_numel=4, world_size=2,
-            dtype=torch.float32, device=device,
-            can_use_param_contiguous_output=False,
-        ))
+        comm.layout.prepare_output(
+            AllGatherInputMetadata(
+                input_split_sizes=[4],
+                input_outer_sizes=[1],
+                input_numel=4,
+                world_size=2,
+                dtype=torch.float32,
+                device=device,
+                can_use_param_contiguous_output=False,
+            )
+        )
         output = comm.allocate((8,), dtype=torch.float32, device=device)
         source = torch.full((4,), float(rank), device=device)
         comm(output, source, subgroup, async_op=True).wait()
-        torch.testing.assert_close(output, torch.tensor([0.] * 4 + [1.] * 4, device=device))
+        torch.testing.assert_close(
+            output, torch.tensor([0.0] * 4 + [1.0] * 4, device=device)
+        )
         assert pool._collective is None
         assert not comm._pool_active
     # Nonmembers never enter the adapter's subgroup call.
     dist.barrier()
     # A custom input callback can allocate directly without preparing a layout.
     output = comm.allocate((4 * world_size,), dtype=torch.float32, device=device)
-    comm(output, torch.full((4,), float(rank), device=device), dist.group.WORLD, async_op=True).wait()
-    expected = torch.arange(world_size, device=device, dtype=torch.float32).repeat_interleave(4)
+    comm(
+        output,
+        torch.full((4,), float(rank), device=device),
+        dist.group.WORLD,
+        async_op=True,
+    ).wait()
+    expected = torch.arange(
+        world_size, device=device, dtype=torch.float32
+    ).repeat_interleave(4)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     comm.release_output()
     collective = pool._collective
-    comm.layout.prepare_output(AllGatherInputMetadata(
-        input_split_sizes=[4], input_numel=4, world_size=world_size,
-        dtype=torch.float32, device=device,
-        can_use_param_contiguous_output=True,
-    ))
+    comm.layout.prepare_output(
+        AllGatherInputMetadata(
+            input_split_sizes=[4],
+            input_outer_sizes=[1],
+            input_numel=4,
+            world_size=world_size,
+            dtype=torch.float32,
+            device=device,
+            can_use_param_contiguous_output=True,
+        )
+    )
     output = comm.allocate((4 * world_size,), dtype=torch.float32, device=device)
     try:
         comm(output, torch.ones(4, device=device), other_full_group)
@@ -258,8 +315,15 @@ def _subgroup_case(rank, world_size):
     assert pool._collective is collective
     assert pool._slots[0].owner is None
     output = comm.allocate((4 * world_size,), dtype=torch.float32, device=device)
-    comm(output, torch.full((4,), float(rank), device=device), dist.group.WORLD, async_op=True).wait()
-    expected = torch.arange(world_size, device=device, dtype=torch.float32).repeat_interleave(4)
+    comm(
+        output,
+        torch.full((4,), float(rank), device=device),
+        dist.group.WORLD,
+        async_op=True,
+    ).wait()
+    expected = torch.arange(
+        world_size, device=device, dtype=torch.float32
+    ).repeat_interleave(4)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     comm.release_output()
     comm.release_output()
@@ -278,7 +342,8 @@ def _configuration_case(rank):
         pool = MoriSdmaAllGatherPool(sizes, group=dist.group.WORLD, device=device)
         MoriSdmaAllGather(
             zero_copy_output=not (field == "mode" and rank == 0),
-            output_pool=pool, buffer_index=int(field == "slot" and rank == 0),
+            output_pool=pool,
+            buffer_index=int(field == "slot" and rank == 0),
             group_key="other" if field == "key" and rank == 0 else "block",
         )
         try:
@@ -292,12 +357,15 @@ def _configuration_case(rank):
 
 
 def _worker(rank, world_size, port):
-    import mori.shmem as shmem
+    from mori import shmem
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
-        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
-        world_size=world_size, timeout=timedelta(seconds=120),
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=120),
     )
     torch._C._distributed_c10d._register_process_group("default", dist.group.WORLD)
     shmem.shmem_torch_process_group_init("default")
@@ -325,7 +393,10 @@ def _worker(rank, world_size, port):
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_shared_fsdp_outputs(world_size):
-    if os.environ.get("MORI_ENABLE_SDMA") != "1" or torch.cuda.device_count() < world_size:
+    if (
+        os.environ.get("MORI_ENABLE_SDMA") != "1"
+        or torch.cuda.device_count() < world_size
+    ):
         pytest.skip("requires MORI_ENABLE_SDMA=1 and enough GPUs")
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

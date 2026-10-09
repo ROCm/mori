@@ -1,17 +1,19 @@
+import importlib
 import unittest
 import warnings
+from contextlib import contextmanager
 import weakref
 from unittest.mock import MagicMock, call, patch
 
 import torch
-
-import mori.ccl.torch_fsdp as torch_fsdp
 from mori.ccl.torch_fsdp import MoriSdmaAllGather, MoriSdmaAllGatherPool
 from torch.distributed.fsdp._fully_shard._all_gather_layout import (
     AllGatherInputMetadata,
     AllGatherLayout,
     DefaultAllGatherLayout,
 )
+
+torch_fsdp = importlib.import_module("mori.ccl.torch_fsdp")
 
 
 def _prepare(
@@ -21,11 +23,13 @@ def _prepare(
     dtype: torch.dtype = torch.float32,
     eligible: bool = True,
     world_size: int = 2,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device | None = None,
 ) -> object | None:
+    device = torch.device("cpu") if device is None else device
     return layout.prepare_output(
         AllGatherInputMetadata(
             input_split_sizes=split_sizes,
+            input_outer_sizes=[1] * len(split_sizes),
             input_numel=sum(split_sizes),
             world_size=world_size,
             dtype=dtype,
@@ -42,22 +46,99 @@ class TestMoriSdmaAllGather(unittest.TestCase):
 
     def test_rank_major_backend_cannot_be_shared_between_groups(self) -> None:
         comm = MoriSdmaAllGather(zero_copy_output=False)
-        comm.layout._bind_owner(object())
+        owner = MagicMock()
+        comm.layout._bind_owner(owner)
         with self.assertRaisesRegex(ValueError, "cannot be shared"):
-            comm.layout._bind_owner(object())
+            comm.layout._bind_owner(MagicMock())
+
+    def test_graph_capture_is_rejected_before_communication(self):
+        for fsdp_owned, zero_copy in [
+            (False, True),
+            (False, False),
+            (True, True),
+            (True, False),
+        ]:
+            with self.subTest(fsdp_owned=fsdp_owned, zero_copy=zero_copy):
+                comm = MoriSdmaAllGather(
+                    fsdp_owned_output=fsdp_owned, zero_copy_output=zero_copy
+                )
+                input_tensor = MagicMock(spec=torch.Tensor)
+                input_tensor.is_cuda = True
+                input_tensor.device = torch.device("cuda:3")
+                comm._output_buffer = input_tensor
+                comm._output_active = True
+                previous = comm._last_use_event = object()
+                with (
+                    patch.object(torch.cuda, "current_stream"),
+                    patch.object(comm, "_validate_tensors"),
+                    patch.object(comm, "_call_full_group") as launch,
+                    patch.object(torch.cuda, "device") as device_guard,
+                    patch.object(
+                        torch.cuda, "is_current_stream_capturing", return_value=True
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "does not support graph capture"
+                    ),
+                ):
+                    comm(torch.empty(8), input_tensor, MagicMock())
+                device_guard.assert_called_with(input_tensor.device)
+                launch.assert_not_called()
+                self.assertIs(comm._last_use_event, previous)
+                self.assertFalse(comm._output_active)
+
+    def test_communication_runs_on_input_device(self):
+        comm = MoriSdmaAllGather()
+        input_tensor = MagicMock(spec=torch.Tensor)
+        input_tensor.is_cuda = True
+        input_tensor.device = torch.device("cuda:1")
+        active_device = torch.device("cuda:0")
+        work = object()
+
+        @contextmanager
+        def device_context(device):
+            nonlocal active_device
+            previous = active_device
+            active_device = device
+            try:
+                yield
+            finally:
+                active_device = previous
+
+        def launch(*args):
+            self.assertEqual(active_device, input_tensor.device)
+            return work
+
+        with (
+            patch.object(comm, "_validate_tensors"),
+            patch.object(comm, "_call_full_group", side_effect=launch),
+            patch.object(torch.cuda, "device", side_effect=device_context),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            self.assertIs(comm(torch.empty(8), input_tensor, MagicMock()), work)
+        self.assertEqual(active_device, torch.device("cuda:0"))
+
+    def test_fsdp_owned_rank_major_does_not_recommend_unsupported_pool(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            MoriSdmaAllGather(zero_copy_output=False, fsdp_owned_output=True)
+        self.assertEqual(caught, [])
 
     def test_fallback_selects_default_finalizer(self) -> None:
         comm = MoriSdmaAllGather()
         copy_in, selected_layout, metadata = comm.layout.prepare(
             AllGatherInputMetadata(
-                input_split_sizes=[2, 4], input_numel=6, world_size=2,
-                dtype=torch.float32, device=torch.device("cpu"),
+                input_split_sizes=[2, 4],
+                input_outer_sizes=[1, 1],
+                input_numel=6,
+                world_size=2,
+                dtype=torch.float32,
+                device=torch.device("cpu"),
                 can_use_param_contiguous_output=False,
             )
         )
         self.assertIs(copy_in, torch.ops.fsdp.all_gather_copy_in)
         self.assertIsInstance(selected_layout, DefaultAllGatherLayout)
-        self.assertEqual(metadata, [2, 4])
+        self.assertIsNone(metadata)
         self.assertIsNone(comm._param_contiguous_split_sizes)
 
     def test_uses_safe_base_copy_in(self):
@@ -70,7 +151,9 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         )
         self.assertIs(returned, output)
         self.assertEqual(output.tolist(), [-1.0] * 12)
-        self.assertNotEqual(source.untyped_storage().data_ptr(), output.untyped_storage().data_ptr())
+        self.assertNotEqual(
+            source.untyped_storage().data_ptr(), output.untyped_storage().data_ptr()
+        )
         self.assertEqual(source.tolist(), [0, 1, 0, 1, 2, 3])
 
     def test_prepare_zero_copy_metadata(self) -> None:
@@ -89,8 +172,10 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         first = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
         comm.release_output()
         self.assertIsNone(comm._param_contiguous_split_sizes)
-        with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")), \
-                patch.object(torch, "empty", side_effect=AssertionError("allocation")):
+        with (
+            patch.object(torch, "tensor", side_effect=AssertionError("cache miss")),
+            patch.object(torch, "empty", side_effect=AssertionError("allocation")),
+        ):
             second = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
         self.assertIs(first[0], second[0])
         self.assertIs(first[1], second[1])
@@ -105,12 +190,18 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             ([2, 4], torch.float32, 2, torch.device("meta")),
         ]
         for splits, dtype, world_size, device in cases:
-            with self.subTest(splits=splits, dtype=dtype, world_size=world_size, device=device):
+            with self.subTest(
+                splits=splits, dtype=dtype, world_size=world_size, device=device
+            ):
                 comm = MoriSdmaAllGather()
                 first = _prepare(comm.layout, [2, 4])
                 with patch.object(torch, "tensor", wraps=torch.tensor) as create:
                     second = _prepare(
-                        comm.layout, splits, dtype=dtype, world_size=world_size, device=device
+                        comm.layout,
+                        splits,
+                        dtype=dtype,
+                        world_size=world_size,
+                        device=device,
                     )
                 self.assertEqual(create.call_count, 2)
                 self.assertIsNot(first[0], second[0])
@@ -121,7 +212,9 @@ class TestMoriSdmaAllGather(unittest.TestCase):
     def test_metadata_cache_does_not_bypass_fallback(self) -> None:
         comm = MoriSdmaAllGather()
         first = _prepare(comm.layout, [2, 4], dtype=torch.bfloat16)
-        self.assertIsNone(_prepare(comm.layout, [2, 4], dtype=torch.bfloat16, eligible=False))
+        self.assertIsNone(
+            _prepare(comm.layout, [2, 4], dtype=torch.bfloat16, eligible=False)
+        )
         self.assertIsNone(comm._param_contiguous_split_sizes)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -136,11 +229,17 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         comm = MoriSdmaAllGather()
         _prepare(comm.layout, [2, 4])
         with self.assertRaisesRegex(RuntimeError, "do not match input numel"):
-            comm.layout.prepare_output(AllGatherInputMetadata(
-                input_split_sizes=[2, 4], input_numel=7, world_size=2,
-                dtype=torch.float32, device=torch.device("cpu"),
-                can_use_param_contiguous_output=True,
-            ))
+            comm.layout.prepare_output(
+                AllGatherInputMetadata(
+                    input_split_sizes=[2, 4],
+                    input_outer_sizes=[1, 1],
+                    input_numel=7,
+                    world_size=2,
+                    dtype=torch.float32,
+                    device=torch.device("cpu"),
+                    can_use_param_contiguous_output=True,
+                )
+            )
         self.assertIsNone(comm._param_contiguous_split_sizes)
 
     def test_metadata_cache_retains_only_latest_entry(self) -> None:
@@ -157,9 +256,13 @@ class TestMoriSdmaAllGather(unittest.TestCase):
     def test_metadata_cache_miss_failure_is_atomic(self) -> None:
         comm = MoriSdmaAllGather()
         first = _prepare(comm.layout, [2, 4])
-        with patch.object(torch, "tensor", side_effect=[torch.zeros(2), RuntimeError("upload")]):
-            with self.assertRaisesRegex(RuntimeError, "upload"):
-                _prepare(comm.layout, [4, 2])
+        with (
+            patch.object(
+                torch, "tensor", side_effect=[torch.zeros(2), RuntimeError("upload")]
+            ),
+            self.assertRaisesRegex(RuntimeError, "upload"),
+        ):
+            _prepare(comm.layout, [4, 2])
         self.assertIsNone(comm._param_contiguous_split_sizes)
         with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
             restored = _prepare(comm.layout, [2, 4])
@@ -169,9 +272,11 @@ class TestMoriSdmaAllGather(unittest.TestCase):
     def test_metadata_cache_survives_failed_call_without_selecting_layout(self) -> None:
         comm = MoriSdmaAllGather()
         first = _prepare(comm.layout, [2, 4])
-        with patch.object(comm, "_validate_tensors", side_effect=RuntimeError("input")):
-            with self.assertRaisesRegex(RuntimeError, "input"):
-                comm(torch.empty(12), torch.empty(6), MagicMock())
+        with (
+            patch.object(comm, "_validate_tensors", side_effect=RuntimeError("input")),
+            self.assertRaisesRegex(RuntimeError, "input"),
+        ):
+            comm(torch.empty(12), torch.empty(6), MagicMock())
         self.assertFalse(comm._can_call_param_contiguous(torch.empty(6)))
         with patch.object(torch, "tensor", side_effect=AssertionError("cache miss")):
             restored = _prepare(comm.layout, [2, 4])
@@ -213,12 +318,8 @@ class TestMoriSdmaAllGather(unittest.TestCase):
 
     def test_allocate_reuses_persistent_output(self) -> None:
         comm = MoriSdmaAllGather()
-        output = comm.allocate(
-            (16,), dtype=torch.bfloat16, device=torch.device("cpu")
-        )
-        reused = comm.allocate(
-            (8,), dtype=torch.bfloat16, device=torch.device("cpu")
-        )
+        output = comm.allocate((16,), dtype=torch.bfloat16, device=torch.device("cpu"))
+        reused = comm.allocate((8,), dtype=torch.bfloat16, device=torch.device("cpu"))
         self.assertEqual(output.data_ptr(), reused.data_ptr())
 
     def test_persistent_release_orders_packing_and_collective(self) -> None:
@@ -241,10 +342,12 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                 self.assertEqual(output.data_ptr(), reused.data_ptr())
                 packer.wait_event.assert_called_once_with(event)
                 order = []
-                gather.wait_event.side_effect = lambda e: order.append("wait")
+                gather.wait_event.side_effect = lambda e, order=order: order.append(
+                    "wait"
+                )
                 collective = MagicMock()
-                collective.enqueue.side_effect = lambda source, *a, **kw: order.append(
-                    "ready" if source.numel() == 1 else "write"
+                collective.enqueue.side_effect = lambda source, *a, order=order, **kw: (
+                    order.append("ready" if source.numel() == 1 else "write")
                 )
                 with (
                     patch.object(torch.cuda, "current_stream", return_value=gather),
@@ -254,7 +357,9 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                 ):
                     comm(reused, torch.ones(2), group)
                 self.assertEqual(order, ["wait", "ready", "write"])
-                collective.register_output_buffer.assert_called_once_with(comm._ready_buffer)
+                collective.register_output_buffer.assert_called_once_with(
+                    comm._ready_buffer
+                )
                 gather.wait_event.assert_called_once_with(event)
                 packer.synchronize.assert_not_called()
                 gather.synchronize.assert_not_called()
@@ -273,7 +378,9 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             comm = MoriSdmaAllGather()
             collective = MagicMock()
             stream.wait_event.side_effect = lambda event: order.append("wait")
-            collective.enqueue.side_effect = lambda *args, **kwargs: order.append("write")
+            collective.enqueue.side_effect = lambda *args, **kwargs: order.append(
+                "write"
+            )
             with (
                 patch.object(comm, "_get_collective", return_value=collective),
                 patch.object(comm, "_wait_for_peer_consumers"),
@@ -284,7 +391,9 @@ class TestMoriSdmaAllGather(unittest.TestCase):
                 comm(torch.empty(4), torch.empty(2), group)
             stream.record_event.assert_called_once()
             if index:
-                stream.wait_event.assert_called_once_with(streams[0].record_event.return_value)
+                stream.wait_event.assert_called_once_with(
+                    streams[0].record_event.return_value
+                )
         self.assertEqual(order, ["write", "wait", "write"])
 
     def test_sync_call_uses_original_enqueue_path(self) -> None:
@@ -322,9 +431,7 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         ):
             warnings.simplefilter("ignore")
             self.assertIs(comm(output, input, group, async_op=True), work)
-        fallback.assert_called_once_with(
-            output, input, group=group, async_op=True
-        )
+        fallback.assert_called_once_with(output, input, group=group, async_op=True)
 
     def test_param_contiguous_call_preserves_stream_lifetimes(self) -> None:
         comm = MoriSdmaAllGather()
@@ -405,7 +512,8 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             patch.object(comm, "_wait_for_peer_consumers"),
             patch.object(comm, "_validate_tensors"),
             patch.object(
-                torch.cuda, "current_stream",
+                torch.cuda,
+                "current_stream",
                 side_effect=[stream, consumer, other_consumer],
             ),
             patch.object(torch.Tensor, "record_stream"),
@@ -419,11 +527,15 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         )
         self.assertEqual(
             order.mock_calls,
-            [call.enqueue(input, output, input.numel(), stream=stream),
-             call.record_event()],
+            [
+                call.enqueue(input, output, input.numel(), stream=stream),
+                call.record_event(),
+            ],
         )
         consumer.wait_event.assert_called_once_with(stream.record_event.return_value)
-        other_consumer.wait_event.assert_called_once_with(stream.record_event.return_value)
+        other_consumer.wait_event.assert_called_once_with(
+            stream.record_event.return_value
+        )
         collective.wait_async.assert_not_called()
         stream.synchronize.assert_not_called()
 
@@ -443,7 +555,8 @@ class TestMoriSdmaAllGather(unittest.TestCase):
             work = comm(
                 torch.empty(4, dtype=torch.bfloat16),
                 torch.empty(2, dtype=torch.bfloat16),
-                MagicMock(), async_op=True,
+                MagicMock(),
+                async_op=True,
             )
             self.assertIsInstance(work, torch.distributed.Work)
             self.assertTrue(work.wait())
@@ -459,9 +572,12 @@ class TestMoriSdmaAllGather(unittest.TestCase):
         group = MagicMock()
         group.rank.return_value = 0
         group.size.return_value = 1
-        with patch.object(
-            torch_fsdp.importlib, "import_module", side_effect=import_module
-        ), self.assertRaisesRegex(RuntimeError, "optional ROCm MORI Python package"):
+        with (
+            patch.object(
+                torch_fsdp.importlib, "import_module", side_effect=import_module
+            ),
+            self.assertRaisesRegex(RuntimeError, "optional ROCm MORI Python package"),
+        ):
             comm._get_collective(group)
 
     def test_persistent_collective_is_bound_to_process_group_identity(self):
@@ -486,17 +602,23 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
                 arena.device = torch.device("cuda:3")
                 group = MagicMock()
                 group.size.return_value = 2
-                with patch.object(torch.cuda, "current_device", return_value=3), \
-                        patch.object(torch.cuda, "device") as device_guard, \
-                        patch.object(torch.cuda, "MemPool"), \
-                        patch.object(torch.cuda, "use_mem_pool") as use_pool, \
-                        patch.object(torch.cuda, "current_stream"), \
-                        patch.object(torch, "empty", return_value=arena), \
-                        patch.object(torch, "zeros"):
-                    pool = MoriSdmaAllGatherPool([128], group=group, device=torch.device(device))
+                with (
+                    patch.object(torch.cuda, "current_device", return_value=3),
+                    patch.object(torch.cuda, "device") as device_guard,
+                    patch.object(torch.cuda, "MemPool"),
+                    patch.object(torch.cuda, "use_mem_pool") as use_pool,
+                    patch.object(torch.cuda, "current_stream"),
+                    patch.object(torch, "empty", return_value=arena),
+                    patch.object(torch, "zeros"),
+                ):
+                    pool = MoriSdmaAllGatherPool(
+                        [128], group=group, device=torch.device(device)
+                    )
                 self.assertEqual(pool._device, torch.device("cuda:3"))
                 device_guard.assert_called_once_with(torch.device("cuda:3"))
-                use_pool.assert_called_once_with(pool._mem_pool, device=torch.device("cuda:3"))
+                use_pool.assert_called_once_with(
+                    pool._mem_pool, device=torch.device("cuda:3")
+                )
 
     def _initialize(self, pool, mutate=None):
         def exchange(outputs, config, **kwargs):
@@ -504,22 +626,30 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
             if mutate is not None:
                 outputs[-1] = mutate(config)
 
-        with patch.object(dist := torch.distributed, "get_process_group_ranks", return_value=[0, 1]), \
-                patch.object(dist, "all_gather_object", side_effect=exchange):
+        with (
+            patch.object(
+                dist := torch.distributed,
+                "get_process_group_ranks",
+                return_value=[0, 1],
+            ),
+            patch.object(dist, "all_gather_object", side_effect=exchange),
+        ):
             pool.initialize()
 
     def _pool(self, sizes=(128,)):
         group = MagicMock()
         group.size.return_value = 2
         group.rank.return_value = 0
-        with patch.object(torch.cuda, "device"), patch.object(torch.cuda, "MemPool"), \
-                patch.object(torch.cuda, "use_mem_pool"), \
-                patch.object(torch.distributed, "new_group"), patch.object(
-            torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+        with (
+            patch.object(torch.cuda, "device"),
+            patch.object(torch.cuda, "MemPool"),
+            patch.object(torch.cuda, "use_mem_pool"),
+            patch.object(torch.distributed, "new_group"),
+            patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
         ):
-            return MoriSdmaAllGatherPool(
-                sizes, group=group, device=torch.device("cpu")
-            )
+            return MoriSdmaAllGatherPool(sizes, group=group, device=torch.device("cpu"))
 
     def test_reuse_preserves_saved_views_and_bounds_storage(self):
         pool = self._pool()
@@ -532,13 +662,17 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         with patch.object(torch.cuda, "current_stream"):
             first.release_output()
         with patch.object(torch.cuda, "current_stream"):
-            other = second.allocate((16,), dtype=torch.float32, device=torch.device("cpu"))
+            other = second.allocate(
+                (16,), dtype=torch.float32, device=torch.device("cpu")
+            )
         with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(other):
             other.fill_(100)
         with patch.object(torch.cuda, "current_stream"):
             second.release_output()
         with patch.object(torch.cuda, "current_stream"):
-            restored = first.allocate((8,), dtype=torch.float32, device=torch.device("cpu"))
+            restored = first.allocate(
+                (8,), dtype=torch.float32, device=torch.device("cpu")
+            )
         with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(restored):
             restored.copy_(torch.arange(8.0))
         loss.backward()
@@ -580,14 +714,23 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         order = []
         gather.wait_event.side_effect = lambda e: order.append("compute_done")
         collective = MagicMock()
-        collective.enqueue.side_effect = lambda *args, **kwargs: order.append("readiness_collective")
-        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False), \
-                patch.object(second, "_make_collective", return_value=collective):
+        collective.enqueue.side_effect = lambda *args, **kwargs: order.append(
+            "readiness_collective"
+        )
+        with (
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(second, "_make_collective", return_value=collective),
+        ):
             pool._before_write(second, gather)
         self.assertEqual(order, ["compute_done", "readiness_collective"])
         gather.wait_event.assert_called_once_with(compute.record_event.return_value)
-        collective.enqueue.assert_called_once_with(pool._ready_input, pool._ready_output, 1, stream=gather)
-        self.assertGreaterEqual(pool._ready_output.data_ptr(), pool._slots[-1].buffer.data_ptr() + pool._slots[-1].buffer.numel())
+        collective.enqueue.assert_called_once_with(
+            pool._ready_input, pool._ready_output, 1, stream=gather
+        )
+        self.assertGreaterEqual(
+            pool._ready_output.data_ptr(),
+            pool._slots[-1].buffer.data_ptr() + pool._slots[-1].buffer.numel(),
+        )
         gather.synchronize.assert_not_called()
 
     def test_slot_writes_are_serialized_across_streams(self):
@@ -597,18 +740,24 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         comm.allocate((8,), dtype=torch.float32, device=torch.device("cpu"))
         previous, current = MagicMock(), MagicMock()
         pool._after_write(previous)
-        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False), \
-                patch.object(comm, "_make_collective", return_value=MagicMock()):
+        with (
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+            patch.object(comm, "_make_collective", return_value=MagicMock()),
+        ):
             pool._before_write(comm, current)
         current.wait_event.assert_called_once_with(previous.record_event.return_value)
 
     def test_shared_slot_is_registered_once(self):
         pool = self._pool((128, 128))
-        first, second = [MoriSdmaAllGather(output_pool=pool, buffer_index=i) for i in range(2)]
+        first, second = [
+            MoriSdmaAllGather(output_pool=pool, buffer_index=i) for i in range(2)
+        ]
         self._initialize(pool)
         collective = MagicMock()
-        with patch.object(first, "_make_collective", return_value=collective), \
-                patch.object(second, "_make_collective") as make_second:
+        with (
+            patch.object(first, "_make_collective", return_value=collective),
+            patch.object(second, "_make_collective") as make_second,
+        ):
             self.assertIs(first._get_collective(pool._group), collective)
             self.assertIs(second._get_collective(pool._group), collective)
         collective.register_output_buffer.assert_called_once_with(pool._buffer)
@@ -618,7 +767,9 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         pool = self._pool((4, 20, 32))
         self.assertEqual(pool.allocated_bytes, 96)
         base = pool._buffer.data_ptr()
-        self.assertEqual([slot.buffer.data_ptr() - base for slot in pool._slots], [0, 16, 48])
+        self.assertEqual(
+            [slot.buffer.data_ptr() - base for slot in pool._slots], [0, 16, 48]
+        )
         self.assertEqual([slot.buffer.numel() for slot in pool._slots], [4, 20, 32])
 
     def test_fallback_keeps_independent_input_and_default_copy_out(self):
@@ -632,17 +783,21 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
             [torch.arange(2.0), torch.arange(4.0)], output, [2, 4], 6, 0
         )
         self.assertIs(returned, output)
-        self.assertNotEqual(source.untyped_storage().data_ptr(), output.untyped_storage().data_ptr())
+        self.assertNotEqual(
+            source.untyped_storage().data_ptr(), output.untyped_storage().data_ptr()
+        )
         self.assertEqual(source.tolist(), [0, 1, 0, 1, 2, 3])
         params = [
-            torch_fsdp.AllGatherParamMetadata([n], [torch.float32], 0, torch.Size([n]), [], False)
+            torch_fsdp.AllGatherParamMetadata([n], [torch.float32], [1], [], False)
             for n in [2, 4]
         ]
         output.copy_(source.repeat(2))
         with patch.object(torch.cuda, "current_stream"):
-            result = comm.layout.finalize_outputs(output, params, 2, metadata)
+            result = comm.layout.finalize_outputs(
+                torch_fsdp.AllGatherFinalizeMetadata(output, params, 2, metadata, [])
+            )
         self.assertIsNone(pool._slots[0].owner)
-        self.assertFalse(result.backend_owned)
+        self.assertTrue(result.buffers)
         self.assertEqual(result.tensors[0][0].tolist(), [0, 1, 0, 1])
         self.assertEqual(result.tensors[1][0].tolist(), [0, 1, 2, 3, 0, 1, 2, 3])
 
@@ -654,7 +809,7 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "initialize"):
                     comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
 
-                def mutate(config):
+                def mutate(config, field=field):
                     values = list(config)
                     values[field] = ()
                     return tuple(values)
@@ -675,6 +830,42 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unique strings"):
             MoriSdmaAllGather(output_pool=pool, group_key="block")
 
+    def test_graph_capture_rejection_releases_lease_without_failing_pool(self):
+        for subgroup in (False, True):
+            with self.subTest(subgroup=subgroup):
+                pool = self._pool()
+                comm = MoriSdmaAllGather(output_pool=pool)
+                self._initialize(pool)
+                output = comm.allocate(
+                    (8,), dtype=torch.float32, device=torch.device("cpu")
+                )
+                input_tensor = MagicMock(spec=torch.Tensor)
+                input_tensor.is_cuda = True
+                input_tensor.device = pool._device = torch.device("cuda:3")
+                previous = pool._slots[0].last_use = object()
+                with (
+                    patch.object(pool, "_validate_group", return_value=subgroup),
+                    patch.object(comm, "_validate_tensors"),
+                    patch.object(torch.cuda, "device") as device_guard,
+                    patch.object(torch.cuda, "current_stream"),
+                    patch.object(
+                        torch.cuda, "is_current_stream_capturing", return_value=True
+                    ),
+                    patch.object(comm, "_call_full_group") as sdma,
+                    patch.object(torch.distributed, "all_gather_into_tensor") as native,
+                    self.assertRaisesRegex(
+                        RuntimeError, "does not support graph capture"
+                    ),
+                ):
+                    comm(output, input_tensor, MagicMock())
+                device_guard.assert_called_with(input_tensor.device)
+                self.assertIs(pool._slots[0].last_use, previous)
+                sdma.assert_not_called()
+                native.assert_not_called()
+                self.assertIsNone(pool._slots[0].owner)
+                self.assertFalse(comm._pool_active)
+                self.assertFalse(pool._failed)
+
     def test_wrong_group_is_rejected_before_readiness_and_releases_lease(self):
         pool = self._pool()
         comm = MoriSdmaAllGather(output_pool=pool)
@@ -682,11 +873,15 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         output = comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
         other = MagicMock()
         other.rank.return_value = 0
-        with patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]), \
-                patch.object(pool, "_before_write") as before, \
-                patch.object(torch.cuda, "current_stream"):
-            with self.assertRaisesRegex(ValueError, "bound process group"):
-                comm(output, torch.ones(2), other)
+        with (
+            patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            patch.object(pool, "_before_write") as before,
+            patch.object(torch.cuda, "current_stream"),
+            self.assertRaisesRegex(ValueError, "bound process group"),
+        ):
+            comm(output, torch.ones(2), other)
         before.assert_not_called()
         self.assertFalse(pool._failed)
         self.assertIsNone(pool._slots[0].owner)
@@ -701,11 +896,17 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         subgroup.size.return_value = 1
         _prepare(comm.layout, [2], world_size=1, eligible=False)
         output = comm.allocate((2,), dtype=torch.float32, device=torch.device("cpu"))
-        self.assertNotEqual(output.untyped_storage().data_ptr(), pool._buffer.data_ptr())
-        with patch.object(torch.distributed, "get_process_group_ranks", return_value=[0]), \
-                patch.object(comm, "_validate_tensors"), \
-                patch.object(pool, "_before_write") as before, \
-                patch.object(torch.distributed, "all_gather_into_tensor") as native:
+        self.assertNotEqual(
+            output.untyped_storage().data_ptr(), pool._buffer.data_ptr()
+        )
+        with (
+            patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0]
+            ),
+            patch.object(comm, "_validate_tensors"),
+            patch.object(pool, "_before_write") as before,
+            patch.object(torch.distributed, "all_gather_into_tensor") as native,
+        ):
             comm(output, torch.ones(2), subgroup, async_op=True)
         before.assert_not_called()
         native.assert_called_once()
@@ -725,9 +926,13 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         subgroup.size.return_value = 1
         _prepare(comm.layout, [2], world_size=1, eligible=False)
         output = comm.allocate((2,), dtype=torch.float32, device=torch.device("cpu"))
-        with patch.object(torch.distributed, "get_process_group_ranks", return_value=[0]), \
-                patch.object(comm, "_validate_tensors"), \
-                patch.object(torch.distributed, "all_gather_into_tensor"):
+        with (
+            patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0]
+            ),
+            patch.object(comm, "_validate_tensors"),
+            patch.object(torch.distributed, "all_gather_into_tensor"),
+        ):
             comm(output, torch.ones(2), subgroup)
         output = comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
         self.assertEqual(output.untyped_storage().data_ptr(), pool._buffer.data_ptr())
@@ -741,10 +946,14 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         self._initialize(pool)
         _prepare(comm.layout, [2, 4])
         output = comm.allocate((12,), dtype=torch.float32, device=torch.device("cpu"))
-        with patch.object(comm, "_validate_tensors", side_effect=RuntimeError("invalid input")), \
-                patch.object(torch.cuda, "current_stream"):
-            with self.assertRaisesRegex(RuntimeError, "invalid input"):
-                comm(output, torch.ones(6), pool._group)
+        with (
+            patch.object(
+                comm, "_validate_tensors", side_effect=RuntimeError("invalid input")
+            ),
+            patch.object(torch.cuda, "current_stream"),
+            self.assertRaisesRegex(RuntimeError, "invalid input"),
+        ):
+            comm(output, torch.ones(6), pool._group)
         self.assertFalse(comm._can_call_param_contiguous(torch.ones(6)))
         self.assertIsNone(pool._slots[0].owner)
         self.assertFalse(pool._failed)
@@ -766,10 +975,13 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         comm = MoriSdmaAllGather(output_pool=pool)
         self._initialize(pool)
         output = comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
-        with patch.object(comm, "_validate_tensors"), patch.object(torch.cuda, "current_stream"), \
-                patch.object(pool, "_before_write", side_effect=RuntimeError("injected")):
-            with self.assertRaisesRegex(RuntimeError, "injected"):
-                comm(output, torch.ones(2), pool._group)
+        with (
+            patch.object(comm, "_validate_tensors"),
+            patch.object(torch.cuda, "current_stream"),
+            patch.object(pool, "_before_write", side_effect=RuntimeError("injected")),
+            self.assertRaisesRegex(RuntimeError, "injected"),
+        ):
+            comm(output, torch.ones(2), pool._group)
         self.assertIsNone(pool._slots[0].owner)
         with self.assertRaisesRegex(RuntimeError, "failed"):
             comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
@@ -777,23 +989,37 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
             pool.close()
 
     def test_copy_in_failure_releases_real_pool_lease(self):
-        from torch.distributed.fsdp._fully_shard._fsdp_collectives import foreach_all_gather
+        from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
+            foreach_all_gather,
+        )
 
         pool = self._pool()
         comm = MoriSdmaAllGather(output_pool=pool)
         self._initialize(pool)
         stream = torch.cpu.current_stream()
 
-        with patch.object(torch.cuda, "current_stream"), patch(
-            "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_param_all_gather_inputs",
-            return_value=[[torch.ones(2)]],
-        ), patch.object(
-            comm.layout, "copy_in", side_effect=RuntimeError("copy-in failed")
+        with (
+            patch.object(torch.cuda, "current_stream"),
+            patch(
+                "torch.distributed.fsdp._fully_shard._fsdp_collectives._get_param_all_gather_inputs",
+                return_value=[[torch.ones(2)]],
+            ),
+            patch.object(
+                comm.layout, "copy_in", side_effect=RuntimeError("copy-in failed")
+            ),
         ):
             for _ in range(2):
                 with self.assertRaisesRegex(RuntimeError, "copy-in failed"):
-                    foreach_all_gather([], pool._group, False, stream, stream,
-                                       torch.device("cpu"), comm)
+                    foreach_all_gather(
+                        [],
+                        pool._group,
+                        False,
+                        stream,
+                        stream,
+                        torch.device("cpu"),
+                        comm,
+                        comm.layout,
+                    )
                 self.assertIsNone(pool._slots[0].owner)
                 self.assertFalse(pool._failed)
             comm.release_output()
@@ -804,11 +1030,167 @@ class TestMoriSdmaAllGatherPool(unittest.TestCase):
         self._initialize(pool)
         output = comm.allocate((4,), dtype=torch.float32, device=torch.device("cpu"))
         output.copy_(torch.arange(4.0))
-        params = [torch_fsdp.AllGatherParamMetadata(
-            [2], [torch.float32], 0, torch.Size([2]), [output], True
-        )]
-        comm.layout.finalize_outputs(output, params, 2, torch_fsdp._POOLED_RANK_MAJOR)
+        params = [
+            torch_fsdp.AllGatherParamMetadata([2], [torch.float32], [1], [output], True)
+        ]
+        comm.layout.finalize_outputs(
+            torch_fsdp.AllGatherFinalizeMetadata(
+                output, params, 2, torch_fsdp._POOLED_RANK_MAJOR, []
+            )
+        )
         self.assertIs(pool._slots[0].owner, comm)
+
+
+class TestMoriFsdpOwnedLayout(unittest.TestCase):
+    def _metadata(self, **kwargs):
+        fields = {
+            "input_split_sizes": [2, 4],
+            "input_outer_sizes": [1, 1],
+            "input_numel": 6,
+            "world_size": 2,
+            "dtype": torch.float32,
+            "device": torch.device("cpu"),
+        }
+        fields.update(kwargs)
+        return AllGatherInputMetadata(**fields)
+
+    def test_base_contract_selection_and_outer_size_fallback(self):
+        comm = MoriSdmaAllGather(fsdp_owned_output=True)
+        self.assertIsNotNone(comm.layout.prepare_output(self._metadata()))
+        self.assertTrue(comm._can_call_param_contiguous(torch.empty(6)))
+        self.assertIs(
+            comm.layout.prepare_output(self._metadata(input_outer_sizes=[2, 1])),
+            torch_fsdp._POOLED_RANK_MAJOR,
+        )
+        self.assertFalse(comm._can_call_param_contiguous(torch.empty(6)))
+
+    def test_parameter_outputs_refill_in_place_and_release_staging(self):
+        comm = MoriSdmaAllGather(fsdp_owned_output=True)
+        params = [
+            torch_fsdp.AllGatherParamMetadata([n], [torch.float32], [1], [])
+            for n in (2, 4)
+        ]
+        selection = comm.layout.prepare_output(self._metadata())
+        source = torch.arange(12.0)
+        with patch.object(comm, "release_output") as release:
+            result = comm.layout.finalize_outputs(
+                torch_fsdp.AllGatherFinalizeMetadata(source, params, 2, selection, [])
+            )
+            release.assert_called_once()
+        self.assertEqual(len(result.buffers), 1)
+        self.assertNotEqual(result.buffers[0].data_ptr(), source.data_ptr())
+        self.assertEqual(result.tensors[0][0].tolist(), list(range(4)))
+        self.assertEqual(result.tensors[1][0].tolist(), list(range(4, 12)))
+        for param, outputs in zip(params, result.tensors):
+            param.outputs = outputs
+        previous = result.tensors
+        with patch.object(comm, "release_output") as release:
+            refilled = comm.layout.finalize_outputs(
+                torch_fsdp.AllGatherFinalizeMetadata(
+                    source + 10, params, 2, selection, result.buffers
+                )
+            )
+            release.assert_called_once()
+        self.assertIs(refilled.buffers, result.buffers)
+        for outputs, before in zip(refilled.tensors, previous):
+            self.assertIs(outputs, before)
+        self.assertEqual(result.buffers[0].tolist(), (source + 10).tolist())
+
+    def test_shrinking_payloads_refill_cached_prefix(self):
+        for rank_major_first in (False, True):
+            with self.subTest(rank_major_first=rank_major_first):
+                comm = MoriSdmaAllGather(fsdp_owned_output=True)
+                params = [
+                    torch_fsdp.AllGatherParamMetadata([n], [torch.float32], [1], [])
+                    for n in (2, 4)
+                ]
+                selection = comm.layout.prepare_output(self._metadata())
+                if rank_major_first:
+                    selection = torch_fsdp._POOLED_RANK_MAJOR
+                with patch.object(comm, "release_output") as release:
+                    first = comm.layout.finalize_outputs(
+                        torch_fsdp.AllGatherFinalizeMetadata(
+                            torch.arange(12.0), params, 2, selection, []
+                        )
+                    )
+                    self.assertEqual(len(first.buffers), 2 if rank_major_first else 1)
+                    for param, outputs in zip(params, first.tensors):
+                        param.outputs = outputs
+                    for sizes in ([1, 2], [0, 2], [2, 4]):
+                        for param, size in zip(params, sizes):
+                            param.input_numels = [size]
+                            param.outputs[0].fill_(-1)
+                        source = torch.arange(2 * sum(sizes), dtype=torch.float32) + 10
+                        metadata = self._metadata(
+                            input_split_sizes=sizes, input_numel=sum(sizes)
+                        )
+                        selection = comm.layout.prepare_output(metadata)
+                        refilled = comm.layout.finalize_outputs(
+                            torch_fsdp.AllGatherFinalizeMetadata(
+                                source, params, 2, selection, first.buffers
+                            )
+                        )
+                        self.assertIs(refilled.buffers, first.buffers)
+                        expected = source.split([2 * size for size in sizes])
+                        for outputs, before, prefix, size in zip(
+                            refilled.tensors, first.tensors, expected, (4, 8)
+                        ):
+                            self.assertIs(outputs, before)
+                            self.assertEqual(
+                                outputs[0].tolist(),
+                                prefix.tolist() + [-1.0] * (size - prefix.numel()),
+                            )
+                    self.assertEqual(release.call_count, 4)
+
+    def test_multiple_payload_views(self):
+        params = [
+            torch_fsdp.AllGatherParamMetadata([2, 4], [torch.float32] * 2, [1, 1], [])
+        ]
+        views = torch_fsdp._param_contiguous_views(torch.arange(12.0), params, 2)
+        self.assertEqual(len(views[0]), 2)
+        self.assertEqual(views[0][0].tolist(), list(range(4)))
+        self.assertEqual(views[0][1].tolist(), list(range(4, 12)))
+
+    def test_unaligned_async_fallback_orders_staging_event_after_work(self):
+        comm = MoriSdmaAllGather(fsdp_owned_output=True)
+        group = MagicMock()
+        output = torch.empty(2, dtype=torch.bfloat16)
+        source = torch.empty(1, dtype=torch.bfloat16)
+        work, stream = MagicMock(), MagicMock()
+        order = []
+        work.wait.side_effect = lambda: order.append("wait")
+        stream.record_event.side_effect = lambda: order.append("event")
+        with (
+            patch.object(comm, "_validate_tensors"),
+            patch.object(torch.cuda, "current_stream", return_value=stream),
+            patch.object(
+                torch.distributed, "all_gather_into_tensor", return_value=work
+            ),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("ignore")
+            self.assertIs(comm(output, source, group, async_op=True), work)
+        self.assertEqual(order, ["wait", "event"])
+
+    def test_discarded_staging_and_finalizer_both_order_reuse(self):
+        comm = MoriSdmaAllGather(fsdp_owned_output=True)
+        comm._output_buffer = torch.empty(12)
+        comm._output_active = True
+        stream = MagicMock()
+        write_event, copy_event = object(), object()
+        stream.record_event.side_effect = [write_event, copy_event]
+        with patch.object(torch.cuda, "current_stream", return_value=stream):
+            comm.release_output()
+            self.assertFalse(comm._output_active)
+            self.assertIs(comm._last_use_event, write_event)
+            comm.release_output()
+            self.assertIs(comm._last_use_event, copy_event)
+
+    def test_fsdp_owned_mode_rejects_shared_pool(self):
+        with self.assertRaisesRegex(ValueError, "shared pools require backend-owned"):
+            MoriSdmaAllGather(
+                fsdp_owned_output=True, output_pool=MagicMock(_slots=[None])
+            )
 
 
 if __name__ == "__main__":

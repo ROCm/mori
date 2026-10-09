@@ -5,7 +5,8 @@ parameter-contiguous zero-copy and stable registered addresses. Keep a separate
 `MoriSdmaAllGather` instance per FSDP parameter group; share only its pool.
 
 The adapter targets the matching experimental private PyTorch layout contract,
-including `AllGatherInputMetadata` and `AllGather.release_output`. These are
+including `AllGatherInputMetadata`, `AllGatherFinalizeMetadata`, and
+`BackendOwnedAllGatherLayout.release_output`. These are
 not public imports from `torch.distributed.fsdp`; updating the adapter and
 PyTorch sides together is required. The contract is documented in PyTorch's
 `_fully_shard/_all_gather_layout.py`. Preparation receives one metadata object;
@@ -21,10 +22,10 @@ pool = MoriSdmaAllGatherPool(
     device=device,
 )
 for index, block in enumerate(model.layers):
-    block.set_custom_all_gather(
-        MoriSdmaAllGather(output_pool=pool, buffer_index=index % 2)
-    )
-model.set_custom_all_gather(MoriSdmaAllGather(output_pool=pool, buffer_index=2))
+    comm = MoriSdmaAllGather(output_pool=pool, buffer_index=index % 2)
+    block.set_all_gather_layout(comm.layout, recurse=False)
+root_comm = MoriSdmaAllGather(output_pool=pool, buffer_index=2)
+model.set_all_gather_layout(root_comm.layout, recurse=False)
 pool.initialize()
 ```
 
@@ -35,9 +36,8 @@ unsharded groups may need more slots. A live lease conflict raises an error.
 Install the backends before the first unshard. FSDP rejects backend replacement
 while an all-gather is pending, while parameters are unsharded, or once they use backend-owned storage:
 their saved aliases must remain coordinated by the original pool. Reinstalling
-the same backend instance is allowed. Replacing a backend with only FSDP-owned
-outputs preserves those destinations, so a newly installed pool may need copy-out
-rather than adopting its arena's views.
+the same layout and comm is allowed. Configure layout ownership before the
+first unshard; changing the owner after outputs have been adopted is rejected.
 
 For an ordinary homogeneous-dtype parameter group, its required capacity is
 the sum of its padded shard element counts, multiplied by the shard world size
@@ -65,7 +65,7 @@ readiness operation. If existing parameters alias a pool slot, its local lease
 is retained through copy-out and compute. A rank-major staging-only output may
 release its lease after copy-out; an aliased parameter output must not.
 
-On reshard, FSDP calls the backend's `release_output()` notification. The
+On reshard, FSDP calls the backend-owned layout's `release_output()` notification. The
 adapter records consumer completion and returns the group lease. Allocation
 waits on that event before any input packing can write the output. Collective
 execution also waits on the local event, then performs a one-element SDMA all-gather
@@ -122,8 +122,8 @@ SHMEM or process-group teardown. It unregisters the slots; it does not invalidat
 outstanding tensor objects or free storage still referenced by parameters.
 Automatic garbage collection does not perform collective cleanup.
 
-Requires the matching PyTorch layout interface and `AllGather.release_output`
-hook. Supports eager training; CUDA graphs are rejected. Unsupported layouts
+Requires the matching PyTorch layout interface and `BackendOwnedAllGatherLayout.release_output`
+notification. Supports eager training; CUDA graphs are rejected. Unsupported layouts
 use the rank-major copy-out fallback. Post-forward resharding to a strict
 subgroup requires `output_pool`, for example `reshard_after_forward=2` with
 four ranks. The pooled adapter uses the native subgroup collective, then
@@ -137,3 +137,40 @@ In particular, non-pooled `zero_copy_output=False` is a legacy resident-buffer
 mode, not a memory-saving mode. Use an explicitly shared pool for bounded
 registered output capacity; this change does not silently switch it to Native
 or introduce per-step IPC registration.
+
+## FSDP-owned integration mode
+
+The base layout API in pytorch/pytorch#199726 owns parameter-output buffers.
+Use `fsdp_owned_output=True` to validate MORI on that API without the
+backend-owned extension:
+
+```python
+comm = MoriSdmaAllGather(zero_copy_output=True, fsdp_owned_output=True)
+module.set_all_gather_layout(comm.layout, recurse=False)
+```
+
+MORI writes parameter-contiguous communication output into private registered
+staging. Finalize copies it into one persistent FSDP-owned buffer, returns
+parameter views and that buffer. The adapter records a write-completion event
+when communication is enqueued and a consumer event after the final copy;
+staging reuse waits for both. A discarded prefetch needs no finalizer callback
+because FSDP-owned outputs never alias staging. FSDP
+frees the parameter storage on reshard and reallocates it before the next
+refill. With `set_keep_unsharded_storage(True)`, FSDP retains that storage.
+This mode avoids rank-major reassembly but includes a communication-output
+copy; it does not provide backend-owned zero copy. `zero_copy_output=False`
+uses rank-major MORI communication and the default finalizer. Outer sizes other
+than one and byte-packed heterogeneous payloads also use the default finalizer.
+Shared output pools require the backend-owned extension; the FSDP-owned mode
+uses private staging.
+
+The local integration targets #199726 at
+`0f51cbaa44d42c6aafc509be656a756b7381e966`. Backend-owned mode requires
+#188276's remaining extension on that base: explicit ownership, release after
+reshard/discard/failure, conservative zero-copy eligibility, and per-group
+layout binding. The matching runtime must provide the base's Tensor
+`grad_dtype` API and current FSDP operators. The old `defd6fe` runtime was used
+only for uniform-BF16 performance comparisons with an isolated compatibility
+snapshot for `grad_dtype`, chunk-cat, and legacy imports. That snapshot is not
+part of the adapter or the PyTorch integration and does not validate the base's
+mixed-gradient-dtype behavior on the old runtime.
