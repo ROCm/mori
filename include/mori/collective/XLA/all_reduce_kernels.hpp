@@ -280,35 +280,46 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 // computed -- there is no cross-block dependency, and therefore no mid-kernel
 // barrier of any kind.
 //
-// That leaves one synchronization, at the very end: I must not return until
-// every peer has finished writing into MY output. `syncFlags` is a symmetric
-// array of one uint64 per PE, slot p owned by producer p, and the whole
-// handshake runs in the single block that closes out the grid -- kernel
-// completion already implies every block retired, so one waiter is enough to
-// make "kernel done" mean "output complete". Every other block returns the
-// moment it has counted in, freeing its CU.
+// Synchronization is the same two PushEntryBarrier rounds as
+// ReduceScatterPullKernel, so back-to-back launches need no host barrier:
+//   * entry: no block may read a peer's input or write a peer's output before
+//     that peer has entered this launch (its producers of input and consumers
+//     of output have retired). Block 0 runs the barrier and releases the other
+//     blocks through groupCounters[1]; all blocks must be co-resident
+//     (grid <= CU count).
+//   * exit: the last block out waits until every peer has finished reading my
+//     input and writing my output, so "kernel done" means "output complete and
+//     input reusable". Every other block returns the moment it has counted in.
 // ===========================================================================
 
-// Stored into a peer's flag slot once I have finished writing into that peer's
-// output. Any non-zero value works: the slots are zeroed again at the end of
-// every launch.
-static constexpr uint64_t kARPullReady = 1;
-
-//   input     : raw symmetric-heap pointer, N = npes*chunkElems elements
-//   output    : raw symmetric-heap pointer, N = npes*chunkElems elements (on
-//               exit every slot p holds the reduction over all PEs of shard p)
-//   syncFlags : raw symmetric-heap pointer, >= npes uint64 slots, zero on entry
-//   groupCounters : plain device buffer (>= 1 uint32), zeroed once by the host.
-//               [0] elects the block that runs the closing handshake, and is
-//               reset by that same block.
+//   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
+//   output        : raw symmetric-heap pointer, N = npes*chunkElems elements (on
+//                   exit every slot p holds the reduction over all PEs of shard p)
+//   groupCounters : plain device buffer (>= 2 uint32), zeroed once by the host.
+//                   [0] elects the last block, [1] is the entry go-flag; both
+//                   are reset by the last block.
+//   barrierCtr    : symmetric-heap uint64[npes] flags shared with the push collectives.
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
-AllReducePullKernel(int myPe, const T* __restrict__ input, T* __restrict__ output,
-                    uint64_t* __restrict__ syncFlags, uint32_t* __restrict__ groupCounters,
-                    size_t chunkElems, mori::cco::ccoWindow_t heapWin) {
+AllReducePullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
+                    const T* __restrict__ input, T* __restrict__ output,
+                    size_t chunkElems, uint32_t* __restrict__ groupCounters,
+                    uint64_t* __restrict__ barrierCtr) {
   const uint32_t stride4G = heapWin->stride4G;
   // My reduced shard lives in output slot myPe, exactly as in the push kernel.
   T* __restrict__ myShard = output + static_cast<size_t>(myPe) * chunkElems;
+
+  auto* go = cco::impl::global(&groupCounters[1]);
+  if (blockIdx.x == 0) {
+    if (threadIdx.x < warpSize) {
+      PushEntryBarrier(barrierCtr, myPe, NPES, stride4G);
+      if (threadIdx.x == 0) __hip_atomic_store(go, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  } else if (threadIdx.x == 0) {
+    while (__hip_atomic_load(go, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
+    }
+  }
+  __syncthreads();
 
   // === Reduce + fan out, in one pass =========================================
   // Every finished position goes to my own slot and to all NPES-1 peers' copies
@@ -336,63 +347,24 @@ AllReducePullKernel(int myPe, const T* __restrict__ input, T* __restrict__ outpu
   };
   detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store, chunkElems);
 
-  // === Closing handshake =====================================================
-  // Release my remote stores, then count in. Everyone but the last block out is
-  // finished and gives its CU back; the last block alone signals, waits and
-  // clears, which is enough because the kernel cannot complete until it exits.
+  // === Exit barrier ==========================================================
+  // Unlike reduce-scatter, the remote stores ARE the payload: every wave must
+  // publish them before its block counts in, since the barrier's release fence
+  // only covers the last block's wave.
   __threadfence_system();
-  __shared__ bool isGridLast;
-  if (threadIdx.x == 0) {
-    isGridLast = (atomicAdd(&groupCounters[0], 1u) + 1 == gridDim.x);
-  }
   __syncthreads();
-  if (!isGridLast) return;  // block-uniform: isGridLast is shared
-
-  {
-    const int peer = static_cast<int>(threadIdx.x);
-    const bool isPeerLane = peer < NPES && peer != myPe;
-    // Tell peer p I am done writing into it: one lane per peer, one 8-byte
-    // remote store each.
-    if (isPeerLane) {
-      const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
-      auto* slot = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(syncFlags + myPe) +
-                                               (static_cast<uint64_t>(diff) << 32));
-      StreamStore<ESystemScope, sizeof(uint64_t)>(cco::impl::global(slot), kARPullReady);
-    }
-    // Push those tokens out before parking on the peers', or every PE could sit
-    // waiting on a signal still held in its own write path.
-    __threadfence_system();
-    // Then wait for the same from everyone. Signalling strictly precedes
-    // waiting on every PE, so this cannot deadlock however the grids interleave.
-    // The poll is local (peers write my slots over XGMI); system scope because
-    // the writer is another device.
-    if (isPeerLane) {
-      auto* addr = cco::impl::global(&syncFlags[peer]);
-      while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0) {
-        __builtin_amdgcn_s_sleep(1);
+  if (threadIdx.x < warpSize) {
+    uint32_t last = 0;
+    if (threadIdx.x == 0) last = (atomicAdd(&groupCounters[0], 1u) + 1 == gridDim.x);
+    if (BroadcastWarp(last, 0)) {
+      PushEntryBarrier(barrierCtr, myPe, NPES, stride4G);
+      // Every block has counted in, so all are past the go-flag wait.
+      if (threadIdx.x == 0) {
+        groupCounters[0] = 0;
+        groupCounters[1] = 0;
       }
     }
-    __syncthreads();
-    // Acquire half only (not the full seq_cst __threadfence_system): we publish
-    // nothing after this, we only need the peers' stores visible to my consumer.
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-
-    // Clear for the next launch. The tokens are dead by now -- every peer that
-    // wrote one is past its own wait -- so zeroing cannot drop an unseen signal.
-    // System scope: peers write these slots from another device, so a plain
-    // store would leave a dirty line that could evict on top of a later token.
-    //
-    // As with AllGatherPushKernel this clears at kernel END and so relies on the
-    // caller barriering between launches (the benchmark does hipStreamSynchronize
-    // + ccoBarrierAll per iteration); without one, a peer's NEXT launch token can
-    // arrive before this store and be overwritten by it, no matter the scope.
-    if (peer < NPES) {
-      StreamStore<ESystemScope, sizeof(uint64_t)>(&syncFlags[peer], 0);
-    }
   }
-  // Re-arm the arrival counter. Safe here: isGridLast means every block of this
-  // grid has already counted, so no arrival can be lost.
-  if (threadIdx.x == 0) groupCounters[0] = 0;
 }
 } // namespace collective
 } // namespace mori
