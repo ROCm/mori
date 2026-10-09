@@ -316,6 +316,22 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
           recvTokenNums + destPe * config.numQpPerPe + laneId, 0);
     }
   }
+
+  // Deferred quiet. The drain is not removed, only moved past the poll: it still
+  // upholds the staging-reuse invariant -- EpCombineLowLatencyAsyncSendCopy_body
+  // overwrites the same interNodeTokBufs.staging our NIC reads from in
+  // SendTransfer. Our own ACKs have had the entire poll window to return by now,
+  // so this is expected to exit on the drain loop's first comparison.
+  //
+  // No deadlock: every peer posts its signal unconditionally in SendTransfer, so
+  // the poll above cannot depend on anyone reaching this point.
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
+        shmem::ShmemQuietThread(destPe, qpId);
+      }
+    }
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -330,26 +346,6 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
   IF_ENABLE_PROFILER(
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvCopy);
-
-  // Deferred quiet, pushed down from RecvTransfer into this kernel's entry so it
-  // overlaps with this kernel's own copy work on other warps instead of only the
-  // RecvTransfer->RecvCopyMultiBlock launch gap. The drain is not removed, only
-  // moved further: it still upholds the staging-reuse invariant --
-  // EpCombineLowLatencyAsyncSendCopy_body (launched later, same stream) overwrites
-  // the same interNodeTokBufs.staging our NIC reads from in SendTransfer, and that
-  // launch cannot happen before this kernel retires. No deadlock: every peer posts
-  // its signal unconditionally in SendTransfer, independent of this kernel.
-  //
-  // Same strided (destPe=blockId, qpId=warpId) loop as before; it makes no
-  // assumption about blockNum/warpNum, so it is correct under this kernel's own
-  // (different) launch geometry without any adaptation.
-  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
-        shmem::ShmemQuietThread(destPe, qpId);
-      }
-    }
-  }
 
   int blocksPerPe = blockNum / npes;
   int destPe = blockId / blocksPerPe;
@@ -589,6 +585,18 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
                                         barrierFlag);
     }
   }
+
+  // Deferred quiet; see the dispatch-side RecvTransfer comment for the invariant
+  // this upholds (staging-reuse: dispatch's next-round SendTransfer reads from the
+  // same interNodeTokBufs.staging this round's EpCombineLowLatencyAsyncSendCopy_body
+  // wrote). No deadlock: every peer posts its signal unconditionally above.
+  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
+      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
+        shmem::ShmemQuietThread(destPe, qpId);
+      }
+    }
+  }
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -604,20 +612,6 @@ __device__ void EpCombineLowLatencyAsyncRecvCopy_body(EpDispatchCombineArgs<T> a
   using TokT = std::conditional_t<UseFp8DirectCast, core::CombineInternalFp8, T>;
   static_assert(!UseFp8DirectCast || std::is_same_v<T, hip_bfloat16>,
                 "Fp8 direct cast combine currently only supports bf16 input");
-
-  // Deferred quiet, pushed down from RecvTransfer into this kernel's entry; see the
-  // dispatch-side RecvCopyMultiBlock comment for the overlap rationale and the
-  // geometry-independence of this loop. Upholds the same staging-reuse invariant
-  // (next round's dispatch SendCopy, launched later on the same stream, overwrites
-  // the same interNodeTokBufs.staging this round's EpCombineLowLatencyAsyncSendCopy_body
-  // wrote). No deadlock: every peer posts its signal unconditionally in SendTransfer.
-  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if ((laneId == 0) && EpAsyncLlFuseSignal(args, destPe)) {
-        shmem::ShmemQuietThread(destPe, qpId);
-      }
-    }
-  }
 
   extern __shared__ char sharedMem[];
   TokT** srcPtrs = reinterpret_cast<TokT**>(sharedMem) + warpId * config.numExpertPerToken;
