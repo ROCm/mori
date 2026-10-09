@@ -64,6 +64,27 @@ __device__ __forceinline__ T* EpLocal(unsigned long long win, unsigned long long
       reinterpret_cast<::mori::cco::ccoWindow_t>(win), static_cast<size_t>(off)));
 }
 
+struct EpWinC {
+  unsigned long long h;
+};
+
+using EpWinConstPtr = const __attribute__((address_space(4))) ::mori::cco::ccoWindowDevice*;
+
+template <typename T>
+__device__ __forceinline__ T* EpPeer(EpWinC win, int peer, unsigned long long off) {
+  const EpWinConstPtr w = reinterpret_cast<EpWinConstPtr>(win.h);
+  return reinterpret_cast<T*>(w->winBase + ((static_cast<uint64_t>(peer) * w->stride4G) << 32) +
+                              static_cast<size_t>(off));
+}
+
+template <typename T>
+__device__ __forceinline__ T* EpLocal(EpWinC win, unsigned long long off) {
+  const EpWinConstPtr w = reinterpret_cast<EpWinConstPtr>(win.h);
+  return reinterpret_cast<T*>(w->winBase +
+                              ((static_cast<uint64_t>(w->lsaRank) * w->stride4G) << 32) +
+                              static_cast<size_t>(off));
+}
+
 // Spin helpers. SYSTEM scope is load-bearing: the dispatch notify loop spins on
 // a *peer's* signal word, and AGENT scope there hangs.
 template <typename T>
@@ -297,7 +318,8 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
   // back wrong at 80 blocks. Both are kept -- that failure was found with neither
   // present, so which one alone sufficed was never isolated.
   __threadfence_system();
-  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+  unsigned _gridArvl = 0;
+  if (thdId == 0) _gridArvl = atomicAdd(args.gridBarrier, 1u);
 
   if constexpr (!EpIsWideEp(kCfg)) {
     // Narrow path: all participating threads are in one warp, no multi-warp race.
@@ -310,11 +332,13 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
                          flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   } else {
-    // Wide path: peers span multiple warps — single-thread wait+reset avoids the
-    // race where warp 0 resets the barrier before warp 1 reads gridDim.x.
+    // Wide path: last-arrival resets to avoid the inter-block race where a late
+    // block misses the transient gridDim.x value and deadlocks on 0.
     if (thdId == 0) {
-      EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-      __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      if (_gridArvl == static_cast<unsigned>(gridDim.x) - 1)
+        __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      else
+        EpWaitEq(args.gridBarrier, 0u);
     }
     __syncthreads();
 

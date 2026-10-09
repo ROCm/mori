@@ -176,12 +176,14 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.chunk_bytes` | Chunk size when chunking is on (default `65536` = 64 KB). Messages ≤ this are unchanged. Env: `MORI_IO_CHUNK_BYTES` |
 | `RdmaBackendConfig.max_chunks_per_transfer` | Cap on chunks per transfer to bound WR/SQ usage (default `64`). Env: `MORI_IO_MAX_CHUNKS` |
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
+| RC retry budget | The RC QP retry attributes applied at RTS, bounded so an out-of-range value is ignored rather than failing QP setup. `MORI_IO_QP_TIMEOUT` (0–31, default `14`; local ACK timeout = `4.096us * 2^timeout`; `0` disables it and lets an unresponsive peer stall indefinitely), `MORI_IO_QP_RETRY_CNT` (0–7, default `7`), `MORI_IO_QP_RNR_RETRY` (0–7, default `7`; `7` = retry RNR NAKs forever), `MORI_IO_QP_MIN_RNR_TIMER` (0–31, default `12`; IB-spec RNR NAK backoff). Each also honors a transport-wide `MORI_RDMA_QP_*` fallback (e.g. `MORI_RDMA_QP_TIMEOUT`) that tunes the shmem/CCO QPs sharing this path. The `MORI_IO_QP_*` name wins whenever it is set, including when its value is out of range — an invalid IO-specific value falls back to the built-in default, never to the `MORI_RDMA_QP_*` value. |
+| `MORI_IO_FAIL_ON_ASYNC_EVENT` | When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set `0` to disable and restore the previous hang-until-timeout behavior. |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 | `LD_LIBRARY_PATH` | MORI-IO loads libibverbs dynamically at runtime (`dlopen` of `libibverbs.so` / `libibverbs.so.1`) rather than linking it. To use an out-of-tree libibverbs, put its directory on `LD_LIBRARY_PATH`. |
 
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
-out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](../src/umbp/doc/runtime-env-vars.md).
+out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
 
 ## Profiling MORI-IO with ROCTX Markers
 
@@ -225,5 +227,6 @@ Either variable can be enabled alone. Enabled values include `1`, `on`, and
 | `src/pybind/mori.cpp` | IO binding registration (`RegisterMoriIo`) |
 | `examples/io/example.py` | Complete usage examples (read, write, batch, session) |
 | `tests/python/io/test_engine.py` | Comprehensive test suite |
-| `tests/python/io/benchmark.py` | Performance benchmark |
+| `tests/cpp/io/bench_engine.cpp` | Performance benchmark (default, nixlbench-matching) |
+| `tests/python/io/benchmark.py` | Performance benchmark (Python, kept for parity) |
 | `docs/MORI-IO-BENCHMARK.md` | Benchmark commands and results |

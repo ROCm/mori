@@ -38,6 +38,12 @@ void ShmemDeleter::operator()(void* ptr) const {
     }
 }
 #endif
+
+// One cacheline for a single uint64_t: the generation counter is re-read by
+// every kernel launch, and sharing a line with the flags the peers AMO_SET
+// would have that remote traffic invalidate it on every collective.
+static constexpr size_t kGenCounterBytes = 128;
+
 // Constructor implementation - delegating version
 template <typename T>
 AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t transit_buffer_size,
@@ -55,6 +61,7 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size,
       npes_(npes),
       dtype_size_(sizeof(T)),
       flags_(nullptr, ShmemDeleter()),
+      gen_(nullptr, ShmemDeleter()),
       input_transit_buffer_(nullptr),
       input_transit_buffer_size_(input_buffer_size),
       input_transit_buffer_ptr_(nullptr, ShmemDeleter()),
@@ -62,14 +69,12 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size,
       output_transit_buffer_size_(output_buffer_size),
       output_transit_buffer_ptr_(nullptr, ShmemDeleter()),
       async_in_progress_(false),
-      call_seq_(0),
       async_input_(nullptr),
       async_output_(nullptr),
       async_total_count_(0),
       async_stream_(nullptr),
       async_dst_obj_(),
       async_start_time_(0.0),
-      async_flag_token_(0),
       copy_output_to_user_(copy_output_to_user) {
   // 1. Allocate and initialize flags memory
   size_t flagsSize = npes_ * sizeof(uint64_t);
@@ -83,6 +88,16 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size,
   if (!flagsObj_.IsValid()) {
     throw std::runtime_error("Failed to get valid flags memory object");
   }
+
+  // 1b. Generation counter. Only ever touched by our own kernels, so it needs
+  // no symmetric memory object; it lives in its own allocation to keep it off
+  // the cacheline the peers AMO_SET into.
+  void* gen = shmem::ShmemMalloc(kGenCounterBytes);
+  if (gen == nullptr) {
+    throw std::runtime_error("Failed to allocate generation counter");
+  }
+  gen_.reset(static_cast<uint64_t*>(gen));
+  memset(gen_.get(), 0, kGenCounterBytes);
 
   // 2. Allocate input transit buffer
   input_transit_buffer_ = shmem::ShmemMalloc(input_transit_buffer_size_);
@@ -115,6 +130,7 @@ AllgatherSdma<T>::AllgatherSdma(int myPe, int npes, size_t input_buffer_size,
   // 4. Print initialization information
   printf("AllgatherSdma initialized: PE %d of %d\n", myPe_, npes_);
   printf("  Flags allocated: %zu bytes at %p\n", flagsSize, flags_.get());
+  printf("  Generation counter at %p\n", gen_.get());
   printf("  Input transit buffer: %.2f MB at %p\n", input_transit_buffer_size_ / (1024.0 * 1024.0),
          input_transit_buffer_);
   printf("  Output transit buffer: %.2f MB at %p\n",
@@ -130,6 +146,7 @@ AllgatherSdma<T>::~AllgatherSdma() {
   if (!shmem::ShmemIsInitialized()) {
     registered_output_buffers_.clear();
     flags_.release();
+    gen_.release();
     input_transit_buffer_ptr_.release();
     output_transit_buffer_ptr_.release();
     return;
@@ -235,7 +252,6 @@ void AllgatherSdma<T>::cancel_async() {
     async_stream_ = nullptr;
     async_dst_obj_ = {};
     async_start_time_ = 0.0;
-    async_flag_token_ = 0;
 
     // Reset flags
     // resetFlags();
@@ -383,7 +399,6 @@ template <typename T>
 int64_t AllgatherSdma<T>::prepare_sync(T* input, T* output, size_t total_count,
                                        hipStream_t stream) {
   (void)stream;
-  uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
   auto [regObj, byteOffset] = find_registered(output);
   bool direct = regObj.IsValid();
 
@@ -395,7 +410,7 @@ int64_t AllgatherSdma<T>::prepare_sync(T* input, T* output, size_t total_count,
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
-  jit_args_.flagVal = flag_token;
+  jit_args_.genCounter = gen_.get();
   jit_args_.splitSizes = nullptr;
   jit_args_.splitOffsets = nullptr;
   jit_args_.splitCount = 0;
@@ -409,7 +424,6 @@ int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(T* input, T* output, siz
                                                         const size_t* split_offsets,
                                                         size_t split_count, hipStream_t stream) {
   (void)stream;
-  uint64_t flag_token = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
   auto [regObj, byteOffset] = find_registered(output);
   bool direct = regObj.IsValid();
 
@@ -421,7 +435,7 @@ int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(T* input, T* output, siz
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
-  jit_args_.flagVal = flag_token;
+  jit_args_.genCounter = gen_.get();
   jit_args_.splitSizes = split_sizes;
   jit_args_.splitOffsets = split_offsets;
   jit_args_.splitCount = split_count;
@@ -430,28 +444,23 @@ int64_t AllgatherSdma<T>::prepare_sync_param_contiguous(T* input, T* output, siz
 }
 
 template <typename T>
-double AllgatherSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream) {
-  if (stream != nullptr) {
-    hipError_t err = hipStreamSynchronize(stream);
+double AllgatherSdma<T>::finish_sync(T* output, size_t total_count, hipStream_t stream,
+                                     bool capturing) {
+  // See the header: the fused kernel already blocks on every peer's flag
+  // before it retires, so these syncs are not what makes the result visible.
+  if (!capturing) {
+    hipError_t err = stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize();
     if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-      throw std::runtime_error("Stream synchronization failed");
-    }
-  } else {
-    hipError_t err = hipDeviceSynchronize();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-      throw std::runtime_error("Device synchronization failed");
+      fprintf(stderr, "PE %d: Synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      throw std::runtime_error("Synchronization failed");
     }
   }
 
   bool direct = find_registered(output).first.IsValid();
   if (!direct && copy_output_to_user_) {
     copy_output_to_user(output, total_count, stream);
-    if (stream != nullptr) {
-      (void)hipStreamSynchronize(stream);
-    } else {
-      (void)hipDeviceSynchronize();
+    if (!capturing) {
+      (void)(stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize());
     }
   }
 
@@ -471,7 +480,6 @@ int64_t AllgatherSdma<T>::prepare_async_start(T* input, T* output, size_t total_
   async_total_count_ = total_count;
   async_stream_ = stream;
   async_start_time_ = CollectiveWallTime();
-  async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
 
   auto [regObj, byteOffset] = find_registered(output);
   bool direct = regObj.IsValid();
@@ -486,7 +494,9 @@ int64_t AllgatherSdma<T>::prepare_async_start(T* input, T* output, size_t total_
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
-  jit_args_.flagVal = async_flag_token_;
+  // The PUT kernel never touches the flags, so it ignores this; the paired WAIT
+  // kernel is where the generation is derived and advanced.
+  jit_args_.genCounter = gen_.get();
   jit_args_.splitSizes = nullptr;
   jit_args_.splitOffsets = nullptr;
   jit_args_.splitCount = 0;
@@ -508,7 +518,6 @@ int64_t AllgatherSdma<T>::prepare_async_start_param_contiguous(
   async_total_count_ = total_count;
   async_stream_ = stream;
   async_start_time_ = CollectiveWallTime();
-  async_flag_token_ = call_seq_.fetch_add(1, std::memory_order_relaxed) + 1;
 
   auto [regObj, byteOffset] = find_registered(output);
   bool direct = regObj.IsValid();
@@ -523,7 +532,7 @@ int64_t AllgatherSdma<T>::prepare_async_start_param_contiguous(
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.elementCount = total_count;
   jit_args_.dstBaseOffset = direct ? byteOffset : 0;
-  jit_args_.flagVal = async_flag_token_;
+  jit_args_.genCounter = gen_.get();
   jit_args_.splitSizes = split_sizes;
   jit_args_.splitOffsets = split_offsets;
   jit_args_.splitCount = split_count;
@@ -549,7 +558,7 @@ int64_t AllgatherSdma<T>::prepare_async_wait(hipStream_t stream) {
   jit_args_.flagsMemObj = flagsObj_;
   jit_args_.elementCount = 0;
   jit_args_.dstBaseOffset = 0;
-  jit_args_.flagVal = async_flag_token_;
+  jit_args_.genCounter = gen_.get();
   jit_args_.splitSizes = nullptr;
   jit_args_.splitOffsets = nullptr;
   jit_args_.splitCount = 0;
@@ -558,41 +567,36 @@ int64_t AllgatherSdma<T>::prepare_async_wait(hipStream_t stream) {
 }
 
 template <typename T>
-double AllgatherSdma<T>::finish_async_wait(hipStream_t stream) {
+double AllgatherSdma<T>::finish_async_wait(hipStream_t stream, bool capturing) {
   if (!async_in_progress_) {
     throw std::runtime_error("No async operation in progress");
   }
 
   hipStream_t wait_stream = (stream != nullptr) ? stream : async_stream_;
 
-  if (wait_stream != nullptr) {
-    hipError_t err = hipStreamSynchronize(wait_stream);
+  // Under `capturing` the stream already carries the ordering: the wait kernel
+  // does not retire until every peer's flag is set, and the copy-out below is
+  // enqueued behind it. Only the returned duration becomes meaningless.
+  if (!capturing) {
+    hipError_t err = wait_stream ? hipStreamSynchronize(wait_stream) : hipDeviceSynchronize();
     if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Stream synchronization failed: %s\n", myPe_, hipGetErrorString(err));
+      fprintf(stderr, "PE %d: Synchronization failed: %s\n", myPe_, hipGetErrorString(err));
       cancel_async();
-      throw std::runtime_error("Stream synchronization failed");
-    }
-  } else {
-    hipError_t err = hipDeviceSynchronize();
-    if (err != hipSuccess) {
-      fprintf(stderr, "PE %d: Device synchronization failed: %s\n", myPe_, hipGetErrorString(err));
-      cancel_async();
-      throw std::runtime_error("Device synchronization failed");
+      throw std::runtime_error("Synchronization failed");
     }
   }
 
   bool direct = find_registered(async_output_).first.IsValid();
   if (!direct && copy_output_to_user_) {
     copy_output_to_user(async_output_, async_total_count_, wait_stream);
-    if (wait_stream != nullptr) {
-      (void)hipStreamSynchronize(wait_stream);
-    } else {
-      (void)hipDeviceSynchronize();
+    if (!capturing) {
+      (void)(wait_stream ? hipStreamSynchronize(wait_stream) : hipDeviceSynchronize());
     }
   }
 
   double end_time = CollectiveWallTime();
-  double duration = end_time - async_start_time_;
+  // Nothing waited for the transfer under `capturing`; see finish_sync.
+  double duration = capturing ? -1.0 : end_time - async_start_time_;
 
   async_in_progress_ = false;
   async_input_ = nullptr;
@@ -601,19 +605,23 @@ double AllgatherSdma<T>::finish_async_wait(hipStream_t stream) {
   async_stream_ = nullptr;
   async_dst_obj_ = {};
   async_start_time_ = 0.0;
-  async_flag_token_ = 0;
 
   return duration;
 }
 
 // ================ END: JIT prepare/finish methods ================
 
-// resetFlags implementation (unchanged)
 template <typename T>
 void AllgatherSdma<T>::resetFlags() {
+  // Flags and generation counter must go back together: a zeroed counter next
+  // to surviving flag values makes the next kernel derive generation 1, find
+  // every peer already above it and skip the wait entirely.
   if (flags_) {
     size_t flagsSize = npes_ * sizeof(uint64_t);
     memset(flags_.get(), 0, flagsSize);
+  }
+  if (gen_) {
+    memset(gen_.get(), 0, kGenCounterBytes);
   }
 }
 

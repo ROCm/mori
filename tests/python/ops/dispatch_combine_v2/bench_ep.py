@@ -52,7 +52,7 @@ time for the same kernel. That replay is a window of its own, AFTER warmup and
 graph capture, because ITERS pairs are ~10 ms against a 50 ms sampling tick.
 
     torchrun --standalone --nproc_per_node=8 bench_ep.py
-    BACKENDS=flydsl,hip SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
+    BACKENDS=flydsl,hip COMB_MODE=pull SWEEP=512,4096 ITERS=200 torchrun ... bench_ep.py
     MORI_SMI_MONITOR=1 MORI_SMI_DURATION=1.0 torchrun ... bench_ep.py
 """
 
@@ -76,6 +76,13 @@ TOPK = int(os.environ.get("TOPK", 8))
 EPR = int(os.environ.get("EPR", 32))
 WARMUP = int(os.environ.get("WARMUP", 10))
 ITERS = int(os.environ.get("ITERS", 50))
+# Per-token scale row transported alongside the payload (the block-scale a quantized
+# MoE hands to dispatch). scale_bytes = SCALE_DIM * SCALE_TS must be a multiple of 4,
+# which hip_backend asserts. The effective SCALE_DIM is resolved once the dispatch
+# dtype is known (see below): fp8/fp4 default scales ON, bf16 OFF. An explicit
+# SCALE_DIM env value overrides that default (SCALE_DIM=0 forces scales off).
+_SCALE_DIM_ENV = os.environ.get("SCALE_DIM")
+SCALE_TS = int(os.environ.get("SCALE_TS", 1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512,4096").split(",")]
 # Comma-separated; MORI_V2_KERNEL_BACKEND still works for a single backend.
 BACKENDS = [
@@ -89,7 +96,33 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # "inplace": the expert already wrote into the staging view, so combine elides the
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
+COMB_MODE = os.environ.get("COMB_MODE", "push")
+if COMB_MODE not in ("pull", "push"):
+    raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
+_PUSH = COMB_MODE == "push"
+PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
+if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32"):
+    raise ValueError(
+        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32"
+    )
+PUSH_QRULE = os.environ.get("PUSH_QRULE")
+if not PUSH_QRULE:
+    PUSH_QRULE = "mx" if PUSH_QUANT == "fp4_blockwise" else "blk"
+if PUSH_QRULE not in ("mx", "blk"):
+    raise ValueError(f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk")
+_PUSH_QGROUP = 32 if PUSH_QRULE == "mx" else 128
+_PUSH_WIRE = (HIDDEN // 2 + HIDDEN // 32 + 127) // 128 * 128
 CHECK = int(os.environ.get("CHECK", 1))
+CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
+PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
+# ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
+# ROUTE=ring: ATOM's --fake-eplb placement, where position p = token * TOPK + j lands
+# on rank p % world. With TOPK >= world every token reaches every rank, so the
+# largest SWEEP point fills each receive buffer to exactly its capacity -- the case
+# that overwrites anything parked at the end of the landing zone.
+# ROUTE=noself: rand without the experts of the token's own rank, so no rank
+# receives from itself.
+ROUTE = os.environ.get("ROUTE", "rand")
 # Payload distribution and RNG seed: DATA_INIT=zero|constant|uniform|norm, SEED,
 # CONST_VAL. Same names and meanings as aiter's test_common, so the two harnesses
 # describe the same input. Defaults reproduce this file's previous behaviour.
@@ -108,6 +141,17 @@ _DISP_DT = {
 }[_DISP]
 _DISP_NBYTES = {torch.bfloat16: 2, torch.float8_e4m3fn: 1}.get(_DISP_DT, 0.5)
 _FP4 = _DISP_DT is torch.float4_e2m1fn_x2
+# Resolve the per-token scale width now that the dispatch dtype is known. Quantized
+# dispatch (fp8/fp4) carries a block-scale row, so default it on and exercise the
+# scale-transport path a real quantized pipeline uses; bf16 has no scales. Both fp8
+# and fp4 default to hidden/32 bytes/token (224 B at hidden=7168, E8M0-style,
+# SCALE_TS=1). An explicit SCALE_DIM env value wins, including SCALE_DIM=0 (off).
+if _SCALE_DIM_ENV is not None:
+    SCALE_DIM = int(_SCALE_DIM_ENV)
+elif _DISP_DT is torch.bfloat16:
+    SCALE_DIM = 0
+else:
+    SCALE_DIM = HIDDEN // 32
 # What the correctness gate covers, as one token. A bool cannot say it: fp4 and
 # an all-zero payload verify the dispatch bytes but never compare combine's
 # output, and a row claiming "verified" next to a combine_us nobody checked is
@@ -117,8 +161,8 @@ VERIFY_SCOPE = (
     if not CHECK
     else (
         "dispatch_bytes"
-        if _FP4 or _data.verifies_nothing(INIT)
-        else "dispatch_bytes+combine"
+        if _data.verifies_nothing(INIT) or (_FP4 and not _PUSH)
+        else ("dispatch_bytes+push_bytes" if _PUSH else "dispatch_bytes+combine")
     )
 )
 # Geometry, same spelling as tools/ep_test.sh. Unset = the backend's tuned default.
@@ -131,8 +175,9 @@ _G = {
 def main():
     dist.init_process_group("gloo")
     rank, world = dist.get_rank(), dist.get_world_size()
-    torch.cuda.set_device(rank)
-    dev = torch.device("cuda", rank)
+    local = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local)
+    dev = torch.device("cuda", local)
 
     n_experts = world * EPR
     M = max(SWEEP)
@@ -149,11 +194,39 @@ def main():
         dev
     )
     wts = torch.rand(M, TOPK, generator=gr, dtype=torch.float32).to(dev)
-    idx = (
-        torch.stack([torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)])
-        .to(torch.int32)
-        .to(dev)
-    )
+    if ROUTE == "ring":
+        pos = (rank + torch.arange(M) * world).unsqueeze(1) * TOPK + torch.arange(TOPK)
+        idx = ((pos % world) * EPR + (pos // world) % EPR).to(torch.int32).to(dev)
+    elif ROUTE == "rand":
+        idx = (
+            torch.stack(
+                [torch.randperm(n_experts, generator=gr)[:TOPK] for _ in range(M)]
+            )
+            .to(torch.int32)
+            .to(dev)
+        )
+    elif ROUTE == "noself":
+        idx = torch.stack(
+            [torch.randperm(n_experts - EPR, generator=gr)[:TOPK] for _ in range(M)]
+        )
+        idx = (idx + (idx >= rank * EPR).long() * EPR).to(torch.int32).to(dev)
+    else:
+        raise ValueError(f"ROUTE={ROUTE!r}: expected rand, ring or noself")
+    # Per-token scale rows, transported when SCALE_DIM>0 (fp8/fp4 by default). Shaped
+    # exactly as repro_epv2_topk9.py: sc_n_i32 int32 lanes viewed as bytes, trimmed to
+    # SCALE_DIM so scale_type_size=1 * scale_dim holds. Deterministic (arange + rank
+    # offset) so a run reproduces; dispatch moves them verbatim (opaque bytes).
+    scales = None
+    if SCALE_DIM:
+        sc_n_i32 = (SCALE_DIM + 3) // 4
+        scales = (
+            (torch.arange(M, dtype=torch.int32) + rank * 100003)
+            .view(M, 1)
+            .repeat(1, sc_n_i32)
+            .view(torch.uint8)[:, :SCALE_DIM]
+            .contiguous()
+            .to(dev)
+        )
     # Unique destination PEs per token: what an identity expert makes combine sum.
     U = (
         torch.zeros(M, world, dtype=torch.bool)
@@ -178,11 +251,14 @@ def main():
             data_type=torch.bfloat16,
             dispatch_data_type=None if _DISP_DT is torch.bfloat16 else _DISP_DT,
             combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
+            scale_dim=SCALE_DIM,
+            scale_type_size=SCALE_TS,
             kernel_backend=backend,
             dispatch_block_num=_G["DBN"],
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
+            quant_type=PUSH_QUANT if _PUSH else "none",
         )
         return EpDispatchCombineOp(cfg, comm)
 
@@ -191,9 +267,11 @@ def main():
     if rank == 0:
         print(
             f"# EP{world} hidden={HIDDEN} topk={TOPK} epr={EPR} "
-            f"init={INIT} seed={SEED} "
+            f"init={INIT} seed={SEED} scale_dim={SCALE_DIM}x{SCALE_TS}B "
             f"disp={_DISP_DT} comb=bf16 backends={BACKENDS} modes={MODES} "
-            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK}",
+            f"iters={ITERS} combine_in={COMBINE_IN} check={CHECK} comb_mode={COMB_MODE}"
+            f" route={ROUTE}"
+            + (f" push_quant={PUSH_QUANT} rule={PUSH_QRULE}" if _PUSH else ""),
             flush=True,
         )
 
@@ -243,7 +321,123 @@ def main():
             )
         return int(n.item())
 
-    def prime(op, ct, i_, w_, x_):
+    def bf16_payload(pe):
+        return _data.make_payload(
+            (M, HIDDEN),
+            INIT,
+            _data.make_generator(_data.seed_for(SEED, int(pe))),
+            torch.bfloat16,
+            constant=CONST_VAL,
+        )
+
+    def push_quant_rows(total, routing):
+        tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
+        src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
+        rows = torch.empty(total, HIDDEN, dtype=torch.bfloat16)
+        for pe in src_pe.unique().tolist():
+            sel = src_pe == pe
+            rows[sel] = bf16_payload(pe)[src_tok[sel]]
+        return rows.to(dev)
+
+    _FP4_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+    def fp4_rne(v):
+        g = _FP4_GRID.to(v.device)
+        v = v.clamp(max=6.0).contiguous()
+        idx = torch.searchsorted(g, v).clamp(1, 7)
+        lo, hi = g[idx - 1], g[idx]
+        up = (hi - v < v - lo) | ((hi - v == v - lo) & (idx % 2 == 0))
+        return torch.where(up, hi, lo)
+
+    def push_quant_deq(x):
+        m15 = (x.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0x7FFF).amax(
+            dim=-1, keepdim=True
+        )
+        byte = torch.clamp(((m15 + 0x3F) >> 7) - 2, min=1)
+        conv = byte.clamp(min=1)
+        sc_conv = torch.pow(2.0, (conv - 127).float())
+        sc_byte = torch.pow(2.0, (byte - 127).float())
+        return torch.sign(x) * fp4_rne(x.abs() / sc_conv) * sc_byte
+
+    def push_quant_blk(x):
+        amax = x.abs().amax(dim=-1, keepdim=True).double()
+        pos = amax > 0
+        six = torch.full_like(amax, 6.0)
+        sc = torch.where(pos, amax / six, torch.ones_like(amax)).float()
+        inv = torch.where(pos, six / amax, torch.zeros_like(amax)).float()
+        return torch.sign(x) * fp4_rne(x.abs() * inv), sc
+
+    def push_quant_ref(x, u):
+        if PUSH_QRULE == "mx":
+            return (u * push_quant_deq(x)).to(torch.bfloat16).float()
+        q, sc = push_quant_blk(x)
+        qs = q.double() * sc.double()
+        acc = torch.zeros_like(x)
+        for k in range(1, int(u.max()) + 1):
+            acc = torch.where(u >= k, (acc.double() + qs).float(), acc)
+        return acc.to(torch.bfloat16).float()
+
+    def push_quant_stats(x, u, got, t0=0):
+        grp = x.shape[-1]
+        amax = x.abs().amax(dim=2, keepdim=True)
+        _, ex = torch.frexp(amax)
+        step = torch.ldexp(torch.ones_like(amax), (ex - 2).clamp(min=-127))
+        err = (got - u * x).abs()
+        tol = u * step + (u * x).abs() * 2.0**-8 + 1e-30
+        bad = int((~(err <= tol)).flatten(1).any(dim=1).sum())
+        nonfinite = int((~torch.isfinite(got)).sum())
+        max_err = float(torch.nan_to_num(err / (u * step), nan=float("inf")).max())
+        first = ""
+        ref = push_quant_ref(x, u)
+        miss = got != ref
+        inexact = int(miss.flatten(1).any(dim=1).sum())
+        if inexact:
+            i = int(miss.flatten().nonzero()[0])
+            t, g = i // (x.shape[1] * grp), (i // grp) % x.shape[1]
+            first = (
+                f" first@rank{rank}:tok{t0 + t}:grp{g}:el{i % grp}"
+                f" x={float(x.flatten()[i]):.6g} got={float(got.flatten()[i]):.6g}"
+                f" ref={float(ref.flatten()[i]):.6g} u={float(u.flatten()[t]):g}"
+                f" amax={float(amax[t, g, 0]):.6g}"
+                f" row_miss={int(miss[t].sum())} grp_miss={int(miss[t, g].sum())}"
+                f" grps_miss={int(miss[t].any(dim=1).sum())}"
+            )
+        return [bad, inexact, nonfinite], max_err, first
+
+    def check_push_quant(out, ct, scale=1.0):
+        grp = _PUSH_QGROUP
+        x_all = (bf16_payload(rank)[:ct].float() * scale).view(ct, HIDDEN // grp, grp)
+        u_all = U[:ct].float().view(ct, 1, 1)
+        got_all = out[:ct].cpu().float().view(ct, HIDDEN // grp, grp)
+        tot, max_err, first = [0, 0, 0], 0.0, ""
+        for t0 in range(0, ct, 1024):
+            sl = slice(t0, min(ct, t0 + 1024))
+            c, e, f = push_quant_stats(x_all[sl], u_all[sl], got_all[sl], t0)
+            tot = [a + b for a, b in zip(tot, c)]
+            max_err = max(max_err, e)
+            first = first or f
+        devdiff = 0
+        if PUSH_QCHECK_DEV:
+            c, _, _ = push_quant_stats(x_all.to(dev), u_all.to(dev), got_all.to(dev))
+            devdiff = sum(abs(a - b) for a, b in zip(c, tot))
+        n = torch.tensor([tot[0], ct, tot[1], tot[2], devdiff], dtype=torch.float64)
+        dist.all_reduce(n)
+        m = torch.tensor([max_err], dtype=torch.float64)
+        dist.all_reduce(m, op=dist.ReduceOp.MAX)
+        firsts = [None] * world
+        dist.all_gather_object(firsts, first)
+        if rank == 0:
+            print(
+                f"  [PUSHQUANT] ct={ct} x{scale:g} rows={int(n[1])} bad={int(n[0])} "
+                f"max_err={float(m[0]):.3f} steps rule={PUSH_QRULE} exact_bad={int(n[2])}"
+                f" nonfinite={int(n[3])}"
+                + (f" dev_diff={int(n[4])}" if PUSH_QCHECK_DEV else "")
+                + "".join(f for f in firsts if f),
+                flush=True,
+            )
+        return int(n[0]) + int(n[2])
+
+    def prime(op, ct, i_, w_, x_, s_=None):
         """One full pair, untimed. Reads total_recv for the host, builds the buffer
         the timed loop will reuse, and with CHECK verifies the result through that
         same buffer -- so the gate covers exactly what gets timed, staged copy
@@ -251,7 +445,7 @@ def main():
         dispatch accumulates into it while only combine clears it, so the next
         combine would stage twice the tokens and run past the arena.
         Returns (total_recv, buf, ok, checked)."""
-        *_, total_t, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+        *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
         lockstep()  # the reverse map is only valid after this barrier
         total = int(total_t.cpu().item())
         dispatch_bad = check_dispatch(op, total, r)
@@ -260,13 +454,40 @@ def main():
         # holds however wrong the kernel is. fp4 cannot go through combine at all
         # (hip has no fp4 combine), so for it check_dispatch is the whole story.
         checked = bool(CHECK) and not _FP4 and not _data.verifies_nothing(INIT)
+        push_checked = bool(CHECK) and _PUSH and not _data.verifies_nothing(INIT)
+        if _PUSH:
+            checked = False
         if checked:  # identity expert: stage the dispatched tokens unchanged
             stage.copy_(op.recv_tokens()[:total].to(stage.dtype))
-        buf = stage.clone() if COMBINE_IN == "staged" else stage
+        if push_checked:
+            stage.copy_(push_quant_rows(total, r))
+            op.push_landing().zero_()
+            lockstep()
+        if COMBINE_IN == "staged":
+            buf = stage.clone()
+        elif COMBINE_IN == "cached":
+            buf = op.combine_in_view().clone()[:total]
+        else:
+            buf = stage
         out, _ = op.combine(buf, routing=r)
         lockstep()
         if dispatch_bad:
             return total, buf, False, True
+        if push_checked:
+            ok = check_push_quant(out, ct) == 0
+            for k in range(1, CHECK_REPEAT + 1):
+                *_, total_t, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
+                lockstep()
+                assert int(total_t.cpu().item()) == total, (
+                    int(total_t.cpu().item()),
+                    total,
+                )
+                buf.copy_(push_quant_rows(total, r) * float(2**k))
+                lockstep()
+                out, _ = op.combine(buf, routing=r)
+                lockstep()
+                ok = check_push_quant(out, ct, float(2**k)) == 0 and ok
+            return total, buf, ok, True
         if not checked:
             return total, buf, True, bool(CHECK)
         exp = U[:ct].view(ct, 1).float() * inp[:ct].float().cpu()
@@ -419,9 +640,34 @@ def main():
                     raise RuntimeError(f"hipEventElapsedTime rc={r}")
                 return ms.value * 1000.0
 
+            # LATE_US: rank 0 reaches every dispatch that much after the others, as
+            # the last rank to arrive does in serving. Its gd then runs from the
+            # last arrival to its own end -- the tail the others cannot hide.
+            late_us = float(os.environ.get("LATE_US", "0") or 0)
+            late_cyc = 0
+            if late_us > 0:
+                # torch.cuda._sleep counts device clock cycles; take the rate here.
+                cal = 2_000_000
+                e0 = torch.cuda.Event(enable_timing=True)
+                e1 = torch.cuda.Event(enable_timing=True)
+                torch.cuda._sleep(cal)
+                e0.record()
+                torch.cuda._sleep(cal)
+                e1.record()
+                torch.cuda.synchronize()
+                per_us = cal / (e0.elapsed_time(e1) * 1000.0)
+                late_cyc = int(late_us * per_us)
+                if rank == 0:
+                    print(
+                        f"[LATE] rank 0 sleeps {late_us:g} us = {late_cyc} cycles "
+                        f"({per_us:.1f}/us) before every dispatch",
+                        flush=True,
+                    )
             gg = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gg):
                 for i in range(gevr):
+                    if late_cyc and rank == 0:
+                        torch.cuda._sleep(late_cyc)
                     rec_ext(gev[i][0])
                     rd()
                     rec_ext(gev[i][1])
@@ -578,7 +824,10 @@ def main():
             "topk": TOPK,
             "experts_per_rank": EPR,
             "dispatch_dtype": _DISP,
+            "scale_dim": SCALE_DIM,
+            "scale_type_size": SCALE_TS,
             "combine_dtype": "bf16",
+            "combine_mode": COMB_MODE,
             "combine_in": COMBINE_IN,
             "data_init": INIT,
             "seed": SEED,
@@ -624,9 +873,10 @@ def main():
     failures = checked = points = 0
     for ct in SWEEP:
         i_, w_, x_ = inp[:ct], wts[:ct], idx[:ct]
+        s_ = scales[:ct] if SCALE_DIM else None
         for name, op in ops.items():
             points += 1
-            total, buf, ok, was_checked = prime(op, ct, i_, w_, x_)
+            total, buf, ok, was_checked = prime(op, ct, i_, w_, x_, s_)
             checked += was_checked
             if not ok:
                 failures += 1
@@ -640,7 +890,7 @@ def main():
 
             def one_pair():
                 """A layer's two all2all legs, in order, nothing in between."""
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 op.combine(buf, routing=r)
 
             def capture_pair():
@@ -649,7 +899,7 @@ def main():
                 combine graph was captured against that handle."""
                 gd = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gd):
-                    *_, r_cap = op.dispatch(i_, w_, None, x_, return_routing=True)
+                    *_, r_cap = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 lockstep()
                 gc = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(gc):
@@ -660,7 +910,7 @@ def main():
             held = [None]  # eager's combine needs the handle its dispatch produced
 
             def eager_d():
-                *_, r = op.dispatch(i_, w_, None, x_, return_routing=True)
+                *_, r = op.dispatch(i_, w_, s_, x_, return_routing=True)
                 held[0] = r
 
             def eager_legs():
@@ -684,8 +934,14 @@ def main():
                 # time gave a row whose columns did not agree with each other,
                 # and recv counts vary between ranks with the routing. The legs
                 # differ whenever dispatch is narrower than combine.
-                d_bw = recv_m * HIDDEN * _DISP_NBYTES / (1000**3) / (d_us_m / 1e6)
-                c_bw = recv_m * HIDDEN * 2 / (1000**3) / (c_us_m / 1e6)
+                d_bw = (
+                    recv_m
+                    * (HIDDEN * _DISP_NBYTES + SCALE_DIM * SCALE_TS)
+                    / (1000**3)
+                    / (d_us_m / 1e6)
+                )
+                c_row = _PUSH_WIRE if _PUSH else HIDDEN * 2
+                c_bw = recv_m * c_row / (1000**3) / (c_us_m / 1e6)
                 if rank == 0:
                     print(
                         f"  ct={ct:<5d} [{name}/{mode}] "
@@ -724,7 +980,9 @@ def main():
         # passing one.
         # Say what was actually verified. fp4 skips the identity-expert check
         # (hip has no fp4 combine) but its dispatch bytes ARE compared.
-        if _FP4:
+        if _PUSH and CHECK and not _data.verifies_nothing(INIT):
+            why = " (push: dispatch bytes + fp4 combine output)"
+        elif _FP4:
             why = " (fp4: dispatch bytes only, combine not compared)"
         elif not CHECK:
             why = " (CHECK=0)"

@@ -84,12 +84,6 @@ constexpr size_t kScratchSize = 8 * kObjectSize;
 // A single page of DRAM ~= no capacity, so a put from this node must route out.
 constexpr size_t kNoCapacity = kPageSize;
 
-uint16_t NextPeerServicePort() {
-  static std::atomic<uint16_t> next{
-      static_cast<uint16_t>(58000 + (static_cast<unsigned>(::getpid()) % 4000))};
-  return next.fetch_add(1);
-}
-
 std::vector<char> Pattern(size_t size, unsigned seed) {
   std::vector<char> out(size);
   for (size_t i = 0; i < size; ++i) {
@@ -165,7 +159,12 @@ class SsdRangedIoTest : public ::testing::Test {
     distributed.master_config.master_address = master_addr_;
     distributed.io_engine.host = "0.0.0.0";
     distributed.io_engine.port = 0;
-    distributed.peer_service_port = NextPeerServicePort();
+    // A peer service is required for the node to register a peer_address and
+    // serve remote AllocateSlot/CommitSlot RPCs; without one, remote access
+    // fails with "peer service connection unavailable".  Let gRPC choose the
+    // port: probing for a free one and closing the socket before PoolClient
+    // binds it races with everything else on a shared CI host.
+    distributed.auto_peer_service_port = true;
     distributed.dram_page_size = kPageSize;
     // Smaller than one object, so a remote ranged transfer can only pass
     // through the registered arena and never the legacy staging path.

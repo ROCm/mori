@@ -61,7 +61,7 @@ The master server is a standalone binary built alongside the mori wheel.
 All ``UMBP_*`` timing knobs (``UMBP_HEARTBEAT_TTL_SEC``, ``UMBP_REAPER_INTERVAL_SEC``,
 ``UMBP_LEASE_DURATION_SEC``, ...) are honored at master startup and printed once as
 ``[Master] Resolved timing: ...``. See
-`runtime-env-vars.md <../../src/umbp/doc/runtime-env-vars.md>`_ for the full list.
+`runtime-env-vars.md <https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md>`_ for the full list.
 
 **Examples:**
 
@@ -436,7 +436,7 @@ evicted from every tier).
        request batch on the client side.
 
 See the
-`master env-var reference <../../src/umbp/doc/runtime-env-vars.md>`_ for the
+`master env-var reference <https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md>`_ for the
 full master env-var list.
 
 **Where to call from.**  External-KV query methods are reachable through two
@@ -856,4 +856,4 @@ report/match/revoke scenario, then shuts everything down cleanly.
    UMBP_MASTER_BIN=/path/to/umbp_master python examples/umbp/umbp_master_client_demo.py
 
 The script is reproduced in full at
-`examples/umbp/umbp_master_client_demo.py <../../examples/umbp/umbp_master_client_demo.py>`_.
+`examples/umbp/umbp_master_client_demo.py <https://github.com/ROCm/mori/blob/main/examples/umbp/umbp_master_client_demo.py>`_.

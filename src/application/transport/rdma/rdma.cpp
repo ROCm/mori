@@ -333,6 +333,70 @@ bool ReadIoTrafficClassDisableEnv() {
   return disable.has_value() && disable.value() == 1;
 }
 
+// The RC retry attributes occupy narrow fields in the QP context, so a value
+// that parses as a uint8_t can still be rejected by ibv_modify_qp. Bound the
+// value here and keep the built-in default when the override is out of range.
+static std::optional<uint8_t> ReadBoundedQpAttrEnv(const char* name, uint8_t maxValue) {
+  const char* raw = std::getenv(name);
+  if (!raw) {
+    return std::nullopt;
+  }
+
+  std::optional<uint8_t> value = ReadUint8FromEnvVar(name);
+  if (!value.has_value() || value.value() > maxValue) {
+    MORI_APP_WARN("Ignore invalid {}={} (allowed: 0-{})", name, raw, maxValue);
+    return std::nullopt;
+  }
+  return value;
+}
+
+// IO QPs read MORI_IO_QP_* first; when that is unset, fall back to a
+// transport-wide MORI_RDMA_QP_* so the same knob also tunes the shmem/CCO QPs
+// that share this ibverbs path but never see the IO-specific name.
+//
+// Presence of the IO name decides, not whether it parsed: an explicitly set but
+// invalid MORI_IO_QP_* falls back to the built-in default like any other bad
+// override. Falling through to the transport-wide value instead would silently
+// apply a knob the operator did not aim at this QP.
+static std::optional<uint8_t> ReadQpRetryAttrEnv(const char* ioName, const char* rdmaName,
+                                                 uint8_t maxValue) {
+  if (std::getenv(ioName) != nullptr) {
+    return ReadBoundedQpAttrEnv(ioName, maxValue);
+  }
+  return ReadBoundedQpAttrEnv(rdmaName, maxValue);
+}
+
+// Local ACK timeout exponent: the responder gets 4.096us * 2^timeout to ack
+// before the requester retransmits. 0 disables the timeout entirely, which
+// turns a silent peer into an unbounded stall instead of a completion error.
+std::optional<uint8_t> ReadIoQpTimeoutEnv() {
+  std::optional<uint8_t> timeout =
+      ReadQpRetryAttrEnv("MORI_IO_QP_TIMEOUT", "MORI_RDMA_QP_TIMEOUT", 31);
+  if (timeout.has_value() && timeout.value() == 0) {
+    MORI_APP_WARN(
+        "MORI_IO_QP_TIMEOUT=0 disables the local ACK timeout; an unresponsive peer will stall "
+        "transfers indefinitely instead of failing with IBV_WC_RETRY_EXC_ERR");
+  }
+  return timeout;
+}
+
+std::optional<uint8_t> ReadIoQpRetryCntEnv() {
+  return ReadQpRetryAttrEnv("MORI_IO_QP_RETRY_CNT", "MORI_RDMA_QP_RETRY_CNT", 7);
+}
+
+// 7 means retry RNR NAKs forever, which is the ibverbs default this path uses.
+std::optional<uint8_t> ReadIoQpRnrRetryEnv() {
+  return ReadQpRetryAttrEnv("MORI_IO_QP_RNR_RETRY", "MORI_RDMA_QP_RNR_RETRY", 7);
+}
+
+// Minimum RNR NAK timer: how long the responder makes the requester wait before
+// retrying after an RNR NAK. Encoded value 0 means 655.36ms (the longest), 1-31
+// map to the IB-spec table. Tunable alongside rnr_retry so a receiver that is
+// slow to post buffers can widen the backoff instead of exhausting the retries.
+std::optional<uint8_t> ReadIoQpMinRnrTimerEnv() {
+  return ReadQpRetryAttrEnv("MORI_IO_QP_MIN_RNR_TIMER", "MORI_RDMA_QP_MIN_RNR_TIMER", 31);
+}
+
 bool ReadIbEnableRelaxedOrderingEnv() {
   std::optional<uint8_t> enable = ReadUint8FromEnvVar("MORI_IB_ENABLE_RELAXED_ORDERING");
   return enable.has_value() && enable.value() == 1;
@@ -440,6 +504,22 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
   return handle;
 }
 
+// hipMemRetainAllocationHandle adds a reference only from HIP 7.12 on
+// (ROCm/rocm-systems 10a4a3e11d). Earlier runtimes, including ROCm 7.2.x, return
+// the owner's handle without one, so releasing it there would drop the owner's
+// reference and make the owner's own hipMemRelease a second release.
+static bool RetainAddsReference() {
+  static const bool adds = [] {
+    int version = 0;
+    if (hipRuntimeGetVersion(&version) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+    return version >= 71200000;
+  }();
+  return adds;
+}
+
 // Export a dmabuf fd for the GPU buffer at `ptr`, and report the offset of `ptr`
 // within the exported dmabuf via `*offset`. Returns -1 if unsupported.
 //
@@ -452,7 +532,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
 // silent writes to the wrong address). hsa_amd_portable_export_dmabuf reports the
 // true byte offset, so prefer it and fall back to the hip path (offset 0, correct
 // only for whole-allocation exports) when HSA export is unavailable.
-static int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
+int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   int fd = -1;
   uint64_t off = 0;
   hsa_status_t hs = hsa_amd_portable_export_dmabuf(ptr, size, &fd, &off);
@@ -460,6 +540,35 @@ static int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
     *offset = off;
     return fd;
   }
+  // VMM memory (hipMemCreate + hipMemMap): hipMemGetHandleForAddressRange keeps
+  // a reference to the backing allocation after the fd is closed, so the memory
+  // is never freed when its owner unmaps and releases it (e.g. vLLM sleep mode).
+  // Exporting the allocation handle does not; it needs the allocation to have
+  // been created with the POSIX fd handle type, otherwise fall through.
+  hipMemGenericAllocationHandle_t handle;
+  if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
+    hipError_t exportErr =
+        hipMemExportToShareableHandle(&fd, handle, hipMemHandleTypePosixFileDescriptor, 0);
+    if (RetainAddsReference()) (void)hipMemRelease(handle);
+    if (exportErr == hipSuccess && fd >= 0) {
+      // The fd covers only the allocation backing `ptr`, so use it only if
+      // [ptr, ptr + size) lies within that allocation.
+      hipDeviceptr_t base = 0;
+      size_t rangeSize = 0;
+      if (hipMemGetAddressRange(&base, &rangeSize, reinterpret_cast<hipDeviceptr_t>(ptr)) ==
+              hipSuccess &&
+          base != 0) {
+        uint64_t allocOffset = reinterpret_cast<uint64_t>(ptr) - reinterpret_cast<uint64_t>(base);
+        if (allocOffset + size <= rangeSize) {
+          *offset = allocOffset;
+          return fd;
+        }
+      }
+      close(fd);
+    }
+  }
+  (void)hipGetLastError();
+  fd = -1;
   hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
                                                   hipMemRangeHandleTypeDmaBufFd, 0);
   if (err != hipSuccess) {

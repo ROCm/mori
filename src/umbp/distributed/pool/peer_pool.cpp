@@ -410,7 +410,8 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       std::vector<AllocateRequest> backend_requests;
       backend_requests.reserve(indices.size());
       for (size_t index : indices) {
-        backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size});
+        backend_requests.push_back(AllocateRequest{requests[index].key, requests[index].size,
+                                                   requests[index].preferred_numa_node});
       }
 
       auto results = backend->BatchAllocate(backend_requests);

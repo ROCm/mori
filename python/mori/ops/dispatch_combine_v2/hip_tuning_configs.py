@@ -124,8 +124,39 @@ _DISPATCH_TABLE: dict = {
         #   2048  101.3   103.5  102.3  101.7  |  86.5 78.5 76.6 76.2 | 85.8 67.9 64.2 64.5
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
         (4, 7168, 6, None): {
-            None: ((512, 64, 8), (4096, 64, 16), (None, 128, 16)),
+            None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
             "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+        },
+        (4, 7168, 9, None): {
+            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+        },
+        # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
+        # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
+        # past 1024 tokens 64x16 gives some warps a second token, and its metadata split
+        # (kPlainMeta in ep_intranode_1250x.hpp) up to four a payload warp, while 64x24 holds
+        # 1536 and 64x32 2048 at one each. Past 2048 64x16 wins again up to about 2900, 64x32
+        # from there to 4096 (its metadata warps borrow the payload warps' metadata slabs), and
+        # 64x16 above that; 8192 is the one point past 4096 where 64x32 is ahead (-2). Dispatch
+        # us, graph, mean over the ranks, 3 alternating rounds (up to 2304 with 4096 tokens a
+        # rank allocated, past it 8192):
+        #   ct     64x16  64x24  64x32
+        #   1088    63.6   54.0   56.3
+        #   1536    66.6   62.4   63.7
+        #   1792    72.4   76.5   69.6
+        #   2048    78.8   79.6   74.8
+        #   2304    82.5   83.0   86.8
+        #   2816    91.1          92.1
+        #   3328   109.5         100.7
+        #   4096   123.2         119.9
+        #   5120   149.4         161.0
+        (8, 7168, 6, None): {
+            None: ((2048, 64, 16), (None, 128, 16)),
+            "fp4_disp_bf16_comb": (
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (2048, 64, 32),
+                (None, 128, 16),
+            ),
         },
     },
 }
@@ -145,6 +176,47 @@ _COMBINE_TABLE: dict = {
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
+        (4, 7168, 9, None): ((None, 64, 8),),
+        # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
+        (8, 7168, 6, None): ((None, 64, 8),),
+    },
+}
+
+_COMBINE_FP4_TABLE: dict = {
+    "fp4_blockwise": {
+        "gfx1250": {
+            # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
+            # (-1.9 at 2048, -17 at 4096, -46 at 8192, -109 at 16384: 361.9 -> 252.4) and below it
+            # behind (+0.7 at 1792, +4.0 at 1536, +8.1 at 1024).
+            (4, 7168, 6, None): (
+                (256, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+            (4, 7168, 9, None): (
+                (256, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+            # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
+            # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
+            # waves kept one chunk in flight; since then it is ahead at 2048 (-0.4) and 4096 (-1.7).
+            (8, 7168, 6, None): (
+                (1536, 64, 8),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 8),
+            ),
+        },
+    },
+    "fp4_blockwise_fp32": {
+        "gfx1250": {
+            (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
     },
 }
 
@@ -187,7 +259,14 @@ def _merge(disp, comb):
     return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
 
 
-def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) -> dict:
+def lookup(
+    world_size,
+    hidden_dim,
+    topk,
+    dtype="bf16",
+    experts_per_rank=None,
+    quant_type="none",
+) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
     An unswept shape gets the HIP single-shot default (schedule=None). A swept one
@@ -199,9 +278,19 @@ def lookup(world_size, hidden_dim, topk, dtype="bf16", experts_per_rank=None) ->
     disp = _bucket_key(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
-    comb = _bucket_key(
-        _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-    )
+    comb = None
+    if quant_type in _COMBINE_FP4_TABLE:
+        comb = _bucket_key(
+            _COMBINE_FP4_TABLE[quant_type].get(dev, {}),
+            world_size,
+            hidden_dim,
+            topk,
+            experts_per_rank,
+        )
+    if comb is None:
+        comb = _bucket_key(
+            _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
+        )
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.

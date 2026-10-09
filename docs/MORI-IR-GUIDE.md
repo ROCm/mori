@@ -26,7 +26,8 @@ device function can be called, the application must:
 - [4. Integration Example: Triton](#4-integration-example-triton)
 - [5. Integration Example: Raw Bitcode (no framework)](#5-integration-example-raw-bitcode-no-framework)
 - [6. Bitcode JIT Compilation](#6-bitcode-jit-compilation)
-- [7. Examples and Testing](#7-examples-and-testing)
+- [7. Examples](#7-examples)
+- [8. Testing](#8-testing)
 - [Known Limitations](#known-limitations)
 
 ## Architecture

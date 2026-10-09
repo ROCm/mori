@@ -33,7 +33,7 @@ jobs:
       MORI_RDMA_DEVICES: ${{ matrix.rdma_devices }}
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,6 +64,15 @@ jobs:
           # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON BUILD_BENCHMARK=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
+
+      - name: Verify the install is complete
+        # This image is the only one built WITH_FLYDSL=1, so it is the only job
+        # that can assert both EP backends registered. A build that skips the
+        # mori.cco.cco extension loses flydsl with it and everything below still
+        # runs -- on the hip backend alone, silently halving the coverage.
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && python tools/verify_install.py"
 
       - name: Check internode arena region invariants
         run: |
@@ -178,6 +187,34 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: Run CCO GEMM+AR numerics (up to 8 ranks)
+        run: |
+          # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
+          # repo cwd `python/mori/` shadows the install and a packaging miss
+          # (a subpackage find_packages never picked up) would read as green.
+          #
+          # test_gemm_ar_op.py is the public wrapper's own tests. The other two
+          # go through the benchmark, which calls the low-level builders, so
+          # they said nothing about that layer -- and three correctness bugs
+          # lived there behind a green suite.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_ar as g; print(g.GemmAllReduceOp)' && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
+      - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
+        run: |
+          # Accuracy is a gate (validated + rel_l2); absolute timings are only
+          # recorded -- this runner is shared, so a microsecond threshold would
+          # fail on a busy box and pass a real regression on an idle one. The
+          # one perf assertion is relative (fused beats split, measured back to
+          # back). -s so the numbers reach the log for a bisect to read.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 1800 pytest -v -s tests/python/cco/test_gemm_ar_bench.py"
 
       - name: Validate CCO ROCm runtime import order
         run: |
@@ -318,7 +355,7 @@ jobs:
           # non-zero if one fails, so this is a smoke test as well as a bench.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            BACKENDS=flydsl,hip MODES=graph SWEEP=128,512,4096,8192 \
+            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
             ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_ep.py"
 

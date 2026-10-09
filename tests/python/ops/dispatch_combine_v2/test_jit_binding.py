@@ -32,6 +32,8 @@ hipcc and a GPU to load onto.
 """
 
 import ctypes
+import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -238,9 +240,129 @@ def test_arena_offsets_are_launch_defaults_not_part_of_the_key():
         def offset(self, name):
             return self._base + 256 * (len(name) % 7)
 
-    a = _plan(arena=FakeArena(0))
-    b = _plan(arena=FakeArena(4096))
+    # tok_off_ext=1: under selfFirst the plan would also want a communicator behind
+    # the window (see the selfFirst tests below); this test is about offsets.
+    a = _plan(arena=FakeArena(0), tok_off_ext=1)
+    b = _plan(arena=FakeArena(4096), tok_off_ext=1)
     assert a.info["cacheDir"] == b.info["cacheDir"], "offsets must not be in the key"
     assert a._defaults["offTokOff"] != b._defaults["offTokOff"], "offsets must be bound"
     a.close()
     b.close()
+
+
+# --------------------------------------------------------------------------
+# selfFirst: its state is mori's own symmetric memory, not the caller's arena
+# --------------------------------------------------------------------------
+
+
+def _self_first_or_skip():
+    p = _plan()
+    on = p.info["selfFirst"]
+    p.close()
+    if not on:
+        pytest.skip("selfFirst resolves on for the gfx125x dispatch only")
+
+
+class _Arena:
+    def __init__(self, handle):
+        self.handle = handle
+
+    def offset(self, name):
+        return 256
+
+
+class _Comm:
+    """mori.cco.Communicator's allocation surface: real device memory behind a
+    window descriptor laid out like ccoWindowDevice, and a record of what was
+    freed. This rank is LSA rank 1 of a 4 GiB stride, so the base the plan binds
+    is not the local address."""
+
+    STRIDE = 1 << 32
+
+    def __init__(self, lsa_rank_in_descriptor=1):
+        self.allocs, self.closed, self._descs = [], [], []
+        self._desc_rank = lsa_rank_in_descriptor
+
+    def alloc_mem(self, size):
+        buf = torch.full((size,), 0x5A, dtype=torch.uint8, device="cuda")
+        self.allocs.append(buf)
+        return SimpleNamespace(ptr=buf.data_ptr(), close=lambda: self.closed.append("mem"))
+
+    def register_window(self, ptr, size):
+        raw = struct.pack("<QIi", ptr - self.STRIDE, self.STRIDE >> 32, self._desc_rank)
+        desc = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
+        self._descs.append(desc)
+        return SimpleNamespace(
+            handle=desc.data_ptr(), local_ptr=ptr, close=lambda: self.closed.append("win")
+        )
+
+
+def test_self_first_needs_a_communicator_behind_the_arena_window():
+    """Nowhere to allocate the state must fail construction, not launch the
+    kernel against window 0."""
+    _self_first_or_skip()
+    with pytest.raises(RuntimeError, match="communicator"):
+        _plan(arena=_Arena(0xDEAD0000))
+    p = _plan(arena=_Arena(0xDEAD0000), tok_off_ext=1)
+    assert p._defaults.get("sfBase", 0) == 0
+    p.close()
+
+
+def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
+    monkeypatch,
+):
+    """Ranks may pick different geometries for the same call, so every dispatch
+    plan on one arena has to meet in one inbox and one call number."""
+    _self_first_or_skip()
+    import mori.cco
+
+    comm, arena = _Comm(), _Arena(0xA0)
+    monkeypatch.setattr(
+        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+    )
+    a = _plan(arena=arena, block_num=32, warp_per_block=4)
+    b = _plan(arena=arena, block_num=64, warp_per_block=4)
+    assert len(comm.allocs) == 1, "one state per arena, not one per plan"
+    base = comm.allocs[0].data_ptr() - _Comm.STRIDE
+    assert a._defaults["sfBase"] == b._defaults["sfBase"] == base
+    assert a._defaults["sfStride"] == b._defaults["sfStride"] == _Comm.STRIDE
+    assert int(comm.allocs[0].count_nonzero()) == 0, "the state must start zeroed"
+    assert cb.SelfFirstState.of(arena) is not None
+    a.close()
+    assert comm.closed == [], "freed while a plan still holds it"
+    b.close()
+    assert sorted(comm.closed) == ["mem", "win"]
+    assert cb.SelfFirstState.of(arena) is None
+
+
+def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monkeypatch):
+    """The kernel addresses every copy from the descriptor's base and stride; if
+    they do not land on the address cco reports for this rank, nothing they
+    compute for a peer can be trusted either."""
+    _self_first_or_skip()
+    import mori.cco
+
+    comm, arena = _Comm(lsa_rank_in_descriptor=0), _Arena(0xA1)
+    monkeypatch.setattr(
+        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+    )
+    with pytest.raises(RuntimeError, match="does not locate"):
+        _plan(arena=arena)
+    assert sorted(comm.closed) == ["mem", "win"], "a failed allocation must not leak"
+    assert cb.SelfFirstState.of(arena) is None
+
+
+def test_self_first_follows_the_slot_word():
+    _self_first_or_skip()
+    # It only pays where the slot word is in the cco window.
+    p = _plan(tok_off_ext=1)
+    assert not p.info["selfFirst"]
+    p.close()
+
+
+def test_self_first_state_size_matches_the_device_layout():
+    # EpSelfFirstBytes (ep_cfg.hpp): 64 B of inbox per rank rounded up to a 128 B
+    # line, then one line holding the counter and the call number, one the ticket.
+    assert cb.self_first_state_bytes(1) == 384
+    assert cb.self_first_state_bytes(4) == 512
+    assert cb.self_first_state_bytes(8) == 768

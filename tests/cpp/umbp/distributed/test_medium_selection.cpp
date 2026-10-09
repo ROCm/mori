@@ -158,29 +158,6 @@ TEST(MediumValidationTest, SelectedSsdNeedsCapacityEvenWhenTierFlagIsOff) {
 //  3 + 4. Live PoolClient: one registered backend, and a remote put onto it
 // ---------------------------------------------------------------------------
 
-// Free ephemeral port; PoolClient binds and advertises this verbatim, so a
-// hardcoded base would collide with concurrent test processes.
-uint16_t NextPeerServicePort() {
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-  if (fd >= 0) {
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = 0;
-    socklen_t len = sizeof(addr);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0) {
-      uint16_t port = ntohs(addr.sin_port);
-      ::close(fd);
-      return port;
-    }
-    ::close(fd);
-  }
-  static std::atomic<uint16_t> next{
-      static_cast<uint16_t>(54000 + (static_cast<unsigned>(::getpid()) % 4000))};
-  return next.fetch_add(1);
-}
-
 class MediumSelectionTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -218,7 +195,12 @@ class MediumSelectionTest : public ::testing::Test {
     cfg.master_config.master_address = master_addr_;
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.peer_service_port = NextPeerServicePort();
+    // A peer service is required for the node to register a peer_address and
+    // serve remote AllocateSlot/CommitSlot RPCs; without one, remote access
+    // fails with "peer service connection unavailable".  Let gRPC choose the
+    // port: probing for a free one and closing the socket before PoolClient
+    // binds it races with everything else on a shared CI host.
+    cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     // Off so a remote read stays remote and the assertions below describe the
     // medium under test, not a re-cached copy on the reader.

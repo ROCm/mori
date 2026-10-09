@@ -60,15 +60,15 @@ using namespace mori::collective;
                      args.outputTransitMemObj, args.flagsMemObj, args.elementCount); \
   }
 
-// AllGather sync: all fields including dstBaseOffset and flagVal
+// AllGather sync: all fields including dstBaseOffset and genCounter
 #define CCL_WRAP_ALLGATHER(kernel, suffix, T)                                \
   extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
                      args.dstMemObj, args.flagsMemObj, args.elementCount,   \
-                     args.dstBaseOffset, args.flagVal);                     \
+                     args.dstBaseOffset, args.genCounter);                  \
   }
 
-// AllGather async put: no flagVal parameter
+// AllGather async put: no generation counter, the paired WAIT kernel owns it
 #define CCL_WRAP_ALLGATHER_ASYNC_PUT(kernel, suffix, T)                      \
   extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
@@ -80,7 +80,7 @@ using namespace mori::collective;
   extern "C" __global__ void kernel##_##suffix(CclAllgatherArgs<T> args) {  \
     kernel##_body<T>(args.myPe, args.npes, args.input, args.srcMemObj,      \
                      args.dstMemObj, args.flagsMemObj, args.elementCount,   \
-                     args.dstBaseOffset, args.flagVal, args.splitSizes,     \
+                     args.dstBaseOffset, args.genCounter, args.splitSizes,  \
                      args.splitOffsets, args.splitCount);                   \
   }
 
@@ -199,7 +199,7 @@ extern "C" __global__ void OneShotAllGatherSdmaSubGroupParamContiguousKernel_u32
 extern "C" __global__ void OneShotAllGatherSdmaAsyncWaitKernel_u32(
     CclAllgatherArgs<uint32_t> args) {
   OneShotAllGatherSdmaAsyncWaitKernel_body(args.myPe, args.npes, args.dstMemObj,
-                                           args.flagsMemObj, args.flagVal);
+                                           args.flagsMemObj, args.genCounter);
 }
 
 // Sub-group intra-node SDMA broadcast: root (group pos 0) fans the full buffer
