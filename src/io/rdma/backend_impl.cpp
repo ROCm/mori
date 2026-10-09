@@ -581,6 +581,15 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
                                         application::RdmaEndpointHandle remote, TopoKeyPair topoKey,
                                         int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
+
+  // Remember who this QP talks to, and which port and CQ it depends on, before
+  // the transition below: moving the QP to RTR/RTS can itself raise a fatal
+  // event, which the monitor attributes at record time. A failed setup unwinds
+  // into DestroyEndpointNoThrow, which drops the association again.
+  peerFailures_.RegisterQp(
+      PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
+      local.handle.portId, local.ibvHandle.cq);
+
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
   auto epConfig = GetRdmaEndpointConfig(devId);
@@ -601,12 +610,6 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   auto rt = std::make_shared<EndpointRuntime>(id, ep);
   endpointsById_[id] = rt;
   endpointsEpoch_.fetch_add(1, std::memory_order_release);
-
-  // Remember who this QP talks to, and which port and CQ it depends on, so a
-  // later failure of any of them can be resolved back to this peer.
-  peerFailures_.RegisterQp(
-      PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
-      local.handle.portId, local.ibvHandle.cq);
   return id;
 }
 

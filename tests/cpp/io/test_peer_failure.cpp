@@ -296,6 +296,21 @@ void CaseUnknownQpStillReported() {
   Require(!tracker.IsQpAlive(Qp(77)), "unknown QP that failed must be dead");
 }
 
+// Attribution happens when the failure is recorded, not when it is drained, so
+// an owner registered afterwards cannot name it. This is why ConnectEndpoint
+// registers before transitioning the QP, which can itself raise a fatal event.
+void CaseLateRegistrationCannotAttribute() {
+  PeerFailureTracker tracker;
+  tracker.Report(QpFailure(10));
+  tracker.RegisterQp(Qp(10), "decode-0", kPort1, kCqA);
+
+  PeerFailureEvent event;
+  Require(tracker.Pop(&event), "the failure must still be reported");
+  Require(event.remoteEngineKey.empty(),
+          "registering after the fact must not retroactively attribute, got '" +
+              event.remoteEngineKey + "'");
+}
+
 // Forgetting a QP must not resurrect it or discard its pending event.
 void CaseForgetQpKeepsFailure() {
   PeerFailureTracker tracker;
@@ -410,6 +425,7 @@ int main() {
       {"PeerUnreachableIsAttributed", CasePeerUnreachableIsAttributed},
       {"RepeatFailuresFoldIntoFirst", CaseRepeatFailuresFoldIntoFirst},
       {"UnknownQpStillReported", CaseUnknownQpStillReported},
+      {"LateRegistrationCannotAttribute", CaseLateRegistrationCannotAttribute},
       {"ForgetQpKeepsFailure", CaseForgetQpKeepsFailure},
       {"FifoOrder", CaseFifoOrder},
       {"BoundedQueueDropsNewest", CaseBoundedQueueDropsNewest},
