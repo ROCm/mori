@@ -709,7 +709,11 @@ jobs:
           #   timeout_minutes: 45
     env:
       CT: ${{ matrix.ct }}
-      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      # node2's sshd checks every new connection against the Conductor auth
+      # service, which intermittently answers 503 and denies the login (ssh exits
+      # 255). Multiplex all of a job's ssh/rsync calls over one master connection
+      # so only the first one is checked; "Open SSH connection to node2" retries it.
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto -o ControlPath=/tmp/mori-ci-ssh-%C -o ControlPersist=30m
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
@@ -769,6 +773,15 @@ jobs:
             $IMAGE sleep infinity
           $CT exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Open SSH connection to node2
+        run: |
+          for i in 1 2 3 4 5; do
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST true && exit 0
+            echo "ssh to node2 failed (attempt $i/5), retrying in 10s"
+            sleep 10
+          done
+          exit 1
 
       - name: Start container on node2
         run: |
