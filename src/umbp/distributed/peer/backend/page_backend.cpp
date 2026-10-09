@@ -845,9 +845,14 @@ std::vector<MetricSample> PageBackend::SampleMetrics() const {
   // outside this class it is indistinguishable from keys that were never
   // stored.  On a masterless node that is ALL of the eviction there is.
   std::vector<MetricSample> out;
+  // Only a node that evicts for itself has these counters.  On one that does,
+  // they are published from the first tick, zero included: a series born
+  // already holding the first round's count hides that round from rate() and
+  // increase(), and eviction is rare enough that the first round is often the
+  // only one a dashboard window contains.
+  if (!local_evict_enabled_) return out;
 
   auto event = [&out](const char* name, uint64_t v) {
-    if (v == 0) return;
     out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL,
                                MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL_HELP,
                                {{"event", name}},
@@ -861,13 +866,10 @@ std::vector<MetricSample> PageBackend::SampleMetrics() const {
   // has nothing to evict, which look the same in the freed-bytes counter.
   event("local_evict_no_candidate", local_evict_no_candidate_.load(std::memory_order_relaxed));
 
-  const uint64_t freed_bytes = local_evict_bytes_.load(std::memory_order_relaxed);
-  if (freed_bytes != 0) {
-    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL_HELP,
-                               {{"event", kPageBackendLocalEvictEvent}},
-                               freed_bytes});
-  }
+  out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL_HELP,
+                             {{"event", kPageBackendLocalEvictEvent}},
+                             local_evict_bytes_.load(std::memory_order_relaxed)});
   return out;
 }
 

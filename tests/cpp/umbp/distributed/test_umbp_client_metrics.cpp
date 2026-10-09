@@ -521,14 +521,16 @@ TEST_F(PoolClientLocalByteTrackingTest, LocalPutGetBytesCounted) {
   EXPECT_GT(batch_get_local_count, 0.0)
       << "Expected local batch-get bandwidth count > 0; Prometheus shows " << batch_get_local_count;
 
-  // Single-node setup must not produce any remote traffic counters.
-  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_put_bytes_total", "remote"), -1.0)
+  // Single-node setup must not move any remote bytes.  The remote series
+  // exist from startup at zero (so a first remote transfer is an increment
+  // Prometheus can see), and must still read zero here.
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_put_bytes_total", "remote"), 0.0)
       << "Unexpected remote outbound put bytes in single-node setup";
-  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_get_bytes_total", "remote"), -1.0)
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_outbound_get_bytes_total", "remote"), 0.0)
       << "Unexpected remote outbound get bytes in single-node setup";
-  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_put_bytes_total", "remote"), -1.0)
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_put_bytes_total", "remote"), 0.0)
       << "Unexpected remote inbound put bytes in single-node setup";
-  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_get_bytes_total", "remote"), -1.0)
+  EXPECT_EQ(ParseMetricValue(body, "mori_umbp_client_inbound_get_bytes_total", "remote"), 0.0)
       << "Unexpected remote inbound get bytes in single-node setup";
 
   EXPECT_EQ(parse_hist_sum("mori_umbp_client_batch_put_bandwidth_gibps", "remote"), -1.0)

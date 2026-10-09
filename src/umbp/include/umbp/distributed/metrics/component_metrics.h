@@ -199,7 +199,9 @@ class MetricSource {
 class MetricPublisher {
  public:
   struct Sink {
-    // delta >= 0, already differenced.  Not called for a zero delta.
+    // delta >= 0, already differenced.  Not called for a zero delta, except
+    // once for a series seen for the first time, so the series exists at 0
+    // before its first event (see Publish).
     std::function<void(const char* name, const char* help, const MetricLabels&, double delta)>
         counter;
     // Current reading, shipped every tick.

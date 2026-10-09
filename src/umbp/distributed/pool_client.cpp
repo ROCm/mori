@@ -1169,6 +1169,7 @@ bool PoolClient::Init() {
   } else {
     metric_sink_ = config_.metric_sink;
   }
+  SeedEventCounters();
 
   // Every instrumented component on this node rides a metrics tick: the storage
   // backend (generic slot-lifecycle series from the decorator, plus whatever the
@@ -5112,6 +5113,102 @@ void PoolClient::PublishComponentMetrics() {
     }
     metric_publisher_.Publish("pool", {}, samples, sink);
   }
+
+  if (!master_client_) PublishNodeStateGauges();
+}
+
+void PoolClient::PublishNodeStateGauges() {
+  // Same derivation MasterClient::SnapshotAndCacheTierCapacities feeds the
+  // master: every backend of a tier summed into one capacity.
+  std::map<TierType, TierCapacity> caps;
+  std::map<TierType, uint64_t> live_keys;
+  for (MediumBackend* backend : registry_.All()) {
+    if (backend == nullptr) continue;
+    const TierCapacity c = backend->Capacity();
+    TierCapacity& agg = caps[backend->Tier()];
+    agg.total_bytes += c.total_bytes;
+    agg.available_bytes += c.available_bytes;
+    live_keys[backend->Tier()] += backend->OwnedKeyCount();
+  }
+
+  // A masterless node is the only client it can see.
+  metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP, {},
+                         1.0);
+
+  uint64_t total_keys = 0;
+  for (const auto& [tier, cap] : caps) {
+    const MetricSink::Labels labels = {{"tier", TierTypeName(tier)}};
+    const uint64_t used =
+        cap.total_bytes >= cap.available_bytes ? cap.total_bytes - cap.available_bytes : 0;
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL,
+                           MORI_UMBP_METRIC_CLIENT_CAPACITY_TOTAL_HELP, labels,
+                           static_cast<double>(cap.total_bytes));
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL,
+                           MORI_UMBP_METRIC_CLIENT_CAPACITY_AVAIL_HELP, labels,
+                           static_cast<double>(cap.available_bytes));
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_USED,
+                           MORI_UMBP_METRIC_CLIENT_CAPACITY_USED_HELP, labels,
+                           static_cast<double>(used));
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION,
+                           MORI_UMBP_METRIC_CLIENT_CAPACITY_UTILIZATION_HELP, labels,
+                           cap.total_bytes > 0
+                               ? static_cast<double>(used) / static_cast<double>(cap.total_bytes)
+                               : 0.0);
+    const uint64_t keys = live_keys[tier];
+    total_keys += keys;
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT,
+                           MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_HELP, labels,
+                           static_cast<double>(keys));
+  }
+  metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL,
+                         MORI_UMBP_METRIC_CLIENT_KV_LIVE_COUNT_TOTAL_HELP, {},
+                         static_cast<double>(total_keys));
+
+  if (default_pool_ == nullptr) return;
+  for (const auto& [name, logical] : default_pool_->LogicalTierCapacities()) {
+    const auto& cap = logical.capacity;
+    const MetricSink::Labels labels = {{"logical_tier", name},
+                                       {"tier", TierTypeName(logical.representative_tier)}};
+    const uint64_t used =
+        cap.total_bytes >= cap.available_bytes ? cap.total_bytes - cap.available_bytes : 0;
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_TOTAL,
+                           MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_TOTAL_HELP, labels,
+                           static_cast<double>(cap.total_bytes));
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_AVAIL,
+                           MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_AVAIL_HELP, labels,
+                           static_cast<double>(cap.available_bytes));
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_USED,
+                           MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_USED_HELP, labels,
+                           static_cast<double>(used));
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_UTILIZATION,
+                           MORI_UMBP_METRIC_CLIENT_LOGICAL_CAPACITY_UTILIZATION_HELP, labels,
+                           cap.total_bytes > 0
+                               ? static_cast<double>(used) / static_cast<double>(cap.total_bytes)
+                               : 0.0);
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE,
+                           MORI_UMBP_METRIC_CLIENT_LOGICAL_PUT_ELIGIBLE_HELP, labels,
+                           logical.put_eligible ? 1.0 : 0.0);
+    metric_sink_->SetGauge(MORI_UMBP_METRIC_CLIENT_LOGICAL_PEAK_UTILIZATION,
+                           MORI_UMBP_METRIC_CLIENT_LOGICAL_PEAK_UTILIZATION_HELP, labels,
+                           logical.peak_member_utilization);
+  }
+}
+
+void PoolClient::SeedEventCounters() {
+  if (metric_sink_ == nullptr) return;
+  for (const char* traffic : {"local", "remote"}) {
+    const MetricSink::Labels labels = {{"traffic", traffic}};
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_PUT_BYTES_TOTAL_HELP, labels, 0.0);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, labels, 0.0);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP, labels, 0.0);
+    CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, labels, 0.0);
+  }
+  CountMetric(MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL,
+              MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP, {}, 0.0);
 }
 
 // ---------------------------------------------------------------------------

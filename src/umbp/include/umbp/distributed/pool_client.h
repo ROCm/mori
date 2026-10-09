@@ -265,6 +265,19 @@ class PoolClient {
   // or a new transfer engine visible in Grafana without touching this file.
   void PublishComponentMetrics();
 
+  // What a master derives from this node's heartbeats -- per-tier capacity,
+  // live key counts, logical-tier eligibility, the client count -- published
+  // directly when there is no master to derive it.  Same metric names and
+  // labels as the master emits, so the same panels read either deployment.
+  void PublishNodeStateGauges();
+
+  // Creates at zero every counter the data path writes directly (the
+  // per-traffic byte counters, ranged install failures), once, before any
+  // traffic.  Those are written on the event itself, so without this a series
+  // would be born holding its first event and rate()/increase() would never
+  // see it.
+  void SeedEventCounters();
+
   // Holds the delta baselines for every component published above, keyed by
   // (component, metric, labels).  Touched once per tick; the counters
   // themselves live in the components.
