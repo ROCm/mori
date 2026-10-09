@@ -182,6 +182,10 @@ __device__ void EpDispatchBody(EpArgs args) {
 
   const unsigned long long win = args.window;
 
+  // Reset the count Phase 2 accumulates into. Ordered before those adds by the
+  // __syncthreads() below (same warp); combine only reads it.
+  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
+
   // Phase 1: route and send. One warp per (token, top-k slot).
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int i = globalWarpId; i < args.numTokens * kTopk; i += globalWarpNum) {
@@ -395,7 +399,6 @@ __device__ void EpCombineBody(EpArgs args) {
 
   EpCrossDeviceBarrier<kCfg>(args, flag);
 
-  *args.totalRecvTokenNum = 0;
   if (args.numTokens == 0) return;
 
   // Per-warp pointer arrays: [srcPtrs][srcWeightPtrs]. Sized by

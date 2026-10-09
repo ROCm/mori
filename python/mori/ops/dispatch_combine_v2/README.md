@@ -109,6 +109,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
+| `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |

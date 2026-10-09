@@ -242,7 +242,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     fp8_direct_cast=cfg.fp8_direct_cast,
                     fp8_blockwise=cfg.fp8_blockwise,
                     scale_dim=cfg.combine_scale_dim,
-                    reset_total_recv=False,
                 )
                 for (b, w) in combine_specs
             }
@@ -261,7 +260,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     off_out_tok=arena.offset("out_tok"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
                     off_out_wts=arena.offset("out_wts"),
-                    reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
                 )
                 for (b, w) in combine_specs
@@ -327,10 +325,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
-            # FlyDSL stages combine's input on the host (see combine()), and its
-            # kernels reset their own counters.
+            # FlyDSL stages combine's input on the host (see combine()).
             stages_in_kernel=False,
-            self_resets_counters=True,
             capabilities=frozenset(
                 {
                     "gather",
@@ -515,7 +511,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
     def local_expert_count(self):
         """[num_experts_per_rank] i32: recv tokens per local expert. Call after
-        dispatch, before combine (gather resets total_recv)."""
+        dispatch."""
         self._local_expert_count_buf.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
         self._local_expert_count(
