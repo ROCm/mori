@@ -142,6 +142,29 @@ def scale_stride_bytes(scale_bytes: int) -> int:
     return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
 
 
+def ep_staging_bytes(world_size: int, max_recv: int, scale_bytes: int) -> int:
+    """Total bytes for the gfx1250 dispatch staging buffer.
+
+    Mirrors EpStagingTotalBytes in ep_cfg.hpp.
+    """
+    pool = world_size * max_recv
+    max_topk = 16
+    max_blocks = 512
+
+    def a128(x):
+        return (x + 127) & ~127
+
+    off = a128(pool * max_topk * 4)  # stgIdx
+    off = a128(off + pool * max_topk * 4)  # stgWt
+    off = a128(off + pool * 4)  # stgSrc
+    off = a128(off + max_blocks * world_size * 4)  # blkBase
+    off = a128(off + max_blocks * world_size * 4)  # blkCount
+    if scale_bytes > 0:
+        s_stride = scale_stride_bytes(scale_bytes)
+        off = a128(off + world_size * max_recv * s_stride)
+    return off
+
+
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
@@ -366,6 +389,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._tokoff_wanted = (
             not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
         )
+
+        # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
+        # all dispatch schedule variants.  Must be set before _build_kernels
+        # because dispatch plans bind the pointer at construction time.  This op
+        # always binds it; the kernel's .bss fallback is for callers that drive
+        # EpDispatchPlan directly and never do.
+        self.dispatch_staging = None
+        if self._is1250 and not cfg.is_internode:
+            raw_scale = self._scale_i32(cfg) * 4
+            stg_bytes = ep_staging_bytes(
+                cfg.world_size, cfg.effective_max_recv, raw_scale
+            )
+            if stg_bytes > 0:
+                self.dispatch_staging = torch.zeros(
+                    stg_bytes, dtype=torch.uint8, device=dev
+                )
+
         self._kernels = self._build_kernels(cfg, self.arena)
 
         if cfg.is_internode:
@@ -1262,6 +1302,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
             )
             plan.bind(rank=cfg.rank)
+            if self.dispatch_staging is not None:
+                plan.bind(staging_base=self.dispatch_staging.data_ptr())
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
         # Outside the arena, so reset() has to zero it itself.
@@ -1292,6 +1334,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._self_first_state = None
         for plan in getattr(self, "_plans", ()):
             plan.close()
+        # After the plans: they carry staging_base by value, so nothing may still be
+        # able to launch when the tensor behind it goes.
+        self.dispatch_staging = None
         ext = getattr(self, "_tokoff_ext", None)
         if ext is not None:
             self._tokoff_ext = None

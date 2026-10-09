@@ -40,6 +40,8 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <cassert>
+
 // AFTER hip_runtime.h, and in its own block so clang-format cannot sort it up:
 // it pulls in driver_types.h, which uses hipMemoryType without declaring it.
 #include <hip/amd_detail/amd_gfx1250_TDM.h>
@@ -207,25 +209,15 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
 #define CUSPLIT_POOL_SLOTS (MORI_EP_WORLD_SIZE * MORI_EP_MAX_RECV)
 #define CUSPLIT_MAX_BLOCKS 512
 #define CUSPLIT_MAX_TOPK 16
+static_assert(CUSPLIT_MAX_TOPK == EpStagingMaxTopk,
+              "CUSPLIT_MAX_TOPK and EpStagingMaxTopk must agree");
+static_assert(CUSPLIT_MAX_BLOCKS == EpStagingMaxBlocks,
+              "CUSPLIT_MAX_BLOCKS and EpStagingMaxBlocks must agree");
 
-alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-alignas(kTdmRowBytes) __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
-alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
-__device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
-__device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
-// Per-token scale rows, staged like the other meta fields so they ship to a peer as
-// one contiguous run rather than a 224 B transfer per (token, destination) -- the
-// size TDM is worst at. The array is at file scope, which the TU reaches before kCfg
-// exists, so its extent comes from a macro RenderEpSource emits only when the feature
-// is on; off, it degenerates to one byte. `if constexpr` discards the staging code
-// but still looks the name up, hence a declaration in both cases.
 #if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
-// Source row vs the stride we lay it down at; they differ by EpScaleStride's pad.
 constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
 constexpr int kEpScaleStride = MORI_EP_SCALE_STRIDE;
 constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
-// Per-peer stride. NOT _stgCap: that one sizes the idx/wt pool, which is a
-// different (larger) constant, and indexing this array with it walks off the end.
 constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
 constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
 #else
@@ -235,34 +227,46 @@ constexpr size_t kEpScaleSlots = 1;
 constexpr size_t kEpScaleRows = 1;
 constexpr int kMetaFields = 3;  // idx, weights, srcmap
 #endif
-// FOOTPRINT, and it is quadratic in world_size: kEpScaleSlots is
-// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank. That
-// is deliberate -- the per-peer stride has to be the peer's full recv capacity so
-// the destination slot id indexes it directly, which is also what lets the
-// existing `ab + cc > recvCapM` guard cover this array (_stgCap does NOT bound
-// it; the two cross over as world_size grows).
-//
-// It costs, at the 256 B STRIDE a 224 B row (hidden 7168) pads up to:
-//     EP4  maxTok 16384  ->   64 MiB
-//     EP8  maxTok  8192  ->  128 MiB
-//     EP8  maxTok 16384  ->  256 MiB
-// and this is a __device__ global, so it is one copy PER COMPILED VARIANT: a
-// three-entry (block, warp) schedule at EP8/16384 reserves ~672 MiB.
-//
-// The idx/wt pools next to it are world_size-independent (a fixed CUSPLIT_POOL
-// split per peer). Making this one match would need the staging to be indexed by
-// a block-local slot instead of the destination slot id, which is a bigger change
-// than it looks and wants hardware validation -- the guard would start dropping
-// tokens rather than merely skipping transfers. Until then, fail at compile time
-// rather than at the first launch on a big EP.
-static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (size_t)1 << 30,
-              "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
-              "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
-              "before going wider");
 static_assert(EpScaleAlign % kTdmRowBytes == 0,
               "the scale staging base must sit on a TDM row for the metadata tile to reach it");
+
+// Staging lives in the caller's buffer (EpArgs::stagingBase). TEMPORARILY, the module
+// also carries it as .bss arrays, and a launch picks between the two layouts on whether
+// that pointer is null -- same protocol, same indexing, only the memory differs. See
+// EpHasStaticStaging in ep_cfg.hpp for why they are here and when to delete them.
+//
+// The fit test is EpStaticStagingBytes <= EpStaticStagingBudget, spelled in macros
+// because this is file scope: the TU reaches it before kCfg exists, the same reason
+// MORI_EP_SCALE_* are macros. Preprocessor arithmetic is intmax_t, so the products do
+// not wrap the way a plain int would. EpDispatch1250xBody static_asserts that this
+// arrives at the same answer the Cfg does.
+#if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
+#define MORI_EP_STG_SCALE_BYTES (MORI_EP_SCALE_SLOTS * MORI_EP_SCALE_STRIDE)
+#else
+#define MORI_EP_STG_SCALE_BYTES 0
+#endif
+#define MORI_EP_STG_BYTES                                               \
+  (CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK * 8 + CUSPLIT_POOL_SLOTS * 4 + \
+   CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE * 8 + MORI_EP_STG_SCALE_BYTES)
+
+#if MORI_EP_STG_BYTES <= (1 << 30)
+#define MORI_EP_HAS_STATIC_STAGING 1
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgIdx_dev[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
+alignas(kTdmRowBytes) __device__ float _cusplit_stgWt_dev[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
+alignas(kTdmRowBytes) __device__ index_t _cusplit_stgSrc_dev[CUSPLIT_POOL_SLOTS];
+__device__ index_t _cusplit_blkBase_dev[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
+__device__ index_t _cusplit_blkCount_dev[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
-__device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
+__device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale_dev[kEpScaleStgBytes];
+// The base is a kernel argument, so the select is wave-uniform and folds to a scalar
+// cmov hoisted out of every loop that follows.
+#define MORI_EP_STG_PICK(dyn, dev) (_stgBase != nullptr ? (dyn) : (dev))
+#else
+// Over budget: the dynamic layout alone. The `dev` token never reaches the compiler, so
+// the arrays need no declaration here, and a null base has nothing to fall back to --
+// EpDispatchSpec::LaunchRaw rejects one for exactly these Cfgs.
+#define MORI_EP_STG_PICK(dyn, dev) (dyn)
+#endif
 
 // The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
 // moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
@@ -363,6 +367,48 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   static_assert(EpScaleStride(kCfg) == kEpScaleStride,
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
+
+  // The macros above size the arrays, the Cfg answers the same question for the host.
+  // They must agree: the host decides from the Cfg whether a null base is legal, and
+  // the module it decides for is this one.
+#if defined(MORI_EP_HAS_STATIC_STAGING) && MORI_EP_HAS_STATIC_STAGING
+  static_assert(EpHasStaticStaging(kCfg),
+                "the rendered macros kept the .bss staging but the Cfg says it is over "
+                "budget -- LaunchRaw would reject a null base the kernel can serve");
+#else
+  static_assert(!EpHasStaticStaging(kCfg),
+                "the rendered macros dropped the .bss staging but the Cfg says it fits "
+                "-- LaunchRaw would pass a null base to a kernel with no fallback");
+#endif
+
+  // Staging pointers. The EpStaging*Offset functions are constexpr on kCfg, so each
+  // dynamic one is base + a compile-time constant; MORI_EP_STG_PICK falls back to the
+  // .bss array of the same shape when this launch left the base null.
+  char* _stgBase = static_cast<char*>(args.stagingBase);
+#if !(defined(MORI_EP_HAS_STATIC_STAGING) && MORI_EP_HAS_STATIC_STAGING)
+  // Over budget, so there is nothing to fall back to. EpDispatchSpec::LaunchRaw rejects
+  // a null base on the host, but it only shadows the base LaunchRaw -- a C++ caller
+  // reaching KernelSpec::Launch names the base one and slips past. Assert rather than
+  // dereference: the fault would otherwise land at null + a staging sub-offset, which
+  // names neither the argument nor the caller that left it unbound.
+  assert(args.stagingBase != nullptr &&
+         "ep_dispatch: stagingBase is null and this Cfg is past EpStaticStagingBudget, "
+         "so the module has no .bss staging -- bind staging_base (EpStagingTotalBytes)");
+#endif
+  index_t* _cusplit_stgIdx = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingIdxOffset(kCfg)), _cusplit_stgIdx_dev);
+  float* _cusplit_stgWt = MORI_EP_STG_PICK(
+      reinterpret_cast<float*>(_stgBase + EpStagingWtOffset(kCfg)), _cusplit_stgWt_dev);
+  index_t* _cusplit_stgSrc = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingSrcOffset(kCfg)), _cusplit_stgSrc_dev);
+  index_t* _cusplit_blkBase = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingBlkBaseOffset(kCfg)), _cusplit_blkBase_dev);
+  index_t* _cusplit_blkCount = MORI_EP_STG_PICK(
+      reinterpret_cast<index_t*>(_stgBase + EpStagingBlkCountOffset(kCfg)), _cusplit_blkCount_dev);
+  unsigned char* _cusplit_stgScale =
+      MORI_EP_STG_PICK(reinterpret_cast<unsigned char*>(_stgBase + EpStagingScaleOffset(kCfg)),
+                       _cusplit_stgScale_dev);
+
   constexpr int WS = kCfg.waveSize;
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
@@ -932,7 +978,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // metadata slabs from m * W / npes, theirs included.
     constexpr int kPmG = (kPlainMeta && kMetaSlabBytes > 0) ? (kCfg.warpPerBlock / kPM) : 1;
     const bool _pmTile = (kPmG > 1) && _metaPlain && (warpId >= warpNum - kPM);
-    const int mtileBytesM = _pmTile ? kPmG * kMetaSlabBytes : kSlabBytes;  // the whole slab, see above
+    const int mtileBytesM =
+        _pmTile ? kPmG * kMetaSlabBytes : kSlabBytes;  // the whole slab, see above
     // idx + weights + srcmap + the scale row, at the stride it is really moved at:
     // sizing this from the unpadded row would under-size the tile it then holds.
     const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
@@ -958,7 +1005,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       constexpr bool kMetaLo = kCfg.selfFirst && !kUnitGeom && kCfg.warpPerBlock > kEpTokChunk &&
                                npes - 1 > kCfg.warpPerBlock - kEpTokChunk &&
                                npes <= kCfg.warpPerBlock;
-      static_assert(!(kMetaLo && kOwnHi), "the own pass of kOwnHi assumes the runs start at warp kEpTokChunk");
+      static_assert(!(kMetaLo && kOwnHi),
+                    "the own pass of kOwnHi assumes the runs start at warp kEpTokChunk");
       int _metaW0 = kEpTokChunk;
       if constexpr (kMetaLo) {
         if (_metaHi) {
@@ -967,10 +1015,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           _metaW0 = (t < 1) ? 1 : ((t > kEpTokChunk) ? kEpTokChunk : t);
         }
       }
-      const int _metaWarps =
-          _metaHi ? (warpNum - _metaW0) : (_metaPlain ? kPM : warpNum);
-      const int split = (_metaHi || _metaPlain) ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1)
-                                                : _peerSplit;
+      const int _metaWarps = _metaHi ? (warpNum - _metaW0) : (_metaPlain ? kPM : warpNum);
+      const int split =
+          (_metaHi || _metaPlain) ? ((_metaWarps >= npes) ? (_metaWarps / npes) : 1) : _peerSplit;
       const int nRuns = npes * split;
       // selfFirst numbers the runs peer-minor when the warps divide evenly, so warp w
       // takes peer w % npes -- the destination it also carries in the payload pass.
@@ -978,10 +1025,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       // pass needs, and they start it at once instead of after a remote run: at 512
       // tokens that ordering is worth ~2 us of the dispatch.
       const bool _runPeerMinor = kCfg.selfFirst && (_metaWarps % npes) == 0;
-      const int _run0 =
-          _metaHi ? ((warpId >= _metaW0) ? (warpId - _metaW0) : nRuns)
-          : _metaPlain ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
-                       : warpId;
+      const int _run0 = _metaHi ? ((warpId >= _metaW0) ? (warpId - _metaW0) : nRuns)
+                        : _metaPlain
+                            ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
+                            : warpId;
       for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
@@ -1200,8 +1247,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       index_t hE[topk];
 #pragma unroll
       for (int k = 0; k < topk; ++k) hE[k] = args.tokenIndices[(size_t)hTok * topk + k];
-      index_t r =
-          (laneId < npes && laneId != myPe) ? EpSelfFirstPeerSent(args, laneId, sfSeq) : 0;
+      index_t r = (laneId < npes && laneId != myPe) ? EpSelfFirstPeerSent(args, laneId, sfSeq) : 0;
       for (int off = WS / 2; off > 0; off >>= 1) r += __shfl_xor(r, off);
       const index_t d0 = r + s0;
       __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -1668,17 +1714,39 @@ struct EpFp4Wire {
 // is stricter than asked and so still correct.
 __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
   switch (n) {
-    case 0: __builtin_amdgcn_s_wait_tensorcnt(0); break;
-    case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
-    case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
-    case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
-    case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
-    case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
-    case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
-    case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
-    case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
-    case 9: __builtin_amdgcn_s_wait_tensorcnt(9); break;
-    default: __builtin_amdgcn_s_wait_tensorcnt(10); break;
+    case 0:
+      __builtin_amdgcn_s_wait_tensorcnt(0);
+      break;
+    case 1:
+      __builtin_amdgcn_s_wait_tensorcnt(1);
+      break;
+    case 2:
+      __builtin_amdgcn_s_wait_tensorcnt(2);
+      break;
+    case 3:
+      __builtin_amdgcn_s_wait_tensorcnt(3);
+      break;
+    case 4:
+      __builtin_amdgcn_s_wait_tensorcnt(4);
+      break;
+    case 5:
+      __builtin_amdgcn_s_wait_tensorcnt(5);
+      break;
+    case 6:
+      __builtin_amdgcn_s_wait_tensorcnt(6);
+      break;
+    case 7:
+      __builtin_amdgcn_s_wait_tensorcnt(7);
+      break;
+    case 8:
+      __builtin_amdgcn_s_wait_tensorcnt(8);
+      break;
+    case 9:
+      __builtin_amdgcn_s_wait_tensorcnt(9);
+      break;
+    default:
+      __builtin_amdgcn_s_wait_tensorcnt(10);
+      break;
   }
 }
 
@@ -1758,8 +1826,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // a second producer on every SIMD -- a producer is bound by its own dependent chains and LDS
   // reads, not by the SIMD's issue rate -- and twelve reducing waves.
   constexpr int kSegWarps = kOvlp ? kCfg.warpPerBlock / 2 : kCfg.warpPerBlock;
-  constexpr int kSegP =
-      kOvlp ? kCfg.warpPerBlock / 2 - 4 : kCfg.warpPerBlock == 16 ? 6 : kCfg.warpPerBlock / 2;
+  constexpr int kSegP = kOvlp                     ? kCfg.warpPerBlock / 2 - 4
+                        : kCfg.warpPerBlock == 16 ? 6
+                                                  : kCfg.warpPerBlock / 2;
   constexpr int kSegS = kSegWarps - kSegP;
   // Chunks a store wave keeps in flight. With eight producers (24 warps) the stores bound the push,
   // and chunks behind the first only queue: one in flight pushes faster than four. With four
@@ -1787,11 +1856,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       mx = __builtin_elementwise_max(mx, __builtin_bit_cast(EpU16x2, w[e] & 0x7FFF7FFFu));
     mx = __builtin_elementwise_max(mx, __builtin_shufflevector(mx, mx, 1, 0));
     unsigned amax = __builtin_bit_cast(unsigned, mx);
-    const unsigned a1 =
-        (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
+    const unsigned a1 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0xb1, 0xf, 0xf, false);
     amax = amax > a1 ? amax : a1;
-    const unsigned a2 =
-        (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
+    const unsigned a2 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
     return amax > a2 ? amax : a2;
   };
   auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
@@ -1813,11 +1880,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
 #pragma unroll
     for (int i = 0; i < kLd; ++i) {
       unsigned a = grpAmax(xs[i]);
-      const unsigned a3 =
-          (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
+      const unsigned a3 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x141, 0xf, 0xf, false);
       a = a > a3 ? a : a3;
-      const unsigned a4 =
-          (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
+      const unsigned a4 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)a, 0x140, 0xf, 0xf, false);
       a = a > a4 ? a : a4;
       if ((laneId & 15) == 0) slot[(i * WS + laneId) >> 4] = a;
     }
@@ -2018,8 +2083,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     // handoff, not a slow peer: fail the launch instead of hanging it.
     constexpr unsigned kSpinMax = 1u << 26;
     if (warpId < kSegP) {
-      const int* const map = reinterpret_cast<const int*>(
-          wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
+      const int* const map =
+          reinterpret_cast<const int*>(wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc);
       unsigned char* const stg = stgB + (size_t)warpId * kTokB;
       auto loadRow = [&](int r) {
         TdmIssueLoad<int>(reinterpret_cast<int*>(stg),
@@ -2035,8 +2100,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         [[maybe_unused]] const int rw = kOvlp && laneId < n ? rowOf(r0 + laneId) : 0;
         if (c >= kSegNb) {
           unsigned spin = 0;
-          while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
-                     fre + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) !=
+          while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(fre + slot, __ATOMIC_RELAXED,
+                                                                  __HIP_MEMORY_SCOPE_WORKGROUP)) !=
                  c - kSegNb + 1) {
             __builtin_amdgcn_s_sleep(1);
             if (++spin > kSpinMax) __builtin_trap();
@@ -2077,8 +2142,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       constexpr bool kKeep = kOvlp && kSegL == 1;
       [[maybe_unused]] int peF = -1, rwF = 0;
       [[maybe_unused]] const __attribute__((address_space(1))) int* const mapG =
-          kKeep ? (const __attribute__((address_space(1))) int*)(
-                      wBase + (uint64_t)wd->lsaRank * wStride + args.offRecvToSrc)
+          kKeep ? (const __attribute__((address_space(1))) int*)(wBase +
+                                                                 (uint64_t)wd->lsaRank * wStride +
+                                                                 args.offRecvToSrc)
                 : nullptr;
       auto retire = [&]() {
         const int sh = 4 * (head % kSegL);
@@ -2413,8 +2479,8 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
 }
 
 template <EpCfg kCfg, typename T, int kIpt>
-__device__ __forceinline__ void EpFp4ReduceLoop(const EpArgs& args, EpFp4Item<kCfg> cur, const int gw,
-                                                const int gn) {
+__device__ __forceinline__ void EpFp4ReduceLoop(const EpArgs& args, EpFp4Item<kCfg> cur,
+                                                const int gw, const int gn) {
   const int nItems = args.numTokens * kIpt;
   for (int it = gw; it < nItems; it += gn) {
     const int nx = it + gn;

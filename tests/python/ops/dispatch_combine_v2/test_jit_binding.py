@@ -286,14 +286,18 @@ class _Comm:
     def alloc_mem(self, size):
         buf = torch.full((size,), 0x5A, dtype=torch.uint8, device="cuda")
         self.allocs.append(buf)
-        return SimpleNamespace(ptr=buf.data_ptr(), close=lambda: self.closed.append("mem"))
+        return SimpleNamespace(
+            ptr=buf.data_ptr(), close=lambda: self.closed.append("mem")
+        )
 
     def register_window(self, ptr, size):
         raw = struct.pack("<QIi", ptr - self.STRIDE, self.STRIDE >> 32, self._desc_rank)
         desc = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
         self._descs.append(desc)
         return SimpleNamespace(
-            handle=desc.data_ptr(), local_ptr=ptr, close=lambda: self.closed.append("win")
+            handle=desc.data_ptr(),
+            local_ptr=ptr,
+            close=lambda: self.closed.append("win"),
         )
 
 
@@ -318,7 +322,9 @@ def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
 
     comm, arena = _Comm(), _Arena(0xA0)
     monkeypatch.setattr(
-        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+        mori.cco,
+        "communicator_of_window",
+        lambda h: comm if h == arena.handle else None,
     )
     a = _plan(arena=arena, block_num=32, warp_per_block=4)
     b = _plan(arena=arena, block_num=64, warp_per_block=4)
@@ -344,7 +350,9 @@ def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monke
 
     comm, arena = _Comm(lsa_rank_in_descriptor=0), _Arena(0xA1)
     monkeypatch.setattr(
-        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+        mori.cco,
+        "communicator_of_window",
+        lambda h: comm if h == arena.handle else None,
     )
     with pytest.raises(RuntimeError, match="does not locate"):
         _plan(arena=arena)
@@ -366,3 +374,21 @@ def test_self_first_state_size_matches_the_device_layout():
     assert cb.self_first_state_bytes(1) == 384
     assert cb.self_first_state_bytes(4) == 512
     assert cb.self_first_state_bytes(8) == 768
+
+
+def test_staging_bytes_matches_the_device_layout():
+    # ep_staging_bytes() hand-mirrors EpStagingTotalBytes (ep_cfg.hpp): six
+    # sub-arrays, each rounded up to EpScaleAlign. EpArgs carries the base but no
+    # length, so the kernel cannot bounds-check it -- an undersized buffer is a
+    # silent write past the end of a torch tensor, not an error. The numbers below
+    # come from EpStagingTotalBytes and are the only thing holding the mirror to
+    # it; if the layout moves, re-derive them there rather than pasting whatever
+    # this function starts returning.
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    assert ep_staging_bytes(8, 4096, 224) == 12746752
+    assert ep_staging_bytes(8, 4096, 0) == 4358144
+    assert ep_staging_bytes(32, 4096, 224) == 50987008
+    # max_recv not a multiple of 32 is the only shape where the 128 B pad does
+    # anything, so it is the only one that exercises the mirror's rounding.
+    assert ep_staging_bytes(1, 7, 0) == 5248

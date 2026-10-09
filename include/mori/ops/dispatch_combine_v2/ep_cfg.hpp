@@ -163,6 +163,7 @@ struct EpArgs {
   // allocator word in hipExtMallocWithFlags(Uncached) memory shared by IPC handle,
   // used instead of the window's offTokOff. Null (the default) keeps the window.
   int* const* tokOffPeers = nullptr;
+  void* stagingBase = nullptr;  // gfx1250 dispatch staging (EpStagingTotalBytes)
 
   int numTokens = 0;  // tokens this rank contributes this call
 };
@@ -199,6 +200,7 @@ struct EpArgs {
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
   X(tokOffPeers, "p")          \
+  X(stagingBase, "p")          \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -222,7 +224,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 27,
+static_assert(detail::kEpArgsFieldCount == 28,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -424,6 +426,95 @@ constexpr int EpCombine1250xLdsBudget = Ep1250xLdsBytes;
 // combine block_num; the host allocates this many and every call keeps them in step.
 constexpr int EpXdbFlagSlots = 256;
 
+// ---------------------------------------------------------------------------
+// Staging layout for the gfx1250 dispatch kernel.  The six __device__ globals
+// in ep_intranode_1250x.hpp are replaced by one dynamically-allocated buffer;
+// these functions compute the byte offset of each sub-array within it.
+//
+// The buffer is local scratch (not P2P-visible), allocated once per op
+// instance and shared by all dispatch schedule variants (they are mutually
+// exclusive).  Combine does not use it.
+// ---------------------------------------------------------------------------
+constexpr int EpStagingMaxTopk = 16;
+constexpr int EpStagingMaxBlocks = 512;
+
+constexpr size_t EpAlignUp128(size_t x) { return (x + 127) & ~(size_t)127; }
+
+constexpr size_t EpStagingPoolSlots(const EpCfg& c) { return (size_t)c.worldSize * EpMaxRecv(c); }
+
+constexpr size_t EpStagingIdxOffset(const EpCfg&) { return 0; }
+constexpr size_t EpStagingIdxBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * EpStagingMaxTopk * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingWtOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingIdxOffset(c) + EpStagingIdxBytes(c));
+}
+constexpr size_t EpStagingWtBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * EpStagingMaxTopk * sizeof(float);
+}
+
+constexpr size_t EpStagingSrcOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingWtOffset(c) + EpStagingWtBytes(c));
+}
+constexpr size_t EpStagingSrcBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingBlkBaseOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingSrcOffset(c) + EpStagingSrcBytes(c));
+}
+constexpr size_t EpStagingBlkBaseBytes(const EpCfg& c) {
+  return (size_t)EpStagingMaxBlocks * c.worldSize * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingBlkCountOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingBlkBaseOffset(c) + EpStagingBlkBaseBytes(c));
+}
+constexpr size_t EpStagingBlkCountBytes(const EpCfg& c) {
+  return (size_t)EpStagingMaxBlocks * c.worldSize * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingScaleOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingBlkCountOffset(c) + EpStagingBlkCountBytes(c));
+}
+constexpr size_t EpStagingScaleBytes(const EpCfg& c) {
+  return c.scaleBytes <= 0 ? 0 : (size_t)c.worldSize * EpMaxRecv(c) * EpScaleStride(c);
+}
+
+constexpr size_t EpStagingTotalBytes(const EpCfg& c) {
+  size_t tail = EpStagingScaleOffset(c) + EpStagingScaleBytes(c);
+  return tail > 0 ? EpAlignUp128(tail) : 0;
+}
+
+// TEMPORARY. The gfx125x dispatch body also carries the staging as __device__ arrays,
+// so a caller that never binds stagingBase still runs -- aiter's MegaMoE drives
+// EpDispatchPlan directly and does not bind it. Delete the arrays, this predicate and
+// its uses once every caller binds the buffer; nothing else depends on them.
+//
+// Not unconditional, because .bss is reserved per COMPILED VARIANT and every pool here
+// is quadratic in world_size (EpStagingPoolSlots is worldSize * EpMaxRecv, and
+// EpMaxRecv is itself worldSize * maxTokPerRank). Past the budget the module carries
+// the dynamic layout alone and a null base is an error rather than a fallback:
+//     EP8  maxTok   128  ->   3 MiB      EP32 maxTok   128  ->   48 MiB
+//     EP8  maxTok 16384  -> 388 MiB      EP32 maxTok  4096  -> 1.3 GiB  (over)
+constexpr size_t EpStaticStagingBudget = (size_t)1 << 30;
+
+// What the arrays reserve. Their own sizes, NOT EpStagingTotalBytes: the buffer pads
+// each sub-array to 128 B, the arrays are declared individually and are not padded.
+constexpr size_t EpStaticStagingBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * EpStagingMaxTopk * (sizeof(int32_t) + sizeof(float)) +
+         EpStagingPoolSlots(c) * sizeof(int32_t) +
+         (size_t)EpStagingMaxBlocks * c.worldSize * sizeof(int32_t) * 2 + EpStagingScaleBytes(c);
+}
+
+// Whether this Cfg's module has the arrays. ep_intranode_1250x.hpp decides the same
+// thing from the rendered macros (it is reached before kCfg exists) and static_asserts
+// the two agree, so this stays the single answer the host may rely on.
+constexpr bool EpHasStaticStaging(const EpCfg& c) {
+  return EpStaticStagingBytes(c) <= EpStaticStagingBudget;
+}
+
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
 // address, different phases), so its size bounds BOTH -- and the metadata batch
 // size is (slab - headroom) / bytes-per-token.
@@ -484,8 +575,7 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // selfFirst: warp 1 takes this rank's own-token step while warp 0 issues
          // the remote reservations, and one lane per peer publishes what this rank
          // took there. The arrival count packs into 12 bits of the counter word.
-         (!c.selfFirst ||
-          (c.warpPerBlock >= 2 && c.worldSize <= c.waveSize && c.blockNum < 4096));
+         (!c.selfFirst || (c.warpPerBlock >= 2 && c.worldSize <= c.waveSize && c.blockNum < 4096));
 }
 
 }  // namespace v2

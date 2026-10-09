@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -98,6 +99,36 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
   static std::string RenderSource(const Cfg& cfg);
   static mori::jit::v2::LaunchGeometry Geometry(const Cfg& cfg);
   static const std::vector<std::string>& SourceDeps();
+
+  // Shadows KernelSpec::LaunchRaw to fail on the host instead of faulting on the
+  // device. Only the gfx125x body reads stagingBase, and it is the only body with
+  // an LDS budget -- sharedBytes is that same EpArchIs1250() decision, taken once
+  // at Prepare and carried on the plan, so no second arch query is needed here.
+  //
+  // Where EpHasStaticStaging holds, the module carries the .bss staging and a null
+  // base is the documented way to ask for it, so there is nothing to reject.
+  static void LaunchRaw(const Plan& plan, const void* argBuf, size_t argSize, hipStream_t stream) {
+    if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase &&
+        !EpHasStaticStaging(plan.cfg)) {
+      throw std::runtime_error(
+          "ep_dispatch on gfx125x: staging_base was not bound, and this config is past "
+          "EpStaticStagingBudget so the module carries no .bss staging to fall back on. "
+          "Allocate ep_staging_bytes(world_size, max_recv, scale_bytes) bytes and "
+          "plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
+    }
+    // EpStaging*Offset are EpScaleAlign multiples OF THE BASE, so the base owns the
+    // alignment the .bss arrays used to declare themselves. A caller carving staging
+    // out of a pool at an arbitrary offset -- the reason this argument exists -- gets
+    // no fault from a misaligned one, just every staging TDM run off its row. A null
+    // base has remainder 0, so this leaves the fallback above alone.
+    if (plan.geom.sharedBytes > 0 &&
+        reinterpret_cast<uintptr_t>(static_cast<const Args*>(argBuf)->stagingBase) % EpScaleAlign) {
+      throw std::runtime_error(
+          "ep_dispatch on gfx125x: staging_base must be " + std::to_string(EpScaleAlign) +
+          " B aligned -- it is the base every staging sub-array is placed against.");
+    }
+    mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg>::LaunchRaw(plan, argBuf, argSize, stream);
+  }
 };
 
 class EpCombineSpec : public mori::jit::v2::KernelSpec<EpCombineSpec, EpCfg> {
