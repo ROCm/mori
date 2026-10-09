@@ -234,8 +234,11 @@ jobs:
 
       - name: MORI-EP (async_ll IBGDA)
         run: |
+          # NCCL_IB_DISABLE=1: RCCL calls ibv_fork_init() once it detects PeerDirect, and with
+          # fork tracking on, rdma-core fails mlx5 dmabuf umems that sit at a nonzero dmabuf
+          # offset (MORI's sub-allocated CQs). This test never uses RCCL's IB transport.
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 NCCL_IB_DISABLE=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-EP (AUTO tuning config quant types, CPU)
