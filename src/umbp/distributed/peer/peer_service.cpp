@@ -32,8 +32,8 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
-#include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_metrics.h"
+#include "umbp/distributed/metrics/metric_sink.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/pool/peer_pool.h"
@@ -122,7 +122,7 @@ void FillPagesAndDescs(Response* resp, const std::vector<PageLocation>& pages, u
 
 class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Service {
  public:
-  UMBPPeerServiceImpl(PeerPool* pool, MasterClient* master_client,
+  UMBPPeerServiceImpl(PeerPool* pool, MetricSink* metric_sink,
                       const std::vector<uint8_t>& engine_desc_bytes)
       : pool_(pool),
         registry_(pool == nullptr ? nullptr : pool->Backends()),
@@ -133,7 +133,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         // starts this server).
         media_(registry_ == nullptr ? std::vector<MediumBackend*>{} : registry_->All()),
         engine_desc_bytes_(engine_desc_bytes),
-        master_client_(master_client) {}
+        metric_sink_(metric_sink) {}
 
   grpc::Status GetPeerInfo(grpc::ServerContext* /*context*/,
                            const ::umbp::GetPeerInfoRequest* /*request*/,
@@ -440,46 +440,44 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
   const std::vector<MediumBackend*>& Media() const { return media_; }
 
   void RecordInboundPut(uint64_t bytes, const char* traffic) {
-    if (master_client_ == nullptr || bytes == 0) return;
-    MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, labels,
-                               static_cast<double>(bytes));
+    if (metric_sink_ == nullptr || bytes == 0) return;
+    MetricSink::Labels labels = {{"traffic", std::string(traffic)}};
+    metric_sink_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, labels,
+                             static_cast<double>(bytes));
   }
 
   void RecordInboundGet(uint64_t bytes, const char* traffic) {
-    if (master_client_ == nullptr || bytes == 0) return;
-    MasterClient::Labels labels = {{"traffic", std::string(traffic)}};
-    master_client_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
-                               MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, labels,
-                               static_cast<double>(bytes));
+    if (metric_sink_ == nullptr || bytes == 0) return;
+    MetricSink::Labels labels = {{"traffic", std::string(traffic)}};
+    metric_sink_->AddCounter(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
+                             MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, labels,
+                             static_cast<double>(bytes));
   }
 
   PeerPool* pool_;
   BackendRegistry* registry_;
   const std::vector<MediumBackend*> media_;
   const std::vector<uint8_t>& engine_desc_bytes_;
-  MasterClient* master_client_;
+  MetricSink* metric_sink_;
 };
 
 PeerServiceServer::PeerServiceServer(PeerPool& pool, std::vector<uint8_t> engine_desc_bytes,
-                                     MasterClient* master_client)
-    : pool_(&pool),
-      master_client_(master_client),
-      engine_desc_bytes_(std::move(engine_desc_bytes)) {
-  service_ = std::make_unique<UMBPPeerServiceImpl>(pool_, master_client_, engine_desc_bytes_);
+                                     MetricSink* metric_sink)
+    : pool_(&pool), metric_sink_(metric_sink), engine_desc_bytes_(std::move(engine_desc_bytes)) {
+  service_ = std::make_unique<UMBPPeerServiceImpl>(pool_, metric_sink_, engine_desc_bytes_);
 }
 
 PeerServiceServer::PeerServiceServer(BackendRegistry* registry,
                                      std::vector<uint8_t> engine_desc_bytes,
-                                     MasterClient* master_client)
+                                     MetricSink* metric_sink)
     : owned_pool_(registry == nullptr
                       ? nullptr
                       : std::make_unique<PeerPool>(registry, MakeSingleBackendPolicy())),
       pool_(owned_pool_.get()),
-      master_client_(master_client),
+      metric_sink_(metric_sink),
       engine_desc_bytes_(std::move(engine_desc_bytes)) {
-  service_ = std::make_unique<UMBPPeerServiceImpl>(pool_, master_client_, engine_desc_bytes_);
+  service_ = std::make_unique<UMBPPeerServiceImpl>(pool_, metric_sink_, engine_desc_bytes_);
 }
 
 PeerServiceServer::~PeerServiceServer() { Stop(); }

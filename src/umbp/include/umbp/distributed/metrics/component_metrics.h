@@ -107,6 +107,13 @@ namespace mori::umbp {
   "Medium-internal events a backend chose to publish (drive read outcomes, single-flight " \
   "coalescing, eviction rounds, staging pressure), keyed by event"
 
+// The one medium event with a reader outside the dashboards, so its spelling
+// is shared rather than written twice.  A page-backed medium reclaiming to its
+// low watermark frees pages inline instead of calling its own Evict(), so this
+// event -- and not op="evict" -- is the eviction that happened on a node with
+// no master.  The periodic activity summary adds the two together.
+inline constexpr const char* kPageBackendLocalEvictEvent = "local_evict";
+
 #define MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL "mori_umbp_backend_medium_bytes_total"
 #define MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL_HELP                                    \
   "Medium-internal byte counters (e.g. bytes that actually reached the device, as opposed " \
@@ -192,7 +199,9 @@ class MetricSource {
 class MetricPublisher {
  public:
   struct Sink {
-    // delta >= 0, already differenced.  Not called for a zero delta.
+    // delta >= 0, already differenced.  Not called for a zero delta, except
+    // once for a series seen for the first time, so the series exists at 0
+    // before its first event (see Publish).
     std::function<void(const char* name, const char* help, const MetricLabels&, double delta)>
         counter;
     // Current reading, shipped every tick.

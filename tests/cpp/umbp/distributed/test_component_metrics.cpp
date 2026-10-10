@@ -119,6 +119,26 @@ TEST(MetricPublisher, ShipsDeltasNotAbsoluteValues) {
   EXPECT_DOUBLE_EQ(c.Counter(kName), 15.0);
 }
 
+TEST(MetricPublisher, ShipsAFirstSightZeroSoTheSeriesExistsBeforeItsFirstEvent) {
+  FakeSource src;
+  src.samples = {MetricSample{kName, kHelp, {}, 0}};
+
+  MetricPublisher pub;
+  Collector c;
+  pub.Publish("src", {}, src, c.Sink());
+  ASSERT_TRUE(c.Has(kName)) << "a counter seen for the first time must create its series";
+  EXPECT_DOUBLE_EQ(c.Counter(kName), 0.0);
+
+  // Only the first sight: an unchanged zero is not re-shipped every tick.
+  c.counters.clear();
+  pub.Publish("src", {}, src, c.Sink());
+  EXPECT_FALSE(c.Has(kName));
+
+  src.samples[0].value = 4;
+  pub.Publish("src", {}, src, c.Sink());
+  EXPECT_DOUBLE_EQ(c.Counter(kName), 4.0);
+}
+
 TEST(MetricPublisher, RebasesInsteadOfShippingNegativeDeltas) {
   FakeSource src;
   src.samples = {MetricSample{kName, kHelp, {}, 100}};
@@ -341,7 +361,28 @@ TEST_F(InstrumentedBackendMetrics, EvictingAnAbsentKeyIsAMissNotAFailure) {
   backend_->Evict({"never-existed"});
   Publish();
   EXPECT_DOUBLE_EQ(Ops("evict", "miss"), 1.0);
-  EXPECT_DOUBLE_EQ(Ops("evict", "ok"), -1.0) << "no successful eviction should have been reported";
+  EXPECT_DOUBLE_EQ(Ops("evict", "ok"), 0.0) << "no successful eviction should have been reported";
+}
+
+TEST_F(InstrumentedBackendMetrics, EverySeriesExistsAtZeroBeforeItsFirstEvent) {
+  // Prometheus sees an increase only between two samples of one series.  A
+  // series born holding its first count hides that count from rate() and
+  // increase() -- for a rare event such as a no_space, the whole event.
+  Publish();
+  EXPECT_DOUBLE_EQ(Ops("allocate", "no_space"), 0.0);
+  EXPECT_DOUBLE_EQ(Ops("commit", "failed"), 0.0);
+  EXPECT_DOUBLE_EQ(Ops("resolve", "miss"), 0.0);
+  EXPECT_DOUBLE_EQ(Ops("evict", "ok"), 0.0);
+  EXPECT_DOUBLE_EQ(Bytes("evict"), 0.0);
+  EXPECT_DOUBLE_EQ(Batches("abort"), 0.0);
+  // ...but only the pairs an op can produce: an abort never runs out of space.
+  EXPECT_DOUBLE_EQ(Ops("abort", "no_space"), -1.0);
+  EXPECT_DOUBLE_EQ(Bytes("allocate"), -1.0);
+
+  // The first event then arrives as an increment on an existing series.
+  PutKey("k", 4096);
+  Publish();
+  EXPECT_DOUBLE_EQ(Ops("commit", "ok"), 1.0);
 }
 
 TEST_F(InstrumentedBackendMetrics, RecordsTimeSpentInsideTheMedium) {
@@ -458,15 +499,25 @@ TEST(TransferEngineMetrics, CountsItemsNoEngineWouldTake) {
 
 TEST(TransferEngineMetrics, AnEngineNeedsNoMetricsCodeToBeMeasured) {
   // The composite is the measurement point precisely so an engine can be added
-  // with AddEngine() alone.  An engine registered but never used reports
-  // nothing rather than a row of zeros, keeping the series set honest.
+  // with AddEngine() alone.  An engine registered but never used reports its
+  // series at zero, so its first transfer -- or first failure -- is an
+  // increment Prometheus can see rather than the value a series is born with.
   CompositeTransferEngine composite;
   composite.AddEngine(std::make_unique<LocalCopyEngine>());
 
   MetricPublisher pub;
   Collector c;
   pub.Publish("transfer", {}, composite, c.Sink());
-  EXPECT_TRUE(c.counters.empty());
+  ASSERT_FALSE(c.counters.empty());
+  for (const auto& [identity, value] : c.counters) EXPECT_DOUBLE_EQ(value, 0.0) << identity;
+
+  const MetricLabels failed = {
+      {"engine", "LocalCopyEngine"}, {"direction", "local"}, {"status", "failed"}};
+  EXPECT_DOUBLE_EQ(c.Counter(Identity(MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL, failed)), 0.0);
+  EXPECT_DOUBLE_EQ(
+      c.Counter(Identity(MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
+                         {{"engine", "none"}, {"direction", "none"}, {"status", "rejected"}})),
+      0.0);
 }
 
 }  // namespace
