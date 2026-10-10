@@ -36,9 +36,11 @@ ascending, and ``lookup`` merges the two into the op's
 An unswept shape returns schedule=None and the single-shot default below. Add one by
 sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
 
-dtype keys are whatever ``EpDispatchCombineConfig.dtype_str`` produces, hence
-"fp4_disp_bf16_comb": hip rejects an fp4 combine outright, so an fp4 dispatch here is
-always paired with bf16 -- which is the configuration the sweep measured.
+Dispatch dtype keys name only what dispatch transports: "bf16", "fp8", "fp4". The
+combine side has no dtype here -- it always reduces bf16 rows, and whether those go
+out as mxfp4 is ``quant_type``'s table. ``EpDispatchCombineConfig.dtype_str`` still
+says "fp4_disp_bf16_comb" for an fp4 dispatch (FlyDSL's table needs both halves), so
+``lookup`` reads that as "fp4".
 """
 
 from __future__ import annotations
@@ -97,11 +99,11 @@ _DISPATCH_TABLE: dict = {
     "mi355x": {
         (8, 7168, 8, None): {
             None: ((None, 64, 8),),
-            "fp4_disp_bf16_comb": ((None, 128, 8),),
+            "fp4": ((None, 128, 8),),
         },
         (8, 7168, 6, None): {
             None: ((None, 64, 8),),
-            "fp4_disp_bf16_comb": ((None, 128, 8),),
+            "fp4": ((None, 128, 8),),
         },
     },
     # 4x gfx1250 at EP4, hidden 7168, 2026-08-11. topk moves the edges (it sets _tpi),
@@ -125,7 +127,7 @@ _DISPATCH_TABLE: dict = {
         # grouped/random routing: 135.2/183.3 against 256x8's 150.3/191.1).
         (4, 7168, 9, None): {
             None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
-            "fp4_disp_bf16_comb": (
+            "fp4": (
                 (512, 64, 8),
                 (1536, 192, 8),
                 (4096, 256, 8),
@@ -140,7 +142,7 @@ _DISPATCH_TABLE: dict = {
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
         (4, 7168, 6, None): {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
-            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
@@ -163,7 +165,7 @@ _DISPATCH_TABLE: dict = {
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((2048, 64, 16), (None, 128, 16)),
-            "fp4_disp_bf16_comb": (
+            "fp4": (
                 (1024, 64, 16),
                 (1536, 64, 24),
                 (2048, 64, 32),
@@ -276,6 +278,10 @@ def _merge(disp, comb):
     return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
 
 
+# dtype_str names both halves; the dispatch table is keyed by the dispatch wire alone.
+_DISPATCH_DTYPE_ALIAS = {"fp4_disp_bf16_comb": "fp4"}
+
+
 def lookup(
     world_size,
     hidden_dim,
@@ -311,7 +317,7 @@ def lookup(
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.
-    disp = disp.get(dtype) or disp.get(None)
+    disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
     if disp is None:
         return base
     base["schedule"] = _merge(disp, comb)
