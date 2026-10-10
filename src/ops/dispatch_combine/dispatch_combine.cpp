@@ -172,10 +172,11 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
     if (config.worldSize > config.gpuPerNode &&
         (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
       throw std::runtime_error(
-          std::string(kDisableRdmaAtomicsEnv) + " is set, but kernelType=" +
-          std::to_string(static_cast<int>(config.kernelType)) +
+          std::string(kDisableRdmaAtomicsEnv) +
+          " is set, but kernelType=" + std::to_string(static_cast<int>(config.kernelType)) +
           " (InterNode v0 / AsyncLL) still signals with RDMA atomics. Use InterNodeV1 or "
-          "InterNodeV1LL, or unset " + kDisableRdmaAtomicsEnv + ".");
+          "InterNodeV1LL, or unset " +
+          kDisableRdmaAtomicsEnv + ".");
     }
     // A WRITE signal is only ordered after its data by in-order PCIe placement; an atomic's
     // read-modify-write at the target flushes prior writes, a WRITE does not.
@@ -585,8 +586,8 @@ void EpDispatchCombineHandle::InitializeBarrier() {
   // The atomic-free InterNodeV1 barrier keeps one slot per (sender rank, qp) after the
   // worldSize per-rank slots, so it never aliases the intra-node barrier slots.
   size_t crossDeviceBarrierSize =
-      std::max(barrierSize * 2 * sizeof(uint64_t), static_cast<size_t>(config.worldSize) *
-                                                       (1 + config.numQpPerPe) * sizeof(uint64_t));
+      std::max(barrierSize * 2 * sizeof(uint64_t),
+               static_cast<size_t>(config.worldSize) * (1 + config.numQpPerPe) * sizeof(uint64_t));
   crossDeviceBarrierMemObj = MallocSymm(crossDeviceBarrierSize, hipDeviceMallocUncached);
 
   size_t interNodeChunkFlagSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
