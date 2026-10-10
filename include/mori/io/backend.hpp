@@ -193,6 +193,10 @@ class Backend {
   virtual bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                         TransferStatus* status) = 0;
 
+  // Takes the oldest pending peer failure, if the backend can detect them.
+  // Backends over a local interconnect have no peer to lose and report none.
+  virtual bool PopPeerFailure(PeerFailureEvent* /*out*/) { return false; }
+
   virtual bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const { return true; }
 };
 

@@ -1,5 +1,6 @@
 set(MORI_IO_SOURCES
     engine.cpp
+    peer_failure_tracker.cpp
     rdma/protocol.cpp
     rdma/backend_impl.cpp
     rdma/async_event_monitor.cpp

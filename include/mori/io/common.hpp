@@ -34,6 +34,7 @@
 #include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/io/enum.hpp"
 #include "mori/io/msgpack_adaptor.hpp"
+#include "mori/io/peer_failure.hpp"
 
 namespace mori {
 namespace io {

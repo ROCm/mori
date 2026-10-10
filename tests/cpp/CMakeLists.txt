@@ -89,6 +89,12 @@ if(BUILD_IO)
     target_link_libraries(test_fault_injection mori_application mori_io)
   endif()
 
+  add_executable(test_peer_failure io/test_peer_failure.cpp)
+
+  target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_peer_failure mori_application mori_io)
+
   add_executable(test_topology application/test_topology.cpp)
 
   target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)
