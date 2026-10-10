@@ -25,9 +25,13 @@
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 
 #include "mori/application/transport/rdma/providers/mlx5/mlx5_ifc.hpp"
@@ -86,143 +90,193 @@ void Mlx5UnregisterUarHost(void* reg_addr) {
   }
 }
 
-// Dmabuf registration mode for the mlx5 devx provider (control-ring umems AND
-// the atomic ibuf MR), from MORI_MLX5_DMABUF: "auto" (default) tries dmabuf
-// then falls back to peermem; "force" requires dmabuf and aborts if it is
-// unavailable; "off" disables dmabuf entirely (peermem only).
-//
-// Independent of MORI_ENABLE_DMABUF_REG, which lives in the vendor-agnostic
-// RDMA layer and flips the try-order in RegisterRdmaMemoryRegionAuto (the
-// generic payload MR path used by all providers). Setting MORI_MLX5_DMABUF=off
-// disables dmabuf only in this mlx5-specific codepath; MORI_ENABLE_DMABUF_REG
-// still controls the generic payload path, and vice versa.
-enum class Mlx5DmabufMode { kAuto, kForce, kOff };
+// GPU-resident control structures (CQ/WQ rings, their doorbell records and the atomic ibuf)
+// are registered one way for the whole process, never mixed per buffer. They are small
+// allocations that ROCr packs into shared BOs, and amdgpu refuses to pin a BO that is already
+// pinned elsewhere: peermem pins it in VRAM, while dmabuf pins it in GTT unless amdgpu can do
+// PCIe P2P to the NIC (CONFIG_PCI_P2PDMA, and for some amdgpu versions also
+// CONFIG_DMABUF_MOVE_NOTIFY), so mixing the two fails whichever buffer registers second.
+enum class Mlx5GpuRegMode { kPeerMem, kDmabuf };
 
-Mlx5DmabufMode GetMlx5DmabufMode() {
-  static const Mlx5DmabufMode mode = []() {
-    std::optional<std::string> v = mori::env::GetString("MORI_MLX5_DMABUF");
-    if (!v.has_value()) return Mlx5DmabufMode::kAuto;
-    if (*v == "force" || *v == "1") return Mlx5DmabufMode::kForce;
-    if (*v == "off" || *v == "0") return Mlx5DmabufMode::kOff;
-    return Mlx5DmabufMode::kAuto;
-  }();
+// ROCr gives an allocation of whole 2 MiB units a BO of its own, starting at dmabuf offset 0.
+constexpr size_t kMlx5OwnBoSize = 2 * 1024 * 1024;
+// A doorbell record shares its ring's umem, right after the ring.
+constexpr size_t kMlx5DbrSize = 64;
+
+// Both dmabuf registrations return nullptr with errno set on failure. `*offset` reports where
+// `addr` sits inside its dmabuf, and a umem must sit at offset 0: rdma-core hands a dmabuf
+// umem's offset to ibv_dontfork_range() as if it were an address, which fails for any nonzero
+// offset once a library has called ibv_fork_init() -- RCCL does whenever it brings up its IB
+// transport.
+mlx5dv_devx_umem* Mlx5RegisterDmabufUmem(ibv_context* context, void* addr, size_t size,
+                                         uint32_t accessFlag, uint64_t* offset) {
+  *offset = 0;
+  int dmabufFd =
+      Mlx5DvApi::Instance().devx_umem_reg_ex ? TryExportDmabufFd(addr, size, offset) : -1;
+  if (dmabufFd < 0) {
+    errno = EOPNOTSUPP;
+    return nullptr;
+  }
+  if (*offset != 0) {
+    close(dmabufFd);
+    errno = EINVAL;
+    return nullptr;
+  }
+  MoriMlx5DevxUmemIn in{};
+  in.addr = reinterpret_cast<void*>(*offset);  // dmabuf-relative byte offset
+  in.size = size;
+  in.access = accessFlag;
+  // Bitmap of allowed log2 page sizes (not a page size); mirror rdma-core's
+  // peermem path (all sizes >= 4K). sysconf() sets one bit and breaks 64K hosts.
+  in.pgsz_bitmap = ~((1ULL << MLX5_ADAPTER_PAGE_SHIFT) - 1);
+  in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
+  in.dmabuf_fd = dmabufFd;
+  mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
+  int err = errno;  // capture before close() overwrites it
+  close(dmabufFd);
+  errno = err;
+  return umem;
+}
+
+ibv_mr* Mlx5RegisterDmabufMr(ibv_pd* pd, void* addr, size_t size, int accessFlag) {
+  uint64_t offset = 0;
+  int dmabufFd = TryExportDmabufFd(addr, size, &offset);
+  if (dmabufFd < 0) {
+    errno = EOPNOTSUPP;
+    return nullptr;
+  }
+  ibv_mr* mr =
+      ibv_reg_dmabuf_mr(pd, offset, size, reinterpret_cast<uint64_t>(addr), dmabufFd, accessFlag);
+  int err = errno;
+  close(dmabufFd);
+  errno = err;
+  return mr;
+}
+
+// MORI_MLX5_DMABUF forces a mode ("force"/"1" = dmabuf, "off"/"0" = peermem); otherwise it is
+// probed once. It covers only these control structures: MORI_ENABLE_DMABUF_REG separately orders
+// the generic payload MR path (RegisterRdmaMemoryRegionAuto). peermem wins when both work:
+// dmabuf may pin into GTT (see above), moving the rings out of VRAM, and costs every ring a BO
+// of its own (see Mlx5AllocControlUmemBuf).
+Mlx5GpuRegMode ProbeMlx5GpuRegMode(ibv_context* context) {
+  std::optional<std::string> forced = mori::env::GetString("MORI_MLX5_DMABUF");
+  if (forced && (*forced == "force" || *forced == "1")) return Mlx5GpuRegMode::kDmabuf;
+  if (forced && (*forced == "off" || *forced == "0")) return Mlx5GpuRegMode::kPeerMem;
+
+  constexpr size_t kProbeSize = 4096;
+  void* scratch = nullptr;
+  HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&scratch, kMlx5OwnBoSize, hipDeviceMallocUncached));
+
+  auto tryRegister = [](mlx5dv_devx_umem* umem) {
+    if (umem == nullptr) return errno;
+    Mlx5DvApi::Instance().devx_umem_dereg(umem);
+    return 0;
+  };
+  int peermemErr = tryRegister(
+      Mlx5DvApi::Instance().devx_umem_reg(context, scratch, kProbeSize, IBV_ACCESS_LOCAL_WRITE));
+  int dmabufErr = 0;
+  if (peermemErr != 0) {
+    uint64_t offset = 0;
+    dmabufErr = tryRegister(
+        Mlx5RegisterDmabufUmem(context, scratch, kProbeSize, IBV_ACCESS_LOCAL_WRITE, &offset));
+  }
+  HIP_RUNTIME_CHECK(hipFree(scratch));
+
+  if (peermemErr == 0) return Mlx5GpuRegMode::kPeerMem;
+  if (dmabufErr == 0) return Mlx5GpuRegMode::kDmabuf;
+  MORI_APP_ERROR(
+      "MLX5: neither peermem (errno={} ({})) nor dmabuf (errno={} ({})) can register GPU "
+      "memory with this NIC; set MORI_MLX5_DMABUF to force one and see its error",
+      peermemErr, strerror(peermemErr), dmabufErr, strerror(dmabufErr));
+  std::abort();
+}
+
+Mlx5GpuRegMode GetMlx5GpuRegMode(ibv_context* context) {
+  static std::once_flag once;
+  static Mlx5GpuRegMode mode = Mlx5GpuRegMode::kPeerMem;
+  std::call_once(once, [context] {
+    mode = ProbeMlx5GpuRegMode(context);
+    MORI_APP_INFO("MLX5 GPU control structures register via {}",
+                  mode == Mlx5GpuRegMode::kPeerMem ? "peermem" : "dmabuf");
+  });
   return mode;
 }
 
-// Register a GPU control-ring umem, preferring dmabuf (peermem-free, works under
-// KVM) and falling back to virtual-address (peermem) registration. `addr` is the
-// GPU VA of the ring; `what` is a short tag for logging. Aborts only when
-// registration truly fails (force-mode without dmabuf, or the fallback also fails).
-mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, void* addr, size_t size,
-                                          uint32_t accessFlag, const char* what) {
-  Mlx5DmabufMode mode = GetMlx5DmabufMode();
-
-  if (mode != Mlx5DmabufMode::kOff) {
-    const char* unavailable = nullptr;  // reason for the force-mode abort below
-    if (Mlx5DvApi::Instance().devx_umem_reg_ex == nullptr) {
-      unavailable = "mlx5dv_devx_umem_reg_ex missing (rdma-core too old)";
-    } else {
-      uint64_t dmabufOffset = 0;
-      int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
-      if (dmabufFd >= 0) {
-        MoriMlx5DevxUmemIn in{};
-        in.addr = reinterpret_cast<void*>(dmabufOffset);  // dmabuf-relative byte offset
-        in.size = size;
-        in.access = accessFlag;
-        // Bitmap of allowed log2 page sizes (not a page size); mirror rdma-core's
-        // peermem path (all sizes >= 4K). sysconf() sets one bit and breaks 64K hosts.
-        in.pgsz_bitmap = ~((1ULL << MLX5_ADAPTER_PAGE_SHIFT) - 1);
-        in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
-        in.dmabuf_fd = dmabufFd;
-        mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
-        int err = errno;  // capture before close() overwrites it
-        close(dmabufFd);
-        if (umem) {
-          MORI_APP_TRACE(
-              "MLX5 control umem [{}] registered via dmabuf: addr=0x{:x}, size={}, offset={}", what,
-              reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
-          return umem;
-        }
-        MORI_APP_TRACE(
-            "MLX5 control umem [{}] dmabuf registration failed (addr=0x{:x}, size={}, errno={} "
-            "({}))",
-            what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
-        unavailable = "dmabuf registration failed";
-      } else {
-        MORI_APP_TRACE("MLX5 control umem [{}] dmabuf export unavailable (addr=0x{:x}, size={})",
-                       what, reinterpret_cast<uintptr_t>(addr), size);
-        unavailable = "dmabuf export unavailable";
-      }
-    }
-
-    // Force must abort even when the symbol is missing, else it silently downgrades
-    // to peermem on the old-rdma-core case it is meant to catch.
-    if (mode == Mlx5DmabufMode::kForce) {
-      MORI_APP_ERROR(
-          "MLX5 control umem [{}] dmabuf required (MORI_MLX5_DMABUF=force) but "
-          "unavailable: {}; aborting",
-          what, unavailable);
-      std::abort();
-    }
+void Mlx5FillControlBuf(bool onGpu, void* ptr, int value, size_t size) {
+  if (onGpu) {
+    HIP_RUNTIME_CHECK(hipMemset(ptr, value, size));
+  } else {
+    memset(ptr, value, size);
   }
+}
 
-  mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg(context, addr, size, accessFlag);
-  if (umem == nullptr) {
-    int err = errno;
+void* Mlx5AllocControlBuf(bool onGpu, size_t size, size_t alignment) {
+  void* ptr = nullptr;
+  if (onGpu) {
+    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&ptr, size, hipDeviceMallocUncached));
+  } else {
+    [[maybe_unused]] int status = posix_memalign(&ptr, alignment, size);
+    assert(status == 0);
+  }
+  Mlx5FillControlBuf(onGpu, ptr, 0, size);
+  return ptr;
+}
+
+// A dmabuf-mode umem must sit at dmabuf offset 0 (see Mlx5RegisterDmabufUmem), so round it up
+// to a BO of its own.
+void* Mlx5AllocControlUmemBuf(ibv_context* context, bool onGpu, size_t size, size_t alignment) {
+  if (onGpu && GetMlx5GpuRegMode(context) == Mlx5GpuRegMode::kDmabuf)
+    size = (size + kMlx5OwnBoSize - 1) / kMlx5OwnBoSize * kMlx5OwnBoSize;
+  return Mlx5AllocControlBuf(onGpu, size, alignment);
+}
+
+void Mlx5FreeControlBuf(bool onGpu, void* ptr) {
+  if (ptr == nullptr) return;
+  if (onGpu) {
+    HIP_RUNTIME_CHECK(hipFree(ptr));
+  } else {
+    free(ptr);
+  }
+}
+
+[[noreturn]] void Mlx5AbortRegistration(const char* kind, const char* what, const char* how,
+                                        void* addr, size_t size, int err,
+                                        uint64_t dmabufOffset = 0) {
+  MORI_APP_ERROR("MLX5 {} [{}] {} registration failed (addr=0x{:x}, size={}, errno={} ({}))", kind,
+                 what, how, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
+  if (dmabufOffset != 0) {
     MORI_APP_ERROR(
-        "MLX5 control umem [{}] peermem registration failed (addr=0x{:x}, size={}, errno={} ({})); "
-        "dmabuf and peermem both failed - is a peer-mem module loaded?",
-        what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
-    return nullptr;
+        "MLX5 {} [{}] sits at dmabuf offset 0x{:x}; a dmabuf umem must start its own BO, since "
+        "rdma-core fails it at a nonzero offset once ibv_fork_init() has run",
+        kind, what, dmabufOffset);
   }
-  MORI_APP_TRACE("MLX5 control umem [{}] registered via peermem: addr=0x{:x}, size={}", what,
+  std::abort();
+}
+
+// Host memory, and GPU memory in peermem mode, register by virtual address. Both helpers abort
+// on failure: there is deliberately no second mechanism to fall back to.
+mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, bool onGpu, void* addr, size_t size,
+                                          const char* what) {
+  const bool dmabuf = onGpu && GetMlx5GpuRegMode(context) == Mlx5GpuRegMode::kDmabuf;
+  const char* how = dmabuf ? "dmabuf" : onGpu ? "peermem" : "host";
+  uint64_t offset = 0;
+  mlx5dv_devx_umem* umem =
+      dmabuf ? Mlx5RegisterDmabufUmem(context, addr, size, IBV_ACCESS_LOCAL_WRITE, &offset)
+             : Mlx5DvApi::Instance().devx_umem_reg(context, addr, size, IBV_ACCESS_LOCAL_WRITE);
+  if (umem == nullptr) Mlx5AbortRegistration("control umem", what, how, addr, size, errno, offset);
+  MORI_APP_TRACE("MLX5 control umem [{}] registered via {}: addr=0x{:x}, size={}", what, how,
                  reinterpret_cast<uintptr_t>(addr), size);
   return umem;
 }
 
-// Register an ibv MR for GPU memory, preferring dmabuf and falling back to
-// plain ibv_reg_mr (peermem). Respects the MORI_MLX5_DMABUF knob.
-ibv_mr* Mlx5RegisterMrDmabuf(ibv_pd* pd, void* addr, size_t size, int accessFlag,
-                             const char* what) {
-  Mlx5DmabufMode mode = GetMlx5DmabufMode();
-
-  if (mode != Mlx5DmabufMode::kOff) {
-    uint64_t dmabufOffset = 0;
-    int dmabufFd = TryExportDmabufFd(addr, size, &dmabufOffset);
-    if (dmabufFd >= 0) {
-      ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(addr),
-                                     dmabufFd, accessFlag);
-      close(dmabufFd);
-      if (mr) {
-        MORI_APP_TRACE("MLX5 MR [{}] registered via dmabuf: addr=0x{:x}, size={}, offset={}", what,
-                       reinterpret_cast<uintptr_t>(addr), size, dmabufOffset);
-        return mr;
-      }
-      MORI_APP_TRACE("MLX5 MR [{}] dmabuf registration failed (addr=0x{:x}, size={})", what,
-                     reinterpret_cast<uintptr_t>(addr), size);
-    } else {
-      MORI_APP_TRACE("MLX5 MR [{}] dmabuf export unavailable (addr=0x{:x}, size={})", what,
-                     reinterpret_cast<uintptr_t>(addr), size);
-    }
-    if (mode == Mlx5DmabufMode::kForce) {
-      MORI_APP_ERROR(
-          "MLX5 MR [{}] dmabuf required (MORI_MLX5_DMABUF=force) but unavailable; "
-          "aborting",
-          what);
-      std::abort();
-    }
-  }
-
-  ibv_mr* mr = ibv_reg_mr(pd, addr, size, accessFlag);
-  if (mr == nullptr) {
-    int err = errno;
-    MORI_APP_ERROR(
-        "MLX5 MR [{}] peermem registration failed (addr=0x{:x}, size={}, errno={} ({})); "
-        "dmabuf and peermem both failed - is a peer-mem module loaded?",
-        what, reinterpret_cast<uintptr_t>(addr), size, err, strerror(err));
-    return nullptr;
-  }
-  MORI_APP_TRACE("MLX5 MR [{}] registered via peermem: addr=0x{:x}, size={}", what,
+ibv_mr* Mlx5RegisterControlMr(ibv_context* context, ibv_pd* pd, bool onGpu, void* addr, size_t size,
+                              int accessFlag, const char* what) {
+  const bool dmabuf = onGpu && GetMlx5GpuRegMode(context) == Mlx5GpuRegMode::kDmabuf;
+  const char* how = dmabuf ? "dmabuf" : onGpu ? "peermem" : "host";
+  ibv_mr* mr = dmabuf ? Mlx5RegisterDmabufMr(pd, addr, size, accessFlag)
+                      : ibv_reg_mr(pd, addr, size, accessFlag);
+  if (mr == nullptr) Mlx5AbortRegistration("MR", what, how, addr, size, errno);
+  MORI_APP_TRACE("MLX5 MR [{}] registered via {}: addr=0x{:x}, size={}", what, how,
                  reinterpret_cast<uintptr_t>(addr), size);
   return mr;
 }
@@ -282,43 +336,13 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
   // TODO: adjust cqe_num after aligning?
   cqSize = (cqSize + config.alignment - 1) / config.alignment * config.alignment;
 
+  const size_t cqUmemSize = cqSize + kMlx5DbrSize;
+  cqUmemAddr = Mlx5AllocControlUmemBuf(context, config.onGpu, cqUmemSize, config.alignment);
+  cqDbrUmemAddr = static_cast<char*>(cqUmemAddr) + cqSize;
   // Init CQ buffer to 0xff so wqe_counter reads 0xffff ("nothing completed")
   // until the NIC writes a real completion (zero-init would look like WQE 0 done).
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&cqUmemAddr, cqSize, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(cqUmemAddr, 0xff, cqSize));
-  } else {
-    int status = posix_memalign(&cqUmemAddr, config.alignment, cqSize);
-    memset(cqUmemAddr, 0xff, cqSize);
-    assert(!status);
-  }
-
-  if (config.onGpu) {
-    cqUmem = Mlx5RegisterControlUmem(context, cqUmemAddr, cqSize, IBV_ACCESS_LOCAL_WRITE, "cq");
-  } else {
-    cqUmem =
-        Mlx5DvApi::Instance().devx_umem_reg(context, cqUmemAddr, cqSize, IBV_ACCESS_LOCAL_WRITE);
-  }
-  assert(cqUmem);
-
-  // Allocate user memory for CQ DBR (doorbell?)
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&cqDbrUmemAddr, 8, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(cqDbrUmemAddr, 0, 8));
-  } else {
-    int status = posix_memalign(&cqDbrUmemAddr, 8, 8);
-    memset(cqDbrUmemAddr, 0, 8);
-    assert(!status);
-  }
-
-  if (config.onGpu) {
-    cqDbrUmem =
-        Mlx5RegisterControlUmem(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE, "cq_dbr");
-  } else {
-    cqDbrUmem =
-        Mlx5DvApi::Instance().devx_umem_reg(context, cqDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
-  }
-  assert(cqDbrUmem);
+  Mlx5FillControlBuf(config.onGpu, cqUmemAddr, 0xff, cqSize);
+  cqUmem = Mlx5RegisterControlUmem(context, config.onGpu, cqUmemAddr, cqUmemSize, "cq");
 
   // Allocate user access region
   uar = Mlx5DvApi::Instance().devx_alloc_uar(context, MLX5DV_UAR_ALLOC_TYPE_NC);
@@ -331,7 +355,8 @@ Mlx5CqContainer::Mlx5CqContainer(ibv_context* context, const RdmaEndpointConfig&
 
   void* cq_context = DEVX_ADDR_OF(create_cq_in, cmd_in, cq_context);
   DEVX_SET(cqc, cq_context, dbr_umem_valid, 0x1);
-  DEVX_SET(cqc, cq_context, dbr_umem_id, cqDbrUmem->umem_id);
+  DEVX_SET(cqc, cq_context, dbr_umem_id, cqUmem->umem_id);
+  DEVX_SET64(cqc, cq_context, dbr_addr, cqSize);  // Byte offset into dbr_umem_id
   // Collapsed CQ: cc=1 collapses all completions into CQE slot 0, oi=1 ignores
   // overrun (no CQ consumer doorbell); progress is tracked via CQE[0].wqe_counter.
   // cqe_sz=0 selects 64B CQEs.
@@ -364,24 +389,10 @@ Mlx5CqContainer::~Mlx5CqContainer() {
     cq = nullptr;
   }
   if (cqUmem) Mlx5DvApi::Instance().devx_umem_dereg(cqUmem);
-  if (cqDbrUmem) Mlx5DvApi::Instance().devx_umem_dereg(cqDbrUmem);
   if (uar) Mlx5DvApi::Instance().devx_free_uar(uar);
-  if (cqUmemAddr) {
-    if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipFree(cqUmemAddr));
-    } else {
-      free(cqUmemAddr);
-    }
-    cqUmemAddr = nullptr;
-  }
-  if (cqDbrUmemAddr) {
-    if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipFree(cqDbrUmemAddr));
-    } else {
-      free(cqDbrUmemAddr);
-    }
-    cqDbrUmemAddr = nullptr;
-  }
+  Mlx5FreeControlBuf(config.onGpu, cqUmemAddr);
+  cqUmemAddr = nullptr;
+  cqDbrUmemAddr = nullptr;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -426,7 +437,6 @@ void Mlx5QpContainer::ComputeQueueAttrs(const RdmaEndpointConfig& config) {
 }
 
 void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
-  int status = 0;
   uint8_t cmd_in[DEVX_ST_SZ_BYTES(create_qp_in)] = {
       0,
   };
@@ -434,69 +444,23 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
       0,
   };
 
-  // Allocate user memory for QP
+  // Allocate user memory for QP: the RQ and SQ, then the doorbell record
+  const size_t qpDbrOffset =
+      (rqAttrs.wqSize + sqAttrs.wqSize + kMlx5DbrSize - 1) / kMlx5DbrSize * kMlx5DbrSize;
+  const size_t qpUmemSize = std::max(qpTotalSize, qpDbrOffset + kMlx5DbrSize);
+  qpUmemAddr = Mlx5AllocControlUmemBuf(context, config.onGpu, qpUmemSize, config.alignment);
+  qpDbrUmemAddr = static_cast<char*>(qpUmemAddr) + qpDbrOffset;
+  qpUmem = Mlx5RegisterControlUmem(context, config.onGpu, qpUmemAddr, qpUmemSize, "wq");
 
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&qpUmemAddr, qpTotalSize, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(qpUmemAddr, 0, qpTotalSize));
-  } else {
-    status = posix_memalign(&qpUmemAddr, config.alignment, qpTotalSize);
-    memset(qpUmemAddr, 0, qpTotalSize);
-    assert(!status);
-  }
-
-  if (config.onGpu) {
-    qpUmem =
-        Mlx5RegisterControlUmem(context, qpUmemAddr, qpTotalSize, IBV_ACCESS_LOCAL_WRITE, "wq");
-  } else {
-    qpUmem = Mlx5DvApi::Instance().devx_umem_reg(context, qpUmemAddr, qpTotalSize,
-                                                 IBV_ACCESS_LOCAL_WRITE);
-  }
-  assert(qpUmem);
-
-  // Allocate user memory for DBR (doorbell?)
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(hipExtMallocWithFlags(&qpDbrUmemAddr, 8, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(qpDbrUmemAddr, 0, 8));
-  } else {
-    status = posix_memalign(&qpDbrUmemAddr, 8, 8);
-    memset(qpDbrUmemAddr, 0, 8);
-    assert(!status);
-  }
-
-  if (config.onGpu) {
-    qpDbrUmem =
-        Mlx5RegisterControlUmem(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE, "wq_dbr");
-  } else {
-    qpDbrUmem =
-        Mlx5DvApi::Instance().devx_umem_reg(context, qpDbrUmemAddr, 8, IBV_ACCESS_LOCAL_WRITE);
-  }
-  assert(qpDbrUmem);
-
-  // Allocate and register atomic internal buffer (ibuf)
+  // Allocate and register atomic internal buffer (ibuf) as an independent memory region
   atomicIbufSize = (RoundUpPowOfTwo(config.atomicIbufSlots) + 1) * ATOMIC_IBUF_SLOT_SIZE;
-  if (config.onGpu) {
-    HIP_RUNTIME_CHECK(
-        hipExtMallocWithFlags(&atomicIbufAddr, atomicIbufSize, hipDeviceMallocUncached));
-    HIP_RUNTIME_CHECK(hipMemset(atomicIbufAddr, 0, atomicIbufSize));
-  } else {
-    status = posix_memalign(&atomicIbufAddr, config.alignment, atomicIbufSize);
-    memset(atomicIbufAddr, 0, atomicIbufSize);
-    assert(!status);
-  }
-
-  // Register atomic ibuf as independent memory region
+  atomicIbufAddr = Mlx5AllocControlBuf(config.onGpu, atomicIbufSize, config.alignment);
   int atomicIbufAccessFlag =
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  if (config.onGpu) {
-    atomicIbufMr = Mlx5RegisterMrDmabuf(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
-                                        atomicIbufAccessFlag, "atomic_ibuf");
-  } else {
-    atomicIbufMr = ibv_reg_mr(device_context->GetIbvPd(), atomicIbufAddr, atomicIbufSize,
-                              atomicIbufAccessFlag);
-  }
-  assert(atomicIbufMr);
+  atomicIbufMr =
+      Mlx5RegisterControlMr(context, device_context->GetIbvPd(), config.onGpu, atomicIbufAddr,
+                            atomicIbufSize, atomicIbufAccessFlag, "atomic_ibuf");
 
   MORI_APP_TRACE(
       "MLX5 Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
@@ -539,10 +503,9 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
   DEVX_SET(qpc, qp_context, ts_format, 0x1);
   DEVX_SET(qpc, qp_context, cs_req, 0);
   DEVX_SET(qpc, qp_context, cs_res, 0);
-  DEVX_SET(qpc, qp_context, dbr_umem_valid, 0x1);  // Enable dbr_umem_id
-  DEVX_SET64(qpc, qp_context, dbr_addr,
-             0);  // Offset of dbr_umem_id (behavior changed because of dbr_umem_valid)
-  DEVX_SET(qpc, qp_context, dbr_umem_id, qpDbrUmem->umem_id);  // DBR buffer
+  DEVX_SET(qpc, qp_context, dbr_umem_valid, 0x1);      // Enable dbr_umem_id
+  DEVX_SET64(qpc, qp_context, dbr_addr, qpDbrOffset);  // Byte offset into dbr_umem_id
+  DEVX_SET(qpc, qp_context, dbr_umem_id, qpUmem->umem_id);
   DEVX_SET(qpc, qp_context, page_offset, 0);
 
   qp = Mlx5DvApi::Instance().devx_obj_create(context, cmd_in, sizeof(cmd_in), cmd_out,
@@ -570,31 +533,11 @@ void Mlx5QpContainer::DestroyQueuePair() {
     ibv_dereg_mr(atomicIbufMr);
     atomicIbufMr = nullptr;
   }
-  if (atomicIbufAddr) {
-    if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipFree(atomicIbufAddr));
-    } else {
-      free(atomicIbufAddr);
-    }
-    atomicIbufAddr = nullptr;
-  }
+  Mlx5FreeControlBuf(config.onGpu, atomicIbufAddr);
+  atomicIbufAddr = nullptr;
 
   if (qpUmem) Mlx5DvApi::Instance().devx_umem_dereg(qpUmem);
-  if (qpUmemAddr) {
-    if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipFree(qpUmemAddr));
-    } else {
-      free(qpUmemAddr);
-    }
-  }
-  if (qpDbrUmem) Mlx5DvApi::Instance().devx_umem_dereg(qpDbrUmem);
-  if (qpDbrUmemAddr) {
-    if (config.onGpu) {
-      HIP_RUNTIME_CHECK(hipFree(qpDbrUmemAddr));
-    } else {
-      free(qpDbrUmemAddr);
-    }
-  }
+  Mlx5FreeControlBuf(config.onGpu, qpUmemAddr);
   if (qpUar) {
     if (config.onGpu) {
       Mlx5UnregisterUarHost(qpUar->reg_addr);
