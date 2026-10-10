@@ -88,6 +88,24 @@ TEST(LruMasterEvictStrategy, VictimCarriesTheTierItWasChargedTo) {
   EXPECT_EQ(victims["n1"][0], (EvictionVictim{"k", TierType::SSD}));
 }
 
+TEST(LruMasterEvictStrategy, ABudgetLargerThanAnyRowCapIsMetInOneRound) {
+  // The round is sized in bytes now: 1,000 candidates against a budget that
+  // covers 600 of them yields 600 victims, not the first 32.
+  LruMasterEvictStrategy strategy;
+  auto now = Clock::now();
+  std::vector<EvictionCandidate> candidates;
+  for (int i = 0; i < 1000; ++i) {
+    candidates.push_back(MakeCandidate("k" + std::to_string(i), "n1", TierType::DRAM, 64,
+                                       now - std::chrono::seconds(1000 - i)));
+  }
+  std::unordered_map<std::string, std::map<TierType, int64_t>> budget;
+  budget["n1"][TierType::DRAM] = 600 * 64;
+
+  auto victims = strategy.SelectVictims(candidates, budget);
+  ASSERT_EQ(victims["n1"].size(), 600u);
+  EXPECT_EQ(victims["n1"].front().key, "k0");  // oldest first
+}
+
 TEST(LruMasterEvictStrategy, KeyOverBudgetInTwoTiersIsOneVictimPerTier) {
   // A copy-mode promotion leaves the same key in DRAM and SSD.  When both
   // media are over budget the master charges each copy to its own tier, and
