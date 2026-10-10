@@ -259,13 +259,22 @@ TEST(MasterEvictionChain, OverWatermarkTierDemotesIntoTheColdTier) {
   EXPECT_EQ(dispatcher.NodeIds().front(), kNodeId);
 
   // Every key the master named must have moved down a tier rather than vanished.
+  // The peer only queues the demotion -- the EvictKey call does not wait on the
+  // copy -- so the move is observed after the fact.
   const auto evicted = dispatcher.Dispatched();
   ASSERT_FALSE(evicted.empty());
+  const bool moved = WaitFor(
+      [&] {
+        for (const auto& key : evicted) {
+          if (registry.Get("hot")->Contains(key)) return false;
+        }
+        return true;
+      },
+      std::chrono::seconds(5));
+  ASSERT_TRUE(moved) << "a queued demotion never completed";
   for (const auto& key : evicted) {
-    EXPECT_FALSE(registry.Get("hot")->Contains(key)) << key << " still in hot";
     EXPECT_TRUE(registry.Get("cold")->Contains(key)) << key << " was dropped, not demoted";
   }
-  EXPECT_GT(dispatcher.FreedBytes(), 0u);
 
   // Keys the master did not name are untouched: eviction is bounded by the
   // budget, so a round must not drain the whole tier.
@@ -662,14 +671,12 @@ TEST(MasterEvictionBytes, ARoundFreesTheWholeOverageNotThirtyTwoKeys) {
   ASSERT_TRUE(WaitFor([&] { return !dispatcher.Calls().empty(); }, std::chrono::seconds(8)));
   manager.Stop();
 
-  // Tiny keys, so the default 1 GiB RPC limit puts the whole round in one call.
+  // A round's victims go out in calls bounded only by gRPC message size, so
+  // these few short keys are one call.
   const auto first = dispatcher.Calls().front();
   ASSERT_GT(kOverageKeys, 32u);
   EXPECT_EQ(first.size(), kOverageKeys) << "the round did not cover its byte budget";
-  for (const auto& victim : first) {
-    EXPECT_EQ(victim.tier, TierType::DRAM);
-    EXPECT_EQ(victim.bytes, kPageSize);
-  }
+  for (const auto& victim : first) EXPECT_EQ(victim.tier, TierType::DRAM);
 }
 
 TEST(MasterEvictionBytes, PerRoundByteLimitThrottlesTheRound) {
@@ -687,46 +694,14 @@ TEST(MasterEvictionBytes, PerRoundByteLimitThrottlesTheRound) {
   EXPECT_EQ(dispatcher.Calls().front().size(), 10u);
 }
 
-TEST(MasterEvictionBytes, DispatchIsSplitIntoRpcsByBytes) {
-  InMemoryMasterMetadataStore store;
-  PublishNode(&store, NumberedKeys(kFullBucketKeys), kFullBucketBytes, kFullBucketBytes);
-
-  auto config = OneSecondRounds();
-  config.max_evict_bytes_per_rpc = 16 * kPageSize;
-  RecordingDispatcher dispatcher;
-  EvictionManager manager(store, config, &dispatcher);
-  manager.Start();
-  ASSERT_TRUE(WaitFor([&] { return dispatcher.Keys() >= kOverageKeys; }, std::chrono::seconds(8)));
-  manager.Stop();
-
-  // The first round's calls: every one within the byte limit, together the
-  // whole overage.  (A later round would re-send the same keys -- the store
-  // has not seen their REMOVEs -- so only the first round is counted.)
-  const size_t rounds_calls = (kOverageKeys + 15) / 16;
-  const auto calls = dispatcher.Calls();
-  ASSERT_GE(calls.size(), rounds_calls);
-  size_t keys = 0;
-  for (size_t i = 0; i < rounds_calls; ++i) {
-    uint64_t bytes = 0;
-    for (const auto& victim : calls[i]) bytes += victim.bytes;
-    EXPECT_LE(bytes, 16 * kPageSize) << "call " << i;
-    keys += calls[i].size();
-  }
-  EXPECT_EQ(keys, kOverageKeys);
-}
-
-TEST(MasterEvictionBytes, ByteLimitsAreReadFromTheEnvironment) {
+TEST(MasterEvictionBytes, PerRoundByteLimitIsReadFromTheEnvironment) {
   ::setenv("UMBP_EVICT_MAX_BYTES_PER_ROUND", "8589934592", 1);
-  ::setenv("UMBP_EVICT_MAX_BYTES_PER_RPC", "268435456", 1);
   const auto config = EvictionConfig::FromEnvironment();
   ::unsetenv("UMBP_EVICT_MAX_BYTES_PER_ROUND");
-  ::unsetenv("UMBP_EVICT_MAX_BYTES_PER_RPC");
   EXPECT_EQ(config.max_evict_bytes_per_round, 8589934592ULL);
-  EXPECT_EQ(config.max_evict_bytes_per_rpc, 268435456ULL);
 
   const auto defaults = EvictionConfig::FromEnvironment();
   EXPECT_EQ(defaults.max_evict_bytes_per_round, 0u);
-  EXPECT_EQ(defaults.max_evict_bytes_per_rpc, 1ULL << 30);
 }
 
 }  // namespace

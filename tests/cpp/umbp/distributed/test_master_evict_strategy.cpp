@@ -86,8 +86,6 @@ TEST(LruMasterEvictStrategy, VictimCarriesTheTierItWasChargedTo) {
   // The peer frees exactly this medium's copy, so the tier must survive
   // selection: without it an SSD-pressure victim could free the DRAM copy.
   EXPECT_EQ(victims["n1"][0], (EvictionVictim{"k", TierType::SSD}));
-  // And its size, which dispatch uses to split EvictKey RPCs by bytes.
-  EXPECT_EQ(victims["n1"][0].bytes, 100u);
 }
 
 TEST(LruMasterEvictStrategy, ABudgetLargerThanAnyRowCapIsMetInOneRound) {
