@@ -1,16 +1,13 @@
 name: ci-rerun
 
-# Re-run CI on a PR merged with the current main, without pushing to the PR
+# Re-run CI on a PR against the current main, without pushing to the PR
 # branch: comment "/ci-rerun" on the PR, or add the "ci-rerun" label.
 #
-# This starts ci.yml and ci_cco.yml with workflow_dispatch on the PR branch and
-# merge_main=true, so they merge the current main in after checkout. Their
-# results land on the PR head commit and show up in the PR checks, and they
-# share the PR's concurrency group (pr_number), so a re-run replaces a CI run
-# in progress and a later push replaces the re-run.
-# GITHUB_TOKEN may start workflow_dispatch runs (labels or pushes made with it
-# start nothing), so no personal token is involved. Fork PRs are not
-# supported: workflow_dispatch can only target branches of this repository.
+# This re-runs the PR's latest ci.yml and ci_cco.yml runs, the same as their
+# "Re-run all jobs" button, so the results stay in the PR checks. On a re-run
+# those workflows merge the current main into the checkout (see
+# .github/scripts/merge_current_main.sh). GITHUB_TOKEN can re-run workflows,
+# so no personal token is involved.
 on:
   issue_comment:
     types: [created]
@@ -46,7 +43,7 @@ jobs:
                 .catch((e) => core.warning(`could not remove ci-rerun: ${e.message}`));
             }
 
-            // This starts CI on the self-hosted GPU runners, so require write
+            // This occupies the self-hosted GPU runners, so require write
             // access. author_association is not enough: MEMBER is any org member.
             let permission = 'none';
             try {
@@ -63,28 +60,36 @@ jobs:
               await reply('`/ci-rerun`: this PR is not open.');
               return;
             }
-            if (pr.head.repo === null || pr.head.repo.full_name !== `${owner}/${repo}`) {
-              await reply('`/ci-rerun` only works for PRs from branches of this repository; push a commit to re-run CI on a fork PR.');
-              return;
-            }
-
             if (context.eventName === 'issue_comment') {
               await github.rest.reactions.createForIssueComment({
                 owner, repo, comment_id: context.payload.comment.id, content: 'rocket',
               }).catch(() => {});
             }
 
-            // Branches that predate merge_main reject the input (422); run them as they are.
-            let how = 'merged with the current main';
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const rerun = [], missing = [];
             for (const workflow_id of ['ci.yml', 'ci_cco.yml']) {
-              try {
-                await github.rest.actions.createWorkflowDispatch({
-                  owner, repo, workflow_id, ref: pr.head.ref, inputs: { merge_main: 'true', pr_number: String(number) } });
-              } catch (e) {
-                if (e.status !== 422) throw e;
-                await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id, ref: pr.head.ref });
-                how = 'as it is, without merging main (this branch predates the ci-rerun support; merge main into it to get that)';
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id, event: 'pull_request', head_sha: pr.head.sha, per_page: 1 });
+              let run = data.workflow_runs[0];
+              if (!run) { missing.push(workflow_id); continue; }
+              // A run can only be re-run once it has finished.
+              if (run.status !== 'completed') {
+                await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: run.id }).catch(() => {});
+                for (let i = 0; i < 30 && run.status !== 'completed'; i++) {
+                  await sleep(10000);
+                  ({ data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id }));
+                }
               }
+              await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+              rerun.push(`[${run.name}](${run.html_url})`);
             }
-            const runs = `https://github.com/${owner}/${repo}/actions?query=${encodeURIComponent(`event:workflow_dispatch branch:${pr.head.ref}`)}`;
-            await reply(`Re-running CI on \`${pr.head.ref}\` ${how}: [runs](${runs}).`);
+
+            const lines = [];
+            if (rerun.length) lines.push(`Re-running ${rerun.join(' and ')} against the current main.`);
+            if (missing.length) {
+              lines.push(`No \`pull_request\` run of ${missing.join(', ')} exists for the head commit ` +
+                `${pr.head.sha.slice(0, 8)} (e.g. it was pushed by a bot, whose pushes start no CI); ` +
+                'push a commit to start one.');
+            }
+            await reply(lines.join('\n\n'));

@@ -22,19 +22,11 @@ on:
         type: boolean
         default: false
         description: Enable DP/EP modes when launching the hicache test
-      merge_main:
-        type: boolean
-        default: false
-        description: Merge the current main into the branch before testing (set by ci-rerun.yml)
-      pr_number:
-        type: string
-        default: ""
-        description: PR this run re-runs CI for (set by ci-rerun.yml; shares the PR's concurrency group)
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -75,8 +67,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       - name: Build CI image
@@ -175,8 +167,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       - name: Build CI image
@@ -434,8 +426,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       # ROCm 10 ships in a different apt repo than 7.x, hence the ROCM_APT_* args.
@@ -532,8 +524,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       - name: Build JAX CI image
@@ -616,8 +608,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       - name: Build CI image
@@ -770,8 +762,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       - name: Recover podman if needed
@@ -1236,8 +1228,8 @@ jobs:
         with:
           submodules: true
 
-      - name: Merge current main
-        if: github.event_name == 'workflow_dispatch' && inputs.merge_main
+      - name: Merge current main (re-run)  # see .github/scripts/merge_current_main.sh
+        if: github.event_name == 'pull_request' && github.run_attempt > 1
         run: bash .github/scripts/merge_current_main.sh
 
       - name: Checkout SGLang
