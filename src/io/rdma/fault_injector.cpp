@@ -201,7 +201,7 @@ int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
     }
     if (ShouldFire(FaultKind::QpError, qp->qp_num, -1, &value)) MoveQpToError(qp);
   }
-  return direct_.PostSend(qp, wr, bad);
+  return real_.PostSend(qp, wr, bad);
 }
 
 int FaultInjector::PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) {
@@ -213,11 +213,11 @@ int FaultInjector::PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) {
       return value;
     }
   }
-  return direct_.PostRecv(qp, wr, bad);
+  return real_.PostRecv(qp, wr, bad);
 }
 
 int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) {
-  int n = direct_.PollCq(cq, numEntries, wc);
+  int n = real_.PollCq(cq, numEntries, wc);
   if (n <= 0 || !armed_.load(std::memory_order_relaxed)) return n;
 
   // Only successful CQEs carry a valid opcode, and only they can be "lost" or

@@ -61,7 +61,7 @@ struct FaultRule {
 FaultRule ParseFaultRule(const std::string& spec);
 const char* FaultKindName(FaultKind kind);
 
-// Decorates DirectVerbs with a single armed FaultRule. Disarmed, each hook costs
+// Decorates RealVerbs with a single armed FaultRule. Disarmed, each hook costs
 // one relaxed atomic load. Arms itself at first use from MORI_IO_FAULT if set.
 class FaultInjector final : public VerbsOps {
  public:
@@ -75,10 +75,10 @@ class FaultInjector final : public VerbsOps {
   int PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) override;
   int PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) override;
   int GetCqEvent(ibv_comp_channel* ch, ibv_cq** cq, void** cqCtx) override {
-    return direct_.GetCqEvent(ch, cq, cqCtx);
+    return real_.GetCqEvent(ch, cq, cqCtx);
   }
   int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) override {
-    return direct_.GetAsyncEvent(ctx, event);
+    return real_.GetAsyncEvent(ctx, event);
   }
 
  private:
@@ -90,7 +90,7 @@ class FaultInjector final : public VerbsOps {
   void RememberQp(ibv_qp* qp);
   void MoveQpToError(ibv_qp* qp);
 
-  DirectVerbs direct_;
+  RealVerbs real_;
   std::atomic<bool> armed_{false};
   std::atomic<uint64_t> fired_{0};
   std::mutex mu_;

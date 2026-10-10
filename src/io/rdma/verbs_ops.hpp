@@ -30,7 +30,7 @@ namespace io {
 // goes through Verbs() so a build with MORI_IO_FAULT_INJECTION can swap in the
 // FaultInjector decorator (src/io/rdma/fault_injector.hpp) without touching the
 // call sites again. Without the macro, Verbs() is a final, stateless
-// DirectVerbs, so calls devirtualize and inline to plain ibv_* as before.
+// RealVerbs, so calls devirtualize and inline to plain ibv_* as before.
 class VerbsOps {
  public:
   virtual ~VerbsOps() = default;
@@ -41,7 +41,8 @@ class VerbsOps {
   virtual int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) = 0;
 };
 
-class DirectVerbs final : public VerbsOps {
+// The real calls: standard libibverbs ibv_*, not a vendor direct-verbs API.
+class RealVerbs final : public VerbsOps {
  public:
   int PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) override {
     return ibv_post_send(qp, wr, bad);
@@ -63,8 +64,8 @@ class DirectVerbs final : public VerbsOps {
 #ifdef MORI_IO_FAULT_INJECTION
 VerbsOps& Verbs();
 #else
-inline DirectVerbs kDirectVerbs;
-inline DirectVerbs& Verbs() { return kDirectVerbs; }
+inline RealVerbs kRealVerbs;
+inline RealVerbs& Verbs() { return kRealVerbs; }
 #endif
 
 }  // namespace io
