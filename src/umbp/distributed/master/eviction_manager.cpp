@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/master/eviction_manager.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iterator>
@@ -53,8 +54,11 @@ void EvictionManager::Start() {
   if (running_.load(std::memory_order_relaxed)) return;
   running_.store(true, std::memory_order_relaxed);
   thread_ = std::thread(&EvictionManager::EvictionLoop, this);
-  MORI_UMBP_INFO("[EvictionManager] Started (interval={}s, high={}, low={})",
-                 config_.check_interval.count(), config_.high_watermark, config_.low_watermark);
+  MORI_UMBP_INFO(
+      "[EvictionManager] Started (interval={}s, high={}, low={}, max_bytes_per_round={}, "
+      "max_bytes_per_rpc={})",
+      config_.check_interval.count(), config_.high_watermark, config_.low_watermark,
+      config_.max_evict_bytes_per_round, config_.max_evict_bytes_per_rpc);
 }
 
 void EvictionManager::Stop() {
@@ -118,20 +122,35 @@ void EvictionManager::RunOnce() {
   }
 
   if (bytes_to_free.empty()) return;
-  MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected", bytes_to_free.size());
+
+  // A round's size is a byte budget: the overage itself, optionally capped by
+  // max_evict_bytes_per_round.  It used to be a row count (32 candidates per
+  // bucket), which freed a few MB per round however far over the tier was --
+  // a 512 GiB tier's 0.9 -> 0.7 band took hours to drain -- while every round
+  // still paid the store's full scan.
+  if (config_.max_evict_bytes_per_round > 0) {
+    for (auto& [ntk, bytes] : bytes_to_free) {
+      bytes = std::min(bytes, config_.max_evict_bytes_per_round);
+    }
+  }
+  uint64_t budget_total = 0;
+  for (const auto& [ntk, bytes] : bytes_to_free) budget_total += bytes;
+  MORI_UMBP_INFO("[EvictionManager] {} overloaded node-tiers detected, {} bytes to free",
+                 bytes_to_free.size(), budget_total);
 
   // Ask the store for eviction-eligible candidates in the overloaded buckets.
   // The store is policy-neutral: it returns rows ordered by the hint (LRU here,
   // so an indexed backend can push the ordering down) but makes no eviction
-  // decision and never sees the byte budget. Limit each bucket to the configured
-  // round size; a still-overloaded bucket is revisited on the next interval.
+  // decision and never sees the byte budget -- the strategy trims to it.  No
+  // row cap: both stores read every eligible row of a bucket before capping,
+  // so a cap would only discard candidates the budget may need.
   std::vector<NodeTierKey> buckets;
   buckets.reserve(bytes_to_free.size());
   for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
 
-  auto candidates_by_bucket = store_.EnumerateEvictionCandidates(
-      buckets, EvictionOrder::kLeastRecentlyAccessed, config_.evict_batch_size,
-      std::chrono::system_clock::now());
+  auto candidates_by_bucket =
+      store_.EnumerateEvictionCandidates(buckets, EvictionOrder::kLeastRecentlyAccessed,
+                                         /*max_per_bucket=*/0, std::chrono::system_clock::now());
   if (candidates_by_bucket.empty()) {
     MORI_UMBP_DEBUG("[EvictionManager] No eviction candidates found");
     return;
@@ -155,12 +174,16 @@ void EvictionManager::RunOnce() {
       strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
 
   size_t selected = 0;
-  for (const auto& [node_id, victims] : per_node_victims) selected += victims.size();
+  uint64_t selected_bytes = 0;
+  for (const auto& [node_id, victims] : per_node_victims) {
+    selected += victims.size();
+    for (const auto& victim : victims) selected_bytes += victim.bytes;
+  }
 
   if (selected == 0) return;
 
-  MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,
-                 per_node_victims.size());
+  MORI_UMBP_INFO("[EvictionManager] Selected {} victims ({} bytes) across {} nodes", selected,
+                 selected_bytes, per_node_victims.size());
 
   // Look up peer addresses once per dispatch round.  ClientRegistry
   // owns the (node_id -> peer_address) mapping; we can't ship an
@@ -196,13 +219,29 @@ void EvictionManager::RunOnce() {
     // Sized on the keys alone: the parallel tier field is a packed enum of one
     // byte per key, inside the per-item overhead GrpcMaxItemsPerBatch already
     // reserves.
+    //
+    // And split by bytes: the peer does the eviction inside the call, and on a
+    // tier that demotes it copies each victim downstream first, so a chunk's
+    // bytes are what decide whether the call fits UMBP_EVICTKEY_DEADLINE_MS.
+    // Every chunk carries at least one victim, however large.
     std::vector<std::string> keys;
     keys.reserve(victims.size());
     for (const auto& victim : victims) keys.push_back(victim.key);
+    const uint64_t rpc_bytes = config_.max_evict_bytes_per_rpc;
     size_t sent = 0;
     size_t chunks = 0;
     while (sent < victims.size()) {
-      const size_t take = GrpcMaxItemsPerBatch(keys, sent);
+      size_t take = GrpcMaxItemsPerBatch(keys, sent);
+      if (rpc_bytes > 0) {
+        uint64_t chunk_bytes = 0;
+        size_t fit = 0;
+        for (; fit < take; ++fit) {
+          const uint64_t bytes = victims[sent + fit].bytes;
+          if (fit > 0 && chunk_bytes + bytes > rpc_bytes) break;
+          chunk_bytes += bytes;
+        }
+        take = fit;
+      }
       std::vector<EvictionVictim> chunk(std::make_move_iterator(victims.begin() + sent),
                                         std::make_move_iterator(victims.begin() + sent + take));
       sent += take;

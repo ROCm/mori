@@ -167,7 +167,13 @@ struct EvictionCandidate {
 struct EvictionVictim {
   std::string key;
   TierType tier = TierType::UNKNOWN;
+  // What the victim was charged against its tier's budget.  Dispatch uses it
+  // to size each EvictKey RPC; a strategy that leaves it 0 still works, its
+  // RPCs are just split by message size alone.
+  uint64_t bytes = 0;
 
+  // Identity: a victim IS a (key, tier).  `bytes` is its weight, not part of
+  // which copy it names.
   bool operator==(const EvictionVictim& other) const {
     return key == other.key && tier == other.tier;
   }

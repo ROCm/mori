@@ -86,6 +86,26 @@ TEST(LruMasterEvictStrategy, VictimCarriesTheTierItWasChargedTo) {
   // The peer frees exactly this medium's copy, so the tier must survive
   // selection: without it an SSD-pressure victim could free the DRAM copy.
   EXPECT_EQ(victims["n1"][0], (EvictionVictim{"k", TierType::SSD}));
+  // And its size, which dispatch uses to split EvictKey RPCs by bytes.
+  EXPECT_EQ(victims["n1"][0].bytes, 100u);
+}
+
+TEST(LruMasterEvictStrategy, ABudgetLargerThanAnyRowCapIsMetInOneRound) {
+  // The round is sized in bytes now: 1,000 candidates against a budget that
+  // covers 600 of them yields 600 victims, not the first 32.
+  LruMasterEvictStrategy strategy;
+  auto now = Clock::now();
+  std::vector<EvictionCandidate> candidates;
+  for (int i = 0; i < 1000; ++i) {
+    candidates.push_back(MakeCandidate("k" + std::to_string(i), "n1", TierType::DRAM, 64,
+                                       now - std::chrono::seconds(1000 - i)));
+  }
+  std::unordered_map<std::string, std::map<TierType, int64_t>> budget;
+  budget["n1"][TierType::DRAM] = 600 * 64;
+
+  auto victims = strategy.SelectVictims(candidates, budget);
+  ASSERT_EQ(victims["n1"].size(), 600u);
+  EXPECT_EQ(victims["n1"].front().key, "k0");  // oldest first
 }
 
 TEST(LruMasterEvictStrategy, KeyOverBudgetInTwoTiersIsOneVictimPerTier) {
