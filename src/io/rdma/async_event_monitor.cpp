@@ -32,6 +32,8 @@
 #include <optional>
 #include <unordered_set>
 
+#include "src/io/rdma/verbs_ops.hpp"
+
 namespace mori {
 namespace io {
 
@@ -280,7 +282,7 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
 
 RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& watch) noexcept {
   ibv_async_event event{};
-  if (ibv_get_async_event(watch.context, &event) != 0) {
+  if (Verbs().GetAsyncEvent(watch.context, &event) != 0) {
     if (errno == EINTR) return GetResult::kEvent;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return GetResult::kDrained;
     SafeLog(spdlog::level::err, "RDMA async monitor: ibv_get_async_event failed on {}: {}",

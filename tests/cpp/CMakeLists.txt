@@ -30,6 +30,12 @@ target_include_directories(test_logging PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(test_logging PRIVATE mori_logging gtest_main)
 add_test(NAME logging_concurrency COMMAND test_logging)
 
+# Header-only reader for flat YAML lists (mori/utils/flat_yaml.hpp).
+add_executable(test_flat_yaml utils/test_flat_yaml.cpp)
+target_include_directories(test_flat_yaml PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_flat_yaml PRIVATE gtest_main)
+add_test(NAME flat_yaml COMMAND test_flat_yaml)
+
 add_executable(test_transport_tcp application/test_transport_tcp.cpp)
 
 target_include_directories(test_transport_tcp
@@ -80,6 +86,19 @@ if(BUILD_IO)
                              PUBLIC ${CMAKE_SOURCE_DIR}/include)
   target_include_directories(test_transfer_wait PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_transfer_wait mori_application mori_io)
+
+  if(ENABLE_IO_FAULT_INJECTION)
+    add_executable(test_fault_injection io/test_fault_injection.cpp)
+    target_include_directories(test_fault_injection
+                               PUBLIC ${CMAKE_SOURCE_DIR}/include)
+    target_include_directories(test_fault_injection PUBLIC ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(
+      test_fault_injection
+      PRIVATE
+        MORI_IO_FAULT_CATALOG_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog/ibverbs.yaml"
+    )
+    target_link_libraries(test_fault_injection mori_application mori_io)
+  endif()
 
   add_executable(test_peer_failure io/test_peer_failure.cpp)
 

@@ -39,6 +39,7 @@
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
+#include "src/io/rdma/verbs_ops.hpp"
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: async post-to-completion range stop
 namespace mori {
 namespace io {
@@ -819,7 +820,7 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
     wr.num_sge = 1;
 
     struct ibv_recv_wr* bad = nullptr;
-    SYSCALL_RETURN_ZERO(ibv_post_recv(qp, &wr, &bad));
+    SYSCALL_RETURN_ZERO(Verbs().PostRecv(qp, &wr, &bad));
   }
 }
 
@@ -841,7 +842,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   struct ibv_wc wc[batchSize];
   int n = 0;
 
-  while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+  while ((n = Verbs().PollCq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
@@ -972,7 +973,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         wr.sg_list = &sge;
         wr.num_sge = 1;
         struct ibv_recv_wr* bad = nullptr;
-        SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
+        SYSCALL_RETURN_ZERO(Verbs().PostRecv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
         if (!IsNotifSendWrId(wc[i].wr_id)) {
           MORI_IO_WARN(
@@ -1082,7 +1083,7 @@ void NotifManager::MainLoop() {
 
         struct ibv_cq* cq = nullptr;
         void* evCtx = nullptr;
-        if (ibv_get_cq_event(ch, &cq, &evCtx)) continue;
+        if (Verbs().GetCqEvent(ch, &cq, &evCtx)) continue;
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
