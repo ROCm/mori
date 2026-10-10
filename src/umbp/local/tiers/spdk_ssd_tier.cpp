@@ -243,50 +243,17 @@ std::vector<std::string> SpdkSsdTier::GetLRUCandidates(size_t max_candidates) co
 }
 
 // ===========================================================================
-// LRU eviction — evicts entries until `needed` bytes are freed.
-// Lock ordering: lru_mu_ → shard.mutex (consistent with all other methods).
-// Returns actual bytes freed (may be 0 if LRU is empty).
-// ===========================================================================
-size_t SpdkSsdTier::EvictLRU(size_t needed) {
-  size_t freed = 0;
-  int evicted = 0;
-  while (freed < needed) {
-    std::lock_guard<std::mutex> lru_lk(lru_mu_);
-    if (lru_list_.empty()) break;
-
-    std::string key = lru_list_.back();
-    auto& shard = shards_[ShardForKey(key)];
-    std::unique_lock<std::shared_mutex> slk(shard.mutex);
-    auto it = shard.map.find(key);
-    if (it != shard.map.end()) {
-      size_t entry_size = AlignUp(it->second.data_size);
-      bool immediate = (it->second.allocation.use_count() == 1);
-      freed += entry_size;
-      evicted_bytes_.fetch_add(entry_size, std::memory_order_relaxed);
-      shard.map.erase(it);
-      if (!immediate) {
-        MORI_UMBP_WARN(
-            "EvictLRU: key '{}' ({}KB) has in-flight readers, "
-            "space reclaim deferred",
-            key, entry_size / 1024);
-      }
-    }
-    lru_list_.pop_back();
-    ++evicted;
-  }
-  if (evicted > 0) {
-    MORI_UMBP_INFO("EvictLRU: evicted {} entries, freed {}MB (requested {}MB)", evicted,
-                   freed / (1024 * 1024), needed / (1024 * 1024));
-  }
-  return freed;
-}
-
-// ===========================================================================
 // PrepareWriteAlloc — common Phase 1 for all BatchWrite* variants.
 //
 // 1) Checks existing keys (shard shared lock + LRU update)
 // 2) Batch allocates space for new keys
-// 3) On allocation failure, evicts LRU entries and retries
+//
+// A key that does not fit FAILS.  The tier never evicts to make room: the
+// keys it would pick belong to whoever owns this tier (PeerSsdManager, over
+// the proxy), which tracks them and reports their REMOVE to the master.  An
+// eviction here would be invisible to both -- the owner would keep listing a
+// key whose bytes are gone.  Making room is the owner's local eviction, which
+// reaches this tier through Evict().
 // ===========================================================================
 std::vector<SpdkSsdTier::PendingWrite> SpdkSsdTier::PrepareWriteAlloc(
     const std::vector<std::string>& keys, const std::vector<size_t>& sizes,
@@ -322,34 +289,18 @@ std::vector<SpdkSsdTier::PendingWrite> SpdkSsdTier::PrepareWriteAlloc(
 
   if (alloc_sizes.empty()) return pending;
 
-  // Allocate with auto-eviction retry
-  size_t success_count = 0;
-  constexpr int kMaxEvictRetries = 3;
-
-  for (int retry = 0; retry <= kMaxEvictRetries; ++retry) {
-    std::vector<size_t> remaining(alloc_sizes.begin() + static_cast<ptrdiff_t>(success_count),
-                                  alloc_sizes.end());
-
-    auto handles = allocator_->batch_allocate(remaining);
-
-    for (size_t j = 0; j < handles.size(); ++j) {
-      if (!handles[j].has_value()) break;
-      PendingWrite pw;
-      pw.idx = new_indices[success_count + j];
-      pw.aligned_size = alloc_sizes[success_count + j];
-      pw.allocation = std::make_shared<RefCountedAllocationHandle>(std::move(handles[j].value()));
-      pending.push_back(std::move(pw));
-    }
-
-    success_count = pending.size();
-    if (success_count >= new_indices.size()) break;
-
-    size_t needed = 0;
-    for (size_t k = success_count; k < alloc_sizes.size(); ++k) needed += alloc_sizes[k];
-
-    size_t freed = EvictLRU(needed);
-    if (freed == 0) break;
+  // One attempt.  The allocator stops at the first request it cannot place,
+  // so everything from there on fails with it.
+  auto handles = allocator_->batch_allocate(alloc_sizes);
+  for (size_t j = 0; j < handles.size(); ++j) {
+    if (!handles[j].has_value()) break;
+    PendingWrite pw;
+    pw.idx = new_indices[j];
+    pw.aligned_size = alloc_sizes[j];
+    pw.allocation = std::make_shared<RefCountedAllocationHandle>(std::move(handles[j].value()));
+    pending.push_back(std::move(pw));
   }
+  const size_t success_count = pending.size();
 
   if (success_count < new_indices.size()) {
     size_t failed = new_indices.size() - success_count;
@@ -439,7 +390,7 @@ std::vector<SpdkSsdTier::ReadInfo> SpdkSsdTier::PrepareReadLookup(
 // ===========================================================================
 // BatchWrite — deep-queue NVMe write pipeline
 //
-// Phase 1: PrepareWriteAlloc (check existing, allocate with auto-eviction)
+// Phase 1: PrepareWriteAlloc (check existing, allocate; no eviction)
 // Phase 2: memcpy + submit + drain pipeline on calling thread
 // Phase 3: CommitWriteEntries (update sharded map + LRU)
 // ===========================================================================
