@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/cco/cco.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
@@ -47,6 +48,7 @@ static constexpr int32_t EP_CONFIG_I32_VERSION = 1;
 // 56 → block_elems = 7168/56 = 128, matching the AccumNum=8 + VecBytes=8 dequant specialization.
 static constexpr int kDefaultFp8BlockwiseScaleDim = 56;
 static constexpr const char* kFp8BlockwiseScaleDimEnv = "MORI_FP8_COMBINE_SCALE_DIM";
+static constexpr const char* kDisableRdmaAtomicsEnv = "MORI_EP_DISABLE_RDMA_ATOMICS";
 
 std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {
   return {
@@ -162,6 +164,32 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
         std::to_string(static_cast<int>(config.kernelType)) +
         " (InterNode v0 / AsyncLL) sends cross-node RDMA to arbitrary PEs, which have no QP in "
         "rail-only mode. Use InterNodeV1 or InterNodeV1LL, or unset MORI_ENABLE_RAIL_ONLY.");
+  }
+  disableRdmaAtomics = env::IsEnvVarEnabled(kDisableRdmaAtomicsEnv);
+  if (disableRdmaAtomics) {
+    // InterNode v0 and AsyncLL still signal with RDMA atomics, which hang on NICs that do not
+    // execute atomic opcodes. Fail at construction instead.
+    if (config.worldSize > config.gpuPerNode &&
+        (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
+      throw std::runtime_error(
+          std::string(kDisableRdmaAtomicsEnv) +
+          " is set, but kernelType=" + std::to_string(static_cast<int>(config.kernelType)) +
+          " (InterNode v0 / AsyncLL) still signals with RDMA atomics. Use InterNodeV1 or "
+          "InterNodeV1LL, or unset " +
+          kDisableRdmaAtomicsEnv + ".");
+    }
+    // A WRITE signal is only ordered after its data by in-order PCIe placement; an atomic's
+    // read-modify-write at the target flushes prior writes, a WRITE does not.
+    if (application::ReadIbEnableRelaxedOrderingEnv()) {
+      throw std::runtime_error(std::string(kDisableRdmaAtomicsEnv) +
+                               " cannot be combined with MORI_IB_ENABLE_RELAXED_ORDERING=1: with "
+                               "relaxed ordering a WRITE signal may become visible before its "
+                               "data.");
+    }
+    if (config.rank == 0) {
+      MORI_OPS_INFO("{} is set: InterNodeV1/V1LL signal with RDMA WRITE instead of RDMA atomics",
+                    kDisableRdmaAtomicsEnv);
+    }
   }
   if (config.maxTotalRecvTokens > 0) {
     int worstCase = config.worldSize * config.maxNumInpTokenPerRank;
@@ -554,8 +582,12 @@ void EpDispatchCombineHandle::InitializeBarrier() {
                                (config.kernelType == KernelType::AsyncLL))
                                   ? 0
                                   : 1;
-  crossDeviceBarrierMemObj =
-      MallocSymm(barrierSize * 2 * sizeof(uint64_t), hipDeviceMallocUncached);
+  // The atomic-free InterNodeV1 barrier keeps one slot per (sender rank, qp) after the
+  // worldSize per-rank slots, so it never aliases the intra-node barrier slots.
+  size_t crossDeviceBarrierSize =
+      std::max(barrierSize * 2 * sizeof(uint64_t),
+               static_cast<size_t>(config.worldSize) * (1 + config.numQpPerPe) * sizeof(uint64_t));
+  crossDeviceBarrierMemObj = MallocSymm(crossDeviceBarrierSize, hipDeviceMallocUncached);
 
   size_t interNodeChunkFlagSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
                                   config.MaxNumTokensToSendPerRank() * sizeof(uint64_t);
@@ -589,6 +621,7 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.config = handle.config;
   args.fp8BlockwiseCombineScaleDim = handle.fp8BlockwiseCombineScaleDim;
   args.rdmaBlockNum = rdmaBlockNum;
+  args.disableRdmaAtomics = handle.disableRdmaAtomics;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = handle.inpTokenBuf;

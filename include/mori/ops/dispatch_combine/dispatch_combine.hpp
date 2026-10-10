@@ -375,6 +375,9 @@ class EpDispatchCombineHandle {
 
   int fp8BlockwiseCombineScaleDim{0};
   int fp8BlockwiseCombineScaleTypeSize{0};
+  // InterNodeV1/V1LL signal remote PEs with RDMA WRITEs instead of RDMA atomics, for NICs or
+  // virtualized functions that do not execute atomic opcodes. Set by MORI_EP_DISABLE_RDMA_ATOMICS.
+  bool disableRdmaAtomics{false};
   // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
 
@@ -479,6 +482,7 @@ struct EpDispatchCombineArgs {
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   bool replayMode{false};
+  bool disableRdmaAtomics{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   T* inpTokenBuf{nullptr};
@@ -544,6 +548,7 @@ struct EpDispatchCombineArgsRaw {
   int fp8BlockwiseCombineScaleDim{0};
   int rdmaBlockNum{-1};
   bool replayMode{false};
+  bool disableRdmaAtomics{false};
   index_t curRankNumToken{0};
   index_t* tokenIndices{nullptr};
   void* inpTokenBuf{nullptr};

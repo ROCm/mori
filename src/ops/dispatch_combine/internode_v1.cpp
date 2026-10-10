@@ -39,6 +39,80 @@ namespace mori {
 namespace moe {
 
 /* ---------------------------------------------------------------------------------------------- */
+/*                                  Inter-node signaling helpers                                  */
+/* ---------------------------------------------------------------------------------------------- */
+namespace v1 {
+
+// With disableRdmaAtomics, cross-node signals are RDMA WRITEs instead of AMO_ADDs. That is only
+// equivalent because every signal slot has a single writer per round and its owner zeroes it
+// before the next round, so the add always lands on zero.
+template <typename T>
+inline __device__ core::atomicType ChunkSignalOp(const EpDispatchCombineArgs<T>& args) {
+  return args.disableRdmaAtomics ? core::atomicType::AMO_SET : core::atomicType::AMO_ADD;
+}
+
+template <typename T>
+inline __device__ void SignalNodeRecvTokenNum(EpDispatchCombineArgs<T>& args, int srcNode,
+                                              uint64_t value, int proxyPe) {
+  size_t offset = srcNode * sizeof(uint64_t);
+  if (args.disableRdmaAtomics) {
+    shmem::ShmemPutTypeImmNbiThread<uint64_t>(args.nodeRecvTokenNumMemObj, offset, value, proxyPe);
+  } else {
+    shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj, offset, value,
+                                                   core::AMO_ADD, proxyPe);
+  }
+}
+
+// The atomic barrier counts one AMO_ADD per QP into a single slot. Writes cannot accumulate, so
+// the write-based barrier gives each (sender, qp) its own slot, placed after the worldSize
+// per-rank slots that the intra-node barrier uses.
+inline __device__ size_t InterNodeBarrierQpSlot(const EpDispatchCombineConfig& config, int senderPe,
+                                                int qpId) {
+  return config.worldSize + static_cast<size_t>(senderPe) * config.numQpPerPe + qpId;
+}
+
+template <typename T>
+inline __device__ void SignalInterNodeBarrier(EpDispatchCombineArgs<T>& args, int proxyPe,
+                                              uint64_t barrierFlag) {
+  const EpDispatchCombineConfig& config = args.config;
+  for (int i = 0; i < config.numQpPerPe; i++) {
+    if (args.disableRdmaAtomics) {
+      shmem::ShmemPutTypeImmNbiThread<uint64_t>(
+          args.crossDeviceBarrierMemObj,
+          InterNodeBarrierQpSlot(config, config.rank, i) * sizeof(uint64_t), barrierFlag, proxyPe,
+          i);
+    } else {
+      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                     config.rank * sizeof(uint64_t), 1,
+                                                     core::AMO_ADD, proxyPe, i);
+    }
+  }
+}
+
+template <typename T>
+inline __device__ void WaitInterNodeBarrier(EpDispatchCombineArgs<T>& args, int proxyPe,
+                                            uint64_t barrierFlag) {
+  const EpDispatchCombineConfig& config = args.config;
+  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
+  if (args.disableRdmaAtomics) {
+    // A peer cannot write round r+1 before this rank leaves round r (it needs this rank's
+    // round r+1 dispatch), so the slot is exactly barrierFlag. Waiting for == rather than >=
+    // turns a barrierFlag desync into a hang instead of an early, silent pass.
+    for (int i = 0; i < config.numQpPerPe; i++) {
+      while (core::AtomicLoadRelaxedSystem(
+                 localBarrierPtr + InterNodeBarrierQpSlot(config, proxyPe, i)) != barrierFlag) {
+      }
+    }
+  } else {
+    while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
+           (barrierFlag * config.numQpPerPe)) {
+    }
+  }
+}
+
+}  // namespace v1
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                                   EpDispatchInterNodeV1Kernel                                  */
 /* ---------------------------------------------------------------------------------------------- */
 namespace v1 {
@@ -227,8 +301,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
                 args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
                 args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, count * xferBytes,
                 args.interNodeChunkFlagMemObj,
-                (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
-                core::atomicType::AMO_ADD, proxyPe, qpId);
+                (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag, ChunkSignalOp(args),
+                proxyPe, qpId);
           }
           if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
         }
@@ -264,7 +338,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
               args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
               args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
               args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-              tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
+              tokenNum + 1, ChunkSignalOp(args), proxyPe, qpId);
         }
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
@@ -279,9 +353,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
-                                                     myNode * sizeof(uint64_t), numTokenSignal,
-                                                     core::AMO_ADD, proxyPe);
+      SignalNodeRecvTokenNum(args, myNode, numTokenSignal, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
@@ -336,7 +408,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
             args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
             args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-            tokenNum + 1, core::atomicType::AMO_ADD, proxyPe, qpId);
+            tokenNum + 1, ChunkSignalOp(args), proxyPe, qpId);
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -350,9 +422,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj,
-                                                     myNode * sizeof(uint64_t), numTokenSignal,
-                                                     core::AMO_ADD, proxyPe);
+      SignalNodeRecvTokenNum(args, myNode, numTokenSignal, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
@@ -1102,20 +1172,13 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
-      }
+      SignalInterNodeBarrier(args, proxyPe, barrierFlag);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
-    uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
-      }
+      WaitInterNodeBarrier(args, proxyPe, barrierFlag);
     }
   }
 }
@@ -1246,22 +1309,15 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      for (int i = 0; i < config.numQpPerPe; i++) {
-        shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                       args.config.rank * sizeof(uint64_t), 1,
-                                                       core::AMO_ADD, proxyPe, i);
-      }
+      SignalInterNodeBarrier(args, proxyPe, barrierFlag);
       __threadfence_system();
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
     // Wait other nodes
-    uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
-      }
+      WaitInterNodeBarrier(args, proxyPe, barrierFlag);
     }
   }
 }
