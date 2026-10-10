@@ -120,11 +120,17 @@ _DISPATCH_TABLE: dict = {
         # topk 9 = 8 routed + 1 shared (what ATOM dispatches: kernel name k9).
         # The engine selects this key, not topk 8; block 64 default starves the
         # 256-CU GPU at the ~3456-recv operating point. Block 256 saturates it.
-        # fp4 past 4096 goes back to 128x16 (us at 16384, grouped/random routing:
-        # 135.2/183.3 against 256x8's 150.3/191.1).
+        # fp4: 192x8 (one token a warp) up to 1536, the decode batch (us at 1536, grouped
+        # routing: 33.5 against 256x8's 35.3); past 4096 128x16 (us at 16384,
+        # grouped/random routing: 135.2/183.3 against 256x8's 150.3/191.1).
         (4, 7168, 9, None): {
             None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
-            "fp4_disp_bf16_comb": ((512, 64, 8), (4096, 256, 8), (None, 128, 16)),
+            "fp4_disp_bf16_comb": (
+                (512, 64, 8),
+                (1536, 192, 8),
+                (4096, 256, 8),
+                (None, 128, 16),
+            ),
         },
         # topk 6 (384 experts at EP4). The edges move in: 64x8 stops paying at 512.
         #   ct     64x8   64x16  128x16 256x16      (bf16 / fp8 / fp4)
