@@ -69,21 +69,20 @@ def self_first_state_bytes(world_size: int) -> int:
     return (inbox + 127) // 128 * 128 + 256
 
 
-# Buffers mori needs beyond the arena a caller lays out, in layout order. Anything
-# new that mori keeps in symmetric memory is added here and nowhere else: the size
-# the caller allocates, the offsets mori cuts it at and the window it allocates for
-# itself all come from this one list.
 _STAGING_ALIGN = 128
 
 
-def _staging_buffers(world_size: int) -> list[tuple[str, int]]:
-    return [("self_first", self_first_state_bytes(world_size))]
-
-
 def _staging_layout(world_size: int) -> tuple[dict[str, int], int]:
-    """({buffer: offset within the staging region}, region bytes)."""
+    """({buffer: offset within the staging region}, region bytes).
+
+    The one list of everything mori keeps in symmetric memory beyond the arena a
+    caller lays out. A new buffer is added here and nowhere else: the size the
+    caller allocates, the offsets mori cuts the region at and the window mori
+    allocates when it allocates its own all come from this.
+    """
+    buffers = [("self_first", self_first_state_bytes(world_size))]
     offsets, off = {}, 0
-    for name, nbytes in _staging_buffers(world_size):
+    for name, nbytes in buffers:
         off = (off + _STAGING_ALIGN - 1) // _STAGING_ALIGN * _STAGING_ALIGN
         offsets[name] = off
         off += nbytes
@@ -93,11 +92,11 @@ def _staging_layout(world_size: int) -> tuple[dict[str, int], int]:
 def staging_region_bytes(world_size: int) -> int:
     """Bytes of symmetric memory mori needs besides the caller's arena.
 
-    A caller that allocates its own arena adds a region of this size to it and
-    names it with ``staging_region=`` on EpDispatchPlan; mori cuts its buffers out
-    of that region. The region must be zero when the arena is created and after
-    every arena-wide zero, and start on a 128 B line. Without ``staging_region``
-    mori allocates the same bytes itself (StagingState).
+    A caller that lays out its own arena adds a region of this size to it and names
+    it with ``staging_region=`` on EpDispatchPlan; mori cuts its buffers out of that
+    region. The region must start on a 128 B line and be zero when the arena is
+    created and after every arena-wide zero. Without ``staging_region`` mori
+    allocates the same bytes itself (StagingState).
     """
     return _staging_layout(world_size)[1]
 
@@ -122,7 +121,7 @@ def _window_flat_layout(win_handle: int, local_ptr: int) -> tuple[int, int]:
     stride = stride4g << 32
     if stride == 0 or win_base + lsa_rank * stride != local_ptr:
         raise RuntimeError(
-            f"staging state: window descriptor (winBase={win_base:#x}, "
+            f"staging region: window descriptor (winBase={win_base:#x}, "
             f"stride4G={stride4g}, lsaRank={lsa_rank}) does not locate the local "
             f"copy at {local_ptr:#x}"
         )
@@ -130,22 +129,18 @@ def _window_flat_layout(win_handle: int, local_ptr: int) -> tuple[int, int]:
 
 
 class _StagingBase:
-    """What a plan binds from: (base, stride) of the region, and the layout."""
+    """What a plan binds from: the region's (base, stride) and what sits where."""
 
     def __init__(self, world_size: int):
-        self.offsets, self._nbytes = _staging_layout(world_size)
-
-    @property
-    def nbytes(self) -> int:
-        return self._nbytes
+        self._offsets, self._nbytes = _staging_layout(world_size)
 
     def buffer_base(self, name: str) -> int:
         """PE p's copy of `name` is at buffer_base(name) + p * stride."""
-        return self.base + self.offsets[name]
+        return self.base + self._offsets[name]
 
 
 class ArenaStagingState(_StagingBase):
-    """The staging region the CALLER allocated, as a region of its own arena.
+    """The staging region as a region of the CALLER's arena.
 
     Owns nothing: the caller allocates, zeroes and frees the window.
     """
@@ -158,23 +153,18 @@ class ArenaStagingState(_StagingBase):
                 f"staging region {region!r} is at offset {offset}, not on a "
                 f"{_STAGING_ALIGN} B line"
             )
-        size = getattr(arena, "size", None)
-        if size is not None and size(region) < self._nbytes:
+        # Not optional: an arena that cannot report the size cannot be checked, and
+        # a region too small for the layout is not an error the kernel would raise
+        # -- mori's atomics would land in whatever region the arena put next.
+        if arena.size(region) < self._nbytes:
             raise RuntimeError(
-                f"staging region {region!r} is {size(region)} B, needs "
+                f"staging region {region!r} is {arena.size(region)} B, needs "
                 f"{self._nbytes} B (staging_region_bytes())"
             )
-        self._local = arena.local_ptr(region)
-        win_base, self.stride = _window_flat_layout(arena.handle, self._local - offset)
+        win_base, self.stride = _window_flat_layout(
+            arena.handle, arena.local_ptr(region) - offset
+        )
         self.base = win_base + offset
-
-    def zero(self) -> None:
-        import torch
-
-        from mori.tensor_utils import from_gpu_ptr
-
-        from_gpu_ptr(self._local, (self._nbytes,), torch.int8).zero_()
-        torch.cuda.synchronize()
 
     def release(self) -> None:
         pass
@@ -261,12 +251,10 @@ class EpDispatchPlan(_EpDispatchPlanBase):
     __doc__ = (_EpDispatchPlanBase.__doc__ or "") + (
         "\n\nThe gfx125x dispatch runs selfFirst unless ``tok_off_ext`` says the slot"
         "\nallocator word lives outside the cco window. With it and an arena, the plan"
-        "\nneeds mori's staging region, from one of two places. ``staging_region=NAME``:"
-        "\nthe arena's own region of that name (staging_region_bytes() sizes it), which"
-        "\nthe caller allocates and zeroes. Omitted: mori allocates it on first use"
-        "\n(StagingState), and an arena whose window mori.cco cannot trace to a"
-        "\ncommunicator makes construction raise. The two never mix: a named region the"
-        "\narena lacks raises rather than falling back."
+        "\nneeds mori's staging region: ``staging_region=NAME`` takes the arena's own"
+        "\nregion of that name (staging_region_bytes() sizes it, the caller zeroes it),"
+        "\nand omitting it has mori allocate one. The two never mix -- a named region"
+        "\nthe arena lacks raises rather than falling back."
     )
 
     def __init__(self, **kwargs):

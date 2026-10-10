@@ -808,15 +808,6 @@ class EpDispatchCombineOp:
         """
         return self._scale_row_bytes()
 
-    def staging_buffer_bytes(self) -> int:
-        """Per-rank symmetric staging bytes: the arena window plus mori's own staging
-        window (ep_plans.StagingState), which lives outside the arena."""
-        total = self.arena.total_bytes
-        staging = getattr(self, "_staging_state", None)
-        if staging is not None:
-            total += staging.nbytes
-        return total
-
     def _scale_row_bytes(self) -> int:
         """The caller's row in bytes, dword-rounded. 0 when the transport is off."""
         n = self.cfg.scale_dim * self.cfg.scale_type_size

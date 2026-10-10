@@ -377,7 +377,7 @@ def test_self_first_state_size_matches_the_device_layout():
 
 
 def _carrying_arena(offset, nbytes, region="mori_staging"):
-    """A caller's arena whose window holds a staging region at `offset`."""
+    """(comm, win, arena): a caller's arena whose window holds a staging region."""
     comm = _Comm()
     mem = comm.alloc_mem(offset + nbytes)
     win = comm.register_window(mem.ptr, offset + nbytes)
@@ -386,7 +386,7 @@ def _carrying_arena(offset, nbytes, region="mori_staging"):
         handle = win.handle
 
         def offset(self, n):
-            return offset if n == region else 256
+            return offset if n == region else 0
 
         def size(self, n):
             return nbytes
@@ -397,20 +397,19 @@ def _carrying_arena(offset, nbytes, region="mori_staging"):
     return comm, win, _CarryingArena()
 
 
-def test_staging_region_bytes_covers_every_staging_buffer():
-    # One buffer today; the region is its size rounded up to a 128 B line, and a
-    # new buffer added to _staging_buffers has to show up here without a second edit.
+def test_staging_region_bytes_covers_the_whole_layout():
+    """Every buffer fits, on its own 128 B line. A buffer added to _staging_layout
+    has to show up in the size the caller allocates without a second edit."""
     for world in (1, 4, 8):
         offsets, total = cb._staging_layout(world)
         assert cb.staging_region_bytes(world) == total
-        assert total >= sum(n for _, n in cb._staging_buffers(world))
         assert total % 128 == 0 and all(o % 128 == 0 for o in offsets.values())
-    assert cb.staging_region_bytes(8) >= cb.self_first_state_bytes(8)
+        assert total >= offsets["self_first"] + cb.self_first_state_bytes(world)
 
 
 def test_staging_region_is_used_in_place_and_not_allocated():
-    """With staging_region= the plan cuts mori's buffers out of the caller's arena:
-    nothing is allocated, and base/stride point into that region."""
+    """With staging_region= the plan cuts its buffers out of the caller's arena:
+    nothing is allocated or freed, and sfBase points into that region."""
     _self_first_or_skip()
     world = _plan().info["worldSize"]
     nbytes, offset = cb.staging_region_bytes(world), 512
@@ -422,34 +421,38 @@ def test_staging_region_is_used_in_place_and_not_allocated():
     self_first = cb._staging_layout(world)[0]["self_first"]
     assert p._defaults["sfStride"] == _Comm.STRIDE
     assert p._defaults["sfBase"] == win.local_ptr - _Comm.STRIDE + offset + self_first
-    p._staging_state.zero()
-    assert int(comm.allocs[0][offset : offset + nbytes].count_nonzero()) == 0
     p.close()
     assert comm.closed == [], "the caller's arena is not the plan's to free"
 
 
 def test_staging_region_never_falls_back_to_mori_allocating():
+    """A named region the arena lacks is a wiring error, not a reason to allocate."""
     _self_first_or_skip()
 
-    # _Arena has no region of that name: the plan must raise, not allocate.
     class _NoRegion(_Arena):
         def offset(self, name):
-            if name == "mori_staging":
-                raise KeyError(name)
-            return 256
+            raise KeyError(name)
 
     with pytest.raises(KeyError):
         _plan(arena=_NoRegion(0xDEAD0000), staging_region="mori_staging")
 
 
-def test_staging_region_too_small_or_misaligned_fails_construction():
+def test_staging_region_that_cannot_hold_the_layout_fails_construction():
+    """Overrunning the region would land in whatever the arena put next, so the
+    arena has to report a size, and it has to be big enough and aligned."""
     _self_first_or_skip()
-    world = _plan().info["worldSize"]
-    nbytes = cb.staging_region_bytes(world)
+    nbytes = cb.staging_region_bytes(_plan().info["worldSize"])
+
     _, _, small = _carrying_arena(256, nbytes)
     small.size = lambda n: nbytes - 1
     with pytest.raises(RuntimeError, match="needs"):
         _plan(arena=small, staging_region="mori_staging")
+
     _, _, misaligned = _carrying_arena(130, nbytes)
     with pytest.raises(RuntimeError, match="128 B"):
         _plan(arena=misaligned, staging_region="mori_staging")
+
+    _, _, unsized = _carrying_arena(256, nbytes)
+    del type(unsized).size
+    with pytest.raises(AttributeError, match="size"):
+        _plan(arena=unsized, staging_region="mori_staging")
