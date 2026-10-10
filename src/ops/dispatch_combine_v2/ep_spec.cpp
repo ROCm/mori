@@ -77,6 +77,9 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // sooner; 64x8 measured best for combine at every token count and topk on
   // mi355x, so it replaces v1's 80x4.
   const bool isDispatch = kind == EpKernelKind::Dispatch;
+  // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
+  // the rendered source and its cache key, stays exactly what it was without it.
+  c.selfFirst = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
@@ -104,9 +107,10 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
-        " blocks=" + std::to_string(c.blockNum) +
+        " blocks=" + std::to_string(c.blockNum) + " selfFirst=" + std::to_string(c.selfFirst) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
-        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize)");
+        "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
+        "selfFirst needs warpPerBlock >= 2, worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }

@@ -158,7 +158,7 @@ def push_wire_nbytes(cfg) -> int:
 
 
 class TokOffExt:
-    """Dispatch's slot allocator word outside the cco window (default-on gfx1250; MORI_EP_TOKOFF_EXT=0 opts out).
+    """Dispatch's slot allocator word outside the cco window (single-host gfx1250 EP, opt-in: MORI_EP_TOKOFF_EXT=1).
 
     One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
     opened on every peer by IPC handle. ``peers`` is the device array of
@@ -173,6 +173,34 @@ class TokOffExt:
     _BYTES = 4096
     _UNCACHED = 0x3  # hipDeviceMallocUncached
     _LAZY_PEER = 0x1  # hipIpcMemLazyEnablePeerAccess
+
+    @staticmethod
+    def wanted(world) -> bool:
+        """MORI_EP_TOKOFF_EXT=1 (default off), and every rank on this host.
+
+        The peers' words are opened by hipIpc handle, which no other host can open;
+        an EP spanning hosts keeps the word in the cco window, which is mapped across
+        them. Collective over the default process group, like the constructor.
+        """
+        v = os.environ.get("MORI_EP_TOKOFF_EXT", "").strip().lower()
+        if v not in ("1", "true", "yes", "on"):
+            return False
+        import socket
+
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return True  # the constructor reports the missing process group
+        # The kernel's boot id, not the hostname: containers on one host each have
+        # a hostname of their own.
+        try:
+            with open("/proc/sys/kernel/random/boot_id") as f:
+                host = f.read().strip()
+        except OSError:
+            host = socket.gethostname()
+        hosts = [None] * world
+        dist.all_gather_object(hosts, host)
+        return len(set(hosts)) == 1
 
     def __init__(self, rank, world, dev):
         import ctypes
@@ -310,6 +338,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._close_backend()
             self.arena.close()
             raise
+        # _build zeroes this rank's arena and selfFirst state, and a peer's first
+        # call already writes into both (its selfFirst count lands in this rank's
+        # inbox). A zero that runs after that write wipes it, and this rank's first
+        # dispatch then waits forever for the count. Every rank finishes its zeroes
+        # before any rank can make a call.
+        torch.cuda.synchronize(dev)
+        comm.barrier()
 
     @staticmethod
     def _specs_from(cfg):
@@ -326,6 +361,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
+        # Decided before the kernels are built: the dispatch plans run selfFirst only
+        # while the slot allocator word lives in the cco window (see TokOffExt below).
+        self._tokoff_wanted = (
+            not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
+        )
         self._kernels = self._build_kernels(cfg, self.arena)
 
         if cfg.is_internode:
@@ -342,14 +382,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
         # memory instead of the cco window (see TokOffExt): the cco-window slot
         # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
-        # only kernel that reads tokOffPeers. Default-on; MORI_EP_TOKOFF_EXT=0
-        # (or false/no/off) opts back out to the cco-window path (tokOffPeers
-        # stays None -> kernel EpTokOff falls back to the VMM hipMemCreate window).
+        # only kernel that reads tokOffPeers. Opt-in for a single-host EP with
+        # MORI_EP_TOKOFF_EXT=1; otherwise, and always for an EP spanning hosts, the
+        # word stays in the cco window (tokOffPeers stays None -> kernel EpTokOff
+        # falls back to the VMM hipMemCreate window).
         self._tokoff_ext = None
         self.tok_off_peers = None
-        _tokoff_env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
-        _tokoff_on = _tokoff_env not in ("0", "false", "no", "off")
-        if self._is1250 and _tokoff_on:
+        if self._tokoff_wanted:
             self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
             self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
@@ -613,6 +652,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         out_tok = cap * cfg.combine_token_nbytes
         if cfg.quant_type in _FP4_QUANT_TYPES:
             out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
+            # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
+            # which runs from four ranks up.
+            if cfg.world_size >= 4:
+                out_tok += cfg.world_size * cap * 8
         regions = [
             ("tok_off", 4),
             ("recv_num", cfg.world_size * 4),
@@ -1213,13 +1256,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
         self._plans = []
+        ext = int(getattr(self, "_tokoff_wanted", False))
         for b, w in self._dispatch_specs:
             plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w
+                **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
             )
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
+        # Outside the arena, so reset() has to zero it itself.
+        self._self_first_state = cb.SelfFirstState.of(arena)
         for b, w in self._combine_specs:
             plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
@@ -1242,6 +1288,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def _close_backend(self):
+        # The plans hold the references; the last one to close frees it.
+        self._self_first_state = None
         for plan in getattr(self, "_plans", ()):
             plan.close()
         ext = getattr(self, "_tokoff_ext", None)

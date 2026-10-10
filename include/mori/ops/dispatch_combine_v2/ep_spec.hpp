@@ -53,6 +53,7 @@ struct EpRequest {
   int scaleBytes = 0;    // per-token scale row carried with the payload; 0 = off
   bool combineFp4 = false;
   bool combineFp4F32Scale = false;
+  bool tokOffExt = false;
 };
 
 template <typename Self, typename Visit>
@@ -71,10 +72,11 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(scaleBytes);
   MORI_FIELD(combineFp4);
   MORI_FIELD(combineFp4F32Scale);
+  MORI_FIELD(tokOffExt);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 13,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 14,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

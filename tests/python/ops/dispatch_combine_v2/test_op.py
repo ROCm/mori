@@ -105,6 +105,12 @@ QUANT = os.environ.get("QUANT", "none")  # none | fp8_direct_cast | fp8_blockwis
 # fp8_blockwise per-block scaling branch (randn ~N(0,1) never triggers it).
 INSCALE = float(os.environ.get("INSCALE", 1))
 SWEEP = [int(x) for x in os.environ.get("SWEEP", "128,512").split(",")]
+# RAGGED=1: rank r sends ct * (r % 3) // 2 tokens of each SWEEP point -- none on ranks
+# 0 and 3, half on 1, all on 2 -- so one call mixes ranks that send nothing with
+# ranks the tuned schedule puts on different geometries.
+RAGGED = int(os.environ.get("RAGGED", 0))
+# NOSELF=1: no token picks an expert on its own rank, so no rank receives from itself.
+NOSELF = int(os.environ.get("NOSELF", 0))
 
 
 def main():
@@ -127,7 +133,12 @@ def main():
         if INSCALE != 1.0:
             inp = inp * INSCALE
         inp = inp.to(DTYPE).to(dev)
-    idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32).to(dev)
+    if NOSELF:
+        idx = torch.randint(0, num_experts - EPR, (M, K), generator=g, dtype=torch.int32)
+        idx += (idx >= rank * EPR).to(torch.int32) * EPR
+    else:
+        idx = torch.randint(0, num_experts, (M, K), generator=g, dtype=torch.int32)
+    idx = idx.to(dev)
     wts = torch.rand(M, K, generator=g, dtype=torch.float32).to(dev)
 
     # Per-token scales (int8 bytes): pattern = rank*100003 + tok per dword, so the
@@ -171,7 +182,15 @@ def main():
         comm.barrier()
 
         cap = cfg.effective_max_recv if cfg.max_total_recv_tokens > 0 else None
-        for ct in SWEEP:
+        for ct_point in SWEEP:
+            # This rank's token count; `ct` keeps naming the SWEEP point in the output.
+            ct = ct_point * (rank % 3) // 2 if RAGGED else ct_point
+            if RAGGED and rank == 0:
+                print(
+                    f"# RAGGED ct={ct_point}: per-rank tokens "
+                    f"{[ct_point * (r % 3) // 2 for r in range(npes)]}",
+                    flush=True,
+                )
             if int(os.environ.get("RESET", 0)):
                 op.reset()
                 sync()
@@ -193,11 +212,12 @@ def main():
             sync()
             comm.barrier()
             lec_total = d.allreduce_sum(lec_sum)
+            lec_exp = d.allreduce_sum(ct) * K
             if rank == 0 and has_lec:
-                ok_lec = lec_total == npes * ct * K
+                ok_lec = lec_total == lec_exp
                 print(
-                    f"# OP-LEC ct={ct}: {'PASS' if ok_lec else 'FAIL'} "
-                    f"(sum={lec_total} exp={npes * ct * K})",
+                    f"# OP-LEC ct={ct_point}: {'PASS' if ok_lec else 'FAIL'} "
+                    f"(sum={lec_total} exp={lec_exp})",
                     flush=True,
                 )
             if int(os.environ.get("REPLAY", 0)) and cap is None:
@@ -209,7 +229,7 @@ def main():
                 errs_r = d.allreduce_sum(0 if ok_r else 1)
                 if rank == 0:
                     print(
-                        f"# OP-REPLAY ct={ct}: {'PASS' if errs_r == 0 else 'FAIL'} "
+                        f"# OP-REPLAY ct={ct_point}: {'PASS' if errs_r == 0 else 'FAIL'} "
                         f"(replayed layout == original)",
                         flush=True,
                     )
@@ -224,7 +244,7 @@ def main():
                 errs = d.allreduce_sum(0 if ok_sc else 1)
                 if rank == 0:
                     print(
-                        f"# OP-SCALES ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"# OP-SCALES ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
                         f"(recv={total_recv}, scale_dim={SCALE_DIM}, "
                         f"{sc_n_i32} dwords/tok)",
                         flush=True,
@@ -237,15 +257,14 @@ def main():
                 # the point: combine only folds the weights, and reads no indices
                 # at all, so a kernel can corrupt both while payload and combine
                 # still pass.
-                srcs_i = [torch.empty_like(idx[:ct]) for _ in range(npes)]
-                srcs_w = [torch.empty_like(wts[:ct]) for _ in range(npes)]
-                dist.all_gather(srcs_i, idx[:ct].contiguous())
-                dist.all_gather(srcs_w, wts[:ct].contiguous())
-                all_i = torch.zeros(npes * M, K, dtype=torch.int32)
-                all_w = torch.zeros(npes * M, K, dtype=torch.float32)
-                for r in range(npes):
-                    all_i[r * M : r * M + ct] = srcs_i[r].cpu()
-                    all_w[r * M : r * M + ct] = srcs_w[r].cpu()
+                # Whole arrays rather than [:ct]: under RAGGED the ranks' counts
+                # differ, and the reverse map only indexes rows a rank really sent.
+                srcs_i = [torch.empty_like(idx) for _ in range(npes)]
+                srcs_w = [torch.empty_like(wts) for _ in range(npes)]
+                dist.all_gather(srcs_i, idx.contiguous())
+                dist.all_gather(srcs_w, wts.contiguous())
+                all_i = torch.cat([s.cpu() for s in srcs_i])
+                all_w = torch.cat([s.cpu() for s in srcs_w])
                 tim = routing.disp_tok_id_to_src_tok_id_local[:total_recv].cpu().long()
                 # The reverse map indexes the expected values, here and in the scale
                 # check above, so it is range-checked before being used as an index.
@@ -263,7 +282,7 @@ def main():
                 errs = d.allreduce_sum(0 if (ok_map and ok_i and ok_dw) else 1)
                 if rank == 0:
                     print(
-                        f"# OP-META ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"# OP-META ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
                         f"(recv={total_recv}, topk={K}, map="
                         f"{'ok' if ok_map else 'BAD'}, idx={'ok' if ok_i else 'BAD'}, "
                         f"wts={'ok' if ok_dw else 'BAD'})",
@@ -280,7 +299,7 @@ def main():
                 errs = d.allreduce_sum(0 if ok else 1)
                 if rank == 0:
                     print(
-                        f"# OP-CAP ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                        f"# OP-CAP ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
                         f"(recv={total_recv} <= cap={cap}, no OOB)",
                         flush=True,
                     )
@@ -337,7 +356,7 @@ def main():
             errs = d.allreduce_sum(0 if (ok and ok_w) else 1)
             if rank == 0:
                 print(
-                    f"# {tag} ct={ct}: {'PASS' if errs == 0 else 'FAIL'} "
+                    f"# {tag} ct={ct_point}: {'PASS' if errs == 0 else 'FAIL'} "
                     f"(hidden={'ok' if ok else 'BAD'} wts={'ok' if ok_w else 'BAD'}; "
                     f"recv={total_recv})",
                     flush=True,

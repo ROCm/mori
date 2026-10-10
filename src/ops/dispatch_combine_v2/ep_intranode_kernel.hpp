@@ -64,6 +64,27 @@ __device__ __forceinline__ T* EpLocal(unsigned long long win, unsigned long long
       reinterpret_cast<::mori::cco::ccoWindow_t>(win), static_cast<size_t>(off)));
 }
 
+struct EpWinC {
+  unsigned long long h;
+};
+
+using EpWinConstPtr = const __attribute__((address_space(4))) ::mori::cco::ccoWindowDevice*;
+
+template <typename T>
+__device__ __forceinline__ T* EpPeer(EpWinC win, int peer, unsigned long long off) {
+  const EpWinConstPtr w = reinterpret_cast<EpWinConstPtr>(win.h);
+  return reinterpret_cast<T*>(w->winBase + ((static_cast<uint64_t>(peer) * w->stride4G) << 32) +
+                              static_cast<size_t>(off));
+}
+
+template <typename T>
+__device__ __forceinline__ T* EpLocal(EpWinC win, unsigned long long off) {
+  const EpWinConstPtr w = reinterpret_cast<EpWinConstPtr>(win.h);
+  return reinterpret_cast<T*>(w->winBase +
+                              ((static_cast<uint64_t>(w->lsaRank) * w->stride4G) << 32) +
+                              static_cast<size_t>(off));
+}
+
 // Spin helpers. SYSTEM scope is load-bearing: the dispatch notify loop spins on
 // a *peer's* signal word, and AGENT scope there hangs.
 template <typename T>

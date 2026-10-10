@@ -1050,6 +1050,10 @@ class EpDispatchCombineOp:
         tokoff_ext = getattr(self, "_tokoff_ext", None)
         if tokoff_ext is not None:
             tokoff_ext.zero()
+        # So does selfFirst its per-call state (ep_plans.SelfFirstState).
+        self_first = getattr(self, "_self_first_state", None)
+        if self_first is not None:
+            self_first.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
@@ -1067,6 +1071,12 @@ class EpDispatchCombineOp:
             counter = getattr(self, name, None)
             if counter is not None:
                 counter.zero_()
+        # A peer's next call writes into the state zeroed above, so, as when the op
+        # is built, every rank finishes its zeroes before any rank goes on.
+        torch.cuda.synchronize()
+        comm = getattr(self, "comm", None)
+        if comm is not None:
+            comm.barrier()
 
     def __repr__(self):
         return (

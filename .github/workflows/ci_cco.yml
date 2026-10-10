@@ -355,7 +355,7 @@ jobs:
           # non-zero if one fails, so this is a smoke test as well as a bench.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            BACKENDS=flydsl,hip MODES=graph SWEEP=128,512,4096,8192 \
+            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
             ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_ep.py"
 
@@ -383,8 +383,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC]
-            node1_host: 10.2.80.22
-            node2_host: 10.2.80.20
+            node1_host: 10.2.80.20
+            node2_host: 10.2.80.10
             node2_port: 22
             node1_ifname: enp193s0f1np1
             node2_ifname: enp193s0f1np1
