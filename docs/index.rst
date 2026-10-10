@@ -16,6 +16,7 @@ MORI Documentation
    :caption: User Guides
 
    MORI-EP-GUIDE
+   rdna4_ep
    MORI-SHMEM-GUIDE
    MORI-CCO-GUIDE
    MORI-IR-GUIDE

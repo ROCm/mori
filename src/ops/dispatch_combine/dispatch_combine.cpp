@@ -208,6 +208,22 @@ EpDispatchCombineHandle::~EpDispatchCombineHandle() {
 mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size,
                                                                      unsigned int flags) {
   if (!useCcoComm) {
+    // RDNA4 EP2/EP4 opt-in cached payloads are separate IPC allocations. Keep the
+    // uncached static heap for control/metadata; flags on heap suballocations
+    // would otherwise be ignored. No process-global allocator policy changes.
+    auto* states = ShmemStatesSingleton::GetInstance();
+    if (flags == hipDeviceMallocDefault && states->mode == ShmemMode::StaticHeap) {
+      // On the validated gfx1201 ROCm stack, reusing sub-2 MiB cached IPC
+      // allocations can leave peer writes invisible through the local mapping
+      // (e.g. FP16 H5120 capacities 1024 -> 192 -> 128 -> 64). A 2 MiB minimum
+      // avoids that small-allocation path. InitializeShmemBuf gates cached
+      // payloads to opt-in gfx1201 EP2/EP4; do not change the generic allocator
+      // or the uncached control heap. Tensor extents still come from config,
+      // and allocations >= 2 MiB plus all per-call kernel work are unchanged.
+      constexpr size_t kMinCachedIpcBytes = size_t{2} << 20;
+      return states->memoryStates->symmMemMgr->ExtMallocWithFlags(
+          std::max(size, kMinCachedIpcBytes), flags);
+    }
     void* buf = ShmemExtMallocWithFlags(size, flags);
     HIP_RUNTIME_CHECK(hipMemset(buf, 0, size));
     mori::application::SymmMemObjPtr obj = ShmemQueryMemObjPtr(buf);
@@ -278,6 +294,18 @@ mori::application::SymmMemObjPtr EpDispatchCombineHandle::MallocSymm(size_t size
 void EpDispatchCombineHandle::FreeSymmByLocalPtr(void* localPtr) {
   if (localPtr == nullptr) return;
   if (!useCcoComm) {
+    auto* states = ShmemStatesSingleton::GetInstance();
+    if (states->mode == ShmemMode::StaticHeap) {
+      const auto* memory = states->memoryStates;
+      const uintptr_t address = reinterpret_cast<uintptr_t>(localPtr);
+      const uintptr_t base = reinterpret_cast<uintptr_t>(memory->staticHeapBasePtr);
+      if (address < base || address - base >= memory->staticHeapSize) {
+        // A separately registered payload must close its own IPC handles and
+        // hipFree its allocation, not return its address to the heap allocator.
+        memory->symmMemMgr->Free(localPtr);
+        return;
+      }
+    }
     mori::shmem::ShmemFree(localPtr);
     return;
   }
@@ -312,6 +340,29 @@ void EpDispatchCombineHandle::FinalizeCcoAllocs() {
 }
 
 void EpDispatchCombineHandle::InitializeShmemBuf() {
+  unsigned int payloadFlags = hipDeviceMallocUncached;
+  const char* rdna4Ep = std::getenv("MORI_RDNA4_EP");
+  if (rdna4Ep && std::string(rdna4Ep) == "1") {
+    int device = 0;
+    hipDeviceProp_t properties{};
+    HIP_RUNTIME_CHECK(hipGetDevice(&device));
+    HIP_RUNTIME_CHECK(hipGetDeviceProperties(&properties, device));
+    if (useCcoComm || config.kernelType != KernelType::IntraNode ||
+        (config.worldSize != 2 && config.worldSize != 4) || config.gpuPerNode != config.worldSize ||
+        config.numExpertPerToken < 1 || config.numExpertPerToken > 64 ||
+        config.quantType != QuantType::None || config.scaleDim != 0 ||
+        !config.useExternalInpBuffer || config.maxTokenTypeSize != 2 || config.hiddenDim < 2048 ||
+        config.hiddenDim > 8192 || config.hiddenDim % 8 != 0 ||
+        config.MaxNumTokensToRecv() != config.worldSize * config.MaxNumTokensToSendPerRank() ||
+        std::string(properties.gcnArchName).rfind("gfx1201", 0) != 0 ||
+        ShmemStatesSingleton::GetInstance()->mode != ShmemMode::StaticHeap) {
+      throw std::invalid_argument(
+          "MORI_RDNA4_EP requires gfx1201 unquantized IntraNode EP2/EP4 topk=1..64, "
+          "16-bit external input, H=2048..8192 aligned to 8, full receive capacity, "
+          "scale_dim=0, MORI_EP_COMM=shmem and MORI_SHMEM_MODE=static_heap");
+    }
+    payloadFlags = hipDeviceMallocDefault;
+  }
   size_t combineOutSize = static_cast<ssize_t>(config.MaxNumTokensToSendPerRank()) *
                           config.HiddenDimSz() * config.maxTokenTypeSize;
   size_t dispatchOutSize = static_cast<ssize_t>(config.MaxNumTokensToRecv()) *
@@ -332,9 +383,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
 
   if (config.kernelType == KernelType::IntraNode || config.kernelType == KernelType::IntraNodeLL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsIntraNode>();
-    bufs.combineInp = MallocSymm(maxStagingSize, hipDeviceMallocUncached);
-    bufs.dispatchOut = MallocSymm(dispatchOutSize, hipDeviceMallocUncached);
-    bufs.combineOut = MallocSymm(combineOutSize, hipDeviceMallocUncached);
+    bufs.combineInp = MallocSymm(maxStagingSize, payloadFlags);
+    bufs.dispatchOut = MallocSymm(dispatchOutSize, payloadFlags);
+    bufs.combineOut = MallocSymm(combineOutSize, payloadFlags);
   } else if (config.kernelType == KernelType::InterNodeV1 ||
              config.kernelType == KernelType::InterNodeV1LL) {
     auto& bufs = shmemTokBufs.emplace<ShmemBufsInterNodeV1>();
