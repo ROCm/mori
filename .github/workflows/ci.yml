@@ -35,6 +35,7 @@ env:
   CONTAINER: mori_ci_${{ github.run_id }}
   CT: docker
 
+
 jobs:
   build:
     name: mori build (${{ matrix.platform }})
@@ -234,8 +235,11 @@ jobs:
 
       - name: MORI-EP (async_ll IBGDA)
         run: |
+          # NCCL_IB_DISABLE=1: RCCL calls ibv_fork_init() once it detects PeerDirect, and with
+          # fork tracking on, rdma-core fails mlx5 dmabuf umems that sit at a nonzero dmabuf
+          # offset (MORI's sub-allocated CQs). This test never uses RCCL's IB transport.
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
-            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
+            cd $GITHUB_WORKSPACE && MORI_DISABLE_P2P=1 MORI_ENABLE_SDMA=0 NCCL_IB_DISABLE=1 timeout 300 pytest tests/python/ops/test_dispatch_combine_async_ll.py -v
           "
 
       - name: MORI-EP (AUTO tuning config quant types, CPU)
@@ -667,8 +671,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC]
-            node1_host: 10.2.80.22
-            node2_host: 10.2.80.20
+            node1_host: 10.2.80.20
+            node2_host: 10.2.80.10
             node2_port: 22
             node1_ifname: enp193s0f1np1
             node2_ifname: enp193s0f1np1
@@ -709,7 +713,11 @@ jobs:
           #   timeout_minutes: 45
     env:
       CT: ${{ matrix.ct }}
-      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      # node2's sshd checks every new connection against the Conductor auth
+      # service, which intermittently answers 503 and denies the login (ssh exits
+      # 255). Multiplex all of a job's ssh/rsync calls over one master connection
+      # so only the first one is checked; "Open SSH connection to node2" retries it.
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ControlMaster=auto -o ControlPath=/tmp/mori-ci-ssh-%C -o ControlPersist=30m
       NODE1_HOST: ${{ matrix.node1_host }}
       NODE2_HOST: ${{ matrix.node2_host }}
       NODE2_PORT: ${{ matrix.node2_port }}
@@ -769,6 +777,15 @@ jobs:
             $IMAGE sleep infinity
           $CT exec $CONTAINER \
             git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Open SSH connection to node2
+        run: |
+          for i in 1 2 3 4 5; do
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST true && exit 0
+            echo "ssh to node2 failed (attempt $i/5), retrying in 10s"
+            sleep 10
+          done
+          exit 1
 
       - name: Start container on node2
         run: |
