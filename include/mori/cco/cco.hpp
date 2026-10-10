@@ -1182,6 +1182,8 @@ typedef struct CCO_SDMA_PKT_ATOMIC_TAG {
 
 // ── from anvil_device.hpp (device path only; host queue-setup constants omitted) ──
 constexpr uint32_t CCO_SDMA_QUEUE_SIZE = 256 * 1024;  // 256KB
+// Top bit of committedWptr: a commit owns the doorbell while it is set.
+constexpr uint64_t CCO_SDMA_RINGING = 1ull << 63;
 constexpr int CCO_SDMA_MAX_RETRIES = 1 << 30;
 // Bound the spin loops and trap on a suspected deadlock. Off by default
 // (including under JIT, which does not define NDEBUG) to keep SGPRs down.
@@ -1440,42 +1442,48 @@ inline __device__ void ccoSdmaFillLane(uint32_t* queueBuf, uint64_t slot, HSAuin
 
 // Ring the doorbell for everything placed-but-not-rung on this queue.
 //
-// A commit owns no reservation -- it rings for whatever is already placed --
-// so it must not hand its snapshot of committedWptr to submitPacket as if it
-// were a chain position. Doing so deadlocks the moment two waves commit one
-// queue: both read base == C, the first publishes and moves committedWptr past
-// C, and the second waits forever for a monotonic counter to return to C.
+// A commit owns no reservation -- it rings for whatever is already placed -- so
+// it must not hand its snapshot of committedWptr to submitPacket as if it were a
+// chain position. That deadlocks the moment two waves commit one queue: both read
+// base == C, the first publishes and moves committedWptr past C, and the second
+// waits forever for a monotonic counter to come back to C.
 //
-// Claim the range with a CAS and let only the winner ring. Winners advance
-// committedWptr in strictly increasing steps, so the doorbell never walks
-// backwards -- which matters, because a doorbell below the read pointer reads
-// as a wrap and sends the engine through the whole ring. A loser retries from
-// where the winner left off, so its own packets still get rung.
-//
-// Store order is load-bearing: wptr must be stored before the CAS, and the
-// doorbell after it.
+// Take ownership with the CAS rather than publishing with it. The owner is the
+// only writer of wptr and the doorbell, so neither can walk backwards -- which
+// matters, because a doorbell below the read pointer reads as a wrap and sends
+// the engine through the whole ring. The next ringer starts only after observing
+// the release store that follows our doorbell, the same argument submitPacket
+// relies on. The owner never waits on anyone, so it cannot deadlock; within a
+// wave too, since the winner releases in the iteration it won.
 inline __device__ void ccoSdmaRingQueueDbr(ccoSdmaQueueDeviceHandle& handle) {
   uint64_t base = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
                                     __HIP_MEMORY_SCOPE_AGENT);
   for (;;) {
+    if (base & CCO_SDMA_RINGING) {  // another commit owns the doorbell; back off
+      __builtin_amdgcn_s_sleep(1);
+      base = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+      continue;
+    }
     const uint64_t pending = __hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED,
                                                __HIP_MEMORY_SCOPE_AGENT);
-    if (base >= pending) return;  // a winner already rang past everything we placed
-    ccoSdmaPublishStores();
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    __hip_atomic_store(impl::global(handle.wptr), pending, __ATOMIC_RELAXED,
-                       __HIP_MEMORY_SCOPE_AGENT);
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    if (base >= pending) return;  // an owner already rang past everything we placed
     uint64_t seen = base;
-    if (__hip_atomic_compare_exchange_strong(impl::global(handle.committedWptr), &seen, pending,
-                                             __ATOMIC_RELAXED, __ATOMIC_RELAXED,
-                                             __HIP_MEMORY_SCOPE_AGENT)) {
+    if (__hip_atomic_compare_exchange_strong(impl::global(handle.committedWptr), &seen,
+                                             base | CCO_SDMA_RINGING, __ATOMIC_RELAXED,
+                                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+      ccoSdmaPublishStores();
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      __hip_atomic_store(impl::global(handle.wptr), pending, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
       __hip_atomic_store(impl::global(handle.doorbell), pending, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_SYSTEM);
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      __hip_atomic_store(impl::global(handle.committedWptr), pending, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);  // release
       return;
     }
-    base = seen;  // lost; re-check what is still unrung and try again
+    base = seen;  // lost the race; re-check what is still unrung and try again
   }
 }
 
@@ -1749,8 +1757,13 @@ inline __device__ void ccoSdmaCommitBlock(ccoSdmaQueueDeviceHandle** deviceHandl
 // published on this queue (rptr >= committedWptr). Independent of signals, so it
 // works whatever a put's signal targets (local / peer / none).
 inline __device__ void ccoSdmaDrainQueue(ccoSdmaQueueDeviceHandle& handle) {
+  // Mask the ownership bit: a commit may hold it right now, and target is a
+  // snapshot taken outside the loop below -- keeping the bit would leave rptr
+  // chasing a value near 2^63 forever. The masked value is the last published
+  // position, which is exactly what drain has to wait for.
   uint64_t target = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
-                                      __HIP_MEMORY_SCOPE_AGENT);
+                                      __HIP_MEMORY_SCOPE_AGENT) &
+                    ~CCO_SDMA_RINGING;
   // Aggregate puts that were never commit()ed sit past committedWptr, so this
   // would return without them having been rung.
   if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
