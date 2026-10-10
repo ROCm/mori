@@ -26,11 +26,15 @@ on:
         type: boolean
         default: false
         description: Merge the current main into the branch before testing (set by ci-rerun.yml)
+      pr_number:
+        type: string
+        default: ""
+        description: PR this run re-runs CI for (set by ci-rerun.yml; shares the PR's concurrency group)
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
   cancel-in-progress: true
 
 env:

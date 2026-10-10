@@ -5,7 +5,9 @@ name: ci-rerun
 #
 # This starts ci.yml and ci_cco.yml with workflow_dispatch on the PR branch and
 # merge_main=true, so they merge the current main in after checkout. Their
-# results land on the PR head commit and show up in the PR checks.
+# results land on the PR head commit and show up in the PR checks, and they
+# share the PR's concurrency group (pr_number), so a re-run replaces a CI run
+# in progress and a later push replaces the re-run.
 # GITHUB_TOKEN may start workflow_dispatch runs (labels or pushes made with it
 # start nothing), so no personal token is involved. Fork PRs are not
 # supported: workflow_dispatch can only target branches of this repository.
@@ -77,7 +79,7 @@ jobs:
             for (const workflow_id of ['ci.yml', 'ci_cco.yml']) {
               try {
                 await github.rest.actions.createWorkflowDispatch({
-                  owner, repo, workflow_id, ref: pr.head.ref, inputs: { merge_main: 'true' } });
+                  owner, repo, workflow_id, ref: pr.head.ref, inputs: { merge_main: 'true', pr_number: String(number) } });
               } catch (e) {
                 if (e.status !== 422) throw e;
                 await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id, ref: pr.head.ref });
