@@ -87,12 +87,14 @@ def staging_layout(world_size: int) -> tuple[dict[str, int], int]:
 
 
 def staging_region_bytes(world_size: int) -> int:
-    """Bytes a caller that lays out its own arena reserves in it for mori's staging
-    region, then names with ``staging_region=`` on EpDispatchPlan."""
+    """Bytes of mori's staging region. Both paths size from this, which is what
+    keeps them in step when a buffer is added: a caller that lays out its own arena
+    reserves this much in it and names it with ``staging_region=`` on
+    EpDispatchPlan, and mori allocates this much when it is not given one."""
     return staging_layout(world_size)[1]
 
 
-def _arena_staging(arena, region: str, world_size: int) -> tuple[int, int]:
+def _external_staging(arena, region: str, world_size: int) -> tuple[int, int]:
     """(base, stride) of a staging region the CALLER reserved in its own arena.
 
     Nothing is allocated or freed here: the arena's owner does both, and its own
@@ -240,7 +242,7 @@ class EpDispatchPlan(_EpDispatchPlanBase):
         offsets = staging_layout(world_size)[0]
         try:
             if region is not None:
-                base, stride = _arena_staging(arena, region, world_size)
+                base, stride = _external_staging(arena, region, world_size)
             else:
                 state = self._self_first_state = SelfFirstState.acquire(
                     arena, world_size
