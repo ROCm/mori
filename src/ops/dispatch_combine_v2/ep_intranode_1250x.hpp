@@ -2651,7 +2651,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         unsigned char s0[kH];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-          __builtin_amdgcn_s_wait_tensorcnt(0);
+          // The compiler does not see a TDM load write the staging area, so the wait itself must
+          // keep the reads below it; the builtin wait does not.
+          asm volatile("s_wait_tensorcnt 0x0" ::: "memory");
           uint4 xs[kH];
 #pragma unroll
           for (int i = 0; i < kH; ++i) xs[i] = l[i * WS + laneId];
