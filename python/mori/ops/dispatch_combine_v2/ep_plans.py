@@ -92,33 +92,6 @@ def staging_region_bytes(world_size: int) -> int:
     return staging_layout(world_size)[1]
 
 
-def _window_flat_layout(win_handle: int, local_ptr: int) -> tuple[int, int]:
-    """(base, stride) such that PE p's copy of the window's byte 0 is at
-    base + p * stride.
-
-    Read once from the window's device descriptor (ccoWindowDevice in cco.hpp:
-    u64 winBase, u32 stride4G, i32 lsaRank), so the kernel addresses the state
-    without loading it. Checked against the local address, which cco reports
-    independently: a descriptor laid out differently fails here, not on the GPU.
-    """
-    import struct
-
-    import torch
-
-    from mori.tensor_utils import from_gpu_ptr
-
-    raw = bytes(from_gpu_ptr(win_handle, (16,), torch.uint8).cpu().tolist())
-    win_base, stride4g, lsa_rank = struct.unpack_from("<QIi", raw)
-    stride = stride4g << 32
-    if stride == 0 or win_base + lsa_rank * stride != local_ptr:
-        raise RuntimeError(
-            f"selfFirst state: window descriptor (winBase={win_base:#x}, "
-            f"stride4G={stride4g}, lsaRank={lsa_rank}) does not locate the local "
-            f"copy at {local_ptr:#x}"
-        )
-    return win_base, stride
-
-
 def _arena_staging(arena, region: str, world_size: int) -> tuple[int, int]:
     """(base, stride) of a staging region the CALLER reserved in its own arena.
 
@@ -133,7 +106,9 @@ def _arena_staging(arena, region: str, world_size: int) -> tuple[int, int]:
             f"staging region {region!r} is {arena.size(region)} B at offset {offset}; "
             f"needs {nbytes} B (staging_region_bytes()) on a {_STAGING_ALIGN} B line"
         )
-    base, stride = _window_flat_layout(arena.handle, arena.local_ptr(region) - offset)
+    base, stride = SelfFirstState._flat_layout(
+        arena.handle, arena.local_ptr(region) - offset
+    )
     return base + offset, stride
 
 
@@ -158,7 +133,7 @@ class SelfFirstState:
         self._win = None
         try:
             self._win = comm.register_window(self._mem.ptr, nbytes)
-            self.base, self.stride = _window_flat_layout(
+            self.base, self.stride = self._flat_layout(
                 self._win.handle, self._win.local_ptr
             )
             self.zero()
@@ -192,6 +167,33 @@ class SelfFirstState:
     def of(cls, arena) -> "SelfFirstState | None":
         """The live state of `arena`, without taking a reference."""
         return cls._by_window.get(int(arena.handle))
+
+    @staticmethod
+    def _flat_layout(win_handle, local_ptr) -> tuple[int, int]:
+        """(base, stride) such that PE p's copy of the window's byte 0 is at
+        base + p * stride.
+
+        Read once from the window's device descriptor (ccoWindowDevice in cco.hpp:
+        u64 winBase, u32 stride4G, i32 lsaRank), so the kernel addresses the state
+        without loading it. Checked against the local address, which cco reports
+        independently: a descriptor laid out differently fails here, not on the GPU.
+        """
+        import struct
+
+        import torch
+
+        from mori.tensor_utils import from_gpu_ptr
+
+        raw = bytes(from_gpu_ptr(win_handle, (16,), torch.uint8).cpu().tolist())
+        win_base, stride4g, lsa_rank = struct.unpack_from("<QIi", raw)
+        stride = stride4g << 32
+        if stride == 0 or win_base + lsa_rank * stride != local_ptr:
+            raise RuntimeError(
+                f"selfFirst state: window descriptor (winBase={win_base:#x}, "
+                f"stride4G={stride4g}, lsaRank={lsa_rank}) does not locate the local "
+                f"copy at {local_ptr:#x}"
+            )
+        return win_base, stride
 
     def zero(self) -> None:
         import torch
