@@ -333,12 +333,12 @@ def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
     assert a._defaults["sfBase"] == b._defaults["sfBase"] == base
     assert a._defaults["sfStride"] == b._defaults["sfStride"] == _Comm.STRIDE
     assert int(comm.allocs[0].count_nonzero()) == 0, "the state must start zeroed"
-    assert cb.StagingState.of(arena) is not None
+    assert cb.SelfFirstState.of(arena) is not None
     a.close()
     assert comm.closed == [], "freed while a plan still holds it"
     b.close()
     assert sorted(comm.closed) == ["mem", "win"]
-    assert cb.StagingState.of(arena) is None
+    assert cb.SelfFirstState.of(arena) is None
 
 
 def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monkeypatch):
@@ -357,7 +357,7 @@ def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monke
     with pytest.raises(RuntimeError, match="does not locate"):
         _plan(arena=arena)
     assert sorted(comm.closed) == ["mem", "win"], "a failed allocation must not leak"
-    assert cb.StagingState.of(arena) is None
+    assert cb.SelfFirstState.of(arena) is None
 
 
 def test_self_first_follows_the_slot_word():
@@ -376,32 +376,26 @@ def test_self_first_state_size_matches_the_device_layout():
     assert cb.self_first_state_bytes(8) == 768
 
 
-def _carrying_arena(offset, nbytes, region="mori_staging"):
-    """(comm, win, arena): a caller's arena whose window holds a staging region."""
+def _staging_arena(offset, nbytes, region="mori_staging"):
+    """(comm, win, arena): a caller's own arena, holding a staging region."""
     comm = _Comm()
     mem = comm.alloc_mem(offset + nbytes)
     win = comm.register_window(mem.ptr, offset + nbytes)
 
-    class _CarryingArena:
+    class _Carrying:
         handle = win.handle
+        offset = staticmethod(lambda n: offset)
+        size = staticmethod(lambda n: nbytes)
+        local_ptr = staticmethod(lambda n: win.local_ptr + offset)
 
-        def offset(self, n):
-            return offset if n == region else 0
-
-        def size(self, n):
-            return nbytes
-
-        def local_ptr(self, n):
-            return win.local_ptr + offset
-
-    return comm, win, _CarryingArena()
+    return comm, win, _Carrying()
 
 
 def test_staging_region_bytes_covers_the_whole_layout():
-    """Every buffer fits, on its own 128 B line. A buffer added to _staging_layout
-    has to show up in the size the caller allocates without a second edit."""
+    """A buffer added to staging_layout has to show up in the bytes the caller
+    reserves, on a 128 B line of its own, without a second edit."""
     for world in (1, 4, 8):
-        offsets, total = cb._staging_layout(world)
+        offsets, total = cb.staging_layout(world)
         assert cb.staging_region_bytes(world) == total
         assert total % 128 == 0 and all(o % 128 == 0 for o in offsets.values())
         assert total >= offsets["self_first"] + cb.self_first_state_bytes(world)
@@ -413,46 +407,42 @@ def test_staging_region_is_used_in_place_and_not_allocated():
     _self_first_or_skip()
     world = _plan().info["worldSize"]
     nbytes, offset = cb.staging_region_bytes(world), 512
-    comm, win, arena = _carrying_arena(offset, nbytes)
+    comm, win, arena = _staging_arena(offset, nbytes)
 
     p = _plan(arena=arena, staging_region="mori_staging")
     assert len(comm.allocs) == 1, "the plan must not allocate a window of its own"
-    assert cb.StagingState.of(arena) is None, "the mori-allocated path was taken"
-    self_first = cb._staging_layout(world)[0]["self_first"]
+    assert cb.SelfFirstState.of(arena) is None, "the mori-allocated path was taken"
+    self_first = cb.staging_layout(world)[0]["self_first"]
     assert p._defaults["sfStride"] == _Comm.STRIDE
     assert p._defaults["sfBase"] == win.local_ptr - _Comm.STRIDE + offset + self_first
     p.close()
     assert comm.closed == [], "the caller's arena is not the plan's to free"
 
 
-def test_staging_region_never_falls_back_to_mori_allocating():
-    """A named region the arena lacks is a wiring error, not a reason to allocate."""
+def test_staging_region_that_cannot_hold_the_layout_fails_construction():
+    """Overrunning the region lands in whatever the arena put next rather than
+    raising, so a region mori cannot verify it fits in is a construction error."""
     _self_first_or_skip()
+    world = _plan().info["worldSize"]
+    nbytes = cb.staging_region_bytes(world)
 
     class _NoRegion(_Arena):
         def offset(self, name):
             raise KeyError(name)
 
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError):  # never falls back to mori allocating
         _plan(arena=_NoRegion(0xDEAD0000), staging_region="mori_staging")
 
-
-def test_staging_region_that_cannot_hold_the_layout_fails_construction():
-    """Overrunning the region would land in whatever the arena put next, so the
-    arena has to report a size, and it has to be big enough and aligned."""
-    _self_first_or_skip()
-    nbytes = cb.staging_region_bytes(_plan().info["worldSize"])
-
-    _, _, small = _carrying_arena(256, nbytes)
-    small.size = lambda n: nbytes - 1
-    with pytest.raises(RuntimeError, match="needs"):
+    _, _, small = _staging_arena(256, nbytes)
+    small.size = staticmethod(lambda n: nbytes - 1)
+    with pytest.raises(RuntimeError, match="staging_region_bytes"):
         _plan(arena=small, staging_region="mori_staging")
 
-    _, _, misaligned = _carrying_arena(130, nbytes)
-    with pytest.raises(RuntimeError, match="128 B"):
+    _, _, misaligned = _staging_arena(130, nbytes)
+    with pytest.raises(RuntimeError, match="128 B line"):
         _plan(arena=misaligned, staging_region="mori_staging")
 
-    _, _, unsized = _carrying_arena(256, nbytes)
+    _, _, unsized = _staging_arena(256, nbytes)
     del type(unsized).size
     with pytest.raises(AttributeError, match="size"):
         _plan(arena=unsized, staging_region="mori_staging")

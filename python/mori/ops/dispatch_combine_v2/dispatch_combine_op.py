@@ -1050,11 +1050,10 @@ class EpDispatchCombineOp:
         tokoff_ext = getattr(self, "_tokoff_ext", None)
         if tokoff_ext is not None:
             tokoff_ext.zero()
-        # So does mori its staging region, e.g. selfFirst's per-call state
-        # (ep_plans.StagingState).
-        staging = getattr(self, "_staging_state", None)
-        if staging is not None:
-            staging.zero()
+        # So does selfFirst its per-call state (ep_plans.SelfFirstState).
+        self_first = getattr(self, "_self_first_state", None)
+        if self_first is not None:
+            self_first.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
