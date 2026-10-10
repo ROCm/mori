@@ -35,7 +35,11 @@
 // nodes. On a single-GPU machine both ends share GPU 0 and its NIC.
 //
 // Usage: test_fault_injection [id-substring]
-//   MORI_IO_FAULT_CATALOG=<file.yaml> runs another catalog.
+//   MORI_IO_FAULT_CATALOG=<file.yaml>  runs another catalog
+//   MORI_IO_FAULT_TARGET_GPU=<n>       puts the target on GPU n (0: same NIC as the initiator)
+//   MORI_IO_FAULT_REPORT=<file.md>     appends a markdown results table (CI job summary)
+// Exits non-zero only on a FAIL (a check failed that the entry does not expect)
+// or an XPASS (a known_bug entry now passes a check it is expected to fail).
 // Needs -DENABLE_IO_FAULT_INJECTION=ON, an active RDMA NIC and a GPU (two of each
 // for the cross-NIC setup).
 
@@ -53,7 +57,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -95,7 +101,11 @@ struct Entry {
   bool notify{false};
   int warmup{0};
   Side side{Side::Initiator};
+  std::string knownBug;         // empty = expected to pass every check
+  std::set<std::string> fails;  // with knownBug: the checks expected to fail today
 };
+
+const std::set<std::string> kChecks = {"ends", "honest", "recovers", "alive"};
 
 std::string CatalogPath() {
   const char* path = std::getenv("MORI_IO_FAULT_CATALOG");
@@ -105,8 +115,8 @@ std::string CatalogPath() {
 // Loads and validates a catalog; throws with the file and entry on any mistake,
 // so a typo never silently drops or weakens an entry.
 std::vector<Entry> LoadCatalog(const std::string& path) {
-  const std::set<std::string> kFields = {"id",     "real_world", "rule", "transfer",
-                                         "notify", "warmup",     "side"};
+  const std::set<std::string> kFields = {"id",     "real_world", "rule",      "transfer", "notify",
+                                         "warmup", "side",       "known_bug", "fails"};
   std::vector<Entry> entries;
   std::set<std::string> ids;
   for (const mori::yaml::FlatMap& raw : mori::yaml::LoadFlatList(path)) {
@@ -142,6 +152,20 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       e.side = Side::Target;
     } else {
       throw std::runtime_error(where + ": side must be initiator or target, got '" + side + "'");
+    }
+    e.knownBug = mori::yaml::GetString(raw, "known_bug");
+    std::istringstream fails(mori::yaml::GetString(raw, "fails"));
+    for (std::string check; std::getline(fails, check, ',');) {
+      check.erase(0, check.find_first_not_of(' '));
+      check.erase(check.find_last_not_of(' ') + 1);
+      if (kChecks.count(check) == 0) {
+        throw std::runtime_error(where + ": fails lists '" + check +
+                                 "'; checks are ends, honest, recovers, alive");
+      }
+      e.fails.insert(check);
+    }
+    if (e.knownBug.empty() != e.fails.empty()) {
+      throw std::runtime_error(where + ": known_bug and fails go together");
     }
     if (!e.rule.empty()) {
       try {
@@ -202,7 +226,9 @@ const char* CodeName(StatusCode code) {
 }
 
 // The target uses a second GPU, and so a second NIC, when there is one.
+// MORI_IO_FAULT_TARGET_GPU overrides it (e.g. 0 to keep both ends on one NIC).
 int TargetGpu() {
+  if (const char* env = std::getenv("MORI_IO_FAULT_TARGET_GPU")) return std::atoi(env);
   int gpus = 0;
   if (hipGetDeviceCount(&gpus) != hipSuccess) return kInitiatorGpu;
   return gpus >= 2 ? 1 : kInitiatorGpu;
@@ -624,12 +650,15 @@ int RunEntry(const Entry& e) {
 /*                                       Runner (parent process)                                  */
 /* ---------------------------------------------------------------------------------------------- */
 
+// What one entry's run showed.
 struct Outcome {
-  enum { Pass, Fail, Skip } verdict{Fail};
-  // -1 = not reached (the initiator crashed or hung before reporting)
+  bool skipped{false};
+  bool reported{false};  // the initiator printed its RESULT line
+  // 1 = passed, 0 = failed, -1 = not reached (a process died before reporting)
   int ends{-1}, honest{-1}, recovers{-1}, target{-1};
   bool alive{true};
-  std::string note;
+  std::string note;      // how a process died, if one did
+  std::string topology;  // "initiator GPU 0 ionic_0 -> target ... (cross-NIC)"
 };
 
 // Runs one entry in an initiator process, echoing its output, and reads back its result.
@@ -675,9 +704,11 @@ Outcome RunChild(const char* self, const Entry& e) {
     if (end == std::string::npos) end = text.size();
     std::string line = text.substr(start, end - start);
     if (line.rfind("RESULT ", 0) == 0) {
-      std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d", &out.ends,
-                  &out.honest, &out.recovers, &out.target);
+      out.reported = std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d",
+                                 &out.ends, &out.honest, &out.recovers, &out.target) == 4;
     } else if (!line.empty()) {
+      size_t topo = line.find("topology: ");
+      if (topo != std::string::npos) out.topology = line.substr(topo + 10);
       std::printf("%s\n", line.c_str());
     }
     start = end + 1;
@@ -690,8 +721,7 @@ Outcome RunChild(const char* self, const Entry& e) {
     out.alive = false;
     out.note = std::string("initiator crashed: ") + strsignal(WTERMSIG(wstatus));
   } else if (WEXITSTATUS(wstatus) == kExitSkip) {
-    out.verdict = Outcome::Skip;
-    return out;
+    out.skipped = true;
   } else if (WEXITSTATUS(wstatus) != kExitPass && WEXITSTATUS(wstatus) != kExitFail) {
     out.alive = false;
     out.note = "initiator exited with code " + std::to_string(WEXITSTATUS(wstatus));
@@ -699,11 +729,52 @@ Outcome RunChild(const char* self, const Entry& e) {
     out.alive = false;
     out.note = "target process died";
   }
-  if (out.alive && WEXITSTATUS(wstatus) == kExitPass) out.verdict = Outcome::Pass;
   return out;
 }
 
 const char* Mark(int v) { return v < 0 ? "-" : v ? "ok" : "FAIL"; }
+
+std::string Join(const std::set<std::string>& items) {
+  std::string out;
+  for (const std::string& item : items) out += (out.empty() ? "" : ",") + item;
+  return out;
+}
+
+// How a run compares with what the catalog expects of the entry.
+struct Verdict {
+  enum Kind { Pass, XFail, Fail, XPass, Skip, kKinds } kind{Fail};
+  std::string why;
+};
+
+const char* const kVerdictNames[] = {"PASS", "XFAIL", "FAIL", "XPASS", "SKIP"};
+
+// PASS:  every check passed and none was expected to fail.
+// XFAIL: exactly the `fails` checks of a known_bug entry failed.
+// FAIL:  a check failed that the entry does not expect (or the entry produced no result).
+// XPASS: a check a known_bug entry expects to fail passed: the bug looks fixed.
+// A check that was not reached (a process died first) counts neither way.
+Verdict Judge(const Entry& e, const Outcome& o) {
+  if (o.skipped) return {Verdict::Skip, ""};
+  if (!o.reported && o.alive) return {Verdict::Fail, "no result; see the output above"};
+  const std::pair<const char*, int> checks[] = {
+      {"ends", o.ends}, {"honest", o.honest}, {"recovers", o.recovers}, {"alive", o.alive}};
+  std::set<std::string> unexpected, fixed;
+  for (const auto& [name, result] : checks) {
+    bool expectedToFail = e.fails.count(name) > 0;
+    if (result == 0 && !expectedToFail) unexpected.insert(name);
+    if (result == 1 && expectedToFail) fixed.insert(name);
+  }
+  if (!unexpected.empty()) {
+    return {Verdict::Fail,
+            "unexpected: " + Join(unexpected) + (o.note.empty() ? "" : " (" + o.note + ")")};
+  }
+  if (!fixed.empty()) {
+    return {Verdict::XPass, "now passes: " + Join(fixed) + "; remove known_bug " + e.knownBug +
+                                " from the catalog"};
+  }
+  if (!e.knownBug.empty()) return {Verdict::XFail, "known bug: " + e.knownBug};
+  return {Verdict::Pass, ""};
+}
 
 void CheckParser() {
   for (const char* bad : {"no_such_kind", "cqe_drop:skip", "cqe_drop:bogus=1", "qp_error:skip=x"}) {
@@ -736,6 +807,67 @@ void CheckParser() {
   }
   std::fflush(stdout);
   std::_Exit(rc);  // skip teardown: a faulted engine may never shut down
+}
+
+// Prints the results table and summary. On GitHub Actions it also emits one
+// warning per known bug and one error per FAIL/XPASS, and with
+// MORI_IO_FAULT_REPORT=<file> it appends a markdown table to that file (for the
+// job summary). Returns the exit code: non-zero only for a FAIL or an XPASS.
+int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
+           const std::string& catalogPath) {
+  int counts[Verdict::kKinds] = {};
+  std::map<std::string, std::vector<std::string>> knownBugs;  // bug -> entries failing on it
+  std::string topology, rows;
+  const bool github = std::getenv("GITHUB_ACTIONS") != nullptr;
+
+  std::printf("\n%-36s %-6s %-6s %-8s %-6s %-7s %s\n", "entry", "ends", "honest", "recovers",
+              "alive", "verdict", "note");
+  for (const auto& [e, o] : results) {
+    Verdict v = Judge(*e, o);
+    counts[v.kind]++;
+    if (v.kind == Verdict::XFail) knownBugs[e->knownBug].push_back(e->id);
+    if (topology.empty()) topology = o.topology;
+    const char* alive = o.skipped ? "-" : o.alive ? "ok" : "FAIL";
+    std::printf("%-36s %-6s %-6s %-8s %-6s %-7s %s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
+                Mark(o.recovers), alive, kVerdictNames[v.kind], v.why.c_str());
+    rows += "| " + e->id + " | " + Mark(o.ends) + " | " + Mark(o.honest) + " | " +
+            Mark(o.recovers) + " | " + alive + " | " + kVerdictNames[v.kind] + " | " + v.why +
+            " |\n";
+    if (github && (v.kind == Verdict::Fail || v.kind == Verdict::XPass)) {
+      std::printf("::error title=Fault catalog %s::%s %s\n", kVerdictNames[v.kind], e->id.c_str(),
+                  v.why.c_str());
+    }
+  }
+
+  std::string bugs;
+  for (const auto& [bug, ids] : knownBugs) {
+    bugs += (bugs.empty() ? "" : ", ") + bug + " x" + std::to_string(ids.size());
+    if (github) {
+      std::string list;
+      for (const std::string& id : ids) list += (list.empty() ? "" : ", ") + id;
+      std::printf("::warning title=Known bug %s::%zu fault catalog entries expected to fail: %s\n",
+                  bug.c_str(), ids.size(), list.c_str());
+    }
+  }
+  std::string summary = std::to_string(counts[Verdict::Pass]) + " pass, " +
+                        std::to_string(counts[Verdict::XFail]) + " known bugs (xfail), " +
+                        std::to_string(counts[Verdict::Fail]) + " new failures, " +
+                        std::to_string(counts[Verdict::XPass]) + " fixed (xpass), " +
+                        std::to_string(counts[Verdict::Skip]) + " skipped";
+  if (!bugs.empty()) std::printf("known bugs: %s\n", bugs.c_str());
+  std::printf("==== test_fault_injection: %zu entries: %s ====\n", results.size(), summary.c_str());
+
+  if (const char* report = std::getenv("MORI_IO_FAULT_REPORT")) {
+    std::ofstream md(report, std::ios::app);
+    md << "### MORI-IO fault catalog: " << catalogPath.substr(catalogPath.find_last_of('/') + 1)
+       << "\n\n**" << summary << "**";
+    if (!topology.empty()) md << "  \nTopology: " << topology;
+    if (!bugs.empty()) md << "  \nKnown bugs: " << bugs;
+    md << "\n\n| entry | ends | honest | recovers | alive | verdict | note |\n"
+       << "|---|---|---|---|---|---|---|\n"
+       << rows << "\n";
+  }
+  return counts[Verdict::Fail] + counts[Verdict::XPass] == 0 ? 0 : 1;
 }
 
 }  // namespace
@@ -793,20 +925,5 @@ int main(int argc, char** argv) {
     results.emplace_back(&e, RunChild("/proc/self/exe", e));
   }
 
-  int failed = 0, skipped = 0;
-  std::printf("\n%-36s %-6s %-6s %-8s %-6s %s\n", "entry", "ends", "honest", "recovers", "alive",
-              "verdict");
-  for (const auto& [e, o] : results) {
-    const char* verdict = o.verdict == Outcome::Pass   ? "PASS"
-                          : o.verdict == Outcome::Skip ? "SKIP"
-                                                       : "FAIL";
-    failed += o.verdict == Outcome::Fail;
-    skipped += o.verdict == Outcome::Skip;
-    std::printf("%-36s %-6s %-6s %-8s %-6s %s%s%s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
-                Mark(o.recovers), o.alive ? "ok" : "FAIL", verdict, o.note.empty() ? "" : "  ",
-                o.note.c_str());
-  }
-  std::printf("==== test_fault_injection: %zu entries, %d failed, %d skipped ====\n",
-              results.size(), failed, skipped);
-  return failed == 0 ? 0 : 1;
+  return Report(results, path);
 }

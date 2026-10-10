@@ -271,6 +271,31 @@ jobs:
               timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
           "
 
+      - name: MORI-IO fault catalog (ibverbs)
+        # The catalog's known_bug expectations were measured on ionic; other NICs
+        # join once verified.
+        if: matrix.platform == 'MI355X_AINIC'
+        run: |
+          # Injects the NIC faults in tests/cpp/io/fault_catalog/ibverbs.yaml between an
+          # initiator on GPU 0 and a target on GPU 1, each on its own NIC. Entries marked
+          # known_bug are expected to fail until fixed. The step fails on a new failure,
+          # or on a known bug that now passes (its fix PR removes the known_bug lines).
+          # MORI_IO_FAULT_TARGET_GPU=0 keeps both ends on one NIC if two cannot reach each other.
+          REPORT=$GITHUB_WORKSPACE/build_fault/fault_report.md
+          set +e
+          $CT exec -e GITHUB_ACTIONS=true -e MORI_IO_FAULT_REPORT=$REPORT $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            cmake -B build_fault -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF -DENABLE_IO_FAULT_INJECTION=ON
+            cmake --build build_fault -j --target test_fault_injection test_flat_yaml
+            timeout 60 ./build_fault/tests/cpp/test_flat_yaml
+            rm -f $REPORT
+            HIP_VISIBLE_DEVICES=0,1 timeout 900 ./build_fault/tests/cpp/test_fault_injection
+          "
+          rc=$?
+          if [ -f "$REPORT" ]; then cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
+
       - name: MORI-IR
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE -e HOME=/tmp $CONTAINER bash -c "
