@@ -184,6 +184,13 @@ void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
   SetEnv("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", config.ssd.spdk_proxy_idle_exit_timeout_ms);
   SetEnv("UMBP_SPDK_PROXY_ALLOW_BORROW", config.ssd.spdk_proxy_allow_borrow);
   SetEnv("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", config.ssd.spdk_proxy_reserved_shared_bytes);
+
+  if (!config.backend_policy_path.empty()) {
+    SetEnv("UMBP_BACKEND_POLICY", config.backend_policy_path);
+  }
+  if (config.page_size.has_value()) {
+    SetEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", *config.page_size);
+  }
 }
 
 class ScopedBootstrapLock {
