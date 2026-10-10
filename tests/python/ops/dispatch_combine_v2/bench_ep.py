@@ -116,10 +116,14 @@ CHECK = int(os.environ.get("CHECK", 1))
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
-# ROUTE=ring: ATOM's --fake-eplb placement, where position p = token * TOPK + j lands
-# on rank p % world. With TOPK >= world every token reaches every rank, so the
-# largest SWEEP point fills each receive buffer to exactly its capacity -- the case
-# that overwrites anything parked at the end of the landing zone.
+# ROUTE=ring: ATOM's --fake-eplb placement for models without group-limited routing,
+# where position p = token * TOPK + j lands on rank p % world. With TOPK >= world every
+# token reaches every rank, so the largest SWEEP point fills each receive buffer to
+# exactly its capacity -- the case that overwrites anything parked at the end of the
+# landing zone.
+# ROUTE=grouped: ATOM's --fake-eplb placement for group-limited routing (DeepSeek:
+# NGROUP=8, TOPK_GROUP=4), plus SHARED=1 trailing columns pinned to the token's own rank.
+# At EP4 a token then reaches 2-3 ranks, not every one, and the ranks receive unevenly.
 # ROUTE=noself: rand without the experts of the token's own rank, so no rank
 # receives from itself.
 ROUTE = os.environ.get("ROUTE", "rand")
@@ -210,8 +214,25 @@ def main():
             [torch.randperm(n_experts - EPR, generator=gr)[:TOPK] for _ in range(M)]
         )
         idx = (idx + (idx >= rank * EPR).long() * EPR).to(torch.int32).to(dev)
+    elif ROUTE == "grouped":
+        # init_balance_router_logits' group-limited branch over the routed experts,
+        # mapped into the dispatch space where each rank's SHARED slots follow its own.
+        ng = int(os.environ.get("NGROUP", 8))
+        tg = int(os.environ.get("TOPK_GROUP", 4))
+        sh = int(os.environ.get("SHARED", 1))
+        kr, L = TOPK - sh, EPR - sh
+        gs = world * L // ng
+        rg = max(1, gs // L)
+        sub = gs // rg
+        c = kr // tg
+        t = rank + torch.arange(M) * world
+        q = t.view(-1, 1, 1) * tg + torch.arange(tg).view(1, -1, 1)
+        p = (q // ng) * c + torch.arange(c).view(1, 1, -1)
+        e = ((q % ng) * gs + (p % rg) * sub + (p // rg) % sub).reshape(M, kr)
+        shared = (rank * EPR + L + torch.arange(sh)).expand(M, sh)
+        idx = torch.cat([(e // L) * EPR + e % L, shared], 1).to(torch.int32).to(dev)
     else:
-        raise ValueError(f"ROUTE={ROUTE!r}: expected rand, ring or noself")
+        raise ValueError(f"ROUTE={ROUTE!r}: expected rand, ring, grouped or noself")
     # Per-token scale rows, transported when SCALE_DIM>0 (fp8/fp4 by default). Shaped
     # exactly as repro_epv2_topk9.py: sc_n_i32 int32 lanes viewed as bytes, trimmed to
     # SCALE_DIM so scale_type_size=1 * scale_dim holds. Deterministic (arange + rank

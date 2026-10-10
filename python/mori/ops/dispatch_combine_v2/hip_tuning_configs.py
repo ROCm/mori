@@ -120,8 +120,11 @@ _DISPATCH_TABLE: dict = {
         # topk 9 = 8 routed + 1 shared (what ATOM dispatches: kernel name k9).
         # The engine selects this key, not topk 8; block 64 default starves the
         # 256-CU GPU at the ~3456-recv operating point. Block 256 saturates it.
+        # fp4 past 4096 goes back to 128x16 (us at 16384, grouped/random routing:
+        # 135.2/183.3 against 256x8's 150.3/191.1).
         (4, 7168, 9, None): {
             None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
+            "fp4_disp_bf16_comb": ((512, 64, 8), (4096, 256, 8), (None, 128, 16)),
         },
         # topk 6 (384 experts at EP4). The edges move in: 64x8 stops paying at 512.
         #   ct     64x8   64x16  128x16 256x16      (bf16 / fp8 / fp4)
@@ -131,9 +134,6 @@ _DISPATCH_TABLE: dict = {
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
         (4, 7168, 6, None): {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
-            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
-        },
-        (4, 7168, 9, None): {
             "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
@@ -187,7 +187,6 @@ _COMBINE_TABLE: dict = {
         # topk 8 (unchanged); only the dispatch half is retuned to block 256.
         (4, 7168, 9, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
-        (4, 7168, 9, None): ((None, 64, 8),),
         # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
     },
@@ -206,11 +205,12 @@ _COMBINE_FP4_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
+            # topk 9: MegaMoE runs nothing beside the combine, so the whole grid pays (us,
+            # grouped routing: 1536 64x16 47.8 -> 256x16 28.8, 16384 128x24 243.4 -> 256x24 156.1).
             (4, 7168, 9, None): (
                 (256, 64, 8),
-                (2047, 64, 16),
-                (2048, 64, 24),
-                (16384, 128, 24),
+                (2048, 256, 16),
+                (16384, 256, 24),
                 (None, 64, 16),
             ),
             # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
