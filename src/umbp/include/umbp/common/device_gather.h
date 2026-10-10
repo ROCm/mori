@@ -46,8 +46,10 @@ struct DeviceGatherFragment {
 // A kernel is insensitive to both: measured ~0.57 us per fragment, and flat
 // across fragment sizes from 8 KiB to 221 KiB.
 //
-// Only worth it below roughly 128 KiB per fragment. Above that the copy engine
-// wins, because one large hipMemcpyAsync already amortizes its submission.
+// Large fragments do not change that host to device: with 8 GPUs copying on
+// MI355X the kernel holds PCIe line rate up to 64 MiB fragments, ahead of the
+// copy engine.  Device to host the copy engine wins from a few MiB up; see
+// HbmCopyEngine for the rule the caller applies.
 //
 // The host side must be inside a HostTierRegistration-covered range: a kernel
 // cannot dereference plain mmap memory at all, it faults. Returns false before

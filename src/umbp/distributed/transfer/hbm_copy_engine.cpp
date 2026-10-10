@@ -86,9 +86,16 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 //  worst at: each call costs a fixed submission (~5.4 us with 8 ranks active)
 //  that a 4 KiB copy cannot amortize.  One kernel doing all of them measures
 //  ~0.57 us per fragment and is flat in fragment size — see the rationale on
-//  LaunchDeviceGather.  Above roughly 128 KiB per fragment the copy engine wins
-//  again, because one large hipMemcpyAsync already amortizes its own
-//  submission.
+//  LaunchDeviceGather.
+//
+//  Large fragments stay on the kernel too, host to device.  With 8 GPUs
+//  copying at once on MI355X, the kernel runs near PCIe line rate (50-55 GB/s
+//  per GPU) for fragments from 8 KiB to 64 MiB, while hipMemcpy and
+//  hipMemcpyAsync take 5.3-6.2x the time at 128 KiB and 1.3-1.6x from 1 MiB
+//  up; alone, a GPU sees the two tie at 64 MiB.  Device to host the copy
+//  engine catches up at about 4 MiB and is up to 14% faster from 16 MiB, so
+//  offloads of that size go to hipMemcpy.  Large per-layer state (e.g.
+//  Mamba-style SSM state) is what produces such fragments.
 //
 //  This is what makes ranged I/O worth having on a GPU caller: reading one
 //  layer out of page-granular objects is exactly "dozens of small strided
@@ -96,7 +103,7 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 //  common/ (upstream 93f2998a).
 // ---------------------------------------------------------------------------
 
-constexpr size_t kGatherFragmentThreshold = 128ULL << 10;
+constexpr size_t kGatherD2HFragmentThreshold = 4ULL << 20;
 
 // Mirrors device_gather.hip's kVectorBytes.  Used ONLY to report, in debug
 // mode, whether a segment would take the kernel's uint4 fast path or fall to
@@ -467,7 +474,7 @@ const char* HbmCopyEngine::GatherSkipName(GatherSkip reason) {
     case GatherSkip::kTooFewFragments:
       return "too-few-fragments";
     case GatherSkip::kFragmentAtOrAboveThreshold:
-      return "mean-seg-at-or-above-threshold";
+      return "d2h-mean-seg-at-or-above-threshold";
     case GatherSkip::kSetDeviceFailed:
       return "hipSetDevice-failed";
     case GatherSkip::kNoStream:
@@ -505,6 +512,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     size_t max_fragment = 0;
     size_t h2d_fragments = 0;
     size_t d2h_fragments = 0;
+    size_t d2h_bytes = 0;  // decides whether the copy engine takes the bucket
   };
   std::map<int, Bucket> buckets;
 
@@ -525,6 +533,12 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     const char* src = static_cast<const char*>(plan.src.host_ptr);
     char* dst = static_cast<char*>(plan.dst.host_ptr);
     const bool host_is_src = kind == hipMemcpyHostToDevice;
+    // Plan() bounds-checked every segment against its endpoint, so when one
+    // registration covers the whole host endpoint its alias base serves every
+    // segment: one locked lookup per plan instead of one per segment.
+    const TransferRef& host_ref = host_is_src ? plan.src : plan.dst;
+    char* const alias_base =
+        static_cast<char*>(HostRegionDeviceAddress(host_ref.host_ptr, host_ref.size, device_id));
 
     std::vector<DeviceGatherFragment> fragments;
     fragments.reserve(plan.sizes.size());
@@ -537,7 +551,10 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       // A kernel cannot dereference plain mmap memory — it faults the GPU — so
       // an uncovered host side disqualifies the whole plan. Nor can it use the
       // host address: only the host side is replaced by its per-device alias.
-      void* const host_alias = HostRegionDeviceAddress(host_side, plan.sizes[i], device_id);
+      void* const host_alias =
+          alias_base != nullptr
+              ? alias_base + (host_is_src ? plan.src_offsets[i] : plan.dst_offsets[i])
+              : HostRegionDeviceAddress(host_side, plan.sizes[i], device_id);
       if (host_alias == nullptr) {
         eligible = false;
         break;
@@ -564,6 +581,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       bucket.max_fragment = std::max(bucket.max_fragment, fragment.bytes);
     }
     (host_is_src ? bucket.h2d_fragments : bucket.d2h_fragments) += fragments.size();
+    if (!host_is_src) bucket.d2h_bytes += plan_bytes;
     bucket.fragments.insert(bucket.fragments.end(), fragments.begin(), fragments.end());
     bucket.plan_indices.push_back(p);
     bucket.total_bytes += plan_bytes;
@@ -577,14 +595,14 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     auto note_bucket = [&bucket_plans, &note](GatherSkip reason) {
       for (size_t p : bucket_plans) note(p, reason);
     };
-    // One fragment is a plain hipMemcpy's best case; above the threshold the
-    // copy engine wins because a single large async copy amortizes its own
-    // submission.
+    // One fragment is a plain hipMemcpy's best case.  Large offload fragments
+    // are the copy engine's too (see "Gather fast path" above).
     if (bucket.fragments.size() < 2) {
       note_bucket(GatherSkip::kTooFewFragments);
       continue;
     }
-    if (bucket.total_bytes / bucket.fragments.size() >= kGatherFragmentThreshold) {
+    if (bucket.d2h_fragments > 0 &&
+        bucket.d2h_bytes / bucket.d2h_fragments >= kGatherD2HFragmentThreshold) {
       note_bucket(GatherSkip::kFragmentAtOrAboveThreshold);
       continue;
     }
