@@ -1,0 +1,164 @@
+# MORI-IO fault catalog: ibverbs data path (fault simulation part 1/N).
+#
+# Each entry is one real-world failure, written as a fault rule plus the
+# transfer it hits. test_fault_injection runs every entry and checks that:
+#   ends      the faulted transfer reaches SUCCESS or an error within 5 s
+#   honest    it reports SUCCESS only if the data landed and, with notify on,
+#             the target was told
+#   recovers  once the fault clears, a new transfer between the same engines succeeds
+#   alive     the process neither exits nor crashes
+# The checks describe the behavior we want, not today's: a failing entry is an
+# open bug for a follow-up fix. "alive" covers both processes below.
+#
+# Each entry runs two processes on one node: the initiator on GPU 0 and the
+# target on GPU 1, each using the NIC closest to its GPU, so the data crosses
+# the wire and the switch as between two nodes.
+#
+# Fields:
+#   id          <fault kind>.<what it hits>[.<when>], unique
+#   real_world  what this stands for in production
+#   rule        fault rule, same syntax as MORI_IO_FAULT (see src/io/rdma/fault_injector.hpp);
+#               omit for no fault
+#   transfer    write | read  (one 1 MiB transfer)
+#               batch         (BatchWrite of 2 non-adjacent segments over 2 QPs)
+#   notify      MORI notifications on: a SEND/RECV after the data tells the target
+#               (default false)
+#   warmup      clean transfers before the fault is armed; 0 arms it before the
+#               engines connect (default 0)
+#   side        initiator | target: the process the fault is armed in; the
+#               other one runs fault-free (default initiator)
+
+- id: none.write
+  real_world: no fault (baseline)
+  transfer: write
+  notify: true
+
+# ---- Post fails: ibv_post_send / ibv_post_recv returns an error ----------------
+
+- id: post_send_fail.write
+  real_world: SQ full or driver rejects the post
+  rule: post_send_fail:value=12
+  transfer: write
+
+- id: post_send_fail.batch.second_qp
+  real_world: post fails on QP 2 after QP 1 already posted
+  rule: post_send_fail:skip=1
+  transfer: batch
+
+- id: post_send_fail.notify
+  real_world: data posted, then the notification post fails
+  rule: post_send_fail:skip=1
+  transfer: write
+  notify: true
+
+- id: post_recv_fail.connect
+  real_world: pre-posting receives fails while connecting
+  rule: post_recv_fail
+  transfer: write
+  notify: true
+
+- id: post_recv_fail.repost
+  real_world: target fails to re-post a used receive mid-run
+  rule: post_recv_fail
+  transfer: write
+  notify: true
+  warmup: 1
+  side: target
+
+# ---- Error completion: the NIC reports the WR failed and moves the QP to ERR ----
+
+- id: cqe_error.write.retry_exc
+  real_world: link down or peer gone during a write
+  rule: cqe_error:op=write:value=retry_exc
+  transfer: write
+
+- id: cqe_error.write.retry_exc.mid_run
+  real_world: same, after 10 good transfers
+  rule: cqe_error:op=write:value=retry_exc
+  transfer: write
+  warmup: 10
+
+- id: cqe_error.read.retry_exc
+  real_world: link down or peer gone during a read
+  rule: cqe_error:op=read:value=retry_exc
+  transfer: read
+
+- id: cqe_error.write.rem_access
+  real_world: "stale rkey: peer deregistered the memory"
+  rule: cqe_error:op=write:value=rem_access
+  transfer: write
+
+- id: cqe_error.read.rem_op
+  real_world: peer rejected the operation
+  rule: cqe_error:op=read:value=rem_op
+  transfer: read
+
+- id: cqe_error.write.loc_prot
+  real_world: local buffer deregistered under an in-flight write
+  rule: cqe_error:op=write:value=loc_prot
+  transfer: write
+
+- id: cqe_error.write.fatal
+  real_world: NIC internal error on one WR
+  rule: cqe_error:op=write:value=fatal
+  transfer: write
+
+- id: cqe_error.batch.one_qp
+  real_world: one of two QPs fails mid-batch
+  rule: cqe_error:op=write
+  transfer: batch
+
+# Initiator side only: the injected error lands after the real SEND was
+# delivered, so the target is still told. cqe_drop.notify.recv covers the target side.
+- id: cqe_error.notify.rnr
+  real_world: target stopped re-posting receives (RNR retries exhausted)
+  rule: cqe_error:op=send:value=rnr_retry_exc
+  transfer: write
+  notify: true
+
+# ---- Lost completion: the WR finishes but its CQE never arrives ----------------
+
+- id: cqe_drop.write
+  real_world: write completion lost
+  rule: cqe_drop:op=write
+  transfer: write
+
+- id: cqe_drop.read
+  real_world: read completion lost
+  rule: cqe_drop:op=read
+  transfer: read
+
+- id: cqe_drop.batch.one_qp
+  real_world: one QP's completion lost in a batch
+  rule: cqe_drop:op=write
+  transfer: batch
+
+- id: cqe_drop.notify.recv
+  real_world: target loses the notification completion
+  rule: cqe_drop:op=recv
+  transfer: write
+  notify: true
+  side: target
+
+# ---- QP error: the QP dies (QP_FATAL, NIC reset) and every WR on it flushes ----
+
+- id: qp_error.write
+  real_world: QP dies before the first write
+  rule: qp_error
+  transfer: write
+
+- id: qp_error.write.mid_run
+  real_world: QP dies after 10 good transfers
+  rule: qp_error
+  transfer: write
+  warmup: 10
+
+- id: qp_error.read
+  real_world: QP dies before a read
+  rule: qp_error
+  transfer: read
+
+- id: qp_error.batch.one_qp
+  real_world: one of two QPs dies
+  rule: qp_error
+  transfer: batch

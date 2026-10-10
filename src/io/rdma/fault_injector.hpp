@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "src/io/rdma/verbs_ops.hpp"
 
@@ -39,7 +40,8 @@ enum class FaultKind : uint8_t {
   PostSendFail,  // ibv_post_send returns `value` (errno), nothing posted
   PostRecvFail,  // ibv_post_recv returns `value` (errno)
   QpError,       // move the QP to IBV_QPS_ERR right before a send: real flush cascade
-  CqeError,      // rewrite a successful CQE's status to `value` (ibv_wc_status)
+  CqeError,      // rewrite a successful CQE's status to `value` (ibv_wc_status) and move
+                 // its QP to IBV_QPS_ERR, as the NIC does after any error completion
   CqeDrop,       // swallow a successful CQE: the completion never arrives
 };
 
@@ -83,6 +85,10 @@ class FaultInjector final : public VerbsOps {
   FaultInjector();
   // True if the armed rule matches and is due; `value` gets the rule's value.
   bool ShouldFire(FaultKind kind, uint32_t qpn, int wcOpcode, int* value);
+  // CQEs carry only a QP number; remember QPs seen at post time so an injected
+  // error CQE can move its QP to ERR. Only recorded while armed.
+  void RememberQp(ibv_qp* qp);
+  void MoveQpToError(ibv_qp* qp);
 
   DirectVerbs direct_;
   std::atomic<bool> armed_{false};
@@ -90,6 +96,7 @@ class FaultInjector final : public VerbsOps {
   std::mutex mu_;
   FaultRule rule_;
   uint64_t matched_{0};
+  std::unordered_map<uint32_t, ibv_qp*> qps_;
 };
 
 }  // namespace io

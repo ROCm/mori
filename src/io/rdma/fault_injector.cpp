@@ -154,6 +154,7 @@ void FaultInjector::Arm(const FaultRule& rule) {
     std::lock_guard<std::mutex> lock(mu_);
     rule_ = rule;
     matched_ = 0;
+    qps_.clear();
   }
   fired_.store(0, std::memory_order_relaxed);
   armed_.store(true, std::memory_order_release);
@@ -178,29 +179,39 @@ bool FaultInjector::ShouldFire(FaultKind kind, uint32_t qpn, int wcOpcode, int* 
   return true;
 }
 
+void FaultInjector::RememberQp(ibv_qp* qp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  qps_[qp->qp_num] = qp;
+}
+
+void FaultInjector::MoveQpToError(ibv_qp* qp) {
+  ibv_qp_attr attr{};
+  attr.qp_state = IBV_QPS_ERR;
+  int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+  if (ret != 0) MORI_IO_ERROR("Fault injection: ibv_modify_qp(ERR) failed: {}", ret);
+}
+
 int FaultInjector::PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) {
   int value = 0;
   if (armed_.load(std::memory_order_relaxed)) {
+    RememberQp(qp);
     if (ShouldFire(FaultKind::PostSendFail, qp->qp_num, -1, &value)) {
       *bad = wr;
       return value;
     }
-    if (ShouldFire(FaultKind::QpError, qp->qp_num, -1, &value)) {
-      ibv_qp_attr attr{};
-      attr.qp_state = IBV_QPS_ERR;
-      int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-      if (ret != 0) MORI_IO_ERROR("Fault injection: ibv_modify_qp(ERR) failed: {}", ret);
-    }
+    if (ShouldFire(FaultKind::QpError, qp->qp_num, -1, &value)) MoveQpToError(qp);
   }
   return direct_.PostSend(qp, wr, bad);
 }
 
 int FaultInjector::PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) {
   int value = 0;
-  if (armed_.load(std::memory_order_relaxed) &&
-      ShouldFire(FaultKind::PostRecvFail, qp->qp_num, -1, &value)) {
-    *bad = wr;
-    return value;
+  if (armed_.load(std::memory_order_relaxed)) {
+    RememberQp(qp);
+    if (ShouldFire(FaultKind::PostRecvFail, qp->qp_num, -1, &value)) {
+      *bad = wr;
+      return value;
+    }
   }
   return direct_.PostRecv(qp, wr, bad);
 }
@@ -219,6 +230,20 @@ int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) {
       if (ShouldFire(FaultKind::CqeError, wc[i].qp_num, wc[i].opcode, &value)) {
         wc[i].status = static_cast<ibv_wc_status>(value);
         wc[i].vendor_err = 0;
+        // Like the NIC: after an error completion the QP is in ERR and every
+        // WR still queued on it flushes.
+        ibv_qp* qp = nullptr;
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          auto it = qps_.find(wc[i].qp_num);
+          if (it != qps_.end()) qp = it->second;
+        }
+        if (qp != nullptr) {
+          MoveQpToError(qp);
+        } else {
+          MORI_IO_WARN("Fault injection: qpn={} not seen at post time; QP left in its state",
+                       wc[i].qp_num);
+        }
       }
     }
     wc[kept++] = wc[i];
