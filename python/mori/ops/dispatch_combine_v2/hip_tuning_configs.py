@@ -123,16 +123,21 @@ _DISPATCH_TABLE: dict = {
         # topk 9 = 8 routed + 1 shared (what ATOM dispatches: kernel name k9).
         # The engine selects this key, not topk 8; block 64 default starves the
         # 256-CU GPU at the ~3456-recv operating point. Block 256 saturates it.
-        # fp4: 192x8 (one token a warp) up to 1536, the decode batch (us at 1536, grouped
-        # routing: 33.5 against 256x8's 35.3); past 4096 128x16 (us at 16384,
-        # grouped/random routing: 135.2/183.3 against 256x8's 150.3/191.1).
+        # fp4, 14 geometries swept (us, random / grouped routing; every pick within 3% of
+        # the best under both):
+        #   ct     64x8        256x8       256x24      256x32      128x16
+        #   512    28.9/21.4   28.9/21.7   35.1/33.3   35.1/33.5   35.8/34.5
+        #   1536   57.2/47.6   37.5/27.7   42.5/37.4   43.4/38.4   39.7/30.2
+        #   2048   59.9/47.3   40.7/30.5   45.7/33.1   46.5/40.0   42.7/32.7
+        #   4096  108.2/90.8   68.3/56.3   55.6/47.5   57.3/46.4   67.8/56.0
+        #   16384 371.5/369.8 187.6/146.1 157.2/128.0 153.4/124.5 164.0/124.3
         (4, 7168, 9, None): {
             None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
             "fp4": (
                 (512, 64, 8),
-                (1536, 192, 8),
-                (4096, 256, 8),
-                (None, 128, 16),
+                (2048, 256, 8),
+                (4096, 256, 24),
+                (None, 256, 32),
             ),
         },
         # topk 6 (384 experts at EP4). The edges move in: 64x8 stops paying at 512.
@@ -190,11 +195,16 @@ _COMBINE_TABLE: dict = {
     },
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
-        # topk 9 = 8 routed + 1 shared (ATOM's actual dispatch key). Needed so the
-        # dispatch schedule has a combine half -- lookup() returns the block-64
-        # single-shot default unless BOTH halves exist. Combine geometry mirrors
-        # topk 8 (unchanged); only the dispatch half is retuned to block 256.
-        (4, 7168, 9, None): ((None, 64, 8),),
+        # topk 9 = 8 routed + 1 shared (ATOM's actual dispatch key), bf16 pull combine, 9
+        # geometries swept (us, random / grouped routing). 192x8 is slow at 256-512 under
+        # both routings, so it only takes the large counts.
+        #   ct     64x8        128x8       256x8       192x8
+        #   16     15.6/14.7   14.5/13.9   23.0/15.9   14.4/13.8
+        #   256    24.7/18.4   21.3/17.5   22.2/18.1   41.0/29.6
+        #   1536   71.8/69.0   59.0/48.2   60.6/44.4   58.2/43.7
+        #   4096  163.5/163.3 130.7/104.5 129.6/94.3  130.9/95.1
+        #   16384 599.0/609.7 470.8/369.5 481.1/388.8 484.7/338.3
+        (4, 7168, 9, None): ((256, 128, 8), (4096, 256, 8), (None, 192, 8)),
         (4, 7168, 6, None): ((None, 64, 8),),
         # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
@@ -214,13 +224,17 @@ _COMBINE_FP4_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
-            # topk 9: MegaMoE runs nothing beside the combine, so the whole grid pays (us,
-            # grouped routing: 1536 64x16 47.8 -> 256x16 28.8, 16384 128x24 243.4 -> 256x24 156.1).
+            # topk 9: MegaMoE runs nothing beside the combine, so the whole grid pays. 10
+            # geometries swept (us, random / grouped routing):
+            #   ct     64x16       256x8       256x16      192x24      256x24
+            #   1024   31.3/ --    23.8/19.7   25.0/19.4   30.2/26.0   29.3/27.1
+            #   1536   43.0/ --    31.8/25.7   30.9/23.9   37.1/30.5   35.0/30.6
+            #   4096  107.8/ --    70.5/58.3   74.7/53.2   60.5/51.5   63.2/54.3
+            #   16384 396.0/ --   273.7/168.8 283.3/161.7 158.5/132.6 167.8/133.2
             (4, 7168, 9, None): (
-                (256, 64, 8),
+                (1024, 256, 8),
                 (2048, 256, 16),
-                (16384, 256, 24),
-                (None, 64, 16),
+                (None, 192, 24),
             ),
             # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
             # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
