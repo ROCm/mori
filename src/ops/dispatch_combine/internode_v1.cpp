@@ -95,9 +95,12 @@ inline __device__ void WaitInterNodeBarrier(EpDispatchCombineArgs<T>& args, int 
   const EpDispatchCombineConfig& config = args.config;
   uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
   if (args.disableRdmaAtomics) {
+    // A peer cannot write round r+1 before this rank leaves round r (it needs this rank's
+    // round r+1 dispatch), so the slot is exactly barrierFlag. Waiting for == rather than >=
+    // turns a barrierFlag desync into a hang instead of an early, silent pass.
     for (int i = 0; i < config.numQpPerPe; i++) {
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr +
-                                           InterNodeBarrierQpSlot(config, proxyPe, i)) <
+                                           InterNodeBarrierQpSlot(config, proxyPe, i)) !=
              barrierFlag) {
       }
     }
