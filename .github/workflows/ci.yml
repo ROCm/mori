@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # labeled: a maintainer adding the "ci-rerun" label re-runs CI on the PR
+    # merged with the current main, without pushing to the PR branch.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       run_umbp_single_node_hicache:
@@ -26,7 +29,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Any other label gets a group of its own, so labeling a PR (e.g. "bug")
+  # does not cancel the CI run already in progress for it.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci-rerun' && format('-label-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 env:
@@ -37,8 +42,28 @@ env:
 
 
 jobs:
+  clear-ci-rerun-label:
+    name: clear ci-rerun label
+    # Remove the label so it can be added again for the next re-run.
+    if: github.event.action == 'labeled' && github.event.label.name == 'ci-rerun'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              name: 'ci-rerun',
+            }).catch((e) => core.warning(`could not remove ci-rerun: ${e.message}`));
+
   build:
     name: mori build (${{ matrix.platform }})
+    # Skip label events other than ci-rerun; the jobs that need this one skip with it.
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci-rerun'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

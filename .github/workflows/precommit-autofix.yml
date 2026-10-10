@@ -17,7 +17,8 @@ jobs:
   autofix:
     if: |
       (github.event_name == 'pull_request' && github.event.label.name == 'fix-precommit') ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && contains(github.event.comment.body, '/fix-precommit'))
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && contains(github.event.comment.body, '/fix-precommit') &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
 
     steps:
@@ -77,11 +78,13 @@ jobs:
             });
             core.setFailed('Fork PR — skipping autofix');
 
+      # Push with MORI_BOT_TOKEN when it is set: a push made with GITHUB_TOKEN
+      # starts no workflow runs, so the fix commit would be left without CI.
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.MORI_BOT_TOKEN || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Set up Python
