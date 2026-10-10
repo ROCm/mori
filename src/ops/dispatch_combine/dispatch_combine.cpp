@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "mori/application/transport/rdma/rdma.hpp"
 #include "mori/cco/cco.hpp"
 #include "mori/core/core.hpp"
 #include "mori/shmem/internal.hpp"
@@ -165,14 +166,28 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
         "rail-only mode. Use InterNodeV1 or InterNodeV1LL, or unset MORI_ENABLE_RAIL_ONLY.");
   }
   disableRdmaAtomics = env::IsEnvVarEnabled(kDisableRdmaAtomicsEnv);
-  if (disableRdmaAtomics && config.rank == 0) {
-    if (config.kernelType == KernelType::InterNodeV1 ||
-        config.kernelType == KernelType::InterNodeV1LL) {
+  if (disableRdmaAtomics) {
+    // InterNode v0 and AsyncLL still signal with RDMA atomics, which hang on NICs that do not
+    // execute atomic opcodes. Fail at construction instead.
+    if (config.worldSize > config.gpuPerNode &&
+        (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::AsyncLL)) {
+      throw std::runtime_error(
+          std::string(kDisableRdmaAtomicsEnv) + " is set, but kernelType=" +
+          std::to_string(static_cast<int>(config.kernelType)) +
+          " (InterNode v0 / AsyncLL) still signals with RDMA atomics. Use InterNodeV1 or "
+          "InterNodeV1LL, or unset " + kDisableRdmaAtomicsEnv + ".");
+    }
+    // A WRITE signal is only ordered after its data by in-order PCIe placement; an atomic's
+    // read-modify-write at the target flushes prior writes, a WRITE does not.
+    if (application::ReadIbEnableRelaxedOrderingEnv()) {
+      throw std::runtime_error(std::string(kDisableRdmaAtomicsEnv) +
+                               " cannot be combined with MORI_IB_ENABLE_RELAXED_ORDERING=1: with "
+                               "relaxed ordering a WRITE signal may become visible before its "
+                               "data.");
+    }
+    if (config.rank == 0) {
       MORI_OPS_INFO("{} is set: InterNodeV1/V1LL signal with RDMA WRITE instead of RDMA atomics",
                     kDisableRdmaAtomicsEnv);
-    } else {
-      MORI_OPS_WARN("{} only affects InterNodeV1/V1LL; kernelType={} still uses RDMA atomics",
-                    kDisableRdmaAtomicsEnv, static_cast<int>(config.kernelType));
     }
   }
   if (config.maxTotalRecvTokens > 0) {
