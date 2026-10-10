@@ -55,10 +55,9 @@ void EvictionManager::Start() {
   running_.store(true, std::memory_order_relaxed);
   thread_ = std::thread(&EvictionManager::EvictionLoop, this);
   MORI_UMBP_INFO(
-      "[EvictionManager] Started (interval={}s, high={}, low={}, max_bytes_per_round={}, "
-      "max_bytes_per_rpc={})",
+      "[EvictionManager] Started (interval={}s, high={}, low={}, max_bytes_per_round={})",
       config_.check_interval.count(), config_.high_watermark, config_.low_watermark,
-      config_.max_evict_bytes_per_round, config_.max_evict_bytes_per_rpc);
+      config_.max_evict_bytes_per_round);
 }
 
 void EvictionManager::Stop() {
@@ -174,16 +173,12 @@ void EvictionManager::RunOnce() {
       strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
 
   size_t selected = 0;
-  uint64_t selected_bytes = 0;
-  for (const auto& [node_id, victims] : per_node_victims) {
-    selected += victims.size();
-    for (const auto& victim : victims) selected_bytes += victim.bytes;
-  }
+  for (const auto& [node_id, victims] : per_node_victims) selected += victims.size();
 
   if (selected == 0) return;
 
-  MORI_UMBP_INFO("[EvictionManager] Selected {} victims ({} bytes) across {} nodes", selected,
-                 selected_bytes, per_node_victims.size());
+  MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,
+                 per_node_victims.size());
 
   // Look up peer addresses once per dispatch round.  ClientRegistry
   // owns the (node_id -> peer_address) mapping; we can't ship an
@@ -218,30 +213,15 @@ void EvictionManager::RunOnce() {
     //
     // Sized on the keys alone: the parallel tier field is a packed enum of one
     // byte per key, inside the per-item overhead GrpcMaxItemsPerBatch already
-    // reserves.
-    //
-    // And split by bytes: the peer does the eviction inside the call, and on a
-    // tier that demotes it copies each victim downstream first, so a chunk's
-    // bytes are what decide whether the call fits UMBP_EVICTKEY_DEADLINE_MS.
-    // Every chunk carries at least one victim, however large.
+    // reserves.  Nothing else bounds a chunk: the peer queues any demotion and
+    // returns, so a call's length does not grow with the bytes it names.
     std::vector<std::string> keys;
     keys.reserve(victims.size());
     for (const auto& victim : victims) keys.push_back(victim.key);
-    const uint64_t rpc_bytes = config_.max_evict_bytes_per_rpc;
     size_t sent = 0;
     size_t chunks = 0;
     while (sent < victims.size()) {
-      size_t take = GrpcMaxItemsPerBatch(keys, sent);
-      if (rpc_bytes > 0) {
-        uint64_t chunk_bytes = 0;
-        size_t fit = 0;
-        for (; fit < take; ++fit) {
-          const uint64_t bytes = victims[sent + fit].bytes;
-          if (fit > 0 && chunk_bytes + bytes > rpc_bytes) break;
-          chunk_bytes += bytes;
-        }
-        take = fit;
-      }
+      const size_t take = GrpcMaxItemsPerBatch(keys, sent);
       std::vector<EvictionVictim> chunk(std::make_move_iterator(victims.begin() + sent),
                                         std::make_move_iterator(victims.begin() + sent + take));
       sent += take;

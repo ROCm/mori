@@ -107,15 +107,8 @@ struct EvictionConfig {
   // demoting tier copies downstream per round.
   uint64_t max_evict_bytes_per_round = 0;
 
-  // Bytes of victims named in one EvictKey RPC.  The peer frees them inside
-  // the call -- and on a tier that demotes, copies them downstream first -- so
-  // this keeps one call inside UMBP_EVICTKEY_DEADLINE_MS.  0 splits by gRPC
-  // message size only.  A victim whose size the strategy did not report
-  // counts as 0 bytes here.
-  uint64_t max_evict_bytes_per_rpc = 1ULL << 30;
-
   // Watermarks are not env-overridable (they have dedicated tuning paths);
-  // timing and the byte limits are.
+  // timing and the round's byte limit are.
   static EvictionConfig FromEnvironment() {
     EvictionConfig cfg;
     cfg.check_interval =
@@ -124,8 +117,6 @@ struct EvictionConfig {
         GetEnvSeconds("UMBP_LEASE_DURATION_SEC", cfg.lease_duration, /*min_allowed=*/1);
     cfg.max_evict_bytes_per_round =
         GetEnvUint64("UMBP_EVICT_MAX_BYTES_PER_ROUND", cfg.max_evict_bytes_per_round);
-    cfg.max_evict_bytes_per_rpc =
-        GetEnvUint64("UMBP_EVICT_MAX_BYTES_PER_RPC", cfg.max_evict_bytes_per_rpc);
     return cfg;
   }
 };

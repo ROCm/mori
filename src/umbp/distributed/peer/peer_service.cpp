@@ -269,8 +269,11 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     // tier per key: the pool frees exactly that medium's copy (demoting it
     // where its tier has a downstream) and leaves any other copy alone.  An
     // older master sends no tiers; each key is then freed from the medium that
-    // currently holds it.  bytes_freed is informational -- the master sizes its
-    // next round off the heartbeat's capacity, not off this reply.
+    // currently holds it.  A demotion is only queued here -- the pool's
+    // transition worker copies the bytes -- so this returns without waiting on
+    // any copy, and a queued key reports 0 bytes freed.  bytes_freed is
+    // informational: the master sizes its next round off the heartbeat's
+    // capacity, not off this reply.
     const int n = request->keys_size();
     if (n == 0) return grpc::Status::OK;
     const bool scoped = request->tiers_size() == n;
@@ -279,7 +282,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       requests[i].key = request->keys(i);
       if (scoped) requests[i].tier = static_cast<TierType>(request->tiers(i));
     }
-    auto evicted = pool_ == nullptr ? std::vector<EvictResult>{}
+    auto evicted = pool_ == nullptr ? std::vector<PoolEvictResult>{}
                                     : pool_->Evict(requests, PoolEvictMode::kReclaim);
     for (size_t i = 0; i < requests.size(); ++i) {
       auto* entry = response->add_evicted();

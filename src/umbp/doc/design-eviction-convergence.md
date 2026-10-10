@@ -163,8 +163,10 @@ there. Two reasons:
   the *same* thing to the same tier. Before, the local round deleted exactly the
   cold keys the offload was about to move (§1 row 3).
 
-The cost is that an `EvictKey` handled for a `watermark` tier now copies bytes,
-as `on_evict` tiers already did inside the same handler.
+The demotion is **queued** to the pool's transition worker, never run inside `Evict`: an
+`EvictKey` RPC returns without waiting on any copy. The worker runs an eviction's
+demotion regardless of the tier's own watermark and drops the copy if nothing
+downstream has room.
 
 **Locking.** `Evict` holds `lifecycle_mutex_` shared for the whole call, so
 `ClearLocal` cannot run underneath it. Demotions release `operation_mutex_` for

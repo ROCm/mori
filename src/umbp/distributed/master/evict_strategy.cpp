@@ -43,7 +43,7 @@ std::unordered_map<std::string, std::vector<EvictionVictim>> LruMasterEvictStrat
     auto& tier_budget = bytes_to_free[c.location.node_id];
     auto it = tier_budget.find(c.location.tier);
     if (it == tier_budget.end() || it->second <= 0) continue;
-    per_node_victims[c.location.node_id].push_back(EvictionVictim{c.key, c.location.tier, c.size});
+    per_node_victims[c.location.node_id].push_back(EvictionVictim{c.key, c.location.tier});
     it->second -= static_cast<int64_t>(c.size);
   }
   return per_node_victims;
