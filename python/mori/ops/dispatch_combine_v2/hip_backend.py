@@ -1279,9 +1279,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
-            # These are plain local buffers, not symmetric regions: the kernels
-            # do not reset them, the op must.
-            self_resets_counters=False,
+            # The dispatch kernel's first-arriver clears the per-peer signal
+            # slots and overwrites totalRecvTokenNum every call; no host zero
+            # needed.
+            self_resets_counters=True,
             capabilities=frozenset(
                 {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
             ),
