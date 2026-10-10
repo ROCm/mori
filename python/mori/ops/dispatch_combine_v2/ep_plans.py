@@ -69,6 +69,51 @@ def self_first_state_bytes(world_size: int) -> int:
     return (inbox + 127) // 128 * 128 + 256
 
 
+_STAGING_ALIGN = 128
+
+
+def staging_layout(world_size: int) -> tuple[dict[str, int], int]:
+    """({buffer: offset within mori's staging region}, region bytes).
+
+    The one list of what mori keeps in symmetric memory beyond the arena a caller
+    lays out: a new buffer is added here, and both the bytes the caller reserves
+    and the offsets mori cuts the region at follow from it.
+    """
+    offsets, off = {}, 0
+    for name, nbytes in (("self_first", self_first_state_bytes(world_size)),):
+        offsets[name] = off
+        off += (nbytes + _STAGING_ALIGN - 1) // _STAGING_ALIGN * _STAGING_ALIGN
+    return offsets, off
+
+
+def staging_region_bytes(world_size: int) -> int:
+    """Bytes of mori's staging region. Both paths size from this, which is what
+    keeps them in step when a buffer is added: a caller that lays out its own arena
+    reserves this much in it and names it with ``staging_region=`` on
+    EpDispatchPlan, and mori allocates this much when it is not given one."""
+    return staging_layout(world_size)[1]
+
+
+def _external_staging(arena, region: str, world_size: int) -> tuple[int, int]:
+    """(base, stride) of a staging region the CALLER reserved in its own arena.
+
+    Nothing is allocated or freed here: the arena's owner does both, and its own
+    zeroing covers the region. arena.size() is not optional -- overrunning the
+    region is not an error the kernel raises, it puts mori's atomics in whatever
+    region the arena laid down next.
+    """
+    offset, nbytes = int(arena.offset(region)), staging_region_bytes(world_size)
+    if arena.size(region) < nbytes or offset % _STAGING_ALIGN:
+        raise RuntimeError(
+            f"staging region {region!r} is {arena.size(region)} B at offset {offset}; "
+            f"needs {nbytes} B (staging_region_bytes()) on a {_STAGING_ALIGN} B line"
+        )
+    base, stride = SelfFirstState._flat_layout(
+        arena.handle, arena.local_ptr(region) - offset
+    )
+    return base + offset, stride
+
+
 class SelfFirstState:
     """The selfFirst dispatch's symmetric state: one window per arena, owned here.
 
@@ -90,7 +135,9 @@ class SelfFirstState:
         self._win = None
         try:
             self._win = comm.register_window(self._mem.ptr, nbytes)
-            self.base, self.stride = self._flat_layout()
+            self.base, self.stride = self._flat_layout(
+                self._win.handle, self._win.local_ptr
+            )
             self.zero()
         except BaseException:
             if self._win is not None:
@@ -110,9 +157,10 @@ class SelfFirstState:
                 raise RuntimeError(
                     "selfFirst dispatch: the arena's window was not registered through "
                     "mori.cco, so there is no communicator to allocate the selfFirst "
-                    "state on"
+                    "state on; reserve staging_region_bytes() in the arena and pass "
+                    "staging_region= instead"
                 )
-            st = cls(comm, self_first_state_bytes(world_size), key)
+            st = cls(comm, staging_region_bytes(world_size), key)
             cls._by_window[key] = st
         st._refs += 1
         return st
@@ -122,8 +170,10 @@ class SelfFirstState:
         """The live state of `arena`, without taking a reference."""
         return cls._by_window.get(int(arena.handle))
 
-    def _flat_layout(self) -> tuple[int, int]:
-        """(base, stride) such that PE p's copy is at base + p * stride.
+    @staticmethod
+    def _flat_layout(win_handle, local_ptr) -> tuple[int, int]:
+        """(base, stride) such that PE p's copy of the window's byte 0 is at
+        base + p * stride.
 
         Read once from the window's device descriptor (ccoWindowDevice in cco.hpp:
         u64 winBase, u32 stride4G, i32 lsaRank), so the kernel addresses the state
@@ -136,14 +186,14 @@ class SelfFirstState:
 
         from mori.tensor_utils import from_gpu_ptr
 
-        raw = bytes(from_gpu_ptr(self._win.handle, (16,), torch.uint8).cpu().tolist())
+        raw = bytes(from_gpu_ptr(win_handle, (16,), torch.uint8).cpu().tolist())
         win_base, stride4g, lsa_rank = struct.unpack_from("<QIi", raw)
         stride = stride4g << 32
-        if stride == 0 or win_base + lsa_rank * stride != self._win.local_ptr:
+        if stride == 0 or win_base + lsa_rank * stride != local_ptr:
             raise RuntimeError(
                 f"selfFirst state: window descriptor (winBase={win_base:#x}, "
                 f"stride4G={stride4g}, lsaRank={lsa_rank}) does not locate the local "
-                f"copy at {self._win.local_ptr:#x}"
+                f"copy at {local_ptr:#x}"
             )
         return win_base, stride
 
@@ -172,12 +222,15 @@ class EpDispatchPlan(_EpDispatchPlanBase):
     __doc__ = (_EpDispatchPlanBase.__doc__ or "") + (
         "\n\nThe gfx125x dispatch runs selfFirst unless ``tok_off_ext`` says the slot"
         "\nallocator word lives outside the cco window. With it and an arena, the plan"
-        "\nbinds the arena's SelfFirstState, allocating it on first use; an arena whose"
-        "\nwindow mori.cco cannot trace to a communicator makes construction raise."
+        "\nneeds mori's staging region: ``staging_region=NAME`` takes the arena's own"
+        "\nregion of that name (staging_region_bytes() sizes it, its owner zeroes it),"
+        "\nand omitting it has mori allocate one on first use. The two never mix -- a"
+        "\nnamed region the arena lacks raises rather than falling back."
     )
 
     def __init__(self, **kwargs):
         arena = kwargs.get("arena")
+        region = kwargs.pop("staging_region", None)
         self._self_first_state = None
         super().__init__(**kwargs)
         if arena is None:
@@ -185,13 +238,20 @@ class EpDispatchPlan(_EpDispatchPlanBase):
         info = self.info
         if not info.get("selfFirst"):
             return
+        world_size = info["worldSize"]
+        offsets = staging_layout(world_size)[0]
         try:
-            self._self_first_state = SelfFirstState.acquire(arena, info["worldSize"])
+            if region is not None:
+                base, stride = _external_staging(arena, region, world_size)
+            else:
+                state = self._self_first_state = SelfFirstState.acquire(
+                    arena, world_size
+                )
+                base, stride = state.base, state.stride
         except BaseException:
             super().close()
             raise
-        state = self._self_first_state
-        self.bind(sf_base=state.base, sf_stride=state.stride)
+        self.bind(sf_base=base + offsets["self_first"], sf_stride=stride)
 
     def close(self) -> None:
         state, self._self_first_state = getattr(self, "_self_first_state", None), None

@@ -286,14 +286,18 @@ class _Comm:
     def alloc_mem(self, size):
         buf = torch.full((size,), 0x5A, dtype=torch.uint8, device="cuda")
         self.allocs.append(buf)
-        return SimpleNamespace(ptr=buf.data_ptr(), close=lambda: self.closed.append("mem"))
+        return SimpleNamespace(
+            ptr=buf.data_ptr(), close=lambda: self.closed.append("mem")
+        )
 
     def register_window(self, ptr, size):
         raw = struct.pack("<QIi", ptr - self.STRIDE, self.STRIDE >> 32, self._desc_rank)
         desc = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
         self._descs.append(desc)
         return SimpleNamespace(
-            handle=desc.data_ptr(), local_ptr=ptr, close=lambda: self.closed.append("win")
+            handle=desc.data_ptr(),
+            local_ptr=ptr,
+            close=lambda: self.closed.append("win"),
         )
 
 
@@ -318,7 +322,9 @@ def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
 
     comm, arena = _Comm(), _Arena(0xA0)
     monkeypatch.setattr(
-        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+        mori.cco,
+        "communicator_of_window",
+        lambda h: comm if h == arena.handle else None,
     )
     a = _plan(arena=arena, block_num=32, warp_per_block=4)
     b = _plan(arena=arena, block_num=64, warp_per_block=4)
@@ -344,7 +350,9 @@ def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monke
 
     comm, arena = _Comm(lsa_rank_in_descriptor=0), _Arena(0xA1)
     monkeypatch.setattr(
-        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+        mori.cco,
+        "communicator_of_window",
+        lambda h: comm if h == arena.handle else None,
     )
     with pytest.raises(RuntimeError, match="does not locate"):
         _plan(arena=arena)
@@ -366,3 +374,75 @@ def test_self_first_state_size_matches_the_device_layout():
     assert cb.self_first_state_bytes(1) == 384
     assert cb.self_first_state_bytes(4) == 512
     assert cb.self_first_state_bytes(8) == 768
+
+
+def _staging_arena(offset, nbytes, region="mori_staging"):
+    """(comm, win, arena): a caller's own arena, holding a staging region."""
+    comm = _Comm()
+    mem = comm.alloc_mem(offset + nbytes)
+    win = comm.register_window(mem.ptr, offset + nbytes)
+
+    class _Carrying:
+        handle = win.handle
+        offset = staticmethod(lambda n: offset)
+        size = staticmethod(lambda n: nbytes)
+        local_ptr = staticmethod(lambda n: win.local_ptr + offset)
+
+    return comm, win, _Carrying()
+
+
+def test_staging_region_bytes_covers_the_whole_layout():
+    """A buffer added to staging_layout has to show up in the bytes the caller
+    reserves, on a 128 B line of its own, without a second edit."""
+    for world in (1, 4, 8):
+        offsets, total = cb.staging_layout(world)
+        assert cb.staging_region_bytes(world) == total
+        assert total % 128 == 0 and all(o % 128 == 0 for o in offsets.values())
+        assert total >= offsets["self_first"] + cb.self_first_state_bytes(world)
+
+
+def test_staging_region_is_used_in_place_and_not_allocated():
+    """With staging_region= the plan cuts its buffers out of the caller's arena:
+    nothing is allocated or freed, and sfBase points into that region."""
+    _self_first_or_skip()
+    world = _plan().info["worldSize"]
+    nbytes, offset = cb.staging_region_bytes(world), 512
+    comm, win, arena = _staging_arena(offset, nbytes)
+
+    p = _plan(arena=arena, staging_region="mori_staging")
+    assert len(comm.allocs) == 1, "the plan must not allocate a window of its own"
+    assert cb.SelfFirstState.of(arena) is None, "the mori-allocated path was taken"
+    self_first = cb.staging_layout(world)[0]["self_first"]
+    assert p._defaults["sfStride"] == _Comm.STRIDE
+    assert p._defaults["sfBase"] == win.local_ptr - _Comm.STRIDE + offset + self_first
+    p.close()
+    assert comm.closed == [], "the caller's arena is not the plan's to free"
+
+
+def test_staging_region_that_cannot_hold_the_layout_fails_construction():
+    """Overrunning the region lands in whatever the arena put next rather than
+    raising, so a region mori cannot verify it fits in is a construction error."""
+    _self_first_or_skip()
+    world = _plan().info["worldSize"]
+    nbytes = cb.staging_region_bytes(world)
+
+    class _NoRegion(_Arena):
+        def offset(self, name):
+            raise KeyError(name)
+
+    with pytest.raises(KeyError):  # never falls back to mori allocating
+        _plan(arena=_NoRegion(0xDEAD0000), staging_region="mori_staging")
+
+    _, _, small = _staging_arena(256, nbytes)
+    small.size = staticmethod(lambda n: nbytes - 1)
+    with pytest.raises(RuntimeError, match="staging_region_bytes"):
+        _plan(arena=small, staging_region="mori_staging")
+
+    _, _, misaligned = _staging_arena(130, nbytes)
+    with pytest.raises(RuntimeError, match="128 B line"):
+        _plan(arena=misaligned, staging_region="mori_staging")
+
+    _, _, unsized = _staging_arena(256, nbytes)
+    del type(unsized).size
+    with pytest.raises(AttributeError, match="size"):
+        _plan(arena=unsized, staging_region="mori_staging")
