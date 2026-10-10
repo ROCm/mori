@@ -1000,7 +1000,7 @@ def main():
         # Say what was actually verified. fp4 skips the identity-expert check
         # (hip has no fp4 combine) but its dispatch bytes ARE compared.
         if _PUSH and CHECK and not _data.verifies_nothing(INIT):
-            why = " (push: dispatch bytes + fp4 combine output)"
+            why = f" (push: dispatch bytes + {PUSH_QUANT} combine output)"
         elif _FP4:
             why = " (fp4: dispatch bytes only, combine not compared)"
         elif not CHECK:
