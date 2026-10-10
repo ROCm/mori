@@ -374,7 +374,7 @@ class EpDispatchCombineConfig:
                     self.world_size,
                     self.hidden_dim,
                     self.num_experts_per_token,
-                    dtype=self.dtype_str,
+                    dtype=self.dispatch_dtype_str,
                     experts_per_rank=self.num_experts_per_rank,
                     quant_type=self.quant_type,
                 )
@@ -549,8 +549,21 @@ class EpDispatchCombineConfig:
         return self.dispatch_dtype != self.combine_dtype
 
     @property
+    def dispatch_dtype_str(self):
+        """What dispatch transports, "fp4" / "fp8" / "bf16": hip_tuning_configs' key.
+
+        HIP tunes dispatch and combine apart, and its combine half is picked by
+        quant_type, so the combine dtype has no place in this key.
+        """
+        if self.is_fp4:
+            return "fp4"
+        if self.is_fp8:
+            return "fp8"
+        return "bf16"
+
+    @property
     def dtype_str(self):
-        """Token/dispatch dtype key for tuning_configs.lookup (fp4/fp8/default)."""
+        """FlyDSL's tuning key (tuning_configs.lookup), which names both halves."""
         if self.is_fp4:
             # fp4 dispatch + non-fp4 combine (asymmetric) moves 2 B/elem on the
             # combine side, so it needs the bf16 combine geometry, not the

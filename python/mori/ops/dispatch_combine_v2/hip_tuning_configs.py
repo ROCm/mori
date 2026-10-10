@@ -36,11 +36,12 @@ ascending, and ``lookup`` merges the two into the op's
 An unswept shape returns schedule=None and the single-shot default below. Add one by
 sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
 
-Dispatch dtype keys name only what dispatch transports: "bf16", "fp8", "fp4". The
-combine side has no dtype here -- it always reduces bf16 rows, and whether those go
-out as mxfp4 is ``quant_type``'s table. ``EpDispatchCombineConfig.dtype_str`` still
-says "fp4_disp_bf16_comb" for an fp4 dispatch (FlyDSL's table needs both halves), so
-``lookup`` reads that as "fp4".
+Dispatch dtype keys name only what dispatch transports: "bf16", "fp8", "fp4"
+(``EpDispatchCombineConfig.dispatch_dtype_str``). The combine side has no dtype here --
+it always reduces bf16 rows, and whether those go out as mxfp4 is ``quant_type``'s
+table. "fp4_disp_bf16_comb" is FlyDSL's key for the same fp4 dispatch (its table does
+name both halves); ``lookup`` still reads it as "fp4" for callers that pass
+``dtype_str``.
 """
 
 from __future__ import annotations
@@ -278,7 +279,7 @@ def _merge(disp, comb):
     return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
 
 
-# dtype_str names both halves; the dispatch table is keyed by the dispatch wire alone.
+# FlyDSL's dtype_str spelling, still accepted from callers that pass it (aiter's MegaMoE).
 _DISPATCH_DTYPE_ALIAS = {"fp4_disp_bf16_comb": "fp4"}
 
 
@@ -292,9 +293,11 @@ def lookup(
 ) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
-    An unswept shape gets the HIP single-shot default (schedule=None). A swept one
-    gets a per-token-count schedule built from the dispatch and combine tables
-    independently, so either half can be re-tuned without touching the other.
+    ``dtype`` is the dispatch wire ("bf16" / "fp8" / "fp4") and picks the dispatch
+    half; ``quant_type`` picks the combine half. An unswept shape gets the HIP
+    single-shot default (schedule=None). A swept one gets a per-token-count schedule
+    built from the dispatch and combine tables independently, so either half can be
+    re-tuned without touching the other.
     """
     base = _hip_default()
     dev = _device_key()
