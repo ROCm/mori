@@ -168,6 +168,7 @@ struct EpInterNodeRequest {
   int maxTotalRecvTokens = 0;
   int gpuPerNode = 8;
   int numQpPerPe = 1;
+  int numQpToDrain = 0;
   EpQuantType quantType = EpQuantType::None;
   // specialisation
   EpInterNodeDType dtype = EpInterNodeDType::Bf16;
@@ -192,6 +193,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(maxTotalRecvTokens);
   MORI_FIELD(gpuPerNode);
   MORI_FIELD(numQpPerPe);
+  MORI_FIELD(numQpToDrain);
   MORI_FIELD(quantType);
   MORI_FIELD(dtype);
   MORI_FIELD(blockNum);
@@ -202,7 +204,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 17,
+    EpInterNodeRequest, 18,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

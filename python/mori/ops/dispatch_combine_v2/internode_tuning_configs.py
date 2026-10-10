@@ -52,6 +52,13 @@ dispatch_warp, combine_block, combine_rdma, combine_warp)``, ascending; the firs
 whose ``max_tokens_inclusive`` covers ``num_tokens`` wins. Filed under the dispatch/token dtype ("fp8" here
 means fp8-dispatch + bf16-combine, the pairing the internode bench measures);
 untuned dtypes fall back to "fp8".
+
+A row may append the active QP count: one more field for both phases, or two
+for dispatch then combine. A configured ``active_qps`` overrides it; a row
+without it takes ``min(2, num_qp_per_pe)``; a count above the allocation is
+clamped to it, as block_num is to the CU count. Like the geometry, it is chosen
+per bucket from each rank's own token count, so ranks may run different counts
+in one cycle; the kernel's combine barrier does not depend on it.
 """
 
 from mori.ops import utils as gpu_utils
@@ -59,7 +66,7 @@ from mori.ops import utils as gpu_utils
 # MI308X (gfx942, 80 CU) -- EP16, hidden 6144, topk 8. Tuned fp8-dispatch +
 # bf16-combine on a 2-node rig, block_num <= 80.
 #
-# Invariant: dispatch and combine are COUPLED -- same graph replay, same QPs, one
+# Invariant: dispatch and combine are COUPLED -- same graph replay, same QP allocation, one
 # shared arena -- so these rows are the best PAIR, not the per-phase argmins. Do
 # not re-tune one phase in isolation; the per-phase winners a sweep prints do not
 # reproduce once the two phases run at different geometries. The 4-token row is
@@ -136,9 +143,10 @@ def _device_key():
 def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
     """Per-phase internode geometry for the current GPU/shape/token-count.
 
-    Returns ``{"dispatch": (block, rdma, warp), "combine": (block, rdma, warp)}``
+    Returns ``{"dispatch": (block, rdma, warp, active_qps), "combine": (...)}``
     with ``block <= CU count``, or ``None`` when this GPU/shape is not tuned (the
-    caller keeps whatever geometry it already had).
+    caller keeps whatever geometry it already had). active_qps is None when the
+    row does not give one.
     """
     key = _device_key()
     if key is None:
@@ -163,7 +171,12 @@ def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
         combine_block,
         combine_rdma,
         combine_warp,
-    ) = bucket
+    ) = bucket[:7]
+    active_qps = bucket[7:]
+    if len(active_qps) > 2:
+        raise ValueError(f"tuning row {bucket!r}: at most two active QP fields")
+    dispatch_qps = active_qps[0] if active_qps else None
+    combine_qps = active_qps[-1] if active_qps else None
 
     cu_count = gpu_utils.cu_count() or 80
     # Never over-subscribe the CUs.
@@ -176,6 +189,6 @@ def lookup(world_size, hidden_dim, topk, num_tokens, dtype="fp8"):
     dispatch_rdma = min(dispatch_rdma, max(1, dispatch_block - 1))
     combine_rdma = min(combine_rdma, max(1, combine_block - 1))
     return {
-        "dispatch": (dispatch_block, dispatch_rdma, dispatch_warp),
-        "combine": (combine_block, combine_rdma, combine_warp),
+        "dispatch": (dispatch_block, dispatch_rdma, dispatch_warp, dispatch_qps),
+        "combine": (combine_block, combine_rdma, combine_warp, combine_qps),
     }
