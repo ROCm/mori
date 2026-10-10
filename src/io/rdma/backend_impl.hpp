@@ -117,6 +117,16 @@ class RdmaManager {
   // to a failed state.
   int FailInFlightTransfers(const QpErrorEvent& event);
 
+  /* -------------------------------- Peer failure -------------------------------- */
+  // Takes the oldest recorded failure; polled by an application thread.
+  bool PopPeerFailure(PeerFailureEvent* out);
+  // False once a failure covering this QP is observed; a slow QP stays alive.
+  bool IsQpAlive(int devId, uint32_t qpNum) const;
+  // Records IBV_WC_RETRY_EXC_ERR: the only place peer death is observable.
+  void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
+  // Name of an available device; availDevices is fixed, so this takes no lock.
+  std::string DeviceName(int devId) const;
+
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
 
@@ -137,6 +147,11 @@ class RdmaManager {
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
 
+  // Self-synchronizing, so not guarded by `mu`; its writer threads join first.
+  PeerFailureTracker peerFailures_;
+
+  // Declared last so it is the first member destroyed, and explicitly reset at
+  // the top of ~RdmaManager: the monitor thread calls into peerFailures_.
   std::unique_ptr<RdmaAsyncEventMonitor> asyncEventMonitor_;
 };
 
@@ -284,7 +299,8 @@ class RdmaBackendSession : public BackendSession {
   RdmaBackendSession(const RdmaBackendConfig& config,
                      std::vector<application::RdmaMemoryRegion> localMrPerEp,
                      std::vector<application::RdmaMemoryRegion> remoteMrPerEp, const EpPairVec& eps,
-                     Executor* executor, MemoryLocationType localLoc = MemoryLocationType::CPU);
+                     Executor* executor, RdmaManager* rdma,
+                     MemoryLocationType localLoc = MemoryLocationType::CPU);
   ~RdmaBackendSession() = default;
 
   void ReadWrite(size_t localOffset, size_t remoteOffset, size_t size, TransferStatus* status,
@@ -302,6 +318,9 @@ class RdmaBackendSession : public BackendSession {
   std::vector<application::RdmaMemoryRegion> remoteMrPerEp{};
   EpPairVec eps{};
   Executor* executor{nullptr};
+  // Source of QP liveness for Alive(). Null on a default-constructed session,
+  // which reports alive because nothing is known to have failed.
+  RdmaManager* rdma_{nullptr};
   MemoryLocationType localLoc_{MemoryLocationType::CPU};
   std::shared_ptr<std::atomic<bool>> warnedChunkedWorkerFallback_{
       std::make_shared<std::atomic<bool>>(false)};
@@ -337,6 +356,7 @@ class RdmaBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
+  bool PopPeerFailure(PeerFailureEvent* out) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:

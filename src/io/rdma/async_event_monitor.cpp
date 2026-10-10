@@ -29,6 +29,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <unordered_set>
 
 namespace mori {
@@ -99,6 +100,29 @@ EventDescriptor DescribeAsyncEvent(ibv_event_type type) {
   }
 }
 
+struct PeerFailureClass {
+  PeerFailureReason reason;
+  FailureScope scope;
+};
+
+// Maps an async event onto a failure reason and scope; nullopt if still usable.
+std::optional<PeerFailureClass> ClassifyPeerFailure(ibv_event_type type) {
+  switch (type) {
+    case IBV_EVENT_QP_FATAL:
+    case IBV_EVENT_QP_REQ_ERR:
+    case IBV_EVENT_QP_ACCESS_ERR:
+      return PeerFailureClass{PeerFailureReason::LOCAL_QP_ERROR, FailureScope::kQp};
+    case IBV_EVENT_PORT_ERR:
+      return PeerFailureClass{PeerFailureReason::LOCAL_PORT_DOWN, FailureScope::kPort};
+    case IBV_EVENT_DEVICE_FATAL:
+      return PeerFailureClass{PeerFailureReason::LOCAL_DEVICE_FATAL, FailureScope::kDevice};
+    case IBV_EVENT_CQ_ERR:
+      return PeerFailureClass{PeerFailureReason::LOCAL_CQ_ERROR, FailureScope::kCq};
+    default:
+      return std::nullopt;
+  }
+}
+
 class AsyncEventAckGuard {
  public:
   explicit AsyncEventAckGuard(ibv_async_event* event) noexcept : event_(event) {}
@@ -115,13 +139,13 @@ class AsyncEventAckGuard {
 
 std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
     const application::RdmaDeviceList& devices, std::shared_ptr<spdlog::logger> logger,
-    QpErrorHandler errorHandler) {
+    QpErrorHandler errorHandler, PeerFailureCallback onPeerFailure) {
   // Thread creation and allocations can throw; a failed monitor must degrade to
   // "no observability", never abort RDMA backend construction. On any throw the
   // in-scope unique_ptr unwinds through Shutdown() and releases monitor fds.
   try {
-    std::unique_ptr<RdmaAsyncEventMonitor> monitor(
-        new RdmaAsyncEventMonitor(std::move(logger), std::move(errorHandler)));
+    std::unique_ptr<RdmaAsyncEventMonitor> monitor(new RdmaAsyncEventMonitor(
+        std::move(logger), std::move(errorHandler), std::move(onPeerFailure)));
     if (!monitor->Start(devices)) return nullptr;
     return monitor;
   } catch (...) {
@@ -130,8 +154,11 @@ std::unique_ptr<RdmaAsyncEventMonitor> RdmaAsyncEventMonitor::Create(
 }
 
 RdmaAsyncEventMonitor::RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger,
-                                             QpErrorHandler errorHandler)
-    : logger_(std::move(logger)), errorHandler_(std::move(errorHandler)) {}
+                                             QpErrorHandler errorHandler,
+                                             PeerFailureCallback onPeerFailure)
+    : logger_(std::move(logger)),
+      errorHandler_(std::move(errorHandler)),
+      onPeerFailure_(std::move(onPeerFailure)) {}
 
 RdmaAsyncEventMonitor::~RdmaAsyncEventMonitor() { Shutdown(); }
 
@@ -292,7 +319,74 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
   }
   DescribeAndLog(watch, info);
   ReportUncompletableIfNeeded(watch, info);
+  ReportTransportEvent(watch, info);
   return GetResult::kEvent;
+}
+
+void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
+                                                 const EventInfo& info) noexcept {
+  if (!onPeerFailure_) return;
+
+  const bool portScoped = DescribeAsyncEvent(info.type).category == Category::kPort;
+  const bool portKnown = portScoped && info.portNum >= 1 &&
+                         static_cast<uint32_t>(info.portNum) <= watch.physicalPortCount;
+  const uint32_t portNum = portKnown ? static_cast<uint32_t>(info.portNum) : 0;
+
+  // The callback and the string building below allocate; this runs on the
+  // monitor thread inside a noexcept boundary, so nothing may escape.
+  try {
+    // Counterpart of PORT_ERR: withdraws the failure a link flap raised.
+    if (info.type == IBV_EVENT_PORT_ACTIVE) {
+      if (!portKnown) return;
+      PeerFailureReport report;
+      report.recovery = true;
+      report.scope = FailureScope::kPort;
+      report.event.reason = PeerFailureReason::LOCAL_PORT_DOWN;
+      report.event.deviceName = watch.deviceName;
+      report.event.portNum = portNum;
+      onPeerFailure_(report);
+      return;
+    }
+
+    std::optional<PeerFailureClass> failure = ClassifyPeerFailure(info.type);
+    if (!failure.has_value()) return;
+    // Unplaceable, and widening to the device would condemn unrelated ports.
+    if (failure->scope == FailureScope::kPort && !portKnown) {
+      SafeLog(spdlog::level::warn,
+              "RDMA async monitor: port event type {} on {} has no usable port number; not "
+              "reported as a failure",
+              static_cast<int>(info.type), watch.deviceName);
+      return;
+    }
+
+    EventDescriptor desc = DescribeAsyncEvent(info.type);
+    PeerFailureReport report;
+    report.scope = failure->scope;
+    report.event.reason = failure->reason;
+    report.event.deviceName = watch.deviceName;
+    // Each field is filled only where ProcessOneEvent actually captured it.
+    report.event.qpNum = desc.category == Category::kQp ? info.qpNum : 0;
+    report.event.portNum = portNum;
+    report.cqHandle = desc.category == Category::kCq ? info.objPtr : nullptr;
+    // No CQ handle means no way to tell which QPs are affected; widen to the device.
+    if (report.scope == FailureScope::kCq && report.cqHandle == nullptr) {
+      report.scope = FailureScope::kDevice;
+    }
+
+    report.event.detail = std::string(desc.name != nullptr ? desc.name : "IBV_EVENT_UNKNOWN") +
+                          " on device " + watch.deviceName;
+    if (report.event.qpNum != 0) {
+      report.event.detail += " qpn=" + std::to_string(report.event.qpNum);
+    }
+    if (report.event.portNum != 0) {
+      report.event.detail += " port=" + std::to_string(report.event.portNum);
+    }
+    onPeerFailure_(report);
+  } catch (...) {
+    SafeLog(spdlog::level::err,
+            "RDMA async monitor: failed to report transport event type {} on {}",
+            static_cast<int>(info.type), watch.deviceName);
+  }
 }
 
 void RdmaAsyncEventMonitor::ReportUncompletableIfNeeded(const Watch& watch,

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "mori/application/transport/rdma/rdma.hpp"
+#include "mori/io/peer_failure.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "src/io/rdma/common.hpp"
 
@@ -47,11 +48,15 @@ namespace io {
 // CQ is dead no CQE can ever be reaped, so the flush cascade the CQ poller relies
 // on never arrives and in-flight transfers would otherwise stay IN_PROGRESS
 // forever.
+//
+// onPeerFailure is separate: it answers liveness rather than settling transfers.
 class RdmaAsyncEventMonitor {
  public:
+  // Both callbacks fire on the monitor thread; taken here so they need no locking.
   static std::unique_ptr<RdmaAsyncEventMonitor> Create(const application::RdmaDeviceList& devices,
                                                        std::shared_ptr<spdlog::logger> logger,
-                                                       QpErrorHandler errorHandler = nullptr);
+                                                       QpErrorHandler errorHandler = nullptr,
+                                                       PeerFailureCallback onPeerFailure = {});
   ~RdmaAsyncEventMonitor();
 
   RdmaAsyncEventMonitor(const RdmaAsyncEventMonitor&) = delete;
@@ -80,13 +85,16 @@ class RdmaAsyncEventMonitor {
 
   enum class GetResult { kEvent, kDrained, kError };
 
-  RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger, QpErrorHandler errorHandler);
+  RdmaAsyncEventMonitor(std::shared_ptr<spdlog::logger> logger, QpErrorHandler errorHandler,
+                        PeerFailureCallback onPeerFailure);
 
   bool Start(const application::RdmaDeviceList& devices);
   void MainLoop() noexcept;
   GetResult ProcessOneEvent(Watch& watch) noexcept;
   void DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept;
   void ReportUncompletableIfNeeded(const Watch& watch, const EventInfo& info) noexcept;
+  // Scopes the event to the resource it invalidates and reports it.
+  void ReportTransportEvent(const Watch& watch, const EventInfo& info) noexcept;
   void RemoveWatch(Watch& watch) noexcept;
   void RestoreWatchFd(Watch& watch) noexcept;
   void DrainWake() noexcept;
@@ -107,6 +115,8 @@ class RdmaAsyncEventMonitor {
 
   std::shared_ptr<spdlog::logger> logger_;
   QpErrorHandler errorHandler_;
+  // Set at construction and never mutated, so the thread reads it unsynchronized.
+  PeerFailureCallback onPeerFailure_;
   std::vector<Watch> watches_;
   int epollFd_{-1};
   int wakeFd_{-1};
