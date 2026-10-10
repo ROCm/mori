@@ -66,8 +66,8 @@ inline __device__ void SignalNodeRecvTokenNum(EpDispatchCombineArgs<T>& args, in
 // The atomic barrier counts one AMO_ADD per QP into a single slot. Writes cannot accumulate, so
 // the write-based barrier gives each (sender, qp) its own slot, placed after the worldSize
 // per-rank slots that the intra-node barrier uses.
-inline __device__ size_t InterNodeBarrierQpSlot(const EpDispatchCombineConfig& config,
-                                                int senderPe, int qpId) {
+inline __device__ size_t InterNodeBarrierQpSlot(const EpDispatchCombineConfig& config, int senderPe,
+                                                int qpId) {
   return config.worldSize + static_cast<size_t>(senderPe) * config.numQpPerPe + qpId;
 }
 
@@ -99,9 +99,8 @@ inline __device__ void WaitInterNodeBarrier(EpDispatchCombineArgs<T>& args, int 
     // round r+1 dispatch), so the slot is exactly barrierFlag. Waiting for == rather than >=
     // turns a barrierFlag desync into a hang instead of an early, silent pass.
     for (int i = 0; i < config.numQpPerPe; i++) {
-      while (core::AtomicLoadRelaxedSystem(localBarrierPtr +
-                                           InterNodeBarrierQpSlot(config, proxyPe, i)) !=
-             barrierFlag) {
+      while (core::AtomicLoadRelaxedSystem(
+                 localBarrierPtr + InterNodeBarrierQpSlot(config, proxyPe, i)) != barrierFlag) {
       }
     }
   } else {
