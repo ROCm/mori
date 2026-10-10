@@ -117,7 +117,7 @@ All subsequent steps run **inside** `$CONTAINER_NAME` via `docker exec`.
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "apt-get update && apt-get install -y --no-install-recommends \
-    git libpci-dev pciutils sudo libdw1 libibverbs-dev ibverbs-utils rdma-core \
+    git pciutils sudo libdw1 libibverbs-dev ibverbs-utils rdma-core \
     locales iputils-ping iproute2 ethtool jq perftest \
     wget unzip ca-certificates curl \
     libgrpc++-dev protobuf-compiler-grpc libprotobuf-dev protobuf-compiler \
@@ -488,7 +488,7 @@ sudo docker exec -w $MORI_REPO_DIR $CONTAINER_NAME bash -c "BUILD_UMBP=OFF pip i
 sudo docker exec $CONTAINER_NAME bash -c "python3 -c \"import mori; print('mori version:', mori.__version__)\""
 ```
 
-On shared-library errors (`libpci.so`, `libibverbs.so`, …):
+On shared-library errors (`libibverbs.so`, …):
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c "
