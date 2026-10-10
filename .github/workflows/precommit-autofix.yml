@@ -28,6 +28,16 @@ jobs:
           script: |
             let pr;
             if (context.eventName === 'issue_comment') {
+              // Anyone can comment; only users with write access may push to the PR.
+              let permission = 'none';
+              try {
+                ({ data: { permission } } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner, repo: context.repo.repo, username: context.actor }));
+              } catch (e) {}
+              if (!['admin', 'maintain', 'write'].includes(permission)) {
+                core.setFailed(`/fix-precommit needs write access; ${context.actor} has ${permission}`);
+                return;
+              }
               const { data } = await github.rest.pulls.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
