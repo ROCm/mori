@@ -621,7 +621,7 @@ __device__ void EpCombineAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args)
       uint8_t* dst = args.reg(args.offCombineInp)->template GetAs<uint8_t*>(destPe) +
                      static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes +
                      share.offset;
-      const uint8_t* src = args.reg(args.offStaging)->template GetAs<const uint8_t*>() +
+      const uint8_t* src = args.reg(args.offCombineStaging)->template GetAs<const uint8_t*>() +
                            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes +
                            share.offset;
       core::WarpCopy<uint8_t, 1>(dst, src, share.bytes);
@@ -670,7 +670,9 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
-  uint8_t* stagingPtr = args.reg(args.offStaging)->template GetAs<uint8_t*>();
+  // Combine's own staging, not dispatch's: writing dispatch's here would race
+  // its transfer still reading it. See asyncll_regions.
+  uint8_t* stagingPtr = args.reg(args.offCombineStaging)->template GetAs<uint8_t*>();
 
   for (int tokenId = globalWarpId; tokenId < totalRecvTokenNum; tokenId += globalWarpNum) {
     index_t stagingTokId = 0;
@@ -721,8 +723,8 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
         destPe - args.lsaBase, EpInterNodeWindow(args.reg(args.offCombineInp)),
         EpInterNodeOffset(args.reg(args.offCombineInp),
                           static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes),
-        EpInterNodeWindow(args.reg(args.offStaging)),
-        EpInterNodeOffset(args.reg(args.offStaging),
+        EpInterNodeWindow(args.reg(args.offCombineStaging)),
+        EpInterNodeOffset(args.reg(args.offCombineStaging),
                           static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes),
         tokenNum * hiddenBytes, q);
   }
@@ -809,8 +811,10 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
       const index_t destPe = PeFromSendBufSlotOffset(config, destTokId);
 
       if (destPe < npes) {
+        // Own tokens were never transferred -- they are still in combine's
+        // staging where SendCopy put them.
         T* base = (destPe != myPe) ? args.reg(args.offCombineInp)->template GetAs<T*>()
-                                   : args.reg(args.offStaging)->template GetAs<T*>();
+                                   : args.reg(args.offCombineStaging)->template GetAs<T*>();
         srcPtrs[j] = base + static_cast<size_t>(destTokId) * hiddenDim + hiddenDimOffset;
       } else {
         srcPtrs[j] = nullptr;

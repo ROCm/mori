@@ -1014,6 +1014,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # AsyncLL's SDMA source word for the small count/epoch writes. Absent
             # from the other families' arenas, where the kernels never read it.
             offSendCount=offset("send_count") if arena.has("send_count") else 0,
+            offCombineStaging=(
+                offset("inter_combine_staging")
+                if arena.has("inter_combine_staging")
+                else 0
+            ),
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map

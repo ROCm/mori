@@ -211,4 +211,21 @@ def asyncll_regions(cfg):
     order.append("send_count")
     regions["send_count"] = world_size * 2 * _U64
 
+    # Combine gets its OWN send staging rather than reusing inter_staging.
+    #
+    # Sharing one buffer is correct but couples the two phases: dispatch's
+    # transfer reads inter_staging asynchronously, and combine's SendCopy writes
+    # the same bytes (at a different stride), so the only thing standing between
+    # them is dispatch's quiet. That makes the quiet load-bearing for SOURCE
+    # SAFETY as well as for ordering, and pins it to "before the next phase
+    # writes" -- which is exactly the point in the pipeline AsyncLL wants to be
+    # free to move past.
+    #
+    # Split, the write-after-read hazard does not exist, and the only remaining
+    # job of the quiet is to keep the count word behind the payload. Costs one
+    # more hidden-sized buffer per rank; at EP8 / 128 tokens / 7168 that is tens
+    # of MB against an arena already measured in hundreds.
+    order.append("inter_combine_staging")
+    regions["inter_combine_staging"] = send_slots * hidden_bytes
+
     return [(name, regions[name]) for name in order]

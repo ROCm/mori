@@ -259,6 +259,7 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(offChunkFlag, "u64")                 \
   X(offOutScales, "u64")                 \
   X(offSendCount, "u64")                 \
+  X(offCombineStaging, "u64")            \
   X(rank, "i32")                         \
   X(lsaBase, "i32")                      \
   X(rdmaBlockNum, "i32")                 \
@@ -315,6 +316,10 @@ struct EpInterNodeArgs {
   // SDMA copy needs a real source address. Left 0 by the other kernel families,
   // whose arenas do not carry the region.
   uint64_t offSendCount{0};
+  // AsyncLL only: combine's send staging, separate from offStaging so that
+  // writing it cannot race dispatch's in-flight transfer reading the other one.
+  // See asyncll_regions for why the two phases do not share.
+  uint64_t offCombineStaging{0};
 
   // Which world rank this is. Runtime, not Cfg, for the reason EpArgs gives:
   // as a compiled-in constant every rank on a node builds its own copy of an
@@ -382,7 +387,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 39,
+static_assert(detail::kEpInterNodeArgsFieldCount == 40,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
