@@ -185,6 +185,16 @@ def _perf_report():
     return perf_report
 
 
+def _rdma_atomics_disabled():
+    """True when MORI_EP_DISABLE_RDMA_ATOMICS is on, parsed like env::IsEnvVarEnabled in C++.
+
+    Unset/empty is off, "0"/"false"/"off"/"no" (case-insensitive) is off, and any other value is
+    on. Mirroring the C++ rule keeps the perf record in step with what the kernel actually did.
+    """
+    val = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
+    return val != "" and val.lower() not in ("0", "false", "off", "no")
+
+
 def _emit_internode_perf(
     bench_stats,
     world_size,
@@ -216,20 +226,26 @@ def _emit_internode_perf(
         disp_xgmi, disp_rdma, disp_ll, disp_lat = disp
         comb_xgmi, comb_rdma, comb_ll, comb_lat = comb
 
+        params = {
+            "world_size": world_size,
+            "max_tokens": max_tokens,
+            "kernel_type": kernel_type,
+            "dtype": perf_report.dtype_label(dtype),
+            "combine_dtype": perf_report.dtype_label(
+                dtype if combine_dtype is None else combine_dtype
+            ),
+            "quant_type": quant_type,
+            "num_qp": num_qp,
+            "hidden_dim": hidden_dim,
+        }
+        # Only present for the atomic-free variant, so records from runs that predate the option
+        # keep the same series/dedup key in tools/perf/build_report.py.
+        if _rdma_atomics_disabled():
+            params["atomic_free"] = True
+
         perf_report.record_perf(
             category="internode_ep",
-            params={
-                "world_size": world_size,
-                "max_tokens": max_tokens,
-                "kernel_type": kernel_type,
-                "dtype": perf_report.dtype_label(dtype),
-                "combine_dtype": perf_report.dtype_label(
-                    dtype if combine_dtype is None else combine_dtype
-                ),
-                "quant_type": quant_type,
-                "num_qp": num_qp,
-                "hidden_dim": hidden_dim,
-            },
+            params=params,
             metrics={
                 "dispatch_rdma_bw_gbps": _best_bw(disp_rdma),
                 "dispatch_xgmi_bw_gbps": _best_bw(disp_xgmi),
