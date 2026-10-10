@@ -36,6 +36,7 @@
 #include "umbp.grpc.pb.h"
 #include "umbp/common/env_time.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/common/rpc_deadline.h"
 #include "umbp/distributed/master/evict_strategy.h"
 #include "umbp/distributed/master/in_memory_master_metadata_store.h"
 #include "umbp/distributed/master/master_metadata_store.h"
@@ -115,9 +116,7 @@ std::map<std::string, LogicalTierCapacity> LogicalCapsFromProto(
 
 int EvictKeyDeadlineMs() {
   static const int v =
-      static_cast<int>(GetEnvMilliseconds("UMBP_EVICTKEY_DEADLINE_MS",
-                                          std::chrono::milliseconds(1000), /*min_allowed=*/1)
-                           .count());
+      ResolveDeadlineMs("UMBP_EVICTKEY_DEADLINE_MS", std::chrono::milliseconds(1000));
   return v;
 }
 
@@ -138,8 +137,7 @@ class MasterPeerStubPool : public EvictKeyDispatcher {
     for (auto& k : keys) req.add_keys(std::move(k));
     ::umbp::EvictKeyResponse resp;
     grpc::ClientContext ctx;
-    ctx.set_deadline(std::chrono::system_clock::now() +
-                     std::chrono::milliseconds(EvictKeyDeadlineMs()));
+    ArmDeadline(ctx, EvictKeyDeadlineMs());
 
     auto status = stub->EvictKey(&ctx, req, &resp);
     if (!status.ok()) {
