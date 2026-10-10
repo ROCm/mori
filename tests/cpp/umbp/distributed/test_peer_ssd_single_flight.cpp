@@ -147,7 +147,7 @@ struct Harness {
 Harness MakeHarness(bool single_flight = true) {
   auto be = std::make_unique<GatedBackend>(1'000'000);
   GatedBackend* raw = be.get();
-  return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be), 0.9, 0.7, single_flight)};
+  return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be), single_flight)};
 }
 
 std::vector<std::pair<const void*, size_t>> OneSeg(const std::string& s) {

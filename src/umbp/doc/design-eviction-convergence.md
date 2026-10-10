@@ -141,7 +141,10 @@ the placement (or, without one, the first owner in read order). No copy there �
    the key (a copy-mode promotion left one there) nothing is copied and only the
    source is freed.
 4. Otherwise, or if the demotion failed (no room downstream) → **drop** that copy
-   only: `Evict({key})` on that one backend.
+   only: `Evict({key})` on that one backend. One exception: if the demotion
+   failed because *another* transition started moving the key meanwhile, leave
+   it (0 freed). Deleting the source then could land before that transition pins
+   it, and the key would be lost instead of moved.
 5. If the freed copy was the placement, point the placement at the remaining
    copy, or forget the key.
 
@@ -184,17 +187,27 @@ so a key re-committed in that window keeps its placement.
 **ordering, not eviction**:
 
 ```cpp
+// types.h: a key, and the capacity freeing it gives back (page-rounded where
+// the medium allocates in pages).
+struct EvictionOffer { std::string key; uint64_t bytes; };
+
 // Start keeping the order EvictionCandidates() reads. Off by default: a
 // master-only node never asks for candidates.
 virtual void TrackEvictionOrder() {}
 // Up to max_count keys this medium could free right now, coldest first,
 // skipping keys under a read lease, a pin, or an in-flight read. Frees nothing;
 // Evict() re-checks every key.
-virtual std::vector<std::string> EvictionCandidates(size_t max_count) { return {}; }
+virtual std::vector<EvictionOffer> EvictionCandidates(size_t max_count) { return {}; }
 ```
 
 `PageBackend` keeps its LRU (touched by commit and resolve) behind
 `TrackEvictionOrder`; `PeerSsdManager` already keeps one unconditionally.
+
+**Why an offer carries its size.** The worker asks for a batch of 64 but takes
+only as many offers as the remaining budget needs. Without sizes it would evict
+the whole batch before re-reading usage, and on a small or nearly-drained medium
+one batch overshoots the low watermark by far -- the old in-medium rounds avoided
+that by summing sizes while selecting, and so must this.
 
 **Why the order comes from the medium, not the pool.** `PeerPool` has an LRU of
 its own, `access_order_`, but maintains it only for `watermark` offload, and
@@ -219,10 +232,14 @@ The first call starts one eviction worker thread. The worker:
 - **Orders** backends lowest tier first (SSD, then DRAM, then HBM), so a
   demotion from an upper tier finds room downstream.
 - For each backend at or above its high watermark: repeat
-  `EvictionCandidates(64)` → `PeerPool::Evict({key, backend_id}…, kReclaim)` —
-  **the same call the master's request makes** — until usage is at or below the
-  low watermark, the medium has no candidates, or a batch frees nothing (every
+  `EvictionCandidates(64)` → take offers until their bytes cover what is left of
+  the budget (usage minus the low watermark, fixed at the start) →
+  `PeerPool::Evict({key, backend_id}…, kReclaim)` — **the same call the master's
+  request makes** — until usage is at or below the low watermark, the budget is
+  covered, the medium has no candidates, or a batch frees nothing (every
   candidate was mid-transition or became busy). The next wake tries again.
+  The fixed budget is what stops a medium whose reported usage lags its deletes
+  from being drained to empty.
 
 Batches of 64 keep each `Evict` call short, so no single call holds the pool
 lock for a whole drain.

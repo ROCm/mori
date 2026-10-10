@@ -276,15 +276,27 @@ class MediumBackend : public MetricSource {
   // call (the default) simply has no outbox worth gating.
   virtual void SetEventPublishing(bool /*enabled*/) {}
 
-  // Turn on the backend's OWN eviction, for a node with no master.
+  // ---- eviction ordering ----
   //
-  // Evict(keys) above is a master decision: it picks victims with a
-  // cluster-wide view of who else holds the key.  Nothing in the system calls
-  // it otherwise, so a masterless node needs some medium-local policy or it
-  // simply fills up.  A backend that already self-evicts (SsdBackend, whose
-  // PeerSsdManager runs its own watermark loop from UMBPSsdConfig) ignores
-  // this; the default is to ignore it.
-  virtual void EnableLocalEviction(double /*high_watermark*/, double /*low_watermark*/) {}
+  // A backend never decides to evict.  The master (EvictKey) or the pool's own
+  // local watermark eviction decides when and how much, both through
+  // PeerPool::Evict, and Evict() below is the one place a medium frees a
+  // committed key.  What only the medium can supply is ORDER: it sees every
+  // read, including the resolve paths that never touch the pool's metadata.
+  // So it offers candidates, and nothing else (design-eviction-convergence.md).
+
+  // Start keeping the recency order EvictionCandidates() reads.  Off by
+  // default: a node whose eviction is all master-driven never asks for
+  // candidates, and keeping the order costs every read a touch.  Idempotent,
+  // and safe after Init: keys already owned are seeded into the order.
+  virtual void TrackEvictionOrder() {}
+
+  // Up to `max_count` keys this medium could free right now, coldest first,
+  // each with the capacity freeing it gives back, skipping keys that a read
+  // lease, pin or in-flight read protects.  Frees nothing: the caller passes
+  // the keys back through Evict(), which re-checks every one.  A medium that
+  // keeps no order returns nothing and is therefore never evicted locally.
+  virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
 
   // ---- observability ----
   //
@@ -363,9 +375,12 @@ class MediumBackend : public MetricSource {
     return out;
   }
 
-  // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
-  // result per key, in request order — the peer service relies on that to sum
-  // freed bytes for a key mirrored across media.
+  // The medium's ONE eviction implementation: free these keys' bytes on this
+  // medium, skipping any a read lease or pin protects, and queue a REMOVE for
+  // each key actually freed.  Every eviction reaches here through
+  // PeerPool::Evict -- master-driven or local -- and nothing else in a backend
+  // may free a committed key for capacity.  Idempotent; see
+  // EvictResult::bytes_freed.  One result per key, in request order.
   virtual std::vector<EvictResult> Evict(const std::vector<std::string>& keys) = 0;
 
   // ---- bootstrap (GetPeerInfo) ----
