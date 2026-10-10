@@ -68,6 +68,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "combineFp4");
   }
   c.combineFp4F32Scale = c.combineFp4 && req.combineFp4F32Scale;
+  if (req.combineFp8 && req.combineFp4) {
+    throw std::runtime_error(
+        "mori v2 ep: combineFp4 and combineFp8 each pick the push combine's wire format; set "
+        "one of them");
+  }
+  c.combineFp8 = (kind == EpKernelKind::Combine) && req.combineFp8;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -204,6 +210,7 @@ const std::vector<std::string>& EpSourceDeps() {
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
   return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
@@ -213,9 +220,10 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  if (cfg.combineFp4 && !EpArchIs1250()) {
+  if (EpCombinePush(cfg) && !EpArchIs1250()) {
     throw std::runtime_error(
-        "mori v2 ep: the fp4 combine is gfx125x only (it moves every token through TDM)");
+        "mori v2 ep: the fp4/fp8 push combine is gfx125x only (it moves every token through "
+        "TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }

@@ -720,7 +720,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // address; the previous call's store is visible across the kernel boundary.
   [[maybe_unused]] unsigned resSeq = 0;
   [[maybe_unused]] bool landStored = false;
-  // The fp4 combine returns this rank's tot rows at p into one run of this rank's landing, taken
+  // The push combine returns this rank's tot rows at p into one run of this rank's landing, taken
   // with the reservation at base: a row at slot s of p lands at s + dl, which p and this rank
   // both keep.
   [[maybe_unused]] auto takeLanding = [&](int p, index_t tot, index_t base) {
@@ -2347,13 +2347,17 @@ __device__ __forceinline__ void EpFp4CrossDeviceBarrier1250x(EpArgs args, bool n
 typedef float EpF32x8 __attribute__((ext_vector_type(8)));
 typedef __bf16 EpBf16x8 __attribute__((ext_vector_type(8)));
 typedef unsigned short EpU16x2 __attribute__((ext_vector_type(2)));
+typedef unsigned EpU32x2 __attribute__((ext_vector_type(2)));
 
 template <EpCfg kCfg>
 struct EpFp4Wire {
   static constexpr bool kF32Scale = kCfg.combineFp4F32Scale;
+  static constexpr bool kFp8 = kCfg.combineFp8;
   static constexpr int kTokB = EpTokenBytes(kCfg);
   static constexpr int kQGroup = kF32Scale ? 128 : 32;
-  static constexpr int kPayB = kCfg.hiddenDim / 2;
+  static constexpr int kPayB = kFp8 ? kCfg.hiddenDim : kCfg.hiddenDim / 2;
+  // Payload bytes of the 32 elements one lane reduces per pass.
+  static constexpr int kLaneB = kFp8 ? 32 : 16;
   static constexpr int kScB = kCfg.hiddenDim / kQGroup * (kF32Scale ? 4 : 1);
   static constexpr int kWireB =
       (kPayB + kScB + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
@@ -2364,6 +2368,44 @@ struct EpFp4Wire {
   static_assert(kWireB % kTdmRowBytes == 0 && kTokB % kTdmRowBytes == 0,
                 "every row a TDM transfer touches must start on a 128 B row");
 };
+
+// The payload of one lane's 32 elements of a landed row.
+template <EpCfg kCfg>
+struct EpFp4Lane {
+  uint4 v[EpFp4Wire<kCfg>::kLaneB / 16];
+};
+template <EpCfg kCfg>
+__device__ __forceinline__ EpFp4Lane<kCfg> EpFp4LoadLane(const char* const row, const int g) {
+  const uint4* const s = reinterpret_cast<const uint4*>(row + (size_t)g * EpFp4Wire<kCfg>::kLaneB);
+  EpFp4Lane<kCfg> p;
+#pragma unroll
+  for (int k = 0; k < EpFp4Wire<kCfg>::kLaneB / 16; ++k) p.v[k] = s[k];
+  return p;
+}
+// The values convert at scale 2^0 and the row's scale s multiplies in software.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpFp4Accum(float (&acc)[32], const EpFp4Lane<kCfg>& p,
+                                           const float s) {
+  if constexpr (EpFp4Wire<kCfg>::kFp8) {
+    const unsigned w[8] = {p.v[0].x, p.v[0].y, p.v[0].z, p.v[0].w,
+                           p.v[1].x, p.v[1].y, p.v[1].z, p.v[1].w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp8(EpU32x2{w[2 * i], w[2 * i + 1]},
+                                                                0x7F7F7F7Fu, 0);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
+    }
+  } else {
+    const unsigned w[4] = {p.v[0].x, p.v[0].y, p.v[0].z, p.v[0].w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
+    }
+  }
+}
 
 // s_wait_tensorcnt takes an immediate. Past the table the wait is for at most 10 in flight, which
 // is stricter than asked and so still correct.
@@ -2388,7 +2430,7 @@ __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
 // path can run at (hip_backend.py, out_tok).
 template <EpCfg kCfg>
 constexpr bool EpFp4Ovl() {
-  return kCfg.combineFp4 && !kCfg.combineFp4F32Scale && !EpIsWideEp(kCfg) &&
+  return EpCombinePush(kCfg) && !kCfg.combineFp4F32Scale && !EpIsWideEp(kCfg) &&
          (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
                               : (kCfg.worldSize >= 4 && kCfg.warpPerBlock == 24));
 }
@@ -2430,7 +2472,7 @@ struct EpFp4Item {
 };
 
 template <EpCfg kCfg>
-using EpFp4First = std::conditional_t<kCfg.combineFp4, EpFp4Item<kCfg>, char>;
+using EpFp4First = std::conditional_t<EpCombinePush(kCfg), EpFp4Item<kCfg>, char>;
 
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
@@ -2450,9 +2492,19 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // free until that row is quantized out of registers -- the only layout a 16-warp tile (five wire
   // rows) can hold. A run's stores and the next row's load stay within the 11 TDM ops a wave keeps
   // in flight.
+  // An fp8 tile at 16 warps holds two wire rows and not a bf16 row besides: half a row is staged at
+  // the end of the warp's share, over the second half of the last wire row, and a row loads and
+  // quantizes in two halves. The scales of the first half wait in registers until the second half
+  // is out of the staging area.
+  constexpr int kShareB = EpCombine1250xLdsBudget / kCfg.warpPerBlock / kTdmRowBytes * kTdmRowBytes;
+  constexpr bool kHalf = W::kFp8 && (size_t)kCap * kWireB < (size_t)kWireB + kTokB;
+  constexpr int kStageB = kHalf ? kTokB / 2 : kTokB;
   constexpr int kRunFit = (kCap * kWireB - kTokB) / kWireB;
   constexpr int C = kRunFit > 2 ? (kRunFit < 10 ? kRunFit : 10) : 2;
-  constexpr size_t kStageOff = (C > 2) ? (size_t)C * kWireB : (size_t)kWireB;
+  constexpr size_t kStageOff = kHalf    ? (size_t)kShareB - kStageB
+                               : (C > 2) ? (size_t)C * kWireB
+                                         : (size_t)kWireB;
+  constexpr size_t kTileB = kHalf ? (size_t)kShareB : (size_t)kCap * kWireB;
 
   // Split send, for 8-warp blocks at eight ranks and up: the first kSegP warps of a block load and
   // quantize, the others only store. A block owns one contiguous range of received rows, cut into
@@ -2478,9 +2530,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // producers (16 warps) the producers bound it and the depth does not matter.
   constexpr int kSegL = (kOvlp && kCfg.warpPerBlock == 24) ? 1 : 4;
   constexpr int kSegMin = 64;
+  constexpr int kSegLds = kOvlp ? (int)EpFp4PendOff<kCfg>() : EpCombine1250xLdsBudget;
   constexpr int kSegNb =
-      kSegK > 0 ? (EpCombine1250xLdsBudget - kSegP * kTokB) / (kSegK * kWireB + (2 + kSegK) * 4)
-                : 0;
+      kSegK > 0 ? (kSegLds - kSegP * kTokB) / (kSegK * kWireB + (2 + kSegK) * 4) : 0;
   constexpr bool kSeg = kSegK > 0 && kSegK <= 15 && kSegL <= 8 && kSegNb >= 2;
 
   const int laneId = threadIdx.x & (WS - 1);
@@ -2506,16 +2558,30 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
     return amax > a2 ? amax : a2;
   };
+  // Writes a group's payload and returns its scale byte. The e8m0 scale is the smallest power of
+  // two that brings the group's amax within the format's largest value: 6 for e2m1, 448 for e4m3.
   auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
     const int u = i * WS + laneId;
     const unsigned amax = grpAmax(x);
-    const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
-    const int se = (e8 < 1 ? 1 : e8) - 127;
-    const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
-    const unsigned q =
-        (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
-    *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
-    d[kPayB + i * (WS / 4) + (laneId >> 2)] = (unsigned char)(se + 127);
+    if constexpr (W::kFp8) {
+      const int e8 = (((int)(amax & 0x7FFFu) + 0x1F) >> 7) - 8;
+      const int se = (e8 < 1 ? 1 : e8) - 127;
+      const float sc = __uint_as_float((unsigned)(127 + se) << 23);
+      *reinterpret_cast<EpU32x2*>(d + (size_t)u * 8) =
+          __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
+      return (unsigned char)(se + 127);
+    } else {
+      const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
+      const int se = (e8 < 1 ? 1 : e8) - 127;
+      const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
+      const unsigned q = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(
+          __builtin_bit_cast(EpBf16x8, x), sc);
+      *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
+      return (unsigned char)(se + 127);
+    }
+  };
+  auto qscale = [&](unsigned char* const d, const int i, const unsigned char s) {
+    d[kPayB + i * (WS / 4) + (laneId >> 2)] = s;
   };
   auto qrowF32 = [&](unsigned char* const d, const uint4(&xs)[kLd]) {
     constexpr int kBpl = WS / 16;
@@ -2570,7 +2636,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       qrowF32(d, xs);
     } else {
 #pragma unroll
-      for (int i = 0; i < kLd; ++i) qgrp(d, i, xs[i]);
+      for (int i = 0; i < kLd; ++i) qscale(d, i, qgrp(d, i, xs[i]));
     }
   };
 
@@ -2579,22 +2645,52 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     const uint4* const l = reinterpret_cast<const uint4*>(dstTile + kStageOff);
     bool next = true;
     for (int r = 0; r < nRows && next; ++r) {
-      __builtin_amdgcn_s_wait_tensorcnt(0);
-      uint4 xs[kLd];
+      if constexpr (kHalf) {
+        constexpr int kH = kLd / 2;
+        unsigned char* const d = dstTile + (size_t)r * kWireB;
+        unsigned char s0[kH];
 #pragma unroll
-      for (int i = 0; i < kLd; ++i) xs[i] = l[i * WS + laneId];
-      next = r + 1 < nRows && rowBase + (r + 1) * rowStep < rowsTot;
-      asm volatile("s_wait_dscnt 0x0" ::: "memory");
-      if (next)
-        TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kStageOff),
-                          reinterpret_cast<const int*>(srcRows + (size_t)(r + 1) * srcStride),
-                          TdmShape<int>((int)(kTokB / 4)));
-      quantRow(dstTile + (size_t)r * kWireB, xs);
+        for (int h = 0; h < 2; ++h) {
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+          uint4 xs[kH];
+#pragma unroll
+          for (int i = 0; i < kH; ++i) xs[i] = l[i * WS + laneId];
+          if (h == 1) next = r + 1 < nRows && rowBase + (r + 1) * rowStep < rowsTot;
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
+          if (h == 0 || next)
+            TdmIssueLoad<int>(
+                reinterpret_cast<int*>(dstTile + kStageOff),
+                reinterpret_cast<const int*>(srcRows + (size_t)(r + h) * srcStride +
+                                             (h == 0 ? (size_t)kStageB : 0)),
+                TdmShape<int>((int)(kStageB / 4)));
+#pragma unroll
+          for (int i = 0; i < kH; ++i) {
+            const unsigned char s = qgrp(d, h * kH + i, xs[i]);
+            if (h == 0)
+              s0[i] = s;
+            else
+              qscale(d, kH + i, s);
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < kH; ++i) qscale(d, i, s0[i]);
+      } else {
+        __builtin_amdgcn_s_wait_tensorcnt(0);
+        uint4 xs[kLd];
+#pragma unroll
+        for (int i = 0; i < kLd; ++i) xs[i] = l[i * WS + laneId];
+        next = r + 1 < nRows && rowBase + (r + 1) * rowStep < rowsTot;
+        asm volatile("s_wait_dscnt 0x0" ::: "memory");
+        if (next)
+          TdmIssueLoad<int>(reinterpret_cast<int*>(dstTile + kStageOff),
+                            reinterpret_cast<const int*>(srcRows + (size_t)(r + 1) * srcStride),
+                            TdmShape<int>((int)(kTokB / 4)));
+        quantRow(dstTile + (size_t)r * kWireB, xs);
+      }
     }
   };
 
-  unsigned char* const tile =
-      reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kCap * kWireB;
+  unsigned char* const tile = reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kTileB;
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
   constexpr int kLandRows = EpFp4LandRows<kCfg>();
   const int landFrom = EpFp4LandFrom(args, kCfg.worldSize, laneId);
@@ -2622,8 +2718,11 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   };
 
   static_assert(kOvlp || C <= kCap, "a run must fit the tile");
-  static_assert(kOvlp || (size_t)kCap * kWireB >= kStageOff + kTokB,
-                "the staged bf16 row must fit the tile");
+  static_assert(kOvlp || kTileB >= kStageOff + kStageB, "the staged bf16 row must fit the tile");
+  static_assert(kOvlp || !kHalf ||
+                    (kStageB % kTdmRowBytes == 0 && kLd % 2 == 0 &&
+                     kStageOff >= (size_t)(C - 1) * kWireB + kPayB / 2),
+                "the half-row staging may cover only the last wire row's second half");
   const int nbRows = (int)gridDim.x;
   const int stride = nbRows * kCfg.warpPerBlock * C;
   const int rowStep = nbRows * kCfg.warpPerBlock;
@@ -2906,7 +3005,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                  "s"(args.offOutTok));
     TdmIssueLoad<int>(reinterpret_cast<int*>(tile + kStageOff),
                       reinterpret_cast<const int*>(src + (size_t)rl * kTokB),
-                      TdmShape<int>((int)(kTokB / 4)));
+                      TdmShape<int>((int)(kStageB / 4)));
     const auto* const wd = reinterpret_cast<const ::mori::cco::ccoWindowDevice*>(win);
     char* const wBase = wd->winBase;
     const uint64_t wStride = (uint64_t)wd->stride4G << 32;
@@ -3037,21 +3136,16 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
   }
   const auto& rp = r.rp;
   const auto& on = r.on;
-  auto accStore = [&](const int g, const uint4(&pk)[kRows], const unsigned (&sb)[kRows]) {
+  auto accStore = [&](const int g, const EpFp4Lane<kCfg>(&pk)[kRows],
+                      const unsigned (&sb)[kRows]) {
     float acc[32];
 #pragma unroll
     for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
       if (j >= __popcll(mask)) break;
-      const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
       const float s = on[j] * __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
-#pragma unroll
-        for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
-      }
+      EpFp4Accum<kCfg>(acc, pk[j], s);
     }
     uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
 #pragma unroll
@@ -3079,13 +3173,13 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       const int p = pBeg + q;
       if (p >= pEnd) break;
       const int g = p * WS + laneId;
-      uint4 pk[kRows];
+      EpFp4Lane<kCfg> pk[kRows];
       unsigned sb[kRows];
 #pragma unroll
       for (int j = 0; j < kRows; ++j) {
         if (j >= nr) break;
         const char* const row = sharedMem + tileOff + (size_t)j * kWireB;
-        pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
+        pk[j] = EpFp4LoadLane<kCfg>(row, g);
         if constexpr (W::kF32Scale)
           sb[j] = *reinterpret_cast<const unsigned*>(row + kPayB + (size_t)(g * 32 / kQGroup) * 4);
         else
@@ -3097,14 +3191,8 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
 #pragma unroll
       for (int j = 0; j < kRows; ++j) {
         if (j >= nr) break;
-        const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
         const float s = __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i], 0x7F7F7F7Fu, 0);
-#pragma unroll
-          for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
-        }
+        EpFp4Accum<kCfg>(acc, pk[j], s);
       }
       uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
 #pragma unroll
@@ -3122,13 +3210,13 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       const int p = pBeg + q;
       if (p >= pEnd) break;
       const int g = p * WS + laneId;
-      uint4 pk[kRows];
+      EpFp4Lane<kCfg> pk[kRows];
       unsigned sb[kRows];
 #pragma unroll
       for (int j = 0; j < kRows; ++j) {
         if (j >= nRow) break;
         const char* const row = sharedMem + tileOff + (size_t)(j < nRow ? j : 0) * kWireB;
-        pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
+        pk[j] = EpFp4LoadLane<kCfg>(row, g);
         if constexpr (W::kF32Scale)
           sb[j] = *reinterpret_cast<const unsigned*>(row + kPayB + (size_t)(g * 32 / kQGroup) * 4);
         else
@@ -3325,14 +3413,14 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
 #pragma unroll
       for (int p = 0; p < kPass; ++p) {
         const int g = p * WS + laneId;
-        uint4 pk[kRows];
+        EpFp4Lane<kCfg> pk[kRows];
         unsigned sb[kRows];
 #pragma unroll
         for (int j = 0; j < kRows; ++j) {
           if (j >= nr) break;
           const int s = s0 + j < kRingL ? s0 + j : s0 + j - kRingL;
           const char* const row = sub + (size_t)s * kWireB;
-          pk[j] = *reinterpret_cast<const uint4*>(row + (size_t)g * 16);
+          pk[j] = EpFp4LoadLane<kCfg>(row, g);
           if constexpr (W::kF32Scale)
             sb[j] =
                 *reinterpret_cast<const unsigned*>(row + kPayB + (size_t)(g * 32 / kQGroup) * 4);
@@ -3345,14 +3433,8 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
 #pragma unroll
         for (int j = 0; j < kRows; ++j) {
           if (j >= nr) break;
-          const unsigned w[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
           const float s = __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
-#pragma unroll
-          for (int i4 = 0; i4 < 4; ++i4) {
-            const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(w[i4], 0x7F7F7F7Fu, 0);
-#pragma unroll
-            for (int k = 0; k < 8; ++k) acc[i4 * 8 + k] = __builtin_fmaf(d[k], s, acc[i4 * 8 + k]);
-          }
+          EpFp4Accum<kCfg>(acc, pk[j], s);
         }
         uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
 #pragma unroll
@@ -3429,16 +3511,21 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
 #pragma unroll 1
   for (int p = 0; p < kPass; ++p) {
     const int g = p * WS + laneId;
-    uint4 pk[kRows];
+    EpFp4Lane<kCfg> pk[kRows];
     unsigned sb[kRows];
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
       if (j >= nr) break;
-      EpGU64* const q = (EpGU64*)(r.rp[j] + (size_t)g * 16);
-      const unsigned long long a = __hip_atomic_load(q, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      const unsigned long long b =
-          __hip_atomic_load(q + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      pk[j] = make_uint4((unsigned)a, (unsigned)(a >> 32), (unsigned)b, (unsigned)(b >> 32));
+      EpGU64* const q = (EpGU64*)(r.rp[j] + (size_t)g * W::kLaneB);
+#pragma unroll
+      for (int k = 0; k < W::kLaneB / 16; ++k) {
+        const unsigned long long a =
+            __hip_atomic_load(q + 2 * k, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        const unsigned long long b =
+            __hip_atomic_load(q + 2 * k + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        pk[j].v[k] =
+            make_uint4((unsigned)a, (unsigned)(a >> 32), (unsigned)b, (unsigned)(b >> 32));
+      }
       const unsigned sw = __hip_atomic_load(
           (__attribute__((address_space(1))) unsigned*)(r.rp[j] + W::kPayB + (g & ~3)),
           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -3450,14 +3537,7 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
       if (j >= nr) break;
-      const unsigned wv[4] = {pk[j].x, pk[j].y, pk[j].z, pk[j].w};
-      const float s = __uint_as_float(sb[j] << 23);
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const EpF32x8 d = __builtin_amdgcn_cvt_scale_pk8_f32_fp4(wv[i], 0x7F7F7F7Fu, 0);
-#pragma unroll
-        for (int k = 0; k < 8; ++k) acc[i * 8 + k] = __builtin_fmaf(d[k], s, acc[i * 8 + k]);
-      }
+      EpFp4Accum<kCfg>(acc, pk[j], __uint_as_float(sb[j] << 23));
     }
     uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
 #pragma unroll
@@ -3592,7 +3672,7 @@ __device__ __forceinline__ void EpFp4OvlWait(const EpArgs& args, const unsigned 
 template <EpCfg kCfg, typename T>
 __device__ void EpCombine1250xBody(EpArgs args) {
   using TokT = T;
-  constexpr bool UseP2PRead = !kCfg.combineFp4;
+  constexpr bool UseP2PRead = !EpCombinePush(kCfg);
   constexpr int npes = kCfg.worldSize;
   constexpr int topk = kCfg.numExpertPerToken;
   constexpr int WS = kCfg.waveSize;

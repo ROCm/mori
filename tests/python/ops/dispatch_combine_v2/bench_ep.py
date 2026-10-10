@@ -101,17 +101,20 @@ if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
 PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
-if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32"):
+if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32", "fp8_blockwise"):
     raise ValueError(
-        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32"
+        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32|fp8_blockwise"
     )
+_PUSH_FP8 = PUSH_QUANT == "fp8_blockwise"
 PUSH_QRULE = os.environ.get("PUSH_QRULE")
 if not PUSH_QRULE:
-    PUSH_QRULE = "mx" if PUSH_QUANT == "fp4_blockwise" else "blk"
-if PUSH_QRULE not in ("mx", "blk"):
-    raise ValueError(f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk")
+    PUSH_QRULE = "blk" if PUSH_QUANT == "fp4_blockwise_fp32" else "mx"
+if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and PUSH_QRULE != "mx"):
+    raise ValueError(
+        f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk (mx only for {PUSH_QUANT})"
+    )
 _PUSH_QGROUP = 32 if PUSH_QRULE == "mx" else 128
-_PUSH_WIRE = (HIDDEN // 2 + HIDDEN // 32 + 127) // 128 * 128
+_PUSH_WIRE = ((HIDDEN if _PUSH_FP8 else HIDDEN // 2) + HIDDEN // 32 + 127) // 128 * 128
 CHECK = int(os.environ.get("CHECK", 1))
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
@@ -359,6 +362,16 @@ def main():
         sc_byte = torch.pow(2.0, (byte - 127).float())
         return torch.sign(x) * fp4_rne(x.abs() / sc_conv) * sc_byte
 
+    # The e8m0 scale brings the group's amax within e4m3's 448; |x / sc| <= 448
+    # by construction, so the cast never saturates.
+    def push_quant_deq8(x):
+        m15 = (x.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0x7FFF).amax(
+            dim=-1, keepdim=True
+        )
+        byte = torch.clamp(((m15 + 0x1F) >> 7) - 8, min=1)
+        sc = torch.pow(2.0, (byte - 127).float())
+        return (x / sc).to(torch.float8_e4m3fn).float() * sc
+
     def push_quant_blk(x):
         amax = x.abs().amax(dim=-1, keepdim=True).double()
         pos = amax > 0
@@ -368,6 +381,8 @@ def main():
         return torch.sign(x) * fp4_rne(x.abs() * inv), sc
 
     def push_quant_ref(x, u):
+        if _PUSH_FP8:
+            return (u * push_quant_deq8(x)).to(torch.bfloat16).float()
         if PUSH_QRULE == "mx":
             return (u * push_quant_deq(x)).to(torch.bfloat16).float()
         q, sc = push_quant_blk(x)
@@ -381,7 +396,10 @@ def main():
         grp = x.shape[-1]
         amax = x.abs().amax(dim=2, keepdim=True)
         _, ex = torch.frexp(amax)
-        step = torch.ldexp(torch.ones_like(amax), (ex - 2).clamp(min=-127))
+        # One step bounds the rounding error of the group's largest binade.
+        step = torch.ldexp(
+            torch.ones_like(amax), (ex - (4 if _PUSH_FP8 else 2)).clamp(min=-127)
+        )
         err = (got - u * x).abs()
         tol = u * step + (u * x).abs() * 2.0**-8 + 1e-30
         bad = int((~(err <= tol)).flatten(1).any(dim=1).sum())
@@ -429,7 +447,8 @@ def main():
         if rank == 0:
             print(
                 f"  [PUSHQUANT] ct={ct} x{scale:g} rows={int(n[1])} bad={int(n[0])} "
-                f"max_err={float(m[0]):.3f} steps rule={PUSH_QRULE} exact_bad={int(n[2])}"
+                f"max_err={float(m[0]):.3f} steps rule={PUSH_QRULE} quant={PUSH_QUANT}"
+                f" exact_bad={int(n[2])}"
                 f" nonfinite={int(n[3])}"
                 + (f" dev_diff={int(n[4])}" if PUSH_QCHECK_DEV else "")
                 + "".join(f for f in firsts if f),

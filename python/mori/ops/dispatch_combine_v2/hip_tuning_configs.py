@@ -182,7 +182,7 @@ _COMBINE_TABLE: dict = {
     },
 }
 
-_COMBINE_FP4_TABLE: dict = {
+_COMBINE_PUSH_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
             # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
@@ -216,6 +216,17 @@ _COMBINE_FP4_TABLE: dict = {
     "fp4_blockwise_fp32": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
+    },
+    "fp8_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): (
+                (256, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
         },
     },
 }
@@ -279,9 +290,9 @@ def lookup(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
     comb = None
-    if quant_type in _COMBINE_FP4_TABLE:
+    if quant_type in _COMBINE_PUSH_TABLE:
         comb = _bucket_key(
-            _COMBINE_FP4_TABLE[quant_type].get(dev, {}),
+            _COMBINE_PUSH_TABLE[quant_type].get(dev, {}),
             world_size,
             hidden_dim,
             topk,

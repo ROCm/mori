@@ -251,6 +251,9 @@ struct EpCfg {
   int scaleBytes = 0;
   bool combineFp4 = false;
   bool combineFp4F32Scale = false;
+  // combineFp4's push combine with an MXFP8 wire: e4m3 plus one e8m0 scale per 32
+  // elements. Exclusive with combineFp4 (MakeEpCfg).
+  bool combineFp8 = false;
   // Dispatch only, gfx125x only (MakeEpCfg): how the blocks take their slots at a
   // destination. On, the blocks of a rank add up their tokens for each destination in
   // the state at EpArgs::resState, and the last of them to arrive reserves the total
@@ -279,12 +282,13 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(scaleBytes);
   MORI_FIELD(combineFp4);
   MORI_FIELD(combineFp4F32Scale);
+  MORI_FIELD(combineFp8);
   MORI_FIELD(aggReserve);
   MORI_FIELD(metaPair);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 16, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 17, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -358,6 +362,10 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
 constexpr int EpCombinePushSlotAlign = 128;
+
+// The push combine: each sender quantizes its rows into the peer's landing zone,
+// and the receiver reduces what landed.
+constexpr bool EpCombinePush(const EpCfg& c) { return c.combineFp4 || c.combineFp8; }
 
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part

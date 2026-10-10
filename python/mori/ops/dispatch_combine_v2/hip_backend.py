@@ -57,7 +57,7 @@ import torch
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
-from .dispatch_combine_op import _FP4_QUANT_TYPES, EpDispatchCombineOp, KernelSet
+from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
 from .internode_regions import internode_regions
 from .symm_arena import SymmArena
 
@@ -146,19 +146,20 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 _XDB_FLAG_SLOTS = 256
 
 _PUSH_SLOT_ALIGN = 128
-PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128}
-_PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4}
+PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
+_PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4, "fp8_blockwise": 1}
+_PUSH_ELEM_BITS = {"fp4_blockwise": 4, "fp4_blockwise_fp32": 4, "fp8_blockwise": 8}
 
 
 def push_wire_nbytes(cfg) -> int:
     h = cfg.hidden_dim
     q = cfg.quant_type
-    wire = h // 2 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
+    wire = h * _PUSH_ELEM_BITS[q] // 8 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
     return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
 
 
 def push_land_rows(cfg) -> int:
-    """EpFp4LandRows: a token gets back one row per distinct destination rank."""
+    """EpFp4LandRows: a token gets back one row per distinct destination rank, fp4 or fp8."""
     return cfg.max_num_inp_token_per_rank * min(cfg.world_size, cfg.num_experts_per_token)
 
 
@@ -354,7 +355,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     @staticmethod
     def _specs_from(cfg):
         disp, comb = EpDispatchCombineOp._specs_from(cfg)
-        if cfg.schedule and cfg.quant_type in _FP4_QUANT_TYPES:
+        if cfg.schedule and cfg.quant_type in _PUSH_QUANT_TYPES:
             comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
         return disp, comb
 
@@ -657,7 +658,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
         out_tok = cap * cfg.combine_token_nbytes
-        if cfg.quant_type in _FP4_QUANT_TYPES:
+        if cfg.quant_type in _PUSH_QUANT_TYPES:
             land_rows = push_land_rows(cfg)
             out_tok += land_rows * push_wire_nbytes(cfg)
             # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
@@ -701,17 +702,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.combine_dtype not in _COMBINE_DTYPES:
             bad.append(f"combine dtype {cfg.combine_dtype} (have bf16, fp32)")
         q = cfg.quant_type
-        fp4 = q in _FP4_QUANT_TYPES
-        if cfg.is_scatter and not fp4:
+        push = q in _PUSH_QUANT_TYPES
+        if cfg.is_scatter and not push:
             bad.append(
-                "combine_mode='scatter' (gather only, except the fp4 quant types "
-                f"{_FP4_QUANT_TYPES})"
+                "combine_mode='scatter' (gather only, except the push quant types "
+                f"{_PUSH_QUANT_TYPES})"
             )
-        if q != "none" and not fp4:
+        if q != "none" and not push:
             bad.append(f"quant_type={q!r}")
-        if fp4:
+        if push:
             if not self._is1250:
-                bad.append(f"quant_type={q!r} (the fp4 combine is gfx125x only)")
+                bad.append(f"quant_type={q!r} (the push combine is gfx125x only)")
             if cfg.combine_dtype != torch.bfloat16:
                 bad.append(
                     f"quant_type={q!r} with combine dtype {cfg.combine_dtype} "
@@ -738,9 +739,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
-        # The fp4 combine lands each source's rows at the offset the aggregated
+        # The push combine lands each source's rows at the offset the aggregated
         # reservation hands out; TokOffExt reserves per block and hands out none.
-        if cfg.quant_type in _FP4_QUANT_TYPES and getattr(self, "_tokoff_wanted", False):
+        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(self, "_tokoff_wanted", False):
             bad.append(
                 f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
                 "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
@@ -1265,10 +1266,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             scale_bytes=self._scale_i32(cfg) * 4,
         )
         comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in _FP4_QUANT_TYPES:
+        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
             comb_cfg["combine_fp4"] = True
         if cfg.quant_type == "fp4_blockwise_fp32":
             comb_cfg["combine_fp4_f32_scale"] = True
+        if cfg.quant_type == "fp8_blockwise":
+            comb_cfg["combine_fp8"] = True
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
@@ -1479,10 +1482,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def _wrap_combine(self, plan):
-        fp4 = self.cfg.quant_type in _FP4_QUANT_TYPES
+        push = self.cfg.quant_type in _PUSH_QUANT_TYPES
 
         def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
-            if want_weights and fp4:
+            if want_weights and push:
                 raise NotImplementedError(
                     f"quant_type={self.cfg.quant_type!r} folds no weights; call combine "
                     "with weights=None"
@@ -1505,9 +1508,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return run
 
     def push_landing(self):
-        if self.cfg.quant_type not in _FP4_QUANT_TYPES:
+        if self.cfg.quant_type not in _PUSH_QUANT_TYPES:
             raise ValueError(
-                f"no landing rows: quant_type {self.cfg.quant_type!r} is not an fp4 one"
+                f"no landing rows: quant_type {self.cfg.quant_type!r} is not a push one"
             )
         view = self._views.get("push_landing")
         if view is None:
