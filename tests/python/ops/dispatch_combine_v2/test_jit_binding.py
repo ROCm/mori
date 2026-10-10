@@ -286,14 +286,18 @@ class _Comm:
     def alloc_mem(self, size):
         buf = torch.full((size,), 0x5A, dtype=torch.uint8, device="cuda")
         self.allocs.append(buf)
-        return SimpleNamespace(ptr=buf.data_ptr(), close=lambda: self.closed.append("mem"))
+        return SimpleNamespace(
+            ptr=buf.data_ptr(), close=lambda: self.closed.append("mem")
+        )
 
     def register_window(self, ptr, size):
         raw = struct.pack("<QIi", ptr - self.STRIDE, self.STRIDE >> 32, self._desc_rank)
         desc = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
         self._descs.append(desc)
         return SimpleNamespace(
-            handle=desc.data_ptr(), local_ptr=ptr, close=lambda: self.closed.append("win")
+            handle=desc.data_ptr(),
+            local_ptr=ptr,
+            close=lambda: self.closed.append("win"),
         )
 
 
@@ -318,7 +322,9 @@ def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
 
     comm, arena = _Comm(), _Arena(0xA0)
     monkeypatch.setattr(
-        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+        mori.cco,
+        "communicator_of_window",
+        lambda h: comm if h == arena.handle else None,
     )
     a = _plan(arena=arena, block_num=32, warp_per_block=4)
     b = _plan(arena=arena, block_num=64, warp_per_block=4)
@@ -327,12 +333,12 @@ def test_self_first_state_is_one_per_arena_and_outlives_all_but_the_last_plan(
     assert a._defaults["sfBase"] == b._defaults["sfBase"] == base
     assert a._defaults["sfStride"] == b._defaults["sfStride"] == _Comm.STRIDE
     assert int(comm.allocs[0].count_nonzero()) == 0, "the state must start zeroed"
-    assert cb.SelfFirstState.of(arena) is not None
+    assert cb.StagingState.of(arena) is not None
     a.close()
     assert comm.closed == [], "freed while a plan still holds it"
     b.close()
     assert sorted(comm.closed) == ["mem", "win"]
-    assert cb.SelfFirstState.of(arena) is None
+    assert cb.StagingState.of(arena) is None
 
 
 def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monkeypatch):
@@ -344,12 +350,14 @@ def test_self_first_refuses_a_window_descriptor_that_misses_the_local_copy(monke
 
     comm, arena = _Comm(lsa_rank_in_descriptor=0), _Arena(0xA1)
     monkeypatch.setattr(
-        mori.cco, "communicator_of_window", lambda h: comm if h == arena.handle else None
+        mori.cco,
+        "communicator_of_window",
+        lambda h: comm if h == arena.handle else None,
     )
     with pytest.raises(RuntimeError, match="does not locate"):
         _plan(arena=arena)
     assert sorted(comm.closed) == ["mem", "win"], "a failed allocation must not leak"
-    assert cb.SelfFirstState.of(arena) is None
+    assert cb.StagingState.of(arena) is None
 
 
 def test_self_first_follows_the_slot_word():
@@ -366,3 +374,82 @@ def test_self_first_state_size_matches_the_device_layout():
     assert cb.self_first_state_bytes(1) == 384
     assert cb.self_first_state_bytes(4) == 512
     assert cb.self_first_state_bytes(8) == 768
+
+
+def _carrying_arena(offset, nbytes, region="mori_staging"):
+    """A caller's arena whose window holds a staging region at `offset`."""
+    comm = _Comm()
+    mem = comm.alloc_mem(offset + nbytes)
+    win = comm.register_window(mem.ptr, offset + nbytes)
+
+    class _CarryingArena:
+        handle = win.handle
+
+        def offset(self, n):
+            return offset if n == region else 256
+
+        def size(self, n):
+            return nbytes
+
+        def local_ptr(self, n):
+            return win.local_ptr + offset
+
+    return comm, win, _CarryingArena()
+
+
+def test_staging_region_bytes_covers_every_staging_buffer():
+    # One buffer today; the region is its size rounded up to a 128 B line, and a
+    # new buffer added to _staging_buffers has to show up here without a second edit.
+    for world in (1, 4, 8):
+        offsets, total = cb._staging_layout(world)
+        assert cb.staging_region_bytes(world) == total
+        assert total >= sum(n for _, n in cb._staging_buffers(world))
+        assert total % 128 == 0 and all(o % 128 == 0 for o in offsets.values())
+    assert cb.staging_region_bytes(8) >= cb.self_first_state_bytes(8)
+
+
+def test_staging_region_is_used_in_place_and_not_allocated():
+    """With staging_region= the plan cuts mori's buffers out of the caller's arena:
+    nothing is allocated, and base/stride point into that region."""
+    _self_first_or_skip()
+    world = _plan().info["worldSize"]
+    nbytes, offset = cb.staging_region_bytes(world), 512
+    comm, win, arena = _carrying_arena(offset, nbytes)
+
+    p = _plan(arena=arena, staging_region="mori_staging")
+    assert len(comm.allocs) == 1, "the plan must not allocate a window of its own"
+    assert cb.StagingState.of(arena) is None, "the mori-allocated path was taken"
+    self_first = cb._staging_layout(world)[0]["self_first"]
+    assert p._defaults["sfStride"] == _Comm.STRIDE
+    assert p._defaults["sfBase"] == win.local_ptr - _Comm.STRIDE + offset + self_first
+    p._staging_state.zero()
+    assert int(comm.allocs[0][offset : offset + nbytes].count_nonzero()) == 0
+    p.close()
+    assert comm.closed == [], "the caller's arena is not the plan's to free"
+
+
+def test_staging_region_never_falls_back_to_mori_allocating():
+    _self_first_or_skip()
+
+    # _Arena has no region of that name: the plan must raise, not allocate.
+    class _NoRegion(_Arena):
+        def offset(self, name):
+            if name == "mori_staging":
+                raise KeyError(name)
+            return 256
+
+    with pytest.raises(KeyError):
+        _plan(arena=_NoRegion(0xDEAD0000), staging_region="mori_staging")
+
+
+def test_staging_region_too_small_or_misaligned_fails_construction():
+    _self_first_or_skip()
+    world = _plan().info["worldSize"]
+    nbytes = cb.staging_region_bytes(world)
+    _, _, small = _carrying_arena(256, nbytes)
+    small.size = lambda n: nbytes - 1
+    with pytest.raises(RuntimeError, match="needs"):
+        _plan(arena=small, staging_region="mori_staging")
+    _, _, misaligned = _carrying_arena(130, nbytes)
+    with pytest.raises(RuntimeError, match="128 B"):
+        _plan(arena=misaligned, staging_region="mori_staging")

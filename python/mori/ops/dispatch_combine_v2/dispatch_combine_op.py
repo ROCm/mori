@@ -808,6 +808,15 @@ class EpDispatchCombineOp:
         """
         return self._scale_row_bytes()
 
+    def staging_buffer_bytes(self) -> int:
+        """Per-rank symmetric staging bytes: the arena window plus mori's own staging
+        window (ep_plans.StagingState), which lives outside the arena."""
+        total = self.arena.total_bytes
+        staging = getattr(self, "_staging_state", None)
+        if staging is not None:
+            total += staging.nbytes
+        return total
+
     def _scale_row_bytes(self) -> int:
         """The caller's row in bytes, dword-rounded. 0 when the transport is off."""
         n = self.cfg.scale_dim * self.cfg.scale_type_size
@@ -1050,10 +1059,11 @@ class EpDispatchCombineOp:
         tokoff_ext = getattr(self, "_tokoff_ext", None)
         if tokoff_ext is not None:
             tokoff_ext.zero()
-        # So does selfFirst its per-call state (ep_plans.SelfFirstState).
-        self_first = getattr(self, "_self_first_state", None)
-        if self_first is not None:
-            self_first.zero()
+        # So does mori its staging region, e.g. selfFirst's per-call state
+        # (ep_plans.StagingState).
+        staging = getattr(self, "_staging_state", None)
+        if staging is not None:
+            staging.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
