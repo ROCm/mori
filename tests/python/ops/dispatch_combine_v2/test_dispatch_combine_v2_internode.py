@@ -269,8 +269,12 @@ def _parse_args(argv):
     # runs it at every token count, which is what makes a benchmark number
     # comparable to another harness's. "auto" compiles both and picks per launch
     # at --auto-ll-max-tokens.
+    # "asyncll" is a different family rather than a third internode kernel: it
+    # sets async_ll on the config instead of internode_kernel, and it addresses
+    # peers individually where v2/v2_ll aggregate through a same-rail proxy. That
+    # makes it the one choice here that needs a cross-rail-capable fabric.
     parser.add_argument(
-        "--kernel-type", default="auto", choices=["auto", "v2", "v2_ll"]
+        "--kernel-type", default="auto", choices=["auto", "v2", "v2_ll", "asyncll"]
     )
     parser.add_argument("--auto-ll-max-tokens", type=int, default=512)
     return parser.parse_args(argv)
@@ -699,6 +703,18 @@ def _report_tables(
         )
 
 
+def _family_that_ran(op, num_tokens):
+    """Which kernel family served this call.
+
+    AsyncLL is not one of the two the auto switch chooses between, so asking
+    _internode_use_ll about it reports whichever of v2/v2_ll the untouched
+    internode_kernel default happens to name -- a wrong label on a real number.
+    """
+    if getattr(op.cfg, "async_ll", False):
+        return f"asyncll({op.cfg.async_ll_transport})"
+    return "v2_ll" if op._internode_use_ll(num_tokens) else "v2"
+
+
 def _bench(op, cfg, dist_handle, device, args, comm):
     """Per-phase latency, structured to match ``run_bench_once`` in
     ``examples/ops/dispatch_combine/test_dispatch_combine_internode.py``.
@@ -958,7 +974,7 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # Report the family that RAN, not the request: under "auto" the request does
     # not name one, and a number is only comparable to another harness's if the
     # kernel behind it is named.
-    kernel_ran = "v2_ll" if op._internode_use_ll(num_tokens) else "v2"
+    kernel_ran = _family_that_ran(op, num_tokens)
     if dist_handle.rank == 0:
         print(
             f"# BENCH tok={num_tokens} "
@@ -1123,9 +1139,8 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         _generate_round(rng, cfg, int(n), device, cfg.dispatch_dtype, args.routing)
         for n in counts
     ]
-    used_ll = {n: op._internode_use_ll(n) for n in set(counts)}
     if dist_handle.rank == 0:
-        families = sorted({("v2_ll" if v else "v2") for v in used_ll.values()})
+        families = sorted({_family_that_ran(op, n) for n in set(counts)})
         print(
             f"# STRESS rounds={args.rounds} datasets={args.stress_datasets} "
             f"tokens=[{min(counts)},{max(counts)}] of {max_tokens} "
@@ -1569,7 +1584,12 @@ def main(argv):
             quant_type=args.quant_type,
             gpu_per_node=gpu_per_node,
             num_qp_per_pe=args.num_qp,
-            internode_kernel=args.kernel_type,
+            # AsyncLL is selected by its own flag; internode_kernel keeps its
+            # default so the config stays valid (it is simply not read).
+            async_ll=args.kernel_type == "asyncll",
+            internode_kernel=(
+                "auto" if args.kernel_type == "asyncll" else args.kernel_type
+            ),
             internode_auto_ll_max_tokens=args.auto_ll_max_tokens,
             kernel_backend="hip",
         )

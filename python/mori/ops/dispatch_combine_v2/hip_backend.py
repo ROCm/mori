@@ -525,6 +525,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         requirements = _cco.DevCommRequirements()
         requirements.gda_connection_type = _cco.GDA_CONNECTION_RAIL
         requirements.gda_context_count = max(1, cfg.num_qp_per_pe)
+        if cfg.async_ll and cfg.nodes > 1:
+            # CROSSNODE, not the RAIL set the v2/v2_ll families ask for. Those
+            # aggregate through a same-rail proxy -- each rank only ever talks to
+            # its own local rank on another node -- so same-rail QPs are all they
+            # can use. AsyncLL addresses peers individually: rank i sends to rank
+            # j directly, which is a cross-rail path and needs a QP to every
+            # cross-node peer.
+            #
+            # This also means AsyncLL cannot run across nodes on a rail-only
+            # fabric. That failure is silent (QP setup is a TCP exchange and
+            # succeeds; no data moves), so confirm the fabric with an ib_write_bw
+            # between two DIFFERENT rails before trusting a multi-node run.
+            requirements.gda_connection_type = _cco.GDA_CONNECTION_CROSSNODE
         if cfg.async_ll and cfg.async_ll_transport == "sdma":
             # One SDMA queue per peer. The transfer kernels run one issuing warp
             # per destination and the queue is picked as destPe % sdmaNumQueue, so
@@ -810,12 +823,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             bad.append(
                 f"async_ll_transport={cfg.async_ll_transport!r} (have 'sdma', 'lsa')"
             )
-        if cfg.nodes > 1:
+        if cfg.nodes > 1 and cfg.async_ll_transport == "lsa":
             bad.append(
-                f"gpu_per_node={cfg.gpu_per_node} with world_size={cfg.world_size}: "
-                "the AsyncLL transfer legs are ccoSdma, which is intra-node only. "
-                "The cross-node branches are present but unimplemented "
-                "(TODO(internode) in ep_asyncll_kernel.hpp)"
+                "async_ll_transport='lsa' with gpu_per_node="
+                f"{cfg.gpu_per_node} < world_size={cfg.world_size}: peer stores "
+                "reach only ranks inside this one's flat LSA window. Use 'sdma', "
+                "whose cross-node peers go over ccoGda"
             )
         # Without this the communicator comes back with zero SDMA queues and every
         # put is a silent no-op -- the tokens never move and the receiver spins on

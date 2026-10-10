@@ -44,9 +44,21 @@
 //   * the per-peer payload goes out as ONE copy, not sliced per QP;
 //   * the token count rides a single slot per source rank rather than one per QP.
 //
-// Cross-node is not implemented here. The hooks are marked TODO(internode) and
-// name the ccoGda helpers in ep_internode_kernel.hpp that already do the job for
-// the v2 / v2_ll families.
+// Cross-node peers go over ccoGda instead, through the same EpInterNode* shim
+// the v2 / v2_ll families use. The protocol is unchanged -- same slots, same
+// count word, same epoch -- and the branch is on `destPe / gpuPerNode != myNode`
+// in the four transfer passes. Two things differ by transport, both deliberate:
+// a cross-node payload is STRIPED over numQpPerPe QPs where a same-node one is
+// sent whole, and the remote count and epoch are atomic ADDs because that is the
+// only remote update ccoGda offers at an arbitrary window offset.
+//
+// Note that AsyncLL talks to every peer directly. On a fabric whose rails are not
+// connected to each other this cannot work at all, and the symptom is not an
+// error: QP setup happens over TCP and succeeds, then no data moves. The
+// v1/v1_ll families aggregate through a same-rail proxy and are immune, which is
+// why MORI_ENABLE_RAIL_ONLY is only ever claimed for them. tools/ has a probe
+// for the cco half of this; the fabric half is an ib_write_bw across two
+// different rails.
 
 #pragma once
 
@@ -266,11 +278,30 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
     if (destPe == myPe) continue;
     if (tokenNum <= 0) continue;
 
+    const size_t remoteBase = static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * xferBytes;
+    const size_t localBase = static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes;
+
     if (destPe / config.gpuPerNode != myNode) {
-      // TODO(internode): EpInterNodePut(comm, args.reg(args.offDispatchInp), ...,
-      // proxyPe, qpId) -- the ccoGda shim in ep_internode_kernel.hpp already does
-      // exactly this for the v2/v2_ll families. Unreachable today: the host gate
-      // refuses an AsyncLL config spanning nodes.
+      // Cross-node: RDMA write, STRIPED over the QPs. This is the opposite of
+      // what the same-node branch below does, and both are right for their
+      // transport. Splitting an SDMA copy only makes each piece smaller on the
+      // one link a peer has; splitting an RDMA transfer spreads it over QPs that
+      // really do progress in parallel (the op README records that
+      // num_qp_per_pe=1 starves this path by about 1.5x).
+      //
+      // No signal rides along: this phase only posts. RecvTransfer drains and
+      // then announces, which is v1's shape and keeps this launch non-blocking.
+      const int chunk = core::CeilDiv(tokenNum, config.numQpPerPe);
+      for (int qpId = 0; qpId < config.numQpPerPe; ++qpId) {
+        const int first = qpId * chunk;
+        const int count = min(chunk, tokenNum - first);
+        if (count <= 0) break;
+        EpInterNodePut(comm, args.reg(args.offDispatchInp),
+                       remoteBase + static_cast<size_t>(first) * xferBytes,
+                       args.reg(args.offStaging),
+                       localBase + static_cast<size_t>(first) * xferBytes,
+                       static_cast<size_t>(count) * xferBytes, destPe, qpId);
+      }
       continue;
     }
 
@@ -279,20 +310,17 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
     // the source is this rank's staging at the destination's slice -- the two
     // halves of SendBufSlotOffset's symmetry, and the one place a transposed
     // index silently delivers another rank's tokens.
-    const size_t remoteOffset = static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * xferBytes;
-    const size_t localOffset =
-        static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes;
-
+    //
     // Whole, not sliced per QP. This is the measured departure from v1: at 64
     // tokens a peer's payload is ~600 KB, which SDMA moves at ~46 GB/s in one op
     // and ~35 GB/s as two 300 KB ones. Warp scope so lane 0 posts for the warp
     // without an explicit if.
-    sdma.put<::mori::cco::ccoCoopWarp>(
-        destPe - args.lsaBase, EpInterNodeWindow(args.reg(args.offDispatchInp)),
-        EpInterNodeOffset(args.reg(args.offDispatchInp), remoteOffset),
-        EpInterNodeWindow(args.reg(args.offStaging)),
-        EpInterNodeOffset(args.reg(args.offStaging), localOffset),
-        static_cast<size_t>(tokenNum) * xferBytes, q);
+    sdma.put<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
+                                       EpInterNodeWindow(args.reg(args.offDispatchInp)),
+                                       EpInterNodeOffset(args.reg(args.offDispatchInp), remoteBase),
+                                       EpInterNodeWindow(args.reg(args.offStaging)),
+                                       EpInterNodeOffset(args.reg(args.offStaging), localBase),
+                                       static_cast<size_t>(tokenNum) * xferBytes, q);
   }
 }
 
@@ -314,11 +342,21 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
     if (warpId != 0) continue;
 
     const bool sameNode = (destPe / config.gpuPerNode == myNode);
-    if (destPe != myPe && sameNode) {
-      // Our payload to this peer is out of the queue before its count word goes,
-      // so the peer seeing a non-zero count has the tokens too.
-      sdma.quietQueue<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
-                                                asyncll::QueueForPe(comm, destPe));
+    // Both drains are WARP-COLLECTIVE and must stay above the laneId guard:
+    // ccoSdma::quietQueue syncs the group, and EpInterNodeQuiet takes ccoGda's
+    // warp-level CQ poll lock. Called from one lane they deadlock rather than
+    // misbehave, which is why the guard is below them and not above.
+    if (destPe != myPe) {
+      if (sameNode) {
+        // Our payload to this peer is out of the queue before its count word
+        // goes, so the peer seeing a non-zero count has the tokens too.
+        sdma.quietQueue<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
+                                                  asyncll::QueueForPe(comm, destPe));
+      } else {
+        // Same argument over RDMA, but every QP the send leg striped across has
+        // to be drained -- EpInterNodeQuiet loops them, flushing each context.
+        EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
+      }
     }
 
     if (laneId != 0) continue;
@@ -338,9 +376,15 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
                EpInterNodeWindow(args.reg(args.offSendCount)),
                EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendCountSlot(destPe)),
                sizeof(uint64_t), asyncll::QueueForPe(comm, destPe));
+    } else {
+      // Cross-node. An ADD rather than a store, because that is the only remote
+      // update ccoGda offers at an arbitrary window offset -- and it is exactly
+      // equivalent here: combine clears this slot every round, so adding
+      // (tokenNum + 1) to zero lands the same value v1 stores with
+      // ShmemPutUint64ImmNbiThread.
+      EpInterNodeAtomicAdd(comm, args.reg(args.offRecvTokenNum), asyncll::RecvCountSlot(myPe),
+                           countValue, destPe);
     }
-    // TODO(internode): the cross-node leg is EpInterNodeQuiet + the chunk-flag
-    // atomic, as DispatchInterNodeLLSend does.
   }
 
   // Wait for every source to have announced. One lane per source rank; the count
@@ -545,7 +589,11 @@ __device__ void EpDispatchAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args
   if (warpsPerPe <= 0) return;
   const int destPe = globalWarpId / warpsPerPe;
   if (destPe >= npes || destPe == myPe) return;
-  if (destPe / config.gpuPerNode != myNode) return;  // TODO(internode)
+  // Single-node by construction: a peer store needs the peer inside this rank's
+  // flat LSA window, which only same-node ranks are. The host gate refuses
+  // async_ll_transport="lsa" on a multi-node config, so this is unreachable
+  // rather than a silent drop -- kept as a guard, not as a fallback.
+  if (destPe / config.gpuPerNode != myNode) return;
 
   const int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
   if (tokenNum <= 0) return;
@@ -581,7 +629,8 @@ __device__ void EpDispatchAsyncLLRecvTransferLsa_body(EpDispatchCombineArgs args
       core::AtomicStoreRelaxedSystem(
           reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(myPe)), countValue);
     }
-    // TODO(internode): cross-node ranks still need the GDA signal.
+    // No cross-node arm, for the same reason the payload has none: this variant
+    // is single-node and the host gate enforces it.
   }
 
   const uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<const uint8_t*>();
@@ -715,18 +764,35 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
     tokenNum = __shfl(static_cast<unsigned long long>(tokenNum), 0);
 
     if (destPe == myPe) continue;
-    if (destPe / config.gpuPerNode != myNode) continue;  // TODO(internode)
     if (tokenNum == 0) continue;
+
+    const size_t remoteBase = static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes;
+    const size_t localBase =
+        static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes;
+
+    if (destPe / config.gpuPerNode != myNode) {
+      // Striped over the QPs, as the dispatch send leg is and for the same
+      // reason. RecvTransfer drains them.
+      const int chunk = core::CeilDiv(static_cast<int>(tokenNum), config.numQpPerPe);
+      for (int qpId = 0; qpId < config.numQpPerPe; ++qpId) {
+        const int first = qpId * chunk;
+        const int count = min(chunk, static_cast<int>(tokenNum) - first);
+        if (count <= 0) break;
+        EpInterNodePut(comm, args.reg(args.offCombineInp),
+                       remoteBase + static_cast<size_t>(first) * hiddenBytes,
+                       args.reg(args.offCombineStaging),
+                       localBase + static_cast<size_t>(first) * hiddenBytes,
+                       static_cast<size_t>(count) * hiddenBytes, destPe, qpId);
+      }
+      continue;
+    }
 
     const int q = asyncll::QueueForPe(comm, destPe);
     sdma.put<::mori::cco::ccoCoopWarp>(
         destPe - args.lsaBase, EpInterNodeWindow(args.reg(args.offCombineInp)),
-        EpInterNodeOffset(args.reg(args.offCombineInp),
-                          static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes),
+        EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
         EpInterNodeWindow(args.reg(args.offCombineStaging)),
-        EpInterNodeOffset(args.reg(args.offCombineStaging),
-                          static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes),
-        tokenNum * hiddenBytes, q);
+        EpInterNodeOffset(args.reg(args.offCombineStaging), localBase), tokenNum * hiddenBytes, q);
   }
 }
 
@@ -746,9 +812,15 @@ __device__ void EpCombineAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     if (warpId != 0) continue;
     const bool sameNode = (destPe / config.gpuPerNode == myNode);
-    if (destPe != myPe && sameNode)
-      sdma.quietQueue<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
-                                                asyncll::QueueForPe(comm, destPe));
+    // Warp-collective, above the laneId guard. See the note in dispatch's
+    // RecvTransfer: from a single lane these deadlock.
+    if (destPe != myPe) {
+      if (sameNode)
+        sdma.quietQueue<::mori::cco::ccoCoopWarp>(destPe - args.lsaBase,
+                                                  asyncll::QueueForPe(comm, destPe));
+      else
+        EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
+    }
 
     if (laneId != 0) continue;
 
@@ -773,6 +845,16 @@ __device__ void EpCombineAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
                EpInterNodeWindow(args.reg(args.offSendCount)),
                EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendFlagSlot(destPe)),
                sizeof(uint64_t), asyncll::QueueForPe(comm, destPe));
+    } else {
+      // Cross-node publishes the epoch as an ADD OF ONE, which is the same value
+      // the two branches above store. crossDeviceBarrierFlag is bumped once per
+      // round by dispatch's RecvCopy, and this rank writes a given peer's slot
+      // exactly once per round, so after round N the slot has been incremented N
+      // times and holds N -- precisely the epoch the wait below compares against.
+      // ccoGda offers only an add at an arbitrary window offset, and here that is
+      // enough rather than a compromise.
+      EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier), myPe * sizeof(uint64_t),
+                           1ull, destPe);
     }
   }
 
