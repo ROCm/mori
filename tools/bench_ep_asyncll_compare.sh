@@ -12,13 +12,14 @@
 #                    the protocol is not carrying an RDMA leg's shape.
 #   v1_asyncll       EPv1 AsyncLL on mori-shmem. The thing v2 had to beat.
 #
-# Why this exists: the four were measured piecemeal on a shared box while the
-# AsyncLL port was being written, and the open question could not be settled
-# there. At 64-128 tokens per rank the transfer is a small part of the time, so
-# sdma and lsa land within a few microseconds of each other. At 1024+ the SDMA
-# engine saturates (~60 GB/s per link, measured) while peer stores do not, so
-# lsa is EXPECTED to pull ahead -- and nothing has measured it. The sweep here
-# covers both regimes on purpose.
+# Why this exists: the four were first measured piecemeal on a shared box, where
+# only 64 and 128 tokens per rank were covered and the transports looked
+# equivalent. Extrapolating from there said lsa should pull ahead at the top end,
+# since the SDMA engine saturates near 60 GB/s per link and peer stores do not.
+# A clean two-sweep run said the opposite -- lsa loses by a widening margin from
+# 128 tokens up, reaching ~11% at 2048 -- which is the whole argument for
+# sweeping both regimes rather than reasoning from the small end. Results and the
+# correction live in ep_asyncll_kernel.hpp's LSA section.
 #
 # Usage (on an idle node, inside the mori container):
 #   bash tools/bench_ep_asyncll_compare.sh

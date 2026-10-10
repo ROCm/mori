@@ -469,26 +469,33 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // payload of ~600 KB at 64 tokens x 7168 x bf16) the engine is latency-bound and
 // a store should win.
 //
-// It does, but far less than that reasoning suggests. Measured on MI355X at EP8,
-// hidden 7168, bf16, dispatch+combine as a CUDA graph:
+// It does at 64 tokens and nowhere else. Measured on an IDLE, RESERVED MI355X
+// node (crsuse2 v2-008) at EP8, hidden 7168, bf16, dispatch+combine as a CUDA
+// graph; two full sweeps agreed to within 0.3 percentage points at every point:
 //
-//            64 tok/rank     128 tok/rank
-//   sdma     103.0 us        133.8 us
-//   lsa       96.4 us        135.0 us
+//   tok/rank      64     128     256     512    1024    2048   (us)
+//   sdma       102.0   136.8   194.3   292.1   523.1   982.0
+//   lsa         97.7   138.9   201.5   320.3   581.4  1094.2
+//   delta      -4.2%   +1.6%   +3.6%   +9.7%  +11.1%  +11.4%
 //
-// Six microseconds at 64 tokens and nothing at 128. The reason is that the
-// transfer is not where the time goes: AsyncLL's protocol moves each payload
-// THREE times (input -> staging, staging -> peer, peer -> dispatch output),
-// because that is what an RDMA leg needs, and changing the middle hop leaves the
-// other two alone. For comparison the ordinary v2 intranode dispatch, which
-// writes straight into the peer and stages nothing, does the same shape in
-// 59.5 / 89.6 us.
+// The reasoning above predicted the opposite sign at the top end -- the engine
+// does saturate there, so peer stores "should" win -- and the measurement says
+// lsa loses by a widening margin instead. Two things the prediction left out:
+// the transfer is a kernel of its own, so nothing overlaps it either way and
+// SDMA's separate hardware is pure gain; and a grid doing the copy contends with
+// its own HBM traffic, where the engines do not. The ordinary v2 intranode
+// dispatch, which writes straight into the peer and stages nothing, reaches
+// 856.9 us on the same point, so the grid is not short of bandwidth -- it is
+// short of bandwidth *while also* running the staging copies this protocol adds.
 //
-// So this variant is worth having for the latency, not for a transformation --
-// and it costs CUs, because the copy occupies the grid instead of an engine and
-// therefore cannot drain under the caller's work the way an SDMA transfer can.
-// Which one is right depends on what the caller puts in the seam, which is why
-// this is a config choice rather than a replacement.
+// That staging is why neither transport closes the gap to v2 native: AsyncLL
+// moves each payload THREE times (input -> staging, staging -> peer, peer ->
+// dispatch output) because that is what an RDMA leg needs, and changing the
+// middle hop leaves the other two alone.
+//
+// So: sdma is the default on evidence, not just because it is the internode
+// shape. lsa is worth keeping for the small-batch case and for a caller with an
+// empty seam, since it also costs CUs that an SDMA transfer leaves free.
 
 namespace asyncll {
 

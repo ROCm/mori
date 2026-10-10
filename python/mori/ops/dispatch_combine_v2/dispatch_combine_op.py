@@ -193,19 +193,25 @@ class EpDispatchCombineConfig:
     #   "sdma" (default) -- ccoSdma, the copy engine. The transfer occupies no
     #       CUs, so it can drain under whatever the caller runs in the send/recv
     #       seam, and it is the shape the cross-node (ccoGda) leg will reuse.
-    #   "lsa" -- peer stores over the flat symmetric VA. A little faster on one
-    #       node, because the engine is latency-bound at these sizes, but it
-    #       spends the grid on the copy, so there is nothing left to overlap.
+    #   "lsa" -- peer stores over the flat symmetric VA. Faster only at small
+    #       batch; it spends the grid on the copy, so there is nothing left to
+    #       overlap and it contends with its own HBM traffic.
     #
-    # Measured on MI355X, EP8, hidden 7168, bf16, dispatch+combine as a graph:
-    # sdma 103.0 / 133.8 us at 64 / 128 tokens per rank, lsa 96.4 / 135.0. The
-    # difference is small because the transport is not what dominates -- AsyncLL
-    # stages each payload through an extra buffer so an RDMA leg can reuse the
-    # protocol, and that cost is the same either way.
+    # Measured on an idle reserved MI355X node, EP8, hidden 7168, bf16,
+    # dispatch+combine as a graph, two sweeps agreeing within 0.3pp:
     #
-    # Pick "lsa" when the seam is empty and you just want the latency; keep
-    # "sdma" when the point is the overlap, or when this op will later run
-    # across nodes.
+    #   tok/rank      64     128     256     512    1024    2048   (us)
+    #   sdma       102.0   136.8   194.3   292.1   523.1   982.0
+    #   lsa         97.7   138.9   201.5   320.3   581.4  1094.2
+    #
+    # So "lsa" wins by ~4% at 64 tokens and loses by up to ~11% from 128 up,
+    # which is why "sdma" is the default. Neither closes the gap to the ordinary
+    # v2 intranode kernels (62.5 / 856.9 us at the ends): AsyncLL stages each
+    # payload through an extra buffer so an RDMA leg can reuse the protocol, and
+    # that cost is the same for both transports.
+    #
+    # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
+    # the point is the overlap, or when this op will later run across nodes.
     async_ll_transport: str = "sdma"
 
     def __post_init__(self):
