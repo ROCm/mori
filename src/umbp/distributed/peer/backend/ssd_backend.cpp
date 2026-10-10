@@ -718,6 +718,20 @@ std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys)
   return results;
 }
 
+std::vector<EvictionOffer> SsdBackend::EvictionCandidates(size_t max_count) {
+  if (ssd_ == nullptr || max_count == 0) return {};
+  auto candidates = ssd_->EvictionCandidates(max_count);
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (read_leases_.empty() && migration_reads_.empty()) return candidates;
+  candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                  [&](const EvictionOffer& offer) {
+                                    return read_leases_.count(offer.key) != 0 ||
+                                           migration_reads_.count(offer.key) != 0;
+                                  }),
+                   candidates.end());
+  return candidates;
+}
+
 // ---------------------------------------------------------------------------
 //  Bootstrap
 // ---------------------------------------------------------------------------
@@ -862,10 +876,10 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   event("single_flight_dup", ssd_->ReadDup());
   event("single_flight_merged", ssd_->ReadMerged());
 
-  // Local high-watermark eviction.  The victims and the freed bytes are the
-  // decorator's (Evict is an interface call); the ROUNDS are not — master never
-  // asked for them — and neither is a backend delete that refused.
-  event("eviction_round", ssd_->EvictionRounds());
+  // Every eviction -- master-driven or the pool's local watermark eviction --
+  // arrives through Evict(), so the keys and bytes are the decorator's and the
+  // rounds are the pool's (mori_umbp_client_local_evict_total).  What neither
+  // can see is a delete the drive itself refused.
   event("eviction_backend_failed", ssd_->EvictionBackendFailures());
 
   // Staging pressure.  slot_full_reject is the one to watch: it counts resolves

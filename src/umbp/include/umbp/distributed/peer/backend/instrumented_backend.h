@@ -91,8 +91,11 @@ class InstrumentedBackend final : public MediumBackend {
   void ClearFullSyncAcked() override { inner_->ClearFullSyncAcked(); }
   bool IsClearFullSyncPending() const override { return inner_->IsClearFullSyncPending(); }
   void SetEventPublishing(bool enabled) override { inner_->SetEventPublishing(enabled); }
-  void EnableLocalEviction(double high_watermark, double low_watermark) override {
-    inner_->EnableLocalEviction(high_watermark, low_watermark);
+  // Ordering only, not an operation: nothing is freed, so nothing is counted.
+  // The eviction that follows is an Evict() call and is measured there.
+  void TrackEvictionOrder() override { inner_->TrackEvictionOrder(); }
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override {
+    return inner_->EvictionCandidates(max_count);
   }
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {

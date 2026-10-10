@@ -173,6 +173,20 @@ struct EvictionVictim {
   }
 };
 
+// One key a medium offers for local eviction (MediumBackend::
+// EvictionCandidates), with the bytes freeing it gives back to that medium's
+// capacity -- page-rounded where the medium allocates in pages.  The size is
+// what lets the caller take exactly as many offers as it needs instead of a
+// whole batch.
+struct EvictionOffer {
+  std::string key;
+  uint64_t bytes = 0;
+
+  bool operator==(const EvictionOffer& other) const {
+    return key == other.key && bytes == other.bytes;
+  }
+};
+
 // Ordering hint for IMasterMetadataStore::EnumerateEvictionCandidates.  This is
 // a performance affordance, NOT eviction policy: it only tells the store what
 // order to return rows in so a backend with an index (e.g. a Redis ZSET keyed

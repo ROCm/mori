@@ -1063,19 +1063,10 @@ bool PoolClient::Init() {
     // every named backend, including multiple instances of the same medium.
     backend = MakeInstrumentedBackend(std::move(backend));
 
-    // A node with no master owns its whole storage policy, and both halves of
-    // that follow from the same fact: nobody will ever call Evict() on this
-    // backend, and nobody will ever drain its heartbeat outbox.  So the backend
-    // evicts for itself, and stops recording events addressed to a master that
-    // does not exist.  Both are no-ops in a cluster -- master-driven eviction
-    // stays the only policy there, and the outbox keeps feeding the heartbeat.
-    //
-    // Before Init(), which is the contract EnableLocalEviction states.
-    if (!master_client_) {
-      backend->SetEventPublishing(false);
-      backend->EnableLocalEviction(config_.local_evict_high_watermark,
-                                   config_.local_evict_low_watermark);
-    }
+    // A node with no master has nobody to drain its heartbeat outbox, so the
+    // backend stops recording events addressed to a master that does not
+    // exist.  (Its eviction is the pool's job; see EnableLocalEviction below.)
+    if (!master_client_) backend->SetEventPublishing(false);
 
     // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
     // move bytes, and that is a compile-time fact (design doc §5 Rule C).
@@ -1102,6 +1093,33 @@ bool PoolClient::Init() {
   }
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
+
+  // Local watermark eviction (design-eviction-convergence.md §6).  It goes
+  // through PeerPool::Evict, the same call a master's EvictKey makes, on the
+  // pool's own thread -- never on a put.  Which media get it is unchanged:
+  //   * no master: every medium, since nothing else would ever free a page;
+  //   * with a master: SSD only, which has always reclaimed for itself between
+  //     the master's periodic rounds.  DRAM/HBM stay master-driven there.
+  // SSD uses the watermarks in its own config, paged media the node-wide pair.
+  for (const auto& backend_config : backend_configs) {
+    auto* backend = registry_.Get(backend_config.name);
+    if (backend == nullptr) continue;
+    const uint32_t backend_id = registry_.BackendId(backend);
+    if (backend_config.tier == TierType::SSD) {
+      if (!default_pool_->EnableLocalEviction(backend_id, backend_config.ssd.ssd.high_watermark,
+                                              backend_config.ssd.ssd.low_watermark)) {
+        MORI_UMBP_ERROR("[PoolClient] backend '{}': invalid SSD watermarks high={} low={}",
+                        backend_config.name, backend_config.ssd.ssd.high_watermark,
+                        backend_config.ssd.ssd.low_watermark);
+        Shutdown();
+        return false;
+      }
+    } else if (!master_client_) {
+      default_pool_->EnableLocalEviction(backend_id, config_.local_evict_high_watermark,
+                                         config_.local_evict_low_watermark);
+    }
+  }
+
   const bool weighted_placement = config_.placement_policy == PoolPlacementPolicy::WEIGHTED ||
                                   config_.placement_policy == PoolPlacementPolicy::TIERED;
   if (master_client_) {
@@ -5079,6 +5097,16 @@ void PoolClient::PublishComponentMetrics() {
       sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,
              {{"tier", tier}}, hits);
     }
+
+    const LocalEvictionMetrics local = default_pool_->LocalEvictionStats();
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "round"}}, local.rounds);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "key"}}, local.keys);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "no_candidate"}}, local.no_candidate);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "stalled"}}, local.stalled);
     metric_publisher_.Publish("pool", {}, samples, sink);
   }
 }
