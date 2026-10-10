@@ -90,24 +90,17 @@ void Mlx5UnregisterUarHost(void* reg_addr) {
   }
 }
 
-// GPU-resident control structures (CQ/WQ rings, their doorbell records and the atomic ibuf)
-// are registered one way for the whole process, never mixed per buffer. They are small
-// allocations that ROCr packs into shared BOs, and amdgpu refuses to pin a BO that is already
-// pinned elsewhere: peermem pins it in VRAM, while dmabuf pins it in GTT unless amdgpu can do
-// PCIe P2P to the NIC (CONFIG_PCI_P2PDMA, and for some amdgpu versions also
-// CONFIG_DMABUF_MOVE_NOTIFY), so mixing the two fails whichever buffer registers second.
+// GPU control structures (CQ/WQ rings, doorbell records, atomic ibuf) use one registration
+// mechanism per process: ROCr packs them into shared BOs, and amdgpu can't pin a BO in VRAM
+// (peermem) and GTT (dmabuf without PCIe P2P to the NIC) at once.
 enum class Mlx5GpuRegMode { kPeerMem, kDmabuf };
 
-// ROCr gives an allocation of whole 2 MiB units a BO of its own, starting at dmabuf offset 0.
+// ROCr gives allocations of whole 2 MiB units their own BO, at dmabuf offset 0.
 constexpr size_t kMlx5OwnBoSize = 2 * 1024 * 1024;
-// A doorbell record shares its ring's umem, right after the ring.
-constexpr size_t kMlx5DbrSize = 64;
+constexpr size_t kMlx5DbrSize = 64;  // doorbell record, right after its ring
 
-// Both dmabuf registrations return nullptr with errno set on failure. `*offset` reports where
-// `addr` sits inside its dmabuf, and a umem must sit at offset 0: rdma-core hands a dmabuf
-// umem's offset to ibv_dontfork_range() as if it were an address, which fails for any nonzero
-// offset once a library has called ibv_fork_init() -- RCCL does whenever it brings up its IB
-// transport.
+// Returns nullptr with errno set. The umem must sit at dmabuf offset 0: rdma-core passes the
+// offset to ibv_dontfork_range() as an address, which fails once ibv_fork_init() has run.
 mlx5dv_devx_umem* Mlx5RegisterDmabufUmem(ibv_context* context, void* addr, size_t size,
                                          uint32_t accessFlag, uint64_t* offset) {
   *offset = 0;
@@ -123,16 +116,14 @@ mlx5dv_devx_umem* Mlx5RegisterDmabufUmem(ibv_context* context, void* addr, size_
     return nullptr;
   }
   MoriMlx5DevxUmemIn in{};
-  in.addr = reinterpret_cast<void*>(*offset);  // dmabuf-relative byte offset
+  in.addr = reinterpret_cast<void*>(*offset);
   in.size = size;
   in.access = accessFlag;
-  // Bitmap of allowed log2 page sizes (not a page size); mirror rdma-core's
-  // peermem path (all sizes >= 4K). sysconf() sets one bit and breaks 64K hosts.
   in.pgsz_bitmap = ~((1ULL << MLX5_ADAPTER_PAGE_SHIFT) - 1);
   in.comp_mask = MORI_MLX5DV_UMEM_MASK_DMABUF;
   in.dmabuf_fd = dmabufFd;
   mlx5dv_devx_umem* umem = Mlx5DvApi::Instance().devx_umem_reg_ex(context, &in);
-  int err = errno;  // capture before close() overwrites it
+  int err = errno;
   close(dmabufFd);
   errno = err;
   return umem;
@@ -153,11 +144,9 @@ ibv_mr* Mlx5RegisterDmabufMr(ibv_pd* pd, void* addr, size_t size, int accessFlag
   return mr;
 }
 
-// MORI_MLX5_DMABUF forces a mode ("force"/"1" = dmabuf, "off"/"0" = peermem); otherwise it is
-// probed once. It covers only these control structures: MORI_ENABLE_DMABUF_REG separately orders
-// the generic payload MR path (RegisterRdmaMemoryRegionAuto). peermem wins when both work:
-// dmabuf may pin into GTT (see above), moving the rings out of VRAM, and costs every ring a BO
-// of its own (see Mlx5AllocControlUmemBuf).
+// MORI_MLX5_DMABUF=force/1 or off/0 pins the mode; otherwise probe once, preferring peermem
+// since dmabuf may pin rings in GTT and needs a BO per ring. MORI_ENABLE_DMABUF_REG governs the
+// payload MR path instead.
 Mlx5GpuRegMode ProbeMlx5GpuRegMode(ibv_context* context) {
   std::optional<std::string> forced = mori::env::GetString("MORI_MLX5_DMABUF");
   if (forced && (*forced == "force" || *forced == "1")) return Mlx5GpuRegMode::kDmabuf;
@@ -222,8 +211,7 @@ void* Mlx5AllocControlBuf(bool onGpu, size_t size, size_t alignment) {
   return ptr;
 }
 
-// A dmabuf-mode umem must sit at dmabuf offset 0 (see Mlx5RegisterDmabufUmem), so round it up
-// to a BO of its own.
+// dmabuf-mode umems get a BO of their own (see Mlx5RegisterDmabufUmem).
 void* Mlx5AllocControlUmemBuf(ibv_context* context, bool onGpu, size_t size, size_t alignment) {
   if (onGpu && GetMlx5GpuRegMode(context) == Mlx5GpuRegMode::kDmabuf)
     size = (size + kMlx5OwnBoSize - 1) / kMlx5OwnBoSize * kMlx5OwnBoSize;
@@ -253,8 +241,7 @@ void Mlx5FreeControlBuf(bool onGpu, void* ptr) {
   std::abort();
 }
 
-// Host memory, and GPU memory in peermem mode, register by virtual address. Both helpers abort
-// on failure: there is deliberately no second mechanism to fall back to.
+// Host memory and peermem register by VA. No fallback by design: failures abort.
 mlx5dv_devx_umem* Mlx5RegisterControlUmem(ibv_context* context, bool onGpu, void* addr, size_t size,
                                           const char* what) {
   const bool dmabuf = onGpu && GetMlx5GpuRegMode(context) == Mlx5GpuRegMode::kDmabuf;
@@ -444,7 +431,7 @@ void Mlx5QpContainer::CreateQueuePair(uint32_t cqn, uint32_t pdn) {
       0,
   };
 
-  // Allocate user memory for QP: the RQ and SQ, then the doorbell record
+  // QP umem: RQ, SQ, then the doorbell record
   const size_t qpDbrOffset =
       (rqAttrs.wqSize + sqAttrs.wqSize + kMlx5DbrSize - 1) / kMlx5DbrSize * kMlx5DbrSize;
   const size_t qpUmemSize = std::max(qpTotalSize, qpDbrOffset + kMlx5DbrSize);

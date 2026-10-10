@@ -68,7 +68,7 @@ class Mlx5CqContainer {
  public:
   uint32_t cqn{0};
   void* cqUmemAddr{nullptr};
-  void* cqDbrUmemAddr{nullptr};  // inside cqUmem, right after the CQ buffer
+  void* cqDbrUmemAddr{nullptr};  // in cqUmem, after the CQ buffer
   mlx5dv_devx_umem* cqUmem{nullptr};
   mlx5dv_devx_uar* uar{nullptr};
   mlx5dv_devx_obj* cq{nullptr};
@@ -111,7 +111,7 @@ class Mlx5QpContainer {
  public:
   size_t qpn{0};
   void* qpUmemAddr{nullptr};
-  void* qpDbrUmemAddr{nullptr};  // inside qpUmem, after the RQ and SQ
+  void* qpDbrUmemAddr{nullptr};  // in qpUmem, after the RQ and SQ
   mlx5dv_devx_umem* qpUmem{nullptr};
   mlx5dv_devx_uar* qpUar{nullptr};
   void* qpUarPtr{nullptr};
