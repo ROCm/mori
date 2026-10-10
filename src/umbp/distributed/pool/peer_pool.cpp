@@ -25,6 +25,7 @@
 #include "umbp/distributed/pool/peer_pool.h"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <numeric>
 #include <set>
@@ -43,6 +44,22 @@ constexpr size_t kWatermarkCandidateBatch = 64;
 // Floor between scans. Without it every commit batch arriving above the high
 // watermark would re-walk the placements.
 constexpr auto kWatermarkScanInterval = std::chrono::milliseconds(5);
+
+// Local eviction frees at most this many keys per Evict() call, so no single
+// call holds the pool lock for a whole drain; the pass keeps calling until the
+// backend is back under its low watermark.
+constexpr size_t kLocalEvictBatch = 64;
+// Wakes are the primary signal; this catches growth no wake reported.
+constexpr auto kLocalEvictPollInterval = std::chrono::milliseconds(100);
+// Floor between passes, so commits arriving back to back above the high
+// watermark cannot keep the worker re-reading capacity in a tight loop.
+constexpr auto kLocalEvictMinGap = std::chrono::milliseconds(1);
+
+uint64_t UsedBytes(const TierCapacity& capacity) {
+  return capacity.total_bytes > capacity.available_bytes
+             ? capacity.total_bytes - capacity.available_bytes
+             : 0;
+}
 
 }  // namespace
 
@@ -75,7 +92,12 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
   }
 }
 
-PeerPool::~PeerPool() { StopTransitionWorker(); }
+PeerPool::~PeerPool() {
+  // Eviction first: a pass may be inside RunTransition, which the transition
+  // machinery below must still be alive for.
+  StopLocalEviction();
+  StopTransitionWorker();
+}
 
 void PeerPool::EnqueueTransition(TransitionJob job) {
   std::lock_guard<std::mutex> lock(transition_mutex_);
@@ -230,6 +252,8 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
     return;
   }
   ++transition_metrics_.succeeded;
+  // The target medium just grew without passing through BatchCommit.
+  WakeLocalEviction();
   if (job.kind == TierTransitionKind::kPromotion) {
     transition_metrics_.promoted_bytes += result.bytes_moved;
   } else {
@@ -250,6 +274,14 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
       draining->second.erase(job.source_backend_id);
       if (draining->second.empty()) draining_sources_.erase(draining);
     }
+  }
+  // The target may be a copy an earlier move left parked (it answered
+  // ALREADY_EXISTS, so nothing was copied).  It is the durable copy now, and a
+  // later eviction must not delete it as though it were still draining.
+  auto draining = draining_sources_.find(job.key);
+  if (draining != draining_sources_.end()) {
+    draining->second.erase(result.target_backend_id);
+    if (draining->second.empty()) draining_sources_.erase(draining);
   }
 }
 
@@ -442,6 +474,10 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
             pending_keys_.erase(requests[index].key);
             break;
           case AllocateOutcome::kFailedNoSpace:
+            // A full medium: the local eviction worker should not wait for its
+            // poll to notice.  This put still fails over to the next candidate
+            // (or fails); eviction never runs on the put itself.
+            WakeLocalEviction();
             advance(index);
             break;
         }
@@ -523,6 +559,9 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
     }
   }
   MaybeEnqueueWatermarkOffloadLocked();
+  // A commit is what grows usage.  Waking is all the put path does; the worker
+  // reads capacity and evicts on its own thread.
+  WakeLocalEviction();
   return out;
 }
 
@@ -835,88 +874,358 @@ std::vector<bool> PeerPool::BatchContains(const std::vector<std::string>& keys) 
   return out;
 }
 
-std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys, PoolEvictMode mode) {
-  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
-  std::vector<EvictResult> out;
-  out.reserve(keys.size());
-  for (const auto& key : keys) out.push_back(EvictResult{key, 0});
-  if (backends_ == nullptr || keys.empty()) return out;
+uint32_t PeerPool::EvictSourceLocked(const PoolEvictRequest& request) const {
+  constexpr uint32_t kNone = BackendRegistry::kMaxBackends;
+  // A copy qualifies when its backend holds the key and, for a tier-scoped
+  // request, is that medium.
+  const auto holds = [&](uint32_t backend_id) {
+    if (backend_id >= kNone) return false;
+    auto* backend = backends_->Get(backend_id);
+    return backend != nullptr &&
+           (request.tier == TierType::UNKNOWN || backend->Tier() == request.tier) &&
+           backend->Contains(request.key);
+  };
+  if (request.backend_id < kNone) return holds(request.backend_id) ? request.backend_id : kNone;
+  // The placement first: it is the copy reads are served from, and the only
+  // one a demotion can start from.
+  auto placement = placements_.find(request.key);
+  if (placement != placements_.end() && holds(placement->second)) return placement->second;
+  if (request.tier == TierType::UNKNOWN) return FindOwnerLocked(request.key);
+  for (auto* backend : backends_->All()) {
+    const uint32_t backend_id = backends_->BackendId(backend);
+    if (holds(backend_id)) return backend_id;
+  }
+  return kNone;
+}
 
-  std::vector<bool> handled(keys.size(), false);
-  for (size_t i = 0; i < keys.size(); ++i) {
+void PeerPool::RepairAfterDropLocked(const std::string& key) {
+  auto draining = draining_sources_.find(key);
+  if (draining != draining_sources_.end()) {
+    for (auto it = draining->second.begin(); it != draining->second.end();) {
+      auto* source = backends_->Get(*it);
+      it = source == nullptr || !source->Contains(key) ? draining->second.erase(it) : std::next(it);
+    }
+    if (draining->second.empty()) draining_sources_.erase(draining);
+  }
+  auto placement = placements_.find(key);
+  if (placement != placements_.end()) {
+    auto* backend = backends_->Get(placement->second);
+    if (backend != nullptr && backend->Contains(key)) return;
+  }
+  const uint32_t owner = FindOwnerLocked(key);
+  if (owner != BackendRegistry::kMaxBackends) {
+    placements_[key] = owner;
+    return;
+  }
+  placements_.erase(key);
+  ForgetAccessLocked(key);
+  draining_sources_.erase(key);
+}
+
+std::vector<EvictResult> PeerPool::Evict(const std::vector<std::string>& keys, PoolEvictMode mode) {
+  std::vector<PoolEvictRequest> requests(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) requests[i].key = keys[i];
+  return Evict(requests, mode);
+}
+
+std::vector<EvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>& requests,
+                                         PoolEvictMode mode) {
+  // Shared for the whole call: the drops below run without operation_mutex_,
+  // and ClearLocal must not wipe the backends between a drop being decided and
+  // being carried out.
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::vector<EvictResult> out;
+  out.reserve(requests.size());
+  for (const auto& request : requests) out.push_back(EvictResult{request.key, 0});
+  if (backends_ == nullptr || requests.empty()) return out;
+
+  // A copy to free by deleting it: (request index, backend).  Decided under
+  // the pool lock, carried out without it.
+  std::vector<std::pair<size_t, uint32_t>> drops;
+  // A copy to free by moving it down a tier: (request index, source backend).
+  std::vector<std::pair<size_t, uint32_t>> demotions;
+
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
+  for (size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
     // A copy already owns this key. Freeing nothing makes the caller retry,
     // which is the same contract as a read lease delaying a source delete, and
     // it keeps a discard from racing a target commit that would resurrect it.
-    if (migrating_keys_.count(keys[i]) != 0) {
-      handled[i] = true;
-      continue;
-    }
-    // A discard has to leave no copy behind, so it skips demotion and the
-    // drain shortcut and goes straight to the delete pass below.
-    if (mode == PoolEvictMode::kDiscard) continue;
-
-    auto draining = draining_sources_.find(keys[i]);
-    if (draining != draining_sources_.end()) {
-      std::vector<uint32_t> drained;
-      for (uint32_t source_id : draining->second) {
-        auto* source = backends_->Get(source_id);
-        if (source != nullptr) {
-          auto retried = source->Evict({keys[i]});
-          if (!retried.empty()) out[i].bytes_freed += retried.front().bytes_freed;
-        }
-        if (source == nullptr || !source->Contains(keys[i])) {
-          drained.push_back(source_id);
-        }
-      }
-      for (uint32_t source_id : drained) draining->second.erase(source_id);
-      if (draining->second.empty()) draining_sources_.erase(draining);
-      handled[i] = true;
+    if (migrating_keys_.count(request.key) != 0) continue;
+    // A discard has to leave no copy behind, so it ignores scope, skips
+    // demotion and drops the key everywhere.
+    if (mode == PoolEvictMode::kDiscard) {
+      for (auto* backend : backends_->All()) drops.emplace_back(i, backends_->BackendId(backend));
       continue;
     }
 
-    auto placement = placements_.find(keys[i]);
-    const uint32_t source_id =
-        placement != placements_.end() ? placement->second : FindOwnerLocked(keys[i]);
-    if (tier_graph_ == nullptr) continue;
-    const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
-    if (!tier_index.has_value()) continue;
-    const auto& tier = tier_graph_->NodeAt(*tier_index);
-    if (tier.trigger != PoolOffloadTrigger::kOnEvict || tier.offload_to.empty()) {
+    // A source left behind by an offload whose delete hit a read lease: the
+    // durable copy already lives downstream, so this copy is only ever deleted,
+    // never moved again.  A request with no scope means "finish the drain", as
+    // it always has -- freeing the durable copy instead would undo the offload.
+    auto draining = draining_sources_.find(request.key);
+    const bool unscoped =
+        request.tier == TierType::UNKNOWN && request.backend_id >= BackendRegistry::kMaxBackends;
+    if (draining != draining_sources_.end() && unscoped) {
+      for (uint32_t source_id : draining->second) drops.emplace_back(i, source_id);
       continue;
     }
-    auto migrated = RunTransition(operation_lock,
-                                  {TierTransitionKind::kOffload, keys[i], source_id, *tier_index});
-    handled[i] = migrated.success;
-    out[i].bytes_freed = migrated.bytes_freed;
-  }
-
-  std::vector<std::string> delete_keys;
-  std::vector<size_t> delete_indices;
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (!handled[i]) {
-      delete_keys.push_back(keys[i]);
-      delete_indices.push_back(i);
+    const uint32_t source_id = EvictSourceLocked(request);
+    if (source_id == BackendRegistry::kMaxBackends) continue;
+    if (draining != draining_sources_.end() && draining->second.count(source_id) != 0) {
+      drops.emplace_back(i, source_id);
+      continue;
     }
-  }
-  for (auto* backend : backends_->All()) {
-    auto results = backend->Evict(delete_keys);
-    for (size_t i = 0; i < results.size() && i < delete_indices.size(); ++i) {
-      out[delete_indices[i]].bytes_freed += results[i].bytes_freed;
-    }
-  }
 
-  for (size_t i = 0; i < keys.size(); ++i) {
-    if (handled[i]) continue;
-    const uint32_t owner = FindOwnerLocked(keys[i]);
-    if (owner != BackendRegistry::kMaxBackends) {
-      placements_[keys[i]] = owner;
+    // Demote when this copy is the key's placement (the only copy a transition
+    // can start from) and its tier has somewhere to go.  The trigger does not
+    // matter here: on_evict vs watermark only says whether the pool ALSO moves
+    // keys proactively, and either way dropping data a lower tier has room for
+    // would be the wrong answer to "free this tier".
+    bool demote = false;
+    if (tier_graph_ != nullptr) {
+      auto placement = placements_.find(request.key);
+      const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
+      demote = placement != placements_.end() && placement->second == source_id &&
+               tier_index.has_value() && !tier_graph_->NodeAt(*tier_index).offload_to.empty();
+    }
+    if (demote) {
+      demotions.emplace_back(i, source_id);
     } else {
-      placements_.erase(keys[i]);
-      ForgetAccessLocked(keys[i]);
-      draining_sources_.erase(keys[i]);
+      drops.emplace_back(i, source_id);
     }
+  }
+
+  // One at a time: RunTransition releases the lock for the byte copy itself.
+  for (const auto& [index, source_id] : demotions) {
+    const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
+    if (!tier_index.has_value()) {
+      drops.emplace_back(index, source_id);
+      continue;
+    }
+    auto migrated = RunTransition(operation_lock, {TierTransitionKind::kOffload,
+                                                   requests[index].key, source_id, *tier_index});
+    if (migrated.success) {
+      out[index].bytes_freed = migrated.bytes_freed;
+      continue;
+    }
+    // Another transition got to this key first (an earlier RunTransition in
+    // this loop released the lock): it is moving the copy, which is the better
+    // outcome.  Deleting the source now could land before that copy pins it
+    // and lose the key outright, so leave it -- 0 freed, the caller retries.
+    if (migrating_keys_.count(requests[index].key) != 0) continue;
+    // Nowhere downstream had room, or the copy moved meanwhile: free it by
+    // deleting it instead.  The tier asked for bytes back either way.
+    drops.emplace_back(index, source_id);
+  }
+  if (drops.empty()) return out;
+
+  // The drops themselves run without the pool lock: deleting from SSD is
+  // device IO, and holding the lock across it would stall every allocate and
+  // commit on the peer.  One Evict call per backend.
+  operation_lock.unlock();
+  std::map<uint32_t, std::vector<size_t>> by_backend;
+  for (const auto& [index, backend_id] : drops) by_backend[backend_id].push_back(index);
+  for (const auto& [backend_id, indices] : by_backend) {
+    auto* backend = backends_->Get(backend_id);
+    if (backend == nullptr) continue;
+    std::vector<std::string> keys;
+    keys.reserve(indices.size());
+    for (size_t index : indices) keys.push_back(requests[index].key);
+    auto results = backend->Evict(keys);
+    for (size_t j = 0; j < indices.size() && j < results.size(); ++j) {
+      out[indices[j]].bytes_freed += results[j].bytes_freed;
+    }
+  }
+  operation_lock.lock();
+
+  std::unordered_set<std::string> repaired;
+  for (const auto& [index, backend_id] : drops) {
+    if (repaired.insert(requests[index].key).second) RepairAfterDropLocked(requests[index].key);
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Local watermark eviction
+//
+//  The policy half of eviction on a node that has to evict for itself.  It
+//  decides when (a backend at its high watermark) and what (the medium's own
+//  coldest candidates), and then asks Evict() above -- the same call the
+//  master's EvictKey makes.  It never frees a byte itself, and it runs on its
+//  own thread: a put only wakes it.
+// ---------------------------------------------------------------------------
+
+bool PeerPool::EnableLocalEviction(uint32_t backend_id, double high_watermark,
+                                   double low_watermark) {
+  if (!(high_watermark > 0.0 && high_watermark <= 1.0 && low_watermark > 0.0 &&
+        low_watermark < high_watermark)) {
+    MORI_UMBP_WARN(
+        "[PeerPool] ignoring local eviction watermarks high={} low={} for backend {} "
+        "(require 0 < low < high <= 1)",
+        high_watermark, low_watermark, backend_id);
+    return false;
+  }
+  auto* backend = backends_ == nullptr ? nullptr : backends_->Get(backend_id);
+  if (backend == nullptr) return false;
+  // Before the worker can ask for candidates.
+  backend->TrackEvictionOrder();
+
+  std::lock_guard<std::mutex> lock(local_evict_mutex_);
+  if (stop_local_evict_) return false;
+  local_evict_[backend_id] = LocalEvictionWatermarks{high_watermark, low_watermark};
+  if (!local_evict_worker_.joinable()) {
+    local_evict_worker_ = std::thread(&PeerPool::LocalEvictionLoop, this);
+  }
+  const auto* entry = backends_->GetEntry(backend_id);
+  MORI_UMBP_INFO("[PeerPool] local eviction ON backend={} tier={} high={} low={}",
+                 entry == nullptr ? std::string(backend->Name()) : entry->name,
+                 TierTypeName(backend->Tier()), high_watermark, low_watermark);
+  return true;
+}
+
+LocalEvictionMetrics PeerPool::LocalEvictionStats() const {
+  LocalEvictionMetrics metrics;
+  metrics.rounds = local_evict_rounds_.load(std::memory_order_relaxed);
+  metrics.keys = local_evict_keys_.load(std::memory_order_relaxed);
+  metrics.no_candidate = local_evict_no_candidate_.load(std::memory_order_relaxed);
+  metrics.stalled = local_evict_stalled_.load(std::memory_order_relaxed);
+  return metrics;
+}
+
+void PeerPool::WakeLocalEviction() {
+  // A wake already pending covers this one.  With local eviction off nothing
+  // ever clears the flag, so every call after the first returns right here.
+  if (local_evict_wake_.exchange(true, std::memory_order_acq_rel)) return;
+  // Notify under the lock the worker waits with, or a notify landing between
+  // its predicate check and its wait would be lost until the next poll.
+  std::lock_guard<std::mutex> lock(local_evict_mutex_);
+  local_evict_cv_.notify_one();
+}
+
+void PeerPool::StopLocalEviction() {
+  {
+    std::lock_guard<std::mutex> lock(local_evict_mutex_);
+    stop_local_evict_ = true;
+  }
+  local_evict_cv_.notify_all();
+  if (local_evict_worker_.joinable()) local_evict_worker_.join();
+}
+
+void PeerPool::LocalEvictionLoop() {
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lock(local_evict_mutex_);
+      local_evict_cv_.wait_for(lock, kLocalEvictPollInterval, [&] {
+        return stop_local_evict_ || local_evict_wake_.load(std::memory_order_acquire);
+      });
+      if (stop_local_evict_) return;
+    }
+    // Cleared before the pass, so a commit that lands during it schedules the
+    // next one rather than being absorbed by this.
+    local_evict_wake_.store(false, std::memory_order_release);
+    LocalEvictionPass();
+    std::this_thread::sleep_for(kLocalEvictMinGap);
+  }
+}
+
+size_t PeerPool::LocalEvictionPass() {
+  std::lock_guard<std::mutex> pass(local_evict_pass_mutex_);
+  std::vector<std::pair<uint32_t, LocalEvictionWatermarks>> targets;
+  {
+    std::lock_guard<std::mutex> lock(local_evict_mutex_);
+    targets.assign(local_evict_.begin(), local_evict_.end());
+  }
+  if (targets.empty() || backends_ == nullptr) return 0;
+
+  // Lowest tier first -- SSD, then DRAM, then HBM.  Evicting from an upper
+  // tier demotes into the one below, so freeing the lower one first is what
+  // lets that demotion find room instead of falling back to a drop.
+  const auto depth = [this](uint32_t backend_id) {
+    auto* backend = backends_->Get(backend_id);
+    return backend == nullptr ? 0 : static_cast<int>(backend->Tier());
+  };
+  std::stable_sort(targets.begin(), targets.end(),
+                   [&](const auto& a, const auto& b) { return depth(a.first) > depth(b.first); });
+
+  size_t freed = 0;
+  for (const auto& [backend_id, watermarks] : targets) {
+    freed += ReclaimBackend(backend_id, watermarks);
+  }
+  return freed;
+}
+
+size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermarks& watermarks) {
+  auto* backend = backends_->Get(backend_id);
+  if (backend == nullptr) return 0;
+  const TierCapacity capacity = backend->Capacity();
+  if (capacity.total_bytes == 0) return 0;
+  const double total = static_cast<double>(capacity.total_bytes);
+  const uint64_t used = UsedBytes(capacity);
+  if (static_cast<double>(used) < watermarks.high * total) return 0;
+  const auto low_bytes = static_cast<uint64_t>(watermarks.low * total);
+  if (used <= low_bytes) return 0;
+  local_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
+
+  // Free what was over the low watermark at the start -- counted in the bytes
+  // each offer said it gives back, which is what Capacity() counts -- or until
+  // usage is back at the low watermark, whichever comes first.  The budget is
+  // the guard against a medium whose reported usage lags its deletes, which
+  // re-reading usage alone would keep draining.
+  const uint64_t budget = used - low_bytes;
+  const TierType tier = backend->Tier();
+  uint64_t freed_bytes = 0;
+  size_t freed_keys = 0;
+  while (freed_bytes < budget) {
+    {
+      std::lock_guard<std::mutex> lock(local_evict_mutex_);
+      if (stop_local_evict_) break;
+    }
+    auto offers = backend->EvictionCandidates(kLocalEvictBatch);
+    if (offers.empty()) {
+      local_evict_no_candidate_.fetch_add(1, std::memory_order_relaxed);
+      MORI_UMBP_DEBUG(
+          "[PeerPool] local eviction: backend {} over its watermark but offers no "
+          "candidate (all leased or pinned)",
+          backend_id);
+      break;
+    }
+    // Only as many of the coldest as the remaining budget needs (at least one),
+    // so a batch cannot carry the drain past the low watermark.
+    std::vector<PoolEvictRequest> requests;
+    std::vector<uint64_t> offered_bytes;
+    uint64_t taken = 0;
+    for (auto& offer : offers) {
+      if (!requests.empty() && freed_bytes + taken >= budget) break;
+      taken += offer.bytes;
+      offered_bytes.push_back(offer.bytes);
+      PoolEvictRequest request;
+      request.key = std::move(offer.key);
+      request.tier = tier;
+      request.backend_id = backend_id;
+      requests.push_back(std::move(request));
+    }
+    // The same entry point the master's EvictKey uses: a candidate whose tier
+    // has a downstream is demoted, anything else is dropped from this backend.
+    const auto results = Evict(requests, PoolEvictMode::kReclaim);
+    size_t batch_keys = 0;
+    for (size_t i = 0; i < results.size() && i < offered_bytes.size(); ++i) {
+      if (results[i].bytes_freed == 0) continue;
+      ++batch_keys;
+      freed_bytes += offered_bytes[i];
+    }
+    if (batch_keys == 0) {
+      // Every candidate was mid-transition or became busy since it was
+      // offered.  Spinning would only re-offer the same keys; the next wake or
+      // poll tries again.
+      local_evict_stalled_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+    freed_keys += batch_keys;
+    if (UsedBytes(backend->Capacity()) <= low_bytes) break;
+  }
+  local_evict_keys_.fetch_add(freed_keys, std::memory_order_relaxed);
+  return freed_keys;
 }
 
 void PeerPool::ClearLocal() {

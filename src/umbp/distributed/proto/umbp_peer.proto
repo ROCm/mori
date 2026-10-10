@@ -142,6 +142,11 @@ message EvictKeyEntry {
 }
 message EvictKeyRequest {
   repeated string keys = 1;
+  // tiers[i] is the medium keys[i] must be freed from -- the one whose budget
+  // the master charged it to.  Honoured only when it has exactly as many
+  // entries as `keys`; otherwise (an older master) each key is freed from the
+  // medium that currently holds it.  An older peer ignores this field.
+  repeated TierType tiers = 2;
 }
 message EvictKeyResponse {
   repeated EvictKeyEntry evicted = 1;

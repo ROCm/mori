@@ -331,38 +331,22 @@ class PageBackend : public MediumBackend {
   // keeping one is a leak of one event per put.
   void SetEventPublishing(bool enabled) override;
 
-  // ==================== Local (masterless) eviction ====================
+  // ==================== Eviction ordering ====================
   //
-  // Eviction here is normally the MASTER's policy: it chooses victims with a
-  // cluster-wide view and calls Evict(keys) through the peer service.  Nothing
-  // else ever calls Evict, so a node with no master fills its pool and
-  // Allocate starts answering NO_SPACE forever — where the deleted local
-  // backend's LocalStorageManager would have evicted on a watermark.  This is
-  // that watermark loop, restored on the backend that now serves embedded
-  // deployments.
+  // This backend never decides to evict.  The master, or the pool's local
+  // watermark eviction on a node without one, decides and calls Evict() --
+  // the only code here that frees a committed key -- through PeerPool::Evict.
+  // What this backend supplies is the order: an LRU of owned keys, inserted by
+  // Commit and renewed by Resolve.
   //
-  // Opt-in so the cluster path is bit-for-bit unchanged: with a master, a
-  // second local policy would free keys the master still indexes and hands out
-  // routes for.  PoolClient::Init enables it exactly when it builds no
-  // MasterClient.
-  //
-  // Enabling it turns on an LRU ordering (inserted by Commit, renewed by
-  // Resolve) that is not maintained otherwise, so the read path pays nothing
-  // in a cluster.  A round runs on the committing thread — there is no
-  // eviction thread — and frees oldest-first down to `low` once usage reaches
-  // `high`.  Leased and copy-pinned keys are skipped, exactly as master-driven
-  // Evict skips them; a round that can only find protected keys frees what it
-  // can and stops rather than spinning.
-  //
-  // Must be called before Init().  Watermarks must satisfy
-  // 0 < low < high <= 1; anything else is rejected with a warning and leaves
-  // local eviction off.
-  void EnableLocalEviction(double high_watermark, double low_watermark) override;
+  // The LRU is maintained only once TrackEvictionOrder() is called, so a node
+  // whose eviction is all master-driven pays nothing for it on the read path.
+  void TrackEvictionOrder() override;
 
-  // Test seam: run one local-eviction round synchronously.  Returns the number
-  // of keys freed (0 when local eviction is off or usage is below the high
-  // watermark).
-  size_t RunLocalEvictionOnceForTest() { return MaybeEvictToLowWatermark(); }
+  // Coldest first, skipping keys under a read lease or a copy pin -- the same
+  // two protections Evict() applies, so a candidate is one Evict() would free
+  // unless it is touched in between.  Empty until TrackEvictionOrder().
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
 
   // ==================== Reaper ====================
 
@@ -398,7 +382,7 @@ class PageBackend : public MediumBackend {
     // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
     // thread already extended.
     std::atomic<int64_t> read_lease_ns{0};
-    // Position in lru_, valid only while in_lru is true (local eviction on).
+    // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
     //
@@ -487,10 +471,10 @@ class PageBackend : public MediumBackend {
   void ReaperLoop();
   void ReaperSweep();
 
-  // ---- local eviction (no-master deployments; see EnableLocalEviction) ----
+  // ---- eviction order (see TrackEvictionOrder) ----
 
   // Caller MUST hold `lru_mutex_`.  Move `key` to the MRU end, inserting it if
-  // it is not yet tracked.  No-op when local eviction is off.
+  // it is not yet tracked.  No-op until the order is tracked.
   void TouchLruLocked(const std::string& key, OwnedSlot& slot);
 
   // Caller MUST hold `lru_mutex_`.  Drop `key` from the LRU if tracked.
@@ -500,11 +484,6 @@ class PageBackend : public MediumBackend {
   // mutex_ -> lru_mutex_, never the reverse.
   void TouchLru(const std::string& key, OwnedSlot& slot);
   void RemoveFromLru(OwnedSlot& slot);
-
-  // Run one round if local eviction is on and usage has reached the high
-  // watermark.  Takes `mutex_` itself, so callers must NOT hold it.  Returns
-  // the number of keys freed.
-  size_t MaybeEvictToLowWatermark();
 
   // Owned pages held back at ClearLocal() because of an active read lease.
   // Released by ReaperSweep() when release_at <= now.
@@ -564,25 +543,18 @@ class PageBackend : public MediumBackend {
 
   std::vector<DeferredFree> deferred_frees_;
 
-  // ---- local eviction state (see EnableLocalEviction) ----
+  // ---- eviction order (see TrackEvictionOrder) ----
   // Front = most recently committed/resolved, back = eviction candidate.
-  // Empty and unmaintained unless local_evict_enabled_.
+  // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
   // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_
   // so a resolve can record an access while holding only a shared lock; the
   // critical section is a list splice, not a hash lookup plus a page-vector
   // copy.  Always taken after mutex_ when both are held.
   mutable std::mutex lru_mutex_;
-  bool local_evict_enabled_ = false;
-  double local_evict_high_wm_ = 0.9;
-  double local_evict_low_wm_ = 0.7;
-  // Serializes rounds without holding mutex_ across one: a second committing
-  // thread backs off instead of over-evicting (same shape as PeerSsdManager).
-  std::mutex local_evict_round_mutex_;
-  // Latches the "nothing reclaimable" warning so a wedged pool reports once
-  // per episode rather than once per commit.  Cleared by the next round that
-  // frees something.
-  bool local_evict_warned_ = false;
+  // Written under mutex_ held exclusively, read under it held shared or
+  // exclusively -- every LRU touch already holds one or the other.
+  bool track_eviction_order_ = false;
 
   // False stops QueueEventLocked from recording anything (no master to ship
   // to).  True is the cluster default.

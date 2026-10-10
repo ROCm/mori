@@ -27,23 +27,23 @@
 #include <unordered_map>
 #include <vector>
 
-#include "umbp/distributed/types.h"  // EvictionCandidate, TierType
+#include "umbp/distributed/types.h"  // EvictionCandidate, EvictionVictim, TierType
 
 namespace mori::umbp {
 
-// Master-side victim selection for DRAM/HBM eviction.  EvictionManager handles
-// watermark detection, candidate gathering, and EvictKey dispatch; the strategy
-// only ranks candidates and picks victims within the per-(node,tier) budget.
-// (SSD eviction is peer-local; master never evicts SSD.)
+// Master-side victim selection.  EvictionManager handles watermark detection,
+// candidate gathering, and EvictKey dispatch; the strategy only ranks
+// candidates and picks victims within the per-(node,tier) budget.
 class MasterEvictStrategy {
  public:
   virtual ~MasterEvictStrategy() = default;
 
   // Pick victims from @p candidates within the per-(node,tier) byte budget
   // @p bytes_to_free.  Both are by value so the impl may sort/decrement freely.
-  // Returns victims grouped by node_id (one keys[] per peer); empty groups
-  // omitted.
-  virtual std::unordered_map<std::string, std::vector<std::string>> SelectVictims(
+  // Returns victims grouped by node_id (one EvictKey per peer); empty groups
+  // omitted.  Each victim carries the tier whose budget it was charged to, so
+  // the peer frees that medium's copy and no other.
+  virtual std::unordered_map<std::string, std::vector<EvictionVictim>> SelectVictims(
       std::vector<EvictionCandidate> candidates,
       std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free) = 0;
 };
@@ -51,7 +51,7 @@ class MasterEvictStrategy {
 // Default policy: pure LRU (evict oldest-access-first until each budget is met).
 class LruMasterEvictStrategy : public MasterEvictStrategy {
  public:
-  std::unordered_map<std::string, std::vector<std::string>> SelectVictims(
+  std::unordered_map<std::string, std::vector<EvictionVictim>> SelectVictims(
       std::vector<EvictionCandidate> candidates,
       std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free) override;
 };

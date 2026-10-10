@@ -38,14 +38,6 @@
 
 namespace mori::umbp {
 
-namespace {
-// Watermarks must satisfy 0 < low < high <= 1.  We fail fast on a bad value
-// rather than silently clamping, so a misconfigured env surfaces immediately.
-bool WatermarksValid(double high, double low) {
-  return high > 0.0 && high <= 1.0 && low > 0.0 && low < high;
-}
-}  // namespace
-
 // ---------------------------------------------------------------------------
 //  Construction
 // ---------------------------------------------------------------------------
@@ -56,14 +48,8 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
     return;
   }
   const auto& ssd = cfg.ssd;
-
-  if (!WatermarksValid(ssd.high_watermark, ssd.low_watermark)) {
-    throw std::runtime_error(
-        "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
-        "high_watermark <= 1)");
-  }
-  high_watermark_ = ssd.high_watermark;
-  low_watermark_ = ssd.low_watermark;
+  // The SSD watermarks in `ssd` are consumed by PeerPool's local eviction,
+  // which PoolClient enables for this medium -- not here.
   single_flight_ = ssd.single_flight_reads;
 
   // Explicit backend selection — an unknown value is a configuration error, not
@@ -100,18 +86,8 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
                            "' (expected one of: file, spdk, spdk_proxy)");
 }
 
-PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, double high_watermark,
-                               double low_watermark, bool single_flight)
-    : backend_(std::move(backend)),
-      high_watermark_(high_watermark),
-      low_watermark_(low_watermark),
-      single_flight_(single_flight) {
-  if (!WatermarksValid(high_watermark_, low_watermark_)) {
-    throw std::runtime_error(
-        "[PeerSsdManager] invalid SSD watermarks (require 0 < low_watermark < "
-        "high_watermark <= 1)");
-  }
-}
+PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight)
+    : backend_(std::move(backend)), single_flight_(single_flight) {}
 
 PeerSsdManager::~PeerSsdManager() = default;
 
@@ -215,14 +191,11 @@ bool PeerSsdManager::Write(const std::string& key,
   }
 
   // Backend IO outside our mutex_ — SSDTier is internally synchronized.  A
-  // failure may be ENOSPC: run one eviction round to reclaim space and retry
-  // once before giving up (best-effort, no event/record on final failure).
+  // failure (ENOSPC included) records nothing and queues nothing.  Making room
+  // is the pool's local eviction, on its own thread, never this write.
   if (!backend_->Write(key, data, total_size)) {
-    EvictToLowWatermark();
-    if (!backend_->Write(key, data, total_size)) {
-      MORI_UMBP_WARN("[PeerSsdManager] backend Write failed key={} size={}", key, total_size);
-      return false;
-    }
+    MORI_UMBP_WARN("[PeerSsdManager] backend Write failed key={} size={}", key, total_size);
+    return false;
   }
 
   // Bytes physically written to the SSD device (write IO bandwidth source).
@@ -244,19 +217,7 @@ bool PeerSsdManager::Write(const std::string& key,
         pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
       }
     }
-    // Keep the just-written key out of this write's own watermark victim set.
-    // A successful Write must imply the key still exists when it returns.
-    auto& slot = inflight_reads_[key];
-    if (!slot) slot = std::make_unique<InflightRead>();
-    ++slot->refs;
   }
-
-  // Check-after-write trigger, on this copy worker (no dedicated thread).
-  auto [used, total] = Capacity();
-  if (total > 0 && static_cast<double>(used) >= high_watermark_ * static_cast<double>(total)) {
-    EvictToLowWatermark();
-  }
-  UnpinForMigration(key);
   return true;
 }
 
@@ -274,7 +235,7 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
   // Stage timers for the [SsdPerf/peer] PUT breakdown (no-ops unless
   // UMBP_SSD_TIMING is set).
   const auto t_begin = ssdperf::Now();
-  double dedup_ms = 0.0, backend_ms = 0.0, retry_ms = 0.0, record_ms = 0.0, evict_ms = 0.0;
+  double dedup_ms = 0.0, backend_ms = 0.0, record_ms = 0.0;
 
   // Pass 1 — dedup under one lock.  Already-owned keys succeed with no IO (same
   // rationale as Write: a sequential re-put must not repeat the device write).
@@ -296,45 +257,24 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
   const size_t dedup_hits = keys.size() - todo.size();
   if (todo.empty()) return results;
 
-  auto gather = [&](const std::vector<size_t>& idxs) {
-    std::vector<std::string> k;
-    std::vector<const void*> d;
-    std::vector<size_t> z;
-    k.reserve(idxs.size());
-    d.reserve(idxs.size());
-    z.reserve(idxs.size());
-    for (size_t i : idxs) {
-      k.push_back(keys[i]);
-      d.push_back(srcs[i]);
-      z.push_back(sizes[i]);
-    }
-    return std::make_tuple(std::move(k), std::move(d), std::move(z));
-  };
-
-  // Pass 2 — one batched backend write outside the lock.  Failures are most
-  // likely ENOSPC, so retry exactly those once after a single eviction round
-  // (mirrors Write's evict-and-retry, amortized over the whole batch).
+  // Pass 2 — one batched backend write outside the lock.  A key that fails
+  // (ENOSPC included) is reported as failed and recorded nowhere; making room
+  // is the pool's local eviction, on its own thread, never this write.
   const auto t_backend = ssdperf::Now();
-  auto [bk, bd, bz] = gather(todo);
-  auto ok = backend_->BatchWrite(bk, bd, bz);
+  std::vector<std::string> batch_keys;
+  std::vector<const void*> batch_srcs;
+  std::vector<size_t> batch_sizes;
+  batch_keys.reserve(todo.size());
+  batch_srcs.reserve(todo.size());
+  batch_sizes.reserve(todo.size());
+  for (size_t i : todo) {
+    batch_keys.push_back(keys[i]);
+    batch_srcs.push_back(srcs[i]);
+    batch_sizes.push_back(sizes[i]);
+  }
+  auto ok = backend_->BatchWrite(batch_keys, batch_srcs, batch_sizes);
   ok.resize(todo.size(), false);
   backend_ms = ssdperf::MsSince(t_backend);
-
-  std::vector<size_t> retry;
-  for (size_t j = 0; j < todo.size(); ++j) {
-    if (!ok[j]) retry.push_back(todo[j]);
-  }
-  if (!retry.empty()) {
-    const auto t_retry = ssdperf::Now();
-    EvictToLowWatermark();
-    auto [rk, rd, rz] = gather(retry);
-    auto retry_ok = backend_->BatchWrite(rk, rd, rz);
-    retry_ok.resize(retry.size(), false);
-    for (size_t j = 0, r = 0; j < todo.size(); ++j) {
-      if (!ok[j]) ok[j] = retry_ok[r++];
-    }
-    retry_ms = ssdperf::MsSince(t_retry);
-  }
 
   // Pass 3 — record locations + ADD events under one lock.  The owned_ re-check
   // matches Write: a concurrent writer may have landed the same content-addressed
@@ -369,29 +309,21 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
     }
   }
 
-  // One check-after-write for the whole batch instead of one per key.
-  const auto t_evict = ssdperf::Now();
-  auto [used, total] = Capacity();
-  if (total > 0 && static_cast<double>(used) >= high_watermark_ * static_cast<double>(total)) {
-    EvictToLowWatermark();
-  }
-  evict_ms = ssdperf::MsSince(t_evict);
-
   if (ssdperf::Enabled()) {
     const double total_ms = ssdperf::MsSince(t_begin);
+    const auto [used, total] = Capacity();
     MORI_UMBP_INFO(
         "[SsdPerf/peer] PUT keys={} dedup_hits={} written={} bytes={} total_ms={:.3f} GB_s={:.2f} "
-        "| dedup={:.3f}ms backend={:.3f}ms ({:.0f}%) evict_retry={:.3f}ms record={:.3f}ms "
-        "evict_check={:.3f}ms | used={}/{}B",
+        "| dedup={:.3f}ms backend={:.3f}ms ({:.0f}%) record={:.3f}ms | used={}/{}B",
         keys.size(), dedup_hits, todo.size(), written_bytes, total_ms,
         ssdperf::GbPerSec(written_bytes, total_ms), dedup_ms, backend_ms,
-        ssdperf::Pct(backend_ms, total_ms), retry_ms, record_ms, evict_ms, used, total);
+        ssdperf::Pct(backend_ms, total_ms), record_ms, used, total);
   }
   return results;
 }
 
 // ---------------------------------------------------------------------------
-//  Eviction (local, read-priority)
+//  Eviction (the medium's one implementation; read-priority)
 // ---------------------------------------------------------------------------
 
 bool PeerSsdManager::Evict(const std::string& key) {
@@ -431,50 +363,21 @@ bool PeerSsdManager::Evict(const std::string& key) {
   return true;
 }
 
-std::vector<std::string> PeerSsdManager::SelectVictims(size_t bytes_to_free) {
+std::vector<EvictionOffer> PeerSsdManager::EvictionCandidates(size_t max_count) {
   std::lock_guard<std::mutex> lock(mutex_);
-  std::vector<std::string> victims;
-  if (bytes_to_free == 0) return victims;
+  std::vector<EvictionOffer> candidates;
+  if (max_count == 0) return candidates;
 
   // Oldest first (LRU tail -> MRU front), skipping keys being read or evicted.
-  size_t freed = 0;
-  for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+  for (auto it = lru_.rbegin(); it != lru_.rend() && candidates.size() < max_count; ++it) {
     const std::string& key = *it;
     if (inflight_reads_.count(key) != 0) continue;
     if (evicting_.count(key) != 0) continue;
     auto owned_it = owned_.find(key);
     if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
-    victims.push_back(key);
-    freed += owned_it->second.size;
-    if (freed >= bytes_to_free) break;
+    candidates.push_back(EvictionOffer{key, owned_it->second.size});
   }
-  return victims;
-}
-
-void PeerSsdManager::EvictToLowWatermark() {
-  if (!backend_) return;
-
-  // Only one eviction round at a time: a second concurrent worker (or a worker
-  // racing ClearLocal) backs off instead of over-evicting.  try_lock keeps the
-  // copy path non-blocking.
-  std::unique_lock<std::mutex> round(eviction_mu_, std::try_to_lock);
-  if (!round.owns_lock()) return;
-
-  auto [used, total] = Capacity();
-  if (total == 0) return;
-  double low_bytes = low_watermark_ * static_cast<double>(total);
-  if (static_cast<double>(used) <= low_bytes) return;
-  size_t bytes_to_free = used - static_cast<size_t>(low_bytes);
-
-  // A real round is about to run (we own the round lock and are over the low
-  // watermark).  Count it before selecting victims.
-  metrics_.evict_rounds.fetch_add(1, std::memory_order_relaxed);
-
-  // Single pass, no retry loop: if everything reclaimable is in use we free
-  // what we can and stop, so a fully-pinned tier cannot starve the worker.
-  for (const auto& key : SelectVictims(bytes_to_free)) {
-    Evict(key);
-  }
+  return candidates;
 }
 
 // ---------------------------------------------------------------------------
@@ -487,9 +390,10 @@ void PeerSsdManager::ClearLocal() {
   // re-add owned_/ADD SSD after backend->Clear() wipes its bytes.
   // PoolClient::Clear() Quiesce()s first; new callers must too.
   //
-  // Exclude eviction rounds for the whole operation (lock order: eviction_mu_
-  // before mutex_, matching EvictToLowWatermark).
-  std::lock_guard<std::mutex> round(eviction_mu_);
+  // No eviction is in flight: the only caller of Evict is PeerPool::Evict,
+  // which holds the lifecycle lock PeerPool::ClearLocal takes exclusively
+  // before it gets here.  An Evict that did overlap would still be safe -- it
+  // finds its key gone from owned_ and records nothing -- just pointless.
   {
     std::unique_lock<std::mutex> lock(mutex_);
     owned_.clear();

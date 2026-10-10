@@ -160,6 +160,33 @@ struct EvictionCandidate {
   uint64_t size;
 };
 
+// One master eviction decision: free `key` from the `tier` medium of a node.
+// The tier is the one whose budget the victim was charged to.  A key over
+// budget in two media of the same node is two victims, one per medium; without
+// the tier the peer could only guess which copy the master meant.
+struct EvictionVictim {
+  std::string key;
+  TierType tier = TierType::UNKNOWN;
+
+  bool operator==(const EvictionVictim& other) const {
+    return key == other.key && tier == other.tier;
+  }
+};
+
+// One key a medium offers for local eviction (MediumBackend::
+// EvictionCandidates), with the bytes freeing it gives back to that medium's
+// capacity -- page-rounded where the medium allocates in pages.  The size is
+// what lets the caller take exactly as many offers as it needs instead of a
+// whole batch.
+struct EvictionOffer {
+  std::string key;
+  uint64_t bytes = 0;
+
+  bool operator==(const EvictionOffer& other) const {
+    return key == other.key && bytes == other.bytes;
+  }
+};
+
 // Ordering hint for IMasterMetadataStore::EnumerateEvictionCandidates.  This is
 // a performance affordance, NOT eviction policy: it only tells the store what
 // order to return rows in so a backend with an index (e.g. a Redis ZSET keyed

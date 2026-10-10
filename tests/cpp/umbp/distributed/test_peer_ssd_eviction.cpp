@@ -20,11 +20,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// SSD local capacity management + eviction.  Drives PeerSsdManager
-// through a controllable in-memory TierBackend (the test-only constructor) so
-// LRU ordering, watermark eviction, the in-flight-read guard, idempotent Write,
+// The SSD medium's eviction primitive and its candidate order.  Drives
+// PeerSsdManager through a controllable in-memory TierBackend (the test-only
+// constructor) so LRU ordering, the in-flight-read guard, idempotent Write,
 // backend-evict failure, concurrent eviction, and physical Clear are all
 // deterministic without real disk IO.
+//
+// What is deliberately NOT here: watermark eviction.  The manager never decides
+// to evict -- not after a write, not when a write runs out of room.  That is
+// PeerPool's local eviction, tested in test_peer_pool against an SsdBackend.
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -158,10 +162,10 @@ struct Harness {
   std::unique_ptr<PeerSsdManager> mgr;
 };
 
-Harness MakeHarness(size_t capacity, double high = 0.9, double low = 0.7) {
+Harness MakeHarness(size_t capacity) {
   auto be = std::make_unique<FakeBackend>(capacity);
   FakeBackend* raw = be.get();
-  return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be), high, low)};
+  return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be))};
 }
 
 int CountKind(const std::vector<KvEvent>& events, KvEvent::Kind kind) {
@@ -170,6 +174,12 @@ int CountKind(const std::vector<KvEvent>& events, KvEvent::Kind kind) {
     if (e.kind == kind && e.tier == TierType::SSD) ++n;
   }
   return n;
+}
+
+std::vector<std::string> Keys(const std::vector<EvictionOffer>& offers) {
+  std::vector<std::string> keys;
+  for (const auto& offer : offers) keys.push_back(offer.key);
+  return keys;
 }
 
 bool HasRemove(const std::vector<KvEvent>& events, const std::string& key) {
@@ -188,62 +198,66 @@ TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
   ASSERT_TRUE(h.mgr->Write("C", OneSeg("cccc"), 4));
 
   // LRU now (oldest->newest): A, B, C.  Reading A promotes it to MRU, so the
-  // oldest becomes B and SelectVictims must pick B first (not the just-read A).
+  // oldest becomes B and the first candidate must be B (not the just-read A).
   std::vector<char> buf(4);
   auto out = h.mgr->PrepareRead("A", buf.data(), buf.size());
   ASSERT_EQ(out.status, SsdReadStatus::kOk);
   EXPECT_EQ(std::string(buf.data(), out.size), "aaaa");
 
-  auto victims = h.mgr->SelectVictims(/*bytes_to_free=*/1);
-  ASSERT_FALSE(victims.empty());
-  EXPECT_EQ(victims.front(), "B");
-  EXPECT_NE(victims.front(), "A");
+  auto candidates = h.mgr->EvictionCandidates(/*max_count=*/1);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_EQ(candidates.front().key, "B");
+  EXPECT_EQ(candidates.front().bytes, 4u);
 }
 
-TEST(PeerSsdEviction, WatermarkTriggersEvictionDownToLow) {
-  // capacity 1000, high 0.9 (=>900), low 0.7 (=>700); 100-byte values.
-  auto h = MakeHarness(/*capacity=*/1000, /*high=*/0.9, /*low=*/0.7);
+TEST(PeerSsdEviction, CandidatesAreColdestFirstAndCapped) {
+  auto h = MakeHarness(/*capacity=*/1'000'000);
+  for (int i = 1; i <= 5; ++i) {
+    ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg("data"), 4));
+  }
+  EXPECT_EQ(Keys(h.mgr->EvictionCandidates(3)), (std::vector<std::string>{"k1", "k2", "k3"}));
+  EXPECT_EQ(h.mgr->EvictionCandidates(100).size(), 5u);
+  // Ordering only: asking freed nothing.
+  for (int i = 1; i <= 5; ++i) EXPECT_TRUE(h.mgr->Exists("k" + std::to_string(i)));
+}
+
+TEST(PeerSsdEviction, WritesNeverEvictEvenWhenNearlyFull) {
+  // 900 of 1000 bytes used is where the manager's own round used to fire.  It
+  // has none now: the pool's local eviction decides, on its own thread, so a
+  // write must leave every earlier key exactly where it was.
+  auto h = MakeHarness(/*capacity=*/1000);
   std::string val(100, 'x');
   for (int i = 1; i <= 9; ++i) {
     ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg(val), val.size()));
   }
-  // After k9: used hit 900 >= high -> evict oldest down to <= 700.
   auto [used, total] = h.mgr->Capacity();
+  EXPECT_EQ(used, 900u);
   EXPECT_EQ(total, 1000u);
-  EXPECT_LE(used, 700u);
-
-  // Oldest (k1, k2) evicted first; newest still present.
-  EXPECT_FALSE(h.mgr->Exists("k1"));
-  EXPECT_FALSE(h.mgr->Exists("k2"));
-  EXPECT_TRUE(h.mgr->Exists("k9"));
-
-  auto events = h.mgr->DrainPendingEvents();
-  EXPECT_TRUE(HasRemove(events, "k1"));
-  EXPECT_TRUE(HasRemove(events, "k2"));
-  EXPECT_EQ(CountKind(events, KvEvent::Kind::REMOVE), 2);
+  for (int i = 1; i <= 9; ++i) EXPECT_TRUE(h.mgr->Exists("k" + std::to_string(i)));
+  EXPECT_EQ(CountKind(h.mgr->DrainPendingEvents(), KvEvent::Kind::REMOVE), 0);
 }
 
-TEST(PeerSsdEviction, SuccessfulWriteDoesNotEvictItself) {
-  auto h = MakeHarness(/*capacity=*/100, /*high=*/0.9, /*low=*/0.7);
-  std::string value(90, 'x');
-  ASSERT_TRUE(h.mgr->Write("only", OneSeg(value), value.size()));
-  EXPECT_TRUE(h.mgr->Exists("only"));
-}
-
-TEST(PeerSsdEviction, EnospcTriggersEvictThenRetry) {
-  // Fill to 800/1000 (below the 0.9 high watermark, so no watermark eviction
-  // fires during the fill), then write a 300-byte value that overflows the
-  // device: backend Write -> ENOSPC -> one evict round (frees the oldest down
-  // to the 0.5 low watermark) -> retry succeeds.  After the retry used is 800,
-  // still below high, so no second round disturbs the just-written key.
-  auto h = MakeHarness(/*capacity=*/1000, /*high=*/0.9, /*low=*/0.5);
+TEST(PeerSsdEviction, WriteThatDoesNotFitFailsWithoutEvicting) {
+  // 800 of 1000 used, then a 300-byte value: the device answers ENOSPC.  The
+  // write fails and records nothing; it does not evict older keys to make room
+  // -- that would be eviction work on the put path.
+  auto h = MakeHarness(/*capacity=*/1000);
   for (int i = 1; i <= 8; ++i) {
     ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg(std::string(100, 'a')), 100));
   }
-  ASSERT_TRUE(h.mgr->Write("big", OneSeg(std::string(300, 'c')), 300));
-  EXPECT_TRUE(h.mgr->Exists("big"));
-  EXPECT_FALSE(h.mgr->Exists("k1"));  // oldest reclaimed to make room
-  EXPECT_LE(h.mgr->Capacity().first, 1000u);
+  h.mgr->DrainPendingEvents();
+  EXPECT_FALSE(h.mgr->Write("big", OneSeg(std::string(300, 'c')), 300));
+  EXPECT_FALSE(h.mgr->Exists("big"));
+  EXPECT_TRUE(h.mgr->Exists("k1"));
+  EXPECT_TRUE(h.mgr->DrainPendingEvents().empty());
+
+  // The batched path behaves the same, per key.
+  const std::string big(300, 'c');
+  const std::string small(100, 's');
+  auto ok =
+      h.mgr->WriteBatch({"big", "small"}, {big.data(), small.data()}, {big.size(), small.size()});
+  EXPECT_EQ(ok, (std::vector<bool>{false, true}));
+  EXPECT_TRUE(h.mgr->Exists("k1"));
 }
 
 TEST(PeerSsdEviction, InFlightReadIsNotEvicted) {
@@ -257,9 +271,9 @@ TEST(PeerSsdEviction, InFlightReadIsNotEvicted) {
   std::thread reader([&] { out = h.mgr->PrepareRead("K", buf.data(), buf.size()); });
   h.backend->WaitReadsStarted(1);  // PrepareRead has marked K in-flight and is blocked in the read
 
-  // Eviction must skip a key that is being read.
+  // Eviction must skip a key that is being read, and must not offer it.
   EXPECT_FALSE(h.mgr->Evict("K"));
-  EXPECT_TRUE(h.mgr->SelectVictims(1'000'000).empty());
+  EXPECT_TRUE(h.mgr->EvictionCandidates(100).empty());
   EXPECT_TRUE(h.mgr->Exists("K"));
 
   h.backend->UnblockReads();
@@ -370,26 +384,19 @@ TEST(PeerSsdEviction, ClearLocalWaitsForInFlightRead) {
   EXPECT_FALSE(h.mgr->Exists("K"));
 }
 
-TEST(PeerSsdEviction, InvalidWatermarksThrow) {
-  // low >= high, and high > 1 are both rejected (fail-fast, no silent clamp).
-  EXPECT_THROW(PeerSsdManager(std::make_unique<FakeBackend>(1000), 0.5, 0.7), std::runtime_error);
-  EXPECT_THROW(PeerSsdManager(std::make_unique<FakeBackend>(1000), 1.5, 0.7), std::runtime_error);
-  EXPECT_THROW(PeerSsdManager(std::make_unique<FakeBackend>(1000), 0.9, 0.0), std::runtime_error);
-}
-
-TEST(PeerSsdEviction, SelectVictimsBoundaries) {
+TEST(PeerSsdEviction, EvictionCandidatesBoundaries) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
   ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));
 
-  EXPECT_TRUE(h.mgr->SelectVictims(0).empty());  // nothing to free
+  EXPECT_TRUE(h.mgr->EvictionCandidates(0).empty());  // nothing asked for
 
-  // All candidates in flight -> no victim, no spin.
+  // All candidates in flight -> none offered, no spin.
   h.backend->BlockReads();
   std::vector<char> buf(4);
   SsdReadOutcome out{};
   std::thread reader([&] { out = h.mgr->PrepareRead("K", buf.data(), buf.size()); });
   h.backend->WaitReadsStarted(1);
-  EXPECT_TRUE(h.mgr->SelectVictims(1'000'000).empty());
+  EXPECT_TRUE(h.mgr->EvictionCandidates(100).empty());
   h.backend->UnblockReads();
   reader.join();
   EXPECT_EQ(out.status, SsdReadStatus::kOk);
@@ -402,7 +409,7 @@ TEST(PeerSsdEviction, DisabledManagerIsInert) {
 
   EXPECT_FALSE(mgr.Write("K", OneSeg("data"), 4));
   EXPECT_FALSE(mgr.Evict("K"));
-  EXPECT_TRUE(mgr.SelectVictims(100).empty());
+  EXPECT_TRUE(mgr.EvictionCandidates(100).empty());
   std::vector<char> buf(4);
   EXPECT_EQ(mgr.PrepareRead("K", buf.data(), buf.size()).status, SsdReadStatus::kNotFound);
   mgr.ClearLocal();  // no backend -> no crash, no-op

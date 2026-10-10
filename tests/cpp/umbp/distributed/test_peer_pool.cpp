@@ -27,6 +27,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -636,6 +637,163 @@ TEST(PeerPool, DiscardDeletesInsteadOfDemoting) {
   EXPECT_EQ(pool.PlacementCount(), 0u);
 }
 
+// A copy-mode promotion leaves the key on both media; the placement follows the
+// promoted (hot) copy.  Returns once both copies exist and the promotion's read
+// lease on the cold copy has lapsed.
+void PromoteByCopy(PeerPool* pool, BackendRegistry* registry, const std::string& key) {
+  auto request = PutRequest(key);
+  request.logical_tier = "cold";
+  auto allocation = pool->BatchAllocate({request}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(pool->BatchCommit({PoolCommitRequest{
+                                    {allocation.backend_id, allocation.allocation.slot_id}, key}})
+                  .front()
+                  .commit.success);
+  ASSERT_TRUE(pool->BatchResolve({key}, false).front().resolved.found);
+  ASSERT_TRUE(WaitForKey(registry, "hot", key));
+  ASSERT_TRUE(registry->Get("cold")->Contains(key));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+}
+
+std::shared_ptr<const LogicalTierGraph> CopyPromotingHotCold(BackendRegistry* registry) {
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+  tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
+  tiers.back().promote_mode = PoolTransitionMode::kCopy;
+  auto compiled = LogicalTierGraph::Compile(tiers, *registry);
+  EXPECT_TRUE(compiled.ok()) << compiled.error;
+  return compiled.graph;
+}
+
+TEST(PeerPool, TierScopedEvictFreesOnlyThatMediumsCopy) {
+  constexpr uint64_t kPageSize = 64;
+  constexpr auto kShortLease = std::chrono::milliseconds(1);
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4, kShortLease);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4, kShortLease);
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(CopyPromotingHotCold(&registry)), &engine);
+  PromoteByCopy(&pool, &registry, "dual");
+
+  // SSD is the medium under pressure: its copy goes, the promoted DRAM copy
+  // stays and keeps serving reads.
+  auto evicted = pool.Evict({PoolEvictRequest{"dual", TierType::SSD}}, PoolEvictMode::kReclaim);
+  ASSERT_EQ(evicted.size(), 1u);
+  EXPECT_EQ(evicted.front().bytes_freed, 64u);
+  EXPECT_FALSE(registry.Get("cold")->Contains("dual"));
+  EXPECT_TRUE(registry.Get("hot")->Contains("dual"));
+  EXPECT_EQ(pool.PlacementBackend("dual"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("hot"))});
+}
+
+TEST(PeerPool, TierScopedEvictOfThePromotedCopyKeepsTheLowerOne) {
+  constexpr uint64_t kPageSize = 64;
+  constexpr auto kShortLease = std::chrono::milliseconds(1);
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4, kShortLease);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4, kShortLease);
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(CopyPromotingHotCold(&registry)), &engine);
+  PromoteByCopy(&pool, &registry, "dual");
+
+  // DRAM under pressure: the hot copy demotes, finds cold already holding the
+  // key, and so frees DRAM without copying anything.  The key stays readable.
+  auto evicted = pool.Evict({PoolEvictRequest{"dual", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().bytes_freed, 64u);
+  EXPECT_FALSE(registry.Get("hot")->Contains("dual"));
+  EXPECT_TRUE(registry.Get("cold")->Contains("dual"));
+  EXPECT_EQ(pool.PlacementBackend("dual"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("cold"))});
+  EXPECT_TRUE(pool.BatchResolve({"dual"}, false).front().resolved.found);
+}
+
+TEST(PeerPool, BackendScopedEvictNamesOneInstance) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("dram_b", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  // The same key on two instances of one medium: only a backend scope can tell
+  // them apart.
+  for (const char* name : {"dram_a", "dram_b"}) {
+    auto* backend = registry.Get(name);
+    auto allocated = backend->BatchAllocate({AllocateRequest{"k", 32}}).front();
+    ASSERT_TRUE(backend->BatchCommit({CommitRequest{allocated.slot_id, "k"}}).front().success);
+  }
+
+  PoolEvictRequest request;
+  request.key = "k";
+  request.backend_id = registry.BackendId(registry.Get("dram_b"));
+  auto evicted = pool.Evict({request}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().bytes_freed, 32u);
+  EXPECT_TRUE(registry.Get("dram_a")->Contains("k"));
+  EXPECT_FALSE(registry.Get("dram_b")->Contains("k"));
+}
+
+TEST(PeerPool, EvictOfACopyThatIsNotThereFreesNothing) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  auto* backend = registry.Get("dram");
+  auto allocated = backend->BatchAllocate({AllocateRequest{"k", 32}}).front();
+  ASSERT_TRUE(backend->BatchCommit({CommitRequest{allocated.slot_id, "k"}}).front().success);
+
+  // Stale master metadata: it believes the key is on SSD.  The DRAM copy is
+  // not the master's to free under an SSD budget.
+  auto evicted = pool.Evict({PoolEvictRequest{"k", TierType::SSD}}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().bytes_freed, 0u);
+  EXPECT_TRUE(backend->Contains("k"));
+}
+
+TEST(PeerPool, ReclaimDemotesOnAWatermarkTierToo) {
+  // The trigger only says whether the pool moves keys proactively.  Asked to
+  // free a copy whose tier has a downstream, the answer is the same either way:
+  // move it, do not delete data a lower tier has room for.
+  constexpr uint64_t kPageSize = 64;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  // Big enough that one key stays far under the 0.4 watermark, so the pool's
+  // own proactive offload never runs and only the explicit evict moves it.
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 16);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 16);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kWatermark), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitKey(&pool, "k");
+
+  auto evicted = pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().bytes_freed, 64u);
+  EXPECT_FALSE(registry.Get("hot")->Contains("k"));
+  EXPECT_TRUE(registry.Get("cold")->Contains("k"))
+      << "a watermark tier deleted instead of demoting";
+}
+
+TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
+  // "Free this tier" still has to free it when the tier below is full.
+  //
+  // A buffer is sized by its mapping, which rounds up to the host page, so a
+  // tier is only genuinely one page long when the page IS the host page.
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 1);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  // Fill cold's only page directly.
+  auto* cold = registry.Get("cold");
+  auto filler = cold->BatchAllocate({AllocateRequest{"filler", kPageSize}}).front();
+  ASSERT_EQ(filler.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(cold->BatchCommit({CommitRequest{filler.slot_id, "filler"}}).front().success);
+  CommitKey(&pool, "k");
+
+  auto evicted = pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().bytes_freed, 64u);
+  EXPECT_FALSE(registry.Get("hot")->Contains("k"));
+  EXPECT_FALSE(cold->Contains("k"));
+  EXPECT_TRUE(cold->Contains("filler"));
+  EXPECT_FALSE(pool.PlacementBackend("k").has_value());
+}
+
 TEST(PeerPool, WatermarkMigratesCommittedKey) {
   // Unlike the other tier tests, this one asserts on utilization, so the owned
   // buffer must be a whole number of host allocation granules: a smaller
@@ -932,6 +1090,173 @@ TEST(PeerPool, ReadPromotesWithMoveDrainsSourceAndKeepsBytes) {
                             resolved.resolved.pages[0].page_index * kPageSize,
                         payload.size()),
             payload);
+}
+
+// ---------------------------------------------------------------------------
+//  Local watermark eviction
+//
+//  The pool's own policy on a node that evicts for itself.  It runs on a
+//  background thread, so these observe rather than await; and it goes through
+//  Evict() -- the master's entry point -- so what it frees and how (demote vs
+//  drop) is the same contract the tests above pin down.
+// ---------------------------------------------------------------------------
+
+bool WaitUntil(const std::function<bool()>& done,
+               std::chrono::milliseconds budget = std::chrono::seconds(5)) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (done()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return done();
+}
+
+// A buffer is sized by its mapping, so a tier is exactly N pages long only when
+// the page is the host page.  Every key below is one page.
+constexpr uint64_t kHostPage = 4096;
+
+TEST(PeerPoolLocalEviction, DrainsAFullBackendToItsLowWatermark) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 9; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // 9 of 10 pages is the high watermark; the worker frees down to 5, and no
+  // further -- the offers carry their size, so a batch cannot overshoot.
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(dram->OwnedKeyCount(), 5u);
+  // Coldest first.
+  for (int i = 0; i < 4; ++i) EXPECT_FALSE(dram->Contains("k" + std::to_string(i))) << i;
+  for (int i = 4; i < 9; ++i) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+  EXPECT_EQ(pool.PlacementCount(), 5u);
+  const auto stats = pool.LocalEvictionStats();
+  EXPECT_GE(stats.rounds, 1u);
+  EXPECT_EQ(stats.keys, 4u);
+}
+
+TEST(PeerPoolLocalEviction, ReadsKeepAKeyWarm) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  // A lease short enough to have lapsed before the worker looks.
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  // Before any traffic, as PoolClient does: the medium keeps its order from the
+  // first commit.  8 of 10 pages stays under the high watermark.
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 8; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  // The oldest key is read, which renews its recency in the medium's order.
+  ASSERT_TRUE(pool.BatchResolve({"k0"}, false).front().resolved.found);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  CommitKey(&pool, "k8");
+
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  EXPECT_TRUE(dram->Contains("k0")) << "a just-read key was evicted ahead of colder ones";
+  EXPECT_FALSE(dram->Contains("k1"));
+}
+
+TEST(PeerPoolLocalEviction, KeysUnderAReadLeaseAreNeverOffered) {
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10);
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  std::vector<std::string> keys;
+  for (int i = 0; i < 9; ++i) {
+    keys.push_back("k" + std::to_string(i));
+    CommitKey(&pool, keys.back());
+  }
+  // Every key is being read (the default lease outlives the test).
+  for (const auto& entry : pool.BatchResolve(keys, false)) ASSERT_TRUE(entry.resolved.found);
+
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+  EXPECT_EQ(pool.RunLocalEvictionOnceForTest(), 0u);
+  EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 9u);
+  EXPECT_GE(pool.LocalEvictionStats().no_candidate, 1u);
+}
+
+TEST(PeerPoolLocalEviction, ATierWithADownstreamDemotesInsteadOfDropping) {
+  // The same call the master makes, so the same answer: a key whose tier has
+  // somewhere to go is moved there, not deleted.
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 20);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("hot")), 0.9, 0.5));
+
+  for (int i = 0; i < 9; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  auto* hot = registry.Get("hot");
+  auto* cold = registry.Get("cold");
+  ASSERT_TRUE(WaitUntil([&] { return hot->OwnedKeyCount() <= 5; }));
+  for (int i = 0; i < 4; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    EXPECT_FALSE(hot->Contains(key)) << key;
+    EXPECT_TRUE(cold->Contains(key)) << key << " was dropped, not demoted";
+    EXPECT_TRUE(pool.BatchResolve({key}, false).front().resolved.found) << key;
+  }
+}
+
+TEST(PeerPoolLocalEviction, NeverDeletesWhatAWatermarkOffloadWouldMove) {
+  // The masterless failure this replaces: the backend's own round ran inside
+  // the commit, emptied the tier below the pool's watermark check, and so
+  // deleted the cold keys the watermark offload was about to move.  Now both
+  // the offload and local eviction move them, so every key survives somewhere.
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 40);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kWatermark);
+  tiers.front().high_watermark = 0.9;
+  tiers.front().low_watermark = 0.5;
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  // Deliberately the SAME watermarks as the offload: the case that used to lose.
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("hot")), 0.9, 0.5));
+
+  std::vector<std::string> keys;
+  for (int i = 0; i < 20; ++i) {
+    keys.push_back("k" + std::to_string(i));
+    CommitKey(&pool, keys.back());
+    // Let the background workers keep up, as a real put rate would.
+    ASSERT_TRUE(WaitUntil([&] { return registry.Get("hot")->OwnedKeyCount() < 9; }));
+  }
+  for (const auto& key : keys) {
+    EXPECT_TRUE(registry.Get("hot")->Contains(key) || registry.Get("cold")->Contains(key))
+        << key << " was deleted although the cold tier had room for it";
+  }
+}
+
+TEST(PeerPoolLocalEviction, RejectsBadWatermarksAndUnknownBackends) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const uint32_t id = registry.BackendId(registry.Get("dram"));
+  EXPECT_FALSE(pool.EnableLocalEviction(id, 0.5, 0.7));  // low above high
+  EXPECT_FALSE(pool.EnableLocalEviction(id, 1.5, 0.7));  // high above 1
+  EXPECT_FALSE(pool.EnableLocalEviction(id, 0.9, 0.0));  // low not positive
+  EXPECT_FALSE(pool.EnableLocalEviction(BackendRegistry::kMaxBackends - 1, 0.9, 0.7));
+  EXPECT_TRUE(pool.EnableLocalEviction(id, 0.9, 0.7));
+}
+
+TEST(PeerPoolLocalEviction, AMediumThatKeepsNoOrderIsNeverEvicted) {
+  // MockBackend offers no candidates (the MediumBackend default).  Local
+  // eviction must leave it alone rather than guess at victims.
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "k");
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+  pool.RunLocalEvictionOnceForTest();
+  EXPECT_TRUE(registry.Get("dram")->Contains("k"));
 }
 
 }  // namespace
