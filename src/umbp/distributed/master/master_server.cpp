@@ -128,14 +128,21 @@ int EvictKeyDeadlineMs() {
 class MasterPeerStubPool : public EvictKeyDispatcher {
  public:
   void DispatchEvictKey(const std::string& node_id, const std::string& peer_address,
-                        std::vector<std::string> keys) override {
-    if (keys.empty() || peer_address.empty()) return;
+                        std::vector<EvictionVictim> victims) override {
+    if (victims.empty() || peer_address.empty()) return;
 
     auto stub = GetOrCreateStub(node_id, peer_address);
     if (stub == nullptr) return;
 
+    // keys and tiers are parallel, so a peer that predates `tiers` still reads
+    // a complete key list.
     ::umbp::EvictKeyRequest req;
-    for (auto& k : keys) req.add_keys(std::move(k));
+    req.mutable_keys()->Reserve(static_cast<int>(victims.size()));
+    req.mutable_tiers()->Reserve(static_cast<int>(victims.size()));
+    for (auto& victim : victims) {
+      req.add_keys(std::move(victim.key));
+      req.add_tiers(static_cast<::umbp::TierType>(victim.tier));
+    }
     ::umbp::EvictKeyResponse resp;
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() +

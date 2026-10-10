@@ -265,18 +265,25 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   grpc::Status EvictKey(grpc::ServerContext* /*ctx*/, const ::umbp::EvictKeyRequest* request,
                         ::umbp::EvictKeyResponse* response) override {
-    // Eviction carries no tier either.  Master drives this to reclaim capacity
-    // it measured per (node, tier), so the pool is free to demote where a tier
-    // configures on_evict offload; otherwise a key mirrored across media is
-    // dropped from ALL of them.  Either way the freed bytes are summed per key
-    // — master sizes its next eviction round off this total.
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    if (keys.empty()) return grpc::Status::OK;
-    auto evicted =
-        pool_ == nullptr ? std::vector<EvictResult>{} : pool_->Evict(keys, PoolEvictMode::kReclaim);
-    for (size_t i = 0; i < keys.size(); ++i) {
+    // Master reclaims capacity it measured per (node, tier), and names that
+    // tier per key: the pool frees exactly that medium's copy (demoting it
+    // where its tier has a downstream) and leaves any other copy alone.  An
+    // older master sends no tiers; each key is then freed from the medium that
+    // currently holds it.  bytes_freed is informational -- the master sizes its
+    // next round off the heartbeat's capacity, not off this reply.
+    const int n = request->keys_size();
+    if (n == 0) return grpc::Status::OK;
+    const bool scoped = request->tiers_size() == n;
+    std::vector<PoolEvictRequest> requests(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      requests[i].key = request->keys(i);
+      if (scoped) requests[i].tier = static_cast<TierType>(request->tiers(i));
+    }
+    auto evicted = pool_ == nullptr ? std::vector<EvictResult>{}
+                                    : pool_->Evict(requests, PoolEvictMode::kReclaim);
+    for (size_t i = 0; i < requests.size(); ++i) {
       auto* entry = response->add_evicted();
-      entry->set_key(keys[i]);
+      entry->set_key(requests[i].key);
       entry->set_bytes_freed(i < evicted.size() ? evicted[i].bytes_freed : 0);
     }
     return grpc::Status::OK;

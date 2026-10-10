@@ -139,7 +139,9 @@ void EvictionManager::RunOnce() {
 
   // Flatten the candidates and translate the per-(node, tier) byte budget into
   // the strategy's shape, then let the strategy pick victims (default LRU),
-  // grouped by node so each peer gets a single EvictKey keys[].
+  // grouped by node so each peer gets a single EvictKey.  Each victim keeps
+  // the tier it was charged to, so the peer frees exactly the copy that is
+  // over budget.
   std::vector<EvictionCandidate> candidates;
   for (auto& [bucket, rows] : candidates_by_bucket) {
     for (auto& c : rows) candidates.push_back(std::move(c));
@@ -149,15 +151,16 @@ void EvictionManager::RunOnce() {
     strategy_budget[ntk.node_id][ntk.tier] = static_cast<int64_t>(bytes);
   }
 
-  auto per_node_keys = strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
+  auto per_node_victims =
+      strategy_->SelectVictims(std::move(candidates), std::move(strategy_budget));
 
   size_t selected = 0;
-  for (const auto& [node_id, keys] : per_node_keys) selected += keys.size();
+  for (const auto& [node_id, victims] : per_node_victims) selected += victims.size();
 
   if (selected == 0) return;
 
   MORI_UMBP_INFO("[EvictionManager] Selected {} victims across {} nodes", selected,
-                 per_node_keys.size());
+                 per_node_victims.size());
 
   // Look up peer addresses once per dispatch round.  ClientRegistry
   // owns the (node_id -> peer_address) mapping; we can't ship an
@@ -165,16 +168,16 @@ void EvictionManager::RunOnce() {
   std::unordered_map<std::string, std::string> node_to_peer;
   for (const auto& client : clients) node_to_peer[client.node_id] = client.peer_address;
 
-  for (auto& [node_id, keys] : per_node_keys) {
+  for (auto& [node_id, victims] : per_node_victims) {
     auto it = node_to_peer.find(node_id);
     if (it == node_to_peer.end() || it->second.empty()) {
       MORI_UMBP_WARN("[EvictionManager] no peer_address for node={} — skipping {} keys", node_id,
-                     keys.size());
+                     victims.size());
       continue;
     }
     if (dispatcher_ == nullptr) {
       MORI_UMBP_DEBUG("[EvictionManager] dispatcher unset; would EvictKey on node={} ({} keys)",
-                      node_id, keys.size());
+                      node_id, victims.size());
       continue;
     }
     // Chunked to the shared gRPC message limit.  An eviction round frees a
@@ -189,19 +192,26 @@ void EvictionManager::RunOnce() {
     // next heartbeat are what shrink the index), and a chunk that fails is
     // retried next round.  So N chunks reach the same state as one message
     // would have, and a partial round still makes progress.
+    //
+    // Sized on the keys alone: the parallel tier field is a packed enum of one
+    // byte per key, inside the per-item overhead GrpcMaxItemsPerBatch already
+    // reserves.
+    std::vector<std::string> keys;
+    keys.reserve(victims.size());
+    for (const auto& victim : victims) keys.push_back(victim.key);
     size_t sent = 0;
     size_t chunks = 0;
-    while (sent < keys.size()) {
+    while (sent < victims.size()) {
       const size_t take = GrpcMaxItemsPerBatch(keys, sent);
-      std::vector<std::string> chunk(std::make_move_iterator(keys.begin() + sent),
-                                     std::make_move_iterator(keys.begin() + sent + take));
+      std::vector<EvictionVictim> chunk(std::make_move_iterator(victims.begin() + sent),
+                                        std::make_move_iterator(victims.begin() + sent + take));
       sent += take;
       ++chunks;
       dispatcher_->DispatchEvictKey(node_id, it->second, std::move(chunk));
     }
     if (chunks > 1) {
       MORI_UMBP_DEBUG("[EvictionManager] node={} {} keys dispatched in {} chunks", node_id,
-                      keys.size(), chunks);
+                      victims.size(), chunks);
     }
   }
 }

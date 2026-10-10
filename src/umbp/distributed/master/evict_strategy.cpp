@@ -26,7 +26,7 @@
 
 namespace mori::umbp {
 
-std::unordered_map<std::string, std::vector<std::string>> LruMasterEvictStrategy::SelectVictims(
+std::unordered_map<std::string, std::vector<EvictionVictim>> LruMasterEvictStrategy::SelectVictims(
     std::vector<EvictionCandidate> candidates,
     std::unordered_map<std::string, std::map<TierType, int64_t>> bytes_to_free) {
   // Oldest-access first (LRU); no tiebreak (peers don't ship depth in KvEvent).
@@ -36,16 +36,17 @@ std::unordered_map<std::string, std::vector<std::string>> LruMasterEvictStrategy
             });
 
   // Walk oldest-first, taking a candidate while its (node, tier) has budget
-  // left.  Group by node so each peer gets a single EvictKey keys[].
-  std::unordered_map<std::string, std::vector<std::string>> per_node_keys;
+  // left.  Group by node so each peer gets a single EvictKey.  The victim keeps
+  // the tier it was charged to: that is the medium the peer must free.
+  std::unordered_map<std::string, std::vector<EvictionVictim>> per_node_victims;
   for (const auto& c : candidates) {
     auto& tier_budget = bytes_to_free[c.location.node_id];
     auto it = tier_budget.find(c.location.tier);
     if (it == tier_budget.end() || it->second <= 0) continue;
-    per_node_keys[c.location.node_id].push_back(c.key);
+    per_node_victims[c.location.node_id].push_back(EvictionVictim{c.key, c.location.tier});
     it->second -= static_cast<int64_t>(c.size);
   }
-  return per_node_keys;
+  return per_node_victims;
 }
 
 }  // namespace mori::umbp

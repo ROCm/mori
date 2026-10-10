@@ -75,14 +75,29 @@ struct PoolResolvedEntry {
 // differently, so the caller has to say which one it means instead of leaving
 // it to the tier configuration.
 enum class PoolEvictMode {
-  // Free bytes on the tier that holds the key. Where a tier configures
-  // on_evict offload the key is demoted, not dropped: the master budgets per
-  // (node, tier), so moving the bytes downstream does relieve the pressure it
-  // measured, and the data stays reachable.
+  // Free the bytes of ONE copy of the key: the one the request names (see
+  // PoolEvictRequest). Where that copy's logical tier has an offload target the
+  // key is demoted, not dropped -- the pressure being relieved is on the named
+  // medium, so moving the bytes downstream relieves it and the data stays
+  // reachable. Any other copy of the key is left alone.
   kReclaim,
   // Drop the key from every backend on the peer regardless of tier
-  // configuration, for when the value itself must stop existing.
+  // configuration or scope, for when the value itself must stop existing.
   kDiscard,
+};
+
+// One key to evict, and which of its copies.  A key can live on several media
+// at once (a copy-mode promotion leaves the lower copy behind), so "evict this
+// key" is ambiguous: the request says which medium is under pressure.
+struct PoolEvictRequest {
+  std::string key;
+  // The medium to free the key from -- the tier a master charged it to.
+  // UNKNOWN means the medium that currently holds the key's placement, which
+  // is how a request with no tier (an older master) is read.
+  TierType tier = TierType::UNKNOWN;
+  // One specific backend instead of a medium.  Local watermark eviction knows
+  // exactly which backend is over its watermark.  Takes precedence over tier.
+  uint32_t backend_id = BackendRegistry::kMaxBackends;
 };
 
 // The implicit peer-local default Pool. It owns logical key placement and
@@ -107,6 +122,13 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // The one routing entry point for eviction.  Every policy calls this -- the
+  // master's EvictKey RPC and this pool's own local watermark eviction alike --
+  // and every byte it frees is freed by the medium's MediumBackend::Evict,
+  // directly or as the last step of a demotion.  One result per request, in
+  // request order; bytes_freed is what the named copy released.
+  std::vector<EvictResult> Evict(const std::vector<PoolEvictRequest>& requests, PoolEvictMode mode);
+  // Every key unscoped: freed from the medium that currently holds it.
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
   void ClearLocal();
   std::vector<KvEvent> DrainPendingEvents();
@@ -156,6 +178,13 @@ class PeerPool {
   // is process-local and can be stale or empty (after a restart, or once
   // another path evicted the key), so the backends are the authority.
   uint32_t FindOwnerLocked(const std::string& key) const;
+  // The backend holding the copy an eviction request names, or kMaxBackends
+  // when there is no such copy (see PoolEvictRequest for how scope resolves).
+  uint32_t EvictSourceLocked(const PoolEvictRequest& request) const;
+  // After copies of `key` were dropped: point the placement at a copy that is
+  // still there, or forget the key if none is. Re-checks the backends rather
+  // than trusting what was dropped, because drops run without the pool lock.
+  void RepairAfterDropLocked(const std::string& key);
   // Queues at most `max_count` offload candidates for one tier, oldest first,
   // and reports how many it queued. Bounded on purpose: a peer can hold
   // millions of placements, so neither the scan nor the queue may be
