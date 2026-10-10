@@ -5,9 +5,9 @@ name: ci-rerun
 #
 # This re-runs the PR's latest ci.yml and ci_cco.yml runs, the same as their
 # "Re-run all jobs" button, so the results stay in the PR checks. On a re-run
-# those workflows merge the current main into the checkout (see
-# .github/scripts/merge_current_main.sh). GITHUB_TOKEN can re-run workflows,
-# so no personal token is involved.
+# those workflows check out refs/pull/N/merge, i.e. the PR merged with the
+# current main. GITHUB_TOKEN can re-run workflows, so no personal token is
+# involved.
 on:
   issue_comment:
     types: [created]
