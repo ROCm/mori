@@ -262,7 +262,6 @@ struct EpCfg {
   // cco window. Off, every block holding tokens for a destination makes its own RMW.
   // Off is free for the same reason as scaleBytes.
   bool aggReserve = false;
-  bool metaPair = false;
 };
 
 template <typename Self, typename Visit>
@@ -284,11 +283,10 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(aggReserve);
-  MORI_FIELD(metaPair);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 17, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 16, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};

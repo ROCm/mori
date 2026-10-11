@@ -1288,22 +1288,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
-            pair_tok = self._meta_pair_tokens(
-                plan.info, cfg.max_num_inp_token_per_rank
-            )
-            pair = None
-            if pair_tok:
-                pair = cb.EpDispatchPlan(
-                    **common,
-                    **disp_cfg,
-                    block_num=b,
-                    warp_per_block=w,
-                    tok_off_ext=ext,
-                    meta_pair=1,
-                )
-                pair.bind(rank=cfg.rank)
-                self._plans.append(pair)
-            dispatch[(b, w)] = self._wrap_dispatch(plan, pair, pair_tok)
+            dispatch[(b, w)] = self._wrap_dispatch(plan)
         for b, w in self._combine_specs:
             plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
@@ -1324,24 +1309,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
             ),
         )
-
-    @staticmethod
-    def _meta_pair_tokens(info, cap):
-        npes, w, b = info["worldSize"], info["warpPerBlock"], info["blockNum"]
-        wave, topk, chunk = info["waveSize"], info["numExpertPerToken"], 8
-        if not (chunk < w and w - chunk < npes and npes <= w):
-            return frozenset()
-        tpi = wave // topk if 0 < topk <= wave and wave % topk == 0 else 1
-        out = set()
-        for n in range(1, min(cap, b * chunk * tpi) + 1):
-            q = -(-n // (b * w))
-            units = -(-n // (q if 1 < tpi and q < tpi else tpi))
-            if units > b * chunk:
-                continue
-            mw = w - min(max(-(-units // b), 1), chunk)
-            if any(r + mw <= npes - 1 < r + 2 * mw for r in range(mw)):
-                out.add(n)
-        return frozenset(out)
 
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
@@ -1464,9 +1431,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 
-    def _wrap_dispatch(self, plan, pair=None, pair_tok=frozenset()):
+    def _wrap_dispatch(self, plan):
         def run(*, input, indices, weights, scales, dest_map, num_tokens):
-            (pair if num_tokens in pair_tok else plan).launch(
+            plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 token_indices=indices,
                 inp_token_buf=input,

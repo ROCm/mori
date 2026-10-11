@@ -1177,12 +1177,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           : _metaPlain ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
                        : warpId;
       bool _bx = false;
-      if constexpr (kMetaLo && kCfg.metaPair) {
+      if constexpr (kMetaLo) {
         const int _r0b = __builtin_amdgcn_readfirstlane(_run0);
         if (_metaHi && _r0b + _metaWarps < nRuns) {
           const int subB = (mtileBytesM / 2) & ~127;
           const int capR = (subB - 128 * kMetaFields) / perTokM;
-          int pA = 0, pB = 0, cA = 0, cB = 0, nB = 0;
+          // (row count << 8) | rank of the first two runs this warp holds; 0 = none.
+          int rA = 0, rB = 0;
           index_t abA = 0, abB = 0;
           bool ok = capR > 0;
           for (int r = _r0b; ok && r < nRuns; r += _metaWarps) {
@@ -1196,15 +1197,15 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             const index_t myCnt = q + ((part < rm) ? 1 : 0);
             if (myCnt <= 0) continue;
             const index_t ab = s_base[peer] + myBeg;
-            if (nB == 2 || myCnt > capR || ab + myCnt > recvCapM || ab + myCnt > _stgCapM) {
+            if (rB != 0 || myCnt > capR || ab + myCnt > recvCapM || ab + myCnt > _stgCapM) {
               ok = false;
-            } else if (nB == 0) {
-              pA = peer, cA = (int)myCnt, abA = ab, nB = 1;
+            } else if (rA == 0) {
+              rA = ((int)myCnt << 8) | peer, abA = ab;
             } else {
-              pB = peer, cB = (int)myCnt, abB = ab, nB = 2;
+              rB = ((int)myCnt << 8) | peer, abB = ab;
             }
           }
-          if (ok && nB == 2) {
+          if (ok && rB != 0) {
             _bx = true;
             char* const wB = EpWinBase(win);
             const uint64_t wS = EpWinStride4G(win);
@@ -1212,11 +1213,14 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
               __builtin_amdgcn_s_wait_tensorcnt(0);
               _mPend = false;
             }
+#pragma unroll 1
             for (int ph = 0; ph < 2; ++ph) {
               if (ph == 1) __builtin_amdgcn_s_wait_tensorcnt(0);
+#pragma unroll 1
               for (int k = 0; k < 2; ++k) {
-                const int peer = k ? pB : pA;
-                const int cc = k ? cB : cA;
+                const int rk = k ? rB : rA;
+                const int peer = rk & 0xff;
+                const int cc = rk >> 8;
                 const index_t ab = k ? abB : abA;
                 const int nIdxB = cc * tkM, nWtB = cc * tkM;
                 char* const pb = wB + (((uint64_t)peer * wS) << 32);
@@ -1286,7 +1290,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           }
         }
       }
-      if (!(kMetaLo && kCfg.metaPair) || !_bx)
+      if (!kMetaLo || !_bx)
       for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);

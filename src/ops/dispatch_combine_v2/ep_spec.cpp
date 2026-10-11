@@ -25,7 +25,6 @@
 
 #include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -34,19 +33,6 @@
 namespace mori {
 namespace ops {
 namespace v2 {
-
-namespace {
-
-int EnvInt(const char* name, int current) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return current;
-  char* end = nullptr;
-  long parsed = std::strtol(v, &end, 10);
-  if (end == v || parsed <= 0) return current;
-  return static_cast<int>(parsed);
-}
-
-}  // namespace
 
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind) {
   EpCfg c;
@@ -83,22 +69,14 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // sooner; 64x8 measured best for combine at every token count and topk on
   // mi355x, so it replaces v1's 80x4.
   const bool isDispatch = kind == EpKernelKind::Dispatch;
-  // Only the gfx125x dispatch body implements these; everywhere else the Cfg, and so
-  // the rendered source and its cache key, stays exactly what it was without them.
-  const bool is1250Dispatch = isDispatch && arch.rfind("gfx125", 0) == 0;
-  c.aggReserve = is1250Dispatch && !req.tokOffExt;
-  c.metaPair = is1250Dispatch && req.metaPair;
+  // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
+  // the rendered source and its cache key, stays exactly what it was without it.
+  c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
-
-  // Overrides. The ONLY place the environment is read.
-  const char* blkVar = isDispatch ? "MORI_V2_EP_DISP_BLOCKS" : "MORI_V2_EP_COMB_BLOCKS";
-  const char* wrpVar = isDispatch ? "MORI_V2_EP_DISP_WARPS" : "MORI_V2_EP_COMB_WARPS";
-  c.blockNum = EnvInt(blkVar, c.blockNum);
-  c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and
@@ -153,7 +131,6 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   s += "_h" + std::to_string(cfg.hiddenDim);
   s += "_k" + std::to_string(cfg.numExpertPerToken);
   s += '_' + std::to_string(cfg.blockNum) + 'x' + std::to_string(cfg.warpPerBlock);
-  if (cfg.metaPair) s += "_mp";
   return s;
 }
 

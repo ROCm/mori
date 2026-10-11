@@ -286,17 +286,6 @@ def test_per_block_reservation_follows_the_slot_word():
     p.close()
 
 
-def test_meta_pair_does_not_depend_on_the_reservation():
-    a = _plan(meta_pair=1)
-    b = _plan(tok_off_ext=1, meta_pair=1)
-    on = a.info.get("metaPair"), b.info.get("metaPair")
-    a.close()
-    b.close()
-    if not on[0]:
-        pytest.skip("metaPair resolves on for the gfx125x dispatch only")
-    assert on[1]
-
-
 def test_agg_reserve_state_size_matches_the_device_layout():
     # EpResStateBytes (ep_cfg.hpp): a 128 B line for the call number, a 4 B count
     # per rank rounded up to a line, then a 64 B published word per rank.
