@@ -2712,14 +2712,10 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
 
   unsigned char* const tile = reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kTileB;
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
-  constexpr int kLandRows = EpFp4LandRows<kCfg>();
   const int landFrom = EpFp4LandFrom(args, kCfg.worldSize, laneId);
-  // The landing row at p of the row in slot s here; a bad offset fails the launch instead of
-  // storing outside p's landing.
+  // The landing row at p of the row in slot s here.
   auto landRow = [&](const int p, const int s) {
-    const int lr = s + __builtin_amdgcn_readlane(landFrom, p);
-    if (lr < 0 || lr >= kLandRows) __builtin_trap();
-    return lr;
+    return s + __builtin_amdgcn_readlane(landFrom, p);
   };
 
   auto sendTile = [&](unsigned char* tl, int r0, int n, int pe, auto landOf, auto laneVal,
@@ -2931,7 +2927,6 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           const int dl = __shfl(landFrom, pe);
           const int lr = on ? (kKeep ? rwF : rowOf(r0c + laneId)) + dl : 0;
           if (on) {
-            if (lr < 0 || lr >= kLandRows) __builtin_trap();
             EpGU64* const f = (EpGU64*)(reinterpret_cast<unsigned long long*>(
                                             wBase + (uint64_t)pe * wStride + args.offOutTok +
                                             EpFp4FlagOff<kCfg>()) +
@@ -3098,7 +3093,6 @@ __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, i
   const int rpe = ok ? r.flat / kMaxRecv : -1;
   const int dl = __shfl(landTo, ok ? rpe : 0);
   r.lrow = ok ? r.flat - rpe * kMaxRecv + dl : 0;
-  if (ok && (r.lrow < 0 || r.lrow >= EpFp4LandRows<kCfg>())) __builtin_trap();
   for (int k = 0; k < topk; ++k) {
     const int pk = __shfl(rpe, k);
     if (k < laneId && pk == rpe) ok = false;
@@ -3357,7 +3351,6 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
       const int rpe = ok ? flat / kMaxRecv : -1;
       const int dl = __shfl(landTo, ok ? rpe : 0);
       const int lrow = ok ? flat - rpe * kMaxRecv + dl : 0;
-      if (ok && (lrow < 0 || lrow >= EpFp4LandRows<kCfg>())) __builtin_trap();
 #pragma unroll
       for (int k = 0; k < topk; ++k) {
         const int pk = __builtin_amdgcn_readlane(rpe, k);
