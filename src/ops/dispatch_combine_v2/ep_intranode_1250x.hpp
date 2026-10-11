@@ -440,8 +440,8 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr int kMetaSlabBytes = EpDispatch1250xMetaSlabBytes(kCfg);
   constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
   constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
-  constexpr bool kDPin = kFp4Pack4 && kMetaSlabBytes == 0 && npes == 16 &&
-                         kCfg.warpPerBlock == npes && kCfg.blockNum == 128 && kCfg.aggReserve &&
+  constexpr bool kDPin = kFp4Pack4 && kMetaSlabBytes == 0 && (npes == 16 || npes == 32) &&
+                         kCfg.warpPerBlock == 16 && kCfg.blockNum == 128 && kCfg.aggReserve &&
                          kEpScaleBytes > 0 && kEpScaleBytes % 8 == 0 && kEpScaleStride == 8 * WS;
   // The payload pass splits each destination's run across warp units instead of
   // walking the token map.
