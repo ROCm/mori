@@ -71,6 +71,9 @@ def _default_backend() -> str:
 
 
 _FP4_QUANT_TYPES = ("fp4_blockwise", "fp4_blockwise_fp32")
+# The quant types the hip backend runs as its gfx125x push combine: the sender
+# quantizes into the destination's landing rows and the destination reduces them.
+_PUSH_QUANT_TYPES = _FP4_QUANT_TYPES + ("fp8_blockwise",)
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise") + _FP4_QUANT_TYPES
 
 _INTERNODE_KERNELS = ("auto", "v2", "v2_ll")
@@ -257,15 +260,16 @@ class EpDispatchCombineConfig:
             # dispatch output (disp_out, dispatch dtype) and combine staging
             # (out_tok, combine dtype) are separate buffers. gather/non-quant/
             # non-StdMoE only (the asymmetric path is implemented for gather).
-            fp4 = self.quant_type in _FP4_QUANT_TYPES
+            push = self.quant_type in _PUSH_QUANT_TYPES
             if (
-                (self.combine_mode != "gather" and not fp4)
-                or (self.quant_type != "none" and not fp4)
+                (self.combine_mode != "gather" and not push)
+                or (self.quant_type != "none" and not push)
                 or self.enable_std_moe
             ):
                 raise ValueError(
                     "combine_data_type (asymmetric dtype) requires combine_mode=gather, "
-                    "quant_type=none (or an fp4 type), enable_std_moe=False"
+                    f"quant_type=none (or one of {_PUSH_QUANT_TYPES}), "
+                    "enable_std_moe=False"
                 )
             # fp4 dispatch + bf16 combine (the SGLang/aiter fp4-asym path) is
             # supported; fp4 on the combine side is not.
@@ -1050,10 +1054,11 @@ class EpDispatchCombineOp:
         tokoff_ext = getattr(self, "_tokoff_ext", None)
         if tokoff_ext is not None:
             tokoff_ext.zero()
-        # So does selfFirst its per-call state (ep_plans.SelfFirstState).
-        self_first = getattr(self, "_self_first_state", None)
-        if self_first is not None:
-            self_first.zero()
+        # So do the dispatch plans their reservation state (ep_plans.EpDispatchPlan).
+        for plan in getattr(self, "_plans", ()):
+            zero_state = getattr(plan, "zero_state", None)
+            if zero_state is not None:
+                zero_state()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()
