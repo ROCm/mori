@@ -127,7 +127,7 @@ struct EpDispatchCombineRoutingPtrs {
 
 #define MAX_EXPERTS_PER_TOKEN (9)
 struct EpDispatchCombineConfig {
-  constexpr static size_t kPackedI32Len = 19;
+  constexpr static size_t kPackedI32Len = 20;
 
   int rank{0};
   int worldSize{0};
@@ -150,6 +150,14 @@ struct EpDispatchCombineConfig {
   int numQpPerPe{1};
   QuantType quantType{QuantType::None};
   bool enableSdma{false};
+
+  // AsyncLL: issue the recv-token-count signal on the same QP as the data put
+  // (SendTransfer) instead of after a local CQE drain (RecvTransfer). The drain
+  // waits for the responder's ACK -- a full network RTT -- while same-QP RC
+  // message ordering gives the same data-before-signal guarantee for free.
+  // RDMA peers only; SDMA/P2P keep the quiet-then-signal path (their signal
+  // travels on a different hardware unit than their payload). Off by default.
+  bool fuseSignalOnSendQp{false};
 
   inline __host__ __device__ int MaxNumTokensToSendPerRank() const { return maxNumInpTokenPerRank; }
 
