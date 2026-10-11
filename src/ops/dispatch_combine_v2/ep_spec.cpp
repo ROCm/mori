@@ -77,9 +77,11 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // sooner; 64x8 measured best for combine at every token count and topk on
   // mi355x, so it replaces v1's 80x4.
   const bool isDispatch = kind == EpKernelKind::Dispatch;
-  // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
-  // the rendered source and its cache key, stays exactly what it was without it.
-  c.selfFirst = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
+  // Only the gfx125x dispatch body implements these; everywhere else the Cfg, and so
+  // the rendered source and its cache key, stays exactly what it was without them.
+  const bool is1250Dispatch = isDispatch && arch.rfind("gfx125", 0) == 0;
+  c.aggReserve = is1250Dispatch && !req.tokOffExt;
+  c.metaPair = is1250Dispatch && req.metaPair;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
@@ -107,10 +109,10 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
-        " blocks=" + std::to_string(c.blockNum) + " selfFirst=" + std::to_string(c.selfFirst) +
+        " blocks=" + std::to_string(c.blockNum) + " aggReserve=" + std::to_string(c.aggReserve) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
         "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
-        "selfFirst needs warpPerBlock >= 2, worldSize <= waveSize and blocks < 4096");
+        "aggReserve needs worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }
@@ -145,6 +147,7 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   s += "_h" + std::to_string(cfg.hiddenDim);
   s += "_k" + std::to_string(cfg.numExpertPerToken);
   s += '_' + std::to_string(cfg.blockNum) + 'x' + std::to_string(cfg.warpPerBlock);
+  if (cfg.metaPair) s += "_mp";
   return s;
 }
 

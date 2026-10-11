@@ -338,11 +338,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             self._close_backend()
             self.arena.close()
             raise
-        # _build zeroes this rank's arena and selfFirst state, and a peer's first
-        # call already writes into both (its selfFirst count lands in this rank's
-        # inbox). A zero that runs after that write wipes it, and this rank's first
-        # dispatch then waits forever for the count. Every rank finishes its zeroes
-        # before any rank can make a call.
+        # _build zeroes this rank's arena, and a peer's first call already writes
+        # into it (its signal lands in this rank's recv-count slot). A zero that runs
+        # after that write wipes it, and this rank's first dispatch then waits forever
+        # for the signal. Every rank finishes its zeroes before any rank can make a
+        # call.
         torch.cuda.synchronize(dev)
         comm.barrier()
 
@@ -361,8 +361,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
-        # Decided before the kernels are built: the dispatch plans run selfFirst only
-        # while the slot allocator word lives in the cco window (see TokOffExt below).
+        # Decided before the kernels are built: how the dispatch plans reserve slots
+        # follows where the slot allocator word lives (see TokOffExt below).
         self._tokoff_wanted = (
             not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
         )
@@ -1256,6 +1256,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
         self._plans = []
+        # The RMWs on one slot word serialize in the cco window, so there a rank's
+        # blocks add up their tokens and reserve once per destination; in TokOffExt's
+        # allocation every block reserves its own.
         ext = int(getattr(self, "_tokoff_wanted", False))
         for b, w in self._dispatch_specs:
             plan = cb.EpDispatchPlan(
@@ -1263,9 +1266,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
-            dispatch[(b, w)] = self._wrap_dispatch(plan)
-        # Outside the arena, so reset() has to zero it itself.
-        self._self_first_state = cb.SelfFirstState.of(arena)
+            pair_tok = self._meta_pair_tokens(
+                plan.info, cfg.max_num_inp_token_per_rank
+            )
+            pair = None
+            if pair_tok:
+                pair = cb.EpDispatchPlan(
+                    **common,
+                    **disp_cfg,
+                    block_num=b,
+                    warp_per_block=w,
+                    tok_off_ext=ext,
+                    meta_pair=1,
+                )
+                pair.bind(rank=cfg.rank)
+                self._plans.append(pair)
+            dispatch[(b, w)] = self._wrap_dispatch(plan, pair, pair_tok)
         for b, w in self._combine_specs:
             plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
@@ -1287,9 +1303,25 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    @staticmethod
+    def _meta_pair_tokens(info, cap):
+        npes, w, b = info["worldSize"], info["warpPerBlock"], info["blockNum"]
+        wave, topk, chunk = info["waveSize"], info["numExpertPerToken"], 8
+        if not (chunk < w and w - chunk < npes and npes <= w):
+            return frozenset()
+        tpi = wave // topk if 0 < topk <= wave and wave % topk == 0 else 1
+        out = set()
+        for n in range(1, min(cap, b * chunk * tpi) + 1):
+            q = -(-n // (b * w))
+            units = -(-n // (q if 1 < tpi and q < tpi else tpi))
+            if units > b * chunk:
+                continue
+            mw = w - min(max(-(-units // b), 1), chunk)
+            if any(r + mw <= npes - 1 < r + 2 * mw for r in range(mw)):
+                out.add(n)
+        return frozenset(out)
+
     def _close_backend(self):
-        # The plans hold the references; the last one to close frees it.
-        self._self_first_state = None
         for plan in getattr(self, "_plans", ()):
             plan.close()
         ext = getattr(self, "_tokoff_ext", None)
@@ -1410,9 +1442,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 
-    def _wrap_dispatch(self, plan):
+    def _wrap_dispatch(self, plan, pair=None, pair_tok=frozenset()):
         def run(*, input, indices, weights, scales, dest_map, num_tokens):
-            plan.launch(
+            (pair if num_tokens in pair_tok else plan).launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 token_indices=indices,
                 inp_token_buf=input,
