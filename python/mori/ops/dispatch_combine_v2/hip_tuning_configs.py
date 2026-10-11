@@ -158,6 +158,15 @@ _DISPATCH_TABLE: dict = {
                 (None, 128, 16),
             ),
         },
+        # EP16 on four 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11. 128x16 is the only geometry
+        # that builds the pinned-destination dispatch (kDPin in ep_intranode_1250x.hpp). 128x16
+        # minus 64x16, dispatch us, graph, one M=16384 plan, 3 alternating rounds: 1024 tokens a
+        # rank -11.0..-11.8, 2048 +2.2..+3.3, 3072 -6.0..-6.8, 8192 -14.7..-15.3, 16384
+        # -80.9..-83.3. 2048 is the only point 64x16 wins; the edge between them is unswept.
+        (16, 7168, 6, None): {
+            None: ((None, 64, 16),),
+            "fp4_disp_bf16_comb": ((4095, 64, 16), (None, 128, 16)),
+        },
     },
 }
 
@@ -177,8 +186,9 @@ _COMBINE_TABLE: dict = {
         (4, 7168, 8, None): ((None, 64, 8),),
         (4, 7168, 6, None): ((None, 64, 8),),
         (4, 7168, 9, None): ((None, 64, 8),),
-        # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
+        # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
+        (16, 7168, 6, None): ((None, 64, 8),),
     },
 }
 
