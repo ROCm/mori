@@ -220,10 +220,18 @@ _COMBINE_PUSH_TABLE: dict = {
     },
     "fp8_blockwise": {
         "gfx1250": {
+            # 128x16 is ahead of 64x16 from 512 to 1536 tokens a rank (-3.6, -7.0, -14.6 at topk 6).
+            # It stays ahead of 128x24 through 2048 at topk 6 (-3.5) but only through 1792 at topk 9
+            # (-3.2); at 2048 topk 9 128x24 is ahead by 1.8.
             (4, 7168, 6, None): (
                 (256, 64, 8),
-                (2047, 64, 16),
-                (2048, 64, 24),
+                (2048, 128, 16),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+            (4, 7168, 9, None): (
+                (256, 64, 8),
+                (2047, 128, 16),
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
