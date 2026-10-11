@@ -282,6 +282,16 @@ __device__ __forceinline__ unsigned* EpResSeq(const EpArgs& args) { return args.
 __device__ __forceinline__ unsigned* EpResCnt(const EpArgs& args, int dst) {
   return EpResAt<unsigned>(args, EpResCntOff) + dst;
 }
+// The tail of the call-number line, past the call number: the kDPin barrier's arrival count and
+// release flag at kEpPinCtrOff and kEpPinCtrOff + 4, then the rows of the fp4 combine landing this
+// call has handed out so far, where the last block of each destination takes its rows.
+constexpr unsigned long long kEpPinCtrOff = 64;
+constexpr unsigned long long EpResLandOff = kEpPinCtrOff + 8;
+static_assert(EpResLandOff + 4 <= EpResCntOff,
+              "the landing counter shares the call-number line, past the call number");
+__device__ __forceinline__ unsigned* EpResLand(const EpArgs& args) {
+  return EpResAt<unsigned>(args, EpResLandOff);
+}
 template <int kWorldSize>
 __device__ __forceinline__ unsigned long long* EpResPub(const EpArgs& args, int dst) {
   return EpResAt<unsigned long long>(args,
@@ -337,7 +347,6 @@ __device__ __forceinline__ int EpTokBlocks(bool chunked, int numTokens, int etpi
   return (n < (int)gridDim.x) ? n : (int)gridDim.x;
 }
 
-constexpr unsigned long long kEpPinCtrOff = 64;
 template <int kN>
 __device__ unsigned _dpClaim[64];
 // The window's base, stride and LSA rank read once, with scalar loads, so every peer address is
@@ -710,6 +719,17 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // every thread runs it, and an atomic load would queue the whole grid on one
   // address; the previous call's store is visible across the kernel boundary.
   [[maybe_unused]] unsigned resSeq = 0;
+  [[maybe_unused]] bool landStored = false;
+  // The fp4 combine returns this rank's tot rows at p into one run of this rank's landing, taken
+  // with the reservation at base: a row at slot s of p lands at s + dl, which p and this rank
+  // both keep.
+  [[maybe_unused]] auto takeLanding = [&](int p, index_t tot, index_t base) {
+    const index_t dl = (index_t)atomicAdd(EpResLand(args), (unsigned)tot) - base;
+    __hip_atomic_store(EpPeer<index_t>(win, p, args.offRecvNum) + npes + args.rank, dl,
+                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    args.destPeTokenCounter[npes + p] = dl;
+    landStored = true;
+  };
   if constexpr (kCfg.aggReserve) {
     resSeq = *EpResSeq(args) + 1u;
     // In each block holding tokens lane p of warp 0 adds the block's count for destination p,
@@ -749,6 +769,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           base = __hip_atomic_fetch_add(EpTokOff(args, p), tot, R, __HIP_MEMORY_SCOPE_SYSTEM);
         __hip_atomic_store(cnt, 0u, R, A);
         __hip_atomic_store(pub, ((unsigned long long)resSeq << 32) | (unsigned)base, R, A);
+        if (tot > 0) takeLanding(p, tot, base);
       }
       // The blocks holding tokens wait here for the last of them, so they must all be
       // resident at once.
@@ -795,9 +816,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   __syncthreads();
-  if (_ls && warpId == 0 && _lsLast && _lsTot > 0)
+  if (_ls && warpId == 0 && _lsLast && _lsTot > 0) {
     _lsBase = __hip_atomic_fetch_add(EpTokOff(args, (int)laneId), _lsTot, __ATOMIC_RELAXED,
                                      __HIP_MEMORY_SCOPE_SYSTEM);
+    takeLanding((int)laneId, _lsTot, _lsBase);
+  }
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
   if (args.tokenIndices && args.inpTokenBuf && _rowOk && _mrg) {
 #pragma unroll
@@ -2099,6 +2122,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // (destPeTokenCounter is a complete sum) and the drain observed.
   constexpr unsigned kNoTicket = ~0u;
   unsigned arriveTicket = 0;
+  if constexpr (kCfg.aggReserve) {
+    // The landing offsets went to the peers as plain stores, which the signal must not overtake.
+    if (warpId == 0 && __ballot(landStored))
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
   if (thdId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
   index_t* recvTokenNums = EpLocal<index_t>(win, args.offRecvNum);
   if (warpId == 0) arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
@@ -2125,7 +2153,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // published bases, so this is the one store of it. The published words need no
     // reset: the next call waits for its own number in them.
     if constexpr (kCfg.aggReserve) {
-      if (laneId == 0) *EpResSeq(args) = resSeq;
+      if (laneId == 0) {
+        *EpResSeq(args) = resSeq;
+        *EpResLand(args) = 0;
+      }
     }
 
     for (int destPe = laneId; destPe < npes; destPe += WS) {
@@ -2361,10 +2392,27 @@ constexpr bool EpFp4Ovl() {
          (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
                               : (kCfg.worldSize >= 4 && kCfg.warpPerBlock == 24));
 }
+// A token lands one row per distinct destination rank of its top-k experts.
+template <EpCfg kCfg>
+constexpr int EpFp4Rows() {
+  return kCfg.worldSize < kCfg.numExpertPerToken ? kCfg.worldSize : kCfg.numExpertPerToken;
+}
+// The landing holds every row this rank's tokens get back: the rows from one destination are one
+// run, at the offset the dispatch reservation took (EpResLand), so the runs tile at most this many.
+template <EpCfg kCfg>
+constexpr int EpFp4LandRows() {
+  return kCfg.maxTokPerRank * EpFp4Rows<kCfg>();
+}
 template <EpCfg kCfg>
 constexpr size_t EpFp4FlagOff() {
-  return EpFp4Wire<kCfg>::kLandOff +
-         (size_t)kCfg.worldSize * EpMaxRecv(kCfg) * EpFp4Wire<kCfg>::kWireB;
+  return EpFp4Wire<kCfg>::kLandOff + (size_t)EpFp4LandRows<kCfg>() * EpFp4Wire<kCfg>::kWireB;
+}
+// Per lane d < worldSize: the landing offset of the rows from d (sender) or to d (receiver).
+__device__ __forceinline__ int EpFp4LandFrom(const EpArgs& args, int npes, int laneId) {
+  return laneId < npes ? EpLocal<index_t>(args.window, args.offRecvNum)[npes + laneId] : 0;
+}
+__device__ __forceinline__ int EpFp4LandTo(const EpArgs& args, int npes, int laneId) {
+  return laneId < npes ? args.destPeTokenCounter[npes + laneId] : 0;
 }
 constexpr int EpFp4PermMax = 2048;
 template <EpCfg kCfg>
@@ -2373,15 +2421,9 @@ constexpr size_t EpFp4PendOff() {
 }
 typedef __attribute__((address_space(1))) unsigned long long EpGU64;
 
-// A token lands one row per distinct destination rank of its top-k experts.
-template <EpCfg kCfg>
-constexpr int EpFp4Rows() {
-  return kCfg.worldSize < kCfg.numExpertPerToken ? kCfg.worldSize : kCfg.numExpertPerToken;
-}
-
 template <EpCfg kCfg>
 struct EpFp4Item {
-  int t, pOnly, flat;
+  int t, pOnly, flat, lrow;
   unsigned long long mask;
   const unsigned char* rp[EpFp4Rows<kCfg>()];
   float on[EpFp4Rows<kCfg>()];
@@ -2554,7 +2596,15 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   unsigned char* const tile =
       reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kCap * kWireB;
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
-  const size_t myColB = (size_t)args.rank * kMaxRecv * kWireB;
+  constexpr int kLandRows = EpFp4LandRows<kCfg>();
+  const int landFrom = EpFp4LandFrom(args, kCfg.worldSize, laneId);
+  // The landing row at p of the row in slot s here; a bad offset fails the launch instead of
+  // storing outside p's landing.
+  auto landRow = [&](const int p, const int s) {
+    const int lr = s + __builtin_amdgcn_readlane(landFrom, p);
+    if (lr < 0 || lr >= kLandRows) __builtin_trap();
+    return lr;
+  };
 
   auto sendTile = [&](unsigned char* tl, int r0, int n, int pe, auto landOf, auto laneVal,
                       int rowStep) {
@@ -2562,7 +2612,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
       const int p = laneVal(pe, i);
       int j = i + 1;
       while (rowStep == 1 && j < n && laneVal(pe, j) == p) ++j;
-      unsigned char* const dst = landOf(p) + myColB + (size_t)(r0 + i * rowStep) * kWireB;
+      unsigned char* const dst = landOf(p) + (size_t)landRow(p, r0 + i * rowStep) * kWireB;
       TdmIssueStore<int, 0, 0, kCpolScopeSys>(reinterpret_cast<int*>(dst),
                                               reinterpret_cast<int*>(tl + (size_t)i * kWireB),
                                               TdmShape<int>((j - i) * kWireDw));
@@ -2757,13 +2807,16 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         const int ch = s + head * kSegS;
         if constexpr (kOvlp) {
           const int r0c = rb + ch * kSegK;
-          if (laneId < min(kSegK, re - r0c)) {
-            const int pe = kKeep ? peF : cpe[(ch % kSegNb) * kSegK + laneId];
-            const int row = kKeep ? rwF : rowOf(r0c + laneId);
+          const bool on = laneId < min(kSegK, re - r0c);
+          const int pe = on ? (kKeep ? peF : cpe[(ch % kSegNb) * kSegK + laneId]) : 0;
+          const int dl = __shfl(landFrom, pe);
+          const int lr = on ? (kKeep ? rwF : rowOf(r0c + laneId)) + dl : 0;
+          if (on) {
+            if (lr < 0 || lr >= kLandRows) __builtin_trap();
             EpGU64* const f = (EpGU64*)(reinterpret_cast<unsigned long long*>(
                                             wBase + (uint64_t)pe * wStride + args.offOutTok +
                                             EpFp4FlagOff<kCfg>()) +
-                                        (size_t)args.rank * kMaxRecv + row);
+                                        (size_t)lr);
             __hip_atomic_store(f, ovlEp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
           }
         }
@@ -2824,7 +2877,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           unsigned char* const dst =
               reinterpret_cast<unsigned char*>(wBase + (uint64_t)p * wStride + args.offOutTok +
                                                W::kLandOff) +
-              myColB + (size_t)dRow * kWireB;
+              (size_t)landRow(p, dRow) * kWireB;
           TdmIssueStore<int, 0, 0, kCpolScopeSys>(reinterpret_cast<int*>(dst),
                                                   reinterpret_cast<int*>(ring + (size_t)i * kWireB),
                                                   TdmShape<int>((j - i) * kWireDw));
@@ -2917,12 +2970,16 @@ __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, i
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
   const unsigned char* const land =
       EpLocal<unsigned char>(args.window, args.offOutTok) + W::kLandOff;
+  const int landTo = EpFp4LandTo(args, npes, laneId);
   EpFp4Item<kCfg> r;
   r.t = it / kItemPass;
   r.pOnly = it - r.t * kItemPass;
   r.flat = (laneId < topk) ? args.dispDestTokIdMap[r.t * topk + laneId] : -1;
   bool ok = r.flat >= 0 && r.flat < npes * kMaxRecv;
   const int rpe = ok ? r.flat / kMaxRecv : -1;
+  const int dl = __shfl(landTo, ok ? rpe : 0);
+  r.lrow = ok ? r.flat - rpe * kMaxRecv + dl : 0;
+  if (ok && (r.lrow < 0 || r.lrow >= EpFp4LandRows<kCfg>())) __builtin_trap();
   for (int k = 0; k < topk; ++k) {
     const int pk = __shfl(rpe, k);
     if (k < laneId && pk == rpe) ok = false;
@@ -2935,7 +2992,7 @@ __device__ __forceinline__ EpFp4Item<kCfg> EpFp4ReducePrep(const EpArgs& args, i
     const int l = mm ? __ffsll((long long)mm) - 1 : l0;
     r.on[j] = mm ? 1.0f : 0.0f;
     mm &= mm - 1;
-    r.rp[j] = land + (size_t)__shfl(r.flat, l) * W::kWireB;
+    r.rp[j] = land + (size_t)__shfl(r.lrow, l) * W::kWireB;
   }
   return r;
 }
@@ -3162,6 +3219,7 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
     char* const sub = ring + (size_t)ld * kRingL * kWireB;
     const unsigned char* const land =
         EpLocal<unsigned char>(args.window, args.offOutTok) + W::kLandOff;
+    const int landTo = EpFp4LandTo(args, npes, laneId);
     auto flatOf = [&](const int i) -> int {
       return (laneId < topk && i < cnt)
                  ? (int)args.dispDestTokIdMap[(size_t)(tb + i) * topk + laneId]
@@ -3189,6 +3247,9 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
       flatNN = flatOf(i + 2 * kNl);
       bool ok = flat >= 0 && flat < npes * kMaxRecv;
       const int rpe = ok ? flat / kMaxRecv : -1;
+      const int dl = __shfl(landTo, ok ? rpe : 0);
+      const int lrow = ok ? flat - rpe * kMaxRecv + dl : 0;
+      if (ok && (lrow < 0 || lrow >= EpFp4LandRows<kCfg>())) __builtin_trap();
 #pragma unroll
       for (int k = 0; k < topk; ++k) {
         const int pk = __builtin_amdgcn_readlane(rpe, k);
@@ -3216,7 +3277,7 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
       for (int j = 0; j < n; ++j) {
         const int l = __builtin_amdgcn_readfirstlane(__ffsll((long long)mm) - 1);
         mm &= mm - 1;
-        const int fl = __builtin_amdgcn_readlane(flat, l);
+        const int fl = __builtin_amdgcn_readlane(lrow, l);
         const int s = s0 + j < kRingL ? s0 + j : s0 + j - kRingL;
         TdmIssueLoad<int>(reinterpret_cast<int*>(sub + (size_t)s * kWireB),
                           reinterpret_cast<const int*>(land + (size_t)fl * kWireB),
@@ -3432,7 +3493,7 @@ __device__ __forceinline__ unsigned EpFp4OvlRound(const EpArgs& args, const unsi
     const bool mine = ((r.mask >> laneId) & 1ull) != 0;
     const bool ok =
         !mine || ((done >> (r.flat / kMaxRecv)) & 1ull) != 0 ||
-        __hip_atomic_load(flags + r.flat, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == ep;
+        __hip_atomic_load(flags + r.lrow, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == ep;
     if (__all(ok)) {
       unsigned won = 1u << i;
       if (take) {

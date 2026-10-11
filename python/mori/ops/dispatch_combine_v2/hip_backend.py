@@ -157,6 +157,11 @@ def push_wire_nbytes(cfg) -> int:
     return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
 
 
+def push_land_rows(cfg) -> int:
+    """EpFp4LandRows: a token gets back one row per distinct destination rank."""
+    return cfg.max_num_inp_token_per_rank * min(cfg.world_size, cfg.num_experts_per_token)
+
+
 class TokOffExt:
     """Dispatch's slot allocator word outside the cco window (single-host gfx1250 EP, opt-in: MORI_EP_TOKOFF_EXT=1).
 
@@ -378,7 +383,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.token_dest_map = torch.zeros(max_tok * topk, **i32)
         self._null_flat = cfg.world_size * cfg.effective_max_recv
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
-        self.dest_pe_counter = torch.zeros(cfg.world_size, **i32)
+        # The send counts, then the fp4 combine's landing offset of the rows each
+        # destination returns (EpFp4LandTo; dispatch writes it, combine reads it).
+        self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
         # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
         # memory instead of the cco window (see TokOffExt): the cco-window slot
         # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
@@ -651,14 +658,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         topk = cfg.num_experts_per_token
         out_tok = cap * cfg.combine_token_nbytes
         if cfg.quant_type in _FP4_QUANT_TYPES:
-            out_tok += cfg.world_size * cap * push_wire_nbytes(cfg)
+            land_rows = push_land_rows(cfg)
+            out_tok += land_rows * push_wire_nbytes(cfg)
             # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
             # which runs from four ranks up.
             if cfg.world_size >= 4:
-                out_tok += cfg.world_size * cap * 8
+                out_tok += land_rows * 8
         regions = [
             ("tok_off", 4),
-            ("recv_num", cfg.world_size * 4),
+            # The recv-count signals, then the fp4 combine's landing offset of each
+            # source's rows here (written by the source's dispatch).
+            ("recv_num", 2 * cfg.world_size * 4),
             ("recv_to_src_token", cap * 4),
             ("out_idx", cap * topk * 4),
             ("out_wts", cap * topk * 4),
@@ -728,6 +738,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
+        # The fp4 combine lands each source's rows at the offset the aggregated
+        # reservation hands out; TokOffExt reserves per block and hands out none.
+        if cfg.quant_type in _FP4_QUANT_TYPES and getattr(self, "_tokoff_wanted", False):
+            bad.append(
+                f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
+                "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
+            )
         worst = cfg.world_size * cfg.max_num_inp_token_per_rank
         if cfg.effective_max_recv < worst:
             bad.append(
@@ -1477,6 +1494,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 # Null == "skip the weight fold" (the kernel's only gate on it).
                 out_weights_buf=self.combine_out_weights if want_weights else None,
                 disp_dest_tok_id_map=dest_map,
+                dest_pe_token_counter=self.dest_pe_counter,
                 total_recv_token_num=total_recv,
                 grid_barrier=self.combine_barrier,
                 xdb_flag=self.cross_device_flag,
@@ -1496,7 +1514,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             view = from_gpu_ptr(
                 self.arena.local_ptr("out_tok")
                 + self._recv_cap * self.cfg.combine_token_nbytes,
-                (self.cfg.world_size, self._recv_cap, push_wire_nbytes(self.cfg)),
+                (push_land_rows(self.cfg), push_wire_nbytes(self.cfg)),
                 torch.uint8,
             )
             self._views["push_landing"] = view
