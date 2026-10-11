@@ -164,12 +164,15 @@ _DISPATCH_TABLE: dict = {
         },
         # EP16 on four 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11. 128x16 is the only geometry
         # that builds the pinned-destination dispatch (kDPin in ep_intranode_1250x.hpp). 128x16
-        # minus 64x16, dispatch us, graph, one M=16384 plan, 3 alternating rounds: 1024 tokens a
-        # rank -11.0..-11.8, 2048 +2.2..+3.3, 3072 -6.0..-6.8, 8192 -14.7..-15.3, 16384
-        # -80.9..-83.3. 2048 is the only point 64x16 wins; the edge between them is unswept.
+        # minus 64x16, dispatch us, graph, 3 alternating rounds: M=512 plan, 64 / 256 / 384 / 512
+        # tokens a rank +3.0 / +3.9..+4.1 / +2.5..+2.8 / +1.7..+2.0 (ab_1011_233137_978008); M=4096
+        # plan, 768 / 1024 / 1280 / 1536 / 2048 / 2560 / 3072 / 4096 -18.2..-18.7 / -18.4..-18.6 /
+        # -12.4..-12.5 / -9.3 / -4.8..-5.1 / -29.0..-29.1 / -35.9..-36.0 / -37.0..-37.1
+        # (ab_1011_232944_972647); M=16384 plan, 8192 -14.7..-15.3, 16384 -80.9..-83.3. The 512
+        # bucket is its own variant: at most 512 tokens a call compiles out the tile path (kCuAlways).
         (16, 7168, 6, None): {
             None: ((None, 64, 16),),
-            "fp4_disp_bf16_comb": ((512, 64, 16), (4095, 64, 16), (None, 128, 16)),
+            "fp4_disp_bf16_comb": ((512, 64, 16), (None, 128, 16)),
         },
         # EP32 on eight 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11, one M=16384 plan, 3
         # alternating rounds, dispatch us (ab_1011_213858_566770):
