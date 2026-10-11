@@ -369,16 +369,35 @@ constexpr bool EpCombinePush(const EpCfg& c) { return c.combineFp4 || c.combineF
 //
 // Padded on every arch so the destination layout does not fork per arch. The pad
 // is unconditional, so small rows amplify: 224->256 is 1.14x, 32->128 is 4x,
-// 4->128 is 32x, and the gfx1250 scale staging is worldSize^2 * maxTok * THIS --
-// the largest term in EpStagingTotalBytes by far. It is one host allocation per
-// op now, not a __device__ array per compiled variant, so nothing fails to build
-// over it: going wider costs VRAM at construction instead.
+// 4->128 is 32x, and the gfx1250 scale staging is worldSize * EpScaleRows * THIS
+// (EpStagingScaleBytes), one host allocation per op.
 //
 // Everything reading the destination uses this, not Cfg.scaleBytes; it assumes
 // the arena aligns the region too (SymmArena._ALIGN, checked in hip_backend).
 constexpr int EpScaleAlign = 128;
 constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
+}
+
+// The gfx1250 scale staging: a block lays the row for destination slot s of peer p
+// at row (b mod EpScaleWrap) + (s - b) of p's part, b being the block's first slot at
+// p. Under aggReserve a rank holds one run of at most maxTokPerRank slots at p, and
+// the wrap is a power of two at least that long, so a block's rows never wrap, two
+// blocks of the rank never share a row, and every row is below twice the wrap --
+// the part is linear in maxTokPerRank instead of p's whole recv capacity
+// (EP32 16384 tokens: 256 MiB against 4 GiB). Without aggReserve every block
+// reserves on its own, the rank's slots at p are spread over the capacity, and the
+// wrap is past it, so the row is the slot.
+constexpr int EpPow2Ceil(int v) {
+  int r = 1;
+  while (r < v) r <<= 1;
+  return r;
+}
+constexpr int EpScaleWrap(const EpCfg& c) {
+  return EpPow2Ceil(c.aggReserve ? c.maxTokPerRank : EpMaxRecv(c));
+}
+constexpr int EpScaleRows(const EpCfg& c) {
+  return c.aggReserve ? 2 * EpScaleWrap(c) : EpMaxRecv(c);
 }
 
 // The Cfg.aggReserve state, a module global of the dispatch kernel (_resState in
@@ -472,7 +491,7 @@ constexpr size_t EpStagingScaleOffset(const EpCfg& c) {
   return EpAlignUp128(EpStagingBlkCountOffset(c) + EpStagingBlkCountBytes(c));
 }
 constexpr size_t EpStagingScaleBytes(const EpCfg& c) {
-  return c.scaleBytes <= 0 ? 0 : (size_t)c.worldSize * EpMaxRecv(c) * EpScaleStride(c);
+  return c.scaleBytes <= 0 ? 0 : (size_t)c.worldSize * EpScaleRows(c) * EpScaleStride(c);
 }
 
 // The scale region is the only one a Cfg can switch off; blkBase and blkCount are
