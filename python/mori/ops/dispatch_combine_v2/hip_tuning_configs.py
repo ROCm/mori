@@ -36,9 +36,12 @@ ascending, and ``lookup`` merges the two into the op's
 An unswept shape returns schedule=None and the single-shot default below. Add one by
 sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
 
-dtype keys are whatever ``EpDispatchCombineConfig.dtype_str`` produces, hence
-"fp4_disp_bf16_comb": hip rejects an fp4 combine outright, so an fp4 dispatch here is
-always paired with bf16 -- which is the configuration the sweep measured.
+Dispatch dtype keys name only what dispatch transports: "bf16", "fp8", "fp4"
+(``EpDispatchCombineConfig.dispatch_dtype_str``). The combine side has no dtype here --
+it always reduces bf16 rows, and whether those go out as mxfp4 is ``quant_type``'s
+table. "fp4_disp_bf16_comb" is FlyDSL's key for the same fp4 dispatch (its table does
+name both halves); ``lookup`` still reads it as "fp4" for callers that pass
+``dtype_str``.
 """
 
 from __future__ import annotations
@@ -97,11 +100,11 @@ _DISPATCH_TABLE: dict = {
     "mi355x": {
         (8, 7168, 8, None): {
             None: ((None, 64, 8),),
-            "fp4_disp_bf16_comb": ((None, 128, 8),),
+            "fp4": ((None, 128, 8),),
         },
         (8, 7168, 6, None): {
             None: ((None, 64, 8),),
-            "fp4_disp_bf16_comb": ((None, 128, 8),),
+            "fp4": ((None, 128, 8),),
         },
     },
     # 4x gfx1250 at EP4, hidden 7168, 2026-08-11. topk moves the edges (it sets _tpi),
@@ -120,8 +123,27 @@ _DISPATCH_TABLE: dict = {
         # topk 9 = 8 routed + 1 shared (what ATOM dispatches: kernel name k9).
         # The engine selects this key, not topk 8; block 64 default starves the
         # 256-CU GPU at the ~3456-recv operating point. Block 256 saturates it.
+        # fp4, 16 geometries swept (us, random / grouped routing). Fewest blocks within 3%
+        # of the best under both routings, so the CUs left over stay free; 256 blocks only
+        # where nothing smaller comes within 5% (2048: 128x16 and 192x16, +5% random, +7%
+        # grouped).
+        #   ct           128x8       192x8       256x8      192x24      192x32      256x32
+        #   1024     33.3/24.6   33.2/24.8   33.2/24.8   38.7/35.0   39.0/36.0   39.4/35.3
+        #   1536     52.3/49.7   37.5/27.7   37.5/27.7   42.0/30.2   42.8/37.6   43.4/38.4
+        #   2048     53.6/50.1   56.3/52.6   40.7/30.5   42.6/34.5   45.5/37.1   46.5/40.0
+        #   4096     68.6/52.5   72.0/54.4   68.3/56.3   55.7/47.5   57.6/46.2   57.3/46.4
+        #   8192    124.7/98.3 116.6/100.3   98.5/75.6   91.3/78.2   92.7/85.4   88.3/75.5
+        #   16384  234.1/196.2 202.6/171.3 187.6/146.1 161.7/137.6 157.9/131.0 153.4/124.5
         (4, 7168, 9, None): {
             None: ((512, 64, 8), (4096, 256, 8), (None, 256, 16)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 128, 8),
+                (1536, 192, 8),
+                (2048, 256, 8),
+                (8192, 192, 24),
+                (None, 192, 32),
+            ),
         },
         # topk 6 (384 experts at EP4). The edges move in: 64x8 stops paying at 512.
         #   ct     64x8   64x16  128x16 256x16      (bf16 / fp8 / fp4)
@@ -131,10 +153,7 @@ _DISPATCH_TABLE: dict = {
         #   16384 551.7   518.5  478.5  470.7  | 423.8 303. 264.9 266.| 414.9 233.7 172.6 166.4
         (4, 7168, 6, None): {
             None: ((512, 64, 8), (2048, 64, 16), (None, 128, 16)),
-            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
-        },
-        (4, 7168, 9, None): {
-            "fp4_disp_bf16_comb": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 8), (1024, 64, 16), (None, 128, 16)),
         },
         # EP8 on two 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-03; the grid stays at 64 blocks
         # (the rest of the CUs belong to the co-resident GEMM). What wins is one token a warp:
@@ -157,7 +176,7 @@ _DISPATCH_TABLE: dict = {
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((2048, 64, 16), (None, 128, 16)),
-            "fp4_disp_bf16_comb": (
+            "fp4": (
                 (1024, 64, 16),
                 (1536, 64, 24),
                 (2048, 64, 32),
@@ -181,13 +200,25 @@ _COMBINE_TABLE: dict = {
     },
     "gfx1250": {
         (4, 7168, 8, None): ((None, 64, 8),),
-        # topk 9 = 8 routed + 1 shared (ATOM's actual dispatch key). Needed so the
-        # dispatch schedule has a combine half -- lookup() returns the block-64
-        # single-shot default unless BOTH halves exist. Combine geometry mirrors
-        # topk 8 (unchanged); only the dispatch half is retuned to block 256.
-        (4, 7168, 9, None): ((None, 64, 8),),
+        # topk 9 = 8 routed + 1 shared (ATOM's actual dispatch key), bf16 pull combine, 10
+        # geometries swept (us, random / grouped routing), picked as the fp4 dispatch is.
+        # 192x8 is slow at 256-1024 under both routings, which is what keeps 256x8 there.
+        #   ct              64x4          64x8         128x8         256x8         192x8
+        #   4          14.4/13.6     21.5/15.5     20.1/14.5     20.2/14.7     20.2/14.8
+        #   64         14.8/14.1     15.8/14.7     16.6/15.1     16.6/15.2     20.9/16.1
+        #   256        29.1/28.2     24.8/18.4     21.3/17.5     22.3/18.1     41.0/29.6
+        #   512        46.5/45.7     33.8/31.0     31.4/23.2     28.1/22.6     58.3/42.9
+        #   1024       79.6/80.9     53.0/50.2     44.5/36.5     45.2/33.8     47.9/36.2
+        #   1536     112.2/116.1     71.8/69.0     59.0/48.2     60.7/44.4     58.2/43.7
+        #   16384  1048.0/1121.6   599.2/609.7   471.0/369.5   479.1/388.8   485.6/338.3
+        (4, 7168, 9, None): (
+            (64, 64, 4),
+            (128, 64, 8),
+            (256, 128, 8),
+            (1024, 256, 8),
+            (None, 192, 8),
+        ),
         (4, 7168, 6, None): ((None, 64, 8),),
-        (4, 7168, 9, None): ((None, 64, 8),),
         # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
     },
@@ -206,12 +237,23 @@ _COMBINE_FP4_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
+            # topk 9: 12 geometries swept (us, random / grouped routing), picked as the fp4
+            # dispatch is. 256 blocks stay at 1024 and 2048, where the best under 256 is +6%
+            # (128x16) and +9% (192x16).
+            #   ct           192x8       256x8      192x16      256x16      192x24
+            #   512      17.8/15.8   17.9/15.8   18.6/16.4   18.6/16.2   24.5/23.4
+            #   1024     25.9/21.2   23.8/19.7   25.8/19.6   25.0/19.4   30.2/26.0
+            #   1536     31.7/26.1   31.8/25.7   31.2/25.0   30.9/23.9   37.1/30.5
+            #   2048     39.4/32.2   36.6/29.9   39.5/31.7   36.5/29.0   39.8/34.7
+            #   4096     77.8/61.9   70.5/58.3   75.9/53.5   74.7/53.2   60.5/51.5
+            #   16384  297.6/189.8 273.7/168.8 285.1/171.9 283.3/161.7 158.5/132.6
             (4, 7168, 9, None): (
-                (256, 64, 8),
-                (2047, 64, 16),
-                (2048, 64, 24),
-                (16384, 128, 24),
-                (None, 64, 16),
+                (128, 64, 8),
+                (512, 192, 8),
+                (1024, 256, 8),
+                (1536, 192, 16),
+                (2048, 256, 16),
+                (None, 192, 24),
             ),
             # 64x24 runs the overlapped path with eight producers and twelve reducing waves:
             # 329.6 -> 314.8 us at 16384 tokens a rank. It tied with 64x16 at 4096 until its store
@@ -270,6 +312,10 @@ def _merge(disp, comb):
     return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
 
 
+# FlyDSL's dtype_str spelling, still accepted from callers that pass it (aiter's MegaMoE).
+_DISPATCH_DTYPE_ALIAS = {"fp4_disp_bf16_comb": "fp4"}
+
+
 def lookup(
     world_size,
     hidden_dim,
@@ -280,9 +326,11 @@ def lookup(
 ) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
-    An unswept shape gets the HIP single-shot default (schedule=None). A swept one
-    gets a per-token-count schedule built from the dispatch and combine tables
-    independently, so either half can be re-tuned without touching the other.
+    ``dtype`` is the dispatch wire ("bf16" / "fp8" / "fp4") and picks the dispatch
+    half; ``quant_type`` picks the combine half. An unswept shape gets the HIP
+    single-shot default (schedule=None). A swept one gets a per-token-count schedule
+    built from the dispatch and combine tables independently, so either half can be
+    re-tuned without touching the other.
     """
     base = _hip_default()
     dev = _device_key()
@@ -305,7 +353,7 @@ def lookup(
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.
-    disp = disp.get(dtype) or disp.get(None)
+    disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
     if disp is None:
         return base
     base["schedule"] = _merge(disp, comb)
