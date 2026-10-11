@@ -151,15 +151,15 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
     // ROWS is the per-peer stride and SLOTS the total. They must be emitted as a
-    // pair: the staging is indexed peer*ROWS + destTokId, and sizing it from one
-    // while indexing with the other is an out-of-bounds write on peer > 0.
+    // pair: the staging is indexed peer*ROWS + row (EpScaleRows), and sizing it
+    // from one while indexing with the other is an out-of-bounds write on peer > 0.
     // BYTES is the caller's row, STRIDE what we lay it down at: staging reads one
     // and writes the other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
-                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) +
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpScaleRows(cfg)) +
                 "\n#define MORI_EP_SCALE_SLOTS " +
-                std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
+                std::to_string((long long)cfg.worldSize * EpScaleRows(cfg)) + "\n";
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";

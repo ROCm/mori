@@ -224,8 +224,8 @@ __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
 constexpr int kEpScaleStride = MORI_EP_SCALE_STRIDE;
 constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
-// Per-peer stride. NOT _stgCap: that one sizes the idx/wt pool, which is a
-// different (larger) constant, and indexing this array with it walks off the end.
+// Per-peer stride, EpScaleRows. NOT _stgCap: that one sizes the idx/wt pool, which
+// is a different (larger) constant, and indexing this array with it walks off the end.
 constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
 constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
 #else
@@ -235,34 +235,30 @@ constexpr size_t kEpScaleSlots = 1;
 constexpr size_t kEpScaleRows = 1;
 constexpr int kMetaFields = 3;  // idx, weights, srcmap
 #endif
-// FOOTPRINT, and it is quadratic in world_size: kEpScaleSlots is
-// worldSize * EpMaxRecv, and EpMaxRecv is itself worldSize * maxTokPerRank. That
-// is deliberate -- the per-peer stride has to be the peer's full recv capacity so
-// the destination slot id indexes it directly, which is also what lets the
-// existing `ab + cc > recvCapM` guard cover this array (_stgCap does NOT bound
-// it; the two cross over as world_size grows).
-//
-// It costs, at the 256 B STRIDE a 224 B row (hidden 7168) pads up to:
-//     EP4  maxTok 16384  ->   64 MiB
-//     EP8  maxTok  8192  ->  128 MiB
-//     EP8  maxTok 16384  ->  256 MiB
-// and this is a __device__ global, so it is one copy PER COMPILED VARIANT: a
-// three-entry (block, warp) schedule at EP8/16384 reserves ~672 MiB.
-//
-// The idx/wt pools next to it are world_size-independent (a fixed CUSPLIT_POOL
-// split per peer). Making this one match would need the staging to be indexed by
-// a block-local slot instead of the destination slot id, which is a bigger change
-// than it looks and wants hardware validation -- the guard would start dropping
-// tokens rather than merely skipping transfers. Until then, fail at compile time
-// rather than at the first launch on a big EP.
+// FOOTPRINT: a __device__ global, so one copy PER COMPILED VARIANT. A peer's part
+// is EpScaleRows rows (ep_cfg.hpp), each block's rows at its run's first slot
+// modulo EpScaleWrap. Under aggReserve, which every gfx1250 dispatch without
+// tokOffExt runs, that is twice maxTokPerRank rounded up to a power of two, so the
+// array is linear in world_size; at the 256 B STRIDE a 224 B row (hidden 7168)
+// pads up to:
+//     EP8   maxTok 16384  ->   64 MiB
+//     EP32  maxTok 16384  ->  256 MiB
+// Without aggReserve the part is the peer's whole recv capacity and the array is
+// quadratic in world_size (EP8 16384 -> 256 MiB, EP32 4096 -> 1 GiB); fail at
+// compile time there rather than at the first launch.
 static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (size_t)1 << 30,
-              "EP scale staging exceeds 1 GiB per compiled variant -- it grows as "
-              "world_size^2 * maxTokPerRank * EpScaleStride; re-index it block-locally "
-              "before going wider");
+              "EP scale staging exceeds 1 GiB per compiled variant -- without aggReserve "
+              "it grows as world_size^2 * maxTokPerRank * EpScaleStride");
 static_assert(EpScaleAlign % kTdmRowBytes == 0,
               "the scale staging base must sit on a TDM row for the metadata tile to reach it");
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
+// The staging row, within its peer's part, of destination slot s of a block whose run
+// at that peer starts at slot b (EpScaleWrap, ep_cfg.hpp).
+template <EpCfg kCfg>
+__device__ __forceinline__ size_t EpScaleRow(index_t b, index_t s) {
+  return (size_t)((unsigned)b & (unsigned)(EpScaleWrap(kCfg) - 1)) + (size_t)(s - b);
+}
 
 // The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
 // moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
@@ -397,6 +393,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   static_assert(EpScaleStride(kCfg) == kEpScaleStride,
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
+  static_assert(kEpScaleStride == 0 || EpScaleRows(kCfg) == (int)kEpScaleRows,
+                "MORI_EP_SCALE_ROWS disagrees with EpScaleRows(Cfg) -- the staging would "
+                "be sized for one row numbering and indexed with another");
   constexpr int WS = kCfg.waveSize;
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
@@ -907,9 +906,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             }
           }
           if constexpr (kEpScaleBytes > 0) {
-            if (!_wfuse && (kScWave || args.scalesBuf) && (size_t)dt < kEpScaleRows) {
+            const size_t sr = EpScaleRow<kCfg>(s_base[d], dt);
+            if (!_wfuse && (kScWave || args.scalesBuf) && sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
-                  _cusplit_stgScale + ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleStride);
+                  _cusplit_stgScale + ((size_t)d * kEpScaleRows + sr) * kEpScaleStride);
               if constexpr (kScWave) {
 #pragma unroll
                 for (int j = 0; j < kScK; ++j) dstS[laneId * kScK + j] = rS[j];
@@ -1018,9 +1018,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             constexpr int kDstDw = kEpScaleStride / 4;
             const unsigned int* srcS =
                 reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)gTok * kSrcDw;
-            if ((size_t)dt < kEpScaleRows) {
+            const size_t sr = EpScaleRow<kCfg>(s_base[d], dt);
+            if (sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
-                  _cusplit_stgScale + ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleStride);
+                  _cusplit_stgScale + ((size_t)d * kEpScaleRows + sr) * kEpScaleStride);
               for (int e = myE; e < kSrcDw; e += gsz) dstS[e] = srcS[e];
               // Zeroed, not left over: it crosses into a peer's memory.
               for (int e = kSrcDw + myE; e < kDstDw; e += gsz) dstS[e] = 0u;
@@ -1034,10 +1035,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             const int l = __ffsll((long long)km) - 1;
             const int d = __shfl(myDestPe, l);
             const index_t dt = __shfl(myDestTokId, l);
-            if (dt >= 0 && dt < _stgCap && (size_t)dt < kEpScaleRows) {
+            const size_t sr = EpScaleRow<kCfg>(s_base[d], dt);
+            if (dt >= 0 && dt < _stgCap && sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
                                        _cusplit_stgScale +
-                                       ((size_t)d * kEpScaleRows + (size_t)dt) * kEpScaleStride) +
+                                       ((size_t)d * kEpScaleRows + sr) * kEpScaleStride) +
                                    laneId * kScK;
 #pragma unroll
               for (int j = 0; j < kScK; ++j) dstS[j] = pickSc(_k, j);
@@ -1244,8 +1246,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                 index_t* dR = reinterpret_cast<index_t*>(pb + args.offRecvToSrc) + (size_t)ab;
                 constexpr int kSdw = (kEpScaleStride > 0) ? kEpScaleStride / 4 : 0;
                 const int nScB = cc * kSdw;
-                unsigned int* sS = reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
-                                   (size_t)peer * kEpScaleRows * kSdw + (size_t)ab * kSdw;
+                unsigned int* sS =
+                    reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
+                    ((size_t)peer * kEpScaleRows + EpScaleRow<kCfg>(s_base[peer], ab)) * kSdw;
                 unsigned int* dS =
                     (kEpScaleBytes > 0 && args.scalesBuf)
                         ? (reinterpret_cast<unsigned int*>(pb + args.offOutScales) + (size_t)ab * kSdw)
@@ -1343,7 +1346,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           constexpr int kSdw = (kEpScaleStride > 0) ? kEpScaleStride / 4 : 0;
           const int nScB = cc * kSdw;
           unsigned int* sS = reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
-                             (size_t)peer * kEpScaleRows * kSdw + (size_t)ab * kSdw;
+                             ((size_t)peer * kEpScaleRows + EpScaleRow<kCfg>(baseAll, ab)) * kSdw;
           unsigned int* dS =
               (kEpScaleBytes > 0 && args.scalesBuf)
                   ? (EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw)
@@ -1504,7 +1507,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         } else if constexpr (kEpScaleStride > 0) {
           constexpr int kSdw = kEpScaleStride / 4;
           unsigned int* src = reinterpret_cast<unsigned int*>(
-              _cusplit_stgScale + ((size_t)peer * kEpScaleRows + (size_t)ab) * kEpScaleStride);
+              _cusplit_stgScale +
+              ((size_t)peer * kEpScaleRows + EpScaleRow<kCfg>(ab, ab)) * kEpScaleStride);
           unsigned int* dst =
               EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw;
           for (int i = laneId; i < (int)cnt * kSdw; i += WS) dst[i] = src[i];
