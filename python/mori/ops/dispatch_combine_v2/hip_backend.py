@@ -384,8 +384,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.token_dest_map = torch.zeros(max_tok * topk, **i32)
         self._null_flat = cfg.world_size * cfg.effective_max_recv
         self.routing_dest_map = torch.full_like(self.token_dest_map, self._null_flat)
-        # The send counts, then the fp4 combine's landing offset of the rows each
-        # destination returns (EpFp4LandTo; dispatch writes it, combine reads it).
+        # The send counts, then per destination its reservation base and, from the
+        # dispatch signal on, the push combine's landing offset of the rows it
+        # returns (EpFp4LandTo; dispatch writes it, combine reads it).
         self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
         # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
         # memory instead of the cco window (see TokOffExt): the cco-window slot
@@ -667,8 +668,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 out_tok += land_rows * 8
         regions = [
             ("tok_off", 4),
-            # The recv-count signals, then the fp4 combine's landing offset of each
-            # source's rows here (written by the source's dispatch).
+            # gfx1250 with the aggregated reservation: one 8-byte signal a source, its
+            # recv count + 1 and in the high word the push combine's landing offset of
+            # that source's rows here. Otherwise 4-byte count signals in the first half.
             ("recv_num", 2 * cfg.world_size * 4),
             ("recv_to_src_token", cap * 4),
             ("out_idx", cap * topk * 4),
@@ -739,8 +741,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
-        # The push combine lands each source's rows at the offset the aggregated
-        # reservation hands out; TokOffExt reserves per block and hands out none.
+        # The push combine's landing offsets ride the aggregated reservation's
+        # dispatch signal, which TokOffExt turns off.
         if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(self, "_tokoff_wanted", False):
             bad.append(
                 f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "

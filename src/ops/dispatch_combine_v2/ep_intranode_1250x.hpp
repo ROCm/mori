@@ -282,16 +282,6 @@ __device__ __forceinline__ unsigned* EpResSeq(const EpArgs& args) { return args.
 __device__ __forceinline__ unsigned* EpResCnt(const EpArgs& args, int dst) {
   return EpResAt<unsigned>(args, EpResCntOff) + dst;
 }
-// The tail of the call-number line, past the call number: the kDPin barrier's arrival count and
-// release flag at kEpPinCtrOff and kEpPinCtrOff + 4, then the rows of the fp4 combine landing this
-// call has handed out so far, where the last block of each destination takes its rows.
-constexpr unsigned long long kEpPinCtrOff = 64;
-constexpr unsigned long long EpResLandOff = kEpPinCtrOff + 8;
-static_assert(EpResLandOff + 4 <= EpResCntOff,
-              "the landing counter shares the call-number line, past the call number");
-__device__ __forceinline__ unsigned* EpResLand(const EpArgs& args) {
-  return EpResAt<unsigned>(args, EpResLandOff);
-}
 template <int kWorldSize>
 __device__ __forceinline__ unsigned long long* EpResPub(const EpArgs& args, int dst) {
   return EpResAt<unsigned long long>(args,
@@ -347,6 +337,7 @@ __device__ __forceinline__ int EpTokBlocks(bool chunked, int numTokens, int etpi
   return (n < (int)gridDim.x) ? n : (int)gridDim.x;
 }
 
+constexpr unsigned long long kEpPinCtrOff = 64;
 template <int kN>
 __device__ unsigned _dpClaim[64];
 // The window's base, stride and LSA rank read once, with scalar loads, so every peer address is
@@ -719,16 +710,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // every thread runs it, and an atomic load would queue the whole grid on one
   // address; the previous call's store is visible across the kernel boundary.
   [[maybe_unused]] unsigned resSeq = 0;
-  [[maybe_unused]] bool landStored = false;
-  // The push combine returns this rank's tot rows at p into one run of this rank's landing, taken
-  // with the reservation at base: a row at slot s of p lands at s + dl, which p and this rank
-  // both keep.
-  [[maybe_unused]] auto takeLanding = [&](int p, index_t tot, index_t base) {
-    const index_t dl = (index_t)atomicAdd(EpResLand(args), (unsigned)tot) - base;
-    __hip_atomic_store(EpPeer<index_t>(win, p, args.offRecvNum) + npes + args.rank, dl,
-                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    args.destPeTokenCounter[npes + p] = dl;
-    landStored = true;
+  // p's base for this rank's rows, for the push combine's landing offset that the signal to p
+  // carries. An RMW like the send counts beside it, so the highest ticket sees it as it sees them.
+  [[maybe_unused]] auto keepBase = [&](int p, index_t base) {
+    __hip_atomic_exchange(&args.destPeTokenCounter[npes + p], base, __ATOMIC_RELAXED,
+                          __HIP_MEMORY_SCOPE_AGENT);
   };
   if constexpr (kCfg.aggReserve) {
     resSeq = *EpResSeq(args) + 1u;
@@ -769,7 +755,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           base = __hip_atomic_fetch_add(EpTokOff(args, p), tot, R, __HIP_MEMORY_SCOPE_SYSTEM);
         __hip_atomic_store(cnt, 0u, R, A);
         __hip_atomic_store(pub, ((unsigned long long)resSeq << 32) | (unsigned)base, R, A);
-        if (tot > 0) takeLanding(p, tot, base);
+        if (tot > 0) keepBase(p, base);
       }
       // The blocks holding tokens wait here for the last of them, so they must all be
       // resident at once.
@@ -819,7 +805,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   if (_ls && warpId == 0 && _lsLast && _lsTot > 0) {
     _lsBase = __hip_atomic_fetch_add(EpTokOff(args, (int)laneId), _lsTot, __ATOMIC_RELAXED,
                                      __HIP_MEMORY_SCOPE_SYSTEM);
-    takeLanding((int)laneId, _lsTot, _lsBase);
+    keepBase((int)laneId, _lsBase);
   }
   constexpr index_t _stgCap = (index_t)(CUSPLIT_POOL_SLOTS / npes);
   if (args.tokenIndices && args.inpTokenBuf && _rowOk && _mrg) {
@@ -2122,11 +2108,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // (destPeTokenCounter is a complete sum) and the drain observed.
   constexpr unsigned kNoTicket = ~0u;
   unsigned arriveTicket = 0;
-  if constexpr (kCfg.aggReserve) {
-    // The landing offsets went to the peers as plain stores, which the signal must not overtake.
-    if (warpId == 0 && __ballot(landStored))
-      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-  }
   if (thdId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
   index_t* recvTokenNums = EpLocal<index_t>(win, args.offRecvNum);
   if (warpId == 0) arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
@@ -2153,23 +2134,46 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // published bases, so this is the one store of it. The published words need no
     // reset: the next call waits for its own number in them.
     if constexpr (kCfg.aggReserve) {
-      if (laneId == 0) {
-        *EpResSeq(args) = resSeq;
-        *EpResLand(args) = 0;
+      if (laneId == 0) *EpResSeq(args) = resSeq;
+      // The signal to p carries in its high word where p's rows from this rank go in this
+      // rank's push combine landing: after the rows to every destination below p, so a row at
+      // slot s of p lands at s + dl and the runs tile [0, the rows this rank sent).
+      const int p = laneId;
+      index_t n = 0, base = 0;
+      if (p < npes) {
+        n = __hip_atomic_load(args.destPeTokenCounter + p, __ATOMIC_RELAXED,
+                              __HIP_MEMORY_SCOPE_AGENT);
+        base = __hip_atomic_load(args.destPeTokenCounter + npes + p, __ATOMIC_RELAXED,
+                                 __HIP_MEMORY_SCOPE_AGENT);
       }
-    }
-
-    for (int destPe = laneId; destPe < npes; destPe += WS) {
-      index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
-      index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe, __ATOMIC_RELAXED,
-                                                 __HIP_MEMORY_SCOPE_AGENT) +
-                               1;
-      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      // Cleared here, not in the inbound loop: that runs on another block now,
-      // and a peer signalling this rank says nothing about whether this rank has
-      // read its own send counts yet.
-      args.destPeTokenCounter[destPe] = 0;
+      index_t below = n;
+#pragma unroll
+      for (int off = 1; off < WS; off <<= 1) {
+        const index_t v = __shfl_up(below, off, WS);
+        if (laneId >= off) below += v;
+      }
+      if (p < npes) {
+        const index_t dl = below - n - base;
+        unsigned long long* signal = EpPeer<unsigned long long>(win, p, args.offRecvNum) + myPe;
+        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(signal, ((unsigned long long)(unsigned)dl << 32) | (unsigned)(n + 1),
+                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        args.destPeTokenCounter[npes + p] = dl;
+        args.destPeTokenCounter[p] = 0;
+      }
+    } else {
+      for (int destPe = laneId; destPe < npes; destPe += WS) {
+        index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
+        index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
+                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
+                                 1;
+        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        // Cleared here, not in the inbound loop: that runs on another block now,
+        // and a peer signalling this rank says nothing about whether this rank has
+        // read its own send counts yet.
+        args.destPeTokenCounter[destPe] = 0;
+      }
     }
   }
   // Inbound rides the first arriver so it is already parked when the peers'
@@ -2179,9 +2183,22 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   if (isFirstArriver) {
     index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
-      index_t* signal = recvTokenNums + srcPe;
-      index_t recvTokenNum = EpWaitGt(signal, 0) - 1;
-      __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      index_t recvTokenNum;
+      if constexpr (kCfg.aggReserve) {
+        // Only the count is cleared: the landing offset in the high word stays for the combine.
+        unsigned long long* signal = reinterpret_cast<unsigned long long*>(recvTokenNums) + srcPe;
+        unsigned long long got;
+        do {
+          got = __hip_atomic_load(signal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        } while ((index_t)(unsigned)got <= 0);
+        recvTokenNum = (index_t)(unsigned)got - 1;
+        __hip_atomic_store(recvTokenNums + 2 * srcPe, 0, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_SYSTEM);
+      } else {
+        index_t* signal = recvTokenNums + srcPe;
+        recvTokenNum = EpWaitGt(signal, 0) - 1;
+        __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      }
       myRecv += recvTokenNum;
     }
     for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
@@ -2440,7 +2457,8 @@ constexpr int EpFp4Rows() {
   return kCfg.worldSize < kCfg.numExpertPerToken ? kCfg.worldSize : kCfg.numExpertPerToken;
 }
 // The landing holds every row this rank's tokens get back: the rows from one destination are one
-// run, at the offset the dispatch reservation took (EpResLand), so the runs tile at most this many.
+// run, after the rows from every destination below it (the dispatch signal's high word), so the
+// runs tile at most this many.
 template <EpCfg kCfg>
 constexpr int EpFp4LandRows() {
   return kCfg.maxTokPerRank * EpFp4Rows<kCfg>();
@@ -2451,7 +2469,7 @@ constexpr size_t EpFp4FlagOff() {
 }
 // Per lane d < worldSize: the landing offset of the rows from d (sender) or to d (receiver).
 __device__ __forceinline__ int EpFp4LandFrom(const EpArgs& args, int npes, int laneId) {
-  return laneId < npes ? EpLocal<index_t>(args.window, args.offRecvNum)[npes + laneId] : 0;
+  return laneId < npes ? EpLocal<index_t>(args.window, args.offRecvNum)[2 * laneId + 1] : 0;
 }
 __device__ __forceinline__ int EpFp4LandTo(const EpArgs& args, int npes, int laneId) {
   return laneId < npes ? args.destPeTokenCounter[npes + laneId] : 0;
