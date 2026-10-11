@@ -882,9 +882,12 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         }
         const bool keep = myDestPe >= 0 && laneId == (__ffsll((long long)mine) - 1);
         index_t myDestTokId = -1;
+        [[maybe_unused]] index_t myScRow = 0;
         if (keep) {
           index_t j = atomicAdd(&s_run[myDestPe], 1);
-          myDestTokId = s_base[myDestPe] + j;
+          const index_t b = s_base[myDestPe];
+          myDestTokId = b + j;
+          if constexpr (kEpScaleBytes > 0) myScRow = (index_t)EpScaleRow<kCfg>(b, myDestTokId);
           args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
               EpFlatIndex<kCfg>(myDestPe, myDestTokId);
           if (myDestTokId < _stgCap)
@@ -906,7 +909,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             }
           }
           if constexpr (kEpScaleBytes > 0) {
-            const size_t sr = EpScaleRow<kCfg>(s_base[d], dt);
+            const size_t sr = (size_t)(unsigned)__builtin_amdgcn_readlane(myScRow, l);
             if (!_wfuse && (kScWave || args.scalesBuf) && sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
                   _cusplit_stgScale + ((size_t)d * kEpScaleRows + sr) * kEpScaleStride);
@@ -960,9 +963,12 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         keep = (act && myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
       }
       index_t myDestTokId = -1;
+      [[maybe_unused]] index_t myScRow = 0;
       if (keep) {
         index_t j = atomicAdd(&s_run[myDestPe], 1);
-        myDestTokId = s_base[myDestPe] + j;
+        const index_t b = s_base[myDestPe];
+        myDestTokId = b + j;
+        if constexpr (kEpScaleBytes > 0) myScRow = (index_t)EpScaleRow<kCfg>(b, myDestTokId);
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
             EpFlatIndex<kCfg>(myDestPe, myDestTokId);
         if (myDestTokId < _stgCap)
@@ -1018,7 +1024,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             constexpr int kDstDw = kEpScaleStride / 4;
             const unsigned int* srcS =
                 reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)gTok * kSrcDw;
-            const size_t sr = EpScaleRow<kCfg>(s_base[d], dt);
+            const size_t sr = (size_t)(unsigned)__shfl(myScRow, sl);
             if (sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
                   _cusplit_stgScale + ((size_t)d * kEpScaleRows + sr) * kEpScaleStride);
@@ -1035,7 +1041,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
             const int l = __ffsll((long long)km) - 1;
             const int d = __shfl(myDestPe, l);
             const index_t dt = __shfl(myDestTokId, l);
-            const size_t sr = EpScaleRow<kCfg>(s_base[d], dt);
+            const size_t sr = (size_t)(unsigned)__shfl(myScRow, l);
             if (dt >= 0 && dt < _stgCap && sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
                                        _cusplit_stgScale +
