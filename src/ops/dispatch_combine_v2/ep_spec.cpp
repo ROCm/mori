@@ -72,6 +72,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
   c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
+  // Kept off the combine and the other arches, whose code does not read it: their Cfg,
+  // and so their cache key, stays the one maxTokPerRank alone gives.
+  c.callTokMax = isDispatch && arch.rfind("gfx125", 0) == 0 && req.callTokMax > 0 &&
+                         req.callTokMax < req.maxTokPerRank
+                     ? req.callTokMax
+                     : 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 

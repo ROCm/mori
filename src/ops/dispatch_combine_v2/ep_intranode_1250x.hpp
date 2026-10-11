@@ -224,7 +224,8 @@ static_assert(CUSPLIT_MAX_BLOCKS == EpStagingMaxBlocks,
 // region with it walks into the next peer's rows.
 //
 // Under aggReserve, which every gfx1250 dispatch without tokOffExt runs, a peer's part
-// is twice maxTokPerRank rounded up to a power of two, so the region is linear in
+// is twice EpCallTok rounded up to a power of two (at most twice maxTokPerRank's, which
+// is what the host sizes the shared buffer for), so the region is linear in
 // world_size; at the 256 B stride a 224 B row (hidden 7168) pads up to, EP8/maxTok
 // 16384 is 64 MiB and EP32/maxTok 16384 is 256 MiB. Without aggReserve the part is
 // the peer's whole recv capacity and the region is quadratic in world_size. One
@@ -440,8 +441,8 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr int kMetaSlabBytes = EpDispatch1250xMetaSlabBytes(kCfg);
   constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
   constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
-  constexpr bool kDPin = kFp4Pack4 && kMetaSlabBytes == 0 && (npes == 16 || npes == 32) &&
-                         kCfg.warpPerBlock == 16 && kCfg.blockNum == 128 && kCfg.aggReserve &&
+  constexpr bool kDPin = kFp4Pack4 && kMetaSlabBytes == 0 && npes == 16 &&
+                         kCfg.warpPerBlock == npes && kCfg.blockNum == 128 && kCfg.aggReserve &&
                          kEpScaleBytes > 0 && kEpScaleBytes % 8 == 0 && kEpScaleStride == 8 * WS;
   // The payload pass splits each destination's run across warp units instead of
   // walking the token map.
@@ -469,11 +470,14 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                              : 1;
   constexpr int kCuRunMax = kEpTokChunk * kCuTpi;
   constexpr bool kCuAlways = kScaleCu && kUnitGeom && kCfg.warpPerBlock > kEpTokChunk &&
-                             kCfg.maxTokPerRank <= kCfg.blockNum * kEpTokChunk &&
+                             EpCallTok(kCfg) <= kCfg.blockNum * kEpTokChunk &&
                              kCuRunMax * kCfg.numExpertPerToken <= 2 * WS && kCuRunMax <= WS &&
                              kCuRunMax * (kEpScaleStride / 4) <= 16 * WS;
   if constexpr (kCuAlways) {
     if (!_tokChunk && args.numTokens > 0) __builtin_trap();
+  }
+  if constexpr (kCfg.callTokMax > 0) {
+    if ((int)args.numTokens > EpCallTok(kCfg)) __builtin_trap();
   }
   constexpr int kUpRows = (kCfg.warpPerBlock * kSlabBytes) / kTokB;
   constexpr bool kUnitLds = kUnitW && kMetaSlabBytes == 0;
@@ -509,11 +513,11 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // metadata, a rank each, and send no payload, and the other warps carry the block's tokens. With
   // at most one token a warp it stays off: the payload warps would run two tokens back to back
   // where every warp ran one (EP8 768 / 1024 tokens: +10 us). A call never holds more than
-  // maxTokPerRank tokens, so a grid with a warp for each of them never takes the split, and its
+  // EpCallTok tokens, so a grid with a warp for each of them never takes the split, and its
   // code is left out. Eight ranks and up only: at four the split measured slower for fp8
   // (EP4 64x16, 1536 / 4096 tokens: +3.9 / +12.8 us) though faster for bf16 (-1.8 / -3.9).
   constexpr bool kPlainMeta = !kUnitGeom && npes >= 8 && kCfg.warpPerBlock >= 2 * kPM &&
-                              kCfg.maxTokPerRank > kCfg.blockNum * kCfg.warpPerBlock;
+                              EpCallTok(kCfg) > kCfg.blockNum * kCfg.warpPerBlock;
   const bool _metaPlain = kPlainMeta && !_tokChunk && _etpi == 1 && (int)args.numTokens > aWarps;
   constexpr int kPreK = 4;
   const bool _preKOk = (_etpi == 1) && (_preGsz >= topk) && (args.numTokens > 0) &&
@@ -526,7 +530,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // the tables take them only where no warp holds more than kPreK tokens, and there the extra code
   // alone cost EP4 fp4 0.3-0.5 us at 128 / 512 tokens.
   constexpr bool kRowPre =
-      kCfg.warpPerBlock >= 16 && kCfg.maxTokPerRank > kPreK * kCfg.blockNum * kCfg.warpPerBlock;
+      kCfg.warpPerBlock >= 16 && EpCallTok(kCfg) > kPreK * kCfg.blockNum * kCfg.warpPerBlock;
   constexpr int kScK = kEpScaleBytes > 0 ? kEpScaleStride / (4 * WS) : 0;
   constexpr bool kScWave = kEpScaleBytes > 0 && kScK >= 1 && kScK <= 4 &&
                            kScK * 4 * WS == kEpScaleStride && (kEpScaleBytes / 4) % kScK == 0;

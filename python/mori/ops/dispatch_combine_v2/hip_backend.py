@@ -162,7 +162,8 @@ def ep_staging_bytes(
 
     ``agg_reserve`` is EpCfg.aggReserve: true for every gfx1250 intranode dispatch
     built without tok_off_ext. It switches the scale part to EpScaleRows' linear
-    numbering, 2 * pow2ceil(max_tok_per_rank) rows a peer, which can be MORE than
+    numbering, 2 * pow2ceil(max_tok_per_rank) rows a peer (a variant built with a
+    smaller callTokMax numbers fewer and shares the buffer), which can be MORE than
     max_recv at EP1/EP2 -- so it needs ``max_tok_per_rank`` too, and passing the
     wrong flag sizes the region for a numbering the kernel does not use.
     """
@@ -1369,14 +1370,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # allocation every block reserves its own.
         ext = int(getattr(self, "_tokoff_wanted", False))
         for b, w in self._dispatch_specs:
-            plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
-            )
-            plan.bind(rank=cfg.rank)
-            if self.dispatch_staging is not None:
-                plan.bind(staging_base=self.dispatch_staging.data_ptr())
-            self._plans.append(plan)
-            dispatch[(b, w)] = self._wrap_dispatch(plan)
+            sized = []
+            for cap in self._dispatch_caps(cfg, (b, w)):
+                plan = cb.EpDispatchPlan(
+                    **common,
+                    **disp_cfg,
+                    block_num=b,
+                    warp_per_block=w,
+                    tok_off_ext=ext,
+                    call_tok_max=cap,
+                )
+                plan.bind(rank=cfg.rank)
+                if self.dispatch_staging is not None:
+                    plan.bind(staging_base=self.dispatch_staging.data_ptr())
+                self._plans.append(plan)
+                sized.append((cap, plan))
+            dispatch[(b, w)] = self._wrap_dispatch(sized)
         for b, w in self._combine_specs:
             plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
@@ -1523,8 +1532,33 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 
-    def _wrap_dispatch(self, plan):
+    def _dispatch_caps(self, cfg, spec):
+        """The call sizes to build `spec`'s dispatch for, ascending: the edge of each
+        schedule bucket that picks it, and the plan's capacity for the open bucket and
+        for the last one, which _pick also gives the counts past every edge. A gfx125x
+        dispatch compiles the code sized to one call out of its bound
+        (EpCfg::callTokMax), so a small bucket does not carry the large one's paths
+        (EP16 fp4 512 tokens, 64x16). Elsewhere the bound is not read: one plan."""
+        cap = int(cfg.max_num_inp_token_per_rank)
+        if not self._is1250 or not cfg.schedule:
+            return [cap]
+        caps = {
+            cap if edge is None else min(int(edge), cap)
+            for (edge, db, dw, _, _) in cfg.schedule
+            if (db, dw) == spec
+        }
+        if not caps or (cfg.schedule[-1][1], cfg.schedule[-1][2]) == spec:
+            caps.add(cap)
+        return sorted(caps)
+
+    def _wrap_dispatch(self, sized):
         def run(*, input, indices, weights, scales, dest_map, num_tokens):
+            plan = next((p for c, p in sized if num_tokens <= c), None)
+            if plan is None:
+                raise ValueError(
+                    f"dispatch of {num_tokens} tokens is past this variant's largest "
+                    f"call size {sized[-1][0]}"
+                )
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 token_indices=indices,
