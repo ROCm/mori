@@ -132,8 +132,13 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   // medium counts: a pure-SSD server is configured by naming SSD and nothing
   // else, which is the whole command for a node that serves storage locally.
   static const std::vector<const char*> kDistributedSelectorEnv = {
-      "UMBP_MASTER_ADDRESS", "UMBP_NODE_ADDRESS",       "UMBP_NODE_ID",
-      "UMBP_IO_ENGINE_HOST", "UMBP_DISTRIBUTED_MEDIUM",
+      "UMBP_MASTER_ADDRESS",
+      "UMBP_NODE_ADDRESS",
+      "UMBP_NODE_ID",
+      "UMBP_IO_ENGINE_HOST",
+      "UMBP_DISTRIBUTED_MEDIUM",
+      "UMBP_BACKEND_POLICY",
+      "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE",
   };
 
   *distributed_requested = AnyEnv(kDistributedSelectorEnv);
@@ -241,7 +246,8 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
-  if (dist.dram_page_size == 0) {
+  // Local pools can use MORI's default. Cluster members must agree on a page size.
+  if (has_master && dist.dram_page_size == 0) {
     *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
     return false;
   }

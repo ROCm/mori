@@ -171,18 +171,28 @@ def _verify_bitcode(cfg: BuildConfig, bc_path: Path) -> None:
 
 
 def _lib_has_ionic_ccqe() -> bool:
-    """Check whether the ionic driver supports CCQE by probing the runtime library symbol."""
+    """Check whether the ionic driver supports CCQE by probing the runtime library symbol.
+
+    Must resolve the same library the host runtime dlopens (IonicDvApi::Load opens
+    "libionic.so"): the host creates a collapsed CQ whenever it finds
+    ionic_dv_create_cq_ex there, and a kernel compiled without -DIONIC_CCQE polls that
+    CQ as a ring and hangs. find_library returns the soname (libionic.so.1), which a
+    container that bind-mounts only libionic.so does not have.
+    """
     import ctypes
     import ctypes.util
 
-    lib_name = ctypes.util.find_library("ionic")
-    if lib_name is None:
-        return False
-    try:
-        lib = ctypes.CDLL(lib_name)
+    candidates = ["libionic.so"]
+    found = ctypes.util.find_library("ionic")
+    if found is not None and found not in candidates:
+        candidates.append(found)
+    for lib_name in candidates:
+        try:
+            lib = ctypes.CDLL(lib_name)
+        except OSError:
+            continue
         return hasattr(lib, "ionic_dv_create_cq_ex")
-    except OSError:
-        return False
+    return False
 
 
 _CCQE_MIN_FW_VERSION = (1, 117, 5, 58)

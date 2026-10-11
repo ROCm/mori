@@ -148,13 +148,26 @@ def _ensure_device_nic() -> None:
     mori.jit.config.detect_nic_type() (env -> /sys/class/infiniband -> lspci -> lib
     -> mlx5), the same detector v1 uses, so v2 picks the real NIC when present and
     mlx5 otherwise. Best-effort: if it cannot run, the C++ default (mlx5) applies.
+
+    On ionic the CQ layout has to be told as well, and even when MORI_DEVICE_NIC
+    was set by hand: the host creates a collapsed CQ whenever is_ccqe_enabled()
+    says so, and a kernel built without -DIONIC_CCQE polls it as a ring and hangs.
     """
-    if os.environ.get("MORI_DEVICE_NIC"):
+    if not os.environ.get("MORI_DEVICE_NIC"):
+        try:
+            from mori.jit.config import detect_nic_type
+
+            os.environ["MORI_DEVICE_NIC"] = detect_nic_type()
+        except Exception:
+            pass
+    if os.environ.get("MORI_DEVICE_NIC", "").lower() != "ionic":
+        return
+    if os.environ.get("MORI_DEVICE_IONIC_CCQE"):
         return
     try:
-        from mori.jit.config import detect_nic_type
+        from mori.jit.core import is_ccqe_enabled
 
-        os.environ["MORI_DEVICE_NIC"] = detect_nic_type()
+        os.environ["MORI_DEVICE_IONIC_CCQE"] = "1" if is_ccqe_enabled() else "0"
     except Exception:
         pass
 

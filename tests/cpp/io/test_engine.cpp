@@ -1612,6 +1612,68 @@ void CaseRdmaTransferBasic() {
               inbound.Message() + "'");
 }
 
+// Writes kXfer bytes from srcBase + offset to dstBase + offset over the dma-buf
+// registration path and checks the payload landed at dstBase + offset, not at
+// dstBase. Both bases point at allocations of at least allocSize bytes.
+void CheckDmabufInteriorWrite(ConnectedEnginePair& pair, void* srcBase, void* dstBase,
+                              size_t allocSize, size_t offset, size_t xfer) {
+  void* srcInterior = static_cast<char*>(srcBase) + offset;
+  void* dstInterior = static_cast<char*>(dstBase) + offset;
+
+  // Base regions get a sentinel (0x11); the src sub-range gets the payload (0xCD),
+  // the dst sub-range is cleared (0x00). If the MR wrongly resolves to the base,
+  // the write lands at dstBase and the checks below catch it two ways: the dst
+  // sub-range stays 0x00 (payload missing) and/or the dst base sentinel is clobbered.
+  HIP_RUNTIME_CHECK(hipMemset(srcBase, 0x11, allocSize));
+  HIP_RUNTIME_CHECK(hipMemset(dstBase, 0x11, allocSize));
+  HIP_RUNTIME_CHECK(hipMemset(srcInterior, 0xCD, xfer));
+  HIP_RUNTIME_CHECK(hipMemset(dstInterior, 0x00, xfer));
+  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
+
+  MemoryDesc srcDesc =
+      pair.initiator->RegisterMemory(srcInterior, xfer, 0, MemoryLocationType::GPU);
+  MemoryDesc dstDesc = pair.target->RegisterMemory(dstInterior, xfer, 0, MemoryLocationType::GPU);
+
+  TransferStatus status;
+  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
+  pair.initiator->Write(srcDesc, 0, dstDesc, 0, xfer, &status, uid);
+
+  std::string err;
+  Require(WaitTransferDone(&status, 5000, &err), "dmabuf interior transfer timeout: " + err);
+  Require(status.Succeeded(),
+          "dmabuf interior transfer failed: code=" + std::to_string(status.CodeUint32()) +
+              ", msg='" + status.Message() + "'");
+
+  std::vector<uint8_t> host(xfer);
+  HIP_RUNTIME_CHECK(hipMemcpy(host.data(), dstInterior, xfer, hipMemcpyDeviceToHost));
+  size_t badAt = xfer;
+  for (size_t i = 0; i < xfer; ++i) {
+    if (host[i] != 0xCD) {
+      badAt = i;
+      break;
+    }
+  }
+  Require(badAt == xfer,
+          "dma-buf interior-range transfer wrote wrong data at byte " + std::to_string(badAt) +
+              " (a zero dma-buf offset lands the write at the allocation base, not base+offset)");
+
+  std::vector<uint8_t> hostBase(xfer);
+  HIP_RUNTIME_CHECK(hipMemcpy(hostBase.data(), dstBase, xfer, hipMemcpyDeviceToHost));
+  size_t clobberAt = xfer;
+  for (size_t i = 0; i < xfer; ++i) {
+    if (hostBase[i] != 0x11) {
+      clobberAt = i;
+      break;
+    }
+  }
+  Require(clobberAt == xfer,
+          "dma-buf interior-range transfer clobbered the allocation base at byte " +
+              std::to_string(clobberAt) + " (indicates the MR resolved to offset 0)");
+
+  pair.initiator->DeregisterMemory(srcDesc);
+  pair.target->DeregisterMemory(dstDesc);
+}
+
 void CaseRdmaDmabufInteriorRangeTransfer() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -1634,63 +1696,64 @@ void CaseRdmaDmabufInteriorRangeTransfer() {
   void* dstBase = nullptr;
   HIP_RUNTIME_CHECK(hipMalloc(&srcBase, kAlloc));
   HIP_RUNTIME_CHECK(hipMalloc(&dstBase, kAlloc));
-  void* srcInterior = static_cast<char*>(srcBase) + kOffset;
-  void* dstInterior = static_cast<char*>(dstBase) + kOffset;
-
-  // Base regions get a sentinel (0x11); the src sub-range gets the payload (0xCD),
-  // the dst sub-range is cleared (0x00). If the MR wrongly resolves to the base,
-  // the write lands at dstBase and the checks below catch it two ways: the dst
-  // sub-range stays 0x00 (payload missing) and/or the dst base sentinel is clobbered.
-  HIP_RUNTIME_CHECK(hipMemset(srcBase, 0x11, kAlloc));
-  HIP_RUNTIME_CHECK(hipMemset(dstBase, 0x11, kAlloc));
-  HIP_RUNTIME_CHECK(hipMemset(srcInterior, 0xCD, kXfer));
-  HIP_RUNTIME_CHECK(hipMemset(dstInterior, 0x00, kXfer));
-  HIP_RUNTIME_CHECK(hipDeviceSynchronize());
-
-  MemoryDesc srcDesc =
-      pair.initiator->RegisterMemory(srcInterior, kXfer, 0, MemoryLocationType::GPU);
-  MemoryDesc dstDesc = pair.target->RegisterMemory(dstInterior, kXfer, 0, MemoryLocationType::GPU);
-
-  TransferStatus status;
-  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
-  pair.initiator->Write(srcDesc, 0, dstDesc, 0, kXfer, &status, uid);
-
-  std::string err;
-  Require(WaitTransferDone(&status, 5000, &err), "dmabuf interior transfer timeout: " + err);
-  Require(status.Succeeded(),
-          "dmabuf interior transfer failed: code=" + std::to_string(status.CodeUint32()) +
-              ", msg='" + status.Message() + "'");
-
-  std::vector<uint8_t> host(kXfer);
-  HIP_RUNTIME_CHECK(hipMemcpy(host.data(), dstInterior, kXfer, hipMemcpyDeviceToHost));
-  size_t badAt = kXfer;
-  for (size_t i = 0; i < kXfer; ++i) {
-    if (host[i] != 0xCD) {
-      badAt = i;
-      break;
-    }
-  }
-  Require(badAt == kXfer,
-          "dma-buf interior-range transfer wrote wrong data at byte " + std::to_string(badAt) +
-              " (a zero dma-buf offset lands the write at the allocation base, not base+offset)");
-
-  std::vector<uint8_t> hostBase(kXfer);
-  HIP_RUNTIME_CHECK(hipMemcpy(hostBase.data(), dstBase, kXfer, hipMemcpyDeviceToHost));
-  size_t clobberAt = kXfer;
-  for (size_t i = 0; i < kXfer; ++i) {
-    if (hostBase[i] != 0x11) {
-      clobberAt = i;
-      break;
-    }
-  }
-  Require(clobberAt == kXfer,
-          "dma-buf interior-range transfer clobbered the allocation base at byte " +
-              std::to_string(clobberAt) + " (indicates the MR resolved to offset 0)");
-
-  pair.initiator->DeregisterMemory(srcDesc);
-  pair.target->DeregisterMemory(dstDesc);
+  CheckDmabufInteriorWrite(pair, srcBase, dstBase, kAlloc, kOffset, kXfer);
   HIP_RUNTIME_CHECK(hipFree(srcBase));
   HIP_RUNTIME_CHECK(hipFree(dstBase));
+}
+
+// Two VMM allocations (POSIX fd handle type) mapped back to back into one VA
+// reservation, the way vLLM's cuMem allocator backs a large tensor.
+struct VmmPair {
+  void* va{nullptr};
+  size_t chunk{0};
+  hipMemGenericAllocationHandle_t handles[2]{};
+
+  explicit VmmPair(size_t chunkSize) {
+    hipMemAllocationProp prop{};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    prop.location.id = 0;
+    prop.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+    size_t gran = 0;
+    HIP_RUNTIME_CHECK(
+        hipMemGetAllocationGranularity(&gran, &prop, hipMemAllocationGranularityMinimum));
+    chunk = (chunkSize + gran - 1) / gran * gran;
+    HIP_RUNTIME_CHECK(hipMemAddressReserve(&va, 2 * chunk, 0, nullptr, 0));
+    for (int i = 0; i < 2; ++i) {
+      HIP_RUNTIME_CHECK(hipMemCreate(&handles[i], chunk, &prop, 0));
+      HIP_RUNTIME_CHECK(hipMemMap(At(i), chunk, 0, handles[i], 0));
+    }
+    hipMemAccessDesc access{};
+    access.location = prop.location;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    HIP_RUNTIME_CHECK(hipMemSetAccess(va, 2 * chunk, &access, 1));
+  }
+  ~VmmPair() {
+    for (int i = 0; i < 2; ++i) {
+      (void)hipMemUnmap(At(i), chunk);
+      (void)hipMemRelease(handles[i]);
+    }
+    (void)hipMemAddressFree(va, 2 * chunk);
+  }
+  void* At(int i) const { return static_cast<char*>(va) + i * chunk; }
+};
+
+void CaseRdmaDmabufVmmInteriorRangeTransfer() {
+  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
+
+  // Same check as CaseRdmaDmabufInteriorRangeTransfer for VMM memory, which
+  // TryExportDmabufFd exports through its allocation handle. The registered range
+  // sits inside the second allocation of the reservation, so its dma-buf offset
+  // must be relative to that allocation, not to the reservation base.
+  ScopedEnvVar enableDmabuf("MORI_ENABLE_DMABUF_REG", "1");
+  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
+
+  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dmabuf_vmm_interior", true);
+
+  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  VmmPair src(64 * 1024 * 1024);
+  VmmPair dst(64 * 1024 * 1024);
+  CheckDmabufInteriorWrite(pair, src.At(1), dst.At(1), src.chunk, src.chunk / 2, 1 * 1024 * 1024);
 }
 
 void CaseRdmaNotificationDisabledBehavior() {
@@ -2216,6 +2279,7 @@ int main(int argc, char* argv[]) {
        CaseRdmaBackendCanHandleRejectsSentinelPortRemote},
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
+      {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},

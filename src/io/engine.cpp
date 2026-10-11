@@ -597,6 +597,14 @@ bool IOEngine::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
   return false;
 }
 
+bool IOEngine::PopPeerFailure(PeerFailureEvent* out) {
+  if (out == nullptr) return false;
+  for (auto& it : backends) {
+    if (it.second->PopPeerFailure(out)) return true;
+  }
+  return false;
+}
+
 StatusCode IOEngine::WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs) {
   if (statuses.empty()) return StatusCode::SUCCESS;
 

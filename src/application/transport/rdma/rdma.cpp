@@ -504,6 +504,22 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
   return handle;
 }
 
+// hipMemRetainAllocationHandle adds a reference only from HIP 7.12 on
+// (ROCm/rocm-systems 10a4a3e11d). Earlier runtimes, including ROCm 7.2.x, return
+// the owner's handle without one, so releasing it there would drop the owner's
+// reference and make the owner's own hipMemRelease a second release.
+static bool RetainAddsReference() {
+  static const bool adds = [] {
+    int version = 0;
+    if (hipRuntimeGetVersion(&version) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+    return version >= 71200000;
+  }();
+  return adds;
+}
+
 // Export a dmabuf fd for the GPU buffer at `ptr`, and report the offset of `ptr`
 // within the exported dmabuf via `*offset`. Returns -1 if unsupported.
 //
@@ -524,6 +540,35 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
     *offset = off;
     return fd;
   }
+  // VMM memory (hipMemCreate + hipMemMap): hipMemGetHandleForAddressRange keeps
+  // a reference to the backing allocation after the fd is closed, so the memory
+  // is never freed when its owner unmaps and releases it (e.g. vLLM sleep mode).
+  // Exporting the allocation handle does not; it needs the allocation to have
+  // been created with the POSIX fd handle type, otherwise fall through.
+  hipMemGenericAllocationHandle_t handle;
+  if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
+    hipError_t exportErr =
+        hipMemExportToShareableHandle(&fd, handle, hipMemHandleTypePosixFileDescriptor, 0);
+    if (RetainAddsReference()) (void)hipMemRelease(handle);
+    if (exportErr == hipSuccess && fd >= 0) {
+      // The fd covers only the allocation backing `ptr`, so use it only if
+      // [ptr, ptr + size) lies within that allocation.
+      hipDeviceptr_t base = 0;
+      size_t rangeSize = 0;
+      if (hipMemGetAddressRange(&base, &rangeSize, reinterpret_cast<hipDeviceptr_t>(ptr)) ==
+              hipSuccess &&
+          base != 0) {
+        uint64_t allocOffset = reinterpret_cast<uint64_t>(ptr) - reinterpret_cast<uint64_t>(base);
+        if (allocOffset + size <= rangeSize) {
+          *offset = allocOffset;
+          return fd;
+        }
+      }
+      close(fd);
+    }
+  }
+  (void)hipGetLastError();
+  fd = -1;
   hipError_t err = hipMemGetHandleForAddressRange(&fd, reinterpret_cast<hipDeviceptr_t>(ptr), size,
                                                   hipMemRangeHandleTypeDmaBufFd, 0);
   if (err != hipSuccess) {
