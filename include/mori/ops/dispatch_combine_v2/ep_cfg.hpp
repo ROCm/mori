@@ -259,6 +259,11 @@ struct EpCfg {
   // cco window. Off, every block holding tokens for a destination makes its own RMW.
   // Off is free for the same reason as scaleBytes.
   bool aggReserve = false;
+  // Dispatch only: the most tokens a call of this variant is handed, when the caller
+  // knows it is fewer than maxTokPerRank (a token-count bucket). 0 = maxTokPerRank.
+  // Only the code sized to one call reads it (EpCallTok); maxTokPerRank stays the
+  // stride every source token is encoded with, which combine decodes.
+  int callTokMax = 0;
 };
 
 template <typename Self, typename Visit>
@@ -280,10 +285,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(aggReserve);
+  MORI_FIELD(callTokMax);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 16, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 17, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -347,6 +353,11 @@ constexpr int EpMaxRecv(const EpCfg& c) {
   return c.maxRecv > 0 ? c.maxRecv : c.worldSize * c.maxTokPerRank;
 }
 
+// The most tokens one call holds. Not a stride: indices keep maxTokPerRank.
+constexpr int EpCallTok(const EpCfg& c) {
+  return c.callTokMax > 0 && c.callTokMax < c.maxTokPerRank ? c.callTokMax : c.maxTokPerRank;
+}
+
 // Combine's shared memory: one pointer array per warp for the topk sources,
 // plus a second one for the weight pointers when weights are enabled.
 constexpr int EpCombineSharedBytes(const EpCfg& c) {
@@ -381,7 +392,7 @@ constexpr int EpScaleStride(const EpCfg& c) {
 
 // The gfx1250 scale staging: a block lays the row for destination slot s of peer p
 // at row (b mod EpScaleWrap) + (s - b) of p's part, b being the block's first slot at
-// p. Under aggReserve a rank holds one run of at most maxTokPerRank slots at p, and
+// p. Under aggReserve a rank holds one run of at most EpCallTok slots at p, and
 // the wrap is a power of two at least that long, so a block's rows never wrap, two
 // blocks of the rank never share a row, and every row is below twice the wrap --
 // the part is linear in maxTokPerRank instead of p's whole recv capacity
@@ -394,7 +405,7 @@ constexpr int EpPow2Ceil(int v) {
   return r;
 }
 constexpr int EpScaleWrap(const EpCfg& c) {
-  return EpPow2Ceil(c.aggReserve ? c.maxTokPerRank : EpMaxRecv(c));
+  return EpPow2Ceil(c.aggReserve ? EpCallTok(c) : EpMaxRecv(c));
 }
 constexpr int EpScaleRows(const EpCfg& c) {
   return c.aggReserve ? 2 * EpScaleWrap(c) : EpMaxRecv(c);
@@ -542,7 +553,8 @@ constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
 // rank is not checked: it is a launch argument, so the op layer owns that bound.
 constexpr bool EpCfgIsValid(const EpCfg& c) {
-  return c.worldSize > 0 && c.hiddenDim > 0 && c.maxTokPerRank > 0 && c.numExpertPerToken > 0 &&
+  return c.worldSize > 0 && c.hiddenDim > 0 && c.maxTokPerRank > 0 && c.callTokMax >= 0 &&
+         c.numExpertPerToken > 0 &&
          c.numExpertPerRank > 0 && c.blockNum > 0 && (c.waveSize == 32 || c.waveSize == 64) &&
          c.warpPerBlock > 0 && EpBlockThreads(c) <= 1024 &&
          // The recv capacity must cover the worst case: the device slot counter is

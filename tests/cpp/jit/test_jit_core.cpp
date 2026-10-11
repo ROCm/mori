@@ -149,6 +149,9 @@ TEST(Render, EveryScalarFieldReachesTheText) {
   c = base;
   c.useWeights = false;
   differs(c, "useWeights");
+  c = base;
+  c.callTokMax = 64;
+  differs(c, "callTokMax");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {
