@@ -151,13 +151,14 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   // text, same sha256, same cache entry.
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
-    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + destTokId, so
-    // it has to be the peer's full receive capacity and not the smaller per-peer
-    // share of the idx/wt pool. BYTES is the caller's row, STRIDE what we lay it
-    // down at: staging reads one and writes the other.
+    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + row
+    // (EpScaleRows, EpScaleRow), and EpStagingScaleBytes sizes the region from the
+    // same function. NOT the smaller per-peer share of the idx/wt pool. BYTES is the
+    // caller's row, STRIDE what we lay it down at: staging reads one and writes the
+    // other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
-                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) + "\n";
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpScaleRows(cfg)) + "\n";
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";

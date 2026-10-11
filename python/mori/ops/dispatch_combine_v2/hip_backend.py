@@ -143,7 +143,11 @@ def scale_stride_bytes(scale_bytes: int) -> int:
 
 
 def ep_staging_bytes(
-    world_size: int, max_recv: int, scale_bytes: int, max_tok_per_rank: int = 0
+    world_size: int,
+    max_recv: int,
+    scale_bytes: int,
+    max_tok_per_rank: int = 0,
+    agg_reserve: bool = False,
 ) -> int:
     """Total bytes for the gfx1250 dispatch staging buffer.
 
@@ -155,6 +159,12 @@ def ep_staging_bytes(
     Pass ``max_tok_per_rank`` with it; the kernel indexes staging at the cap it
     resolved, so a buffer sized at 0 is not a short allocation that faults but a
     write past the end of whatever the caller handed us.
+
+    ``agg_reserve`` is EpCfg.aggReserve: true for every gfx1250 intranode dispatch
+    built without tok_off_ext. It switches the scale part to EpScaleRows' linear
+    numbering, 2 * pow2ceil(max_tok_per_rank) rows a peer, which can be MORE than
+    max_recv at EP1/EP2 -- so it needs ``max_tok_per_rank`` too, and passing the
+    wrong flag sizes the region for a numbering the kernel does not use.
     """
     recv = max_recv if max_recv > 0 else world_size * max_tok_per_rank
     if recv <= 0:
@@ -177,7 +187,19 @@ def ep_staging_bytes(
     off = a128(off + max_blocks * world_size * 4)  # blkCount
     if scale_bytes > 0:
         s_stride = scale_stride_bytes(scale_bytes)
-        off = a128(off + world_size * recv * s_stride)
+        if agg_reserve:
+            if max_tok_per_rank <= 0:
+                raise ValueError(
+                    "ep_staging_bytes: agg_reserve numbers the scale rows from "
+                    "max_tok_per_rank (EpScaleRows), so it needs one."
+                )
+            wrap = 1
+            while wrap < max_tok_per_rank:
+                wrap <<= 1
+            s_rows = 2 * wrap
+        else:
+            s_rows = recv
+        off = a128(off + world_size * s_rows * s_stride)
     return off
 
 
@@ -420,8 +442,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.dispatch_staging = None
         if self._is1250 and not cfg.is_internode:
             raw_scale = self._scale_i32(cfg) * 4
+            # The plans below get tok_off_ext from this same flag, and EpCfg
+            # derives aggReserve from it (ep_spec.cpp).
             stg_bytes = ep_staging_bytes(
-                cfg.world_size, cfg.effective_max_recv, raw_scale
+                cfg.world_size,
+                cfg.effective_max_recv,
+                raw_scale,
+                max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+                agg_reserve=not self._tokoff_wanted,
             )
             if stg_bytes > 0:
                 self.dispatch_staging = torch.zeros(
