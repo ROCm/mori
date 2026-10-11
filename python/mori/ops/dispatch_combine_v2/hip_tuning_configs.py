@@ -169,7 +169,7 @@ _DISPATCH_TABLE: dict = {
         # -80.9..-83.3. 2048 is the only point 64x16 wins; the edge between them is unswept.
         (16, 7168, 6, None): {
             None: ((None, 64, 16),),
-            "fp4_disp_bf16_comb": ((4095, 64, 16), (None, 128, 16)),
+            "fp4_disp_bf16_comb": ((512, 64, 16), (4095, 64, 16), (None, 128, 16)),
         },
         # EP32 on eight 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11, one M=16384 plan, 3
         # alternating rounds, dispatch us (ab_1011_213858_566770):
