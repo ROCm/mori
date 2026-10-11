@@ -181,6 +181,28 @@ _DISPATCH_TABLE: dict = {
             None: ((None, 64, 16),),
             "fp4": ((4095, 64, 16), (None, 128, 16)),
         },
+        # EP32 on eight 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11, one M=16384 plan, 3
+        # alternating rounds, dispatch us (ab_1011_213858_566770):
+        #   ct     64x16  128x16 256x16
+        #   64     33.60  33.97  33.12
+        #   512    38.14  39.26  41.06
+        #   1024   57.01  47.75  50.79
+        #   2048   97.24  80.83  68.47
+        #   4096  144.96 145.69 133.17
+        #   8192  239.43 226.28 239.29
+        #   16384 459.61 432.08 414.95
+        # 384 and 512 blocks hang (384 at 16384 tokens, 512 at the first call). The edges between
+        # the swept points are unswept.
+        (32, 7168, 6, None): {
+            None: ((None, 64, 16),),
+            "fp4_disp_bf16_comb": (
+                (512, 64, 16),
+                (1024, 128, 16),
+                (4096, 256, 16),
+                (8192, 128, 16),
+                (None, 256, 16),
+            ),
+        },
     },
 }
 
@@ -211,6 +233,7 @@ _COMBINE_TABLE: dict = {
         # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
+        (32, 7168, 6, None): ((None, 64, 8),),
     },
 }
 
@@ -256,6 +279,21 @@ _COMBINE_PUSH_TABLE: dict = {
             # The edge between 512 and 1024 is unswept.
             (16, 7168, 6, None): (
                 (512, 64, 8),
+                (8192, 128, 16),
+                (None, 128, 24),
+            ),
+            # EP32, 2026-10-11, the run of the EP32 dispatch entry, combine us:
+            #   ct     64x8   128x16 128x24 256x8  256x16
+            #   64     16.19  22.65  23.19  16.07  22.02
+            #   512    32.70  34.52  35.56  28.03  34.50
+            #   1024   48.40  45.94  47.71  46.74  44.17
+            #   2048   77.71  63.25  65.13  76.20  64.69
+            #   4096  134.05 105.14 105.87 112.95 106.61
+            #   8192  243.99 191.68 197.61 209.69 195.29
+            #   16384 462.90 371.53 358.19 402.34 368.26
+            (32, 7168, 6, None): (
+                (512, 256, 8),
+                (1024, 256, 16),
                 (8192, 128, 16),
                 (None, 128, 24),
             ),
