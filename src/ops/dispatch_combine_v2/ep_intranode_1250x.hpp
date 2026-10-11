@@ -1196,7 +1196,11 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           : _metaPlain ? ((warpId >= warpNum - kPM) ? (warpId - (warpNum - kPM)) : nRuns)
                        : warpId;
       bool _bx = false;
-      if constexpr (kMetaLo) {
+      // A warp holding two runs loads both, waits once and stores both, instead of waiting for the
+      // first run's stores before loading the second. Under kMetaAllW that is every warp of a
+      // 16-warp block at 32 ranks; runs short enough for the lanes (kMetaDirect) keep the lanes.
+      constexpr bool kMetaPair = kMetaLo || (kMetaAllW && kMetaDirect == 0);
+      if constexpr (kMetaPair) {
         const int _r0b = __builtin_amdgcn_readfirstlane(_run0);
         if (_metaHi && _r0b + _metaWarps < nRuns) {
           const int subB = (mtileBytesM / 2) & ~127;
@@ -1310,7 +1314,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           }
         }
       }
-      if (!kMetaLo || !_bx)
+      if (!kMetaPair || !_bx)
       for (int r = _run0; r < nRuns; r += _metaWarps) {
         int peer = _runPeerMinor ? (r % npes) : (r / split);
         int part = _runPeerMinor ? (r / npes) : (r - peer * split);
