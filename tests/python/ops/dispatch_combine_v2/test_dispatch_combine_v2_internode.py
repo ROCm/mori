@@ -364,7 +364,13 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
         if cfg.is_asymmetric_dtype
         else dispatch_out[0]
     )
-    out, out_w = op.combine(combine_input, wts, routing=dispatch_out[5])
+    # AsyncLL is the exception to "always fold here": its combine payload is
+    # hidden-only, so the request raises rather than returning a tensor. The
+    # hidden check below still runs, which is the half that can be wrong.
+    folds_weights = not getattr(cfg, "async_ll", False)
+    out, out_w = op.combine(
+        combine_input, wts if folds_weights else None, routing=dispatch_out[5]
+    )
     torch.cuda.synchronize()
     comm.barrier()
 
@@ -392,11 +398,15 @@ def _verify_once(op, cfg, dist_handle, args, comm, inp, idx, wts, sc):
             <= eps * unique_pes_column * input_magnitude.clamp(min=1.0)
         ).all()
     )
-    weights_ok = bool(
-        (
-            (out_w.cpu() - unique_pes_column * wts.float().cpu()).abs()
-            <= 2e-3 * unique_pes_column
-        ).all()
+    weights_ok = (
+        True
+        if out_w is None
+        else bool(
+            (
+                (out_w.cpu() - unique_pes_column * wts.float().cpu()).abs()
+                <= 2e-3 * unique_pes_column
+            ).all()
+        )
     )
     if not (hidden_ok and weights_ok) and dist_handle.rank == 0:
         print(
@@ -1640,7 +1650,15 @@ def main(argv):
             combine_input = (
                 recv_x.to(cfg.combine_dtype) if cfg.is_asymmetric_dtype else recv_x
             )
-            out, out_w = op.combine(combine_input, wts, routing=routing)
+            # `wts` is a REQUEST for the weight fold, and AsyncLL cannot serve
+            # one: its combine payload is hidden-only, so there is no per-token
+            # metadata to accumulate (v1's AsyncLL is the same). Asking anyway
+            # raises; the weight half of the check is skipped for that family
+            # rather than compared against a tensor it never writes.
+            wants_weights = not getattr(cfg, "async_ll", False)
+            out, out_w = op.combine(
+                combine_input, wts if wants_weights else None, routing=routing
+            )
             torch.cuda.synchronize()
             comm.barrier()
 
@@ -1673,18 +1691,28 @@ def main(argv):
             hidden_ok = bool(((got - expected).abs() <= bound).all())
             # Weights are transported as f32 and summed the same way, so their
             # bound is much tighter -- but still proportional to unique_pes.
-            got_weights = out_w.cpu()
-            weights_ok = bool(
-                (
-                    (got_weights - expected_weights).abs() <= 2e-3 * unique_pes_column
-                ).all()
+            got_weights = out_w.cpu() if out_w is not None else None
+            weights_ok = (
+                True
+                if got_weights is None
+                else bool(
+                    (
+                        (got_weights - expected_weights).abs()
+                        <= 2e-3 * unique_pes_column
+                    ).all()
+                )
             )
 
             if not (hidden_ok and weights_ok) and rank == 0:
                 print(f"#   hidden_ok={hidden_ok} weights_ok={weights_ok}", flush=True)
-                ratio = (out_w.cpu() / wts.float().cpu().clamp(min=1e-6))[:4]
+                ratio = (
+                    (got_weights / wts.float().cpu().clamp(min=1e-6))[:4]
+                    if got_weights is not None
+                    else None
+                )
                 print(
-                    f"#   effective multiplier got_w/wts[0,:4]={ratio[0, :4].tolist()} "
+                    f"#   effective multiplier got_w/wts[0,:4]="
+                    f"{ratio[0, :4].tolist() if ratio is not None else 'n/a'} "
                     f"(expected unique_pes[0]={int(unique_pes[0])})",
                     flush=True,
                 )
@@ -1721,35 +1749,43 @@ def main(argv):
                     f"got_nonzero={int((got != 0).sum())}/{got.numel()}",
                     flush=True,
                 )
-                want_weights = expected_weights
-                # Distinguish "the kernel never wrote it" from "the base reads
-                # the wrong place": read the region the kernel targets directly.
-                from mori.tensor_utils import from_gpu_ptr
-
-                for region_name in (
-                    "combine_out_weights",
-                    "inp_weights",
-                    "dispatch_out_weights",
-                ):
-                    region_values = from_gpu_ptr(
-                        op.arena.local_ptr(region_name),
-                        (min(8, args.topk * 2),),
-                        torch.float32,
-                    )
+                if got_weights is None:
+                    # Nothing to diff: this family was asked for hidden only, so
+                    # a weight failure here would be the hidden check's.
                     print(
-                        f"#   region {region_name}[:8] = "
-                        f"{region_values.cpu().tolist()}",
+                        "#   weights: not requested (AsyncLL folds none)",
                         flush=True,
                     )
-                print(
-                    f"#   weights: "
-                    f"max|diff|={(got_weights - want_weights).abs().max():.4g} "
-                    f"got[0,:4]={got_weights[0, :4].tolist()} "
-                    f"want[0,:4]={want_weights[0, :4].tolist()} "
-                    f"unique_pes[:4]={unique_pes[:4].tolist()} "
-                    f"total_recv={int(total_recv[0])}",
-                    flush=True,
-                )
+                else:
+                    want_weights = expected_weights
+                    # Distinguish "the kernel never wrote it" from "the base
+                    # reads the wrong place": read the region it targets.
+                    from mori.tensor_utils import from_gpu_ptr
+
+                    for region_name in (
+                        "combine_out_weights",
+                        "inp_weights",
+                        "dispatch_out_weights",
+                    ):
+                        region_values = from_gpu_ptr(
+                            op.arena.local_ptr(region_name),
+                            (min(8, args.topk * 2),),
+                            torch.float32,
+                        )
+                        print(
+                            f"#   region {region_name}[:8] = "
+                            f"{region_values.cpu().tolist()}",
+                            flush=True,
+                        )
+                    print(
+                        f"#   weights: "
+                        f"max|diff|={(got_weights - want_weights).abs().max():.4g} "
+                        f"got[0,:4]={got_weights[0, :4].tolist()} "
+                        f"want[0,:4]={want_weights[0, :4].tolist()} "
+                        f"unique_pes[:4]={unique_pes[:4].tolist()} "
+                        f"total_recv={int(total_recv[0])}",
+                        flush=True,
+                    )
             failed_ranks = dist_handle.allreduce_sum(
                 0 if (hidden_ok and weights_ok) else 1
             )
