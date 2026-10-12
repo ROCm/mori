@@ -362,10 +362,8 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   EXPECT_TRUE(registry.Get("cold")->Contains("moved"))
       << "source was deleted during the promotion, so there is nothing to reclaim";
 
-  // The parked source is what occupies the cold medium, so that is the bucket
-  // the master sees over its watermark; the hot medium is comfortably under.
-  // The victim therefore names SSD -- the copy to free -- and not the promoted
-  // DRAM copy, which a tier-less request used to reach first via the placement.
+  // Only SSD (the parked source) is over its watermark, so the victim must name
+  // SSD, not the promoted DRAM copy the placement points at.
   InMemoryMasterMetadataStore store;
   const auto now = Clock::now();
   RegisterNode(&store, now);
@@ -388,77 +386,6 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   // The promoted copy is the only one left, so the key is still servable.
   EXPECT_TRUE(registry.Get("hot")->Contains("moved"))
       << "the evict drained the promoted target instead of the parked source";
-}
-
-// A copy-mode promotion leaves a key in BOTH media, and the master charges
-// each copy to its own tier.  When only SSD is over budget the master must free
-// the SSD copy -- and only that one.  A tier-less request could not say so: the
-// pool went by the placement, which a promotion points at the DRAM copy, so SSD
-// pressure demoted the hot copy (cold already held it), freed DRAM instead, and
-// left SSD exactly as full as before.
-TEST(MasterEvictionChain, SsdPressureFreesOnlyTheSsdCopyOfAPromotedKey) {
-  constexpr auto kShortLease = std::chrono::milliseconds(50);
-  LocalCopyEngine engine;
-  BackendRegistry registry;
-  PageBackend::OwnershipConfig hot_ownership;
-  hot_ownership.buffer_sizes = {4 * kPageSize};
-  auto hot = MakePageBackend(TierType::DRAM, kPageSize, hot_ownership, kNoExpiry, kShortLease);
-  ASSERT_TRUE(hot->Init(&engine));
-  ASSERT_TRUE(registry.Register("hot", std::move(hot)));
-  PageBackend::OwnershipConfig cold_ownership;
-  cold_ownership.buffer_sizes = {4 * kPageSize};
-  auto cold = MakePageBackend(TierType::SSD, kPageSize, cold_ownership, kNoExpiry, kShortLease);
-  ASSERT_TRUE(cold->Init(&engine));
-  ASSERT_TRUE(registry.Register("cold", std::move(cold)));
-
-  auto tiers = HotColdOnEvict();
-  tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;
-  tiers.back().promote_mode = PoolTransitionMode::kCopy;
-  auto compiled = LogicalTierGraph::Compile(tiers, registry);
-  ASSERT_TRUE(compiled.ok()) << compiled.error;
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
-
-  PoolPlacementRequest request;
-  request.key = "dual";
-  request.size = kPageSize;
-  request.tier = TierType::DRAM;
-  request.logical_tier = "cold";
-  auto allocation = pool.BatchAllocate({request}).front();
-  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
-  ASSERT_TRUE(pool.BatchCommit({PoolCommitRequest{
-                                   {allocation.backend_id, allocation.allocation.slot_id}, "dual"}})
-                  .front()
-                  .commit.success);
-  ASSERT_TRUE(pool.BatchResolve({"dual"}, false).front().resolved.found);
-  ASSERT_TRUE(
-      WaitFor([&] { return registry.Get("hot")->Contains("dual"); }, std::chrono::seconds(2)))
-      << "promotion never reached the hot tier";
-  ASSERT_TRUE(registry.Get("cold")->Contains("dual")) << "copy promotion removed the source";
-  // Let the promotion's read lease on the cold copy lapse.
-  std::this_thread::sleep_for(4 * kShortLease);
-
-  InMemoryMasterMetadataStore store;
-  const auto now = Clock::now();
-  RegisterNode(&store, now);
-  std::map<TierType, TierCapacity> caps;
-  caps[TierType::SSD] = TierCapacity{4 * kPageSize, 0, kPageSize};
-  caps[TierType::DRAM] = TierCapacity{4 * kPageSize, 3 * kPageSize, kPageSize};
-  ReportHeartbeat(&store, /*seq=*/1, now, caps, TierType::SSD, "cold", {"dual"},
-                  /*full_sync=*/true);
-
-  PoolDispatcher dispatcher(&pool);
-  EvictionManager manager(store, OneSecondRounds(), &dispatcher);
-  manager.Start();
-  const bool freed =
-      WaitFor([&] { return !registry.Get("cold")->Contains("dual"); }, std::chrono::seconds(8));
-  manager.Stop();
-
-  ASSERT_TRUE(freed) << "SSD was over budget but its copy was never freed";
-  EXPECT_EQ(dispatcher.Victims().front(), (EvictionVictim{"dual", TierType::SSD}));
-  EXPECT_TRUE(registry.Get("hot")->Contains("dual"))
-      << "SSD pressure freed the DRAM copy as well (or instead)";
-  ASSERT_TRUE(pool.PlacementBackend("dual").has_value());
-  EXPECT_EQ(*pool.PlacementBackend("dual"), registry.BackendId(registry.Get("hot")));
 }
 
 // Master-side eviction reads one capacity per TierType, and a client with a

@@ -421,9 +421,7 @@ TEST_F(PeerServiceDispatchTest, BatchResolveReportsTheServingTier) {
 }
 
 TEST_F(PeerServiceDispatchTest, EvictWithATierFreesOnlyThatMedium) {
-  // The master charged this victim to the second medium.  A key mirrored
-  // across media loses exactly that copy; the other one is not the master's to
-  // free, because it was measured against a different budget.
+  // A mirrored key charged to the second medium loses only that copy.
   SeedKey(kFirstByTier, "mirrored", 111);
   SeedKey(kSecondByTier, "mirrored", 222);
 
@@ -440,13 +438,12 @@ TEST_F(PeerServiceDispatchTest, EvictWithATierFreesOnlyThatMedium) {
   EXPECT_FALSE(Backend(kSecondByTier)->Contains("mirrored"));
 }
 
-TEST_F(PeerServiceDispatchTest, EvictWithoutTiersFreesTheCopyThatHoldsTheKey) {
-  // An older master sends no tiers.  Each key is then freed from the medium
-  // that holds it -- the first owner in read order here, since the seed went
-  // around the pool and left no placement -- and never from every medium at
-  // once, which used to delete copies no budget had asked for.
+TEST_F(PeerServiceDispatchTest, EvictWithoutUsableTiersFreesTheCopyThatHoldsTheKey) {
+  // No tiers (an older master), or a count that does not match `keys`: each
+  // key is freed from the one medium that holds it, never from every medium.
   SeedKey(kFirstByTier, "mirrored", 111);
   SeedKey(kSecondByTier, "mirrored", 222);
+  SeedKey(kSecondByTier, "b", 20);
 
   ::umbp::EvictKeyRequest req;
   req.add_keys("mirrored");
@@ -454,27 +451,20 @@ TEST_F(PeerServiceDispatchTest, EvictWithoutTiersFreesTheCopyThatHoldsTheKey) {
   grpc::ClientContext ctx;
   ASSERT_TRUE(stub_->EvictKey(&ctx, req, &resp).ok());
   ASSERT_EQ(resp.evicted_size(), 1);
-  EXPECT_EQ(resp.evicted(0).bytes_freed(), 111u);
+  EXPECT_EQ(resp.evicted(0).bytes_freed(), 111u);  // first owner in read order
   EXPECT_FALSE(Backend(kFirstByTier)->Contains("mirrored"));
   EXPECT_TRUE(Backend(kSecondByTier)->Contains("mirrored"));
-}
 
-TEST_F(PeerServiceDispatchTest, EvictWithMismatchedTierCountIsUnscoped) {
-  // `tiers` is parallel to `keys`; anything else cannot be paired up, so it is
-  // ignored rather than misapplied to the wrong keys.
-  SeedKey(kFirstByTier, "a", 10);
-  SeedKey(kSecondByTier, "b", 20);
-
-  ::umbp::EvictKeyRequest req;
-  req.add_keys("a");
-  req.add_keys("b");
-  req.add_tiers(Proto(kSecondByTier));
-  ::umbp::EvictKeyResponse resp;
-  grpc::ClientContext ctx;
-  ASSERT_TRUE(stub_->EvictKey(&ctx, req, &resp).ok());
-  ASSERT_EQ(resp.evicted_size(), 2);
-  EXPECT_EQ(resp.evicted(0).bytes_freed(), 10u);
-  EXPECT_EQ(resp.evicted(1).bytes_freed(), 20u);
+  ::umbp::EvictKeyRequest mismatched;
+  mismatched.add_keys("mirrored");
+  mismatched.add_keys("b");
+  mismatched.add_tiers(Proto(kFirstByTier));
+  ::umbp::EvictKeyResponse resp2;
+  grpc::ClientContext ctx2;
+  ASSERT_TRUE(stub_->EvictKey(&ctx2, mismatched, &resp2).ok());
+  ASSERT_EQ(resp2.evicted_size(), 2);
+  EXPECT_EQ(resp2.evicted(0).bytes_freed(), 222u);  // the tier was not misapplied
+  EXPECT_EQ(resp2.evicted(1).bytes_freed(), 20u);
 }
 
 TEST_F(PeerServiceDispatchTest, EvictOfAnAbsentKeyReportsZeroBytes) {

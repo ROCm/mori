@@ -72,26 +72,9 @@ TEST(LruMasterEvictStrategy, PicksOldestFirstUntilBudgetMet) {
   EXPECT_EQ(victims["n1"][1].key, "b");
 }
 
-TEST(LruMasterEvictStrategy, VictimCarriesTheTierItWasChargedTo) {
-  LruMasterEvictStrategy strategy;
-  auto now = Clock::now();
-  std::vector<EvictionCandidate> candidates = {
-      MakeCandidate("k", "n1", TierType::SSD, 100, now),
-  };
-  std::unordered_map<std::string, std::map<TierType, int64_t>> budget;
-  budget["n1"][TierType::SSD] = 100;
-
-  auto victims = strategy.SelectVictims(candidates, budget);
-  ASSERT_EQ(victims["n1"].size(), 1u);
-  // The peer frees exactly this medium's copy, so the tier must survive
-  // selection: without it an SSD-pressure victim could free the DRAM copy.
-  EXPECT_EQ(victims["n1"][0], (EvictionVictim{"k", TierType::SSD}));
-}
-
 TEST(LruMasterEvictStrategy, KeyOverBudgetInTwoTiersIsOneVictimPerTier) {
-  // A copy-mode promotion leaves the same key in DRAM and SSD.  When both
-  // media are over budget the master charges each copy to its own tier, and
-  // the peer must be told to free both -- one victim per (key, tier).
+  // A key in DRAM and SSD, both over budget: one victim per (key, tier), each
+  // carrying the tier its copy was charged to.
   LruMasterEvictStrategy strategy;
   auto now = Clock::now();
   std::vector<EvictionCandidate> candidates = {

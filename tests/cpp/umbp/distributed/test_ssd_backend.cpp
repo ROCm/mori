@@ -558,7 +558,7 @@ TEST_F(SsdBackendTest, EvictResultsAreOnePerKeyInRequestOrder) {
 }
 
 // ---------------------------------------------------------------------------
-//  Local eviction: the backend offers order, the pool decides
+//  Local eviction: the backend offers order; the pool decides
 // ---------------------------------------------------------------------------
 
 TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
@@ -573,8 +573,7 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   EXPECT_EQ(offers[1], (EvictionOffer{"b", 2048}));
   EXPECT_EQ(offers[2], (EvictionOffer{"c", 1024}));
 
-  // A staged read holds "b" for its lease, and Evict would refuse it, so it is
-  // not offered at all.
+  // A staged read's lease makes "b" unevictable, so it is not offered.
   ASSERT_TRUE(backend->BatchResolve({"b"}, false)[0].found);
   offers = backend->EvictionCandidates(10);
   for (const auto& offer : offers) EXPECT_NE(offer.key, "b");
@@ -582,9 +581,7 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
 }
 
 TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
-  // SSD's watermark eviction used to run inside every write.  It now lives in
-  // the pool, on the pool's thread, and reaches this medium through Evict()
-  // like any master-driven eviction does.
+  // SSD's watermark eviction now runs in the pool and reaches it via Evict().
   constexpr uint64_t kCapacity = 1024 * 1024;
   SsdBackend::Config cfg;
   cfg.page_size = kPageSize;
@@ -602,8 +599,7 @@ TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
   ASSERT_TRUE(registry.Register("ssd", std::move(owned)));
   PeerPool pool(&registry, MakeSingleBackendPolicy());
 
-  // Fill past the high watermark.  Record overheads make the exact count a
-  // property of the segment format, so fill by measurement, not arithmetic.
+  // Fill past the high watermark by measurement (record overhead varies).
   std::vector<std::string> keys;
   const auto used = [&] { return ssd->Capacity().total_bytes - ssd->Capacity().available_bytes; };
   while (used() < kCapacity * 9 / 10) {
