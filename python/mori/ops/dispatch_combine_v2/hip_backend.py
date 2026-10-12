@@ -830,6 +830,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "reach only ranks inside this one's flat LSA window. Use 'sdma', "
                 "whose cross-node peers go over ccoGda"
             )
+        # Refused rather than left to hang: on gfx1250 the LSA transfer bodies do
+        # not complete. Measured at EP4 on an MI455X -- sdma sweeps 64..2048 and
+        # verifies every point, lsa pins all four GPUs at 100% on the first one
+        # until something kills it. Undiagnosed; see the LSA section of
+        # ep_asyncll_kernel.hpp. The failure gives no message of its own, which is
+        # the one thing a gate here can fix.
+        if cfg.async_ll_transport == "lsa" and self._is1250:
+            bad.append(
+                "async_ll_transport='lsa' on gfx125x: the peer-store transfer "
+                "does not complete on this arch (it hangs rather than failing). "
+                "Use async_ll_transport='sdma'"
+            )
         # Without this the communicator comes back with zero SDMA queues and every
         # put is a silent no-op -- the tokens never move and the receiver spins on
         # a count that never arrives. A hang with no message is the worst way to

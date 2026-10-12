@@ -545,6 +545,16 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // So: sdma is the default on evidence, not just because it is the internode
 // shape. lsa is worth keeping for the small-batch case and for a caller with an
 // empty seam, since it also costs CUs that an SDMA transfer leaves free.
+//
+// KNOWN BROKEN on gfx1250 (wave32). The numbers above are MI355X (gfx950,
+// wave64). On an MI455X at EP4 the sdma transport sweeps 64..2048 in about two
+// minutes and verifies every point, while lsa hangs on the FIRST one -- four
+// GPUs pinned at 100% for half an hour until the harness timeout kills it.
+// Unlike sdma, these bodies move the bytes from the grid itself over the flat
+// peer VA, so they are the half of AsyncLL whose correctness depends on the
+// memory model rather than on an engine. Not yet diagnosed. test_asyncll.py
+// exercises the sdma transport only, which is why the gfx1250 enablement passed
+// without touching this.
 
 namespace asyncll {
 
