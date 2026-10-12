@@ -266,3 +266,45 @@ def test_per_block_reservation_follows_the_slot_word():
     p = _plan(tok_off_ext=1)
     assert not p.info.get("aggReserve")
     p.close()
+
+
+# --------------------------------------------------------------------------
+# The gfx1250 dispatch staging buffer: the caller sizes it, so the size has to
+# be the one the kernel lays out
+# --------------------------------------------------------------------------
+
+
+def test_staging_bytes_matches_the_device_layout():
+    # ep_staging_bytes() hand-mirrors EpStagingTotalBytes (ep_cfg.hpp): six
+    # sub-arrays, each rounded up to EpScaleAlign. EpArgs carries the base but no
+    # length, so the kernel cannot bounds-check what it was given -- a mirror that
+    # drifts low is not an error but a silent write past the end of a torch tensor,
+    # into whatever the caching allocator handed out next. The numbers below come
+    # from EpStagingTotalBytes and are the only thing holding the mirror to it; if
+    # the layout moves, re-derive them there rather than pasting whatever this
+    # function starts returning.
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    assert ep_staging_bytes(8, 4096, 224) == 12746752
+    assert ep_staging_bytes(8, 4096, 0) == 4358144
+    assert ep_staging_bytes(32, 4096, 224) == 50987008
+    # max_recv not a multiple of 32 is the only shape among realistic configs
+    # where a sub-array size is not already a multiple of 128, so it is the only
+    # case that exercises the mirror's rounding at all.
+    assert ep_staging_bytes(1, 7, 0) == 5248
+
+
+def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
+    # EpCfg.maxRecv == 0 means "worldSize * maxTokPerRank" (EpMaxRecv), and it is
+    # the Plan default -- so this is the spelling an out-of-tree caller sizing the
+    # buffer from a Cfg actually passes. Returning a pool of 0 for it would hand
+    # back a 4 KiB buffer the kernel then writes megabytes into.
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    assert ep_staging_bytes(8, 0, 224, 512) == ep_staging_bytes(8, 8 * 512, 224)
+    # A resolved cap wins over the fallback, as EpMaxRecv's ternary does.
+    assert ep_staging_bytes(8, 4096, 224, 1) == ep_staging_bytes(8, 4096, 224)
+    # Neither spelling given is the case that used to return a short buffer in
+    # silence; there is no size to compute, so it cannot be a return value.
+    with pytest.raises(ValueError, match="max_tok_per_rank"):
+        ep_staging_bytes(8, 0, 224)
