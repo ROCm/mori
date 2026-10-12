@@ -45,6 +45,9 @@ Every full table lives here, next to the code it is about.
   - [The mxfp8 GEMM against SGLang, across every shape](#the-mxfp8-gemm-against-sglang-across-every-shape)
   - [DeepSeek-V4-Pro (blockscale, TP8)](#deepseek-v4-pro-blockscale-tp8)
   - [DeepSeek-V4.1-Flash (mxfp8, TP4)](#deepseek-v41-flash-mxfp8-tp4)
+  - [Kimi-K3 (blockscale, TP8 and TP4)](#kimi-k3-blockscale-tp8-and-tp4)
+    - [Below the crossover there is nothing to chunk](#below-the-crossover-there-is-nothing-to-chunk)
+    - [An fp8 gather is worth more here than the fusing](#an-fp8-gather-is-worth-more-here-than-the-fusing)
   - [End to end, in SGLang](#end-to-end-in-sglang)
   - [Measurement traps](#measurement-traps)
 - [How it works](#how-it-works)
@@ -1018,6 +1021,105 @@ graph-replay and guard checks; FP8 scatter also passed the actual-wire checks.
 Both FP8 legs give about **3.48% relL2**; model quality was not tested.
 Raw timings, 88,704 kernel records, per-rank breakdowns and reproduction commands
 are in [the phase archive](</workspace/reports/gemm-ar-phases-20260930/README.md>).
+
+### Kimi-K3 (blockscale, TP8 and TP4)
+
+A third model, and the first one here whose fused layer is an MLP `down_proj`
+rather than attention's `wo_b`. K3's text config is hidden 7168, dense
+intermediate 33792, `moe_intermediate` 3072 with 2 shared experts, and
+`first_k_dense_replace=1` -- so of 93 layers exactly one is dense and 92 are
+MoE. `down_proj` is `RowParallelLinear(intermediate, hidden)`, which puts
+**N = 7168** and **K/rank = intermediate / TP** in front of this op:
+
+| layer | count | TP8 K/rank | TP4 K/rank |
+|---|---:|---:|---:|
+| dense MLP `down_proj` | 1 | 4224 | 8448 |
+| shared experts `down_proj` | 92 | 768 | 1536 |
+
+All of them are expressible: 7168 is 28x256 and every K is a multiple of 128.
+That is not automatic -- `gemm_ag`'s K3 shapes (the *input* projections, N=6288
+and 3648) are not multiples of 128 and cannot be expressed at all. The
+difference is which side of the layer the collective is on: `down_proj`'s N is
+the hidden size, which is aligned by construction.
+
+**The shared-expert row is the one that matters**, since it is 92 of the 93
+layers, and it is also the hardest case: K/rank 768 at TP8 is a third of
+DSV4.1-Flash's 2048, so there is correspondingly less GEMM to hide the
+collective behind.
+
+8x MI355X, `--quant blockscale`, N=7168, bf16 wire on both legs and every
+opt-in path off, so this isolates fusing from everything else. Three
+alternating repetitions per arm, min of per-arm medians; within-arm spread was
+0.54% median and 3.49% worst. Negative is fused faster.
+
+| layer | K/rank | M=1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|---:|---:|---:|
+| TP8 shared | 768 | +2.7% | -0.5% | -3.5% | -5.1% | **-9.7%** |
+| TP8 dense | 4224 | +2.4% | -6.8% | -11.0% | -11.6% | **-21.4%** |
+| TP4 shared | 1536 | +4.0% | -1.4% | -5.7% | -7.7% | **-10.4%** |
+| TP4 dense | 8448 | +2.0% | -10.5% | -16.8% | -22.6% | **-21.6%** |
+
+The crossover is at M ~ 2048 and more K wins more, both as expected. All 120
+runs validated at relL2 2.35e-3.
+
+#### Below the crossover there is nothing to chunk
+
+Fusing loses 2-4% at M=1024, and `--chunk-bands` does not rescue it. The
+`chunks` each run reports says why: at M=1024 on TP8 a peer's slice is
+`1024/8 = 128` rows, exactly one `BLOCK_M=128` band, so the finest setting
+already produces one chunk. One chunk is one push after the GEMM, which is the
+split path with extra bookkeeping.
+
+| layer | M | split | fused | fused `--chunk-bands 1` | chunks |
+|---|---:|---:|---:|---:|---|
+| TP8 shared | 1024 | 120.1 | +2.6% | +2.9% | 1 -> 1 |
+| TP8 shared | 2048 | 197.8 | -0.0% | -0.3% | 2 -> 2 |
+| TP8 dense | 1024 | 157.0 | +2.9% | +1.6% | 1 -> 1 |
+| TP8 dense | 2048 | 270.9 | -6.6% | -6.6% | 2 -> 2 |
+| TP4 shared | 1024 | 187.0 | +3.3% | +2.7% | 2 -> 2 |
+| TP4 dense | 2048 | 480.3 | -10.6% | -10.6% | 4 -> 4 |
+
+`chunk_bands` is bands *per push*, so a smaller value means more chunks. A
+first pass used 2 and made M=2048 worse: a peer's slice there is two bands, so
+two bands per push collapses it to a single chunk and removes the overlap
+(`chunks` went 2 -> 1, and the arm measured +5.5%). The short-tail option is
+for shapes whose *default* chunking leaves a ragged tail, not for shapes that
+are too small to chunk.
+
+#### An fp8 gather is worth more here than the fusing
+
+`--gather-dtype fp8 --gather-transport lsa`, against the same fused kernel with
+a bf16 wire, at the M where fusing already wins:
+
+| layer | M | bf16 | fp8/lsa | vs bf16 | vs split |
+|---|---:|---:|---:|---:|---:|
+| TP8 shared | 8192 | 607.1 | 497.8 | **-18.0%** | -22.5% |
+| TP8 shared | 16384 | 1148.4 | 932.1 | **-18.8%** | -26.7% |
+| TP8 dense | 8192 | 784.4 | 677.6 | -13.6% | -23.8% |
+| TP8 dense | 16384 | 1493.7 | 1329.9 | -11.0% | -29.9% |
+| TP4 shared | 8192 | 1106.3 | 883.8 | **-20.1%** | -26.3% |
+| TP4 shared | 16384 | 2160.7 | 1713.0 | **-20.7%** | -29.0% |
+| TP4 dense | 8192 | 1389.9 | 1219.5 | -12.3% | -32.1% |
+| TP4 dense | 16384 | 2904.7 | 2406.5 | -17.2% | -35.1% |
+
+The two stack in the convenient direction: the shared-expert rows gain least
+from fusing and most from the fp8 wire, and they are 92 of the 93 layers.
+Together they are -26.7% against the split baseline at TP8 and -29.0% at TP4.
+
+This leg is lossy. relL2 goes from 2.35e-3 to 2.3-2.5e-2, an order of
+magnitude, and no model-quality result backs it at these shapes.
+
+> Three of the 120 runs in the second sweep were discarded, not averaged in:
+> they measured 70-240x the rest with all eight ranks slow together, and they
+> were the first runs after a `pkill -9` of an earlier sweep, which does not
+> let the SDMA queues be reclaimed -- see the 20-second rule in
+> [Benchmarks and tests](#benchmarks-and-tests). The remaining 117 were clean,
+> at 0.69% median within-arm spread.
+
+These are operator microbenchmarks against this op's own split path, which is
+the comparison that isolates fusing. They are not an end-to-end claim, and the
+baseline a framework would replace is its own collective (RCCL or AITER
+QuickReduce), not this one.
 
 ### End to end, in SGLang
 
