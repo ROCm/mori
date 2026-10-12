@@ -477,6 +477,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   OwnedSlot owned;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
+  owned.generation = next_slot_generation_++;
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
   TouchLru(key, owned_[key]);
@@ -541,7 +542,8 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
 }
 
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                     bool include_descs, bool allow_file_refs) {
+                                                     bool include_descs, bool allow_file_refs,
+                                                     ResolveReader reader) {
   (void)allow_file_refs;  // pages are this medium's storage; there is no file to name
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
@@ -568,6 +570,10 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     RenewLeaseAtomic(it->second, lease_deadline);
+    if (reader == ResolveReader::kLocal) {
+      it->second.local_readers.fetch_add(1, std::memory_order_relaxed);
+      entry.lease_token = it->second.generation;
+    }
     if (track_eviction_order_) touched.emplace_back(&keys[i], &it->second);
   }
   if (!touched.empty()) {
@@ -589,6 +595,23 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   resolved->page_size = page_size_;
   pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now(), /*migration=*/true};
   return true;
+}
+
+void PageBackend::ReleaseResolved(const std::vector<std::string>& keys,
+                                  const std::vector<uint64_t>& lease_tokens) {
+  // Shared, like the resolve that took these holds: a release only lowers a
+  // per-slot atomic and never touches owned_ itself.
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size() && i < lease_tokens.size(); ++i) {
+    if (lease_tokens[i] == 0) continue;
+    auto it = owned_.find(keys[i]);
+    if (it == owned_.end() || it->second.generation != lease_tokens[i]) continue;
+    uint32_t current = it->second.local_readers.load(std::memory_order_relaxed);
+    while (current > 0 &&
+           !it->second.local_readers.compare_exchange_weak(
+               current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+  }
 }
 
 void PageBackend::ReleaseMigrationRead(const std::string& key) {
@@ -970,7 +993,8 @@ std::vector<BufferMemoryDescBytes> PageBackend::BuildBufferDescsLocked(
 
 bool PageBackend::HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                            std::chrono::steady_clock::time_point now) {
-  return slot.read_lease_ns.load(std::memory_order_relaxed) > SteadyNs(now);
+  return slot.read_lease_ns.load(std::memory_order_relaxed) > SteadyNs(now) ||
+         slot.local_readers.load(std::memory_order_relaxed) > 0;
 }
 
 // ---------------------------------------------------------------------------
