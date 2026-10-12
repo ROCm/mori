@@ -488,6 +488,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       "kUnitW: the metadata tiles must fit beside the slabs");
   T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
+  // Past warpPerBlock ranks every warp takes metadata runs (kMetaAllW below), and a chunked call
+  // gives a token warp one token. kPayFirst loads that token into the slab's first row before the
+  // metadata pass, so the wait before the metadata stores covers it, and its stores follow the
+  // metadata stores with no wait between: one completion wait instead of two. The metadata tile
+  // moves up a row where it shares the slab.
+  constexpr bool kPayFirst = !kUnitGeom && !kDPin && npes > kCfg.warpPerBlock &&
+                             kCfg.warpPerBlock > kEpTokChunk && kSlabBytes >= 2 * kTokB;
 
   constexpr int kMaxNpes = kCfg.worldSize;
   __shared__ index_t s_N[kMaxNpes];
@@ -1128,6 +1135,20 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
     }
   }
   if (_ls && _pfN != 0) __builtin_trap();
+  bool _payPre = false;
+  if constexpr (kPayFirst) {
+    if (_tokChunk && _etpi == 1 && args.tokenIndices && args.inpTokenBuf &&
+        aWarp < (int)args.numTokens) {
+      const index_t f = (laneId < topk) ? args.dispDestTokIdMap[(size_t)aWarp * topk + laneId]
+                                        : EpNullFlat<kCfg>();
+      if (__any(laneId < topk && EpPeFromFlat<kCfg>(f) < (index_t)npes)) {
+        TdmIssueLoad<T>(_tdmTile,
+                        reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)aWarp * hiddenDim,
+                        _tdmG1);
+        _payPre = true;
+      }
+    }
+  }
   bool _mPend = false;
   bool _mDirect = false;
   // The largest metadata run, in tokens, that the lanes store directly instead of through the TDM
@@ -1148,9 +1169,11 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
     // metadata slabs from m * W / npes, theirs included.
     constexpr int kPmG = (kPlainMeta && kMetaSlabBytes > 0) ? (kCfg.warpPerBlock / kPM) : 1;
     const bool _pmTile = (kPmG > 1) && _metaPlain && (warpId >= warpNum - kPM);
-    const int mtileBytesM =
-        kUnitLds ? kUnitMetaBytes
-                 : (_pmTile ? kPmG * kMetaSlabBytes : kSlabBytes);  // the whole slab, see above
+    const bool _payRow = kPayFirst && kMetaSlabBytes == 0 && _tokChunk;
+    const int mtileBytesM = kUnitLds ? kUnitMetaBytes
+                            : _pmTile ? kPmG * kMetaSlabBytes
+                            : _payRow ? kSlabBytes - kTokB
+                                      : kSlabBytes;  // the whole slab, see above
     // idx + weights + srcmap + the scale row, at the stride it is really moved at:
     // sizing this from the unpadded row would under-size the tile it then holds.
     const int perTokM = tkM * 4 + tkM * 4 + 4 + EpScaleStride(kCfg);
@@ -1164,7 +1187,8 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           : (kMetaSlabBytes > 0)
               ? (reinterpret_cast<uint8_t*>(_tdmBatchSmem) +
                  (size_t)kCfg.warpPerBlock * kSlabBytes + (size_t)warpId * kMetaSlabBytes)
-              : (reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM);
+              : (reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * kSlabBytes +
+                 (_payRow ? kTokB : 0));
       if constexpr (kUnitLds) {
         __shared__
             __attribute__((aligned(256))) uint8_t s_unitMeta[kCfg.warpPerBlock * kUnitMetaBytes];
@@ -1554,7 +1578,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       }
     }
   }
-  __builtin_amdgcn_s_wait_tensorcnt(0);
+  if (!_payPre) __builtin_amdgcn_s_wait_tensorcnt(0);
   // The signal store orders the TDM stores by their tensorcnt wait; the direct ones need theirs.
   if (!kDPin && _mDirect) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   if constexpr (kDPin) {
@@ -2158,9 +2182,10 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           index_t peMe = EpPeFromFlat<kCfg>(flatMe);
           int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
           if (!__any(validMe)) continue;
-          TdmIssueLoad<T>(_tdmTile,
-                          reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
-                          _tdmG1);
+          if (!_payPre)
+            TdmIssueLoad<T>(_tdmTile,
+                            reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
+                            _tdmG1);
           bool loadWaited = false;
           unsigned long long _vm = __ballot(validMe);
           while (_vm) {
@@ -2170,13 +2195,15 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             index_t destPe = EpPeFromFlat<kCfg>(flat);
             index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
             if (!loadWaited) {
-              __builtin_amdgcn_s_wait_tensorcnt(0);
+              // A preloaded row is in once a metadata store is out: each was issued after a wait.
+              if (!_payPre || !_mPend) __builtin_amdgcn_s_wait_tensorcnt(0);
               loadWaited = true;
             }
             T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
             TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
           }
           __builtin_amdgcn_s_wait_tensorcnt(0);
+          _payPre = false;
         }
       }
     }
