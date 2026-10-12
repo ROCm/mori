@@ -461,7 +461,8 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
 }
 
 std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                    bool include_descs, bool allow_file_refs) {
+                                                    bool include_descs, bool allow_file_refs,
+                                                    ResolveReader reader) {
   std::vector<ResolvedEntry> results(keys.size());
   if (keys.empty()) return results;
   const auto now = std::chrono::steady_clock::now();
@@ -470,7 +471,11 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // mutex_.  Factored out because the lease-hit and read-completed paths publish
   // byte-identical results and drifting between them would be a silent bug.
   auto publish = [&](ResolvedEntry& out, ReadLease& lease) {
-    ++lease.holders;
+    if (reader == ResolveReader::kLocal) {
+      ++lease.local_holders;
+    } else {
+      ++lease.remote_holders;
+    }
     out.lease_token = lease.token;
     out.outcome = ResolveOutcome::kFound;
     out.found = true;
@@ -599,7 +604,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
           for (size_t index : group) results[index].outcome = ResolveOutcome::kBusy;
         }
         // The caller retries the whole batch and drops these entries unread.
-        for (const auto& [key, token] : lease_hits) DropLeaseHolderLocked(key, token);
+        for (const auto& [key, token] : lease_hits) DropLeaseHolderLocked(key, token, reader);
         slot_full_rejects_.fetch_add(1, std::memory_order_relaxed);
         MORI_UMBP_WARN(
             "[SsdBackend] Resolve: staging arena busy; rolled back {} reservations for {} keys",
@@ -641,9 +646,12 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       // A concurrent Resolve of the same key may have staged it while this read
       // was in flight; keep the winner and give this page back.
       const auto lease_deadline = std::chrono::steady_clock::now() + cfg_.read_lease_ttl;
-      auto [it, inserted] = read_leases_.emplace(
-          keys[primary], ReadLease{spans[j], outcomes[j].size, lease_deadline, /*holders=*/0,
-                                   /*token=*/next_lease_token_});
+      ReadLease lease;
+      lease.span = spans[j];
+      lease.size = outcomes[j].size;
+      lease.expires_at = lease_deadline;
+      lease.token = next_lease_token_;
+      auto [it, inserted] = read_leases_.emplace(keys[primary], lease);
       if (inserted) ++next_lease_token_;
       if (!inserted) {
         ReleaseStagingSpanLocked(spans[j]);
@@ -698,12 +706,15 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
   return true;
 }
 
-bool SsdBackend::DropLeaseHolderLocked(const std::string& key, uint64_t token) {
+bool SsdBackend::DropLeaseHolderLocked(const std::string& key, uint64_t token,
+                                       ResolveReader reader) {
   auto it = read_leases_.find(key);
   if (it == read_leases_.end() || it->second.token != token) return false;
-  if (it->second.holders > 0) --it->second.holders;
-  if (it->second.holders > 0) return false;
-  ReleaseStagingSpanLocked(it->second.span);
+  ReadLease& lease = it->second;
+  uint32_t& holders = reader == ResolveReader::kLocal ? lease.local_holders : lease.remote_holders;
+  if (holders > 0) --holders;
+  if (lease.local_holders > 0 || lease.remote_holders > 0) return false;
+  ReleaseStagingSpanLocked(lease.span);
   read_leases_.erase(it);
   return true;
 }
@@ -715,7 +726,8 @@ void SsdBackend::ReleaseResolved(const std::vector<std::string>& keys,
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size() && i < lease_tokens.size(); ++i) {
       if (lease_tokens[i] == 0) continue;
-      if (DropLeaseHolderLocked(keys[i], lease_tokens[i])) ++released;
+      // Only an in-process reader ever reports completion.
+      if (DropLeaseHolderLocked(keys[i], lease_tokens[i], ResolveReader::kLocal)) ++released;
     }
   }
   if (released > 0) staging_early_releases_.fetch_add(released, std::memory_order_relaxed);
@@ -861,13 +873,29 @@ void SsdBackend::ReaperSweep() {
   }
 
   for (auto it = read_leases_.begin(); it != read_leases_.end();) {
-    if (it->second.expires_at <= now) {
-      ReleaseStagingSpanLocked(it->second.span);
-      staging_expired_reclaims_.fetch_add(1, std::memory_order_relaxed);
-      it = read_leases_.erase(it);
-    } else {
+    ReadLease& lease = it->second;
+    if (lease.expires_at > now) {
       ++it;
+      continue;
     }
+    if (lease.local_holders > 0) {
+      // An in-process copy is still reading these pages and will release them
+      // when it finishes.  Never reclaim under it -- that is a use-after-free
+      // of the staging arena -- but say so if it is taking implausibly long.
+      constexpr std::chrono::seconds kLocalHoldWarn{30};
+      if (!lease.overdue_warned && now - lease.expires_at > kLocalHoldWarn) {
+        lease.overdue_warned = true;
+        MORI_UMBP_WARN(
+            "[SsdBackend] read lease for key '{}' still held by {} local reader(s) {}s past "
+            "its expiry -- a reader that never released?",
+            it->first, lease.local_holders, kLocalHoldWarn.count());
+      }
+      ++it;
+      continue;
+    }
+    ReleaseStagingSpanLocked(lease.span);
+    staging_expired_reclaims_.fetch_add(1, std::memory_order_relaxed);
+    it = read_leases_.erase(it);
   }
 }
 
