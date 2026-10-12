@@ -28,8 +28,16 @@
 
 namespace mori::umbp {
 
-// Makes a host region addressable from GPU kernels via one whole-region
-// hipHostRegister call.
+// The size of the pieces a HostTierRegistration registers, and so the
+// alignment of the boundaries no single copy of registered memory may cross:
+// hipMemcpy rejects a host range spanning two registrations, and a gather
+// fragment can use only one piece's device alias. Pieces are cut at absolute
+// multiples of this, so a caller needs nothing but the address to split at
+// them. UMBP_DRAM_HOST_REGISTER_CHUNK_MB, default 1024; 0 registers each
+// region whole.
+size_t HostRegistrationChunkBytes();
+
+// Makes a host region addressable from GPU kernels via hipHostRegister.
 //
 // Two things depend on this. A gather kernel cannot dereference plain mmap
 // memory at all -- it faults the GPU -- so registration is a hard prerequisite
@@ -37,20 +45,28 @@ namespace mori::umbp {
 // hipMemcpyAsync off the pageable staging path, which alone is worth ~6x on the
 // per-fragment copies that remain.
 //
-// Registration runs at roughly 13 GiB/s and does not parallelize: splitting it
-// across threads measured slower, because it serializes inside the driver. A
-// 512 GiB tier would therefore add ~40 s to server startup, so anything larger
-// than the synchronous threshold is registered on a background thread and the
-// caller simply behaves as it did before until that finishes. It must be a
-// single registration covering the whole region -- see Register() -- so this is
-// all-or-nothing rather than a progressive watermark.
+// The region is registered in HostRegistrationChunkBytes() pieces, not whole,
+// because the GPU driver does not pin what it registers: it mirrors the range,
+// and when the kernel moves any page inside it (compaction does this
+// continuously on a host with fragmented free memory) it stops every GPU queue
+// of the process until it has re-validated that entire registration. Over a
+// terabyte pool that re-validation takes minutes and is restarted by the next
+// moved page, so the process gets no GPU work done at all; over one piece it
+// takes a fraction of a second, though a burst of compaction can still touch
+// many pieces at once. A pool on hugetlbfs pages avoids all of it: compaction
+// never moves them.
 //
-// The device need not see the region at the host's address -- hipHostRegister's
+// Registration does not parallelize -- splitting it across threads measured
+// slower, because it serializes inside the driver -- so anything larger than
+// the synchronous threshold is registered on a background thread, piece by
+// piece in address order. Each piece is usable as soon as it is registered;
+// until then a copy touching it simply takes the path it took before.
+//
+// The device need not see a piece at the host's address -- hipHostRegister's
 // own documentation says the two "will have a different value" on many systems
 // and that device code must use the device pointer. Equal addresses are a CUDA
-// UVA property ROCm never promised. So the alias is recorded per device and
-// DeviceAddress() translates by offset, which is sound because the whole region
-// is one registration of one contiguous range.
+// UVA property ROCm never promised. So each piece records its alias per device
+// and DeviceAddress() translates by offset within the piece.
 class HostTierRegistration {
  public:
   // Registers [base, base + bytes). `bytes` must be the mapped (page-aligned)
@@ -63,9 +79,10 @@ class HostTierRegistration {
   HostTierRegistration(const HostTierRegistration&) = delete;
   HostTierRegistration& operator=(const HostTierRegistration&) = delete;
 
-  // True when [ptr, ptr + size) is registered, and therefore safe to copy from
-  // or to without the pageable staging path. False is always the safe answer.
-  // Weaker than "safe to hand to a kernel" -- that needs DeviceAddress().
+  // True when [ptr, ptr + size) lies inside one registered piece, and is
+  // therefore safe to copy from or to without the pageable staging path. False
+  // is always the safe answer. Weaker than "safe to hand to a kernel" -- that
+  // needs DeviceAddress().
   bool Covers(const void* ptr, size_t size) const;
 
   // Whether a kernel on `device_id` can reach this region at all, i.e. whether
@@ -73,30 +90,37 @@ class HostTierRegistration {
   bool GatherableOn(int device_id) const;
 
   // The address `device_id` must use to reach [host_ptr, host_ptr + size), or
-  // null when that range is outside the region or the device has no alias, in
-  // which case the caller must stay on the copy-engine path. Subsumes Covers(),
-  // so a caller that needs the address should not test both.
+  // null when that range is not inside one registered piece or the device has
+  // no alias, in which case the caller must stay on the copy-engine path.
+  // Subsumes Covers(), so a caller that needs the address should not test both.
   void* DeviceAddress(const void* host_ptr, size_t size, int device_id) const;
 
-  // Zero until registration succeeds, then the full region. For logging and
-  // tests.
+  // Bytes registered so far: zero until the first piece is, the full region
+  // once every piece is. For logging and tests.
   size_t RegisteredBytes() const { return registered_bytes_.load(std::memory_order_acquire); }
 
  private:
+  struct Piece {
+    char* base = nullptr;
+    size_t bytes = 0;
+    // Indexed by device ordinal; null where the device has no mapping.
+    std::vector<char*> aliases;
+  };
+
   void Register();
-  // Fills alias_bases_, one entry per device. False only when the devices
-  // cannot be enumerated; a device without an alias gets a null entry.
-  bool RecordDeviceAliases();
-  // Bounds check against an already-loaded registered_bytes_, so an entry point
-  // that needs the value anyway reads the atomic once.
-  bool CoversRegistered(const void* ptr, size_t size, size_t registered) const;
+  // The registered piece holding all of [ptr, ptr + size), or null.
+  const Piece* FindPiece(const void* ptr, size_t size) const;
 
   char* base_{nullptr};
   size_t bytes_{0};
+  size_t piece_bytes_{0};
+  // Laid out by the constructor, before any reader or the worker exists.
+  std::vector<Piece> pieces_;
+  // Pieces [0, registered_pieces_) are registered. A piece, aliases included,
+  // is written before the count that covers it is released, and is read-only
+  // after, so that release/acquire pair is what publishes it.
+  std::atomic<size_t> registered_pieces_{0};
   std::atomic<size_t> registered_bytes_{0};
-  // Indexed by device ordinal. Written before registered_bytes_ is published
-  // and read-only after, so that release/acquire pair is what publishes it.
-  std::vector<char*> alias_bases_;
   std::thread worker_;
 };
 
