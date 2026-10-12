@@ -29,6 +29,7 @@
 // PUBLISHES is plain host memory, so no transfer-layer change was needed.
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -202,6 +203,28 @@ TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {
 // ---------------------------------------------------------------------------
 //  Put / Get
 // ---------------------------------------------------------------------------
+
+// Every segment file stays open for the tier's lifetime, so the tier makes room
+// for them in RLIMIT_NOFILE when it starts.  At docker's default soft limit of
+// 1,024 a 1.5 TB tier ran out of descriptors partway through filling, and every
+// write then failed with EMFILE until something else closed one.
+TEST_F(SsdBackendTest, RaisesTheOpenFileLimitForItsSegments) {
+  struct rlimit original{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  if (original.rlim_max != RLIM_INFINITY && original.rlim_max < 8192) {
+    GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves no room to test";
+  }
+  struct rlimit low = original;
+  low.rlim_cur = 256;
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
+
+  Start();  // one shard; budget = its segments + headroom, well over 256
+
+  struct rlimit after{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &after), 0);
+  EXPECT_GT(after.rlim_cur, 4096u) << "the soft limit was left where the tier would run out";
+  setrlimit(RLIMIT_NOFILE, &original);
+}
 
 TEST_F(SsdBackendTest, PutThenGetReturnsTheSameBytes) {
   SsdBackend* backend = Start();
