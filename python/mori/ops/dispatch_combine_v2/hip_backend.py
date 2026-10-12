@@ -1344,12 +1344,26 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 self._asyncll_indices = indices
                 weights_ptr = 0 if weights is None else weights.data_ptr()
             else:
-                weights_ptr = (
-                    self.arena.local_ptr(self._region("dispatch_out_weights"))
-                    if kwargs.get("want_weights", False)
-                    and getattr(self, "_asyncll_has_weights", False)
-                    else 0
-                )
+                # AsyncLL does not fold weights on combine, and says so rather
+                # than returning a zero tensor that looks like an answer.
+                #
+                # The fold the internode family does (EpCombineAll's second
+                # WarpAccum) reads the weights back out of the COMBINE staging,
+                # which carries topk floats per token alongside the hidden row.
+                # AsyncLL's combine payload is hidden-only by design -- see
+                # asyncll_regions -- so there is nothing to accumulate, and
+                # widening it would add topk*4 bytes per token to the one
+                # transfer this kernel family exists to make cheap. v1's AsyncLL
+                # makes the same trade: low_latency_async.cpp writes weights on
+                # dispatch and never on combine.
+                if kwargs.get("want_weights", False):
+                    raise NotImplementedError(
+                        "AsyncLL combine does not produce output weights: its "
+                        "combine payload carries no per-token metadata (v1's "
+                        "AsyncLL is the same). Call combine() with weights=None, "
+                        "or use a non-AsyncLL kernel family if you need the fold."
+                    )
+                weights_ptr = 0
                 indices = getattr(self, "_asyncll_indices", None)
 
             # Only what varies; everything fixed for the op's lifetime was bound

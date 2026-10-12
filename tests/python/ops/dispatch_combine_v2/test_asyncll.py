@@ -210,6 +210,30 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
                         flush=True,
                     )
                     failures += 1
+
+            # Asking for the weight fold has to FAIL, not return zeros: on this
+            # API a non-None `weights` is a REQUEST, and AsyncLL's combine
+            # payload carries no per-token metadata to fold. Every call above
+            # passes None, which is how a wrong weight branch sat here unnoticed
+            # until the cross-node harness -- which requests weights
+            # unconditionally -- ran into it.
+            #
+            # Last in the iteration, and only on the first one: the raise comes
+            # from inside _combine_impl, AFTER it has staged `input` into the
+            # out_tok region, so running it before the round trip above would
+            # have it write through a buffer the measured path reads.
+            if it == 0:
+                try:
+                    op.combine_send(out[:recv].clone(), win, idx, routing=routing)
+                except NotImplementedError:
+                    pass
+                else:
+                    print(
+                        f"[rank {rank}] h={hidden} k={topk}: combine accepted a "
+                        "weight-fold request it cannot serve",
+                        flush=True,
+                    )
+                    failures += 1
     return failures
 
 
