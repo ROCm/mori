@@ -885,6 +885,7 @@ TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
   auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  pool.SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds{50});
   // Fill cold's only page directly.
   auto* cold = registry.Get("cold");
   auto filler = cold->BatchAllocate({AllocateRequest{"filler", kPageSize}}).front();
@@ -936,11 +937,39 @@ TEST(PeerPool, APersistentDemotionFailureStillFreesTheTier) {
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
   CommitKey(&pool, "k");
 
-  engine.FailNext(1000);  // every demotion copy fails
+  pool.SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds{50});
+  engine.FailNext(1000000);  // every demotion copy fails
   pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
   ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
   EXPECT_FALSE(registry.Get("cold")->Contains("k"));
   EXPECT_FALSE(pool.PlacementBackend("k").has_value());
+}
+
+// No space at the target is pressure, not a verdict: an SSD reports it while
+// its staging arena is full of reads.  The demotion waits it out instead of
+// dropping the only copy -- dropping it lost keys a reader had just been told
+// were there.
+TEST(PeerPool, ADemotionWaitsOutATargetWithNoRoomForNow) {
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 1);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  auto* cold = registry.Get("cold");
+  auto filler = cold->BatchAllocate({AllocateRequest{"filler", kPageSize}}).front();
+  ASSERT_EQ(filler.outcome, AllocateOutcome::kSuccessAllocated);  // cold's only page, pending
+  CommitKey(&pool, "k");
+
+  pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  EXPECT_TRUE(registry.Get("hot")->Contains("k")) << "dropped while the target was only busy";
+
+  cold->BatchAbort({filler.slot_id});  // the pressure clears
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
+  EXPECT_TRUE(cold->Contains("k"));
 }
 
 TEST(PeerPool, EvictReturnsBeforeTheDemotionCopyRuns) {
