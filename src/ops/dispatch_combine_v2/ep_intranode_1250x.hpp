@@ -367,11 +367,12 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // Staging pointers from the dynamically-allocated base.  The EpStaging*Offset
   // functions are constexpr on kCfg, so each is base + compile-time constant.
   //
-  // EpDispatchSpec::LaunchRaw rejects a null base on the host, but it only shadows
-  // the base LaunchRaw -- a C++ caller reaching KernelSpec::Launch names the base
-  // one and slips past. Assert rather than dereference: the fault would otherwise
-  // land at null + a staging sub-offset, which names neither the argument nor the
-  // caller that left it unbound.
+  // EpDispatchSpec::LaunchRaw rejects a null base on the host, and both entries
+  // into it -- KernelSpec::Launch and the C ABI -- name it through the spec, so
+  // nothing routine arrives here unbound. The backstop is for a caller that names
+  // KernelSpec<...>::LaunchRaw itself, past the shadow. Assert rather than
+  // dereference: the fault would otherwise land at null + a staging sub-offset,
+  // which names neither the argument nor the caller that left it unbound.
   assert(args.stagingBase != nullptr &&
          "ep_dispatch: stagingBase is null -- bind staging_base (EpStagingTotalBytes)");
   char* _stgBase = static_cast<char*>(args.stagingBase);
