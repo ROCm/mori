@@ -132,6 +132,10 @@ class CollectivesFacade {
     return GetInstances()[dev].get();
   }
 
+  // This device's MORI PE id and the total PE count the facade was created with.
+  int MyPe() const { return myPe_; }
+  int NumPes() const { return nPes_; }
+
   // CCO-backed factory. Records this device's rank identity (myPe, nPes) and the
   // comm, and registers ONE big symmetric CCO "heap" window based on CCO comm
   // size. Need to be called by every rank in parallel.
