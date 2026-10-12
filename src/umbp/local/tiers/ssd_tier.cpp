@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -45,6 +46,34 @@
 namespace fs = std::filesystem;
 
 namespace mori::umbp {
+
+namespace {
+// DIAGNOSTIC (e2e demotion run): ReadBatchIntoPtr drops a key for one of five
+// reasons and logs none of them, so a caller sees only "read failed".  Log the
+// first 64 of each kind, then every 1000th.
+enum class ReadFailKind : int { kIndexMiss, kSizeMismatch, kNoSegment, kIo, kCrc, kCount };
+const char* ReadFailName(ReadFailKind k) {
+  switch (k) {
+    case ReadFailKind::kIndexMiss:
+      return "index_miss";
+    case ReadFailKind::kSizeMismatch:
+      return "size_mismatch";
+    case ReadFailKind::kNoSegment:
+      return "no_segment";
+    case ReadFailKind::kIo:
+      return "io_error";
+    case ReadFailKind::kCrc:
+      return "crc_mismatch";
+    default:
+      return "?";
+  }
+}
+bool ShouldLogReadFail(ReadFailKind k) {
+  static std::atomic<uint64_t> counts[static_cast<int>(ReadFailKind::kCount)];
+  const uint64_t n = counts[static_cast<int>(k)].fetch_add(1, std::memory_order_relaxed) + 1;
+  return n <= 64 || n % 1000 == 0;
+}
+}  // namespace
 
 SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& ssd_config,
                  SSDAccessMode access_mode)
@@ -519,10 +548,28 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
 
     for (size_t i = 0; i < keys.size(); ++i) {
       auto* meta = index_.FindKey(keys[i]);
-      if (!meta) continue;
-      if (sizes[i] != meta->size) continue;
+      if (!meta) {
+        if (ShouldLogReadFail(ReadFailKind::kIndexMiss)) {
+          MORI_UMBP_WARN("[SSDTier/diag] {}: read {} key={} want={}B", dir_,
+                         ReadFailName(ReadFailKind::kIndexMiss), keys[i], sizes[i]);
+        }
+        continue;
+      }
+      if (sizes[i] != meta->size) {
+        if (ShouldLogReadFail(ReadFailKind::kSizeMismatch)) {
+          MORI_UMBP_WARN("[SSDTier/diag] {}: read {} key={} want={}B index={}B", dir_,
+                         ReadFailName(ReadFailKind::kSizeMismatch), keys[i], sizes[i], meta->size);
+        }
+        continue;
+      }
       auto* seg = GetSegmentLocked(meta->segment_id);
-      if (!seg || seg->fd < 0) continue;
+      if (!seg || seg->fd < 0) {
+        if (ShouldLogReadFail(ReadFailKind::kNoSegment)) {
+          MORI_UMBP_WARN("[SSDTier/diag] {}: read {} key={} segment={}", dir_,
+                         ReadFailName(ReadFailKind::kNoSegment), keys[i], meta->segment_id);
+        }
+        continue;
+      }
       index_.TouchLRU(keys[i]);
 
       ReadLookup lk;
@@ -580,6 +627,12 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       std::fill(io_ok.begin(), io_ok.end(), true);
     } else {
       // Batch failed — fall back to per-key reads.
+      if (ShouldLogReadFail(ReadFailKind::kIo)) {
+        MORI_UMBP_WARN(
+            "[SSDTier/diag] {}: batch read of {} keys failed errno={} msg='{}'; "
+            "retrying per key",
+            dir_, lookups.size(), status.os_errno(), status.message());
+      }
       RememberStatus(std::move(status));
       for (size_t j = 0; j < lookups.size(); ++j) {
         const auto& lk = lookups[j];
@@ -591,7 +644,16 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
           s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
         }
         io_ok[j] = s.ok();
-        if (!s.ok()) RememberStatus(std::move(s));
+        if (!s.ok()) {
+          if (ShouldLogReadFail(ReadFailKind::kIo)) {
+            MORI_UMBP_WARN(
+                "[SSDTier/diag] {}: read {} key={} off={} io_size={} size={} bounce={} "
+                "errno={} msg='{}' (per-key retry after batch failure)",
+                dir_, ReadFailName(ReadFailKind::kIo), keys[lk.orig_idx], lk.offset, lk.io_size,
+                lk.size, lk.io_dst != lk.dst, s.os_errno(), s.message());
+          }
+          RememberStatus(std::move(s));
+        }
       }
     }
   } else {
@@ -606,7 +668,16 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
         s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
       }
       io_ok[j] = s.ok();
-      if (!s.ok()) RememberStatus(std::move(s));
+      if (!s.ok()) {
+        if (ShouldLogReadFail(ReadFailKind::kIo)) {
+          MORI_UMBP_WARN(
+              "[SSDTier/diag] {}: read {} key={} off={} io_size={} size={} bounce={} "
+              "errno={} msg='{}' (serial path)",
+              dir_, ReadFailName(ReadFailKind::kIo), keys[lk.orig_idx], lk.offset, lk.io_size,
+              lk.size, lk.io_dst != lk.dst, s.os_errno(), s.message());
+        }
+        RememberStatus(std::move(s));
+      }
     }
   }
 
@@ -638,6 +709,15 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   for (size_t j = 0; j < lookups.size(); ++j) {
     if (!io_ok[j]) continue;
     if (!key_ok[j]) {
+      if (ShouldLogReadFail(ReadFailKind::kCrc)) {
+        const auto& lk = lookups[j];
+        MORI_UMBP_WARN(
+            "[SSDTier/diag] {}: read {} key={} off={} io_size={} size={} bounce={} batch={} "
+            "expected_crc={:#x} got_crc={:#x}",
+            dir_, ReadFailName(ReadFailKind::kCrc), keys[lk.orig_idx], lk.offset, lk.io_size,
+            lk.size, lk.io_dst != lk.dst, lookups.size(), lk.expected_crc,
+            segment::ComputeRecordCrc32(keys[lk.orig_idx], lk.dst, lk.size));
+      }
       RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
       continue;
     }
