@@ -408,6 +408,11 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  // The absolute bound only. The prefix sum below is one wavefront wide, so the
+  // real limit is this arch's wave -- 32 on gfx1250, not 64 -- and waveSize is
+  // not part of the rendered cfg, so it cannot be said here. The exact check is
+  // host-side in EpAsyncLLRenderSource, which every compile goes through and
+  // which does know it. This catches only a worldSize no wave could hold.
   static_assert(kConfig.worldSize <= 64,
                 "the per-PE offset prefix sum is one wavefront wide; worldSize must fit it");
 

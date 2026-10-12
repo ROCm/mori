@@ -114,6 +114,20 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
     throw std::runtime_error("mori ep asyncll jit: unusable config " + Render(cfg.kernelCfg));
   }
 
+  // DispatchRecvCopy derives every PE's output offset from a prefix sum over one
+  // wavefront -- lane i holds PE i's count. Past the end __shfl returns the
+  // issuing lane's own value instead of faulting, so a worldSize wider than the
+  // wave folds several PEs onto one offset and the ranks disagree about where
+  // their tokens went. The kernel can only static_assert the absolute bound,
+  // because waveSize is host-side state and not part of the rendered cfg; this
+  // is the funnel that knows the real one.
+  if (cfg.waveSize > 0 && cfg.kernelCfg.worldSize > cfg.waveSize) {
+    throw std::runtime_error(
+        "mori ep asyncll jit: worldSize " + std::to_string(cfg.kernelCfg.worldSize) +
+        " exceeds the wavefront (" + std::to_string(cfg.waveSize) +
+        " lanes on this arch); the per-PE offset prefix sum is one wavefront wide");
+  }
+
   const AsyncLLDescriptor descriptor = DescriptorFor(kind);
   const std::string entry = EpAsyncLLEntryName(cfg, kind);
 
@@ -245,7 +259,7 @@ mori::ops::v2::EpInterNodeCfg EpAsyncLLCfgFromFields(const mori::jit::v2::FieldB
     if (fields.Has(name)) WireAssign(slot, fields.Get(name, 0));
   });
   return MakeEpInterNodeCfg(mori::jit::v2::GetToolchain().arch, request,
-                            EpInterNodeKernel::Dispatch);
+                            EpInterNodeKernel::Dispatch, EpInterNodeFamily::AsyncLL);
 }
 
 int EpAsyncLLNoPrecompile(const std::string&) { return 0; }

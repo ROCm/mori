@@ -79,7 +79,7 @@ const std::vector<std::string>& EpInterNodeSourceDeps() {
 // Request -> Cfg
 // ---------------------------------------------------------------------------
 EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& request,
-                                  EpInterNodeKernel kind) {
+                                  EpInterNodeKernel kind, EpInterNodeFamily family) {
   EpInterNodeCfg cfg;
   cfg.kernelCfg.worldSize = request.worldSize;
   cfg.kernelCfg.hiddenDim = request.hiddenDim;
@@ -127,13 +127,21 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
         " threads per block, which exceeds 1024");
   }
 
-  // Wave64 only. DispatchInterNodeSend builds its intra-warp prefix count as
-  // __popcll(mask << (warpSize - laneId)) on a uint64_t, which drops the lanes
-  // at or above laneId only when the shift width equals the container width.
-  // On wave32 the discarded bits stay inside the 64-bit value and every set bit
-  // is counted, so the send slot is wrong rather than the code merely being
-  // slow. Rejected here rather than left to produce bad offsets.
-  if (cfg.waveSize != 64) {
+  // Wave64 only, and only for this family. DispatchInterNodeSend builds its
+  // intra-warp prefix count as __popcll(mask << (warpSize - laneId)) on a
+  // uint64_t, which drops the lanes at or above laneId only when the shift width
+  // equals the container width. On wave32 the discarded bits stay inside the
+  // 64-bit value and every set bit is counted, so the send slot is wrong rather
+  // than the code merely being slow. Rejected here rather than left to produce
+  // bad offsets.
+  //
+  // AsyncLL is exempt because the reason does not reach it: its nine kernels
+  // contain no __ballot and no __popc at all, and take laneId and warpSize from
+  // the HIP builtins (DEF_COMMON_VARS), so nothing in them is written against a
+  // particular lane-mask width. It shares this factory, not those kernels.
+  // Narrowing the gate here rather than deleting it keeps v2/v2_ll refusing
+  // wave32 until that idiom is rewritten.
+  if (family == EpInterNodeFamily::InterNode && cfg.waveSize != 64) {
     throw std::runtime_error("mori ep internode v2: waveSize " + std::to_string(cfg.waveSize) +
                              " is unsupported; the internode kernels are wave64 only");
   }

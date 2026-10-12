@@ -222,10 +222,22 @@ enum class EpInterNodeKernel {
   CombineAll,
 };
 
+// Which family is being built. AsyncLL shares this Request, this Cfg and this
+// factory with the internode kernels, but it is a different set of kernels, and
+// one host-side check does not carry over: the wave64 requirement below belongs
+// to DispatchInterNodeSend, which AsyncLL does not run. Told rather than
+// inferred from EpInterNodeKernel, because AsyncLL passes Dispatch there purely
+// to satisfy a non-optional parameter and never reads the geometry it picks.
+enum class EpInterNodeFamily {
+  InterNode,
+  AsyncLL,
+};
+
 // Geometry rules differ per pass, so the Request -> Cfg step is told which pass
 // it is building for -- the same reason MakeEpCfg takes EpKernelKind.
 EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequest& request,
-                                  EpInterNodeKernel kind);
+                                  EpInterNodeKernel kind,
+                                  EpInterNodeFamily family = EpInterNodeFamily::InterNode);
 
 // Rendering, naming and geometry are shared by all eight Specs. Exposed so a
 // test can exercise them per kernel without going through eight class names.
