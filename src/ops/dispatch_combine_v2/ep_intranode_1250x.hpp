@@ -1136,11 +1136,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   }
   if (_ls && _pfN != 0) __builtin_trap();
   bool _payPre = false;
+  index_t _payFlat = EpNullFlat<kCfg>();
   if constexpr (kPayFirst) {
     if (_tokChunk && _etpi == 1 && args.tokenIndices && args.inpTokenBuf &&
         aWarp < (int)args.numTokens) {
       const index_t f = (laneId < topk) ? args.dispDestTokIdMap[(size_t)aWarp * topk + laneId]
                                         : EpNullFlat<kCfg>();
+      _payFlat = f;
       if (__any(laneId < topk && EpPeFromFlat<kCfg>(f) < (index_t)npes)) {
         TdmIssueLoad<T>(_tdmTile,
                         reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)aWarp * hiddenDim,
@@ -1580,7 +1582,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   }
   // s_wait_tensorcnt is a scalar instruction: under a branch the compiler takes as divergent it is
   // reached with EXEC masked off and waits all the same, so the conditions are read as uniform.
-  if (!__builtin_amdgcn_readfirstlane((int)_payPre)) __builtin_amdgcn_s_wait_tensorcnt(0);
+  if (!kPayFirst || !__builtin_amdgcn_readfirstlane((int)_payPre)) __builtin_amdgcn_s_wait_tensorcnt(0);
   // The signal store orders the TDM stores by their tensorcnt wait; the direct ones need theirs.
   if (!kDPin && _mDirect) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   if constexpr (kDPin) {
@@ -2179,8 +2181,12 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
         for (int _sub = 0; _sub < _etpi; ++_sub) {
           int tok = tokBase + _sub;
           if (tok >= args.numTokens) break;
-          index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
-                                           : EpNullFlat<kCfg>();
+          // A load issued behind the metadata stores returns only once they are acknowledged, so a
+          // preloaded token keeps the map entries read with its row.
+          index_t flatMe = _payFlat;
+          if (!kPayFirst || !__builtin_amdgcn_readfirstlane((int)_payPre))
+            flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
+                                     : EpNullFlat<kCfg>();
           index_t peMe = EpPeFromFlat<kCfg>(flatMe);
           int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
           if (!__any(validMe)) continue;
@@ -2198,7 +2204,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
             if (!loadWaited) {
               // A preloaded row is in once a metadata store is out: each was issued after a wait.
-              if (!__builtin_amdgcn_readfirstlane((int)(_payPre && _mPend)))
+              if (!kPayFirst || !__builtin_amdgcn_readfirstlane((int)(_payPre && _mPend)))
                 __builtin_amdgcn_s_wait_tensorcnt(0);
               loadWaited = true;
             }
