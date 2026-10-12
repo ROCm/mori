@@ -183,6 +183,15 @@ _DISPATCH_TABLE: dict = {
                 (None, 128, 16),
             ),
         },
+        # EP16 on four 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11. 128x16 is the only geometry
+        # that builds the pinned-destination dispatch (kDPin in ep_intranode_1250x.hpp). 128x16
+        # minus 64x16, dispatch us, graph, one M=16384 plan, 3 alternating rounds: 1024 tokens a
+        # rank -11.0..-11.8, 2048 +2.2..+3.3, 3072 -6.0..-6.8, 8192 -14.7..-15.3, 16384
+        # -80.9..-83.3. 2048 is the only point 64x16 wins; the edge between them is unswept.
+        (16, 7168, 6, None): {
+            None: ((None, 64, 16),),
+            "fp4": ((4095, 64, 16), (None, 128, 16)),
+        },
     },
 }
 
@@ -219,12 +228,13 @@ _COMBINE_TABLE: dict = {
             (None, 192, 8),
         ),
         (4, 7168, 6, None): ((None, 64, 8),),
-        # The single-shot default, listed so the EP8 dispatch schedule has a combine half.
+        # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
+        (16, 7168, 6, None): ((None, 64, 8),),
     },
 }
 
-_COMBINE_FP4_TABLE: dict = {
+_COMBINE_PUSH_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
             # EP4 64x24 runs the overlapped path too; from 2048 tokens a rank it is ahead of 64x16
@@ -264,11 +274,45 @@ _COMBINE_FP4_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 8),
             ),
+            # EP16, 2026-10-11, dispatch 128x16, one M=16384 plan, 3 alternating rounds, combine us:
+            #   ct     64x8   64x16  64x24  128x16 128x24
+            #   64     16.0   24.4   24.9   22.6   22.9
+            #   512    28.3   34.4   34.7   30.7   31.3
+            #   1024   46.4                 40.7   41.6
+            #   2048   74.0                 57.0   57.5
+            #   4096  127.9  111.8  109.3   88.2   87.6
+            #   8192  232.7                159.4  159.0
+            #   16384 434.2  369.1  353.5  306.8  303.5
+            # The edge between 512 and 1024 is unswept.
+            (16, 7168, 6, None): (
+                (512, 64, 8),
+                (8192, 128, 16),
+                (None, 128, 24),
+            ),
         },
     },
     "fp4_blockwise_fp32": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
+    },
+    "fp8_blockwise": {
+        "gfx1250": {
+            # 128x16 is ahead of 64x16 from 512 to 1536 tokens a rank (-3.6, -7.0, -14.6 at topk 6).
+            # It stays ahead of 128x24 through 2048 at topk 6 (-3.5) but only through 1792 at topk 9
+            # (-3.2); at 2048 topk 9 128x24 is ahead by 1.8.
+            (4, 7168, 6, None): (
+                (256, 64, 8),
+                (2048, 128, 16),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
+            (4, 7168, 9, None): (
+                (256, 64, 8),
+                (2047, 128, 16),
+                (16384, 128, 24),
+                (None, 64, 16),
+            ),
         },
     },
 }
@@ -338,9 +382,9 @@ def lookup(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
     comb = None
-    if quant_type in _COMBINE_FP4_TABLE:
+    if quant_type in _COMBINE_PUSH_TABLE:
         comb = _bucket_key(
-            _COMBINE_FP4_TABLE[quant_type].get(dev, {}),
+            _COMBINE_PUSH_TABLE[quant_type].get(dev, {}),
             world_size,
             hidden_dim,
             topk,

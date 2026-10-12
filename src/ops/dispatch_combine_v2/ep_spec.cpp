@@ -25,7 +25,6 @@
 
 #include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -34,19 +33,6 @@
 namespace mori {
 namespace ops {
 namespace v2 {
-
-namespace {
-
-int EnvInt(const char* name, int current) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return current;
-  char* end = nullptr;
-  long parsed = std::strtol(v, &end, 10);
-  if (end == v || parsed <= 0) return current;
-  return static_cast<int>(parsed);
-}
-
-}  // namespace
 
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind) {
   EpCfg c;
@@ -68,6 +54,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "combineFp4");
   }
   c.combineFp4F32Scale = c.combineFp4 && req.combineFp4F32Scale;
+  if (req.combineFp8 && req.combineFp4) {
+    throw std::runtime_error(
+        "mori v2 ep: combineFp4 and combineFp8 each pick the push combine's wire format; set "
+        "one of them");
+  }
+  c.combineFp8 = (kind == EpKernelKind::Combine) && req.combineFp8;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -79,18 +71,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   const bool isDispatch = kind == EpKernelKind::Dispatch;
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
-  c.selfFirst = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
+  c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
-
-  // Overrides. The ONLY place the environment is read.
-  const char* blkVar = isDispatch ? "MORI_V2_EP_DISP_BLOCKS" : "MORI_V2_EP_COMB_BLOCKS";
-  const char* wrpVar = isDispatch ? "MORI_V2_EP_DISP_WARPS" : "MORI_V2_EP_COMB_WARPS";
-  c.blockNum = EnvInt(blkVar, c.blockNum);
-  c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and
@@ -107,10 +93,10 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
-        " blocks=" + std::to_string(c.blockNum) + " selfFirst=" + std::to_string(c.selfFirst) +
+        " blocks=" + std::to_string(c.blockNum) + " aggReserve=" + std::to_string(c.aggReserve) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
         "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
-        "selfFirst needs warpPerBlock >= 2, worldSize <= waveSize and blocks < 4096");
+        "aggReserve needs worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }
@@ -201,6 +187,7 @@ const std::vector<std::string>& EpSourceDeps() {
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
   return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
@@ -210,9 +197,10 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  if (cfg.combineFp4 && !EpArchIs1250()) {
+  if (EpCombinePush(cfg) && !EpArchIs1250()) {
     throw std::runtime_error(
-        "mori v2 ep: the fp4 combine is gfx125x only (it moves every token through TDM)");
+        "mori v2 ep: the fp4/fp8 push combine is gfx125x only (it moves every token through "
+        "TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }

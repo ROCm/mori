@@ -66,6 +66,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
@@ -162,6 +165,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
@@ -417,6 +423,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       # ROCm 10 ships in a different apt repo than 7.x, hence the ROCM_APT_* args.
       - name: Build CI image
@@ -511,6 +520,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Build JAX CI image
         run: |
@@ -591,6 +603,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Build CI image
         run: $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE -t $IMAGE -f docker/Dockerfile.dev .
@@ -741,6 +756,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Recover podman if needed
         run: |
@@ -1203,6 +1221,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Checkout SGLang
         uses: actions/checkout@v4
