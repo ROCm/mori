@@ -147,10 +147,6 @@ struct EpArgs {
   int* destPeTokenCounter = nullptr;      // [worldSize] per-dest send count
   int* totalRecvTokenNum = nullptr;       // [1]
   unsigned int* gridBarrier = nullptr;    // [1] intra-kernel grid rendezvous
-  // Cfg.aggReserve only: this rank's reservation state, EpResStateBytes(worldSize) laid
-  // out below. Local memory, so whoever lays out the arena never has to know it exists;
-  // ep_plans.EpDispatchPlan allocates one per plan. Null otherwise.
-  unsigned int* resState = nullptr;
   unsigned long long* xdbFlag = nullptr;  // [1] monotone cross-device barrier epoch
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
@@ -190,7 +186,6 @@ struct EpArgs {
   X(destPeTokenCounter, "p")   \
   X(totalRecvTokenNum, "p")    \
   X(gridBarrier, "p")          \
-  X(resState, "p")             \
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
   X(tokOffPeers, "p")          \
@@ -217,7 +212,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 26,
+static_assert(detail::kEpArgsFieldCount == 25,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -256,7 +251,7 @@ struct EpCfg {
   bool combineFp8 = false;
   // Dispatch only, gfx125x only (MakeEpCfg): how the blocks take their slots at a
   // destination. On, the blocks of a rank add up their tokens for each destination in
-  // the state at EpArgs::resState, and the last of them to arrive reserves the total
+  // the state EpResStateBytes lays out, and the last of them to arrive reserves the total
   // with one RMW on the destination's slot allocator word: one RMW per call for each
   // pair of ranks, which matters where the RMWs on one word serialize, as they do in the
   // cco window. Off, every block holding tokens for a destination makes its own RMW.
@@ -382,8 +377,8 @@ constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
 }
 
-// The Cfg.aggReserve state, at EpArgs::resState; this rank's blocks are the only
-// ones that touch it.
+// The Cfg.aggReserve state, a module global of the dispatch kernel (_resState in
+// ep_intranode_1250x.hpp); this rank's blocks are the only ones that touch it.
 //   [0]                           calls completed: the number the next call publishes
 //                                 under is one more
 //   [EpResCntOff + 4 * dst]       (blocks arrived << 20) | this rank's tokens for dst
@@ -392,9 +387,9 @@ constexpr int EpScaleStride(const EpCfg& c) {
 //                                 this call, stored by the last block to arrive
 // Each part starts a 128 B line of its own and the published words are 64 B apart,
 // so the blocks waiting on one destination poll a word nothing else writes.
-// Zero when allocated and after every collective reset (EpDispatchPlan allocates it
-// zeroed; reset() calls its zero_state()). agg_reserve_state_bytes() in ep_plans.py
-// is the host-side copy of EpResStateBytes.
+// The last block to arrive puts the counts and the barrier counter back to zero, and a
+// published word only counts once it carries this call's number, so nothing has to be
+// cleared between calls.
 constexpr unsigned long long EpResLine = 128;
 constexpr unsigned long long EpResPubStride = 64;
 constexpr unsigned long long EpResCntOff = EpResLine;
