@@ -119,15 +119,13 @@ CHECK = int(os.environ.get("CHECK", 1))
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
-# ROUTE=ring: ATOM's --fake-eplb placement for models without group-limited routing,
-# where position p = token * TOPK + j lands on rank p % world. With TOPK >= world every
-# token reaches every rank, so the largest SWEEP point fills each receive buffer to
-# exactly its capacity -- the case that overwrites anything parked at the end of the
+# ROUTE=ring: position p = token * TOPK + j lands on rank p % world. With TOPK >= world
+# every token reaches every rank, so the largest SWEEP point fills each receive buffer
+# to exactly its capacity -- the case that overwrites anything parked at the end of the
 # landing zone.
-# ROUTE=grouped: ATOM's --fake-eplb placement for group-limited routing (DeepSeek:
-# EXPERT_GROUPS=8, TOPK_GROUPS=4), plus SHARED_EXPERTS=1 trailing columns pinned to
-# the token's own rank. At EP4 a token then reaches 2-3 ranks, not every one, and the
-# ranks receive unevenly.
+# ROUTE=grouped: group-limited routing (EXPERT_GROUPS=8, TOPK_GROUPS=4 by default), plus
+# SHARED_EXPERTS=1 trailing columns pinned to the token's own rank. At EP4 a token then
+# reaches 2-3 ranks, not every one, and the ranks receive unevenly.
 # ROUTE=noself: rand without the experts of the token's own rank, so no rank
 # receives from itself.
 ROUTE = os.environ.get("ROUTE", "rand")
@@ -219,9 +217,8 @@ def main():
         )
         idx = (idx + (idx >= rank * EPR).long() * EPR).to(torch.int32).to(dev)
     elif ROUTE == "grouped":
-        # ATOM's init_balance_router_logits, group-limited branch: a token picks
-        # TOPK_GROUPS of EXPERT_GROUPS groups on a ring, then the same number of
-        # experts in each. Its SHARED_EXPERTS columns stay on the token's own rank.
+        # A token picks TOPK_GROUPS of EXPERT_GROUPS groups on a ring, then the same
+        # number of experts in each. Its SHARED_EXPERTS columns stay on its own rank.
         expert_groups = int(os.environ.get("EXPERT_GROUPS", 8))
         topk_groups = int(os.environ.get("TOPK_GROUPS", 4))
         shared_experts = int(os.environ.get("SHARED_EXPERTS", 1))
@@ -231,7 +228,7 @@ def main():
         ranks_per_group = max(1, experts_per_group // routed_per_rank)
         experts_per_group_rank = experts_per_group // ranks_per_group
         picks_per_group = routed_topk // topk_groups
-        # ATOM interleaves the tokens over the DP ranks.
+        # Tokens interleave over the ranks: rank r holds tokens r, r + world, ...
         token = rank + torch.arange(M) * world
         group_slot = torch.arange(topk_groups).view(1, -1, 1)
         pick = torch.arange(picks_per_group).view(1, 1, -1)
