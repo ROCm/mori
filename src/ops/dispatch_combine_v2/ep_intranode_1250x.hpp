@@ -1245,7 +1245,12 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
         const int _r0b = __builtin_amdgcn_readfirstlane(_run0);
         if (_metaHi && _r0b + _metaWarps < nRuns) {
           const int subB = (mtileBytesM / 2) & ~127;
-          const int capR = (subB - 128 * kMetaFields) / perTokM;
+          // With scales the lanes carry the indices, weights and srcmap (_pcu below): the tile
+          // holds the scale rows alone, and a lane two index and two weight slots of a run.
+          constexpr bool kPairCu = kMetaAllW && kEpScaleBytes > 0;
+          constexpr int kScSt = kEpScaleStride > 0 ? kEpScaleStride : 1;
+          const int capR = kPairCu ? min((subB - 128) / kScSt, 2 * WS / tkM)
+                                   : (subB - 128 * kMetaFields) / perTokM;
           // (row count << 8) | rank of the first two runs this warp holds; 0 = none.
           int rA = 0, rB = 0;
           index_t abA = 0, abB = 0;
@@ -1280,8 +1285,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             // With scales the two runs' indices, weights and srcmap go with the lanes and only the
             // scale rows through the tile: a wave holds at most 10 tensor ops in flight, and four
             // a run left two runs and a token's six payload stores waiting on one another.
-            const bool _pcu = kMetaAllW && kEpScaleBytes > 0 && (rA >> 8) * tkM <= 2 * WS &&
-                              (rB >> 8) * tkM <= 2 * WS;
+            constexpr bool _pcu = kPairCu;
             const bool _pcW = kCfg.useWeights && args.weightsBuf;
             int _pcA[5] = {0, 0, 0, 0, 0}, _pcB[5] = {0, 0, 0, 0, 0};
             auto pcLoad = [&](int rk, index_t ab, int (&v)[5]) {
