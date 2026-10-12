@@ -131,10 +131,15 @@ void LogHugepageFallbackOnce(size_t size, size_t hugepage_size, int err) {
   static std::once_flag once;
   std::call_once(once, [size, hugepage_size, err] {
     const std::string meminfo = ReadHugepageMeminfoSummary();
-    MORI_UMBP_WARN(
+    MORI_UMBP_ERROR(
         "HostMemAllocator: MAP_HUGETLB allocation failed for size={} "
-        "hugepage_size={} ({}: {}); falling back to anonymous pages. {}",
-        size, hugepage_size, err, std::strerror(err), meminfo);
+        "hugepage_size={} ({} pages; {}: {}); falling back to anonymous 4 KiB pages. "
+        "If this buffer is registered with a GPU, kernel compaction can migrate those "
+        "pages, and every migration stops this process's GPU queues until the driver "
+        "re-validates the registration. Reserve enough hugepages (vm.nr_hugepages) "
+        "before starting. {}",
+        size, hugepage_size, hugepage_size ? (size + hugepage_size - 1) / hugepage_size : 0, err,
+        std::strerror(err), meminfo);
   });
 }
 
