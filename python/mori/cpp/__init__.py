@@ -23,6 +23,7 @@ import os
 import sys
 import importlib.util
 import ctypes
+import threading
 
 try:
     import torch  # noqa: F401
@@ -47,41 +48,56 @@ spec.loader.exec_module(module)
 
 from libmori_pybinds import *
 
-# UMBP's bindings are a separate module because it links gRPC/Protobuf. It loads
-# on first access to a UMBP name, so mori.ops/io/shmem import without gRPC and
-# `from mori.cpp import UMBPClient` still works.
+# UMBP's bindings are a separate module because it links gRPC/Protobuf, which
+# mori.ops/io/shmem must not need. A name not found above is looked up there,
+# loading it on first use, so `from mori.cpp import UMBPClient` and UMBP's
+# exported enum values still resolve. If it cannot load, the lookup is an
+# AttributeError so hasattr()/getattr(default) probes stay safe; mori.umbp calls
+# _load_umbp() itself to report why.
 _UMBP_LIB = "libmori_umbp_pybinds"
 _umbp = None
+_umbp_error = None
+_umbp_lock = threading.Lock()
 
 
-def _is_umbp_name(name):
-    return name.startswith("UMBP") or name == "CacheRemoteAdmission"
-
-
-def _load_umbp():
-    global _umbp
-    if _umbp is not None:
-        return _umbp
+def _import_umbp():
     path = os.path.join(mori_lib_dir, _UMBP_LIB + ".so")
     if not os.path.exists(path):
-        raise ImportError(
-            f"mori was built without UMBP ({_UMBP_LIB}.so is absent); rebuild with BUILD_UMBP=ON"
-        )
+        raise ImportError(f"mori was built without UMBP ({_UMBP_LIB}.so is absent)")
     spec = importlib.util.spec_from_file_location(_UMBP_LIB, path)
     try:
         # module_from_spec is where an extension module is dlopen'ed.
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     except ImportError as e:
-        raise ImportError(
-            f"mori.umbp needs the gRPC/Protobuf runtime (e.g. `apt install libgrpc++1`): {e}"
-        ) from e
+        hint = ""
+        if any(k in str(e) for k in ("grpc", "gpr", "protobuf")):
+            hint = " UMBP needs the gRPC/Protobuf runtime (Ubuntu 22.04: apt install libgrpc++1)."
+        raise ImportError(f"cannot load {_UMBP_LIB}: {e}.{hint}") from e
     sys.modules[_UMBP_LIB] = mod
-    _umbp = mod
     return mod
 
 
+def _load_umbp():
+    """UMBP's module, loaded once; a failure is cached and re-raised as ImportError."""
+    global _umbp, _umbp_error
+    with _umbp_lock:  # a pybind11 module must not be exec'd twice
+        if _umbp is None and _umbp_error is None:
+            try:
+                _umbp = _import_umbp()
+            except ImportError as e:
+                _umbp_error = e
+    if _umbp_error is not None:
+        raise ImportError(str(_umbp_error)) from _umbp_error
+    return _umbp
+
+
 def __getattr__(name):
-    if _is_umbp_name(name):
-        return getattr(_load_umbp(), name)
+    if not name.startswith("_"):
+        try:
+            umbp = _load_umbp()
+        except ImportError:
+            umbp = None
+        if umbp is not None and hasattr(umbp, name):
+            return getattr(umbp, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

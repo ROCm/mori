@@ -843,9 +843,10 @@ class CMakeBuild(build_ext):
             shutil.copyfile(src_path, dst_path)
 
         # UMBP bindings are their own module (it links gRPC); mori.cpp loads it lazily.
+        # Keyed on the flag, not the file: CMake leaves a stale one in a reused build dir.
         umbp_pybinds_src = build_dir / "src/pybind/libmori_umbp_pybinds.so"
         umbp_pybinds_dst = root_dir / "python/mori/libmori_umbp_pybinds.so"
-        if umbp_pybinds_src.exists():
+        if build_umbp_enabled and umbp_pybinds_src.exists():
             shutil.copyfile(umbp_pybinds_src, umbp_pybinds_dst)
         elif umbp_pybinds_dst.exists():
             umbp_pybinds_dst.unlink()

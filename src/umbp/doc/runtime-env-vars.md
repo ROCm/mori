@@ -70,7 +70,7 @@ Read by the **master process** (`bin/master_main.cpp` via
 ## Peer / pool client
 
 Read by each **pool client** process (typically an SGLang/vLLM worker
-that has loaded `libmori_pybinds.so`).
+that has loaded `libmori_umbp_pybinds.so`, i.e. imported `mori.umbp`).
 
 | Env var | Default | Unit | Description |
 |---|---|---|---|
