@@ -672,6 +672,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       if (outcome == ResolveOutcome::kFailed) {
         failed_but_owned[i] = direct_backend->Contains(keys[i]);
       }
+      // Held and readable, just not staged by this call: never a stale placement.
+      if (outcome == ResolveOutcome::kDeferred) failed_but_owned[i] = true;
       out[i].backend_id = direct_backend_id;
       out[i].tier = direct_backend->Tier();
       out[i].resolved = std::move(resolved[i]);
@@ -741,7 +743,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       // permanent backend failure is useful only when no backend reported
       // BUSY; BUSY has priority because a later attempt can still succeed.
       const ResolveOutcome current = EffectiveResolveOutcome(out[index].resolved);
-      if (outcome == ResolveOutcome::kBusy || current == ResolveOutcome::kMissing) {
+      if (outcome == ResolveOutcome::kBusy || outcome == ResolveOutcome::kDeferred ||
+          current == ResolveOutcome::kMissing) {
         out[index].backend_id = backend_id;
         out[index].tier = backend->Tier();
         out[index].resolved.outcome = outcome;
@@ -839,6 +842,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       // A concurrent commit or transition changed the placement after the
       // snapshot; its publication is newer than this miss and must win.
       if (!placement_unchanged(i)) continue;
+      // The owner deferred it to a later call; the placement is still right.
+      if (EffectiveResolveOutcome(out[i].resolved) == ResolveOutcome::kDeferred) continue;
       if (repaired[i].has_value()) {
         placements_[keys[i]] = *repaired[i];
         continue;

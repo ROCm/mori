@@ -165,6 +165,8 @@ class SsdBackend : public MediumBackend {
                                           bool allow_file_refs = false) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
+  void ReleaseResolved(const std::vector<std::string>& keys,
+                       const std::vector<uint64_t>& lease_tokens) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
   // The manager's LRU, minus keys a staged read lease or migration read holds
@@ -205,16 +207,28 @@ class SsdBackend : public MediumBackend {
     std::chrono::steady_clock::time_point deadline;
   };
 
+  // A staged read.  `holders` counts the entries published from it that have
+  // not been released yet; the span goes back to the arena when the last one
+  // is released, or at expires_at for a holder that never reports (a peer
+  // reading over the wire).  `token` is what those entries carry as
+  // lease_token, so a release meant for an expired lease cannot free its
+  // successor.
   struct ReadLease {
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
+    uint32_t holders = 0;
+    uint64_t token = 0;
   };
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
+  // Caller MUST hold mutex_.  Drops one holder of `key`'s lease if `token`
+  // still names it; returns the span to the arena when that was the last.
+  // Returns true when the span was returned.
+  bool DropLeaseHolderLocked(const std::string& key, uint64_t token);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -280,6 +294,12 @@ class SsdBackend : public MediumBackend {
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
+  // Leases handed back by ReleaseResolved before their expiry, and keys a
+  // resolve left for a further call because the batch outgrew its share of the
+  // arena.  next_lease_token_ starts at 1: 0 means "nothing to release".
+  std::atomic<uint64_t> staging_early_releases_{0};
+  std::atomic<uint64_t> resolve_deferred_keys_{0};
+  uint64_t next_lease_token_ = 1;  // guarded by mutex_
   // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
   // can read it without taking mutex_ (the metrics tick must never contend with
   // a read).
