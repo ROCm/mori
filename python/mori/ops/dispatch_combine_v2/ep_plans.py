@@ -54,55 +54,8 @@ def _extra_dirs() -> list[str]:
 
 plan_api.load_library(_LIB_NAME, extra_dirs=_extra_dirs())
 
-_EpDispatchPlanBase = make_plan("ep_dispatch")
+EpDispatchPlan = make_plan("ep_dispatch")
 EpCombinePlan = make_plan("ep_combine")
-
-
-def agg_reserve_state_bytes(world_size: int) -> int:
-    """Size of the state the blocks of an aggReserve dispatch meet in.
-
-    The host-side copy of EpResStateBytes in ep_cfg.hpp: a 128 B line for the call
-    number, a 4 B count per rank rounded up to a line, then a 64 B published word
-    per rank.
-    """
-    w = int(world_size)
-    return 128 + (4 * w + 127) // 128 * 128 + 64 * w
-
-
-class EpDispatchPlan(_EpDispatchPlanBase):
-    # The generated signature stays the documentation; this only adds the binding.
-    __doc__ = (_EpDispatchPlanBase.__doc__ or "") + (
-        "\n\nThe gfx125x dispatch reserves its slots once per destination (aggReserve)"
-        "\nunless ``tok_off_ext`` says the slot allocator word lives outside the cco"
-        "\nwindow. With it, the plan allocates the state its blocks meet in, zeroed, on"
-        "\nthe current device and binds it; zero_state() clears it again."
-    )
-
-    def __init__(self, **kwargs):
-        self._res_state = None
-        super().__init__(**kwargs)
-        info = self.info
-        if not info.get("aggReserve"):
-            return
-        import torch
-
-        try:
-            self._res_state = torch.zeros(
-                agg_reserve_state_bytes(info["worldSize"]), dtype=torch.uint8, device="cuda"
-            )
-        except BaseException:
-            super().close()
-            raise
-        self.bind(res_state=self._res_state.data_ptr())
-
-    def zero_state(self) -> None:
-        """Clear the reservation state. No launch of this plan may be in flight."""
-        if self._res_state is not None:
-            self._res_state.zero_()
-
-    def close(self) -> None:
-        self._res_state = None
-        super().close()
 
 
 # The internode sequence. Eight plans rather than two: its dispatch and combine

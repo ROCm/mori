@@ -273,19 +273,27 @@ __device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
                                      : EpPeer<index_t>(EpWinC{args.window}, pe, args.offTokOff);
 }
 
-// Cfg.aggReserve state at args.resState, laid out by EpResStateBytes (ep_cfg.hpp).
-template <typename T>
-__device__ __forceinline__ T* EpResAt(const EpArgs& args, unsigned long long off) {
-  return reinterpret_cast<T*>(reinterpret_cast<char*>(args.resState) + off);
-}
-__device__ __forceinline__ unsigned* EpResSeq(const EpArgs& args) { return args.resState; }
-__device__ __forceinline__ unsigned* EpResCnt(const EpArgs& args, int dst) {
-  return EpResAt<unsigned>(args, EpResCntOff) + dst;
+// The Cfg.aggReserve state, laid out by EpResStateBytes (ep_cfg.hpp). Zero when the module
+// loads, and every call leaves it ready for the next, so the host never touches it.
+template <int kWorldSize>
+__device__ __align__(EpResLine) unsigned
+    _resState[EpResStateBytes(kWorldSize) / sizeof(unsigned)];
+template <int kWorldSize, typename T>
+__device__ __forceinline__ T* EpResAt(unsigned long long off) {
+  return reinterpret_cast<T*>(reinterpret_cast<char*>(_resState<kWorldSize>) + off);
 }
 template <int kWorldSize>
-__device__ __forceinline__ unsigned long long* EpResPub(const EpArgs& args, int dst) {
-  return EpResAt<unsigned long long>(args,
-                                     EpResPubOff(kWorldSize) + EpResPubStride * (unsigned)dst);
+__device__ __forceinline__ unsigned* EpResSeq() {
+  return _resState<kWorldSize>;
+}
+template <int kWorldSize>
+__device__ __forceinline__ unsigned* EpResCnt(int dst) {
+  return EpResAt<kWorldSize, unsigned>(EpResCntOff) + dst;
+}
+template <int kWorldSize>
+__device__ __forceinline__ unsigned long long* EpResPub(int dst) {
+  return EpResAt<kWorldSize, unsigned long long>(EpResPubOff(kWorldSize) +
+                                                 EpResPubStride * (unsigned)dst);
 }
 
 // The plain token map fills block b with its warpPerBlock consecutive work units, so a
@@ -717,7 +725,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                           __HIP_MEMORY_SCOPE_AGENT);
   };
   if constexpr (kCfg.aggReserve) {
-    resSeq = *EpResSeq(args) + 1u;
+    resSeq = *EpResSeq<npes>() + 1u;
     // In each block holding tokens lane p of warp 0 adds the block's count for destination p,
     // this rank included, into the rank's total for p and keeps its offset in it; the last of
     // those blocks to arrive reserves the total with one RMW on p's slot word and publishes the
@@ -729,8 +737,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       constexpr int A = __HIP_MEMORY_SCOPE_AGENT;
       const int p = laneId;
       const bool dest = p < npes;
-      unsigned* cnt = EpResCnt(args, dest ? p : 0);
-      unsigned long long* pub = EpResPub<npes>(args, dest ? p : 0);
+      unsigned* cnt = EpResCnt<npes>(dest ? p : 0);
+      unsigned long long* pub = EpResPub<npes>(dest ? p : 0);
       const index_t n = dest ? s_N[p] : 0;
       // Only the blocks holding tokens meet: a call of fewer units than blocks waits on those.
       const unsigned nHold = (unsigned)EpTokBlocks<kCfg>(_tokChunk, (int)args.numTokens, _etpi);
@@ -842,7 +850,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
     if (_ls && warpId == 0 && _lsLast)
-      __hip_atomic_store(EpResPub<npes>(args, (int)laneId),
+      __hip_atomic_store(EpResPub<npes>((int)laneId),
                          ((unsigned long long)resSeq << 32) | (unsigned)_lsBase, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_AGENT);
   } else if (args.tokenIndices && args.inpTokenBuf && _rowOk) {
@@ -1516,8 +1524,8 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       if (thdId == 0) {
         constexpr int R = __ATOMIC_RELAXED;
         constexpr int A = __HIP_MEMORY_SCOPE_AGENT;
-        unsigned* const ctr = EpResAt<unsigned>(args, kEpPinCtrOff);
-        unsigned* const flg = EpResAt<unsigned>(args, kEpPinCtrOff + 4);
+        unsigned* const ctr = EpResAt<npes, unsigned>(kEpPinCtrOff);
+        unsigned* const flg = EpResAt<npes, unsigned>(kEpPinCtrOff + 4);
         if (__hip_atomic_fetch_add(ctr, 1u, R, A) == gridDim.x - 1u) {
           __scoped_atomic_thread_fence(__ATOMIC_ACQ_REL, A);
           __hip_atomic_store(ctr, 0u, R, A);
@@ -1551,13 +1559,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         const int p = (int)blockIdx.x % npes;
         const int kq = (int)blockIdx.x / npes;
         const int nq = (int)gridDim.x / npes;
-        const unsigned long long pw = __hip_atomic_load(EpResPub<npes>(args, p), R, A);
+        const unsigned long long pw = __hip_atomic_load(EpResPub<npes>(p), R, A);
         if ((unsigned)(pw >> 32) != resSeq) __builtin_trap();
         const index_t rb = (index_t)__builtin_amdgcn_readfirstlane((unsigned)pw);
         if (_ls) {
           index_t vB = 0;
           if (laneId < npes) {
-            const unsigned long long q = __hip_atomic_load(EpResPub<npes>(args, (int)laneId), R, A);
+            const unsigned long long q = __hip_atomic_load(EpResPub<npes>((int)laneId), R, A);
             if ((unsigned)(q >> 32) != resSeq) __builtin_trap();
             vB = (index_t)(unsigned)q;
           }
@@ -1743,7 +1751,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           if (lim > (index_t)(1 << 24) || gridDim.x % npes != 0) __builtin_trap();
           index_t vRb = 0, vN = 0;
           if (laneId < npes) {
-            const unsigned long long pq = __hip_atomic_load(EpResPub<npes>(args, (int)laneId), R, A);
+            const unsigned long long pq = __hip_atomic_load(EpResPub<npes>((int)laneId), R, A);
             if ((unsigned)(pq >> 32) != resSeq) __builtin_trap();
             const index_t b = (index_t)(unsigned)pq;
             index_t e = b + __hip_atomic_load(args.destPeTokenCounter + laneId, R, A);
@@ -2138,7 +2146,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // published bases, so this is the one store of it. The published words need no
     // reset: the next call waits for its own number in them.
     if constexpr (kCfg.aggReserve) {
-      if (laneId == 0) *EpResSeq(args) = resSeq;
+      if (laneId == 0) *EpResSeq<npes>() = resSeq;
       // The signal to p carries in its high word where p's rows from this rank go in this
       // rank's push combine landing: after the rows to every destination below p, so a row at
       // slot s of p lands at s + dl and the runs tile [0, the rows this rank sent).
