@@ -283,7 +283,7 @@ class MediumBackend : public MetricSource {
   // PeerPool::Evict, and Evict() below is the one place a medium frees a
   // committed key.  What only the medium can supply is ORDER: it sees every
   // read, including the resolve paths that never touch the pool's metadata.
-  // So it offers candidates, and nothing else (design-eviction-convergence.md).
+  // So it offers candidates, and nothing else.
 
   // Start keeping the recency order EvictionCandidates() reads.  Off by
   // default: a node whose eviction is all master-driven never asks for

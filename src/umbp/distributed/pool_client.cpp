@@ -1094,9 +1094,9 @@ bool PoolClient::Init() {
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
 
-  // Local watermark eviction (design-eviction-convergence.md §6).  It goes
-  // through PeerPool::Evict, the same call a master's EvictKey makes, on the
-  // pool's own thread -- never on a put.  Which media get it is unchanged:
+  // Local watermark eviction.  It goes through PeerPool::Evict, the same call
+  // a master's EvictKey makes, on the pool's own thread -- never on a put.
+  // Which media get it is unchanged:
   //   * no master: every medium, since nothing else would ever free a page;
   //   * with a master: SSD only, which has always reclaimed for itself between
   //     the master's periodic rounds.  DRAM/HBM stay master-driven there.
