@@ -8,6 +8,11 @@ name: ci-rerun
 # those workflows check out refs/pull/N/merge, i.e. the PR merged with the
 # current main. GITHUB_TOKEN can re-run workflows, so no personal token is
 # involved.
+#
+# Fork PRs: use the comment. A label event on a fork PR gets a read-only
+# GITHUB_TOKEN, so the label path is skipped there. (pull_request_target would
+# have a write token, but GitHub blocks it by default in public repositories
+# from 2026-11-02.)
 on:
   issue_comment:
     types: [created]
@@ -25,7 +30,8 @@ jobs:
     if: |
       (github.event_name == 'issue_comment' && github.event.issue.pull_request != null &&
        startsWith(github.event.comment.body, '/ci-rerun')) ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'ci-rerun')
+      (github.event_name == 'pull_request' && github.event.label.name == 'ci-rerun' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
@@ -37,8 +43,11 @@ jobs:
               github.rest.issues.createComment({ owner, repo, issue_number: number, body })
                 .catch((e) => core.warning(`could not comment: ${e.message}`));
 
-            // Remove the label first so it can be added again next time.
-            if (context.eventName === 'pull_request') {
+            // Remove the label so it can be added again next time. The comment
+            // path also clears one left on a fork PR, where the label path is
+            // skipped.
+            const labels = (context.payload.issue || context.payload.pull_request).labels || [];
+            if (labels.some((l) => l.name === 'ci-rerun')) {
               await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: 'ci-rerun' })
                 .catch((e) => core.warning(`could not remove ci-rerun: ${e.message}`));
             }
