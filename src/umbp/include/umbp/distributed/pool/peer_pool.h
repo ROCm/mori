@@ -155,6 +155,11 @@ class PeerPool {
   LocalEvictionMetrics LocalEvictionStats() const;
   // Test seam: one synchronous pass.  Returns keys dropped or queued.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
+  // How long an eviction demotion keeps retrying before its copy is dropped
+  // (UMBP_EVICT_DEMOTION_RETRY_MS, default 30 s).  Tests shorten it.
+  void SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds budget) {
+    evict_demotion_retry_budget_ = budget;
+  }
 
   // Victims for a backend over its watermark, coldest first, before the
   // medium's own order: (tier, logical tier, bytes) -> offers, or nullopt when
@@ -176,7 +181,9 @@ class PeerPool {
     uint32_t source_backend_id = BackendRegistry::kMaxBackends;
     LogicalTierGraph::TierIndex source_tier = 0;
     uint8_t attempts = 0;
-    bool evict = false;  // from Evict(): ignores watermarks; drops on failure
+    // An eviction demotion's retries are bounded by time from its first attempt.
+    std::chrono::steady_clock::time_point first_attempt{};
+    bool evict = false;  // from Evict(): ignores watermarks; drops once retries run out
   };
 
   // What the copy phase needs, resolved while the pool lock is still held.
@@ -294,6 +301,8 @@ class PeerPool {
   std::vector<size_t> queued_by_tier_;
   bool stop_transition_worker_ = false;
   std::thread transition_worker_;
+  // Read by the transition worker only (and the test seam before it starts).
+  std::chrono::milliseconds evict_demotion_retry_budget_{30000};
 
   // Local watermark eviction.  local_evict_mutex_ guards local_evict_,
   // stop_local_evict_ and the worker's start.

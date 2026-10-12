@@ -109,6 +109,10 @@ TierTransitionResult TierTransitionExecutor::Execute(
         continue;
       }
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
+      // No space is pressure, not a verdict: an SSD reports it while its staging
+      // arena is full of in-flight reads, a page tier while its eviction catches
+      // up.  A shape failure (kFailed) can never succeed and stays final.
+      if (allocation.outcome == AllocateOutcome::kFailedNoSpace) result.retryable = true;
       continue;
     }
 
