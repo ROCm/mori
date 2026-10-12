@@ -142,12 +142,28 @@ def scale_stride_bytes(scale_bytes: int) -> int:
     return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
 
 
-def ep_staging_bytes(world_size: int, max_recv: int, scale_bytes: int) -> int:
+def ep_staging_bytes(
+    world_size: int, max_recv: int, scale_bytes: int, max_tok_per_rank: int = 0
+) -> int:
     """Total bytes for the gfx1250 dispatch staging buffer.
 
     Mirrors EpStagingTotalBytes in ep_cfg.hpp.
+
+    ``max_recv`` is EpCfg.maxRecv, where 0 is not a cap of zero but "ask
+    EpMaxRecv", which answers world_size * max_tok_per_rank -- and that is the
+    Plan default, so a caller sizing the buffer straight from a Cfg hits it.
+    Pass ``max_tok_per_rank`` with it; the kernel indexes staging at the cap it
+    resolved, so a buffer sized at 0 is not a short allocation that faults but a
+    write past the end of whatever the caller handed us.
     """
-    pool = world_size * max_recv
+    recv = max_recv if max_recv > 0 else world_size * max_tok_per_rank
+    if recv <= 0:
+        raise ValueError(
+            "ep_staging_bytes: max_recv is 0 (EpCfg's 'use EpMaxRecv' spelling) and "
+            "no max_tok_per_rank was given, so the receive cap is unknown. Pass "
+            "max_tok_per_rank, or pass an already-resolved cap as max_recv."
+        )
+    pool = world_size * recv
     max_topk = 16
     max_blocks = 512
 
@@ -161,7 +177,7 @@ def ep_staging_bytes(world_size: int, max_recv: int, scale_bytes: int) -> int:
     off = a128(off + max_blocks * world_size * 4)  # blkCount
     if scale_bytes > 0:
         s_stride = scale_stride_bytes(scale_bytes)
-        off = a128(off + world_size * max_recv * s_stride)
+        off = a128(off + world_size * recv * s_stride)
     return off
 
 

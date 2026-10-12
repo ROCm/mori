@@ -110,8 +110,8 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
     if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase) {
       throw std::runtime_error(
           "ep_dispatch on gfx125x: staging_base was not bound. Allocate "
-          "ep_staging_bytes(world_size, max_recv, scale_bytes) bytes and "
-          "plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
+          "ep_staging_bytes(world_size, max_recv, scale_bytes, max_tok_per_rank) bytes "
+          "and plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
     }
     // EpStaging*Offset are EpScaleAlign multiples OF THE BASE, so the base owns the
     // alignment the .bss arrays used to declare themselves. A caller carving staging

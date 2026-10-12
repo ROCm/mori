@@ -292,3 +292,19 @@ def test_staging_bytes_matches_the_device_layout():
     # where a sub-array size is not already a multiple of 128, so it is the only
     # case that exercises the mirror's rounding at all.
     assert ep_staging_bytes(1, 7, 0) == 5248
+
+
+def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
+    # EpCfg.maxRecv == 0 means "worldSize * maxTokPerRank" (EpMaxRecv), and it is
+    # the Plan default -- so this is the spelling an out-of-tree caller sizing the
+    # buffer from a Cfg actually passes. Returning a pool of 0 for it would hand
+    # back a 4 KiB buffer the kernel then writes megabytes into.
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    assert ep_staging_bytes(8, 0, 224, 512) == ep_staging_bytes(8, 8 * 512, 224)
+    # A resolved cap wins over the fallback, as EpMaxRecv's ternary does.
+    assert ep_staging_bytes(8, 4096, 224, 1) == ep_staging_bytes(8, 4096, 224)
+    # Neither spelling given is the case that used to return a short buffer in
+    # silence; there is no size to compute, so it cannot be a return value.
+    with pytest.raises(ValueError, match="max_tok_per_rank"):
+        ep_staging_bytes(8, 0, 224)
