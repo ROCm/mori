@@ -369,8 +369,10 @@ constexpr bool EpCombinePush(const EpCfg& c) { return c.combineFp4 || c.combineF
 //
 // Padded on every arch so the destination layout does not fork per arch. The pad
 // is unconditional, so small rows amplify: 224->256 is 1.14x, 32->128 is 4x,
-// 4->128 is 32x, and the gfx1250 staging pool is worldSize^2 * maxTok * THIS per
-// compiled variant. Bounded by the static_assert there, not by this being cheap.
+// 4->128 is 32x, and the gfx1250 scale staging is worldSize^2 * maxTok * THIS --
+// the largest term in EpStagingTotalBytes by far. It is one host allocation per
+// op now, not a __device__ array per compiled variant, so nothing fails to build
+// over it: going wider costs VRAM at construction instead.
 //
 // Everything reading the destination uses this, not Cfg.scaleBytes; it assumes
 // the arena aligns the region too (SymmArena._ALIGN, checked in hip_backend).
@@ -473,9 +475,11 @@ constexpr size_t EpStagingScaleBytes(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (size_t)c.worldSize * EpMaxRecv(c) * EpScaleStride(c);
 }
 
+// The scale region is the only one a Cfg can switch off; blkBase and blkCount are
+// EpStagingMaxBlocks * worldSize regardless, so the total is never zero and the
+// caller always has something to allocate.
 constexpr size_t EpStagingTotalBytes(const EpCfg& c) {
-  size_t tail = EpStagingScaleOffset(c) + EpStagingScaleBytes(c);
-  return tail > 0 ? EpAlignUp128(tail) : 0;
+  return EpAlignUp128(EpStagingScaleOffset(c) + EpStagingScaleBytes(c));
 }
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
