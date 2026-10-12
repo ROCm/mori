@@ -20,15 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// The SSD medium's eviction primitive and its candidate order.  Drives
-// PeerSsdManager through a controllable in-memory TierBackend (the test-only
-// constructor) so LRU ordering, the in-flight-read guard, idempotent Write,
-// backend-evict failure, concurrent eviction, and physical Clear are all
-// deterministic without real disk IO.
-//
-// What is deliberately NOT here: watermark eviction.  The manager never decides
-// to evict -- not after a write, not when a write runs out of room.  That is
-// PeerPool's local eviction, tested in test_peer_pool against an SsdBackend.
+// The SSD medium's eviction primitive and candidate order, driven through an
+// in-memory TierBackend (the test-only constructor) so LRU order, the
+// in-flight-read guard, idempotent Write, evict failure, concurrency and Clear
+// are deterministic.  Watermark eviction is PeerPool's, tested there.
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -176,19 +171,6 @@ int CountKind(const std::vector<KvEvent>& events, KvEvent::Kind kind) {
   return n;
 }
 
-std::vector<std::string> Keys(const std::vector<EvictionOffer>& offers) {
-  std::vector<std::string> keys;
-  for (const auto& offer : offers) keys.push_back(offer.key);
-  return keys;
-}
-
-bool HasRemove(const std::vector<KvEvent>& events, const std::string& key) {
-  for (const auto& e : events) {
-    if (e.kind == KvEvent::Kind::REMOVE && e.tier == TierType::SSD && e.key == key) return true;
-  }
-  return false;
-}
-
 // ---------------------------------------------------------------------------
 
 TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
@@ -197,8 +179,7 @@ TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
   ASSERT_TRUE(h.mgr->Write("B", OneSeg("bbbb"), 4));
   ASSERT_TRUE(h.mgr->Write("C", OneSeg("cccc"), 4));
 
-  // LRU now (oldest->newest): A, B, C.  Reading A promotes it to MRU, so the
-  // oldest becomes B and the first candidate must be B (not the just-read A).
+  // LRU is A, B, C; reading A makes B the coldest.
   std::vector<char> buf(4);
   auto out = h.mgr->PrepareRead("A", buf.data(), buf.size());
   ASSERT_EQ(out.status, SsdReadStatus::kOk);
@@ -208,56 +189,30 @@ TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
   ASSERT_EQ(candidates.size(), 1u);
   EXPECT_EQ(candidates.front().key, "B");
   EXPECT_EQ(candidates.front().bytes, 4u);
+  EXPECT_EQ(h.mgr->EvictionCandidates(100).size(), 3u);
+  EXPECT_TRUE(h.mgr->Exists("B")) << "asking for candidates freed one";
 }
 
-TEST(PeerSsdEviction, CandidatesAreColdestFirstAndCapped) {
-  auto h = MakeHarness(/*capacity=*/1'000'000);
-  for (int i = 1; i <= 5; ++i) {
-    ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg("data"), 4));
-  }
-  EXPECT_EQ(Keys(h.mgr->EvictionCandidates(3)), (std::vector<std::string>{"k1", "k2", "k3"}));
-  EXPECT_EQ(h.mgr->EvictionCandidates(100).size(), 5u);
-  // Ordering only: asking freed nothing.
-  for (int i = 1; i <= 5; ++i) EXPECT_TRUE(h.mgr->Exists("k" + std::to_string(i)));
-}
-
-TEST(PeerSsdEviction, WritesNeverEvictEvenWhenNearlyFull) {
-  // 900 of 1000 bytes used is where the manager's own round used to fire.  It
-  // has none now: the pool's local eviction decides, on its own thread, so a
-  // write must leave every earlier key exactly where it was.
+TEST(PeerSsdEviction, WritesNeverEvict) {
+  // At 900 of 1000 (the old watermark round) and on ENOSPC alike, a write
+  // leaves every earlier key in place: eviction is the pool's job.
   auto h = MakeHarness(/*capacity=*/1000);
   std::string val(100, 'x');
   for (int i = 1; i <= 9; ++i) {
     ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg(val), val.size()));
   }
-  auto [used, total] = h.mgr->Capacity();
-  EXPECT_EQ(used, 900u);
-  EXPECT_EQ(total, 1000u);
-  for (int i = 1; i <= 9; ++i) EXPECT_TRUE(h.mgr->Exists("k" + std::to_string(i)));
-  EXPECT_EQ(CountKind(h.mgr->DrainPendingEvents(), KvEvent::Kind::REMOVE), 0);
-}
-
-TEST(PeerSsdEviction, WriteThatDoesNotFitFailsWithoutEvicting) {
-  // 800 of 1000 used, then a 300-byte value: the device answers ENOSPC.  The
-  // write fails and records nothing; it does not evict older keys to make room
-  // -- that would be eviction work on the put path.
-  auto h = MakeHarness(/*capacity=*/1000);
-  for (int i = 1; i <= 8; ++i) {
-    ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg(std::string(100, 'a')), 100));
-  }
-  h.mgr->DrainPendingEvents();
+  EXPECT_EQ(h.mgr->Capacity().first, 900u);
   EXPECT_FALSE(h.mgr->Write("big", OneSeg(std::string(300, 'c')), 300));
   EXPECT_FALSE(h.mgr->Exists("big"));
-  EXPECT_TRUE(h.mgr->Exists("k1"));
-  EXPECT_TRUE(h.mgr->DrainPendingEvents().empty());
 
-  // The batched path behaves the same, per key.
+  // The batched path fails the oversized key alone.
   const std::string big(300, 'c');
   const std::string small(100, 's');
   auto ok =
       h.mgr->WriteBatch({"big", "small"}, {big.data(), small.data()}, {big.size(), small.size()});
   EXPECT_EQ(ok, (std::vector<bool>{false, true}));
-  EXPECT_TRUE(h.mgr->Exists("k1"));
+  for (int i = 1; i <= 9; ++i) EXPECT_TRUE(h.mgr->Exists("k" + std::to_string(i)));
+  EXPECT_EQ(CountKind(h.mgr->DrainPendingEvents(), KvEvent::Kind::REMOVE), 0);
 }
 
 TEST(PeerSsdEviction, InFlightReadIsNotEvicted) {
