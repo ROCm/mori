@@ -492,9 +492,11 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // gives a token warp one token. kPayFirst loads that token into the slab's first row before the
   // metadata pass, so the wait before the metadata stores covers it, and its stores follow the
   // metadata stores with no wait between: one completion wait instead of two. The metadata tile
-  // moves up a row where it shares the slab.
+  // moves up a row where it shares the slab. EP32 dispatch, 3 alternating rounds: 64x16 -1.6 / -0.5
+  // us at 512 / 1024 tokens a rank, 128x16 +0.7 / +0.8, so it stops at 64 blocks.
   constexpr bool kPayFirst = !kUnitGeom && !kDPin && npes > kCfg.warpPerBlock &&
-                             kCfg.warpPerBlock > kEpTokChunk && kSlabBytes >= 2 * kTokB;
+                             kCfg.blockNum <= 64 && kCfg.warpPerBlock > kEpTokChunk &&
+                             kSlabBytes >= 2 * kTokB;
 
   constexpr int kMaxNpes = kCfg.worldSize;
   __shared__ index_t s_N[kMaxNpes];
