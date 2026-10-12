@@ -2197,12 +2197,10 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool holdsHighestTicket =
       (warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket);
   if (holdsHighestTicket) {
-    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    // Every block of this rank is past its reads of the call number and of the
-    // published bases, so this is the one store of it. The published words need no
-    // reset: the next call waits for its own number in them.
+    // The counter reset and the call number go out after the signals: the system fence in front
+    // of a signal waits for every store before it, and these two are a fabric round trip (EP32
+    // fen to sig 4.3 us). Nothing in this call reads either again.
     if constexpr (kCfg.aggReserve) {
-      if (laneId == 0) *EpResSeq<npes>() = resSeq;
       // The signal to p carries in its high word where p's rows from this rank go in this
       // rank's push combine landing: after the rows to every destination below p, so a row at
       // slot s of p lands at s + dl and the runs tile [0, the rows this rank sent).
@@ -2242,6 +2240,13 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         // read its own send counts yet.
         args.destPeTokenCounter[destPe] = 0;
       }
+    }
+    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    // Every block of this rank is past its reads of the call number and of the
+    // published bases, so this is the one store of it. The published words need no
+    // reset: the next call waits for its own number in them.
+    if constexpr (kCfg.aggReserve) {
+      if (laneId == 0) *EpResSeq<npes>() = resSeq;
     }
   }
   // Inbound rides the first arriver so it is already parked when the peers'
