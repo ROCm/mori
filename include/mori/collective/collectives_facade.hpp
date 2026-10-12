@@ -94,10 +94,13 @@ class CollectivesFacade {
   CollectivesFacade() = default;
  public:
   // Reduce algorithm selection for reduce-scatter and all-reduce (default
-  // auto: pull or push chosen per call by message size). MORI_COLL_FORCE_PUSH=1
-  // or MORI_COLL_FORCE_PULL=1 (read in Create) replaces that default. Set at
-  // runtime via SetReduceMode(); the push slice count via SetPushLogSlices()
-  // (-1 = auto).
+  // auto: pull or push chosen per call by message size). Env overrides read in
+  // Create: MORI_CCL_FORCE_PUSH_N_SLICES=<S> (a power of two in {1,2,4,8})
+  // forces push mode and pins the slice count, <=0/unset means no preference,
+  // anything else is an error; MORI_CCL_FORCE_PULL!=0 forces pull (npes 4 or 8).
+  // Set at runtime via SetReduceMode(); the push slice count via
+  // SetPushLogSlices() (-1 = auto). MORI_CCL_MAX_NBLOCKS caps the launch grid
+  // (<= 0/unset = no cap).
   enum class RsMode { kPush, kPull, kAuto };
 
   static constexpr size_t kDefAlign = 256;
@@ -172,21 +175,40 @@ class CollectivesFacade {
     facade.MP_count_ = prop.multiProcessorCount;
 
     // Tuning (reduce-scatter mode / push slice count) defaults to auto for both;
-    // MORI_COLL_FORCE_PUSH / MORI_COLL_FORCE_PULL replace the mode default.
+    // MORI_CCL_FORCE_PUSH_N_SLICES / MORI_CCL_FORCE_PULL replace the mode default.
     // Callers override at runtime via SetReduceMode() / SetPushLogSlices().
     // Reset here: a device's facade is reused across Create/TearDown.
-    const bool forcePush = EnvFlag("MORI_CCL_FORCE_PUSH"),
-               forcePull = EnvFlag("MORI_CCL_FORCE_PULL");
+    //
+    // MORI_CCL_FORCE_PUSH_N_SLICES is the actual push slice count S: a
+    // power-of-two value in {1, 2, ..., kRSPushMaxSlices} forces push mode AND
+    // pins the slice count (logS_ = log2(S)); a value <= 0 (or unset) means no
+    // preference; any other value is an error.
     facade.mode_ = RsMode::kAuto;
-    if (forcePush) {
+    facade.logS_ = -1;
+    bool pushOk = true;
+    const long forcePushSlices = EnvInt("MORI_CCL_FORCE_PUSH_N_SLICES", 0, &pushOk);
+    const bool forcePull = EnvInt("MORI_CCL_FORCE_PULL", 0) != 0;
+    if (!pushOk ||
+        (forcePushSlices > 0 &&
+         (forcePushSlices > kRSPushMaxSlices || (forcePushSlices & (forcePushSlices - 1)) != 0))) {
+      FACADE_PRINTF("CollectivesFacade: MORI_CCL_FORCE_PUSH_N_SLICES must be a power of two in "
+                    "[1,%d] (or <=0/unset for no preference)", kRSPushMaxSlices);
+      return -1;
+    }
+    if (forcePushSlices > 0) {
       facade.mode_ = RsMode::kPush;
+      facade.logS_ = __builtin_ctz(static_cast<unsigned>(forcePushSlices));  // log2(S)
     } else if (forcePull) {
       if (facade.nPes_ == 4 || facade.nPes_ == 8) {
         facade.mode_ = RsMode::kPull;
       } else {
-        FACADE_PRINTF("CollectivesFacade: MORI_COLL_FORCE_PULL needs npes 4 or 8; using auto");
+        FACADE_PRINTF("CollectivesFacade: MORI_CCL_FORCE_PULL needs npes 4 or 8; using auto");
       }
     }
+    // Optional hard cap on the launch grid of the reduce-scatter/all-reduce
+    // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
+    facade.maxNBlocks_ = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
+
     if (facade.nPes_ > kRSPushMaxPeers) {
       FACADE_PRINTF("CollectivesFacade: npes too large (max %d)", kRSPushMaxPeers);
       return -1;
@@ -422,10 +444,21 @@ class CollectivesFacade {
     return *inst;
   }
   
-  // Set means non-empty and not "0".
-  static bool EnvFlag(const char* name) {
+  // Parse an integer env var. Returns `defaultVal` (and sets *ok=true) when the
+  // var is unset or empty; parses the whole string as a base-10 long otherwise.
+  // A non-numeric or partially-numeric value sets *ok=false and returns
+  // `defaultVal`. `ok` may be null if the caller does not care about validity.
+  static long EnvInt(const char* name, long defaultVal, bool* ok = nullptr) {
+    if (ok != nullptr) *ok = true;
     const char* e = std::getenv(name);
-    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+    if (e == nullptr || *e == '\0') return defaultVal;
+    char* end = nullptr;
+    const long v = std::strtol(e, &end, 10);
+    if (end == e || *end != '\0') {
+      if (ok != nullptr) *ok = false;
+      return defaultVal;
+    }
+    return v;
   }
 
   RsMode resolveMode(size_t totalBytes, bool allReduce) const {
@@ -467,6 +500,7 @@ private:
   // SDMA target); devComm_ is the SDMA device comm.
   mori::cco::ccoDevComm devComm_{};
   int myPe_{0}, nPes_{0}, logS_{-1}, MP_count_{0};
+  int maxNBlocks_{0};  // MORI_CCL_MAX_NBLOCKS grid cap; <= 0 means no cap
   RsMode mode_{RsMode::kAuto};
 };
 
@@ -540,6 +574,8 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, MP_count_));
+  // MORI_CCL_MAX_NBLOCKS tightens (never raises) the grid; it stays co-resident.
+  if (maxNBlocks_ > 0) blocks = std::min(blocks, maxNBlocks_);
 
   int logS = resolveLogS(chunkBytes, /*allReduce=*/false);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
@@ -612,6 +648,8 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // for the multi-producer broadcast submitPacket ordering, pull for the
   // entry go-flag spin.
   int blocks = std::min(wantBlocks, std::max(1, MP_count_));
+  // MORI_CCL_MAX_NBLOCKS tightens (never raises) the grid; it stays co-resident.
+  if (maxNBlocks_ > 0) blocks = std::min(blocks, maxNBlocks_);
 
   int logS = resolveLogS(chunkBytes, /*allReduce=*/true);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);

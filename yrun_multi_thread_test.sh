@@ -68,8 +68,9 @@ export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/lib
 #   COLL: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute
 #         (aliases rs|ar|ag|a2a|cp)
 COLL=${COLL:-all_reduce}
-MODE=${MODE:-push}      # push|pull (reduce_scatter)
-LOGS=${LOGS:-2}         # logS: S = 1<<LOGS slices (push path)
+MODE=${MODE-push}       # push|pull|auto; MODE= (empty) omits --mode -> facade default
+MODE_ARG=${MODE:+--mode $MODE}
+LOGS=${LOGS:-2}         # logS: S = 1<<LOGS slices (push path), -1 = auto
 DTYPE=${DTYPE:-f32}     # f32|bf16|f16|s32|s64 (reduction collectives)
 OP=${OP:-sum}           # sum|prod|min|max (reduction collectives)
 
@@ -92,7 +93,7 @@ rm -f zzout_*.log
 
 for ((size = MIN_SIZE; size <= MAX_SIZE; size = size * 2)); do
   $GDB $ROCPROF $TEST --coll $COLL --npes $NUM_GPUS --size $size \
-    --dtype $DTYPE --op $OP --mode $MODE --logS $LOGS $@ 2>&1 | tee -a zzout_0.log
+    --dtype $DTYPE --op $OP $MODE_ARG --logS $LOGS $@ 2>&1 | tee -a zzout_0.log
 done
 exit 0
 

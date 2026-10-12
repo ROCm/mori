@@ -455,6 +455,17 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
                                     mori::cco::ccoDevComm devComm, mori::cco::ccoWindow_t heapWin,
                                     const T* __restrict__ input, T* __restrict__ staging,
                                     uint64_t* __restrict__ barrierCtr) {
+  
+
+  // gen = gen_ptr[0];
+  // __syncthreads();
+  // if (threadIdx.x == 0) {
+  //   cnt = 1 + atomicAdd(counter, 1);
+  //   if (cnt == gridDim.x) {
+  //     *counter = 0;
+  //     gen_ptr[0] = gen + 1;
+  //   }
+  // }
 
     // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
