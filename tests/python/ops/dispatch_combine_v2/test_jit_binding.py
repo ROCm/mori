@@ -247,49 +247,22 @@ def test_arena_offsets_are_launch_defaults_not_part_of_the_key():
 
 
 # --------------------------------------------------------------------------
-# aggReserve: the blocks meet in state the plan owns, not in the caller's arena
+# aggReserve: the blocks meet in a module global of the kernel, so the caller
+# allocates and binds nothing for it
 # --------------------------------------------------------------------------
 
 
-def _agg_reserve_or_skip():
+def test_agg_reserve_is_the_default_and_takes_no_argument():
     p = _plan()
     on = p.info.get("aggReserve")
     p.close()
     if not on:
         pytest.skip("aggReserve resolves on for the gfx125x dispatch only")
-
-
-def test_agg_reserve_is_the_default_and_binds_zeroed_state_of_its_own():
-    _agg_reserve_or_skip()
-    a = _plan()
-    b = _plan(block_num=32, warp_per_block=4)
-    sa, sb = a._res_state, b._res_state
-    assert a._defaults["resState"] == sa.data_ptr()
-    assert sa.data_ptr() != sb.data_ptr(), "one state per plan"
-    assert sa.numel() == cb.agg_reserve_state_bytes(1)
-    assert int(sa.count_nonzero()) == 0, "the state must start zeroed"
-    sa.fill_(0x5A)
-    a.zero_state()
-    assert int(sa.count_nonzero()) == 0
-    a.close()
-    assert a._res_state is None
-    b.close()
+    assert "resState" not in cb.EpDispatchPlan._arg_names
 
 
 def test_per_block_reservation_follows_the_slot_word():
     # The slot word outside the cco window: every block reserves its own.
     p = _plan(tok_off_ext=1)
     assert not p.info.get("aggReserve")
-    assert p._res_state is None
-    assert p._defaults.get("resState", 0) == 0
-    p.zero_state()
     p.close()
-
-
-def test_agg_reserve_state_size_matches_the_device_layout():
-    # EpResStateBytes (ep_cfg.hpp): a 128 B line for the call number, a 4 B count
-    # per rank rounded up to a line, then a 64 B published word per rank.
-    assert cb.agg_reserve_state_bytes(1) == 128 + 128 + 64
-    assert cb.agg_reserve_state_bytes(8) == 128 + 128 + 512
-    assert cb.agg_reserve_state_bytes(32) == 128 + 128 + 2048
-    assert cb.agg_reserve_state_bytes(33) == 128 + 256 + 2112

@@ -1054,11 +1054,6 @@ class EpDispatchCombineOp:
         tokoff_ext = getattr(self, "_tokoff_ext", None)
         if tokoff_ext is not None:
             tokoff_ext.zero()
-        # So do the dispatch plans their reservation state (ep_plans.EpDispatchPlan).
-        for plan in getattr(self, "_plans", ()):
-            zero_state = getattr(plan, "zero_state", None)
-            if zero_state is not None:
-                zero_state()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         self.total_recv.zero_()

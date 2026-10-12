@@ -62,8 +62,8 @@ every destination, this rank included, into the rank's total for it, and the las
 block to arrive reserves the total with one RMW on that destination's word and
 publishes the first slot to the others. In the window the RMWs on one word
 serialize, so a rank makes one per destination per call instead of one per block.
-The blocks meet in a few hundred bytes of local memory that `EpDispatchPlan`
-allocates per plan, so an arena built outside this package needs nothing for it.
+The blocks meet in a few hundred bytes of a `__device__` array in the dispatch
+kernel's own module, so neither the arena nor the caller allocates anything for it.
 
 `MORI_EP_TOKOFF_EXT=1` (default off) moves the word of a single-host EP into a separate
 allocation (`TokOffExt` in `hip_backend.py`), and there every block reserves its
