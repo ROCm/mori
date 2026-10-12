@@ -172,14 +172,15 @@ def _ensure_device_nic() -> None:
         pass
 
 
-def load_library(name: str = _ABI_NAME, extra_dirs=None) -> None:
+def load_library(name: str = _ABI_NAME, extra_dirs=None) -> ctypes.CDLL:
     """dlopen an op-library so its kernels register into the JIT registry.
 
     Brings ``libmori_jit.so`` (the ABI + registry) as its dependency; both are
     loaded RTLD_GLOBAL so the registry is one shared instance and the ABI symbols
     resolve regardless of which directory each .so lives in. Idempotent enough to
     call once per op-library at import time. ``extra_dirs`` is searched first --
-    a caller pointing at a build tree passes its lib dir there.
+    a caller pointing at a build tree passes its lib dir there. Returns the handle,
+    for an op-library carrying symbols of its own beyond the generic ABI.
     """
     global _abi
     _ensure_device_nic()  # set MORI_DEVICE_NIC before the C++ toolchain resolves
@@ -199,7 +200,7 @@ def load_library(name: str = _ABI_NAME, extra_dirs=None) -> None:
                 f"{_ABI_NAME} not found. Build the jit target, or pass its dir. "
                 "Searched:\n  " + "\n  ".join(str(d / _ABI_NAME) for d in dirs)
             )
-        return
+        return _abi
 
     # 2) The op-library. Loading it registers its kernels; if the ABI was not
     #    found on its own, it comes in here as a dependency (dlsym walks it).
@@ -209,10 +210,11 @@ def load_library(name: str = _ABI_NAME, extra_dirs=None) -> None:
             f"{name} not found. Build it, or set its lib dir. Searched:\n  "
             + "\n  ".join(str(d / name) for d in dirs)
         )
-    ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+    lib = ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
     if _abi is None:
         _abi = ctypes.CDLL(str(so))
         _bind(_abi)
+    return lib
 
 
 def _bind(lib: ctypes.CDLL) -> None:

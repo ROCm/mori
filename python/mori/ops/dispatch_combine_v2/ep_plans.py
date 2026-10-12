@@ -34,6 +34,7 @@ which is what lets the binding test skip cleanly when the .so is absent.
 
 from __future__ import annotations
 
+import ctypes
 import os
 
 from mori.jit.v2 import plan_api
@@ -52,7 +53,14 @@ def _extra_dirs() -> list[str]:
     return [env] if env else []
 
 
-plan_api.load_library(_LIB_NAME, extra_dirs=_extra_dirs())
+_lib = plan_api.load_library(_LIB_NAME, extra_dirs=_extra_dirs())
+
+# EpStagingTotalBytes(world_size, max_recv, scale_bytes, max_tok_per_rank), EP's one
+# symbol beyond the generic plan ABI (ep_spec.cpp says why). Bound here rather than
+# in plan_api, which stays op-agnostic.
+staging_bytes = _lib.mori_ep_staging_bytes
+staging_bytes.restype = ctypes.c_ulonglong
+staging_bytes.argtypes = [ctypes.c_int] * 4
 
 EpDispatchPlan = make_plan("ep_dispatch")
 EpCombinePlan = make_plan("ep_combine")

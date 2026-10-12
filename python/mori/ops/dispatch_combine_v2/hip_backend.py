@@ -147,38 +147,22 @@ def ep_staging_bytes(
 ) -> int:
     """Total bytes for the gfx1250 dispatch staging buffer.
 
-    Mirrors EpStagingTotalBytes in ep_cfg.hpp.
+    EpStagingTotalBytes (ep_cfg.hpp), called rather than reproduced; ep_spec.cpp
+    says why.
 
     ``max_recv`` is EpCfg.maxRecv, where 0 is not a cap of zero but "ask
     EpMaxRecv", which answers world_size * max_tok_per_rank -- and that is the
     Plan default, so a caller sizing the buffer straight from a Cfg hits it.
-    Pass ``max_tok_per_rank`` with it; the kernel indexes staging at the cap it
-    resolved, so a buffer sized at 0 is not a short allocation that faults but a
-    write past the end of whatever the caller handed us.
+    Pass ``max_tok_per_rank`` with it; the pair resolves on the C++ side exactly
+    as it does in the kernel.
     """
-    recv = max_recv if max_recv > 0 else world_size * max_tok_per_rank
-    if recv <= 0:
+    if max_recv <= 0 and world_size * max_tok_per_rank <= 0:
         raise ValueError(
             "ep_staging_bytes: max_recv is 0 (EpCfg's 'use EpMaxRecv' spelling) and "
             "no max_tok_per_rank was given, so the receive cap is unknown. Pass "
             "max_tok_per_rank, or pass an already-resolved cap as max_recv."
         )
-    pool = world_size * recv
-    max_topk = 16
-    max_blocks = 512
-
-    def a128(x):
-        return (x + 127) & ~127
-
-    off = a128(pool * max_topk * 4)  # stgIdx
-    off = a128(off + pool * max_topk * 4)  # stgWt
-    off = a128(off + pool * 4)  # stgSrc
-    off = a128(off + max_blocks * world_size * 4)  # blkBase
-    off = a128(off + max_blocks * world_size * 4)  # blkCount
-    if scale_bytes > 0:
-        s_stride = scale_stride_bytes(scale_bytes)
-        off = a128(off + world_size * recv * s_stride)
-    return off
+    return cb.staging_bytes(world_size, max_recv, scale_bytes, max_tok_per_rank)
 
 
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
