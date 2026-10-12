@@ -169,8 +169,9 @@ demotion regardless of the tier's own watermark and drops the copy if nothing
 downstream has room.
 
 **Locking.** `Evict` holds `lifecycle_mutex_` shared for the whole call, so
-`ClearLocal` cannot run underneath it. Demotions release `operation_mutex_` for
-the byte copy as before (`RunTransition`), and the drops now also run outside
+`ClearLocal` cannot run underneath it. `Evict` itself copies nothing: a demotion
+is a job on the transition queue, whose worker releases `operation_mutex_` for
+the byte copy as before (`RunTransition`). The drops run outside
 `operation_mutex_`: an SSD delete is device IO and must not stall every commit
 on the node. Placement repair re-checks the backends under the lock afterwards,
 so a key re-committed in that window keeps its placement.
