@@ -1538,9 +1538,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         for the last one, which _pick also gives the counts past every edge. A gfx125x
         dispatch compiles the code sized to one call out of its bound
         (EpCfg::callTokMax), so a small bucket does not carry the large one's paths
-        (EP16 fp4 512 tokens, 64x16). Elsewhere the bound is not read: one plan."""
+        (EP16 fp4 512 tokens, 64x16). Elsewhere the bound is not read: one plan.
+        Below 16 ranks there is one plan too: EP8 fp4 64x16 sized to 1024 leaves out
+        kPlainMeta and kRowPre and dispatched 1 / 64 tokens 0.2-0.5 / 0.1-0.3 us slower
+        than sized to the plan (3 alternating rounds, ab_1012_065929_2397421); no EP4
+        or EP8 bucket measured faster."""
         cap = int(cfg.max_num_inp_token_per_rank)
-        if not self._is1250 or not cfg.schedule:
+        if not self._is1250 or not cfg.schedule or cfg.world_size < 16:
             return [cap]
         caps = {
             cap if edge is None else min(int(edge), cap)
