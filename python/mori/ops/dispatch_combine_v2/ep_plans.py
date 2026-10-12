@@ -69,6 +69,89 @@ def agg_reserve_state_bytes(world_size: int) -> int:
     return 128 + (4 * w + 127) // 128 * 128 + 64 * w
 
 
+_STAGING_ALIGN = 128
+
+
+def _staging_buffers(world_size: int) -> tuple[tuple[str, int], ...]:
+    """What mori keeps in SYMMETRIC memory beyond the arena a caller lays out.
+
+    Empty: the aggReserve state is local memory (EpArgs::resState), which mori
+    allocates per plan and a caller never has to provide. A buffer that has to be
+    symmetric -- one peers address, or one every plan on an arena must share --
+    is added here, and both the bytes the caller reserves and the offsets mori
+    cuts the region at follow from it.
+    """
+    return ()
+
+
+def staging_layout(world_size: int) -> tuple[dict[str, int], int]:
+    """({buffer: offset within mori's staging region}, region bytes)."""
+    offsets, off = {}, 0
+    for name, nbytes in _staging_buffers(world_size):
+        offsets[name] = off
+        off += (nbytes + _STAGING_ALIGN - 1) // _STAGING_ALIGN * _STAGING_ALIGN
+    return offsets, off
+
+
+def staging_region_bytes(world_size: int) -> int:
+    """Bytes of mori's staging region; 0 while _staging_buffers is empty.
+
+    A caller that lays out its own arena reserves this much in it, on a 128 B line,
+    and names it with ``staging_region=`` on EpDispatchPlan. Reserving it before
+    there is anything to put in it is the point: the caller wires the region in
+    once and a buffer added to _staging_buffers reaches it without a second edit.
+    """
+    return staging_layout(world_size)[1]
+
+
+def _window_flat_layout(win_handle: int, local_ptr: int) -> tuple[int, int]:
+    """(base, stride) such that PE p's copy of the window's byte 0 is at
+    base + p * stride.
+
+    Read once from the window's device descriptor (ccoWindowDevice in cco.hpp:
+    u64 winBase, u32 stride4G, i32 lsaRank), so a kernel reaching a peer's copy
+    does no descriptor load of its own. Checked against the local address, which
+    cco reports independently: a descriptor laid out differently fails here rather
+    than on the GPU, where every peer address it produced would be wrong too.
+    """
+    import struct
+
+    import torch
+
+    from mori.tensor_utils import from_gpu_ptr
+
+    raw = bytes(from_gpu_ptr(win_handle, (16,), torch.uint8).cpu().tolist())
+    win_base, stride4g, lsa_rank = struct.unpack_from("<QIi", raw)
+    stride = stride4g << 32
+    if stride == 0 or win_base + lsa_rank * stride != local_ptr:
+        raise RuntimeError(
+            f"staging region: window descriptor (winBase={win_base:#x}, "
+            f"stride4G={stride4g}, lsaRank={lsa_rank}) does not locate the local "
+            f"copy at {local_ptr:#x}"
+        )
+    return win_base, stride
+
+
+def _external_staging(arena, region: str, world_size: int) -> tuple[int, int]:
+    """(base, stride) of a staging region the CALLER reserved in its own arena.
+
+    Nothing is allocated or freed here: the arena's owner does both, and its own
+    zeroing covers the region. arena.size() is not optional -- overrunning the
+    region is not an error the kernel raises, it puts mori's writes in whatever
+    region the arena laid down next.
+    """
+    offset, nbytes = int(arena.offset(region)), staging_region_bytes(world_size)
+    if arena.size(region) < nbytes or offset % _STAGING_ALIGN:
+        raise RuntimeError(
+            f"staging region {region!r} is {arena.size(region)} B at offset {offset}; "
+            f"needs {nbytes} B (staging_region_bytes()) on a {_STAGING_ALIGN} B line"
+        )
+    # local_ptr is the REGION; back out to the window's byte 0, which is what the
+    # descriptor's base and stride are relative to, then step back in.
+    base, stride = _window_flat_layout(arena.handle, arena.local_ptr(region) - offset)
+    return base + offset, stride
+
+
 class EpDispatchPlan(_EpDispatchPlanBase):
     # The generated signature stays the documentation; this only adds the binding.
     __doc__ = (_EpDispatchPlanBase.__doc__ or "") + (
@@ -79,16 +162,29 @@ class EpDispatchPlan(_EpDispatchPlanBase):
     )
 
     def __init__(self, **kwargs):
+        arena, region = kwargs.get("arena"), kwargs.pop("staging_region", None)
         self._res_state = None
+        # (base, stride) of the caller's staging region, for the buffers
+        # _staging_buffers lists to bind from. None when the caller passed no
+        # region; empty of buffers either way until one is added there.
+        self._staging = None
         super().__init__(**kwargs)
         info = self.info
+        if region is not None:
+            try:
+                self._staging = _external_staging(arena, region, info["worldSize"])
+            except BaseException:
+                super().close()
+                raise
         if not info.get("aggReserve"):
             return
         import torch
 
         try:
             self._res_state = torch.zeros(
-                agg_reserve_state_bytes(info["worldSize"]), dtype=torch.uint8, device="cuda"
+                agg_reserve_state_bytes(info["worldSize"]),
+                dtype=torch.uint8,
+                device="cuda",
             )
         except BaseException:
             super().close()

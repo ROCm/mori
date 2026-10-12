@@ -293,3 +293,98 @@ def test_agg_reserve_state_size_matches_the_device_layout():
     assert cb.agg_reserve_state_bytes(8) == 128 + 128 + 512
     assert cb.agg_reserve_state_bytes(32) == 128 + 128 + 2048
     assert cb.agg_reserve_state_bytes(33) == 128 + 256 + 2112
+
+
+# --------------------------------------------------------------------------
+# staging region: symmetric memory mori takes from the caller's arena
+# --------------------------------------------------------------------------
+
+
+_STRIDE = 1 << 32
+
+
+def _staging_arena(off, nbytes, region="mori_staging", desc_rank=1):
+    """A caller's own arena, behind a window descriptor laid out like
+    ccoWindowDevice. This rank is LSA rank 1 of a 4 GiB stride, so the base the
+    plan resolves is not the local address. `desc_rank` is what the descriptor
+    claims; anything but 1 makes it disagree with the memory behind it.
+    """
+    import struct
+
+    import torch
+
+    mem = torch.zeros(off + max(nbytes, 128), dtype=torch.uint8, device="cuda")
+    raw = struct.pack("<QIi", mem.data_ptr() - _STRIDE, _STRIDE >> 32, desc_rank)
+    desc = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
+
+    class _Arena:
+        handle = desc.data_ptr()
+        local = mem.data_ptr()
+
+        def offset(self, name):
+            return off if name == region else 0
+
+        def size(self, name):
+            return nbytes
+
+        def local_ptr(self, name):
+            return mem.data_ptr() + off
+
+    return _Arena()
+
+
+def test_staging_region_is_empty_until_a_symmetric_buffer_is_added():
+    """The aggReserve state is local memory, so nothing has to come out of the
+    caller's arena today. A buffer added to _staging_buffers lands here, and both
+    the bytes a caller reserves and the offsets mori cuts follow from it."""
+    for world in (1, 8, 64):
+        assert cb.staging_layout(world) == ({}, 0)
+        assert cb.staging_region_bytes(world) == 0
+
+
+def test_staging_region_resolves_to_the_region_the_caller_reserved():
+    """A caller wires the region in before there is anything to put in it, so the
+    address mori resolves has to be right from the start."""
+    _agg_reserve_or_skip()
+    off, world = 512, _plan().info["worldSize"]
+    arena = _staging_arena(off, cb.staging_region_bytes(world))
+
+    p = _plan(arena=arena, staging_region="mori_staging")
+    assert p._staging == (arena.local - _STRIDE + off, _STRIDE)
+    p.close()
+
+
+def test_staging_region_mori_cannot_verify_fails_construction():
+    """Overrunning the region lands in whatever the arena put next rather than
+    raising, so a region mori cannot check is a construction error -- and a region
+    the arena does not carry never silently becomes an offset into something else."""
+    _agg_reserve_or_skip()
+    nbytes = cb.staging_region_bytes(_plan().info["worldSize"])
+
+    def _missing(self, name):
+        raise KeyError(name)
+
+    no_region = _staging_arena(256, nbytes)
+    type(no_region).offset = _missing
+    with pytest.raises(KeyError):
+        _plan(arena=no_region, staging_region="mori_staging")
+
+    unsized = _staging_arena(256, nbytes)
+    del type(unsized).size
+    with pytest.raises(AttributeError, match="size"):
+        _plan(arena=unsized, staging_region="mori_staging")
+
+    with pytest.raises(RuntimeError, match="128 B line"):
+        _plan(arena=_staging_arena(130, nbytes), staging_region="mori_staging")
+
+
+def test_staging_region_refuses_a_descriptor_that_misses_the_local_copy():
+    """Every peer address comes off the same base and stride; if they do not land
+    on the address cco reports for this rank, none of them can be trusted."""
+    _agg_reserve_or_skip()
+    nbytes = cb.staging_region_bytes(_plan().info["worldSize"])
+    with pytest.raises(RuntimeError, match="does not locate"):
+        _plan(
+            arena=_staging_arena(512, nbytes, desc_rank=0),
+            staging_region="mori_staging",
+        )
