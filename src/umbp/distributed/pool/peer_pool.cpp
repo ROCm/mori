@@ -139,7 +139,8 @@ void PeerPool::DropEvictedCopyLocked(const TransitionJob& job) {
   auto* source = backends_ == nullptr ? nullptr : backends_->Get(job.source_backend_id);
   if (source == nullptr) return;
   // One key, under the pool lock: the cost a synchronous drop always had.
-  source->Evict({job.key});
+  const auto evicted = source->Evict({job.key});
+  if (!evicted.empty() && evicted.front().bytes_freed > 0) ++transition_metrics_.dropped;
   RepairAfterDropLocked(job.key);
 }
 

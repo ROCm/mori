@@ -133,6 +133,7 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
       Delta(now.transitions.offloaded_bytes, before.transitions.offloaded_bytes);
   const uint64_t moves_ok = Delta(now.transitions.succeeded, before.transitions.succeeded);
   const uint64_t moves_failed = Delta(now.transitions.failed, before.transitions.failed);
+  const uint64_t moves_dropped = Delta(now.transitions.dropped, before.transitions.dropped);
 
   const ReCacheActivity& rc_now = now.recache;
   const ReCacheActivity& rc_old = before.recache;
@@ -211,6 +212,11 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
                   static_cast<unsigned long long>(moves_ok),
                   static_cast<unsigned long long>(moves_failed));
     head += moves.data();
+    if (moves_dropped != 0) {
+      // Inside the parentheses: "(9371 moved, 593 failed, 2 dropped)".
+      head.pop_back();
+      head += ", " + std::to_string(moves_dropped) + " dropped)";
+    }
   }
   lines.push_back(std::move(head));
 
