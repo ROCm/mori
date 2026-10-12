@@ -214,16 +214,29 @@ static_assert(CUSPLIT_MAX_TOPK == EpStagingMaxTopk,
 static_assert(CUSPLIT_MAX_BLOCKS == EpStagingMaxBlocks,
               "CUSPLIT_MAX_BLOCKS and EpStagingMaxBlocks must agree");
 
+// Per-token scale rows, staged like the other meta fields so they ship to a peer as
+// one contiguous run rather than a 224 B transfer per (token, destination) -- the
+// size TDM is worst at.
+//
+// kEpScaleRows is the PER-PEER stride, and the staging is indexed
+// peer * kEpScaleRows + destTokId. NOT _stgCap: that one is the per-peer share of
+// the idx/wt pool, a different and smaller constant, and indexing this region with
+// it walks into the next peer's rows. It is the peer's full receive capacity
+// because the destination slot id indexes it directly, which is also what lets the
+// existing `ab + cc > recvCapM` guard cover this region.
+//
+// That makes the region worldSize^2 * maxTokPerRank * kEpScaleStride, the largest
+// term in EpStagingTotalBytes -- at the 256 B stride a 224 B row (hidden 7168) pads
+// up to, EP4/maxTok 16384 is 64 MiB and EP8/maxTok 16384 is 256 MiB. One allocation
+// per op, so this is VRAM at construction, not a per-variant .bss reservation.
 #if defined(MORI_EP_SCALE_BYTES) && MORI_EP_SCALE_BYTES > 0
 constexpr int kEpScaleBytes = MORI_EP_SCALE_BYTES;
 constexpr int kEpScaleStride = MORI_EP_SCALE_STRIDE;
-constexpr size_t kEpScaleSlots = (size_t)MORI_EP_SCALE_SLOTS;
 constexpr size_t kEpScaleRows = (size_t)MORI_EP_SCALE_ROWS;
 constexpr int kMetaFields = 4;  // idx, weights, srcmap, scale
 #else
 constexpr int kEpScaleBytes = 0;
 constexpr int kEpScaleStride = 0;
-constexpr size_t kEpScaleSlots = 1;
 constexpr size_t kEpScaleRows = 1;
 constexpr int kMetaFields = 3;  // idx, weights, srcmap
 #endif
