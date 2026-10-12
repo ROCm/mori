@@ -41,6 +41,7 @@ Two modes, because the two catch different things:
 import argparse
 import importlib.util
 import os
+import struct
 import sys
 import tempfile
 import zipfile
@@ -52,10 +53,41 @@ from typing import NoReturn
 # importable, never on a build flag.
 _REQUIRED_EXTENSIONS = ("mori/cco/cco",)
 
+# libmori_pybinds backs mori.ops/io/shmem, so it must not need a library a plain
+# ROCm host lacks. gRPC/Protobuf belong to UMBP's own module (libmori_umbp_pybinds).
+_PYBINDS = "mori/libmori_pybinds.so"
+_UMBP_PYBINDS = "mori/libmori_umbp_pybinds.so"
+_PYBINDS_FORBIDDEN_DEPS = ("libgrpc", "libgpr", "libprotobuf")
+
 
 def _fail(msg: str) -> NoReturn:
     print(f"verify_install: FAIL: {msg}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def _elf_needed(data: bytes) -> list:
+    """DT_NEEDED entries of an ELF64 little-endian shared object."""
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        return []
+    (shoff,) = struct.unpack_from("<Q", data, 0x28)
+    shentsize, shnum = struct.unpack_from("<HH", data, 0x3A)
+    sections = [
+        struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize)
+        for i in range(shnum)
+    ]
+    needed = []
+    for sh in sections:
+        if sh[1] != 6:  # SHT_DYNAMIC
+            continue
+        strtab_off = sections[sh[6]][4]
+        for off in range(sh[4], sh[4] + sh[5], 16):
+            tag, val = struct.unpack_from("<qQ", data, off)
+            if tag == 0:  # DT_NULL
+                break
+            if tag == 1:  # DT_NEEDED
+                end = data.index(b"\0", strtab_off + val)
+                needed.append(data[strtab_off + val : end].decode())
+    return needed
 
 
 def check_wheel(path: str) -> None:
@@ -63,6 +95,7 @@ def check_wheel(path: str) -> None:
     name = os.path.basename(path)
     with zipfile.ZipFile(path) as zf:
         members = zf.namelist()
+        pybinds = zf.read(_PYBINDS) if _PYBINDS in members else b""
 
     for prefix in _REQUIRED_EXTENSIONS:
         if not any(m.startswith(prefix) and m.endswith(".so") for m in members):
@@ -71,6 +104,16 @@ def check_wheel(path: str) -> None:
                 "build time -- check the build log for 'Cython not found' -- and "
                 "the wheel is incomplete even though the build reported success."
             )
+
+    bad = [d for d in _elf_needed(pybinds) if d.startswith(_PYBINDS_FORBIDDEN_DEPS)]
+    if bad:
+        _fail(
+            f"{name}: {_PYBINDS} needs {bad}, so mori.ops/io/shmem would not import "
+            "on a host without them. UMBP's bindings belong in libmori_umbp_pybinds."
+        )
+    # umbp_master ships only with BUILD_UMBP=ON, and then UMBP's module must too.
+    if "mori/umbp_master" in members and _UMBP_PYBINDS not in members:
+        _fail(f"{name} ships UMBP but no {_UMBP_PYBINDS}; check setup.py package_data")
     print(f"verify_install: {name} carries every required extension")
 
 

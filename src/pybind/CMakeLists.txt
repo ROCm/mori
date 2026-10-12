@@ -40,9 +40,6 @@ set(MORI_PYBIND_SOURCES mori.cpp pybind_ops.cpp pybind_shmem.cpp pybind_io.cpp)
 if(BUILD_COLLECTIVE)
   list(APPEND MORI_PYBIND_SOURCES pybind_ccl.cpp)
 endif()
-if(BUILD_UMBP)
-  list(APPEND MORI_PYBIND_SOURCES pybind_umbp.cpp)
-endif()
 add_library(mori_pybinds SHARED ${MORI_PYBIND_SOURCES})
 
 if(ENABLE_PROFILER)
@@ -60,11 +57,21 @@ if(BUILD_COLLECTIVE)
   target_compile_definitions(mori_pybinds PRIVATE MORI_BUILD_COLLECTIVE)
 endif()
 
+# UMBP is its own module: it links gRPC/Protobuf, which importing mori.ops/io/shmem
+# must not require. mori.cpp loads it on first access to a UMBP name.
 if(BUILD_UMBP)
-  target_link_libraries(mori_pybinds umbp_core umbp_common)
-  target_include_directories(mori_pybinds
-                             PRIVATE ${CMAKE_SOURCE_DIR}/src/umbp/include)
-  target_compile_definitions(mori_pybinds PRIVATE MORI_BUILD_UMBP)
+  add_library(mori_umbp_pybinds SHARED mori_umbp.cpp pybind_umbp.cpp)
+  target_include_directories(
+    mori_umbp_pybinds PUBLIC ${PYTHON_INCLUDE_DIRS} ${PYBIND11_INCLUDE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src/umbp/include)
+  target_link_directories(mori_umbp_pybinds PRIVATE ${ROCM_PATH}/lib)
+  target_link_libraries(mori_umbp_pybinds umbp_core umbp_common mori_io hip::host)
+  target_compile_definitions(mori_umbp_pybinds PRIVATE MORI_BUILD_UMBP)
+  set_target_properties(
+    mori_umbp_pybinds
+    PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+               INSTALL_RPATH "$ORIGIN;${ROCM_PATH}/lib"
+               BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
 
 if(BUILD_XLA_FFI_OPS)

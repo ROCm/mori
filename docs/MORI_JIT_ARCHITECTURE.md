@@ -67,6 +67,7 @@ site-packages/mori/
 ├── ops/dispatch_combine.py            # Python-side kernel launch orchestration
 ├── ir/bitcode.py                      # Triton bitcode locator
 ├── libmori_pybinds.so                 # Host pybind11 module
+├── libmori_umbp_pybinds.so            # UMBP pybind11 module (BUILD_UMBP; links gRPC, loaded lazily)
 ├── libmori_application.so             # Bootstrap + RDMA transport
 └── libmori_io.so                      # I/O module
 ```

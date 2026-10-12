@@ -46,3 +46,42 @@ sys.modules["libmori_pybinds"] = module
 spec.loader.exec_module(module)
 
 from libmori_pybinds import *
+
+# UMBP's bindings are a separate module because it links gRPC/Protobuf. It loads
+# on first access to a UMBP name, so mori.ops/io/shmem import without gRPC and
+# `from mori.cpp import UMBPClient` still works.
+_UMBP_LIB = "libmori_umbp_pybinds"
+_umbp = None
+
+
+def _is_umbp_name(name):
+    return name.startswith("UMBP") or name == "CacheRemoteAdmission"
+
+
+def _load_umbp():
+    global _umbp
+    if _umbp is not None:
+        return _umbp
+    path = os.path.join(mori_lib_dir, _UMBP_LIB + ".so")
+    if not os.path.exists(path):
+        raise ImportError(
+            f"mori was built without UMBP ({_UMBP_LIB}.so is absent); rebuild with BUILD_UMBP=ON"
+        )
+    spec = importlib.util.spec_from_file_location(_UMBP_LIB, path)
+    try:
+        # module_from_spec is where an extension module is dlopen'ed.
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except ImportError as e:
+        raise ImportError(
+            f"mori.umbp needs the gRPC/Protobuf runtime (e.g. `apt install libgrpc++1`): {e}"
+        ) from e
+    sys.modules[_UMBP_LIB] = mod
+    _umbp = mod
+    return mod
+
+
+def __getattr__(name):
+    if _is_umbp_name(name):
+        return getattr(_load_umbp(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
