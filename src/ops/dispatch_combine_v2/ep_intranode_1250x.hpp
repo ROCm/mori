@@ -1578,7 +1578,9 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       }
     }
   }
-  if (!_payPre) __builtin_amdgcn_s_wait_tensorcnt(0);
+  // s_wait_tensorcnt is a scalar instruction: under a branch the compiler takes as divergent it is
+  // reached with EXEC masked off and waits all the same, so the conditions are read as uniform.
+  if (!__builtin_amdgcn_readfirstlane((int)_payPre)) __builtin_amdgcn_s_wait_tensorcnt(0);
   // The signal store orders the TDM stores by their tensorcnt wait; the direct ones need theirs.
   if (!kDPin && _mDirect) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   if constexpr (kDPin) {
@@ -2196,7 +2198,8 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
             if (!loadWaited) {
               // A preloaded row is in once a metadata store is out: each was issued after a wait.
-              if (!_payPre || !_mPend) __builtin_amdgcn_s_wait_tensorcnt(0);
+              if (!__builtin_amdgcn_readfirstlane((int)(_payPre && _mPend)))
+                __builtin_amdgcn_s_wait_tensorcnt(0);
               loadWaited = true;
             }
             T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
