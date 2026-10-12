@@ -199,7 +199,9 @@ def push_wire_nbytes(cfg) -> int:
 
 def push_land_rows(cfg) -> int:
     """EpFp4LandRows: a token gets back one row per distinct destination rank, fp4 or fp8."""
-    return cfg.max_num_inp_token_per_rank * min(cfg.world_size, cfg.num_experts_per_token)
+    return cfg.max_num_inp_token_per_rank * min(
+        cfg.world_size, cfg.num_experts_per_token
+    )
 
 
 class TokOffExt:
@@ -425,7 +427,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 self.dispatch_staging = torch.zeros(
                     stg_bytes, dtype=torch.uint8, device=dev
                 )
-
 
         self._kernels = self._build_kernels(cfg, self.arena)
 
@@ -798,7 +799,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # of merely overrunning the region.
         # The push combine's landing offsets ride the aggregated reservation's
         # dispatch signal, which TokOffExt turns off.
-        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(self, "_tokoff_wanted", False):
+        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(
+            self, "_tokoff_wanted", False
+        ):
             bad.append(
                 f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
                 "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
