@@ -80,6 +80,10 @@ struct TierTransitionMetrics {
   uint64_t attempted = 0;
   uint64_t succeeded = 0;
   uint64_t failed = 0;
+  // Evicted copies given up on: their demotion could not land within the retry
+  // budget (or never could), so the key left this node.  `failed` counts every
+  // failed attempt, including ones a retry later rescued; this counts loss.
+  uint64_t dropped = 0;
   uint64_t offloaded_bytes = 0;
   uint64_t promoted_bytes = 0;
 };
