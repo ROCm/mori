@@ -1265,9 +1265,50 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
               __builtin_amdgcn_s_wait_tensorcnt(0);
               _mPend = false;
             }
+            // With scales the two runs' indices, weights and srcmap go with the lanes and only the
+            // scale rows through the tile: a wave holds at most 10 tensor ops in flight, and four
+            // a run left two runs and a token's six payload stores waiting on one another.
+            const bool _pcu = kMetaAllW && kEpScaleBytes > 0 && (rA >> 8) * tkM <= 2 * WS &&
+                              (rB >> 8) * tkM <= 2 * WS;
+            const bool _pcW = kCfg.useWeights && args.weightsBuf;
+            int _pcA[5] = {0, 0, 0, 0, 0}, _pcB[5] = {0, 0, 0, 0, 0};
+            auto pcLoad = [&](int rk, index_t ab, int (&v)[5]) {
+              const int peer = rk & 0xff, cc = rk >> 8, n = cc * tkM;
+              const int* qI = reinterpret_cast<const int*>(
+                  _cusplit_stgIdx + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM);
+              const int* qW = reinterpret_cast<const int*>(
+                  _cusplit_stgWt + (size_t)peer * _stgCapM * CUSPLIT_MAX_TOPK + (size_t)ab * tkM);
+              const int* qR = reinterpret_cast<const int*>(_cusplit_stgSrc + (size_t)peer * _stgCapM + (size_t)ab);
+              if (laneId < n) v[0] = qI[laneId];
+              if (laneId + WS < n) v[1] = qI[laneId + WS];
+              if (_pcW && laneId < n) v[2] = qW[laneId];
+              if (_pcW && laneId + WS < n) v[3] = qW[laneId + WS];
+              if (laneId < cc) v[4] = qR[laneId];
+            };
+            auto pcStore = [&](int rk, index_t ab, const int (&v)[5]) {
+              const int peer = rk & 0xff, cc = rk >> 8, n = cc * tkM;
+              char* const pb = wB + (((uint64_t)peer * wS) << 32);
+              int* eI = reinterpret_cast<int*>(pb + args.offOutIdx) + (size_t)ab * tkM;
+              int* eW = reinterpret_cast<int*>(pb + args.offOutWts) + (size_t)ab * tkM;
+              int* eR = reinterpret_cast<int*>(pb + args.offRecvToSrc) + (size_t)ab;
+              if (laneId < n) eI[laneId] = v[0];
+              if (laneId + WS < n) eI[laneId + WS] = v[1];
+              if (_pcW && laneId < n) eW[laneId] = v[2];
+              if (_pcW && laneId + WS < n) eW[laneId + WS] = v[3];
+              if (laneId < cc) eR[laneId] = v[4];
+            };
+            if (_pcu) {
+              pcLoad(rA, abA, _pcA);
+              pcLoad(rB, abB, _pcB);
+            }
 #pragma unroll 1
             for (int ph = 0; ph < 2; ++ph) {
               if (ph == 1) __builtin_amdgcn_s_wait_tensorcnt(0);
+              if (ph == 1 && _pcu) {
+                pcStore(rA, abA, _pcA);
+                pcStore(rB, abB, _pcB);
+                _mDirect = true;
+              }
 #pragma unroll 1
               for (int k = 0; k < 2; ++k) {
                 const int rk = k ? rB : rA;
@@ -1310,6 +1351,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                 if (rB) spR = TdmSplit128{0, cc, 0, cc, 1};
                 if (dS && spS.body != nScB)
                   spS = sB ? TdmSplit128{0, nScB, 0, nScB, 1} : TdmSplit128{0, nScB, 0, nScB / 2, 2};
+                if (_pcu) spI = spW = spR = TdmSplit128{0, 0, 0, 0, 0};
                 int* tI = reinterpret_cast<int*>(_m4 + (size_t)k * subB);
                 int* tW = tI + ((spI.body + 31) & ~31);
                 int* tR = tW + ((spW.body + 31) & ~31);
@@ -1561,8 +1603,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // s_wait_tensorcnt is a scalar instruction: under a branch the compiler takes as divergent it is
   // reached with EXEC masked off and waits all the same, so the conditions are read as uniform.
   if (!kPayFirst || !__builtin_amdgcn_readfirstlane((int)_payPre)) __builtin_amdgcn_s_wait_tensorcnt(0);
-  // The signal store orders the TDM stores by their tensorcnt wait; the direct ones need theirs.
-  if (!kDPin && _mDirect) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   if constexpr (kDPin) {
     if (_dpin) {
       if (blockIdx.x == 0 && thdId < npes)
@@ -2165,9 +2205,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       }
     }
   }
-  if constexpr (kDPin) {
-    if (_mDirect) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-  }
+  // The signal store orders the TDM stores by their tensorcnt wait; the direct ones need theirs,
+  // taken here so that they overlap the payload pass.
+  if (_mDirect) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   __syncthreads();
 
   // Tickets on the arrival counter instead of a spin on it: every block draws
