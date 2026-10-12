@@ -318,6 +318,13 @@ TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,
   return result;
 }
 
+namespace {
+// Further attempts an eviction demotion gets after a retryable failure.  Each
+// retry goes to the back of the queue, so with a backlog it runs well after the
+// fault that failed it.
+constexpr uint32_t kEvictDemotionRetries = 3;
+}  // namespace
+
 void PeerPool::TransitionWorkerLoop() {
   for (;;) {
     TransitionJob job;
@@ -337,10 +344,17 @@ void PeerPool::TransitionWorkerLoop() {
         const bool watermark_driven = WatermarkDrivenLocked(job);
         if (!watermark_driven || tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
           const auto result = RunTransition(lock, job);
-          if (job.evict && !result.success) DropEvictedCopyLocked(job);
+          // An eviction's demotion that failed on the way (a write error, not a
+          // full downstream) is tried again before its copy is given up: the
+          // copy is the only one left, and dropping it turns a transient fault
+          // into a lost key.  Only after the retries, or when nothing below has
+          // room, is the evicted copy dropped so the tier still frees.
+          const bool evict_retry = job.evict && !result.success && result.retryable &&
+                                   job.attempts < kEvictDemotionRetries;
+          if (job.evict && !result.success && !evict_retry) DropEvictedCopyLocked(job);
           const bool still_pressured =
               watermark_driven && tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
-          retry = still_pressured && !result.success && job.attempts < 3;
+          retry = (still_pressured && !result.success && job.attempts < 3) || evict_retry;
           // Keep the drain going without waiting for the next commit batch to
           // notice the tier is still above its low watermark. The scan skips
           // whatever is still queued, so this tops the batch back up rather

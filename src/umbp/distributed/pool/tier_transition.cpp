@@ -99,11 +99,13 @@ TierTransitionResult TierTransitionExecutor::Execute(
       if (!BuildTransfers(source, resolved, target, allocation, &transfers) ||
           !transfer_engine_->Transfer(transfers, nullptr)) {
         target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
         continue;
       }
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
         target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
         continue;
       }
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
@@ -114,10 +116,12 @@ TierTransitionResult TierTransitionExecutor::Execute(
     if (!target->AcquireMigrationRead(key, &target_read) || target_read.size != resolved.size) {
       if (target_read.found) target->ReleaseMigrationRead(key);
       if (allocation.outcome == AllocateOutcome::kSuccessAllocated) target->Evict({key});
+      result.retryable = true;
       continue;
     }
 
     result.success = true;
+    result.retryable = false;
     result.target_backend_id = target_backend_id;
     result.bytes_moved = resolved.size;
     source->ReleaseMigrationRead(key);

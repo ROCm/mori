@@ -43,6 +43,11 @@ struct TierTransitionResult {
   uint64_t bytes_moved = 0;
   uint64_t bytes_freed = 0;
   bool source_draining = false;
+  // A target had room but the copy, its commit, or the read-back check failed.
+  // That is a fault on the way (a device write error, a transfer failure), not
+  // a verdict that nothing downstream can take the key, so trying again later
+  // may succeed.  Always false on success and when no target had room.
+  bool retryable = false;
 };
 
 // Executes one peer-local copy or move. Placement policy and scheduling remain
