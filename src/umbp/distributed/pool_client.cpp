@@ -630,7 +630,9 @@ std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(PeerPool* pool,
   std::chrono::milliseconds backoff{1};
   size_t attempts = 0;
   while (true) {
-    auto resolved = pool->BatchResolve(keys, include_descs, allow_file_refs);
+    // kLocal: everything this resolves is read in this process, and every
+    // caller hands it back with ReleaseResolved once its copy is done.
+    auto resolved = pool->BatchResolve(keys, include_descs, allow_file_refs, ResolveReader::kLocal);
     const bool busy = std::any_of(resolved.begin(), resolved.end(), [](const auto& entry) {
       return EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
     });
@@ -639,8 +641,11 @@ std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(PeerPool* pool,
     const auto remaining = deadline - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) {
       MORI_UMBP_WARN("[PoolClient] local BatchResolve BUSY timeout after {} attempts", attempts);
-      return resolved;
+      return resolved;  // the caller releases the hits it was given
     }
+    // This response is discarded and the whole batch asked again, so the holds
+    // its hits took must go back now -- a local hold never expires on its own.
+    pool->ReleaseResolved(keys, resolved);
     const auto sleep_for =
         std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(remaining));
     if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
@@ -1796,6 +1801,9 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
       }
     }
   }
+  // A caller without `resolutions` cannot hand anything back, and a local
+  // hold never expires: release now -- it only wanted to know what is here.
+  if (resolutions == nullptr) default_pool_->ReleaseResolved(*batch, found);
   for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
     if (!found[j].resolved.found) {
       // Held, but this resolve staged up to its limit and left the key for the
@@ -2302,7 +2310,8 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   std::vector<std::string> keys;
   keys.reserve(jobs.size());
   for (const auto& job : jobs) keys.push_back(job.key);
-  const auto resolved = backend->BatchResolve(keys, /*include_descs=*/false);
+  const auto resolved = backend->BatchResolve(keys, /*include_descs=*/false,
+                                              /*allow_file_refs=*/false, ResolveReader::kLocal);
   // Only `found` is read here; hand any staging the probe took straight back.
   {
     std::vector<std::string> release_keys;
@@ -3129,6 +3138,10 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
     ResolveLocalBatch(
         keys, round, &holders, &resolutions,
         [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); }, &deferred);
+    bool round_released = false;
+    ScopeExit release_round{[&] {
+      if (!round_released) ReleaseResolvedLocal(keys, round, holders, resolutions);
+    }};
     std::unordered_set<size_t> is_deferred(deferred.begin(), deferred.end());
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -3211,6 +3224,7 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
     }
     // Transfer returned, so every copy out of staging has landed.
     ReleaseResolvedLocal(keys, round, holders, resolutions);
+    round_released = true;
     round = std::move(deferred);
   }
 }
@@ -3630,6 +3644,12 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
           },
           &deferred);
     }
+    // A local hold never expires, so an exception between here and the
+    // release below must still give this round's holds back.
+    bool round_released = false;
+    ScopeExit release_round{[&] {
+      if (!round_released) ReleaseResolvedLocal(keys, candidates, holders, resolutions);
+    }};
     std::vector<char> is_deferred(deferred.empty() ? 0 : n, 0);
     for (size_t i : deferred) is_deferred[i] = 1;
 
@@ -3698,6 +3718,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     // The copies above are complete (Transfer returns after the wait), so the
     // staging they read from can go back now rather than at lease expiry.
     ReleaseResolvedLocal(keys, candidates, holders, resolutions);
+    round_released = true;
     local_items.clear();
     local_keys.clear();
     candidates = std::move(deferred);
@@ -4379,7 +4400,8 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
   std::vector<std::string> candidate_keys;
   candidate_keys.reserve(candidates.size());
   for (size_t i : candidates) candidate_keys.push_back(keys[units[i].original]);
-  const auto resolved = backend->BatchResolve(candidate_keys, /*include_descs=*/false);
+  const auto resolved = backend->BatchResolve(candidate_keys, /*include_descs=*/false,
+                                              /*allow_file_refs=*/false, ResolveReader::kLocal);
   // Only `found` is read here; hand any staging the probe took straight back.
   {
     std::vector<std::string> release_keys;

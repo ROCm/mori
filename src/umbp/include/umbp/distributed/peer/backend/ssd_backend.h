@@ -162,7 +162,8 @@ class SsdBackend : public MediumBackend {
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override;
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
   void ReleaseResolved(const std::vector<std::string>& keys,
@@ -207,28 +208,33 @@ class SsdBackend : public MediumBackend {
     std::chrono::steady_clock::time_point deadline;
   };
 
-  // A staged read.  `holders` counts the entries published from it that have
-  // not been released yet; the span goes back to the arena when the last one
-  // is released, or at expires_at for a holder that never reports (a peer
-  // reading over the wire).  `token` is what those entries carry as
-  // lease_token, so a release meant for an expired lease cannot free its
-  // successor.
+  // A staged read.  `local_holders` counts entries published to in-process
+  // readers (ResolveReader::kLocal) not yet handed back with ReleaseResolved;
+  // while any is outstanding the span is never reclaimed, however long the copy
+  // takes -- an expiry would free pages a copy is still reading.
+  // `remote_holders` counts entries published to peers, which cannot report
+  // completion: once one exists the span waits for expires_at as it always did.
+  // With neither, the span goes back the moment the last local holder
+  // releases.  `token` is what published entries carry as lease_token, so a
+  // stray release cannot free a later lease on the same key.
   struct ReadLease {
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
-    uint32_t holders = 0;
+    uint32_t local_holders = 0;
+    uint32_t remote_holders = 0;
     uint64_t token = 0;
+    bool overdue_warned = false;
   };
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
-  // Caller MUST hold mutex_.  Drops one holder of `key`'s lease if `token`
-  // still names it; returns the span to the arena when that was the last.
-  // Returns true when the span was returned.
-  bool DropLeaseHolderLocked(const std::string& key, uint64_t token);
+  // Caller MUST hold mutex_.  Drops one `reader`-kind holder of `key`'s lease
+  // if `token` still names it, and returns the span to the arena when no holder
+  // of either kind is left.  Returns true when the span was returned.
+  bool DropLeaseHolderLocked(const std::string& key, uint64_t token, ResolveReader reader);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;

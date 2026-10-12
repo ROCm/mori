@@ -624,8 +624,26 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
   return out;
 }
 
+void PeerPool::ReleaseResolved(const std::vector<std::string>& keys,
+                               const std::vector<PoolResolvedEntry>& entries) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  if (backends_ == nullptr) return;
+  std::map<uint32_t, std::pair<std::vector<std::string>, std::vector<uint64_t>>> by_backend;
+  for (size_t i = 0; i < keys.size() && i < entries.size(); ++i) {
+    if (!entries[i].resolved.found || entries[i].resolved.lease_token == 0) continue;
+    auto& group = by_backend[entries[i].backend_id];
+    group.first.push_back(keys[i]);
+    group.second.push_back(entries[i].resolved.lease_token);
+  }
+  for (auto& [backend_id, group] : by_backend) {
+    if (auto* backend = backends_->Get(backend_id))
+      backend->ReleaseResolved(group.first, group.second);
+  }
+}
+
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
-                                                      bool include_descs, bool allow_file_refs) {
+                                                      bool include_descs, bool allow_file_refs,
+                                                      ResolveReader reader) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<PoolResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
@@ -661,7 +679,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
   if (direct_backend != nullptr) {
-    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs);
+    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader);
     bool batch_busy = false;
     bool all_found = resolved.size() == keys.size();
     std::vector<bool> failed_but_owned(keys.size(), false);
@@ -725,8 +743,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       attempted[index] |= static_cast<uint16_t>(1u << backend_id);
       if (!identity) backend_keys.push_back(keys[index]);
     }
-    auto results =
-        backend->BatchResolve(identity ? keys : backend_keys, include_descs, allow_file_refs);
+    auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs,
+                                         allow_file_refs, reader);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
       const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);

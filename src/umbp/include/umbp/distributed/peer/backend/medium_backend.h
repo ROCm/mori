@@ -166,6 +166,18 @@ struct CommitResult {
 // was published, then resolves the deferred keys in a further call.  Only a
 // staged medium returns it; a caller that cannot make a further call (a peer
 // answering over the wire) treats it as kFailed.
+// Who will read what a resolve publishes, which decides how long a medium
+// must keep it readable.  A kLocal reader is this process: it reads through
+// the transfer layer, observes completion, and ALWAYS calls ReleaseResolved
+// afterwards -- so its hold never expires on a timer (an expiry would free
+// bytes it may still be copying).  A kRemote reader is a peer over the wire
+// that cannot report completion, so its hold lasts the medium's read lease.
+// kRemote is the default because it is the one that cannot leak.
+enum class ResolveReader {
+  kRemote,
+  kLocal,
+};
+
 enum class ResolveOutcome {
   kMissing,
   kFound,
@@ -360,9 +372,13 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                                  bool include_descs,
-                                                  bool allow_file_refs = false) = 0;
+  //
+  // `reader` (see ResolveReader): a kLocal caller must hand every published
+  // entry back with ReleaseResolved, and until it does the entry stays readable
+  // however long the copy takes.
+  virtual std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
