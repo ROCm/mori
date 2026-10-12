@@ -296,7 +296,7 @@ SymmMemObjPtr SymmMemManager::RegisterSymmMemObj(void* localPtr, size_t size, bo
         HIP_RUNTIME_CHECK(hipMemcpy(&gpuMemObj->deviceHandles_d[dstPe * numOfQueuesPerDevice + q],
                                     &anvilHandle, sizeof(anvilHandle), hipMemcpyHostToDevice));
       }
-    }
+    } // NOP
 
     size_t signalArraySize = sizeof(HSAuint64) * numDevices * numOfQueuesPerDevice;
     HIP_RUNTIME_CHECK(hipMalloc(&gpuMemObj->signalPtrs, signalArraySize));
