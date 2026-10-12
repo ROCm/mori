@@ -858,6 +858,7 @@ TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
   EXPECT_FALSE(cold->Contains("k"));
   EXPECT_TRUE(cold->Contains("filler"));
   EXPECT_FALSE(pool.PlacementBackend("k").has_value());
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 1u);
 }
 
 // A demotion that fails on the way down (here: the target's commit) is tried
@@ -880,6 +881,8 @@ TEST(PeerPool, ATransientDemotionFailureIsRetriedNotDropped) {
   ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
   EXPECT_TRUE(registry.Get("cold")->Contains("k")) << "the key was dropped, not demoted";
   EXPECT_TRUE(pool.PlacementBackend("k").has_value());
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 0u);
+  EXPECT_GE(pool.TransitionMetrics().failed, 2u) << "the failed attempts still count";
 }
 
 // ...but a target that never accepts it does not pin the source tier forever:
@@ -901,6 +904,7 @@ TEST(PeerPool, APersistentDemotionFailureStillFreesTheTier) {
   ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
   EXPECT_FALSE(registry.Get("cold")->Contains("k"));
   EXPECT_FALSE(pool.PlacementBackend("k").has_value());
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 1u);
 }
 
 // No space at the target is pressure, not a verdict: an SSD reports it while
@@ -928,6 +932,7 @@ TEST(PeerPool, ADemotionWaitsOutATargetWithNoRoomForNow) {
   cold->BatchAbort({filler.slot_id});  // the pressure clears
   ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
   EXPECT_TRUE(cold->Contains("k"));
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 0u);
 }
 
 TEST(PeerPool, WatermarkMigratesCommittedKey) {
