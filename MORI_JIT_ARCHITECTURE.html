@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI JIT Compilation Framework &mdash; MORI development (097bb470) documentation</title>
+  <title>MORI JIT Compilation Framework &mdash; MORI development (c770a632) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=d6a7e2d1"></script>
+      <script src="_static/documentation_options.js?v=b7f214f8"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -553,7 +553,8 @@ for runtime JIT compilation.</p>
   ├── CMake + clang++ → host .so (no device code in ops)
   │   ├── mori_ops        → CXX  (args construction, handle lifecycle)
   │   ├── mori_shmem      → CXX  (host-only: init, runtime, memory)
-  │   └── mori_pybinds    → CXX  (pybind11 bindings)
+  │   ├── mori_pybinds    → CXX  (pybind11 bindings)
+  │   └── mori_umbp_pybinds → CXX  (UMBP bindings; BUILD_UMBP, links gRPC)
   └── Copy JIT sources → mori/_jit_sources/ (packaged in wheel)
 
 First run (JIT, one-time, needs hipcc at runtime)
@@ -588,6 +589,7 @@ Kernel launch (Python-driven)
 ├── ops/dispatch_combine.py            # Python-side kernel launch orchestration
 ├── ir/bitcode.py                      # Triton bitcode locator
 ├── libmori_pybinds.so                 # Host pybind11 module
+├── libmori_umbp_pybinds.so            # UMBP pybind11 module (BUILD_UMBP; links gRPC, loaded lazily)
 ├── libmori_application.so             # Bootstrap + RDMA transport
 └── libmori_io.so                      # I/O module
 </pre></div>
