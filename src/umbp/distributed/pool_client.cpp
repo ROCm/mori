@@ -3468,19 +3468,18 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // key and one bad key does not fail the batch.  This is why the local half
   // needs no per-key threading the way whole-object BatchGet does: the copies
   // are already batched into a single plan set.
-  std::vector<TransferItem> local_items;
+  // Preserve the batch vector's original reservation for buffered engines.
+  // HBM builds plans directly and does not need this hint.
+  size_t range_total = 0;
+  for (const auto& per_key : sizes) range_total += per_key.size();
+  auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
+  // Buffer one object until its complete page walk succeeds. This preserves
+  // the existing rollback: a bad object cannot leak partial work into a plan.
+  std::vector<TransferItem> key_items;
+  size_t local_item_count = 0;
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
-  // A TransferItem carries two TransferRefs, each with a MemoryDesc, so growing
-  // this vector by doubling relocates a lot of bytes.  One range is at least one
-  // item -- more only when it straddles a page -- so the range count is a tight
-  // lower bound and covers the common case exactly.
-  {
-    size_t range_total = 0;
-    for (const auto& per_key : sizes) range_total += per_key.size();
-    local_items.reserve(range_total);
-  }
   std::vector<ObjectRange> key_ranges;
 
   // A key that asked for no ranges is never resolved -- there is nothing to
@@ -3526,7 +3525,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                       keys[i], resolved.size);
       continue;  // a caller bug, not a miss — do not go looking for a replica
     }
-    const size_t before = local_items.size();
+    key_items.clear();
     bool built = false;
     {
       PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
@@ -3535,34 +3534,45 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
       built =
           resolved.file_ref.IsFile()
-              ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &local_items)
+              ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items)
               : BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
                                          key_ranges, /*to_backend=*/false,
-                                         /*tag=*/i, &local_items, dbg ? &dbg->classify : nullptr);
+                                         /*tag=*/i, &key_items, dbg ? &dbg->classify : nullptr);
     }
     if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
       // Same disposition the local get path takes on a size mismatch: look
       // reporting a miss the caller cannot distinguish from absence.
-      local_items.resize(before);
+      key_items.clear();
       missed.push_back(i);
       continue;
     }
+    {
+      PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
+      PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
+      for (const auto& item : key_items) plan_builder->Add(item);
+    }
+    local_item_count += key_items.size();
     local_keys.push_back(i);
   }
   if (dbg != nullptr) {
     // Classification is timed inside the build window, so subtract it out to
     // keep the phases disjoint and `other` meaningful.
     dbg->build -= dbg->classify;
-    dbg->items += local_items.size();
+    dbg->items += local_item_count;
   }
-  if (!local_items.empty()) {
+  if (local_item_count != 0) {
     std::vector<size_t> failed_tags;
     {
       PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
       TransferEngine::StepTiming steps;
       if (dbg != nullptr) steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
-      transfer_engine_->Transfer(local_items, &failed_tags, dbg != nullptr ? &steps : nullptr);
+      TransferPlanSet planned;
+      {
+        PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
+        planned = plan_builder->Finish();
+      }
+      transfer_engine_->Transfer(std::move(planned), &failed_tags, dbg != nullptr ? &steps : nullptr);
     }
     const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
     for (size_t i : local_keys) {

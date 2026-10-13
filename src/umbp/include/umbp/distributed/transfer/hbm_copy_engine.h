@@ -112,6 +112,7 @@ class HbmCopyEngine final : public TransferEngine {
   // rather than just loop iterations.  This is the concrete instance of the
   // reason Plan() is virtual rather than a base-class helper.
   TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Performs the copies inline; the returned handle is already settled.
   //

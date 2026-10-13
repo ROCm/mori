@@ -193,6 +193,51 @@ bool CompositeTransferEngine::CanHandle(const TransferRef& src, const TransferRe
   return SelectEngine(src, dst) != nullptr;
 }
 
+class CompositeTransferEngine::PlanBuilder final : public TransferPlanBuilder {
+ public:
+  PlanBuilder(const CompositeTransferEngine& owner, size_t expected_items)
+      : owner_(owner), expected_items_(expected_items) {}
+  void Add(const TransferItem& item) override {
+    TransferEngine* engine = owner_.SelectEngine(item.src, item.dst);
+    if (engine == nullptr) {
+      rejected_.push_back(item.tag);
+      owner_.rejected_items_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    auto it = builders_.find(engine);
+    if (it == builders_.end()) {
+      order_.push_back(engine);
+      it = builders_.emplace(engine, engine->CreatePlanBuilder(expected_items_)).first;
+    }
+    it->second->Add(item);
+  }
+  TransferPlanSet Finish() override {
+    TransferPlanSet out;
+    out.rejected_tags = std::move(rejected_);
+    for (TransferEngine* engine : order_) {
+      TransferPlanSet sub = builders_.at(engine)->Finish();
+      for (auto& plan : sub.plans) {
+        plan.engine = engine;
+        out.plans.push_back(std::move(plan));
+      }
+      out.rejected_tags.insert(out.rejected_tags.end(), sub.rejected_tags.begin(),
+                               sub.rejected_tags.end());
+    }
+    return out;
+  }
+
+ private:
+  const CompositeTransferEngine& owner_;
+  const size_t expected_items_;
+  std::unordered_map<TransferEngine*, std::unique_ptr<TransferPlanBuilder>> builders_;
+  std::vector<TransferEngine*> order_;
+  std::vector<size_t> rejected_;
+};
+
+std::unique_ptr<TransferPlanBuilder> CompositeTransferEngine::CreatePlanBuilder(size_t expected_items) const {
+  return std::make_unique<PlanBuilder>(*this, expected_items);
+}
+
 TransferPlanSet CompositeTransferEngine::Plan(const std::vector<TransferItem>& items) const {
   TransferPlanSet out;
   if (items.empty()) return out;

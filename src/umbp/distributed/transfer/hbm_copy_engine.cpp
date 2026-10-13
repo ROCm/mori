@@ -358,19 +358,16 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   return IsGpu(src) || IsGpu(dst);
 }
 
-TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
-  pair_to_plan.reserve(items.size() * 2);
-  // No segment may cross a host registration piece boundary on its host side;
-  // see HostRegistrationChunkBytes().
-  const size_t piece = HostRegistrationChunkBytes();
-
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst)) {
+namespace {
+class HbmPlanBuilder final : public TransferPlanBuilder {
+ public:
+  explicit HbmPlanBuilder(const HbmCopyEngine& engine)
+      : engine_(engine), host_registration_piece_(HostRegistrationChunkBytes()) {}
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    if (!engine_.CanHandle(item.src, item.dst)) {
       out.rejected_tags.push_back(item.tag);
-      continue;
+      return;
     }
     // Bounds are checked here, once, rather than per copy: a page index that
     // does not fit its buffer is a bug in the backend's slot bookkeeping, and
@@ -380,7 +377,7 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
     if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
         item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
       out.rejected_tags.push_back(item.tag);
-      continue;
+      return;
     }
 
     const PtrPairKey key{item.src.host_ptr, item.dst.host_ptr};
@@ -405,7 +402,8 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
                                 : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
                                               : 0;
     const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
-      return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
+      return (host_base + (host_is_src ? src_offset : dst_offset)) /
+             host_registration_piece_;
     };
     size_t so = static_cast<size_t>(item.src_offset);
     size_t dof = static_cast<size_t>(item.dst_offset);
@@ -414,7 +412,8 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
       size_t sz = remaining;
       if (host_base != 0) {
         const uintptr_t host = host_base + (host_is_src ? so : dof);
-        sz = std::min<size_t>(sz, piece - host % piece);
+        sz = std::min<size_t>(sz,
+                              host_registration_piece_ - host % host_registration_piece_);
       }
       const bool can_coalesce =
           !plan.sizes.empty() &&
@@ -435,7 +434,28 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
     }
     if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
   }
-  return out;
+  TransferPlanSet Finish() override { return std::move(out); }
+
+ private:
+  const HbmCopyEngine& engine_;
+  const size_t host_registration_piece_;
+  TransferPlanSet out;
+  // Grows with distinct endpoint pairs, rather than reserving two hash
+  // buckets for every page fragment in the batch.
+  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
+};
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(size_t /*expected_items*/) const {
+  return std::make_unique<HbmPlanBuilder>(*this);
+}
+
+TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) const {
+  auto builder = CreatePlanBuilder();
+  for (const auto& item : items) {
+    builder->Add(item);
+  }
+  return builder->Finish();
 }
 
 void HbmCopyEngine::AddHostGatherRegion(void* base, size_t bytes) {
