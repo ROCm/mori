@@ -39,6 +39,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "src/io/rdma/verbs_ops.hpp"
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: MORI_ROCTX-gated host-I/O markers
 
 namespace mori {
@@ -623,7 +624,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
     wr.num_sge = 1;
 
     struct ibv_send_wr* bad_wr = nullptr;
-    int ret = ibv_post_send(ep.ibvHandle.qp, &wr, &bad_wr);
+    int ret = Verbs().PostSend(ep.ibvHandle.qp, &wr, &bad_wr);
     if (ret != 0) {
       // WR i was reserved but failed to post if bad_wr points at this WR.
       if (bad_wr == &wr) ReleaseSqDepth(eps[i], 1);
@@ -1033,7 +1034,7 @@ RdmaOpRet RdmaBatchReadWrite(const EpPairVec& eps,
     }
 
     struct ibv_send_wr* badWr = nullptr;
-    int ret = ibv_post_send(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
+    int ret = Verbs().PostSend(eps[epId].local.ibvHandle.qp, &mergedWrs[st].wr, &badWr);
     if (ret != 0) {
       int postedCount = 0;
       if (badWr != nullptr) {

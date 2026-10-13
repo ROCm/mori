@@ -101,25 +101,31 @@ if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
 PUSH_QUANT = os.environ.get("PUSH_QUANT") or "fp4_blockwise"
-if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32"):
+if PUSH_QUANT not in ("fp4_blockwise", "fp4_blockwise_fp32", "fp8_blockwise"):
     raise ValueError(
-        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32"
+        f"PUSH_QUANT={PUSH_QUANT!r}: want fp4_blockwise|fp4_blockwise_fp32|fp8_blockwise"
     )
+_PUSH_FP8 = PUSH_QUANT == "fp8_blockwise"
 PUSH_QRULE = os.environ.get("PUSH_QRULE")
 if not PUSH_QRULE:
-    PUSH_QRULE = "mx" if PUSH_QUANT == "fp4_blockwise" else "blk"
-if PUSH_QRULE not in ("mx", "blk"):
-    raise ValueError(f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk")
+    PUSH_QRULE = "blk" if PUSH_QUANT == "fp4_blockwise_fp32" else "mx"
+if PUSH_QRULE not in ("mx", "blk") or (_PUSH_FP8 and PUSH_QRULE != "mx"):
+    raise ValueError(
+        f"PUSH_QRULE={PUSH_QRULE!r}: want mx|blk (mx only for {PUSH_QUANT})"
+    )
 _PUSH_QGROUP = 32 if PUSH_QRULE == "mx" else 128
-_PUSH_WIRE = (HIDDEN // 2 + HIDDEN // 32 + 127) // 128 * 128
+_PUSH_WIRE = ((HIDDEN if _PUSH_FP8 else HIDDEN // 2) + HIDDEN // 32 + 127) // 128 * 128
 CHECK = int(os.environ.get("CHECK", 1))
 CHECK_REPEAT = int(os.environ.get("CHECK_REPEAT", 0))
 PUSH_QCHECK_DEV = int(os.environ.get("PUSH_QCHECK_DEV", 0))
 # ROUTE=rand (default): TOPK distinct experts per token, drawn at random.
-# ROUTE=ring: ATOM's --fake-eplb placement, where position p = token * TOPK + j lands
-# on rank p % world. With TOPK >= world every token reaches every rank, so the
-# largest SWEEP point fills each receive buffer to exactly its capacity -- the case
-# that overwrites anything parked at the end of the landing zone.
+# ROUTE=ring: position p = token * TOPK + j lands on rank p % world. With TOPK >= world
+# every token reaches every rank, so the largest SWEEP point fills each receive buffer
+# to exactly its capacity -- the case that overwrites anything parked at the end of the
+# landing zone.
+# ROUTE=grouped: group-limited routing (EXPERT_GROUPS=8, TOPK_GROUPS=4 by default), plus
+# SHARED_EXPERTS=1 trailing columns pinned to the token's own rank. At EP4 a token then
+# reaches 2-3 ranks, not every one, and the ranks receive unevenly.
 # ROUTE=noself: rand without the experts of the token's own rank, so no rank
 # receives from itself.
 ROUTE = os.environ.get("ROUTE", "rand")
@@ -210,8 +216,39 @@ def main():
             [torch.randperm(n_experts - EPR, generator=gr)[:TOPK] for _ in range(M)]
         )
         idx = (idx + (idx >= rank * EPR).long() * EPR).to(torch.int32).to(dev)
+    elif ROUTE == "grouped":
+        # A token picks TOPK_GROUPS of EXPERT_GROUPS groups on a ring, then the same
+        # number of experts in each. Its SHARED_EXPERTS columns stay on its own rank.
+        expert_groups = int(os.environ.get("EXPERT_GROUPS", 8))
+        topk_groups = int(os.environ.get("TOPK_GROUPS", 4))
+        shared_experts = int(os.environ.get("SHARED_EXPERTS", 1))
+        routed_topk = TOPK - shared_experts
+        routed_per_rank = EPR - shared_experts
+        experts_per_group = world * routed_per_rank // expert_groups
+        ranks_per_group = max(1, experts_per_group // routed_per_rank)
+        experts_per_group_rank = experts_per_group // ranks_per_group
+        picks_per_group = routed_topk // topk_groups
+        # Tokens interleave over the ranks: rank r holds tokens r, r + world, ...
+        token = rank + torch.arange(M) * world
+        group_slot = torch.arange(topk_groups).view(1, -1, 1)
+        pick = torch.arange(picks_per_group).view(1, 1, -1)
+        # Position on the group ring; its group is group_pos % expert_groups.
+        group_pos = token.view(-1, 1, 1) * topk_groups + group_slot
+        # How many times that group was picked before, so its experts rotate.
+        group_visit = (group_pos // expert_groups) * picks_per_group + pick
+        routed = (
+            (group_pos % expert_groups) * experts_per_group
+            + (group_visit % ranks_per_group) * experts_per_group_rank
+            + (group_visit // ranks_per_group) % experts_per_group_rank
+        ).reshape(M, routed_topk)
+        # Routed expert ids -> dispatch ids, whose ranks hold EPR slots each.
+        routed_ids = (routed // routed_per_rank) * EPR + routed % routed_per_rank
+        shared_ids = (
+            rank * EPR + routed_per_rank + torch.arange(shared_experts)
+        ).expand(M, shared_experts)
+        idx = torch.cat([routed_ids, shared_ids], 1).to(torch.int32).to(dev)
     else:
-        raise ValueError(f"ROUTE={ROUTE!r}: expected rand, ring or noself")
+        raise ValueError(f"ROUTE={ROUTE!r}: expected rand, ring, grouped or noself")
     # Per-token scale rows, transported when SCALE_DIM>0 (fp8/fp4 by default). Shaped
     # exactly as repro_epv2_topk9.py: sc_n_i32 int32 lanes viewed as bytes, trimmed to
     # SCALE_DIM so scale_type_size=1 * scale_dim holds. Deterministic (arange + rank
@@ -359,6 +396,16 @@ def main():
         sc_byte = torch.pow(2.0, (byte - 127).float())
         return torch.sign(x) * fp4_rne(x.abs() / sc_conv) * sc_byte
 
+    # The e8m0 scale brings the group's amax within e4m3's 448; |x / sc| <= 448
+    # by construction, so the cast never saturates.
+    def push_quant_deq8(x):
+        m15 = (x.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0x7FFF).amax(
+            dim=-1, keepdim=True
+        )
+        byte = torch.clamp(((m15 + 0x1F) >> 7) - 8, min=1)
+        sc = torch.pow(2.0, (byte - 127).float())
+        return (x / sc).to(torch.float8_e4m3fn).float() * sc
+
     def push_quant_blk(x):
         amax = x.abs().amax(dim=-1, keepdim=True).double()
         pos = amax > 0
@@ -368,6 +415,8 @@ def main():
         return torch.sign(x) * fp4_rne(x.abs() * inv), sc
 
     def push_quant_ref(x, u):
+        if _PUSH_FP8:
+            return (u * push_quant_deq8(x)).to(torch.bfloat16).float()
         if PUSH_QRULE == "mx":
             return (u * push_quant_deq(x)).to(torch.bfloat16).float()
         q, sc = push_quant_blk(x)
@@ -381,7 +430,10 @@ def main():
         grp = x.shape[-1]
         amax = x.abs().amax(dim=2, keepdim=True)
         _, ex = torch.frexp(amax)
-        step = torch.ldexp(torch.ones_like(amax), (ex - 2).clamp(min=-127))
+        # One step bounds the rounding error of the group's largest binade.
+        step = torch.ldexp(
+            torch.ones_like(amax), (ex - (4 if _PUSH_FP8 else 2)).clamp(min=-127)
+        )
         err = (got - u * x).abs()
         tol = u * step + (u * x).abs() * 2.0**-8 + 1e-30
         bad = int((~(err <= tol)).flatten(1).any(dim=1).sum())
@@ -429,7 +481,8 @@ def main():
         if rank == 0:
             print(
                 f"  [PUSHQUANT] ct={ct} x{scale:g} rows={int(n[1])} bad={int(n[0])} "
-                f"max_err={float(m[0]):.3f} steps rule={PUSH_QRULE} exact_bad={int(n[2])}"
+                f"max_err={float(m[0]):.3f} steps rule={PUSH_QRULE} quant={PUSH_QUANT}"
+                f" exact_bad={int(n[2])}"
                 f" nonfinite={int(n[3])}"
                 + (f" dev_diff={int(n[4])}" if PUSH_QCHECK_DEV else "")
                 + "".join(f for f in firsts if f),
@@ -981,7 +1034,7 @@ def main():
         # Say what was actually verified. fp4 skips the identity-expert check
         # (hip has no fp4 combine) but its dispatch bytes ARE compared.
         if _PUSH and CHECK and not _data.verifies_nothing(INIT):
-            why = " (push: dispatch bytes + fp4 combine output)"
+            why = f" (push: dispatch bytes + {PUSH_QUANT} combine output)"
         elif _FP4:
             why = " (fp4: dispatch bytes only, combine not compared)"
         elif not CHECK:

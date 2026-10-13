@@ -362,6 +362,9 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
   TransferPlanSet out;
   std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
   pair_to_plan.reserve(items.size() * 2);
+  // No segment may cross a host registration piece boundary on its host side;
+  // see HostRegistrationChunkBytes().
+  const size_t piece = HostRegistrationChunkBytes();
 
   for (const auto& item : items) {
     if (item.size == 0) continue;
@@ -395,18 +398,40 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
       pi = it->second;
     }
     TransferPlan& plan = out.plans[pi];
-    const size_t so = static_cast<size_t>(item.src_offset);
-    const size_t dof = static_cast<size_t>(item.dst_offset);
-    const size_t sz = static_cast<size_t>(item.size);
-    const bool can_coalesce = !plan.sizes.empty() &&
-                              AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
-                              AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof);
-    if (can_coalesce) {
-      plan.sizes.back() += sz;
-    } else {
-      plan.src_offsets.push_back(so);
-      plan.dst_offsets.push_back(dof);
-      plan.sizes.push_back(sz);
+    // D2D has no host side; otherwise exactly one side is host memory.
+    const bool host_is_src = !IsGpu(item.src);
+    const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
+    const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
+                                : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
+                                              : 0;
+    const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
+      return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
+    };
+    size_t so = static_cast<size_t>(item.src_offset);
+    size_t dof = static_cast<size_t>(item.dst_offset);
+    size_t remaining = static_cast<size_t>(item.size);
+    while (remaining > 0) {
+      size_t sz = remaining;
+      if (host_base != 0) {
+        const uintptr_t host = host_base + (host_is_src ? so : dof);
+        sz = std::min<size_t>(sz, piece - host % piece);
+      }
+      const bool can_coalesce =
+          !plan.sizes.empty() &&
+          AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
+          AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof) &&
+          (host_base == 0 ||
+           host_piece(plan.src_offsets.back(), plan.dst_offsets.back()) == host_piece(so, dof));
+      if (can_coalesce) {
+        plan.sizes.back() += sz;
+      } else {
+        plan.src_offsets.push_back(so);
+        plan.dst_offsets.push_back(dof);
+        plan.sizes.push_back(sz);
+      }
+      so += sz;
+      dof += sz;
+      remaining -= sz;
     }
     if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
   }

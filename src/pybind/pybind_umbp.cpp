@@ -300,7 +300,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
       .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
       .def_readwrite("distributed", &UMBPConfig::distributed)
-      .def_readwrite("standalone_process", &UMBPConfig::standalone_process);
+      .def_readwrite("standalone_process", &UMBPConfig::standalone_process)
+      .def_readwrite("backend_policy_path", &UMBPConfig::backend_policy_path)
+      .def_readwrite("page_size", &UMBPConfig::page_size);
 
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
       .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
