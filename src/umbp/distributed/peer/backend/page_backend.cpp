@@ -607,8 +607,7 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
 
 void PageBackend::ReleaseResolved(const std::vector<std::string>& keys,
                                   const std::vector<uint64_t>& lease_tokens) {
-  // Shared, like the resolve that took these holds: a release only lowers a
-  // per-slot atomic and never touches owned_ itself.
+  // Shared: a release only lowers a per-slot atomic.
   std::shared_lock<std::shared_mutex> lock(mutex_);
   for (size_t i = 0; i < keys.size() && i < lease_tokens.size(); ++i) {
     if (lease_tokens[i] == 0) continue;

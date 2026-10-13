@@ -196,15 +196,11 @@ std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(const std::vector<s
         Add(kResolve, kMiss, 1);
         break;
       case ResolveOutcome::kFailed:
-        // Held but unreadable: the one resolve result that is a real load
-        // failure, so it must not hide among the misses.
-        Add(kResolve, kFailed, 1);
+        Add(kResolve, kFailed, 1);  // held but unreadable: a real load failure
         break;
       case ResolveOutcome::kBusy:
       case ResolveOutcome::kDeferred:
-        // Not an answer yet: the caller resolves these keys again, and that
-        // call is the one counted.
-        break;
+        break;  // not an answer yet: the retry is what gets counted
     }
   }
   if (bytes > 0) ops_[kResolve].bytes.fetch_add(bytes, std::memory_order_relaxed);

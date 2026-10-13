@@ -153,31 +153,22 @@ struct CommitResult {
   uint64_t bytes_committed = 0;
 };
 
-// A resolve needs one more state than a cache lookup.  kBusy means this backend
-// owns the key but cannot publish its bytes until a transient resource (SSD
-// staging) becomes available; callers must retry THIS peer rather than exclude
-// it as they do for kMissing.  kFailed is a permanent shape/backend error and
-// must not be retried indefinitely.
-//
-// kDeferred means the key is held and readable, but this call staged as much
-// of the batch as the backend can hold at once and left this key out.  It is
-// not pressure that waiting clears -- the same batch would be deferred again --
-// so it is NOT kBusy: the caller consumes and releases (ReleaseResolved) what
-// was published, then resolves the deferred keys in a further call.  Only a
-// staged medium returns it; a caller that cannot make a further call (a peer
-// answering over the wire) treats it as kFailed.
-// Who will read what a resolve publishes, which decides how long a medium
-// must keep it readable.  A kLocal reader is this process: it reads through
-// the transfer layer, observes completion, and ALWAYS calls ReleaseResolved
-// afterwards -- so its hold never expires on a timer (an expiry would free
-// bytes it may still be copying).  A kRemote reader is a peer over the wire
-// that cannot report completion, so its hold lasts the medium's read lease.
-// kRemote is the default because it is the one that cannot leak.
+// Who reads what a resolve publishes.  kLocal is this process: it always calls
+// ReleaseResolved after its copy, so its hold never expires on a timer.
+// kRemote is a peer that cannot report completion: its hold lasts the read
+// lease.  kRemote is the default because it cannot leak.
 enum class ResolveReader {
   kRemote,
   kLocal,
 };
 
+// A resolve needs one more state than a cache lookup.  kBusy means this backend
+// owns the key but cannot publish its bytes until a transient resource (SSD
+// staging) becomes available; callers must retry THIS peer rather than exclude
+// it as they do for kMissing.  kFailed is a permanent shape/backend error and
+// must not be retried indefinitely.  kDeferred: held and readable, but this
+// call staged its share of the batch without it; the caller releases what was
+// published and resolves the rest in a further call (on the wire, kFailed).
 enum class ResolveOutcome {
   kMissing,
   kFound,
@@ -204,10 +195,8 @@ struct ResolvedEntry {
   // this invalid and publishes pages as before.
   TransferRef file_ref{};
 
-  // Non-zero when the published bytes sit in staging the caller should hand
-  // back with ReleaseResolved once it has read them.  It names the lease this
-  // entry was published under, so a release that arrives after that lease
-  // expired cannot free a later reader's staging.  Not carried on the wire.
+  // Non-zero: hand back with ReleaseResolved after reading.  Names the hold, so
+  // a late release cannot free a later reader's.  Not carried on the wire.
   uint64_t lease_token = 0;
 };
 
@@ -360,10 +349,7 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  //
-  // `reader` (see ResolveReader): a kLocal caller must hand every published
-  // entry back with ReleaseResolved, and until it does the entry stays readable
-  // however long the copy takes.
+  // A kLocal `reader` must ReleaseResolved every published entry.
   virtual std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote) = 0;
@@ -378,16 +364,8 @@ class MediumBackend : public MetricSource {
   }
   virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
 
-  // The caller has finished reading what an earlier BatchResolve published for
-  // these keys, one entry per published entry (an entry with lease_token 0 is
-  // skipped).  A staged medium may then reuse
-  // the staging the entry pointed at instead of holding it for the whole read
-  // lease; anything never released still falls back to the lease's expiry, so
-  // a reader that cannot report completion (a peer reading over the wire) is
-  // unaffected.  The transfer layer is the only one that observes completion,
-  // which is why this is a signal from the caller and not a backend timer.
-  // A medium that resolves its own resident bytes has nothing to release and
-  // publishes lease_token 0.  `lease_tokens` is parallel to `keys`.
+  // The caller has finished reading what a kLocal BatchResolve published.
+  // `lease_tokens` is parallel to `keys`; 0 is skipped.
   virtual void ReleaseResolved(const std::vector<std::string>& keys,
                                const std::vector<uint64_t>& lease_tokens) {
     (void)keys;

@@ -422,9 +422,8 @@ TEST(PageBackend, EvictDefersWhenReadLeaseActive) {
   EXPECT_EQ(events[0].kind, KvEvent::Kind::REMOVE);
 }
 
-// A local reader's hold fences eviction until it releases -- the deadline
-// alone would let a copy slower than the lease have its pages freed and reused
-// under it.  A release naming another slot generation changes nothing.
+// A local reader fences eviction until it releases, past the lease deadline;
+// a remote reader is fenced by the deadline alone and has nothing to release.
 TEST(PageBackend, ALocalReaderFencesEvictionUntilItReleases) {
   auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
                                          /*pending_ttl=*/std::chrono::milliseconds{5000},
@@ -433,6 +432,7 @@ TEST(PageBackend, ALocalReaderFencesEvictionUntilItReleases) {
   uint64_t committed_bytes = 0;
   ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
 
+  EXPECT_EQ(a->BatchResolve({"k"}, false)[0].lease_token, 0u);  // remote
   auto held = a->BatchResolve({"k"}, false, false, ResolveReader::kLocal);
   ASSERT_TRUE(held[0].found);
   ASSERT_NE(held[0].lease_token, 0u);
@@ -443,22 +443,6 @@ TEST(PageBackend, ALocalReaderFencesEvictionUntilItReleases) {
   EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, 0u);
 
   a->ReleaseResolved({"k"}, {held[0].lease_token});
-  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
-}
-
-// A remote reader (the default) is fenced by the deadline alone, as before.
-TEST(PageBackend, ARemoteReaderIsFencedOnlyByTheLease) {
-  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
-                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
-                                         /*read_lease_ttl=*/std::chrono::milliseconds{1});
-  auto p = AllocateOk(*a, "k", kPageSize);
-  uint64_t committed_bytes = 0;
-  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
-
-  auto remote = a->BatchResolve({"k"}, false);
-  ASSERT_TRUE(remote[0].found);
-  EXPECT_EQ(remote[0].lease_token, 0u) << "nothing for a remote reader to release";
-  std::this_thread::sleep_for(std::chrono::milliseconds{10});
   EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
 }
 
