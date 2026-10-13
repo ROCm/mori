@@ -265,13 +265,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   grpc::Status EvictKey(grpc::ServerContext* /*ctx*/, const ::umbp::EvictKeyRequest* request,
                         ::umbp::EvictKeyResponse* response) override {
-    // Master reclaims capacity it measured per (node, tier), and names that
-    // tier per key: the pool frees exactly that medium's copy (demoting it
-    // where its tier has a downstream) and leaves any other copy alone.  An
-    // older master sends no tiers; each key is then freed from the medium that
-    // currently holds it.  Demotions are only queued, so a demoted key reports
-    // 0 bytes freed; bytes_freed is informational anyway -- the master sizes
-    // its next round off the heartbeat's capacity, not off this reply.
+    // Free each key's copy on the tier the master named (an older master names
+    // none: the medium holding it).  bytes_freed is informational; a queued
+    // demotion reports 0.
     const int n = request->keys_size();
     if (n == 0) return grpc::Status::OK;
     const bool scoped = request->tiers_size() == n;

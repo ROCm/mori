@@ -332,20 +332,9 @@ class PageBackend : public MediumBackend {
   void SetEventPublishing(bool enabled) override;
 
   // ==================== Eviction ordering ====================
-  //
-  // This backend never decides to evict.  The master, or the pool's local
-  // watermark eviction on a node without one, decides and calls Evict() --
-  // the only code here that frees a committed key -- through PeerPool::Evict.
-  // What this backend supplies is the order: an LRU of owned keys, inserted by
-  // Commit and renewed by Resolve.
-  //
-  // The LRU is maintained only once TrackEvictionOrder() is called, so a node
-  // whose eviction is all master-driven pays nothing for it on the read path.
+  // An LRU of owned keys (Commit inserts, Resolve renews), kept only after
+  // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
   void TrackEvictionOrder() override;
-
-  // Coldest first, skipping keys under a read lease or a copy pin -- the same
-  // two protections Evict() applies, so a candidate is one Evict() would free
-  // unless it is touched in between.  Empty until TrackEvictionOrder().
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
 
   // ==================== Reaper ====================

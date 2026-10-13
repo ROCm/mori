@@ -20,10 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// The SSD medium's eviction primitive and candidate order, driven through an
-// in-memory TierBackend (the test-only constructor) so LRU order, the
-// in-flight-read guard, idempotent Write, evict failure, concurrency and Clear
-// are deterministic.  Watermark eviction is PeerPool's, tested there.
+// The SSD medium's Evict() and candidate order, over an in-memory TierBackend.
+// Watermark eviction is PeerPool's, tested there.
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -194,8 +192,7 @@ TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
 }
 
 TEST(PeerSsdEviction, WritesNeverEvict) {
-  // At 900 of 1000 (the old watermark round) and on ENOSPC alike, a write
-  // leaves every earlier key in place: eviction is the pool's job.
+  // Neither 90% usage nor ENOSPC makes a write evict earlier keys.
   auto h = MakeHarness(/*capacity=*/1000);
   std::string val(100, 'x');
   for (int i = 1; i <= 9; ++i) {

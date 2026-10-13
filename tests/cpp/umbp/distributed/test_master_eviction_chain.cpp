@@ -574,8 +574,7 @@ size_t FirstRoundVictims(const EvictionConfig& config) {
 }
 
 TEST(MasterEvictionBytes, ARoundFreesTheOverageUpToTheByteLimit) {
-  // The overage above the 0.7 low watermark is 77 keys, more than the 32 a
-  // round used to stop at.
+  // 77 keys over the 0.7 low watermark; rounds used to stop at 32.
   EXPECT_EQ(FirstRoundVictims(OneSecondRounds()), 77u);
 
   ::setenv("UMBP_EVICT_MAX_BYTES_PER_ROUND", std::to_string(10 * kPageSize).c_str(), 1);

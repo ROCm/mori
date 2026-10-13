@@ -48,8 +48,7 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
     return;
   }
   const auto& ssd = cfg.ssd;
-  // The SSD watermarks in `ssd` are consumed by PeerPool's local eviction,
-  // which PoolClient enables for this medium -- not here.
+  // `ssd`'s watermarks drive PeerPool's local eviction, not this class.
   single_flight_ = ssd.single_flight_reads;
 
   // Explicit backend selection — an unknown value is a configuration error, not
@@ -191,8 +190,7 @@ bool PeerSsdManager::Write(const std::string& key,
   }
 
   // Backend IO outside our mutex_ — SSDTier is internally synchronized.  A
-  // failure (ENOSPC included) records nothing and queues nothing.  Making room
-  // is the pool's local eviction, on its own thread, never this write.
+  // failure (ENOSPC included) records nothing; this never evicts.
   if (!backend_->Write(key, data, total_size)) {
     MORI_UMBP_WARN("[PeerSsdManager] backend Write failed key={} size={}", key, total_size);
     return false;
@@ -257,9 +255,8 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
   const size_t dedup_hits = keys.size() - todo.size();
   if (todo.empty()) return results;
 
-  // Pass 2 — one batched backend write outside the lock.  A key that fails
-  // (ENOSPC included) is reported as failed and recorded nowhere; making room
-  // is the pool's local eviction, on its own thread, never this write.
+  // Pass 2 — one batched backend write outside the lock.  A failed key
+  // (ENOSPC included) is recorded nowhere; this never evicts.
   const auto t_backend = ssdperf::Now();
   std::vector<std::string> batch_keys;
   std::vector<const void*> batch_srcs;
@@ -389,11 +386,8 @@ void PeerSsdManager::ClearLocal() {
   // in-flight reads (below) but not in-flight Writes, so a racing Write could
   // re-add owned_/ADD SSD after backend->Clear() wipes its bytes.
   // PoolClient::Clear() Quiesce()s first; new callers must too.
-  //
-  // No eviction is in flight: the only caller of Evict is PeerPool::Evict,
-  // which holds the lifecycle lock PeerPool::ClearLocal takes exclusively
-  // before it gets here.  An Evict that did overlap would still be safe -- it
-  // finds its key gone from owned_ and records nothing -- just pointless.
+  // No Evict overlaps this: PeerPool::Evict holds the lifecycle lock that
+  // PeerPool::ClearLocal takes exclusively.
   {
     std::unique_lock<std::mutex> lock(mutex_);
     owned_.clear();

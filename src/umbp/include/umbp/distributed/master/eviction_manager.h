@@ -43,8 +43,7 @@ class MasterEvictStrategy;
 // REMOVE events arrive on the peer's next heartbeat and that's where
 // the index actually shrinks.
 //
-// Each victim names the medium to free the key from: the peer frees that
-// copy and leaves any other copy of the key alone.
+// Each victim names the medium to free the key from.
 //
 // The implementation lives in master_server.cpp (MasterPeerStubPool)
 // where the gRPC stub plumbing belongs.  Tests can swap in a fake.

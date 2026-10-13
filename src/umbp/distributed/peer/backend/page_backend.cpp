@@ -811,8 +811,7 @@ void PageBackend::TrackEvictionOrder() {
   std::unique_lock<std::shared_mutex> lock(mutex_);
   if (track_eviction_order_) return;
   track_eviction_order_ = true;
-  // Keys committed before this call are not in lru_ and would otherwise never
-  // be offered.  They have no recorded access, so they go in as coldest.
+  // Seed keys committed before this call, as coldest.
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   for (auto& [key, slot] : owned_) TouchLruLocked(key, slot);
 }
@@ -820,7 +819,6 @@ void PageBackend::TrackEvictionOrder() {
 std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   std::vector<EvictionOffer> out;
   if (max_count == 0) return out;
-  // Shared: this only reads owned_ and pins_.  The LRU has its own lock.
   std::shared_lock<std::shared_mutex> lock(mutex_);
   if (!track_eviction_order_) return out;
   const auto now = std::chrono::steady_clock::now();
@@ -828,15 +826,11 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   for (auto it = lru_.rbegin(); it != lru_.rend() && out.size() < max_count; ++it) {
     auto owned_it = owned_.find(*it);
     if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
-    // The two protections Evict() applies: an in-flight read owns the pages
-    // until its lease expires, a copy pin until the copy is done.  Offering
-    // them would only make the caller's batch free less than it asked for.
-    // Except a migration pin: the key is already leaving, and the caller
-    // counts its bytes as in flight.
+    // Skip what Evict() refuses (read lease, copy pin); a migration pin is
+    // offered so the caller can count it as in flight.
     if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
     if (auto pin = pins_.find(*it); pin != pins_.end() && !pin->second.migration) continue;
-    // Whole pages: that is what the allocator gives back, and what Capacity()
-    // counts against the watermark.
+    // Whole pages, as Capacity() counts them.
     out.push_back(
         EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
   }

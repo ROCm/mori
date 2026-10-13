@@ -1063,9 +1063,7 @@ bool PoolClient::Init() {
     // every named backend, including multiple instances of the same medium.
     backend = MakeInstrumentedBackend(std::move(backend));
 
-    // A node with no master has nobody to drain its heartbeat outbox, so the
-    // backend stops recording events addressed to a master that does not
-    // exist.  (Its eviction is the pool's job; see EnableLocalEviction below.)
+    // With no master, nothing drains the heartbeat outbox.
     if (!master_client_) backend->SetEventPublishing(false);
 
     // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
@@ -1094,13 +1092,8 @@ bool PoolClient::Init() {
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
 
-  // Local watermark eviction.  It goes through PeerPool::Evict, the same call
-  // a master's EvictKey makes, on the pool's own thread -- never on a put.
-  // Which media get it is unchanged:
-  //   * no master: every medium, since nothing else would ever free a page;
-  //   * with a master: SSD only, which has always reclaimed for itself between
-  //     the master's periodic rounds.  DRAM/HBM stay master-driven there.
-  // SSD uses the watermarks in its own config, paged media the node-wide pair.
+  // Local watermark eviction: every medium without a master, SSD only with
+  // one (as before).  SSD uses its own watermarks, paged media the node pair.
   for (const auto& backend_config : backend_configs) {
     auto* backend = registry_.Get(backend_config.name);
     if (backend == nullptr) continue;

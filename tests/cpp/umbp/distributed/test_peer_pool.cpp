@@ -120,8 +120,7 @@ bool WaitForKeyGone(BackendRegistry* registry, const std::string& backend, const
   return !registry->Get(backend)->Contains(key);
 }
 
-// A LocalCopyEngine that holds every copy until Release() -- or 10 s, so a
-// failed test cannot hang the pool's teardown.
+// Holds every copy until Release(), or 10 s so a failed test can't hang.
 class GatedEngine final : public TransferEngine {
  public:
   const char* Name() const override { return "gated"; }
@@ -625,8 +624,7 @@ TEST(PeerPool, OnEvictMigratesBytesToConfiguredBackend) {
                   .front()
                   .commit.success);
 
-  // Evict only queues the demotion: it returns while the copy is held, and
-  // asking again does not queue it twice.
+  // Evict returns while the copy is held, and does not queue it twice.
   auto evicted = pool.Evict({"move"}, PoolEvictMode::kReclaim);
   ASSERT_EQ(evicted.size(), 1u);
   EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kDemotionQueued);
@@ -746,8 +744,7 @@ TEST(PeerPool, TierScopedEvictFreesOnlyThatMediumsCopy) {
   EXPECT_TRUE(registry.Get("hot")->Contains("a"));
   EXPECT_EQ(pool.PlacementBackend("a"), std::optional<uint32_t>{hot});
 
-  // DRAM scope: cold already holds the key, so the demotion frees DRAM without
-  // a copy.
+  // DRAM scope: cold already holds the key, so DRAM frees without a copy.
   evicted = pool.Evict({PoolEvictRequest{"b", TierType::DRAM}}, PoolEvictMode::kReclaim);
   EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kDemotionQueued);
   ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "b"));
@@ -803,8 +800,7 @@ TEST(PeerPool, ReclaimDemotesOnAWatermarkTierToo) {
 }
 
 TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
-  // Reclaim still frees the tier when the tier below is full.  Host-page-sized
-  // pages, so `cold` really is one page long.
+  // Reclaim still frees the tier when the tier below is full (cold: one page).
   constexpr uint64_t kPageSize = 4096;
   LocalCopyEngine engine;
   BackendRegistry registry;
@@ -1127,10 +1123,7 @@ TEST(PeerPool, ReadPromotesWithMoveDrainsSourceAndKeepsBytes) {
             payload);
 }
 
-// ---------------------------------------------------------------------------
-//  Local watermark eviction: a background worker that frees through Evict(),
-//  so it follows the same demote-or-drop contract as the tests above.
-// ---------------------------------------------------------------------------
+// ---- Local watermark eviction (frees through Evict(), as above) ----
 
 bool WaitUntil(const std::function<bool()>& done,
                std::chrono::milliseconds budget = std::chrono::seconds(5)) {
@@ -1194,9 +1187,8 @@ TEST(PeerPoolLocalEviction, KeysUnderAReadLeaseAreNeverOffered) {
 }
 
 TEST(PeerPoolLocalEviction, ATierWithADownstreamDemotesJustTheOverage) {
-  // Same call as a master evict: a tier with a downstream demotes, never drops.
-  // A queued demotion frees its source only when the copy lands, so passes run
-  // meanwhile must count it, or they would queue the whole tier.
+  // A tier with a downstream demotes, and passes that run while copies are
+  // held count them rather than queueing the whole tier.
   GatedEngine engine;
   BackendRegistry registry;
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);
@@ -1226,8 +1218,7 @@ TEST(PeerPoolLocalEviction, ATierWithADownstreamDemotesJustTheOverage) {
 }
 
 TEST(PeerPoolLocalEviction, NeverDeletesWhatAWatermarkOffloadWouldMove) {
-  // Regression: the old in-commit round deleted the cold keys a watermark
-  // offload was about to move.  Now both move them, so every key survives.
+  // Regression: the old in-commit round deleted keys offload was about to move.
   LocalCopyEngine engine;
   BackendRegistry registry;
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kHostPage, 10);

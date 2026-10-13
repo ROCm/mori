@@ -152,9 +152,8 @@ void EvictionManager::RunOnce() {
 
   // Flatten the candidates and translate the per-(node, tier) byte budget into
   // the strategy's shape, then let the strategy pick victims (default LRU),
-  // grouped by node so each peer gets a single EvictKey.  Each victim keeps
-  // the tier it was charged to, so the peer frees exactly the copy that is
-  // over budget.
+  // grouped by node so each peer gets a single EvictKey.  Victims keep their
+  // tier, so the peer frees the copy that is over budget.
   std::vector<EvictionCandidate> candidates;
   for (auto& [bucket, rows] : candidates_by_bucket) {
     for (auto& c : rows) candidates.push_back(std::move(c));
@@ -205,10 +204,7 @@ void EvictionManager::RunOnce() {
     // next heartbeat are what shrink the index), and a chunk that fails is
     // retried next round.  So N chunks reach the same state as one message
     // would have, and a partial round still makes progress.
-    //
-    // Sized on the keys alone: the parallel tier field is a packed enum of one
-    // byte per key, inside the per-item overhead GrpcMaxItemsPerBatch already
-    // reserves.  Bytes don't lengthen a call: the peer only queues demotions.
+    // The one-byte tier per key fits in GrpcMaxItemsPerBatch's item overhead.
     std::vector<std::string> keys;
     keys.reserve(victims.size());
     for (const auto& victim : victims) keys.push_back(victim.key);

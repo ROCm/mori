@@ -248,12 +248,8 @@ std::vector<std::string> SpdkSsdTier::GetLRUCandidates(size_t max_candidates) co
 // 1) Checks existing keys (shard shared lock + LRU update)
 // 2) Batch allocates space for new keys
 //
-// A key that does not fit FAILS.  The tier never evicts to make room: the
-// keys it would pick belong to whoever owns this tier (PeerSsdManager, over
-// the proxy), which tracks them and reports their REMOVE to the master.  An
-// eviction here would be invisible to both -- the owner would keep listing a
-// key whose bytes are gone.  Making room is the owner's local eviction, which
-// reaches this tier through Evict().
+// A key that does not fit fails.  The tier never evicts on its own: its owner
+// (PeerSsdManager) tracks the keys and would keep listing ones it dropped.
 // ===========================================================================
 std::vector<SpdkSsdTier::PendingWrite> SpdkSsdTier::PrepareWriteAlloc(
     const std::vector<std::string>& keys, const std::vector<size_t>& sizes,

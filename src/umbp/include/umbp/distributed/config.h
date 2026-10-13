@@ -307,13 +307,8 @@ struct PoolClientConfig {
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
-  // Watermarks for local eviction of the paged media (DRAM/HBM), used ONLY
-  // when this node has no master (PoolClient::Init enables PeerPool's local
-  // eviction for them exactly then).  With a master, their eviction is a
-  // cluster-wide decision shipped as EvictKey RPCs and these are ignored;
-  // without one, nothing else would ever free a page.  Lowered from
-  // UMBPDramConfig::high_watermark / low_watermark.  The SSD medium uses its
-  // own pair inside UMBPSsdConfig, with or without a master.
+  // Local eviction watermarks for DRAM/HBM, used only without a master (SSD
+  // has its own pair).  Lowered from UMBPDramConfig.
   double local_evict_high_watermark = 0.9;
   double local_evict_low_watermark = 0.7;
 

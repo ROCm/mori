@@ -557,9 +557,7 @@ TEST_F(SsdBackendTest, EvictResultsAreOnePerKeyInRequestOrder) {
   EXPECT_EQ(evicted[1].bytes_freed, 1024u);
 }
 
-// ---------------------------------------------------------------------------
-//  Local eviction: the backend offers order; the pool decides
-// ---------------------------------------------------------------------------
+// ---- Local eviction: the backend offers order; the pool decides ----
 
 TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   SsdBackend* backend = Start();

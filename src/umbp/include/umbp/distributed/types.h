@@ -160,10 +160,7 @@ struct EvictionCandidate {
   uint64_t size;
 };
 
-// One master eviction decision: free `key` from the `tier` medium of a node.
-// The tier is the one whose budget the victim was charged to.  A key over
-// budget in two media of the same node is two victims, one per medium; without
-// the tier the peer could only guess which copy the master meant.
+// One master eviction decision: free `key`'s copy on the `tier` medium.
 struct EvictionVictim {
   std::string key;
   TierType tier = TierType::UNKNOWN;
@@ -173,11 +170,7 @@ struct EvictionVictim {
   }
 };
 
-// One key a medium offers for local eviction (MediumBackend::
-// EvictionCandidates), with the bytes freeing it gives back to that medium's
-// capacity -- page-rounded where the medium allocates in pages.  The size is
-// what lets the caller take exactly as many offers as it needs instead of a
-// whole batch.
+// A key offered for local eviction, with the (page-rounded) bytes it frees.
 struct EvictionOffer {
   std::string key;
   uint64_t bytes = 0;

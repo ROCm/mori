@@ -53,13 +53,8 @@ struct SsdReadOutcome {
 
 // Peer-side owner of the local SSD tier: one SSD TierBackend + the
 // key->SSD-location map, capacity, the owned-location event outbox, the
-// read-prepare path, and the SSD medium's one eviction implementation
-// (Evict).  Reached from the distributed data plane through
-// SsdBackend : MediumBackend, which forwards to it.
-//
-// It decides nothing about eviction.  When to evict and how much is
-// PeerPool's local watermark eviction (or the master), which reaches Evict()
-// through SsdBackend::Evict; this class only offers its LRU as candidates.
+// read-prepare path, and Evict().  Reached through SsdBackend.  It never
+// decides to evict; it only offers its LRU as candidates.
 //
 // It reuses ONLY the low-level TierBackend (SSDTier).  Peer DRAM is owned by
 // PageBackend, and a second thing here that also held DRAM and demoted between
@@ -69,9 +64,7 @@ class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
 
-  // Test-only: inject a ready-made backend so unit tests can drive the manager
-  // with a controllable (e.g. blocking) fake.  Production code must use the
-  // config constructor.
+  // Test-only: inject a fake backend.
   explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true);
 
   ~PeerSsdManager();
@@ -115,30 +108,20 @@ class PeerSsdManager {
   // drive but one.
   //
   // Result length and order match @p keys.  An already-owned key reports true
-  // without any device IO (LRU refreshed).  A key the device has no room for
-  // fails: this never evicts to make room -- that is the pool's local
-  // eviction, on its own thread, at the SSD's watermark.
+  // without any device IO (LRU refreshed).  A key with no room fails; this
+  // never evicts to make room.
   std::vector<bool> WriteBatch(const std::vector<std::string>& keys,
                                const std::vector<const void*>& srcs,
                                const std::vector<size_t>& sizes);
 
-  // The SSD medium's ONE eviction implementation: free a single key.  Read
-  // priority: a key with an in-flight PrepareRead or migration pin
-  // (inflight_reads_ > 0) is NOT evicted (returns false).
-  // Concurrency: marks the key in evicting_ under the lock, runs the backend
-  // evict outside the lock, and only on backend success removes owned_/lru_ and
-  // queues a REMOVE SSD event (so REMOVE is never emitted while the bytes still
-  // exist, and two callers cannot double-evict the same key).
-  //
-  // Reached only through SsdBackend::Evict, which PeerPool::Evict calls under
-  // its lifecycle lock -- the one ClearLocal takes exclusively -- so an
-  // eviction is never in flight during a Clear.
+  // Frees one key; false if it is being read or pinned (inflight_reads_ > 0).
+  // Marks the key in evicting_ under the lock, evicts outside it, and only on
+  // success removes owned_/lru_ and queues a REMOVE (never while the bytes
+  // still exist; no double evict).  PeerPool::Evict holds the lifecycle lock,
+  // so this never overlaps a Clear.
   bool Evict(const std::string& key);
 
-  // Up to @p max_count keys, coldest first (LRU tail -> MRU front), skipping
-  // keys that are being read or pinned (inflight_reads_) or already being
-  // evicted (evicting_).  Ordering only: frees nothing, and Evict() re-checks
-  // every key.  Never blocks on IO.
+  // Coldest first, skipping keys being read, pinned or evicted.  Frees nothing.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count);
 
   // Distributed Clear: drop the logical owned-location map + undrained events,

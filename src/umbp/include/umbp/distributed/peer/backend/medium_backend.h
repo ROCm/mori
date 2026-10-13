@@ -276,26 +276,14 @@ class MediumBackend : public MetricSource {
   // call (the default) simply has no outbox worth gating.
   virtual void SetEventPublishing(bool /*enabled*/) {}
 
-  // ---- eviction ordering ----
-  //
-  // A backend never decides to evict.  The master (EvictKey) or the pool's own
-  // local watermark eviction decides when and how much, both through
-  // PeerPool::Evict, and Evict() below is the one place a medium frees a
-  // committed key.  What only the medium can supply is ORDER: it sees every
-  // read, including the resolve paths that never touch the pool's metadata.
-  // So it offers candidates, and nothing else.
+  // ---- eviction ordering: the pool decides; a medium only supplies order ----
 
-  // Start keeping the recency order EvictionCandidates() reads.  Off by
-  // default: a node whose eviction is all master-driven never asks for
-  // candidates, and keeping the order costs every read a touch.  Idempotent,
-  // and safe after Init: keys already owned are seeded into the order.
+  // Start the recency order EvictionCandidates() reads.  Off by default (it
+  // costs every read a touch).  Idempotent; seeds keys already owned.
   virtual void TrackEvictionOrder() {}
 
-  // Up to `max_count` keys this medium could free right now, coldest first,
-  // each with the capacity freeing it gives back, skipping keys that a read
-  // lease, pin or in-flight read protects.  Frees nothing: the caller passes
-  // the keys back through Evict(), which re-checks every one.  A medium that
-  // keeps no order returns nothing and is therefore never evicted locally.
+  // Up to `max_count` unprotected keys, coldest first, with the bytes each
+  // frees.  Frees nothing; Evict() re-checks.  Empty if no order is kept.
   virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
 
   // ---- observability ----
@@ -375,12 +363,8 @@ class MediumBackend : public MetricSource {
     return out;
   }
 
-  // The medium's ONE eviction implementation: free these keys' bytes on this
-  // medium, skipping any a read lease or pin protects, and queue a REMOVE for
-  // each key actually freed.  Every eviction reaches here through
-  // PeerPool::Evict -- master-driven or local -- and nothing else in a backend
-  // may free a committed key for capacity.  Idempotent; see
-  // EvictResult::bytes_freed.  One result per key, in request order.
+  // The medium's only eviction path, reached via PeerPool::Evict: frees keys a
+  // lease or pin doesn't protect and queues a REMOVE for each.  Idempotent.
   virtual std::vector<EvictResult> Evict(const std::vector<std::string>& keys) = 0;
 
   // ---- bootstrap (GetPeerInfo) ----

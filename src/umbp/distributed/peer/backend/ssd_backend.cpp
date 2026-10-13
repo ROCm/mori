@@ -876,10 +876,8 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   event("single_flight_dup", ssd_->ReadDup());
   event("single_flight_merged", ssd_->ReadMerged());
 
-  // Every eviction -- master-driven or the pool's local watermark eviction --
-  // arrives through Evict(), so the keys and bytes are the decorator's and the
-  // rounds are the pool's (mori_umbp_client_local_evict_total).  What neither
-  // can see is a delete the drive itself refused.
+  // Evictions are counted by the decorator and the pool; only a delete the
+  // drive refused is counted here.
   event("eviction_backend_failed", ssd_->EvictionBackendFailures());
 
   // Staging pressure.  slot_full_reject is the one to watch: it counts resolves
