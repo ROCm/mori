@@ -254,6 +254,45 @@ hangs rather than failing, undiagnosed). The host gate refuses it on gfx125x so
 it fails immediately instead. `v1_asyncll` has no row either -- v1 is the shmem
 path and does not run on this arch.
 
+### Tried and rejected
+
+Both of these follow from the same picture -- AsyncLL stages the payload three
+times and runs nine kernels, so the obvious targets are the extra passes and the
+extra launches -- and both were measured on an MI355X at EP8, six interleaved
+pairs, every pair agreeing in sign. They are recorded because the reasoning
+behind them is sound enough to be had again.
+
+**Pipelining the send half over PE groups.** `SendTransfer` only posts SDMA
+descriptors; the engine's copy is not on the stream, so splitting the send into
+PE groups and alternating copy/post launches should let the engine move group 0
+while the grid stages group 1. Measured +20% (2048 tokens) to +61% (64), worse
+everywhere. Each `SendCopy` launch still walks every entry and copies only its
+share, so half the grid idles through the scan and the fixed costs double, while
+the overlap it was supposed to buy never showed up.
+
+**Fusing SlotAssign and SendCopy behind a grid rendezvous.** One launch instead
+of two, keeping both decompositions (SlotAssign is top-k parallel, SendCopy is
+hidden-dim parallel) rather than interleaving per warp. Measured +12% (2048) to
++104% (64). A spin barrier waits for the slowest block, and SlotAssign's work is
+uneven across blocks by nature; the kernel boundary it replaced was synchronised
+by the hardware scheduler for less. Launch overhead is not the bottleneck here,
+which is also why the first experiment failed -- its small-batch penalty was
+load imbalance, not the extra launches.
+
+**Fusing the cross-node count onto the payload's WQE.** `EpInterNodePutSignal`
+instead of `EpInterNodePut`, so the stripe's token count rides its own QP and
+`RecvTransfer` can drop both the `EpInterNodeQuiet` drain and the separate count
+send. Needs per-(srcPe, qpId) count slots, because a fused flag is ordered
+behind the data only on its own QP and the payload is striped across
+`num_qp_per_pe` of them. Never got correct: 16 of 16 ranks disagreed at EP16,
+`max|diff|` around 24 with `got_nonzero` at or near full, i.e. every output
+position written but some holding the wrong value -- the signature of a wrong
+offset rather than of data that has not arrived. The suspect is the count
+arithmetic the new layout needs (`sum(row) - num_qp_per_pe`), which feeds the
+per-PE output prefix sum. Abandoned rather than chased: even correct, the
+cross-node leg is bandwidth-bound on per-PE cross-rail QPs at ~25 GB/s against
+v2_ll's 64-71, so a CQE drain is not what is costing it.
+
 ### Reproducing
 
 ```bash
