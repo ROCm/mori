@@ -44,6 +44,7 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/common/fd_limit.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -203,26 +204,30 @@ TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {
 //  Put / Get
 // ---------------------------------------------------------------------------
 
-// Every segment file stays open for the tier's lifetime, so the tier makes room
-// for them in RLIMIT_NOFILE when it starts.  At docker's default soft limit of
-// 1,024 a 1.5 TB tier ran out of descriptors partway through filling, and every
-// write then failed with EMFILE until something else closed one.
-TEST_F(SsdBackendTest, RaisesTheOpenFileLimitForItsSegments) {
+// The tier also runs inside other programs (sglang, embedded), so it leaves the
+// process-wide fd limit alone; UMBP's executables raise it in main().
+TEST_F(SsdBackendTest, LeavesTheOpenFileLimitToTheExecutable) {
   struct rlimit original{};
   ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
-  if (original.rlim_max != RLIM_INFINITY && original.rlim_max < 8192) {
-    GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves no room to test";
+  if (original.rlim_max == RLIM_INFINITY || original.rlim_max <= 1024) {
+    GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves nothing to test";
   }
+  struct Restore {
+    rlimit rl;
+    ~Restore() { setrlimit(RLIMIT_NOFILE, &rl); }
+  } restore{original};
   struct rlimit low = original;
-  low.rlim_cur = 256;
+  low.rlim_cur = 1024;  // docker's default
   ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
 
-  Start();  // one shard; budget = its segments + headroom, well over 256
+  Start();
+  struct rlimit now{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, 1024u);
 
-  struct rlimit after{};
-  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &after), 0);
-  EXPECT_GT(after.rlim_cur, 4096u) << "the soft limit was left where the tier would run out";
-  setrlimit(RLIMIT_NOFILE, &original);
+  RaiseOpenFileLimit();
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, original.rlim_max);
 }
 
 TEST_F(SsdBackendTest, PutThenGetReturnsTheSameBytes) {
