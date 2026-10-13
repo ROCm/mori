@@ -658,6 +658,10 @@ static int ccoCommCreateImpl(application::BootstrapNetwork* bootNet, size_t perR
       }
     }
     if (comm->handleType != static_cast<int>(hipMemHandleTypeFabricCompat)) {
+      // A failed probe is an expected fallback, but it leaves the runtime's sticky
+      // last-error set; the next torch allocation would pick it up via
+      // hipGetLastError() and raise "operation not supported".
+      (void)hipGetLastError();
       MORI_SHMEM_INFO("ccoCommCreate: fabric handle probe failed, using FD path");
     }
   }
