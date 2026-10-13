@@ -837,8 +837,15 @@ class CMakeBuild(build_ext):
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
-        # UMBP bindings are compiled into libmori_pybinds.so when BUILD_UMBP=ON
-        # (no separate .so to copy)
+        # UMBP bindings are their own module (it links gRPC); mori.cpp loads it lazily.
+        # Keyed on the flag, not the file: CMake leaves a stale one in a reused build dir.
+        umbp_pybinds_src = build_dir / "src/pybind/libmori_umbp_pybinds.so"
+        umbp_pybinds_dst = root_dir / "python/mori/libmori_umbp_pybinds.so"
+        if build_umbp_enabled and umbp_pybinds_src.exists():
+            shutil.copyfile(umbp_pybinds_src, umbp_pybinds_dst)
+        elif umbp_pybinds_dst.exists():
+            umbp_pybinds_dst.unlink()
+
         spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
         if build_umbp_spdk_enabled and spdk_proxy_src.exists():
@@ -1079,6 +1086,7 @@ mori_package_data = [
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "libmori_jit.so",  # JIT v2 C ABI + plan registry
     "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
+    "libmori_umbp_pybinds.so",  # optional: only present when BUILD_UMBP=ON
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",

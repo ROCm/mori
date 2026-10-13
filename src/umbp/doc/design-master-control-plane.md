@@ -20,7 +20,7 @@ allocator that lives on the peers. It runs as a single binary
 (`build/src/umbp/umbp_master`) exposing one gRPC service (`UMBPMaster`)
 plus an optional Prometheus metrics endpoint.
 
-Peers are processes that load `libmori_pybinds.so` (typically inside an
+Peers are processes that load `libmori_umbp_pybinds.so` (typically inside an
 SGLang or vLLM worker). Each peer owns:
 
 - a **`PeerDramAllocator`** — page-bitmap allocator for HBM/DRAM tiers,
