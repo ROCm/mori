@@ -276,15 +276,15 @@ class MediumBackend : public MetricSource {
   // call (the default) simply has no outbox worth gating.
   virtual void SetEventPublishing(bool /*enabled*/) {}
 
-  // Turn on the backend's OWN eviction, for a node with no master.
-  //
-  // Evict(keys) above is a master decision: it picks victims with a
-  // cluster-wide view of who else holds the key.  Nothing in the system calls
-  // it otherwise, so a masterless node needs some medium-local policy or it
-  // simply fills up.  A backend that already self-evicts (SsdBackend, whose
-  // PeerSsdManager runs its own watermark loop from UMBPSsdConfig) ignores
-  // this; the default is to ignore it.
-  virtual void EnableLocalEviction(double /*high_watermark*/, double /*low_watermark*/) {}
+  // ---- eviction ordering: the pool decides; a medium only supplies order ----
+
+  // Start the recency order EvictionCandidates() reads.  Off by default (it
+  // costs every read a touch).  Idempotent; seeds keys already owned.
+  virtual void TrackEvictionOrder() {}
+
+  // Up to `max_count` unprotected keys, coldest first, with the bytes each
+  // frees.  Frees nothing; Evict() re-checks.  Empty if no order is kept.
+  virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
 
   // ---- observability ----
   //
@@ -363,9 +363,8 @@ class MediumBackend : public MetricSource {
     return out;
   }
 
-  // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
-  // result per key, in request order — the peer service relies on that to sum
-  // freed bytes for a key mirrored across media.
+  // The medium's only eviction path, reached via PeerPool::Evict: frees keys a
+  // lease or pin doesn't protect and queues a REMOVE for each.  Idempotent.
   virtual std::vector<EvictResult> Evict(const std::vector<std::string>& keys) = 0;
 
   // ---- bootstrap (GetPeerInfo) ----

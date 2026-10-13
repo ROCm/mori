@@ -84,6 +84,16 @@ struct TierTransitionMetrics {
   uint64_t promoted_bytes = 0;
 };
 
+// Local watermark eviction counters; bytes freed are counted by
+// InstrumentedBackend.
+struct LocalEvictionMetrics {
+  uint64_t rounds = 0;        // passes that found a backend over its high watermark
+  uint64_t keys = 0;          // keys dropped or queued for demotion
+  uint64_t no_candidate = 0;  // passes where every key was leased or pinned
+  uint64_t stalled = 0;       // batches that freed nothing; the next wake retries
+  uint64_t master_keys = 0;   // of `keys`, those the candidate source ranked
+};
+
 struct ExternalKvHitCountEntry {
   std::string hash;
   uint64_t hit_count_total = 0;
@@ -158,6 +168,26 @@ struct EvictionCandidate {
   Location location;
   std::chrono::system_clock::time_point last_accessed_at;
   uint64_t size;
+};
+
+// One master eviction decision: free `key`'s copy on the `tier` medium.
+struct EvictionVictim {
+  std::string key;
+  TierType tier = TierType::UNKNOWN;
+
+  bool operator==(const EvictionVictim& other) const {
+    return key == other.key && tier == other.tier;
+  }
+};
+
+// A key offered for local eviction, with the (page-rounded) bytes it frees.
+struct EvictionOffer {
+  std::string key;
+  uint64_t bytes = 0;
+
+  bool operator==(const EvictionOffer& other) const {
+    return key == other.key && bytes == other.bytes;
+  }
 };
 
 // Ordering hint for IMasterMetadataStore::EnumerateEvictionCandidates.  This is

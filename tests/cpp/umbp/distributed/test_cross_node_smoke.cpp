@@ -98,6 +98,8 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_a.auto_peer_service_port = true;
     cfg_a.dram.buffer_sizes = {kBlockSize};
     cfg_a.dram_page_size = kBlockSize;
+    // These tiers are filled on purpose; leave eviction to the master's rounds.
+    cfg_a.eviction_mode = PeerEvictionMode::kMaster;
     client_a_ = std::make_unique<PoolClient>(std::move(cfg_a));
     ASSERT_TRUE(client_a_->Init());
 
@@ -110,6 +112,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_b.auto_peer_service_port = true;
     cfg_b.dram.buffer_sizes = {kBufSize};
     cfg_b.dram_page_size = kBlockSize;
+    cfg_b.eviction_mode = PeerEvictionMode::kMaster;
     client_b_ = std::make_unique<PoolClient>(std::move(cfg_b));
     ASSERT_TRUE(client_b_->Init());
 
@@ -242,6 +245,8 @@ class CrossNodeMultiPage : public ::testing::Test {
     cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     cfg.dram.buffer_sizes = setup.buffer_sizes;
+    // These tiers are filled on purpose; leave eviction to the master's rounds.
+    cfg.eviction_mode = PeerEvictionMode::kMaster;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(cli->Init());
     return cli;
@@ -542,6 +547,8 @@ class CrossNodeOverlap : public ::testing::Test {
     cfg.dram_page_size = kPageSize;
     if (staging_buffer_size > 0) cfg.staging_buffer_size = staging_buffer_size;
     cfg.dram.buffer_sizes = buffer_sizes;
+    // These tiers are filled on purpose; leave eviction to the master's rounds.
+    cfg.eviction_mode = PeerEvictionMode::kMaster;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(cli->Init());
     clients_.push_back(std::move(cli));

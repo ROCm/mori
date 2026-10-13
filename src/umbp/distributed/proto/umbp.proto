@@ -89,12 +89,16 @@ message RegisterClientRequest {
   bytes  engine_desc                  = 5;   // packed EngineDesc
   repeated string tags                = 13;  // opaque key=value labels (e.g. "sgl_role=prefill")
   repeated LogicalTierCapacity logical_tier_capacities = 14;
+  // The peer evicts at its own watermarks (GetEvictionCandidates); the master
+  // stops pushing EvictKey to it.  Re-sent on every heartbeat.
+  bool peer_driven_eviction = 15;
 }
 message RegisterClientResponse {
   uint64 heartbeat_interval_ms = 1;  // Recommended heartbeat interval
   uint64 ack_seq               = 2;  // Initial heartbeat seq peer should send (= 0)
   bool supports_max_allocatable_bytes = 3;
   bool supports_logical_tiers = 4;
+  bool supports_peer_driven_eviction = 5;
 }
 
 message UnregisterClientRequest {
@@ -142,6 +146,22 @@ message HeartbeatRequest {
   uint64 delta_seq_baseline = 6;    // valid for full-sync; master adopts this cursor
   repeated TierKvCount  tier_kv_counts  = 7; // live owned-key count per tier (client-reported)
   repeated LogicalTierCapacity logical_tier_capacities = 8;
+  bool peer_driven_eviction = 9;  // as in RegisterClientRequest
+}
+
+// A peer over its watermark asks for its own keys on one medium, coldest first
+// by the master's cluster-wide recency, until their sizes cover `bytes`.
+// Master-leased keys are skipped.
+message GetEvictionCandidatesRequest {
+  string   node_id      = 1;
+  TierType tier         = 2;
+  string   logical_tier = 3;  // empty: any logical tier on that medium
+  uint64   bytes        = 4;
+  uint32   max_keys     = 5;  // 0: server cap
+}
+message GetEvictionCandidatesResponse {
+  repeated string keys  = 1;
+  repeated uint64 sizes = 2;  // parallel to keys
 }
 message HeartbeatResponse {
   ClientStatus status            = 1;
@@ -370,6 +390,10 @@ service UMBPMaster {
   rpc RegisterClient  (RegisterClientRequest)   returns (RegisterClientResponse);
   rpc UnregisterClient(UnregisterClientRequest) returns (UnregisterClientResponse);
   rpc Heartbeat       (HeartbeatRequest)        returns (HeartbeatResponse);
+
+  // Peer-driven eviction: ranked victims for a peer over its watermark
+  rpc GetEvictionCandidates(GetEvictionCandidatesRequest)
+      returns (GetEvictionCandidatesResponse);
 
   // Router (read-only)
   rpc RouteGet        (RouteGetRequest)         returns (RouteGetResponse);
