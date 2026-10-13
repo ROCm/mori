@@ -298,6 +298,12 @@ class MediumBackend : public MetricSource {
   // keeps no order returns nothing and is therefore never evicted locally.
   virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
 
+  // Count these keys as just used, for a caller that used them without reading
+  // them here (it served them from a faster cache of its own).  Recency is the
+  // only thing that moves: no lease, no read.  Returns how many are held here;
+  // a medium that keeps no order holds them for nothing and returns 0.
+  virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or

@@ -1141,5 +1141,54 @@ TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
   unlink(fd_path.c_str());
 }
 
+// The recency hint crosses the process boundary and reaches the server's
+// paged medium, whose order an embedded deployment tracks for local eviction.
+TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
+  const std::string address =
+      "unix:///tmp/umbp_standalone_touch_" + std::to_string(getpid()) + ".grpc.sock";
+  const std::string grpc_path = standalone::UnixPathFromGrpcAddress(address);
+  const std::string fd_path = standalone::DeriveFdSocketPath(address);
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+
+  UMBPConfig server_cfg;
+  server_cfg.dram.capacity_bytes = 1 << 20;
+  server_cfg.ssd.enabled = false;
+  UMBPStandaloneProcessConfig sp_cfg;
+  sp_cfg.address = address;
+  sp_cfg.startup_timeout_ms = 5000;
+  server_cfg.standalone_process = sp_cfg;
+
+  standalone::StandaloneServer server(server_cfg, address);
+  ASSERT_TRUE(server.Start());
+  std::thread server_thread([&]() { server.Run(); });
+  auto client = CreateUMBPClient(server_cfg);
+
+  HostMemAllocator allocator;
+  HostBufferOptions opts;
+  opts.backing = HostBufferBacking::kAnonymousShm;
+  opts.prefault = false;
+  HostBufferHandle handle = allocator.Alloc(4096, opts);
+  ASSERT_TRUE(handle.valid());
+  auto* bytes = static_cast<unsigned char*>(handle.ptr);
+  ASSERT_TRUE(client->RegisterMemory(reinterpret_cast<uintptr_t>(handle.ptr), handle.mapped_size));
+  std::memset(bytes, 0x5a, 64);
+  ASSERT_TRUE(client->Put("touch-a", reinterpret_cast<uintptr_t>(bytes), 32));
+  ASSERT_TRUE(client->Put("touch-b", reinterpret_cast<uintptr_t>(bytes + 32), 32));
+
+  EXPECT_EQ(client->BatchTouch({"touch-a", "touch-missing", "touch-b"}), 2u);
+  EXPECT_EQ(client->BatchTouch({}), 0u);
+  // A touch is not a read and does not change what exists.
+  EXPECT_EQ(client->BatchExists({"touch-a", "touch-missing"}), (std::vector<bool>{true, false}));
+
+  client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
+  client->Close();
+  allocator.Free(handle);
+  server.Shutdown();
+  server_thread.join();
+  unlink(grpc_path.c_str());
+  unlink(fd_path.c_str());
+}
+
 }  // namespace
 }  // namespace mori::umbp
