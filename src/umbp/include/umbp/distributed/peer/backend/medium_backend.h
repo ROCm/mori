@@ -320,8 +320,10 @@ class MediumBackend : public MetricSource {
   virtual bool OwnsEvictionOrder() const { return false; }
 
   // Renew these keys' recency without reading them: a client looked them up to
-  // load next.  No-op for keys not held, or when no order is kept.
-  virtual void Touch(const std::vector<std::string>& /*keys*/) {}
+  // load next, or used them from a faster cache of its own.  Recency is the
+  // only thing that moves: no lease, no read.  Returns how many are held here;
+  // a medium that keeps no order, or counts none (SsdBackend), returns 0.
+  virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
 
   // ---- observability ----
   //

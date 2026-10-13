@@ -1005,8 +1005,9 @@ std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys)
 
 bool SsdBackend::OwnsEvictionOrder() const { return ssd_ != nullptr && ssd_->OrdersEviction(); }
 
-void SsdBackend::Touch(const std::vector<std::string>& keys) {
+size_t SsdBackend::Touch(const std::vector<std::string>& keys) {
   if (ssd_ != nullptr) ssd_->Touch(keys);
+  return 0;
 }
 
 std::vector<EvictionOffer> SsdBackend::EvictionCandidates(size_t max_count) {

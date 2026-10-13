@@ -131,7 +131,8 @@ class SsdBackend : public MediumBackend {
   // a staged or migration read holds.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
   bool OwnsEvictionOrder() const override;
-  void Touch(const std::vector<std::string>& keys) override;
+  // Renews the keys as a lookup does (PeerSsdManager::Touch); counts none.
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
