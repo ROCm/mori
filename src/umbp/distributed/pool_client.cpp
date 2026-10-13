@@ -5006,6 +5006,11 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
   return out;
 }
 
+size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
+  if (!initialized_ || keys.empty() || default_pool_ == nullptr) return 0;
+  return default_pool_->BatchTouch(keys);
+}
+
 // ---------------------------------------------------------------------------
 //  External KV
 // ---------------------------------------------------------------------------

@@ -311,6 +311,10 @@ class PageBackend : public MediumBackend {
   void TrackEvictionOrder() override;
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
 
+  // Moves held keys to the recent end of the order, as a read would, without
+  // the read's lease.  0 until TrackEvictionOrder().
+  size_t Touch(const std::vector<std::string>& keys) override;
+
   // ==================== Reaper ====================
 
   // Test seam: run one reaper sweep synchronously without the thread.

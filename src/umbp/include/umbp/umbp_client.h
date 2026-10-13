@@ -122,6 +122,19 @@ class IUMBPClient {
   /// Stops at the first key that does not exist (early-stop).
   virtual size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const = 0;
 
+  /// Tell the store these objects were just used without being read from it
+  /// -- the caller served them from a faster cache of its own -- so its local
+  /// eviction counts them as recently used.  Only recency moves: no read, no
+  /// lease, and keys not stored are skipped.  Only the media of the caller's
+  /// node see it: keys a pool placed on another node, and eviction the master
+  /// ranks, are unaffected.  Returns the copies touched, one per medium that
+  /// holds a key and keeps an eviction order (the SSD tier keeps none); a store
+  /// that keeps no eviction order (or an older server) returns 0.
+  virtual size_t BatchTouch(const std::vector<std::string>& keys) {
+    (void)keys;
+    return 0;
+  }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

@@ -1085,4 +1085,61 @@ TEST(PageBackendAutoFlush, FullSyncSnapshotClearsOutbox) {
   EXPECT_EQ(delta[0].kind, KvEvent::Kind::ADD);
 }
 
+// ---- Recency hints (Touch) ------------------------------------------------------
+
+namespace {
+
+// Ordered, with a 1 ms read lease so a read does not keep a key out of
+// EvictionCandidates for the rest of the test.
+std::unique_ptr<PageBackend> MakeOrderedBackend() {
+  auto backend = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{1});
+  backend->TrackEvictionOrder();
+  return backend;
+}
+
+void PutKey(PageBackend& backend, const std::string& key) {
+  auto slot = AllocateOk(backend, key, kPageSize);
+  ASSERT_TRUE(slot.has_value()) << key;
+  uint64_t bytes = 0;
+  ASSERT_TRUE(backend.Commit(slot->slot_id, key, bytes)) << key;
+}
+
+std::vector<std::string> OfferedOrder(PageBackend& backend) {
+  std::vector<std::string> keys;
+  for (const auto& offer : backend.EvictionCandidates(16)) keys.push_back(offer.key);
+  return keys;
+}
+
+}  // namespace
+
+TEST(PageBackendTouch, MovesRecencyWithoutALease) {
+  auto backend = MakeOrderedBackend();
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  ASSERT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"a", "b", "c"}));
+  EXPECT_EQ(backend->Touch({"a", "missing"}), 1u);
+  // Most recent now, and still offered at once: a touch takes no lease.
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c", "a"}));
+}
+
+TEST(PageBackendTouch, ExistsProbesLeaveTheOrderAlone) {
+  auto backend = MakeOrderedBackend();
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  for (int i = 0; i < 5; ++i) backend->BatchContains({"a", "b", "missing"});
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"a", "b", "c"}));
+  // A read is a use.
+  ASSERT_TRUE(backend->BatchResolve({"a"}, false).front().found);
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c", "a"}));
+}
+
+TEST(PageBackendTouch, DoesNothingUntilTheOrderIsTracked) {
+  auto backend = MakeAllocator();
+  PutKey(*backend, "a");
+  EXPECT_EQ(backend->Touch({"a"}), 0u);
+}
+
 }  // namespace mori::umbp

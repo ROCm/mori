@@ -842,6 +842,20 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  // A lookup in all but name: it moves recency, never bytes, and dereferences
+  // no caller memory, so it takes the lookup lock.
+  grpc::Status BatchTouch(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
+                          ::umbp::CountResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (shutdown_.load()) {
+      response->set_count(0);
+      return grpc::Status::OK;
+    }
+    response->set_count(client_->BatchTouch(keys));
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

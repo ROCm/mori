@@ -16,6 +16,10 @@ service UMBPStandalone {
   rpc Exists(KeyRequest) returns (BoolResponse);
   rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
   rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
+  // Recency hint for keys the caller used from its own faster cache; count =
+  // copies touched (media without an eviction order count 0).  Reads nothing,
+  // grants no lease.
+  rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);

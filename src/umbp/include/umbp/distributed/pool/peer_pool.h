@@ -135,6 +135,10 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // A caller's recency hint (IUMBPClient::BatchTouch), passed to every medium
+  // that holds the keys: their eviction order is the only thing that changes.
+  // Returns the number of (medium, key) copies touched.
+  size_t BatchTouch(const std::vector<std::string>& keys);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
