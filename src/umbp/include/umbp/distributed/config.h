@@ -99,16 +99,24 @@ struct EvictionConfig {
   double low_watermark = 0.7;
   std::chrono::seconds check_interval{5};
   std::chrono::seconds lease_duration{2};
-  size_t evict_batch_size = 32;
 
-  // Only timing fields are env-overridable here; watermarks and batch size
-  // have dedicated tuning paths and are intentionally excluded.
+  // A round frees one (node, tier)'s overage -- usage above its low watermark
+  // -- in BYTES.  This caps what one round may evict from one (node, tier);
+  // 0 means the whole overage, which is already at most (1 - low_watermark)
+  // of the tier.  Set it to throttle eviction work, e.g. to bound how much a
+  // demoting tier copies downstream per round.
+  uint64_t max_evict_bytes_per_round = 0;
+
+  // Watermarks are not env-overridable (they have dedicated tuning paths);
+  // timing and the round's byte limit are.
   static EvictionConfig FromEnvironment() {
     EvictionConfig cfg;
     cfg.check_interval =
         GetEnvSeconds("UMBP_EVICTION_CHECK_INTERVAL_SEC", cfg.check_interval, /*min_allowed=*/1);
     cfg.lease_duration =
         GetEnvSeconds("UMBP_LEASE_DURATION_SEC", cfg.lease_duration, /*min_allowed=*/1);
+    cfg.max_evict_bytes_per_round =
+        GetEnvUint64("UMBP_EVICT_MAX_BYTES_PER_ROUND", cfg.max_evict_bytes_per_round);
     return cfg;
   }
 };
