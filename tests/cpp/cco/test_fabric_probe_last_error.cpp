@@ -25,7 +25,7 @@
 // ccoCommCreate probes hipMemHandleTypeFabricCompat and falls back to the FD
 // path when it is unsupported. The failed probe leaves the runtime's sticky
 // last-error set; if it is not consumed, the next framework call that checks
-// hipGetLastError() (e.g. a torch allocation) raises "operation not supported".
+// hipGetLastError() (e.g. a torch kernel launch) reports it as its own error.
 // On hosts where the probe succeeds there is nothing to leak and the test
 // passes trivially.
 
