@@ -39,21 +39,17 @@
 namespace mori::umbp {
 
 namespace {
-// An eviction demotion that failed retryably goes to the back of the queue and
-// runs again until this long has passed since its first attempt; only then is
-// its copy dropped.  A time budget rather than a count, because the faults it
-// rides out -- an SSD staging arena full of reads, a write-error burst -- last
-// a wall-clock interval, and a short queue would burn a count in milliseconds.
+
+// How long a retryable eviction demotion keeps retrying before its copy is
+// dropped.  Time, not a count: the faults it rides out last a wall-clock
+// interval, and a short queue would burn a count in milliseconds.
 std::chrono::milliseconds EvictDemotionRetryBudget() {
   static const auto v = GetEnvMilliseconds("UMBP_EVICT_DEMOTION_RETRY_MS",
                                            std::chrono::milliseconds(30000), /*min_allowed=*/0);
   return v;
 }
-// Pause before re-running a retry when nothing else is queued, so a lone job
-// waiting out pressure does not spin the worker.
+// Pause before a lone retry, so waiting out pressure does not spin the worker.
 constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
-}  // namespace
-namespace {
 
 // One watermark scan queues at most this many keys; the worker tops the queue
 // up after each completed offload, so a tier still drains all the way down to
@@ -351,12 +347,8 @@ void PeerPool::TransitionWorkerLoop() {
             job.first_attempt = std::chrono::steady_clock::now();
           }
           const auto result = RunTransition(lock, job);
-          // An eviction's demotion that failed in a way that can clear (no space
-          // at the target, a write error) is tried again before its copy is
-          // given up: the copy is the only one left, and a reader may already
-          // have been told the key is here.  Only once the retry budget is spent,
-          // or the target can never take the key, is the evicted copy dropped,
-          // so the tier still frees.
+          // The evicted copy is the only one: retry what can clear, and drop it
+          // only once the budget is spent or the target can never take it.
           evict_retry =
               job.evict && !result.success && result.retryable &&
               std::chrono::steady_clock::now() - job.first_attempt < evict_demotion_retry_budget_;

@@ -176,9 +176,7 @@ class NoSpaceBackend final : public MockBackend {
   }
 };
 
-// Moves bytes like LocalCopyEngine, except that its first `failures` copies
-// fail -- the transient fault (a device or transport error) a demotion can hit
-// on the way down although the target has room.
+// LocalCopyEngine whose next `failures` copies fail.
 class FailingEngine final : public TransferEngine {
  public:
   explicit FailingEngine(int failures) : failures_(failures) {}
@@ -863,10 +861,9 @@ TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
   EXPECT_EQ(pool.TransitionMetrics().dropped, 1u);
 }
 
-// A demotion that fails on the way down (here: the target's commit) is tried
-// again, not abandoned -- the evicted copy is the only one, so giving up turns a
-// transient write error into a lost key.
-TEST(PeerPool, ATransientDemotionFailureIsRetriedNotDropped) {
+// A demotion copy that fails is retried, since the evicted copy is the only
+// one; it is dropped only once the retry budget runs out, so the tier frees.
+TEST(PeerPool, AFailedDemotionIsRetriedUntilItsBudgetRunsOut) {
   constexpr uint64_t kPageSize = 4096;
   FailingEngine engine(/*failures=*/0);
   BackendRegistry registry;
@@ -875,44 +872,28 @@ TEST(PeerPool, ATransientDemotionFailureIsRetriedNotDropped) {
   auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
-  CommitKey(&pool, "k");
+  CommitKey(&pool, "a");
+  CommitKey(&pool, "b");
 
-  engine.FailNext(2);  // the first two demotion copies fail; the third lands
-  auto evicted = pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  engine.FailNext(2);  // the first two copies fail; the third lands
+  auto evicted = pool.Evict({PoolEvictRequest{"a", TierType::DRAM}}, PoolEvictMode::kReclaim);
   EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kDemotionQueued);
-  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
-  EXPECT_TRUE(registry.Get("cold")->Contains("k")) << "the key was dropped, not demoted";
-  EXPECT_TRUE(pool.PlacementBackend("k").has_value());
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "a"));
+  EXPECT_TRUE(registry.Get("cold")->Contains("a")) << "dropped, not demoted";
   EXPECT_EQ(pool.TransitionMetrics().dropped, 0u);
   EXPECT_GE(pool.TransitionMetrics().failed, 2u) << "the failed attempts still count";
-}
-
-// ...but a target that never accepts it does not pin the source tier forever:
-// after the retries the evicted copy is dropped, so eviction still frees.
-TEST(PeerPool, APersistentDemotionFailureStillFreesTheTier) {
-  constexpr uint64_t kPageSize = 4096;
-  FailingEngine engine(/*failures=*/0);
-  BackendRegistry registry;
-  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
-  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4);
-  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
-  ASSERT_TRUE(compiled.ok()) << compiled.error;
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
-  CommitKey(&pool, "k");
 
   pool.SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds{50});
-  engine.FailNext(1000000);  // every demotion copy fails
-  pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
-  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
-  EXPECT_FALSE(registry.Get("cold")->Contains("k"));
-  EXPECT_FALSE(pool.PlacementBackend("k").has_value());
+  engine.FailNext(1000000);  // every copy fails
+  pool.Evict({PoolEvictRequest{"b", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "b"));
+  EXPECT_FALSE(registry.Get("cold")->Contains("b"));
+  EXPECT_FALSE(pool.PlacementBackend("b").has_value());
   EXPECT_EQ(pool.TransitionMetrics().dropped, 1u);
 }
 
-// No space at the target is pressure, not a verdict: an SSD reports it while
-// its staging arena is full of reads.  The demotion waits it out instead of
-// dropping the only copy -- dropping it lost keys a reader had just been told
-// were there.
+// No space at the target (an SSD whose staging is full of reads) is waited
+// out, not a reason to drop the only copy.
 TEST(PeerPool, ADemotionWaitsOutATargetWithNoRoomForNow) {
   constexpr uint64_t kPageSize = 4096;
   LocalCopyEngine engine;
