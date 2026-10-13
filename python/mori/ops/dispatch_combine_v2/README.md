@@ -51,35 +51,31 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
 | `intranode_kernels.py` | FlyDSL kernel factories: `make_dispatch` (+scales/replay), `make_combine` (gather) / `make_combine_scatter` (`_nop2p`, bf16/f32/fp8/fp4), `make_convert_dispatch_output` / `make_convert_combine_input` (StdMoE), `make_local_expert_count` |
 | `tuning_configs.py` | **flydsl** kernel geometry: per-(world,hidden,topk) block/warp lookup |
-| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape, topk and (dispatch only) dtype; an unswept shape gets a single-shot default |
+| `hip_tuning_configs.py` | **hip** kernel geometry, separate table (never borrows flydsl's); same `lookup` contract. Independent dispatch/combine tables, keyed by device, shape and topk, plus the dispatch dtype (`dispatch_dtype_str`: bf16/fp8/fp4) for dispatch and `quant_type` for combine; an unswept shape gets a single-shot default |
 | `internode_tuning_configs.py` | **hip** internode kernel geometry, a third table: token-count buckets keyed by device, shape, topk and dispatch dtype, carrying `(block_num, rdma_block_num, warp_num)` **per phase** — dispatch and combine are tuned to different values over one shared arena. The internode plans are compiled per geometry, so the backend walks the whole table at build time and `lookup` only picks a prebuilt bucket; `block_num` is clamped to the CU count |
 
-## gfx125x dispatch: selfFirst
+## gfx125x dispatch: slot reservation
 
-Always on wherever the slot allocator word lives in the cco window, which is the
-default; there is no switch for it. `MORI_EP_TOKOFF_EXT=1` (default off) moves the
-word of a single-host EP into a separate
-allocation (`TokOffExt` in `hip_backend.py`), where the local RMW costs nothing, and
-there the original protocol runs; an EP spanning hosts always keeps the word in the
-window, since its ranks cannot open each other's hipIpc handles.
+Where the slot allocator word lives in the cco window, which is the default, the
+blocks of a rank reserve their slots together: each block adds its token count for
+every destination, this rank included, into the rank's total for it, and the last
+block to arrive reserves the total with one RMW on that destination's word and
+publishes the first slot to the others. In the window the RMWs on one word
+serialize, so a rank makes one per destination per call instead of one per block.
+The blocks meet in a few hundred bytes of a `__device__` array in the dispatch
+kernel's own module, so neither the arena nor the caller allocates anything for it.
 
-With it on, the hip dispatch on gfx125x never makes a rank RMW its own
-slot allocator word: on memory mapped MTYPE_RW, that local RMW on the word the
-peers' remote RMWs also hit costs microseconds per call. A sender's slot in a peer
-is what its remote RMW returns, with no wait on that peer; once all of a rank's
-blocks have reserved, it publishes to every peer how many slots it took there,
-and each rank places its own tokens above the sum of those. The state this needs
-is a few hundred bytes of symmetric memory per arena that `EpDispatchPlan`
-allocates on the arena's communicator itself, so an arena built outside this
-package needs nothing for it.
+`MORI_EP_TOKOFF_EXT=1` (default off) moves the word of a single-host EP into a separate
+allocation (`TokOffExt` in `hip_backend.py`), and there every block reserves its
+own slots. An EP spanning hosts always keeps the word in the window, since its
+ranks cannot open each other's hipIpc handles.
 
-With it on, a call small enough to give every block at most 8 warp work units
-(512 tokens on the default 64 × 16 geometry at top-k 6) is spread over all the
-blocks instead of filling the low half: block b takes units [8b, 8b + 8) on its
-first 8 warps. Where the payload pass walks the token map, the warps left without
-a token then send all of the metadata, so the token warps go straight to the
-payload. Geometries with at most 8 warps per
-block, such as EP4's tuned 64 × 8, compile to the same code as without it.
+A call small enough to give every block at most 8 warp work units (512 tokens on
+the default 64 × 16 geometry at top-k 6) is spread over all the blocks instead of
+filling the low half: block b takes units [8b, 8b + 8) on its first 8 warps. Where
+the payload pass walks the token map, the warps left without a token then send all
+of the metadata, so the token warps go straight to the payload. Geometries with at
+most 8 warps per block, such as EP4's tuned 64 × 8, keep the plain map.
 
 ## Internode config
 

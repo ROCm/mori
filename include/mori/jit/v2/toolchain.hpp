@@ -50,6 +50,12 @@ struct Toolchain {
   // (mori.jit.config.detect_nic_type -> MORI_DEVICE_NIC), not here: one detector.
   std::string nic;
 
+  // ionic only. The host creates a collapsed CQ whenever the firmware supports it,
+  // and a kernel built without -DIONIC_CCQE polls that CQ as a ring and never sees
+  // a completion. Told by Python (mori.jit.core.is_ccqe_enabled ->
+  // MORI_DEVICE_IONIC_CCQE), like nic.
+  bool ionicCcqe = false;
+
   // -I flags, derived from sourceRoot.
   std::vector<std::string> IncludeDirs() const;
 
@@ -57,9 +63,11 @@ struct Toolchain {
   // runs must be in the cache key -- it is, because `Flags()` is hashed whole.
   std::vector<std::string> Flags() const;
 
-  // "<arch>_<nic>": the human-readable cache directory level. Correctness does
-  // not depend on it -- both components are inside the digest.
-  std::string Tag() const { return arch + "_" + (nic.empty() ? "none" : nic); }
+  // "<arch>_<nic>[_ccqe]": the human-readable cache directory level, laid out as
+  // v1's. Correctness does not depend on it -- every component is inside the digest.
+  std::string Tag() const {
+    return arch + "_" + (nic.empty() ? "none" : nic) + (ionicCcqe ? "_ccqe" : "");
+  }
 
   bool Valid() const { return !arch.empty() && !hipcc.empty() && !sourceRoot.empty(); }
 

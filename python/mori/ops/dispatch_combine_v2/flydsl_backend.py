@@ -74,6 +74,13 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 f"quant_type={cfg.quant_type!r} is the hip backend's gfx125x combine; "
                 "pass kernel_backend='hip'",
             )
+        # The config lets an asymmetric dtype through with fp8_blockwise for the
+        # hip push combine; this backend's fp8_blockwise scatter has no such path.
+        if cfg.is_asymmetric_dtype and cfg.quant_type != "none":
+            return (
+                f"quant_type={cfg.quant_type!r} with an asymmetric dtype is the hip "
+                "backend's gfx125x push combine; pass kernel_backend='hip'",
+            )
         return ()
 
     def __init__(self, cfg: EpDispatchCombineConfig, comm):

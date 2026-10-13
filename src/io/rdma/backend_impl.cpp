@@ -39,6 +39,7 @@
 #include "mori/io/logging.hpp"
 #include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
+#include "src/io/rdma/verbs_ops.hpp"
 #include "src/io/roctx_mori.hpp"  // ADDITIVE: async post-to-completion range stop
 namespace mori {
 namespace io {
@@ -276,7 +277,9 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
     }
 
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
-    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(devices, logger, std::move(handler));
+    asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(
+        devices, logger, std::move(handler),
+        [this](const PeerFailureReport& report) { peerFailures_.Report(report); });
     if (!asyncEventMonitor_ && logger) {
       logger->error("Failed to start RDMA async event monitor; continuing without it");
     }
@@ -284,7 +287,7 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 }
 
 RdmaManager::~RdmaManager() {
-  // Join the monitor thread first: its handler reaches back into this object and
+  // Join the monitor thread first: its handlers reach back into this object and
   // into endpoint ledgers, neither of which may be torn down under it.
   asyncEventMonitor_.reset();
 
@@ -569,7 +572,12 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
       MORI_IO_WARN("DestroyEndpointNoThrow: invalid devId={} for qpn={}", devId, ep.handle.qpn);
       return false;
     }
-    return deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
+    const bool destroyed = deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
+    // Drop it only once gone, so the number cannot be reused under a stale owner.
+    if (destroyed) {
+      peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
+    }
+    return destroyed;
   } catch (const std::exception& e) {
     MORI_IO_ERROR("DestroyEndpointNoThrow caught exception for devId={} qpn={}: {}", devId,
                   ep.handle.qpn, e.what());
@@ -585,6 +593,12 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
                                         application::RdmaEndpointHandle remote, TopoKeyPair topoKey,
                                         int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
+
+  // Before the transition below, which can itself raise a fatal event.
+  peerFailures_.RegisterQp(
+      PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
+      local.handle.portId, local.ibvHandle.cq);
+
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
   auto epConfig = GetRdmaEndpointConfig(devId);
@@ -606,6 +620,31 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   endpointsById_[id] = rt;
   endpointsEpoch_.fetch_add(1, std::memory_order_release);
   return id;
+}
+
+std::string RdmaManager::DeviceName(int devId) const {
+  if (devId < 0 || devId >= static_cast<int>(availDevices.size())) return {};
+  return availDevices[devId].first->Name();
+}
+
+bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.Pop(out); }
+
+bool RdmaManager::IsQpAlive(int devId, uint32_t qpNum) const {
+  return peerFailures_.IsQpAlive(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
+}
+
+void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText) {
+  PeerFailureReport report;
+  report.scope = FailureScope::kQp;
+  report.event.reason = PeerFailureReason::PEER_UNREACHABLE;
+  report.event.remoteEngineKey = ep.remoteEngineKey;
+  report.event.qpNum = ep.local.handle.qpn;
+  report.event.portNum = ep.local.handle.portId;
+  report.event.deviceName = DeviceName(ep.ldevId);
+  report.event.detail = std::string("completion status ") +
+                        (statusText != nullptr ? statusText : "unknown") +
+                        ": peer did not acknowledge within the transport retry budget";
+  peerFailures_.Report(report);
 }
 
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
@@ -781,7 +820,7 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
     wr.num_sge = 1;
 
     struct ibv_recv_wr* bad = nullptr;
-    SYSCALL_RETURN_ZERO(ibv_post_recv(qp, &wr, &bad));
+    SYSCALL_RETURN_ZERO(Verbs().PostRecv(qp, &wr, &bad));
   }
 }
 
@@ -803,7 +842,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
   struct ibv_wc wc[batchSize];
   int n = 0;
 
-  while ((n = ibv_poll_cq(cq, batchSize, wc)) > 0) {
+  while ((n = Verbs().PollCq(cq, batchSize, wc)) > 0) {
     for (int i = 0; i < n; ++i) {
       if (wc[i].status != IBV_WC_SUCCESS) {
         const bool isFlush = (wc[i].status == IBV_WC_WR_FLUSH_ERR);
@@ -831,6 +870,11 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                 "vendor_err={}",
                 wc[i].wr_id, static_cast<uint32_t>(wc[i].status), failureAdvice.statusText,
                 wc[i].qp_num, wc[i].vendor_err);
+          }
+
+          // Retries exhausted: the one status that is about the peer, not us.
+          if (wc[i].status == IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
+            rdma->RecordPeerUnreachable(ep, failureAdvice.statusText);
           }
         }
 
@@ -929,7 +973,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
         wr.sg_list = &sge;
         wr.num_sge = 1;
         struct ibv_recv_wr* bad = nullptr;
-        SYSCALL_RETURN_ZERO(ibv_post_recv(ep.local.ibvHandle.qp, &wr, &bad));
+        SYSCALL_RETURN_ZERO(Verbs().PostRecv(ep.local.ibvHandle.qp, &wr, &bad));
       } else if (wc[i].opcode == IBV_WC_SEND) {
         if (!IsNotifSendWrId(wc[i].wr_id)) {
           MORI_IO_WARN(
@@ -1039,7 +1083,7 @@ void NotifManager::MainLoop() {
 
         struct ibv_cq* cq = nullptr;
         void* evCtx = nullptr;
-        if (ibv_get_cq_event(ch, &cq, &evCtx)) continue;
+        if (Verbs().GetCqEvent(ch, &cq, &evCtx)) continue;
         ibv_ack_cq_events(cq, 1);
         ibv_req_notify_cq(cq, 0);
 
@@ -1436,13 +1480,14 @@ EpPairVec InterleaveEndpointsByLocalDevice(const EpPairVec& eps,
 RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
                                        std::vector<application::RdmaMemoryRegion> localMrPerEp,
                                        std::vector<application::RdmaMemoryRegion> remoteMrPerEp,
-                                       const EpPairVec& e, Executor* exec,
+                                       const EpPairVec& e, Executor* exec, RdmaManager* rdma,
                                        MemoryLocationType localLoc)
     : config(config),
       localMrPerEp(std::move(localMrPerEp)),
       remoteMrPerEp(std::move(remoteMrPerEp)),
       eps(e),
       executor(exec),
+      rdma_(rdma),
       localLoc_(localLoc) {}
 
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
@@ -1568,7 +1613,15 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 }
 
-bool RdmaBackendSession::Alive() const { return true; }
+bool RdmaBackendSession::Alive() const {
+  // Liveness of the transport, not progress of a transfer: only an observed fatal
+  // event makes this false, so a slow but reachable peer stays alive.
+  if (rdma_ == nullptr) return true;
+  for (const auto& ep : eps) {
+    if (!rdma_->IsQpAlive(ep.ldevId, ep.local.handle.qpn)) return false;
+  }
+  return true;
+}
 
 /* ----------------------------------------------------------------------------------------------
  */
@@ -1810,12 +1863,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
-                            executor.get(), local.loc);
+                            executor.get(), rdma.get(), local.loc);
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                            TransferStatus* status) {
   return notif->PopInboundTransferStatus(remote, id, status);
+}
+
+bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
+  if (!rdma) return false;
+  return rdma->PopPeerFailure(out);
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,

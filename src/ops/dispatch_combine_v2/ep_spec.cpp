@@ -25,7 +25,6 @@
 
 #include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -34,19 +33,6 @@
 namespace mori {
 namespace ops {
 namespace v2 {
-
-namespace {
-
-int EnvInt(const char* name, int current) {
-  const char* v = std::getenv(name);
-  if (!v || !*v) return current;
-  char* end = nullptr;
-  long parsed = std::strtol(v, &end, 10);
-  if (end == v || parsed <= 0) return current;
-  return static_cast<int>(parsed);
-}
-
-}  // namespace
 
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind) {
   EpCfg c;
@@ -68,6 +54,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "combineFp4");
   }
   c.combineFp4F32Scale = c.combineFp4 && req.combineFp4F32Scale;
+  if (req.combineFp8 && req.combineFp4) {
+    throw std::runtime_error(
+        "mori v2 ep: combineFp4 and combineFp8 each pick the push combine's wire format; set "
+        "one of them");
+  }
+  c.combineFp8 = (kind == EpKernelKind::Combine) && req.combineFp8;
 
   c.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -79,18 +71,12 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   const bool isDispatch = kind == EpKernelKind::Dispatch;
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
-  c.selfFirst = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
+  c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
-
-  // Overrides. The ONLY place the environment is read.
-  const char* blkVar = isDispatch ? "MORI_V2_EP_DISP_BLOCKS" : "MORI_V2_EP_COMB_BLOCKS";
-  const char* wrpVar = isDispatch ? "MORI_V2_EP_DISP_WARPS" : "MORI_V2_EP_COMB_WARPS";
-  c.blockNum = EnvInt(blkVar, c.blockNum);
-  c.warpPerBlock = EnvInt(wrpVar, c.warpPerBlock);
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and
@@ -107,10 +93,10 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
         "mori v2 ep: inconsistent config (world=" + std::to_string(c.worldSize) +
         " hidden=" + std::to_string(c.hiddenDim) + " topk=" + std::to_string(c.numExpertPerToken) +
         " wave=" + std::to_string(c.waveSize) + " warps=" + std::to_string(c.warpPerBlock) +
-        " blocks=" + std::to_string(c.blockNum) + " selfFirst=" + std::to_string(c.selfFirst) +
+        " blocks=" + std::to_string(c.blockNum) + " aggReserve=" + std::to_string(c.aggReserve) +
         "); token bytes must be 16 B aligned, topk must fit in a wavefront, "
         "worldSize must fit in one block (worldSize <= warpPerBlock * waveSize), and "
-        "selfFirst needs warpPerBlock >= 2, worldSize <= waveSize and blocks < 4096");
+        "aggReserve needs worldSize <= waveSize and blocks < 4096");
   }
   return c;
 }
@@ -158,22 +144,20 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
                               : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
   const char* body = is1250 ? gfx1250Body : portableBody;
-  // Scale staging is a macro rather than a Cfg read because the array is at file
-  // scope in the header, which the TU includes BEFORE kCfg exists. Emitted only
-  // when the feature is on, so a scaleBytes=0 TU is byte-identical to one built
-  // before this existed -- same text, same sha256, same cache entry.
+  // Scale staging is a macro rather than a Cfg read because the constants it feeds
+  // are at file scope in the header, which the TU reaches BEFORE kCfg exists (the
+  // #if there also picks kMetaFields). Emitted only when the feature is on, so a
+  // scaleBytes=0 TU is byte-identical to one built before this existed -- same
+  // text, same sha256, same cache entry.
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
-    // ROWS is the per-peer stride and SLOTS the total. They must be emitted as a
-    // pair: the staging is indexed peer*ROWS + destTokId, and sizing it from one
-    // while indexing with the other is an out-of-bounds write on peer > 0.
-    // BYTES is the caller's row, STRIDE what we lay it down at: staging reads one
-    // and writes the other.
+    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + destTokId, so
+    // it has to be the peer's full receive capacity and not the smaller per-peer
+    // share of the idx/wt pool. BYTES is the caller's row, STRIDE what we lay it
+    // down at: staging reads one and writes the other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
-                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) +
-                "\n#define MORI_EP_SCALE_SLOTS " +
-                std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) + "\n";
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
@@ -201,6 +185,7 @@ const std::vector<std::string>& EpSourceDeps() {
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
+  if (cfg.combineFp8) return EpEntryName(cfg, "combine_fp8");
   if (!cfg.combineFp4) return EpEntryName(cfg, "combine");
   return EpEntryName(cfg, cfg.combineFp4F32Scale ? "combine_fp4b" : "combine_fp4");
 }
@@ -210,9 +195,10 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  if (cfg.combineFp4 && !EpArchIs1250()) {
+  if (EpCombinePush(cfg) && !EpArchIs1250()) {
     throw std::runtime_error(
-        "mori v2 ep: the fp4 combine is gfx125x only (it moves every token through TDM)");
+        "mori v2 ep: the fp4/fp8 push combine is gfx125x only (it moves every token through "
+        "TDM)");
   }
   return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
 }

@@ -33,6 +33,8 @@ from mori.cpp import (
     EngineDesc,
     MemoryDesc,
     MemoryLocationType,
+    PeerFailureEvent,
+    PeerFailureReason,
     PollCqMode,
     RdmaBackendConfig,
     XgmiBackendConfig,

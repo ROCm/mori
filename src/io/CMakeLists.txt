@@ -1,5 +1,6 @@
 set(MORI_IO_SOURCES
     engine.cpp
+    peer_failure_tracker.cpp
     rdma/protocol.cpp
     rdma/backend_impl.cpp
     rdma/async_event_monitor.cpp
@@ -24,6 +25,11 @@ target_include_directories(
 target_link_libraries(mori_io mori_application hip::host mori_logging
                       mori_ibv_shim)
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
+if(ENABLE_IO_FAULT_INJECTION)
+  target_sources(mori_io PRIVATE rdma/fault_injector.cpp)
+  set_source_files_properties(rdma/fault_injector.cpp PROPERTIES LANGUAGE CXX)
+  target_compile_definitions(mori_io PUBLIC MORI_IO_FAULT_INJECTION)
+endif()
 set_target_properties(
   mori_io
   PROPERTIES BUILD_RPATH "$ORIGIN;${ROCM_PATH}/lib"

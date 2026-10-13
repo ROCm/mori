@@ -56,6 +56,8 @@ endif()
 
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
+option(ENABLE_IO_FAULT_INJECTION
+       "Compile MORI-IO verbs fault injection (tests only; never in production)" OFF)
 option(BUILD_COLLECTIVE "Whether to build mori collective library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
