@@ -20,9 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Peer-driven eviction end to end: a real master and a DRAM PoolClient over
-// gRPC.  The master's own rounds run every 5 s, so anything evicted well inside
-// that window was evicted by the node itself.
+// Eviction modes end to end: a real master and a DRAM PoolClient over gRPC.
+// The master's own rounds run every 5 s, so anything evicted well inside that
+// window was evicted by the node itself.
 
 #include <gtest/gtest.h>
 
@@ -70,7 +70,7 @@ class PeerDrivenEvictionTest : public ::testing::Test {
 
   // A master (advertising peer-driven eviction or not) and one 16-page DRAM
   // node with 0.9 / 0.5 watermarks.
-  PoolClient* Start(bool master_supports, bool node_requests) {
+  PoolClient* Start(bool master_supports, PeerEvictionMode mode) {
     MasterServerConfig master_cfg;
     master_cfg.listen_address = "0.0.0.0:0";
     master_cfg.registry_config.advertise_peer_driven_eviction = master_supports;
@@ -93,7 +93,7 @@ class PeerDrivenEvictionTest : public ::testing::Test {
     cfg.cache_remote_fetches = false;
     cfg.local_evict_high_watermark = 0.9;
     cfg.local_evict_low_watermark = 0.5;
-    cfg.peer_driven_eviction = node_requests;
+    cfg.eviction_mode = mode;
     client_ = std::make_unique<PoolClient>(std::move(cfg));
     if (!client_->Init()) client_.reset();
     return client_.get();
@@ -113,8 +113,8 @@ class PeerDrivenEvictionTest : public ::testing::Test {
   std::unique_ptr<PoolClient> client_;
 };
 
-TEST_F(PeerDrivenEvictionTest, NodeEvictsAtItsOwnWatermarkWithMasterRankedVictims) {
-  auto* node = Start(/*master_supports=*/true, /*node_requests=*/true);
+TEST_F(PeerDrivenEvictionTest, MasterRankedNodeEvictsTheMastersVictims) {
+  auto* node = Start(/*master_supports=*/true, PeerEvictionMode::kMasterRanked);
   ASSERT_NE(node, nullptr);
   ASSERT_TRUE(node->Master().PeerDrivenEviction());
 
@@ -140,18 +140,31 @@ TEST_F(PeerDrivenEvictionTest, NodeEvictsAtItsOwnWatermarkWithMasterRankedVictim
   for (int i = 8; i < 15; ++i) EXPECT_TRUE(Dram()->Contains(Key(i))) << i;
 }
 
-TEST_F(PeerDrivenEvictionTest, DramWaitsForTheMasterWithoutBothSidesOptingIn) {
-  const std::vector<std::pair<bool, bool>> cases = {{false, true}, {true, false}};
-  for (const auto& [master_supports, node_requests] : cases) {
-    SCOPED_TRACE(::testing::Message()
-                 << "master_supports=" << master_supports << " node_requests=" << node_requests);
-    auto* node = Start(master_supports, node_requests);
+TEST_F(PeerDrivenEvictionTest, EvictsLocallyUnlessTheModeIsMaster) {
+  struct Case {
+    bool master_supports;
+    PeerEvictionMode mode;
+    bool self_evicts;
+  };
+  // The default; master_ranked against an older master (falls back to local
+  // LRU); and master mode, which leaves DRAM to the master's rounds.
+  const std::vector<Case> cases = {{true, PeerEvictionMode::kLocal, true},
+                                   {false, PeerEvictionMode::kMasterRanked, true},
+                                   {true, PeerEvictionMode::kMaster, false}};
+  for (const auto& c : cases) {
+    SCOPED_TRACE(::testing::Message() << "master_supports=" << c.master_supports
+                                      << " mode=" << static_cast<int>(c.mode));
+    auto* node = Start(c.master_supports, c.mode);
     ASSERT_NE(node, nullptr);
-    EXPECT_FALSE(node->Master().PeerDrivenEviction());
-    PutKeys(0, 15);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    EXPECT_EQ(Dram()->OwnedKeyCount(), 15u);
-    EXPECT_EQ(node->LocalEvictionStats().rounds, 0u);
+    PutKeys(0, 15);  // 15 of 16 pages
+    if (c.self_evicts) {
+      EXPECT_TRUE(
+          WaitFor([&] { return Dram()->OwnedKeyCount() <= kPages / 2; }, std::chrono::seconds(3)));
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+      EXPECT_EQ(Dram()->OwnedKeyCount(), 15u);
+    }
+    EXPECT_EQ(node->LocalEvictionStats().master_keys, 0u) << "asked the master";
     Stop();
   }
 }

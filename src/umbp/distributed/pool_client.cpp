@@ -1092,39 +1092,37 @@ bool PoolClient::Init() {
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
 
-  // Local watermark eviction: SSD's own pair or the node pair; with
-  // peer_driven_eviction, a tiered policy's per-tier pair instead.  SSD and
-  // every medium without a master start now; paged media under a master wait
-  // for it to confirm peer-driven eviction (below).
-  if (const char* env = std::getenv("UMBP_PEER_DRIVEN_EVICTION")) {
-    config_.peer_driven_eviction = std::string_view(env) != "0";
+  // Local watermark eviction, for every medium unless a master's rounds own
+  // DRAM/HBM (eviction_mode kMaster; SSD always evicts locally).  A node that
+  // evicts for itself uses a tiered policy's per-tier watermarks when there
+  // is one; otherwise SSD's own pair, or the node pair for paged media.
+  {
+    static constexpr const char* kModes[] = {"local", "master_ranked", "master"};
+    const std::string mode =
+        GetEnvEnum("UMBP_EVICTION_MODE", kModes[static_cast<int>(config_.eviction_mode)],
+                   {kModes[0], kModes[1], kModes[2]});
+    config_.eviction_mode = mode == "master"          ? PeerEvictionMode::kMaster
+                            : mode == "master_ranked" ? PeerEvictionMode::kMasterRanked
+                                                      : PeerEvictionMode::kLocal;
   }
-  struct LocalEvictTarget {
-    uint32_t backend_id;
-    double high;
-    double low;
-  };
-  std::vector<LocalEvictTarget> deferred_local_evict;
+  const bool self_evicting = !master_client_ || config_.eviction_mode != PeerEvictionMode::kMaster;
   for (const auto& backend_config : backend_configs) {
     auto* backend = registry_.Get(backend_config.name);
     if (backend == nullptr) continue;
-    const uint32_t backend_id = registry_.BackendId(backend);
     const bool ssd = backend_config.tier == TierType::SSD;
-    LocalEvictTarget target{
-        backend_id,
-        ssd ? backend_config.ssd.ssd.high_watermark : config_.local_evict_high_watermark,
-        ssd ? backend_config.ssd.ssd.low_watermark : config_.local_evict_low_watermark};
-    if (config_.peer_driven_eviction && tier_graph != nullptr) {
+    if (!ssd && !self_evicting) continue;
+    const uint32_t backend_id = registry_.BackendId(backend);
+    double high = ssd ? backend_config.ssd.ssd.high_watermark : config_.local_evict_high_watermark;
+    double low = ssd ? backend_config.ssd.ssd.low_watermark : config_.local_evict_low_watermark;
+    if (self_evicting && tier_graph != nullptr) {
       if (const auto index = tier_graph->TierIndexForBackendId(backend_id)) {
-        target.high = tier_graph->NodeAt(*index).high_watermark;
-        target.low = tier_graph->NodeAt(*index).low_watermark;
+        high = tier_graph->NodeAt(*index).high_watermark;
+        low = tier_graph->NodeAt(*index).low_watermark;
       }
     }
-    if (!ssd && master_client_) {
-      deferred_local_evict.push_back(target);
-    } else if (!default_pool_->EnableLocalEviction(backend_id, target.high, target.low) && ssd) {
+    if (!default_pool_->EnableLocalEviction(backend_id, high, low) && ssd) {
       MORI_UMBP_ERROR("[PoolClient] backend '{}': invalid SSD watermarks high={} low={}",
-                      backend_config.name, target.high, target.low);
+                      backend_config.name, high, low);
       Shutdown();
       return false;
     }
@@ -1234,7 +1232,8 @@ bool PoolClient::Init() {
     const auto logical_caps = default_pool_ == nullptr
                                   ? std::map<std::string, LogicalTierCapacity>{}
                                   : default_pool_->LogicalTierCapacities();
-    master_client_->RequestPeerDrivenEviction(config_.peer_driven_eviction);
+    // A self-evicting node asks the master to leave it out of its rounds.
+    master_client_->RequestPeerDrivenEviction(self_evicting);
     auto status =
         master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes, logical_caps);
     if (!status.ok()) {
@@ -1242,19 +1241,21 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
-    // Peer-driven: this node evicts every medium at its own watermarks, with
-    // victims ranked by the master, and the master stops sending EvictKey.
-    if (master_client_->PeerDrivenEviction() && default_pool_ != nullptr) {
-      for (const auto& target : deferred_local_evict) {
-        default_pool_->EnableLocalEviction(target.backend_id, target.high, target.low);
-      }
+    if (self_evicting && !master_client_->PeerDrivenEviction()) {
+      MORI_UMBP_WARN(
+          "[PoolClient] master predates peer-driven eviction: it may also evict this node in its "
+          "rounds, and master_ranked falls back to local LRU");
+    } else if (config_.eviction_mode == PeerEvictionMode::kMasterRanked &&
+               default_pool_ != nullptr) {
       default_pool_->SetEvictionCandidateSource(
           [client = master_client_.get()](TierType tier, const std::string& logical_tier,
                                           uint64_t bytes) {
             return client->GetEvictionCandidates(tier, logical_tier, bytes, /*max_keys=*/0);
           });
-      MORI_UMBP_INFO("[PoolClient] peer-driven eviction ON (victims ranked by the master)");
     }
+    static constexpr const char* kModeNames[] = {"local", "master_ranked", "master"};
+    MORI_UMBP_INFO("[PoolClient] eviction mode: {}",
+                   kModeNames[static_cast<int>(config_.eviction_mode)]);
     if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
     if (weighted_placement && !master_client_->SupportsMaxAllocatableCapacity()) {
       MORI_UMBP_WARN(

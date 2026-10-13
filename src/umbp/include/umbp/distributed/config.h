@@ -233,6 +233,12 @@ struct BackendInstanceConfig {
   uint32_t placement_weight = 1;
 };
 
+enum class PeerEvictionMode {
+  kLocal,         // at its own watermarks, by its own LRU; never asks the master
+  kMasterRanked,  // at its own watermarks, victims ranked by the master
+  kMaster,        // the master's EvictKey rounds (SSD still evicts locally)
+};
+
 struct PoolClientConfig {
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
@@ -310,17 +316,16 @@ struct PoolClientConfig {
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
-  // Local eviction watermarks for DRAM/HBM (SSD has its own pair), used
-  // without a master or in peer-driven mode; with peer_driven_eviction a
-  // tiered policy's per-tier pair takes precedence.  From UMBPDramConfig.
+  // Local eviction watermarks for DRAM/HBM (SSD has its own pair).  Unless
+  // eviction_mode is kMaster, a tiered policy's per-tier pair takes
+  // precedence.  From UMBPDramConfig.
   double local_evict_high_watermark = 0.9;
   double local_evict_low_watermark = 0.7;
 
-  // With a master: evict every medium at this node's own watermarks, taking
-  // victims from the master's ranking (GetEvictionCandidates), instead of
-  // waiting for EvictKey.  Needs a master that supports it.  Opt-in for now;
-  // env UMBP_PEER_DRIVEN_EVICTION overrides (0 / 1).
-  bool peer_driven_eviction = false;
+  // How this node evicts when it has a master (env UMBP_EVICTION_MODE =
+  // local | master_ranked | master).  Without a master it always evicts
+  // locally.  In every mode it still serves the master's EvictKey.
+  PeerEvictionMode eviction_mode = PeerEvictionMode::kLocal;
 
   UMBPCopyPipelineConfig copy_pipeline = [] {
     UMBPCopyPipelineConfig c;
