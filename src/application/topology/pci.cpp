@@ -21,12 +21,16 @@
 // SOFTWARE.
 #include "mori/application/topology/pci.hpp"
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -37,26 +41,109 @@
 #include <unordered_map>
 #include <unordered_set>
 
-extern "C" {
-#include <pci/pci.h>
-}
-
 namespace mori {
 namespace application {
 
-bool IsUnderRootComplex(struct pci_dev* dev) {
-  char devpath[128];
-  snprintf(devpath, sizeof(devpath), "/sys/bus/pci/devices/%04x:%02x:%02x.%d", dev->domain,
-           dev->bus, dev->dev, dev->func);
+namespace {
+
+constexpr const char* kSysfsPciDevices = "/sys/bus/pci/devices";
+
+// PCI configuration header offsets (PCI Local Bus Specification).
+constexpr off_t kCfgHeaderType = 0x0e;
+constexpr off_t kCfgPrimaryBus = 0x18;
+constexpr off_t kCfgSecondaryBus = 0x19;
+constexpr off_t kCfgSubordinateBus = 0x1a;
+
+constexpr uint8_t kHeaderTypeNormal = 0x00;
+constexpr uint8_t kHeaderTypeBridge = 0x01;
+
+constexpr uint16_t kClassBridgePci = 0x0604;
+constexpr uint8_t kBaseClassNetwork = 0x02;
+
+// One PCI function as described by sysfs. Unprivileged readers of sysfs
+// "config" only see the first 64 bytes of configuration space, which covers
+// every field read here.
+struct SysfsPciDev {
+  uint16_t domain{0};
+  uint8_t bus{0};
+  uint8_t dev{0};
+  uint8_t func{0};
+  uint16_t deviceClass{0};  // class code without the programming interface byte
+  NumaNodeId numaNode{-1};
+  uint8_t headerType{0};
+  uint8_t primaryBus{0};
+  uint8_t secondaryBus{0};
+  uint8_t subordinateBus{0};
+
+  PciBusId BusId() const { return PciBusId(domain, bus, dev, func); }
+};
+
+bool ReadSysfsLine(const std::string& path, std::string& out) {
+  std::ifstream f(path);
+  return static_cast<bool>(std::getline(f, out));
+}
+
+bool ReadSysfsPciDev(const std::string& name, SysfsPciDev& out) {
+  std::vector<uint64_t> bdf = ParseBdfFromString(name);
+  if (bdf.size() != 4) return false;
+  out.domain = bdf[0];
+  out.bus = bdf[1];
+  out.dev = bdf[2];
+  out.func = bdf[3];
+
+  const std::string dir = std::string(kSysfsPciDevices) + "/" + name;
+
+  std::string line;
+  if (!ReadSysfsLine(dir + "/class", line)) return false;
+  out.deviceClass = static_cast<uint16_t>(strtoul(line.c_str(), nullptr, 16) >> 8);
+
+  out.numaNode = -1;
+  if (ReadSysfsLine(dir + "/numa_node", line)) out.numaNode = strtol(line.c_str(), nullptr, 10);
+
+  int fd = open((dir + "/config").c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  uint8_t cfg[kCfgSubordinateBus + 1];
+  ssize_t n = pread(fd, cfg, sizeof(cfg), 0);
+  close(fd);
+  if (n != static_cast<ssize_t>(sizeof(cfg))) return false;
+
+  out.headerType = cfg[kCfgHeaderType] & 0x7f;
+  out.primaryBus = cfg[kCfgPrimaryBus];
+  out.secondaryBus = cfg[kCfgSecondaryBus];
+  out.subordinateBus = cfg[kCfgSubordinateBus];
+  return true;
+}
+
+std::vector<SysfsPciDev> ScanSysfsPci() {
+  std::vector<SysfsPciDev> devs;
+  DIR* d = opendir(kSysfsPciDevices);
+  if (d == nullptr) return devs;
+  while (struct dirent* e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;
+    SysfsPciDev dev;
+    if (ReadSysfsPciDev(e->d_name, dev)) devs.push_back(dev);
+  }
+  closedir(d);
+  std::sort(devs.begin(), devs.end(), [](const SysfsPciDev& a, const SysfsPciDev& b) {
+    return a.BusId().packed < b.BusId().packed;
+  });
+  return devs;
+}
+
+bool IsUnderRootComplex(const SysfsPciDev& dev) {
+  const std::string devpath = std::string(kSysfsPciDevices) + "/" + dev.BusId().String();
 
   char link[256], parent[256];
-  ssize_t len = readlink(devpath, link, sizeof(link) - 1);
+  ssize_t len = readlink(devpath.c_str(), link, sizeof(link) - 1);
+  if (len < 0) return false;
   link[len] = '\0';
 
   strcpy(parent, dirname(link));
   const char* last = basename(parent);
   return strncmp(last, "pci", 3) == 0;
 }
+
+}  // namespace
 
 bool IsBdfString(const std::string& s) {
   static const std::regex bdfRegex(R"(^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$)");
@@ -256,14 +343,14 @@ TopoSystemPci::TopoSystemPci() : pathCache() {
 
 TopoSystemPci::~TopoSystemPci() {}
 
-TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
-  uint16_t cls = dev->device_class;
+static TopoNodePci* CreateTopoNodePciFrom(const SysfsPciDev& dev) {
+  uint16_t cls = dev.deviceClass;
   uint16_t baseCls = (cls >> 8);
-  PciBusId bus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func);
-  NumaNodeId numa = dev->numa_node;
-  if (cls == PCI_CLASS_BRIDGE_PCI) {
+  PciBusId bus = dev.BusId();
+  NumaNodeId numa = dev.numaNode;
+  if (cls == kClassBridgePci) {
     return TopoNodePci::CreateBridge(bus, numa);
-  } else if (baseCls == PCI_BASE_CLASS_NETWORK) {
+  } else if (baseCls == kBaseClassNetwork) {
     return TopoNodePci::CreateNet(bus, numa);
   } else if (cls == 0x1200 || cls == 0x0300 || cls == 0x0302) {
     // 0x1200: Processing Accelerator (data-center GPUs)
@@ -276,48 +363,43 @@ TopoNodePci* CreateTopoNodePciFrom(pci_dev* dev) {
 }
 
 void TopoSystemPci::Load() {
-  struct pci_access* pacc = pci_alloc();
-  pci_init(pacc);
-  pci_scan_bus(pacc);
+  const std::vector<SysfsPciDev> devs = ScanSysfsPci();
 
-  std::unordered_map<uint64_t, pci_dev*> dsp2dev;
-  std::unordered_map<uint64_t, pci_dev*> bus2dev;
+  std::unordered_map<uint64_t, const SysfsPciDev*> dsp2dev;
+  std::unordered_map<uint64_t, const SysfsPciDev*> bus2dev;
   std::unordered_set<uint32_t> domains;
 
   root = TopoNodePci::CreateVirtualRoot();
   pcis.emplace(root->BusId().packed, root);
 
   // Collect all pcie nodes
-  for (struct pci_dev* dev = pacc->devices; dev; dev = dev->next) {
-    pci_fill_info(dev, PCI_FILL_CLASS | PCI_FILL_NUMA_NODE);
-    uint8_t headerType = pci_read_byte(dev, PCI_HEADER_TYPE) & 0x7f;
-    if ((headerType != PCI_HEADER_TYPE_NORMAL) && (headerType != PCI_HEADER_TYPE_BRIDGE)) continue;
+  for (const SysfsPciDev& dev : devs) {
+    if ((dev.headerType != kHeaderTypeNormal) && (dev.headerType != kHeaderTypeBridge)) continue;
 
     TopoNodePci* node = CreateTopoNodePciFrom(dev);
     if (node == nullptr) continue;
 
-    domains.insert(dev->domain);
+    domains.insert(dev.domain);
     pcis.emplace(node->BusId().packed, node);
 
-    if (headerType == PCI_HEADER_TYPE_BRIDGE) {
+    if (dev.headerType == kHeaderTypeBridge) {
       // Use a wider counter than the bus numbers themselves: a bridge may report
       // a subordinate bus of 0xff (e.g. empty downstream ports on some NICs), and
       // a uint8_t loop variable would wrap from 0xff back to 0 and spin forever.
-      uint32_t secondary = pci_read_byte(dev, PCI_SECONDARY_BUS);
-      uint32_t subordinate = pci_read_byte(dev, PCI_SUBORDINATE_BUS);
+      uint32_t secondary = dev.secondaryBus;
+      uint32_t subordinate = dev.subordinateBus;
       for (uint32_t i = secondary; i <= subordinate; i++) {
-        uint64_t dspBusId = PciBusId(dev->domain, i, 0, 0).packed;
+        uint64_t dspBusId = PciBusId(dev.domain, i, 0, 0).packed;
         if (dsp2dev.find(dspBusId) != dsp2dev.end()) {
-          struct pci_dev* lastDev = dsp2dev[dspBusId];
-          if (pci_read_byte(dev, PCI_PRIMARY_BUS) < pci_read_byte(lastDev, PCI_PRIMARY_BUS))
-            continue;
+          const SysfsPciDev* lastDev = dsp2dev[dspBusId];
+          if (dev.primaryBus < lastDev->primaryBus) continue;
         }
-        dsp2dev[dspBusId] = dev;
-        assert(dev->bus == pci_read_byte(dev, PCI_PRIMARY_BUS));
+        dsp2dev[dspBusId] = &dev;
+        assert(dev.bus == dev.primaryBus);
       }
     }
 
-    bus2dev.insert({node->BusId().packed, dev});
+    bus2dev.insert({node->BusId().packed, &dev});
   }
 
   // Create root port
@@ -347,11 +429,10 @@ void TopoSystemPci::Load() {
     uint64_t parentDsp = PciBusId(busId.Domain(), busId.Bus(), 0, 0).packed;
     uint64_t parentBus = 0;
     if (dsp2dev.find(parentDsp) == dsp2dev.end()) {
-      assert(IsUnderRootComplex(bus2dev[busId.packed]));
+      assert(IsUnderRootComplex(*bus2dev[busId.packed]));
       parentBus = PciBusId(busId.Domain(), 0, 0, 0).packed;
     } else {
-      pci_dev* dev = dsp2dev[parentDsp];
-      parentBus = PciBusId(dev->domain, dev->bus, dev->dev, dev->func).packed;
+      parentBus = dsp2dev[parentDsp]->BusId().packed;
     }
 
     // Prevent loopback to self, this could happen in SR-IOV mode where all devices directly connect
@@ -364,8 +445,6 @@ void TopoSystemPci::Load() {
     node->SetUpstreamPort(parent);
     parent->AddDownstreamPort(node);
   }
-
-  pci_cleanup(pacc);
 }
 
 void TopoSystemPci::Validate() {
