@@ -180,3 +180,92 @@ payload per dtype, `hidden*2` for bf16). Indicative bf16 numbers on **MI308X
 | 8192 | 314 GB/s | 323 GB/s |
 
 Cross-impl (v2 vs mori v1) latency tables for fp8/fp4 are in PR ROCm/mori#448.
+
+## Perf (AsyncLL)
+
+AsyncLL (`async_ll=True`) splits each phase into a send half and a recv half, so
+a caller can put compute between them. The nine kernels and the transports are
+described in `src/ops/dispatch_combine_v2/ep_asyncll_kernel.hpp`.
+
+**Read the numbers below with one caveat.** The benchmark calls `send` and then
+`recv` with nothing in between, which is the one thing AsyncLL exists to fill.
+It therefore measures the cost of the protocol -- a payload staged three times
+(input -> staging, staging -> peer, peer -> output), because that is the shape an
+RDMA leg needs -- and none of the benefit. These tables say the port is correct
+and what it costs; whether AsyncLL pays for itself needs an end-to-end MoE run
+with real expert compute in the seam, which is not measured here.
+
+### Cross-node, EP16 (2 x MI355X gfx950, 8 GPUs each)
+
+hidden 7168, top-k 8, bf16, `--cmd bench`. Totals in us (dispatch + combine);
+each token count's three arms were run interleaved in one window, so a node
+stolen mid-batch biases all three equally.
+
+| tok/rank | v2 asyncll | v2_ll | v1 async_ll | vs v1 |
+|---:|---:|---:|---:|---:|
+| 64   |  320.1 |  252.9 |  561.7 | -43.0% |
+| 128  |  419.9 |  212.6 |  430.6 |  -2.4% |
+| 256  |  684.0 |  322.5 |  694.0 |  -1.4% |
+| 512  | 1243.9 |  521.0 | 1232.1 |  +0.9% |
+| 1024 | 2618.8 | 1585.9 | 2441.2 |  +7.3% |
+| 2048 | 4559.6 | 1755.7 | 4545.2 |  +0.3% |
+
+**Against v1: parity.** Within ±7% from 128 tokens up, +0.3% at 2048. The two are
+the same protocol over different transports, so tracking this closely is the
+evidence that the cco port preserves it. RDMA bandwidth agrees digit for digit
+at 2048 -- 25.2/26.2 GB/s for v2 against 25.7/25.8 for v1.
+
+The -43% at 64 tokens is **not** a win. v1 launches with `block=auto warp=auto
+rdma=auto` and its autotune picks badly in that band: v1 is *slower* at 64
+tokens (561.7 us) than at 128 (430.6 us). Our geometry is fixed, so we do not
+share the dip.
+
+**Against v2_ll: 1.3x to 2.6x slower, and that is topological, not a tuning
+gap.** v2_ll's RDMA bandwidth at 2048 is 64/71 GB/s against our 25/26. Its proxy
+model has each rank talk only to its own-numbered rank on the far node, so the
+traffic rides one fat same-rail link; AsyncLL addresses peers individually
+(`SendBufSlotOffset` is per-PE), which spreads the same bytes over eight thinner
+cross-rail QPs that never fill. That is the cost of the per-PE addressing, not
+something a knob reaches. See `_make_dev_comm` in `hip_backend.py` for why
+AsyncLL has to ask for `GDA_CONNECTION_CROSSNODE` where the others take RAIL.
+
+### Single-node, EP4 (MI455X gfx1250, wave32)
+
+hidden 7168, top-k 8, bf16, CUDA graph, 50 iters. `pair_us` = dispatch + combine.
+
+| tok/rank | asyncll (sdma) | v2 native | delta |
+|---:|---:|---:|---:|
+| 64   |  90.3 us |  67.2 us | +34.4% |
+| 128  |  99.9 us |  65.0 us | +53.7% |
+| 256  | 122.7 us |  73.7 us | +66.5% |
+| 512  | 156.8 us |  93.7 us | +67.3% |
+| 1024 | 222.1 us | 148.9 us | +49.2% |
+| 2048 | 355.9 us | 249.2 us | +42.8% |
+
+Per-rank payload bandwidth, dispatch / combine: 68/79 against 79/130 GB/s at 64
+tokens, 505/736 against 688/1129 at 2048.
+
+Losing to the native intranode path is expected and is the same shape MI355X
+shows at EP8: native writes straight into the peer, AsyncLL stages. On a single
+node the staging buys nothing, because there is no RDMA leg for it to feed.
+
+`v2_asyncll_lsa` has no row: the LSA transport does not complete on gfx1250 (it
+hangs rather than failing, undiagnosed). The host gate refuses it on gfx125x so
+it fails immediately instead. `v1_asyncll` has no row either -- v1 is the shmem
+path and does not run on this arch.
+
+### Reproducing
+
+```bash
+# four-way single-node comparison, writes JSON + a table under /tmp/mori_bench
+MORI_ENABLE_SDMA=1 bash tools/bench_ep_asyncll_compare.sh --world-size 8
+
+# cross-node, one arm at a time (the v2 and v1 entries take different flags)
+tools/run_internode_test.sh --rank {0,1} --master-addr <ip> --ifname <nic> \
+  --entry tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py \
+  --cmd bench --kernel-type asyncll --dtype bf16 --hidden-dim 7168 --topk 8 \
+  --max-tokens 128
+```
+
+Both need `MORI_ENABLE_SDMA=1` for the sdma transport; without it cco creates no
+queues and every transfer is a silent no-op (the host gate catches this).
