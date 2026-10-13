@@ -182,8 +182,8 @@
   "Reads served by each logical tier of this client's pool"
 
 // --- Local watermark eviction ----------------------------------------------
-// event=round|key|no_candidate|stalled (LocalEvictionMetrics); bytes freed are
-// in the backend evict series.
+// event=round|key|no_candidate|stalled|master_key (LocalEvictionMetrics); bytes
+// freed are in the backend evict series.
 
 #define MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT "mori_umbp_client_local_evict_total"
 #define MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP \

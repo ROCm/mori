@@ -84,6 +84,16 @@ struct TierTransitionMetrics {
   uint64_t promoted_bytes = 0;
 };
 
+// Local watermark eviction counters; bytes freed are counted by
+// InstrumentedBackend.
+struct LocalEvictionMetrics {
+  uint64_t rounds = 0;        // passes that found a backend over its high watermark
+  uint64_t keys = 0;          // keys dropped or queued for demotion
+  uint64_t no_candidate = 0;  // passes where every key was leased or pinned
+  uint64_t stalled = 0;       // batches that freed nothing; the next wake retries
+  uint64_t master_keys = 0;   // of `keys`, those the candidate source ranked
+};
+
 struct ExternalKvHitCountEntry {
   std::string hash;
   uint64_t hit_count_total = 0;

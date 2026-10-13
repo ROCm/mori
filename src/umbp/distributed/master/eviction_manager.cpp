@@ -50,6 +50,51 @@ EvictionManager::EvictionManager(IMasterMetadataStore& store, const EvictionConf
 
 EvictionManager::~EvictionManager() { Stop(); }
 
+void EvictionManager::SetPeerDriven(const std::string& node_id, bool peer_driven) {
+  std::lock_guard<std::mutex> lock(peer_driven_mutex_);
+  if (peer_driven) {
+    if (peer_driven_.insert(node_id).second) {
+      MORI_UMBP_INFO("[EvictionManager] node {} evicts for itself; no EvictKey rounds", node_id);
+    }
+  } else {
+    peer_driven_.erase(node_id);
+  }
+}
+
+bool EvictionManager::PeerDriven(const std::string& node_id) const {
+  std::lock_guard<std::mutex> lock(peer_driven_mutex_);
+  return peer_driven_.count(node_id) != 0;
+}
+
+std::vector<EvictionCandidate> SelectPeerEvictionCandidates(
+    const IMasterMetadataStore& store, const std::string& node_id, TierType tier,
+    const std::string& logical_tier, uint64_t bytes, size_t max_keys,
+    std::chrono::system_clock::time_point now) {
+  if (max_keys == 0 || max_keys > kMaxPeerEvictionCandidates) {
+    max_keys = kMaxPeerEvictionCandidates;
+  }
+  const NodeTierKey bucket{node_id, tier};
+  // A logical-tier filter drops rows after the store returns them, so it
+  // cannot cap.
+  auto by_bucket = store.EnumerateEvictionCandidates(
+      {bucket}, EvictionOrder::kLeastRecentlyAccessed, logical_tier.empty() ? max_keys : 0, now);
+  auto it = by_bucket.find(bucket);
+  if (it == by_bucket.end()) return {};
+  auto& rows = it->second;
+  // The order is only a hint to the store.
+  std::sort(rows.begin(), rows.end(),
+            [](const auto& a, const auto& b) { return a.last_accessed_at < b.last_accessed_at; });
+  std::vector<EvictionCandidate> out;
+  uint64_t covered = 0;
+  for (auto& row : rows) {
+    if (out.size() >= max_keys || covered >= bytes) break;
+    if (!logical_tier.empty() && row.location.logical_tier != logical_tier) continue;
+    covered += row.size;
+    out.push_back(std::move(row));
+  }
+  return out;
+}
+
 void EvictionManager::Start() {
   if (running_.load(std::memory_order_relaxed)) return;
   running_.store(true, std::memory_order_relaxed);
@@ -100,6 +145,7 @@ void EvictionManager::RunOnce() {
   std::map<NodeTierKey, uint64_t> bytes_to_free;
 
   for (const auto& client : clients) {
+    if (PeerDriven(client.node_id)) continue;
     for (const auto& [tier, cap] : client.tier_capacities) {
       // No tier is special-cased here any more (backend-agnostic refactor
       // Phase 4).  The old `if (tier == SSD) continue` existed because EvictKey

@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -84,15 +85,6 @@ struct PoolEvictResult {
   std::string key;
   uint64_t bytes_freed = 0;  // by the time Evict returned; 0 for a queued demotion
   PoolEvictOutcome outcome = PoolEvictOutcome::kNone;
-};
-
-// Local watermark eviction counters; bytes freed are counted by
-// InstrumentedBackend.
-struct LocalEvictionMetrics {
-  uint64_t rounds = 0;        // passes that found a backend over its high watermark
-  uint64_t keys = 0;          // keys dropped or queued for demotion
-  uint64_t no_candidate = 0;  // passes where every key was leased or pinned
-  uint64_t stalled = 0;       // batches that freed nothing; the next wake retries
 };
 
 // Why a key is being removed. A tiered pool answers the two intents
@@ -164,6 +156,13 @@ class PeerPool {
   // Test seam: one synchronous pass.  Returns keys dropped or queued.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
 
+  // Victims for a backend over its watermark, coldest first, before the
+  // medium's own order: (tier, logical tier, bytes) -> offers, or nullopt when
+  // unavailable.  The master's GetEvictionCandidates in peer-driven mode.
+  using EvictionCandidateSource = std::function<std::optional<std::vector<EvictionOffer>>(
+      TierType tier, const std::string& logical_tier, uint64_t bytes)>;
+  void SetEvictionCandidateSource(EvictionCandidateSource source);
+
  private:
   struct PendingPlacement {
     uint32_t backend_id = BackendRegistry::kMaxBackends;
@@ -203,6 +202,8 @@ class PeerPool {
   void StopLocalEviction();
   size_t LocalEvictionPass();  // lowest tier first; returns keys evicted
   size_t ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermarks& watermarks);
+  std::optional<std::vector<EvictionOffer>> RankedCandidates(uint32_t backend_id, TierType tier,
+                                                             uint64_t bytes);
 
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
@@ -307,6 +308,9 @@ class PeerPool {
   std::atomic<uint64_t> local_evict_keys_{0};
   std::atomic<uint64_t> local_evict_no_candidate_{0};
   std::atomic<uint64_t> local_evict_stalled_{0};
+  std::atomic<uint64_t> local_evict_master_keys_{0};
+  EvictionCandidateSource candidate_source_;  // guarded by local_evict_mutex_
+  std::map<uint32_t, std::chrono::steady_clock::time_point> last_ranked_query_;  // pass thread
 };
 
 }  // namespace mori::umbp

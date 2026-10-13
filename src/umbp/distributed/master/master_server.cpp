@@ -291,6 +291,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                             "node is already alive and cannot be re-registered");
       }
 
+      NotePeerDriven(request->node_id(), request->peer_driven_eviction());
       UpdateClientCountMetric();
       UpdateClientCapacityMetrics(request->node_id(), caps);
       UpdateClientLogicalTierMetrics(request->node_id(), registration.logical_tier_capacities);
@@ -301,6 +302,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->set_ack_seq(0);
       response->set_supports_max_allocatable_bytes(config_.advertise_max_allocatable_bytes);
       response->set_supports_logical_tiers(config_.advertise_logical_tiers);
+      response->set_supports_peer_driven_eviction(config_.advertise_peer_driven_eviction);
       return grpc::Status::OK;
     });
   }
@@ -310,6 +312,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
                                 ::umbp::UnregisterClientResponse* /*response*/) override {
     return GuardStore("UnregisterClient", [&]() -> grpc::Status {
       store_.UnregisterClient(request->node_id());
+      NotePeerDriven(request->node_id(), false);
       UpdateClientCountMetric();
       return grpc::Status::OK;
     });
@@ -320,6 +323,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   grpc::Status Heartbeat(grpc::ServerContext* /*ctx*/, const ::umbp::HeartbeatRequest* request,
                          ::umbp::HeartbeatResponse* response) override {
     return GuardStore("Heartbeat", [&]() -> grpc::Status {
+      NotePeerDriven(request->node_id(), request->peer_driven_eviction());
       std::map<TierType, TierCapacity> caps;
       for (const auto& tc : request->tier_capacities()) {
         TierCapacity c;
@@ -609,6 +613,30 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     });
   }
 
+  grpc::Status GetEvictionCandidates(grpc::ServerContext* /*ctx*/,
+                                     const ::umbp::GetEvictionCandidatesRequest* request,
+                                     ::umbp::GetEvictionCandidatesResponse* response) override {
+    if (!config_.advertise_peer_driven_eviction) {
+      return grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "peer-driven eviction is disabled");
+    }
+    return GuardStore("GetEvictionCandidates", [&]() -> grpc::Status {
+      if (request->node_id().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "node_id must not be empty");
+      }
+      const auto rows = SelectPeerEvictionCandidates(
+          store_, request->node_id(), static_cast<TierType>(request->tier()),
+          request->logical_tier(), request->bytes(), request->max_keys(),
+          std::chrono::system_clock::now());
+      response->mutable_keys()->Reserve(static_cast<int>(rows.size()));
+      response->mutable_sizes()->Reserve(static_cast<int>(rows.size()));
+      for (const auto& row : rows) {
+        response->add_keys(row.key);
+        response->add_sizes(row.size);
+      }
+      return grpc::Status::OK;
+    });
+  }
+
   // -------- External KV mutation/query --------
 
   grpc::Status ReportExternalKvBlocks(
@@ -831,8 +859,17 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   }
 
   void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
+  void SetEvictionManager(EvictionManager* eviction_manager) {
+    eviction_manager_ = eviction_manager;
+  }
 
  private:
+  void NotePeerDriven(const std::string& node_id, bool peer_driven) {
+    if (eviction_manager_ == nullptr || node_id.empty()) return;
+    eviction_manager_->SetPeerDriven(node_id,
+                                     peer_driven && config_.advertise_peer_driven_eviction);
+  }
+
   void UpdateClientCountMetric() {
     if (!metrics_) return;
     metrics_->setGauge(MORI_UMBP_METRIC_CLIENT_COUNT, MORI_UMBP_METRIC_CLIENT_COUNT_HELP,
@@ -903,6 +940,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   Router& router_;
   ClientRegistryConfig config_;
   mori::metrics::MetricsServer* metrics_ = nullptr;
+  EvictionManager* eviction_manager_ = nullptr;  // non-owning; set before Run()
 };
 
 // ---------------------------------------------------------------------------
@@ -919,6 +957,7 @@ MasterServer::MasterServer(MasterServerConfig config)
                                                           peer_stub_pool_.get(),
                                                           std::move(config_.evict_strategy))) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
+  service_->SetEvictionManager(eviction_manager_.get());
 }
 
 MasterServer::~MasterServer() {

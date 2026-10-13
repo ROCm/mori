@@ -584,5 +584,41 @@ TEST(MasterEvictionBytes, ARoundFreesTheOverageUpToTheByteLimit) {
   EXPECT_EQ(FirstRoundVictims(limited), 10u);
 }
 
+// Peer-driven eviction: the master ranks a node's keys on request and leaves
+// the node out of its own rounds.
+TEST(MasterPeerDrivenEviction, RanksANodesKeysAndSkipsItInRounds) {
+  InMemoryMasterMetadataStore store;
+  const auto t0 = Clock::now();
+  RegisterNode(&store, t0);
+  std::map<TierType, TierCapacity> full;
+  full[TierType::DRAM] = TierCapacity{6 * kPageSize, 0, kPageSize};
+  // k5 is the oldest; k0..k3 are "hot", k4/k5 "warm".
+  for (int i = 0; i < 6; ++i) {
+    ReportHeartbeat(&store, /*seq=*/i + 1, t0 + std::chrono::seconds(6 - i), full, TierType::DRAM,
+                    i < 4 ? "hot" : "warm", {"k" + std::to_string(i)}, /*full_sync=*/i == 0);
+  }
+  const auto now = t0 + std::chrono::seconds(10);
+  const auto keys = [&](const std::string& logical, uint64_t pages, size_t max_keys) {
+    std::vector<std::string> out;
+    for (const auto& row : SelectPeerEvictionCandidates(store, kNodeId, TierType::DRAM, logical,
+                                                        pages * kPageSize, max_keys, now)) {
+      out.push_back(row.key);
+    }
+    return out;
+  };
+  EXPECT_EQ(keys("", 3, 0), (std::vector<std::string>{"k5", "k4", "k3"}));
+  EXPECT_EQ(keys("hot", 2, 0), (std::vector<std::string>{"k3", "k2"}));
+  EXPECT_EQ(keys("", 100, 2), (std::vector<std::string>{"k5", "k4"}));
+
+  RecordingDispatcher dispatcher;
+  EvictionManager manager(store, OneSecondRounds(), &dispatcher);
+  manager.SetPeerDriven(kNodeId, true);
+  manager.RunOnceForTest();
+  EXPECT_TRUE(dispatcher.Calls().empty()) << "a peer-driven node still got EvictKey";
+  manager.SetPeerDriven(kNodeId, false);
+  manager.RunOnceForTest();
+  EXPECT_FALSE(dispatcher.Calls().empty());
+}
+
 }  // namespace
 }  // namespace mori::umbp

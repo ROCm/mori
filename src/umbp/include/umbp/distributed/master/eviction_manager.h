@@ -22,11 +22,14 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "umbp/distributed/config.h"
@@ -75,6 +78,15 @@ class EvictionManager {
   void Start();
   void Stop();
 
+  // A peer-driven node evicts at its own watermarks and asks for candidates
+  // (SelectPeerEvictionCandidates); rounds skip it.  In memory only: peers
+  // re-assert it on every heartbeat.
+  void SetPeerDriven(const std::string& node_id, bool peer_driven);
+  bool PeerDriven(const std::string& node_id) const;
+
+  // Test seam: one synchronous round.
+  void RunOnceForTest() { RunOnce(); }
+
  private:
   void EvictionLoop();
 
@@ -91,6 +103,19 @@ class EvictionManager {
   std::atomic<bool> running_{false};
   std::mutex cv_mutex_;
   std::condition_variable cv_;
+  mutable std::mutex peer_driven_mutex_;
+  std::unordered_set<std::string> peer_driven_;
 };
+
+// Server cap on one GetEvictionCandidates reply.
+constexpr size_t kMaxPeerEvictionCandidates = 4096;
+
+// `node_id`'s keys on `tier` (and `logical_tier`, if non-empty), least
+// recently accessed first, until their sizes cover `bytes` or `max_keys` is
+// reached (0: kMaxPeerEvictionCandidates).  Master-leased keys are skipped.
+std::vector<EvictionCandidate> SelectPeerEvictionCandidates(
+    const IMasterMetadataStore& store, const std::string& node_id, TierType tier,
+    const std::string& logical_tier, uint64_t bytes, size_t max_keys,
+    std::chrono::system_clock::time_point now);
 
 }  // namespace mori::umbp

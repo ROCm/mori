@@ -1092,24 +1092,41 @@ bool PoolClient::Init() {
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
 
-  // Local watermark eviction: every medium without a master, SSD only with
-  // one (as before).  SSD uses its own watermarks, paged media the node pair.
+  // Local watermark eviction: SSD's own pair or the node pair; with
+  // peer_driven_eviction, a tiered policy's per-tier pair instead.  SSD and
+  // every medium without a master start now; paged media under a master wait
+  // for it to confirm peer-driven eviction (below).
+  if (const char* env = std::getenv("UMBP_PEER_DRIVEN_EVICTION")) {
+    config_.peer_driven_eviction = std::string_view(env) != "0";
+  }
+  struct LocalEvictTarget {
+    uint32_t backend_id;
+    double high;
+    double low;
+  };
+  std::vector<LocalEvictTarget> deferred_local_evict;
   for (const auto& backend_config : backend_configs) {
     auto* backend = registry_.Get(backend_config.name);
     if (backend == nullptr) continue;
     const uint32_t backend_id = registry_.BackendId(backend);
-    if (backend_config.tier == TierType::SSD) {
-      if (!default_pool_->EnableLocalEviction(backend_id, backend_config.ssd.ssd.high_watermark,
-                                              backend_config.ssd.ssd.low_watermark)) {
-        MORI_UMBP_ERROR("[PoolClient] backend '{}': invalid SSD watermarks high={} low={}",
-                        backend_config.name, backend_config.ssd.ssd.high_watermark,
-                        backend_config.ssd.ssd.low_watermark);
-        Shutdown();
-        return false;
+    const bool ssd = backend_config.tier == TierType::SSD;
+    LocalEvictTarget target{
+        backend_id,
+        ssd ? backend_config.ssd.ssd.high_watermark : config_.local_evict_high_watermark,
+        ssd ? backend_config.ssd.ssd.low_watermark : config_.local_evict_low_watermark};
+    if (config_.peer_driven_eviction && tier_graph != nullptr) {
+      if (const auto index = tier_graph->TierIndexForBackendId(backend_id)) {
+        target.high = tier_graph->NodeAt(*index).high_watermark;
+        target.low = tier_graph->NodeAt(*index).low_watermark;
       }
-    } else if (!master_client_) {
-      default_pool_->EnableLocalEviction(backend_id, config_.local_evict_high_watermark,
-                                         config_.local_evict_low_watermark);
+    }
+    if (!ssd && master_client_) {
+      deferred_local_evict.push_back(target);
+    } else if (!default_pool_->EnableLocalEviction(backend_id, target.high, target.low) && ssd) {
+      MORI_UMBP_ERROR("[PoolClient] backend '{}': invalid SSD watermarks high={} low={}",
+                      backend_config.name, target.high, target.low);
+      Shutdown();
+      return false;
     }
   }
 
@@ -1217,12 +1234,26 @@ bool PoolClient::Init() {
     const auto logical_caps = default_pool_ == nullptr
                                   ? std::map<std::string, LogicalTierCapacity>{}
                                   : default_pool_->LogicalTierCapacities();
+    master_client_->RequestPeerDrivenEviction(config_.peer_driven_eviction);
     auto status =
         master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes, logical_caps);
     if (!status.ok()) {
       MORI_UMBP_ERROR("[PoolClient] RegisterSelf failed: {}", status.error_message());
       Shutdown();
       return false;
+    }
+    // Peer-driven: this node evicts every medium at its own watermarks, with
+    // victims ranked by the master, and the master stops sending EvictKey.
+    if (master_client_->PeerDrivenEviction() && default_pool_ != nullptr) {
+      for (const auto& target : deferred_local_evict) {
+        default_pool_->EnableLocalEviction(target.backend_id, target.high, target.low);
+      }
+      default_pool_->SetEvictionCandidateSource(
+          [client = master_client_.get()](TierType tier, const std::string& logical_tier,
+                                          uint64_t bytes) {
+            return client->GetEvictionCandidates(tier, logical_tier, bytes, /*max_keys=*/0);
+          });
+      MORI_UMBP_INFO("[PoolClient] peer-driven eviction ON (victims ranked by the master)");
     }
     if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
     if (weighted_placement && !master_client_->SupportsMaxAllocatableCapacity()) {
@@ -1298,6 +1329,7 @@ void PoolClient::Shutdown() {
     if (!status.ok()) {
       MORI_UMBP_WARN("[PoolClient] UnregisterSelf failed: {}", status.error_message());
     }
+    if (default_pool_) default_pool_->SetEvictionCandidateSource(nullptr);
   }
 
   {
@@ -1380,6 +1412,10 @@ std::string PoolClient::LogicalTierForBackend(uint32_t backend_id) const {
 
 TierTransitionMetrics PoolClient::TransitionMetrics() const {
   return default_pool_ == nullptr ? TierTransitionMetrics{} : default_pool_->TransitionMetrics();
+}
+
+LocalEvictionMetrics PoolClient::LocalEvictionStats() const {
+  return default_pool_ == nullptr ? LocalEvictionMetrics{} : default_pool_->LocalEvictionStats();
 }
 
 // ---------------------------------------------------------------------------
@@ -5100,6 +5136,8 @@ void PoolClient::PublishComponentMetrics() {
            {{"event", "no_candidate"}}, local.no_candidate);
     sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
            {{"event", "stalled"}}, local.stalled);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "master_key"}}, local.master_keys);
     metric_publisher_.Publish("pool", {}, samples, sink);
   }
 }

@@ -277,6 +277,19 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_local_first COMMAND test_umbp_local_first)
 
+# test_umbp_peer_driven_eviction — a real master and DRAM node: the node evicts
+# at its own watermark with master-ranked victims, or not at all unless both
+# sides opt in.
+add_executable(test_umbp_peer_driven_eviction test_peer_driven_eviction.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_peer_driven_eviction PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_peer_driven_eviction
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_peer_driven_eviction COMMAND test_umbp_peer_driven_eviction)
+
 # test_umbp_no_master — the distributed client with master_address empty: same
 # data plane, no routing/registration/heartbeat, a local miss is final.  No
 # master is started in that file, so reaching for one hangs or crashes rather

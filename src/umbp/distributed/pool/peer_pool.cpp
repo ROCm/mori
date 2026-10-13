@@ -50,6 +50,8 @@ constexpr size_t kLocalEvictBatch = 64;
 // Wakes are the main signal; the poll catches growth no wake reported.
 constexpr auto kLocalEvictPollInterval = std::chrono::milliseconds(100);
 constexpr auto kLocalEvictMinGap = std::chrono::milliseconds(1);  // between passes
+// Per backend, between candidate-source queries.
+constexpr auto kRankedCandidatesMinInterval = std::chrono::milliseconds(200);
 
 uint64_t UsedBytes(const TierCapacity& capacity) {
   return capacity.total_bytes > capacity.available_bytes
@@ -1069,6 +1071,7 @@ LocalEvictionMetrics PeerPool::LocalEvictionStats() const {
   metrics.keys = local_evict_keys_.load(std::memory_order_relaxed);
   metrics.no_candidate = local_evict_no_candidate_.load(std::memory_order_relaxed);
   metrics.stalled = local_evict_stalled_.load(std::memory_order_relaxed);
+  metrics.master_keys = local_evict_master_keys_.load(std::memory_order_relaxed);
   return metrics;
 }
 
@@ -1149,12 +1152,62 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
   size_t evicted_keys = 0;
   // The medium keeps offering settled keys until they leave; look past them.
   std::unordered_set<std::string> settled;
-  size_t window = kLocalEvictBatch;
-  while (covered < budget) {
-    {
-      std::lock_guard<std::mutex> lock(local_evict_mutex_);
-      if (stop_local_evict_) break;
+  const auto stopping = [this] {
+    std::lock_guard<std::mutex> lock(local_evict_mutex_);
+    return stop_local_evict_;
+  };
+  const auto drained = [&] { return UsedBytes(backend->Capacity()) <= low_bytes; };
+
+  // Evicts the coldest of offers[*next...] the budget still needs, at most one
+  // batch.  False if none of them freed or moved anything.
+  const auto evict_some = [&](const std::vector<EvictionOffer>& offers, size_t* next) {
+    std::vector<PoolEvictRequest> requests;
+    std::vector<uint64_t> offered_bytes;
+    uint64_t taken = 0;
+    for (; *next < offers.size(); ++*next) {
+      const auto& offer = offers[*next];
+      if (requests.size() >= kLocalEvictBatch) break;
+      if (!requests.empty() && covered + taken >= budget) break;
+      if (settled.count(offer.key) != 0) continue;
+      taken += offer.bytes;
+      offered_bytes.push_back(offer.bytes);
+      requests.push_back(PoolEvictRequest{offer.key, tier, backend_id});
     }
+    const auto results = Evict(requests, PoolEvictMode::kReclaim);
+    bool progressed = false;
+    for (size_t i = 0; i < results.size() && i < offered_bytes.size(); ++i) {
+      settled.insert(results[i].key);
+      switch (results[i].outcome) {
+        case PoolEvictOutcome::kFreed:
+        case PoolEvictOutcome::kDemotionQueued:
+          ++evicted_keys;
+          [[fallthrough]];
+        case PoolEvictOutcome::kInFlight:
+          covered += offered_bytes[i];  // capacity units, as offered
+          progressed = true;
+          break;
+        case PoolEvictOutcome::kNone:
+          break;
+      }
+    }
+    return progressed;
+  };
+
+  // The master's cluster-wide ranking first (at most one query per interval);
+  // the medium's own order covers whatever it leaves.
+  const auto ranked = RankedCandidates(backend_id, tier, budget);
+  if (ranked.has_value()) {
+    const size_t before = evicted_keys;
+    size_t next = 0;
+    while (covered < budget && next < ranked->size() && !stopping() && !drained()) {
+      evict_some(*ranked, &next);  // stale entries just yield kNone
+    }
+    local_evict_master_keys_.fetch_add(evicted_keys - before, std::memory_order_relaxed);
+  }
+
+  size_t window = kLocalEvictBatch;
+  while (covered < budget && !drained()) {
+    if (stopping()) break;
     auto offers = backend->EvictionCandidates(window);
     const bool exhausted = offers.size() < window;
     offers.erase(std::remove_if(offers.begin(), offers.end(),
@@ -1174,47 +1227,47 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
       }
       break;
     }
-    // The coldest the budget still needs, at most one batch.
-    std::vector<PoolEvictRequest> requests;
-    std::vector<uint64_t> offered_bytes;
-    uint64_t taken = 0;
-    for (auto& offer : offers) {
-      if (requests.size() >= kLocalEvictBatch) break;
-      if (!requests.empty() && covered + taken >= budget) break;
-      taken += offer.bytes;
-      offered_bytes.push_back(offer.bytes);
-      PoolEvictRequest request;
-      request.key = std::move(offer.key);
-      request.tier = tier;
-      request.backend_id = backend_id;
-      requests.push_back(std::move(request));
-    }
-    const auto results = Evict(requests, PoolEvictMode::kReclaim);
-    bool progressed = false;
-    for (size_t i = 0; i < results.size() && i < offered_bytes.size(); ++i) {
-      settled.insert(results[i].key);
-      switch (results[i].outcome) {
-        case PoolEvictOutcome::kFreed:
-        case PoolEvictOutcome::kDemotionQueued:
-          ++evicted_keys;
-          [[fallthrough]];
-        case PoolEvictOutcome::kInFlight:
-          covered += offered_bytes[i];
-          progressed = true;
-          break;
-        case PoolEvictOutcome::kNone:
-          break;
-      }
-    }
-    if (!progressed) {
+    size_t next = 0;
+    if (!evict_some(offers, &next)) {
       // All got leased or pinned since offered; retry on the next wake.
       local_evict_stalled_.fetch_add(1, std::memory_order_relaxed);
       break;
     }
-    if (UsedBytes(backend->Capacity()) <= low_bytes) break;
   }
   local_evict_keys_.fetch_add(evicted_keys, std::memory_order_relaxed);
   return evicted_keys;
+}
+
+std::optional<std::vector<EvictionOffer>> PeerPool::RankedCandidates(uint32_t backend_id,
+                                                                     TierType tier,
+                                                                     uint64_t bytes) {
+  EvictionCandidateSource source;
+  {
+    std::lock_guard<std::mutex> lock(local_evict_mutex_);
+    source = candidate_source_;
+  }
+  if (!source) return std::nullopt;
+  // Only the pass thread touches this (local_evict_pass_mutex_).  A backend
+  // stuck over its watermark would otherwise query on every wake.
+  const auto now = std::chrono::steady_clock::now();
+  auto& last = last_ranked_query_[backend_id];
+  if (now - last < kRankedCandidatesMinInterval) return std::nullopt;
+  last = now;
+  const std::string logical = tier_graph_ == nullptr ? "" : tier_graph_->NameForBackend(backend_id);
+  auto offers = source(tier, logical, bytes);
+  // The source reports value sizes; the budget counts whole pages.
+  auto* backend = backends_->Get(backend_id);
+  const uint64_t page = backend == nullptr ? 0 : backend->PageSize();
+  if (offers.has_value() && page > 0) {
+    for (auto& offer : *offers)
+      offer.bytes = std::max<uint64_t>(1, (offer.bytes + page - 1) / page) * page;
+  }
+  return offers;
+}
+
+void PeerPool::SetEvictionCandidateSource(EvictionCandidateSource source) {
+  std::lock_guard<std::mutex> lock(local_evict_mutex_);
+  candidate_source_ = std::move(source);
 }
 
 void PeerPool::ClearLocal() {

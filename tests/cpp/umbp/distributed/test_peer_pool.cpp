@@ -24,6 +24,7 @@
 // MIT License
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -1165,6 +1166,37 @@ TEST(PeerPoolLocalEviction, DrainsAFullBackendColdestFirstToItsLowWatermark) {
   EXPECT_EQ(pool.PlacementCount(), 5u);
   EXPECT_GE(pool.LocalEvictionStats().rounds, 1u);
   EXPECT_EQ(pool.LocalEvictionStats().keys, 4u);
+}
+
+TEST(PeerPoolLocalEviction, RankedCandidatesGoFirstAndTheMediumCoversTheRest) {
+  // The source (the master, in peer-driven mode) ranks differently from the
+  // medium's LRU, names a key this backend no longer holds, and reports value
+  // sizes rather than the whole pages the budget counts.
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kHostPage, 10,
+                      std::chrono::milliseconds(1));
+  PeerPool pool(&registry, MakeSingleBackendPolicy(), &engine);
+  std::atomic<int> queries{0};
+  std::atomic<uint64_t> asked_bytes{0};
+  pool.SetEvictionCandidateSource([&](TierType tier, const std::string&, uint64_t bytes) {
+    ++queries;
+    asked_bytes = tier == TierType::DRAM ? bytes : 0;
+    return std::optional<std::vector<EvictionOffer>>({{"k8", 64}, {"gone", 64}, {"k7", 64}});
+  });
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(registry.Get("dram")), 0.9, 0.5));
+
+  for (int i = 0; i < 9; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  auto* dram = registry.Get("dram");
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(dram->OwnedKeyCount(), 5u) << "evicted past the overage";
+  EXPECT_EQ(queries.load(), 1);
+  EXPECT_EQ(asked_bytes.load(), 4 * kHostPage);  // 9 pages down to 5
+  // Ranked k8, k7 first; then the medium's coldest, k0 and k1.
+  for (const char* gone : {"k8", "k7", "k0", "k1"}) EXPECT_FALSE(dram->Contains(gone)) << gone;
+  for (int i = 2; i <= 6; ++i) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
+  EXPECT_EQ(pool.LocalEvictionStats().master_keys, 2u);
 }
 
 TEST(PeerPoolLocalEviction, KeysUnderAReadLeaseAreNeverOffered) {
