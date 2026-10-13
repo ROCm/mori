@@ -384,11 +384,8 @@ class PoolClient {
   // `dst_is_device` answers, for an ORIGINAL key index, whether that key's
   // destination is device memory -- the only place a file ref can be read.
   // Empty (the default) means the caller cannot consume a file ref at all, so
-  // none is requested and every key resolves onto staged pages.
-  //
-  // `deferred`, when given, receives the candidates a staged medium left for a
-  // further call (ResolveOutcome::kDeferred); the caller copies and releases
-  // what was published, then resolves those.  Without it they read as misses.
+  // none is requested and every key resolves onto staged pages.  `deferred`
+  // receives the kDeferred candidates (without it they read as misses).
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
@@ -396,8 +393,7 @@ class PoolClient {
                          const std::function<bool(size_t)>& dst_is_device = {},
                          std::vector<size_t>* deferred = nullptr);
 
-  // Hand back the staging behind entries ResolveLocalBatch published for
-  // `indices` (MediumBackend::ReleaseResolved), once their copies are done.
+  // ReleaseResolved what ResolveLocalBatch published for `indices`.
   void ReleaseResolvedLocal(const std::vector<std::string>& keys,
                             const std::vector<size_t>& indices,
                             const std::vector<MediumBackend*>& holders,

@@ -374,14 +374,10 @@ class PageBackend : public MediumBackend {
     // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
     // thread already extended.
     std::atomic<int64_t> read_lease_ns{0};
-    // In-process readers (ResolveReader::kLocal) that have not yet released
-    // what they resolved.  While non-zero the pages are fenced like a live
-    // lease, whatever the deadline says: a local copy reports completion, so it
-    // is never cut off by a timer.  Bumped under the shared lock, hence atomic.
+    // Unreleased kLocal readers; while non-zero the pages are fenced whatever
+    // the deadline says.  Bumped under the shared lock, hence atomic.
     std::atomic<uint32_t> local_readers{0};
-    // Identifies this slot to a release (ResolvedEntry::lease_token): a key
-    // dropped by ClearLocal and committed again is a different slot, and a
-    // release meant for the old one must not touch it.  Set at commit.
+    // The lease_token releases must name: a re-committed key is a new slot.
     uint64_t generation = 0;
     // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
@@ -549,9 +545,7 @@ class PageBackend : public MediumBackend {
   };
   std::unordered_map<std::string, PinState> pins_;
   uint64_t next_pin_token_ = 1;
-  // OwnedSlot::generation source; 0 is reserved for "nothing to release".
-  // Written under mutex_ held exclusively (commit).
-  uint64_t next_slot_generation_ = 1;
+  uint64_t next_slot_generation_ = 1;  // 0 means "nothing to release"; commit only
 
   std::vector<DeferredFree> deferred_frees_;
 

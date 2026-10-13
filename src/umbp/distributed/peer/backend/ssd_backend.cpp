@@ -505,9 +505,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   std::vector<std::string> read_keys;              // parallel to todo
   std::vector<std::vector<size_t>> result_groups;  // duplicate input indices per device read
   std::unordered_map<std::string, size_t> scheduled;
-  // Leases this call published from (key, token).  A BUSY return discards
-  // every entry, so those holders are dropped again before returning.
-  std::vector<std::pair<std::string, uint64_t>> lease_hits;
+  std::vector<std::pair<std::string, uint64_t>> lease_hits;  // dropped again if BUSY
   todo.reserve(keys.size());
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -566,12 +564,9 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       result_groups.push_back({i});
     }
 
-    // One call stages at most half the arena.  A batch that needs more is
-    // served in order up to that share and the rest deferred to the caller's
-    // next call -- failing it outright made any batch larger than the arena
-    // unreadable however long the caller waited, and taking the whole arena
-    // would leave a concurrent reader nothing to stage into.  The first key is
-    // always taken: it alone fits (checked above), so the batch makes progress.
+    // One call stages at most half the arena, leaving room for concurrent
+    // readers; the rest of the batch is deferred to the caller's next call.
+    // The first key always fits (checked above), so every call progresses.
     const uint64_t arena_pages = staging_page_used_.size();
     const uint64_t call_budget = std::max<uint64_t>(arena_pages / 2, 1);
     uint64_t requested_pages = 0;
@@ -879,9 +874,7 @@ void SsdBackend::ReaperSweep() {
       continue;
     }
     if (lease.local_holders > 0) {
-      // An in-process copy is still reading these pages and will release them
-      // when it finishes.  Never reclaim under it -- that is a use-after-free
-      // of the staging arena -- but say so if it is taking implausibly long.
+      // A local copy is still reading these pages: never reclaim under it.
       constexpr std::chrono::seconds kLocalHoldWarn{30};
       if (!lease.overdue_warned && now - lease.expires_at > kLocalHoldWarn) {
         lease.overdue_warned = true;

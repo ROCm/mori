@@ -298,10 +298,8 @@ TEST_F(SsdRangedIoTest, LocalRangedGetReadsASubsetFromSsd) {
   EXPECT_EQ(std::memcmp(middle.data(), object.data() + kObjectSize / 2, middle.size()), 0);
 }
 
-// One call asking for more SSD-resident objects than the staging arena holds
-// (8 slots here) is served in full -- in rounds, each one releasing its staging
-// before the next resolves -- by both readers.  Before, the medium failed the
-// whole batch as larger than the arena, and the caller got nothing back.
+// A batch of SSD objects larger than the staging arena (8 slots) is served in
+// full, in rounds, by both readers.
 TEST_F(SsdRangedIoTest, LocalBatchLargerThanTheStagingArenaIsServedInFull) {
   auto* node = Start(SsdConfig("ssd-local-oversized"));
   ASSERT_NE(node, nullptr);
