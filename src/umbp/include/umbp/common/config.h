@@ -89,7 +89,9 @@ struct UMBPSsdConfig {
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
-  size_t segment_size_bytes = 256ULL * 1024 * 1024;
+  // Each segment file holds an fd for the tier's lifetime: at 4 GiB a 1.5 TB
+  // tier needs ~350, under the usual soft RLIMIT_NOFILE of 1,024.
+  size_t segment_size_bytes = 4ULL * 1024 * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 

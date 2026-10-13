@@ -201,6 +201,58 @@ void test_batch_write_read_across_shards() {
   std::cout << "PASSED" << std::endl;
 }
 
+// Per-key results come back from one worker per drive at once.  They used to
+// be written straight into a std::vector<bool>, whose elements share machine
+// words: two drives finishing together could each rewrite the word holding the
+// other's result, so a read or write that succeeded was reported as failed --
+// rarely, and only when several drives ran in parallel.  Many small keys,
+// interleaved across drives, and many rounds make that overlap likely.
+void test_parallel_drives_never_lose_a_result() {
+  std::cout << "test_parallel_drives_never_lose_a_result... ";
+  auto cfg = MakeConfig(MakeDirs("race", 3), 256ULL * 1024 * 1024);
+  auto backend = MakeFileSsdBackend(cfg);
+
+  constexpr int kKeys = 4096;
+  constexpr size_t kSize = 512;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> payloads;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes(kKeys, kSize);
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("race" + std::to_string(i));
+    payloads.emplace_back(kSize, static_cast<char>(i * 7));
+  }
+  for (auto& p : payloads) srcs.push_back(p.data());
+
+  auto wrote = backend->BatchWrite(keys, srcs, sizes);
+  int write_lost = 0;
+  for (bool ok : wrote) write_lost += ok ? 0 : 1;
+  if (write_lost != 0) {
+    std::cerr << "FAILED: " << write_lost << " successful writes reported as failed\n";
+    std::abort();
+  }
+
+  std::vector<std::vector<char>> outs(kKeys, std::vector<char>(kSize, 0));
+  std::vector<uintptr_t> dsts;
+  for (auto& o : outs) dsts.push_back(reinterpret_cast<uintptr_t>(o.data()));
+  int read_lost = 0;
+  for (int round = 0; round < 200; ++round) {
+    auto read = backend->BatchReadIntoPtr(keys, dsts, sizes);
+    for (int i = 0; i < kKeys; ++i) read_lost += read[i] ? 0 : 1;
+  }
+  if (read_lost != 0) {
+    std::cerr << "FAILED: " << read_lost << " successful reads reported as failed\n";
+    std::abort();
+  }
+  for (int i = 0; i < kKeys; ++i) {
+    if (outs[i] != payloads[i]) {
+      std::cerr << "FAILED: key " << i << " read back the wrong bytes\n";
+      std::abort();
+    }
+  }
+  std::cout << "PASSED" << std::endl;
+}
+
 // A key that was never written must miss, not read someone else's bytes, and a
 // batch containing unknown keys must report exactly those as failures.
 void test_missing_keys() {
@@ -290,6 +342,7 @@ int main() {
   test_balanced_placement_and_readback();
   test_rewrite_stays_on_same_shard();
   test_batch_write_read_across_shards();
+  test_parallel_drives_never_lose_a_result();
   test_missing_keys();
   test_evict_and_clear();
   test_uneven_shards_place_by_free_space();
