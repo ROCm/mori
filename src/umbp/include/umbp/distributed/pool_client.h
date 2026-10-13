@@ -197,6 +197,9 @@ class PoolClient {
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
+  // Recency hint for keys held on this node (IUMBPClient::BatchTouch); returns
+  // how many of them this node's media hold.  Never contacts the master.
+  size_t BatchTouch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
