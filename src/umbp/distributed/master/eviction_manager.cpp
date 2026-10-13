@@ -122,11 +122,7 @@ void EvictionManager::RunOnce() {
 
   if (bytes_to_free.empty()) return;
 
-  // A round's size is a byte budget: the overage itself, optionally capped by
-  // max_evict_bytes_per_round.  It used to be a row count (32 candidates per
-  // bucket), which freed a few MB per round however far over the tier was --
-  // a 512 GiB tier's 0.9 -> 0.7 band took hours to drain -- while every round
-  // still paid the store's full scan.
+  // A round frees each bucket's overage in bytes, optionally capped per round.
   if (config_.max_evict_bytes_per_round > 0) {
     for (auto& [ntk, bytes] : bytes_to_free) {
       bytes = std::min(bytes, config_.max_evict_bytes_per_round);
@@ -140,9 +136,8 @@ void EvictionManager::RunOnce() {
   // Ask the store for eviction-eligible candidates in the overloaded buckets.
   // The store is policy-neutral: it returns rows ordered by the hint (LRU here,
   // so an indexed backend can push the ordering down) but makes no eviction
-  // decision and never sees the byte budget -- the strategy trims to it.  No
-  // row cap: both stores read every eligible row of a bucket before capping,
-  // so a cap would only discard candidates the budget may need.
+  // decision and never sees the byte budget; the strategy trims to it, so
+  // there is no row cap.
   std::vector<NodeTierKey> buckets;
   buckets.reserve(bytes_to_free.size());
   for (const auto& [ntk, _bytes] : bytes_to_free) buckets.push_back(ntk);
@@ -213,8 +208,7 @@ void EvictionManager::RunOnce() {
     //
     // Sized on the keys alone: the parallel tier field is a packed enum of one
     // byte per key, inside the per-item overhead GrpcMaxItemsPerBatch already
-    // reserves.  Nothing else bounds a chunk: the peer queues any demotion and
-    // returns, so a call's length does not grow with the bytes it names.
+    // reserves.  Bytes don't lengthen a call: the peer only queues demotions.
     std::vector<std::string> keys;
     keys.reserve(victims.size());
     for (const auto& victim : victims) keys.push_back(victim.key);

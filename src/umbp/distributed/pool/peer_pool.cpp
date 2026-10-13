@@ -109,8 +109,7 @@ bool PeerPool::EnqueueTransition(TransitionJob job) {
 }
 
 bool PeerPool::TransitionQueued(const std::string& key) {
-  // A key stays in queued_transition_keys_ until the worker has finished its
-  // job, so this covers a running job as well as a waiting one.
+  // Keys leave queued_transition_keys_ only when their job finishes.
   std::lock_guard<std::mutex> lock(transition_mutex_);
   return queued_transition_keys_.count(key) != 0;
 }
@@ -119,7 +118,6 @@ void PeerPool::DropEvictedCopyLocked(const TransitionJob& job) {
   if (migrating_keys_.count(job.key) != 0) return;
   auto* source = backends_ == nullptr ? nullptr : backends_->Get(job.source_backend_id);
   if (source == nullptr) return;
-  // One key, under the pool lock: the cost a synchronous drop always had.
   source->Evict({job.key});
   RepairAfterDropLocked(job.key);
 }
@@ -237,8 +235,7 @@ void PeerPool::MaybeEnqueueWatermarkOffloadLocked() {
 }
 
 bool PeerPool::WatermarkDrivenLocked(const TransitionJob& job) const {
-  // An eviction's demotion was asked for, so the tier's own watermark has no
-  // say in whether it runs.
+  // An eviction's demotion runs whatever the tier's own watermark says.
   return !job.evict && job.kind == TierTransitionKind::kOffload && tier_graph_ != nullptr &&
          tier_graph_->NodeAt(job.source_tier).trigger == PoolOffloadTrigger::kWatermark;
 }
@@ -1020,11 +1017,9 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
     }
   }
 
-  // Queued, never run here: the copy is the transition worker's job, so an
-  // EvictKey RPC returns without waiting on it however many bytes it names.
-  // The worker runs an eviction's demotion regardless of the tier's own
-  // watermark, frees the source when the copy lands, and drops the copy
-  // instead if nothing downstream can take it (DropEvictedCopyLocked).
+  // Queued, never copied here, so EvictKey never waits on bytes.  The worker
+  // frees the source when the copy lands, or drops it if nothing downstream
+  // can take it (DropEvictedCopyLocked).
   for (const auto& [index, source_id] : demotions) {
     const auto tier_index = tier_graph_->TierIndexForBackendId(source_id);
     if (!tier_index.has_value()) {
@@ -1036,9 +1031,8 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
     if (EnqueueTransition(std::move(job))) {
       out[index].outcome = PoolEvictOutcome::kDemotionQueued;
     } else if (TransitionQueued(requests[index].key)) {
-      // Another job already owns the key -- a watermark offload, or this
-      // eviction's own earlier request.  It will move or free the copy;
-      // deleting the source under it could lose the key instead.
+      // Another job owns the key and will move or free it; deleting the
+      // source under it could lose the key.
       out[index].outcome = PoolEvictOutcome::kInFlight;
     }
   }
@@ -1197,17 +1191,13 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
   // once usage is back at the low watermark, whichever comes first.  The budget
   // is the guard against a medium whose reported usage lags its deletes, which
   // re-reading usage alone would keep draining.
-  //
-  // "Covered" includes bytes on their way out: a demotion queued by this pass
-  // or an earlier one frees its source only once the copy lands, and until
-  // then the key still sits at the cold end of the medium's order.  Counting
-  // it keeps a pass from queueing more than the overage while the copies run.
+  // Queued demotions count as covered: their source stays until the copy
+  // lands, and counting it stops a pass from queueing past the overage.
   const uint64_t budget = used - low_bytes;
   const TierType tier = backend->Tier();
   uint64_t covered = 0;
   size_t evicted_keys = 0;
-  // Keys this pass already settled, which the medium keeps offering until
-  // they leave it.  The window grows past them instead of re-offering them.
+  // The medium keeps offering settled keys until they leave; look past them.
   std::unordered_set<std::string> settled;
   size_t window = kLocalEvictBatch;
   while (covered < budget) {
@@ -1222,7 +1212,7 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
                  offers.end());
     if (offers.empty()) {
       if (!exhausted) {
-        window *= 2;  // everything offered so far is settled: look further
+        window *= 2;
         continue;
       }
       if (settled.empty()) {
@@ -1271,8 +1261,8 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
       }
     }
     if (!progressed) {
-      // Every candidate became busy since it was offered (a read lease or pin
-      // landed in between).  The next wake or poll tries again.
+      // Every candidate got leased or pinned since it was offered; the next
+      // wake or poll tries again.
       local_evict_stalled_.fetch_add(1, std::memory_order_relaxed);
       break;
     }

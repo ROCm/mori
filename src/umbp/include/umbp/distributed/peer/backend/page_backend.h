@@ -537,9 +537,7 @@ class PageBackend : public MediumBackend {
   struct PinState {
     uint64_t token = 0;
     std::chrono::steady_clock::time_point acquired_at;  // for long-running warning only
-    // Taken by AcquireMigrationRead: the pool is moving this key off the
-    // medium, so it still counts as an eviction candidate (see
-    // EvictionCandidates).
+    // Set by AcquireMigrationRead; the key stays an eviction candidate.
     bool migration = false;
   };
   std::unordered_map<std::string, PinState> pins_;

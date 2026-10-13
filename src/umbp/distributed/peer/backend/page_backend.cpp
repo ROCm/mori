@@ -831,9 +831,8 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
     // The two protections Evict() applies: an in-flight read owns the pages
     // until its lease expires, a copy pin until the copy is done.  Offering
     // them would only make the caller's batch free less than it asked for.
-    // A migration pin is the exception: the key is already on its way out,
-    // and the caller has to see it to count its bytes as in flight rather
-    // than reach past it for one more victim.
+    // Except a migration pin: the key is already leaving, and the caller
+    // counts its bytes as in flight.
     if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
     if (auto pin = pins_.find(*it); pin != pins_.end() && !pin->second.migration) continue;
     // Whole pages: that is what the allocator gives back, and what Capacity()

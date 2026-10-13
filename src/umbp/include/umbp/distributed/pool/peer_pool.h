@@ -72,21 +72,17 @@ struct PoolResolvedEntry {
   ResolvedEntry resolved;
 };
 
-// What PeerPool::Evict did with one request.  A demotion is never run inside
-// the call: it is queued to the pool's transition worker, so an EvictKey RPC
-// returns without waiting on a copy.
+// What PeerPool::Evict did with one request.
 enum class PoolEvictOutcome {
   kNone,            // nothing freed: no such copy, or a read lease / pin holds it
-  kFreed,           // the copy was dropped; bytes_freed says how much
-  kDemotionQueued,  // this call queued the copy's demotion; it frees the source when done
-  kInFlight,        // a transition already owned the key; it will move or free it
+  kFreed,           // the copy was dropped
+  kDemotionQueued,  // queued for the transition worker, which frees the source
+  kInFlight,        // another transition owns the key and will move or free it
 };
 
 struct PoolEvictResult {
   std::string key;
-  // Bytes freed by the time Evict returned.  0 for a queued demotion, whose
-  // bytes come back when the transition completes.
-  uint64_t bytes_freed = 0;
+  uint64_t bytes_freed = 0;  // by the time Evict returned; 0 for a queued demotion
   PoolEvictOutcome outcome = PoolEvictOutcome::kNone;
 };
 
@@ -161,10 +157,9 @@ class PeerPool {
   // The one routing entry point for eviction.  Every policy calls this -- the
   // master's EvictKey RPC and this pool's own local watermark eviction alike --
   // and every byte it frees is freed by the medium's MediumBackend::Evict,
-  // directly or as the last step of a demotion.  A copy that drops is freed
-  // before this returns; a copy that demotes is only QUEUED (see
-  // PoolEvictOutcome), so the call never waits on a byte copy.  One result per
-  // request, in request order.
+  // directly or as the last step of a demotion.  Drops happen before this
+  // returns; demotions are only queued, so it never waits on a byte copy.  One
+  // result per request, in request order.
   std::vector<PoolEvictResult> Evict(const std::vector<PoolEvictRequest>& requests,
                                      PoolEvictMode mode);
   // Every key unscoped: freed from the medium that currently holds it.
@@ -197,8 +192,7 @@ class PeerPool {
   bool EnableLocalEviction(uint32_t backend_id, double high_watermark, double low_watermark);
   LocalEvictionMetrics LocalEvictionStats() const;
   // Test seam: one synchronous pass over every enabled backend, as the worker
-  // runs it.  Returns the number of keys evicted: dropped, or queued for
-  // demotion (which completes on the transition worker afterwards).
+  // runs it.  Returns the number of keys dropped or queued for demotion.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
 
  private:
@@ -214,10 +208,8 @@ class PeerPool {
     uint32_t source_backend_id = BackendRegistry::kMaxBackends;
     LogicalTierGraph::TierIndex source_tier = 0;
     uint8_t attempts = 0;
-    // Queued by Evict(): a demotion someone asked for -- the master's EvictKey
-    // or local eviction -- not one the tier's own watermark started.  It runs
-    // whatever the tier's usage is by then, and if nothing downstream can take
-    // the key the copy is dropped instead: the eviction still has to free it.
+    // Queued by Evict(): runs regardless of the tier's watermark, and drops
+    // the copy if nothing downstream can take it.
     bool evict = false;
   };
 
@@ -228,16 +220,15 @@ class PeerPool {
     std::vector<uint32_t> targets;
   };
 
-  // False when the key already has a job (queued or running) or the worker is
-  // stopping; the job is not queued then.
+  // False if the key already has a job (queued or running) or the worker is
+  // stopping.
   bool EnqueueTransition(TransitionJob job);
-  // Whether a transition job owns `key` right now, queued or running.
+  // Whether a job owns `key`, queued or running.
   bool TransitionQueued(const std::string& key);
   void TransitionWorkerLoop();
   void StopTransitionWorker();
-  // An eviction's demotion could not move the copy (no room downstream, or the
-  // copy moved meanwhile): drop it, as a synchronous eviction would have --
-  // unless another transition owns the key, which would rather move it.
+  // A failed eviction demotion drops the copy instead, unless another
+  // transition owns the key.
   void DropEvictedCopyLocked(const TransitionJob& job);
 
   struct LocalEvictionWatermarks {
@@ -251,8 +242,8 @@ class PeerPool {
   void StopLocalEviction();
   // One pass: every enabled backend, lowest tier first.  Returns keys evicted.
   size_t LocalEvictionPass();
-  // Brings one backend down to its low watermark if it is at or above its
-  // high one -- counting demotions still in flight -- and returns keys evicted.
+  // Brings one backend at or above its high watermark down to its low one,
+  // counting in-flight demotions.  Returns keys evicted.
   size_t ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermarks& watermarks);
 
   void TouchLocked(const std::string& key);

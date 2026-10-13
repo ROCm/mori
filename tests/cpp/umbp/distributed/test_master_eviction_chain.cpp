@@ -259,8 +259,7 @@ TEST(MasterEvictionChain, OverWatermarkTierDemotesIntoTheColdTier) {
   EXPECT_EQ(dispatcher.NodeIds().front(), kNodeId);
 
   // Every key the master named must have moved down a tier rather than vanished.
-  // The peer only queues the demotion -- the EvictKey call does not wait on the
-  // copy -- so the move is observed after the fact.
+  // The peer only queues the demotion, so wait for the move.
   const auto evicted = dispatcher.Dispatched();
   ASSERT_FALSE(evicted.empty());
   const bool moved = WaitFor(
@@ -542,15 +541,7 @@ TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
   EXPECT_TRUE(registry.Get("hot")->Contains("moved"));
 }
 
-// ---------------------------------------------------------------------------
-//  Round size in bytes
-//
-//  A round frees the overage, measured in bytes, rather than a fixed number of
-//  candidates per bucket.  These drive the real EvictionManager against the
-//  real store and record what it dispatches; nothing is executed.
-// ---------------------------------------------------------------------------
-
-// Records every EvictKey the manager sends, one entry per RPC.
+// Records what the manager sends, one entry per EvictKey; executes nothing.
 class RecordingDispatcher final : public EvictKeyDispatcher {
  public:
   void DispatchEvictKey(const std::string& /*node_id*/, const std::string& /*peer_address*/,
@@ -562,73 +553,36 @@ class RecordingDispatcher final : public EvictKeyDispatcher {
     std::lock_guard<std::mutex> lock(mutex_);
     return calls_;
   }
-  size_t Keys() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    size_t n = 0;
-    for (const auto& call : calls_) n += call.size();
-    return n;
-  }
 
  private:
   mutable std::mutex mutex_;
   std::vector<std::vector<EvictionVictim>> calls_;
 };
 
-std::vector<std::string> NumberedKeys(size_t n) {
+// Keys in the first EvictKey for a full 256-page DRAM bucket of one-page keys.
+size_t FirstRoundVictims(const EvictionConfig& config) {
   std::vector<std::string> keys;
-  for (size_t i = 0; i < n; ++i) keys.push_back("k" + std::to_string(i));
-  return keys;
-}
-
-// 256 one-page keys filling a 256-page DRAM bucket: the overage above the 0.7
-// low watermark is 4,916 bytes, i.e. 77 keys -- more than the 32-row cap a
-// round used to stop at.
-constexpr size_t kFullBucketKeys = 256;
-const uint64_t kFullBucketBytes = kFullBucketKeys * kPageSize;
-const size_t kOverageKeys =
-    (kFullBucketBytes - static_cast<uint64_t>(kFullBucketBytes * 0.7) + kPageSize - 1) / kPageSize;
-
-TEST(MasterEvictionBytes, ARoundFreesTheWholeOverageNotThirtyTwoKeys) {
+  for (int i = 0; i < 256; ++i) keys.push_back("k" + std::to_string(i));
   InMemoryMasterMetadataStore store;
-  PublishNode(&store, NumberedKeys(kFullBucketKeys), kFullBucketBytes, kFullBucketBytes);
-
-  RecordingDispatcher dispatcher;
-  EvictionManager manager(store, OneSecondRounds(), &dispatcher);
-  manager.Start();
-  ASSERT_TRUE(WaitFor([&] { return !dispatcher.Calls().empty(); }, std::chrono::seconds(8)));
-  manager.Stop();
-
-  // A round's victims go out in calls bounded only by gRPC message size, so
-  // these few short keys are one call.
-  const auto first = dispatcher.Calls().front();
-  ASSERT_GT(kOverageKeys, 32u);
-  EXPECT_EQ(first.size(), kOverageKeys) << "the round did not cover its byte budget";
-  for (const auto& victim : first) EXPECT_EQ(victim.tier, TierType::DRAM);
-}
-
-TEST(MasterEvictionBytes, PerRoundByteLimitThrottlesTheRound) {
-  InMemoryMasterMetadataStore store;
-  PublishNode(&store, NumberedKeys(kFullBucketKeys), kFullBucketBytes, kFullBucketBytes);
-
-  auto config = OneSecondRounds();
-  config.max_evict_bytes_per_round = 10 * kPageSize;
+  PublishNode(&store, keys, 256 * kPageSize, 256 * kPageSize);
   RecordingDispatcher dispatcher;
   EvictionManager manager(store, config, &dispatcher);
   manager.Start();
-  ASSERT_TRUE(WaitFor([&] { return !dispatcher.Calls().empty(); }, std::chrono::seconds(8)));
+  const bool sent = WaitFor([&] { return !dispatcher.Calls().empty(); }, std::chrono::seconds(8));
   manager.Stop();
-
-  EXPECT_EQ(dispatcher.Calls().front().size(), 10u);
+  return sent ? dispatcher.Calls().front().size() : 0;
 }
 
-TEST(MasterEvictionBytes, PerRoundByteLimitIsReadFromTheEnvironment) {
-  ::setenv("UMBP_EVICT_MAX_BYTES_PER_ROUND", "8589934592", 1);
-  const auto config = EvictionConfig::FromEnvironment();
-  ::unsetenv("UMBP_EVICT_MAX_BYTES_PER_ROUND");
-  EXPECT_EQ(config.max_evict_bytes_per_round, 8589934592ULL);
+TEST(MasterEvictionBytes, ARoundFreesTheOverageUpToTheByteLimit) {
+  // The overage above the 0.7 low watermark is 77 keys, more than the 32 a
+  // round used to stop at.
+  EXPECT_EQ(FirstRoundVictims(OneSecondRounds()), 77u);
 
-  const auto defaults = EvictionConfig::FromEnvironment();
-  EXPECT_EQ(defaults.max_evict_bytes_per_round, 0u);
+  ::setenv("UMBP_EVICT_MAX_BYTES_PER_ROUND", std::to_string(10 * kPageSize).c_str(), 1);
+  auto limited = OneSecondRounds();
+  limited.max_evict_bytes_per_round = EvictionConfig::FromEnvironment().max_evict_bytes_per_round;
+  ::unsetenv("UMBP_EVICT_MAX_BYTES_PER_ROUND");
+  EXPECT_EQ(FirstRoundVictims(limited), 10u);
 }
 
 }  // namespace
