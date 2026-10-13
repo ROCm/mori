@@ -43,11 +43,8 @@ struct TierTransitionResult {
   uint64_t bytes_moved = 0;
   uint64_t bytes_freed = 0;
   bool source_draining = false;
-  // Every target refused or failed in a way that can clear: it reported no
-  // space (an SSD's staging arena under read load, or a tier its own eviction
-  // is about to free), or it had room but the copy, its commit, or the
-  // read-back check failed.  Trying again later may succeed.  False on success
-  // and when the target can never take the key (a shape failure).
+  // Failed in a way that can clear (no space, or a copy/commit/read-back
+  // error), so a later attempt may succeed.  False for a shape failure.
   bool retryable = false;
 };
 

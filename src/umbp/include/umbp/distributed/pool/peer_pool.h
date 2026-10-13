@@ -155,8 +155,7 @@ class PeerPool {
   LocalEvictionMetrics LocalEvictionStats() const;
   // Test seam: one synchronous pass.  Returns keys dropped or queued.
   size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
-  // How long an eviction demotion keeps retrying before its copy is dropped
-  // (UMBP_EVICT_DEMOTION_RETRY_MS, default 30 s).  Tests shorten it.
+  // UMBP_EVICT_DEMOTION_RETRY_MS override; set it before queueing work.
   void SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds budget) {
     evict_demotion_retry_budget_ = budget;
   }
@@ -301,8 +300,7 @@ class PeerPool {
   std::vector<size_t> queued_by_tier_;
   bool stop_transition_worker_ = false;
   std::thread transition_worker_;
-  // Read by the transition worker only (and the test seam before it starts).
-  std::chrono::milliseconds evict_demotion_retry_budget_{30000};
+  std::chrono::milliseconds evict_demotion_retry_budget_{30000};  // transition worker only
 
   // Local watermark eviction.  local_evict_mutex_ guards local_evict_,
   // stop_local_evict_ and the worker's start.
