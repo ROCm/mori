@@ -78,6 +78,11 @@ class InstrumentedBackend final : public MediumBackend {
   TierCapacity Capacity() const override { return inner_->Capacity(); }
   uint64_t OwnedKeyCount() const override { return inner_->OwnedKeyCount(); }
   bool Contains(const std::string& key) const override { return inner_->Contains(key); }
+  // Without this the base class's per-key loop answers a client's exists
+  // batch -- one lock per key -- and the medium's own batch never runs.
+  std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override {
+    return inner_->BatchContains(keys);
+  }
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override {
     return inner_->AcquireMigrationRead(key, resolved);
   }
