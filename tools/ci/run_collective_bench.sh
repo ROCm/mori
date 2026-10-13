@@ -11,7 +11,9 @@
 #   OPS          ops to sweep (rs/ar only) [sum prod]
 #   MIN_SIZE     smallest total elem count [1048576]
 #   MAX_SIZE     largest total elem count  [134217728]
-#   SIZES        explicit element counts   [MIN_SIZE..MAX_SIZE, doubling]
+#   SIZE_STEP    size growth factor num/den [2/1] (e.g. 3/2 = 1.5x)
+#   SIZE_ALIGN   round generated sizes down to a multiple of this [256]
+#   SIZES        explicit element counts   [MIN_SIZE..MAX_SIZE, x SIZE_STEP]
 #   EXTRA_SIZES  extra counts appended to SIZES (e.g. non-power-of-two) []
 #   WARMUP/ITERS benchmark iterations      [2/5]
 #   RUN_TIMEOUT  seconds per run           [120]
@@ -37,9 +39,18 @@ DTYPES=${DTYPES:-"f32 bf16 f16"}
 OPS=${OPS:-"sum prod"}
 MIN_SIZE=${MIN_SIZE:-1048576}
 MAX_SIZE=${MAX_SIZE:-134217728}
+SIZE_STEP=${SIZE_STEP:-2/1}
+SIZE_ALIGN=${SIZE_ALIGN:-256}
+STEP_NUM=${SIZE_STEP%/*}; STEP_DEN=${SIZE_STEP#*/}
+[[ "$SIZE_STEP" == */* ]] || STEP_DEN=1
+if (( STEP_NUM <= STEP_DEN )); then
+  echo "SIZE_STEP must be > 1: $SIZE_STEP" >&2; exit 2
+fi
 if [[ -z "${SIZES:-}" ]]; then
   SIZES=
-  for ((s = MIN_SIZE; s <= MAX_SIZE; s *= 2)); do SIZES+="$s "; done
+  for ((s = MIN_SIZE; s <= MAX_SIZE; s = s * STEP_NUM / STEP_DEN)); do
+    SIZES+="$(( s / SIZE_ALIGN * SIZE_ALIGN )) "
+  done
 fi
 # Append extra (e.g. non-power-of-two) element counts to whatever SIZES holds.
 [[ -n "${EXTRA_SIZES:-}" ]] && SIZES+=" $EXTRA_SIZES"
