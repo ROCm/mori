@@ -476,32 +476,177 @@ TEST_F(SsdBackendTest, ResolveReportsBusyWhenStagingIsExhausted) {
 }
 
 TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
-  SsdBackend* backend = Start(/*staging_pages=*/4);
-  ASSERT_TRUE(Put(backend, "blocker", Payload(1024, 1)));
+  // Six pages, so a call may stage three; the blocker leaves only two free.
+  SsdBackend* backend = Start(/*staging_pages=*/6);
+  ASSERT_TRUE(Put(backend, "blocker", Payload(4 * kPageSize, 1)));
   ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
-  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
-  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);  // one page remains leased
+  ASSERT_TRUE(Put(backend, "small-b", Payload(1024, 3)));
+  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);  // four pages stay leased
 
-  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
+  auto resolved = backend->BatchResolve({"large-a", "small-b"}, false);
   ASSERT_EQ(resolved.size(), 2u);
   EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kBusy);
   EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kBusy);
 
-  // The first two-page reservation was returned when the second could not fit:
-  // all three pages not held by blocker are available to one writer.
-  auto allocated = backend->BatchAllocate({AllocateRequest{"three-pages", 3 * kPageSize}});
+  // large-a's two-page reservation was returned when small-b could not fit:
+  // both pages not held by blocker are available to one writer.
+  auto allocated = backend->BatchAllocate({AllocateRequest{"two-pages", 2 * kPageSize}});
   EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
 }
 
-TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
+// A batch that needs more than its share of the arena (half) is served in
+// order up to that share and the rest deferred -- not failed: before this, any
+// batch larger than the arena was unreadable however long the caller waited.
+TEST_F(SsdBackendTest, BatchLargerThanItsShareIsServedInParts) {
   SsdBackend* backend = Start(/*staging_pages=*/3);
   ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
   ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
 
-  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
-  ASSERT_EQ(resolved.size(), 2u);
-  EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kFailed);
-  EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kFailed);
+  auto first = backend->BatchResolve({"large-a", "large-b"}, false, false, ResolveReader::kLocal);
+  ASSERT_EQ(first.size(), 2u);
+  // The first key is always taken, even past the share, so a batch progresses.
+  EXPECT_EQ(first[0].outcome, ResolveOutcome::kFound);
+  EXPECT_NE(first[0].lease_token, 0u);
+  EXPECT_EQ(first[1].outcome, ResolveOutcome::kDeferred);
+  EXPECT_FALSE(first[1].found);
+
+  // The caller's next round, once it has read and released the first part.
+  backend->ReleaseResolved({"large-a"}, {first[0].lease_token});
+  auto second = backend->BatchResolve({"large-b"}, false, false, ResolveReader::kLocal);
+  ASSERT_EQ(second.size(), 1u);
+  EXPECT_EQ(second[0].outcome, ResolveOutcome::kFound);
+}
+
+// The staging behind a read goes back when its reader says it is done, not at
+// the lease's expiry -- the arena otherwise has to hold read_rate x lease.
+TEST_F(SsdBackendTest, ReleaseReturnsStagingBeforeTheLeaseExpires) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+
+  auto resolved = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(resolved[0].found);
+  ASSERT_NE(resolved[0].lease_token, 0u);
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace);
+
+  backend->ReleaseResolved({"key-a"}, {resolved[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
+// Two readers share one staged copy; the first to finish must not pull it out
+// from under the second.
+TEST_F(SsdBackendTest, EveryHolderMustReleaseASharedLease) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+
+  auto first = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  auto second = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(first[0].found);
+  ASSERT_TRUE(second[0].found);
+  ASSERT_EQ(first[0].lease_token, second[0].lease_token);
+
+  backend->ReleaseResolved({"key-a"}, {first[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "released while the second reader still holds it";
+
+  backend->ReleaseResolved({"key-a"}, {second[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
+// A release carries the token of the lease it was given, so a stray release
+// (here: one naming a lease that expired and was replaced) cannot free the
+// staging a later reader of the same key holds.
+TEST_F(SsdBackendTest, AReleaseForAnExpiredLeaseCannotFreeItsSuccessor) {
+  // Long enough that the fresh lease below outlives the assertions.
+  SsdBackend* backend =
+      Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{300});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+
+  // A remote reader's lease: the only kind that expires on its own.
+  auto stale = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(stale[0].found);
+  std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  backend->RunReaperOnceForTest();  // the stale lease is gone
+
+  auto fresh = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(fresh[0].found);
+  ASSERT_NE(fresh[0].lease_token, stale[0].lease_token);
+
+  backend->ReleaseResolved({"key-a"}, {stale[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace);
+
+  backend->ReleaseResolved({"key-a"}, {fresh[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
+// A local copy that outlives the read lease keeps its staging: the reaper
+// must never reclaim pages an in-process reader has not released, or the copy
+// reads pages another resolve is already staging into.
+TEST_F(SsdBackendTest, ALocalReaderOutlivingItsLeaseKeepsItsStaging) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+
+  auto held = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(held[0].found);
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();  // long past the lease
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "the reaper reclaimed staging a local reader was still holding";
+
+  backend->ReleaseResolved({"key-a"}, {held[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
+// A peer reading over the wire never reports completion, so a lease it shares
+// with a local reader waits for its expiry even after the local one releases.
+TEST_F(SsdBackendTest, AReleaseLeavesARemoteReadersStagingToItsExpiry) {
+  SsdBackend* backend =
+      Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{300});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+
+  auto remote = backend->BatchResolve({"key-a"}, false);  // kRemote
+  auto local = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(remote[0].found);
+  ASSERT_TRUE(local[0].found);
+
+  backend->ReleaseResolved({"key-a"}, {local[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "freed under a remote reader";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
+// A BUSY batch is discarded and retried whole, so the holders it took on keys
+// that were already staged must be dropped again -- else those leases could
+// never be released early.
+TEST_F(SsdBackendTest, ABusyResolveDropsTheHoldersItTook) {
+  SsdBackend* backend = Start(/*staging_pages=*/2, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "small", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "large", Payload(2 * kPageSize, 2)));
+
+  auto held = backend->BatchResolve({"small"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(held[0].found);
+
+  // "small" is a lease hit; "large" needs both pages and only one is free.
+  auto busy = backend->BatchResolve({"small", "large"}, false, false, ResolveReader::kLocal);
+  ASSERT_EQ(busy.size(), 2u);
+  EXPECT_EQ(busy[1].outcome, ResolveOutcome::kBusy);
+
+  backend->ReleaseResolved({"small"}, {held[0].lease_token});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"both", 2 * kPageSize}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated)
+      << "the BUSY call kept a holder on 'small'";
 }
 
 // ---------------------------------------------------------------------------

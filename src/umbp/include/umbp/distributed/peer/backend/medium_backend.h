@@ -158,11 +158,32 @@ struct CommitResult {
 // staging) becomes available; callers must retry THIS peer rather than exclude
 // it as they do for kMissing.  kFailed is a permanent shape/backend error and
 // must not be retried indefinitely.
+//
+// kDeferred means the key is held and readable, but this call staged as much
+// of the batch as the backend can hold at once and left this key out.  It is
+// not pressure that waiting clears -- the same batch would be deferred again --
+// so it is NOT kBusy: the caller consumes and releases (ReleaseResolved) what
+// was published, then resolves the deferred keys in a further call.  Only a
+// staged medium returns it; a caller that cannot make a further call (a peer
+// answering over the wire) treats it as kFailed.
+// Who will read what a resolve publishes, which decides how long a medium
+// must keep it readable.  A kLocal reader is this process: it reads through
+// the transfer layer, observes completion, and ALWAYS calls ReleaseResolved
+// afterwards -- so its hold never expires on a timer (an expiry would free
+// bytes it may still be copying).  A kRemote reader is a peer over the wire
+// that cannot report completion, so its hold lasts the medium's read lease.
+// kRemote is the default because it is the one that cannot leak.
+enum class ResolveReader {
+  kRemote,
+  kLocal,
+};
+
 enum class ResolveOutcome {
   kMissing,
   kFound,
   kBusy,
   kFailed,
+  kDeferred,
 };
 
 struct ResolvedEntry {
@@ -182,6 +203,12 @@ struct ResolvedEntry {
   // into device memory, with `pages` left empty.  A memory-backed medium leaves
   // this invalid and publishes pages as before.
   TransferRef file_ref{};
+
+  // Non-zero when the published bytes sit in staging the caller should hand
+  // back with ReleaseResolved once it has read them.  It names the lease this
+  // entry was published under, so a release that arrives after that lease
+  // expired cannot free a later reader's staging.  Not carried on the wire.
+  uint64_t lease_token = 0;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -333,9 +360,13 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                                  bool include_descs,
-                                                  bool allow_file_refs = false) = 0;
+  //
+  // `reader` (see ResolveReader): a kLocal caller must hand every published
+  // entry back with ReleaseResolved, and until it does the entry stays readable
+  // however long the copy takes.
+  virtual std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
@@ -346,6 +377,22 @@ class MediumBackend : public MetricSource {
     return false;
   }
   virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
+
+  // The caller has finished reading what an earlier BatchResolve published for
+  // these keys, one entry per published entry (an entry with lease_token 0 is
+  // skipped).  A staged medium may then reuse
+  // the staging the entry pointed at instead of holding it for the whole read
+  // lease; anything never released still falls back to the lease's expiry, so
+  // a reader that cannot report completion (a peer reading over the wire) is
+  // unaffected.  The transfer layer is the only one that observes completion,
+  // which is why this is a signal from the caller and not a backend timer.
+  // A medium that resolves its own resident bytes has nothing to release and
+  // publishes lease_token 0.  `lease_tokens` is parallel to `keys`.
+  virtual void ReleaseResolved(const std::vector<std::string>& keys,
+                               const std::vector<uint64_t>& lease_tokens) {
+    (void)keys;
+    (void)lease_tokens;
+  }
 
   // Authoritative metadata lookup with no staging, descriptor construction, or
   // read-lease side effects. Pool placement validation must use this instead of

@@ -159,20 +159,34 @@ std::vector<bool> InstrumentedBackend::BatchAbort(const std::vector<uint64_t>& s
 
 std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(const std::vector<std::string>& keys,
                                                              bool include_descs,
-                                                             bool allow_file_refs) {
+                                                             bool allow_file_refs,
+                                                             ResolveReader reader) {
   ops_[kResolve].batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<ResolvedEntry> out;
   {
     ScopedNanos timer(ops_[kResolve].nanos);
-    out = inner_->BatchResolve(keys, include_descs, allow_file_refs);
+    out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader);
   }
   uint64_t bytes = 0;
   for (const ResolvedEntry& r : out) {
-    if (r.found) {
-      Add(kResolve, kOk, 1);
-      bytes += r.size;
-    } else {
-      Add(kResolve, kMiss, 1);
+    switch (EffectiveResolveOutcome(r)) {
+      case ResolveOutcome::kFound:
+        Add(kResolve, kOk, 1);
+        bytes += r.size;
+        break;
+      case ResolveOutcome::kMissing:
+        Add(kResolve, kMiss, 1);
+        break;
+      case ResolveOutcome::kFailed:
+        // Held but unreadable: the one resolve result that is a real load
+        // failure, so it must not hide among the misses.
+        Add(kResolve, kFailed, 1);
+        break;
+      case ResolveOutcome::kBusy:
+      case ResolveOutcome::kDeferred:
+        // Not an answer yet: the caller resolves these keys again, and that
+        // call is the one counted.
+        break;
     }
   }
   if (bytes > 0) ops_[kResolve].bytes.fetch_add(bytes, std::memory_order_relaxed);
