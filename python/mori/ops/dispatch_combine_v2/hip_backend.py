@@ -1247,13 +1247,32 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "combine_recv": ("combine_recvtransfer{sfx}", "combine_recvcopy"),
     }
 
+    # LSA's dispatch send is two passes, not three. The staging hop exists so
+    # ccoSdma has a local contiguous source to hand the engine; a peer store does
+    # not need one, so the gather addresses the peer itself and the bulk copy --
+    # a whole pass over the payload -- is gone. The fused kernel also publishes
+    # the counts, which is all SendTransferLsa did besides copying.
+    _ASYNCLL_SEQ_DISPATCH_SEND_LSA = (
+        "dispatch_slotassign",
+        "dispatch_sendcopy_lsa",
+    )
+
     @classmethod
     def _asyncll_seq(cls, cfg):
-        sfx = "_lsa" if cfg.async_ll_transport == "lsa" else ""
-        return {
+        lsa = cfg.async_ll_transport == "lsa"
+        sfx = "_lsa" if lsa else ""
+        seq = {
             group: tuple(n.format(sfx=sfx) for n in names)
             for group, names in cls._ASYNCLL_SEQ_TEMPLATE.items()
         }
+        # The unfused LSA sequence is reachable through MORI_ASYNCLL_LSA_FUSED=0
+        # so the fusion can be A/B'd against it on one box in one container.
+        # Comparing against the pre-fusion numbers recorded elsewhere would be
+        # comparing across machines, which on these parts is enough to move a
+        # single-digit effect either way.
+        if lsa and os.environ.get("MORI_ASYNCLL_LSA_FUSED", "1") != "0":
+            seq["dispatch_send"] = cls._ASYNCLL_SEQ_DISPATCH_SEND_LSA
+        return seq
 
     # Which leg's dtype each pass is compiled for. Same rule as _INTERNODE_LEG:
     # compiling a combine pass with the dispatch dtype is how an fp8 dispatch ends

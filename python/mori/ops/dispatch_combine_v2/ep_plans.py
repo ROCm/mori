@@ -104,6 +104,10 @@ EP_ASYNCLL_PLANS = {
         "combine_recvcopy",
         # The LSA transport's transfer passes. Same protocol, peer stores instead
         # of the copy engine; the op picks one set or the other at build time.
+        # dispatch_sendcopy_lsa replaces the sendcopy/sendtransfer PAIR: with no
+        # engine to feed there is no reason to stage, so the gather lands in the
+        # peer and one pass over the payload disappears.
+        "dispatch_sendcopy_lsa",
         "dispatch_sendtransfer_lsa",
         "dispatch_recvtransfer_lsa",
         "combine_sendtransfer_lsa",

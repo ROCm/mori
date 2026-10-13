@@ -245,6 +245,95 @@ __device__ void EpDispatchAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/*            EpDispatchAsyncLLSendCopyLsa -- dispatch passes 2 and 3, fused (LSA only)           */
+/* ---------------------------------------------------------------------------------------------- */
+// The same gather, landed in the peer instead of in local staging.
+//
+// The unfused pair moves the payload twice: SendCopy gathers scattered tokens
+// into staging at SendBufSlotOffset(destPe, slot), then SendTransferLsa bulk
+// copies that contiguous range into the peer. The second pass exists because
+// ccoSdma needs a local, contiguous source to hand the engine. A peer store has
+// no such requirement -- the grid is already doing the move -- so for this
+// transport the gather can address the peer directly and the bulk copy
+// disappears, taking one of AsyncLL's three passes over the payload with it.
+//
+// Self is the exception: RecvCopy reads this rank's own slice out of staging,
+// not out of dispatchInp, so entries for myPe still land where they did.
+//
+// It also absorbs the count publication, which is a handful of words and the
+// only other thing SendTransferLsa did. RecvTransfer is still what sends those
+// counts, one kernel boundary later, so the payload is visible to the peer
+// before its count is.
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpDispatchAsyncLLSendCopyLsa_body(EpDispatchCombineArgs args) {
+  DEF_COMMON_VARS;
+
+  // Unconditional, not gated on having tokens: a rank handed none still has to
+  // publish its zero or every peer waits on it forever.
+  if (globalWarpId == 0 && laneId < npes) {
+    uint8_t* sendCount = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+    *reinterpret_cast<uint64_t*>(sendCount + asyncll::SendCountSlot(laneId)) =
+        static_cast<uint64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId)) + 1;
+  }
+
+  const index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
+  if (totalEntries <= 0) return;
+
+  const index_t warpsPerToken = (globalWarpNum + totalEntries - 1) / totalEntries;
+  const size_t hiddenBytesPerWarp =
+      ((hiddenBytes + warpsPerToken - 1) / warpsPerToken + 15) & ~static_cast<size_t>(15);
+
+  uint8_t* stagingPtr = args.reg(args.offStaging)->template GetAs<uint8_t*>();
+
+  for (int i = globalWarpId; i < totalEntries * warpsPerToken; i += globalWarpNum) {
+    const index_t entryId = i / warpsPerToken;
+    const index_t inTokenPartId = i % warpsPerToken;
+
+    const index_t destTokOffset = args.dispDestTokIdMap[entryId];
+    if (destTokOffset >= NullSendBufSlotOffset(config)) continue;
+
+    const int destPe = PeFromSendBufSlotOffset(config, destTokOffset);
+    const int slotId = SlotIdFromSendBufSlotOffset(config, destTokOffset);
+    const index_t srcTokId = entryId / config.numExpertPerToken;
+
+    // The two halves of SendBufSlotOffset's symmetry, as in the SDMA transfer:
+    // locally a slot is indexed by its DESTINATION, in the peer by its SOURCE.
+    uint8_t* dst;
+    if (destPe == myPe) {
+      dst = stagingPtr + static_cast<size_t>(destTokOffset) * xferBytes;
+    } else {
+      dst = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>(destPe) +
+            static_cast<size_t>(SendBufSlotOffset(config, myPe, slotId)) * xferBytes;
+    }
+
+    const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
+    if (hiddenOffset < hiddenBytes) {
+      const size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
+      core::WarpCopy<uint8_t, 1>(
+          dst + hiddenOffset,
+          static_cast<const uint8_t*>(args.inpTokenBuf) + srcTokId * hiddenBytes + hiddenOffset,
+          len);
+    }
+
+    if (inTokenPartId == 0) {
+      core::WarpCopy<uint8_t, 1>(
+          dst + hiddenBytes, reinterpret_cast<uint8_t*>(args.tokenIndices) + srcTokId * indexBytes,
+          indexBytes);
+      if (args.weightsBuf)
+        core::WarpCopy<uint8_t, 1>(
+            dst + hiddenBytes + indexBytes,
+            reinterpret_cast<uint8_t*>(args.weightsBuf) + srcTokId * weightBytes, weightBytes);
+      if (args.scalesBuf && (scaleBytes > 0))
+        core::WarpCopy<uint8_t, 1>(dst + hiddenBytes + indexBytes + weightBytes,
+                                   args.scalesBuf + srcTokId * scaleBytes, scaleBytes);
+      if (laneId == 0)
+        reinterpret_cast<index_t*>(dst + hiddenBytes + indexBytes + weightBytes + scaleBytes)[0] =
+            static_cast<index_t>(asyncll::SrcTokenIndex(config, myPe, srcTokId));
+    }
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /*                         EpDispatchAsyncLLSendTransfer -- dispatch pass 3                       */
 /* ---------------------------------------------------------------------------------------------- */
 // Issue and return. Nothing is waited on here: that is what makes the seam between

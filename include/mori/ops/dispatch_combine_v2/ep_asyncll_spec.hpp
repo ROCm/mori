@@ -64,6 +64,11 @@ enum class EpAsyncLLKernel {
   // rather than a runtime branch, for the reason v2 and v2_ll are separate: the
   // choice is fixed for an op, and a branch would compile both bodies into every
   // module.
+  // SendCopy and SendTransferLsa fused: the gather lands straight in the peer,
+  // so the staging hop the engine needed is not there to copy out of. Replaces
+  // BOTH of them in the LSA sequence; there is no SDMA counterpart because that
+  // transport does need the local contiguous source.
+  DispatchSendCopyLsa,
   DispatchSendTransferLsa,
   DispatchRecvTransferLsa,
   CombineSendTransferLsa,
@@ -108,6 +113,8 @@ MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendCopySpec, "ep_asyncll_combine_s
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferSpec, "ep_asyncll_combine_sendtransfer");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvTransferSpec, "ep_asyncll_combine_recvtransfer");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvCopySpec, "ep_asyncll_combine_recvcopy");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendCopyLsaSpec,
+                             "ep_asyncll_dispatch_sendcopy_lsa");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendTransferLsaSpec,
                              "ep_asyncll_dispatch_sendtransfer_lsa");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchRecvTransferLsaSpec,

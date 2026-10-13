@@ -61,6 +61,8 @@ AsyncLLDescriptor DescriptorFor(EpAsyncLLKernel kind) {
       return {"combine_recvtransfer", "EpCombineAsyncLLRecvTransfer_body"};
     case EpAsyncLLKernel::CombineRecvCopy:
       return {"combine_recvcopy", "EpCombineAsyncLLRecvCopy_body"};
+    case EpAsyncLLKernel::DispatchSendCopyLsa:
+      return {"dispatch_sendcopy_lsa", "EpDispatchAsyncLLSendCopyLsa_body"};
     case EpAsyncLLKernel::DispatchSendTransferLsa:
       return {"dispatch_sendtransfer_lsa", "EpDispatchAsyncLLSendTransferLsa_body"};
     case EpAsyncLLKernel::DispatchRecvTransferLsa:
@@ -161,6 +163,10 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     // need it but share the number so a profile lines the three up.
     case EpAsyncLLKernel::DispatchSlotAssign:
     case EpAsyncLLKernel::DispatchSendCopy:
+    // The fused LSA copy belongs here and not with the transfers: it walks token
+    // ENTRIES like the other copy passes, and reaches the peer by pointer rather
+    // than by owning a slice of the grid.
+    case EpAsyncLLKernel::DispatchSendCopyLsa:
     case EpAsyncLLKernel::DispatchRecvCopy:
     case EpAsyncLLKernel::CombineSendCopy:
       geometry.gridX = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.mpCount, worldSize));
@@ -225,6 +231,7 @@ MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendCopySpec, CombineSendCopy)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendTransferSpec, CombineSendTransfer)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineRecvTransferSpec, CombineRecvTransfer)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineRecvCopySpec, CombineRecvCopy)
+MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendCopyLsaSpec, DispatchSendCopyLsa)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendTransferLsaSpec, DispatchSendTransferLsa)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchRecvTransferLsaSpec, DispatchRecvTransferLsa)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendTransferLsaSpec, CombineSendTransferLsa)
@@ -281,6 +288,7 @@ MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_sendcopy, EpAsyncLLCombineSendCop
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_sendtransfer, EpAsyncLLCombineSendTransferSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_recvtransfer, EpAsyncLLCombineRecvTransferSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_recvcopy, EpAsyncLLCombineRecvCopySpec)
+MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_sendcopy_lsa, EpAsyncLLDispatchSendCopyLsaSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_sendtransfer_lsa,
                             EpAsyncLLDispatchSendTransferLsaSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_recvtransfer_lsa,
