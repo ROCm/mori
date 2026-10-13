@@ -3572,7 +3572,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
         PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
         planned = plan_builder->Finish();
       }
-      transfer_engine_->Transfer(std::move(planned), &failed_tags, dbg != nullptr ? &steps : nullptr);
+      transfer_engine_->Transfer(std::move(planned), &failed_tags,
+                                 dbg != nullptr ? &steps : nullptr);
     }
     const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
     for (size_t i : local_keys) {

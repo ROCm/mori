@@ -234,7 +234,8 @@ class CompositeTransferEngine::PlanBuilder final : public TransferPlanBuilder {
   std::vector<size_t> rejected_;
 };
 
-std::unique_ptr<TransferPlanBuilder> CompositeTransferEngine::CreatePlanBuilder(size_t expected_items) const {
+std::unique_ptr<TransferPlanBuilder> CompositeTransferEngine::CreatePlanBuilder(
+    size_t expected_items) const {
   return std::make_unique<PlanBuilder>(*this, expected_items);
 }
 

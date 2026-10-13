@@ -402,8 +402,7 @@ class HbmPlanBuilder final : public TransferPlanBuilder {
                                 : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
                                               : 0;
     const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
-      return (host_base + (host_is_src ? src_offset : dst_offset)) /
-             host_registration_piece_;
+      return (host_base + (host_is_src ? src_offset : dst_offset)) / host_registration_piece_;
     };
     size_t so = static_cast<size_t>(item.src_offset);
     size_t dof = static_cast<size_t>(item.dst_offset);
@@ -412,8 +411,7 @@ class HbmPlanBuilder final : public TransferPlanBuilder {
       size_t sz = remaining;
       if (host_base != 0) {
         const uintptr_t host = host_base + (host_is_src ? so : dof);
-        sz = std::min<size_t>(sz,
-                              host_registration_piece_ - host % host_registration_piece_);
+        sz = std::min<size_t>(sz, host_registration_piece_ - host % host_registration_piece_);
       }
       const bool can_coalesce =
           !plan.sizes.empty() &&
@@ -446,7 +444,8 @@ class HbmPlanBuilder final : public TransferPlanBuilder {
 };
 }  // namespace
 
-std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(size_t /*expected_items*/) const {
+std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
   return std::make_unique<HbmPlanBuilder>(*this);
 }
 

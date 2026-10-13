@@ -68,7 +68,8 @@ class BufferedPlanBuilder final : public TransferPlanBuilder {
 };
 }  // namespace
 
-std::unique_ptr<TransferPlanBuilder> TransferEngine::CreatePlanBuilder(size_t expected_items) const {
+std::unique_ptr<TransferPlanBuilder> TransferEngine::CreatePlanBuilder(
+    size_t expected_items) const {
   return std::make_unique<BufferedPlanBuilder>(*this, expected_items);
 }
 
@@ -84,8 +85,8 @@ bool TransferEngine::Transfer(const std::vector<TransferItem>& items,
   return Transfer(std::move(planned), failed_tags, timing);
 }
 
-bool TransferEngine::Transfer(TransferPlanSet planned,
-                              std::vector<size_t>* failed_tags, const StepTiming* timing) {
+bool TransferEngine::Transfer(TransferPlanSet planned, std::vector<size_t>* failed_tags,
+                              const StepTiming* timing) {
   bool ok = planned.rejected_tags.empty();
   if (failed_tags != nullptr) {
     failed_tags->insert(failed_tags->end(), planned.rejected_tags.begin(),

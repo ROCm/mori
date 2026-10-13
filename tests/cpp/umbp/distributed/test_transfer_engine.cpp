@@ -198,7 +198,7 @@ TEST(HbmCopyEngine, BuilderCreatesPlanPerBufferPair) {
   auto host = TransferRef::HostBytes(src.data(), src.size());
   auto gpu = TransferRef::HostBytes(dst.data(), dst.size(), mori::io::MemoryLocationType::GPU, 0);
   auto other_gpu = TransferRef::HostBytes(other_dst.data(), other_dst.size(),
-                                         mori::io::MemoryLocationType::GPU, 0);
+                                          mori::io::MemoryLocationType::GPU, 0);
   auto builder = engine.CreatePlanBuilder();
   builder->Add(MakeItem(host, 0, gpu, 0, 4, 1));
   builder->Add(MakeItem(host, 16, other_gpu, 2, 4, 2));
@@ -347,7 +347,7 @@ TEST(CompositeTransferEngine, BuilderGroupsHbmAndBatchesOtherEngines) {
   auto host = TransferRef::HostBytes(src.data(), src.size());
   auto cpu = TransferRef::HostBytes(dst.data(), dst.size());
   auto gpu = TransferRef::HostBytes(gpu_bytes.data(), gpu_bytes.size(),
-                                   mori::io::MemoryLocationType::GPU, 0);
+                                    mori::io::MemoryLocationType::GPU, 0);
   auto remote = RemoteRef("peer", 3, 64);
   auto builder = composite.CreatePlanBuilder();
   builder->Add(MakeItem(host, 0, gpu, 0, 4, 10));
