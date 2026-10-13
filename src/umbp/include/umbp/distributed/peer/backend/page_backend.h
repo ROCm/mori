@@ -320,7 +320,10 @@ class PageBackend : public MediumBackend {
   // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
   void TrackEvictionOrder() override;
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
-  void Touch(const std::vector<std::string>& keys) override;
+
+  // Moves held keys to the recent end of the order, as a read would, without
+  // the read's lease.  0 until TrackEvictionOrder().
+  size_t Touch(const std::vector<std::string>& keys) override;
 
   // ==================== Reaper ====================
 
