@@ -4541,78 +4541,93 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
                                          std::vector<bool>* results) {
   entries->clear();
 
-  // Ask the peer to omit the buffer descriptors once we have already hydrated
-  // them (from the GetPeerInfo handshake, or a prior resolve).  A wrong guess
-  // is safe: a missing descriptor is caught by the transfer-build guard and the
-  // entry degrades to a miss, never a corrupt read.
-  const bool have_descs =
-      peer_directory_ != nullptr && peer_directory_->HasRemoteBuffers(peer.node_id);
-
-  ::umbp::BatchResolveKeysRequest resolve_req;
-  for (const auto& item : items) resolve_req.add_keys(*item.key);
-  resolve_req.set_omit_descs(have_descs);
-
   DecodedBatchResolve decoded;
-  const auto retry_timeout = ResolveBusyRetryTimeout();
-  const auto retry_deadline = std::chrono::steady_clock::now() + retry_timeout;
-  std::chrono::milliseconds backoff{1};
-  size_t busy_attempts = 0;
-  while (true) {
-    ::umbp::BatchResolveKeysResponse resolve_resp;
-    grpc::ClientContext resolve_ctx;
-    const auto remaining = retry_deadline - std::chrono::steady_clock::now();
-    if (remaining <= std::chrono::steady_clock::duration::zero()) {
-      MORI_UMBP_WARN("[PoolClient] BatchResolveKeys BUSY timeout on {} after {} attempts",
-                     items.front().route.node_id, busy_attempts);
-      for (const auto& item : items) (*results)[item.index] = false;
-      return false;
-    }
-    resolve_ctx.set_deadline(std::chrono::system_clock::now() + remaining);
-    grpc::Status resolve_status;
-    {
-      PhaseTimer resolve_timer(t_remote_leg ? t_remote_leg->resolve : nullptr);
-      resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
-    }
-    if (!resolve_status.ok() ||
-        BatchResolveKeyCount(resolve_resp) != static_cast<int>(items.size())) {
-      MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}", items.front().route.node_id,
-                     resolve_status.error_message());
-      for (const auto& item : items) (*results)[item.index] = false;
-      return false;
-    }
 
-    {
-      PhaseTimer decode_timer(t_remote_leg ? t_remote_leg->decode : nullptr);
-      decoded = DecodeBatchResolveResponse(resolve_resp);
-    }
-    if (decoded.keys.size() != items.size()) {
-      // Malformed (mismatched parallel arrays); fail the whole batch rather
-      // than partially reading it.
-      MORI_UMBP_WARN("[PoolClient] BatchResolveKeys malformed response on {}: {} keys for {} items",
-                     items.front().route.node_id, decoded.keys.size(), items.size());
-      for (const auto& item : items) (*results)[item.index] = false;
-      return false;
-    }
+  // A ranged-get group (BeginRangedGetGroup) may already hold a resolve for
+  // every key this call asks about, still inside its read lease -- in which
+  // case the RPC below is exactly the round trip the group exists to skip.
+  auto cached = TryReuseRangedGetGroup(peer.node_id, items);
+  if (cached.has_value()) {
+    decoded = std::move(*cached);
+  } else {
+    // Ask the peer to omit the buffer descriptors once we have already
+    // hydrated them (from the GetPeerInfo handshake, or a prior resolve).  A
+    // wrong guess is safe: a missing descriptor is caught by the
+    // transfer-build guard and the entry degrades to a miss, never a corrupt
+    // read.
+    const bool have_descs =
+        peer_directory_ != nullptr && peer_directory_->HasRemoteBuffers(peer.node_id);
 
-    const bool busy = std::any_of(decoded.keys.begin(), decoded.keys.end(), [](const auto& key) {
-      return key.outcome == ResolveOutcome::kBusy;
-    });
-    if (!busy) break;
+    ::umbp::BatchResolveKeysRequest resolve_req;
+    for (const auto& item : items) resolve_req.add_keys(*item.key);
+    resolve_req.set_omit_descs(have_descs);
+    remote_resolve_rpc_count_.fetch_add(1, std::memory_order_relaxed);
 
-    // Discard the ENTIRE response.  Keeping its successful SSD entries while
-    // retrying only BUSY keys would pin their leases and can make forward
-    // progress impossible; it can also leave stale page locations if a retry
-    // outlives the lease.
-    ++busy_attempts;
-    const auto sleep_for =
-        std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(
-                              retry_deadline - std::chrono::steady_clock::now()));
-    if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
-    backoff = std::min(backoff * 2, std::chrono::milliseconds{50});
+    const auto retry_timeout = ResolveBusyRetryTimeout();
+    const auto retry_deadline = std::chrono::steady_clock::now() + retry_timeout;
+    std::chrono::milliseconds backoff{1};
+    size_t busy_attempts = 0;
+    while (true) {
+      ::umbp::BatchResolveKeysResponse resolve_resp;
+      grpc::ClientContext resolve_ctx;
+      const auto remaining = retry_deadline - std::chrono::steady_clock::now();
+      if (remaining <= std::chrono::steady_clock::duration::zero()) {
+        MORI_UMBP_WARN("[PoolClient] BatchResolveKeys BUSY timeout on {} after {} attempts",
+                       items.front().route.node_id, busy_attempts);
+        for (const auto& item : items) (*results)[item.index] = false;
+        return false;
+      }
+      resolve_ctx.set_deadline(std::chrono::system_clock::now() + remaining);
+      grpc::Status resolve_status;
+      {
+        PhaseTimer resolve_timer(t_remote_leg ? t_remote_leg->resolve : nullptr);
+        resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+      }
+      if (!resolve_status.ok() ||
+          BatchResolveKeyCount(resolve_resp) != static_cast<int>(items.size())) {
+        MORI_UMBP_WARN("[PoolClient] BatchResolveKeys failed on {}: {}",
+                       items.front().route.node_id, resolve_status.error_message());
+        for (const auto& item : items) (*results)[item.index] = false;
+        return false;
+      }
+
+      {
+        PhaseTimer decode_timer(t_remote_leg ? t_remote_leg->decode : nullptr);
+        decoded = DecodeBatchResolveResponse(resolve_resp);
+      }
+      if (decoded.keys.size() != items.size()) {
+        // Malformed (mismatched parallel arrays); fail the whole batch rather
+        // than partially reading it.
+        MORI_UMBP_WARN(
+            "[PoolClient] BatchResolveKeys malformed response on {}: {} keys for {} items",
+            items.front().route.node_id, decoded.keys.size(), items.size());
+        for (const auto& item : items) (*results)[item.index] = false;
+        return false;
+      }
+
+      const bool busy = std::any_of(decoded.keys.begin(), decoded.keys.end(), [](const auto& key) {
+        return key.outcome == ResolveOutcome::kBusy;
+      });
+      if (!busy) break;
+
+      // Discard the ENTIRE response.  Keeping its successful SSD entries while
+      // retrying only BUSY keys would pin their leases and can make forward
+      // progress impossible; it can also leave stale page locations if a retry
+      // outlives the lease.
+      ++busy_attempts;
+      const auto sleep_for =
+          std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                retry_deadline - std::chrono::steady_clock::now()));
+      if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
+      backoff = std::min(backoff * 2, std::chrono::milliseconds{50});
+    }
+    // Hydrate the batch-level descriptors once (skipped when the peer honored
+    // omit_descs and sent none).
+    if (!decoded.descs.empty()) peer_directory_->CacheRemoteBuffers(peer.node_id, decoded.descs);
+    // An open group pinning some of these keys gets the fresh answer too, so
+    // the NEXT call in the group is the one that skips the RPC, not this one.
+    RefreshRangedGetGroup(peer.node_id, items, decoded);
   }
-  // Hydrate the batch-level descriptors once (skipped when the peer honored
-  // omit_descs and sent none).
-  if (!decoded.descs.empty()) peer_directory_->CacheRemoteBuffers(peer.node_id, decoded.descs);
 
   entries->reserve(items.size());
   for (size_t i = 0; i < items.size(); ++i) {
@@ -4653,6 +4668,131 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
   }
 
   return !entries->empty();
+}
+
+// ---------------------------------------------------------------------------
+//  Ranged-get groups
+// ---------------------------------------------------------------------------
+
+std::optional<DecodedBatchResolve> PoolClient::TryReuseRangedGetGroup(
+    const std::string& node_id, const std::vector<BatchGetItem>& items) {
+  std::lock_guard<std::mutex> lock(ranged_get_group_mutex_);
+  auto peer_it = ranged_get_group_cache_.find(node_id);
+  if (peer_it == ranged_get_group_cache_.end()) return std::nullopt;
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto ttl = DramReadLeaseTtl();
+  // A margin under the real lease, not a TTL invented for the cache: the peer
+  // already promised this window when it resolved the pages, and transit plus
+  // clock skew is what the margin covers.
+  constexpr auto kMargin = std::chrono::milliseconds(50);
+
+  DecodedBatchResolve out;
+  out.page_size = peer_it->second.page_size;
+  out.keys.reserve(items.size());
+  for (const auto& item : items) {
+    auto key_it = peer_it->second.keys.find(*item.key);
+    if (key_it == peer_it->second.keys.end()) return std::nullopt;
+    if (now - key_it->second.resolved_at + kMargin >= ttl) return std::nullopt;
+    out.keys.push_back(key_it->second.resolved);
+  }
+  return out;
+}
+
+void PoolClient::RefreshRangedGetGroup(const std::string& node_id,
+                                       const std::vector<BatchGetItem>& items,
+                                       const DecodedBatchResolve& decoded) {
+  std::lock_guard<std::mutex> lock(ranged_get_group_mutex_);
+  auto peer_it = ranged_get_group_cache_.find(node_id);
+  if (peer_it == ranged_get_group_cache_.end()) return;
+
+  const auto now = std::chrono::steady_clock::now();
+  for (size_t i = 0; i < items.size() && i < decoded.keys.size(); ++i) {
+    // A key never named to BeginRangedGetGroup is left alone -- writing it
+    // here would turn this into an unbounded cache of every remote get this
+    // client ever makes, which is exactly the capacity/eviction problem a
+    // group is meant to avoid.
+    auto key_it = peer_it->second.keys.find(*items[i].key);
+    if (key_it == peer_it->second.keys.end()) continue;
+    if (!decoded.keys[i].found) continue;
+    key_it->second.resolved = decoded.keys[i];
+    key_it->second.resolved_at = now;
+  }
+}
+
+bool PoolClient::BeginRangedGetGroup(const std::vector<std::string>& keys) {
+  if (keys.empty() || !initialized_ || !HasMaster()) return false;
+
+  std::vector<size_t> all(keys.size());
+  std::iota(all.begin(), all.end(), size_t{0});
+  std::vector<std::optional<RouteGetResult>> routes(keys.size());
+  if (!RouteGetsInto(keys, all, /*exclude_self=*/true, &routes)) return false;
+
+  // A group is one peer's worth of resolve, held under one lease.  Keys that
+  // land on different peers (or nowhere) do not fit that shape; the caller's
+  // BatchGetRanges calls simply resolve each of them normally.
+  std::string node_id;
+  std::string peer_address;
+  for (const auto& route : routes) {
+    if (!route.has_value() || route->node_id == config_.master_config.node_id) return false;
+    if (node_id.empty()) {
+      node_id = route->node_id;
+      peer_address = route->peer_address;
+    } else if (node_id != route->node_id) {
+      return false;
+    }
+  }
+  if (node_id.empty()) return false;
+
+  auto& peer = GetOrConnectPeer(node_id, peer_address);
+  if (!EnsurePeerServiceConnection(peer)) return false;
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+
+  const bool have_descs = peer_directory_ != nullptr && peer_directory_->HasRemoteBuffers(node_id);
+  ::umbp::BatchResolveKeysRequest resolve_req;
+  for (const auto& key : keys) resolve_req.add_keys(key);
+  resolve_req.set_omit_descs(have_descs);
+  remote_resolve_rpc_count_.fetch_add(1, std::memory_order_relaxed);
+
+  ::umbp::BatchResolveKeysResponse resolve_resp;
+  grpc::ClientContext resolve_ctx;
+  resolve_ctx.set_deadline(std::chrono::system_clock::now() + ResolveBusyRetryTimeout());
+  const auto resolve_status = stub->BatchResolveKeys(&resolve_ctx, resolve_req, &resolve_resp);
+  if (!resolve_status.ok() || BatchResolveKeyCount(resolve_resp) != static_cast<int>(keys.size())) {
+    MORI_UMBP_WARN("[PoolClient] BeginRangedGetGroup: BatchResolveKeys failed on {}: {}", node_id,
+                   resolve_status.error_message());
+    return false;
+  }
+  const DecodedBatchResolve decoded = DecodeBatchResolveResponse(resolve_resp);
+  if (decoded.keys.size() != keys.size()) return false;
+  if (!decoded.descs.empty()) peer_directory_->CacheRemoteBuffers(node_id, decoded.descs);
+
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(ranged_get_group_mutex_);
+  auto& group = ranged_get_group_cache_[node_id];
+  group.page_size = decoded.page_size;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    // A miss is not pinned: BUSY/absent keys should keep resolving normally
+    // (e.g. a write still in flight) rather than being frozen at "not found"
+    // for the group's whole lifetime.
+    if (!decoded.keys[i].found) continue;
+    group.keys[keys[i]] = RangedGetGroupEntry{decoded.keys[i], now};
+  }
+  return true;
+}
+
+void PoolClient::EndRangedGetGroup(const std::vector<std::string>& keys) {
+  std::lock_guard<std::mutex> lock(ranged_get_group_mutex_);
+  for (auto peer_it = ranged_get_group_cache_.begin(); peer_it != ranged_get_group_cache_.end();) {
+    for (const auto& key : keys) peer_it->second.keys.erase(key);
+    // Drop peers left with nothing pinned, so a long-lived client does not
+    // carry an empty map per peer it has ever grouped.
+    if (peer_it->second.keys.empty()) {
+      peer_it = ranged_get_group_cache_.erase(peer_it);
+    } else {
+      ++peer_it;
+    }
+  }
 }
 
 bool PoolClient::BuildRemoteGetTransfers(std::vector<RemoteGetEntry>& entries,

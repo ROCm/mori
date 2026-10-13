@@ -1039,6 +1039,152 @@ TEST_F(PoolClientRangesTest, MultiLayerGroupsOverSameKeys) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// BeginRangedGetGroup / EndRangedGetGroup: a layer-wise restore issues one
+// BatchGetRanges per layer group against the SAME key set, and without a
+// group each of those re-resolves the keys over the wire even though the
+// resolve does not depend on which bytes are asked for.  These pin down that
+// an open group actually removes those RPCs (not just that the bytes still
+// come back right -- MultiLayerGroupsOverSameKeys above already proves that),
+// and that ending the group or never opening one falls back to today's
+// per-call resolve behaviour exactly.
+// ---------------------------------------------------------------------------
+
+TEST_F(PoolClientRangesTest, RangedGetGroupSkipsResolveAcrossRepeatedCalls) {
+  // Locality prefetch off: a whole-object read installs locally regardless of
+  // this flag, but a partial (layer-group-shaped) one only does so with
+  // prefetch on, and a local hit would resolve for free -- silently hiding
+  // whether the group, rather than a local install, is what stopped the RPCs.
+  std::vector<char> quiet_get(kScratchSize), quiet_put(kScratchSize);
+  auto quiet = MakeClient("ranges-rgg-skip", kCallerCapacity, quiet_get, quiet_put,
+                          /*locality_prefetch=*/false);
+
+  constexpr size_t kKeys = 3;
+  constexpr size_t kGroups = 8;
+  constexpr size_t kSliceSize = kObjectSize / kGroups;
+
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("rgg-skip-" + std::to_string(k));
+    std::vector<char> object(kObjectSize);
+    for (size_t i = 0; i < kObjectSize; ++i) {
+      object[i] = static_cast<char>((i * 7 + k * 41) & 0xff);
+    }
+    PutLocalReplica(target_.get(), keys.back(), object);
+    objects.push_back(std::move(object));
+  }
+  target_->Master().FlushHeartbeat();
+  quiet->Master().FlushHeartbeat();
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(quiet.get(), key));
+
+  auto restore_all_groups = [&](std::vector<std::vector<char>>* restored) {
+    restored->assign(kKeys, std::vector<char>(kObjectSize, 0));
+    for (size_t g = 0; g < kGroups; ++g) {
+      const size_t slice_offset = g * kSliceSize;
+      std::vector<std::vector<void*>> ptrs(kKeys);
+      std::vector<std::vector<size_t>> sizes(kKeys, {kSliceSize});
+      std::vector<std::vector<size_t>> offsets(kKeys, {slice_offset});
+      for (size_t k = 0; k < kKeys; ++k) ptrs[k] = {(*restored)[k].data() + slice_offset};
+      auto got = quiet->BatchGetRanges(keys, ptrs, sizes, offsets);
+      ASSERT_EQ(got.size(), kKeys);
+      for (size_t k = 0; k < kKeys; ++k) ASSERT_TRUE(got[k]) << "group=" << g << " key=" << keys[k];
+    }
+  };
+
+  // Baseline, no group open: today's behaviour is one resolve per call.
+  const uint64_t before_baseline = quiet->RemoteResolveRpcCount();
+  std::vector<std::vector<char>> baseline;
+  restore_all_groups(&baseline);
+  const uint64_t after_baseline = quiet->RemoteResolveRpcCount();
+  EXPECT_EQ(after_baseline - before_baseline, kGroups)
+      << "each layer-group call is expected to resolve on its own without a group open";
+  for (size_t k = 0; k < kKeys; ++k) {
+    EXPECT_EQ(std::memcmp(baseline[k].data(), objects[k].data(), kObjectSize), 0);
+  }
+
+  // Same restore, same keys, wrapped in a group: Begin pays exactly one
+  // resolve, and every call inside the group reuses it.
+  ASSERT_TRUE(quiet->BeginRangedGetGroup(keys));
+  const uint64_t after_begin = quiet->RemoteResolveRpcCount();
+  EXPECT_EQ(after_begin - after_baseline, 1u) << "BeginRangedGetGroup should resolve exactly once";
+
+  std::vector<std::vector<char>> grouped;
+  restore_all_groups(&grouped);
+  const uint64_t after_grouped = quiet->RemoteResolveRpcCount();
+  EXPECT_EQ(after_grouped, after_begin)
+      << "no BatchGetRanges call inside an open group should issue its own resolve RPC";
+  for (size_t k = 0; k < kKeys; ++k) {
+    EXPECT_EQ(std::memcmp(grouped[k].data(), objects[k].data(), kObjectSize), 0);
+  }
+
+  quiet->EndRangedGetGroup(keys);
+  quiet->Shutdown();
+}
+
+TEST_F(PoolClientRangesTest, RangedGetGroupStopsSkippingAfterEnd) {
+  // Partial range, not the whole object: a whole-object read installs locally
+  // on its own (see LocalityPrefetchOffLeavesNothingLocal's comment on
+  // WholeObjectRead*), which would make the post-End call resolve for free
+  // locally and hide whether ending the group is what mattered.
+  std::vector<char> quiet_get(kScratchSize), quiet_put(kScratchSize);
+  auto quiet = MakeClient("ranges-rgg-end", kCallerCapacity, quiet_get, quiet_put,
+                          /*locality_prefetch=*/false);
+
+  const std::string key = "rgg-end";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 5 + 3) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  quiet->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(quiet.get(), key));
+
+  ASSERT_TRUE(quiet->BeginRangedGetGroup({key}));
+  const uint64_t after_begin = quiet->RemoteResolveRpcCount();
+
+  std::vector<char> out(512, 0);
+  std::vector<void*> ptrs = {out.data()};
+  std::vector<size_t> sizes = {512};
+  std::vector<size_t> offsets = {1024};
+  ASSERT_EQ(quiet->BatchGetRanges({key}, {ptrs}, {sizes}, {offsets}), std::vector<bool>({true}));
+  EXPECT_EQ(quiet->RemoteResolveRpcCount(), after_begin)
+      << "still inside the group, so no new resolve";
+  EXPECT_EQ(std::memcmp(out.data(), object.data() + 1024, 512), 0);
+
+  quiet->EndRangedGetGroup({key});
+
+  std::fill(out.begin(), out.end(), 0);
+  ASSERT_EQ(quiet->BatchGetRanges({key}, {ptrs}, {sizes}, {offsets}), std::vector<bool>({true}));
+  EXPECT_EQ(quiet->RemoteResolveRpcCount(), after_begin + 1)
+      << "after End, the next call is back to resolving on its own";
+  EXPECT_EQ(std::memcmp(out.data(), object.data() + 1024, 512), 0);
+
+  quiet->Shutdown();
+}
+
+TEST_F(PoolClientRangesTest, BeginRangedGetGroupFailsForUnroutableKeys) {
+  // Never published anywhere: BatchRouteGet answers with no route, so a group
+  // cannot be formed -- Begin must say so rather than silently opening an
+  // empty/half-populated one.
+  EXPECT_FALSE(caller_->BeginRangedGetGroup({"rgg-nowhere"}));
+
+  // Ending a group that was never (successfully) begun is a no-op, not a
+  // crash -- sglang's wrapper calls End unconditionally on the way out.
+  caller_->EndRangedGetGroup({"rgg-nowhere"});
+
+  // The failed Begin must not have left anything pinned: an ordinary call
+  // for the same key still resolves normally once the key actually exists.
+  std::vector<char> object(kObjectSize, 0x42);
+  SeedRemoteObject("rgg-nowhere", object);
+  std::vector<char> out(kObjectSize, 0);
+  std::vector<void*> ptrs = {out.data()};
+  std::vector<size_t> sizes = {kObjectSize};
+  std::vector<size_t> offsets = {0};
+  ASSERT_EQ(caller_->BatchGetRanges({"rgg-nowhere"}, {ptrs}, {sizes}, {offsets}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+}
+
 // Spans totalling more than the arena are split across sub-batches rather than
 // failing the key -- the packing unit is a span prefix, not an object.
 TEST_F(PoolClientRangesTest, PartialReadSplitsWhenSpansExceedArena) {
