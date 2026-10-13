@@ -34,7 +34,25 @@
 #include <tuple>
 #include <utility>
 
+#include "umbp/common/env_time.h"
+
 namespace mori::umbp {
+
+namespace {
+// An eviction demotion that failed retryably goes to the back of the queue and
+// runs again until this long has passed since its first attempt; only then is
+// its copy dropped.  A time budget rather than a count, because the faults it
+// rides out -- an SSD staging arena full of reads, a write-error burst -- last
+// a wall-clock interval, and a short queue would burn a count in milliseconds.
+std::chrono::milliseconds EvictDemotionRetryBudget() {
+  static const auto v = GetEnvMilliseconds("UMBP_EVICT_DEMOTION_RETRY_MS",
+                                           std::chrono::milliseconds(30000), /*min_allowed=*/0);
+  return v;
+}
+// Pause before re-running a retry when nothing else is queued, so a lone job
+// waiting out pressure does not spin the worker.
+constexpr std::chrono::milliseconds kEvictRetryIdlePause{20};
+}  // namespace
 namespace {
 
 // One watermark scan queues at most this many keys; the worker tops the queue
@@ -86,6 +104,7 @@ PeerPool::PeerPool(BackendRegistry* backends, std::unique_ptr<PoolPolicy> policy
         break;
       }
     }
+    evict_demotion_retry_budget_ = EvictDemotionRetryBudget();
     transition_worker_ = std::thread(&PeerPool::TransitionWorkerLoop, this);
   }
 }
@@ -113,7 +132,8 @@ void PeerPool::DropEvictedCopyLocked(const TransitionJob& job) {
   if (migrating_keys_.count(job.key) != 0) return;
   auto* source = backends_ == nullptr ? nullptr : backends_->Get(job.source_backend_id);
   if (source == nullptr) return;
-  source->Evict({job.key});
+  const auto evicted = source->Evict({job.key});
+  if (!evicted.empty() && evicted.front().bytes_freed > 0) ++transition_metrics_.dropped;
   RepairAfterDropLocked(job.key);
 }
 
@@ -320,17 +340,30 @@ void PeerPool::TransitionWorkerLoop() {
       transition_queue_.pop_front();
     }
     bool retry = false;
+    bool evict_retry = false;
     {
       std::unique_lock<std::mutex> lock(operation_mutex_);
       if (tier_graph_ != nullptr) {
         const auto& tier = tier_graph_->NodeAt(job.source_tier);
         const bool watermark_driven = WatermarkDrivenLocked(job);
         if (!watermark_driven || tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark)) {
+          if (job.evict && job.first_attempt == std::chrono::steady_clock::time_point{}) {
+            job.first_attempt = std::chrono::steady_clock::now();
+          }
           const auto result = RunTransition(lock, job);
-          if (job.evict && !result.success) DropEvictedCopyLocked(job);
+          // An eviction's demotion that failed in a way that can clear (no space
+          // at the target, a write error) is tried again before its copy is
+          // given up: the copy is the only one left, and a reader may already
+          // have been told the key is here.  Only once the retry budget is spent,
+          // or the target can never take the key, is the evicted copy dropped,
+          // so the tier still frees.
+          evict_retry =
+              job.evict && !result.success && result.retryable &&
+              std::chrono::steady_clock::now() - job.first_attempt < evict_demotion_retry_budget_;
+          if (job.evict && !result.success && !evict_retry) DropEvictedCopyLocked(job);
           const bool still_pressured =
               watermark_driven && tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
-          retry = still_pressured && !result.success && job.attempts < 3;
+          retry = (still_pressured && !result.success && job.attempts < 3) || evict_retry;
           // Keep the drain going without waiting for the next commit batch to
           // notice the tier is still above its low watermark. The scan skips
           // whatever is still queued, so this tops the batch back up rather
@@ -342,7 +375,14 @@ void PeerPool::TransitionWorkerLoop() {
         }
       }
     }
-    if (retry) {
+    if (evict_retry) {
+      bool idle = false;
+      {
+        std::lock_guard<std::mutex> lock(transition_mutex_);
+        idle = transition_queue_.empty();
+      }
+      if (idle) std::this_thread::sleep_for(kEvictRetryIdlePause);
+    } else if (retry) {
       std::this_thread::sleep_for(std::chrono::milliseconds(uint64_t{1} << job.attempts));
     }
     {
@@ -350,7 +390,7 @@ void PeerPool::TransitionWorkerLoop() {
       queued_transition_keys_.erase(job.key);
       const size_t source_tier = job.source_tier;
       if (retry && !stop_transition_worker_) {
-        ++job.attempts;
+        if (job.attempts < UINT8_MAX) ++job.attempts;
         queued_transition_keys_.insert(job.key);
         transition_queue_.push_back(std::move(job));
         transition_cv_.notify_one();

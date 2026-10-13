@@ -99,14 +99,20 @@ TierTransitionResult TierTransitionExecutor::Execute(
       if (!BuildTransfers(source, resolved, target, allocation, &transfers) ||
           !transfer_engine_->Transfer(transfers, nullptr)) {
         target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
         continue;
       }
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
         target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
         continue;
       }
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
+      // No space is pressure, not a verdict: an SSD reports it while its staging
+      // arena is full of in-flight reads, a page tier while its eviction catches
+      // up.  A shape failure (kFailed) can never succeed and stays final.
+      if (allocation.outcome == AllocateOutcome::kFailedNoSpace) result.retryable = true;
       continue;
     }
 
@@ -114,10 +120,12 @@ TierTransitionResult TierTransitionExecutor::Execute(
     if (!target->AcquireMigrationRead(key, &target_read) || target_read.size != resolved.size) {
       if (target_read.found) target->ReleaseMigrationRead(key);
       if (allocation.outcome == AllocateOutcome::kSuccessAllocated) target->Evict({key});
+      result.retryable = true;
       continue;
     }
 
     result.success = true;
+    result.retryable = false;
     result.target_backend_id = target_backend_id;
     result.bytes_moved = resolved.size;
     source->ReleaseMigrationRead(key);
