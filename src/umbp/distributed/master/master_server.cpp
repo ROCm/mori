@@ -23,6 +23,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -244,6 +245,29 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     }
   }
 
+  // -------- Heartbeat interval (derived, overridable) --------
+
+  // The interval a peer is told to use.  Derived from the expiry budget so the
+  // "peers report faster than the reaper expires them" invariant holds by
+  // construction; see HeartbeatIntervalDivisor().
+  uint64_t DerivedHeartbeatIntervalMs() const {
+    return static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
+  }
+
+  // Upper bound for an override.  Past the expiry window a peer would be
+  // reaped between two of its own heartbeats, so an override is clamped here
+  // rather than honoured — the whole point of the divisor is that this cannot
+  // be configured into an outage.
+  uint64_t MaxHeartbeatIntervalMs() const {
+    return static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) *
+           config_.max_missed_heartbeats;
+  }
+
+  uint64_t EffectiveHeartbeatIntervalMs() const {
+    const uint64_t override_ms = interval_override_ms_.load(std::memory_order_relaxed);
+    return override_ms > 0 ? override_ms : DerivedHeartbeatIntervalMs();
+  }
+
   // -------- Client lifecycle --------
 
   grpc::Status RegisterClient(grpc::ServerContext* /*ctx*/,
@@ -288,9 +312,7 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       UpdateClientCapacityMetrics(request->node_id(), caps);
       UpdateClientLogicalTierMetrics(request->node_id(), registration.logical_tier_capacities);
 
-      auto interval_ms =
-          static_cast<uint64_t>(config_.heartbeat_ttl.count() * 1000) / HeartbeatIntervalDivisor();
-      response->set_heartbeat_interval_ms(interval_ms);
+      response->set_heartbeat_interval_ms(EffectiveHeartbeatIntervalMs());
       response->set_ack_seq(0);
       response->set_supports_max_allocatable_bytes(config_.advertise_max_allocatable_bytes);
       response->set_supports_logical_tiers(config_.advertise_logical_tiers);
@@ -400,6 +422,10 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
       response->set_status(static_cast<::umbp::ClientStatus>(client_status));
       response->set_acked_seq(acked_seq);
       response->set_request_full_sync(request_full_sync);
+      // Re-advertise unconditionally: this is the only channel that reaches an
+      // already-registered peer, so a SetRuntimeConfig change converges within
+      // one (old) interval without anyone re-registering.
+      response->set_heartbeat_interval_ms(EffectiveHeartbeatIntervalMs());
 
       UpdateClientCapacityMetrics(request->node_id(), caps);
       UpdateClientLogicalTierMetrics(request->node_id(), logical_caps);
@@ -823,6 +849,35 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
     });
   }
 
+  // -------- Runtime configuration (admin) --------
+
+  grpc::Status SetRuntimeConfig(grpc::ServerContext* /*ctx*/,
+                                const ::umbp::SetRuntimeConfigRequest* request,
+                                ::umbp::SetRuntimeConfigResponse* response) override {
+    // Touches no metadata-store state, so no GuardStore wrapper.
+    std::string note;
+    if (request->set_heartbeat_interval()) {
+      const uint64_t requested = request->heartbeat_interval_ms();
+      uint64_t applied = requested;
+      if (requested == 0) {
+        note = "heartbeat interval override cleared; reverting to derived value";
+      } else {
+        const uint64_t max_ms = MaxHeartbeatIntervalMs();
+        if (requested > max_ms) {
+          applied = max_ms;
+          note = "requested heartbeat interval " + std::to_string(requested) +
+                 "ms exceeds the expiry window; clamped to " + std::to_string(max_ms) + "ms";
+        }
+      }
+      interval_override_ms_.store(applied, std::memory_order_relaxed);
+      MORI_UMBP_INFO("[Master] SetRuntimeConfig heartbeat_interval_ms: requested={} effective={}{}",
+                     requested, EffectiveHeartbeatIntervalMs(), note.empty() ? "" : " (clamped)");
+    }
+    response->set_heartbeat_interval_ms(EffectiveHeartbeatIntervalMs());
+    response->set_note(note);
+    return grpc::Status::OK;
+  }
+
   void SetMetrics(mori::metrics::MetricsServer* metrics) { metrics_ = metrics; }
 
  private:
@@ -896,6 +951,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
   Router& router_;
   ClientRegistryConfig config_;
   mori::metrics::MetricsServer* metrics_ = nullptr;
+  // Runtime override for the advertised heartbeat interval; 0 = use the value
+  // derived from heartbeat_ttl / HeartbeatIntervalDivisor().  Written by
+  // SetRuntimeConfig, read by RegisterClient and by every Heartbeat handler,
+  // so it is atomic rather than guarded: a reader racing a change sees either
+  // the old or the new interval, and both are valid to advertise.
+  std::atomic<uint64_t> interval_override_ms_{0};
 };
 
 // ---------------------------------------------------------------------------

@@ -234,7 +234,7 @@ grpc::Status MasterClient::RegisterSelf(
   registered_peer_address_ = peer_address;
   registered_engine_desc_bytes_ = engine_desc_bytes;
   registered_ = true;
-  MORI_UMBP_INFO("[Client] Registered with master (heartbeat={}ms)", heartbeat_interval_ms_);
+  MORI_UMBP_INFO("[Client] Registered with master (heartbeat={}ms)", heartbeat_interval_ms_.load());
   StartMetricsReporting();
   return grpc::Status::OK;
 }
@@ -545,7 +545,8 @@ void MasterClient::StartHeartbeat() {
     MORI_UMBP_ERROR("[Client] Failed to start heartbeat thread: {}", e.what());
     return;
   }
-  MORI_UMBP_INFO("[Client] Heartbeat thread started (interval={}ms)", heartbeat_interval_ms_);
+  MORI_UMBP_INFO("[Client] Heartbeat thread started (interval={}ms)",
+                 heartbeat_interval_ms_.load());
 }
 
 void MasterClient::StopHeartbeat() {
@@ -572,7 +573,12 @@ void MasterClient::HeartbeatLoop() {
   while (heartbeat_running_) {
     {
       std::unique_lock lock(hb_cv_mutex_);
-      hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_),
+      // Re-read every iteration: the master re-advertises the interval on each
+      // HeartbeatResponse, so a change applied via SetRuntimeConfig takes
+      // effect on the next wait rather than at the next re-register.  A change
+      // arriving while this wait is already sleeping is picked up one (old)
+      // period later, which is the convergence bound for the whole mechanism.
+      hb_cv_.wait_for(lock, std::chrono::milliseconds(heartbeat_interval_ms_.load()),
                       [this] { return !heartbeat_running_.load() || flush_requested_.load(); });
       flush_requested_ = false;
     }
@@ -790,6 +796,17 @@ grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
     _rpc_timer.SetStatus(status);
   }
   if (!status.ok()) return status;
+  // Adopt a re-advertised interval.  `0` means the master has no opinion (an
+  // older master that predates this field always sends 0), so keep the current
+  // value rather than collapsing the wait to zero and spinning.
+  if (resp->heartbeat_interval_ms() > 0) {
+    const uint64_t advertised = resp->heartbeat_interval_ms();
+    const uint64_t previous = heartbeat_interval_ms_.exchange(advertised);
+    if (previous != advertised) {
+      MORI_UMBP_INFO("[Client] Heartbeat interval updated by master: {}ms -> {}ms", previous,
+                     advertised);
+    }
+  }
   bool more_pending = false;
   bool made_progress = false;
   {
