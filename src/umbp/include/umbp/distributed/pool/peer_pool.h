@@ -139,6 +139,9 @@ class PeerPool {
   // that holds the keys: their eviction order is the only thing that changes.
   // Returns the number of (medium, key) copies touched.
   size_t BatchTouch(const std::vector<std::string>& keys);
+  // Eviction class hint (IUMBPClient::BatchSetEvictionClass) for every medium
+  // holding the keys.  Returns the number of (medium, key) copies updated.
+  size_t BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.

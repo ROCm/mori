@@ -201,6 +201,10 @@ class PoolClient {
   // the copies touched on this node's media.  Never contacts the master or
   // another peer.
   size_t BatchTouch(const std::vector<std::string>& keys);
+  // Eviction class hint for keys held on this node
+  // (IUMBPClient::BatchSetEvictionClass); returns the copies updated.  Never
+  // contacts the master or another peer.
+  size_t BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class);
 
   MasterClient& Master();
 

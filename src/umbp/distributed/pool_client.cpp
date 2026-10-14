@@ -5011,6 +5011,11 @@ size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
   return default_pool_->BatchTouch(keys);
 }
 
+size_t PoolClient::BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class) {
+  if (!initialized_ || keys.empty() || default_pool_ == nullptr) return 0;
+  return default_pool_->BatchSetEvictionClass(keys, eviction_class);
+}
+
 // ---------------------------------------------------------------------------
 //  External KV
 // ---------------------------------------------------------------------------

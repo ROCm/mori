@@ -856,6 +856,20 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  // Like BatchTouch: an ordering hint, no bytes, no caller memory.
+  grpc::Status BatchSetEvictionClass(grpc::ServerContext*,
+                                     const ::umbp::BatchSetEvictionClassRequest* request,
+                                     ::umbp::CountResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    if (shutdown_.load()) {
+      response->set_count(0);
+      return grpc::Status::OK;
+    }
+    response->set_count(client_->BatchSetEvictionClass(keys, request->eviction_class()));
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

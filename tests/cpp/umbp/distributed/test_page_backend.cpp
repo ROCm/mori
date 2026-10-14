@@ -1085,7 +1085,7 @@ TEST(PageBackendAutoFlush, FullSyncSnapshotClearsOutbox) {
   EXPECT_EQ(delta[0].kind, KvEvent::Kind::ADD);
 }
 
-// ---- Recency hints (Touch) ------------------------------------------------------
+// ---- Recency hints (Touch) and eviction classes -----------------------------------
 
 namespace {
 
@@ -1102,6 +1102,14 @@ void PutKey(PageBackend& backend, const std::string& key) {
   ASSERT_TRUE(slot.has_value()) << key;
   uint64_t bytes = 0;
   ASSERT_TRUE(backend.Commit(slot->slot_id, key, bytes)) << key;
+}
+
+// Commit k0..k(n-1), k0 oldest, gap apart.
+void PutKeys(PageBackend& backend, int n, std::chrono::milliseconds gap) {
+  for (int i = 0; i < n; ++i) {
+    if (i > 0) std::this_thread::sleep_for(gap);
+    PutKey(backend, "k" + std::to_string(i));
+  }
 }
 
 std::vector<std::string> OfferedOrder(PageBackend& backend) {
@@ -1140,6 +1148,36 @@ TEST(PageBackendTouch, DoesNothingUntilTheOrderIsTracked) {
   auto backend = MakeAllocator();
   PutKey(*backend, "a");
   EXPECT_EQ(backend->Touch({"a"}), 0u);
+  EXPECT_EQ(backend->SetEvictionClass({"a"}, 1), 0u);
+}
+
+TEST(PageBackendEvictionClass, LowClassGoesFirstUnderALargeWeight) {
+  auto backend = MakeOrderedBackend();
+  backend->SetLowClassAgeWeightForTest(1e9);
+  PutKeys(*backend, 4, std::chrono::milliseconds{1});
+  EXPECT_EQ(backend->SetEvictionClass({"k2", "k3", "missing"}, 1), 2u);
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"k2", "k3", "k0", "k1"}));
+}
+
+TEST(PageBackendEvictionClass, DefaultWeightKeepsOnePlainLruOrder) {
+  auto backend = MakeOrderedBackend();
+  PutKeys(*backend, 6, std::chrono::milliseconds{2});
+  // A class change is not a use: with weight 1 both keys keep their LRU turn.
+  EXPECT_EQ(backend->SetEvictionClass({"k1", "k4"}, 1), 2u);
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"k0", "k1", "k2", "k3", "k4", "k5"}));
+}
+
+TEST(PageBackendEvictionClass, ScaledAgeDecidesTheTurn) {
+  auto backend = MakeOrderedBackend();
+  backend->SetLowClassAgeWeightForTest(2.5);
+  PutKeys(*backend, 5, std::chrono::milliseconds{30});
+  // k3 is about 30 ms old and counts as 75 ms: after k1 (90), before k2 (60).
+  EXPECT_EQ(backend->SetEvictionClass({"k3"}, 1), 1u);
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"k0", "k1", "k3", "k2", "k4"}));
+  // Back to normal it takes its plain LRU turn, and it can go low again.
+  EXPECT_EQ(backend->SetEvictionClass({"k3"}, 0), 1u);
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"k0", "k1", "k2", "k3", "k4"}));
+  EXPECT_EQ(backend->SetEvictionClass({"k3"}, 1), 1u);
 }
 
 }  // namespace mori::umbp

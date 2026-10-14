@@ -100,6 +100,9 @@ class InstrumentedBackend final : public MediumBackend {
   }
   bool OwnsEvictionOrder() const override { return inner_->OwnsEvictionOrder(); }
   size_t Touch(const std::vector<std::string>& keys) override { return inner_->Touch(keys); }
+  size_t SetEvictionClass(const std::vector<std::string>& keys, int eviction_class) override {
+    return inner_->SetEvictionClass(keys, eviction_class);
+  }
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
     inner_->SetAutoFlushHook(threshold, std::move(cb));

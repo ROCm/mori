@@ -315,6 +315,14 @@ class PageBackend : public MediumBackend {
   // the read's lease.  0 until TrackEvictionOrder().
   size_t Touch(const std::vector<std::string>& keys) override;
 
+  // Puts held keys in eviction class 0 (normal) or 1 (low priority) without
+  // changing their recency.  When EvictionCandidates picks between the oldest
+  // key of each class, a low-priority key's age counts low_class_age_weight
+  // times (UMBP_LOW_CLASS_AGE_WEIGHT, default 1: one plain LRU order).  Returns
+  // how many are held; 0 until TrackEvictionOrder().
+  size_t SetEvictionClass(const std::vector<std::string>& keys, int eviction_class) override;
+  void SetLowClassAgeWeightForTest(double weight);
+
   // ==================== Reaper ====================
 
   // Test seam: run one reaper sweep synchronously without the thread.
@@ -360,6 +368,11 @@ class PageBackend : public MediumBackend {
     // while holding only a shared lock on mutex_.
     std::list<std::string>::iterator lru_it{};
     bool in_lru = false;
+    // Which list lru_it points into (0 = lru_, 1 = lru_low_) and the
+    // steady-clock time of the last recency update, which EvictionCandidates compares
+    // across the two lists.  GUARDED BY lru_mutex_, like lru_it.
+    uint8_t eviction_class = 0;
+    int64_t touched_ns = 0;
 
     // std::atomic is neither copyable nor movable, but OwnedSlot is stored by
     // value in owned_ and moved into place on commit, so the moves are spelled
@@ -371,7 +384,9 @@ class PageBackend : public MediumBackend {
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
           hold(std::move(other.hold)),
           lru_it(other.lru_it),
-          in_lru(other.in_lru) {}
+          in_lru(other.in_lru),
+          eviction_class(other.eviction_class),
+          touched_ns(other.touched_ns) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
       if (this == &other) return *this;
       pages = std::move(other.pages);
@@ -381,6 +396,8 @@ class PageBackend : public MediumBackend {
       hold = std::move(other.hold);
       lru_it = other.lru_it;
       in_lru = other.in_lru;
+      eviction_class = other.eviction_class;
+      touched_ns = other.touched_ns;
       return *this;
     }
     OwnedSlot(const OwnedSlot&) = delete;
@@ -447,6 +464,10 @@ class PageBackend : public MediumBackend {
   // Caller MUST hold `lru_mutex_`.  Drop `key` from the LRU if tracked.
   void RemoveFromLruLocked(OwnedSlot& slot);
 
+  // Caller MUST hold `lru_mutex_`, with `slot` in no list.  Insert `key` into
+  // its class's list where its touched_ns belongs, keeping the age it has.
+  void InsertByAgeLocked(const std::string& key, OwnedSlot& slot);
+
   // Self-locking wrappers for single-key callers.  Lock order is always
   // mutex_ -> lru_mutex_, never the reverse.
   void TouchLru(const std::string& key, OwnedSlot& slot);
@@ -512,7 +533,10 @@ class PageBackend : public MediumBackend {
   // Front = most recently committed/resolved, back = eviction candidate.
   // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
-  // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_
+  // Same order for eviction class 1; EvictionCandidates merges the two tails by age.
+  std::list<std::string> lru_low_;
+  double low_class_age_weight_ = 1.0;
+  // Guards lru_, lru_low_ and the per-slot LRU fields.  Separate from mutex_
   // so a resolve can record an access while holding only a shared lock; the
   // critical section is a list splice, not a hash lookup plus a page-vector
   // copy.  Always taken after mutex_ when both are held.

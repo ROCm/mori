@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -724,6 +726,7 @@ void PageBackend::ClearLocal() {
   {
     std::lock_guard<std::mutex> lru_lock(lru_mutex_);
     lru_.clear();
+    lru_low_.clear();
   }
 
   // Deadlines that mattered are already in deferred_frees_; the rest went
@@ -783,13 +786,38 @@ void PageBackend::SetEventPublishing(bool enabled) {
 //  Eviction order (the policy that consumes it lives in PeerPool)
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// How much faster eviction class 1 ages, from UMBP_LOW_CLASS_AGE_WEIGHT.  Below
+// 1 would protect low-priority keys over normal ones, so it is rejected.
+double LowClassAgeWeightFromEnv() {
+  const char* raw = std::getenv("UMBP_LOW_CLASS_AGE_WEIGHT");
+  if (raw == nullptr || raw[0] == '\0') return 1.0;
+  char* end = nullptr;
+  const double parsed = std::strtod(raw, &end);
+  if (end == raw || !std::isfinite(parsed) || parsed < 1.0) {
+    MORI_UMBP_WARN("[PageBackend] ignoring UMBP_LOW_CLASS_AGE_WEIGHT='{}' (need a number >= 1)",
+                   raw);
+    return 1.0;
+  }
+  return parsed;
+}
+
+}  // namespace
+
 void PageBackend::TrackEvictionOrder() {
+  const double low_class_age_weight = LowClassAgeWeightFromEnv();
   std::unique_lock<std::shared_mutex> lock(mutex_);
   if (track_eviction_order_) return;
   track_eviction_order_ = true;
   // Seed keys committed before this call, as coldest.
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  low_class_age_weight_ = low_class_age_weight;
   for (auto& [key, slot] : owned_) TouchLruLocked(key, slot);
+  if (low_class_age_weight != 1.0) {
+    MORI_UMBP_INFO("[PageBackend] eviction class 1 ages {}x as fast tier={}", low_class_age_weight,
+                   static_cast<int>(tier_));
+  }
 }
 
 std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
@@ -798,18 +826,84 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   if (!track_eviction_order_) return out;
   const auto now = std::chrono::steady_clock::now();
+  const int64_t now_ns = SteadyNs(now);
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
-  for (auto it = lru_.rbegin(); it != lru_.rend() && out.size() < max_count; ++it) {
-    auto owned_it = owned_.find(*it);
-    if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
-    // Skip what Evict() refuses for good (a read lease); a pinned key is
-    // offered so the caller can count it as in flight.
-    if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
+  using Cursor = std::list<std::string>::reverse_iterator;
+  // Advance `it` past what Evict() refuses for good (a read lease) and return the
+  // slot of the coldest key left, or null when the list is exhausted; a pinned
+  // key is offered so the caller can count it as in flight.
+  auto next_offer = [&](Cursor& it, std::list<std::string>& order) -> OwnedSlot* {
+    for (; it != order.rend(); ++it) {
+      auto owned_it = owned_.find(*it);
+      if (owned_it == owned_.end()) continue;  // defensive; the lists and owned_ stay in sync
+      if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
+      return &owned_it->second;
+    }
+    return nullptr;
+  };
+  Cursor normal = lru_.rbegin();
+  Cursor low = lru_low_.rbegin();
+  while (out.size() < max_count) {
+    OwnedSlot* normal_slot = next_offer(normal, lru_);
+    OwnedSlot* low_slot = next_offer(low, lru_low_);
+    if (normal_slot == nullptr && low_slot == nullptr) break;
+    // The older of the two tails goes first, a low-priority key's age counting
+    // low_class_age_weight_ times.
+    bool take_low = normal_slot == nullptr;
+    if (normal_slot != nullptr && low_slot != nullptr) {
+      const double normal_age = static_cast<double>(now_ns - normal_slot->touched_ns);
+      const double low_age =
+          static_cast<double>(now_ns - low_slot->touched_ns) * low_class_age_weight_;
+      take_low = low_age > normal_age;
+    }
+    Cursor& it = take_low ? low : normal;
+    const OwnedSlot* slot = take_low ? low_slot : normal_slot;
     // Whole pages, as Capacity() counts them.
-    out.push_back(
-        EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
+    out.push_back(EvictionOffer{*it, static_cast<uint64_t>(slot->pages.size()) * page_size_});
+    ++it;
   }
   return out;
+}
+
+size_t PageBackend::SetEvictionClass(const std::vector<std::string>& keys, int eviction_class) {
+  if (keys.empty()) return 0;
+  const uint8_t target = eviction_class > 0 ? 1 : 0;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (!track_eviction_order_) return 0;
+  std::vector<std::pair<const std::string*, OwnedSlot*>> held;
+  held.reserve(keys.size());
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it != owned_.end()) held.emplace_back(&key, &it->second);
+  }
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (auto& [key, slot] : held) {
+    if (slot->eviction_class == target) continue;
+    // Changing class is not a use: the key keeps its age, and its place by age
+    // in the new list.
+    RemoveFromLruLocked(*slot);
+    slot->eviction_class = target;
+    InsertByAgeLocked(*key, *slot);
+  }
+  return held.size();
+}
+
+void PageBackend::InsertByAgeLocked(const std::string& key, OwnedSlot& slot) {
+  auto& order = slot.eviction_class != 0 ? lru_low_ : lru_;
+  // From the recent end: a class is usually set right after the commit, so the
+  // walk stops at once.
+  auto it = order.begin();
+  for (; it != order.end(); ++it) {
+    auto owned_it = owned_.find(*it);
+    if (owned_it == owned_.end() || owned_it->second.touched_ns <= slot.touched_ns) break;
+  }
+  slot.lru_it = order.insert(it, key);
+  slot.in_lru = true;
+}
+
+void PageBackend::SetLowClassAgeWeightForTest(double weight) {
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  low_class_age_weight_ = weight;
 }
 
 size_t PageBackend::Touch(const std::vector<std::string>& keys) {
@@ -831,18 +925,20 @@ size_t PageBackend::Touch(const std::vector<std::string>& keys) {
 
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
   if (!track_eviction_order_) return;
+  slot.touched_ns = SteadyNs(std::chrono::steady_clock::now());
+  auto& order = slot.eviction_class != 0 ? lru_low_ : lru_;
   if (slot.in_lru) {
-    lru_.splice(lru_.begin(), lru_, slot.lru_it);
+    order.splice(order.begin(), order, slot.lru_it);
     return;
   }
-  lru_.push_front(key);
-  slot.lru_it = lru_.begin();
+  order.push_front(key);
+  slot.lru_it = order.begin();
   slot.in_lru = true;
 }
 
 void PageBackend::RemoveFromLruLocked(OwnedSlot& slot) {
   if (!slot.in_lru) return;
-  lru_.erase(slot.lru_it);
+  (slot.eviction_class != 0 ? lru_low_ : lru_).erase(slot.lru_it);
   slot.in_lru = false;
 }
 
