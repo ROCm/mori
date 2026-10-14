@@ -317,6 +317,7 @@ AllReducePullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
     }
   } else if (threadIdx.x == 0) {
     while (__hip_atomic_load(go, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
+      __builtin_amdgcn_s_sleep(1);
     }
   }
   __syncthreads();
