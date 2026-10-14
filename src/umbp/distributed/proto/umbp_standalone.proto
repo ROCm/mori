@@ -19,6 +19,9 @@ service UMBPStandalone {
   // Recency hint for keys the caller used from its own faster cache; count =
   // how many are stored.  Reads nothing, grants no lease.
   rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+  // Eviction class for stored keys (0 normal, 1 low priority); count = how
+  // many are stored.  Recency does not change.
+  rpc BatchSetEvictionClass(BatchSetEvictionClassRequest) returns (CountResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
@@ -62,6 +65,11 @@ message KeyRequest {
 
 message BatchKeysRequest {
   repeated string keys = 1;
+}
+
+message BatchSetEvictionClassRequest {
+  repeated string keys = 1;
+  int32 eviction_class = 2;
 }
 
 message PutRequest {

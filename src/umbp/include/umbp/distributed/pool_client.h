@@ -200,6 +200,9 @@ class PoolClient {
   // Recency hint for keys held on this node (IUMBPClient::BatchTouch); returns
   // how many of them this node's media hold.  Never contacts the master.
   size_t BatchTouch(const std::vector<std::string>& keys);
+  // Eviction class hint for keys held on this node
+  // (IUMBPClient::BatchSetEvictionClass).  Never contacts the master.
+  size_t BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class);
 
   MasterClient& Master();
 

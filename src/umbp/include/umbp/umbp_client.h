@@ -132,6 +132,19 @@ class IUMBPClient {
     return 0;
   }
 
+  /// Put stored objects in an eviction class: 0 normal, 1 low priority.  When
+  /// local eviction picks between the oldest object of each class, a
+  /// low-priority object's age counts UMBP_LOW_CLASS_AGE_WEIGHT times (default
+  /// 1, one plain LRU order).  For state a caller rarely reads back, such as
+  /// recurrent-model checkpoints.  Recency does not change; keys not stored are
+  /// skipped.  Returns how many were stored.  A store that keeps no eviction
+  /// order (or an older server) returns 0.
+  virtual size_t BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class) {
+    (void)keys;
+    (void)eviction_class;
+    return 0;
+  }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is

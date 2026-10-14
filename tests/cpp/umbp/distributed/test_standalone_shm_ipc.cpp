@@ -1180,6 +1180,10 @@ TEST(StandaloneShmIpcTest, BatchTouchCountsTheKeysTheServerHolds) {
   EXPECT_EQ(client->BatchTouch({}), 0u);
   // A touch is not a read and does not change what exists.
   EXPECT_EQ(client->BatchExists({"touch-a", "touch-missing"}), (std::vector<bool>{true, false}));
+  // The eviction-class hint takes the same path and counts the same way.
+  EXPECT_EQ(client->BatchSetEvictionClass({"touch-a", "touch-missing"}, 1), 1u);
+  EXPECT_EQ(client->BatchSetEvictionClass({"touch-a", "touch-b"}, 0), 2u);
+  EXPECT_EQ(client->BatchExists({"touch-a", "touch-b"}), (std::vector<bool>{true, true}));
 
   client->DeregisterMemory(reinterpret_cast<uintptr_t>(handle.ptr));
   client->Close();
