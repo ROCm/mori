@@ -377,16 +377,15 @@ bool LocalCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) 
          dst.loc == mori::io::MemoryLocationType::CPU;
 }
 
-TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
-  pair_to_plan.reserve(items.size() * 2);
-
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst)) {
+namespace {
+class LocalCopyPlanBuilder final : public TransferPlanBuilder {
+ public:
+  explicit LocalCopyPlanBuilder(const LocalCopyEngine& engine) : engine_(engine) {}
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    if (!engine_.CanHandle(item.src, item.dst)) {
       out.rejected_tags.push_back(item.tag);
-      continue;
+      return;
     }
     // Bounds are checked here, once, rather than per copy: a page index that
     // does not fit its buffer is a bug in the backend's slot bookkeeping, and
@@ -394,7 +393,7 @@ TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) co
     if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
         item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
       out.rejected_tags.push_back(item.tag);
-      continue;
+      return;
     }
 
     const PtrPairKey key{item.src.host_ptr, item.dst.host_ptr};
@@ -427,7 +426,28 @@ TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) co
     }
     if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
   }
-  return out;
+  TransferPlanSet Finish() override { return std::move(out); }
+
+ private:
+  const LocalCopyEngine& engine_;
+  TransferPlanSet out;
+  // Grows with distinct endpoint pairs, rather than reserving two hash
+  // buckets for every page fragment in the batch.
+  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
+};
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> LocalCopyEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
+  return std::make_unique<LocalCopyPlanBuilder>(*this);
+}
+
+TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) const {
+  auto builder = CreatePlanBuilder();
+  for (const auto& item : items) {
+    builder->Add(item);
+  }
+  return builder->Finish();
 }
 
 std::unique_ptr<TransferHandle> LocalCopyEngine::Submit(std::vector<TransferPlan> plans) {
