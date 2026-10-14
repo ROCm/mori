@@ -459,8 +459,9 @@ std::optional<std::vector<EvictionOffer>> MasterClient::GetEvictionCandidates(
 
   ::umbp::GetEvictionCandidatesResponse resp;
   grpc::ClientContext ctx;
-  // Eviction falls back to the medium's own order rather than wait long.
-  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(1));
+  // Eviction does not wait on this (PeerPool::RankedCandidates); past the
+  // age a peer still uses, an answer is wasted work.
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
   auto status = GetStub(stub_.get())->GetEvictionCandidates(&ctx, req, &resp);
   _rpc_timer.SetStatus(status);
   if (!status.ok()) {

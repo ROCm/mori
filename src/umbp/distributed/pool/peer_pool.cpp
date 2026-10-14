@@ -52,6 +52,10 @@ constexpr auto kLocalEvictPollInterval = std::chrono::milliseconds(100);
 constexpr auto kLocalEvictMinGap = std::chrono::milliseconds(1);  // between passes
 // Per backend, between candidate-source queries.
 constexpr auto kRankedCandidatesMinInterval = std::chrono::milliseconds(200);
+// How long a pass waits on the query it just sent (a small index answers in
+// time); a slower answer serves a later pass, unless older than the max age.
+constexpr auto kRankedCandidatesWait = std::chrono::milliseconds(20);
+constexpr auto kRankedCandidatesMaxAge = std::chrono::seconds(3);
 
 uint64_t UsedBytes(const TierCapacity& capacity) {
   return capacity.total_bytes > capacity.available_bytes
@@ -1270,14 +1274,28 @@ std::optional<std::vector<EvictionOffer>> PeerPool::RankedCandidates(uint32_t ba
     source = candidate_source_;
   }
   if (!source) return std::nullopt;
-  // Only the pass thread touches this (local_evict_pass_mutex_).  A backend
-  // stuck over its watermark would otherwise query on every wake.
-  const auto now = std::chrono::steady_clock::now();
-  auto& last = last_ranked_query_[backend_id];
-  if (now - last < kRankedCandidatesMinInterval) return std::nullopt;
-  last = now;
-  const std::string logical = tier_graph_ == nullptr ? "" : tier_graph_->NameForBackend(backend_id);
-  auto offers = source(tier, logical, bytes);
+  // Only the pass thread touches this (local_evict_pass_mutex_).  The master
+  // answers in time proportional to its index, so the pass never waits long:
+  // it evicts by the medium's order meanwhile.  The interval keeps a backend
+  // stuck over its watermark from querying on every wake.
+  auto& query = ranked_queries_[backend_id];
+  auto wait = std::chrono::milliseconds(0);
+  if (!query.answer.valid()) {
+    if (std::chrono::steady_clock::now() - query.started < kRankedCandidatesMinInterval) {
+      return std::nullopt;
+    }
+    query.started = std::chrono::steady_clock::now();
+    const std::string logical =
+        tier_graph_ == nullptr ? "" : tier_graph_->NameForBackend(backend_id);
+    query.answer = std::async(std::launch::async, [source = std::move(source), tier, logical,
+                                                   bytes] { return source(tier, logical, bytes); });
+    wait = kRankedCandidatesWait;
+  }
+  if (query.answer.wait_for(wait) != std::future_status::ready) return std::nullopt;
+  auto offers = query.answer.get();
+  if (std::chrono::steady_clock::now() - query.started > kRankedCandidatesMaxAge) {
+    return std::nullopt;  // the index has moved on since
+  }
   // The source reports value sizes; the budget counts whole pages.
   auto* backend = backends_->Get(backend_id);
   const uint64_t page = backend == nullptr ? 0 : backend->PageSize();
