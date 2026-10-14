@@ -66,8 +66,8 @@ constexpr auto kLocalEvictPollInterval = std::chrono::milliseconds(100);
 constexpr auto kLocalEvictMinGap = std::chrono::milliseconds(1);  // between passes
 // Per backend, between candidate-source queries.
 constexpr auto kRankedCandidatesMinInterval = std::chrono::milliseconds(200);
-// How long a pass waits on the query it just sent (a small index answers in
-// time); a slower answer serves a later pass, unless older than the max age.
+// How long a pass waits on its first query (a small index answers in time); a
+// slower answer is taken when ready, unless older than the max age.
 constexpr auto kRankedCandidatesWait = std::chrono::milliseconds(20);
 constexpr auto kRankedCandidatesMaxAge = std::chrono::seconds(3);
 
@@ -1252,21 +1252,26 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
     return progressed;
   };
 
-  // The master's cluster-wide ranking first (at most one query per interval);
-  // the medium's own order covers whatever it leaves.
-  const auto ranked = RankedCandidates(backend_id, tier, budget);
-  if (ranked.has_value()) {
-    const size_t before = evicted_keys;
-    size_t next = 0;
-    while (covered < budget && next < ranked->size() && !stopping() && !drained()) {
-      evict_some(*ranked, &next);  // stale entries just yield kNone
-    }
-    local_evict_master_keys_.fetch_add(evicted_keys - before, std::memory_order_relaxed);
-  }
-
+  // The master's ranking whenever an answer is at hand, asked again for what
+  // the budget still needs as each one runs out; the medium's own order
+  // covers the rest meanwhile.  A pass can span a whole band, far more keys
+  // than one answer carries.
+  auto ranked = RankedCandidates(backend_id, tier, budget, kRankedCandidatesWait);
+  size_t ranked_next = 0;
+  size_t master_keys = 0;
   size_t window = kLocalEvictBatch;
   while (covered < budget && !drained()) {
     if (stopping()) break;
+    if (!ranked.has_value() || ranked_next >= ranked->size()) {
+      ranked = RankedCandidates(backend_id, tier, budget - covered, std::chrono::milliseconds(0));
+      ranked_next = 0;
+    }
+    if (ranked.has_value() && ranked_next < ranked->size()) {
+      const size_t before = evicted_keys;
+      evict_some(*ranked, &ranked_next);  // stale entries just yield kNone
+      master_keys += evicted_keys - before;
+      continue;
+    }
     auto offers = backend->EvictionCandidates(window);
     const bool exhausted = offers.size() < window;
     offers.erase(std::remove_if(offers.begin(), offers.end(),
@@ -1293,13 +1298,13 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
       break;
     }
   }
+  local_evict_master_keys_.fetch_add(master_keys, std::memory_order_relaxed);
   local_evict_keys_.fetch_add(evicted_keys, std::memory_order_relaxed);
   return evicted_keys;
 }
 
-std::optional<std::vector<EvictionOffer>> PeerPool::RankedCandidates(uint32_t backend_id,
-                                                                     TierType tier,
-                                                                     uint64_t bytes) {
+std::optional<std::vector<EvictionOffer>> PeerPool::RankedCandidates(
+    uint32_t backend_id, TierType tier, uint64_t bytes, std::chrono::milliseconds wait) {
   EvictionCandidateSource source;
   {
     std::lock_guard<std::mutex> lock(local_evict_mutex_);
@@ -1307,11 +1312,10 @@ std::optional<std::vector<EvictionOffer>> PeerPool::RankedCandidates(uint32_t ba
   }
   if (!source) return std::nullopt;
   // Only the pass thread touches this (local_evict_pass_mutex_).  The master
-  // answers in time proportional to its index, so the pass never waits long:
-  // it evicts by the medium's order meanwhile.  The interval keeps a backend
-  // stuck over its watermark from querying on every wake.
+  // answers in time proportional to its index, so the pass never waits long
+  // (`wait` only on a query it just sent): it evicts by the medium's order
+  // meanwhile.  The interval keeps the master from being asked continuously.
   auto& query = ranked_queries_[backend_id];
-  auto wait = std::chrono::milliseconds(0);
   if (!query.answer.valid()) {
     if (std::chrono::steady_clock::now() - query.started < kRankedCandidatesMinInterval) {
       return std::nullopt;
@@ -1321,7 +1325,8 @@ std::optional<std::vector<EvictionOffer>> PeerPool::RankedCandidates(uint32_t ba
         tier_graph_ == nullptr ? "" : tier_graph_->NameForBackend(backend_id);
     query.answer = std::async(std::launch::async, [source = std::move(source), tier, logical,
                                                    bytes] { return source(tier, logical, bytes); });
-    wait = kRankedCandidatesWait;
+  } else {
+    wait = std::chrono::milliseconds(0);
   }
   if (query.answer.wait_for(wait) != std::future_status::ready) return std::nullopt;
   auto offers = query.answer.get();

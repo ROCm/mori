@@ -216,7 +216,8 @@ class PeerPool {
   size_t LocalEvictionPass();  // lowest tier first; returns keys evicted
   size_t ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermarks& watermarks);
   std::optional<std::vector<EvictionOffer>> RankedCandidates(uint32_t backend_id, TierType tier,
-                                                             uint64_t bytes);
+                                                             uint64_t bytes,
+                                                             std::chrono::milliseconds wait);
 
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
