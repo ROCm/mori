@@ -309,7 +309,9 @@ __device__ void EpDispatchAsyncLLSendCopyLsa_body(EpDispatchCombineArgs args) {
     const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
     if (hiddenOffset < hiddenBytes) {
       const size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
-      core::WarpCopy<uint8_t, 1>(
+      // Unroll 4, not 1: see the LSA section's note on store concurrency. This is
+      // the peer write, and it is the single biggest lever on this transport.
+      core::WarpCopy<uint8_t, 4>(
           dst + hiddenOffset,
           static_cast<const uint8_t*>(args.inpTokenBuf) + srcTokId * hiddenBytes + hiddenOffset,
           len);
@@ -635,6 +637,33 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // shape. lsa is worth keeping for the small-batch case and for a caller with an
 // empty seam, since it also costs CUs that an SDMA transfer leaves free.
 //
+// STORE CONCURRENCY IS THE LEVER ON THIS TRANSPORT. The three peer-facing copies
+// here (the fused gather and the two bulk transfers) carry Unroll=4 rather than
+// WarpCopy's default of 1. At Unroll=1 a lane has exactly ONE 16 B store in
+// flight and the warp walks a 14 KB token as 28 dependent round trips to the
+// peer; raising it to 4 keeps four in flight and the latency stops being
+// serial. Note that EpCombineAsyncLLSendCopy_body, whose copy is LOCAL, was
+// already at 4 -- only the peer-facing sites had been left at 1, which is the
+// wrong way round, since a peer store is the one with the long latency to hide.
+//
+// Measured on an idle gfx1250 node at EP4, hidden 7168, topk 8, bf16, graph;
+// five interleaved rounds per arm, medians, arms differing only in
+// MORI_SOURCE_ROOT. us for the dispatch+combine pair:
+//
+//   tok/rank        128      512     2048
+//   Unroll=1      646.5    813.6   1364.1
+//   Unroll=4      644.3    715.4    974.5
+//   delta         -0.3%   -12.1%   -28.6%
+//
+// The dispatch half alone is -13.5% / -45.1% / -53.9%: 202 -> 438 GB/s at 2048
+// in bench_ep.py's accounting. Unroll=8 was measured in the same matrix and is
+// NOT better -- it ties at 512 and 2048 and loses 1.4% at 128, so 4 is the
+// setting, not merely a direction.
+//
+// Two things tried in the same matrix and rejected, both documented in
+// python/mori/ops/dispatch_combine_v2/README.md: moving the transfer onto the
+// gfx1250 TDM engine, and padding the slot stride to a 128 B row.
+//
 // INTERMITTENT HANG observed on gfx125x UNDER CUDA GRAPH CAPTURE before the
 // count-reset ordering fix below. The numbers above are MI355X (gfx950, wave64).
 // On gfx1250 at EP4, hidden 7168, 64 tokens:
@@ -754,7 +783,7 @@ __device__ void EpDispatchAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args
   const uint8_t* src = args.reg(args.offStaging)->template GetAs<const uint8_t*>() +
                        static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes +
                        share.offset;
-  core::WarpCopy<uint8_t, 1>(dst, src, share.bytes);
+  core::WarpCopy<uint8_t, 4>(dst, src, share.bytes);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename T>
@@ -820,7 +849,7 @@ __device__ void EpCombineAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args)
       const uint8_t* src = args.reg(args.offCombineStaging)->template GetAs<const uint8_t*>() +
                            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes +
                            share.offset;
-      core::WarpCopy<uint8_t, 1>(dst, src, share.bytes);
+      core::WarpCopy<uint8_t, 4>(dst, src, share.bytes);
     }
   }
 }

@@ -236,28 +236,36 @@ combine, median of three interleaved rounds, no excluded samples.
 
 | tok/rank | v2 native | asyncll sdma | asyncll lsa (fused) | asyncll lsa (unfused) |
 |---:|---:|---:|---:|---:|
-| 64   |  65.7 |  90.9 |  676.5 | 1071.3 |
-| 128  |  70.3 | 100.6 |  659.3 | 1053.8 |
-| 256  |  74.3 | 122.0 |  714.5 | 1108.8 |
-| 512  |  95.2 | 155.8 |  826.5 | 1207.2 |
-| 1024 | 149.1 | 222.1 | 1130.1 | 1329.7 |
-| 2048 | 246.1 | 355.4 | 1370.2 | 1706.9 |
+| 64   |  65.7 |  90.9 |  676.4 | 1071.3 |
+| 128  |  70.3 | 100.6 |  646.2 | 1053.8 |
+| 256  |  74.3 | 122.0 |  677.7 | 1108.8 |
+| 512  |  95.2 | 155.8 |  717.6 | 1207.2 |
+| 1024 | 149.1 | 222.1 |  789.2 | 1329.7 |
+| 2048 | 246.1 | 355.4 |  972.9 | 1706.9 |
+
+The fused LSA column was re-measured after the `Unroll=4` change to the
+peer-facing copies (see the LSA section of `ep_asyncll_kernel.hpp`), three
+interleaved rounds against an unmodified tree on the same node and harness. The
+unmodified arm reproduced the column this replaces to within ~1% at five of the
+six points -- 676.4/655.5/717.2/821.3/1357.2 against 676.5/659.3/714.5/826.5/1370.2
+-- so the two are comparable; 1024 is the exception (991.1 against 1130.1) and
+the 1130.1 reading is the suspect one, being non-monotonic with its neighbours.
+The unfused column predates the change and is left as measured; it would move
+too, since the same three sites serve both.
 
 Losing to the native intranode path is expected and is the same shape MI355X
 shows at EP8: native writes straight into the peer, AsyncLL stages. On a single
 node the staging buys nothing, because there is no RDMA leg for it to feed.
 
-**LSA is usable on this arch but not useful.** It runs 2.9-7.4x slower than
-sdma and 5.6-10.3x slower than native, which is nothing like MI355X, where the
+**LSA is usable on this arch but not useful.** It runs 2.7-7.4x slower than
+sdma and 4.0-10.3x slower than native, which is nothing like MI355X, where the
 two transports trade places (lsa 4% ahead at 64 tokens, 11% behind at 2048).
 Whatever makes a peer store competitive on wave64 does not hold here. sdma
 stays the default and the gap is wide enough that it is not close.
 
-**The LSA fusion is worth much more here than on MI355X.** Fused against
-unfused: -36.9% at 64 tokens, -35.6% at 256, -19.7% at 2048, where MI355X saw
--7.0% to -1.8%. Same sign, five times the magnitude -- consistent with the
-staging pass being a larger share of a transport whose remaining pass is this
-expensive.
+Note which end `Unroll=4` moved: -28.3% at 2048 and nothing at 64. The small
+end of this transport is not store-bound, so the remaining 7.4x there is a
+different problem from the 2.7x at the top.
 
 The 512 row is from a separate six-repeat run. The three-round sweep put it at
 331 us, non-monotonic between 256 and 1024; six repeats give 155.8 us with 1.2
@@ -310,11 +318,11 @@ arch.
 
 ### Tried and rejected
 
-Both of these follow from the same picture -- AsyncLL stages the payload three
+The first two follow from the same picture -- AsyncLL stages the payload three
 times and runs nine kernels, so the obvious targets are the extra passes and the
 extra launches -- and both were measured on an MI355X at EP8, six interleaved
-pairs, every pair agreeing in sign. They are recorded because the reasoning
-behind them is sound enough to be had again.
+pairs, every pair agreeing in sign. All of them are recorded because the
+reasoning behind them is sound enough to be had again.
 
 **Pipelining the send half over PE groups.** `SendTransfer` only posts SDMA
 descriptors; the engine's copy is not on the stream, so splitting the send into
@@ -346,6 +354,34 @@ arithmetic the new layout needs (`sum(row) - num_qp_per_pe`), which feeds the
 per-PE output prefix sum. Abandoned rather than chased: even correct, the
 cross-node leg is bandwidth-bound on per-PE cross-rail QPs at ~25 GB/s against
 v2_ll's 64-71, so a CQE drain is not what is costing it.
+
+**Moving the LSA transfer onto the gfx1250 TDM engine.** `benchmark/cco/ualoe_metric`
+establishes that TDM reaches the xGMI ceiling (~1640 GB/s one-way) on 512 blocks
+where a CU vector copy needs 8192, so a transport whose whole cost is CU-issued
+peer stores looks like the case for it. Written as a global -> LDS -> peer
+double-buffered copy, following `src/ops/dispatch_combine/intranode_1250x.hpp`,
+which is where the non-obvious part comes from: a TDM store can target a PEER's
+flat address, not only local memory. Measured on an idle gfx1250 node at EP4,
+five interleaved rounds, and it is a wash or slightly negative -- combine +1.6%
+at 2048, dispatch flat, and still a wash after `Unroll=4` removed the real
+bottleneck. Two reasons, and the second is the general one:
+
+* Dispatch never reached the TDM path at all. `XferBytesPerToken` is
+  7168*2 + 32 + 32 + 4 = 14404, so the slot stride is 4-byte aligned and source
+  and destination never share a 128 B phase.
+* The same ualoe data says TDM's advantage is a *grid-width* one, and below
+  about 1 MB neither transport is grid-limited -- there the CU path is often the
+  faster of the two. AsyncLL's transfer hands each warp tens of KB, so it sits in
+  the latency regime, not the bandwidth regime, and the extra trip through LDS is
+  pure cost. TDM pays in a kernel that has other work for the freed VGPRs; a
+  transfer pass has none.
+
+**Padding the slot stride to a 128 B row.** The alignment above is real, and
+fixing it (`XferBytesPerToken` rounded up to 128, with `internode_regions.py`
+following) is worth ~3.4% on the dispatch half and ~1% on the pair, measured in
+the same matrix. Not taken here because it changes the arena layout shared with
+the v2 / v2_ll families for a gain that `Unroll=4` dwarfs; it is a reasonable
+separate change.
 
 ### Reproducing
 
