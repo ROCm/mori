@@ -231,27 +231,44 @@ AsyncLL has to ask for `GDA_CONNECTION_CROSSNODE` where the others take RAIL.
 
 ### Single-node, EP4 (MI455X gfx1250, wave32)
 
-hidden 7168, top-k 8, bf16, CUDA graph, 50 iters. `pair_us` = dispatch + combine.
+hidden 7168, top-k 8, bf16, CUDA graph, 50 iters. `pair_us` = dispatch +
+combine, median of three interleaved rounds, no excluded samples.
 
-| tok/rank | asyncll (sdma) | v2 native | delta |
-|---:|---:|---:|---:|
-| 64   |  90.3 us |  67.2 us | +34.4% |
-| 128  |  99.9 us |  65.0 us | +53.7% |
-| 256  | 122.7 us |  73.7 us | +66.5% |
-| 512  | 156.8 us |  93.7 us | +67.3% |
-| 1024 | 222.1 us | 148.9 us | +49.2% |
-| 2048 | 355.9 us | 249.2 us | +42.8% |
-
-Per-rank payload bandwidth, dispatch / combine: 68/79 against 79/130 GB/s at 64
-tokens, 505/736 against 688/1129 at 2048.
+| tok/rank | v2 native | asyncll sdma | asyncll lsa (fused) | asyncll lsa (unfused) |
+|---:|---:|---:|---:|---:|
+| 64   |  65.7 |  90.9 |  676.5 | 1071.3 |
+| 128  |  70.3 | 100.6 |  659.3 | 1053.8 |
+| 256  |  74.3 | 122.0 |  714.5 | 1108.8 |
+| 512  |  95.2 | 155.8 |  826.5 | 1207.2 |
+| 1024 | 149.1 | 222.1 | 1130.1 | 1329.7 |
+| 2048 | 246.1 | 355.4 | 1370.2 | 1706.9 |
 
 Losing to the native intranode path is expected and is the same shape MI355X
 shows at EP8: native writes straight into the peer, AsyncLL stages. On a single
 node the staging buys nothing, because there is no RDMA leg for it to feed.
 
-`v2_asyncll_lsa` has no row here because the sweep that produced this table
-predates the count-reset fix. The LSA transport used to hang intermittently on
-gfx125x **under CUDA graph capture**, which is what this benchmark uses.
+**LSA is usable on this arch but not useful.** It runs 2.9-7.4x slower than
+sdma and 5.6-10.3x slower than native, which is nothing like MI355X, where the
+two transports trade places (lsa 4% ahead at 64 tokens, 11% behind at 2048).
+Whatever makes a peer store competitive on wave64 does not hold here. sdma
+stays the default and the gap is wide enough that it is not close.
+
+**The LSA fusion is worth much more here than on MI355X.** Fused against
+unfused: -36.9% at 64 tokens, -35.6% at 256, -19.7% at 2048, where MI355X saw
+-7.0% to -1.8%. Same sign, five times the magnitude -- consistent with the
+staging pass being a larger share of a transport whose remaining pass is this
+expensive.
+
+The 512 row is from a separate six-repeat run. The three-round sweep put it at
+331 us, non-monotonic between 256 and 1024; six repeats give 155.8 us with 1.2
+us of spread, and the neighbouring 384 showed an 810 us spread over the same
+six. This box throws an occasional large outlier that a median of three does
+not absorb -- 256 and 1024 reproduced to within 0.5% across both runs, so the
+rest of the column stands.
+
+The LSA rows above could not be measured at all until recently: the transport
+hung intermittently on gfx125x **under CUDA graph capture**, which is what this
+benchmark uses.
 
 The cause was a count-reuse race. LSA announced the combine epoch and only then
 cleared the dispatch receive counts, so a peer that passed the epoch handshake
