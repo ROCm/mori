@@ -635,15 +635,34 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // shape. lsa is worth keeping for the small-batch case and for a caller with an
 // empty seam, since it also costs CUs that an SDMA transfer leaves free.
 //
-// KNOWN BROKEN on gfx1250 (wave32). The numbers above are MI355X (gfx950,
-// wave64). On an MI455X at EP4 the sdma transport sweeps 64..2048 in about two
-// minutes and verifies every point, while lsa hangs on the FIRST one -- four
-// GPUs pinned at 100% for half an hour until the harness timeout kills it.
-// Unlike sdma, these bodies move the bytes from the grid itself over the flat
-// peer VA, so they are the half of AsyncLL whose correctness depends on the
-// memory model rather than on an engine. Not yet diagnosed. test_asyncll.py
-// exercises the sdma transport only, which is why the gfx1250 enablement passed
-// without touching this.
+// INTERMITTENT HANG on gfx125x UNDER CUDA GRAPH CAPTURE. The numbers above are
+// MI355X (gfx950, wave64) and stand. On an MI455X at EP4, hidden 7168, 64
+// tokens:
+//
+//   lsa  + eager          passes every run, output verifies
+//   lsa  + graph capture  hung 6 runs out of 8
+//   sdma + graph capture  passes every run
+//
+// So it is neither "lsa is broken on wave32" nor "capture is broken on this
+// arch" -- it is the two together, and only sometimes. An earlier note here
+// said the first of those, which was wrong: it came from a single run of a
+// benchmark that always captures, against a single-node test that never does.
+//
+// The shape of the failure is the diagnosis worth having. These bodies are the
+// one half of AsyncLL that moves the bytes from the GRID, over the flat peer VA,
+// instead of handing them to an engine -- so they are the half whose ordering
+// rests on the memory model rather than on a queue. Eager puts a kernel-launch
+// boundary between the peer stores and the receiver's spin on the count word;
+// replaying a captured graph does not. A missing release there would be visible
+// exactly like this: intermittent, capture-only, sdma unaffected. Unverified --
+// nobody has tried adding the fence and re-measuring the rate.
+//
+// Measure the RATE before believing any claim about this. Four separate
+// conclusions were drawn here from single runs and all four were wrong; at a 75%
+// hit rate a passing run means nothing.
+//
+// test_asyncll.py drives eager and the sdma transport, which is why the gfx1250
+// enablement passed without touching this.
 
 namespace asyncll {
 

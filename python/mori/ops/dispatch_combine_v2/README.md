@@ -249,10 +249,27 @@ Losing to the native intranode path is expected and is the same shape MI355X
 shows at EP8: native writes straight into the peer, AsyncLL stages. On a single
 node the staging buys nothing, because there is no RDMA leg for it to feed.
 
-`v2_asyncll_lsa` has no row: the LSA transport does not complete on gfx1250 (it
-hangs rather than failing, undiagnosed). The host gate refuses it on gfx125x so
-it fails immediately instead. `v1_asyncll` has no row either -- v1 is the shmem
-path and does not run on this arch.
+`v2_asyncll_lsa` has no row. The LSA transport hangs on gfx125x **under CUDA
+graph capture**, which is what this benchmark uses, and only sometimes:
+
+| | |
+|---|---|
+| lsa + eager | passes every run, output verifies |
+| lsa + graph capture | hung 6 runs out of 8 |
+| sdma + graph capture | passes every run |
+
+Measured at EP4, hidden 7168, 64 tokens. So neither the transport nor the arch
+is broken on its own -- it is the two together. Undiagnosed; the suspect is a
+missing release between the peer stores and the receiver's spin, which eager's
+kernel-launch boundaries would hide. The host gate refuses the combination on
+gfx125x so it fails immediately instead of hanging, and
+`MORI_ASYNCLL_LSA_FORCE=1` unlocks it for a caller who will not capture.
+
+Measure the rate before trusting any single run here: four conclusions about
+this were drawn from one run each and all four were wrong.
+
+`v1_asyncll` has no row either -- v1 is the shmem path and does not run on this
+arch.
 
 ### Tried and rejected
 
