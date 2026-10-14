@@ -372,6 +372,8 @@ class EpDispatchCombineConfig:
                     dtype=self.dtype_str,
                     experts_per_rank=self.num_experts_per_rank,
                     quant_type=self.quant_type,
+                    dispatch_dtype=self.dispatch_dtype,
+                    combine_dtype=self.combine_dtype,
                 )
             else:
                 from .tuning_configs import lookup

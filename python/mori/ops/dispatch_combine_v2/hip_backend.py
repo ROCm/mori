@@ -59,6 +59,7 @@ import os
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
+from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
 from .internode_regions import internode_regions
 from .symm_arena import SymmArena
@@ -1027,9 +1028,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # blocks add up their tokens and reserve once per destination; in TokOffExt's
         # allocation every block reserves its own.
         ext = int(getattr(self, "_tokoff_wanted", False))
-        for b, w in self._dispatch_specs:
+        for spec in self._dispatch_specs:
             plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
+                **common,
+                **disp_cfg,
+                block_num=spec.block_num,
+                warp_per_block=spec.warp_per_block,
+                tok_off_ext=ext,
             )
             self._plans.append(plan)
             plan.bind(rank=cfg.rank)

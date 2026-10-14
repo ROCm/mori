@@ -111,8 +111,8 @@ plus an accumulate in three kernels and a wider staging slot.
 
 import argparse
 import ctypes
+import dataclasses
 import os
-import socket
 import sys
 import time
 from pathlib import Path
@@ -1063,7 +1063,20 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
     (tokens 4: dispatch 64/32/8, combine 32/21/6). Driving both from one geometry
     means the sweep's incumbent is not the configuration actually shipped, so
     "beats the incumbent" would not mean "beats what we ship".
+
+    The intranode backend has no such hook; there the geometry is pinned through
+    the config fields, which also drops the tuned schedule.
     """
+    if not cfg.is_internode:
+        pinned = dataclasses.replace(
+            cfg,
+            schedule=None,
+            dispatch_block_num=dispatch_geometry[0],
+            warp_num_per_block=dispatch_geometry[2],
+            combine_block_num=combine_geometry[0],
+            combine_warp_num_per_block=combine_geometry[2],
+        )
+        return EpDispatchCombineOp(pinned, comm)
     previous = (
         os.environ.get("MORI_EP_DISP_GEOM"),
         os.environ.get("MORI_EP_COMB_GEOM"),
@@ -1302,12 +1315,16 @@ def _tune(cfg, dist_handle, device, args, comm):
         )
         return sorted({count for count in fractions if 1 <= count < block_count})
 
-    candidates = [
-        (block, rdma, warp)
-        for block in sorted(blocks)
-        for warp in warps
-        for rdma in rdma_block_counts(block)
-    ]
+    if cfg.is_internode:
+        candidates = [
+            (block, rdma, warp)
+            for block in sorted(blocks)
+            for warp in warps
+            for rdma in rdma_block_counts(block)
+        ]
+    else:
+        # Intranode has no RDMA split; the middle field stays 0.
+        candidates = [(block, 0, warp) for block in sorted(blocks) for warp in warps]
     if args.tuning_candidate:
         candidates = [tuple(int(x) for x in args.tuning_candidate.split(","))]
     elif args.tuning_limit:
@@ -1316,6 +1333,7 @@ def _tune(cfg, dist_handle, device, args, comm):
     from mori.ops.dispatch_combine_v2.hip_tuning_configs import (
         internode_kernel_family,
         lookup_internode,
+        pick_bucket,
     )
     from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR
 
@@ -1327,7 +1345,9 @@ def _tune(cfg, dist_handle, device, args, comm):
         "dispatch": DTYPE_TO_CONFIG_STR.get(cfg.dispatch_dtype),
         "combine": DTYPE_TO_CONFIG_STR.get(cfg.combine_dtype),
     }
-    kernel_family = internode_kernel_family(cfg, args.max_tokens)
+    kernel_family = (
+        internode_kernel_family(cfg, args.max_tokens) if cfg.is_internode else "intra"
+    )
     if args.tuning_save or args.tuning_config_dir:
         # Read the incumbent from the SAME table the winner will be written to.
         # The kernels run from site-packages while --tuning-save writes the
@@ -1335,16 +1355,40 @@ def _tune(cfg, dist_handle, device, args, comm):
         # is not about to replace -- and the second phase of a shape would not
         # see the first phase's result at all.
         os.environ["MORI_EP_V2_TUNING_DIR"] = str(_tuning_table_dir(args))
-    table_row = lookup_internode(
-        cfg.world_size,
-        cfg.hidden_dim,
-        cfg.num_experts_per_token,
-        args.max_tokens,
-        cfg.dispatch_dtype,
-        cfg.combine_dtype,
-        kernel_family=kernel_family,
-        experts_per_rank=cfg.num_experts_per_rank,
-    )
+    if cfg.is_internode:
+        table_row = lookup_internode(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            args.max_tokens,
+            cfg.dispatch_dtype,
+            cfg.combine_dtype,
+            kernel_family=kernel_family,
+            experts_per_rank=cfg.num_experts_per_rank,
+        )
+    else:
+        # Re-resolve the schedule: the caller's config was built before
+        # MORI_EP_V2_TUNING_DIR pointed at the table this run writes.
+        current = dataclasses.replace(
+            cfg,
+            schedule=None,
+            dispatch_block_num=None,
+            warp_num_per_block=None,
+            combine_block_num=None,
+            combine_warp_num_per_block=None,
+        )
+        row = (
+            pick_bucket(current.schedule, args.max_tokens)
+            if current.schedule
+            else (
+                None,
+                current.dispatch_block_num,
+                current.warp_num_per_block,
+                current.combine_block_num,
+                current.combine_warp_num_per_block,
+            )
+        )
+        table_row = {"dispatch": (row[1], 0, row[2]), "combine": (row[3], 0, row[4])}
 
     # The incumbent is what a user gets TODAY: the shipped row where there is
     # one, and otherwise the geometry the config resolves on its own. Not
@@ -1657,8 +1701,6 @@ def _tune(cfg, dist_handle, device, args, comm):
                 dtype_key=dtype_keys[phase],
                 kernel_family=kernel_family,
                 geometry=best,
-                selected_us=best_median,
-                incumbent=shipped,
                 metrics=metrics[phase],
             )
     return 0
@@ -1693,11 +1735,10 @@ def _save_tuning_row(
     dtype_key,
     kernel_family,
     geometry,
-    selected_us,
-    incumbent,
     metrics,
 ):
-    """Merge one swept phase's rule into its own file (v1's phase split).
+    """Merge one swept phase's rule into its own file, one per expert count,
+    top-k and phase (hip_tuning_configs.v2_table_filename).
 
     Only the phase that was swept is written, and it goes in that phase's file,
     so the other phase's rule is untouched by construction -- writing the
@@ -1707,51 +1748,29 @@ def _save_tuning_row(
     from mori.ops.dispatch_combine_v2.hip_tuning_configs import save_internode_result
 
     block_num, rdma_block_num, warp_per_block = geometry
-    measured = (
-        f"{time.strftime('%Y-%m-%d')}, {socket.gethostname()}, "
-        f"--cmd tuning --tuning-phase {phase} --max-tokens {args.max_tokens} "
-        f"--kernel-type {args.kernel_type} --num-qp {args.num_qp} "
-        f"--topk {args.topk} --experts-per-rank {cfg.num_experts_per_rank}, "
-        f"scope={args.tuning_scope} reps={args.tuning_reps} rounds={args.rounds}. "
-        + (
-            f"Selected on --tuning-metric {args.tuning_metric} "
-            f"({selected_us:.1f}us"
-            + (
-                ", the dispatch+combine PAIR total, not this phase alone"
-                if args.tuning_metric == "total"
-                else ""
-            )
-            + f"), paired against {incumbent}. "
-            if selected_us is not None
-            # A refresh run: no candidate was measured against the incumbent,
-            # so this row's GEOMETRY is unchanged and only its avg_* fields are
-            # new. Saying so matters -- the alternative reading is that this
-            # geometry won a sweep, which it did not, here.
-            else f"No candidate was measured: the geometry {incumbent} is "
-            "unchanged and only the avg_* fields below are from this run. "
-        )
-        + "The avg_* fields were measured on the pair this row ships, one op "
-        "alone. Guard 2 of the re-tuning protocol (a head-to-head re-run) is "
-        "NOT part of these numbers."
-    )
+    if kernel_family == "intra":
+        # One node has no RDMA leg and no LL scale; xGMI is the transport.
+        metrics = {
+            "bandwidth_gbps": metrics["avg_xgmi_bandwidth_gbps"],
+            "avg_xgmi_bandwidth_gbps": metrics["avg_xgmi_bandwidth_gbps"],
+            "avg_latency_us": metrics["avg_latency_us"],
+            "bandwidth_metric": metrics["bandwidth_metric"],
+        }
     entry = {
         "dtype": dtype_key,
         "num_tokens": args.max_tokens,
         "hidden_dim": cfg.hidden_dim,
         "topk": cfg.num_experts_per_token,
-        # Part of the merge key, so two expert counts at the same (dtype,
-        # hidden, topk, num_tokens) are two rules rather than one overwriting
-        # the other. Derived -- world_size x this is the model's expert count --
-        # so it costs the caller nothing to record.
+        # world_size x this is the model's expert count, which picks the file
+        # and is not stored in the rule, so two expert counts at the same
+        # (dtype, hidden, topk, num_tokens) land in two files rather than one
+        # overwriting the other.
         "experts_per_rank": cfg.num_experts_per_rank,
         "block_num": block_num,
         "rdma_block_num": rdma_block_num,
         "warp_per_block": warp_per_block,
         # v1's metric field set, same names and same definitions (_row_metrics).
         **metrics,
-        # This harness measures live tokens equal to capacity. Lookup uses live
-        # tokens, so these measurements do not cover a larger fixed capacity.
-        "measured": measured,
     }
     if args.tuning_note:
         entry["note"] = args.tuning_note
@@ -1822,9 +1841,10 @@ def main(argv):
     device = torch.device("cuda", dist_handle.local_rank)
 
     gpu_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-    if npes <= gpu_per_node:
+    # One node builds the intranode op; only test and tuning support that.
+    if npes <= gpu_per_node and args.cmd not in ("test", "tuning"):
         raise SystemExit(
-            f"this test needs more than one node: world_size={npes} with "
+            f"--cmd {args.cmd} needs more than one node: world_size={npes} with "
             f"{gpu_per_node} GPUs per node is a single node"
         )
 

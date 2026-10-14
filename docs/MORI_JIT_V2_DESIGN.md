@@ -349,16 +349,18 @@ HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyD
 跨机的数据解析中，`internode_schedule(cfg)` 合并查表结果、手动覆盖和 token 边界，
 `internode_buckets()` 读取单个 family 的规则，
 `lookup_internode()` 解析单个 token 数，`save_internode_result()` 保存调优结果，
-`internode_kernel_family()` 解析本次调用的 kernel family。JSON 的命名、加载、lookup 和合并保存复用
-`mori.ops.tuning_config`；`MORI_EP_V2_TUNING_DIR` 可指定 JSON 目录。没有匹配 JSON 规则的相使用配置默认几何。
+`internode_kernel_family()` 解析本次调用的 kernel family。规则校验、lookup 和合并保存复用
+`mori.ops.tuning_config`，文件命名由 V2 自己的 `v2_table_filename()` 决定；`MORI_EP_V2_TUNING_DIR`
+可指定 JSON 目录。没有匹配 JSON 规则的相使用配置默认几何。
 
-JSON 按 dispatch/combine 和 `InterNodeV2`/`InterNodeV2LL` 分文件，各相按**自身 dtype**查找：
+JSON 按 kernel（`InterNodeV2`/`InterNodeV2LL`/`IntraNodeV2`）、EP、总专家数、topk 和 dispatch/combine
+分文件，命名为 `{arch}_{model}_{kernel}_ep{n}_expert{experts}_top{k}_{phase}.json`，例如
+`gfx950_mi355x_InterNodeV2_ep16_expert256_top6_dispatch.json`。各相按**自身 dtype**查找：
 fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
-ceiling，最大一档也服务更大的 token 数。V2 规则必须显式记录 `topk` 和 `experts_per_rank`，
-两者均精确匹配，不跨模型组合回退；缺少任一字段的旧规则不参与 V2 查表，未调优的相使用默认几何。
-总专家数为 `ep_size * experts_per_rank`：例如 EP16 的 256/8 使用 `(experts_per_rank=16, topk=8)`，
-384/6 使用 `(experts_per_rank=24, topk=6)`。保存结果也要求这两个字段，并将它们纳入合并键，
-不同专家组合可以在同一文件中共存。V1 的历史通配兼容行为不变。
+ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）和 `topk` 决定读哪个
+文件：例如 EP16 的 256/8 读 `expert256_top8`，384/6 读 `expert384_top6`，不跨专家组合回退。规则必须
+显式记录 `topk`，缺这个字段的旧规则不参与 V2 查表；专家数由文件确定，不逐条记录。未调优的相使用默认几何。
+保存结果时用这两个值选择文件。V1 的历史通配兼容行为不变。
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
 
 internode 几何增加了 `rdma_block_num`，把 grid 分成 RDMA 和 node 内两部分。

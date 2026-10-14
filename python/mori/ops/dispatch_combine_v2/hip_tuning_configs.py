@@ -22,8 +22,9 @@
 """HIP V2 configuration: resolve_schedule(cfg) -> ScheduleEntry rows.
 
 Both paths use KernelConfig keys and pick_bucket() with inclusive token ceilings.
-The data sources retain their existing formats: intra lookup() uses Python
-tables; internode_buckets() reads JSON through mori.ops.tuning_config.
+Intra lookup() reads the IntraNodeV2 JSON tables first and falls back to the
+Python tables per phase; internode_buckets() reads the JSON table named by
+v2_table_filename() for its shape, validated by mori.ops.tuning_config.
 """
 
 from __future__ import annotations
@@ -385,18 +386,27 @@ def lookup(
     dtype="bf16",
     experts_per_rank=None,
     quant_type="none",
+    dispatch_dtype=None,
+    combine_dtype=None,
 ) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
     An unswept shape gets the HIP single-shot default (schedule=None). A swept one
     gets a per-token-count schedule built from the dispatch and combine tables
     independently, so either half can be re-tuned without touching the other.
+
+    Given both legs' dtypes, the IntraNodeV2 JSON tables come first. Each phase
+    takes its JSON rules when it has any and the Python table otherwise, so the
+    JSON can be filled one phase at a time.
     """
     base = _hip_default()
     dev = _device_key()
     disp = _bucket_key(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
+    if disp is not None:
+        # None is the "every dtype measured the same" key; an exact dtype overrides it.
+        disp = disp.get(dtype) or disp.get(None)
     comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
         comb = _bucket_key(
@@ -410,18 +420,40 @@ def lookup(
         comb = _bucket_key(
             _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
         )
+    if dispatch_dtype is not None and quant_type == "none":
+        json_disp, json_comb = intranode_buckets(
+            world_size,
+            hidden_dim,
+            topk,
+            dispatch_dtype,
+            combine_dtype,
+            experts_per_rank=experts_per_rank,
+        )
+        if json_disp or json_comb:
+            disp = json_disp or disp
+            comb = json_comb or comb
+            disp = disp or (
+                (None, base["dispatch_block_num"], base["warp_num_per_block"]),
+            )
+            comb = comb or (
+                (None, base["combine_block_num"], base["combine_warp_num_per_block"]),
+            )
+            base["schedule"] = _merge(disp, comb)
+            return base
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
-    # None is the "every dtype measured the same" key; an exact dtype overrides it.
-    disp = disp.get(dtype) or disp.get(None)
-    if disp is None:
-        return base
     base["schedule"] = _merge(disp, comb)
     return base
 
 
 _INTERNODE_TABLE_DIR = Path(__file__).parent / "tuning_configs"
-_INTERNODE_KERNEL_TYPES = {"v2": "InterNodeV2", "v2_ll": "InterNodeV2LL"}
+# JSON kernel_type per table family. "intra" is the single-node HIP op, which
+# shares the internode loader, matching rules and save path.
+_V2_KERNEL_TYPES = {
+    "v2": "InterNodeV2",
+    "v2_ll": "InterNodeV2LL",
+    "intra": "IntraNodeV2",
+}
 _INTERNODE_PHASES = ("dispatch", "combine")
 _INTERNODE_GEOMETRY_FIELDS = (
     ("dispatch_block_num", "dispatch_rdma_block_num", "warp_num_per_block"),
@@ -532,8 +564,72 @@ def internode_schedule(cfg):
 
 
 def internode_table_dir():
-    """V2's explicit directory also isolates it from MORI_EP_TUNING_CONFIG."""
+    """V2 reads only this directory; V1's MORI_EP_TUNING_CONFIG never applies."""
     return Path(os.environ.get("MORI_EP_V2_TUNING_DIR") or _INTERNODE_TABLE_DIR)
+
+
+def v2_table_filename(
+    gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
+):
+    """One V2 table per model shape and phase, e.g.
+    ``gfx950_mi355x_InterNodeV2_ep16_expert256_top8_dispatch.json``."""
+    return (
+        f"{gpu_arch}_{gpu_model}_{kernel_type}_ep{ep_size}_"
+        f"expert{num_experts}_top{topk}_{phase}.json"
+    )
+
+
+def _v2_table_path(
+    directory, gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
+):
+    """The exact model's table, else another model's with the same arch and shape."""
+    directory = Path(directory)
+    exact = directory / v2_table_filename(
+        gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
+    )
+    if exact.is_file() or not directory.is_dir():
+        return exact
+    siblings = sorted(
+        directory.glob(
+            v2_table_filename(
+                gpu_arch, "*", kernel_type, ep_size, num_experts, topk, phase
+            )
+        )
+    )
+    return siblings[0] if siblings else exact
+
+
+_V2_RULES_CACHE: dict = {}
+
+
+def _v2_phase_rules(
+    gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
+):
+    """Validated, sorted rules of one V2 table; [] when there is none."""
+    from mori.ops.tuning_config import (
+        _COMBINE_RULE_REQUIRED,
+        _DISPATCH_RULE_REQUIRED,
+        TuningConfigManager,
+    )
+
+    path = _v2_table_path(
+        internode_table_dir(),
+        gpu_arch,
+        gpu_model,
+        kernel_type,
+        ep_size,
+        num_experts,
+        topk,
+        phase,
+    )
+    if path not in _V2_RULES_CACHE:
+        required = (
+            _DISPATCH_RULE_REQUIRED if phase == "dispatch" else _COMBINE_RULE_REQUIRED
+        )
+        _V2_RULES_CACHE[path] = TuningConfigManager._load_phase_rules(
+            path, gpu_arch, phase, required
+        )
+    return _V2_RULES_CACHE[path]
 
 
 def internode_buckets(
@@ -548,8 +644,9 @@ def internode_buckets(
     """Return (token ceiling, dispatch geometry, combine geometry) rows.
 
     Each phase matches its own dtype and stored width (packed for FP4 dispatch).
-    Top-k and experts per rank must match explicitly; missing fields are not
-    wildcards. Total experts are world_size * experts_per_rank.
+    Total experts (world_size * experts_per_rank) and top-k name the table file
+    (v2_table_filename), so a file only holds its own expert count. Rules still
+    record top-k, and a rule without it is not a wildcard.
     An untuned phase is None, and a wholly untuned shape returns None.
     """
     if topk is None or experts_per_rank is None:
@@ -557,15 +654,13 @@ def internode_buckets(
 
     from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR, TuningConfigManager
 
-    kernel_type = _INTERNODE_KERNEL_TYPES.get(kernel_family)
+    kernel_type = _V2_KERNEL_TYPES.get(kernel_family)
     if kernel_type is None:
         return None
     model, arch = _gpu.detect_model(), _gpu.arch_name()
     if model is None or arch is None:
         return None
-    manager = TuningConfigManager.get_instance(
-        arch, kernel_type, world_size, model, directory=internode_table_dir()
-    )
+    num_experts = world_size * experts_per_rank
     dtypes = {
         "dispatch": dispatch_dtype,
         "combine": combine_dtype if combine_dtype is not None else dispatch_dtype,
@@ -578,21 +673,22 @@ def internode_buckets(
         "combine": hidden_dim,
     }
     phase_rules = {
-        "dispatch": manager.dispatch_rules,
-        "combine": manager.combine_rules,
+        phase: _v2_phase_rules(
+            arch, model, kernel_type, world_size, num_experts, topk, phase
+        )
+        for phase in _INTERNODE_PHASES
     }
     edges, matched = set(), {}
     for phase, rules in phase_rules.items():
         dtype_str = DTYPE_TO_CONFIG_STR.get(dtypes[phase])
         # The shared loader permits broader shape fallback. Restrict its input
-        # here so V2 never borrows another hidden dimension or expert/top-k shape.
+        # here so V2 never borrows another hidden dimension or top-k shape.
         matched[phase] = [
             rule
             for rule in rules
             if rule["dtype"] == dtype_str
             and rule["hidden_dim"] == hidden_dims[phase]
             and rule.get("topk") == topk
-            and rule.get("experts_per_rank") == experts_per_rank
         ]
         edges.update(rule["num_tokens"] for rule in matched[phase])
     if not edges:
@@ -621,6 +717,42 @@ def internode_buckets(
             geometries.append(fit_internode_geometry(geometry, clamp_to_cu=True))
         table.append((num_tokens, *geometries))
     return table
+
+
+def intranode_buckets(
+    world_size,
+    hidden_dim,
+    topk,
+    dispatch_dtype,
+    combine_dtype=None,
+    experts_per_rank=None,
+):
+    """(dispatch, combine) bucket lists from the IntraNodeV2 JSON tables.
+
+    Each is ((max_tok_inclusive, block, warp), ...) ascending, or None when that
+    phase has no rule. Matching is internode_buckets', so dtype, top-k and the
+    expert count must all be exact; intranode has no RDMA split to keep.
+    """
+    rows = internode_buckets(
+        world_size,
+        hidden_dim,
+        topk,
+        dispatch_dtype,
+        combine_dtype,
+        kernel_family="intra",
+        experts_per_rank=experts_per_rank,
+    )
+    if not rows:
+        return None, None
+    phases = []
+    for index in (1, 2):
+        buckets = tuple(
+            (row[0], row[index][0], row[index][2])
+            for row in rows
+            if row[index] is not None
+        )
+        phases.append(buckets or None)
+    return phases[0], phases[1]
 
 
 def lookup_internode(
@@ -658,27 +790,30 @@ def save_internode_result(
     directory=None,
     path=None,
 ):
-    """Save an explicitly keyed expert/top-k rule and invalidate the cache."""
-    from mori.ops.tuning_config import TuningConfigManager, build_config_filename
+    """Save one rule into the table v2_table_filename names for its total experts
+    (world_size * entry["experts_per_rank"]) and top-k, then invalidate the cache.
+    experts_per_rank only picks the file; the stored rule does not repeat it."""
+    from mori.ops.tuning_config import TuningConfigManager
 
     if phase not in _INTERNODE_PHASES:
         raise ValueError(f"phase must be one of {_INTERNODE_PHASES}, got {phase!r}")
-    kernel_type = _INTERNODE_KERNEL_TYPES.get(kernel_family)
+    kernel_type = _V2_KERNEL_TYPES.get(kernel_family)
     if kernel_type is None:
-        raise ValueError(f"unsupported internode kernel family: {kernel_family!r}")
+        raise ValueError(f"unsupported V2 kernel family: {kernel_family!r}")
     entry = dict(entry)
     for name in ("topk", "experts_per_rank"):
         value = entry.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"V2 internode tuning requires a positive integer {name}")
     model, arch = _gpu.detect_model(), _gpu.arch_name()
+    num_experts = world_size * entry.pop("experts_per_rank")
     if path is None:
         if model is None or arch is None:
             raise RuntimeError(
                 "cannot save internode tuning for an unknown GPU; pass an explicit path"
             )
-        path = Path(directory or internode_table_dir()) / build_config_filename(
-            arch, kernel_type, world_size, model, phase
+        path = Path(directory or internode_table_dir()) / v2_table_filename(
+            arch, model, kernel_type, world_size, num_experts, entry["topk"], phase
         )
     else:
         path = Path(path)
@@ -692,6 +827,8 @@ def save_internode_result(
             gpu_model=model,
             kernel_type=kernel_type,
             ep_size=world_size,
+            num_experts=num_experts,
+            topk=entry["topk"],
             phase=phase,
         ),
         entry,
@@ -699,5 +836,5 @@ def save_internode_result(
     )
     # Container sweeps may run as root; keep their output readable on the host.
     os.chmod(path, 0o644)
-    TuningConfigManager._cache.clear()
+    _V2_RULES_CACHE.clear()
     return path
