@@ -830,36 +830,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "reach only ranks inside this one's flat LSA window. Use 'sdma', "
                 "whose cross-node peers go over ccoGda"
             )
-        # Refused rather than left to hang. On gfx125x the LSA transfer hangs
-        # INTERMITTENTLY and only under CUDA graph capture: measured at EP4 on an
-        # MI455X, hidden 7168, 64 tokens, it hung 6 runs out of 8, with all four
-        # GPUs spinning at 100% and nothing in the log. The same build in eager
-        # mode passes every time and verifies, and sdma under capture passes every
-        # time, so neither the kernels nor the arch is broken on its own.
-        #
-        # Gated on the arch rather than on capture because the op is built before
-        # the caller has said whether it will capture, and a hang is a worse
-        # answer than a refusal. The cost of that choice is real -- it also
-        # refuses the eager path, which works -- so MORI_ASYNCLL_LSA_FORCE=1
-        # unlocks it for a caller who knows which mode they are in, and for
-        # working on the hang itself.
-        #
-        # Undiagnosed. The shape of it -- intermittent, capture-only, and on the
-        # one transport whose bytes the grid moves itself rather than handing to
-        # an engine -- points at a missing release between the peer stores and
-        # the receiver's spin, with eager's kernel-launch boundaries papering
-        # over it. See the LSA section of ep_asyncll_kernel.hpp.
-        if (
-            cfg.async_ll_transport == "lsa"
-            and self._is1250
-            and os.environ.get("MORI_ASYNCLL_LSA_FORCE", "0") != "1"
-        ):
-            bad.append(
-                "async_ll_transport='lsa' on gfx125x: hangs intermittently under "
-                "CUDA graph capture (6 of 8 runs at EP4). Eager works; set "
-                "MORI_ASYNCLL_LSA_FORCE=1 if you will not capture, or use "
-                "async_ll_transport='sdma'"
-            )
         # Without this the communicator comes back with zero SDMA queues and every
         # put is a silent no-op -- the tokens never move and the receiver spins on
         # a count that never arrives. A hang with no message is the worst way to

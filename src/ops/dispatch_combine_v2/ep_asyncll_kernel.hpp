@@ -635,31 +635,55 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // shape. lsa is worth keeping for the small-batch case and for a caller with an
 // empty seam, since it also costs CUs that an SDMA transfer leaves free.
 //
-// INTERMITTENT HANG on gfx125x UNDER CUDA GRAPH CAPTURE. The numbers above are
-// MI355X (gfx950, wave64) and stand. On an MI455X at EP4, hidden 7168, 64
-// tokens:
+// INTERMITTENT HANG observed on gfx125x UNDER CUDA GRAPH CAPTURE before the
+// count-reset ordering fix below. The numbers above are MI355X (gfx950, wave64).
+// On an MI455X at EP4, hidden 7168, 64 tokens:
 //
 //   lsa  + eager          passes every run, output verifies
 //   lsa  + graph capture  hung 6 runs out of 8
 //   sdma + graph capture  passes every run
 //
-// So it is neither "lsa is broken on wave32" nor "capture is broken on this
-// arch" -- it is the two together, and only sometimes. An earlier note here
-// said the first of those, which was wrong: it came from a single run of a
-// benchmark that always captures, against a single-node test that never does.
+// These runs observed hangs only for LSA under graph capture. They do not
+// establish that eager execution or other architectures are immune. An earlier
+// note incorrectly called LSA broken on wave32 based on one capturing benchmark
+// run compared with a single-node test that never captures.
 //
-// The shape of the failure is the diagnosis worth having. These bodies are the
-// one half of AsyncLL that moves the bytes from the GRID, over the flat peer VA,
-// instead of handing them to an engine -- so they are the half whose ordering
-// rests on the memory model rather than on a queue. Eager puts a kernel-launch
-// boundary between the peer stores and the receiver's spin on the count word;
-// replaying a captured graph does not. A missing release there would be visible
-// exactly like this: intermittent, capture-only, sdma unaffected. Unverified --
-// nobody has tried adding the fence and re-measuring the rate.
+// A protocol race exists independently of payload visibility: CombineRecvTransferLsa
+// used to publish its epoch, wait for peers, and only THEN clear recv counts. A
+// fast peer could pass the epoch handshake and publish its next dispatch count
+// before our late clear erased it. SDMA clears in CombineSendTransfer, before
+// the epoch announcement, so it does not have this window. LSA now clears each
+// peer's count before its release epoch store, paired with an acquire wait.
 //
-// Measure the RATE before believing any claim about this. Four separate
-// conclusions were drawn here from single runs and all four were wrong; at a 75%
-// hit rate a passing run means nothing.
+// Fixing it removes the hang. Eight interleaved pairs on an idle MI455X at the
+// shape above, base and fixed alternating, no contaminated samples:
+//
+//   baseline  1 pass / 7 hang
+//   fixed     8 pass / 0 hang
+//
+// The two arms shared one host library and differed only in MORI_SOURCE_ROOT, so
+// the JIT compiled a different kernel for each. That was checked rather than
+// assumed -- an #error planted in the baseline tree fired when the root pointed
+// there and did not fire when it pointed at the fixed tree. Without that check
+// "both arms passed" cannot be told from "both arms ran the same code", which is
+// how an earlier 8/8-vs-8/8 run reached no conclusion.
+//
+// Why eager never hit it, when the race does not need graphs: the window is the
+// gap between a peer passing the epoch handshake and our clear landing, and
+// eager's host round trip between kernels is wide enough that ranks rarely sit
+// in it. Replay closes that gap and the ranks run shoulder to shoulder. So
+// "eager passes" was never evidence against this race -- only evidence that the
+// window was wide. Reading it as a contradiction cost a round of disbelief.
+//
+// A separate payload-visibility defect has not been established; adding a fence
+// after WarpCopy alone would not fix a count that a later kernel overwrites with
+// zero.
+//
+// Measure the RATE before believing any claim about this. Several conclusions
+// here were drawn from single runs and were wrong; at a 7-in-8 hit rate a
+// passing run means nothing, and on a shared box an interfering job can hide the
+// failure entirely -- a 55-run matrix on a busy node saw 0 hangs where this
+// 16-run matrix on an idle one saw 7.
 //
 // test_asyncll.py drives eager and the sdma transport, which is why the gfx1250
 // enablement passed without touching this.
@@ -812,25 +836,24 @@ __device__ void EpCombineAsyncLLRecvTransferLsa_body(EpDispatchCombineArgs args)
   if (globalWarpId == 0 && laneId < npes) {
     const int destPe = laneId;
     if (destPe == myPe || destPe / config.gpuPerNode == myNode) {
+      // All warps finished reading these counts in SendTransferLsa. Re-arm this
+      // peer's slot BEFORE allowing it to start the next dispatch: if we clear
+      // after the epoch wait, a faster peer can already have written its next
+      // count and our late zero would erase it, leaving dispatch spinning forever.
+      uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
+      core::AtomicStoreRelaxedSystem(
+          reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(destPe)), uint64_t{0});
       uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>(destPe);
-      core::AtomicStoreRelaxedSystem(barrier + myPe, flag);
+      // The same lane clears the slot and notifies its writer. The peer's acquire
+      // must observe this clear before its next dispatch can reuse the slot.
+      core::AtomicStoreReleaseSystem(barrier + myPe, flag);
     }
   }
 
   if (blockId == 0 && warpId == 0 && laneId < npes) {
     uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-    while (core::AtomicLoadRelaxedSystem(barrier + laneId) != flag) {
+    while (__hip_atomic_load(barrier + laneId, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != flag) {
     }
-  }
-
-  // Clear the dispatch recv counts, re-arming the "0 means not arrived" test the
-  // next dispatch spins on. Here rather than in the pass that reads them: that
-  // one sizes every warp's copy from these words and has no grid-wide point
-  // after the last read, whereas this is a separate launch and therefore is one.
-  if (globalWarpId == 0 && laneId < npes) {
-    uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
-    core::AtomicStoreRelaxedSystem(
-        reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(laneId)), uint64_t{0});
   }
 }
 

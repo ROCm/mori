@@ -249,24 +249,44 @@ Losing to the native intranode path is expected and is the same shape MI355X
 shows at EP8: native writes straight into the peer, AsyncLL stages. On a single
 node the staging buys nothing, because there is no RDMA leg for it to feed.
 
-`v2_asyncll_lsa` has no row. The LSA transport hangs on gfx125x **under CUDA
-graph capture**, which is what this benchmark uses, and only sometimes:
+`v2_asyncll_lsa` has no row here because the sweep that produced this table
+predates the count-reset fix. The LSA transport used to hang intermittently on
+gfx125x **under CUDA graph capture**, which is what this benchmark uses.
 
-| | |
+The cause was a count-reuse race. LSA announced the combine epoch and only then
+cleared the dispatch receive counts, so a peer that passed the epoch handshake
+could publish its next dispatch count before the old round's clear erased it,
+leaving dispatch waiting on a count that would never come again. SDMA clears in
+`CombineSendTransfer`, before its epoch announcement, which is why it was never
+affected. LSA now clears each peer's count before publishing its epoch, with
+system release/acquire ordering.
+
+Eight interleaved pairs at EP4, hidden 7168, 64 tokens, on an idle MI455X, no
+contaminated samples:
+
+| | pass / hang |
 |---|---|
-| lsa + eager | passes every run, output verifies |
-| lsa + graph capture | hung 6 runs out of 8 |
-| sdma + graph capture | passes every run |
+| baseline | 1 / 7 |
+| fixed | 8 / 0 |
 
-Measured at EP4, hidden 7168, 64 tokens. So neither the transport nor the arch
-is broken on its own -- it is the two together. Undiagnosed; the suspect is a
-missing release between the peer stores and the receiver's spin, which eager's
-kernel-launch boundaries would hide. The host gate refuses the combination on
-gfx125x so it fails immediately instead of hanging, and
-`MORI_ASYNCLL_LSA_FORCE=1` unlocks it for a caller who will not capture.
+Two things about that measurement are worth copying rather than the number
+itself. The arms shared one host library and differed only in
+`MORI_SOURCE_ROOT`, and that this actually selected different kernels was
+*checked* -- an `#error` planted in the baseline tree fired when the root
+pointed there and not when it pointed at the fixed tree. And the node was idle:
+an earlier 55-run matrix on a busy box recorded 0 hangs for the same baseline,
+because an interfering job widens the window the race needs.
 
-Measure the rate before trusting any single run here: four conclusions about
-this were drawn from one run each and all four were wrong.
+Eager never hit this even though the race does not need graphs: the window is
+the gap between a peer clearing the handshake and our clear landing, and eager's
+host round trip between kernels is wide enough that ranks rarely sit in it.
+"Eager passes" was therefore never evidence against the race.
+
+Measure the rate before trusting any single run here. Several conclusions about
+this bug were each drawn from one run and were wrong -- that the kernels were
+broken on wave32, that the LSA fusion caused it, that the iteration count was a
+threshold, that a lane guard fixed it, and that the race could not be the cause
+because eager passed.
 
 `v1_asyncll` has no row either -- v1 is the shmem path and does not run on this
 arch.
