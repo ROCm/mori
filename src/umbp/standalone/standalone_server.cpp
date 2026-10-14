@@ -167,21 +167,23 @@ std::chrono::milliseconds FdHandshakeTimeout() {
   return std::chrono::milliseconds(value);
 }
 
-// Keeps the read-handler bodies independent of the deployment-specific lock
-// policy. Exactly one of the two deferred locks owns the mutex.
-class ConditionalReadLock {
+enum class DataPathLocking { kNone, kShared, kExclusive };
+
+// Keeps the data-path handler bodies independent of the deployment-specific
+// lock policy. At most one of the two deferred locks owns the mutex.
+class DataPathLock {
  public:
-  ConditionalReadLock(std::shared_mutex& mutex, bool shared)
+  DataPathLock(std::shared_mutex& mutex, DataPathLocking mode)
       : shared_(mutex, std::defer_lock), exclusive_(mutex, std::defer_lock) {
-    if (shared) {
+    if (mode == DataPathLocking::kShared) {
       shared_.lock();
-    } else {
+    } else if (mode == DataPathLocking::kExclusive) {
       exclusive_.lock();
     }
   }
 
-  ConditionalReadLock(const ConditionalReadLock&) = delete;
-  ConditionalReadLock& operator=(const ConditionalReadLock&) = delete;
+  DataPathLock(const DataPathLock&) = delete;
+  DataPathLock& operator=(const DataPathLock&) = delete;
 
  private:
   std::shared_lock<std::shared_mutex> shared_;
@@ -488,6 +490,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         // backend may not serve at all, so reading it here would serialize a
         // DRAM server for no reason.
         shared_reads_(BackendMedium(backend_config_) != UMBPMedium::SSD),
+        concurrent_backend_(shared_reads_ && client_ != nullptr &&
+                            client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed),
         address_(std::move(address)),
         fd_socket_path_(DeriveFdSocketPath(address_)) {}
 
@@ -529,7 +533,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     chmod(grpc_path.c_str(), 0600);
     MORI_UMBP_INFO("[StandaloneServer] listening grpc={} fd_socket={}", address_, fd_socket_path_);
-    if (shared_reads_) {
+    if (concurrent_backend_) {
+      MORI_UMBP_INFO(
+          "[StandaloneServer] data plane: concurrent reads and writes, unlocked lookups "
+          "(medium={})",
+          TierTypeName(ToTierType(BackendMedium(backend_config_))));
+    } else if (shared_reads_) {
       MORI_UMBP_INFO("[StandaloneServer] data plane: concurrent reads (medium={})",
                      TierTypeName(ToTierType(BackendMedium(backend_config_))));
     } else {
@@ -580,7 +589,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Put(grpc::ServerContext*, const ::umbp::PutRequest* request,
                    ::umbp::BoolResponse* response) override {
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    DataPathLock lock(client_mu_, WriteLocking());
     uintptr_t ptr = 0;
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
                       request->size(), &ptr)) {
@@ -597,7 +606,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Get(grpc::ServerContext*, const ::umbp::GetRequest* request,
                    ::umbp::BoolResponse* response) override {
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    DataPathLock lock(client_mu_, ReadLocking());
     uintptr_t ptr = 0;
     if (!ResolveRange(request->client_id(), request->region_base(), request->shm_offset(),
                       request->size(), &ptr)) {
@@ -616,7 +625,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                         ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     std::vector<size_t> sizes = Sizes(*request);
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    DataPathLock lock(client_mu_, WriteLocking());
     std::vector<uintptr_t> ptrs;
     if (!ResolveBatch(*request, &ptrs)) {
       FillFalse(request->keys_size(), response);
@@ -646,7 +655,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                          request->sizes(static_cast<int>(i))});
     }
 
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    DataPathLock lock(client_mu_, WriteLocking());
     std::vector<uintptr_t> flat_ptrs;
     if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
         shutdown_.load()) {
@@ -702,7 +711,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                          request->sizes(i)});
     }
 
-    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    DataPathLock lock(client_mu_, WriteLocking());
     std::vector<uintptr_t> ptrs;
     if (!ResolveRanges(request->client_id(), queries, &ptrs, /*allow_zero=*/false)) {
       FillFalse(request->keys_size(), response);
@@ -720,7 +729,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                         ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
     std::vector<size_t> sizes = Sizes(*request);
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    DataPathLock lock(client_mu_, ReadLocking());
     std::vector<uintptr_t> ptrs;
     if (!ResolveBatch(*request, &ptrs)) {
       FillFalse(request->keys_size(), response);
@@ -785,7 +794,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                          request->sizes(static_cast<int>(i))});
     }
 
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    DataPathLock lock(client_mu_, ReadLocking());
     std::vector<uintptr_t> flat_ptrs;
     if (!ResolveRanges(request->client_id(), queries, &flat_ptrs, /*allow_zero=*/true) ||
         shutdown_.load()) {
@@ -815,7 +824,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   grpc::Status Exists(grpc::ServerContext*, const ::umbp::KeyRequest* request,
                       ::umbp::BoolResponse* response) override {
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    DataPathLock lock(client_mu_, LookupLocking());
     if (shutdown_.load()) {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
@@ -827,7 +836,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchExists(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                            ::umbp::BatchBoolResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    DataPathLock lock(client_mu_, LookupLocking());
     if (shutdown_.load()) {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
@@ -839,7 +848,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   grpc::Status BatchExistsConsecutive(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
                                       ::umbp::CountResponse* response) override {
     std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    ConditionalReadLock lock(client_mu_, shared_reads_);
+    DataPathLock lock(client_mu_, LookupLocking());
     if (shutdown_.load()) {
       response->set_count(0);
       return grpc::Status::OK;
@@ -981,7 +990,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (auto identity = GetExternalIdentity(request->client_id())) {
       matches = identity->MatchExternalKv(hashes, request->count_as_hit());
     } else {
-      ConditionalReadLock lock(client_mu_, shared_reads_);
+      DataPathLock lock(client_mu_, ReadLocking());
       if (!shutdown_.load()) matches = client_->MatchExternalKv(hashes, request->count_as_hit());
     }
     FillExternalKvMatches(matches, response);
@@ -997,7 +1006,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     if (auto identity = GetExternalIdentity(request->client_id())) {
       entries = identity->GetExternalKvHitCounts(hashes);
     } else {
-      ConditionalReadLock lock(client_mu_, shared_reads_);
+      DataPathLock lock(client_mu_, ReadLocking());
       if (!shutdown_.load()) entries = client_->GetExternalKvHitCounts(hashes);
     }
     FillExternalKvHitCounts(entries, response);
@@ -1041,6 +1050,18 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   bool BackendIsDistributed() const {
     return client_ && client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed;
+  }
+
+  DataPathLocking ReadLocking() const {
+    return shared_reads_ ? DataPathLocking::kShared : DataPathLocking::kExclusive;
+  }
+  DataPathLocking WriteLocking() const {
+    return concurrent_backend_ ? DataPathLocking::kShared : DataPathLocking::kExclusive;
+  }
+  // A lookup dereferences no registered memory, so it needs the lifetime
+  // barrier no more than the backend needs the serialization.
+  DataPathLocking LookupLocking() const {
+    return concurrent_backend_ ? DataPathLocking::kNone : ReadLocking();
   }
 
   std::string BackendPeerAddress() const {
@@ -1614,6 +1635,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   UMBPConfig backend_config_;
   std::unique_ptr<IUMBPClient> client_;
   const bool shared_reads_;
+  // A distributed backend on a non-SSD medium synchronizes concurrent puts,
+  // gets and lookups itself -- it is driven that way by an embedded client's
+  // threads -- so client_mu_ only has to be the lifetime barrier for it.
+  const bool concurrent_backend_;
   std::string address_;
   std::string fd_socket_path_;
   std::unique_ptr<grpc::Server> server_;
@@ -1622,6 +1647,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   // Data operations acquire client_mu_ before memory_mu_ and keep the client
   // lock through the backend call, making it the lifetime barrier for resolved
   // host/GPU mappings. Lifecycle paths never hold the two locks at once.
+  // Registration changes take it exclusively; how data operations take it is
+  // ReadLocking()/WriteLocking()/LookupLocking().
   std::shared_mutex client_mu_;
   mutable std::shared_mutex memory_mu_;
   std::mutex ipc_mu_;

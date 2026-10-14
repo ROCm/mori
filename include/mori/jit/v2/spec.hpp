@@ -85,10 +85,16 @@ class KernelSpec {
   }
 
   // Single by-value struct argument, the shape every EP kernel uses.
+  //
+  // Qualified Derived::, like Geometry and RenderSource above: a spec that shadows
+  // LaunchRaw to reject an argument on the host does so to keep that argument from
+  // reaching the device, and an unqualified call here binds to the base and hands it
+  // straight through. plan_api.hpp's C ABI already names SPEC::LaunchRaw, so this is
+  // the one entry that would have disagreed with it.
   template <typename ArgsT>
   static void Launch(const Plan& plan, const ArgsT& args, hipStream_t stream) {
     if (!plan.module) throw std::runtime_error("mori jit: Launch on an unprepared plan");
-    LaunchRaw(plan, &args, sizeof(ArgsT), stream);
+    Derived::LaunchRaw(plan, &args, sizeof(ArgsT), stream);
   }
 
   static void LaunchRaw(const Plan& plan, const void* argBuf, size_t argSize, hipStream_t stream) {

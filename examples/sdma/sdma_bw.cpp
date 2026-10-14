@@ -176,9 +176,20 @@ void runExperiment(int srcDeviceId, const ExperimentParams& params) {
 
   size_t totalNumQueues = params.numOfQueues * params.numDestinations;
 
+  // Resolve KFD node ids once: anvil queues are keyed on node ids, not HIP
+  // device ordinals, so both connect() and getSdmaQueue() below must use
+  // the SAME converted id (calling them separately with raw device ids would
+  // silently miss the queue lookup whenever a device ordinal != its node id).
+  int srcNode = anvil::anvil.nodeForHipDevice(srcDeviceId);
+  std::vector<int> dstNodes;
+  dstNodes.reserve(dstDeviceIds.size());
   for (auto& dstDeviceId : dstDeviceIds) {
+    dstNodes.push_back(anvil::anvil.nodeForHipDevice(dstDeviceId));
+  }
+
+  for (auto& dstNode : dstNodes) {
     // Better performance if allocating all 8 queues
-    anvil::anvil.connect(srcDeviceId, dstDeviceId, 8);  // params.numOfQueues);
+    anvil::anvil.connect(srcNode, dstNode, 8);  // params.numOfQueues);
   }
 
   anvil::SdmaQueueDeviceHandle** deviceHandles_d = nullptr;
@@ -186,10 +197,9 @@ void runExperiment(int srcDeviceId, const ExperimentParams& params) {
       hipMalloc(&deviceHandles_d, totalNumQueues * sizeof(anvil::SdmaQueueDeviceHandle*)));
 
   size_t queueIdx = 0;
-  for (auto& dstDeviceId : dstDeviceIds) {
+  for (auto& dstNode : dstNodes) {
     for (size_t q = 0; q < params.numOfQueues; q++) {
-      deviceHandles_d[queueIdx] =
-          anvil::anvil.getSdmaQueue(srcDeviceId, dstDeviceId, q)->deviceHandle();
+      deviceHandles_d[queueIdx] = anvil::anvil.getSdmaQueue(srcNode, dstNode, q)->deviceHandle();
       queueIdx++;
     }
   }

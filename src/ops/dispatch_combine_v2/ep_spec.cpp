@@ -144,22 +144,20 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
                               : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
   const char* body = is1250 ? gfx1250Body : portableBody;
-  // Scale staging is a macro rather than a Cfg read because the array is at file
-  // scope in the header, which the TU includes BEFORE kCfg exists. Emitted only
-  // when the feature is on, so a scaleBytes=0 TU is byte-identical to one built
-  // before this existed -- same text, same sha256, same cache entry.
+  // Scale staging is a macro rather than a Cfg read because the constants it feeds
+  // are at file scope in the header, which the TU reaches BEFORE kCfg exists (the
+  // #if there also picks kMetaFields). Emitted only when the feature is on, so a
+  // scaleBytes=0 TU is byte-identical to one built before this existed -- same
+  // text, same sha256, same cache entry.
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
-    // ROWS is the per-peer stride and SLOTS the total. They must be emitted as a
-    // pair: the staging is indexed peer*ROWS + destTokId, and sizing it from one
-    // while indexing with the other is an out-of-bounds write on peer > 0.
-    // BYTES is the caller's row, STRIDE what we lay it down at: staging reads one
-    // and writes the other.
+    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + destTokId, so
+    // it has to be the peer's full receive capacity and not the smaller per-peer
+    // share of the idx/wt pool. BYTES is the caller's row, STRIDE what we lay it
+    // down at: staging reads one and writes the other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
-                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) +
-                "\n#define MORI_EP_SCALE_SLOTS " +
-                std::to_string((long long)cfg.worldSize * EpMaxRecv(cfg)) + "\n";
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) + "\n";
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";

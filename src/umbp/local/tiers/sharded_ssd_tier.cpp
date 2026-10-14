@@ -37,12 +37,19 @@ namespace {
 // Gather each shard's sub-batch, run `op` on it in parallel across drives, and
 // scatter the per-key results back.  Shared by the put and get paths, which
 // differ only in the pointer type and the backend call.  Buckets touch disjoint
-// shards and disjoint result indices, so nothing here needs a lock.
+// shards and disjoint result indices, so nothing here needs a lock -- PROVIDED
+// the per-key slots are separate memory locations.  std::vector<bool> packs
+// them into shared words, and two drives finishing together would each
+// rewrite the word holding the other's results: a read or write that succeeded
+// came back false (seen as rare "PrepareReadBatch read failed" under parallel
+// SSD load).  So the workers fill a vector<char> and `results` is written once
+// they have all joined.
 template <typename PtrT, typename Op>
 void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::vector<int>& busy,
                    int io_threads, const std::vector<std::string>& keys,
                    const std::vector<PtrT>& ptrs, const std::vector<size_t>& sizes,
                    std::vector<bool>& results, std::vector<double>& shard_ms, Op&& op) {
+  std::vector<char> ok(results.size(), 0);
   ParallelFor(busy.size(), io_threads, [&](size_t bi) {
     const int s = busy[bi];
     const auto t_shard = ssdperf::Now();
@@ -60,10 +67,13 @@ void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::v
     }
     const auto shard_res = op(s, k, d, z);
     for (size_t j = 0; j < idxs.size(); ++j) {
-      results[idxs[j]] = j < shard_res.size() && shard_res[j];
+      ok[idxs[j]] = (j < shard_res.size() && shard_res[j]) ? 1 : 0;
     }
     shard_ms[s] = ssdperf::MsSince(t_shard);  // disjoint shards: no race on shard_ms
   });
+  for (int s : busy) {
+    for (size_t i : buckets[s]) results[i] = ok[i] != 0;
+  }
 }
 
 // Indices of the shards this batch actually touches.

@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/fd_limit.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 
@@ -262,6 +263,7 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
 }  // namespace
 
 int main(int argc, char** argv) {
+  mori::umbp::RaiseOpenFileLimit();
   mori::umbp::UMBPConfig config = mori::umbp::UMBPConfig::FromEnvironment();
   config.role = mori::umbp::UMBPRole::Standalone;
   config.follower_mode = false;
