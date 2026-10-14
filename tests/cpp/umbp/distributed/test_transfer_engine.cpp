@@ -169,6 +169,74 @@ TEST(LocalCopyEngine, RefusesAnEndpointItCannotAddress) {
   EXPECT_FALSE(engine.CanHandle(remote, remote));
 }
 
+TEST(LocalCopyEngine, BuilderMergesAdjacentRanges) {
+  LocalCopyEngine engine;
+  std::vector<char> src(64, 'x'), dst(64, 0);
+  auto s = TransferRef::HostBytes(src.data(), src.size());
+  auto d = TransferRef::HostBytes(dst.data(), dst.size());
+  auto builder = engine.CreatePlanBuilder();
+  builder->Add(MakeItem(s, 0, d, 0, 8, 1));
+  builder->Add(MakeItem(s, 8, d, 8, 8, 1));
+  builder->Add(MakeItem(s, 32, d, 40, 4, 2));
+  auto planned = builder->Finish();
+  EXPECT_TRUE(planned.rejected_tags.empty());
+  ASSERT_EQ(1u, planned.plans.size());
+  EXPECT_EQ(std::vector<size_t>({0, 32}), planned.plans[0].src_offsets);
+  EXPECT_EQ(std::vector<size_t>({0, 40}), planned.plans[0].dst_offsets);
+  EXPECT_EQ(std::vector<size_t>({16, 4}), planned.plans[0].sizes);
+  EXPECT_EQ(std::vector<size_t>({1, 2}), planned.plans[0].tags);
+}
+
+TEST(LocalCopyEngine, BuilderRejectsOutOfBoundsRanges) {
+  LocalCopyEngine engine;
+  std::vector<char> src(64, 'x'), dst(64, 0);
+  auto s = TransferRef::HostBytes(src.data(), src.size());
+  auto d = TransferRef::HostBytes(dst.data(), dst.size());
+  auto builder = engine.CreatePlanBuilder();
+  builder->Add(MakeItem(s, 64, d, 0, 1, 1));
+  builder->Add(MakeItem(s, 0, d, 64, 1, 2));
+  builder->Add(MakeItem(s, 0, d, 0, 0, 3));
+  auto planned = builder->Finish();
+  EXPECT_EQ(std::vector<size_t>({1, 2}), planned.rejected_tags);
+  EXPECT_TRUE(planned.plans.empty());
+}
+
+// Plan() is the builder over a vector, so the two must agree item for item.
+TEST(LocalCopyEngine, BuilderMatchesPlan) {
+  LocalCopyEngine engine;
+  std::vector<char> a(256, 'a'), b(256, 'b'), out1(256, 0), out2(256, 0);
+  auto ra = TransferRef::HostBytes(a.data(), a.size());
+  auto rb = TransferRef::HostBytes(b.data(), b.size());
+  auto r1 = TransferRef::HostBytes(out1.data(), out1.size());
+  auto r2 = TransferRef::HostBytes(out2.data(), out2.size());
+  const std::vector<TransferItem> items{
+      MakeItem(ra, 0, r1, 0, 64, 0),     MakeItem(rb, 0, r2, 0, 32, 1),
+      MakeItem(ra, 64, r1, 64, 64, 0),   MakeItem(rb, 32, r2, 64, 32, 1),
+      MakeItem(ra, 200, r1, 200, 64, 2), MakeItem(ra, 128, r1, 128, 16, 3),
+  };
+  auto builder = engine.CreatePlanBuilder();
+  for (const auto& item : items) builder->Add(item);
+  const auto built = builder->Finish();
+  const auto planned = engine.Plan(items);
+
+  EXPECT_EQ(planned.rejected_tags, built.rejected_tags);
+  EXPECT_EQ(std::vector<size_t>({2}), built.rejected_tags);
+  ASSERT_EQ(planned.plans.size(), built.plans.size());
+  for (size_t i = 0; i < planned.plans.size(); ++i) {
+    EXPECT_EQ(planned.plans[i].src.host_ptr, built.plans[i].src.host_ptr);
+    EXPECT_EQ(planned.plans[i].dst.host_ptr, built.plans[i].dst.host_ptr);
+    EXPECT_EQ(planned.plans[i].src_offsets, built.plans[i].src_offsets);
+    EXPECT_EQ(planned.plans[i].dst_offsets, built.plans[i].dst_offsets);
+    EXPECT_EQ(planned.plans[i].sizes, built.plans[i].sizes);
+    EXPECT_EQ(planned.plans[i].tags, built.plans[i].tags);
+  }
+  ASSERT_EQ(2u, built.plans.size());
+  EXPECT_EQ(std::vector<size_t>({144}), built.plans[0].sizes);  // 0, 64, then 128 all abut
+  EXPECT_EQ(std::vector<size_t>({0, 3}), built.plans[0].tags);
+  EXPECT_EQ(std::vector<size_t>({32, 32}), built.plans[1].sizes);  // dst gap: two segments
+  EXPECT_EQ(std::vector<size_t>({0, 64}), built.plans[1].dst_offsets);
+}
+
 // ---------------------------------------------------------------------------
 //  HbmCopyEngine
 // ---------------------------------------------------------------------------
