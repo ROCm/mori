@@ -1252,6 +1252,9 @@ bool PoolClient::Init() {
                                   : default_pool_->LogicalTierCapacities();
     // A self-evicting node asks the master to leave it out of its rounds.
     master_client_->RequestPeerDrivenEviction(self_evicting);
+    // Unless it evicts by its own LRU, its victims follow the master's
+    // recency, which must then hear about the reads served here.
+    master_client_->EnableLocalReadReports(config_.eviction_mode != PeerEvictionMode::kLocal);
     auto status =
         master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes, logical_caps);
     if (!status.ok()) {
@@ -1812,6 +1815,8 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   }
   // A caller without `resolutions` cannot release later: it only probes.
   if (resolutions == nullptr) default_pool_->ReleaseResolved(*batch, found);
+  const bool report = master_client_ != nullptr && master_client_->ReportsLocalReads();
+  std::vector<std::string> read_keys;
   for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
     if (!found[j].resolved.found) {
       if (deferred != nullptr &&
@@ -1823,10 +1828,12 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
     auto* backend = registry_.Get(found[j].backend_id);
     if (backend == nullptr) continue;
     (*holders)[candidates[j]] = backend;
+    if (report) read_keys.push_back((*batch)[j]);
     if (resolutions != nullptr) {
       (*resolutions)[candidates[j]] = std::move(found[j].resolved);
     }
   }
+  if (report) master_client_->NoteLocalReads(read_keys);
 }
 
 // ---------------------------------------------------------------------------

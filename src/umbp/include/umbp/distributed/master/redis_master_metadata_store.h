@@ -125,6 +125,8 @@ class RedisMasterMetadataStore : public IMasterMetadataStore {
       const std::vector<std::string>& keys, const std::unordered_set<std::string>& exclude_nodes,
       std::chrono::system_clock::time_point now,
       std::chrono::system_clock::duration lease_duration) override;
+  void RecordLocalReads(const std::vector<std::string>& keys,
+                        std::chrono::system_clock::time_point now) override;
   std::vector<bool> BatchExistsBlock(const std::vector<std::string>& keys) const override;
   std::map<NodeTierKey, std::vector<EvictionCandidate>> EnumerateEvictionCandidates(
       const std::vector<NodeTierKey>& buckets, EvictionOrder order, size_t max_per_bucket,

@@ -118,10 +118,10 @@ TEST_F(PeerDrivenEvictionTest, MasterRankedNodeEvictsTheMastersVictims) {
   ASSERT_NE(node, nullptr);
   ASSERT_TRUE(node->Master().PeerDrivenEviction());
 
-  // Half full, and known to the master, before crossing the watermark.
-  PutKeys(0, 8);
+  // Just under the watermark, and known to the master.
+  PutKeys(0, 14);
   std::vector<std::string> known;
-  for (int i = 0; i < 8; ++i) known.push_back(Key(i));
+  for (int i = 0; i < 14; ++i) known.push_back(Key(i));
   node->Master().FlushHeartbeat();
   ASSERT_TRUE(WaitFor(
       [&] {
@@ -131,13 +131,31 @@ TEST_F(PeerDrivenEvictionTest, MasterRankedNodeEvictsTheMastersVictims) {
       },
       std::chrono::seconds(5)));
 
-  PutKeys(8, 7);  // 15 of 16 pages
+  // Local reads, which the master sees only through the heartbeat, must move
+  // these keys behind every other in its ranking.
+  const std::vector<std::string> read = {Key(0), Key(1), Key(2)};
+  std::vector<char> buf(kPage);
+  for (const auto& key : read) ASSERT_TRUE(node->Get(key, buf.data(), buf.size())) << key;
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        node->Master().FlushHeartbeat();
+        auto ranked = node->Master().GetEvictionCandidates(TierType::DRAM, "", 14 * kPage, 0);
+        if (!ranked.has_value() || ranked->size() != 14) return false;
+        std::vector<std::string> last;
+        for (size_t i = 11; i < 14; ++i) last.push_back((*ranked)[i].key);
+        std::sort(last.begin(), last.end());
+        return last == read;
+      },
+      std::chrono::seconds(5)))
+      << "local reads did not reach the master's ranking";
+
+  PutKeys(14, 1);  // 15 of 16 pages
   ASSERT_TRUE(
       WaitFor([&] { return Dram()->OwnedKeyCount() <= kPages / 2; }, std::chrono::seconds(3)))
       << "the node did not evict for itself";
   EXPECT_EQ(Dram()->OwnedKeyCount(), kPages / 2);
   EXPECT_EQ(node->LocalEvictionStats().master_keys, 7u) << "victims did not come from the master";
-  for (int i = 8; i < 15; ++i) EXPECT_TRUE(Dram()->Contains(Key(i))) << i;
+  for (const auto& key : read) EXPECT_TRUE(Dram()->Contains(key)) << key;
 }
 
 TEST_F(PeerDrivenEvictionTest, EvictsLocallyUnlessTheModeIsMaster) {

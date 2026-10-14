@@ -135,6 +135,14 @@ class MasterClient {
                                                                   const std::string& logical_tier,
                                                                   uint64_t bytes,
                                                                   uint32_t max_keys);
+  // Keys read locally, shipped (deduped, best effort) on the next heartbeat:
+  // the master's recency otherwise sees only RouteGet.  For a node whose
+  // eviction follows that recency; a no-op until enabled and supported.
+  void EnableLocalReadReports(bool enabled) { local_read_reports_requested_ = enabled; }
+  bool ReportsLocalReads() const {
+    return local_read_reports_requested_ && supports_peer_driven_eviction_.load();
+  }
+  void NoteLocalReads(const std::vector<std::string>& keys);
 
   // --- Heartbeat (event-driven) ---
   // Bind every storage medium live on this peer.  The heartbeat drains each
@@ -260,6 +268,9 @@ class MasterClient {
   bool peer_driven_requested_ = false;
   // Rewritten on re-registration (heartbeat thread), read by eviction.
   std::atomic<bool> supports_peer_driven_eviction_{false};
+  std::atomic<bool> local_read_reports_requested_{false};
+  std::mutex local_reads_mutex_;
+  std::unordered_set<std::string> local_reads_;
   // Initial conservative registration payload, retained so an UNKNOWN response
   // can rebuild the full peer record after Master state loss.
   std::map<TierType, TierCapacity> registration_capacities_;
