@@ -35,6 +35,9 @@ which is what lets the binding test skip cleanly when the .so is absent.
 from __future__ import annotations
 
 import os
+import sys
+import warnings
+import weakref
 
 from mori.jit.v2 import plan_api
 
@@ -54,7 +57,113 @@ def _extra_dirs() -> list[str]:
 
 plan_api.load_library(_LIB_NAME, extra_dirs=_extra_dirs())
 
-EpDispatchPlan = make_plan("ep_dispatch")
+_EpDispatchJitPlan = make_plan("ep_dispatch")
+
+# Staging for unbound dispatch plans, per device and layout; held by its plans.
+_FALLBACK_STAGING = weakref.WeakValueDictionary()
+
+# A warning about a caller's plan points at the first frame outside these.
+_BINDING_DIRS = tuple(
+    os.path.join(os.path.dirname(f), "") for f in (plan_api.__file__, __file__)
+)
+
+
+class EpDispatchPlan(_EpDispatchJitPlan):
+    # gfx125x: staging_base defaults to a buffer shared per layout until bound (#703).
+    __doc__ = _EpDispatchJitPlan.__doc__
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._fallback_staging = None
+        info = self.info
+        # Only the gfx125x body stages; EpDispatchSpec::LaunchRaw tests the same.
+        if info["sharedBytes"]:
+            self.bind(staging_base=_FallbackStaging(self, info))
+
+    def close(self) -> None:
+        super().close()
+        self._fallback_staging = None
+
+
+class _FallbackStaging:
+    """The staging_base an EpDispatchPlan starts with; resolved at its first launch."""
+
+    __slots__ = ("_plan", "_info")
+
+    def __init__(self, plan, info):
+        self._plan = weakref.ref(plan)
+        self._info = info
+
+    def data_ptr(self) -> int:
+        buf = _fallback_staging(self._info)
+        plan = self._plan()
+        if plan is not None:
+            plan._fallback_staging = buf
+            # An int from here on: the launch struct caches it like a caller's.
+            plan.bind(staging_base=buf.data_ptr())
+        return buf.data_ptr()
+
+    def group_key(self):
+        # What a launch group compares, without allocating: the buffer's address
+        # once its layout has one, the layout until then.
+        key = _staging_key(self._info)
+        buf = _FALLBACK_STAGING.get(key)
+        return buf.data_ptr() if buf is not None else ("fallback", *key)
+
+
+def _staging_key(info: dict) -> tuple:
+    import torch
+
+    # The cap EpMaxRecv resolves, so maxRecv=0 and its resolved value share.
+    max_recv = info["maxRecv"]
+    recv = max_recv if max_recv > 0 else info["worldSize"] * info["maxTokPerRank"]
+    return (
+        torch.cuda.current_device(),
+        info["worldSize"],
+        recv,
+        info["scaleBytes"],
+        info["maxTokPerRank"],
+    )
+
+
+def _fallback_staging(info: dict):
+    import torch
+
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    key = _staging_key(info)
+    device = key[0]
+    buf = _FALLBACK_STAGING.get(key)
+    if buf is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "ep_dispatch: staging_base is not bound, and the buffer it falls back "
+                "to cannot be allocated inside a graph capture; bind one "
+                "(ep_staging_bytes) or launch once before capturing"
+            )
+        nbytes = ep_staging_bytes(*key[1:])
+        buf = _FALLBACK_STAGING[key] = torch.zeros(
+            nbytes, dtype=torch.uint8, device=device
+        )
+        warnings.warn(
+            f"ep_dispatch: staging_base is not bound; allocated {nbytes:,} bytes for "
+            "it. Allocate ep_staging_bytes() bytes once, keep them alive, and "
+            "bind(staging_base=buf.data_ptr()) on every dispatch plan "
+            "(ROCm/mori#703); this fallback will be removed.",
+            FutureWarning,
+            stacklevel=_caller_stacklevel(),
+        )
+    return buf
+
+
+def _caller_stacklevel() -> int:
+    # The caller's warnings.warn stacklevel for the first frame outside mori.
+    level, frame = 1, sys._getframe(1)
+    while frame is not None and frame.f_code.co_filename.startswith(_BINDING_DIRS):
+        level, frame = level + 1, frame.f_back
+    return level
+
+
 EpCombinePlan = make_plan("ep_combine")
 
 

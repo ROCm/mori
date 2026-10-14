@@ -358,16 +358,16 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   return IsGpu(src) || IsGpu(dst);
 }
 
-TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
-  pair_to_plan.reserve(items.size() * 2);
-
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst)) {
+namespace {
+class HbmPlanBuilder final : public TransferPlanBuilder {
+ public:
+  explicit HbmPlanBuilder(const HbmCopyEngine& engine)
+      : engine_(engine), host_registration_piece_(HostRegistrationChunkBytes()) {}
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    if (!engine_.CanHandle(item.src, item.dst)) {
       out.rejected_tags.push_back(item.tag);
-      continue;
+      return;
     }
     // Bounds are checked here, once, rather than per copy: a page index that
     // does not fit its buffer is a bug in the backend's slot bookkeeping, and
@@ -377,7 +377,7 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
     if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
         item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
       out.rejected_tags.push_back(item.tag);
-      continue;
+      return;
     }
 
     const PtrPairKey key{item.src.host_ptr, item.dst.host_ptr};
@@ -395,22 +395,66 @@ TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) cons
       pi = it->second;
     }
     TransferPlan& plan = out.plans[pi];
-    const size_t so = static_cast<size_t>(item.src_offset);
-    const size_t dof = static_cast<size_t>(item.dst_offset);
-    const size_t sz = static_cast<size_t>(item.size);
-    const bool can_coalesce = !plan.sizes.empty() &&
-                              AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
-                              AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof);
-    if (can_coalesce) {
-      plan.sizes.back() += sz;
-    } else {
-      plan.src_offsets.push_back(so);
-      plan.dst_offsets.push_back(dof);
-      plan.sizes.push_back(sz);
+    // D2D has no host side; otherwise exactly one side is host memory.
+    const bool host_is_src = !IsGpu(item.src);
+    const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
+    const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
+                                : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
+                                              : 0;
+    const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
+      return (host_base + (host_is_src ? src_offset : dst_offset)) / host_registration_piece_;
+    };
+    size_t so = static_cast<size_t>(item.src_offset);
+    size_t dof = static_cast<size_t>(item.dst_offset);
+    size_t remaining = static_cast<size_t>(item.size);
+    while (remaining > 0) {
+      size_t sz = remaining;
+      if (host_base != 0) {
+        const uintptr_t host = host_base + (host_is_src ? so : dof);
+        sz = std::min<size_t>(sz, host_registration_piece_ - host % host_registration_piece_);
+      }
+      const bool can_coalesce =
+          !plan.sizes.empty() &&
+          AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
+          AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof) &&
+          (host_base == 0 ||
+           host_piece(plan.src_offsets.back(), plan.dst_offsets.back()) == host_piece(so, dof));
+      if (can_coalesce) {
+        plan.sizes.back() += sz;
+      } else {
+        plan.src_offsets.push_back(so);
+        plan.dst_offsets.push_back(dof);
+        plan.sizes.push_back(sz);
+      }
+      so += sz;
+      dof += sz;
+      remaining -= sz;
     }
     if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
   }
-  return out;
+  TransferPlanSet Finish() override { return std::move(out); }
+
+ private:
+  const HbmCopyEngine& engine_;
+  const size_t host_registration_piece_;
+  TransferPlanSet out;
+  // Grows with distinct endpoint pairs, rather than reserving two hash
+  // buckets for every page fragment in the batch.
+  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
+};
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
+  return std::make_unique<HbmPlanBuilder>(*this);
+}
+
+TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) const {
+  auto builder = CreatePlanBuilder();
+  for (const auto& item : items) {
+    builder->Add(item);
+  }
+  return builder->Finish();
 }
 
 void HbmCopyEngine::AddHostGatherRegion(void* base, size_t bytes) {

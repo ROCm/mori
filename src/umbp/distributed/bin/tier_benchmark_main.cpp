@@ -46,6 +46,7 @@
 #include <utility>
 #include <vector>
 
+#include "umbp/common/fd_limit.h"
 #include "umbp/distributed/benchmark/pool_workload_client.h"
 #include "umbp/distributed/benchmark/workload_runner.h"
 #include "umbp/distributed/benchmark/workload_source.h"
@@ -693,6 +694,7 @@ int RunBenchmark(Options options) {
 }
 }  // namespace
 int main(int argc, char** argv) {
+  mori::umbp::RaiseOpenFileLimit();
   try {
     Options options = ParseOptions(argc, argv);
     LoadPolicy(&options);

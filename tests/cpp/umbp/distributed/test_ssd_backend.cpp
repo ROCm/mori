@@ -29,6 +29,7 @@
 // PUBLISHES is plain host memory, so no transfer-layer change was needed.
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -43,6 +44,7 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/common/fd_limit.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
@@ -201,6 +203,32 @@ TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {
 // ---------------------------------------------------------------------------
 //  Put / Get
 // ---------------------------------------------------------------------------
+
+// The tier also runs inside other programs (sglang, embedded), so it leaves the
+// process-wide fd limit alone; UMBP's executables raise it in main().
+TEST_F(SsdBackendTest, LeavesTheOpenFileLimitToTheExecutable) {
+  struct rlimit original{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  if (original.rlim_max == RLIM_INFINITY || original.rlim_max <= 1024) {
+    GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves nothing to test";
+  }
+  struct Restore {
+    rlimit rl;
+    ~Restore() { setrlimit(RLIMIT_NOFILE, &rl); }
+  } restore{original};
+  struct rlimit low = original;
+  low.rlim_cur = 1024;  // docker's default
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
+
+  Start();
+  struct rlimit now{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, 1024u);
+
+  RaiseOpenFileLimit();
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, original.rlim_max);
+}
 
 TEST_F(SsdBackendTest, PutThenGetReturnsTheSameBytes) {
   SsdBackend* backend = Start();

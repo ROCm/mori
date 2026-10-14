@@ -131,10 +131,15 @@ void LogHugepageFallbackOnce(size_t size, size_t hugepage_size, int err) {
   static std::once_flag once;
   std::call_once(once, [size, hugepage_size, err] {
     const std::string meminfo = ReadHugepageMeminfoSummary();
-    MORI_UMBP_WARN(
+    MORI_UMBP_ERROR(
         "HostMemAllocator: MAP_HUGETLB allocation failed for size={} "
-        "hugepage_size={} ({}: {}); falling back to anonymous pages. {}",
-        size, hugepage_size, err, std::strerror(err), meminfo);
+        "hugepage_size={} ({} pages; {}: {}); falling back to anonymous 4 KiB pages. "
+        "If this buffer is registered with a GPU, kernel compaction can migrate those "
+        "pages, and every migration stops this process's GPU queues until the driver "
+        "re-validates the registration. Reserve enough hugepages (vm.nr_hugepages) "
+        "before starting. {}",
+        size, hugepage_size, hugepage_size ? (size + hugepage_size - 1) / hugepage_size : 0, err,
+        std::strerror(err), meminfo);
   });
 }
 
@@ -207,18 +212,37 @@ class ScopedNumaAffinity {
 #endif
 };
 
+// Nodes that have CPUs to run a prefault worker on (memory-only nodes have an
+// empty cpulist).
+const std::vector<int>& NodesWithCpus() {
+  static const std::vector<int> nodes = [] {
+    std::vector<int> found;
+    for (int node = 0; node < 256; ++node) {
+      std::ifstream input("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+      std::string cpus;
+      if (input && std::getline(input, cpus) && !cpus.empty()) found.push_back(node);
+    }
+    return found;
+  }();
+  return nodes;
+}
+
 void PrefaultPages(void* ptr, size_t mapped_size, size_t stride, const HostBufferOptions& opts) {
   // Avoid creating threads for small pools. Chunk boundaries respect hugetlb
   // alignment as well as base pages, so MADV_POPULATE_WRITE can serve both.
   const size_t pages = mapped_size / stride;
-  const size_t workers = std::min<size_t>(std::clamp(opts.prefault_threads, 1, 16),
-                                          std::max<size_t>(1, mapped_size / (64ULL << 20)));
+  size_t workers = std::min<size_t>(std::clamp(opts.prefault_threads, 1, 16),
+                                    std::max<size_t>(1, mapped_size / (64ULL << 20)));
+  const auto& nodes = NodesWithCpus();
+  const bool spread = opts.numa_node < 0 && opts.spread_prefault_across_nodes && nodes.size() > 1;
+  // Whole rounds over the nodes, so first touch splits the mapping evenly.
+  if (spread && workers >= nodes.size()) workers -= workers % nodes.size();
   if (workers == 1) {
     PrefaultRange(ptr, mapped_size, stride);
     return;
   }
   ParallelFor(workers, workers, [&](size_t i) {
-    ScopedNumaAffinity affinity(opts.numa_node);
+    ScopedNumaAffinity affinity(spread ? nodes[i % nodes.size()] : opts.numa_node);
     const size_t begin = (pages / workers * i + std::min(i, pages % workers)) * stride;
     const size_t count = (pages / workers + (i < pages % workers)) * stride;
     PrefaultRange(static_cast<char*>(ptr) + begin, count, stride);

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
@@ -169,6 +170,61 @@ TEST(LocalCopyEngine, RefusesAnEndpointItCannotAddress) {
 }
 
 // ---------------------------------------------------------------------------
+//  HbmCopyEngine
+// ---------------------------------------------------------------------------
+
+TEST(HbmCopyEngine, BuilderMergesAdjacentRanges) {
+  HbmCopyEngine engine;
+  std::vector<char> src(64, 'x'), dst(64, 0);
+  auto host = TransferRef::HostBytes(src.data(), src.size());
+  // Planning uses descriptions only; these fake GPU endpoints are never submitted.
+  auto gpu = TransferRef::HostBytes(dst.data(), dst.size(), mori::io::MemoryLocationType::GPU, 0);
+  auto builder = engine.CreatePlanBuilder();
+  builder->Add(MakeItem(host, 0, gpu, 0, 8, 1));
+  builder->Add(MakeItem(host, 8, gpu, 8, 8, 1));
+  builder->Add(MakeItem(host, 32, gpu, 40, 4, 2));
+  auto planned = builder->Finish();
+  EXPECT_TRUE(planned.rejected_tags.empty());
+  ASSERT_EQ(1u, planned.plans.size());
+  EXPECT_EQ(std::vector<size_t>({0, 32}), planned.plans[0].src_offsets);
+  EXPECT_EQ(std::vector<size_t>({0, 40}), planned.plans[0].dst_offsets);
+  EXPECT_EQ(std::vector<size_t>({16, 4}), planned.plans[0].sizes);
+  EXPECT_EQ(std::vector<size_t>({1, 2}), planned.plans[0].tags);
+}
+
+TEST(HbmCopyEngine, BuilderCreatesPlanPerBufferPair) {
+  HbmCopyEngine engine;
+  std::vector<char> src(64, 'x'), dst(64, 0), other_dst(64, 0);
+  auto host = TransferRef::HostBytes(src.data(), src.size());
+  auto gpu = TransferRef::HostBytes(dst.data(), dst.size(), mori::io::MemoryLocationType::GPU, 0);
+  auto other_gpu = TransferRef::HostBytes(other_dst.data(), other_dst.size(),
+                                          mori::io::MemoryLocationType::GPU, 0);
+  auto builder = engine.CreatePlanBuilder();
+  builder->Add(MakeItem(host, 0, gpu, 0, 4, 1));
+  builder->Add(MakeItem(host, 16, other_gpu, 2, 4, 2));
+  auto planned = builder->Finish();
+
+  ASSERT_EQ(2u, planned.plans.size());
+  EXPECT_EQ(dst.data(), planned.plans[0].dst.host_ptr);
+  EXPECT_EQ(other_dst.data(), planned.plans[1].dst.host_ptr);
+}
+
+TEST(HbmCopyEngine, BuilderRejectsOutOfBoundsRanges) {
+  HbmCopyEngine engine;
+  std::vector<char> src(64, 'x'), dst(64, 0);
+  auto host = TransferRef::HostBytes(src.data(), src.size());
+  auto gpu = TransferRef::HostBytes(dst.data(), dst.size(), mori::io::MemoryLocationType::GPU, 0);
+  auto builder = engine.CreatePlanBuilder();
+  builder->Add(MakeItem(host, 64, gpu, 0, 1, 1));
+  builder->Add(MakeItem(host, 0, gpu, 64, 1, 2));
+  builder->Add(MakeItem(host, 0, gpu, 0, 0, 3));
+  auto planned = builder->Finish();
+
+  EXPECT_EQ(std::vector<size_t>({1, 2}), planned.rejected_tags);
+  EXPECT_TRUE(planned.plans.empty());
+}
+
+// ---------------------------------------------------------------------------
 //  CompositeTransferEngine
 // ---------------------------------------------------------------------------
 
@@ -277,6 +333,39 @@ TEST(CompositeTransferEngine, SelectsPerPairAndPlansOncePerEngine) {
   // Every plan is tagged with the engine that produced it.
   ASSERT_FALSE(planned.plans.empty());
   for (const auto& plan : planned.plans) EXPECT_NE(nullptr, plan.engine);
+}
+TEST(CompositeTransferEngine, BuilderGroupsHbmAndBatchesOtherEngines) {
+  CompositeTransferEngine composite;
+  auto hbm = std::make_unique<HbmCopyEngine>();
+  auto* hbm_ptr = hbm.get();
+  composite.AddEngine(std::move(hbm));
+  composite.AddEngine(std::make_unique<LocalCopyEngine>());
+  auto spy_owned = std::make_unique<SpyEngine>(/*claims_remote=*/true);
+  auto* spy = spy_owned.get();
+  composite.AddEngine(std::move(spy_owned));
+  std::vector<char> src(64, 'x'), dst(64, 0), gpu_bytes(64, 0);
+  auto host = TransferRef::HostBytes(src.data(), src.size());
+  auto cpu = TransferRef::HostBytes(dst.data(), dst.size());
+  auto gpu = TransferRef::HostBytes(gpu_bytes.data(), gpu_bytes.size(),
+                                    mori::io::MemoryLocationType::GPU, 0);
+  auto remote = RemoteRef("peer", 3, 64);
+  auto builder = composite.CreatePlanBuilder();
+  builder->Add(MakeItem(host, 0, gpu, 0, 4, 10));
+  builder->Add(MakeItem(host, 0, cpu, 0, 4, 20));
+  builder->Add(MakeItem(host, 8, remote, 0, 4, 30));
+  builder->Add(MakeItem(host, 4, gpu, 4, 4, 11));
+  builder->Add(MakeItem(host, 12, remote, 4, 4, 31));
+  builder->Add(MakeItem(host, 64, gpu, 0, 1, 40));
+  auto planned = builder->Finish();
+  EXPECT_EQ(std::vector<size_t>({40}), planned.rejected_tags);
+  EXPECT_EQ(std::vector<size_t>({2}), spy->planned_batches);
+  ASSERT_EQ(3u, planned.plans.size());
+  EXPECT_EQ(hbm_ptr, planned.plans[0].engine);
+  EXPECT_EQ(std::vector<size_t>({8}), planned.plans[0].sizes);
+  EXPECT_EQ(std::vector<size_t>({10, 11}), planned.plans[0].tags);
+  for (const auto& plan : planned.plans) EXPECT_NE(nullptr, plan.engine);
+  EXPECT_EQ(0u, spy->submitted);
+  EXPECT_EQ(std::vector<char>(64, 0), dst);
 }
 
 TEST(CompositeTransferEngine, RejectsAPairNoEngineClaims) {

@@ -26,6 +26,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -213,7 +215,20 @@ bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
 
   int flags = (IsReadOnlyShared() ? O_RDONLY : (O_RDWR | O_CREAT)) | SegmentOpenFlags();
   seg.fd = open(seg.path.c_str(), flags, 0644);
-  if (seg.fd < 0) return false;
+  if (seg.fd < 0) {
+    // Every write that needed this segment now fails, and the caller sees only
+    // "write failed" -- so name the cause.  EMFILE here means the process ran
+    // out of descriptors (each segment holds one for the tier's lifetime).
+    const int err = errno;
+    static std::atomic<uint64_t> failures{0};
+    const uint64_t n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || n % 1000 == 0) {
+      MORI_UMBP_ERROR("[SSDTier] {}: cannot open segment {} ({}): {} [{} so far]", dir_, segment_id,
+                      seg.path, std::strerror(err), n);
+    }
+    RememberStatus(IoStatus::IoError("segment open failed", err));
+    return false;
+  }
 
   struct stat st;
   if (fstat(seg.fd, &st) != 0) {

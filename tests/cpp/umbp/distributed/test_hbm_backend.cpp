@@ -174,6 +174,48 @@ TEST(HbmCopyEngine, CoalescesAdjacentSegments) {
   EXPECT_EQ(set.plans[0].tags.size(), 3u);
 }
 
+// A host range spanning two registration pieces is rejected by hipMemcpy and
+// has no single device alias for the gather kernel, so the planner cuts at
+// piece boundaries and never coalesces across one. Addresses are fake: the
+// planner does not dereference.
+TEST(HbmCopyEngine, NeverPlansASegmentAcrossAHostRegistrationPiece) {
+  const size_t piece = HostRegistrationChunkBytes();
+  auto* host = reinterpret_cast<void*>(piece * 4 - 1024);  // a boundary at offset 1024
+  auto* dev = reinterpret_cast<void*>(piece * 9 - 1024);
+  HbmCopyEngine engine;
+  const TransferRef h = HostRef(host, 4096);
+  const TransferRef g = GpuRef(dev, 4096);
+
+  // One item across the boundary becomes two segments, in both directions.
+  for (const bool to_device : {true, false}) {
+    const auto set = to_device ? engine.Plan({MakeItem(h, 512, g, 512, 1024, 0)})
+                               : engine.Plan({MakeItem(g, 512, h, 512, 1024, 0)});
+    ASSERT_EQ(set.plans.size(), 1u);
+    const auto& plan = set.plans[0];
+    ASSERT_EQ(plan.sizes.size(), 2u);
+    EXPECT_EQ(plan.src_offsets[0], 512u);
+    EXPECT_EQ(plan.sizes[0], 512u);
+    EXPECT_EQ(plan.src_offsets[1], 1024u);
+    EXPECT_EQ(plan.dst_offsets[1], 1024u);
+    EXPECT_EQ(plan.sizes[1], 512u);
+    EXPECT_EQ(plan.tags.size(), 1u);
+  }
+
+  // Adjacent items still coalesce, but only on each side of the boundary.
+  const auto set = engine.Plan({MakeItem(h, 0, g, 0, 1024, 0), MakeItem(h, 1024, g, 1024, 1024, 1),
+                                MakeItem(h, 2048, g, 2048, 1024, 2)});
+  ASSERT_EQ(set.plans.size(), 1u);
+  ASSERT_EQ(set.plans[0].sizes.size(), 2u);
+  EXPECT_EQ(set.plans[0].sizes[0], 1024u);
+  EXPECT_EQ(set.plans[0].src_offsets[1], 1024u);
+  EXPECT_EQ(set.plans[0].sizes[1], 2048u);
+
+  // Device-to-device has no host side and is not cut.
+  const auto d2d = engine.Plan({MakeItem(GpuRef(host, 4096), 512, g, 512, 1024, 0)});
+  ASSERT_EQ(d2d.plans.size(), 1u);
+  EXPECT_EQ(d2d.plans[0].sizes.size(), 1u);
+}
+
 TEST(HbmCopyEngine, RejectsOutOfBoundsRatherThanCorruptingThePool) {
   int host = 0, dev = 0;
   HbmCopyEngine engine;
