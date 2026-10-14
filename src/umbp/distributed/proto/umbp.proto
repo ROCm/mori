@@ -147,6 +147,10 @@ message HeartbeatRequest {
   repeated TierKvCount  tier_kv_counts  = 7; // live owned-key count per tier (client-reported)
   repeated LogicalTierCapacity logical_tier_capacities = 8;
   bool peer_driven_eviction = 9;  // as in RegisterClientRequest
+  // Keys this node read locally since its last heartbeat (best effort, deduped).
+  // Sent only by a node whose eviction follows the master's recency, which
+  // local reads would otherwise never reach.
+  repeated string local_reads = 10;
 }
 
 // A peer over its watermark asks for its own keys on one medium, coldest first

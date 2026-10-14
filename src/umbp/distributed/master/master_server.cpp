@@ -408,6 +408,12 @@ class MasterServer::UMBPMasterServiceImpl final : public ::umbp::UMBPMaster::Ser
         }
       }
 
+      // After the bundles, so a key added by this heartbeat is already there.
+      if (client_status != ClientStatus::UNKNOWN && request->local_reads_size() > 0) {
+        store_.RecordLocalReads({request->local_reads().begin(), request->local_reads().end()},
+                                now);
+      }
+
       response->set_status(static_cast<::umbp::ClientStatus>(client_status));
       response->set_acked_seq(acked_seq);
       response->set_request_full_sync(request_full_sync);

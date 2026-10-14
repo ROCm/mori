@@ -799,6 +799,23 @@ std::vector<std::vector<Location>> RedisMasterMetadataStore::BatchLookupBlockFor
   return out;
 }
 
+void RedisMasterMetadataStore::RecordLocalReads(const std::vector<std::string>& keys,
+                                                std::chrono::system_clock::time_point now) {
+  if (keys.empty()) return;
+  ScopedStoreOp _op(metrics_, "RecordLocalReads");
+  const redis::ShardedBatch batch = redis::GroupKeysByShard(keys_, keys);
+  try {
+    redis::RunShardedRead(
+        batch, redis::kRecordLocalReadsLua, {std::to_string(ToEpochMs(now))}, "RecordLocalReads",
+        fanout_pool_.get(), /*tolerate_shard_failures=*/mode_ != Mode::kSingle, metrics_,
+        [&](size_t group) { return &client_for_shard(batch.shard_of_group[group]); },
+        [](size_t, const RespValue&) {});
+  } catch (const std::exception& e) {
+    // Recency is a hint; losing it must not fail the heartbeat carrying it.
+    MORI_UMBP_WARN("[RedisStore] RecordLocalReads failed: {}", e.what());
+  }
+}
+
 std::vector<bool> RedisMasterMetadataStore::BatchExistsBlock(
     const std::vector<std::string>& keys) const {
   std::vector<bool> results(keys.size(), false);
