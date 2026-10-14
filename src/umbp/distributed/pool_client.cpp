@@ -1336,6 +1336,9 @@ bool PoolClient::Clear() {
   if (master_client_) {
     ok = master_client_->ClearFullSync();
     if (!ok) MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
+  } else {
+    // No master holds stale placements, so local clear needs no remote ack.
+    for (auto* backend : registry_.All()) backend->ClearFullSyncAcked();
   }
   return ok;
 }
