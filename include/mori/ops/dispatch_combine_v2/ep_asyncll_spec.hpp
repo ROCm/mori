@@ -113,8 +113,7 @@ MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendCopySpec, "ep_asyncll_combine_s
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferSpec, "ep_asyncll_combine_sendtransfer");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvTransferSpec, "ep_asyncll_combine_recvtransfer");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvCopySpec, "ep_asyncll_combine_recvcopy");
-MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendCopyLsaSpec,
-                             "ep_asyncll_dispatch_sendcopy_lsa");
+MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendCopyLsaSpec, "ep_asyncll_dispatch_sendcopy_lsa");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendTransferLsaSpec,
                              "ep_asyncll_dispatch_sendtransfer_lsa");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchRecvTransferLsaSpec,

@@ -852,7 +852,8 @@ __device__ void EpCombineAsyncLLRecvTransferLsa_body(EpDispatchCombineArgs args)
 
   if (blockId == 0 && warpId == 0 && laneId < npes) {
     uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
-    while (__hip_atomic_load(barrier + laneId, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != flag) {
+    while (__hip_atomic_load(barrier + laneId, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) !=
+           flag) {
     }
   }
 }
