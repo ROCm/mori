@@ -637,7 +637,7 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 //
 // INTERMITTENT HANG observed on gfx125x UNDER CUDA GRAPH CAPTURE before the
 // count-reset ordering fix below. The numbers above are MI355X (gfx950, wave64).
-// On an MI455X at EP4, hidden 7168, 64 tokens:
+// On gfx1250 at EP4, hidden 7168, 64 tokens:
 //
 //   lsa  + eager          passes every run, output verifies
 //   lsa  + graph capture  hung 6 runs out of 8
@@ -655,7 +655,7 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // the epoch announcement, so it does not have this window. LSA now clears each
 // peer's count before its release epoch store, paired with an acquire wait.
 //
-// Fixing it removes the hang. Eight interleaved pairs on an idle MI455X at the
+// Fixing it removes the hang. Eight interleaved pairs on an idle gfx1250 at the
 // shape above, base and fixed alternating, no contaminated samples:
 //
 //   baseline  1 pass / 7 hang

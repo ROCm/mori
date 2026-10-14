@@ -229,7 +229,7 @@ cross-rail QPs that never fill. That is the cost of the per-PE addressing, not
 something a knob reaches. See `_make_dev_comm` in `hip_backend.py` for why
 AsyncLL has to ask for `GDA_CONNECTION_CROSSNODE` where the others take RAIL.
 
-### Single-node, EP4 (MI455X gfx1250, wave32)
+### Single-node, EP4 (gfx1250, wave32)
 
 hidden 7168, top-k 8, bf16, CUDA graph, 50 iters. `pair_us` = dispatch +
 combine, median of three interleaved rounds, no excluded samples.
@@ -278,7 +278,7 @@ leaving dispatch waiting on a count that would never come again. SDMA clears in
 affected. LSA now clears each peer's count before publishing its epoch, with
 system release/acquire ordering.
 
-Eight interleaved pairs at EP4, hidden 7168, 64 tokens, on an idle MI455X, no
+Eight interleaved pairs at EP4, hidden 7168, 64 tokens, on an idle gfx1250, no
 contaminated samples:
 
 | | pass / hang |
