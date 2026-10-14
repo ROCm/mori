@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <future>
 #include <list>
 #include <map>
 #include <memory>
@@ -317,7 +318,13 @@ class PeerPool {
   std::atomic<uint64_t> local_evict_stalled_{0};
   std::atomic<uint64_t> local_evict_master_keys_{0};
   EvictionCandidateSource candidate_source_;  // guarded by local_evict_mutex_
-  std::map<uint32_t, std::chrono::steady_clock::time_point> last_ranked_query_;  // pass thread
+  // At most one source query in flight per backend; pass thread only.  Last
+  // member, so a pending query is joined before anything else goes away.
+  struct RankedQuery {
+    std::chrono::steady_clock::time_point started{};
+    std::future<std::optional<std::vector<EvictionOffer>>> answer;
+  };
+  std::map<uint32_t, RankedQuery> ranked_queries_;
 };
 
 }  // namespace mori::umbp

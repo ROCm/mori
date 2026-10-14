@@ -1287,6 +1287,20 @@ TEST(PeerPoolLocalEviction, RankedCandidatesGoFirstAndTheMediumCoversTheRest) {
   for (const char* gone : {"k8", "k7", "k0", "k1"}) EXPECT_FALSE(dram->Contains(gone)) << gone;
   for (int i = 2; i <= 6; ++i) EXPECT_TRUE(dram->Contains("k" + std::to_string(i))) << i;
   EXPECT_EQ(pool.LocalEvictionStats().master_keys, 2u);
+
+  // A source slower than a pass waits for (a master with a large index): the
+  // medium's order covers the overage meanwhile.
+  std::atomic<bool> answered{false};
+  pool.SetEvictionCandidateSource([&](TierType, const std::string&, uint64_t) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    answered = true;
+    return std::optional<std::vector<EvictionOffer>>({{"k2", 64}});
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));  // past the query interval
+  for (int i = 9; i < 13; ++i) CommitKey(&pool, "k" + std::to_string(i));
+  ASSERT_TRUE(WaitUntil([&] { return dram->OwnedKeyCount() <= 5; }));
+  EXPECT_FALSE(answered.load()) << "the pass waited on the source";
+  EXPECT_EQ(pool.LocalEvictionStats().master_keys, 2u);
 }
 
 TEST(PeerPoolLocalEviction, KeysUnderAReadLeaseAreNeverOffered) {
