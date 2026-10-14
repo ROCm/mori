@@ -23,9 +23,10 @@
 // ===========================================================================
 // collective_permute_kernels.hpp
 //
-// SDMA-based "push" collective-permute for a single destination. PE myPe copies
-// sendBuf into peer dstPe's recvBuf (self-copy when dstPe == myPe) and waits for
-// srcPe's copy to land in our recvBuf (srcPe < 0 means no incoming).
+// SDMA-based "push" collective-permute for at most one destination. PE myPe copies
+// sendBuf into peer dstPe's recvBuf (self-copy when dstPe == myPe; dstPe < 0 means
+// no outgoing) and waits for srcPe's copy to land in our recvBuf (srcPe < 0 means
+// no incoming).
 //
 // Compute-free: one block, logS=0, reusing StartSdmaScatter from
 // collectives_common.hpp. sendBuf and recvBuf must be symmetric-heap pointers
@@ -43,7 +44,7 @@ namespace collective {
 // Single-block, compute-free collective-permute (one destination).
 //   sendBuf  : raw symmetric-heap pointer, numBytes to send
 //   recvBuf  : raw symmetric-heap pointer, numBytes receive slot
-//   dstPe    : peer that receives our sendBuf (may be myPe)
+//   dstPe    : peer that receives our sendBuf (may be myPe), or -1 if nobody does
 //   srcPe    : peer that sends into our recvBuf, or -1 if nobody does
 //
 //   ready    : symmetric-heap uint64[>= npes] ready tokens, zeroed once. Slot p of
@@ -59,7 +60,9 @@ namespace collective {
 // acquire fence makes the peer SDMA write visible. Finally thread 0 resets the
 // counter for the next launch.
 //
-// Launch <<<1, 256>>> with npes <= 8 (SDMA fast path).
+// With dstPe == -1 no peer is active, so Phase 1 issues no packets.
+//
+// Launch <<<1, 64>>> with npes <= 8 (SDMA fast path).
 __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             const void* __restrict__ sendBuf,
                                             void* __restrict__ recvBuf, size_t numBytes,
@@ -81,7 +84,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
           reinterpret_cast<uint8_t*>(&ready[myLsaRank]) + (static_cast<uint64_t>(diff) << 32)));
       __hip_atomic_store(tok, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
-    if (dstPe != myLsaRank) {
+    if (dstPe >= 0 && dstPe != myLsaRank) {
       auto* mine = cco::impl::global(&ready[dstPe]);
       while (__hip_atomic_load(mine, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == 0) {
         __builtin_amdgcn_s_sleep(1);
