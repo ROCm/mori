@@ -105,11 +105,13 @@ class CollectivesFacade {
 
   static constexpr size_t kDefAlign = 256;
   // Auto tuning: pull wins below kAutoPullMaxBytes of total input, except
-  // 4-PE all-reduce where the crossover is kAutoPullMaxBytesAr4 (pull is only
+  // 8-PE reduce-scatter (kAutoPullMaxBytesRs) and 4-PE all-reduce
+  // (kAutoPullMaxBytesAr4), which cross over earlier (pull is only
   // instantiated for npes 4 and 8); push reduce-scatter keeps each slice
   // >= kAutoMinSliceBytes with at most 1<<kAutoMaxLogS slices; push all-reduce
   // always uses 1<<kAutoAllReduceLogS slices.
   static constexpr size_t kAutoPullMaxBytes = 32ull << 20;
+  static constexpr size_t kAutoPullMaxBytesRs = 24ull << 20;
   static constexpr size_t kAutoPullMaxBytesAr4 = 16ull << 20;
   static constexpr size_t kAutoMinSliceBytes = 8ull << 20;
   static constexpr int kAutoMaxLogS = 2;
@@ -203,10 +205,10 @@ class CollectivesFacade {
       facade.mode_ = RsMode::kPush;
       facade.logS_ = __builtin_ctz(static_cast<unsigned>(forcePushSlices));  // log2(S)
     } else if (forcePull) {
-      if (facade.nPes_ == 4 || facade.nPes_ == 8) {
+      if (facade.nPes_ == 2 || facade.nPes_ == 4 || facade.nPes_ == 8) {
         facade.mode_ = RsMode::kPull;
       } else {
-        FACADE_PRINTF("CollectivesFacade: MORI_CCL_FORCE_PULL needs npes 4 or 8; using auto");
+        FACADE_PRINTF("CollectivesFacade: MORI_CCL_FORCE_PULL needs npes 2, 4 or 8; using auto");
       }
     }
     // Optional hard cap on the launch grid of the reduce-scatter/all-reduce
@@ -467,9 +469,10 @@ class CollectivesFacade {
 
   RsMode resolveMode(size_t totalBytes, bool allReduce) const {
     if (mode_ != RsMode::kAuto) return mode_;
-    if (nPes_ != 4 && nPes_ != 8) return RsMode::kPush;
-    const size_t pullMax =
-        (allReduce && nPes_ == 4) ? kAutoPullMaxBytesAr4 : kAutoPullMaxBytes;
+    if (nPes_ != 2 && nPes_ != 4 && nPes_ != 8) return RsMode::kPush;
+    size_t pullMax = kAutoPullMaxBytes;
+    if (allReduce && nPes_ == 4) pullMax = kAutoPullMaxBytesAr4;
+    if (!allReduce && nPes_ == 8) pullMax = kAutoPullMaxBytesRs;
     return totalBytes < pullMax ? RsMode::kPull : RsMode::kPush;
   }
   int resolveLogS(size_t chunkBytes, bool allReduce) const {
@@ -539,10 +542,11 @@ hipError_t DispatchNpes(int npes, F&& f) {
   case n:                   \
     return std::forward<F>(f)(std::integral_constant<int, n>{});
   switch (npes) {
+    FACADE_NPES_CASE(2)
     FACADE_NPES_CASE(4)
     FACADE_NPES_CASE(8)
     default:
-      FACADE_PRINTF("CollectivesFacade: pull mode supports npes 4 or 8, got %d", npes);
+      FACADE_PRINTF("CollectivesFacade: pull mode supports npes 2, 4 or 8, got %d", npes);
       return hipErrorInvalidConfiguration;
   }
 #undef FACADE_NPES_CASE
@@ -745,15 +749,19 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
                                                    size_t numBytes, int srcPe,
                                                    const std::vector<int>& dstPes,
                                                    hipStream_t stream) {
-  if (dstPes.size() != 1) {
-    FACADE_PRINTF("CollectivePermute: only dstPes.size()==1 is implemented");
+  if (dstPes.size() > 1) {
+    FACADE_PRINTF("CollectivePermute: unsupported dstPes.size()=%zu", dstPes.size());
     return hipErrorNotSupported;
   }
-  const int dstPe = dstPes[0];
-  if (dstPe < 0 || dstPe >= nPes_ || srcPe < -1 || srcPe >= nPes_) {
+  // Empty dstPes: receive-only rank (nobody receives from us).
+  const int dstPe = dstPes.empty() ? -1 : dstPes[0];
+  if (dstPe < -1 || dstPe >= nPes_ || srcPe < -1 || srcPe >= nPes_) {
     FACADE_PRINTF("CollectivePermute: dstPe=%d srcPe=%d out of range (nPes=%d)", dstPe, srcPe,
                   nPes_);
     return hipErrorInvalidValue;
+  }
+  if (dstPe < 0 && srcPe < 0) {
+    return hipSuccess;
   }
   constexpr int kThreads = 64;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(nPes_, dstPe, srcPe, sendBuf, recvBuf,
