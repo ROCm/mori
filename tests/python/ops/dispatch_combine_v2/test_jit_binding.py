@@ -386,16 +386,18 @@ def test_unbound_plans_of_one_layout_share_one_buffer(launched, stages):
 
     a = _plan()
     b = _plan(block_num=2 * a.info["blockNum"])
+    resolved = _plan(max_recv=0)  # EpMaxRecv answers a's 1 * 64
     other = _plan(max_tok_per_rank=128, max_recv=128)
     with warnings.catch_warnings(record=True) as warned:
         warnings.simplefilter("always")
-        for p in (a, b, other):
+        for p in (a, b, resolved, other):
             p.launch()
     # Another geometry, same layout: one buffer, as an op's plans share the op's.
-    assert a._buf.stagingBase == b._buf.stagingBase != other._buf.stagingBase
+    assert a._buf.stagingBase == b._buf.stagingBase == resolved._buf.stagingBase
+    assert a._buf.stagingBase != other._buf.stagingBase
     # One warning per buffer allocated, not per plan.
     assert [w.category for w in warned] == [FutureWarning, FutureWarning]
-    for p in (a, b, other):
+    for p in (a, b, resolved, other):
         p.close()
 
 
@@ -426,10 +428,16 @@ def test_staging_passed_per_launch_is_left_alone(launched, stages):
 
 def test_a_launch_argument_wins_over_a_bound_default_every_launch(launched, no_staging):
     p = _plan()
-    p.bind(weights_buf=torch.zeros(64, device="cuda"))  # a non-int default
+    weights = torch.zeros(64, device="cuda")
+    p.bind(weights_buf=weights)  # a non-int default
     for _ in range(2):  # the second launch takes the cached struct
         p.launch(weights_buf=1 << 20)
         assert p._buf.weightsBuf == 1 << 20
+    # Omitting it again is a new argument set: the struct is rebuilt from defaults.
+    p.launch()
+    assert p._buf.weightsBuf == weights.data_ptr()
+    p.launch(weights_buf=1 << 20)
+    assert p._buf.weightsBuf == 1 << 20
     p.close()
 
 
@@ -473,6 +481,13 @@ def test_a_capture_reuses_the_buffer_of_its_layout(launched, stages, monkeypatch
     b.close()
 
 
+def test_closing_an_unlaunched_plan_allocates_nothing(launched, stages):
+    p = _plan()
+    p.close()
+    assert p._fallback_staging is None
+    assert not cb._FALLBACK_STAGING
+
+
 def test_closing_the_plans_gives_their_buffer_back(launched, stages):
     import warnings
 
@@ -493,13 +508,22 @@ def test_a_group_compares_defaults_by_the_address_launch_writes(launched, stages
 
     a = _plan()
     b = _plan(block_num=2 * a.info["blockNum"])
+    other = _plan(max_tok_per_rank=128, max_recv=128)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        # Neither launched: they compare by layout, and nothing is allocated.
+        cb.plan_api.make_launch_group([a, b])
+        assert not cb._FALLBACK_STAGING
+        with pytest.raises(ValueError, match="stagingBase"):
+            cb.plan_api.make_launch_group([a, other])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         a.launch()  # a's default is an address now, b's not yet resolved
-        cb.plan_api.make_launch_group([a, b])
+    cb.plan_api.make_launch_group([a, b])
+    assert isinstance(b._defaults["stagingBase"], cb._FallbackStaging)
     weights = torch.zeros(64, device="cuda")
     a.bind(weights_buf=weights)
     b.bind(weights_buf=weights.data_ptr())  # a tensor and its address agree
     cb.plan_api.make_launch_group([a, b])
-    a.close()
-    b.close()
+    for p in (a, b, other):
+        p.close()

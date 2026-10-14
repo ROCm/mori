@@ -63,7 +63,9 @@ _EpDispatchJitPlan = make_plan("ep_dispatch")
 _FALLBACK_STAGING = weakref.WeakValueDictionary()
 
 # A warning about a caller's plan points at the first frame outside these.
-_BINDING_DIRS = (os.path.dirname(plan_api.__file__), os.path.dirname(__file__))
+_BINDING_DIRS = tuple(
+    os.path.join(os.path.dirname(f), "") for f in (plan_api.__file__, __file__)
+)
 
 
 class EpDispatchPlan(_EpDispatchJitPlan):
@@ -72,6 +74,7 @@ class EpDispatchPlan(_EpDispatchJitPlan):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._fallback_staging = None
         info = self.info
         # Only the gfx125x body stages; EpDispatchSpec::LaunchRaw tests the same.
         if info["sharedBytes"]:
@@ -100,20 +103,36 @@ class _FallbackStaging:
             plan.bind(staging_base=buf.data_ptr())
         return buf.data_ptr()
 
+    def group_key(self):
+        # What a launch group compares, without allocating: the buffer's address
+        # once its layout has one, the layout until then.
+        key = _staging_key(self._info)
+        buf = _FALLBACK_STAGING.get(key)
+        return buf.data_ptr() if buf is not None else ("fallback", *key)
+
+
+def _staging_key(info: dict) -> tuple:
+    import torch
+
+    # The cap EpMaxRecv resolves, so maxRecv=0 and its resolved value share.
+    max_recv = info["maxRecv"]
+    recv = max_recv if max_recv > 0 else info["worldSize"] * info["maxTokPerRank"]
+    return (
+        torch.cuda.current_device(),
+        info["worldSize"],
+        recv,
+        info["scaleBytes"],
+        info["maxTokPerRank"],
+    )
+
 
 def _fallback_staging(info: dict):
     import torch
 
     from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
-    device = torch.cuda.current_device()
-    key = (
-        device,
-        info["worldSize"],
-        info["maxRecv"],
-        info["scaleBytes"],
-        info["maxTokPerRank"],
-    )
+    key = _staging_key(info)
+    device = key[0]
     buf = _FALLBACK_STAGING.get(key)
     if buf is None:
         if torch.cuda.is_current_stream_capturing():

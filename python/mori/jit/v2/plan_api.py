@@ -748,10 +748,15 @@ def _bound_defaults(plan) -> dict:
 
     Compared the way launch would write each one: an int and a pointer-like value
     by the bits it writes, so a tensor and its data_ptr() agree; anything else by
-    identity.
+    identity. A default resolved at its first launch compares by its group_key(),
+    so building a group does not resolve it.
     """
     out = {}
     for name, v in plan._defaults.items():
+        group_key = getattr(v, "group_key", None)
+        if group_key is not None:
+            out[name] = group_key()
+            continue
         try:
             out[name] = _as_ptr(v)
         except TypeError:
