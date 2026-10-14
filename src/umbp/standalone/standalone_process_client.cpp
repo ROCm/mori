@@ -833,6 +833,21 @@ size_t StandaloneProcessClient::BatchTouch(const std::vector<std::string>& keys)
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
+size_t StandaloneProcessClient::BatchSetEvictionClass(const std::vector<std::string>& keys,
+                                                      int eviction_class) {
+  if (closing_ || keys.empty()) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  grpc::ClientContext ctx;
+  ::umbp::BatchSetEvictionClassRequest req;
+  for (const auto& key : keys) req.add_keys(key);
+  req.set_eviction_class(eviction_class);
+  ::umbp::CountResponse resp;
+  // An older server answers UNIMPLEMENTED: the objects keep the normal class.
+  const grpc::Status status = stub_->BatchSetEvictionClass(&ctx, req, &resp);
+  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+}
+
 bool StandaloneProcessClient::Clear() {
   SimCall call(sim_trace_.get(), "clear", 0, 0);
   if (closing_) return call.Result(true);

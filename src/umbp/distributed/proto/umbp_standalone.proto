@@ -19,6 +19,9 @@ service UMBPStandalone {
   rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
   // IUMBPClient::BatchTouch; a server without it answers UNIMPLEMENTED.
   rpc BatchTouch(BatchKeysRequest) returns (CountResponse);
+  // Eviction class for stored keys (0 normal, 1 low priority); count = how
+  // many are stored.  Recency does not change.
+  rpc BatchSetEvictionClass(BatchSetEvictionClassRequest) returns (CountResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
@@ -84,6 +87,11 @@ message KeyRequest {
 
 message BatchKeysRequest {
   repeated string keys = 1;
+}
+
+message BatchSetEvictionClassRequest {
+  repeated string keys = 1;
+  int32 eviction_class = 2;
 }
 
 message PutRequest {
