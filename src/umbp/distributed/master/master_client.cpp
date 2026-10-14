@@ -479,6 +479,24 @@ std::optional<std::vector<EvictionOffer>> MasterClient::GetEvictionCandidates(
   return out;
 }
 
+void MasterClient::NoteLocalReads(const std::vector<std::string>& keys) {
+  // Past kFlushAt distinct keys, ship them now rather than wait out the
+  // interval; past kMax (master unreachable) the rest are dropped.
+  constexpr size_t kFlushAt = 4096;
+  constexpr size_t kMax = 65536;
+  if (keys.empty() || !ReportsLocalReads()) return;
+  bool flush = false;
+  {
+    std::lock_guard lock(local_reads_mutex_);
+    for (const auto& key : keys) {
+      if (local_reads_.size() >= kMax) break;
+      local_reads_.insert(key);
+    }
+    flush = local_reads_.size() >= kFlushAt;
+  }
+  if (flush) FlushHeartbeat();
+}
+
 namespace {
 // Auto-flush the heartbeat once this many KvEvents accumulate at the peer, so a
 // completed batch of puts becomes visible at the master without the application
@@ -817,6 +835,13 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
 grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
                                                   ::umbp::HeartbeatResponse* resp) {
   req.set_peer_driven_eviction(peer_driven_requested_);
+  std::unordered_set<std::string> reads;
+  {
+    std::lock_guard lock(local_reads_mutex_);
+    reads.swap(local_reads_);
+  }
+  req.mutable_local_reads()->Reserve(static_cast<int>(reads.size()));
+  while (!reads.empty()) req.add_local_reads(std::move(reads.extract(reads.begin()).value()));
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
                    std::chrono::milliseconds(HeartbeatRpcTimeoutMs()));

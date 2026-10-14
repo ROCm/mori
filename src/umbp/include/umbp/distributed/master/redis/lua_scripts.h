@@ -266,6 +266,21 @@ end
 return out
 )LUA";
 
+// record_local_reads:
+//   KEYS[1..n] = block keys (single-slot per invocation, grouped by shard, as
+//     route_get_batch).  ARGV = [now_ms].
+//   An access bump without a lease for every key that still exists.
+inline const std::string kRecordLocalReadsLua = R"LUA(
+local now = ARGV[1]
+for i = 1, #KEYS do
+  if redis.call('EXISTS', KEYS[i]) == 1 then
+    redis.call('HSET', KEYS[i], '_lacc', now)
+    redis.call('HINCRBY', KEYS[i], '_acnt', 1)
+  end
+end
+return 0
+)LUA";
+
 // exists_batch:
 //   KEYS[1..n] = block keys (single-slot per invocation, grouped by shard by
 //     the caller, same as route_get_batch).
