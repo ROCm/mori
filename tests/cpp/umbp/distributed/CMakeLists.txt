@@ -414,6 +414,13 @@ target_link_libraries(
 add_executable(bench_umbp_route_strategy bench_route_strategy.cpp)
 target_link_libraries(bench_umbp_route_strategy PRIVATE umbp_common)
 
+# Plan-building bench for one layer-wise ranged restore: buffered Plan() vs the
+# incremental TransferPlanBuilder. Pure logic (umbp_common only); standalone
+# executable, not a CTest target.
+add_executable(bench_umbp_transfer_plan bench_transfer_plan.cpp)
+target_link_libraries(bench_umbp_transfer_plan PRIVATE umbp_common)
+target_compile_features(bench_umbp_transfer_plan PRIVATE cxx_std_17)
+
 # ===========================================================================
 # Metadata-store / external-KV / SSD-tier suite (migrated from src/umbp/tests).
 # These link umbp_common (pure logic). Each binary is registered as a single
