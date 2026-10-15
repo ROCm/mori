@@ -203,6 +203,7 @@ class PoolClient {
   // MediumBackend — no concrete backend type is named outside PoolClient::Init.
   BackendRegistry& Backends();
   TierTransitionMetrics TransitionMetrics() const;
+  LocalEvictionMetrics LocalEvictionStats() const;
   std::map<std::string, uint64_t> TierReadHits() const;
   std::string LogicalTierForBackend(uint32_t backend_id) const;
 
