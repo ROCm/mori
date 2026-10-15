@@ -207,6 +207,13 @@ class PeerSsdManager {
   uint64_t EvictionBackendFailures() const {
     return metrics_.evict_backend_failures.load(std::memory_order_relaxed);
   }
+  // Records written in place through a reservation, and reservations given up.
+  uint64_t WritesInPlace() const {
+    return metrics_.writes_in_place.load(std::memory_order_relaxed);
+  }
+  uint64_t WriteInPlaceAborts() const {
+    return metrics_.write_in_place_aborts.load(std::memory_order_relaxed);
+  }
 
  private:
   // One owned SSD key: its size plus a hook into the LRU recency list so that
@@ -324,6 +331,8 @@ class PeerSsdManager {
     std::atomic<uint64_t> evict_victims{0};
     std::atomic<uint64_t> evict_bytes_freed{0};
     std::atomic<uint64_t> evict_backend_failures{0};
+    std::atomic<uint64_t> writes_in_place{0};
+    std::atomic<uint64_t> write_in_place_aborts{0};
   };
   MetricsCounters metrics_;
 };

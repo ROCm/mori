@@ -78,6 +78,15 @@ class LocalOnlyRegistrar final : public MemoryRegistrar {
   mori::io::MemoryLocationType last_loc = mori::io::MemoryLocationType::GPU;
 };
 
+// `name`'s samples keyed by their one label's value.
+std::map<std::string, uint64_t> Samples(const MediumBackend& backend, const char* name) {
+  std::map<std::string, uint64_t> out;
+  for (const auto& m : backend.SampleMetrics()) {
+    if (std::string(m.name) == name) out[m.labels.at(0).second] = m.value;
+  }
+  return out;
+}
+
 class SsdBackendTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -254,6 +263,11 @@ TEST_F(SsdBackendTest, ExecutorDemotesAndPromotesWithoutStaging) {
   get.size = out.size();
   ASSERT_TRUE(engine_.Transfer({get}, nullptr));
   EXPECT_EQ(out, payload);
+
+  auto events = Samples(*ssd, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL);
+  EXPECT_EQ(events["write_in_place"], 1u);
+  EXPECT_GE(events["migration_in_place"], 1u);
+  EXPECT_EQ(events["migration_staged"], 0u);
   ssd->Shutdown();
 }
 
@@ -642,12 +656,7 @@ TEST_F(SsdBackendTest, StagingPeakOutlivesTheRelease) {
   ASSERT_TRUE(got[0].found);
   backend->ReleaseResolved({"key-a"}, {got[0].lease_token});
 
-  std::map<std::string, uint64_t> state;
-  for (const auto& m : backend->SampleMetrics()) {
-    if (std::string(m.name) == MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE) {
-      state[m.labels.at(0).second] = m.value;
-    }
-  }
+  auto state = Samples(*backend, MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE);
   EXPECT_EQ(state["staging_pages_in_use"], 0u);
   EXPECT_EQ(state["staging_pages_peak"], 1u);
 }

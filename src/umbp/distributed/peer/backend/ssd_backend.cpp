@@ -744,6 +744,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
     resolved->size = loc->value_size;
     resolved->page_size = cfg_.page_size;
     resolved->file_ref = TransferRef::File(loc->fd, loc->value_offset, loc->readable_size);
+    migrations_in_place_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
   const uint32_t page_count = SizeToPages(size, cfg_.page_size);
@@ -780,6 +781,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
   }
   resolved->size = outcome.size;
   resolved->page_size = cfg_.page_size;
+  migrations_staged_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -1046,6 +1048,12 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
   event("staging_early_release", staging_early_releases_.load(std::memory_order_relaxed));
   event("resolve_deferred", resolve_deferred_keys_.load(std::memory_order_relaxed));
+
+  // Migrations: in place (file <-> DRAM through the file engine) or staged.
+  event("migration_in_place", migrations_in_place_.load(std::memory_order_relaxed));
+  event("migration_staged", migrations_staged_.load(std::memory_order_relaxed));
+  event("write_in_place", ssd_->WritesInPlace());
+  event("write_in_place_aborted", ssd_->WriteInPlaceAborts());
 
   // Bytes that actually crossed the device boundary, as opposed to the logical
   // bytes in mori_umbp_backend_bytes_total.  Reads exclude single-flight merges,

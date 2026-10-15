@@ -281,6 +281,7 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
   if (migrating_keys_.empty()) transition_idle_cv_.notify_all();
   if (!result.success) {
     ++transition_metrics_.failed;
+    if (job.kind == TierTransitionKind::kPromotion) ++transition_metrics_.promote_failed;
     return;
   }
   ++transition_metrics_.succeeded;

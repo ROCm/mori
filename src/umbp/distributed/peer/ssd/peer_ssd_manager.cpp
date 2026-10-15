@@ -258,11 +258,13 @@ bool PeerSsdManager::CommitReserved(const std::string& key, const RecordReservat
     RecordWrittenLocked(key, r.location.value_size);
   }
   metrics_.copy_bytes.fetch_add(r.location.value_size, std::memory_order_relaxed);
+  metrics_.writes_in_place.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
 void PeerSsdManager::AbortReserved(const std::string& key, const RecordReservation& r) {
   if (backend_) backend_->AbortRecord(key, r);
+  metrics_.write_in_place_aborts.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------

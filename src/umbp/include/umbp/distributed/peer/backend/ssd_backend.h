@@ -247,6 +247,9 @@ class SsdBackend : public MediumBackend {
   std::atomic<uint64_t> staging_expired_reclaims_{0};
   std::atomic<uint64_t> staging_early_releases_{0};  // released before expiry
   std::atomic<uint64_t> resolve_deferred_keys_{0};   // left for a further call
+  // Migration pins (a source read, or a target after commit): file range or staging.
+  std::atomic<uint64_t> migrations_in_place_{0};
+  std::atomic<uint64_t> migrations_staged_{0};
   uint64_t next_lease_token_ = 1;  // guarded by mutex_; 0 means "nothing to release"
   // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
   // can read it without taking mutex_ (the metrics tick must never contend with
