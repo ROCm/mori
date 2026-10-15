@@ -40,7 +40,6 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/numa_config.h"
 #include "umbp/common/parallel_for.h"
-#include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
@@ -63,7 +62,10 @@ uint32_t SizeToPages(uint64_t size, uint64_t page_size) {
   return static_cast<uint32_t>(pages);
 }
 
-void LogNumaPlacement(size_t index, const HostBufferHandle& handle) {
+// Unbound buffers log under a different prefix: launch scripts identify a NUMA
+// tier by the "tier layout" lines.
+void LogNumaPlacement(size_t index, const HostBufferHandle& handle, bool bound) {
+  const char* what = bound ? "tier layout (actual sampled)" : "tier placement (unbound, sampled)";
 #if defined(__linux__) && defined(__NR_move_pages)
   const size_t stride = std::max<size_t>(handle.actual_alignment, sysconf(_SC_PAGESIZE));
   const size_t pages = handle.mapped_size / stride;
@@ -75,17 +77,22 @@ void LogNumaPlacement(size_t index, const HostBufferHandle& handle) {
     addresses[i] = static_cast<char*>(handle.ptr) + (pages / samples * i) * stride;
   }
   if (syscall(__NR_move_pages, 0, samples, addresses.data(), nullptr, status.data(), 0) < 0) {
-    MORI_UMBP_WARN("[HostPageMemorySource] tier layout (actual): buffer={} query unavailable: {}",
-                   index, std::strerror(errno));
+    if (bound) {
+      MORI_UMBP_WARN("[HostPageMemorySource] tier layout (actual): buffer={} query unavailable: {}",
+                     index, std::strerror(errno));
+    }
     return;
   }
   std::map<int, size_t> counts;
   for (int node : status) ++counts[node];
   for (const auto& [node, count] : counts) {
-    MORI_UMBP_INFO(
-        "[HostPageMemorySource] tier layout (actual sampled): buffer={} node={} pages={}/{}", index,
-        node, count, samples);
+    MORI_UMBP_INFO("[HostPageMemorySource] {}: buffer={} node={} pages={}/{}", what, index, node,
+                   count, samples);
   }
+#else
+  (void)index;
+  (void)handle;
+  (void)what;
 #endif
 }
 
@@ -300,8 +307,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
   const int thread_budget =
       opts_.prefault_threads > 0
           ? opts_.prefault_threads
-          : (nodes.size() > 1 ? std::max(1u, std::min(16u, std::thread::hardware_concurrency()))
-                              : 1);
+          : static_cast<int>(std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
   const bool parallel =
       opts_.prefault && std::any_of(sizes.begin(), sizes.end(),
                                     [](uint64_t bytes) { return bytes >= (64ULL << 20); });
@@ -319,6 +325,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
     opts.require_numa_binding = !nodes.empty() && opts_.numa_strict;
     opts.prefault = opts_.prefault;
     opts.prefault_threads = std::max(1, thread_budget / buffer_workers);
+    opts.spread_prefault_across_nodes = nodes.empty();
     if (!nodes.empty()) {
       MORI_UMBP_INFO(
           "[HostPageMemorySource] tier layout (target): buffer={} node={} bytes={} policy={} "
@@ -341,7 +348,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
     }
     // mapped_size, not the request: hugepage rounding makes the extra usable.
     staged.push_back(Buffer{handle.ptr, handle.mapped_size});
-    if (!nodes.empty()) LogNumaPlacement(i, handle);
+    if (!nodes.empty() || opts_.prefault) LogNumaPlacement(i, handle, !nodes.empty());
   }
 
   handles_.insert(handles_.end(), taken.begin(), taken.end());
@@ -360,17 +367,8 @@ void HostPageMemorySource::Release() {
 // ---------------------------------------------------------------------------
 
 AllocateResult PageBackend::Allocate(const std::string& key, uint64_t size) {
-  AllocateResult out;
-  {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    out = AllocateLocked(key, size);
-  }
-  // A full pool is the one state the commit-time round cannot have prevented
-  // (one object larger than the headroom, or a burst that never reached
-  // commit).  Evicting here does not rescue THIS allocation -- it is not
-  // retried -- but it stops the pool staying wedged for every put after it.
-  if (out.outcome == AllocateOutcome::kFailedNoSpace) MaybeEvictToLowWatermark();
-  return out;
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  return AllocateLocked(key, size);
 }
 
 AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size,
@@ -434,18 +432,13 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
     const std::vector<AllocateRequest>& entries) {
   std::vector<AllocateResult> out(entries.size());
   if (entries.empty()) return out;
-  bool no_space = false;
-  {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (size_t i = 0; i < entries.size(); ++i) {
-      out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node);
-      if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
-        out[i].descs = BuildBufferDescsLocked(out[i].pages);
-      }
-      no_space = no_space || out[i].outcome == AllocateOutcome::kFailedNoSpace;
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < entries.size(); ++i) {
+    out[i] = AllocateLocked(entries[i].key, entries[i].size, entries[i].preferred_numa_node);
+    if (out[i].outcome == AllocateOutcome::kSuccessAllocated) {
+      out[i].descs = BuildBufferDescsLocked(out[i].pages);
     }
   }
-  if (no_space) MaybeEvictToLowWatermark();
   return out;
 }
 
@@ -454,16 +447,8 @@ std::vector<AllocateResult> PageBackend::BatchAllocate(
 // ---------------------------------------------------------------------------
 
 bool PageBackend::Commit(uint64_t slot_id, const std::string& key, uint64_t& bytes_committed) {
-  bool ok = false;
-  {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    ok = CommitLocked(slot_id, key, bytes_committed);
-  }
-  // Check-after-write, on the committing thread: there is no eviction thread,
-  // and a commit is the only event that grows usage.  Outside the lock because
-  // a round takes mutex_ itself.  No-op unless local eviction is enabled.
-  MaybeEvictToLowWatermark();
-  return ok;
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  return CommitLocked(slot_id, key, bytes_committed);
 }
 
 bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
@@ -511,15 +496,10 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
 std::vector<CommitResult> PageBackend::BatchCommit(const std::vector<CommitRequest>& entries) {
   std::vector<CommitResult> out(entries.size());
   if (entries.empty()) return out;
-  {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (size_t i = 0; i < entries.size(); ++i) {
-      out[i].success = CommitLocked(entries[i].slot_id, entries[i].key, out[i].bytes_committed);
-    }
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < entries.size(); ++i) {
+    out[i].success = CommitLocked(entries[i].slot_id, entries[i].key, out[i].bytes_committed);
   }
-  // One round for the whole batch, not one per key: a batch is a single burst
-  // of growth and a round already frees down to the low watermark.
-  MaybeEvictToLowWatermark();
   return out;
 }
 
@@ -584,7 +564,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   // taking lru_mutex_ per key.  Nothing here can invalidate the pointers: a
   // shared lock excludes every writer of owned_.
   std::vector<std::pair<const std::string*, OwnedSlot*>> touched;
-  if (local_evict_enabled_) touched.reserve(keys.size());
+  if (track_eviction_order_) touched.reserve(keys.size());
   for (size_t i = 0; i < keys.size(); ++i) {
     auto it = owned_.find(keys[i]);
     if (it == owned_.end()) continue;
@@ -596,7 +576,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     RenewLeaseAtomic(it->second, lease_deadline);
-    if (local_evict_enabled_) touched.emplace_back(&keys[i], &it->second);
+    if (track_eviction_order_) touched.emplace_back(&keys[i], &it->second);
   }
   if (!touched.empty()) {
     std::lock_guard<std::mutex> lru_lock(lru_mutex_);
@@ -615,7 +595,7 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   resolved->pages = owned->second.pages;
   resolved->size = owned->second.size;
   resolved->page_size = page_size_;
-  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now()};
+  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now(), /*migration=*/true};
   return true;
 }
 
@@ -832,73 +812,41 @@ void PageBackend::SetEventPublishing(bool enabled) {
 }
 
 // ---------------------------------------------------------------------------
-//  Local eviction (no-master deployments; see EnableLocalEviction)
+//  Eviction order (the policy that consumes it lives in PeerPool)
 // ---------------------------------------------------------------------------
 
-std::vector<MetricSample> PageBackend::SampleMetrics() const {
-  // Only what the MediumBackend interface hides.  Commits, resolves and
-  // master-driven evictions are all interface calls and are already measured by
-  // InstrumentedBackend; repeating them here would double-count them.
-  //
-  // Local watermark eviction is the exception that makes this function
-  // necessary: a round frees pages directly instead of calling Evict(), so from
-  // outside this class it is indistinguishable from keys that were never
-  // stored.  On a masterless node that is ALL of the eviction there is.
-  std::vector<MetricSample> out;
-  // Only a node that evicts for itself has these counters.  On one that does,
-  // they are published from the first tick, zero included: a series born
-  // already holding the first round's count hides that round from rate() and
-  // increase(), and eviction is rare enough that the first round is often the
-  // only one a dashboard window contains.
-  if (!local_evict_enabled_) return out;
+void PageBackend::TrackEvictionOrder() {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  if (track_eviction_order_) return;
+  track_eviction_order_ = true;
+  // Seed keys committed before this call, as coldest.
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (auto& [key, slot] : owned_) TouchLruLocked(key, slot);
+}
 
-  auto event = [&out](const char* name, uint64_t v) {
-    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL,
-                               MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL_HELP,
-                               {{"event", name}},
-                               v});
-  };
-
-  event(kPageBackendLocalEvictEvent, local_evict_keys_.load(std::memory_order_relaxed));
-  event("local_evict_round", local_evict_rounds_.load(std::memory_order_relaxed));
-  // A round that found nothing reclaimable: every candidate was under a read
-  // lease or a copy pin.  Distinguishes a tier that cannot evict from one that
-  // has nothing to evict, which look the same in the freed-bytes counter.
-  event("local_evict_no_candidate", local_evict_no_candidate_.load(std::memory_order_relaxed));
-
-  out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL,
-                             MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL_HELP,
-                             {{"event", kPageBackendLocalEvictEvent}},
-                             local_evict_bytes_.load(std::memory_order_relaxed)});
+std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
+  std::vector<EvictionOffer> out;
+  if (max_count == 0) return out;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  if (!track_eviction_order_) return out;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (auto it = lru_.rbegin(); it != lru_.rend() && out.size() < max_count; ++it) {
+    auto owned_it = owned_.find(*it);
+    if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
+    // Skip what Evict() refuses (read lease, copy pin); a migration pin is
+    // offered so the caller can count it as in flight.
+    if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
+    if (auto pin = pins_.find(*it); pin != pins_.end() && !pin->second.migration) continue;
+    // Whole pages, as Capacity() counts them.
+    out.push_back(
+        EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
+  }
   return out;
 }
 
-void PageBackend::EnableLocalEviction(double high_watermark, double low_watermark) {
-  if (!(high_watermark > 0.0 && high_watermark <= 1.0 && low_watermark > 0.0 &&
-        low_watermark < high_watermark)) {
-    MORI_UMBP_WARN(
-        "[PageBackend] ignoring local eviction watermarks high={} low={} "
-        "(require 0 < low < high <= 1) — local eviction stays OFF",
-        high_watermark, low_watermark);
-    return;
-  }
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  local_evict_enabled_ = true;
-  local_evict_high_wm_ = high_watermark;
-  local_evict_low_wm_ = low_watermark;
-  // Keys committed before this call are not in lru_ and would therefore be
-  // invisible to a round.  Enabling before Init is the contract, but seed
-  // anyway so a late enable degrades to "wrong order", not "never evicted".
-  {
-    std::lock_guard<std::mutex> lru_lock(lru_mutex_);
-    for (auto& [key, slot] : owned_) TouchLruLocked(key, slot);
-  }
-  MORI_UMBP_INFO("[PageBackend] local eviction ON tier={} high={} low={}", static_cast<int>(tier_),
-                 high_watermark, low_watermark);
-}
-
 void PageBackend::TouchLruLocked(const std::string& key, OwnedSlot& slot) {
-  if (!local_evict_enabled_) return;
+  if (!track_eviction_order_) return;
   if (slot.in_lru) {
     lru_.splice(lru_.begin(), lru_, slot.lru_it);
     return;
@@ -915,7 +863,7 @@ void PageBackend::RemoveFromLruLocked(OwnedSlot& slot) {
 }
 
 void PageBackend::TouchLru(const std::string& key, OwnedSlot& slot) {
-  if (!local_evict_enabled_) return;
+  if (!track_eviction_order_) return;
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   TouchLruLocked(key, slot);
 }
@@ -923,79 +871,6 @@ void PageBackend::TouchLru(const std::string& key, OwnedSlot& slot) {
 void PageBackend::RemoveFromLru(OwnedSlot& slot) {
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   RemoveFromLruLocked(slot);
-}
-
-size_t PageBackend::MaybeEvictToLowWatermark() {
-  // Only one round at a time.  A second committing thread backs off rather
-  // than over-evicting, and try_lock keeps the put path non-blocking.
-  std::unique_lock<std::mutex> round(local_evict_round_mutex_, std::try_to_lock);
-  if (!round.owns_lock()) return 0;
-
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  if (!local_evict_enabled_ || !allocator_) return 0;
-
-  const uint64_t total = allocator_->TotalBytes();
-  if (total == 0) return 0;
-  const uint64_t used = allocator_->UsedBytes();
-  if (static_cast<double>(used) < local_evict_high_wm_ * static_cast<double>(total)) return 0;
-
-  const auto low_bytes = static_cast<uint64_t>(local_evict_low_wm_ * static_cast<double>(total));
-  if (used <= low_bytes) return 0;
-  const uint64_t to_free = used - low_bytes;
-
-  // Oldest first.  Two passes so the list is not mutated under its own
-  // reverse iterator; the selection pass is where the skips happen.
-  const auto now = std::chrono::steady_clock::now();
-  uint64_t selected_bytes = 0;
-  std::vector<std::string> victims;
-  {
-    std::lock_guard<std::mutex> lru_lock(lru_mutex_);
-    for (auto it = lru_.rbegin(); it != lru_.rend() && selected_bytes < to_free; ++it) {
-      auto owned_it = owned_.find(*it);
-      if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
-      // Same two protections master-driven Evict honours: an in-flight read
-      // owns the pages until its lease expires, and a copy pin until the
-      // worker is done.  A round that finds only protected keys frees what it
-      // can and stops — it must not spin waiting for a reader.
-      if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
-      if (HasActivePinLocked(*it)) continue;
-      victims.push_back(*it);
-      selected_bytes += static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_;
-    }
-  }
-
-  size_t freed = 0;
-  for (const auto& key : victims) {
-    auto owned_it = owned_.find(key);
-    if (owned_it == owned_.end()) continue;
-    if (allocator_) allocator_->Deallocate(owned_it->second.pages);
-    // A REMOVE is queued for symmetry with master-driven Evict; with no master
-    // event publishing is off and this is a no-op, so nothing accumulates.
-    QueueEventLocked(KvEvent{KvEvent::Kind::REMOVE, key, tier_, 0});
-    RemoveFromLru(owned_it->second);
-    owned_.erase(owned_it);
-    ++freed;
-  }
-  local_evict_rounds_.fetch_add(1, std::memory_order_relaxed);
-  if (freed > 0) {
-    // Counted, not logged.  A round frees a handful of keys and runs whenever
-    // a commit finds the tier above its high watermark, so the per-round line
-    // this replaced could reach thousands per second under steady offload —
-    // and it was at DEBUG, so the volume also bought every other DEBUG line in
-    // the process.  The periodic activity summary reports the window total.
-    local_evict_keys_.fetch_add(freed, std::memory_order_relaxed);
-    local_evict_bytes_.fetch_add(selected_bytes, std::memory_order_relaxed);
-    local_evict_warned_ = false;
-  } else if (!local_evict_warned_) {
-    // Latched: a wedged pool would otherwise log this on every commit.
-    local_evict_warned_ = true;
-    local_evict_no_candidate_.fetch_add(1, std::memory_order_relaxed);
-    MORI_UMBP_WARN(
-        "[PageBackend] local eviction found no reclaimable key at {}/{} bytes used "
-        "(all leased or pinned) tier={}",
-        used, total, static_cast<int>(tier_));
-  }
-  return freed;
 }
 
 void PageBackend::SetAutoFlushHook(size_t threshold, std::function<void()> cb) {

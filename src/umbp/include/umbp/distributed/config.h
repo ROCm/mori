@@ -93,6 +93,9 @@ struct ClientRegistryConfig {
   // single backend can hold. Tests set this false to emulate that Master.
   bool advertise_max_allocatable_bytes = true;
   bool advertise_logical_tiers = true;
+  // Serve GetEvictionCandidates and stop EvictKey rounds for peers that evict
+  // for themselves.  False emulates an older Master.
+  bool advertise_peer_driven_eviction = true;
 };
 
 struct EvictionConfig {
@@ -100,16 +103,20 @@ struct EvictionConfig {
   double low_watermark = 0.7;
   std::chrono::seconds check_interval{5};
   std::chrono::seconds lease_duration{2};
-  size_t evict_batch_size = 32;
 
-  // Only timing fields are env-overridable here; watermarks and batch size
-  // have dedicated tuning paths and are intentionally excluded.
+  // Most bytes one round evicts from one (node, tier).  0 = its whole overage
+  // above the low watermark.
+  uint64_t max_evict_bytes_per_round = 0;
+
+  // Watermarks have dedicated tuning paths and are not env-overridable.
   static EvictionConfig FromEnvironment() {
     EvictionConfig cfg;
     cfg.check_interval =
         GetEnvSeconds("UMBP_EVICTION_CHECK_INTERVAL_SEC", cfg.check_interval, /*min_allowed=*/1);
     cfg.lease_duration =
         GetEnvSeconds("UMBP_LEASE_DURATION_SEC", cfg.lease_duration, /*min_allowed=*/1);
+    cfg.max_evict_bytes_per_round =
+        GetEnvUint64("UMBP_EVICT_MAX_BYTES_PER_ROUND", cfg.max_evict_bytes_per_round);
     return cfg;
   }
 };
@@ -227,6 +234,12 @@ struct BackendInstanceConfig {
   uint32_t placement_weight = 1;
 };
 
+enum class PeerEvictionMode {
+  kLocal,         // at its own watermarks, by its own LRU; never asks the master
+  kMasterRanked,  // at its own watermarks, victims ranked by the master
+  kMaster,        // the master's EvictKey rounds (SSD still evicts locally)
+};
+
 struct PoolClientConfig {
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
@@ -304,15 +317,16 @@ struct PoolClientConfig {
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
-  // Watermarks for the paged medium's own eviction, used ONLY when this node
-  // has no master (PoolClient::Init enables it exactly then).  With a master,
-  // eviction is a cluster-wide decision shipped as Evict RPCs and these are
-  // ignored; without one, nothing else would ever free a page.  Lowered from
-  // UMBPDramConfig::high_watermark / low_watermark, which is where the
-  // deleted local backend read the same policy from.  The SSD medium has its
-  // own pair inside UMBPSsdConfig and does not consult these.
+  // Local eviction watermarks for DRAM/HBM (SSD has its own pair).  Unless
+  // eviction_mode is kMaster, a tiered policy's per-tier pair takes
+  // precedence.  From UMBPDramConfig.
   double local_evict_high_watermark = 0.9;
   double local_evict_low_watermark = 0.7;
+
+  // How this node evicts when it has a master (env UMBP_EVICTION_MODE =
+  // local | master_ranked | master).  Without a master it always evicts
+  // locally.  In every mode it still serves the master's EvictKey.
+  PeerEvictionMode eviction_mode = PeerEvictionMode::kLocal;
 
   UMBPCopyPipelineConfig copy_pipeline = [] {
     UMBPCopyPipelineConfig c;

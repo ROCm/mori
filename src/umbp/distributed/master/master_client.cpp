@@ -204,6 +204,7 @@ grpc::Status MasterClient::RegisterSelf(
   FillTierCapacities(req.mutable_tier_capacities(), tier_capacities);
   FillLogicalTierCapacities(req.mutable_logical_tier_capacities(), logical_tier_capacities);
   for (const auto& tag : config_.tags) req.add_tags(tag);
+  req.set_peer_driven_eviction(peer_driven_requested_);
 
   ::umbp::RegisterClientResponse resp;
   grpc::ClientContext ctx;
@@ -217,6 +218,7 @@ grpc::Status MasterClient::RegisterSelf(
   if (resp.heartbeat_interval_ms() > 0) heartbeat_interval_ms_ = resp.heartbeat_interval_ms();
   supports_max_allocatable_capacity_ = resp.supports_max_allocatable_bytes();
   supports_logical_tiers_ = resp.supports_logical_tiers();
+  supports_peer_driven_eviction_ = resp.supports_peer_driven_eviction();
   aggregate_backend_capacities_ =
       aggregate_backend_capacities_requested_ && supports_max_allocatable_capacity_;
   {
@@ -443,6 +445,57 @@ grpc::Status MasterClient::BatchLookup(const std::vector<std::string>& keys,
   out->reserve(static_cast<size_t>(resp.found_size()));
   for (int i = 0; i < resp.found_size(); ++i) out->push_back(resp.found(i));
   return grpc::Status::OK;
+}
+
+std::optional<std::vector<EvictionOffer>> MasterClient::GetEvictionCandidates(
+    TierType tier, const std::string& logical_tier, uint64_t bytes, uint32_t max_keys) {
+  ScopedRpcTimer _rpc_timer(this, "GetEvictionCandidates");
+  ::umbp::GetEvictionCandidatesRequest req;
+  req.set_node_id(config_.node_id);
+  req.set_tier(ToProtoTier(tier));
+  req.set_logical_tier(logical_tier);
+  req.set_bytes(bytes);
+  req.set_max_keys(max_keys);
+
+  ::umbp::GetEvictionCandidatesResponse resp;
+  grpc::ClientContext ctx;
+  // Eviction does not wait on this (PeerPool::RankedCandidates); past the
+  // age a peer still uses, an answer is wasted work.
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+  auto status = GetStub(stub_.get())->GetEvictionCandidates(&ctx, req, &resp);
+  _rpc_timer.SetStatus(status);
+  if (!status.ok()) {
+    static std::atomic<uint64_t> failures{0};
+    const uint64_t n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8 || n % 1000 == 0) {
+      MORI_UMBP_WARN("[Client] GetEvictionCandidates failed ({} so far): {}", n,
+                     status.error_message());
+    }
+    return std::nullopt;
+  }
+  const int n = std::min(resp.keys_size(), resp.sizes_size());
+  std::vector<EvictionOffer> out;
+  out.reserve(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) out.push_back(EvictionOffer{resp.keys(i), resp.sizes(i)});
+  return out;
+}
+
+void MasterClient::NoteLocalReads(const std::vector<std::string>& keys) {
+  // Past kFlushAt distinct keys, ship them now rather than wait out the
+  // interval; past kMax (master unreachable) the rest are dropped.
+  constexpr size_t kFlushAt = 4096;
+  constexpr size_t kMax = 65536;
+  if (keys.empty() || !ReportsLocalReads()) return;
+  bool flush = false;
+  {
+    std::lock_guard lock(local_reads_mutex_);
+    for (const auto& key : keys) {
+      if (local_reads_.size() >= kMax) break;
+      local_reads_.insert(key);
+    }
+    flush = local_reads_.size() >= kFlushAt;
+  }
+  if (flush) FlushHeartbeat();
 }
 
 namespace {
@@ -742,6 +795,7 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
                                 peer_pool_->LogicalTierCapacities());
     }
     for (const auto& tag : config_.tags) re_req.add_tags(tag);
+    re_req.set_peer_driven_eviction(peer_driven_requested_);
     ::umbp::RegisterClientResponse re_resp;
     grpc::ClientContext re_ctx;
     grpc::Status re_status;
@@ -754,6 +808,7 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
       supports_max_allocatable_capacity_ =
           re_status.ok() && re_resp.supports_max_allocatable_bytes();
       supports_logical_tiers_ = re_status.ok() && re_resp.supports_logical_tiers();
+      supports_peer_driven_eviction_ = re_status.ok() && re_resp.supports_peer_driven_eviction();
       aggregate_backend_capacities_ =
           aggregate_backend_capacities_requested_ && supports_max_allocatable_capacity_;
       registered_ = true;
@@ -780,6 +835,14 @@ bool MasterClient::SendDeltaHeartbeatLocked(const std::map<TierType, TierCapacit
 
 grpc::Status MasterClient::SendHeartbeatRpcLocked(::umbp::HeartbeatRequest& req,
                                                   ::umbp::HeartbeatResponse* resp) {
+  req.set_peer_driven_eviction(peer_driven_requested_);
+  std::unordered_set<std::string> reads;
+  {
+    std::lock_guard lock(local_reads_mutex_);
+    reads.swap(local_reads_);
+  }
+  req.mutable_local_reads()->Reserve(static_cast<int>(reads.size()));
+  while (!reads.empty()) req.add_local_reads(std::move(reads.extract(reads.begin()).value()));
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
                    std::chrono::milliseconds(HeartbeatRpcTimeoutMs()));

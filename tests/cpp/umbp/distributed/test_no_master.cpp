@@ -243,6 +243,11 @@ TEST_F(NoMasterTest, ClearAndFlushSucceed) {
   ASSERT_EQ(node->BatchPut({"nml-a"}, {object.data()}, {kObjectSize}), std::vector<bool>({true}));
   EXPECT_TRUE(node->Clear()) << "Clear must converge vacuously with no master to sync to";
   EXPECT_EQ(node->BatchExists({"nml-a"}), std::vector<bool>({false}));
+
+  // No master will ever ack the clear, so Clear itself must reopen the write gate.
+  EXPECT_EQ(node->BatchPut({"nml-a"}, {object.data()}, {kObjectSize}), std::vector<bool>({true}))
+      << "put after a no-master Clear was rejected";
+  EXPECT_EQ(node->BatchExists({"nml-a"}), std::vector<bool>({true}));
 }
 
 // The same process, the same client class, both deployments -- which is the

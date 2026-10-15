@@ -40,6 +40,7 @@ using mori::umbp::GetEnvMicroseconds;
 using mori::umbp::GetEnvMilliseconds;
 using mori::umbp::GetEnvSeconds;
 using mori::umbp::GetEnvUint32;
+using mori::umbp::GetEnvUint64;
 using mori::umbp::ResetEnvWarnStateForTesting;
 
 constexpr const char* kName = "UMBP_TEST_ENV_TIME_XYZ";
@@ -105,6 +106,15 @@ TEST_F(EnvTimeTest, ZeroIsAllowedWhenMinIsZero) {
   ::setenv(kName, "0", 1);
   EXPECT_EQ(GetEnvSeconds(kName, std::chrono::seconds(6)).count(), 0);
   EXPECT_EQ(GetEnvUint32(kName, 7), 0u);
+}
+
+TEST_F(EnvTimeTest, Uint64ParsesPastUint32AndRejectsGarbage) {
+  ::setenv(kName, "8589934592", 1);  // 8 GiB
+  EXPECT_EQ(GetEnvUint64(kName, 1), 8589934592ULL);
+  ::setenv(kName, "-1", 1);
+  EXPECT_EQ(GetEnvUint64(kName, 5), 5u);
+  ::setenv(kName, "1G", 1);
+  EXPECT_EQ(GetEnvUint64(kName, 6), 6u);
 }
 
 TEST_F(EnvTimeTest, FallsBackWhenAboveUint32Max) {

@@ -199,6 +199,8 @@ class InProcessClusterTest : public ::testing::Test {
     config.cache_remote_fetches = false;
     config.placement_policy = PoolPlacementPolicy::WEIGHTED;
     config.backends = backends;
+    // Cases fill the pool on purpose; leave eviction to the master's rounds.
+    config.eviction_mode = PeerEvictionMode::kMaster;
 
     auto client = std::make_unique<PoolClient>(std::move(config));
     ASSERT_TRUE(client->Init()) << "failed to initialize PoolClient " << node_id;

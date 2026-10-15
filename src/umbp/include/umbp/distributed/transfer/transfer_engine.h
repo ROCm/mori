@@ -326,6 +326,15 @@ struct TransferPlanSet {
   std::vector<size_t> rejected_tags;
 };
 
+// A call owns its builder. Adding fragments only plans work; it never
+// submits IO. Finish consumes the accumulated plans once.
+class TransferPlanBuilder {
+ public:
+  virtual ~TransferPlanBuilder() = default;
+  virtual void Add(const TransferItem& item) = 0;
+  virtual TransferPlanSet Finish() = 0;
+};
+
 // One failed plan, mapped back to the keys that rode in it.  Carries enough to
 // reproduce the pre-refactor per-transfer error log.
 struct TransferFailure {
@@ -405,6 +414,15 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // and fills `failed_tags` if anything was rejected or failed.
   bool Transfer(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags,
                 const StepTiming* timing = nullptr);
+
+  // Submit and wait for work that has already been planned.
+  bool Transfer(TransferPlanSet planned, std::vector<size_t>* failed_tags,
+                const StepTiming* timing = nullptr);
+
+  // Engines may build incrementally; the default preserves their existing
+  // batch planner by buffering items until Finish. expected_items is a
+  // reservation hint for buffered engines; incremental engines may ignore it.
+  virtual std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const;
 };
 
 }  // namespace mori::umbp

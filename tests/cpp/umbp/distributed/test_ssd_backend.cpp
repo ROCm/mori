@@ -29,6 +29,7 @@
 // PUBLISHES is plain host memory, so no transfer-layer change was needed.
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -43,7 +44,9 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/common/fd_limit.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
+#include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #ifdef UMBP_ENABLE_GDS
@@ -201,6 +204,32 @@ TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {
 // ---------------------------------------------------------------------------
 //  Put / Get
 // ---------------------------------------------------------------------------
+
+// The tier also runs inside other programs (sglang, embedded), so it leaves the
+// process-wide fd limit alone; UMBP's executables raise it in main().
+TEST_F(SsdBackendTest, LeavesTheOpenFileLimitToTheExecutable) {
+  struct rlimit original{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  if (original.rlim_max == RLIM_INFINITY || original.rlim_max <= 1024) {
+    GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves nothing to test";
+  }
+  struct Restore {
+    rlimit rl;
+    ~Restore() { setrlimit(RLIMIT_NOFILE, &rl); }
+  } restore{original};
+  struct rlimit low = original;
+  low.rlim_cur = 1024;  // docker's default
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
+
+  Start();
+  struct rlimit now{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, 1024u);
+
+  RaiseOpenFileLimit();
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, original.rlim_max);
+}
 
 TEST_F(SsdBackendTest, PutThenGetReturnsTheSameBytes) {
   SsdBackend* backend = Start();
@@ -526,6 +555,65 @@ TEST_F(SsdBackendTest, EvictResultsAreOnePerKeyInRequestOrder) {
   EXPECT_EQ(evicted[1].key, "key-a");
   EXPECT_EQ(evicted[2].key, "missing-2");
   EXPECT_EQ(evicted[1].bytes_freed, 1024u);
+}
+
+// ---- Local eviction: the backend offers order; the pool decides ----
+
+TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
+  SsdBackend* backend = Start();
+  ASSERT_TRUE(Put(backend, "a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "b", Payload(2048, 2)));
+  ASSERT_TRUE(Put(backend, "c", Payload(1024, 3)));
+
+  auto offers = backend->EvictionCandidates(10);
+  ASSERT_EQ(offers.size(), 3u);
+  EXPECT_EQ(offers[0], (EvictionOffer{"a", 1024}));
+  EXPECT_EQ(offers[1], (EvictionOffer{"b", 2048}));
+  EXPECT_EQ(offers[2], (EvictionOffer{"c", 1024}));
+
+  // A staged read's lease makes "b" unevictable, so it is not offered.
+  ASSERT_TRUE(backend->BatchResolve({"b"}, false)[0].found);
+  offers = backend->EvictionCandidates(10);
+  for (const auto& offer : offers) EXPECT_NE(offer.key, "b");
+  EXPECT_EQ(offers.size(), 2u);
+}
+
+TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
+  // SSD's watermark eviction now runs in the pool and reaches it via Evict().
+  constexpr uint64_t kCapacity = 1024 * 1024;
+  SsdBackend::Config cfg;
+  cfg.page_size = kPageSize;
+  cfg.staging_pages = 8;
+  cfg.read_lease_ttl = std::chrono::milliseconds{500};
+  cfg.ssd.enabled = true;
+  cfg.ssd.ssd.enabled = true;
+  cfg.ssd.ssd.storage_dir = dir_.string();
+  cfg.ssd.ssd.capacity_bytes = kCapacity;
+  cfg.ssd.ssd.io.backend = UMBPIoBackend::Posix;
+  auto owned = std::make_unique<SsdBackend>(std::move(cfg));
+  ASSERT_TRUE(owned->Init(&registrar_));
+  SsdBackend* ssd = owned.get();
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("ssd", std::move(owned)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+
+  // Fill past the high watermark by measurement (record overhead varies).
+  std::vector<std::string> keys;
+  const auto used = [&] { return ssd->Capacity().total_bytes - ssd->Capacity().available_bytes; };
+  while (used() < kCapacity * 9 / 10) {
+    keys.push_back("k" + std::to_string(keys.size()));
+    ASSERT_TRUE(Put(ssd, keys.back(), Payload(32 * 1024, static_cast<char>(keys.size()))))
+        << "filled to " << used() << " of " << kCapacity;
+  }
+  ASSERT_GE(keys.size(), 8u);
+
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(ssd), 0.9, 0.5));
+  pool.RunLocalEvictionOnceForTest();
+
+  EXPECT_LE(used(), kCapacity / 2) << "not drained to the low watermark";
+  EXPECT_FALSE(ssd->Contains(keys.front())) << "the coldest key survived";
+  EXPECT_TRUE(ssd->Contains(keys.back())) << "drained past the low watermark";
+  EXPECT_GE(pool.LocalEvictionStats().keys, 1u);
 }
 
 TEST_F(SsdBackendTest, ClearLocalDropsEverythingAndGatesAllocation) {

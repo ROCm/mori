@@ -20,7 +20,7 @@ allocator that lives on the peers. It runs as a single binary
 (`build/src/umbp/umbp_master`) exposing one gRPC service (`UMBPMaster`)
 plus an optional Prometheus metrics endpoint.
 
-Peers are processes that load `libmori_pybinds.so` (typically inside an
+Peers are processes that load `libmori_umbp_pybinds.so` (typically inside an
 SGLang or vLLM worker). Each peer owns:
 
 - a **`PeerDramAllocator`** — page-bitmap allocator for HBM/DRAM tiers,
@@ -886,7 +886,7 @@ fields:
 | `ssd` | `enabled` | true | Toggle SSD tier. |
 | `ssd` | `storage_dir` | `/tmp/umbp_ssd` | POSIX backend root. |
 | `ssd` | `capacity_bytes` | 32 GiB | |
-| `ssd` | `segment_size_bytes` | 256 MiB | SegmentedLog segment size. |
+| `ssd` | `segment_size_bytes` | 4 GiB | SegmentedLog segment size. Each segment file keeps an fd open for the tier's lifetime. |
 | `ssd` | `high_watermark` / `low_watermark` | 0.9 / 0.7 | Peer-local SSD eviction band (`UMBP_SSD_HIGH_WM` / `UMBP_SSD_LOW_WM`). Must satisfy `0 < low < high <= 1` or construction throws. |
 | `ssd` | `ssd_backend` | `file` | `file`, `spdk`, or `spdk_proxy`. Distributed peers reach SPDK only via the proxy. |
 | `ssd` | `spdk_*` | — | SPDK/proxy tuning (BDF, reactor mask, channels, shm name, ...), all under `ssd.*`. |

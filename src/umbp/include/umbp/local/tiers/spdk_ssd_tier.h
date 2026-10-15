@@ -25,7 +25,8 @@
 // Metadata management follows mooncake-store's OffsetAllocatorStorageBackend:
 //   - Sharded map (kNumShards) with std::shared_mutex for concurrent reads
 //   - RefCounted allocation handles (AllocationPtr) for safe concurrent access
-//   - Auto LRU eviction on allocation failure
+//   - NO eviction on allocation failure: a write that does not fit fails, and
+//     freeing space is the owner's decision (PeerSsdManager calls Evict()).
 #pragma once
 
 #include <array>
@@ -206,9 +207,6 @@ class SpdkSsdTier : public TierBackend {
   std::vector<ReadInfo> PrepareReadLookup(const std::vector<std::string>& keys,
                                           const std::vector<size_t>& sizes,
                                           std::vector<bool>& results);
-
-  // -- LRU eviction --------------------------------------------------------
-  size_t EvictLRU(size_t needed);
 
   // -- Member data ---------------------------------------------------------
   bool initialized_ = false;

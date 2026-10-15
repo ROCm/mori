@@ -165,7 +165,7 @@ if(HAVE_SPDK)
 endif()
 
 # Python bindings are registered in src/pybind/pybind_umbp.cpp (compiled into
-# libmori_pybinds when BUILD_UMBP=ON)
+# their own module, libmori_umbp_pybinds, when BUILD_UMBP=ON)
 
 # =============================================================================
 # UMBP Master Control Plane — CMake Build (requires gRPC + Protobuf)
@@ -440,9 +440,9 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 # host-staged SSD path.
 #
 # HEADERS ONLY, NEVER -lhipfile.  umbp_common is linked into
-# libmori_pybinds.so, so a link-time dependency here becomes a DT_NEEDED on the
-# Python extension and `import mori` fails on any host whose ROCm ships without
-# libhipfile — even for users who never touch UMBP. hipfile_dl.cpp dlopen's the
+# libmori_umbp_pybinds.so, so a link-time dependency here becomes a DT_NEEDED on
+# that extension and `import mori.umbp` fails on any host whose ROCm ships without
+# libhipfile — even for UMBP users who never use GDS. hipfile_dl.cpp dlopen's the
 # library on first use instead, which keeps GDS working where it exists and
 # costs nothing where it does not.
 # GLOBAL so tests/cpp/umbp/distributed can still gate test_gds_engine on the

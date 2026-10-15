@@ -1060,19 +1060,8 @@ bool PoolClient::Init() {
     // every named backend, including multiple instances of the same medium.
     backend = MakeInstrumentedBackend(std::move(backend));
 
-    // A node with no master owns its whole storage policy, and both halves of
-    // that follow from the same fact: nobody will ever call Evict() on this
-    // backend, and nobody will ever drain its heartbeat outbox.  So the backend
-    // evicts for itself, and stops recording events addressed to a master that
-    // does not exist.  Both are no-ops in a cluster -- master-driven eviction
-    // stays the only policy there, and the outbox keeps feeding the heartbeat.
-    //
-    // Before Init(), which is the contract EnableLocalEviction states.
-    if (!master_client_) {
-      backend->SetEventPublishing(false);
-      backend->EnableLocalEviction(config_.local_evict_high_watermark,
-                                   config_.local_evict_low_watermark);
-    }
+    // With no master, nothing drains the heartbeat outbox.
+    if (!master_client_) backend->SetEventPublishing(false);
 
     // Narrowed to MemoryRegistrar: a backend publishes endpoints, it does not
     // move bytes, and that is a compile-time fact (design doc §5 Rule C).
@@ -1099,6 +1088,43 @@ bool PoolClient::Init() {
   }
   default_pool_ =
       std::make_unique<PeerPool>(&registry_, std::move(placement_policy), transfer_engine_.get());
+
+  // Local watermark eviction, for every medium unless a master's rounds own
+  // DRAM/HBM (eviction_mode kMaster; SSD always evicts locally).  A node that
+  // evicts for itself uses a tiered policy's per-tier watermarks when there
+  // is one; otherwise SSD's own pair, or the node pair for paged media.
+  {
+    static constexpr const char* kModes[] = {"local", "master_ranked", "master"};
+    const std::string mode =
+        GetEnvEnum("UMBP_EVICTION_MODE", kModes[static_cast<int>(config_.eviction_mode)],
+                   {kModes[0], kModes[1], kModes[2]});
+    config_.eviction_mode = mode == "master"          ? PeerEvictionMode::kMaster
+                            : mode == "master_ranked" ? PeerEvictionMode::kMasterRanked
+                                                      : PeerEvictionMode::kLocal;
+  }
+  const bool self_evicting = !master_client_ || config_.eviction_mode != PeerEvictionMode::kMaster;
+  for (const auto& backend_config : backend_configs) {
+    auto* backend = registry_.Get(backend_config.name);
+    if (backend == nullptr) continue;
+    const bool ssd = backend_config.tier == TierType::SSD;
+    if (!ssd && !self_evicting) continue;
+    const uint32_t backend_id = registry_.BackendId(backend);
+    double high = ssd ? backend_config.ssd.ssd.high_watermark : config_.local_evict_high_watermark;
+    double low = ssd ? backend_config.ssd.ssd.low_watermark : config_.local_evict_low_watermark;
+    if (self_evicting && tier_graph != nullptr) {
+      if (const auto index = tier_graph->TierIndexForBackendId(backend_id)) {
+        high = tier_graph->NodeAt(*index).high_watermark;
+        low = tier_graph->NodeAt(*index).low_watermark;
+      }
+    }
+    if (!default_pool_->EnableLocalEviction(backend_id, high, low) && ssd) {
+      MORI_UMBP_ERROR("[PoolClient] backend '{}': invalid SSD watermarks high={} low={}",
+                      backend_config.name, high, low);
+      Shutdown();
+      return false;
+    }
+  }
+
   const bool weighted_placement = config_.placement_policy == PoolPlacementPolicy::WEIGHTED ||
                                   config_.placement_policy == PoolPlacementPolicy::TIERED;
   if (master_client_) {
@@ -1228,6 +1254,11 @@ bool PoolClient::Init() {
     const auto logical_caps = default_pool_ == nullptr
                                   ? std::map<std::string, LogicalTierCapacity>{}
                                   : default_pool_->LogicalTierCapacities();
+    // A self-evicting node asks the master to leave it out of its rounds.
+    master_client_->RequestPeerDrivenEviction(self_evicting);
+    // Unless it evicts by its own LRU, its victims follow the master's
+    // recency, which must then hear about the reads served here.
+    master_client_->EnableLocalReadReports(config_.eviction_mode != PeerEvictionMode::kLocal);
     auto status =
         master_client_->RegisterSelf(tier_caps, peer_address, engine_desc_bytes, logical_caps);
     if (!status.ok()) {
@@ -1235,6 +1266,21 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
+    if (self_evicting && !master_client_->PeerDrivenEviction()) {
+      MORI_UMBP_WARN(
+          "[PoolClient] master predates peer-driven eviction: it may also evict this node in its "
+          "rounds, and master_ranked falls back to local LRU");
+    } else if (config_.eviction_mode == PeerEvictionMode::kMasterRanked &&
+               default_pool_ != nullptr) {
+      default_pool_->SetEvictionCandidateSource(
+          [client = master_client_.get()](TierType tier, const std::string& logical_tier,
+                                          uint64_t bytes) {
+            return client->GetEvictionCandidates(tier, logical_tier, bytes, /*max_keys=*/0);
+          });
+    }
+    static constexpr const char* kModeNames[] = {"local", "master_ranked", "master"};
+    MORI_UMBP_INFO("[PoolClient] eviction mode: {}",
+                   kModeNames[static_cast<int>(config_.eviction_mode)]);
     if (config_.master_config.auto_heartbeat) master_client_->StartHeartbeat();
     if (weighted_placement && !master_client_->SupportsMaxAllocatableCapacity()) {
       MORI_UMBP_WARN(
@@ -1309,6 +1355,7 @@ void PoolClient::Shutdown() {
     if (!status.ok()) {
       MORI_UMBP_WARN("[PoolClient] UnregisterSelf failed: {}", status.error_message());
     }
+    if (default_pool_) default_pool_->SetEvictionCandidateSource(nullptr);
   }
   // The masterless counterpart, joined at the same point in teardown and for
   // the same reason: its final tick samples the backends and transfer engine,
@@ -1369,6 +1416,9 @@ bool PoolClient::Clear() {
   if (master_client_) {
     ok = master_client_->ClearFullSync();
     if (!ok) MORI_UMBP_WARN("[PoolClient] Clear full-sync heartbeat failed");
+  } else {
+    // No master holds stale placements, so local clear needs no remote ack.
+    for (auto* backend : registry_.All()) backend->ClearFullSyncAcked();
   }
   return ok;
 }
@@ -1402,6 +1452,10 @@ std::string PoolClient::LogicalTierForBackend(uint32_t backend_id) const {
 
 TierTransitionMetrics PoolClient::TransitionMetrics() const {
   return default_pool_ == nullptr ? TierTransitionMetrics{} : default_pool_->TransitionMetrics();
+}
+
+LocalEvictionMetrics PoolClient::LocalEvictionStats() const {
+  return default_pool_ == nullptr ? LocalEvictionMetrics{} : default_pool_->LocalEvictionStats();
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,15 +1799,19 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
       }
     }
   }
+  const bool report = master_client_ != nullptr && master_client_->ReportsLocalReads();
+  std::vector<std::string> read_keys;
   for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
     if (!found[j].resolved.found) continue;
     auto* backend = registry_.Get(found[j].backend_id);
     if (backend == nullptr) continue;
     (*holders)[candidates[j]] = backend;
+    if (report) read_keys.push_back((*batch)[j]);
     if (resolutions != nullptr) {
       (*resolutions)[candidates[j]] = std::move(found[j].resolved);
     }
   }
+  if (report) master_client_->NoteLocalReads(read_keys);
 }
 
 // ---------------------------------------------------------------------------
@@ -3500,19 +3558,18 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // key and one bad key does not fail the batch.  This is why the local half
   // needs no per-key threading the way whole-object BatchGet does: the copies
   // are already batched into a single plan set.
-  std::vector<TransferItem> local_items;
+  // Preserve the batch vector's original reservation for buffered engines.
+  // HBM builds plans directly and does not need this hint.
+  size_t range_total = 0;
+  for (const auto& per_key : sizes) range_total += per_key.size();
+  auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
+  // Buffer one object until its complete page walk succeeds. This preserves
+  // the existing rollback: a bad object cannot leak partial work into a plan.
+  std::vector<TransferItem> key_items;
+  size_t local_item_count = 0;
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
-  // A TransferItem carries two TransferRefs, each with a MemoryDesc, so growing
-  // this vector by doubling relocates a lot of bytes.  One range is at least one
-  // item -- more only when it straddles a page -- so the range count is a tight
-  // lower bound and covers the common case exactly.
-  {
-    size_t range_total = 0;
-    for (const auto& per_key : sizes) range_total += per_key.size();
-    local_items.reserve(range_total);
-  }
   std::vector<ObjectRange> key_ranges;
 
   // A key that asked for no ranges is never resolved -- there is nothing to
@@ -3558,7 +3615,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                       keys[i], resolved.size);
       continue;  // a caller bug, not a miss — do not go looking for a replica
     }
-    const size_t before = local_items.size();
+    key_items.clear();
     bool built = false;
     {
       PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
@@ -3567,34 +3624,46 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
       built =
           resolved.file_ref.IsFile()
-              ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &local_items)
+              ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items)
               : BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
                                          key_ranges, /*to_backend=*/false,
-                                         /*tag=*/i, &local_items, dbg ? &dbg->classify : nullptr);
+                                         /*tag=*/i, &key_items, dbg ? &dbg->classify : nullptr);
     }
     if (!built) {
       // The medium holds the key but cannot be read in-process.  Same call as
       // Same disposition the local get path takes on a size mismatch: look
       // reporting a miss the caller cannot distinguish from absence.
-      local_items.resize(before);
+      key_items.clear();
       missed.push_back(i);
       continue;
     }
+    {
+      PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
+      PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
+      for (const auto& item : key_items) plan_builder->Add(item);
+    }
+    local_item_count += key_items.size();
     local_keys.push_back(i);
   }
   if (dbg != nullptr) {
     // Classification is timed inside the build window, so subtract it out to
     // keep the phases disjoint and `other` meaningful.
     dbg->build -= dbg->classify;
-    dbg->items += local_items.size();
+    dbg->items += local_item_count;
   }
-  if (!local_items.empty()) {
+  if (local_item_count != 0) {
     std::vector<size_t> failed_tags;
     {
       PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
       TransferEngine::StepTiming steps;
       if (dbg != nullptr) steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
-      transfer_engine_->Transfer(local_items, &failed_tags, dbg != nullptr ? &steps : nullptr);
+      TransferPlanSet planned;
+      {
+        PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
+        planned = plan_builder->Finish();
+      }
+      transfer_engine_->Transfer(std::move(planned), &failed_tags,
+                                 dbg != nullptr ? &steps : nullptr);
     }
     const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
     for (size_t i : local_keys) {
@@ -5111,6 +5180,18 @@ void PoolClient::PublishComponentMetrics() {
       sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,
              {{"tier", tier}}, hits);
     }
+
+    const LocalEvictionMetrics local = default_pool_->LocalEvictionStats();
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "round"}}, local.rounds);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "key"}}, local.keys);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "no_candidate"}}, local.no_candidate);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "stalled"}}, local.stalled);
+    sample(MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT, MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP,
+           {{"event", "master_key"}}, local.master_keys);
     metric_publisher_.Publish("pool", {}, samples, sink);
   }
 
@@ -5295,16 +5376,6 @@ ActivitySnapshot PoolClient::CollectActivitySnapshot() const {
         if (op == "commit") tier.offload_bytes += sample.value;
         if (op == "resolve") tier.load_bytes += sample.value;
         if (op == "evict") tier.evict_bytes += sample.value;
-      } else if (std::strcmp(sample.name, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL) == 0 &&
-                 label("event") == kPageBackendLocalEvictEvent) {
-        // Added to op="evict" rather than reported separately: to the operator
-        // asking "is this tier reclaiming", who initiated the reclaim is
-        // detail.  The two are disjoint -- a local round never makes the
-        // interface call -- so this adds, it does not double-count.
-        tier.evict_keys += sample.value;
-      } else if (std::strcmp(sample.name, MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL) == 0 &&
-                 label("event") == kPageBackendLocalEvictEvent) {
-        tier.evict_bytes += sample.value;
       }
     }
 

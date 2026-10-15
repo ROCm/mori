@@ -195,3 +195,22 @@ def test_batch_get_with_ssd_enabled(tmp_path):
     assert mem_pool.read_page_k(0)[0] == ord("M")
     assert mem_pool.read_page_v(0)[0] == ord("N")
     assert client.clear()
+
+
+@pytest.mark.parametrize("ssd_enabled", [False, True])
+def test_no_master_clear_allows_new_ranged_put_and_restore(tmp_path, ssd_enabled):
+    """A successful local clear must reopen every backend for fresh writes."""
+    client = _make_client(ssd_dir=tmp_path / "reset-ssd" if ssd_enabled else None)
+    key = "reset-range"
+    for cycle in range(3):
+        data = (ctypes.c_ubyte * 256)(*([cycle + 1] * 256))
+        out = (ctypes.c_ubyte * 256)()
+        assert client.batch_put_ranges_from_ptr(
+            [key], [256], [[ctypes.addressof(data)]], [[256]], [[0]]
+        ) == [True]
+        assert client.batch_get_ranges_into_ptr(
+            [key], [[ctypes.addressof(out)]], [[256]], [[0]]
+        ) == [True]
+        assert bytes(out) == bytes(data)
+        assert client.clear()
+        assert not client.exists(key)
