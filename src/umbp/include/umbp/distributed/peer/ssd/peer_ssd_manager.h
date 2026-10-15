@@ -114,6 +114,13 @@ class PeerSsdManager {
                                const std::vector<const void*>& srcs,
                                const std::vector<size_t>& sizes);
 
+  // Write-in-place for a local file engine: reserve room, fill
+  // `location`, then CommitReserved records the key (ADD event) or
+  // AbortReserved drops it.  nullopt when the tier cannot (no file, no room).
+  std::optional<RecordReservation> Reserve(const std::string& key, uint64_t size);
+  bool CommitReserved(const std::string& key, const RecordReservation& r);
+  void AbortReserved(const std::string& key, const RecordReservation& r);
+
   // Frees one key; false if it is being read or pinned (inflight_reads_ > 0).
   // Marks the key in evicting_ under the lock, evicts outside it, and only on
   // success removes owned_/lru_ and queues a REMOVE (never while the bytes
@@ -219,6 +226,10 @@ class PeerSsdManager {
   // Splice |key| to the MRU (front) of the recency list.  Caller holds mutex_
   // and must have already inserted the key into owned_.
   void TouchLocked(const std::string& key);
+
+  // A write of `key` landed: own it (ADD event), or just touch it if a
+  // concurrent writer already did.  Caller holds mutex_.
+  void RecordWrittenLocked(const std::string& key, uint64_t size);
 
   // Build the full ADD list for every owned SSD key.  Caller MUST hold mutex_.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;

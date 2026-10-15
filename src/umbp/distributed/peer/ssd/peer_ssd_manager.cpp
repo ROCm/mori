@@ -285,15 +285,7 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
       if (!ok[j]) continue;
       results[i] = true;
       written_bytes += sizes[i];
-      if (owned_.find(keys[i]) != owned_.end()) {
-        TouchLocked(keys[i]);
-      } else {
-        lru_.push_front(keys[i]);
-        owned_.emplace(keys[i], OwnedEntry{sizes[i], lru_.begin()});
-        if (event_publishing_) {
-          pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, keys[i], TierType::SSD, sizes[i]});
-        }
-      }
+      RecordWrittenLocked(keys[i], sizes[i]);
     }
   }
   metrics_.copy_bytes.fetch_add(written_bytes, std::memory_order_relaxed);
@@ -317,6 +309,37 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
         ssdperf::Pct(backend_ms, total_ms), record_ms, used, total);
   }
   return results;
+}
+
+void PeerSsdManager::RecordWrittenLocked(const std::string& key, uint64_t size) {
+  if (owned_.find(key) != owned_.end()) {
+    TouchLocked(key);
+    return;
+  }
+  lru_.push_front(key);
+  owned_.emplace(key, OwnedEntry{size, lru_.begin()});
+  if (event_publishing_) {
+    pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, size});
+  }
+}
+
+std::optional<RecordReservation> PeerSsdManager::Reserve(const std::string& key, uint64_t size) {
+  if (!backend_ || size == 0) return std::nullopt;
+  return backend_->ReserveRecord(key, static_cast<size_t>(size));
+}
+
+bool PeerSsdManager::CommitReserved(const std::string& key, const RecordReservation& r) {
+  if (!backend_ || !backend_->CommitRecord(key, r)) return false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordWrittenLocked(key, r.location.value_size);
+  }
+  metrics_.copy_bytes.fetch_add(r.location.value_size, std::memory_order_relaxed);
+  return true;
+}
+
+void PeerSsdManager::AbortReserved(const std::string& key, const RecordReservation& r) {
+  if (backend_) backend_->AbortRecord(key, r);
 }
 
 // ---------------------------------------------------------------------------

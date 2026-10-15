@@ -98,7 +98,11 @@ void Index::RollbackWrite(const WriteReservation& reservation) {
       if (seg->second.live_bytes >= reservation.meta.disk_bytes) {
         seg->second.live_bytes -= reservation.meta.disk_bytes;
       }
-      seg->second.write_offset = reservation.previous_write_offset;
+      // Only the newest record can hand its room back; rewinding under a later
+      // reservation would let the next write overwrite it.
+      if (seg->second.write_offset == reservation.record_offset + reservation.meta.disk_bytes) {
+        seg->second.write_offset = reservation.previous_write_offset;
+      }
     }
     if (used_ >= reservation.meta.disk_bytes) used_ -= reservation.meta.disk_bytes;
     key_meta_.erase(it);

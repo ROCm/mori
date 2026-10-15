@@ -310,6 +310,48 @@ std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& ke
   return shards_[shard]->LocateRecord(key);
 }
 
+std::optional<RecordReservation> ShardedSsdTier::ReserveRecord(const std::string& key,
+                                                               size_t size) {
+  int shard;
+  {
+    std::unique_lock<std::shared_mutex> lock(map_mu_);
+    shard = LookupLocked(key);
+    if (shard < 0) {
+      shard = PickShardLocked(size);
+      if (shard < 0) return std::nullopt;
+      key_shard_[key] = KeyLoc{static_cast<uint32_t>(shard), size};
+      ReserveLocked(shard, size);
+    }
+  }
+  auto r = shards_[shard]->ReserveRecord(key, size);
+  if (!r) ForgetIfGone(key, shard);
+  return r;
+}
+
+bool ShardedSsdTier::CommitRecord(const std::string& key, const RecordReservation& r) {
+  const int shard = ShardOf(key);
+  if (shard < 0) return false;
+  if (shards_[shard]->CommitRecord(key, r)) return true;
+  ForgetIfGone(key, shard);
+  return false;
+}
+
+void ShardedSsdTier::AbortRecord(const std::string& key, const RecordReservation& r) {
+  const int shard = ShardOf(key);
+  if (shard < 0) return;
+  shards_[shard]->AbortRecord(key, r);
+  ForgetIfGone(key, shard);
+}
+
+void ShardedSsdTier::ForgetIfGone(const std::string& key, int shard) {
+  if (shards_[shard]->Exists(key)) return;
+  std::unique_lock<std::shared_mutex> lock(map_mu_);
+  auto it = key_shard_.find(key);
+  if (it == key_shard_.end() || static_cast<int>(it->second.shard) != shard) return;
+  ReleaseLocked(shard, it->second.size);
+  key_shard_.erase(it);
+}
+
 bool ShardedSsdTier::Flush() {
   bool ok = true;
   for (auto& s : shards_) ok = s->Flush() && ok;

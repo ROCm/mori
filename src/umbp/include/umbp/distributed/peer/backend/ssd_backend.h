@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -40,63 +41,13 @@
 
 namespace mori::umbp {
 
-// SSD as a MediumBackend, staged through registered host DRAM.
-//
-// WHY STAGED, AND NOT A FileRef.  transfer_engine.h reserves a file endpoint
-// for exactly this backend ("SsdBackend is what needs a FileRef, so SsdBackend
-// brings it").  This implementation deliberately does NOT take that option, and
-// the reason is worth stating because it is the whole design:
-//
-//   SSD bytes are not addressable.  Every endpoint UMBP moves bytes between is
-//   a memory range — a raw pointer locally, an RDMA MR remotely.  A file offset
-//   is neither.  Two ways to close that gap:
-//
-//     (a) teach the transfer layer a file endpoint — a new TransferRef kind, a
-//         PosixFileEngine, and CHAINING in CompositeTransferEngine for the
-//         remote reader (file -> bounce -> wire), which that class explicitly
-//         does not implement today;
-//     (b) make the SSD's published endpoint ordinary registered host memory,
-//         and move bytes between it and the device inside the backend.
-//
-//   (b) is what this class does.  The cost is a host-DRAM copy on each side;
-//   the benefit is that SSD reaches the data plane with ZERO new transfer-layer
-//   concepts — no new endpoint kind, no new engine, no chaining — and a remote
-//   peer reading from this node's SSD sees a perfectly ordinary registered
-//   buffer and needs no code at all.  A FileRef backend remains the right
-//   answer for a zero-copy / GDS path; it is a strictly larger change and this
-//   one does not block it.
-//
-// SO: THE STAGING ARENA IS THE MEDIUM, as far as everything outside this class
-// is concerned.  The pages this backend publishes are host DRAM.  What makes it
-// SSD is where the bytes live BETWEEN a Commit and the next Resolve, which is
-// the only window in which a cache tier's capacity actually means anything.
-//
-// LIFECYCLE OF A PUT
-//   1. BatchAllocate(key, size) reserves a staging page and publishes it.
-//   2. The writer RDMAs (or memcpys) into that page — normal data plane, no
-//      SSD awareness anywhere.
-//   3. BatchCommit spills the staging page to the SSD via PeerSsdManager::Write,
-//      frees the page, and queues an ADD event.  The staging page is NOT the
-//      key's home; it is borrowed for the duration of the write.
-//
-// LIFECYCLE OF A GET
-//   1. BatchResolve fills a staging page from the SSD (PeerSsdManager::
-//      PrepareRead) and publishes that page under a READ LEASE.
-//   2. The reader moves bytes out of it, exactly as it would from DRAM.
-//   3. The reaper frees the staging page when the lease expires.
-//
-//   This is the one place SSD's asymmetry with DRAM shows through the
-//   interface: a Resolve does real IO and can fail, and it consumes a scarce
-//   resource (staging pages) that a DRAM resolve does not.  A transient
-//   shortfall is reported as kBusy, after rolling back every reservation made
-//   by that backend batch.  PoolClient retries the whole response so no page
-//   location survives across attempts.  A batch whose own working set exceeds
-//   the arena is kFailed instead: unchanged retries can never make it fit.
-//
-// A key may span several staging pages.  Runs are contiguous inside the one
-// registered arena because PeerSsdManager::PrepareRead takes one (ptr,
-// capacity), while AllocateResult / ResolvedEntry publish every page so the
-// ordinary transfer path can address the object at page granularity.
+// SSD as a MediumBackend.  Bytes reach the drive one of two ways:
+//   * in place, through a File TransferRef that a local file engine moves
+//     (PosixEngine for tier migrations, GdsEngine for reads into the GPU);
+//   * through the staging arena, registered host DRAM a remote peer can RDMA:
+//     Allocate lends pages and Commit writes them out; Resolve fills pages under
+//     a read lease, kBusy while the arena is full, kFailed if a batch can never
+//     fit.  A key's pages are one contiguous run of the arena.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -164,7 +115,8 @@ class SsdBackend : public MediumBackend {
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
                                           bool allow_file_refs = false,
                                           ResolveReader reader = ResolveReader::kRemote) override;
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   void ReleaseResolved(const std::vector<std::string>& keys,
                        const std::vector<uint64_t>& lease_tokens) override;
@@ -197,13 +149,15 @@ class SsdBackend : public MediumBackend {
     uint32_t page_count = 0;
   };
 
-  // A contiguous staging span borrowed for a write (pending slot) or read.
+  // A write in flight: a staging span, or a reserved file range (`record`)
+  // that a local file engine fills directly.
   struct PendingSlot {
     uint64_t slot_id = 0;
     std::string key;
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point deadline;
+    std::optional<RecordReservation> record;
   };
 
   // A staged read.  The span is never reclaimed while a kLocal holder has not

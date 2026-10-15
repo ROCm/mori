@@ -78,8 +78,9 @@ class InstrumentedBackend final : public MediumBackend {
   TierCapacity Capacity() const override { return inner_->Capacity(); }
   uint64_t OwnedKeyCount() const override { return inner_->OwnedKeyCount(); }
   bool Contains(const std::string& key) const override { return inner_->Contains(key); }
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override {
-    return inner_->AcquireMigrationRead(key, resolved);
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override {
+    return inner_->AcquireMigrationRead(key, resolved, allow_file_ref);
   }
   void ReleaseMigrationRead(const std::string& key) override { inner_->ReleaseMigrationRead(key); }
   void ReleaseResolved(const std::vector<std::string>& keys,

@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -91,6 +92,12 @@ class SSDTier : public TierBackend {
   const IoStatus& LastIoStatus() const { return last_io_status_; }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
   std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+
+  // The uncommitted prefix goes down at reserve, so the log stays parseable and
+  // the scanner skips the record until CommitRecord flips its flag.
+  std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
+  bool CommitRecord(const std::string& key, const RecordReservation& r) override;
+  void AbortRecord(const std::string& key, const RecordReservation& r) override;
   // Enables O_DIRECT for segments opened from here on.  Takes effect for
   // segments opened after the call; existing fds keep their current mode, so
   // the intended use is at construction (ssd.direct_io) rather than mid-run.
@@ -130,6 +137,7 @@ class SSDTier : public TierBackend {
   // Issue one value read, transparently bouncing through an aligned buffer when
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
+  IoStatus WritePrepared(int fd, const segment::PreparedRecord& pr, bool sync) const;
   bool ShouldVerifyCrc(bool crc_valid) const { return ssd_config_.verify_crc && crc_valid; }
   int TierThreads() const;
 
@@ -146,6 +154,13 @@ class SSDTier : public TierBackend {
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;
   mutable IoStatus last_io_status_;
+
+  // Reserved records awaiting commit, by RecordReservation::token.  Guarded by mu_.
+  struct PendingRecord {
+    segment::PreparedRecord prefix;
+    int fd = -1;
+  };
+  std::unordered_map<uint64_t, PendingRecord> pending_records_;
 };
 
 }  // namespace mori::umbp

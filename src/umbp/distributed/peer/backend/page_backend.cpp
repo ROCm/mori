@@ -591,7 +591,8 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   return out;
 }
 
-bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                                       bool /*allow_file_ref*/) {
   if (resolved == nullptr) return false;
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto owned = owned_.find(key);

@@ -262,7 +262,8 @@ class PageBackend : public MediumBackend {
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
                                           bool allow_file_refs = false,
                                           ResolveReader reader = ResolveReader::kRemote) override;
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   void ReleaseResolved(const std::vector<std::string>& keys,
                        const std::vector<uint64_t>& lease_tokens) override;
