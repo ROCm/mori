@@ -28,7 +28,9 @@
 // needs a real fabric); what is unit-testable here is everything that decides
 // WHICH engine runs and WHAT it is asked to run.
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstring>
 #include <memory>
@@ -36,9 +38,11 @@
 #include <string>
 #include <vector>
 
+#include "umbp/common/aligned_buffer.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#include "umbp/distributed/transfer/posix_engine.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 
 namespace mori::umbp {
@@ -469,6 +473,56 @@ TEST(CompositeTransferEngine, RegisterFileIsInvalidWithoutAFileEngine) {
   TransferRef ref = composite->RegisterFile(/*fd=*/3, /*offset=*/0, /*size=*/4096);
   EXPECT_FALSE(ref.IsFile());
   EXPECT_FALSE(ref.Valid());
+}
+
+// Scattered pages with an unaligned tail go to a file range and back, direct
+// where the filesystem allows it; the tail's on-disk padding is zeroed.
+TEST(PosixEngine, RoundTripsScatteredPagesThroughAFile) {
+  constexpr size_t kPage = 4096;
+  constexpr size_t kValue = 2 * kPage + 100;
+  const std::string path = ::testing::TempDir() + "/umbp_posix_engine.bin";
+  for (int flags : {O_DIRECT, 0}) {
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | flags, 0644);
+    if (fd < 0) continue;  // no O_DIRECT here
+    CompositeTransferEngine composite;
+    composite.AddEngine(std::make_unique<LocalCopyEngine>());
+    composite.AddEngine(std::make_unique<PosixEngine>());
+
+    AlignedBuffer dram(4 * kPage);
+    for (size_t i = 0; i < dram.size(); ++i) dram.data()[i] = static_cast<char>(i * 7 + 1);
+    const TransferRef mem = TransferRef::HostBytes(dram.data(), dram.size());
+    const TransferRef file = TransferRef::File(fd, kPage, 3 * kPage);
+    EXPECT_STREQ("PosixEngine", composite.SelectEngine(mem, file)->Name());
+    EXPECT_STREQ("PosixEngine", composite.SelectEngine(file, mem)->Name());
+
+    // The value lives in pages {2, 0, 3}; it reads back into pages {1, 3, 0}.
+    const size_t from[] = {2, 0, 3};
+    const size_t to[] = {1, 3, 0};
+    std::vector<TransferItem> put, get;
+    for (size_t i = 0; i < 3; ++i) {
+      const size_t n = std::min(kPage, kValue - i * kPage);
+      put.push_back(MakeItem(mem, from[i] * kPage, file, i * kPage, n, i));
+      get.push_back(MakeItem(file, i * kPage, mem, to[i] * kPage, n, i));
+    }
+    std::vector<char> want(kValue);
+    for (size_t i = 0; i < 3; ++i) {
+      std::memcpy(want.data() + i * kPage, dram.data() + from[i] * kPage,
+                  std::min(kPage, kValue - i * kPage));
+    }
+    ASSERT_TRUE(composite.Transfer(put, nullptr));
+    std::memset(dram.data(), 0, dram.size());
+    ASSERT_TRUE(composite.Transfer(get, nullptr));
+    for (size_t i = 0; i < 3; ++i) {
+      const size_t n = std::min(kPage, kValue - i * kPage);
+      EXPECT_EQ(0, std::memcmp(want.data() + i * kPage, dram.data() + to[i] * kPage, n));
+    }
+
+    AlignedBuffer tail(kPage);
+    ASSERT_EQ(static_cast<ssize_t>(kPage), ::pread(fd, tail.data(), kPage, 3 * kPage));
+    EXPECT_EQ(std::string(kPage - 100, '\0'), std::string(tail.data() + 100, kPage - 100));
+    ::close(fd);
+  }
+  ::unlink(path.c_str());
 }
 
 TEST(CompositeTransferEngine, SelectsTheFileEngineForAFileToGpuPair) {

@@ -64,6 +64,7 @@
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
+#include "umbp/distributed/transfer/posix_engine.h"
 #ifdef UMBP_ENABLE_GDS
 #include "umbp/distributed/transfer/gds_engine.h"
 #endif
@@ -684,9 +685,8 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
   return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
 }
 
-// A file ref can only be READ into device memory: GdsEngine claims the
-// (file, GPU) pair and no engine claims (file, host).  Callers use this to
-// decide whether asking a medium for a file ref is even useful.
+// A client read asks for a file ref only for device memory, which GdsEngine
+// reads in place; (file, host) is PosixEngine's, used by tier migrations.
 bool DestinationIsDevice(void* ptr, uint64_t size) {
   return ClassifiedUserBytes(ptr, size).loc == mori::io::MemoryLocationType::GPU;
 }
@@ -997,6 +997,8 @@ bool PoolClient::Init() {
   // call: everything that moves bytes still goes through transfer_engine_.
   hbm_engine_ = hbm.get();
   composite->AddEngine(std::move(hbm));
+  // (file, host memory): SSD migrations to and from DRAM pages, no staging.
+  composite->AddEngine(std::make_unique<PosixEngine>());
 #ifdef UMBP_ENABLE_GDS
   // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
   // device) pairs, which no memory engine touches, so registration order is

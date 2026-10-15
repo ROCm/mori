@@ -392,6 +392,7 @@ add_library(
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp
   distributed/transfer/hbm_copy_engine.cpp
+  distributed/transfer/posix_engine.cpp
   distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/peer/ssd/ssd_copy_pipeline.cpp
