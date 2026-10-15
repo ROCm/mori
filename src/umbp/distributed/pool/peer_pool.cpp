@@ -398,8 +398,9 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
       } else {
         // A second writer must retry until the reservation commits, aborts, or
         // reaches the same TTL as the backend slot. ALREADY_EXISTS would expose
-        // uncommitted bytes.
+        // uncommitted bytes; in_flight lets a local put count it as stored.
         out[i].allocation.outcome = AllocateOutcome::kFailed;
+        out[i].in_flight = true;
         continue;
       }
     }
