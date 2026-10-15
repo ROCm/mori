@@ -1358,10 +1358,29 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         def run(*, input, num_tokens, dest_map, **kwargs):
             phase = "dispatch" if groups[0].startswith("dispatch") else "combine"
             if phase == "dispatch":
-                weights, indices = kwargs.get("weights"), kwargs.get("indices")
+                if groups[0] == "dispatch_recv":
+                    # dispatch_recv() launches this half with only input/dest_map/
+                    # num_tokens, but its copy pass gates the weight unpack on
+                    # weightsBuf: reuse what the send half was handed, or the recv
+                    # weights view is never written.
+                    weights = getattr(self, "_asyncll_weights", None)
+                    indices = getattr(self, "_asyncll_indices", None)
+                else:
+                    weights, indices = kwargs.get("weights"), kwargs.get("indices")
+                    self._asyncll_weights = weights
                 self._asyncll_has_weights = weights is not None
                 self._asyncll_indices = indices
                 weights_ptr = 0 if weights is None else weights.data_ptr()
+                if (
+                    weights_ptr == 0
+                    and weights is not None
+                    and "dispatch_recv" in groups
+                ):
+                    # A rank with no tokens of its own (empty weights, null data_ptr)
+                    # still receives its peers' tokens, and the recv copy pass only
+                    # uses weightsBuf as the gate for unpacking their weights. Keep
+                    # it non-null; the send half reads nothing with 0 tokens.
+                    weights_ptr = self.recv_weights().data_ptr()
             else:
                 # AsyncLL does not fold weights on combine, and says so rather
                 # than returning a zero tensor that looks like an answer.
