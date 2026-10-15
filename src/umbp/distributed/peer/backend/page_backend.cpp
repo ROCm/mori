@@ -374,8 +374,13 @@ AllocateResult PageBackend::Allocate(const std::string& key, uint64_t size) {
 AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size,
                                            int preferred_numa_node) {
   auto fail = [&](AllocateOutcome outcome, const char* reason) {
-    MORI_UMBP_WARN("[PageBackend] Allocate reason={} key='{}' size={} tier={}", reason, key, size,
-                   static_cast<int>(tier_));
+    // A full tier fails every put and promotion; log a sample, not each key,
+    // since this runs under the exclusive lock.
+    const uint64_t n = ++alloc_failures_;
+    if (n <= 16 || n % 10000 == 0) {
+      MORI_UMBP_WARN("[PageBackend] Allocate reason={} key='{}' size={} tier={} [{} failed so far]",
+                     reason, key, size, static_cast<int>(tier_), n);
+    }
     AllocateResult r;
     r.outcome = outcome;
     return r;
