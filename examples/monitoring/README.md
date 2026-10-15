@@ -1,9 +1,22 @@
 # UMBP monitoring
 
-A Prometheus scrape fragment and the Grafana dashboards for a UMBP deployment.
+Prometheus scrape fragments and the Grafana dashboards for a UMBP deployment.
 Point Grafana at `grafana/dashboards/` and Prometheus at
 `umbp_master.scrape.yml`; `example/docker-compose.yml` is a working stack that
 does both.
+
+Which fragment you want depends on where the metrics come out:
+
+| Deployment | Fragment | Port |
+| --- | --- | --- |
+| With a master | `umbp_master.scrape.yml` | `9091` |
+| Masterless (standalone server) | `umbp_standalone.scrape.yml` | `9092` |
+
+A masterless node has no master to report to, so the standalone server serves
+its own `/metrics` (see `UMBP_STANDALONE_METRICS_PORT`) and stamps the `node`
+label the master used to add on ingest. **The dashboards below are the same
+either way** — they are written against the series, not against the deployment
+that published them.
 
 ## The dashboards
 
