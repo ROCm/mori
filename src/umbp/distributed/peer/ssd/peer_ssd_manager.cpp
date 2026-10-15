@@ -454,11 +454,8 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     // Reject over-capacity before touching the device (no in-flight mark, no IO).
     if (size > staging_cap) {
       metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
-      // staging_cap = per-slot cap (ssd_staging_buffer_size / ssd_staging_buffer_slots).
-      MORI_UMBP_WARN(
-          "[PeerSsdManager] remote SSD read key={} size={}B exceeds per-slot staging cap {}B; "
-          "raise ssd_staging_buffer_size or lower ssd_staging_buffer_slots",
-          key, size, staging_cap);
+      MORI_UMBP_WARN("[PeerSsdManager] SSD read key={} size={}B exceeds its {}B buffer", key, size,
+                     staging_cap);
       return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
     }
     // Same leader/follower protocol as PrepareReadBatch, over the same map, so
@@ -602,10 +599,8 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
       const size_t size = it->second.size;
       if (size > caps[i]) {
         metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
-        MORI_UMBP_WARN(
-            "[PeerSsdManager] SSD read key={} size={}B exceeds per-slot staging cap {}B; "
-            "raise ssd_staging_buffer_size or lower ssd_staging_buffer_slots",
-            keys[i], size, caps[i]);
+        MORI_UMBP_WARN("[PeerSsdManager] SSD read key={} size={}B exceeds its {}B buffer", keys[i],
+                       size, caps[i]);
         out[i] = SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
         continue;
       }

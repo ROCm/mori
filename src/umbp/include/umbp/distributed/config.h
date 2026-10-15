@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -226,12 +227,23 @@ struct BackendInstanceConfig {
   DramOwnershipConfig dram;
   HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
-  int ssd_staging_buffer_slots = 16;
+  // SSD staging arena in pages; 0 = the preset (SsdStagingPages).
+  int ssd_staging_buffer_slots = 0;
   // Relative admission share within this tier when WEIGHTED placement is
   // enabled. Must be positive; legacy and SINGLE_BACKEND paths ignore it.
   // Appended to preserve existing positional aggregate initializers.
   uint32_t placement_weight = 1;
 };
+
+// Staging pages for an SSD backend: `slots` when set, else 4 GiB capped at the
+// tier.  Only reads and remote writes stage, and a local read that does not fit
+// waits for a later round, so no workload has to size it.
+inline uint32_t SsdStagingPages(int slots, uint64_t ssd_capacity, uint64_t page_size) {
+  if (slots > 0) return static_cast<uint32_t>(slots);
+  uint64_t bytes = 4ULL << 30;
+  if (ssd_capacity > 0) bytes = std::min(bytes, ssd_capacity);
+  return static_cast<uint32_t>(std::max<uint64_t>(bytes / std::max<uint64_t>(page_size, 1), 1));
+}
 
 enum class PeerEvictionMode {
   kLocal,         // at its own watermarks, by its own LRU; never asks the master
@@ -260,15 +272,9 @@ struct PoolClientConfig {
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
 
-  // SSD read-staging tuning. More slots increase concurrent reads and writes;
-  // each policy-created SsdBackend owns `slots * page_size` staging bytes. Its
+  // SSD staging pages per SsdBackend; 0 = the preset (SsdStagingPages).  Its
   // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
-  int ssd_staging_buffer_slots = 16;
-
-  // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
-  // read fits one whole key value in a slot, so this / ssd_staging_buffer_slots
-  // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
-  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+  int ssd_staging_buffer_slots = 0;
 
   // Back the SSD staging arena with hugetlbfs pages. Every SSD backend this
   // client registers uses the same node-wide setting. Falls back to 4 KiB
@@ -378,7 +384,6 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.staging_buffer_size = dc.staging_buffer_size;
   // The ranged scratch buffers/sizes are set by DistributedClient after it
   // allocates and registers the two arenas (see DistributedClient ctor).
-  pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
   pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
