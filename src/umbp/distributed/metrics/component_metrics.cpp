@@ -74,10 +74,19 @@ void MetricPublisher::Publish(const std::string& source_id, const MetricLabels& 
       continue;
     }
 
-    uint64_t& last = last_[BaselineKey(source_id, s.name, source_labels, s.labels)];
-    if (s.value > last && sink.counter) {
+    // A counter seen for the first time is shipped even at zero.  Prometheus
+    // computes rate() and increase() from a series' own samples, so a series
+    // whose first sample already holds its first burst has no baseline to
+    // difference against and that burst never shows up.  For a steady counter
+    // that loses one tick; for a rare one -- an eviction round, a no_space, a
+    // failed transfer -- it is the whole event.  Creating the series at 0
+    // before anything happens is what makes the first occurrence visible.
+    auto [it, first_sight] =
+        last_.try_emplace(BaselineKey(source_id, s.name, source_labels, s.labels), 0);
+    uint64_t& last = it->second;
+    if ((first_sight || s.value > last) && sink.counter) {
       sink.counter(s.name, s.help, MergeLabels(source_labels, s.labels),
-                   static_cast<double>(s.value - last) * s.scale);
+                   s.value > last ? static_cast<double>(s.value - last) * s.scale : 0.0);
     }
     // Updated even on a zero or negative delta so the next tick stays correct
     // against a counter that was rebuilt underneath us.
