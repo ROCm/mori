@@ -87,7 +87,7 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   // is unregistered are grouped separately and assigned bounce offsets; a
   // bounce group is chunked to fit the pool, and an item larger than the whole
   // pool is rejected.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
 
