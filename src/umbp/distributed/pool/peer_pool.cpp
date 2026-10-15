@@ -400,6 +400,7 @@ void PeerPool::TransitionWorkerLoop() {
           evict_retry =
               job.evict && !result.success && result.retryable &&
               std::chrono::steady_clock::now() - job.first_attempt < evict_demotion_retry_budget_;
+          if (evict_retry) ++transition_metrics_.retried;
           if (job.evict && !result.success && !evict_retry) DropEvictedCopyLocked(job);
           const bool still_pressured =
               watermark_driven && tier_graph_->AtOrAbove(job.source_tier, tier.low_watermark);
