@@ -880,6 +880,7 @@ TEST(PeerPool, AFailedDemotionIsRetriedUntilItsBudgetRunsOut) {
   EXPECT_TRUE(registry.Get("cold")->Contains("a")) << "dropped, not demoted";
   EXPECT_EQ(pool.TransitionMetrics().dropped, 0u);
   EXPECT_GE(pool.TransitionMetrics().failed, 2u) << "the failed attempts still count";
+  EXPECT_GE(pool.TransitionMetrics().retried, 2u);
 
   pool.SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds{50});
   engine.FailNext(1000000);  // every copy fails
