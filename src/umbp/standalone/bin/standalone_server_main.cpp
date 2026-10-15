@@ -206,8 +206,8 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                    error)) {
     return false;
   }
-  if (dist.ssd_staging_buffer_slots <= 0) {
-    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
+  if (dist.ssd_staging_buffer_slots < 0) {
+    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be >= 0 (0 sizes it from the tier)";
     return false;
   }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,

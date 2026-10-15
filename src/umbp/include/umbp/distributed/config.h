@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -227,12 +228,23 @@ struct BackendInstanceConfig {
   DramOwnershipConfig dram;
   HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
-  int ssd_staging_buffer_slots = 16;
+  // SSD staging arena in pages; 0 sizes it from the tier (SsdStagingPages).
+  int ssd_staging_buffer_slots = 0;
   // Relative admission share within this tier when WEIGHTED placement is
   // enabled. Must be positive; legacy and SINGLE_BACKEND paths ignore it.
   // Appended to preserve existing positional aggregate initializers.
   uint32_t placement_weight = 1;
 };
+
+// Staging pages for an SSD backend: `slots` when set, otherwise 1/64 of the
+// tier's capacity clamped to [64 MiB, 4 GiB].  The arena bounds read
+// concurrency, not correctness: a local read that does not fit is served in a
+// later round, so no workload has to size it.
+inline uint32_t SsdStagingPages(int slots, uint64_t ssd_capacity, uint64_t page_size) {
+  if (slots > 0) return static_cast<uint32_t>(slots);
+  const uint64_t bytes = std::clamp<uint64_t>(ssd_capacity / 64, 64ULL << 20, 4ULL << 30);
+  return static_cast<uint32_t>(std::max<uint64_t>(bytes / std::max<uint64_t>(page_size, 1), 1));
+}
 
 enum class PeerEvictionMode {
   kLocal,         // at its own watermarks, by its own LRU; never asks the master
@@ -261,10 +273,10 @@ struct PoolClientConfig {
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
 
-  // SSD read-staging tuning. More slots increase concurrent reads and writes;
-  // each policy-created SsdBackend owns `slots * page_size` staging bytes. Its
-  // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
-  int ssd_staging_buffer_slots = 16;
+  // SSD read-staging pages per SsdBackend (`slots * page_size` bytes); 0 sizes
+  // the arena from the tier (SsdStagingPages).  Its read lease is resolved
+  // from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
+  int ssd_staging_buffer_slots = 0;
 
   // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
   // read fits one whole key value in a slot, so this / ssd_staging_buffer_slots

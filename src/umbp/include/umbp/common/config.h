@@ -341,8 +341,9 @@ struct UMBPDistributedConfig {
   // (61-layer MLA page ~= 4.5 MB).
   size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
 
-  // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
-  int ssd_staging_buffer_slots = 16;
+  // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
+  // 0 sizes it from the SSD tier's capacity.
+  int ssd_staging_buffer_slots = 0;
 
   // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
   // backend moves crosses that arena twice (device <-> arena, arena <-> wire),

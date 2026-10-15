@@ -187,7 +187,9 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       // is a permanent resolve failure.
       medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
                     "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
-                    " staging_slots=" + std::to_string(dc.ssd_staging_buffer_slots);
+                    " staging_slots=" +
+                    (dc.ssd_staging_buffer_slots > 0 ? std::to_string(dc.ssd_staging_buffer_slots)
+                                                     : std::string("auto"));
       break;
   }
 
