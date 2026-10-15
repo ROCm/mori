@@ -504,6 +504,22 @@ TEST_F(SsdBackendTest, ArenaFullMidBatchRollsBackRemoteAndDefersLocal) {
   EXPECT_EQ(local[0].size, 2 * kPageSize);
 }
 
+// Reads stop short of the last eighth of the arena, so a write (a demotion)
+// still stages while reads hold the rest.
+TEST_F(SsdBackendTest, ReadsLeaveTheLastEighthToWrites) {
+  SsdBackend* backend = Start(/*staging_pages=*/8);  // readers may hold 7
+  ASSERT_TRUE(Put(backend, "big", Payload(6 * kPageSize, 1)));
+  ASSERT_TRUE(Put(backend, "one", Payload(1024, 2)));
+  ASSERT_TRUE(Put(backend, "two", Payload(1024, 3)));
+
+  ASSERT_TRUE(backend->BatchResolve({"big"}, false, false, ResolveReader::kLocal)[0].found);
+  ASSERT_TRUE(backend->BatchResolve({"one"}, false, false, ResolveReader::kLocal)[0].found);
+  EXPECT_EQ(backend->BatchResolve({"two"}, false, false, ResolveReader::kLocal)[0].outcome,
+            ResolveOutcome::kBusy);
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"write", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
 // A batch over its share of the arena (half) is served up to that share and
 // the rest deferred, not failed.
 TEST_F(SsdBackendTest, BatchLargerThanItsShareIsServedInParts) {

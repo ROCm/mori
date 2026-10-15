@@ -201,6 +201,21 @@ SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count
   return {};
 }
 
+// Writes stage through the same arena, and a demotion that cannot stage is
+// retried and then dropped.  Under a heavy read load readers kept the arena
+// full and starved them, so readers stop short of the last eighth.
+uint32_t SsdBackend::ReadablePages() const {
+  const uint32_t arena = static_cast<uint32_t>(staging_page_used_.size());
+  return arena - arena / 8;
+}
+
+SsdBackend::StagingSpan SsdBackend::AcquireReadSpanLocked(uint32_t page_count) {
+  if (staging_pages_in_use_.load(std::memory_order_relaxed) + page_count > ReadablePages()) {
+    return {};
+  }
+  return AcquireStagingSpanLocked(page_count);
+}
+
 void SsdBackend::ReleaseStagingSpanLocked(StagingSpan span) {
   if (span.page_count == 0 || span.first_page >= staging_page_used_.size()) return;
   const uint32_t end = std::min<uint64_t>(staging_page_used_.size(),
@@ -225,8 +240,7 @@ TierCapacity SsdBackend::Capacity() const {
   TierCapacity cap;
   cap.total_bytes = static_cast<uint64_t>(total);
   cap.available_bytes = total > used ? static_cast<uint64_t>(total - used) : 0;
-  const uint64_t staging_capacity =
-      static_cast<uint64_t>(staging_page_used_.size()) * cfg_.page_size;
+  const uint64_t staging_capacity = static_cast<uint64_t>(ReadablePages()) * cfg_.page_size;
   cap.max_allocatable_bytes = std::min({cap.available_bytes, cap.total_bytes, staging_capacity});
   return cap;
 }
@@ -326,15 +340,14 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
   const auto now = std::chrono::steady_clock::now();
   std::lock_guard<std::mutex> lock(mutex_);
   const uint64_t ssd_capacity = static_cast<uint64_t>(ssd_->Capacity().second);
-  const uint64_t staging_capacity =
-      static_cast<uint64_t>(staging_page_used_.size()) * cfg_.page_size;
+  const uint64_t staging_capacity = static_cast<uint64_t>(ReadablePages()) * cfg_.page_size;
 
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& req = entries[i];
     AllocateResult& out = results[i];
 
     const uint32_t page_count = SizeToPages(req.size, cfg_.page_size);
-    if (page_count == 0 || req.size > ssd_capacity || page_count > staging_page_used_.size()) {
+    if (page_count == 0 || req.size > ssd_capacity || page_count > ReadablePages()) {
       // The object can never fit this backend's staging arena. This is a shape
       // failure, not transient arena pressure, so another identical peer would
       // not do better.
@@ -550,7 +563,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       const uint64_t size = ssd_->SizeOf(keys[i]);
       const uint32_t page_count = SizeToPages(size, cfg_.page_size);
       if (size == 0) continue;
-      if (page_count == 0 || page_count > staging_page_used_.size()) {
+      if (page_count == 0 || page_count > ReadablePages()) {
         results[i].outcome = ResolveOutcome::kFailed;
         MORI_UMBP_ERROR("[SsdBackend] Resolve: key '{}' size {} cannot fit staging arena", keys[i],
                         size);
@@ -594,7 +607,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
 
     spans.reserve(todo.size());
     for (size_t j = 0; j < todo.size(); ++j) {
-      const StagingSpan span = AcquireStagingSpanLocked(page_counts[j]);
+      const StagingSpan span = AcquireReadSpanLocked(page_counts[j]);
       if (span.page_count == 0) {
         const bool served_some =
             j > 0 || std::any_of(results.begin(), results.end(),
@@ -674,7 +687,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
   if (!ssd_->PinForMigration(key)) return false;
   const uint64_t size = ssd_->SizeOf(key);
   const uint32_t page_count = SizeToPages(size, cfg_.page_size);
-  if (page_count == 0 || page_count > staging_page_used_.size()) {
+  if (page_count == 0 || page_count > ReadablePages()) {
     ssd_->UnpinForMigration(key);
     return false;
   }
@@ -686,7 +699,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
       ssd_->UnpinForMigration(key);
       return false;
     }
-    span = AcquireStagingSpanLocked(page_count);
+    span = AcquireReadSpanLocked(page_count);
     if (span.page_count == 0) {
       ssd_->UnpinForMigration(key);
       return false;
