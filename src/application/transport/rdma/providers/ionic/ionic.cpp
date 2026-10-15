@@ -667,6 +667,16 @@ IonicDeviceContext::~IonicDeviceContext() {
     delete it.second;
   }
   cqPool.clear();
+
+  // Parent domains can only be released once no CQ/QP references them.
+  for (int i = 0; i < 2; i++) {
+    if (pd_uxdma[i] == nullptr) continue;
+    int err = ibv_dealloc_pd(pd_uxdma[i]);
+    if (err != 0) {
+      MORI_APP_WARN("ibv_dealloc_pd failed on pd_uxdma[{}]: err:{} ({})", i, err, strerror(err));
+    }
+    pd_uxdma[i] = nullptr;
+  }
 }
 
 RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -724,7 +734,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
-  // cqPool.insert({cq->cqn, cq});
+  // One CQ per endpoint, keyed by its QP's qpn: ionic leaves cqn unset (0 for every CQ).
+  cqPool.insert({qp->qpn, cq});
   qpPool.insert({qp->qpn, qp});
 
   MORI_APP_TRACE(

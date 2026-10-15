@@ -229,8 +229,8 @@ struct IonicDvApi {
     pd_set_rqcmb = (pd_set_rqcmb_t)DvLoadSymbol(handle, "ionic_dv_pd_set_rqcmb");
     pd_set_udma_mask = (pd_set_udma_mask_t)DvLoadSymbol(handle, "ionic_dv_pd_set_udma_mask");
     create_cq_ex = (create_cq_ex_t)DvLoadSymbol(handle, "ionic_dv_create_cq_ex");
-    pd_set_dmabuf_alloc =
-        (pd_set_dmabuf_alloc_t)DvLoadSymbol(handle, "ionic_dv_pd_set_dmabuf_alloc");
+    pd_set_dmabuf_alloc = (pd_set_dmabuf_alloc_t)DvLoadSymbol(
+        handle, "ionic_dv_pd_set_dmabuf_alloc", /*warn_on_miss=*/false);
 
     // create_cq_ex and pd_set_dmabuf_alloc are optional: nullptr means CCQE resp. dmabuf
     // descriptor rings are not supported by this driver version
