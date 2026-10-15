@@ -878,9 +878,8 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
     case TierType::SSD: {
       SsdBackend::Config ssd_cfg;
       ssd_cfg.page_size = page_size;
-      ssd_cfg.staging_pages = config.ssd_staging_buffer_slots > 0
-                                  ? static_cast<uint32_t>(config.ssd_staging_buffer_slots)
-                                  : 16;
+      ssd_cfg.staging_pages = SsdStagingPages(config.ssd_staging_buffer_slots,
+                                              config.ssd.ssd.capacity_bytes, page_size);
       ssd_cfg.staging_use_hugepages = staging_use_hugepages;
       ssd_cfg.staging_hugepage_size = staging_hugepage_size;
       ssd_cfg.ssd = config.ssd;

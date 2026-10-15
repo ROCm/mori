@@ -475,7 +475,10 @@ TEST_F(SsdBackendTest, ResolveReportsBusyWhenStagingIsExhausted) {
   EXPECT_EQ(b[0].outcome, ResolveOutcome::kBusy);
 }
 
-TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
+// The arena fills mid-batch: a remote reader, which retries the whole batch,
+// gets kBusy and keeps nothing; a local reader keeps what it reserved and
+// defers the rest to its next round.
+TEST_F(SsdBackendTest, ArenaFullMidBatchRollsBackRemoteAndDefersLocal) {
   // Six pages, so a call may stage three; the blocker leaves only two free.
   SsdBackend* backend = Start(/*staging_pages=*/6);
   ASSERT_TRUE(Put(backend, "blocker", Payload(4 * kPageSize, 1)));
@@ -491,7 +494,14 @@ TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
   // large-a's two-page reservation was returned when small-b could not fit:
   // both pages not held by blocker are available to one writer.
   auto allocated = backend->BatchAllocate({AllocateRequest{"two-pages", 2 * kPageSize}});
-  EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(backend->BatchAbort({allocated[0].slot_id})[0]);
+
+  auto local = backend->BatchResolve({"large-a", "small-b"}, false, false, ResolveReader::kLocal);
+  ASSERT_EQ(local.size(), 2u);
+  EXPECT_EQ(local[0].outcome, ResolveOutcome::kFound);
+  EXPECT_EQ(local[1].outcome, ResolveOutcome::kDeferred);
+  EXPECT_EQ(local[0].size, 2 * kPageSize);
 }
 
 // A batch over its share of the arena (half) is served up to that share and
@@ -597,8 +607,9 @@ TEST_F(SsdBackendTest, ABusyResolveDropsTheHoldersItTook) {
   auto held = backend->BatchResolve({"small"}, false, false, ResolveReader::kLocal);
   ASSERT_TRUE(held[0].found);
 
-  // "small" is a lease hit; "large" needs both pages and only one is free.
-  auto busy = backend->BatchResolve({"small", "large"}, false, false, ResolveReader::kLocal);
+  // "small" is a lease hit; "large" needs both pages and only one is free.  A
+  // remote reader cannot take part of a batch (a local one would defer).
+  auto busy = backend->BatchResolve({"small", "large"}, false);
   ASSERT_EQ(busy.size(), 2u);
   EXPECT_EQ(busy[1].outcome, ResolveOutcome::kBusy);
 

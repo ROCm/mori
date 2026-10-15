@@ -492,11 +492,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   };
 
   // Phase 1 (ONE lock): serve every key that is already staged, size every
-  // unique remaining key, then reserve ALL required spans atomically.  A
-  // partial resolve is unusable to layer-wise callers and, worse, pins the
-  // successful subset while retries compete for the remainder.  On transient
-  // pressure this call therefore publishes kBusy and keeps none of its new
-  // reservations.
+  // unique remaining key, then reserve the spans.  A local reader that runs
+  // out of arena after serving something keeps that and defers the rest to its
+  // next round.  A remote reader, or one that got nothing, gets kBusy and
+  // keeps none of its new reservations, since it retries the whole batch.
   std::vector<size_t> todo;                        // keys needing a device read
   std::vector<uint32_t> page_counts;               // parallel to todo
   std::vector<StagingSpan> spans;                  // parallel to todo
@@ -564,6 +563,22 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       result_groups.push_back({i});
     }
 
+    // Keys from `first` on wait for the caller's next call.
+    const auto defer_from = [&](size_t first) {
+      size_t deferred = 0;
+      for (size_t j = first; j < todo.size(); ++j) {
+        for (size_t index : result_groups[j]) {
+          results[index].outcome = ResolveOutcome::kDeferred;
+          ++deferred;
+        }
+      }
+      resolve_deferred_keys_.fetch_add(deferred, std::memory_order_relaxed);
+      todo.resize(first);
+      page_counts.resize(first);
+      read_keys.resize(first);
+      result_groups.resize(first);
+    };
+
     // One call stages at most half the arena, leaving room for concurrent
     // readers; the rest of the batch is deferred to the caller's next call.
     // The first key always fits (checked above), so every call progresses.
@@ -575,25 +590,19 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       if (take > 0 && requested_pages + page_counts[take] > call_budget) break;
       requested_pages += page_counts[take];
     }
-    if (take < todo.size()) {
-      size_t deferred = 0;
-      for (size_t j = take; j < todo.size(); ++j) {
-        for (size_t index : result_groups[j]) {
-          results[index].outcome = ResolveOutcome::kDeferred;
-          ++deferred;
-        }
-      }
-      resolve_deferred_keys_.fetch_add(deferred, std::memory_order_relaxed);
-      todo.resize(take);
-      page_counts.resize(take);
-      read_keys.resize(take);
-      result_groups.resize(take);
-    }
+    if (take < todo.size()) defer_from(take);
 
     spans.reserve(todo.size());
     for (size_t j = 0; j < todo.size(); ++j) {
       const StagingSpan span = AcquireStagingSpanLocked(page_counts[j]);
       if (span.page_count == 0) {
+        const bool served_some =
+            j > 0 || std::any_of(results.begin(), results.end(),
+                                 [](const ResolvedEntry& entry) { return entry.found; });
+        if (reader == ResolveReader::kLocal && served_some) {
+          defer_from(j);
+          break;
+        }
         for (const StagingSpan reserved : spans) ReleaseStagingSpanLocked(reserved);
         for (const auto& group : result_groups) {
           for (size_t index : group) results[index].outcome = ResolveOutcome::kBusy;
