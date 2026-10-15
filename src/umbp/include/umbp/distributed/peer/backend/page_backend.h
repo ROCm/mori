@@ -531,6 +531,7 @@ class PageBackend : public MediumBackend {
   // Bumped by ClearLocal(); snapshotted into each PendingSlot.  Commit()
   // rejects pre-clear slots via mismatch.  Local-only.
   uint64_t allocator_generation_ = 0;
+  uint64_t alloc_failures_ = 0;  // guarded by mutex_; samples the Allocate WARN
 
   std::atomic<uint64_t> next_slot_id_{1};
 
