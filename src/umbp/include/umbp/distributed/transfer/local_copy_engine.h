@@ -90,7 +90,7 @@ class LocalCopyEngine final : public TransferEngine {
   // Group by (src base, dst base) and coalesce exactly-contiguous segments, so
   // a multi-page key whose pages happen to be adjacent collapses into one
   // memcpy instead of one per page.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Performs the copies inline; the returned handle is already settled.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
