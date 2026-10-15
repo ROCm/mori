@@ -221,7 +221,6 @@ void umbp_app_start_cb(void* ctx) {
   env->bdev_desc_ = desc;
 
   struct spdk_bdev* bd = spdk_bdev_desc_get_bdev(desc);
-  env->bdev_ = bd;
   env->block_size_ = spdk_bdev_get_block_size(bd);
   env->bdev_size_ = static_cast<uint64_t>(spdk_bdev_get_num_blocks(bd)) * env->block_size_;
 
@@ -441,15 +440,6 @@ int SpdkEnv::Init(const SpdkEnvConfig& config) {
   return 0;
 }
 
-void SpdkEnv::CleanupOnSpdkThread(void* ctx) {
-  auto* self = static_cast<SpdkEnv*>(ctx);
-  if (self->bdev_desc_) {
-    spdk_bdev_close(SPDK_DESC(self->bdev_desc_));
-    self->bdev_desc_ = nullptr;
-  }
-  spdk_app_stop(0);
-}
-
 void SpdkEnv::Shutdown() {
   if (!initialized_.load(std::memory_order_acquire)) return;
   initialized_.store(false, std::memory_order_release);
@@ -475,8 +465,6 @@ void SpdkEnv::Shutdown() {
 
   MORI_UMBP_INFO("SpdkEnv: shutdown complete");
 }
-
-void SpdkEnv::CleanupThreadLocalCtx() { /* no per-thread state */ }
 
 // ---------------------------------------------------------------------------
 // I/O submission — per-IO round-robin across reactors.
@@ -529,8 +517,6 @@ int SpdkEnv::SubmitIoBatchAsync(SpdkIoRequest** reqs, int count) {
   return 0;
 }
 
-int SpdkEnv::PollIo() { return 0; }
-
 void SpdkEnv::SubmitIo(SpdkIoRequest* req) {
   int rc = SubmitIoAsync(req);
   if (rc != 0) {
@@ -545,24 +531,6 @@ void SpdkEnv::SubmitIo(SpdkIoRequest* req) {
     std::this_thread::yield();
 #endif
   }
-}
-
-// ---------------------------------------------------------------------------
-// Reactor accessors
-// ---------------------------------------------------------------------------
-void* SpdkEnv::GetReactorChannel(int idx) const {
-  if (idx < 0 || idx >= num_reactors_) return nullptr;
-  return reactors_[idx].io_channel;
-}
-
-void* SpdkEnv::GetReactorThread(int idx) const {
-  if (idx < 0 || idx >= num_reactors_) return nullptr;
-  return reactors_[idx].spdk_thread;
-}
-
-void SpdkEnv::SendMsgToReactor(int idx, void (*fn)(void*), void* arg) {
-  if (idx < 0 || idx >= num_reactors_) return;
-  spdk_thread_send_msg(SPDK_THREAD(reactors_[idx].spdk_thread), fn, arg);
 }
 
 // ---------------------------------------------------------------------------

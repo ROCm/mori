@@ -111,17 +111,10 @@ class SpdkEnv {
   void SubmitIo(SpdkIoRequest* req);
   int SubmitIoAsync(SpdkIoRequest* req);
   int SubmitIoBatchAsync(SpdkIoRequest** reqs, int count);
-  int PollIo();
-  void CleanupThreadLocalCtx();
 
   uint32_t GetBlockSize() const { return block_size_; }
   uint64_t GetBdevSize() const { return bdev_size_; }
   int GetNumReactors() const { return num_reactors_; }
-
-  void* GetBdevDesc() const { return bdev_desc_; }
-  void* GetReactorChannel(int idx) const;
-  void* GetReactorThread(int idx) const;
-  void SendMsgToReactor(int idx, void (*fn)(void*), void* arg);
 
   void* DmaMalloc(size_t size, size_t align = 4096);
   void DmaFree(void* buf);
@@ -140,8 +133,6 @@ class SpdkEnv {
   SpdkEnv(const SpdkEnv&) = delete;
   SpdkEnv& operator=(const SpdkEnv&) = delete;
 
-  static void CleanupOnSpdkThread(void* ctx);
-
   friend void ::umbp_bdev_init_complete_cb(void*, int);
   friend void ::umbp_execute_io_cb(void*);
   friend void ::umbp_execute_io_batch_cb(void*);
@@ -155,7 +146,6 @@ class SpdkEnv {
 
   std::thread reactor_thread_;
 
-  void* bdev_ = nullptr;
   void* bdev_desc_ = nullptr;
 
   std::vector<ReactorCtx> reactors_;

@@ -349,8 +349,6 @@ bool PeerSsdManager::Evict(const std::string& key) {
   }
   auto it = owned_.find(key);
   if (it != owned_.end()) {  // still present (a racing ClearLocal could have dropped it)
-    metrics_.evict_victims.fetch_add(1, std::memory_order_relaxed);
-    metrics_.evict_bytes_freed.fetch_add(it->second.size, std::memory_order_relaxed);
     lru_.erase(it->second.lru_it);
     owned_.erase(it);
     if (event_publishing_) {

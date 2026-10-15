@@ -52,7 +52,6 @@ void HostCopyBlock(void* dst, const void* src, size_t size);
 // Thread-local and sticky, so a worker sets it once at start-up rather than
 // around each call.
 void MarkThreadBackgroundCopies();
-bool ThreadDoesBackgroundCopies();
 
 // The both-endpoints-are-local implementation of TransferEngine.
 //

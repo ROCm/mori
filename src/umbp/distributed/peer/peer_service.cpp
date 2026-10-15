@@ -37,6 +37,7 @@
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/pool/peer_pool.h"
+#include "umbp/distributed/tier_proto.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
 
@@ -48,21 +49,6 @@ std::chrono::seconds GrpcShutdownDeadline() {
   static const auto v =
       GetEnvSeconds("UMBP_GRPC_SHUTDOWN_DEADLINE_SEC", std::chrono::seconds(3), /*min_allowed=*/1);
   return v;
-}
-
-// Translate proto TierType <-> umbp::TierType.  Defined inline because
-// only the peer service handlers need them.
-TierType FromProtoTier(::umbp::TierType t) {
-  switch (t) {
-    case ::umbp::TIER_HBM:
-      return TierType::HBM;
-    case ::umbp::TIER_DRAM:
-      return TierType::DRAM;
-    case ::umbp::TIER_SSD:
-      return TierType::SSD;
-    default:
-      return TierType::UNKNOWN;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +175,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     PoolPlacementRequest entry;
     entry.key = request->key();
     entry.size = request->size();
-    entry.tier = FromProtoTier(request->tier());
+    entry.tier = TierFromProto(request->tier());
     entry.backend_name = request->backend_name();
     entry.logical_tier = request->logical_tier();
     auto pool_result = pool_->BatchAllocate({entry}).front();
@@ -303,7 +289,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       PoolPlacementRequest entry;
       entry.key = request->entries(i).key();
       entry.size = request->entries(i).size();
-      entry.tier = FromProtoTier(request->entries(i).tier());
+      entry.tier = TierFromProto(request->entries(i).tier());
       entry.backend_name = request->entries(i).backend_name();
       entry.logical_tier = request->entries(i).logical_tier();
       entries.push_back(std::move(entry));
