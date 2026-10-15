@@ -105,12 +105,8 @@ class HbmCopyEngine final : public TransferEngine {
   // Both endpoints addressable in this process, at least one of them GPU.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
 
-  // Group by (src base, dst base) and coalesce exactly-contiguous segments —
-  // same shape as LocalCopyEngine, and it pays MORE here.  Each hipMemcpy
-  // carries a fixed launch/synchronization cost that a memcpy does not, so
-  // collapsing a run of adjacent pages into one call removes real overhead
-  // rather than just loop iterations.  A segment never crosses a host
-  // registration piece.
+  // One plan per buffer pair, contiguous segments merged (each hipMemcpy has a
+  // launch cost); a segment never crosses a host registration piece.
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Performs the copies inline; the returned handle is already settled.

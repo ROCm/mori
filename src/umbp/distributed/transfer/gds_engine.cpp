@@ -127,10 +127,7 @@ bool GdsEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const 
 }
 
 namespace {
-// One plan per item (see CreatePlanBuilder in the header).  Only the read's
-// destination is bounded: an overrun into a device pool is silent corruption,
-// not a segfault, so it is rejected here rather than let hipFileRead scribble
-// past the slot.
+// One plan per item.  Only the GPU destination is bounds-checked.
 class GdsPlanBuilder final : public TransferPlanBuilder {
  public:
   GdsPlanBuilder(const GdsEngine& engine, size_t expected_items) : engine_(engine) {

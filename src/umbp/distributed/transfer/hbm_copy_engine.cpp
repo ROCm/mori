@@ -340,11 +340,8 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
 }
 
 namespace {
-// Appends `item` to its pair's plan, merging adjacent ranges but never across
-// a host registration piece: the host side of a copy is registered in pieces,
-// and one segment must stay inside one.
+// Merges adjacent ranges, but a segment never crosses a host registration piece.
 void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t piece) {
-  // D2D has no host side; otherwise exactly one side is host memory.
   const bool host_is_src = !IsGpu(item.src);
   const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
   const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
@@ -373,8 +370,6 @@ void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t
 }
 }  // namespace
 
-// On a GPU endpoint an out-of-bounds range is not a segfault but silent
-// corruption of whatever else lives in the pool; PairPlanBuilder rejects it.
 std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
   const size_t piece = HostRegistrationChunkBytes();

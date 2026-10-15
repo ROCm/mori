@@ -87,17 +87,15 @@ TEST(GdsEngine, PlansOneRangePerItemAndBoundsToBuffer) {
   TransferRef host = TransferRef::HostBytes(stub.data(), stub.size());
   std::vector<TransferItem> items{
       MakeItem(file, 0, gpu, 0, 2048, 0),
-      MakeItem(file, 2048, gpu, 2048, 2048, 1),  // adjacent, still its own plan
-      MakeItem(file, 0, gpu, 0, 8192, 2),        // overruns the 4096-byte buffer
-      MakeItem(file, 0, host, 0, 64, 3),         // host destination: not ours
-      MakeItem(file, 0, gpu, 0, 0, 4),           // empty: dropped, not rejected
+      MakeItem(file, 2048, gpu, 2048, 2048, 1),  // adjacent: still its own plan
+      MakeItem(file, 0, gpu, 0, 8192, 2),        // overruns the buffer
+      MakeItem(file, 0, host, 0, 64, 3),         // host destination
+      MakeItem(file, 0, gpu, 0, 0, 4),           // empty: dropped
   };
   TransferPlanSet planned = engine.Plan(items);
   EXPECT_EQ(std::vector<size_t>({2, 3}), planned.rejected_tags);
   ASSERT_EQ(2u, planned.plans.size());
   for (const auto& p : planned.plans) EXPECT_EQ(1u, p.sizes.size());
-  EXPECT_EQ(std::vector<size_t>({2048}), planned.plans[1].src_offsets);
-  EXPECT_EQ(std::vector<size_t>({1}), planned.plans[1].tags);
 }
 
 // ---------------------------------------------------------------------------

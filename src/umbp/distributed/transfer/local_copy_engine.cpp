@@ -361,7 +361,6 @@ bool LocalCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) 
          dst.loc == mori::io::MemoryLocationType::CPU;
 }
 
-// One plan per buffer pair; adjacent ranges merge into one copy.
 std::unique_ptr<TransferPlanBuilder> LocalCopyEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
   return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {

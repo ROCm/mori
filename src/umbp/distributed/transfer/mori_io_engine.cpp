@@ -40,9 +40,7 @@ namespace mori::umbp {
 
 namespace {
 
-// Do `plan` and `item` name the same two endpoints?  Compares engine keys, not
-// just ids: a MemoryUniqueId is allocated per IOEngine, so two different peers
-// can both publish buffer id 1.
+// Same two endpoints?  Ids are only unique per IOEngine, so compare engine keys too.
 bool SameEndpoints(const TransferPlan& plan, const TransferRef& src, const TransferRef& dst) {
   return plan.src.mem.id == src.mem.id && plan.dst.mem.id == dst.mem.id &&
          plan.src.mem.engineKey == src.mem.engineKey && plan.dst.mem.engineKey == dst.mem.engineKey;
@@ -368,9 +366,8 @@ bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) con
 
 namespace {
 
-// Bucket key for grouping transfers by their endpoint pair.  MemoryUniqueId is
-// allocated per IOEngine, so two DIFFERENT peers can both publish buffer id 1:
-// a bucket holds candidate plan indices that SameEndpoints tells apart.
+// Memory ids are per IOEngine, so two peers can share one; SameEndpoints tells
+// a bucket's plans apart.
 struct PairKey {
   mori::io::MemoryUniqueId src;
   mori::io::MemoryUniqueId dst;
@@ -383,19 +380,9 @@ struct PairKeyHash {
   }
 };
 
-// Groups in first-appearance order so submit order stays deterministic.
-//
-// Zero copy: items between the same two registered buffers share a plan,
-// coalescing segments exactly contiguous on BOTH sides.  This is NOT redundant
-// with the RDMA backend's own WR merging: it shrinks the SG vector the backend
-// sorts/merges (O(M log M)) and allocates.  A merged segment must fit
-// ibv_sge.length (uint32_t).
-//
-// Staged: an item whose local side is unregistered rides the bounce pool.  It
-// groups by (remote buffer, direction) and takes the plan's next bounce offset;
-// once a plan's pool is full a fresh plan replaces it -- several plans over one
-// pool are fine because Submit runs each to completion before the next.  An
-// item larger than the whole pool is rejected.
+// Zero copy: one plan per registered buffer pair, segments merged up to
+// ibv_sge.length.  Staged: unregistered local memory takes bounce-pool offsets;
+// a full pool starts a new plan, and an item larger than the pool is rejected.
 class MoriIoPlanBuilder final : public TransferPlanBuilder {
  public:
   MoriIoPlanBuilder(const std::string& local_key, uint64_t bounce_size,
@@ -435,7 +422,7 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
       return;
     }
 
-    // Staged: the local endpoint is addressable host memory but not registered.
+    // Unregistered local memory: stage through the bounce pool.
     if (bounce_size_ == 0 || !IsBounceable(local) || item.size > bounce_size_) {
       out_.rejected_tags.push_back(item.tag);
       return;
@@ -448,13 +435,12 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
       const TransferPlan& p = out_.plans[cand];
       const TransferRef& p_remote = (dir == TransferDirection::kPush) ? p.dst : p.src;
       if (p.dir != dir || p_remote.mem.engineKey != remote.mem.engineKey) continue;
-      // Right endpoint; reuse it only while the pool still has room, otherwise
-      // retire it and open a fresh plan in its place.
+      // Reuse while the pool has room, else retire it for a new plan.
       if (bounce_cursor_[cand] + item.size <= bounce_size_) {
         pi = cand;
         fresh = false;
       } else {
-        cand = pi;  // this bucket entry now names the plan about to be added
+        cand = pi;  // now names the new plan
       }
       break;
     }
@@ -465,7 +451,7 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
       TransferPlan plan;
       plan.dir = dir;
       plan.uses_bounce = true;
-      // The local endpoint IS the bounce region; the remote side is unchanged.
+      // The bounce region stands in for the local side.
       plan.src = dir == TransferDirection::kPush ? bounce_ref_ : remote;
       plan.dst = dir == TransferDirection::kPush ? remote : bounce_ref_;
       out_.plans.push_back(std::move(plan));
@@ -492,7 +478,6 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
   const uint64_t bounce_size_;
   const TransferRef& bounce_ref_;
   TransferPlanSet out_;
-  // Both grow with distinct groups, not with the items of the batch.
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> pair_to_plans_;
   std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> bounce_to_plans_;
   std::vector<uint64_t> bounce_cursor_;  // parallel to out_.plans

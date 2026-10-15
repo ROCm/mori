@@ -21,9 +21,7 @@
 // SOFTWARE.
 #pragma once
 
-// Shared pieces for engines' TransferPlanBuilders (see TransferPlanBuilder for
-// the rules every builder keeps).  PairPlanBuilder is a whole builder for an
-// engine with one plan per (src, dst) buffer pair; the helpers serve any other.
+// Shared pieces for TransferPlanBuilders; the rules are on TransferPlanBuilder.
 
 #include <cstddef>
 #include <cstdint>
@@ -38,20 +36,17 @@
 
 namespace mori::umbp {
 
-// True iff [next, ...) starts exactly where [base, base + len) ends, with no
-// overflow in base + len.
+// [base, base + len) ends exactly at `next`, without overflow.
 inline bool AdjacentNoOverflow(size_t base, size_t len, size_t next) {
   return len <= std::numeric_limits<size_t>::max() - base && base + len == next;
 }
 
-// Does [offset, offset + size) fit a buffer of `capacity` bytes?
+// [offset, offset + size) fits in `capacity` bytes.
 inline bool RangeFits(uint64_t offset, uint64_t size, uint64_t capacity) {
   return size <= capacity && offset <= capacity - size;
 }
 
-// Both sides of `item` within their buffers.  Checked once per item: a range
-// past the end is a bug in the caller's slot bookkeeping, and its key must be
-// failed rather than copied past the end.
+// Both of `item`'s ranges fit their buffers.
 inline bool ItemInBounds(const TransferItem& item) {
   return RangeFits(item.src_offset, item.size, item.src.size) &&
          RangeFits(item.dst_offset, item.size, item.dst.size);
@@ -61,7 +56,7 @@ inline size_t HashCombine(size_t seed, size_t value) {
   return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
-// A new plan between `item`'s endpoints, with no segments yet.
+// An empty plan between `item`'s endpoints.
 inline TransferPlan PlanBetween(const TransferItem& item, TransferDirection dir) {
   TransferPlan plan;
   plan.src = item.src;
@@ -70,9 +65,8 @@ inline TransferPlan PlanBetween(const TransferItem& item, TransferDirection dir)
   return plan;
 }
 
-// Appends one segment to `plan`, extending its last segment instead when both
-// sides continue it, `merge` allows it, and the result stays <= max_merged.
-// Records `tag` once per run of segments from the same item.
+// Appends a segment, extending the last one when both sides are contiguous,
+// `merge` allows it and the result stays <= max_merged; adds `tag` once.
 inline void AppendSegment(TransferPlan* plan, size_t src_off, size_t dst_off, size_t size,
                           size_t tag, bool merge = true,
                           size_t max_merged = std::numeric_limits<size_t>::max()) {
@@ -90,11 +84,9 @@ inline void AppendSegment(TransferPlan* plan, size_t src_off, size_t dst_off, si
   if (plan->tags.empty() || plan->tags.back() != tag) plan->tags.push_back(tag);
 }
 
-// The builder of an engine with one local plan per (src, dst) buffer pair:
-// the memcpy engines.  It takes an item when the engine's CanHandle() takes the
-// pair and both ranges are in bounds, and `append(plan, item)` adds the item's
-// segment(s) to its pair's plan.  `Engine` is the final class, so CanHandle()
-// is not a virtual call per item.
+// Builder for engines with one plan per (src, dst) buffer pair.  Admits what
+// CanHandle() and ItemInBounds() accept; `append(plan, item)` adds segments.
+// `Engine` is the final class, so CanHandle() is not a virtual call.
 template <typename Engine, typename AppendFn>
 class PairPlanBuilder final : public TransferPlanBuilder {
  public:
@@ -108,7 +100,7 @@ class PairPlanBuilder final : public TransferPlanBuilder {
       return;
     }
     const Pair pair{item.src.host_ptr, item.dst.host_ptr};
-    // A key's pages arrive back to back, so most items skip the lookup.
+    // Consecutive items usually share a pair: skip the lookup.
     if (out_.plans.empty() || !(pair == last_pair_)) {
       last_index_ = plan_of_.try_emplace(pair, out_.plans.size()).first->second;
       last_pair_ = pair;
@@ -136,7 +128,6 @@ class PairPlanBuilder final : public TransferPlanBuilder {
   const Engine& engine_;
   AppendFn append_;
   TransferPlanSet out_;
-  // Grows with distinct pairs, not with the items of the batch.
   std::unordered_map<Pair, size_t, PairHash> plan_of_;
   Pair last_pair_{nullptr, nullptr};
   size_t last_index_ = 0;

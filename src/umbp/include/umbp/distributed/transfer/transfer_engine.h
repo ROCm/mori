@@ -327,24 +327,15 @@ struct TransferPlanSet {
   std::vector<size_t> rejected_tags;
 };
 
-// How an engine plans: a builder fed one item at a time, so a batch never has
-// to exist as a vector of items.  A call owns its builder, and Finish() hands
-// the plans over once.  Every engine's builder keeps the same rules, which
-// callers rely on:
-//
-//   * Add() issues no IO and changes no engine state.
-//   * An empty item (size 0) is dropped: no plan, no rejection.
-//   * An item the engine cannot carry -- a pair its CanHandle() refuses, or a
-//     range past the end of a buffer it can check -- is REJECTED: its tag goes
-//     to rejected_tags, and the caller fails that key.
-//   * Every other item's bytes land in one plan, whose `tags` name the item
-//     (once per run of its segments), so a failed plan maps back to its keys.
-//   * Plans come out in a deterministic order; a leaf engine's follow the
-//     order of each plan's first item.
-//
-// plan_builder.h has the shared pieces: PairPlanBuilder, a whole builder for an
-// engine with one plan per (src, dst) buffer pair, and AppendSegment /
-// ItemInBounds / PlanBetween for an engine that writes its own.
+// Plans a batch one item at a time; Finish() hands the plans over once.
+// Every builder keeps these rules:
+//   * Add() does no IO and changes no engine state.
+//   * An empty item is dropped.
+//   * An item the engine cannot carry (CanHandle() refuses the pair, or a range
+//     is out of bounds) goes to rejected_tags; the caller fails its key.
+//   * Every other item lands in one plan whose `tags` name it.
+//   * Plan order is deterministic.
+// Shared pieces are in plan_builder.h.
 class TransferPlanBuilder {
  public:
   virtual ~TransferPlanBuilder() = default;
@@ -402,15 +393,13 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // function of the PAIR, never of either endpoint alone.
   virtual bool CanHandle(const TransferRef& src, const TransferRef& dst) const = 0;
 
-  // How this engine groups items into the units it wants to submit; see
-  // TransferPlanBuilder for the rules.  `expected_items` is a reservation hint
-  // and may be ignored.  This is the one planning hook an engine implements.
+  // The one planning hook; see TransferPlanBuilder.  `expected_items` is a
+  // reservation hint.
   virtual std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(
       size_t expected_items = 0) const = 0;
 
-  // `items` through CreatePlanBuilder(): batch and incremental planning cannot
-  // differ.  Pure: no IO is issued and no engine state changes, so a caller
-  // may plan on one thread and submit on another.
+  // CreatePlanBuilder() over `items`.  Pure, so a caller may plan on one thread
+  // and submit on another.
   TransferPlanSet Plan(const std::vector<TransferItem>& items) const;
 
   // Post `plans`.  Returns a handle to wait on, or nullptr if nothing was
