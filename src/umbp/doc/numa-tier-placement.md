@@ -74,11 +74,14 @@ the kernel back a buffer with another node's physical pages when necessary.
 Startup logs distinguish target placement from sampled physical placement.
 Failure to query placement is logged rather than inferred as success.
 
-Multi-node tiers prefault buffers in parallel with a total budget of at most
-16 workers. Large buffers can subdivide that budget into page-aligned chunks;
-small chunks stay serial. Prefault workers use the target node's allowed CPUs
-and restore their previous affinity. `UMBP_DRAM_PREFAULT=0` disables prefault.
-GPU registration and the transfer path are unchanged.
+Every tier of at least 64 MiB prefaults in parallel with a total budget of at
+most 16 workers (`UMBP_DRAM_PREFAULT_THREADS=1` restores the serial path).
+Large buffers can subdivide that budget into page-aligned chunks; small chunks
+stay serial. A bound buffer's workers run on its node's allowed CPUs. An
+unbound buffer's workers alternate between nodes in whole rounds, so first
+touch splits it evenly across sockets instead of filling one node first.
+Workers restore their previous affinity. `UMBP_DRAM_PREFAULT=0` disables
+prefault. GPU registration and the transfer path are unchanged.
 
 This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
@@ -101,11 +104,11 @@ is about 1.3% of forward time with or without the split. A hugetlb tier
 reserved to capacity already fills node 0 and then node 1.
 
 The split does shorten startup. A standalone server with a 740 GB tier is ready
-in 64-81 s instead of 274 s with 4K pages, and in 10-13 s instead of 36 s with
-hugetlb. The single-buffer tier is prefaulted by one thread, which places the
-whole tier on that thread's node, and registering it for GPU access then takes
-several times longer. The split prefaults both halves at once, each on its own
-node.
+in 64-81 s with 4K pages and in 10-13 s with hugetlb. A single-buffer tier used
+to take 274 s and 36 s: one thread prefaulted it, which placed the whole tier on
+that thread's node, and registering a tier packed onto one node for GPU access
+takes several times longer. Its workers now alternate between nodes, and it is
+ready in 79-90 s and 12-14 s.
 
 Replicating shared keys on both nodes was measured at concurrency 128 and not
 adopted. Throughput fell by 10.9%: storing each shared key twice raised

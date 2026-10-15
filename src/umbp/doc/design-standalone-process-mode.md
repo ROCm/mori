@@ -856,7 +856,7 @@ from core memory registration via an async/retry path.
 7. **`tcp_staging` transport** is deferred; not built unless a
    concrete deployment needs it (§2).
 8. **Version/ABI skew**: the standalone server binary and the
-   `mori_pybinds`-linked proto definitions in each worker process must
+   `mori_umbp_pybinds`-linked proto definitions in each worker process must
    agree on the `UMBPStandalone` proto schema — the same constraint
    `distributed/` already has between `umbp_master` and workers, but
    more likely in practice here since a standalone server is typically
