@@ -107,13 +107,9 @@ class SSDTier : public TierBackend {
                           std::chrono::milliseconds grace) override;
   const IoStatus& LastIoStatus() const { return last_io_status_; }
 
-  // Bytes of the records still mapped to a key (Capacity().first is on disk).
-  size_t LiveBytes() const;
+  TierSpaceStats SpaceStats() const override;
   // Segment size in effect: ssd.segment_size_bytes, capped for a small tier.
   uint64_t segment_size() const { return segment_size_; }
-  // Segment files deleted, and the bytes they held, since construction.
-  uint64_t SegmentsReclaimed() const { return segments_reclaimed_.load(std::memory_order_relaxed); }
-  uint64_t BytesReclaimed() const { return bytes_reclaimed_.load(std::memory_order_relaxed); }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
   std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
   // Enables O_DIRECT for segments opened from here on.  Takes effect for
@@ -200,6 +196,7 @@ class SSDTier : public TierBackend {
   std::chrono::milliseconds retired_grace_{0};  // guarded by graveyard_mu_
   std::atomic<uint64_t> segments_reclaimed_{0};
   std::atomic<uint64_t> bytes_reclaimed_{0};
+  mutable std::atomic<uint64_t> no_room_refusals_{0};
 
   mutable std::mutex mu_;
   mutable std::mutex io_mu_;

@@ -332,8 +332,7 @@ bool SSDTier::HasRoomForNewSegment() const {
   if (free_bytes >= segment_size_) return true;
   // The tier itself stays within capacity_bytes, so either something else is
   // filling this filesystem or capacity_bytes is more than it can hold.
-  static std::atomic<uint64_t> refusals{0};
-  const uint64_t n = refusals.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t n = no_room_refusals_.fetch_add(1, std::memory_order_relaxed) + 1;
   if (n <= 16 || n % 1000 == 0) {
     MORI_UMBP_ERROR(
         "[SSDTier] {}: not opening a new segment: the filesystem has {}B free, less than one "
@@ -1229,9 +1228,17 @@ std::pair<size_t, size_t> SSDTier::Capacity() const {
   return index_.Capacity();
 }
 
-size_t SSDTier::LiveBytes() const {
-  std::lock_guard<std::mutex> lock(mu_);
-  return index_.live_bytes();
+TierSpaceStats SSDTier::SpaceStats() const {
+  TierSpaceStats out;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    out.live_bytes = index_.live_bytes();
+    out.files = index_.Segments().size();
+  }
+  out.files_deleted = segments_reclaimed_.load(std::memory_order_relaxed);
+  out.bytes_deleted = bytes_reclaimed_.load(std::memory_order_relaxed);
+  out.no_room = no_room_refusals_.load(std::memory_order_relaxed);
+  return out;
 }
 
 std::vector<EvictionHint> SSDTier::EvictionOrder(size_t max_keys) {

@@ -162,10 +162,11 @@ TEST_F(SegmentReclaimTest, WriteEvictChurnKeepsDiskBounded) {
     EXPECT_LE(BytesOnDisk(), 1 * kMiB) << "round " << round << ": dead segments left on disk";
     EXPECT_LE(SegmentFiles(), 2u) << "round " << round;
     EXPECT_LE(OpenFdsUnderDir(), 2u) << "round " << round;
-    EXPECT_EQ(tier->LiveBytes(), 0u);
+    EXPECT_EQ(tier->SpaceStats().live_bytes, 0u);
+    EXPECT_EQ(tier->SpaceStats().files, SegmentFiles());
   }
   // 4000 records of 64 KiB went through, ~250 MiB, 31x the capacity.
-  EXPECT_GE(tier->BytesReclaimed(), 4000 * kRecord - 1 * kMiB);
+  EXPECT_GE(tier->SpaceStats().bytes_deleted, 4000 * kRecord - 1 * kMiB);
 
   // A restart neither resurrects the evicted keys nor starts out full.
   tier.reset();
@@ -187,7 +188,7 @@ TEST_F(SegmentReclaimTest, AdmissionCountsDeadRecordsUntilTheirSegmentGoes) {
 
   // One key out of each of the 8 segments: 512 KiB less live, 0 bytes less disk.
   for (int s = 0; s < 8; ++s) ASSERT_TRUE(tier->Evict(Key(s * kPerSegment)));
-  EXPECT_EQ(tier->LiveBytes(), 8 * kMiB - 8 * kRecord);
+  EXPECT_EQ(tier->SpaceStats().live_bytes, 8 * kMiB - 8 * kRecord);
   EXPECT_EQ(tier->Capacity().first, 8 * kMiB);
   EXPECT_FALSE(Write(*tier, 1000)) << "admitted past capacity on disk";
 
@@ -200,7 +201,7 @@ TEST_F(SegmentReclaimTest, AdmissionCountsDeadRecordsUntilTheirSegmentGoes) {
     ASSERT_TRUE(tier->Evict(hint.key));
   }
   EXPECT_EQ(tier->Capacity().first, 7 * kMiB);
-  EXPECT_EQ(tier->SegmentsReclaimed(), 1u);
+  EXPECT_EQ(tier->SpaceStats().files_deleted, 1u);
   for (int i = 0; i < static_cast<int>(kPerSegment); ++i) {
     EXPECT_TRUE(Write(*tier, 1000 + i)) << i;
   }
@@ -268,7 +269,7 @@ TEST_F(SegmentReclaimTest, OverwritingEveryRecordDeletesTheOldSegment) {
     ASSERT_TRUE(tier->Write(Key(i), v.data(), v.size()));
   }
   EXPECT_EQ(SegmentFiles(), 1u) << "segment 0 holds nothing live and should be gone";
-  EXPECT_EQ(tier->SegmentsReclaimed(), 1u);
+  EXPECT_EQ(tier->SpaceStats().files_deleted, 1u);
   EXPECT_EQ(tier->Capacity().first, 16 * kRecord);
   std::vector<char> buf(kValue);
   ASSERT_TRUE(tier->ReadIntoPtr(Key(3), reinterpret_cast<uintptr_t>(buf.data()), buf.size()));
@@ -290,7 +291,7 @@ TEST_F(SegmentReclaimTest, StartupDeletesSegmentsWithNothingLive) {
       << "exactly one copy should be left";
   EXPECT_EQ(BytesOnDisk(), 16 * kRecord);  // plus, if segment 0 went, a fresh empty one
   EXPECT_EQ(tier->Capacity().first, 16 * kRecord);
-  EXPECT_EQ(tier->SegmentsReclaimed(), 1u);
+  EXPECT_EQ(tier->SpaceStats().files_deleted, 1u);
   for (int i = 0; i < 16; ++i) EXPECT_TRUE(ReadsBack(*tier, i)) << i;
 }
 
@@ -423,7 +424,7 @@ TEST_F(SegmentReclaimTest, ReadsNeverSeeAnotherSegmentsBytes) {
 
   EXPECT_EQ(bad_reads.load(), 0u);
   EXPECT_GT(good_reads.load(), 0u);
-  EXPECT_GT(tier->SegmentsReclaimed(), 10u) << "the test did not churn segments";
+  EXPECT_GT(tier->SpaceStats().files_deleted, 10u) << "the test did not churn segments";
   EXPECT_LE(tier->Capacity().first, 8 * kMiB);
 }
 

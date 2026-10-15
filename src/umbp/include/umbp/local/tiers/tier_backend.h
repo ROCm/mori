@@ -56,6 +56,16 @@ struct EvictionHint {
   uint64_t reclaim_bytes = 0;
 };
 
+// Disk use of a tier that deletes files as space frees.  live_bytes and files
+// are current; the rest count since start.
+struct TierSpaceStats {
+  uint64_t live_bytes = 0;     // records still mapped to a key
+  uint64_t files = 0;          // segment files on disk
+  uint64_t files_deleted = 0;  // emptied segment files deleted
+  uint64_t bytes_deleted = 0;  // disk those files held
+  uint64_t no_room = 0;        // new segments refused: the filesystem was full
+};
+
 // Physical location of a value inside a segment file, for a zero-copy reader
 // (GdsEngine) that DMAs the bytes itself with hipFileRead instead of asking the
 // tier to copy them.  Only the segment-file SSD tiers can answer; every other
@@ -139,6 +149,9 @@ class TierBackend {
   // telling the tier when it is done.  Default: no files are ever deleted.
   virtual void SetRetiredFileHook(std::function<void(int fd)> /*on_close*/,
                                   std::chrono::milliseconds /*grace*/) {}
+
+  // Default: a tier that deletes no files reports nothing.
+  virtual TierSpaceStats SpaceStats() const { return {}; }
 
   // Batch write: write multiple keys in one call.
   // Default loops over Write(). Override for deep-queue NVMe pipeline.

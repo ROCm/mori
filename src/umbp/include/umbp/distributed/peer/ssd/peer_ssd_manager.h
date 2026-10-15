@@ -137,6 +137,7 @@ class PeerSsdManager {
 
   // Forwards to the tier: see TierBackend::SetRetiredFileHook.
   void SetRetiredFileHook(std::function<void(int fd)> on_close, std::chrono::milliseconds grace);
+  TierSpaceStats SpaceStats() const { return backend_ ? backend_->SpaceStats() : TierSpaceStats{}; }
 
   // Distributed Clear: drop the logical owned-location map + undrained events,
   // then delete the physical SSD bytes (a user Clear means the cache is no

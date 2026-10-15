@@ -914,6 +914,15 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   bytes("device_write", ssd_->CopyBytes());
   bytes("device_read", ssd_->ReadBytes());
 
+  // Disk comes back a whole segment file at a time; capacity used counts dead
+  // records too, so live_bytes says how much of it still holds keys.
+  const TierSpaceStats space = ssd_->SpaceStats();
+  event("segment_deleted", space.files_deleted);
+  bytes("segment_deleted", space.bytes_deleted);
+  event("segment_no_room", space.no_room);
+  state("live_bytes", space.live_bytes);
+  state("segment_files", space.files);
+
   state("staging_pages_in_use", staging_pages_in_use_.load(std::memory_order_relaxed));
   state("staging_pages_total", cfg_.staging_pages);
   return out;

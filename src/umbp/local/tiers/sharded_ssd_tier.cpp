@@ -328,6 +328,19 @@ void ShardedSsdTier::SetRetiredFileHook(std::function<void(int fd)> on_close,
   for (auto& s : shards_) s->SetRetiredFileHook(on_close, grace);
 }
 
+TierSpaceStats ShardedSsdTier::SpaceStats() const {
+  TierSpaceStats sum;
+  for (const auto& s : shards_) {
+    const TierSpaceStats one = s->SpaceStats();
+    sum.live_bytes += one.live_bytes;
+    sum.files += one.files;
+    sum.files_deleted += one.files_deleted;
+    sum.bytes_deleted += one.bytes_deleted;
+    sum.no_room += one.no_room;
+  }
+  return sum;
+}
+
 std::optional<std::string> ShardedSsdTier::GetLocationId(const std::string& key) const {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
