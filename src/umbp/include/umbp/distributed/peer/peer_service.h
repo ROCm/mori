@@ -30,7 +30,7 @@
 namespace mori::umbp {
 
 class BackendRegistry;
-class MasterClient;
+class MetricSink;
 class PeerPool;
 
 class PeerServiceServer {
@@ -43,11 +43,11 @@ class PeerServiceServer {
   // backend-agnostic refactor Phase 0 — SSD is unwired from the distributed
   // data plane (see design-backend-agnostic-refactor.md).
   PeerServiceServer(PeerPool& pool, std::vector<uint8_t> engine_desc_bytes = {},
-                    MasterClient* master_client = nullptr);
+                    MetricSink* metric_sink = nullptr);
   // Source-compatible adapter for embedders that have not created a Pool yet.
   // The server owns an implicit SingleBackendPolicy PeerPool over `registry`.
   PeerServiceServer(BackendRegistry* registry, std::vector<uint8_t> engine_desc_bytes = {},
-                    MasterClient* master_client = nullptr);
+                    MetricSink* metric_sink = nullptr);
   ~PeerServiceServer();
 
   bool Start(uint16_t port);
@@ -57,7 +57,7 @@ class PeerServiceServer {
  private:
   std::unique_ptr<PeerPool> owned_pool_;
   PeerPool* pool_;
-  MasterClient* master_client_;
+  MetricSink* metric_sink_;
 
   std::vector<uint8_t> engine_desc_bytes_;
 
