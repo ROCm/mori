@@ -103,6 +103,9 @@ inline ::umbp::ResolveStatus ResolveOutcomeToProto(ResolveOutcome outcome) {
     case ResolveOutcome::kBusy:
       return ::umbp::RESOLVE_STATUS_BUSY;
     case ResolveOutcome::kFailed:
+    // A remote reader gets one answer per call and cannot come back for the
+    // rest of an oversized batch, so a deferral is a failure on the wire.
+    case ResolveOutcome::kDeferred:
       return ::umbp::RESOLVE_STATUS_FAILED;
     case ResolveOutcome::kMissing:
     default:

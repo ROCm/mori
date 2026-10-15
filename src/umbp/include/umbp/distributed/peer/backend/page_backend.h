@@ -260,9 +260,12 @@ class PageBackend : public MediumBackend {
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override;
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
+  void ReleaseResolved(const std::vector<std::string>& keys,
+                       const std::vector<uint64_t>& lease_tokens) override;
   bool Contains(const std::string& key) const override;
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
@@ -371,6 +374,11 @@ class PageBackend : public MediumBackend {
     // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
     // thread already extended.
     std::atomic<int64_t> read_lease_ns{0};
+    // Unreleased kLocal readers; while non-zero the pages are fenced whatever
+    // the deadline says.  Bumped under the shared lock, hence atomic.
+    std::atomic<uint32_t> local_readers{0};
+    // The lease_token releases must name: a re-committed key is a new slot.
+    uint64_t generation = 0;
     // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
@@ -388,6 +396,8 @@ class PageBackend : public MediumBackend {
         : pages(std::move(other.pages)),
           size(other.size),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
+          local_readers(other.local_readers.load(std::memory_order_relaxed)),
+          generation(other.generation),
           lru_it(other.lru_it),
           in_lru(other.in_lru) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
@@ -396,6 +406,9 @@ class PageBackend : public MediumBackend {
       size = other.size;
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
+      local_readers.store(other.local_readers.load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+      generation = other.generation;
       lru_it = other.lru_it;
       in_lru = other.in_lru;
       return *this;
@@ -431,7 +444,8 @@ class PageBackend : public MediumBackend {
   // Build the full ADD list for every owned key.  Caller MUST hold `mutex_`.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
-  // True iff `slot`'s read-lease deadline is still in the future.
+  // True iff `slot`'s read-lease deadline is still in the future, or a local
+  // reader has not released it yet.
   static bool HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                        std::chrono::steady_clock::time_point now);
 
@@ -531,6 +545,7 @@ class PageBackend : public MediumBackend {
   };
   std::unordered_map<std::string, PinState> pins_;
   uint64_t next_pin_token_ = 1;
+  uint64_t next_slot_generation_ = 1;  // 0 means "nothing to release"; commit only
 
   std::vector<DeferredFree> deferred_frees_;
 

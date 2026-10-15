@@ -153,16 +153,28 @@ struct CommitResult {
   uint64_t bytes_committed = 0;
 };
 
+// Who reads what a resolve publishes.  kLocal is this process: it always calls
+// ReleaseResolved after its copy, so its hold never expires on a timer.
+// kRemote is a peer that cannot report completion: its hold lasts the read
+// lease.  kRemote is the default because it cannot leak.
+enum class ResolveReader {
+  kRemote,
+  kLocal,
+};
+
 // A resolve needs one more state than a cache lookup.  kBusy means this backend
 // owns the key but cannot publish its bytes until a transient resource (SSD
 // staging) becomes available; callers must retry THIS peer rather than exclude
 // it as they do for kMissing.  kFailed is a permanent shape/backend error and
-// must not be retried indefinitely.
+// must not be retried indefinitely.  kDeferred: held and readable, but this
+// call staged its share of the batch without it; the caller releases what was
+// published and resolves the rest in a further call (on the wire, kFailed).
 enum class ResolveOutcome {
   kMissing,
   kFound,
   kBusy,
   kFailed,
+  kDeferred,
 };
 
 struct ResolvedEntry {
@@ -182,6 +194,10 @@ struct ResolvedEntry {
   // into device memory, with `pages` left empty.  A memory-backed medium leaves
   // this invalid and publishes pages as before.
   TransferRef file_ref{};
+
+  // Non-zero: hand back with ReleaseResolved after reading.  Names the hold, so
+  // a late release cannot free a later reader's.  Not carried on the wire.
+  uint64_t lease_token = 0;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -333,9 +349,10 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                                  bool include_descs,
-                                                  bool allow_file_refs = false) = 0;
+  // A kLocal `reader` must ReleaseResolved every published entry.
+  virtual std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
@@ -346,6 +363,14 @@ class MediumBackend : public MetricSource {
     return false;
   }
   virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
+
+  // The caller has finished reading what a kLocal BatchResolve published.
+  // `lease_tokens` is parallel to `keys`; 0 is skipped.
+  virtual void ReleaseResolved(const std::vector<std::string>& keys,
+                               const std::vector<uint64_t>& lease_tokens) {
+    (void)keys;
+    (void)lease_tokens;
+  }
 
   // Authoritative metadata lookup with no staging, descriptor construction, or
   // read-lease side effects. Pool placement validation must use this instead of
