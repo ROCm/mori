@@ -98,20 +98,6 @@ TEST(GdsEngine, PlansOneRangePerItemAndBoundsToBuffer) {
   for (const auto& p : planned.plans) EXPECT_EQ(1u, p.sizes.size());
   EXPECT_EQ(std::vector<size_t>({2048}), planned.plans[1].src_offsets);
   EXPECT_EQ(std::vector<size_t>({1}), planned.plans[1].tags);
-
-  // Plan() is the builder over a vector: item by item gives the same plans.
-  auto builder = engine.CreatePlanBuilder();
-  for (const auto& item : items) builder->Add(item);
-  TransferPlanSet built = builder->Finish();
-  EXPECT_EQ(planned.rejected_tags, built.rejected_tags);
-  ASSERT_EQ(planned.plans.size(), built.plans.size());
-  for (size_t i = 0; i < planned.plans.size(); ++i) {
-    EXPECT_EQ(planned.plans[i].src.file_fd, built.plans[i].src.file_fd);
-    EXPECT_EQ(planned.plans[i].src_offsets, built.plans[i].src_offsets);
-    EXPECT_EQ(planned.plans[i].dst_offsets, built.plans[i].dst_offsets);
-    EXPECT_EQ(planned.plans[i].sizes, built.plans[i].sizes);
-    EXPECT_EQ(planned.plans[i].tags, built.plans[i].tags);
-  }
 }
 
 // ---------------------------------------------------------------------------

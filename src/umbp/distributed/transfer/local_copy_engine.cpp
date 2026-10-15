@@ -32,7 +32,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -362,40 +361,12 @@ bool LocalCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) 
          dst.loc == mori::io::MemoryLocationType::CPU;
 }
 
-namespace {
-// One plan per (src, dst) buffer pair; adjacent ranges merge into one copy.
-struct LocalCopyPlanTraits {
-  static constexpr PlanGrouping kGrouping = PlanGrouping::kOnePerKey;
-  using Key = PtrPairKey;
-  using KeyHash = PtrPairKeyHash;
-
-  const LocalCopyEngine& engine;
-
-  std::optional<Key> Admit(const TransferItem& item) const {
-    if (!engine.CanHandle(item.src, item.dst) || !ItemInBounds(item)) return std::nullopt;
-    return Key{item.src.host_ptr, item.dst.host_ptr};
-  }
-  TransferPlan NewPlan(const Key&, const TransferItem& item) const {
-    TransferPlan plan;
-    plan.src = item.src;
-    plan.dst = item.dst;
-    plan.dir = TransferDirection::kLocal;
-    return plan;
-  }
-  void Append(size_t, TransferPlan* plan, const Key&, const TransferItem& item) const {
-    AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
-  }
-};
-}  // namespace
-
+// One plan per buffer pair; adjacent ranges merge into one copy.
 std::unique_ptr<TransferPlanBuilder> LocalCopyEngine::CreatePlanBuilder(
-    size_t expected_items) const {
-  return std::make_unique<GroupedPlanBuilder<LocalCopyPlanTraits>>(LocalCopyPlanTraits{*this},
-                                                                   expected_items);
-}
-
-TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  return PlanViaBuilder(*this, items);
+    size_t /*expected_items*/) const {
+  return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {
+    AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
+  });
 }
 
 std::unique_ptr<TransferHandle> LocalCopyEngine::Submit(std::vector<TransferPlan> plans) {

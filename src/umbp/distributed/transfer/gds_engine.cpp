@@ -22,8 +22,7 @@
 #include "umbp/distributed/transfer/gds_engine.h"
 
 #include <cerrno>
-#include <functional>
-#include <optional>
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -128,43 +127,36 @@ bool GdsEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const 
 }
 
 namespace {
-// One plan per item, no grouping (see Plan() in the header).  Only the read's
+// One plan per item (see CreatePlanBuilder in the header).  Only the read's
 // destination is bounded: an overrun into a device pool is silent corruption,
 // not a segfault, so it is rejected here rather than let hipFileRead scribble
 // past the slot.
-struct GdsPlanTraits {
-  static constexpr PlanGrouping kGrouping = PlanGrouping::kNone;
-  using Key = bool;
-  using KeyHash = std::hash<bool>;
-
-  const GdsEngine& engine;
-
-  std::optional<Key> Admit(const TransferItem& item) const {
-    if (!engine.CanHandle(item.src, item.dst) ||
+class GdsPlanBuilder final : public TransferPlanBuilder {
+ public:
+  GdsPlanBuilder(const GdsEngine& engine, size_t expected_items) : engine_(engine) {
+    out_.plans.reserve(expected_items);
+  }
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    if (!engine_.CanHandle(item.src, item.dst) ||
         !RangeFits(item.dst_offset, item.size, item.dst.size)) {
-      return std::nullopt;
+      out_.rejected_tags.push_back(item.tag);
+      return;
     }
-    return true;
+    TransferPlan plan = PlanBetween(item, TransferDirection::kLocal);
+    AppendSegment(&plan, item.src_offset, item.dst_offset, item.size, item.tag);
+    out_.plans.push_back(std::move(plan));
   }
-  TransferPlan NewPlan(const Key&, const TransferItem& item) const {
-    TransferPlan plan;
-    plan.src = item.src;
-    plan.dst = item.dst;
-    plan.dir = TransferDirection::kLocal;
-    return plan;
-  }
-  void Append(size_t, TransferPlan* plan, const Key&, const TransferItem& item) const {
-    AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
-  }
+  TransferPlanSet Finish() override { return std::move(out_); }
+
+ private:
+  const GdsEngine& engine_;
+  TransferPlanSet out_;
 };
 }  // namespace
 
 std::unique_ptr<TransferPlanBuilder> GdsEngine::CreatePlanBuilder(size_t expected_items) const {
-  return std::make_unique<GroupedPlanBuilder<GdsPlanTraits>>(GdsPlanTraits{*this}, expected_items);
-}
-
-TransferPlanSet GdsEngine::Plan(const std::vector<TransferItem>& items) const {
-  return PlanViaBuilder(*this, items);
+  return std::make_unique<GdsPlanBuilder>(*this, expected_items);
 }
 
 std::unique_ptr<TransferHandle> GdsEngine::Submit(std::vector<TransferPlan> plans) {

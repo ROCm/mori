@@ -27,7 +27,6 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
-#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
 
@@ -238,13 +237,6 @@ class CompositeTransferEngine::PlanBuilder final : public TransferPlanBuilder {
 std::unique_ptr<TransferPlanBuilder> CompositeTransferEngine::CreatePlanBuilder(
     size_t expected_items) const {
   return std::make_unique<PlanBuilder>(*this, expected_items);
-}
-
-// The builder over a vector: one routing path for both.  Every engine UMBP
-// ships plans incrementally, so routing item by item copies no item; engines
-// appear in first-seen order.
-TransferPlanSet CompositeTransferEngine::Plan(const std::vector<TransferItem>& items) const {
-  return PlanViaBuilder(*this, items);
 }
 
 size_t CompositeTransferEngine::IndexOf(const TransferEngine* engine) const {

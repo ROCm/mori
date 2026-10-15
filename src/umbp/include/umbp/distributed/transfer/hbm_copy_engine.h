@@ -106,12 +106,11 @@ class HbmCopyEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
 
   // Group by (src base, dst base) and coalesce exactly-contiguous segments —
-  // same shape as LocalCopyEngine::Plan, and it pays MORE here.  Each hipMemcpy
+  // same shape as LocalCopyEngine, and it pays MORE here.  Each hipMemcpy
   // carries a fixed launch/synchronization cost that a memcpy does not, so
   // collapsing a run of adjacent pages into one call removes real overhead
-  // rather than just loop iterations.  This is the concrete instance of the
-  // reason Plan() is virtual rather than a base-class helper.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  // rather than just loop iterations.  A segment never crosses a host
+  // registration piece.
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Performs the copies inline; the returned handle is already settled.

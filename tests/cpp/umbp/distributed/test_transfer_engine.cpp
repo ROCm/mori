@@ -34,6 +34,7 @@
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -70,32 +71,26 @@ TransferRef RemoteRef(const std::string& engine_key, mori::io::MemoryUniqueId id
   return TransferRef::Remote(std::move(desc));
 }
 
-// Every engine's Plan() is its builder over a vector, so feeding the same items
-// one at a time must give the same plans in the same order.
-void ExpectBuilderMatchesPlan(const TransferEngine& engine,
-                              const std::vector<TransferItem>& items) {
-  auto builder = engine.CreatePlanBuilder();
-  for (const auto& item : items) builder->Add(item);
-  const TransferPlanSet built = builder->Finish();
-  const TransferPlanSet planned = engine.Plan(items);
-  EXPECT_EQ(planned.rejected_tags, built.rejected_tags);
-  ASSERT_EQ(planned.plans.size(), built.plans.size());
-  for (size_t i = 0; i < planned.plans.size(); ++i) {
-    const TransferPlan& a = planned.plans[i];
-    const TransferPlan& b = built.plans[i];
-    EXPECT_EQ(a.src.host_ptr, b.src.host_ptr) << "plan " << i;
-    EXPECT_EQ(a.dst.host_ptr, b.dst.host_ptr) << "plan " << i;
-    EXPECT_EQ(a.src.mem.id, b.src.mem.id) << "plan " << i;
-    EXPECT_EQ(a.dst.mem.id, b.dst.mem.id) << "plan " << i;
-    EXPECT_TRUE(a.dir == b.dir) << "plan " << i;
-    EXPECT_EQ(a.uses_bounce, b.uses_bounce) << "plan " << i;
-    EXPECT_EQ(a.src_offsets, b.src_offsets) << "plan " << i;
-    EXPECT_EQ(a.dst_offsets, b.dst_offsets) << "plan " << i;
-    EXPECT_EQ(a.sizes, b.sizes) << "plan " << i;
-    EXPECT_EQ(a.tags, b.tags) << "plan " << i;
-    EXPECT_EQ(a.bounce_copies.size(), b.bounce_copies.size()) << "plan " << i;
-    EXPECT_EQ(a.engine, b.engine) << "plan " << i;
+// The rules every engine's builder keeps (TransferPlanBuilder): each non-empty
+// item is either rejected or named by a plan, and the plans carry exactly the
+// accepted items' bytes -- none lost, none twice.  Assumes a rejected item's
+// tag is not shared with an accepted one.
+void ExpectPlanContract(const std::vector<TransferItem>& items, const TransferPlanSet& planned) {
+  const std::set<size_t> rejected(planned.rejected_tags.begin(), planned.rejected_tags.end());
+  std::set<size_t> carried;
+  uint64_t planned_bytes = 0;
+  for (const auto& plan : planned.plans) {
+    carried.insert(plan.tags.begin(), plan.tags.end());
+    planned_bytes += std::accumulate(plan.sizes.begin(), plan.sizes.end(), uint64_t{0});
   }
+  uint64_t accepted_bytes = 0;
+  for (const auto& item : items) {
+    if (item.size == 0) continue;
+    EXPECT_TRUE(rejected.count(item.tag) != 0 || carried.count(item.tag) != 0)
+        << "item tag " << item.tag << " is neither rejected nor planned";
+    if (rejected.count(item.tag) == 0) accepted_bytes += item.size;
+  }
+  EXPECT_EQ(accepted_bytes, planned_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +227,8 @@ TEST(LocalCopyEngine, BuilderRejectsOutOfBoundsRanges) {
   EXPECT_TRUE(planned.plans.empty());
 }
 
-// Plan() is the builder over a vector, so the two must agree item for item.
-TEST(LocalCopyEngine, BuilderMatchesPlan) {
+// Two pairs' items interleave: each still merges within its own pair's plan.
+TEST(LocalCopyEngine, MergesWithinEachPairWhenPairsInterleave) {
   LocalCopyEngine engine;
   std::vector<char> a(256, 'a'), b(256, 'b'), out1(256, 0), out2(256, 0);
   auto ra = TransferRef::HostBytes(a.data(), a.size());
@@ -245,8 +240,8 @@ TEST(LocalCopyEngine, BuilderMatchesPlan) {
       MakeItem(ra, 64, r1, 64, 64, 0),   MakeItem(rb, 32, r2, 64, 32, 1),
       MakeItem(ra, 200, r1, 200, 64, 2), MakeItem(ra, 128, r1, 128, 16, 3),
   };
-  ExpectBuilderMatchesPlan(engine, items);
   const auto built = engine.Plan(items);
+  ExpectPlanContract(items, built);
   EXPECT_EQ(std::vector<size_t>({2}), built.rejected_tags);
   ASSERT_EQ(2u, built.plans.size());
   EXPECT_EQ(std::vector<size_t>({144}), built.plans[0].sizes);  // 0, 64, then 128 all abut
@@ -329,7 +324,7 @@ TEST(HbmCopyEngine, BuilderSplitsAtHostRegistrationPieces) {
   EXPECT_EQ(std::vector<size_t>({0, 4096}), planned.plans[0].src_offsets);
   EXPECT_EQ(std::vector<size_t>({4096, 8192}), planned.plans[0].sizes);
   EXPECT_EQ(std::vector<size_t>({1, 2}), planned.plans[0].tags);
-  ExpectBuilderMatchesPlan(engine, items);
+  ExpectPlanContract(items, planned);
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +372,7 @@ TEST(MoriIoEngine, GroupsZeroCopyByEndpointsAndCapsSegments) {
   EXPECT_TRUE(planned.plans[2].dir == TransferDirection::kPull);
   // Adjacent, but 6 GiB overflows ibv_sge.length (uint32_t): two segments.
   EXPECT_EQ(std::vector<size_t>({3ULL << 30, 3ULL << 30}), planned.plans[3].sizes);
-  ExpectBuilderMatchesPlan(engine, items);
+  ExpectPlanContract(items, planned);
 }
 
 // Unregistered local memory rides the bounce pool: each item takes the plan's
@@ -415,7 +410,7 @@ TEST(MoriIoEngine, StagesUnregisteredMemoryThroughTheBouncePool) {
   EXPECT_EQ(std::vector<size_t>({2}), planned.plans[1].tags);
   EXPECT_TRUE(planned.plans[2].dir == TransferDirection::kPull);
   EXPECT_EQ(std::vector<size_t>({0}), planned.plans[2].dst_offsets);
-  ExpectBuilderMatchesPlan(engine, items);
+  ExpectPlanContract(items, planned);
 
   // Without a pool, unregistered memory is rejected instead.
   MoriIoEngine no_pool("local", mori::io::IOEngineConfig{}, /*bounce_bytes=*/0);
@@ -450,20 +445,31 @@ class SpyEngine final : public TransferEngine {
     return claims_remote_ == any_remote;
   }
 
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    planned_batches.push_back(items.size());
-    TransferPlanSet out;
-    TransferPlan plan;
-    for (const auto& item : items) {
-      plan.src = item.src;
-      plan.dst = item.dst;
-      plan.sizes.push_back(item.size);
-      plan.src_offsets.push_back(item.src_offset);
-      plan.dst_offsets.push_back(item.dst_offset);
-      plan.tags.push_back(item.tag);
+  // One plan holding every item; Finish() records how many it was fed.
+  class Builder final : public TransferPlanBuilder {
+   public:
+    explicit Builder(const SpyEngine& spy) : spy_(spy) {}
+    void Add(const TransferItem& item) override {
+      plan_.src = item.src;
+      plan_.dst = item.dst;
+      plan_.sizes.push_back(item.size);
+      plan_.src_offsets.push_back(item.src_offset);
+      plan_.dst_offsets.push_back(item.dst_offset);
+      plan_.tags.push_back(item.tag);
     }
-    if (!plan.sizes.empty()) out.plans.push_back(std::move(plan));
-    return out;
+    TransferPlanSet Finish() override {
+      spy_.planned_batches.push_back(plan_.sizes.size());
+      TransferPlanSet out;
+      if (!plan_.sizes.empty()) out.plans.push_back(std::move(plan_));
+      return out;
+    }
+
+   private:
+    const SpyEngine& spy_;
+    TransferPlan plan_;
+  };
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t) const override {
+    return std::make_unique<Builder>(*this);
   }
 
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
@@ -524,8 +530,7 @@ TEST(CompositeTransferEngine, SelectsPerPairAndPlansOncePerEngine) {
 
   TransferPlanSet planned = composite->Plan(items);
   EXPECT_TRUE(planned.rejected_tags.empty());
-  // An engine without its own builder still gets ONE Plan() call for all of its
-  // items, not one per item: the default builder buffers them.
+  // Each engine gets ONE builder per call, fed all of its items.
   ASSERT_EQ(1u, spy->planned_batches.size());
   EXPECT_EQ(1u, spy->planned_batches[0]);
   // Every plan is tagged with the engine that produced it.
@@ -566,8 +571,7 @@ TEST(CompositeTransferEngine, BuilderGroupsHbmAndBatchesOtherEngines) {
   for (const auto& plan : planned.plans) EXPECT_NE(nullptr, plan.engine);
   EXPECT_EQ(0u, spy->submitted);
   EXPECT_EQ(std::vector<char>(64, 0), dst);
-  // Plan() is this builder over a vector, mixed batch included.
-  ExpectBuilderMatchesPlan(composite, items);
+  ExpectPlanContract(items, planned);
 }
 
 TEST(CompositeTransferEngine, RejectsAPairNoEngineClaims) {
@@ -621,7 +625,15 @@ class FakeFileEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return src.IsFile() && dst.loc == mori::io::MemoryLocationType::GPU;
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>&) const override { return {}; }
+  // Plans nothing: these tests only exercise registration and selection.
+  class NoPlans final : public TransferPlanBuilder {
+   public:
+    void Add(const TransferItem&) override {}
+    TransferPlanSet Finish() override { return {}; }
+  };
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t) const override {
+    return std::make_unique<NoPlans>();
+  }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan>) override { return nullptr; }
 
   int file_registrations = 0;

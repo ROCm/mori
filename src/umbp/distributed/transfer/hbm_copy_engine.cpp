@@ -32,7 +32,6 @@
 #include <limits>
 #include <map>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -341,68 +340,47 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
 }
 
 namespace {
-// One plan per (src, dst) buffer pair.  Adjacent ranges merge, but never
-// across a host registration piece: the host side of a copy is registered in
-// pieces, and one segment must stay inside one.
-struct HbmPlanTraits {
-  static constexpr PlanGrouping kGrouping = PlanGrouping::kOnePerKey;
-  using Key = PtrPairKey;
-  using KeyHash = PtrPairKeyHash;
-
-  const HbmCopyEngine& engine;
-  size_t host_registration_piece;
-
-  std::optional<Key> Admit(const TransferItem& item) const {
-    // On a GPU endpoint an overrun is not a segfault but silent corruption of
-    // whatever else lives in the pool, so the bounds check matters more here.
-    if (!engine.CanHandle(item.src, item.dst) || !ItemInBounds(item)) return std::nullopt;
-    return Key{item.src.host_ptr, item.dst.host_ptr};
-  }
-  TransferPlan NewPlan(const Key&, const TransferItem& item) const {
-    TransferPlan plan;
-    plan.src = item.src;
-    plan.dst = item.dst;
-    plan.dir = TransferDirection::kLocal;
-    return plan;
-  }
-  void Append(size_t, TransferPlan* plan, const Key&, const TransferItem& item) const {
-    // D2D has no host side; otherwise exactly one side is host memory.
-    const bool host_is_src = !IsGpu(item.src);
-    const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
-    const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
-                                : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
-                                              : 0;
-    const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
-      return (host_base + (host_is_src ? src_offset : dst_offset)) / host_registration_piece;
-    };
-    size_t so = static_cast<size_t>(item.src_offset);
-    size_t dof = static_cast<size_t>(item.dst_offset);
-    size_t remaining = static_cast<size_t>(item.size);
-    while (remaining > 0) {
-      size_t sz = remaining;
-      if (host_base != 0) {
-        const uintptr_t host = host_base + (host_is_src ? so : dof);
-        sz = std::min<size_t>(sz, host_registration_piece - host % host_registration_piece);
-      }
-      const bool same_piece =
-          host_base == 0 || plan->sizes.empty() ||
-          host_piece(plan->src_offsets.back(), plan->dst_offsets.back()) == host_piece(so, dof);
-      AppendSegment(plan, so, dof, sz, item.tag, same_piece);
-      so += sz;
-      dof += sz;
-      remaining -= sz;
+// Appends `item` to its pair's plan, merging adjacent ranges but never across
+// a host registration piece: the host side of a copy is registered in pieces,
+// and one segment must stay inside one.
+void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t piece) {
+  // D2D has no host side; otherwise exactly one side is host memory.
+  const bool host_is_src = !IsGpu(item.src);
+  const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
+  const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
+                              : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
+                                            : 0;
+  const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
+    return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
+  };
+  size_t so = static_cast<size_t>(item.src_offset);
+  size_t dof = static_cast<size_t>(item.dst_offset);
+  size_t remaining = static_cast<size_t>(item.size);
+  while (remaining > 0) {
+    size_t sz = remaining;
+    if (host_base != 0) {
+      const uintptr_t host = host_base + (host_is_src ? so : dof);
+      sz = std::min<size_t>(sz, piece - host % piece);
     }
+    const bool same_piece =
+        host_base == 0 || plan->sizes.empty() ||
+        host_piece(plan->src_offsets.back(), plan->dst_offsets.back()) == host_piece(so, dof);
+    AppendSegment(plan, so, dof, sz, item.tag, same_piece);
+    so += sz;
+    dof += sz;
+    remaining -= sz;
   }
-};
+}
 }  // namespace
 
-std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(size_t expected_items) const {
-  return std::make_unique<GroupedPlanBuilder<HbmPlanTraits>>(
-      HbmPlanTraits{*this, HostRegistrationChunkBytes()}, expected_items);
-}
-
-TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  return PlanViaBuilder(*this, items);
+// On a GPU endpoint an out-of-bounds range is not a segfault but silent
+// corruption of whatever else lives in the pool; PairPlanBuilder rejects it.
+std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
+  const size_t piece = HostRegistrationChunkBytes();
+  return MakePairPlanBuilder(*this, [piece](TransferPlan* plan, const TransferItem& item) {
+    AppendWithinHostPieces(plan, item, piece);
+  });
 }
 
 void HbmCopyEngine::AddHostGatherRegion(void* base, size_t bytes) {

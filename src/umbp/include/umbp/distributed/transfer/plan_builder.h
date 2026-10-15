@@ -21,18 +21,15 @@
 // SOFTWARE.
 #pragma once
 
-// What every engine's incremental TransferPlanBuilder shares.  An engine
-// describes only what is its own -- which items it takes, how it groups them,
-// how a segment is appended -- in a small Traits struct, and
-// GroupedPlanBuilder<Traits> does the rest.  Plan() is then PlanViaBuilder(),
-// so batch and incremental planning cannot drift apart.
+// Shared pieces for engines' TransferPlanBuilders (see TransferPlanBuilder for
+// the rules every builder keeps).  PairPlanBuilder is a whole builder for an
+// engine with one plan per (src, dst) buffer pair; the helpers serve any other.
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <optional>
-#include <type_traits>
+#include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -64,17 +61,14 @@ inline size_t HashCombine(size_t seed, size_t value) {
   return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
-// Groups by the two endpoints' addresses: the plan key of the memcpy engines.
-struct PtrPairKey {
-  const void* src;
-  const void* dst;
-  bool operator==(const PtrPairKey& o) const noexcept { return src == o.src && dst == o.dst; }
-};
-struct PtrPairKeyHash {
-  size_t operator()(const PtrPairKey& k) const noexcept {
-    return HashCombine(std::hash<const void*>{}(k.src), std::hash<const void*>{}(k.dst));
-  }
-};
+// A new plan between `item`'s endpoints, with no segments yet.
+inline TransferPlan PlanBetween(const TransferItem& item, TransferDirection dir) {
+  TransferPlan plan;
+  plan.src = item.src;
+  plan.dst = item.dst;
+  plan.dir = dir;
+  return plan;
+}
 
 // Appends one segment to `plan`, extending its last segment instead when both
 // sides continue it, `merge` allows it, and the result stays <= max_merged.
@@ -96,92 +90,61 @@ inline void AppendSegment(TransferPlan* plan, size_t src_off, size_t dst_off, si
   if (plan->tags.empty() || plan->tags.back() != tag) plan->tags.push_back(tag);
 }
 
-// Plan() of an engine whose CreatePlanBuilder() is incremental: that builder
-// over a vector.  Never call it from an engine that keeps the default
-// (buffered) builder, whose Finish() calls Plan().
-inline TransferPlanSet PlanViaBuilder(const TransferEngine& engine,
-                                      const std::vector<TransferItem>& items) {
-  auto builder = engine.CreatePlanBuilder(items.size());
-  for (const auto& item : items) builder->Add(item);
-  return builder->Finish();
-}
-
-// How an engine's items share plans.
-enum class PlanGrouping {
-  kNone,        // one plan per item
-  kOnePerKey,   // items with equal keys share one plan
-  kManyPerKey,  // a key's group holds several plans; Joins picks one
-};
-
-// An incremental builder from a Traits struct.  The builder skips empty items,
-// collects rejected tags, keeps plans in first-seen order, and hands the set
-// over in Finish().  Traits supplies:
-//
-//   static constexpr PlanGrouping kGrouping;
-//   using Key; using KeyHash;
-//   // The item's key, or nullopt to reject it.
-//   std::optional<Key> Admit(const TransferItem&);
-//   // kManyPerKey only: may plan `index`, in the item's group, take the item?
-//   bool Joins(size_t index, const TransferPlan&, const Key&, const TransferItem&);
-//   TransferPlan NewPlan(const Key&, const TransferItem&);
-//   void Append(size_t index, TransferPlan*, const Key&, const TransferItem&);
-//
-// kManyPerKey is for a key that only buckets endpoints (MORI-IO's per-engine
-// memory ids) or a plan that can fill up (a bounce pool): the first plan in the
-// group that Joins takes the item, else a new plan opens in the group.
-template <typename Traits>
-class GroupedPlanBuilder final : public TransferPlanBuilder {
+// The builder of an engine with one local plan per (src, dst) buffer pair:
+// the memcpy engines.  It takes an item when the engine's CanHandle() takes the
+// pair and both ranges are in bounds, and `append(plan, item)` adds the item's
+// segment(s) to its pair's plan.  `Engine` is the final class, so CanHandle()
+// is not a virtual call per item.
+template <typename Engine, typename AppendFn>
+class PairPlanBuilder final : public TransferPlanBuilder {
  public:
-  explicit GroupedPlanBuilder(Traits traits, size_t expected_items = 0)
-      : traits_(std::move(traits)) {
-    if constexpr (Traits::kGrouping == PlanGrouping::kNone) out_.plans.reserve(expected_items);
-  }
+  PairPlanBuilder(const Engine& engine, AppendFn append)
+      : engine_(engine), append_(std::move(append)) {}
 
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
-    const std::optional<Key> key = traits_.Admit(item);
-    if (!key.has_value()) {
+    if (!engine_.CanHandle(item.src, item.dst) || !ItemInBounds(item)) {
       out_.rejected_tags.push_back(item.tag);
       return;
     }
-    const size_t index = PlanFor(*key, item);
-    if (index == out_.plans.size()) out_.plans.push_back(traits_.NewPlan(*key, item));
-    traits_.Append(index, &out_.plans[index], *key, item);
+    const Pair pair{item.src.host_ptr, item.dst.host_ptr};
+    // A key's pages arrive back to back, so most items skip the lookup.
+    if (out_.plans.empty() || !(pair == last_pair_)) {
+      last_index_ = plan_of_.try_emplace(pair, out_.plans.size()).first->second;
+      last_pair_ = pair;
+      if (last_index_ == out_.plans.size()) {
+        out_.plans.push_back(PlanBetween(item, TransferDirection::kLocal));
+      }
+    }
+    append_(&out_.plans[last_index_], item);
   }
 
   TransferPlanSet Finish() override { return std::move(out_); }
 
  private:
-  using Key = typename Traits::Key;
-  // Grows with distinct keys, not with the items of the batch.
-  using Group = std::conditional_t<Traits::kGrouping == PlanGrouping::kManyPerKey,
-                                   std::vector<size_t>, size_t>;
-
-  // The plan that takes `item`; plans.size() means a new one, already recorded.
-  size_t PlanFor(const Key& key, const TransferItem& item) {
-    const size_t fresh = out_.plans.size();
-    if constexpr (Traits::kGrouping == PlanGrouping::kNone) {
-      return fresh;
-    } else if constexpr (Traits::kGrouping == PlanGrouping::kOnePerKey) {
-      // A key's pages arrive back to back, so most items skip the lookup.
-      if (last_.has_value() && last_->first == key) return last_->second;
-      const size_t index = groups_.try_emplace(key, fresh).first->second;
-      last_.emplace(key, index);
-      return index;
-    } else {
-      std::vector<size_t>& group = groups_[key];
-      for (size_t candidate : group) {
-        if (traits_.Joins(candidate, out_.plans[candidate], key, item)) return candidate;
-      }
-      group.push_back(fresh);
-      return fresh;
+  struct Pair {
+    const void* src;
+    const void* dst;
+    bool operator==(const Pair& o) const noexcept { return src == o.src && dst == o.dst; }
+  };
+  struct PairHash {
+    size_t operator()(const Pair& p) const noexcept {
+      return HashCombine(std::hash<const void*>{}(p.src), std::hash<const void*>{}(p.dst));
     }
-  }
+  };
 
-  Traits traits_;
+  const Engine& engine_;
+  AppendFn append_;
   TransferPlanSet out_;
-  std::unordered_map<Key, Group, typename Traits::KeyHash> groups_;
-  std::optional<std::pair<Key, size_t>> last_;  // kOnePerKey's most recent key
+  // Grows with distinct pairs, not with the items of the batch.
+  std::unordered_map<Pair, size_t, PairHash> plan_of_;
+  Pair last_pair_{nullptr, nullptr};
+  size_t last_index_ = 0;
 };
+
+template <typename Engine, typename AppendFn>
+std::unique_ptr<TransferPlanBuilder> MakePairPlanBuilder(const Engine& engine, AppendFn append) {
+  return std::make_unique<PairPlanBuilder<Engine, AppendFn>>(engine, std::move(append));
+}
 
 }  // namespace mori::umbp
