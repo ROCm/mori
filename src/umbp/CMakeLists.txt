@@ -395,7 +395,6 @@ add_library(
   distributed/transfer/posix_engine.cpp
   distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
-  distributed/peer/ssd/ssd_copy_pipeline.cpp
   distributed/pool/policy_config.cpp
   distributed/pool/tier_graph.cpp
   distributed/pool/tier_transition.cpp

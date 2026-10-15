@@ -93,13 +93,6 @@ class PeerSsdManager {
   // Forwards to the SSD tier; does no device IO.
   std::optional<RecordLocation> LocateRecord(const std::string& key) const;
 
-  // Write the key's bytes (assembled from possibly non-contiguous DRAM source
-  // segments) to the SSD backend.  On success records the SSD location and
-  // queues an ADD SSD event; on failure records nothing and queues nothing
-  // (best-effort clean).
-  bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
-             size_t total_size);
-
   // Batched form of Write for contiguous sources — the SsdBackend::BatchCommit
   // path.  One dedup pass, ONE backend BatchWrite (which a multi-drive
   // ShardedSsdTier fans across every drive in parallel), then one recording

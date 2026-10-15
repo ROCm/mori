@@ -145,8 +145,8 @@ class FakeBackend : public TierBackend {
   int reads_started_ = 0;
 };
 
-std::vector<std::pair<const void*, size_t>> OneSeg(const std::string& s) {
-  return {{s.data(), s.size()}};
+bool Put(PeerSsdManager& mgr, const std::string& key, const std::string& value) {
+  return mgr.WriteBatch({key}, {value.data()}, {value.size()})[0];
 }
 
 // Manager owning a FakeBackend we keep a raw pointer to for test inspection.
@@ -173,9 +173,9 @@ int CountKind(const std::vector<KvEvent>& events, KvEvent::Kind kind) {
 
 TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("A", OneSeg("aaaa"), 4));
-  ASSERT_TRUE(h.mgr->Write("B", OneSeg("bbbb"), 4));
-  ASSERT_TRUE(h.mgr->Write("C", OneSeg("cccc"), 4));
+  ASSERT_TRUE(Put(*h.mgr, "A", "aaaa"));
+  ASSERT_TRUE(Put(*h.mgr, "B", "bbbb"));
+  ASSERT_TRUE(Put(*h.mgr, "C", "cccc"));
 
   // LRU is A, B, C; reading A makes B the coldest.
   std::vector<char> buf(4);
@@ -196,10 +196,10 @@ TEST(PeerSsdEviction, WritesNeverEvict) {
   auto h = MakeHarness(/*capacity=*/1000);
   std::string val(100, 'x');
   for (int i = 1; i <= 9; ++i) {
-    ASSERT_TRUE(h.mgr->Write("k" + std::to_string(i), OneSeg(val), val.size()));
+    ASSERT_TRUE(Put(*h.mgr, "k" + std::to_string(i), val));
   }
   EXPECT_EQ(h.mgr->Capacity().first, 900u);
-  EXPECT_FALSE(h.mgr->Write("big", OneSeg(std::string(300, 'c')), 300));
+  EXPECT_FALSE(Put(*h.mgr, "big", std::string(300, 'c')));
   EXPECT_FALSE(h.mgr->Exists("big"));
 
   // The batched path fails the oversized key alone.
@@ -215,7 +215,7 @@ TEST(PeerSsdEviction, WritesNeverEvict) {
 TEST(PeerSsdEviction, InFlightReadIsNotEvicted) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
   const std::string val = "payload-payload";
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg(val), val.size()));
+  ASSERT_TRUE(Put(*h.mgr, "K", val));
 
   h.backend->BlockReads();
   std::vector<char> buf(val.size());
@@ -240,7 +240,7 @@ TEST(PeerSsdEviction, InFlightReadIsNotEvicted) {
 
 TEST(PeerSsdEviction, StaleRouteReadAfterEvictIsNotFound) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));
+  ASSERT_TRUE(Put(*h.mgr, "K", "data"));
   ASSERT_TRUE(h.mgr->Evict("K"));
 
   std::vector<char> buf(4);
@@ -250,8 +250,8 @@ TEST(PeerSsdEviction, StaleRouteReadAfterEvictIsNotFound) {
 
 TEST(PeerSsdEviction, DuplicateWriteIsIdempotent) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));  // same content-addressed key
+  ASSERT_TRUE(Put(*h.mgr, "K", "data"));
+  ASSERT_TRUE(Put(*h.mgr, "K", "data"));  // same content-addressed key
 
   EXPECT_EQ(h.backend->write_calls(), 1);  // no second backend write
   auto events = h.mgr->DrainPendingEvents();
@@ -260,7 +260,7 @@ TEST(PeerSsdEviction, DuplicateWriteIsIdempotent) {
 
 TEST(PeerSsdEviction, BackendEvictFailureKeepsMetadata) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));
+  ASSERT_TRUE(Put(*h.mgr, "K", "data"));
   h.mgr->DrainPendingEvents();  // discard ADD
 
   h.backend->SetFailEvict(true);
@@ -277,7 +277,7 @@ TEST(PeerSsdEviction, BackendEvictFailureKeepsMetadata) {
 
 TEST(PeerSsdEviction, ConcurrentEvictOfSameKeyRemovesOnce) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));
+  ASSERT_TRUE(Put(*h.mgr, "K", "data"));
   h.mgr->DrainPendingEvents();
 
   std::atomic<int> wins{0};
@@ -297,8 +297,8 @@ TEST(PeerSsdEviction, ConcurrentEvictOfSameKeyRemovesOnce) {
 
 TEST(PeerSsdEviction, ClearLocalWipesPhysicalBytes) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("a", OneSeg("1111"), 4));
-  ASSERT_TRUE(h.mgr->Write("b", OneSeg("2222"), 4));
+  ASSERT_TRUE(Put(*h.mgr, "a", "1111"));
+  ASSERT_TRUE(Put(*h.mgr, "b", "2222"));
 
   h.mgr->ClearLocal();
 
@@ -313,7 +313,7 @@ TEST(PeerSsdEviction, ClearLocalWipesPhysicalBytes) {
 TEST(PeerSsdEviction, ClearLocalWaitsForInFlightRead) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
   const std::string val = "read-priority";
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg(val), val.size()));
+  ASSERT_TRUE(Put(*h.mgr, "K", val));
 
   h.backend->BlockReads();
   std::vector<char> buf(val.size());
@@ -338,7 +338,7 @@ TEST(PeerSsdEviction, ClearLocalWaitsForInFlightRead) {
 
 TEST(PeerSsdEviction, EvictionCandidatesBoundaries) {
   auto h = MakeHarness(/*capacity=*/1'000'000);
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg("data"), 4));
+  ASSERT_TRUE(Put(*h.mgr, "K", "data"));
 
   EXPECT_TRUE(h.mgr->EvictionCandidates(0).empty());  // nothing asked for
 
@@ -359,7 +359,7 @@ TEST(PeerSsdEviction, DisabledManagerIsInert) {
   cfg.enabled = false;
   PeerSsdManager mgr(cfg);
 
-  EXPECT_FALSE(mgr.Write("K", OneSeg("data"), 4));
+  EXPECT_FALSE(Put(mgr, "K", "data"));
   EXPECT_FALSE(mgr.Evict("K"));
   EXPECT_TRUE(mgr.EvictionCandidates(100).empty());
   std::vector<char> buf(4);
