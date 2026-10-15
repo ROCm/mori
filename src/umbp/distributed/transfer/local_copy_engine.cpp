@@ -32,10 +32,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "umbp/distributed/transfer/plan_builder.h"
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -83,24 +86,6 @@ inline bool NtSupported() { return __builtin_cpu_supports("avx2"); }
 inline void NtCopyAvx2(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
 inline bool NtSupported() { return false; }
 #endif
-
-// True iff [next, ...) is exactly adjacent after [base, base+len).
-inline bool AdjacentNoOverflow(size_t base, size_t len, size_t next) {
-  return len <= std::numeric_limits<size_t>::max() - base && base + len == next;
-}
-
-struct PtrPairKey {
-  const void* src;
-  const void* dst;
-  bool operator==(const PtrPairKey& o) const noexcept { return src == o.src && dst == o.dst; }
-};
-struct PtrPairKeyHash {
-  size_t operator()(const PtrPairKey& k) const noexcept {
-    size_t h = std::hash<const void*>{}(k.src);
-    h ^= std::hash<const void*>{}(k.dst) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-  }
-};
 
 // Every plan this engine produces is executed before Submit returns, so the
 // handle only has to replay the outcome.
@@ -378,76 +363,40 @@ bool LocalCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) 
 }
 
 namespace {
-class LocalCopyPlanBuilder final : public TransferPlanBuilder {
- public:
-  explicit LocalCopyPlanBuilder(const LocalCopyEngine& engine) : engine_(engine) {}
-  void Add(const TransferItem& item) override {
-    if (item.size == 0) return;
-    if (!engine_.CanHandle(item.src, item.dst)) {
-      out.rejected_tags.push_back(item.tag);
-      return;
-    }
-    // Bounds are checked here, once, rather than per copy: a page index that
-    // does not fit its buffer is a bug in the backend's slot bookkeeping, and
-    // the key must be failed rather than copied past the end.
-    if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
-        item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
-      out.rejected_tags.push_back(item.tag);
-      return;
-    }
+// One plan per (src, dst) buffer pair; adjacent ranges merge into one copy.
+struct LocalCopyPlanTraits {
+  static constexpr bool kGroups = true;
+  using Key = PtrPairKey;
+  using KeyHash = PtrPairKeyHash;
 
-    const PtrPairKey key{item.src.host_ptr, item.dst.host_ptr};
-    auto it = pair_to_plan.find(key);
-    size_t pi;
-    if (it == pair_to_plan.end()) {
-      pi = out.plans.size();
-      pair_to_plan.emplace(key, pi);
-      TransferPlan plan;
-      plan.src = item.src;
-      plan.dst = item.dst;
-      plan.dir = TransferDirection::kLocal;
-      out.plans.push_back(std::move(plan));
-    } else {
-      pi = it->second;
-    }
-    TransferPlan& plan = out.plans[pi];
-    const size_t so = static_cast<size_t>(item.src_offset);
-    const size_t dof = static_cast<size_t>(item.dst_offset);
-    const size_t sz = static_cast<size_t>(item.size);
-    const bool can_coalesce = !plan.sizes.empty() &&
-                              AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
-                              AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof);
-    if (can_coalesce) {
-      plan.sizes.back() += sz;
-    } else {
-      plan.src_offsets.push_back(so);
-      plan.dst_offsets.push_back(dof);
-      plan.sizes.push_back(sz);
-    }
-    if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
+  const LocalCopyEngine& engine;
+
+  std::optional<Key> Admit(const TransferItem& item) const {
+    if (!engine.CanHandle(item.src, item.dst) || !ItemInBounds(item)) return std::nullopt;
+    return Key{item.src.host_ptr, item.dst.host_ptr};
   }
-  TransferPlanSet Finish() override { return std::move(out); }
-
- private:
-  const LocalCopyEngine& engine_;
-  TransferPlanSet out;
-  // Grows with distinct endpoint pairs, rather than reserving two hash
-  // buckets for every page fragment in the batch.
-  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
+  bool Joins(size_t, const TransferPlan&, const Key&, const TransferItem&) const { return true; }
+  TransferPlan NewPlan(const Key&, const TransferItem& item) const {
+    TransferPlan plan;
+    plan.src = item.src;
+    plan.dst = item.dst;
+    plan.dir = TransferDirection::kLocal;
+    return plan;
+  }
+  void Append(size_t, TransferPlan* plan, const Key&, const TransferItem& item) const {
+    AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
+  }
 };
 }  // namespace
 
 std::unique_ptr<TransferPlanBuilder> LocalCopyEngine::CreatePlanBuilder(
-    size_t /*expected_items*/) const {
-  return std::make_unique<LocalCopyPlanBuilder>(*this);
+    size_t expected_items) const {
+  return std::make_unique<GroupedPlanBuilder<LocalCopyPlanTraits>>(LocalCopyPlanTraits{*this},
+                                                                   expected_items);
 }
 
 TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  auto builder = CreatePlanBuilder();
-  for (const auto& item : items) {
-    builder->Add(item);
-  }
-  return builder->Finish();
+  return PlanViaBuilder(*this, items);
 }
 
 std::unique_ptr<TransferHandle> LocalCopyEngine::Submit(std::vector<TransferPlan> plans) {

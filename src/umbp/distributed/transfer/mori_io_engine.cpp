@@ -28,74 +28,24 @@
 #include <iterator>
 #include <limits>
 #include <msgpack.hpp>
+#include <optional>
 #include <utility>
+#include <vector>
 
 #include "mori/io/backend.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
 
 namespace {
 
-// Bucket key for grouping page transfers by their endpoint pair.
-//
-// MemoryUniqueId is allocated per IOEngine, so two DIFFERENT peers can both
-// publish buffer id 1 — the id alone does NOT identify an endpoint.  The map
-// therefore buckets on ids (cheap, no string in the key) and each bucket holds
-// candidate plan indices that the caller disambiguates by comparing engine
-// keys.  Collisions are rare, so the string compare is off the common path.
-struct PairKey {
-  mori::io::MemoryUniqueId src;
-  mori::io::MemoryUniqueId dst;
-  bool operator==(const PairKey& o) const noexcept { return src == o.src && dst == o.dst; }
-};
-struct PairKeyHash {
-  size_t operator()(const PairKey& k) const noexcept {
-    // hash_combine (boost-style): independent of size_t width.
-    size_t h = std::hash<mori::io::MemoryUniqueId>{}(k.src);
-    h ^= std::hash<mori::io::MemoryUniqueId>{}(k.dst) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
 // Do `plan` and `item` name the same two endpoints?  Compares engine keys, not
-// just ids, for the reason above.
+// just ids: a MemoryUniqueId is allocated per IOEngine, so two different peers
+// can both publish buffer id 1.
 bool SameEndpoints(const TransferPlan& plan, const TransferRef& src, const TransferRef& dst) {
   return plan.src.mem.id == src.mem.id && plan.dst.mem.id == dst.mem.id &&
          plan.src.mem.engineKey == src.mem.engineKey && plan.dst.mem.engineKey == dst.mem.engineKey;
-}
-
-// True iff [next, ...) is exactly adjacent after [base, base+len), with no
-// size_t overflow in base+len.  Used to coalesce contiguous SG segments.
-inline bool AdjacentNoOverflow(size_t base, size_t len, size_t next) {
-  return len <= std::numeric_limits<size_t>::max() - base && base + len == next;
-}
-
-// Append one segment to `plan`, coalescing with the previous when BOTH sides
-// are exactly contiguous.
-//
-// This is NOT redundant with the RDMA backend's own WR merging: the backend
-// would fold these into the same WR either way, but doing it here shrinks the
-// inner SG vector it has to sort/merge (O(M log M)) and allocate, which matters
-// when M is large (big batch x pages).  Same bytes, so per-plan failure
-// granularity is unchanged.  The merged size must stay within uint32_t since
-// the backend stores it in ibv_sge.length.
-void AppendSegment(TransferPlan* plan, size_t src_off, size_t dst_off, size_t size, size_t tag) {
-  const bool can_coalesce =
-      !plan->sizes.empty() &&
-      AdjacentNoOverflow(plan->src_offsets.back(), plan->sizes.back(), src_off) &&
-      AdjacentNoOverflow(plan->dst_offsets.back(), plan->sizes.back(), dst_off) &&
-      plan->sizes.back() <= static_cast<size_t>(std::numeric_limits<uint32_t>::max()) - size;
-  if (can_coalesce) {
-    plan->sizes.back() += size;
-  } else {
-    plan->src_offsets.push_back(src_off);
-    plan->dst_offsets.push_back(dst_off);
-    plan->sizes.push_back(size);
-  }
-  // De-dup contributing tags: a single item's pages arrive consecutively
-  // within a pair, so a back() check suffices.
-  if (plan->tags.empty() || plan->tags.back() != tag) plan->tags.push_back(tag);
 }
 
 }  // namespace
@@ -416,116 +366,132 @@ bool MoriIoEngine::CanHandle(const TransferRef& src, const TransferRef& dst) con
   return IsBounceable(local) && bounce_size_ > 0;  // staged through the pool
 }
 
-TransferPlanSet MoriIoEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  if (items.empty()) return out;
+namespace {
 
-  // Direct (zero-copy) groups, bucketed by the endpoint MR id pair; a bucket
-  // holds candidate plan indices disambiguated by engine key (see PairKey).
-  // First-appearance order is preserved so submit order stays deterministic.
-  std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> pair_to_plans;
-  pair_to_plans.reserve(items.size() * 2);
-
-  // Bounce groups, bucketed by (remote MR id, direction).  Each accumulates
-  // until the pool is full, then a fresh plan starts — several plans over one
-  // pool are fine because Submit runs each to completion before the next.
-  std::unordered_map<PairKey, std::vector<size_t>, PairKeyHash> bounce_to_plans;
-  std::vector<uint64_t> bounce_cursor;  // parallel to out.plans, only for bounce plans
-
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    const bool src_remote = IsRemoteMemory(item.src, local_engine_key_);
-    const bool dst_remote = IsRemoteMemory(item.dst, local_engine_key_);
-    if (src_remote == dst_remote) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
+// Plans for MoriIoEngine, in first-appearance order so submit order stays
+// deterministic.
+//
+// Zero copy: items between the same two registered buffers share a plan,
+// coalescing segments that are exactly contiguous on BOTH sides.  This is NOT
+// redundant with the RDMA backend's own WR merging: it shrinks the SG vector
+// the backend sorts/merges (O(M log M)) and allocates, which matters for a big
+// batch x pages.  A merged segment must fit ibv_sge.length (uint32_t).
+//
+// Staged: an item whose local side is unregistered rides the bounce pool.  It
+// groups by (remote buffer, direction), takes the plan's next bounce offset,
+// and once a plan's pool is full it is retired for a fresh one -- several
+// plans over one pool are fine because Submit runs each to completion before
+// the next.  An item larger than the whole pool is rejected.
+struct MoriIoPlanTraits {
+  static constexpr bool kGroups = true;
+  // Memory ids are allocated per IOEngine, so two peers can both publish id 1:
+  // a key only buckets endpoints, and Joins tells them apart by engine key.
+  struct Key {
+    bool bounce;
+    TransferDirection dir;
+    mori::io::MemoryUniqueId first;   // src id; the remote id when staged
+    mori::io::MemoryUniqueId second;  // dst id; 0 when staged
+    bool operator==(const Key& o) const noexcept {
+      return bounce == o.bounce && dir == o.dir && first == o.first && second == o.second;
     }
+  };
+  struct KeyHash {
+    size_t operator()(const Key& k) const noexcept {
+      const size_t ids = HashCombine(std::hash<mori::io::MemoryUniqueId>{}(k.first),
+                                     std::hash<mori::io::MemoryUniqueId>{}(k.second));
+      return HashCombine(ids, (k.bounce ? 2u : 0u) | (k.dir == TransferDirection::kPush ? 1u : 0u));
+    }
+  };
+
+  const std::string& local_key;
+  uint64_t bounce_size;
+  const TransferRef& bounce_ref;
+  // Per staged plan, by plan index: the next free bounce offset, and whether a
+  // full pool retired the plan.
+  struct BounceState {
+    uint64_t cursor = 0;
+    bool retired = false;
+  };
+  std::vector<BounceState> bounce;
+
+  static constexpr size_t kMaxSgeBytes = std::numeric_limits<uint32_t>::max();
+
+  std::optional<Key> Admit(const TransferItem& item) const {
+    const bool src_remote = IsRemoteMemory(item.src, local_key);
+    const bool dst_remote = IsRemoteMemory(item.dst, local_key);
+    if (src_remote == dst_remote) return std::nullopt;  // both local or both remote
     const TransferDirection dir = dst_remote ? TransferDirection::kPush : TransferDirection::kPull;
     const TransferRef& local = src_remote ? item.dst : item.src;
+    if (local.HasMemoryDesc()) return Key{false, dir, item.src.mem.id, item.dst.mem.id};
+    if (bounce_size == 0 || !IsBounceable(local) || item.size > bounce_size) return std::nullopt;
     const TransferRef& remote = src_remote ? item.src : item.dst;
-    const uint64_t local_off = src_remote ? item.dst_offset : item.src_offset;
-    const uint64_t remote_off = src_remote ? item.src_offset : item.dst_offset;
-
-    if (local.HasMemoryDesc()) {
-      const PairKey key{item.src.mem.id, item.dst.mem.id};
-      auto& candidates = pair_to_plans[key];
-      size_t pi = out.plans.size();
-      bool found = false;
-      for (size_t cand : candidates) {
-        if (SameEndpoints(out.plans[cand], item.src, item.dst)) {
-          pi = cand;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        candidates.push_back(pi);
-        TransferPlan plan;
-        plan.src = item.src;
-        plan.dst = item.dst;
-        plan.dir = dir;
-        out.plans.push_back(std::move(plan));
-        bounce_cursor.push_back(0);
-      }
-      AppendSegment(&out.plans[pi], item.src_offset, item.dst_offset, item.size, item.tag);
-      continue;
-    }
-
-    // Staged: the local endpoint is addressable host memory but not registered.
-    if (bounce_size_ == 0 || !IsBounceable(local) || item.size > bounce_size_) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
-    }
-    const PairKey key{remote.mem.id, static_cast<mori::io::MemoryUniqueId>(dir)};
-    auto& bounce_candidates = bounce_to_plans[key];
-    size_t pi = out.plans.size();
-    bool fresh = true;
-    for (size_t& cand : bounce_candidates) {
-      const TransferPlan& p = out.plans[cand];
-      const TransferRef& p_remote = (dir == TransferDirection::kPush) ? p.dst : p.src;
-      if (p.dir != dir || p_remote.mem.engineKey != remote.mem.engineKey) continue;
-      // Right endpoint; reuse it only while the pool still has room, otherwise
-      // retire it and open a fresh plan in its place.
-      if (bounce_cursor[cand] + item.size <= bounce_size_) {
-        pi = cand;
-        fresh = false;
-      } else {
-        cand = pi;  // this bucket entry now names the plan we are about to add
-      }
-      break;
-    }
-    if (fresh) {
-      if (bounce_candidates.empty() || std::find(bounce_candidates.begin(), bounce_candidates.end(),
-                                                 pi) == bounce_candidates.end()) {
-        bounce_candidates.push_back(pi);
-      }
-      TransferPlan plan;
-      plan.dir = dir;
-      plan.uses_bounce = true;
-      // The local endpoint IS the bounce region; the remote side is unchanged.
-      if (dir == TransferDirection::kPush) {
-        plan.src = bounce_ref_;
-        plan.dst = remote;
-      } else {
-        plan.src = remote;
-        plan.dst = bounce_ref_;
-      }
-      out.plans.push_back(std::move(plan));
-      bounce_cursor.push_back(0);
-    }
-    TransferPlan& plan = out.plans[pi];
-    const uint64_t bounce_off = bounce_cursor[pi];
-    bounce_cursor[pi] += item.size;
-    if (dir == TransferDirection::kPush) {
-      AppendSegment(&plan, bounce_off, remote_off, item.size, item.tag);
-    } else {
-      AppendSegment(&plan, remote_off, bounce_off, item.size, item.tag);
-    }
-    plan.bounce_copies.push_back(TransferPlan::BounceCopy{
-        static_cast<char*>(local.host_ptr) + local_off, bounce_off, item.size});
+    return Key{true, dir, remote.mem.id, 0};
   }
 
-  return out;
+  bool Joins(size_t index, const TransferPlan& plan, const Key& key, const TransferItem& item) {
+    if (!key.bounce) return SameEndpoints(plan, item.src, item.dst);
+    const bool push = key.dir == TransferDirection::kPush;
+    const TransferRef& remote = push ? item.dst : item.src;
+    const TransferRef& plan_remote = push ? plan.dst : plan.src;
+    if (plan.dir != key.dir || plan_remote.mem.engineKey != remote.mem.engineKey) return false;
+    BounceState& state = bounce[index];
+    if (state.retired) return false;
+    if (state.cursor + item.size <= bounce_size) return true;
+    state.retired = true;  // full: the item opens a fresh plan instead
+    return false;
+  }
+
+  TransferPlan NewPlan(const Key& key, const TransferItem& item) const {
+    TransferPlan plan;
+    plan.dir = key.dir;
+    if (!key.bounce) {
+      plan.src = item.src;
+      plan.dst = item.dst;
+    } else if (key.dir == TransferDirection::kPush) {
+      // The local endpoint IS the bounce region; the remote side is unchanged.
+      plan.uses_bounce = true;
+      plan.src = bounce_ref;
+      plan.dst = item.dst;
+    } else {
+      plan.uses_bounce = true;
+      plan.src = item.src;
+      plan.dst = bounce_ref;
+    }
+    return plan;
+  }
+
+  void Append(size_t index, TransferPlan* plan, const Key& key, const TransferItem& item) {
+    if (!key.bounce) {
+      AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag, true,
+                    kMaxSgeBytes);
+      return;
+    }
+    if (bounce.size() <= index) bounce.resize(index + 1);
+    const uint64_t bounce_off = bounce[index].cursor;
+    bounce[index].cursor += item.size;
+    const bool push = key.dir == TransferDirection::kPush;
+    const TransferRef& local = push ? item.src : item.dst;
+    const uint64_t local_off = push ? item.src_offset : item.dst_offset;
+    const uint64_t remote_off = push ? item.dst_offset : item.src_offset;
+    if (push) {
+      AppendSegment(plan, bounce_off, remote_off, item.size, item.tag, true, kMaxSgeBytes);
+    } else {
+      AppendSegment(plan, remote_off, bounce_off, item.size, item.tag, true, kMaxSgeBytes);
+    }
+    plan->bounce_copies.push_back(TransferPlan::BounceCopy{
+        static_cast<char*>(local.host_ptr) + local_off, bounce_off, item.size});
+  }
+};
+
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(size_t expected_items) const {
+  return std::make_unique<GroupedPlanBuilder<MoriIoPlanTraits>>(
+      MoriIoPlanTraits{local_engine_key_, bounce_size_, bounce_ref_, {}}, expected_items);
+}
+
+TransferPlanSet MoriIoEngine::Plan(const std::vector<TransferItem>& items) const {
+  return PlanViaBuilder(*this, items);
 }
 
 // ---------------------------------------------------------------------------

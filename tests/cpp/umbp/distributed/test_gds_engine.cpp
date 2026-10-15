@@ -84,14 +84,34 @@ TEST(GdsEngine, PlansOneRangePerItemAndBoundsToBuffer) {
   std::vector<char> stub(4096);
   TransferRef gpu = GpuBuf(stub.data(), stub.size());
 
+  TransferRef host = TransferRef::HostBytes(stub.data(), stub.size());
   std::vector<TransferItem> items{
-      MakeItem(file, 0, gpu, 0, 2048, 0), MakeItem(file, 2048, gpu, 2048, 2048, 1),
-      MakeItem(file, 0, gpu, 0, 8192, 2),  // overruns the 4096-byte buffer
+      MakeItem(file, 0, gpu, 0, 2048, 0),
+      MakeItem(file, 2048, gpu, 2048, 2048, 1),  // adjacent, still its own plan
+      MakeItem(file, 0, gpu, 0, 8192, 2),        // overruns the 4096-byte buffer
+      MakeItem(file, 0, host, 0, 64, 3),         // host destination: not ours
+      MakeItem(file, 0, gpu, 0, 0, 4),           // empty: dropped, not rejected
   };
   TransferPlanSet planned = engine.Plan(items);
-  EXPECT_EQ(std::vector<size_t>({2}), planned.rejected_tags);
+  EXPECT_EQ(std::vector<size_t>({2, 3}), planned.rejected_tags);
   ASSERT_EQ(2u, planned.plans.size());
   for (const auto& p : planned.plans) EXPECT_EQ(1u, p.sizes.size());
+  EXPECT_EQ(std::vector<size_t>({2048}), planned.plans[1].src_offsets);
+  EXPECT_EQ(std::vector<size_t>({1}), planned.plans[1].tags);
+
+  // Plan() is the builder over a vector: item by item gives the same plans.
+  auto builder = engine.CreatePlanBuilder();
+  for (const auto& item : items) builder->Add(item);
+  TransferPlanSet built = builder->Finish();
+  EXPECT_EQ(planned.rejected_tags, built.rejected_tags);
+  ASSERT_EQ(planned.plans.size(), built.plans.size());
+  for (size_t i = 0; i < planned.plans.size(); ++i) {
+    EXPECT_EQ(planned.plans[i].src.file_fd, built.plans[i].src.file_fd);
+    EXPECT_EQ(planned.plans[i].src_offsets, built.plans[i].src_offsets);
+    EXPECT_EQ(planned.plans[i].dst_offsets, built.plans[i].dst_offsets);
+    EXPECT_EQ(planned.plans[i].sizes, built.plans[i].sizes);
+    EXPECT_EQ(planned.plans[i].tags, built.plans[i].tags);
+  }
 }
 
 // ---------------------------------------------------------------------------

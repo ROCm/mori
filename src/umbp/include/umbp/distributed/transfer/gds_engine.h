@@ -80,6 +80,8 @@ class GdsEngine final : public TransferEngine {
   // out deliberately: hipFileRead already moves a contiguous range in one DMA,
   // and a batch's ranges land in disjoint GPU buffers.
   TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  // Plan() one item at a time; Plan() itself is this builder over the vector.
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Performs the reads inline with hipFileRead; the returned handle is already
   // settled (same contract as the copy engines).

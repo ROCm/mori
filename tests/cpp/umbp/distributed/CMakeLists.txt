@@ -477,9 +477,10 @@ target_compile_features(test_peer_pool PRIVATE cxx_std_17)
 add_test(NAME umbp_peer_pool COMMAND test_peer_pool)
 
 # test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
-# LocalCopyEngine's planner/executor and CompositeTransferEngine's fan-out
-# registration + per-pair engine selection.  MoriIoEngine needs a real fabric
-# and is covered end-to-end by test_cross_node_smoke instead.
+# every memory engine's planner, LocalCopyEngine's executor and
+# CompositeTransferEngine's fan-out registration + per-pair engine selection.
+# MoriIoEngine's transfers need a real fabric and are covered end-to-end by
+# test_cross_node_smoke; its planner is tested here.
 add_executable(test_transfer_engine test_transfer_engine.cpp)
 target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
