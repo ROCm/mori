@@ -222,6 +222,10 @@ class SsdBackend : public MediumBackend {
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
+  // A reader's span: readers leave the last eighth of the arena to writes.
+  StagingSpan AcquireReadSpanLocked(uint32_t page_count);
+  // The largest object, in pages, a reader can stage (and so a writer may store).
+  uint32_t ReadablePages() const;
   void ReleaseStagingSpanLocked(StagingSpan span);
   // Caller MUST hold mutex_.  Drops one holder of `key`'s lease if `token`
   // still names it; true when that returned the span to the arena.
