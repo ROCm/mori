@@ -43,19 +43,20 @@ namespace moe {
 /* ---------------------------------------------------------------------------------------------- */
 namespace v1 {
 
-// With disableRdmaAtomics, cross-node signals are RDMA WRITEs instead of AMO_ADDs. That is only
+// With NoRdmaAtomics, cross-node signals are RDMA WRITEs instead of AMO_ADDs. That is only
 // equivalent because every signal slot has a single writer per round and its owner zeroes it
-// before the next round, so the add always lands on zero.
-template <typename T>
-inline __device__ core::atomicType ChunkSignalOp(const EpDispatchCombineArgs<T>& args) {
-  return args.disableRdmaAtomics ? core::atomicType::AMO_SET : core::atomicType::AMO_ADD;
+// before the next round, so the add always lands on zero. It is a template parameter so the
+// default kernels compile without the write path.
+template <bool NoRdmaAtomics>
+inline __device__ constexpr core::atomicType ChunkSignalOp() {
+  return NoRdmaAtomics ? core::atomicType::AMO_SET : core::atomicType::AMO_ADD;
 }
 
-template <typename T>
+template <bool NoRdmaAtomics, typename T>
 inline __device__ void SignalNodeRecvTokenNum(EpDispatchCombineArgs<T>& args, int srcNode,
                                               uint64_t value, int proxyPe) {
   size_t offset = srcNode * sizeof(uint64_t);
-  if (args.disableRdmaAtomics) {
+  if constexpr (NoRdmaAtomics) {
     shmem::ShmemPutTypeImmNbiThread<uint64_t>(args.nodeRecvTokenNumMemObj, offset, value, proxyPe);
   } else {
     shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.nodeRecvTokenNumMemObj, offset, value,
@@ -71,12 +72,12 @@ inline __device__ size_t InterNodeBarrierQpSlot(const EpDispatchCombineConfig& c
   return config.worldSize + static_cast<size_t>(senderPe) * config.numQpPerPe + qpId;
 }
 
-template <typename T>
+template <bool NoRdmaAtomics, typename T>
 inline __device__ void SignalInterNodeBarrier(EpDispatchCombineArgs<T>& args, int proxyPe,
                                               uint64_t barrierFlag) {
   const EpDispatchCombineConfig& config = args.config;
   for (int i = 0; i < config.numQpPerPe; i++) {
-    if (args.disableRdmaAtomics) {
+    if constexpr (NoRdmaAtomics) {
       shmem::ShmemPutTypeImmNbiThread<uint64_t>(
           args.crossDeviceBarrierMemObj,
           InterNodeBarrierQpSlot(config, config.rank, i) * sizeof(uint64_t), barrierFlag, proxyPe,
@@ -89,12 +90,13 @@ inline __device__ void SignalInterNodeBarrier(EpDispatchCombineArgs<T>& args, in
   }
 }
 
-template <typename T>
-inline __device__ void WaitInterNodeBarrier(EpDispatchCombineArgs<T>& args, int proxyPe,
+// localBarrierPtr is loaded by the caller before its lane check, as the atomic barrier always did.
+template <bool NoRdmaAtomics, typename T>
+inline __device__ void WaitInterNodeBarrier(EpDispatchCombineArgs<T>& args,
+                                            uint64_t* localBarrierPtr, int proxyPe,
                                             uint64_t barrierFlag) {
   const EpDispatchCombineConfig& config = args.config;
-  uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
-  if (args.disableRdmaAtomics) {
+  if constexpr (NoRdmaAtomics) {
     // A peer cannot write round r+1 before this rank leaves round r (it needs this rank's
     // round r+1 dispatch), so the slot is exactly barrierFlag. Waiting for == rather than >=
     // turns a barrierFlag desync into a hang instead of an early, silent pass.
@@ -221,7 +223,7 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   }
 }
 
-template <typename T, bool DEDUP>
+template <typename T, bool DEDUP, bool NoRdmaAtomics>
 inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -301,8 +303,8 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
                 args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
                 args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, count * xferBytes,
                 args.interNodeChunkFlagMemObj,
-                (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag, ChunkSignalOp(args),
-                proxyPe, qpId);
+                (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t), flag,
+                ChunkSignalOp<NoRdmaAtomics>(), proxyPe, qpId);
           }
           if (!args.replayMode) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
         }
@@ -338,7 +340,7 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
               args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
               args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
               args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-              tokenNum + 1, ChunkSignalOp(args), proxyPe, qpId);
+              tokenNum + 1, ChunkSignalOp<NoRdmaAtomics>(), proxyPe, qpId);
         }
         if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
       }
@@ -353,13 +355,13 @@ inline __device__ void DispatchInterNodeSend(EpDispatchCombineArgs<T>& args) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      SignalNodeRecvTokenNum(args, myNode, numTokenSignal, proxyPe);
+      SignalNodeRecvTokenNum<NoRdmaAtomics>(args, myNode, numTokenSignal, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
   }
 }
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -408,7 +410,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
             args.interNodeV1TokBufs.dispatchInp, remoteIdx * xferBytes,
             args.interNodeV1TokBufs.dispatchStaging, stagingTokOffset, tokenNum * xferBytes,
             args.interNodeChunkFlagMemObj, (myNode * maxChunkNum + flagSlotId) * sizeof(uint64_t),
-            tokenNum + 1, ChunkSignalOp(args), proxyPe, qpId);
+            tokenNum + 1, ChunkSignalOp<NoRdmaAtomics>(), proxyPe, qpId);
       }
       if (shouldSend) args.interNodeDispSendMap[nNodes * tokenId + i] = destTokId;
     }
@@ -422,7 +424,7 @@ inline __device__ void DispatchInterNodeLLSend(EpDispatchCombineArgs<T>& args) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
       index_t numTokenSignal =
           core::AtomicLoadRelaxed(args.blockFlagCounter + laneId) * warpSize + 1;
-      SignalNodeRecvTokenNum(args, myNode, numTokenSignal, proxyPe);
+      SignalNodeRecvTokenNum<NoRdmaAtomics>(args, myNode, numTokenSignal, proxyPe);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[1] = 0;
   }
@@ -739,11 +741,11 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
 
 }  // namespace v1
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 __device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
-    v1::DispatchInterNodeSend<T, true>(args);
+    v1::DispatchInterNodeSend<T, true, NoRdmaAtomics>(args);
     v1::DispatchInterNodeRecv(args);
   } else {
     v1::DispatchIntraNode(args);
@@ -751,9 +753,9 @@ __device__ void EpDispatchInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) 
   v1::DispatchSync(args);
 }
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchInterNodeV1Kernel_body<T>(args);
+  EpDispatchInterNodeV1Kernel_body<T, NoRdmaAtomics>(args);
 }
 
 template <typename T>
@@ -801,11 +803,11 @@ __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args) {
   EpDispatchCopyToStaging_body<T>(args);
 }
 
-template <typename T, bool EnableStdMoE>
+template <typename T, bool EnableStdMoE, bool NoRdmaAtomics>
 __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
   if (blockId < args.rdmaBlockNum) {
-    v1::DispatchInterNodeLLSend<T>(args);
+    v1::DispatchInterNodeLLSend<T, NoRdmaAtomics>(args);
     v1::DispatchInterNodeLLRecv(args);
   } else {
     v1::DispatchIntraNode(args);
@@ -819,9 +821,9 @@ __device__ void EpDispatchInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs
 #endif
 }
 
-template <typename T, bool EnableStdMoE>
+template <typename T, bool EnableStdMoE, bool NoRdmaAtomics>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
-  EpDispatchInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+  EpDispatchInterNodeV1KernelLowLatency_body<T, EnableStdMoE, NoRdmaAtomics>(args);
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -1015,7 +1017,7 @@ __forceinline__ __device__ void CombineIntraNodeLLTyped(EpDispatchCombineArgs<T>
   }
 }
 
-template <typename TokT, typename T>
+template <typename TokT, bool NoRdmaAtomics, typename T>
 __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& args,
                                                       size_t tokHiddenBytes,
                                                       size_t tokCombXferBytes) {
@@ -1172,18 +1174,19 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      SignalInterNodeBarrier(args, proxyPe, barrierFlag);
+      SignalInterNodeBarrier<NoRdmaAtomics>(args, proxyPe, barrierFlag);
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
+    uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      WaitInterNodeBarrier(args, proxyPe, barrierFlag);
+      WaitInterNodeBarrier<NoRdmaAtomics>(args, localBarrierPtr, proxyPe, barrierFlag);
     }
   }
 }
 
-template <typename TokT, typename T>
+template <typename TokT, bool NoRdmaAtomics, typename T>
 __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>& args,
                                                         size_t tokHiddenBytes,
                                                         size_t tokCombXferBytes) {
@@ -1309,23 +1312,26 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      SignalInterNodeBarrier(args, proxyPe, barrierFlag);
+      SignalInterNodeBarrier<NoRdmaAtomics>(args, proxyPe, barrierFlag);
       __threadfence_system();
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
     // Wait other nodes
+    uint64_t* localBarrierPtr = args.crossDeviceBarrierMemObj->template GetAs<uint64_t*>();
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      WaitInterNodeBarrier(args, proxyPe, barrierFlag);
+      WaitInterNodeBarrier<NoRdmaAtomics>(args, localBarrierPtr, proxyPe, barrierFlag);
     }
   }
 }
 
 }  // namespace combine_impl
 
+// Force-inlined: the default and atomic-free combine kernels share this instantiation, and with
+// two callers the compiler stops inlining it for fp4, which adds a call frame to the kernel.
 template <typename T>
-inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
+__forceinline__ __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
@@ -1361,7 +1367,7 @@ inline __device__ void CombineIntraNodeLL(EpDispatchCombineArgs<T>& args) {
   combine_impl::CombineIntraNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
 }
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -1373,13 +1379,14 @@ inline __device__ void CombineInterNode(EpDispatchCombineArgs<T>& args) {
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineInterNodeTyped<TokT, NoRdmaAtomics>(args, tokHiddenBytes,
+                                                             tokCombXferBytes);
     return;
   }
-  combine_impl::CombineInterNodeTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineInterNodeTyped<T, NoRdmaAtomics>(args, hiddenBytes, combXferBytes);
 }
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
@@ -1390,27 +1397,28 @@ inline __device__ void CombineInterNodeLL(EpDispatchCombineArgs<T>& args) {
     const size_t tokHiddenBytes = hiddenDim * sizeof(TokT);
     const size_t tokCombXferBytes =
         (args.weightsBuf == nullptr) ? tokHiddenBytes : tokHiddenBytes + weightBytes;
-    combine_impl::CombineInterNodeLLTyped<TokT>(args, tokHiddenBytes, tokCombXferBytes);
+    combine_impl::CombineInterNodeLLTyped<TokT, NoRdmaAtomics>(args, tokHiddenBytes,
+                                                               tokCombXferBytes);
     return;
   }
-  combine_impl::CombineInterNodeLLTyped<T>(args, hiddenBytes, combXferBytes);
+  combine_impl::CombineInterNodeLLTyped<T, NoRdmaAtomics>(args, hiddenBytes, combXferBytes);
 }
 }  // namespace v1
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 __device__ void EpCombineInterNodeV1Kernel_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
   if (blockId < args.rdmaBlockNum) {
-    v1::CombineInterNode(args);
+    v1::CombineInterNode<T, NoRdmaAtomics>(args);
   } else {
     v1::CombineIntraNode(args);
   }
 }
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args) {
-  EpCombineInterNodeV1Kernel_body<T>(args);
+  EpCombineInterNodeV1Kernel_body<T, NoRdmaAtomics>(args);
 }
 
 namespace combine_all_impl {
@@ -1554,7 +1562,7 @@ __global__ void EpCombineAll(EpDispatchCombineArgs<T> args) {
   EpCombineAll_body<T>(args);
 }
 
-template <typename T, bool EnableStdMoE>
+template <typename T, bool EnableStdMoE, bool NoRdmaAtomics>
 __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<T> args) {
   DEF_COMMON_VARS;
 
@@ -1566,15 +1574,15 @@ __device__ void EpCombineInterNodeV1KernelLowLatency_body(EpDispatchCombineArgs<
 #endif
 
   if (blockId < args.rdmaBlockNum) {
-    v1::CombineInterNodeLL(args);
+    v1::CombineInterNodeLL<T, NoRdmaAtomics>(args);
   } else {
     v1::CombineIntraNodeLL(args);
   }
 }
 
-template <typename T, bool EnableStdMoE>
+template <typename T, bool EnableStdMoE, bool NoRdmaAtomics>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args) {
-  EpCombineInterNodeV1KernelLowLatency_body<T, EnableStdMoE>(args);
+  EpCombineInterNodeV1KernelLowLatency_body<T, EnableStdMoE, NoRdmaAtomics>(args);
 }
 
 template <typename T>

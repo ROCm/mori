@@ -95,6 +95,13 @@ using namespace mori::moe;
   MORI_FP4(WRAP_BOOL(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B))         \
   WRAP_BOOL(kernel, f32##bool_suffix, float, B)
 
+#define WRAP_ALL_TYPES_BOOL2(kernel, bool_suffix, B1, B2)                                \
+  WRAP_BOOL2(kernel, bf16##bool_suffix, hip_bfloat16, B1, B2)                            \
+  MORI_FP8_FNUZ(WRAP_BOOL2(kernel, fp8_fnuz##bool_suffix, __hip_fp8_e4m3_fnuz, B1, B2)) \
+  MORI_FP8_OCP(WRAP_BOOL2(kernel, fp8_ocp##bool_suffix, __hip_fp8_e4m3, B1, B2))        \
+  MORI_FP4(WRAP_BOOL2(kernel, fp4##bool_suffix, mori::mori_fp4x2_e2m1, B1, B2))         \
+  WRAP_BOOL2(kernel, f32##bool_suffix, float, B1, B2)
+
 #define WRAP_BOOL3(kernel, suffix, T, B1, B2, B3)                               \
   extern "C" __global__ void kernel##_##suffix(EpDispatchCombineArgs<T> args) { \
     kernel##_body<T, B1, B2, B3>(args);                                         \

@@ -584,9 +584,12 @@ void EpDispatchCombineHandle::InitializeBarrier() {
                                   : 1;
   // The atomic-free InterNodeV1 barrier keeps one slot per (sender rank, qp) after the
   // worldSize per-rank slots, so it never aliases the intra-node barrier slots.
-  size_t crossDeviceBarrierSize =
-      std::max(barrierSize * 2 * sizeof(uint64_t),
-               static_cast<size_t>(config.worldSize) * (1 + config.numQpPerPe) * sizeof(uint64_t));
+  size_t crossDeviceBarrierSize = barrierSize * 2 * sizeof(uint64_t);
+  if (disableRdmaAtomics) {
+    crossDeviceBarrierSize =
+        std::max(crossDeviceBarrierSize, static_cast<size_t>(config.worldSize) *
+                                             (1 + config.numQpPerPe) * sizeof(uint64_t));
+  }
   crossDeviceBarrierMemObj = MallocSymm(crossDeviceBarrierSize, hipDeviceMallocUncached);
 
   size_t interNodeChunkFlagSize = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
@@ -621,7 +624,6 @@ EpDispatchCombineArgsRaw GetEpDispatchCombineArgsRaw(const EpDispatchCombineHand
   args.config = handle.config;
   args.fp8BlockwiseCombineScaleDim = handle.fp8BlockwiseCombineScaleDim;
   args.rdmaBlockNum = rdmaBlockNum;
-  args.disableRdmaAtomics = handle.disableRdmaAtomics;
   args.curRankNumToken = handle.curRankNumToken;
   args.tokenIndices = handle.tokenIndices;
   args.inpTokenBuf = handle.inpTokenBuf;
