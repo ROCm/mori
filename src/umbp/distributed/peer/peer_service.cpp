@@ -265,18 +265,22 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
 
   grpc::Status EvictKey(grpc::ServerContext* /*ctx*/, const ::umbp::EvictKeyRequest* request,
                         ::umbp::EvictKeyResponse* response) override {
-    // Eviction carries no tier either.  Master drives this to reclaim capacity
-    // it measured per (node, tier), so the pool is free to demote where a tier
-    // configures on_evict offload; otherwise a key mirrored across media is
-    // dropped from ALL of them.  Either way the freed bytes are summed per key
-    // — master sizes its next eviction round off this total.
-    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
-    if (keys.empty()) return grpc::Status::OK;
-    auto evicted =
-        pool_ == nullptr ? std::vector<EvictResult>{} : pool_->Evict(keys, PoolEvictMode::kReclaim);
-    for (size_t i = 0; i < keys.size(); ++i) {
+    // Free each key's copy on the tier the master named (an older master names
+    // none: the medium holding it).  bytes_freed is informational; a queued
+    // demotion reports 0.
+    const int n = request->keys_size();
+    if (n == 0) return grpc::Status::OK;
+    const bool scoped = request->tiers_size() == n;
+    std::vector<PoolEvictRequest> requests(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      requests[i].key = request->keys(i);
+      if (scoped) requests[i].tier = static_cast<TierType>(request->tiers(i));
+    }
+    auto evicted = pool_ == nullptr ? std::vector<PoolEvictResult>{}
+                                    : pool_->Evict(requests, PoolEvictMode::kReclaim);
+    for (size_t i = 0; i < requests.size(); ++i) {
       auto* entry = response->add_evicted();
-      entry->set_key(keys[i]);
+      entry->set_key(requests[i].key);
       entry->set_bytes_freed(i < evicted.size() ? evicted[i].bytes_freed : 0);
     }
     return grpc::Status::OK;

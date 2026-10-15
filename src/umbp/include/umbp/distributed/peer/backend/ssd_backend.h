@@ -167,6 +167,8 @@ class SsdBackend : public MediumBackend {
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
+  // The manager's LRU (always kept) minus keys a staged or migration read holds.
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
