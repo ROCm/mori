@@ -36,9 +36,10 @@ namespace mori::umbp {
 
 namespace {
 
-// Every segment file of every shard stays open for the life of the tier, so a
-// full tier holds about capacity / segment_size descriptors (more under churn:
-// evicted space is not reclaimed, #755).  Past the soft RLIMIT_NOFILE the next
+// Every segment file of every shard stays open until the file is deleted, which
+// is once nothing in it is live, so a full tier holds about capacity /
+// segment_size descriptors (a few more while a deleted segment's fd waits out
+// the GDS grace, see SSDTier::SetRetiredFileHook).  Past the soft RLIMIT_NOFILE the next
 // segment open fails with EMFILE, and so does every write that needs it.  This
 // library also runs inside other programs (sglang, embedded), so it leaves the
 // process-wide limit alone and says what to change; UMBP's own executables

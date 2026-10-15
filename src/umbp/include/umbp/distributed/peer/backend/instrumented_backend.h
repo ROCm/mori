@@ -101,6 +101,7 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override {
     return inner_->EvictionCandidates(max_count);
   }
+  bool OwnsEvictionOrder() const override { return inner_->OwnsEvictionOrder(); }
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
     inner_->SetAutoFlushHook(threshold, std::move(cb));
