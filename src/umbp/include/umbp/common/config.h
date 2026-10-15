@@ -67,7 +67,7 @@ struct UMBPDramConfig {
   std::vector<int> numa_nodes;                // Empty = no NUMA binding.
   bool prefault = true;
   bool numa_strict = false;
-  int prefault_threads = 0;  // 0 = automatic (up to 16 for multi-node tiers), 1 = serial.
+  int prefault_threads = 0;  // 0 = automatic (up to 16), 1 = serial.
 };
 
 struct UMBPIoConfig {

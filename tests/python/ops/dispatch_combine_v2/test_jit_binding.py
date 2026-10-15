@@ -308,3 +308,222 @@ def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
     # silence; there is no size to compute, so it cannot be a return value.
     with pytest.raises(ValueError, match="max_tok_per_rank"):
         ep_staging_bytes(8, 0, 224)
+
+
+# --------------------------------------------------------------------------
+# A caller that binds no staging_base: the plan's default buffer
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def launched(monkeypatch):
+    """The ABI crossing stubbed out: launch() fills the args struct and stops."""
+    monkeypatch.setattr(cb.plan_api._load(), "mori_jit_plan_launch", lambda *a: 0)
+    cb._FALLBACK_STAGING.clear()
+
+
+def _shared_bytes(monkeypatch, n):
+    # The staging decision on any arch: the gfx125x dispatch is the one with
+    # dynamic LDS, so faking it runs the fallback where CI runs.
+    real = cb._EpDispatchJitPlan.info.fget
+    monkeypatch.setattr(
+        cb.EpDispatchPlan,
+        "info",
+        property(lambda self: {**real(self), "sharedBytes": n}),
+    )
+
+
+@pytest.fixture
+def stages(monkeypatch):
+    _shared_bytes(monkeypatch, 1)
+
+
+@pytest.fixture
+def no_staging(monkeypatch):
+    _shared_bytes(monkeypatch, 0)
+
+
+def test_a_dispatch_that_does_not_stage_binds_nothing(launched, no_staging):
+    p = _plan()
+    assert "stagingBase" not in p._defaults
+    p.launch()
+    assert not p._buf.stagingBase
+    assert not cb._FALLBACK_STAGING
+    p.close()
+
+
+def test_an_unbound_plan_gets_staging_at_its_first_launch(launched, stages):
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    p = _plan()
+    assert not cb._FALLBACK_STAGING  # nothing until a launch needs it
+    with pytest.warns(FutureWarning, match="staging_base is not bound") as warned:
+        p.launch()
+    assert warned[0].filename == __file__  # the caller's line, not mori's
+    buf = p._fallback_staging
+    assert p._buf.stagingBase == buf.data_ptr()
+    info = p.info
+    assert buf.numel() == ep_staging_bytes(
+        info["worldSize"], info["maxRecv"], info["scaleBytes"], info["maxTokPerRank"]
+    )
+    # Settled to an address: later launches reuse the cached struct untouched.
+    assert p._defaults["stagingBase"] == buf.data_ptr()
+    assert "stagingBase" not in p._dyn_defs
+    p.close()
+
+
+def test_calling_the_plan_resolves_it_too(launched, stages):
+    p = _plan()
+    with pytest.warns(FutureWarning) as warned:
+        p()
+    assert warned[0].filename == __file__
+    assert p._buf.stagingBase == p._fallback_staging.data_ptr()
+    p.close()
+
+
+def test_unbound_plans_of_one_layout_share_one_buffer(launched, stages):
+    import warnings
+
+    a = _plan()
+    b = _plan(block_num=2 * a.info["blockNum"])
+    resolved = _plan(max_recv=0)  # EpMaxRecv answers a's 1 * 64
+    other = _plan(max_tok_per_rank=128, max_recv=128)
+    with warnings.catch_warnings(record=True) as warned:
+        warnings.simplefilter("always")
+        for p in (a, b, resolved, other):
+            p.launch()
+    # Another geometry, same layout: one buffer, as an op's plans share the op's.
+    assert a._buf.stagingBase == b._buf.stagingBase == resolved._buf.stagingBase
+    assert a._buf.stagingBase != other._buf.stagingBase
+    # One warning per buffer allocated, not per plan.
+    assert [w.category for w in warned] == [FutureWarning, FutureWarning]
+    for p in (a, b, resolved, other):
+        p.close()
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_a_bound_staging_base_is_left_alone(launched, stages, as_tensor):
+    import warnings
+
+    p = _plan()
+    staging = torch.zeros(4096, dtype=torch.uint8, device="cuda")
+    # An address, as mori's op layer and aiter bind it, or the tensor itself.
+    p.bind(staging_base=staging if as_tensor else staging.data_ptr())
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        p.launch()
+    assert p._buf.stagingBase == staging.data_ptr()
+    assert not cb._FALLBACK_STAGING
+    p.close()
+
+
+def test_staging_passed_per_launch_is_left_alone(launched, stages):
+    p = _plan()
+    for _ in range(2):  # the second launch takes the cached struct
+        p.launch(staging_base=1 << 20)
+        assert p._buf.stagingBase == 1 << 20
+    assert not cb._FALLBACK_STAGING
+    p.close()
+
+
+def test_a_launch_argument_wins_over_a_bound_default_every_launch(launched, no_staging):
+    p = _plan()
+    weights = torch.zeros(64, device="cuda")
+    p.bind(weights_buf=weights)  # a non-int default
+    for _ in range(2):  # the second launch takes the cached struct
+        p.launch(weights_buf=1 << 20)
+        assert p._buf.weightsBuf == 1 << 20
+    # Omitting it again is a new argument set: the struct is rebuilt from defaults.
+    p.launch()
+    assert p._buf.weightsBuf == weights.data_ptr()
+    p.launch(weights_buf=1 << 20)
+    assert p._buf.weightsBuf == 1 << 20
+    p.close()
+
+
+def test_the_fallback_goes_with_the_last_plan_holding_it(launched, stages):
+    import gc
+    import warnings
+
+    p = _plan()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        p.launch()
+    assert len(cb._FALLBACK_STAGING) == 1
+    gc.disable()
+    try:
+        del p  # unclosed: refcounting alone has to free it
+        assert not cb._FALLBACK_STAGING
+    finally:
+        gc.enable()
+
+
+def test_the_fallback_is_not_allocated_inside_a_capture(launched, stages, monkeypatch):
+    p = _plan()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="graph capture"):
+        p.launch()
+    p.close()
+
+
+def test_a_capture_reuses_the_buffer_of_its_layout(launched, stages, monkeypatch):
+    import warnings
+
+    a = _plan()
+    b = _plan(block_num=2 * a.info["blockNum"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        a.launch()  # eager, before any capture
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    b.launch()  # first launched inside a capture
+    assert b._buf.stagingBase == a._buf.stagingBase
+    a.close()
+    b.close()
+
+
+def test_closing_an_unlaunched_plan_allocates_nothing(launched, stages):
+    p = _plan()
+    p.close()
+    assert p._fallback_staging is None
+    assert not cb._FALLBACK_STAGING
+
+
+def test_closing_the_plans_gives_their_buffer_back(launched, stages):
+    import warnings
+
+    a = _plan()
+    b = _plan(block_num=2 * a.info["blockNum"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        a.launch()
+        b.launch()
+    a.close()
+    assert len(cb._FALLBACK_STAGING) == 1  # b still holds it
+    b.close()
+    assert not cb._FALLBACK_STAGING  # both plans still referenced, both closed
+
+
+def test_a_group_compares_defaults_by_the_address_launch_writes(launched, stages):
+    import warnings
+
+    a = _plan()
+    b = _plan(block_num=2 * a.info["blockNum"])
+    other = _plan(max_tok_per_rank=128, max_recv=128)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FutureWarning)
+        # Neither launched: they compare by layout, and nothing is allocated.
+        cb.plan_api.make_launch_group([a, b])
+        assert not cb._FALLBACK_STAGING
+        with pytest.raises(ValueError, match="stagingBase"):
+            cb.plan_api.make_launch_group([a, other])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        a.launch()  # a's default is an address now, b's not yet resolved
+    cb.plan_api.make_launch_group([a, b])
+    assert isinstance(b._defaults["stagingBase"], cb._FallbackStaging)
+    weights = torch.zeros(64, device="cuda")
+    a.bind(weights_buf=weights)
+    b.bind(weights_buf=weights.data_ptr())  # a tensor and its address agree
+    cb.plan_api.make_launch_group([a, b])
+    for p in (a, b, other):
+        p.close()

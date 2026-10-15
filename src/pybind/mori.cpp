@@ -26,6 +26,7 @@
 //   pybind_ops.cpp   - Ops bindings (torch-free, uses raw pointers + DLPack)
 //   pybind_shmem.cpp - Shmem bindings
 //   pybind_io.cpp    - IO bindings
+// UMBP (pybind_umbp.cpp) is its own module, libmori_umbp_pybinds; see mori_umbp.cpp.
 
 #include "src/pybind/mori.hpp"
 
@@ -38,8 +39,5 @@ PYBIND11_MODULE(libmori_pybinds, m) {
 #endif
 #ifdef BUILD_XLA_FFI_OPS
   mori::RegisterXLAFFIOps(m);
-#endif
-#ifdef MORI_BUILD_UMBP
-  mori::RegisterMoriUmbp(m);
 #endif
 }
