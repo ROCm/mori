@@ -142,83 +142,6 @@ void PeerSsdManager::TouchLocked(const std::string& key) {
   it->second.lru_it = lru_.begin();
 }
 
-// ---------------------------------------------------------------------------
-//  Write (copy-on-commit landing)
-// ---------------------------------------------------------------------------
-
-bool PeerSsdManager::Write(const std::string& key,
-                           const std::vector<std::pair<const void*, size_t>>& segments,
-                           size_t total_size) {
-  if (!backend_) return false;
-
-  // Optimization, not just defense: the DRAM pin only dedups *concurrent*
-  // copies, so a sequential re-put of an already-resident key would otherwise
-  // repeat the whole SSD write.  Skip it and refresh LRU instead.
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (owned_.find(key) != owned_.end()) {
-      TouchLocked(key);
-      return true;
-    }
-  }
-
-  // Assemble (possibly non-contiguous) DRAM source segments into one contiguous
-  // buffer for the backend.  A single right-sized segment is written directly;
-  // otherwise we memcpy into scratch (a writev-style path could avoid the copy).
-  const void* data = nullptr;
-  std::vector<char> scratch;
-  if (segments.size() == 1 && segments[0].second == total_size) {
-    data = segments[0].first;
-  } else {
-    scratch.resize(total_size);
-    size_t off = 0;
-    for (const auto& [ptr, len] : segments) {
-      if (off + len > total_size) {
-        MORI_UMBP_ERROR("[PeerSsdManager] Write key={} segments exceed total_size={}", key,
-                        total_size);
-        return false;
-      }
-      if (len > 0) std::memcpy(scratch.data() + off, ptr, len);
-      off += len;
-    }
-    if (off != total_size) {
-      MORI_UMBP_ERROR("[PeerSsdManager] Write key={} assembled {} != total_size={}", key, off,
-                      total_size);
-      return false;
-    }
-    data = scratch.data();
-  }
-
-  // Backend IO outside our mutex_ — SSDTier is internally synchronized.  A
-  // failure (ENOSPC included) records nothing; this never evicts.
-  if (!backend_->Write(key, data, total_size)) {
-    MORI_UMBP_WARN("[PeerSsdManager] backend Write failed key={} size={}", key, total_size);
-    return false;
-  }
-
-  // Bytes physically written to the SSD device (write IO bandwidth source).
-  // Counted on every successful backend Write, including the rare dup-content
-  // re-write by a second copy worker (real device IO happened either way).
-  metrics_.copy_bytes.fetch_add(total_size, std::memory_order_relaxed);
-
-  // Record the location.  Re-check owned_: with > 1 copy worker, two of them
-  // could have both seen "absent" above and written the same (identical,
-  // content-addressed) bytes — only the first records it + emits ADD SSD.
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (owned_.find(key) != owned_.end()) {
-      TouchLocked(key);
-    } else {
-      lru_.push_front(key);
-      owned_.emplace(key, OwnedEntry{total_size, lru_.begin()});
-      if (event_publishing_) {
-        pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, total_size});
-      }
-    }
-  }
-  return true;
-}
-
 std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& keys,
                                              const std::vector<const void*>& srcs,
                                              const std::vector<size_t>& sizes) {
@@ -285,15 +208,7 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
       if (!ok[j]) continue;
       results[i] = true;
       written_bytes += sizes[i];
-      if (owned_.find(keys[i]) != owned_.end()) {
-        TouchLocked(keys[i]);
-      } else {
-        lru_.push_front(keys[i]);
-        owned_.emplace(keys[i], OwnedEntry{sizes[i], lru_.begin()});
-        if (event_publishing_) {
-          pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, keys[i], TierType::SSD, sizes[i]});
-        }
-      }
+      RecordWrittenLocked(keys[i], sizes[i]);
     }
   }
   metrics_.copy_bytes.fetch_add(written_bytes, std::memory_order_relaxed);
@@ -317,6 +232,39 @@ std::vector<bool> PeerSsdManager::WriteBatch(const std::vector<std::string>& key
         ssdperf::Pct(backend_ms, total_ms), record_ms, used, total);
   }
   return results;
+}
+
+void PeerSsdManager::RecordWrittenLocked(const std::string& key, uint64_t size) {
+  if (owned_.find(key) != owned_.end()) {
+    TouchLocked(key);
+    return;
+  }
+  lru_.push_front(key);
+  owned_.emplace(key, OwnedEntry{size, lru_.begin()});
+  if (event_publishing_) {
+    pending_events_.push_back(KvEvent{KvEvent::Kind::ADD, key, TierType::SSD, size});
+  }
+}
+
+std::optional<RecordReservation> PeerSsdManager::Reserve(const std::string& key, uint64_t size) {
+  if (!backend_ || size == 0) return std::nullopt;
+  return backend_->ReserveRecord(key, static_cast<size_t>(size));
+}
+
+bool PeerSsdManager::CommitReserved(const std::string& key, const RecordReservation& r) {
+  if (!backend_ || !backend_->CommitRecord(key, r)) return false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    RecordWrittenLocked(key, r.location.value_size);
+  }
+  metrics_.copy_bytes.fetch_add(r.location.value_size, std::memory_order_relaxed);
+  metrics_.writes_in_place.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void PeerSsdManager::AbortReserved(const std::string& key, const RecordReservation& r) {
+  if (backend_) backend_->AbortRecord(key, r);
+  metrics_.write_in_place_aborts.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -485,11 +433,8 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     // Reject over-capacity before touching the device (no in-flight mark, no IO).
     if (size > staging_cap) {
       metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
-      // staging_cap = per-slot cap (ssd_staging_buffer_size / ssd_staging_buffer_slots).
-      MORI_UMBP_WARN(
-          "[PeerSsdManager] remote SSD read key={} size={}B exceeds per-slot staging cap {}B; "
-          "raise ssd_staging_buffer_size or lower ssd_staging_buffer_slots",
-          key, size, staging_cap);
+      MORI_UMBP_WARN("[PeerSsdManager] SSD read key={} size={}B exceeds its {}B buffer", key, size,
+                     staging_cap);
       return SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
     }
     // Same leader/follower protocol as PrepareReadBatch, over the same map, so
@@ -633,10 +578,8 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
       const size_t size = it->second.size;
       if (size > caps[i]) {
         metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
-        MORI_UMBP_WARN(
-            "[PeerSsdManager] SSD read key={} size={}B exceeds per-slot staging cap {}B; "
-            "raise ssd_staging_buffer_size or lower ssd_staging_buffer_slots",
-            keys[i], size, caps[i]);
+        MORI_UMBP_WARN("[PeerSsdManager] SSD read key={} size={}B exceeds its {}B buffer", keys[i],
+                       size, caps[i]);
         out[i] = SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
         continue;
       }

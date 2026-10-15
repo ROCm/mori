@@ -33,8 +33,6 @@ HiCache.
   "kv_events_endpoint": "tcp://localhost:6557",
 
   "staging_buffer_size": 2147483648,
-  "ssd_staging_buffer_slots": 512,
-  "ssd_staging_buffer_size": 4294967296,
   "ssd_staging_use_hugepages": true,
   "ssd_staging_hugepage_size": 2097152
 }

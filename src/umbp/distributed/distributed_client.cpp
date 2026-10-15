@@ -174,20 +174,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
           "HBM pool=" + mb(dc.hbm.capacity_bytes) + "MB device=" + std::to_string(dc.hbm.device);
       break;
     case UMBPMedium::SSD:
-      // Slot COUNT only, not ssd_staging_buffer_size.  The arena SsdBackend
-      // actually allocates is staging_pages * page_size (see its own
-      // "[SsdBackend] Init ... arena_bytes=" line, which is authoritative);
-      // ssd_staging_buffer_size does not size it, so printing that number here
-      // stated a capacity the node did not have — 6144MB against a real 4096MB
-      // arena in a 2 MiB-page run.
-      //
-      // The slot count is the number worth showing, because it is the SSD
-      // medium's read-concurrency limit.  Transient shortfalls now surface as
-      // BUSY and are retried; a batch whose own working set exceeds the arena
-      // is a permanent resolve failure.
+      // The arena's bytes are on SsdBackend's own Init line.
       medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
                     "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
-                    " staging_slots=" + std::to_string(dc.ssd_staging_buffer_slots);
+                    " staging_slots=" +
+                    (dc.ssd_staging_buffer_slots > 0 ? std::to_string(dc.ssd_staging_buffer_slots)
+                                                     : std::string("preset"));
       break;
   }
 

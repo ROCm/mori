@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -1267,6 +1268,7 @@ void SSDTier::Clear() {
       }
     }
     index_.ResetAll();
+    pending_records_.clear();
     if (!IsReadOnlyShared()) {
       OpenOrCreateSegmentLocked(0);
     } else {
@@ -1369,6 +1371,96 @@ std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) cons
   loc.value_size = meta->size;
   loc.direct_io = direct_io_;
   return loc;
+}
+
+IoStatus SSDTier::WritePrepared(int fd, const segment::PreparedRecord& pr, bool sync) const {
+  if (io_driver_->Capabilities().thread_safe) return writer_->WriteRecord(fd, pr, sync);
+  std::lock_guard<std::mutex> io_lock(io_mu_);
+  return writer_->WriteRecord(fd, pr, sync);
+}
+
+std::optional<RecordReservation> SSDTier::ReserveRecord(const std::string& key, size_t size) {
+  if (IsReadOnlyShared() || size == 0) return std::nullopt;
+  PendingRecord pending;
+  writer_->BuildPrefix(key, size, &pending.prefix);
+  std::vector<segment::Meta> doomed;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto need = static_cast<size_t>(segment::RecordBytes(key.size(), size));
+    auto* seg =
+        EnsureActiveSegment(need, &doomed) ? GetSegmentLocked(index_.active_segment_id()) : nullptr;
+    if (seg && writer_->Reserve(key, size, seg, index_, &pending.prefix)) {
+      pending.fd = seg->fd;
+      pending.pinned.push_back(seg->id);
+      const auto& res = pending.prefix.reservation;
+      if (res.had_previous) pending.pinned.push_back(res.previous_meta.segment_id);
+      for (uint64_t id : pending.pinned) index_.PinSegment(id);
+    }
+  }
+  DisposeSegments(&doomed);
+  if (pending.pinned.empty()) return std::nullopt;
+
+  IoStatus status = WritePrepared(pending.fd, pending.prefix, /*sync=*/false);
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (status.ok()) {
+      const segment::KeyMeta& meta = pending.prefix.reservation.meta;
+      RecordReservation r;
+      r.location.fd = pending.fd;
+      r.location.value_offset = meta.value_offset;
+      r.location.readable_size = segment::AlignUp(size);
+      r.location.value_size = size;
+      r.location.direct_io = direct_io_;
+      r.token = meta.generation;
+      pending_records_.emplace(r.token, std::move(pending));
+      return r;
+    }
+    index_.RollbackWrite(pending.prefix.reservation);
+    RememberStatus(std::move(status));
+    UnpinLocked(pending.pinned, &doomed);
+  }
+  DisposeSegments(&doomed);
+  return std::nullopt;
+}
+
+bool SSDTier::CommitRecord(const std::string& /*key*/, const RecordReservation& r) {
+  PendingRecord pending;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = pending_records_.find(r.token);
+    if (it == pending_records_.end()) return false;
+    pending = std::move(it->second);
+    pending_records_.erase(it);
+  }
+  const uint16_t flags = segment::kFlagCommitted | segment::kFlagNoCrc;
+  std::memcpy(pending.prefix.record.data() + offsetof(segment::RecordHeader, flags), &flags,
+              sizeof(flags));
+  IoStatus status = WritePrepared(pending.fd, pending.prefix, ShouldSyncOnWrite());
+  const bool ok = status.ok();
+  std::vector<segment::Meta> doomed;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!ok) {
+      index_.RollbackWrite(pending.prefix.reservation);
+      RememberStatus(std::move(status));
+    }
+    UnpinLocked(pending.pinned, &doomed);
+  }
+  DisposeSegments(&doomed);
+  return ok;
+}
+
+void SSDTier::AbortRecord(const std::string& /*key*/, const RecordReservation& r) {
+  std::vector<segment::Meta> doomed;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = pending_records_.find(r.token);
+    if (it == pending_records_.end()) return;
+    index_.RollbackWrite(it->second.prefix.reservation);
+    UnpinLocked(it->second.pinned, &doomed);
+    pending_records_.erase(it);
+  }
+  DisposeSegments(&doomed);
 }
 
 }  // namespace mori::umbp

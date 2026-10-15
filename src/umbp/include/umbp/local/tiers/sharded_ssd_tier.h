@@ -86,6 +86,9 @@ class ShardedSsdTier : public TierBackend {
   TierSpaceStats SpaceStats() const override;
   std::optional<std::string> GetLocationId(const std::string& key) const override;
   std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
+  bool CommitRecord(const std::string& key, const RecordReservation& r) override;
+  void AbortRecord(const std::string& key, const RecordReservation& r) override;
   bool Flush() override;
   void SetColdRead(bool enable) override;
 
@@ -123,6 +126,8 @@ class ShardedSsdTier : public TierBackend {
   // disk use only drops when a whole segment goes, so a hint kept up by adding
   // and subtracting value sizes drifts away from what the drive can take.
   void RefreshHintsLocked();
+  // Drops the placement of a key its shard no longer holds (a failed write).
+  void ForgetIfGone(const std::string& key, int shard);
 
   // Shard assignment + the byte count needed to release the placement hint on
   // evict, so eviction never has to re-read a key just to learn its size.

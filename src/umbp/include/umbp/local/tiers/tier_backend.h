@@ -78,6 +78,12 @@ struct RecordLocation {
   bool direct_io = false;      // fd is O_DIRECT — a hipFile fastpath precondition
 };
 
+// Room for one value that a file engine writes in place at `location`.
+struct RecordReservation {
+  RecordLocation location;
+  uint64_t token = 0;  // tier-private
+};
+
 // Abstract base class for storage tier backends (SSD, SPDK, ...).
 // All tiers share a common interface for write/read/evict; tier-specific
 // extensions (e.g. SSDTier::direct_io_active) live in the concrete subclass.
@@ -158,11 +164,6 @@ class TierBackend {
   virtual std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& data_ptrs,
                                        const std::vector<size_t>& sizes);
-  virtual std::vector<bool> BatchWriteRanges(const std::vector<std::string>& keys,
-                                             const std::vector<size_t>& object_sizes,
-                                             const std::vector<std::vector<const void*>>& src_ptrs,
-                                             const std::vector<std::vector<size_t>>& sizes,
-                                             const std::vector<std::vector<size_t>>& dst_offsets);
 
   // Batch read into user pointers. Default loops over ReadIntoPtr().
   virtual std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
@@ -190,6 +191,18 @@ class TierBackend {
   virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) const {
     return std::nullopt;
   }
+
+  // Write-in-place: reserve room for |key|, let a file engine fill
+  // `location`, then CommitRecord makes it readable or AbortRecord drops it.
+  // Default: unsupported (no stable file location).
+  virtual std::optional<RecordReservation> ReserveRecord(const std::string& /*key*/,
+                                                         size_t /*size*/) {
+    return std::nullopt;
+  }
+  virtual bool CommitRecord(const std::string& /*key*/, const RecordReservation& /*r*/) {
+    return false;
+  }
+  virtual void AbortRecord(const std::string& /*key*/, const RecordReservation& /*r*/) {}
 
   // Which StorageTier does this backend represent?
   StorageTier tier_id() const { return tier_id_; }

@@ -337,18 +337,33 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
     return results;
   }
 
-  const auto now = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(mutex_);
   const uint64_t ssd_capacity = static_cast<uint64_t>(ssd_->Capacity().second);
   const uint64_t staging_capacity =
       static_cast<uint64_t>(staging_page_used_.size()) * cfg_.page_size;
+  const auto fits = [&](uint64_t size) {
+    const uint32_t pages = SizeToPages(size, cfg_.page_size);
+    return pages != 0 && size <= ssd_capacity && pages <= staging_page_used_.size();
+  };
 
+  // A local file engine writes straight into a reserved file range, so it
+  // needs no staging; the reservation's disk write runs outside mutex_.
+  std::vector<std::optional<RecordReservation>> records(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& req = entries[i];
+    if (req.allow_file_ref && fits(req.size) && !ssd_->Exists(req.key)) {
+      records[i] = ssd_->Reserve(req.key, req.size);
+    }
+  }
+
+  std::vector<size_t> unused_records;
+  const auto now = std::chrono::steady_clock::now();
+  std::unique_lock<std::mutex> lock(mutex_);
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& req = entries[i];
     AllocateResult& out = results[i];
 
     const uint32_t page_count = SizeToPages(req.size, cfg_.page_size);
-    if (page_count == 0 || req.size > ssd_capacity || page_count > staging_page_used_.size()) {
+    if (!fits(req.size)) {
       // The object can never fit this backend's staging arena. This is a shape
       // failure, not transient arena pressure, so another identical peer would
       // not do better.
@@ -358,7 +373,22 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
       continue;
     }
     if (ssd_->Exists(req.key)) {
+      if (records[i]) unused_records.push_back(i);
       out.outcome = AllocateOutcome::kSuccessAlreadyExists;
+      continue;
+    }
+    if (records[i]) {
+      const RecordLocation& loc = records[i]->location;
+      const uint64_t slot_id = next_slot_id_.fetch_add(1, std::memory_order_relaxed);
+      PendingSlot slot{slot_id, req.key, StagingSpan{}, req.size, now + cfg_.pending_ttl};
+      slot.record = records[i];
+      pending_.emplace(slot_id, std::move(slot));
+      out.outcome = AllocateOutcome::kSuccessAllocated;
+      out.slot_id = slot_id;
+      out.size = req.size;
+      out.page_size = cfg_.page_size;
+      out.pending_ttl_ms = static_cast<uint64_t>(cfg_.pending_ttl.count());
+      out.file_ref = TransferRef::File(loc.fd, loc.value_offset, loc.readable_size);
       continue;
     }
 
@@ -386,6 +416,8 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
       out.descs = {BufferMemoryDescBytes{kStagingBufferIndex, buffer_desc_}};
     }
   }
+  lock.unlock();
+  for (size_t i : unused_records) ssd_->AbortReserved(entries[i].key, *records[i]);
   return results;
 }
 
@@ -419,11 +451,16 @@ std::vector<CommitResult> SsdBackend::BatchCommit(const std::vector<CommitReques
   std::vector<const void*> srcs;
   std::vector<size_t> sizes;
   std::vector<size_t> batched;  // indices into `entries`, parallel to the above
+  std::vector<size_t> written;  // reserved records, already on the drive
   keys.reserve(todo.size());
   srcs.reserve(todo.size());
   sizes.reserve(todo.size());
   batched.reserve(todo.size());
   for (size_t i : todo) {
+    if (slots[i].record) {
+      if (ssd_->CommitReserved(entries[i].key, *slots[i].record)) written.push_back(i);
+      continue;
+    }
     const void* src = StagingPagePtr(slots[i].span.first_page);
     if (src == nullptr) continue;
     keys.push_back(entries[i].key);
@@ -447,6 +484,11 @@ std::vector<CommitResult> SsdBackend::BatchCommit(const std::vector<CommitReques
     for (size_t j = 0; j < batched.size(); ++j) {
       if (ok[j]) NoteEventQueuedLocked();
     }
+    for (size_t k = 0; k < written.size(); ++k) NoteEventQueuedLocked();
+  }
+  for (size_t i : written) {
+    results[i].success = true;
+    results[i].bytes_committed = slots[i].size;
   }
 
   for (size_t j = 0; j < batched.size(); ++j) {
@@ -464,13 +506,18 @@ std::vector<CommitResult> SsdBackend::BatchCommit(const std::vector<CommitReques
 
 std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) {
   std::vector<bool> results(slot_ids.size(), true);
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (uint64_t slot_id : slot_ids) {
-    auto it = pending_.find(slot_id);
-    if (it == pending_.end()) continue;  // idempotent: already reaped or unknown
-    ReleaseStagingSpanLocked(it->second.span);
-    pending_.erase(it);
+  std::vector<PendingSlot> reserved;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (uint64_t slot_id : slot_ids) {
+      auto it = pending_.find(slot_id);
+      if (it == pending_.end()) continue;  // idempotent: already reaped or unknown
+      ReleaseStagingSpanLocked(it->second.span);
+      if (it->second.record) reserved.push_back(std::move(it->second));
+      pending_.erase(it);
+    }
   }
+  for (const auto& slot : reserved) ssd_->AbortReserved(slot.key, *slot.record);
   return results;
 }
 
@@ -506,11 +553,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   };
 
   // Phase 1 (ONE lock): serve every key that is already staged, size every
-  // unique remaining key, then reserve ALL required spans atomically.  A
-  // partial resolve is unusable to layer-wise callers and, worse, pins the
-  // successful subset while retries compete for the remainder.  On transient
-  // pressure this call therefore publishes kBusy and keeps none of its new
-  // reservations.
+  // unique remaining key, then reserve the spans.  A local reader that runs
+  // out of arena after serving something keeps that and defers the rest to its
+  // next round.  A remote reader, or one that got nothing, gets kBusy and
+  // keeps none of its new reservations, since it retries the whole batch.
   std::vector<size_t> todo;                        // keys needing a device read
   std::vector<uint32_t> page_counts;               // parallel to todo
   std::vector<StagingSpan> spans;                  // parallel to todo
@@ -578,6 +624,22 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       result_groups.push_back({i});
     }
 
+    // Keys from `first` on wait for the caller's next call.
+    const auto defer_from = [&](size_t first) {
+      size_t deferred = 0;
+      for (size_t j = first; j < todo.size(); ++j) {
+        for (size_t index : result_groups[j]) {
+          results[index].outcome = ResolveOutcome::kDeferred;
+          ++deferred;
+        }
+      }
+      resolve_deferred_keys_.fetch_add(deferred, std::memory_order_relaxed);
+      todo.resize(first);
+      page_counts.resize(first);
+      read_keys.resize(first);
+      result_groups.resize(first);
+    };
+
     // One call stages at most half the arena, leaving room for concurrent
     // readers; the rest of the batch is deferred to the caller's next call.
     // The first key always fits (checked above), so every call progresses.
@@ -589,25 +651,19 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       if (take > 0 && requested_pages + page_counts[take] > call_budget) break;
       requested_pages += page_counts[take];
     }
-    if (take < todo.size()) {
-      size_t deferred = 0;
-      for (size_t j = take; j < todo.size(); ++j) {
-        for (size_t index : result_groups[j]) {
-          results[index].outcome = ResolveOutcome::kDeferred;
-          ++deferred;
-        }
-      }
-      resolve_deferred_keys_.fetch_add(deferred, std::memory_order_relaxed);
-      todo.resize(take);
-      page_counts.resize(take);
-      read_keys.resize(take);
-      result_groups.resize(take);
-    }
+    if (take < todo.size()) defer_from(take);
 
     spans.reserve(todo.size());
     for (size_t j = 0; j < todo.size(); ++j) {
       const StagingSpan span = AcquireStagingSpanLocked(page_counts[j]);
       if (span.page_count == 0) {
+        const bool served_some =
+            j > 0 || std::any_of(results.begin(), results.end(),
+                                 [](const ResolvedEntry& entry) { return entry.found; });
+        if (reader == ResolveReader::kLocal && served_some) {
+          defer_from(j);
+          break;
+        }
         for (const StagingSpan reserved : spans) ReleaseStagingSpanLocked(reserved);
         for (const auto& group : result_groups) {
           for (size_t index : group) results[index].outcome = ResolveOutcome::kBusy;
@@ -674,10 +730,33 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   return results;
 }
 
-bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                                      bool allow_file_ref) {
   if (resolved == nullptr) return false;
   if (!ssd_->PinForMigration(key)) return false;
   const uint64_t size = ssd_->SizeOf(key);
+
+  // The caller reads the record in place: a pin, no staging.
+  const auto loc = allow_file_ref ? ssd_->LocateRecord(key) : std::nullopt;
+  if (loc) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!migration_reads_
+               .emplace(key, ReadLease{StagingSpan{}, size,
+                                       std::chrono::steady_clock::time_point::max()})
+               .second) {
+        ssd_->UnpinForMigration(key);
+        return false;
+      }
+    }
+    resolved->outcome = ResolveOutcome::kFound;
+    resolved->found = true;
+    resolved->size = loc->value_size;
+    resolved->page_size = cfg_.page_size;
+    resolved->file_ref = TransferRef::File(loc->fd, loc->value_offset, loc->readable_size);
+    migrations_in_place_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   const uint32_t page_count = SizeToPages(size, cfg_.page_size);
   if (page_count == 0 || page_count > staging_page_used_.size()) {
     ssd_->UnpinForMigration(key);
@@ -712,6 +791,7 @@ bool SsdBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* res
   }
   resolved->size = outcome.size;
   resolved->page_size = cfg_.page_size;
+  migrations_staged_.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -873,20 +953,24 @@ void SsdBackend::ReaperLoop() {
   }
 }
 
-// Returns staging pages whose borrower is gone: a writer that died between
-// Allocate and Commit, and a reader whose lease has elapsed.  Both are pure
-// arena bookkeeping — no SSD state is touched, because neither case ever put
-// anything on the SSD.
+// Returns what a gone borrower held: a writer that died between Allocate and
+// Commit (its staging span, or its reserved record), and a reader whose lease
+// has elapsed.
 void SsdBackend::ReaperSweep() {
   const auto now = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<PendingSlot> expired_records;
+  std::unique_lock<std::mutex> lock(mutex_);
 
   for (auto it = pending_.begin(); it != pending_.end();) {
     if (it->second.deadline <= now) {
       MORI_UMBP_WARN("[SsdBackend] reaping expired slot {} (key '{}')", it->second.slot_id,
                      it->second.key);
       ReleaseStagingSpanLocked(it->second.span);
-      staging_expired_reclaims_.fetch_add(1, std::memory_order_relaxed);
+      if (it->second.record) {
+        expired_records.push_back(std::move(it->second));
+      } else {
+        staging_expired_reclaims_.fetch_add(1, std::memory_order_relaxed);
+      }
       it = pending_.erase(it);
     } else {
       ++it;
@@ -916,6 +1000,8 @@ void SsdBackend::ReaperSweep() {
     staging_expired_reclaims_.fetch_add(1, std::memory_order_relaxed);
     it = read_leases_.erase(it);
   }
+  lock.unlock();
+  for (const auto& slot : expired_records) ssd_->AbortReserved(slot.key, *slot.record);
 }
 
 std::unique_ptr<MediumBackend> MakeSsdBackend(SsdBackend::Config cfg) {
@@ -984,6 +1070,12 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
   event("staging_early_release", staging_early_releases_.load(std::memory_order_relaxed));
   event("resolve_deferred", resolve_deferred_keys_.load(std::memory_order_relaxed));
+
+  // Migrations: in place (file <-> DRAM through the file engine) or staged.
+  event("migration_in_place", migrations_in_place_.load(std::memory_order_relaxed));
+  event("migration_staged", migrations_staged_.load(std::memory_order_relaxed));
+  event("write_in_place", ssd_->WritesInPlace());
+  event("write_in_place_aborted", ssd_->WriteInPlaceAborts());
 
   // Bytes that actually crossed the device boundary, as opposed to the logical
   // bytes in mori_umbp_backend_bytes_total.  Reads exclude single-flight merges,

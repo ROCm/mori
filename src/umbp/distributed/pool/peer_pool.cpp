@@ -35,6 +35,7 @@
 #include <utility>
 
 #include "umbp/common/env_time.h"
+#include "umbp/common/parallel_for.h"
 
 namespace mori::umbp {
 
@@ -280,6 +281,7 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
   if (migrating_keys_.empty()) transition_idle_cv_.notify_all();
   if (!result.success) {
     ++transition_metrics_.failed;
+    if (job.kind == TierTransitionKind::kPromotion) ++transition_metrics_.promote_failed;
     return;
   }
   ++transition_metrics_.succeeded;
@@ -311,6 +313,49 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
   if (draining != draining_sources_.end()) {
     draining->second.erase(result.target_backend_id);
     if (draining->second.empty()) draining_sources_.erase(draining);
+  }
+}
+
+// The promoting read lands in the upper tier once and is served from there.  It
+// does not wait for that tier to drop below its high watermark: the headroom
+// above it is for this; a promotion that finds no room leaves the read where it is.
+void PeerPool::PromoteForRead(const std::vector<std::string>& keys,
+                              std::vector<std::optional<uint32_t>>* preferred) {
+  std::vector<size_t> at;
+  std::vector<TransitionJob> jobs;
+  std::vector<TransitionPlan> plans;
+  {
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    if (tier_graph_ == nullptr) return;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      if (!(*preferred)[i].has_value()) continue;
+      const auto source_tier = tier_graph_->TierIndexForBackendId(*(*preferred)[i]);
+      if (!source_tier.has_value() || *source_tier == tier_graph_->EntryTierIndex() ||
+          migrating_keys_.count(keys[i]) != 0 || !PromoteOnReadLocked(keys[i], *source_tier)) {
+        continue;
+      }
+      TransitionJob job{TierTransitionKind::kPromotion, keys[i], *(*preferred)[i], *source_tier};
+      TransitionPlan plan = PlanTransitionLocked(job);
+      if (!plan.valid) continue;
+      at.push_back(i);
+      jobs.push_back(std::move(job));
+      plans.push_back(std::move(plan));
+    }
+  }
+  if (jobs.empty()) return;
+
+  // Several at once, so a batch keeps more than one device read in flight.
+  constexpr int kPromoteThreads = 8;
+  std::vector<TierTransitionResult> results(jobs.size());
+  ParallelFor(jobs.size(), kPromoteThreads, [&](size_t j) {
+    results[j] = transition_executor_.Execute(jobs[j].key, jobs[j].source_backend_id,
+                                              plans[j].targets, plans[j].remove_source);
+  });
+
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  for (size_t j = 0; j < jobs.size(); ++j) {
+    FinishTransitionLocked(jobs[j], results[j]);
+    if (results[j].success) (*preferred)[at[j]] = results[j].target_backend_id;
   }
 }
 
@@ -748,6 +793,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
     read_order = policy_->ReadOrder(*backends_);
   }
+  PromoteForRead(keys, &preferred);
 
   // A flat mask avoids one heap allocation per key in the common 1023-key
   // ranged-get batch.
@@ -820,8 +866,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     all_found &= entry.resolved.found;
   }
   // A caller retries the whole batch on BUSY and discards this response. Do
-  // not count hits, repair placements, or enqueue promotions for a response
-  // whose page locations will never be consumed.
+  // not count hits or repair placements for a response whose page locations
+  // will never be consumed.
   if (batch_busy) return out;
 
   // Contains is backend work too; keep it off the pool metadata lock. A
@@ -867,16 +913,6 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       if (still_placed) TouchLocked(keys[i]);
       if (tier_graph_ != nullptr) {
         ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
-        const auto source_tier = tier_graph_->TierIndexForBackendId(out[i].backend_id);
-        if (metadata_current && source_tier.has_value() &&
-            *source_tier != tier_graph_->EntryTierIndex() && migrating_keys_.count(keys[i]) == 0 &&
-            !tier_graph_->AtOrAbove(
-                tier_graph_->EntryTierIndex(),
-                tier_graph_->NodeAt(tier_graph_->EntryTierIndex()).high_watermark) &&
-            PromoteOnReadLocked(keys[i], *source_tier)) {
-          EnqueueTransition(
-              {TierTransitionKind::kPromotion, keys[i], out[i].backend_id, *source_tier});
-        }
       }
     } else {
       // A concurrent commit or transition changed the placement after the

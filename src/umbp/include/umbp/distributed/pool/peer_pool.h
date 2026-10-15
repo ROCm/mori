@@ -222,9 +222,12 @@ class PeerPool {
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
   // Whether this read should promote the key out of `source_tier`, per that
-  // tier's trigger. Counts the read for an kOnHits tier, so it must only be
-  // called once per served read and only when a promotion could actually run.
+  // tier's trigger. Counts the read for an kOnHits tier, so call it once per read.
   bool PromoteOnReadLocked(const std::string& key, LogicalTierGraph::TierIndex source_tier);
+  // Promotes what this read should, before it runs, and repoints `preferred` at
+  // each promoted copy so the read is served from there.
+  void PromoteForRead(const std::vector<std::string>& keys,
+                      std::vector<std::optional<uint32_t>>* preferred);
   // Backend that currently holds the key, or kMaxBackends. The placement index
   // is process-local and can be stale or empty (after a restart, or once
   // another path evicted the key), so the backends are the authority.

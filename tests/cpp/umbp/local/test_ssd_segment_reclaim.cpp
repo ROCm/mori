@@ -276,6 +276,22 @@ TEST_F(SegmentReclaimTest, OverwritingEveryRecordDeletesTheOldSegment) {
   EXPECT_EQ(buf, ValueFor(503));
 }
 
+// A reservation's value is written through its segment's fd, so the segment
+// outlives everything else in it until the reservation ends.
+TEST_F(SegmentReclaimTest, AReservationKeepsItsSegmentUntilItEnds) {
+  auto tier = MakeTier();
+  auto reserved = tier->ReserveRecord(Key(0), kValue);
+  ASSERT_TRUE(reserved.has_value());
+  for (int i = 1; i <= 16; ++i) ASSERT_TRUE(Write(*tier, i));  // fills and seals segment 0
+  for (int i = 1; i < 16; ++i) ASSERT_TRUE(tier->Evict(Key(i)));
+  ASSERT_TRUE(Write(*tier, 0));  // the reserved key moves on to segment 1
+  EXPECT_EQ(tier->SpaceStats().files_deleted, 0u) << "deleted under a pending reservation";
+
+  tier->AbortRecord(Key(0), *reserved);
+  EXPECT_EQ(tier->SpaceStats().files_deleted, 1u);
+  EXPECT_TRUE(ReadsBack(*tier, 0));
+}
+
 // A segment whose every record a later segment supersedes -- left behind by a
 // build that never deleted segments -- is deleted when the tier starts.
 TEST_F(SegmentReclaimTest, StartupDeletesSegmentsWithNothingLive) {
