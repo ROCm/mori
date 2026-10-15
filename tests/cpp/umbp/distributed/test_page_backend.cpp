@@ -25,6 +25,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -77,6 +78,14 @@ std::optional<AllocateResult> AllocateOk(PageBackend& a, const std::string& key,
   return r;
 }
 
+class ScopedMaxBufferSize {
+ public:
+  explicit ScopedMaxBufferSize(uint64_t bytes) {
+    setenv("UMBP_DISTRIBUTED_DRAM_MAX_BUFFER_SIZE", std::to_string(bytes).c_str(), 1);
+  }
+  ~ScopedMaxBufferSize() { unsetenv("UMBP_DISTRIBUTED_DRAM_MAX_BUFFER_SIZE"); }
+};
+
 }  // namespace
 
 // ---- Allocate / Commit / Resolve happy path ---------------------------------
@@ -124,6 +133,45 @@ TEST(PageBackend, NumaBindingAndPreferredAllocationAgree) {
 #else
   GTEST_SKIP() << "requires Linux move_pages";
 #endif
+}
+
+TEST(PageBackend, HostBuffersRegisterInChunksOfMaxBufferSize) {
+  ScopedMaxBufferSize cap(4 * 4096 + 100);  // Rounds down to whole pages.
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {10 * 4096};
+  PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  ASSERT_TRUE(backend.Init(nullptr));
+  ASSERT_EQ(backend.BufferCount(), 3u);
+  auto* base = static_cast<char*>(backend.BufferRef(0).host_ptr);
+  const uint64_t pages[] = {4, 4, 2};
+  for (uint32_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(static_cast<char*>(backend.BufferRef(i).host_ptr), base + i * 4 * 4096);
+    EXPECT_EQ(backend.BufferRef(i).size, pages[i] * 4096);
+  }
+  EXPECT_EQ(backend.Capacity().total_bytes, 10u * 4096);
+  auto spanning = AllocateOk(backend, "spanning", 6 * 4096);
+  ASSERT_TRUE(spanning.has_value());
+  EXPECT_EQ(spanning->pages.size(), 6u);
+}
+
+TEST(PageBackend, HostBufferChunksKeepSubPageTailAndZeroDisablesCap) {
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {9 * 4096};
+  {
+    ScopedMaxBufferSize cap(2 * 8192);
+    PageBackend backend(TierType::DRAM, 8192, cfg, std::chrono::seconds(30));
+    ASSERT_TRUE(backend.Init(nullptr));
+    ASSERT_EQ(backend.BufferCount(), 2u);
+    EXPECT_EQ(static_cast<char*>(backend.BufferRef(1).host_ptr),
+              static_cast<char*>(backend.BufferRef(0).host_ptr) + 2 * 8192);
+    EXPECT_EQ(backend.BufferRef(0).size, 2u * 8192);
+    EXPECT_EQ(backend.BufferRef(1).size, 2u * 8192);
+    EXPECT_EQ(backend.Capacity().total_bytes, 4u * 8192);
+  }
+  ScopedMaxBufferSize uncapped(0);
+  PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  ASSERT_TRUE(backend.Init(nullptr));
+  EXPECT_EQ(backend.BufferCount(), 1u);
 }
 
 TEST(PageBackend, NumaRejectsMismatchedLayoutBeforeAllocating) {
