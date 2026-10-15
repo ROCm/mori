@@ -252,6 +252,7 @@ class SsdBackend : public MediumBackend {
   // can read it without taking mutex_ (the metrics tick must never contend with
   // a read).
   std::atomic<uint64_t> staging_pages_in_use_{0};
+  std::atomic<uint64_t> staging_pages_peak_{0};  // highest occupancy; written under mutex_
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

@@ -33,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -631,6 +632,24 @@ TEST_F(SsdBackendTest, StagingGoesBackWhenEveryLocalReaderReleases) {
   backend->ReleaseResolved({"key-a"}, {second[0].lease_token});
   EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
             AllocateOutcome::kSuccessAllocated);
+}
+
+// The peak outlives the release, so a scrape between bursts still sees them.
+TEST_F(SsdBackendTest, StagingPeakOutlivesTheRelease) {
+  SsdBackend* backend = Start(/*staging_pages=*/4, /*read_lease_ttl=*/std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  auto got = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(got[0].found);
+  backend->ReleaseResolved({"key-a"}, {got[0].lease_token});
+
+  std::map<std::string, uint64_t> state;
+  for (const auto& m : backend->SampleMetrics()) {
+    if (std::string(m.name) == MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE) {
+      state[m.labels.at(0).second] = m.value;
+    }
+  }
+  EXPECT_EQ(state["staging_pages_in_use"], 0u);
+  EXPECT_EQ(state["staging_pages_peak"], 1u);
 }
 
 // The reaper never reclaims staging a local reader has not released.

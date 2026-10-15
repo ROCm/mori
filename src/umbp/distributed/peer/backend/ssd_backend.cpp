@@ -195,7 +195,11 @@ SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count
     }
     // Mirrored for the metrics tick, which must not take mutex_. Correctness
     // still lives entirely in staging_page_used_.
-    staging_pages_in_use_.fetch_add(page_count, std::memory_order_relaxed);
+    const uint64_t in_use =
+        staging_pages_in_use_.fetch_add(page_count, std::memory_order_relaxed) + page_count;
+    if (in_use > staging_pages_peak_.load(std::memory_order_relaxed)) {
+      staging_pages_peak_.store(in_use, std::memory_order_relaxed);
+    }
     return StagingSpan{run_start, page_count};
   }
   return {};
@@ -1050,6 +1054,7 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   bytes("device_read", ssd_->ReadBytes());
 
   state("staging_pages_in_use", staging_pages_in_use_.load(std::memory_order_relaxed));
+  state("staging_pages_peak", staging_pages_peak_.load(std::memory_order_relaxed));
   state("staging_pages_total", cfg_.staging_pages);
   return out;
 }
