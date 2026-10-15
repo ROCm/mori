@@ -133,7 +133,7 @@ namespace {
 // not a segfault, so it is rejected here rather than let hipFileRead scribble
 // past the slot.
 struct GdsPlanTraits {
-  static constexpr bool kGroups = false;
+  static constexpr PlanGrouping kGrouping = PlanGrouping::kNone;
   using Key = bool;
   using KeyHash = std::hash<bool>;
 
@@ -146,7 +146,6 @@ struct GdsPlanTraits {
     }
     return true;
   }
-  bool Joins(size_t, const TransferPlan&, const Key&, const TransferItem&) const { return false; }
   TransferPlan NewPlan(const Key&, const TransferItem& item) const {
     TransferPlan plan;
     plan.src = item.src;

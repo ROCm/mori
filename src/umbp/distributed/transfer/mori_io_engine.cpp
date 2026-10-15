@@ -383,7 +383,7 @@ namespace {
 // plans over one pool are fine because Submit runs each to completion before
 // the next.  An item larger than the whole pool is rejected.
 struct MoriIoPlanTraits {
-  static constexpr bool kGroups = true;
+  static constexpr PlanGrouping kGrouping = PlanGrouping::kManyPerKey;
   // Memory ids are allocated per IOEngine, so two peers can both publish id 1:
   // a key only buckets endpoints, and Joins tells them apart by engine key.
   struct Key {

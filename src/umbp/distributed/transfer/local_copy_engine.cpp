@@ -365,7 +365,7 @@ bool LocalCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) 
 namespace {
 // One plan per (src, dst) buffer pair; adjacent ranges merge into one copy.
 struct LocalCopyPlanTraits {
-  static constexpr bool kGroups = true;
+  static constexpr PlanGrouping kGrouping = PlanGrouping::kOnePerKey;
   using Key = PtrPairKey;
   using KeyHash = PtrPairKeyHash;
 
@@ -375,7 +375,6 @@ struct LocalCopyPlanTraits {
     if (!engine.CanHandle(item.src, item.dst) || !ItemInBounds(item)) return std::nullopt;
     return Key{item.src.host_ptr, item.dst.host_ptr};
   }
-  bool Joins(size_t, const TransferPlan&, const Key&, const TransferItem&) const { return true; }
   TransferPlan NewPlan(const Key&, const TransferItem& item) const {
     TransferPlan plan;
     plan.src = item.src;

@@ -32,6 +32,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -105,52 +106,45 @@ inline TransferPlanSet PlanViaBuilder(const TransferEngine& engine,
   return builder->Finish();
 }
 
+// How an engine's items share plans.
+enum class PlanGrouping {
+  kNone,        // one plan per item
+  kOnePerKey,   // items with equal keys share one plan
+  kManyPerKey,  // a key's group holds several plans; Joins picks one
+};
+
 // An incremental builder from a Traits struct.  The builder skips empty items,
 // collects rejected tags, keeps plans in first-seen order, and hands the set
 // over in Finish().  Traits supplies:
 //
-//   static constexpr bool kGroups;  // false: one plan per item, no lookup
+//   static constexpr PlanGrouping kGrouping;
 //   using Key; using KeyHash;
-//   // The item's group, or nullopt to reject it.
+//   // The item's key, or nullopt to reject it.
 //   std::optional<Key> Admit(const TransferItem&);
-//   // May plan `index` (already in the item's group) take the item?
+//   // kManyPerKey only: may plan `index`, in the item's group, take the item?
 //   bool Joins(size_t index, const TransferPlan&, const Key&, const TransferItem&);
 //   TransferPlan NewPlan(const Key&, const TransferItem&);
 //   void Append(size_t index, TransferPlan*, const Key&, const TransferItem&);
 //
-// A group may hold several plans: a key that only buckets endpoints (MORI-IO's
-// per-engine memory ids), or a plan that can fill up (a bounce pool).  Joins
-// picks among them; the first that accepts takes the item, else a new plan
-// opens in the group.
+// kManyPerKey is for a key that only buckets endpoints (MORI-IO's per-engine
+// memory ids) or a plan that can fill up (a bounce pool): the first plan in the
+// group that Joins takes the item, else a new plan opens in the group.
 template <typename Traits>
 class GroupedPlanBuilder final : public TransferPlanBuilder {
  public:
   explicit GroupedPlanBuilder(Traits traits, size_t expected_items = 0)
       : traits_(std::move(traits)) {
-    if constexpr (!Traits::kGroups) out_.plans.reserve(expected_items);
+    if constexpr (Traits::kGrouping == PlanGrouping::kNone) out_.plans.reserve(expected_items);
   }
 
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
-    const std::optional<typename Traits::Key> key = traits_.Admit(item);
+    const std::optional<Key> key = traits_.Admit(item);
     if (!key.has_value()) {
       out_.rejected_tags.push_back(item.tag);
       return;
     }
-    size_t index = out_.plans.size();
-    if constexpr (Traits::kGroups) {
-      // Grows with distinct groups, not with the items of the batch.
-      std::vector<size_t>& group = groups_[*key];
-      bool joined = false;
-      for (size_t candidate : group) {
-        if (traits_.Joins(candidate, out_.plans[candidate], *key, item)) {
-          index = candidate;
-          joined = true;
-          break;
-        }
-      }
-      if (!joined) group.push_back(index);
-    }
+    const size_t index = PlanFor(*key, item);
     if (index == out_.plans.size()) out_.plans.push_back(traits_.NewPlan(*key, item));
     traits_.Append(index, &out_.plans[index], *key, item);
   }
@@ -158,9 +152,36 @@ class GroupedPlanBuilder final : public TransferPlanBuilder {
   TransferPlanSet Finish() override { return std::move(out_); }
 
  private:
+  using Key = typename Traits::Key;
+  // Grows with distinct keys, not with the items of the batch.
+  using Group = std::conditional_t<Traits::kGrouping == PlanGrouping::kManyPerKey,
+                                   std::vector<size_t>, size_t>;
+
+  // The plan that takes `item`; plans.size() means a new one, already recorded.
+  size_t PlanFor(const Key& key, const TransferItem& item) {
+    const size_t fresh = out_.plans.size();
+    if constexpr (Traits::kGrouping == PlanGrouping::kNone) {
+      return fresh;
+    } else if constexpr (Traits::kGrouping == PlanGrouping::kOnePerKey) {
+      // A key's pages arrive back to back, so most items skip the lookup.
+      if (last_.has_value() && last_->first == key) return last_->second;
+      const size_t index = groups_.try_emplace(key, fresh).first->second;
+      last_.emplace(key, index);
+      return index;
+    } else {
+      std::vector<size_t>& group = groups_[key];
+      for (size_t candidate : group) {
+        if (traits_.Joins(candidate, out_.plans[candidate], key, item)) return candidate;
+      }
+      group.push_back(fresh);
+      return fresh;
+    }
+  }
+
   Traits traits_;
   TransferPlanSet out_;
-  std::unordered_map<typename Traits::Key, std::vector<size_t>, typename Traits::KeyHash> groups_;
+  std::unordered_map<Key, Group, typename Traits::KeyHash> groups_;
+  std::optional<std::pair<Key, size_t>> last_;  // kOnePerKey's most recent key
 };
 
 }  // namespace mori::umbp
