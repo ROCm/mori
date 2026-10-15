@@ -51,6 +51,8 @@ namespace mori::umbp {
 struct PoolAllocateResult {
   uint32_t backend_id = BackendRegistry::kMaxBackends;
   AllocateResult allocation;
+  // Failed because another writer is storing this key right now.
+  bool in_flight = false;
 };
 
 struct PoolSlotRef {

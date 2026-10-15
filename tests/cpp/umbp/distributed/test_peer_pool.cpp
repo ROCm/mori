@@ -403,6 +403,7 @@ TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   EXPECT_EQ(results[0].backend_id, registry.BackendId(registry.Get("dram_b")));
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_FALSE(results[1].in_flight);
   EXPECT_EQ(results[2].backend_id, registry.BackendId(registry.Get("dram_a")));
   EXPECT_EQ(results[2].allocation.outcome, AllocateOutcome::kSuccessAllocated);
 }
@@ -417,6 +418,7 @@ TEST(PeerPool, ReservesDuplicateKeysUntilCommitOrAbort) {
   ASSERT_EQ(results.size(), 2u);
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_TRUE(results[1].in_flight);
 
   ASSERT_TRUE(
       pool.BatchAbort({PoolSlotRef{results[0].backend_id, results[0].allocation.slot_id}}).front());

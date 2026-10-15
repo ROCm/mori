@@ -1644,6 +1644,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.logical_tier = logical_tier;
   request.preferred_numa_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
+  if (pool_alloc.in_flight) return PutAttemptOutcome::kSuccessAlreadyExists;
   auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
   // all; route the key elsewhere rather than allocating a slot we cannot fill.
@@ -2094,7 +2095,7 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     MediumBackend* const backend = backend_of[r];
     const auto& request = requests[r];
     const AllocateResult& alloc_res = allocations[r].allocation;
-    if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+    if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists || allocations[r].in_flight) {
       (*results)[request.result_index] = true;
       continue;
     }
@@ -2623,7 +2624,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     staged.reserve(local.size());
     for (size_t k = 0; k < local.size(); ++k) {
       const auto& alloc = allocations[k].allocation;
-      if (alloc.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+      if (alloc.outcome == AllocateOutcome::kSuccessAlreadyExists || allocations[k].in_flight) {
         (*results)[local[k].index] = PutEntryOutcome::kAlreadyExists;
         continue;
       }
