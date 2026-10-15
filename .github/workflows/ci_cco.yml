@@ -1,8 +1,8 @@
 name: CCO CI test
+# Perf-collection branch: pull_request trigger removed so this does not compete
+# with the EP perf job for the MI355X-AINIC node pair.
 on:
   push:
-    branches: [main]
-  pull_request:
     branches: [main]
   workflow_dispatch:
 
