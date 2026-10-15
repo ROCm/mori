@@ -28,6 +28,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "umbp/local/tiers/segment/segment_types.h"
@@ -63,6 +64,8 @@ class Index {
     return (it == segments_.end()) ? nullptr : &it->second;
   }
 
+  // For the scanner and the tier's startup repair.  Whoever moves a segment's
+  // write_offset through here must call RecomputeDiskBytes() afterwards.
   std::unordered_map<uint64_t, Meta>& MutableSegments() { return segments_; }
   const std::unordered_map<uint64_t, Meta>& Segments() const { return segments_; }
 
@@ -80,6 +83,8 @@ class Index {
   uint64_t active_segment_id() const { return active_segment_id_; }
   void set_active_segment_id(uint64_t active_segment_id) { active_segment_id_ = active_segment_id; }
 
+  // Moves `key` to the front of the recency list and stamps it and its segment
+  // with a fresh access tick.  Every read and write of a key goes through here.
   void TouchLRU(const std::string& key);
   void RemoveLRU(const std::string& key);
 
@@ -98,7 +103,45 @@ class Index {
     generation_counter_ = std::max(generation_counter_, generation + 1);
   }
 
-  std::pair<size_t, size_t> Capacity() const { return {used_, capacity_}; }
+  // {bytes on disk, capacity}.  On disk is every segment's append extent, dead
+  // records included: it is what the drive actually holds, so it is what
+  // admission and the eviction watermarks bound.  Never below live_bytes().
+  std::pair<size_t, size_t> Capacity() const { return {disk_used_, capacity_}; }
+  // Bytes of the records a key still maps to.
+  size_t live_bytes() const { return used_; }
+
+  // ---- segment lifecycle ----
+
+  // Registers a segment the tier just opened or created.
+  void InsertSegment(const Meta& seg);
+  // Re-derives the on-disk total after segment cursors were moved directly.
+  void RecomputeDiskBytes();
+
+  // A read or write is using the segment's fd outside the tier lock.
+  void PinSegment(uint64_t segment_id);
+  void UnpinSegment(uint64_t segment_id);
+
+  // True when the segment can be deleted: it is no longer appended to, no key
+  // maps into it, and no I/O holds its fd.
+  bool Reclaimable(uint64_t segment_id) const;
+  // True when the active segment was written to but every record in it has
+  // since been dropped.  The tier then rolls past it so it can be deleted.
+  bool ActiveSegmentEmptied() const;
+  // Drops a Reclaimable() segment from the index and hands back its Meta, so
+  // the caller can unlink and close the file outside the tier lock.
+  bool TakeSegment(uint64_t segment_id, Meta* out);
+
+  // Up to `max_keys` keys in the order that frees disk soonest, each paired
+  // with the bytes evicting it is credited with: its share of its segment's
+  // on-disk size, so evicting every key of a segment credits exactly the file.
+  //
+  // Disk comes back a whole segment at a time, so this ranks segments.  A
+  // sealed segment scores (age + 1) / live_fraction, highest first: the least
+  // recently touched segment goes first, and a mostly dead one goes far sooner
+  // than its age alone would send it, because evicting its few live keys frees
+  // the whole file.  Within a segment, keys go coldest first.  The active
+  // segment comes last: emptying it frees nothing until it is rolled past.
+  std::vector<std::pair<std::string, uint64_t>> EvictionOrder(size_t max_keys) const;
 
   std::string GetLRUKey() const {
     if (lru_list_.empty()) return "";
@@ -117,13 +160,26 @@ class Index {
   }
 
  private:
+  using KeyEntry = std::unordered_map<std::string, KeyMeta>::value_type;
+
+  // Keep segment_keys_ in step with key_meta_.  A pointer to a key_meta_
+  // element stays valid until that element is erased, so every erase unlinks
+  // first.
+  void LinkKey(const KeyEntry* entry);
+  void UnlinkKey(const KeyEntry* entry);
+
   size_t capacity_ = 0;
-  size_t used_ = 0;
+  size_t used_ = 0;       // live record bytes
+  size_t disk_used_ = 0;  // sum of the segments' write_offset
   uint64_t next_segment_id_ = 0;
   uint64_t active_segment_id_ = 0;
   uint64_t generation_counter_ = 1;
+  uint64_t access_tick_ = 0;
   std::unordered_map<std::string, KeyMeta> key_meta_;
   std::unordered_map<uint64_t, Meta> segments_;
+  // The keys whose current record is in each segment.  Eviction ranks
+  // segments and then needs their keys; finding them in key_meta_ is O(keys).
+  std::unordered_map<uint64_t, std::unordered_set<const KeyEntry*>> segment_keys_;
   std::unordered_set<uint64_t> known_segment_ids_;
   std::list<std::string> lru_list_;
   std::unordered_map<std::string, std::list<std::string>::iterator> lru_map_;
