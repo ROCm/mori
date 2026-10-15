@@ -34,6 +34,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <tuple>
 
 #include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
@@ -132,7 +133,12 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
     cq_ex = ibv_create_cq_ex(context, &cq_attr);
   }
 
-  assert(cq_ex);
+  if (cq_ex == nullptr) {
+    int savedErrno = errno;
+    MORI_APP_ERROR("IONIC CQ creation failed: errno {} ({}), ccqe:{}, cqe:{}", savedErrno,
+                   strerror(savedErrno), ccqe_enabled, cq_attr.cqe);
+    std::abort();
+  }
   cq = ibv_cq_ex_to_cq(cq_ex);
   assert(cq);
 
@@ -253,7 +259,12 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   attr.send_cq = cq;
   attr.recv_cq = cq;
   qp = ibv_create_qp_ex(context, &attr);
-  assert(qp);
+  if (qp == nullptr) {
+    int savedErrno = errno;
+    MORI_APP_ERROR("IONIC QP creation failed: errno {} ({}), max_send_wr:{}, max_recv_wr:{}",
+                   savedErrno, strerror(savedErrno), attr.cap.max_send_wr, attr.cap.max_recv_wr);
+    std::abort();
+  }
 
   HIP_RUNTIME_CHECK(hipGetDevice(&hip_dev_id));
   IonicDvApi::Instance().get_ctx(&dvctx, context);
@@ -328,6 +339,10 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
 
+  // errno of each failed attempt; dmabufErrno stays 0 when the dmabuf export itself
+  // failed, since the HSA/HIP export paths do not set errno.
+  int dmabufErrno = 0;
+  int plainErrno = 0;
   auto tryIbufDmabuf = [&]() -> ibv_mr* {
     if (!config.onGpu) return nullptr;
     uint64_t dmabufOffset = 0;
@@ -336,11 +351,14 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
     ibv_mr* mr = ibv_reg_dmabuf_mr(pd_uxdma, dmabufOffset, atomicIbufSize,
                                    reinterpret_cast<uint64_t>(atomicIbufAddr), dmabufFd,
                                    atomicIbufAccessFlag);
+    if (mr == nullptr) dmabufErrno = errno;
     close(dmabufFd);
     return mr;
   };
   auto tryIbufPlain = [&]() -> ibv_mr* {
-    return ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+    ibv_mr* mr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+    if (mr == nullptr) plainErrno = errno;
+    return mr;
   };
 
   bool preferDmabuf = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
@@ -354,11 +372,15 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   }
 
   if (atomicIbufMr == nullptr) {
+    std::string dmabufStatus = !config.onGpu      ? "skipped (host memory)"
+                               : dmabufErrno != 0 ? strerror(dmabufErrno)
+                                                  : "dmabuf export failed";
     MORI_APP_ERROR(
-        "IONIC atomic ibuf registration failed: dmabuf and ibv_reg_mr both failed (addr:{}, "
-        "size:{}, onGpu:{}, errno:{} ({})). Device memory needs either a dma-buf capable "
+        "IONIC atomic ibuf registration failed (addr:{}, size:{}, onGpu:{}): ibv_reg_mr: "
+        "errno {} ({}); dmabuf: {}. Device memory needs either a dma-buf capable "
         "libionic/driver or a registered peer memory client.",
-        atomicIbufAddr, atomicIbufSize, config.onGpu, errno, strerror(errno));
+        atomicIbufAddr, atomicIbufSize, config.onGpu, plainErrno, strerror(plainErrno),
+        dmabufStatus);
     std::abort();
   }
 
@@ -593,9 +615,9 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   // Same switch as payload MRs: MORI_ENABLE_DMABUF_REG=1 enables dma-buf CQ/SQ/RQ
   // rings. Needs libionic >= the release that exports ionic_dv_pd_set_dmabuf_alloc;
   // older libs keep the bare-VA alloc above.
-  bool useDmabufRings = IonicDvApi::Instance().pd_set_dmabuf_alloc != nullptr &&
-                        env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
-  if (IonicDvApi::Instance().pd_set_dmabuf_alloc == nullptr) {
+  bool wantDmabufRings = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
+  bool useDmabufRings = wantDmabufRings && IonicDvApi::Instance().pd_set_dmabuf_alloc != nullptr;
+  if (wantDmabufRings && !useDmabufRings) {
     MORI_APP_WARN(
         "libionic has no ionic_dv_pd_set_dmabuf_alloc; CQ/SQ/RQ rings fall back to bare-VA "
         "allocation");
