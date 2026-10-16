@@ -57,6 +57,12 @@ enum class TierType : int {
 // triple each.
 inline constexpr uint32_t kMaxBackendsPerPeer = 16;
 
+// Object bytes [offset, offset + length) a reader will touch; length 0 = all.
+struct ObjectExtent {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
 struct TierCapacity {
   uint64_t total_bytes = 0;
   uint64_t available_bytes = 0;
