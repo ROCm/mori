@@ -86,7 +86,7 @@ hipError_t DispatchNpes(int npes, F&& f) {
     FACADE_NPES_CASE(4)
     FACADE_NPES_CASE(8)
     default:
-      FACADE_PRINTF("CollectivesFacade: pull mode supports npes 2, 4 or 8, got %d", npes);
+      FACADE_PRINTF("pull mode supports npes 2, 4 or 8, got %d", npes);
       return hipErrorInvalidConfiguration;
   }
 #undef FACADE_NPES_CASE
@@ -124,7 +124,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   const size_t chunkBytes = chunkElems * sizeof(T);
   const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/false);
   // Staging is only needed by the push path; pull reads peers directly (no staging).
-  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
+  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > state_.stagingBytes) {
     FACADE_PRINTF("ReduceScatter: staging too small; increase maxStagingBytes");
     return hipErrorInvalidConfiguration;
   }
@@ -139,9 +139,9 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   constexpr int kThreads = 256;
   size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
-  int blocks = std::min(wantBlocks, std::max(1, MP_count_));
+  int blocks = std::min(wantBlocks, std::max(1, state_.MP_count));
   // MORI_CCL_MAX_NBLOCKS tightens (never raises) the grid; it stays co-resident.
-  if (maxNBlocks_ > 0) blocks = std::min(blocks, maxNBlocks_);
+  if (state_.maxNBlocks > 0) blocks = std::min(blocks, state_.maxNBlocks);
 
   int logS = resolveLogS(chunkBytes, /*allReduce=*/false);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
@@ -153,10 +153,10 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
     // with stride4G read from heapWin_.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       ReduceScatterPullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
-          <<<blocks, kThreads, 0, stream>>>(myPe_, heapWin_,
+          <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                   reinterpret_cast<const ComputeT*>(input),
                                   reinterpret_cast<ComputeT*>(output), chunkElemsC,
-                                  groupCounters_, barrierCtr_);
+                                  state_.groupCounters, state_.barrierCtr);
       return hipGetLastError();
     });
   } else {
@@ -164,9 +164,9 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
     // grid needs no rounding to a multiple of S.
     ReduceScatterPushKernel<NumPushVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<ComputeT*>(output),
-        groupCounters_, chunkElemsC, devComm_, heapWin_,
+        state_.groupCounters, chunkElemsC, state_.devComm, state_.heapWin,
         reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(staging_), barrierCtr_);
+        reinterpret_cast<ComputeT*>(state_.staging), state_.barrierCtr);
   }
   return hipGetLastError();
 }
@@ -198,7 +198,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/true);
   // Only the push path stages through peer-writable scratch; pull reads peers
   // directly and gathers straight into output.
-  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > stagingBytes_) {
+  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > state_.stagingBytes) {
     FACADE_PRINTF("AllReduce: staging too small; increase maxStagingBytes");
     return hipErrorInvalidConfiguration;
   }
@@ -213,9 +213,9 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // Cap the grid to the SM count so all blocks are co-resident: push needs it
   // for the multi-producer broadcast submitPacket ordering, pull for the
   // entry go-flag spin.
-  int blocks = std::min(wantBlocks, std::max(1, MP_count_));
+  int blocks = std::min(wantBlocks, std::max(1, state_.MP_count));
   // MORI_CCL_MAX_NBLOCKS tightens (never raises) the grid; it stays co-resident.
-  if (maxNBlocks_ > 0) blocks = std::min(blocks, maxNBlocks_);
+  if (state_.maxNBlocks > 0) blocks = std::min(blocks, state_.maxNBlocks);
 
   int logS = resolveLogS(chunkBytes, /*allReduce=*/true);
   const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
@@ -227,10 +227,10 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
     // staging; entry and exit PushEntryBarrier rounds on barrierCtr_.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllReducePullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
-          <<<blocks, kThreads, 0, stream>>>(myPe_, heapWin_,
+          <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                             reinterpret_cast<const ComputeT*>(input),
                                             reinterpret_cast<ComputeT*>(output), chunkElemsC,
-                                            groupCounters_, barrierCtr_);
+                                            state_.groupCounters, state_.barrierCtr);
       return hipGetLastError();
     });
   }
@@ -242,8 +242,8 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // derives each intra-heap offset from the raw pointer via ccoGetLocalPtr.
   AllReducePushKernel<NumPushVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(output), groupCounters_, chunkElemsC, devComm_,
-        reinterpret_cast<ComputeT*>(staging_), heapWin_, barrierCtr_);
+        reinterpret_cast<ComputeT*>(output), state_.groupCounters, chunkElemsC, state_.devComm,
+        reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin, state_.barrierCtr);
   return hipGetLastError();
 }
 
@@ -266,7 +266,7 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
   constexpr int kThreads = 64;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
-                                                  devComm_, heapWin_, barrierCtr_);
+                                     state_.devComm, state_.heapWin, state_.barrierCtr);
   return hipGetLastError();
 }
 
@@ -276,13 +276,14 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   // Fill the preallocated pinned (host-visible, device-readable) AddressPair
   // buffer with a plain host write, then launch -- no per-call device copy.
   for (int p = 0; p < nPes_; ++p) {
-    pinnedPairs_[p].source = addrs[p].first;
-    pinnedPairs_[p].dest = addrs[p].second;
+    state_.pinnedPairs[p].source = addrs[p].first;
+    state_.pinnedPairs[p].dest = addrs[p].second;
   }
   constexpr int kThreads = 64;
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
-  AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, pinnedPairs_, chunkBytes, devComm_,
-                                                 heapWin_, barrierCtr_);
+  AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
+                    state_.pinnedPairs, chunkBytes, state_.devComm,
+                    state_.heapWin, state_.barrierCtr);
   return hipGetLastError();
 }
 
@@ -322,9 +323,9 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
     return hipSuccess;
   }
   constexpr int kThreads = 64;
-  CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(nPes_, dstPe, srcPe, sendBuf, recvBuf,
-                                                          numBytes, devComm_, heapWin_,
-                                                          permuteReady_);
+  CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(
+                nPes_, dstPe, srcPe, sendBuf, recvBuf,
+                numBytes, state_.devComm, state_.heapWin, state_.permuteReady);
   return hipGetLastError();
 }
 
