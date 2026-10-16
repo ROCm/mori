@@ -179,10 +179,8 @@ class PeerSsdManager {
   // synchronized against Write/PrepareRead).  No-op when SSD is disabled.
   void DiscardLeftoverOnStartup();
 
-  // Prometheus-only observability snapshots (see metrics_ below); never drive
-  // correctness. Unread while dormant (PoolClient::PublishSsdMetrics, the
-  // former sampler, was removed with the rest of Phase 0's distributed-mode
-  // SSD wiring — see design-backend-agnostic-refactor.md).
+  // Prometheus-only observability snapshots (see metrics_ below), sampled by
+  // SsdBackend::SampleMetrics; never drive correctness.
   uint64_t ReadOk() const { return metrics_.read_ok.load(std::memory_order_relaxed); }
   uint64_t ReadNotFound() const { return metrics_.read_not_found.load(std::memory_order_relaxed); }
   uint64_t ReadSizeTooLarge() const {
@@ -198,12 +196,6 @@ class PeerSsdManager {
   // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
   uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
   uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
-  uint64_t EvictionVictims() const {
-    return metrics_.evict_victims.load(std::memory_order_relaxed);
-  }
-  uint64_t EvictionBytesFreed() const {
-    return metrics_.evict_bytes_freed.load(std::memory_order_relaxed);
-  }
   uint64_t EvictionBackendFailures() const {
     return metrics_.evict_backend_failures.load(std::memory_order_relaxed);
   }
@@ -328,8 +320,6 @@ class PeerSsdManager {
     std::atomic<uint64_t> read_merged{0};
     std::atomic<uint64_t> copy_bytes{0};  // bytes written to SSD (write IO)
     std::atomic<uint64_t> read_bytes{0};  // bytes read from SSD (read IO)
-    std::atomic<uint64_t> evict_victims{0};
-    std::atomic<uint64_t> evict_bytes_freed{0};
     std::atomic<uint64_t> evict_backend_failures{0};
     std::atomic<uint64_t> writes_in_place{0};
     std::atomic<uint64_t> write_in_place_aborts{0};

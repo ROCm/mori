@@ -78,13 +78,11 @@ class ShardedSsdTier : public TierBackend {
   TierCapabilities Capabilities() const override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
-  std::optional<std::string> GetLocationId(const std::string& key) const override;
   std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
   std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
   bool CommitRecord(const std::string& key, const RecordReservation& r) override;
   void AbortRecord(const std::string& key, const RecordReservation& r) override;
   bool Flush() override;
-  void SetColdRead(bool enable) override;
 
   // Parallel across shards: keys are bucketed by their (assigned or resolved)
   // shard and each bucket is handed to its own worker.  This is the whole point

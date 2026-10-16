@@ -108,10 +108,9 @@ Read by the **spdk_proxy daemon** (for intervals it emits) and by the
 
 | Env var | Default | Unit | Description |
 |---|---|---|---|
-| `UMBP_SPDK_PROXY_HEARTBEAT_STALE_MS` | `5000` | ms | Threshold after which the SHM-header heartbeat is considered stale. Consumed independently by proxy daemon, `SpdkProxyTier`, and probe code in `spdk_proxy_shm.cpp`. |
+| `UMBP_SPDK_PROXY_HEARTBEAT_STALE_MS` | `5000` | ms | Threshold after which the SHM-header heartbeat is considered stale. Consumed by `SpdkProxyTier`. |
 | `UMBP_SPDK_PROXY_HEARTBEAT_INTERVAL_MS` | `500` | ms | How often the proxy daemon's `PollLoop` writes `proxy_heartbeat_ms`. |
 | `UMBP_SPDK_PROXY_REAP_INTERVAL_SEC` | `5` | sec | Period of dead-channel reap + `SyncTelemetry` in `PollLoop`. |
-| `UMBP_SPDK_PROXY_POLL_INTERVAL_MS` | `100` | ms | `SpdkProxyTier::WaitForProxy` poll step. |
 | `UMBP_SPDK_PROXY_INIT_FAIL_SLEEP_SEC` | `2` | sec | Sleep before detach when `SpdkEnv::Init` fails during daemon startup. |
 | `UMBP_SPDK_PROXY_BUSY_YIELD_MS` | `1` | ms | Yield step used by writeback / batch-drain busy waits. |
 | `UMBP_SPDK_PROXY_TIMEOUT_MS` | `30000` | ms | Max time `SpdkProxyTier` waits for the proxy to reach `READY`. |

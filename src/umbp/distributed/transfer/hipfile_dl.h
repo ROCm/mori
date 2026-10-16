@@ -38,6 +38,11 @@ namespace mori::umbp {
 //
 // The signatures come from <hipfile.h> via decltype, so they cannot drift from
 // the real ones.
+//
+// ACKNOWLEDGEMENT.  <hipfile.h> and libhipfile belong to hipFile
+// (https://github.com/ROCm/hipFile; MIT License, Copyright (c) Advanced Micro
+// Devices, Inc.); this file only resolves their entry points.  Thanks to the
+// hipFile authors and contributors -- see gds_engine.h.
 struct HipFileApi {
   decltype(&::hipFileHandleRegister) HandleRegister = nullptr;
   decltype(&::hipFileHandleDeregister) HandleDeregister = nullptr;

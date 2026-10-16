@@ -316,8 +316,7 @@ TEST_F(SsdRangedIoTest, LocalBatchLargerThanTheStagingArenaIsServedInFull) {
   }
   for (const auto& key : keys) ASSERT_TRUE(WaitForExists(node, key));
 
-  // Back to back, several times: without releases each call would wait out
-  // the previous call's leases before it could stage anything.
+  // Back to back: each call's staging must be back before the next needs it.
   for (int pass = 0; pass < 3; ++pass) {
     std::vector<std::vector<char>> got(kKeys, std::vector<char>(128, 0));
     std::vector<std::vector<uintptr_t>> dsts(kKeys);

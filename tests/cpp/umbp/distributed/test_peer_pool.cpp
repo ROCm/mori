@@ -133,8 +133,8 @@ class GatedEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return inner_.CanHandle(src, dst);
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    return inner_.Plan(items);
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
     {
@@ -191,8 +191,8 @@ class FailingEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return inner_.CanHandle(src, dst);
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    return inner_.Plan(items);
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
     if (failures_.load() > 0) {
@@ -436,6 +436,7 @@ TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   EXPECT_EQ(results[0].backend_id, registry.BackendId(registry.Get("dram_b")));
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_FALSE(results[1].in_flight);
   EXPECT_EQ(results[2].backend_id, registry.BackendId(registry.Get("dram_a")));
   EXPECT_EQ(results[2].allocation.outcome, AllocateOutcome::kSuccessAllocated);
 }
@@ -450,6 +451,7 @@ TEST(PeerPool, ReservesDuplicateKeysUntilCommitOrAbort) {
   ASSERT_EQ(results.size(), 2u);
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_TRUE(results[1].in_flight);
 
   ASSERT_TRUE(
       pool.BatchAbort({PoolSlotRef{results[0].backend_id, results[0].allocation.slot_id}}).front());

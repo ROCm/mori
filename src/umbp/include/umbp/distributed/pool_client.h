@@ -427,11 +427,9 @@ class PoolClient {
   // Single-attempt outcome from a peer call; mapped to PutEntryOutcome
   // by the caller (Partition / Allocate).
   enum class PutAttemptOutcome { kSuccess, kSuccessAlreadyExists, kRetry, kFatal };
-  enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier, const std::string& logical_tier = {});
-  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
 
   // Resolve `keys` through the PeerPool. On return holders[i] is the
   // backend that owns keys[i] (nullptr when nothing here does) and, when it is
@@ -448,20 +446,17 @@ class PoolClient {
   // `dst_is_device` answers, for an ORIGINAL key index, whether that key's
   // destination is device memory -- the only place a file ref can be read.
   // Empty (the default) means the caller cannot consume a file ref at all, so
-  // none is requested and every key resolves onto staged pages.  `deferred`
-  // receives the kDeferred candidates (without it they read as misses).
+  // none is requested and every key resolves onto staged pages.
+  //
+  // Each hit's bytes stay put while its resolutions[i].hold lives.  `busy`
+  // receives the candidates a staged medium left for a later call while
+  // serving others; without it, or when nothing was served, they are misses.
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
                          std::vector<ResolvedEntry>* resolutions,
                          const std::function<bool(size_t)>& dst_is_device = {},
-                         std::vector<size_t>* deferred = nullptr);
-
-  // ReleaseResolved what ResolveLocalBatch published for `indices`.
-  void ReleaseResolvedLocal(const std::vector<std::string>& keys,
-                            const std::vector<size_t>& indices,
-                            const std::vector<MediumBackend*>& holders,
-                            const std::vector<ResolvedEntry>& resolutions);
+                         std::vector<size_t>* busy = nullptr);
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -525,18 +520,16 @@ class PoolClient {
   // as host bytes, or the engine picks the wrong copy direction.
   bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base, size_t object_size,
                               const std::vector<ObjectRange>& ranges);
-  bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
-                              size_t object_size);
 
-  // Item-building halves of the two copies above.  They append to `items`
+  // Item builders for ranged <-> contiguous copies.  They append to `items`
   // instead of transferring, so a caller with MANY objects can issue ONE
   // Transfer for all of them.
   //
   // This is the difference between the local and remote ranged paths, and it
   // was worth ~65% of remote transfer time: ExecuteLocalPutRangesBatch
   // accumulates every request's items and transfers once, while the remote
-  // arena loop called CopyRangesToContiguous per key -- one blocking transfer,
-  // one kernel launch and one hipStreamSynchronize EACH.  Measured on an
+  // arena loop used to copy per key -- one blocking transfer, one kernel
+  // launch and one hipStreamSynchronize EACH.  Measured on an
   // 8-rank embedded deployment: 369 transfers carrying 369 segments, 14.5 us
   // apiece, of which only ~5 us was the copy.
   //
@@ -898,6 +891,12 @@ class PoolClient {
   void ServeLocalGets(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
                       const std::vector<size_t>& sizes, const std::vector<size_t>& indices,
                       std::vector<bool>* results, std::vector<size_t>* missed);
+  // One part of ServeLocalGets; returns the keys left for the next part.
+  std::vector<size_t> ServeLocalGetPart(const std::vector<std::string>& keys,
+                                        const std::vector<void*>& dsts,
+                                        const std::vector<size_t>& sizes,
+                                        const std::vector<size_t>& indices,
+                                        std::vector<bool>* results, std::vector<size_t>* missed);
 
   // Whole-batch wrapper for the local-first arm: drops what cannot be served at
   // all, serves the rest, and returns the keys the master still has to route.

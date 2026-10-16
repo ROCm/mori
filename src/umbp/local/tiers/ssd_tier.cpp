@@ -139,17 +139,6 @@ bool SSDTier::ProbeDirectIo() const {
   return ok;
 }
 
-void SSDTier::SetColdRead(bool enable) {
-  if (enable == direct_io_) return;
-  if (enable && !ProbeDirectIo()) {
-    MORI_UMBP_WARN("[SSDTier] {}: SetColdRead(true) ignored — filesystem rejects O_DIRECT", dir_);
-    return;
-  }
-  direct_io_ = enable;
-  MORI_UMBP_INFO("[SSDTier] {}: direct I/O {} for segments opened from here on", dir_,
-                 enable ? "enabled" : "disabled");
-}
-
 void SSDTier::DropUnparsedTailsLocked() {
   // A follower must never rewrite the shared log; the owner does this once at
   // startup, before any write can land.
@@ -207,8 +196,6 @@ const segment::Meta* SSDTier::GetSegmentLocked(uint64_t segment_id) const {
   return index_.FindSegment(segment_id);
 }
 
-void SSDTier::RememberStatus(IoStatus status) const { last_io_status_ = std::move(status); }
-
 bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
   segment::Meta seg;
   seg.id = segment_id;
@@ -227,7 +214,6 @@ bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
       MORI_UMBP_ERROR("[SSDTier] {}: cannot open segment {} ({}): {} [{} so far]", dir_, segment_id,
                       seg.path, std::strerror(err), n);
     }
-    RememberStatus(IoStatus::IoError("segment open failed", err));
     return false;
   }
 
@@ -278,9 +264,6 @@ bool SSDTier::RefreshFromDiskLocked(bool force_full_rescan) {
   std::string error_message;
   bool ok = scanner_.RefreshFromDisk(dir_, *io_driver_, index_, IsReadOnlyShared(),
                                      force_full_rescan, &error_message, SegmentOpenFlags());
-  if (!ok && !error_message.empty()) {
-    RememberStatus(IoStatus::IoError(error_message));
-  }
   return ok;
 }
 
@@ -321,7 +304,6 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
   if (!status.ok()) {
     std::lock_guard<std::mutex> lock(mu_);
     index_.RollbackWrite(pr.reservation);
-    RememberStatus(std::move(status));
     return false;
   }
   return true;
@@ -416,7 +398,6 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
     for (auto it = prepared.rbegin(); it != prepared.rend(); ++it) {
       index_.RollbackWrite(it->reservation);
     }
-    RememberStatus(std::move(status));
     return false;
   }
   return true;
@@ -449,12 +430,10 @@ bool SSDTier::ReadRecordLocked(const std::string& key, void* dst, size_t size,
     status = ReadValueInto(read_fd, dst, size, value_offset);
   }
   if (!status.ok()) {
-    RememberStatus(std::move(status));
     return false;
   }
 
   if (ShouldVerifyCrc(crc_valid) && segment::ComputeRecordCrc32(key, dst, size) != expected_crc) {
-    RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
     return false;
   }
   return true;
@@ -598,7 +577,6 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       std::fill(io_ok.begin(), io_ok.end(), true);
     } else {
       // Batch failed — fall back to per-key reads.
-      RememberStatus(std::move(status));
       for (size_t j = 0; j < lookups.size(); ++j) {
         const auto& lk = lookups[j];
         IoStatus s;
@@ -609,7 +587,6 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
           s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
         }
         io_ok[j] = s.ok();
-        if (!s.ok()) RememberStatus(std::move(s));
       }
     }
   } else {
@@ -624,7 +601,6 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
         s = io_driver_->ReadAt(lk.fd, lk.io_dst, lk.io_size, lk.offset);
       }
       io_ok[j] = s.ok();
-      if (!s.ok()) RememberStatus(std::move(s));
     }
   }
 
@@ -655,10 +631,7 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
 
   for (size_t j = 0; j < lookups.size(); ++j) {
     if (!io_ok[j]) continue;
-    if (!key_ok[j]) {
-      RememberStatus(IoStatus::Corruption("segment CRC mismatch"));
-      continue;
-    }
+    if (!key_ok[j]) continue;
     results[lookups[j].orig_idx] = true;
   }
   crc_ms = ssdperf::MsSince(t_crc);
@@ -894,7 +867,6 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
       status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
     }
     run_ok[j] = status.ok() ? 1 : 0;
-    if (!status.ok()) RememberStatus(std::move(status));
   };
 
   if (use_batch) {
@@ -912,7 +884,6 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
     if (status.ok()) {
       std::fill(run_ok.begin(), run_ok.end(), 1);
     } else {
-      RememberStatus(std::move(status));
       for (size_t j = 0; j < runs.size(); ++j) read_one(j);
     }
   } else {
@@ -1065,19 +1036,6 @@ std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const 
   return index_.GetLRUCandidates(max_candidates);
 }
 
-std::optional<std::string> SSDTier::GetLocationId(const std::string& key) const {
-  std::lock_guard<std::mutex> lock(mu_);
-  auto* meta = index_.FindKey(key);
-  if (!meta && IsReadOnlyShared()) {
-    const_cast<SSDTier*>(this)->RefreshFromDiskLocked(false);
-    meta = index_.FindKey(key);
-  }
-  if (!meta) {
-    return std::nullopt;
-  }
-  return "seg" + std::to_string(meta->segment_id) + ":" + std::to_string(meta->value_offset);
-}
-
 std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   const auto* meta = index_.FindKey(key);
@@ -1123,7 +1081,6 @@ std::optional<RecordReservation> SSDTier::ReserveRecord(const std::string& key, 
   std::lock_guard<std::mutex> lock(mu_);
   if (!status.ok()) {
     index_.RollbackWrite(pending.prefix.reservation);
-    RememberStatus(std::move(status));
     return std::nullopt;
   }
   const segment::KeyMeta& meta = pending.prefix.reservation.meta;
@@ -1154,7 +1111,6 @@ bool SSDTier::CommitRecord(const std::string& /*key*/, const RecordReservation& 
   if (status.ok()) return true;
   std::lock_guard<std::mutex> lock(mu_);
   index_.RollbackWrite(pending.prefix.reservation);
-  RememberStatus(std::move(status));
   return false;
 }
 

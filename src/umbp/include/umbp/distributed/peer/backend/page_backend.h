@@ -262,8 +262,6 @@ class PageBackend : public MediumBackend {
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<uint64_t>& lease_tokens) override;
   bool Contains(const std::string& key) const override;
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
@@ -346,11 +344,9 @@ class PageBackend : public MediumBackend {
     // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
     // thread already extended.
     std::atomic<int64_t> read_lease_ns{0};
-    // Unreleased kLocal readers; while non-zero the pages are fenced whatever
-    // the deadline says.  Bumped under the shared lock, hence atomic.
-    std::atomic<uint32_t> local_readers{0};
-    // The lease_token releases must name: a re-committed key is a new slot.
-    uint64_t generation = 0;
+    // Copied into every kLocal hit; a reader still has it while use_count() > 1.
+    // Made at commit, so the shared-lock resolve path only copies it.
+    std::shared_ptr<const void> hold;
     // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
@@ -368,8 +364,7 @@ class PageBackend : public MediumBackend {
         : pages(std::move(other.pages)),
           size(other.size),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
-          local_readers(other.local_readers.load(std::memory_order_relaxed)),
-          generation(other.generation),
+          hold(std::move(other.hold)),
           lru_it(other.lru_it),
           in_lru(other.in_lru) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
@@ -378,9 +373,7 @@ class PageBackend : public MediumBackend {
       size = other.size;
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
-      local_readers.store(other.local_readers.load(std::memory_order_relaxed),
-                          std::memory_order_relaxed);
-      generation = other.generation;
+      hold = std::move(other.hold);
       lru_it = other.lru_it;
       in_lru = other.in_lru;
       return *this;
@@ -416,8 +409,7 @@ class PageBackend : public MediumBackend {
   // Build the full ADD list for every owned key.  Caller MUST hold `mutex_`.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
-  // True iff `slot`'s read-lease deadline is still in the future, or a local
-  // reader has not released it yet.
+  // True iff `slot`'s read lease is still running or a local reader holds it.
   static bool HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                        std::chrono::steady_clock::time_point now);
 
@@ -455,12 +447,13 @@ class PageBackend : public MediumBackend {
   void TouchLru(const std::string& key, OwnedSlot& slot);
   void RemoveFromLru(OwnedSlot& slot);
 
-  // Owned pages held back at ClearLocal() because of an active read lease.
-  // Released by ReaperSweep() when release_at <= now.
+  // Owned pages held back at ClearLocal() by a read lease or a local reader.
+  // Released by ReaperSweep() once release_at has passed and the hold is free.
   struct DeferredFree {
     std::string key;  // for debug log only.
     std::vector<PageLocation> pages;
     std::chrono::steady_clock::time_point release_at;
+    std::shared_ptr<const void> hold;
   };
 
   TierType tier_;
@@ -507,7 +500,6 @@ class PageBackend : public MediumBackend {
   };
   std::unordered_map<std::string, PinState> pins_;
   uint64_t next_pin_token_ = 1;
-  uint64_t next_slot_generation_ = 1;  // 0 means "nothing to release"; commit only
 
   std::vector<DeferredFree> deferred_frees_;
 
@@ -531,6 +523,7 @@ class PageBackend : public MediumBackend {
   // Bumped by ClearLocal(); snapshotted into each PendingSlot.  Commit()
   // rejects pre-clear slots via mismatch.  Local-only.
   uint64_t allocator_generation_ = 0;
+  uint64_t alloc_failures_ = 0;  // guarded by mutex_; samples the Allocate WARN
 
   std::atomic<uint64_t> next_slot_id_{1};
 

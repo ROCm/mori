@@ -447,6 +447,9 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 # costs nothing where it does not.
 # GLOBAL so tests/cpp/umbp/distributed can still gate test_gds_engine on the
 # same target; nothing links it.
+#
+# hipFile (https://github.com/ROCm/hipFile, MIT License) is the work of its
+# authors and contributors; see the acknowledgement in gds_engine.h.
 find_package(hipfile QUIET CONFIG GLOBAL)
 if(TARGET hip::hipfile)
   message(STATUS "[UMBP] hipfile headers found — GDS transfer engine ENABLED "

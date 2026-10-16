@@ -51,6 +51,8 @@ namespace mori::umbp {
 struct PoolAllocateResult {
   uint32_t backend_id = BackendRegistry::kMaxBackends;
   AllocateResult allocation;
+  // Failed because another writer is storing this key right now.
+  bool in_flight = false;
 };
 
 struct PoolSlotRef {
@@ -126,10 +128,6 @@ class PeerPool {
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                               bool include_descs, bool allow_file_refs = false,
                                               ResolveReader reader = ResolveReader::kRemote);
-  // Hands back what a kLocal BatchResolve published, grouped per backend
-  // (MediumBackend::ReleaseResolved).  Entries without a lease token are skipped.
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<PoolResolvedEntry>& entries);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
   // check discards. Takes no read lease and does not touch recency: asking

@@ -46,8 +46,12 @@ namespace mori::umbp {
 //     (PosixEngine for tier migrations, GdsEngine for reads into the GPU);
 //   * through the staging arena, registered host DRAM a remote peer can RDMA:
 //     Allocate lends pages and Commit writes them out; Resolve fills pages under
-//     a read lease, kBusy while the arena is full, kFailed if a batch can never
-//     fit.  A key's pages are one contiguous run of the arena.
+//     a read lease (a remote reader) or a hold (a local one, see ResolveReader).
+//     A remote batch is staged all or nothing: kBusy while the arena is full,
+//     kFailed if it can never fit.  A local batch is staged up to half the
+//     arena and the rest is kBusy.  A key's pages are one contiguous run of the
+//     arena.  A staged page goes back once its lease has expired and no hold is
+//     left: at the next reaper sweep, or at once when the arena is short.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -118,8 +122,6 @@ class SsdBackend : public MediumBackend {
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<uint64_t>& lease_tokens) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
   // The manager's LRU (always kept) minus keys a staged or migration read holds.
@@ -160,26 +162,20 @@ class SsdBackend : public MediumBackend {
     std::optional<RecordReservation> record;
   };
 
-  // A staged read.  The span is never reclaimed while a kLocal holder has not
-  // released it; a kRemote holder keeps it until expires_at; with neither it
-  // goes back on the last release.  `token` is the entries' lease_token.
   struct ReadLease {
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
-    uint32_t local_holders = 0;
-    uint32_t remote_holders = 0;
-    uint64_t token = 0;
-    bool overdue_warned = false;
+    std::shared_ptr<const void> hold;  // copied into each kLocal hit
   };
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
-  // the requested size is currently available.
+  // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
-  // Caller MUST hold mutex_.  Drops one holder of `key`'s lease if `token`
-  // still names it; true when that returned the span to the arena.
-  bool DropLeaseHolderLocked(const std::string& key, uint64_t token, ResolveReader reader);
+  // Caller MUST hold mutex_.  Frees every read lease that has expired and has
+  // no hold left; returns how many.
+  size_t ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point now);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -245,17 +241,14 @@ class SsdBackend : public MediumBackend {
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
-  std::atomic<uint64_t> staging_early_releases_{0};  // released before expiry
-  std::atomic<uint64_t> resolve_deferred_keys_{0};   // left for a further call
   // Migration pins (a source read, or a target after commit): file range or staging.
   std::atomic<uint64_t> migrations_in_place_{0};
   std::atomic<uint64_t> migrations_staged_{0};
-  uint64_t next_lease_token_ = 1;  // guarded by mutex_; 0 means "nothing to release"
   // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
   // can read it without taking mutex_ (the metrics tick must never contend with
   // a read).
   std::atomic<uint64_t> staging_pages_in_use_{0};
-  std::atomic<uint64_t> staging_pages_peak_{0};  // highest occupancy; written under mutex_
+  std::atomic<uint64_t> staging_pages_peak_{0};  // written under mutex_
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

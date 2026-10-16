@@ -27,10 +27,4 @@ namespace mori::umbp {
 
 enum class StorageTier : int { CPU_DRAM = 0, LOCAL_SSD = 1 };
 
-struct LocalLocation {
-  StorageTier tier;
-  size_t offset;
-  size_t size;
-};
-
 }  // namespace mori::umbp

@@ -19,14 +19,18 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+// Every read below is a hipFileRead: the drive -> GPU transfer is hipFile's
+// (https://github.com/ROCm/hipFile).  See the acknowledgement in gds_engine.h.
 #include "umbp/distributed/transfer/gds_engine.h"
 
 #include <cerrno>
+#include <memory>
 #include <string>
 #include <utility>
 
 #include "hipfile_dl.h"
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
 namespace {
@@ -124,33 +128,34 @@ bool GdsEngine::CanHandle(const TransferRef& src, const TransferRef& dst) const 
   return src.IsFile() && !dst.IsFile() && dst.HasHostPtr() && IsGpu(dst);
 }
 
-TransferPlanSet GdsEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  out.plans.reserve(items.size());
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst)) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
-    }
-    // Bound the read to the destination buffer: an overrun into a device pool
-    // is silent corruption, not a segfault, so reject it here rather than let
-    // hipFileRead scribble past the slot.
-    if (item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
-    }
-    TransferPlan plan;
-    plan.src = item.src;
-    plan.dst = item.dst;
-    plan.dir = TransferDirection::kLocal;
-    plan.src_offsets.push_back(static_cast<size_t>(item.src_offset));
-    plan.dst_offsets.push_back(static_cast<size_t>(item.dst_offset));
-    plan.sizes.push_back(static_cast<size_t>(item.size));
-    plan.tags.push_back(item.tag);
-    out.plans.push_back(std::move(plan));
+namespace {
+// One plan per item.  Only the GPU destination is bounds-checked.
+class GdsPlanBuilder final : public TransferPlanBuilder {
+ public:
+  GdsPlanBuilder(const GdsEngine& engine, size_t expected_items) : engine_(engine) {
+    out_.plans.reserve(expected_items);
   }
-  return out;
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    if (!engine_.CanHandle(item.src, item.dst) ||
+        !RangeFits(item.dst_offset, item.size, item.dst.size)) {
+      out_.rejected_tags.push_back(item.tag);
+      return;
+    }
+    TransferPlan plan = PlanBetween(item, TransferDirection::kLocal);
+    AppendSegment(&plan, item.src_offset, item.dst_offset, item.size, item.tag);
+    out_.plans.push_back(std::move(plan));
+  }
+  TransferPlanSet Finish() override { return std::move(out_); }
+
+ private:
+  const GdsEngine& engine_;
+  TransferPlanSet out_;
+};
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> GdsEngine::CreatePlanBuilder(size_t expected_items) const {
+  return std::make_unique<GdsPlanBuilder>(*this, expected_items);
 }
 
 std::unique_ptr<TransferHandle> GdsEngine::Submit(std::vector<TransferPlan> plans) {

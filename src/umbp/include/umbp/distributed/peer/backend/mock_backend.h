@@ -160,7 +160,7 @@ class MockBackend : public MediumBackend {
                                           bool allow_file_refs = false,
                                           ResolveReader reader = ResolveReader::kRemote) override {
     (void)allow_file_refs;  // this mock stages everything; it publishes no file refs
-    (void)reader;           // ...and holds nothing a reader would have to release
+    (void)reader;           // ...and its map entries never move under a reader
     std::vector<ResolvedEntry> out(keys.size());
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {

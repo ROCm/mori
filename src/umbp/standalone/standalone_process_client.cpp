@@ -44,6 +44,7 @@
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/distributed/tier_proto.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 
@@ -75,32 +76,6 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
     for (char c : key) mix(static_cast<unsigned char>(c));
   }
   return hash == 0 ? kPrime : hash;
-}
-
-::umbp::TierType TierToProto(TierType tier) {
-  switch (tier) {
-    case TierType::HBM:
-      return ::umbp::TIER_HBM;
-    case TierType::DRAM:
-      return ::umbp::TIER_DRAM;
-    case TierType::SSD:
-      return ::umbp::TIER_SSD;
-    default:
-      return ::umbp::TIER_UNKNOWN;
-  }
-}
-
-TierType TierFromProto(::umbp::TierType tier) {
-  switch (tier) {
-    case ::umbp::TIER_HBM:
-      return TierType::HBM;
-    case ::umbp::TIER_DRAM:
-      return TierType::DRAM;
-    case ::umbp::TIER_SSD:
-      return TierType::SSD;
-    default:
-      return TierType::UNKNOWN;
-  }
 }
 
 UMBPDeploymentMode BackendModeFromProto(::umbp::StandaloneBackendMode mode) {

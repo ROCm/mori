@@ -31,7 +31,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/env_time.h"
@@ -54,12 +53,6 @@ uint64_t HeartbeatStaleMs() {
                                                std::chrono::milliseconds(kDefaultHeartbeatStaleMs),
                                                /*min_allowed=*/1)
                                 .count());
-  return v;
-}
-
-std::chrono::milliseconds ProxyPollInterval() {
-  static const auto v = GetEnvMilliseconds("UMBP_SPDK_PROXY_POLL_INTERVAL_MS",
-                                           std::chrono::milliseconds(100), /*min_allowed=*/1);
   return v;
 }
 }  // namespace
@@ -186,59 +179,6 @@ SpdkProxyTier::~SpdkProxyTier() {
     session_id_ = 0;
   }
   shm_.Detach();
-}
-
-// ---------------------------------------------------------------------------
-// WaitForProxy — static, called before constructing SpdkProxyTier
-// ---------------------------------------------------------------------------
-bool SpdkProxyTier::WaitForProxy(const std::string& shm_name, int timeout_ms) {
-  auto start = std::chrono::steady_clock::now();
-
-  while (true) {
-    ProxyShmRegion probe;
-    int rc = probe.Attach(shm_name);
-    if (rc == 0) {
-      auto* hdr = probe.Header();
-      if (hdr->version != kProxyVersion) {
-        MORI_UMBP_ERROR("SpdkProxyTier: protocol mismatch on SHM '{}' (have={} want={})", shm_name,
-                        hdr->version, kProxyVersion);
-        return false;
-      }
-      std::string layout_error;
-      if (!ProxyShmRegion::ValidateHeaderLayout(hdr, probe.Size(), &layout_error)) {
-        MORI_UMBP_ERROR("SpdkProxyTier: invalid proxy SHM layout on '{}': {}", shm_name,
-                        layout_error);
-        return false;
-      }
-
-      uint32_t st = hdr->state.load(std::memory_order_acquire);
-      if (st == static_cast<uint32_t>(ProxyState::READY)) {
-#ifdef __linux__
-        uint32_t pid = hdr->proxy_pid.load(std::memory_order_relaxed);
-        if (pid > 0 && kill(static_cast<pid_t>(pid), 0) != 0) {
-          probe.Detach();
-        } else
-#endif
-        {
-          uint64_t hb = hdr->proxy_heartbeat_ms.load(std::memory_order_acquire);
-          if (hb == 0 || (NowEpochMs() - hb) < HeartbeatStaleMs()) {
-            return true;
-          }
-        }
-      } else if (st == static_cast<uint32_t>(ProxyState::ERROR)) {
-        MORI_UMBP_ERROR("SpdkProxyTier: proxy reported ERROR state");
-        return false;
-      }
-    }
-
-    auto elapsed = std::chrono::steady_clock::now() - start;
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= timeout_ms) {
-      MORI_UMBP_ERROR("SpdkProxyTier: timed out waiting for proxy READY ({} ms)", timeout_ms);
-      return false;
-    }
-
-    std::this_thread::sleep_for(ProxyPollInterval());
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +604,7 @@ bool SpdkProxyTier::Flush() {
 // Per-item ring cache read — validate tenant, key, and tenant cache epoch.
 // ---------------------------------------------------------------------------
 bool SpdkProxyTier::TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const {
-  if (!connected_ || cold_read_) return false;
+  if (!connected_) return false;
 
   auto* hdr = shm_.Header();
   if (hdr->cache_index_slots == 0 || tenant_slot_ >= hdr->max_tenants) return false;

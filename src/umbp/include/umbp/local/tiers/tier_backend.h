@@ -101,7 +101,6 @@ class TierBackend {
 
   // Optional capability-based extensions.
   virtual TierCapabilities Capabilities() const;
-  virtual const void* ReadPtr(const std::string& key, size_t* out_size);
   virtual bool WriteBatch(const std::vector<std::string>& keys,
                           const std::vector<const void*>& data_ptrs,
                           const std::vector<size_t>& sizes);
@@ -136,14 +135,6 @@ class TierBackend {
   // Default is a no-op (write-through tiers are always consistent).
   // SpdkProxyTier overrides this to drain pending write-back NVMe flushes.
   virtual bool Flush() { return true; }
-
-  // Toggle cold-read mode: bypass all caches, read directly from storage.
-  // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
-  virtual void SetColdRead(bool /*enable*/) {}
-
-  // Return an opaque location identifier for a previously written key.
-  // Callers prepend the store index before publishing to the Master.
-  virtual std::optional<std::string> GetLocationId(const std::string& key) const;
 
   // Physical location of |key|'s value for a zero-copy reader that DMAs it
   // itself (GdsEngine).  Default: no stable file location — only the

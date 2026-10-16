@@ -53,24 +53,10 @@ class StepTimer {
 
 }  // namespace
 
-namespace {
-class BufferedPlanBuilder final : public TransferPlanBuilder {
- public:
-  BufferedPlanBuilder(const TransferEngine& engine, size_t expected_items) : engine_(engine) {
-    items_.reserve(expected_items);
-  }
-  void Add(const TransferItem& item) override { items_.push_back(item); }
-  TransferPlanSet Finish() override { return engine_.Plan(items_); }
-
- private:
-  const TransferEngine& engine_;
-  std::vector<TransferItem> items_;
-};
-}  // namespace
-
-std::unique_ptr<TransferPlanBuilder> TransferEngine::CreatePlanBuilder(
-    size_t expected_items) const {
-  return std::make_unique<BufferedPlanBuilder>(*this, expected_items);
+TransferPlanSet TransferEngine::Plan(const std::vector<TransferItem>& items) const {
+  auto builder = CreatePlanBuilder(items.size());
+  for (const auto& item : items) builder->Add(item);
+  return builder->Finish();
 }
 
 bool TransferEngine::Transfer(const std::vector<TransferItem>& items,

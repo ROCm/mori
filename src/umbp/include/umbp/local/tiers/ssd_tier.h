@@ -89,23 +89,17 @@ class SSDTier : public TierBackend {
   TierCapabilities Capabilities() const override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
-  const IoStatus& LastIoStatus() const { return last_io_status_; }
-  std::optional<std::string> GetLocationId(const std::string& key) const override;
   std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+
+  // True when segment I/O is actually bypassing the page cache.  False if
+  // direct I/O was never requested, or was requested and the probe failed.
+  bool direct_io_active() const { return direct_io_; }
 
   // The uncommitted prefix goes down at reserve, so the log stays parseable and
   // the scanner skips the record until CommitRecord flips its flag.
   std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
   bool CommitRecord(const std::string& key, const RecordReservation& r) override;
   void AbortRecord(const std::string& key, const RecordReservation& r) override;
-  // Enables O_DIRECT for segments opened from here on.  Takes effect for
-  // segments opened after the call; existing fds keep their current mode, so
-  // the intended use is at construction (ssd.direct_io) rather than mid-run.
-  void SetColdRead(bool enable) override;
-
-  // True when segment I/O is actually bypassing the page cache.  False if
-  // direct I/O was never requested, or was requested and the probe failed.
-  bool direct_io_active() const { return direct_io_; }
 
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
@@ -133,7 +127,6 @@ class SSDTier : public TierBackend {
   const segment::Meta* GetSegmentLocked(uint64_t segment_id) const;
   bool ReadRecordLocked(const std::string& key, void* dst, size_t size, uint32_t expected_crc,
                         uint64_t value_offset, int read_fd, bool crc_valid) const;
-  void RememberStatus(IoStatus status) const;
   // Issue one value read, transparently bouncing through an aligned buffer when
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
@@ -153,7 +146,6 @@ class SSDTier : public TierBackend {
   segment::Index index_;
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;
-  mutable IoStatus last_io_status_;
 
   // Reserved records awaiting commit, by RecordReservation::token.  Guarded by mu_.
   struct PendingRecord {
