@@ -350,16 +350,21 @@ _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): {"fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))},
+            # EP8: the combine on 64x8, where it keeps 365 VGPRs; on 64x16 (256 a lane) it spills 230.
+            (8, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
         },
     },
     "fp8_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
+            (8, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
         },
     },
     "none": {
         "gfx1250": {
             (4, 7168, 6, None): {"bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))},
+            # EP8: the combine on 64x8 (333 VGPRs, no spill); past 16 tokens it is slower than the pull.
+            (8, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
         },
     },
 }
