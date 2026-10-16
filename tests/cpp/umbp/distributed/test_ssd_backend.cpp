@@ -971,6 +971,25 @@ TEST_F(SsdBackendExtentTest, LocalExtentResolveReadsOnlyTheWindow) {
   EXPECT_EQ(PagesInUse(), 0u) << "an extent stage goes back with its last hold";
 }
 
+// A Clear must not hand a span to the next reader while a local reader copies out of it.
+TEST_F(SsdBackendExtentTest, ClearKeepsSpansALocalReaderHolds) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "a", Aperiodic(kObject)));
+  ASSERT_TRUE(Put(backend_.get(), "b", Aperiodic(kObject)));
+  auto whole = backend_->BatchResolve({"a"}, false, false, ResolveReader::kLocal);
+  auto window = ResolveExtents({"b"}, {ObjectExtent{0, 4096}});
+  ASSERT_TRUE(whole[0].found);
+  ASSERT_TRUE(window[0].found);
+  ASSERT_EQ(PagesInUse(), 17u);
+
+  backend_->ClearLocal();
+  EXPECT_EQ(PagesInUse(), 17u);
+  whole.clear();
+  window.clear();
+  backend_->RunReaperOnceForTest();
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
 // The last window of an object that is not a 4 KiB multiple stops at its end.
 TEST_F(SsdBackendExtentTest, TailWindowIsClampedToTheObject) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});

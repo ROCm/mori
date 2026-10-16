@@ -173,7 +173,8 @@ class SsdBackend : public MediumBackend {
   };
 
   // A span holding only object bytes `window`, for in-process readers (D1);
-  // freed once the holds published from it are gone.
+  // freed once the holds published from it are gone.  ClearLocal also parks
+  // here the leases readers still hold.
   struct ExtentStage {
     StagingSpan span;
     ObjectExtent window;
