@@ -314,11 +314,6 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
   }
   // Empty dstPes: receive-only rank (nobody receives from us).
   const int dstPe = dstPes.empty() ? -1 : dstPes[0];
-  if (dstPe < -1 || dstPe >= nPes_ || srcPe < -1 || srcPe >= nPes_) {
-    FACADE_PRINTF("CollectivePermute: dstPe=%d srcPe=%d out of range (nPes=%d)", dstPe, srcPe,
-                  nPes_);
-    return hipErrorInvalidValue;
-  }
   if (dstPe < 0 && srcPe < 0) {
     return hipSuccess;
   }
