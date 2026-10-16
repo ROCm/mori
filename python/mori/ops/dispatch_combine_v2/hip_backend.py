@@ -176,6 +176,13 @@ def push_land_rows(cfg) -> int:
     return cfg.max_num_inp_token_per_rank * min(cfg.world_size, cfg.num_experts_per_token)
 
 
+def ll_bf16_row_bytes(cfg) -> int:
+    """A landing row of the bf16 LL128 combine (EpCombineLlBf16_1250x): the bf16 row and the
+    weights, two a line, in 128 B lines of 120 data bytes each, in whole units of eight lines."""
+    wt = 8 * ((cfg.num_experts_per_token + 1) // 2)
+    return ((cfg.combine_token_nbytes + wt + 119) // 120 + 7) // 8 * 1024
+
+
 def _mtype_local_rw() -> bool:
     """amdgpu's mtype_local is 0, MTYPE_RW. Unreadable counts as not."""
     try:
@@ -694,6 +701,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dt = "fp4"
         elif cfg.dispatch_dtype in _FP8_TUNING_DTYPES:
             dt = "fp8"
+        elif (
+            cfg.dispatch_dtype is torch.bfloat16
+            and cfg.combine_dtype is torch.bfloat16
+            and cfg.quant_type == "none"
+        ):
+            dt = "bf16"
         else:
             return None
         from .hip_tuning_configs import ll128
@@ -729,6 +742,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             row = push_wire_nbytes(cfg) + (8 if cfg.world_size >= 4 else 0)
             # The LL128 combine lands the same rows, as lines, from the same offset.
             out_tok += land_rows * (max(row, ll_comb_row_bytes(cfg)) if ll else row)
+        elif ll:
+            # The bf16 LL128 combine lands a token's rows from each of its ranks past the staging.
+            out_tok += push_land_rows(cfg) * ll_bf16_row_bytes(cfg)
         tok_off = 4
         if ll:
             # Past the slot word, at _STAGE_OFF: the LL128 dispatch's count words and the

@@ -84,16 +84,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
 
-  // The LL128 combine is the push combine with e8m0 scales, and its dispatch fills the map
-  // only that combine reads; both kernels see the same request, so they agree. The grid
-  // bounds are the per-block call numbers (_llSeq, _lcSeq) and the dispatch's count headers.
+  // The LL128 combine is the push combine with e8m0 scales or, for a bf16 op, the bf16 sum, and
+  // its dispatch fills the map only that combine reads; both kernels see the same request, so they
+  // agree. The grid bounds are the per-block call numbers (_llSeq, _lcSeq) and the dispatch's
+  // count headers.
   if (req.ll128) {
     const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
-    if (arch.rfind("gfx125", 0) != 0 || !pushE8m0 || req.maxTokPerRank > 512 ||
+    const bool bf16 = !req.combineFp4 && !req.combineFp8 && req.dtype == EpDType::Bf16;
+    if (arch.rfind("gfx125", 0) != 0 || !(pushE8m0 || bf16) || req.maxTokPerRank > 512 ||
         c.waveSize != 32 || c.blockNum > (isDispatch ? 128 : 256)) {
       throw std::runtime_error(
-          "mori v2 ep: ll128 needs gfx125x, the fp4 / fp8 push combine with e8m0 scales, at "
-          "most 512 tokens a rank, wave32, and at most 128 dispatch / 256 combine blocks");
+          "mori v2 ep: ll128 needs gfx125x, the fp4 / fp8 push combine with e8m0 scales or a bf16 "
+          "op, at most 512 tokens a rank, wave32, and at most 128 dispatch / 256 combine blocks");
     }
     c.ll128 = true;
   }

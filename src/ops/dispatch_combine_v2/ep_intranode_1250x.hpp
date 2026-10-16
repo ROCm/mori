@@ -4548,10 +4548,252 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
     __hip_atomic_store(_lcSeq + blockIdx.x, seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// The LL128 combine of a bf16 op (EpCfg::ll128 without a push combine): an expert rank stores each
+// row it received, unchanged, as 128 B lines that carry the call number, to the landing of the rank
+// the row came from at the slot EpCombineLl1250x uses, and the source sums a token's rows in fp32 in
+// the same order (the order of first appearance of their ranks in its ids). A line's lanes 0..6
+// carry 16 B of the row from 112 B a line, lane 7 the 8 B of the row's tail past 112 B a line, then
+// the call number, so every lane's bytes are one aligned load at the expert and one aligned store at
+// the source, and a token's rows sum in registers without LDS. A row's units are split into
+// parts, a wave each, so a few rows still spread over many waves. The tail lines past the row
+// carry the slot's forwarded weights, which the source sums as the pull combine's weight fold
+// does when outWeightsBuf asks for it.
+template <EpCfg kCfg, typename T>
+__device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
+  static_assert(std::is_same_v<T, hip_bfloat16> && !EpCombinePush(kCfg),
+                "the bf16 LL128 combine sums bf16 rows as they are");
+  constexpr int npes = kCfg.worldSize;
+  constexpr int topk = kCfg.numExpertPerToken;
+  constexpr int WS = kCfg.waveSize;
+  constexpr int kEpr = kCfg.numExpertPerRank;
+  constexpr int kTokB = EpTokenBytes(kCfg);
+  constexpr int kRows = EpFp4Rows<kCfg>();
+  constexpr int kLinePay = 120;
+  constexpr int kLinesU = WS / 8;
+  constexpr int kUnitB = WS * 16;
+  // The weights ride two a line in the tail lines past the row.
+  constexpr int kWtPairs = (topk + 1) / 2;
+  constexpr int kLines = (kTokB + 8 * kWtPairs + kLinePay - 1) / kLinePay;
+  constexpr int kMainB = 112 * kLines < kTokB ? 112 * kLines : kTokB;
+  constexpr int kTailLines = (kTokB - kMainB) / 8;
+  constexpr int kUnits = (kLines + kLinesU - 1) / kLinesU;
+  constexpr int kLlRowB = kUnits * kUnitB;
+  constexpr int kUPart = 8;
+  constexpr int kParts = (kUnits + kUPart - 1) / kUPart;
+  constexpr size_t kLandOff = (size_t)EpMaxRecv(kCfg) * kTokB;
+  constexpr unsigned kSpinMax = 1u << 22;
+  static_assert(kTokB % 16 == 0 && kMainB % 16 == 0, "every lane's bytes are aligned");
+  static_assert(kTailLines + kWtPairs <= kLines, "the tail and the weights fit 8 B a line");
+  static_assert(kLlRowB <= ((kTokB + 8 * kWtPairs + 119) / 120 + 7) / 8 * 1024,
+                "hip_backend.ll_bf16_row_bytes sizes the landing rows");
+  static_assert(kCfg.blockNum <= 256, "the per-block call numbers hold 256 blocks");
+
+  const int thdId = threadIdx.x;
+  const int laneId = thdId & (WS - 1);
+  const int warpId = thdId / WS;
+  asm volatile("" ::"s"(args.window), "s"(args.totalRecvTokenNum), "s"(args.offRecvToSrc),
+               "s"(args.offOutIdx), "s"(args.inpTokenBuf), "s"(args.offOutTok), "s"(args.outTokenBuf),
+               "s"(args.dispDestTokIdMap), "s"(args.numTokens), "s"(args.rank));
+  const int G = kCfg.blockNum;
+  const int nWaves = G * kCfg.warpPerBlock;
+  const int wv = blockIdx.x + G * warpId;
+  const int lg = laneId >> 3, lp = laneId & 7;
+  const int myPe = args.rank;
+  const int N = args.numTokens;
+  const EpWinRegs wr = EpWinRegsLoad(args.window);
+  const unsigned seq =
+      __hip_atomic_load(_lcSeq + blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u;
+  const unsigned long long flag = seq;
+  const int nRecv = min((int)args.totalRecvTokenNum[0], EpMaxRecv(kCfg));
+  // As in EpCombineLl1250x: past the barrier every wave has its receive total and call number, so
+  // the last block to count itself may clear the total for the next dispatch.
+  asm volatile("" ::"s"(nRecv), "v"(seq) : "memory");
+  __syncthreads();
+  if (thdId == (kCfg.warpPerBlock - 1) * WS) {
+    const unsigned d =
+        __hip_atomic_fetch_add(&_lcTicket, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (d == (unsigned)(G - 1)) {
+      *args.totalRecvTokenNum = 0;
+      __hip_atomic_store(&_lcTicket, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
+  auto firsts = [&](const int rq) -> unsigned long long {
+    bool f = rq >= 0;
+#pragma unroll
+    for (int k = 0; k < topk; ++k) {
+      const int qk = __shfl(rq, k, WS);
+      if (k < laneId && qk == rq) f = false;
+    }
+    return __ballot(f);
+  };
+  // This lane's bytes of unit c: 16 B of the main part, or for lane 7 the 8 B of the tail.
+  auto offOf = [&](const int c) { return 112 * (c * kLinesU + lg) + 16 * lp; };
+  auto tailOf = [&](const int c) { return kMainB + 8 * (c * kLinesU + lg); };
+
+  // Expert side: (received row, part) a wave, the source, ids and the part's units loaded before
+  // any of them is waited for.
+  const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
+  for (int it = wv; it < nRecv * kParts; it += nWaves) {
+    const int j = it / kParts, q = it - j * kParts;
+    const int st = EpUniG(EpLocal<int>(wr, args.offRecvToSrc))[j];
+    int e = -1;
+    if (laneId < topk) e = EpUniG(EpLocal<int>(wr, args.offOutIdx))[(size_t)j * topk + laneId];
+    const unsigned char* const row = src + (size_t)j * kTokB;
+    uint4 w[kUPart];
+#pragma unroll
+    for (int i = 0; i < kUPart; ++i) {
+      const int c = q * kUPart + i;
+      w[i] = make_uint4(0u, 0u, (unsigned)flag, (unsigned)(flag >> 32));
+      if (c >= kUnits) continue;
+      if (lp < 7) {
+        if (offOf(c) < kMainB) w[i] = *reinterpret_cast<const uint4*>(row + offOf(c));
+      } else if (tailOf(c) < kTokB) {
+        const uint2 x = *reinterpret_cast<const uint2*>(row + tailOf(c));
+        w[i].x = x.x;
+        w[i].y = x.y;
+      } else if constexpr (kCfg.useWeights) {
+        const int p = c * kLinesU + lg - kTailLines;
+        if (p >= 0 && p < kWtPairs) {
+          const float* const wt = EpLocal<float>(wr, args.offOutWts) + (size_t)j * topk + 2 * p;
+          w[i].x = __float_as_uint(wt[0]);
+          w[i].y = 2 * p + 1 < topk ? __float_as_uint(wt[1]) : 0u;
+        }
+      }
+    }
+    asm volatile("" ::: "memory");
+    if (st < 0 || st >= npes * kCfg.maxTokPerRank) continue;
+    const int s = st / kCfg.maxTokPerRank, t = st - s * kCfg.maxTokPerRank;
+    const unsigned qr = (unsigned)e / (unsigned)kEpr;
+    const int rq = (e >= 0 && qr < (unsigned)npes) ? (int)qr : -1;
+    const unsigned long long fm = firsts(rq);
+    const unsigned long long me = fm & __ballot(rq == myPe);
+    if (!me) continue;
+    const int k = __popcll(fm & (me - 1ull));
+    const auto dg = EpUniG(reinterpret_cast<uint4*>(EpPeer<char>(wr, s, args.offOutTok) + kLandOff +
+                                                    ((size_t)t * kRows + k) * kLlRowB));
+#pragma unroll
+    for (int i = 0; i < kUPart; ++i) {
+      const int c = q * kUPart + i;
+      if (c < kUnits) dg[c * (kUnitB / 16) + laneId] = w[i];
+    }
+  }
+
+  // Source side: (token, part) a wave from the top of the grid; all of the token's rows are read
+  // each poll round (past its last row the last row again, so no load sits behind a branch).
+  const char* const land = EpLocal<char>(wr, args.offOutTok) + kLandOff;
+  unsigned char* const out = reinterpret_cast<unsigned char*>(args.outTokenBuf);
+  int tmoT = -1, tmoR = 0;
+  unsigned tmoSeen = 0;
+  for (int it = nWaves - 1 - wv; it < N * kParts; it += nWaves) {
+    const int t = it / kParts, q = it - t * kParts;
+    const int r0 = laneId < topk ? args.dispDestTokIdMap[t * topk + laneId] : -1;
+    const unsigned long long fm = firsts(r0 >= 0 && r0 < npes ? r0 : -1);
+    const int nRow = __popcll(fm);
+    unsigned char* const orow = out + (size_t)t * kTokB;
+    // This lane's pair of weights in unit c, or -1.
+    auto wtPair = [&](const int c) {
+      const int p = c * kLinesU + lg - kTailLines;
+      return lp == 7 && tailOf(c) >= kTokB && p >= 0 && p < kWtPairs ? p : -1;
+    };
+    auto storeWt = [&](const int p, const float a, const float b) {
+      float* const ow = args.outWeightsBuf + (size_t)t * topk + 2 * p;
+      ow[0] = a;
+      if (2 * p + 1 < topk) ow[1] = b;
+    };
+    if (nRow == 0) {
+#pragma unroll
+      for (int i = 0; i < kUPart; ++i) {
+        const int c = q * kUPart + i;
+        if (c >= kUnits) break;
+        if (lp < 7) {
+          if (offOf(c) < kMainB) *reinterpret_cast<uint4*>(orow + offOf(c)) = make_uint4(0u, 0u, 0u, 0u);
+        } else if (tailOf(c) < kTokB) {
+          *reinterpret_cast<uint2*>(orow + tailOf(c)) = make_uint2(0u, 0u);
+        } else if (args.outWeightsBuf && wtPair(c) >= 0) {
+          storeWt(wtPair(c), 0.0f, 0.0f);
+        }
+      }
+      continue;
+    }
+    uint4 v[kRows][kUPart];
+    bool ok = false;
+    for (unsigned spin = 0; spin < kSpinMax && !ok; ++spin) {
+      // The CU and SE caches can hold the landing's lines from an earlier kernel, and a read there
+      // never sees the row land: drop them before every round.
+      asm volatile("global_inv scope:SCOPE_SE\n\ts_wait_loadcnt 0x0" ::: "memory");
+#pragma unroll
+      for (int b = 0; b < kRows; ++b) {
+        const char* const row = land + ((size_t)t * kRows + (b < nRow ? b : nRow - 1)) * kLlRowB;
+#pragma unroll
+        for (int i = 0; i < kUPart; ++i) {
+          const int c = q * kUPart + i < kUnits ? q * kUPart + i : kUnits - 1;
+          const _mori_v4i x = __builtin_nontemporal_load(
+              reinterpret_cast<const _mori_v4i*>(row + (size_t)c * kUnitB + laneId * 16));
+          v[b][i] = make_uint4((unsigned)x.x, (unsigned)x.y, (unsigned)x.z, (unsigned)x.w);
+        }
+      }
+      int bad = 0;
+#pragma unroll
+      for (int b = 0; b < kRows; ++b)
+#pragma unroll
+        for (int i = 0; i < kUPart; ++i)
+          if (lp == 7 && ((((unsigned long long)v[b][i].w) << 32) | v[b][i].z) != flag) bad = 1;
+      ok = __ballot(bad) == 0ull;
+    }
+    if (!ok && tmoT < 0) {
+      tmoT = t;
+      tmoR = 1000 + q;
+      tmoSeen = __shfl(v[0][0].z, 7, WS);
+    }
+    // The rows in order, in fp32, rounded once.
+#pragma unroll
+    for (int i = 0; i < kUPart; ++i) {
+      const int c = q * kUPart + i;
+      if (c >= kUnits) break;
+      float acc[8];
+      float wa = 0.0f, wb = 0.0f;
+#pragma unroll
+      for (int x = 0; x < 8; ++x) acc[x] = 0.0f;
+#pragma unroll
+      for (int b = 0; b < kRows; ++b) {
+        if (b >= nRow) break;
+        const unsigned wd[4] = {v[b][i].x, v[b][i].y, v[b][i].z, v[b][i].w};
+#pragma unroll
+        for (int x = 0; x < 4; ++x) {
+          acc[2 * x] += __uint_as_float(wd[x] << 16);
+          acc[2 * x + 1] += __uint_as_float(wd[x] & 0xFFFF0000u);
+        }
+        wa += __uint_as_float(wd[0]);
+        wb += __uint_as_float(wd[1]);
+      }
+      if (lp < 7) {
+        if (offOf(c) < kMainB)
+          *reinterpret_cast<uint4*>(orow + offOf(c)) =
+              make_uint4(MoriPackTo2<T>(acc[0], acc[1]), MoriPackTo2<T>(acc[2], acc[3]),
+                         MoriPackTo2<T>(acc[4], acc[5]), MoriPackTo2<T>(acc[6], acc[7]));
+      } else if (tailOf(c) < kTokB) {
+        *reinterpret_cast<uint2*>(orow + tailOf(c)) =
+            make_uint2(MoriPackTo2<T>(acc[0], acc[1]), MoriPackTo2<T>(acc[2], acc[3]));
+      } else if (args.outWeightsBuf && wtPair(c) >= 0) {
+        storeWt(wtPair(c), wa, wb);
+      }
+    }
+  }
+
+  if (tmoT >= 0 && laneId == 0 && atomicAdd(&_lcTmo, 1u) < 8u)
+    printf("[LCTMO] rank=%d block=%d wave=%d tok=%d row=%d seq=%u seen=%u\n", myPe,
+           (int)blockIdx.x, warpId, tmoT, tmoR, seq, tmoSeen);
+  if (thdId == 0)
+    __hip_atomic_store(_lcSeq + blockIdx.x, seq, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpCombine1250xBody(EpArgs args) {
   if constexpr (kCfg.ll128) {
-    EpCombineLl1250x<kCfg, T>(args);
+    if constexpr (EpCombinePush(kCfg))
+      EpCombineLl1250x<kCfg, T>(args);
+    else
+      EpCombineLlBf16_1250x<kCfg, T>(args);
     return;
   }
   using TokT = T;
