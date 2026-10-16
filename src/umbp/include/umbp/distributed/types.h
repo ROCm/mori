@@ -80,6 +80,8 @@ struct TierTransitionMetrics {
   uint64_t attempted = 0;
   uint64_t succeeded = 0;
   uint64_t failed = 0;
+  uint64_t dropped = 0;  // evicted copies whose demotion never landed (lost keys)
+  uint64_t retried = 0;  // eviction demotions re-queued after a retryable failure
   uint64_t offloaded_bytes = 0;
   uint64_t promoted_bytes = 0;
 };
@@ -128,6 +130,17 @@ struct NodeTierKey {
   bool operator==(const NodeTierKey& o) const { return node_id == o.node_id && tier == o.tier; }
 };
 
+// Number of *distinct* hashes across tier buckets (size of the union): a hash
+// held on both HBM and DRAM counts once.  Shared by every match-result type.
+inline size_t CountDistinctHashes(
+    const std::map<TierType, std::vector<std::string>>& hashes_by_tier) {
+  std::unordered_set<std::string_view> seen;
+  for (const auto& [tier, hashes] : hashes_by_tier) {
+    for (const auto& h : hashes) seen.insert(h);
+  }
+  return seen.size();
+}
+
 // One node's external-KV match result, grouped by tier.  A single hash may
 // appear in MORE THAN ONE tier bucket when a node holds multiple physical
 // copies (e.g. HBM + DRAM mirror).  std::map iterates in sorted TierType
@@ -138,13 +151,7 @@ struct NodeMatch {
   std::string node_id;
   std::map<TierType, std::vector<std::string>> hashes_by_tier;
 
-  size_t MatchedHashCount() const {
-    std::unordered_set<std::string_view> seen;
-    for (const auto& [tier, hashes] : hashes_by_tier) {
-      for (const auto& h : hashes) seen.insert(h);
-    }
-    return seen.size();
-  }
+  size_t MatchedHashCount() const { return CountDistinctHashes(hashes_by_tier); }
 };
 
 enum class ClientStatus : int {

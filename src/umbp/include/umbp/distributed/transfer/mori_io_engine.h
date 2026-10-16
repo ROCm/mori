@@ -87,7 +87,7 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   // is unregistered are grouped separately and assigned bounce offsets; a
   // bounce group is chunked to fit the pool, and an item larger than the whole
   // pool is rejected.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
 
@@ -109,8 +109,6 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   bool HasRemoteBuffers(const std::string& node_id) const override;
   std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id,
                                                 uint32_t backend_id) const override;
-
-  const std::string& LocalEngineKey() const { return local_engine_key_; }
 
  private:
   class RdmaHandle;

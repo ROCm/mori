@@ -105,17 +105,11 @@ class SSDTier : public TierBackend {
   std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
   void SetRetiredFileHook(std::function<void(int fd)> on_close,
                           std::chrono::milliseconds grace) override;
-  const IoStatus& LastIoStatus() const { return last_io_status_; }
 
   TierSpaceStats SpaceStats() const override;
   // Segment size in effect: ssd.segment_size_bytes, capped for a small tier.
   uint64_t segment_size() const { return segment_size_; }
-  std::optional<std::string> GetLocationId(const std::string& key) const override;
   std::optional<RecordLocation> LocateRecord(const std::string& key) override;
-  // Enables O_DIRECT for segments opened from here on.  Takes effect for
-  // segments opened after the call; existing fds keep their current mode, so
-  // the intended use is at construction (ssd.direct_io) rather than mid-run.
-  void SetColdRead(bool enable) override;
 
   // True when segment I/O is actually bypassing the page cache.  False if
   // direct I/O was never requested, or was requested and the probe failed.
@@ -171,7 +165,6 @@ class SSDTier : public TierBackend {
   const segment::Meta* GetSegmentLocked(uint64_t segment_id) const;
   bool ReadRecordLocked(const std::string& key, void* dst, size_t size, uint32_t expected_crc,
                         uint64_t value_offset, int read_fd, bool crc_valid) const;
-  void RememberStatus(IoStatus status) const;
   // Issue one value read, transparently bouncing through an aligned buffer when
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
@@ -204,7 +197,6 @@ class SSDTier : public TierBackend {
   segment::Index index_;
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;
-  mutable IoStatus last_io_status_;
 };
 
 }  // namespace mori::umbp

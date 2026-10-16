@@ -73,7 +73,6 @@ class Index {
     return known_segment_ids_.count(segment_id) > 0;
   }
   void MarkKnownSegment(uint64_t segment_id) { known_segment_ids_.insert(segment_id); }
-  void ClearKnownSegments() { known_segment_ids_.clear(); }
 
   uint64_t next_segment_id() const { return next_segment_id_; }
   void AdvanceNextSegmentId(uint64_t next_segment_id) {

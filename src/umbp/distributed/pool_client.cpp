@@ -1644,6 +1644,7 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
   request.logical_tier = logical_tier;
   request.preferred_numa_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
   auto pool_alloc = default_pool_->BatchAllocate({request}).front();
+  if (pool_alloc.in_flight) return PutAttemptOutcome::kSuccessAlreadyExists;
   auto* backend = registry_.Get(pool_alloc.backend_id);
   // A medium that publishes no buffer endpoints cannot be reached in-process at
   // all; route the key elsewhere rather than allocating a slot we cannot fill.
@@ -1688,60 +1689,6 @@ PoolClient::PutAttemptOutcome PoolClient::ExecuteLocalPut(const std::string& key
               MORI_UMBP_METRIC_CLIENT_INBOUND_PUT_BYTES_TOTAL_HELP, {{"traffic", "local"}},
               static_cast<double>(size));
   return PutAttemptOutcome::kSuccess;
-}
-
-PoolClient::GetAttemptOutcome PoolClient::ExecuteLocalGet(const std::string& key, void* dst,
-                                                          size_t size) {
-  if (default_pool_ == nullptr || registry_.Empty()) {
-    MORI_UMBP_ERROR("[PoolClient] Local Get requested but no default pool is initialized");
-    return GetAttemptOutcome::kFatal;
-  }
-  auto pool_resolved =
-      ResolveLocalBatchWithBusyRetry(default_pool_.get(), {key}, /*include_descs=*/false,
-                                     /*allow_file_refs=*/true)
-          .front();
-  auto* backend = registry_.Get(pool_resolved.backend_id);
-  bool served = pool_resolved.resolved.found && backend != nullptr;
-  if (served) {
-    auto& resolved = pool_resolved.resolved;
-    // Same guard the remote path applies after BatchResolveKeys: a stored size
-    // that disagrees with the requested one is a different object, and copying
-    // `size` bytes out of a slot sized for something else would read past it.
-    if (resolved.size != size) {
-      MORI_UMBP_WARN("[PoolClient] local Get: size mismatch for key='{}' (wanted {}, got {})", key,
-                     size, resolved.size);
-      return GetAttemptOutcome::kRetry;
-    }
-    std::vector<TransferItem> items;
-    if (resolved.file_ref.IsFile()) {
-      // Zero-copy GDS path: the backend published a file range, not a staged
-      // host page.  Read it straight into the caller's (device) buffer; the
-      // planner routes the (file, GPU) pair to GdsEngine.
-      TransferItem item;
-      item.src = resolved.file_ref;
-      item.dst = ClassifiedUserBytes(dst, size);
-      item.size = size;
-      items.push_back(std::move(item));
-    } else if (!BuildLocalPageTransfers(backend, resolved.pages, resolved.page_size, dst, size,
-                                        /*to_backend=*/false, &items)) {
-      // This medium holds the key but cannot be read in-process (no published
-      // endpoint for its buffers).  Route elsewhere rather than reporting a
-      // miss, which would make the client exclude a node that does hold it.
-      return GetAttemptOutcome::kRetry;
-    }
-    if (!transfer_engine_->Transfer(items, /*failed_tags=*/nullptr)) {
-      return GetAttemptOutcome::kFatal;
-    }
-    served = true;
-  }
-  if (!served) return GetAttemptOutcome::kRetry;
-  CountMetric(MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL,
-              MORI_UMBP_METRIC_CLIENT_OUTBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
-              static_cast<double>(size));
-  CountMetric(MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL,
-              MORI_UMBP_METRIC_CLIENT_INBOUND_GET_BYTES_TOTAL_HELP, {{"traffic", "local"}},
-              static_cast<double>(size));
-  return GetAttemptOutcome::kSuccess;
 }
 
 void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
@@ -2031,17 +1978,6 @@ bool PoolClient::BuildRangesToContiguousItems(const std::vector<ObjectRange>& ra
   return items->size() > before;
 }
 
-bool PoolClient::CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
-                                        size_t object_size) {
-  std::vector<TransferItem> items;
-  items.reserve(ranges.size());
-  if (!BuildRangesToContiguousItems(ranges, TransferRef::HostBytes(dst, object_size),
-                                    /*dst_base=*/0, object_size, /*tag=*/0, &items)) {
-    return false;
-  }
-  return transfer_engine_->Transfer(items, /*failed_tags=*/nullptr);
-}
-
 void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteRequest>& requests,
                                             std::vector<bool>* results, double* committed_bytes,
                                             const RangedPhaseSinks* sinks_or_null) {
@@ -2094,7 +2030,7 @@ void PoolClient::ExecuteLocalPutRangesBatch(const std::vector<LocalRangeWriteReq
     MediumBackend* const backend = backend_of[r];
     const auto& request = requests[r];
     const AllocateResult& alloc_res = allocations[r].allocation;
-    if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+    if (alloc_res.outcome == AllocateOutcome::kSuccessAlreadyExists || allocations[r].in_flight) {
       (*results)[request.result_index] = true;
       continue;
     }
@@ -2623,7 +2559,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
     staged.reserve(local.size());
     for (size_t k = 0; k < local.size(); ++k) {
       const auto& alloc = allocations[k].allocation;
-      if (alloc.outcome == AllocateOutcome::kSuccessAlreadyExists) {
+      if (alloc.outcome == AllocateOutcome::kSuccessAlreadyExists || allocations[k].in_flight) {
         (*results)[local[k].index] = PutEntryOutcome::kAlreadyExists;
         continue;
       }
@@ -3133,9 +3069,9 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
     }
     const size_t before = items.size();
     if (resolved.file_ref.IsFile()) {
-      // Zero-copy GDS path, the same one ExecuteLocalGet takes: the backend
-      // published a file range rather than staged pages, so read it straight
-      // into the caller's device buffer and let the planner pick GdsEngine.
+      // Zero-copy GDS path: the backend published a file range rather than
+      // staged pages, so read it straight into the caller's device buffer and
+      // let the planner pick GdsEngine.
       TransferItem item;
       item.src = resolved.file_ref;
       item.dst = ClassifiedUserBytes(dsts[i], sizes[i]);
@@ -4208,7 +4144,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     sub_originals.reserve(count);
     // Assemble EVERY object in this arena round with ONE transfer.
     //
-    // This used to call CopyRangesToContiguous per key, and each of those is a
+    // This used to copy per key, and each of those copies was a
     // blocking Transfer -- its own kernel launch and hipStreamSynchronize.  On
     // an 8-rank embedded deployment that showed up as 369 transfers carrying
     // 369 segments, 14.5 us apiece for ~5 us of actual copy: ~65% of remote
@@ -5171,6 +5107,10 @@ void PoolClient::PublishComponentMetrics() {
            {{"outcome", "succeeded"}}, tiers.succeeded);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
            {{"outcome", "failed"}}, tiers.failed);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+           {{"outcome", "dropped"}}, tiers.dropped);
+    sample(MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS, MORI_UMBP_METRIC_CLIENT_TIER_TRANSITIONS_HELP,
+           {{"outcome", "retried"}}, tiers.retried);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES,
            MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,

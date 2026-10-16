@@ -23,7 +23,6 @@
 
 #include <algorithm>
 #include <random>
-#include <sstream>
 
 #include "mori/utils/mori_log.hpp"
 
@@ -31,40 +30,14 @@ namespace mori::umbp {
 
 namespace {
 
-[[maybe_unused]] std::string SummarizeLocations(const std::vector<Location>& locations) {
-  if (locations.empty()) return "<empty>";
-  std::ostringstream oss;
-  bool first = true;
-  for (const auto& loc : locations) {
-    if (!first) oss << ", ";
-    first = false;
-    oss << loc.node_id << ':' << TierTypeName(loc.tier) << '/' << loc.size;
-  }
-  return oss.str();
-}
-
 // Core selection cores shared by the single-key Select and the batched
 // BatchSelect.  Precondition: `locations` is non-empty (callers guarantee it).
 Location PickRandomReplica(const std::vector<Location>& locations) {
-  if (locations.size() == 1) {
-    const auto& single = locations[0];
-    // NOTE: temporarily disabled — the macro args are evaluated even when the
-    // log level suppresses output; SummarizeLocations() dominated the hot path.
-    // MORI_UMBP_DEBUG("[RouteGetStrategy] single candidate selected node={} tier={} size={}",
-    //                 single.node_id, TierTypeName(single.tier), single.size);
-    return single;
-  }
+  if (locations.size() == 1) return locations[0];
 
   thread_local std::mt19937 rng{std::random_device{}()};
   std::uniform_int_distribution<size_t> dist(0, locations.size() - 1);
-  size_t choice = dist(rng);
-  const auto& selected = locations[choice];
-  // NOTE: temporarily disabled — see above; SummarizeLocations() ran on every call.
-  // MORI_UMBP_DEBUG(
-  //     "[RouteGetStrategy] {} candidates -> choice={} node={} tier={} size={}, candidates=[{}]",
-  //     locations.size(), choice, selected.node_id, TierTypeName(selected.tier), selected.size,
-  //     SummarizeLocations(locations));
-  return selected;
+  return locations[dist(rng)];
 }
 
 Location PickLocalPreferringReplica(const std::vector<Location>& locations,

@@ -43,8 +43,6 @@ enum class UMBPRole : int {
   SharedSSDFollower = 2,
 };
 
-static constexpr uint32_t kAutoRankId = UINT32_MAX;
-
 enum class UMBPSsdLayoutMode : int {
   SegmentedLog = 1,
 };
@@ -534,19 +532,6 @@ struct UMBPConfig {
       return false;
     }
     return true;
-  }
-
-  UMBPRole ResolveRole() const {
-    if (role != UMBPRole::Standalone) {
-      return role;
-    }
-    if (follower_mode) {
-      return UMBPRole::SharedSSDFollower;
-    }
-    if (force_ssd_copy_on_write) {
-      return UMBPRole::SharedSSDLeader;
-    }
-    return UMBPRole::Standalone;
   }
 
   bool Validate(std::string* error_message = nullptr) const {

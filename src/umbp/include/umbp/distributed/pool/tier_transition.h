@@ -43,6 +43,9 @@ struct TierTransitionResult {
   uint64_t bytes_moved = 0;
   uint64_t bytes_freed = 0;
   bool source_draining = false;
+  // Failed in a way that can clear (no space, or a copy/commit/read-back
+  // error), so a later attempt may succeed.  False for a shape failure.
+  bool retryable = false;
 };
 
 // Executes one peer-local copy or move. Placement policy and scheduling remain
