@@ -604,7 +604,8 @@ def main():
             buf = op.combine_in_view().clone()[:total]
         else:
             buf = stage
-        out, _ = op.combine(buf, routing=r)
+        # A checked call also asks a pull combine for its weight fold; a push combine has none.
+        out, outw = op.combine(buf, weights=w_ if checked and not _PUSH else None, routing=r)
         lockstep()
         if dispatch_bad:
             return total, buf, False, True
@@ -639,7 +640,23 @@ def main():
                 f"[{int(U[:ct].min())},{int(U[:ct].max())}])",
                 flush=True,
             )
-        return total, buf, bad.item() == 0, True
+        # The weight fold sums the weights row each of the token's U ranks was forwarded, so it is
+        # U[t] times the row; U[t] + 1 times the row is the control, which must miss every row.
+        w_ref = wts[:ct].float().cpu()
+        ew = U[:ct].view(ct, 1).float() * w_ref
+        gw = outw.float().cpu()
+        wbad = int((~torch.isclose(gw, ew, rtol=1e-6, atol=1e-7)).any(dim=1).sum())
+        wctl = int((~torch.isclose(gw, ew + w_ref, rtol=1e-6, atol=1e-7)).any(dim=1).sum())
+        nw = torch.tensor([wbad, wctl, ct])
+        dist.all_reduce(nw)
+        wt_ok = int(nw[0]) == 0 and int(nw[1]) == int(nw[2])
+        if rank == 0:
+            print(
+                f"  [{op.backend_name}] WTSCHECK rows={int(nw[2])} bad={int(nw[0])} "
+                f"ctl={int(nw[1])} ok={int(wt_ok)}",
+                flush=True,
+            )
+        return total, buf, bad.item() == 0 and wt_ok, True
 
     def time_pairs(mode, one_pair, capture, split_legs):
         """ITERS (dispatch, combine) pairs; mean us per leg.
