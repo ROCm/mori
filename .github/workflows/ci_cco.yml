@@ -352,6 +352,28 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
+      - name: Run ops-v2 AsyncLL (EP8, sdma and lsa transports)
+        run: |
+          # The only CI coverage of the v2 AsyncLL family: ci.yml's async_ll steps
+          # run v1's test_dispatch_combine_async_ll.py, which never touches it.
+          #
+          # Both transports, because they share the protocol but not the transfer
+          # passes -- the LSA count-reset race lived only in the lsa ones. The
+          # script exits non-zero on a failed check; the PASS grep is there for a
+          # run that died before reporting, which would otherwise read as green.
+          #
+          # MORI_ENABLE_SDMA=1 matters for the sdma leg: without SDMA queues every
+          # put is a no-op and the receiver spins until the timeout, so a runner
+          # that quietly lost SDMA shows up as this step timing out, not passing.
+          for transport in sdma lsa; do
+            $CT exec -e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+              out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asyncll.py 2>&1) || \
+                { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *'# PASS:'*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac" || exit 1
+          done
+
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
         run: |
           # bench_ep.py gates every point on an identity-expert check and exits
