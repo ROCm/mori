@@ -81,17 +81,20 @@ namespace mori::umbp {
 //
 // LIFECYCLE OF A GET
 //   1. BatchResolve fills a staging page from the SSD (PeerSsdManager::
-//      PrepareRead) and publishes that page under a READ LEASE.
+//      PrepareRead) and publishes that page under a READ LEASE (a remote
+//      reader) or a hold (a local one, see ResolveReader).
 //   2. The reader moves bytes out of it, exactly as it would from DRAM.
-//   3. The reaper frees the staging page when the lease expires.
+//   3. Once the lease has expired and no hold is left, the page goes back: at
+//      the next reaper sweep, or at once when the arena is short.
 //
 //   This is the one place SSD's asymmetry with DRAM shows through the
 //   interface: a Resolve does real IO and can fail, and it consumes a scarce
-//   resource (staging pages) that a DRAM resolve does not.  A transient
-//   shortfall is reported as kBusy, after rolling back every reservation made
-//   by that backend batch.  PoolClient retries the whole response so no page
-//   location survives across attempts.  A batch whose own working set exceeds
-//   the arena is kFailed instead: unchanged retries can never make it fit.
+//   resource (staging pages) that a DRAM resolve does not.  For a remote
+//   reader a transient shortfall is reported as kBusy, after rolling back every
+//   reservation made by that backend batch, and the reader retries the whole
+//   response; a batch whose own working set exceeds the arena is kFailed, as
+//   unchanged retries can never make it fit.  A local reader copies what it is
+//   given, so its batch is staged up to half the arena and the rest is kBusy.
 //
 // A key may span several staging pages.  Runs are contiguous inside the one
 // registered arena because PeerSsdManager::PrepareRead takes one (ptr,
@@ -166,8 +169,6 @@ class SsdBackend : public MediumBackend {
                                           ResolveReader reader = ResolveReader::kRemote) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<uint64_t>& lease_tokens) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
   // The manager's LRU (always kept) minus keys a staged or migration read holds.
@@ -206,26 +207,20 @@ class SsdBackend : public MediumBackend {
     std::chrono::steady_clock::time_point deadline;
   };
 
-  // A staged read.  The span is never reclaimed while a kLocal holder has not
-  // released it; a kRemote holder keeps it until expires_at; with neither it
-  // goes back on the last release.  `token` is the entries' lease_token.
   struct ReadLease {
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
-    uint32_t local_holders = 0;
-    uint32_t remote_holders = 0;
-    uint64_t token = 0;
-    bool overdue_warned = false;
+    std::shared_ptr<const void> hold;  // copied into each kLocal hit
   };
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
-  // the requested size is currently available.
+  // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
-  // Caller MUST hold mutex_.  Drops one holder of `key`'s lease if `token`
-  // still names it; true when that returned the span to the arena.
-  bool DropLeaseHolderLocked(const std::string& key, uint64_t token, ResolveReader reader);
+  // Caller MUST hold mutex_.  Frees every read lease that has expired and has
+  // no hold left; returns how many.
+  size_t ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point now);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -291,14 +286,11 @@ class SsdBackend : public MediumBackend {
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
-  std::atomic<uint64_t> staging_early_releases_{0};  // released before expiry
-  std::atomic<uint64_t> resolve_deferred_keys_{0};   // left for a further call
-  uint64_t next_lease_token_ = 1;  // guarded by mutex_; 0 means "nothing to release"
   // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
   // can read it without taking mutex_ (the metrics tick must never contend with
   // a read).
   std::atomic<uint64_t> staging_pages_in_use_{0};
-  std::atomic<uint64_t> staging_pages_peak_{0};  // highest occupancy; written under mutex_
+  std::atomic<uint64_t> staging_pages_peak_{0};  // written under mutex_
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

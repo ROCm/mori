@@ -38,7 +38,6 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
-#include <map>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -477,154 +476,95 @@ TEST_F(SsdBackendTest, ResolveReportsBusyWhenStagingIsExhausted) {
 }
 
 TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
-  // Six pages, so a call may stage three; the blocker leaves only two free.
-  SsdBackend* backend = Start(/*staging_pages=*/6);
-  ASSERT_TRUE(Put(backend, "blocker", Payload(4 * kPageSize, 1)));
+  SsdBackend* backend = Start(/*staging_pages=*/4);
+  ASSERT_TRUE(Put(backend, "blocker", Payload(1024, 1)));
   ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
-  ASSERT_TRUE(Put(backend, "small-b", Payload(1024, 3)));
-  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);  // four pages stay leased
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);  // one page remains leased
 
-  auto resolved = backend->BatchResolve({"large-a", "small-b"}, false);
+  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
   ASSERT_EQ(resolved.size(), 2u);
   EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kBusy);
   EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kBusy);
 
-  // large-a's two-page reservation was returned when small-b could not fit:
-  // both pages not held by blocker are available to one writer.
-  auto allocated = backend->BatchAllocate({AllocateRequest{"two-pages", 2 * kPageSize}});
+  // The first two-page reservation was returned when the second could not fit:
+  // all three pages not held by blocker are available to one writer.
+  auto allocated = backend->BatchAllocate({AllocateRequest{"three-pages", 3 * kPageSize}});
   EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
 }
 
-// A batch over its share of the arena (half) is served up to that share and
-// the rest deferred, not failed.
-TEST_F(SsdBackendTest, BatchLargerThanItsShareIsServedInParts) {
+TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+
+  auto resolved = backend->BatchResolve({"large-a", "large-b"}, false);
+  ASSERT_EQ(resolved.size(), 2u);
+  EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kFailed);
+  EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kFailed);
+}
+
+// A local reader copies what it gets, so its batch is staged up to half the
+// arena and the rest comes back kBusy for its next call.
+TEST_F(SsdBackendTest, ALocalBatchOverHalfTheArenaIsStagedInParts) {
   SsdBackend* backend = Start(/*staging_pages=*/3);
   ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
   ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
 
   auto first = backend->BatchResolve({"large-a", "large-b"}, false, false, ResolveReader::kLocal);
   ASSERT_EQ(first.size(), 2u);
-  // The first key is always taken, even past the share, so a batch progresses.
-  EXPECT_EQ(first[0].outcome, ResolveOutcome::kFound);
-  EXPECT_NE(first[0].lease_token, 0u);
-  EXPECT_EQ(first[1].outcome, ResolveOutcome::kDeferred);
-  EXPECT_FALSE(first[1].found);
+  EXPECT_TRUE(first[0].found);  // the first key may pass the half, so calls progress
+  EXPECT_NE(first[0].hold, nullptr);
+  EXPECT_EQ(first[1].outcome, ResolveOutcome::kBusy);
 
-  // The caller's next round, once it has read and released the first part.
-  backend->ReleaseResolved({"large-a"}, {first[0].lease_token});
-  auto second = backend->BatchResolve({"large-b"}, false, false, ResolveReader::kLocal);
-  ASSERT_EQ(second.size(), 1u);
-  EXPECT_EQ(second[0].outcome, ResolveOutcome::kFound);
+  first.clear();  // copied
+  EXPECT_TRUE(backend->BatchResolve({"large-b"}, false, false, ResolveReader::kLocal)[0].found);
 }
 
-// Staging goes back when its last local reader releases it, long before the
-// lease would expire; the first of two readers to finish keeps it held.
-TEST_F(SsdBackendTest, StagingGoesBackWhenEveryLocalReaderReleases) {
-  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::seconds{60});
+// Local staging lives exactly as long as its holds, whatever the lease clock
+// and the reaper say.
+TEST_F(SsdBackendTest, LocalStagingLivesAsLongAsItsHolds) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
   ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
-
   auto first = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
   auto second = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
   ASSERT_TRUE(first[0].found);
-  ASSERT_TRUE(second[0].found);
-  ASSERT_NE(first[0].lease_token, 0u);
-  ASSERT_EQ(first[0].lease_token, second[0].lease_token);
+  ASSERT_EQ(first[0].pages, second[0].pages);  // one staged read, shared
 
-  backend->ReleaseResolved({"key-a"}, {first[0].lease_token});
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  first.clear();
   EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
             AllocateOutcome::kFailedNoSpace)
-      << "released while the second reader still holds it";
+      << "freed under a local reader";
 
-  backend->ReleaseResolved({"key-a"}, {second[0].lease_token});
+  second.clear();
   EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
             AllocateOutcome::kSuccessAllocated);
-}
-
-// The peak outlives the release, so a scrape between bursts still sees them.
-TEST_F(SsdBackendTest, StagingPeakOutlivesTheRelease) {
-  SsdBackend* backend = Start(/*staging_pages=*/4, /*read_lease_ttl=*/std::chrono::seconds{60});
-  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
-  auto got = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
-  ASSERT_TRUE(got[0].found);
-  backend->ReleaseResolved({"key-a"}, {got[0].lease_token});
-
-  std::map<std::string, uint64_t> state;
+  double peak = 0;
   for (const auto& m : backend->SampleMetrics()) {
-    if (std::string(m.name) == MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE) {
-      state[m.labels.at(0).second] = m.value;
+    if (std::string(m.name) == MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE &&
+        m.labels.at(0).second == "staging_pages_peak") {
+      peak = m.value;
     }
   }
-  EXPECT_EQ(state["staging_pages_in_use"], 0u);
-  EXPECT_EQ(state["staging_pages_peak"], 1u);
+  EXPECT_EQ(peak, 1.0);
 }
 
-// The reaper never reclaims staging a local reader has not released.
-TEST_F(SsdBackendTest, ALocalReaderOutlivingItsLeaseKeepsItsStaging) {
-  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
-  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
-
-  auto held = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
-  ASSERT_TRUE(held[0].found);
-  std::this_thread::sleep_for(std::chrono::milliseconds{10});
-  backend->RunReaperOnceForTest();  // long past the lease
-  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
-            AllocateOutcome::kFailedNoSpace)
-      << "the reaper reclaimed staging a local reader was still holding";
-
-  backend->ReleaseResolved({"key-a"}, {held[0].lease_token});
-  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
-            AllocateOutcome::kSuccessAllocated);
-}
-
-// A remote reader cannot report completion, so a lease it shares with a local
-// reader waits for its expiry; and a release naming that expired lease cannot
-// free the next lease on the same key.
-TEST_F(SsdBackendTest, ARemoteHolderWaitsForExpiryAndAStaleTokenFreesNothing) {
+// A remote reader cannot say when it is done: its lease outlives a local hold.
+TEST_F(SsdBackendTest, ARemoteLeaseOutlivesALocalHold) {
   SsdBackend* backend =
       Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{300});
   ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
-
-  auto remote = backend->BatchResolve({"key-a"}, false);  // kRemote
-  auto local = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
-  ASSERT_TRUE(remote[0].found);
-  ASSERT_TRUE(local[0].found);
-  backend->ReleaseResolved({"key-a"}, {local[0].lease_token});
+  ASSERT_TRUE(backend->BatchResolve({"key-a"}, false)[0].found);
+  ASSERT_TRUE(backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal)[0].found);
   EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
             AllocateOutcome::kFailedNoSpace)
       << "freed under a remote reader";
 
   std::this_thread::sleep_for(std::chrono::milliseconds{350});
-  backend->RunReaperOnceForTest();  // the shared lease expires
-  auto fresh = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
-  ASSERT_TRUE(fresh[0].found);
-  ASSERT_NE(fresh[0].lease_token, local[0].lease_token);
-  backend->ReleaseResolved({"key-a"}, {local[0].lease_token});  // stale
-  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
-            AllocateOutcome::kFailedNoSpace);
-
-  backend->ReleaseResolved({"key-a"}, {fresh[0].lease_token});
   EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
             AllocateOutcome::kSuccessAllocated);
-}
-
-// A BUSY batch is retried whole, so it drops the holders it took on hits.
-TEST_F(SsdBackendTest, ABusyResolveDropsTheHoldersItTook) {
-  SsdBackend* backend = Start(/*staging_pages=*/2, /*read_lease_ttl=*/std::chrono::seconds{60});
-  ASSERT_TRUE(Put(backend, "small", Payload(1024, 1)));
-  ASSERT_TRUE(Put(backend, "large", Payload(2 * kPageSize, 2)));
-
-  auto held = backend->BatchResolve({"small"}, false, false, ResolveReader::kLocal);
-  ASSERT_TRUE(held[0].found);
-
-  // "small" is a lease hit; "large" needs both pages and only one is free.
-  auto busy = backend->BatchResolve({"small", "large"}, false, false, ResolveReader::kLocal);
-  ASSERT_EQ(busy.size(), 2u);
-  EXPECT_EQ(busy[1].outcome, ResolveOutcome::kBusy);
-
-  backend->ReleaseResolved({"small"}, {held[0].lease_token});
-  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"both", 2 * kPageSize}})[0].outcome,
-            AllocateOutcome::kSuccessAllocated)
-      << "the BUSY call kept a holder on 'small'";
 }
 
 // ---------------------------------------------------------------------------

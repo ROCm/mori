@@ -226,8 +226,7 @@ TEST(MetricPublisher, PrependsSourceLabelsToEverySample) {
 //  InstrumentedBackend
 // ---------------------------------------------------------------------------
 
-// A MockBackend whose resolve can be scripted per key, for the outcomes only a
-// staged medium produces (held but unreadable, arena full, deferred).
+// A MockBackend whose resolve answers are scripted per key.
 class ScriptedResolveBackend : public MockBackend {
  public:
   using MockBackend::MockBackend;
@@ -387,12 +386,9 @@ TEST_F(InstrumentedBackendMetrics, EvictingAnAbsentKeyIsAMissNotAFailure) {
 }
 
 TEST_F(InstrumentedBackendMetrics, ResolveCountsOnlyFinalAnswers) {
-  // A key held but unreadable is a load failure and must not hide among the
-  // misses; BUSY and deferred are not answers yet -- the retry is counted.
-  mock_->outcomes = {{"failed", ResolveOutcome::kFailed},
-                     {"busy", ResolveOutcome::kBusy},
-                     {"deferred", ResolveOutcome::kDeferred}};
-  backend_->BatchResolve({"failed", "busy", "deferred", "absent"}, /*include_descs=*/false);
+  // Held but unreadable is a load failure, not a miss; BUSY is not an answer.
+  mock_->outcomes = {{"failed", ResolveOutcome::kFailed}, {"busy", ResolveOutcome::kBusy}};
+  backend_->BatchResolve({"failed", "busy", "absent"}, /*include_descs=*/false);
   Publish();
   EXPECT_DOUBLE_EQ(Ops("resolve", "failed"), 1.0);
   EXPECT_DOUBLE_EQ(Ops("resolve", "miss"), 1.0);

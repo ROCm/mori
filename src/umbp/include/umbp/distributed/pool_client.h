@@ -446,20 +446,17 @@ class PoolClient {
   // `dst_is_device` answers, for an ORIGINAL key index, whether that key's
   // destination is device memory -- the only place a file ref can be read.
   // Empty (the default) means the caller cannot consume a file ref at all, so
-  // none is requested and every key resolves onto staged pages.  `deferred`
-  // receives the kDeferred candidates (without it they read as misses).
+  // none is requested and every key resolves onto staged pages.
+  //
+  // Each hit's bytes stay put while its resolutions[i].hold lives.  `busy`
+  // receives the candidates a staged medium left for a later call while
+  // serving others; without it, or when nothing was served, they are misses.
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
                          std::vector<ResolvedEntry>* resolutions,
                          const std::function<bool(size_t)>& dst_is_device = {},
-                         std::vector<size_t>* deferred = nullptr);
-
-  // ReleaseResolved what ResolveLocalBatch published for `indices`.
-  void ReleaseResolvedLocal(const std::vector<std::string>& keys,
-                            const std::vector<size_t>& indices,
-                            const std::vector<MediumBackend*>& holders,
-                            const std::vector<ResolvedEntry>& resolutions);
+                         std::vector<size_t>* busy = nullptr);
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -894,6 +891,12 @@ class PoolClient {
   void ServeLocalGets(const std::vector<std::string>& keys, const std::vector<void*>& dsts,
                       const std::vector<size_t>& sizes, const std::vector<size_t>& indices,
                       std::vector<bool>* results, std::vector<size_t>* missed);
+  // One part of ServeLocalGets; returns the keys left for the next part.
+  std::vector<size_t> ServeLocalGetPart(const std::vector<std::string>& keys,
+                                        const std::vector<void*>& dsts,
+                                        const std::vector<size_t>& sizes,
+                                        const std::vector<size_t>& indices,
+                                        std::vector<bool>* results, std::vector<size_t>* missed);
 
   // Whole-batch wrapper for the local-first arm: drops what cannot be served at
   // all, serves the rest, and returns the keys the master still has to route.

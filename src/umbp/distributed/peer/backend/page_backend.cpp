@@ -490,7 +490,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   OwnedSlot owned;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
-  owned.generation = next_slot_generation_++;
+  owned.hold = std::make_shared<char>();
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
   TouchLru(key, owned_[key]);
@@ -582,10 +582,10 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.size = it->second.size;
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
-    RenewLeaseAtomic(it->second, lease_deadline);
     if (reader == ResolveReader::kLocal) {
-      it->second.local_readers.fetch_add(1, std::memory_order_relaxed);
-      entry.lease_token = it->second.generation;
+      entry.hold = it->second.hold;
+    } else {
+      RenewLeaseAtomic(it->second, lease_deadline);
     }
     if (track_eviction_order_) touched.emplace_back(&keys[i], &it->second);
   }
@@ -608,22 +608,6 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   resolved->page_size = page_size_;
   pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now(), /*migration=*/true};
   return true;
-}
-
-void PageBackend::ReleaseResolved(const std::vector<std::string>& keys,
-                                  const std::vector<uint64_t>& lease_tokens) {
-  // Shared: a release only lowers a per-slot atomic.
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-  for (size_t i = 0; i < keys.size() && i < lease_tokens.size(); ++i) {
-    if (lease_tokens[i] == 0) continue;
-    auto it = owned_.find(keys[i]);
-    if (it == owned_.end() || it->second.generation != lease_tokens[i]) continue;
-    uint32_t current = it->second.local_readers.load(std::memory_order_relaxed);
-    while (current > 0 &&
-           !it->second.local_readers.compare_exchange_weak(
-               current, current - 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
-    }
-  }
 }
 
 void PageBackend::ReleaseMigrationRead(const std::string& key) {
@@ -762,18 +746,19 @@ void PageBackend::ClearLocal() {
     assert(pins_.empty() && "ClearLocal called with active copy pins; quiesce the pipeline first");
   }
 
-  // Owned: defer pages with an active read lease (an RDMA read may still be
-  // in flight) until their lease deadline; free the rest immediately.  No
+  // Owned: defer pages a read lease or a local reader still covers (a read
+  // may be in flight); free the rest immediately.  No
   // REMOVE events — the upcoming full-sync empty snapshot collapses
   // master's index.
   const int64_t now_ns = SteadyNs(now);
   for (auto& [key, slot] : owned_) {
     const int64_t lease_ns = slot.read_lease_ns.load(std::memory_order_relaxed);
-    if (lease_ns > now_ns) {
+    if (lease_ns > now_ns || slot.hold.use_count() > 1) {
       DeferredFree df;
       df.key = key;
       df.pages = std::move(slot.pages);
       df.release_at = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(lease_ns));
+      df.hold = std::move(slot.hold);
       deferred_frees_.push_back(std::move(df));
       continue;
     }
@@ -998,8 +983,9 @@ std::vector<BufferMemoryDescBytes> PageBackend::BuildBufferDescsLocked(
 
 bool PageBackend::HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                            std::chrono::steady_clock::time_point now) {
+  // Exact under the exclusive lock: no resolve can copy the hold meanwhile.
   return slot.read_lease_ns.load(std::memory_order_relaxed) > SteadyNs(now) ||
-         slot.local_readers.load(std::memory_order_relaxed) > 0;
+         slot.hold.use_count() > 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,9 +1044,9 @@ void PageBackend::ReaperSweep() {
     }
   }
 
-  // Release ClearLocal()-deferred pages whose lease deadline has passed.
+  // Release ClearLocal()-deferred pages no lease or reader covers any more.
   for (auto it = deferred_frees_.begin(); it != deferred_frees_.end();) {
-    if (it->release_at <= now) {
+    if (it->release_at <= now && it->hold.use_count() <= 1) {
       if (allocator_) allocator_->Deallocate(it->pages);
       MORI_UMBP_DEBUG("[PageBackend] released deferred key='{}' pages={}", it->key,
                       it->pages.size());

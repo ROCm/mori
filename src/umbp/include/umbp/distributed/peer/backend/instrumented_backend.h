@@ -82,10 +82,6 @@ class InstrumentedBackend final : public MediumBackend {
     return inner_->AcquireMigrationRead(key, resolved);
   }
   void ReleaseMigrationRead(const std::string& key) override { inner_->ReleaseMigrationRead(key); }
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<uint64_t>& lease_tokens) override {
-    inner_->ReleaseResolved(keys, lease_tokens);
-  }
   std::vector<KvEvent> DrainPendingEvents() override { return inner_->DrainPendingEvents(); }
   std::vector<KvEvent> SnapshotOwnedKeys() const override { return inner_->SnapshotOwnedKeys(); }
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
