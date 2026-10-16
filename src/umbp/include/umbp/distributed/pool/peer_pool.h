@@ -148,6 +148,14 @@ class PeerPool {
   // holding the keys.  Returns the number of (medium, key) copies updated.
   size_t BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class);
 
+  // After a remote reader's copy: is each (backend, key, generation) it was
+  // resolved against still the copy here?  False when the backend is gone or
+  // the copy was freed or replaced since, so the reader drops what it read.
+  // The three vectors are parallel; one answer per key, in order.
+  std::vector<bool> ValidateResolved(const std::vector<uint32_t>& backend_ids,
+                                     const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations);
+
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.

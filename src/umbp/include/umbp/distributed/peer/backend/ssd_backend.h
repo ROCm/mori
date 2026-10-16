@@ -126,6 +126,10 @@ class SsdBackend : public MediumBackend {
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
+  // Checks the staging lease a remote reader read from, not the record on disk:
+  // the reader's pages point into staging.
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
   // The manager's order (the file tier's segment order, or its LRU) minus keys
   // a staged or migration read holds.
@@ -174,6 +178,10 @@ class SsdBackend : public MediumBackend {
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
     std::shared_ptr<const void> hold;  // copied into each kLocal hit
+    // ResolvedEntry::generation for this staging span.  The span goes back to
+    // the arena only with the lease, so a lease that still carries it still
+    // holds the bytes a remote reader was told about.
+    uint64_t generation = 0;
   };
 
   // A lease ClearLocal took while a local reader still held it; freed once
