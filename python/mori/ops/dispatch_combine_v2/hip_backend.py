@@ -616,6 +616,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"layout implies {expected_lsa_rank}: world ranks are not laid out "
                     "node-major, so worldPe - lsaBase is not an LSA rank"
                 )
+            # The env check in _asyncll_unsupported catches MORI_ENABLE_SDMA being
+            # unset before anything is built, but it is not the only way to end
+            # up with no queues: a library built BUILD_CCO_SDMA=OFF, or peers that
+            # do not report SDMA capability, get 0 too. cco only logs that, and
+            # every ccoSdma put then moves no bytes, so the receiver spins on a
+            # count that never arrives -- a hang, not an error. Ask the handle for
+            # what it actually connected. A node of one has no same-node peer and
+            # makes no SDMA put at all, so 0 is correct there.
+            if (
+                cfg.async_ll
+                and cfg.async_ll_transport == "sdma"
+                and handle.lsa_size > 1
+                and handle.sdma_num_queue == 0
+            ):
+                raise ValueError(
+                    "async_ll_transport='sdma' but this communicator has no SDMA "
+                    "queues (mori built with BUILD_CCO_SDMA=OFF, MORI_ENABLE_SDMA "
+                    "unset, or no peer reports SDMA capability -- the log above "
+                    "says which); every transfer would be a no-op and the receiver "
+                    "would wait forever. Use async_ll_transport='lsa', which needs "
+                    "no engine, or fix the SDMA setup"
+                )
         except BaseException:
             handle.close()
             raise
