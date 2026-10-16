@@ -175,11 +175,8 @@ class PageBackend : public MediumBackend {
   struct TierConfig {
     std::vector<uint64_t> buffer_sizes;
     std::vector<std::vector<uint8_t>> buffer_descs;  // packed mori::io::MemoryDesc bytes
-    // Local host base pointer of each buffer (same order as buffer_sizes).
-    // Used by AcquireDramCopyPin to resolve a (buffer_index, page_index)
-    // page to a directly-readable local pointer for the SSD copy worker.
-    // Empty is allowed for tiers/deployments with no DRAM copy (e.g. unit
-    // tests that never pin); pin acquisition then yields no segments.
+    // Local host base pointer of each buffer (same order as buffer_sizes);
+    // may be empty when the buffers are not addressable here.
     std::vector<void*> buffer_bases;
   };
 
@@ -262,7 +259,8 @@ class PageBackend : public MediumBackend {
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
                                           bool allow_file_refs = false,
                                           ResolveReader reader = ResolveReader::kRemote) override;
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
@@ -294,32 +292,6 @@ class PageBackend : public MediumBackend {
   // referenced by `pages`.
   std::vector<BufferMemoryDescBytes> BufferDescsForPages(
       const std::vector<PageLocation>& pages) const;
-
-  // ==================== DRAM copy pin (SSD copy-on-commit) ====================
-
-  // A copy pin protects a committed key's pages from eviction while the SSD
-  // copy worker reads them.  It is an in-process lifetime guard (NOT a
-  // master lease): pages stay readable until ReleaseDramCopyPin.  `segments`
-  // are directly-readable local pointers + lengths (pages may be
-  // non-contiguous across buffers).
-  struct DramCopyPin {
-    std::vector<std::pair<const void*, size_t>> segments;
-    size_t total_size = 0;
-    uint64_t pin_token = 0;  // release-time validation
-  };
-
-  // Atomically (under mutex_) confirm `key` is owned, mark it pinned, and
-  // resolve its pages to local segments.  Returns nullopt if the key is
-  // not owned (already evicted -> worker drops the task) or is already
-  // pinned (duplicate task).  While pinned, Evict(key) reports
-  // bytes_freed=0 and emits no REMOVE (master retries next round).  There
-  // is NO TTL: the pin lives until ReleaseDramCopyPin.  The caller MUST
-  // release (use a RAII guard) so a worker exit always frees the pin.
-  std::optional<DramCopyPin> AcquireDramCopyPin(const std::string& key);
-
-  // Release a pin.  No-op if the key is not pinned or the token does not
-  // match (tolerates duplicate / late release).
-  void ReleaseDramCopyPin(const std::string& key, uint64_t pin_token);
 
   // ==================== Heartbeat auto-flush ====================
 
@@ -445,11 +417,6 @@ class PageBackend : public MediumBackend {
   // pin (protects its pages from eviction).
   bool HasActivePinLocked(const std::string& key) const;
 
-  // Caller MUST hold `mutex_`.  Resolve `pages` to directly-readable local
-  // segments via buffer_bases_.  Empty if no bases are configured.
-  std::vector<std::pair<const void*, size_t>> BuildCopySegmentsLocked(
-      const std::vector<PageLocation>& pages, uint64_t total_size) const;
-
   // Caller MUST hold `mutex_`.
   std::vector<BufferMemoryDescBytes> BuildBufferDescsLocked(
       const std::vector<PageLocation>& pages) const;
@@ -510,8 +477,7 @@ class PageBackend : public MediumBackend {
   // it got.  See page_pool.h.
   std::unique_ptr<PagePool> allocator_;
   std::vector<std::vector<uint8_t>> buffer_descs_;
-  // Local host base pointer per buffer_index.  Source of truth for page ->
-  // local pointer, used by AcquireDramCopyPin.
+  // Local host base pointer per buffer_index.
   std::vector<void*> buffer_bases_;
   // The same buffers as transfer endpoints, built once at InstallTierConfig so
   // BufferRef() costs an index rather than an msgpack unpack.  Immutable after
@@ -526,15 +492,11 @@ class PageBackend : public MediumBackend {
   size_t auto_flush_threshold_ = SIZE_MAX;  // events before a flush; default = never
   std::function<void()> auto_flush_cb_;     // set once at startup; wakes the heartbeat
 
-  // Active copy pins.  An entry means `key`'s owned pages are protected
-  // from eviction until ReleaseDramCopyPin.  No TTL: lifetime is bound to
-  // the worker via a RAII guard, not a deadline (force-freeing under an
-  // in-flight backend Write would be a use-after-free).
+  // Migration pins (AcquireMigrationRead): the pages stay until the
+  // migration releases them.  The key stays an eviction candidate.
   struct PinState {
     uint64_t token = 0;
     std::chrono::steady_clock::time_point acquired_at;  // for long-running warning only
-    // Set by AcquireMigrationRead; the key stays an eviction candidate.
-    bool migration = false;
   };
   std::unordered_map<std::string, PinState> pins_;
   uint64_t next_pin_token_ = 1;

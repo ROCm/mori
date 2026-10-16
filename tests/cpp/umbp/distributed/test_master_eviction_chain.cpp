@@ -363,6 +363,8 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
           .commit.success);
   ASSERT_TRUE(registry.Get("cold")->Contains("moved"));
 
+  // Another reader holds the source, so the move parks it rather than deleting.
+  ASSERT_TRUE(registry.Get("cold")->BatchResolve({"moved"}, false).front().found);
   ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
   ASSERT_TRUE(
       WaitFor([&] { return registry.Get("hot")->Contains("moved"); }, std::chrono::seconds(2)))
@@ -494,8 +496,9 @@ TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
   for (const auto& key : colder) place_in_cold(key);
   place_in_cold("moved");
 
-  // Read "moved" so it promotes; move defers the source delete behind the read
-  // lease, leaving the source parked in cold alongside the three colder keys.
+  // Read "moved" so it promotes while another reader holds the source; move
+  // parks the source in cold alongside the three colder keys.
+  ASSERT_TRUE(registry.Get("cold")->BatchResolve({"moved"}, false).front().found);
   ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
   ASSERT_TRUE(
       WaitFor([&] { return registry.Get("hot")->Contains("moved"); }, std::chrono::seconds(2)));

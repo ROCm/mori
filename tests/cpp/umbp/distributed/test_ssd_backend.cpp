@@ -20,13 +20,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// SsdBackend: SSD reaching the data plane as an ordinary MediumBackend by
-// staging through registered host DRAM.
-//
-// What is worth asserting here is the part that differs from DRAM — the spill
-// on Commit, the fill on Resolve, and the staging arena that both borrow from —
-// plus the invariant that makes the whole design work: what the backend
-// PUBLISHES is plain host memory, so no transfer-layer change was needed.
+// SsdBackend: the staged path (spill on Commit, fill on Resolve, the arena both
+// borrow from) and the in-place path a local file engine takes.
 
 #include <gtest/gtest.h>
 #include <sys/resource.h>
@@ -47,8 +42,10 @@
 #include "umbp/common/fd_limit.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/pool/peer_pool.h"
+#include "umbp/distributed/pool/tier_transition.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#include "umbp/distributed/transfer/posix_engine.h"
 #ifdef UMBP_ENABLE_GDS
 #include <hip/hip_runtime.h>
 
@@ -79,6 +76,15 @@ class LocalOnlyRegistrar final : public MemoryRegistrar {
   int deregistrations = 0;
   mori::io::MemoryLocationType last_loc = mori::io::MemoryLocationType::GPU;
 };
+
+// `name`'s samples keyed by their one label's value.
+std::map<std::string, uint64_t> Samples(const MediumBackend& backend, const char* name) {
+  std::map<std::string, uint64_t> out;
+  for (const auto& m : backend.SampleMetrics()) {
+    if (std::string(m.name) == name) out[m.labels.at(0).second] = m.value;
+  }
+  return out;
+}
 
 class SsdBackendTest : public ::testing::Test {
  protected:
@@ -163,7 +169,10 @@ class SsdBackendTest : public ::testing::Test {
     return v;
   }
 
-  SsdBackendTest() { engine_.AddEngine(std::make_unique<LocalCopyEngine>()); }
+  SsdBackendTest() {
+    engine_.AddEngine(std::make_unique<LocalCopyEngine>());
+    engine_.AddEngine(std::make_unique<PosixEngine>());
+  }
 
   fs::path dir_;
   LocalOnlyRegistrar registrar_;
@@ -171,13 +180,102 @@ class SsdBackendTest : public ::testing::Test {
   std::unique_ptr<SsdBackend> backend_;
 };
 
+// A local file engine writes and reads the SSD file in place: with the only
+// staging page held by a reader, the file slot, its commit and a file-ref
+// migration read still go through, while a staged write cannot.
+TEST_F(SsdBackendTest, FileEngineWritesAndReadsWithoutStaging) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "blocker", Payload(100, 1)));
+  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"staged", 100}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace);
+
+  const auto payload = Payload(10000, 7);
+  const auto slot = backend->BatchAllocate({AllocateRequest{"k", payload.size(), -1, true}})[0];
+  ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(slot.file_ref.IsFile());
+  EXPECT_TRUE(slot.pages.empty());
+  TransferItem put;
+  put.src = TransferRef::HostBytes(const_cast<char*>(payload.data()), payload.size());
+  put.dst = slot.file_ref;
+  put.size = payload.size();
+  ASSERT_TRUE(engine_.Transfer({put}, nullptr));
+  ASSERT_TRUE(backend->BatchCommit({CommitRequest{slot.slot_id, "k"}})[0].success);
+
+  ResolvedEntry moved;
+  ASSERT_TRUE(backend->AcquireMigrationRead("k", &moved, /*allow_file_ref=*/true));
+  ASSERT_TRUE(moved.file_ref.IsFile());
+  std::vector<char> out(payload.size());
+  TransferItem get;
+  get.src = moved.file_ref;
+  get.dst = TransferRef::HostBytes(out.data(), out.size());
+  get.size = out.size();
+  ASSERT_TRUE(engine_.Transfer({get}, nullptr));
+  backend->ReleaseMigrationRead("k");
+  EXPECT_EQ(out, payload);
+}
+
+// DRAM -> SSD -> DRAM through the executor while the SSD's only staging page is
+// held: both directions go through the file.
+TEST_F(SsdBackendTest, ExecutorDemotesAndPromotesWithoutStaging) {
+  Start(/*staging_pages=*/1, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "blocker", Payload(100, 1)));
+  ASSERT_TRUE(backend_->BatchResolve({"blocker"}, false)[0].found);
+
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {4 * kPageSize};
+  auto dram_owned = MakePageBackend(TierType::DRAM, kPageSize, ownership, std::chrono::seconds{30},
+                                    std::chrono::seconds{30});
+  ASSERT_TRUE(dram_owned->Init(&engine_));
+  BackendRegistry registry;
+  MediumBackend* dram = dram_owned.get();
+  MediumBackend* ssd = backend_.get();
+  ASSERT_TRUE(registry.Register("dram", std::move(dram_owned)));
+  ASSERT_TRUE(registry.Register("ssd", std::move(backend_)));
+  const uint32_t dram_id = registry.BackendId(dram);
+  const uint32_t ssd_id = registry.BackendId(ssd);
+
+  const auto payload = Payload(10000, 3);
+  const auto slot = dram->BatchAllocate({AllocateRequest{"k", payload.size()}})[0];
+  ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+  TransferItem put;
+  put.src = TransferRef::HostBytes(const_cast<char*>(payload.data()), payload.size());
+  put.dst = dram->BufferRef(slot.pages[0].buffer_index);
+  put.dst_offset = static_cast<uint64_t>(slot.pages[0].page_index) * kPageSize;
+  put.size = payload.size();
+  ASSERT_TRUE(engine_.Transfer({put}, nullptr));
+  ASSERT_TRUE(dram->BatchCommit({CommitRequest{slot.slot_id, "k"}})[0].success);
+
+  TierTransitionExecutor executor(&registry, &engine_);
+  ASSERT_TRUE(executor.Execute("k", dram_id, {ssd_id}, /*remove_source=*/true).success);
+  EXPECT_FALSE(dram->Contains("k"));
+  ASSERT_TRUE(executor.Execute("k", ssd_id, {dram_id}, /*remove_source=*/true).success);
+  EXPECT_FALSE(ssd->Contains("k"));
+
+  const auto got = dram->BatchResolve({"k"}, false)[0];
+  ASSERT_TRUE(got.found);
+  std::vector<char> out(payload.size());
+  TransferItem get;
+  get.src = dram->BufferRef(got.pages[0].buffer_index);
+  get.src_offset = static_cast<uint64_t>(got.pages[0].page_index) * kPageSize;
+  get.dst = TransferRef::HostBytes(out.data(), out.size());
+  get.size = out.size();
+  ASSERT_TRUE(engine_.Transfer({get}, nullptr));
+  EXPECT_EQ(out, payload);
+
+  auto events = Samples(*ssd, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL);
+  EXPECT_EQ(events["write_in_place"], 1u);
+  EXPECT_GE(events["migration_in_place"], 1u);
+  EXPECT_EQ(events["migration_staged"], 0u);
+  ssd->Shutdown();
+}
+
 // ---------------------------------------------------------------------------
 //  The design invariant
 // ---------------------------------------------------------------------------
 
-// The reason SSD needed no new engine, no new TransferRef kind and no chaining:
-// what it publishes is ordinary registered HOST memory.  If this ever changes,
-// every claim in ssd_backend.h's header comment stops holding.
+// What the staged path publishes is ordinary registered HOST memory, so a
+// remote peer reads and writes it with no SSD awareness.
 TEST_F(SsdBackendTest, PublishesPlainHostMemorySoNoNewEngineIsNeeded) {
   SsdBackend* backend = Start();
 

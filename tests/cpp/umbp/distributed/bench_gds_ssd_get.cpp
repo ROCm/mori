@@ -268,8 +268,6 @@ int main(int argc, char** argv) {
   // ssd_staging_buffer_slots is what PoolClient hands SsdBackend as
   // Config::staging_pages -- the LOCAL arena, in pages, not the remote one.
   distributed.ssd_staging_buffer_slots = static_cast<int>(opt.slots);
-  distributed.ssd_staging_buffer_size =
-      std::max<size_t>(256ULL << 20, opt.batch * opt.value_bytes * 4);
   config.distributed = std::move(distributed);
 
   std::string err;

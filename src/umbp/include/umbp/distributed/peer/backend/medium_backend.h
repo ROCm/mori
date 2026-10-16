@@ -125,6 +125,9 @@ struct AllocateRequest {
   std::string key;
   uint64_t size = 0;
   int preferred_numa_node = -1;
+  // The writer is a local file engine: a file-backed medium may hand out a
+  // file range (AllocateResult::file_ref) instead of staged pages.
+  bool allow_file_ref = false;
 };
 
 // Populated fields below `outcome` are meaningful ONLY when
@@ -141,6 +144,8 @@ struct AllocateResult {
   std::vector<BufferMemoryDescBytes> descs;
   // How long the slot survives without a matching BatchCommit / BatchAbort.
   uint64_t pending_ttl_ms = 0;
+  // Set instead of `pages` when the bytes go straight into the medium's file.
+  TransferRef file_ref{};
 };
 
 struct CommitRequest {
@@ -359,10 +364,13 @@ class MediumBackend : public MetricSource {
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
-  // acquisition after its synchronous transfer completes.
-  virtual bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+  // acquisition after its synchronous transfer completes.  `allow_file_ref`:
+  // the caller can read a file range, so a file-backed medium need not stage.
+  virtual bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                                    bool allow_file_ref) {
     (void)key;
     (void)resolved;
+    (void)allow_file_ref;
     return false;
   }
   virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
