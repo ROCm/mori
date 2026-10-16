@@ -128,6 +128,17 @@ struct NodeTierKey {
   bool operator==(const NodeTierKey& o) const { return node_id == o.node_id && tier == o.tier; }
 };
 
+// Number of *distinct* hashes across tier buckets (size of the union): a hash
+// held on both HBM and DRAM counts once.  Shared by every match-result type.
+inline size_t CountDistinctHashes(
+    const std::map<TierType, std::vector<std::string>>& hashes_by_tier) {
+  std::unordered_set<std::string_view> seen;
+  for (const auto& [tier, hashes] : hashes_by_tier) {
+    for (const auto& h : hashes) seen.insert(h);
+  }
+  return seen.size();
+}
+
 // One node's external-KV match result, grouped by tier.  A single hash may
 // appear in MORE THAN ONE tier bucket when a node holds multiple physical
 // copies (e.g. HBM + DRAM mirror).  std::map iterates in sorted TierType
@@ -138,13 +149,7 @@ struct NodeMatch {
   std::string node_id;
   std::map<TierType, std::vector<std::string>> hashes_by_tier;
 
-  size_t MatchedHashCount() const {
-    std::unordered_set<std::string_view> seen;
-    for (const auto& [tier, hashes] : hashes_by_tier) {
-      for (const auto& h : hashes) seen.insert(h);
-    }
-    return seen.size();
-  }
+  size_t MatchedHashCount() const { return CountDistinctHashes(hashes_by_tier); }
 };
 
 enum class ClientStatus : int {

@@ -33,37 +33,12 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp.grpc.pb.h"
 #include "umbp/common/grpc_limits.h"
+#include "umbp/distributed/tier_proto.h"
 
 namespace mori::umbp::standalone {
 namespace {
 
 ::umbp::UMBPMaster::Stub* Stub(void* ptr) { return static_cast<::umbp::UMBPMaster::Stub*>(ptr); }
-
-::umbp::TierType TierToProto(TierType tier) {
-  switch (tier) {
-    case TierType::HBM:
-      return ::umbp::TIER_HBM;
-    case TierType::DRAM:
-      return ::umbp::TIER_DRAM;
-    case TierType::SSD:
-      return ::umbp::TIER_SSD;
-    default:
-      return ::umbp::TIER_UNKNOWN;
-  }
-}
-
-TierType TierFromProto(::umbp::TierType tier) {
-  switch (tier) {
-    case ::umbp::TIER_HBM:
-      return TierType::HBM;
-    case ::umbp::TIER_DRAM:
-      return TierType::DRAM;
-    case ::umbp::TIER_SSD:
-      return TierType::SSD;
-    default:
-      return TierType::UNKNOWN;
-  }
-}
 
 int RpcShutdownTimeoutMs() {
   const char* raw = std::getenv("UMBP_RPC_SHUTDOWN_TIMEOUT_MS");

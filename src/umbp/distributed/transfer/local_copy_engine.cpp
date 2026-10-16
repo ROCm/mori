@@ -339,8 +339,6 @@ int CopyThreads(size_t total_bytes, size_t copy_count) {
 // Set on a worker thread at start-up; read by CopyThreads above.
 void MarkThreadBackgroundCopies() { ThreadBackgroundFlag() = true; }
 
-bool ThreadDoesBackgroundCopies() { return ThreadBackgroundFlag(); }
-
 void HostCopyBlock(void* dst, const void* src, size_t size) {
   static const bool kNt = NtSupported() && !(std::getenv("UMBP_DRAM_NT_COPY") &&
                                              std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');

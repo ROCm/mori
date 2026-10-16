@@ -295,15 +295,6 @@ std::vector<std::string> ShardedSsdTier::GetLRUCandidates(size_t max_candidates)
   return out;
 }
 
-std::optional<std::string> ShardedSsdTier::GetLocationId(const std::string& key) const {
-  const int shard = ShardOf(key);
-  if (shard < 0) return std::nullopt;
-  auto inner = shards_[shard]->GetLocationId(key);
-  if (!inner) return std::nullopt;
-  // Prefix the drive so a location string identifies which device holds the key.
-  return "s" + std::to_string(shard) + ":" + *inner;
-}
-
 std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) const {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
@@ -314,10 +305,6 @@ bool ShardedSsdTier::Flush() {
   bool ok = true;
   for (auto& s : shards_) ok = s->Flush() && ok;
   return ok;
-}
-
-void ShardedSsdTier::SetColdRead(bool enable) {
-  for (auto& s : shards_) s->SetColdRead(enable);
 }
 
 std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& keys,

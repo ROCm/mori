@@ -110,8 +110,6 @@ class MoriIoEngine final : public TransferEngine, public PeerDirectory {
   std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id,
                                                 uint32_t backend_id) const override;
 
-  const std::string& LocalEngineKey() const { return local_engine_key_; }
-
  private:
   class RdmaHandle;
 

@@ -62,6 +62,7 @@
 #include "umbp/common/grpc_limits.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/metrics/prometheus_metric_sink.h"
+#include "umbp/distributed/tier_proto.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/umbp_client.h"
@@ -76,32 +77,6 @@ std::chrono::seconds ShutdownDeadline() {
   if (!v) return std::chrono::seconds(5);
   int seconds = std::atoi(v);
   return std::chrono::seconds(seconds > 0 ? seconds : 5);
-}
-
-::umbp::TierType TierToProto(TierType tier) {
-  switch (tier) {
-    case TierType::HBM:
-      return ::umbp::TIER_HBM;
-    case TierType::DRAM:
-      return ::umbp::TIER_DRAM;
-    case TierType::SSD:
-      return ::umbp::TIER_SSD;
-    default:
-      return ::umbp::TIER_UNKNOWN;
-  }
-}
-
-TierType TierFromProto(::umbp::TierType tier) {
-  switch (tier) {
-    case ::umbp::TIER_HBM:
-      return TierType::HBM;
-    case ::umbp::TIER_DRAM:
-      return TierType::DRAM;
-    case ::umbp::TIER_SSD:
-      return TierType::SSD;
-    default:
-      return TierType::UNKNOWN;
-  }
 }
 
 bool FillSockaddr(const std::string& path, sockaddr_un* addr, socklen_t* addr_len) {

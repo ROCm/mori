@@ -214,8 +214,4 @@ void* HostTierRegistration::DeviceAddress(const void* host_ptr, size_t size, int
   return alias + (reinterpret_cast<uintptr_t>(host_ptr) - reinterpret_cast<uintptr_t>(piece->base));
 }
 
-bool HostTierRegistration::Covers(const void* ptr, size_t size) const {
-  return FindPiece(ptr, size) != nullptr;
-}
-
 }  // namespace mori::umbp
