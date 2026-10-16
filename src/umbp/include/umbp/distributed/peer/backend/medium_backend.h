@@ -153,6 +153,15 @@ struct CommitResult {
   uint64_t bytes_committed = 0;
 };
 
+// Who reads what a resolve publishes.  kRemote is a peer, which cannot say when
+// it is done, so its bytes stay put for the read lease.  kLocal is this process:
+// it keeps each hit's `hold` until its copy returns, and comes back for any key
+// a staged medium answered kBusy.
+enum class ResolveReader {
+  kRemote,
+  kLocal,
+};
+
 // A resolve needs one more state than a cache lookup.  kBusy means this backend
 // owns the key but cannot publish its bytes until a transient resource (SSD
 // staging) becomes available; callers must retry THIS peer rather than exclude
@@ -182,6 +191,9 @@ struct ResolvedEntry {
   // into device memory, with `pages` left empty.  A memory-backed medium leaves
   // this invalid and publishes pages as before.
   TransferRef file_ref{};
+
+  // kLocal only: the published bytes stay put while any copy of this lives.
+  std::shared_ptr<const void> hold;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -317,12 +329,14 @@ class MediumBackend : public MetricSource {
   // is reserved for a state not currently produced.
   virtual std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
 
-  // Look up keys and take a read lease on each hit, protecting it from
-  // concurrent Evict for the lease window.  `include_descs=false` skips
-  // building descs entirely for the whole batch.  A medium whose own bytes are
-  // not registerable publishes a descriptor naming its storage (a file/object
-  // ref) rather than a memory one — the engine decides how to reach it, and
-  // supplies a bounce buffer if the chosen path needs one.
+  // Look up keys and protect each hit from concurrent Evict: for the lease
+  // window (kRemote), or while its `hold` lives (kLocal).  A kLocal batch too
+  // big for a staged medium at once is published in part, the rest kBusy.
+  // `include_descs=false` skips building descs entirely for the whole batch.
+  // A medium whose own bytes are not registerable publishes a descriptor
+  // naming its storage (a file/object ref) rather than a memory one — the
+  // engine decides how to reach it, and supplies a bounce buffer if the
+  // chosen path needs one.
   //
   // `allow_file_refs` says the caller can consume a TransferRef::File -- it
   // will read the medium's own storage directly (GdsEngine DMAs the range into
@@ -333,9 +347,9 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                                  bool include_descs,
-                                                  bool allow_file_refs = false) = 0;
+  virtual std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
