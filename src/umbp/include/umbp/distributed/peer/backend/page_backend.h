@@ -256,9 +256,10 @@ class PageBackend : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override;
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;

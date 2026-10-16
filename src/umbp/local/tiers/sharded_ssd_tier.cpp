@@ -251,8 +251,13 @@ TierCapabilities ShardedSsdTier::Capabilities() const {
   caps.batch_write = true;
   caps.batch_read = true;
   caps.zero_copy_read = true;
+  caps.ranged_read = !shards_.empty();
   for (const auto& s : shards_) {
-    if (!s->Capabilities().zero_copy_read) caps.zero_copy_read = false;
+    const auto shard_caps = s->Capabilities();
+    if (!shard_caps.zero_copy_read) caps.zero_copy_read = false;
+    // Ranged only if every shard is: a key on a shard without it would come
+    // back false, which a caller cannot tell from a miss.
+    if (!shard_caps.ranged_read) caps.ranged_read = false;
   }
   return caps;
 }
@@ -492,6 +497,81 @@ std::vector<bool> ShardedSsdTier::ReadBatchIntoPtr(const std::vector<std::string
                                                    const std::vector<uintptr_t>& dst_ptrs,
                                                    const std::vector<size_t>& sizes) {
   return BatchReadIntoPtr(keys, dst_ptrs, sizes);
+}
+
+std::vector<bool> ShardedSsdTier::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty()) return results;
+  if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size() ||
+      src_offsets.size() != keys.size()) {
+    MORI_UMBP_ERROR(
+        "[ShardedSsdTier] ReadBatchRangesIntoPtr: mismatched input lengths ({} / {} / {} / {})",
+        keys.size(), dst_ptrs.size(), sizes.size(), src_offsets.size());
+    return results;
+  }
+
+  std::vector<std::vector<size_t>> buckets(shards_.size());
+  {
+    std::shared_lock<std::shared_mutex> lock(map_mu_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      int shard = LookupLocked(keys[i]);
+      if (shard >= 0) buckets[shard].push_back(i);
+    }
+  }
+
+  const std::vector<int> busy = BusyShards(buckets);
+  const auto t_fanout = ssdperf::Now();
+  std::vector<double> shard_ms(shards_.size(), 0.0);
+  std::vector<char> ok(keys.size(), 0);
+  ParallelFor(busy.size(), io_threads_, [&](size_t bi) {
+    const int s = busy[bi];
+    const auto t_shard = ssdperf::Now();
+    const auto& idxs = buckets[s];
+    std::vector<std::string> k;
+    std::vector<std::vector<uintptr_t>> d;
+    std::vector<std::vector<size_t>> z;
+    std::vector<std::vector<size_t>> o;
+    k.reserve(idxs.size());
+    d.reserve(idxs.size());
+    z.reserve(idxs.size());
+    o.reserve(idxs.size());
+    for (size_t i : idxs) {
+      k.push_back(keys[i]);
+      d.push_back(dst_ptrs[i]);
+      z.push_back(sizes[i]);
+      o.push_back(src_offsets[i]);
+    }
+    const auto shard_res = shards_[s]->ReadBatchRangesIntoPtr(k, d, z, o);
+    for (size_t j = 0; j < idxs.size(); ++j) {
+      ok[idxs[j]] = (j < shard_res.size() && shard_res[j]) ? 1 : 0;
+    }
+    shard_ms[s] = ssdperf::MsSince(t_shard);  // disjoint shards: no race on shard_ms
+  });
+  for (size_t i = 0; i < keys.size(); ++i) results[i] = ok[i] != 0;
+
+  if (ssdperf::Enabled()) {
+    const double total_ms = ssdperf::MsSince(t_fanout);
+    std::vector<size_t> key_bytes(keys.size(), 0);
+    uint64_t bytes = 0, mapped = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      for (size_t z : sizes[i]) key_bytes[i] += z;
+      bytes += key_bytes[i];
+    }
+    for (const auto& b : buckets) mapped += b.size();
+    double slowest = 0.0;
+    for (double m : shard_ms) slowest = std::max(slowest, m);
+    MORI_UMBP_INFO(
+        "[SsdPerf/shard] GET_RANGES drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
+        "total_ms={:.3f} GB_s={:.2f} slowest_drive_ms={:.3f} overlap={:.2f}x | {}",
+        shards_.size(), io_threads_, busy.size(), keys.size(), keys.size() - mapped, bytes,
+        total_ms, ssdperf::GbPerSec(bytes, total_ms), slowest,
+        total_ms > 0.0 ? std::accumulate(shard_ms.begin(), shard_ms.end(), 0.0) / total_ms : 0.0,
+        FormatShardFanout(busy, buckets, key_bytes, shard_ms, shards_.size()));
+  }
+  return results;
 }
 
 }  // namespace mori::umbp

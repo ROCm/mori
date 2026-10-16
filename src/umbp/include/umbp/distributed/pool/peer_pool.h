@@ -122,10 +122,12 @@ class PeerPool {
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
-  // `reader` is passed to every backend asked (see MediumBackend::BatchResolve).
+  // `reader` and `extents` (parallel to `keys`, or null) are passed to every
+  // backend asked (see MediumBackend::BatchResolve).
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                               bool include_descs, bool allow_file_refs = false,
-                                              ResolveReader reader = ResolveReader::kRemote);
+                                              ResolveReader reader = ResolveReader::kRemote,
+                                              const std::vector<ObjectExtent>* extents = nullptr);
   // Hands back what a kLocal BatchResolve published, grouped per backend
   // (MediumBackend::ReleaseResolved).  Entries without a lease token are skipped.
   void ReleaseResolved(const std::vector<std::string>& keys,

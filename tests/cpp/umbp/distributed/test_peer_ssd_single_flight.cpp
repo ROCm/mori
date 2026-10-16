@@ -79,6 +79,48 @@ class GatedBackend : public TierBackend {
     return true;
   }
 
+  // The extent read PeerSsdManager::PrepareReadRangesBatch issues, gated like
+  // ReadIntoPtr: one gate pass per KEY, so reads_started() counts device reads.
+  TierCapabilities Capabilities() const override {
+    TierCapabilities caps;
+    caps.ranged_read = true;
+    return caps;
+  }
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override {
+    std::vector<bool> out(keys.size(), false);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      {
+        std::unique_lock<std::mutex> lk(gate_mu_);
+        ++reads_started_;
+        started_cv_.notify_all();
+        gate_cv_.wait(lk, [this] { return !blocked_; });
+        if (fail_) continue;
+      }
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = store_.find(keys[k]);
+      if (it == store_.end()) continue;
+      bool ok = true;
+      for (size_t r = 0; r < dst_ptrs[k].size(); ++r) {
+        if (src_offsets[k][r] + sizes[k][r] > it->second.size()) {
+          ok = false;
+          break;
+        }
+        std::memcpy(reinterpret_cast<void*>(dst_ptrs[k][r]), it->second.data() + src_offsets[k][r],
+                    sizes[k][r]);
+        bytes_read_ += sizes[k][r];
+      }
+      out[k] = ok;
+    }
+    return out;
+  }
+  size_t bytes_read() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return bytes_read_;
+  }
+
   bool Exists(const std::string& key) const override {
     std::lock_guard<std::mutex> lk(mu_);
     return store_.count(key) != 0;
@@ -129,6 +171,7 @@ class GatedBackend : public TierBackend {
   mutable std::mutex mu_;
   std::unordered_map<std::string, std::vector<char>> store_;
   size_t used_ = 0;
+  size_t bytes_read_ = 0;  // ranged reads only
   size_t capacity_;
 
   mutable std::mutex gate_mu_;
@@ -296,6 +339,108 @@ TEST(PeerSsdSingleFlight, SequentialRoundsStayIndependent) {
       EXPECT_EQ(std::string(bufs[i].data(), outs[i].size), payload);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+//  Extent reads (doc/design-ssd-ranged-io.md, D1c)
+// ---------------------------------------------------------------------------
+
+const std::string kObject = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
+
+SsdReadOutcome ReadExtent(PeerSsdManager& mgr, const std::string& key, uint64_t offset,
+                          std::vector<char>* buf) {
+  return mgr.PrepareReadRangesBatch({key}, {offset}, {buf->size()}, {buf->data()})[0];
+}
+
+// The hazard extent-aware coalescing exists for: two readers of DIFFERENT
+// windows of one key, in flight together with single flight on.  Attaching on
+// the key alone would hand the second reader the first one's bytes, and both
+// reads would "succeed".  Each must get its own window, from its own read.
+TEST(PeerSsdSingleFlight, DisjointExtentsOfOneKeyEachGetTheirOwnBytes) {
+  auto h = MakeHarness(/*single_flight=*/true);
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+
+  h.backend->BlockReads();
+  std::vector<char> front(16, '\0');
+  std::vector<char> back(16, '\0');
+  SsdReadOutcome out_front, out_back;
+  std::thread a([&] { out_front = ReadExtent(*h.mgr, "K", 0, &front); });
+  h.backend->WaitReadsStarted(1);  // the first is on the device: its episode is open
+  std::thread b([&] { out_back = ReadExtent(*h.mgr, "K", 40, &back); });
+  h.backend->WaitReadsStarted(2);  // the second did not attach; it went to the drive
+  h.backend->UnblockReads();
+  a.join();
+  b.join();
+
+  EXPECT_EQ(h.mgr->ReadMerged(), 0u);
+  ASSERT_EQ(out_front.status, SsdReadStatus::kOk);
+  ASSERT_EQ(out_back.status, SsdReadStatus::kOk);
+  EXPECT_EQ(out_front.size, kObject.size()) << "outcome size is the object's, not the extent's";
+  EXPECT_EQ(std::string(front.begin(), front.end()), kObject.substr(0, 16));
+  EXPECT_EQ(std::string(back.begin(), back.end()), kObject.substr(40, 16));
+  EXPECT_EQ(h.backend->bytes_read(), 32u) << "only the two extents came off the drive";
+}
+
+// A window inside an in-flight whole-object read is a legitimate follower, and
+// takes its own slice of the leader's bytes.
+TEST(PeerSsdSingleFlight, ExtentInsideAWholeReadFollowsAndTakesItsSlice) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+
+  h.backend->BlockReads();
+  std::vector<char> whole(kObject.size(), '\0');
+  std::vector<char> slice(20, '\0');
+  SsdReadOutcome out_whole, out_slice;
+  std::thread a([&] { out_whole = h.mgr->PrepareRead("K", whole.data(), whole.size()); });
+  h.backend->WaitReadsStarted(1);
+  std::thread b([&] { out_slice = ReadExtent(*h.mgr, "K", 23, &slice); });
+  WaitForDups(*h.mgr, 1);
+  h.backend->UnblockReads();
+  a.join();
+  b.join();
+
+  EXPECT_EQ(h.backend->reads_started(), 1) << "the extent reader must not touch the drive";
+  EXPECT_EQ(h.mgr->ReadMerged(), 1u);
+  ASSERT_EQ(out_whole.status, SsdReadStatus::kOk);
+  ASSERT_EQ(out_slice.status, SsdReadStatus::kOk);
+  EXPECT_EQ(std::string(whole.begin(), whole.end()), kObject);
+  EXPECT_EQ(std::string(slice.begin(), slice.end()), kObject.substr(23, 20));
+}
+
+// The converse: an extent leader does not hold the whole object, so a whole
+// reader arriving while it is in flight reads the drive itself.
+TEST(PeerSsdSingleFlight, WholeReadDoesNotFollowAnExtentLeader) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+
+  h.backend->BlockReads();
+  std::vector<char> slice(8, '\0');
+  std::vector<char> whole(kObject.size(), '\0');
+  SsdReadOutcome out_slice, out_whole;
+  std::thread a([&] { out_slice = ReadExtent(*h.mgr, "K", 8, &slice); });
+  h.backend->WaitReadsStarted(1);
+  std::thread b([&] { out_whole = h.mgr->PrepareRead("K", whole.data(), whole.size()); });
+  h.backend->WaitReadsStarted(2);
+  h.backend->UnblockReads();
+  a.join();
+  b.join();
+
+  EXPECT_EQ(h.mgr->ReadMerged(), 0u);
+  ASSERT_EQ(out_slice.status, SsdReadStatus::kOk);
+  ASSERT_EQ(out_whole.status, SsdReadStatus::kOk);
+  EXPECT_EQ(std::string(slice.begin(), slice.end()), kObject.substr(8, 8));
+  EXPECT_EQ(std::string(whole.begin(), whole.end()), kObject);
+}
+
+// An extent that does not fit inside the object is that key's error, not a
+// read of whatever lies past it.
+TEST(PeerSsdSingleFlight, ExtentPastTheObjectIsAnError) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+  std::vector<char> buf(16, '\0');
+  const auto out = ReadExtent(*h.mgr, "K", kObject.size() - 8, &buf);
+  EXPECT_EQ(out.status, SsdReadStatus::kError);
+  EXPECT_EQ(h.backend->reads_started(), 0);
 }
 
 }  // namespace

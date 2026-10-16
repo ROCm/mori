@@ -158,6 +158,28 @@ class PeerSsdManager {
                                                const std::vector<void*>& dsts,
                                                const std::vector<size_t>& caps);
 
+  // Extent form of PrepareReadBatch: read object bytes [offsets[i],
+  // offsets[i] + lengths[i]) of each key into dsts[i] (which must hold
+  // lengths[i] bytes), and nothing else off the drive.  One batched
+  // TierBackend::ReadBatchRangesIntoPtr, so a multi-drive tier still runs every
+  // drive at once.  The outcome's `size` is the OBJECT's size; an extent that
+  // does not fit inside the object is kError.  Checksums are not verified --
+  // a record's CRC covers the whole value, so a partial read has nothing to
+  // check against (SSDTier::ReadBatchRangesIntoPtr).
+  //
+  // Single flight is extent-aware: a reader attaches to an in-flight read of
+  // the same key only when its extent lies inside the leader's, and takes its
+  // own slice of the leader's bytes.  Attaching on the key alone would hand a
+  // follower the leader's bytes as if they were its own.
+  std::vector<SsdReadOutcome> PrepareReadRangesBatch(const std::vector<std::string>& keys,
+                                                     const std::vector<uint64_t>& offsets,
+                                                     const std::vector<uint64_t>& lengths,
+                                                     const std::vector<void*>& dsts);
+
+  // Whether PrepareReadRangesBatch can be served: the tier implements ranged
+  // reads (ShardedSsdTier only when every drive does).
+  bool SupportsRangedRead() const;
+
   // Same shape as OwnedLocationSource (see the class comment above) — all
   // events carry TierType::SSD.
   std::vector<KvEvent> DrainPendingEvents();
@@ -257,6 +279,11 @@ class PeerSsdManager {
   struct FollowerTarget {
     void* dst = nullptr;
     size_t cap = 0;
+    // The object bytes this follower wants, [offset, offset + length): the
+    // leader copies them out of its own buffer, which holds the episode's
+    // extent.  A whole-object follower has offset 0 and length min(size, cap).
+    uint64_t offset = 0;
+    uint64_t length = 0;
     // Written by the leader before it sets episode->done, read by the follower
     // after it wakes.
     bool ok = false;
@@ -276,6 +303,15 @@ class PeerSsdManager {
   struct ReadEpisode {
     bool sealed = false;  // snapshot taken; late arrivals must not attach
     bool done = false;    // leader finished (read + fan-out)
+    // The object bytes the leader is reading, [offset, offset + length).  A
+    // whole-object read covers [0, size).  Only a reader whose own extent lies
+    // inside this one may attach (see Covers).
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    bool Covers(uint64_t want_offset, uint64_t want_length) const {
+      return want_offset >= offset && want_offset - offset <= length &&
+             want_length <= length - (want_offset - offset);
+    }
     std::vector<std::shared_ptr<FollowerTarget>> followers;
     std::condition_variable cv;  // waited on under mutex_
   };

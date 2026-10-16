@@ -27,6 +27,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -957,6 +958,223 @@ TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
   fs::remove_all(dir);
 }
 #endif  // UMBP_ENABLE_GDS
+
+// ---------------------------------------------------------------------------
+//  Extent-scoped staging (doc/design-ssd-ranged-io.md, D1b)
+// ---------------------------------------------------------------------------
+//
+// A layer-wise restore resolves one layer group of every object per call.
+// Staging the whole object each time read every object once per group off the
+// drive (8x for 8 groups).  With an extent, a local resolve reads only that
+// window.  These assert the DEVICE read size, not just the bytes handed back:
+// a whole-object stage returns the right bytes too, which is why the old
+// behaviour passed every content test.
+
+// Not periodic in any power of two, so a window staged at the wrong 4 KiB
+// boundary cannot compare equal by accident (Payload's iota repeats every 256).
+std::vector<char> Aperiodic(size_t n) {
+  std::vector<char> v(n);
+  for (size_t i = 0; i < n; ++i) {
+    v[i] = static_cast<char>(((i * 131) ^ (i >> 8) ^ (i >> 16) ^ (i / 4093)) & 0xff);
+  }
+  return v;
+}
+
+class SsdBackendExtentTest : public SsdBackendTest {
+ protected:
+  static constexpr size_t kObject = 1 << 20;  // 16 staging pages
+
+  uint64_t DeviceReadBytes() {
+    return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL)["device_read"];
+  }
+  uint64_t PagesInUse() {
+    return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE)["staging_pages_in_use"];
+  }
+
+  std::vector<ResolvedEntry> ResolveExtents(const std::vector<std::string>& keys,
+                                            const std::vector<ObjectExtent>& extents,
+                                            ResolveReader reader = ResolveReader::kLocal) {
+    return backend_->BatchResolve(keys, /*include_descs=*/false, /*allow_file_refs=*/false, reader,
+                                  &extents);
+  }
+
+  // The first `n` bytes the entry's pages hold (a staging span is contiguous).
+  std::vector<char> Staged(const ResolvedEntry& entry, size_t n) {
+    std::vector<char> out(n, 0);
+    TransferItem item;
+    item.src = backend_->BufferRef(entry.pages[0].buffer_index);
+    item.src_offset = static_cast<uint64_t>(entry.pages[0].page_index) * kPageSize;
+    item.dst = TransferRef::HostBytes(out.data(), out.size());
+    item.size = n;
+    std::vector<size_t> failed;
+    EXPECT_TRUE(engine_.Transfer({item}, &failed));
+    return out;
+  }
+
+  static std::vector<char> Slice(const std::vector<char>& v, size_t off, size_t n) {
+    return std::vector<char>(v.begin() + off, v.begin() + off + n);
+  }
+};
+
+// The core of D1: a window of a 1 MiB object, widened to 4 KiB, is all that
+// comes off the drive, and the entry says which window its pages hold.
+TEST_F(SsdBackendExtentTest, LocalExtentResolveReadsOnlyTheWindow) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{300000, 100000}});
+  ASSERT_EQ(got.size(), 1u);
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].size, kObject) << "size stays the OBJECT's";
+  EXPECT_EQ(got[0].covered_offset, 299008u);  // 300000 down to 4 KiB
+  EXPECT_EQ(got[0].covered_size, 102400u);    // 400000 up to 4 KiB, minus the start
+  EXPECT_EQ(got[0].pages.size(), 2u);
+  EXPECT_EQ(DeviceReadBytes() - before, 102400u) << "the drive read the whole object";
+  EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(object, 299008, 102400));
+  EXPECT_EQ(Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL)["extent_stage"], 1u);
+
+  EXPECT_EQ(PagesInUse(), 2u);
+  backend_->ReleaseResolved({"k"}, {got[0].lease_token});
+  EXPECT_EQ(PagesInUse(), 0u) << "an extent stage goes back on release";
+}
+
+// The last window of an object that is not a 4 KiB multiple is clamped to the
+// object, so the read never asks for bytes past the value.
+TEST_F(SsdBackendExtentTest, TailWindowIsClampedToTheObject) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  constexpr size_t kOdd = 1000000;
+  const auto object = Aperiodic(kOdd);
+  ASSERT_TRUE(Put(backend_.get(), "odd", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"odd"}, {ObjectExtent{998000, 2000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_offset, 995328u);
+  EXPECT_EQ(got[0].covered_size, kOdd - 995328u);
+  EXPECT_EQ(DeviceReadBytes() - before, kOdd - 995328u);
+  EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(object, 995328, kOdd - 995328));
+  backend_->ReleaseResolved({"odd"}, {got[0].lease_token});
+}
+
+// One key named twice with different windows in one call: two private stages,
+// two tokens, each holding its own window.  Collapsing them on the key would
+// hand one reader the other's bytes.
+TEST_F(SsdBackendExtentTest, TwoWindowsOfOneKeyStageSeparately) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got =
+      ResolveExtents({"k", "k"}, {ObjectExtent{0, 65536}, ObjectExtent{720896, 65536}});
+  ASSERT_TRUE(got[0].found);
+  ASSERT_TRUE(got[1].found);
+  EXPECT_NE(got[0].lease_token, got[1].lease_token);
+  EXPECT_EQ(got[0].covered_offset, 0u);
+  EXPECT_EQ(got[1].covered_offset, 720896u);
+  EXPECT_EQ(DeviceReadBytes() - before, 2u * 65536);
+  EXPECT_EQ(Staged(got[0], 65536), Slice(object, 0, 65536));
+  EXPECT_EQ(Staged(got[1], 65536), Slice(object, 720896, 65536));
+  backend_->ReleaseResolved({"k", "k"}, {got[0].lease_token, got[1].lease_token});
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
+// Both resolves of an identical window in one call share one device read.
+TEST_F(SsdBackendExtentTest, IdenticalWindowsInOneCallShareOneRead) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k", "k"}, {ObjectExtent{4096, 8192}, ObjectExtent{4096, 8192}});
+  ASSERT_TRUE(got[0].found);
+  ASSERT_TRUE(got[1].found);
+  EXPECT_EQ(got[0].lease_token, got[1].lease_token);
+  EXPECT_EQ(DeviceReadBytes() - before, 8192u);
+  // Two holders: the span survives the first release.
+  backend_->ReleaseResolved({"k"}, {got[0].lease_token});
+  EXPECT_EQ(PagesInUse(), 1u);
+  EXPECT_EQ(Staged(got[1], 8192), Slice(object, 4096, 8192));
+  backend_->ReleaseResolved({"k"}, {got[1].lease_token});
+  EXPECT_EQ(PagesInUse(), 0u);
+}
+
+// A whole-object lease already staged covers any window: no second read.
+TEST_F(SsdBackendExtentTest, WholeObjectLeaseServesAnExtentWithoutReading) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+
+  const auto whole = backend_->BatchResolve({"k"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(whole[0].found);
+  EXPECT_EQ(whole[0].covered_size, 0u);
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{500000, 1000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_size, 0u) << "served from the whole-object lease";
+  EXPECT_EQ(got[0].lease_token, whole[0].lease_token);
+  EXPECT_EQ(DeviceReadBytes(), before);
+  backend_->ReleaseResolved({"k", "k"}, {whole[0].lease_token, got[0].lease_token});
+}
+
+// A remote reader's extent does not travel on the wire (D2), so it keeps the
+// whole-object lease whatever it passes.
+TEST_F(SsdBackendExtentTest, RemoteReaderStagesTheWholeObject) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{0, 4096}}, ResolveReader::kRemote);
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_size, 0u);
+  EXPECT_EQ(DeviceReadBytes() - before, kObject);
+  EXPECT_EQ(Staged(got[0], kObject), object);
+}
+
+// UMBP_SSD_EXTENT_STAGING=0 is the A/B switch: whole-object staging as before.
+TEST_F(SsdBackendExtentTest, KillSwitchRestoresWholeObjectStaging) {
+  ASSERT_EQ(setenv("UMBP_SSD_EXTENT_STAGING", "0", 1), 0);
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  unsetenv("UMBP_SSD_EXTENT_STAGING");  // read once, at Init
+  const auto object = Aperiodic(kObject);
+  ASSERT_TRUE(Put(backend_.get(), "k", object));
+  const uint64_t before = DeviceReadBytes();
+
+  const auto got = ResolveExtents({"k"}, {ObjectExtent{300000, 100000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].covered_size, 0u);
+  EXPECT_EQ(DeviceReadBytes() - before, kObject);
+  backend_->ReleaseResolved({"k"}, {got[0].lease_token});
+}
+
+// An extent stage fits where the whole object would not: the arena bound is
+// the window's, not the object's.  With 16 of 20 pages held, a second whole
+// 1 MiB object cannot stage, but a 2-page window of it can.
+TEST_F(SsdBackendExtentTest, WindowFitsAnArenaTheObjectDoesNot) {
+  Start(/*staging_pages=*/20, std::chrono::seconds{60});
+  const auto a = Aperiodic(kObject);
+  auto b = Aperiodic(kObject);
+  std::reverse(b.begin(), b.end());
+  ASSERT_TRUE(Put(backend_.get(), "a", a));
+  ASSERT_TRUE(Put(backend_.get(), "b", b));
+  const auto held = backend_->BatchResolve({"a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(held[0].found);
+  ASSERT_EQ(PagesInUse(), 16u);
+
+  const auto whole = backend_->BatchResolve({"b"}, false, false, ResolveReader::kLocal);
+  EXPECT_FALSE(whole[0].found) << "16 more pages cannot be had";
+
+  const auto got = ResolveExtents({"b"}, {ObjectExtent{65536, 100000}});
+  ASSERT_TRUE(got[0].found);
+  EXPECT_EQ(got[0].pages.size(), 2u);
+  EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(b, 65536, got[0].covered_size));
+  backend_->ReleaseResolved({"a", "b"}, {held[0].lease_token, got[0].lease_token});
+  EXPECT_EQ(PagesInUse(), 0u);
+}
 
 }  // namespace
 }  // namespace mori::umbp

@@ -112,9 +112,10 @@ class SsdBackend : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override;
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
@@ -173,6 +174,21 @@ class SsdBackend : public MediumBackend {
     bool overdue_warned = false;
   };
 
+  // An extent-scoped read (BatchResolve with an extent, kLocal only): a span
+  // holding object bytes [offset, offset + length), private to the reader(s)
+  // it was published to and released by token.  Kept out of read_leases_,
+  // whose entries stand for the whole object.
+  struct ExtentStage {
+    StagingSpan span;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    uint32_t holders = 0;
+  };
+
+  // Extent windows are widened to this, the SSD record alignment, so an
+  // O_DIRECT read can go straight into the staging span.
+  static constexpr uint64_t kExtentAlign = 4096;
+
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
@@ -218,6 +234,12 @@ class SsdBackend : public MediumBackend {
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
+  std::unordered_map<uint64_t, ExtentStage> extent_stages_;  // by lease token
+
+  // Stage only the requested extent for an in-process reader that names one
+  // (D1).  Set at Init: on when the tier reads ranges, off with
+  // UMBP_SSD_EXTENT_STAGING=0.
+  bool extent_staging_ = false;
 
   // Opt-in switch (UMBP_ENABLE_GDS=1): route SSD reads of O_DIRECT records
   // through the file->GPU GdsEngine instead of the staging arena.  Off by
@@ -247,6 +269,8 @@ class SsdBackend : public MediumBackend {
   std::atomic<uint64_t> staging_expired_reclaims_{0};
   std::atomic<uint64_t> staging_early_releases_{0};  // released before expiry
   std::atomic<uint64_t> resolve_deferred_keys_{0};   // left for a further call
+  std::atomic<uint64_t> extent_stages_total_{0};     // extent-scoped device reads
+  std::atomic<uint64_t> extent_stage_bytes_{0};      // their window bytes
   // Migration pins (a source read, or a target after commit): file range or staging.
   std::atomic<uint64_t> migrations_in_place_{0};
   std::atomic<uint64_t> migrations_staged_{0};

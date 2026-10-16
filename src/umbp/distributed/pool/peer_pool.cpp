@@ -710,7 +710,9 @@ void PeerPool::ReleaseResolved(const std::vector<std::string>& keys,
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
                                                       bool include_descs, bool allow_file_refs,
-                                                      ResolveReader reader) {
+                                                      ResolveReader reader,
+                                                      const std::vector<ObjectExtent>* extents) {
+  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;  // never misalign
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<PoolResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
@@ -746,7 +748,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
   if (direct_backend != nullptr) {
-    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader);
+    auto resolved =
+        direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     bool batch_busy = false;
     bool all_found = resolved.size() == keys.size();
     std::vector<bool> failed_but_owned(keys.size(), false);
@@ -806,13 +809,18 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     bool identity = indices.size() == keys.size();
     for (size_t i = 0; identity && i < indices.size(); ++i) identity = indices[i] == i;
     std::vector<std::string> backend_keys;
+    std::vector<ObjectExtent> backend_extents;
     if (!identity) backend_keys.reserve(indices.size());
+    if (!identity && extents != nullptr) backend_extents.reserve(indices.size());
     for (size_t index : indices) {
       attempted[index] |= static_cast<uint16_t>(1u << backend_id);
       if (!identity) backend_keys.push_back(keys[index]);
+      if (!identity && extents != nullptr) backend_extents.push_back((*extents)[index]);
     }
+    const std::vector<ObjectExtent>* sub_extents =
+        extents == nullptr ? nullptr : (identity ? extents : &backend_extents);
     auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs,
-                                         allow_file_refs, reader);
+                                         allow_file_refs, reader, sub_extents);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
       const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);

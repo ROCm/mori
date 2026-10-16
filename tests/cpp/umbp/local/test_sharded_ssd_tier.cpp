@@ -22,12 +22,17 @@
 //
 // Multi-drive SSD tier: keys spread across N directories (one per drive), read
 // back from whichever drive holds them, and batch IO runs on all drives at once.
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "umbp/local/tiers/sharded_ssd_tier.h"
@@ -201,6 +206,193 @@ void test_batch_write_read_across_shards() {
   std::cout << "PASSED" << std::endl;
 }
 
+// A sub-object read (the extent an SSD resolve stages, doc/design-ssd-ranged-io.md
+// D1a) goes to the drive holding each key, and the tier advertises it only
+// because every drive implements it.  Before this the sharded tier inherited
+// the base class's all-false default, which reads exactly like a miss.
+void test_ranged_read_across_shards() {
+  std::cout << "test_ranged_read_across_shards... ";
+  auto cfg = MakeConfig(MakeDirs("ranged", 4), 128ULL * 1024 * 1024);
+  auto backend = MakeFileSsdBackend(cfg);
+  auto* sharded = dynamic_cast<ShardedSsdTier*>(backend.get());
+  assert(sharded != nullptr);
+  assert(backend->Capabilities().ranged_read);
+
+  constexpr int kKeys = 64;
+  constexpr size_t kSize = 16384;
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> payloads;
+  std::vector<const void*> srcs;
+  std::vector<size_t> sizes;
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("rk" + std::to_string(i));
+    std::vector<char> p(kSize);
+    for (size_t b = 0; b < kSize; ++b) p[b] = static_cast<char>((b * 7 + b / 251 + i * 13) & 0xff);
+    payloads.push_back(std::move(p));
+    sizes.push_back(kSize);
+  }
+  for (auto& p : payloads) srcs.push_back(p.data());
+  for (bool ok : backend->BatchWrite(keys, srcs, sizes)) assert(ok);
+  for (const auto& cap : sharded->PerShardCapacity()) assert(cap.first > 0);
+
+  // Two windows per key, neither at the start, plus one key no drive holds.
+  keys.push_back("rk-missing");
+  std::vector<std::vector<char>> head(keys.size(), std::vector<char>(1000, 0));
+  std::vector<std::vector<char>> tail(keys.size(), std::vector<char>(300, 0));
+  std::vector<std::vector<uintptr_t>> dsts;
+  std::vector<std::vector<size_t>> lens;
+  std::vector<std::vector<size_t>> offs;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    dsts.push_back(
+        {reinterpret_cast<uintptr_t>(head[i].data()), reinterpret_cast<uintptr_t>(tail[i].data())});
+    lens.push_back({1000, 300});
+    offs.push_back({4096, kSize - 300});
+  }
+  auto read = backend->ReadBatchRangesIntoPtr(keys, dsts, lens, offs);
+  assert(read.size() == keys.size());
+  for (int i = 0; i < kKeys; ++i) {
+    assert(read[i]);
+    assert(std::equal(head[i].begin(), head[i].end(), payloads[i].begin() + 4096));
+    assert(std::equal(tail[i].begin(), tail[i].end(), payloads[i].begin() + (kSize - 300)));
+  }
+  assert(!read[kKeys]);
+  std::cout << "PASSED" << std::endl;
+}
+
+// In-memory shard that counts ranged batch calls, so the fan-out shape is
+// observable: a sharded ranged read must reach each drive ONCE with that
+// drive's keys, not once per key.
+class CountingShard : public TierBackend {
+ public:
+  CountingShard(size_t capacity, bool ranged)
+      : TierBackend(StorageTier::LOCAL_SSD), capacity_(capacity), ranged_(ranged) {}
+
+  bool Write(const std::string& key, const void* data, size_t size) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (used_ + size > capacity_) return false;
+    store_[key].assign(static_cast<const char*>(data), static_cast<const char*>(data) + size);
+    used_ += size;
+    return true;
+  }
+  bool ReadIntoPtr(const std::string& key, uintptr_t dst, size_t size) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = store_.find(key);
+    if (it == store_.end() || it->second.size() != size) return false;
+    std::memcpy(reinterpret_cast<void*>(dst), it->second.data(), size);
+    return true;
+  }
+  bool Exists(const std::string& key) const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return store_.count(key) != 0;
+  }
+  bool Evict(const std::string& key) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = store_.find(key);
+    if (it == store_.end()) return false;
+    used_ -= it->second.size();
+    store_.erase(it);
+    return true;
+  }
+  std::pair<size_t, size_t> Capacity() const override {
+    std::lock_guard<std::mutex> lk(mu_);
+    return {used_, capacity_};
+  }
+  void Clear() override {
+    std::lock_guard<std::mutex> lk(mu_);
+    store_.clear();
+    used_ = 0;
+  }
+  TierCapabilities Capabilities() const override {
+    TierCapabilities caps;
+    caps.ranged_read = ranged_;
+    return caps;
+  }
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    ++ranged_calls_;
+    ranged_keys_ += keys.size();
+    std::vector<bool> out(keys.size(), false);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      auto it = store_.find(keys[k]);
+      if (it == store_.end()) continue;
+      for (size_t r = 0; r < sizes[k].size(); ++r) {
+        std::memcpy(reinterpret_cast<void*>(dst_ptrs[k][r]), it->second.data() + src_offsets[k][r],
+                    sizes[k][r]);
+      }
+      out[k] = true;
+    }
+    return out;
+  }
+  size_t key_count() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return store_.size();
+  }
+
+  int ranged_calls_ = 0;
+  size_t ranged_keys_ = 0;
+
+ private:
+  mutable std::mutex mu_;
+  std::unordered_map<std::string, std::vector<char>> store_;
+  size_t used_ = 0;
+  size_t capacity_;
+  bool ranged_;
+};
+
+// D1a's shape: ONE ReadBatchRangesIntoPtr per shard holding part of the batch,
+// carrying exactly that shard's keys; and ranged_read is the AND over shards.
+void test_ranged_read_is_one_call_per_shard() {
+  std::cout << "test_ranged_read_is_one_call_per_shard... ";
+  std::vector<std::unique_ptr<TierBackend>> shards;
+  std::vector<CountingShard*> raw;
+  for (int s = 0; s < 3; ++s) {
+    auto shard = std::make_unique<CountingShard>(1 << 20, /*ranged=*/true);
+    raw.push_back(shard.get());
+    shards.push_back(std::move(shard));
+  }
+  ShardedSsdTier tier(std::move(shards));
+  assert(tier.Capabilities().ranged_read);
+
+  constexpr int kKeys = 30;
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
+  for (int i = 0; i < kKeys; ++i) {
+    keys.push_back("c" + std::to_string(i));
+    std::string v(300, '\0');  // position- and key-dependent, so a wrong slice cannot match
+    for (size_t b = 0; b < v.size(); ++b) v[b] = static_cast<char>((b * 7 + i * 31) & 0xff);
+    values.push_back(std::move(v));
+    assert(tier.Write(keys.back(), values.back().data(), values.back().size()));
+  }
+  for (auto* shard : raw) assert(shard->key_count() > 0);
+
+  std::vector<std::vector<char>> got(kKeys, std::vector<char>(16, 0));
+  std::vector<std::vector<uintptr_t>> dsts;
+  std::vector<std::vector<size_t>> lens(kKeys, std::vector<size_t>{16});
+  std::vector<std::vector<size_t>> offs(kKeys, std::vector<size_t>{250});
+  for (auto& g : got) dsts.push_back({reinterpret_cast<uintptr_t>(g.data())});
+  const auto read = tier.ReadBatchRangesIntoPtr(keys, dsts, lens, offs);
+  for (int i = 0; i < kKeys; ++i) {
+    assert(read[i]);
+    assert(std::equal(got[i].begin(), got[i].end(), values[i].begin() + 250));
+  }
+  for (auto* shard : raw) {
+    assert(shard->ranged_calls_ == 1);
+    assert(shard->ranged_keys_ == shard->key_count());
+  }
+
+  // One shard without it makes the whole tier not ranged: a key on that shard
+  // would come back false, indistinguishable from a miss.
+  std::vector<std::unique_ptr<TierBackend>> mixed;
+  mixed.push_back(std::make_unique<CountingShard>(1 << 20, true));
+  mixed.push_back(std::make_unique<CountingShard>(1 << 20, false));
+  ShardedSsdTier mixed_tier(std::move(mixed));
+  assert(!mixed_tier.Capabilities().ranged_read);
+  std::cout << "PASSED" << std::endl;
+}
+
 // Per-key results come back from one worker per drive at once.  They used to
 // be written straight into a std::vector<bool>, whose elements share machine
 // words: two drives finishing together could each rewrite the word holding the
@@ -342,6 +534,8 @@ int main() {
   test_balanced_placement_and_readback();
   test_rewrite_stays_on_same_shard();
   test_batch_write_read_across_shards();
+  test_ranged_read_across_shards();
+  test_ranged_read_is_one_call_per_shard();
   test_parallel_drives_never_lose_a_result();
   test_missing_keys();
   test_evict_and_clear();

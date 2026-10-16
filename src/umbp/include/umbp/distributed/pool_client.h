@@ -450,12 +450,16 @@ class PoolClient {
   // Empty (the default) means the caller cannot consume a file ref at all, so
   // none is requested and every key resolves onto staged pages.  `deferred`
   // receives the kDeferred candidates (without it they read as misses).
+  // `extents`, parallel to `keys` (or null), names what each key's reader will
+  // touch; a staging medium may then publish only that window, which the
+  // caller must honor (ResolvedEntry::covered_offset / covered_size).
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
                          std::vector<ResolvedEntry>* resolutions,
                          const std::function<bool(size_t)>& dst_is_device = {},
-                         std::vector<size_t>* deferred = nullptr);
+                         std::vector<size_t>* deferred = nullptr,
+                         const std::vector<ObjectExtent>* extents = nullptr);
 
   // ReleaseResolved what ResolveLocalBatch published for `indices`.
   void ReleaseResolvedLocal(const std::vector<std::string>& keys,

@@ -100,6 +100,13 @@ class ShardedSsdTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  // Sub-object reads, bucketed like BatchReadIntoPtr: ONE call per shard, the
+  // shards run concurrently.  A per-key loop would leave every drive but one
+  // idle.  Checksums are not verified (see SSDTier::ReadBatchRangesIntoPtr).
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
 
  private:
   // Shard for a new key of @p size: the one with the most projected free space
