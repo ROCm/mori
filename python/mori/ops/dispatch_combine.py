@@ -321,6 +321,7 @@ _KERNEL_TYPE_TO_HIP = {
 _DTYPE_SUFFIX = {
     torch.float32: "f32",
     torch.bfloat16: "bf16",
+    torch.float16: "fp16",
 }
 try:
     _DTYPE_SUFFIX[torch.float8_e4m3fn] = "fp8_ocp"
@@ -422,6 +423,43 @@ def _load_hip_modules(kernel_type, init_shmem=True):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        self._rdna4_ep = None
+        if os.environ.get("MORI_RDNA4_EP") == "1":
+            from mori.ops._rdna4_ep import Rdna4EpPolicy
+
+            arch = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).gcnArchName
+            if not (
+                arch.split(":")[0] == "gfx1201"
+                and config.kernel_type == EpDispatchCombineKernelType.IntraNode
+                and config.world_size in (2, 4)
+                and config.gpu_per_node == config.world_size
+                and 1 <= config.num_experts_per_token <= 64
+                and config.use_external_inp_buf
+                and config.scale_dim == 0
+                and config.max_token_type_size == 2
+                and _normalize_quant_type(config.quant_type)
+                == EpDispatchCombineQuantType.None_
+                and (
+                    config.max_total_recv_tokens == 0
+                    or config.max_total_recv_tokens
+                    >= config.world_size * config.max_num_inp_token_per_rank
+                )
+                and _ep_comm() == "shmem"
+            ):
+                raise ValueError(
+                    "MORI_RDNA4_EP requires gfx1201 IntraNode EP2/EP4 topk=1..64, "
+                    "unquantized 16-bit external input, full receive capacity, "
+                    "scale_dim=0 and MORI_EP_COMM=shmem"
+                )
+            self._rdna4_ep = Rdna4EpPolicy(
+                config.world_size,
+                config.hidden_dim,
+                config.max_num_inp_token_per_rank,
+                _DTYPE_SUFFIX.get(config.data_type),
+                config.num_experts_per_token,
+            )
         # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
         # every kernel launch's block dim; keep consistent with the device-side
         # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
@@ -799,6 +837,16 @@ class EpDispatchCombineOp:
         is_intranode_combine=False,
         is_push_transport=False,
     ):
+        policy = getattr(self, "_rdna4_ep", None)
+        if policy is not None and (is_intranode_dispatch or is_intranode_combine):
+            # The validated policy supplies defaults in either launch mode;
+            # explicit per-phase launch arguments still take precedence.
+            bn, wpb = policy.launch(num_tokens, dispatch=is_intranode_dispatch)
+            return (
+                block_num if block_num > 0 else bn,
+                rdma_block_num if rdma_block_num > 0 else self.config.rdma_block_num,
+                warp_per_block if warp_per_block > 0 else wpb,
+            )
         if tuning_rules and dtype is not None:
             params = TuningConfigManager.lookup(
                 tuning_rules,
@@ -868,9 +916,15 @@ class EpDispatchCombineOp:
             return max(base, tile)
         return base
 
-    def _intranode_dispatch_kernel(self, sfx, stdmoe=False):
-        """Intra-node dispatch. One launch symbol; which body it reaches is decided on the device
-        side by EpDispatchIntraNodeKernel_entry in intranode_entry.hpp."""
+    def _intranode_dispatch_kernel(self, sfx, stdmoe=False, num_tokens=None):
+        """Select the opt-in RDNA4 transport or the upstream architecture entry."""
+        policy = getattr(self, "_rdna4_ep", None)
+        if policy is not None:
+            if stdmoe:
+                raise ValueError(
+                    "MORI_RDNA4_EP supports ordinary IntraNode routing only"
+                )
+            return policy.dispatch_kernel(num_tokens)
         name = f"EpDispatchIntraNodeKernel_{sfx}"
         if stdmoe:
             name += "_stdmoe"
@@ -1226,7 +1280,18 @@ class EpDispatchCombineOp:
                 )
 
         hidden_dim = input.size(1)
+        if self._rdna4_ep is not None:
+            self._rdna4_ep.check_input(_DTYPE_SUFFIX.get(input.dtype), hidden_dim)
         weight_ptr = weights.data_ptr() if weights is not None else 0
+        if (
+            self._rdna4_ep is not None
+            and weights is not None
+            and num_tokens == 0
+            and weight_ptr == 0
+        ):
+            # Empty ranks still receive peer weights in hybrid Dispatch. The
+            # allocated pointer is a presence flag; no source rows are read.
+            weight_ptr = self._dispatch_out_ptrs[1]
         has_scales = scales is not None and self.config.scale_dim > 0
         scale_ptr = scales.data_ptr() if has_scales else 0
         actual_bn, actual_rbn, actual_wpb = self._resolve_launch_params(
@@ -1308,8 +1373,11 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
         elif kt == EpDispatchCombineKernelType.IntraNode.value:
+            self._cached_dispatch_kernel = self._intranode_dispatch_kernel(
+                sfx, num_tokens=num_tokens
+            )
             self._launch(
-                self._intranode_dispatch_kernel(sfx),
+                self._cached_dispatch_kernel,
                 grid,
                 block,
                 shared_mem,
@@ -1505,6 +1573,17 @@ class EpDispatchCombineOp:
             if use_external_inp_buf >= 0
             else int(self.config.use_external_inp_buf)
         )
+        if self._rdna4_ep is not None:
+            self._rdna4_ep.check_input(
+                _DTYPE_SUFFIX.get(input.dtype),
+                hidden_dim,
+                external=bool(actual_use_ext),
+            )
+            if weights is not None and weight_ptr == 0:
+                # A rank with no received rows can still own tokens whose
+                # weights must be reduced from peers (especially at topk=1).
+                # Preserve presence; no local source weights are read.
+                weight_ptr = self._dispatch_out_ptrs[1]
         is_zero_copy = not actual_use_ext
         cur_n = (
             self._routing_source_token_count(routing)
@@ -1651,7 +1730,12 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNode.value,
             EpDispatchCombineKernelType.IntraNodeLL.value,
         ):
-            if quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
+            if self._rdna4_ep is not None:
+                self._last_rdna4_combine_kernel = self._rdna4_ep.combine_kernel(cur_n)
+                self._launch(
+                    self._last_rdna4_combine_kernel, grid, block, 0, stream, args_ptr
+                )
+            elif quant_type in _BLOCKWISE_COMBINE_QUANT_TYPES:
                 # Mirror of the AccumNum=8/9 + VecBytes=8 specialization gating in
                 # LaunchCombine() / launch.cpp. top-k==9 covers shared-expert fusion
                 # (8 routed + 1 fused shared). Keep in sync.
@@ -1895,6 +1979,8 @@ class EpDispatchCombineOp:
         rdma_block_num: int = -1,
         warp_per_block: int = -1,
     ):
+        if self._rdna4_ep is not None:
+            raise ValueError("MORI_RDNA4_EP supports ordinary IntraNode routing only")
         set_fn = _cpp_dispatch_combine_factory(
             "set_standard_moe_output_buffers", allow_missing=True
         )
@@ -2011,6 +2097,8 @@ class EpDispatchCombineOp:
         warp_per_block: int = -1,
         call_reset: bool = False,
     ):
+        if self._rdna4_ep is not None:
+            raise ValueError("MORI_RDNA4_EP supports ordinary IntraNode routing only")
         set_fn = _cpp_dispatch_combine_factory(
             "set_standard_moe_output_buffers", allow_missing=True
         )
