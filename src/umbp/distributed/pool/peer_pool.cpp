@@ -1270,8 +1270,13 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
       }
       break;
     }
+    // Use the whole fetch: queued demotions stay offered, so a refetch per batch rescans them.
     size_t next = 0;
-    if (!evict_some(offers, &next)) {
+    bool progressed = false;
+    while (next < offers.size() && covered < budget && !drained() && !stopping()) {
+      progressed = evict_some(offers, &next) || progressed;
+    }
+    if (!progressed) {
       // All got leased or pinned since offered; retry on the next wake.
       local_evict_stalled_.fetch_add(1, std::memory_order_relaxed);
       break;
