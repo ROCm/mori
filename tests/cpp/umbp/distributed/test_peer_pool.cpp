@@ -1358,6 +1358,42 @@ TEST(PeerPoolLocalEviction, ATierWithADownstreamDemotesJustTheOverage) {
   }
 }
 
+class CountingPageBackend final : public PageBackend {
+ public:
+  using PageBackend::PageBackend;
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override {
+    ++calls;
+    return PageBackend::EvictionCandidates(max_count);
+  }
+  std::atomic<int> calls{0};
+};
+
+TEST(PeerPoolLocalEviction, ARoundDoesNotRescanItsQueuedDemotionsPerBatch) {
+  // Held demotions stay offered; refetching them for every 64-key batch made a round quadratic.
+  GatedEngine engine;
+  BackendRegistry registry;
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {8192 * kHostPage};
+  auto counting = std::make_unique<CountingPageBackend>(TierType::DRAM, kHostPage, ownership,
+                                                        kNoExpiry, kNoExpiry);
+  auto* hot = counting.get();
+  ASSERT_TRUE(hot->Init(&engine));
+  ASSERT_TRUE(registry.Register("hot", std::move(counting)));
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 8192);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  hot->TrackEvictionOrder();
+  for (int i = 0; i < 8000; ++i) CommitKey(&pool, "k" + std::to_string(i));
+
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(hot), 0.9, 0.5));
+  const int before = hot->calls;
+  pool.RunLocalEvictionOnceForTest();
+  EXPECT_EQ(pool.LocalEvictionStats().keys, 8000u - 4096u);
+  EXPECT_LE(hot->calls - before, 40);  // ~13 now; ~67 when it refetched per batch
+  engine.Release();
+}
+
 TEST(PeerPoolLocalEviction, NeverDeletesWhatAWatermarkOffloadWouldMove) {
   // Regression: the old in-commit round deleted keys offload was about to move.
   LocalCopyEngine engine;
