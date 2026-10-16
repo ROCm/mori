@@ -111,14 +111,17 @@ plus an accumulate in three kernels and a wider staging slot.
 
 import argparse
 import ctypes
+import dataclasses
+import math
 import os
 import sys
 import time
+from numbers import Real
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from mori.cco import Communicator
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
@@ -222,14 +225,8 @@ def _parse_args(argv):
     # with its own error; before it is written into the table it gets one long
     # head-to-head against what it would replace.
     parser.add_argument("--tuning-candidate", default=None)
-    # What a candidate is selected ON. "total" by default, and deliberately:
-    # internode_tuning_configs.py records that the two phases are COUPLED -- a
-    # dispatch with too few rdma blocks leaves the following combine ~18us slower
-    # at 4/8 tokens -- so the shipped small-token dispatch is NOT the dispatch
-    # argmin, it holds rdma high to keep the paired combine fast. Selecting a
-    # dispatch geometry on dispatch time alone reproduces exactly the mistake
-    # that comment warns about. "phase" is kept for looking at a phase in
-    # isolation, which is a diagnostic, not a way to choose a table row.
+    # Dispatch geometry can affect the following combine, so select on the
+    # pair total by default. "phase" is available for individual-op diagnostics.
     parser.add_argument("--tuning-metric", default="total", choices=["total", "phase"])
     # Greedy chaining (v1's shape: a winner becomes the incumbent) is OFF by
     # default here. With a chain, one lucky early win moves the baseline and
@@ -255,6 +252,13 @@ def _parse_args(argv):
     # worst-of-reps improvement makes a median TIE interesting. Fraction of the
     # incumbent's median.
     parser.add_argument("--tuning-tail-frac", type=float, default=0.10)
+    # Saving is opt-in. Confirm sweep winners in independent paired runs before
+    # adopting them; the sweep alone does not establish a stable improvement.
+    parser.add_argument("--tuning-save", action="store_true")
+    # Where --tuning-save writes. Default: this repo's copy of the table, not the
+    # installed package's -- a row is only useful once it is in a git diff
+    # somebody can read (same convention as the v1 bench's `auto`).
+    parser.add_argument("--tuning-config-dir", default=None)
     # The v1 bench calls combine with weights=None, so it does not pay for the
     # weight fold: an extra peer read per (token, destination) plus an accumulate
     # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
@@ -484,27 +488,13 @@ def _report_loop_alignment(args, rank):
         )
 
 
-def _geometry_for_report(op, cfg, args):
-    """The (block, rdma, warp) each phase actually launched with, for the table
-    titles -- the point v1's `_launch_params_str` makes: a table that does not
-    name its launch config cannot be matched back to the run that produced it.
-    Read from the backend rather than from the config, because on the internode
-    path cfg.dispatch_block_num is a dict key and not a grid."""
-    try:
-        # EpDispatchCombineOpHip IS the backend -- it subclasses the op.
-        return (
-            tuple(op._internode_geom_for("dispatch", args.max_tokens)),
-            tuple(op._internode_geom_for("combine", args.max_tokens)),
-        )
-    except Exception:
-        from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
-
-        table_row = lookup(
-            cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
-        )
-        if table_row:
-            return tuple(table_row["dispatch"]), tuple(table_row["combine"])
-        return (0, 0, 0), (0, 0, 0)
+def _geometry_for_report(op, num_tokens):
+    """Report the same HIP configuration used to select the launch callable."""
+    selected = op.kernel_config(num_tokens)
+    return tuple(
+        (spec.block_num, spec.rdma_block_num, spec.warp_per_block)
+        for spec in (selected.dispatch, selected.combine)
+    )
 
 
 def _rdma_algo_token_count(idx, cfg, ll):
@@ -958,7 +948,7 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # Report the family that RAN, not the request: under "auto" the request does
     # not name one, and a number is only comparable to another harness's if the
     # kernel behind it is named.
-    kernel_ran = "v2_ll" if op._internode_use_ll(num_tokens) else "v2"
+    kernel_ran = op.kernel_config(num_tokens).dispatch.family
     if dist_handle.rank == 0:
         print(
             f"# BENCH tok={num_tokens} "
@@ -976,8 +966,8 @@ def _bench(op, cfg, dist_handle, device, args, comm):
     # performance tables. Off with --no-bench-tables; it costs one all_gather
     # after the timed loop and nothing inside it.
     if not args.no_bench_tables:
-        ll = op._internode_use_ll(args.max_tokens)
-        geometry = _geometry_for_report(op, cfg, args)
+        ll = op.kernel_config(args.max_tokens).dispatch.family == "v2_ll"
+        geometry = _geometry_for_report(op, args.max_tokens)
         _report_tables(
             dist_handle,
             cfg,
@@ -1071,7 +1061,20 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
     (tokens 4: dispatch 64/32/8, combine 32/21/6). Driving both from one geometry
     means the sweep's incumbent is not the configuration actually shipped, so
     "beats the incumbent" would not mean "beats what we ship".
+
+    The intranode backend has no such hook; there the geometry is pinned through
+    the config fields, which also drops the tuned schedule.
     """
+    if not cfg.is_internode:
+        pinned = dataclasses.replace(
+            cfg,
+            schedule=None,
+            dispatch_block_num=dispatch_geometry[0],
+            warp_num_per_block=dispatch_geometry[2],
+            combine_block_num=combine_geometry[0],
+            combine_warp_num_per_block=combine_geometry[2],
+        )
+        return EpDispatchCombineOp(pinned, comm)
     previous = (
         os.environ.get("MORI_EP_DISP_GEOM"),
         os.environ.get("MORI_EP_COMB_GEOM"),
@@ -1091,6 +1094,244 @@ def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
 def _median(values):
     ordered = sorted(values)
     return ordered[len(ordered) // 2]
+
+
+def _metric_timing_pass(
+    op, inp, idx, wts, sc, combine_weights, convert, num_rounds, num_warmup
+):
+    """Local event timings with v1's barrier before, not inside, the timed loop."""
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(3 * num_rounds + 1)]
+    warmup_combine_input = None
+    for _ in range(num_warmup):
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        warmup_combine_input = convert(dispatch_out[0])
+        op.combine(warmup_combine_input, combine_weights, routing=dispatch_out[5])
+    del warmup_combine_input
+    torch.cuda.synchronize()
+    dist.barrier()
+    events[0].record()
+    for i in range(num_rounds):
+        dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+        events[3 * i + 1].record()
+        combine_input = convert(dispatch_out[0])
+        events[3 * i + 2].record()
+        op.combine(combine_input, combine_weights, routing=dispatch_out[5])
+        events[3 * i + 3].record()
+    torch.cuda.synchronize()
+    return [
+        (
+            events[3 * i].elapsed_time(events[3 * i + 1]) * 1e3,
+            events[3 * i + 2].elapsed_time(events[3 * i + 3]) * 1e3,
+        )
+        for i in range(num_rounds)
+    ]
+
+
+def _integer(value, name, minimum):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+        or value != int(value)
+        or value < minimum
+    ):
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return int(value)
+
+
+def _summarize_metric_samples(
+    gathered,
+    *,
+    num_passes,
+    num_rounds,
+    num_warmup,
+    drop_rounds,
+    max_tokens,
+    topk,
+    ll,
+):
+    """Return (rounded tuning metrics, evidence) from CPU all-gather rows.
+
+    Each rank contributes four metadata values followed by interleaved
+    dispatch/combine microseconds in pass-major, round-major order. Metadata is
+    received tokens, algorithm RDMA tokens, dispatch bytes/token and combine
+    bytes/token. Bandwidth is averaged after dividing each rank's own bytes by
+    each retained latency. The LL scale is rank 0's, applied after that average.
+    """
+    num_passes = _integer(num_passes, "num_passes", 1)
+    num_rounds = _integer(num_rounds, "num_rounds", 1)
+    num_warmup = _integer(num_warmup, "num_warmup", 0)
+    drop_rounds = _integer(drop_rounds, "drop_rounds", 0)
+    max_tokens = _integer(max_tokens, "max_tokens", 0)
+    topk = _integer(topk, "topk", 1)
+    if drop_rounds >= num_rounds:
+        raise ValueError("drop_rounds must leave at least one retained round per pass")
+    if not isinstance(ll, bool):
+        raise ValueError("ll must be a boolean")
+    try:
+        rows = [list(row) for row in gathered]
+    except TypeError as exc:
+        raise ValueError("gathered must contain rank rows") from exc
+    if not rows:
+        raise ValueError("gathered must contain at least one rank")
+
+    row_length = 4 + 2 * num_passes * num_rounds
+    for rank, row in enumerate(rows):
+        if len(row) != row_length:
+            raise ValueError(
+                f"rank {rank}: expected {row_length} values, received {len(row)}"
+            )
+        for column, (name, minimum) in enumerate(
+            (
+                ("recv_tokens", 0),
+                ("rdma_algo_tokens", 0),
+                ("dispatch_bytes_per_token", 1),
+                ("combine_bytes_per_token", 1),
+            )
+        ):
+            row[column] = _integer(row[column], f"rank {rank} {name}", minimum)
+        for column in range(4, row_length):
+            value = row[column]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"rank {rank}, sample value {column - 4}: "
+                    "latency must be finite and positive"
+                )
+            row[column] = float(value)
+
+    samples_per_rank = num_passes * (num_rounds - drop_rounds)
+    sample_count = len(rows) * samples_per_rank
+    ll_scale_rank0 = max_tokens * topk / (rows[0][0] + 1)
+    metrics = {}
+    unrounded = {}
+    for phase_index, phase in enumerate(("dispatch", "combine")):
+        latencies, rdma_bandwidths, xgmi_bandwidths = [], [], []
+        for row in rows:
+            recv_tokens, rdma_tokens = row[:2]
+            width = row[2 + phase_index]
+            for pass_index in range(num_passes):
+                for round_index in range(drop_rounds, num_rounds):
+                    offset = 4 + 2 * (pass_index * num_rounds + round_index)
+                    latency = row[offset + phase_index]
+                    latencies.append(latency)
+                    rdma_bandwidths.append(rdma_tokens * width / (1000 * latency))
+                    xgmi_bandwidths.append(recv_tokens * width / (1000 * latency))
+        latency = math.fsum(latencies) / sample_count
+        rdma = math.fsum(rdma_bandwidths) / sample_count
+        xgmi = math.fsum(xgmi_bandwidths) / sample_count
+        ll_bandwidth = xgmi * ll_scale_rank0
+        values = {
+            "bandwidth_gbps": ll_bandwidth if ll else rdma,
+            "avg_rdma_bandwidth_gbps": rdma,
+            "avg_xgmi_bandwidth_gbps": xgmi,
+            "avg_ll_bandwidth_gbps": ll_bandwidth,
+            "avg_latency_us": latency,
+        }
+        unrounded[phase] = values
+        metrics[phase] = {
+            **{name: round(value, 2) for name, value in values.items()},
+            "bandwidth_metric": "grand_mean",
+        }
+
+    evidence = {
+        "schema_version": 1,
+        "method": "dispatch.md:2026-09-30/grand_mean",
+        "parameters": {
+            "num_passes": num_passes,
+            "num_rounds": num_rounds,
+            "num_warmup": num_warmup,
+            "drop_rounds": drop_rounds,
+            "max_tokens": max_tokens,
+            "topk": topk,
+            "ll": ll,
+            "world_size": len(rows),
+        },
+        "row_layout": {
+            "metadata": [
+                "recv_tokens",
+                "rdma_algo_tokens",
+                "dispatch_bytes_per_token",
+                "combine_bytes_per_token",
+            ],
+            "samples": "pass-major, round-major, [dispatch_us, combine_us]",
+            "includes_dropped_rounds": True,
+        },
+        "rank_rows": rows,
+        "retained_samples_per_rank_per_phase": samples_per_rank,
+        "retained_samples_per_phase": sample_count,
+        "ll_scale_rank0": ll_scale_rank0,
+        "metrics_unrounded": unrounded,
+    }
+    return metrics, evidence
+
+
+def _row_metrics(
+    op, cfg, args, dist_handle, rng_data, convert, ll, *, evidence_callback=None
+):
+    """Final metrics with v1's grand mean, separate from search estimators.
+
+    Each rank computes bandwidth with its own payload and each retained round's
+    latency, then all samples across passes, ranks, and rounds are averaged.
+    The headline is RDMA for v2 and LL for v2_ll. LL uses the global XGMI mean
+    times rank 0's scale, exactly as v1's saved Average row does.
+
+    One CPU all-gather follows all synchronized timing passes. An optional
+    callback receives every rank's byte counts and raw rounds for replay;
+    those evidence fields are not added to tuning JSON entries.
+    """
+    if (
+        args.tuning_reps < 1
+        or args.rounds < 1
+        or not 0 <= args.drop_rounds < args.rounds
+    ):
+        raise ValueError("Metric sampling requires passes and retained rounds")
+    if args.warmup < 0:
+        raise ValueError("Metric warmup must be nonnegative")
+    inp, idx, wts, sc, combine_weights = rng_data
+    dispatch_out = op.dispatch(inp, wts, sc, idx, return_routing=True)
+    torch.cuda.synchronize()
+    total_recv = int(dispatch_out[4].item())
+    combine_input = convert(dispatch_out[0])
+    # Actual storage widths handle packed FP4 dispatch and unpacked BF16 combine.
+    dispatch_bytes = inp.shape[-1] * inp.element_size()
+    combine_bytes = combine_input.shape[-1] * combine_input.element_size()
+    op.combine(combine_input, combine_weights, routing=dispatch_out[5])
+    torch.cuda.synchronize()
+    del combine_input, dispatch_out
+    rdma_tokens = _rdma_algo_token_count(idx, cfg, ll)
+    row = [total_recv, rdma_tokens, dispatch_bytes, combine_bytes]
+    for _ in range(args.tuning_reps):
+        samples = _metric_timing_pass(
+            op,
+            inp,
+            idx,
+            wts,
+            sc,
+            combine_weights,
+            convert,
+            args.rounds,
+            args.warmup,
+        )
+        row.extend(value for sample in samples for value in sample)
+    gathered = dist_handle.all_gather_rows(row).tolist()
+    metrics, evidence = _summarize_metric_samples(
+        gathered,
+        num_passes=args.tuning_reps,
+        num_rounds=args.rounds,
+        num_warmup=args.warmup,
+        drop_rounds=args.drop_rounds,
+        max_tokens=args.max_tokens,
+        topk=cfg.num_experts_per_token,
+        ll=ll,
+    )
+    if evidence_callback is not None:
+        evidence_callback(evidence)
+    return metrics
 
 
 def _stress(op, cfg, dist_handle, device, args, comm):
@@ -1123,7 +1364,7 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         _generate_round(rng, cfg, int(n), device, cfg.dispatch_dtype, args.routing)
         for n in counts
     ]
-    used_ll = {n: op._internode_use_ll(n) for n in set(counts)}
+    used_ll = {n: op.kernel_config(n).dispatch.family == "v2_ll" for n in set(counts)}
     if dist_handle.rank == 0:
         families = sorted({("v2_ll" if v else "v2") for v in used_ll.values()})
         print(
@@ -1215,25 +1456,106 @@ def _tune(cfg, dist_handle, device, args, comm):
         )
         return sorted({count for count in fractions if 1 <= count < block_count})
 
-    candidates = [
-        (block, rdma, warp)
-        for block in sorted(blocks)
-        for warp in warps
-        for rdma in rdma_block_counts(block)
-    ]
+    if cfg.is_internode:
+        candidates = [
+            (block, rdma, warp)
+            for block in sorted(blocks)
+            for warp in warps
+            for rdma in rdma_block_counts(block)
+        ]
+    else:
+        # Intranode has no RDMA split; the middle field stays 0.
+        candidates = [(block, 0, warp) for block in sorted(blocks) for warp in warps]
     if args.tuning_candidate:
         candidates = [tuple(int(x) for x in args.tuning_candidate.split(","))]
     elif args.tuning_limit:
         candidates = candidates[: args.tuning_limit]
 
-    from mori.ops.dispatch_combine_v2.internode_tuning_configs import lookup
-
-    table_row = lookup(
-        cfg.world_size, cfg.hidden_dim, cfg.num_experts_per_token, args.max_tokens
+    from mori.ops.dispatch_combine_v2.hip_tuning_configs import (
+        internode_kernel_family,
+        lookup_internode,
+        pick_bucket,
     )
-    # The incumbent is the SHIPPED pair, so a win means "better than what we ship".
-    incumbent_dispatch = tuple(table_row["dispatch"]) if table_row else candidates[0]
-    incumbent_combine = tuple(table_row["combine"]) if table_row else candidates[0]
+    from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR
+
+    # Each phase's rules are keyed by ITS OWN leg's dtype, as v1 keys its two
+    # files: an fp8-dispatch + bf16-combine op writes fp8_e4m3 dispatch rules and
+    # bf16 combine rules. So the two strings can differ, and the saved row has to
+    # use the one for the phase being swept.
+    dtype_keys = {
+        "dispatch": DTYPE_TO_CONFIG_STR.get(cfg.dispatch_dtype),
+        "combine": DTYPE_TO_CONFIG_STR.get(cfg.combine_dtype),
+    }
+    kernel_family = (
+        internode_kernel_family(cfg, args.max_tokens) if cfg.is_internode else "intra"
+    )
+    if args.tuning_save or args.tuning_config_dir:
+        # Read the incumbent from the SAME table the winner will be written to.
+        # The kernels run from site-packages while --tuning-save writes the
+        # repo's copy, so without this a sweep would be judged against a row it
+        # is not about to replace -- and the second phase of a shape would not
+        # see the first phase's result at all.
+        os.environ["MORI_EP_V2_TUNING_DIR"] = str(_tuning_table_dir(args))
+    if cfg.is_internode:
+        table_row = lookup_internode(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            args.max_tokens,
+            cfg.dispatch_dtype,
+            cfg.combine_dtype,
+            kernel_family=kernel_family,
+            experts_per_rank=cfg.num_experts_per_rank,
+        )
+    else:
+        # Re-resolve the schedule: the caller's config was built before
+        # MORI_EP_V2_TUNING_DIR pointed at the table this run writes.
+        current = dataclasses.replace(
+            cfg,
+            schedule=None,
+            dispatch_block_num=None,
+            warp_num_per_block=None,
+            combine_block_num=None,
+            combine_warp_num_per_block=None,
+        )
+        row = (
+            pick_bucket(current.schedule, args.max_tokens)
+            if current.schedule
+            else (
+                None,
+                current.dispatch_block_num,
+                current.warp_num_per_block,
+                current.combine_block_num,
+                current.combine_warp_num_per_block,
+            )
+        )
+        table_row = {"dispatch": (row[1], 0, row[2]), "combine": (row[3], 0, row[4])}
+
+    # The incumbent is what a user gets TODAY: the shipped row where there is
+    # one, and otherwise the geometry the config resolves on its own. Not
+    # candidates[0] -- that is just the smallest grid in the sweep, so on a shape
+    # with no row yet (every shape but one, before this table was writable) the
+    # whole sweep would be scored against a geometry nobody runs, and "beats the
+    # incumbent" would not mean "beats what we ship".
+    #
+    # Per phase, because a phase may have no rule: the tuner sweeps one phase
+    # against the other's current value, so a bucket grows a phase at a time.
+    def _incumbent(phase_name, config_geometry):
+        tuned = table_row.get(phase_name) if table_row else None
+        return tuple(tuned) if tuned else config_geometry
+
+    incumbent_dispatch = _incumbent(
+        "dispatch",
+        (cfg.dispatch_block_num, cfg.dispatch_rdma_block_num, cfg.warp_num_per_block),
+    )
+    incumbent_combine = _incumbent(
+        "combine",
+        (
+            cfg.combine_block_num,
+            cfg.combine_rdma_block_num,
+            cfg.combine_warp_num_per_block,
+        ),
+    )
     phase = args.tuning_phase
     shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
     if shipped in candidates:
@@ -1433,8 +1755,13 @@ def _tune(cfg, dist_handle, device, args, comm):
         comm.barrier()
 
     best_op.close()
-    if dist_handle.rank == 0 and not args.tuning_greedy:
+    if not args.tuning_greedy and fixed_wins:
+        # Sorted below, on rank 0 only -- but the winner has to be agreed by
+        # EVERY rank before anyone builds an op for it, since building one is
+        # collective. fixed_wins is derived from allreduced medians, so the
+        # ordering is identical on every rank and no communication is needed.
         fixed_wins.sort()
+    if dist_handle.rank == 0 and not args.tuning_greedy:
         print(
             f"# TUNING tok={args.max_tokens} phase={phase}: {len(fixed_wins)} of "
             f"{len(candidates)} candidates beat the fixed incumbent {shipped}",
@@ -1457,22 +1784,142 @@ def _tune(cfg, dist_handle, device, args, comm):
                 f"worst {candidate_worst:.0f}/{incumbent_worst:.0f})",
                 flush=True,
             )
-        if fixed_wins:
-            best = fixed_wins[0][2]
-            best_median = fixed_wins[0][3]
+    if not args.tuning_greedy and fixed_wins:
+        best = fixed_wins[0][2]
+        best_median = fixed_wins[0][3]
+
+    dispatch_row = best if phase == "dispatch" else incumbent_dispatch
+    combine_row = best if phase == "combine" else incumbent_combine
+
+    # Measure the pair that will actually be written, on every rank: the row's
+    # bandwidth and latency fields are v1's, and v1's mean them for the
+    # configuration it shipped. Reusing the sweep's own numbers would mean the
+    # winner's stats came from a comparison against a live second op holding a
+    # second symmetric window, which is not the state a user runs in.
+    metrics = None
+    if args.tuning_save:
+        final_op = _build_op(cfg, comm, dispatch_row, combine_row)
+        comm.barrier()
+        metrics = _row_metrics(
+            final_op,
+            cfg,
+            args,
+            dist_handle,
+            (inp, idx, wts, sc, combine_weights),
+            convert,
+            ll=kernel_family == "v2_ll",
+        )
+        final_op.close()
+        comm.barrier()
+
     if dist_handle.rank == 0:
-        dispatch_row = best if phase == "dispatch" else incumbent_dispatch
-        combine_row = best if phase == "combine" else incumbent_combine
+        # best_median is None when nothing was measured against the incumbent,
+        # which is not a failure: `--tuning-candidate <the shipped geometry>`
+        # empties the candidate list (the shipped one is removed from it), and
+        # that is the shape of a REFRESH run -- keep the geometry, re-measure the
+        # avg_* fields. Formatting it unguarded is how that path used to die.
+        selection = (
+            f"median {args.tuning_metric}={best_median:.1f}us"
+            if best_median is not None
+            else "no candidate measured (refresh of the shipped geometry)"
+        )
         print(
             f"# TUNING RESULT tok={args.max_tokens} phase={phase}: "
-            f"block/rdma/warp={best} median {phase}={best_median:.1f}us "
-            f"(shipped was {shipped})\n"
+            # Named for the metric, not the phase: --tuning-metric defaults to
+            # the dispatch+combine total, so "median dispatch=725us" read as a
+            # dispatch time is off by roughly a factor of two.
+            f"block/rdma/warp={best} {selection} (shipped was {shipped})\n"
             f"#   table row: ({args.max_tokens}, {dispatch_row[0]}, "
             f"{dispatch_row[1]}, {dispatch_row[2]}, "
             f"{combine_row[0]}, {combine_row[1]}, {combine_row[2]}),",
             flush=True,
         )
+        if args.tuning_save:
+            _save_tuning_row(
+                cfg,
+                args,
+                phase=phase,
+                dtype_key=dtype_keys[phase],
+                kernel_family=kernel_family,
+                geometry=best,
+                metrics=metrics[phase],
+            )
     return 0
+
+
+def _tuning_table_dir(args):
+    """Where --tuning-save writes, as a Path.
+
+    Defaults to THIS REPO's table rather than the installed package's: the
+    kernels run from site-packages, but a tuning row is only useful once it is a
+    diff somebody can read, and writing into site-packages leaves it nowhere. Same
+    reasoning as the v1 bench's `config_path auto`. parents[4] is the repo root
+    from tests/python/ops/dispatch_combine_v2/.
+    """
+    if args.tuning_config_dir:
+        return Path(args.tuning_config_dir)
+    return (
+        Path(__file__).resolve().parents[4]
+        / "python"
+        / "mori"
+        / "ops"
+        / "dispatch_combine_v2"
+        / "tuning_configs"
+    )
+
+
+def _save_tuning_row(
+    cfg,
+    args,
+    *,
+    phase,
+    dtype_key,
+    kernel_family,
+    geometry,
+    metrics,
+):
+    """Merge one swept phase's rule into its own file, one per expert count,
+    top-k and phase (hip_tuning_configs.v2_table_filename).
+
+    Only the phase that was swept is written, and it goes in that phase's file,
+    so the other phase's rule is untouched by construction -- writing the
+    incumbent back as if it were a result would claim a measurement that was
+    never made.
+    """
+    from mori.ops.dispatch_combine_v2.hip_tuning_configs import save_internode_result
+
+    block_num, rdma_block_num, warp_per_block = geometry
+    if kernel_family == "intra":
+        # One node has no RDMA leg and no LL scale; xGMI is the transport.
+        metrics = {
+            "bandwidth_gbps": metrics["avg_xgmi_bandwidth_gbps"],
+            "avg_xgmi_bandwidth_gbps": metrics["avg_xgmi_bandwidth_gbps"],
+            "avg_latency_us": metrics["avg_latency_us"],
+            "bandwidth_metric": metrics["bandwidth_metric"],
+        }
+    entry = {
+        "dtype": dtype_key,
+        "num_tokens": args.max_tokens,
+        "hidden_dim": cfg.hidden_dim,
+        "topk": cfg.num_experts_per_token,
+        # world_size x this is the model's expert count, which picks the file
+        # and is not stored in the rule, so two expert counts at the same
+        # (dtype, hidden, topk, num_tokens) land in two files rather than one
+        # overwriting the other.
+        "experts_per_rank": cfg.num_experts_per_rank,
+        "block_num": block_num,
+        "rdma_block_num": rdma_block_num,
+        "warp_per_block": warp_per_block,
+        # v1's metric field set, same names and same definitions (_row_metrics).
+        **metrics,
+    }
+    save_internode_result(
+        cfg.world_size,
+        phase,
+        entry,
+        kernel_family=kernel_family,
+        directory=_tuning_table_dir(args),
+    )
 
 
 def _spawn_entry(local_rank, argv, node_rank, num_nodes, ranks_per_node):
@@ -1533,9 +1980,10 @@ def main(argv):
     device = torch.device("cuda", dist_handle.local_rank)
 
     gpu_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-    if npes <= gpu_per_node:
+    # One node builds the intranode op; only test and tuning support that.
+    if npes <= gpu_per_node and args.cmd not in ("test", "tuning"):
         raise SystemExit(
-            f"this test needs more than one node: world_size={npes} with "
+            f"--cmd {args.cmd} needs more than one node: world_size={npes} with "
             f"{gpu_per_node} GPUs per node is a single node"
         )
 
