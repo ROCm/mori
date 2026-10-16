@@ -106,7 +106,8 @@ class CollectivesFacade {
   int NumPes() const { return nPes_; }
 
   // creates a concrete facade for the given PE and PE count
-  static std::unique_ptr< CollectivesFacade > Get(int myPe, int nPes) {
+  static std::unique_ptr< CollectivesFacade > Get(int myPe, int nPes,
+                                                const int *rank_to_pe) {
     auto *state = GetState();
     if (MORI_UNLIKELY(state == nullptr)) {
       FACADE_PRINTF("Get: no instance");

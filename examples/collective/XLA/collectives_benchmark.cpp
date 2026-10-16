@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <numeric>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -521,7 +522,9 @@ static void RunThreaded(const Config& cfg, const ccoUniqueId& uid, ThreadInfo& i
   if (CollectivesFacade::Create(comm, cfg.heapBytes, cfg.stagingBytes) != 0) {
     XPUT("ERROR: Failed to create CollectivesFacade");
   } else {
-    auto facade = CollectivesFacade::Get(myPe, npes);
+    std::vector<int> rank_to_pe(npes);
+    std::iota(rank_to_pe.begin(), rank_to_pe.end(), 0);
+    auto facade = CollectivesFacade::Get(myPe, npes, rank_to_pe.data());
     if (facade == nullptr) {
       XPUT("ERROR: No CollectivesFacade for device %d", info.deviceId);
     } else if ((!cfg.modeSet || facade->SetReduceMode(cfg.mode)) &&
