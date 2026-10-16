@@ -23,6 +23,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -48,6 +49,28 @@ namespace fs = std::filesystem;
 
 namespace mori::umbp {
 
+namespace {
+
+// Disk comes back a whole segment at a time, so a segment must be a small
+// slice of the tier: one as large as the tier could never be emptied by
+// evicting part of it.  Eight keeps a pass between the default watermarks
+// (0.9 -> 0.7) to a couple of segments' worth of keys.
+constexpr uint64_t kMinSegmentsPerTier = 8;
+
+template <typename Fn>
+class ScopeExit {
+ public:
+  explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+  ~ScopeExit() { fn_(); }
+  ScopeExit(const ScopeExit&) = delete;
+  ScopeExit& operator=(const ScopeExit&) = delete;
+
+ private:
+  Fn fn_;
+};
+
+}  // namespace
+
 SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& ssd_config,
                  SSDAccessMode access_mode)
     : TierBackend(StorageTier::LOCAL_SSD),
@@ -71,6 +94,16 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
   writer_ = std::make_unique<segment::Writer>(*io_driver_, ssd_config_.verify_crc);
   fs::create_directories(dir_);
 
+  segment_size_ = ssd_config_.segment_size_bytes;
+  const uint64_t slice = (capacity_ / kMinSegmentsPerTier) & ~(segment::kRecordAlign - 1);
+  if (slice >= segment::kRecordAlign && slice < segment_size_) {
+    MORI_UMBP_INFO(
+        "[SSDTier] {}: segment size {}B capped to {}B (1/{} of capacity {}B) so eviction can "
+        "free disk a segment at a time",
+        dir_, segment_size_, slice, kMinSegmentsPerTier, capacity_);
+    segment_size_ = slice;
+  }
+
   if (ssd_config_.direct_io) {
     direct_io_ = ProbeDirectIo();
     if (!direct_io_) {
@@ -92,12 +125,24 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
         dir_);
   }
 
-  std::lock_guard<std::mutex> lock(mu_);
-  RefreshFromDiskLocked(true);
-  DropUnparsedTailsLocked();
-  if (!IsReadOnlyShared() && index_.Segments().empty()) {
-    OpenOrCreateSegmentLocked(0);
+  std::vector<segment::Meta> doomed;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    RefreshFromDiskLocked(true);
+    DropUnparsedTailsLocked();
+    if (!IsReadOnlyShared() && index_.Segments().empty()) {
+      OpenOrCreateSegmentLocked(0);
+    }
+    // A segment the scan found no live record in -- every record superseded by
+    // a later one, or dropped as an unreadable tail -- is dead weight.
+    if (!IsReadOnlyShared()) {
+      std::vector<uint64_t> ids;
+      ids.reserve(index_.Segments().size());
+      for (const auto& kv : index_.Segments()) ids.push_back(kv.first);
+      for (uint64_t id : ids) CollectReclaimableLocked(id, &doomed);
+    }
   }
+  DisposeSegments(&doomed);
 }
 
 int SSDTier::TierThreads() const {
@@ -175,16 +220,21 @@ void SSDTier::DropUnparsedTailsLocked() {
     // the scanner would stop at all over again.
     seg.write_offset = seg.scanned_offset;
   }
+  index_.RecomputeDiskBytes();
 }
 
 SSDTier::~SSDTier() {
-  std::lock_guard<std::mutex> lock(mu_);
-  for (auto& kv : index_.MutableSegments()) {
-    if (kv.second.fd >= 0) {
-      close(kv.second.fd);
-      kv.second.fd = -1;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto& kv : index_.MutableSegments()) {
+      if (kv.second.fd >= 0) {
+        close(kv.second.fd);
+        kv.second.fd = -1;
+      }
     }
   }
+  // The hook's owner may already be gone; nothing can read these fds now.
+  SweepGraveyard(/*all=*/true, /*run_hook=*/false);
 }
 
 segment::Meta* SSDTier::GetSegmentLocked(uint64_t segment_id) {
@@ -223,7 +273,7 @@ bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
   }
 
   seg.write_offset = static_cast<uint64_t>(st.st_size);
-  index_.MutableSegments()[segment_id] = seg;
+  index_.InsertSegment(seg);
   index_.MarkKnownSegment(segment_id);
   index_.AdvanceNextSegmentId(segment_id + 1);
   if (!IsReadOnlyShared()) {
@@ -232,21 +282,140 @@ bool SSDTier::OpenOrCreateSegmentLocked(uint64_t segment_id) {
   return true;
 }
 
-bool SSDTier::EnsureActiveSegment(size_t need_bytes) {
+bool SSDTier::EnsureActiveSegment(size_t need_bytes, std::vector<segment::Meta>* doomed) {
   auto* seg = GetSegmentLocked(index_.active_segment_id());
   if (!seg) {
+    if (!HasRoomForNewSegment()) return false;
     if (!OpenOrCreateSegmentLocked(index_.next_segment_id())) return false;
     index_.set_active_segment_id(index_.next_segment_id() - 1);
     seg = GetSegmentLocked(index_.active_segment_id());
   }
   if (!seg) return false;
 
-  if (seg->write_offset + need_bytes <= ssd_config_.segment_size_bytes) return true;
+  // An empty segment takes any record, even one larger than a segment.
+  if (seg->write_offset == 0 || seg->write_offset + need_bytes <= segment_size_) return true;
 
-  uint64_t new_id = index_.next_segment_id();
+  const uint64_t sealed = seg->id;
+  if (!RollActiveSegmentLocked()) return false;
+  // The segment just sealed may hold nothing live: every record in it was
+  // overwritten or evicted while it was still being appended to.
+  CollectReclaimableLocked(sealed, doomed);
+  return true;
+}
+
+bool SSDTier::RollActiveSegmentLocked() {
+  if (!HasRoomForNewSegment()) return false;
+  const uint64_t new_id = index_.next_segment_id();
   if (!OpenOrCreateSegmentLocked(new_id)) return false;
   index_.set_active_segment_id(new_id);
   return true;
+}
+
+bool SSDTier::HasRoomForNewSegment() const {
+  struct statvfs vfs{};
+  if (statvfs(dir_.c_str(), &vfs) != 0) return true;  // cannot tell; let open() decide
+  const uint64_t free_bytes = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+  if (free_bytes >= segment_size_) return true;
+  // The tier itself stays within capacity_bytes, so either something else is
+  // filling this filesystem or capacity_bytes is more than it can hold.
+  const uint64_t n = no_room_refusals_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 16 || n % 1000 == 0) {
+    MORI_UMBP_ERROR(
+        "[SSDTier] {}: not opening a new segment: the filesystem has {}B free, less than one "
+        "segment ({}B); writes to this drive fail until space comes back [{} so far]",
+        dir_, free_bytes, segment_size_, n);
+  }
+  return false;
+}
+
+void SSDTier::CollectReclaimableLocked(uint64_t segment_id, std::vector<segment::Meta>* doomed) {
+  if (IsReadOnlyShared() || doomed == nullptr) return;
+  if (segment_id == index_.active_segment_id()) {
+    // Still being appended to, so it cannot go -- unless everything written to
+    // it is already gone, in which case roll past it and let it go.
+    if (!index_.ActiveSegmentEmptied() || !RollActiveSegmentLocked()) return;
+  }
+  segment::Meta seg;
+  if (index_.TakeSegment(segment_id, &seg)) doomed->push_back(std::move(seg));
+}
+
+void SSDTier::UnpinLocked(const std::vector<uint64_t>& pinned, std::vector<segment::Meta>* doomed) {
+  for (uint64_t id : pinned) index_.UnpinSegment(id);
+  for (uint64_t id : pinned) CollectReclaimableLocked(id, doomed);
+}
+
+void SSDTier::ReleasePins(const std::vector<uint64_t>& pinned) {
+  if (pinned.empty()) return;
+  std::vector<segment::Meta> doomed;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    UnpinLocked(pinned, &doomed);
+  }
+  DisposeSegments(&doomed);
+}
+
+void SSDTier::DisposeSegments(std::vector<segment::Meta>* doomed) {
+  if (doomed == nullptr) return;
+  for (auto& seg : *doomed) {
+    // Unlink now, so a restart never rescans the file; the blocks themselves
+    // are freed when its fd closes.
+    if (unlink(seg.path.c_str()) != 0 && errno != ENOENT) {
+      MORI_UMBP_WARN("[SSDTier] {}: unlink of empty segment failed: {}", seg.path,
+                     std::strerror(errno));
+    }
+    const uint64_t n = segments_reclaimed_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total =
+        bytes_reclaimed_.fetch_add(seg.write_offset, std::memory_order_relaxed) + seg.write_offset;
+    if (n <= 16 || n % 256 == 0) {
+      MORI_UMBP_INFO(
+          "[SSDTier] {}: deleted segment {} ({}B on disk, no live record left) [{} segments, {}B "
+          "reclaimed so far]",
+          dir_, seg.id, seg.write_offset, n, total);
+    }
+    if (seg.fd >= 0) RetireFd(seg.fd);
+  }
+  doomed->clear();
+  SweepGraveyard(/*all=*/false);
+}
+
+void SSDTier::RetireFd(int fd) {
+  std::function<void(int)> hook;
+  {
+    std::lock_guard<std::mutex> lock(graveyard_mu_);
+    if (retired_grace_.count() > 0) {
+      graveyard_.push_back({fd, std::chrono::steady_clock::now() + retired_grace_});
+      return;
+    }
+    hook = retired_hook_;
+  }
+  if (hook) hook(fd);
+  close(fd);
+}
+
+void SSDTier::SweepGraveyard(bool all, bool run_hook) const {
+  std::vector<int> due;
+  std::function<void(int)> hook;
+  {
+    std::lock_guard<std::mutex> lock(graveyard_mu_);
+    if (graveyard_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    while (!graveyard_.empty() && (all || graveyard_.front().close_at <= now)) {
+      due.push_back(graveyard_.front().fd);
+      graveyard_.pop_front();
+    }
+    if (run_hook) hook = retired_hook_;
+  }
+  for (int fd : due) {
+    if (hook) hook(fd);
+    close(fd);
+  }
+}
+
+void SSDTier::SetRetiredFileHook(std::function<void(int fd)> on_close,
+                                 std::chrono::milliseconds grace) {
+  std::lock_guard<std::mutex> lock(graveyard_mu_);
+  retired_hook_ = std::move(on_close);
+  retired_grace_ = grace.count() > 0 ? grace : std::chrono::milliseconds{0};
 }
 
 bool SSDTier::RefreshFromDiskLocked(bool force_full_rescan) {
@@ -263,6 +432,7 @@ bool SSDTier::RefreshFromDiskLocked(bool force_full_rescan) {
   std::string error_message;
   bool ok = scanner_.RefreshFromDisk(dir_, *io_driver_, index_, IsReadOnlyShared(),
                                      force_full_rescan, &error_message, SegmentOpenFlags());
+  index_.RecomputeDiskBytes();  // the scanner sets segment cursors directly
   return ok;
 }
 
@@ -280,15 +450,25 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
   writer_->Build(key, data, size, &pr);
 
   int write_fd = -1;
+  // Segments this write needs kept: the one it appends to, and the one holding
+  // the record it replaces, which a failed write restores.
+  std::vector<uint64_t> pinned;
+  std::vector<segment::Meta> doomed;
   {
     // Phase 1b: reserve index space under mu_
     std::lock_guard<std::mutex> lock(mu_);
-    if (!EnsureActiveSegment(record_size)) return false;
-    auto* seg = GetSegmentLocked(index_.active_segment_id());
-    if (!seg) return false;
-    if (!writer_->Reserve(key, size, seg, index_, &pr)) return false;
-    write_fd = seg->fd;
+    auto* seg = EnsureActiveSegment(record_size, &doomed)
+                    ? GetSegmentLocked(index_.active_segment_id())
+                    : nullptr;
+    if (seg && writer_->Reserve(key, size, seg, index_, &pr)) {
+      write_fd = seg->fd;
+      pinned.push_back(seg->id);
+      if (pr.reservation.had_previous) pinned.push_back(pr.reservation.previous_meta.segment_id);
+      for (uint64_t id : pinned) index_.PinSegment(id);
+    }
   }
+  DisposeSegments(&doomed);
+  if (pinned.empty()) return false;
 
   // Phase 2: perform I/O outside mu_ (io_mu_ serializes non-thread-safe backends)
   const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
@@ -300,19 +480,28 @@ bool SSDTier::Write(const std::string& key, const void* data, size_t size) {
     status = writer_->WriteRecord(write_fd, pr, ShouldSyncOnWrite());
   }
 
-  if (!status.ok()) {
+  const bool ok = status.ok();
+  {
     std::lock_guard<std::mutex> lock(mu_);
-    index_.RollbackWrite(pr.reservation);
-    return false;
+    if (!ok) index_.RollbackWrite(pr.reservation);
+    UnpinLocked(pinned, &doomed);
   }
-  return true;
+  DisposeSegments(&doomed);
+  return ok;
 }
 
 bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
                          const std::vector<const void*>& data_ptrs,
                          const std::vector<size_t>& sizes) {
-  if (keys.empty()) return true;
-  if (IsReadOnlyShared()) return false;
+  const auto results = BatchWrite(keys, data_ptrs, sizes);
+  return std::all_of(results.begin(), results.end(), [](bool ok) { return ok; });
+}
+
+std::vector<bool> SSDTier::BatchWrite(const std::vector<std::string>& keys,
+                                      const std::vector<const void*>& data_ptrs,
+                                      const std::vector<size_t>& sizes) {
+  std::vector<bool> results(keys.size(), false);
+  if (keys.empty() || IsReadOnlyShared()) return results;
 
   // Padded size: what the batch will actually occupy on disk, and therefore what
   // the segment-roll check has to be made against.
@@ -320,12 +509,9 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
   for (size_t i = 0; i < keys.size(); ++i) {
     total_bytes += static_cast<size_t>(segment::RecordBytes(keys[i].size(), sizes[i]));
   }
-  if (total_bytes > ssd_config_.segment_size_bytes) {
-    bool all_ok = true;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (!Write(keys[i], data_ptrs[i], sizes[i])) all_ok = false;
-    }
-    return all_ok;
+  if (total_bytes > segment_size_) {
+    for (size_t i = 0; i < keys.size(); ++i) results[i] = Write(keys[i], data_ptrs[i], sizes[i]);
+    return results;
   }
 
   // Stage timers for the [SsdPerf/tier] PUT breakdown (no-ops unless
@@ -344,6 +530,11 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
   build_ms = ssdperf::MsSince(t_begin);
 
   std::vector<segment::PreparedRecord> prepared;
+  std::vector<size_t> prepared_index;  // prepared[j] is keys[prepared_index[j]]
+  // The segment appended to, plus those holding records this batch replaces
+  // (a failed batch restores them).  See Write.
+  std::vector<uint64_t> pinned;
+  std::vector<segment::Meta> doomed;
   int write_fd = -1;
   {
     // Phase 1b: reserve index/segment space under mu_ (cheap: no CRC, no copy).
@@ -351,20 +542,30 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
     std::lock_guard<std::mutex> lock(mu_);
     const auto t_locked = ssdperf::Now();
     lock_ms = ssdperf::MsBetween(t_lock, t_locked);
-    if (!EnsureActiveSegment(total_bytes)) return false;
-    auto* seg = GetSegmentLocked(index_.active_segment_id());
-    if (!seg) return false;
-    write_fd = seg->fd;
-
-    prepared.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-      if (!writer_->Reserve(keys[i], sizes[i], seg, index_, &built[i])) continue;
-      prepared.push_back(std::move(built[i]));
+    auto* seg = EnsureActiveSegment(total_bytes, &doomed)
+                    ? GetSegmentLocked(index_.active_segment_id())
+                    : nullptr;
+    if (seg) {
+      write_fd = seg->fd;
+      prepared.reserve(keys.size());
+      prepared_index.reserve(keys.size());
+      // A key that does not fit is left false and the rest still go.
+      for (size_t i = 0; i < keys.size(); ++i) {
+        if (!writer_->Reserve(keys[i], sizes[i], seg, index_, &built[i])) continue;
+        if (built[i].reservation.had_previous) {
+          pinned.push_back(built[i].reservation.previous_meta.segment_id);
+        }
+        prepared.push_back(std::move(built[i]));
+        prepared_index.push_back(i);
+      }
+      if (!prepared.empty()) pinned.push_back(seg->id);
+      for (uint64_t id : pinned) index_.PinSegment(id);
     }
     reserve_ms = ssdperf::MsSince(t_locked);
   }
+  DisposeSegments(&doomed);
 
-  if (prepared.empty()) return true;
+  if (prepared.empty()) return results;
 
   // Phase 2: perform I/O outside mu_
   const bool needs_io_lock = !io_driver_->Capabilities().thread_safe;
@@ -392,12 +593,23 @@ bool SSDTier::WriteBatch(const std::vector<std::string>& keys,
         ssdperf::GbPerSec(total_bytes, io_ms), ShouldSyncOnWrite());
   }
 
-  if (!status.ok()) {
+  const bool ok = status.ok();
+  {
     std::lock_guard<std::mutex> lock(mu_);
-    for (const auto& pr : prepared) index_.RollbackWrite(pr.reservation);
-    return false;
+    if (!ok) {
+      // Newest first, so each rollback finds its record at the segment's tail
+      // and can give the bytes back.
+      for (auto it = prepared.rbegin(); it != prepared.rend(); ++it) {
+        index_.RollbackWrite(it->reservation);
+      }
+    }
+    UnpinLocked(pinned, &doomed);
   }
-  return true;
+  DisposeSegments(&doomed);
+  if (ok) {
+    for (size_t i : prepared_index) results[i] = true;
+  }
+  return results;
 }
 
 IoStatus SSDTier::ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const {
@@ -441,6 +653,9 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
   uint64_t value_offset = 0;
   uint32_t expected_crc = 0;
   bool crc_valid = true;
+  // The segment's fd is used below without mu_, so the segment must not be
+  // deleted (and its fd closed, and the number reused) until the read is done.
+  std::vector<uint64_t> pinned;
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto* meta = index_.FindKey(key);
@@ -456,8 +671,11 @@ bool SSDTier::ReadIntoPtr(const std::string& key, uintptr_t dst_ptr, size_t size
     value_offset = meta->value_offset;
     expected_crc = meta->crc32;
     crc_valid = meta->crc_valid;
+    index_.PinSegment(seg->id);
+    pinned.push_back(seg->id);
     index_.TouchLRU(key);
   }
+  ScopeExit release([&] { ReleasePins(pinned); });
   return ReadRecordLocked(key, reinterpret_cast<void*>(dst_ptr), size, expected_crc, value_offset,
                           read_fd, crc_valid);
 }
@@ -471,6 +689,7 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   // Per-key lookup result for Phase 2/3.
   struct ReadLookup {
     size_t orig_idx;
+    uint64_t segment_id;
     int fd;
     uint64_t offset;
     uint32_t expected_crc;
@@ -484,6 +703,9 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
 
   std::vector<ReadLookup> lookups;
   lookups.reserve(keys.size());
+  // One pin per lookup, held until the reads land (see ReadIntoPtr).
+  std::vector<uint64_t> pinned;
+  ScopeExit release([&] { ReleasePins(pinned); });
 
   // Stage timers for the [SsdPerf/tier] GET breakdown (no-ops unless
   // UMBP_SSD_TIMING is set).  The three stages are disjoint and cover the whole
@@ -518,9 +740,12 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
       auto* seg = GetSegmentLocked(meta->segment_id);
       if (!seg || seg->fd < 0) continue;
       index_.TouchLRU(keys[i]);
+      index_.PinSegment(seg->id);
+      pinned.push_back(seg->id);
 
       ReadLookup lk;
       lk.orig_idx = i;
+      lk.segment_id = seg->id;
       lk.fd = seg->fd;
       lk.offset = meta->value_offset;
       lk.expected_crc = meta->crc32;
@@ -649,13 +874,6 @@ std::vector<bool> SSDTier::ReadBatchIntoPtr(const std::vector<std::string>& keys
   return results;
 }
 
-std::vector<bool> SSDTier::BatchWrite(const std::vector<std::string>& keys,
-                                      const std::vector<const void*>& data_ptrs,
-                                      const std::vector<size_t>& sizes) {
-  bool ok = WriteBatch(keys, data_ptrs, sizes);
-  return std::vector<bool>(keys.size(), ok);
-}
-
 std::vector<bool> SSDTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
                                             const std::vector<uintptr_t>& dst_ptrs,
                                             const std::vector<size_t>& sizes) {
@@ -715,6 +933,9 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
   };
   std::vector<KeyLocation> located;
   located.reserve(n);
+  // Held until the reads land (see ReadIntoPtr).
+  std::vector<uint64_t> pinned;
+  ScopeExit release([&] { ReleasePins(pinned); });
 
   // Phase 1 (mu_ held): resolve every key to a segment fd + value offset.
   {
@@ -739,6 +960,8 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
       auto* seg = GetSegmentLocked(meta->segment_id);
       if (!seg || seg->fd < 0) continue;
       index_.TouchLRU(keys[i]);
+      index_.PinSegment(seg->id);
+      pinned.push_back(seg->id);
       located.push_back({i, seg->fd, meta->value_offset, meta->size});
     }
     plan_ms = ssdperf::MsSince(t_locked);
@@ -952,32 +1175,74 @@ bool SSDTier::Exists(const std::string& key) const {
 }
 
 bool SSDTier::Evict(const std::string& key) {
-  std::lock_guard<std::mutex> lock(mu_);
-  return index_.EraseKey(key);
+  std::vector<segment::Meta> doomed;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto* meta = index_.FindKey(key);
+    if (!meta) return false;
+    const uint64_t segment_id = meta->segment_id;
+    index_.EraseKey(key);
+    // Nothing on disk changes for the key itself; its bytes come back with the
+    // whole segment, once this was the segment's last live record.
+    CollectReclaimableLocked(segment_id, &doomed);
+  }
+  DisposeSegments(&doomed);
+  return true;
 }
 
 std::pair<size_t, size_t> SSDTier::Capacity() const {
+  SweepGraveyard(/*all=*/false);
   std::lock_guard<std::mutex> lock(mu_);
   return index_.Capacity();
 }
 
+TierSpaceStats SSDTier::SpaceStats() const {
+  TierSpaceStats out;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    out.live_bytes = index_.live_bytes();
+    out.files = index_.Segments().size();
+  }
+  out.files_deleted = segments_reclaimed_.load(std::memory_order_relaxed);
+  out.bytes_deleted = bytes_reclaimed_.load(std::memory_order_relaxed);
+  out.no_room = no_room_refusals_.load(std::memory_order_relaxed);
+  return out;
+}
+
+std::vector<EvictionHint> SSDTier::EvictionOrder(size_t max_keys) {
+  if (IsReadOnlyShared()) return {};
+  std::vector<std::pair<std::string, uint64_t>> picks;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    picks = index_.EvictionOrder(max_keys);
+  }
+  std::vector<EvictionHint> out;
+  out.reserve(picks.size());
+  for (auto& [key, bytes] : picks) out.push_back(EvictionHint{std::move(key), bytes});
+  return out;
+}
+
 void SSDTier::Clear() {
-  std::lock_guard<std::mutex> lock(mu_);
-  for (auto& kv : index_.MutableSegments()) {
-    if (kv.second.fd >= 0) {
-      close(kv.second.fd);
-      kv.second.fd = -1;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto& kv : index_.MutableSegments()) {
+      if (kv.second.fd >= 0) {
+        close(kv.second.fd);
+        kv.second.fd = -1;
+      }
+      if (!IsReadOnlyShared()) {
+        std::remove(kv.second.path.c_str());
+      }
     }
+    index_.ResetAll();
     if (!IsReadOnlyShared()) {
-      std::remove(kv.second.path.c_str());
+      OpenOrCreateSegmentLocked(0);
+    } else {
+      RefreshFromDiskLocked(true);
     }
   }
-  index_.ResetAll();
-  if (!IsReadOnlyShared()) {
-    OpenOrCreateSegmentLocked(0);
-  } else {
-    RefreshFromDiskLocked(true);
-  }
+  // Callers quiesce I/O before a Clear and drop per-fd reader state themselves.
+  SweepGraveyard(/*all=*/true, /*run_hook=*/false);
 }
 
 std::vector<char> SSDTier::Read(const std::string& key) {
@@ -986,6 +1251,7 @@ std::vector<char> SSDTier::Read(const std::string& key) {
   uint32_t read_size = 0;
   uint32_t expected_crc = 0;
   bool crc_valid = true;
+  std::vector<uint64_t> pinned;  // see ReadIntoPtr
   {
     std::lock_guard<std::mutex> lock(mu_);
     auto* meta = index_.FindKey(key);
@@ -1001,8 +1267,11 @@ std::vector<char> SSDTier::Read(const std::string& key) {
     read_size = meta->size;
     expected_crc = meta->crc32;
     crc_valid = meta->crc_valid;
+    index_.PinSegment(seg->id);
+    pinned.push_back(seg->id);
     index_.TouchLRU(key);
   }
+  ScopeExit release([&] { ReleasePins(pinned); });
 
   // The returned vector is only max_align_t-aligned, so under direct I/O
   // ReadValueInto bounces it; that is the whole cost of keeping this API's
@@ -1019,6 +1288,7 @@ TierCapabilities SSDTier::Capabilities() const {
   caps.batch_write = true;
   caps.batch_read = true;
   caps.ranged_read = true;
+  caps.orders_eviction = !IsReadOnlyShared();
   return caps;
 }
 
@@ -1032,6 +1302,9 @@ std::vector<std::string> SSDTier::GetLRUCandidates(size_t max_candidates) const 
   return index_.GetLRUCandidates(max_candidates);
 }
 
+// The fd handed out is not pinned: the zero-copy reader never says when it is
+// done.  A deleted segment's fd stays open for the retired-file grace instead
+// (SetRetiredFileHook), and the bytes under it are never rewritten meanwhile.
 std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) const {
   std::lock_guard<std::mutex> lock(mu_);
   const auto* meta = index_.FindKey(key);

@@ -128,6 +128,14 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
   // capacity would diverge from owned_.  Must run before any IO.
   ssd_->DiscardLeftoverOnStartup();
 
+  // The file tier deletes a segment once nothing in it is live.  A GDS reader
+  // holds a FileRef (fd + offset) with no lease, so keep a deleted segment's
+  // fd open as long as a staged read may lag its resolve, and drop the cached
+  // handle before the fd closes and its number can be reused.
+  if (gds_enabled_) {
+    ssd_->SetRetiredFileHook([this](int fd) { DropGdsHandle(fd); }, cfg_.read_lease_ttl);
+  }
+
   initialized_ = true;
   StartReaper();
   MORI_UMBP_INFO(
@@ -146,7 +154,9 @@ void SsdBackend::Shutdown() {
   buffer_ref_ = TransferRef{};
   buffer_desc_.clear();
 
-  // Release the GDS file handles obtained lazily during resolves.
+  // Release the GDS file handles obtained lazily during resolves.  Unhook
+  // first: the tier outlives this call and must not call back into it.
+  if (ssd_) ssd_->SetRetiredFileHook(nullptr, std::chrono::milliseconds{0});
   {
     std::lock_guard<std::mutex> lock(gds_mutex_);
     if (registrar_ != nullptr) {
@@ -718,6 +728,8 @@ std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys)
   return results;
 }
 
+bool SsdBackend::OwnsEvictionOrder() const { return ssd_ != nullptr && ssd_->OrdersEviction(); }
+
 std::vector<EvictionOffer> SsdBackend::EvictionCandidates(size_t max_count) {
   if (ssd_ == nullptr || max_count == 0) return {};
   auto candidates = ssd_->EvictionCandidates(max_count);
@@ -760,6 +772,16 @@ void* SsdBackend::GdsHandleForFd(int fd) {
   }
   gds_handles_[fd] = handle;
   return handle;
+}
+
+void SsdBackend::DropGdsHandle(int fd) {
+  std::lock_guard<std::mutex> lock(gds_mutex_);
+  auto it = gds_handles_.find(fd);
+  if (it == gds_handles_.end()) return;
+  if (it->second != nullptr && registrar_ != nullptr) {
+    registrar_->Deregister(TransferRef::File(fd, 0, 0, it->second));
+  }
+  gds_handles_.erase(it);
 }
 
 // ---------------------------------------------------------------------------
@@ -891,6 +913,15 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   // so this stays a true measure of device traffic.
   bytes("device_write", ssd_->CopyBytes());
   bytes("device_read", ssd_->ReadBytes());
+
+  // Disk comes back a whole segment file at a time; capacity used counts dead
+  // records too, so live_bytes says how much of it still holds keys.
+  const TierSpaceStats space = ssd_->SpaceStats();
+  event("segment_deleted", space.files_deleted);
+  bytes("segment_deleted", space.bytes_deleted);
+  event("segment_no_room", space.no_room);
+  state("live_bytes", space.live_bytes);
+  state("segment_files", space.files);
 
   state("staging_pages_in_use", staging_pages_in_use_.load(std::memory_order_relaxed));
   state("staging_pages_total", cfg_.staging_pages);

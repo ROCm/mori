@@ -1234,15 +1234,23 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
   // The master's ranking whenever an answer is at hand, asked again for what
   // the budget still needs as each one runs out; the medium's own order
   // covers the rest meanwhile.  A pass can span a whole band, far more keys
-  // than one answer carries.
-  auto ranked = RankedCandidates(backend_id, tier, budget, kRankedCandidatesWait);
+  // than one answer carries.  A medium whose own order is the only one that
+  // frees space (the file SSD tier: a whole segment at a time) skips the
+  // master: its per-key recency would leave every segment partly live.
+  const bool own_order = backend->OwnsEvictionOrder();
+  using Ranking = std::optional<std::vector<EvictionOffer>>;
+  const auto ranked_for = [&](uint64_t bytes, std::chrono::milliseconds wait) -> Ranking {
+    if (own_order) return std::nullopt;
+    return RankedCandidates(backend_id, tier, bytes, wait);
+  };
+  auto ranked = ranked_for(budget, kRankedCandidatesWait);
   size_t ranked_next = 0;
   size_t master_keys = 0;
   size_t window = kLocalEvictBatch;
   while (covered < budget && !drained()) {
     if (stopping()) break;
     if (!ranked.has_value() || ranked_next >= ranked->size()) {
-      ranked = RankedCandidates(backend_id, tier, budget - covered, std::chrono::milliseconds(0));
+      ranked = ranked_for(budget - covered, std::chrono::milliseconds(0));
       ranked_next = 0;
     }
     if (ranked.has_value() && ranked_next < ranked->size()) {
