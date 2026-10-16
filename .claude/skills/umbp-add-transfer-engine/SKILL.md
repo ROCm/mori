@@ -4,7 +4,7 @@ description: >-
   Add a new byte-moving path to UMBP's distributed mode as a TransferEngine
   (GPU copy, a second RDMA transport, a file/GDS engine, a fake for tests).
   Covers CanHandle pair-dispatch and why engines must be disjoint, the
-  Plan/Submit/Wait split, bounce buffers, PeerDirectory for transports that need
+  plan-builder/Submit/Wait split, bounce buffers, PeerDirectory for transports that need
   a handshake, and how to extend TransferRef for a non-memory endpoint. Use when
   the user wants to add or debug a transfer engine in src/umbp/distributed/
   transfer, mentions TransferEngine, CanHandle, TransferRef, MoriIoEngine,
@@ -106,8 +106,9 @@ class TransferEngine : public MemoryRegistrar {
   virtual TransferRef RegisterMemory(void*, size_t, MemoryLocationType, int device) = 0;
   virtual void Deregister(const TransferRef&) = 0;
   virtual bool CanHandle(const TransferRef& src, const TransferRef& dst) const = 0;
-  virtual TransferPlanSet Plan(const std::vector<TransferItem>&) const = 0;
+  virtual std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const = 0;
   virtual std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan>) = 0;
+  TransferPlanSet Plan(const std::vector<TransferItem>&) const;  // your builder over a vector
   bool Transfer(const std::vector<TransferItem>&, std::vector<size_t>* failed_tags);
 };
 ```
@@ -127,42 +128,50 @@ void Deregister(const TransferRef&) override {}
 merges the handles, so a buffer can be a raw pointer and an MR at once. Your
 engine seeing a buffer it cannot pin is normal, not an error.
 
-### `Plan` — pure, and virtual for a reason
+### Planning — `CreatePlanBuilder`, the one hook
 
-`Plan` must issue no IO and change no engine state, so a caller may plan on one
-thread and submit on another. It is virtual rather than a base helper because
-grouping is engine-specific: pair-grouping is an RDMA optimization (it cuts CQE
-and post count), a memcpy engine gains little, and a file engine would rather
-group by file and merge adjacent offset ranges.
+An engine plans through a `TransferPlanBuilder` fed one item at a time, so a
+ranged get never materializes its ~15k items (720 B each) as a vector.
+`Plan()` is not virtual: it is your builder run over a vector, so batch and
+incremental planning cannot differ. Grouping is still yours: pair-grouping is
+an RDMA optimization (it cuts CQE and post count), a memcpy engine gains little,
+and a file engine would rather group by file and merge adjacent offset ranges.
 
-Two things every `Plan` must do:
+**The rules every builder keeps** (documented on `TransferPlanBuilder`; callers
+rely on them):
 
-1. **Reject what you cannot carry**, into `rejected_tags`. This is not an error
-   path the caller can ignore — those items were dropped and their keys must be
-   failed. `PoolClient` logs them as "transfer unplannable (no engine claimed the
-   endpoints)".
+1. `Add()` issues no IO and changes no engine state, so a caller may plan on one
+   thread and submit on another.
+2. An empty item (size 0) is dropped: no plan, no rejection.
+3. **Reject what you cannot carry** into `rejected_tags`: a pair your
+   `CanHandle()` refuses, or a range past the end of a buffer you can check.
+   This is not an error path the caller can ignore — those keys are failed, and
+   `PoolClient` logs them as "transfer unplannable". Bounds-check once, at
+   planning, not per copy: on a GPU endpoint an overrun is not a segfault but
+   silent corruption of whatever else is in the pool.
+4. Every other item lands in one plan whose `tags` name it, de-duplicated per run
+   of its segments, so a failed plan maps back to the keys that rode in it.
+5. Plans come out in a deterministic order (first item first).
 
-2. **Bounds-check once, here**, not per copy:
+**How to write one** — `transfer/plan_builder.h` has the shared pieces:
 
-   ```cpp
-   if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
-       item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
-     out.rejected_tags.push_back(item.tag);
-     continue;
-   }
-   ```
-
-   Written that way to avoid overflow. A page index that does not fit its buffer
-   is a backend bookkeeping bug, and the key must be failed rather than copied
-   past the end — on a GPU endpoint an overrun is not a segfault but silent
-   corruption of whatever else is in the pool.
+- **One plan per (src, dst) buffer pair** (a memcpy-like engine): don't write a
+  builder at all. `MakePairPlanBuilder(*this, append)` admits by your
+  `CanHandle()` plus `ItemInBounds()`, groups by pair (with a fast path for
+  consecutive items of one pair), and calls `append(plan, item)` for the
+  segments. `LocalCopyEngine` passes `AppendSegment`; `HbmCopyEngine` passes one
+  that splits at host registration pieces.
+- **Anything else**: write a small `TransferPlanBuilder` (`Add` / `Finish`)
+  using `ItemInBounds` / `RangeFits`, `PlanBetween` and `AppendSegment` (merge
+  adjacent segments, optional cap — MORI-IO caps at `ibv_sge.length` — and tag
+  de-duplication). `GdsEngine` (one plan per item) and `MoriIoEngine` (groups by
+  memory ids, bounce pool) are the examples.
+- Plan as items arrive. Buffer them only if you genuinely must see the whole
+  batch first (e.g. sorting by file offset), and say why in a comment.
 
 Coalescing adjacent segments is worth it if your per-call cost is non-trivial:
 `HbmCopyEngine` coalesces because each `hipMemcpy` carries launch overhead a
 `memcpy` does not.
-
-`tag` is the caller's per-entry index. It must survive grouping so a failed plan
-maps back to the keys that rode in it; de-duplicate as you append.
 
 ### `Submit` — and the one blocking exception
 
@@ -284,7 +293,9 @@ Split the suite the way the layer splits:
 the gap your engine fills (assert the *other* engines refuse the pair);
 disjointness; composite routing via `SelectEngine`, which is exposed for exactly
 this; coalescing; out-of-bounds rejection; and rejection of pairs you cannot
-carry.
+carry. Run `ExpectPlanContract(items, planned)` (in `test_transfer_engine.cpp`)
+on your planning tests: every non-empty item rejected or named by a plan, and
+the accepted bytes planned exactly once.
 
 ```cpp
 TransferEngine* chosen = composite.SelectEngine(host_ref, gpu_ref);
@@ -301,8 +312,9 @@ not coprime with the page count is not a permutation and silently leaves pages
 uncopied — `(i * 2) % 4` gives `{0,2,0,2}`. That failure looks like an engine
 bug and is not.
 
-`MoriIoEngine` is not unit-testable (needs a real fabric); it is covered
-end-to-end by `test_cross_node_smoke`, which is labeled `integration`.
+`MoriIoEngine`'s transfers need a real fabric and are covered end-to-end by
+`test_cross_node_smoke` (labeled `integration`); its planner needs nothing and
+is unit-tested on an engine that is never `Init()`ed.
 
 ## Build and run
 
@@ -319,6 +331,7 @@ docker exec <mori-container> bash -c "cd <repo> && ninja -C build && \
 - `transfer/transfer_engine.h` — `TransferRef`, `MemoryRegistrar`,
   `PeerDirectory`, `TransferItem/Plan/Handle`, `TransferEngine`; also records
   what was deliberately left out and why
+- `transfer/plan_builder.h` — `PairPlanBuilder` and the planning helpers
 - `transfer/local_copy_engine.{h,cpp}` — the simplest complete engine
 - `transfer/hbm_copy_engine.{h,cpp}` — a second engine closing a real gap
 - `transfer/mori_io_engine.{h,cpp}` — RDMA, bounce buffers, `PeerDirectory`

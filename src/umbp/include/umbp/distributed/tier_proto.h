@@ -21,6 +21,38 @@
 // SOFTWARE.
 #pragma once
 
-// Backward-compatible source-tree include. New shared users include the common
-// header directly.
-#include "umbp/common/host_registration.h"
+// Host TierType <-> wire ::umbp::TierType.  Any value outside the known media
+// maps to UNKNOWN in both directions.
+
+#include "umbp.pb.h"
+#include "umbp/distributed/types.h"
+
+namespace mori::umbp {
+
+inline ::umbp::TierType TierToProto(TierType tier) {
+  switch (tier) {
+    case TierType::HBM:
+      return ::umbp::TIER_HBM;
+    case TierType::DRAM:
+      return ::umbp::TIER_DRAM;
+    case TierType::SSD:
+      return ::umbp::TIER_SSD;
+    default:
+      return ::umbp::TIER_UNKNOWN;
+  }
+}
+
+inline TierType TierFromProto(::umbp::TierType tier) {
+  switch (tier) {
+    case ::umbp::TIER_HBM:
+      return TierType::HBM;
+    case ::umbp::TIER_DRAM:
+      return TierType::DRAM;
+    case ::umbp::TIER_SSD:
+      return TierType::SSD;
+    default:
+      return TierType::UNKNOWN;
+  }
+}
+
+}  // namespace mori::umbp

@@ -239,56 +239,6 @@ std::unique_ptr<TransferPlanBuilder> CompositeTransferEngine::CreatePlanBuilder(
   return std::make_unique<PlanBuilder>(*this, expected_items);
 }
 
-TransferPlanSet CompositeTransferEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  if (items.empty()) return out;
-
-  auto adopt = [&out](TransferPlanSet sub, TransferEngine* engine) {
-    for (auto& plan : sub.plans) {
-      plan.engine = engine;
-      out.plans.push_back(std::move(plan));
-    }
-    out.rejected_tags.insert(out.rejected_tags.end(), sub.rejected_tags.begin(),
-                             sub.rejected_tags.end());
-  };
-
-  // Fast path: every item goes to the same engine, so delegate the caller's own
-  // vector.  Worth a separate path because a TransferItem holds two
-  // TransferRefs and each carries a MemoryDesc with three std::strings —
-  // partitioning by copy would allocate per page on the hot path, and in
-  // practice a batch is uniform (one peer group is all-remote, a self-target
-  // batch is all-local).
-  TransferEngine* first = SelectEngine(items.front().src, items.front().dst);
-  if (first != nullptr) {
-    bool uniform = true;
-    for (size_t i = 1; i < items.size() && uniform; ++i) {
-      uniform = SelectEngine(items[i].src, items[i].dst) == first;
-    }
-    if (uniform) {
-      adopt(first->Plan(items), first);
-      return out;
-    }
-  }
-
-  // Mixed batch: partition, then plan per engine in ONE call each — grouping is
-  // what Plan is for, and planning item-by-item would defeat it.
-  std::unordered_map<TransferEngine*, std::vector<TransferItem>> by_engine;
-  for (const auto& item : items) {
-    TransferEngine* engine = SelectEngine(item.src, item.dst);
-    if (engine == nullptr) {
-      out.rejected_tags.push_back(item.tag);
-      rejected_items_.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-    by_engine[engine].push_back(item);
-  }
-
-  for (auto& [engine, engine_items] : by_engine) {
-    adopt(engine->Plan(engine_items), engine);
-  }
-  return out;
-}
-
 size_t CompositeTransferEngine::IndexOf(const TransferEngine* engine) const {
   for (size_t i = 0; i < engines_.size(); ++i) {
     if (engines_[i].get() == engine) return i;
