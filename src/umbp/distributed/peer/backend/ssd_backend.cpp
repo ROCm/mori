@@ -82,6 +82,14 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
     gds_enabled_ = (v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON");
   }
 
+  // Extent staging (D1) wherever the tier reads ranges; UMBP_SSD_EXTENT_STAGING=0 disables it.
+  extent_staging_ = ssd_->SupportsRangedRead();
+  if (const char* env = std::getenv("UMBP_SSD_EXTENT_STAGING")) {
+    const std::string v(env);
+    if (v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "OFF")
+      extent_staging_ = false;
+  }
+
   // ONE buffer covering every staging page, so each page is contiguous and a
   // single registration serves the arena.  Host memory deliberately: this is
   // what the backend publishes, and publishing ordinary registered DRAM is the
@@ -140,9 +148,9 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
   StartReaper();
   MORI_UMBP_INFO(
       "[SsdBackend] Init staging_pages={} page_size={} arena_bytes={} hugepages={} "
-      "single_flight={}",
+      "single_flight={} extent_staging={}",
       usable_pages, cfg_.page_size, staging_size_, cfg_.staging_use_hugepages,
-      cfg_.ssd.ssd.single_flight_reads);
+      cfg_.ssd.ssd.single_flight_reads, extent_staging_);
   return true;
 }
 
@@ -285,6 +293,8 @@ void SsdBackend::ClearLocal() {
     pending_.clear();
     for (auto& [key, lease] : read_leases_) ReleaseStagingSpanLocked(lease.span);
     read_leases_.clear();
+    for (auto& stage : extent_stages_) ReleaseStagingSpanLocked(stage.span);
+    extent_stages_.clear();
     for (auto& [key, lease] : migration_reads_) {
       ReleaseStagingSpanLocked(lease.span);
       migration_keys.push_back(key);
@@ -531,29 +541,40 @@ std::vector<bool> SsdBackend::BatchAbort(const std::vector<uint64_t>& slot_ids) 
 
 std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::string>& keys,
                                                     bool include_descs, bool allow_file_refs,
-                                                    ResolveReader reader) {
+                                                    ResolveReader reader,
+                                                    const std::vector<ObjectExtent>* extents) {
   const bool local = reader == ResolveReader::kLocal;
   std::vector<ResolvedEntry> results(keys.size());
   if (keys.empty()) return results;
   const auto now = std::chrono::steady_clock::now();
+  // Stage only the bytes an in-process reader names (design-ssd-ranged-io.md D1).
+  // A remote reader's extent does not travel on the wire (D2), so it stages whole.
+  const bool use_extents =
+      extent_staging_ && extents != nullptr && extents->size() == keys.size() && local;
 
   // Fills `out` from a lease the caller has already located.  Caller holds
   // mutex_.  Factored out because the lease-hit and read-completed paths publish
   // byte-identical results and drifting between them would be a silent bug.
-  auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
-    if (local) out.hold = lease.hold;
+  // `window` is the object bytes the span holds when it is not all of them.
+  auto publish_span = [&](ResolvedEntry& out, StagingSpan span, uint64_t size,
+                          const std::shared_ptr<const void>& hold, ObjectExtent window) {
+    if (local) out.hold = hold;
     out.outcome = ResolveOutcome::kFound;
     out.found = true;
-    out.pages.reserve(lease.span.page_count);
-    for (uint32_t page = lease.span.first_page;
-         page < lease.span.first_page + lease.span.page_count; ++page) {
+    out.pages.reserve(span.page_count);
+    for (uint32_t page = span.first_page; page < span.first_page + span.page_count; ++page) {
       out.pages.push_back(PageLocation{kStagingBufferIndex, page});
     }
-    out.size = lease.size;
+    out.size = size;
     out.page_size = cfg_.page_size;
+    out.covered_offset = window.offset;
+    out.covered_size = window.length;
     if (include_descs && !buffer_desc_.empty()) {
       out.descs = {BufferMemoryDescBytes{kStagingBufferIndex, buffer_desc_}};
     }
+  };
+  auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
+    publish_span(out, lease.span, lease.size, lease.hold, ObjectExtent{});
   };
 
   // Phase 1 (ONE lock): serve every key that is already staged, size every
@@ -561,28 +582,23 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // partial resolve whole, so its leases would pin the subset while retries
   // compete for the rest: it gets every span or, on transient pressure, kBusy
   // with no new reservation kept.  A local reader copies its part first.
-  std::vector<size_t> todo;                        // keys needing a device read
-  std::vector<uint32_t> page_counts;               // parallel to todo
-  std::vector<StagingSpan> spans;                  // parallel to todo
-  std::vector<void*> dsts;                         // parallel to todo
-  std::vector<size_t> caps;                        // parallel to todo
-  std::vector<std::string> read_keys;              // parallel to todo
-  std::vector<std::vector<size_t>> result_groups;  // duplicate input indices per device read
-  std::unordered_map<std::string, size_t> scheduled;
+  std::vector<size_t> todo;                           // keys needing a device read
+  std::vector<uint32_t> page_counts;                  // parallel to todo
+  std::vector<ObjectExtent> read_extents;             // parallel to todo; length 0 = whole
+  std::vector<StagingSpan> spans;                     // parallel to todo
+  std::vector<void*> dsts;                            // parallel to todo
+  std::vector<size_t> caps;                           // parallel to todo
+  std::vector<std::string> read_keys;                 // parallel to todo
+  std::vector<std::vector<size_t>> result_groups;     // duplicate input indices per device read
+  std::unordered_map<std::string, size_t> scheduled;  // key (+ window) -> its todo slot
   todo.reserve(keys.size());
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = read_leases_.find(keys[i]);
-      if (it != read_leases_.end()) {
+      if (it != read_leases_.end()) {  // a whole-object lease serves any extent too
         if (!local) it->second.expires_at = now + cfg_.read_lease_ttl;
         publish(results[i], it->second);
-        continue;
-      }
-
-      auto duplicate = scheduled.find(keys[i]);
-      if (duplicate != scheduled.end()) {
-        result_groups[duplicate->second].push_back(i);
         continue;
       }
 
@@ -611,18 +627,45 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       }
 
       const uint64_t size = ssd_->SizeOf(keys[i]);
-      const uint32_t page_count = SizeToPages(size, cfg_.page_size);
       if (size == 0) continue;
+
+      // The extent widened to the 4 KiB record alignment (so O_DIRECT lands in
+      // the page-aligned span) and clamped to the object.  One outside the
+      // object, or one that widens to all of it, is a whole read.
+      ObjectExtent window;
+      if (use_extents && (*extents)[i].length != 0) {
+        const ObjectExtent& want = (*extents)[i];
+        if (want.offset < size && want.length <= size - want.offset) {
+          const uint64_t lo = want.offset & ~(kExtentAlign - 1);
+          const uint64_t hi = std::min<uint64_t>(
+              size, (want.offset + want.length + kExtentAlign - 1) & ~(kExtentAlign - 1));
+          if (hi - lo < size) window = ObjectExtent{lo, hi - lo};
+        }
+      }
+      // Duplicates share a read only when they want the same bytes.
+      std::string schedule_key = keys[i];
+      if (window.length != 0) {
+        schedule_key += '\0' + std::to_string(window.offset) + ':' + std::to_string(window.length);
+      }
+      auto duplicate = scheduled.find(schedule_key);
+      if (duplicate != scheduled.end()) {
+        result_groups[duplicate->second].push_back(i);
+        continue;
+      }
+
+      const uint64_t read_size = window.length != 0 ? window.length : size;
+      const uint32_t page_count = SizeToPages(read_size, cfg_.page_size);
       if (page_count == 0 || page_count > staging_page_used_.size()) {
         results[i].outcome = ResolveOutcome::kFailed;
         MORI_UMBP_ERROR("[SsdBackend] Resolve: key '{}' size {} cannot fit staging arena", keys[i],
-                        size);
+                        read_size);
         continue;
       }
       todo.push_back(i);
       page_counts.push_back(page_count);
+      read_extents.push_back(window);
       read_keys.push_back(keys[i]);
-      scheduled.emplace(keys[i], todo.size() - 1);
+      scheduled.emplace(std::move(schedule_key), todo.size() - 1);
       result_groups.push_back({i});
     }
 
@@ -648,6 +691,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         for (size_t index : result_groups[j]) results[index].outcome = ResolveOutcome::kBusy;
       }
       todo.resize(staged);
+      read_extents.resize(staged);
       read_keys.resize(staged);
       result_groups.resize(staged);
     } else {
@@ -689,7 +733,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // this call were collapsed above; PeerSsdManager additionally coalesces reads
   // racing across calls.  It marks each key in-flight for the window, so
   // eviction already skips them.
-  const std::vector<SsdReadOutcome> outcomes = ssd_->PrepareReadBatch(read_keys, dsts, caps);
+  const std::vector<SsdReadOutcome> outcomes =
+      ssd_->PrepareReadBatch(read_keys, dsts, caps, &read_extents);
 
   // Phase 3 (ONE lock): install a lease per key that landed, hand back the pages
   // of the ones that did not.
@@ -705,6 +750,18 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         for (size_t result_index : result_groups[j]) {
           results[result_index].outcome = outcome;
         }
+        continue;
+      }
+      if (read_extents[j].length != 0) {
+        // Private to its readers and freed with their holds; never a read lease,
+        // which promises the WHOLE object to the next resolve of the key.
+        extent_stages_.push_back(ExtentStage{spans[j], read_extents[j], std::make_shared<char>()});
+        for (size_t result_index : result_groups[j]) {
+          publish_span(results[result_index], spans[j], outcomes[j].size,
+                       extent_stages_.back().hold, read_extents[j]);
+        }
+        extent_stages_total_.fetch_add(1, std::memory_order_relaxed);
+        extent_stage_bytes_.fetch_add(read_extents[j].length, std::memory_order_relaxed);
         continue;
       }
       // A concurrent Resolve of the same key may have staged it while this read
@@ -964,6 +1021,16 @@ size_t SsdBackend::ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point
       ++it;
     }
   }
+  for (size_t k = 0; k < extent_stages_.size();) {
+    if (extent_stages_[k].hold.use_count() <= 1) {
+      ReleaseStagingSpanLocked(extent_stages_[k].span);
+      extent_stages_[k] = std::move(extent_stages_.back());
+      extent_stages_.pop_back();
+      ++reclaimed;
+    } else {
+      ++k;
+    }
+  }
   staging_expired_reclaims_.fetch_add(reclaimed, std::memory_order_relaxed);
   return reclaimed;
 }
@@ -1032,6 +1099,9 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   // was full — indistinguishable from a real miss anywhere else.
   event("staging_slot_full_reject", slot_full_rejects_.load(std::memory_order_relaxed));
   event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
+  // Reads that staged only an extent (D1), and their bytes.
+  event("extent_stage", extent_stages_total_.load(std::memory_order_relaxed));
+  bytes("extent_stage", extent_stage_bytes_.load(std::memory_order_relaxed));
 
   // Migrations: in place (file <-> DRAM through the file engine) or staged.
   event("migration_in_place", migrations_in_place_.load(std::memory_order_relaxed));
