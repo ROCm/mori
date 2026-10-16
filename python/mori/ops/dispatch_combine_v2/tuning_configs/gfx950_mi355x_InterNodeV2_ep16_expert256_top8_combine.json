@@ -23,8 +23,7 @@
       "avg_latency_us": 108.72,
       "bandwidth_metric": "grand_mean",
       "zero_copy": false,
-      "quant_type": "none",
-      "note": "Exact experts_per_rank=16 override; the same BF16 Combine row serves BF16 and FP8 dispatch. Versus original Combine96/64/8, BF16 C107.93->106.57us, pair225.23->223.53us (-0.75%); FP8 C108.72->107.27us, pair199.10->196.77us (-1.17%). All three ordinary ABA groups improved for each dtype; this is a small mean improvement. Lookup uses live-token ceiling, not declared capacity; different capacity/QP/CQ performance is unmeasured."
+      "quant_type": "none"
     },
     {
       "dtype": "bf16",
@@ -58,8 +57,7 @@
       "avg_latency_us": 170.53,
       "bandwidth_metric": "grand_mean",
       "zero_copy": false,
-      "quant_type": "none",
-      "note": "Measured at experts_per_rank=16 and shared by BF16 and FP8 dispatch; supersedes the original same-shape rule. BF16 C177.58->171.97us, pair345.32->339.40us (-1.71%); three ABA pair differences -6.40/-6.15/-5.20us. FP8 full means C185.68->174.53us, pair304.72->292.70us (-3.94%), with spikes retained; per-group pair differences -22.30/-10.10/-3.65us. FP8 percent is sensitive to spikes and does not establish their relative frequency or host-wall improvement. Head-to-head median pair improvements were 6.6-6.9us. Performance was measured at capacity=live tokens with QP2 and CCQE off; the key does not restrict capacity/QP/CQ."
+      "quant_type": "none"
     },
     {
       "dtype": "bf16",
@@ -76,8 +74,7 @@
       "avg_latency_us": 275.58,
       "bandwidth_metric": "grand_mean",
       "zero_copy": false,
-      "quant_type": "none",
-      "note": "Geometry from the 2026-09-14 sweep, verified in the archived benchmark report (stage v2opt4): combine 296.71 -> 273.30us, the whole -4.6% on the pair (538.79 -> 514.26us). Independently confirmed by the fp8 campaign, whose sweep picked 64/42/8 and tied with this (+0.6us, 0.14%)."
+      "quant_type": "none"
     },
     {
       "dtype": "bf16",
@@ -128,8 +125,7 @@
       "avg_latency_us": 1592.91,
       "bandwidth_metric": "grand_mean",
       "zero_copy": false,
-      "quant_type": "none",
-      "note": "Geometry from the 2026-09-14 sweep, verified in the archived benchmark report (stage v2opt4): combine 1657.58 -> 1586.11us, pair total 3326.26 -> 3138.03us, -5.7%. The fp8 campaign's own sweep landed on this same geometry."
+      "quant_type": "none"
     }
   ]
 }
