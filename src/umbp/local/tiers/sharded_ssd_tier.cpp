@@ -157,6 +157,10 @@ void ShardedSsdTier::ReleaseLocked(int shard, size_t size) {
   used_hint_[shard] = used_hint_[shard] > size ? used_hint_[shard] - size : 0;
 }
 
+void ShardedSsdTier::RefreshHintsLocked() {
+  for (size_t i = 0; i < shards_.size(); ++i) used_hint_[i] = shards_[i]->Capacity().first;
+}
+
 int ShardedSsdTier::ShardOf(const std::string& key) const {
   std::shared_lock<std::shared_mutex> lock(map_mu_);
   return LookupLocked(key);
@@ -177,6 +181,7 @@ bool ShardedSsdTier::Write(const std::string& key, const void* data, size_t size
     shard = LookupLocked(key);
     is_new = shard < 0;
     if (is_new) {
+      RefreshHintsLocked();
       shard = PickShardLocked(size);
       if (shard < 0) {
         MORI_UMBP_WARN("[ShardedSsdTier] Write key={} size={}: no shard has room", key, size);
@@ -251,8 +256,11 @@ TierCapabilities ShardedSsdTier::Capabilities() const {
   caps.batch_write = true;
   caps.batch_read = true;
   caps.zero_copy_read = true;
+  caps.orders_eviction = true;
   for (const auto& s : shards_) {
-    if (!s->Capabilities().zero_copy_read) caps.zero_copy_read = false;
+    const auto shard_caps = s->Capabilities();
+    if (!shard_caps.zero_copy_read) caps.zero_copy_read = false;
+    if (!shard_caps.orders_eviction) caps.orders_eviction = false;
   }
   return caps;
 }
@@ -295,6 +303,44 @@ std::vector<std::string> ShardedSsdTier::GetLRUCandidates(size_t max_candidates)
   return out;
 }
 
+std::vector<EvictionHint> ShardedSsdTier::EvictionOrder(size_t max_keys) {
+  std::vector<EvictionHint> out;
+  if (max_keys == 0) return out;
+  std::vector<std::pair<double, size_t>> fullness;  // (used / total, shard)
+  fullness.reserve(shards_.size());
+  for (size_t i = 0; i < shards_.size(); ++i) {
+    const auto [used, total] = shards_[i]->Capacity();
+    fullness.emplace_back(total > 0 ? static_cast<double>(used) / static_cast<double>(total) : 0.0,
+                          i);
+  }
+  std::stable_sort(fullness.begin(), fullness.end(),
+                   [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& [ratio, shard] : fullness) {
+    if (out.size() >= max_keys) break;
+    auto hints = shards_[shard]->EvictionOrder(max_keys - out.size());
+    for (auto& hint : hints) out.push_back(std::move(hint));
+  }
+  return out;
+}
+
+void ShardedSsdTier::SetRetiredFileHook(std::function<void(int fd)> on_close,
+                                        std::chrono::milliseconds grace) {
+  for (auto& s : shards_) s->SetRetiredFileHook(on_close, grace);
+}
+
+TierSpaceStats ShardedSsdTier::SpaceStats() const {
+  TierSpaceStats sum;
+  for (const auto& s : shards_) {
+    const TierSpaceStats one = s->SpaceStats();
+    sum.live_bytes += one.live_bytes;
+    sum.files += one.files;
+    sum.files_deleted += one.files_deleted;
+    sum.bytes_deleted += one.bytes_deleted;
+    sum.no_room += one.no_room;
+  }
+  return sum;
+}
+
 std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) const {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
@@ -324,6 +370,7 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   std::vector<char> is_new(keys.size(), 0);
   {
     std::unique_lock<std::shared_mutex> lock(map_mu_);
+    RefreshHintsLocked();
     for (size_t i = 0; i < keys.size(); ++i) {
       int shard = LookupLocked(keys[i]);
       if (shard < 0) {

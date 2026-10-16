@@ -22,9 +22,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -54,7 +56,8 @@ struct SsdReadOutcome {
 // Peer-side owner of the local SSD tier: one SSD TierBackend + the
 // key->SSD-location map, capacity, the owned-location event outbox, the
 // read-prepare path, and Evict().  Reached through SsdBackend.  It never
-// decides to evict; it only offers its LRU as candidates.
+// decides to evict; it only offers candidates, in the tier's order when the
+// tier keeps one and in its own LRU otherwise.
 //
 // It reuses ONLY the low-level TierBackend (SSDTier).  Peer DRAM is owned by
 // PageBackend, and a second thing here that also held DRAM and demoted between
@@ -122,7 +125,19 @@ class PeerSsdManager {
   bool Evict(const std::string& key);
 
   // Coldest first, skipping keys being read, pinned or evicted.  Frees nothing.
+  // When the tier orders its own eviction (OrdersEviction()), its order is used
+  // and each offer carries the bytes the tier credits it with; otherwise the
+  // order is this class's LRU and an offer carries the key's size.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count);
+
+  // True when only the tier's own order frees space (the segment-log SSD tier
+  // returns disk a whole segment at a time), so no other ranking should be
+  // used to pick its victims.
+  bool OrdersEviction() const;
+
+  // Forwards to the tier: see TierBackend::SetRetiredFileHook.
+  void SetRetiredFileHook(std::function<void(int fd)> on_close, std::chrono::milliseconds grace);
+  TierSpaceStats SpaceStats() const { return backend_ ? backend_->SpaceStats() : TierSpaceStats{}; }
 
   // Distributed Clear: drop the logical owned-location map + undrained events,
   // then delete the physical SSD bytes (a user Clear means the cache is no

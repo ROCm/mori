@@ -628,11 +628,16 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   ASSERT_TRUE(Put(backend, "b", Payload(2048, 2)));
   ASSERT_TRUE(Put(backend, "c", Payload(1024, 3)));
 
+  // The file tier frees disk a segment at a time, so it owns the order and an
+  // offer carries the key's share of its segment on disk: here, all live, the
+  // padded record (a 4 KiB prefix plus the value padded to 4 KiB).
+  EXPECT_TRUE(backend->OwnsEvictionOrder());
+  constexpr uint64_t kRecord = 8 * 1024;
   auto offers = backend->EvictionCandidates(10);
   ASSERT_EQ(offers.size(), 3u);
-  EXPECT_EQ(offers[0], (EvictionOffer{"a", 1024}));
-  EXPECT_EQ(offers[1], (EvictionOffer{"b", 2048}));
-  EXPECT_EQ(offers[2], (EvictionOffer{"c", 1024}));
+  EXPECT_EQ(offers[0], (EvictionOffer{"a", kRecord}));
+  EXPECT_EQ(offers[1], (EvictionOffer{"b", kRecord}));
+  EXPECT_EQ(offers[2], (EvictionOffer{"c", kRecord}));
 
   // A staged read's lease makes "b" unevictable, so it is not offered.
   ASSERT_TRUE(backend->BatchResolve({"b"}, false)[0].found);

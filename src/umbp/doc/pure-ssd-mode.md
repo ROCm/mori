@@ -203,6 +203,7 @@ for HiCache's L3 path to initialize, but `random` routing skips any node that
 | Puts fail on an SSD node | The staging arena is exhausted, so `BatchAllocate` had no page to hand out. Check `mori_umbp_backend_medium_events_total{tier="SSD", event="staging_slot_full_reject"}` and raise `ssd_staging_buffer_slots` |
 | Node comes up with an empty cache after an upgrade | On-disk record format changed; older records are dropped on version mismatch |
 | Tier fills far earlier than expected | Capacity is charged in padded bytes — small values pay up to 16× |
+| SSD used is well above the live data | Used counts dead records until their segment file empties. Compare `mori_umbp_backend_medium_state{state="live_bytes"}` with it; `medium_events_total{event="segment_deleted"}` should grow while the tier evicts |
 | Startup rejects `medium: SSD` | `ssd.capacity_bytes` or `ssd.segment_size_bytes` is 0 — the selected medium must be sized |
 | A config key seems to do nothing | `extra_config` is an allow-list; unknown or wrong-mode keys are ignored with a warning. Grep the engine log for `UMBPStore:` |
 | Reads keep missing after killing/relaunching a node several times | Master registry doesn't expire dead clients — stale entries stay capacity-weighted and `random` can still pick them. Restart `umbp_master` along with every engine/worker whenever node topology (count, capacity, drives) changes |

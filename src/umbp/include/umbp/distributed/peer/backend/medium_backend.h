@@ -298,6 +298,12 @@ class MediumBackend : public MetricSource {
   // frees.  Frees nothing; Evict() re-checks.  Empty if no order is kept.
   virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
 
+  // True when EvictionCandidates() is the only order that frees this medium's
+  // space, so local eviction must not substitute the master's ranking.  The
+  // file SSD tier is one: it frees disk a whole segment file at a time, and
+  // keys picked by recency alone can leave every segment partly live.
+  virtual bool OwnsEvictionOrder() const { return false; }
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or
