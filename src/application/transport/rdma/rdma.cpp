@@ -44,6 +44,7 @@
 #include "mori/hip_compat.hpp"
 #include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
+#include "src/application/transport/rdma/kfd_pin_accounting.hpp"
 
 // mori::core::WcStatus is a device-safe mirror of ibverbs' ibv_wc_status so device
 // TUs need not include <infiniband/verbs.h>. This host TU sees both — guard the
@@ -420,10 +421,12 @@ RdmaDeviceContext::RdmaDeviceContext(RdmaDevice* device, ibv_pd* inPd) : device(
 }
 
 RdmaDeviceContext::~RdmaDeviceContext() {
+  KfdPinAccounting& pins = KfdPinAccounting::Instance();
   for (auto& it : mrPool) {
-    ibv_dereg_mr(it.second);
+    pins.Deregister(it.second);
   }
   mrPool.clear();
+  pins.ReleasePd(pd);
 
   if (srq != nullptr) ibv_destroy_srq(srq);
   ibv_dealloc_pd(pd);
@@ -433,18 +436,39 @@ RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
 
 ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaultContext; }
 
+namespace {
+
+// dma-buf MR over [ptr, ptr + size), or nullptr if export or registration fails.
+ibv_mr* RegisterDmabufMr(ibv_pd* pd, void* ptr, size_t size, int accessFlag) {
+  uint64_t dmabufOffset = 0;
+  int dmabufFd = TryExportDmabufFd(ptr, size, &dmabufOffset);
+  if (dmabufFd < 0) return nullptr;
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(ptr), dmabufFd,
+                                 accessFlag);
+  close(dmabufFd);
+  return mr;
+}
+
+}  // namespace
+
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
-  ibv_mr* mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
+  // An allocation whose KFD pin is already held goes through dmabuf, see
+  // KfdPinAccounting.
+  auto pin = KfdPinAccounting::Instance().Begin(pd, ptr, size);
+  ibv_mr* mr = pin.PreferDmabuf() ? RegisterDmabufMr(pd, ptr, size, effectiveAccessFlag) : nullptr;
+  const bool viaDmabuf = mr != nullptr;
+  if (!mr) mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
         "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
         size, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
-  MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
-                 mr->lkey, mr->rkey);
+  pin.Commit(mr, viaDmabuf);
+  MORI_APP_TRACE("RegisterRdmaMemoryRegion[{}], addr:{}, size:{}, lkey:{}, rkey:{}\n",
+                 viaDmabuf ? "dmabuf" : "ibv_reg_mr", ptr, size, mr->lkey, mr->rkey);
   mrPool.insert({ptr, mr});
   application::RdmaMemoryRegion handle;
   handle.addr = reinterpret_cast<uintptr_t>(ptr);
@@ -459,6 +483,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
                                                                                 int dmabuf_fd,
                                                                                 int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+  auto pin = KfdPinAccounting::Instance().Begin(pd, ptr, size);
+  pin.BeforeDmabuf();
   ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, reinterpret_cast<uint64_t>(ptr), dmabuf_fd,
                                  effectiveAccessFlag);
   if (!mr) {
@@ -468,6 +494,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
         ptr, size, dmabuf_fd, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
+  pin.Commit(mr, /*viaDmabuf=*/true);
   MORI_APP_TRACE(
       "RegisterRdmaMemoryRegionDmabuf, addr:{}, size:{}, dmabuf_fd:{}, lkey:{}, rkey:{}\n", ptr,
       size, dmabuf_fd, mr->lkey, mr->rkey);
@@ -483,6 +510,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabuf(
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufIova0(
     void* ptr, size_t size, int dmabuf_fd, int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
+  auto pin = KfdPinAccounting::Instance().Begin(pd, ptr, size);
+  pin.BeforeDmabuf();
   ibv_mr* mr = ibv_reg_dmabuf_mr(pd, 0, size, 0, dmabuf_fd, effectiveAccessFlag);
   if (!mr) {
     MORI_APP_ERROR(
@@ -491,6 +520,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionDmabufI
         ptr, size, dmabuf_fd, effectiveAccessFlag, errno, strerror(errno));
     std::abort();
   }
+  pin.Commit(mr, /*viaDmabuf=*/true);
   MORI_APP_TRACE(
       "RegisterRdmaMemoryRegionDmabufIova0, addr:{}, size:{}, dmabuf_fd:{}, iova:0, lkey:{}, "
       "rkey:{}",
@@ -595,22 +625,22 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
   };
   auto tryPlain = [&]() -> ibv_mr* { return ibv_reg_mr(pd, ptr, size, effectiveAccessFlag); };
   auto tryDmabuf = [&]() -> ibv_mr* {
-    uint64_t dmabufOffset = 0;
-    int dmabufFd = TryExportDmabufFd(ptr, size, &dmabufOffset);
-    if (dmabufFd < 0) return nullptr;
-    ibv_mr* mr = ibv_reg_dmabuf_mr(pd, dmabufOffset, size, reinterpret_cast<uint64_t>(ptr),
-                                   dmabufFd, effectiveAccessFlag);
-    close(dmabufFd);
-    return mr;
+    return RegisterDmabufMr(pd, ptr, size, effectiveAccessFlag);
   };
 
   // Default: ibv_reg_mr first, dmabuf fallback (fast on bnxt). Set
   // MORI_ENABLE_DMABUF_REG to prefer dmabuf first, falling back to ibv_reg_mr.
+  // An allocation whose KFD pin is already held goes dmabuf first as well, see
+  // KfdPinAccounting.
+  auto pin = KfdPinAccounting::Instance().Begin(pd, ptr, size);
+  const bool dmabufFirst = preferDmabufReg || pin.PreferDmabuf();
   for (int attempt = 0; attempt < 2; ++attempt) {
-    bool useDmabuf = (attempt == 0) ? preferDmabufReg : !preferDmabufReg;
+    bool useDmabuf = (attempt == 0) ? dmabufFirst : !dmabufFirst;
     const char* name = useDmabuf ? "dmabuf" : "ibv_reg_mr";
+    if (useDmabuf) pin.BeforeDmabuf();
     ibv_mr* mr = useDmabuf ? tryDmabuf() : tryPlain();
     if (mr) {
+      pin.Commit(mr, useDmabuf);
       MORI_APP_TRACE("RegisterRdmaMemoryRegionAuto[{}], addr:{}, size:{}, lkey:{}, rkey:{}", name,
                      ptr, size, mr->lkey, mr->rkey);
       return makeHandle(mr);
@@ -631,7 +661,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
 void RdmaDeviceContext::DeregisterRdmaMemoryRegion(void* ptr) {
   if (mrPool.find(ptr) == mrPool.end()) return;
   ibv_mr* mr = mrPool[ptr];
-  ibv_dereg_mr(mr);
+  KfdPinAccounting::Instance().Deregister(mr);
   mrPool.erase(ptr);
 }
 

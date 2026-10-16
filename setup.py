@@ -683,6 +683,7 @@ class CMakeBuild(build_ext):
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
         enable_io_fault_injection = os.environ.get("ENABLE_IO_FAULT_INJECTION", "OFF")
+        enable_kfd_pin_fix = os.environ.get("ENABLE_KFD_PIN_FIX", "ON")
 
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
         multithread_support = os.environ.get("MORI_MULTITHREAD_SUPPORT", "OFF")
@@ -740,6 +741,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
             f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
             f"-DENABLE_IO_FAULT_INJECTION={enable_io_fault_injection}",
+            f"-DENABLE_KFD_PIN_FIX={enable_kfd_pin_fix}",
             f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
             f"-DGPU_TARGETS={gpu_archs}",
             f"-DENABLE_PROFILER={enable_profiler}",
