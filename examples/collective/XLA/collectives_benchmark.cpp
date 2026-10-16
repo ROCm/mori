@@ -518,15 +518,15 @@ static void RunThreaded(const Config& cfg, const ccoUniqueId& uid, ThreadInfo& i
   HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
 
   int rc = 1;
-  if (CollectivesFacade::Create(comm, myPe, npes, cfg.heapBytes, cfg.stagingBytes) != 0) {
+  if (CollectivesFacade::Create(comm, cfg.heapBytes, cfg.stagingBytes) != 0) {
     XPUT("ERROR: Failed to create CollectivesFacade");
   } else {
-    auto* facade = CollectivesFacade::Get();
+    auto facade = CollectivesFacade::Get(myPe, npes);
     if (facade == nullptr) {
       XPUT("ERROR: No CollectivesFacade for device %d", info.deviceId);
     } else if ((!cfg.modeSet || facade->SetReduceMode(cfg.mode)) &&
                facade->SetPushLogSlices(cfg.logS)) {
-      rc = RunCollective(cfg, facade, comm, myPe, npes, stream);
+      rc = RunCollective(cfg, facade.get(), comm, myPe, npes, stream);
     }
   }
 

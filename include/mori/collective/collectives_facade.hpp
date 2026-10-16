@@ -62,13 +62,13 @@
 #include "mori/collective/XLA/reduce_ops.hpp"
 #include "mori/collective/XLA/collectives_common.hpp"
 
-#define FACADE_PRINTF(fmt, ...) std::fprintf(stderr, fmt"\n", ##__VA_ARGS__)
+#define FACADE_PRINTF(fmt, ...) \
+      std::fprintf(stderr, "CollectivesFacade: " fmt "\n", ##__VA_ARGS__)
 namespace mori {
 namespace collective {
 
 class CollectivesFacade {
 
-  CollectivesFacade() = default;
  public:
   // Reduce algorithm selection for reduce-scatter and all-reduce (default
   // auto: pull or push chosen per call by message size). Env overrides read in
@@ -80,7 +80,7 @@ class CollectivesFacade {
   // (<= 0/unset = no cap).
   enum class RsMode { kPush, kPull, kAuto };
 
-  static constexpr size_t kDefAlign = 256;
+  static constexpr size_t kDefAlign = 128;
   // Auto tuning: pull wins below kAutoPullMaxBytes of total input, except
   // 8-PE reduce-scatter (kAutoPullMaxBytesRs) and 4-PE all-reduce
   // (kAutoPullMaxBytesAr4), which cross over earlier (pull is only
@@ -101,61 +101,21 @@ class CollectivesFacade {
   CollectivesFacade(const CollectivesFacade&) = delete;
   CollectivesFacade& operator=(const CollectivesFacade&) = delete;
 
-  static CollectivesFacade *Get() {
-    int dev = 0;
-    HIP_RUNTIME_CHECK(hipGetDevice(&dev));
-    std::lock_guard<std::mutex> lock(GetMutex());
-    if (MORI_UNLIKELY(GetInstances().size() <= static_cast<size_t>(dev))) {
-      return nullptr;
-    }
-    return GetInstances()[dev].get();
-  }
-
   // This device's MORI PE id and the total PE count the facade was created with.
   int MyPe() const { return myPe_; }
   int NumPes() const { return nPes_; }
 
-  // CCO-backed factory. Records this device's rank identity (myPe, nPes) and the
-  // comm, and registers ONE big symmetric CCO "heap" window based on CCO comm
-  // size. Need to be called by every rank in parallel.
-  static int Create(mori::cco::ccoComm* comm, int myPe, int nPes, 
-                    size_t heapBytes, size_t maxStagingBytes = 0) {
-    if (comm == nullptr) {
-      FACADE_PRINTF("CollectivesFacade: null comm for CCO create");
-      return -1;
+  // creates a concrete facade for the given PE and PE count
+  static std::unique_ptr< CollectivesFacade > Get(int myPe, int nPes) {
+    auto *state = GetState();
+    if (MORI_UNLIKELY(state == nullptr)) {
+      FACADE_PRINTF("Get: no instance");
+      return nullptr;
     }
-    
-    if (maxStagingBytes == 0) {
-      maxStagingBytes = heapBytes / 4;
+    if (nPes > kRSPushMaxPeers) {
+      FACADE_PRINTF("nPes too large (max %d)", kRSPushMaxPeers);
+      return nullptr;
     }
-    maxStagingBytes = (maxStagingBytes + kDefAlign - 1) & ~(kDefAlign - 1);
-    if (heapBytes == 0 || maxStagingBytes >= heapBytes) {
-      FACADE_PRINTF("CollectivesFacade: wrong heap size or maxStagingBytes");
-      return -1;
-    }
-
-    int dev = 0;
-    HIP_RUNTIME_CHECK(hipGetDevice(&dev));
-    auto& facade = CreateInternal(dev);
-    facade.myPe_ = myPe;
-    facade.nPes_ = nPes;
-    facade.ccoComm_ = comm;
-
-    {
-      int rc = mori::cco::ccoWindowRegister(comm, heapBytes, &facade.heapWin_,
-                                            reinterpret_cast<void**>(&facade.heapBase_));
-      if (rc != 0 || facade.heapBase_ == nullptr) {
-        FACADE_PRINTF("CollectivesFacade: failed to register heap window (%zu bytes, ret=%d)",
-                      heapBytes, rc);
-        return -1;
-      }
-      facade.heapSize_ = heapBytes;
-      facade.heapUsed_ = 0;
-    }
-
-    hipDeviceProp_t prop;
-    HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, dev));
-    facade.MP_count_ = prop.multiProcessorCount;
 
     // Tuning (reduce-scatter mode / push slice count) defaults to auto for both;
     // MORI_CCL_FORCE_PUSH_N_SLICES / MORI_CCL_FORCE_PULL replace the mode default.
@@ -166,126 +126,134 @@ class CollectivesFacade {
     // power-of-two value in {1, 2, ..., kRSPushMaxSlices} forces push mode AND
     // pins the slice count (logS_ = log2(S)); a value <= 0 (or unset) means no
     // preference; any other value is an error.
-    facade.mode_ = RsMode::kAuto;
-    facade.logS_ = -1;
+    RsMode mode = RsMode::kAuto;
+    int logS = -1;
     bool pushOk = true;
-    const long forcePushSlices = EnvInt("MORI_CCL_FORCE_PUSH_N_SLICES", 0, &pushOk);
-    const bool forcePull = EnvInt("MORI_CCL_FORCE_PULL", 0) != 0;
-    if (!pushOk ||
-        (forcePushSlices > 0 &&
-         (forcePushSlices > kRSPushMaxSlices || (forcePushSlices & (forcePushSlices - 1)) != 0))) {
-      FACADE_PRINTF("CollectivesFacade: MORI_CCL_FORCE_PUSH_N_SLICES must be a power of two in "
-                    "[1,%d] (or <=0/unset for no preference)", kRSPushMaxSlices);
-      return -1;
+    const long forcePushS = EnvInt("MORI_CCL_FORCE_PUSH_N_SLICES", 0, &pushOk);
+    bool forcePull = EnvInt("MORI_CCL_FORCE_PULL", 0) != 0;
+    
+    if (forcePushS <= 0) pushOk = false;
+    if (pushOk && (forcePushS > kRSPushMaxSlices || 
+                  (forcePushS & (forcePushS - 1)) != 0)) {
+      FACADE_PRINTF("MORI_CCL_FORCE_PUSH_N_SLICES must be a power of two in range [1,%d]",
+                    kRSPushMaxSlices);
+      pushOk = false;
     }
-    if (forcePushSlices > 0) {
-      facade.mode_ = RsMode::kPush;
-      facade.logS_ = __builtin_ctz(static_cast<unsigned>(forcePushSlices));  // log2(S)
+    if (pushOk) {
+      mode = RsMode::kPush;
+      logS = __builtin_ctz(static_cast<uint32_t>(forcePushS));  // log2(S)
     } else if (forcePull) {
-      if (facade.nPes_ == 2 || facade.nPes_ == 4 || facade.nPes_ == 8) {
-        facade.mode_ = RsMode::kPull;
+      if (nPes == 2 || nPes == 4 || nPes == 8) {
+        mode = RsMode::kPull;
       } else {
-        FACADE_PRINTF("CollectivesFacade: MORI_CCL_FORCE_PULL needs npes 2, 4 or 8; using auto");
+        FACADE_PRINTF("MORI_CCL_FORCE_PULL needs nPes 2, 4 or 8; using auto");
       }
     }
-    // Optional hard cap on the launch grid of the reduce-scatter/all-reduce
-    // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
-    facade.maxNBlocks_ = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
+    return std::unique_ptr<CollectivesFacade>(
+                   new CollectivesFacade(*state, myPe, nPes, logS, mode));
+  }
 
-    if (facade.nPes_ > kRSPushMaxPeers) {
-      FACADE_PRINTF("CollectivesFacade: npes too large (max %d)", kRSPushMaxPeers);
+  // CCO-backed factory. Records the device's CCO comm, and registers ONE big 
+  // symmetric CCO "heap" window based on CCO comm size.
+  // Need to be called by every rank in parallel.
+  static int Create(cco::ccoComm* comm, size_t heapBytes, 
+                                                 size_t maxStagingBytes = 0) {
+    if (comm == nullptr) {
+      FACADE_PRINTF("NULL comm for CCO create");
+      return -1;
+    }
+    if (maxStagingBytes == 0) {
+      maxStagingBytes = heapBytes / 4;
+    }
+    maxStagingBytes = (maxStagingBytes + kDefAlign - 1) & ~(kDefAlign - 1);
+    if (heapBytes == 0 || maxStagingBytes >= heapBytes) {
+      FACADE_PRINTF("wrong heap size or maxStagingBytes");
       return -1;
     }
 
-    // The facade's internal buffers are carved from the shared heap window
-    // BEFORE any user Allocate, so their heap offsets are identical on every
-    // rank (symmetric) since every rank runs the same Create.
-    //
+    int dev = 0;
+    HIP_RUNTIME_CHECK(hipGetDevice(&dev));
+    auto& state = GetOrCreateState(dev);
+    state.ccoComm = comm;
+    int ret = cco::ccoWindowRegister(comm, heapBytes, &state.heapWin,
+                                     reinterpret_cast<void**>(&state.heapBase));
+    if (ret != 0 || state.heapBase == nullptr) {
+      FACADE_PRINTF("failed to register heap window (%zu bytes, ret=%d)",
+                    heapBytes, ret);
+      return -1;
+    }
+    state.heapSize = heapBytes;
+    state.heapUsed = 0;
+
+    hipDeviceProp_t prop;
+    HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, dev));
+    state.MP_count = prop.multiProcessorCount;
+
+    // Optional hard cap on the launch grid of the reduce-scatter/all-reduce
+    // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
+    state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
+
+    size_t controlBytes = kRSPushMaxPeers * sizeof(uint64_t) * 2;
+    size_t totalBytes = maxStagingBytes + controlBytes;
+    state.staging = Allocate(totalBytes);
+    if (state.staging == nullptr) {
+      FACADE_PRINTF("failed to carve staging and control flags from heap (%zu bytes)",
+                      totalBytes);
+      return -1;
+    }
+    state.stagingBytes = maxStagingBytes;
+
     // Entry/exit-barrier flags of the push and pull collectives (see
     // PushEntryBarrier): slot p of every copy is written only by PE p with its
     // monotonic epoch; never reset after this.
-    facade.barrierCtr_ =
-        static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
-    if (facade.barrierCtr_ == nullptr) {
-      FACADE_PRINTF("CollectivesFacade: failed to carve barrier flags from heap");
-      return -1;
-    }
-    HIP_RUNTIME_CHECK(hipMemset(facade.barrierCtr_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
+    state.barrierCtr = reinterpret_cast<uint64_t*>(
+             static_cast<uint8_t*>(state.staging) + maxStagingBytes);
     // Collective-permute ready tokens. Slot p of my copy is written only by PE p
     // ("p has entered the permute and may receive from me"); I clear it on use.
-    facade.permuteReady_ =
-        static_cast<uint64_t*>(facade.Allocate(kRSPushMaxPeers * sizeof(uint64_t)));
-    if (facade.permuteReady_ == nullptr) {
-      FACADE_PRINTF("CollectivesFacade: failed to carve permute ready tokens from heap");
-      return -1;
-    }
-    HIP_RUNTIME_CHECK(hipMemset(facade.permuteReady_, 0, kRSPushMaxPeers * sizeof(uint64_t)));
+    state.permuteReady = state.barrierCtr + kRSPushMaxPeers;
+    HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
 
-    // Staging is the push path's peer-writable scratch (SDMA scatter target).
-    // Pull needs none.
-    if (maxStagingBytes > 0) {
-      facade.staging_ = facade.Allocate(maxStagingBytes);
-      if (facade.staging_ == nullptr) {
-        FACADE_PRINTF("CollectivesFacade: failed to carve staging from heap (%zu bytes)",
-                      maxStagingBytes);
-        return -1;
-      }
-      facade.stagingBytes_ = maxStagingBytes;
-    }
-    HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&facade.groupCounters_),
+    HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.groupCounters),
                                 kGroupCounterCount * sizeof(uint32_t)));
-    HIP_RUNTIME_CHECK(hipMemset(facade.groupCounters_, 0, kGroupCounterCount * sizeof(uint32_t)));
+    HIP_RUNTIME_CHECK(hipMemset(state.groupCounters, 0, kGroupCounterCount * sizeof(uint32_t)));
     // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
     // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
     // device alloc/copy). Sized for the max supported peer count.
-    HIP_RUNTIME_CHECK(hipHostMalloc(reinterpret_cast<void**>(&facade.pinnedPairs_),
+    HIP_RUNTIME_CHECK(hipHostMalloc(reinterpret_cast<void**>(&state.pinnedPairs),
                                     kRSPushMaxPeers * sizeof(AddressPair), 
                                     hipHostMallocDefault));
 
     // SDMA device comm for the push path (passed by value into the push kernel).
-    mori::cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    reqs.gdaConnectionType = mori::cco::CCO_GDA_CONNECTION_NONE;
+    cco::ccoDevCommRequirements reqs = CCO_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    reqs.gdaConnectionType = cco::CCO_GDA_CONNECTION_NONE;
     reqs.gdaContextCount = 0;
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
     reqs.sdmaQueueCount = 0; // Use the context's SDMA queue count
-    int ret = mori::cco::ccoDevCommCreate(comm, &reqs, &facade.devComm_);
-    if (ret != 0 || facade.devComm_.sdma.sdmaNumQueue == 0) {
-      FACADE_PRINTF("CollectivesFacade: ccoDevCommCreate failed or "
-                    "no SDMA queues allocated.");
+    
+    ret = cco::ccoDevCommCreate(comm, &reqs, &state.devComm);
+    if (ret != 0 || state.devComm.sdma.sdmaNumQueue == 0) {
+      FACADE_PRINTF("ccoDevCommCreate failed or no SDMA queues allocated.");
       return -1;
     }
     // The push collectives use signal slots [0, kSdmaSignalSlotsUsed) of the
     // lsaSize * sdmaNumQueue pool.
-    const size_t signalSlots =
-        static_cast<size_t>(facade.devComm_.lsaSize) * facade.devComm_.sdma.sdmaNumQueue;
-    if (signalSlots < static_cast<size_t>(kSdmaSignalSlotsUsed)) {
-      FACADE_PRINTF("CollectivesFacade: SDMA signal pool has %zu slots, need %d "
-                    "(lsaSize=%d, sdmaNumQueue=%u)",
-                    signalSlots, kSdmaSignalSlotsUsed, facade.devComm_.lsaSize,
-                    facade.devComm_.sdma.sdmaNumQueue);
+    const uint32_t signalSlots =
+        state.devComm.lsaSize * state.devComm.sdma.sdmaNumQueue;
+    if (signalSlots < static_cast<uint32_t>(kSdmaSignalSlotsUsed)) {
+      FACADE_PRINTF("SDMA signal pool has %u slots, need %d (lsaSize=%d, sdmaNumQueue=%u)",
+                    signalSlots, kSdmaSignalSlotsUsed, state.devComm.lsaSize,
+                    state.devComm.sdma.sdmaNumQueue);
       return -1;
     }
     return 0;
-  }
-
-  // Release this device's heap window, counters, and SDMA comm. Staging is a
-  // sub-region of heapWin_, so it needs no separate deregistration.
-  ~CollectivesFacade() {
-    if (heapWin_ != nullptr) mori::cco::ccoWindowDeregister(ccoComm_, heapWin_);
-    if (ccoComm_ != nullptr) {
-      mori::cco::ccoDevCommDestroy(ccoComm_, &devComm_);
-      mori::cco::ccoCommDestroy(ccoComm_);
-    }
-    if (groupCounters_ != nullptr) HIP_RUNTIME_CHECK(hipFree(groupCounters_));
-    if (pinnedPairs_ != nullptr) HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs_));
   }
 
   // Tear down all collectives instances (should be safe to be called from 
   // a single thread).
   static void TearDown() {
     std::lock_guard<std::mutex> lock(GetMutex());
-    GetInstances().clear();
+    GetStates().clear();
   }
 
   // Bump-allocate a peer-visible buffer from the static heap window. Returns a
@@ -293,40 +261,40 @@ class CollectivesFacade {
   // Allocate sequence (same sizes/order) so a given buffer sits at the same heap
   // offset on all ranks (symmetric addressing). Returns nullptr if the heap is
   // exhausted. `align` defaults to 256B (SDMA/b128 friendly).
-  static void* Allocate(size_t bytes) {
-    auto *facade = Get();
-    if (MORI_UNLIKELY(facade == nullptr)) {
-      FACADE_PRINTF("CollectivesFacade::Allocate: no instance");
+  static void* Allocate(size_t bytes, size_t align = kDefAlign) {
+    auto *state = GetState();
+    if (MORI_UNLIKELY(state == nullptr)) {
+      FACADE_PRINTF("Allocate: no instance");
       return nullptr;
     }
-    const size_t off = (facade->heapUsed_ + (kDefAlign - 1)) & ~(kDefAlign - 1);
-    if (MORI_UNLIKELY(off + bytes > facade->heapSize_)) {
-      FACADE_PRINTF("CollectivesFacade::Allocate: heap exhausted (need %zu at off %zu, size %zu)",
-                    bytes, off, facade->heapSize_);
+    const size_t off = (state->heapUsed + (align - 1)) & ~(align - 1);
+    if (MORI_UNLIKELY(off + bytes > state->heapSize)) {
+      FACADE_PRINTF("Allocate: heap exhausted (need %zu at off %zu, size %zu)",
+                    bytes, off, state->heapSize);
       return nullptr;
     }
-    facade->heapUsed_ = off + bytes;
-    return facade->heapBase_ + off;
+    state->heapUsed = off + bytes;
+    return state->heapBase + off;
   }
 
   // Bump allocator: individual frees are a no-op. Use Reset() to reclaim the
   // whole heap between phases (all outstanding buffers become invalid).
   static int Deallocate(void* ptr) {
-    auto *facade = Get();
-    if (MORI_UNLIKELY(facade == nullptr)) {
-      FACADE_PRINTF("CollectivesFacade::Deallocate: no instance");
+    auto *state = GetState();
+    if (MORI_UNLIKELY(state == nullptr)) {
+      FACADE_PRINTF("Deallocate: no instance");
       return -1;
     }
     return 0;
   }
 
   static void Reset() {
-    auto *facade = Get();
-    if (MORI_UNLIKELY(facade == nullptr)) {
-      FACADE_PRINTF("CollectivesFacade::Reset: no instance");
+    auto *state = GetState();
+    if (MORI_UNLIKELY(state == nullptr)) {
+      FACADE_PRINTF("Reset: no instance");
       return;
     }
-    facade->heapUsed_ = 0;
+    state->heapUsed = 0;
   }
 
   // Runtime tuning "backdoors" (replace the former RS_MODE / RS_LOG_PUSH_SLICES
@@ -334,7 +302,7 @@ class CollectivesFacade {
   // the current value unchanged on an invalid request.
   bool SetReduceMode(RsMode mode) {
     if (mode == RsMode::kPull && nPes_ > 8) {
-      FACADE_PRINTF("CollectivesFacade: pull mode supports npes in [1,8]");
+      FACADE_PRINTF("pull mode supports npes in [1,8]");
       return false;
     }
     mode_ = mode;
@@ -343,8 +311,7 @@ class CollectivesFacade {
   // logS < 0 selects the slice count automatically per call.
   bool SetPushLogSlices(int logS) {
     if (logS >= 0 && (1 << logS) > kRSPushMaxSlices) {
-      FACADE_PRINTF("CollectivesFacade: logS out of range (-1..%d)",
-                    kRSPushMaxSlices > 0 ? 31 : 0);
+      FACADE_PRINTF("logS out of range!");
       return false;
     }
     logS_ = logS < 0 ? -1 : logS;
@@ -403,34 +370,73 @@ class CollectivesFacade {
   hipError_t RunFence();
 
  private:
+   struct SharedState {
+    void* staging{nullptr};
+    size_t stagingBytes{0};
+    uint32_t* groupCounters{nullptr};
+    uint64_t* barrierCtr{nullptr};  // symmetric, entry-barrier flags (slot p written by PE p)
+    uint64_t* permuteReady{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
+    AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
+    cco::ccoComm* ccoComm{nullptr};
+    // Static heap: one symmetric window backing all user buffers (bump allocator).
+    cco::ccoWindow_t heapWin{nullptr};
+    uint8_t* heapBase{nullptr};
+    size_t heapSize{0};
+    size_t heapUsed{0};
+    // CCO-backed push: staging (above) is a sub-region of heapWin (peer-writable
+    // SDMA target); devComm is the SDMA device comm.
+    cco::ccoDevComm devComm{};
+    int MP_count{0};    // Number of CUs per device
+    int maxNBlocks{0};  // MORI_CCL_MAX_NBLOCKS grid cap; <= 0 means no cap
 
-  using FacadeMap = std::deque< std::unique_ptr<CollectivesFacade> >;
+    // Release this device's heap window, counters, and SDMA comm. Staging is a
+    // sub-region of heapWin, so it needs no separate deregistration.
+    ~SharedState() {
+      if (heapWin != nullptr) {
+        cco::ccoWindowDeregister(ccoComm, heapWin);
+      }
+      if (ccoComm != nullptr) {
+        cco::ccoDevCommDestroy(ccoComm, &devComm);
+        cco::ccoCommDestroy(ccoComm);
+      }
+      if (groupCounters != nullptr) HIP_RUNTIME_CHECK(hipFree(groupCounters));
+      if (pinnedPairs != nullptr) HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs));
+    }
+  };
+
+  using StateMap = std::deque< std::unique_ptr<SharedState> >;
   static std::mutex& GetMutex() {
     static std::mutex mutex;
     return mutex;
   }
 
-  static FacadeMap& GetInstances() {
-    static FacadeMap instances(8);
-    return instances;
+  static StateMap& GetStates() {
+    static StateMap states(8);
+    return states;
   }
 
-  static CollectivesFacade& CreateInternal(uint32_t ordinal) {
+  static SharedState *GetState() {
+    int dev = 0;
+    HIP_RUNTIME_CHECK(hipGetDevice(&dev));
     std::lock_guard<std::mutex> lock(GetMutex());
-    if (ordinal >= GetInstances().size()) {
-      GetInstances().resize(ordinal + 1);
+    if (MORI_UNLIKELY(GetStates().size() <= static_cast<size_t>(dev))) {
+      return nullptr;
     }
-    auto& inst = GetInstances()[ordinal];
-    if (inst == nullptr) {
-      inst = std::unique_ptr<CollectivesFacade>(new CollectivesFacade());
+    return GetStates()[dev].get();
+  }
+
+  static SharedState& GetOrCreateState(uint32_t ordinal) {
+    std::lock_guard<std::mutex> lock(GetMutex());
+    if (MORI_UNLIKELY(ordinal >= GetStates().size())) {
+      GetStates().resize(ordinal + 1);
     }
-    return *inst;
+    auto& state = GetStates()[ordinal];
+    if (state == nullptr) {
+      state = std::make_unique<SharedState>();
+    }
+    return *state;
   }
   
-  // Parse an integer env var. Returns `defaultVal` (and sets *ok=true) when the
-  // var is unset or empty; parses the whole string as a base-10 long otherwise.
-  // A non-numeric or partially-numeric value sets *ok=false and returns
-  // `defaultVal`. `ok` may be null if the caller does not care about validity.
   static long EnvInt(const char* name, long defaultVal, bool* ok = nullptr) {
     if (ok != nullptr) *ok = true;
     const char* e = std::getenv(name);
@@ -444,6 +450,10 @@ class CollectivesFacade {
     return v;
   }
 
+  CollectivesFacade(SharedState& state, int myPe, int nPes, int logS, RsMode mode) : 
+           state_(state), myPe_(myPe), nPes_(nPes), 
+           logS_(logS), mode_(mode) {}
+
   RsMode resolveMode(size_t totalBytes, bool allReduce) const;
   int resolveLogS(size_t chunkBytes, bool allReduce) const;
 
@@ -455,24 +465,9 @@ class CollectivesFacade {
   hipError_t allReduceImpl(const void* input, void* output, size_t numElems, hipStream_t stream);
 
 private:
-  void* staging_{nullptr};
-  size_t stagingBytes_{0};
-  uint32_t* groupCounters_{nullptr};
-  uint64_t* barrierCtr_{nullptr};  // symmetric, entry-barrier flags (slot p written by PE p)
-  uint64_t* permuteReady_{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
-  AddressPair* pinnedPairs_{nullptr};  // host-pinned, device-readable
-  mori::cco::ccoComm* ccoComm_{nullptr};
-  // Static heap: one symmetric window backing all user buffers (bump allocator).
-  mori::cco::ccoWindow_t heapWin_{nullptr};
-  uint8_t* heapBase_{nullptr};
-  size_t heapSize_{0};
-  size_t heapUsed_{0};
-  // CCO-backed push: staging_ (above) is a sub-region of heapWin_ (peer-writable
-  // SDMA target); devComm_ is the SDMA device comm.
-  mori::cco::ccoDevComm devComm_{};
-  int myPe_{0}, nPes_{0}, logS_{-1}, MP_count_{0};
-  int maxNBlocks_{0};  // MORI_CCL_MAX_NBLOCKS grid cap; <= 0 means no cap
-  RsMode mode_{RsMode::kAuto};
+  SharedState& state_;
+  int myPe_, nPes_, logS_;
+  RsMode mode_;
 };
 
 }  // namespace collective
