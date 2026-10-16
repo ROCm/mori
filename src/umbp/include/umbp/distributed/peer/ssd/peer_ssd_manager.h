@@ -134,6 +134,8 @@ class PeerSsdManager {
   // returns disk a whole segment at a time), so no other ranking should be
   // used to pick its victims.
   bool OrdersEviction() const;
+  // Renews recency in this class's LRU and the tier's order; reads nothing.
+  void Touch(const std::vector<std::string>& keys);
 
   // Forwards to the tier: see TierBackend::SetRetiredFileHook.
   void SetRetiredFileHook(std::function<void(int fd)> on_close, std::chrono::milliseconds grace);

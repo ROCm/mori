@@ -132,8 +132,8 @@ class PeerPool {
                                               const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
-  // check discards. Takes no read lease and does not touch recency: asking
-  // whether a key is here is not a read of it.
+  // check discards. Takes no read lease, but renews recency: a client looks
+  // keys up to load them next, and evicting them in between fails that load.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per

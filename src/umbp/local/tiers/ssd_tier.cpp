@@ -1223,6 +1223,13 @@ std::vector<EvictionHint> SSDTier::EvictionOrder(size_t max_keys) {
   return out;
 }
 
+void SSDTier::Touch(const std::vector<std::string>& keys) {
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& key : keys) {
+    if (index_.FindKey(key) != nullptr) index_.TouchLRU(key);
+  }
+}
+
 void SSDTier::Clear() {
   {
     std::lock_guard<std::mutex> lock(mu_);

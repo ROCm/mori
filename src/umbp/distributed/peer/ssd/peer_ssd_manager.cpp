@@ -310,6 +310,15 @@ bool PeerSsdManager::OrdersEviction() const {
   return backend_ != nullptr && backend_->Capabilities().orders_eviction;
 }
 
+void PeerSsdManager::Touch(const std::vector<std::string>& keys) {
+  if (backend_ == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& key : keys) TouchLocked(key);
+  }
+  backend_->Touch(keys);
+}
+
 void PeerSsdManager::SetRetiredFileHook(std::function<void(int fd)> on_close,
                                         std::chrono::milliseconds grace) {
   if (backend_) backend_->SetRetiredFileHook(std::move(on_close), grace);
