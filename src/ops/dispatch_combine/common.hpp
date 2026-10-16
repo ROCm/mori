@@ -22,6 +22,7 @@
 #pragma once
 
 #include "mori/ops/dispatch_combine/dispatch_combine.hpp"
+#include "mori/shmem/internal.hpp"
 
 namespace mori {
 namespace moe {
@@ -92,6 +93,24 @@ struct MultiWarpIter {
     dimChunk = (dimOffset < dimSize) ? std::min(dimSize - dimOffset, dimPerWarp) : size_t{0};
   }
 };
+
+// True when the recv-count signal for `pe` should ride the same QP as the payload
+// put, skipping the local CQE drain.
+//
+// RDMA only, and deliberately so:
+//   - SDMA peers move the payload on the copy engine but send the signal as a P2P
+//     store (shmem_sdma_kernels.hpp:152-156 has no SDMA Imm path and falls back to
+//     P2P) -- two independent hardware units with no mutual ordering.
+//   - P2P peers have ShmemQuietThreadKernel<P2P> == {} (shmem_p2p_kernels.hpp:1152),
+//     so their ordering already comes from the kernel boundary and there is no RTT
+//     to save.
+//   - Self (pe == myPe) is never RDMA-typed, so it falls out automatically.
+template <typename T>
+__device__ __forceinline__ bool EpAsyncLlFuseSignal(const EpDispatchCombineArgs<T>& args, int pe) {
+  if (!args.config.fuseSignalOnSendQp) return false;
+  return mori::shmem::GetGlobalGpuStatesPtr()->transportTypes[pe] ==
+         mori::application::TransportType::RDMA;
+}
 
 #define DEF_COMMON_VARS                                    \
   const EpDispatchCombineConfig& config = args.config;     \
