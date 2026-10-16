@@ -567,6 +567,44 @@ TEST_F(SsdBackendTest, ARemoteLeaseOutlivesALocalHold) {
             AllocateOutcome::kSuccessAllocated);
 }
 
+// The #749 window on SSD: a remote reader's lease lapses and its staging page
+// is handed to another key.  The key is still on the drive, so only the lease
+// can answer whether the page the reader copied from still held it.
+TEST_F(SsdBackendTest, StillHoldsTracksTheStagingLeaseNotTheDrive) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "key-b", Payload(1024, 2)));
+
+  const auto first = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(first[0].found);
+  const uint64_t gen = first[0].generation;
+  ASSERT_NE(gen, 0u) << "SSD must stamp its staged copies";
+  EXPECT_EQ(backend->BatchResolve({"key-a"}, false)[0].generation, gen)
+      << "a shared lease is one copy";
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {gen}), std::vector<bool>{true});
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {gen}), std::vector<bool>{false});
+
+  // The only page now holds key-b: the bytes a stale key-a reader would get.
+  const auto other = backend->BatchResolve({"key-b"}, false);
+  ASSERT_TRUE(other[0].found);
+  EXPECT_EQ(other[0].pages[0].page_index, first[0].pages[0].page_index);
+  EXPECT_NE(other[0].generation, gen);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  const auto again = backend->BatchResolve({"key-a"}, false);
+  ASSERT_TRUE(again[0].found);
+  EXPECT_NE(again[0].generation, gen) << "a re-stage is a new copy";
+  EXPECT_EQ(backend->BatchStillHolds({"key-a", "key-a"}, {gen, again[0].generation}),
+            (std::vector<bool>{false, true}));
+
+  backend->ClearLocal();
+  EXPECT_EQ(backend->BatchStillHolds({"key-a"}, {again[0].generation}), std::vector<bool>{false});
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction and Clear
 // ---------------------------------------------------------------------------

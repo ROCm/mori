@@ -1012,6 +1012,8 @@ class PoolClient {
     size_t result_index;
     const BatchGetItem* item;
     SlotPlan plan;
+    // Which copy the peer resolved (0 = unstamped, nothing to check).
+    uint64_t generation = 0;
     bool failed = false;
   };
 
@@ -1036,6 +1038,11 @@ class PoolClient {
                                std::vector<TransferItem>* items);
   void FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries, std::vector<bool>* results,
                                 bool recache_remote);
+  // Check-after-read: the peer's read lease is only a timer and may lapse
+  // while the RDMA read runs, so ask it whether each copy read is still the one
+  // it resolved.  Marks entries whose copy changed (or that cannot be
+  // confirmed) failed, so they become misses instead of another key's bytes.
+  void ValidateRemoteGetEntries(PeerConnection& peer, std::vector<RemoteGetEntry>& entries);
 
   // One posted-but-not-yet-waited remote read for a single peer; the scheduler
   // waits it later.  The lifetime contract that used to live here — statuses

@@ -236,6 +236,7 @@ struct RangedPhases {
   double rmt_sub = 0.0;          // per-group sub_* vectors + PartitionBatchGetRangeTargets
   double rmt_items_build = 0.0;  // BuildContiguousToRangesItems for the scatter
   double rmt_final = 0.0;        // ApplyTransferFailures + FinalizeRemoteGetEntries
+  double rmt_check = 0.0;        // ValidateReads round trip after the RDMA read
   double rmt_medium = 0.0;       // ServeWholeObjectUnitsFromMedium
   double rmt_install = 0.0;      // install-from-arena / background prefetch
   double rmt_scatter = 0.0;      // arena -> caller buffers
@@ -311,6 +312,7 @@ struct RemoteLegSinks {
   double* peer = nullptr;
   double* decode = nullptr;
   double* final_ = nullptr;
+  double* check = nullptr;
   double* wait = nullptr;
 };
 thread_local RemoteLegSinks* t_remote_leg = nullptr;
@@ -357,6 +359,7 @@ class RangedStats {
     t.rmt_sub += p.rmt_sub;
     t.rmt_items_build += p.rmt_items_build;
     t.rmt_final += p.rmt_final;
+    t.rmt_check += p.rmt_check;
     t.rmt_medium += p.rmt_medium;
     t.rmt_install += p.rmt_install;
     t.rmt_scatter += p.rmt_scatter;
@@ -414,8 +417,8 @@ class RangedStats {
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
            rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0, rmt_bld_post = 0,
            rmt_peer = 0, rmt_decode = 0, rmt_sub = 0, rmt_items_build = 0, rmt_final = 0,
-           rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0, scat_plan = 0,
-           scat_submit = 0, scat_wait = 0, bytes = 0;
+           rmt_check = 0, rmt_medium = 0, rmt_install = 0, rmt_wait = 0, rmt_scatter = 0,
+           scat_plan = 0, scat_submit = 0, scat_wait = 0, bytes = 0;
   };
   struct Component {
     uint64_t calls = 0;
@@ -434,8 +437,8 @@ class RangedStats {
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
-        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% med={:.1f}% "
-        "inst={:.1f}% rdma={:.1f}% "
+        "po={:.1f}%] peer={:.1f}% dec={:.1f}% sub={:.1f}% ib={:.1f}% fin={:.1f}% chk={:.1f}% "
+        "med={:.1f}% inst={:.1f}% rdma={:.1f}% "
         "scat={:.1f}%[pl={:.1f}% sub={:.1f}% wt={:.1f}%]) "
         "other={:.1f}% | xfer_only={:.2f}GiB/s end2end={:.2f}GiB/s",
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
@@ -446,9 +449,9 @@ class RangedStats {
         share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
         share(t.remote), share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items),
         share(t.rmt_bld_plan), share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode),
-        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium),
-        share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter), share(t.scat_plan),
-        share(t.scat_submit), share(t.scat_wait), share(other),
+        share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_check),
+        share(t.rmt_medium), share(t.rmt_install), share(t.rmt_wait), share(t.rmt_scatter),
+        share(t.scat_plan), share(t.scat_submit), share(t.scat_wait), share(other),
         t.xfer > 0 ? (t.bytes / t.xfer) / (1024.0 * 1024 * 1024) : 0.0,
         t.total > 0 ? (t.bytes / t.total) / (1024.0 * 1024 * 1024) : 0.0);
   }
@@ -619,6 +622,17 @@ inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
     if (end != value && *end == '\0' && parsed > 0) ms = parsed;
   }
   return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
+}
+
+// Check-after-read for remote readers (#749).  On by default;
+// UMBP_REMOTE_READ_VALIDATE=0 turns it off for an A/B of its cost, which also
+// reopens the window where a read returns another key's bytes as a hit.
+inline bool RemoteReadValidateEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("UMBP_REMOTE_READ_VALIDATE");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
 }
 
 std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(PeerPool* pool,
@@ -3864,6 +3878,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
            .peer = &dbg->rmt_peer,
            .decode = &dbg->rmt_decode,
            .final_ = &dbg->rmt_final,
+           .check = &dbg->rmt_check,
            .wait = &dbg->rmt_wait};
   }
   ScopedRemoteLeg leg_scope(dbg ? &leg : nullptr);
@@ -4610,10 +4625,20 @@ void PoolClient::WaitRemoteBatchGet(RemoteGetInFlight& f, std::vector<bool>* res
     PhaseTimer wait_timer(t_remote_leg ? t_remote_leg->wait : nullptr);
     if (f.handle != nullptr) f.handle->Wait(&failures);
   }
-  PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
-  ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  {
+    PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
+    ApplyTransferFailures(f.entries, failures, "RemoteGet");
+  }
+  // Before anything is reported or re-cached: a read the peer cannot vouch for
+  // must not become a hit, nor be installed locally under the key.  Timed on
+  // its own, outside `final_`, because it is a network round trip.
+  if (f.peer != nullptr) {
+    PhaseTimer check_timer(t_remote_leg ? t_remote_leg->check : nullptr);
+    ValidateRemoteGetEntries(*f.peer, f.entries);
+  }
   // Nothing to copy out here even for a staged read: the engine owns its bounce
   // pool and lands the bytes in the user's dst before its Wait returns.
+  PhaseTimer final_timer(t_remote_leg ? t_remote_leg->final_ : nullptr);
   FinalizeRemoteGetEntries(f.entries, results, recache_remote);
 }
 
@@ -4728,6 +4753,7 @@ bool PoolClient::PrepareRemoteGetEntries(const std::vector<BatchGetItem>& items,
     // once; the pages below are indices into THIS backend's buffers.
     entry.plan.backend_id = key.backend_id;
     entry.plan.pages = std::move(decoded.keys[i].pages);
+    entry.generation = key.generation;
     // Descriptors were hydrated batch-level above; the per-entry plan carries
     // none (BuildRemoteGetTransfers' EnsureBufferDescsCached call is a no-op on
     // an empty list and the read path resolves descriptors by buffer_index).
@@ -4896,6 +4922,62 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
       MaybeReCacheAfterRemote(*entry.item->key, entry.item->dst, entry.item->size);
     }
   }
+}
+
+void PoolClient::ValidateRemoteGetEntries(PeerConnection& peer,
+                                          std::vector<RemoteGetEntry>& entries) {
+  if (!RemoteReadValidateEnabled()) return;
+
+  // Ask only about reads that landed and carry a generation.  0 means the
+  // medium does not stamp copies, or the peer predates the field and so has no
+  // ValidateReads to call either.
+  ::umbp::ValidateReadsRequest req;
+  std::vector<size_t> asked;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& entry = entries[i];
+    if (entry.failed || entry.generation == 0) continue;
+    req.add_keys(*entry.item->key);
+    req.add_backend_id(entry.plan.backend_id);
+    req.add_generation(entry.generation);
+    asked.push_back(i);
+  }
+  if (asked.empty()) return;
+
+  auto drop = [&](const std::vector<size_t>& which, const char* reason) {
+    for (size_t i : which) entries[i].failed = true;
+    CountMetric(MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL,
+                MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL_HELP, {{"reason", reason}},
+                static_cast<double>(which.size()));
+  };
+
+  // Fail closed.  A peer that stamped a generation is new enough to answer, so
+  // any error here (UNIMPLEMENTED included) means the bytes are unconfirmed,
+  // and an unconfirmed read is exactly what this check exists to refuse.
+  auto* stub = static_cast<::umbp::UMBPPeer::Stub*>(peer.peer_stub.get());
+  ::umbp::ValidateReadsResponse resp;
+  grpc::Status status(grpc::StatusCode::UNAVAILABLE, "no peer stub");
+  if (stub != nullptr) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + ResolveBusyRetryTimeout());
+    status = stub->ValidateReads(&ctx, req, &resp);
+  }
+  if (!status.ok() || resp.still_valid_size() != static_cast<int>(asked.size())) {
+    MORI_UMBP_WARN("[PoolClient] ValidateReads failed on {} ({} keys): {}", peer.node_id,
+                   asked.size(), status.ok() ? "answer count mismatch" : status.error_message());
+    drop(asked, "unverified");
+    return;
+  }
+
+  std::vector<size_t> stale;
+  for (size_t j = 0; j < asked.size(); ++j) {
+    if (!resp.still_valid(static_cast<int>(j))) stale.push_back(asked[j]);
+  }
+  if (stale.empty()) return;
+  MORI_UMBP_WARN(
+      "[PoolClient] BatchGet: {} of {} remote reads from {} changed under the read, returned "
+      "as misses (first key='{}')",
+      stale.size(), asked.size(), peer.node_id, *entries[stale.front()].item->key);
+  drop(stale, "stale");
 }
 
 // ---------------------------------------------------------------------------

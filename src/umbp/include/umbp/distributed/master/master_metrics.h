@@ -245,6 +245,14 @@
 #define MORI_UMBP_METRIC_RANGED_REMOTE_INSTALL_FAILURES_TOTAL_HELP \
   "Remote ranged objects that could not be synchronously installed in the local medium"
 
+// Remote reads thrown away after the RDMA read finished, by reason:
+//   stale      — the peer freed or refilled the copy while it was being read
+//   unverified — the ValidateReads check itself failed, so the read is not trusted
+// Nonzero `stale` is the #749 window caught; each one would have been a wrong-bytes hit.
+#define MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL "mori_umbp_client_remote_get_dropped_total"
+#define MORI_UMBP_METRIC_CLIENT_REMOTE_GET_DROPPED_TOTAL_HELP \
+  "Remote reads returned as misses because the copy could not be confirmed after the read"
+
 // --- Heartbeat / event-shipping counters (master-as-advisor) ----------------
 
 #define MORI_UMBP_METRIC_HEARTBEAT_EVENTS_APPLIED_TOTAL "mori_umbp_heartbeat_events_applied_total"

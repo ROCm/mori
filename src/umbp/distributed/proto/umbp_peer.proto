@@ -24,6 +24,9 @@ service UMBPPeer {
   rpc BatchCommitSlots  (BatchCommitSlotsRequest)   returns (BatchCommitSlotsResponse);
   rpc BatchAbortSlots   (BatchAbortSlotsRequest)    returns (BatchAbortSlotsResponse);
   rpc BatchResolveKeys  (BatchResolveKeysRequest)   returns (BatchResolveKeysResponse);
+  // Check-after-read for remote readers: a reader that copied bytes out of a
+  // resolved key asks whether that copy was still the key's when it finished.
+  rpc ValidateReads     (ValidateReadsRequest)      returns (ValidateReadsResponse);
 }
 
 // ============================================================
@@ -237,4 +240,24 @@ message BatchResolveKeysResponse {
   // (buffer_index, page_index) pairs, walking keys in order.
   repeated uint32 buffer_index = 7;
   repeated uint32 page_index   = 8;
+  // Per key: which copy the pages above belong to.  A medium draws a fresh
+  // value every time it fills a slot or staging span, so the same key read
+  // twice names the same copy only if nothing was freed or reused between.
+  // The reader hands it back in ValidateReads.  0 = this medium does not stamp
+  // copies (nothing to check); absent entirely = an old peer.
+  repeated uint64 generation = 11;
+}
+
+// Parallel arrays, one entry per key read.  backend_id and generation are the
+// values the same peer returned in BatchResolveKeysResponse.
+message ValidateReadsRequest {
+  repeated string keys       = 1;
+  repeated uint32 backend_id = 2;
+  repeated uint64 generation = 3;
+}
+
+message ValidateReadsResponse {
+  // Parallel to request.keys.  False: the copy was freed or replaced while the
+  // reader was copying, so what it read may be another key's bytes.
+  repeated bool still_valid = 1;
 }

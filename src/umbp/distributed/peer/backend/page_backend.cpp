@@ -491,6 +491,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
   owned.hold = std::make_shared<char>();
+  owned.generation = NextCopyGeneration();
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
   TouchLru(key, owned_[key]);
@@ -546,6 +547,7 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
   r.pages = it->second.pages;
   r.size = it->second.size;
   r.page_size = page_size_;
+  r.generation = it->second.generation;
   // Extend the read lease so concurrent Evict reports bytes_freed=0 for
   // this key.  CAS-max rather than a plain store: with a shared lock two
   // readers can renew the same key at once, and neither may shorten it.
@@ -581,6 +583,7 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.pages = it->second.pages;
     entry.size = it->second.size;
     entry.page_size = page_size_;
+    entry.generation = it->second.generation;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
     if (reader == ResolveReader::kLocal) {
       entry.hold = it->second.hold;
@@ -627,6 +630,21 @@ std::vector<bool> PageBackend::BatchContains(const std::vector<std::string>& key
   // existence answer needs no page vector, no lease renewal and no LRU touch.
   std::shared_lock<std::shared_mutex> lock(mutex_);
   for (size_t i = 0; i < keys.size(); ++i) out[i] = owned_.find(keys[i]) != owned_.end();
+  return out;
+}
+
+std::vector<bool> PageBackend::BatchStillHolds(const std::vector<std::string>& keys,
+                                               const std::vector<uint64_t>& generations) const {
+  std::vector<bool> out(keys.size(), false);
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  for (size_t i = 0; i < keys.size() && i < generations.size(); ++i) {
+    if (generations[i] == 0) {
+      out[i] = true;
+      continue;
+    }
+    const auto it = owned_.find(keys[i]);
+    out[i] = it != owned_.end() && it->second.generation == generations[i];
+  }
   return out;
 }
 

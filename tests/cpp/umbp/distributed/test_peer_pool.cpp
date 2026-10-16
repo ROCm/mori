@@ -424,6 +424,50 @@ TEST(PeerPool, ClearDropsPhysicalAndLogicalState) {
   EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 0u);
 }
 
+// Answers BatchStillHolds by generation parity and records what it was asked.
+class ParityStillHoldsBackend final : public MockBackend {
+ public:
+  explicit ParityStillHoldsBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    ++calls;
+    asked.insert(asked.end(), keys.begin(), keys.end());
+    std::vector<bool> out(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) out[i] = generations[i] % 2 == 0;
+    return out;
+  }
+
+  mutable int calls = 0;
+  mutable std::vector<std::string> asked;
+};
+
+TEST(PeerPool, ValidateResolvedAsksEachNamedBackendOnce) {
+  BackendRegistry registry;
+  auto a = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto b = std::make_unique<ParityStillHoldsBackend>(TierType::DRAM);
+  auto* pa = a.get();
+  auto* pb = b.get();
+  ASSERT_TRUE(registry.Register("dram_a", std::move(a)));
+  ASSERT_TRUE(registry.Register("dram_b", std::move(b)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  const uint32_t ida = registry.BackendId(pa);
+  const uint32_t idb = registry.BackendId(pb);
+
+  // Answered by the backend the reader read from, not by whichever holds the
+  // key now; a backend this peer does not have cannot vouch for anything.
+  const auto valid = pool.ValidateResolved({ida, idb, ida, BackendRegistry::kMaxBackends, idb},
+                                           {"a1", "b1", "a2", "x", "b2"}, {2, 2, 3, 2, 5});
+  EXPECT_EQ(valid, (std::vector<bool>{true, true, false, false, false}));
+  EXPECT_EQ(pa->calls, 1);
+  EXPECT_EQ(pb->calls, 1);
+  EXPECT_EQ(pa->asked, (std::vector<std::string>{"a1", "a2"}));
+  EXPECT_EQ(pb->asked, (std::vector<std::string>{"b1", "b2"}));
+
+  // Parallel vectors that disagree are a malformed request: nothing is vouched for.
+  EXPECT_EQ(pool.ValidateResolved({ida}, {"a1", "a2"}, {2, 2}), (std::vector<bool>{false, false}));
+}
+
 TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));

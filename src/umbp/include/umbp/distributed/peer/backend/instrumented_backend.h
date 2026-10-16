@@ -78,6 +78,11 @@ class InstrumentedBackend final : public MediumBackend {
   TierCapacity Capacity() const override { return inner_->Capacity(); }
   uint64_t OwnedKeyCount() const override { return inner_->OwnedKeyCount(); }
   bool Contains(const std::string& key) const override { return inner_->Contains(key); }
+  // Must forward: the default answers true, which would wave every stale read through.
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    return inner_->BatchStillHolds(keys, generations);
+  }
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override {
     return inner_->AcquireMigrationRead(key, resolved);
   }
