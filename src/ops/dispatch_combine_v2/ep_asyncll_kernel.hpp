@@ -1021,8 +1021,13 @@ __device__ void EpCombineAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
       uint64_t* count = reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(laneId));
       uint8_t* sendCounts = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
       // Dispatch recv drained its sends, so its old count source may be reused.
+      // Biased by one: 0 means no dispatch was announced this round, and must
+      // stay 0 tokens rather than wrap to UINT64_MAX, which SendTransfer would
+      // multiply into a ~2^64-byte SDMA copy. Same guard as the legacy path's
+      // `announced == 0`; the host call-order check keeps it unreachable.
+      const uint64_t announced = core::AtomicLoadRelaxedSystem(count);
       *reinterpret_cast<uint64_t*>(sendCounts + asyncll::SendCountSlot(laneId)) =
-          core::AtomicLoadRelaxedSystem(count) - 1;
+          announced == 0 ? 0 : announced - 1;
       core::AtomicStoreRelaxedSystem(count, uint64_t{0});
       *reinterpret_cast<uint64_t*>(sendCounts + asyncll::SendFlagSlot(laneId)) =
           args.crossDeviceBarrierFlag[0];
