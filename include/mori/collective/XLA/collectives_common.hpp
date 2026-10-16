@@ -90,7 +90,6 @@ struct AddressPair {
 
 #define USE_NONTEMPORAL_LOAD 0
 #define GLOBAL_SPACE __attribute__((address_space(1)))
-#define BREAK_ON_RETRIES 1
 
 // Streaming (cache-bypassing) 16-byte load/store.
 #if (defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__))
