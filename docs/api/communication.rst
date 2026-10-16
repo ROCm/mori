@@ -68,7 +68,7 @@ Dispatch and combine kernels for MoE expert parallelism.
 See :doc:`MORI-EP Guide <../MORI-EP-GUIDE>` for full API reference.
 
 AsyncLL v2 SDMA overlap
-~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
 The HIP backend of ``mori.ops.dispatch_combine_v2`` supports
 ``async_ll=True, async_ll_transport="sdma"``. Run independent computation
