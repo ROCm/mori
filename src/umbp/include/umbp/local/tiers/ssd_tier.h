@@ -109,7 +109,7 @@ class SSDTier : public TierBackend {
   TierSpaceStats SpaceStats() const override;
   // Segment size in effect: ssd.segment_size_bytes, capped for a small tier.
   uint64_t segment_size() const { return segment_size_; }
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
 
   // True when segment I/O is actually bypassing the page cache.  False if
   // direct I/O was never requested, or was requested and the probe failed.

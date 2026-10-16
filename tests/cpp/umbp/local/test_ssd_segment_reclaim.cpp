@@ -232,6 +232,14 @@ TEST_F(SegmentReclaimTest, EvictionOrderRanksEmptiestAndColdestFirst) {
   EXPECT_EQ(tier->EvictionOrder(3).size(), 3u);
 }
 
+// GDS reads and in-place promotions read through LocateRecord.
+TEST_F(SegmentReclaimTest, InPlaceReadCountsAsAnAccess) {
+  auto tier = MakeTier();
+  for (int i = 0; i < 48; ++i) ASSERT_TRUE(Write(*tier, i));  // segments 0..2, 2 active
+  for (int i = 0; i < 16; ++i) ASSERT_TRUE(tier->LocateRecord(Key(i)).has_value());
+  EXPECT_EQ(tier->EvictionOrder(1).front().key, Key(16));
+}
+
 // A batch reports each key: one that does not fit fails alone, and is not
 // left looking stored.  Before, a key refused for space came back `true`.
 TEST_F(SegmentReclaimTest, BatchWriteReportsKeysThatDidNotFit) {
