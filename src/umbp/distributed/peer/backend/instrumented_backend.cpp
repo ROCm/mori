@@ -175,22 +175,21 @@ std::vector<bool> InstrumentedBackend::BatchAbort(const std::vector<uint64_t>& s
   return out;
 }
 
-std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                             bool include_descs,
-                                                             bool allow_file_refs,
-                                                             ResolveReader reader) {
+std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(
+    const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs,
+    ResolveReader reader, const std::vector<ObjectExtent>* extents) {
   ops_[kResolve].batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<ResolvedEntry> out;
   {
     ScopedNanos timer(ops_[kResolve].nanos);
-    out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader);
+    out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
   }
   uint64_t bytes = 0;
   for (const ResolvedEntry& r : out) {
     switch (EffectiveResolveOutcome(r)) {
       case ResolveOutcome::kFound:
         Add(kResolve, kOk, 1);
-        bytes += r.size;
+        bytes += r.covered_size != 0 ? r.covered_size : r.size;
         break;
       case ResolveOutcome::kMissing:
         Add(kResolve, kMiss, 1);

@@ -62,6 +62,19 @@ inline bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page
   return true;
 }
 
+// Moves an object range onto a staged window (ResolvedEntry::covered_offset /
+// covered_size), so the walk below indexes the window's pages.  False, leaving
+// `*object_offset` untouched, if any byte of the range lies outside the window.
+inline bool RebaseRangeOntoWindow(uint64_t window_offset, uint64_t window_size,
+                                  size_t* object_offset, size_t range_size) {
+  const uint64_t offset = *object_offset;
+  if (offset < window_offset) return false;
+  const uint64_t into = offset - window_offset;
+  if (into > window_size || range_size > window_size - into) return false;
+  *object_offset = static_cast<size_t>(into);
+  return true;
+}
+
 // Walk [object_offset, object_offset + range_size) across `pages`, calling
 // `emit` once per page the range touches.
 //

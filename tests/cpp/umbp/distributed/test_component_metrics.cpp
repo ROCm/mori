@@ -233,10 +233,11 @@ class ScriptedResolveBackend : public MockBackend {
 
   std::map<std::string, ResolveOutcome> outcomes;
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override {
-    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
+    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
       auto it = outcomes.find(keys[i]);
       if (it == outcomes.end()) continue;

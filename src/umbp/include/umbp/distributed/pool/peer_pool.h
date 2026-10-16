@@ -124,10 +124,12 @@ class PeerPool {
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
-  // `reader` is passed to every backend asked (see MediumBackend::BatchResolve).
+  // `reader` and `extents` (parallel to `keys`, or null) are passed to every
+  // backend asked (see MediumBackend::BatchResolve).
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                               bool include_descs, bool allow_file_refs = false,
-                                              ResolveReader reader = ResolveReader::kRemote);
+                                              ResolveReader reader = ResolveReader::kRemote,
+                                              const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
   // check discards. Takes no read lease and does not touch recency: asking

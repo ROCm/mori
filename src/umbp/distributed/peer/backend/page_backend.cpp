@@ -556,8 +556,10 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
 
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
                                                      bool include_descs, bool allow_file_refs,
-                                                     ResolveReader reader) {
+                                                     ResolveReader reader,
+                                                     const std::vector<ObjectExtent>* extents) {
   (void)allow_file_refs;  // pages are this medium's storage; there is no file to name
+  (void)extents;          // ...and they already hold the whole object
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
   // Shared: the whole batch -- hash lookups, page-vector copies and descriptor
