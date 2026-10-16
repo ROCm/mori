@@ -427,11 +427,9 @@ class PoolClient {
   // Single-attempt outcome from a peer call; mapped to PutEntryOutcome
   // by the caller (Partition / Allocate).
   enum class PutAttemptOutcome { kSuccess, kSuccessAlreadyExists, kRetry, kFatal };
-  enum class GetAttemptOutcome { kSuccess, kRetry, kFatal };
 
   PutAttemptOutcome ExecuteLocalPut(const std::string& key, const void* src, size_t size,
                                     TierType tier, const std::string& logical_tier = {});
-  GetAttemptOutcome ExecuteLocalGet(const std::string& key, void* dst, size_t size);
 
   // Resolve `keys` through the PeerPool. On return holders[i] is the
   // backend that owns keys[i] (nullptr when nothing here does) and, when it is
@@ -525,18 +523,16 @@ class PoolClient {
   // as host bytes, or the engine picks the wrong copy direction.
   bool CopyContiguousToRanges(const TransferRef& src, uint64_t src_base, size_t object_size,
                               const std::vector<ObjectRange>& ranges);
-  bool CopyRangesToContiguous(const std::vector<ObjectRange>& ranges, void* dst,
-                              size_t object_size);
 
-  // Item-building halves of the two copies above.  They append to `items`
+  // Item builders for ranged <-> contiguous copies.  They append to `items`
   // instead of transferring, so a caller with MANY objects can issue ONE
   // Transfer for all of them.
   //
   // This is the difference between the local and remote ranged paths, and it
   // was worth ~65% of remote transfer time: ExecuteLocalPutRangesBatch
   // accumulates every request's items and transfers once, while the remote
-  // arena loop called CopyRangesToContiguous per key -- one blocking transfer,
-  // one kernel launch and one hipStreamSynchronize EACH.  Measured on an
+  // arena loop used to copy per key -- one blocking transfer, one kernel
+  // launch and one hipStreamSynchronize EACH.  Measured on an
   // 8-rank embedded deployment: 369 transfers carrying 369 segments, 14.5 us
   // apiece, of which only ~5 us was the copy.
   //

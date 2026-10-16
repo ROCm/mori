@@ -112,27 +112,6 @@ class SpdkSsdTier : public TierBackend {
                                               const std::vector<size_t>* item_shm_offsets = nullptr,
                                               void** ext_dma_bufs = nullptr, int ext_dma_count = 0);
 
-  // Zero-copy DMA variants: data_ptrs must be DMA-registered, 4KB-aligned,
-  // with AlignUp(size) bytes of writable space per key.
-  std::vector<bool> BatchWriteDmaDirect(const std::vector<std::string>& keys,
-                                        const std::vector<void*>& dma_ptrs,
-                                        const std::vector<size_t>& sizes);
-
-  std::vector<bool> BatchReadDmaDirect(const std::vector<std::string>& keys,
-                                       const std::vector<uintptr_t>& dma_ptrs,
-                                       const std::vector<size_t>& sizes);
-
-  // Streaming zero-copy variants.
-  std::vector<bool> BatchWriteDmaStreaming(const std::vector<std::string>& keys,
-                                           const std::vector<void*>& dma_ptrs,
-                                           const std::vector<size_t>& sizes,
-                                           std::atomic<uint32_t>* items_ready);
-
-  std::vector<bool> BatchReadDmaStreaming(const std::vector<std::string>& keys,
-                                          const std::vector<uintptr_t>& dma_ptrs,
-                                          const std::vector<size_t>& sizes,
-                                          std::atomic<uint32_t>* items_done);
-
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 

@@ -133,8 +133,8 @@ class GatedEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return inner_.CanHandle(src, dst);
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    return inner_.Plan(items);
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
     {
@@ -174,6 +174,37 @@ class NoSpaceBackend final : public MockBackend {
     for (auto& result : results) result.outcome = AllocateOutcome::kFailedNoSpace;
     return results;
   }
+};
+
+// LocalCopyEngine whose next `failures` copies fail.
+class FailingEngine final : public TransferEngine {
+ public:
+  explicit FailingEngine(int failures) : failures_(failures) {}
+  void FailNext(int n) { failures_.store(n); }
+
+  const char* Name() const override { return "failing"; }
+  TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
+                             int device) override {
+    return inner_.RegisterMemory(base, size, loc, device);
+  }
+  void Deregister(const TransferRef& ref) override { inner_.Deregister(ref); }
+  bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
+    return inner_.CanHandle(src, dst);
+  }
+  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
+    return inner_.Plan(items);
+  }
+  std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
+    if (failures_.load() > 0) {
+      failures_.fetch_sub(1);
+      return nullptr;  // the copy never happened
+    }
+    return inner_.Submit(std::move(plans));
+  }
+
+ private:
+  LocalCopyEngine inner_;
+  std::atomic<int> failures_;
 };
 
 class BusyResolveBackend final : public MockBackend {
@@ -405,6 +436,7 @@ TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   EXPECT_EQ(results[0].backend_id, registry.BackendId(registry.Get("dram_b")));
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_FALSE(results[1].in_flight);
   EXPECT_EQ(results[2].backend_id, registry.BackendId(registry.Get("dram_a")));
   EXPECT_EQ(results[2].allocation.outcome, AllocateOutcome::kSuccessAllocated);
 }
@@ -419,6 +451,7 @@ TEST(PeerPool, ReservesDuplicateKeysUntilCommitOrAbort) {
   ASSERT_EQ(results.size(), 2u);
   EXPECT_EQ(results[0].allocation.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_EQ(results[1].allocation.outcome, AllocateOutcome::kFailed);
+  EXPECT_TRUE(results[1].in_flight);
 
   ASSERT_TRUE(
       pool.BatchAbort({PoolSlotRef{results[0].backend_id, results[0].allocation.slot_id}}).front());
@@ -812,6 +845,7 @@ TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
   auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
   ASSERT_TRUE(compiled.ok()) << compiled.error;
   PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  pool.SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds{50});
   // Fill cold's only page directly.
   auto* cold = registry.Get("cold");
   auto filler = cold->BatchAllocate({AllocateRequest{"filler", kPageSize}}).front();
@@ -826,6 +860,65 @@ TEST(PeerPool, DemotionWithNoRoomDownstreamDropsTheCopy) {
   EXPECT_FALSE(cold->Contains("k"));
   EXPECT_TRUE(cold->Contains("filler"));
   EXPECT_FALSE(pool.PlacementBackend("k").has_value());
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 1u);
+}
+
+// A demotion copy that fails is retried, since the evicted copy is the only
+// one; it is dropped only once the retry budget runs out, so the tier frees.
+TEST(PeerPool, AFailedDemotionIsRetriedUntilItsBudgetRunsOut) {
+  constexpr uint64_t kPageSize = 4096;
+  FailingEngine engine(/*failures=*/0);
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitKey(&pool, "a");
+  CommitKey(&pool, "b");
+
+  engine.FailNext(2);  // the first two copies fail; the third lands
+  auto evicted = pool.Evict({PoolEvictRequest{"a", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  EXPECT_EQ(evicted.front().outcome, PoolEvictOutcome::kDemotionQueued);
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "a"));
+  EXPECT_TRUE(registry.Get("cold")->Contains("a")) << "dropped, not demoted";
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 0u);
+  EXPECT_GE(pool.TransitionMetrics().failed, 2u) << "the failed attempts still count";
+  EXPECT_GE(pool.TransitionMetrics().retried, 2u);
+
+  pool.SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds{50});
+  engine.FailNext(1000000);  // every copy fails
+  pool.Evict({PoolEvictRequest{"b", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "b"));
+  EXPECT_FALSE(registry.Get("cold")->Contains("b"));
+  EXPECT_FALSE(pool.PlacementBackend("b").has_value());
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 1u);
+}
+
+// No space at the target (an SSD whose staging is full of reads) is waited
+// out, not a reason to drop the only copy.
+TEST(PeerPool, ADemotionWaitsOutATargetWithNoRoomForNow) {
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 1);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  auto* cold = registry.Get("cold");
+  auto filler = cold->BatchAllocate({AllocateRequest{"filler", kPageSize}}).front();
+  ASSERT_EQ(filler.outcome, AllocateOutcome::kSuccessAllocated);  // cold's only page, pending
+  CommitKey(&pool, "k");
+
+  pool.Evict({PoolEvictRequest{"k", TierType::DRAM}}, PoolEvictMode::kReclaim);
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  EXPECT_TRUE(registry.Get("hot")->Contains("k")) << "dropped while the target was only busy";
+
+  cold->BatchAbort({filler.slot_id});  // the pressure clears
+  ASSERT_TRUE(WaitForKeyGone(&registry, "hot", "k"));
+  EXPECT_TRUE(cold->Contains("k"));
+  EXPECT_EQ(pool.TransitionMetrics().dropped, 0u);
 }
 
 TEST(PeerPool, WatermarkMigratesCommittedKey) {

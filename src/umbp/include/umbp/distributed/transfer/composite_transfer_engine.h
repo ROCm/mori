@@ -76,9 +76,8 @@ class CompositeTransferEngine final : public TransferEngine {
 
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
 
-  // Partition items by the engine that will carry them, delegate, and tag each
-  // returned plan with its engine so Submit can route it back.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  // Routes each item to its engine's builder and tags plans with the engine.
+  // Plans are grouped by engine, in first-seen order.
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
