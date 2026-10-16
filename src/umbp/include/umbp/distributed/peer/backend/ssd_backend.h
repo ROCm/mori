@@ -175,7 +175,8 @@ class SsdBackend : public MediumBackend {
   // An extent-scoped read (BatchResolve with an extent, kLocal only): a span
   // holding object bytes [offset, offset + length), private to the reader(s)
   // it was published to and freed once their holds are gone.  Kept out of
-  // read_leases_, whose entries stand for the whole object.
+  // read_leases_, whose entries stand for the whole object.  ClearLocal also
+  // parks here the leases readers still hold.
   struct ExtentStage {
     StagingSpan span;
     uint64_t offset = 0;
