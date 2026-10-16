@@ -19,6 +19,8 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+// Loads hipFile (https://github.com/ROCm/hipFile) at runtime.  See the
+// acknowledgement in gds_engine.h.
 #include "hipfile_dl.h"
 
 #include <dlfcn.h>
