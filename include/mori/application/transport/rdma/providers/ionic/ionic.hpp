@@ -171,9 +171,10 @@ class IonicDeviceContext : public RdmaDeviceContext {
   };
   std::mutex dmabufRingsMutex;
   std::unordered_map<int, DmabufRing> dmabufRings;
+  bool dmabufRingsEnabled{false};
 
   uint32_t pdn;
-  struct ibv_pd* pd_uxdma[2];
+  struct ibv_pd* pd_uxdma[2]{};
 
   std::unordered_map<uint32_t, IonicCqContainer*> cqPool;
   std::unordered_map<uint32_t, IonicQpContainer*> qpPool;

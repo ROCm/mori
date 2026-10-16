@@ -643,6 +643,7 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
             "rings",
             i, err);
       } else {
+        dmabufRingsEnabled = true;
         MORI_APP_TRACE("dmabuf descriptor rings enabled on pd_uxdma[{}]", i);
       }
     }
@@ -667,6 +668,18 @@ IonicDeviceContext::~IonicDeviceContext() {
     delete it.second;
   }
   cqPool.clear();
+
+  // Parent domains can only be released once no CQ/QP references them. Only done with
+  // dmabuf rings, whose fds must be returned; the default path keeps them until the
+  // device is closed, as it always has.
+  for (int i = 0; i < 2 && dmabufRingsEnabled; i++) {
+    if (pd_uxdma[i] == nullptr) continue;
+    int err = ibv_dealloc_pd(pd_uxdma[i]);
+    if (err != 0) {
+      MORI_APP_WARN("ibv_dealloc_pd failed on pd_uxdma[{}]: err:{} ({})", i, err, strerror(err));
+    }
+    pd_uxdma[i] = nullptr;
+  }
 }
 
 RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -724,7 +737,9 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
-  // cqPool.insert({cq->cqn, cq});
+  // One CQ per endpoint, keyed by its QP's qpn: ionic leaves cqn unset (0 for every CQ).
+  // Tracked (and so destroyed at teardown) only with dmabuf rings, to release the ring fd.
+  if (dmabufRingsEnabled) cqPool.insert({qp->qpn, cq});
   qpPool.insert({qp->qpn, qp});
 
   MORI_APP_TRACE(
