@@ -316,40 +316,33 @@ _COMBINE_PUSH_TABLE: dict = {
 # The LL128 protocol (EpCfg::ll128 in ep_cfg.hpp): an op of at most `max_tok` tokens a rank
 # runs every call on one dispatch and one combine plan, block x warp each, instead of the
 # schedule. One plan each because the per-block call numbers are module globals, which a
-# second plan would not share. Keyed by quant_type, then (world, hidden, topk, experts a rank)
-# and the dispatch dtype. EP4 on C17, 2026-10-16, 3 alternating rounds, us against the schedule
-# at 1 / 64 / 256 / 512 tokens a rank, an op of 512 tokens a rank:
-#   fp4  dispatch 18.0 -> 8.1, 21.7 -> 10.8, 21.5 -> 13.2, 23.3 -> 20.8
-#        combine  12.2 -> 7.6, 14.6 -> 8.6, 16.4 -> 10.2, 19.3 -> 14.4
-#   fp8  dispatch 18.3 -> 8.3, 24.6 -> 11.8, 25.9 -> 16.7, 29.5 -> 27.9
-#        combine  12.4 -> 8.1, 15.1 -> 9.2, 18.4 -> 12.5, 23.8 -> 19.1
-# bf16, the bf16 LL128 combine in place of the pull combine, an op of 256 tokens a rank, at
-# 1 / 64 / 256: dispatch 20.6 -> 9.6, 29.1 -> 13.9, 30.4 -> 27.2; combine 17.1 -> 10.0,
-# 16.5 -> 11.6, 25.2 -> 21.9. At 512 both lost (dispatch 34.9 -> 44.5, combine 34.2 -> 36.7,
-# measured before the combine folded the weights, which only adds work), so bf16 stops at 256.
-# Past max_tok and up to combine_max_tok only the combine takes LL128 (EpCfg::ll128CombineOnly),
-# after the schedule's dispatch in every bucket. fp4, an op of 2048 tokens a rank, at
-# 1 / 64 / 512 / 1024 / 2048 tokens a rank:
-#   combine  12.8 -> 7.7, 14.5 -> 8.7, 19.4 -> 14.7, 31.2 -> 23.4, 50.8 -> 40.8
-#   dispatch (the same kernel) 18.1 -> 18.0, 20.6 -> 20.6, 23.3 -> 23.4, 31.1 -> 32.6, 40.1 -> 41.0
-# fp8 has none: at 1024 / 2048 its combine gains less (34.2 -> 32.9, 63.7 -> 61.9) than its
-# dispatch loses (36.4 -> 38.7, 54.3 -> 59.2).
+# second plan would not share. The plans keep the schedule's grid at those token counts, 64
+# blocks: the rest of the CUs belong to the co-resident GEMM. max_tok is the largest op whose
+# dispatch and combine are both faster than the schedule's on that grid at every token count.
+# Keyed by quant_type, then (world, hidden, topk, experts a rank) and the dispatch dtype.
+# EP4 on C17, 2026-10-16, 3 alternating rounds, us against the schedule (the same 64x8 grids):
+#   fp4, an op of 128, at 1 / 16 / 64 / 128: dispatch 17.9 -> 8.1, 19.3 -> 9.1, 20.7 -> 11.8,
+#     20.8 -> 12.3; combine 12.0 -> 7.8, 13.3 -> 8.3, 14.6 -> 9.1, 15.2 -> 11.5
+#   fp8, the same: dispatch 18.2 -> 8.2, 22.8 -> 9.5, 24.2 -> 12.6, 24.6 -> 14.5;
+#     combine 12.2 -> 8.1, 13.7 -> 8.6, 15.2 -> 9.9, 16.3 -> 13.7
+#   bf16, an op of 16, at 1 / 4 / 16: dispatch 21.6 -> 9.4, 22.4 -> 10.2, 25.4 -> 11.7;
+#     combine 16.0 -> 9.7, 21.8 -> 10.1, 16.2 -> 10.6
+# On that grid, in an op of 256, the combine loses at 256 (fp4 16.6 -> 19.6, fp8 18.8 -> 21.8)
+# and bf16's from 64 (16.5 -> 18.5).
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): {
-                "fp4": dict(max_tok=512, combine_max_tok=2048, dispatch=(128, 8), combine=(256, 8))
-            },
+            (4, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
         },
     },
     "fp8_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): {"fp8": dict(max_tok=512, dispatch=(128, 8), combine=(256, 8))},
+            (4, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
         },
     },
     "none": {
         "gfx1250": {
-            (4, 7168, 6, None): {"bf16": dict(max_tok=256, dispatch=(128, 8), combine=(256, 8))},
+            (4, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 8), combine=(64, 8))},
         },
     },
 }
