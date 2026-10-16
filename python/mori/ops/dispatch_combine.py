@@ -36,6 +36,14 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 TOPK_IDX_DTYPE = torch.int32
+_CUSPLIT_POOL_SLOTS_GFX125X = 8 * 65536
+
+
+def _cusplit_slots_per_peer(world_size: int) -> int:
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    return _CUSPLIT_POOL_SLOTS_GFX125X // world_size
+
 
 # Threads per wavefront. gfx1250 (MI450/MI455) is wave32; gfx9xx (MI300/MI355)
 # is wave64. This MUST NOT be hard-coded: the device kernels recompute
@@ -514,8 +522,7 @@ class EpDispatchCombineOp:
             config.kernel_type == EpDispatchCombineKernelType.IntraNode
             and _is_gfx125x()
         ):
-            _cusplit_pool_slots = 8 * 32768
-            _slots_per_peer = _cusplit_pool_slots // max(config.world_size, 1)
+            _slots_per_peer = _cusplit_slots_per_peer(config.world_size)
             if config.max_total_recv_tokens > 0:
                 _recv_per_rank = min(
                     -(-config.max_total_recv_tokens // config.world_size),

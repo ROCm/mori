@@ -322,7 +322,7 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
 // The dispatch body. Launch geometry is 64 blocks x 8 warps (see _resolve_launch_params in
 // python/mori/ops/dispatch_combine.py).
 
-#define CUSPLIT_POOL_SLOTS (MAX_GPUS_PER_NODE * 32768)
+#define CUSPLIT_POOL_SLOTS (MAX_GPUS_PER_NODE * 65536)
 #define CUSPLIT_MAX_BLOCKS 512
 // GATHER-FUSED staging: FINALIZE gathers each token's metadata into these per-peer, destTokId-
 // ordered SoA arrays (sequential reads of tokenIndices/weights/scales by srcTok, sequential writes
