@@ -331,23 +331,25 @@ _COMBINE_PUSH_TABLE: dict = {
 # The LL128 protocol (EpCfg::ll128 in ep_cfg.hpp): an op of at most `max_tok` tokens a rank
 # runs every call on one dispatch and one combine plan, block x warp each, instead of the
 # schedule. One plan each because the per-block call numbers are module globals, which a
-# second plan would not share. The plans keep the schedule's grid at those token counts, 64
-# blocks: the rest of the CUs belong to the co-resident GEMM. max_tok is the largest op whose
-# dispatch and combine are both faster than the schedule's on that grid at every token count.
-# Keyed by quant_type, then (world, hidden, topk, experts a rank) and the dispatch dtype.
-# EP4 on C17, 2026-10-16, 3 alternating rounds, us against the schedule (the same 64x8 grids):
-#   fp4, an op of 128, at 1 / 16 / 64 / 128: dispatch 17.9 -> 8.1, 19.3 -> 9.1, 20.7 -> 11.8,
-#     20.8 -> 12.3; combine 12.0 -> 7.8, 13.3 -> 8.3, 14.6 -> 9.1, 15.2 -> 11.5
-#   fp8, the same: dispatch 18.2 -> 8.2, 22.8 -> 9.5, 24.2 -> 12.6, 24.6 -> 14.5;
-#     combine 12.2 -> 8.1, 13.7 -> 8.6, 15.2 -> 9.9, 16.3 -> 13.7
-#   bf16, an op of 16, at 1 / 4 / 16: dispatch 21.6 -> 9.4, 22.4 -> 10.2, 25.4 -> 11.7;
-#     combine 16.0 -> 9.7, 21.8 -> 10.1, 16.2 -> 10.6
-# On that grid, in an op of 256, the combine loses at 256 (fp4 16.6 -> 19.6, fp8 18.8 -> 21.8)
-# and bf16's from 64 (16.5 -> 18.5).
+# second plan would not share. The plans stay on 64 blocks at these token counts (the rest of
+# the CUs belong to the co-resident GEMM); dispatch and combine may differ in warps a block.
+# max_tok is the largest op whose dispatch and combine are both faster than the schedule's at
+# every token count. Keyed by quant_type, then (world, hidden, topk, experts a rank) and the
+# dispatch dtype. EP4 on C17, 2026-10-16, 3 alternating rounds, us against the schedule:
+#   fp4 on 64x16 + 64x16, an op of 256, at 1 / 64 / 128 / 256: dispatch 18.0 -> 8.1,
+#     22.9 -> 10.9, 21.1 -> 12.2, 22.4 -> 18.9; combine 12.2 -> 7.6, 14.7 -> 8.7, 15.1 -> 9.9,
+#     16.7 -> 15.1. At 512, in an op of 512, both lose (24.3 -> 29.0, 20.4 -> 26.1).
+#   fp8 on 64x8 + 64x8, an op of 128, at 1 / 16 / 64 / 128: dispatch 18.2 -> 8.2, 22.8 -> 9.5,
+#     24.2 -> 12.6, 24.6 -> 14.5; combine 12.2 -> 8.1, 13.7 -> 8.6, 15.2 -> 9.9, 16.3 -> 13.7.
+#     Its combine loses at 256 (18.9 -> 21.9), and on 64x16 from 64 (15.2 -> 15.8).
+#   bf16 on 64x16 + 64x16, an op of 64, at 1 / 16 / 64: dispatch 18.5 -> 9.6, 25.2 -> 10.8,
+#     27.2 -> 14.7; combine 19.5 -> 9.9, 16.1 -> 10.6, 16.4 -> 16.0. Its combine loses at 128
+#     (17.6 -> 23.6).
+# The fp4 push combine on 64x32 does not build.
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
+            (4, 7168, 6, None): {"fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))},
         },
     },
     "fp8_blockwise": {
@@ -357,7 +359,7 @@ _LL128_TABLE: dict = {
     },
     "none": {
         "gfx1250": {
-            (4, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 8), combine=(64, 8))},
+            (4, 7168, 6, None): {"bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))},
         },
     },
 }
