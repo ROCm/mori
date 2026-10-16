@@ -170,10 +170,9 @@ class TierBackend {
 
   // Physical location of |key|'s value for a zero-copy reader that DMAs it
   // itself (GdsEngine).  Default: no stable file location — only the
-  // segment-file SSD tiers override it.  Read-only: acquires no lock the caller
-  // must hold and does not touch LRU, so a Resolve can call it without
-  // perturbing recency.
-  virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) const {
+  // segment-file SSD tiers override it.  Acquires no lock the caller must hold.
+  // Touches LRU: the caller reads the record, just not through this tier.
+  virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) {
     return std::nullopt;
   }
 

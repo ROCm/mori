@@ -341,7 +341,7 @@ TierSpaceStats ShardedSsdTier::SpaceStats() const {
   return sum;
 }
 
-std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) const {
+std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
   return shards_[shard]->LocateRecord(key);
