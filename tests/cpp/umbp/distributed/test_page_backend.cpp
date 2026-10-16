@@ -422,6 +422,25 @@ TEST(PageBackend, EvictDefersWhenReadLeaseActive) {
   EXPECT_EQ(events[0].kind, KvEvent::Kind::REMOVE);
 }
 
+// A local reader's hold fences eviction past any lease, until it is dropped.
+TEST(PageBackend, ALocalHoldFencesEvictionUntilDropped) {
+  auto a = std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                         /*pending_ttl=*/std::chrono::milliseconds{5000},
+                                         /*read_lease_ttl=*/std::chrono::milliseconds{1});
+  auto p = AllocateOk(*a, "k", kPageSize);
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+
+  EXPECT_EQ(a->BatchResolve({"k"}, false)[0].hold, nullptr);  // a remote reader leases
+  auto held = a->BatchResolve({"k"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(held[0].found);
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, 0u) << "evicted under a local reader";
+
+  held.clear();
+  EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+}
+
 // ---- Full-sync snapshot -----------------------------------------------------
 
 TEST(PageBackend, SnapshotOwnedKeysReturnsEveryAdd) {

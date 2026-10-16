@@ -191,8 +191,8 @@ class FailingEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return inner_.CanHandle(src, dst);
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    return inner_.Plan(items);
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
     if (failures_.load() > 0) {
@@ -212,8 +212,9 @@ class BusyResolveBackend final : public MockBackend {
   explicit BusyResolveBackend(TierType tier) : MockBackend(tier) {}
 
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override {
-    if (!busy_) return MockBackend::BatchResolve(keys, include_descs, allow_file_refs);
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override {
+    if (!busy_) return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
     std::vector<ResolvedEntry> results(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
       if (Contains(keys[i])) results[i].outcome = ResolveOutcome::kBusy;
@@ -275,7 +276,8 @@ class BlockingResolveBackend final : public MockBackend {
   explicit BlockingResolveBackend(TierType tier) : MockBackend(tier) {}
 
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override {
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       entered_ = true;
@@ -285,7 +287,7 @@ class BlockingResolveBackend final : public MockBackend {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
     }
-    return MockBackend::BatchResolve(keys, include_descs, allow_file_refs);
+    return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
   }
 
   bool WaitUntilEntered() {

@@ -504,6 +504,69 @@ TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
   EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kFailed);
 }
 
+// A local reader copies what it gets, so its batch is staged up to half the
+// arena and the rest comes back kBusy for its next call.
+TEST_F(SsdBackendTest, ALocalBatchOverHalfTheArenaIsStagedInParts) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+
+  auto first = backend->BatchResolve({"large-a", "large-b"}, false, false, ResolveReader::kLocal);
+  ASSERT_EQ(first.size(), 2u);
+  EXPECT_TRUE(first[0].found);  // the first key may pass the half, so calls progress
+  EXPECT_NE(first[0].hold, nullptr);
+  EXPECT_EQ(first[1].outcome, ResolveOutcome::kBusy);
+
+  first.clear();  // copied
+  EXPECT_TRUE(backend->BatchResolve({"large-b"}, false, false, ResolveReader::kLocal)[0].found);
+}
+
+// Local staging lives exactly as long as its holds, whatever the lease clock
+// and the reaper say.
+TEST_F(SsdBackendTest, LocalStagingLivesAsLongAsItsHolds) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  auto first = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  auto second = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(first[0].found);
+  ASSERT_EQ(first[0].pages, second[0].pages);  // one staged read, shared
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  first.clear();
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "freed under a local reader";
+
+  second.clear();
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+  double peak = 0;
+  for (const auto& m : backend->SampleMetrics()) {
+    if (std::string(m.name) == MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE &&
+        m.labels.at(0).second == "staging_pages_peak") {
+      peak = m.value;
+    }
+  }
+  EXPECT_EQ(peak, 1.0);
+}
+
+// A remote reader cannot say when it is done: its lease outlives a local hold.
+TEST_F(SsdBackendTest, ARemoteLeaseOutlivesALocalHold) {
+  SsdBackend* backend =
+      Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{300});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(backend->BatchResolve({"key-a"}, false)[0].found);
+  ASSERT_TRUE(backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal)[0].found);
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "freed under a remote reader";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction and Clear
 // ---------------------------------------------------------------------------

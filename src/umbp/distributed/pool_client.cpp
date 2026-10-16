@@ -630,11 +630,16 @@ std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(PeerPool* pool,
   std::chrono::milliseconds backoff{1};
   size_t attempts = 0;
   while (true) {
-    auto resolved = pool->BatchResolve(keys, include_descs, allow_file_refs);
-    const bool busy = std::any_of(resolved.begin(), resolved.end(), [](const auto& entry) {
-      return EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
-    });
-    if (!busy) return resolved;
+    auto resolved = pool->BatchResolve(keys, include_descs, allow_file_refs, ResolveReader::kLocal);
+    bool busy = false;
+    bool served = false;
+    for (const auto& entry : resolved) {
+      const ResolveOutcome outcome = EffectiveResolveOutcome(entry.resolved);
+      busy |= outcome == ResolveOutcome::kBusy;
+      served |= outcome == ResolveOutcome::kFound;
+    }
+    // A served part is progress: the caller copies it, then asks for the rest.
+    if (!busy || served) return resolved;
     ++attempts;
     const auto remaining = deadline - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) {
@@ -1695,7 +1700,8 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
                                    const std::vector<size_t>& candidates,
                                    std::vector<MediumBackend*>* holders,
                                    std::vector<ResolvedEntry>* resolutions,
-                                   const std::function<bool(size_t)>& dst_is_device) {
+                                   const std::function<bool(size_t)>& dst_is_device,
+                                   std::vector<size_t>* busy) {
   holders->assign(keys.size(), nullptr);
   if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
   if (candidates.empty() || default_pool_ == nullptr || registry_.Empty()) return;
@@ -1748,10 +1754,18 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   }
   const bool report = master_client_ != nullptr && master_client_->ReportsLocalReads();
   std::vector<std::string> read_keys;
+  std::vector<size_t> left;
+  size_t served = 0;
   for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
-    if (!found[j].resolved.found) continue;
+    if (!found[j].resolved.found) {
+      if (EffectiveResolveOutcome(found[j].resolved) == ResolveOutcome::kBusy) {
+        left.push_back(candidates[j]);
+      }
+      continue;
+    }
     auto* backend = registry_.Get(found[j].backend_id);
     if (backend == nullptr) continue;
+    ++served;
     (*holders)[candidates[j]] = backend;
     if (report) read_keys.push_back((*batch)[j]);
     if (resolutions != nullptr) {
@@ -1759,6 +1773,7 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
     }
   }
   if (report) master_client_->NoteLocalReads(read_keys);
+  if (busy != nullptr && served > 0) *busy = std::move(left);
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,14 +2252,14 @@ void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
   std::vector<std::string> keys;
   keys.reserve(jobs.size());
   for (const auto& job : jobs) keys.push_back(job.key);
-  const auto resolved = backend->BatchResolve(keys, /*include_descs=*/false);
+  const auto present = backend->BatchContains(keys);
 
   std::vector<size_t> wanted;
   std::vector<AllocateRequest> requests;
   wanted.reserve(jobs.size());
   requests.reserve(jobs.size());
   for (size_t i = 0; i < jobs.size(); ++i) {
-    if (i < resolved.size() && resolved[i].found) continue;
+    if (i < present.size() && present[i]) continue;
     if (!jobs[i].route.has_value()) continue;
     wanted.push_back(i);
     requests.push_back(AllocateRequest{jobs[i].key, jobs[i].size});
@@ -3037,21 +3052,38 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
                                 const std::vector<void*>& dsts, const std::vector<size_t>& sizes,
                                 const std::vector<size_t>& indices, std::vector<bool>* results,
                                 std::vector<size_t>* missed) {
+  // A staged medium may publish a batch in parts; each part's holds go when
+  // its copy returns, before the next part is resolved.
+  for (std::vector<size_t> part = indices; !part.empty();) {
+    part = ServeLocalGetPart(keys, dsts, sizes, part, results, missed);
+  }
+}
+
+std::vector<size_t> PoolClient::ServeLocalGetPart(const std::vector<std::string>& keys,
+                                                  const std::vector<void*>& dsts,
+                                                  const std::vector<size_t>& sizes,
+                                                  const std::vector<size_t>& indices,
+                                                  std::vector<bool>* results,
+                                                  std::vector<size_t>* missed) {
   const auto miss = [&](size_t i) {
     if (missed != nullptr) missed->push_back(i);
   };
-  if (indices.empty()) return;
 
   std::vector<MediumBackend*> holders;
   std::vector<ResolvedEntry> resolutions;
-  ResolveLocalBatch(keys, indices, &holders, &resolutions,
-                    [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); });
+  std::vector<size_t> later;
+  ResolveLocalBatch(
+      keys, indices, &holders, &resolutions,
+      [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); }, &later);
+  std::vector<char> is_later(later.empty() ? 0 : keys.size(), 0);
+  for (size_t i : later) is_later[i] = 1;
 
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<TransferItem> items;
   std::vector<size_t> local_keys;
   local_keys.reserve(indices.size());
   for (size_t i : indices) {
+    if (!later.empty() && is_later[i]) continue;
     MediumBackend* const holder = holders[i];
     if (holder == nullptr) {
       miss(i);
@@ -3089,7 +3121,7 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
     for (size_t k = before; k < items.size(); ++k) items[k].tag = i;
     local_keys.push_back(i);
   }
-  if (items.empty()) return;
+  if (items.empty()) return later;
 
   std::vector<size_t> failed_tags;
   transfer_engine_->Transfer(items, &failed_tags);
@@ -3123,6 +3155,7 @@ void PoolClient::ServeLocalGets(const std::vector<std::string>& keys,
                    local_keys.size(), items.size(), local_get_bytes, sec * 1000.0,
                    local_get_bytes / (sec > 0 ? sec : 1e-12) / (1024.0 * 1024 * 1024));
   }
+  return later;
 }
 
 // Whole-batch entry point for the local-first arm: filter what cannot be served
@@ -3494,15 +3527,9 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // key and one bad key does not fail the batch.  This is why the local half
   // needs no per-key threading the way whole-object BatchGet does: the copies
   // are already batched into a single plan set.
-  // Preserve the batch vector's original reservation for buffered engines.
-  // HBM builds plans directly and does not need this hint.
-  size_t range_total = 0;
-  for (const auto& per_key : sizes) range_total += per_key.size();
-  auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
   // Buffer one object until its complete page walk succeeds. This preserves
   // the existing rollback: a bad object cannot leak partial work into a plan.
   std::vector<TransferItem> key_items;
-  size_t local_item_count = 0;
   std::vector<size_t> local_keys;
   std::vector<size_t> missed;
   missed.reserve(n);
@@ -3515,99 +3542,117 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   for (size_t i = 0; i < n; ++i) {
     if (!sizes[i].empty()) candidates.push_back(i);
   }
-  std::vector<MediumBackend*> holders;
-  std::vector<ResolvedEntry> resolutions;
-  {
-    PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
-    ResolveLocalBatch(keys, candidates, &holders, &resolutions, [&](size_t i) {
-      // One key's ranges normally share a caller allocation, but nothing
-      // guarantees it; a single host range makes the whole key unservable
-      // from a file ref, so require all of them.
-      const std::vector<void*>& key_dsts = dsts[i];
-      for (size_t r = 0; r < key_dsts.size(); ++r) {
-        if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+  // A staged medium may publish the batch in parts: each part is planned and
+  // copied, and its holds dropped, before the next part is resolved.
+  while (!candidates.empty()) {
+    std::vector<MediumBackend*> holders;
+    std::vector<ResolvedEntry> resolutions;
+    std::vector<size_t> later;
+    {
+      PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
+      ResolveLocalBatch(
+          keys, candidates, &holders, &resolutions,
+          [&](size_t i) {
+            // One key's ranges normally share a caller allocation, but nothing
+            // guarantees it; a single host range makes the whole key unservable
+            // from a file ref, so require all of them.
+            const std::vector<void*>& key_dsts = dsts[i];
+            for (size_t r = 0; r < key_dsts.size(); ++r) {
+              if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+            }
+            return !key_dsts.empty();
+          },
+          &later);
+    }
+    std::vector<char> is_later(later.empty() ? 0 : n, 0);
+    for (size_t i : later) is_later[i] = 1;
+
+    // The range count is a reservation hint for buffered engines; HBM builds
+    // plans directly and ignores it.
+    size_t range_total = 0;
+    for (size_t i : candidates) range_total += sizes[i].size();
+    auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
+    size_t local_item_count = 0;
+    local_keys.clear();
+    for (size_t i : candidates) {
+      if (!later.empty() && is_later[i]) continue;
+
+      MediumBackend* const holder = holders[i];
+      const ResolvedEntry& resolved = resolutions[i];
+      if (holder == nullptr) {
+        missed.push_back(i);
+        continue;
       }
-      return !key_dsts.empty();
-    });
-  }
-
-  for (size_t i = 0; i < n; ++i) {
-    if (sizes[i].empty()) continue;  // asked for nothing; stays false
-
-    MediumBackend* const holder = holders[i];
-    const ResolvedEntry& resolved = resolutions[i];
-    if (holder == nullptr) {
-      missed.push_back(i);
-      continue;
-    }
-    // The get API takes no object_sizes; the resolved entry is where the true
-    // stored size becomes known.  First hit labels the call.
-    if (dbg != nullptr && dbg->object_size == 0) {
-      dbg->object_size = static_cast<size_t>(resolved.size);
-    }
-    if (!RangesAreDisjointAndInBounds(static_cast<size_t>(resolved.size), sizes[i],
-                                      src_offsets[i])) {
-      MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid local ranges for key='{}' size={}",
-                      keys[i], resolved.size);
-      continue;  // a caller bug, not a miss — do not go looking for a replica
-    }
-    key_items.clear();
-    bool built = false;
-    {
-      PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
-      // Refilled per key rather than returned fresh: one allocation for the
-      // call instead of one per key.
-      FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
-      built =
-          resolved.file_ref.IsFile()
-              ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items)
-              : BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, resolved.size,
-                                         key_ranges, /*to_backend=*/false,
-                                         /*tag=*/i, &key_items, dbg ? &dbg->classify : nullptr);
-    }
-    if (!built) {
-      // The medium holds the key but cannot be read in-process.  Same call as
-      // Same disposition the local get path takes on a size mismatch: look
-      // reporting a miss the caller cannot distinguish from absence.
+      // The get API takes no object_sizes; the resolved entry is where the true
+      // stored size becomes known.  First hit labels the call.
+      if (dbg != nullptr && dbg->object_size == 0) {
+        dbg->object_size = static_cast<size_t>(resolved.size);
+      }
+      if (!RangesAreDisjointAndInBounds(static_cast<size_t>(resolved.size), sizes[i],
+                                        src_offsets[i])) {
+        MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: invalid local ranges for key='{}' size={}",
+                        keys[i], resolved.size);
+        continue;  // a caller bug, not a miss — do not go looking for a replica
+      }
       key_items.clear();
-      missed.push_back(i);
-      continue;
+      bool built = false;
+      {
+        PhaseTimer build_timer(dbg ? &dbg->build : nullptr);
+        // Refilled per key rather than returned fresh: one allocation for the
+        // call instead of one per key.
+        FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
+        built =
+            resolved.file_ref.IsFile()
+                ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items)
+                : BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size,
+                                           resolved.size, key_ranges, /*to_backend=*/false,
+                                           /*tag=*/i, &key_items, dbg ? &dbg->classify : nullptr);
+      }
+      if (!built) {
+        // The medium holds the key but cannot be read in-process.  Same call as
+        // Same disposition the local get path takes on a size mismatch: look
+        // reporting a miss the caller cannot distinguish from absence.
+        key_items.clear();
+        missed.push_back(i);
+        continue;
+      }
+      {
+        PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
+        PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
+        for (const auto& item : key_items) plan_builder->Add(item);
+      }
+      local_item_count += key_items.size();
+      local_keys.push_back(i);
     }
-    {
-      PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
-      PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
-      for (const auto& item : key_items) plan_builder->Add(item);
+    if (dbg != nullptr) dbg->items += local_item_count;
+    if (local_item_count != 0) {
+      std::vector<size_t> failed_tags;
+      {
+        PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
+        TransferEngine::StepTiming steps;
+        if (dbg != nullptr) steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
+        TransferPlanSet planned;
+        {
+          PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
+          planned = plan_builder->Finish();
+        }
+        transfer_engine_->Transfer(std::move(planned), &failed_tags,
+                                   dbg != nullptr ? &steps : nullptr);
+      }
+      const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
+      for (size_t i : local_keys) {
+        if (failed.count(i) != 0) continue;
+        results[i] = true;
+        record_local_get(i);
+        if (dbg != nullptr) dbg->local_keys += 1;
+      }
     }
-    local_item_count += key_items.size();
-    local_keys.push_back(i);
+    candidates = std::move(later);
   }
   if (dbg != nullptr) {
     // Classification is timed inside the build window, so subtract it out to
     // keep the phases disjoint and `other` meaningful.
     dbg->build -= dbg->classify;
-    dbg->items += local_item_count;
-  }
-  if (local_item_count != 0) {
-    std::vector<size_t> failed_tags;
-    {
-      PhaseTimer xfer_timer(dbg ? &dbg->xfer : nullptr);
-      TransferEngine::StepTiming steps;
-      if (dbg != nullptr) steps = {&dbg->xfer_plan, &dbg->xfer_submit, &dbg->xfer_wait};
-      TransferPlanSet planned;
-      {
-        PhaseTimer plan_timer(dbg ? &dbg->xfer_plan : nullptr);
-        planned = plan_builder->Finish();
-      }
-      transfer_engine_->Transfer(std::move(planned), &failed_tags,
-                                 dbg != nullptr ? &steps : nullptr);
-    }
-    const std::unordered_set<size_t> failed(failed_tags.begin(), failed_tags.end());
-    for (size_t i : local_keys) {
-      if (failed.count(i) != 0) continue;
-      results[i] = true;
-      record_local_get(i);
-      if (dbg != nullptr) dbg->local_keys += 1;
-    }
   }
   if (dbg != nullptr) dbg->remote_keys = missed.size();
   if (missed.empty()) return results;
@@ -4281,14 +4326,14 @@ std::vector<PoolClient::RangeFetchUnit> PoolClient::ServeWholeObjectUnitsFromMed
   std::vector<std::string> candidate_keys;
   candidate_keys.reserve(candidates.size());
   for (size_t i : candidates) candidate_keys.push_back(keys[units[i].original]);
-  const auto resolved = backend->BatchResolve(candidate_keys, /*include_descs=*/false);
+  const auto present = backend->BatchContains(candidate_keys);
 
   std::vector<size_t> wanted;
   std::vector<AllocateRequest> requests;
   wanted.reserve(candidates.size());
   requests.reserve(candidates.size());
   for (size_t c = 0; c < candidates.size(); ++c) {
-    if (c < resolved.size() && resolved[c].found) {
+    if (c < present.size() && present[c]) {
       leftover.push_back(std::move(units[candidates[c]]));
       continue;
     }
