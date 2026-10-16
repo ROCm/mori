@@ -236,6 +236,15 @@ def main():
         .scatter_(1, (idx.cpu().long() // EPR), True)
         .sum(1)
     )
+    # Every rank's ids and weights, [world, M, TOPK]: unlike the payload and the scale
+    # rows, a receiver cannot rebuild them from (rank, token), and dispatch forwards
+    # both next to every row it delivers.
+    def gather_all(t):
+        parts = [torch.empty_like(t.cpu()) for _ in range(world)]
+        dist.all_gather(parts, t.cpu().contiguous())
+        return torch.stack(parts)
+
+    all_idx, all_wts = gather_all(idx), gather_all(wts)
 
     obj = [cco.Communicator.get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(obj, src=0)
@@ -283,7 +292,8 @@ def main():
         dist.barrier()
 
     def check_dispatch(op, total, routing):
-        """Every received row must equal, BYTE FOR BYTE, the source row it claims.
+        """Every received row -- payload, scale row, ids and weights -- must equal,
+        BYTE FOR BYTE, the source row it claims.
 
         dispatch only transports -- "mori does no quantizing here: fp8/fp4 payloads
         arrive already packed" (hip_backend.py) -- so the bytes that land must be
@@ -298,8 +308,12 @@ def main():
         reverse map says a slot came from. That determinism is what makes this
         possible; before the seed was configurable it was not.
         """
-        if not CHECK or total == 0:
+        if not CHECK:
             return 0
+        # A rank that received nothing still takes part in the all_reduce below, or the
+        # other ranks wait in it for good.
+        if total == 0:
+            print(f"[EMPTY] rank {rank} received no token", flush=True)
         tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
         src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
         got = op.recv_tokens()[:total].cpu().view(torch.uint8)
@@ -314,15 +328,83 @@ def main():
                 constant=CONST_VAL,
             ).view(torch.uint8)
             bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
-        n = torch.tensor([bad])
+        # The scale rows travel with the payload rows. A source row's scale bytes are a
+        # pure function of (rank, token) -- see `scales` above -- so the reverse map
+        # alone gives the expected row. The control compares against the next token's
+        # row, which must fail every row: a comparison that cannot fail proves nothing.
+        sbad = sctl = 0
+        if SCALE_DIM:
+            sc_n_i32 = (SCALE_DIM + 3) // 4
+            gs = op.recv_scales()[:total].cpu().contiguous().view(torch.uint8)
+            gs = gs[:, :SCALE_DIM]
+
+            def sref(tok):
+                v = (tok + src_pe * 100003).to(torch.int32).view(-1, 1)
+                return v.repeat(1, sc_n_i32).view(torch.uint8)[:, :SCALE_DIM]
+
+            sbad = int((gs != sref(src_tok)).any(dim=1).sum())
+            sctl = int((gs != sref(src_tok + 1)).any(dim=1).sum())
+        # The ids and weights of every row against its sender's, through the same reverse
+        # map. A source rank out of range fails its row instead of raising here, which would
+        # leave the other ranks in the all_reduce. The control is the next rank's ids and
+        # weights for the same token, which must differ from every row; the next token's
+        # would not exist at one token a rank.
+        inr = (src_pe >= 0) & (src_pe < world)
+        pe_c = torch.where(inr, src_pe, torch.zeros_like(src_pe))
+        got_i = op.recv_indices()[:total].cpu()
+        got_w = op.recv_weights()[:total].cpu()
+        ibad = int(((got_i != all_idx[pe_c, src_tok]).any(dim=1) | ~inr).sum())
+        wbad = int(((got_w != all_wts[pe_c, src_tok]).any(dim=1) | ~inr).sum())
+        pe_n = (pe_c + 1) % world
+        mctl = int(
+            (
+                (got_i != all_idx[pe_n, src_tok]).any(dim=1)
+                | (got_w != all_wts[pe_n, src_tok]).any(dim=1)
+            ).sum()
+        )
+        n = torch.tensor(
+            [bad, sbad, sctl, total if SCALE_DIM else 0, ibad, wbad, mctl, total]
+        )
         dist.all_reduce(n)
-        if rank == 0 and n.item():
+        if rank == 0 and n[0].item():
             print(
                 f"  [{op.backend_name}] DISPATCH BYTE MISMATCH: "
-                f"{int(n.item())} rows across {world} ranks",
+                f"{int(n[0])} rows across {world} ranks",
                 flush=True,
             )
-        return int(n.item())
+        mt_ok = int(n[4]) == 0 and int(n[5]) == 0 and int(n[6]) == int(n[7])
+        if rank == 0:
+            print(
+                f"  [{op.backend_name}] METACHECK rows={int(n[7])} idx_bad={int(n[4])} "
+                f"wts_bad={int(n[5])} ctl={int(n[6])} ok={int(mt_ok)}",
+                flush=True,
+            )
+            if not mt_ok:
+                print(
+                    f"  [{op.backend_name}] DISPATCH BYTE MISMATCH (ids / weights): "
+                    f"{int(n[4])} / {int(n[5])} rows across {world} ranks, control "
+                    f"{int(n[6])} of {int(n[7])}",
+                    flush=True,
+                )
+        sc_ok = int(n[1]) == 0 and int(n[2]) == int(n[3])
+        if rank == 0 and SCALE_DIM:
+            print(
+                f"  [{op.backend_name}] SCALECHECK rows={int(n[3])} bad={int(n[1])} "
+                f"ctl={int(n[2])} ok={int(sc_ok)}",
+                flush=True,
+            )
+            if not sc_ok:
+                print(
+                    f"  [{op.backend_name}] DISPATCH BYTE MISMATCH (scales): "
+                    f"{int(n[1])} rows across {world} ranks, control {int(n[2])} "
+                    f"of {int(n[3])}",
+                    flush=True,
+                )
+        return (
+            int(n[0])
+            + (0 if sc_ok else max(1, int(n[1])))
+            + (0 if mt_ok else max(1, int(n[4]) + int(n[5])))
+        )
 
     def bf16_payload(pe):
         return _data.make_payload(
