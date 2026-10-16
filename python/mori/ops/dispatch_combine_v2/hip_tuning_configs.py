@@ -331,11 +331,17 @@ _COMBINE_PUSH_TABLE: dict = {
 # The LL128 protocol (EpCfg::ll128 in ep_cfg.hpp): an op of at most `max_tok` tokens a rank
 # runs every call on one dispatch and one combine plan, block x warp each, instead of the
 # schedule. One plan each because the per-block call numbers are module globals, which a
-# second plan would not share. Keyed by push combine, then (world, hidden, topk, experts a rank)
-# and the dispatch dtype. EP4 on C17, 2026-10-16, an op of 512 tokens a rank, 3 alternating
-# rounds, dispatch + combine us against the schedule at 1 / 64 / 256 / 512 tokens a rank:
-# fp4 30.0 -> 15.7, 36.1 -> 19.5, 37.9 -> 23.3, 42.7 -> 35.1; fp8 30.9 -> 16.7, 39.8 -> 20.9,
-# 44.4 -> 29.3, 53.3 -> 47.4.
+# second plan would not share. Keyed by quant_type, then (world, hidden, topk, experts a rank)
+# and the dispatch dtype. EP4 on C17, 2026-10-16, 3 alternating rounds, us against the schedule
+# at 1 / 64 / 256 / 512 tokens a rank, an op of 512 tokens a rank:
+#   fp4  dispatch 18.0 -> 8.1, 21.7 -> 10.8, 21.5 -> 13.2, 23.3 -> 20.8
+#        combine  12.2 -> 7.6, 14.6 -> 8.6, 16.4 -> 10.2, 19.3 -> 14.4
+#   fp8  dispatch 18.3 -> 8.3, 24.6 -> 11.8, 25.9 -> 16.7, 29.5 -> 27.9
+#        combine  12.4 -> 8.1, 15.1 -> 9.2, 18.4 -> 12.5, 23.8 -> 19.1
+# bf16, the bf16 LL128 combine in place of the pull combine, an op of 256 tokens a rank, at
+# 1 / 64 / 256: dispatch 20.6 -> 9.6, 29.1 -> 13.9, 30.4 -> 27.2; combine 17.1 -> 10.0,
+# 16.5 -> 11.6, 25.2 -> 21.9. At 512 both lost (dispatch 34.9 -> 44.5, combine 34.2 -> 36.7,
+# measured before the combine folded the weights, which only adds work), so bf16 stops at 256.
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
@@ -345,6 +351,11 @@ _LL128_TABLE: dict = {
     "fp8_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): {"fp8": dict(max_tok=512, dispatch=(128, 8), combine=(256, 8))},
+        },
+    },
+    "none": {
+        "gfx1250": {
+            (4, 7168, 6, None): {"bf16": dict(max_tok=256, dispatch=(128, 8), combine=(256, 8))},
         },
     },
 }
