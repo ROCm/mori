@@ -449,57 +449,6 @@ TEST_F(SsdRangedIoTest, LocalRangedGetOfLargeObjectsFollowsTheirExtents) {
   EXPECT_EQ(whole, objects[0]);
 }
 
-// The pipelined local get: a batch big enough to be cut into parts, against an
-// arena far smaller than any part.  Every part is staged in pieces, and the
-// part being resolved ahead finds the arena held by the part being copied --
-// the BUSY retry has to wait out that copy rather than deadlock on it.  Each
-// pass is checked against the one-stage-at-a-time loop (CHUNKS=1).
-TEST_F(SsdRangedIoTest, PipelinedLocalGetOfABatchFarLargerThanTheArenaIsServedInFull) {
-  auto* node = Start(SsdConfig("ssd-local-pipelined"));
-  ASSERT_NE(node, nullptr);
-  ASSERT_TRUE(node->SupportsRangedIO());
-
-  constexpr size_t kKeys = 128;  // four parts of 32, each 32 pages against an 8-page arena
-  std::vector<std::string> keys;
-  std::vector<std::vector<char>> objects;
-  for (size_t k = 0; k < kKeys; ++k) {
-    keys.push_back("ssd-pipelined-" + std::to_string(k));
-    objects.push_back(Aperiodic(kObjectSize, static_cast<unsigned>(100 + k)));
-    ASSERT_EQ(node->BatchPut({keys.back()}, {Addr(objects.back().data())}, {kObjectSize}),
-              std::vector<bool>({true}));
-  }
-  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(node, key));
-
-  const char* saved = std::getenv("UMBP_GET_PIPELINE_CHUNKS");
-  const std::string restore = saved != nullptr ? saved : "";
-  for (const char* chunks : {"4", "1", "4"}) {
-    ASSERT_EQ(setenv("UMBP_GET_PIPELINE_CHUNKS", chunks, 1), 0);
-    constexpr size_t kGuard = 16;
-    constexpr size_t kWanted = 200;
-    const size_t offset = kObjectSize - kWanted - 7;  // not page aligned, not the tail
-    std::vector<std::vector<char>> bufs(kKeys, std::vector<char>(kGuard + kWanted + kGuard, 0x3C));
-    std::vector<std::vector<uintptr_t>> dsts(kKeys);
-    for (size_t k = 0; k < kKeys; ++k) dsts[k] = {Addr(bufs[k].data() + kGuard)};
-    auto got = node->BatchGetRanges(keys, dsts, std::vector<std::vector<size_t>>(kKeys, {kWanted}),
-                                    std::vector<std::vector<size_t>>(kKeys, {offset}));
-    ASSERT_EQ(got, std::vector<bool>(kKeys, true)) << "chunks=" << chunks;
-    for (size_t k = 0; k < kKeys; ++k) {
-      EXPECT_EQ(std::memcmp(bufs[k].data() + kGuard, objects[k].data() + offset, kWanted), 0)
-          << "key " << k << " chunks=" << chunks;
-      for (size_t i = 0; i < kGuard; ++i) {
-        ASSERT_EQ(bufs[k][i], 0x3C) << "leading guard, key " << k << " chunks=" << chunks;
-        ASSERT_EQ(bufs[k][kGuard + kWanted + i], 0x3C)
-            << "trailing guard, key " << k << " chunks=" << chunks;
-      }
-    }
-  }
-  if (saved != nullptr) {
-    setenv("UMBP_GET_PIPELINE_CHUNKS", restore.c_str(), 1);
-  } else {
-    unsetenv("UMBP_GET_PIPELINE_CHUNKS");
-  }
-}
-
 // ---------------------------------------------------------------------------
 //  5. Remote: across the wire to an SSD-only peer
 // ---------------------------------------------------------------------------

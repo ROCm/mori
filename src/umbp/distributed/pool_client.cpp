@@ -30,9 +30,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <functional>
-#include <future>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -622,23 +620,6 @@ inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
     if (end != value && *end == '\0' && parsed > 0) ms = parsed;
   }
   return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
-}
-
-// How many parts a local ranged GET is cut into, so the next part's resolve
-// (on SSD: the device read) overlaps this part's copy to the caller.  At most
-// UMBP_GET_PIPELINE_CHUNKS (default 4; 1 = one stage at a time, the old path),
-// and never below kMinKeysPerChunk keys a part: each part costs a resolve and
-// a transfer of its own, which a handful of keys would not pay back.  Read per
-// call, so it can be flipped without a restart.
-inline size_t LocalGetPipelineChunks(size_t keys) {
-  constexpr size_t kMinKeysPerChunk = 32;
-  size_t chunks = 4;
-  if (const char* value = std::getenv("UMBP_GET_PIPELINE_CHUNKS")) {
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end != value && *end == '\0' && parsed > 0) chunks = static_cast<size_t>(parsed);
-  }
-  return std::max<size_t>(1, std::min(chunks, keys / kMinKeysPerChunk));
 }
 
 std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
@@ -3612,100 +3593,42 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   std::vector<ObjectExtent> extents(n);
   for (size_t i : candidates) extents[i] = ReadExtent(sizes[i], src_offsets[i]);
   // A staged medium may publish the batch in parts: each part is planned and
-  // copied, and its holds dropped, before what it left is resolved again.
-  //
-  // Pipelined: the batch is cut into parts and the NEXT part is resolved on a
-  // helper thread while this one is planned and copied.  On SSD the resolve IS
-  // the device read -- about two thirds of a layer-group call -- and the plan
-  // and copy are most of the rest, so overlapping them hides most of the copy.
-  // A part's keys are contiguous in the batch, its holds go as soon as its copy
-  // is done, and whatever the medium left for later joins the back of the queue.
-  // With one part (UMBP_GET_PIPELINE_CHUNKS=1, or a small batch) this is the
-  // one-stage-at-a-time loop it replaced.
-  const auto device_destination = [&](size_t i) {
-    // One key's ranges normally share a caller allocation, but nothing
-    // guarantees it; a single host range makes the whole key unservable
-    // from a file ref, so require all of them.
-    const std::vector<void*>& key_dsts = dsts[i];
-    for (size_t r = 0; r < key_dsts.size(); ++r) {
-      if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
-    }
-    return !key_dsts.empty();
-  };
-  // Dropping a Stage drops its holds.
-  struct Stage {
-    std::vector<size_t> keys;
-    std::vector<size_t> later;
+  // copied, and its holds dropped, before the next part is resolved.
+  while (!candidates.empty()) {
     std::vector<MediumBackend*> holders;
     std::vector<ResolvedEntry> resolutions;
-  };
-  // Touches only the stage it builds (plus read-only call inputs), so it is
-  // safe on the helper thread.
-  const auto resolve_stage = [&](std::vector<size_t> stage_keys) {
-    Stage stage;
-    stage.keys = std::move(stage_keys);
-    ResolveLocalBatch(keys, stage.keys, &stage.holders, &stage.resolutions, device_destination,
-                      &stage.later, &extents);
-    return stage;
-  };
-  std::deque<std::vector<size_t>> pending;
-  {
-    const size_t parts = LocalGetPipelineChunks(candidates.size());
-    for (size_t p = 0; p < parts; ++p) {
-      const size_t first = candidates.size() * p / parts;
-      const size_t last = candidates.size() * (p + 1) / parts;
-      pending.emplace_back(candidates.begin() + static_cast<std::ptrdiff_t>(first),
-                           candidates.begin() + static_cast<std::ptrdiff_t>(last));
+    std::vector<size_t> later;
+    {
+      PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
+      ResolveLocalBatch(
+          keys, candidates, &holders, &resolutions,
+          [&](size_t i) {
+            // One key's ranges normally share a caller allocation, but nothing
+            // guarantees it; a single host range makes the whole key unservable
+            // from a file ref, so require all of them.
+            const std::vector<void*>& key_dsts = dsts[i];
+            for (size_t r = 0; r < key_dsts.size(); ++r) {
+              if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+            }
+            return !key_dsts.empty();
+          },
+          &later, &extents);
     }
-  }
-  const auto pop_pending = [&] {
-    std::vector<size_t> part = std::move(pending.front());
-    pending.pop_front();
-    return part;
-  };
-  // Left early (an exception), the future's destructor waits for the helper,
-  // whose stage's holds then go with it.
-  std::future<Stage> ahead;
-  // `resolve` in the debug line is what this thread waited for, not what the
-  // helper spent: the hidden part is the point, and the phases must still sum.
-  const auto next_stage = [&](std::optional<Stage>* out) {
-    PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
-    if (ahead.valid()) {
-      *out = ahead.get();
-    } else if (!pending.empty()) {
-      *out = resolve_stage(pop_pending());
-    }
-  };
-  std::optional<Stage> stage;
-  next_stage(&stage);
-  while (stage.has_value()) {
-    if (!pending.empty()) {
-      std::vector<size_t> part = pop_pending();
-      try {
-        ahead = std::async(std::launch::async, resolve_stage, part);
-      } catch (const std::system_error&) {
-        pending.push_front(std::move(part));  // no thread to spare: resolve it inline later
-      }
-    }
-    const std::vector<size_t>& part_keys = stage->keys;
-    const std::vector<size_t>& part_later = stage->later;
-    const std::vector<MediumBackend*>& part_holders = stage->holders;
-    const std::vector<ResolvedEntry>& part_resolutions = stage->resolutions;
-    std::vector<char> is_later(part_later.empty() ? 0 : n, 0);
-    for (size_t i : part_later) is_later[i] = 1;
+    std::vector<char> is_later(later.empty() ? 0 : n, 0);
+    for (size_t i : later) is_later[i] = 1;
 
     // The range count is a reservation hint for buffered engines; HBM builds
     // plans directly and ignores it.
     size_t range_total = 0;
-    for (size_t i : part_keys) range_total += sizes[i].size();
+    for (size_t i : candidates) range_total += sizes[i].size();
     auto plan_builder = transfer_engine_->CreatePlanBuilder(range_total);
     size_t local_item_count = 0;
     local_keys.clear();
-    for (size_t i : part_keys) {
-      if (!part_later.empty() && is_later[i]) continue;
+    for (size_t i : candidates) {
+      if (!later.empty() && is_later[i]) continue;
 
-      MediumBackend* const holder = part_holders[i];
-      const ResolvedEntry& resolved = part_resolutions[i];
+      MediumBackend* const holder = holders[i];
+      const ResolvedEntry& resolved = resolutions[i];
       if (holder == nullptr) {
         missed.push_back(i);
         continue;
@@ -3783,9 +3706,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
         if (dbg != nullptr) dbg->local_keys += 1;
       }
     }
-    if (!part_later.empty()) pending.push_back(std::move(stage->later));
-    stage.reset();  // copies are done: this part's holds go
-    next_stage(&stage);
+    candidates = std::move(later);
   }
   if (dbg != nullptr) {
     // Classification is timed inside the build window, so subtract it out to
