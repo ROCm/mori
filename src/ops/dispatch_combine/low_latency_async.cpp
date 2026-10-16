@@ -593,22 +593,16 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
     }
   }
 
-  // Incoming signals do not guarantee completion of our outgoing RDMA transfers.
-  // Reuse alone no longer requires a drain here: the next dispatch sends from
-  // dispatchStaging, so the next combine reuses `staging` only after that
-  // dispatch has received all peer signals, which implies peers have already
-  // consumed this combine payload.
-  // Still drain outgoing RDMA transfers, because the handle may be destroyed
-  // without a following cycle and ~EpDispatchCombineHandle() frees `staging`
-  // while transfers may still be in flight.
-  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    bool isSdmaPeer = IsSdmaPeer(destPe);
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0 && !isSdmaPeer && myPe != destPe) {
-        shmem::ShmemQuietThread(destPe, qpId);
-      }
-    }
-  }
+  // Incoming signals do not guarantee completion of our outgoing RDMA transfers,
+  // yet no drain is needed here:
+  //  - Reuse: the next dispatch uses the separate `dispatchStaging` buffer. The
+  //    next combine reuses `staging` only after that dispatch receives all peer
+  //    signals, which implies peers have consumed the current combine payload.
+  //  - Teardown: E2E inference is assumed to complete collective communication
+  //    before ~EpDispatchCombineHandle() frees `staging`, which implies peers
+  //    have consumed the current combine payload.
+  // In both cases the outgoing RDMA transfers complete before `staging`
+  // is reused or freed.
 }
 
 /* ---------------------------------------------------------------------------------------------- */
