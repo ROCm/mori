@@ -1046,12 +1046,15 @@ class EpDispatchCombineOp:
             dest_map=dest_map,
             num_tokens=n,
         )
-        # What dispatch_recv() needs to launch the other half. Set unconditionally:
-        # a plain dispatch() leaves it as harmless bookkeeping, and only
-        # dispatch_recv() reads it.
-        self._async_pending_dispatch_tokens = n
-        self._async_pending_dispatch_input = input
-        self._async_pending_dispatch_map = dest_map
+        # What dispatch_recv() needs to launch the other half -- recorded only
+        # when this WAS the send half. Recording it for a plain dispatch() was not
+        # harmless bookkeeping: it kept the previous round's input activations
+        # alive until the next call, for every kernel family. dispatch_recv()
+        # drops the references again once it has launched.
+        if kernels is not self._kernels.dispatch:
+            self._async_pending_dispatch_tokens = n
+            self._async_pending_dispatch_input = input
+            self._async_pending_dispatch_map = dest_map
 
         base = (
             self.recv_tokens(),
@@ -1128,12 +1131,14 @@ class EpDispatchCombineOp:
             num_tokens=ct,
             want_weights=want_weights,
         )
-        self._async_pending_combine = (
-            input,
-            routing.disp_dest_tok_id_map,
-            ct,
-            want_weights,
-        )
+        # Same rule as dispatch: only the send half leaves anything for later.
+        if kernels is not self._kernels.combine:
+            self._async_pending_combine = (
+                input,
+                routing.disp_dest_tok_id_map,
+                ct,
+                want_weights,
+            )
 
         cdt = self.cfg.combine_dtype
         hidden = self.cfg.hidden_dim
@@ -1281,6 +1286,11 @@ class EpDispatchCombineOp:
             dest_map=self._async_pending_dispatch_map,
             num_tokens=n,
         )
+        # Launched, so nothing reads these again; holding them would keep the
+        # caller's input alive until the next round. combine_recv already drops
+        # its whole tuple the same way.
+        self._async_pending_dispatch_input = None
+        self._async_pending_dispatch_map = None
 
     def combine_send(self, input, weights=None, indices=None, *, routing):
         """Enqueue the send half of a combine and return immediately."""
