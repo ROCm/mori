@@ -272,6 +272,70 @@ def test_ptpc_matches_an_fp32_reference(m, n, k):
     )
 
 
+@pytest.mark.parametrize("m,n,k", [(4096, 7168, 256), (16384, 7168, 512)])
+def test_ptpc_tail_reads_complete_lds(m, n, k):
+    """The peeled tail must not read LDS its producing loads have not finished.
+
+    The last two K steps are peeled out of the main loop, and they pre-read the
+    final step's B0 and A0 tiles. If nothing drains those tiles' global->LDS
+    loads first, the reads can take stale LDS: a few wrong rows, no NaN, and
+    only on some launches. K=256 is the shape where the main loop runs zero
+    times, so no wait inside the loop can cover it; [16384, 7168] K=512 is the
+    shape that corrupted under the loop's original wait count.
+
+    Checked element-wise rather than by relL2: the corruption can sit close
+    enough to the fp8 floor that a norm-based gate passes it. The output is
+    NaN-poisoned before each launch so a skipped store cannot hide behind the
+    previous run's values.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    pytest.importorskip("flydsl")
+    import flydsl.expr as fx
+    from mori.ops.gemm_ar import compile_fused_gemm_scatter, preshuffle_b
+
+    g = torch.Generator(device="cuda").manual_seed(0)
+    a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    sa = torch.rand(m, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    sb = torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
+    b_shuf = preshuffle_b(b)
+    ref = (
+        ((a.float() @ b.float().T) * sa[:, None] * sb[None, :])
+        .to(torch.bfloat16)
+        .float()
+    )
+    floor = 0.01 * ref.square().mean().sqrt()
+
+    cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    gemm = compile_fused_gemm_scatter(
+        cfg, 0, K=k, BLOCK_M=256, BLOCK_N=256, b_preshuffled=True, fuse=False
+    )
+    a_flat = a.contiguous().view(torch.int8).view(-1)
+    b_flat = b_shuf.contiguous().view(torch.int8).view(-1)
+    got = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    stream = fx.Stream(torch.cuda.current_stream())
+
+    # Whether the race fires depends on how the waves interleave, so one clean
+    # launch proves nothing.
+    reps = 12
+    bad_runs = 0
+    worst = 0
+    for _ in range(reps):
+        got.fill_(float("nan"))
+        gemm(a_flat, b_flat, got.view(-1), sa, sb, m, n, 0, 0, stream=stream)
+        torch.cuda.synchronize()
+        diff = (got.float() - ref).abs()
+        bad = int((diff > 0.05 * ref.abs().clamp(min=floor)).sum())
+        bad += int((~torch.isfinite(got.float())).sum())
+        bad_runs += bad > 0
+        worst = max(worst, bad)
+    assert bad_runs == 0, (
+        f"{bad_runs}/{reps} launches had elements off by >5% (worst {worst}); "
+        f"the peeled tail is reading LDS before its producers finish"
+    )
+
+
 @pytest.mark.parametrize("m,n,k", [(1024, 512, 512), (2048, 7168, 2048)])
 def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     """``quant="blockscale"`` -- the model's quantisation -- against fp32.
