@@ -916,12 +916,16 @@ __device__ void EpCombineAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args)
   const int destPe = globalWarpId / warpsPerPe;
   if (destPe >= npes) return;
 
-  const uint64_t tokenNum =
-      core::AtomicLoadRelaxedSystem(const_cast<uint64_t*>(
-          reinterpret_cast<const uint64_t*>(recvCounts + asyncll::RecvCountSlot(destPe)))) -
-      1;
+  // Biased by one, so 0 means "no dispatch announced this round". Test the raw
+  // value rather than subtracting first: an unpaired combine finds 0 here and
+  // `announced - 1` would be UINT64_MAX, which the old `tokenNum > 0` test waves
+  // through and LsaShareFor then turns into a grid of peer stores running far
+  // past the buffer. Same defect as the SDMA combine send; see its comment.
+  const uint64_t announced = core::AtomicLoadRelaxedSystem(const_cast<uint64_t*>(
+      reinterpret_cast<const uint64_t*>(recvCounts + asyncll::RecvCountSlot(destPe))));
 
-  if (destPe != myPe && destPe / config.gpuPerNode == myNode && tokenNum > 0) {
+  if (destPe != myPe && destPe / config.gpuPerNode == myNode && announced > 1) {
+    const uint64_t tokenNum = announced - 1;
     const asyncll::LsaShare share =
         asyncll::LsaShareFor(globalWarpId, globalWarpNum, npes, tokenNum * hiddenBytes);
     if (share.bytes > 0) {
@@ -1061,13 +1065,25 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
     // back. Dispatch left the slot alone precisely so this read works; clear it
     // now, which is also what re-arms the "0 means not arrived" test the next
     // dispatch's RecvTransfer spins on.
-    uint64_t tokenNum = 0;
+    uint64_t announced = 0;
     if (laneId == 0) {
       uint64_t* slot = reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(destPe));
-      tokenNum = core::AtomicLoadRelaxedSystem(slot) - 1;
+      announced = core::AtomicLoadRelaxedSystem(slot);
       core::AtomicStoreRelaxedSystem(slot, uint64_t{0});
     }
-    tokenNum = __shfl(static_cast<unsigned long long>(tokenNum), 0);
+    announced = __shfl(static_cast<unsigned long long>(announced), 0);
+
+    // The count is biased by one, so 0 is "no dispatch announced this round"
+    // rather than "zero tokens" -- and subtracting from it wraps. A combine with
+    // no dispatch behind it (combine() twice on one routing, combine() before any
+    // dispatch, combine_recv() after a whole combine) lands here with 0, and the
+    // `tokenNum == 0` test below cannot catch UINT64_MAX: sdma.put would then be
+    // handed a ~2^64-byte copy. Reproduced on 8xMI308X as a PERMISSION_FAULT on
+    // every GPU in the job. Nothing this kernel can do makes the call correct, so
+    // this only keeps a caller's mistake from becoming a memory fault; the host
+    // raises on it first (see the call-order check in dispatch_combine_op.py).
+    if (announced == 0) continue;
+    const uint64_t tokenNum = announced - 1;
 
     if (destPe == myPe) continue;
     if (tokenNum == 0) continue;
