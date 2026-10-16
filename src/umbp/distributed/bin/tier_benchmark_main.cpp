@@ -342,9 +342,8 @@ void LoadPolicy(Options* options) {
   }
   for (const auto& backend : lowered.backends) {
     if (backend.tier != TierType::SSD) continue;
-    const uint64_t pages = backend.ssd_staging_buffer_slots > 0
-                               ? static_cast<uint64_t>(backend.ssd_staging_buffer_slots)
-                               : 16;
+    const uint64_t pages = mori::umbp::SsdStagingPages(
+        backend.ssd_staging_buffer_slots, backend.ssd.ssd.capacity_bytes, options->page_size);
     if (pages > std::numeric_limits<uint64_t>::max() / options->page_size) {
       UsageError("SSD staging arena size overflows uint64");
     }

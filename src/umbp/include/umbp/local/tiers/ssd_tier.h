@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -115,6 +116,12 @@ class SSDTier : public TierBackend {
   // direct I/O was never requested, or was requested and the probe failed.
   bool direct_io_active() const { return direct_io_; }
 
+  // The uncommitted prefix goes down at reserve, so the log stays parseable and
+  // the scanner skips the record until CommitRecord flips its flag.
+  std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
+  bool CommitRecord(const std::string& key, const RecordReservation& r) override;
+  void AbortRecord(const std::string& key, const RecordReservation& r) override;
+
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
   bool ShouldSyncOnWrite() const {
@@ -168,6 +175,7 @@ class SSDTier : public TierBackend {
   // Issue one value read, transparently bouncing through an aligned buffer when
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
+  IoStatus WritePrepared(int fd, const segment::PreparedRecord& pr, bool sync) const;
   bool ShouldVerifyCrc(bool crc_valid) const { return ssd_config_.verify_crc && crc_valid; }
   int TierThreads() const;
 
@@ -197,6 +205,16 @@ class SSDTier : public TierBackend {
   segment::Index index_;
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;
+
+  // Reserved records awaiting commit, by RecordReservation::token.  Guarded by mu_.
+  struct PendingRecord {
+    segment::PreparedRecord prefix;
+    int fd = -1;
+    // Its segment, and the replaced record's (see Write), kept until commit or
+    // abort: the value is written through `fd` outside the lock.
+    std::vector<uint64_t> pinned;
+  };
+  std::unordered_map<uint64_t, PendingRecord> pending_records_;
 };
 
 }  // namespace mori::umbp
