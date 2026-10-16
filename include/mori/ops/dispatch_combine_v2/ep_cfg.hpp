@@ -262,6 +262,10 @@ struct EpCfg {
   // Only the code sized to one call reads it (EpCallTok); maxTokPerRank stays the
   // stride every source token is encoded with, which combine decodes.
   int callTokMax = 0;
+  // gfx125x, both kernels of an op alike (MakeEpCfg): every call takes the LL128 dispatch
+  // and the LL128 push combine (ep_intranode_1250x.hpp). The two only pair with each
+  // other, so the op chooses for both. Off is free for the same reason as scaleBytes.
+  bool ll128 = false;
 };
 
 template <typename Self, typename Visit>
@@ -284,10 +288,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(combineFp8);
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
+  MORI_FIELD(ll128);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 17, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 18, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};

@@ -56,6 +56,7 @@ struct EpRequest {
   bool combineFp8 = false;
   bool tokOffExt = false;
   int callTokMax = 0;  // dispatch only; 0 = maxTokPerRank (EpCfg::callTokMax)
+  bool ll128 = false;  // both kernels of the op take the LL128 protocol (EpCfg::ll128)
 };
 
 template <typename Self, typename Visit>
@@ -77,10 +78,11 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(combineFp8);
   MORI_FIELD(tokOffExt);
   MORI_FIELD(callTokMax);
+  MORI_FIELD(ll128);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 16,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 17,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();
