@@ -124,8 +124,10 @@ class SsdBackend : public MediumBackend {
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
-  // The manager's LRU (always kept) minus keys a staged or migration read holds.
+  // The manager's order (the file tier's segment order, or its LRU) minus keys
+  // a staged or migration read holds.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
+  bool OwnsEvictionOrder() const override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
@@ -183,8 +185,10 @@ class SsdBackend : public MediumBackend {
   // hipFile handle for a segment fd, obtained lazily from the registrar's file
   // engine (GdsEngine) and shared by every key on that segment.  Returns nullptr
   // when no file engine is configured; that result is cached so a fd is probed
-  // at most once.  Deregistered in Shutdown.
+  // at most once.  Deregistered in Shutdown, or when the tier deletes the
+  // segment (DropGdsHandle), before the fd number can be reused.
   void* GdsHandleForFd(int fd);
+  void DropGdsHandle(int fd);
 
   // Caller MUST hold mutex_.  Bumps the unshipped-event count and fires the
   // auto-flush hook once it crosses the threshold.

@@ -78,7 +78,13 @@ class ShardedSsdTier : public TierBackend {
   TierCapabilities Capabilities() const override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  // The fullest drive's order first, then the next fullest: the drive closest
+  // to full is the one that has to give space back.
+  std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  void SetRetiredFileHook(std::function<void(int fd)> on_close,
+                          std::chrono::milliseconds grace) override;
+  TierSpaceStats SpaceStats() const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
   std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
   bool CommitRecord(const std::string& key, const RecordReservation& r) override;
   void AbortRecord(const std::string& key, const RecordReservation& r) override;
@@ -114,6 +120,10 @@ class ShardedSsdTier : public TierBackend {
   // balance, never correctness.
   void ReserveLocked(int shard, size_t size);
   void ReleaseLocked(int shard, size_t size);
+  // Re-reads every shard's usage into used_hint_ before a placement.  A drive's
+  // disk use only drops when a whole segment goes, so a hint kept up by adding
+  // and subtracting value sizes drifts away from what the drive can take.
+  void RefreshHintsLocked();
   // Drops the placement of a key its shard no longer holds (a failed write).
   void ForgetIfGone(const std::string& key, int shard);
 
