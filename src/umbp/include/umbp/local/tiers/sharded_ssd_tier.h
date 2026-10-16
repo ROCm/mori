@@ -84,7 +84,7 @@ class ShardedSsdTier : public TierBackend {
   void SetRetiredFileHook(std::function<void(int fd)> on_close,
                           std::chrono::milliseconds grace) override;
   TierSpaceStats SpaceStats() const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
   bool Flush() override;
 
   // Parallel across shards: keys are bucketed by their (assigned or resolved)
