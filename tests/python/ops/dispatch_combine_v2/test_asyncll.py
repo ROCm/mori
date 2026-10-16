@@ -27,7 +27,8 @@ communicator, like its neighbours here.
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 test_asyncll.py
 
 Env: HIDDEN, TOPK, EPR, M, LOOP (at least 3), SHAPES to override the swept list,
-TRANSPORT=sdma|lsa, and GRAPH_REPLAYS (default 32; 0 skips the graph regression).
+TRANSPORT=sdma|lsa, GRAPH_REPLAYS (default 32; 0 skips the graph regression) and
+BACK_TO_BACK (rounds with no host sync, default 6; 0 skips).
 
 What is checked, and why these and not more:
 
@@ -47,6 +48,16 @@ What is checked, and why these and not more:
 Both split and ordinary APIs run weighted -> unweighted -> weighted calls on one
 op. A small graph additionally replays fresh payload/weights with a zero-input
 receiver and with all ranks empty. Graph replay is checked after every call.
+
+Two scenarios target the protocol rather than the data path:
+
+  * **back-to-back** -- several rounds with no host sync between them, checked
+    only after the last. Everything above syncs after each phase, which closes
+    the windows the recv-count and combine-epoch races live in.
+  * **call order** -- every out-of-order call (dispatch twice, combine twice,
+    combine before dispatch, ...) is refused on the host before launching, and
+    the op is usable afterwards, both by finishing the open round and by reset().
+    Before the check existed these were wrong data, a GPU fault, or a hang.
 
 The swept shapes are chosen for the two things that have actually broken:
 top-k that does not divide the wavefront (64 % 6 == 4, DeepSeek-V4's shape), and
@@ -284,10 +295,9 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
             # until the cross-node harness -- which requests weights
             # unconditionally -- ran into it.
             #
-            # Last in the iteration, and only on the first one: the raise comes
-            # from inside _combine_impl, AFTER it has staged `input` into the
-            # out_tok region, so running it before the round trip above would
-            # have it write through a buffer the measured path reads.
+            # The op refuses it at the call, before staging anything or touching
+            # the call-order state, which is why it is safe here between rounds;
+            # run_call_order checks that a refused request leaves the op usable.
             if it == 0:
                 try:
                     op.combine_send(out[:recv].clone(), win, idx, routing=routing)
@@ -425,6 +435,259 @@ def run_graph(d, comm, empty_all, replays):
     return failures
 
 
+def run_back_to_back(d, comm, rounds):
+    """Several rounds with NO host sync between them, every round checked after.
+
+    Every other scenario here synchronizes and barriers after each phase, which
+    is exactly what closes the windows AsyncLL's races live in: the recv-count
+    slot is cleared by combine's send leg and re-armed by the next dispatch, and
+    the combine epoch is published while a fast peer may already be starting the
+    next round. A race in that hand-off is invisible to a test that lets every
+    rank finish before anyone starts again -- the LSA count-reset bug was found
+    by a benchmark, not by this file. Here ranks are free to run rounds ahead of
+    each other, the way a model's layers do.
+
+    Results are copied off the arena on the stream as each round completes, so
+    nothing the next round overwrites is read late, and the host only looks once
+    every round has been enqueued. Each round has different data, a different
+    per-rank token count (some zero), alternates the split and ordinary APIs,
+    and one round drops the weights -- the toggle the dispatch_recv weights bug
+    (a0b9dfcb) lived in.
+    """
+    hidden, topk, epr, m = 4096, 6, 16, 64  # 64 % 6 != 0, as in the sweep
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    cfg = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world,
+        hidden_dim=hidden,
+        max_num_inp_token_per_rank=m,
+        num_experts_per_rank=epr,
+        num_experts_per_token=topk,
+        data_type=torch.bfloat16,
+        kernel_backend="hip",
+        async_ll=True,
+        async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+    )
+
+    # Every round's inputs, and every rank's view of them, exist before the
+    # first launch: all_gather_object is a host collective and would be a sync.
+    plans = []
+    for r in range(rounds):
+        n = ((rank + r) * 5) % (m + 1)
+        gen = torch.Generator(device=dev).manual_seed(4321 + rank * 31 + r)
+        x = torch.randn(n, hidden, generator=gen, device=dev, dtype=torch.bfloat16)
+        w = torch.rand(n, topk, generator=gen, device=dev, dtype=torch.float32)
+        idx = _routing(rank, world, m, topk, epr, dev, gen, n)
+        weights = None if r == 2 else w
+        plans.append((x, weights, idx, _gather_inputs(x, idx, weights, world)))
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    failures = 0
+    with EpDispatchCombineOp(cfg, comm) as op:
+        stage = op.combine_in_view()
+        kept = []
+        for r, (x, weights, idx, _) in enumerate(plans):
+            split = r % 2 == 0
+            if split:
+                out, out_w, _, out_idx, total, routing = op.dispatch_send(
+                    x, weights, None, idx, return_routing=True
+                )
+                op.dispatch_recv()
+            else:
+                out, out_w, _, out_idx, total, routing = op.dispatch(
+                    x, weights, None, idx, return_routing=True
+                )
+            # Stream-ordered copies: they run after this round's recv and before
+            # the next round's dispatch can overwrite the region.
+            snap = {
+                "out": out.clone(),
+                "weights": out_w.clone(),
+                "indices": out_idx.clone(),
+                "total": total.clone(),
+                "reverse": routing.disp_tok_id_to_src_tok_id_local,
+            }
+            stage.copy_(out)  # identity expert
+            if split:
+                cout, _ = op.combine_send(stage, routing=routing)
+                op.combine_recv()
+            else:
+                cout, _ = op.combine(stage, routing=routing)
+            snap["combined"] = cout[: x.shape[0]].clone()
+            kept.append(snap)
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        for r, ((x, weights, idx, gathered), snap) in enumerate(zip(plans, kept)):
+            api = "split" if r % 2 == 0 else "ordinary"
+            tag = f"back_to_back round={r} api={api} weights={weights is not None}"
+            _, bad = _check_dispatch(
+                d,
+                snap["out"],
+                snap["indices"],
+                snap["weights"],
+                snap["total"],
+                snap["reverse"],
+                gathered,
+                m,
+                epr,
+                tag,
+            )
+            failures += bad
+            n = x.shape[0]
+            if n:
+                uniq = torch.tensor(
+                    [
+                        len({int(e) // epr for e in row.tolist()})
+                        for row in gathered[rank][1]
+                    ],
+                    dtype=torch.float32,
+                )
+                want = (gathered[rank][2].float() * uniq[:, None]).to(torch.bfloat16)
+                got = snap["combined"].cpu()
+                if not torch.allclose(got.float(), want.float(), atol=1e-2, rtol=1e-2):
+                    diff = (got.float() - want.float()).abs().max().item()
+                    print(
+                        f"[rank {rank}] {tag}: combine max |diff| {diff:.4f}",
+                        flush=True,
+                    )
+                    failures += 1
+    return failures
+
+
+def run_call_order(d, comm):
+    """Every out-of-order call raises before launching, and reset() recovers.
+
+    AsyncLL's signal slots couple one call to the next, so an unpaired call does
+    not fail where it is made: it leaves state a LATER round misreads. Measured
+    by the reviewer of #768 before the host check existed --
+
+        dispatch twice        wrong recv counts (560 vs 548), wrong combine output
+        dispatch_send twice   slot counter past the per-PE stride
+        combine twice         every GPU faulted (a ~2^64-byte SDMA copy)
+
+    so each sequence here must be refused on the HOST, as a RuntimeError, before
+    any kernel runs. The refusal is deterministic and identical on every rank,
+    which is what keeps this collective-safe: no rank launches a half that its
+    peers declined.
+
+    Then a refused call has to leave the op usable. Two ways back are checked:
+    finishing the round that was legally in progress, and reset() -- which the
+    error message names -- followed by a fully verified round.
+    """
+    hidden, topk, epr, m = 2048, 8, 8, 32
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    cfg = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world,
+        hidden_dim=hidden,
+        max_num_inp_token_per_rank=m,
+        num_experts_per_rank=epr,
+        num_experts_per_token=topk,
+        data_type=torch.bfloat16,
+        kernel_backend="hip",
+        async_ll=True,
+        async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+    )
+    gen = torch.Generator(device=dev).manual_seed(777 + rank)
+    x = torch.randn(m, hidden, generator=gen, device=dev, dtype=torch.bfloat16)
+    w = torch.rand(m, topk, generator=gen, device=dev, dtype=torch.float32)
+    idx = _routing(rank, world, m, topk, epr, dev, gen, m)
+    gathered = _gather_inputs(x, idx, w, world)
+
+    failures = 0
+
+    def lockstep():
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    def refused(tag, fn, kind=RuntimeError):
+        nonlocal failures
+        try:
+            fn()
+        except kind:
+            return
+        except Exception as e:  # the wrong refusal is a failure too
+            print(
+                f"[rank {rank}] order {tag}: raised {type(e).__name__}: {e}", flush=True
+            )
+        else:
+            print(f"[rank {rank}] order {tag}: was accepted", flush=True)
+        failures += 1
+
+    def verified_round(tag):
+        nonlocal failures
+        out, out_w, _, out_idx, total, routing = op.dispatch(
+            x, w, None, idx, return_routing=True
+        )
+        lockstep()
+        recv, bad = _check_dispatch(
+            d,
+            out,
+            out_idx,
+            out_w,
+            total,
+            routing.disp_tok_id_to_src_tok_id_local,
+            gathered,
+            m,
+            epr,
+            f"order {tag}",
+        )
+        failures += bad
+        op.combine(out[:recv].clone(), routing=routing)
+        lockstep()
+
+    with EpDispatchCombineOp(cfg, comm) as op:
+        # Idle: nothing to receive or combine.
+        refused("combine before dispatch", lambda: op.combine(x, routing=None))
+        refused(
+            "combine_send before dispatch", lambda: op.combine_send(x, routing=None)
+        )
+        refused("combine_recv while idle", op.combine_recv)
+        refused("dispatch_recv while idle", op.dispatch_recv)
+        verified_round("first round after refusals")
+
+        # dispatch() already ran its recv half.
+        *_, routing = op.dispatch(x, w, None, idx, return_routing=True)
+        lockstep()
+        refused("dispatch twice", lambda: op.dispatch(x, w, None, idx))
+        refused(
+            "dispatch_send after dispatch", lambda: op.dispatch_send(x, w, None, idx)
+        )
+        refused("dispatch_recv after dispatch()", op.dispatch_recv)
+        # A refused weight-fold request must not advance the state either.
+        refused(
+            "combine weight fold",
+            lambda: op.combine_send(x, w, idx, routing=routing),
+            kind=NotImplementedError,
+        )
+        op.combine_send(op.combine_in_view(), routing=routing)
+        refused("combine_send twice", lambda: op.combine_send(x, routing=routing))
+        refused("dispatch while combining", lambda: op.dispatch(x, w, None, idx))
+        op.combine_recv()
+        lockstep()
+        refused("combine twice", lambda: op.combine(x, routing=routing))
+        refused("combine_recv twice", op.combine_recv)
+
+        op.dispatch_send(x, w, None, idx)
+        refused("dispatch_send twice", lambda: op.dispatch_send(x, w, None, idx))
+        refused("combine before dispatch_recv", lambda: op.combine(x, routing=routing))
+        op.dispatch_recv()
+        lockstep()
+        # Leave this round unfinished and recover the way the error says to. The
+        # dispatch is complete on every rank (recv waits for every peer's count),
+        # so nothing is still in flight into the arena reset() is about to zero.
+        refused("dispatch with a round open", lambda: op.dispatch(x, w, None, idx))
+        op.reset()
+        lockstep()
+        verified_round("after reset")
+        verified_round("second round after reset")
+    return failures
+
+
 def main():
     d = Dist()
     shapes = _shapes()
@@ -432,6 +695,9 @@ def main():
     graph_replays = int(os.environ.get("GRAPH_REPLAYS", "32"))
     if graph_replays < 0:
         raise ValueError("GRAPH_REPLAYS must be nonnegative")
+    back_to_back = int(os.environ.get("BACK_TO_BACK", "6"))
+    if back_to_back < 0:
+        raise ValueError("BACK_TO_BACK must be nonnegative")
 
     failures = 0
     # One communicator PER SHAPE, each with its own unique id, rather than one for
@@ -473,12 +739,31 @@ def main():
                     flush=True,
                 )
 
+    def own_comm(run, hidden, m):
+        uid = Communicator.get_unique_id() if d.rank == 0 else None
+        uid = d.bcast_uid(uid)
+        win_bytes = d.world * hidden * m * 2 * 4 + (1 << 24)
+        with Communicator.init(
+            d.world, d.rank, uid, per_rank_vmm=6 * win_bytes + (1 << 28)
+        ) as comm:
+            return run(comm)
+
+    if back_to_back:
+        failures += own_comm(lambda c: run_back_to_back(d, c, back_to_back), 4096, 64)
+        if d.rank == 0:
+            print(f"# asyncll back-to-back: {back_to_back} rounds done", flush=True)
+
+    failures += own_comm(lambda c: run_call_order(d, c), 2048, 32)
+    if d.rank == 0:
+        print("# asyncll call order: done", flush=True)
+
     total = d.allreduce_sum(failures)
     if d.rank == 0:
         print(
             f"# {'PASS' if total == 0 else 'FAIL'}: {total} failed checks across "
             f"{d.world} ranks, {len(shapes)} shapes x {loops} iterations x 2 APIs, "
-            f"2 graph scenarios x {graph_replays} replays",
+            f"2 graph scenarios x {graph_replays} replays, "
+            f"{back_to_back} back-to-back rounds, call order",
             flush=True,
         )
     dist.destroy_process_group()
