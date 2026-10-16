@@ -101,6 +101,10 @@ bool EpAsyncLLTakesComm(EpAsyncLLKernel kind) {
 
 std::string EpAsyncLLEntryName(const EpInterNodeCfg& cfg, EpAsyncLLKernel kind) {
   std::string name = "mori_ep_asyncll_";
+  if (cfg.asyncLlMode == 2)
+    name += "fused_";
+  else if (cfg.asyncLlMode == 1)
+    name += "early_";
   name += DescriptorFor(kind).tag;
   name += '_';
   name += EpInterNodeDTypeTag(cfg.dtype);
@@ -130,11 +134,25 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
         " lanes on this arch); the per-PE offset prefix sum is one wavefront wide");
   }
 
+  if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2)
+    throw std::runtime_error("AsyncLL mode must be 0 (legacy), 1 (early), or 2 (fused CTA)");
+  const bool early = cfg.asyncLlMode != 0;
+  const bool fused = cfg.asyncLlMode == 2;
+  if (early && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode)
+    throw std::runtime_error("AsyncLL early notification requires a single node");
+  if (early && (kind == EpAsyncLLKernel::DispatchSendCopyLsa ||
+                kind == EpAsyncLLKernel::DispatchSendTransferLsa ||
+                kind == EpAsyncLLKernel::DispatchRecvTransferLsa ||
+                kind == EpAsyncLLKernel::CombineSendTransferLsa ||
+                kind == EpAsyncLLKernel::CombineRecvTransferLsa))
+    throw std::runtime_error("AsyncLL early notification requires the SDMA transport");
   const AsyncLLDescriptor descriptor = DescriptorFor(kind);
   const std::string entry = EpAsyncLLEntryName(cfg, kind);
 
-  std::string source =
-      "// mori jit — generated, do not edit.\n"
+  std::string source = "// mori jit — generated, do not edit.\n";
+  source += "#define MORI_ASYNCLL_EARLY_NOTIFY " + std::to_string(early ? 1 : 0) + "\n";
+  source += "#define MORI_ASYNCLL_FUSED_RECV " + std::to_string(fused ? 1 : 0) + "\n";
+  source +=
       "#include \"src/ops/dispatch_combine_v2/ep_asyncll_kernel.hpp\"\n"
       "constexpr ::mori::ops::v2::EpInterNodeKernelCfg kConfig = ";
   source += Render(cfg.kernelCfg);
@@ -143,11 +161,18 @@ std::string EpAsyncLLRenderSource(const EpInterNodeCfg& cfg, EpAsyncLLKernel kin
   source += ";\n";
   // The entry macros come from ep_internode_kernel.hpp, which the AsyncLL header
   // includes; the _LOCAL form is the one whose body takes no communicator.
-  source += EpAsyncLLTakesComm(kind) ? "MORI_EP_INTERNODE_CCO_ENTRY("
-                                     : "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
+  const bool fusedCopy = fused && (kind == EpAsyncLLKernel::DispatchRecvCopy ||
+                                   kind == EpAsyncLLKernel::CombineRecvCopy);
+  source += (EpAsyncLLTakesComm(kind) || fusedCopy) ? "MORI_EP_INTERNODE_CCO_ENTRY("
+                                                    : "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
   source += entry;
   source += ", ";
-  source += descriptor.body;
+  if (fusedCopy) {
+    source += kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopyFused_body"
+                                                        : "EpCombineAsyncLLRecvCopyFused_body";
+  } else {
+    source += descriptor.body;
+  }
   source += ")\n";
   return source;
 }

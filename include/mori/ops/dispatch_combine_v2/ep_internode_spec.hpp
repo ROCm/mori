@@ -52,15 +52,19 @@ namespace v2 {
 // Cfg *and* reaches the source, through Render(kCfg) and
 // __launch_bounds__(EpBlockThreads(kCfg)) -- so a geometry sweep really is a
 // hipcc sweep. Here geometry is in the Cfg (KernelSpec::Geometry needs it, and
-// the plan reports it) but is NOT rendered: only kernelCfg and dtype reach the
-// TU. Two cfgs differing only in geometry therefore render identical text, land
-// in the same content-addressed cache entry, and cost no extra compile. v1
+// the plan reports it) but is NOT rendered: kernelCfg, dtype and the AsyncLL
+// protocol mode reach the TU. Two cfgs differing only in geometry render
+// identical text, land in the same content-addressed cache entry, and cost no extra compile. v1
 // retunes blocks and warps per token count, so that difference is the point.
 // ---------------------------------------------------------------------------
 struct EpInterNodeCfg {
   // ---- rendered: this is the specialisation ----
   EpInterNodeKernelCfg kernelCfg{};
   EpInterNodeDType dtype{EpInterNodeDType::Bf16};
+  // Host-only protocol selection, rendered as defines by the AsyncLL specs.
+  // 0 = legacy, 1 = early notification, 2 = early notification + fused CTA recv.
+  // Bare plans stay legacy; callers must explicitly choose a single-node SDMA mode.
+  int asyncLlMode{0};
 
   // ---- launch geometry (host-derived; see MakeEpInterNodeCfg). NOT rendered. ----
   int blockNum{64};
@@ -81,6 +85,7 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
 #define MORI_FIELD(x) visit(#x, cfg.x, defaults.x)
   MORI_FIELD(kernelCfg);
   MORI_FIELD(dtype);
+  MORI_FIELD(asyncLlMode);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -90,12 +95,12 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeCfg, 7, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
+    EpInterNodeCfg, 8, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
 
 // The whole Cfg as text, for the plan's `info` and for logs. NOT the source
-// text: RenderSource renders kernelCfg alone, because geometry must not enter
-// the cache key. Rendered here anyway so `info` reports what the host actually
-// resolved, geometry included.
+// text: RenderSource renders the kernel specialisation (and AsyncLL mode), not
+// geometry. Rendered here anyway so `info` reports what the host actually
+// resolved, including the geometry and protocol mode.
 inline std::string Render(const EpInterNodeCfg& cfg) {
   const EpInterNodeCfg defaults{};
   mori::jit::v2::Fields fields;
@@ -171,6 +176,8 @@ struct EpInterNodeRequest {
   EpQuantType quantType = EpQuantType::None;
   // specialisation
   EpInterNodeDType dtype = EpInterNodeDType::Bf16;
+  // AsyncLL only; the host resolves transport/env policy before constructing a plan.
+  int asyncLlMode = 0;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
   int blockNum = 0;
   int warpPerBlock = 0;
@@ -194,6 +201,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(numQpPerPe);
   MORI_FIELD(quantType);
   MORI_FIELD(dtype);
+  MORI_FIELD(asyncLlMode);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -202,7 +210,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 17,
+    EpInterNodeRequest, 18,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

@@ -95,6 +95,7 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.quantType = request.quantType;
 
   cfg.dtype = request.dtype;
+  cfg.asyncLlMode = request.asyncLlMode;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
@@ -115,6 +116,18 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
     throw std::runtime_error(
         "mori ep internode v2: unusable config " + Render(cfg.kernelCfg) +
         "; every divisor must be positive and worldSize must be a multiple of gpuPerNode");
+  }
+
+  if (cfg.asyncLlMode < 0 || cfg.asyncLlMode > 2) {
+    throw std::runtime_error(
+        "mori ep v2: asyncLlMode must be 0 (legacy), 1 (early), or "
+        "2 (fused CTA receive)");
+  }
+  if (cfg.asyncLlMode != 0 && family != EpInterNodeFamily::AsyncLL) {
+    throw std::runtime_error("mori ep v2: asyncLlMode is only supported by AsyncLL plans");
+  }
+  if (cfg.asyncLlMode != 0 && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode) {
+    throw std::runtime_error("mori ep v2: asyncLlMode > 0 requires a single-node SDMA plan");
   }
 
   // Caught here rather than by hipModuleLaunchKernel, which reports it as a
@@ -188,6 +201,9 @@ std::string EpInterNodeEntryName(const EpInterNodeCfg& cfg, EpInterNodeKernel ki
 }
 
 std::string EpInterNodeRenderSource(const EpInterNodeCfg& cfg, EpInterNodeKernel kind) {
+  if (cfg.asyncLlMode != 0) {
+    throw std::runtime_error("mori ep internode v2 jit: asyncLlMode requires an AsyncLL plan");
+  }
   // Once the cfg is an NTTP its divisors are literals, so a zero here is a
   // division by constant zero inside hipcc -- diagnosed, if at all, against
   // generated source no one can trace back to the caller. MakeEpInterNodeCfg already

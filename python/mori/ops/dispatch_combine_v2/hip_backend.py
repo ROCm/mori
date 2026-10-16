@@ -363,6 +363,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._views = {}
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
+        self._arch = _arch.split(":")[0]
         self._is1250 = _arch.split(":")[0].startswith("gfx125")
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
@@ -1245,8 +1246,32 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "dispatch_sendcopy_lsa",
     )
 
+    @staticmethod
+    def _asyncll_options(cfg, arch):
+        # Resolve once per op. Shared copy passes also serve LSA, so topology
+        # alone cannot select the SDMA notification protocol in native code.
+        if cfg.async_ll_transport != "sdma" or cfg.nodes != 1:
+            return 0, False
+
+        def flag(name, default):
+            value = os.environ.get(name, "1" if default else "0")
+            if value not in ("0", "1"):
+                raise ValueError(f"{name} must be '0' or '1', got {value!r}")
+            return value == "1"
+
+        early = flag("MORI_ASYNCLL_EARLY_NOTIFY", arch == "gfx1250")
+        fused = flag("MORI_ASYNCLL_FUSED_RECV", False)
+        skip_reset = flag("MORI_ASYNCLL_SKIP_RESET", early)
+        if (fused or skip_reset) and not early:
+            raise ValueError(
+                "MORI_ASYNCLL_FUSED_RECV and MORI_ASYNCLL_SKIP_RESET require "
+                "MORI_ASYNCLL_EARLY_NOTIFY=1"
+            )
+        # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused CTA wait.
+        return (2 if fused else int(early)), skip_reset
+
     @classmethod
-    def _asyncll_seq(cls, cfg):
+    def _asyncll_seq(cls, cfg, mode=0):
         lsa = cfg.async_ll_transport == "lsa"
         sfx = "_lsa" if lsa else ""
         seq = {
@@ -1260,6 +1285,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # single-digit effect either way.
         if lsa and os.environ.get("MORI_ASYNCLL_LSA_FUSED", "1") != "0":
             seq["dispatch_send"] = cls._ASYNCLL_SEQ_DISPATCH_SEND_LSA
+        if mode == 2:
+            seq["dispatch_recv"] = ("dispatch_recvcopy",)
+            seq["combine_recv"] = ("combine_recvcopy",)
         return seq
 
     # Which leg's dtype each pass is compiled for. Same rule as _INTERNODE_LEG:
@@ -1278,6 +1306,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # has to reach them. The internode request never carries it because its
         # geometry table supplies grids directly.
         request["mpCount"] = self._multi_processor_count
+        request["asyncLlMode"] = self._asyncll_mode
         return request
 
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
@@ -1292,7 +1321,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         self._plans = []
         plans_by_pass = {}
-        sequences = self._asyncll_seq(cfg)
+        self._asyncll_mode, skip_reset = self._asyncll_options(cfg, self._arch)
+        sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         for group, names in sequences.items():
             for name in names:
                 request = self._asyncll_request(
@@ -1343,7 +1373,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine_recv=table("combine_recv"),
             dispatch_replay=None,
             stages_in_kernel=True,
-            self_resets_counters=False,
+            self_resets_counters=skip_reset,
             capabilities=frozenset({"gather", "scales", "async_ll"}),
         )
 

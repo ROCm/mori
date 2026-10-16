@@ -68,10 +68,26 @@
 // what keeps the two families from drifting apart.
 #include "src/ops/dispatch_combine_v2/ep_internode_kernel.hpp"
 
+#ifndef MORI_ASYNCLL_EARLY_NOTIFY
+#define MORI_ASYNCLL_EARLY_NOTIFY 0
+#endif
+#ifndef MORI_ASYNCLL_FUSED_RECV
+#define MORI_ASYNCLL_FUSED_RECV 0
+#endif
+#if MORI_ASYNCLL_FUSED_RECV && !MORI_ASYNCLL_EARLY_NOTIFY
+#error "MORI_ASYNCLL_FUSED_RECV requires MORI_ASYNCLL_EARLY_NOTIFY"
+#endif
+
 namespace mori {
 namespace ops {
 namespace v2 {
 namespace asyncll {
+
+// The host resolves this protocol per op and carries it in every Plan's cfg.
+// LSA and multi-node configurations retain the original protocol.
+template <EpInterNodeKernelCfg kConfig>
+inline constexpr bool EarlyNotify =
+    MORI_ASYNCLL_EARLY_NOTIFY && kConfig.worldSize == kConfig.gpuPerNode;
 
 // ---------------------------------------------------------------------------
 // Signal slots.
@@ -123,6 +139,32 @@ __device__ __forceinline__ int SrcTokenIndex(const EpInterNodeDeviceCfg& config,
 __device__ __forceinline__ int QueueForPe(const ::mori::cco::ccoDevComm& comm, int destPe) {
   const uint32_t n = comm.sdma.sdmaNumQueue;
   return (n == 0) ? 0 : static_cast<int>(static_cast<uint32_t>(destPe) % n);
+}
+
+// The first active lane places the payload, the second its ready word, in one
+// reservation and with one doorbell. A zero-byte payload still sends the word.
+// Keep exceptionally large, multi-packet copies separate: the chunked put's
+// per-lane loop must not interleave the ready word with an unfinished payload.
+__device__ __forceinline__ void PostPayloadAndNotify(
+    const ::mori::cco::ccoDevComm& comm, int peer, int queueId, ::mori::cco::ccoWindow_t dstWin,
+    size_t dstOffset, ::mori::cco::ccoWindow_t srcWin, size_t srcOffset, size_t bytes,
+    ::mori::cco::ccoWindow_t notifyDstWin, size_t notifyDstOffset,
+    ::mori::cco::ccoWindow_t notifySrcWin, size_t notifySrcOffset) {
+  ::mori::cco::ccoSdma sdma{comm};
+  const int lane = threadIdx.x & (warpSize - 1);
+  if (bytes > ::mori::cco::CCO_SDMA_MAX_COPY_BYTES) {
+    sdma.put<::mori::cco::ccoCoopWarp>(peer, dstWin, dstOffset, srcWin, srcOffset, bytes, queueId);
+    if (lane == 0)
+      sdma.put(peer, notifyDstWin, notifyDstOffset, notifySrcWin, notifySrcOffset, sizeof(uint64_t),
+               queueId);
+  } else if ((lane == 0 && bytes != 0) || lane == 1) {
+    const bool notify = lane == 1;
+    sdma.put<::mori::cco::ccoCoopThread, false, false, ::mori::cco::ccoSdmaOptFlagsDefault,
+             ::mori::cco::ccoSdmaThreadSameQueue>(
+        peer, notify ? notifyDstWin : dstWin, notify ? notifyDstOffset : dstOffset,
+        notify ? notifySrcWin : srcWin, notify ? notifySrcOffset : srcOffset,
+        notify ? sizeof(uint64_t) : bytes, queueId);
+  }
 }
 
 }  // namespace asyncll
@@ -192,6 +234,15 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  if constexpr (asyncll::EarlyNotify<kConfig>) {
+    // SlotAssign has completed. The following SendTransfer kernel may hand
+    // these words directly to SDMA without an additional system fence.
+    if (globalWarpId == 0 && laneId < npes) {
+      uint8_t* counts = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+      *reinterpret_cast<uint64_t*>(counts + asyncll::SendCountSlot(laneId)) =
+          static_cast<uint64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId)) + 1;
+    }
+  }
   const index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
   // v1 divides by totalEntries unguarded, which is an integer division by zero on
   // a rank that was handed no tokens -- reachable, and covered by the ragged
@@ -355,6 +406,34 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
 
     const int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
 
+    if constexpr (asyncll::EarlyNotify<kConfig>) {
+      if (destPe == myPe) {
+        if (laneId == 0) {
+          uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
+          core::AtomicStoreReleaseSystem(
+              reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(myPe)),
+              static_cast<uint64_t>(tokenNum) + 1);
+        }
+      } else {
+        const size_t remoteBase =
+            static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * xferBytes;
+        const size_t localBase =
+            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * xferBytes;
+        asyncll::PostPayloadAndNotify(
+            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe),
+            EpInterNodeWindow(args.reg(args.offDispatchInp)),
+            EpInterNodeOffset(args.reg(args.offDispatchInp), remoteBase),
+            EpInterNodeWindow(args.reg(args.offStaging)),
+            EpInterNodeOffset(args.reg(args.offStaging), localBase),
+            static_cast<size_t>(tokenNum) * xferBytes,
+            EpInterNodeWindow(args.reg(args.offRecvTokenNum)),
+            EpInterNodeOffset(args.reg(args.offRecvTokenNum), asyncll::RecvCountSlot(myPe)),
+            EpInterNodeWindow(args.reg(args.offSendCount)),
+            EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendCountSlot(destPe)));
+      }
+      continue;
+    }
+
     // Publish the count into the local staging word now, while the value is in
     // hand; RecvTransfer is what sends it, after it has drained the payload.
     if (laneId == 0) {
@@ -450,6 +529,9 @@ __device__ void EpDispatchAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
       }
     }
 
+    // Early notifications were already placed after their payloads by SendTransfer.
+    // Keep local completion: incoming ready words do not prove our sources are free.
+    if constexpr (asyncll::EarlyNotify<kConfig>) continue;
     if (laneId != 0) continue;
 
     const uint8_t* sendCount = args.reg(args.offSendCount)->template GetAs<const uint8_t*>();
@@ -894,6 +976,21 @@ __device__ void EpCombineAsyncLLRecvTransferLsa_body(EpDispatchCombineArgs args)
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpCombineAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
+  if constexpr (asyncll::EarlyNotify<kConfig>) {
+    if (globalWarpId == 0 && laneId < npes) {
+      uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
+      uint64_t* count = reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(laneId));
+      uint8_t* sendCounts = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
+      // Dispatch recv drained its sends, so its old count source may be reused.
+      *reinterpret_cast<uint64_t*>(sendCounts + asyncll::SendCountSlot(laneId)) =
+          core::AtomicLoadRelaxedSystem(count) - 1;
+      core::AtomicStoreRelaxedSystem(count, uint64_t{0});
+      *reinterpret_cast<uint64_t*>(sendCounts + asyncll::SendFlagSlot(laneId)) =
+          args.crossDeviceBarrierFlag[0];
+      // This kernel must complete before SendTransfer publishes the epoch. In
+      // particular the count clear must land before a peer starts its next round.
+    }
+  }
   const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   // Combine's own staging, not dispatch's: writing dispatch's here would race
   // its transfer still reading it. See asyncll_regions.
@@ -926,6 +1023,39 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     if (warpId != 0) continue;
+
+    if constexpr (asyncll::EarlyNotify<kConfig>) {
+      const uint8_t* sendCounts = args.reg(args.offSendCount)->template GetAs<const uint8_t*>();
+      uint64_t tokenNum = 0;
+      if (laneId == 0)
+        tokenNum = *reinterpret_cast<const uint64_t*>(sendCounts + asyncll::SendCountSlot(destPe));
+      tokenNum = __shfl(static_cast<unsigned long long>(tokenNum), 0);
+      if (destPe == myPe) {
+        if (laneId == 0) {
+          uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+          const uint64_t flag =
+              *reinterpret_cast<const uint64_t*>(sendCounts + asyncll::SendFlagSlot(destPe));
+          core::AtomicStoreReleaseSystem(barrier + myPe, flag);
+        }
+      } else {
+        const size_t remoteBase =
+            static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes;
+        const size_t localBase =
+            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes;
+        asyncll::PostPayloadAndNotify(
+            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe),
+            EpInterNodeWindow(args.reg(args.offCombineInp)),
+            EpInterNodeOffset(args.reg(args.offCombineInp), remoteBase),
+            EpInterNodeWindow(args.reg(args.offCombineStaging)),
+            EpInterNodeOffset(args.reg(args.offCombineStaging), localBase),
+            static_cast<size_t>(tokenNum) * hiddenBytes,
+            EpInterNodeWindow(args.reg(args.offCrossDeviceBarrier)),
+            EpInterNodeOffset(args.reg(args.offCrossDeviceBarrier), myPe * sizeof(uint64_t)),
+            EpInterNodeWindow(args.reg(args.offSendCount)),
+            EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendFlagSlot(destPe)));
+      }
+      continue;
+    }
 
     // How many tokens this peer sent us during dispatch is how many we owe it
     // back. Dispatch left the slot alone precisely so this read works; clear it
@@ -998,6 +1128,7 @@ __device__ void EpCombineAsyncLLRecvTransfer_body(EpDispatchCombineArgs args,
         EpInterNodeQuiet(comm, destPe, config.numQpPerPe);
     }
 
+    if constexpr (asyncll::EarlyNotify<kConfig>) continue;
     if (laneId != 0) continue;
 
     uint8_t* sendFlags = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
@@ -1084,6 +1215,68 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
     core::WarpAccum<T, 4>(outPtr, srcPtrs, nullptr, kTopk, hiddenDimSize);
   }
 }
+
+#if MORI_ASYNCLL_FUSED_RECV
+// The control wave checks one outgoing queue per lane. Thread-scope quiet has
+// no collective barrier and these queues only wait on independently progressing
+// SDMA engines. Kernel completion waits for this wave, so sources remain owned
+// until all outgoing copies finish, without making other CTAs wait on this CTA.
+template <EpInterNodeKernelCfg kConfig>
+__device__ __forceinline__ void EpAsyncLLFusedQuiet(EpDispatchCombineArgs args,
+                                                    const ::mori::cco::ccoDevComm& comm) {
+  static_assert(asyncll::EarlyNotify<kConfig>,
+                "fused AsyncLL receive requires early notifications on a single node");
+  const int lane = threadIdx.x & (warpSize - 1);
+  if (blockIdx.x == 0 && threadIdx.x < warpSize && lane < kConfig.worldSize && lane != args.rank) {
+    ::mori::cco::ccoSdma sdma{comm};
+    sdma.quietQueue<::mori::cco::ccoCoopThread>(lane - args.lsaBase,
+                                                asyncll::QueueForPe(comm, lane));
+  }
+}
+
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpDispatchAsyncLLRecvCopyFused_body(EpDispatchCombineArgs args,
+                                                    const ::mori::cco::ccoDevComm& comm) {
+  EpAsyncLLFusedQuiet<kConfig>(args, comm);
+  const int lane = threadIdx.x & (warpSize - 1);
+  if (threadIdx.x < warpSize) {
+    if (lane < kConfig.worldSize) {
+      uint8_t* counts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
+      uint64_t* slot = reinterpret_cast<uint64_t*>(counts + asyncll::RecvCountSlot(lane));
+      while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == 0)
+        __builtin_amdgcn_s_sleep(1);
+    }
+    // Pair the successful system-scope observations with an acquire before
+    // handing the ready data to every consumer wave in this CTA.
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  }
+  // HIP's barrier includes global/local workgroup release and acquire fences:
+  // propagate the first wave's system acquire to every consumer in this CTA.
+  // All threads participate, including CTAs whose copy body has no work.
+  __syncthreads();
+  EpDispatchAsyncLLRecvCopy_body<kConfig, T>(args);
+}
+
+template <EpInterNodeKernelCfg kConfig, typename T>
+__device__ void EpCombineAsyncLLRecvCopyFused_body(EpDispatchCombineArgs args,
+                                                   const ::mori::cco::ccoDevComm& comm) {
+  const uint64_t flag = args.crossDeviceBarrierFlag[0];
+  EpAsyncLLFusedQuiet<kConfig>(args, comm);
+  const int lane = threadIdx.x & (warpSize - 1);
+  if (threadIdx.x < warpSize) {
+    if (lane < kConfig.worldSize) {
+      uint64_t* barrier = args.reg(args.offCrossDeviceBarrier)->template GetAs<uint64_t*>();
+      while (__hip_atomic_load(barrier + lane, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) != flag)
+        __builtin_amdgcn_s_sleep(1);
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  }
+  __syncthreads();
+  // Even a zero-token rank must execute both completion paths above before the
+  // original copy body returns early and the caller can start the next round.
+  EpCombineAsyncLLRecvCopy_body<kConfig, T>(args);
+}
+#endif
 
 }  // namespace v2
 }  // namespace ops

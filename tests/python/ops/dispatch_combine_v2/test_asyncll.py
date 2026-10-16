@@ -26,7 +26,8 @@ communicator, like its neighbours here.
 
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 test_asyncll.py
 
-Env: HIDDEN, TOPK, EPR, M, LOOP, plus SHAPES to override the swept list.
+Env: HIDDEN, TOPK, EPR, M, LOOP (at least 3), SHAPES to override the swept list,
+TRANSPORT=sdma|lsa, and GRAPH_REPLAYS (default 32; 0 skips the graph regression).
 
 What is checked, and why these and not more:
 
@@ -40,17 +41,23 @@ What is checked, and why these and not more:
   * **round trip** -- an identity expert must return each token scaled by its
     number of DISTINCT destination ranks. That is the end-to-end statement, and
     it is what fails if dedup, the slot maps or the reduction disagree.
+  * **received fields** -- hidden, indices and optional top-k weights match the
+    source row exactly, including a zero-input rank receiving its peers' weights.
+
+Both split and ordinary APIs run weighted -> unweighted -> weighted calls on one
+op. A small graph additionally replays fresh payload/weights with a zero-input
+receiver and with all ranks empty. Graph replay is checked after every call.
 
 The swept shapes are chosen for the two things that have actually broken:
 top-k that does not divide the wavefront (64 % 6 == 4, DeepSeek-V4's shape), and
 ranks that are handed no tokens at all.
 """
+
 import os
 import sys
 
 import torch
 import torch.distributed as dist
-
 from mori.cco.communicator import Communicator
 from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
@@ -70,10 +77,10 @@ def _shapes():
         if "HIDDEN" in os.environ or "TOPK" in os.environ:
             return [
                 (
-                    int(os.environ.get("HIDDEN", 7168)),
-                    int(os.environ.get("TOPK", 8)),
-                    int(os.environ.get("EPR", 32)),
-                    int(os.environ.get("M", 128)),
+                    int(os.environ.get("HIDDEN", "7168")),
+                    int(os.environ.get("TOPK", "8")),
+                    int(os.environ.get("EPR", "32")),
+                    int(os.environ.get("M", "128")),
                 )
             ]
         return _DEFAULT_SHAPES
@@ -111,9 +118,84 @@ def _routing(rank, world, m, topk, epr, dev, gen, num_tokens):
     return idx[:num_tokens]
 
 
+def _gather_inputs(x, indices, weights, world):
+    """Gather actual source rows; GPU and CPU RNGs need not generate equal data."""
+    local = (
+        x.shape[0],
+        indices.cpu(),
+        x.cpu(),
+        None if weights is None else weights.cpu(),
+    )
+    gathered = [None] * world
+    dist.all_gather_object(gathered, local)
+    return gathered
+
+
+def _check_dispatch(
+    d, out, out_indices, out_weights, total, reverse, gathered, m, epr, tag
+):
+    """Count, origin, and exact source-row comparisons after dispatch completes."""
+    recv = int(total[0].item())
+    invalid = torch.tensor([int(not 0 <= recv <= out.shape[0])], dtype=torch.int64)
+    dist.all_reduce(invalid)
+    if invalid.item():
+        raise RuntimeError(f"{tag}: receive count outside the output capacity")
+
+    failures = 0
+    expected = sum(
+        d.rank in {int(e) // epr for e in row.tolist()}
+        for _, source_indices, _, _ in gathered
+        for row in source_indices
+    )
+    if recv != expected:
+        print(f"[rank {d.rank}] {tag}: recv={recv}, expected={expected}", flush=True)
+        failures += 1
+
+    origins = reverse[:recv].cpu().to(torch.int64)
+    source_ranks, source_tokens = origins // m, origins % m
+    bad_origin = sum(
+        not (0 <= pe < d.world and 0 <= token < gathered[pe][0])
+        for pe, token in zip(source_ranks.tolist(), source_tokens.tolist())
+    )
+    if bad_origin:
+        print(f"[rank {d.rank}] {tag}: {bad_origin} invalid source origins", flush=True)
+        failures += 1
+
+    # None means the caller did not request weight transport; its output weights
+    # are not defined. The next weighted call still has to replace every row.
+    has_weights = gathered[d.rank][3] is not None
+    actual = {"hidden": out[:recv].cpu(), "indices": out_indices[:recv].cpu()}
+    if has_weights:
+        actual["weights"] = out_weights[:recv].cpu()
+    for pe, (source_n, source_idx, source_x, source_w) in enumerate(gathered):
+        selected = (
+            (source_ranks == pe) & (source_tokens >= 0) & (source_tokens < source_n)
+        )
+        if not selected.any().item():
+            continue
+        token_ids = source_tokens[selected]
+        expected_fields = {
+            "hidden": source_x[token_ids],
+            "indices": source_idx[token_ids],
+        }
+        if has_weights:
+            expected_fields["weights"] = source_w[token_ids]
+        for field, want in expected_fields.items():
+            got = actual[field][selected]
+            if not torch.equal(got, want):
+                bad_rows = int((got != want).any(dim=1).sum().item())
+                print(
+                    f"[rank {d.rank}] {tag}: recv {field} mismatch in {bad_rows} "
+                    f"rows from rank {pe}",
+                    flush=True,
+                )
+                failures += 1
+    return recv, failures
+
+
 def run_shape(d, comm, hidden, topk, epr, m, loops):
     rank, world = d.rank, d.world
-    dev = torch.device("cuda", rank)
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
     cfg = EpDispatchCombineConfig(
         rank=rank,
         world_size=world,
@@ -141,75 +223,59 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
             idx_full = _routing(rank, world, m, topk, epr, dev, gen, m)
             idx, xin, win = idx_full[:n], x[:n], w[:n]
 
-            out, _, _, _, total, routing = op.dispatch_send(
-                xin, win, None, idx, return_routing=True
-            )
-            op.dispatch_recv()
-            torch.cuda.synchronize()
-            dist.barrier()
-
-            recv = int(total[0].item())
-
-            # -- arrival count ------------------------------------------------
-            idx_cpu = idx.cpu()
-            gathered = [None] * world
-            dist.all_gather_object(gathered, (n, idx_cpu))
-            expected = 0
-            for src_n, src_idx in gathered:
-                for t in range(src_n):
-                    if rank in {int(e) // epr for e in src_idx[t].tolist()}:
-                        expected += 1
-            if recv != expected:
-                print(
-                    f"[rank {rank}] h={hidden} k={topk} it={it}: recv={recv} "
-                    f"expected={expected} -- slot assignment produced "
-                    "orphan or duplicate slots",
-                    flush=True,
+            weights = None if it % 3 == 1 else win
+            gathered = _gather_inputs(xin, idx, weights, world)
+            idx_cpu = gathered[rank][1]
+            for split in (True, False):
+                api = "split" if split else "ordinary"
+                tag = f"h={hidden} k={topk} it={it} api={api} weights={weights is not None}"
+                dispatch = op.dispatch_send if split else op.dispatch
+                out, out_weights, _, out_indices, total, routing = dispatch(
+                    xin, weights, None, idx, return_routing=True
                 )
-                failures += 1
-
-            # -- origin decode ------------------------------------------------
-            tis = routing.disp_tok_id_to_src_tok_id_local[:recv].cpu()
-            src_pe, src_tok = (tis // m).tolist(), (tis % m).tolist()
-            bad_origin = sum(
-                1
-                for pe, tok in zip(src_pe, src_tok)
-                if not (0 <= pe < world and 0 <= tok < gathered[pe][0])
-            )
-            if bad_origin:
-                print(
-                    f"[rank {rank}] h={hidden} k={topk} it={it}: {bad_origin} "
-                    "recv slots decode to a source that never sent -- the slot "
-                    "was never written",
-                    flush=True,
+                if split:
+                    op.dispatch_recv()
+                torch.cuda.synchronize()
+                dist.barrier()
+                recv, bad = _check_dispatch(
+                    d,
+                    out,
+                    out_indices,
+                    out_weights,
+                    total,
+                    routing.disp_tok_id_to_src_tok_id_local,
+                    gathered,
+                    m,
+                    epr,
+                    tag,
                 )
-                failures += 1
+                failures += bad
 
-            # -- round trip ---------------------------------------------------
-            cout, _ = op.combine_send(out[:recv].clone(), None, idx, routing=routing)
-            op.combine_recv()
-            torch.cuda.synchronize()
-            dist.barrier()
+                combine = op.combine_send if split else op.combine
+                cout, _ = combine(out[:recv].clone(), None, idx, routing=routing)
+                if split:
+                    op.combine_recv()
+                torch.cuda.synchronize()
+                dist.barrier()
 
-            if n:
-                uniq = torch.tensor(
-                    [
-                        len({int(e) // epr for e in idx_cpu[t].tolist()})
-                        for t in range(n)
-                    ],
-                    device=dev,
-                    dtype=torch.float32,
-                )
-                want = (xin.float() * uniq[:, None]).to(torch.bfloat16)
-                got = cout[:n]
-                if not torch.allclose(got.float(), want.float(), atol=1e-2, rtol=1e-2):
-                    diff = (got.float() - want.float()).abs()
-                    print(
-                        f"[rank {rank}] h={hidden} k={topk} it={it}: combine "
-                        f"mismatch, max |diff| {diff.max().item():.4f}",
-                        flush=True,
+                if n:
+                    uniq = torch.tensor(
+                        [len({int(e) // epr for e in row.tolist()}) for row in idx_cpu],
+                        dtype=torch.float32,
                     )
-                    failures += 1
+                    want = (gathered[rank][2].float() * uniq[:, None]).to(
+                        torch.bfloat16
+                    )
+                    got = cout[:n].cpu()
+                    if not torch.allclose(
+                        got.float(), want.float(), atol=1e-2, rtol=1e-2
+                    ):
+                        diff = (got.float() - want.float()).abs()
+                        print(
+                            f"[rank {rank}] {tag}: combine max |diff| {diff.max().item():.4f}",
+                            flush=True,
+                        )
+                        failures += 1
 
             # Asking for the weight fold has to FAIL, not return zeros: on this
             # API a non-None `weights` is a REQUEST, and AsyncLL's combine
@@ -237,10 +303,135 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
     return failures
 
 
+def run_graph(d, comm, empty_all, replays):
+    """Small exact-data regression; all allocations precede graph replay."""
+    hidden, topk, epr, m = 2048, 6, 8, 16
+    n = 0 if empty_all or d.rank == 0 else m
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", d.rank)))
+    cfg = EpDispatchCombineConfig(
+        rank=d.rank,
+        world_size=d.world,
+        hidden_dim=hidden,
+        max_num_inp_token_per_rank=m,
+        num_experts_per_rank=epr,
+        num_experts_per_token=topk,
+        data_type=torch.bfloat16,
+        kernel_backend="hip",
+        async_ll=True,
+        async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+    )
+    # With at least two ranks, peers deterministically route live tokens to rank
+    # zero, whose empty weights tensor has a null data_ptr on HIP.
+    idx_cpu = torch.arange(n * topk, dtype=torch.int32).view(n, topk) % (d.world * epr)
+    indices = idx_cpu.to(dev)
+    base_x = (
+        (torch.arange(n).view(n, 1) % 2)
+        + (torch.arange(hidden).view(1, hidden) % 2)
+        + 2 * (d.rank % 4)
+        + 1
+    )
+    base_w = (
+        torch.arange(n * topk, dtype=torch.float32).view(n, topk) + d.rank * 100000 + 1
+    )
+    x = torch.empty((n, hidden), dtype=torch.bfloat16, device=dev)
+    weights = torch.empty((n, topk), dtype=torch.float32, device=dev)
+    uniq = torch.tensor(
+        [len(set((row // epr).tolist())) for row in idx_cpu],
+        dtype=torch.float32,
+    ).view(n, 1)
+    failures = 0
+    scenario = "all_zero" if empty_all else "zero_source_receives"
+    with EpDispatchCombineOp(cfg, comm) as op:
+        stage = op.combine_in_view()
+        last = {}
+
+        def update(generation):
+            # Hidden <= 40 and at most six contributions: the identity sum is
+            # <= 240 and exact in bf16. Float32 weight watermarks change on every
+            # replay, even when the hidden watermark wraps after 32 generations.
+            x.copy_((base_x + generation % 32).to(torch.bfloat16))
+            weights.copy_(base_w + generation * 1024)
+
+        def pair():
+            out, out_weights, _, out_indices, total, routing = op.dispatch_send(
+                x, weights, None, indices, return_routing=True
+            )
+            op.dispatch_recv()
+            # Capture the lazy reverse-map clone after recv. Its GPU copy then
+            # executes on EACH replay; reading a cached host routing snapshot
+            # only after the first replay would retain the previous slot order.
+            reverse = routing.disp_tok_id_to_src_tok_id_local
+            stage.copy_(out)
+            cout, _ = op.combine_send(stage, routing=routing)
+            op.combine_recv()
+            last.update(
+                out=out,
+                weights=out_weights,
+                indices=out_indices,
+                total=total,
+                reverse=reverse,
+                combined=cout,
+            )
+
+        def check(generation):
+            torch.cuda.synchronize()
+            dist.barrier()
+            gathered = _gather_inputs(x, indices, weights, d.world)
+            tag = f"graph={scenario} generation={generation}"
+            recv, bad = _check_dispatch(
+                d,
+                last["out"],
+                last["indices"],
+                last["weights"],
+                last["total"],
+                last["reverse"],
+                gathered,
+                m,
+                epr,
+                tag,
+            )
+            if not empty_all and d.world > 1 and d.rank == 0 and recv == 0:
+                print(
+                    f"[rank 0] {tag}: zero-input rank received no peer tokens",
+                    flush=True,
+                )
+                bad += 1
+            want = (gathered[d.rank][2].float() * uniq).to(torch.bfloat16)
+            if not torch.equal(last["combined"].cpu(), want):
+                print(
+                    f"[rank {d.rank}] {tag}: exact identity round trip failed",
+                    flush=True,
+                )
+                bad += 1
+            return bad
+
+        update(0)
+        pair()
+        failures += check("prime")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pair()
+        torch.cuda.synchronize()
+        dist.barrier()
+        for generation in range(1, replays + 1):
+            update(generation)
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph.replay()
+            failures += check(generation)
+        del graph
+        torch.cuda.synchronize()
+        dist.barrier()
+    return failures
+
+
 def main():
     d = Dist()
     shapes = _shapes()
-    loops = int(os.environ.get("LOOP", 2))
+    loops = max(3, int(os.environ.get("LOOP", "3")))
+    graph_replays = int(os.environ.get("GRAPH_REPLAYS", "32"))
+    if graph_replays < 0:
+        raise ValueError("GRAPH_REPLAYS must be nonnegative")
 
     failures = 0
     # One communicator PER SHAPE, each with its own unique id, rather than one for
@@ -267,11 +458,27 @@ def main():
                 flush=True,
             )
 
+    if graph_replays:
+        for empty_all in (False, True):
+            uid = Communicator.get_unique_id() if d.rank == 0 else None
+            uid = d.bcast_uid(uid)
+            win_bytes = d.world * 2048 * 16 * 2 * 4 + (1 << 24)
+            with Communicator.init(
+                d.world, d.rank, uid, per_rank_vmm=6 * win_bytes + (1 << 28)
+            ) as comm:
+                failures += run_graph(d, comm, empty_all, graph_replays)
+            if d.rank == 0:
+                print(
+                    f"# asyncll graph empty_all={empty_all}: {graph_replays} replays done",
+                    flush=True,
+                )
+
     total = d.allreduce_sum(failures)
     if d.rank == 0:
         print(
             f"# {'PASS' if total == 0 else 'FAIL'}: {total} failed checks across "
-            f"{d.world} ranks, {len(shapes)} shapes x {loops} iterations",
+            f"{d.world} ranks, {len(shapes)} shapes x {loops} iterations x 2 APIs, "
+            f"2 graph scenarios x {graph_replays} replays",
             flush=True,
         )
     dist.destroy_process_group()
