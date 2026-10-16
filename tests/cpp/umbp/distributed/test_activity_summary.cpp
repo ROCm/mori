@@ -135,10 +135,12 @@ TEST(ActivitySummary, ReportsPromotionAndDemotionAsAPairEvenWhenOneIsZero) {
   second.transitions.offloaded_bytes = 8ULL * 1024 * 1024;
   second.transitions.succeeded = 4;
   second.transitions.failed = 1;
+  second.transitions.retried = 3;
+  second.transitions.dropped = 2;
   const std::string all = Joined(summary.Render(second, 60.0));
   EXPECT_NE(all.find("promote 0 B"), std::string::npos) << all;
   EXPECT_NE(all.find("demote 8.00 MiB"), std::string::npos) << all;
-  EXPECT_NE(all.find("1 failed"), std::string::npos) << all;
+  EXPECT_NE(all.find("1 failed, 3 retried, 2 dropped"), std::string::npos) << all;
 }
 
 TEST(ActivitySummary, SurfacesLoadMissesWhichBytesAloneHide) {

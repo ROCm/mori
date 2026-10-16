@@ -39,6 +39,7 @@ from mori.cpp import (
     RdmaBackendConfig,
     XgmiBackendConfig,
     FabricBackendConfig,
+    OfiBackendConfig,
     fabric_alloc,
     fabric_free,
     set_log_level,

@@ -312,6 +312,19 @@ TEST_F(BatchPutWarnTest, ZeroSizePutEntriesFailOthersSucceed) {
   EXPECT_TRUE(results[2]) << "key=" << keys[2];
 }
 
+// The second entry finds the first one's reservation: the key is being stored, so not a failure.
+TEST_F(BatchPutWarnTest, KeyAlreadyBeingStoredIsNotAFailure) {
+  std::vector<char> buf(kPerKey, 0x31);
+  std::vector<std::string> keys = {"dup", "dup"};
+  std::vector<const void*> srcs = {buf.data(), buf.data()};
+  std::vector<size_t> sizes = {kPerKey, kPerKey};
+
+  auto results = target_->BatchPut(keys, srcs, sizes);
+  ASSERT_EQ(results.size(), 2u);
+  EXPECT_TRUE(results[0]);
+  EXPECT_TRUE(results[1]);
+}
+
 // Zero-size gets are rejected before local fallback or remote read: they fail
 // (false) while previously-seeded non-zero keys still resolve.  Return vector
 // length is preserved.  Local self put+get on target_ keeps the round trip

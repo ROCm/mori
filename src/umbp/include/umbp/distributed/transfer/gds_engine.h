@@ -50,6 +50,14 @@ namespace mori::umbp {
 // segment (a segment file holds many keys): RegisterFile ref-counts, Deregister
 // releases at zero.  hipFileHandle_t is kept as an opaque void* so this header
 // carries no hipfile dependency; only the .cpp includes <hipfile.h>.
+//
+// ACKNOWLEDGEMENT.  This engine is built on hipFile, AMD's GPU-direct storage
+// library (https://github.com/ROCm/hipFile; MIT License, Copyright (c) Advanced
+// Micro Devices, Inc.).  Everything that moves bytes from the drive to the GPU
+// is hipFile's: file and buffer registration, the O_DIRECT peer-to-peer DMA
+// fastpath and its compat fallback.  This engine only decides which ranges to
+// read and where they land.  Our thanks to the hipFile authors and
+// contributors (https://github.com/ROCm/hipFile/graphs/contributors).
 class GdsEngine final : public TransferEngine {
  public:
   // libhipfile is dlopen'd, not linked (see hipfile_dl.h), so its presence is a
