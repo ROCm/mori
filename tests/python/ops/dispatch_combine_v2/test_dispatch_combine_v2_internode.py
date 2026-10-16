@@ -259,9 +259,6 @@ def _parse_args(argv):
     # installed package's -- a row is only useful once it is in a git diff
     # somebody can read (same convention as the v1 bench's `auto`).
     parser.add_argument("--tuning-config-dir", default=None)
-    # Free-text provenance stored with the row. The geometry alone does not say
-    # what it beat or on what machine.
-    parser.add_argument("--tuning-note", default=None)
     # The v1 bench calls combine with weights=None, so it does not pay for the
     # weight fold: an extra peer read per (token, destination) plus an accumulate
     # in three kernels, and a wider staging slot (combXferBytes = hidden + weights).
@@ -1916,8 +1913,6 @@ def _save_tuning_row(
         # v1's metric field set, same names and same definitions (_row_metrics).
         **metrics,
     }
-    if args.tuning_note:
-        entry["note"] = args.tuning_note
     save_internode_result(
         cfg.world_size,
         phase,

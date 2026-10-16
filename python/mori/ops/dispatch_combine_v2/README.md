@@ -186,7 +186,7 @@ MORI_DISABLE_IONIC_CCQE=1 tools/run_internode_test.sh \
     --cmd tuning --kernel-type v2 --max-tokens 4096 --num-qp 2 \
     --dtype bf16 --combine-dtype bf16 --hidden-dim 7168 --topk 8 \
     -- --experts-per-rank 16 --tuning-phase dispatch --tuning-save \
-       --tuning-config-dir <directory> --tuning-note "machine and comparison details"
+       --tuning-config-dir <directory>
 ```
 
 Repeat for each token ceiling and phase being tuned. `--tuning-save` merges the
@@ -204,7 +204,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | file | role |
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
-| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (default 1), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. `--cmd tuning` sweeps one phase (`--tuning-phase`) against the other's shipped value and, with `--tuning-save`, merges the winner into `tuning_configs/` (`--tuning-config-dir`, `--tuning-note`). **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
+| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (default 1), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. `--cmd tuning` sweeps one phase (`--tuning-phase`) against the other's shipped value and, with `--tuning-save`, merges the winner into `tuning_configs/` (`--tuning-config-dir`). **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
 | `test_internode_regions.py` | pure-Python invariants of `internode_regions()`: the name contract with the backend and the capacity bounds the kernel's indexing implies. No GPU, no process group |
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
