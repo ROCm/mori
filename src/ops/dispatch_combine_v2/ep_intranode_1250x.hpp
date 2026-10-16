@@ -4143,11 +4143,21 @@ __device__ __forceinline__ void EpFp4OvlWait(const EpArgs& args, const unsigned 
 // (token, k): k counts the token's destination ranks in the order their first expert appears in
 // its ids, the order EpFp4ReducePrep sums them in. The source polls the lines, gathers each row
 // back in the warp's LDS tile and sums the rows as EpFp4ReduceItem does, so the result is the same
-// bit for bit, with no barrier. It pairs with EpDispatchLl1250x: a slot's ids and source come from
-// its outIdx and recvToSrc, and a token's destination ranks from dispDestTokIdMap, which that
-// dispatch fills with the rank of each id. An expert's call c + 1 stores to a source's landing only
-// after its dispatch c + 1 has the source's count word, which the source stores after its combine c.
+// bit for bit, with no barrier. A slot's ids and source come from its outIdx and recvToSrc, and a
+// token's destination ranks from dispDestTokIdMap (EpLlMapRank). An expert's call c + 1 stores to a
+// source's landing only after its dispatch c + 1 has the source's count, which the source sends
+// after its combine c.
 __device__ unsigned _lcSeq[256];
+// The rank an entry of dispDestTokIdMap names: EpDispatchLl1250x stores the rank of each id; the
+// original dispatch (EpCfg::ll128CombineOnly) a flat index for the first id of each rank and the
+// null one, past every rank, for the rest.
+template <EpCfg kCfg>
+__device__ __forceinline__ int EpLlMapRank(const int m) {
+  if constexpr (kCfg.ll128CombineOnly)
+    return EpPeFromFlat<kCfg>(m);
+  else
+    return m;
+}
 __device__ unsigned _lcTicket;
 __device__ unsigned _lcTmo;
 template <EpCfg kCfg, typename T>
@@ -4350,7 +4360,7 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
     for (int it = nWaves - 1 - wv; live && it < N * Wn; it += nWaves) {
       const int t = it / Wn, w = it - t * Wn;
       const int p0 = w * kPass / Wn, p1 = (w + 1) * kPass / Wn;
-      const int rq0 = laneId < topk ? args.dispDestTokIdMap[t * topk + laneId] : -1;
+      const int rq0 = laneId < topk ? EpLlMapRank<kCfg>(args.dispDestTokIdMap[t * topk + laneId]) : -1;
       const unsigned long long fm = firsts(rq0 >= 0 && rq0 < npes ? rq0 : -1);
       const int nRow = __popcll(fm);
       unsigned char* const orow = out + (size_t)t * kTokB;
@@ -4456,7 +4466,7 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
   // One wave a token otherwise; a poll round reads all of the token's rows (past its last row the
   // last row is read again, so no load sits behind a branch).
   for (int t = nWaves - 1 - wv; live && !passMode && t < N; t += nWaves) {
-    const int r0 = laneId < topk ? args.dispDestTokIdMap[t * topk + laneId] : -1;
+    const int r0 = laneId < topk ? EpLlMapRank<kCfg>(args.dispDestTokIdMap[t * topk + laneId]) : -1;
     const unsigned long long fm = firsts(r0 >= 0 && r0 < npes ? r0 : -1);
     const int nRow = __popcll(fm);
     unsigned char* const orow = out + (size_t)t * kTokB;
@@ -4550,14 +4560,14 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
 
 // The LL128 combine of a bf16 op (EpCfg::ll128 without a push combine): an expert rank stores each
 // row it received, unchanged, as 128 B lines that carry the call number, to the landing of the rank
-// the row came from at the slot EpCombineLl1250x uses, and the source sums a token's rows in fp32 in
-// the same order (the order of first appearance of their ranks in its ids). A line's lanes 0..6
-// carry 16 B of the row from 112 B a line, lane 7 the 8 B of the row's tail past 112 B a line, then
-// the call number, so every lane's bytes are one aligned load at the expert and one aligned store at
-// the source, and a token's rows sum in registers without LDS. A row's units are split into
-// parts, a wave each, so a few rows still spread over many waves. The tail lines past the row
-// carry the slot's forwarded weights, which the source sums as the pull combine's weight fold
-// does when outWeightsBuf asks for it.
+// the row came from at the slot EpCombineLl1250x uses, and the source sums a token's rows in fp32,
+// in the order their ranks first appear in its ids. Lanes 0..6 of a line carry 112 B of the row,
+// 16 B each; lane 7 carries 8 B of the row's tail (the bytes past 112 B a line), then the call
+// number. So every lane's bytes are one aligned load at the expert and one aligned store at the
+// source, and a token's rows sum in registers without LDS. A row's units are split into parts, a
+// wave each, so a few rows still spread over many waves. In the lines past the row's tail, lane 7
+// carries the slot's forwarded weights, two a line; when outWeightsBuf is set the source sums
+// them, as the pull combine's weight fold does.
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   static_assert(std::is_same_v<T, hip_bfloat16> && !EpCombinePush(kCfg),
@@ -4686,7 +4696,7 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   unsigned tmoSeen = 0;
   for (int it = nWaves - 1 - wv; it < N * kParts; it += nWaves) {
     const int t = it / kParts, q = it - t * kParts;
-    const int r0 = laneId < topk ? args.dispDestTokIdMap[t * topk + laneId] : -1;
+    const int r0 = laneId < topk ? EpLlMapRank<kCfg>(args.dispDestTokIdMap[t * topk + laneId]) : -1;
     const unsigned long long fm = firsts(r0 >= 0 && r0 < npes ? r0 : -1);
     const int nRow = __popcll(fm);
     unsigned char* const orow = out + (size_t)t * kTokB;
@@ -4789,7 +4799,7 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
 
 template <EpCfg kCfg, typename T>
 __device__ void EpCombine1250xBody(EpArgs args) {
-  if constexpr (kCfg.ll128) {
+  if constexpr (kCfg.ll128 || kCfg.ll128CombineOnly) {
     if constexpr (EpCombinePush(kCfg))
       EpCombineLl1250x<kCfg, T>(args);
     else

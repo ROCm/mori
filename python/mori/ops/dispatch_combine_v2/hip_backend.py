@@ -404,10 +404,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.arena.zero()
 
         # An LL128 op runs every call on one dispatch and one combine plan (_LL128_TABLE in
-        # hip_tuning_configs). A geometry the caller pinned is one plan already.
+        # hip_tuning_configs); with the LL128 combine alone, on the schedule's dispatch and one
+        # combine plan. A geometry the caller pinned is one plan already.
         if self._ll128_geom is not None and cfg.schedule:
-            (db, dw), (cb, cw) = self._ll128_geom["dispatch"], self._ll128_geom["combine"]
-            cfg.schedule = ((None, db, dw, cb, cw),)
+            cb, cw = self._ll128_geom["combine"]
+            if "dispatch" in self._ll128_geom:
+                db, dw = self._ll128_geom["dispatch"]
+                cfg.schedule = ((None, db, dw, cb, cw),)
+            else:
+                cfg.schedule = tuple((e, db, dw, cb, cw) for (e, db, dw, _, _) in cfg.schedule)
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
@@ -693,8 +698,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _ll128_plan(self, cfg):
         """The LL128 plans of this op ({"dispatch": (block, warp), "combine": (block, warp)},
-        hip_tuning_configs.ll128), or None. Only on local memory of MTYPE RW: on the MTYPE NC
-        parts (f01-2) a poll kept reading stale lines and rows went missing."""
+        without "dispatch" when only the combine takes LL128; hip_tuning_configs.ll128), or None.
+        Only on local memory of MTYPE RW: on the MTYPE NC parts (f01-2) a poll kept reading
+        stale lines and rows went missing."""
         if not self._is1250 or cfg.is_internode or not _mtype_local_rw():
             return None
         if cfg.is_fp4:
@@ -734,14 +740,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
         out_tok = cap * cfg.combine_token_nbytes
-        ll = self._ll128_geom is not None
+        llc = self._ll128_geom is not None
+        ll = llc and "dispatch" in self._ll128_geom
         if cfg.quant_type in _PUSH_QUANT_TYPES:
             land_rows = push_land_rows(cfg)
             # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
             # which runs from four ranks up.
             row = push_wire_nbytes(cfg) + (8 if cfg.world_size >= 4 else 0)
             # The LL128 combine lands the same rows, as lines, from the same offset.
-            out_tok += land_rows * (max(row, ll_comb_row_bytes(cfg)) if ll else row)
+            out_tok += land_rows * (max(row, ll_comb_row_bytes(cfg)) if llc else row)
         elif ll:
             # The bf16 LL128 combine lands a token's rows from each of its ranks past the staging.
             out_tok += push_land_rows(cfg) * ll_bf16_row_bytes(cfg)
@@ -1358,7 +1365,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             comb_cfg["combine_fp4_f32_scale"] = True
         if cfg.quant_type == "fp8_blockwise":
             comb_cfg["combine_fp8"] = True
-        if self._ll128_geom is not None:
+        if self._ll128_geom is not None and "dispatch" in self._ll128_geom:
             # MakeEpCfg checks the dispatch's request against the combine it pairs with.
             disp_cfg.update(
                 ll128=True,
@@ -1366,6 +1373,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 combine_fp8=comb_cfg.get("combine_fp8", False),
             )
             comb_cfg["ll128"] = True
+        elif self._ll128_geom is not None:
+            comb_cfg["ll128_combine_only"] = True
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
@@ -1548,7 +1557,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             not self._is1250
             or not cfg.schedule
             or cfg.world_size < 16
-            or self._ll128_geom is not None
+            or (self._ll128_geom is not None and "dispatch" in self._ll128_geom)
         ):
             return [cap]
         caps = {
