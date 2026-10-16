@@ -42,12 +42,9 @@
 //   4. Subset semantics        — a ranged get writes the requested bytes and
 //      nothing else, which is what distinguishes it from a whole-object read.
 //
-// WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT: that any of it is faster.
-// Since D1 a local ranged get stages only its extent off the drive; the test
-// that counts the bytes read lives with SsdBackend (test_ssd_backend.cpp,
-// SsdBackendExtentTest), because only there is the drive observable.  What
-// this suite adds for D1 (section 4b) is the reader's half: ranges rebased onto
-// a window that does not start at byte 0 must still land the right bytes.
+// WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT: that any of it is faster.  The
+// bytes D1 reads off the drive are counted in test_ssd_backend.cpp; section 4b
+// checks the reader's half, ranges rebased onto a window mid-object.
 
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -56,7 +53,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -375,8 +371,7 @@ TEST_F(SsdRangedIoTest, LocalRangedGetWritesOnlyTheRequestedBytes) {
 //  4b. Local: extent-scoped staging, through the client (D1b)
 // ---------------------------------------------------------------------------
 
-// Aperiodic, unlike Pattern (period 256): a window rebased by the wrong 4 KiB
-// multiple must not compare equal by accident.
+// Unlike Pattern (period 256), a window rebased by a wrong 4 KiB multiple cannot match.
 std::vector<char> Aperiodic(size_t size, unsigned seed) {
   std::vector<char> out(size);
   for (size_t i = 0; i < size; ++i) {
@@ -385,12 +380,9 @@ std::vector<char> Aperiodic(size_t size, unsigned seed) {
   return out;
 }
 
-// Layer-wise restore in miniature: several multi-page objects, each read as
-// two ranges from the middle of the object (one "layer group"), then again at
-// a different group.  The SSD resolve stages only [first, last) of each key's
-// ranges, widened to 4 KiB, so the reader must rebase its ranges onto a window
-// that starts mid-object.  More keys than half the arena forces a second
-// resolve round, which must carry the extents too.
+// Layer-wise restore in miniature: two "layer groups" of several multi-page
+// objects, each two ranges mid-object.  More keys than half the arena forces a
+// second resolve round, which must carry the extents too.
 TEST_F(SsdRangedIoTest, LocalRangedGetOfLargeObjectsFollowsTheirExtents) {
   auto config = SsdConfig("ssd-local-extent");
   config.distributed->ssd_staging_buffer_slots = 32;  // 32 x 4 KiB pages
@@ -410,8 +402,7 @@ TEST_F(SsdRangedIoTest, LocalRangedGetOfLargeObjectsFollowsTheirExtents) {
   }
   for (const auto& key : keys) ASSERT_TRUE(WaitForExists(node, key));
 
-  // Two "layer groups": each a pair of disjoint ranges spanning a few pages,
-  // neither starting on a page boundary.
+  // Each group: two disjoint ranges spanning a few pages, off page boundaries.
   const std::vector<std::vector<size_t>> group_offsets = {{20000, 30000}, {41000, 47000}};
   const std::vector<std::vector<size_t>> group_sizes = {{3000, 2000}, {5000, 1234}};
   for (size_t g = 0; g < group_offsets.size(); ++g) {
@@ -442,8 +433,7 @@ TEST_F(SsdRangedIoTest, LocalRangedGetOfLargeObjectsFollowsTheirExtents) {
     }
   }
 
-  // The whole object is still readable the ordinary way afterwards: no extent
-  // stage was left behind as if it were the object.
+  // A whole read afterwards still gets the whole object, not a leftover extent.
   std::vector<char> whole(kLarge, 0);
   ASSERT_EQ(node->BatchGet({keys[0]}, {Addr(whole.data())}, {kLarge}), std::vector<bool>({true}));
   EXPECT_EQ(whole, objects[0]);

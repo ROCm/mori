@@ -1715,7 +1715,6 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   // A partial batch still has to be gathered.
   std::vector<std::string> gathered;
   const std::vector<std::string>* batch = &keys;
-  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;
   std::vector<ObjectExtent> gathered_extents;
   const std::vector<ObjectExtent>* batch_extents = extents;
   if (candidates.size() != keys.size()) {
@@ -3305,9 +3304,7 @@ void FillReadRanges(const std::vector<void*>& dsts, const std::vector<size_t>& s
   for (size_t r = 0; r < dsts.size(); ++r) out->push_back({dsts[r], sizes[r], offsets[r]});
 }
 
-// The window a layer-wise reader touches in one object: [first byte, last
-// byte) over all its ranges.  It is what an extent-scoped medium stages instead
-// of the whole object (MediumBackend::BatchResolve).
+// [first byte, last byte) of a key's ranges: what a staging medium needs to read.
 ObjectExtent ReadExtent(const std::vector<size_t>& sizes, const std::vector<size_t>& offsets) {
   uint64_t lo = std::numeric_limits<uint64_t>::max();
   uint64_t hi = 0;
@@ -3320,11 +3317,8 @@ ObjectExtent ReadExtent(const std::vector<size_t>& sizes, const std::vector<size
   return ObjectExtent{lo, hi - lo};
 }
 
-// Moves object-relative ranges onto a resolve that staged only part of the
-// object: subtract the window start, so they index its pages.  False if any
-// range leaves the window -- the medium staged less than the reader needs,
-// which only a mismatched extent can cause, and the page walk must not read
-// past it.  A whole-object entry (covered_size == 0) is left untouched.
+// Moves a key's ranges onto the window its resolve staged, if it staged only
+// part of the object.  False if any range falls outside that window.
 bool RebaseRangesOntoCoveredWindow(const ResolvedEntry& resolved,
                                    std::vector<PoolClient::ObjectRange>* ranges) {
   if (resolved.covered_size == 0) return true;
@@ -3587,9 +3581,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   for (size_t i = 0; i < n; ++i) {
     if (!sizes[i].empty()) candidates.push_back(i);
   }
-  // What each key will touch.  A layer-wise reader asks for one layer group per
-  // call; a medium that stages (SSD) reads only this window off the device
-  // instead of the whole object once per group (doc/design-ssd-ranged-io.md D1).
+  // What each key will touch, so SSD stages one layer group, not the whole
+  // object once per group (design-ssd-ranged-io.md D1).
   std::vector<ObjectExtent> extents(n);
   for (size_t i : candidates) extents[i] = ReadExtent(sizes[i], src_offsets[i]);
   // A staged medium may publish the batch in parts: each part is planned and
@@ -3660,8 +3653,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
               keys[i], resolved.covered_offset, resolved.covered_size);
           built = false;
         } else {
-          // Pages tile the staged window, which is the whole object unless the
-          // medium staged only this key's extent.
+          // The pages tile the staged window (the whole object, or its extent).
           const uint64_t staged_size =
               resolved.covered_size != 0 ? resolved.covered_size : resolved.size;
           built = BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, staged_size,

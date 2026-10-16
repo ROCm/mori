@@ -451,9 +451,8 @@ class PoolClient {
   // Each hit's bytes stay put while its resolutions[i].hold lives.  `busy`
   // receives the candidates a staged medium left for a later call while
   // serving others; without it, or when nothing was served, they are misses.
-  // `extents`, parallel to `keys` (or null), names what each key's reader will
-  // touch; a staging medium may then publish only that window, which the
-  // caller must honor (ResolvedEntry::covered_offset / covered_size).
+  // `extents` (parallel to `keys`, or null) lets a staging medium publish only
+  // what each reader touches (ResolvedEntry::covered_offset / covered_size).
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,

@@ -696,7 +696,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
                                                       bool include_descs, bool allow_file_refs,
                                                       ResolveReader reader,
                                                       const std::vector<ObjectExtent>* extents) {
-  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;  // never misalign
+  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;
   // A remote reader discards a response holding any kBusy key; a local one
   // reads its hits and comes back for the busy keys.
   const bool busy_discards = reader == ResolveReader::kRemote;

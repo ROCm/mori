@@ -424,12 +424,10 @@ bool DistributedClient::SupportsRangedIO() const {
   // walking (ssd_backend.h).  All four ranged paths therefore work on an SSD
   // node: get and put, each local and remote.
   //
-  // What the medium changes is the saving, not the correctness.  A LOCAL
-  // ranged get names each key's extent on the resolve, and SsdBackend stages
-  // only that window off the device (doc/design-ssd-ranged-io.md, D1); a remote
-  // one still stages the whole object on the peer, since the extent does not
-  // travel on the wire (D2).  Ranged put is unaffected: it tiles its object, so
-  // the single whole-object write was always going to happen.
+  // What the medium changes is the saving, not the correctness.  A local
+  // ranged get off SSD reads only its extent (design-ssd-ranged-io.md D1); a
+  // remote one still stages the whole object (D2).  Ranged put tiles its
+  // object, so the single whole-object write was always going to happen.
   //
   // The one exception is a node with no master.  Nothing can route a key off
   // this node, so every ranged operation it will ever serve is the local path

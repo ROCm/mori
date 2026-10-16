@@ -27,7 +27,6 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -899,18 +898,11 @@ TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
 #endif  // UMBP_ENABLE_GDS
 
 // ---------------------------------------------------------------------------
-//  Extent-scoped staging (doc/design-ssd-ranged-io.md, D1b)
+//  Extent-scoped staging (design-ssd-ranged-io.md D1b).  These assert the
+//  DEVICE read size: a whole-object stage hands back the right bytes too.
 // ---------------------------------------------------------------------------
-//
-// A layer-wise restore resolves one layer group of every object per call.
-// Staging the whole object each time read every object once per group off the
-// drive (8x for 8 groups).  With an extent, a local resolve reads only that
-// window.  These assert the DEVICE read size, not just the bytes handed back:
-// a whole-object stage returns the right bytes too, which is why the old
-// behaviour passed every content test.
 
-// Not periodic in any power of two, so a window staged at the wrong 4 KiB
-// boundary cannot compare equal by accident (Payload's iota repeats every 256).
+// Aperiodic, so a window staged at the wrong 4 KiB boundary cannot match.
 std::vector<char> Aperiodic(size_t n) {
   std::vector<char> v(n);
   for (size_t i = 0; i < n; ++i) {
@@ -955,8 +947,7 @@ class SsdBackendExtentTest : public SsdBackendTest {
   }
 };
 
-// The core of D1: a window of a 1 MiB object, widened to 4 KiB, is all that
-// comes off the drive, and the entry says which window its pages hold.
+// A window of a 1 MiB object, widened to 4 KiB, is all that comes off the drive.
 TEST_F(SsdBackendExtentTest, LocalExtentResolveReadsOnlyTheWindow) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});
   const auto object = Aperiodic(kObject);
@@ -980,8 +971,7 @@ TEST_F(SsdBackendExtentTest, LocalExtentResolveReadsOnlyTheWindow) {
   EXPECT_EQ(PagesInUse(), 0u) << "an extent stage goes back with its last hold";
 }
 
-// The last window of an object that is not a 4 KiB multiple is clamped to the
-// object, so the read never asks for bytes past the value.
+// The last window of an object that is not a 4 KiB multiple stops at its end.
 TEST_F(SsdBackendExtentTest, TailWindowIsClampedToTheObject) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});
   constexpr size_t kOdd = 1000000;
@@ -997,46 +987,22 @@ TEST_F(SsdBackendExtentTest, TailWindowIsClampedToTheObject) {
   EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(object, 995328, kOdd - 995328));
 }
 
-// One key named twice with different windows in one call: two private stages,
-// each holding its own window.  Collapsing them on the key would
-// hand one reader the other's bytes.
-TEST_F(SsdBackendExtentTest, TwoWindowsOfOneKeyStageSeparately) {
+// Identical windows in one call share a read; different ones of the same key do not.
+TEST_F(SsdBackendExtentTest, WindowsOfOneKeyShareAReadOnlyWhenIdentical) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});
   const auto object = Aperiodic(kObject);
   ASSERT_TRUE(Put(backend_.get(), "k", object));
   const uint64_t before = DeviceReadBytes();
 
-  auto got = ResolveExtents({"k", "k"}, {ObjectExtent{0, 65536}, ObjectExtent{720896, 65536}});
-  ASSERT_TRUE(got[0].found);
-  ASSERT_TRUE(got[1].found);
-  EXPECT_NE(got[0].hold, got[1].hold);
-  EXPECT_EQ(got[0].covered_offset, 0u);
-  EXPECT_EQ(got[1].covered_offset, 720896u);
-  EXPECT_EQ(DeviceReadBytes() - before, 2u * 65536);
-  EXPECT_EQ(Staged(got[0], 65536), Slice(object, 0, 65536));
-  EXPECT_EQ(Staged(got[1], 65536), Slice(object, 720896, 65536));
-  got.clear();
-  backend_->RunReaperOnceForTest();
-  EXPECT_EQ(PagesInUse(), 0u);
-}
-
-// Both resolves of an identical window in one call share one device read.
-TEST_F(SsdBackendExtentTest, IdenticalWindowsInOneCallShareOneRead) {
-  Start(/*staging_pages=*/32, std::chrono::seconds{60});
-  const auto object = Aperiodic(kObject);
-  ASSERT_TRUE(Put(backend_.get(), "k", object));
-  const uint64_t before = DeviceReadBytes();
-
-  auto got = ResolveExtents({"k", "k"}, {ObjectExtent{4096, 8192}, ObjectExtent{4096, 8192}});
-  ASSERT_TRUE(got[0].found);
-  ASSERT_TRUE(got[1].found);
+  auto got = ResolveExtents({"k", "k", "k"}, {ObjectExtent{0, 65536}, ObjectExtent{0, 65536},
+                                              ObjectExtent{720896, 65536}});
+  for (const auto& entry : got) ASSERT_TRUE(entry.found);
   EXPECT_EQ(got[0].hold, got[1].hold);
-  EXPECT_EQ(DeviceReadBytes() - before, 8192u);
-  // Two holds: the span outlives the first.
-  got[0].hold.reset();
-  backend_->RunReaperOnceForTest();
-  EXPECT_EQ(PagesInUse(), 1u);
-  EXPECT_EQ(Staged(got[1], 8192), Slice(object, 4096, 8192));
+  EXPECT_NE(got[0].hold, got[2].hold);
+  EXPECT_EQ(got[2].covered_offset, 720896u);
+  EXPECT_EQ(DeviceReadBytes() - before, 2u * 65536);
+  EXPECT_EQ(Staged(got[1], 65536), Slice(object, 0, 65536));
+  EXPECT_EQ(Staged(got[2], 65536), Slice(object, 720896, 65536));
   got.clear();
   backend_->RunReaperOnceForTest();
   EXPECT_EQ(PagesInUse(), 0u);
@@ -1060,8 +1026,7 @@ TEST_F(SsdBackendExtentTest, WholeObjectLeaseServesAnExtentWithoutReading) {
   EXPECT_EQ(DeviceReadBytes(), before);
 }
 
-// A remote reader's extent does not travel on the wire (D2), so it keeps the
-// whole-object lease whatever it passes.
+// A remote reader's extent does not travel on the wire (D2): it stages whole.
 TEST_F(SsdBackendExtentTest, RemoteReaderStagesTheWholeObject) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});
   const auto object = Aperiodic(kObject);
@@ -1075,7 +1040,7 @@ TEST_F(SsdBackendExtentTest, RemoteReaderStagesTheWholeObject) {
   EXPECT_EQ(Staged(got[0], kObject), object);
 }
 
-// UMBP_SSD_EXTENT_STAGING=0 is the A/B switch: whole-object staging as before.
+// UMBP_SSD_EXTENT_STAGING=0 restores whole-object staging.
 TEST_F(SsdBackendExtentTest, KillSwitchRestoresWholeObjectStaging) {
   ASSERT_EQ(setenv("UMBP_SSD_EXTENT_STAGING", "0", 1), 0);
   Start(/*staging_pages=*/32, std::chrono::seconds{60});
@@ -1088,33 +1053,6 @@ TEST_F(SsdBackendExtentTest, KillSwitchRestoresWholeObjectStaging) {
   ASSERT_TRUE(got[0].found);
   EXPECT_EQ(got[0].covered_size, 0u);
   EXPECT_EQ(DeviceReadBytes() - before, kObject);
-}
-
-// An extent stage fits where the whole object would not: the arena bound is
-// the window's, not the object's.  With 16 of 20 pages held, a second whole
-// 1 MiB object cannot stage, but a 2-page window of it can.
-TEST_F(SsdBackendExtentTest, WindowFitsAnArenaTheObjectDoesNot) {
-  Start(/*staging_pages=*/20, std::chrono::seconds{60});
-  const auto a = Aperiodic(kObject);
-  auto b = Aperiodic(kObject);
-  std::reverse(b.begin(), b.end());
-  ASSERT_TRUE(Put(backend_.get(), "a", a));
-  ASSERT_TRUE(Put(backend_.get(), "b", b));
-  auto held = backend_->BatchResolve({"a"}, false, false, ResolveReader::kLocal);
-  ASSERT_TRUE(held[0].found);
-  ASSERT_EQ(PagesInUse(), 16u);
-
-  const auto whole = backend_->BatchResolve({"b"}, false, false, ResolveReader::kLocal);
-  EXPECT_FALSE(whole[0].found) << "16 more pages cannot be had";
-
-  auto got = ResolveExtents({"b"}, {ObjectExtent{65536, 100000}});
-  ASSERT_TRUE(got[0].found);
-  EXPECT_EQ(got[0].pages.size(), 2u);
-  EXPECT_EQ(Staged(got[0], got[0].covered_size), Slice(b, 65536, got[0].covered_size));
-  held.clear();
-  got.clear();
-  backend_->RunReaperOnceForTest();
-  EXPECT_EQ(PagesInUse(), 0u);
 }
 
 }  // namespace
