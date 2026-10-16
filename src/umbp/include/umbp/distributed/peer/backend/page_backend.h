@@ -260,7 +260,8 @@ class PageBackend : public MediumBackend {
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override;
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
@@ -371,6 +372,9 @@ class PageBackend : public MediumBackend {
     // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
     // thread already extended.
     std::atomic<int64_t> read_lease_ns{0};
+    // Copied into every kLocal hit; a reader still has it while use_count() > 1.
+    // Made at commit, so the shared-lock resolve path only copies it.
+    std::shared_ptr<const void> hold;
     // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
@@ -388,6 +392,7 @@ class PageBackend : public MediumBackend {
         : pages(std::move(other.pages)),
           size(other.size),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
+          hold(std::move(other.hold)),
           lru_it(other.lru_it),
           in_lru(other.in_lru) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
@@ -396,6 +401,7 @@ class PageBackend : public MediumBackend {
       size = other.size;
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
+      hold = std::move(other.hold);
       lru_it = other.lru_it;
       in_lru = other.in_lru;
       return *this;
@@ -431,7 +437,7 @@ class PageBackend : public MediumBackend {
   // Build the full ADD list for every owned key.  Caller MUST hold `mutex_`.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
-  // True iff `slot`'s read-lease deadline is still in the future.
+  // True iff `slot`'s read lease is still running or a local reader holds it.
   static bool HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                        std::chrono::steady_clock::time_point now);
 
@@ -474,12 +480,13 @@ class PageBackend : public MediumBackend {
   void TouchLru(const std::string& key, OwnedSlot& slot);
   void RemoveFromLru(OwnedSlot& slot);
 
-  // Owned pages held back at ClearLocal() because of an active read lease.
-  // Released by ReaperSweep() when release_at <= now.
+  // Owned pages held back at ClearLocal() by a read lease or a local reader.
+  // Released by ReaperSweep() once release_at has passed and the hold is free.
   struct DeferredFree {
     std::string key;  // for debug log only.
     std::vector<PageLocation> pages;
     std::chrono::steady_clock::time_point release_at;
+    std::shared_ptr<const void> hold;
   };
 
   TierType tier_;

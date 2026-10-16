@@ -191,8 +191,8 @@ class FailingEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return inner_.CanHandle(src, dst);
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    return inner_.Plan(items);
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
     if (failures_.load() > 0) {
@@ -212,8 +212,9 @@ class BusyResolveBackend final : public MockBackend {
   explicit BusyResolveBackend(TierType tier) : MockBackend(tier) {}
 
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override {
-    if (!busy_) return MockBackend::BatchResolve(keys, include_descs, allow_file_refs);
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override {
+    if (!busy_) return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
     std::vector<ResolvedEntry> results(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
       if (Contains(keys[i])) results[i].outcome = ResolveOutcome::kBusy;
@@ -275,7 +276,8 @@ class BlockingResolveBackend final : public MockBackend {
   explicit BlockingResolveBackend(TierType tier) : MockBackend(tier) {}
 
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override {
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       entered_ = true;
@@ -285,7 +287,7 @@ class BlockingResolveBackend final : public MockBackend {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
     }
-    return MockBackend::BatchResolve(keys, include_descs, allow_file_refs);
+    return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
   }
 
   bool WaitUntilEntered() {
@@ -1354,6 +1356,42 @@ TEST(PeerPoolLocalEviction, ATierWithADownstreamDemotesJustTheOverage) {
     EXPECT_TRUE(cold->Contains(key)) << key << " was dropped, not demoted";
     EXPECT_TRUE(pool.BatchResolve({key}, false).front().resolved.found) << key;
   }
+}
+
+class CountingPageBackend final : public PageBackend {
+ public:
+  using PageBackend::PageBackend;
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override {
+    ++calls;
+    return PageBackend::EvictionCandidates(max_count);
+  }
+  std::atomic<int> calls{0};
+};
+
+TEST(PeerPoolLocalEviction, ARoundDoesNotRescanItsQueuedDemotionsPerBatch) {
+  // Held demotions stay offered; refetching them for every 64-key batch made a round quadratic.
+  GatedEngine engine;
+  BackendRegistry registry;
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {8192 * kHostPage};
+  auto counting = std::make_unique<CountingPageBackend>(TierType::DRAM, kHostPage, ownership,
+                                                        kNoExpiry, kNoExpiry);
+  auto* hot = counting.get();
+  ASSERT_TRUE(hot->Init(&engine));
+  ASSERT_TRUE(registry.Register("hot", std::move(counting)));
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kHostPage, 8192);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  hot->TrackEvictionOrder();
+  for (int i = 0; i < 8000; ++i) CommitKey(&pool, "k" + std::to_string(i));
+
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(hot), 0.9, 0.5));
+  const int before = hot->calls;
+  pool.RunLocalEvictionOnceForTest();
+  EXPECT_EQ(pool.LocalEvictionStats().keys, 8000u - 4096u);
+  EXPECT_LE(hot->calls - before, 40);  // ~13 now; ~67 when it refetched per batch
+  engine.Release();
 }
 
 TEST(PeerPoolLocalEviction, NeverDeletesWhatAWatermarkOffloadWouldMove) {

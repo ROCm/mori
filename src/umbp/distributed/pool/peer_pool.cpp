@@ -648,7 +648,11 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
 }
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
-                                                      bool include_descs, bool allow_file_refs) {
+                                                      bool include_descs, bool allow_file_refs,
+                                                      ResolveReader reader) {
+  // A remote reader discards a response holding any kBusy key; a local one
+  // reads its hits and comes back for the busy keys.
+  const bool busy_discards = reader == ResolveReader::kRemote;
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
   std::vector<PoolResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
@@ -684,7 +688,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
   if (direct_backend != nullptr) {
-    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs);
+    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader);
     bool batch_busy = false;
     bool all_found = resolved.size() == keys.size();
     std::vector<bool> failed_but_owned(keys.size(), false);
@@ -700,7 +704,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       out[i].resolved = std::move(resolved[i]);
       out[i].resolved.outcome = outcome;
     }
-    if (batch_busy || all_found) return out;
+    if (all_found || (batch_busy && busy_discards)) return out;
     // A plain miss is authoritative, while kFailed needs one ownership probe:
     // a backend can still own a key whose descriptor shape it cannot return.
     // Finalize stale placements here instead of running the whole routing
@@ -708,6 +712,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     std::lock_guard<std::mutex> operation_lock(operation_mutex_);
     for (size_t i = 0; i < out.size(); ++i) {
       if (out[i].resolved.found || failed_but_owned[i]) continue;
+      if (EffectiveResolveOutcome(out[i].resolved) == ResolveOutcome::kBusy) continue;
       const auto placement = placements_.find(keys[i]);
       if (placement == placements_.end() || placement->second != direct_backend_id) continue;
       placements_.erase(placement);
@@ -746,8 +751,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       attempted[index] |= static_cast<uint16_t>(1u << backend_id);
       if (!identity) backend_keys.push_back(keys[index]);
     }
-    auto results =
-        backend->BatchResolve(identity ? keys : backend_keys, include_descs, allow_file_refs);
+    auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs,
+                                         allow_file_refs, reader);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
       const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);
@@ -799,10 +804,9 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     batch_busy |= EffectiveResolveOutcome(entry.resolved) == ResolveOutcome::kBusy;
     all_found &= entry.resolved.found;
   }
-  // A caller retries the whole batch on BUSY and discards this response. Do
-  // not count hits, repair placements, or enqueue promotions for a response
-  // whose page locations will never be consumed.
-  if (batch_busy) return out;
+  // Do not count hits, repair placements, or enqueue promotions for a
+  // response whose page locations will never be consumed.
+  if (batch_busy && busy_discards) return out;
 
   // Contains is backend work too; keep it off the pool metadata lock. A
   // placement snapshot check below prevents this repair from overwriting a
@@ -862,6 +866,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       // A concurrent commit or transition changed the placement after the
       // snapshot; its publication is newer than this miss and must win.
       if (!placement_unchanged(i)) continue;
+      // Held, just not staged yet: the local reader comes back for it.
+      if (EffectiveResolveOutcome(out[i].resolved) == ResolveOutcome::kBusy) continue;
       if (repaired[i].has_value()) {
         placements_[keys[i]] = *repaired[i];
         continue;
@@ -1278,8 +1284,13 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
       }
       break;
     }
+    // Use the whole fetch: queued demotions stay offered, so a refetch per batch rescans them.
     size_t next = 0;
-    if (!evict_some(offers, &next)) {
+    bool progressed = false;
+    while (next < offers.size() && covered < budget && !drained() && !stopping()) {
+      progressed = evict_some(offers, &next) || progressed;
+    }
+    if (!progressed) {
       // All got leased or pinned since offered; retry on the next wake.
       local_evict_stalled_.fetch_add(1, std::memory_order_relaxed);
       break;
