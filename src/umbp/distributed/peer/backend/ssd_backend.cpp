@@ -555,8 +555,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // A layer-wise restore asks for one layer group per call, so staging the
   // whole object re-read every object once per group.  Remote readers keep the
   // whole-object lease: their extent does not travel on the wire (D2).
-  const bool use_extents = extent_staging_ && extents != nullptr &&
-                           extents->size() == keys.size() && local;
+  const bool use_extents =
+      extent_staging_ && extents != nullptr && extents->size() == keys.size() && local;
 
   // Fills `out` from a lease the caller has already located.  Caller holds
   // mutex_.  Factored out because the lease-hit and read-completed paths publish
