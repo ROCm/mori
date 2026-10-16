@@ -106,6 +106,19 @@ __device__ __forceinline__ size_t RecvCountSlot(int srcPe) {
   return static_cast<size_t>(srcPe) * sizeof(uint64_t);
 }
 
+// How many tokens this rank actually has for `pe`, clamped to the slice it can
+// hold. destPeTokenCounter is cleared once per round by RecvCopy, so a second
+// dispatch_send with no recv between keeps climbing: the raw value then names
+// more tokens than the per-PE stride, and every reader of it -- the transfer's
+// byte count, and the count the peer is told to expect -- would run off the end
+// of the slice. SlotAssign refuses to encode a slot past the stride for the same
+// reason; this is the other half of that bound, so the two agree on where the
+// slice ends. The host's call-order check is what keeps this unreachable.
+__device__ __forceinline__ int SendTokenCount(const EpInterNodeDeviceCfg& config, int raw) {
+  const int cap = config.MaxNumTokensToSendPerRank();
+  return (raw < cap) ? raw : cap;
+}
+
 // The local staging for a value that is about to be SDMA'd out. ccoSdma moves
 // window to window and has no immediate form, so a number has to exist at a real
 // address before it can be sent; v1 put the same number straight in the WQE with
@@ -221,7 +234,21 @@ __device__ void EpDispatchAsyncLLSlotAssign_body(EpDispatchCombineArgs args) {
       args.dispDestTokIdMap[i] = NullSendBufSlotOffset(config);
     } else {
       const index_t destTokId = atomicAdd(args.destPeTokenCounter + destPe, 1);
-      args.dispDestTokIdMap[i] = SendBufSlotOffset(config, destPe, destTokId);
+      // The counter is cleared by RecvCopy, one per round, so a SECOND
+      // dispatch_send with no recv between it and the first keeps climbing from
+      // where the first left off. Unbounded, SendBufSlotOffset then encodes a
+      // slot past this PE's stride and every later pass writes into the NEXT
+      // PE's slice -- silently, because the decoders are plain divide/modulo and
+      // a slot one stride over decodes as a legal slot of a legal PE.
+      //
+      // Out of range is the same condition the dedup already has a sentinel for,
+      // so use it: the entry is simply not sent. That makes the round WRONG, not
+      // right -- it is the host's call-order check that stops it being reachable
+      // (dispatch_combine_op.py) -- but wrong-and-in-bounds beats corrupting a
+      // peer's buffer, which is the one thing this kernel can still choose.
+      args.dispDestTokIdMap[i] = (destTokId < config.MaxNumTokensToSendPerRank())
+                                     ? SendBufSlotOffset(config, destPe, destTokId)
+                                     : NullSendBufSlotOffset(config);
     }
   }
 }
@@ -240,7 +267,9 @@ __device__ void EpDispatchAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
     if (globalWarpId == 0 && laneId < npes) {
       uint8_t* counts = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
       *reinterpret_cast<uint64_t*>(counts + asyncll::SendCountSlot(laneId)) =
-          static_cast<uint64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId)) + 1;
+          static_cast<uint64_t>(asyncll::SendTokenCount(
+              config, core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId))) +
+          1;
     }
   }
   const index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
@@ -324,7 +353,9 @@ __device__ void EpDispatchAsyncLLSendCopyLsa_body(EpDispatchCombineArgs args) {
   if (globalWarpId == 0 && laneId < npes) {
     uint8_t* sendCount = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
     *reinterpret_cast<uint64_t*>(sendCount + asyncll::SendCountSlot(laneId)) =
-        static_cast<uint64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId)) + 1;
+        static_cast<uint64_t>(asyncll::SendTokenCount(
+            config, core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId))) +
+        1;
   }
 
   const index_t totalEntries = args.curRankNumToken * config.numExpertPerToken;
@@ -404,7 +435,8 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     if (warpId != 0) continue;
 
-    const int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+    const int tokenNum =
+        asyncll::SendTokenCount(config, core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe));
 
     if constexpr (asyncll::EarlyNotify<kConfig>) {
       if (destPe == myPe) {
@@ -837,7 +869,9 @@ __device__ void EpDispatchAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args
   if (globalWarpId == 0 && laneId < npes) {
     uint8_t* sendCount = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
     *reinterpret_cast<uint64_t*>(sendCount + asyncll::SendCountSlot(laneId)) =
-        static_cast<uint64_t>(core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId)) + 1;
+        static_cast<uint64_t>(asyncll::SendTokenCount(
+            config, core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId))) +
+        1;
   }
 
   // Every warp in the grid carries bytes, rather than one warp per peer: a peer
@@ -853,7 +887,8 @@ __device__ void EpDispatchAsyncLLSendTransferLsa_body(EpDispatchCombineArgs args
   // rather than a silent drop -- kept as a guard, not as a fallback.
   if (destPe / config.gpuPerNode != myNode) return;
 
-  const int tokenNum = core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe);
+  const int tokenNum =
+      asyncll::SendTokenCount(config, core::AtomicLoadRelaxed(args.destPeTokenCounter + destPe));
   if (tokenNum <= 0) return;
 
   const asyncll::LsaShare share = asyncll::LsaShareFor(globalWarpId, globalWarpNum, npes,
