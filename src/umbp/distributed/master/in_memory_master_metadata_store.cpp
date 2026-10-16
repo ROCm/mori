@@ -546,6 +546,23 @@ std::vector<std::vector<Location>> InMemoryMasterMetadataStore::BatchLookupBlock
   return out;
 }
 
+void InMemoryMasterMetadataStore::RecordLocalReads(const std::vector<std::string>& keys,
+                                                   std::chrono::system_clock::time_point now) {
+  if (keys.empty()) return;
+  // An access bump is atomic, so the shard's shared lock is enough.
+  std::vector<std::vector<size_t>> idx_by_shard(num_shards_);
+  for (size_t i = 0; i < keys.size(); ++i) idx_by_shard[shard_index(keys[i])].push_back(i);
+  for (size_t si = 0; si < num_shards_; ++si) {
+    if (idx_by_shard[si].empty()) continue;
+    auto& sh = shard_at(si);
+    std::shared_lock lock(sh.mutex);
+    for (size_t i : idx_by_shard[si]) {
+      auto it = sh.entries.find(keys[i]);
+      if (it != sh.entries.end()) it->second.RecordAccessAtomic(now);
+    }
+  }
+}
+
 std::vector<bool> InMemoryMasterMetadataStore::BatchExistsBlock(
     const std::vector<std::string>& keys) const {
   std::vector<bool> results(keys.size(), false);

@@ -24,10 +24,13 @@
 // MIT License
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <future>
 #include <list>
 #include <map>
 #include <memory>
@@ -71,18 +74,37 @@ struct PoolResolvedEntry {
   ResolvedEntry resolved;
 };
 
+// What PeerPool::Evict did with one request.
+enum class PoolEvictOutcome {
+  kNone,            // nothing freed: no such copy, or a read lease / pin holds it
+  kFreed,           // the copy was dropped
+  kDemotionQueued,  // queued for the transition worker, which frees the source
+  kInFlight,        // another transition owns the key and will move or free it
+};
+
+struct PoolEvictResult {
+  std::string key;
+  uint64_t bytes_freed = 0;  // by the time Evict returned; 0 for a queued demotion
+  PoolEvictOutcome outcome = PoolEvictOutcome::kNone;
+};
+
 // Why a key is being removed. A tiered pool answers the two intents
 // differently, so the caller has to say which one it means instead of leaving
 // it to the tier configuration.
 enum class PoolEvictMode {
-  // Free bytes on the tier that holds the key. Where a tier configures
-  // on_evict offload the key is demoted, not dropped: the master budgets per
-  // (node, tier), so moving the bytes downstream does relieve the pressure it
-  // measured, and the data stays reachable.
+  // Free the one copy the request names: demoted if its tier has an offload
+  // target, else dropped.  Other copies are left alone.
   kReclaim,
   // Drop the key from every backend on the peer regardless of tier
-  // configuration, for when the value itself must stop existing.
+  // configuration or scope, for when the value itself must stop existing.
   kDiscard,
+};
+
+// One key to evict, and which of its copies (a key can live on several media).
+struct PoolEvictRequest {
+  std::string key;
+  TierType tier = TierType::UNKNOWN;                    // UNKNOWN: the medium holding the placement
+  uint32_t backend_id = BackendRegistry::kMaxBackends;  // overrides tier when set
 };
 
 // The implicit peer-local default Pool. It owns logical key placement and
@@ -107,7 +129,13 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
-  std::vector<EvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
+  // The single eviction entry point (master EvictKey and local eviction).
+  // Drops happen before it returns; demotions are only queued.  One result per
+  // request, in order.
+  std::vector<PoolEvictResult> Evict(const std::vector<PoolEvictRequest>& requests,
+                                     PoolEvictMode mode);
+  // Every key unscoped: freed from the medium that currently holds it.
+  std::vector<PoolEvictResult> Evict(const std::vector<std::string>& keys, PoolEvictMode mode);
   void ClearLocal();
   std::vector<KvEvent> DrainPendingEvents();
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync();
@@ -120,6 +148,25 @@ class PeerPool {
   // Reads this peer served, by the logical tier that held the key. Says whether
   // a tier policy is actually keeping hot data where it was supposed to.
   std::map<std::string, uint64_t> TierReadHits() const;
+
+  // Background watermark eviction for one backend: at `high` usage, Evict()
+  // its coldest keys down to `low`.  Puts only wake the worker.  False for an
+  // unknown backend or watermarks outside 0 < low < high <= 1.
+  bool EnableLocalEviction(uint32_t backend_id, double high_watermark, double low_watermark);
+  LocalEvictionMetrics LocalEvictionStats() const;
+  // Test seam: one synchronous pass.  Returns keys dropped or queued.
+  size_t RunLocalEvictionOnceForTest() { return LocalEvictionPass(); }
+  // UMBP_EVICT_DEMOTION_RETRY_MS override; set it before queueing work.
+  void SetEvictDemotionRetryBudgetForTest(std::chrono::milliseconds budget) {
+    evict_demotion_retry_budget_ = budget;
+  }
+
+  // Victims for a backend over its watermark, coldest first, before the
+  // medium's own order: (tier, logical tier, bytes) -> offers, or nullopt when
+  // unavailable.  The master's GetEvictionCandidates in peer-driven mode.
+  using EvictionCandidateSource = std::function<std::optional<std::vector<EvictionOffer>>(
+      TierType tier, const std::string& logical_tier, uint64_t bytes)>;
+  void SetEvictionCandidateSource(EvictionCandidateSource source);
 
  private:
   struct PendingPlacement {
@@ -134,6 +181,9 @@ class PeerPool {
     uint32_t source_backend_id = BackendRegistry::kMaxBackends;
     LogicalTierGraph::TierIndex source_tier = 0;
     uint8_t attempts = 0;
+    // An eviction demotion's retries are bounded by time from its first attempt.
+    std::chrono::steady_clock::time_point first_attempt{};
+    bool evict = false;  // from Evict(): ignores watermarks; drops once retries run out
   };
 
   // What the copy phase needs, resolved while the pool lock is still held.
@@ -143,9 +193,26 @@ class PeerPool {
     std::vector<uint32_t> targets;
   };
 
-  void EnqueueTransition(TransitionJob job);
+  // False if the key already has a job or the worker is stopping.
+  bool EnqueueTransition(TransitionJob job);
+  bool TransitionQueued(const std::string& key);  // queued or running
   void TransitionWorkerLoop();
   void StopTransitionWorker();
+  void DropEvictedCopyLocked(const TransitionJob& job);
+
+  struct LocalEvictionWatermarks {
+    double high = 0.0;
+    double low = 0.0;
+  };
+  void WakeLocalEviction();  // put path: one atomic exchange, no capacity read
+  void LocalEvictionLoop();
+  void StopLocalEviction();
+  size_t LocalEvictionPass();  // lowest tier first; returns keys evicted
+  size_t ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermarks& watermarks);
+  std::optional<std::vector<EvictionOffer>> RankedCandidates(uint32_t backend_id, TierType tier,
+                                                             uint64_t bytes,
+                                                             std::chrono::milliseconds wait);
+
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
   // Whether this read should promote the key out of `source_tier`, per that
@@ -156,6 +223,11 @@ class PeerPool {
   // is process-local and can be stale or empty (after a restart, or once
   // another path evicted the key), so the backends are the authority.
   uint32_t FindOwnerLocked(const std::string& key) const;
+  // The backend holding the copy a request names, or kMaxBackends.
+  uint32_t EvictSourceLocked(const PoolEvictRequest& request) const;
+  // Re-points the placement at a surviving copy (or forgets the key); drops
+  // run unlocked, so it re-checks the backends.
+  void RepairAfterDropLocked(const std::string& key);
   // Queues at most `max_count` offload candidates for one tier, oldest first,
   // and reports how many it queued. Bounded on purpose: a peer can hold
   // millions of placements, so neither the scan nor the queue may be
@@ -230,6 +302,30 @@ class PeerPool {
   std::vector<size_t> queued_by_tier_;
   bool stop_transition_worker_ = false;
   std::thread transition_worker_;
+  std::chrono::milliseconds evict_demotion_retry_budget_{30000};  // transition worker only
+
+  // Local watermark eviction.  local_evict_mutex_ guards local_evict_,
+  // stop_local_evict_ and the worker's start.
+  mutable std::mutex local_evict_mutex_;
+  std::condition_variable local_evict_cv_;
+  std::map<uint32_t, LocalEvictionWatermarks> local_evict_;
+  bool stop_local_evict_ = false;
+  std::atomic<bool> local_evict_wake_{false};  // lets a put skip the lock
+  std::thread local_evict_worker_;
+  std::mutex local_evict_pass_mutex_;  // one pass at a time (worker vs test seam)
+  std::atomic<uint64_t> local_evict_rounds_{0};
+  std::atomic<uint64_t> local_evict_keys_{0};
+  std::atomic<uint64_t> local_evict_no_candidate_{0};
+  std::atomic<uint64_t> local_evict_stalled_{0};
+  std::atomic<uint64_t> local_evict_master_keys_{0};
+  EvictionCandidateSource candidate_source_;  // guarded by local_evict_mutex_
+  // At most one source query in flight per backend; pass thread only.  Last
+  // member, so a pending query is joined before anything else goes away.
+  struct RankedQuery {
+    std::chrono::steady_clock::time_point started{};
+    std::future<std::optional<std::vector<EvictionOffer>>> answer;
+  };
+  std::map<uint32_t, RankedQuery> ranked_queries_;
 };
 
 }  // namespace mori::umbp

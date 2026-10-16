@@ -132,7 +132,8 @@ class AnvilLib {
   // reports no CPU link. Used to spread loopback channels on gfx1250.
   uint32_t getHostLinkEngineMask(int srcNode);
 
-  // Peer-link fallback when a GPU has no CPU io_link.
+  // Union of the engines KFD recommends on any of the node's links. The loopback
+  // fallback for a gfx1250 GPU that reports no CPU link.
   uint32_t getAnyLinkEngineMask(int srcNode);
 
   // True for gfx1250 (gfx12.5), the only arch that spreads loopback channels.

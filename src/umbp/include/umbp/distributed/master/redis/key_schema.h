@@ -190,9 +190,4 @@ class KeySchema {
   std::vector<std::string> block_tags_;  // indexed by shard; size == num_shards_
 };
 
-// Location hash-field prefix marker. A field named "l|<node>|<tier>" holds a
-// location's size; any field beginning with this marker is a location, and
-// "_"-prefixed fields (_lease/_lacc/_acnt/_created) are per-block metadata.
-inline constexpr const char* kLocFieldMarker = "l|";
-
 }  // namespace mori::umbp::redis

@@ -239,56 +239,6 @@ std::unique_ptr<TransferPlanBuilder> CompositeTransferEngine::CreatePlanBuilder(
   return std::make_unique<PlanBuilder>(*this, expected_items);
 }
 
-TransferPlanSet CompositeTransferEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  if (items.empty()) return out;
-
-  auto adopt = [&out](TransferPlanSet sub, TransferEngine* engine) {
-    for (auto& plan : sub.plans) {
-      plan.engine = engine;
-      out.plans.push_back(std::move(plan));
-    }
-    out.rejected_tags.insert(out.rejected_tags.end(), sub.rejected_tags.begin(),
-                             sub.rejected_tags.end());
-  };
-
-  // Fast path: every item goes to the same engine, so delegate the caller's own
-  // vector.  Worth a separate path because a TransferItem holds two
-  // TransferRefs and each carries a MemoryDesc with three std::strings —
-  // partitioning by copy would allocate per page on the hot path, and in
-  // practice a batch is uniform (one peer group is all-remote, a self-target
-  // batch is all-local).
-  TransferEngine* first = SelectEngine(items.front().src, items.front().dst);
-  if (first != nullptr) {
-    bool uniform = true;
-    for (size_t i = 1; i < items.size() && uniform; ++i) {
-      uniform = SelectEngine(items[i].src, items[i].dst) == first;
-    }
-    if (uniform) {
-      adopt(first->Plan(items), first);
-      return out;
-    }
-  }
-
-  // Mixed batch: partition, then plan per engine in ONE call each — grouping is
-  // what Plan is for, and planning item-by-item would defeat it.
-  std::unordered_map<TransferEngine*, std::vector<TransferItem>> by_engine;
-  for (const auto& item : items) {
-    TransferEngine* engine = SelectEngine(item.src, item.dst);
-    if (engine == nullptr) {
-      out.rejected_tags.push_back(item.tag);
-      rejected_items_.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-    by_engine[engine].push_back(item);
-  }
-
-  for (auto& [engine, engine_items] : by_engine) {
-    adopt(engine->Plan(engine_items), engine);
-  }
-  return out;
-}
-
 size_t CompositeTransferEngine::IndexOf(const TransferEngine* engine) const {
   for (size_t i = 0; i < engines_.size(); ++i) {
     if (engines_[i].get() == engine) return i;
@@ -389,10 +339,14 @@ std::vector<MetricSample> CompositeTransferEngine::SampleMetrics() const {
   for (size_t i = 0; i < engines_.size() && i < counters_.size(); ++i) {
     const char* engine_name = engines_[i]->Name();
 
+    // Every direction of every registered engine is published from the first
+    // tick, at zero: Prometheus sees an increase only between two samples of
+    // one series, so a series born holding its first transfer -- or its first
+    // failure -- hides it from rate() and increase().  The cost is a few
+    // flat-zero series for directions an engine never carries.
     for (size_t d = 0; d < kDirectionCount; ++d) {
       const DirectionCounters& c = counters_[i]->by_direction[d];
       const uint64_t plans = c.plans.load(std::memory_order_relaxed);
-      if (plans == 0) continue;
       const char* dir = DirectionName(static_cast<TransferDirection>(d));
       const uint64_t failed = c.failed_plans.load(std::memory_order_relaxed);
 
@@ -402,30 +356,21 @@ std::vector<MetricSample> CompositeTransferEngine::SampleMetrics() const {
                                  // Plans posted but not yet settled count as ok until Wait says
                                  // otherwise; the correction lands on the next tick.
                                  plans >= failed ? plans - failed : 0});
-      if (failed > 0) {
-        out.push_back(
-            MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
-                         MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
-                         {{"engine", engine_name}, {"direction", dir}, {"status", "failed"}},
-                         failed});
-      }
-
-      const uint64_t bytes = c.bytes.load(std::memory_order_relaxed);
-      if (bytes > 0) {
-        out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_BYTES_TOTAL,
-                                   MORI_UMBP_METRIC_TRANSFER_BYTES_TOTAL_HELP,
-                                   {{"engine", engine_name}, {"direction", dir}},
-                                   bytes});
-      }
-      const uint64_t nanos = c.nanos.load(std::memory_order_relaxed);
-      if (nanos > 0) {
-        out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_SECONDS_TOTAL,
-                                   MORI_UMBP_METRIC_TRANSFER_SECONDS_TOTAL_HELP,
-                                   {{"engine", engine_name}, {"direction", dir}},
-                                   nanos,
-                                   MetricKind::kCounter,
-                                   1.0 / kNanosPerSecond});
-      }
+      out.push_back(
+          MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
+                       MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
+                       {{"engine", engine_name}, {"direction", dir}, {"status", "failed"}},
+                       failed});
+      out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_BYTES_TOTAL,
+                                 MORI_UMBP_METRIC_TRANSFER_BYTES_TOTAL_HELP,
+                                 {{"engine", engine_name}, {"direction", dir}},
+                                 c.bytes.load(std::memory_order_relaxed)});
+      out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_SECONDS_TOTAL,
+                                 MORI_UMBP_METRIC_TRANSFER_SECONDS_TOTAL_HELP,
+                                 {{"engine", engine_name}, {"direction", dir}},
+                                 c.nanos.load(std::memory_order_relaxed),
+                                 MetricKind::kCounter,
+                                 1.0 / kNanosPerSecond});
     }
 
     // Whatever the engine publishes about its own internals, stamped with the
@@ -438,13 +383,12 @@ std::vector<MetricSample> CompositeTransferEngine::SampleMetrics() const {
 
   // Items no engine would take.  Not an engine failure — a routing one — so it
   // gets its own engine value rather than being blamed on whoever ran last.
-  const uint64_t rejected = rejected_items_.load(std::memory_order_relaxed);
-  if (rejected > 0) {
-    out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
-                               MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
-                               {{"engine", "none"}, {"direction", "none"}, {"status", "rejected"}},
-                               rejected});
-  }
+  // Published at zero too: it is a routing bug, so its first occurrence is
+  // the one that matters.
+  out.push_back(MetricSample{MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL,
+                             MORI_UMBP_METRIC_TRANSFER_OPS_TOTAL_HELP,
+                             {{"engine", "none"}, {"direction", "none"}, {"status", "rejected"}},
+                             rejected_items_.load(std::memory_order_relaxed)});
   return out;
 }
 

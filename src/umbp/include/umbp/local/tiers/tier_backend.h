@@ -95,7 +95,6 @@ class TierBackend {
 
   // Optional capability-based extensions.
   virtual TierCapabilities Capabilities() const;
-  virtual const void* ReadPtr(const std::string& key, size_t* out_size);
   virtual bool WriteBatch(const std::vector<std::string>& keys,
                           const std::vector<const void*>& data_ptrs,
                           const std::vector<size_t>& sizes);
@@ -120,11 +119,6 @@ class TierBackend {
   virtual std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
                                        const std::vector<const void*>& data_ptrs,
                                        const std::vector<size_t>& sizes);
-  virtual std::vector<bool> BatchWriteRanges(const std::vector<std::string>& keys,
-                                             const std::vector<size_t>& object_sizes,
-                                             const std::vector<std::vector<const void*>>& src_ptrs,
-                                             const std::vector<std::vector<size_t>>& sizes,
-                                             const std::vector<std::vector<size_t>>& dst_offsets);
 
   // Batch read into user pointers. Default loops over ReadIntoPtr().
   virtual std::vector<bool> BatchReadIntoPtr(const std::vector<std::string>& keys,
@@ -135,14 +129,6 @@ class TierBackend {
   // Default is a no-op (write-through tiers are always consistent).
   // SpdkProxyTier overrides this to drain pending write-back NVMe flushes.
   virtual bool Flush() { return true; }
-
-  // Toggle cold-read mode: bypass all caches, read directly from storage.
-  // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
-  virtual void SetColdRead(bool /*enable*/) {}
-
-  // Return an opaque location identifier for a previously written key.
-  // Callers prepend the store index before publishing to the Master.
-  virtual std::optional<std::string> GetLocationId(const std::string& key) const;
 
   // Physical location of |key|'s value for a zero-copy reader that DMAs it
   // itself (GdsEngine).  Default: no stable file location — only the
