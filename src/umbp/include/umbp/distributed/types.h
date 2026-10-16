@@ -80,6 +80,8 @@ struct TierTransitionMetrics {
   uint64_t attempted = 0;
   uint64_t succeeded = 0;
   uint64_t failed = 0;
+  uint64_t dropped = 0;  // evicted copies whose demotion never landed (lost keys)
+  uint64_t retried = 0;  // eviction demotions re-queued after a retryable failure
   uint64_t offloaded_bytes = 0;
   uint64_t promoted_bytes = 0;
 };

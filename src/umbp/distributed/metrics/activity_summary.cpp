@@ -133,6 +133,8 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
       Delta(now.transitions.offloaded_bytes, before.transitions.offloaded_bytes);
   const uint64_t moves_ok = Delta(now.transitions.succeeded, before.transitions.succeeded);
   const uint64_t moves_failed = Delta(now.transitions.failed, before.transitions.failed);
+  const uint64_t moves_retried = Delta(now.transitions.retried, before.transitions.retried);
+  const uint64_t moves_dropped = Delta(now.transitions.dropped, before.transitions.dropped);
 
   const ReCacheActivity& rc_now = now.recache;
   const ReCacheActivity& rc_old = before.recache;
@@ -157,8 +159,9 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   std::snprintf(window.data(), window.size(), "%.1fs", window_seconds);
 
   const bool anything = Moved(total) || promoted != 0 || demoted != 0 || moves_failed != 0 ||
-                        rc_admitted != 0 || rc_dropped != 0 || rc_prefetched != 0 ||
-                        rc_fragmented != 0 || rc_already != 0;
+                        moves_retried != 0 || moves_dropped != 0 || rc_admitted != 0 ||
+                        rc_dropped != 0 || rc_prefetched != 0 || rc_fragmented != 0 ||
+                        rc_already != 0;
 
   std::vector<std::string> lines;
 
@@ -205,11 +208,14 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   // they are printed as a pair even when one of them is zero: "promote 0 B"
   // next to a large demote is the shape of a tier graph that only sheds.
   head += " · promote " + FormatBytes(promoted) + " · demote " + FormatBytes(demoted);
-  if (moves_ok != 0 || moves_failed != 0) {
-    std::array<char, 80> moves{};
-    std::snprintf(moves.data(), moves.size(), " (%llu moved, %llu failed)",
-                  static_cast<unsigned long long>(moves_ok),
-                  static_cast<unsigned long long>(moves_failed));
+  if (moves_ok != 0 || moves_failed != 0 || moves_retried != 0 || moves_dropped != 0) {
+    // dropped = evicted copies lost for good; retried = demotions re-queued.
+    std::array<char, 128> moves{};
+    std::snprintf(
+        moves.data(), moves.size(), " (%llu moved, %llu failed, %llu retried, %llu dropped)",
+        static_cast<unsigned long long>(moves_ok), static_cast<unsigned long long>(moves_failed),
+        static_cast<unsigned long long>(moves_retried),
+        static_cast<unsigned long long>(moves_dropped));
     head += moves.data();
   }
   lines.push_back(std::move(head));
