@@ -482,9 +482,14 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // metadata stores with no wait between: one completion wait instead of two. The metadata tile
   // moves up a row where it shares the slab. EP32 dispatch, 3 alternating rounds: 64x16 -1.6 / -0.5
   // us at 512 / 1024 tokens a rank, 128x16 +0.7 / +0.8, so it stops at 64 blocks.
-  constexpr bool kPayFirst = !kUnitGeom && !kDPin && npes > kCfg.warpPerBlock &&
-                             kCfg.blockNum <= 64 && kCfg.warpPerBlock > kEpTokChunk &&
-                             kSlabBytes >= 2 * kTokB;
+  // kPayFirstPlain: the same at no more ranks than warps on the plain map (at most kEpTokChunk warps
+  // a block, a token per warp on its first stride), where the metadata tile has its own slab.
+  constexpr bool kPayFirstPlain = !kUnitGeom && !kDPin && npes <= kCfg.warpPerBlock &&
+                                  kCfg.warpPerBlock <= kEpTokChunk && kMetaSlabBytes > 0;
+  constexpr bool kPayFirst = (!kUnitGeom && !kDPin && npes > kCfg.warpPerBlock &&
+                              kCfg.blockNum <= 64 && kCfg.warpPerBlock > kEpTokChunk &&
+                              kSlabBytes >= 2 * kTokB) ||
+                             kPayFirstPlain;
 
   constexpr int kMaxNpes = kCfg.worldSize;
   __shared__ index_t s_N[kMaxNpes];
@@ -1128,7 +1133,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   bool _payPre = false;
   index_t _payFlat = EpNullFlat<kCfg>();
   if constexpr (kPayFirst) {
-    if (_tokChunk && _etpi == 1 && args.tokenIndices && args.inpTokenBuf &&
+    if ((_tokChunk || kPayFirstPlain) && _etpi == 1 && args.tokenIndices && args.inpTokenBuf &&
         aWarp < (int)args.numTokens) {
       const index_t f = (laneId < topk) ? args.dispDestTokIdMap[(size_t)aWarp * topk + laneId]
                                         : EpNullFlat<kCfg>();
