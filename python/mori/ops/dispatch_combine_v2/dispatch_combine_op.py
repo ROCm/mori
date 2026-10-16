@@ -172,6 +172,47 @@ class EpDispatchCombineConfig:
     # default. Only consulted when constructing the BASE class; naming a
     # subclass directly wins.
     kernel_backend: str = None
+    # Opt in to the AsyncLL kernel family (hip backend only). It is not a member
+    # of internode_kernel because it is not an internode-only choice: AsyncLL runs
+    # on one node too, which is where it is validated, and hanging it off a field
+    # named "internode" would say otherwise.
+    #
+    # What it buys is the send/recv split -- dispatch_send/dispatch_recv and
+    # combine_send/combine_recv become separate launches, so the caller can run
+    # its own work in the seam while the transfers drain. Every other family does
+    # send and recv in one kernel and has no such seam.
+    #
+    # Intranode it moves tokens with ccoSdma, the copy engine, rather than with
+    # peer stores: that is the v1 AsyncLL protocol transcribed onto cco, and it is
+    # what the cross-node leg will reuse. It is therefore NOT the fastest way to
+    # dispatch on a single node -- the ordinary v2 intranode kernels are, by about
+    # 2x on MI355X -- and it is off by default for that reason.
+    async_ll: bool = False
+    # How AsyncLL's transfer passes move bytes between same-node peers.
+    #
+    #   "sdma" (default) -- ccoSdma, the copy engine. The transfer occupies no
+    #       CUs, so it can drain under whatever the caller runs in the send/recv
+    #       seam, and it is the shape the cross-node (ccoGda) leg will reuse.
+    #   "lsa" -- peer stores over the flat symmetric VA. Faster only at small
+    #       batch; it spends the grid on the copy, so there is nothing left to
+    #       overlap and it contends with its own HBM traffic.
+    #
+    # Measured on an idle reserved MI355X node, EP8, hidden 7168, bf16,
+    # dispatch+combine as a graph, two sweeps agreeing within 0.3pp:
+    #
+    #   tok/rank      64     128     256     512    1024    2048   (us)
+    #   sdma       102.0   136.8   194.3   292.1   523.1   982.0
+    #   lsa         97.7   138.9   201.5   320.3   581.4  1094.2
+    #
+    # So "lsa" wins by ~4% at 64 tokens and loses by up to ~11% from 128 up,
+    # which is why "sdma" is the default. Neither closes the gap to the ordinary
+    # v2 intranode kernels (62.5 / 856.9 us at the ends): AsyncLL stages each
+    # payload through an extra buffer so an RDMA leg can reuse the protocol, and
+    # that cost is the same for both transports.
+    #
+    # Pick "lsa" for a small-batch, empty-seam call; keep "sdma" otherwise, when
+    # the point is the overlap, or when this op will later run across nodes.
+    async_ll_transport: str = "sdma"
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -613,6 +654,15 @@ class KernelSet:
     # Replay-routing dispatch. None = this backend has no replay.
     dispatch_replay: dict[tuple[int, int], Callable] | None = None
 
+    # The AsyncLL split. Each is the same (block_num, warp_num) -> callable shape
+    # as `dispatch`, but launching only half the pass sequence, so the caller can
+    # put its own work between the two. None = this backend runs send and recv in
+    # one launch and has no seam to expose.
+    dispatch_send: dict[tuple[int, int], Callable] | None = None
+    dispatch_recv: dict[tuple[int, int], Callable] | None = None
+    combine_send: dict[tuple[int, int], Callable] | None = None
+    combine_recv: dict[tuple[int, int], Callable] | None = None
+
     # True  -> combine's kernel stages the caller's tokens into out_tok itself.
     # False -> the op must copy them in on the host first (one extra torch kernel).
     stages_in_kernel: bool = False
@@ -698,6 +748,14 @@ class EpDispatchCombineOp:
 
     _BACKENDS: dict[str, type] = {}
     backend_name: str | None = None
+
+    # What the AsyncLL recv halves need from their send halves. Class-level so
+    # every backend has them whether or not it implements the split, and so a
+    # recv without a send raises rather than hitting a missing attribute.
+    _async_pending_dispatch_tokens = None
+    _async_pending_dispatch_input = None
+    _async_pending_dispatch_map = None
+    _async_pending_combine = None
 
     # -- registration / selection -----------------------------------------
 
@@ -930,6 +988,27 @@ class EpDispatchCombineOp:
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
         """
+        self._asyncll_step("dispatch")
+        return self._dispatch_impl(
+            input,
+            weights,
+            scales,
+            indices,
+            routing=routing,
+            return_routing=return_routing,
+            kernels=self._kernels.dispatch,
+        )
+
+    def _dispatch_impl(
+        self, input, weights, scales, indices, *, routing, return_routing, kernels
+    ):
+        """The body of dispatch(), parameterised by which kernel table runs.
+
+        dispatch() passes the whole-phase table; dispatch_send() passes the send
+        half. Everything else -- the capacity check, the replay choice, the views
+        returned -- is identical, which is why this is one function and not two
+        that drift.
+        """
         if routing is not None and return_routing:
             raise ValueError(
                 "pass either routing= (replay) or return_routing=True, not both"
@@ -953,7 +1032,7 @@ class EpDispatchCombineOp:
                 )
             kern, dest_map = table[disp_spec], routing.disp_dest_tok_id_map
         else:
-            kern = self._kernels.dispatch[disp_spec]
+            kern = kernels[disp_spec]
             if return_routing:
                 dest_map = self.routing_dest_map
             else:
@@ -967,6 +1046,15 @@ class EpDispatchCombineOp:
             dest_map=dest_map,
             num_tokens=n,
         )
+        # What dispatch_recv() needs to launch the other half -- recorded only
+        # when this WAS the send half. Recording it for a plain dispatch() was not
+        # harmless bookkeeping: it kept the previous round's input activations
+        # alive until the next call, for every kernel family. dispatch_recv()
+        # drops the references again once it has launched.
+        if kernels is not self._kernels.dispatch:
+            self._async_pending_dispatch_tokens = n
+            self._async_pending_dispatch_input = input
+            self._async_pending_dispatch_map = dest_map
 
         base = (
             self.recv_tokens(),
@@ -1012,6 +1100,15 @@ class EpDispatchCombineOp:
         the same null pointer.
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
+        self._asyncll_check_weight_fold(weights)
+        self._asyncll_step("combine")
+        return self._combine_impl(
+            input, weights, indices, routing=routing, kernels=self._kernels.combine
+        )
+
+    def _combine_impl(self, input, weights, indices, *, routing, kernels):
+        """The body of combine(), parameterised by which kernel table runs. See
+        _dispatch_impl."""
         ct = routing.cur_rank_num_token
         _, comb_spec = self._pick(ct)
 
@@ -1027,13 +1124,21 @@ class EpDispatchCombineOp:
         # [0, ct), so the prior contents of the returned slice never leak.
 
         want_weights = weights is not None
-        self._kernels.combine[comb_spec](
+        kernels[comb_spec](
             input=input,
             dest_map=routing.disp_dest_tok_id_map,
             total_recv=routing.total_recv_token_num,
             num_tokens=ct,
             want_weights=want_weights,
         )
+        # Same rule as dispatch: only the send half leaves anything for later.
+        if kernels is not self._kernels.combine:
+            self._async_pending_combine = (
+                input,
+                routing.disp_dest_tok_id_map,
+                ct,
+                want_weights,
+            )
 
         cdt = self.cfg.combine_dtype
         hidden = self.cfg.hidden_dim
@@ -1052,6 +1157,170 @@ class EpDispatchCombineOp:
         )
         return out, outw
 
+    # -- the AsyncLL seam ------------------------------------------------
+    #
+    # dispatch() and combine() above run a whole phase in one call. On the
+    # AsyncLL family each splits in two, and the point of the split is what the
+    # caller does in between:
+    #
+    #     out, ..., routing = op.dispatch_send(x, w, s, idx, return_routing=True)
+    #     ...                       # anything; the SDMA copies drain under it
+    #     op.dispatch_recv()        # now the tokens are in `out`
+    #
+    # The send half returns the same tuple dispatch() does, but the output buffers
+    # are NOT populated until the matching recv call has run. Reading them in the
+    # seam reads the previous round.
+
+    # The AsyncLL protocol's call order, as a state machine. What each call is
+    # allowed to see, and what it leaves behind:
+    #
+    #   idle --dispatch_send--> sent --dispatch_recv--> dispatched
+    #   dispatched --combine_send--> combining --combine_recv--> idle
+    #
+    # with dispatch() and combine() taking both steps of their half at once.
+    #
+    # This is not API tidiness; the protocol's signal slots carry the coupling
+    # and an unpaired call leaves state the NEXT call misreads:
+    #
+    #   * dispatch twice, no combine between: the recv counts are cleared only by
+    #     combine's send leg, so the second RecvTransfer finds the previous
+    #     round's non-zero count and its "0 means not arrived" wait passes at
+    #     once -- it then reads a payload that may still be in flight. Observed
+    #     on 8xMI308X and 8xMI355X, both transports, as wrong received counts
+    #     (560 against 548) and wrong combine output, in 1-2 of 6 attempts.
+    #   * dispatch_send twice: the slot counter keeps climbing past
+    #     MaxNumTokensToSendPerRank unchecked and writes into the next PE's slice.
+    #   * combine twice: the count is already 0, so the biased read underflows.
+    #     The kernels now skip instead of faulting, but the round is still wrong.
+    #   * cross-node combine twice: the epoch is an add of 1 per combine while
+    #     crossDeviceBarrierFlag moves once per dispatch, so one unpaired call
+    #     shifts them permanently and the wait never matches again -- a hang that
+    #     only reset() clears.
+    #
+    # Hence an error at the call rather than a diagnosis three kernels later. It
+    # is host-side bookkeeping on a path that already launches nine kernels, and
+    # it is only armed for async_ll: no other family couples its calls this way.
+    _ASYNCLL_ORDER = {
+        "dispatch": ("idle", "dispatched"),
+        "dispatch_send": ("idle", "sent"),
+        "dispatch_recv": ("sent", "dispatched"),
+        "combine": ("dispatched", "idle"),
+        "combine_send": ("dispatched", "combining"),
+        "combine_recv": ("combining", "idle"),
+    }
+    _asyncll_state = "idle"
+
+    def _asyncll_check_weight_fold(self, weights):
+        """Refuse an AsyncLL combine weight fold at the CALL, not three layers in.
+
+        The backend raises this too, but from inside the kernel wrapper -- after
+        _combine_impl has already staged `input` into the out_tok region, and
+        after the call-order check below has advanced the state. Both are wrong
+        places to find out: a caller that catches the error is left with a
+        half-written staging buffer and a state machine that has moved on.
+        """
+        if weights is not None and getattr(self.cfg, "async_ll", False):
+            raise NotImplementedError(
+                "AsyncLL combine does not produce output weights: its combine "
+                "payload carries no per-token metadata (v1's AsyncLL is the "
+                "same). Call combine() with weights=None, or use a non-AsyncLL "
+                "kernel family if you need the fold."
+            )
+
+    def _asyncll_step(self, call):
+        """Check `call` is legal now and advance. No-op off the AsyncLL family."""
+        if not getattr(self.cfg, "async_ll", False):
+            return
+        want, nxt = self._ASYNCLL_ORDER[call]
+        if self._asyncll_state != want:
+            raise RuntimeError(
+                f"{call}() is not valid here: AsyncLL is {self._asyncll_state!r} "
+                f"and this call needs {want!r}. The order is dispatch_send -> "
+                "dispatch_recv -> combine_send -> combine_recv (dispatch() and "
+                "combine() take both steps of their half). An unpaired call "
+                "leaves the recv counts and the combine epoch out of step, which "
+                "shows up as wrong data or a hang in a LATER round, not here. "
+                "Call reset() if you need to start over."
+            )
+        self._asyncll_state = nxt
+
+    def _async_half(self, which):
+        table = getattr(self._kernels, which)
+        if table is None:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no {which}: it runs send and "
+                "recv in one launch. Build the op with async_ll=True (hip backend) "
+                "to get the split."
+            )
+        return table
+
+    def dispatch_send(
+        self, input, weights, scales, indices, *, routing=None, return_routing=False
+    ):
+        """Enqueue the send half of a dispatch and return immediately.
+
+        Same arguments and same return as :meth:`dispatch`. The returned views are
+        only valid after :meth:`dispatch_recv`.
+        """
+        self._asyncll_step("dispatch_send")
+        return self._dispatch_impl(
+            input,
+            weights,
+            scales,
+            indices,
+            routing=routing,
+            return_routing=return_routing,
+            kernels=self._async_half("dispatch_send"),
+        )
+
+    def dispatch_recv(self):
+        """Run the recv half of the dispatch the last :meth:`dispatch_send` began."""
+        self._asyncll_step("dispatch_recv")
+        n = self._async_pending_dispatch_tokens
+        if n is None:
+            raise RuntimeError("dispatch_recv without a preceding dispatch_send")
+        self._async_pending_dispatch_tokens = None
+        spec, _ = self._pick(n)
+        self._async_half("dispatch_recv")[spec](
+            input=self._async_pending_dispatch_input,
+            dest_map=self._async_pending_dispatch_map,
+            num_tokens=n,
+        )
+        # Launched, so nothing reads these again; holding them would keep the
+        # caller's input alive until the next round. combine_recv already drops
+        # its whole tuple the same way.
+        self._async_pending_dispatch_input = None
+        self._async_pending_dispatch_map = None
+
+    def combine_send(self, input, weights=None, indices=None, *, routing):
+        """Enqueue the send half of a combine and return immediately."""
+        self._asyncll_check_weight_fold(weights)
+        self._asyncll_step("combine_send")
+        return self._combine_impl(
+            input,
+            weights,
+            indices,
+            routing=routing,
+            kernels=self._async_half("combine_send"),
+        )
+
+    def combine_recv(self):
+        """Run the recv half of the combine the last :meth:`combine_send` began."""
+        self._asyncll_step("combine_recv")
+        state = self._async_pending_combine
+        if state is None:
+            raise RuntimeError("combine_recv without a preceding combine_send")
+        self._async_pending_combine = None
+        inp, dest_map, ct, want_weights = state
+        _, spec = self._pick(ct)
+        self._async_half("combine_recv")[spec](
+            input=inp,
+            dest_map=dest_map,
+            total_recv=None,
+            num_tokens=ct,
+            want_weights=want_weights,
+        )
+
     def reset(self):
         """Zero the arena staging + per-rank counters (mori LaunchReset). The
         kernels self-reset their counters already; this forces a clean slate.
@@ -1059,6 +1328,10 @@ class EpDispatchCombineOp:
         Collective, like every other call here: cross_device_flag is the local
         half of the cross-device barrier and arena.zero() has just wiped the peer
         half, so one rank resetting alone would leave the two disagreeing."""
+        # This is the one way out of a half-finished exchange, and it is what the
+        # call-order error tells a caller to use: the counts and the epoch it
+        # zeroes below are exactly the state that order was protecting.
+        self._asyncll_state = "idle"
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)
