@@ -40,7 +40,7 @@ Geometry 由 [hip_tuning_configs.py](python/mori/ops/dispatch_combine_v2/hip_tun
 
 ## 测量方法（2026-09-30）
 
-适用于 [test_dispatch_combine_v2_internode.py](tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py) 的 `--cmd tuning --tuning-save`。最终指标由 `_row_metrics()` 采样、[_grand_mean_metrics.py](tests/python/ops/dispatch_combine_v2/_grand_mean_metrics.py) 汇总，与 V1 的 grand mean 口径对齐。搜索选优与最终入表测量是两个独立步骤。9 月及更早的数据按当时的口径记录，不按本节改写。
+适用于 [test_dispatch_combine_v2_internode.py](tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py) 的 `--cmd tuning --tuning-save`。最终指标由同一文件中的 `_row_metrics()` 采样、`_summarize_metric_samples()` 汇总，与 V1 的 grand mean 口径对齐。搜索选优与最终入表测量是两个独立步骤。9 月及更早的数据按当时的口径记录，不按本节改写。
 
 ### 计时与采样
 
