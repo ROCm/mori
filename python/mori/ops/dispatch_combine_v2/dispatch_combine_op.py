@@ -988,6 +988,7 @@ class EpDispatchCombineOp:
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
         """
+        self._asyncll_step("dispatch")
         return self._dispatch_impl(
             input,
             weights,
@@ -1096,6 +1097,8 @@ class EpDispatchCombineOp:
         the same null pointer.
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
+        self._asyncll_check_weight_fold(weights)
+        self._asyncll_step("combine")
         return self._combine_impl(
             input, weights, indices, routing=routing, kernels=self._kernels.combine
         )
@@ -1163,6 +1166,79 @@ class EpDispatchCombineOp:
     # are NOT populated until the matching recv call has run. Reading them in the
     # seam reads the previous round.
 
+    # The AsyncLL protocol's call order, as a state machine. What each call is
+    # allowed to see, and what it leaves behind:
+    #
+    #   idle --dispatch_send--> sent --dispatch_recv--> dispatched
+    #   dispatched --combine_send--> combining --combine_recv--> idle
+    #
+    # with dispatch() and combine() taking both steps of their half at once.
+    #
+    # This is not API tidiness; the protocol's signal slots carry the coupling
+    # and an unpaired call leaves state the NEXT call misreads:
+    #
+    #   * dispatch twice, no combine between: the recv counts are cleared only by
+    #     combine's send leg, so the second RecvTransfer finds the previous
+    #     round's non-zero count and its "0 means not arrived" wait passes at
+    #     once -- it then reads a payload that may still be in flight. Observed
+    #     on 8xMI308X and 8xMI355X, both transports, as wrong received counts
+    #     (560 against 548) and wrong combine output, in 1-2 of 6 attempts.
+    #   * dispatch_send twice: the slot counter keeps climbing past
+    #     MaxNumTokensToSendPerRank unchecked and writes into the next PE's slice.
+    #   * combine twice: the count is already 0, so the biased read underflows.
+    #     The kernels now skip instead of faulting, but the round is still wrong.
+    #   * cross-node combine twice: the epoch is an add of 1 per combine while
+    #     crossDeviceBarrierFlag moves once per dispatch, so one unpaired call
+    #     shifts them permanently and the wait never matches again -- a hang that
+    #     only reset() clears.
+    #
+    # Hence an error at the call rather than a diagnosis three kernels later. It
+    # is host-side bookkeeping on a path that already launches nine kernels, and
+    # it is only armed for async_ll: no other family couples its calls this way.
+    _ASYNCLL_ORDER = {
+        "dispatch": ("idle", "dispatched"),
+        "dispatch_send": ("idle", "sent"),
+        "dispatch_recv": ("sent", "dispatched"),
+        "combine": ("dispatched", "idle"),
+        "combine_send": ("dispatched", "combining"),
+        "combine_recv": ("combining", "idle"),
+    }
+    _asyncll_state = "idle"
+
+    def _asyncll_check_weight_fold(self, weights):
+        """Refuse an AsyncLL combine weight fold at the CALL, not three layers in.
+
+        The backend raises this too, but from inside the kernel wrapper -- after
+        _combine_impl has already staged `input` into the out_tok region, and
+        after the call-order check below has advanced the state. Both are wrong
+        places to find out: a caller that catches the error is left with a
+        half-written staging buffer and a state machine that has moved on.
+        """
+        if weights is not None and getattr(self.cfg, "async_ll", False):
+            raise NotImplementedError(
+                "AsyncLL combine does not produce output weights: its combine "
+                "payload carries no per-token metadata (v1's AsyncLL is the "
+                "same). Call combine() with weights=None, or use a non-AsyncLL "
+                "kernel family if you need the fold."
+            )
+
+    def _asyncll_step(self, call):
+        """Check `call` is legal now and advance. No-op off the AsyncLL family."""
+        if not getattr(self.cfg, "async_ll", False):
+            return
+        want, nxt = self._ASYNCLL_ORDER[call]
+        if self._asyncll_state != want:
+            raise RuntimeError(
+                f"{call}() is not valid here: AsyncLL is {self._asyncll_state!r} "
+                f"and this call needs {want!r}. The order is dispatch_send -> "
+                "dispatch_recv -> combine_send -> combine_recv (dispatch() and "
+                "combine() take both steps of their half). An unpaired call "
+                "leaves the recv counts and the combine epoch out of step, which "
+                "shows up as wrong data or a hang in a LATER round, not here. "
+                "Call reset() if you need to start over."
+            )
+        self._asyncll_state = nxt
+
     def _async_half(self, which):
         table = getattr(self._kernels, which)
         if table is None:
@@ -1181,6 +1257,7 @@ class EpDispatchCombineOp:
         Same arguments and same return as :meth:`dispatch`. The returned views are
         only valid after :meth:`dispatch_recv`.
         """
+        self._asyncll_step("dispatch_send")
         return self._dispatch_impl(
             input,
             weights,
@@ -1193,6 +1270,7 @@ class EpDispatchCombineOp:
 
     def dispatch_recv(self):
         """Run the recv half of the dispatch the last :meth:`dispatch_send` began."""
+        self._asyncll_step("dispatch_recv")
         n = self._async_pending_dispatch_tokens
         if n is None:
             raise RuntimeError("dispatch_recv without a preceding dispatch_send")
@@ -1206,6 +1284,8 @@ class EpDispatchCombineOp:
 
     def combine_send(self, input, weights=None, indices=None, *, routing):
         """Enqueue the send half of a combine and return immediately."""
+        self._asyncll_check_weight_fold(weights)
+        self._asyncll_step("combine_send")
         return self._combine_impl(
             input,
             weights,
@@ -1216,6 +1296,7 @@ class EpDispatchCombineOp:
 
     def combine_recv(self):
         """Run the recv half of the combine the last :meth:`combine_send` began."""
+        self._asyncll_step("combine_recv")
         state = self._async_pending_combine
         if state is None:
             raise RuntimeError("combine_recv without a preceding combine_send")
@@ -1237,6 +1318,10 @@ class EpDispatchCombineOp:
         Collective, like every other call here: cross_device_flag is the local
         half of the cross-device barrier and arena.zero() has just wiped the peer
         half, so one rank resetting alone would leave the two disagreeing."""
+        # This is the one way out of a half-finished exchange, and it is what the
+        # call-order error tells a caller to use: the counts and the epoch it
+        # zeroes below are exactly the state that order was protecting.
+        self._asyncll_state = "idle"
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)
