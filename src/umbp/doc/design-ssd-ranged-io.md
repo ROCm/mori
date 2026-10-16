@@ -340,6 +340,38 @@ needs a test that asserts *content*, not success.
   (disjoint extents of one key each get their own bytes, content-compared;
   an extent follows a whole read; a whole read never follows an extent).
 
+### 4.6 Pipelined local get — overlap the next read with this copy
+
+After D1 a layer-group call is still two serial stages: resolve (on SSD, the
+device read into the staging arena) and plan + copy to the caller. On the
+layer-wise microbench (1024 x 1.97 MB objects, 8 groups, GPU destination,
+2 x Micron 7450) a call was 37.9 ms, of which 24 ms was the read and 11 ms the
+plan and H2D copy.
+
+`BatchGetRanges` now cuts its local phase into up to
+`UMBP_GET_PIPELINE_CHUNKS` parts (default 4, at least 32 keys a part) and
+resolves part k+1 on a helper thread (`std::async`) while part k is planned and
+copied. Unchanged from the one-stage loop:
+
+- **Holds are per part.** A part's holds go back as soon as its copy finishes,
+  before the caller thread waits on the next part. A concurrent resolve that
+  finds the arena held by the part being copied gets `kBusy`, and its retry
+  succeeds once that copy finishes, so the two never wait on each other.
+- **Deferral is per part.** Keys a part's resolve defers (`kDeferred`, the
+  half-arena call budget) join the back of the queue, which is the same rule
+  as before, just per part.
+- **Every exit releases.** An exception releases the current part (scope
+  guard), and a part still resolving is waited on and released.
+- **`CHUNKS=1`, or fewer than 64 keys, is the old loop exactly.**
+
+The debug line's `resolve` is now the time the caller thread *waited* for a
+resolve, so the phases still sum to `total`. Measured with that bench, steady
+state: 324 → 275 ms per 8-group load (−15%), 37.9 → 32.5 ms per call, the same
+bytes off disk, content-checked. The read itself does not shrink; the rest of
+the gain is capped by the copy it hides. Tests: `test_ssd_ranged_io.cpp`
+`PipelinedLocalGetOfABatchFarLargerThanTheArenaIsServedInFull` (128 keys, an
+8-page arena, `CHUNKS=4/1/4`: deferral and BUSY inside the pipeline).
+
 ## 5. D2 — ranged resolve on the peer wire
 
 After D1 a locally-held key reads only its extent off disk. A remotely-held one
