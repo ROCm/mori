@@ -415,6 +415,23 @@ class Sdma:
         """Wait on a single (peer, queueId) queue only."""
         raw.cco_sdma_quiet_queue(self.dev_comm, peer, qid)
 
+    def put_ptr(self, peer, dst_ptr, src_ptr, nbytes, qid):
+        """Thread-scope put on raw addresses; bumps the PEER's signal slot only.
+
+        ``dst_ptr`` is the peer's address as mapped here (``Window.lsa_ptr``),
+        ``src_ptr`` a local one; neither is checked. The peer polls
+        ``signal_slot(<this lsa rank>, qid)``.
+        """
+        raw.cco_sdma_put_ptr_rsig_thread(
+            self.dev_comm, peer, dst_ptr, src_ptr, nbytes, qid
+        )
+
+    def signal_slot(self, src_lsa_rank, qid):
+        """Address of our uint64 counter that ``src_lsa_rank``'s signalling
+        puts on ``qid`` increment; 0 when out of range. The SDMA engine writes
+        it, so poll it with a system-scope atomic load."""
+        return raw.cco_sdma_signal_slot(self.dev_comm, src_lsa_rank, qid)
+
 
 @cco_struct
 class DevComm:

@@ -113,18 +113,24 @@ torchrun --standalone --nproc_per_node=2 \
 
 ## Adding a new device op (the path)
 
-1. Add the `extern "C"` wrapper in `cco_device_wrapper.cpp`. For a templated op,
-   define it with the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros so every valid
-   combination is monomorphized into a tagged symbol (no runtime dispatch). JIT
-   re-compiles automatically — the cache key includes the wrapper source hash.
-2. Add the scalar signature once to `CCO_DEVICE_FUNCTIONS` in `ops.py`.
-   Triton exports it automatically; `_bindings.py` builds FlyDSL FFI objects
-   from the same entry.
-3. Expose it as a FlyDSL method on `DevComm` / `Window` / `Gda` in `handles.py`, picking
-   the symbol from the compile-time `coop`/`thread_mode`/`signal_op` constants.
+1. Add the `extern "C"` wrapper in `cco_device_wrapper.cpp`, as a call to the
+   public device API (`ccoGda` / `ccoSdma` / ...), not its internals. For a
+   templated op, monomorphize every valid combination into a tagged symbol
+   (`cco_<op>__<tag>`; no runtime dispatch): the GDA ops use the `CCO_TC_LIST` /
+   `CCO_COOP_LIST` X-macros, the SDMA ops their own `CCO_DEF_SDMA_*` macros. SDMA
+   wrappers go inside `#if BUILD_CCO_SDMA`. JIT re-compiles automatically — the
+   cache key includes the wrapper source hash.
+2. Add the scalar signature once to `CCO_DEVICE_FUNCTIONS` in `ops.py`; an SDMA
+   op's `family` must start with `sdma_`, which is how builds without SDMA skip
+   it. Triton exports the entry automatically; FlyDSL does not — add the
+   `_binding(...)` for it to `flydsl/_bindings.py` by hand.
+3. Expose it as a method in both `flydsl/handles.py` and
+   `mori/ir/triton/cco/handles.py`, picking the symbol from the compile-time
+   `coop`/`thread_mode`/`signal_op` constants.
 
-`tests/python/cco/test_triton_bindings.py` verifies metadata, FlyDSL FFI, and
-the symbols defined in the cov5 bitcode remain synchronized.
+`tests/python/cco/test_triton_bindings.py` checks that the cov5 bitcode defines
+exactly the registered symbols (no more, no fewer) and that FlyDSL binds the same
+set with the same signatures. It does not check step 3.
 
 ## Examples
 

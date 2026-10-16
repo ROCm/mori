@@ -94,6 +94,8 @@ SDMA_XFER = {
 SDMA_QUIET = {s: _binding(f"sdma_quiet_{s}") for s in ("thread", "warp", "block")}
 SDMA_COMMIT = {s: _binding(f"sdma_commit_{s}") for s in ("thread", "warp", "block")}
 cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
+cco_sdma_put_ptr_rsig_thread = _binding("sdma_put_ptr_rsig_thread")
+cco_sdma_signal_slot = _binding("sdma_signal_slot")
 
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
