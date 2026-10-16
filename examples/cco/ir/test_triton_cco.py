@@ -64,12 +64,14 @@ NUM_ELEMS = 256
 NBYTES = NUM_ELEMS * 4
 BLOCK = 256
 PER_RANK_VMM = 128 * 1024 * 1024
+SDMA_QUEUE_COUNT = 2
 
 SEND_OFF = 0
 LSA_RECV_OFF = SEND_OFF + NBYTES
 SDMA_RECV_OFF = LSA_RECV_OFF + 2 * NBYTES
 SDMA_GET_OFF = SDMA_RECV_OFF + 2 * NBYTES
-GDA_RECV_OFF = SDMA_GET_OFF + NBYTES
+SDMA_PTR_RECV_OFF = SDMA_GET_OFF + NBYTES
+GDA_RECV_OFF = SDMA_PTR_RECV_OFF + NBYTES
 GDA_GET_OFF = GDA_RECV_OFF + 2 * NBYTES
 GDA_VALUE_OFF = GDA_GET_OFF + NBYTES
 WINDOW_BYTES = GDA_VALUE_OFF + 8
@@ -207,6 +209,43 @@ def sdma_get_kernel(
         coop=cco.CoopScope.BLOCK,
     )
     cco.Sdma.quiet(dev_comm, peer, coop=cco.CoopScope.BLOCK)
+
+
+@triton.jit
+def sdma_put_ptr_kernel(
+    dev_comm,
+    window,
+    peer: tl.constexpr,
+    source: tl.constexpr,
+    num_queues: tl.constexpr,
+    dst_off: tl.constexpr,
+    src_off: tl.constexpr,
+    nbytes: tl.constexpr,
+    out,
+    out_slots,
+    n_elements: tl.constexpr,
+    block: tl.constexpr,
+):
+    my_lsa_rank = cco.DevComm.lsa_rank(dev_comm)
+    dst = cco.Window.lsa_ptr(window, peer, dst_off)
+    src = cco.Window.lsa_ptr(window, my_lsa_rank, src_off)
+    cco.Sdma.put_ptr(dev_comm, peer, dst, src, nbytes, 0)
+
+    # `source` puts into us the same way; its signal says the payload landed.
+    slot_addr = cco.Sdma.signal_slot(dev_comm, source, 0)
+    slot = slot_addr.to(tl.pointer_type(tl.uint64), bitcast=True)
+    while tl.atomic_add(slot, 0, sem="acquire", scope="sys") < 1:
+        pass
+    offs = tl.arange(0, block)
+    mask = offs < n_elements
+    recv_addr = cco.Window.lsa_ptr(window, my_lsa_rank, dst_off)
+    recv = recv_addr.to(tl.pointer_type(tl.uint32), bitcast=True)
+    tl.store(out + offs, tl.load(recv + offs, mask=mask, volatile=True), mask=mask)
+
+    tl.store(out_slots + 0, slot_addr)
+    tl.store(out_slots + 1, cco.Sdma.signal_slot(dev_comm, source, num_queues))
+    tl.store(out_slots + 2, cco.Sdma.signal_slot(dev_comm, -1, 0))
+    cco.Sdma.quiet_queue(dev_comm, peer, 0)
 
 
 @triton.jit
@@ -577,6 +616,39 @@ def test_sdma(comm, dc, win, rank, world_size, extern_libs):
     )
     torch.cuda.synchronize()
     check_payload(win, SDMA_GET_OFF, peer, "SDMA get")
+
+    # put_ptr signals only the receiver, so this kernel is also the reader: it
+    # returns what it saw once the signal arrived, not what is there later.
+    comm.barrier()
+    out = torch.zeros(NUM_ELEMS, dtype=torch.int32, device="cuda")
+    out_slots = torch.zeros(3, dtype=torch.uint64, device="cuda")
+    sdma_put_ptr_kernel[(1,)](
+        dc.ptr,
+        win.handle,
+        peer=peer,
+        source=source,
+        num_queues=SDMA_QUEUE_COUNT,
+        dst_off=SDMA_PTR_RECV_OFF,
+        src_off=SEND_OFF,
+        nbytes=NBYTES,
+        out=out,
+        out_slots=out_slots,
+        n_elements=NUM_ELEMS,
+        block=BLOCK,
+        extern_libs=extern_libs,
+        num_warps=1,
+    )
+    torch.cuda.synchronize()
+    comm.barrier()
+    got = out.view(torch.uint32).cpu().tolist()
+    assert got == expected_payload(source), "SDMA put_ptr: payload not there at signal"
+    slot_addr, past_queues, negative_rank = out_slots.cpu().tolist()
+    assert slot_addr != 0, "SDMA signal_slot: null for a valid (source, queue)"
+    assert past_queues == 0, "SDMA signal_slot: queue past the last one not rejected"
+    assert negative_rank == 0, "SDMA signal_slot: negative rank not rejected"
+    # One signal per put() call, however many lanes posted it.
+    signals = read_u64(slot_addr)
+    assert signals == 1, f"SDMA put_ptr: {signals} signals, expected 1"
     print(f"[rank {rank}] SDMA PASS", flush=True)
 
 
@@ -787,7 +859,7 @@ def main():
             reqs.gda_context_count = 1 if gda_enabled else 0
             reqs.gda_signal_count = world_size if gda_enabled else 0
             reqs.gda_counter_count = 0
-            reqs.sdma_queue_count = 2 if sdma_enabled else 0
+            reqs.sdma_queue_count = SDMA_QUEUE_COUNT if sdma_enabled else 0
             dc = comm.create_dev_comm(reqs)
 
             comm.barrier()

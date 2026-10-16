@@ -196,6 +196,23 @@ _add(
     _I32,
     family="sdma_quiet_queue",
 )
+# put on raw addresses (dst from lsa_ptr), signalling the peer's slot only.
+_add(
+    "sdma_put_ptr_rsig_thread",
+    "cco_sdma_put_ptr_rsig__thread",
+    [_U64, _I32, _U64, _U64, _U64, _I32],
+    _I32,
+    family="sdma_put_ptr",
+    tag="thread",
+)
+_add(
+    "sdma_signal_slot",
+    "cco_sdma_signal_slot",
+    [_U64, _I32, _I32],
+    _U64,
+    pure=True,
+    family="sdma_signal_slot",
+)
 
 # GDA data path.
 _gda_put_args = [

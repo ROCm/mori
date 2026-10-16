@@ -55,7 +55,7 @@ def invalid_constexpr_axis_kernel(
 
 
 def test_all_cco_device_symbols_are_exported_to_triton():
-    assert len(CCO_DEVICE_FUNCTIONS) == 70
+    assert len(CCO_DEVICE_FUNCTIONS) == 72
     assert set(CCO_DEVICE_FUNCTIONS).issubset(cco.__all__)
     for name in CCO_DEVICE_FUNCTIONS:
         assert callable(getattr(cco, name))
@@ -76,7 +76,15 @@ def test_triton_facades_match_flydsl_handle_names():
         "flush",
         "flush_peer",
     } <= set(vars(cco.Gda))
-    assert {"put", "get", "commit", "quiet", "quiet_queue"} <= set(vars(cco.Sdma))
+    assert {
+        "put",
+        "get",
+        "commit",
+        "quiet",
+        "quiet_queue",
+        "put_ptr",
+        "signal_slot",
+    } <= set(vars(cco.Sdma))
 
 
 @pytest.mark.parametrize(
@@ -126,6 +134,12 @@ def test_cov5_bitcode_contains_every_enabled_wrapper_symbol():
         if _sdma_enabled() or not meta["family"].startswith("sdma_")
     }
     assert expected <= defined
+    # And the other way: a wrapper nobody registered is unreachable from
+    # FlyDSL and Triton, so it must not ship silently.
+    unregistered = {
+        symbol for symbol in defined if symbol.startswith("cco_")
+    } - expected
+    assert unregistered == set(), f"not in CCO_DEVICE_FUNCTIONS: {sorted(unregistered)}"
 
 
 def test_cov5_bitcode_return_types_match_the_declared_abi():
@@ -179,6 +193,8 @@ def test_flydsl_and_triton_share_the_same_scalar_abi():
         *_bindings.SDMA_QUIET.values(),
         *_bindings.SDMA_COMMIT.values(),
         _bindings.cco_sdma_quiet_queue,
+        _bindings.cco_sdma_put_ptr_rsig_thread,
+        _bindings.cco_sdma_signal_slot,
         _bindings.cco_lsa_ptr,
         _bindings.cco_lsa_win_base,
         _bindings.cco_lsa_stride,

@@ -743,6 +743,9 @@ class Sdma:
     commit = staticmethod(_sdma_commit)
     quiet = staticmethod(_sdma_quiet)
     quiet_queue = staticmethod(raw.sdma_quiet_queue)
+    # Raw addresses, thread scope, bumps the PEER's signal_slot only.
+    put_ptr = staticmethod(raw.sdma_put_ptr_rsig_thread)
+    signal_slot = staticmethod(raw.sdma_signal_slot)
 
 
 __all__ = [

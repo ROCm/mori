@@ -1852,6 +1852,18 @@ struct ccoSdma {
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes, int queueId = 0) {
+    putPtr<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+        peer, ccoGetLsaPeerPtr(dstWin, peer, dstOffset), ccoGetLocalPtr(srcWin, srcOffset), bytes,
+        queueId);
+  }
+
+  // putPtr: put() on addresses the caller already resolved. `dst` must be in
+  // `peer`'s memory as mapped here (e.g. ccoGetLsaPeerPtr); `src` must be local.
+  // Nothing checks either, so a wrong address faults in the SDMA engine.
+  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault,
+            ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
+  __device__ inline void putPtr(int peer, void* dst, void* src, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
                   "ccoSdma::put supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
@@ -1863,8 +1875,6 @@ struct ccoSdma {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
-    void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
-    void* src = ccoGetLocalPtr(srcWin, srcOffset);
     ccoSdmaDispatchChunked<Coop, localSignal, remoteSignal, optFlags, threadMode>(
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
@@ -1947,6 +1957,19 @@ struct ccoSdma {
            expected) {
       __builtin_amdgcn_s_sleep(2);
     }
+  }
+
+  // signalSlot: the counter waitSignal polls, for callers that poll it
+  // themselves. The SDMA engine writes it, so read it with a system-scope
+  // atomic load. nullptr when srcRank or queueId is out of range.
+  __device__ inline uint64_t* signalSlot(int srcRank, int queueId) const {
+    const ccoSdmaContext& s = comm.sdma;
+    const uint32_t n = s.sdmaNumQueue;
+    if (srcRank < 0 || srcRank >= comm.lsaSize || queueId < 0 ||
+        static_cast<uint32_t>(queueId) >= n) {
+      return nullptr;
+    }
+    return s.signalBuf + (static_cast<uint32_t>(srcRank) * n + static_cast<uint32_t>(queueId));
   }
 
   // commit: ring the doorbell for Aggregate-posted ops, then drain with quiet().

@@ -208,21 +208,22 @@ CCO_DEF_SDMA_COMMIT(warp, ccoCoopWarp)
 CCO_DEF_SDMA_COMMIT(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_COMMIT
 
+// ── SDMA put on raw addresses, signalling the peer only ──
+// `dst` is the peer's address as mapped here (cco_lsa_ptr), `src` a local one;
+// neither is checked. The trailing ATOMIC bumps the peer's
+// cco_sdma_signal_slot(dc, <my lsa rank>, qid), not ours.
 CCO_DEV int cco_sdma_put_ptr_rsig__thread(uint64_t dc, int peer, uint64_t dst, uint64_t src,
                                           uint64_t n, int qid) {
-  const ccoDevComm& comm = *AsDevComm(dc);
-  const ccoSdmaContext& s = comm.sdma;
-  ccoSdmaDispatchChunked<ccoCoopThread, false, true, ccoSdmaOptFlagsDefault,
-                         ccoSdmaThreadIndependent>(
-      s, peer, s.sdmaNumQueue, reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), n, qid,
-      static_cast<uint32_t>(comm.lsaRank), static_cast<uint32_t>(comm.lsaSize));
+  Sdma sdma{*AsDevComm(dc)};
+  sdma.putPtr<ccoCoopThread, false, true>(peer, reinterpret_cast<void*>(dst),
+                                          reinterpret_cast<void*>(src), n, qid);
   return 0;
 }
 
+// Address of our signal counter for (src lsa rank, qid); 0 when out of range.
 CCO_DEV uint64_t cco_sdma_signal_slot(uint64_t dc, int src, int qid) {
-  const ccoSdmaContext& s = AsDevComm(dc)->sdma;
-  return reinterpret_cast<uint64_t>(s.signalBuf + static_cast<uint32_t>(src) * s.sdmaNumQueue +
-                                    static_cast<uint32_t>(qid));
+  Sdma sdma{*AsDevComm(dc)};
+  return reinterpret_cast<uint64_t>(sdma.signalSlot(src, qid));
 }
 #endif  // BUILD_CCO_SDMA
 
