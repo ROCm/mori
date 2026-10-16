@@ -335,6 +335,21 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
   return keys.size();
 }
 
+size_t DistributedClient::BatchTouch(const std::vector<std::string>& keys) {
+  if (closing_ || keys.empty()) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  return pool_client_->BatchTouch(keys);
+}
+
+size_t DistributedClient::BatchSetEvictionClass(const std::vector<std::string>& keys,
+                                                int eviction_class) {
+  if (closing_ || keys.empty()) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  return pool_client_->BatchSetEvictionClass(keys, eviction_class);
+}
+
 // ---------------------------------------------------------------------------
 // RegisterMemory / DeregisterMemory
 // ---------------------------------------------------------------------------
