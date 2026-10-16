@@ -172,21 +172,15 @@ class SsdBackend : public MediumBackend {
     std::shared_ptr<const void> hold;  // copied into each kLocal hit
   };
 
-  // An extent-scoped read (BatchResolve with an extent, kLocal only): a span
-  // holding object bytes [offset, offset + length), private to the reader(s)
-  // it was published to and freed once their holds are gone.  Kept out of
-  // read_leases_, whose entries stand for the whole object.  ClearLocal also
-  // parks here the leases readers still hold.
+  // A span holding only object bytes `window`, for in-process readers (D1);
+  // freed once the holds published from it are gone.  ClearLocal also parks
+  // here the leases readers still hold.
   struct ExtentStage {
     StagingSpan span;
-    uint64_t offset = 0;
-    uint64_t length = 0;
-    std::shared_ptr<const void> hold;  // copied into each entry published from it
+    ObjectExtent window;
+    std::shared_ptr<const void> hold;
   };
-
-  // Extent windows are widened to this, the SSD record alignment, so an
-  // O_DIRECT read can go straight into the staging span.
-  static constexpr uint64_t kExtentAlign = 4096;
+  static constexpr uint64_t kExtentAlign = 4096;  // the SSD record alignment
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
   // the requested size is currently available, even after reclaiming leases.
@@ -236,11 +230,7 @@ class SsdBackend : public MediumBackend {
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
   std::vector<ExtentStage> extent_stages_;
-
-  // Stage only the requested extent for an in-process reader that names one
-  // (D1).  Set at Init: on when the tier reads ranges, off with
-  // UMBP_SSD_EXTENT_STAGING=0.
-  bool extent_staging_ = false;
+  bool extent_staging_ = false;  // set at Init (UMBP_SSD_EXTENT_STAGING)
 
   // Opt-in switch (UMBP_ENABLE_GDS=1): route SSD reads of O_DIRECT records
   // through the file->GPU GdsEngine instead of the staging arena.  Off by

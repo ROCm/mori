@@ -189,7 +189,6 @@ std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(
     switch (EffectiveResolveOutcome(r)) {
       case ResolveOutcome::kFound:
         Add(kResolve, kOk, 1);
-        // What was published: an extent-scoped resolve hands out its window.
         bytes += r.covered_size != 0 ? r.covered_size : r.size;
         break;
       case ResolveOutcome::kMissing:

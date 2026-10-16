@@ -696,7 +696,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
                                                       bool include_descs, bool allow_file_refs,
                                                       ResolveReader reader,
                                                       const std::vector<ObjectExtent>* extents) {
-  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;  // never misalign
+  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;
   // A remote reader discards a response holding any kBusy key; a local one
   // reads its hits and comes back for the busy keys.
   const bool busy_discards = reader == ResolveReader::kRemote;
@@ -1328,8 +1328,13 @@ size_t PeerPool::ReclaimBackend(uint32_t backend_id, const LocalEvictionWatermar
       }
       break;
     }
+    // Use the whole fetch: queued demotions stay offered, so a refetch per batch rescans them.
     size_t next = 0;
-    if (!evict_some(offers, &next)) {
+    bool progressed = false;
+    while (next < offers.size() && covered < budget && !drained() && !stopping()) {
+      progressed = evict_some(offers, &next) || progressed;
+    }
+    if (!progressed) {
       // All got leased or pinned since offered; retry on the next wake.
       local_evict_stalled_.fetch_add(1, std::memory_order_relaxed);
       break;

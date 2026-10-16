@@ -34,9 +34,9 @@ namespace mori::umbp {
 
 namespace {
 
-// Gather each shard's sub-batch, run `op` on it in parallel across drives, and
-// scatter the per-key results back.  Shared by the put and get paths, which
-// differ only in the pointer type and the backend call.  Buckets touch disjoint
+// Run `op(shard, key indices)` on every busy shard in parallel across drives,
+// and scatter the per-key results back; `op` gathers its own sub-batch (see
+// Gather) and makes the backend call.  Buckets touch disjoint
 // shards and disjoint result indices, so nothing here needs a lock -- PROVIDED
 // the per-key slots are separate memory locations.  std::vector<bool> packs
 // them into shared words, and two drives finishing together would each
@@ -44,28 +44,16 @@ namespace {
 // came back false (seen as rare "PrepareReadBatch read failed" under parallel
 // SSD load).  So the workers fill a vector<char> and `results` is written once
 // they have all joined.
-template <typename PtrT, typename Op>
+template <typename Op>
 void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::vector<int>& busy,
-                   int io_threads, const std::vector<std::string>& keys,
-                   const std::vector<PtrT>& ptrs, const std::vector<size_t>& sizes,
-                   std::vector<bool>& results, std::vector<double>& shard_ms, Op&& op) {
+                   int io_threads, std::vector<bool>& results, std::vector<double>& shard_ms,
+                   Op&& op) {
   std::vector<char> ok(results.size(), 0);
   ParallelFor(busy.size(), io_threads, [&](size_t bi) {
     const int s = busy[bi];
     const auto t_shard = ssdperf::Now();
     const auto& idxs = buckets[s];
-    std::vector<std::string> k;
-    std::vector<PtrT> d;
-    std::vector<size_t> z;
-    k.reserve(idxs.size());
-    d.reserve(idxs.size());
-    z.reserve(idxs.size());
-    for (size_t i : idxs) {
-      k.push_back(keys[i]);
-      d.push_back(ptrs[i]);
-      z.push_back(sizes[i]);
-    }
-    const auto shard_res = op(s, k, d, z);
+    const auto shard_res = op(s, idxs);
     for (size_t j = 0; j < idxs.size(); ++j) {
       ok[idxs[j]] = (j < shard_res.size() && shard_res[j]) ? 1 : 0;
     }
@@ -74,6 +62,15 @@ void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::v
   for (int s : busy) {
     for (size_t i : buckets[s]) results[i] = ok[i] != 0;
   }
+}
+
+// The entries of `v` at `idxs`, in order: one shard's slice of a batch argument.
+template <typename T>
+std::vector<T> Gather(const std::vector<T>& v, const std::vector<size_t>& idxs) {
+  std::vector<T> out;
+  out.reserve(idxs.size());
+  for (size_t i : idxs) out.push_back(v[i]);
+  return out;
 }
 
 // Indices of the shards this batch actually touches.
@@ -261,8 +258,7 @@ TierCapabilities ShardedSsdTier::Capabilities() const {
   for (const auto& s : shards_) {
     const auto shard_caps = s->Capabilities();
     if (!shard_caps.zero_copy_read) caps.zero_copy_read = false;
-    // Ranged only if every shard is: a key on a shard without it would come
-    // back false, which a caller cannot tell from a miss.
+    // Ranged only if every shard is: elsewhere a ranged read looks like a miss.
     if (!shard_caps.ranged_read) caps.ranged_read = false;
     if (!shard_caps.orders_eviction) caps.orders_eviction = false;
   }
@@ -435,9 +431,10 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   const auto t_fanout = ssdperf::Now();
   std::vector<double> shard_ms(shards_.size(), 0.0);
 
-  FanOutBatches(buckets, busy, io_threads_, keys, data_ptrs, sizes, results, shard_ms,
-                [&](int s, const auto& k, const auto& d, const auto& z) {
-                  return shards_[s]->BatchWrite(k, d, z);
+  FanOutBatches(buckets, busy, io_threads_, results, shard_ms,
+                [&](int s, const std::vector<size_t>& idx) {
+                  return shards_[s]->BatchWrite(Gather(keys, idx), Gather(data_ptrs, idx),
+                                                Gather(sizes, idx));
                 });
 
   if (ssdperf::Enabled()) {
@@ -470,17 +467,12 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   return results;
 }
 
-std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
-                                                   const std::vector<uintptr_t>& dst_ptrs,
-                                                   const std::vector<size_t>& sizes) {
+template <typename ShardOp>
+std::vector<bool> ShardedSsdTier::FanOutRead(const char* label,
+                                             const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& key_bytes, ShardOp&& op) {
   std::vector<bool> results(keys.size(), false);
   if (keys.empty()) return results;
-  if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size()) {
-    MORI_UMBP_ERROR("[ShardedSsdTier] BatchReadIntoPtr: mismatched input lengths ({} / {} / {})",
-                    keys.size(), dst_ptrs.size(), sizes.size());
-    return results;
-  }
-
   std::vector<std::vector<size_t>> buckets(shards_.size());
   {
     std::shared_lock<std::shared_mutex> lock(map_mu_);
@@ -493,16 +485,12 @@ std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string
   const std::vector<int> busy = BusyShards(buckets);
   const auto t_fanout = ssdperf::Now();
   std::vector<double> shard_ms(shards_.size(), 0.0);
-
-  FanOutBatches(buckets, busy, io_threads_, keys, dst_ptrs, sizes, results, shard_ms,
-                [&](int s, const auto& k, const auto& d, const auto& z) {
-                  return shards_[s]->BatchReadIntoPtr(k, d, z);
-                });
+  FanOutBatches(buckets, busy, io_threads_, results, shard_ms, op);
 
   if (ssdperf::Enabled()) {
     const double total_ms = ssdperf::MsSince(t_fanout);
     uint64_t bytes = 0, missing = 0;
-    for (size_t i = 0; i < keys.size(); ++i) bytes += sizes[i];
+    for (size_t i = 0; i < keys.size(); ++i) bytes += key_bytes[i];
     for (const auto& b : buckets) missing += b.size();
     missing = keys.size() - missing;
     double slowest = 0.0;
@@ -510,14 +498,28 @@ std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string
     // overlap = sum(per-drive time) / wall time.  ~1.0 means the drives ran one
     // after another (no parallelism); ~N means all N drives were busy at once.
     MORI_UMBP_INFO(
-        "[SsdPerf/shard] GET drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
+        "[SsdPerf/shard] {} drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
         "total_ms={:.3f} GB_s={:.2f} slowest_drive_ms={:.3f} overlap={:.2f}x | {}",
-        shards_.size(), io_threads_, busy.size(), keys.size(), missing, bytes, total_ms,
+        label, shards_.size(), io_threads_, busy.size(), keys.size(), missing, bytes, total_ms,
         ssdperf::GbPerSec(bytes, total_ms), slowest,
         total_ms > 0.0 ? std::accumulate(shard_ms.begin(), shard_ms.end(), 0.0) / total_ms : 0.0,
-        FormatShardFanout(busy, buckets, sizes, shard_ms, shards_.size()));
+        FormatShardFanout(busy, buckets, key_bytes, shard_ms, shards_.size()));
   }
   return results;
+}
+
+std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                                   const std::vector<uintptr_t>& dst_ptrs,
+                                                   const std::vector<size_t>& sizes) {
+  if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size()) {
+    MORI_UMBP_ERROR("[ShardedSsdTier] BatchReadIntoPtr: mismatched input lengths ({} / {} / {})",
+                    keys.size(), dst_ptrs.size(), sizes.size());
+    return std::vector<bool>(keys.size(), false);
+  }
+  return FanOutRead("GET", keys, sizes, [&](int s, const std::vector<size_t>& idx) {
+    return shards_[s]->BatchReadIntoPtr(Gather(keys, idx), Gather(dst_ptrs, idx),
+                                        Gather(sizes, idx));
+  });
 }
 
 bool ShardedSsdTier::WriteBatch(const std::vector<std::string>& keys,
@@ -537,75 +539,19 @@ std::vector<bool> ShardedSsdTier::ReadBatchRangesIntoPtr(
     const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
     const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& src_offsets) {
-  std::vector<bool> results(keys.size(), false);
-  if (keys.empty()) return results;
   if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size() ||
       src_offsets.size() != keys.size()) {
-    MORI_UMBP_ERROR(
-        "[ShardedSsdTier] ReadBatchRangesIntoPtr: mismatched input lengths ({} / {} / {} / {})",
-        keys.size(), dst_ptrs.size(), sizes.size(), src_offsets.size());
-    return results;
+    MORI_UMBP_ERROR("[ShardedSsdTier] ReadBatchRangesIntoPtr: mismatched input lengths");
+    return std::vector<bool>(keys.size(), false);
   }
-
-  std::vector<std::vector<size_t>> buckets(shards_.size());
-  {
-    std::shared_lock<std::shared_mutex> lock(map_mu_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      int shard = LookupLocked(keys[i]);
-      if (shard >= 0) buckets[shard].push_back(i);
-    }
+  std::vector<size_t> key_bytes(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    key_bytes[i] = std::accumulate(sizes[i].begin(), sizes[i].end(), size_t{0});
   }
-
-  const std::vector<int> busy = BusyShards(buckets);
-  const auto t_fanout = ssdperf::Now();
-  std::vector<double> shard_ms(shards_.size(), 0.0);
-  std::vector<char> ok(keys.size(), 0);
-  ParallelFor(busy.size(), io_threads_, [&](size_t bi) {
-    const int s = busy[bi];
-    const auto t_shard = ssdperf::Now();
-    const auto& idxs = buckets[s];
-    std::vector<std::string> k;
-    std::vector<std::vector<uintptr_t>> d;
-    std::vector<std::vector<size_t>> z;
-    std::vector<std::vector<size_t>> o;
-    k.reserve(idxs.size());
-    d.reserve(idxs.size());
-    z.reserve(idxs.size());
-    o.reserve(idxs.size());
-    for (size_t i : idxs) {
-      k.push_back(keys[i]);
-      d.push_back(dst_ptrs[i]);
-      z.push_back(sizes[i]);
-      o.push_back(src_offsets[i]);
-    }
-    const auto shard_res = shards_[s]->ReadBatchRangesIntoPtr(k, d, z, o);
-    for (size_t j = 0; j < idxs.size(); ++j) {
-      ok[idxs[j]] = (j < shard_res.size() && shard_res[j]) ? 1 : 0;
-    }
-    shard_ms[s] = ssdperf::MsSince(t_shard);  // disjoint shards: no race on shard_ms
+  return FanOutRead("GET_RANGES", keys, key_bytes, [&](int s, const std::vector<size_t>& idx) {
+    return shards_[s]->ReadBatchRangesIntoPtr(Gather(keys, idx), Gather(dst_ptrs, idx),
+                                              Gather(sizes, idx), Gather(src_offsets, idx));
   });
-  for (size_t i = 0; i < keys.size(); ++i) results[i] = ok[i] != 0;
-
-  if (ssdperf::Enabled()) {
-    const double total_ms = ssdperf::MsSince(t_fanout);
-    std::vector<size_t> key_bytes(keys.size(), 0);
-    uint64_t bytes = 0, mapped = 0;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      for (size_t z : sizes[i]) key_bytes[i] += z;
-      bytes += key_bytes[i];
-    }
-    for (const auto& b : buckets) mapped += b.size();
-    double slowest = 0.0;
-    for (double m : shard_ms) slowest = std::max(slowest, m);
-    MORI_UMBP_INFO(
-        "[SsdPerf/shard] GET_RANGES drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
-        "total_ms={:.3f} GB_s={:.2f} slowest_drive_ms={:.3f} overlap={:.2f}x | {}",
-        shards_.size(), io_threads_, busy.size(), keys.size(), keys.size() - mapped, bytes,
-        total_ms, ssdperf::GbPerSec(bytes, total_ms), slowest,
-        total_ms > 0.0 ? std::accumulate(shard_ms.begin(), shard_ms.end(), 0.0) / total_ms : 0.0,
-        FormatShardFanout(busy, buckets, key_bytes, shard_ms, shards_.size()));
-  }
-  return results;
 }
 
 }  // namespace mori::umbp

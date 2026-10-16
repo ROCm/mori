@@ -62,13 +62,9 @@ inline bool SizeMatchesAllocation(uint64_t size, size_t num_pages, uint64_t page
   return true;
 }
 
-// A medium may stage only part of an object (ResolvedEntry::covered_offset /
-// covered_size): its pages then tile [window_offset, window_offset +
-// window_size) instead of [0, object size).  Moves one object range onto that
-// window so the walk below indexes the window's pages, passing window_size as
-// its stored size.  False, with `*object_offset` untouched, when any byte of the
-// range lies outside the window: the medium staged less than the reader needs,
-// and reading on would copy bytes that are not this object's.
+// Moves an object range onto a staged window (ResolvedEntry::covered_offset /
+// covered_size), so the walk below indexes the window's pages.  False, leaving
+// `*object_offset` untouched, if any byte of the range lies outside the window.
 inline bool RebaseRangeOntoWindow(uint64_t window_offset, uint64_t window_size,
                                   size_t* object_offset, size_t range_size) {
   const uint64_t offset = *object_offset;

@@ -82,15 +82,12 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
     gds_enabled_ = (v == "1" || v == "true" || v == "TRUE" || v == "on" || v == "ON");
   }
 
-  // Extent-scoped staging for in-process readers that name an extent.  On by
-  // default wherever the tier can read a sub-object range (every drive, for a
-  // multi-drive tier); UMBP_SSD_EXTENT_STAGING=0 restores whole-object staging.
+  // Extent staging (D1) wherever the tier reads ranges; UMBP_SSD_EXTENT_STAGING=0 disables it.
   extent_staging_ = ssd_->SupportsRangedRead();
   if (const char* env = std::getenv("UMBP_SSD_EXTENT_STAGING")) {
     const std::string v(env);
-    if (v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "OFF") {
+    if (v == "0" || v == "false" || v == "FALSE" || v == "off" || v == "OFF")
       extent_staging_ = false;
-    }
   }
 
   // ONE buffer covering every staging page, so each page is contiguous and a
@@ -296,7 +293,8 @@ void SsdBackend::ClearLocal() {
     pending_.clear();
     // A span a local reader still copies out of goes back with its last hold.
     for (auto& [key, lease] : read_leases_)
-      extent_stages_.push_back({lease.span, 0, lease.size, std::move(lease.hold)});
+      extent_stages_.push_back(
+          ExtentStage{lease.span, ObjectExtent{0, lease.size}, std::move(lease.hold)});
     read_leases_.clear();
     std::vector<ExtentStage> held;
     for (auto& stage : extent_stages_) {
@@ -559,51 +557,34 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   std::vector<ResolvedEntry> results(keys.size());
   if (keys.empty()) return results;
   const auto now = std::chrono::steady_clock::now();
-  // Extent-scoped staging (doc/design-ssd-ranged-io.md, D1): an in-process
-  // reader that names the bytes it will touch gets only those off the drive.
-  // A layer-wise restore asks for one layer group per call, so staging the
-  // whole object re-read every object once per group.  Remote readers keep the
-  // whole-object lease: their extent does not travel on the wire (D2).
+  // Stage only the bytes an in-process reader names (design-ssd-ranged-io.md D1).
+  // A remote reader's extent does not travel on the wire (D2), so it stages whole.
   const bool use_extents =
       extent_staging_ && extents != nullptr && extents->size() == keys.size() && local;
 
   // Fills `out` from a lease the caller has already located.  Caller holds
   // mutex_.  Factored out because the lease-hit and read-completed paths publish
   // byte-identical results and drifting between them would be a silent bug.
-  auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
-    if (local) out.hold = lease.hold;
+  // `window` is the object bytes the span holds when it is not all of them.
+  auto publish_span = [&](ResolvedEntry& out, StagingSpan span, uint64_t size,
+                          const std::shared_ptr<const void>& hold, ObjectExtent window) {
+    if (local) out.hold = hold;
     out.outcome = ResolveOutcome::kFound;
     out.found = true;
-    out.pages.reserve(lease.span.page_count);
-    for (uint32_t page = lease.span.first_page;
-         page < lease.span.first_page + lease.span.page_count; ++page) {
+    out.pages.reserve(span.page_count);
+    for (uint32_t page = span.first_page; page < span.first_page + span.page_count; ++page) {
       out.pages.push_back(PageLocation{kStagingBufferIndex, page});
     }
-    out.size = lease.size;
+    out.size = size;
     out.page_size = cfg_.page_size;
+    out.covered_offset = window.offset;
+    out.covered_size = window.length;
     if (include_descs && !buffer_desc_.empty()) {
       out.descs = {BufferMemoryDescBytes{kStagingBufferIndex, buffer_desc_}};
     }
   };
-
-  // The extent-scoped counterpart: pages tile the staged window only, and the
-  // entry says so (covered_offset / covered_size).  Caller holds mutex_.
-  auto publish_extent = [&](ResolvedEntry& out, const ExtentStage& stage, uint64_t object_size) {
-    out.hold = stage.hold;
-    out.outcome = ResolveOutcome::kFound;
-    out.found = true;
-    out.pages.reserve(stage.span.page_count);
-    for (uint32_t page = stage.span.first_page;
-         page < stage.span.first_page + stage.span.page_count; ++page) {
-      out.pages.push_back(PageLocation{kStagingBufferIndex, page});
-    }
-    out.size = object_size;
-    out.page_size = cfg_.page_size;
-    out.covered_offset = stage.offset;
-    out.covered_size = stage.length;
-    if (include_descs && !buffer_desc_.empty()) {
-      out.descs = {BufferMemoryDescBytes{kStagingBufferIndex, buffer_desc_}};
-    }
+  auto publish = [&](ResolvedEntry& out, const ReadLease& lease) {
+    publish_span(out, lease.span, lease.size, lease.hold, ObjectExtent{});
   };
 
   // Phase 1 (ONE lock): serve every key that is already staged, size every
@@ -611,37 +592,24 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // partial resolve whole, so its leases would pin the subset while retries
   // compete for the rest: it gets every span or, on transient pressure, kBusy
   // with no new reservation kept.  A local reader copies its part first.
-  std::vector<size_t> todo;            // keys needing a device read
-  std::vector<uint32_t> page_counts;   // parallel to todo
-  std::vector<uint64_t> read_offsets;  // parallel to todo: object byte the read starts at
-  std::vector<uint64_t> read_lengths;  // parallel to todo: 0 = the whole object
-  std::vector<StagingSpan> spans;      // parallel to todo
-  std::vector<void*> dsts;             // parallel to todo
-  std::vector<size_t> caps;            // parallel to todo
-  std::vector<std::string> read_keys;  // parallel to todo
-  std::vector<std::vector<size_t>> result_groups;  // duplicate input indices per device read
-  // A whole-object read is shared by key; an extent read only by the identical
-  // extent (the key plus its window), so two windows of one key never collapse.
-  std::unordered_map<std::string, size_t> scheduled;
+  std::vector<size_t> todo;                           // keys needing a device read
+  std::vector<uint32_t> page_counts;                  // parallel to todo
+  std::vector<ObjectExtent> read_extents;             // parallel to todo; length 0 = whole
+  std::vector<StagingSpan> spans;                     // parallel to todo
+  std::vector<void*> dsts;                            // parallel to todo
+  std::vector<size_t> caps;                           // parallel to todo
+  std::vector<std::string> read_keys;                 // parallel to todo
+  std::vector<std::vector<size_t>> result_groups;     // duplicate input indices per device read
+  std::unordered_map<std::string, size_t> scheduled;  // key (+ window) -> its todo slot
   todo.reserve(keys.size());
   {
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = read_leases_.find(keys[i]);
-      if (it != read_leases_.end()) {
-        // A whole-object lease covers any extent.
+      if (it != read_leases_.end()) {  // a whole-object lease serves any extent too
         if (!local) it->second.expires_at = now + cfg_.read_lease_ttl;
         publish(results[i], it->second);
         continue;
-      }
-
-      const bool wants_extent = use_extents && (*extents)[i].length != 0;
-      if (!wants_extent) {
-        auto duplicate = scheduled.find(keys[i]);
-        if (duplicate != scheduled.end()) {
-          result_groups[duplicate->second].push_back(i);
-          continue;
-        }
       }
 
       // Zero-copy GDS (UMBP_ENABLE_GDS): when the caller can read a file ref,
@@ -671,55 +639,41 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       const uint64_t size = ssd_->SizeOf(keys[i]);
       if (size == 0) continue;
 
-      // The window actually read: the requested extent widened to the record
-      // alignment, so an O_DIRECT read can land straight in the (page-aligned)
-      // staging span.  A value is padded to that alignment on disk, so widening
-      // never leaves the record; it is clamped to the object regardless.  A
-      // window that ends up covering the whole object is just a whole read.
-      uint64_t read_offset = 0;
-      uint64_t read_length = 0;
-      if (wants_extent) {
+      // The extent widened to the 4 KiB record alignment (so O_DIRECT lands in
+      // the page-aligned span) and clamped to the object.  One outside the
+      // object, or one that widens to all of it, is a whole read.
+      ObjectExtent window;
+      if (use_extents && (*extents)[i].length != 0) {
         const ObjectExtent& want = (*extents)[i];
         if (want.offset < size && want.length <= size - want.offset) {
           const uint64_t lo = want.offset & ~(kExtentAlign - 1);
-          const uint64_t end = want.offset + want.length;
-          const uint64_t hi =
-              std::min<uint64_t>(size, (end + kExtentAlign - 1) & ~(kExtentAlign - 1));
-          if (hi - lo < size) {
-            read_offset = lo;
-            read_length = hi - lo;
-          }
+          const uint64_t hi = std::min<uint64_t>(
+              size, (want.offset + want.length + kExtentAlign - 1) & ~(kExtentAlign - 1));
+          if (hi - lo < size) window = ObjectExtent{lo, hi - lo};
         }
-        // An extent outside the object falls back to a whole read; the caller's
-        // own range validation reports it against `size`.
       }
+      // Duplicates share a read only when they want the same bytes.
       std::string schedule_key = keys[i];
-      if (read_length != 0) {
-        schedule_key.push_back('\0');
-        schedule_key += std::to_string(read_offset);
-        schedule_key.push_back(':');
-        schedule_key += std::to_string(read_length);
+      if (window.length != 0) {
+        schedule_key += '\0' + std::to_string(window.offset) + ':' + std::to_string(window.length);
       }
-      if (wants_extent) {
-        auto duplicate = scheduled.find(schedule_key);
-        if (duplicate != scheduled.end()) {
-          result_groups[duplicate->second].push_back(i);
-          continue;
-        }
+      auto duplicate = scheduled.find(schedule_key);
+      if (duplicate != scheduled.end()) {
+        result_groups[duplicate->second].push_back(i);
+        continue;
       }
 
-      const uint32_t page_count =
-          SizeToPages(read_length != 0 ? read_length : size, cfg_.page_size);
+      const uint64_t read_size = window.length != 0 ? window.length : size;
+      const uint32_t page_count = SizeToPages(read_size, cfg_.page_size);
       if (page_count == 0 || page_count > staging_page_used_.size()) {
         results[i].outcome = ResolveOutcome::kFailed;
         MORI_UMBP_ERROR("[SsdBackend] Resolve: key '{}' size {} cannot fit staging arena", keys[i],
-                        read_length != 0 ? read_length : size);
+                        read_size);
         continue;
       }
       todo.push_back(i);
       page_counts.push_back(page_count);
-      read_offsets.push_back(read_offset);
-      read_lengths.push_back(read_length);
+      read_extents.push_back(window);
       read_keys.push_back(keys[i]);
       scheduled.emplace(std::move(schedule_key), todo.size() - 1);
       result_groups.push_back({i});
@@ -747,8 +701,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         for (size_t index : result_groups[j]) results[index].outcome = ResolveOutcome::kBusy;
       }
       todo.resize(staged);
-      read_offsets.resize(staged);
-      read_lengths.resize(staged);
+      read_extents.resize(staged);
       read_keys.resize(staged);
       result_groups.resize(staged);
     } else {
@@ -785,48 +738,13 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   }
   if (todo.empty()) return results;
 
-  // Phase 2 (no lock): ONE batched SSD read per shape -- whole objects through
-  // PrepareReadBatch, extents through PrepareReadRangesBatch.  ShardedSsdTier
-  // turns each into concurrent IO on every drive holding part of the batch.
-  // Duplicate keys in this call were collapsed above; PeerSsdManager
-  // additionally coalesces reads racing across calls, extent-aware.  It marks
-  // each key in-flight for the window, so eviction already skips them.
-  std::vector<SsdReadOutcome> outcomes(todo.size());
-  {
-    std::vector<size_t> whole_at, extent_at;
-    for (size_t j = 0; j < todo.size(); ++j) {
-      (read_lengths[j] != 0 ? extent_at : whole_at).push_back(j);
-    }
-    if (!whole_at.empty()) {
-      std::vector<std::string> k;
-      std::vector<void*> d;
-      std::vector<size_t> c;
-      for (size_t j : whole_at) {
-        k.push_back(read_keys[j]);
-        d.push_back(dsts[j]);
-        c.push_back(caps[j]);
-      }
-      const auto got = whole_at.size() == todo.size()
-                           ? ssd_->PrepareReadBatch(read_keys, dsts, caps)
-                           : ssd_->PrepareReadBatch(k, d, c);
-      for (size_t w = 0; w < whole_at.size() && w < got.size(); ++w) outcomes[whole_at[w]] = got[w];
-    }
-    if (!extent_at.empty()) {
-      std::vector<std::string> k;
-      std::vector<uint64_t> o, z;
-      std::vector<void*> d;
-      for (size_t j : extent_at) {
-        k.push_back(read_keys[j]);
-        o.push_back(read_offsets[j]);
-        z.push_back(read_lengths[j]);
-        d.push_back(dsts[j]);
-      }
-      const auto got = ssd_->PrepareReadRangesBatch(k, o, z, d);
-      for (size_t e = 0; e < extent_at.size() && e < got.size(); ++e) {
-        outcomes[extent_at[e]] = got[e];
-      }
-    }
-  }
+  // Phase 2 (no lock): ONE batched SSD read.  ShardedSsdTier turns this into
+  // concurrent IO on every drive holding part of the batch.  Duplicate keys in
+  // this call were collapsed above; PeerSsdManager additionally coalesces reads
+  // racing across calls.  It marks each key in-flight for the window, so
+  // eviction already skips them.
+  const std::vector<SsdReadOutcome> outcomes =
+      ssd_->PrepareReadBatch(read_keys, dsts, caps, &read_extents);
 
   // Phase 3 (ONE lock): install a lease per key that landed, hand back the pages
   // of the ones that did not.
@@ -844,18 +762,16 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         }
         continue;
       }
-      if (read_lengths[j] != 0) {
-        // Private to this reader: never entered in read_leases_, whose entries
-        // promise the WHOLE object to the next resolve of the key.  Freed once
-        // its holds are gone.  It needs no eviction guard -- its bytes are
-        // already off the drive.
-        extent_stages_.push_back(
-            ExtentStage{spans[j], read_offsets[j], read_lengths[j], std::make_shared<char>()});
+      if (read_extents[j].length != 0) {
+        // Private to its readers and freed with their holds; never a read lease,
+        // which promises the WHOLE object to the next resolve of the key.
+        extent_stages_.push_back(ExtentStage{spans[j], read_extents[j], std::make_shared<char>()});
         for (size_t result_index : result_groups[j]) {
-          publish_extent(results[result_index], extent_stages_.back(), outcomes[j].size);
+          publish_span(results[result_index], spans[j], outcomes[j].size,
+                       extent_stages_.back().hold, read_extents[j]);
         }
         extent_stages_total_.fetch_add(1, std::memory_order_relaxed);
-        extent_stage_bytes_.fetch_add(read_lengths[j], std::memory_order_relaxed);
+        extent_stage_bytes_.fetch_add(read_extents[j].length, std::memory_order_relaxed);
         continue;
       }
       // A concurrent Resolve of the same key may have staged it while this read
@@ -1193,8 +1109,7 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   // was full — indistinguishable from a real miss anywhere else.
   event("staging_slot_full_reject", slot_full_rejects_.load(std::memory_order_relaxed));
   event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
-  // Extent-scoped stages (D1): how many resolves read only their window, and
-  // the bytes those windows were.  device_read already counts only them.
+  // Reads that staged only an extent (D1), and their bytes.
   event("extent_stage", extent_stages_total_.load(std::memory_order_relaxed));
   bytes("extent_stage", extent_stage_bytes_.load(std::memory_order_relaxed));
 

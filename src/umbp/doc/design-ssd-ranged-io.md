@@ -16,11 +16,9 @@ and the sglang tree connector falls back to whole-object I/O for every request.
 tested; D1, D1c, X1 and D2 remain open. §3.1 records one thing the
 implementation corrected about the shape of the fix.
 
-**Update: D1a + D1b + D1c implemented** on `feat/umbp-ssd-extent-staging`
-(§4.5 records where the implementation departs from §4.2). X1 and D2 remain
-open. Measured on a layer-wise restore (1024 objects x 1.97 MB, 8 layer
-groups, two NVMe drives, io_uring): device bytes per restore 15.00 GiB ->
-1.88 GiB (8.0x -> 1.0x of what is served), restore 1.52 s -> 0.32 s.
+**Update: D1a + D1b + D1c implemented** (§4.5); X1 and D2 remain open. A
+layer-wise restore (1024 x 1.97 MB objects, 8 groups, two NVMe drives,
+io_uring) reads 1.88 GiB off the drives instead of 15.00 GiB, 0.32 s vs 1.52 s.
 
 This document covers the distributed data plane only — a client talking to a
 master, whether that client is a `DistributedClient` in-process or a standalone
@@ -306,72 +304,18 @@ needs a test that asserts *content*, not success.
 
 ### 4.5 As implemented
 
-- **The extent travels as a pointer, not an optional per key.**
-  `BatchResolve(..., const std::vector<ObjectExtent>* extents)`, parallel to
-  `keys`, `nullptr` = whole objects; `ObjectExtent{offset, length}` with
-  `length == 0` meaning "everything". `ResolvedEntry` gains `covered_offset`
-  *and* `covered_size` (0 = the pages tile `[0, size)` as before) and `size`
-  stays the object's.
-- **In-process readers only.** `SsdBackend` honours an extent for
-  `ResolveReader::kLocal` alone; a remote reader keeps the whole-object lease,
-  because its extent does not cross the wire until D2.
-- **Widened to 4 KiB** (the record alignment) and clamped to the object, so an
-  O_DIRECT read lands straight in the page-aligned staging span. A window that
-  widens to the whole object is just a whole read.
-- **Extent stages are private.** They are kept on their own list, never in
-  `read_leases_`, whose entries promise the WHOLE object to the next resolve of
-  the key; a stage's span goes back once the last hold published from it drops. Identical windows in one call share one read; an
-  existing whole-object lease serves any window with no read at all.
-- **Rebase lives in `range_map.h`** (`RebaseRangeOntoWindow`), so the "range
-  outside the window is rejected" rule is unit-tested on its own; `BatchGetRanges`
-  rebases each key's ranges and walks the window's pages with
-  `stored_size = covered_size`.
-- **Kill switch:** `UMBP_SSD_EXTENT_STAGING=0` (read at `SsdBackend::Init`)
-  restores whole-object staging; the Init log line reports `extent_staging=`.
-  It is also off wherever the tier cannot read ranges (`SupportsRangedRead`).
-- **Counters:** `extent_stage` (event + bytes) in the backend's medium metrics;
-  `device_read` bytes now count the extent, not the object.
-- **Tests:** D1a — `test_sharded_ssd_tier.cpp` (`test_ranged_read_across_shards`,
-  `test_ranged_read_is_one_call_per_shard`, mixed-capability AND); D1b —
-  `test_ssd_backend.cpp` `SsdBackendExtentTest.*` (asserts `device_read` bytes ==
-  the window), `test_range_map.cpp` window tests, `test_ssd_ranged_io.cpp`
-  `LocalRangedGetOfLargeObjectsFollowsTheirExtents` (rebased ranges through the
-  client, staged in parts); D1c — `test_peer_ssd_single_flight.cpp`
-  (disjoint extents of one key each get their own bytes, content-compared;
-  an extent follows a whole read; a whole read never follows an extent).
-
-### 4.6 Pipelined local get — overlap the next read with this copy
-
-After D1 a layer-group call is still two serial stages: resolve (on SSD, the
-device read into the staging arena) and plan + copy to the caller. On the
-layer-wise microbench (1024 x 1.97 MB objects, 8 groups, GPU destination,
-2 x Micron 7450) a call was 37.9 ms, of which 24 ms was the read and 11 ms the
-plan and H2D copy.
-
-`BatchGetRanges` now cuts its local phase into up to
-`UMBP_GET_PIPELINE_CHUNKS` parts (default 4, at least 32 keys a part) and
-resolves part k+1 on a helper thread (`std::async`) while part k is planned and
-copied. Unchanged from the one-stage loop:
-
-- **Holds are per part.** A part's holds go as soon as its copy finishes,
-  before the caller thread waits on the next part. A concurrent resolve that
-  finds the arena held by the part being copied gets `kBusy`, and its retry
-  succeeds once that copy finishes, so the two never wait on each other.
-- **Leftovers are per part.** Keys a part's resolve leaves `kBusy` (past the
-  half-arena call budget, or a full arena) join the back of the queue, which
-  is the same rule as before, just per part.
-- **Every exit lets go.** Holds live in the part's `Stage`, so an exception
-  drops them, and a part still resolving is waited on by its future's
-  destructor.
-- **`CHUNKS=1`, or fewer than 64 keys, is the old loop exactly.**
-
-The debug line's `resolve` is now the time the caller thread *waited* for a
-resolve, so the phases still sum to `total`. Measured with that bench, steady
-state: 324 → 275 ms per 8-group load (−15%), 37.9 → 32.5 ms per call, the same
-bytes off disk, content-checked. The read itself does not shrink; the rest of
-the gain is capped by the copy it hides. Tests: `test_ssd_ranged_io.cpp`
-`PipelinedLocalGetOfABatchFarLargerThanTheArenaIsServedInFull` (128 keys, an
-8-page arena, `CHUNKS=4/1/4`: leftovers and BUSY inside the pipeline).
+- `BatchResolve(..., const std::vector<ObjectExtent>* extents)`, parallel to
+  `keys`; `ResolvedEntry::covered_offset` / `covered_size` name the window the
+  pages hold, and `size` stays the object's. Only `ResolveReader::kLocal`
+  honours extents; a remote reader stages the whole object until D2.
+- `SsdBackend` widens each extent to 4 KiB and clamps it to the object, so
+  O_DIRECT lands in the staging span. Extent stages are private to their
+  readers, never in `read_leases_` (which promise the whole object). Identical
+  windows in one call share a read; a whole-object lease serves any window.
+- `PeerSsdManager::PrepareReadBatch` takes the extents too, and single flight
+  attaches a reader only to a read that covers its bytes (D1c).
+- `UMBP_SSD_EXTENT_STAGING=0` restores whole-object staging. `extent_stage`
+  counts extent reads; `device_read` bytes count the window.
 
 ## 5. D2 — ranged resolve on the peer wire
 
