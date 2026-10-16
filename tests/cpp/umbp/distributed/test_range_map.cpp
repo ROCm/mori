@@ -200,5 +200,61 @@ TEST(RangeMapTest, EmitRefusalAbortsTheWalk) {
   EXPECT_EQ(calls, 2u);
 }
 
+// ---------------------------------------------------------------------------
+//  Extent-scoped stages (doc/design-ssd-ranged-io.md, D1b)
+// ---------------------------------------------------------------------------
+//
+// An SSD resolve can stage only [window_offset, window_offset + window_size) of
+// an object.  The reader must rebase its ranges onto that window before the
+// walk, and must refuse a range the window does not hold: walking it anyway
+// would read staging bytes that belong to nothing, and the transfer would
+// still report success.
+
+TEST(RangeMapTest, RangeInsideTheWindowIsRebasedToTheWindowStart) {
+  size_t offset = 12288 + 100;
+  ASSERT_TRUE(
+      RebaseRangeOntoWindow(/*window_offset=*/12288, /*window_size=*/2 * kPage, &offset, 500));
+  EXPECT_EQ(offset, 100u);
+
+  // And the rebased range walks the window's pages exactly as it would the
+  // object's, with the window size as the stored size.
+  bool ok = false;
+  const auto frags = Collect(PageRun(2, /*first_page=*/7), kPage, 2 * kPage, offset, 500, &ok);
+  EXPECT_TRUE(ok);
+  ASSERT_EQ(frags.size(), 1u);
+  EXPECT_EQ(frags[0], (Fragment{0, 7 * kPage + 100, 500, 0}));
+}
+
+TEST(RangeMapTest, RangeFillingTheWindowExactlyIsAccepted) {
+  size_t offset = 8192;
+  ASSERT_TRUE(RebaseRangeOntoWindow(8192, 3 * kPage, &offset, 3 * kPage));
+  EXPECT_EQ(offset, 0u);
+}
+
+TEST(RangeMapTest, RangeOutsideTheWindowIsRejectedAndLeftUntouched) {
+  const uint64_t lo = 4 * kPage;
+  const uint64_t size = 2 * kPage;
+
+  size_t before = lo - 1;  // one byte before the window
+  EXPECT_FALSE(RebaseRangeOntoWindow(lo, size, &before, 10));
+  EXPECT_EQ(before, lo - 1) << "a refused range must not be half-rebased";
+
+  size_t past = lo + size - 9;  // one byte past the window's end
+  EXPECT_FALSE(RebaseRangeOntoWindow(lo, size, &past, 10));
+
+  size_t beyond = lo + size + kPage;  // wholly after it
+  EXPECT_FALSE(RebaseRangeOntoWindow(lo, size, &beyond, 1));
+
+  size_t straddle = lo - 100;  // starts before, ends inside
+  EXPECT_FALSE(RebaseRangeOntoWindow(lo, size, &straddle, 200));
+}
+
+// A window at the object's start is the identity: offset 0, nothing moves.
+TEST(RangeMapTest, WindowAtTheObjectStartLeavesOffsetsAlone) {
+  size_t offset = 777;
+  ASSERT_TRUE(RebaseRangeOntoWindow(0, kPage, &offset, 100));
+  EXPECT_EQ(offset, 777u);
+}
+
 }  // namespace
 }  // namespace mori::umbp

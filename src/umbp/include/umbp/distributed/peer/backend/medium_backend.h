@@ -179,6 +179,15 @@ enum class ResolveOutcome {
   kFailed,
 };
 
+// The part of an object a reader will touch, as a byte range of the object.
+// length == 0 means the whole object.  A resolve may stage only this extent
+// (SsdBackend does, for an in-process reader); a medium whose pages already hold
+// the whole object ignores it.
+struct ObjectExtent {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+};
+
 struct ResolvedEntry {
   ResolveOutcome outcome = ResolveOutcome::kMissing;
   // Kept for source and wire compatibility.  New code should set outcome too;
@@ -199,6 +208,17 @@ struct ResolvedEntry {
 
   // kLocal only: the published bytes stay put while any copy of this lives.
   std::shared_ptr<const void> hold;
+
+  // The object bytes `pages` hold, when they are not the whole object.  With
+  // covered_size == 0 (every memory medium, and any whole-object stage) the
+  // pages tile [0, size) as always.  Otherwise they tile
+  // [covered_offset, covered_offset + covered_size): byte covered_offset sits at
+  // the start of pages[0], and a reader must subtract covered_offset before its
+  // page arithmetic and must not touch anything outside the window.  `size`
+  // stays the OBJECT's size either way.  Set only for an extent-scoped resolve,
+  // which is in-process only, so it is not carried on the wire.
+  uint64_t covered_offset = 0;
+  uint64_t covered_size = 0;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -358,9 +378,15 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
+  //
+  // `extents`, when non-null, is parallel to `keys` and names the part of each
+  // object the caller will read.  A medium MAY then publish only that window
+  // (ResolvedEntry::covered_offset / covered_size); one whose pages already
+  // hold the object ignores it.  Only an in-process reader passes extents.
   virtual std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
-      ResolveReader reader = ResolveReader::kRemote) = 0;
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
