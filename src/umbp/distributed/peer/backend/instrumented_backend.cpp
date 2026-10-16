@@ -76,7 +76,7 @@ constexpr bool kProduces[5][5] = {
     {true, true, true, false, true},    // allocate
     {true, false, false, false, true},  // commit
     {true, false, false, false, true},  // abort
-    {true, false, false, true, false},  // resolve
+    {true, false, false, true, true},   // resolve
     {true, false, false, true, false},  // evict
 };
 

@@ -226,10 +226,32 @@ TEST(MetricPublisher, PrependsSourceLabelsToEverySample) {
 //  InstrumentedBackend
 // ---------------------------------------------------------------------------
 
+// A MockBackend whose resolve can be scripted per key, for the outcomes only a
+// staged medium produces (held but unreadable, arena full, deferred).
+class ScriptedResolveBackend : public MockBackend {
+ public:
+  using MockBackend::MockBackend;
+
+  std::map<std::string, ResolveOutcome> outcomes;
+
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override {
+    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+    for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
+      auto it = outcomes.find(keys[i]);
+      if (it == outcomes.end()) continue;
+      out[i] = ResolvedEntry{};
+      out[i].outcome = it->second;
+    }
+    return out;
+  }
+};
+
 class InstrumentedBackendMetrics : public ::testing::Test {
  protected:
   void SetUp() override {
-    auto mock = std::make_unique<MockBackend>(TierType::DRAM);
+    auto mock = std::make_unique<ScriptedResolveBackend>(TierType::DRAM);
     mock_ = mock.get();
     backend_ = MakeInstrumentedBackend(std::move(mock));
     ASSERT_TRUE(backend_->Init(nullptr));
@@ -273,7 +295,7 @@ class InstrumentedBackendMetrics : public ::testing::Test {
     backend_->BatchCommit({CommitRequest{alloc[0].slot_id, key}});
   }
 
-  MockBackend* mock_ = nullptr;
+  ScriptedResolveBackend* mock_ = nullptr;
   std::unique_ptr<MediumBackend> backend_;
   MetricPublisher publisher_;
   Collector collector_;
@@ -364,6 +386,19 @@ TEST_F(InstrumentedBackendMetrics, EvictingAnAbsentKeyIsAMissNotAFailure) {
   EXPECT_DOUBLE_EQ(Ops("evict", "ok"), 0.0) << "no successful eviction should have been reported";
 }
 
+TEST_F(InstrumentedBackendMetrics, ResolveCountsOnlyFinalAnswers) {
+  // A key held but unreadable is a load failure and must not hide among the
+  // misses; BUSY and deferred are not answers yet -- the retry is counted.
+  mock_->outcomes = {{"failed", ResolveOutcome::kFailed},
+                     {"busy", ResolveOutcome::kBusy},
+                     {"deferred", ResolveOutcome::kDeferred}};
+  backend_->BatchResolve({"failed", "busy", "deferred", "absent"}, /*include_descs=*/false);
+  Publish();
+  EXPECT_DOUBLE_EQ(Ops("resolve", "failed"), 1.0);
+  EXPECT_DOUBLE_EQ(Ops("resolve", "miss"), 1.0);
+  EXPECT_DOUBLE_EQ(Ops("resolve", "ok"), 0.0);
+}
+
 TEST_F(InstrumentedBackendMetrics, EverySeriesExistsAtZeroBeforeItsFirstEvent) {
   // Prometheus sees an increase only between two samples of one series.  A
   // series born holding its first count hides that count from rate() and
@@ -372,6 +407,7 @@ TEST_F(InstrumentedBackendMetrics, EverySeriesExistsAtZeroBeforeItsFirstEvent) {
   EXPECT_DOUBLE_EQ(Ops("allocate", "no_space"), 0.0);
   EXPECT_DOUBLE_EQ(Ops("commit", "failed"), 0.0);
   EXPECT_DOUBLE_EQ(Ops("resolve", "miss"), 0.0);
+  EXPECT_DOUBLE_EQ(Ops("resolve", "failed"), 0.0);
   EXPECT_DOUBLE_EQ(Ops("evict", "ok"), 0.0);
   EXPECT_DOUBLE_EQ(Bytes("evict"), 0.0);
   EXPECT_DOUBLE_EQ(Batches("abort"), 0.0);
