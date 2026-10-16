@@ -350,7 +350,7 @@ std::optional<std::string> ShardedSsdTier::GetLocationId(const std::string& key)
   return "s" + std::to_string(shard) + ":" + *inner;
 }
 
-std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) const {
+std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
   return shards_[shard]->LocateRecord(key);

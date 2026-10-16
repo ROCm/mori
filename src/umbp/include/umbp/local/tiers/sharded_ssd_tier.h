@@ -85,7 +85,7 @@ class ShardedSsdTier : public TierBackend {
                           std::chrono::milliseconds grace) override;
   TierSpaceStats SpaceStats() const override;
   std::optional<std::string> GetLocationId(const std::string& key) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
   bool Flush() override;
   void SetColdRead(bool enable) override;
 

@@ -111,7 +111,7 @@ class SSDTier : public TierBackend {
   // Segment size in effect: ssd.segment_size_bytes, capped for a small tier.
   uint64_t segment_size() const { return segment_size_; }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
   // Enables O_DIRECT for segments opened from here on.  Takes effect for
   // segments opened after the call; existing fds keep their current mode, so
   // the intended use is at construction (ssd.direct_io) rather than mid-run.
