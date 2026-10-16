@@ -76,7 +76,7 @@ constexpr bool kProduces[5][5] = {
     {true, true, true, false, true},    // allocate
     {true, false, false, false, true},  // commit
     {true, false, false, false, true},  // abort
-    {true, false, false, true, false},  // resolve
+    {true, false, false, true, true},   // resolve
     {true, false, false, true, false},  // evict
 };
 
@@ -199,7 +199,6 @@ std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(
         Add(kResolve, kFailed, 1);  // held but unreadable: a real load failure
         break;
       case ResolveOutcome::kBusy:
-      case ResolveOutcome::kDeferred:
         break;  // not an answer yet: the retry is what gets counted
     }
   }

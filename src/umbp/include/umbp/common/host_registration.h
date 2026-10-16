@@ -71,19 +71,12 @@ class HostTierRegistration {
  public:
   // Registers [base, base + bytes). `bytes` must be the mapped (page-aligned)
   // length, not the usable capacity. Never throws and never fails hard: if
-  // registration is unavailable the object simply reports Covers() == false
-  // forever.
+  // registration is unavailable DeviceAddress() simply returns null forever.
   HostTierRegistration(void* base, size_t bytes);
   ~HostTierRegistration();
 
   HostTierRegistration(const HostTierRegistration&) = delete;
   HostTierRegistration& operator=(const HostTierRegistration&) = delete;
-
-  // True when [ptr, ptr + size) lies inside one registered piece, and is
-  // therefore safe to copy from or to without the pageable staging path. False
-  // is always the safe answer. Weaker than "safe to hand to a kernel" -- that
-  // needs DeviceAddress().
-  bool Covers(const void* ptr, size_t size) const;
 
   // Whether a kernel on `device_id` can reach this region at all, i.e. whether
   // DeviceAddress() will return non-null for a covered pointer.
@@ -92,12 +85,7 @@ class HostTierRegistration {
   // The address `device_id` must use to reach [host_ptr, host_ptr + size), or
   // null when that range is not inside one registered piece or the device has
   // no alias, in which case the caller must stay on the copy-engine path.
-  // Subsumes Covers(), so a caller that needs the address should not test both.
   void* DeviceAddress(const void* host_ptr, size_t size, int device_id) const;
-
-  // Bytes registered so far: zero until the first piece is, the full region
-  // once every piece is. For logging and tests.
-  size_t RegisteredBytes() const { return registered_bytes_.load(std::memory_order_acquire); }
 
  private:
   struct Piece {

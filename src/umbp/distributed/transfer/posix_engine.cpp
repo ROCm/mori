@@ -36,6 +36,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/aligned_buffer.h"
+#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
 namespace {
@@ -175,38 +176,42 @@ bool PosixEngine::CanHandle(const TransferRef& src, const TransferRef& dst) cons
   return (src.IsFile() && IsHostCpu(dst)) || (IsHostCpu(src) && dst.IsFile());
 }
 
-TransferPlanSet PosixEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  std::map<std::tuple<const void*, int, uint64_t, bool>, size_t> index;
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst) || item.size > item.src.size ||
-        item.src_offset > item.src.size - item.size || item.size > item.dst.size ||
-        item.dst_offset > item.dst.size - item.size) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
+namespace {
+
+// Pairs by (memory buffer, file range, direction): a file endpoint has no
+// host_ptr, so PairPlanBuilder's key would merge different files.
+class PosixPlanBuilder final : public TransferPlanBuilder {
+ public:
+  explicit PosixPlanBuilder(const PosixEngine& engine) : engine_(engine) {}
+
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    if (!engine_.CanHandle(item.src, item.dst) || !ItemInBounds(item)) {
+      out_.rejected_tags.push_back(item.tag);
+      return;
     }
     const bool write = item.dst.IsFile();
     const TransferRef& file = write ? item.dst : item.src;
     const void* mem = write ? item.src.host_ptr : item.dst.host_ptr;
-    auto [it, fresh] = index.emplace(std::make_tuple(mem, file.file_fd, file.file_offset, write),
-                                     out.plans.size());
-    if (fresh) {
-      TransferPlan plan;
-      plan.src = item.src;
-      plan.dst = item.dst;
-      plan.dir = TransferDirection::kLocal;
-      out.plans.push_back(std::move(plan));
-    }
-    TransferPlan& plan = out.plans[it->second];
-    plan.src_offsets.push_back(static_cast<size_t>(item.src_offset));
-    plan.dst_offsets.push_back(static_cast<size_t>(item.dst_offset));
-    plan.sizes.push_back(static_cast<size_t>(item.size));
-    if (std::find(plan.tags.begin(), plan.tags.end(), item.tag) == plan.tags.end()) {
-      plan.tags.push_back(item.tag);
-    }
+    auto [it, fresh] = plan_of_.emplace(std::make_tuple(mem, file.file_fd, file.file_offset, write),
+                                        out_.plans.size());
+    if (fresh) out_.plans.push_back(PlanBetween(item, TransferDirection::kLocal));
+    AppendSegment(&out_.plans[it->second], item.src_offset, item.dst_offset, item.size, item.tag);
   }
-  return out;
+
+  TransferPlanSet Finish() override { return std::move(out_); }
+
+ private:
+  const PosixEngine& engine_;
+  TransferPlanSet out_;
+  std::map<std::tuple<const void*, int, uint64_t, bool>, size_t> plan_of_;
+};
+
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> PosixEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
+  return std::make_unique<PosixPlanBuilder>(*this);
 }
 
 std::unique_ptr<TransferHandle> PosixEngine::Submit(std::vector<TransferPlan> plans) {

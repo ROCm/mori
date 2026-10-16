@@ -317,8 +317,7 @@ TEST_F(SsdRangedIoTest, LocalBatchLargerThanTheStagingArenaIsServedInFull) {
   }
   for (const auto& key : keys) ASSERT_TRUE(WaitForExists(node, key));
 
-  // Back to back, several times: without releases each call would wait out
-  // the previous call's leases before it could stage anything.
+  // Back to back: each call's staging must be back before the next needs it.
   for (int pass = 0; pass < 3; ++pass) {
     std::vector<std::vector<char>> got(kKeys, std::vector<char>(128, 0));
     std::vector<std::vector<uintptr_t>> dsts(kKeys);
@@ -451,7 +450,7 @@ TEST_F(SsdRangedIoTest, LocalRangedGetOfLargeObjectsFollowsTheirExtents) {
 }
 
 // The pipelined local get: a batch big enough to be cut into parts, against an
-// arena far smaller than any part.  Every part is deferred in rounds, and the
+// arena far smaller than any part.  Every part is staged in pieces, and the
 // part being resolved ahead finds the arena held by the part being copied --
 // the BUSY retry has to wait out that copy rather than deadlock on it.  Each
 // pass is checked against the one-stage-at-a-time loop (CHUNKS=1).

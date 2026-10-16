@@ -318,9 +318,9 @@ needs a test that asserts *content*, not success.
 - **Widened to 4 KiB** (the record alignment) and clamped to the object, so an
   O_DIRECT read lands straight in the page-aligned staging span. A window that
   widens to the whole object is just a whole read.
-- **Extent stages are private.** They are kept in their own map keyed by lease
-  token, never in `read_leases_`, whose entries promise the WHOLE object to the
-  next resolve of the key. Identical windows in one call share one read; an
+- **Extent stages are private.** They are kept on their own list, never in
+  `read_leases_`, whose entries promise the WHOLE object to the next resolve of
+  the key; a stage's span goes back once the last hold published from it drops. Identical windows in one call share one read; an
   existing whole-object lease serves any window with no read at all.
 - **Rebase lives in `range_map.h`** (`RebaseRangeOntoWindow`), so the "range
   outside the window is rejected" rule is unit-tested on its own; `BatchGetRanges`
@@ -336,7 +336,7 @@ needs a test that asserts *content*, not success.
   `test_ssd_backend.cpp` `SsdBackendExtentTest.*` (asserts `device_read` bytes ==
   the window), `test_range_map.cpp` window tests, `test_ssd_ranged_io.cpp`
   `LocalRangedGetOfLargeObjectsFollowsTheirExtents` (rebased ranges through the
-  client, deferred rounds included); D1c — `test_peer_ssd_single_flight.cpp`
+  client, staged in parts); D1c — `test_peer_ssd_single_flight.cpp`
   (disjoint extents of one key each get their own bytes, content-compared;
   an extent follows a whole read; a whole read never follows an extent).
 
@@ -353,15 +353,16 @@ plan and H2D copy.
 resolves part k+1 on a helper thread (`std::async`) while part k is planned and
 copied. Unchanged from the one-stage loop:
 
-- **Holds are per part.** A part's holds go back as soon as its copy finishes,
+- **Holds are per part.** A part's holds go as soon as its copy finishes,
   before the caller thread waits on the next part. A concurrent resolve that
   finds the arena held by the part being copied gets `kBusy`, and its retry
   succeeds once that copy finishes, so the two never wait on each other.
-- **Deferral is per part.** Keys a part's resolve defers (`kDeferred`, the
-  half-arena call budget) join the back of the queue, which is the same rule
-  as before, just per part.
-- **Every exit releases.** An exception releases the current part (scope
-  guard), and a part still resolving is waited on and released.
+- **Leftovers are per part.** Keys a part's resolve leaves `kBusy` (past the
+  half-arena call budget, or a full arena) join the back of the queue, which
+  is the same rule as before, just per part.
+- **Every exit lets go.** Holds live in the part's `Stage`, so an exception
+  drops them, and a part still resolving is waited on by its future's
+  destructor.
 - **`CHUNKS=1`, or fewer than 64 keys, is the old loop exactly.**
 
 The debug line's `resolve` is now the time the caller thread *waited* for a
@@ -370,7 +371,7 @@ state: 324 → 275 ms per 8-group load (−15%), 37.9 → 32.5 ms per call, the 
 bytes off disk, content-checked. The read itself does not shrink; the rest of
 the gain is capped by the copy it hides. Tests: `test_ssd_ranged_io.cpp`
 `PipelinedLocalGetOfABatchFarLargerThanTheArenaIsServedInFull` (128 keys, an
-8-page arena, `CHUNKS=4/1/4`: deferral and BUSY inside the pipeline).
+8-page arena, `CHUNKS=4/1/4`: leftovers and BUSY inside the pipeline).
 
 ## 5. D2 — ranged resolve on the peer wire
 

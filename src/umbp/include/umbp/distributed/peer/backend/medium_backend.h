@@ -158,10 +158,10 @@ struct CommitResult {
   uint64_t bytes_committed = 0;
 };
 
-// Who reads what a resolve publishes.  kLocal is this process: it always calls
-// ReleaseResolved after its copy, so its hold never expires on a timer.
-// kRemote is a peer that cannot report completion: its hold lasts the read
-// lease.  kRemote is the default because it cannot leak.
+// Who reads what a resolve publishes.  kRemote is a peer, which cannot say when
+// it is done, so its bytes stay put for the read lease.  kLocal is this process:
+// it keeps each hit's `hold` until its copy returns, and comes back for any key
+// a staged medium answered kBusy.
 enum class ResolveReader {
   kRemote,
   kLocal,
@@ -171,15 +171,12 @@ enum class ResolveReader {
 // owns the key but cannot publish its bytes until a transient resource (SSD
 // staging) becomes available; callers must retry THIS peer rather than exclude
 // it as they do for kMissing.  kFailed is a permanent shape/backend error and
-// must not be retried indefinitely.  kDeferred: held and readable, but this
-// call staged its share of the batch without it; the caller releases what was
-// published and resolves the rest in a further call (on the wire, kFailed).
+// must not be retried indefinitely.
 enum class ResolveOutcome {
   kMissing,
   kFound,
   kBusy,
   kFailed,
-  kDeferred,
 };
 
 // The part of an object a reader will touch, as a byte range of the object.
@@ -209,9 +206,8 @@ struct ResolvedEntry {
   // this invalid and publishes pages as before.
   TransferRef file_ref{};
 
-  // Non-zero: hand back with ReleaseResolved after reading.  Names the hold, so
-  // a late release cannot free a later reader's.  Not carried on the wire.
-  uint64_t lease_token = 0;
+  // kLocal only: the published bytes stay put while any copy of this lives.
+  std::shared_ptr<const void> hold;
 
   // The object bytes `pages` hold, when they are not the whole object.  With
   // covered_size == 0 (every memory medium, and any whole-object stage) the
@@ -327,6 +323,12 @@ class MediumBackend : public MetricSource {
   // frees.  Frees nothing; Evict() re-checks.  Empty if no order is kept.
   virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
 
+  // True when EvictionCandidates() is the only order that frees this medium's
+  // space, so local eviction must not substitute the master's ranking.  The
+  // file SSD tier is one: it frees disk a whole segment file at a time, and
+  // keys picked by recency alone can leave every segment partly live.
+  virtual bool OwnsEvictionOrder() const { return false; }
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or
@@ -358,12 +360,14 @@ class MediumBackend : public MetricSource {
   // is reserved for a state not currently produced.
   virtual std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
 
-  // Look up keys and take a read lease on each hit, protecting it from
-  // concurrent Evict for the lease window.  `include_descs=false` skips
-  // building descs entirely for the whole batch.  A medium whose own bytes are
-  // not registerable publishes a descriptor naming its storage (a file/object
-  // ref) rather than a memory one — the engine decides how to reach it, and
-  // supplies a bounce buffer if the chosen path needs one.
+  // Look up keys and protect each hit from concurrent Evict: for the lease
+  // window (kRemote), or while its `hold` lives (kLocal).  A kLocal batch too
+  // big for a staged medium at once is published in part, the rest kBusy.
+  // `include_descs=false` skips building descs entirely for the whole batch.
+  // A medium whose own bytes are not registerable publishes a descriptor
+  // naming its storage (a file/object ref) rather than a memory one — the
+  // engine decides how to reach it, and supplies a bounce buffer if the
+  // chosen path needs one.
   //
   // `allow_file_refs` says the caller can consume a TransferRef::File -- it
   // will read the medium's own storage directly (GdsEngine DMAs the range into
@@ -374,7 +378,6 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  // A kLocal `reader` must ReleaseResolved every published entry.
   //
   // `extents`, when non-null, is parallel to `keys` and names the part of each
   // object the caller will read.  A medium MAY then publish only that window
@@ -397,14 +400,6 @@ class MediumBackend : public MetricSource {
     return false;
   }
   virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
-
-  // The caller has finished reading what a kLocal BatchResolve published.
-  // `lease_tokens` is parallel to `keys`; 0 is skipped.
-  virtual void ReleaseResolved(const std::vector<std::string>& keys,
-                               const std::vector<uint64_t>& lease_tokens) {
-    (void)keys;
-    (void)lease_tokens;
-  }
 
   // Authoritative metadata lookup with no staging, descriptor construction, or
   // read-lease side effects. Pool placement validation must use this instead of

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/tier_proto.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.pb.h"
 
@@ -69,33 +70,6 @@ struct DecodedBatchResolve {
   std::vector<DecodedResolveKey> keys;       // parallel to request.keys
 };
 
-// proto <-> host tier.  Header-local (inline) to avoid a second definition of
-// the anonymous-namespace helpers already living in the .cpp files.
-inline TierType BatchResolveTierFromProto(::umbp::TierType t) {
-  switch (t) {
-    case ::umbp::TIER_HBM:
-      return TierType::HBM;
-    case ::umbp::TIER_DRAM:
-      return TierType::DRAM;
-    case ::umbp::TIER_SSD:
-      return TierType::SSD;
-    default:
-      return TierType::UNKNOWN;
-  }
-}
-inline ::umbp::TierType BatchResolveTierToProto(TierType t) {
-  switch (t) {
-    case TierType::HBM:
-      return ::umbp::TIER_HBM;
-    case TierType::DRAM:
-      return ::umbp::TIER_DRAM;
-    case TierType::SSD:
-      return ::umbp::TIER_SSD;
-    default:
-      return ::umbp::TIER_UNKNOWN;
-  }
-}
-
 inline ::umbp::ResolveStatus ResolveOutcomeToProto(ResolveOutcome outcome) {
   switch (outcome) {
     case ResolveOutcome::kFound:
@@ -103,9 +77,6 @@ inline ::umbp::ResolveStatus ResolveOutcomeToProto(ResolveOutcome outcome) {
     case ResolveOutcome::kBusy:
       return ::umbp::RESOLVE_STATUS_BUSY;
     case ResolveOutcome::kFailed:
-    // A remote reader gets one answer per call and cannot come back for the
-    // rest of an oversized batch, so a deferral is a failure on the wire.
-    case ResolveOutcome::kDeferred:
       return ::umbp::RESOLVE_STATUS_FAILED;
     case ResolveOutcome::kMissing:
     default:
@@ -161,7 +132,7 @@ inline void EncodeBatchResolveResponse(const std::vector<ResolvedKeyEntry>& keys
     const ResolveOutcome outcome = k.found ? ResolveOutcome::kFound : k.outcome;
     resp->add_found(outcome == ResolveOutcome::kFound);
     resp->add_resolve_status(ResolveOutcomeToProto(outcome));
-    resp->add_tier(BatchResolveTierToProto(k.tier));
+    resp->add_tier(TierToProto(k.tier));
     resp->add_size(k.size);
     resp->add_backend_id(k.backend_id);
     resp->add_page_count(static_cast<uint32_t>(k.pages.size()));
@@ -221,7 +192,7 @@ inline DecodedBatchResolve DecodeBatchResolveResponse(
                     ? ResolveOutcomeFromProto(resp.resolve_status(i))
                     : (resp.found(i) ? ResolveOutcome::kFound : ResolveOutcome::kMissing);
     k.found = k.outcome == ResolveOutcome::kFound;
-    k.tier = BatchResolveTierFromProto(resp.tier(i));
+    k.tier = TierFromProto(resp.tier(i));
     k.size = resp.size(i);
     k.backend_id = resp.backend_id(i);
     const uint32_t pc = resp.page_count(i);

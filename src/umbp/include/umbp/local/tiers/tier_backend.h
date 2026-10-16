@@ -21,8 +21,10 @@
 // SOFTWARE.
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -41,6 +43,27 @@ struct TierCapabilities {
   // missed"; callers route on this flag instead so an unsupported tier falls
   // through to another one rather than reporting a phantom miss.
   bool ranged_read = false;
+  // Whether EvictionOrder() is the order to evict in.  Set by tiers that free
+  // disk in units bigger than one key, where evicting keys in plain recency
+  // order can leave every unit partly live and free nothing.
+  bool orders_eviction = false;
+};
+
+// A key offered for eviction, with the bytes evicting it is credited with
+// freeing.
+struct EvictionHint {
+  std::string key;
+  uint64_t reclaim_bytes = 0;
+};
+
+// Disk use of a tier that deletes files as space frees.  live_bytes and files
+// are current; the rest count since start.
+struct TierSpaceStats {
+  uint64_t live_bytes = 0;     // records still mapped to a key
+  uint64_t files = 0;          // segment files on disk
+  uint64_t files_deleted = 0;  // emptied segment files deleted
+  uint64_t bytes_deleted = 0;  // disk those files held
+  uint64_t no_room = 0;        // new segments refused: the filesystem was full
 };
 
 // Physical location of a value inside a segment file, for a zero-copy reader
@@ -101,7 +124,6 @@ class TierBackend {
 
   // Optional capability-based extensions.
   virtual TierCapabilities Capabilities() const;
-  virtual const void* ReadPtr(const std::string& key, size_t* out_size);
   virtual bool WriteBatch(const std::vector<std::string>& keys,
                           const std::vector<const void*>& data_ptrs,
                           const std::vector<size_t>& sizes);
@@ -121,6 +143,21 @@ class TierBackend {
   // Default delegates to GetLRUKey(); override in tiers with LRU tracking.
   virtual std::vector<std::string> GetLRUCandidates(size_t max_candidates) const;
 
+  // Up to |max_keys| keys in the order that frees space soonest, for tiers
+  // that set TierCapabilities::orders_eviction.  Frees nothing.  Default: none.
+  virtual std::vector<EvictionHint> EvictionOrder(size_t /*max_keys*/) { return {}; }
+
+  // For tiers that delete whole files as space is freed.  |on_close| runs with
+  // each deleted file's fd just before it is closed, and the close waits
+  // |grace| after the delete: an fd handed out by LocateRecord() may still be
+  // in a zero-copy reader's hands, which caches per-fd state and reads without
+  // telling the tier when it is done.  Default: no files are ever deleted.
+  virtual void SetRetiredFileHook(std::function<void(int fd)> /*on_close*/,
+                                  std::chrono::milliseconds /*grace*/) {}
+
+  // Default: a tier that deletes no files reports nothing.
+  virtual TierSpaceStats SpaceStats() const { return {}; }
+
   // Batch write: write multiple keys in one call.
   // Default loops over Write(). Override for deep-queue NVMe pipeline.
   virtual std::vector<bool> BatchWrite(const std::vector<std::string>& keys,
@@ -137,20 +174,11 @@ class TierBackend {
   // SpdkProxyTier overrides this to drain pending write-back NVMe flushes.
   virtual bool Flush() { return true; }
 
-  // Toggle cold-read mode: bypass all caches, read directly from storage.
-  // SSDTier: O_DIRECT; SpdkProxyTier: skip ring buffer cache.
-  virtual void SetColdRead(bool /*enable*/) {}
-
-  // Return an opaque location identifier for a previously written key.
-  // Callers prepend the store index before publishing to the Master.
-  virtual std::optional<std::string> GetLocationId(const std::string& key) const;
-
   // Physical location of |key|'s value for a zero-copy reader that DMAs it
   // itself (GdsEngine).  Default: no stable file location — only the
-  // segment-file SSD tiers override it.  Read-only: acquires no lock the caller
-  // must hold and does not touch LRU, so a Resolve can call it without
-  // perturbing recency.
-  virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) const {
+  // segment-file SSD tiers override it.  Acquires no lock the caller must hold.
+  // Touches LRU: the caller reads the record, just not through this tier.
+  virtual std::optional<RecordLocation> LocateRecord(const std::string& /*key*/) {
     return std::nullopt;
   }
 

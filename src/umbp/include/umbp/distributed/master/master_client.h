@@ -168,7 +168,6 @@ class MasterClient : public MetricSink {
     aggregate_backend_capacities_ = enabled && supports_max_allocatable_capacity_;
   }
   bool SupportsMaxAllocatableCapacity() const { return supports_max_allocatable_capacity_; }
-  bool SupportsLogicalTiers() const { return supports_logical_tiers_; }
 
   void StartHeartbeat();
   void StopHeartbeat();
@@ -224,13 +223,7 @@ class MasterClient : public MetricSink {
 
     // Number of *distinct* matched hashes (size of the union across tiers).
     // A hash present on HBM+DRAM still counts once.
-    size_t MatchedHashCount() const {
-      std::unordered_set<std::string_view> seen;
-      for (const auto& [tier, hashes] : hashes_by_tier) {
-        for (const auto& h : hashes) seen.insert(h);
-      }
-      return seen.size();
-    }
+    size_t MatchedHashCount() const { return CountDistinctHashes(hashes_by_tier); }
   };
   using ExternalKvHitCountEntry = mori::umbp::ExternalKvHitCountEntry;
   grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,

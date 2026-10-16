@@ -46,8 +46,12 @@ namespace mori::umbp {
 //     (PosixEngine for tier migrations, GdsEngine for reads into the GPU);
 //   * through the staging arena, registered host DRAM a remote peer can RDMA:
 //     Allocate lends pages and Commit writes them out; Resolve fills pages under
-//     a read lease, kBusy while the arena is full, kFailed if a batch can never
-//     fit.  A key's pages are one contiguous run of the arena.
+//     a read lease (a remote reader) or a hold (a local one, see ResolveReader).
+//     A remote batch is staged all or nothing: kBusy while the arena is full,
+//     kFailed if it can never fit.  A local batch is staged up to half the
+//     arena and the rest is kBusy.  A key's pages are one contiguous run of the
+//     arena.  A staged page goes back once its lease has expired and no hold is
+//     left: at the next reaper sweep, or at once when the arena is short.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -119,12 +123,12 @@ class SsdBackend : public MediumBackend {
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<uint64_t>& lease_tokens) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
-  // The manager's LRU (always kept) minus keys a staged or migration read holds.
+  // The manager's order (the file tier's segment order, or its LRU) minus keys
+  // a staged or migration read holds.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
+  bool OwnsEvictionOrder() const override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
@@ -161,28 +165,22 @@ class SsdBackend : public MediumBackend {
     std::optional<RecordReservation> record;
   };
 
-  // A staged read.  The span is never reclaimed while a kLocal holder has not
-  // released it; a kRemote holder keeps it until expires_at; with neither it
-  // goes back on the last release.  `token` is the entries' lease_token.
   struct ReadLease {
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
-    uint32_t local_holders = 0;
-    uint32_t remote_holders = 0;
-    uint64_t token = 0;
-    bool overdue_warned = false;
+    std::shared_ptr<const void> hold;  // copied into each kLocal hit
   };
 
   // An extent-scoped read (BatchResolve with an extent, kLocal only): a span
   // holding object bytes [offset, offset + length), private to the reader(s)
-  // it was published to and released by token.  Kept out of read_leases_,
-  // whose entries stand for the whole object.
+  // it was published to and freed once their holds are gone.  Kept out of
+  // read_leases_, whose entries stand for the whole object.
   struct ExtentStage {
     StagingSpan span;
     uint64_t offset = 0;
     uint64_t length = 0;
-    uint32_t holders = 0;
+    std::shared_ptr<const void> hold;  // copied into each entry published from it
   };
 
   // Extent windows are widened to this, the SSD record alignment, so an
@@ -190,12 +188,12 @@ class SsdBackend : public MediumBackend {
   static constexpr uint64_t kExtentAlign = 4096;
 
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
-  // the requested size is currently available.
+  // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
-  // Caller MUST hold mutex_.  Drops one holder of `key`'s lease if `token`
-  // still names it; true when that returned the span to the arena.
-  bool DropLeaseHolderLocked(const std::string& key, uint64_t token, ResolveReader reader);
+  // Caller MUST hold mutex_.  Frees every read lease that has expired and has
+  // no hold left, and every extent stage with no hold left; returns how many.
+  size_t ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point now);
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -203,8 +201,10 @@ class SsdBackend : public MediumBackend {
   // hipFile handle for a segment fd, obtained lazily from the registrar's file
   // engine (GdsEngine) and shared by every key on that segment.  Returns nullptr
   // when no file engine is configured; that result is cached so a fd is probed
-  // at most once.  Deregistered in Shutdown.
+  // at most once.  Deregistered in Shutdown, or when the tier deletes the
+  // segment (DropGdsHandle), before the fd number can be reused.
   void* GdsHandleForFd(int fd);
+  void DropGdsHandle(int fd);
 
   // Caller MUST hold mutex_.  Bumps the unshipped-event count and fires the
   // auto-flush hook once it crosses the threshold.
@@ -234,7 +234,7 @@ class SsdBackend : public MediumBackend {
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
-  std::unordered_map<uint64_t, ExtentStage> extent_stages_;  // by lease token
+  std::vector<ExtentStage> extent_stages_;
 
   // Stage only the requested extent for an in-process reader that names one
   // (D1).  Set at Init: on when the tier reads ranges, off with
@@ -267,19 +267,16 @@ class SsdBackend : public MediumBackend {
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
-  std::atomic<uint64_t> staging_early_releases_{0};  // released before expiry
-  std::atomic<uint64_t> resolve_deferred_keys_{0};   // left for a further call
-  std::atomic<uint64_t> extent_stages_total_{0};     // extent-scoped device reads
-  std::atomic<uint64_t> extent_stage_bytes_{0};      // their window bytes
+  std::atomic<uint64_t> extent_stages_total_{0};  // extent-scoped device reads
+  std::atomic<uint64_t> extent_stage_bytes_{0};   // their window bytes
   // Migration pins (a source read, or a target after commit): file range or staging.
   std::atomic<uint64_t> migrations_in_place_{0};
   std::atomic<uint64_t> migrations_staged_{0};
-  uint64_t next_lease_token_ = 1;  // guarded by mutex_; 0 means "nothing to release"
   // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
   // can read it without taking mutex_ (the metrics tick must never contend with
   // a read).
   std::atomic<uint64_t> staging_pages_in_use_{0};
-  std::atomic<uint64_t> staging_pages_peak_{0};  // highest occupancy; written under mutex_
+  std::atomic<uint64_t> staging_pages_peak_{0};  // written under mutex_
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

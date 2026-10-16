@@ -21,8 +21,12 @@
 // SOFTWARE.
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -45,6 +49,15 @@ enum class SSDAccessMode : int {
   ReadOnlyShared = 1,
 };
 
+// An append-only log of segment files.  A record is never rewritten in place;
+// evicting a key only drops it from the index, so its bytes stay on disk until
+// every record in its segment is gone and the segment file itself is deleted.
+// Space therefore comes back a segment at a time, which is why:
+//   * Capacity() and write admission count bytes on disk, dead records included;
+//   * EvictionOrder() hands out whole segments' keys, emptiest and coldest
+//     first (see segment::Index::EvictionOrder);
+//   * a segment is deleted as soon as it is sealed, empty and has no read or
+//     write in flight on its fd.
 class SSDTier : public TierBackend {
  public:
   SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& ssd_config,
@@ -83,29 +96,31 @@ class SSDTier : public TierBackend {
       const std::vector<std::vector<size_t>>& src_offsets) override;
   bool Exists(const std::string& key) const override;
   bool Evict(const std::string& key) override;
+  // {bytes on disk, capacity}: the segments' total size, not just live records.
   std::pair<size_t, size_t> Capacity() const override;
   void Clear() override;
   std::vector<char> Read(const std::string& key) override;
   TierCapabilities Capabilities() const override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
-  const IoStatus& LastIoStatus() const { return last_io_status_; }
-  std::optional<std::string> GetLocationId(const std::string& key) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  void SetRetiredFileHook(std::function<void(int fd)> on_close,
+                          std::chrono::milliseconds grace) override;
+
+  TierSpaceStats SpaceStats() const override;
+  // Segment size in effect: ssd.segment_size_bytes, capped for a small tier.
+  uint64_t segment_size() const { return segment_size_; }
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
+
+  // True when segment I/O is actually bypassing the page cache.  False if
+  // direct I/O was never requested, or was requested and the probe failed.
+  bool direct_io_active() const { return direct_io_; }
 
   // The uncommitted prefix goes down at reserve, so the log stays parseable and
   // the scanner skips the record until CommitRecord flips its flag.
   std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
   bool CommitRecord(const std::string& key, const RecordReservation& r) override;
   void AbortRecord(const std::string& key, const RecordReservation& r) override;
-  // Enables O_DIRECT for segments opened from here on.  Takes effect for
-  // segments opened after the call; existing fds keep their current mode, so
-  // the intended use is at construction (ssd.direct_io) rather than mid-run.
-  void SetColdRead(bool enable) override;
-
-  // True when segment I/O is actually bypassing the page cache.  False if
-  // direct I/O was never requested, or was requested and the probe failed.
-  bool direct_io_active() const { return direct_io_; }
 
  private:
   bool IsReadOnlyShared() const { return access_mode_ == SSDAccessMode::ReadOnlyShared; }
@@ -119,7 +134,31 @@ class SSDTier : public TierBackend {
   // (which reject the open) as well as devices needing coarser alignment.
   bool ProbeDirectIo() const;
 
-  bool EnsureActiveSegment(size_t need_bytes);
+  // Makes sure the active segment can take `need_bytes`, rolling to a new one
+  // if not.  A segment sealed by the roll that is already empty goes into
+  // `doomed`.
+  bool EnsureActiveSegment(size_t need_bytes, std::vector<segment::Meta>* doomed);
+  bool RollActiveSegmentLocked();
+  // A new segment is only opened while the filesystem still has a segment's
+  // worth of free space, so a drive something else is filling fails writes
+  // cleanly instead of with ENOSPC partway through a record.
+  bool HasRoomForNewSegment() const;
+
+  // If `segment_id` can be deleted, moves it from the index into `doomed`.  An
+  // emptied active segment is rolled past first.  Owner only.
+  void CollectReclaimableLocked(uint64_t segment_id, std::vector<segment::Meta>* doomed);
+  // Drops the pins a read or write took, collecting segments that were waiting
+  // only on them.
+  void UnpinLocked(const std::vector<uint64_t>& pinned, std::vector<segment::Meta>* doomed);
+  void ReleasePins(const std::vector<uint64_t>& pinned);
+  // Unlinks the doomed segments and closes (or parks) their fds.  Runs without
+  // mu_: deleting a multi-GiB file frees its extents, which takes milliseconds.
+  void DisposeSegments(std::vector<segment::Meta>* doomed);
+  // Closes a deleted segment's fd now, or after the retired-file grace.
+  void RetireFd(int fd);
+  // Closes parked fds whose grace has run out (all of them when `all`).
+  void SweepGraveyard(bool all, bool run_hook = true) const;
+
   bool RefreshFromDiskLocked(bool force_full_rescan);
   // Startup repair: truncate each segment to the last record the scanner could
   // parse.  Removes records from an older kRecordVersion and torn tails, both of
@@ -133,7 +172,6 @@ class SSDTier : public TierBackend {
   const segment::Meta* GetSegmentLocked(uint64_t segment_id) const;
   bool ReadRecordLocked(const std::string& key, void* dst, size_t size, uint32_t expected_crc,
                         uint64_t value_offset, int read_fd, bool crc_valid) const;
-  void RememberStatus(IoStatus status) const;
   // Issue one value read, transparently bouncing through an aligned buffer when
   // direct I/O is on and `dst`/`size` do not meet the alignment rules.
   IoStatus ReadValueInto(int fd, void* dst, size_t size, uint64_t value_offset) const;
@@ -146,6 +184,20 @@ class SSDTier : public TierBackend {
   UMBPSsdConfig ssd_config_;
   SSDAccessMode access_mode_;
   bool direct_io_ = false;
+  uint64_t segment_size_ = 0;
+
+  // Deleted segments whose fds wait out the retired-file grace.
+  struct RetiredFd {
+    int fd = -1;
+    std::chrono::steady_clock::time_point close_at;
+  };
+  mutable std::mutex graveyard_mu_;
+  mutable std::deque<RetiredFd> graveyard_;     // guarded by graveyard_mu_
+  std::function<void(int fd)> retired_hook_;    // guarded by graveyard_mu_
+  std::chrono::milliseconds retired_grace_{0};  // guarded by graveyard_mu_
+  std::atomic<uint64_t> segments_reclaimed_{0};
+  std::atomic<uint64_t> bytes_reclaimed_{0};
+  mutable std::atomic<uint64_t> no_room_refusals_{0};
 
   mutable std::mutex mu_;
   mutable std::mutex io_mu_;
@@ -153,12 +205,14 @@ class SSDTier : public TierBackend {
   segment::Index index_;
   segment::Scanner scanner_;
   std::unique_ptr<segment::Writer> writer_;
-  mutable IoStatus last_io_status_;
 
   // Reserved records awaiting commit, by RecordReservation::token.  Guarded by mu_.
   struct PendingRecord {
     segment::PreparedRecord prefix;
     int fd = -1;
+    // Its segment, and the replaced record's (see Write), kept until commit or
+    // abort: the value is written through `fd` outside the lock.
+    std::vector<uint64_t> pinned;
   };
   std::unordered_map<uint64_t, PendingRecord> pending_records_;
 };

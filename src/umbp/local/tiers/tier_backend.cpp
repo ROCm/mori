@@ -31,8 +31,6 @@ std::vector<char> TierBackend::Read(const std::string& key) { return {}; }
 
 TierCapabilities TierBackend::Capabilities() const { return {}; }
 
-const void* TierBackend::ReadPtr(const std::string& key, size_t* out_size) { return nullptr; }
-
 bool TierBackend::WriteBatch(const std::vector<std::string>& keys,
                              const std::vector<const void*>& data_ptrs,
                              const std::vector<size_t>& sizes) {
@@ -83,11 +81,6 @@ std::vector<std::string> TierBackend::GetLRUCandidates(size_t max_candidates) co
   std::string lru = GetLRUKey();
   if (lru.empty()) return {};
   return {lru};
-}
-
-std::optional<std::string> TierBackend::GetLocationId(const std::string& key) const {
-  (void)key;
-  return std::nullopt;
 }
 
 }  // namespace mori::umbp

@@ -297,8 +297,6 @@ bool PeerSsdManager::Evict(const std::string& key) {
   }
   auto it = owned_.find(key);
   if (it != owned_.end()) {  // still present (a racing ClearLocal could have dropped it)
-    metrics_.evict_victims.fetch_add(1, std::memory_order_relaxed);
-    metrics_.evict_bytes_freed.fetch_add(it->second.size, std::memory_order_relaxed);
     lru_.erase(it->second.lru_it);
     owned_.erase(it);
     if (event_publishing_) {
@@ -308,11 +306,42 @@ bool PeerSsdManager::Evict(const std::string& key) {
   return true;
 }
 
+bool PeerSsdManager::OrdersEviction() const {
+  return backend_ != nullptr && backend_->Capabilities().orders_eviction;
+}
+
+void PeerSsdManager::SetRetiredFileHook(std::function<void(int fd)> on_close,
+                                        std::chrono::milliseconds grace) {
+  if (backend_) backend_->SetRetiredFileHook(std::move(on_close), grace);
+}
+
 std::vector<EvictionOffer> PeerSsdManager::EvictionCandidates(size_t max_count) {
-  std::lock_guard<std::mutex> lock(mutex_);
   std::vector<EvictionOffer> candidates;
   if (max_count == 0) return candidates;
 
+  if (OrdersEviction()) {
+    // Ask the tier outside mutex_ (it ranks every segment), for enough extra
+    // keys that the ones filtered out below do not shorten the answer -- a
+    // short answer reads to the pool as "nothing more to offer".
+    size_t skipped = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      skipped = inflight_reads_.size() + evicting_.size();
+    }
+    const auto hints = backend_->EvictionOrder(max_count + skipped);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& hint : hints) {
+      if (candidates.size() >= max_count) break;
+      if (inflight_reads_.count(hint.key) != 0) continue;
+      if (evicting_.count(hint.key) != 0) continue;
+      // Not recorded yet (its write is still landing) or already gone.
+      if (owned_.find(hint.key) == owned_.end()) continue;
+      candidates.push_back(EvictionOffer{hint.key, hint.reclaim_bytes});
+    }
+    return candidates;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
   // Oldest first (LRU tail -> MRU front), skipping keys being read or evicted.
   for (auto it = lru_.rbegin(); it != lru_.rend() && candidates.size() < max_count; ++it) {
     const std::string& key = *it;

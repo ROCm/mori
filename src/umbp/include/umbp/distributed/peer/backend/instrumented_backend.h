@@ -83,10 +83,6 @@ class InstrumentedBackend final : public MediumBackend {
     return inner_->AcquireMigrationRead(key, resolved, allow_file_ref);
   }
   void ReleaseMigrationRead(const std::string& key) override { inner_->ReleaseMigrationRead(key); }
-  void ReleaseResolved(const std::vector<std::string>& keys,
-                       const std::vector<uint64_t>& lease_tokens) override {
-    inner_->ReleaseResolved(keys, lease_tokens);
-  }
   std::vector<KvEvent> DrainPendingEvents() override { return inner_->DrainPendingEvents(); }
   std::vector<KvEvent> SnapshotOwnedKeys() const override { return inner_->SnapshotOwnedKeys(); }
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
@@ -102,6 +98,7 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override {
     return inner_->EvictionCandidates(max_count);
   }
+  bool OwnsEvictionOrder() const override { return inner_->OwnsEvictionOrder(); }
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
     inner_->SetAutoFlushHook(threshold, std::move(cb));

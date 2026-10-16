@@ -43,8 +43,6 @@ enum class UMBPRole : int {
   SharedSSDFollower = 2,
 };
 
-static constexpr uint32_t kAutoRankId = UINT32_MAX;
-
 enum class UMBPSsdLayoutMode : int {
   SegmentedLog = 1,
 };
@@ -94,8 +92,10 @@ struct UMBPSsdConfig {
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
-  // Each segment file holds an fd for the tier's lifetime: at 4 GiB a 1.5 TB
-  // tier needs ~350, under the usual soft RLIMIT_NOFILE of 1,024.
+  // The unit disk is reclaimed in: evicted records keep their bytes until every
+  // record in their segment is gone and the file is deleted.  Each live segment
+  // also holds an fd: at 4 GiB a 1.5 TB tier needs ~350, under the usual soft
+  // RLIMIT_NOFILE of 1,024.  A tier smaller than 8 segments uses capacity / 8.
   size_t segment_size_bytes = 4ULL * 1024 * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
@@ -530,19 +530,6 @@ struct UMBPConfig {
     return true;
   }
 
-  UMBPRole ResolveRole() const {
-    if (role != UMBPRole::Standalone) {
-      return role;
-    }
-    if (follower_mode) {
-      return UMBPRole::SharedSSDFollower;
-    }
-    if (force_ssd_copy_on_write) {
-      return UMBPRole::SharedSSDLeader;
-    }
-    return UMBPRole::Standalone;
-  }
-
   bool Validate(std::string* error_message = nullptr) const {
     if (!ValidateStorageConfig(error_message)) return false;
     if (dram.capacity_bytes == 0) {
@@ -665,6 +652,7 @@ struct UMBPConfig {
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.segment_size_bytes = getenv_size("UMBP_SSD_SEGMENT_SIZE", cfg.ssd.segment_size_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
     cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;

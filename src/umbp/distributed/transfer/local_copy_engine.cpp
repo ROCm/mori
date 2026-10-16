@@ -37,6 +37,8 @@
 #include <utility>
 #include <vector>
 
+#include "umbp/distributed/transfer/plan_builder.h"
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -83,24 +85,6 @@ inline bool NtSupported() { return __builtin_cpu_supports("avx2"); }
 inline void NtCopyAvx2(char* d, const char* s, size_t n) { std::memcpy(d, s, n); }
 inline bool NtSupported() { return false; }
 #endif
-
-// True iff [next, ...) is exactly adjacent after [base, base+len).
-inline bool AdjacentNoOverflow(size_t base, size_t len, size_t next) {
-  return len <= std::numeric_limits<size_t>::max() - base && base + len == next;
-}
-
-struct PtrPairKey {
-  const void* src;
-  const void* dst;
-  bool operator==(const PtrPairKey& o) const noexcept { return src == o.src && dst == o.dst; }
-};
-struct PtrPairKeyHash {
-  size_t operator()(const PtrPairKey& k) const noexcept {
-    size_t h = std::hash<const void*>{}(k.src);
-    h ^= std::hash<const void*>{}(k.dst) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-  }
-};
 
 // Every plan this engine produces is executed before Submit returns, so the
 // handle only has to replay the outcome.
@@ -355,8 +339,6 @@ int CopyThreads(size_t total_bytes, size_t copy_count) {
 // Set on a worker thread at start-up; read by CopyThreads above.
 void MarkThreadBackgroundCopies() { ThreadBackgroundFlag() = true; }
 
-bool ThreadDoesBackgroundCopies() { return ThreadBackgroundFlag(); }
-
 void HostCopyBlock(void* dst, const void* src, size_t size) {
   static const bool kNt = NtSupported() && !(std::getenv("UMBP_DRAM_NT_COPY") &&
                                              std::getenv("UMBP_DRAM_NT_COPY")[0] == '0');
@@ -377,57 +359,11 @@ bool LocalCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) 
          dst.loc == mori::io::MemoryLocationType::CPU;
 }
 
-TransferPlanSet LocalCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
-  pair_to_plan.reserve(items.size() * 2);
-
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst)) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
-    }
-    // Bounds are checked here, once, rather than per copy: a page index that
-    // does not fit its buffer is a bug in the backend's slot bookkeeping, and
-    // the key must be failed rather than copied past the end.
-    if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
-        item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
-    }
-
-    const PtrPairKey key{item.src.host_ptr, item.dst.host_ptr};
-    auto it = pair_to_plan.find(key);
-    size_t pi;
-    if (it == pair_to_plan.end()) {
-      pi = out.plans.size();
-      pair_to_plan.emplace(key, pi);
-      TransferPlan plan;
-      plan.src = item.src;
-      plan.dst = item.dst;
-      plan.dir = TransferDirection::kLocal;
-      out.plans.push_back(std::move(plan));
-    } else {
-      pi = it->second;
-    }
-    TransferPlan& plan = out.plans[pi];
-    const size_t so = static_cast<size_t>(item.src_offset);
-    const size_t dof = static_cast<size_t>(item.dst_offset);
-    const size_t sz = static_cast<size_t>(item.size);
-    const bool can_coalesce = !plan.sizes.empty() &&
-                              AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
-                              AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof);
-    if (can_coalesce) {
-      plan.sizes.back() += sz;
-    } else {
-      plan.src_offsets.push_back(so);
-      plan.dst_offsets.push_back(dof);
-      plan.sizes.push_back(sz);
-    }
-    if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
-  }
-  return out;
+std::unique_ptr<TransferPlanBuilder> LocalCopyEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
+  return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {
+    AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
+  });
 }
 
 std::unique_ptr<TransferHandle> LocalCopyEngine::Submit(std::vector<TransferPlan> plans) {
