@@ -322,6 +322,7 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
     // so keep them pinned to engine 0.
     if (isGfx1250(srcNode)) {
       uint32_t mask = getHostLinkEngineMask(srcNode);
+      if (!mask) mask = getAnyLinkEngineMask(srcNode);
       for (uint32_t b = 0; b < 32; ++b) {
         if (mask & (1u << b)) engines.push_back(b);
       }
@@ -415,6 +416,19 @@ uint32_t AnvilLib::getHostLinkEngineMask(int srcNode) {
     if (link.RecSdmaEngIdMask) return link.RecSdmaEngIdMask;
   }
   return 0;
+}
+
+uint32_t AnvilLib::getAnyLinkEngineMask(int srcNode) {
+  HsaNodeProperties props{};
+  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0)
+    return 0;
+  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
+  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
+      HSAKMT_STATUS_SUCCESS)
+    return 0;
+  uint32_t mask = 0;
+  for (const auto& link : links) mask |= link.RecSdmaEngIdMask;
+  return mask;
 }
 
 // gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
