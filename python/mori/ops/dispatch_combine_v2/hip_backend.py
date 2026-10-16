@@ -112,6 +112,32 @@ def _geometry_from_env(name):
     return parts
 
 
+# SDMA queues per GPU pair that an arch is known to fit, when AsyncLL would
+# otherwise ask for one per peer. Only archs that CANNOT hold the full eight
+# belong here; everything else keeps the peer count.
+#
+# gfx942 (MI300X/MI308X): its xGMI engines fold to the even ids {2,4,6} and
+# ROCr's own blit queues take part of that, so three is what a pair fits. Asking
+# for eight on 8xMI308X returns HSAKMT_STATUS_NO_MEMORY from hsaKmtCreateQueueExt
+# and anvil exit()s the process; with three the AsyncLL suite passes there.
+_ASYNCLL_SDMA_QUEUE_CAP = {"gfx942": 3}
+
+
+def _asyncll_sdma_queues(arch: str, gpu_per_node: int) -> int:
+    """How many SDMA queues per pair to ask cco for, 0 to leave the env default.
+
+    An explicit MORI_SDMA_NUM_CHANNELS is the operator saying what this machine
+    can take, so it wins: returning 0 lets cco fall through to it. Without that
+    deference this request silently beat the env knob, and the only way out of
+    the gfx942 abort was to edit the source.
+    """
+    if os.environ.get("MORI_SDMA_NUM_CHANNELS"):
+        return 0
+    want = min(8, max(1, gpu_per_node))
+    cap = _ASYNCLL_SDMA_QUEUE_CAP.get(arch)
+    return min(want, cap) if cap else want
+
+
 def _raw_stream(device_index: int) -> int:
     """The current stream on `device_index`, as a raw pointer.
 
@@ -412,7 +438,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # communicator, not off the window -- which is why the test is not just
         # is_internode.
         self._dev_comm = (
-            self._make_dev_comm(cfg, comm)
+            self._make_dev_comm(cfg, comm, self._arch)
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
@@ -506,7 +532,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     # in a backend of its own.
 
     @staticmethod
-    def _make_dev_comm(cfg, comm):
+    def _make_dev_comm(cfg, comm, arch=""):
         """The communicator the internode kernels take by value.
 
         Two requirements the defaults do not meet, made here so no caller has to
@@ -545,7 +571,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # fewer queues than peers folds two warps onto one queue -- correct,
             # but they then serialise on its in-order commit chain. Eight is the
             # hardware cap; above it cco clamps with a warning.
-            requirements.sdma_queue_count = min(8, max(1, cfg.gpu_per_node))
+            #
+            # The count is a PERFORMANCE knob, not a correctness one, and asking
+            # for more than a pair can hold is fatal rather than degrading:
+            # anvil's queue creation is CHECK_HSAKMT_SUCCESS, which exit()s. On
+            # 8xMI308X, 8 queues per pair gets HSAKMT_STATUS_NO_MEMORY from
+            # hsaKmtCreateQueueExt and every rank leaves the process -- its xGMI
+            # engines fold to the even ids {2,4,6} and ROCr's own blit queues
+            # take part of that, so three is what fits. With <= 3 the whole
+            # AsyncLL suite passes there, which is why this clamps rather than
+            # trying to recover: by the time the request is refused the process
+            # is already gone.
+            requirements.sdma_queue_count = _asyncll_sdma_queues(arch, cfg.gpu_per_node)
         handle = DevCommHandle(comm, requirements=requirements)
 
         # A rejected handle still owns its QPs, so every exit below its
