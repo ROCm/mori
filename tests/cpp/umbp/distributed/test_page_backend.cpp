@@ -441,6 +441,55 @@ TEST(PageBackend, ALocalHoldFencesEvictionUntilDropped) {
   EXPECT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
 }
 
+// ---- Check-after-read (remote readers, #749) --------------------------------
+
+// A remote reader's lease is a timer that can lapse mid-read.  BatchStillHolds
+// is how it learns afterwards whether the pages it read were freed and refilled
+// under it — here, by the same key, which is the case a key check alone misses.
+TEST(PageBackend, StillHoldsUntilTheCopyIsFreed) {
+  auto a = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{1});
+  auto p = AllocateOk(*a, "k", kPageSize);
+  uint64_t committed_bytes = 0;
+  ASSERT_TRUE(a->Commit(p->slot_id, "k", committed_bytes));
+
+  const uint64_t gen = a->BatchResolve({"k"}, false)[0].generation;
+  ASSERT_NE(gen, 0u) << "a page medium must stamp its copies";
+  EXPECT_EQ(a->Resolve("k").generation, gen) << "same copy, same generation";
+  EXPECT_EQ(a->BatchStillHolds({"k"}, {gen}), std::vector<bool>{true});
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});  // the lease lapses
+  ASSERT_EQ(a->Evict({"k"})[0].bytes_freed, kPageSize);
+  EXPECT_EQ(a->BatchStillHolds({"k"}, {gen}), std::vector<bool>{false});
+
+  auto p2 = AllocateOk(*a, "k", kPageSize);
+  ASSERT_TRUE(p2.has_value());
+  ASSERT_TRUE(a->Commit(p2->slot_id, "k", committed_bytes));
+  const uint64_t gen2 = a->BatchResolve({"k"}, false)[0].generation;
+  EXPECT_NE(gen2, gen);
+  EXPECT_EQ(a->BatchStillHolds({"k", "k"}, {gen, gen2}), (std::vector<bool>{false, true}));
+}
+
+TEST(PageBackend, StillHoldsAfterClearLocalAndForUnstampedReads) {
+  auto a = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{1});
+  uint64_t committed_bytes = 0;
+  auto pa = AllocateOk(*a, "a", kPageSize);
+  auto pb = AllocateOk(*a, "b", kPageSize);
+  ASSERT_TRUE(a->Commit(pa->slot_id, "a", committed_bytes));
+  ASSERT_TRUE(a->Commit(pb->slot_id, "b", committed_bytes));
+  const auto r = a->BatchResolve({"a", "b"}, false);
+  EXPECT_NE(r[0].generation, r[1].generation) << "one counter, never shared by two copies";
+
+  // Another key's generation does not vouch for this key; 0 is not checkable.
+  EXPECT_EQ(a->BatchStillHolds({"a", "a", "ghost", "ghost"},
+                               {r[0].generation, r[1].generation, r[0].generation, 0}),
+            (std::vector<bool>{true, false, false, true}));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  a->ClearLocal();
+  EXPECT_EQ(a->BatchStillHolds({"a", "b"}, {r[0].generation, r[1].generation}),
+            (std::vector<bool>{false, false}));
+}
+
 // ---- Full-sync snapshot -----------------------------------------------------
 
 TEST(PageBackend, SnapshotOwnedKeysReturnsEveryAdd) {

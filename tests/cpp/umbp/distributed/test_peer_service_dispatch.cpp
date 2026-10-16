@@ -44,6 +44,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -66,9 +67,14 @@ constexpr TierType kSecondByTier = TierType::DRAM;
 
 class PeerServiceDispatchTest : public ::testing::Test {
  protected:
+  // What SetUp registers for each tier; a fixture can swap in a mock subclass.
+  virtual std::unique_ptr<MockBackend> MakeMedium(TierType tier) {
+    return std::make_unique<MockBackend>(tier);
+  }
+
   void SetUp() override {
-    registry_.Register(std::make_unique<MockBackend>(kFirstByTier));
-    registry_.Register(std::make_unique<MockBackend>(kSecondByTier));
+    registry_.Register(MakeMedium(kFirstByTier));
+    registry_.Register(MakeMedium(kSecondByTier));
     pool_ = std::make_unique<PeerPool>(&registry_, MakeSingleBackendPolicy());
 
     // OS-assigned ports are not reachable through PeerServiceServer::Start
@@ -606,6 +612,120 @@ TEST(PeerServicePortExclusivity, SecondServerCannotBindTheSamePort) {
 
   second.Stop();
   first.Stop();
+}
+
+// ---- ValidateReads (check-after-read, #749) ---------------------------------
+
+// A MockBackend that stamps copies the way the real media do: a fresh
+// generation at every commit, gone once the copy is evicted.
+class StampingMockBackend final : public MockBackend {
+ public:
+  using MockBackend::MockBackend;
+
+  std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override {
+    auto out = MockBackend::BatchCommit(entries);
+    std::lock_guard<std::mutex> lock(gen_mutex_);
+    for (size_t i = 0; i < entries.size() && i < out.size(); ++i) {
+      if (out[i].success) generations_[entries[i].key] = NextCopyGeneration();
+    }
+    return out;
+  }
+
+  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override {
+    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+    std::lock_guard<std::mutex> lock(gen_mutex_);
+    for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
+      auto it = generations_.find(keys[i]);
+      if (out[i].found && it != generations_.end()) out[i].generation = it->second;
+    }
+    return out;
+  }
+
+  std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override {
+    auto out = MockBackend::Evict(keys);
+    std::lock_guard<std::mutex> lock(gen_mutex_);
+    for (const auto& r : out) {
+      if (r.bytes_freed > 0) generations_.erase(r.key);
+    }
+    return out;
+  }
+
+  std::vector<bool> BatchStillHolds(const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& generations) const override {
+    std::vector<bool> out(keys.size(), false);
+    std::lock_guard<std::mutex> lock(gen_mutex_);
+    for (size_t i = 0; i < keys.size() && i < generations.size(); ++i) {
+      auto it = generations_.find(keys[i]);
+      out[i] = generations[i] == 0 || (it != generations_.end() && it->second == generations[i]);
+    }
+    return out;
+  }
+
+ private:
+  mutable std::mutex gen_mutex_;
+  std::map<std::string, uint64_t> generations_;
+};
+
+class PeerServiceValidateReadsTest : public PeerServiceDispatchTest {
+ protected:
+  std::unique_ptr<MockBackend> MakeMedium(TierType tier) override {
+    return std::make_unique<StampingMockBackend>(tier);
+  }
+
+  std::vector<bool> Validate(const ::umbp::BatchResolveKeysResponse& resolved,
+                             const std::vector<std::string>& keys) {
+    ::umbp::ValidateReadsRequest req;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      req.add_keys(keys[i]);
+      req.add_backend_id(resolved.backend_id(static_cast<int>(i)));
+      req.add_generation(resolved.generation(static_cast<int>(i)));
+    }
+    ::umbp::ValidateReadsResponse resp;
+    grpc::ClientContext ctx;
+    EXPECT_TRUE(stub_->ValidateReads(&ctx, req, &resp).ok());
+    return std::vector<bool>(resp.still_valid().begin(), resp.still_valid().end());
+  }
+};
+
+// The whole #749 window over the wire: a reader resolves, the copy is freed and
+// the key refilled while it reads, and the check afterwards says so — for the
+// copy that changed only, on whichever medium served it.
+TEST_F(PeerServiceValidateReadsTest, AReadIsVouchedForUntilItsCopyIsReplaced) {
+  Mock(kFirstByTier)->PublishBuffers(1, 0xA1);
+  Mock(kSecondByTier)->PublishBuffers(1, 0xB2);
+  SeedKey(kFirstByTier, "a", 8);
+  SeedKey(kSecondByTier, "b", 8);
+
+  ::umbp::BatchResolveKeysRequest req;
+  req.add_keys("a");
+  req.add_keys("b");
+  ::umbp::BatchResolveKeysResponse resolved;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->BatchResolveKeys(&ctx, req, &resolved).ok());
+  ASSERT_EQ(resolved.generation_size(), 2);
+  EXPECT_NE(resolved.generation(0), 0u);
+  EXPECT_NE(resolved.generation(1), 0u);
+
+  EXPECT_EQ(Validate(resolved, {"a", "b"}), (std::vector<bool>{true, true}));
+
+  ASSERT_EQ(Backend(kFirstByTier)->Evict({"a"})[0].bytes_freed, 8u);
+  SeedKey(kFirstByTier, "a", 8);  // same key, new copy: a key check alone says "fine"
+  EXPECT_EQ(Validate(resolved, {"a", "b"}), (std::vector<bool>{false, true}));
+}
+
+TEST_F(PeerServiceValidateReadsTest, RejectsArraysOfDifferentLengths) {
+  ::umbp::ValidateReadsRequest req;
+  req.add_keys("a");
+  req.add_keys("b");
+  req.add_backend_id(0);
+  req.add_generation(1);
+  req.add_generation(2);
+  ::umbp::ValidateReadsResponse resp;
+  grpc::ClientContext ctx;
+  EXPECT_EQ(stub_->ValidateReads(&ctx, req, &resp).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);
 }
 
 }  // namespace

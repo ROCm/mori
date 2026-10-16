@@ -399,6 +399,7 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entries[i].backend_id = result.backend_id;
       entries[i].size = r.size;
       entries[i].pages = std::move(r.pages);
+      entries[i].generation = r.generation;
       total_bytes += r.size;
 
       if (omit_descs) continue;
@@ -417,6 +418,30 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     EncodeBatchResolveResponse(entries, registry_ == nullptr ? 0 : registry_->PageSize(),
                                batch_descs, response);
     RecordInboundGet(total_bytes, "remote");
+    return grpc::Status::OK;
+  }
+
+  // A remote reader's read lease is only a timer: once it lapses, the pages it
+  // resolved can be freed and refilled while its RDMA read still runs.  It asks
+  // afterwards: is each copy it read still the one this peer resolved?
+  // Read-only; it neither takes nor extends a lease.
+  grpc::Status ValidateReads(grpc::ServerContext* /*ctx*/,
+                             const ::umbp::ValidateReadsRequest* request,
+                             ::umbp::ValidateReadsResponse* response) override {
+    const int n = request->keys_size();
+    if (request->backend_id_size() != n || request->generation_size() != n) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "ValidateReads: keys, backend_id and generation differ in length");
+    }
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    std::vector<uint32_t> backend_ids(request->backend_id().begin(), request->backend_id().end());
+    std::vector<uint64_t> generations(request->generation().begin(), request->generation().end());
+    auto valid = pool_ == nullptr ? std::vector<bool>(keys.size(), false)
+                                  : pool_->ValidateResolved(backend_ids, keys, generations);
+    response->mutable_still_valid()->Reserve(n);
+    for (int i = 0; i < n; ++i) {
+      response->add_still_valid(static_cast<size_t>(i) < valid.size() && valid[i]);
+    }
     return grpc::Status::OK;
   }
 

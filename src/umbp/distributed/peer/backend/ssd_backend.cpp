@@ -494,6 +494,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
     }
     out.size = lease.size;
     out.page_size = cfg_.page_size;
+    out.generation = lease.generation;
     if (include_descs && !buffer_desc_.empty()) {
       out.descs = {BufferMemoryDescBytes{kStagingBufferIndex, buffer_desc_}};
     }
@@ -656,8 +657,8 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       const auto lease_deadline = local ? std::chrono::steady_clock::time_point{}
                                         : std::chrono::steady_clock::now() + cfg_.read_lease_ttl;
       auto [it, inserted] = read_leases_.emplace(
-          keys[primary],
-          ReadLease{spans[j], outcomes[j].size, lease_deadline, std::make_shared<char>()});
+          keys[primary], ReadLease{spans[j], outcomes[j].size, lease_deadline,
+                                   std::make_shared<char>(), NextCopyGeneration()});
       if (!inserted) {
         ReleaseStagingSpanLocked(spans[j]);
         if (!local) it->second.expires_at = lease_deadline;
@@ -726,6 +727,26 @@ void SsdBackend::ReleaseMigrationRead(const std::string& key) {
 
 bool SsdBackend::Contains(const std::string& key) const {
   return ssd_ != nullptr && ssd_->Exists(key);
+}
+
+// A remote reader copies out of a staging span, not the drive, so the copy is
+// good only while the lease it resolved is still the one in the table.  Any
+// reclaim drops the lease, and a re-stage of the same key draws a new
+// generation, so an equal generation means the span was never handed out again.
+std::vector<bool> SsdBackend::BatchStillHolds(const std::vector<std::string>& keys,
+                                              const std::vector<uint64_t>& generations) const {
+  std::vector<bool> out(keys.size(), false);
+  std::lock_guard<std::mutex> lk(mutex_);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    const uint64_t gen = i < generations.size() ? generations[i] : 0;
+    if (gen == 0) {
+      out[i] = true;
+      continue;
+    }
+    auto it = read_leases_.find(keys[i]);
+    out[i] = it != read_leases_.end() && it->second.generation == gen;
+  }
+  return out;
 }
 
 std::vector<EvictResult> SsdBackend::Evict(const std::vector<std::string>& keys) {

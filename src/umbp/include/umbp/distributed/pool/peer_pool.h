@@ -133,6 +133,13 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // After a remote reader's copy: is each (backend, key, generation) it was
+  // resolved against still the copy here?  False when the backend is gone or
+  // the copy was freed or replaced since, so the reader drops what it read.
+  // The three vectors are parallel; one answer per key, in order.
+  std::vector<bool> ValidateResolved(const std::vector<uint32_t>& backend_ids,
+                                     const std::vector<std::string>& keys,
+                                     const std::vector<uint64_t>& generations);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
