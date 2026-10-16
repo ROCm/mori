@@ -835,6 +835,16 @@ void PageBackend::TouchLru(const std::string& key, OwnedSlot& slot) {
   TouchLruLocked(key, slot);
 }
 
+void PageBackend::Touch(const std::vector<std::string>& keys) {
+  if (!track_eviction_order_) return;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lru_lock(lru_mutex_);
+  for (const auto& key : keys) {
+    auto it = owned_.find(key);
+    if (it != owned_.end()) TouchLruLocked(key, it->second);
+  }
+}
+
 void PageBackend::RemoveFromLru(OwnedSlot& slot) {
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   RemoveFromLruLocked(slot);

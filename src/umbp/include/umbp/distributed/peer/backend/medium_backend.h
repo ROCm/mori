@@ -329,6 +329,10 @@ class MediumBackend : public MetricSource {
   // keys picked by recency alone can leave every segment partly live.
   virtual bool OwnsEvictionOrder() const { return false; }
 
+  // Renew these keys' recency without reading them: a client looked them up to
+  // load next.  No-op for keys not held, or when no order is kept.
+  virtual void Touch(const std::vector<std::string>& /*keys*/) {}
+
   // ---- observability ----
   //
   // A backend does NOT report its own operation counts, byte volumes or

@@ -745,6 +745,21 @@ TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
   EXPECT_EQ(offers.size(), 2u);
 }
 
+// A client loads what its lookup found seconds later; evicting it in between fails the load.
+TEST_F(SsdBackendTest, PoolLookupRenewsTheKeysEvictionOrder) {
+  SsdBackend* ssd = Start();
+  ASSERT_TRUE(Put(ssd, "a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(ssd, "b", Payload(1024, 2)));
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("ssd", std::move(backend_)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+
+  ASSERT_TRUE(pool.BatchContains({"a"})[0]);
+  const auto offers = ssd->EvictionCandidates(10);
+  ASSERT_EQ(offers.size(), 2u);
+  EXPECT_EQ(offers[0].key, "b");
+}
+
 TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
   // SSD's watermark eviction now runs in the pool and reaches it via Evict().
   constexpr uint64_t kCapacity = 1024 * 1024;

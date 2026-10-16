@@ -147,6 +147,9 @@ class TierBackend {
   // that set TierCapabilities::orders_eviction.  Frees nothing.  Default: none.
   virtual std::vector<EvictionHint> EvictionOrder(size_t /*max_keys*/) { return {}; }
 
+  // Marks held keys recently used, as a read would, without reading them.
+  virtual void Touch(const std::vector<std::string>& /*keys*/) {}
+
   // For tiers that delete whole files as space is freed.  |on_close| runs with
   // each deleted file's fd just before it is closed, and the close waits
   // |grace| after the delete: an fd handed out by LocateRecord() may still be
