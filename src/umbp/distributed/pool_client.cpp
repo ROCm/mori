@@ -5062,6 +5062,7 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
     // below.
     if (default_pool_ != nullptr) {
       const auto local = default_pool_->BatchContains(keys);
+      default_pool_->TraceLookup(keys, local);
       for (size_t i = 0; i < keys.size() && i < local.size(); ++i) out[i] = local[i];
     }
     for (size_t i = 0; i < keys.size(); ++i) {
