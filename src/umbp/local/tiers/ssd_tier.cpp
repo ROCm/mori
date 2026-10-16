@@ -1352,16 +1352,18 @@ std::optional<std::string> SSDTier::GetLocationId(const std::string& key) const 
 // The fd handed out is not pinned: the zero-copy reader never says when it is
 // done.  A deleted segment's fd stays open for the retired-file grace instead
 // (SetRetiredFileHook), and the bytes under it are never rewritten meanwhile.
-std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) const {
+std::optional<RecordLocation> SSDTier::LocateRecord(const std::string& key) {
   std::lock_guard<std::mutex> lock(mu_);
   const auto* meta = index_.FindKey(key);
   if (!meta && IsReadOnlyShared()) {
-    const_cast<SSDTier*>(this)->RefreshFromDiskLocked(false);
+    RefreshFromDiskLocked(false);
     meta = index_.FindKey(key);
   }
   if (!meta) return std::nullopt;
   const auto* seg = GetSegmentLocked(meta->segment_id);
   if (!seg || seg->fd < 0) return std::nullopt;
+  // A zero-copy read is still a read; without this EvictionOrder never sees it.
+  index_.TouchLRU(key);
   RecordLocation loc;
   loc.fd = seg->fd;
   loc.value_offset = meta->value_offset;

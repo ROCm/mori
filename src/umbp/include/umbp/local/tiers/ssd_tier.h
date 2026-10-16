@@ -112,7 +112,7 @@ class SSDTier : public TierBackend {
   // Segment size in effect: ssd.segment_size_bytes, capped for a small tier.
   uint64_t segment_size() const { return segment_size_; }
   std::optional<std::string> GetLocationId(const std::string& key) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
 
   // The uncommitted prefix goes down at reserve, so the log stays parseable and
   // the scanner skips the record until CommitRecord flips its flag.

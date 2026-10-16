@@ -85,7 +85,7 @@ class ShardedSsdTier : public TierBackend {
                           std::chrono::milliseconds grace) override;
   TierSpaceStats SpaceStats() const override;
   std::optional<std::string> GetLocationId(const std::string& key) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
   std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
   bool CommitRecord(const std::string& key, const RecordReservation& r) override;
   void AbortRecord(const std::string& key, const RecordReservation& r) override;
