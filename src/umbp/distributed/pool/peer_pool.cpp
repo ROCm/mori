@@ -71,6 +71,13 @@ constexpr auto kRankedCandidatesMinInterval = std::chrono::milliseconds(200);
 // slower answer is taken when ready, unless older than the max age.
 constexpr auto kRankedCandidatesWait = std::chrono::milliseconds(20);
 constexpr auto kRankedCandidatesMaxAge = std::chrono::seconds(3);
+// F8 diagnostic: how long a lookup's keys are watched, and log sampling.
+constexpr auto kLookupTraceWindow = std::chrono::seconds(30);
+bool LookupTraceShouldLog(uint64_t n) { return n <= 64 || n % 1000 == 0; }
+int64_t MsSince(std::chrono::steady_clock::time_point t,
+                std::chrono::steady_clock::time_point now) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count();
+}
 
 uint64_t UsedBytes(const TierCapacity& capacity) {
   return capacity.total_bytes > capacity.available_bytes
@@ -136,6 +143,7 @@ void PeerPool::DropEvictedCopyLocked(const TransitionJob& job) {
   const auto evicted = source->Evict({job.key});
   if (!evicted.empty() && evicted.front().bytes_freed > 0) ++transition_metrics_.dropped;
   RepairAfterDropLocked(job.key);
+  TraceDropLocked(job.key, job.source_backend_id);
 }
 
 void PeerPool::StopTransitionWorker() {
@@ -167,6 +175,88 @@ void PeerPool::ForgetAccessLocked(const std::string& key) {
   if (access == last_access_.end()) return;
   access_order_.erase(access->second);
   last_access_.erase(access);
+}
+
+void PeerPool::TraceLookup(const std::vector<std::string>& keys, const std::vector<bool>& found) {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(lookup_trace_mutex_);
+  // Expire old entries; one a later lookup refreshed goes to the back again.
+  while (!lookup_trace_order_.empty() &&
+         now - lookup_trace_order_.front().first > kLookupTraceWindow) {
+    auto it = lookup_trace_.find(lookup_trace_order_.front().second);
+    if (it != lookup_trace_.end()) {
+      if (now - it->second.looked_up > kLookupTraceWindow) {
+        lookup_trace_.erase(it);
+      } else {
+        lookup_trace_order_.emplace_back(it->second.looked_up, it->first);
+      }
+    }
+    lookup_trace_order_.pop_front();
+  }
+  for (size_t i = 0; i < keys.size() && i < found.size(); ++i) {
+    if (!found[i]) continue;
+    auto [it, inserted] = lookup_trace_.try_emplace(keys[i]);
+    it->second = LookupTrace{now};
+    if (inserted) lookup_trace_order_.emplace_back(now, keys[i]);
+  }
+}
+
+PeerPool::LookupTraceCounts PeerPool::LookupTraceStats() const {
+  std::lock_guard<std::mutex> lock(lookup_trace_mutex_);
+  return lookup_trace_counts_;
+}
+
+void PeerPool::TraceReadsLocked(const std::vector<std::string>& keys,
+                                const std::vector<PoolResolvedEntry>& out) {
+  std::lock_guard<std::mutex> lock(lookup_trace_mutex_);
+  if (lookup_trace_.empty()) return;
+  const auto now = std::chrono::steady_clock::now();
+  for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
+    if (!out[i].resolved.found) continue;
+    auto it = lookup_trace_.find(keys[i]);
+    if (it != lookup_trace_.end()) it->second.read = now;
+  }
+}
+
+void PeerPool::TraceDropLocked(const std::string& key, uint32_t backend_id) {
+  if (placements_.count(key) != 0) return;  // another copy survives
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(lookup_trace_mutex_);
+  auto it = lookup_trace_.find(key);
+  if (it == lookup_trace_.end() || now - it->second.looked_up > kLookupTraceWindow) return;
+  auto& trace = it->second;
+  auto* backend = backends_ == nullptr ? nullptr : backends_->Get(backend_id);
+  trace.dropped = now;
+  trace.dropped_from = backend == nullptr ? "?" : TierTypeName(backend->Tier());
+  const bool unread = trace.read == std::chrono::steady_clock::time_point{};
+  const uint64_t n =
+      unread ? ++lookup_trace_counts_.drops_unread : ++lookup_trace_counts_.drops_read;
+  if (!LookupTraceShouldLog(n)) return;
+  MORI_UMBP_WARN(
+      "[PeerPool] lookup trace: dropped the last copy of '{}' from {} {} ms after a lookup found "
+      "it, {} [{} such drops]",
+      key, trace.dropped_from, MsSince(trace.looked_up, now),
+      unread ? std::string("never read since")
+             : "last read " + std::to_string(MsSince(trace.read, now)) + " ms ago",
+      n);
+}
+
+void PeerPool::TraceMissLocked(const std::string& key) {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(lookup_trace_mutex_);
+  auto it = lookup_trace_.find(key);
+  if (it == lookup_trace_.end() || now - it->second.looked_up > kLookupTraceWindow) return;
+  const auto& trace = it->second;
+  const uint64_t n = ++lookup_trace_counts_.misses;
+  if (!LookupTraceShouldLog(n)) return;
+  MORI_UMBP_WARN(
+      "[PeerPool] lookup trace: get missed '{}', which a lookup found {} ms ago; {} [{} misses]",
+      key, MsSince(trace.looked_up, now),
+      trace.dropped == std::chrono::steady_clock::time_point{}
+          ? std::string("no eviction here dropped its last copy")
+          : "eviction dropped its last copy from " + trace.dropped_from + " " +
+                std::to_string(MsSince(trace.dropped, now)) + " ms ago",
+      n);
 }
 
 bool PeerPool::PromoteOnReadLocked(const std::string& key,
@@ -907,6 +997,9 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
         ++tier_read_hits_[tier_graph_->NameForBackend(out[i].backend_id)];
       }
     } else {
+      if (EffectiveResolveOutcome(out[i].resolved) != ResolveOutcome::kBusy) {
+        TraceMissLocked(keys[i]);
+      }
       // A concurrent commit or transition changed the placement after the
       // snapshot; its publication is newer than this miss and must win.
       if (!placement_unchanged(i)) continue;
@@ -922,6 +1015,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
       ForgetAccessLocked(keys[i]);
     }
   }
+  TraceReadsLocked(keys, out);
   return out;
 }
 
@@ -1118,7 +1212,9 @@ std::vector<PoolEvictResult> PeerPool::Evict(const std::vector<PoolEvictRequest>
 
   std::unordered_set<std::string> repaired;
   for (const auto& [index, backend_id] : drops) {
-    if (repaired.insert(requests[index].key).second) RepairAfterDropLocked(requests[index].key);
+    if (!repaired.insert(requests[index].key).second) continue;
+    RepairAfterDropLocked(requests[index].key);
+    TraceDropLocked(requests[index].key, backend_id);
   }
   return out;
 }

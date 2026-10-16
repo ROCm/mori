@@ -428,6 +428,22 @@ TEST(PeerPool, ClearDropsPhysicalAndLogicalState) {
   EXPECT_EQ(registry.Get("dram")->OwnedKeyCount(), 0u);
 }
 
+// F8 diagnostic: a looked-up key dropped before any read, then missed, is counted.
+TEST(PeerPool, LookupTraceCountsADropBeforeReadAndItsMiss) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "k");
+  pool.TraceLookup({"k", "absent"}, pool.BatchContains({"k", "absent"}));
+
+  pool.Evict(std::vector<std::string>{"k"}, PoolEvictMode::kReclaim);
+  EXPECT_FALSE(pool.BatchResolve({"k"}, false, false, ResolveReader::kLocal)[0].resolved.found);
+  const auto counts = pool.LookupTraceStats();
+  EXPECT_EQ(counts.drops_unread, 1u);
+  EXPECT_EQ(counts.drops_read, 0u);
+  EXPECT_EQ(counts.misses, 1u);
+}
+
 TEST(PeerPool, BatchResultsRemainPositionalAcrossBackends) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("dram_a", std::make_unique<MockBackend>(TierType::DRAM)));

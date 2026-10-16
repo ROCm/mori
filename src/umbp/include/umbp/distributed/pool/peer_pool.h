@@ -135,6 +135,15 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // Diagnostic (F8): a client lookup found these keys.  For the next 30 s,
+  // dropping one's last copy, or missing it on a get, is logged.
+  void TraceLookup(const std::vector<std::string>& keys, const std::vector<bool>& found);
+  struct LookupTraceCounts {
+    uint64_t drops_unread = 0;  // last copy dropped before any read since the lookup
+    uint64_t drops_read = 0;    // last copy dropped after a read
+    uint64_t misses = 0;        // a get missed a looked-up key
+  };
+  LookupTraceCounts LookupTraceStats() const;
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
@@ -237,6 +246,11 @@ class PeerPool {
   // Re-points the placement at a surviving copy (or forgets the key); drops
   // run unlocked, so it re-checks the backends.
   void RepairAfterDropLocked(const std::string& key);
+  // Lookup trace hooks; callers hold operation_mutex_ (it orders before the trace lock).
+  void TraceReadsLocked(const std::vector<std::string>& keys,
+                        const std::vector<PoolResolvedEntry>& out);
+  void TraceDropLocked(const std::string& key, uint32_t backend_id);
+  void TraceMissLocked(const std::string& key);
   // Queues at most `max_count` offload candidates for one tier, oldest first,
   // and reports how many it queued. Bounded on purpose: a peer can hold
   // millions of placements, so neither the scan nor the queue may be
@@ -270,6 +284,16 @@ class PeerPool {
   // it; later policies can shard the protected state by key without changing
   // the public interface.
   mutable std::mutex operation_mutex_;
+  struct LookupTrace {
+    std::chrono::steady_clock::time_point looked_up;
+    std::chrono::steady_clock::time_point read{};
+    std::chrono::steady_clock::time_point dropped{};
+    std::string dropped_from;
+  };
+  mutable std::mutex lookup_trace_mutex_;
+  std::unordered_map<std::string, LookupTrace> lookup_trace_;
+  std::deque<std::pair<std::chrono::steady_clock::time_point, std::string>> lookup_trace_order_;
+  LookupTraceCounts lookup_trace_counts_;
   // Every use is a point lookup, insert or erase. Keeping this unordered avoids
   // string comparisons in BatchResolve's publish critical section.
   std::unordered_map<std::string, uint32_t> placements_;
