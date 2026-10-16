@@ -47,7 +47,7 @@ class PosixEngine final : public TransferEngine {
 
   // One plan per (file range, memory buffer); Submit merges file-contiguous
   // segments into one vectored call.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Synchronous; the handle comes back settled.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
