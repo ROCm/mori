@@ -191,8 +191,8 @@ class FailingEngine final : public TransferEngine {
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override {
     return inner_.CanHandle(src, dst);
   }
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override {
-    return inner_.Plan(items);
+  std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items) const override {
+    return inner_.CreatePlanBuilder(expected_items);
   }
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override {
     if (failures_.load() > 0) {
