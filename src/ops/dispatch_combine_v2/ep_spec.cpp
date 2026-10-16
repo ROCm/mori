@@ -264,6 +264,23 @@ int EpNoPrecompile(const std::string&) { return 0; }
 
 }  // namespace
 
+// The staging size, for a caller that allocates the buffer itself. A call, not a
+// number Python could compute: EpStagingTotalBytes IS the layout, and EpArgs
+// carries the base but no length, so a second derivation of it across the boundary
+// would be a silent overrun of the caller's tensor on the day the two drift.
+//
+// These four are every EpCfg field the result depends on. maxRecv == 0 resolves
+// through EpMaxRecv here exactly as it does in the kernel's own indexing.
+extern "C" __attribute__((visibility("default"))) unsigned long long mori_ep_staging_bytes(
+    int worldSize, int maxRecv, int scaleBytes, int maxTokPerRank) {
+  mori::ops::v2::EpCfg c{};
+  c.worldSize = worldSize;
+  c.maxRecv = maxRecv;
+  c.maxTokPerRank = maxTokPerRank;
+  c.scaleBytes = scaleBytes;
+  return mori::ops::v2::EpStagingTotalBytes(c);
+}
+
 // MORI_EP_ARGS_SCHEMA is generated from MORI_EP_ARGS_FIELDS next to the struct
 // (ep_cfg.hpp), which also static_asserts that the list is in declaration order.
 MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,
