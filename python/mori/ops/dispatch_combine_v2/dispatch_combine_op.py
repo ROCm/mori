@@ -639,8 +639,12 @@ class EpDispatchRoutingHandle:
 
     Either way only the routing is the handle's. What dispatch delivered into the
     arena (recv tokens, weights, indices, scales, and the reverse map below until
-    its first access clones it) is overwritten by the next dispatch, and combine's
-    weight fold reads the forwarded weights from there.
+    its first access clones it) is overwritten by the next dispatch. Combine
+    re-stages the tokens from its `input`, but the weight fold
+    (combine(..., weights=...)) reads the forwarded weights straight from the
+    arena, so the caller must make sure the arena holds this handle's: a weighted
+    combine is valid with the handle of the latest dispatch, or after a replay
+    dispatch(..., routing=handle), which rewrites them at the handle's slots.
 
     disp_dest_tok_id_map: forward (src_tok,k)->dest flat slot (v2 tok_map).
     disp_tok_id_to_src_tok_id_local: reverse recv-slot->src token (v2 tis).
@@ -944,8 +948,9 @@ class EpDispatchCombineOp:
         (the kernel writes it directly, no copy) and its own copy of total_recv,
         so it outlives later return_routing dispatches on this op. Without it the
         handle is valid only until the next one; see EpDispatchRoutingHandle.
-        Intranode gather combine only: the internode and scatter combines also
-        read routing state the op keeps in the arena.
+        Intranode gather combine without StdMoE only: the internode and scatter
+        combines also read routing state the op keeps in the arena, and StdMoE's
+        convert reads the op's slot map and forwarded weights.
 
         out_scales is [max_recv, scale_dim_i32] on both backends but is not always
         CONTIGUOUS -- a backend may lay the rows down wider and return a strided
@@ -963,10 +968,13 @@ class EpDispatchCombineOp:
             raise ValueError(
                 "snapshot=True applies to the handle return_routing=True returns"
             )
-        if snapshot and (self.cfg.is_internode or self.cfg.is_scatter):
+        if snapshot and (
+            self.cfg.is_internode or self.cfg.is_scatter or self.cfg.enable_std_moe
+        ):
             raise ValueError(
-                "snapshot=True is intranode gather only: the internode and scatter "
-                "combines also read routing state the op keeps in the arena"
+                "snapshot=True is intranode gather without StdMoE only: the internode "
+                "and scatter combines and StdMoE's convert also read state the op "
+                "keeps in the arena"
             )
         n = input.shape[0]
         cap = self.cfg.max_num_inp_token_per_rank
@@ -1044,10 +1052,11 @@ class EpDispatchCombineOp:
         indices are accepted for API parity but unused; routing carries the mapping.
 
         `weights` is a REQUEST, not an input: passing it asks for the weight fold,
-        whose values come from the forwarded out_wts, not from this argument. The
-        fold is for training backward (mori a668e25e) and costs more than the whole
-        token payload on gfx1250, so inference passes None -- as v1 does, gating on
-        the same null pointer.
+        whose values come from the forwarded out_wts, not from this argument, so
+        they must be this routing's (see EpDispatchRoutingHandle). The fold is for
+        training backward (mori a668e25e) and costs more than the whole token
+        payload on gfx1250, so inference passes None -- as v1 does, gating on the
+        same null pointer.
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
         ct = routing.cur_rank_num_token

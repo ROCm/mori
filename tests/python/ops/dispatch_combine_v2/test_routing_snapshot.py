@@ -22,10 +22,12 @@
 """Regression test (#715): dispatch(return_routing=True, snapshot=True) handles
 own their routing, so several can be held at once -- one per MoE layer, then the
 backward in reverse -- and each still combines (and, on flydsl, replays) correctly
-after later dispatches on the same op. Also: a handle combines more than once, and
-the default (snapshot=False) handle still aliases the op's buffers.
+after later dispatches on the same op. Also: a handle combines more than once, the
+default (snapshot=False) handle still aliases the op's buffers, and the weight fold
+is correct when the arena holds the handle's weights (latest dispatch, or replay).
 
-Identity expert, so combine[t] == U[t] * input[t] (U = distinct dest PEs of t).
+Identity expert, so combine[t] == U[t] * input[t] (U = distinct dest PEs of t), and
+the fold returns U[t] * w[t] for the weights w last dispatched with that routing.
 
     torchrun --standalone --nproc_per_node=2 test_routing_snapshot.py
     BACKENDS=hip torchrun --standalone --nproc_per_node=2 test_routing_snapshot.py
@@ -58,6 +60,9 @@ def make_inputs(rank, world, dev):
     def tokens():
         return torch.randn(M, HIDDEN, generator=g).to(torch.bfloat16)
 
+    def weights():
+        return torch.rand(M, TOPK, generator=g) + 0.5
+
     def n_dest(idx):
         return torch.tensor([len({e // EPR for e in row}) for row in idx.tolist()])
 
@@ -69,7 +74,9 @@ def make_inputs(rank, world, dev):
         x_a=x_a.to(dev),
         x_b=x_b.to(dev),
         x_c=x_c.to(dev),
-        w=torch.ones(M, TOPK, device=dev),
+        w_a=weights().to(dev),
+        w_b=weights().to(dev),
+        w_c=weights().to(dev),
         u_a=n_dest(idx_a).to(dev)[:, None].float(),
         u_b=n_dest(idx_b).to(dev)[:, None].float(),
     )
@@ -93,8 +100,8 @@ def run_backend(name, comm, rank, world, d):
         torch.cuda.synchronize()
         comm.barrier()
 
-    def dispatch(x, idx, **kw):
-        out, _, _, _, total, *handle = op.dispatch(x, d["w"], None, idx, **kw)
+    def dispatch(x, w, idx, **kw):
+        out, _, _, _, total, *handle = op.dispatch(x, w, None, idx, **kw)
         sync()
         n = int(total.item())
         recv = out[:n].clone()
@@ -108,15 +115,23 @@ def run_backend(name, comm, rank, world, d):
         sync()
         return ok
 
+    def weighted_combine_ok(recv, handle, x, u, w):
+        out, outw = op.combine(recv, w, None, routing=handle)
+        sync()
+        ok = torch.allclose(out.float(), u * x.float(), atol=2e-2, rtol=2e-2)
+        ok = ok and torch.allclose(outw, u * w, atol=1e-5, rtol=1e-5)
+        sync()
+        return ok
+
     try:
-        op.dispatch(d["x_a"], d["w"], None, d["idx_a"], snapshot=True)
+        op.dispatch(d["x_a"], d["w_a"], None, d["idx_a"], snapshot=True)
         checks["snapshot_needs_return_routing"] = False
     except ValueError:
         checks["snapshot_needs_return_routing"] = True
 
     # Default: the handle aliases the op's buffers (valid until the next
     # return_routing dispatch), and combines correctly within that lifetime.
-    recv_0, _, h0 = dispatch(d["x_a"], d["idx_a"], return_routing=True)
+    recv_0, _, h0 = dispatch(d["x_a"], d["w_a"], d["idx_a"], return_routing=True)
     checks["default_aliases_op"] = (
         h0.disp_dest_tok_id_map.data_ptr() == op.routing_dest_map.data_ptr()
         and h0.total_recv_token_num.data_ptr() == op.total_recv.data_ptr()
@@ -124,8 +139,12 @@ def run_backend(name, comm, rank, world, d):
     checks["default_combine"] = combine_ok(recv_0, h0, d["x_a"], d["u_a"])
 
     # Two snapshot handles from back-to-back dispatches, B after A.
-    recv_a, n_a, ha = dispatch(d["x_a"], d["idx_a"], return_routing=True, snapshot=True)
-    recv_b, n_b, hb = dispatch(d["x_b"], d["idx_b"], return_routing=True, snapshot=True)
+    recv_a, n_a, ha = dispatch(
+        d["x_a"], d["w_a"], d["idx_a"], return_routing=True, snapshot=True
+    )
+    recv_b, n_b, hb = dispatch(
+        d["x_b"], d["w_b"], d["idx_b"], return_routing=True, snapshot=True
+    )
     ptrs = {
         t.data_ptr()
         for t in (
@@ -149,13 +168,22 @@ def run_backend(name, comm, rank, world, d):
         int(ha.total_recv_token_num.item()) == n_a
         and int(hb.total_recv_token_num.item()) == n_b
     )
+    # The arena holds B's forwarded weights, so B's handle may fold them. A's may
+    # not (the caller's responsibility, see EpDispatchRoutingHandle).
+    checks["newer_handle_weighted_combine"] = weighted_combine_ok(
+        recv_b, hb, d["x_b"], d["u_b"], d["w_b"]
+    )
 
     if "replay" in op.capabilities:
         # Replay the OLDER handle with a new payload: same routing, new tokens.
-        recv_c, n_c, _ = dispatch(d["x_c"], d["idx_a"], routing=ha)
+        recv_c, n_c, _ = dispatch(d["x_c"], d["w_c"], d["idx_a"], routing=ha)
         checks["older_handle_replay_count"] = n_c == n_a
         checks["older_handle_replay_combine"] = combine_ok(
             recv_c, ha, d["x_c"], d["u_a"]
+        )
+        # Replay rewrote the arena's weights at A's slots, so A may fold them now.
+        checks["older_handle_replay_weighted_combine"] = weighted_combine_ok(
+            recv_c, ha, d["x_c"], d["u_a"], d["w_c"]
         )
 
     op.close()
