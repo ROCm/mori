@@ -99,6 +99,18 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     }
     c.ll128 = true;
   }
+  // The LL128 push combine alone, after the original dispatch, whose Cfg stays as it was: the
+  // combine takes each id's rank from the flat index that dispatch leaves in the map.
+  if (req.ll128CombineOnly && !isDispatch) {
+    const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
+    if (req.ll128 || arch.rfind("gfx125", 0) != 0 || !pushE8m0 || c.waveSize != 32 ||
+        c.blockNum > 256) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128CombineOnly needs gfx125x, the fp4 / fp8 push combine with e8m0 "
+          "scales, wave32, at most 256 combine blocks, and no ll128");
+    }
+    c.ll128CombineOnly = true;
+  }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and

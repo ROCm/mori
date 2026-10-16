@@ -265,9 +265,14 @@ struct EpCfg {
   // stride every source token is encoded with, which combine decodes.
   int callTokMax = 0;
   // gfx125x, both kernels of an op alike (MakeEpCfg): every call takes the LL128 dispatch
-  // and the LL128 push combine (ep_intranode_1250x.hpp). The two only pair with each
-  // other, so the op chooses for both. Off is free for the same reason as scaleBytes.
+  // and the LL128 combine, the push combine's or a bf16 op's sum (ep_intranode_1250x.hpp).
+  // That dispatch only pairs with that combine, so the op chooses for both. Off is free for
+  // the same reason as scaleBytes.
   bool ll128 = false;
+  // gfx125x, combine only (MakeEpCfg): the LL128 push combine after the original dispatch, for ops
+  // the LL128 dispatch is too slow for. The map then holds the original dispatch's flat indices,
+  // and the combine takes each id's rank from them. Off is free for the same reason as scaleBytes.
+  bool ll128CombineOnly = false;
 };
 
 template <typename Self, typename Visit>
@@ -291,10 +296,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(aggReserve);
   MORI_FIELD(callTokMax);
   MORI_FIELD(ll128);
+  MORI_FIELD(ll128CombineOnly);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 18, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 19, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};

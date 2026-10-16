@@ -155,6 +155,9 @@ TEST(Render, EveryScalarFieldReachesTheText) {
   c = base;
   c.ll128 = true;
   differs(c, "ll128");
+  c = base;
+  c.ll128CombineOnly = true;
+  differs(c, "ll128CombineOnly");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {

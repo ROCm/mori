@@ -342,10 +342,19 @@ _COMBINE_PUSH_TABLE: dict = {
 # 1 / 64 / 256: dispatch 20.6 -> 9.6, 29.1 -> 13.9, 30.4 -> 27.2; combine 17.1 -> 10.0,
 # 16.5 -> 11.6, 25.2 -> 21.9. At 512 both lost (dispatch 34.9 -> 44.5, combine 34.2 -> 36.7,
 # measured before the combine folded the weights, which only adds work), so bf16 stops at 256.
+# Past max_tok and up to combine_max_tok only the combine takes LL128 (EpCfg::ll128CombineOnly),
+# after the schedule's dispatch in every bucket. fp4, an op of 2048 tokens a rank, at
+# 1 / 64 / 512 / 1024 / 2048 tokens a rank:
+#   combine  12.8 -> 7.7, 14.5 -> 8.7, 19.4 -> 14.7, 31.2 -> 23.4, 50.8 -> 40.8
+#   dispatch (the same kernel) 18.1 -> 18.0, 20.6 -> 20.6, 23.3 -> 23.4, 31.1 -> 32.6, 40.1 -> 41.0
+# fp8 has none: at 1024 / 2048 its combine gains less (34.2 -> 32.9, 63.7 -> 61.9) than its
+# dispatch loses (36.4 -> 38.7, 54.3 -> 59.2).
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): {"fp4": dict(max_tok=512, dispatch=(128, 8), combine=(256, 8))},
+            (4, 7168, 6, None): {
+                "fp4": dict(max_tok=512, combine_max_tok=2048, dispatch=(128, 8), combine=(256, 8))
+            },
         },
     },
     "fp8_blockwise": {
@@ -362,14 +371,20 @@ _LL128_TABLE: dict = {
 
 
 def ll128(world_size, hidden_dim, topk, dtype, max_tok, experts_per_rank=None, quant_type="none"):
-    """The LL128 plan geometry {"dispatch": (block, warp), "combine": (block, warp)} for an op of
-    this shape, dispatch dtype and capacity, or None when the op keeps the schedule."""
+    """The LL128 plan geometry for an op of this shape, dispatch dtype and capacity:
+    {"dispatch": (block, warp), "combine": (block, warp)} when both kernels take LL128,
+    {"combine": (block, warp)} when only the combine does, or None when the op keeps the
+    schedule."""
     per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
     entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
     plan = entry.get(dtype) if entry else None
-    if plan is None or max_tok > plan["max_tok"]:
+    if plan is None:
         return None
-    return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
+    if max_tok <= plan["max_tok"]:
+        return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
+    if max_tok <= plan.get("combine_max_tok", 0):
+        return {"combine": plan["combine"]}
+    return None
 
 
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are
