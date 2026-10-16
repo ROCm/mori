@@ -328,6 +328,39 @@ _COMBINE_PUSH_TABLE: dict = {
     },
 }
 
+# The LL128 protocol (EpCfg::ll128 in ep_cfg.hpp): an op of at most `max_tok` tokens a rank
+# runs every call on one dispatch and one combine plan, block x warp each, instead of the
+# schedule. One plan each because the per-block call numbers are module globals, which a
+# second plan would not share. Keyed by push combine, then (world, hidden, topk, experts a rank)
+# and the dispatch dtype. EP4 on C17, 2026-10-16, an op of 512 tokens a rank, 3 alternating
+# rounds, dispatch + combine us against the schedule at 1 / 64 / 256 / 512 tokens a rank:
+# fp4 30.0 -> 15.7, 36.1 -> 19.5, 37.9 -> 23.3, 42.7 -> 35.1; fp8 30.9 -> 16.7, 39.8 -> 20.9,
+# 44.4 -> 29.3, 53.3 -> 47.4.
+_LL128_TABLE: dict = {
+    "fp4_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): {"fp4": dict(max_tok=512, dispatch=(128, 8), combine=(256, 8))},
+        },
+    },
+    "fp8_blockwise": {
+        "gfx1250": {
+            (4, 7168, 6, None): {"fp8": dict(max_tok=512, dispatch=(128, 8), combine=(256, 8))},
+        },
+    },
+}
+
+
+def ll128(world_size, hidden_dim, topk, dtype, max_tok, experts_per_rank=None, quant_type="none"):
+    """The LL128 plan geometry {"dispatch": (block, warp), "combine": (block, warp)} for an op of
+    this shape, dispatch dtype and capacity, or None when the op keeps the schedule."""
+    per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
+    entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
+    plan = entry.get(dtype) if entry else None
+    if plan is None or max_tok > plan["max_tok"]:
+        return None
+    return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
+
+
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are
 # consumed per warp-iteration, so one round covers block*warp*_tpi tokens and coming up
 # short costs more than any geometry difference (gfx1250 fp4 at ct=4096: 64x8 121.4us

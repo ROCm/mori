@@ -92,6 +92,19 @@ _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
 # Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _SCALE_ALIGN = 128
 
+# Must match kEpStageOff / kEpStageRegionTok in ep_intranode_1250x.hpp: the LL128
+# dispatch's area past the slot word, a 256 B counter area, two parities of one 128 B
+# header a source, then room for two parities of _STAGE_TOK rows a source.
+_STAGE_OFF = 512
+_STAGE_TOK = 512
+
+
+def _stage_bytes(cfg, scale_stride):
+    row = cfg.token_nbytes + scale_stride + 4 + 8 * cfg.num_experts_per_token
+    row = (row + 127) // 128 * 128
+    ws = cfg.world_size
+    return 256 + 2 * ws * 128 + 2 * ws * _STAGE_TOK * row
+
 # Which tuning-table dtype column a dispatch dtype reads.
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
@@ -225,6 +238,24 @@ def push_land_rows(cfg) -> int:
     return cfg.max_num_inp_token_per_rank * min(
         cfg.world_size, cfg.num_experts_per_token
     )
+
+
+def _mtype_local_rw() -> bool:
+    """amdgpu's mtype_local is 0, MTYPE_RW. Unreadable counts as not."""
+    try:
+        with open("/sys/module/amdgpu/parameters/mtype_local") as f:
+            return f.read().strip() == "0"
+    except OSError:
+        return False
+
+
+def ll_comb_row_bytes(cfg) -> int:
+    """A landing row of the LL128 combine (EpCombineLl1250x): the wire row's payload and scale
+    bytes in 128 B lines of 120 data bytes each, in whole units of eight lines."""
+    h = cfg.hidden_dim
+    q = cfg.quant_type
+    data = h * _PUSH_ELEM_BITS[q] // 8 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
+    return ((data + 119) // 120 + 7) // 8 * 1024
 
 
 class TokOffExt:
@@ -390,6 +421,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
+        # Read by _regions and _build_kernels, so it is fixed before the arena exists.
+        self._ll128_geom = self._ll128_plan(cfg)
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -427,6 +460,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dev = self.dev
         self.arena.zero()
 
+        # An LL128 op runs every call on one dispatch and one combine plan (_LL128_TABLE in
+        # hip_tuning_configs). A geometry the caller pinned is one plan already.
+        if self._ll128_geom is not None and cfg.schedule:
+            (db, dw), (cb, cw) = self._ll128_geom["dispatch"], self._ll128_geom["combine"]
+            cfg.schedule = ((None, db, dw, cb, cw),)
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
@@ -731,6 +769,30 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """Dwords per DESTINATION scale row, 0 when the transport is off."""
         return scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
 
+    def _ll128_plan(self, cfg):
+        """The LL128 plans of this op ({"dispatch": (block, warp), "combine": (block, warp)},
+        hip_tuning_configs.ll128), or None. Only on local memory of MTYPE RW: on the MTYPE NC
+        parts (f01-2) a poll kept reading stale lines and rows went missing."""
+        if not self._is1250 or cfg.is_internode or not _mtype_local_rw():
+            return None
+        if cfg.is_fp4:
+            dt = "fp4"
+        elif cfg.dispatch_dtype in _FP8_TUNING_DTYPES:
+            dt = "fp8"
+        else:
+            return None
+        from .hip_tuning_configs import ll128
+
+        return ll128(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            dt,
+            cfg.max_num_inp_token_per_rank,
+            experts_per_rank=cfg.num_experts_per_rank,
+            quant_type=cfg.quant_type,
+        )
+
     def _regions(self, cfg):
         if cfg.is_internode:
             # Sized exactly, region by region. v1 sizes its arena with a 256 MB
@@ -744,15 +806,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         cap = cfg.effective_max_recv
         topk = cfg.num_experts_per_token
         out_tok = cap * cfg.combine_token_nbytes
+        ll = self._ll128_geom is not None
         if cfg.quant_type in _PUSH_QUANT_TYPES:
             land_rows = push_land_rows(cfg)
-            out_tok += land_rows * push_wire_nbytes(cfg)
             # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
             # which runs from four ranks up.
-            if cfg.world_size >= 4:
-                out_tok += land_rows * 8
+            row = push_wire_nbytes(cfg) + (8 if cfg.world_size >= 4 else 0)
+            # The LL128 combine lands the same rows, as lines, from the same offset.
+            out_tok += land_rows * (max(row, ll_comb_row_bytes(cfg)) if ll else row)
+        tok_off = 4
+        if ll:
+            # Past the slot word, at _STAGE_OFF: the LL128 dispatch's count words and the
+            # rows it stores at each destination.
+            tok_off = _STAGE_OFF + _stage_bytes(cfg, self._scale_stride_i32(cfg) * 4)
         regions = [
-            ("tok_off", 4),
+            ("tok_off", tok_off),
             # gfx1250 with the aggregated reservation: one 8-byte signal a source, its
             # recv count + 1 and in the high word the push combine's landing offset of
             # that source's rows here. Otherwise 4-byte count signals in the first half.
@@ -1361,6 +1429,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             comb_cfg["combine_fp4_f32_scale"] = True
         if cfg.quant_type == "fp8_blockwise":
             comb_cfg["combine_fp8"] = True
+        if self._ll128_geom is not None:
+            # MakeEpCfg checks the dispatch's request against the combine it pairs with.
+            disp_cfg.update(
+                ll128=True,
+                combine_fp4=comb_cfg.get("combine_fp4", False),
+                combine_fp8=comb_cfg.get("combine_fp8", False),
+            )
+            comb_cfg["ll128"] = True
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
@@ -1544,7 +1620,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         than sized to the plan (3 alternating rounds, ab_1012_065929_2397421); no EP4
         or EP8 bucket measured faster."""
         cap = int(cfg.max_num_inp_token_per_rank)
-        if not self._is1250 or not cfg.schedule or cfg.world_size < 16:
+        if (
+            not self._is1250
+            or not cfg.schedule
+            or cfg.world_size < 16
+            or self._ll128_geom is not None
+        ):
             return [cap]
         caps = {
             cap if edge is None else min(int(edge), cap)
