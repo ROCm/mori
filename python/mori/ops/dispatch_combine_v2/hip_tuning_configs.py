@@ -346,25 +346,44 @@ _COMBINE_PUSH_TABLE: dict = {
 #     27.2 -> 14.7; combine 19.5 -> 9.9, 16.1 -> 10.6, 16.4 -> 16.0. Its combine loses at 128
 #     (17.6 -> 23.6).
 # The fp4 push combine on 64x32 does not build.
+# From 8 ranks the combines run on 64x8: on 64x16 (256 VGPRs a lane) fp4's spills 230. From 8 ranks
+# the dispatch sends a row's units past the first only to the ranks it is routed to, and fp8's
+# takes 64x16 there: it receives 4 to 5 rows a token from each of 8 or 16 sources. EP16 on C1 C4
+# C11 C14, 2026-10-17, 3 alternating rounds, us against the schedule, at 1 / 16 / 64 / 128:
+#   fp4 dispatch 19.8 -> 9.3, 24.0 -> 12.2, 24.9 -> 15.0, 25.2 -> 21.8; combine 14.3 -> 8.5,
+#     14.8 -> 9.1, 15.8 -> 11.0, 17.4 -> 16.8.
+#   fp8 dispatch 20.6 -> 9.7, 25.3 -> 14.6, 25.9 -> 18.4, 27.9 -> 27.3; combine 15.8 -> 8.8,
+#     16.8 -> 10.0, 18.5 -> 14.6, 21.3 -> 20.8.
+#   bf16 at 1 / 4 / 16: dispatch 22.8 -> 10.7, 23.1 -> 11.4, 25.1 -> 12.9; combine 28.2 -> 10.6,
+#     31.9 -> 11.2, 15.7 -> 12.1. Its combine loses at 64 (18.0 -> 26.0).
+# EP8 on C1 C4, same day and method, at 1 / 16 / 64 / 128:
+#   fp4 dispatch 18.6 -> 8.6, 22.7 -> 9.5, 23.6 -> 12.6, 24.4 -> 16.1; combine 13.3 -> 8.0,
+#     14.0 -> 8.7, 14.8 -> 10.5, 16.0 -> 15.3.
+#   fp8 dispatch 18.8 -> 9.0, 22.8 -> 10.7, 24.1 -> 14.8, 25.4 -> 19.3; combine 14.7 -> 8.5,
+#     15.6 -> 9.7, 17.0 -> 13.6, 19.2 -> 18.7.
+#   bf16 at 1 / 4 / 16: dispatch 20.4 -> 9.9, 20.1 -> 10.7, 22.5 -> 11.5; combine 24.3 -> 10.1,
+#     26.9 -> 10.5, 14.9 -> 11.2.
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): {"fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))},
-            # EP8: the combine on 64x8, where it keeps 365 VGPRs; on 64x16 (256 a lane) it spills 230.
             (8, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
+            (16, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
         },
     },
     "fp8_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
-            (8, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
+            (8, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
+            (16, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
         },
     },
     "none": {
         "gfx1250": {
             (4, 7168, 6, None): {"bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))},
-            # EP8: the combine on 64x8 (333 VGPRs, no spill); past 16 tokens it is slower than the pull.
+            # From 8 ranks past 16 tokens the bf16 combine is slower than the pull.
             (8, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
+            (16, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
         },
     },
 }

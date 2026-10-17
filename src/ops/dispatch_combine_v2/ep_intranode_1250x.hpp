@@ -385,8 +385,9 @@ __device__ __forceinline__ __attribute__((address_space(1))) T* EpUniG(T* p) {
 // global, so every call of an op must run the same plan (hip_tuning_configs._LL128_TABLE).
 // Area past the slot word of tok_off, at kEpStageOff (hip_backend._stage_bytes):
 //   [0, 256)                     unused
-//   [256, 256 + npes * 128)      the count word from each source
-//   [kRowsOff, ...)              row[src][kT]
+//   [256, 256 + 2 * npes * 128)  the count word from each source, [parity][src]
+//   [kRowsOff, ...)              row[parity][src][kT]
+// The parity is the call number's low bit.
 constexpr unsigned long long kEpStageOff = 512;
 // Rows a source the area has room for in each of two parities (hip_backend._STAGE_TOK).
 constexpr int kEpStageRegionTok = 512;
@@ -396,7 +397,7 @@ __device__ unsigned _llSeq[256];
 template <EpCfg kCfg, typename T>
 constexpr bool EpStageOk() {
   constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
-  return kCfg.worldSize <= 8 && (kCfg.waveSize == 32 || kCfg.waveSize == 64) && kTokB % 16 == 0 &&
+  return kCfg.worldSize <= kCfg.waveSize && (kCfg.waveSize == 32 || kCfg.waveSize == 64) && kTokB % 16 == 0 &&
          kCfg.numExpertPerToken <= 16 && kEpScaleBytes % 4 == 0 && kEpScaleStride % 16 == 0;
 }
 
@@ -429,9 +430,15 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   // branch per region: the branches all write the same registers, so each one waited for the
   // previous one's loads. Needs halves that never straddle two regions.
   constexpr bool kSendFlat = topk % 2 == 0 && kScB % 8 == 0;
+  // From 8 ranks a row's first unit, which holds its ids, goes to every rank and the rest only to the
+  // ranks the row is routed to: a token reaches about 4.4 of 8, 5 of 16 or 5.5 of 32 ranks, so
+  // sending every unit to every rank would multiply the bytes by 2 to 6. A destination with none of
+  // the row's experts reads its first unit and moves on.
+  constexpr bool kSkip = npes >= 8;
+  static_assert(!kSkip || npes <= 32, "the routing mask is one bit a rank");
   static_assert(EpStageOk<kCfg, T>(), "the LL128 dispatch serves this shape");
-  static_assert((unsigned long long)npes * kT * kLlRowB <= 2ull * npes * kEpStageRegionTok * kRowB,
-                "the LL128 rows must fit the stage rows of both parities");
+  static_assert(2ull * npes * kT * kLlRowB <= 2ull * npes * kEpStageRegionTok * kRowB,
+                "both parities of the LL128 rows must fit the stage rows");
   static_assert(kMetaB <= kLinesU * kLinePay, "the ids and weights must sit in a row's first unit");
   static_assert(kTokB % 8 == 0 && kScB % 4 == 0, "an 8-byte half must not straddle two regions");
   static_assert(kCfg.blockNum * 4 <= npes * kHdrB && kCfg.blockNum <= 256,
@@ -447,6 +454,19 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   const int lg = laneId >> 3, lp = laneId & 7;
   const int myPe = args.rank;
   const int N = args.numTokens;
+  // Sending only the routed units makes each store wait for the row's ids. From 16 ranks that still
+  // wins at 1 token; at 8 ranks every unit goes to every rank up to 512 unit stores a call (fp4 /
+  // fp8 up to 4 tokens, bf16 1). A destination applies the same rule to the source's token count,
+  // and only for a source that routes does it decide a row from its first unit; otherwise it waits
+  // for the whole row as without kSkip.
+  constexpr bool kAlwaysRoute = kSkip && npes >= 16;
+  auto routes = [&](const int n) {
+    if constexpr (kAlwaysRoute)
+      return true;
+    else
+      return kSkip && n * kUnits * npes > 512;
+  };
+  const bool route = routes(N);
   const EpWinRegs wr = EpWinRegsLoad(args.window);
   const unsigned long long stOff = args.offTokOff + kEpStageOff;
   char* const stLocal = EpLocal<char>(wr, stOff);
@@ -454,6 +474,11 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   const unsigned seq =
       __hip_atomic_load(_llSeq + blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u;
   const unsigned long long flag = seq;
+  // A source whose rows none of this rank's experts take does not wait for this rank, so it can
+  // finish its combine and start the next call while a late block here still reads this call:
+  // calls alternate between two copies of the count words and rows. Two calls ahead it would need
+  // this rank's next count word, which goes out after this call is read.
+  const size_t par = seq & 1u;
   auto tmo = [&](int what, int s, int t) {
     if (laneId == 0 && atomicAdd(&_llTmo, 1u) < 8u)
       printf("[LLTMO] rank=%d block=%d wave=%d what=%d src=%d tok=%d seq=%u\n", myPe,
@@ -464,8 +489,8 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   // do not hold up anybody's payload reads. It also clears the counters combine reads.
   if (wv == nWaves / 2) {
     if (laneId < npes)
-      __hip_atomic_store(reinterpret_cast<unsigned long long*>(EpPeer<char>(wr, laneId, stOff) +
-                                                               256 + (size_t)myPe * kHdrB),
+      __hip_atomic_store(reinterpret_cast<unsigned long long*>(EpPeer<char>(wr, laneId, stOff) + 256 +
+                                                               (par * npes + myPe) * kHdrB),
                          ((unsigned long long)seq << 32) | (unsigned)N, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_SYSTEM);
     if (laneId < npes) {
@@ -528,25 +553,52 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     uint4 vb[kStB];
     size_t ob[kStB];
     bool on[kStB];
+    unsigned dm[kStB];
 #pragma unroll
     for (int ib = 0; ib < kStB; ++ib) {
       const int w = u0 + ib * nWaves;
       on[ib] = w < nW;
+      dm[ib] = ~0u;
       if (!on[ib]) continue;
       const int t = w / kUnits, c = w - t * kUnits;
+      // The ids load before the row's bytes, so the stores below do not wait for them behind those.
+      if constexpr (kSkip) {
+        if (route && c > 0) {
+          unsigned m = 0u;
+#pragma unroll
+          for (int k = 0; k < topk; ++k) {
+            const int e = args.tokenIndices[t * topk + k];
+            const unsigned q = (unsigned)e / (unsigned)kEpr;
+            m |= (e >= 0 && q < (unsigned)npes) ? (1u << q) : 0u;
+          }
+          dm[ib] = m;
+        }
+      }
       const int h = (c * kLinesU + lg) * kLinePay + lp * 16;
       const uint2 a = kSendFlat ? half8(t, h) : half(t, h);
       const uint2 b = lp == 7 ? make_uint2((unsigned)flag, (unsigned)(flag >> 32))
                               : (kSendFlat ? half8(t, h + 8) : half(t, h + 8));
       vb[ib] = make_uint4(a.x, a.y, b.x, b.y);
-      ob[ib] = ((size_t)myPe * kT + t) * kLlRowB + (size_t)c * kUnitB + laneId * 16;
+      ob[ib] = ((par * npes + myPe) * kT + t) * kLlRowB + (size_t)c * kUnitB + laneId * 16;
     }
+    if (kAlwaysRoute || (kSkip && route)) {
 #pragma unroll
-    for (int ib = 0; ib < kStB; ++ib) {
-      if (!on[ib]) continue;
+      for (int ib = 0; ib < kStB; ++ib) {
+        if (!on[ib]) continue;
 #pragma unroll
-      for (int p = 0; p < npes; ++p)
-        *reinterpret_cast<uint4*>(EpPeer<char>(wr, p, stOff) + kRowsOff + ob[ib]) = vb[ib];
+        for (int p = 0; p < npes; ++p) {
+          if (!((dm[ib] >> p) & 1u)) continue;
+          *reinterpret_cast<uint4*>(EpPeer<char>(wr, p, stOff) + kRowsOff + ob[ib]) = vb[ib];
+        }
+      }
+    } else {
+#pragma unroll
+      for (int ib = 0; ib < kStB; ++ib) {
+        if (!on[ib]) continue;
+#pragma unroll
+        for (int p = 0; p < npes; ++p)
+          *reinterpret_cast<uint4*>(EpPeer<char>(wr, p, stOff) + kRowsOff + ob[ib]) = vb[ib];
+      }
     }
   }
   // For EpCombineLl1250x, the rank of each id (-1 for none): the ranks the token's rows come back
@@ -602,8 +654,8 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   for (int r = nWaves - 1 - wv; r < npes * kT; r += nWaves) {
     const int s = r % npes, t = r / npes;
     unsigned long long* const cwp =
-        reinterpret_cast<unsigned long long*>(stLocal + 256 + (size_t)s * kHdrB);
-    const char* const row = stLocal + kRowsOff + ((size_t)s * kT + t) * kLlRowB;
+        reinterpret_cast<unsigned long long*>(stLocal + 256 + (par * npes + s) * kHdrB);
+    const char* const row = stLocal + kRowsOff + ((par * npes + s) * kT + t) * kLlRowB;
     if (s == sKnown && t >= nsKnown) continue;
     int ns = 0;
     // The count and the row's first kRB units in one round: the row is polled before the count
@@ -628,6 +680,9 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
       }
       if (haveCnt && t >= ns) continue;
     }
+    // From a source that routes only the first unit of a row routed elsewhere comes: once it is in,
+    // its ids decide. mine: wait for the whole row.
+    bool other = false, mine = !kSkip || (haveCnt && !routes(ns));
     for (unsigned spin = 0; spin < kSpinMax; ++spin) {
       asm volatile("" ::: "memory");
       const unsigned long long cw =
@@ -637,9 +692,21 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
         haveCnt = true;
         ns = (int)(unsigned)cw;
         if (ns > kT) ns = kT;
+        if (!routes(ns)) mine = true;
       }
       if (haveCnt && t >= ns) break;
-      if (haveCnt && __ballot(bb & 1) == 0ull) {
+      if constexpr (kSkip) {
+        if (haveCnt && !mine && __ballot(bb & 2) == 0ull) {
+          const int k0 = laneId < topk ? laneId : 0;
+          const int e0 = laneId < topk ? (int)pick(4 * k0) : -1;
+          if (__ballot(e0 >= 0 && e0 / kEpr == myPe) == 0ull) {
+            other = true;
+            break;
+          }
+          mine = true;
+        }
+      }
+      if (haveCnt && mine && __ballot(bb & 1) == 0ull) {
         rowOk = true;
         break;
       }
@@ -650,7 +717,7 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     }
     sKnown = s;
     nsKnown = ns;
-    if (t >= ns) continue;
+    if (t >= ns || other) continue;
     if (!rowOk) {
       tmo(1, s, t);
       continue;
@@ -4403,20 +4470,27 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
   }
 
   // Source side: the waves from the top of the grid take this rank's tokens.
-  constexpr int kPB = kRows;
+  // A poll round holds the units it reads in registers; 64 units (EP4's fp8 round) fit. Six fp8 rows
+  // of 16 units, a token's rows from 8 ranks up, took 384 VGPRs and spilled, so the one-wave mode
+  // reads them in rounds of kPB rows, and the run of (kPass + 1) / 2 passes, 72 units there, is not
+  // built: those tokens go to the one-wave mode.
+  constexpr int kPB = kRows * kUnits <= 64 ? kRows : 64 / kUnits;
   const char* const land = EpLocal<char>(wr, args.offOutTok) + W::kLandOff;
   unsigned char* const out = reinterpret_cast<unsigned char*>(args.outTokenBuf);
   constexpr int kUnitPay = kLinesU * kLinePay;
   constexpr int kPassB = W::kLaneB * WS;
+  constexpr int kMP2 = (kPass + 1) / 2;
+  constexpr bool kRun2 =
+      kRows * (((kMP2 * kPassB - 1) / kUnitPay + 2) + ((kMP2 * WS - 1) / kUnitPay + 2)) <= 64;
   // While the grid has spare waves beside the expert side's, a token is summed by 7, 4 or 2 waves,
   // the most they allow, each summing a run of 1, 2 or 4 passes and polling only the units that
   // hold its passes' payload and scale bytes: LL128 lines land whole, so those units alone tell
   // the passes' rows are in.
   const int spareW = nWaves - nRecv;
-  const int passW = N * kPass <= spareW ? kPass
-                    : N * 4 <= spareW   ? 4
-                    : N * 2 <= spareW   ? 2
-                                        : 0;
+  const int passW = N * kPass <= spareW        ? kPass
+                    : N * 4 <= spareW          ? 4
+                    : kRun2 && N * 2 <= spareW ? 2
+                                               : 0;
   const bool passMode = passW > 0;
   // A wave keeps its first poll time-out (row = 1000 + pass in the pass mode) and prints it once
   // at the end: each printf inlines thousands of instructions, and they sat between the poll loops
@@ -4532,8 +4606,9 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
     passRun(std::integral_constant<int, 1>{}, kPass);
   else if (passW == 4)
     passRun(std::integral_constant<int, (kPass + 3) / 4>{}, 4);
-  else if (passW == 2)
-    passRun(std::integral_constant<int, (kPass + 1) / 2>{}, 2);
+  else if (passW == 2) {
+    if constexpr (kRun2) passRun(std::integral_constant<int, (kPass + 1) / 2>{}, 2);
+  }
   // One wave a token otherwise; a poll round reads all of the token's rows (past its last row the
   // last row is read again, so no load sits behind a branch).
   for (int t = nWaves - 1 - wv; live && !passMode && t < N; t += nWaves) {
