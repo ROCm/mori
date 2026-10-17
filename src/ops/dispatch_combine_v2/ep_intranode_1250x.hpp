@@ -964,6 +964,15 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   float _pWtK[kPreK] = {};
   [[maybe_unused]] unsigned _pScK[kPreK][kScWave ? kScK : 1] = {};
   const bool _scWave = kScWave && _preKOk && args.scalesBuf != nullptr;
+  // EP32 fp4 past 8192 tokens a rank, on the plain map: a row's scale goes out with its payload, from
+  // the slab right behind the row, instead of through the staged metadata runs (16384 tokens
+  // -7.75 us; 8192 on 128 x 16 was +0.84, so the smaller buckets keep the runs; fp8 and the other
+  // world sizes are untimed).
+  constexpr bool kScPayOn =
+      npes >= 32 && kCfg.dtype == EpDType::Fp4x2 && EpCallTok(kCfg) > 8192;
+  const bool _scPay = kScPayOn && kEpScaleStride > 0 && kEpScaleStride % 16 == 0 && !kUnitGeom &&
+                      !_tokChunk && !_wtok && !_metaPlain && args.scalesBuf != nullptr &&
+                      kTokB + kEpScaleStride <= kSlabBytes;
   if (_preKOk) {
     const float* const wSrc = (kCfg.useWeights && args.weightsBuf)
                                   ? args.weightsBuf
@@ -1396,7 +1405,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           }
           if constexpr (kEpScaleBytes > 0) {
             const size_t sr = (size_t)(unsigned)__builtin_amdgcn_readlane(myScRow, l);
-            if (!_wfuse && (kScWave || args.scalesBuf) && sr < kEpScaleRows) {
+            if (!_wfuse && !_scPay && (kScWave || args.scalesBuf) && sr < kEpScaleRows) {
               unsigned int* dstS = reinterpret_cast<unsigned int*>(
                   _cusplit_stgScale + ((size_t)d * kEpScaleRows + sr) * kEpScaleStride);
               if constexpr (kScWave) {
@@ -1502,7 +1511,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           }
         }
         if constexpr (kEpScaleBytes > 0) {
-          if (args.scalesBuf && !_scWave) {
+          if (args.scalesBuf && !_scWave && !_scPay) {
             // The only place the two widths meet, and the copy is per-row anyway,
             // which is what makes the pad free rather than a pass of its own.
             // EpCfgIsValid keeps the row dword-sized, so these lanes have no tail.
@@ -1522,7 +1531,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
         }
       }
       if constexpr (kScWave) {
-        if (_scWave) {
+        if (_scWave && !_scPay) {
           for (unsigned long long km = _keepAll; km; km &= km - 1) {
             const int l = __ffsll((long long)km) - 1;
             const int d = __shfl(myDestPe, l);
@@ -1810,7 +1819,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                 unsigned int* sS =
                     reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
                     ((size_t)peer * kEpScaleRows + EpScaleRow<kCfg>(s_base[peer], ab)) * kSdw;
-                unsigned int* dS = (kEpScaleBytes > 0 && args.scalesBuf)
+                unsigned int* dS = (kEpScaleBytes > 0 && args.scalesBuf && !_scPay)
                                        ? (reinterpret_cast<unsigned int*>(pb + args.offOutScales) +
                                           (size_t)ab * kSdw)
                                        : nullptr;
@@ -1921,7 +1930,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                 reinterpret_cast<unsigned int*>(_cusplit_stgScale) +
                 ((size_t)peer * kEpScaleRows + EpScaleRow<kCfg>(baseAll, ab)) * kSdw;
             unsigned int* dS =
-                (kEpScaleBytes > 0 && args.scalesBuf)
+                (kEpScaleBytes > 0 && args.scalesBuf && !_scPay)
                     ? (EpPeer<unsigned int>(win, peer, args.offOutScales) + (size_t)ab * kSdw)
                     : nullptr;
             // kScaleCu: kSdw is a multiple of 4, so the run is nScB / 4 vectors, a lane taking
@@ -2079,6 +2088,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           index_t* dst = EpPeer<index_t>(win, peer, args.offRecvToSrc) + (size_t)ab;
           for (int i = laneId; i < (int)cnt; i += WS) dst[i] = src[i];
         } else if constexpr (kEpScaleStride > 0) {
+          if (_scPay) continue;
           constexpr int kSdw = kEpScaleStride / 4;
           unsigned int* src = reinterpret_cast<unsigned int*>(
               _cusplit_stgScale +
@@ -2702,6 +2712,21 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             TdmIssueLoad<T>(_tdmTile,
                             reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
                             _tdmG1);
+          if constexpr (kEpScaleStride > 0 && kEpScaleStride % 16 == 0) {
+            if (_scPay) {
+              // The scale row, zero-padded to the stride, into the slab right behind the payload row.
+              // Metadata runs are staged from the start of this slab and lane writes are not ordered
+              // behind tensor ops: every tensor op but the row load just issued completes first.
+              if (__builtin_amdgcn_readfirstlane((int)_payPre)) __builtin_amdgcn_s_wait_tensorcnt(0);
+              else __builtin_amdgcn_s_wait_tensorcnt(1);
+              constexpr int kSv = kEpScaleStride / 16, kSb = kEpScaleBytes / 16;
+              uint4* const ls = reinterpret_cast<uint4*>(reinterpret_cast<char*>(_tdmTile) + kTokB);
+              const uint4* const gs = reinterpret_cast<const uint4*>(
+                  static_cast<const char*>(args.scalesBuf) + (size_t)tok * kEpScaleBytes);
+              for (int x = laneId; x < kSv; x += WS) ls[x] = (x < kSb) ? gs[x] : make_uint4(0u, 0u, 0u, 0u);
+              asm volatile("s_wait_dscnt 0x0" ::: "memory");
+            }
+          }
           bool loadWaited = false;
           unsigned long long _vm = __ballot(validMe);
           while (_vm) {
@@ -2718,6 +2743,15 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
             }
             T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
             TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
+            if constexpr (kEpScaleStride > 0 && kEpScaleStride % 16 == 0) {
+              if (_scPay) {
+                constexpr int kSdw = kEpScaleStride / 4;
+                TdmIssueStore<int>(reinterpret_cast<int*>(EpPeer<unsigned>(win, destPe, args.offOutScales) +
+                                                          (size_t)destTokId * kSdw),
+                                   reinterpret_cast<int*>(reinterpret_cast<char*>(_tdmTile) + kTokB),
+                                   TdmShape<int>(kSdw));
+              }
+            }
           }
           __builtin_amdgcn_s_wait_tensorcnt(0);
           _payPre = false;
