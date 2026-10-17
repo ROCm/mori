@@ -892,9 +892,20 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                              kPayFirstPlain;
 
   constexpr int kMaxNpes = kCfg.worldSize;
+  // EP32 fp4 on the plain map (an instance whose calls can pass blockNum x kEpTokChunk tokens): a row's
+  // scale goes out with its payload, from the slab right behind the row, instead of through the staged
+  // metadata runs; and the block's warps take its tokens one at a time from an LDS counter instead of
+  // a fixed stride, so a warp with fewer rows or a shorter metadata pass takes more. Together, 3
+  // alternating rounds: 2560 / 3072 / 4096 tokens -6.15 / -5.69 / -8.54 us, 4097 / 8192 -13.73 /
+  // -3.84, 16384 -11.64 (the scale alone was +1.37 at 8192). fp8 and the other world sizes are untimed.
+  constexpr bool kScPayOn = npes >= 32 && kCfg.dtype == EpDType::Fp4x2 &&
+                            EpCallTok(kCfg) > kCfg.blockNum * kEpTokChunk;
+  constexpr bool kDynTok = kScPayOn;
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
-  __shared__ index_t s_run[kMaxNpes];
+  // kDynTok: entry kMaxNpes is the next of the block's tokens; sized only there, so every other
+  // instance keeps its LDS layout.
+  __shared__ index_t s_run[kMaxNpes + (kDynTok ? 1 : 0)];
   // kUnitW: entry w is rank w's first pool row, entry npes the rows of the block. A whole KiB,
   // so the dynamic LDS behind it starts at the same offset modulo 1 KiB as without it.
   constexpr int kUpPN = kUnitW ? 1024 / (int)sizeof(index_t) : 1;
@@ -953,12 +964,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   float _pWtK[kPreK] = {};
   [[maybe_unused]] unsigned _pScK[kPreK][kScWave ? kScK : 1] = {};
   const bool _scWave = kScWave && _preKOk && args.scalesBuf != nullptr;
-  // EP32 fp4 past 8192 tokens a rank, on the plain map: a row's scale goes out with its payload, from
-  // the slab right behind the row, instead of through the staged metadata runs (16384 tokens
-  // -7.75 us; 8192 on 128 x 16 was +0.84, so the smaller buckets keep the runs; fp8 and the other
-  // world sizes are untimed).
-  constexpr bool kScPayOn =
-      npes >= 32 && kCfg.dtype == EpDType::Fp4x2 && EpCallTok(kCfg) > 8192;
   const bool _scPay = kScPayOn && kEpScaleStride > 0 && kEpScaleStride % 16 == 0 && !kUnitGeom &&
                       !_tokChunk && !_wtok && !_metaPlain && args.scalesBuf != nullptr &&
                       kTokB + kEpScaleStride <= kSlabBytes;
@@ -1033,6 +1038,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   for (int p = thdId; p < npes; p += blockDim.x) {
     s_N[p] = 0;
     s_run[p] = 0;
+  }
+  if constexpr (kDynTok) {
+    if (thdId == 0) s_run[kMaxNpes] = 0;
   }
   __syncthreads();
 
@@ -2640,8 +2648,18 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
           }
         }
       }
-      for (int tokBase = aWarp * _etpi; !(kPlainMeta && _metaPlain) && tokBase < args.numTokens;
-           tokBase += aWarps * _etpi) {
+      // kDynTok: grab q is token (b * W + q % W) + (q / W) * aWarps, the block's own set in the order
+      // of the stride, so it grows with q and the bound still ends the loop.
+      const bool _dyn = kDynTok && !kPayFirst && _etpi == 1 && !_tokChunk && !_metaPlain;
+      auto _dynGrab = [&]() -> int {
+        int q = 0;
+        if (laneId == 0) q = (int)atomicAdd(&s_run[kMaxNpes], (index_t)1);
+        q = __shfl(q, 0);
+        return ((int)blockIdx.x * warpNum + q % warpNum) + (q / warpNum) * aWarps;
+      };
+      for (int tokBase = _dyn ? _dynGrab() : aWarp * _etpi;
+           !(kPlainMeta && _metaPlain) && tokBase < args.numTokens;
+           tokBase = _dyn ? _dynGrab() : tokBase + aWarps * _etpi) {
         for (int _sub = 0; _sub < _etpi; ++_sub) {
           int tok = tokBase + _sub;
           if (tok >= args.numTokens) break;
