@@ -350,12 +350,19 @@ _COMBINE_PUSH_TABLE: dict = {
 #   bf16 at 1 / 4 / 16: dispatch 20.4 -> 9.9, 20.1 -> 10.7, 22.5 -> 11.5; combine 24.3 -> 10.1,
 #     26.9 -> 10.5, 14.9 -> 11.2 on 64x8, and on 64x16 (parts of 4 units) another 1.7 less:
 #     10.3 -> 8.6, 10.6 -> 8.9, 11.3 -> 9.6.
+# EP32 on C1 C2 C4 C6 C9 C11 C14 C17, same day and method: fp4 up to 64 tokens a rank, fp8 up to 16.
+#   fp4 at 1 / 4 / 16 / 64: dispatch 22.1 -> 13.1, 23.2 -> 13.3, 25.9 -> 15.9, 26.5 -> 20.4;
+#     combine 14.8 -> 8.5, 15.3 -> 9.2, 15.5 -> 9.4, 16.2 -> 11.7. At 128 the dispatch loses.
+#   fp8 at 1 / 4 / 16: dispatch 21.7 -> 13.2, 22.5 -> 13.3, 25.8 -> 24.0; combine 16.3 -> 9.1,
+#     16.8 -> 9.6, 17.1 -> 10.5. At 64 the dispatch loses.
+#   bf16 has no EP32 entry: the schedule's bf16 op failed its window import there (no baseline).
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
             (4, 7168, 6, None): {"fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))},
             (8, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
             (16, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
+            (32, 7168, 6, None): {"fp4": dict(max_tok=64, dispatch=(64, 16), combine=(64, 8))},
         },
     },
     "fp8_blockwise": {
@@ -363,6 +370,7 @@ _LL128_TABLE: dict = {
             (4, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
             (8, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
             (16, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
+            (32, 7168, 6, None): {"fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
         },
     },
     "none": {
