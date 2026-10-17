@@ -347,7 +347,8 @@ _COMBINE_PUSH_TABLE: dict = {
 #   fp8 dispatch 18.8 -> 9.0, 22.8 -> 10.7, 24.1 -> 14.8, 25.4 -> 19.3; combine 14.7 -> 8.5,
 #     15.6 -> 9.7, 17.0 -> 13.6, 19.2 -> 18.7.
 #   bf16 at 1 / 4 / 16: dispatch 20.4 -> 9.9, 20.1 -> 10.7, 22.5 -> 11.5; combine 24.3 -> 10.1,
-#     26.9 -> 10.5, 14.9 -> 11.2.
+#     26.9 -> 10.5, 14.9 -> 11.2 on 64x8, and on 64x16 (parts of 4 units) another 1.7 less:
+#     10.3 -> 8.6, 10.6 -> 8.9, 11.3 -> 9.6.
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
@@ -367,7 +368,7 @@ _LL128_TABLE: dict = {
         "gfx1250": {
             (4, 7168, 6, None): {"bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))},
             # From 8 ranks past 16 tokens the bf16 combine is slower than the pull.
-            (8, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
+            (8, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))},
             (16, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
         },
     },

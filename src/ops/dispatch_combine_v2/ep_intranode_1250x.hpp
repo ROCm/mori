@@ -4663,7 +4663,10 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   constexpr int kTailLines = (kTokB - kMainB) / 8;
   constexpr int kUnits = (kLines + kLinesU - 1) / kLinesU;
   constexpr int kLlRowB = kUnits * kUnitB;
-  constexpr int kUPart = 8;
+  // Units a part: from 8 ranks on 16 warps a block, parts of 4 spread a token's rows over twice the
+  // waves at both ends (EP8, 1 / 16 tokens: 10.2 -> 8.6, 11.2 -> 9.7 us against parts of 8 on
+  // 64x8). EP4 keeps parts of 8: with 4 its 64-token combine is 0.4 us slower.
+  constexpr int kUPart = kCfg.warpPerBlock >= 16 && npes >= 8 ? 4 : 8;
   constexpr int kParts = (kUnits + kUPart - 1) / kUPart;
   constexpr size_t kLandOff = (size_t)EpMaxRecv(kCfg) * kTokB;
   constexpr unsigned kSpinMax = 1u << 22;
