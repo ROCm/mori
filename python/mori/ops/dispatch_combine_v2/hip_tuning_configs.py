@@ -340,7 +340,8 @@ _COMBINE_PUSH_TABLE: dict = {
 #   fp8 dispatch 20.6 -> 9.7, 25.3 -> 14.6, 25.9 -> 18.4, 27.9 -> 27.3; combine 15.8 -> 8.8,
 #     16.8 -> 10.0, 18.5 -> 14.6, 21.3 -> 20.8.
 #   bf16 at 1 / 4 / 16: dispatch 22.8 -> 10.7, 23.1 -> 11.4, 25.1 -> 12.9; combine 28.2 -> 10.6,
-#     31.9 -> 11.2, 15.7 -> 12.1. Its combine loses at 64 (18.0 -> 26.0).
+#     31.9 -> 11.2, 15.7 -> 12.1 on 64x8. Its combine loses at 64 (18.0 -> 26.0). On 64x16 (parts
+#     of 4 units; C1 C4 C13 C14) the combine is 26.4 -> 8.9, 30.7 -> 9.5, 15.8 -> 10.7.
 # EP8 on C1 C4, same day and method, at 1 / 16 / 64 / 128:
 #   fp4 dispatch 18.6 -> 8.6, 22.7 -> 9.5, 23.6 -> 12.6, 24.4 -> 16.1; combine 13.3 -> 8.0,
 #     14.0 -> 8.7, 14.8 -> 10.5, 16.0 -> 15.3.
@@ -369,7 +370,7 @@ _LL128_TABLE: dict = {
             (4, 7168, 6, None): {"bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))},
             # From 8 ranks past 16 tokens the bf16 combine is slower than the pull.
             (8, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))},
-            (16, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
+            (16, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))},
         },
     },
 }
