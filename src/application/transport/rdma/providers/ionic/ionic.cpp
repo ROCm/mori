@@ -24,19 +24,24 @@
 
 #include <hip/hip_runtime_api.h>
 #include <infiniband/verbs.h>
+#include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <tuple>
 
 #include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
+#include "mori/utils/env_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori {
@@ -128,7 +133,12 @@ IonicCqContainer::IonicCqContainer(ibv_context* context, const RdmaEndpointConfi
     cq_ex = ibv_create_cq_ex(context, &cq_attr);
   }
 
-  assert(cq_ex);
+  if (cq_ex == nullptr) {
+    int savedErrno = errno;
+    MORI_APP_ERROR("IONIC CQ creation failed: errno {} ({}), ccqe:{}, cqe:{}", savedErrno,
+                   strerror(savedErrno), ccqe_enabled, cq_attr.cqe);
+    std::abort();
+  }
   cq = ibv_cq_ex_to_cq(cq_ex);
   assert(cq);
 
@@ -249,7 +259,12 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
   attr.send_cq = cq;
   attr.recv_cq = cq;
   qp = ibv_create_qp_ex(context, &attr);
-  assert(qp);
+  if (qp == nullptr) {
+    int savedErrno = errno;
+    MORI_APP_ERROR("IONIC QP creation failed: errno {} ({}), max_send_wr:{}, max_recv_wr:{}",
+                   savedErrno, strerror(savedErrno), attr.cap.max_send_wr, attr.cap.max_recv_wr);
+    std::abort();
+  }
 
   HIP_RUNTIME_CHECK(hipGetDevice(&hip_dev_id));
   IonicDvApi::Instance().get_ctx(&dvctx, context);
@@ -312,12 +327,62 @@ IonicQpContainer::IonicQpContainer(ibv_context* context, const RdmaEndpointConfi
     assert(!err);
   }
 
-  // Register atomic ibuf as independent memory region
+  // Register atomic ibuf as independent memory region.
+  //
+  // A device-resident ibuf is GPU memory just like the CQ/SQ/RQ rings, so a bare
+  // VA only resolves if a peer memory client is registered with the RDMA stack.
+  // That is not guaranteed: amdgpu's PeerDirect client is optional and resolves
+  // ib_register_peer_memory_client via symbol_get at load time, so on a host
+  // without it ibv_reg_mr returns NULL here while the dma-buf path works fine.
+  // Try both, ordered the same way payload MRs are in RegisterRdmaMemoryRegionAuto.
   int atomicIbufAccessFlag =
       MaybeAddRelaxedOrderingFlag(IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  atomicIbufMr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
-  assert(atomicIbufMr);
+
+  // errno of each failed attempt; dmabufErrno stays 0 when the dmabuf export itself
+  // failed, since the HSA/HIP export paths do not set errno.
+  int dmabufErrno = 0;
+  int plainErrno = 0;
+  auto tryIbufDmabuf = [&]() -> ibv_mr* {
+    if (!config.onGpu) return nullptr;
+    uint64_t dmabufOffset = 0;
+    int dmabufFd = TryExportDmabufFd(atomicIbufAddr, atomicIbufSize, &dmabufOffset);
+    if (dmabufFd < 0) return nullptr;
+    ibv_mr* mr = ibv_reg_dmabuf_mr(pd_uxdma, dmabufOffset, atomicIbufSize,
+                                   reinterpret_cast<uint64_t>(atomicIbufAddr), dmabufFd,
+                                   atomicIbufAccessFlag);
+    if (mr == nullptr) dmabufErrno = errno;
+    close(dmabufFd);
+    return mr;
+  };
+  auto tryIbufPlain = [&]() -> ibv_mr* {
+    ibv_mr* mr = ibv_reg_mr(pd_uxdma, atomicIbufAddr, atomicIbufSize, atomicIbufAccessFlag);
+    if (mr == nullptr) plainErrno = errno;
+    return mr;
+  };
+
+  bool preferDmabuf = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
+  for (int attempt = 0; attempt < 2 && (atomicIbufMr == nullptr); ++attempt) {
+    bool useDmabuf = (attempt == 0) ? preferDmabuf : !preferDmabuf;
+    atomicIbufMr = useDmabuf ? tryIbufDmabuf() : tryIbufPlain();
+    if (atomicIbufMr) {
+      MORI_APP_TRACE("IONIC atomic ibuf registered via {}, addr:{}, size:{}",
+                     useDmabuf ? "dmabuf" : "ibv_reg_mr", atomicIbufAddr, atomicIbufSize);
+    }
+  }
+
+  if (atomicIbufMr == nullptr) {
+    std::string dmabufStatus = !config.onGpu      ? "skipped (host memory)"
+                               : dmabufErrno != 0 ? strerror(dmabufErrno)
+                                                  : "dmabuf export failed";
+    MORI_APP_ERROR(
+        "IONIC atomic ibuf registration failed (addr:{}, size:{}, onGpu:{}): ibv_reg_mr: "
+        "errno {} ({}); dmabuf: {}. Device memory needs either a dma-buf capable "
+        "libionic/driver or a registered peer memory client.",
+        atomicIbufAddr, atomicIbufSize, config.onGpu, plainErrno, strerror(plainErrno),
+        dmabufStatus);
+    std::abort();
+  }
 
   MORI_APP_TRACE(
       "IONIC Atomic ibuf allocated: addr=0x{:x}, slots={}, size={}, lkey=0x{:x}, rkey=0x{:x}",
@@ -366,6 +431,10 @@ void IonicQpContainer::ModifyRst2Init() {
 
   attr_mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
   err = ibv_modify_qp(qp, &attr, attr_mask);
+  if (err != 0) {
+    MORI_APP_ERROR("ionic ModifyRst2Init failed: err:{} ({}), qpn:{}, portId:{}", err,
+                   strerror(err), qp ? qp->qp_num : 0, config.portId);
+  }
   assert(err == 0);
 }
 
@@ -411,6 +480,18 @@ void IonicQpContainer::ModifyInit2Rtr(const RdmaEndpointHandle& local_handle,
   printf("\n");
 #endif
   err = ibv_modify_qp(qp, &attr, attr_mask);
+  if (err != 0) {
+    char dgidStr[48] = {0};
+    for (int i = 0; i < 16; i++) {
+      snprintf(dgidStr + i * 2, sizeof(dgidStr) - i * 2, "%02x", remote_handle.eth.gid[i]);
+    }
+    MORI_APP_ERROR(
+        "ionic ModifyInit2Rtr failed: err:{} ({}), local_qpn:{}, dest_qpn:{}, rq_psn:{}, "
+        "sgid_index:{}, portId:{}, path_mtu:{}, max_dest_rd_atomic:{}, sl:{}, tc:{}, dgid:{}",
+        err, strerror(err), qp ? qp->qp_num : 0, attr.dest_qp_num, attr.rq_psn,
+        attr.ah_attr.grh.sgid_index, config.portId, static_cast<int>(attr.path_mtu),
+        attr.max_dest_rd_atomic, attr.ah_attr.sl, attr.ah_attr.grh.traffic_class, dgidStr);
+  }
   assert(err == 0);
 }
 
@@ -432,6 +513,10 @@ void IonicQpContainer::ModifyRtr2Rts(const RdmaEndpointHandle& local_handle,
               IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY;
 
   err = ibv_modify_qp(qp, &attr, attr_mask);
+  if (err != 0) {
+    MORI_APP_ERROR("ionic ModifyRtr2Rts failed: err:{} ({}), local_qpn:{}, sq_psn:{}", err,
+                   strerror(err), qp ? qp->qp_num : 0, attr.sq_psn);
+  }
   assert(!err);
 }
 
@@ -452,6 +537,71 @@ void* IonicDeviceContext::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_c
   return dev_ptr;
 }
 
+int IonicDeviceContext::pd_alloc_dmabuf(struct ibv_pd* pd, void* pd_context, size_t size,
+                                        uint64_t resource_type,
+                                        struct ionic_dmabuf_alloc_result* result) {
+  auto* self = static_cast<IonicDeviceContext*>(pd_context);
+  if ((self == nullptr) || (result == nullptr)) return EINVAL;
+
+  void* devPtr{nullptr};
+  hipError_t err =
+      hipExtMallocWithFlags(reinterpret_cast<void**>(&devPtr), size, hipDeviceMallocUncached);
+  if (err != hipSuccess) {
+    (void)hipGetLastError();
+    MORI_APP_ERROR("pd_alloc_dmabuf: hipExtMallocWithFlags failed, size:{}, resource_type:{:#x}",
+                   size, resource_type);
+    return ENOMEM;
+  }
+  memset(devPtr, 0, size);
+
+  uint64_t offset = 0;
+  int fd = TryExportDmabufFd(devPtr, size, &offset);
+  if (fd < 0) {
+    MORI_APP_ERROR("pd_alloc_dmabuf: dmabuf export failed, size:{}, resource_type:{:#x}", size,
+                   resource_type);
+    HIP_RUNTIME_CHECK(hipFree(devPtr));
+    return EOPNOTSUPP;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(self->dmabufRingsMutex);
+    self->dmabufRings[fd] = DmabufRing{devPtr, offset};
+  }
+
+  result->fd = fd;
+  result->offset = offset;
+  // Hand back the VA too so the provider can still drive ibv_post_send/recv and ibv_poll_cq.
+  result->ptr = devPtr;
+
+  MORI_APP_TRACE("pd_alloc_dmabuf, addr:{}, size:{}, fd:{}, offset:{}, resource_type:{:#x}", devPtr,
+                 size, fd, offset, resource_type);
+  return 0;
+}
+
+void IonicDeviceContext::pd_free_dmabuf(struct ibv_pd* pd, void* pd_context, int fd,
+                                        uint64_t offset, uint64_t resource_type) {
+  auto* self = static_cast<IonicDeviceContext*>(pd_context);
+  if (self == nullptr) return;
+
+  void* devPtr{nullptr};
+  {
+    std::lock_guard<std::mutex> lock(self->dmabufRingsMutex);
+    auto it = self->dmabufRings.find(fd);
+    if (it == self->dmabufRings.end()) {
+      MORI_APP_WARN("pd_free_dmabuf: unknown fd:{}, offset:{}, resource_type:{:#x}", fd, offset,
+                    resource_type);
+      return;
+    }
+    devPtr = it->second.devPtr;
+    self->dmabufRings.erase(it);
+  }
+
+  close(fd);
+  HIP_RUNTIME_CHECK(hipFree(devPtr));
+  MORI_APP_TRACE("pd_free_dmabuf, addr:{}, fd:{}, offset:{}, resource_type:{:#x}", devPtr, fd,
+                 offset, resource_type);
+}
+
 void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_pd* pd_orig) {
   struct ibv_parent_domain_init_attr pattr;
 
@@ -461,6 +611,17 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   pattr.free = IonicDeviceContext::pd_release;
   pattr.pd_context = nullptr;
   pattr.alloc = IonicDeviceContext::pd_alloc_device_uncached;
+
+  // Same switch as payload MRs: MORI_ENABLE_DMABUF_REG=1 enables dma-buf CQ/SQ/RQ
+  // rings. Needs libionic >= the release that exports ionic_dv_pd_set_dmabuf_alloc;
+  // older libs keep the bare-VA alloc above.
+  bool wantDmabufRings = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
+  bool useDmabufRings = wantDmabufRings && IonicDvApi::Instance().pd_set_dmabuf_alloc != nullptr;
+  if (wantDmabufRings && !useDmabufRings) {
+    MORI_APP_WARN(
+        "libionic has no ionic_dv_pd_set_dmabuf_alloc; CQ/SQ/RQ rings fall back to bare-VA "
+        "allocation");
+  }
 #if 0
   pd_parent = ibv_alloc_parent_domain(defaultContext, &pattr);
   assert(pd_parent);
@@ -472,6 +633,20 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
     pd_uxdma[i] = ibv_alloc_parent_domain(context, &pattr);
     assert(pd_uxdma[i]);
     // printf("create_parent_domain, pd_uxdma:%p\n", pd_uxdma[i]);
+    if (useDmabufRings) {
+      int err = IonicDvApi::Instance().pd_set_dmabuf_alloc(
+          pd_uxdma[i], IonicDeviceContext::pd_alloc_dmabuf, IonicDeviceContext::pd_free_dmabuf,
+          this);
+      if (err) {
+        MORI_APP_WARN(
+            "ionic_dv_pd_set_dmabuf_alloc failed on pd_uxdma[{}] (err:{}); falling back to bare-VA "
+            "rings",
+            i, err);
+      } else {
+        dmabufRingsEnabled = true;
+        MORI_APP_TRACE("dmabuf descriptor rings enabled on pd_uxdma[{}]", i);
+      }
+    }
     IonicDvApi::Instance().pd_set_sqcmb(pd_uxdma[i], false, false, false);
     IonicDvApi::Instance().pd_set_rqcmb(pd_uxdma[i], false, false, false);
     IonicDvApi::Instance().pd_set_udma_mask(pd_uxdma[i], 1u << i);
@@ -493,6 +668,18 @@ IonicDeviceContext::~IonicDeviceContext() {
     delete it.second;
   }
   cqPool.clear();
+
+  // Parent domains can only be released once no CQ/QP references them. Only done with
+  // dmabuf rings, whose fds must be returned; the default path keeps them until the
+  // device is closed, as it always has.
+  for (int i = 0; i < 2 && dmabufRingsEnabled; i++) {
+    if (pd_uxdma[i] == nullptr) continue;
+    int err = ibv_dealloc_pd(pd_uxdma[i]);
+    if (err != 0) {
+      MORI_APP_WARN("ibv_dealloc_pd failed on pd_uxdma[{}]: err:{} ({})", i, err, strerror(err));
+    }
+    pd_uxdma[i] = nullptr;
+  }
 }
 
 RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& config) {
@@ -550,7 +737,9 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.atomicIbuf.lkey = qp->atomicIbufMr->lkey;
   endpoint.atomicIbuf.rkey = qp->atomicIbufMr->rkey;
   endpoint.atomicIbuf.nslots = RoundUpPowOfTwo(config.atomicIbufSlots);
-  // cqPool.insert({cq->cqn, cq});
+  // One CQ per endpoint, keyed by its QP's qpn: ionic leaves cqn unset (0 for every CQ).
+  // Tracked (and so destroyed at teardown) only with dmabuf rings, to release the ring fd.
+  if (dmabufRingsEnabled) cqPool.insert({qp->qpn, cq});
   qpPool.insert({qp->qpn, qp});
 
   MORI_APP_TRACE(
