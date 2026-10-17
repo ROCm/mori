@@ -34,6 +34,7 @@ import glob
 # MI350X/MI355X (both 256 CU) are only separable here, not by CU count.
 _DID_TO_MODEL = {
     0x74A1: "mi300x",  # MI300X (gfx942, 304 CU)
+    0x74A9: "mi300x",  # MI300X HF (gfx942, 304 CU)
     0x74A5: "mi325x",  # MI325X (gfx942, 304 CU)
     0x74A2: "mi308x",  # MI308X (gfx942, 80 CU)
     0x75A0: "mi350x",  # MI350X (gfx950, 256 CU)
