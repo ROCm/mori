@@ -1030,6 +1030,29 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   const bool _dedupOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens);
   int _cDestPe = -1;
   int _cKeep = 0;
+  // kLdsMeta: at 32 ranks and up, on a chunked call of at most kEpTokChunk token warps a block, the
+  // reservation of a block's slots is a fabric round trip (EP32 512 tokens: 5.8 us from the count to
+  // the bases), and the staging of the metadata, its TDM loads back and the payload load came after
+  // it (4.5 us more before the first store). Here a token-free warp reserves while the token warps
+  // put every row's ids, weights, source and scale into the block's run to its rank in LDS, held in
+  // the slabs of the token-free warps, and load their payload row; once the bases are in, the runs
+  // and rows go out with nothing to load. A token adds at most one row to a run, so a run is at most
+  // kEpTokChunk rows.
+  constexpr int kRbRows = kEpTokChunk;
+  constexpr int kRbIdxB = (kRbRows * topk * 4 + 255) / 256 * 256;
+  constexpr int kRbSrcB = (kRbRows * 4 + 255) / 256 * 256;
+  constexpr int kRbPeerB = 2 * kRbIdxB + kRbSrcB + kRbRows * kEpScaleStride;
+  constexpr bool kLdsMeta = kCfg.dtype == EpDType::Fp4x2 && kPayFirst && !kPayFirstPlain &&
+                            kCfg.aggReserve && npes >= 32 && (kEpScaleBytes == 0 || kScWave) && topk <= WS &&
+                            EpCallTok(kCfg) <= kCfg.blockNum * kEpTokChunk &&
+                            kCfg.warpPerBlock >= 2 * kEpTokChunk &&
+                            (long long)npes * kRbPeerB <=
+                                (long long)(kCfg.warpPerBlock - kEpTokChunk) * kSlabBytes;
+  const bool _ldsMeta = kLdsMeta && _tokChunk && _etpi == 1 && _preKOk && _dedupOk &&
+                        args.tokenIndices && args.inpTokenBuf &&
+                        (kEpScaleBytes == 0 || _scWave);
+  [[maybe_unused]] index_t _ldsJ = -1;
+  bool _mDirect = false;
   const bool _bdOk = (_etpi == 1);
   constexpr int kMrgN = 8;
   const bool _mrg = _dpin && _rowOk && (long long)args.numTokens <= (long long)kMrgN * aWarps;
@@ -1148,7 +1171,7 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     // base with the call number in one word.
     static_assert(npes <= WS, "one lane per destination");
     static_assert(kCfg.maxTokPerRank < (1 << 20), "a destination's total is kept in 20 bits");
-    if (warpId == 0) {
+    if (warpId == (_ldsMeta ? warpNum - 1 : 0)) {
       constexpr int R = __ATOMIC_RELAXED;
       constexpr int A = __HIP_MEMORY_SCOPE_AGENT;
       const int p = laneId;
@@ -1225,7 +1248,42 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
       if (laneId == 0) s_upP[npes] = tot;
     }
   }
+  [[maybe_unused]] uint8_t* const _rb =
+      reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)kEpTokChunk * kSlabBytes;
+  if constexpr (kLdsMeta) {
+    // The token warp's one token: its row's place in the block's run to each rank it goes to, the
+    // row's parts into that run, and the payload into the warp's slab.
+    if (_ldsMeta && aWarp < (int)args.numTokens) {
+      const int tok = aWarp;
+      if (_cKeep) _ldsJ = (index_t)atomicAdd(&s_run[_cDestPe], 1);
+      if (_cKeep && _ldsJ >= (index_t)kRbRows) __builtin_trap();
+      const unsigned long long km0 = __ballot(_cKeep != 0);
+      for (unsigned long long km = km0; km; km &= km - 1) {
+        const int l = __ffsll((long long)km) - 1;
+        const int d = __builtin_amdgcn_readlane(_cDestPe, l);
+        const int j = __builtin_amdgcn_readlane(_ldsJ, l);
+        uint8_t* const pr = _rb + (size_t)d * kRbPeerB;
+        if (laneId < topk) {
+          reinterpret_cast<index_t*>(pr)[j * topk + (int)laneId] = pickIdx(0);
+          if constexpr (kCfg.useWeights) {
+            if (args.weightsBuf) reinterpret_cast<float*>(pr + kRbIdxB)[j * topk + (int)laneId] = pickWt(0);
+          }
+        }
+        if (laneId == 0) reinterpret_cast<index_t*>(pr + 2 * kRbIdxB)[j] = EpSrcTokIndex<kCfg>(myPe, tok);
+        if constexpr (kEpScaleBytes > 0) {
+          unsigned* const ps = reinterpret_cast<unsigned*>(pr + 2 * kRbIdxB + kRbSrcB) +
+                               (size_t)j * (kEpScaleStride / 4) + (size_t)laneId * kScK;
+#pragma unroll
+          for (int q = 0; q < kScK; ++q) ps[q] = pickSc(0, q);
+        }
+      }
+      if (km0 != 0ull)
+        TdmIssueLoad<T>(_tdmTile, reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
+                        _tdmG1);
+    }
+  }
   __syncthreads();
+  if (!kLdsMeta || !_ldsMeta) {
   if (_ls && warpId == 0 && _lsLast && _lsTot > 0) {
     _lsBase = __hip_atomic_fetch_add(EpTokOff(args, (int)laneId), _lsTot, __ATOMIC_RELAXED,
                                      __HIP_MEMORY_SCOPE_SYSTEM);
@@ -1547,7 +1605,6 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
     }
   }
   bool _mPend = false;
-  bool _mDirect = false;
   // The largest metadata run, in tokens, that the lanes store directly instead of through the TDM
   // tile. At 32 ranks a run is a token or two (EP32 512 tokens -1.1 us); at 4 ranks the runs are
   // longer and the tile is faster (EP4 +2.4 us), at 16 it is a wash. With scales a token carries
@@ -2613,6 +2670,56 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
         }
       }
     }
+  }
+  } else if constexpr (kLdsMeta) {
+    // The bases are in: the token warp's map entries; the block's runs, ranks w and w + warpPerBlock
+    // for warp w, ids, weights and sources from the lanes and the scale rows by TDM out of LDS; then
+    // the payload stores. The runs go first, while the fabric is still quiet: behind the payload
+    // their lane stores took 7-9 us a warp (EP32 512 tokens, p50).
+    const bool _tw = aWarp < (int)args.numTokens;
+    const unsigned long long _km = __ballot(_tw && _cKeep != 0);
+    if (_km != 0ull) __builtin_amdgcn_s_wait_tensorcnt(0);
+    if (_tw && laneId < topk) {
+      const int dk = _cKeep ? _cDestPe : 0;
+      args.dispDestTokIdMap[(size_t)aWarp * topk + laneId] =
+          _cKeep ? EpFlatIndex<kCfg>(dk, s_base[dk] + _ldsJ) : EpNullFlat<kCfg>();
+    }
+    for (int d = warpId; d < npes; d += warpNum) {
+      const int n = s_N[d];
+      if (n <= 0) continue;
+      const index_t ab = s_base[d];
+      const uint8_t* const pr = _rb + (size_t)d * kRbPeerB;
+      const int nI = n * topk;
+      index_t* const eI = EpPeer<index_t>(win, d, args.offOutIdx) + (size_t)ab * topk;
+      for (int i = laneId; i < nI; i += WS) eI[i] = reinterpret_cast<const index_t*>(pr)[i];
+      if constexpr (kCfg.useWeights) {
+        if (args.weightsBuf) {
+          float* const eW = EpPeer<float>(win, d, args.offOutWts) + (size_t)ab * topk;
+          for (int i = laneId; i < nI; i += WS) eW[i] = reinterpret_cast<const float*>(pr + kRbIdxB)[i];
+        }
+      }
+      if (laneId < n)
+        EpPeer<index_t>(win, d, args.offRecvToSrc)[ab + laneId] =
+            reinterpret_cast<const index_t*>(pr + 2 * kRbIdxB)[laneId];
+      if constexpr (kEpScaleBytes > 0) {
+        if (args.scalesBuf) {
+          constexpr int kSdw = kEpScaleStride / 4;
+          TdmIssueStore<int>(reinterpret_cast<int*>(EpPeer<unsigned>(win, d, args.offOutScales) +
+                                                    (size_t)ab * kSdw),
+                             reinterpret_cast<int*>(const_cast<uint8_t*>(pr) + 2 * kRbIdxB + kRbSrcB),
+                             TdmShape<int>(n * kSdw));
+        }
+      }
+      _mDirect = true;
+    }
+    for (unsigned long long km = _km; km; km &= km - 1) {
+      const int l = __ffsll((long long)km) - 1;
+      const int d = __builtin_amdgcn_readlane(_cDestPe, l);
+      const index_t slot = s_base[d] + __builtin_amdgcn_readlane(_ldsJ, l);
+      TdmIssueStore<T>(EpPeer<T>(win, d, args.offDispOut) + (size_t)slot * hiddenDim, _tdmTile,
+                       _tdmG1);
+    }
+    __builtin_amdgcn_s_wait_tensorcnt(0);
   }
   // The signal store orders the TDM stores by their tensorcnt wait; the direct ones need theirs,
   // taken here so that they overlap the payload pass.
