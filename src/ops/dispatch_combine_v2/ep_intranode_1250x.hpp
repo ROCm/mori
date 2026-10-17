@@ -934,7 +934,12 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
                               EpCallTok(kCfg) > kCfg.blockNum * kCfg.warpPerBlock;
   const bool _metaPlain = kPlainMeta && !_tokChunk && _etpi == 1 && (int)args.numTokens > aWarps;
   constexpr int kPreK = 4;
-  const bool _preKOk = (_etpi == 1) && (_preGsz >= topk) && (args.numTokens > 0) &&
+  // The pinned-destination geometry (kDPin, EP16 128x16) takes the row window, and with it the fused
+  // path, from past two tokens a warp: EP16, 3 alternating rounds, an op of 8192 tokens a rank,
+  // 5120 / 6144 / 7168 / 8192 tokens -3.35 / -6.52 / -8.88 / -19.38 us; at one or two a warp it lost
+  // (2048 +6.2, 4096 +14.5).
+  const bool _kdRow = kDPin && (long long)args.numTokens > 2LL * aWarps;
+  const bool _preKOk = !_kdRow && (_etpi == 1) && (_preGsz >= topk) && (args.numTokens > 0) &&
                        ((long long)aWarps * kPreK >= (long long)args.numTokens) &&
                        args.tokenIndices && args.inpTokenBuf;
   // Past kPreK tokens a warp the same registers hold a window of kPreK tokens that rotates: each
@@ -944,7 +949,9 @@ __device__ void EpDispatch1250xBody(EpArgs args) {
   // the tables take them only where no warp holds more than kPreK tokens, and there the extra code
   // alone cost EP4 fp4 0.3-0.5 us at 128 / 512 tokens.
   constexpr bool kRowPre =
-      kCfg.warpPerBlock >= 16 && EpCallTok(kCfg) > kPreK * kCfg.blockNum * kCfg.warpPerBlock;
+      kCfg.warpPerBlock >= 16 &&
+      (EpCallTok(kCfg) > kPreK * kCfg.blockNum * kCfg.warpPerBlock ||
+       (kDPin && EpCallTok(kCfg) > 2 * kCfg.blockNum * kCfg.warpPerBlock));
   constexpr int kScK = kEpScaleBytes > 0 ? kEpScaleStride / (4 * WS) : 0;
   constexpr bool kScWave = kEpScaleBytes > 0 && kScK >= 1 && kScK <= 4 &&
                            kScK * 4 * WS == kEpScaleStride && (kEpScaleBytes / 4) % kScK == 0;
