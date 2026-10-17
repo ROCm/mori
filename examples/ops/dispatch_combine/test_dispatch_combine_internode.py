@@ -1128,47 +1128,21 @@ class EpDispatchCombineTestCase:
 
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        num_test_data = 128
+        num_test_data = 8
         sync_interval = 128
         is_cross_type = self.combine_data_type != self.dispatch_data_type
 
+        kt = mori.ops.EpDispatchCombineKernelType
+        verify = self.config.kernel_type in (kt.InterNodeV1, kt.InterNodeV1LL) and not (
+            _is_fp4x2_dtype(self.dispatch_data_type)
+            or _is_fp4x2_dtype(self.combine_data_type)
+        )
         if self.rank == 0:
-            print("Stress Test")
-        test_data_list = [
-            self.gen_test_data(
-                max_num_token=self.config.max_num_inp_token_per_rank,
-                use_max_token_num=False,
-            )
-            for i in range(num_test_data)
-        ]
-        for i in tqdm(range(5000)):
-            (
-                all_rank_num_token,
-                all_rank_indices,
-                all_rank_input,
-                all_rank_weights,
-                all_rank_scales,
-            ) = test_data_list[i % num_test_data]
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = self.run_dispatch(
-                op,
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-            )
-            combine_input = self._convert_for_combine(dispatch_output)
-            combine_output, combine_output_weight = self.run_combine(
-                op, combine_input, None, all_rank_indices[self.rank]
-            )
-            if i % sync_interval == 0:
-                torch.cuda.synchronize()
-        torch.cuda.synchronize()
+            print("Stress Test" + (" (every round verified)" if verify else ""))
+        if verify:
+            self._stress_verified_rounds(op, 5000, num_test_data, sync_interval)
+        else:
+            self._stress_rounds(op, num_test_data, sync_interval)
 
         if is_cross_type:
             if self.rank == 0:
@@ -1215,6 +1189,235 @@ class EpDispatchCombineTestCase:
                 time.sleep(0.0001)
 
         del op
+
+    def _stress_rounds(self, op, num_test_data, sync_interval):
+        test_data_list = [
+            self.gen_test_data(
+                max_num_token=self.config.max_num_inp_token_per_rank,
+                use_max_token_num=False,
+            )
+            for i in range(num_test_data)
+        ]
+        for i in tqdm(range(5000)):
+            (
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                all_rank_scales,
+            ) = test_data_list[i % num_test_data]
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = self.run_dispatch(
+                op,
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+            )
+            combine_input = self._convert_for_combine(dispatch_output)
+            combine_output, combine_output_weight = self.run_combine(
+                op, combine_input, None, all_rank_indices[self.rank]
+            )
+            if i % sync_interval == 0:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+
+    def _stress_verified_rounds(self, op, rounds, num_datasets, check_interval):
+        """Stress's back-to-back eager rounds, with every round's results verified.
+
+        Each round is checked like run_test_once: received count, dispatched tokens/indices/
+        weights/scales (exact) and combined tokens/weights. Checks run on the GPU in stream
+        order -- dispatch output before combine is launched, combine output before the next
+        dispatch -- and mismatch counts stay on the device; the host only syncs every
+        check_interval rounds, so rounds keep running back-to-back. A signalling race shows
+        up as wrong data rather than a hang, which unverified stress cannot see.
+        """
+        kt = mori.ops.EpDispatchCombineKernelType
+        from mori.tensor_utils import from_gpu_ptr
+
+        cfg = self.config
+        stride = op.max_num_tokens_to_send()
+        max_recv = op._cpp_config.max_num_tokens_to_recv()
+        max_tok = cfg.max_num_inp_token_per_rank
+        epr = cfg.num_experts_per_rank
+        k = cfg.num_experts_per_token
+        # Persistent buffer: output row -> flat (src_pe, src_tok) index. Taken once, read
+        # per round without the synchronize() that get_dispatch_src_token_pos() does.
+        ptr, _ = op._get_dispatch_src_token_pos_func(op._handle)
+        src_pos = from_gpu_ptr(ptr, (max_recv,), torch.int32)
+
+        atol, rtol = 1e-2, 1e-2
+        if getattr(cfg, "quant_type", "none") == "fp8_direct_cast":
+            atol, rtol = 1e-1, 1e-1
+
+        # Every rank generates every rank's data from the same seed, so each dataset is
+        # padded into [world, max_tok, ...] tensors that can be gathered by (src_pe, src_tok).
+        datasets = []
+        for _ in range(num_datasets):
+            num_token, idx_l, inp_l, w_l, s_l = self.gen_test_data(
+                max_num_token=max_tok, use_max_token_num=False
+            )
+            d = {}
+            d["inp"] = torch.zeros(
+                self.world_size,
+                max_tok,
+                inp_l[0].shape[1],
+                dtype=inp_l[0].dtype,
+                device=self.device,
+            )
+            d["idx"] = torch.full(
+                (self.world_size, max_tok, k), -1, dtype=torch.int32, device=self.device
+            )
+            d["w"] = torch.zeros(self.world_size, max_tok, k, device=self.device)
+            d["s"] = torch.zeros(
+                self.world_size, max_tok, cfg.scale_dim, device=self.device
+            )
+            recv_cnt = 0
+            for r in range(self.world_size):
+                n = int(num_token[r])
+                d["inp"][r, :n] = inp_l[r]
+                d["idx"][r, :n] = idx_l[r]
+                d["w"][r, :n] = w_l[r]
+                d["s"][r, :n] = s_l[r]
+                recv_cnt += int(((idx_l[r] // epr) == self.rank).any(dim=1).sum())
+            # combine of a token = its input times the number of distinct dest PEs
+            pes = torch.sort(idx_l[self.rank].long() // epr, dim=1).values
+            uniq = 1 + (pes[:, 1:] != pes[:, :-1]).sum(dim=1)
+            d["comb_exp"] = (
+                inp_l[self.rank].to(self.combine_data_type).float() * uniq[:, None]
+            ).to(self.combine_data_type)
+            d["comb_w_exp"] = w_l[self.rank] * uniq[:, None]
+            d["n_my"], d["recv_cnt"] = int(num_token[self.rank]), recv_cnt
+            del idx_l, inp_l, w_l, s_l
+            datasets.append(d)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        cats = [
+            "recv_count",
+            "disp_token",
+            "disp_index",
+            "disp_weight_scale",
+            "comb_token",
+            "comb_weight",
+        ]
+        errs = torch.zeros(rounds, len(cats), dtype=torch.int64, device=self.device)
+        got_total = torch.zeros(rounds, dtype=torch.int64, device=self.device)
+        # Self-check of the checker: corrupt one received element at this round on rank 0.
+        inject_round = int(os.environ.get("MORI_STRESS_VERIFY_INJECT_ROUND", "-1"))
+        # MORI_STRESS_JITTER=<max_us>: before each dispatch every rank spins its GPU for a random
+        # 0..max_us, drawn independently per rank, so ranks enter each round out of step and
+        # cross-round windows (flag resets, barriers) get exercised with varying overlap.
+        jitter_us = int(os.environ.get("MORI_STRESS_JITTER", "0"))
+        jitter_cycles = []
+        if jitter_us > 0:
+            s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                enable_timing=True
+            )
+            torch.cuda._sleep(1000)
+            s.record()
+            torch.cuda._sleep(1_000_000)
+            e.record()
+            torch.cuda.synchronize()
+            cycles_per_us = 1_000_000 / (s.elapsed_time(e) * 1000)
+            g = torch.Generator().manual_seed(1000 + self.rank)
+            jitter_cycles = [
+                int(us * cycles_per_us)
+                for us in torch.randint(
+                    0, jitter_us + 1, (rounds,), generator=g
+                ).tolist()
+            ]
+            if self.rank == 0:
+                print(f"Stress jitter: 0..{jitter_us} us per rank before each dispatch")
+        t0 = time.time()
+        done = 0
+        failed = False
+        for i in tqdm(range(rounds), disable=self.rank != 0):
+            d = datasets[i % num_datasets]
+            n_my, n = d["n_my"], d["recv_cnt"]
+            r = self.rank
+            if jitter_cycles:
+                torch.cuda._sleep(jitter_cycles[i])
+            out, out_w, out_s, out_idx, total = self.run_dispatch(
+                op,
+                d["inp"][r, :n_my],
+                d["w"][r, :n_my],
+                d["s"][r, :n_my],
+                d["idx"][r, :n_my],
+            )
+            if i == inject_round and self.rank == 0 and n > 0:
+                out[0].view(torch.uint8)[1] ^= 0x40
+            e = errs[i]
+            got_total[i] = total.view(()).long()
+            e[0] = (total.view(()).long() != n).long()
+            pos = src_pos[:n].long()
+            spe, stok = pos // stride, pos % stride
+            e[1] = (out[:n] != d["inp"][spe, stok]).any(dim=1).sum()
+            e[2] = (out_idx[:n] != d["idx"][spe, stok]).any(dim=1).sum()
+            if out_w is not None:
+                e[3] += (out_w[:n] != d["w"][spe, stok]).any(dim=1).sum()
+            if out_s is not None:
+                e[3] += (out_s[:n] != d["s"][spe, stok]).any(dim=1).sum()
+
+            comb_w_in = None if cfg.kernel_type == kt.AsyncLL else out_w
+            comb_out, comb_w = self.run_combine(
+                op, self._convert_for_combine(out), comb_w_in, d["idx"][r, :n_my]
+            )
+            e[4] = (
+                (
+                    ~torch.isclose(
+                        comb_out[:n_my].float(),
+                        d["comb_exp"].float(),
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                )
+                .any(dim=1)
+                .sum()
+            )
+            if comb_w_in is not None and comb_w is not None:
+                e[5] = (
+                    (
+                        ~torch.isclose(
+                            comb_w[:n_my], d["comb_w_exp"], atol=1e-5, rtol=1e-5
+                        )
+                    )
+                    .any(dim=1)
+                    .sum()
+                )
+
+            if (i + 1) % check_interval == 0 or i == rounds - 1:
+                tot = torch.tensor([int(errs[: i + 1].sum())], dtype=torch.int64)
+                dist.all_reduce(tot)
+                done = i + 1
+                if int(tot) > 0:
+                    failed = True
+                    bad = torch.nonzero(errs[: i + 1].sum(dim=1)).flatten().tolist()
+                    if bad:
+                        first = bad[0]
+                        detail = {
+                            c: int(v) for c, v in zip(cats, errs[first].tolist()) if v
+                        }
+                        print(
+                            f"rank {self.rank} FAIL: first bad round {first} "
+                            f"(dataset {first % num_datasets}): {detail}; recv expected "
+                            f"{datasets[first % num_datasets]['recv_cnt']} got "
+                            f"{int(got_total[first])}"
+                        )
+                    break
+
+        totals = dict(zip(cats, errs[:done].sum(dim=0).tolist()))
+        print(
+            f"rank {self.rank} stress verify {'FAIL' if failed else 'PASS'}: {done} rounds "
+            f"in {time.time() - t0:.0f}s, bad rows {totals}"
+        )
+        dist.barrier()
+        assert not failed, f"rank {self.rank}: stress produced wrong results"
 
     def measure_e2e(
         self,
