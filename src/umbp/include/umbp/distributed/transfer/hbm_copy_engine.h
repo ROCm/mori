@@ -127,6 +127,18 @@ class HbmCopyEngine final : public TransferEngine {
   // threads that have called Submit.  Lets a test assert the reuse.
   static uint64_t GatherStreamsCreated();
 
+  // Creates `gather_streams_per_device` gather streams on every GPU and runs an
+  // empty gather on each, copies once on every one of the GPU's copy engines,
+  // and runs a hipMemcpy each way, so that the hardware queues (compute and
+  // copy engine), descriptor staging and kernel code object that copies would
+  // otherwise create on first use already exist.  It also caps each device at
+  // that many gather streams, so that later gathers wait for one rather than
+  // create more.  Call it before serving.  Creating a hardware queue migrates
+  // its context-save area into VRAM, and with the GPU nearly full, as it is
+  // next to an inference server, that has been seen to stall the whole process
+  // for 30-46 s at a time (amdgpu 6.16).
+  static void Prewarm(size_t gather_streams_per_device);
+
  private:
   // Why a plan did not take the gather kernel.  The hot path never computes
   // this: it is filled in only when debug mode is on (UMBP_HBM_COPY_DEBUG), so
