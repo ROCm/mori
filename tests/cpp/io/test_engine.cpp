@@ -45,6 +45,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
@@ -2026,7 +2027,9 @@ int RunHiddenDeviceImporter(const char* shmPath, int localDevice) {
     char hostname[HOST_NAME_MAX];
     gethostname(hostname, HOST_NAME_MAX);
     remoteEngDesc.hostname = std::string(hostname);
-    remoteEngDesc.nodeId = remoteEngDesc.hostname;
+    // Match the node id the exporter's backend resolves (MORI_NODE_ID, then
+    // boot_id, then hostname), or IsSameNodeEngine rejects the peer.
+    remoteEngDesc.nodeId = mori::ResolveNodeId(remoteEngDesc.hostname);
   }
   remoteEngDesc.host = "127.0.0.1";
   remoteEngDesc.port = 0;
