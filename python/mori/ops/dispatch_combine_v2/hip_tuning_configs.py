@@ -205,23 +205,11 @@ _DISPATCH_TABLE: dict = {
         #   4096  225.27 231.13 228.21
         #   8192  427.62 404.23 424.08
         #   16384 829.91 789.81 773.33
+        # EP32 takes EP4's block count at every token count (the rest of the CUs belong to the
+        # co-resident GEMM); warps may be more: up to 512 tokens 64 x 16, which runs the LDS metadata path.
         (32, 7168, 6, None): {
-            None: ((None, 64, 16),),
-            "fp8": (
-                (512, 64, 16),
-                (1024, 128, 16),
-                (2048, 256, 16),
-                (4096, 64, 16),
-                (8192, 128, 16),
-                (None, 256, 16),
-            ),
-            "fp4": (
-                (512, 64, 16),
-                (1024, 128, 16),
-                (4096, 256, 16),
-                (8192, 128, 16),
-                (None, 256, 16),
-            ),
+            None: ((512, 64, 16), (2048, 64, 16), (None, 128, 16)),
+            "fp4": ((512, 64, 16), (1024, 64, 16), (None, 128, 16)),
         },
     },
 }
@@ -311,11 +299,16 @@ _COMBINE_PUSH_TABLE: dict = {
             #   4096  134.05 105.14 105.87 112.95 106.61
             #   8192  243.99 191.68 197.61 209.69 195.29
             #   16384 462.90 371.53 358.19 402.34 368.26
+            # EP4's block counts, as the EP32 dispatch entry. Up to 512 tokens 8 warps: 16 take the
+            # overlapped path, which there loses (2026-10-18, 12 experts a rank, an op a size,
+            # 3 alternating rounds, 64x16 -> 64x8: 384 / 512 tokens 36.03 -> 28.60 / 38.59 -> 33.77,
+            # 1024 +0.3; at 512 64x16 with the overlap off measured 38.43).
             (32, 7168, 6, None): (
-                (512, 256, 8),
-                (1024, 256, 16),
-                (8192, 128, 16),
-                (None, 128, 24),
+                (512, 64, 8),
+                (2047, 64, 16),
+                (2048, 64, 24),
+                (16384, 128, 24),
+                (None, 64, 16),
             ),
         },
     },
@@ -350,10 +343,16 @@ _COMBINE_PUSH_TABLE: dict = {
             #   4096  240.54 191.73 199.64 200.24 223.46
             #   8192  448.19 375.14 362.76 364.97 415.45
             #   16384 868.81 711.16 696.19 714.86 783.73
+            # EP4's block counts, as the EP32 dispatch entry, and 8 warps up to 384 tokens: the
+            # overlapped path of 16 loses there (2026-10-18, 12 experts a rank, an op a size,
+            # 3 alternating rounds: 384 tokens 128x16 / 128x8 / 64x8 42.20 / 38.05 / 48.27,
+            # 512 46.07 / 47.73).
             (32, 7168, 6, None): (
-                (512, 256, 8),
-                (4096, 128, 16),
-                (None, 128, 24),
+                (256, 64, 8),
+                (384, 128, 8),
+                (2048, 128, 16),
+                (16384, 128, 24),
+                (None, 64, 16),
             ),
         },
     },

@@ -302,6 +302,18 @@ __device__ __forceinline__ bool EpTokChunked(int numTokens, int etpi) {
     return units <= gridDim.x * (unsigned)T;
   }
 }
+// Whether this lane holds the lowest-numbered of the token's ids going to rank d (d < 0: none). The
+// ids are lanes [0, kTopk), so it takes kTopk - 1 compares where a ballot a rank takes npes.
+template <int kTopk>
+__device__ __forceinline__ bool EpFirstOfDest(int d, int lane) {
+  bool first = d >= 0;
+#pragma unroll
+  for (int l = 0; l + 1 < kTopk; ++l) {
+    const int dl = __builtin_amdgcn_readlane(d, l);
+    if (l < lane && dl == d) first = false;
+  }
+  return first;
+}
 __device__ __forceinline__ int EpTokChunkT(int units) {
   const int g = (int)gridDim.x;
   const int t = (units + g - 1) / g;
@@ -332,6 +344,11 @@ __device__ __forceinline__ int EpTokBlocks(bool chunked, int numTokens, int etpi
 }
 
 constexpr unsigned long long kEpPinCtrOff = 64;
+// The grid token counter of the dispatch payload pass (kGDyn) and the number of blocks of the call
+// that have written their part of the token map, in the first line of _resState; both are cleared
+// at the end of a call that uses them.
+constexpr unsigned long long kEpGDynNextOff = 96;
+constexpr unsigned long long kEpGDynReadyOff = 100;
 template <int kN>
 __device__ unsigned _dpClaim[64];
 // The window's base, stride and LSA rank read once, with scalar loads, so every peer address is
@@ -549,6 +566,16 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     return pad ? make_uint2(0u, 0u) : x;
   };
   const int nW = N * kUnits;
+  // At 32 ranks past 4 tokens the units are numbered unit-major, so token t's first unit, which every
+  // rank reads before it knows whether the row is its own, goes out from wave t and the call's first
+  // units sit on N blocks. Token-major put them every kUnits-th wave: at fp8 (16 units a row) on 4
+  // blocks of 64 (EP32 fp8 16 tokens, 3 alternating rounds, dispatch 24.06 -> 14.66 us, 8 tokens
+  // 16.54 -> 13.94, fp4 16 tokens -0.9). At 4 tokens token-major spreads them too, and unit-major
+  // measured +0.34.
+  const bool unitMajor = npes >= 32 && N > 4;
+  // floor(w / N) as the high word of w * ceil(2^32 / N), exact while w * N stays below 2^32 (w is
+  // below N * kUnits < 2^16): one division a call instead of one a unit in the unrolled loop.
+  const unsigned nRcp = unitMajor ? 0xFFFFFFFFu / (unsigned)N + 1u : 0u;
   for (int u0 = wv; u0 < nW; u0 += nWaves * kStB) {
     uint4 vb[kStB];
     size_t ob[kStB];
@@ -560,7 +587,14 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
       on[ib] = w < nW;
       dm[ib] = ~0u;
       if (!on[ib]) continue;
-      const int t = w / kUnits, c = w - t * kUnits;
+      int t, c;
+      if (unitMajor) {
+        c = (int)__umulhi((unsigned)w, nRcp);
+        t = w - c * N;
+      } else {
+        t = w / kUnits;
+        c = w - t * kUnits;
+      }
       // The ids load before the row's bytes, so the stores below do not wait for them behind those.
       if constexpr (kSkip) {
         if (route && c > 0) {
@@ -916,6 +950,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr bool kMetaDtOk = EpDTypeIsByte(kCfg.dtype);
   constexpr bool kScPayOn = npes >= 32 && kMetaDtOk && EpCallTok(kCfg) > kCfg.blockNum * kEpTokChunk;
   constexpr bool kDynTok = kScPayOn;
+  // kGDyn: past two tokens a warp the payload pass takes its tokens from one counter of the whole
+  // grid instead of the block's own set, so no block is left with the slow ones; any warp can send
+  // any token, whose destinations and slots are in the token map written before the payload pass.
+  // At two tokens a warp, waiting for every block's part of the map cost more than the balance saved.
+  // EP32 with the metadata riding the payload (kRide), 3 alternating rounds, fp8 / fp4 dispatch:
+  // 8192 tokens -0.7 / -2.3 us, 16384 -9.6 / -4.8; 4096 (two a warp) +2.2 / +1.9 when it was on.
+  constexpr bool kGDyn = kDynTok && kCfg.aggReserve;
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
   // kDynTok: entry kMaxNpes is the next of the block's tokens; sized only there, so every other
@@ -962,6 +1003,10 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // the dispatch in the assignment, on ~19 dependent loads a token. Not built into 8-warp blocks:
   // the tables take them only where no warp holds more than kPreK tokens, and there the extra code
   // alone cost EP4 fp4 0.3-0.5 us at 128 / 512 tokens.
+  // At 32 ranks the count and the assignment find each token's distinct ranks with EpFirstOfDest
+  // instead of a ballot for every rank, 32 a token in each pass (EP32, 3 alternating rounds, dispatch
+  // 64 to 2048 tokens -0.7 to -1.4 us, 4096 / 8192 / 16384 -1.8 / -3.5 / -7.0, fp4 and fp8 alike).
+  constexpr bool kCDed = npes >= 32;
   constexpr bool kRowPre =
       kCfg.warpPerBlock >= 16 &&
       (EpCallTok(kCfg) > kPreK * kCfg.blockNum * kCfg.warpPerBlock ||
@@ -988,6 +1033,10 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   const bool _scPay = kScPayOn && kEpScaleStride > 0 && kEpScaleStride % 16 == 0 && !kUnitGeom &&
                       !_tokChunk && !_wtok && !_metaPlain && args.scalesBuf != nullptr &&
                       kTokB + kEpScaleStride <= kSlabBytes;
+  // The calls whose payload pass takes the grid counter (kGDyn); a subset of those taking the
+  // block's (_dyn below).
+  const bool _gdyn = kGDyn && !kPayFirst && _etpi == 1 && !_tokChunk && !_metaPlain &&
+                     (int)args.numTokens > 2 * aWarps;
   if (_preKOk) {
     const float* const wSrc = (kCfg.useWeights && args.weightsBuf)
                                   ? args.weightsBuf
@@ -1144,9 +1193,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           int d = (int)(myExpert / kCfg.numExpertPerRank);
           if (d >= 0 && d < npes) myDestPe = d;
         }
-        for (int p = 0; p < npes; ++p) {
-          unsigned long long m = __ballot(myDestPe == p);
-          if (laneId == 0 && m != 0ull) atomicAdd(&s_N[p], 1);
+        if constexpr (kCDed) {
+          if (EpFirstOfDest<topk>(myDestPe, (int)laneId)) atomicAdd(&s_N[myDestPe], 1);
+        } else {
+          for (int p = 0; p < npes; ++p) {
+            unsigned long long m = __ballot(myDestPe == p);
+            if (laneId == 0 && m != 0ull) atomicAdd(&s_N[p], 1);
+          }
         }
         // Refilled after the slot's last read, so the load lands in the slot's own registers.
         rowLoad(s, k0 + s + kPreK, false, false);
@@ -1166,7 +1219,10 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
         if (d >= 0 && d < npes) myDestPe = d;
       }
       int keep = 0;
-      if (_bdOk) {
+      if (kCDed && _bdOk) {
+        keep = EpFirstOfDest<topk>(myDestPe, (int)laneId) ? 1 : 0;
+        if (keep) atomicAdd(&s_N[myDestPe], 1);
+      } else if (_bdOk) {
         unsigned long long _mine = 0ull;
         for (int p = 0; p < npes; ++p) {
           unsigned long long m = __ballot(myDestPe == p);
@@ -1388,12 +1444,17 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           int d = (int)(rI / kCfg.numExpertPerRank);
           if (d >= 0 && d < npes) myDestPe = d;
         }
-        unsigned long long mine = 0ull;
-        for (int p = 0; p < npes; ++p) {
-          unsigned long long m = __ballot(myDestPe == p);
-          if (myDestPe == p) mine = m;
+        bool keep;
+        if constexpr (kCDed) {
+          keep = EpFirstOfDest<topk>(myDestPe, (int)laneId);
+        } else {
+          unsigned long long mine = 0ull;
+          for (int p = 0; p < npes; ++p) {
+            unsigned long long m = __ballot(myDestPe == p);
+            if (myDestPe == p) mine = m;
+          }
+          keep = myDestPe >= 0 && laneId == (__ffsll((long long)mine) - 1);
         }
-        const bool keep = myDestPe >= 0 && laneId == (__ffsll((long long)mine) - 1);
         index_t myDestTokId = -1;
         [[maybe_unused]] index_t myScRow = 0;
         if (keep) {
@@ -1568,7 +1629,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       }
     }
   }
+  // Under the grid counter another block may send this block's tokens: its part of the map is
+  // published before the block counts itself in.
+  if (_gdyn) __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
   __syncthreads();
+  if (_gdyn && thdId == 0)
+    __hip_atomic_fetch_add(EpResAt<npes, unsigned>(kEpGDynReadyOff), 1u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
 
   int _pfN = 0;
   index_t _pfSlot0 = 0;
@@ -1650,6 +1717,18 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // 56 more words and the lanes' remote stores dominate (EP32 fp4 512 tokens 59.8 -> 213.9 us), so
   // scaled formats keep the tile.
   constexpr int kMetaDirect = npes >= 32 && kEpScaleBytes == 0 ? 4 : 0;
+  // kRide: where the scale rides with the payload (_scPay), so do the indices, weights and srcmap,
+  // at up to two tokens a warp: the payload pass stores them from the lanes to each destination of
+  // a token behind its row, and the metadata pass sends no run. Otherwise every warp sent its runs
+  // ahead of its first row, and a run's TDM load waited for the earlier TDM stores of its CU, other
+  // warps' rows included (EP32 fp8 1024 tokens on 64 x 16: metadata pass p50 6.8 us, its wait 4.7,
+  // first rows at p50 13.1 us past the reservation, 1.4 to 3.2 with kRide). EP32, 3 alternating
+  // rounds, dispatch fp8 / fp4: 1024 tokens -6.0 / -10.9 us, 2048 -12.3 / -5.9, 4096 -9.4 / -12.4.
+  // Past two tokens a warp a run moves a dozen tokens' metadata in one tensor op, and three small
+  // stores a token and destination cost more than the earlier start saves (8192 / 16384 +9.0 /
+  // +20.1 fp8 when it was on).
+  constexpr bool kRide = kScPayOn && 2 * topk + 1 <= WS;
+  const bool _ride = kRide && _scPay && _etpi == 1 && (int)args.numTokens <= 2 * aWarps;
   if (args.tokenIndices && args.inpTokenBuf) {
     const int tkM = topk;
     const index_t recvCapM = (index_t)EpMaxRecv(kCfg);
@@ -1900,7 +1979,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           }
         }
       }
-      if (!kMetaPair || !_bx)
+      if ((!kMetaPair || !_bx) && !_ride)
         for (int r = _run0; r < nRuns; r += _metaWarps) {
           int peer = _runPeerMinor ? (r % npes) : (r / split);
           int part = _runPeerMinor ? (r / npes) : (r - peer * split);
@@ -2715,8 +2794,31 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       // kDynTok: grab q is token (b * W + q % W) + (q / W) * aWarps, the block's own set in the order
       // of the stride, so it grows with q and the bound still ends the loop.
       const bool _dyn = kDynTok && !kPayFirst && _etpi == 1 && !_tokChunk && !_metaPlain;
+      // _gdyn: grab q is the token itself, taken once every block of this call has counted itself in
+      // above, which makes the whole map visible.
+      if constexpr (kGDyn) {
+        if (_gdyn) {
+          if (laneId == 0) {
+            const unsigned* const ready = EpResAt<npes, unsigned>(kEpGDynReadyOff);
+            unsigned spin = 0;
+            while (__hip_atomic_load(ready, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != gridDim.x) {
+              if (++spin > (1u << 24)) __builtin_trap();
+              __builtin_amdgcn_s_sleep(1);
+            }
+          }
+          __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+      }
       auto _dynGrab = [&]() -> int {
         int q = 0;
+        if constexpr (kGDyn) {
+          if (_gdyn) {
+            if (laneId == 0)
+              q = (int)__hip_atomic_fetch_add(EpResAt<npes, unsigned>(kEpGDynNextOff), 1u,
+                                              __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            return __shfl(q, 0);
+          }
+        }
         if (laneId == 0) q = (int)atomicAdd(&s_run[kMaxNpes], (index_t)1);
         q = __shfl(q, 0);
         return ((int)blockIdx.x * warpNum + q % warpNum) + (q / warpNum) * aWarps;
@@ -2736,6 +2838,21 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
           index_t peMe = EpPeFromFlat<kCfg>(flatMe);
           int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
           if (!__any(validMe)) continue;
+          // _ride: lane e < topk holds index e of the token, lane topk + e its weight e, lane 2 * topk
+          // its srcmap entry, the words of one destination slot's metadata.
+          [[maybe_unused]] int _rv = 0;
+          if constexpr (kRide) {
+            if (_ride) {
+              if (laneId < topk) {
+                _rv = (int)args.tokenIndices[(size_t)tok * topk + laneId];
+              } else if (laneId < 2 * topk) {
+                if (kCfg.useWeights && args.weightsBuf)
+                  _rv = __float_as_int(args.weightsBuf[(size_t)tok * topk + (laneId - topk)]);
+              } else if (laneId == 2 * topk) {
+                _rv = (int)EpSrcTokIndex<kCfg>(myPe, tok);
+              }
+            }
+          }
           if (!_payPre)
             TdmIssueLoad<T>(_tdmTile,
                             reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
@@ -2778,6 +2895,22 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                                                           (size_t)destTokId * kSdw),
                                    reinterpret_cast<int*>(reinterpret_cast<char*>(_tdmTile) + kTokB),
                                    TdmShape<int>(kSdw));
+              }
+            }
+            if constexpr (kRide) {
+              if (_ride && destTokId < (index_t)EpMaxRecv(kCfg)) {
+                int* _rd = nullptr;
+                if (laneId < topk)
+                  _rd = reinterpret_cast<int*>(EpPeer<index_t>(win, destPe, args.offOutIdx) +
+                                               (size_t)destTokId * topk + laneId);
+                else if (laneId < 2 * topk && kCfg.useWeights && args.weightsBuf)
+                  _rd = reinterpret_cast<int*>(EpPeer<float>(win, destPe, args.offOutWts) +
+                                               (size_t)destTokId * topk + (laneId - topk));
+                else if (laneId == 2 * topk)
+                  _rd = reinterpret_cast<int*>(EpPeer<index_t>(win, destPe, args.offRecvToSrc) +
+                                               (size_t)destTokId);
+                if (_rd != nullptr) *_rd = _rv;
+                _mDirect = true;
               }
             }
           }
@@ -2869,6 +3002,15 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   const bool holdsHighestTicket =
       (warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket);
   if (holdsHighestTicket) {
+    // Every block is past its payload pass, so nothing reads either grid counter again this call.
+    if constexpr (kGDyn) {
+      if (_gdyn && laneId == 0) {
+        __hip_atomic_store(EpResAt<npes, unsigned>(kEpGDynNextOff), 0u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(EpResAt<npes, unsigned>(kEpGDynReadyOff), 0u, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      }
+    }
     // The counter reset and the call number go out after the signals: the system fence in front
     // of a signal waits for every store before it, and these two are a fabric round trip (EP32
     // fen to sig 4.3 us). Nothing in this call reads either again.
