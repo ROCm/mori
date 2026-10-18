@@ -1128,21 +1128,47 @@ class EpDispatchCombineTestCase:
 
     def stress_dispatch_combine(self):
         op = mori.ops.EpDispatchCombineOp(self.config)
-        num_test_data = 8
+        num_test_data = 128
         sync_interval = 128
         is_cross_type = self.combine_data_type != self.dispatch_data_type
 
-        kt = mori.ops.EpDispatchCombineKernelType
-        verify = self.config.kernel_type in (kt.InterNodeV1, kt.InterNodeV1LL) and not (
-            _is_fp4x2_dtype(self.dispatch_data_type)
-            or _is_fp4x2_dtype(self.combine_data_type)
-        )
         if self.rank == 0:
-            print("Stress Test" + (" (every round verified)" if verify else ""))
-        if verify:
-            self._stress_verified_rounds(op, 5000, num_test_data, sync_interval)
-        else:
-            self._stress_rounds(op, num_test_data, sync_interval)
+            print("Stress Test")
+        test_data_list = [
+            self.gen_test_data(
+                max_num_token=self.config.max_num_inp_token_per_rank,
+                use_max_token_num=False,
+            )
+            for i in range(num_test_data)
+        ]
+        for i in tqdm(range(5000)):
+            (
+                all_rank_num_token,
+                all_rank_indices,
+                all_rank_input,
+                all_rank_weights,
+                all_rank_scales,
+            ) = test_data_list[i % num_test_data]
+            (
+                dispatch_output,
+                dispatch_weights,
+                dispatch_scales,
+                dispatch_indices,
+                dispatch_recv_num_token,
+            ) = self.run_dispatch(
+                op,
+                all_rank_input[self.rank],
+                all_rank_weights[self.rank],
+                all_rank_scales[self.rank],
+                all_rank_indices[self.rank],
+            )
+            combine_input = self._convert_for_combine(dispatch_output)
+            combine_output, combine_output_weight = self.run_combine(
+                op, combine_input, None, all_rank_indices[self.rank]
+            )
+            if i % sync_interval == 0:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
         if is_cross_type:
             if self.rank == 0:
@@ -1190,42 +1216,29 @@ class EpDispatchCombineTestCase:
 
         del op
 
-    def _stress_rounds(self, op, num_test_data, sync_interval):
-        test_data_list = [
-            self.gen_test_data(
-                max_num_token=self.config.max_num_inp_token_per_rank,
-                use_max_token_num=False,
+    def stress_accuracy_dispatch_combine(
+        self, rounds=5000, num_datasets=8, check_interval=128
+    ):
+        """Back-to-back eager rounds like stress, with every round's results verified.
+
+        Separate from stress on purpose: the per-round checks run between dispatch and
+        combine, which changes the timing that unverified stress relies on to provoke hangs
+        and faults. Supported for InterNodeV1/V1LL (not fp4).
+        """
+        kt = mori.ops.EpDispatchCombineKernelType
+        if self.config.kernel_type not in (kt.InterNodeV1, kt.InterNodeV1LL):
+            raise ValueError(
+                f"stress_accuracy supports InterNodeV1/V1LL, not {self.config.kernel_type}"
             )
-            for i in range(num_test_data)
-        ]
-        for i in tqdm(range(5000)):
-            (
-                all_rank_num_token,
-                all_rank_indices,
-                all_rank_input,
-                all_rank_weights,
-                all_rank_scales,
-            ) = test_data_list[i % num_test_data]
-            (
-                dispatch_output,
-                dispatch_weights,
-                dispatch_scales,
-                dispatch_indices,
-                dispatch_recv_num_token,
-            ) = self.run_dispatch(
-                op,
-                all_rank_input[self.rank],
-                all_rank_weights[self.rank],
-                all_rank_scales[self.rank],
-                all_rank_indices[self.rank],
-            )
-            combine_input = self._convert_for_combine(dispatch_output)
-            combine_output, combine_output_weight = self.run_combine(
-                op, combine_input, None, all_rank_indices[self.rank]
-            )
-            if i % sync_interval == 0:
-                torch.cuda.synchronize()
-        torch.cuda.synchronize()
+        if _is_fp4x2_dtype(self.dispatch_data_type) or _is_fp4x2_dtype(
+            self.combine_data_type
+        ):
+            raise ValueError("stress_accuracy does not support fp4")
+        op = mori.ops.EpDispatchCombineOp(self.config)
+        if self.rank == 0:
+            print("Stress Accuracy Test (every round verified)")
+        self._stress_verified_rounds(op, rounds, num_datasets, check_interval)
+        del op
 
     def _stress_verified_rounds(self, op, rounds, num_datasets, check_interval):
         """Stress's back-to-back eager rounds, with every round's results verified.
@@ -1237,23 +1250,22 @@ class EpDispatchCombineTestCase:
         check_interval rounds, so rounds keep running back-to-back. A signalling race shows
         up as wrong data rather than a hang, which unverified stress cannot see.
         """
-        kt = mori.ops.EpDispatchCombineKernelType
-        from mori.tensor_utils import from_gpu_ptr
-
         cfg = self.config
         stride = op.max_num_tokens_to_send()
-        max_recv = op._cpp_config.max_num_tokens_to_recv()
         max_tok = cfg.max_num_inp_token_per_rank
         epr = cfg.num_experts_per_rank
         k = cfg.num_experts_per_token
-        # Persistent buffer: output row -> flat (src_pe, src_tok) index. Taken once, read
-        # per round without the synchronize() that get_dispatch_src_token_pos() does.
-        ptr, _ = op._get_dispatch_src_token_pos_func(op._handle)
-        src_pos = from_gpu_ptr(ptr, (max_recv,), torch.int32)
+        src_pos = op.get_dispatch_src_token_pos_buffer()
 
+        # Same tolerances as run_test_once, including the per-token widening for fp8 combine.
         atol, rtol = 1e-2, 1e-2
         if getattr(cfg, "quant_type", "none") == "fp8_direct_cast":
             atol, rtol = 1e-1, 1e-1
+        fp8_combine = self.combine_data_type in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+        comb_rtol = max(rtol, 0.15) if fp8_combine else rtol
 
         # Every rank generates every rank's data from the same seed, so each dataset is
         # padded into [world, max_tok, ...] tensors that can be gathered by (src_pe, src_tok).
@@ -1292,6 +1304,11 @@ class EpDispatchCombineTestCase:
                 inp_l[self.rank].to(self.combine_data_type).float() * uniq[:, None]
             ).to(self.combine_data_type)
             d["comb_w_exp"] = w_l[self.rank] * uniq[:, None]
+            d["comb_atol"] = (
+                (2.0 * uniq).clamp(min=atol)
+                if fp8_combine
+                else torch.full_like(uniq, atol)
+            ).float()[:, None]
             d["n_my"], d["recv_cnt"] = int(num_token[self.rank]), recv_cnt
             del idx_l, inp_l, w_l, s_l
             datasets.append(d)
@@ -1364,23 +1381,19 @@ class EpDispatchCombineTestCase:
             if out_s is not None:
                 e[3] += (out_s[:n] != d["s"][spe, stok]).any(dim=1).sum()
 
-            comb_w_in = None if cfg.kernel_type == kt.AsyncLL else out_w
             comb_out, comb_w = self.run_combine(
-                op, self._convert_for_combine(out), comb_w_in, d["idx"][r, :n_my]
+                op, self._convert_for_combine(out), out_w, d["idx"][r, :n_my]
             )
+            exp = d["comb_exp"].float()
             e[4] = (
                 (
-                    ~torch.isclose(
-                        comb_out[:n_my].float(),
-                        d["comb_exp"].float(),
-                        atol=atol,
-                        rtol=rtol,
-                    )
+                    (comb_out[:n_my].float() - exp).abs()
+                    > d["comb_atol"] + comb_rtol * exp.abs()
                 )
                 .any(dim=1)
                 .sum()
             )
-            if comb_w_in is not None and comb_w is not None:
+            if out_w is not None and comb_w is not None:
                 e[5] = (
                     (
                         ~torch.isclose(
@@ -1413,11 +1426,11 @@ class EpDispatchCombineTestCase:
 
         totals = dict(zip(cats, errs[:done].sum(dim=0).tolist()))
         print(
-            f"rank {self.rank} stress verify {'FAIL' if failed else 'PASS'}: {done} rounds "
+            f"rank {self.rank} stress accuracy {'FAIL' if failed else 'PASS'}: {done} rounds "
             f"in {time.time() - t0:.0f}s, bad rows {totals}"
         )
         dist.barrier()
-        assert not failed, f"rank {self.rank}: stress produced wrong results"
+        assert not failed, f"rank {self.rank}: stress_accuracy produced wrong results"
 
     def measure_e2e(
         self,
@@ -2421,7 +2434,15 @@ def test_dispatch_combine(
     node_rank = int(os.environ["RANK"])
     global_rank = node_rank * gpu_per_node + local_rank
 
-    if cmd in ("test", "bench", "stress", "profile", "tuning", "test_sentinel"):
+    if cmd in (
+        "test",
+        "bench",
+        "stress",
+        "stress_accuracy",
+        "profile",
+        "tuning",
+        "test_sentinel",
+    ):
         test_case = EpDispatchCombineTestCase(
             global_rank,
             gpu_per_node,
@@ -2468,6 +2489,8 @@ def test_dispatch_combine(
                 )
         elif cmd == "stress":
             test_case.stress_dispatch_combine()
+        elif cmd == "stress_accuracy":
+            test_case.stress_accuracy_dispatch_combine()
         elif cmd == "profile":
             test_case.profile_dispatch_combine(max_tokens)
         elif cmd == "tuning":
@@ -2512,11 +2535,13 @@ parser.add_argument(
         "test_sentinel",
         "bench",
         "stress",
+        "stress_accuracy",
         "sweep_bench",
         "profile",
         "tuning",
     ],
-    help="Available subcommands: test, test_sentinel, bench, stress, sweep_bench, profile, tuning",
+    help="Available subcommands: test, test_sentinel, bench, stress, stress_accuracy "
+    "(stress with every round verified; InterNodeV1/V1LL), sweep_bench, profile, tuning",
 )
 parser.add_argument(
     "--dtype",
