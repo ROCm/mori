@@ -264,26 +264,55 @@ void LogPlanGeometry(const char* path, size_t plan_index, const TransferPlan& pl
   }
 }
 
-// One non-blocking stream per device, per thread.  Submit runs on PoolClient's
-// executor threads, so a shared stream would serialize copies that the
-// hipMemcpy path ran independently.
-std::map<int, hipStream_t>& GatherStreams() {
-  static thread_local std::map<int, hipStream_t>* streams = new std::map<int, hipStream_t>();
-  return *streams;
-}
-
-hipStream_t GatherStream(int device_id) {
-  auto& streams = GatherStreams();
-  auto it = streams.find(device_id);
-  if (it != streams.end()) return it->second;
-  hipStream_t stream = nullptr;
-  if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
-    (void)hipGetLastError();
-    return nullptr;
+// Non-blocking gather streams, pooled per device and lent to one gather at a
+// time, so concurrent copies still run on separate streams.  They are not tied
+// to the calling thread: the standalone server calls Submit from gRPC's sync
+// pool, which retires and spawns threads under load, and every HIP stream holds
+// ~6.4 MiB of device memory for its kernarg pool.  Kept per thread, they leaked
+// until the GPU was full and stream creation failed (which HIP 7.2 turns into a
+// segfault).  A device's pool grows only to its peak number of concurrent
+// gathers.  Never destroyed: worker threads can still be copying during static
+// teardown.
+class GatherStreamPool {
+ public:
+  static GatherStreamPool& Instance() {
+    static GatherStreamPool* pool = new GatherStreamPool();
+    return *pool;
   }
-  streams.emplace(device_id, stream);
-  return stream;
-}
+
+  // The current device must already be `device_id`.  nullptr if no stream is
+  // free and a new one cannot be created.
+  hipStream_t Acquire(int device_id) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& idle = idle_[device_id];
+      if (!idle.empty()) {
+        hipStream_t stream = idle.back();
+        idle.pop_back();
+        return stream;
+      }
+    }
+    hipStream_t stream = nullptr;
+    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+      (void)hipGetLastError();
+      return nullptr;
+    }
+    created_.fetch_add(1, std::memory_order_relaxed);
+    return stream;
+  }
+
+  void Release(int device_id, hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    idle_[device_id].push_back(stream);
+  }
+
+  uint64_t Created() const { return created_.load(std::memory_order_relaxed); }
+
+ private:
+  std::mutex mutex_;
+  std::map<int, std::vector<hipStream_t>> idle_;
+  std::atomic<uint64_t> created_{0};
+};
 
 // Latches on the first gather failure and never tries again.  A kernel that
 // cannot launch here will not start working later, and the fallback is always
@@ -397,6 +426,8 @@ void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int d
   }
   return nullptr;
 }
+
+uint64_t HbmCopyEngine::GatherStreamsCreated() { return GatherStreamPool::Instance().Created(); }
 
 // Run the gather kernel over every eligible segment in the batch, and report
 // which plans it completed.
@@ -558,7 +589,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kSetDeviceFailed);
       continue;
     }
-    hipStream_t stream = GatherStream(device_id);
+    hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
     if (stream == nullptr) {
       note_bucket(GatherSkip::kNoStream);
       continue;
@@ -569,21 +600,23 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     // perturb what is being measured.
     const auto started = std::chrono::steady_clock::now();
     if (!LaunchDeviceGather(bucket.fragments.data(), bucket.fragments.size(), device_id, stream)) {
+      GatherStreamPool::Instance().Release(device_id, stream);
       note_bucket(GatherSkip::kLaunchFailed);
       continue;
     }
     const hipError_t sync = hipStreamSynchronize(stream);
     if (sync != hipSuccess) {
       // Latch off: a kernel that cannot complete here will not start working
-      // later, and every caller still has the fallback.
+      // later, and every caller still has the fallback.  The stream is dropped
+      // rather than returned to the pool.
       (void)hipGetLastError();
       GatherDisabled().store(true, std::memory_order_relaxed);
-      GatherStreams().erase(device_id);
       MORI_UMBP_ERROR("[HbmCopyEngine] gather sync dev={} failed: {}", device_id,
                       hipGetErrorString(sync));
       note_bucket(GatherSkip::kSyncFailed);
       continue;
     }
+    GatherStreamPool::Instance().Release(device_id, stream);
     for (size_t p : bucket.plan_indices) done[p] = 1;
     if (!debug) continue;
 

@@ -26,6 +26,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime_api.h>
 #include <unistd.h>
 
 #include <cstdint>
@@ -34,9 +35,11 @@
 #include <numeric>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "umbp/common/aligned_buffer.h"
+#include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
@@ -290,6 +293,59 @@ TEST(HbmCopyEngine, BuilderSplitsAtHostRegistrationPieces) {
   EXPECT_EQ(std::vector<size_t>({4096, 8192}), planned.plans[0].sizes);
   EXPECT_EQ(std::vector<size_t>({1, 2}), planned.plans[0].tags);
   ExpectPlanContract(items, planned);
+}
+
+// Gathers submitted from a succession of short-lived threads, the way the
+// standalone server's gRPC pool retires and spawns threads under load, share a
+// pooled stream.  A stream per thread grew until HIP could not create another.
+TEST(HbmCopyEngine, GatherStreamsOutliveTheirThreads) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kBytes = 1 << 20;
+  constexpr size_t kFragment = 4096;
+  constexpr int kThreads = 16;
+  AlignedBuffer host(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) host.data()[i] = static_cast<char>(i * 131 + 7);
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(host.data(), host.size());
+  void* device = nullptr;
+  ASSERT_EQ(hipMalloc(&device, kBytes), hipSuccess);
+  ASSERT_EQ(hipMemset(device, 0, kBytes), hipSuccess);
+  const auto src = TransferRef::HostBytes(host.data(), host.size());
+  const auto dst = TransferRef::HostBytes(device, kBytes, mori::io::MemoryLocationType::GPU, 0);
+
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  const uint64_t streams_before = HbmCopyEngine::GatherStreamsCreated();
+  for (int t = 0; t < kThreads; ++t) {
+    std::thread([&, t] {
+      // Two fragments far apart, so they stay two segments: one is hipMemcpy's case.
+      const uint64_t first = t * 2 * kFragment;
+      const uint64_t second = kBytes / 2 + first;
+      auto planned = engine.Plan({MakeItem(src, first, dst, first, kFragment, 1),
+                                  MakeItem(src, second, dst, second, kFragment, 2)});
+      std::vector<TransferFailure> failures;
+      if (auto handle = engine.Submit(std::move(planned.plans))) handle->Wait(&failures);
+      EXPECT_TRUE(failures.empty());
+    }).join();
+  }
+  if (DeviceGatherLaunchCount() == launches_before) {
+    (void)hipFree(device);
+    GTEST_SKIP() << "host region not gatherable on this device";
+  }
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + kThreads);
+  EXPECT_LE(HbmCopyEngine::GatherStreamsCreated() - streams_before, 1u);
+
+  std::vector<char> copied(kBytes);
+  ASSERT_EQ(hipMemcpy(copied.data(), device, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  for (int t = 0; t < kThreads; ++t) {
+    for (const size_t offset : {t * 2 * kFragment, kBytes / 2 + t * 2 * kFragment}) {
+      EXPECT_EQ(std::memcmp(copied.data() + offset, host.data() + offset, kFragment), 0)
+          << "thread " << t << " offset " << offset;
+    }
+  }
+  (void)hipFree(device);
 }
 
 // ---------------------------------------------------------------------------
