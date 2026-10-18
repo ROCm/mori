@@ -909,9 +909,12 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // metadata runs; and the block's warps take its tokens one at a time from an LDS counter instead of
   // a fixed stride, so a warp with fewer rows or a shorter metadata pass takes more. Together, 3
   // alternating rounds: 2560 / 3072 / 4096 tokens -6.15 / -5.69 / -8.54 us, 4097 / 8192 -13.73 /
-  // -3.84, 16384 -11.64 (the scale alone was +1.37 at 8192). fp8 and the other world sizes are untimed.
-  constexpr bool kScPayOn = npes >= 32 && kCfg.dtype == EpDType::Fp4x2 &&
-                            EpCallTok(kCfg) > kCfg.blockNum * kEpTokChunk;
+  // -3.84, 16384 -11.64 (the scale alone was +1.37 at 8192). fp8 takes both as well, and kLdsMeta below:
+  // 12 experts a rank, an op per size group, 3 alternating rounds, dispatch 64 / 128 / 256 / 512 tokens
+  // -2.79 / -2.85 / -2.76 / -2.95 us (kLdsMeta), 8192 / 16384 -2.18 / -21.95, 4096 +0.22 (+0.22 / +0.01 /
+  // +0.30); the 1024 and 2048 buckets take neither path. The other world sizes are untimed.
+  constexpr bool kMetaDtOk = EpDTypeIsByte(kCfg.dtype);
+  constexpr bool kScPayOn = npes >= 32 && kMetaDtOk && EpCallTok(kCfg) > kCfg.blockNum * kEpTokChunk;
   constexpr bool kDynTok = kScPayOn;
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
@@ -1077,7 +1080,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr int kRbIdxB = (kRbRows * topk * 4 + 255) / 256 * 256;
   constexpr int kRbSrcB = (kRbRows * 4 + 255) / 256 * 256;
   constexpr int kRbPeerB = 2 * kRbIdxB + kRbSrcB + kRbRows * kEpScaleStride;
-  constexpr bool kLdsMeta = kCfg.dtype == EpDType::Fp4x2 && kPayFirst && !kPayFirstPlain &&
+  constexpr bool kLdsMeta = kMetaDtOk && kPayFirst && !kPayFirstPlain &&
                             kCfg.aggReserve && npes >= 32 && (kEpScaleBytes == 0 || kScWave) && topk <= WS &&
                             EpCallTok(kCfg) <= kCfg.blockNum * kEpTokChunk &&
                             kCfg.warpPerBlock >= 2 * kEpTokChunk &&
