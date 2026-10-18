@@ -196,8 +196,25 @@ _DISPATCH_TABLE: dict = {
         #   16384 459.61 432.08 414.95
         # 384 and 512 blocks hang (384 at 16384 tokens, 512 at the first call). The edges between
         # the swept points are unswept.
+        # fp8 dispatch, 2026-10-18, C2 C5 C6 C7 C9 C11 C14 C17, 12 experts a rank, one M=16384 plan,
+        # combine pinned beside it, 3 alternating rounds, every difference one-signed (ab_1018_053343_1616815):
+        #   ct     64x16  128x16 256x16
+        #   512    43.98  44.58  45.82
+        #   1024   74.55  64.01  67.56
+        #   2048  132.38 127.69 117.81
+        #   4096  225.27 231.13 228.21
+        #   8192  427.62 404.23 424.08
+        #   16384 829.91 789.81 773.33
         (32, 7168, 6, None): {
             None: ((None, 64, 16),),
+            "fp8": (
+                (512, 64, 16),
+                (1024, 128, 16),
+                (2048, 256, 16),
+                (4096, 64, 16),
+                (8192, 128, 16),
+                (None, 256, 16),
+            ),
             "fp4": (
                 (512, 64, 16),
                 (1024, 128, 16),
@@ -323,6 +340,20 @@ _COMBINE_PUSH_TABLE: dict = {
                 (2047, 128, 16),
                 (16384, 128, 24),
                 (None, 64, 16),
+            ),
+            # EP32, 2026-10-18, the run of the EP32 fp8 dispatch entry, combine us. Without an entry
+            # the op took the plain combine table's 64x8, below the overlapped path's 16 or 24 warps:
+            #   ct     64x8   128x16 128x24 256x16 256x8
+            #   512    55.58  46.32  48.50  46.74  44.01
+            #   1024   76.64  65.06  68.92  66.82  82.53
+            #   2048  134.22 110.36 114.01 108.65 178.19
+            #   4096  240.54 191.73 199.64 200.24 223.46
+            #   8192  448.19 375.14 362.76 364.97 415.45
+            #   16384 868.81 711.16 696.19 714.86 783.73
+            (32, 7168, 6, None): (
+                (512, 256, 8),
+                (4096, 128, 16),
+                (None, 128, 24),
             ),
         },
     },
