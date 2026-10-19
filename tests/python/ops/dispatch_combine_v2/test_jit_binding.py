@@ -383,11 +383,33 @@ def test_an_unbound_plan_gets_staging_at_its_first_launch(launched, stages):
     assert p._buf.stagingBase == buf.data_ptr()
     info = p.info
     assert buf.numel() == ep_staging_bytes(
-        info["worldSize"], info["maxRecv"], info["scaleBytes"], info["maxTokPerRank"]
+        info["worldSize"],
+        info["maxRecv"],
+        info["scaleBytes"],
+        info["maxTokPerRank"],
+        info["aggReserve"],
     )
     # Settled to an address: later launches reuse the cached struct untouched.
     assert p._defaults["stagingBase"] == buf.data_ptr()
     assert "stagingBase" not in p._dyn_defs
+    p.close()
+
+
+def test_the_fallback_follows_the_scale_row_numbering(launched, stages):
+    import warnings
+
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    # One rank with a scale row: under aggReserve the rows wrap at 2 * 64 a peer,
+    # past the 64-slot recv cap, so a buffer sized from recv would be short.
+    p = _plan(scale_bytes=224)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        p.launch()
+    agg = p.info["aggReserve"]
+    assert p._fallback_staging.numel() == ep_staging_bytes(1, 64, 224, 64, agg)
+    if agg:
+        assert p._fallback_staging.numel() > ep_staging_bytes(1, 64, 224, 64)
     p.close()
 
 
