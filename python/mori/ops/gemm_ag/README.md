@@ -80,12 +80,15 @@ its `serial` control retains those streams but disables compute/transfer overlap
 
 ## BF16 benchmarks: DeepSeek-V4-Pro
 
-Model shape: **DeepSeek-V4-Pro ratio-4 main compressor**. Measured on
-2026-09-28 on eight MI355X GPUs, M=N=2048, K=7168, with BF16
-inputs and FP32 output, using PyTorch `2.10.0+rocm7.2.0.gitb6ee5fde` and
-FlyDSL 0.2.4.
-Use the separate [v2-015 controls](EXPERIMENTS.md#larger-m-on-v2-015) when
-comparing that host's measurements.
+Model shape: **DeepSeek-V4-Pro ratio-4 main compressor**, M=N=2048, K=7168,
+BF16 inputs and FP32 output. Measured on 2026-10-19 on **mi355-gpu-51, eight
+MI355X GPUs**, ROCm 7.14, PyTorch `2.12.0+rocm7.14.0`, FlyDSL 0.3.4.1, MORI
+`main` at `8ae8156` (which includes the SDMA changes #603 and #711).
+The first tables were taken on 2026-09-28 with PyTorch 2.10 / ROCm 7.2 /
+FlyDSL 0.2.4; the host and the whole stack changed between the two, so a
+difference between them is not attributable to MORI alone. The
+[v2-015 controls](EXPERIMENTS.md#larger-m-on-v2-015) belong to that earlier
+study and compare only with each other.
 
 ### Pure GEMM
 
@@ -99,32 +102,34 @@ medians; the reported time is the median across rounds.
 
 | Implementation | Median, µs | Round range, µs | Latency vs Torch |
 |---|---:|---:|---:|
-| Native Torch BF16 → FP32 | 71.1 | 70.6–72.1 | baseline |
-| MORI `256x256` (default) | 131.9 | 131.8–132.0 | +85.5% |
-| MORI `128x256` | 88.6 | 88.2–88.7 | +24.6% |
-| MORI `128x128` | 72.0 | 71.8–73.7 | +1.3% |
+| Native Torch BF16 → FP32 | 77.8 | 77.4–79.8 | baseline |
+| MORI `256x256` (default) | 127.4 | 127.2–127.4 | +63.8% |
+| MORI `128x256` | 83.9 | 83.4–84.2 | +7.8% |
+| MORI `128x128` | 69.4 | 69.1–69.7 | −10.8% |
 
 All implementations passed on all ranks, with worst relative L2 error
-`9.95e-7`. The smaller tile is close to Torch at this shape; it does not
-establish a speedup. Select it explicitly with `--block-m 128 --block-n 128`.
+`9.95e-7`. The `128x128` tile is now 10.8% below Torch, but most of that is
+Torch moving: it measured 71.1 µs on the September stack and MORI `128x128`
+72.0, so read the sign as specific to this stack rather than as a GEMM win.
+Select the tile explicitly with `--block-m 128 --block-n 128`.
 BF16 output followed by widening is not an equivalent FP32-output reference.
 
 ### GEMM + AG — DeepSeek-V4-Pro
 
 Each rank produces 16 MiB and sends 112 MiB. Times include the complete AG
-and final cross-rank synchronization. Native Torch + RCCL takes **397.5 µs**.
+and final cross-rank synchronization. Native Torch + RCCL takes **407.4 µs**.
 
 | Mode | `256x256`, µs | `128x128`, µs |
 |---|---:|---:|
-| GEMM + RCCL | 462.7 | 403.7 |
-| GEMM + LSA push | 444.6 | 379.0 |
-| GEMM + LSA pull | 448.3 | 406.3 |
-| Fused LSA, cached stores | 542.4 | 509.2 |
-| Fused LSA, uncached stores | 470.4 | 420.8 |
-| **GEMM + SDMA** | **427.8** | **364.0** |
-| Fused SDMA, 1 chunk | 429.0 | 377.0 |
-| Fused SDMA, 2 chunks | 440.6 | 388.6 |
-| Fused SDMA, 4 chunks | 462.2 | 409.9 |
+| GEMM + RCCL | 472.0 | 414.8 |
+| GEMM + LSA push | 438.7 | 372.2 |
+| GEMM + LSA pull | 443.8 | 399.2 |
+| Fused LSA, cached stores | 466.9 | 413.7 |
+| Fused LSA, uncached stores | 467.2 | 422.6 |
+| **GEMM + SDMA** | **421.8** | **355.9** |
+| Fused SDMA, 1 chunk | 422.5 | 360.6 |
+| Fused SDMA, 2 chunks | 433.5 | 372.1 |
+| Fused SDMA, 4 chunks | 455.8 | 394.0 |
 
 These fused runs use the default leader fence and lane-parallel SDMA posting;
 all multi-queue measurements use the corrected drain. Five rounds use 50
@@ -133,12 +138,15 @@ before the final median. Every configuration ran in a fresh process group
 with no foreign GPU processes before or after it.
 
 All 19 configurations passed initial output and two changed-input replays,
-with finite output and `relL2 < 1e-5`; worst error was `9.94e-7`. The receive
+with finite output and `relL2 < 1e-5`; worst error was `9.93e-7`. The receive
 buffer was cloned immediately after replay, before reference computation.
 Allocation, compilation, capture and validation were outside timing.
 
 At this shape, the benefit comes from tile selection and SDMA transport:
-364.0 µs is 8.4% below native Torch + RCCL. The publication optimization and
+355.9 µs is 12.6% below native Torch + RCCL. Fusing still does not pay here:
+every chunk count is slower than the split SDMA path, as in September. The
+cached fused-LSA store, 70 µs behind the uncached one then, now measures
+level with it. The publication optimization and
 larger-M fusion results are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
 ### Earlier FP8 reference — DeepSeek-V4-Pro dimensions
@@ -166,8 +174,11 @@ for that shape or a precision-equivalent replacement for BF16-to-FP32 GEMM.
 
 ## BF16 benchmarks: DeepSeek-V4.1-Flash
 
-Measured on 2026-09-28 on **v2-015, eight MI355X GPUs**, using ROCm 7.2.4,
-PyTorch `2.11.0+rocm7.2`, FlyDSL 0.2.4 and 128x128 tiles. K=5120 comes from
+Measured on 2026-10-19 on **mi355-gpu-51, eight MI355X GPUs**, ROCm 7.14,
+PyTorch `2.12.0+rocm7.14.0`, FlyDSL 0.3.4.1, MORI `main` at `8ae8156` (which
+includes the SDMA changes #603 and #711).
+The September tables came from v2-015 with ROCm 7.2.4, PyTorch 2.11 and FlyDSL
+0.2.4. All use 128x128 tiles. K=5120 comes from
 Flash's hidden size. **N=512 is one KV or gate projection** in the ratio-2
 path; **N=1024 is a combined KV/gate candidate**. Both use BF16 input and
 FP32 output/wire. The N=512 timings must not be read as the total for both
@@ -175,8 +186,8 @@ projections.
 
 Each case uses five rounds, 50 warmups and 101 graph samples per round, with
 the same rank/round aggregation and changed-input validation described above.
-All 40 unique shape configurations passed; the complete study contains 52
-accepted configurations/repeats, with worst relative L2 error `8.04e-07`.
+All 34 re-measured configurations passed, with worst relative L2 error
+`8.28e-07`.
 These are local-projection-then-AG tests; token-order restoration and KV/gate
 unpacking are excluded from these tables. A separate ratio-2 subgraph test
 includes those steps.
@@ -185,43 +196,43 @@ includes those steps.
 
 | Mode | N=512, µs | N=1024, µs |
 |---|---:|---:|
-| Native Torch + RCCL | 141.0 | 227.8 |
-| MORI GEMM + RCCL | 156.8 | 239.0 |
-| MORI GEMM + LSA push | 137.2 | 222.8 |
-| MORI GEMM + LSA pull | 150.6 | 241.3 |
-| Fused LSA, uncached | 141.4 | 236.1 |
-| MORI GEMM + SDMA | 139.2 | 212.6 |
-| Fused SDMA, 1 chunk | 138.5 | 215.3 |
-| Fused SDMA, 4 chunks | 166.2 | 247.4 |
+| Native Torch + RCCL | 153.5 | 273.4 |
+| MORI GEMM + RCCL | 173.1 | 282.2 |
+| MORI GEMM + LSA push | **126.4** | 206.5 |
+| MORI GEMM + LSA pull | 138.0 | 220.1 |
+| Fused LSA, uncached | 128.4 | 221.2 |
+| MORI GEMM + SDMA | 130.5 | 203.2 |
+| Fused SDMA, 1 chunk | 129.7 | **202.8** |
+| Fused SDMA, 4 chunks | 157.7 | 236.0 |
 
 Fused SDMA uses `--peer-uncached --fence release`; fused LSA uses uncached
 stores. RCCL uses thread-local graph capture to allow its watchdog's event
-queries on another thread. One global-capture RCCL attempt aborted before
-producing a result and was excluded; the RCCL comparisons were rerun.
+queries on another thread.
 
-For N=512, the leading single-stream paths are close (about 137–141 µs),
-without a material fusion win. N=1024 split SDMA is 212.6 µs; four-chunk
-fusion at this small M is slower. Do not compare these numbers directly with
+For N=512, the leading single-stream paths are close (about 126–131 µs), with
+LSA push now ahead of SDMA by 3%, and without a material fusion win. For
+N=1024, split SDMA (203.2 µs) and one-chunk fusion (202.8) are within 0.2%;
+four-chunk fusion at this small M is slower. RCCL fell further behind than in
+September on both N. Do not compare these numbers directly with
 the Pro table's different host/runtime, K, N and communication volume.
 
 ### Larger local M, SDMA
 
-First-pass times in µs, with the same K and tile:
+Times in µs, with the same K and tile:
 
 | Local M | N=512 split | N=512 fused c4 | N=1024 split | N=1024 fused c4 |
 |---|---:|---:|---:|---:|
-| 4096 | 214.3 | 245.2 | 363.4 | 397.7 |
-| 8192 | 366.5 | 398.1 | 703.5 | 733.7 |
-| 16384 | 700.2 | 736.2 | 1371.5 | 1308.1 |
+| 4096 | 201.5 | 235.9 | 346.8 | 385.5 |
+| 8192 | 346.2 | 382.3 | 669.0 | 705.6 |
+| 16384 | 671.8 | 707.7 | 1314.7 | **1257.7** |
 
-Four chunks do not help the individual N=512 projection in this sweep.
-The N=1024 combined candidate first shows a useful four-chunk gain at M=16384;
-smaller M does not show that benefit. One-chunk candidates were also measured
-at all four M values; differences below 1% at the small N=512 shapes are not
-treated as established speedups.
+Four chunks do not help the individual N=512 projection. The N=1024 combined
+candidate first shows a useful four-chunk gain at M=16384, 4.3% here; smaller
+M does not show that benefit. Both agree with September's sweep.
 
-Independent adjacent pairs confirmed the SDMA comparison (N=512 uses one
-fused chunk; N=1024 uses four):
+The September study also confirmed the SDMA comparison with independent
+adjacent pairs on v2-015 (N=512 uses one fused chunk; N=1024 uses four); these
+were not repeated:
 
 | N | Local M | Repeat | Split SDMA, µs | Fused SDMA, µs | Latency reduction |
 |---:|---:|---:|---:|---:|---:|
@@ -230,20 +241,22 @@ fused chunk; N=1024 uses four):
 | 1024 | 16384 | 2 | 1369.6 | 1308.0 | 4.49% |
 
 Thus the small N=512 result does not establish a fusion win, while the
-combined N=1024 projection at M=16384 has a repeatable **about 4.5%** benefit.
+combined N=1024 projection at M=16384 has a repeatable benefit: **about 4.5%**
+in those pairs and 4.3% in the current single pass.
 
 ### Two-stream pipeline at local M=2048
 
 | Four-chunk, two-stream backend | N=512, µs | N=1024, µs |
 |---|---:|---:|
-| MORI | 253.0 | 272.2 |
-| MORI, four-way split-K | 176.1 | 210.3 |
-| Native Torch | 145.2 | 201.4 |
+| MORI | 221.6 | 242.7 |
+| MORI, four-way split-K | 144.4 | 202.3 |
+| Native Torch | 130.3 | 192.6 |
 
 These are total GEMM+AG pipeline times, not isolated GEMM times. The N=512
 pipeline does not improve the better whole-matrix paths. The N=1024 Torch
-pipeline is faster than MORI split SDMA here, but that comparison changes the
-GEMM backend as well as the scheduling; it does not isolate overlap alone.
+pipeline (192.6 µs) is faster than MORI split SDMA (203.2) here, but that
+comparison changes the GEMM backend as well as the scheduling; it does not
+isolate overlap alone.
 
 ### Complete ratio-2 projection subgraph
 
@@ -255,7 +268,8 @@ for every collective and is not an end-to-end SGLang measurement.
 
 ### Smaller-tile follow-up
 
-An isolated [smaller-tile study](EXPERIMENTS.md#smaller-tile-study) tested
+An isolated [smaller-tile study](EXPERIMENTS.md#smaller-tile-study) from the
+September stack, not repeated here, tested
 64×128, 128×64, 64×64, 32×64 and 32×32 layouts with fewer waves. At local
 M=2048, the selected Flash non-fused paths improved by 7.7% (N=512) and 2.4%
 (N=1024) in adjacent repeats. Fusion did not beat the tuned non-fused path.

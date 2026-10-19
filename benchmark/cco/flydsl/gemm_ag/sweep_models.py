@@ -30,7 +30,7 @@ communication at all, so samples taken with company are discarded rather than
 averaged, and the GPU clock and junction temperature are recorded next to
 every sample for the same reason.
 
-    MORI_REPO=/workspace/reports/mori PYTHONPATH=$MORI_REPO/python \\
+    MORI_REPO=$PWD PYTHONPATH=$MORI_REPO/python \\
       python sweep_models.py --rounds 3 --quant ptpc --out ag_models.jsonl
 """
 

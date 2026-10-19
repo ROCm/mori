@@ -38,7 +38,7 @@ One process per cell: a mori window and its SDMA queues are per-process, and a
 stale counter set from one configuration electing on another's leftovers is a
 failure that only shows up as a wrong answer.
 
-    MORI_REPO=/workspace/reports/mori PYTHONPATH=$MORI_REPO/python \\
+    MORI_REPO=$PWD PYTHONPATH=$MORI_REPO/python \\
       python sweep_ag.py -m 2048 --out-dim 2048 -k 7168
 """
 

@@ -15,9 +15,11 @@ Run from the repository root, using its installed Python environment:
 ```bash
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 export MORI_ENABLE_SDMA=1
-export BUILD_CCO_SDMA=1
 export MORI_SOCKET_IFNAME=lo
 ```
+
+The SDMA modes also need a mori built with `BUILD_CCO_SDMA=ON`, the default
+since #710. It is a build flag: exporting it when running does nothing.
 
 Run configurations sequentially on idle GPUs. The commands below use eight
 ranks; adjust `--nproc_per_node` for another supported world size. Allow SDMA

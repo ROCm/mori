@@ -18,6 +18,10 @@ use the maintained kernel interfaces directly.
 
 Compare candidates with controls from the same host. Each case uses a fresh
 eight-rank process group with no foreign GPU processes before or after it.
+
+Everything in this file predates the SDMA changes #603 and #711 and was not
+re-measured with them. The [operator README](README.md) tables were re-taken on
+2026-10-19 on another host and stack; compare figures within one dataset only.
 Five rounds use 50 warmups and 101 graph samples each. The result is the
 median across rounds of the maximum per-rank sample median. Allocation,
 compilation, graph capture and validation are excluded; complete AG and

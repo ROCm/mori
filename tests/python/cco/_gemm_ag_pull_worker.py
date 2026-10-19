@@ -98,6 +98,10 @@ def run_dirty_window_benchmark():
         "1",
         "--no-graph",
     ]
+    # run_path, unlike `python bench_gemm_ag.py`, does not put the script's
+    # directory on sys.path, and the benchmark imports its sibling
+    # `_bench_utils` from there.
+    sys.path.insert(0, str(bench.parent))
     runpy.run_path(str(bench), run_name="__main__")
 
 
