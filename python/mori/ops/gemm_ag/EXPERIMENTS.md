@@ -19,9 +19,10 @@ use the maintained kernel interfaces directly.
 Compare candidates with controls from the same host. Each case uses a fresh
 eight-rank process group with no foreign GPU processes before or after it.
 
-Everything in this file predates the SDMA changes #603 and #711 and was not
-re-measured with them. The [operator README](README.md) tables were re-taken on
-2026-10-19 on another host and stack; compare figures within one dataset only.
+Everything in this file predates the SDMA changes #603 and #711. Only the
+[larger-M study](#larger-m-on-v2-015) was re-measured with them, on
+2026-10-19 on the [operator README](README.md)'s host and stack, as were that
+README's tables; compare figures within one dataset only.
 Five rounds use 50 warmups and 101 graph samples each. The result is the
 median across rounds of the maximum per-rank sample median. Allocation,
 compilation, graph capture and validation are excluded; complete AG and
@@ -58,6 +59,11 @@ sc_release c4/c8 were close (2526.0/2523.4 µs); c4 was selected for paired
 confirmation. An M=4096 original-c4 run had an unstable 4137.3 µs median;
 its independent repeat was 737.2 µs. That outlier did not reproduce and is
 not used as a stable baseline; its cause remains unknown.
+
+Re-measured on 2026-10-19 on the README's current stack, single pass:
+split / sc_release c4 are 680.0 / 712.6 µs at M=4096 (c2: 690.8), 1338.0 /
+1266.5 at M=8192 (**5.3%**) and 2760.6 / 2432.1 at M=16384 (**11.9%**) --
+the same pattern.
 
 Each rank sends 224/448/896 MiB at M=4096/8192/16384. The grid grows from
 256 CTAs at M=2048 to 512/1024/2048 CTAs. The gains are consistent with more

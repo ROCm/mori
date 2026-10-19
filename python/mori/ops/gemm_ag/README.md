@@ -11,13 +11,15 @@ for setup and execution, and [EXPERIMENTS.md](EXPERIMENTS.md) for optimization
 results. The retained measurements show:
 
 - For the DeepSeek-V4-Pro ratio-4 main compressor, at M=N=2048, K=7168,
-  BF16-to-FP32 GEMM with an explicit `128x128` tile is
-  close to native Torch: **72.0 vs 71.1 µs**. The default remains `256x256`.
-- At that shape, non-fused GEMM + SDMA takes **364.0 µs**; original fused
-  SDMA takes **377.0 µs** with one chunk.
-- In the separate v2-015 sweep, four-chunk single-stream fusion reduces
-  latency by **about 5% at M=8192** and **11% at M=16384**, with no benefit
-  at M=4096. Fusion performance depends on shape and chunk size.
+  BF16-to-FP32 GEMM with an explicit `128x128` tile measures **69.4 µs**
+  against native Torch's **77.8 µs** on the current stack (72.0 vs 71.1 in
+  September -- Torch moved, not MORI). The default remains `256x256`.
+- At that shape, non-fused GEMM + SDMA takes **355.9 µs**; fused SDMA takes
+  **360.6 µs** with one chunk.
+- At larger M the same shape gains from four-chunk single-stream fusion:
+  **5.3% at M=8192** and **11.9% at M=16384**, with no benefit at M=4096
+  (re-measured 2026-10-19; September's v2-015 pairs gave 4.9–5.2% and 11.1%).
+  Fusion performance depends on shape and chunk size.
 
 ## Model shapes
 
