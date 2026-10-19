@@ -22,8 +22,6 @@
 #include "umbp/distributed/transfer/hbm_copy_engine.h"
 
 #include <hip/hip_runtime.h>
-#include <hsa/hsa.h>
-#include <hsa/hsa_ext_amd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -351,52 +349,6 @@ class GatherStreamPool {
   std::atomic<uint64_t> created_{0};
 };
 
-// One copy each way on every copy engine between these two buffers, so that
-// ROCr creates each engine's queue here instead of on the engine's first use.
-void PrewarmCopyEngines(void* device_bytes, void* host_bytes, size_t bytes) {
-  hsa_amd_pointer_info_t device_info{};
-  hsa_amd_pointer_info_t host_info{};
-  device_info.size = sizeof(device_info);
-  host_info.size = sizeof(host_info);
-  if (hsa_amd_pointer_info(device_bytes, &device_info, nullptr, nullptr, nullptr) !=
-          HSA_STATUS_SUCCESS ||
-      hsa_amd_pointer_info(host_bytes, &host_info, nullptr, nullptr, nullptr) !=
-          HSA_STATUS_SUCCESS) {
-    return;
-  }
-  hsa_signal_t signal;
-  if (hsa_signal_create(1, 0, nullptr, &signal) != HSA_STATUS_SUCCESS) return;
-  const hsa_agent_t gpu = device_info.agentOwner;
-  const hsa_agent_t cpu = host_info.agentOwner;
-  struct Direction {
-    void* dst;
-    hsa_agent_t dst_agent;
-    const void* src;
-    hsa_agent_t src_agent;
-  };
-  const Direction directions[] = {{device_bytes, gpu, host_bytes, cpu},
-                                  {host_bytes, cpu, device_bytes, gpu}};
-  for (const Direction& d : directions) {
-    uint32_t engines = 0;
-    if (hsa_amd_memory_copy_engine_status(d.dst_agent, d.src_agent, &engines) !=
-        HSA_STATUS_SUCCESS) {
-      continue;
-    }
-    for (uint32_t bit = 0; bit < 32; ++bit) {
-      const uint32_t engine = 1u << bit;
-      if ((engines & engine) == 0) continue;
-      hsa_signal_store_screlease(signal, 1);
-      if (hsa_amd_memory_async_copy_on_engine(
-              d.dst, d.dst_agent, d.src, d.src_agent, bytes, 0, nullptr, signal,
-              static_cast<hsa_amd_sdma_engine_id_t>(engine), true) == HSA_STATUS_SUCCESS) {
-        hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX,
-                                  HSA_WAIT_STATE_BLOCKED);
-      }
-    }
-  }
-  hsa_signal_destroy(signal);
-}
-
 // Latches on the first gather failure and never tries again.  A kernel that
 // cannot launch here will not start working later, and the fallback is always
 // available, so one failed launch should not cost every later batch a retry.
@@ -519,7 +471,7 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
     (void)hipGetLastError();
     return;
   }
-  // The copy engines are warmed either way: with the kernel off, every copy
+  // The null stream is warmed either way: with the kernel off, every copy
   // takes the hipMemcpy fallback.
   const bool gather = !GatherDisabled().load(std::memory_order_relaxed) && DeviceGatherEnabled();
   int previous_device = 0;
@@ -531,6 +483,10 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
       (void)hipGetLastError();
       continue;
     }
+    // All of a device's streams are held until the null stream's copies are
+    // done, so that each upload and each of those copies is given a copy engine
+    // of its own: with the pool capped, these are the engines a copy can ever
+    // be given, and their queues are the only SDMA queues created.
     std::vector<hipStream_t> streams;
     for (size_t i = 0; gather && i < gather_streams_per_device; ++i) {
       hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
@@ -542,7 +498,6 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
     void* device_bytes = nullptr;
     if (hipHostMalloc(&host_bytes, kPrewarmCopyBytes, hipHostMallocDefault) == hipSuccess &&
         hipMalloc(&device_bytes, kPrewarmCopyBytes) == hipSuccess) {
-      PrewarmCopyEngines(device_bytes, host_bytes, kPrewarmCopyBytes);
       // The hipMemcpy fallback runs on the null stream.
       (void)hipMemcpy(device_bytes, host_bytes, kPrewarmCopyBytes, hipMemcpyHostToDevice);
       (void)hipMemcpy(host_bytes, device_bytes, kPrewarmCopyBytes, hipMemcpyDeviceToHost);
@@ -561,8 +516,7 @@ void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
     (void)hipGetLastError();
   }
   (void)hipSetDevice(previous_device);
-  MORI_UMBP_INFO("[HbmCopyEngine] prewarmed {} gather streams and the copy engines of {} devices",
-                 warmed, devices);
+  MORI_UMBP_INFO("[HbmCopyEngine] prewarmed {} gather streams on {} devices", warmed, devices);
 }
 
 // Run the gather kernel over every eligible segment in the batch, and report
