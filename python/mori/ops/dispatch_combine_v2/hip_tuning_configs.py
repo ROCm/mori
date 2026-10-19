@@ -377,6 +377,58 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
     return tuple(entries)
 
 
+def describe_schedule(cfg, schedule) -> str:
+    """Multi-line summary of a resolved schedule and the tables it came from."""
+
+    def fmt(spec):
+        if spec.rdma_block_num is None:
+            return f"{spec.family} B/W={spec.block_num}/{spec.warp_per_block}"
+        return (
+            f"{spec.family} B/R/W="
+            f"{spec.block_num}/{spec.rdma_block_num}/{spec.warp_per_block}"
+        )
+
+    num_experts = cfg.world_size * cfg.num_experts_per_rank
+    lines = [
+        f"HIP V2 schedule: {_gpu.arch_name()}/{_gpu.detect_model()} "
+        f"ep{cfg.world_size} expert{num_experts} top{cfg.num_experts_per_token} "
+        f"hidden{cfg.hidden_dim} dispatch={cfg.dispatch_dtype} combine={cfg.combine_dtype}"
+    ]
+    if cfg.is_internode:
+        families = [_V2_KERNEL_TYPES[f] for f in internode_kernel_families(cfg)]
+        overrides = [
+            name
+            for name in ("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM")
+            if os.environ.get(name)
+        ]
+        if overrides:
+            lines.append(f"  tables bypassed by {', '.join(overrides)}")
+        pinned = sorted(getattr(cfg, "_pinned_geometry", ()))
+        if pinned:
+            lines.append(f"  pinned fields: {', '.join(pinned)}")
+    else:
+        families = [_V2_KERNEL_TYPES["intra"]]
+    for kernel_type in families:
+        for phase in _INTERNODE_PHASES:
+            path = internode_table_dir() / v2_table_filename(
+                _gpu.arch_name(),
+                _gpu.detect_model(),
+                kernel_type,
+                cfg.world_size,
+                num_experts,
+                cfg.num_experts_per_token,
+                phase,
+            )
+            lines.append(f"  {'found' if path.is_file() else 'missing'}: {path}")
+    for row in schedule:
+        ceiling = "rest" if row.max_tokens is None else f"<={row.max_tokens}"
+        lines.append(
+            f"  tokens {ceiling:>7}: dispatch {fmt(row.dispatch)}, "
+            f"combine {fmt(row.combine)}"
+        )
+    return "\n".join(lines)
+
+
 def _merge(disp, comb):
     """Interleave two independent bucket lists into the op's one schedule.
 

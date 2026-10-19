@@ -53,8 +53,10 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
-import torch
+import logging
 import os
+
+import torch
 
 from mori.tensor_utils import from_gpu_ptr
 
@@ -63,6 +65,8 @@ from . import hip_tuning_configs as tuning
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
 from .internode_regions import internode_regions
 from .symm_arena import SymmArena
+
+logger = logging.getLogger(__name__)
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
@@ -1029,6 +1033,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return KernelSet(dispatch={}, combine={}, unsupported=bad)
 
         self._schedule = tuning.resolve_schedule(cfg)
+        if cfg.rank == 0 and logger.isEnabledFor(logging.INFO):
+            logger.info("%s", tuning.describe_schedule(cfg, self._schedule))
         self._dispatch_specs = tuple(
             dict.fromkeys(row.dispatch for row in self._schedule)
         )
