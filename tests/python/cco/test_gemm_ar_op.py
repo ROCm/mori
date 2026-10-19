@@ -698,3 +698,43 @@ def test_close_releases_and_is_idempotent(worker_results):
     """The communicator holds the handles, so dropping the op is not enough."""
     r = _case(worker_results, "close")
     assert r["refused_after_close"], r
+
+
+@requires_two_gpus
+def test_reduce_scatter_returns_my_band_of_the_sum(worker_results):
+    """``GemmReduceScatterOp`` end to end: the all-reduce pipeline minus the gather.
+
+    Each rank gets ``[M/P, N]``, rows ``rank*M/P`` onward of the sum, at the fp8
+    floor -- across two M values through one instance and fresh operands every
+    call. The comparison against the *next* rank's band has to fail, or the
+    floor check cannot tell a wrong band offset from a right one. Its self-test
+    must pass and must catch a scatter that did not happen, like the
+    all-reduce's.
+    """
+    r = _case(worker_results, "reduce_scatter")
+    assert r["self_test_passes"], r
+    assert r["detects_missing_scatter"], r
+    calls = [key for key in r if key.startswith("call") and key.count("_") == 1]
+    assert len(calls) == 4, r
+    for key in calls:
+        assert r[f"{key}_shape_ok"], (key, r)
+        assert r[key] < FP8_FLOOR, (key, r)
+        assert r[f"{key}_vs_other_band"] > 0.5, (key, r)
+
+
+@requires_two_gpus
+def test_reduce_scatter_survives_a_slow_reader(worker_results):
+    """No rank may push into a peer's recv slot while that peer still reads it.
+
+    The reduce reads slots the peers fill and the next call's epilogue refills
+    them, so the reduce-scatter needs the cross-rank barrier the all-reduce gets
+    for free from its gather. The worker holds one rank between drain and
+    reduce, a different one each call, which makes the others certainly a call
+    ahead -- without the trailing barrier the held rank reduces the *next*
+    call's bytes. Before the barrier this showed up only intermittently, as
+    relL2 0.71 on one call in an alternating-M run.
+    """
+    r = _case(worker_results, "reduce_scatter")
+    assert r["slow_peer_order"][-1] == "rs_barrier", r
+    for i in range(4):
+        assert r[f"slow{i}"] < FP8_FLOOR, (i, r)

@@ -229,7 +229,9 @@ def build_sdma_phases(
     Returns ``{"scatter", "drain", "reduce", "gather"}``, each a launcher taking
     ``(dev_comm, win, stream=...)``. ``scatter`` pushes *and* drains; ``drain``
     only drains and barriers, and exists for the fused path, where the pushes
-    were already issued from inside the GEMM epilogue.
+    were already issued from inside the GEMM epilogue. The sequences to run
+    them in ride along under ``order``/``fused_order`` (all-reduce) and
+    ``rs_order``/``fused_rs_order`` (reduce-scatter only).
 
     ``queues`` must match ``reqs.sdma_queue_count``. Queue ids are taken modulo
     it, and the hardware queues are per **(source, destination) pair**, so even
@@ -1153,6 +1155,22 @@ def build_sdma_phases(
     #: The same sequence for the fused GEMM, which issued the scatter's puts from
     #: its own epilogue and only has to drain them.
     phases["fused_order"] = ("drain",) + tail
+    #: Reduce-scatter only: stop once my slice is reduced into
+    #: ``output + rank*slice``. That slice is row band ``rank`` of the sum, which
+    #: is what a sequence-parallel layer keeps, so the gather -- and with it any
+    #: fp8 gather leg -- has nothing to do. Always the plain ``reduce``:
+    #: ``reduce_push`` and ``reduce_quant`` exist to feed a gather.
+    #:
+    #: The trailing barrier is not optional, and it is the one thing the gather
+    #: was doing for free. ``reduce`` reads the recv slots the *peers* fill, so
+    #: until every rank has finished reading, no rank may start its next call --
+    #: whose epilogue pushes straight into those slots. The all-reduce gets that
+    #: from the gather's ``end`` barrier; without it a rank one call ahead
+    #: overwrote half of a slower peer's band (relL2 0.71 on the second call of
+    #: an instance alternating M=512/1024 at 2 ranks).
+    phases["rs_barrier"] = _phase(_push_kernel(end_off), 1, PUSH_THREADS)
+    phases["rs_order"] = ("scatter", "reduce", "rs_barrier")
+    phases["fused_rs_order"] = ("drain", "reduce", "rs_barrier")
     return phases
 
 

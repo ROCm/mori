@@ -488,6 +488,14 @@ class GemmAllReduceOp:
     the deployment will see, not for the first one it does.
     """
 
+    #: Which of ``build_sdma_phases``' sequences this op runs: the split one is
+    #: what :meth:`self_test` drives without a GEMM, the fused one follows the
+    #: GEMM whose epilogue already pushed. A subclass that stops earlier swaps
+    #: these and :meth:`_output_view`, and nothing else.
+    _SPLIT_ORDER = "order"
+    _FUSED_ORDER = "fused_order"
+    _COLLECTIVE = "all-reduce"
+
     def __init__(
         self,
         comm,
@@ -705,7 +713,7 @@ class GemmAllReduceOp:
         # drain/reduce/gather would skip them and reduce into zeros.
         # Pinned launchers on the hot path; `parts` keeps the raw ones, which is
         # what self_test uses (it runs a different order, once).
-        tail = tuple(_PinnedLaunch(parts[name]) for name in parts["fused_order"])
+        tail = tuple(_PinnedLaunch(parts[name]) for name in parts[self._FUSED_ORDER])
         hit = _Plan(
             gemm=_PinnedLaunch(gemm),
             tail=tail,
@@ -713,12 +721,14 @@ class GemmAllReduceOp:
             input=from_gpu_ptr(
                 self.mem.ptr + cfg.input_off, (m, self.n), torch.bfloat16
             ),
-            output=from_gpu_ptr(
-                self.mem.ptr + cfg.output_off, (m, self.n), torch.bfloat16
-            ),
+            output=self._output_view(cfg, m),
         )
         self._cache[m] = hit
         return hit
+
+    def _output_view(self, cfg: ArConfig, m: int) -> torch.Tensor:
+        """What :meth:`__call__` returns: the whole all-reduced ``[m, n]``."""
+        return from_gpu_ptr(self.mem.ptr + cfg.output_off, (m, self.n), torch.bfloat16)
 
     def self_test(self, m: int | None = None) -> None:
         """Verify that the collective actually moves bytes. Raises if it does not.
@@ -734,20 +744,21 @@ class GemmAllReduceOp:
         it was perplexity: 862511 against 3.26.
 
         So: write ``rank + 1`` over the whole input region, run the *split* order
-        (``scatter -> reduce -> gather``), and check every element came back as
+        (``scatter -> reduce -> gather``; ``scatter -> reduce -> rs_barrier``
+        for the reduce-scatter), and check every element of the output came back as
         ``sum(1..world_size)``. With the puts inert each rank sees only its own
         contribution and the check fails.
 
-        Uses ``parts["order"]`` rather than ``fused_order`` on purpose:
-        ``fused_order`` opens with ``drain``, which assumes the GEMM epilogue has
-        already pushed, so without a GEMM it would drain nothing and reduce
-        whatever the window happened to hold.
+        Uses the split order rather than the fused one on purpose: the fused
+        order opens with ``drain``, which assumes the GEMM epilogue has already
+        pushed, so without a GEMM it would drain nothing and reduce whatever the
+        window happened to hold.
 
         Runs at ``m_max`` by default, which compiles the shape the first real
         call needs anyway rather than burning a second one.
         """
         if self.mem is None:
-            raise RuntimeError("this GemmAllReduceOp has been closed")
+            raise RuntimeError(f"this {type(self).__name__} has been closed")
         m = m or self.m_max
 
         try:
@@ -762,7 +773,7 @@ class GemmAllReduceOp:
         plan.output.zero_()
 
         stream = fx.Stream(torch.cuda.current_stream())
-        for name in plan.parts["order"]:
+        for name in plan.parts[self._SPLIT_ORDER]:
             plan.parts[name](self.dev_comm.ptr, self.win.handle, stream=stream)
         torch.cuda.current_stream().synchronize()
 
@@ -782,7 +793,7 @@ class GemmAllReduceOp:
                 "does nothing."
             )
             raise RuntimeError(
-                f"gemm_ar self-test failed: the all-reduce returned "
+                f"gemm_ar self-test failed: the {self._COLLECTIVE} returned "
                 f"{got.flatten()[0].item():g} where {want:g} was expected "
                 f"(worst relative error {worst:.3g} at M={m}, world_size="
                 f"{self.world_size}).{hint}"
@@ -937,7 +948,7 @@ class GemmAllReduceOp:
         profile.
         """
         if self.mem is None:
-            raise RuntimeError("this GemmAllReduceOp has been closed")
+            raise RuntimeError(f"this {type(self).__name__} has been closed")
         mxfp8 = self.quant == "mxfp8"
         kb = self.k // SCALE_BLOCK_K
         for name, t, shape in (
@@ -982,3 +993,96 @@ class GemmAllReduceOp:
                 raise ValueError(f"{name} must have {numel} elements, got {t.numel()}")
             if t.device.type != "cuda":
                 raise ValueError(f"{name} must be on a GPU, got {t.device}")
+
+
+class GemmReduceScatterOp(GemmAllReduceOp):
+    """Fused fp8 GEMM + reduce-scatter over cco SDMA, for sequence parallelism.
+
+    The same pipeline as :class:`GemmAllReduceOp` stopped one phase early: the
+    GEMM's epilogue pushes each destination's row band as it is produced, the
+    reduce sums my band, and there is no gather. Rank ``r`` gets rows
+    ``[r*M/P, (r+1)*M/P)`` of ``sum over ranks of A_r @ B_r.T`` -- the row-band
+    split ``torch.distributed.reduce_scatter_tensor`` makes on dim 0, and what a
+    sequence-parallel layer keeps after a RowParallelLinear.
+
+    No kernel differs from the all-reduce's. What changes is the order run after
+    the GEMM (``fused_rs_order``: drain, reduce, then a barrier-only kernel that
+    stands in for the gather's -- see ``build_sdma_phases``) and the returned
+    view, which is my band only. The wire options do not apply: the only leg is
+    the scatter, which is bf16.
+
+    The window is the all-reduce's, so it still holds a whole ``[m_max, n]``
+    output region of which this op writes ``1/P``. Shrinking it changes the
+    layout every other region is placed by, and is left for when the memory is
+    shown to matter.
+    """
+
+    _SPLIT_ORDER = "rs_order"
+    _FUSED_ORDER = "fused_rs_order"
+    _COLLECTIVE = "reduce-scatter"
+
+    def __init__(
+        self,
+        comm,
+        *,
+        n: int,
+        k: int,
+        m_max: int,
+        block_m: int | None = None,
+        block_n: int = DEFAULT_BLOCK_N,
+        sdma_queues: int = 1,
+        quant: str = "blockscale",
+        max_shapes: int | None = None,
+    ):
+        super().__init__(
+            comm,
+            n=n,
+            k=k,
+            m_max=m_max,
+            block_m=block_m,
+            block_n=block_n,
+            sdma_queues=sdma_queues,
+            quant=quant,
+            max_shapes=max_shapes,
+        )
+
+    @staticmethod
+    def window_bytes_for(
+        world_size: int,
+        *,
+        m_max: int,
+        n: int,
+        block_m: int = DEFAULT_BLOCK_M,
+        max_shapes: int | None = None,
+    ) -> int:
+        """Symmetric-window bytes an op for this shape will allocate."""
+        return GemmAllReduceOp.window_bytes_for(
+            world_size, m_max=m_max, n=n, block_m=block_m, max_shapes=max_shapes
+        )
+
+    def _output_view(self, cfg: ArConfig, m: int) -> torch.Tensor:
+        """My reduced row band, ``[m / world_size, n]``."""
+        return from_gpu_ptr(
+            self.mem.ptr + cfg.output_off + self.rank * cfg.slice_bytes,
+            (cfg.slice_rows, self.n),
+            torch.bfloat16,
+        )
+
+    def __call__(
+        self,
+        a_fp8: torch.Tensor,
+        b_preshuffled: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """One fused GEMM + reduce-scatter; returns a view of my row band.
+
+        Operands are exactly :meth:`GemmAllReduceOp.__call__`'s. The result is
+        ``[M / world_size, N]``: rows ``rank*M/P`` onward of the summed GEMM. It
+        aliases the window and is overwritten by the next call.
+
+        ``M`` has to be a multiple of ``world_size * block_m`` here too, and that
+        padding decides where the bands split -- a caller whose own split is over
+        the unpadded token count has to pad to this granule before it shards.
+        """
+        return super().__call__(a_fp8, b_preshuffled, a_scale, b_scale)
