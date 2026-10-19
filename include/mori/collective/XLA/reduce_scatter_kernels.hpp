@@ -42,12 +42,6 @@
 #include "mori/collective/XLA/collectives_common.hpp"
 #include "mori/collective/XLA/reduce_ops.hpp"
 
-// Push Phase-3 reduce path: 1 = range-checked raw-buffer loads/stores (no scalar
-// tail), 0 = original global b128 load/store + partial-group + scalar tail.
-#ifndef RS_USE_BUFFER_REDUCE
-#define RS_USE_BUFFER_REDUCE 0
-#endif
-
 namespace mori {
 namespace collective {
 
@@ -115,70 +109,6 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 #pragma unroll
     for (int j = 0; j < vecSize; j++) lanes[j] = DowncastF<T>(acc[i][j]);
     StreamStore<Scope>(output + idx * vecSize, __builtin_bit_cast(Vec, lanes));
-  }
-}
-
-// Buffered variant of ReduceVecGroup for the push path: same NV-grouped reduce,
-// but every access goes through a range-checked RAW buffer resource (V#) instead
-// of a raw pointer. srcRsrc(pe) returns peer pe's slice descriptor and outR is the
-// output slice descriptor; each descriptor's num_records is the valid slice byte
-// extent, so the hardware per-component range check (CDNA4 ISA 9.1.5 note 4)
-// handles the final partial vector -- OOB reads return 0 and OOB stores are
-// dropped -- with NO per-lane guard and NO scalar tail, for ANY reduction op.
-// The byte offset of vector index k is k * VecBytes (uint32; slice < 4 GiB).
-// Cache policy / non-temporal hint rides RS_BUF_AUX inside BufferLoad/Store128.
-template <int NV, class ReduceOp, class SrcRsrcFn, class T = typename ReduceOp::Type>
-__device__ __forceinline__ void ReduceVecGroupBuffered(SrcRsrcFn srcRsrc, BufRsrc outR,
-                                                       int npes, uint32_t g, uint32_t gstride) {
-  static_assert(VecBytes == 16, "ReduceVecGroupBuffered uses b128 buffer ops");
-  constexpr int vecSize = VecBytes / sizeof(T);
-  using Vec = TVecType<VecBytes>;
-  using AccType = typename AccumulatorType<T>::type;
-  using Data = std::array<T, vecSize>;
-
-  AccType acc[NV][vecSize];
-  Vec vec[NV];
-
-  // Seed accumulators from peer 0.
-  BufRsrc r0 = srcRsrc(0);
-#pragma unroll
-  for (int i = 0; i < NV; i++) {
-    uint32_t voff = static_cast<uint32_t>((g + i * gstride) * VecBytes);
-    vec[i] = BufferLoad128(r0, voff);
-  }
-#pragma unroll
-  for (int i = 0; i < NV; i++) {
-    Data lanes = __builtin_bit_cast(Data, vec[i]);
-#pragma unroll
-    for (int j = 0; j < vecSize; j++) acc[i][j] = UpcastF<T>(lanes[j]);
-  }
-  for (int pe = 1; pe < npes; pe++) {
-    BufRsrc rp = srcRsrc(pe);
-#pragma unroll
-    for (int i = 0; i < NV; i++) {
-      uint32_t voff = static_cast<uint32_t>((g + i * gstride) * VecBytes);
-      vec[i] = BufferLoad128(rp, voff);
-    }
-#pragma unroll
-    for (int i = 0; i < NV; i++) {
-      Data lanes = __builtin_bit_cast(Data, vec[i]);
-#pragma unroll
-      for (int j = 0; j < vecSize; j++) {
-        acc[i][j] = ReduceOp()(acc[i][j], UpcastF<T>(lanes[j]));
-      }
-    }
-  }
-#pragma unroll
-  for (int i = 0; i < NV; i++) {
-    Data lanes;
-#pragma unroll
-    for (int j = 0; j < vecSize; j++) lanes[j] = DowncastF<T>(acc[i][j]);
-    vec[i] = __builtin_bit_cast(Vec, lanes);
-  }
-#pragma unroll
-  for (int i = 0; i < NV; i++) {
-    uint32_t voff = static_cast<uint32_t>((g + i * gstride) * VecBytes);
-    BufferStore128(outR, vec[i], voff);
   }
 }
 
@@ -272,36 +202,6 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   staging += sOfs;
   shardOut += sOfs;
 
-#if RS_USE_BUFFER_REDUCE
-  // Range-checked raw-buffer path. Each descriptor's num_records is the valid
-  // slice byte extent (sCnt elements), so the hardware per-component range check
-  // covers the final partial vector: OOB reads return 0 and OOB stores are
-  // dropped. No partial-group loop, no scalar tail -- correct for any op. We only
-  // iterate to the vector ceiling; groups whose members run past the end are
-  // no-ops (bounded by NumVecs-1 extra chunks per thread).
-  const uint32_t sliceBytes32 = static_cast<uint32_t>(sCnt * sizeof(T));
-  auto srcRsrc = [input, staging, chunkElems, myPe, sliceBytes32](int pe) -> BufRsrc {
-    const T *ptr = pe == 0 ? input + myPe * chunkElems : 
-                             staging + (pe - 1) * chunkElems;
-    return MakeRawRsrc(ptr, sliceBytes32);
-  };
-  const BufRsrc outR = MakeRawRsrc(shardOut, sliceBytes32);
-  // Index in 32-bit: within a slice the vector index is bounded by the same
-  // < 4 GiB extent the buffer descriptor (num_records) already assumes, and the
-  // grid dims are small -- so 32-bit avoids 64-bit address math and VGPRs.
-  const uint32_t totalVecs = static_cast<uint32_t>(sCnt / vecSize);
-  const uint32_t totalVecsCeil = static_cast<uint32_t>((sCnt + vecSize - 1) / vecSize);
-  // Full NumVecs groups only while every member is in-bounds (no wasted OOB
-  // chunks), then NV=1 buffered groups to the ceiling so only the genuine final
-  // sub-vector element(s) hit the hardware range check.
-  uint32_t v = blockIdx.x * BlockDimX + threadIdx.x;
-  for (; v + (NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
-    ReduceVecGroupBuffered<NumVecs, ReduceOp>(srcRsrc, outR, npes, v, lstride);
-  }
-  for (; v < totalVecsCeil; v += lstride) {
-    ReduceVecGroupBuffered<1, ReduceOp>(srcRsrc, outR, npes, v, lstride);
-  }
-#else
   // Push path: every source (input + staging) is LOCAL HBM and the Phase-2
   // __threadfence_system() already made the remote-DMA'd staging visible, so the
   // per-access loads/stores use agent scope (scope=EAgentScope).
@@ -333,7 +233,6 @@ __device__ __forceinline__ void WaitAndReduceSlice(
     V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     StreamStore<EAgentScope, sizeof(T)>(shardOut + v, V);
   }
-#endif // RS_USE_BUFFER_REDUCE
 }
 
 // Load M output positions x NPES peers ALL up front into distinct registers, then
@@ -405,15 +304,15 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, StoreFn s
 template <int NumVecs, int NPES, class ReduceOp, class StoreFn,
           class T = typename ReduceOp::Type>
 __device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
-                                                const T* __restrict__ input, StoreFn store,
-                                                size_t chunkElems) {
+                                    const T* __restrict__ input, StoreFn store,
+                                    size_t chunkElems) {
   constexpr int vecSize = VecBytes / sizeof(T);
   constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
   const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
   const size_t totalVecs = chunkElems / vecSize;
 
-  const T* __restrict__ myShard = input + static_cast<size_t>(myPe) * chunkElems;
+  const T* __restrict__ myShard = input + myPe * chunkElems;
   auto srcBase = [myShard, myPe, stride4G](int pe) -> const T* {
     int32_t diff = (pe - myPe) * static_cast<int32_t>(stride4G);
     return reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(myShard) +
