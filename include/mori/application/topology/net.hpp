@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,9 @@
 
 namespace mori {
 namespace application {
+
+// Extract a PCI BDF (e.g. 0000:8c:00.0) from a sysfs path by walking up parents.
+PciBusId ParseBusIdFromSysfs(std::filesystem::path path);
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           TopoNodeNic                                          */
@@ -52,6 +56,10 @@ class TopoSystemNet {
 
   int NumNics() const { return nics.size(); }
   std::vector<TopoNodeNic*> GetNics() const;
+
+  // Add an externally-discovered NIC (e.g. a fabric NIC not exposed through
+  // ibverbs). Keeps fabric-specific discovery out of the generic topology layer.
+  void AddNic(std::string name, PciBusId busId, double totalGbps);
 
  private:
   void Load();

@@ -601,12 +601,11 @@ helper mirrors `umbp_store.py`'s env-var-driven construction of
 - **Optional**, defaulting the same way `UMBPDistributedConfig`
   already does when unset: `UMBP_IO_ENGINE_PORT`,
   `UMBP_PEER_SERVICE_PORT` (reusing the worker-side env-var names,
-  since those refer to the same concept in both places), and five
+  since those refer to the same concept in both places), and four
   server-backend-only names with a `UMBP_DISTRIBUTED_` prefix (chosen
-  because these five have no existing worker-side env-var form to
+  because these four have no existing worker-side env-var form to
   collide with — worker-side they are `extra_config`-only):
   `UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE`,
-  `UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE`,
   `UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS`,
   `UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES`,
   `UMBP_DISTRIBUTED_DRAM_PAGE_SIZE`.

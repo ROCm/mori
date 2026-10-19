@@ -198,16 +198,12 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE", &dist.ssd_staging_buffer_size,
-                    error)) {
-    return false;
-  }
   if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
                    error)) {
     return false;
   }
-  if (dist.ssd_staging_buffer_slots <= 0) {
-    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
+  if (dist.ssd_staging_buffer_slots < 0) {
+    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be >= 0 (0 = the preset)";
     return false;
   }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,

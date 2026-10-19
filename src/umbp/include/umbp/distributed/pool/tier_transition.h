@@ -63,6 +63,7 @@ class TierTransitionExecutor {
   static bool BuildTransfers(MediumBackend* source, const ResolvedEntry& resolved,
                              MediumBackend* target, const AllocateResult& allocation,
                              std::vector<TransferItem>* items);
+  bool FileReachable(MediumBackend* backend) const;
 
   BackendRegistry* backends_;
   TransferEngine* transfer_engine_;

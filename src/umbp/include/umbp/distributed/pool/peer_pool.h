@@ -51,6 +51,8 @@ namespace mori::umbp {
 struct PoolAllocateResult {
   uint32_t backend_id = BackendRegistry::kMaxBackends;
   AllocateResult allocation;
+  // Failed because another writer is storing this key right now.
+  bool in_flight = false;
 };
 
 struct PoolSlotRef {
@@ -122,8 +124,10 @@ class PeerPool {
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
+  // `reader` is passed to every backend asked (see MediumBackend::BatchResolve).
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                              bool include_descs, bool allow_file_refs = false);
+                                              bool include_descs, bool allow_file_refs = false,
+                                              ResolveReader reader = ResolveReader::kRemote);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
   // check discards. Takes no read lease and does not touch recency: asking
@@ -216,9 +220,12 @@ class PeerPool {
   void TouchLocked(const std::string& key);
   void ForgetAccessLocked(const std::string& key);
   // Whether this read should promote the key out of `source_tier`, per that
-  // tier's trigger. Counts the read for an kOnHits tier, so it must only be
-  // called once per served read and only when a promotion could actually run.
+  // tier's trigger. Counts the read for an kOnHits tier, so call it once per read.
   bool PromoteOnReadLocked(const std::string& key, LogicalTierGraph::TierIndex source_tier);
+  // Promotes what this read should, before it runs, and repoints `preferred` at
+  // each promoted copy so the read is served from there.
+  void PromoteForRead(const std::vector<std::string>& keys,
+                      std::vector<std::optional<uint32_t>>* preferred);
   // Backend that currently holds the key, or kMaxBackends. The placement index
   // is process-local and can be stale or empty (after a restart, or once
   // another path evicted the key), so the backends are the authority.

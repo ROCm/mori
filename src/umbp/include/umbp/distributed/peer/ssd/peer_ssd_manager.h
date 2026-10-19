@@ -22,9 +22,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -54,7 +56,8 @@ struct SsdReadOutcome {
 // Peer-side owner of the local SSD tier: one SSD TierBackend + the
 // key->SSD-location map, capacity, the owned-location event outbox, the
 // read-prepare path, and Evict().  Reached through SsdBackend.  It never
-// decides to evict; it only offers its LRU as candidates.
+// decides to evict; it only offers candidates, in the tier's order when the
+// tier keeps one and in its own LRU otherwise.
 //
 // It reuses ONLY the low-level TierBackend (SSDTier).  Peer DRAM is owned by
 // PageBackend, and a second thing here that also held DRAM and demoted between
@@ -93,13 +96,6 @@ class PeerSsdManager {
   // Forwards to the SSD tier; does no device IO.
   std::optional<RecordLocation> LocateRecord(const std::string& key) const;
 
-  // Write the key's bytes (assembled from possibly non-contiguous DRAM source
-  // segments) to the SSD backend.  On success records the SSD location and
-  // queues an ADD SSD event; on failure records nothing and queues nothing
-  // (best-effort clean).
-  bool Write(const std::string& key, const std::vector<std::pair<const void*, size_t>>& segments,
-             size_t total_size);
-
   // Batched form of Write for contiguous sources — the SsdBackend::BatchCommit
   // path.  One dedup pass, ONE backend BatchWrite (which a multi-drive
   // ShardedSsdTier fans across every drive in parallel), then one recording
@@ -114,6 +110,13 @@ class PeerSsdManager {
                                const std::vector<const void*>& srcs,
                                const std::vector<size_t>& sizes);
 
+  // Write-in-place for a local file engine: reserve room, fill
+  // `location`, then CommitReserved records the key (ADD event) or
+  // AbortReserved drops it.  nullopt when the tier cannot (no file, no room).
+  std::optional<RecordReservation> Reserve(const std::string& key, uint64_t size);
+  bool CommitReserved(const std::string& key, const RecordReservation& r);
+  void AbortReserved(const std::string& key, const RecordReservation& r);
+
   // Frees one key; false if it is being read or pinned (inflight_reads_ > 0).
   // Marks the key in evicting_ under the lock, evicts outside it, and only on
   // success removes owned_/lru_ and queues a REMOVE (never while the bytes
@@ -122,7 +125,19 @@ class PeerSsdManager {
   bool Evict(const std::string& key);
 
   // Coldest first, skipping keys being read, pinned or evicted.  Frees nothing.
+  // When the tier orders its own eviction (OrdersEviction()), its order is used
+  // and each offer carries the bytes the tier credits it with; otherwise the
+  // order is this class's LRU and an offer carries the key's size.
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count);
+
+  // True when only the tier's own order frees space (the segment-log SSD tier
+  // returns disk a whole segment at a time), so no other ranking should be
+  // used to pick its victims.
+  bool OrdersEviction() const;
+
+  // Forwards to the tier: see TierBackend::SetRetiredFileHook.
+  void SetRetiredFileHook(std::function<void(int fd)> on_close, std::chrono::milliseconds grace);
+  TierSpaceStats SpaceStats() const { return backend_ ? backend_->SpaceStats() : TierSpaceStats{}; }
 
   // Distributed Clear: drop the logical owned-location map + undrained events,
   // then delete the physical SSD bytes (a user Clear means the cache is no
@@ -199,6 +214,13 @@ class PeerSsdManager {
   uint64_t EvictionBackendFailures() const {
     return metrics_.evict_backend_failures.load(std::memory_order_relaxed);
   }
+  // Records written in place through a reservation, and reservations given up.
+  uint64_t WritesInPlace() const {
+    return metrics_.writes_in_place.load(std::memory_order_relaxed);
+  }
+  uint64_t WriteInPlaceAborts() const {
+    return metrics_.write_in_place_aborts.load(std::memory_order_relaxed);
+  }
 
  private:
   // One owned SSD key: its size plus a hook into the LRU recency list so that
@@ -211,6 +233,10 @@ class PeerSsdManager {
   // Splice |key| to the MRU (front) of the recency list.  Caller holds mutex_
   // and must have already inserted the key into owned_.
   void TouchLocked(const std::string& key);
+
+  // A write of `key` landed: own it (ADD event), or just touch it if a
+  // concurrent writer already did.  Caller holds mutex_.
+  void RecordWrittenLocked(const std::string& key, uint64_t size);
 
   // Build the full ADD list for every owned SSD key.  Caller MUST hold mutex_.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
@@ -310,6 +336,8 @@ class PeerSsdManager {
     std::atomic<uint64_t> copy_bytes{0};  // bytes written to SSD (write IO)
     std::atomic<uint64_t> read_bytes{0};  // bytes read from SSD (read IO)
     std::atomic<uint64_t> evict_backend_failures{0};
+    std::atomic<uint64_t> writes_in_place{0};
+    std::atomic<uint64_t> write_in_place_aborts{0};
   };
   MetricsCounters metrics_;
 };

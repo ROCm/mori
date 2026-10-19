@@ -92,8 +92,10 @@ struct UMBPSsdConfig {
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
-  // Each segment file holds an fd for the tier's lifetime: at 4 GiB a 1.5 TB
-  // tier needs ~350, under the usual soft RLIMIT_NOFILE of 1,024.
+  // The unit disk is reclaimed in: evicted records keep their bytes until every
+  // record in their segment is gone and the file is deleted.  Each live segment
+  // also holds an fd: at 4 GiB a 1.5 TB tier needs ~350, under the usual soft
+  // RLIMIT_NOFILE of 1,024.  A tier smaller than 8 segments uses capacity / 8.
   size_t segment_size_bytes = 4ULL * 1024 * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
@@ -334,13 +336,9 @@ struct UMBPDistributedConfig {
   // stops paying for an arena it does not use.
   size_t ranged_scratch_size = 0;
 
-  // Dedicated SSD read staging, allocated only when medium == SSD. Per-slot
-  // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
-  // (61-layer MLA page ~= 4.5 MB).
-  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
-
-  // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
-  int ssd_staging_buffer_slots = 16;
+  // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
+  // 0 = 4 GiB capped at the SSD tier.
+  int ssd_staging_buffer_slots = 0;
 
   // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
   // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
@@ -654,6 +652,7 @@ struct UMBPConfig {
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.segment_size_bytes = getenv_size("UMBP_SSD_SEGMENT_SIZE", cfg.ssd.segment_size_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
     cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
