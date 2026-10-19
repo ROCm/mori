@@ -47,15 +47,25 @@ struct KeyMeta {
   // must skip verification for those regardless of their own verify_crc setting,
   // otherwise every such key reads back as corrupt.
   bool crc_valid = true;
+  // Index access tick of this key's last read or write.  Orders the keys of
+  // one segment for eviction, coldest first.
+  uint64_t last_access = 0;
 };
 
 struct Meta {
   uint64_t id = 0;
   std::string path;
   int fd = -1;
+  // Append cursor, which is also the file's size on disk: segments are only
+  // ever appended to, never preallocated or rewritten.
   uint64_t write_offset = 0;
   uint64_t scanned_offset = 0;
   size_t live_bytes = 0;
+  // Reads and writes that copied `fd` under the tier lock and are still using
+  // it outside the lock.  The segment is not deleted while any are left.
+  uint32_t io_refs = 0;
+  // Index access tick of the last read or write of any record in here.
+  uint64_t last_access = 0;
 };
 
 struct WriteReservation {

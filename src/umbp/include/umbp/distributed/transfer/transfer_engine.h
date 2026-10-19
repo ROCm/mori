@@ -74,8 +74,8 @@ namespace mori::umbp {
 // FILE ENDPOINT (kind == File): the "one-file change" the note below predicted.
 // A `kind` tag plus a second handle set — an O_DIRECT fd, a file offset, and an
 // opaque engine handle — lets a backend publish a byte range of a file that a
-// file engine (GdsEngine) moves straight between the drive and device memory,
-// with no host bounce.  The memory-only engines ignore it for free: their
+// file engine moves in place: GdsEngine to device memory, PosixEngine to and
+// from host memory.  The memory-only engines ignore it for free: their
 // CanHandle keys on HasHostPtr()/HasMemoryDesc(), both false for a file ref, so
 // the existing per-pair selection already routes it to the only engine that
 // claims it.  SsdBackend is the backend that needed it (design doc §4/§6).

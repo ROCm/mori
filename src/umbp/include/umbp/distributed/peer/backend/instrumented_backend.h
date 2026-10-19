@@ -78,8 +78,9 @@ class InstrumentedBackend final : public MediumBackend {
   TierCapacity Capacity() const override { return inner_->Capacity(); }
   uint64_t OwnedKeyCount() const override { return inner_->OwnedKeyCount(); }
   bool Contains(const std::string& key) const override { return inner_->Contains(key); }
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override {
-    return inner_->AcquireMigrationRead(key, resolved);
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override {
+    return inner_->AcquireMigrationRead(key, resolved, allow_file_ref);
   }
   void ReleaseMigrationRead(const std::string& key) override { inner_->ReleaseMigrationRead(key); }
   std::vector<KvEvent> DrainPendingEvents() override { return inner_->DrainPendingEvents(); }
@@ -97,6 +98,7 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override {
     return inner_->EvictionCandidates(max_count);
   }
+  bool OwnsEvictionOrder() const override { return inner_->OwnsEvictionOrder(); }
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override {
     inner_->SetAutoFlushHook(threshold, std::move(cb));
@@ -114,7 +116,8 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& reqs) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override;
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   // ---- bootstrap / local endpoints: pass-through ----

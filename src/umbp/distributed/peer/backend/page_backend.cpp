@@ -490,6 +490,7 @@ bool PageBackend::CommitLocked(uint64_t slot_id, const std::string& key,
   OwnedSlot owned;
   owned.pages = std::move(it->second.pages);
   owned.size = it->second.size;
+  owned.hold = std::make_shared<char>();
   QueueEventLocked(KvEvent{KvEvent::Kind::ADD, key, tier_, owned.size});
   owned_[key] = std::move(owned);
   TouchLru(key, owned_[key]);
@@ -554,7 +555,8 @@ ResolvedEntry PageBackend::Resolve(const std::string& key) {
 }
 
 std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::string>& keys,
-                                                     bool include_descs, bool allow_file_refs) {
+                                                     bool include_descs, bool allow_file_refs,
+                                                     ResolveReader reader) {
   (void)allow_file_refs;  // pages are this medium's storage; there is no file to name
   std::vector<ResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
@@ -580,7 +582,11 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
     entry.size = it->second.size;
     entry.page_size = page_size_;
     if (include_descs) entry.descs = BuildBufferDescsLocked(it->second.pages);
-    RenewLeaseAtomic(it->second, lease_deadline);
+    if (reader == ResolveReader::kLocal) {
+      entry.hold = it->second.hold;
+    } else {
+      RenewLeaseAtomic(it->second, lease_deadline);
+    }
     if (track_eviction_order_) touched.emplace_back(&keys[i], &it->second);
   }
   if (!touched.empty()) {
@@ -590,7 +596,8 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   return out;
 }
 
-bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                                       bool /*allow_file_ref*/) {
   if (resolved == nullptr) return false;
   std::unique_lock<std::shared_mutex> lock(mutex_);
   auto owned = owned_.find(key);
@@ -600,7 +607,7 @@ bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* re
   resolved->pages = owned->second.pages;
   resolved->size = owned->second.size;
   resolved->page_size = page_size_;
-  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now(), /*migration=*/true};
+  pins_[key] = PinState{next_pin_token_++, std::chrono::steady_clock::now()};
   return true;
 }
 
@@ -646,9 +653,8 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
       continue;
     }
     if (HasActivePinLocked(key)) {
-      // An SSD copy worker is reading these pages.  Do NOT free them, do
-      // NOT emit REMOVE, keep the key owned.  bytes_freed=0 tells master to
-      // retry; the pin is released when the copy finishes.
+      // A migration is reading these pages: keep them, emit no REMOVE, and
+      // report bytes_freed=0 so the caller retries.
       out.push_back(std::move(r));
       continue;
     }
@@ -662,54 +668,8 @@ std::vector<EvictResult> PageBackend::Evict(const std::vector<std::string>& keys
   return out;
 }
 
-// ---------------------------------------------------------------------------
-//  DRAM copy pins (protect owned pages while the SSD copy pipeline reads them)
-// ---------------------------------------------------------------------------
-
-std::optional<PageBackend::DramCopyPin> PageBackend::AcquireDramCopyPin(const std::string& key) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = owned_.find(key);
-  if (it == owned_.end()) return std::nullopt;              // already evicted -> drop task
-  if (pins_.find(key) != pins_.end()) return std::nullopt;  // duplicate task
-
-  DramCopyPin pin;
-  pin.total_size = it->second.size;
-  pin.segments = BuildCopySegmentsLocked(it->second.pages, it->second.size);
-  pin.pin_token = next_pin_token_++;
-  pins_[key] = PinState{pin.pin_token, std::chrono::steady_clock::now()};
-  return pin;
-}
-
-void PageBackend::ReleaseDramCopyPin(const std::string& key, uint64_t pin_token) {
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  auto it = pins_.find(key);
-  if (it == pins_.end() || it->second.token != pin_token) return;  // tolerate late/dup release
-  pins_.erase(it);
-}
-
 bool PageBackend::HasActivePinLocked(const std::string& key) const {
   return pins_.find(key) != pins_.end();
-}
-
-std::vector<std::pair<const void*, size_t>> PageBackend::BuildCopySegmentsLocked(
-    const std::vector<PageLocation>& pages, uint64_t total_size) const {
-  std::vector<std::pair<const void*, size_t>> segments;
-  if (buffer_bases_.empty()) return segments;
-  segments.reserve(pages.size());
-  uint64_t remaining = total_size;
-  for (const auto& p : pages) {
-    if (p.buffer_index >= buffer_bases_.size() || buffer_bases_[p.buffer_index] == nullptr) {
-      MORI_UMBP_ERROR("[PageBackend] copy segment: bad buffer_index {} (bases={})", p.buffer_index,
-                      buffer_bases_.size());
-      return {};
-    }
-    // Last page may be partial; earlier pages are full page_size.
-    const uint64_t bytes = std::min<uint64_t>(page_size_, remaining);
-    const char* base = static_cast<const char*>(buffer_bases_[p.buffer_index]);
-    segments.emplace_back(base + static_cast<uint64_t>(p.page_index) * page_size_, bytes);
-    remaining -= bytes;
-  }
-  return segments;
 }
 
 // ---------------------------------------------------------------------------
@@ -734,24 +694,25 @@ void PageBackend::ClearLocal() {
   // UAF-safe in practice).
   if (!pins_.empty()) {
     MORI_UMBP_ERROR(
-        "[PageBackend] ClearLocal with {} active copy pin(s) — caller did not quiesce the copy "
-        "pipeline (bug)",
+        "[PageBackend] ClearLocal with {} active migration pin(s) — caller did not drain "
+        "migrations (bug)",
         pins_.size());
-    assert(pins_.empty() && "ClearLocal called with active copy pins; quiesce the pipeline first");
+    assert(pins_.empty() && "ClearLocal called with active migration pins");
   }
 
-  // Owned: defer pages with an active read lease (an RDMA read may still be
-  // in flight) until their lease deadline; free the rest immediately.  No
+  // Owned: defer pages a read lease or a local reader still covers (a read
+  // may be in flight); free the rest immediately.  No
   // REMOVE events — the upcoming full-sync empty snapshot collapses
   // master's index.
   const int64_t now_ns = SteadyNs(now);
   for (auto& [key, slot] : owned_) {
     const int64_t lease_ns = slot.read_lease_ns.load(std::memory_order_relaxed);
-    if (lease_ns > now_ns) {
+    if (lease_ns > now_ns || slot.hold.use_count() > 1) {
       DeferredFree df;
       df.key = key;
       df.pages = std::move(slot.pages);
       df.release_at = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(lease_ns));
+      df.hold = std::move(slot.hold);
       deferred_frees_.push_back(std::move(df));
       continue;
     }
@@ -839,10 +800,9 @@ std::vector<EvictionOffer> PageBackend::EvictionCandidates(size_t max_count) {
   for (auto it = lru_.rbegin(); it != lru_.rend() && out.size() < max_count; ++it) {
     auto owned_it = owned_.find(*it);
     if (owned_it == owned_.end()) continue;  // defensive; lru_/owned_ stay in sync
-    // Skip what Evict() refuses (read lease, copy pin); a migration pin is
+    // Skip what Evict() refuses for good (a read lease); a pinned key is
     // offered so the caller can count it as in flight.
     if (HasActiveReadLeaseLocked(owned_it->second, now)) continue;
-    if (auto pin = pins_.find(*it); pin != pins_.end() && !pin->second.migration) continue;
     // Whole pages, as Capacity() counts them.
     out.push_back(
         EvictionOffer{*it, static_cast<uint64_t>(owned_it->second.pages.size()) * page_size_});
@@ -976,7 +936,9 @@ std::vector<BufferMemoryDescBytes> PageBackend::BuildBufferDescsLocked(
 
 bool PageBackend::HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                            std::chrono::steady_clock::time_point now) {
-  return slot.read_lease_ns.load(std::memory_order_relaxed) > SteadyNs(now);
+  // Exact under the exclusive lock: no resolve can copy the hold meanwhile.
+  return slot.read_lease_ns.load(std::memory_order_relaxed) > SteadyNs(now) ||
+         slot.hold.use_count() > 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,9 +997,9 @@ void PageBackend::ReaperSweep() {
     }
   }
 
-  // Release ClearLocal()-deferred pages whose lease deadline has passed.
+  // Release ClearLocal()-deferred pages no lease or reader covers any more.
   for (auto it = deferred_frees_.begin(); it != deferred_frees_.end();) {
-    if (it->release_at <= now) {
+    if (it->release_at <= now && it->hold.use_count() <= 1) {
       if (allocator_) allocator_->Deallocate(it->pages);
       MORI_UMBP_DEBUG("[PageBackend] released deferred key='{}' pages={}", it->key,
                       it->pages.size());
