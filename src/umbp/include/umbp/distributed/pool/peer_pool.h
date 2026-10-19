@@ -260,10 +260,10 @@ class PeerPool {
   // name their victim explicitly, and non-tiered pools never read the LRU.
   bool track_access_order_ = false;
 
-  // Resolve dispatch deliberately drops operation_mutex_ while thread-safe
-  // backends do their work. ClearLocal takes this exclusively so it cannot
-  // invalidate an SSD staging result while a resolve is between its plan and
-  // publish phases.
+  // Resolve and commit dispatch deliberately drop operation_mutex_ while
+  // thread-safe backends do their work. ClearLocal takes this exclusively so it
+  // cannot invalidate an SSD staging result while a resolve is between its plan
+  // and publish phases, or wipe a key a commit is still writing.
   mutable std::shared_mutex lifecycle_mutex_;
   // Serializes policy decisions with backend lifecycle operations. The first
   // Pool still uses one metadata lock, but slow resolve dispatch does not hold
