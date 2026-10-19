@@ -277,9 +277,10 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
       LOW_LATENCY_ASYNC_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
   MORI_TRACE_SPAN(profiler, Slot::DispatchAsyncRecvTransfer);
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        if (destPe / config.gpuPerNode == myNode && config.enableSdma) {
+        if (isSdmaPeer) {
           shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
               destPe, args.interNodeTokBufs.dispatchInp);
         } else {
@@ -524,9 +525,10 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
   (void)sizeof(TokT);
 
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
+    bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
       if (laneId == 0) {
-        if (destPe / config.gpuPerNode == myNode && config.enableSdma) {
+        if (isSdmaPeer) {
           shmem::ShmemQuietThreadKernel<application::TransportType::SDMA>(
               destPe, args.interNodeTokBufs.combineInp);
         } else {
