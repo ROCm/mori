@@ -522,7 +522,8 @@ def internode_schedule(cfg):
 
     Either sweep env override bypasses both tables. Otherwise explicit config
     fields override the selected family's table, with config defaults for an
-    untuned phase. Only table values are CU-clamped; all paths keep R < B.
+    untuned phase. Table values and unpinned defaults are CU-clamped; pinned
+    fields are kept as given. All paths keep R < B.
     """
     defaults = [
         tuple(getattr(cfg, name) for name in fields)
@@ -568,7 +569,11 @@ def internode_schedule(cfg):
         for index, (fields, fallback) in enumerate(
             zip(_INTERNODE_GEOMETRY_FIELDS, defaults), start=1
         ):
-            geometry = tuned[index] if tuned and tuned[index] else fallback
+            geometry = (
+                tuned[index]
+                if tuned and tuned[index]
+                else fit_internode_geometry(fallback, clamp_to_cu=True)
+            )
             geometry = tuple(
                 getattr(cfg, name) if name in pinned else value
                 for name, value in zip(fields, geometry)
@@ -600,48 +605,21 @@ def v2_table_filename(
     )
 
 
-def _v2_table_path(
-    directory, gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
-):
-    """The exact model's table, else another model's with the same arch and shape."""
-    directory = Path(directory)
-    exact = directory / v2_table_filename(
-        gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
-    )
-    if exact.is_file() or not directory.is_dir():
-        return exact
-    siblings = sorted(
-        directory.glob(
-            v2_table_filename(
-                gpu_arch, "*", kernel_type, ep_size, num_experts, topk, phase
-            )
-        )
-    )
-    return siblings[0] if siblings else exact
-
-
 _V2_RULES_CACHE: dict = {}
 
 
 def _v2_phase_rules(
     gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
 ):
-    """Validated, sorted rules of one V2 table; [] when there is none."""
+    """Validated, sorted rules of this model's own V2 table; [] when there is none."""
     from mori.ops.tuning_config import (
         _COMBINE_RULE_REQUIRED,
         _DISPATCH_RULE_REQUIRED,
         TuningConfigManager,
     )
 
-    path = _v2_table_path(
-        internode_table_dir(),
-        gpu_arch,
-        gpu_model,
-        kernel_type,
-        ep_size,
-        num_experts,
-        topk,
-        phase,
+    path = internode_table_dir() / v2_table_filename(
+        gpu_arch, gpu_model, kernel_type, ep_size, num_experts, topk, phase
     )
     if path not in _V2_RULES_CACHE:
         required = (
