@@ -118,18 +118,21 @@ calls of up to 512 tokens.
 Leave `dispatch_block_num` / `combine_block_num` / `warp_num_per_block` /
 `combine_warp_num_per_block` / `dispatch_rdma_block_num` /
 `combine_rdma_block_num` at `None` and the backend resolves the swept geometry
-for this GPU, shape and dtype out of `tuning_configs/`, one bucket per
+for this GPU model, shape and dtype out of `tuning_configs/`, one bucket per
 token range, with plans prepared up front. A pinned config field overrides only that
 field; the remaining fields stay tuned. The sweep hooks `MORI_EP_DISP_GEOM` /
 `MORI_EP_COMB_GEOM` (`"block,rdma,warp"`) bypass table selection for both phases
 when either is set. Clear both when checking automatic selection.
 
-`MORI_EP_V2_TUNING_DIR` selects an alternate internode JSON directory. The shared
+`MORI_EP_V2_TUNING_DIR` selects an alternate V2 JSON directory (intra and inter). The shared
 loader in `mori.ops.tuning_config` handles filenames, loading, lookup and
 merge-on-save; `hip_tuning_configs.py` adds the HIP schedule and CU limits.
 
-- Each phase matches **its own dtype**: fp8 dispatch + bf16 combine reads
-  `fp8_e4m3` dispatch rules and the same `bf16` combine rules as bf16 dispatch.
+- Only the current GPU model's own files are read; a model without a file uses
+  the default geometry instead of another model's table.
+- Each phase matches **its own dtype**: fp8 dispatch + bf16 combine reads the
+  arch's fp8 dispatch rules (`fp8_e4m3_fnuz` on gfx942, `fp8_e4m3` on gfx950)
+  and the same `bf16` combine rules as bf16 dispatch.
 - `num_tokens` is an inclusive ceiling; the largest matching rule also serves
   larger token counts. Dispatch/combine bucket edges are combined into a schedule,
   while a phase without matching rules keeps its default geometry.
@@ -196,8 +199,8 @@ defaults to the dispatch+combine pair's total latency (`--tuning-metric total`),
 with the other phase held at its selected geometry. A bf16 combine rule is shared
 by bf16, fp8 and fp4 dispatch, so validate the affected input dtypes before
 replacing it, or use a separate tuning directory for a dtype-specific experiment.
-Experiment results and bandwidth records live in [dispatch.md](../../../../dispatch.md) and
-[bw.md](../../../../bw.md).
+Table layout, coverage and measurement conditions are in
+[tuning_configs/README.md](tuning_configs/README.md).
 
 Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 

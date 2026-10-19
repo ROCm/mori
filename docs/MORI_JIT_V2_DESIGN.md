@@ -341,7 +341,7 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 
 HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 backend 入口，返回统一的
 `ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R 的 `KernelConfig`。
-单机保留 Python 表和显式 `cfg.schedule`；跨机保留 JSON。
+单机先查 `IntraNodeV2` JSON，某相没有规则时回退到 Python 表，显式 `cfg.schedule` 优先；跨机只查 JSON。
 `op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
 HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyDSL 表。
@@ -358,7 +358,7 @@ JSON 按 kernel（`InterNodeV2`/`InterNodeV2LL`/`IntraNodeV2`）、EP、总专�
 `gfx950_mi355x_InterNodeV2_ep16_expert256_top6_dispatch.json`。各相按**自身 dtype**查找：
 fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
 ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）和 `topk` 决定读哪个
-文件：例如 EP16 的 256/8 读 `expert256_top8`，384/6 读 `expert384_top6`，不跨专家组合回退。规则必须
+文件：例如 EP16 的 256/8 读 `expert256_top8`，384/6 读 `expert384_top6`；只读当前型号自己的文件，不跨型号或专家组合回退。规则必须
 显式记录 `topk`，缺这个字段的旧规则不参与 V2 查表；专家数由文件确定，不逐条记录。未调优的相使用默认几何。
 保存结果时用这两个值选择文件。V1 的历史通配兼容行为不变。
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
@@ -370,8 +370,9 @@ internode 几何增加了 `rdma_block_num`，把 grid 分成 RDMA 和 node 内�
 shape/dtype 决定编译特化；B/R/W 只影响 plan 的启动配置，相同源码可以共享编译缓存。
 运行时选中的配置直接索引到已绑定的 group callable，不会触发编译。
 表中参数限制 `block_num <= CU 数`；手动参数保留指定的 grid，所有路径都限制 `rdma_block_num < block_num`。具体调优用法见
-[包 README](../python/mori/ops/dispatch_combine_v2/README.md#internode-geometry-tuned-by-default)，
-实验及带宽记录见 [dispatch.md](../dispatch.md) 和 [bw.md](../bw.md)。
+[包 README](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md#internode-geometry-tuned-by-default)，
+各型号的覆盖范围和测量条件见
+[tuning_configs/README.md](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/tuning_configs/README.md)。
 
 ## 6. Python 绑定
 
