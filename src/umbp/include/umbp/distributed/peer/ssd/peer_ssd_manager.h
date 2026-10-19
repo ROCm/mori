@@ -190,6 +190,7 @@ class PeerSsdManager {
   // master would otherwise grow it by one entry per written key forever.
   void SetEventPublishing(bool enabled);
   std::vector<KvEvent> SnapshotOwnedKeys() const;
+  size_t OwnedKeyCount() const;
 
   // Full-sync snapshot that also atomically drops the event outbox under the
   // same lock.
