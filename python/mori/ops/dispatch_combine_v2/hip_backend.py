@@ -54,6 +54,7 @@ import os
 
 import torch
 
+from mori.ops import utils as _gpu
 from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
@@ -112,29 +113,35 @@ def _geometry_from_env(name):
     return parts
 
 
-# SDMA queues per GPU pair that an arch is known to fit, when AsyncLL would
-# otherwise ask for one per peer. Only archs that CANNOT hold the full eight
+# SDMA queues per GPU pair that a PART is known to fit, when AsyncLL would
+# otherwise ask for one per peer. Only parts that CANNOT hold the full eight
 # belong here; everything else keeps the peer count.
 #
-# gfx942 (MI300X/MI308X): its xGMI engines fold to the even ids {2,4,6} and
-# ROCr's own blit queues take part of that, so three is what a pair fits. Asking
-# for eight on 8xMI308X returns HSAKMT_STATUS_NO_MEMORY from hsaKmtCreateQueueExt
-# and anvil exit()s the process; with three the AsyncLL suite passes there.
-_ASYNCLL_SDMA_QUEUE_CAP = {"gfx942": 3}
+# Keyed on the model (mori.ops.utils.detect_model, i.e. the PCI device id), not
+# the arch: MI300X, MI325X and MI308X are all gfx942, and only MI308X is short of
+# engines. Its xGMI engines fold to the even ids {2,4,6} and ROCr's own blit
+# queues take part of that, so three is what a pair fits -- asking for eight on
+# 8xMI308X returns HSAKMT_STATUS_NO_MEMORY from hsaKmtCreateQueueExt and anvil
+# exit()s the process; with three the AsyncLL suite passes there. anvil singles
+# MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
+# would have held MI300X and MI325X, which have the full set, to three as well.
+_ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
 
 
-def _asyncll_sdma_queues(arch: str, gpu_per_node: int) -> int:
+def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
     """How many SDMA queues per pair to ask cco for, 0 to leave the env default.
+
+    `model` is detect_model()'s answer, None when the part is not one it knows.
 
     An explicit MORI_SDMA_NUM_CHANNELS is the operator saying what this machine
     can take, so it wins: returning 0 lets cco fall through to it. Without that
     deference this request silently beat the env knob, and the only way out of
-    the gfx942 abort was to edit the source.
+    the MI308X abort was to edit the source.
     """
     if os.environ.get("MORI_SDMA_NUM_CHANNELS"):
         return 0
     want = min(8, max(1, gpu_per_node))
-    cap = _ASYNCLL_SDMA_QUEUE_CAP.get(arch)
+    cap = _ASYNCLL_SDMA_QUEUE_CAP.get(model)
     return min(want, cap) if cap else want
 
 
@@ -438,7 +445,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # communicator, not off the window -- which is why the test is not just
         # is_internode.
         self._dev_comm = (
-            self._make_dev_comm(cfg, comm, self._arch)
+            self._make_dev_comm(cfg, comm)
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
@@ -532,7 +539,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     # in a backend of its own.
 
     @staticmethod
-    def _make_dev_comm(cfg, comm, arch=""):
+    def _make_dev_comm(cfg, comm):
         """The communicator the internode kernels take by value.
 
         Two requirements the defaults do not meet, made here so no caller has to
@@ -582,7 +589,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # AsyncLL suite passes there, which is why this clamps rather than
             # trying to recover: by the time the request is refused the process
             # is already gone.
-            requirements.sdma_queue_count = _asyncll_sdma_queues(arch, cfg.gpu_per_node)
+            requirements.sdma_queue_count = _asyncll_sdma_queues(
+                _gpu.detect_model(), cfg.gpu_per_node
+            )
         handle = DevCommHandle(comm, requirements=requirements)
 
         # A rejected handle still owns its QPs, so every exit below its
