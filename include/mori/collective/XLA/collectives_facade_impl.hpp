@@ -224,7 +224,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   if (mode == RsMode::kPull) {
     // Fused pull: reduce this PE's shard straight off the peers' inputs and fan
     // the result out to every peer from registers, in one pass. No SDMA and no
-    // staging; entry and exit PushEntryBarrier rounds on barrierCtr_.
+    // staging; entry and exit GenBarrier rounds on barrierCtr.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllReducePullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
           <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
