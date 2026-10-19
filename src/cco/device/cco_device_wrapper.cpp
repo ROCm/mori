@@ -40,16 +40,20 @@
 //   * Provider is fixed at build time via CCO_GDA_BUILD_PROVIDER (NIC macro), so
 //     only one ccoGda<P> specialization is built (same model as the C++ kernels).
 //
-// Symbol tags (must stay in sync with python/.../_bindings.py):
-//   data path (put/put_value/get) — (ThreadMode,Coop) tag, since aggregate is
+// Symbol tags (registered in python/mori/cco/device/ops.py):
+//   GDA data path (put/put_value/get) — (ThreadMode,Coop) tag, since aggregate is
 //   only valid with thread coop (static_assert in cco_scale_out.hpp):
 //     it = independent+thread   iw = independent+warp
 //     ib = independent+block    at = aggregate+thread
 //   signal/wait/flush — coop-only tag: thread / warp / block.
 //   put/put_value/signal also carry a remote-action tag: none / inc / add.
+//   SDMA put/get on resolved addresses — coop tag only; their other axes ride
+//   in a `flags` argument (SdmaWithFlags), constant-folded once inlined.
 //   Side-effect-only wrappers return int status 0 rather than void. Triton's
 //   extern_elementwise requires a concrete return element type; FlyDSL ignores
 //   the status.
+
+#include <type_traits>
 
 #include "mori/cco/cco_scale_out.hpp"
 
@@ -100,6 +104,11 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   ccoWindowDevice* w = AsWindow(window);
   uint64_t stride = static_cast<uint64_t>(w->stride4G) << 32;
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
+}
+
+// Our own VA inside the window (ccoGetLocalPtr): cco_lsa_ptr at our LSA rank.
+CCO_DEV uint64_t cco_local_ptr(uint64_t window, uint64_t offset) {
+  return reinterpret_cast<uint64_t>(ccoGetLocalPtr(AsWindow(window), offset));
 }
 
 // ── LSA window geometry ───────────────────────────────────────────────────────
@@ -208,7 +217,102 @@ CCO_DEF_SDMA_COMMIT(warp, ccoCoopWarp)
 CCO_DEF_SDMA_COMMIT(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_COMMIT
 
+// ── SDMA put/get on resolved addresses: cco_sdma_{put,get}_ptr__<coop> ──
+// ccoSdma::putPtr / getPtr with every remaining template axis carried in
+// `flags` (below). The wrappers are inlined into the caller's kernel, so a
+// compile-time constant `flags` folds the dispatch down to the one
+// instantiation; only a runtime `flags` pays for the branches. Unknown bits, and
+// SAME_QUEUE off thread scope, trap. Mirrored by SdmaFlags in ops.py.
+namespace {
+// Bits 0-1 are ccoSdmaOptFlags itself.
+constexpr int kSdmaFlagOptMask = ccoSdmaOptFlagsAggregate | ccoSdmaOptFlagsSignalPerCopy;
+constexpr int kSdmaFlagLocalSignal = 1 << 2;
+constexpr int kSdmaFlagRemoteSignal = 1 << 3;
+constexpr int kSdmaFlagSameQueue = 1 << 4;
+constexpr int kSdmaFlagAll =
+    kSdmaFlagOptMask | kSdmaFlagLocalSignal | kSdmaFlagRemoteSignal | kSdmaFlagSameQueue;
+
+template <typename T, T v>
+using Const = std::integral_constant<T, v>;
+
+// Calls fn(localSignal, remoteSignal, optFlags, threadMode), each a
+// std::integral_constant, for the instantiation `flags` names.
+template <typename Coop, typename Fn>
+inline __device__ void SdmaWithFlags(int flags, Fn&& fn) {
+  if (flags & ~kSdmaFlagAll) __builtin_trap();  // unknown SdmaFlags bit
+  auto withMode = [&](auto local, auto remote, auto opt) {
+    if (flags & kSdmaFlagSameQueue) {
+      if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+        fn(local, remote, opt, Const<ccoSdmaThreadMode, ccoSdmaThreadSameQueue>{});
+      } else {
+        __builtin_trap();  // SAME_QUEUE needs thread scope
+      }
+    } else {
+      fn(local, remote, opt, Const<ccoSdmaThreadMode, ccoSdmaThreadIndependent>{});
+    }
+  };
+  auto withOpt = [&](auto local, auto remote) {
+    switch (flags & kSdmaFlagOptMask) {
+      case 0:
+        withMode(local, remote, Const<uint32_t, 0>{});
+        break;
+      case 1:
+        withMode(local, remote, Const<uint32_t, 1>{});
+        break;
+      case 2:
+        withMode(local, remote, Const<uint32_t, 2>{});
+        break;
+      default:
+        withMode(local, remote, Const<uint32_t, 3>{});
+        break;
+    }
+  };
+  auto withRemote = [&](auto local) {
+    if (flags & kSdmaFlagRemoteSignal) {
+      withOpt(local, std::true_type{});
+    } else {
+      withOpt(local, std::false_type{});
+    }
+  };
+  if (flags & kSdmaFlagLocalSignal) {
+    withRemote(std::true_type{});
+  } else {
+    withRemote(std::false_type{});
+  }
+}
+}  // namespace
+
+#define CCO_DEF_SDMA_PTR(OP, CPP_OP, TAG, COOP)                                                \
+  CCO_DEV int cco_sdma_##OP##_ptr__##TAG(uint64_t dc, int peer, uint64_t dst, uint64_t src,    \
+                                         uint64_t n, int qid, int flags) {                     \
+    Sdma sdma{*AsDevComm(dc)};                                                                 \
+    void* d = reinterpret_cast<void*>(dst);                                                    \
+    void* s = reinterpret_cast<void*>(src);                                                    \
+    SdmaWithFlags<COOP>(flags, [&](auto local, auto remote, auto opt, auto mode) {             \
+      sdma.CPP_OP<COOP, decltype(local)::value, decltype(remote)::value, decltype(opt)::value, \
+                  decltype(mode)::value>(peer, d, s, n, qid);                                  \
+    });                                                                                        \
+    return 0;                                                                                  \
+  }
+CCO_DEF_SDMA_PTR(put, putPtr, thread, ccoCoopThread)
+CCO_DEF_SDMA_PTR(put, putPtr, warp, ccoCoopWarp)
+CCO_DEF_SDMA_PTR(put, putPtr, block, ccoCoopBlock)
+CCO_DEF_SDMA_PTR(get, getPtr, thread, ccoCoopThread)
+CCO_DEF_SDMA_PTR(get, getPtr, warp, ccoCoopWarp)
+CCO_DEF_SDMA_PTR(get, getPtr, block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_PTR
+
+// Poll our signal counter for (src lsa rank, qid) until it reaches `expected`
+// (ccoSdma::waitSignal; returns at once for an out-of-range qid).
+CCO_DEV int cco_sdma_wait_signal(uint64_t dc, int src, int qid, uint64_t expected) {
+  Sdma sdma{*AsDevComm(dc)};
+  sdma.waitSignal(src, qid, expected);
+  return 0;
+}
+
 // ── SDMA put on raw addresses, signalling the peer only ──
+// Kept for existing callers; cco_sdma_put_ptr__thread with REMOTE_SIGNAL is the
+// same instantiation.
 // `dst` is the peer's address as mapped here (cco_lsa_ptr), `src` a local one;
 // neither is checked. The trailing ATOMIC bumps the peer's
 // cco_sdma_signal_slot(dc, <my lsa rank>, qid), not ours.

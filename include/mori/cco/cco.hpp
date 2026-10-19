@@ -1859,19 +1859,21 @@ struct ccoSdma {
 
   // putPtr: put() on addresses the caller already resolved. `dst` must be in
   // `peer`'s memory as mapped here (e.g. ccoGetLsaPeerPtr); `src` must be local.
-  // Nothing checks either, so a wrong address faults in the SDMA engine.
+  // Nothing checks either: a wrong address faults in the SDMA engine, or, if it
+  // is mapped, is silently written.
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
             uint32_t optFlags = ccoSdmaOptFlagsDefault,
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
   __device__ inline void putPtr(int peer, void* dst, void* src, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
-                  "ccoSdma::put supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+                  "ccoSdma::put/putPtr supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate |
                                                      ccoSdmaOptFlagsSignalPerCopy)) == 0,
-                  "ccoSdma::put: unknown ccoSdmaOptFlags bit");
+                  "ccoSdma::put/putPtr: unknown ccoSdmaOptFlags bit");
     static_assert(threadMode == ccoSdmaThreadIndependent || std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter put");
+                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter "
+                  "put/putPtr");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
@@ -1885,19 +1887,29 @@ struct ccoSdma {
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
   __device__ inline void get(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes, int queueId = 0) {
+    getPtr<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+        peer, ccoGetLocalPtr(dstWin, dstOffset), ccoGetLsaPeerPtr(srcWin, peer, srcOffset), bytes,
+        queueId);
+  }
+
+  // getPtr: get() on resolved addresses, the mirror of putPtr: `dst` local,
+  // `src` in `peer`'s memory as mapped here. Unchecked the same way.
+  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault,
+            ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
+  __device__ inline void getPtr(int peer, void* dst, void* src, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
-                  "ccoSdma::get supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+                  "ccoSdma::get/getPtr supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate |
                                                      ccoSdmaOptFlagsSignalPerCopy)) == 0,
-                  "ccoSdma::get: unknown ccoSdmaOptFlags bit");
+                  "ccoSdma::get/getPtr: unknown ccoSdmaOptFlags bit");
     static_assert(threadMode == ccoSdmaThreadIndependent || std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter get");
+                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter "
+                  "get/getPtr");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
-    void* dst = ccoGetLocalPtr(dstWin, dstOffset);
-    void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
     ccoSdmaDispatchChunked<Coop, localSignal, remoteSignal, optFlags, threadMode>(
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
@@ -1961,7 +1973,8 @@ struct ccoSdma {
 
   // signalSlot: the counter waitSignal polls, for callers that poll it
   // themselves. The SDMA engine writes it, so read it with a system-scope
-  // atomic load. nullptr when srcRank or queueId is out of range.
+  // atomic load, with acquire ordering if the caller then reads the data the
+  // signal covers. nullptr when srcRank or queueId is out of range.
   __device__ inline uint64_t* signalSlot(int srcRank, int queueId) const {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;

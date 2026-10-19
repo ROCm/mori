@@ -30,7 +30,13 @@ constexpr template axes match ``mori.cco.device.flydsl``.
 import triton
 import triton.language as tl
 
-from mori.cco.device.ops import CoopScope, SignalOp, ThreadMode, SdmaOptFlags
+from mori.cco.device.ops import (
+    CoopScope,
+    SdmaFlags,
+    SdmaOptFlags,
+    SignalOp,
+    ThreadMode,
+)
 
 from . import ops as raw
 
@@ -42,6 +48,11 @@ _SIGNAL_INC = tl.constexpr(SignalOp.INC)
 _SIGNAL_ADD = tl.constexpr(SignalOp.ADD)
 _THREAD_INDEPENDENT = tl.constexpr(ThreadMode.INDEPENDENT)
 _THREAD_AGGREGATE = tl.constexpr(ThreadMode.AGGREGATE)
+_FLAG_AGGREGATE = tl.constexpr(SdmaFlags.AGGREGATE)
+_FLAG_SIGNAL_PER_COPY = tl.constexpr(SdmaFlags.SIGNAL_PER_COPY)
+_FLAG_LOCAL_SIGNAL = tl.constexpr(SdmaFlags.LOCAL_SIGNAL)
+_FLAG_REMOTE_SIGNAL = tl.constexpr(SdmaFlags.REMOTE_SIGNAL)
+_FLAG_SAME_QUEUE = tl.constexpr(SdmaFlags.SAME_QUEUE)
 
 
 @triton.jit
@@ -477,6 +488,128 @@ def _gda_flush_peer(
         raw.gda_flush_peer_warp(dev_comm, ctx, peer)
 
 
+# put / get / put_ptr / get_ptr mirror ccoSdma's, and their keywords its template
+# arguments (all tl.constexpr): coop, local_signal, remote_signal, aggregate,
+# signal_per_copy, same_queue. A signal is a trailing ATOMIC bumping
+# signal_slot(<sender lsa rank>, qid): ours for local_signal, the peer's for
+# remote_signal. put / get also take `signal`, the older name of local_signal; a
+# call that names no signal keeps their old default, a local one. The keywords
+# fold into a constant SdmaFlags word, so the wrapper's dispatch compiles away.
+
+
+@triton.jit
+def _sdma_ptr_op(
+    op: tl.constexpr,
+    dev_comm,
+    peer,
+    dst,
+    src,
+    nbytes,
+    qid,
+    coop: tl.constexpr,
+    local_signal: tl.constexpr,
+    remote_signal: tl.constexpr,
+    aggregate: tl.constexpr,
+    signal_per_copy: tl.constexpr,
+    same_queue: tl.constexpr,
+):
+    tl.static_assert(
+        coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
+        "SDMA coop must be CoopScope.THREAD, WARP, or BLOCK",
+    )
+    tl.static_assert(
+        not same_queue or coop == _COOP_THREAD,
+        "SDMA same_queue requires CoopScope.THREAD",
+    )
+    flags: tl.constexpr = (
+        (_FLAG_LOCAL_SIGNAL if local_signal else 0)
+        | (_FLAG_REMOTE_SIGNAL if remote_signal else 0)
+        | (_FLAG_AGGREGATE if aggregate else 0)
+        | (_FLAG_SIGNAL_PER_COPY if signal_per_copy else 0)
+        | (_FLAG_SAME_QUEUE if same_queue else 0)
+    )
+    if op == "put":
+        if coop == _COOP_THREAD:
+            raw.sdma_put_ptr_thread(dev_comm, peer, dst, src, nbytes, qid, flags)
+        elif coop == _COOP_WARP:
+            raw.sdma_put_ptr_warp(dev_comm, peer, dst, src, nbytes, qid, flags)
+        else:
+            raw.sdma_put_ptr_block(dev_comm, peer, dst, src, nbytes, qid, flags)
+    else:
+        if coop == _COOP_THREAD:
+            raw.sdma_get_ptr_thread(dev_comm, peer, dst, src, nbytes, qid, flags)
+        elif coop == _COOP_WARP:
+            raw.sdma_get_ptr_warp(dev_comm, peer, dst, src, nbytes, qid, flags)
+        else:
+            raw.sdma_get_ptr_block(dev_comm, peer, dst, src, nbytes, qid, flags)
+
+
+@triton.jit
+def _sdma_put_ptr(
+    dev_comm,
+    peer,
+    dst,
+    src,
+    nbytes,
+    qid=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    local_signal: tl.constexpr = False,
+    remote_signal: tl.constexpr = False,
+    aggregate: tl.constexpr = False,
+    signal_per_copy: tl.constexpr = False,
+    same_queue: tl.constexpr = False,
+):
+    # dst: peer's memory as mapped here (Window.lsa_ptr); src: ours. Unchecked.
+    _sdma_ptr_op(
+        "put",
+        dev_comm,
+        peer,
+        dst,
+        src,
+        nbytes,
+        qid,
+        coop,
+        local_signal,
+        remote_signal,
+        aggregate,
+        signal_per_copy,
+        same_queue,
+    )
+
+
+@triton.jit
+def _sdma_get_ptr(
+    dev_comm,
+    peer,
+    dst,
+    src,
+    nbytes,
+    qid=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    local_signal: tl.constexpr = False,
+    remote_signal: tl.constexpr = False,
+    aggregate: tl.constexpr = False,
+    signal_per_copy: tl.constexpr = False,
+    same_queue: tl.constexpr = False,
+):
+    # dst: ours; src: peer's memory as mapped here (Window.lsa_ptr). Unchecked.
+    _sdma_ptr_op(
+        "get",
+        dev_comm,
+        peer,
+        dst,
+        src,
+        nbytes,
+        qid,
+        coop,
+        local_signal,
+        remote_signal,
+        aggregate,
+        signal_per_copy,
+        same_queue,
+    )
+
+
 @triton.jit
 def _sdma_put(
     dev_comm,
@@ -488,89 +621,38 @@ def _sdma_put(
     nbytes,
     qid=0,
     coop: tl.constexpr = _COOP_THREAD,
-    signal: tl.constexpr = True,
+    signal: tl.constexpr = None,
+    local_signal: tl.constexpr = None,
+    remote_signal: tl.constexpr = None,
     aggregate: tl.constexpr = False,
+    signal_per_copy: tl.constexpr = False,
+    same_queue: tl.constexpr = False,
 ):
     tl.static_assert(
-        coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
-        "SDMA coop must be CoopScope.THREAD, WARP, or BLOCK",
+        signal is None or local_signal is None,
+        "SDMA put: pass signal or local_signal, not both",
     )
-    flags = 1 if aggregate else 0
-    if coop == _COOP_THREAD:
-        if signal:
-            raw.sdma_put_thread(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-        else:
-            raw.sdma_put_thread_ns(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-    elif coop == _COOP_WARP:
-        if signal:
-            raw.sdma_put_warp(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-        else:
-            raw.sdma_put_warp_ns(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-    else:
-        if signal:
-            raw.sdma_put_block(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-        else:
-            raw.sdma_put_block_ns(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
+    _sdma_ptr_op(
+        "put",
+        dev_comm,
+        peer,
+        raw.lsa_ptr(dst_win, peer, dst_off),
+        raw.local_ptr(src_win, src_off),
+        nbytes,
+        qid,
+        coop,
+        # sdma_signals(): `signal` is local_signal's old name; naming no signal
+        # keeps the old default, a local one
+        (
+            local_signal
+            if local_signal is not None
+            else (signal if signal is not None else remote_signal is None)
+        ),
+        remote_signal is not None and remote_signal,
+        aggregate,
+        signal_per_copy,
+        same_queue,
+    )
 
 
 @triton.jit
@@ -584,89 +666,38 @@ def _sdma_get(
     nbytes,
     qid=0,
     coop: tl.constexpr = _COOP_THREAD,
-    signal: tl.constexpr = True,
+    signal: tl.constexpr = None,
+    local_signal: tl.constexpr = None,
+    remote_signal: tl.constexpr = None,
     aggregate: tl.constexpr = False,
+    signal_per_copy: tl.constexpr = False,
+    same_queue: tl.constexpr = False,
 ):
     tl.static_assert(
-        coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
-        "SDMA coop must be CoopScope.THREAD, WARP, or BLOCK",
+        signal is None or local_signal is None,
+        "SDMA get: pass signal or local_signal, not both",
     )
-    flags = 1 if aggregate else 0
-    if coop == _COOP_THREAD:
-        if signal:
-            raw.sdma_get_thread(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-        else:
-            raw.sdma_get_thread_ns(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-    elif coop == _COOP_WARP:
-        if signal:
-            raw.sdma_get_warp(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-        else:
-            raw.sdma_get_warp_ns(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-    else:
-        if signal:
-            raw.sdma_get_block(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
-        else:
-            raw.sdma_get_block_ns(
-                dev_comm,
-                peer,
-                dst_win,
-                dst_off,
-                src_win,
-                src_off,
-                nbytes,
-                qid,
-                flags,
-            )
+    _sdma_ptr_op(
+        "get",
+        dev_comm,
+        peer,
+        raw.local_ptr(dst_win, dst_off),
+        raw.lsa_ptr(src_win, peer, src_off),
+        nbytes,
+        qid,
+        coop,
+        # sdma_signals(): `signal` is local_signal's old name; naming no signal
+        # keeps the old default, a local one
+        (
+            local_signal
+            if local_signal is not None
+            else (signal if signal is not None else remote_signal is None)
+        ),
+        remote_signal is not None and remote_signal,
+        aggregate,
+        signal_per_copy,
+        same_queue,
+    )
 
 
 @triton.jit
@@ -743,8 +774,9 @@ class Sdma:
     commit = staticmethod(_sdma_commit)
     quiet = staticmethod(_sdma_quiet)
     quiet_queue = staticmethod(raw.sdma_quiet_queue)
-    # Raw addresses, thread scope, bumps the PEER's signal_slot only.
-    put_ptr = staticmethod(raw.sdma_put_ptr_rsig_thread)
+    put_ptr = staticmethod(_sdma_put_ptr)
+    get_ptr = staticmethod(_sdma_get_ptr)
+    wait_signal = staticmethod(raw.sdma_wait_signal)
     signal_slot = staticmethod(raw.sdma_signal_slot)
 
 
@@ -757,4 +789,5 @@ __all__ = [
     "SignalOp",
     "ThreadMode",
     "SdmaOptFlags",
+    "SdmaFlags",
 ]
