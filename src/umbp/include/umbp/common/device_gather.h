@@ -53,6 +53,9 @@ struct DeviceGatherFragment {
 // cannot dereference plain mmap memory at all, it faults. Returns false before
 // enqueueing any work when the launch could not be issued, so the caller can
 // fall back to hipMemcpy.
+//
+// The descriptors are staged in a buffer kept per `stream`, so the caller must
+// not use `stream` from another thread until it has synchronized this launch.
 bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
                         hipStream_t stream);
 

@@ -121,6 +121,12 @@ class HbmCopyEngine final : public TransferEngine {
   // where a multi-MiB copy dwarfs the per-call launch overhead.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
 
+  // Gather streams created since process start, across all engines.  They are
+  // pooled per device and outlive the thread that first used them, so this
+  // tracks the peak number of gathers in flight at once, not the number of
+  // threads that have called Submit.  Lets a test assert the reuse.
+  static uint64_t GatherStreamsCreated();
+
  private:
   // Why a plan did not take the gather kernel.  The hot path never computes
   // this: it is filled in only when debug mode is on (UMBP_HBM_COPY_DEBUG), so
