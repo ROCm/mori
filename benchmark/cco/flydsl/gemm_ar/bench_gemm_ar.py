@@ -184,7 +184,7 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
             torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
         )
         return a, b, sa, sb
-    if quant == "mxfp8":
+    if quant in ("mxfp8", "mxfp8_raw"):
         # DeepSeek-V4.1-Flash's dense form: A per-32-K, B per-32x32, both ue8m0.
         # Scales stay as exponent bytes all the way to the MFMA, which is what
         # the instruction's scale operand reads.
@@ -193,7 +193,9 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
         sb = _ue8m0_bytes((n // MXFP8_BK, kb), g)
         return a, b, sa.contiguous(), sb.contiguous()
     if quant != "blockscale":
-        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
+        raise ValueError(
+            f"quant must be ptpc, blockscale, mxfp8 or mxfp8_raw, got {quant!r}"
+        )
     kb = k // SCALE_BK
     sa = (
         torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
@@ -211,7 +213,7 @@ def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
     af, bf = a.float(), b.float()
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
-    if quant == "mxfp8":
+    if quant in ("mxfp8", "mxfp8_raw"):
         sav, sbv = _ue8m0_value(sa), _ue8m0_value(sb)
         out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
         for i in range(a.shape[1] // MXFP8_BK):
@@ -416,6 +418,10 @@ def run(args) -> int:
             # already a broadcast and there is nothing to pack.
             sa_arg = preshuffle_a_scale(sa)
             sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
+        elif args.quant == "mxfp8_raw":
+            # The quantiser's own row-major bytes; the kernel stages them
+            # through LDS.
+            sa_arg, sb_arg = sa.reshape(-1), sb.reshape(-1)
         else:
             sa_arg, sb_arg = sa, sb
 
@@ -604,7 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-k", type=int, default=1024)
     p.add_argument(
         "--quant",
-        choices=("ptpc", "blockscale", "mxfp8"),
+        choices=("ptpc", "blockscale", "mxfp8", "mxfp8_raw"),
         default="ptpc",
         help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
         "or the model's 1x128 / 128x128 block scale. blockscale applies the "
