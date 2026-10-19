@@ -617,7 +617,7 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
       continue;
     }
     // Claimed: a second commit of this slot finds nothing, and the key stays
-    // reserved (no expiry) so a racing put sees it in flight.
+    // reserved so racing puts see it in flight. No expiry: a hung commit pins it.
     accepted_slots.insert(slot_key);
     pending_slots_.erase(slot);
     pending->second.expires_at = std::chrono::steady_clock::time_point::max();
