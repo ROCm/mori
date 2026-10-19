@@ -377,13 +377,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         torch.cuda.synchronize(dev)
         comm.barrier()
 
-    @staticmethod
-    def _specs_from(cfg):
-        disp, comb = EpDispatchCombineOp._specs_from(cfg)
-        if cfg.schedule and cfg.quant_type in _PUSH_QUANT_TYPES:
-            comb = sorted({(cb, cw) for (_, _, _, cb, cw) in cfg.schedule})
-        return disp, comb
-
     def _build(self, cfg, comm):
         dev = self.dev
         self.arena.zero()

@@ -41,16 +41,15 @@ def lookup(
     num_tokens,
     dtype="fp8",
     *,
+    experts_per_rank,
     kernel_family="v2",
-    experts_per_rank=None,
 ):
     """Return dispatch/combine B/R/W from the selected family's JSON rules.
 
     ``dtype`` accepts a torch dtype, a shared config string, or ``"fp8"``
     (FNUZ on gfx942, OCP elsewhere). Combine remains BF16. Missing rules use
     the same None result as lookup_internode(), without borrowing another dtype.
-    ``experts_per_rank`` must be supplied to match a measured expert/top-k shape;
-    leaving it unknown returns None rather than selecting another model's rule.
+    ``experts_per_rank`` is required: the tables are keyed by total expert count.
     """
     if isinstance(dtype, str):
         if dtype == "fp8":
