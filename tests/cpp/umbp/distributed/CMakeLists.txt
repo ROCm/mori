@@ -277,6 +277,18 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_local_first COMMAND test_umbp_local_first)
 
+# test_umbp_peer_driven_eviction — a real master and DRAM node in each eviction
+# mode: local (default), master_ranked, and master (the master's rounds).
+add_executable(test_umbp_peer_driven_eviction test_peer_driven_eviction.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_peer_driven_eviction PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(
+  test_umbp_peer_driven_eviction
+  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
+          gtest_main)
+add_test(NAME umbp_peer_driven_eviction COMMAND test_umbp_peer_driven_eviction)
+
 # test_umbp_no_master — the distributed client with master_address empty: same
 # data plane, no routing/registration/heartbeat, a local miss is final.  No
 # master is started in that file, so reaching for one hangs or crashes rather
@@ -465,9 +477,8 @@ target_compile_features(test_peer_pool PRIVATE cxx_std_17)
 add_test(NAME umbp_peer_pool COMMAND test_peer_pool)
 
 # test_transfer_engine — the Phase 6 transfer layer without gRPC or RDMA:
-# LocalCopyEngine's planner/executor and CompositeTransferEngine's fan-out
-# registration + per-pair engine selection.  MoriIoEngine needs a real fabric
-# and is covered end-to-end by test_cross_node_smoke instead.
+# every engine's planner, LocalCopyEngine's executor and the composite's routing.
+# MoriIoEngine's transfers need a fabric: see test_cross_node_smoke.
 add_executable(test_transfer_engine test_transfer_engine.cpp)
 target_link_libraries(test_transfer_engine PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_transfer_engine PRIVATE cxx_std_17)
@@ -483,6 +494,23 @@ target_link_libraries(test_component_metrics PRIVATE umbp_common
                                                      GTest::gtest_main)
 target_compile_features(test_component_metrics PRIVATE cxx_std_17)
 add_test(NAME test_component_metrics COMMAND test_component_metrics)
+
+# test_prometheus_metric_sink — the masterless end of the same seam: the sink
+# that serves a node's own metrics when there is no master to ship them to, and
+# the rule deciding whether the standalone server binds a port for it at all.
+add_executable(test_prometheus_metric_sink test_prometheus_metric_sink.cpp)
+target_link_libraries(test_prometheus_metric_sink PRIVATE umbp_common
+                                                          GTest::gtest_main)
+target_compile_features(test_prometheus_metric_sink PRIVATE cxx_std_17)
+add_test(NAME test_prometheus_metric_sink COMMAND test_prometheus_metric_sink)
+
+# test_activity_summary — the periodic INFO line that replaced the per-key DEBUG
+# logs on the offload / load / evict / promote / demote paths. Pure rendering,
+# so the deltas, units and the idle case are testable without a pool.
+add_executable(test_activity_summary test_activity_summary.cpp)
+target_link_libraries(test_activity_summary PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_activity_summary PRIVATE cxx_std_17)
+add_test(NAME test_activity_summary COMMAND test_activity_summary)
 
 # test_gds_engine — GdsEngine routing/planning (no GPU) plus a GPU + hipFile
 # read round trip (skipped without a device, or on a filesystem that rejects
@@ -555,13 +583,6 @@ target_link_libraries(test_peer_ssd_eviction PRIVATE umbp_common
                                                      GTest::gtest_main)
 target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_eviction COMMAND test_peer_ssd_eviction)
-
-# test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
-add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
-target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
-                                                     GTest::gtest_main)
-target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
-add_test(NAME test_ssd_copy_pipeline COMMAND test_ssd_copy_pipeline)
 
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).

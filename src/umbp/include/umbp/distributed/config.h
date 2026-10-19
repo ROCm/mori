@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,7 @@
 
 #include "umbp/common/config.h"
 #include "umbp/common/env_time.h"
+#include "umbp/distributed/metrics/metric_sink.h"
 #include "umbp/distributed/pool/policy_config.h"
 #include "umbp/distributed/types.h"
 
@@ -92,6 +94,9 @@ struct ClientRegistryConfig {
   // single backend can hold. Tests set this false to emulate that Master.
   bool advertise_max_allocatable_bytes = true;
   bool advertise_logical_tiers = true;
+  // Serve GetEvictionCandidates and stop EvictKey rounds for peers that evict
+  // for themselves.  False emulates an older Master.
+  bool advertise_peer_driven_eviction = true;
 };
 
 struct EvictionConfig {
@@ -99,16 +104,20 @@ struct EvictionConfig {
   double low_watermark = 0.7;
   std::chrono::seconds check_interval{5};
   std::chrono::seconds lease_duration{2};
-  size_t evict_batch_size = 32;
 
-  // Only timing fields are env-overridable here; watermarks and batch size
-  // have dedicated tuning paths and are intentionally excluded.
+  // Most bytes one round evicts from one (node, tier).  0 = its whole overage
+  // above the low watermark.
+  uint64_t max_evict_bytes_per_round = 0;
+
+  // Watermarks have dedicated tuning paths and are not env-overridable.
   static EvictionConfig FromEnvironment() {
     EvictionConfig cfg;
     cfg.check_interval =
         GetEnvSeconds("UMBP_EVICTION_CHECK_INTERVAL_SEC", cfg.check_interval, /*min_allowed=*/1);
     cfg.lease_duration =
         GetEnvSeconds("UMBP_LEASE_DURATION_SEC", cfg.lease_duration, /*min_allowed=*/1);
+    cfg.max_evict_bytes_per_round =
+        GetEnvUint64("UMBP_EVICT_MAX_BYTES_PER_ROUND", cfg.max_evict_bytes_per_round);
     return cfg;
   }
 };
@@ -219,11 +228,28 @@ struct BackendInstanceConfig {
   DramOwnershipConfig dram;
   HbmOwnershipConfig hbm;
   PeerSsdConfig ssd;
-  int ssd_staging_buffer_slots = 16;
+  // SSD staging arena in pages; 0 = the preset (SsdStagingPages).
+  int ssd_staging_buffer_slots = 0;
   // Relative admission share within this tier when WEIGHTED placement is
   // enabled. Must be positive; legacy and SINGLE_BACKEND paths ignore it.
   // Appended to preserve existing positional aggregate initializers.
   uint32_t placement_weight = 1;
+};
+
+// Staging pages for an SSD backend: `slots` when set, else 4 GiB capped at the
+// tier.  Only reads and remote writes stage, and a local read that does not fit
+// waits for a later round, so no workload has to size it.
+inline uint32_t SsdStagingPages(int slots, uint64_t ssd_capacity, uint64_t page_size) {
+  if (slots > 0) return static_cast<uint32_t>(slots);
+  uint64_t bytes = 4ULL << 30;
+  if (ssd_capacity > 0) bytes = std::min(bytes, ssd_capacity);
+  return static_cast<uint32_t>(std::max<uint64_t>(bytes / std::max<uint64_t>(page_size, 1), 1));
+}
+
+enum class PeerEvictionMode {
+  kLocal,         // at its own watermarks, by its own LRU; never asks the master
+  kMasterRanked,  // at its own watermarks, victims ranked by the master
+  kMaster,        // the master's EvictKey rounds (SSD still evicts locally)
 };
 
 struct PoolClientConfig {
@@ -247,15 +273,9 @@ struct PoolClientConfig {
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
 
-  // SSD read-staging tuning. More slots increase concurrent reads and writes;
-  // each policy-created SsdBackend owns `slots * page_size` staging bytes. Its
+  // SSD staging pages per SsdBackend; 0 = the preset (SsdStagingPages).  Its
   // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
-  int ssd_staging_buffer_slots = 16;
-
-  // Backs ssd_staging_buffer_, allocated only when ssd.enabled. A remote SSD
-  // read fits one whole key value in a slot, so this / ssd_staging_buffer_slots
-  // must be >= the largest single-key page KV (61-layer MLA page ~= 4.5 MB).
-  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
+  int ssd_staging_buffer_slots = 0;
 
   // Back the SSD staging arena with hugetlbfs pages. Every SSD backend this
   // client registers uses the same node-wide setting. Falls back to 4 KiB
@@ -303,15 +323,16 @@ struct PoolClientConfig {
   // (2 MiB by default).  Set to an explicit byte count to override.
   uint64_t dram_page_size = 0;
 
-  // Watermarks for the paged medium's own eviction, used ONLY when this node
-  // has no master (PoolClient::Init enables it exactly then).  With a master,
-  // eviction is a cluster-wide decision shipped as Evict RPCs and these are
-  // ignored; without one, nothing else would ever free a page.  Lowered from
-  // UMBPDramConfig::high_watermark / low_watermark, which is where the
-  // deleted local backend read the same policy from.  The SSD medium has its
-  // own pair inside UMBPSsdConfig and does not consult these.
+  // Local eviction watermarks for DRAM/HBM (SSD has its own pair).  Unless
+  // eviction_mode is kMaster, a tiered policy's per-tier pair takes
+  // precedence.  From UMBPDramConfig.
   double local_evict_high_watermark = 0.9;
   double local_evict_low_watermark = 0.7;
+
+  // How this node evicts when it has a master (env UMBP_EVICTION_MODE =
+  // local | master_ranked | master).  Without a master it always evicts
+  // locally.  In every mode it still serves the master's EvictKey.
+  PeerEvictionMode eviction_mode = PeerEvictionMode::kLocal;
 
   UMBPCopyPipelineConfig copy_pipeline = [] {
     UMBPCopyPipelineConfig c;
@@ -341,6 +362,20 @@ struct PoolClientConfig {
   std::string workload_trace_path;
   uint32_t workload_trace_client_id = 0;
   uint64_t workload_trace_seed = 0;
+
+  // Where this node's metrics go, for a node that has no master to send them
+  // to.  Caller-owned and must outlive the PoolClient; null means metrics are
+  // measured and discarded, which is what every masterless deployment did
+  // before this seam existed.  IGNORED when master_config.master_address is
+  // set: with a master, MasterClient is the sink and shipping the same series
+  // to both would double-count it on any Prometheus scraping the pair.
+  //
+  // PoolClient does not create one of these itself.  A sink binds a TCP port,
+  // and PoolClient is also constructed in-process inside every sglang rank —
+  // eight of them per node — so making it implicit would turn one config flag
+  // into eight racing binds.  The standalone server, which is one process per
+  // node, opts in explicitly.
+  MetricSink* metric_sink = nullptr;
 };
 
 // Lower a user-facing UMBPDistributedConfig to the internal PoolClientConfig.
@@ -364,7 +399,6 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.staging_buffer_size = dc.staging_buffer_size;
   // The ranged scratch buffers/sizes are set by DistributedClient after it
   // allocates and registers the two arenas (see DistributedClient ctor).
-  pc.ssd_staging_buffer_size = dc.ssd_staging_buffer_size;
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
   pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
@@ -383,6 +417,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.workload_trace_path = dc.workload_trace_path;
   pc.workload_trace_client_id = dc.workload_trace_client_id;
   pc.workload_trace_seed = dc.workload_trace_seed;
+  pc.metric_sink = dc.metric_sink;
   pc.dram = std::move(dram);
   pc.ssd = std::move(ssd);
   // Unlike dram/ssd, UMBPHbmConfig carries no ownership knobs that live

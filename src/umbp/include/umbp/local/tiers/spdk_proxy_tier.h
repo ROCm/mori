@@ -77,9 +77,6 @@ class SpdkProxyTier : public TierBackend {
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
   bool Flush() override;
-  void SetColdRead(bool enable) override { cold_read_ = enable; }
-
-  static bool WaitForProxy(const std::string& shm_name, int timeout_ms);
 
  private:
   ::umbp::proxy::ResultCode SubmitAndWait(::umbp::proxy::RequestType type, const std::string& key,
@@ -102,7 +99,6 @@ class SpdkProxyTier : public TierBackend {
   bool TryShmCacheReadOne(const std::string& key, uintptr_t dst, size_t size) const;
 
   bool connected_ = false;
-  bool cold_read_ = false;  // SetColdRead(true): skip ring cache, always read from NVMe
   uint32_t channel_id_ = 0;
   uint32_t tenant_id_ = 0;
   uint32_t tenant_slot_ = 0;

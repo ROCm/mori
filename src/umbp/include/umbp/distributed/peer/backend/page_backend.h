@@ -175,11 +175,8 @@ class PageBackend : public MediumBackend {
   struct TierConfig {
     std::vector<uint64_t> buffer_sizes;
     std::vector<std::vector<uint8_t>> buffer_descs;  // packed mori::io::MemoryDesc bytes
-    // Local host base pointer of each buffer (same order as buffer_sizes).
-    // Used by AcquireDramCopyPin to resolve a (buffer_index, page_index)
-    // page to a directly-readable local pointer for the SSD copy worker.
-    // Empty is allowed for tiers/deployments with no DRAM copy (e.g. unit
-    // tests that never pin); pin acquisition then yields no segments.
+    // Local host base pointer of each buffer (same order as buffer_sizes);
+    // may be empty when the buffers are not addressable here.
     std::vector<void*> buffer_bases;
   };
 
@@ -260,8 +257,10 @@ class PageBackend : public MediumBackend {
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
   std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override;
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+                                          bool allow_file_refs = false,
+                                          ResolveReader reader = ResolveReader::kRemote) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<bool> BatchContains(const std::vector<std::string>& keys) const override;
@@ -294,32 +293,6 @@ class PageBackend : public MediumBackend {
   std::vector<BufferMemoryDescBytes> BufferDescsForPages(
       const std::vector<PageLocation>& pages) const;
 
-  // ==================== DRAM copy pin (SSD copy-on-commit) ====================
-
-  // A copy pin protects a committed key's pages from eviction while the SSD
-  // copy worker reads them.  It is an in-process lifetime guard (NOT a
-  // master lease): pages stay readable until ReleaseDramCopyPin.  `segments`
-  // are directly-readable local pointers + lengths (pages may be
-  // non-contiguous across buffers).
-  struct DramCopyPin {
-    std::vector<std::pair<const void*, size_t>> segments;
-    size_t total_size = 0;
-    uint64_t pin_token = 0;  // release-time validation
-  };
-
-  // Atomically (under mutex_) confirm `key` is owned, mark it pinned, and
-  // resolve its pages to local segments.  Returns nullopt if the key is
-  // not owned (already evicted -> worker drops the task) or is already
-  // pinned (duplicate task).  While pinned, Evict(key) reports
-  // bytes_freed=0 and emits no REMOVE (master retries next round).  There
-  // is NO TTL: the pin lives until ReleaseDramCopyPin.  The caller MUST
-  // release (use a RAII guard) so a worker exit always frees the pin.
-  std::optional<DramCopyPin> AcquireDramCopyPin(const std::string& key);
-
-  // Release a pin.  No-op if the key is not pinned or the token does not
-  // match (tolerates duplicate / late release).
-  void ReleaseDramCopyPin(const std::string& key, uint64_t pin_token);
-
   // ==================== Heartbeat auto-flush ====================
 
   // MediumBackend contract.  The hook is invoked while the allocator lock is
@@ -331,38 +304,11 @@ class PageBackend : public MediumBackend {
   // keeping one is a leak of one event per put.
   void SetEventPublishing(bool enabled) override;
 
-  // ==================== Local (masterless) eviction ====================
-  //
-  // Eviction here is normally the MASTER's policy: it chooses victims with a
-  // cluster-wide view and calls Evict(keys) through the peer service.  Nothing
-  // else ever calls Evict, so a node with no master fills its pool and
-  // Allocate starts answering NO_SPACE forever — where the deleted local
-  // backend's LocalStorageManager would have evicted on a watermark.  This is
-  // that watermark loop, restored on the backend that now serves embedded
-  // deployments.
-  //
-  // Opt-in so the cluster path is bit-for-bit unchanged: with a master, a
-  // second local policy would free keys the master still indexes and hands out
-  // routes for.  PoolClient::Init enables it exactly when it builds no
-  // MasterClient.
-  //
-  // Enabling it turns on an LRU ordering (inserted by Commit, renewed by
-  // Resolve) that is not maintained otherwise, so the read path pays nothing
-  // in a cluster.  A round runs on the committing thread — there is no
-  // eviction thread — and frees oldest-first down to `low` once usage reaches
-  // `high`.  Leased and copy-pinned keys are skipped, exactly as master-driven
-  // Evict skips them; a round that can only find protected keys frees what it
-  // can and stops rather than spinning.
-  //
-  // Must be called before Init().  Watermarks must satisfy
-  // 0 < low < high <= 1; anything else is rejected with a warning and leaves
-  // local eviction off.
-  void EnableLocalEviction(double high_watermark, double low_watermark) override;
-
-  // Test seam: run one local-eviction round synchronously.  Returns the number
-  // of keys freed (0 when local eviction is off or usage is below the high
-  // watermark).
-  size_t RunLocalEvictionOnceForTest() { return MaybeEvictToLowWatermark(); }
+  // ==================== Eviction ordering ====================
+  // An LRU of owned keys (Commit inserts, Resolve renews), kept only after
+  // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
+  void TrackEvictionOrder() override;
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
 
   // ==================== Reaper ====================
 
@@ -398,7 +344,10 @@ class PageBackend : public MediumBackend {
     // (RenewLeaseAtomic) so a slower thread can never shorten a lease another
     // thread already extended.
     std::atomic<int64_t> read_lease_ns{0};
-    // Position in lru_, valid only while in_lru is true (local eviction on).
+    // Copied into every kLocal hit; a reader still has it while use_count() > 1.
+    // Made at commit, so the shared-lock resolve path only copies it.
+    std::shared_ptr<const void> hold;
+    // Position in lru_, valid only while in_lru is true (order tracked).
     // Held here for the same reason as the lease: the alternative is a second
     // map keyed by the same string.
     //
@@ -415,6 +364,7 @@ class PageBackend : public MediumBackend {
         : pages(std::move(other.pages)),
           size(other.size),
           read_lease_ns(other.read_lease_ns.load(std::memory_order_relaxed)),
+          hold(std::move(other.hold)),
           lru_it(other.lru_it),
           in_lru(other.in_lru) {}
     OwnedSlot& operator=(OwnedSlot&& other) noexcept {
@@ -423,6 +373,7 @@ class PageBackend : public MediumBackend {
       size = other.size;
       read_lease_ns.store(other.read_lease_ns.load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
+      hold = std::move(other.hold);
       lru_it = other.lru_it;
       in_lru = other.in_lru;
       return *this;
@@ -458,18 +409,13 @@ class PageBackend : public MediumBackend {
   // Build the full ADD list for every owned key.  Caller MUST hold `mutex_`.
   std::vector<KvEvent> SnapshotOwnedKeysLocked() const;
 
-  // True iff `slot`'s read-lease deadline is still in the future.
+  // True iff `slot`'s read lease is still running or a local reader holds it.
   static bool HasActiveReadLeaseLocked(const OwnedSlot& slot,
                                        std::chrono::steady_clock::time_point now);
 
   // Caller MUST hold `mutex_`.  True iff `key` currently has an active copy
   // pin (protects its pages from eviction).
   bool HasActivePinLocked(const std::string& key) const;
-
-  // Caller MUST hold `mutex_`.  Resolve `pages` to directly-readable local
-  // segments via buffer_bases_.  Empty if no bases are configured.
-  std::vector<std::pair<const void*, size_t>> BuildCopySegmentsLocked(
-      const std::vector<PageLocation>& pages, uint64_t total_size) const;
 
   // Caller MUST hold `mutex_`.
   std::vector<BufferMemoryDescBytes> BuildBufferDescsLocked(
@@ -487,10 +433,10 @@ class PageBackend : public MediumBackend {
   void ReaperLoop();
   void ReaperSweep();
 
-  // ---- local eviction (no-master deployments; see EnableLocalEviction) ----
+  // ---- eviction order (see TrackEvictionOrder) ----
 
   // Caller MUST hold `lru_mutex_`.  Move `key` to the MRU end, inserting it if
-  // it is not yet tracked.  No-op when local eviction is off.
+  // it is not yet tracked.  No-op until the order is tracked.
   void TouchLruLocked(const std::string& key, OwnedSlot& slot);
 
   // Caller MUST hold `lru_mutex_`.  Drop `key` from the LRU if tracked.
@@ -501,17 +447,13 @@ class PageBackend : public MediumBackend {
   void TouchLru(const std::string& key, OwnedSlot& slot);
   void RemoveFromLru(OwnedSlot& slot);
 
-  // Run one round if local eviction is on and usage has reached the high
-  // watermark.  Takes `mutex_` itself, so callers must NOT hold it.  Returns
-  // the number of keys freed.
-  size_t MaybeEvictToLowWatermark();
-
-  // Owned pages held back at ClearLocal() because of an active read lease.
-  // Released by ReaperSweep() when release_at <= now.
+  // Owned pages held back at ClearLocal() by a read lease or a local reader.
+  // Released by ReaperSweep() once release_at has passed and the hold is free.
   struct DeferredFree {
     std::string key;  // for debug log only.
     std::vector<PageLocation> pages;
     std::chrono::steady_clock::time_point release_at;
+    std::shared_ptr<const void> hold;
   };
 
   TierType tier_;
@@ -535,8 +477,7 @@ class PageBackend : public MediumBackend {
   // it got.  See page_pool.h.
   std::unique_ptr<PagePool> allocator_;
   std::vector<std::vector<uint8_t>> buffer_descs_;
-  // Local host base pointer per buffer_index.  Source of truth for page ->
-  // local pointer, used by AcquireDramCopyPin.
+  // Local host base pointer per buffer_index.
   std::vector<void*> buffer_bases_;
   // The same buffers as transfer endpoints, built once at InstallTierConfig so
   // BufferRef() costs an index rather than an msgpack unpack.  Immutable after
@@ -551,10 +492,8 @@ class PageBackend : public MediumBackend {
   size_t auto_flush_threshold_ = SIZE_MAX;  // events before a flush; default = never
   std::function<void()> auto_flush_cb_;     // set once at startup; wakes the heartbeat
 
-  // Active copy pins.  An entry means `key`'s owned pages are protected
-  // from eviction until ReleaseDramCopyPin.  No TTL: lifetime is bound to
-  // the worker via a RAII guard, not a deadline (force-freeing under an
-  // in-flight backend Write would be a use-after-free).
+  // Migration pins (AcquireMigrationRead): the pages stay until the
+  // migration releases them.  The key stays an eviction candidate.
   struct PinState {
     uint64_t token = 0;
     std::chrono::steady_clock::time_point acquired_at;  // for long-running warning only
@@ -564,25 +503,18 @@ class PageBackend : public MediumBackend {
 
   std::vector<DeferredFree> deferred_frees_;
 
-  // ---- local eviction state (see EnableLocalEviction) ----
+  // ---- eviction order (see TrackEvictionOrder) ----
   // Front = most recently committed/resolved, back = eviction candidate.
-  // Empty and unmaintained unless local_evict_enabled_.
+  // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
   // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_
   // so a resolve can record an access while holding only a shared lock; the
   // critical section is a list splice, not a hash lookup plus a page-vector
   // copy.  Always taken after mutex_ when both are held.
   mutable std::mutex lru_mutex_;
-  bool local_evict_enabled_ = false;
-  double local_evict_high_wm_ = 0.9;
-  double local_evict_low_wm_ = 0.7;
-  // Serializes rounds without holding mutex_ across one: a second committing
-  // thread backs off instead of over-evicting (same shape as PeerSsdManager).
-  std::mutex local_evict_round_mutex_;
-  // Latches the "nothing reclaimable" warning so a wedged pool reports once
-  // per episode rather than once per commit.  Cleared by the next round that
-  // frees something.
-  bool local_evict_warned_ = false;
+  // Written under mutex_ held exclusively, read under it held shared or
+  // exclusively -- every LRU touch already holds one or the other.
+  bool track_eviction_order_ = false;
 
   // False stops QueueEventLocked from recording anything (no master to ship
   // to).  True is the cluster default.
@@ -591,6 +523,7 @@ class PageBackend : public MediumBackend {
   // Bumped by ClearLocal(); snapshotted into each PendingSlot.  Commit()
   // rejects pre-clear slots via mismatch.  Local-only.
   uint64_t allocator_generation_ = 0;
+  uint64_t alloc_failures_ = 0;  // guarded by mutex_; samples the Allocate WARN
 
   std::atomic<uint64_t> next_slot_id_{1};
 

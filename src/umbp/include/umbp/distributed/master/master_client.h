@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/metrics/metric_sink.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/routing/route_put_strategy.h"
 #include "umbp/distributed/types.h"
@@ -70,12 +71,15 @@ struct RouteGetResult {
   std::string logical_tier;
 };
 
-class MasterClient {
+// Implements MetricSink: when a node has a master, that is where its metrics
+// go.  A masterless node is given a PrometheusMetricSink instead, and neither
+// PoolClient nor any component publishing through it knows which one it has.
+class MasterClient : public MetricSink {
  public:
-  using Labels = std::vector<std::pair<std::string, std::string>>;
+  using Labels = MetricSink::Labels;
 
   explicit MasterClient(const UMBPMasterClientConfig& config);
-  ~MasterClient();
+  ~MasterClient() override;
 
   MasterClient(const MasterClient&) = delete;
   MasterClient& operator=(const MasterClient&) = delete;
@@ -122,6 +126,28 @@ class MasterClient {
   // wants to know "is the key resident?" and is not about to RDMA-read.
   grpc::Status BatchLookup(const std::vector<std::string>& keys, std::vector<bool>* out);
 
+  // --- Peer-driven eviction ---
+  // Ask the master to stop EvictKey rounds for this node; set before
+  // RegisterSelf.  In effect only once the master confirms support.
+  void RequestPeerDrivenEviction(bool enabled) { peer_driven_requested_ = enabled; }
+  bool PeerDrivenEviction() const {
+    return peer_driven_requested_ && supports_peer_driven_eviction_.load();
+  }
+  // This node's keys on `tier`, coldest first by the master's recency, until
+  // their sizes cover `bytes`.  nullopt when the RPC fails.
+  std::optional<std::vector<EvictionOffer>> GetEvictionCandidates(TierType tier,
+                                                                  const std::string& logical_tier,
+                                                                  uint64_t bytes,
+                                                                  uint32_t max_keys);
+  // Keys read locally, shipped (deduped, best effort) on the next heartbeat:
+  // the master's recency otherwise sees only RouteGet.  For a node whose
+  // eviction follows that recency; a no-op until enabled and supported.
+  void EnableLocalReadReports(bool enabled) { local_read_reports_requested_ = enabled; }
+  bool ReportsLocalReads() const {
+    return local_read_reports_requested_ && supports_peer_driven_eviction_.load();
+  }
+  void NoteLocalReads(const std::vector<std::string>& keys);
+
   // --- Heartbeat (event-driven) ---
   // Bind every storage medium live on this peer.  The heartbeat drains each
   // backend's outbox and concatenates them into ONE bundle under a single
@@ -142,7 +168,6 @@ class MasterClient {
     aggregate_backend_capacities_ = enabled && supports_max_allocatable_capacity_;
   }
   bool SupportsMaxAllocatableCapacity() const { return supports_max_allocatable_capacity_; }
-  bool SupportsLogicalTiers() const { return supports_logical_tiers_; }
 
   void StartHeartbeat();
   void StopHeartbeat();
@@ -159,10 +184,10 @@ class MasterClient {
   bool ClearFullSync();
 
   // --- Client-side metrics ---
-  void AddCounter(std::string name, std::string help, Labels labels, double delta);
-  void SetGauge(std::string name, std::string help, Labels labels, double value);
+  void AddCounter(std::string name, std::string help, Labels labels, double delta) override;
+  void SetGauge(std::string name, std::string help, Labels labels, double value) override;
   void Observe(std::string name, std::string help, Labels labels, const std::vector<double>& bounds,
-               double value);
+               double value) override;
 
   // Register a callback run once per metrics flush tick in the existing metrics
   // thread (no new thread) so a component can publish counters/gauges from its
@@ -198,13 +223,7 @@ class MasterClient {
 
     // Number of *distinct* matched hashes (size of the union across tiers).
     // A hash present on HBM+DRAM still counts once.
-    size_t MatchedHashCount() const {
-      std::unordered_set<std::string_view> seen;
-      for (const auto& [tier, hashes] : hashes_by_tier) {
-        for (const auto& h : hashes) seen.insert(h);
-      }
-      return seen.size();
-    }
+    size_t MatchedHashCount() const { return CountDistinctHashes(hashes_by_tier); }
   };
   using ExternalKvHitCountEntry = mori::umbp::ExternalKvHitCountEntry;
   grpc::Status MatchExternalKv(const std::vector<std::string>& hashes,
@@ -243,6 +262,12 @@ class MasterClient {
   bool aggregate_backend_capacities_ = false;
   bool supports_max_allocatable_capacity_ = false;
   bool supports_logical_tiers_ = false;
+  bool peer_driven_requested_ = false;
+  // Rewritten on re-registration (heartbeat thread), read by eviction.
+  std::atomic<bool> supports_peer_driven_eviction_{false};
+  std::atomic<bool> local_read_reports_requested_{false};
+  std::mutex local_reads_mutex_;
+  std::unordered_set<std::string> local_reads_;
   // Initial conservative registration payload, retained so an UNKNOWN response
   // can rebuild the full peer record after Master state loss.
   std::map<TierType, TierCapacity> registration_capacities_;

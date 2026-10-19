@@ -65,6 +65,24 @@ const char* StatusName(int status) {
   }
 }
 
+// The (op, status) pairs each op can actually produce -- exactly the Add()
+// calls below.  They are published from the first tick, at zero, so every
+// series exists before its first event: Prometheus can only see an increase
+// between two samples of one series, so a series born holding its first
+// count would hide that count from rate() and increase().  Pairs an op never
+// produces (an abort has no "no_space") stay unpublished.
+constexpr bool kProduces[5][5] = {
+    //  ok    exists no_space miss   failed
+    {true, true, true, false, true},    // allocate
+    {true, false, false, false, true},  // commit
+    {true, false, false, false, true},  // abort
+    {true, false, false, true, true},   // resolve
+    {true, false, false, true, false},  // evict
+};
+
+// Ops that move bytes, so their bytes counter exists from the first tick.
+constexpr bool kCarriesBytes[5] = {false, true, false, true, true};
+
 // Scoped timer that charges elapsed nanoseconds to an op on destruction, so an
 // early return inside a forwarded call still gets measured.
 class ScopedNanos {
@@ -159,20 +177,29 @@ std::vector<bool> InstrumentedBackend::BatchAbort(const std::vector<uint64_t>& s
 
 std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(const std::vector<std::string>& keys,
                                                              bool include_descs,
-                                                             bool allow_file_refs) {
+                                                             bool allow_file_refs,
+                                                             ResolveReader reader) {
   ops_[kResolve].batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<ResolvedEntry> out;
   {
     ScopedNanos timer(ops_[kResolve].nanos);
-    out = inner_->BatchResolve(keys, include_descs, allow_file_refs);
+    out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader);
   }
   uint64_t bytes = 0;
   for (const ResolvedEntry& r : out) {
-    if (r.found) {
-      Add(kResolve, kOk, 1);
-      bytes += r.size;
-    } else {
-      Add(kResolve, kMiss, 1);
+    switch (EffectiveResolveOutcome(r)) {
+      case ResolveOutcome::kFound:
+        Add(kResolve, kOk, 1);
+        bytes += r.size;
+        break;
+      case ResolveOutcome::kMissing:
+        Add(kResolve, kMiss, 1);
+        break;
+      case ResolveOutcome::kFailed:
+        Add(kResolve, kFailed, 1);  // held but unreadable: a real load failure
+        break;
+      case ResolveOutcome::kBusy:
+        break;  // not an answer yet: the retry is what gets counted
     }
   }
   if (bytes > 0) ops_[kResolve].bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -203,16 +230,16 @@ std::vector<EvictResult> InstrumentedBackend::Evict(const std::vector<std::strin
 
 std::vector<MetricSample> InstrumentedBackend::SampleMetrics() const {
   std::vector<MetricSample> out;
+  static_assert(kOpCount == 5 && kStatusCount == 5,
+                "kProduces / kCarriesBytes must list every op and status");
   out.reserve(kOpCount * 4 + 8);
 
   for (int op = 0; op < kOpCount; ++op) {
     const char* op_name = OpName(op);
 
     for (int status = 0; status < kStatusCount; ++status) {
+      if (!kProduces[op][status]) continue;
       const uint64_t v = entries_[op][status].load(std::memory_order_relaxed);
-      // Skip combinations this op never produces (an abort has no "no_space")
-      // so the series set stays the shape of what actually happens.
-      if (v == 0) continue;
       out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_OPS_TOTAL,
                                  MORI_UMBP_METRIC_BACKEND_OPS_TOTAL_HELP,
                                  {{"op", op_name}, {"status", StatusName(status)}},
@@ -220,7 +247,6 @@ std::vector<MetricSample> InstrumentedBackend::SampleMetrics() const {
     }
 
     const uint64_t batches = ops_[op].batches.load(std::memory_order_relaxed);
-    if (batches == 0) continue;
     out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_BATCHES_TOTAL,
                                MORI_UMBP_METRIC_BACKEND_BATCHES_TOTAL_HELP,
                                {{"op", op_name}},
@@ -230,17 +256,15 @@ std::vector<MetricSample> InstrumentedBackend::SampleMetrics() const {
     // MetricSample::scale converts once, in the publisher, so the metric keeps
     // the seconds its name promises.
     const uint64_t nanos = ops_[op].nanos.load(std::memory_order_relaxed);
-    if (nanos > 0) {
-      out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_OP_SECONDS_TOTAL,
-                                 MORI_UMBP_METRIC_BACKEND_OP_SECONDS_TOTAL_HELP,
-                                 {{"op", op_name}},
-                                 nanos,
-                                 MetricKind::kCounter,
-                                 1.0 / kNanosPerSecond});
-    }
+    out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_OP_SECONDS_TOTAL,
+                               MORI_UMBP_METRIC_BACKEND_OP_SECONDS_TOTAL_HELP,
+                               {{"op", op_name}},
+                               nanos,
+                               MetricKind::kCounter,
+                               1.0 / kNanosPerSecond});
 
     const uint64_t bytes = ops_[op].bytes.load(std::memory_order_relaxed);
-    if (bytes > 0) {
+    if (kCarriesBytes[op]) {
       out.push_back(MetricSample{MORI_UMBP_METRIC_BACKEND_BYTES_TOTAL,
                                  MORI_UMBP_METRIC_BACKEND_BYTES_TOTAL_HELP,
                                  {{"op", op_name}},

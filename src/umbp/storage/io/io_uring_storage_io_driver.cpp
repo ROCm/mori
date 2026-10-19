@@ -50,8 +50,6 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
     if (ring_fd_ < 0) return;
 
     single_mmap_ = (p.features & IORING_FEAT_SINGLE_MMAP) != 0;
-    sq_ring_entries_ = p.sq_entries;
-    cq_ring_entries_ = p.cq_entries;
 
     sq_ring_sz_ = p.sq_off.array + p.sq_entries * sizeof(uint32_t);
     cq_ring_sz_ = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
@@ -481,8 +479,6 @@ class IoUringStorageIoDriver final : public StorageIoDriver {
   int ring_fd_ = -1;
   bool ready_ = false;
   bool single_mmap_ = false;
-  uint32_t sq_ring_entries_ = 0;
-  uint32_t cq_ring_entries_ = 0;
 
   size_t sq_ring_sz_ = 0;
   size_t cq_ring_sz_ = 0;

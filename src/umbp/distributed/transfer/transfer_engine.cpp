@@ -53,6 +53,12 @@ class StepTimer {
 
 }  // namespace
 
+TransferPlanSet TransferEngine::Plan(const std::vector<TransferItem>& items) const {
+  auto builder = CreatePlanBuilder(items.size());
+  for (const auto& item : items) builder->Add(item);
+  return builder->Finish();
+}
+
 bool TransferEngine::Transfer(const std::vector<TransferItem>& items,
                               std::vector<size_t>* failed_tags, const StepTiming* timing) {
   if (items.empty()) return true;
@@ -62,6 +68,11 @@ bool TransferEngine::Transfer(const std::vector<TransferItem>& items,
     StepTimer plan_timer(timing ? timing->plan : nullptr);
     planned = Plan(items);
   }
+  return Transfer(std::move(planned), failed_tags, timing);
+}
+
+bool TransferEngine::Transfer(TransferPlanSet planned, std::vector<size_t>* failed_tags,
+                              const StepTiming* timing) {
   bool ok = planned.rejected_tags.empty();
   if (failed_tags != nullptr) {
     failed_tags->insert(failed_tags->end(), planned.rejected_tags.begin(),

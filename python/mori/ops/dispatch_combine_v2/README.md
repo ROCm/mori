@@ -45,7 +45,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
 | `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
-| `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here |
+| `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `ep_staging_bytes(...)` bytes once, keep them alive, and `bind(staging_base=buf.data_ptr())` on every dispatch plan (an int is cached in the launch struct; a bound tensor is re-read every launch) |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `internode_regions.py` | `internode_regions(cfg)`: the internode op's `SymmArena` region list — 17 named `(name, nbytes)` regions (16 plus `out_scales` when scales are on), in v1's allocation order and transcribed from what `EpDispatchCombineHandle` allocated |
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
@@ -212,6 +212,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
+| `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |

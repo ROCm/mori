@@ -298,6 +298,47 @@ TEST_F(SsdRangedIoTest, LocalRangedGetReadsASubsetFromSsd) {
   EXPECT_EQ(std::memcmp(middle.data(), object.data() + kObjectSize / 2, middle.size()), 0);
 }
 
+// A batch of SSD objects larger than the staging arena (8 slots) is served in
+// full, in rounds, by both readers.
+TEST_F(SsdRangedIoTest, LocalBatchLargerThanTheStagingArenaIsServedInFull) {
+  auto* node = Start(SsdConfig("ssd-local-oversized"));
+  ASSERT_NE(node, nullptr);
+  ASSERT_TRUE(node->SupportsRangedIO());
+
+  constexpr size_t kKeys = 20;  // 20 one-page objects against an 8-page arena
+  std::vector<std::string> keys;
+  std::vector<std::vector<char>> objects;
+  for (size_t k = 0; k < kKeys; ++k) {
+    keys.push_back("ssd-oversized-" + std::to_string(k));
+    objects.push_back(Pattern(kObjectSize, static_cast<unsigned>(10 + k)));
+    ASSERT_EQ(node->BatchPut({keys.back()}, {Addr(objects.back().data())}, {kObjectSize}),
+              std::vector<bool>({true}));
+  }
+  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(node, key));
+
+  // Back to back: each call's staging must be back before the next needs it.
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<std::vector<char>> got(kKeys, std::vector<char>(128, 0));
+    std::vector<std::vector<uintptr_t>> dsts(kKeys);
+    std::vector<std::vector<size_t>> sizes(kKeys, {128});
+    std::vector<std::vector<size_t>> offsets(kKeys, {kObjectSize / 4});
+    for (size_t k = 0; k < kKeys; ++k) dsts[k] = {Addr(got[k].data())};
+    auto ranged = node->BatchGetRanges(keys, dsts, sizes, offsets);
+    ASSERT_EQ(ranged, std::vector<bool>(kKeys, true)) << "pass " << pass;
+    for (size_t k = 0; k < kKeys; ++k) {
+      EXPECT_EQ(std::memcmp(got[k].data(), objects[k].data() + kObjectSize / 4, 128), 0)
+          << "key " << k << " pass " << pass;
+    }
+
+    std::vector<std::vector<char>> whole(kKeys, std::vector<char>(kObjectSize, 0));
+    std::vector<uintptr_t> whole_dsts;
+    for (auto& w : whole) whole_dsts.push_back(Addr(w.data()));
+    auto plain = node->BatchGet(keys, whole_dsts, std::vector<size_t>(kKeys, kObjectSize));
+    ASSERT_EQ(plain, std::vector<bool>(kKeys, true)) << "pass " << pass;
+    for (size_t k = 0; k < kKeys; ++k) EXPECT_EQ(whole[k], objects[k]) << "key " << k;
+  }
+}
+
 // A ranged get must touch the requested bytes and nothing else.  Guard bytes
 // on either side of the destination catch an implementation that quietly
 // copies the whole staged object out -- which, on SSD, is precisely the shape

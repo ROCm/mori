@@ -39,30 +39,11 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
+#include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
 
 namespace {
-
-// True iff [next, ...) is exactly adjacent after [base, base+len).  Same guard
-// LocalCopyEngine uses; duplicated rather than shared because the two engines
-// are otherwise independent and this is three lines.
-inline bool AdjacentNoOverflow(size_t base, size_t len, size_t next) {
-  return len <= std::numeric_limits<size_t>::max() - base && base + len == next;
-}
-
-struct PtrPairKey {
-  const void* src;
-  const void* dst;
-  bool operator==(const PtrPairKey& o) const noexcept { return src == o.src && dst == o.dst; }
-};
-struct PtrPairKeyHash {
-  size_t operator()(const PtrPairKey& k) const noexcept {
-    size_t h = std::hash<const void*>{}(k.src);
-    h ^= std::hash<const void*>{}(k.dst) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-  }
-};
 
 inline bool IsGpu(const TransferRef& r) { return r.loc == mori::io::MemoryLocationType::GPU; }
 
@@ -283,26 +264,55 @@ void LogPlanGeometry(const char* path, size_t plan_index, const TransferPlan& pl
   }
 }
 
-// One non-blocking stream per device, per thread.  Submit runs on PoolClient's
-// executor threads, so a shared stream would serialize copies that the
-// hipMemcpy path ran independently.
-std::map<int, hipStream_t>& GatherStreams() {
-  static thread_local std::map<int, hipStream_t>* streams = new std::map<int, hipStream_t>();
-  return *streams;
-}
-
-hipStream_t GatherStream(int device_id) {
-  auto& streams = GatherStreams();
-  auto it = streams.find(device_id);
-  if (it != streams.end()) return it->second;
-  hipStream_t stream = nullptr;
-  if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
-    (void)hipGetLastError();
-    return nullptr;
+// Non-blocking gather streams, pooled per device and lent to one gather at a
+// time, so concurrent copies still run on separate streams.  They are not tied
+// to the calling thread: the standalone server calls Submit from gRPC's sync
+// pool, which retires and spawns threads under load, and every HIP stream holds
+// ~6.4 MiB of device memory for its kernarg pool.  Kept per thread, they leaked
+// until the GPU was full and stream creation failed (which HIP 7.2 turns into a
+// segfault).  A device's pool grows only to its peak number of concurrent
+// gathers.  Never destroyed: worker threads can still be copying during static
+// teardown.
+class GatherStreamPool {
+ public:
+  static GatherStreamPool& Instance() {
+    static GatherStreamPool* pool = new GatherStreamPool();
+    return *pool;
   }
-  streams.emplace(device_id, stream);
-  return stream;
-}
+
+  // The current device must already be `device_id`.  nullptr if no stream is
+  // free and a new one cannot be created.
+  hipStream_t Acquire(int device_id) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto& idle = idle_[device_id];
+      if (!idle.empty()) {
+        hipStream_t stream = idle.back();
+        idle.pop_back();
+        return stream;
+      }
+    }
+    hipStream_t stream = nullptr;
+    if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
+      (void)hipGetLastError();
+      return nullptr;
+    }
+    created_.fetch_add(1, std::memory_order_relaxed);
+    return stream;
+  }
+
+  void Release(int device_id, hipStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    idle_[device_id].push_back(stream);
+  }
+
+  uint64_t Created() const { return created_.load(std::memory_order_relaxed); }
+
+ private:
+  std::mutex mutex_;
+  std::map<int, std::vector<hipStream_t>> idle_;
+  std::atomic<uint64_t> created_{0};
+};
 
 // Latches on the first gather failure and never tries again.  A kernel that
 // cannot launch here will not start working later, and the fallback is always
@@ -358,84 +368,43 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   return IsGpu(src) || IsGpu(dst);
 }
 
-TransferPlanSet HbmCopyEngine::Plan(const std::vector<TransferItem>& items) const {
-  TransferPlanSet out;
-  std::unordered_map<PtrPairKey, size_t, PtrPairKeyHash> pair_to_plan;
-  pair_to_plan.reserve(items.size() * 2);
-  // No segment may cross a host registration piece boundary on its host side;
-  // see HostRegistrationChunkBytes().
-  const size_t piece = HostRegistrationChunkBytes();
-
-  for (const auto& item : items) {
-    if (item.size == 0) continue;
-    if (!CanHandle(item.src, item.dst)) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
+namespace {
+// Merges adjacent ranges, but a segment never crosses a host registration piece.
+void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t piece) {
+  const bool host_is_src = !IsGpu(item.src);
+  const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
+  const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
+                              : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
+                                            : 0;
+  const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
+    return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
+  };
+  size_t so = static_cast<size_t>(item.src_offset);
+  size_t dof = static_cast<size_t>(item.dst_offset);
+  size_t remaining = static_cast<size_t>(item.size);
+  while (remaining > 0) {
+    size_t sz = remaining;
+    if (host_base != 0) {
+      const uintptr_t host = host_base + (host_is_src ? so : dof);
+      sz = std::min<size_t>(sz, piece - host % piece);
     }
-    // Bounds are checked here, once, rather than per copy: a page index that
-    // does not fit its buffer is a bug in the backend's slot bookkeeping, and
-    // the key must be failed rather than copied past the end.  On a GPU
-    // endpoint that matters more than on a host one — an overrun is not a
-    // segfault but silent corruption of whatever else lives in the pool.
-    if (item.size > item.src.size || item.src_offset > item.src.size - item.size ||
-        item.size > item.dst.size || item.dst_offset > item.dst.size - item.size) {
-      out.rejected_tags.push_back(item.tag);
-      continue;
-    }
-
-    const PtrPairKey key{item.src.host_ptr, item.dst.host_ptr};
-    auto it = pair_to_plan.find(key);
-    size_t pi;
-    if (it == pair_to_plan.end()) {
-      pi = out.plans.size();
-      pair_to_plan.emplace(key, pi);
-      TransferPlan plan;
-      plan.src = item.src;
-      plan.dst = item.dst;
-      plan.dir = TransferDirection::kLocal;
-      out.plans.push_back(std::move(plan));
-    } else {
-      pi = it->second;
-    }
-    TransferPlan& plan = out.plans[pi];
-    // D2D has no host side; otherwise exactly one side is host memory.
-    const bool host_is_src = !IsGpu(item.src);
-    const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
-    const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
-                                : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
-                                              : 0;
-    const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
-      return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
-    };
-    size_t so = static_cast<size_t>(item.src_offset);
-    size_t dof = static_cast<size_t>(item.dst_offset);
-    size_t remaining = static_cast<size_t>(item.size);
-    while (remaining > 0) {
-      size_t sz = remaining;
-      if (host_base != 0) {
-        const uintptr_t host = host_base + (host_is_src ? so : dof);
-        sz = std::min<size_t>(sz, piece - host % piece);
-      }
-      const bool can_coalesce =
-          !plan.sizes.empty() &&
-          AdjacentNoOverflow(plan.src_offsets.back(), plan.sizes.back(), so) &&
-          AdjacentNoOverflow(plan.dst_offsets.back(), plan.sizes.back(), dof) &&
-          (host_base == 0 ||
-           host_piece(plan.src_offsets.back(), plan.dst_offsets.back()) == host_piece(so, dof));
-      if (can_coalesce) {
-        plan.sizes.back() += sz;
-      } else {
-        plan.src_offsets.push_back(so);
-        plan.dst_offsets.push_back(dof);
-        plan.sizes.push_back(sz);
-      }
-      so += sz;
-      dof += sz;
-      remaining -= sz;
-    }
-    if (plan.tags.empty() || plan.tags.back() != item.tag) plan.tags.push_back(item.tag);
+    const bool same_piece =
+        host_base == 0 || plan->sizes.empty() ||
+        host_piece(plan->src_offsets.back(), plan->dst_offsets.back()) == host_piece(so, dof);
+    AppendSegment(plan, so, dof, sz, item.tag, same_piece);
+    so += sz;
+    dof += sz;
+    remaining -= sz;
   }
-  return out;
+}
+}  // namespace
+
+std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
+    size_t /*expected_items*/) const {
+  const size_t piece = HostRegistrationChunkBytes();
+  return MakePairPlanBuilder(*this, [piece](TransferPlan* plan, const TransferItem& item) {
+    AppendWithinHostPieces(plan, item, piece);
+  });
 }
 
 void HbmCopyEngine::AddHostGatherRegion(void* base, size_t bytes) {
@@ -457,6 +426,8 @@ void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int d
   }
   return nullptr;
 }
+
+uint64_t HbmCopyEngine::GatherStreamsCreated() { return GatherStreamPool::Instance().Created(); }
 
 // Run the gather kernel over every eligible segment in the batch, and report
 // which plans it completed.
@@ -618,7 +589,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kSetDeviceFailed);
       continue;
     }
-    hipStream_t stream = GatherStream(device_id);
+    hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
     if (stream == nullptr) {
       note_bucket(GatherSkip::kNoStream);
       continue;
@@ -629,21 +600,23 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
     // perturb what is being measured.
     const auto started = std::chrono::steady_clock::now();
     if (!LaunchDeviceGather(bucket.fragments.data(), bucket.fragments.size(), device_id, stream)) {
+      GatherStreamPool::Instance().Release(device_id, stream);
       note_bucket(GatherSkip::kLaunchFailed);
       continue;
     }
     const hipError_t sync = hipStreamSynchronize(stream);
     if (sync != hipSuccess) {
       // Latch off: a kernel that cannot complete here will not start working
-      // later, and every caller still has the fallback.
+      // later, and every caller still has the fallback.  The stream is dropped
+      // rather than returned to the pool.
       (void)hipGetLastError();
       GatherDisabled().store(true, std::memory_order_relaxed);
-      GatherStreams().erase(device_id);
       MORI_UMBP_ERROR("[HbmCopyEngine] gather sync dev={} failed: {}", device_id,
                       hipGetErrorString(sync));
       note_bucket(GatherSkip::kSyncFailed);
       continue;
     }
+    GatherStreamPool::Instance().Release(device_id, stream);
     for (size_t p : bucket.plan_indices) done[p] = 1;
     if (!debug) continue;
 

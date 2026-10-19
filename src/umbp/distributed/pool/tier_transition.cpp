@@ -29,47 +29,63 @@
 
 namespace mori::umbp {
 
+namespace {
+
+// Where byte `offset` of a value lives on one side: a file range holds all of
+// it, a page holds the rest of that page.
+bool Locate(MediumBackend* backend, const std::vector<PageLocation>& pages, uint64_t page_size,
+            const TransferRef& file, uint64_t offset, TransferRef* ref, uint64_t* at,
+            uint64_t* run) {
+  if (file.IsFile()) {
+    *ref = file;
+    *at = offset;
+    *run = UINT64_MAX;
+    return true;
+  }
+  if (page_size == 0 || offset / page_size >= pages.size()) return false;
+  const PageLocation& page = pages[static_cast<size_t>(offset / page_size)];
+  *ref = backend->BufferRef(page.buffer_index);
+  *at = static_cast<uint64_t>(page.page_index) * page_size + offset % page_size;
+  *run = page_size - offset % page_size;
+  return ref->Valid();
+}
+
+}  // namespace
+
 bool TierTransitionExecutor::BuildTransfers(MediumBackend* source, const ResolvedEntry& resolved,
                                             MediumBackend* target, const AllocateResult& allocation,
                                             std::vector<TransferItem>* items) {
   if (source == nullptr || target == nullptr || items == nullptr || resolved.size == 0 ||
-      resolved.page_size == 0 || allocation.page_size == 0 || resolved.pages.empty() ||
-      allocation.pages.empty() || allocation.size != resolved.size) {
+      allocation.size != resolved.size) {
     return false;
   }
 
   items->clear();
   for (uint64_t copied = 0; copied < resolved.size;) {
-    const uint64_t source_page_number = copied / resolved.page_size;
-    const uint64_t target_page_number = copied / allocation.page_size;
-    if (source_page_number >= resolved.pages.size() ||
-        target_page_number >= allocation.pages.size()) {
+    TransferItem item;
+    uint64_t src_run = 0;
+    uint64_t dst_run = 0;
+    if (!Locate(source, resolved.pages, resolved.page_size, resolved.file_ref, copied, &item.src,
+                &item.src_offset, &src_run) ||
+        !Locate(target, allocation.pages, allocation.page_size, allocation.file_ref, copied,
+                &item.dst, &item.dst_offset, &dst_run)) {
       return false;
     }
-
-    const auto& source_page = resolved.pages[static_cast<size_t>(source_page_number)];
-    const auto& target_page = allocation.pages[static_cast<size_t>(target_page_number)];
-    TransferRef source_ref = source->BufferRef(source_page.buffer_index);
-    TransferRef target_ref = target->BufferRef(target_page.buffer_index);
-    if (!source_ref.Valid() || !target_ref.Valid()) return false;
-
-    const uint64_t source_offset = copied % resolved.page_size;
-    const uint64_t target_offset = copied % allocation.page_size;
-    const uint64_t size = std::min({resolved.size - copied, resolved.page_size - source_offset,
-                                    allocation.page_size - target_offset});
-    TransferItem item;
     item.tag = items->size();
-    item.src = std::move(source_ref);
-    item.src_offset =
-        static_cast<uint64_t>(source_page.page_index) * resolved.page_size + source_offset;
-    item.dst = std::move(target_ref);
-    item.dst_offset =
-        static_cast<uint64_t>(target_page.page_index) * allocation.page_size + target_offset;
-    item.size = size;
+    item.size = std::min({resolved.size - copied, src_run, dst_run});
+    copied += item.size;
     items->push_back(std::move(item));
-    copied += size;
   }
   return true;
+}
+
+// An engine joins `backend`'s memory and a file both ways; CanHandle is pure,
+// so a placeholder range answers.
+bool TierTransitionExecutor::FileReachable(MediumBackend* backend) const {
+  const TransferRef mem = backend->BufferRef(0);
+  const TransferRef file = TransferRef::File(/*fd=*/0, 0, 1);
+  return mem.Valid() && transfer_engine_->CanHandle(mem, file) &&
+         transfer_engine_->CanHandle(file, mem);
 }
 
 TierTransitionResult TierTransitionExecutor::Execute(
@@ -81,16 +97,26 @@ TierTransitionResult TierTransitionExecutor::Execute(
   }
 
   MediumBackend* source = backends_->Get(source_backend_id);
+  if (source == nullptr) return result;
+  // A file-backed side skips staging when an engine joins its file to the other
+  // side's memory.
+  bool targets_reach_files = true;
+  for (uint32_t target_backend_id : target_backend_ids) {
+    MediumBackend* target = backends_->Get(target_backend_id);
+    if (target != nullptr && target != source) targets_reach_files &= FileReachable(target);
+  }
   ResolvedEntry resolved;
-  if (source == nullptr || !source->AcquireMigrationRead(key, &resolved) || !resolved.found) {
+  if (!source->AcquireMigrationRead(key, &resolved, targets_reach_files) || !resolved.found) {
     return result;
   }
+  const bool source_reaches_files = FileReachable(source);
 
   for (uint32_t target_backend_id : target_backend_ids) {
     MediumBackend* target = backends_->Get(target_backend_id);
     if (target == nullptr || target == source) continue;
 
-    auto allocations = target->BatchAllocate({AllocateRequest{key, resolved.size}});
+    auto allocations =
+        target->BatchAllocate({AllocateRequest{key, resolved.size, -1, source_reaches_files}});
     if (allocations.empty()) continue;
     AllocateResult& allocation = allocations.front();
 
@@ -99,25 +125,34 @@ TierTransitionResult TierTransitionExecutor::Execute(
       if (!BuildTransfers(source, resolved, target, allocation, &transfers) ||
           !transfer_engine_->Transfer(transfers, nullptr)) {
         target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
         continue;
       }
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
         target->BatchAbort({allocation.slot_id});
+        result.retryable = true;
         continue;
       }
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
+      // No space is pressure (staging full of reads, eviction catching up);
+      // a shape failure (kFailed) stays final.
+      if (allocation.outcome == AllocateOutcome::kFailedNoSpace) result.retryable = true;
       continue;
     }
 
+    // A pin, not a read-back: the bytes were just written.
     ResolvedEntry target_read;
-    if (!target->AcquireMigrationRead(key, &target_read) || target_read.size != resolved.size) {
+    if (!target->AcquireMigrationRead(key, &target_read, /*allow_file_ref=*/true) ||
+        target_read.size != resolved.size) {
       if (target_read.found) target->ReleaseMigrationRead(key);
       if (allocation.outcome == AllocateOutcome::kSuccessAllocated) target->Evict({key});
+      result.retryable = true;
       continue;
     }
 
     result.success = true;
+    result.retryable = false;
     result.target_backend_id = target_backend_id;
     result.bytes_moved = resolved.size;
     source->ReleaseMigrationRead(key);
