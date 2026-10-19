@@ -309,8 +309,8 @@ static int BenchAndVerify(const Config& cfg, ccoComm* comm, int myPe, hipStream_
 
   float totalMs = 0, minMs = 1e9f, maxMs = 0;
   hipError_t launchErr = hipSuccess;
-  // No per-iteration host barrier: the push kernels and the pull reduce-scatter
-  // synchronize with their peers in-kernel (PushEntryBarrier).
+  // No per-iteration host barrier: the push and pull kernels synchronize with
+  // their peers in-kernel (GenBarrier).
   for (int iter = 0; iter < nWarmup + nRuns; iter++) {
     HIP_RUNTIME_CHECK(hipEventRecord(tStart, stream));
     launchErr = runOnce();

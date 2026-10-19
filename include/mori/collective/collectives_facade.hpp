@@ -204,9 +204,9 @@ class CollectivesFacade {
     }
     state.stagingBytes = maxStagingBytes;
 
-    // Entry/exit-barrier flags of the push and pull collectives (see
-    // PushEntryBarrier): slot p of every copy is written only by PE p with its
-    // monotonic epoch; never reset after this.
+    // Generation-barrier flags shared by every push and pull collective (see
+    // GenBarrier in collectives_common.hpp): slot p of every copy is written only
+    // by PE p; never reset after this.
     state.barrierCtr = reinterpret_cast<uint64_t*>(
              static_cast<uint8_t*>(state.staging) + maxStagingBytes);
     // Collective-permute ready tokens. Slot p of my copy is written only by PE p
@@ -375,7 +375,7 @@ class CollectivesFacade {
     void* staging{nullptr};
     size_t stagingBytes{0};
     uint32_t* groupCounters{nullptr};
-    uint64_t* barrierCtr{nullptr};  // symmetric, entry-barrier flags (slot p written by PE p)
+    uint64_t* barrierCtr{nullptr};  // symmetric, gen-barrier flags of all collectives (slot p written by PE p)
     uint64_t* permuteReady{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
     AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};

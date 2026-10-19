@@ -59,7 +59,11 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   const uint32_t stride4G = heapWin->stride4G;
   // A peer finishing its previous launch only proves our shard reached it; gate
   // our writes into its output / signalBuf[0] until every PE entered this one.
-  if (threadIdx.x < warpSize) PushEntryBarrier(barrierCtr, myPe, npes, stride4G);
+  if (threadIdx.x < warpSize) {
+    // Every lane reads my slot before lane myPe overwrites it (same wave).
+    const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
+    GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
+  }
   __syncthreads();
 
   // Single block: push my shard to every peer's output[myPe] slot (+ self). The
@@ -102,7 +106,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // follows: there is nothing left in L2 to write back.
   //
   // Clearing at kernel END is safe without a host barrier: a peer's NEXT launch
-  // only ADDs here after passing its PushEntryBarrier, which needs us to have
+  // only ADDs here after passing its entry GenBarrier, which needs us to have
   // entered that launch too, i.e. after this kernel has retired.
   if (threadIdx.x == 0) {
     StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[0], 0);
