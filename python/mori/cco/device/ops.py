@@ -172,6 +172,40 @@ for _op in ("put", "get"):
             tag=_tag,
         )
 
+# SDMA 2D put/get: (devComm, peer, dstWin, dstOff, dstPitch, srcWin, srcOff,
+# srcPitch, widthBytes, height, qid, flags).
+_sdma_xfer2d_args = [
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+]
+for _op in ("put", "get"):
+    for _tag in (
+        "thread",
+        "warp",
+        "block",
+        "thread_ns",
+        "warp_ns",
+        "block_ns",
+    ):
+        _add(
+            f"sdma_{_op}2d_{_tag}",
+            f"cco_sdma_{_op}2d__{_tag}",
+            _sdma_xfer2d_args,
+            _I32,
+            family=f"sdma_{_op}2d",
+            tag=_tag,
+        )
+
 for _tag in COOP_TAGS:
     _add(
         f"sdma_quiet_{_tag}",

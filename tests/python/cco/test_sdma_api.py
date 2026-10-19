@@ -583,6 +583,131 @@ def _worker_put_aggregate(rank, world_size, uid_path, coop_name, results_path):
         f.write(err or "")
 
 
+def _worker_put2d(rank, world_size, uid_path, coop_name, results_path):
+    """2D put: a rect of the sender's matrix lands at an offset in the peer's slot.
+
+    THREAD coop: all 64 lanes post one 1-row rect each to the same peer, which
+    put2d batches into a single run. WARP/BLOCK: the leader posts the whole
+    64-row rect as one packet. The whole slot is read back, so a stray write
+    outside the rect fails as surely as a wrong value inside it."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        coop = getattr(cco.CoopScope, coop_name)
+        comm = _init_comm(rank, world_size, uid_path)
+
+        # src: S_ROWS x S_COLS u32; each dst slot: D_ROWS x D_COLS u32.
+        S_ROWS, S_COLS, D_ROWS, D_COLS = 80, 32, 80, 48
+        SY, SX, DY, DX, H, W = 3, 5, 2, 7, 64, 16  # rect origin/extent, u32 units
+        s_pitch, d_pitch = S_COLS * 4, D_COLS * 4
+        slot_bytes = D_ROWS * d_pitch
+        send_off = 0
+        recv_off = S_ROWS * s_pitch
+        win_bytes = recv_off + world_size * slot_bytes
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+
+        def val(r, row, col):
+            return r * 100000 + row * 100 + col + 1
+
+        fill(
+            win.local_ptr + send_off,
+            [val(rank, y, x) for y in range(S_ROWS) for x in range(S_COLS)],
+            u32,
+        )
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        my_rank = rank
+        batch = coop == cco.CoopScope.THREAD
+        src0 = send_off + (SY * S_COLS + SX) * 4
+        dst0 = recv_off + my_rank * slot_bytes + (DY * D_COLS + DX) * 4
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def put2d_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            tid = fx.thread_idx.x
+            for p in range(world_size):
+                if p != my_rank:
+                    if batch:
+                        # lane i: row i of the rect, all lanes on (p, queue 0)
+                        row = fx.Int64(tid)
+                        sdma.put2d(
+                            p,
+                            w,
+                            fx.Int64(dst0) + row * fx.Int64(d_pitch),
+                            d_pitch,
+                            w,
+                            fx.Int64(src0) + row * fx.Int64(s_pitch),
+                            s_pitch,
+                            W * 4,
+                            1,
+                            0,
+                            coop=coop,
+                        )
+                    else:
+                        sdma.put2d(
+                            p,
+                            w,
+                            dst0,
+                            d_pitch,
+                            w,
+                            src0,
+                            s_pitch,
+                            W * 4,
+                            H,
+                            0,
+                            coop=coop,
+                        )
+            if tid == 0:
+                for p in range(world_size):
+                    if p != my_rank:
+                        sdma.quiet(p)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            put2d_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        for s in range(world_size):
+            if s == my_rank:
+                continue
+            got = read(win.local_ptr + recv_off + s * slot_bytes, D_ROWS * D_COLS, u32)
+            for y in range(D_ROWS):
+                for x in range(D_COLS):
+                    inside = DY <= y < DY + H and DX <= x < DX + W
+                    exp = val(s, SY + y - DY, SX + x - DX) if inside else 0
+                    if got[y * D_COLS + x] != exp:
+                        raise AssertionError(
+                            f"rank {my_rank} slot[{s}] ({y},{x})="
+                            f"{got[y * D_COLS + x]} expected {exp}"
+                        )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 # ── spawn harness ──────────────────────────────────────────────────────────
 
 
@@ -653,3 +778,10 @@ def test_sdma_put_nosignal():
 def test_sdma_put_aggregate():
     """Aggregate puts batch into the SQ; one commit rings the doorbell for all."""
     _run(_worker_put_aggregate, world_size=2, coop_name="THREAD")
+
+
+@pytest.mark.parametrize("world_size", [2, 8])
+@pytest.mark.parametrize("coop_name", ["THREAD", "WARP", "BLOCK"])
+def test_sdma_put2d(coop_name, world_size):
+    """put2d moves exactly the rect; THREAD batches 64 one-row rects in one run."""
+    _run(_worker_put2d, world_size=world_size, coop_name=coop_name)

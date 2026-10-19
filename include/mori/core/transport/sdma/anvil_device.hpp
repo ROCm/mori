@@ -80,6 +80,28 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
   return copy_packet;
 }
 
+// One packet for `height` rows of `widthBytes`; offsets are folded into the
+// base addresses, so the packet's x/y/z stay 0.
+__device__ __forceinline__ SDMA_PKT_COPY_LARGE_SUB_WINDOW
+CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
+                   uint32_t widthBytes, uint32_t height) {
+  SDMA_PKT_COPY_LARGE_SUB_WINDOW packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_COPY;
+  packet.HEADER_UNION.sub_op = SDMA_SUBOP_COPY_LINEAR_LARGE_SUB_WINDOW;
+
+  packet.src_addr_31_0 = (uint32_t)(uintptr_t)srcBuf;
+  packet.src_addr_63_32 = (uint32_t)((uintptr_t)srcBuf >> 32);
+  packet.src_pitch = srcPitch - 1;
+  packet.dst_addr_31_0 = (uint32_t)(uintptr_t)dstBuf;
+  packet.dst_addr_63_32 = (uint32_t)((uintptr_t)dstBuf >> 32);
+  packet.dst_pitch = dstPitch - 1;
+  packet.rect_x = widthBytes - 1;
+  packet.rect_y = height - 1;
+
+  return packet;
+}
+
 __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
   SDMA_PKT_ATOMIC packet = {};
 
@@ -267,6 +289,17 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   uint64_t offset = 0;
   auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LINEAR), offset);
   auto packet = CreateCopyPacket(src, dst, size);
+  uint64_t pendingWptr = base;
+  handle.placePacket(packet, pendingWptr, offset);
+  handle.submitPacket(base, pendingWptr);
+}
+
+__device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, uint32_t dstPitch,
+                                      void* src, uint32_t srcPitch, uint32_t widthBytes,
+                                      uint32_t height) {
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LARGE_SUB_WINDOW), offset);
+  auto packet = CreateCopy2DPacket(src, srcPitch, dst, dstPitch, widthBytes, height);
   uint64_t pendingWptr = base;
   handle.placePacket(packet, pendingWptr, offset);
   handle.submitPacket(base, pendingWptr);
