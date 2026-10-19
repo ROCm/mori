@@ -400,8 +400,12 @@ class CollectivesFacade {
         cco::ccoDevCommDestroy(ccoComm, &devComm);
         cco::ccoCommDestroy(ccoComm);
       }
-      if (groupCounters != nullptr) HIP_RUNTIME_CHECK(hipFree(groupCounters));
-      if (pinnedPairs != nullptr) HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs));
+      if (groupCounters != nullptr) {
+        HIP_RUNTIME_CHECK(hipFree(groupCounters));
+      }
+      if (pinnedPairs != nullptr) {
+        HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs));
+      }
     }
   };
 
