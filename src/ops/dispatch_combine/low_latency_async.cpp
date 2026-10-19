@@ -95,7 +95,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> 
 
     index_t destTokOffset = SendBufSlotOffset(config, destPe, destTokId);
 
-    uint8_t* stagingPtr = args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+    uint8_t* stagingPtr = args.interNodeTokBufs.dispatchStaging->template GetAs<uint8_t*>();
     size_t stagingTokOffset = destTokOffset * xferBytes;
     core::WarpCopy<uint8_t, 4>(
         stagingPtr + stagingTokOffset,
@@ -200,7 +200,7 @@ __device__ void EpDispatchLowLatencyAsyncSendCopyMultiBlock_body(EpDispatchCombi
 
     index_t srcTokId = entryId / config.numExpertPerToken;
 
-    uint8_t* stagingPtr = args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+    uint8_t* stagingPtr = args.interNodeTokBufs.dispatchStaging->template GetAs<uint8_t*>();
     uint8_t* dst = stagingPtr + destTokOffset * xferBytes;
 
     // Each sub-warp copies its portion of hidden bytes
@@ -261,7 +261,7 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
         // waits for its completion before publishing the signal separately.
         if (myPe != destPe && thisChunkTokenNum > 0) {
           shmem::ShmemPutMemNbiThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
-                                      args.interNodeTokBufs.staging, localOffset,
+                                      args.interNodeTokBufs.dispatchStaging, localOffset,
                                       thisChunkTokenNum * xferBytes, destPe, qpId);
         }
       } else {
@@ -276,7 +276,7 @@ __device__ void EpDispatchLowLatencyAsyncSendTransfer_body(EpDispatchCombineArgs
           // put-with-signal makes the payload visible to the receiver before the
           // signal, without an intervening quiet.
           shmem::ShmemPutMemNbiSignalThread(args.interNodeTokBufs.dispatchInp, remoteOffset,
-                                            args.interNodeTokBufs.staging, localOffset,
+                                            args.interNodeTokBufs.dispatchStaging, localOffset,
                                             thisChunkTokenNum * xferBytes, args.recvTokenNumMemObj,
                                             signalOffset, signalValue, core::atomicType::AMO_SET,
                                             destPe, qpId);
@@ -322,16 +322,11 @@ __device__ void EpDispatchLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs
     }
   }
 
-  // Incoming signals do not guarantee completion of our outgoing RDMA transfers.
-  // Drain transfers before combine reuses the shared staging buffer.
-  for (int destPe = blockId; destPe < npes; destPe += blockNum) {
-    bool isSdmaPeer = IsSdmaPeer(destPe);
-    for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
-      if (laneId == 0 && !isSdmaPeer && myPe != destPe) {
-        shmem::ShmemQuietThread(destPe, qpId);
-      }
-    }
-  }
+  // Incoming signals do not guarantee completion of our outgoing RDMA transfers,
+  // yet no drain is needed here. Combine sends from `staging`, so it never touches
+  // the in-flight `dispatchStaging` payload, and the next dispatch reuses
+  // dispatchStaging only after the current combine has received all peer signals,
+  // which implies peers have already consumed this dispatch payload.
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -377,7 +372,7 @@ __device__ void EpDispatchLowLatencyAsyncRecvCopyMultiBlock_body(EpDispatchCombi
   // Copy data — multiple warps cooperate per token
   uint8_t* stagingPtr = (destPe != myPe)
                             ? args.interNodeTokBufs.dispatchInp->template GetAs<uint8_t*>()
-                            : args.interNodeTokBufs.staging->template GetAs<uint8_t*>();
+                            : args.interNodeTokBufs.dispatchStaging->template GetAs<uint8_t*>();
   stagingPtr += SendBufSlotOffset(config, destPe, 0) * xferBytes;
 
   int peWarps = blocksPerPe * warpNum;
@@ -599,8 +594,13 @@ __device__ void EpCombineLowLatencyAsyncRecvTransfer_body(EpDispatchCombineArgs<
   }
 
   // Incoming signals do not guarantee completion of our outgoing RDMA transfers.
-  // Drain transfers before the next dispatch reuses the shared staging buffer
-  // or ~EpDispatchCombineHandle() frees it.
+  // Reuse alone no longer requires a drain here: the next dispatch sends from
+  // dispatchStaging, so the next combine reuses `staging` only after that
+  // dispatch has received all peer signals, which implies peers have already
+  // consumed this combine payload.
+  // Still drain outgoing RDMA transfers, because the handle may be destroyed
+  // without a following cycle and ~EpDispatchCombineHandle() frees `staging`
+  // while transfers may still be in flight.
   for (int destPe = blockId; destPe < npes; destPe += blockNum) {
     bool isSdmaPeer = IsSdmaPeer(destPe);
     for (int qpId = warpId; qpId < config.numQpPerPe; qpId += warpNum) {
