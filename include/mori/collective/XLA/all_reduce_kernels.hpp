@@ -61,8 +61,8 @@ namespace collective {
 //                   counter (every block counts in once per launch, never
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
 //                   which elects the tail owner.
-//   barrierCtr    : symmetric-heap uint64[npes] flags for PushEntryBarrier (block 0, before
-//                   Phase 1)
+//   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
+//                   collective (GenBarrier in block 0, before Phase 1)
 //
 // Phase 1-3 are the reduce-scatter push algorithm: block 0 SDMA-scatters each
 // peer's source slice into that peer's staging slot, then every block loops the S
@@ -141,7 +141,11 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // the other push collectives, and the slice counter is cleared only after
     // the b=1 release, so a peer may finish before my previous launch is done
     // with them. Lane 0 enters after its stores above, in program order.
-    if (threadIdx.x < warpSize) PushEntryBarrier(barrierCtr, myPe, npes, heapWin->stride4G);
+    if (threadIdx.x < warpSize) {
+      // Every lane reads my slot before lane myPe overwrites it (same wave).
+      const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
+      GenBarrier(barrierCtr, gen + 2, myPe, npes, heapWin->stride4G);
+    }
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -234,7 +238,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // The block whose count completed b=1 is the last one out of every slice wait,
   // so no add to the packed slice counter is still unseen and it may clear it.
   // That need not precede the b=1 release: peers only ADD into it again from
-  // their next launch's scatter, behind PushEntryBarrier, which needs my next
+  // their next launch's scatter, behind the entry GenBarrier, which needs my next
   // launch to have started.
   //
   // Both broadcasts share one packed counter, so it can only be cleared once
@@ -280,13 +284,13 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 // computed -- there is no cross-block dependency, and therefore no mid-kernel
 // barrier of any kind.
 //
-// Synchronization is the same two PushEntryBarrier rounds as
-// ReduceScatterPullKernel, so back-to-back launches need no host barrier:
+// Synchronization is the same two GenBarrier rounds as ReduceScatterPullKernel
+// (entry posts gen+1, exit gen+2, gen = arrived[myPe] & ~1), so back-to-back
+// launches need no host barrier:
 //   * entry: no block may read a peer's input or write a peer's output before
 //     that peer has entered this launch (its producers of input and consumers
-//     of output have retired). Block 0 runs the barrier and releases the other
-//     blocks through groupCounters[1]; all blocks must be co-resident
-//     (grid <= CU count).
+//     of output have retired). Block 0 posts; every block waits on the local
+//     slots itself, so blocks never wait on each other.
 //   * exit: the last block out waits until every peer has finished reading my
 //     input and writing my output, so "kernel done" means "output complete and
 //     input reusable". Every other block returns the moment it has counted in.
@@ -295,31 +299,23 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 //   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
 //   output        : raw symmetric-heap pointer, N = npes*chunkElems elements (on
 //                   exit every slot p holds the reduction over all PEs of shard p)
-//   groupCounters : plain device buffer (>= 2 uint32), zeroed once by the host.
-//                   [0] elects the last block, [1] is the entry go-flag; both
-//                   are reset by the last block.
-//   barrierCtr    : symmetric-heap uint64[npes] flags shared with the push collectives.
+//   groupCounters : plain device buffer, zeroed once by the host. [0] elects the
+//                   last block; atomicInc wraps it back to 0, so no reset.
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
+//                   collective (see GenBarrier).
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 AllReducePullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
                     const T* __restrict__ input, T* __restrict__ output,
                     size_t chunkElems, uint32_t* __restrict__ groupCounters,
-                    uint64_t* __restrict__ barrierCtr) {
+                    uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
   // My reduced shard lives in output slot myPe, exactly as in the push kernel.
   T* __restrict__ myShard = output + static_cast<size_t>(myPe) * chunkElems;
 
-  auto* go = cco::impl::global(&groupCounters[1]);
-  if (blockIdx.x == 0) {
-    if (threadIdx.x < warpSize) {
-      PushEntryBarrier(barrierCtr, myPe, NPES, stride4G);
-      if (threadIdx.x == 0) __hip_atomic_store(go, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-    }
-  } else if (threadIdx.x == 0) {
-    while (__hip_atomic_load(go, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == 0) {
-      __builtin_amdgcn_s_sleep(1);
-    }
-  }
+  // In block 0's first wave every lane loads this before lane myPe posts.
+  const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
+  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
   __syncthreads();
 
   // === Reduce + fan out, in one pass =========================================
@@ -352,19 +348,14 @@ AllReducePullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
   // Unlike reduce-scatter, the remote stores ARE the payload: every wave must
   // publish them before its block counts in, since the barrier's release fence
   // only covers the last block's wave.
-  __threadfence_system();
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");   // system-scope release only
   __syncthreads();
   if (threadIdx.x < warpSize) {
     uint32_t last = 0;
-    if (threadIdx.x == 0) last = (atomicAdd(&groupCounters[0], 1u) + 1 == gridDim.x);
-    if (BroadcastWarp(last, 0)) {
-      PushEntryBarrier(barrierCtr, myPe, NPES, stride4G);
-      // Every block has counted in, so all are past the go-flag wait.
-      if (threadIdx.x == 0) {
-        groupCounters[0] = 0;
-        groupCounters[1] = 0;
-      }
+    if (threadIdx.x == 0) {
+      last = atomicInc(&groupCounters[0], gridDim.x - 1) == gridDim.x - 1;
     }
+    if (BroadcastWarp(last, 0)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
   }
 }
 } // namespace collective

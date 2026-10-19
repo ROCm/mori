@@ -66,7 +66,7 @@ static_assert(kBcastSlot < kSdmaSignalSlotsUsed, "broadcast counter must be a ch
 
 // groupCounters layout (local uint32 buffer): [0, kRSPushMaxSlices) per-slice
 // arrival counters, then all-reduce's two broadcast release counters, then the
-// pull reduce-scatter's launch epoch (see FlagBarrierSignal / FlagBarrierWait),
+// a reserved (currently unused) slot,
 // then all-reduce's per-launch b=1 release target (elects the tail owner).
 static constexpr int kBcastFlagIdx = kRSPushMaxSlices;
 static constexpr int kPullEpochIdx = kBcastFlagIdx + 2;
@@ -160,6 +160,20 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
                                              : __HIP_MEMORY_SCOPE_AGENT);
   }
 #endif
+}
+
+template <StreamScope Scope, class T>
+__device__ __forceinline__ T AtomicLoad(const T* p) {
+  return __hip_atomic_load(cco::impl::global(p), __ATOMIC_RELAXED,
+              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
+                                    : __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <StreamScope Scope, class T>
+__device__ __forceinline__ void AtomicStore(T* p, T v) {
+  __hip_atomic_store(cco::impl::global(p), v, __ATOMIC_RELAXED,
+              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
+                                    : __HIP_MEMORY_SCOPE_AGENT);
 }
 
 #define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane(x)
@@ -506,48 +520,64 @@ __device__ __forceinline__ void SdmaPostPerPeer(mori::cco::ccoSdmaContext sdma, 
 }
 
 // ---------------------------------------------------------------------------
-// Entry barrier for the SDMA push collectives: executed by ONE full wave (the
-// block's first, npes <= warpSize) before its block issues any SDMA, followed by
-// a __syncthreads(). A peer that has arrived
-// has entered this launch, so its previous kernel on its stream has retired:
-// it no longer reads the staging / recv slots we are about to overwrite, and
-// its end-of-kernel signalBuf resets have landed, so our ADDs cannot be erased.
+// Generation barrier shared by every push and pull collective.
 //
-// `ctr` is a symmetric-heap uint64[npes] (zeroed once at facade creation, never
-// reset). Slot p of every PE's copy is written only by PE p, so my own slot
-// ctr[myPe] doubles as my barrier epoch. Arriving posts the new epoch into slot
-// myPe of every PE's copy (plain one-way stores, no remote RMW), then waits on
-// local loads only, until every slot of my copy has reached that epoch. Lane p
-// posts to and polls for PE p, so one load + wave vote checks every slot.
-// `>= epoch` is safe against a fast peer: it can only post epoch e+1 after its
-// launch e completes, which requires data from me, which I send only after
-// leaving this wait. The pull reduce-scatter and all-reduce call it twice per
-// launch (entry + exit); that is fine as long as every PE issues the same
-// sequence of calls.
+// The array is a symmetric-heap uint64[npes] (barrierCtr; zeroed once at facade
+// creation, never reset). Slot p of every PE's copy is written only by PE p, so
+// my own slot doubles as the launch generation: between launches it is always
+// even, and gen = slot & ~1. Every launch advances it by exactly 2 whatever the
+// collective -- push kernels post gen+2 in one entry round, pull kernels post
+// gen+1 at entry and gen+2 at exit -- so as long as every PE issues the same
+// sequence of collectives, every PE posts the same value in every round.
+//
+// Arriving posts the value into slot myPe of every PE's copy (plain one-way
+// stores, no remote RMW), then waits on local loads only, until every slot of my
+// copy has reached it. Lane p posts to and polls for PE p, so one load + wave
+// vote checks every slot. `>=` tolerates a fast peer that already posted a
+// later round.
+//
+// A peer that has arrived has entered this launch, so its previous kernel on its
+// stream has retired: it no longer reads the staging / recv slots we are about
+// to overwrite, and its end-of-kernel signalBuf resets have landed, so our ADDs
+// cannot be erased.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ void PushEntryBarrier(uint64_t* ctr, int myPe, int npes,
-                                                 int32_t stride4G) {
+
+// One barrier round on a symmetric uint64[npes] `arrived` array: post `value`
+// into slot myPe of every PE's copy, then wait (local loads only) until every
+// slot of my copy has reached it. Executed by ONE full wave (npes <= warpSize)
+// per calling block. With LeaderOnly, only block 0 posts and every calling
+// block just waits, so a whole grid can gate on one arrival per PE.
+// `value` must be identical on every PE for a given round and strictly increase
+// across rounds on the same array; `>=` then tolerates a fast peer that already
+// posted a later round.
+template <bool LeaderOnly = false>
+__device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, int myPe,
+                                           int npes, int32_t stride4G) {
   const int lane = __lane_id();
   const bool active = lane < npes;
-  // Every lane reads my slot before lane myPe overwrites it (same wave).
-  const uint64_t epoch =
-      __hip_atomic_load(cco::impl::global(&ctr[myPe]), __ATOMIC_RELAXED,
-                        __HIP_MEMORY_SCOPE_AGENT) + 1;
-  // One system release orders the caller's prior stores ahead of every arrival.
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-  if (active) {
-    const int32_t diff = (lane - myPe) * stride4G;
-    auto* dst = cco::impl::global(reinterpret_cast<uint64_t*>(
-        reinterpret_cast<uint8_t*>(&ctr[myPe]) + (static_cast<uint64_t>(diff) << 32)));
-    __hip_atomic_store(dst, epoch, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  if (!LeaderOnly || blockIdx.x == 0) {
+    // One system release orders the caller's prior stores ahead of every arrival.
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+    if (active) {
+      const int32_t diff = (lane - myPe) * stride4G;
+      auto* dst = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&arrived[myPe]) +
+                                             (static_cast<uint64_t>(diff) << 32));
+      AtomicStore<ESystemScope>(dst, value);
+    }
   }
   while (true) {
-    const uint64_t v = active ? __hip_atomic_load(cco::impl::global(&ctr[lane]),
-                                                  __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)
-                              : epoch;
-    if (__all(v >= epoch)) break;
+    const uint64_t v = active ? AtomicLoad<ESystemScope>(&arrived[lane]) : value;
+    if (__all(v >= value)) break;
     __builtin_amdgcn_s_sleep(1);
   }
+  /*if(active) {
+    while (true) {
+      const uint64_t v =AtomicLoad<ESystemScope>(&arrived[lane]);
+      if (v >= value) break;
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }*/
+  
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
 
