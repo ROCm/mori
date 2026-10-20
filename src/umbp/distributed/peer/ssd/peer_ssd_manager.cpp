@@ -845,6 +845,11 @@ std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeys() const {
   return SnapshotOwnedKeysLocked();
 }
 
+size_t PeerSsdManager::OwnedKeyCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return owned_.size();
+}
+
 std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeysForFullSync() {
   std::lock_guard<std::mutex> lock(mutex_);
   auto out = SnapshotOwnedKeysLocked();
