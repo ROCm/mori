@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -304,6 +305,39 @@ class BlockingResolveBackend final : public MockBackend {
       std::lock_guard<std::mutex> lock(mutex_);
       released_ = true;
     }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+// Parks one backend commit, the step where an SSD medium writes the device.
+class BlockingCommitBackend final : public MockBackend {
+ public:
+  explicit BlockingCommitBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      entered_ = true;
+      cv_.notify_all();
+      cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
+    }
+    return MockBackend::BatchCommit(entries);
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
     cv_.notify_all();
   }
 
@@ -1028,6 +1062,40 @@ TEST(PeerPool, SlowResolveDoesNotBlockUnrelatedPreferredBackend) {
   ASSERT_EQ(fast_result.size(), 1u);
   EXPECT_TRUE(fast_result.front().resolved.found);
   EXPECT_EQ(slow_resolve.get().size(), 1u);
+}
+
+TEST(PeerPool, SlowCommitDoesNotBlockLookupsOrReads) {
+  BackendRegistry registry;
+  auto slow = std::make_unique<BlockingCommitBackend>(TierType::DRAM);
+  auto* blocking = slow.get();
+  ASSERT_TRUE(registry.Register("slow", std::move(slow)));
+  ASSERT_TRUE(registry.Register("fast", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "fast-key", "fast");
+
+  auto allocation = pool.BatchAllocate({PutRequest("slow-key", "slow")}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  auto commit = std::async(std::launch::async, [&] {
+    return pool.BatchCommit(
+        {PoolCommitRequest{{allocation.backend_id, allocation.allocation.slot_id}, "slow-key"}});
+  });
+  ASSERT_TRUE(blocking->WaitUntilEntered());
+
+  auto lookups = std::async(std::launch::async, [&] {
+    return std::make_tuple(pool.BatchContains({"fast-key"}), pool.BatchResolve({"fast-key"}, false),
+                           pool.BatchAllocate({PutRequest("slow-key", "slow")}).front());
+  });
+  const auto status = lookups.wait_for(std::chrono::seconds(2));
+  blocking->Release();
+
+  EXPECT_EQ(status, std::future_status::ready);
+  const auto [contains, resolved, second_put] = lookups.get();
+  EXPECT_TRUE(contains.front());
+  EXPECT_TRUE(resolved.front().resolved.found);
+  EXPECT_TRUE(second_put.in_flight);  // the committing key stays reserved
+  EXPECT_TRUE(commit.get().front().commit.success);
+  EXPECT_EQ(pool.PlacementBackend("slow-key"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("slow"))});
 }
 
 TEST(PeerPool, ResolveMissDoesNotEraseConcurrentCommit) {

@@ -580,7 +580,9 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
 
 std::vector<PoolCommitResult> PeerPool::BatchCommit(
     const std::vector<PoolCommitRequest>& requests) {
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  // Backend commits run without operation_mutex_; this keeps ClearLocal out meanwhile.
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<PoolCommitResult> out(requests.size());
   if (backends_ == nullptr) return out;
 
@@ -614,38 +616,48 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
       release_pending(requests[i].slot);
       continue;
     }
+    // Claimed: a second commit of this slot finds nothing, and the key stays
+    // reserved so racing puts see it in flight. No expiry: a hung commit pins it.
     accepted_slots.insert(slot_key);
+    pending_slots_.erase(slot);
+    pending->second.expires_at = std::chrono::steady_clock::time_point::max();
     by_backend[requests[i].slot.backend_id].push_back(i);
   }
 
+  // Unlocked: an SSD commit is the device write, and every lookup and read
+  // needs this lock.
+  operation_lock.unlock();
+  std::map<uint32_t, std::vector<CommitResult>> results;
   for (const auto& [backend_id, indices] : by_backend) {
     auto* backend = backends_->Get(backend_id);
-    if (backend == nullptr) {
-      for (size_t index : indices) release_pending(requests[index].slot);
-      continue;
-    }
-
+    if (backend == nullptr) continue;
     std::vector<CommitRequest> backend_requests;
     backend_requests.reserve(indices.size());
     for (size_t index : indices) {
       backend_requests.push_back(
           CommitRequest{requests[index].slot.local_slot_id, requests[index].key});
     }
+    results[backend_id] = backend->BatchCommit(backend_requests);
+  }
+  operation_lock.lock();
 
-    auto results = backend->BatchCommit(backend_requests);
+  for (const auto& [backend_id, indices] : by_backend) {
+    const auto& backend_results = results[backend_id];
     for (size_t i = 0; i < indices.size(); ++i) {
-      const size_t index = indices[i];
-      if (i >= results.size()) {
-        release_pending(requests[index].slot);
-        continue;
+      const PoolCommitRequest& request = requests[indices[i]];
+      if (i < backend_results.size()) {
+        out[indices[i]].backend_id = backend_id;
+        out[indices[i]].commit = backend_results[i];
+        if (backend_results[i].success) {
+          placements_[request.key] = backend_id;
+          TouchLocked(request.key);
+        }
       }
-      out[index].backend_id = backend_id;
-      out[index].commit = results[i];
-      if (results[i].success) {
-        placements_[requests[index].key] = backend_id;
-        TouchLocked(requests[index].key);
+      auto pending = pending_keys_.find(request.key);
+      if (pending != pending_keys_.end() && pending->second.backend_id == backend_id &&
+          pending->second.local_slot_id == request.slot.local_slot_id) {
+        pending_keys_.erase(pending);
       }
-      release_pending(requests[index].slot);
     }
   }
   MaybeEnqueueWatermarkOffloadLocked();
