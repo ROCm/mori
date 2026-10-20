@@ -21,7 +21,7 @@
 // SOFTWARE.
 /* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
 /*
- * Copyright (c) 2023 Advanced Micro Devices, Inc.  All rights reserved.
+ * Copyright (c) 2018-2026 Advanced Micro Devices, Inc.  All rights reserved.
  */
 
 #ifndef IONIC_DV_H
@@ -29,12 +29,17 @@
 
 #include <infiniband/verbs.h>
 #include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct ibv_cq;
 struct ibv_qp;
+
+#ifndef RDMA_DRIVER_IONIC
+#define RDMA_DRIVER_IONIC 21
+#endif
 
 /** IONIC_PD_TAG - tag used for parent domain resource allocation. */
 #define IONIC_PD_TAG ((uint64_t)RDMA_DRIVER_IONIC << 32)
@@ -53,7 +58,8 @@ struct ibv_qp;
 /** IONIC_UDMA_MASK_HIGH - flag represents the udma1 pipeline in the udma mask. */
 #define IONIC_UDMA_MASK_HIGH 2
 
-#define IONIC_DV_PUEC_NPORTS_MAX 8
+#define IONIC_DV_MULTIPLANE_NPORTS_MAX 8
+#define IONIC_DV_PUEC_NPORTS_MAX IONIC_DV_MULTIPLANE_NPORTS_MAX
 
 /** struct ionic_dv_ctx - Context information for gpu-initiated rdma. */
 struct ionic_dv_ctx {
@@ -85,7 +91,27 @@ struct ionic_dv_qp {
   struct ionic_dv_queue sq;
 };
 
-/** struct ionic_puec_route - Info needed to setup a PUEC plane route. */
+/** struct ionic_dv_multiplane_route - Info needed to setup a multiplane route. */
+struct ionic_dv_multiplane_route {
+  union ibv_gid dgid;
+  union ibv_gid sgid;
+  uint32_t flow_label;
+  uint8_t hop_limit;
+  uint8_t traffic_class;
+  uint8_t sl;
+  uint8_t rsvd[5];
+  uint32_t flags;
+};
+
+/** struct ionic_dv_multiplane_conn_info - Multiplane connection information. */
+struct ionic_dv_multiplane_conn_info {
+  uint16_t num_planes;
+  struct ionic_dv_multiplane_route* mp_routes;
+  union ibv_gid src_gid;
+  union ibv_gid dest_gid;
+};
+
+/** Deprecated: use struct ionic_dv_multiplane_route instead */
 struct ionic_dv_puec_route {
   union ibv_gid dgid;
   union ibv_gid sgid;
@@ -96,6 +122,54 @@ struct ionic_dv_puec_route {
   uint8_t rsvd[5];
   uint32_t flags;
 };
+
+/**
+ * struct ionic_dmabuf_alloc_result - Result of a DMABUF ring allocation.
+ * @fd:     DMABUF file descriptor.  The allocator owns it; the provider only
+ *          borrows it and never closes or duplicates it.  The provider hands it to
+ *          the kernel in the CQ/QP create command, where the import takes its own
+ *          dma-buf reference, and otherwise keeps it only to pass back to
+ *          ionic_dmabuf_free_fn.  That callback runs after the CQ/QP destroy
+ *          command has dropped the kernel reference, and is where the allocator
+ *          closes the fd.  The same fd may be returned for several rings at
+ *          different @offset values (page aligned).
+ * @offset: Byte offset within the DMABUF at which the ring starts.
+ * @ptr:    Optional CPU mapping of the ring.  If non-NULL, the provider
+ *          will use this address for ibv_post_send(), ibv_post_recv(), and
+ *          ibv_poll_cq().  If NULL, those functions must not be called.
+ */
+struct ionic_dmabuf_alloc_result {
+  int fd;
+  uint64_t offset;
+  void* ptr;
+};
+
+/**
+ * ionic_dmabuf_alloc_fn - Allocate a DMABUF on behalf of the provider.
+ *
+ * @pd:            Parent domain of the allocation.
+ * @pd_context:    Context set by ionic_dv_pd_set_dmabuf_alloc().
+ * @size:          Size in bytes of the buffer to allocate.
+ * @resource_type: IONIC_PD_TAG_* identifying the buffer type.
+ * @result:        Output: fd and offset of the allocated buffer.
+ *
+ * Return: 0 on success, ECANCELED to try another allocator (bare VA), or other errno on failure.
+ */
+typedef int ionic_dmabuf_alloc_fn(struct ibv_pd* pd, void* pd_context, size_t size,
+                                  uint64_t resource_type, struct ionic_dmabuf_alloc_result* result);
+
+/**
+ * ionic_dmabuf_free_fn - Free a DMABUF allocated by ionic_dmabuf_alloc_fn.
+ *
+ * @pd:            Parent domain of the allocation.
+ * @pd_context:    Context set by ionic_dv_pd_set_dmabuf_alloc().
+ * @fd:            DMABUF fd from the alloc callback, still open.  Together with
+ *                 @offset it identifies the ring being freed.
+ * @offset:        Offset from the alloc callback.
+ * @resource_type: IONIC_PD_TAG_* identifying the buffer type.
+ */
+typedef void ionic_dmabuf_free_fn(struct ibv_pd* pd, void* pd_context, int fd, uint64_t offset,
+                                  uint64_t resource_type);
 
 /**
  * ionic_dv_is_ionic_ctx - Test if context belongs to ionic provider.
@@ -159,6 +233,21 @@ uint8_t ionic_dv_cq_get_udma_mask(struct ibv_cq* ibcq);
 uint8_t ionic_dv_qp_get_udma_idx(struct ibv_qp* ibqp);
 
 /**
+ * ionic_dv_pd_set_dmabuf_alloc - Register DMABUF ring allocation callbacks on a pd.
+ *
+ * When set, the provider calls @alloc instead of the standard parent domain
+ * alloc callback to obtain descriptor ring memory.  The callback returns a
+ * dmabuf fd, byte offset and optional virtual address.
+ *
+ * @ibpd:       Protection domain to configure.
+ * @alloc:      Callback to allocate a descriptor ring, or NULL.
+ * @free:       Callback to free a descriptor ring, or NULL.
+ * @pd_context: Opaque pointer passed to both callbacks.
+ */
+int ionic_dv_pd_set_dmabuf_alloc(struct ibv_pd* ibpd, ionic_dmabuf_alloc_fn* alloc,
+                                 ionic_dmabuf_free_fn* free, void* pd_context);
+
+/**
  * ionic_dv_pd_set_sqcmb - Specify send queue preference for controller memory bar.
  *
  * Send queues associated with this pd will use the controller memory bar according to
@@ -173,7 +262,12 @@ int ionic_dv_pd_set_sqcmb(struct ibv_pd* ibpd, bool enable, bool expdb, bool req
 /**
  * ionic_dv_pd_set_rqcmb - Specify receive queue preference for controller memory bar.
  *
- * See ionic_dv_pd_set_sqcmb().
+ * Receive queues associated with this pd will use the controller memory bar according to
+ * this preference at the time of queue creation.
+ *
+ * @enable - Allow the use of the controller memory bar.
+ * @expdb - Allow the use of express doorbell optimizations.
+ * @require - Require preferences to be met, no fallback.
  */
 int ionic_dv_pd_set_rqcmb(struct ibv_pd* ibpd, bool enable, bool expdb, bool require);
 
@@ -292,11 +386,26 @@ int ionic_dv_get_cq(struct ionic_dv_cq* dvcq, struct ibv_cq* ibcq, uint8_t udma_
 int ionic_dv_get_qp(struct ionic_dv_qp* dvqp, struct ibv_qp* ibqp);
 
 /**
+ * ionic_dv_qp_set_multiplane_conn_info - Set multiplane connection information for a QP.
+ * This is used in multiplane environments to configure both routing information
+ * and GIDs used for routing that may differ from the real port GIDs.
+ * @ibqp: Queue pair to configure
+ * @conn_info: Multiplane connection information including routes and GIDs
+ *
+ * Returns 0 on success, error code on failure.
+ */
+int ionic_dv_qp_set_multiplane_conn_info(struct ibv_qp* ibqp,
+                                         const struct ionic_dv_multiplane_conn_info* conn_info);
+
+/**
  * ionic_dv_qp_set_puec_plane_route - set route info for a PUEC plane.
+ * Deprecated: use ionic_dv_qp_set_multiplane_conn_info instead.
  */
 int ionic_dv_qp_set_puec_plane_route(struct ibv_qp* ibqp, uint8_t plane_idx,
                                      struct ionic_dv_puec_route* ipr);
+
 #ifdef __cplusplus
 }
 #endif
+
 #endif /* IONIC_DV_H */
