@@ -315,6 +315,10 @@ class KernelConfig(NamedTuple):
     block_num: int
     warp_per_block: int
     rdma_block_num: int | None = None
+    # Ordinary-v2 combine only: compile the load-first gather (JSON
+    # combine_load_first). Part of the key, so buckets that share a geometry
+    # but differ here get separate kernels.
+    load_first: bool = False
 
 
 class ScheduleEntry(NamedTuple):
@@ -328,7 +332,9 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
 
     Intra adapts the Python-table/explicit schedule resolved by Config. Inter
     resolves JSON and overrides, then includes the family crossover in the
-    schedule. Loading and selection never depend on the declared token capacity.
+    schedule. Loading and selection never depend on the declared token capacity;
+    that includes the combine load-first choice, which comes from each bucket's
+    JSON rule (combine_load_first).
     """
     if not cfg.is_internode:
         rows = cfg.schedule or (
@@ -356,7 +362,7 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
     for ceiling in [*sorted(edges), None]:
         probe = ceiling if ceiling is not None else max(edges, default=0) + 1
         family = internode_kernel_family(cfg, probe)
-        _, dispatch, combine = pick_bucket(geometries, probe)
+        _, dispatch, combine, load_first = pick_bucket(geometries, probe)
         entries.append(
             ScheduleEntry(
                 ceiling,
@@ -371,6 +377,7 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
                     block_num=combine[0],
                     warp_per_block=combine[2],
                     rdma_block_num=combine[1],
+                    load_first=load_first,
                 ),
             )
         )
@@ -386,6 +393,7 @@ def describe_schedule(cfg, schedule) -> str:
         return (
             f"{spec.family} B/R/W="
             f"{spec.block_num}/{spec.rdma_block_num}/{spec.warp_per_block}"
+            + (" load-first" if spec.load_first else "")
         )
 
     num_experts = cfg.world_size * cfg.num_experts_per_rank
@@ -570,7 +578,8 @@ def _geometry_from_env(name):
 
 
 def internode_schedule(cfg):
-    """Resolve (inclusive token ceiling, dispatch B/R/W, combine B/R/W).
+    """Resolve (inclusive token ceiling, dispatch B/R/W, combine B/R/W,
+    combine load-first).
 
     Either sweep env override bypasses both tables. Otherwise explicit config
     fields override the selected family's table, with config defaults for an
@@ -590,6 +599,7 @@ def internode_schedule(cfg):
             (
                 None,
                 *(fit_internode_geometry(g or d) for g, d in zip(overrides, defaults)),
+                False,
             )
         ]
 
@@ -631,7 +641,9 @@ def internode_schedule(cfg):
                 for name, value in zip(fields, geometry)
             )
             geometries.append(fit_internode_geometry(geometry))
-        row = (ceiling, *geometries)
+        # The load-first gather exists in the ordinary combine only.
+        load_first = bool(tuned and tuned[3]) and family == "v2"
+        row = (ceiling, *geometries, load_first)
         # Equal geometry can span a crossover here. resolve_schedule() restores
         # the family boundary when producing the executable configurations.
         if rows and rows[-1][1:] == row[1:]:
@@ -692,18 +704,21 @@ def internode_buckets(
     kernel_family="v2",
     experts_per_rank=None,
 ):
-    """Return (token ceiling, dispatch geometry, combine geometry) rows.
+    """Return (token ceiling, dispatch geometry, combine geometry,
+    combine load-first) rows.
 
     Each phase matches its own dtype and stored width (packed for FP4 dispatch).
     Total experts (world_size * experts_per_rank) and top-k name the table file
     (v2_table_filename), so a file only holds its own expert count. Rules still
     record top-k, and a rule without it is not a wildcard.
     An untuned phase is None, and a wholly untuned shape returns None.
+    A combine rule's optional ``combine_load_first`` (default false) selects
+    the load-first gather for its bucket.
     """
     if topk is None or experts_per_rank is None:
         return None
 
-    from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR, TuningConfigManager
+    from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR
 
     kernel_type = _V2_KERNEL_TYPES.get(kernel_family)
     if kernel_type is None:
@@ -740,6 +755,10 @@ def internode_buckets(
             if rule["dtype"] == dtype_str
             and rule["hidden_dim"] == hidden_dims[phase]
             and rule.get("topk") == topk
+            and (
+                phase == "dispatch"
+                or (not rule["zero_copy"] and rule["quant_type"] == "none")
+            )
         ]
         edges.update(rule["num_tokens"] for rule in matched[phase])
     if not edges:
@@ -747,26 +766,28 @@ def internode_buckets(
 
     table = []
     for num_tokens in sorted(edges):
-        geometries = []
+        selected = {}
         for phase in _INTERNODE_PHASES:
-            filters = (
-                {"zero_copy": False, "quant_type": "none"} if phase == "combine" else {}
+            # Rules are sorted by num_tokens: the tightest ceiling, else the last.
+            rules = matched[phase]
+            selected[phase] = next(
+                (rule for rule in rules if num_tokens <= rule["num_tokens"]),
+                rules[-1] if rules else None,
             )
-            params = TuningConfigManager.lookup(
-                matched[phase],
-                dtype=dtypes[phase],
-                num_tokens=num_tokens,
-                hidden_dim=hidden_dims[phase],
-                topk=topk,
-                **filters,
+        geometries = [
+            fit_internode_geometry(
+                (
+                    (rule["block_num"], rule["rdma_block_num"], rule["warp_per_block"])
+                    if rule is not None
+                    else None
+                ),
+                clamp_to_cu=True,
             )
-            geometry = (
-                (params.block_num, params.rdma_block_num, params.warp_per_block)
-                if params is not None
-                else None
-            )
-            geometries.append(fit_internode_geometry(geometry, clamp_to_cu=True))
-        table.append((num_tokens, *geometries))
+            for rule in selected.values()
+        ]
+        combine = selected["combine"]
+        load_first = bool(combine is not None and combine.get("combine_load_first"))
+        table.append((num_tokens, *geometries, load_first))
     return table
 
 
@@ -829,7 +850,7 @@ def lookup_internode(
     row = pick_bucket(table, num_tokens) if table else None
     if row is None or (row[1] is None and row[2] is None):
         return None
-    return {"dispatch": row[1], "combine": row[2]}
+    return {"dispatch": row[1], "combine": row[2], "combine_load_first": row[3]}
 
 
 def save_internode_result(

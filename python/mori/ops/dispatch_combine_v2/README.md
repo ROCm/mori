@@ -103,15 +103,13 @@ This is transport of already packed data. The expert stage must provide an
 unpacked `[received_tokens, hidden_dim]` BF16 or FP32 tensor to combine;
 FP4 combine and FP4 dispatch with FP8 combine are unsupported.
 
-For ordinary `internode_kernel="v2"`, gfx950 combine uses 4-byte-per-lane
-load-first peer gathers when the declared capacity is at most 256 and the row
-and staging strides are 4-byte aligned. The kernel calls the existing
-`WarpAccumLF<T, 4, 2>` primitive directly, including its vector and scalar-tail
-handling; other cases use `WarpAccum<T, 4>`. This selection adds no dtype,
-top-k, topology, NIC-provider or QP-count restrictions beyond the operation's
-existing validity checks. Architectures other than gfx950 use the ordinary
-gather. These are ordinary-v2 rules; default `"auto"` still selects `v2_ll` for
-calls of up to 512 tokens.
+For ordinary `internode_kernel="v2"`, a combine rule with
+`"combine_load_first": true` compiles that token bucket's combine with
+4-byte-per-lane load-first peer gathers (`WarpAccumLF<T, 4, 2>`, when the row
+and staging strides are 4-byte aligned); other buckets use `WarpAccum<T, 4>`.
+The choice is per bucket and per GPU model, independent of the declared
+capacity, and costs one extra compile of the combine pass only. It has no effect
+on `v2_ll`, which has its own gather.
 
 ### Internode geometry: tuned by default
 

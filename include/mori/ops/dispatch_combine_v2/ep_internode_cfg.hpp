@@ -152,6 +152,9 @@ inline std::string RenderValue(EpInterNodeDType dtype) {
 //   header, because the kernel reads its grid from gridDim/blockDim rather than
 //   from kConfig. See the note there.
 //
+// One field is not shape: combineLoadFirst selects the ordinary combine's
+// gather per token bucket, from the tuning JSON rather than from any config field.
+//
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.
 // ---------------------------------------------------------------------------
@@ -168,6 +171,10 @@ struct EpInterNodeKernelCfg {
   int gpuPerNode{8};
   int numQpPerPe{1};
   EpQuantType quantType{EpQuantType::None};
+  // Ordinary-v2 combine only: gather with load-first peer reads. Chosen per
+  // token bucket by the tuning JSON (combine_load_first), so it is part of the
+  // compiled identity; every other pass is built with the default.
+  bool combineLoadFirst{false};
 };
 
 // The device-side config the bodies read: purely the compiled-in shape, so the
@@ -204,11 +211,12 @@ inline void VisitFields(Self& cfg, const EpInterNodeKernelCfg& defaults, Visit&&
   MORI_FIELD(gpuPerNode);
   MORI_FIELD(numQpPerPe);
   MORI_FIELD(quantType);
+  MORI_FIELD(combineLoadFirst);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeKernelCfg, 12,
+    EpInterNodeKernelCfg, 13,
     "added an EpInterNodeKernelCfg field -- update VisitFields(EpInterNodeKernelCfg) "
     "too, or the kernel silently compiles against its default");
 

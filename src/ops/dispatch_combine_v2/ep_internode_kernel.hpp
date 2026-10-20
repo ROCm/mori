@@ -1013,26 +1013,17 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
 
 template <EpInterNodeKernelCfg kConfig>
 __forceinline__ __device__ constexpr bool UseCombineLoadFirst() {
-#if defined(__gfx950__)
-  return kConfig.maxNumInpTokenPerRank <= 256;
-#else
-  return false;
-#endif
+  return kConfig.combineLoadFirst;
 }
 
-// Ordinary gather selects the architecture policy at compile time.
-// Peer-memory gather does not depend on the NIC provider or QP count.
-// The LL gather uses its separate path.
+// Ordinary gather: load-first or plain, fixed at compile time per token bucket
+// by the tuning JSON's combine_load_first. The LL gather uses its separate path.
 template <EpInterNodeKernelCfg kConfig, typename TokT>
 __forceinline__ __device__ void CombineGatherNormal(TokT* dest, TokT** srcPtrs, int accumNum,
                                                     size_t nelems, size_t tokHiddenBytes,
                                                     size_t tokCombXferBytes) {
-#if defined(__gfx942__) || defined(__gfx950__)
-  constexpr bool useSmallLoadFirst = UseCombineLoadFirst<kConfig>();
-#else
-  constexpr bool useSmallLoadFirst = false;
-#endif
-  if constexpr (useSmallLoadFirst) {
+  constexpr bool useLoadFirst = UseCombineLoadFirst<kConfig>();
+  if constexpr (useLoadFirst) {
     // Arena bases are aligned; require aligned row and staging strides.
     if ((tokHiddenBytes % 4 == 0) && (tokCombXferBytes % 4 == 0)) {
       core::WarpAccumLF<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);

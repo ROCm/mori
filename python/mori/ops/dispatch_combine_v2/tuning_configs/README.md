@@ -37,7 +37,18 @@ ceiling:
 
 Combine rules also carry `"zero_copy": false` and `"quant_type": "none"`.
 Intra-node rules use `rdma_block_num: 0`. The metric fields are for reference
-only; lookup reads just the selector and geometry.
+only; lookup reads just the selector, the geometry and the optional flag below.
+
+`InterNodeV2` combine rules may set `"combine_load_first": true` (absent means
+false). That bucket's combine pass is then compiled with the load-first peer
+gather (`WarpAccumLF`). It is chosen per bucket, not from the declared capacity,
+and is ignored by `InterNodeV2LL` and intra-node tables. Current settings:
+
+- MI355X: on for T ≤ 256 in every ordinary-V2 combine table (the previous
+  capacity ≤ 256 rule, measured with capacity equal to the token count).
+- MI308X: on for 256/8 bf16 H7168 at T64–512, T2048 and T4096, and 256/6 bf16
+  H7168 at T64, where an interleaved A/B measured it faster (QP2). Elsewhere it
+  measured neutral or slower (256/6 T256 and T1024, 256/8 T1024) or is unmeasured.
 
 ## Lookup
 
@@ -112,3 +123,6 @@ the shape and merges rules by selector.
 - Never copy rows from another GPU model. A missing row is safer than a
   borrowed one.
 - Store the geometry that actually ran: keep `block_num` within the CU count.
+- `--cmd tuning` measures candidates with load-first off and rewrites the whole
+  rule, so re-saving a combine rule clears `combine_load_first`. Re-measure with
+  load-first on (A/B the table with and without the flag) before setting it again.

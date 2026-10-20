@@ -171,6 +171,8 @@ struct EpInterNodeRequest {
   EpQuantType quantType = EpQuantType::None;
   // specialisation
   EpInterNodeDType dtype = EpInterNodeDType::Bf16;
+  // Applied to the ordinary Combine pass only; see EpInterNodeKernelCfg.
+  bool combineLoadFirst = false;
   // geometry; 0 = the placeholder MakeEpInterNodeCfg picks
   int blockNum = 0;
   int warpPerBlock = 0;
@@ -194,6 +196,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(numQpPerPe);
   MORI_FIELD(quantType);
   MORI_FIELD(dtype);
+  MORI_FIELD(combineLoadFirst);
   MORI_FIELD(blockNum);
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
@@ -202,7 +205,7 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 17,
+    EpInterNodeRequest, 18,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();

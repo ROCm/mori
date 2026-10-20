@@ -936,14 +936,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 group_plans = []
                 for pass_name in self._INTERNODE_SEQ[phase, spec.family]:
                     # Common passes share a plan across families at one geometry.
+                    # Only the ordinary combine pass compiles the load-first
+                    # gather, so only its key and request carry the flag.
+                    load_first = pass_name == "combine" and spec.load_first
                     key = (
                         pass_name,
                         spec.block_num,
                         spec.warp_per_block,
                         spec.rdma_block_num,
+                        load_first,
                     )
                     if key not in plans:
-                        plan = cb.EP_INTERNODE_PLANS[pass_name](**request)
+                        plan = cb.EP_INTERNODE_PLANS[pass_name](
+                            **request, combineLoadFirst=load_first
+                        )
                         self._plans.append(plan)
                         plan.bind(rdmaBlockNum=spec.rdma_block_num, replayMode=0)
                         plans[key] = plan

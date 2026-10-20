@@ -95,6 +95,9 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   cfg.kernelCfg.quantType = request.quantType;
 
   cfg.dtype = request.dtype;
+  // Only the ordinary Combine pass reads it; keeping it false elsewhere lets the
+  // other passes share one compiled module across load-first and plain buckets.
+  cfg.kernelCfg.combineLoadFirst = (kind == EpInterNodeKernel::Combine) && request.combineLoadFirst;
 
   cfg.waveSize = mori::jit::v2::WaveSizeForArch(arch);
 
