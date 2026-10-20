@@ -1985,7 +1985,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
 
     sdma.deviceHandles = comm->sdmaDevHandles;
     MORI_SHMEM_TRACE("ccoDevCommCreate: SDMA pool signalBuf={} peerSignalPtrs={} numQueue={}",
-      (void*)sdma.signalBuf, (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue);
+                     (void*)sdma.signalBuf, (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue);
   }
 
   // Fill the caller-provided host struct in place — no device allocation. It
