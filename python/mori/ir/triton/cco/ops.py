@@ -40,6 +40,7 @@ from mori.cco.device.ops import (
     SignalOp,
     ThreadMode,
     SdmaOptFlags,
+    SdmaFlags,
 )
 
 _LIB_NAME = "libmori_cco_device"
@@ -130,4 +131,5 @@ __all__ = list(_all_ops) + [
     "SignalOp",
     "ThreadMode",
     "SdmaOptFlags",
+    "SdmaFlags",
 ]

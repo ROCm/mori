@@ -285,6 +285,103 @@ def _worker_put_quiet_queue(rank, world_size, uid_path, coop_name, results_path)
         f.write(err or "")
 
 
+def _worker_signals(rank, world_size, uid_path, coop_name, results_path):
+    """put / put_ptr / get_ptr with local and remote signals, consumed by
+    wait_signal: window put with both, put_ptr remote only, get_ptr local only."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        # Window layout: [ send | put recv | put_ptr recv | get_ptr recv ]
+        send_off, put_off, ptr_off, get_off = 0, NBYTES, 2 * NBYTES, 3 * NBYTES
+        win_bytes = 4 * NBYTES
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        me, peer = rank, 1 - rank
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def signal_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            window = cco.Window(w)
+            if fx.thread_idx.x == 0:
+                sdma.put(
+                    peer,
+                    w,
+                    put_off,
+                    w,
+                    send_off,
+                    NBYTES,
+                    0,
+                    local_signal=True,
+                    remote_signal=True,
+                )
+                sdma.put_ptr(
+                    peer,
+                    window.lsa_ptr(peer, ptr_off),
+                    window.lsa_ptr(me, send_off),
+                    NBYTES,
+                    0,
+                    remote_signal=True,
+                )
+                sdma.get_ptr(
+                    peer,
+                    window.lsa_ptr(me, get_off),
+                    window.lsa_ptr(peer, send_off),
+                    NBYTES,
+                    0,
+                    local_signal=True,
+                )
+                # Ours: put + get_ptr. The peer's: its put + put_ptr.
+                sdma.wait_signal(me, 0, 2)
+                sdma.wait_signal(peer, 0, 2)
+                sdma.quiet_queue(peer, 0)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            signal_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        for off, src, what in (
+            (put_off, peer, "put"),
+            (ptr_off, peer, "put_ptr"),
+            (get_off, peer, "get_ptr"),
+        ):
+            got = read(win.local_ptr + off, NUM_ELEMS, u32)
+            for i in (0, NUM_ELEMS // 2, NUM_ELEMS - 1):
+                if got[i] != src * 1000 + i:
+                    raise AssertionError(
+                        f"rank {me} {what}[{i}]={got[i]} expected {src * 1000 + i}"
+                    )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 def _worker_put_block(rank, world_size, uid_path, coop_name, results_path):
     """All-to-all via BLOCK-coop SDMA put: the whole block drives the queues.
 
@@ -643,6 +740,11 @@ def test_sdma_quiet_queue():
 def test_sdma_put_alltoall_block(world_size):
     """BLOCK-coop put/quiet: a multi-warp block drives the queues correctly."""
     _run(_worker_put_block, world_size=world_size, coop_name="BLOCK")
+
+
+def test_sdma_signals():
+    """Local and remote signals of put / put_ptr / get_ptr reach wait_signal."""
+    _run(_worker_signals, world_size=2, coop_name="THREAD")
 
 
 def test_sdma_put_nosignal():
