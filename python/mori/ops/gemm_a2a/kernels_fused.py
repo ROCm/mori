@@ -100,6 +100,7 @@ from ..gemm_ar._gemm_a8w8_8wave import (
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
+    read_done_barrier,
     split_row_major_2d,
     wait_barrier,
 )
@@ -644,7 +645,10 @@ def compile_fused_gemm_a2a(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # The leading wave group refills the B0 slot just read one stage
+            # after the barrier the lagging group's S0 pairs with; make the
+            # reads complete before advertising it (gemm_ar, #785).
+            read_done_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
@@ -661,13 +665,10 @@ def compile_fused_gemm_a2a(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            # N_LDS_STEPS_A + N_LDS_STEPS_B - 1, not aiter's
-            # 2*N_LDS_STEPS_A + N_LDS_STEPS_B. The upstream count lets too many
-            # global->LDS prefetches stay in flight across the barrier and
-            # corrupts the output non-deterministically on large grids. See the
-            # long comment at the same line in gemm_ar/kernels_fused.py for the
-            # measured boundary; do not "restore" it.
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
+            # The original count, as gemm_ar since #785. A+B-1 used to be the
+            # fix for large-grid corruption, but it only made the peeled tail's
+            # tiles land sooner; the tail now drains them itself (below).
+            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
@@ -695,7 +696,12 @@ def compile_fused_gemm_a2a(
             )
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        # The peeled steps pre-read step K_ITERS - 1's B0 (end of this step)
+        # and A0 (top of the next), both before the last step's
+        # wait_barrier(0). Drain their producers here (gemm_ar, #785). At
+        # K=256 the main loop runs zero times, so no count inside it can cover
+        # this. The last step's wait stays: it still covers the final A1.
+        wait_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
