@@ -200,6 +200,8 @@ is 8 q heads + 1 k + 1 v at 128 each, which is one whole GQA group per rank.
 
 ## Reproducing
 
+From the repository root:
+
 ```bash
 # one cell
 MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
