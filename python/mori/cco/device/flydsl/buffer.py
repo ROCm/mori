@@ -105,7 +105,7 @@ except ImportError:  # flydsl >= 0.3.0
     HAS_BUFFER_OPS = False
 
     def _dtype(name):
-        # 0.3.0 turned T.<dtype> from a factory into a property.
+        # A property returning the type, or a factory returning it when called.
         attr = getattr(_T, name)
         return attr() if callable(attr) else attr
 
@@ -150,7 +150,7 @@ except ImportError:  # flydsl >= 0.3.0
         elem_bytes = elem_ty.width // 8
         return _arith.MulIOp(_as_i32(offset), _const(elem_bytes, 32)).result
 
-    # FlyDSL 0.3.2 moved `aux` on the raw buffer ops from a positional i32
+    # FlyDSL 0.3.1 moved `aux` on the raw buffer ops from a positional i32
     # *value* to a keyword-only *attribute*. Both spellings are in use here --
     # aiter's venv has 0.3.0, sglang's has 0.3.2 -- so probe once and adapt
     # rather than pinning either.

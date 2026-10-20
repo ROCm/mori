@@ -991,14 +991,15 @@ jobs:
     # FlyDSL shims (mori.cco.device.flydsl.buffer and
     # ops/dispatch_combine_v2/flydsl_compat.py) still carry 0.2.x and 0.3.x paths
     # for environments pinned to an older one; this runs the FlyDSL-backed tests
-    # on those so the paths stay exercised. 0.3.2 is where `aux` on the raw buffer
-    # ops became a keyword attribute.
+    # on those so the paths stay exercised: 0.2.4 is flydsl.expr.buffer_ops, and
+    # 0.3.0 still takes `aux` on the raw buffer ops positionally (0.3.1 made it the
+    # keyword attribute that CI's 0.4.0 covers).
     name: FlyDSL ${{ matrix.flydsl }} compat (MI355X_AINIC)
     runs-on: [self-hosted, MI355X-AINIC]
     strategy:
       fail-fast: false
       matrix:
-        flydsl: ["0.2.4", "0.3.2"]
+        flydsl: ["0.2.4", "0.3.0"]
     env:
       IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
       BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
@@ -1056,11 +1057,11 @@ jobs:
 
       - name: CCO FlyDSL examples (2 ranks)
         run: |
-          $CT exec $CONTAINER bash -c "pip install mpi4py && \
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "pip install mpi4py && \
             cd $GITHUB_WORKSPACE/examples/cco/python && \
             mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
-            mpirun --allow-run-as-root -np 2 python 07_flydsl_sdma/main.py && \
+            mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
             mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py"
 
       - name: Cleanup

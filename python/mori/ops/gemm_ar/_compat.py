@@ -89,8 +89,8 @@ def wave_uniform_i64(addr):
 
 #: AMDGPU's LLVM address space for global memory. `fx.to_llvm_ptr` would
 #: resolve this from the active backend, but it does not exist before flydsl
-#: 0.3 and the CI image pins `flydsl<0.3` (the cco Python examples still import
-#: `flydsl.expr.buffer_ops`, which 0.3 dropped). `llvm.inttoptr` is identical in
+#: 0.3, and 0.2.x is still supported (nightly.yml's flydsl-compat job).
+#: `llvm.inttoptr` is identical in
 #: both -- same signature, same dialect module -- so going straight to an
 #: `!llvm.ptr` keeps one code path instead of a version probe.
 _GLOBAL_LLVM_AS = 1
