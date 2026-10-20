@@ -97,8 +97,6 @@ __device__ __forceinline__ float MoriFmaMixBf16M(uint32_t src, float mul, float 
   }
   return r;
 }
-typedef int _mori_v4i __attribute__((ext_vector_type(4)));
-
 // __syncthreads() is `s_waitcnt lgkmcnt(0) vmcnt(0); s_barrier`, and the vmcnt(0) is the problem:
 // the only vector memory the fold loop has outstanding is its own output stores, which nobody in
 // the block reads, so draining them at every iteration serialises a store round trip into the
@@ -1303,8 +1301,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
       constexpr int _qOutVB = 16;
       constexpr int _qV = _qOutVB / (int)sizeof(T);
       constexpr int _qVB = _qV * (int)sizeof(TokT);
-      using _QVecT = typename core::VecTypeSelector<_qVB>::dataType;
-      using _QOutVecT = typename core::VecTypeSelector<_qOutVB>::dataType;
+      using _QVecT = core::VecTypeT<_qVB>;
+      using _QOutVecT = core::VecTypeT<_qOutVB>;
       constexpr bool _qCvtPk =
           std::is_same_v<TokT, hip_bfloat16> && std::is_same_v<T, hip_bfloat16>;
       // Round to the VECTOR width, not to a whole warp's worth of it. Rounding to warpSize*_qV
@@ -1598,8 +1596,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
               constexpr int _cOutVB = 16;
               constexpr int _cV = _cOutVB / (int)sizeof(T);
               constexpr int _cVB = _cV * (int)sizeof(TokT);
-              using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
-              using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
+              using _CVecT = core::VecTypeT<_cVB>;
+              using _COutVecT = core::VecTypeT<_cOutVB>;
               const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
                                    ((hiddenDimOffset % (size_t)_cV) == 0) &&
                                    ((_rowStride % _cV) == 0);
@@ -1655,9 +1653,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
                       _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
                   }
                 };
-              // Dereferenced directly rather than through core::load<16>: that takes a const void*,
-              // which addrspacecasts the LDS pointer to generic and leaves it to InferAddressSpaces
-              // to recover ds_read_b128 instead of a flat_load.
+              // Dereferenced directly rather than through core::load<16>: _cPullTiles lives in LDS,
+              // but core::load now casts its pointer to the global address space, so handing it an
+              // LDS pointer would issue a flat/global load instead of the ds_read_b128 we want
+              // here.
 #define _CROW_AT(_j) \
   (*reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)(_j) * _rowStride + _e))
                 // Read every source before consuming any of them, so the ds_read_b128s issue back
@@ -1713,15 +1712,13 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
 #pragma unroll
                   for (int _k = 0; _k < _cV; ++_k) _oe[_k] = T(_a[_k]);
                 }
-                // Same bytes, same address, one instruction instead of two: core::store<16> is two
-                // 8-byte __builtin_nontemporal_store (device_primitives.hpp:218-222). 16 B
+                // core::store<16> is a single 128-bit nontemporal store to global. 16 B
                 // alignment holds because _cVecOk already requires hiddenDim and hiddenDimOffset to
                 // be multiples of _cV, _off is a multiple of the tile and _e steps by _cV, so every
                 // address here is _cV * sizeof(T) = _cOutVB aligned.
                 static_assert(_cOutVB == 16,
                               "the b128 store is written for the 16 B output vector");
-                __builtin_nontemporal_store(*reinterpret_cast<const _mori_v4i*>(&_ov),
-                                            reinterpret_cast<_mori_v4i*>(outPtr + _off + _e));
+                core::store<16>(outPtr + _off + _e, _ov);
               }
               for (int _e = _nv + laneId; _e < _n; _e += warpSize) {
                 float _acc = 0.0f;
