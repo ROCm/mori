@@ -125,7 +125,14 @@ struct ionic_dv_puec_route {
 
 /**
  * struct ionic_dmabuf_alloc_result - Result of a DMABUF ring allocation.
- * @fd:     DMABUF file descriptor.
+ * @fd:     DMABUF file descriptor.  The allocator owns it; the provider only
+ *          borrows it and never closes or duplicates it.  The provider hands it to
+ *          the kernel in the CQ/QP create command, where the import takes its own
+ *          dma-buf reference, and otherwise keeps it only to pass back to
+ *          ionic_dmabuf_free_fn.  That callback runs after the CQ/QP destroy
+ *          command has dropped the kernel reference, and is where the allocator
+ *          closes the fd.  The same fd may be returned for several rings at
+ *          different @offset values (page aligned).
  * @offset: Byte offset within the DMABUF at which the ring starts.
  * @ptr:    Optional CPU mapping of the ring.  If non-NULL, the provider
  *          will use this address for ibv_post_send(), ibv_post_recv(), and
@@ -146,7 +153,7 @@ struct ionic_dmabuf_alloc_result {
  * @resource_type: IONIC_PD_TAG_* identifying the buffer type.
  * @result:        Output: fd and offset of the allocated buffer.
  *
- * Return: 0 on success, errno on failure.
+ * Return: 0 on success, ECANCELED to try another allocator (bare VA), or other errno on failure.
  */
 typedef int ionic_dmabuf_alloc_fn(struct ibv_pd* pd, void* pd_context, size_t size,
                                   uint64_t resource_type, struct ionic_dmabuf_alloc_result* result);
@@ -156,7 +163,8 @@ typedef int ionic_dmabuf_alloc_fn(struct ibv_pd* pd, void* pd_context, size_t si
  *
  * @pd:            Parent domain of the allocation.
  * @pd_context:    Context set by ionic_dv_pd_set_dmabuf_alloc().
- * @fd:            DMABUF fd from the alloc callback.
+ * @fd:            DMABUF fd from the alloc callback, still open.  Together with
+ *                 @offset it identifies the ring being freed.
  * @offset:        Offset from the alloc callback.
  * @resource_type: IONIC_PD_TAG_* identifying the buffer type.
  */

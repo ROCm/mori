@@ -27,6 +27,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mori/application/transport/rdma/providers/dv_loader.hpp"
 #include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
@@ -163,14 +164,20 @@ class IonicDeviceContext : public RdmaDeviceContext {
   void create_parent_domain(ibv_context* context, struct ibv_pd* pd_orig);
 
  private:
-  // Backing device allocation for a ring handed out through pd_alloc_dmabuf, keyed by the
-  // dmabuf fd since that plus the offset is all pd_free_dmabuf gets back.
-  struct DmabufRing {
-    void* devPtr;
-    uint64_t offset;
+  // Exported device chunks that pd_alloc_dmabuf carves CQ/SQ/RQ rings from, keyed by the
+  // chunk's dma-buf fd. (fd, offset) is all pd_free_dmabuf gets back, so it names one ring.
+  // Slices are not reused; a chunk is freed with its last ring.
+  struct DmabufChunk {
+    void* base{nullptr};
+    size_t size{0};
+    uint64_t exportOffset{0};
+    int device{-1};
+    int fd{-1};
+    size_t used{0};
+    std::unordered_set<uint64_t> live;
   };
   std::mutex dmabufRingsMutex;
-  std::unordered_map<int, DmabufRing> dmabufRings;
+  std::unordered_map<int, DmabufChunk> dmabufChunks;
   bool dmabufRingsEnabled{false};
 
   uint32_t pdn;

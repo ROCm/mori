@@ -26,6 +26,7 @@
 #include <infiniband/verbs.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
@@ -537,44 +538,129 @@ void* IonicDeviceContext::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_c
   return dev_ptr;
 }
 
+namespace {
+
+constexpr size_t kDmabufRingAlign = 4096;
+constexpr size_t kDmabufRingChunkBytes = size_t{16} << 20;
+
+// Payload MR registration falls back to ibv_reg_mr when dma-buf fails; rings have no such
+// fallback once pd_set_dmabuf_alloc is set. Export one ring-sized allocation first and keep
+// bare-VA rings on a host where that fails.
+bool ProbeIonicDmabufExport() {
+  int device = -1;
+  if (hipGetDevice(&device) != hipSuccess) {
+    (void)hipGetLastError();
+    MORI_APP_WARN(
+        "MORI_ENABLE_DMABUF_REG=1 but there is no current HIP device for the dma-buf ring probe; "
+        "CQ/SQ/RQ rings stay bare-VA");
+    return false;
+  }
+  void* devPtr = nullptr;
+  hipError_t err = hipExtMallocWithFlags(reinterpret_cast<void**>(&devPtr), kDmabufRingAlign,
+                                         hipDeviceMallocUncached);
+  if (err != hipSuccess) {
+    (void)hipGetLastError();
+    MORI_APP_WARN(
+        "MORI_ENABLE_DMABUF_REG=1 but the dma-buf ring probe allocation failed ({}); CQ/SQ/RQ "
+        "rings stay bare-VA",
+        hipGetErrorString(err));
+    return false;
+  }
+  uint64_t offset = 0;
+  int fd = TryExportDmabufFd(devPtr, kDmabufRingAlign, &offset);
+  if (fd >= 0) close(fd);
+  if (hipFree(devPtr) != hipSuccess) (void)hipGetLastError();
+  if (fd < 0) {
+    MORI_APP_WARN(
+        "MORI_ENABLE_DMABUF_REG=1 but dma-buf export of a ring-sized probe failed; CQ/SQ/RQ "
+        "rings stay bare-VA (payload MR registration is unchanged)");
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+// Rings are slices of a few exported chunks. A ring's fd is the key the provider hands back to
+// pd_free_dmabuf, so it stays open for the life of the ring; one export per ring would hold about
+// three fds per QP.
 int IonicDeviceContext::pd_alloc_dmabuf(struct ibv_pd* pd, void* pd_context, size_t size,
                                         uint64_t resource_type,
                                         struct ionic_dmabuf_alloc_result* result) {
   auto* self = static_cast<IonicDeviceContext*>(pd_context);
-  if ((self == nullptr) || (result == nullptr)) return EINVAL;
+  if ((self == nullptr) || (result == nullptr) || (size == 0)) return EINVAL;
 
-  void* devPtr{nullptr};
-  hipError_t err =
-      hipExtMallocWithFlags(reinterpret_cast<void**>(&devPtr), size, hipDeviceMallocUncached);
-  if (err != hipSuccess) {
+  int device = -1;
+  if (hipGetDevice(&device) != hipSuccess) {
     (void)hipGetLastError();
-    MORI_APP_ERROR("pd_alloc_dmabuf: hipExtMallocWithFlags failed, size:{}, resource_type:{:#x}",
-                   size, resource_type);
-    return ENOMEM;
+    MORI_APP_WARN("pd_alloc_dmabuf: hipGetDevice failed; returning ECANCELED for a bare-VA ring");
+    return ECANCELED;
   }
-  memset(devPtr, 0, size);
+  size_t sliceBytes = (size + kDmabufRingAlign - 1) & ~(kDmabufRingAlign - 1);
 
-  uint64_t offset = 0;
-  int fd = TryExportDmabufFd(devPtr, size, &offset);
-  if (fd < 0) {
-    MORI_APP_ERROR("pd_alloc_dmabuf: dmabuf export failed, size:{}, resource_type:{:#x}", size,
-                   resource_type);
-    HIP_RUNTIME_CHECK(hipFree(devPtr));
-    return EOPNOTSUPP;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(self->dmabufRingsMutex);
-    self->dmabufRings[fd] = DmabufRing{devPtr, offset};
+  std::lock_guard<std::mutex> lock(self->dmabufRingsMutex);
+  DmabufChunk* chunk = nullptr;
+  for (auto& entry : self->dmabufChunks) {
+    DmabufChunk& c = entry.second;
+    if (c.device == device && c.used + sliceBytes <= c.size) {
+      chunk = &c;
+      break;
+    }
   }
 
-  result->fd = fd;
-  result->offset = offset;
+  if (chunk == nullptr) {
+    size_t chunkBytes = std::max(kDmabufRingChunkBytes, sliceBytes);
+    void* base = nullptr;
+    hipError_t err =
+        hipExtMallocWithFlags(reinterpret_cast<void**>(&base), chunkBytes, hipDeviceMallocUncached);
+    if (err != hipSuccess) {
+      (void)hipGetLastError();
+      MORI_APP_WARN(
+          "pd_alloc_dmabuf: hipExtMallocWithFlags({}) failed ({}), resource_type:{:#x}; returning "
+          "ECANCELED for a bare-VA ring",
+          chunkBytes, hipGetErrorString(err), resource_type);
+      return ECANCELED;
+    }
+    uint64_t exportOffset = 0;
+    int fd = TryExportDmabufFd(base, chunkBytes, &exportOffset);
+    // The kernel rejects ring offsets that are not page aligned.
+    if ((fd >= 0) && (exportOffset % kDmabufRingAlign != 0)) {
+      close(fd);
+      fd = -1;
+    }
+    if (fd < 0) {
+      MORI_APP_WARN(
+          "pd_alloc_dmabuf: dma-buf export of a {}-byte ring chunk failed or is not page aligned, "
+          "resource_type:{:#x}; returning ECANCELED for a bare-VA ring",
+          chunkBytes, resource_type);
+      if (hipFree(base) != hipSuccess) (void)hipGetLastError();
+      return ECANCELED;
+    }
+    DmabufChunk fresh;
+    fresh.base = base;
+    fresh.size = chunkBytes;
+    fresh.exportOffset = exportOffset;
+    fresh.device = device;
+    fresh.fd = fd;
+    chunk = &self->dmabufChunks.emplace(fd, std::move(fresh)).first->second;
+    MORI_APP_TRACE("pd_alloc_dmabuf: new ring chunk, addr:{}, size:{}, fd:{}, device:{}, chunks:{}",
+                   base, chunkBytes, fd, device, self->dmabufChunks.size());
+  }
+
+  size_t sliceOffset = chunk->used;
+  chunk->used += sliceBytes;
+  void* ptr = static_cast<char*>(chunk->base) + sliceOffset;
+  memset(ptr, 0, size);
+  uint64_t dmabufOffset = chunk->exportOffset + sliceOffset;
+  chunk->live.insert(dmabufOffset);
+
+  result->fd = chunk->fd;
+  result->offset = dmabufOffset;
   // Hand back the VA too so the provider can still drive ibv_post_send/recv and ibv_poll_cq.
-  result->ptr = devPtr;
+  result->ptr = ptr;
 
-  MORI_APP_TRACE("pd_alloc_dmabuf, addr:{}, size:{}, fd:{}, offset:{}, resource_type:{:#x}", devPtr,
-                 size, fd, offset, resource_type);
+  MORI_APP_TRACE("pd_alloc_dmabuf, addr:{}, size:{}, fd:{}, offset:{}, resource_type:{:#x}", ptr,
+                 size, chunk->fd, dmabufOffset, resource_type);
   return 0;
 }
 
@@ -583,23 +669,30 @@ void IonicDeviceContext::pd_free_dmabuf(struct ibv_pd* pd, void* pd_context, int
   auto* self = static_cast<IonicDeviceContext*>(pd_context);
   if (self == nullptr) return;
 
-  void* devPtr{nullptr};
+  void* base{nullptr};
   {
     std::lock_guard<std::mutex> lock(self->dmabufRingsMutex);
-    auto it = self->dmabufRings.find(fd);
-    if (it == self->dmabufRings.end()) {
-      MORI_APP_WARN("pd_free_dmabuf: unknown fd:{}, offset:{}, resource_type:{:#x}", fd, offset,
-                    resource_type);
+    auto it = self->dmabufChunks.find(fd);
+    if ((it == self->dmabufChunks.end()) || (it->second.live.erase(offset) == 0)) {
+      MORI_APP_WARN("pd_free_dmabuf: unknown ring fd:{}, offset:{}, resource_type:{:#x}", fd,
+                    offset, resource_type);
       return;
     }
-    devPtr = it->second.devPtr;
-    self->dmabufRings.erase(it);
+    if (!it->second.live.empty()) {
+      MORI_APP_TRACE("pd_free_dmabuf, fd:{}, offset:{}, resource_type:{:#x}, rings left:{}", fd,
+                     offset, resource_type, it->second.live.size());
+      return;
+    }
+    base = it->second.base;
+    self->dmabufChunks.erase(it);
   }
 
+  // Closed only with the chunk's last ring: the provider borrows the fd, and the same number is
+  // shared by every ring in the chunk.
   close(fd);
-  HIP_RUNTIME_CHECK(hipFree(devPtr));
-  MORI_APP_TRACE("pd_free_dmabuf, addr:{}, fd:{}, offset:{}, resource_type:{:#x}", devPtr, fd,
-                 offset, resource_type);
+  HIP_RUNTIME_CHECK(hipFree(base));
+  MORI_APP_TRACE("pd_free_dmabuf: released ring chunk, addr:{}, fd:{}, resource_type:{:#x}", base,
+                 fd, resource_type);
 }
 
 void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_pd* pd_orig) {
@@ -616,8 +709,9 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   // rings. Needs libionic >= the release that exports ionic_dv_pd_set_dmabuf_alloc;
   // older libs keep the bare-VA alloc above.
   bool wantDmabufRings = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
-  bool useDmabufRings = wantDmabufRings && IonicDvApi::Instance().pd_set_dmabuf_alloc != nullptr;
-  if (wantDmabufRings && !useDmabufRings) {
+  bool haveDmabufAlloc = IonicDvApi::Instance().pd_set_dmabuf_alloc != nullptr;
+  bool useDmabufRings = wantDmabufRings && haveDmabufAlloc && ProbeIonicDmabufExport();
+  if (wantDmabufRings && !haveDmabufAlloc) {
     MORI_APP_WARN(
         "libionic has no ionic_dv_pd_set_dmabuf_alloc; CQ/SQ/RQ rings fall back to bare-VA "
         "allocation");
