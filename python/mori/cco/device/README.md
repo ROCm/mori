@@ -80,7 +80,7 @@ then install MORI and the example runtime deps:
 
 ```bash
 pip install .                          # builds + co-locates all libmori_*.so
-pip install mpi4py "flydsl==0.2.2"     # mpi4py: bootstrap; flydsl: the device bindings
+pip install mpi4py "flydsl==0.4.0"     # mpi4py: bootstrap; flydsl: the device bindings
 ```
 
 After `pip install .` no `PYTHONPATH` / `LD_LIBRARY_PATH` / `MORI_CCO_BC` is

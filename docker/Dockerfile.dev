@@ -18,6 +18,10 @@ ARG ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
 ARG ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
 # 1 installs flydsl, which only the cco Python examples need.
 ARG WITH_FLYDSL=0
+# The version aiter pins, so CI runs mori against the FlyDSL it ships with.
+# mori itself also runs on 0.2.x and 0.3.x; nightly.yml's flydsl-compat job
+# builds this image with an older one to keep those paths covered.
+ARG FLYDSL_VERSION=0.4.0
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -74,6 +78,4 @@ RUN set -ex; \
 # distro kernel's amdgpu, so bumping the Ubuntu kernel alone does nothing.
 ENV MALLOC_MMAP_THRESHOLD_=131072
 
-# Pinned <0.3: 0.3.x dropped `flydsl.expr.buffer_ops`, still imported directly
-# by the cco examples (04/05/07/08). Unpin once they move to the 0.3.x API.
-RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl<0.3"; fi
+RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}"; fi
