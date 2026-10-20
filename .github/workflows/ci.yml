@@ -349,6 +349,7 @@ jobs:
           $CT exec $CONTAINER bash -c "
             set -e
             cd $GITHUB_WORKSPACE
+            MORI_SHMEM_HEAP_SIZE=6G timeout 120 mpirun --allow-run-as-root -np 2 ./build/examples/test_warp_copy_alignment
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_get_thread
             timeout 60 mpirun --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
