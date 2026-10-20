@@ -93,8 +93,11 @@ These options are read once when an op is constructed:
      - ``1`` on single-node gfx1250 SDMA; ``0`` elsewhere. Posts notifications
        in the send phase. Other architectures can opt in with ``1``.
    * - ``MORI_ASYNCLL_SKIP_RESET``
-     - ``1`` when early notification is enabled. Set ``0`` to retain the
-       additional receive-count reset for comparison.
+     - No longer has an effect. It skipped the host-side ``total_recv`` reset
+       before each dispatch; that reset has been removed for every kernel
+       family (the dispatch kernels now produce the count themselves), and
+       AsyncLL's receive copy always assigned it. Still accepted, so existing
+       settings do not fail.
    * - ``MORI_ASYNCLL_FUSED_RECV``
      - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
        per CTA waits, then an acquire and CTA barrier release the copy waves.

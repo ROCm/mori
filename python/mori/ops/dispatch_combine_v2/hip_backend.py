@@ -1389,7 +1389,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         self._plans = []
         plans_by_pass = {}
-        self._asyncll_mode, skip_reset = self._asyncll_options(cfg, self._arch)
+        # The second value is MORI_ASYNCLL_SKIP_RESET, which no longer selects
+        # anything: main dropped the host total_recv reset it skipped (and
+        # KernelSet.self_resets_counters with it), and AsyncLL's RecvCopy
+        # always assigned the count. Still parsed so existing settings validate.
+        self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         for group, names in sequences.items():
             for name in names:
@@ -1441,7 +1445,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine_recv=table("combine_recv"),
             dispatch_replay=None,
             stages_in_kernel=True,
-            self_resets_counters=skip_reset,
             capabilities=frozenset({"gather", "scales", "async_ll"}),
         )
 
@@ -1606,10 +1609,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine={combine_spec: self._wrap_internode("combine")},
             dispatch_replay=None,
             stages_in_kernel=True,
-            # copystaging zeroes total_recv as its first act, so the host does not
-            # have to -- that zero_() was a fill kernel enqueued ahead of the
-            # dispatch sequence, delaying the kernels it protected.
-            self_resets_counters=True,
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
@@ -1775,10 +1774,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
-            # gfx1250 overwrites totalRecvTokenNum in the dispatch kernel's
-            # first-arriver, so the host zero_() is redundant.  gfx942/950 use
-            # atomicAdd and rely on the combine kernel to clear it.
-            self_resets_counters=self._is1250,
             capabilities=frozenset(
                 {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
             ),
