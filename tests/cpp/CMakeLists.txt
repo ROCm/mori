@@ -96,6 +96,7 @@ if(BUILD_IO)
       test_fault_injection
       PRIVATE
         MORI_IO_FAULT_CATALOG_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog/ibverbs.yaml"
+        MORI_IO_FAULT_CATALOG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog"
     )
     target_link_libraries(test_fault_injection mori_application mori_io)
   endif()

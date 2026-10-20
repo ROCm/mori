@@ -312,11 +312,30 @@ jobs:
             cmake -B build_fault -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF -DENABLE_IO_FAULT_INJECTION=ON
             cmake --build build_fault -j --target test_fault_injection test_flat_yaml
             timeout 60 ./build_fault/tests/cpp/test_flat_yaml
+            MORI_IO_LOG_LEVEL=error ./build_fault/tests/cpp/test_fault_injection --check-catalog
+            MORI_IO_LOG_LEVEL=error MORI_IO_FAULT_CATALOG=async_events.yaml ./build_fault/tests/cpp/test_fault_injection --check-catalog
+            MORI_IO_LOG_LEVEL=error ./build_fault/tests/cpp/test_fault_injection --check-async-sources
             rm -f $REPORT
             HIP_VISIBLE_DEVICES=0,1 timeout 900 ./build_fault/tests/cpp/test_fault_injection
           "
           rc=$?
           if [ -f "$REPORT" ]; then cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
+
+      - name: MORI-IO fault catalog (async events)
+        if: ${{ !cancelled() && matrix.platform == 'MI355X_AINIC' }}
+        run: |
+          REPORT=$GITHUB_WORKSPACE/build_fault/fault_report.md
+          set +e
+          $CT exec -e GITHUB_ACTIONS=true -e MORI_IO_FAULT_CATALOG=async_events.yaml -e MORI_IO_FAULT_REPORT=$REPORT $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            HIP_VISIBLE_DEVICES=0,1 timeout 900 ./build_fault/tests/cpp/test_fault_injection
+          "
+          rc=$?
+          if [ -f "$REPORT" ]; then
+            sed -n '/^### MORI-IO fault catalog: async_events.yaml/,$p' "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+          fi
           exit $rc
 
       - name: MORI-IR

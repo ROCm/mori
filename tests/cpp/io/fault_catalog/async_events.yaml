@@ -1,0 +1,180 @@
+# MORI-IO fault catalog: NIC async events (fault simulation part 2/N).
+# Each entry runs an initiator and target on separate GPUs/NICs, as ibverbs.yaml.
+# Checks: ends / honest / recovers / alive, plus optional reported / during.
+# recovers requires both a successful next transfer and session Alive().
+# peer_failure: expected PopPeerFailure reason, or none (no event in 500 ms).
+# during: reject (ERR_RDMA_OP on return) or succeed, before explicit Disarm().
+# env: KEY=VAL[,KEY=VAL], applied before either engine is created.
+# known_bug + fails must match exactly; XPASS and unexpected failures fail CI.
+# Fatal resources remain dead after Disarm(): no-qp-rebuild is still open.
+# With no CQEs and fatal-event handling disabled: no-completion-deadline.
+# While a local port is down (PORT_ERR, no PORT_ACTIVE yet), new submissions on it
+# fail synchronously with ERR_RDMA_OP; a 1 s port recheck recovers a lost
+# PORT_ACTIVE. MORI_IO_PORT_DOWN_FAIL_FAST=0 turns the rejection off
+# (port_down.fail_fast_off shows the behavior without it).
+# Known bug added here: notify-failure-not-reported. A notification SEND that
+# fails (e.g. flushed by a dead QP) only logs; the initiator still reports
+# SUCCESS although the target is never told.
+
+- id: none.write
+  real_world: no fault (baseline)
+  transfer: write
+  peer_failure: none
+  notify: true
+
+- id: qp_fatal.write
+  real_world: local QP fatal during a write
+  rule: async_event:value=qp_fatal:op=write
+  transfer: write
+  peer_failure: LOCAL_QP_ERROR
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: qp_fatal.write.mid_run
+  real_world: local QP fatal after ten clean transfers
+  rule: async_event:value=qp_fatal:op=write
+  transfer: write
+  peer_failure: LOCAL_QP_ERROR
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+  warmup: 10
+
+- id: qp_fatal.batch.one_qp
+  real_world: one local QP fails during a two-QP batch
+  rule: async_event:value=qp_fatal:op=write
+  transfer: batch
+  peer_failure: LOCAL_QP_ERROR
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+# The data write completes; the QP dies before the notification SEND, which is
+# flushed. The initiator sees the failed SEND CQE but still reports SUCCESS.
+- id: qp_fatal.notify
+  real_world: local QP dies between the data write and its notification
+  rule: async_event:value=qp_fatal:op=send
+  transfer: write
+  notify: true
+  peer_failure: LOCAL_QP_ERROR
+  during: reject
+  known_bug: notify-failure-not-reported
+  fails: honest, recovers
+
+# The target's QP dies while re-posting a receive; the initiator's next write
+# ends with a transport retry error, and nothing rebuilds the target's QP.
+- id: qp_fatal.target
+  real_world: target QP dies while re-posting a notification receive
+  rule: async_event:value=qp_fatal:op=recv
+  transfer: write
+  notify: true
+  warmup: 1
+  side: target
+  peer_failure: LOCAL_QP_ERROR
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: qp_fatal.fail_on_event_off
+  real_world: QP fatal with transfer failure callback disabled; hardware flush remains
+  rule: async_event:value=qp_fatal:op=write
+  transfer: write
+  peer_failure: LOCAL_QP_ERROR
+  env: MORI_IO_FAIL_ON_ASYNC_EVENT=0
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: qp_access_err.write
+  real_world: local QP access error during a write
+  rule: async_event:value=qp_access_err:op=write
+  transfer: write
+  peer_failure: LOCAL_QP_ERROR
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: cq_err.write
+  real_world: local CQ failure loses all completions; async handling must settle the transfer
+  rule: async_event:value=cq_err:op=write
+  transfer: write
+  peer_failure: LOCAL_CQ_ERROR
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: cq_err.fail_on_event_off
+  real_world: dead CQ with transfer failure callback disabled
+  rule: async_event:value=cq_err:op=write
+  transfer: write
+  peer_failure: LOCAL_CQ_ERROR
+  env: MORI_IO_FAIL_ON_ASYNC_EVENT=0
+  known_bug: no-completion-deadline
+  fails: ends, recovers
+
+- id: device_fatal.write
+  real_world: local NIC fatal during a write
+  rule: async_event:value=device_fatal:op=write
+  transfer: write
+  peer_failure: LOCAL_DEVICE_FATAL
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: device_fatal.batch
+  real_world: local NIC fatal on the second QP post of a batch
+  rule: async_event:value=device_fatal:op=write:skip=1
+  transfer: batch
+  peer_failure: LOCAL_DEVICE_FATAL
+  during: reject
+  known_bug: no-qp-rebuild
+  fails: recovers
+
+- id: device_fatal.monitor_off
+  real_world: local NIC fatal without an async monitor
+  rule: async_event:value=device_fatal:op=write
+  transfer: write
+  peer_failure: none
+  env: MORI_IO_ENABLE_ASYNC_EVENTS=0
+  known_bug: no-completion-deadline
+  fails: ends, recovers
+
+- id: port_flap.write
+  real_world: local port down then active after 200 ms; data path survives
+  rule: port_flap:value=200:op=write
+  transfer: write
+  peer_failure: LOCAL_PORT_DOWN
+
+- id: port_down.write
+  real_world: local port stays down; new submissions are rejected until Disarm
+  rule: port_down:op=write
+  transfer: write
+  peer_failure: LOCAL_PORT_DOWN
+  during: reject
+
+- id: port_down.fail_fast_off
+  real_world: port down with admission rejection explicitly disabled
+  rule: port_down:op=write
+  transfer: write
+  peer_failure: LOCAL_PORT_DOWN
+  during: succeed
+  env: MORI_IO_PORT_DOWN_FAIL_FAST=0
+
+- id: port_err.lost_active
+  real_world: PORT_ERR without PORT_ACTIVE; a port query must restore liveness
+  rule: async_event:value=port_err:op=write
+  transfer: write
+  peer_failure: LOCAL_PORT_DOWN
+
+- id: gid_change.write
+  real_world: GID table changes without a transfer failure
+  rule: async_event:value=gid_change:op=write
+  transfer: write
+  peer_failure: none
+  during: succeed
+
+- id: port_active.spurious
+  real_world: PORT_ACTIVE without an earlier PORT_ERR
+  rule: async_event:value=port_active:op=write
+  transfer: write
+  peer_failure: none
+  during: succeed
