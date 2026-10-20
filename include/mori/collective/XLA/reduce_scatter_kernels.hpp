@@ -352,7 +352,7 @@ template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
                                     uint32_t* __restrict__ groupCounters, size_t chunkElems,
-                                    mori::cco::ccoDevComm devComm, mori::cco::ccoWindow_t heapWin,
+                                    cco::ccoDevComm devComm, cco::ccoWindow_t heapWin,
                                     const T* __restrict__ input, T* __restrict__ staging,
                                     uint64_t* __restrict__ barrierCtr) {
 
@@ -418,8 +418,8 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // counter cannot drop an unseen signal. atomicInc wraps the arrival counter
   // back to 0 on the last block, so it needs no reset of its own.
   if (threadIdx.x == 0 &&
-      atomicInc(&groupCounters[0], gridDim.x - 1) == gridDim.x - 1) {
-    StreamStore<ESystemScope, sizeof(uint64_t)>(&devComm.sdma.signalBuf[kSliceSignalSlot], 0);
+      atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
+    AtomicStore<ESystemScope>(&devComm.sdma.signalBuf[kSliceSignalSlot], 0UL);
   }
 }
 
@@ -452,7 +452,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 // ---------------------------------------------------------------------------
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
-ReduceScatterPullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
+ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
                         const T* __restrict__ input, T* __restrict__ output,
                         size_t chunkElems, uint32_t* __restrict__ groupCounters,
                         uint64_t* __restrict__ arrived) {
@@ -474,7 +474,7 @@ ReduceScatterPullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
   if (threadIdx.x < warpSize) {
     uint32_t last = 0;
     if (threadIdx.x == 0) {
-      last = atomicInc(&groupCounters[0], gridDim.x - 1) == gridDim.x - 1;
+      last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
     }
     if (BroadcastWarp(last, 0)) {
       GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);

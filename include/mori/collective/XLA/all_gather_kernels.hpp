@@ -53,8 +53,8 @@ namespace collective {
 // npes <= 8 (SDMA fast path) and a comfortable blockDim (256).
 __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__ input,
                                     void* __restrict__ output, size_t chunkBytes,
-                                    mori::cco::ccoDevComm devComm,
-                                    mori::cco::ccoWindow_t heapWin,
+                                    cco::ccoDevComm devComm,
+                                    cco::ccoWindow_t heapWin,
                                     uint64_t* __restrict__ barrierCtr) {
   const uint32_t stride4G = heapWin->stride4G;
   // A peer finishing its previous launch only proves our shard reached it; gate
@@ -109,7 +109,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // only ADDs here after passing its entry GenBarrier, which needs us to have
   // entered that launch too, i.e. after this kernel has retired.
   if (threadIdx.x == 0) {
-    StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[0], 0);
+    AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
 }
 } // namespace collective

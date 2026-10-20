@@ -43,7 +43,7 @@ static_assert(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC)
                                   + sizeof(uint32_t) == kSDMACopyAtomicPktSize,
               "Packet size mismatch: copy+atomic must be 64B");
 #if defined(__HIPCC__) || defined(__HIP__)
-static_assert(mori::cco::CCO_SDMA_QUEUE_SIZE % kSDMACopyAtomicPktSize == 0,
+static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopyAtomicPktSize == 0,
               "SDMA ring must be a multiple of the 64B fused packet");
 #endif
 
@@ -64,13 +64,14 @@ static constexpr int kSdmaSignalSlotsUsed = 2;
 static constexpr int kBcastSlot = kSliceSignalSlot + 1;
 static_assert(kBcastSlot < kSdmaSignalSlotsUsed, "broadcast counter must be a checked slot");
 
-// groupCounters layout (local uint32 buffer): [0, kRSPushMaxSlices) per-slice
-// arrival counters, then all-reduce's two broadcast release counters, then the
-// a reserved (currently unused) slot,
-// then all-reduce's per-launch b=1 release target (elects the tail owner).
-static constexpr int kBcastFlagIdx = kRSPushMaxSlices;
-static constexpr int kPullEpochIdx = kBcastFlagIdx + 2;
-static constexpr int kBcastTargetIdx = kPullEpochIdx + 1;
+// groupCounters layout (local uint32 buffer): [0] grid-wide last-block arrival
+// counter (reduce-scatter's packed-counter reset and all-reduce-pull's exit
+// barrier elect the tail block through it), then all-reduce's two broadcast
+// release counters, then all-reduce's per-launch b=1 release target (elects the
+// tail owner).
+static constexpr int kArrivalIdx = 0;
+static constexpr int kBcastFlagIdx = kArrivalIdx + 1;
+static constexpr int kBcastTargetIdx = kBcastFlagIdx + 2;
 static constexpr int kGroupCounterCount = kBcastTargetIdx + 1;
 static_assert(kRSPushMaxSlices * 8 <= 64 && kRSPushMaxPeers - 1 < 256,
               "slice counters must fit one byte each of a uint64");
@@ -291,14 +292,14 @@ __device__ __forceinline__ T BroadcastWarp(T v, int srcLane) {
 // SDMA queue handle augmented with collective-specific ring writers. It adds no
 // data members (same layout as the base), so a base handle can be used through it
 // via a reinterpret_cast -- mirroring anvil::SdmaQueueSingleProducerDeviceHandle.
-struct SdmaCollectiveHandle : mori::cco::ccoSdmaQueueDeviceHandle {
+struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
 
   static __device__ __forceinline__ uint64_t WrapIntoRing(uint64_t index) {
-    return index % mori::cco::CCO_SDMA_QUEUE_SIZE;
+    return index % cco::CCO_SDMA_QUEUE_SIZE;
   }
 
   __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) {
-    const uint64_t queue_size_in_bytes = mori::cco::CCO_SDMA_QUEUE_SIZE;
+    const uint64_t queue_size_in_bytes = cco::CCO_SDMA_QUEUE_SIZE;
     if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
       return true;
     }
@@ -322,7 +323,7 @@ struct SdmaCollectiveHandle : mori::cco::ccoSdmaQueueDeviceHandle {
   // write the hint back to `shared` once at the end if it moved. The hint only
   // moves forward to a value rptr actually had, so a later writer is harmless.
   __device__ __forceinline__ uint64_t ReserveSingleProducer(const size_t size_in_bytes) {
-    constexpr uint64_t q_size = mori::cco::CCO_SDMA_QUEUE_SIZE;
+    constexpr uint64_t q_size = cco::CCO_SDMA_QUEUE_SIZE;
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
@@ -332,8 +333,8 @@ struct SdmaCollectiveHandle : mori::cco::ccoSdmaQueueDeviceHandle {
       do {
         cachedHwReadIndex =
             __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        if constexpr (mori::cco::CCO_SDMA_BREAK_ON_RETRIES) {
-          if (retries++ == mori::cco::CCO_SDMA_MAX_RETRIES) __builtin_trap();
+        if constexpr (cco::CCO_SDMA_BREAK_ON_RETRIES) {
+          if (retries++ == cco::CCO_SDMA_MAX_RETRIES) __builtin_trap();
         }
       } while (end - cachedHwReadIndex > q_size);
     }
@@ -386,7 +387,7 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // ---------------------------------------------------------------------------
 template <uint64_t ElemBytes = 1, class ActiveFn, class SrcFn, class DstFn>
 __device__ __forceinline__ void StartSdmaScatter(
-    mori::cco::ccoSdmaContext sdma, int npes, int logS, size_t chunkElems,
+    cco::ccoSdmaContext sdma, int npes, int logS, size_t chunkElems,
     ActiveFn activeOf, SrcFn srcOf, DstFn dstOf) {
 
   static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
@@ -437,7 +438,7 @@ __device__ __forceinline__ void StartSdmaScatter(
                          queueBuf + ringDw);
       }
 
-      mori::cco::ccoSdmaPublishStores();
+      cco::ccoSdmaPublishStores();
       __builtin_amdgcn_wave_barrier();
 
       if (active && sub == 0) {
@@ -473,7 +474,7 @@ __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf,
 // after it by the same block, each queue keeps a single producing lane and these
 // packets land behind that peer's scatter packets.
 template <class WriteFn>
-__device__ __forceinline__ void SdmaPostPerPeer(mori::cco::ccoSdmaContext sdma, int npes,
+__device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int npes,
                                                 int myPe, int nSlots, WriteFn writeFn) {
   constexpr int W = warpSize;
   const int tid = static_cast<int>(threadIdx.x), B = static_cast<int>(blockDim.x);
@@ -505,7 +506,7 @@ __device__ __forceinline__ void SdmaPostPerPeer(mori::cco::ccoSdmaContext sdma, 
 
     if (active) writeFn(peer, sub, queueBuf, pktBase);
 
-    mori::cco::ccoSdmaPublishStores();
+    cco::ccoSdmaPublishStores();
     __builtin_amdgcn_wave_barrier();
 
     if (active && sub == 0) {

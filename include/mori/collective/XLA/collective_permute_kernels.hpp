@@ -66,8 +66,8 @@ namespace collective {
 __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             const void* __restrict__ sendBuf,
                                             void* __restrict__ recvBuf, size_t numBytes,
-                                            mori::cco::ccoDevComm devComm,
-                                            mori::cco::ccoWindow_t heapWin,
+                                            cco::ccoDevComm devComm,
+                                            cco::ccoWindow_t heapWin,
                                             uint64_t* __restrict__ ready) {
   const int myLsaRank = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
