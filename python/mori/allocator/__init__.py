@@ -152,7 +152,8 @@ def _jit_ext():
         raise ImportError(f"mori_torch_symm sources missing at {source}")
 
     rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
-    flags = ["-std=c++17", "-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
+    # No -std here: load() already passes the standard torch's headers need.
+    flags = ["-O3", "-D__HIP_PLATFORM_AMD__=1", "-DUSE_ROCM=1"]
     logger.info("compiling mori_torch_symm from %s", source)
     # libmori_cco sits in the package directory, wherever mori was installed.
     pkg = str(Path(__file__).resolve().parent.parent)

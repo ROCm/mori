@@ -39,6 +39,26 @@ def _page_size() -> int:
     return os.sysconf("SC_PAGE_SIZE")
 
 
+def test_numa_config_environment_and_python_properties(monkeypatch):
+    monkeypatch.setenv("UMBP_DRAM_NUMA_NODE", "0,1")
+    monkeypatch.setenv("UMBP_DRAM_NUMA_STRICT", "1")
+    monkeypatch.setenv("UMBP_DRAM_PREFAULT_THREADS", "4")
+    cfg = umbp.UMBPConfig.from_environment()
+    assert cfg.dram.numa_nodes == [0, 1]
+    assert cfg.dram.numa_strict
+    assert cfg.dram.prefault_threads == 4
+    cfg.dram.numa_node = 1
+    assert cfg.dram.numa_nodes == [1]
+    cfg.dram.numa_node = -1
+    assert cfg.dram.numa_nodes == []
+    assert cfg.dram.numa_node == -1
+    with pytest.raises(ValueError):
+        cfg.dram.numa_nodes = [0, 0]
+    monkeypatch.setenv("UMBP_DRAM_NUMA_NODE", "0,-1")
+    with pytest.raises(ValueError):
+        umbp.UMBPConfig.from_environment()
+
+
 def _touch(handle, value: int = 0x5A) -> None:
     assert handle
     data = (ctypes.c_ubyte * handle.requested_size).from_address(handle.ptr)

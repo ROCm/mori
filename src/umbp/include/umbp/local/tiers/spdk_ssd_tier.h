@@ -25,7 +25,8 @@
 // Metadata management follows mooncake-store's OffsetAllocatorStorageBackend:
 //   - Sharded map (kNumShards) with std::shared_mutex for concurrent reads
 //   - RefCounted allocation handles (AllocationPtr) for safe concurrent access
-//   - Auto LRU eviction on allocation failure
+//   - NO eviction on allocation failure: a write that does not fit fails, and
+//     freeing space is the owner's decision (PeerSsdManager calls Evict()).
 #pragma once
 
 #include <array>
@@ -111,27 +112,6 @@ class SpdkSsdTier : public TierBackend {
                                               const std::vector<size_t>* item_shm_offsets = nullptr,
                                               void** ext_dma_bufs = nullptr, int ext_dma_count = 0);
 
-  // Zero-copy DMA variants: data_ptrs must be DMA-registered, 4KB-aligned,
-  // with AlignUp(size) bytes of writable space per key.
-  std::vector<bool> BatchWriteDmaDirect(const std::vector<std::string>& keys,
-                                        const std::vector<void*>& dma_ptrs,
-                                        const std::vector<size_t>& sizes);
-
-  std::vector<bool> BatchReadDmaDirect(const std::vector<std::string>& keys,
-                                       const std::vector<uintptr_t>& dma_ptrs,
-                                       const std::vector<size_t>& sizes);
-
-  // Streaming zero-copy variants.
-  std::vector<bool> BatchWriteDmaStreaming(const std::vector<std::string>& keys,
-                                           const std::vector<void*>& dma_ptrs,
-                                           const std::vector<size_t>& sizes,
-                                           std::atomic<uint32_t>* items_ready);
-
-  std::vector<bool> BatchReadDmaStreaming(const std::vector<std::string>& keys,
-                                          const std::vector<uintptr_t>& dma_ptrs,
-                                          const std::vector<size_t>& sizes,
-                                          std::atomic<uint32_t>* items_done);
-
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
 
@@ -206,9 +186,6 @@ class SpdkSsdTier : public TierBackend {
   std::vector<ReadInfo> PrepareReadLookup(const std::vector<std::string>& keys,
                                           const std::vector<size_t>& sizes,
                                           std::vector<bool>& results);
-
-  // -- LRU eviction --------------------------------------------------------
-  size_t EvictLRU(size_t needed);
 
   // -- Member data ---------------------------------------------------------
   bool initialized_ = false;

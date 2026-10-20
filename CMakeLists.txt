@@ -7,6 +7,7 @@ set(CMAKE_CXX_FLAGS_O3DEBUG "-ggdb -O3")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+option(MORI_USE_LIBFABRIC "Build the OFI/libfabric backend (auto-skipped if libfabric is absent)" ON)
 
 if(NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
   message(STATUS "Build type not set - defaulting to Release")
@@ -41,13 +42,12 @@ option(BUILD_APPLICATION "Whether to build application library" ON)
 option(BUILD_SHMEM "Whether to build shmem library" ON)
 option(BUILD_CCO "Whether to build cco library" ON)
 
-if(BUILD_BENCHMARK)
-  set(_cco_sdma_default ON)
-else()
-  set(_cco_sdma_default OFF)
-endif()
-option(BUILD_CCO_SDMA "Compile the cco SDMA intra-node copy-engine path"
-       ${_cco_sdma_default})
+# ON by default. It costs ~6 KB of libmori_cco.so and no measurable build time,
+# it adds no dependency (anvil.cpp and find_package(hsakmt REQUIRED) are both
+# unconditional), and it creates no queue on its own -- MORI_ENABLE_SDMA still
+# gates that at runtime, in ccoSdmaSetupCommQueues. What OFF buys is a build
+# whose SDMA puts compile away to nothing and then silently move no bytes.
+option(BUILD_CCO_SDMA "Compile the cco SDMA intra-node copy-engine path" ON)
 if(BUILD_BENCHMARK AND NOT BUILD_CCO_SDMA)
   message(WARNING
     "BUILD_BENCHMARK=ON requires BUILD_CCO_SDMA=ON (cco benchmarks use ccoSdma); "
@@ -57,6 +57,8 @@ endif()
 
 option(BUILD_OPS "Whether to build mori operation kernels" ON)
 option(BUILD_IO "Whether to build mori io library" ON)
+option(ENABLE_IO_FAULT_INJECTION
+       "Compile MORI-IO verbs fault injection (tests only; never in production)" OFF)
 option(BUILD_COLLECTIVE "Whether to build mori collective library" ON)
 option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
@@ -238,7 +240,19 @@ if(HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)
 endif()
 
 add_library(mori_logging INTERFACE)
-target_include_directories(mori_logging INTERFACE include)
+# Prefer the real pciutils header for PCI topology enumeration. The bundled
+# 3rdparty/local_pci stub has a no-op pci_scan_bus, so if it shadows the system
+# <pci/pci.h> the PCI tree is silently empty (breaks GPU/NIC affinity). Only fall
+# back to the stub when pciutils-devel/libpci-dev is genuinely absent.
+find_path(MORI_SYSTEM_PCI_HEADER pci/pci.h)
+if(MORI_SYSTEM_PCI_HEADER)
+  message(STATUS "Using system pciutils header: ${MORI_SYSTEM_PCI_HEADER}/pci/pci.h")
+  target_include_directories(mori_logging INTERFACE include ${MORI_SYSTEM_PCI_HEADER})
+else()
+  message(WARNING "pciutils-devel/libpci-dev not found; using stub 3rdparty/local_pci "
+                  "— PCI topology detection is DISABLED (GPU/NIC affinity will not work)")
+  target_include_directories(mori_logging INTERFACE include 3rdparty/local_pci)
+endif()
 target_link_libraries(mori_logging INTERFACE spdlog::spdlog)
 
 if(HAVE_WNO_DEPRECATED_LITERAL_OPERATOR)

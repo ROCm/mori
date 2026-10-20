@@ -44,6 +44,7 @@
 #include "umbp/common/device_copy.h"
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/distributed/tier_proto.h"
 #include "umbp/local/host_mem_allocator.h"
 #include "umbp/standalone/ipc.h"
 
@@ -75,32 +76,6 @@ uint64_t FingerprintKeys(const std::vector<std::string>& keys) {
     for (char c : key) mix(static_cast<unsigned char>(c));
   }
   return hash == 0 ? kPrime : hash;
-}
-
-::umbp::TierType TierToProto(TierType tier) {
-  switch (tier) {
-    case TierType::HBM:
-      return ::umbp::TIER_HBM;
-    case TierType::DRAM:
-      return ::umbp::TIER_DRAM;
-    case TierType::SSD:
-      return ::umbp::TIER_SSD;
-    default:
-      return ::umbp::TIER_UNKNOWN;
-  }
-}
-
-TierType TierFromProto(::umbp::TierType tier) {
-  switch (tier) {
-    case ::umbp::TIER_HBM:
-      return TierType::HBM;
-    case ::umbp::TIER_DRAM:
-      return TierType::DRAM;
-    case ::umbp::TIER_SSD:
-      return TierType::SSD;
-    default:
-      return TierType::UNKNOWN;
-  }
 }
 
 UMBPDeploymentMode BackendModeFromProto(::umbp::StandaloneBackendMode mode) {
@@ -154,7 +129,9 @@ void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
   SetEnv("UMBP_DRAM_CAPACITY", config.dram.capacity_bytes);
   SetEnv("UMBP_DRAM_USE_HUGEPAGES", config.dram.use_hugepages);
   SetEnv("UMBP_DRAM_HUGEPAGE_SIZE", config.dram.hugepage_size);
-  SetEnv("UMBP_DRAM_NUMA_NODE", config.dram.numa_node);
+  SetEnv("UMBP_DRAM_NUMA_NODE", FormatNumaNodes(config.dram.numa_nodes));
+  SetEnv("UMBP_DRAM_NUMA_STRICT", config.dram.numa_strict);
+  SetEnv("UMBP_DRAM_PREFAULT_THREADS", config.dram.prefault_threads);
   SetEnv("UMBP_DRAM_PREFAULT", config.dram.prefault);
   SetEnv("UMBP_DRAM_HIGH_WM", config.dram.high_watermark);
   SetEnv("UMBP_DRAM_LOW_WM", config.dram.low_watermark);
@@ -182,6 +159,13 @@ void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
   SetEnv("UMBP_SPDK_PROXY_IDLE_EXIT_TIMEOUT_MS", config.ssd.spdk_proxy_idle_exit_timeout_ms);
   SetEnv("UMBP_SPDK_PROXY_ALLOW_BORROW", config.ssd.spdk_proxy_allow_borrow);
   SetEnv("UMBP_SPDK_PROXY_RESERVED_SHARED_BYTES", config.ssd.spdk_proxy_reserved_shared_bytes);
+
+  if (!config.backend_policy_path.empty()) {
+    SetEnv("UMBP_BACKEND_POLICY", config.backend_policy_path);
+  }
+  if (config.page_size.has_value()) {
+    SetEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", *config.page_size);
+  }
 }
 
 class ScopedBootstrapLock {

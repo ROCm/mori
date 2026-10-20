@@ -151,6 +151,12 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
+  // MORI_EP_TOKOFF_EXT only: [worldSize] pointers, entry p = PE p's dispatch slot
+  // allocator word in hipExtMallocWithFlags(Uncached) memory shared by IPC handle,
+  // used instead of the window's offTokOff. Null (the default) keeps the window.
+  int* const* tokOffPeers = nullptr;
+  void* stagingBase = nullptr;  // gfx1250 dispatch staging (EpStagingTotalBytes)
+
   int numTokens = 0;  // tokens this rank contributes this call
 };
 
@@ -183,6 +189,8 @@ struct EpArgs {
   X(gridBarrier, "p")          \
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
+  X(tokOffPeers, "p")          \
+  X(stagingBase, "p")          \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -206,7 +214,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 26,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),
@@ -238,6 +246,19 @@ struct EpCfg {
   // is free: Render omits default-valued fields, so the Cfg text -- which IS the
   // JIT cache key -- is byte-identical to a build without this feature.
   int scaleBytes = 0;
+  bool combineFp4 = false;
+  bool combineFp4F32Scale = false;
+  // combineFp4's push combine with an MXFP8 wire: e4m3 plus one e8m0 scale per 32
+  // elements. Exclusive with combineFp4 (MakeEpCfg).
+  bool combineFp8 = false;
+  // Dispatch only, gfx125x only (MakeEpCfg): how the blocks take their slots at a
+  // destination. On, the blocks of a rank add up their tokens for each destination in
+  // the state EpResStateBytes lays out, and the last of them to arrive reserves the total
+  // with one RMW on the destination's slot allocator word: one RMW per call for each
+  // pair of ranks, which matters where the RMWs on one word serialize, as they do in the
+  // cco window. Off, every block holding tokens for a destination makes its own RMW.
+  // Off is free for the same reason as scaleBytes.
+  bool aggReserve = false;
 };
 
 template <typename Self, typename Visit>
@@ -255,10 +276,14 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(waveSize);
   MORI_FIELD(useWeights);
   MORI_FIELD(scaleBytes);
+  MORI_FIELD(combineFp4);
+  MORI_FIELD(combineFp4F32Scale);
+  MORI_FIELD(combineFp8);
+  MORI_FIELD(aggReserve);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 12, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 16, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -331,6 +356,12 @@ constexpr int EpCombineSharedBytes(const EpCfg& c) {
 
 constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.dtype); }
 
+constexpr int EpCombinePushSlotAlign = 128;
+
+// The push combine: each sender quantizes its rows into the peer's landing zone,
+// and the receiver reduces what landed.
+constexpr bool EpCombinePush(const EpCfg& c) { return c.combineFp4 || c.combineFp8; }
+
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part
 // of a run that starts aligned -- at the natural 224 B only every 4th one does.
@@ -338,14 +369,40 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 //
 // Padded on every arch so the destination layout does not fork per arch. The pad
 // is unconditional, so small rows amplify: 224->256 is 1.14x, 32->128 is 4x,
-// 4->128 is 32x, and the gfx1250 staging pool is worldSize^2 * maxTok * THIS per
-// compiled variant. Bounded by the static_assert there, not by this being cheap.
+// 4->128 is 32x, and the gfx1250 scale staging is worldSize^2 * maxTok * THIS --
+// the largest term in EpStagingTotalBytes by far. It is one host allocation per
+// op now, not a __device__ array per compiled variant, so nothing fails to build
+// over it: going wider costs VRAM at construction instead.
 //
 // Everything reading the destination uses this, not Cfg.scaleBytes; it assumes
 // the arena aligns the region too (SymmArena._ALIGN, checked in hip_backend).
 constexpr int EpScaleAlign = 128;
 constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
+}
+
+// The Cfg.aggReserve state, a module global of the dispatch kernel (_resState in
+// ep_intranode_1250x.hpp); this rank's blocks are the only ones that touch it.
+//   [0]                           calls completed: the number the next call publishes
+//                                 under is one more
+//   [EpResCntOff + 4 * dst]       (blocks arrived << 20) | this rank's tokens for dst
+//                                 so far this call
+//   [EpResPubOff(ws) + 64 * dst]  (call number << 32) | the first slot reserved at dst
+//                                 this call, stored by the last block to arrive
+// Each part starts a 128 B line of its own and the published words are 64 B apart,
+// so the blocks waiting on one destination poll a word nothing else writes.
+// The last block to arrive puts the counts and the barrier counter back to zero, and a
+// published word only counts once it carries this call's number, so nothing has to be
+// cleared between calls.
+constexpr unsigned long long EpResLine = 128;
+constexpr unsigned long long EpResPubStride = 64;
+constexpr unsigned long long EpResCntOff = EpResLine;
+constexpr unsigned long long EpResPubOff(int worldSize) {
+  return EpResCntOff +
+         (4ull * (unsigned long long)worldSize + EpResLine - 1) / EpResLine * EpResLine;
+}
+constexpr unsigned long long EpResStateBytes(int worldSize) {
+  return EpResPubOff(worldSize) + EpResPubStride * (unsigned long long)worldSize;
 }
 
 // gfx1250 launch LDS. Dispatch stages one token tile per warp through the TDM
@@ -361,6 +418,69 @@ constexpr int EpCombine1250xLdsBudget = Ep1250xLdsBytes;
 // block is the only writer of its own epoch. 256 == the CU count, which caps the
 // combine block_num; the host allocates this many and every call keeps them in step.
 constexpr int EpXdbFlagSlots = 256;
+
+// ---------------------------------------------------------------------------
+// Staging layout for the gfx1250 dispatch kernel.  The six __device__ globals
+// in ep_intranode_1250x.hpp are replaced by one dynamically-allocated buffer;
+// these functions compute the byte offset of each sub-array within it.
+//
+// The buffer is local scratch (not P2P-visible), allocated once per op
+// instance and shared by all dispatch schedule variants (they are mutually
+// exclusive).  Combine does not use it.
+// ---------------------------------------------------------------------------
+constexpr int EpStagingMaxTopk = 16;
+constexpr int EpStagingMaxBlocks = 512;
+
+constexpr size_t EpAlignUp128(size_t x) { return (x + 127) & ~(size_t)127; }
+
+constexpr size_t EpStagingPoolSlots(const EpCfg& c) { return (size_t)c.worldSize * EpMaxRecv(c); }
+
+constexpr size_t EpStagingIdxOffset(const EpCfg&) { return 0; }
+constexpr size_t EpStagingIdxBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * EpStagingMaxTopk * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingWtOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingIdxOffset(c) + EpStagingIdxBytes(c));
+}
+constexpr size_t EpStagingWtBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * EpStagingMaxTopk * sizeof(float);
+}
+
+constexpr size_t EpStagingSrcOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingWtOffset(c) + EpStagingWtBytes(c));
+}
+constexpr size_t EpStagingSrcBytes(const EpCfg& c) {
+  return EpStagingPoolSlots(c) * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingBlkBaseOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingSrcOffset(c) + EpStagingSrcBytes(c));
+}
+constexpr size_t EpStagingBlkBaseBytes(const EpCfg& c) {
+  return (size_t)EpStagingMaxBlocks * c.worldSize * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingBlkCountOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingBlkBaseOffset(c) + EpStagingBlkBaseBytes(c));
+}
+constexpr size_t EpStagingBlkCountBytes(const EpCfg& c) {
+  return (size_t)EpStagingMaxBlocks * c.worldSize * sizeof(int32_t);
+}
+
+constexpr size_t EpStagingScaleOffset(const EpCfg& c) {
+  return EpAlignUp128(EpStagingBlkCountOffset(c) + EpStagingBlkCountBytes(c));
+}
+constexpr size_t EpStagingScaleBytes(const EpCfg& c) {
+  return c.scaleBytes <= 0 ? 0 : (size_t)c.worldSize * EpMaxRecv(c) * EpScaleStride(c);
+}
+
+// The scale region is the only one a Cfg can switch off; blkBase and blkCount are
+// EpStagingMaxBlocks * worldSize regardless, so the total is never zero and the
+// caller always has something to allocate.
+constexpr size_t EpStagingTotalBytes(const EpCfg& c) {
+  return EpAlignUp128(EpStagingScaleOffset(c) + EpStagingScaleBytes(c));
+}
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same
 // address, different phases), so its size bounds BOTH -- and the metadata batch
@@ -382,13 +502,22 @@ constexpr int EpXdbFlagSlots = 256;
 // follows combine.
 constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const int payload = c.hiddenDim * EpElemSize(c.dtype);
+  if (c.dtype == EpDType::Fp4x2) {
+    constexpr int kFp4Pack = 4;
+    const long long packedTotal = (long long)c.warpPerBlock * kFp4Pack * payload;
+    return packedTotal <= Ep1250xLdsBytes ? kFp4Pack * payload : payload;
+  }
   if (c.scaleBytes <= 0) return payload;
   const int wide = c.hiddenDim * EpElemSize(EpDType::Bf16);
   const long long total = (long long)wide * c.warpPerBlock;
   return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
 }
+constexpr int EpDispatch1250xMetaSlabBytes(const EpCfg& c) {
+  const int slab = EpDispatch1250xSlabBytes(c);
+  return ((long long)c.warpPerBlock * 2 * slab <= Ep1250xLdsBytes) ? slab : 0;
+}
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
-  return c.warpPerBlock * EpDispatch1250xSlabBytes(c);
+  return c.warpPerBlock * (EpDispatch1250xSlabBytes(c) + EpDispatch1250xMetaSlabBytes(c));
 }
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.
@@ -409,7 +538,10 @@ constexpr bool EpCfgIsValid(const EpCfg& c) {
          // WarpCopy moves whole 16 B chunks.
          (EpTokenBytes(c) % 16) == 0 &&
          // Scale rows are copied as dwords, so the row must be dword-sized.
-         c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0;
+         c.scaleBytes >= 0 && (c.scaleBytes % 4) == 0 &&
+         // aggReserve: lane p of warp 0 reserves destination p, and the blocks
+         // arrived pack into the 12 bits above the 20-bit total of a count word.
+         (!c.aggReserve || (c.worldSize <= c.waveSize && c.blockNum < 4096));
 }
 
 }  // namespace v2

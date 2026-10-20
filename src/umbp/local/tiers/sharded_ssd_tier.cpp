@@ -37,12 +37,19 @@ namespace {
 // Gather each shard's sub-batch, run `op` on it in parallel across drives, and
 // scatter the per-key results back.  Shared by the put and get paths, which
 // differ only in the pointer type and the backend call.  Buckets touch disjoint
-// shards and disjoint result indices, so nothing here needs a lock.
+// shards and disjoint result indices, so nothing here needs a lock -- PROVIDED
+// the per-key slots are separate memory locations.  std::vector<bool> packs
+// them into shared words, and two drives finishing together would each
+// rewrite the word holding the other's results: a read or write that succeeded
+// came back false (seen as rare "PrepareReadBatch read failed" under parallel
+// SSD load).  So the workers fill a vector<char> and `results` is written once
+// they have all joined.
 template <typename PtrT, typename Op>
 void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::vector<int>& busy,
                    int io_threads, const std::vector<std::string>& keys,
                    const std::vector<PtrT>& ptrs, const std::vector<size_t>& sizes,
                    std::vector<bool>& results, std::vector<double>& shard_ms, Op&& op) {
+  std::vector<char> ok(results.size(), 0);
   ParallelFor(busy.size(), io_threads, [&](size_t bi) {
     const int s = busy[bi];
     const auto t_shard = ssdperf::Now();
@@ -60,10 +67,13 @@ void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::v
     }
     const auto shard_res = op(s, k, d, z);
     for (size_t j = 0; j < idxs.size(); ++j) {
-      results[idxs[j]] = j < shard_res.size() && shard_res[j];
+      ok[idxs[j]] = (j < shard_res.size() && shard_res[j]) ? 1 : 0;
     }
     shard_ms[s] = ssdperf::MsSince(t_shard);  // disjoint shards: no race on shard_ms
   });
+  for (int s : busy) {
+    for (size_t i : buckets[s]) results[i] = ok[i] != 0;
+  }
 }
 
 // Indices of the shards this batch actually touches.
@@ -147,6 +157,10 @@ void ShardedSsdTier::ReleaseLocked(int shard, size_t size) {
   used_hint_[shard] = used_hint_[shard] > size ? used_hint_[shard] - size : 0;
 }
 
+void ShardedSsdTier::RefreshHintsLocked() {
+  for (size_t i = 0; i < shards_.size(); ++i) used_hint_[i] = shards_[i]->Capacity().first;
+}
+
 int ShardedSsdTier::ShardOf(const std::string& key) const {
   std::shared_lock<std::shared_mutex> lock(map_mu_);
   return LookupLocked(key);
@@ -167,6 +181,7 @@ bool ShardedSsdTier::Write(const std::string& key, const void* data, size_t size
     shard = LookupLocked(key);
     is_new = shard < 0;
     if (is_new) {
+      RefreshHintsLocked();
       shard = PickShardLocked(size);
       if (shard < 0) {
         MORI_UMBP_WARN("[ShardedSsdTier] Write key={} size={}: no shard has room", key, size);
@@ -241,8 +256,11 @@ TierCapabilities ShardedSsdTier::Capabilities() const {
   caps.batch_write = true;
   caps.batch_read = true;
   caps.zero_copy_read = true;
+  caps.orders_eviction = true;
   for (const auto& s : shards_) {
-    if (!s->Capabilities().zero_copy_read) caps.zero_copy_read = false;
+    const auto shard_caps = s->Capabilities();
+    if (!shard_caps.zero_copy_read) caps.zero_copy_read = false;
+    if (!shard_caps.orders_eviction) caps.orders_eviction = false;
   }
   return caps;
 }
@@ -285,29 +303,97 @@ std::vector<std::string> ShardedSsdTier::GetLRUCandidates(size_t max_candidates)
   return out;
 }
 
-std::optional<std::string> ShardedSsdTier::GetLocationId(const std::string& key) const {
-  const int shard = ShardOf(key);
-  if (shard < 0) return std::nullopt;
-  auto inner = shards_[shard]->GetLocationId(key);
-  if (!inner) return std::nullopt;
-  // Prefix the drive so a location string identifies which device holds the key.
-  return "s" + std::to_string(shard) + ":" + *inner;
+std::vector<EvictionHint> ShardedSsdTier::EvictionOrder(size_t max_keys) {
+  std::vector<EvictionHint> out;
+  if (max_keys == 0) return out;
+  std::vector<std::pair<double, size_t>> fullness;  // (used / total, shard)
+  fullness.reserve(shards_.size());
+  for (size_t i = 0; i < shards_.size(); ++i) {
+    const auto [used, total] = shards_[i]->Capacity();
+    fullness.emplace_back(total > 0 ? static_cast<double>(used) / static_cast<double>(total) : 0.0,
+                          i);
+  }
+  std::stable_sort(fullness.begin(), fullness.end(),
+                   [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& [ratio, shard] : fullness) {
+    if (out.size() >= max_keys) break;
+    auto hints = shards_[shard]->EvictionOrder(max_keys - out.size());
+    for (auto& hint : hints) out.push_back(std::move(hint));
+  }
+  return out;
 }
 
-std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) const {
+void ShardedSsdTier::SetRetiredFileHook(std::function<void(int fd)> on_close,
+                                        std::chrono::milliseconds grace) {
+  for (auto& s : shards_) s->SetRetiredFileHook(on_close, grace);
+}
+
+TierSpaceStats ShardedSsdTier::SpaceStats() const {
+  TierSpaceStats sum;
+  for (const auto& s : shards_) {
+    const TierSpaceStats one = s->SpaceStats();
+    sum.live_bytes += one.live_bytes;
+    sum.files += one.files;
+    sum.files_deleted += one.files_deleted;
+    sum.bytes_deleted += one.bytes_deleted;
+    sum.no_room += one.no_room;
+  }
+  return sum;
+}
+
+std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
   return shards_[shard]->LocateRecord(key);
+}
+
+std::optional<RecordReservation> ShardedSsdTier::ReserveRecord(const std::string& key,
+                                                               size_t size) {
+  int shard;
+  {
+    std::unique_lock<std::shared_mutex> lock(map_mu_);
+    shard = LookupLocked(key);
+    if (shard < 0) {
+      RefreshHintsLocked();
+      shard = PickShardLocked(size);
+      if (shard < 0) return std::nullopt;
+      key_shard_[key] = KeyLoc{static_cast<uint32_t>(shard), size};
+      ReserveLocked(shard, size);
+    }
+  }
+  auto r = shards_[shard]->ReserveRecord(key, size);
+  if (!r) ForgetIfGone(key, shard);
+  return r;
+}
+
+bool ShardedSsdTier::CommitRecord(const std::string& key, const RecordReservation& r) {
+  const int shard = ShardOf(key);
+  if (shard < 0) return false;
+  if (shards_[shard]->CommitRecord(key, r)) return true;
+  ForgetIfGone(key, shard);
+  return false;
+}
+
+void ShardedSsdTier::AbortRecord(const std::string& key, const RecordReservation& r) {
+  const int shard = ShardOf(key);
+  if (shard < 0) return;
+  shards_[shard]->AbortRecord(key, r);
+  ForgetIfGone(key, shard);
+}
+
+void ShardedSsdTier::ForgetIfGone(const std::string& key, int shard) {
+  if (shards_[shard]->Exists(key)) return;
+  std::unique_lock<std::shared_mutex> lock(map_mu_);
+  auto it = key_shard_.find(key);
+  if (it == key_shard_.end() || static_cast<int>(it->second.shard) != shard) return;
+  ReleaseLocked(shard, it->second.size);
+  key_shard_.erase(it);
 }
 
 bool ShardedSsdTier::Flush() {
   bool ok = true;
   for (auto& s : shards_) ok = s->Flush() && ok;
   return ok;
-}
-
-void ShardedSsdTier::SetColdRead(bool enable) {
-  for (auto& s : shards_) s->SetColdRead(enable);
 }
 
 std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& keys,
@@ -327,6 +413,7 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   std::vector<char> is_new(keys.size(), 0);
   {
     std::unique_lock<std::shared_mutex> lock(map_mu_);
+    RefreshHintsLocked();
     for (size_t i = 0; i < keys.size(); ++i) {
       int shard = LookupLocked(keys[i]);
       if (shard < 0) {

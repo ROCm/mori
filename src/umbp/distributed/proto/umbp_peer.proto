@@ -142,6 +142,9 @@ message EvictKeyEntry {
 }
 message EvictKeyRequest {
   repeated string keys = 1;
+  // The medium to free keys[i] from.  Used only if sized like `keys`; older
+  // masters send none.
+  repeated TierType tiers = 2;
 }
 message EvictKeyResponse {
   repeated EvictKeyEntry evicted = 1;

@@ -74,8 +74,8 @@ namespace mori::umbp {
 // FILE ENDPOINT (kind == File): the "one-file change" the note below predicted.
 // A `kind` tag plus a second handle set — an O_DIRECT fd, a file offset, and an
 // opaque engine handle — lets a backend publish a byte range of a file that a
-// file engine (GdsEngine) moves straight between the drive and device memory,
-// with no host bounce.  The memory-only engines ignore it for free: their
+// file engine moves in place: GdsEngine to device memory, PosixEngine to and
+// from host memory.  The memory-only engines ignore it for free: their
 // CanHandle keys on HasHostPtr()/HasMemoryDesc(), both false for a file ref, so
 // the existing per-pair selection already routes it to the only engine that
 // claims it.  SsdBackend is the backend that needed it (design doc §4/§6).
@@ -284,12 +284,13 @@ enum class TransferDirection {
   kLocal  // local -> local   (no wire)
 };
 
-// One grouped unit of work, produced by Plan() and consumed by Submit().
+// One grouped unit of work, produced by an engine's plan builder and consumed
+// by Submit().
 //
 // Collapsing a scatter into one plan per endpoint pair is an RDMA optimization
-// — it cuts CQE and post count — which is exactly why Plan() is virtual and
-// not a base-class helper: a memcpy engine gains nothing from pair grouping and
-// a file engine would rather group by file and merge adjacent offset ranges.
+// — it cuts CQE and post count — which is exactly why each engine supplies its
+// own builder: a memcpy engine gains little from pair grouping and a file
+// engine would rather group by file and merge adjacent offset ranges.
 // Submit-all-then-wait IS universal, and lives with the caller's scheduler.
 struct TransferPlan {
   TransferRef src;
@@ -324,6 +325,22 @@ struct TransferPlan {
 struct TransferPlanSet {
   std::vector<TransferPlan> plans;
   std::vector<size_t> rejected_tags;
+};
+
+// Plans a batch one item at a time; Finish() hands the plans over once.
+// Every builder keeps these rules:
+//   * Add() does no IO and changes no engine state.
+//   * An empty item is dropped.
+//   * An item the engine cannot carry (CanHandle() refuses the pair, or a range
+//     is out of bounds) goes to rejected_tags; the caller fails its key.
+//   * Every other item lands in one plan whose `tags` name it.
+//   * Plan order is deterministic.
+// Shared pieces are in plan_builder.h.
+class TransferPlanBuilder {
+ public:
+  virtual ~TransferPlanBuilder() = default;
+  virtual void Add(const TransferItem& item) = 0;
+  virtual TransferPlanSet Finish() = 0;
 };
 
 // One failed plan, mapped back to the keys that rode in it.  Carries enough to
@@ -376,10 +393,14 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // function of the PAIR, never of either endpoint alone.
   virtual bool CanHandle(const TransferRef& src, const TransferRef& dst) const = 0;
 
-  // Group `items` into the units this engine wants to submit.  Pure: no IO is
-  // issued and no engine state changes, so a caller may plan on one thread and
-  // submit on another.
-  virtual TransferPlanSet Plan(const std::vector<TransferItem>& items) const = 0;
+  // The one planning hook; see TransferPlanBuilder.  `expected_items` is a
+  // reservation hint.
+  virtual std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(
+      size_t expected_items = 0) const = 0;
+
+  // CreatePlanBuilder() over `items`.  Pure, so a caller may plan on one thread
+  // and submit on another.
+  TransferPlanSet Plan(const std::vector<TransferItem>& items) const;
 
   // Post `plans`.  Returns a handle to wait on, or nullptr if nothing was
   // posted (in which case every tag in `plans` must be treated as failed).
@@ -404,6 +425,10 @@ class TransferEngine : public MemoryRegistrar, public MetricSource {
   // Plan + Submit + Wait, for callers with nothing to overlap.  Returns false
   // and fills `failed_tags` if anything was rejected or failed.
   bool Transfer(const std::vector<TransferItem>& items, std::vector<size_t>* failed_tags,
+                const StepTiming* timing = nullptr);
+
+  // Submit and wait for work that has already been planned.
+  bool Transfer(TransferPlanSet planned, std::vector<size_t>* failed_tags,
                 const StepTiming* timing = nullptr);
 };
 

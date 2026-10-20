@@ -24,13 +24,61 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <string>
 
+#include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/pool/policy_config.h"
 
 namespace mori::umbp {
 namespace {
+
+TEST(BackendPolicyConfig, NumaListParsingAndCapacitySplitting) {
+  EXPECT_TRUE(ParseNumaNodes("-1").empty());
+  EXPECT_EQ(ParseNumaNodes("0"), (std::vector<int>{0}));
+  EXPECT_EQ(ParseNumaNodes(" 0, 2 "), (std::vector<int>{0, 2}));
+  for (const auto* bad : {"", "0,", "0,,1", "0,0", "-1,0", "2x"}) {
+    EXPECT_THROW(ParseNumaNodes(bad), std::invalid_argument) << bad;
+  }
+  EXPECT_EQ(SplitNumaCapacity(11 * 4096 + 7, 2, 4096),
+            (std::vector<uint64_t>{5 * 4096, 6 * 4096 + 7}));
+  EXPECT_THROW(SplitNumaCapacity(4096, 2, 4096), std::invalid_argument);
+}
+
+TEST(BackendPolicyConfig, BlankNumaEnvironmentMeansNoBinding) {
+  for (const char* blank : {"", "  "}) {
+    ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", blank, 1), 0);
+    EXPECT_TRUE(UMBPConfig::FromEnvironment().dram.numa_nodes.empty()) << "'" << blank << "'";
+  }
+  ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", "1,0", 1), 0);
+  EXPECT_EQ(UMBPConfig::FromEnvironment().dram.numa_nodes, (std::vector<int>{1, 0}));
+  ASSERT_EQ(setenv("UMBP_DRAM_NUMA_NODE", "0,", 1), 0);
+  EXPECT_THROW(UMBPConfig::FromEnvironment(), std::invalid_argument);
+  unsetenv("UMBP_DRAM_NUMA_NODE");
+}
+
+TEST(BackendPolicyConfig, NumaPolicyPreservesHostOptionsAndSplitsBothNodes) {
+  const char* json = R"({"schema_version":1,"backends":{
+    "dram":{"type":"dram","capacity":"1GiB","numa_node":[0,1]}},
+    "tiers":[{"name":"host","backends":{"dram":100}}],"entry_tier":"host"})";
+  auto loaded = LoadBackendPolicyJson(json);
+  ASSERT_TRUE(loaded.ok()) << loaded.error;
+  PoolClientConfig output;
+  output.dram_page_size = 4096;
+  output.dram.use_hugepages = true;
+  output.dram.numa_strict = true;
+  output.dram.prefault_threads = 4;
+  std::string error;
+  ASSERT_TRUE(ApplyBackendPolicy(*loaded.config, &output, &error)) << error;
+  ASSERT_EQ(output.backends.size(), 1u);
+  const auto& dram = output.backends.front().dram;
+  EXPECT_EQ(dram.numa_nodes, (std::vector<int>{0, 1}));
+  EXPECT_EQ(dram.buffer_sizes, (std::vector<uint64_t>{1ULL << 29, 1ULL << 29}));
+  EXPECT_TRUE(dram.use_hugepages);
+  EXPECT_TRUE(dram.numa_strict);
+  EXPECT_EQ(dram.prefault_threads, 4);
+}
 
 // The three-tier example we ship, read from disk rather than copied here, so
 // that editing one without the other fails this test.
@@ -56,7 +104,7 @@ TEST(BackendPolicyConfig, ParsesAndLowersShippedExample) {
     return nullptr;
   };
   ASSERT_NE(find_backend("dram"), nullptr);
-  EXPECT_EQ(find_backend("dram")->dram.numa_node, 0);
+  EXPECT_EQ(find_backend("dram")->dram.numa_nodes, (std::vector<int>{0}));
   ASSERT_NE(find_backend("hbm@0"), nullptr);
   ASSERT_NE(find_backend("hbm@1"), nullptr);
   EXPECT_EQ(find_backend("hbm@0")->hbm.buffer_sizes.front(), 40ULL << 30);
@@ -242,13 +290,7 @@ TEST(BackendPolicyConfig, LowersPromoteTriggerAndRejectsIncoherentThresholds) {
   }
 }
 
-// An SSD backend's staging arena is staging_slots * page_size, and a read that
-// cannot claim a slot is reported as a miss rather than as backpressure, so the
-// slot count is a hard read-concurrency ceiling. Left at the default of 16 a
-// 64 KiB-page backend has a 1 MiB arena, which under a mixed workload fails the
-// majority of its reads and, because the offload target then refuses pages,
-// most of its writes too. Omitting the field must keep the previous default so
-// existing policies are unaffected.
+// An omitted staging_slots takes the 4 GiB preset, capped at the tier.
 TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
   auto loaded = LoadBackendPolicyJson(R"json(
     {"backends":{
@@ -271,7 +313,12 @@ TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
     return -1;
   };
   EXPECT_EQ(slots_of("with_slots"), 512);
-  EXPECT_EQ(slots_of("without"), BackendInstanceConfig{}.ssd_staging_buffer_slots);
+  EXPECT_EQ(slots_of("without"), 0);
+
+  constexpr uint64_t kPage = 64ULL << 10;
+  EXPECT_EQ(SsdStagingPages(512, 1ULL << 30, kPage), 512u);
+  EXPECT_EQ(SsdStagingPages(0, 1ULL << 40, kPage), (4ULL << 30) / kPage);
+  EXPECT_EQ(SsdStagingPages(0, 1ULL << 30, kPage), (1ULL << 30) / kPage);
 
   // A DRAM backend has no staging arena, so the field must not be silently
   // accepted there and then ignored.

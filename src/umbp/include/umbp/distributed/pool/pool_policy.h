@@ -47,6 +47,7 @@ struct PoolPlacementRequest {
   TierType tier = TierType::UNKNOWN;
   std::string backend_name;
   std::string logical_tier;
+  int preferred_numa_node = -1;
 };
 
 // Decision-only interface. A policy returns backend ids; PeerPool owns slot

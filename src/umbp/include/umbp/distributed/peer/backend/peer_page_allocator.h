@@ -109,69 +109,30 @@ class PageBitmapAllocator : public PagePool {
 
   // All-or-nothing allocate.  See class doc for strategy ordering; nullopt
   // leaves every bitmap bit untouched.
-  std::optional<std::vector<PageLocation>> Allocate(uint32_t num_pages) override {
+  std::optional<std::vector<PageLocation>> Allocate(
+      uint32_t num_pages, std::optional<size_t> preferred_buffer = std::nullopt) override {
     if (num_pages == 0) return std::nullopt;
 
-    // Strategy 1: same-buffer continuous run.
+    if (preferred_buffer && *preferred_buffer < buffers_.size()) {
+      auto& local = buffers_[*preferred_buffer];
+      if (local.free_count >= num_pages) {
+        if (auto pages = AllocateInBuffer(local, num_pages, true)) return pages;
+        return AllocateInBuffer(local, num_pages, false);
+      }
+      return AllocateAcrossBuffers(num_pages, *preferred_buffer, true);
+    }
+
+    // Preserve the original order when there is no valid preference.
     for (auto& buf : buffers_) {
       if (buf.free_count < num_pages) continue;
-      auto run_start = FindContinuousFreeRun(buf, num_pages);
-      if (run_start) {
-        std::vector<PageLocation> pages;
-        pages.reserve(num_pages);
-        for (uint32_t k = 0; k < num_pages; ++k) {
-          uint32_t idx = *run_start + k;
-          buf.bitmap[idx] = true;
-          pages.push_back({buf.buffer_index, idx});
-        }
-        buf.free_count -= num_pages;
-        // Resume the next search just past this run.
-        buf.cursor = (*run_start + num_pages) % buf.total_pages;
-        return pages;
-      }
+      if (auto pages = AllocateInBuffer(buf, num_pages, true)) return pages;
     }
-
-    // Strategy 2: same-buffer discrete pages.  free_count >= num_pages is
-    // sufficient to guarantee CollectFirstNFree() can yield exactly num_pages.
     for (auto& buf : buffers_) {
-      if (buf.free_count < num_pages) continue;
-      auto idxs = CollectFirstNFree(buf, num_pages);
-      std::vector<PageLocation> pages;
-      pages.reserve(num_pages);
-      for (auto idx : idxs) {
-        buf.bitmap[idx] = true;
-        pages.push_back({buf.buffer_index, idx});
-      }
-      buf.free_count -= num_pages;
-      if (!idxs.empty()) buf.cursor = (idxs.back() + 1) % buf.total_pages;
-      return pages;
+      if (buf.free_count >= num_pages) return AllocateInBuffer(buf, num_pages, false);
     }
 
-    // Strategy 3: cross-buffer discrete pages (greedy, in buffer-index order).
-    // First a guarded total-capacity check so that we never partially mutate
-    // bitmaps when the request can't be satisfied globally.
-    uint64_t total_free = 0;
-    for (const auto& b : buffers_) total_free += b.free_count;
-    if (total_free < num_pages) return std::nullopt;
-
-    std::vector<PageLocation> pages;
-    pages.reserve(num_pages);
-    uint32_t remaining = num_pages;
-    for (auto& buf : buffers_) {
-      if (remaining == 0) break;
-      if (buf.free_count == 0) continue;
-      uint32_t take = std::min<uint32_t>(remaining, buf.free_count);
-      auto idxs = CollectFirstNFree(buf, take);
-      for (auto idx : idxs) {
-        buf.bitmap[idx] = true;
-        pages.push_back({buf.buffer_index, idx});
-      }
-      buf.free_count -= take;
-      remaining -= take;
-    }
-    return pages;
+    return AllocateAcrossBuffers(num_pages, 0, false);
   }
-
   // Idempotent free: for each entry, only flip true -> false.  Out-of-range
   // buffer_index / page_index and already-free pages are silently skipped
   // (do NOT throw, do NOT underflow free_count).
@@ -212,6 +173,59 @@ class PageBitmapAllocator : public PagePool {
   const std::vector<BufferState>& Buffers() const { return buffers_; }
 
  private:
+  static std::optional<std::vector<PageLocation>> AllocateInBuffer(BufferState& buf, uint32_t count,
+                                                                   bool contiguous) {
+    std::optional<uint32_t> start;
+    if (contiguous) {
+      start = FindContinuousFreeRun(buf, count);
+      if (!start) return std::nullopt;
+    }
+    const auto indices = contiguous ? std::vector<uint32_t>{} : CollectFirstNFree(buf, count);
+    std::vector<PageLocation> pages;
+    pages.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t index = start ? *start + i : indices[i];
+      buf.bitmap[index] = true;
+      pages.push_back({buf.buffer_index, index});
+    }
+    buf.free_count -= count;
+    buf.cursor = (pages.back().page_index + 1) % buf.total_pages;
+    return pages;
+  }
+
+  std::optional<std::vector<PageLocation>> AllocateAcrossBuffers(uint32_t num_pages, size_t first,
+                                                                 bool advance_cursors) {
+    // Check before mutating any bitmap. A local fragment is useful even when
+    // another buffer could independently satisfy the whole request.
+    // First a guarded total-capacity check so that we never partially mutate
+    // bitmaps when the request can't be satisfied globally.
+    uint64_t total_free = 0;
+    for (const auto& b : buffers_) total_free += b.free_count;
+    if (total_free < num_pages) return std::nullopt;
+
+    std::vector<PageLocation> pages;
+    pages.reserve(num_pages);
+    uint32_t remaining = num_pages;
+    for (size_t i = 0; i < buffers_.size(); ++i) {
+      auto& buf = buffers_[(first + i) % buffers_.size()];
+      if (remaining == 0) break;
+      if (buf.free_count == 0) continue;
+      uint32_t take = std::min<uint32_t>(remaining, buf.free_count);
+      auto idxs = CollectFirstNFree(buf, take);
+      for (auto idx : idxs) {
+        buf.bitmap[idx] = true;
+        pages.push_back({buf.buffer_index, idx});
+      }
+      buf.free_count -= take;
+      // NUMA spill becomes the normal path when a local buffer fills. Keep
+      // next-fit progress there instead of rescanning all earlier spills on
+      // every request. The no-preference path retains its original ordering.
+      if (advance_cursors) buf.cursor = (idxs.back() + 1) % buf.total_pages;
+      remaining -= take;
+    }
+    return pages;
+  }
+
   // Find a contiguous run of `n` free pages in `buf`.  Returns the starting
   // page_index on success, nullopt if no such run exists.  O(total_pages).
   // Next-fit: start where the last search stopped and wrap once.  A run may

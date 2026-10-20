@@ -147,11 +147,11 @@ struct Harness {
 Harness MakeHarness(bool single_flight = true) {
   auto be = std::make_unique<GatedBackend>(1'000'000);
   GatedBackend* raw = be.get();
-  return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be), 0.9, 0.7, single_flight)};
+  return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be), single_flight)};
 }
 
-std::vector<std::pair<const void*, size_t>> OneSeg(const std::string& s) {
-  return {{s.data(), s.size()}};
+bool Put(PeerSsdManager& mgr, const std::string& key, const std::string& value) {
+  return mgr.WriteBatch({key}, {value.data()}, {value.size()})[0];
 }
 
 // Spin until `n` requesters have found a read already in flight.  Deterministic
@@ -166,7 +166,7 @@ void WaitForDups(const PeerSsdManager& mgr, uint64_t n) {
 TEST(PeerSsdSingleFlight, ConcurrentSameKeyReadsIssueOneDeviceRead) {
   auto h = MakeHarness();
   const std::string payload = "kv-page-payload";
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg(payload), payload.size()));
+  ASSERT_TRUE(Put(*h.mgr, "K", payload));
 
   h.backend->BlockReads();
   std::vector<std::vector<char>> bufs(kFanout, std::vector<char>(payload.size(), '\0'));
@@ -194,7 +194,7 @@ TEST(PeerSsdSingleFlight, ConcurrentSameKeyReadsIssueOneDeviceRead) {
 TEST(PeerSsdSingleFlight, DisabledIssuesOneDeviceReadPerRequester) {
   auto h = MakeHarness(/*single_flight=*/false);
   const std::string payload = "kv-page-payload";
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg(payload), payload.size()));
+  ASSERT_TRUE(Put(*h.mgr, "K", payload));
 
   h.backend->BlockReads();
   std::vector<std::vector<char>> bufs(kFanout, std::vector<char>(payload.size(), '\0'));
@@ -221,7 +221,7 @@ TEST(PeerSsdSingleFlight, DisabledIssuesOneDeviceReadPerRequester) {
 TEST(PeerSsdSingleFlight, LeaderFailureReleasesFollowersWithError) {
   auto h = MakeHarness();
   const std::string payload = "kv-page-payload";
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg(payload), payload.size()));
+  ASSERT_TRUE(Put(*h.mgr, "K", payload));
 
   h.backend->BlockReads();
   h.backend->SetFailReads(true);
@@ -247,7 +247,7 @@ TEST(PeerSsdSingleFlight, LeaderFailureReleasesFollowersWithError) {
 TEST(PeerSsdSingleFlight, DistinctKeysDoNotMerge) {
   auto h = MakeHarness();
   for (int i = 0; i < kFanout; ++i) {
-    ASSERT_TRUE(h.mgr->Write("K" + std::to_string(i), OneSeg("payload!"), 8));
+    ASSERT_TRUE(Put(*h.mgr, "K" + std::to_string(i), "payload!"));
   }
 
   h.backend->BlockReads();
@@ -277,7 +277,7 @@ TEST(PeerSsdSingleFlight, DistinctKeysDoNotMerge) {
 TEST(PeerSsdSingleFlight, SequentialRoundsStayIndependent) {
   auto h = MakeHarness();
   const std::string payload = "kv-page-payload";
-  ASSERT_TRUE(h.mgr->Write("K", OneSeg(payload), payload.size()));
+  ASSERT_TRUE(Put(*h.mgr, "K", payload));
 
   for (int round = 0; round < 20; ++round) {
     h.backend->BlockReads();

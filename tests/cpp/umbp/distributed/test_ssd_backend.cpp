@@ -20,15 +20,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// SsdBackend: SSD reaching the data plane as an ordinary MediumBackend by
-// staging through registered host DRAM.
-//
-// What is worth asserting here is the part that differs from DRAM — the spill
-// on Commit, the fill on Resolve, and the staging arena that both borrow from —
-// plus the invariant that makes the whole design work: what the backend
-// PUBLISHES is plain host memory, so no transfer-layer change was needed.
+// SsdBackend: the staged path (spill on Commit, fill on Resolve, the arena both
+// borrow from) and the in-place path a local file engine takes.
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -43,9 +39,13 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/common/fd_limit.h"
 #include "umbp/distributed/peer/backend/ssd_backend.h"
+#include "umbp/distributed/pool/peer_pool.h"
+#include "umbp/distributed/pool/tier_transition.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#include "umbp/distributed/transfer/posix_engine.h"
 #ifdef UMBP_ENABLE_GDS
 #include <hip/hip_runtime.h>
 
@@ -76,6 +76,15 @@ class LocalOnlyRegistrar final : public MemoryRegistrar {
   int deregistrations = 0;
   mori::io::MemoryLocationType last_loc = mori::io::MemoryLocationType::GPU;
 };
+
+// `name`'s samples keyed by their one label's value.
+std::map<std::string, uint64_t> Samples(const MediumBackend& backend, const char* name) {
+  std::map<std::string, uint64_t> out;
+  for (const auto& m : backend.SampleMetrics()) {
+    if (std::string(m.name) == name) out[m.labels.at(0).second] = m.value;
+  }
+  return out;
+}
 
 class SsdBackendTest : public ::testing::Test {
  protected:
@@ -160,7 +169,10 @@ class SsdBackendTest : public ::testing::Test {
     return v;
   }
 
-  SsdBackendTest() { engine_.AddEngine(std::make_unique<LocalCopyEngine>()); }
+  SsdBackendTest() {
+    engine_.AddEngine(std::make_unique<LocalCopyEngine>());
+    engine_.AddEngine(std::make_unique<PosixEngine>());
+  }
 
   fs::path dir_;
   LocalOnlyRegistrar registrar_;
@@ -168,13 +180,102 @@ class SsdBackendTest : public ::testing::Test {
   std::unique_ptr<SsdBackend> backend_;
 };
 
+// A local file engine writes and reads the SSD file in place: with the only
+// staging page held by a reader, the file slot, its commit and a file-ref
+// migration read still go through, while a staged write cannot.
+TEST_F(SsdBackendTest, FileEngineWritesAndReadsWithoutStaging) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend, "blocker", Payload(100, 1)));
+  ASSERT_TRUE(backend->BatchResolve({"blocker"}, false)[0].found);
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"staged", 100}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace);
+
+  const auto payload = Payload(10000, 7);
+  const auto slot = backend->BatchAllocate({AllocateRequest{"k", payload.size(), -1, true}})[0];
+  ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+  ASSERT_TRUE(slot.file_ref.IsFile());
+  EXPECT_TRUE(slot.pages.empty());
+  TransferItem put;
+  put.src = TransferRef::HostBytes(const_cast<char*>(payload.data()), payload.size());
+  put.dst = slot.file_ref;
+  put.size = payload.size();
+  ASSERT_TRUE(engine_.Transfer({put}, nullptr));
+  ASSERT_TRUE(backend->BatchCommit({CommitRequest{slot.slot_id, "k"}})[0].success);
+
+  ResolvedEntry moved;
+  ASSERT_TRUE(backend->AcquireMigrationRead("k", &moved, /*allow_file_ref=*/true));
+  ASSERT_TRUE(moved.file_ref.IsFile());
+  std::vector<char> out(payload.size());
+  TransferItem get;
+  get.src = moved.file_ref;
+  get.dst = TransferRef::HostBytes(out.data(), out.size());
+  get.size = out.size();
+  ASSERT_TRUE(engine_.Transfer({get}, nullptr));
+  backend->ReleaseMigrationRead("k");
+  EXPECT_EQ(out, payload);
+}
+
+// DRAM -> SSD -> DRAM through the executor while the SSD's only staging page is
+// held: both directions go through the file.
+TEST_F(SsdBackendTest, ExecutorDemotesAndPromotesWithoutStaging) {
+  Start(/*staging_pages=*/1, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "blocker", Payload(100, 1)));
+  ASSERT_TRUE(backend_->BatchResolve({"blocker"}, false)[0].found);
+
+  PageBackend::OwnershipConfig ownership;
+  ownership.buffer_sizes = {4 * kPageSize};
+  auto dram_owned = MakePageBackend(TierType::DRAM, kPageSize, ownership, std::chrono::seconds{30},
+                                    std::chrono::seconds{30});
+  ASSERT_TRUE(dram_owned->Init(&engine_));
+  BackendRegistry registry;
+  MediumBackend* dram = dram_owned.get();
+  MediumBackend* ssd = backend_.get();
+  ASSERT_TRUE(registry.Register("dram", std::move(dram_owned)));
+  ASSERT_TRUE(registry.Register("ssd", std::move(backend_)));
+  const uint32_t dram_id = registry.BackendId(dram);
+  const uint32_t ssd_id = registry.BackendId(ssd);
+
+  const auto payload = Payload(10000, 3);
+  const auto slot = dram->BatchAllocate({AllocateRequest{"k", payload.size()}})[0];
+  ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+  TransferItem put;
+  put.src = TransferRef::HostBytes(const_cast<char*>(payload.data()), payload.size());
+  put.dst = dram->BufferRef(slot.pages[0].buffer_index);
+  put.dst_offset = static_cast<uint64_t>(slot.pages[0].page_index) * kPageSize;
+  put.size = payload.size();
+  ASSERT_TRUE(engine_.Transfer({put}, nullptr));
+  ASSERT_TRUE(dram->BatchCommit({CommitRequest{slot.slot_id, "k"}})[0].success);
+
+  TierTransitionExecutor executor(&registry, &engine_);
+  ASSERT_TRUE(executor.Execute("k", dram_id, {ssd_id}, /*remove_source=*/true).success);
+  EXPECT_FALSE(dram->Contains("k"));
+  ASSERT_TRUE(executor.Execute("k", ssd_id, {dram_id}, /*remove_source=*/true).success);
+  EXPECT_FALSE(ssd->Contains("k"));
+
+  const auto got = dram->BatchResolve({"k"}, false)[0];
+  ASSERT_TRUE(got.found);
+  std::vector<char> out(payload.size());
+  TransferItem get;
+  get.src = dram->BufferRef(got.pages[0].buffer_index);
+  get.src_offset = static_cast<uint64_t>(got.pages[0].page_index) * kPageSize;
+  get.dst = TransferRef::HostBytes(out.data(), out.size());
+  get.size = out.size();
+  ASSERT_TRUE(engine_.Transfer({get}, nullptr));
+  EXPECT_EQ(out, payload);
+
+  auto events = Samples(*ssd, MORI_UMBP_METRIC_BACKEND_MEDIUM_EVENTS_TOTAL);
+  EXPECT_EQ(events["write_in_place"], 1u);
+  EXPECT_GE(events["migration_in_place"], 1u);
+  EXPECT_EQ(events["migration_staged"], 0u);
+  ssd->Shutdown();
+}
+
 // ---------------------------------------------------------------------------
 //  The design invariant
 // ---------------------------------------------------------------------------
 
-// The reason SSD needed no new engine, no new TransferRef kind and no chaining:
-// what it publishes is ordinary registered HOST memory.  If this ever changes,
-// every claim in ssd_backend.h's header comment stops holding.
+// What the staged path publishes is ordinary registered HOST memory, so a
+// remote peer reads and writes it with no SSD awareness.
 TEST_F(SsdBackendTest, PublishesPlainHostMemorySoNoNewEngineIsNeeded) {
   SsdBackend* backend = Start();
 
@@ -201,6 +302,32 @@ TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {
 // ---------------------------------------------------------------------------
 //  Put / Get
 // ---------------------------------------------------------------------------
+
+// The tier also runs inside other programs (sglang, embedded), so it leaves the
+// process-wide fd limit alone; UMBP's executables raise it in main().
+TEST_F(SsdBackendTest, LeavesTheOpenFileLimitToTheExecutable) {
+  struct rlimit original{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &original), 0);
+  if (original.rlim_max == RLIM_INFINITY || original.rlim_max <= 1024) {
+    GTEST_SKIP() << "hard RLIMIT_NOFILE " << original.rlim_max << " leaves nothing to test";
+  }
+  struct Restore {
+    rlimit rl;
+    ~Restore() { setrlimit(RLIMIT_NOFILE, &rl); }
+  } restore{original};
+  struct rlimit low = original;
+  low.rlim_cur = 1024;  // docker's default
+  ASSERT_EQ(setrlimit(RLIMIT_NOFILE, &low), 0);
+
+  Start();
+  struct rlimit now{};
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, 1024u);
+
+  RaiseOpenFileLimit();
+  ASSERT_EQ(getrlimit(RLIMIT_NOFILE, &now), 0);
+  EXPECT_EQ(now.rlim_cur, original.rlim_max);
+}
 
 TEST_F(SsdBackendTest, PutThenGetReturnsTheSameBytes) {
   SsdBackend* backend = Start();
@@ -475,6 +602,69 @@ TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
   EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kFailed);
 }
 
+// A local reader copies what it gets, so its batch is staged up to half the
+// arena and the rest comes back kBusy for its next call.
+TEST_F(SsdBackendTest, ALocalBatchOverHalfTheArenaIsStagedInParts) {
+  SsdBackend* backend = Start(/*staging_pages=*/3);
+  ASSERT_TRUE(Put(backend, "large-a", Payload(2 * kPageSize, 2)));
+  ASSERT_TRUE(Put(backend, "large-b", Payload(2 * kPageSize, 3)));
+
+  auto first = backend->BatchResolve({"large-a", "large-b"}, false, false, ResolveReader::kLocal);
+  ASSERT_EQ(first.size(), 2u);
+  EXPECT_TRUE(first[0].found);  // the first key may pass the half, so calls progress
+  EXPECT_NE(first[0].hold, nullptr);
+  EXPECT_EQ(first[1].outcome, ResolveOutcome::kBusy);
+
+  first.clear();  // copied
+  EXPECT_TRUE(backend->BatchResolve({"large-b"}, false, false, ResolveReader::kLocal)[0].found);
+}
+
+// Local staging lives exactly as long as its holds, whatever the lease clock
+// and the reaper say.
+TEST_F(SsdBackendTest, LocalStagingLivesAsLongAsItsHolds) {
+  SsdBackend* backend = Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{1});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  auto first = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  auto second = backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal);
+  ASSERT_TRUE(first[0].found);
+  ASSERT_EQ(first[0].pages, second[0].pages);  // one staged read, shared
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  backend->RunReaperOnceForTest();
+  first.clear();
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "freed under a local reader";
+
+  second.clear();
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+  double peak = 0;
+  for (const auto& m : backend->SampleMetrics()) {
+    if (std::string(m.name) == MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE &&
+        m.labels.at(0).second == "staging_pages_peak") {
+      peak = m.value;
+    }
+  }
+  EXPECT_EQ(peak, 1.0);
+}
+
+// A remote reader cannot say when it is done: its lease outlives a local hold.
+TEST_F(SsdBackendTest, ARemoteLeaseOutlivesALocalHold) {
+  SsdBackend* backend =
+      Start(/*staging_pages=*/1, /*read_lease_ttl=*/std::chrono::milliseconds{300});
+  ASSERT_TRUE(Put(backend, "key-a", Payload(1024, 1)));
+  ASSERT_TRUE(backend->BatchResolve({"key-a"}, false)[0].found);
+  ASSERT_TRUE(backend->BatchResolve({"key-a"}, false, false, ResolveReader::kLocal)[0].found);
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kFailedNoSpace)
+      << "freed under a remote reader";
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  EXPECT_EQ(backend->BatchAllocate({AllocateRequest{"key-b", 512}})[0].outcome,
+            AllocateOutcome::kSuccessAllocated);
+}
+
 // ---------------------------------------------------------------------------
 //  Eviction and Clear
 // ---------------------------------------------------------------------------
@@ -526,6 +716,70 @@ TEST_F(SsdBackendTest, EvictResultsAreOnePerKeyInRequestOrder) {
   EXPECT_EQ(evicted[1].key, "key-a");
   EXPECT_EQ(evicted[2].key, "missing-2");
   EXPECT_EQ(evicted[1].bytes_freed, 1024u);
+}
+
+// ---- Local eviction: the backend offers order; the pool decides ----
+
+TEST_F(SsdBackendTest, CandidatesAreColdestFirstAndSkipALeasedKey) {
+  SsdBackend* backend = Start();
+  ASSERT_TRUE(Put(backend, "a", Payload(1024, 1)));
+  ASSERT_TRUE(Put(backend, "b", Payload(2048, 2)));
+  ASSERT_TRUE(Put(backend, "c", Payload(1024, 3)));
+
+  // The file tier frees disk a segment at a time, so it owns the order and an
+  // offer carries the key's share of its segment on disk: here, all live, the
+  // padded record (a 4 KiB prefix plus the value padded to 4 KiB).
+  EXPECT_TRUE(backend->OwnsEvictionOrder());
+  constexpr uint64_t kRecord = 8 * 1024;
+  auto offers = backend->EvictionCandidates(10);
+  ASSERT_EQ(offers.size(), 3u);
+  EXPECT_EQ(offers[0], (EvictionOffer{"a", kRecord}));
+  EXPECT_EQ(offers[1], (EvictionOffer{"b", kRecord}));
+  EXPECT_EQ(offers[2], (EvictionOffer{"c", kRecord}));
+
+  // A staged read's lease makes "b" unevictable, so it is not offered.
+  ASSERT_TRUE(backend->BatchResolve({"b"}, false)[0].found);
+  offers = backend->EvictionCandidates(10);
+  for (const auto& offer : offers) EXPECT_NE(offer.key, "b");
+  EXPECT_EQ(offers.size(), 2u);
+}
+
+TEST_F(SsdBackendTest, PoolLocalEvictionDrainsTheSsdMediumThroughEvict) {
+  // SSD's watermark eviction now runs in the pool and reaches it via Evict().
+  constexpr uint64_t kCapacity = 1024 * 1024;
+  SsdBackend::Config cfg;
+  cfg.page_size = kPageSize;
+  cfg.staging_pages = 8;
+  cfg.read_lease_ttl = std::chrono::milliseconds{500};
+  cfg.ssd.enabled = true;
+  cfg.ssd.ssd.enabled = true;
+  cfg.ssd.ssd.storage_dir = dir_.string();
+  cfg.ssd.ssd.capacity_bytes = kCapacity;
+  cfg.ssd.ssd.io.backend = UMBPIoBackend::Posix;
+  auto owned = std::make_unique<SsdBackend>(std::move(cfg));
+  ASSERT_TRUE(owned->Init(&registrar_));
+  SsdBackend* ssd = owned.get();
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("ssd", std::move(owned)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+
+  // Fill past the high watermark by measurement (record overhead varies).
+  std::vector<std::string> keys;
+  const auto used = [&] { return ssd->Capacity().total_bytes - ssd->Capacity().available_bytes; };
+  while (used() < kCapacity * 9 / 10) {
+    keys.push_back("k" + std::to_string(keys.size()));
+    ASSERT_TRUE(Put(ssd, keys.back(), Payload(32 * 1024, static_cast<char>(keys.size()))))
+        << "filled to " << used() << " of " << kCapacity;
+  }
+  ASSERT_GE(keys.size(), 8u);
+
+  ASSERT_TRUE(pool.EnableLocalEviction(registry.BackendId(ssd), 0.9, 0.5));
+  pool.RunLocalEvictionOnceForTest();
+
+  EXPECT_LE(used(), kCapacity / 2) << "not drained to the low watermark";
+  EXPECT_FALSE(ssd->Contains(keys.front())) << "the coldest key survived";
+  EXPECT_TRUE(ssd->Contains(keys.back())) << "drained past the low watermark";
+  EXPECT_GE(pool.LocalEvictionStats().keys, 1u);
 }
 
 TEST_F(SsdBackendTest, ClearLocalDropsEverythingAndGatesAllocation) {

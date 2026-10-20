@@ -38,7 +38,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     throw std::runtime_error("DistributedClient requires UMBPConfig::distributed to be set");
   }
 
-  const auto& dc = config.distributed.value();
+  std::string config_error;
+  if (!config.ValidateStorageConfig(&config_error)) {
+    throw std::runtime_error("invalid UMBP storage config: " + config_error);
+  }
+  auto dc = config.distributed.value();
+  if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
+  if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;
   local_only_ = dc.master_config.master_address.empty();
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
@@ -53,11 +59,14 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // (backend-agnostic refactor Phase 2b, design doc §1 item 4).  Only the
   // sizing/policy knobs cross this boundary now.
   DramOwnershipConfig dram_ownership;
-  dram_ownership.buffer_sizes = {config.dram.capacity_bytes};
+  dram_ownership.numa_nodes = NormalizeNumaNodes(config.dram.numa_nodes);
+  dram_ownership.buffer_sizes = SplitNumaCapacity(
+      config.dram.capacity_bytes, dram_ownership.numa_nodes.size(), dc.dram_page_size);
   dram_ownership.use_hugepages = config.dram.use_hugepages;
   dram_ownership.hugepage_size = config.dram.hugepage_size;
-  dram_ownership.numa_node = config.dram.numa_node;
   dram_ownership.prefault = config.dram.prefault;
+  dram_ownership.numa_strict = config.dram.numa_strict;
+  dram_ownership.prefault_threads = config.dram.prefault_threads;
 
   // SSD came back to the distributed data plane as a MediumBackend: Phase 0
   // unwired the old PeerSsdManager special case, and PoolClient::Init builds an
@@ -158,27 +167,19 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       medium_desc = "DRAM pool=" + mb(config_.dram.capacity_bytes) +
                     "MB hugepages=" + (config_.dram.use_hugepages ? "true" : "false") +
                     " hugepage_size=" + mb(config_.dram.hugepage_size) +
-                    "MB numa_node=" + std::to_string(config_.dram.numa_node);
+                    "MB numa_nodes=" + FormatNumaNodes(config_.dram.numa_nodes);
       break;
     case UMBPMedium::HBM:
       medium_desc =
           "HBM pool=" + mb(dc.hbm.capacity_bytes) + "MB device=" + std::to_string(dc.hbm.device);
       break;
     case UMBPMedium::SSD:
-      // Slot COUNT only, not ssd_staging_buffer_size.  The arena SsdBackend
-      // actually allocates is staging_pages * page_size (see its own
-      // "[SsdBackend] Init ... arena_bytes=" line, which is authoritative);
-      // ssd_staging_buffer_size does not size it, so printing that number here
-      // stated a capacity the node did not have — 6144MB against a real 4096MB
-      // arena in a 2 MiB-page run.
-      //
-      // The slot count is the number worth showing, because it is the SSD
-      // medium's read-concurrency limit.  Transient shortfalls now surface as
-      // BUSY and are retried; a batch whose own working set exceeds the arena
-      // is a permanent resolve failure.
+      // The arena's bytes are on SsdBackend's own Init line.
       medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
                     "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
-                    " staging_slots=" + std::to_string(dc.ssd_staging_buffer_slots);
+                    " staging_slots=" +
+                    (dc.ssd_staging_buffer_slots > 0 ? std::to_string(dc.ssd_staging_buffer_slots)
+                                                     : std::string("preset"));
       break;
   }
 

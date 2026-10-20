@@ -27,9 +27,11 @@
 
 #ifdef __linux__
 #include <linux/mempolicy.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #endif
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
@@ -37,10 +39,12 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/parallel_for.h"
 
 namespace mori::umbp {
 namespace {
@@ -127,17 +131,22 @@ void LogHugepageFallbackOnce(size_t size, size_t hugepage_size, int err) {
   static std::once_flag once;
   std::call_once(once, [size, hugepage_size, err] {
     const std::string meminfo = ReadHugepageMeminfoSummary();
-    MORI_UMBP_WARN(
+    MORI_UMBP_ERROR(
         "HostMemAllocator: MAP_HUGETLB allocation failed for size={} "
-        "hugepage_size={} ({}: {}); falling back to anonymous pages. {}",
-        size, hugepage_size, err, std::strerror(err), meminfo);
+        "hugepage_size={} ({} pages; {}: {}); falling back to anonymous 4 KiB pages. "
+        "If this buffer is registered with a GPU, kernel compaction can migrate those "
+        "pages, and every migration stops this process's GPU queues until the driver "
+        "re-validates the registration. Reserve enough hugepages (vm.nr_hugepages) "
+        "before starting. {}",
+        size, hugepage_size, hugepage_size ? (size + hugepage_size - 1) / hugepage_size : 0, err,
+        std::strerror(err), meminfo);
   });
 }
 
 void LogNumaUnavailableOnce() {
   static std::once_flag once;
   std::call_once(once, [] {
-    MORI_UMBP_WARN("HostMemAllocator: NUMA binding unavailable on this build; ignoring numa_node");
+    MORI_UMBP_WARN("HostMemAllocator: NUMA binding unavailable; continuing without binding");
   });
 }
 
@@ -148,7 +157,7 @@ void TouchPages(void* ptr, size_t mapped_size, size_t stride) {
   }
 }
 
-void PrefaultPages(void* ptr, size_t mapped_size, size_t stride) {
+void PrefaultRange(void* ptr, size_t mapped_size, size_t stride) {
   if (ptr == nullptr || mapped_size == 0) return;
 
 #ifdef MADV_POPULATE_WRITE
@@ -163,8 +172,85 @@ void PrefaultPages(void* ptr, size_t mapped_size, size_t stride) {
   TouchPages(ptr, mapped_size, stride);
 }
 
+// ParallelFor also uses the calling thread. Restore its affinity after each
+// chunk; a pool allocation must never leave a gRPC/startup thread pinned.
+class ScopedNumaAffinity {
+ public:
+  explicit ScopedNumaAffinity(int node) {
 #ifdef __linux__
-int MbindMemory(void* ptr, size_t mapped_size, int numa_node) {
+    if (node < 0 || sched_getaffinity(0, sizeof(saved_), &saved_) != 0) return;
+    std::ifstream input("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+    std::string token;
+    cpu_set_t local;
+    CPU_ZERO(&local);
+    while (std::getline(input, token, ',')) {
+      std::istringstream part(token);
+      int first = -1, last = -1;
+      if (!(part >> first)) continue;
+      last = first;
+      if (part.peek() == '-') {
+        part.get();
+        part >> last;
+      }
+      for (int cpu = std::max(0, first); cpu <= last && cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &saved_)) CPU_SET(cpu, &local);
+      }
+    }
+    if (CPU_COUNT(&local) > 0) changed_ = sched_setaffinity(0, sizeof(local), &local) == 0;
+#endif
+  }
+  ~ScopedNumaAffinity() {
+#ifdef __linux__
+    if (changed_) (void)sched_setaffinity(0, sizeof(saved_), &saved_);
+#endif
+  }
+
+ private:
+#ifdef __linux__
+  cpu_set_t saved_{};
+  bool changed_ = false;
+#endif
+};
+
+// Nodes that have CPUs to run a prefault worker on (memory-only nodes have an
+// empty cpulist).
+const std::vector<int>& NodesWithCpus() {
+  static const std::vector<int> nodes = [] {
+    std::vector<int> found;
+    for (int node = 0; node < 256; ++node) {
+      std::ifstream input("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+      std::string cpus;
+      if (input && std::getline(input, cpus) && !cpus.empty()) found.push_back(node);
+    }
+    return found;
+  }();
+  return nodes;
+}
+
+void PrefaultPages(void* ptr, size_t mapped_size, size_t stride, const HostBufferOptions& opts) {
+  // Avoid creating threads for small pools. Chunk boundaries respect hugetlb
+  // alignment as well as base pages, so MADV_POPULATE_WRITE can serve both.
+  const size_t pages = mapped_size / stride;
+  size_t workers = std::min<size_t>(std::clamp(opts.prefault_threads, 1, 16),
+                                    std::max<size_t>(1, mapped_size / (64ULL << 20)));
+  const auto& nodes = NodesWithCpus();
+  const bool spread = opts.numa_node < 0 && opts.spread_prefault_across_nodes && nodes.size() > 1;
+  // Whole rounds over the nodes, so first touch splits the mapping evenly.
+  if (spread && workers >= nodes.size()) workers -= workers % nodes.size();
+  if (workers == 1) {
+    PrefaultRange(ptr, mapped_size, stride);
+    return;
+  }
+  ParallelFor(workers, workers, [&](size_t i) {
+    ScopedNumaAffinity affinity(spread ? nodes[i % nodes.size()] : opts.numa_node);
+    const size_t begin = (pages / workers * i + std::min(i, pages % workers)) * stride;
+    const size_t count = (pages / workers + (i < pages % workers)) * stride;
+    PrefaultRange(static_cast<char*>(ptr) + begin, count, stride);
+  });
+}
+
+#ifdef __linux__
+int MbindMemory(void* ptr, size_t mapped_size, int numa_node, NumaBindMode mode) {
 #if defined(__NR_mbind)
   if (ptr == nullptr || mapped_size == 0 || numa_node < 0) return 0;
 
@@ -174,8 +260,9 @@ int MbindMemory(void* ptr, size_t mapped_size, int numa_node) {
   nodemask[static_cast<size_t>(numa_node) / kBitsPerWord] =
       1UL << (static_cast<size_t>(numa_node) % kBitsPerWord);
 
-  const long rc = syscall(__NR_mbind, ptr, mapped_size, MPOL_BIND, nodemask.data(),
-                          static_cast<unsigned long>(word_count * kBitsPerWord), 0UL);
+  const long rc = syscall(
+      __NR_mbind, ptr, mapped_size, mode == NumaBindMode::kPreferred ? MPOL_PREFERRED : MPOL_BIND,
+      nodemask.data(), static_cast<unsigned long>(word_count * kBitsPerWord), 0UL);
   if (rc == 0) return 0;
   return -errno;
 #else
@@ -186,7 +273,7 @@ int MbindMemory(void* ptr, size_t mapped_size, int numa_node) {
 #endif
 }
 #else
-int MbindMemory(void* ptr, size_t mapped_size, int numa_node) {
+int MbindMemory(void* ptr, size_t mapped_size, int numa_node, NumaBindMode mode) {
   (void)ptr;
   (void)mapped_size;
   (void)numa_node;
@@ -198,9 +285,18 @@ void ApplyPostMappingPolicies(HostBufferHandle& handle, const HostBufferOptions&
   if (!handle.valid()) return;
 
   if (opts.numa_node >= 0) {
-    const int rc = MbindMemory(handle.ptr, handle.mapped_size, opts.numa_node);
-    if (rc == -ENOSYS) {
+    const int rc = MbindMemory(handle.ptr, handle.mapped_size, opts.numa_node, opts.numa_bind_mode);
+    if (rc != 0 && opts.require_numa_binding) {
+      MORI_UMBP_ERROR("HostMemAllocator: required mbind(node={}) failed ({}: {})", opts.numa_node,
+                      -rc, std::strerror(-rc));
+      HostMemAllocator{}.Free(handle);
+      return;
+    } else if (rc == -ENOSYS) {
       LogNumaUnavailableOnce();
+    } else if (rc != 0 && opts.numa_bind_mode == NumaBindMode::kPreferred) {
+      MORI_UMBP_ERROR(
+          "HostMemAllocator: preferred mbind(node={}) failed ({}: {}); placement degraded",
+          opts.numa_node, -rc, std::strerror(-rc));
     } else if (rc != 0) {
       MORI_UMBP_WARN("HostMemAllocator: mbind(node={}) failed ({}: {})", opts.numa_node, -rc,
                      std::strerror(-rc));
@@ -211,7 +307,7 @@ void ApplyPostMappingPolicies(HostBufferHandle& handle, const HostBufferOptions&
     const bool is_hugetlb = handle.actual_backing == HostBufferBacking::kAnonymousHugetlb ||
                             handle.actual_backing == HostBufferBacking::kAnonymousShmHugetlb;
     const size_t stride = is_hugetlb ? handle.actual_alignment : GetPageSize();
-    PrefaultPages(handle.ptr, handle.mapped_size, stride);
+    PrefaultPages(handle.ptr, handle.mapped_size, stride, opts);
   }
 }
 

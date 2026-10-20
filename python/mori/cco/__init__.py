@@ -68,4 +68,5 @@ from .communicator import (
     RegisteredWindow,
     ImportedWindow,
     DevCommHandle,
+    communicator_of_window,
 )

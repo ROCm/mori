@@ -27,7 +27,27 @@
 
 #include "mori/application/topology/node.hpp"
 #include "mori/application/topology/pci.hpp"
+
+// ROCm version detection: TheRock#6852 removed rocm_smi_lib from ROCm 10.1+.
+// Use amd_smi API on 10.1+, fall back to rocm_smi on 10.0 and earlier.
+#if __has_include(<rocm-core/rocm_version.h>)
+#include <rocm-core/rocm_version.h>
+#elif __has_include(<rocm_version.h>)
+#include <rocm_version.h>
+#endif
+
+#if defined(ROCM_VERSION_MAJOR) && \
+    ((ROCM_VERSION_MAJOR > 10) || (ROCM_VERSION_MAJOR == 10 && ROCM_VERSION_MINOR >= 1))
+#define MORI_USE_AMDSMI 1
+#else
+#define MORI_USE_AMDSMI 0
+#endif
+
+#if MORI_USE_AMDSMI
+#include "amd_smi/amdsmi.h"
+#else
 #include "rocm_smi/rocm_smi.h"
+#endif
 
 namespace mori {
 namespace application {
@@ -42,7 +62,11 @@ class TopoNodeGpuP2pLink : public TopoNode {
   ~TopoNodeGpuP2pLink() = default;
 
  public:
+#if MORI_USE_AMDSMI
+  amdsmi_link_type_t type;
+#else
   RSMI_IO_LINK_TYPE type;
+#endif
   uint64_t hops{0};
   uint64_t weight{0};
 

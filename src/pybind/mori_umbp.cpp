@@ -19,8 +19,11 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#pragma once
 
-// Backward-compatible source-tree include. New shared users include the common
-// header directly.
-#include "umbp/common/device_gather.h"
+// UMBP's pybind module, built only with BUILD_UMBP. It is separate from
+// libmori_pybinds because UMBP links gRPC/Protobuf, and importing mori.ops,
+// mori.io or mori.shmem must not require them. mori.cpp loads it on first use.
+
+#include "src/pybind/mori.hpp"
+
+PYBIND11_MODULE(libmori_umbp_pybinds, m) { mori::RegisterMoriUmbp(m); }

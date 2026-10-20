@@ -220,7 +220,14 @@ PolicyBackendSpec ParseBackend(const std::string& name, const Value& value) {
     RejectUnknownFields(object, {"type", "capacity", "numa_node"}, context);
     backend.tier = TierType::DRAM;
     if (const Value* numa = OptionalField(object, "numa_node")) {
-      backend.numa_node = AsInt(*numa, -1, context + ".numa_node");
+      if (numa->kind_case() == Value::kListValue) {
+        for (const auto& node : numa->list_value().values()) {
+          backend.numa_nodes.push_back(AsInt(node, 0, context + ".numa_node"));
+        }
+      } else {
+        backend.numa_nodes = {AsInt(*numa, -1, context + ".numa_node")};
+      }
+      backend.numa_nodes = NormalizeNumaNodes(std::move(backend.numa_nodes));
     }
   } else if (type == "ssd") {
     RejectUnknownFields(object, {"type", "capacity", "path", "staging_slots"}, context);
@@ -363,7 +370,7 @@ LogicalTierIndex ValidateBackendPolicy(const BackendPolicyConfig& policy) {
         }
       }
     } else if (backend.tier == TierType::DRAM) {
-      if (backend.numa_node < -1) Invalid(context + ": numa_node must be >= -1");
+      NormalizeNumaNodes(backend.numa_nodes);
     } else if (backend.tier == TierType::SSD) {
       if (backend.path.empty()) Invalid(context + ": path must not be empty");
       if (backend.staging_slots < 0) Invalid(context + ": staging_slots must be >= 0");
@@ -605,8 +612,10 @@ bool ApplyBackendPolicy(const BackendPolicyConfig& policy, PoolClientConfig* con
         instance.name = backend.name;
         instance.tier = backend.tier;
         if (backend.tier == TierType::DRAM) {
-          instance.dram.buffer_sizes = {backend.capacity_bytes};
-          instance.dram.numa_node = backend.numa_node;
+          instance.dram = config->dram;
+          instance.dram.numa_nodes = NormalizeNumaNodes(backend.numa_nodes);
+          instance.dram.buffer_sizes = SplitNumaCapacity(
+              backend.capacity_bytes, instance.dram.numa_nodes.size(), config->dram_page_size);
         } else {
           if (backend.capacity_bytes > std::numeric_limits<size_t>::max()) {
             Invalid("backend '" + backend.name + "': capacity does not fit size_t");

@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import weakref
 from abc import ABC, abstractmethod
 
 import mori.cco.cco as _cco
@@ -42,7 +43,19 @@ __all__ = [
     "ImportedWindow",
     "DevCommHandle",
     "Communicator",
+    "communicator_of_window",
 ]
+
+
+# Window handle -> the communicator it was registered on, for as long as the window
+# is registered. Lets a library that is handed only a window (an arena's handle)
+# allocate symmetric memory of its own on the same communicator.
+_WINDOW_OWNERS: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+
+def communicator_of_window(handle: int) -> Communicator | None:
+    """The communicator `handle` was registered on, or None if no live window has it."""
+    return _WINDOW_OWNERS.get(int(handle))
 
 
 # ── UniqueId (pure-Python wrapper with pickle support) ───────────────────────
@@ -171,9 +184,11 @@ class RegisteredWindow(CCOResource):
         self._ptr = ptr
         self._size = size
         self._handle = _cco.window_register_ptr(comm._raw, ptr, size)
+        _WINDOW_OWNERS[self._handle] = comm
 
     def _deallocate(self) -> None:
         if self._handle:
+            _WINDOW_OWNERS.pop(self._handle, None)
             _cco.window_deregister(self._comm._raw, self._handle)
             self._handle = 0
 
@@ -219,9 +234,11 @@ class ImportedWindow(CCOResource):
         self._handle, self._local_ptr = _cco.window_register_external(
             comm._raw, ext_ptr, size
         )
+        _WINDOW_OWNERS[self._handle] = comm
 
     def _deallocate(self) -> None:
         if self._handle:
+            _WINDOW_OWNERS.pop(self._handle, None)
             _cco.window_deregister(self._comm._raw, self._handle)
             self._handle = 0
         if self._local_ptr:

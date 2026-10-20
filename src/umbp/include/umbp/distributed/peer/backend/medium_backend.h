@@ -124,6 +124,10 @@ enum class AllocateOutcome {
 struct AllocateRequest {
   std::string key;
   uint64_t size = 0;
+  int preferred_numa_node = -1;
+  // The writer is a local file engine: a file-backed medium may hand out a
+  // file range (AllocateResult::file_ref) instead of staged pages.
+  bool allow_file_ref = false;
 };
 
 // Populated fields below `outcome` are meaningful ONLY when
@@ -140,6 +144,8 @@ struct AllocateResult {
   std::vector<BufferMemoryDescBytes> descs;
   // How long the slot survives without a matching BatchCommit / BatchAbort.
   uint64_t pending_ttl_ms = 0;
+  // Set instead of `pages` when the bytes go straight into the medium's file.
+  TransferRef file_ref{};
 };
 
 struct CommitRequest {
@@ -150,6 +156,15 @@ struct CommitRequest {
 struct CommitResult {
   bool success = false;  // false = slot unknown: reaped, aborted, or never existed
   uint64_t bytes_committed = 0;
+};
+
+// Who reads what a resolve publishes.  kRemote is a peer, which cannot say when
+// it is done, so its bytes stay put for the read lease.  kLocal is this process:
+// it keeps each hit's `hold` until its copy returns, and comes back for any key
+// a staged medium answered kBusy.
+enum class ResolveReader {
+  kRemote,
+  kLocal,
 };
 
 // A resolve needs one more state than a cache lookup.  kBusy means this backend
@@ -181,6 +196,9 @@ struct ResolvedEntry {
   // into device memory, with `pages` left empty.  A memory-backed medium leaves
   // this invalid and publishes pages as before.
   TransferRef file_ref{};
+
+  // kLocal only: the published bytes stay put while any copy of this lives.
+  std::shared_ptr<const void> hold;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -275,15 +293,21 @@ class MediumBackend : public MetricSource {
   // call (the default) simply has no outbox worth gating.
   virtual void SetEventPublishing(bool /*enabled*/) {}
 
-  // Turn on the backend's OWN eviction, for a node with no master.
-  //
-  // Evict(keys) above is a master decision: it picks victims with a
-  // cluster-wide view of who else holds the key.  Nothing in the system calls
-  // it otherwise, so a masterless node needs some medium-local policy or it
-  // simply fills up.  A backend that already self-evicts (SsdBackend, whose
-  // PeerSsdManager runs its own watermark loop from UMBPSsdConfig) ignores
-  // this; the default is to ignore it.
-  virtual void EnableLocalEviction(double /*high_watermark*/, double /*low_watermark*/) {}
+  // ---- eviction ordering: the pool decides; a medium only supplies order ----
+
+  // Start the recency order EvictionCandidates() reads.  Off by default (it
+  // costs every read a touch).  Idempotent; seeds keys already owned.
+  virtual void TrackEvictionOrder() {}
+
+  // Up to `max_count` unprotected keys, coldest first, with the bytes each
+  // frees.  Frees nothing; Evict() re-checks.  Empty if no order is kept.
+  virtual std::vector<EvictionOffer> EvictionCandidates(size_t /*max_count*/) { return {}; }
+
+  // True when EvictionCandidates() is the only order that frees this medium's
+  // space, so local eviction must not substitute the master's ranking.  The
+  // file SSD tier is one: it frees disk a whole segment file at a time, and
+  // keys picked by recency alone can leave every segment partly live.
+  virtual bool OwnsEvictionOrder() const { return false; }
 
   // ---- observability ----
   //
@@ -316,12 +340,14 @@ class MediumBackend : public MetricSource {
   // is reserved for a state not currently produced.
   virtual std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) = 0;
 
-  // Look up keys and take a read lease on each hit, protecting it from
-  // concurrent Evict for the lease window.  `include_descs=false` skips
-  // building descs entirely for the whole batch.  A medium whose own bytes are
-  // not registerable publishes a descriptor naming its storage (a file/object
-  // ref) rather than a memory one — the engine decides how to reach it, and
-  // supplies a bounce buffer if the chosen path needs one.
+  // Look up keys and protect each hit from concurrent Evict: for the lease
+  // window (kRemote), or while its `hold` lives (kLocal).  A kLocal batch too
+  // big for a staged medium at once is published in part, the rest kBusy.
+  // `include_descs=false` skips building descs entirely for the whole batch.
+  // A medium whose own bytes are not registerable publishes a descriptor
+  // naming its storage (a file/object ref) rather than a memory one — the
+  // engine decides how to reach it, and supplies a bounce buffer if the
+  // chosen path needs one.
   //
   // `allow_file_refs` says the caller can consume a TransferRef::File -- it
   // will read the medium's own storage directly (GdsEngine DMAs the range into
@@ -332,16 +358,19 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
-  virtual std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
-                                                  bool include_descs,
-                                                  bool allow_file_refs = false) = 0;
+  virtual std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
-  // acquisition after its synchronous transfer completes.
-  virtual bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) {
+  // acquisition after its synchronous transfer completes.  `allow_file_ref`:
+  // the caller can read a file range, so a file-backed medium need not stage.
+  virtual bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                                    bool allow_file_ref) {
     (void)key;
     (void)resolved;
+    (void)allow_file_ref;
     return false;
   }
   virtual void ReleaseMigrationRead(const std::string& key) { (void)key; }
@@ -362,9 +391,8 @@ class MediumBackend : public MetricSource {
     return out;
   }
 
-  // Master-driven eviction.  Idempotent; see EvictResult::bytes_freed.  One
-  // result per key, in request order — the peer service relies on that to sum
-  // freed bytes for a key mirrored across media.
+  // The medium's only eviction path, reached via PeerPool::Evict: frees keys a
+  // lease or pin doesn't protect and queues a REMOVE for each.  Idempotent.
   virtual std::vector<EvictResult> Evict(const std::vector<std::string>& keys) = 0;
 
   // ---- bootstrap (GetPeerInfo) ----

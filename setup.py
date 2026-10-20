@@ -57,11 +57,6 @@ _MPI_SYSTEM_DEPS = [
 
 _REQUIRED_HEADERS = [
     (
-        ["/usr/include/pci/pci.h", "/usr/include/x86_64-linux-gnu/pci/pci.h"],
-        ("libpci-dev", "pciutils-devel"),
-        "PCI library headers (needed for topology detection)",
-    ),
-    (
         ["/usr/include/infiniband/verbs.h"],
         ("libibverbs-dev", "rdma-core-devel"),
         "InfiniBand verbs headers (needed for RDMA transport)",
@@ -590,8 +585,34 @@ class CMakeBuild(build_ext):
         if ext.sources and any(s.endswith((".pyx", ".cpp")) for s in ext.sources):
             if self.compiler is None:
                 self.ensure_finalized()
-                from setuptools._distutils.ccompiler import new_compiler
-                from setuptools._distutils.sysconfig import customize_compiler
+                # Take new_compiler from the module holding the base build_ext
+                # super() reaches. `distutils` and `setuptools._distutils` load
+                # the same source as two separate modules, so each ends up with
+                # its own CCompiler class, and build_extension (setuptools >=
+                # 84) asserts isinstance against the one from its own module --
+                # a compiler built from the other copy fails that check even
+                # though it is otherwise fully configured.
+                from setuptools._distutils.ccompiler import (
+                    new_compiler as _default_new_compiler,
+                )
+                from setuptools._distutils.sysconfig import (
+                    customize_compiler as _default_customize_compiler,
+                )
+
+                bx_mod = next(
+                    (
+                        sys.modules[k.__module__]
+                        for k in type(self).__mro__
+                        if k.__module__.endswith("distutils.command.build_ext")
+                    ),
+                    None,
+                )
+                # getattr, not attribute access: a module that matched the name
+                # but re-exports neither helper must still fall back, not raise.
+                new_compiler = getattr(bx_mod, "new_compiler", _default_new_compiler)
+                customize_compiler = getattr(
+                    bx_mod, "customize_compiler", _default_customize_compiler
+                )
 
                 try:
                     # distutils / older setuptools signature
@@ -661,6 +682,7 @@ class CMakeBuild(build_ext):
         build_shmem_device_wrapper = os.environ.get("BUILD_SHMEM_DEVICE_WRAPPER", "ON")
         enable_profiler = os.environ.get("ENABLE_PROFILER", "OFF")
         enable_debug_printf = os.environ.get("ENABLE_DEBUG_PRINTF", "OFF")
+        enable_io_fault_injection = os.environ.get("ENABLE_IO_FAULT_INJECTION", "OFF")
 
         enable_standard_moe_adapt = os.environ.get("ENABLE_STANDARD_MOE_ADAPT", "OFF")
         multithread_support = os.environ.get("MORI_MULTITHREAD_SUPPORT", "OFF")
@@ -687,8 +709,20 @@ class CMakeBuild(build_ext):
             if build_xla_ffi_ops.upper() == "ON"
             else os.environ.get("BUILD_OPS_DEVICE", "OFF")
         )
-        BUILD_CCO_SDMA = os.environ.get(
-            "BUILD_CCO_SDMA", "ON" if build_benchmark.upper() == "ON" else "OFF"
+        # ON by default, matching CMakeLists.txt. See the comment there for why:
+        # the flag creates no queue on its own, and OFF produces a build whose
+        # SDMA puts silently move no bytes.
+        #
+        # Normalised, because this value is consumed twice and the two used to
+        # disagree: CMake takes 1/TRUE/yes as true, while the baked-in flag was
+        # `== "ON"`. `BUILD_CCO_SDMA=1` therefore built a host library with SDMA
+        # and JITted a device wrapper without it -- the same silent-zeros failure
+        # this default exists to prevent, from the other side.
+        BUILD_CCO_SDMA = (
+            "ON"
+            if os.environ.get("BUILD_CCO_SDMA", "ON").strip().upper()
+            in ("ON", "1", "TRUE", "YES", "Y")
+            else "OFF"
         )
         if build_benchmark.upper() == "ON" and BUILD_CCO_SDMA.upper() != "ON":
             print(
@@ -705,6 +739,7 @@ class CMakeBuild(build_ext):
             f"-DWARP_ACCUM_UNROLL={unroll_value}",
             f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
             f"-DENABLE_DEBUG_PRINTF={enable_debug_printf}",
+            f"-DENABLE_IO_FAULT_INJECTION={enable_io_fault_injection}",
             f"-DENABLE_STANDARD_MOE_ADAPT={enable_standard_moe_adapt}",
             f"-DGPU_TARGETS={gpu_archs}",
             f"-DENABLE_PROFILER={enable_profiler}",
@@ -802,8 +837,15 @@ class CMakeBuild(build_ext):
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
-        # UMBP bindings are compiled into libmori_pybinds.so when BUILD_UMBP=ON
-        # (no separate .so to copy)
+        # UMBP bindings are their own module (it links gRPC); mori.cpp loads it lazily.
+        # Keyed on the flag, not the file: CMake leaves a stale one in a reused build dir.
+        umbp_pybinds_src = build_dir / "src/pybind/libmori_umbp_pybinds.so"
+        umbp_pybinds_dst = root_dir / "python/mori/libmori_umbp_pybinds.so"
+        if build_umbp_enabled and umbp_pybinds_src.exists():
+            shutil.copyfile(umbp_pybinds_src, umbp_pybinds_dst)
+        elif umbp_pybinds_dst.exists():
+            umbp_pybinds_dst.unlink()
+
         spdk_proxy_src = build_dir / "src/umbp/spdk_proxy"
         spdk_proxy_dst = root_dir / "python/mori/spdk_proxy"
         if build_umbp_spdk_enabled and spdk_proxy_src.exists():
@@ -1014,7 +1056,7 @@ def _torch_symm_extension():
         library_dirs=[f"{rocm}/lib", str(_root_dir.resolve() / "python" / "mori")],
         libraries=["amdhip64", "c10_hip", "torch_hip", "mori_cco"],
         runtime_library_dirs=["$ORIGIN"],
-        extra_compile_args=["-std=c++17"],
+        # No -std here: torch's BuildExtension adds the standard its headers need.
     )
     ext._mori_torch_ext = True
     return [ext]
@@ -1044,6 +1086,7 @@ mori_package_data = [
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
     "libmori_jit.so",  # JIT v2 C ABI + plan registry
     "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
+    "libmori_umbp_pybinds.so",  # optional: only present when BUILD_UMBP=ON
     "umbp_master",
     "umbp_standalone_server",
     "_jit-sources/include/**/*.hpp",

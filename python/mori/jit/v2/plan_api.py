@@ -148,13 +148,26 @@ def _ensure_device_nic() -> None:
     mori.jit.config.detect_nic_type() (env -> /sys/class/infiniband -> lspci -> lib
     -> mlx5), the same detector v1 uses, so v2 picks the real NIC when present and
     mlx5 otherwise. Best-effort: if it cannot run, the C++ default (mlx5) applies.
+
+    On ionic the CQ layout has to be told as well, and even when MORI_DEVICE_NIC
+    was set by hand: the host creates a collapsed CQ whenever is_ccqe_enabled()
+    says so, and a kernel built without -DIONIC_CCQE polls it as a ring and hangs.
     """
-    if os.environ.get("MORI_DEVICE_NIC"):
+    if not os.environ.get("MORI_DEVICE_NIC"):
+        try:
+            from mori.jit.config import detect_nic_type
+
+            os.environ["MORI_DEVICE_NIC"] = detect_nic_type()
+        except Exception:
+            pass
+    if os.environ.get("MORI_DEVICE_NIC", "").lower() != "ionic":
+        return
+    if os.environ.get("MORI_DEVICE_IONIC_CCQE"):
         return
     try:
-        from mori.jit.config import detect_nic_type
+        from mori.jit.core import is_ccqe_enabled
 
-        os.environ["MORI_DEVICE_NIC"] = detect_nic_type()
+        os.environ["MORI_DEVICE_IONIC_CCQE"] = "1" if is_ccqe_enabled() else "0"
     except Exception:
         pass
 
@@ -592,10 +605,14 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                 self._buf = buf
                 self._buf_shape = shape
                 self._dyn_args = tuple((k, arg_snake_to_wire.get(k, k)) for k in args)
+                passed = {wire for _, wire in self._dyn_args}
                 self._dyn_defs = tuple(
                     w
                     for w, v in self._defaults.items()
-                    if w in arg_names and (not isinstance(v, int) or w in arg_blobs)
+                    if w in arg_names
+                    # A launch argument wins over the default it shadows, as in
+                    # `merged` above; re-writing the default after it would not.
+                    and w not in passed and (not isinstance(v, int) or w in arg_blobs)
                 )
                 self._last = {}
             else:
@@ -729,16 +746,19 @@ _UNSET = object()  # "no default bound", distinct from every bound value
 def _bound_defaults(plan) -> dict:
     """The plan's bound defaults, keyed for comparison across a group.
 
-    Compared the way launch would write each one: an int by value, a
-    pointer-like value by the address it resolves to, anything else by identity.
+    Compared the way launch would write each one: an int and a pointer-like value
+    by the bits it writes, so a tensor and its data_ptr() agree; anything else by
+    identity. A default resolved at its first launch compares by its group_key(),
+    so building a group does not resolve it.
     """
     out = {}
     for name, v in plan._defaults.items():
-        if type(v) is int:
-            out[name] = v
+        group_key = getattr(v, "group_key", None)
+        if group_key is not None:
+            out[name] = group_key()
             continue
         try:
-            out[name] = ("p", _as_ptr(v))
+            out[name] = _as_ptr(v)
         except TypeError:
             out[name] = ("o", id(v))
     return out

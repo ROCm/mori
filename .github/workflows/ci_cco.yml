@@ -39,6 +39,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Build CI image
         run: |
@@ -64,6 +67,15 @@ jobs:
           # BUILD_UMBP=OFF: not needed for CCO, and its gtest discovery breaks under cmake 4.4.
           $CT exec $CONTAINER bash -c \
             "cd $GITHUB_WORKSPACE && BUILD_TESTS=ON BUILD_EXAMPLES=ON BUILD_BENCHMARK=ON MORI_WITH_MPI=ON BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install ."
+
+      - name: Verify the install is complete
+        # This image is the only one built WITH_FLYDSL=1, so it is the only job
+        # that can assert both EP backends registered. A build that skips the
+        # mori.cco.cco extension loses flydsl with it and everything below still
+        # runs -- on the hip backend alone, silently halving the coverage.
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && python tools/verify_install.py"
 
       - name: Check internode arena region invariants
         run: |
@@ -340,13 +352,19 @@ jobs:
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
 
+      - name: Run ops-v2 routing snapshot handles (EP8, both backends)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+            timeout 900 torchrun --standalone --nproc_per_node=8 test_routing_snapshot.py"
+
       - name: Run ops-v2 dispatch/combine bench (EP8 smoke, both backends)
         run: |
           # bench_ep.py gates every point on an identity-expert check and exits
           # non-zero if one fails, so this is a smoke test as well as a bench.
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
-            BACKENDS=flydsl,hip MODES=graph SWEEP=128,512,4096,8192 \
+            BACKENDS=flydsl,hip COMB_MODE=pull MODES=graph SWEEP=128,512,4096,8192 \
             ITERS=20 WARMUP=10 \
             torchrun --standalone --nproc_per_node=8 bench_ep.py"
 
@@ -374,8 +392,8 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC]
-            node1_host: 10.2.80.22
-            node2_host: 10.2.80.20
+            node1_host: 10.2.80.20
+            node2_host: 10.2.80.10
             node2_port: 22
             node1_ifname: enp193s0f1np1
             node2_ifname: enp193s0f1np1
@@ -403,6 +421,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
 
       - name: Build CI image
         run: |

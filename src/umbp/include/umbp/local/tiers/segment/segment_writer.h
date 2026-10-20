@@ -58,6 +58,10 @@ class Writer {
   // `generation` is left zero and stamped by Reserve.
   void Build(const std::string& key, const void* data, size_t size, PreparedRecord* out) const;
 
+  // The prefix alone (header + key), uncommitted and without a CRC, for a value
+  // written in place later.  Setting kFlagCommitted in it commits the record.
+  void BuildPrefix(const std::string& key, size_t size, PreparedRecord* out) const;
+
   // Phase 1b (caller holds mu_): reserve index/segment space for an already-built
   // record and stamp the header field that depends on the reservation.  Cheap:
   // no checksum, no payload copy.  Returns false if capacity is exhausted.

@@ -28,16 +28,21 @@ namespace mori::umbp {
 // hipFile resolved at runtime instead of linked.
 //
 // WHY.  GdsEngine is one optional transfer path inside umbp_common, and
-// umbp_common is linked into libmori_pybinds.so — so a `-lhipfile` here becomes
-// a DT_NEEDED on the Python extension, and `import mori` dies with "libhipfile
-// .so.0: cannot open shared object file" on every host whose ROCm ships without
-// hipFile, whether or not UMBP is used at all.  Building against the header but
+// umbp_common is linked into libmori_umbp_pybinds.so — so a `-lhipfile` here
+// becomes a DT_NEEDED on that extension, and `import mori.umbp` dies with
+// "libhipfile.so.0: cannot open shared object file" on every host whose ROCm
+// ships without hipFile, whether or not GDS is used at all.  Building against the header but
 // resolving the four entry points with dlopen keeps the capability and makes
 // the library a runtime option: present -> GDS works, absent -> GDS is simply
 // not offered as an engine.
 //
 // The signatures come from <hipfile.h> via decltype, so they cannot drift from
 // the real ones.
+//
+// ACKNOWLEDGEMENT.  <hipfile.h> and libhipfile belong to hipFile
+// (https://github.com/ROCm/hipFile; MIT License, Copyright (c) Advanced Micro
+// Devices, Inc.); this file only resolves their entry points.  Thanks to the
+// hipFile authors and contributors -- see gds_engine.h.
 struct HipFileApi {
   decltype(&::hipFileHandleRegister) HandleRegister = nullptr;
   decltype(&::hipFileHandleDeregister) HandleDeregister = nullptr;

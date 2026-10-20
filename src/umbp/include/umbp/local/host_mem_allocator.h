@@ -37,11 +37,19 @@ enum class HostBufferBacking : int {
   kAnonymousShmHugetlb = 3,
 };
 
+enum class NumaBindMode { kBind, kPreferred };
+
 struct HostBufferOptions {
   HostBufferBacking backing = HostBufferBacking::kAnonymous;
   size_t hugepage_size = 2ULL * 1024 * 1024;
   int numa_node = -1;
   bool prefault = true;
+  NumaBindMode numa_bind_mode = NumaBindMode::kBind;
+  bool require_numa_binding = false;  // Preserve best-effort binding for existing callers.
+  int prefault_threads = 1;
+  // Unbound mappings only: run prefault worker i on NUMA node i % N, so first
+  // touch spreads the chunks evenly instead of filling one node first.
+  bool spread_prefault_across_nodes = false;
 };
 
 struct HostBufferHandle {

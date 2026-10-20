@@ -146,7 +146,20 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("low_watermark", &UMBPDramConfig::low_watermark)
       .def_readwrite("use_hugepages", &UMBPDramConfig::use_hugepages)
       .def_readwrite("hugepage_size", &UMBPDramConfig::hugepage_size)
-      .def_readwrite("numa_node", &UMBPDramConfig::numa_node)
+      .def_property(
+          "numa_nodes", [](const UMBPDramConfig& cfg) { return cfg.numa_nodes; },
+          [](UMBPDramConfig& cfg, std::vector<int> nodes) {
+            cfg.numa_nodes = NormalizeNumaNodes(std::move(nodes));
+          })
+      .def_property(
+          "numa_node",
+          [](const UMBPDramConfig& cfg) {
+            return cfg.numa_nodes.empty() ? -1 : cfg.numa_nodes.front();
+          },
+          [](UMBPDramConfig& cfg, int node) { cfg.numa_nodes = NormalizeNumaNodes({node}); },
+          "Deprecated: use numa_nodes. Setting this property replaces the node list.")
+      .def_readwrite("numa_strict", &UMBPDramConfig::numa_strict)
+      .def_readwrite("prefault_threads", &UMBPDramConfig::prefault_threads)
       .def_readwrite("prefault", &UMBPDramConfig::prefault);
 
   py::class_<UMBPIoConfig>(m, "UMBPIoConfig")
@@ -249,7 +262,6 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
-      .def_readwrite("ssd_staging_buffer_size", &UMBPDistributedConfig::ssd_staging_buffer_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("ssd_staging_use_hugepages", &UMBPDistributedConfig::ssd_staging_use_hugepages)
       .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
@@ -287,7 +299,9 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
       .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
       .def_readwrite("distributed", &UMBPConfig::distributed)
-      .def_readwrite("standalone_process", &UMBPConfig::standalone_process);
+      .def_readwrite("standalone_process", &UMBPConfig::standalone_process)
+      .def_readwrite("backend_policy_path", &UMBPConfig::backend_policy_path)
+      .def_readwrite("page_size", &UMBPConfig::page_size);
 
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
       .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),

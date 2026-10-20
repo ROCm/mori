@@ -194,7 +194,6 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 - ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
 - System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
-  - `libpci-dev`
   - `libibverbs-dev`, `ibverbs-utils`
   See [docker/Dockerfile.dev](https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev) for the full apt list used in CI/dev images.
 - Optional: `libopenmpi-dev`, `openmpi-bin` — only needed when building C++ examples (`BUILD_EXAMPLES=ON`) or enabling MPI bootstrap (`MORI_WITH_MPI=ON`)
@@ -265,9 +264,22 @@ pip install --pre amd-mori-nightly
 ```bash
 git clone --recursive https://github.com/ROCm/mori.git
 cd mori
-# NOTE: for venv build, add --no-build-isolation at the end
 pip install .
 ```
+
+For a venv build, add `--no-build-isolation` — and install the build
+dependencies first, because that flag is exactly what stops pip from reading
+them out of `pyproject.toml`:
+
+```bash
+pip install -r requirements-build.txt
+pip install . --no-build-isolation
+```
+
+Skipping the first line leaves the build without Cython, and it only *warns*
+before dropping the `mori.cco.cco` extension, taking the flydsl EP backend with
+it — on an install that otherwise reports success. `python
+tools/verify_install.py` checks for exactly that.
 
 No hipcc needed at install time — host code compiles with a standard
 C++ compiler. GPU kernels are JIT-compiled on first use and cached to

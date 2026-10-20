@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -114,12 +115,18 @@ class PoolDispatcher final : public EvictKeyDispatcher {
   explicit PoolDispatcher(PeerPool* pool) : pool_(pool) {}
 
   void DispatchEvictKey(const std::string& node_id, const std::string& /*peer_address*/,
-                        std::vector<std::string> keys) override {
-    auto results = pool_->Evict(keys, PoolEvictMode::kReclaim);
+                        std::vector<EvictionVictim> victims) override {
+    std::vector<PoolEvictRequest> requests(victims.size());
+    for (size_t i = 0; i < victims.size(); ++i) {
+      requests[i].key = victims[i].key;
+      requests[i].tier = victims[i].tier;
+    }
+    auto results = pool_->Evict(requests, PoolEvictMode::kReclaim);
     std::lock_guard<std::mutex> lock(mutex_);
     ++rounds_;
-    for (size_t i = 0; i < keys.size(); ++i) {
-      dispatched_.push_back(keys[i]);
+    for (size_t i = 0; i < victims.size(); ++i) {
+      dispatched_.push_back(victims[i].key);
+      victims_.push_back(victims[i]);
       if (i < results.size()) freed_bytes_ += results[i].bytes_freed;
     }
     node_ids_.push_back(node_id);
@@ -128,6 +135,10 @@ class PoolDispatcher final : public EvictKeyDispatcher {
   std::vector<std::string> Dispatched() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return dispatched_;
+  }
+  std::vector<EvictionVictim> Victims() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return victims_;
   }
   size_t Rounds() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -146,6 +157,7 @@ class PoolDispatcher final : public EvictKeyDispatcher {
   PeerPool* pool_;
   mutable std::mutex mutex_;
   std::vector<std::string> dispatched_;
+  std::vector<EvictionVictim> victims_;
   std::vector<std::string> node_ids_;
   size_t rounds_ = 0;
   uint64_t freed_bytes_ = 0;
@@ -247,13 +259,21 @@ TEST(MasterEvictionChain, OverWatermarkTierDemotesIntoTheColdTier) {
   EXPECT_EQ(dispatcher.NodeIds().front(), kNodeId);
 
   // Every key the master named must have moved down a tier rather than vanished.
+  // The peer only queues the demotion, so wait for the move.
   const auto evicted = dispatcher.Dispatched();
   ASSERT_FALSE(evicted.empty());
+  const bool moved = WaitFor(
+      [&] {
+        for (const auto& key : evicted) {
+          if (registry.Get("hot")->Contains(key)) return false;
+        }
+        return true;
+      },
+      std::chrono::seconds(5));
+  ASSERT_TRUE(moved) << "a queued demotion never completed";
   for (const auto& key : evicted) {
-    EXPECT_FALSE(registry.Get("hot")->Contains(key)) << key << " still in hot";
     EXPECT_TRUE(registry.Get("cold")->Contains(key)) << key << " was dropped, not demoted";
   }
-  EXPECT_GT(dispatcher.FreedBytes(), 0u);
 
   // Keys the master did not name are untouched: eviction is bounded by the
   // budget, so a round must not drain the whole tier.
@@ -343,6 +363,8 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
           .commit.success);
   ASSERT_TRUE(registry.Get("cold")->Contains("moved"));
 
+  // Another reader holds the source, so the move parks it rather than deleting.
+  ASSERT_TRUE(registry.Get("cold")->BatchResolve({"moved"}, false).front().found);
   ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
   ASSERT_TRUE(
       WaitFor([&] { return registry.Get("hot")->Contains("moved"); }, std::chrono::seconds(2)))
@@ -351,8 +373,16 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   EXPECT_TRUE(registry.Get("cold")->Contains("moved"))
       << "source was deleted during the promotion, so there is nothing to reclaim";
 
+  // Only SSD (the parked source) is over its watermark, so the victim must name
+  // SSD, not the promoted DRAM copy the placement points at.
   InMemoryMasterMetadataStore store;
-  PublishNode(&store, {"moved"}, /*total_bytes=*/4 * kPageSize, /*used_bytes=*/4 * kPageSize);
+  const auto now = Clock::now();
+  RegisterNode(&store, now);
+  std::map<TierType, TierCapacity> caps;
+  caps[TierType::SSD] = TierCapacity{4 * kPageSize, 0, kPageSize};
+  caps[TierType::DRAM] = TierCapacity{4 * kPageSize, 3 * kPageSize, kPageSize};
+  ReportHeartbeat(&store, /*seq=*/1, now, caps, TierType::SSD, "cold", {"moved"},
+                  /*full_sync=*/true);
 
   PoolDispatcher dispatcher(&pool);
   EvictionManager manager(store, OneSecondRounds(), &dispatcher);
@@ -362,6 +392,8 @@ TEST(MasterEvictionChain, MasterRoundReclaimsTheParkedSourceOfAMovePromotion) {
   manager.Stop();
 
   EXPECT_TRUE(reclaimed) << "the parked source outlived a master eviction round that named it";
+  ASSERT_FALSE(dispatcher.Victims().empty());
+  EXPECT_EQ(dispatcher.Victims().front(), (EvictionVictim{"moved", TierType::SSD}));
   // The promoted copy is the only one left, so the key is still servable.
   EXPECT_TRUE(registry.Get("hot")->Contains("moved"))
       << "the evict drained the promoted target instead of the parked source";
@@ -464,8 +496,9 @@ TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
   for (const auto& key : colder) place_in_cold(key);
   place_in_cold("moved");
 
-  // Read "moved" so it promotes; move defers the source delete behind the read
-  // lease, leaving the source parked in cold alongside the three colder keys.
+  // Read "moved" so it promotes while another reader holds the source; move
+  // parks the source in cold alongside the three colder keys.
+  ASSERT_TRUE(registry.Get("cold")->BatchResolve({"moved"}, false).front().found);
   ASSERT_TRUE(pool.BatchResolve({"moved"}, false).front().resolved.found);
   ASSERT_TRUE(
       WaitFor([&] { return registry.Get("hot")->Contains("moved"); }, std::chrono::seconds(2)));
@@ -509,6 +542,85 @@ TEST(MasterEvictionChain, ParkedMoveSourceIsNamedLastAmongColderKeys) {
   EXPECT_TRUE(registry.Get("cold")->Contains("moved"))
       << "parked source was reclaimed after all, so the ordering concern is moot";
   EXPECT_TRUE(registry.Get("hot")->Contains("moved"));
+}
+
+// Records what the manager sends, one entry per EvictKey; executes nothing.
+class RecordingDispatcher final : public EvictKeyDispatcher {
+ public:
+  void DispatchEvictKey(const std::string& /*node_id*/, const std::string& /*peer_address*/,
+                        std::vector<EvictionVictim> victims) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    calls_.push_back(std::move(victims));
+  }
+  std::vector<std::vector<EvictionVictim>> Calls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return calls_;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::vector<std::vector<EvictionVictim>> calls_;
+};
+
+// Keys in the first EvictKey for a full 256-page DRAM bucket of one-page keys.
+size_t FirstRoundVictims(const EvictionConfig& config) {
+  std::vector<std::string> keys;
+  for (int i = 0; i < 256; ++i) keys.push_back("k" + std::to_string(i));
+  InMemoryMasterMetadataStore store;
+  PublishNode(&store, keys, 256 * kPageSize, 256 * kPageSize);
+  RecordingDispatcher dispatcher;
+  EvictionManager manager(store, config, &dispatcher);
+  manager.Start();
+  const bool sent = WaitFor([&] { return !dispatcher.Calls().empty(); }, std::chrono::seconds(8));
+  manager.Stop();
+  return sent ? dispatcher.Calls().front().size() : 0;
+}
+
+TEST(MasterEvictionBytes, ARoundFreesTheOverageUpToTheByteLimit) {
+  // 77 keys over the 0.7 low watermark; rounds used to stop at 32.
+  EXPECT_EQ(FirstRoundVictims(OneSecondRounds()), 77u);
+
+  ::setenv("UMBP_EVICT_MAX_BYTES_PER_ROUND", std::to_string(10 * kPageSize).c_str(), 1);
+  auto limited = OneSecondRounds();
+  limited.max_evict_bytes_per_round = EvictionConfig::FromEnvironment().max_evict_bytes_per_round;
+  ::unsetenv("UMBP_EVICT_MAX_BYTES_PER_ROUND");
+  EXPECT_EQ(FirstRoundVictims(limited), 10u);
+}
+
+// Peer-driven eviction: the master ranks a node's keys on request and leaves
+// the node out of its own rounds.
+TEST(MasterPeerDrivenEviction, RanksANodesKeysAndSkipsItInRounds) {
+  InMemoryMasterMetadataStore store;
+  const auto t0 = Clock::now();
+  RegisterNode(&store, t0);
+  std::map<TierType, TierCapacity> full;
+  full[TierType::DRAM] = TierCapacity{6 * kPageSize, 0, kPageSize};
+  // k5 is the oldest; k0..k3 are "hot", k4/k5 "warm".
+  for (int i = 0; i < 6; ++i) {
+    ReportHeartbeat(&store, /*seq=*/i + 1, t0 + std::chrono::seconds(6 - i), full, TierType::DRAM,
+                    i < 4 ? "hot" : "warm", {"k" + std::to_string(i)}, /*full_sync=*/i == 0);
+  }
+  const auto now = t0 + std::chrono::seconds(10);
+  const auto keys = [&](const std::string& logical, uint64_t pages, size_t max_keys) {
+    std::vector<std::string> out;
+    for (const auto& row : SelectPeerEvictionCandidates(store, kNodeId, TierType::DRAM, logical,
+                                                        pages * kPageSize, max_keys, now)) {
+      out.push_back(row.key);
+    }
+    return out;
+  };
+  EXPECT_EQ(keys("", 3, 0), (std::vector<std::string>{"k5", "k4", "k3"}));
+  EXPECT_EQ(keys("hot", 2, 0), (std::vector<std::string>{"k3", "k2"}));
+  EXPECT_EQ(keys("", 100, 2), (std::vector<std::string>{"k5", "k4"}));
+
+  RecordingDispatcher dispatcher;
+  EvictionManager manager(store, OneSecondRounds(), &dispatcher);
+  manager.SetPeerDriven(kNodeId, true);
+  manager.RunOnceForTest();
+  EXPECT_TRUE(dispatcher.Calls().empty()) << "a peer-driven node still got EvictKey";
+  manager.SetPeerDriven(kNodeId, false);
+  manager.RunOnceForTest();
+  EXPECT_FALSE(dispatcher.Calls().empty());
 }
 
 }  // namespace

@@ -28,15 +28,20 @@
 #include <string>
 #include <vector>
 
+#include "umbp/common/numa_config.h"
+
 namespace mori::umbp {
+
+// Forward-declared rather than included: the dependency runs the other way
+// (distributed/metrics/metric_sink.h is a distributed-layer header), and the
+// config only ever stores a pointer to one.
+class MetricSink;
 
 enum class UMBPRole : int {
   Standalone = 0,
   SharedSSDLeader = 1,
   SharedSSDFollower = 2,
 };
-
-static constexpr uint32_t kAutoRankId = UINT32_MAX;
 
 enum class UMBPSsdLayoutMode : int {
   SegmentedLog = 1,
@@ -62,8 +67,10 @@ struct UMBPDramConfig {
   // Host memory options (ignored when use_shared_memory=true).
   bool use_hugepages = false;
   size_t hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
-  int numa_node = -1;                         // -1 = no NUMA binding
+  std::vector<int> numa_nodes;                // Empty = no NUMA binding.
   bool prefault = true;
+  bool numa_strict = false;
+  int prefault_threads = 0;  // 0 = automatic (up to 16), 1 = serial.
 };
 
 struct UMBPIoConfig {
@@ -85,7 +92,11 @@ struct UMBPSsdConfig {
   std::string storage_dir = "/tmp/umbp_ssd";
   size_t capacity_bytes = 32ULL * 1024 * 1024 * 1024;
   UMBPSsdLayoutMode layout_mode = UMBPSsdLayoutMode::SegmentedLog;
-  size_t segment_size_bytes = 256ULL * 1024 * 1024;
+  // The unit disk is reclaimed in: evicted records keep their bytes until every
+  // record in their segment is gone and the file is deleted.  Each live segment
+  // also holds an fd: at 4 GiB a 1.5 TB tier needs ~350, under the usual soft
+  // RLIMIT_NOFILE of 1,024.  A tier smaller than 8 segments uses capacity / 8.
+  size_t segment_size_bytes = 4ULL * 1024 * 1024 * 1024;
   UMBPIoConfig io;
   UMBPDurabilityConfig durability;
 
@@ -325,13 +336,9 @@ struct UMBPDistributedConfig {
   // stops paying for an arena it does not use.
   size_t ranged_scratch_size = 0;
 
-  // Dedicated SSD read staging, allocated only when medium == SSD. Per-slot
-  // (this / ssd_staging_buffer_slots) must be >= the largest single-key page KV
-  // (61-layer MLA page ~= 4.5 MB).
-  size_t ssd_staging_buffer_size = 268435456;  // 256 MiB
-
-  // Remote SSD read staging slots; per-slot = ssd_staging_buffer_size / this.
-  int ssd_staging_buffer_slots = 16;
+  // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
+  // 0 = 4 GiB capped at the SSD tier.
+  int ssd_staging_buffer_slots = 0;
 
   // Back the SSD staging arena with hugetlbfs pages.  Every byte the SSD
   // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
@@ -435,6 +442,12 @@ struct UMBPDistributedConfig {
   std::string workload_trace_path;
   uint32_t workload_trace_client_id = 0;
   uint64_t workload_trace_seed = 0;
+
+  // Where a MASTERLESS node publishes its metrics; see
+  // PoolClientConfig::metric_sink, which this is lowered into verbatim.
+  // Caller-owned, must outlive the client, null disables. Ignored when
+  // master_config.master_address is set.
+  MetricSink* metric_sink = nullptr;
 };
 
 // User-facing same-host standalone-process configuration.  Set
@@ -483,20 +496,42 @@ struct UMBPConfig {
   // not the cross-node master/RDMA path.
   std::optional<UMBPStandaloneProcessConfig> standalone_process;
 
-  UMBPRole ResolveRole() const {
-    if (role != UMBPRole::Standalone) {
-      return role;
+  // Storage settings shared by embedded, distributed, and auto-started servers.
+  // Unset values preserve the existing deployment-specific defaults.
+  std::string backend_policy_path;
+  std::optional<uint64_t> page_size;
+
+  bool ValidateStorageConfig(std::string* error_message = nullptr) const {
+    if (page_size.has_value() && *page_size == 0) {
+      if (error_message) *error_message = "page_size must be > 0 when supplied";
+      return false;
     }
-    if (follower_mode) {
-      return UMBPRole::SharedSSDFollower;
+    if (distributed.has_value()) {
+      const auto& d = *distributed;
+      if (!backend_policy_path.empty() && !d.backend_policy_path.empty() &&
+          backend_policy_path != d.backend_policy_path) {
+        if (error_message)
+          *error_message = "backend_policy_path conflicts with distributed.backend_policy_path";
+        return false;
+      }
+      if (page_size.has_value() && d.dram_page_size != 0 && *page_size != d.dram_page_size) {
+        if (error_message) *error_message = "page_size conflicts with distributed.dram_page_size";
+        return false;
+      }
     }
-    if (force_ssd_copy_on_write) {
-      return UMBPRole::SharedSSDLeader;
+    if (standalone_process.has_value() && !standalone_process->auto_start &&
+        (!backend_policy_path.empty() || page_size.has_value())) {
+      if (error_message)
+        *error_message =
+            "standalone storage settings require auto_start; configure an existing "
+            "server separately";
+      return false;
     }
-    return UMBPRole::Standalone;
+    return true;
   }
 
   bool Validate(std::string* error_message = nullptr) const {
+    if (!ValidateStorageConfig(error_message)) return false;
     if (dram.capacity_bytes == 0) {
       if (error_message) *error_message = "dram.capacity_bytes must be > 0";
       return false;
@@ -551,8 +586,8 @@ struct UMBPConfig {
       }
       // Only the selected medium's sizing is checked: a node that serves HBM
       // still carries a defaulted dram/ssd block it never allocates from.
-      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::HBM &&
-          d.hbm.capacity_bytes == 0) {
+      if (backend_policy_path.empty() && d.backend_policy_path.empty() &&
+          d.medium == UMBPMedium::HBM && d.hbm.capacity_bytes == 0) {
         if (error_message)
           *error_message =
               "distributed.hbm.capacity_bytes must be > 0 when distributed.medium is HBM";
@@ -561,7 +596,8 @@ struct UMBPConfig {
       // Not ssd.Validate(): that returns early on ssd.enabled == false, and
       // selecting SSD here IS the opt-in (DistributedClient enables the tier
       // from `medium`, so an unset ssd.enabled must not skip the sizing check).
-      if (d.backend_policy_path.empty() && d.medium == UMBPMedium::SSD) {
+      if (backend_policy_path.empty() && d.backend_policy_path.empty() &&
+          d.medium == UMBPMedium::SSD) {
         if (ssd.capacity_bytes == 0) {
           if (error_message)
             *error_message = "ssd.capacity_bytes must be > 0 when distributed.medium is SSD";
@@ -616,6 +652,7 @@ struct UMBPConfig {
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
     cfg.ssd.capacity_bytes = getenv_size("UMBP_SSD_CAPACITY", cfg.ssd.capacity_bytes);
+    cfg.ssd.segment_size_bytes = getenv_size("UMBP_SSD_SEGMENT_SIZE", cfg.ssd.segment_size_bytes);
     cfg.ssd.shard_io_threads = getenv_int("UMBP_SSD_SHARD_IO_THREADS", cfg.ssd.shard_io_threads);
     cfg.ssd.tier_io_threads = getenv_int("UMBP_SSD_TIER_IO_THREADS", cfg.ssd.tier_io_threads);
     cfg.ssd.direct_io = getenv_int("UMBP_SSD_DIRECT_IO", cfg.ssd.direct_io ? 1 : 0) != 0;
@@ -648,7 +685,16 @@ struct UMBPConfig {
     cfg.dram.use_hugepages =
         getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
     cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
-    cfg.dram.numa_node = getenv_int("UMBP_DRAM_NUMA_NODE", cfg.dram.numa_node);
+    // Blank counts as unset, like -1: launch scripts often export VAR=${X:-}.
+    if (const char* nodes = std::getenv("UMBP_DRAM_NUMA_NODE");
+        nodes != nullptr && std::string(nodes).find_first_not_of(" \t\r\n") != std::string::npos) {
+      cfg.dram.numa_nodes = ParseNumaNodes(nodes);
+    }
+    cfg.dram.numa_strict = getenv_int("UMBP_DRAM_NUMA_STRICT", 0) != 0;
+    cfg.dram.prefault_threads = getenv_int("UMBP_DRAM_PREFAULT_THREADS", 0);
+    if (cfg.dram.prefault_threads < 0 || cfg.dram.prefault_threads > 16) {
+      throw std::invalid_argument("UMBP_DRAM_PREFAULT_THREADS must be between 0 and 16");
+    }
     cfg.dram.prefault = getenv_int("UMBP_DRAM_PREFAULT", cfg.dram.prefault ? 1 : 0) != 0;
 
     cfg.ssd.ssd_backend = getenv_str("UMBP_SSD_BACKEND", cfg.ssd.ssd_backend);

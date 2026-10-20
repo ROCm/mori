@@ -21,7 +21,12 @@
 // SOFTWARE.
 #include "umbp/local/tiers/ssd_backend_factory.h"
 
+#include <sys/resource.h>
+
+#include <cstdint>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
@@ -29,9 +34,48 @@
 
 namespace mori::umbp {
 
+namespace {
+
+// Every segment file of every shard stays open until the file is deleted, which
+// is once nothing in it is live, so a full tier holds about capacity /
+// segment_size descriptors (a few more while a deleted segment's fd waits out
+// the GDS grace, see SSDTier::SetRetiredFileHook).  Past the soft RLIMIT_NOFILE the next
+// segment open fails with EMFILE, and so does every write that needs it.  This
+// library also runs inside other programs (sglang, embedded), so it leaves the
+// process-wide limit alone and says what to change; UMBP's own executables
+// raise it in main() (RaiseOpenFileLimit).
+void CheckSegmentFdBudget(uint64_t segments) {
+  // Sockets, GPU IPC imports and the like that the process opens later.
+  constexpr uint64_t kSlack = 256;
+  struct rlimit rl{};
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY) return;
+  uint64_t open_now = 0;
+  std::error_code ec;
+  for (std::filesystem::directory_iterator it("/proc/self/fd", ec), end; !ec && it != end;
+       it.increment(ec)) {
+    ++open_now;
+  }
+  const uint64_t need = open_now + segments + kSlack;
+  if (need <= rl.rlim_cur) return;
+  MORI_UMBP_ERROR(
+      "[MakeFileSsdBackend] RLIMIT_NOFILE soft limit {} is below the ~{} descriptors this "
+      "process needs once the SSD tier fills ({} open + {} segment files + {} slack); writes "
+      "will then fail with EMFILE.  Raise it (ulimit -n, docker --ulimit nofile) or "
+      "ssd.segment_size_bytes.",
+      rl.rlim_cur, need, open_now, segments, kSlack);
+}
+
+}  // namespace
+
 std::unique_ptr<TierBackend> MakeFileSsdBackend(const UMBPSsdConfig& ssd_config,
                                                 SSDAccessMode access_mode) {
   const std::vector<std::string> dirs = ssd_config.StorageDirs();
+  if (ssd_config.segment_size_bytes > 0) {
+    // Plus each shard's partially filled active segment.
+    CheckSegmentFdBudget((ssd_config.capacity_bytes + ssd_config.segment_size_bytes - 1) /
+                             ssd_config.segment_size_bytes +
+                         dirs.size());
+  }
   // Surface the resolved durability mode once: "strict" fdatasync()s every batch
   // write and, on a real drive, dominates write time.  UMBP_SSD_DURABILITY.
   MORI_UMBP_INFO("[MakeFileSsdBackend] drives={} durability={} io_backend={} queue_depth={}",

@@ -326,11 +326,6 @@ class TenantRegistry {
     return false;
   }
 
-  TenantRuntime* FindTenant(uint32_t tenant_id) {
-    auto it = tenants_.find(tenant_id);
-    return (it != tenants_.end()) ? it->second.get() : nullptr;
-  }
-
   TenantRuntime* FindTenantByChannel(const ClientChannel& ch) {
     auto it = tenants_.find(ch.tenant_id);
     if (it == tenants_.end()) return nullptr;

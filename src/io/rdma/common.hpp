@@ -21,7 +21,9 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -159,7 +161,10 @@ struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
       : status(s), id(id_), totalBatchSize(n) {}
 
-  TransferStatus* status{nullptr};
+  // Claimed with exchange(nullptr) by whoever completes the transfer first, so a
+  // terminal update happens exactly once even though the CQ poller and the async
+  // event monitor can both reach the same meta concurrently.
+  std::atomic<TransferStatus*> status{nullptr};
   TransferUniqueId id{0};
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
@@ -168,6 +173,7 @@ struct CqCallbackMeta {
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
 enum class SubmissionState : uint8_t {
+  Posting,   // admitted, but ibv_post_send has not returned yet
   Posted,    // submitted, awaiting CQE
   Orphaned,  // partial post without signaled tail; awaits recovery
 };
@@ -183,14 +189,84 @@ struct SubmissionRecord {
 
 class SubmissionLedger {
  public:
-  explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{notifPerQp} {}
+  // Every unsignaled WR is posted with wr_id 0 (see PostSend), so 0 can never
+  // name a record and is free to mean "refused".
+  static constexpr uint64_t kInvalidRecordId = 0;
 
-  // Allocate recordId, insert Posted record, return recordId.
+  // Record ids are allocated from wr_id Zone B, which starts at notifPerQp.
+  // Zone A is empty when notifications are disabled (notifPerQp == 0), and
+  // starting there would hand out 0 -- kInvalidRecordId -- for the first record,
+  // making every first submission on this ledger look refused. Skip it; that id
+  // is unused in that configuration anyway.
+  explicit SubmissionLedger(uint32_t notifPerQp) : nextId_{std::max<uint64_t>(notifPerQp, 1)} {}
+
+  // RAII handle for the window between admission and ibv_post_send. The record
+  // exists in Posting state for as long as the guard is alive, which is what
+  // holds FailAll() back (see InsertForPost). Destroying the guard commits the
+  // outcome, so no exit path can leave a fatal event draining forever.
+  class PostGuard {
+   public:
+    PostGuard() = default;
+    PostGuard(SubmissionLedger* ledger, uint64_t recordId) : ledger_(ledger), recordId_(recordId) {}
+    PostGuard(const PostGuard&) = delete;
+    PostGuard& operator=(const PostGuard&) = delete;
+    PostGuard(PostGuard&& other) noexcept { *this = std::move(other); }
+    PostGuard& operator=(PostGuard&& other) noexcept {
+      if (this != &other) {
+        Commit();
+        ledger_ = std::exchange(other.ledger_, nullptr);
+        recordId_ = std::exchange(other.recordId_, kInvalidRecordId);
+        posted_ = std::exchange(other.posted_, false);
+      }
+      return *this;
+    }
+    ~PostGuard() { Commit(); }
+
+    // Call once ibv_post_send has actually placed the signaled tail on the wire.
+    void MarkPosted() { posted_ = true; }
+
+    // Settle the record now instead of at scope exit. Idempotent; the destructor
+    // is the backstop for paths that do not reach an explicit call.
+    void Commit() {
+      if (ledger_) ledger_->CommitPost(recordId_, posted_);
+      ledger_ = nullptr;
+    }
+
+    // kInvalidRecordId when admission was refused.
+    uint64_t RecordId() const { return ledger_ ? recordId_ : kInvalidRecordId; }
+    explicit operator bool() const { return ledger_ != nullptr; }
+
+   private:
+    SubmissionLedger* ledger_{nullptr};
+    uint64_t recordId_{kInvalidRecordId};
+    bool posted_{false};
+  };
+
+  // Admit a signaled record and hold it in Posting state until the returned
+  // guard is destroyed. FailAll() cannot retire records while any guard is
+  // outstanding, so the ledger either refuses admission outright (falsy guard,
+  // caller must not post) or waits until the post outcome is known -- there is
+  // no interleaving where a record is failed while its WR is still in flight.
+  //
+  // ibv_post_send deliberately runs outside the ledger mutex; only the short
+  // admission and commit steps take it.
+  PostGuard InsertForPost(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
+
+  // Allocate recordId, insert Posted record, return recordId. Returns
+  // kInvalidRecordId once the ledger is closed; the caller must then not post the
+  // WR, because nothing will ever reap a completion for it.
+  //
+  // Only safe where there is no post step to race -- production submitters go
+  // through InsertForPost() instead.
   uint64_t Insert(int postedWr, bool hasSignaledTail, std::shared_ptr<CqCallbackMeta> meta,
                   int batchSize);
 
-  // Insert an Orphaned record (partial post, no signaled tail).
-  void InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta, int batchSize);
+  // Insert an Orphaned record (partial post, no signaled tail). Returns false
+  // when the ledger is already closed, which means the record was refused and
+  // the caller still owns the sqDepth reservation for those WRs: FailAll() could
+  // not have released them, because they were never in the ledger.
+  [[nodiscard]] bool InsertOrphaned(int postedWr, std::shared_ptr<CqCallbackMeta> meta,
+                                    int batchSize);
 
   // CQE path: find record by recordId, release sqDepth, return CqCallbackMeta.
   // Returns nullptr if record not found.
@@ -202,11 +278,57 @@ class SubmissionLedger {
 
   bool HasOrphaned() const;
 
+  // Terminal path: fail every record and erase them. Used when the QP or its CQ
+  // has died, so no CQE can ever arrive for the records left behind. Returns the
+  // number of transfers whose status this call moved to a failed state.
+  //
+  // This also closes the ledger for good. Closing matters as much as failing: a
+  // submitter that cleared the degraded check just before the event arrives is
+  // still on its way to Insert(), and a record accepted after this point would
+  // wait for a completion that can never come.
+  //
+  // Blocks until every outstanding PostGuard has committed, so a record is never
+  // failed while its ibv_post_send is still running. The wait is bounded by that
+  // one verbs call and only happens on the fatal-event path.
+  int FailAll(StatusCode code, const std::string& message, std::atomic<int>* sqDepth);
+
+  // True once FailAll() has run. A closed ledger never accepts another record, so
+  // it also tells the CQE path that this endpoint's degraded flag is terminal.
+  bool Closed() const;
+
  private:
+  friend class PostGuard;
+
+  // Resolve a Posting record: promote it to Posted, or drop it when the WR never
+  // reached the wire. Tolerates a missing record, because the CQ poller may have
+  // already reaped the completion through ReleaseByCqe().
+  void CommitPost(uint64_t recordId, bool posted);
+
   mutable std::mutex mu_;
+  std::condition_variable postingDrained_;
   uint64_t nextId_;
   std::unordered_map<uint64_t, SubmissionRecord> records_;
+  // Outstanding PostGuards. FailAll() waits for this to reach 0.
+  int posting_{0};
+  bool closed_{false};
 };
+
+// A verbs async event that means outstanding work can never complete. Scope says
+// which endpoints are affected: a single QP moved to Error state, or a CQ/device
+// that died and took every endpoint sharing it with it.
+struct QpErrorEvent {
+  enum class Scope : uint8_t { kQueuePair, kCompletionQueue, kDevice };
+
+  Scope scope{Scope::kQueuePair};
+  uint32_t qpNum{0};
+  // CQ handle for kCompletionQueue. Compared by value only: the verbs object may
+  // already be acked and must never be dereferenced here.
+  const void* cq{nullptr};
+  ibv_context* context{nullptr};
+  const char* eventName{""};
+};
+
+using QpErrorHandler = std::function<void(const QpErrorEvent&)>;
 
 inline constexpr std::memory_order kSqAdmissionOrder = std::memory_order_seq_cst;
 
@@ -231,6 +353,10 @@ struct EpPair {
   // Shared across EpPair copies that refer to the same QP.
   std::shared_ptr<SqAdmissionEvent> sqAdmission;
 };
+
+// Which endpoints a fatal async event takes down with it. A QP event hits one
+// endpoint; a CQ or device event hits everything sharing that CQ or context.
+bool EndpointAffectedByAsyncEvent(const QpErrorEvent& event, const EpPair& ep);
 
 using EndpointId = uint64_t;
 

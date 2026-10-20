@@ -91,7 +91,12 @@ _configure_packaged_spdk_proxy()
 _configure_packaged_umbp_master()
 _configure_packaged_umbp_standalone_server()
 
-from mori.cpp import (
+from mori.cpp import _load_umbp
+
+# Says why when UMBP's module cannot load; the names below would only say "cannot import".
+_load_umbp()
+
+from mori.cpp import (  # noqa: E402
     CacheRemoteAdmission,
     UMBPClient,
     UMBPConfig,

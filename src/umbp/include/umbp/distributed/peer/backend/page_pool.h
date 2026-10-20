@@ -70,7 +70,8 @@ class PagePool {
   // RDMA), packs within one buffer, or scatters across buffers is POLICY that
   // belongs to the implementation; it is deliberately not in this contract, so
   // a new pool can change placement without touching a caller.
-  virtual std::optional<std::vector<PageLocation>> Allocate(uint32_t num_pages) = 0;
+  virtual std::optional<std::vector<PageLocation>> Allocate(
+      uint32_t num_pages, std::optional<size_t> preferred_buffer = std::nullopt) = 0;
 
   // Return pages to the pool.  Must tolerate an empty list, and must ignore
   // out-of-range entries rather than trap -- teardown paths can present pages

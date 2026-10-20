@@ -146,6 +146,18 @@ inline uint32_t GetEnvUint32(const char* name, uint32_t def, uint32_t min_allowe
   return static_cast<uint32_t>(v);
 }
 
+// Byte counts and other values past uint32.  The parser is signed, so the
+// ceiling is INT64_MAX -- far beyond any byte count this reads.
+inline uint64_t GetEnvUint64(const char* name, uint64_t def, uint64_t min_allowed = 0) {
+  const int64_t v = env_time_detail::ResolveEnvInt(name, static_cast<int64_t>(def),
+                                                   static_cast<int64_t>(min_allowed));
+  if (v < 0) {
+    env_time_detail::WarnOnce(name, "negative", std::getenv(name));
+    return def;
+  }
+  return static_cast<uint64_t>(v);
+}
+
 // Resolve a string-enum env var against a fixed set of allowed values.
 //   - Unset / empty / whitespace-only -> return `def` silently.
 //   - After trimming leading/trailing whitespace, exact (case-sensitive,

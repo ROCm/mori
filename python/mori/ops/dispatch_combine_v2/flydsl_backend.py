@@ -41,6 +41,7 @@ from .intranode_kernels import (
 )
 from .dispatch_combine_op import (  # noqa: F401
     _DT,
+    _FP4_QUANT_TYPES,
     _FP8_DTYPES,
     _QUANT_TYPES,
     EpDispatchCombineConfig,
@@ -67,6 +68,18 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                 f"gpu_per_node={cfg.gpu_per_node} < world_size={cfg.world_size} "
                 "selects the internode path, which only the 'hip' backend "
                 "implements; pass kernel_backend='hip'",
+            )
+        if cfg.quant_type in _FP4_QUANT_TYPES:
+            return (
+                f"quant_type={cfg.quant_type!r} is the hip backend's gfx125x combine; "
+                "pass kernel_backend='hip'",
+            )
+        # The config lets an asymmetric dtype through with fp8_blockwise for the
+        # hip push combine; this backend's fp8_blockwise scatter has no such path.
+        if cfg.is_asymmetric_dtype and cfg.quant_type != "none":
+            return (
+                f"quant_type={cfg.quant_type!r} with an asymmetric dtype is the hip "
+                "backend's gfx125x push combine; pass kernel_backend='hip'",
             )
         return ()
 
@@ -236,7 +249,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     fp8_direct_cast=cfg.fp8_direct_cast,
                     fp8_blockwise=cfg.fp8_blockwise,
                     scale_dim=cfg.combine_scale_dim,
-                    reset_total_recv=False,
                 )
                 for (b, w) in combine_specs
             }
@@ -255,7 +267,6 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     off_out_tok=arena.offset("out_tok"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
                     off_out_wts=arena.offset("out_wts"),
-                    reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
                 )
                 for (b, w) in combine_specs
@@ -321,10 +332,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
-            # FlyDSL stages combine's input on the host (see combine()), and its
-            # kernels reset their own counters.
+            # FlyDSL stages combine's input on the host (see combine()).
             stages_in_kernel=False,
-            self_resets_counters=True,
             capabilities=frozenset(
                 {
                     "gather",
@@ -509,7 +518,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
     def local_expert_count(self):
         """[num_experts_per_rank] i32: recv tokens per local expert. Call after
-        dispatch, before combine (gather resets total_recv)."""
+        dispatch."""
         self._local_expert_count_buf.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
         self._local_expert_count(
