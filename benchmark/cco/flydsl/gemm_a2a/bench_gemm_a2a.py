@@ -74,6 +74,7 @@ from mori.ops.gemm_a2a import (
     counter_chunks,
     preshuffle_b,
 )
+from mori.ops.gemm_a2a import timeline
 from mori.ops.gemm_a2a.layout import DEFAULT_BLOCK_M, MXFP8_BLOCK_M
 from mori.ops.gemm_a2a.kernels_fused import (
     compile_fused_gemm_a2a,
@@ -305,6 +306,13 @@ def run(args) -> int:
     # A chunk is a run of row tiles; the count has to divide them, and the
     # request is rounded down rather than rejected so a sweep stays usable.
     chunks = counter_chunks(args.m // args.block_m, args.chunks) if needs_sdma else 1
+    # An explicit plan is a requirement, not a preference: it is validated
+    # rather than rounded, because a silently different plan is a different
+    # experiment.
+    plan = ()
+    if needs_sdma and args.chunk_plan:
+        plan = tuple(int(t) for t in args.chunk_plan.split(","))
+        chunks = len(plan)
     cfg = a2a_config(
         world_size=world_size,
         m=args.m,
@@ -313,17 +321,31 @@ def run(args) -> int:
         block_n=args.block_n,
         staged=needs_staging,
         counter_chunks=chunks,
+        chunk_plan=plan,
         force_blocks=args.copy_blocks or None,
     )
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
     b_shuf = preshuffle_b(b)
 
+    # --timeline: a stamp region after the window proper, rank-local, read back
+    # after the timed replays so it holds the last replay's steady state.
+    stamp_off = stamp_drain = 0
+    alloc_bytes = cfg.window_bytes
+    if args.timeline:
+        if args.mode != "fused-sdma":
+            raise SystemExit("--timeline instruments fused-sdma only")
+        stamp_grid = cfg.m_tiles * cfg.n_blocks
+        stamp_off = (cfg.window_bytes + 4095) // 4096 * 4096
+        stamp_drain = timeline.drain_slot(stamp_grid, world_size, chunks)
+        n_stamps = timeline.stamp_slots(stamp_grid, world_size, chunks)
+        alloc_bytes = stamp_off + n_stamps * 8
+
     # The window holds only what peers must reach: recv. C is local.
-    vmm = 2 * cfg.window_bytes + (64 << 20)
+    vmm = 2 * alloc_bytes + (64 << 20)
     with Communicator.init(world_size, rank, uid, per_rank_vmm=vmm) as comm:
-        mem = comm.alloc_mem(cfg.window_bytes)
+        mem = comm.alloc_mem(alloc_bytes)
         win = comm.register_window(mem.ptr, mem.size)
-        from_gpu_ptr(mem.ptr, (cfg.window_bytes,), torch.uint8).zero_()
+        from_gpu_ptr(mem.ptr, (alloc_bytes,), torch.uint8).zero_()
         recv = from_gpu_ptr(
             mem.ptr + cfg.recv_off,
             (world_size * args.m, cfg.shard_n),
@@ -373,6 +395,7 @@ def run(args) -> int:
                 # be off or it reads a hole.
                 self_to_recv=args.mode != "split-rccl",
                 staging_store=args.staging_store,
+                stamp_off=stamp_off,
             )
         elif args.mode == "fused-lsa":
             # The epilogue writes into the peers, so there is no separate
@@ -455,7 +478,13 @@ def run(args) -> int:
         # *finished*, or a rank reads a slab a peer is still writing.
         barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
         parts = (
-            build_sdma_phases(cfg, rank, queues=args.sdma_queues)
+            build_sdma_phases(
+                cfg,
+                rank,
+                queues=args.sdma_queues,
+                stamp_off=stamp_off,
+                stamp_drain=stamp_drain,
+            )
             if needs_sdma
             else None
         )
@@ -563,6 +592,25 @@ def run(args) -> int:
                 )
 
         us = _median_us(once, args.warmup, args.iters, graph=not args.no_graph)
+        stamps = None
+        if args.timeline:
+            # Before the phase split, whose GEMM-only launches would overwrite
+            # the block stamps without a matching drain.
+            torch.cuda.synchronize()
+            raw = (
+                from_gpu_ptr(mem.ptr + stamp_off, (n_stamps,), torch.int64)
+                .cpu()
+                .tolist()
+            )
+            chunk_bytes = [t * args.block_m * cfg.shard_n * 2 for t in cfg.chunk_tiles]
+            stamps = timeline.decode(
+                raw,
+                grid=stamp_grid,
+                world=world_size,
+                chunks=chunks,
+                rank=rank,
+                chunk_bytes=chunk_bytes,
+            )
         # Same-run phase split, as gcnasm's strict_timing does. The headline
         # `us` stays the whole thing; these two are only for attribution, and
         # they exist because "mode E2E minus a separate gemm-only run" charges
@@ -603,7 +651,20 @@ def run(args) -> int:
         comm.barrier()
 
         gathered = [None] * world_size
-        dist.all_gather_object(gathered, {"rank": rank, "us": us, "ok": validated})
+        dist.all_gather_object(
+            gathered, {"rank": rank, "us": us, "ok": validated, "stamps": stamps}
+        )
+        if rank == 0 and args.timeline:
+            with open(args.timeline, "w") as f:
+                json.dump(
+                    {
+                        "args": vars(args),
+                        "chunk_plan": list(cfg.chunk_tiles),
+                        "us": [g["us"] for g in gathered],
+                        "ranks": [g["stamps"] for g in gathered],
+                    },
+                    f,
+                )
         if rank == 0:
             result = {
                 "mode": args.mode,
@@ -613,6 +674,8 @@ def run(args) -> int:
                 "quant": args.quant,
                 "world_size": world_size,
                 "shard_n": cfg.shard_n,
+                "chunks": chunks,
+                "chunk_plan": list(cfg.chunk_tiles) if needs_sdma else [],
                 "us": max(g["us"] for g in gathered),
                 "rel_l2": rel_l2,
                 "validated": all(g["ok"] for g in gathered),
@@ -643,6 +706,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rotated", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--n-stripe", type=int, default=1)
     p.add_argument("--chunks", type=int, default=1)
+    p.add_argument(
+        "--chunk-plan",
+        default="",
+        help="row tiles per chunk, comma-separated, e.g. 1,3,8,3,1; must sum to "
+        "m/block_m and overrides --chunks",
+    )
     p.add_argument("--direct-fence", choices=("leader", "all"), default="leader")
     p.add_argument("--fence", choices=("none", "leader", "all"), default="leader")
     p.add_argument("--copy-blocks", type=int, default=0)
@@ -662,6 +731,13 @@ def build_parser() -> argparse.ArgumentParser:
         "by construction and validation is skipped",
     )
     p.add_argument("--skip-validation", action="store_true")
+    p.add_argument(
+        "--timeline",
+        default="",
+        metavar="PATH",
+        help="fused-sdma only: compile in device timestamps and write the last "
+        "timed replay's per-rank timeline to PATH (JSON)",
+    )
     #: fp8's own floor at these shapes is ~2e-3; 3e-3 leaves headroom for the
     #: accumulation order differing from the host reference without admitting a
     #: real error, which starts at 1e-2 and rises fast.

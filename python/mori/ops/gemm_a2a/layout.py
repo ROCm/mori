@@ -148,6 +148,12 @@ class A2aConfig:
     #: leave while the GEMM is still computing its later ones. Chunking is along
     #: **M**, so a chunk stays contiguous inside ``[dst][M][shard_n]``.
     counter_chunks: int = 1
+    #: Row tiles in each chunk, in order, when they are not all equal. Empty
+    #: means ``counter_chunks`` equal chunks. An uneven plan exists to shrink
+    #: the two ends a fused GEMM cannot hide -- the wait before the first put
+    #: and the transfer of the last chunk -- while keeping the middle puts large
+    #: enough that the per-packet cost does not dominate.
+    chunk_plan: tuple[int, ...] = ()
     #: Chunks the counter *region* is sized for, as opposed to the number this
     #: config uses. Same rationale as gemm_ar: ``counter_chunks`` changes with
     #: ``m``, and sizing the region from it would move every later offset, which
@@ -215,6 +221,22 @@ class A2aConfig:
     @property
     def tiles_per_peer(self) -> int:
         return self.m_tiles * self.n_blocks_per_peer
+
+    @property
+    def chunk_tiles(self) -> tuple[int, ...]:
+        """Row tiles per chunk, in order -- ``chunk_plan`` or the even split."""
+        if self.chunk_plan:
+            return tuple(self.chunk_plan)
+        return (self.m_tiles // self.counter_chunks,) * self.counter_chunks
+
+    @property
+    def chunk_starts(self) -> tuple[int, ...]:
+        """First row tile of each chunk."""
+        starts, at = [], 0
+        for t in self.chunk_tiles:
+            starts.append(at)
+            at += t
+        return tuple(starts)
 
     # --- index maps --------------------------------------------------------
     #
@@ -404,7 +426,24 @@ class A2aConfig:
             )
         if self.counter_chunks < 1:
             raise ValueError(f"counter_chunks must be >= 1, got {self.counter_chunks}")
-        if self.m_tiles % self.counter_chunks:
+        if self.chunk_plan:
+            if len(self.chunk_plan) != self.counter_chunks:
+                raise ValueError(
+                    f"chunk_plan has {len(self.chunk_plan)} chunks but "
+                    f"counter_chunks={self.counter_chunks}; the counter region "
+                    f"is indexed by chunk, so the two must agree"
+                )
+            if any(t < 1 for t in self.chunk_plan):
+                raise ValueError(
+                    f"chunk_plan {self.chunk_plan} has an empty chunk; a chunk "
+                    f"with no tiles would never be elected and never pushed"
+                )
+            if sum(self.chunk_plan) != self.m_tiles:
+                raise ValueError(
+                    f"chunk_plan {self.chunk_plan} covers {sum(self.chunk_plan)} "
+                    f"row tiles, but m={self.m} has {self.m_tiles}"
+                )
+        elif self.m_tiles % self.counter_chunks:
             raise ValueError(
                 f"counter_chunks ({self.counter_chunks}) must divide the "
                 f"{self.m_tiles} row tiles: chunking is along M so that a chunk "

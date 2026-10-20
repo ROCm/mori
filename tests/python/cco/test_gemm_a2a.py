@@ -166,6 +166,33 @@ def test_m_must_be_whole_row_tiles_and_chunks_must_divide_them():
     layout.a2a_config(world_size=8, m=2048, n=2048, counter_chunks=8).validate()
 
 
+def test_chunk_plan_covers_the_row_tiles_in_order():
+    # 2048/128 = 16 row tiles; 5 uneven chunks are fine where 5 even ones are not.
+    c = layout.a2a_config(
+        world_size=8, m=2048, n=2048, counter_chunks=5, chunk_plan=(1, 3, 8, 3, 1)
+    )
+    assert c.chunk_tiles == (1, 3, 8, 3, 1)
+    assert c.chunk_starts == (0, 1, 4, 12, 15)
+    even = layout.a2a_config(world_size=8, m=2048, n=2048, counter_chunks=4)
+    assert even.chunk_tiles == (4, 4, 4, 4)
+    assert even.chunk_starts == (0, 4, 8, 12)
+
+
+@pytest.mark.parametrize(
+    "plan, chunks, match",
+    [
+        ((1, 3, 8, 3), 4, "covers 15"),
+        ((1, 3, 8, 3, 1), 4, "counter_chunks"),
+        ((0, 4, 8, 4), 4, "empty chunk"),
+    ],
+)
+def test_chunk_plan_rejects(plan, chunks, match):
+    with pytest.raises(ValueError, match=match):
+        layout.a2a_config(
+            world_size=8, m=2048, n=2048, counter_chunks=chunks, chunk_plan=plan
+        )
+
+
 @pytest.mark.parametrize(
     "kwargs, match",
     [

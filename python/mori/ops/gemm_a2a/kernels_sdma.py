@@ -62,13 +62,22 @@ from ..gemm_ar._compat import (
     signal_store_u32,
 )
 from .kernels_lsa import _spin_until
+from .timeline import stamp
 
 #: One wave is enough: the kernel issues at most ``world_size`` puts and then
 #: polls. gemm_ar uses the same number for the same reason.
 PUSH_THREADS = 64
 
 
-def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
+def build_sdma_phases(
+    cfg,
+    rank: int,
+    *,
+    queues: int = 1,
+    signal: bool = False,
+    stamp_off: int = 0,
+    stamp_drain: int = 0,
+):
     """Compile the push phases for ``cfg`` on ``rank``.
 
     Returns ``{"scatter", "drain"}``, each a launcher taking
@@ -90,6 +99,9 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
     ``signal`` selects ``put``'s trailing local ATOMIC, off by default:
     ``quiet_queue`` drains the queue's read pointer independently of signals and
     nothing here polls one, so the packet would be pure overhead.
+
+    ``stamp_off``/``stamp_drain`` place ``timeline`` stamps (byte offset of the
+    region, u64 slot of the drain block); ``stamp_off=0`` compiles them out.
     """
     cfg.validate()
     if not cfg.staged:
@@ -139,6 +151,11 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
             sdma = cco.DevComm(dev_comm).sdma()
 
             flag, flag_rsrc = _next_flag(w)
+            ts_base = None
+            if const_expr(stamp_off):
+                ts_base = fx.Int64(w.lsa_ptr(rank, stamp_off))
+                if tid == 0:
+                    stamp(ts_base, stamp_drain)
             if tid < ws:
                 if tid != rank:
                     if const_expr(pushes):
@@ -158,6 +175,8 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
                             signal=signal,
                         )
                     sdma.quiet_queue(tid, tid % fx.Int32(queues))
+                    if const_expr(stamp_off):
+                        stamp(ts_base, fx.Int32(stamp_drain + 2) + tid)
                 # Release before publishing arrival. The bytes were moved by the
                 # copy engine rather than by this CU, so there is nothing of ours
                 # to flush; the fence keeps the flag store from being hoisted
@@ -165,9 +184,13 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
                 # on.
                 raw_cco.cco_system_fence(fx.Int32(0))
                 _signal_and_wait(w, flag, tid)
+                if const_expr(stamp_off):
+                    stamp(ts_base, fx.Int32(stamp_drain + 2 + ws) + tid)
             fgpu.barrier()
             if tid == 0:
                 local_store_u32(flag_rsrc, flag)
+                if const_expr(stamp_off):
+                    stamp(ts_base, stamp_drain + 1)
 
         @flyc.jit
         def run(dev_comm: Int64, win: Int64, stream: fx.Stream = fx.Stream(None)):
@@ -178,8 +201,12 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
         return run
 
     return {
-        "scatter": _push_kernel(True, f"mori_a2a_sdma_scatter_r{rank}_q{queues}"),
-        "drain": _push_kernel(False, f"mori_a2a_sdma_drain_r{rank}_q{queues}"),
+        "scatter": _push_kernel(
+            True, f"mori_a2a_sdma_scatter_r{rank}_q{queues}{'_ts' if stamp_off else ''}"
+        ),
+        "drain": _push_kernel(
+            False, f"mori_a2a_sdma_drain_r{rank}_q{queues}{'_ts' if stamp_off else ''}"
+        ),
     }
 
 

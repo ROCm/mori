@@ -118,6 +118,7 @@ from ..gemm_ar.kernels_fused import (
     _PermlaneStoreC,
     _SwappedMfma,
 )
+from .timeline import chunk_slot, stamp
 from .layout import (  # noqa: F401
     DEFAULT_BLOCK_M,
     DEFAULT_BLOCK_N,
@@ -126,6 +127,25 @@ from .layout import (  # noqa: F401
 )
 
 BLOCK_K = 128
+
+
+def _uneven_chunk(block_m, starts, sizes):
+    """``(chunk, row tiles in it, its first row tile)`` for row tile ``block_m``.
+
+    ``starts`` and ``sizes`` are Python constants, so this unrolls into one
+    compare and three selects per chunk boundary -- a handful of SALU ops, once
+    per block, against a plan that has at most a few chunks. Kept outside the
+    kernel body so FlyDSL's rewriter does not turn the loop into an scf.for.
+    """
+    chunk = fx.Int32(0)
+    rows = fx.Int32(sizes[0])
+    start = fx.Int32(0)
+    for i in range(1, len(starts)):
+        past = block_m >= fx.Int32(starts[i])
+        chunk = arith.select(past, fx.Int32(i), chunk)
+        rows = arith.select(past, fx.Int32(sizes[i]), rows)
+        start = arith.select(past, fx.Int32(starts[i]), start)
+    return chunk, rows, start
 
 
 def direct_lsa_probe(transport: str) -> bool:
@@ -256,8 +276,12 @@ def compile_fused_gemm_a2a(
     direct_fence: str = "leader",
     emit_put: bool = True,
     fence: str = "leader",
+    stamp_off: int = 0,
 ):
     """The GEMM with its C stored straight into the destinations' windows.
+
+    ``stamp_off`` (SDMA path only) is the byte offset in this rank's window of a
+    ``timeline`` stamp region; 0 compiles the stamps out. See ``timeline``.
 
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``. ``C`` is not written on this path -- it is still passed
@@ -353,6 +377,17 @@ def compile_fused_gemm_a2a(
     m_tiles_per_chunk = cfg.m_tiles // chunks
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_per_peer
     chunk_bytes = m_tiles_per_chunk * BLOCK_M * shard_n * 2
+    # An uneven plan replaces the three constants above with per-chunk values,
+    # looked up from block_m in the epilogue. An even plan keeps the constants,
+    # so `--chunks N` compiles to exactly the kernel it did before.
+    chunk_sizes = cfg.chunk_tiles if not direct_lsa else (cfg.m_tiles,)
+    uneven = len(set(chunk_sizes)) > 1
+    chunk_starts = cfg.chunk_starts if uneven else ()
+    row_tile_bytes = BLOCK_M * shard_n * 2
+    if stamp_off and direct_lsa:
+        raise ValueError("stamp_off instruments the SDMA path only")
+    stamp_grid = cfg.m_tiles * cfg.n_blocks
+    stamp_chunk0 = chunk_slot(stamp_grid)
     if rotated and n_blocks_per_peer % n_stripe:
         raise ValueError(
             f"n_stripe={n_stripe} must divide the {n_blocks_per_peer} N tiles in a "
@@ -376,8 +411,11 @@ def compile_fused_gemm_a2a(
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
         f"{'B' if blockscale else ('X' if mxfp8 else 'P')}"
         f"{'r' if rotated else 'l'}s{n_stripe}"
-        f"c{chunks}q{sdma_queues}{'S' if self_to_recv else 'A'}"
-        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_r{rank}"
+        # `_`, not `-`: the name becomes an assembler symbol.
+        f"c{chunks}{'p' + '_'.join(map(str, chunk_sizes)) if uneven else ''}"
+        f"q{sdma_queues}{'S' if self_to_recv else 'A'}"
+        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}"
+        f"{'_ts' if stamp_off else ''}_r{rank}"
     )
 
     @fx.struct
@@ -476,6 +514,11 @@ def compile_fused_gemm_a2a(
         # and gives 0.58 here.
         mfma = _SwappedMfma(Mfma16x16x128(N_TILES_B, N_TILES_A, opsel_b_per_tile=mxfp8))
         w_pre = cco.CachedWindow(win)
+        stamp_base = None
+        if const_expr(stamp_off):
+            stamp_base = fx.Int64(w_pre.lsa_ptr(rank, stamp_off))
+            if fx.thread_idx.x == 0:
+                stamp(stamp_base, fx.block_idx.x)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
@@ -888,12 +931,25 @@ def compile_fused_gemm_a2a(
             lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
             sdma = cco.DevComm(dev_comm).sdma()
             if fx.thread_idx.x == 0 and const_expr(fuse):
+                if const_expr(stamp_off):
+                    stamp(stamp_base, fx.block_idx.x + fx.Int32(stamp_grid))
                 # dest is the *column* block's owner and chunk is a run of row
                 # tiles, which is the transpose of gemm_ar's (dest from rows,
                 # chunk from... rows as well). Chunking along M is what keeps a
                 # chunk contiguous inside [dst][M][shard_n].
                 dest = block_n // fx.Int32(n_blocks_per_peer)
-                chunk = block_m // fx.Int32(m_tiles_per_chunk)
+                if const_expr(uneven):
+                    chunk, c_rows, c_start = _uneven_chunk(
+                        block_m, chunk_starts, chunk_sizes
+                    )
+                    c_tiles = c_rows * fx.Int32(n_blocks_per_peer)
+                    c_off = fx.Int64(c_start) * fx.Int64(row_tile_bytes)
+                    c_bytes = fx.Int64(c_rows) * fx.Int64(row_tile_bytes)
+                else:
+                    chunk = block_m // fx.Int32(m_tiles_per_chunk)
+                    c_tiles = fx.Int32(tiles_per_chunk)
+                    c_off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
+                    c_bytes = fx.Int64(chunk_bytes)
                 slot = dest * fx.Int32(chunks) + chunk
                 ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
                 # acq_rel, matching gemm_ar's default rather than
@@ -903,16 +959,24 @@ def compile_fused_gemm_a2a(
                 # Monotonic: the counters are never reset, so "last tile of this
                 # chunk, this epoch" is a modulo test rather than a compare --
                 # the same property that makes graph replay behave like a fresh
-                # launch.
-                if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
+                # launch. Each counter only ever sees its own chunk's tiles, so
+                # an uneven plan's per-chunk divisor keeps that true.
+                if seq % c_tiles == fx.Int32(0):
                     if const_expr(fuse and emit_put) and dest != fx.Int32(rank):
-                        off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
+                        off = c_off
                         lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))
+                        ts_slot = fx.Int32(stamp_chunk0) + (
+                            dest * fx.Int32(chunks) + chunk
+                        ) * fx.Int32(3)
+                        if const_expr(stamp_off):
+                            stamp(stamp_base, ts_slot)
                         if const_expr(chunks > 1):
                             # Two chunks of one destination can be elected at
                             # nearly the same moment and would then post to the
                             # same queue concurrently.
                             _acquire_peer_lock(lock)
+                        if const_expr(stamp_off):
+                            stamp(stamp_base, ts_slot + fx.Int32(1))
                         sdma.put(
                             dest,
                             win,
@@ -921,11 +985,13 @@ def compile_fused_gemm_a2a(
                             fx.Int64(staging_off)
                             + fx.Int64(dest) * fx.Int64(cap_slab_bytes)
                             + off,
-                            fx.Int64(chunk_bytes),
+                            c_bytes,
                             dest % fx.Int32(sdma_queues),
                             coop=cco.CoopScope.THREAD,
                             signal=False,
                         )
+                        if const_expr(stamp_off):
+                            stamp(stamp_base, ts_slot + fx.Int32(2))
                         if const_expr(chunks > 1):
                             atomic_store_u32(lock, 0)
             # gcnasm closes its ChunkFused epilogue with a barrier here; its
