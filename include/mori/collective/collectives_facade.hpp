@@ -209,14 +209,19 @@ class CollectivesFacade {
     // by PE p; never reset after this.
     state.barrierCtr = reinterpret_cast<uint64_t*>(
              static_cast<uint8_t*>(state.staging) + maxStagingBytes);
-    // Collective-permute ready tokens. Slot p of my copy is written only by PE p
-    // ("p has entered the permute and may receive from me"); I clear it on use.
+    // Collective-permute ready counts. Slot p of my copy is written only by PE p:
+    // the number of permutes in which p has entered to receive from me; never reset.
     state.permuteReady = state.barrierCtr + kRSPushMaxPeers;
     HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
 
-    HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.groupCounters),
-                                kGroupCounterCount * sizeof(uint32_t)));
-    HIP_RUNTIME_CHECK(hipMemset(state.groupCounters, 0, kGroupCounterCount * sizeof(uint32_t)));
+    // One local, zeroed-once buffer: the uint64 per-peer permute counts first
+    // (see CollectivePermutePushKernel: [p] sends to p, [kRSPushMaxPeers + p]
+    // receives from p), then the uint32 groupCounters.
+    const size_t permuteCntBytes = 2 * kRSPushMaxPeers * sizeof(uint64_t);
+    const size_t localCtrBytes = permuteCntBytes + kGroupCounterCount * sizeof(uint32_t);
+    HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.permuteCnt), localCtrBytes));
+    HIP_RUNTIME_CHECK(hipMemset(state.permuteCnt, 0, localCtrBytes));
+    state.groupCounters = reinterpret_cast<uint32_t*>(state.permuteCnt + 2 * kRSPushMaxPeers);
     // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
     // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
     // device alloc/copy). Sized for the max supported peer count.
@@ -374,9 +379,10 @@ class CollectivesFacade {
    struct SharedState {
     void* staging{nullptr};
     size_t stagingBytes{0};
-    uint32_t* groupCounters{nullptr};
+    uint64_t* permuteCnt{nullptr};    // local, per-peer permute send/recv counts (owns the buffer)
+    uint32_t* groupCounters{nullptr};  // local, sub-region of the permuteCnt buffer
     uint64_t* barrierCtr{nullptr};  // symmetric, gen-barrier flags of all collectives (slot p written by PE p)
-    uint64_t* permuteReady{nullptr};  // symmetric, permute ready tokens (slot p written by PE p)
+    uint64_t* permuteReady{nullptr};  // symmetric, permute ready counts (slot p written by PE p)
     AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};
     // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -400,8 +406,8 @@ class CollectivesFacade {
         cco::ccoDevCommDestroy(ccoComm, &devComm);
         cco::ccoCommDestroy(ccoComm);
       }
-      if (groupCounters != nullptr) {
-        HIP_RUNTIME_CHECK(hipFree(groupCounters));
+      if (permuteCnt != nullptr) {  // also backs groupCounters
+        HIP_RUNTIME_CHECK(hipFree(permuteCnt));
       }
       if (pinnedPairs != nullptr) {
         HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs));

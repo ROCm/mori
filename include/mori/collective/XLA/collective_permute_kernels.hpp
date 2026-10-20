@@ -47,13 +47,19 @@ namespace collective {
 //   dstPe    : peer that receives our sendBuf (may be myPe), or -1 if nobody does
 //   srcPe    : peer that sends into our recvBuf, or -1 if nobody does
 //
-//   ready    : symmetric-heap uint64[>= npes] ready tokens, zeroed once. Slot p of
-//              my copy is written only by PE p and cleared only by me.
+//   ready    : symmetric-heap uint64[>= npes] ready counts, zeroed once, never
+//              reset. Slot p of my copy is written only by PE p.
+//   cnt      : local uint64[2*kRSPushMaxPeers], zeroed once, thread 0 only.
+//              cnt[p] counts my permutes sending to p, cnt[kRSPushMaxPeers+p]
+//              my permutes receiving from p.
 //
 // Phase 0: pairwise handshake, no global barrier -- only the PEs of a send/recv
 // pair synchronize, so PEs that do not launch this kernel are never waited on.
-// The receiver posts a token into its source's ready[myPe]; the sender waits for
-// its destination's token and consumes it before writing anything into it.
+// Each side counts the permutes it shares with its partner: whenever I send to
+// dstPe, dstPe receives from me, so my k-th send pairs with its k-th receive.
+// The receiver posts its count k into its source's ready[myPe]; the sender
+// waits until its destination's slot reaches its own count k. The slot only
+// grows, so nothing is consumed or cleared.
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
 // dstPe == myPe), trailed by an ADD64 of 1 into the receiver's signalPtrs[0].
 // Phase 2: if srcPe >= 0, thread 0 waits until the counter reaches 1, then an
@@ -68,31 +74,34 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             void* __restrict__ recvBuf, size_t numBytes,
                                             cco::ccoDevComm devComm,
                                             cco::ccoWindow_t heapWin,
-                                            uint64_t* __restrict__ ready) {
+                                            uint64_t* __restrict__ ready,
+                                            uint64_t* __restrict__ cnt) {
   const int myLsaRank = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
-  // dstPe's token proves it has entered this launch, so by its stream order its
-  // previous kernel (of any collective) is done with recvBuf and has cleared
-  // signalBuf[0]. Without it, my copy could overwrite recvBuf before dstPe
-  // consumed it, or my ADD could land before its end-of-launch reset and be lost.
-  // Every PE posts its token before waiting, so a ring cannot deadlock. A
-  // self-send needs no handshake: stream order covers it.
+  // dstPe reaching count k proves it has entered this launch, so by its stream
+  // order its previous kernel (of any collective) is done with recvBuf and has
+  // cleared signalBuf[0]. Without it, my copy could overwrite recvBuf before
+  // dstPe consumed it, or my ADD could land before its end-of-launch reset and be
+  // lost. Every PE posts before waiting, so a ring cannot deadlock. A self-send
+  // needs no handshake: stream order covers it.
+  //
+  // No fences: the post only says "I have entered", and everything before it in
+  // my stream is ordered by the kernel boundary; after the wait nothing reads
+  // data dstPe wrote. `>=` cannot miss: dstPe posts k+1 for me only after my
+  // k-th copy lands, which needs this wait to pass first.
   if (threadIdx.x == 0) {
-    int32_t diff = srcPe - myLsaRank;
-    if (srcPe >= 0 && diff != 0) {
-      diff *= static_cast<int32_t>(stride4G);
-      auto* tok = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&ready[myLsaRank]) 
-                     + (static_cast<uint64_t>(diff) << 32));
-      AtomicStore<ESystemScope>(tok, 1UL);
+    if (srcPe >= 0 && srcPe != myLsaRank) {
+      const uint64_t k = ++cnt[kRSPushMaxPeers + srcPe];
+      const int32_t diff = (srcPe - myLsaRank) * static_cast<int32_t>(stride4G);
+      auto* tok = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&ready[myLsaRank]) +
+                                              (static_cast<uint64_t>(diff) << 32));
+      AtomicStore<ESystemScope>(tok, k);
     }
     if (dstPe >= 0 && dstPe != myLsaRank) {
-      while (AtomicLoad<ESystemScope>(&ready[dstPe]) == 0) {
+      const uint64_t k = ++cnt[dstPe];
+      while (AtomicLoad<ESystemScope>(&ready[dstPe]) < k) {
         __builtin_amdgcn_s_sleep(1);
       }
-      // dstPe re-arms only after my copy below lands, so this clear cannot
-      // swallow its next token -- provided it is visible before the doorbell.
-      AtomicStore<ESystemScope>(&ready[dstPe], 0UL);
-      __threadfence_system();
     }
   }
   __syncthreads();
@@ -134,7 +143,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // write back.
   //
   // Clearing at kernel END is safe: srcPe's next ADD only follows my next
-  // token, which I post only once my next launch has started.
+  // post to it, which I make only once my next launch has started.
   if (threadIdx.x == 0) {
     AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
