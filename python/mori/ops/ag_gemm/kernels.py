@@ -74,6 +74,7 @@ from ..gemm_ar._gemm_a8w8_8wave import (
     S2RLoader,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
+    read_done_barrier,
     split_row_major_2d,
     wait_barrier,
 )
@@ -364,7 +365,8 @@ def compile_ag_gemm(
             b0_frag = b_s2r.load(b_cur0, preshuffled=True)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # LDS reads done before the leading wave group refills B0 (#785).
+            read_done_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
@@ -381,9 +383,9 @@ def compile_ag_gemm(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            # gemm_ar's count, not aiter's: see the long comment at the same
-            # line in gemm_ar/kernels_fused.py. Do not "restore" it.
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
+            # The original count, as gemm_ar since #785: the peeled tail now
+            # drains its own producers (below), which A+B-1 only papered over.
+            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
@@ -395,7 +397,10 @@ def compile_ag_gemm(
         # Step k = K_ITERS - 2
         b0_frag = b_s2r.load(b_cur0, preshuffled=True)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        # Drain the producers of step K_ITERS - 1's B0 and A0, which the peeled
+        # steps read before the last wait_barrier(0) (#785). At K=256 the main
+        # loop runs zero times, so nothing inside it can cover this.
+        wait_barrier(0)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         b1_frag = b_s2r.load(b_cur1, preshuffled=True)
         rocdl.s_barrier()
