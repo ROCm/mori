@@ -320,7 +320,8 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
   constexpr int kThreads = 64;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(
                 nPes_, dstPe, srcPe, sendBuf, recvBuf,
-                numBytes, state_.devComm, state_.heapWin, state_.permuteReady);
+                numBytes, state_.devComm, state_.heapWin, state_.permuteReady,
+                state_.permuteCnt);
   return hipGetLastError();
 }
 

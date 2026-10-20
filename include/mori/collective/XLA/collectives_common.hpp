@@ -117,6 +117,20 @@ enum StreamScope {
   EAgentScope = 1,
 };
 
+template <StreamScope Scope, class T>
+__device__ __forceinline__ T AtomicLoad(const T* p) {
+  return __hip_atomic_load(cco::impl::global(p), __ATOMIC_RELAXED,
+              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
+                                    : __HIP_MEMORY_SCOPE_AGENT);
+}
+
+template <StreamScope Scope, class T>
+__device__ __forceinline__ void AtomicStore(T* p, T v) {
+  __hip_atomic_store(cco::impl::global(p), v, __ATOMIC_RELAXED,
+              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
+                                    : __HIP_MEMORY_SCOPE_AGENT);
+}
+
 template <StreamScope Scope, int Bytes = VecBytes>
 __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
@@ -134,9 +148,7 @@ __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
     }
   } else {
-    return __hip_atomic_load(ptr, __ATOMIC_RELAXED,
-              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM 
-                                    : __HIP_MEMORY_SCOPE_AGENT);
+    return AtomicLoad<Scope>(ptr);
   }
 #endif
 }
@@ -156,25 +168,9 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
       __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
     }
   } else {
-    __hip_atomic_store(ptr, v, __ATOMIC_RELAXED,
-                       Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM 
-                                             : __HIP_MEMORY_SCOPE_AGENT);
+    AtomicStore<Scope>(ptr, v);
   }
 #endif
-}
-
-template <StreamScope Scope, class T>
-__device__ __forceinline__ T AtomicLoad(const T* p) {
-  return __hip_atomic_load(cco::impl::global(p), __ATOMIC_RELAXED,
-              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
-                                    : __HIP_MEMORY_SCOPE_AGENT);
-}
-
-template <StreamScope Scope, class T>
-__device__ __forceinline__ void AtomicStore(T* p, T v) {
-  __hip_atomic_store(cco::impl::global(p), v, __ATOMIC_RELAXED,
-              Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM
-                                    : __HIP_MEMORY_SCOPE_AGENT);
 }
 
 #define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane(x)
