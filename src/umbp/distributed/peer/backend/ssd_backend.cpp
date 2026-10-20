@@ -291,10 +291,20 @@ void SsdBackend::ClearLocal() {
     // resurrecting a key the cluster believes is gone.
     for (auto& [slot_id, slot] : pending_) ReleaseStagingSpanLocked(slot.span);
     pending_.clear();
-    for (auto& [key, lease] : read_leases_) ReleaseStagingSpanLocked(lease.span);
+    // A span a local reader still copies out of goes back with its last hold.
+    for (auto& [key, lease] : read_leases_)
+      extent_stages_.push_back(
+          ExtentStage{lease.span, ObjectExtent{0, lease.size}, std::move(lease.hold)});
     read_leases_.clear();
-    for (auto& stage : extent_stages_) ReleaseStagingSpanLocked(stage.span);
-    extent_stages_.clear();
+    std::vector<ExtentStage> held;
+    for (auto& stage : extent_stages_) {
+      if (stage.hold.use_count() > 1) {
+        held.push_back(std::move(stage));
+      } else {
+        ReleaseStagingSpanLocked(stage.span);
+      }
+    }
+    extent_stages_ = std::move(held);
     for (auto& [key, lease] : migration_reads_) {
       ReleaseStagingSpanLocked(lease.span);
       migration_keys.push_back(key);
