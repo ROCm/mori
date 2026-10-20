@@ -101,22 +101,27 @@ struct Entry {
   bool notify{false};
   int warmup{0};
   Side side{Side::Initiator};
+  std::string peerFailure;      // empty = unchecked, none = expect no event
+  std::string during;           // empty, reject, succeed
+  std::string env;              // KEY=VAL[,KEY=VAL]
   std::string knownBug;         // empty = expected to pass every check
   std::set<std::string> fails;  // with knownBug: the checks expected to fail today
 };
 
-const std::set<std::string> kChecks = {"ends", "honest", "recovers", "alive"};
+const std::set<std::string> kChecks = {"ends", "honest", "recovers", "alive", "reported", "during"};
 
 std::string CatalogPath() {
   const char* path = std::getenv("MORI_IO_FAULT_CATALOG");
-  return path != nullptr && path[0] != '\0' ? path : MORI_IO_FAULT_CATALOG_DEFAULT;
+  if (path == nullptr || path[0] == '\0') return MORI_IO_FAULT_CATALOG_DEFAULT;
+  return std::strchr(path, '/') ? path : std::string(MORI_IO_FAULT_CATALOG_DIR) + "/" + path;
 }
 
 // Loads and validates a catalog; throws with the file and entry on any mistake,
 // so a typo never silently drops or weakens an entry.
 std::vector<Entry> LoadCatalog(const std::string& path) {
-  const std::set<std::string> kFields = {"id",     "real_world", "rule",      "transfer", "notify",
-                                         "warmup", "side",       "known_bug", "fails"};
+  const std::set<std::string> kFields = {"id",     "real_world",   "rule",   "transfer",
+                                         "notify", "warmup",       "side",   "known_bug",
+                                         "fails",  "peer_failure", "during", "env"};
   std::vector<Entry> entries;
   std::set<std::string> ids;
   for (const mori::yaml::FlatMap& raw : mori::yaml::LoadFlatList(path)) {
@@ -153,6 +158,30 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
     } else {
       throw std::runtime_error(where + ": side must be initiator or target, got '" + side + "'");
     }
+    e.peerFailure = mori::yaml::GetString(raw, "peer_failure");
+    const std::set<std::string> reasons = {"",
+                                           "none",
+                                           "LOCAL_QP_ERROR",
+                                           "LOCAL_CQ_ERROR",
+                                           "LOCAL_DEVICE_FATAL",
+                                           "LOCAL_PORT_DOWN",
+                                           "PEER_UNREACHABLE"};
+    if (!reasons.count(e.peerFailure)) throw std::runtime_error(where + ": bad peer_failure");
+    e.during = mori::yaml::GetString(raw, "during");
+    if (!e.during.empty() && e.during != "reject" && e.during != "succeed") {
+      throw std::runtime_error(where + ": during must be reject or succeed");
+    }
+    e.env = mori::yaml::GetString(raw, "env");
+    std::istringstream vars(e.env);
+    for (std::string var; std::getline(vars, var, ',');) {
+      size_t eq = var.find('=');
+      if (eq == std::string::npos || eq == 0 ||
+          var.substr(0, eq).find_first_not_of(
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_") !=
+              std::string::npos) {
+        throw std::runtime_error(where + ": env requires KEY=VAL[,KEY=VAL]");
+      }
+    }
     e.knownBug = mori::yaml::GetString(raw, "known_bug");
     std::istringstream fails(mori::yaml::GetString(raw, "fails"));
     for (std::string check; std::getline(fails, check, ',');) {
@@ -160,9 +189,13 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       check.erase(check.find_last_not_of(' ') + 1);
       if (kChecks.count(check) == 0) {
         throw std::runtime_error(where + ": fails lists '" + check +
-                                 "'; checks are ends, honest, recovers, alive");
+                                 "'; checks are ends, honest, recovers, alive, reported, during");
       }
       e.fails.insert(check);
+    }
+    if ((e.fails.count("reported") && e.peerFailure.empty()) ||
+        (e.fails.count("during") && e.during.empty())) {
+      throw std::runtime_error(where + ": fails names an unchecked field");
     }
     if (e.knownBug.empty() != e.fails.empty()) {
       throw std::runtime_error(where + ": known_bug and fails go together");
@@ -352,6 +385,48 @@ T Unpack(const std::string& bytes) {
   return handle.get().as<T>();
 }
 
+const char* FailureName(PeerFailureReason reason) {
+  switch (reason) {
+    case PeerFailureReason::LOCAL_QP_ERROR:
+      return "LOCAL_QP_ERROR";
+    case PeerFailureReason::LOCAL_CQ_ERROR:
+      return "LOCAL_CQ_ERROR";
+    case PeerFailureReason::LOCAL_DEVICE_FATAL:
+      return "LOCAL_DEVICE_FATAL";
+    case PeerFailureReason::LOCAL_PORT_DOWN:
+      return "LOCAL_PORT_DOWN";
+    case PeerFailureReason::PEER_UNREACHABLE:
+      return "PEER_UNREACHABLE";
+    default:
+      return "unknown";
+  }
+}
+
+std::string CollectFailures(IOEngine* engine, int ms, const std::string& expected) {
+  std::string reasons;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+  do {
+    PeerFailureEvent event;
+    while (engine->PopPeerFailure(&event)) {
+      std::string reason = FailureName(event.reason);
+      reasons += reason + " ";
+      if (reason == expected) return reasons;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return reasons;
+}
+
+void ApplyEnv(const Entry& e) {
+  std::istringstream vars(e.env);
+  for (std::string var; std::getline(vars, var, ',');) {
+    size_t eq = var.find('=');
+    if (setenv(var.substr(0, eq).c_str(), var.substr(eq + 1).c_str(), 1) != 0) {
+      throw std::runtime_error("could not set catalog environment");
+    }
+  }
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Target process                                          */
 /* ---------------------------------------------------------------------------------------------- */
@@ -398,6 +473,11 @@ int ServeTarget(const Entry& e, int fd) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       } while (std::chrono::steady_clock::now() < deadline);
+    } else if (cmd == "failures") {
+      int ms = 0;
+      std::string expected;
+      in >> ms >> expected;
+      reply = CollectFailures(engine.get(), ms, expected);
     } else if (cmd == "arm") {
       std::string rule;
       in >> rule;
@@ -406,6 +486,8 @@ int ServeTarget(const Entry& e, int fd) {
       FaultInjector::Instance().Disarm();
     } else if (cmd == "fired") {
       reply = std::to_string(FaultInjector::Instance().Fired());
+    } else if (cmd == "injection_failed") {
+      reply = FaultInjector::Instance().Failed() ? "yes" : "no";
     } else if (cmd == "quit") {
       break;
     } else if (cmd != "ping") {
@@ -549,6 +631,43 @@ class PeerRig {
     return std::stoull(*reply);
   }
 
+  bool InjectionFailed() {
+    if (entry_.side == Side::Initiator) return FaultInjector::Instance().Failed();
+    auto reply = Ask("injection_failed");
+    return reply && *reply == "yes";
+  }
+
+  bool Reported() {
+    const int ms = entry_.peerFailure == "none" ? 500 : kDeadlineMs;
+    std::string reasons;
+    if (entry_.side == Side::Target) {
+      auto reply = Ask("failures " + std::to_string(ms) + " " + entry_.peerFailure, ms + kRpcMs);
+      if (!reply) return false;
+      reasons = *reply;
+    } else {
+      reasons = CollectFailures(engine_.get(), ms, entry_.peerFailure);
+    }
+    std::printf("    peer failures: %s\n", reasons.empty() ? "none" : reasons.c_str());
+    if (entry_.peerFailure == "none") return reasons.empty();
+    std::istringstream in(reasons);
+    for (std::string reason; in >> reason;) {
+      if (reason == entry_.peerFailure) return true;
+    }
+    return false;
+  }
+
+  bool SessionAlive(bool wait) {
+    if (!session_) session_ = engine_->CreateSession(local_->desc, remote_);
+    if (!session_) return false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDeadlineMs);
+    do {
+      if (session_->Alive()) return true;
+      if (!wait) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  }
+
   // Whether the target process is still up and answering; `why` says what happened if not.
   bool TargetAlive(std::string* why) {
     if (Ask("ping")) return true;
@@ -602,11 +721,13 @@ class PeerRig {
   std::unique_ptr<IOEngine> engine_;
   std::unique_ptr<GpuBuffer> local_;
   MemoryDesc remote_{};
+  std::optional<IOEngineSession> session_;
   std::vector<std::unique_ptr<Transfer>> transfers_;  // MORI keeps pointers to their statuses
 };
 
 // Prints "RESULT ends=<0|1> honest=<0|1> recovers=<0|1> target=<0|1>" for the runner.
 int RunEntry(const Entry& e) {
+  ApplyEnv(e);
   PeerRig rig(e);
   std::string why;
   for (int i = 0; i < e.warmup; ++i) {
@@ -629,21 +750,41 @@ int RunEntry(const Entry& e) {
   std::printf("    faulted transfer: %s %s\n", CodeName(code), t->status.Message().c_str());
 
   std::optional<uint64_t> fired = faulted ? rig.Fired() : std::optional<uint64_t>(0);
+  int reported = e.peerFailure.empty() ? -1 : static_cast<int>(rig.Reported());
+  int during = -1;
+  if (!e.during.empty()) {
+    if (e.peerFailure.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Transfer* next = rig.Start(e.op);
+    during = e.during == "reject" ? next->status.Code() == StatusCode::ERR_RDMA_OP
+                                  : rig.Completes(next, &why);
+    std::printf("    during fault: %s %s\n", CodeName(next->status.Code()),
+                next->status.Message().c_str());
+  }
   rig.Disarm();
+  if (faulted && rig.InjectionFailed()) {
+    std::printf("    the injection failed; this is a harness error, not a known bug\n");
+    return kExitFail;
+  }
   if (faulted && fired && *fired == 0) {
     std::printf("    the fault never fired: the entry does not exercise its rule\n");
     return kExitFail;
   }
 
-  bool recovers = rig.Completes(rig.Start(e.op), &why);
+  if (e.peerFailure == "LOCAL_PORT_DOWN") rig.SessionAlive(true);
+  bool recovers = rig.Completes(rig.Start(e.op), &why) && rig.SessionAlive(false);
   if (!recovers) std::printf("    after the fault cleared: %s\n", why.c_str());
 
   bool targetAlive = rig.TargetAlive(&why);
   if (!targetAlive) std::printf("    target process: %s\n", why.c_str());
 
-  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d\n", ends, honest, recovers,
-              targetAlive);
-  return ends && honest && recovers && targetAlive ? kExitPass : kExitFail;
+  if (faulted && rig.InjectionFailed()) {
+    std::printf("    the injection failed; this is a harness error, not a known bug\n");
+    return kExitFail;
+  }
+  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d\n", ends,
+              honest, recovers, targetAlive, reported, during);
+  return ends && honest && recovers && targetAlive && reported != 0 && during != 0 ? kExitPass
+                                                                                   : kExitFail;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -653,9 +794,9 @@ int RunEntry(const Entry& e) {
 // What one entry's run showed.
 struct Outcome {
   bool skipped{false};
-  bool reported{false};  // the initiator printed its RESULT line
+  bool hasResult{false};  // the initiator printed its RESULT line
   // 1 = passed, 0 = failed, -1 = not reached (a process died before reporting)
-  int ends{-1}, honest{-1}, recovers{-1}, target{-1};
+  int ends{-1}, honest{-1}, recovers{-1}, target{-1}, reported{-1}, during{-1};
   bool alive{true};
   std::string note;      // how a process died, if one did
   std::string topology;  // "initiator GPU 0 ionic_0 -> target ... (cross-NIC)"
@@ -704,8 +845,10 @@ Outcome RunChild(const char* self, const Entry& e) {
     if (end == std::string::npos) end = text.size();
     std::string line = text.substr(start, end - start);
     if (line.rfind("RESULT ", 0) == 0) {
-      out.reported = std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d",
-                                 &out.ends, &out.honest, &out.recovers, &out.target) == 4;
+      out.hasResult =
+          std::sscanf(
+              line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d reported=%d during=%d",
+              &out.ends, &out.honest, &out.recovers, &out.target, &out.reported, &out.during) == 6;
     } else if (!line.empty()) {
       size_t topo = line.find("topology: ");
       if (topo != std::string::npos) out.topology = line.substr(topo + 10);
@@ -755,9 +898,10 @@ const char* const kVerdictNames[] = {"PASS", "XFAIL", "FAIL", "XPASS", "SKIP"};
 // A check that was not reached (a process died first) counts neither way.
 Verdict Judge(const Entry& e, const Outcome& o) {
   if (o.skipped) return {Verdict::Skip, ""};
-  if (!o.reported && o.alive) return {Verdict::Fail, "no result; see the output above"};
-  const std::pair<const char*, int> checks[] = {
-      {"ends", o.ends}, {"honest", o.honest}, {"recovers", o.recovers}, {"alive", o.alive}};
+  if (!o.hasResult && o.alive) return {Verdict::Fail, "no result; see the output above"};
+  const std::pair<const char*, int> checks[] = {{"ends", o.ends},         {"honest", o.honest},
+                                                {"recovers", o.recovers}, {"alive", o.alive},
+                                                {"reported", o.reported}, {"during", o.during}};
   std::set<std::string> unexpected, fixed;
   for (const auto& [name, result] : checks) {
     bool expectedToFail = e.fails.count(name) > 0;
@@ -777,7 +921,11 @@ Verdict Judge(const Entry& e, const Outcome& o) {
 }
 
 void CheckParser() {
-  for (const char* bad : {"no_such_kind", "cqe_drop:skip", "cqe_drop:bogus=1", "qp_error:skip=x"}) {
+  for (const char* bad :
+       {"no_such_kind", "cqe_drop:skip", "cqe_drop:bogus=1", "qp_error:skip=x", "async_event",
+        "async_event:value=typo", "async_event:value=999", "async_event:value=srq_err",
+        "async_event:value=srq_limit_reached", "async_event:value=14", "async_event:value=15",
+        "port_down:count=0", "port_flap:count=2", "port_flap:value=0", "port_flap:value=-1"}) {
     bool threw = false;
     try {
       ParseFaultRule(bad);
@@ -786,11 +934,84 @@ void CheckParser() {
     }
     if (!threw) throw std::runtime_error(std::string("expected a parse error for '") + bad + "'");
   }
+  auto event = ParseFaultRule("async_event:value=device_fatal:op=write:skip=1");
+  if (event.kind != FaultKind::AsyncEvent || event.value != IBV_EVENT_DEVICE_FATAL ||
+      event.skip != 1) {
+    throw std::runtime_error("async_event spec parsed wrong");
+  }
+  if (ParseFaultRule("port_flap").value != 200 ||
+      ParseFaultRule("port_down").kind != FaultKind::PortDown) {
+    throw std::runtime_error("port defaults parsed wrong");
+  }
   FaultRule r = ParseFaultRule("cqe_drop:op=write:skip=3:count=2:qpn=17");
   if (r.kind != FaultKind::CqeDrop || r.wcOpcode != IBV_WC_RDMA_WRITE || r.skip != 3 ||
       r.count != 2 || r.qpn != 17) {
     throw std::runtime_error("cqe_drop spec parsed wrong");
   }
+}
+
+// No GPU or NIC access: COMM_EST needs no provider state change or port query.
+// Exercise the real injector hooks with only the post_send op replaced by a no-op.
+void CheckAsyncSources() {
+  ibv_context ctxA{}, ctxB{};
+  ctxA.ops.post_send = ctxB.ops.post_send = [](ibv_qp*, ibv_send_wr*, ibv_send_wr**) { return 0; };
+  ibv_qp qpA{}, qpB{};
+  qpA.context = &ctxA;
+  qpB.context = &ctxB;
+  qpA.qp_num = qpB.qp_num = 17;  // same number, different contexts
+  ibv_send_wr wr{};
+  wr.opcode = IBV_WR_SEND;
+  ibv_send_wr* bad = nullptr;
+  auto& injector = FaultInjector::Instance();
+  int fdA = injector.WatchAsyncContext(&ctxA);
+  int fdB = injector.WatchAsyncContext(&ctxB);
+  auto readable = [](int fd) {
+    pollfd p{fd, POLLIN, 0};
+    return poll(&p, 1, 0) == 1 && (p.revents & POLLIN);
+  };
+  injector.Arm(ParseFaultRule("async_event:value=comm_est:op=send:count=0"));
+  for (int i = 0; i < 33; ++i) injector.PostSend(&qpA, &wr, &bad);
+  if (injector.Fired() != 33 || injector.Failed()) {
+    throw std::runtime_error("successful async injections were not counted");
+  }
+  if (!readable(fdA) || readable(fdB)) throw std::runtime_error("async context isolation failed");
+  for (int i = 0; i < 33; ++i) {
+    ibv_async_event event{};
+    if (injector.GetAsyncEvent(&ctxA, &event) != 0 || event.element.qp != &qpA ||
+        event.event_type != IBV_EVENT_COMM_EST) {
+      throw std::runtime_error("synthetic event was not delivered");
+    }
+    injector.AckAsyncEvent(&event);
+    if (readable(fdA) != (i < 32)) throw std::runtime_error("async source lost level readiness");
+  }
+  if (qpA.events_completed != 0) throw std::runtime_error("synthetic ack reached the provider");
+  injector.PostSend(&qpB, &wr, &bad);
+  if (readable(fdA) || !readable(fdB)) throw std::runtime_error("second context isolation failed");
+  injector.UnwatchAsyncContext(&ctxB);  // pending events must not survive address reuse
+  fdB = injector.WatchAsyncContext(&ctxB);
+  if (readable(fdB)) throw std::runtime_error("unwatch left a stale event");
+  injector.Disarm();
+  injector.UnwatchAsyncContext(&ctxA);
+  injector.UnwatchAsyncContext(&ctxB);
+
+  // A syscall failure must neither throw through a worker nor count as injected.
+  fdA = injector.WatchAsyncContext(&ctxA);
+  injector.Arm(ParseFaultRule("async_event:value=comm_est:op=send"));
+  close(fdA);
+  if (injector.PostSend(&qpA, &wr, &bad) != 0 || !injector.Failed() || injector.Fired() != 0) {
+    throw std::runtime_error("failed async source was not recorded correctly");
+  }
+  injector.UnwatchAsyncContext(&ctxA);
+  injector.Arm(ParseFaultRule("async_event:value=comm_est:op=send"));
+  fdA = injector.WatchAsyncContext(&ctxA);
+  injector.PostSend(&qpA, &wr, &bad);
+  close(fdA);
+  ibv_async_event event{};
+  if (injector.GetAsyncEvent(&ctxA, &event) == 0 || !injector.Failed() || errno != EIO) {
+    throw std::runtime_error("failed eventfd read was not reported without throwing");
+  }
+  injector.UnwatchAsyncContext(&ctxA);
+  injector.Disarm();
 }
 
 // Runs `body` as a child role: line-buffered output, no teardown on the way out.
@@ -830,9 +1051,10 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
     const char* alive = o.skipped ? "-" : o.alive ? "ok" : "FAIL";
     std::printf("%-36s %-6s %-6s %-8s %-6s %-7s %s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
                 Mark(o.recovers), alive, kVerdictNames[v.kind], v.why.c_str());
+    std::printf("    reported=%s during=%s\n", Mark(o.reported), Mark(o.during));
     rows += "| " + e->id + " | " + Mark(o.ends) + " | " + Mark(o.honest) + " | " +
-            Mark(o.recovers) + " | " + alive + " | " + kVerdictNames[v.kind] + " | " + v.why +
-            " |\n";
+            Mark(o.recovers) + " | " + alive + " | " + Mark(o.reported) + " | " + Mark(o.during) +
+            " | " + kVerdictNames[v.kind] + " | " + v.why + " |\n";
     if (github && (v.kind == Verdict::Fail || v.kind == Verdict::XPass)) {
       std::printf("::error title=Fault catalog %s::%s %s\n", kVerdictNames[v.kind], e->id.c_str(),
                   v.why.c_str());
@@ -863,8 +1085,8 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
        << "\n\n**" << summary << "**";
     if (!topology.empty()) md << "  \nTopology: " << topology;
     if (!bugs.empty()) md << "  \nKnown bugs: " << bugs;
-    md << "\n\n| entry | ends | honest | recovers | alive | verdict | note |\n"
-       << "|---|---|---|---|---|---|---|\n"
+    md << "\n\n| entry | ends | honest | recovers | alive | reported | during | verdict | note |\n"
+       << "|---|---|---|---|---|---|---|---|---|\n"
        << rows << "\n";
   }
   return counts[Verdict::Fail] + counts[Verdict::XPass] == 0 ? 0 : 1;
@@ -914,6 +1136,18 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("catalog: %s (%zu entries)\n", path.c_str(), catalog.size());
+  if (filter == "--check-catalog") return 0;
+  if (filter == "--check-async-sources") {
+    try {
+      CheckAsyncSources();
+      std::printf(
+          "[PASS] async sources: readiness, context isolation, ack, cleanup, syscall failures\n");
+    } catch (const std::exception& ex) {
+      std::printf("[FAIL] async sources: %s\n", ex.what());
+      return 1;
+    }
+    return 0;
+  }
 
   std::vector<std::pair<const Entry*, Outcome>> results;
   for (const Entry& e : catalog) {

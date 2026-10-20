@@ -126,6 +126,8 @@ class RdmaManager {
   void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
   // Name of an available device; availDevices is fixed, so this takes no lock.
   std::string DeviceName(int devId) const;
+  // Session admission only: never reject part-way through posting a transfer.
+  bool RejectIfPortDown(const EpPairVec& eps, TransferStatus* status);
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -149,6 +151,9 @@ class RdmaManager {
 
   // Self-synchronizing, so not guarded by `mu`; its writer threads join first.
   PeerFailureTracker peerFailures_;
+  bool portDownFailFast_{true};
+  std::unique_ptr<std::atomic<bool>[]> portDown_;
+  std::unique_ptr<std::atomic<uint64_t>[]> portRejected_;
 
   // Declared last so it is the first member destroyed, and explicitly reset at
   // the top of ~RdmaManager: the monitor thread calls into peerFailures_.

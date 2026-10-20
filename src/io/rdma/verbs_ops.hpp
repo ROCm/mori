@@ -39,6 +39,11 @@ class VerbsOps {
   virtual int PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) = 0;
   virtual int GetCqEvent(ibv_comp_channel* ch, ibv_cq** cq, void** cqCtx) = 0;
   virtual int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) = 0;
+  virtual void AckAsyncEvent(ibv_async_event* event) = 0;
+  virtual int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) = 0;
+  // Optional event source; the owner keeps its fd readable while events remain.
+  virtual int WatchAsyncContext(ibv_context* ctx) = 0;
+  virtual void UnwatchAsyncContext(ibv_context* ctx) = 0;
 };
 
 // The real calls: standard libibverbs ibv_*, not a vendor direct-verbs API.
@@ -59,6 +64,12 @@ class RealVerbs final : public VerbsOps {
   int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) override {
     return ibv_get_async_event(ctx, event);
   }
+  void AckAsyncEvent(ibv_async_event* event) override { ibv_ack_async_event(event); }
+  int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) override {
+    return ibv_query_port(ctx, port, attr);
+  }
+  int WatchAsyncContext(ibv_context*) override { return -1; }
+  void UnwatchAsyncContext(ibv_context*) override {}
 };
 
 #ifdef MORI_IO_FAULT_INJECTION
