@@ -118,7 +118,12 @@ def _load_u32_system(ptr):
 
 
 def _spin_until(ptr, flag, load=signal_load_u32):
-    """Block until the u32 at ``ptr`` is >= ``flag`` (unsigned, wrap-safe)."""
+    """Block until the u32 at ``ptr`` has reached ``flag``.
+
+    The test is a signed difference, so a counter that wraps past 2**32 still
+    compares correctly, as long as the two stay less than 2**31 apart. A plain
+    unsigned ``<`` would let a wait pass at the wrap: 0xFFFFFFFF < 0 is false.
+    """
     first = load(ptr)
     first_v = first.ir_value() if hasattr(first, "ir_value") else first
     i32 = i32_type()
@@ -128,7 +133,7 @@ def _spin_until(ptr, flag, load=signal_load_u32):
     with ir.InsertionPoint(cond):
         cur = fx.Int32(cond.arguments[0])
         scf.ConditionOp(
-            (fx.Uint32(cur) < fx.Uint32(flag)).ir_value(), [cond.arguments[0]]
+            ((cur - fx.Int32(flag)) < fx.Int32(0)).ir_value(), [cond.arguments[0]]
         )
     with ir.InsertionPoint(body):
         nxt = load(ptr)
@@ -284,11 +289,13 @@ class AllGatherAsync:
         return self.wait_async(stream)
 
     def close(self):
-        # The dev-comm's SDMA queues are communicator-scoped; it goes with the comm.
-        for h in (self.win, self.mem):
+        # Dev comm first: destroying it frees this instance's signal pool and peer
+        # IPC mappings and leaves the communicator-scoped SDMA queues alone. Then
+        # deregister the window, then free its memory.
+        for h in (self.dev_comm, self.win, self.mem):
             if h is not None:
                 h.close()
-        self.win = self.mem = None
+        self.dev_comm = self.win = self.mem = None
 
     def __enter__(self):
         return self
