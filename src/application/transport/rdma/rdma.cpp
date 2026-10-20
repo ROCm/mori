@@ -605,7 +605,8 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
   };
 
   // Default: ibv_reg_mr first, dmabuf fallback (fast on bnxt). Set
-  // MORI_ENABLE_DMABUF_REG to prefer dmabuf first, falling back to ibv_reg_mr.
+  // MORI_ENABLE_DMABUF_REG=1 to prefer dmabuf first (payload MRs and, on Ionic,
+  // CQ/SQ/RQ rings), falling back to ibv_reg_mr for payload.
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool useDmabuf = (attempt == 0) ? preferDmabufReg : !preferDmabufReg;
     const char* name = useDmabuf ? "dmabuf" : "ibv_reg_mr";

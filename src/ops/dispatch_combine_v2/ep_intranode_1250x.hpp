@@ -5311,7 +5311,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0);
     }
     EpFp4OvlWait<kCfg>(args, phase);
-    if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
     __builtin_amdgcn_s_wait_tensorcnt(0);
     return;
   }
@@ -5357,7 +5356,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     EpCrossDeviceBarrier1250x<kCfg>(args, staged);
   else
     EpFp4CrossDeviceBarrier1250x<kCfg>(args, staged);
-  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
   if (args.numTokens == 0) return;
   if constexpr (!UseP2PRead) {
     EpFp4CombineReduce<kCfg, T>(args, rFirst);

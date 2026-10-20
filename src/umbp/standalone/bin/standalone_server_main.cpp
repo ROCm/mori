@@ -41,7 +41,9 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/env_time.h"
 #include "umbp/common/fd_limit.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 
@@ -285,6 +287,13 @@ int main(int argc, char** argv) {
   } else {
     address = mori::umbp::standalone::DefaultStandaloneAddress();
   }
+
+  // Before the server exists: registering its host pool, which carries on in
+  // the background, would slow each queue creation here to about a second.
+  // 8 covers the peak number of concurrent gathers per GPU under TP8 serving;
+  // 0 turns the prewarm off.
+  mori::umbp::HbmCopyEngine::Prewarm(
+      mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
 
   std::unique_ptr<mori::umbp::standalone::StandaloneServer> server;
   try {

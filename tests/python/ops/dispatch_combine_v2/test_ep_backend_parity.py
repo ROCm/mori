@@ -80,9 +80,7 @@ def run_once(op, comm, ct, inp, wts, idx, scales):
         )
         torch.cuda.synchronize()
         comm.barrier()
-        # Read it HERE: it is dispatch's return value. Reading after combine
-        # measures each backend's reset policy instead -- flydsl's combine kernel
-        # zeroes the op's live counter, the C++ one zeroes only the handle's copy.
+        # Read it HERE: it is dispatch's return value.
         total = int(total_recv_t.cpu().item())
         # Cloned before combine, and only the live rows: this is the view whose
         # PITCH differs between the backends, so it has to be read the way a
