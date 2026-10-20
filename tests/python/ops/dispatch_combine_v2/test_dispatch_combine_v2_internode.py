@@ -186,6 +186,12 @@ def _parse_args(argv):
     # v1 uses 128 and 128; matching them keeps the two soaks comparable.
     parser.add_argument("--stress-datasets", type=int, default=128)
     parser.add_argument("--stress-sync-interval", type=int, default=128)
+    # Every rank on this node sends max_tokens in every dataset: a full-capacity
+    # sender, the case where the LL receive can finish on chunk flags alone.
+    parser.add_argument("--stress-full-node", type=int, default=-1)
+    # Check every Nth round's combine output in place (0 = never). No sync is
+    # added between that round's dispatch and combine.
+    parser.add_argument("--stress-check-interval", type=int, default=0)
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=8)
@@ -1344,10 +1350,14 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     internode_kernel="auto" -- the per-call switch between the v2 and v2_ll
     families, since the counts fall on both sides of the crossover.
 
-    No per-round verification: this looks for hangs, faults and protocol drift
-    over many rounds, and checking every round would hide them behind the
-    check's own synchronisation. The queue is drained every
+    By default no per-round verification: this looks for hangs, faults and
+    protocol drift over many rounds, and checking every round would hide them
+    behind the check's own synchronisation. The queue is drained every
     --stress-sync-interval rounds rather than every round for the same reason.
+    --stress-check-interval N compares every Nth round's combine output with the
+    identity-expert expectation after the round, never between its dispatch and
+    combine, so a combine that starts before dispatch state has landed is caught
+    rather than masked. --stress-full-node makes one node a full-capacity sender.
 
     v1 follows its soak with a CUDA-graph phase. Not reproduced here: graph
     capture over the internode plan sequence is untested, and adding it to a
@@ -1360,10 +1370,31 @@ def _stress(op, cfg, dist_handle, device, args, comm):
     counts = torch.randint(
         1, max_tokens + 1, [args.stress_datasets], generator=rng, device=device
     ).tolist()
+    if dist_handle.rank // cfg.gpu_per_node == args.stress_full_node:
+        counts = [max_tokens] * len(counts)
     datasets = [
         _generate_round(rng, cfg, int(n), device, cfg.dispatch_dtype, args.routing)
         for n in counts
     ]
+    expected = []
+    if args.stress_check_interval:
+        # combine(weights=None) of an identity expert sums one copy per distinct
+        # destination rank: unique_pes[t] * input[t].
+        eps = 3e-1 if cfg.dispatch_dtype in _FP8 else 8e-3
+        for inp, idx, _, _ in datasets:
+            pes = idx.long() // cfg.num_experts_per_rank
+            unique = torch.stack(
+                [
+                    (pes[:, j : j + 1] != pes[:, :j]).all(dim=1)
+                    for j in range(pes.shape[1])
+                ],
+                dim=1,
+            ).sum(dim=1, keepdim=True)
+            golden = unique.float() * inp.float()
+            expected.append(
+                (golden, eps * unique.float() * inp.float().abs().clamp(min=1.0))
+            )
+    failed_checks = checks = 0
     used_ll = {n: op.kernel_config(n).dispatch.family == "v2_ll" for n in set(counts)}
     if dist_handle.rank == 0:
         families = sorted({("v2_ll" if v else "v2") for v in used_ll.values()})
@@ -1389,18 +1420,32 @@ def _stress(op, cfg, dist_handle, device, args, comm):
         # (run_combine(op, combine_input, None, indices)), and since want_weights
         # is now honoured, passing them would make this a different kernel path
         # from the case it is meant to mirror.
-        op.combine(combine_input, None, routing=dispatch_out[5])
+        out, _ = op.combine(combine_input, None, routing=dispatch_out[5])
+        if args.stress_check_interval and i % args.stress_check_interval == 0:
+            golden, tolerance = expected[i % len(datasets)]
+            checks += 1
+            failed_checks += int(
+                not bool(((out.float() - golden).abs() <= tolerance).all())
+            )
         if i % args.stress_sync_interval == 0:
             torch.cuda.synchronize()
     torch.cuda.synchronize()
     comm.barrier()
 
+    failed_ranks = dist_handle.allreduce_sum(int(failed_checks > 0))
     if dist_handle.rank == 0:
+        verdict = "OK" if failed_ranks == 0 else "FAILED"
         print(
-            f"# STRESS OK: {args.rounds} rounds in {time.time() - started:.1f}s",
+            f"# STRESS {verdict}: {args.rounds} rounds in {time.time() - started:.1f}s"
+            + (
+                f"; {checks} checked rounds per rank, {failed_ranks} rank(s) with "
+                "mismatches"
+                if args.stress_check_interval
+                else ""
+            ),
             flush=True,
         )
-    return 0
+    return 0 if failed_ranks == 0 else 1
 
 
 def _tune(cfg, dist_handle, device, args, comm):
