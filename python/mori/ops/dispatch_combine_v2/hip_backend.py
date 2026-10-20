@@ -98,6 +98,10 @@ _SCALE_ALIGN = 128
 _STAGE_OFF = 512
 _STAGE_TOK = 512
 
+# Ints of an LL128 op's count buffer: one 64-bit word, the count in its low half and the call number it
+# is for in its high half (ep_intranode_1250x.hpp). Needs 8-byte alignment, which torch gives.
+_LL_CTR_INTS = 2
+
 
 def _stage_bytes(cfg, scale_stride):
     row = cfg.token_nbytes + scale_stride + 4 + 8 * cfg.num_experts_per_token
@@ -535,7 +539,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if self._tokoff_wanted:
             self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
             self.tok_off_peers = self._tokoff_ext.peers
-        self.total_recv = torch.zeros(1, **i32)
+        # An LL128 dispatch keeps the call number its count is for behind the count, which callers
+        # and routing handles still see as one int.
+        ll_disp = self._ll128_geom is not None and "dispatch" in self._ll128_geom
+        self._recv_ctr = torch.zeros(_LL_CTR_INTS if ll_disp else 1, **i32)
+        self.total_recv = self._recv_ctr[:1]
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         # Monotone epoch. Starts at 1 so the zeroed barrier slots cannot alias
@@ -810,6 +818,30 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             cfg.max_num_inp_token_per_rank,
             experts_per_rank=cfg.num_experts_per_rank,
             quant_type=cfg.quant_type,
+        )
+
+    def _snapshot_recv_views(self):
+        """(recv_to_src [recv_cap], recv_idx [recv_cap * topk]) int32 views of the arena, for a
+        snapshot handle of an LL128 op to copy: its combines read each slot's source and ids
+        through EpArgs::recvToSrc / recvIdx, which the LL128 dispatch writes here from this rank.
+        None when the combine is not LL128."""
+        geom = self._ll128_geom
+        if geom is None:
+            return None
+        if "dispatch" not in geom:
+            raise ValueError(
+                "snapshot=True on an op whose LL128 combine runs behind the schedule's "
+                "dispatch: that combine reads the slot map peers write into the arena, which "
+                "the next dispatch overwrites"
+            )
+        cap = self._recv_cap
+        return (
+            from_gpu_ptr(self.arena.local_ptr("recv_to_src_token"), (cap,), torch.int32),
+            from_gpu_ptr(
+                self.arena.local_ptr("out_idx"),
+                (cap * self.cfg.num_experts_per_token,),
+                torch.int32,
+            ),
         )
 
     def _regions(self, cfg):
@@ -1654,7 +1686,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return sorted(caps)
 
     def _wrap_dispatch(self, sized):
-        def run(*, input, indices, weights, scales, dest_map, num_tokens):
+        def run(
+            *,
+            input,
+            indices,
+            weights,
+            scales,
+            dest_map,
+            num_tokens,
+        ):
             plan = next((p for c, p in sized if num_tokens <= c), None)
             if plan is None:
                 raise ValueError(
@@ -1680,8 +1720,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _wrap_combine(self, plan):
         push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        # Where the bf16 LL128 combine reads each slot's source and ids unless a snapshot handle
+        # brings its copies (EpArgs::recvToSrc / recvIdx); the other combines do not read them.
+        src_ptr = self.arena.local_ptr("recv_to_src_token")
+        idx_ptr = self.arena.local_ptr("out_idx")
 
-        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
+        def run(
+            *,
+            input,
+            dest_map,
+            total_recv,
+            num_tokens,
+            want_weights=False,
+            recv_to_src=None,
+            recv_idx=None,
+        ):
             if want_weights and push:
                 raise NotImplementedError(
                     f"quant_type={self.cfg.quant_type!r} folds no weights; call combine "
@@ -1699,6 +1752,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 grid_barrier=self.combine_barrier,
                 xdb_flag=self.cross_device_flag,
                 combine_barrier_fan=self.combine_barrier_fan,  # None on non-gfx1250 -> 0
+                recv_to_src=src_ptr if recv_to_src is None else recv_to_src.data_ptr(),
+                recv_idx=idx_ptr if recv_idx is None else recv_idx.data_ptr(),
                 num_tokens=num_tokens,
             )
 

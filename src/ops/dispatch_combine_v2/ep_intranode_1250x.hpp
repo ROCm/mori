@@ -398,8 +398,12 @@ __device__ __forceinline__ __attribute__((address_space(1))) T* EpUniG(T* p) {
 // row, in that order, so line 0 tells the destination whether the row is routed to it before it
 // reads the rest. Every row goes to every rank, and each source also stores one 8-byte
 // {token count, call number} word at every destination. The destination takes its slots off
-// totalRecvTokenNum, which the LL128 combine clears. The call numbers are per block, in a module
-// global, so every call of an op must run the same plan (hip_tuning_configs._LL128_TABLE).
+// totalRecvTokenNum, the low half of a 64-bit word whose high half is the call number the count is
+// for (hip_backend._LL_CTR_INTS). Block 0 starts it over for this call with one store; an add that
+// returns the last call's number landed before that store and takes its slot again once it is in.
+// The count stays for the combine and the routing handles, which only read it, until the op's next
+// call. The call numbers are per block, in a module global, so every call of an op must run the same
+// plan (hip_tuning_configs._LL128_TABLE).
 // Area past the slot word of tok_off, at kEpStageOff (hip_backend._stage_bytes):
 //   [0, 256)                     unused
 //   [256, 256 + 2 * npes * 128)  the count word from each source, [parity][src]
@@ -487,10 +491,13 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   const EpWinRegs wr = EpWinRegsLoad(args.window);
   const unsigned long long stOff = args.offTokOff + kEpStageOff;
   char* const stLocal = EpLocal<char>(wr, stOff);
-  unsigned* const slotCtr = reinterpret_cast<unsigned*>(args.totalRecvTokenNum);
+  unsigned long long* const cnt = reinterpret_cast<unsigned long long*>(args.totalRecvTokenNum);
   const unsigned seq =
       __hip_atomic_load(_llSeq + blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u;
   const unsigned long long flag = seq;
+  // The count starts over for this call: a store, which nothing waits for.
+  if (blockIdx.x == 0 && thdId == 0)
+    __hip_atomic_store(cnt, (unsigned long long)seq << 32, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
   // A source whose rows none of this rank's experts take does not wait for this rank, so it can
   // finish its combine and start the next call while a late block here still reads this call:
   // calls alternate between two copies of the count words and rows. Two calls ahead it would need
@@ -762,8 +769,20 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     const int e = laneId < topk ? (int)idw : -1;
     if (__ballot(e >= 0 && e / kEpr == myPe) == 0ull) continue;
     int slot = 0;
-    if (laneId == 0)
-      slot = (int)__hip_atomic_fetch_add(slotCtr, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (laneId == 0) {
+      // An add that lands before block 0 has started this call's count goes to the op's last call,
+      // which that store overwrites: once the count is this call's, the slot is taken again.
+      unsigned long long c = __hip_atomic_fetch_add(cnt, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      for (unsigned spin = 0; (unsigned)(c >> 32) != seq && spin < kSpinMax; ++spin)
+        if ((unsigned)(__hip_atomic_load(cnt, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) >> 32) == seq)
+          c = __hip_atomic_fetch_add(cnt, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      if ((unsigned)(c >> 32) == seq) {
+        slot = (int)(unsigned)c;
+      } else {
+        tmo(3, s, t);
+        slot = EpMaxRecv(kCfg);
+      }
+    }
     slot = __shfl(slot, 0, WS);
     if (slot >= EpMaxRecv(kCfg)) continue;
     if (laneId < topk) {
@@ -4607,7 +4626,6 @@ __device__ __forceinline__ int EpLlMapRank(const int m) {
   else
     return m;
 }
-__device__ unsigned _lcTicket;
 __device__ unsigned _lcTmo;
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
@@ -4666,21 +4684,9 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
   const unsigned seq =
       __hip_atomic_load(_lcSeq + blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u;
   const unsigned long long flag = seq;
+  // The combine only reads the total: a routing handle may hold a copy of it and combine again.
   const int nRecv = min((int)args.totalRecvTokenNum[0], EpMaxRecv(kCfg));
-  // Past this barrier every wave of the block has its receive total and call number in hand, so
-  // the last block to count itself may clear the total, and the call number stored at the end
-  // cannot overtake a read of it. The add is relaxed: each read returned before its block's
-  // barrier, which is before the block's add.
   asm volatile("" ::"s"(nRecv), "v"(seq) : "memory");
-  __syncthreads();
-  if (thdId == (kLlWarps - 1) * WS) {
-    const unsigned d =
-        __hip_atomic_fetch_add(&_lcTicket, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if (d == (unsigned)(G - 1)) {
-      *args.totalRecvTokenNum = 0;
-      __hip_atomic_store(&_lcTicket, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    }
-  }
   extern __shared__ char sharedMem[];
   unsigned char* const tile = reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kTileB;
 
@@ -5061,8 +5067,8 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   const int thdId = threadIdx.x;
   const int laneId = thdId & (WS - 1);
   const int warpId = thdId / WS;
-  asm volatile("" ::"s"(args.window), "s"(args.totalRecvTokenNum), "s"(args.offRecvToSrc),
-               "s"(args.offOutIdx), "s"(args.inpTokenBuf), "s"(args.offOutTok), "s"(args.outTokenBuf),
+  asm volatile("" ::"s"(args.window), "s"(args.totalRecvTokenNum), "s"(args.recvToSrc),
+               "s"(args.recvIdx), "s"(args.inpTokenBuf), "s"(args.offOutTok), "s"(args.outTokenBuf),
                "s"(args.dispDestTokIdMap), "s"(args.numTokens), "s"(args.rank));
   const int G = kCfg.blockNum;
   const int nWaves = G * kCfg.warpPerBlock;
@@ -5074,19 +5080,9 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   const unsigned seq =
       __hip_atomic_load(_lcSeq + blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u;
   const unsigned long long flag = seq;
+  // As in EpCombineLl1250x, the total is only read.
   const int nRecv = min((int)args.totalRecvTokenNum[0], EpMaxRecv(kCfg));
-  // As in EpCombineLl1250x: past the barrier every wave has its receive total and call number, so
-  // the last block to count itself may clear the total for the next dispatch.
   asm volatile("" ::"s"(nRecv), "v"(seq) : "memory");
-  __syncthreads();
-  if (thdId == (kCfg.warpPerBlock - 1) * WS) {
-    const unsigned d =
-        __hip_atomic_fetch_add(&_lcTicket, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if (d == (unsigned)(G - 1)) {
-      *args.totalRecvTokenNum = 0;
-      __hip_atomic_store(&_lcTicket, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    }
-  }
   auto firsts = [&](const int rq) -> unsigned long long {
     bool f = rq >= 0;
 #pragma unroll
@@ -5103,11 +5099,14 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   // Expert side: (received row, part) a wave, the source, ids and the part's units loaded before
   // any of them is waited for.
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
+  // Each slot's source and ids: the op's, or a snapshot routing handle's copy of them.
+  int* const rSrc = args.recvToSrc;
+  int* const rIdx = args.recvIdx;
   for (int it = wv; it < nRecv * kParts; it += nWaves) {
     const int j = it / kParts, q = it - j * kParts;
-    const int st = EpUniG(EpLocal<int>(wr, args.offRecvToSrc))[j];
+    const int st = EpUniG(rSrc)[j];
     int e = -1;
-    if (laneId < topk) e = EpUniG(EpLocal<int>(wr, args.offOutIdx))[(size_t)j * topk + laneId];
+    if (laneId < topk) e = EpUniG(rIdx)[(size_t)j * topk + laneId];
     const unsigned char* const row = src + (size_t)j * kTokB;
     uint4 w[kUPart];
 #pragma unroll

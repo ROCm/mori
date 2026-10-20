@@ -156,6 +156,11 @@ struct EpArgs {
   // used instead of the window's offTokOff. Null (the default) keeps the window.
   int* const* tokOffPeers = nullptr;
   void* stagingBase = nullptr;  // gfx1250 dispatch staging (EpStagingTotalBytes)
+  // Where the gfx1250 bf16 LL128 combine reads [maxRecv] slot -> src token and [maxRecv * topk]
+  // forwarded expert ids: the op's own at offRecvToSrc / offOutIdx, or a snapshot routing handle's
+  // copies of them, since the next dispatch overwrites the op's.
+  int* recvToSrc = nullptr;
+  int* recvIdx = nullptr;
 
   int numTokens = 0;  // tokens this rank contributes this call
 };
@@ -191,6 +196,8 @@ struct EpArgs {
   X(combineBarrierFan, "p")    \
   X(tokOffPeers, "p")          \
   X(stagingBase, "p")          \
+  X(recvToSrc, "p")            \
+  X(recvIdx, "p")              \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -214,7 +221,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 26,
+static_assert(detail::kEpArgsFieldCount == 28,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

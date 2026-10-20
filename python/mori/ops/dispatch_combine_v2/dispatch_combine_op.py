@@ -635,7 +635,10 @@ class EpDispatchRoutingHandle:
     the serving path (dispatch -> experts -> combine) free of allocations. A caller
     that holds several handles at once (one per MoE layer, then the backward in
     reverse) passes dispatch(..., snapshot=True): the handle then owns its dest map
-    and count, and combine / replay with it stay correct after later dispatches.
+    and count, and combine / replay with it stay correct after later dispatches. On a
+    gfx1250 LL128 op it also owns copies of its reverse map and forwarded ids (recv_maps),
+    taken after the dispatch: that combine sends each received row back from them, not
+    from the dest map.
 
     Either way only the routing is the handle's. What dispatch delivered into the
     arena (recv tokens, weights, indices, scales, and the reverse map below until
@@ -674,8 +677,12 @@ class EpDispatchRoutingHandle:
         cur_rank_num_token=0,
         *,
         reverse_src_view=None,
+        recv_maps=None,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
+        # (recv_to_src, recv_idx) copies a snapshot handle owns when its combine reads them back
+        # (EpDispatchCombineOp._snapshot_recv_views); None otherwise.
+        self.recv_maps = recv_maps
         self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
         self.inter_node_disp_send_map = inter_node_disp_send_map
         self.total_recv_token_num = total_recv_token_num
@@ -922,6 +929,12 @@ class EpDispatchCombineOp:
             )
         return cache
 
+    def _snapshot_recv_views(self):
+        """What a snapshot handle must copy out of the arena because this backend's combine
+        reads it back, as (recv_to_src, recv_idx) views, copied once the dispatch has written
+        them; None when the combine routes from the dest map and the count alone."""
+        return None
+
     # -- shared: the ops ---------------------------------------------------
 
     def dispatch(
@@ -945,8 +958,10 @@ class EpDispatchCombineOp:
         .clone() because combine stages into a separate out_tok buffer.
 
         snapshot=: with return_routing=True, give the handle its own dest map
-        (the kernel writes it directly, no copy) and its own copy of total_recv,
-        so it outlives later return_routing dispatches on this op. Without it the
+        (the kernel writes it directly, no copy) and its own copy of total_recv --
+        on an LL128 op also its own reverse map and forwarded ids, written by the
+        kernel next to the arena's -- so it outlives later return_routing
+        dispatches on this op. Without it the
         handle is valid only until the next one; see EpDispatchRoutingHandle.
         Intranode gather combine without StdMoE only: the internode and scatter
         combines also read routing state the op keeps in the arena, and StdMoE's
@@ -982,6 +997,7 @@ class EpDispatchCombineOp:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
         disp_spec, _ = self._pick(n)
 
+        recv_views = None
         if routing is not None:
             table = self._kernels.dispatch_replay
             if table is None:
@@ -995,6 +1011,7 @@ class EpDispatchCombineOp:
                 # No fill: dispatch writes every (tok, k) entry below n, and
                 # nothing reads past n.
                 dest_map = torch.empty_like(self.routing_dest_map)
+                recv_views = self._snapshot_recv_views()
             elif return_routing:
                 dest_map = self.routing_dest_map
             else:
@@ -1007,6 +1024,10 @@ class EpDispatchCombineOp:
             scales=scales,
             dest_map=dest_map,
             num_tokens=n,
+        )
+        # Behind the kernel on the stream, so the copies hold what this dispatch wrote.
+        recv_maps = (
+            None if recv_views is None else tuple(v.clone() for v in recv_views)
         )
 
         base = (
@@ -1042,8 +1063,11 @@ class EpDispatchCombineOp:
             total_recv_token_num=(
                 self.total_recv.clone() if snapshot else self.total_recv
             ),
+            # The handle's copy of the reverse map when it took one, no clone needed.
+            disp_tok_id_to_src_tok_id_local=None if recv_maps is None else recv_maps[0],
             cur_rank_num_token=n,
             reverse_src_view=reverse,
+            recv_maps=recv_maps,
         )
         return base + (handle,)
 
@@ -1074,12 +1098,15 @@ class EpDispatchCombineOp:
         # [0, ct), so the prior contents of the returned slice never leak.
 
         want_weights = weights is not None
+        maps = getattr(routing, "recv_maps", None)
+        own = {} if maps is None else dict(recv_to_src=maps[0], recv_idx=maps[1])
         self._kernels.combine[comb_spec](
             input=input,
             dest_map=routing.disp_dest_tok_id_map,
             total_recv=routing.total_recv_token_num,
             num_tokens=ct,
             want_weights=want_weights,
+            **own,
         )
 
         cdt = self.cfg.combine_dtype
@@ -1116,7 +1143,8 @@ class EpDispatchCombineOp:
             tokoff_ext.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
-        self.total_recv.zero_()
+        # The whole buffer behind the count: an LL128 op keeps the count's call number there too.
+        getattr(self, "_recv_ctr", self.total_recv).zero_()
         # The two backends seed this differently -- intranode starts the epoch at
         # 1, internode at 0 (see the two constructors in hip_backend) -- so a
         # single literal here silently desynchronises one of them from its peers.
