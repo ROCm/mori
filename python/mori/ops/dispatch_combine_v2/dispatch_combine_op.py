@@ -48,6 +48,7 @@ methods to override, after aiter's ``MOEMetadata``.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import os
 from dataclasses import dataclass
@@ -1018,17 +1019,17 @@ class EpDispatchCombineOp:
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
         """
-        self._asyncll_step("dispatch")
-        return self._dispatch_impl(
-            input,
-            weights,
-            scales,
-            indices,
-            routing=routing,
-            return_routing=return_routing,
-            kernels=self._kernels.dispatch,
-            snapshot=snapshot,
-        )
+        with self._asyncll_call("dispatch"):
+            return self._dispatch_impl(
+                input,
+                weights,
+                scales,
+                indices,
+                routing=routing,
+                return_routing=return_routing,
+                kernels=self._kernels.dispatch,
+                snapshot=snapshot,
+            )
 
     def _dispatch_impl(
         self,
@@ -1170,10 +1171,10 @@ class EpDispatchCombineOp:
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
         self._asyncll_check_weight_fold(weights)
-        self._asyncll_step("combine")
-        return self._combine_impl(
-            input, weights, indices, routing=routing, kernels=self._kernels.combine
-        )
+        with self._asyncll_call("combine"):
+            return self._combine_impl(
+                input, weights, indices, routing=routing, kernels=self._kernels.combine
+            )
 
     def _combine_impl(self, input, weights, indices, *, routing, kernels):
         """The body of combine(), parameterised by which kernel table runs. See
@@ -1296,9 +1297,20 @@ class EpDispatchCombineOp:
                 "kernel family if you need the fold."
             )
 
-    def _asyncll_step(self, call):
-        """Check `call` is legal now and advance. No-op off the AsyncLL family."""
+    @contextlib.contextmanager
+    def _asyncll_call(self, call):
+        """Refuse `call` if it is out of order; advance only once it has run.
+
+        Advancing at the top -- before the body -- meant a call that then failed
+        its own argument checks (too many tokens, snapshot=True on async_ll,
+        routing= together with return_routing=) left the state moved on for a
+        launch that never happened, and the caller's next, correct call was
+        refused as out of order. So the check is up front and the advance is on
+        the way out: an exception from the body leaves the state where it was.
+        No-op off the AsyncLL family.
+        """
         if not getattr(self.cfg, "async_ll", False):
+            yield
             return
         want, nxt = self._ASYNCLL_ORDER[call]
         if self._asyncll_state != want:
@@ -1311,6 +1323,7 @@ class EpDispatchCombineOp:
                 "shows up as wrong data or a hang in a LATER round, not here. "
                 "Call reset() if you need to start over."
             )
+        yield
         self._asyncll_state = nxt
 
     def _async_half(self, which):
@@ -1331,64 +1344,64 @@ class EpDispatchCombineOp:
         Same arguments and same return as :meth:`dispatch`. The returned views are
         only valid after :meth:`dispatch_recv`.
         """
-        self._asyncll_step("dispatch_send")
-        return self._dispatch_impl(
-            input,
-            weights,
-            scales,
-            indices,
-            routing=routing,
-            return_routing=return_routing,
-            kernels=self._async_half("dispatch_send"),
-        )
+        with self._asyncll_call("dispatch_send"):
+            return self._dispatch_impl(
+                input,
+                weights,
+                scales,
+                indices,
+                routing=routing,
+                return_routing=return_routing,
+                kernels=self._async_half("dispatch_send"),
+            )
 
     def dispatch_recv(self):
         """Run the recv half of the dispatch the last :meth:`dispatch_send` began."""
-        self._asyncll_step("dispatch_recv")
-        n = self._async_pending_dispatch_tokens
-        if n is None:
-            raise RuntimeError("dispatch_recv without a preceding dispatch_send")
-        self._async_pending_dispatch_tokens = None
-        spec, _ = self._pick(n)
-        self._async_half("dispatch_recv")[spec](
-            input=self._async_pending_dispatch_input,
-            dest_map=self._async_pending_dispatch_map,
-            num_tokens=n,
-        )
-        # Launched, so nothing reads these again; holding them would keep the
-        # caller's input alive until the next round. combine_recv already drops
-        # its whole tuple the same way.
-        self._async_pending_dispatch_input = None
-        self._async_pending_dispatch_map = None
+        with self._asyncll_call("dispatch_recv"):
+            n = self._async_pending_dispatch_tokens
+            if n is None:
+                raise RuntimeError("dispatch_recv without a preceding dispatch_send")
+            self._async_pending_dispatch_tokens = None
+            spec, _ = self._pick(n)
+            self._async_half("dispatch_recv")[spec](
+                input=self._async_pending_dispatch_input,
+                dest_map=self._async_pending_dispatch_map,
+                num_tokens=n,
+            )
+            # Launched, so nothing reads these again; holding them would keep the
+            # caller's input alive until the next round. combine_recv already drops
+            # its whole tuple the same way.
+            self._async_pending_dispatch_input = None
+            self._async_pending_dispatch_map = None
 
     def combine_send(self, input, weights=None, indices=None, *, routing):
         """Enqueue the send half of a combine and return immediately."""
         self._asyncll_check_weight_fold(weights)
-        self._asyncll_step("combine_send")
-        return self._combine_impl(
-            input,
-            weights,
-            indices,
-            routing=routing,
-            kernels=self._async_half("combine_send"),
-        )
+        with self._asyncll_call("combine_send"):
+            return self._combine_impl(
+                input,
+                weights,
+                indices,
+                routing=routing,
+                kernels=self._async_half("combine_send"),
+            )
 
     def combine_recv(self):
         """Run the recv half of the combine the last :meth:`combine_send` began."""
-        self._asyncll_step("combine_recv")
-        state = self._async_pending_combine
-        if state is None:
-            raise RuntimeError("combine_recv without a preceding combine_send")
-        self._async_pending_combine = None
-        inp, dest_map, ct, want_weights = state
-        _, spec = self._pick(ct)
-        self._async_half("combine_recv")[spec](
-            input=inp,
-            dest_map=dest_map,
-            total_recv=None,
-            num_tokens=ct,
-            want_weights=want_weights,
-        )
+        with self._asyncll_call("combine_recv"):
+            state = self._async_pending_combine
+            if state is None:
+                raise RuntimeError("combine_recv without a preceding combine_send")
+            self._async_pending_combine = None
+            inp, dest_map, ct, want_weights = state
+            _, spec = self._pick(ct)
+            self._async_half("combine_recv")[spec](
+                input=inp,
+                dest_map=dest_map,
+                total_recv=None,
+                num_tokens=ct,
+                want_weights=want_weights,
+            )
 
     def reset(self):
         """Zero the arena staging + per-rank counters (mori LaunchReset). The

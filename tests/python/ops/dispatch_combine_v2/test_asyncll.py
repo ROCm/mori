@@ -648,6 +648,20 @@ def run_call_order(d, comm):
         )
         refused("combine_recv while idle", op.combine_recv)
         refused("dispatch_recv while idle", op.dispatch_recv)
+        # Refused for its ARGUMENTS rather than its order: nothing launched, so
+        # the state must not move either, or the verified round below would be
+        # refused as a second dispatch.
+        over = torch.zeros(m + 1, hidden, dtype=torch.bfloat16, device=dev)
+        refused(
+            "dispatch over capacity",
+            lambda: op.dispatch(over, w, None, idx),
+            kind=ValueError,
+        )
+        refused(
+            "snapshot on async_ll",
+            lambda: op.dispatch(x, w, None, idx, return_routing=True, snapshot=True),
+            kind=ValueError,
+        )
         verified_round("first round after refusals")
 
         # dispatch() already ran its recv half.
