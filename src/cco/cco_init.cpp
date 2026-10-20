@@ -23,7 +23,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1925,8 +1924,7 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
   ccoSdmaContext& sdma = hostShadow.sdma;
   sdma.sdmaNumQueue = static_cast<uint32_t>(comm->sdmaNumQueue);
   if (comm->sdmaNumQueue > 0) {
-    const size_t numSlots = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue;
-    size_t poolBytes = numSlots * sizeof(uint64_t);
+    size_t poolBytes = static_cast<size_t>(comm->lsaSize) * comm->sdmaNumQueue * sizeof(uint64_t);
     HIP_RUNTIME_CHECK(hipMalloc(&sdma.signalBuf, poolBytes));
     HIP_RUNTIME_CHECK(hipMemset(sdma.signalBuf, 0, poolBytes));
 
@@ -1986,9 +1984,8 @@ int ccoDevCommCreate(ccoComm* comm, const ccoDevCommRequirements* reqs, ccoDevCo
                                 sizeof(uint64_t*) * comm->lsaSize, hipMemcpyHostToDevice));
 
     sdma.deviceHandles = comm->sdmaDevHandles;
-    MORI_SHMEM_TRACE(
-        "ccoDevCommCreate: SDMA pool signalBuf={} peerSignalPtrs={} numQueue={} numSlots={}",
-        (void*)sdma.signalBuf, (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue, numSlots);
+    MORI_SHMEM_TRACE("ccoDevCommCreate: SDMA pool signalBuf={} peerSignalPtrs={} numQueue={}",
+      (void*)sdma.signalBuf, (void*)sdma.peerSignalPtrs, sdma.sdmaNumQueue);
   }
 
   // Fill the caller-provided host struct in place — no device allocation. It
