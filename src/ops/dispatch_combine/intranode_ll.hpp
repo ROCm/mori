@@ -39,7 +39,7 @@ namespace moe {
 
 using core::load;
 using core::store;
-using core::VecTypeSelector;
+using core::VecTypeT;
 
 constexpr int kMaxGpusPerNode = 8;
 
@@ -86,7 +86,7 @@ inline __device__ void WarpLoadBroadcastStoreImpl(T* dstReg, int numDests,
                                                   size_t count) {
   constexpr int kVecBytes = 16;
   constexpr int kElemsPerVec = kVecBytes / sizeof(T);
-  using VecT = typename VecTypeSelector<kVecBytes>::dataType;
+  using VecT = VecTypeT<kVecBytes>;
 
   const int laneId = threadIdx.x & (warpSize - 1);
   const int elemsPerIter = Unroll * warpSize * kElemsPerVec;

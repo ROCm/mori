@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
     printf("[Rank %d] Dispatch completed, received %d tokens\n", rank, recv_count);
 
     // Get dispatch output buffer (shmem buffer where received tokens landed)
-    void* dispatch_out = handle.shmemDispatchOutTokMemObj->Get();
+    void* dispatch_out = handle.GetShmemDispatchOutTokMemObj()->Get();
     void* dispatch_out_weights = handle.shmemDispatchOutWeightsMemObj->Get();
 
     // Simulate expert computation (identity: just use dispatch output as-is)
