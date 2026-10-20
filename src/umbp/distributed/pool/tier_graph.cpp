@@ -54,22 +54,26 @@ uint64_t StablePlacementHash(std::string_view key) {
 }
 
 std::vector<uint32_t> WeightedBackendOrder(const std::vector<LogicalTierBackendConfig>& members,
-                                           const BackendRegistry& backends, std::string_view key) {
+                                           const BackendRegistry& backends, std::string_view key,
+                                           uint64_t size) {
   struct Candidate {
     uint32_t backend_id;
     uint32_t weight;
   };
 
-  std::vector<Candidate> candidates;
+  // Members the object is too small for go last, as overflow; if that is every member, none do.
+  std::vector<Candidate> candidates, too_small;
   candidates.reserve(members.size());
-  uint64_t total_weight = 0;
   for (const auto& member : members) {
     const auto* entry = backends.GetEntry(member.backend_name);
     if (entry == nullptr || member.weight == 0) continue;
-    candidates.push_back({entry->backend_id, member.weight});
-    total_weight += member.weight;
+    (size != 0 && size < member.min_object_bytes ? too_small : candidates)
+        .push_back({entry->backend_id, member.weight});
   }
+  if (candidates.empty()) candidates.swap(too_small);
   if (candidates.empty()) return {};
+  uint64_t total_weight = 0;
+  for (const auto& candidate : candidates) total_weight += candidate.weight;
 
   uint64_t bucket = StablePlacementHash(key) % total_weight;
   size_t primary = 0;
@@ -86,6 +90,7 @@ std::vector<uint32_t> WeightedBackendOrder(const std::vector<LogicalTierBackendC
   for (size_t offset = 0; offset < candidates.size(); ++offset) {
     order.push_back(candidates[(primary + offset) % candidates.size()].backend_id);
   }
+  for (const auto& candidate : too_small) order.push_back(candidate.backend_id);
   return order;
 }
 
@@ -223,9 +228,9 @@ bool LogicalTierGraph::MemberAtOrAbove(uint32_t backend_id, double watermark) co
   return MemberUtilization(backend_id) >= watermark;
 }
 
-std::vector<uint32_t> LogicalTierGraph::WeightedMemberOrder(TierIndex tier,
-                                                            std::string_view key) const {
-  return WeightedBackendOrder(NodeAt(tier).members, *backends_, key);
+std::vector<uint32_t> LogicalTierGraph::WeightedMemberOrder(TierIndex tier, std::string_view key,
+                                                            uint64_t size) const {
+  return WeightedBackendOrder(NodeAt(tier).members, *backends_, key, size);
 }
 
 std::vector<LogicalTierGraph::TierIndex> LogicalTierGraph::ReachableTierOrder(
@@ -247,24 +252,25 @@ std::vector<LogicalTierGraph::TierIndex> LogicalTierGraph::ReachableTierOrder(
 }
 
 std::vector<uint32_t> LogicalTierGraph::BackendOrder(const std::vector<TierIndex>& tiers,
-                                                     std::string_view key) const {
+                                                     std::string_view key, uint64_t size) const {
   std::vector<uint32_t> order;
   for (TierIndex tier : tiers) {
-    auto members = WeightedMemberOrder(tier, key);
+    auto members = WeightedMemberOrder(tier, key, size);
     order.insert(order.end(), members.begin(), members.end());
   }
   return order;
 }
 
-std::vector<uint32_t> LogicalTierGraph::PutOrder(std::string_view key) const {
-  return BackendOrder(ReachableTierOrder(entry_tier_, false, true), key);
+std::vector<uint32_t> LogicalTierGraph::PutOrder(std::string_view key, uint64_t size) const {
+  return BackendOrder(ReachableTierOrder(entry_tier_, false, true), key, size);
 }
 
 std::vector<uint32_t> LogicalTierGraph::PutOrderFromTier(std::string_view name,
-                                                         std::string_view key) const {
+                                                         std::string_view key,
+                                                         uint64_t size) const {
   for (TierIndex tier = 0; tier < nodes_.size(); ++tier) {
     if (NodeAt(tier).name == name) {
-      return BackendOrder(ReachableTierOrder(tier, false, true), key);
+      return BackendOrder(ReachableTierOrder(tier, false, true), key, size);
     }
   }
   return {};
