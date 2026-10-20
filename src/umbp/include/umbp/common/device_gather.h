@@ -59,6 +59,14 @@ struct DeviceGatherFragment {
 bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int device_id,
                         hipStream_t stream);
 
+// Sizes `stream`'s descriptor staging for `capacity` fragments and runs an
+// empty gather on it, so that a later LaunchDeviceGather of up to `capacity`
+// fragments allocates nothing.  The whole staging buffer is uploaded, which
+// makes the upload large enough to take a copy engine as a real batch's does.
+// Same contract as LaunchDeviceGather: the current device must be `device_id`,
+// and the caller synchronizes `stream`.
+bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity);
+
 // Whether the gather kernel path is compiled in and not disabled via
 // UMBP_DRAM_GATHER_KERNEL=0.
 bool DeviceGatherEnabled();
