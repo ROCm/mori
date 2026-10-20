@@ -86,7 +86,7 @@ inline __device__ void WarpLoadBroadcastStoreImpl(T* dstReg, int numDests,
                                                   size_t count) {
   constexpr int kVecBytes = 16;
   constexpr int kElemsPerVec = kVecBytes / sizeof(T);
-  using VecT = typename VecTypeSelector<kVecBytes>::dataType;
+  using VecT = VecTypeSelector<kVecBytes>;
 
   const int laneId = threadIdx.x & (warpSize - 1);
   const int elemsPerIter = Unroll * warpSize * kElemsPerVec;

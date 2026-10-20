@@ -1303,8 +1303,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
       constexpr int _qOutVB = 16;
       constexpr int _qV = _qOutVB / (int)sizeof(T);
       constexpr int _qVB = _qV * (int)sizeof(TokT);
-      using _QVecT = typename core::VecTypeSelector<_qVB>::dataType;
-      using _QOutVecT = typename core::VecTypeSelector<_qOutVB>::dataType;
+      using _QVecT = core::VecTypeSelector<_qVB>;
+      using _QOutVecT = core::VecTypeSelector<_qOutVB>;
       constexpr bool _qCvtPk =
           std::is_same_v<TokT, hip_bfloat16> && std::is_same_v<T, hip_bfloat16>;
       // Round to the VECTOR width, not to a whole warp's worth of it. Rounding to warpSize*_qV
@@ -1598,8 +1598,8 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_1250x_body(EpDispatchCo
               constexpr int _cOutVB = 16;
               constexpr int _cV = _cOutVB / (int)sizeof(T);
               constexpr int _cVB = _cV * (int)sizeof(TokT);
-              using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
-              using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
+              using _CVecT = core::VecTypeSelector<_cVB>;
+              using _COutVecT = core::VecTypeSelector<_cOutVB>;
               const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
                                    ((hiddenDimOffset % (size_t)_cV) == 0) &&
                                    ((_rowStride % _cV) == 0);

@@ -56,35 +56,25 @@ using CombineInternalFp8 = uint8_t;
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Type Definitions                                        */
 /* ---------------------------------------------------------------------------------------------- */
+
+// #if (defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__))
+// #if __has_builtin(__builtin_amdgcn_global_load_b128) && \
+//     __has_builtin(__builtin_amdgcn_global_store_b128)
+// #elif defined(__HIP_DEVICE_COMPILE__)
+// #error "Global b128 load/store not supported on this architecture"
+// #endif
+// #endif
+
+using VecU32x4 = uint32_t __attribute__((ext_vector_type(4)));
 template <int VecBytes>
-struct VecTypeSelector {
-  using type = void;
-};
+using VecTypeSelector = std::conditional_t<
+    VecBytes == 1, uint8_t,
+        std::conditional_t<VecBytes == 2, uint16_t,
+        std::conditional_t<VecBytes == 4, uint32_t,
+        std::conditional_t<VecBytes == 8, uint64_t,
+        std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
 
-template <>
-struct VecTypeSelector<1> {
-  using dataType = uint8_t;
-};
 
-template <>
-struct VecTypeSelector<2> {
-  using dataType = uint16_t;
-};
-
-template <>
-struct VecTypeSelector<4> {
-  using dataType = uint32_t;
-};
-
-template <>
-struct VecTypeSelector<8> {
-  using dataType = uint64_t;
-};
-
-template <>
-struct VecTypeSelector<16> {
-  using dataType = ulong2;
-};
 
 template <typename T, int VecSize>
 struct VecTypeAdaptor {
@@ -124,134 +114,68 @@ struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
 #define USE_BUILDIN_LD 1
 #define USE_BUILDIN_ST 1
 
+namespace impl {
+  
+template <typename T>
+inline  __device__ T* global(T* ptr) {
+  static_assert(!std::is_volatile<T>::value, "T must not be volatile");
+  return (T*)(T __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
+}
+} // namespace impl
+
+template <int VecBytes>
+inline __device__ VecTypeSelector<VecBytes> load(const void* p) {
+  auto ptr = impl::global(static_cast<VecTypeSelector<VecBytes>*>(p)); 
 #if USE_BUILDIN_LD
-template <int VecBytes>
-__device__ __forceinline__ typename VecTypeSelector<VecBytes>::dataType load(const void* addr);
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<1>::dataType load<1>(const void* addr) {
-  return __builtin_nontemporal_load((uint8_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<2>::dataType load<2>(const void* addr) {
-  return __builtin_nontemporal_load((uint16_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<4>::dataType load<4>(const void* addr) {
-  return __builtin_nontemporal_load((uint32_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<8>::dataType load<8>(const void* addr) {
-  return __builtin_nontemporal_load((uint64_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<16>::dataType load<16>(const void* addr) {
-  ulong2 result;
-  result.x = __builtin_nontemporal_load((uint64_t*)addr);
-  result.y = __builtin_nontemporal_load(((uint64_t*)addr) + 1);
-  return result;
-}
+  return __builtin_nontemporal_load(ptr);
 #else
-template <int VecBytes>
-__device__ __forceinline__ typename VecTypeSelector<VecBytes>::dataType load(const void* addr);
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<1>::dataType load<1>(const void* addr) {
-  return *static_cast<const uint8_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<2>::dataType load<2>(const void* addr) {
-  return *static_cast<const uint16_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<4>::dataType load<4>(const void* addr) {
-  return *static_cast<const uint32_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<8>::dataType load<8>(const void* addr) {
-  return *static_cast<const uint64_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<16>::dataType load<16>(const void* addr) {
-  const uint64_t* ptr = static_cast<const uint64_t*>(addr);
-  ulong2 result;
-  result.x = ptr[0];
-  result.y = ptr[1];
-  return result;
-}
+  return *ptr;
 #endif
+}
 
+template <int VecBytes>
+inline __device__ void store(void* p, VecTypeSelector<VecBytes> v) {
+  auto ptr = impl::global(static_cast<VecTypeSelector<VecBytes>*>(p));
 #if USE_BUILDIN_ST
-template <int VecBytes>
-__device__ __forceinline__ void store(void* addr,
-                                      typename VecTypeSelector<VecBytes>::dataType value);
-
-template <>
-__device__ __forceinline__ void store<1>(void* addr, typename VecTypeSelector<1>::dataType value) {
-  __builtin_nontemporal_store(value, (uint8_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<2>(void* addr, typename VecTypeSelector<2>::dataType value) {
-  __builtin_nontemporal_store(value, (uint16_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<4>(void* addr, typename VecTypeSelector<4>::dataType value) {
-  __builtin_nontemporal_store(value, (uint32_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<8>(void* addr, typename VecTypeSelector<8>::dataType value) {
-  __builtin_nontemporal_store(value, (uint64_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<16>(void* addr,
-                                          typename VecTypeSelector<16>::dataType value) {
-  __builtin_nontemporal_store(value.x, (uint64_t*)addr);
-  __builtin_nontemporal_store(value.y, ((uint64_t*)addr) + 1);
-}
+  __builtin_nontemporal_store(v, ptr);
 #else
-template <int VecBytes>
-__device__ __forceinline__ void store(void* addr,
-                                      typename VecTypeSelector<VecBytes>::dataType value);
-
-template <>
-__device__ __forceinline__ void store<1>(void* addr, typename VecTypeSelector<1>::dataType value) {
-  *((uint8_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<2>(void* addr, typename VecTypeSelector<2>::dataType value) {
-  *((uint16_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<4>(void* addr, typename VecTypeSelector<4>::dataType value) {
-  *((uint32_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<8>(void* addr, typename VecTypeSelector<8>::dataType value) {
-  *((uint64_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<16>(void* addr,
-                                          typename VecTypeSelector<16>::dataType value) {
-  *((uint64_t*)addr) = value.x;
-  *(((uint64_t*)addr) + 1) = value.y;
-}
+  *ptr = v;
 #endif
+}
+
+template <StreamScope Scope, int Bytes = VecBytes>
+inline __device__ VecTypeSelector<Bytes> streamLoad(const void* p) {
+  static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
+                "StreamLoad supports 1/2/4/8/16 byte accesses");
+  // Intrinsic takes a non-const pointer
+  auto non_const = const_cast<void*>(p);
+  auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(non_const)); 
+  if constexpr (Bytes == 16) {
+    if constexpr (Scope == ESystemScope) {
+      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
+    } else {
+      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
+    }
+  } else {
+    return AtomicLoad<Scope>(ptr);
+  }
+}
+
+template <StreamScope Scope, int Bytes = VecBytes>
+inline __device__ void streamStore(void* p, VecTypeSelector<Bytes> v) {
+  static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
+                "StreamStore supports 1/2/4/8/16 byte accesses");
+  auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(p));
+  if constexpr (Bytes == 16) {
+    if constexpr (Scope == ESystemScope) {
+      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "");
+    } else {
+      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
+    }
+  } else {
+    AtomicStore<Scope>(ptr, v);
+  }
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                              Copy                                              */
@@ -278,7 +202,7 @@ inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ s
   constexpr int VecBytes = 16;
   constexpr int vecSize = VecBytes / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
 
   const int elemsPerWarp = Unroll * warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -324,7 +248,7 @@ inline __device__ void BlockCopyImpl(T* __restrict__ dst, const T* __restrict__ 
 
   const int threadId = FlatBlockThreadId();
   const int blockSize = FlatBlockSize();
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
 
   const size_t elemsPerBlock = static_cast<size_t>(Unroll) * blockSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerBlock;
@@ -479,7 +403,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const int laneId = threadIdx.x & (warpSize - 1);
   size_t offset = 0;
 
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
   const size_t laneOffset = laneId * vecSize;
@@ -533,7 +457,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
                                               const float* __restrict__ srcScales, size_t& offset,
                                               size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
 
   const int elemsPerWarp = Unroll * warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -589,7 +513,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
                                               const float* __restrict__ srcScales, size_t& offset,
                                               size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
 
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -648,7 +572,7 @@ __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest,
                                                       const float* __restrict__ srcScales,
                                                       size_t& offset, size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
 
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -799,7 +723,7 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
                                                 const float* __restrict__ srcScales, size_t& offset,
                                                 size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeSelector<VecBytes>;
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
 
   const int laneId = threadIdx.x & (warpSize - 1);
