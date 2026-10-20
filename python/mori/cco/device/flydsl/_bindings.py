@@ -91,6 +91,12 @@ SDMA_XFER = {
     for s in ("thread", "warp", "block", "thread_ns", "warp_ns", "block_ns")
 }
 
+SDMA_XFER2D = {
+    f"{op}2d__{s}": _binding(f"sdma_{op}2d_{s}")
+    for op in ("put", "get")
+    for s in ("thread", "warp", "block", "thread_ns", "warp_ns", "block_ns")
+}
+
 SDMA_QUIET = {s: _binding(f"sdma_quiet_{s}") for s in ("thread", "warp", "block")}
 SDMA_COMMIT = {s: _binding(f"sdma_commit_{s}") for s in ("thread", "warp", "block")}
 cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
