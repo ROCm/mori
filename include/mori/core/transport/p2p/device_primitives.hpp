@@ -125,12 +125,19 @@ inline  __device__ T* global(T* ptr) {
 
 template <int VecBytes>
 inline __device__ VecTypeSelector<VecBytes> load(const void* p) {
-  auto ptr = impl::global(static_cast<VecTypeSelector<VecBytes>*>(p)); 
+  auto ptr = impl::global(static_cast<const VecTypeSelector<VecBytes>*>(p)); 
 #if USE_BUILDIN_LD
   return __builtin_nontemporal_load(ptr);
 #else
   return *ptr;
 #endif
+}
+
+template <int VecBytes, class T>
+inline __device__ void store(void* p, T v) {
+  static_assert(sizeof(T) == sizeof(VecTypeSelector<VecBytes>), 
+            "T must be the same size as VecTypeSelector<VecBytes>");
+  store<VecBytes>(p, (VecTypeSelector<VecBytes>)v);
 }
 
 template <int VecBytes>
@@ -143,39 +150,39 @@ inline __device__ void store(void* p, VecTypeSelector<VecBytes> v) {
 #endif
 }
 
-template <StreamScope Scope, int Bytes = VecBytes>
-inline __device__ VecTypeSelector<Bytes> streamLoad(const void* p) {
-  static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
-                "StreamLoad supports 1/2/4/8/16 byte accesses");
-  // Intrinsic takes a non-const pointer
-  auto non_const = const_cast<void*>(p);
-  auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(non_const)); 
-  if constexpr (Bytes == 16) {
-    if constexpr (Scope == ESystemScope) {
-      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
-    } else {
-      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
-    }
-  } else {
-    return AtomicLoad<Scope>(ptr);
-  }
-}
+// template <StreamScope Scope, int Bytes = VecBytes>
+// inline __device__ VecTypeSelector<Bytes> streamLoad(const void* p) {
+//   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
+//                 "StreamLoad supports 1/2/4/8/16 byte accesses");
+//   // Intrinsic takes a non-const pointer
+//   auto non_const = const_cast<void*>(p);
+//   auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(non_const)); 
+//   if constexpr (Bytes == 16) {
+//     if constexpr (Scope == ESystemScope) {
+//       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
+//     } else {
+//       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
+//     }
+//   } else {
+//     return AtomicLoad<Scope>(ptr);
+//   }
+// }
 
-template <StreamScope Scope, int Bytes = VecBytes>
-inline __device__ void streamStore(void* p, VecTypeSelector<Bytes> v) {
-  static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
-                "StreamStore supports 1/2/4/8/16 byte accesses");
-  auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(p));
-  if constexpr (Bytes == 16) {
-    if constexpr (Scope == ESystemScope) {
-      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "");
-    } else {
-      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
-    }
-  } else {
-    AtomicStore<Scope>(ptr, v);
-  }
-}
+// template <StreamScope Scope, int Bytes = VecBytes>
+// inline __device__ void streamStore(void* p, VecTypeSelector<Bytes> v) {
+//   static_assert(Bytes == 1 || Bytes == 2 || Bytes == 4 || Bytes == 8 || Bytes == 16,
+//                 "StreamStore supports 1/2/4/8/16 byte accesses");
+//   auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(p));
+//   if constexpr (Bytes == 16) {
+//     if constexpr (Scope == ESystemScope) {
+//       __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "");
+//     } else {
+//       __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
+//     }
+//   } else {
+//     AtomicStore<Scope>(ptr, v);
+//   }
+// }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                              Copy                                              */
