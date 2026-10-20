@@ -33,8 +33,8 @@
 //   thread      one lane posts one rect (odd origin, src/dst pitches differ)
 //   block_wide  block leader, rect wider than 16K bytes -- beyond the 14-bit
 //               extents of the 13-dword sub_op 4 packet
-//   warp_batch  64 lanes post 64 tiles as one run with one remote signal; the
-//               receiver waits on that signal, not on a barrier
+//   warp_batch  64 lanes post 64 tiles, one run and one remote signal per
+//               wavefront; the receiver waits on the signal, not on a barrier
 //   get2d       pull a rect from the peer
 //   aggregate   four rects posted without the doorbell, then commit()
 //   ring_wrap   thousands of small rects interleaved with 1-unit linear puts,
@@ -96,7 +96,7 @@ __global__ void Put2DBlockKernel(ccoWindowDevice* src, ccoWindowDevice* dst, Rec
 }
 
 // warp batch: lane i of block p posts tile i of an 8x8 grid to peer p, all on
-// queue 0, with one remote signal for the run. Rect r is the whole grid.
+// queue 0, one run and one remote signal per wavefront. Rect r is the whole grid.
 __global__ void Put2DWarpBatchKernel(ccoWindowDevice* src, ccoWindowDevice* dst, Rect r,
                                      ccoDevComm dc) {
   ccoSdma sdma{dc};
@@ -293,12 +293,15 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
       fetch();
       ok &= checkAll("block_wide", {r});
     }
-    // warp_batch: 8x8 tiles of 16 rows x 96 bytes, one run, one signal each.
+    // warp_batch: 8x8 tiles of 16 rows x 96 bytes, one signal per wavefront
+    // (two on wave32).
     {
       const Rect r{512, 64, 3072, 32, 8 * 96, 8 * 16};
+      int warpSize = 64;
+      HIP_CHECK(hipDeviceGetAttribute(&warpSize, hipDeviceAttributeWarpSize, rank % numDevices));
       reset();
       Put2DWarpBatchKernel<<<nranks, 64, 0, stream>>>(sW, dW, r, devComm);
-      WaitSignalsKernel<<<1, 64, 0, stream>>>(devComm, 1);
+      WaitSignalsKernel<<<1, 64, 0, stream>>>(devComm, 64 / warpSize);
       fetch();
       ok &= checkAll("warp_batch", {r});
     }

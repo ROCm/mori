@@ -1186,8 +1186,9 @@ typedef struct CCO_SDMA_PKT_ATOMIC_TAG {
 // covers any tile of a [M, N] row-major matrix. Byte granular: x, pitch and
 // rect_x are in bytes, y and rect_y in rows. Pitch and rect fields are stored
 // minus one. Same layout as rocm-xio's SDMA_PKT_LINEAR_LARGE_SUB_WINDOW_COPY.
-// gfx9 (SDMA 4.4.x) only: gfx12.5 has its own 2D packet, which cco does not post.
+// gfx9 (SDMA 4.4.x) only; gfx12.5 posts CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12.
 const unsigned int CCO_SDMA_SUBOP_COPY_LINEAR_LARGE_SUB_WINDOW = 36;
+const unsigned int CCO_SDMA_SUBOP_COPY_LINEAR_RECT = 4;
 
 typedef struct CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW_TAG {
   union {
@@ -1221,6 +1222,63 @@ typedef struct CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW_TAG {
 } CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW;
 static_assert(sizeof(CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW) == 20 * sizeof(uint32_t),
               "SDMA large sub-window copy packet must be exactly 20 dwords");
+
+// gfx12 2D copy (sub_op 4), ROCr's SDMA_PKT_COPY_LINEAR_RECT_GFX12. Counted in
+// elements of 1 << element bytes; bases are dword aligned, the rest of the start
+// goes in offset_x. x/y/rect_x/rect_y and pitch are 16-bit, slice 32-bit, z 14-bit.
+typedef struct CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12_TAG {
+  union {
+    struct {
+      unsigned int op : 8;
+      unsigned int sub_op : 8;
+      unsigned int reserved_0 : 12;
+      unsigned int npd : 1;
+      unsigned int element : 3;
+    };
+    unsigned int DW_0_DATA;
+  } HEADER_UNION;
+
+  unsigned int src_addr_31_0;
+  unsigned int src_addr_63_32;
+  struct {
+    unsigned int src_offset_x : 16;
+    unsigned int src_offset_y : 16;
+  };
+  struct {
+    unsigned int src_offset_z : 14;
+    unsigned int reserved_1 : 2;
+    unsigned int src_pitch : 16;
+  };
+  unsigned int src_slice_pitch;
+  unsigned int dst_addr_31_0;
+  unsigned int dst_addr_63_32;
+  struct {
+    unsigned int dst_offset_x : 16;
+    unsigned int dst_offset_y : 16;
+  };
+  struct {
+    unsigned int dst_offset_z : 14;
+    unsigned int reserved_2 : 2;
+    unsigned int dst_pitch : 16;
+  };
+  unsigned int dst_slice_pitch;
+  struct {
+    unsigned int rect_x : 16;
+    unsigned int rect_y : 16;
+  };
+  struct {
+    unsigned int rect_z : 14;
+    unsigned int reserved_3 : 4;
+    unsigned int dst_scope : 2;
+    unsigned int dst_temporal_hint : 3;
+    unsigned int reserved_4 : 3;
+    unsigned int src_scope : 2;
+    unsigned int src_temporal_hint : 3;
+    unsigned int reserved_5 : 1;
+  };
+} CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12;
+static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12) == 13 * sizeof(uint32_t),
+              "SDMA gfx12 rect copy packet must be exactly 13 dwords");
 
 // ── from anvil_device.hpp (device path only; host queue-setup constants omitted) ──
 constexpr uint32_t CCO_SDMA_QUEUE_SIZE = 256 * 1024;  // 256KB
@@ -1285,11 +1343,70 @@ __device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint6
   return packet;
 }
 
-// Offsets are folded into the base addresses, so x/y/z stay 0; z extent is 1.
-__device__ __forceinline__ CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW
+#if defined(__gfx1250__)
+using ccoSdmaCopy2DPacket = CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12;
+
+// Largest element (log2 bytes, at most 16B) dividing the width, both pitches and
+// both sub-dword start offsets.
+__device__ __forceinline__ uint32_t ccoSdma2DElement(uintptr_t src, uint32_t srcPitch,
+                                                     uintptr_t dst, uint32_t dstPitch,
+                                                     uint32_t widthBytes) {
+  return __builtin_ctz(widthBytes | srcPitch | dstPitch | uint32_t(src & 3) | uint32_t(dst & 3) |
+                       16u);
+}
+
+// Both pitches fit the 16-bit field; otherwise rows step the slice pitch along z.
+__device__ __forceinline__ bool ccoSdma2DPitchFits(uint32_t srcPitch, uint32_t dstPitch,
+                                                   uint32_t e) {
+  return (srcPitch >> e) <= 0x10000u && (dstPitch >> e) <= 0x10000u;
+}
+
+// The rect must fit one packet (see ccoSdma2DPieceLimits).
+__device__ __forceinline__ ccoSdmaCopy2DPacket
 ccoCreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
                       uint32_t widthBytes, uint32_t height) {
-  CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW packet = {};
+  const uintptr_t s = reinterpret_cast<uintptr_t>(srcBuf);
+  const uintptr_t d = reinterpret_cast<uintptr_t>(dstBuf);
+  const uint32_t e = ccoSdma2DElement(s, srcPitch, d, dstPitch, widthBytes);
+  ccoSdmaCopy2DPacket packet = {};
+
+  packet.HEADER_UNION.op = CCO_SDMA_OP_COPY;
+  packet.HEADER_UNION.sub_op = CCO_SDMA_SUBOP_COPY_LINEAR_RECT;
+  packet.HEADER_UNION.npd = 1;
+  packet.HEADER_UNION.element = e;
+
+  packet.src_addr_31_0 = (uint32_t)(s & ~uintptr_t(3));
+  packet.src_addr_63_32 = (uint32_t)(s >> 32);
+  packet.src_offset_x = (s & 3) >> e;
+  packet.dst_addr_31_0 = (uint32_t)(d & ~uintptr_t(3));
+  packet.dst_addr_63_32 = (uint32_t)(d >> 32);
+  packet.dst_offset_x = (d & 3) >> e;
+  packet.rect_x = (widthBytes >> e) - 1;
+  if (ccoSdma2DPitchFits(srcPitch, dstPitch, e)) {
+    packet.src_pitch = (srcPitch >> e) - 1;
+    packet.dst_pitch = (dstPitch >> e) - 1;
+    packet.rect_y = height - 1;
+  } else {
+    // One row in y, `height` slices along z, as ROCr's wide-pitch copy_rect.
+    packet.src_pitch = 0xffff;
+    packet.dst_pitch = 0xffff;
+    packet.src_slice_pitch = (srcPitch >> e) - 1;
+    packet.dst_slice_pitch = (dstPitch >> e) - 1;
+    packet.rect_z = height - 1;
+  }
+  packet.dst_scope = CCO_SDMA_MEMORY_SCOPE_SYS;
+  packet.src_scope = CCO_SDMA_MEMORY_SCOPE_SYS;
+
+  return packet;
+}
+#else
+using ccoSdmaCopy2DPacket = CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW;
+
+// Offsets are folded into the base addresses, so x/y/z stay 0; z extent is 1.
+__device__ __forceinline__ ccoSdmaCopy2DPacket
+ccoCreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
+                      uint32_t widthBytes, uint32_t height) {
+  ccoSdmaCopy2DPacket packet = {};
 
   packet.HEADER_UNION.op = CCO_SDMA_OP_COPY;
   packet.HEADER_UNION.sub_op = CCO_SDMA_SUBOP_COPY_LINEAR_LARGE_SUB_WINDOW;
@@ -1305,6 +1422,7 @@ ccoCreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t ds
 
   return packet;
 }
+#endif
 
 struct ccoSdmaQueueDeviceHandle {
   // Reserve slotBytes with one atomic_fetch_add. Returns the monotonic base;
@@ -1480,15 +1598,18 @@ inline __device__ void ccoSdmaWriteAtomic(uint32_t* queueBuf, uint64_t at, HSAui
   dst->vec[1] = ccoUint4{p[4], p[5], p[6], p[7]};
 }
 
-// A 2D copy is 80B, so it takes a 128B slot -- three units of packet, one of NOP
-// -- and the slot starts 128B-aligned. The ring is a whole number of slots, so a
-// packet can never straddle the ring end, which a 3-unit packet at an arbitrary
-// unit could. A run reserves three units of slack for that alignment; whatever
-// the alignment leaves over is NOP-filled after the run.
+// A 2D copy is 80B (gfx12.5: 52B), so it takes a 128B (64B) slot, NOP-padded,
+// and the slot starts slot-aligned. The ring is a whole number of slots, so a
+// packet can never straddle the ring end, which a multi-unit packet at an
+// arbitrary unit could. A run reserves one slot less a unit of slack for that
+// alignment; whatever the alignment leaves over is NOP-filled after the run.
+#if defined(__gfx1250__)
+constexpr uint64_t CCO_SDMA_2D_SLOT = 2 * CCO_SDMA_UNIT;
+#else
 constexpr uint64_t CCO_SDMA_2D_SLOT = 4 * CCO_SDMA_UNIT;
+#endif
 constexpr uint64_t CCO_SDMA_2D_SLACK = CCO_SDMA_2D_SLOT - CCO_SDMA_UNIT;
-static_assert(sizeof(CCO_SDMA_PKT_COPY_LARGE_SUB_WINDOW) <= CCO_SDMA_2D_SLOT,
-              "2D COPY must fit one slot");
+static_assert(sizeof(ccoSdmaCopy2DPacket) <= CCO_SDMA_2D_SLOT, "2D COPY must fit one slot");
 static_assert(CCO_SDMA_QUEUE_SIZE % CCO_SDMA_2D_SLOT == 0, "ring must be whole 2D slots");
 
 // One rectangle: `height` rows of `widthBytes`, rows `srcPitch` / `dstPitch`
@@ -1511,20 +1632,47 @@ inline __device__ void ccoSdmaWriteNops(uint32_t* queueBuf, uint64_t at, uint64_
   }
 }
 
-// `at` is slot-aligned, so the slot's four units are contiguous in the ring.
+// `at` is slot-aligned, so the slot's units are contiguous in the ring. The
+// zeros after the packet are 1-dword NOPs.
 inline __device__ void ccoSdmaWriteCopy2D(uint32_t* queueBuf, uint64_t at, const ccoSdmaRect& r) {
-  auto pkt = ccoCreateCopy2DPacket(r.src, r.srcPitch, r.dst, r.dstPitch, r.widthBytes, r.height);
-  const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
+  uint32_t p[CCO_SDMA_2D_SLOT / sizeof(uint32_t)] = {};
+  const auto pkt =
+      ccoCreateCopy2DPacket(r.src, r.srcPitch, r.dst, r.dstPitch, r.widthBytes, r.height);
+  __builtin_memcpy(p, &pkt, sizeof(pkt));
   auto u = impl::global(ccoSdmaUnitAt(queueBuf, at));
-  u[0].vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
-  u[0].vec[1] = ccoUint4{p[4], p[5], p[6], p[7]};
-  u[1].vec[0] = ccoUint4{p[8], p[9], p[10], p[11]};
-  u[1].vec[1] = ccoUint4{p[12], p[13], p[14], p[15]};
-  u[2].vec[0] = ccoUint4{p[16], p[17], p[18], p[19]};
-  u[2].vec[1] = ccoUint4{0, 0, 0, 0};
-  u[3].vec[0] = ccoUint4{0, 0, 0, 0};
-  u[3].vec[1] = ccoUint4{0, 0, 0, 0};
+#pragma unroll
+  for (uint32_t i = 0; i < CCO_SDMA_2D_SLOT / CCO_SDMA_UNIT; i++) {
+    u[i].vec[0] = ccoUint4{p[8 * i], p[8 * i + 1], p[8 * i + 2], p[8 * i + 3]};
+    u[i].vec[1] = ccoUint4{p[8 * i + 4], p[8 * i + 5], p[8 * i + 6], p[8 * i + 7]};
+  }
 }
+
+#if defined(__gfx1250__)
+// The most one gfx12 packet carries: 64Ki elements per row, and 64Ki rows -- 16Ki
+// once the pitch needs the slice field. Pieces of these sizes keep the element.
+__device__ __forceinline__ void ccoSdma2DPieceLimits(const ccoSdmaRect& r, uint32_t& maxW,
+                                                     uint32_t& maxH) {
+  const uint32_t e =
+      ccoSdma2DElement(reinterpret_cast<uintptr_t>(r.src), r.srcPitch,
+                       reinterpret_cast<uintptr_t>(r.dst), r.dstPitch, r.widthBytes);
+  maxW = 0x10000u << e;
+  maxH = ccoSdma2DPitchFits(r.srcPitch, r.dstPitch, e) ? 0x10000u : 0x4000u;
+}
+
+// Piece i of r cut into maxW x maxH tiles, row-major with nx tiles per row.
+__device__ __forceinline__ ccoSdmaRect ccoSdma2DPiece(const ccoSdmaRect& r, uint32_t i,
+                                                      uint32_t nx, uint32_t maxW,
+                                                      uint32_t maxH) {
+  const uint32_t x = (i % nx) * maxW;
+  const uint32_t y = (i / nx) * maxH;
+  return ccoSdmaRect{static_cast<char*>(r.src) + size_t(y) * r.srcPitch + x,
+                     static_cast<char*>(r.dst) + size_t(y) * r.dstPitch + x,
+                     r.srcPitch,
+                     r.dstPitch,
+                     r.widthBytes - x < maxW ? r.widthBytes - x : maxW,
+                     r.height - y < maxH ? r.height - y : maxH};
+}
+#endif
 
 template <bool localSignal, bool remoteSignal>
 inline __device__ void ccoSdmaWriteSignals(uint32_t* queueBuf, uint64_t at, HSAuint64* localTarget,
@@ -2014,8 +2162,24 @@ __device__ inline void ccoSdmaDispatchPut2D(const ccoSdmaContext& s, int peer, u
   const uint32_t queueKey = static_cast<uint32_t>(peer) * n + static_cast<uint32_t>(queueId);
   const uint32_t span = lsaSize * n;
   const uint32_t keyBits = span > 1 ? (32u - static_cast<uint32_t>(__builtin_clz(span - 1))) : 1u;
+#if defined(__gfx1250__)
+  // Past one packet's extents: split. Every lane posts its last piece in one
+  // converged call, so a batch still carries one signal.
+  uint32_t maxW, maxH;
+  ccoSdma2DPieceLimits(rect, maxW, maxH);
+  const uint32_t nx = static_cast<uint32_t>((uint64_t(rect.widthBytes) + maxW - 1) / maxW);
+  const uint32_t pieces = nx * ((rect.height + maxH - 1) / maxH);
+  for (uint32_t i = 0; i + 1 < pieces; i++)
+    ccoSdmaPut2DThread<false, false, optFlags>(ccoSdma2DPiece(rect, i, nx, maxW, maxH),
+                                               s.deviceHandles + peer * n, nullptr, nullptr, n,
+                                               queueId, queueKey, keyBits);
+  ccoSdmaPut2DThread<localSignal, remoteSignal, optFlags>(
+      pieces > 1 ? ccoSdma2DPiece(rect, pieces - 1, nx, maxW, maxH) : rect,
+      s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId, queueKey, keyBits);
+#else
   ccoSdmaPut2DThread<localSignal, remoteSignal, optFlags>(
       rect, s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId, queueKey, keyBits);
+#endif
 }
 
 struct ccoSdma {
