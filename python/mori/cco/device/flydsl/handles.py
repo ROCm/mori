@@ -415,6 +415,20 @@ class Sdma:
         """Wait on a single (peer, queueId) queue only."""
         raw.cco_sdma_quiet_queue(self.dev_comm, peer, qid)
 
+    def put_remote_signal(self, peer, dst_ptr, src_ptr, nbytes, qid):
+        """Thread-scope put by raw VA, with remoteSignal: once the copy lands the
+        engine adds 1 to the peer's ``signal_slot(my_lsa_rank, qid)``.
+
+        ``dst_ptr``/``src_ptr`` are addresses, e.g. ``Window.lsa_ptr(peer, off)``
+        and ``Window.lsa_ptr(my_lsa_rank, off)``.
+        """
+        raw.cco_sdma_put_ptr_rsig(self.dev_comm, peer, dst_ptr, src_ptr, nbytes, qid)
+
+    def signal_slot(self, src, qid):
+        """Address of my ``signalBuf[src * sdmaNumQueue + qid]``, a u64 counter that
+        ``src``'s :meth:`put_remote_signal` bumps (``src`` is an LSA rank)."""
+        return raw.cco_sdma_signal_slot(self.dev_comm, src, qid)
+
 
 @cco_struct
 class DevComm:

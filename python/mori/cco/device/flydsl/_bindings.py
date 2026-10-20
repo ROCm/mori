@@ -95,6 +95,20 @@ SDMA_QUIET = {s: _binding(f"sdma_quiet_{s}") for s in ("thread", "warp", "block"
 SDMA_COMMIT = {s: _binding(f"sdma_commit_{s}") for s in ("thread", "warp", "block")}
 cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
 
+# Declared here rather than in CCO_DEVICE_FUNCTIONS: that table also drives the
+# Triton bindings, and these two are FlyDSL-only for now.
+# put with remoteSignal: after the copy, the engine's trailing ATOMIC adds 1 to
+# the *peer's* signalBuf[myLsaRank * sdmaNumQueue + qid]. dst/src are raw VAs.
+cco_sdma_put_ptr_rsig = _ffi(
+    "cco_sdma_put_ptr_rsig__thread",
+    ["uint64", "int32", "uint64", "uint64", "uint64", "int32"],
+    "int32",
+)
+# Address of *my* signalBuf[src * sdmaNumQueue + qid] (a u64 counter), to poll.
+cco_sdma_signal_slot = _ffi(
+    "cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"
+)
+
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
 cco_lsa_ptr = _binding("lsa_ptr")
