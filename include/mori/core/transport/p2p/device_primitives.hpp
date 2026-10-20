@@ -56,67 +56,16 @@ using CombineInternalFp8 = uint8_t;
 /* ---------------------------------------------------------------------------------------------- */
 /*                                        Type Definitions                                        */
 /* ---------------------------------------------------------------------------------------------- */
+
+using VecU32x4 = uint32_t __attribute__((ext_vector_type(4)));
+// clang-format off
 template <int VecBytes>
-struct VecTypeSelector {
-  using type = void;
-};
-
-template <>
-struct VecTypeSelector<1> {
-  using dataType = uint8_t;
-};
-
-template <>
-struct VecTypeSelector<2> {
-  using dataType = uint16_t;
-};
-
-template <>
-struct VecTypeSelector<4> {
-  using dataType = uint32_t;
-};
-
-template <>
-struct VecTypeSelector<8> {
-  using dataType = uint64_t;
-};
-
-template <>
-struct VecTypeSelector<16> {
-  using dataType = ulong2;
-};
-
-template <typename T, int VecSize>
-struct VecTypeAdaptor {
-  using type = void;
-};
-
-template <>
-struct VecTypeAdaptor<float, 1> {
-  using dataType = float;
-};
-
-template <>
-struct VecTypeAdaptor<float, 2> {
-  using dataType = float2;
-};
-
-template <>
-struct VecTypeAdaptor<float, 4> {
-  using dataType = float4;
-};
-
-#ifdef MORI_HAS_OCP_FP
-template <>
-struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
-  using dataType = mori_fp4x2_e2m1;
-};
-
-template <>
-struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
-  using dataType = mori_fp4x4_e2m1;
-};
-#endif  // MORI_HAS_OCP_FP
+using VecTypeT = std::conditional_t<VecBytes == 1,  uint8_t,
+                 std::conditional_t<VecBytes == 2,  uint16_t,
+                 std::conditional_t<VecBytes == 4,  uint32_t,
+                 std::conditional_t<VecBytes == 8,  uint64_t,
+                 std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
+// clang-format on
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
@@ -124,134 +73,52 @@ struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
 #define USE_BUILDIN_LD 1
 #define USE_BUILDIN_ST 1
 
+namespace detail {
+
+template <typename T>
+__forceinline__ __device__ T* global(T* ptr) {
+  static_assert(!std::is_volatile<T>::value, "T must not be volatile");
+  return (T*)(T __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
+}
+}  // namespace detail
+
+template <int VecBytes>
+__forceinline__ __device__ VecTypeT<VecBytes> load(const void* p) {
+  auto ptr = detail::global(static_cast<const VecTypeT<VecBytes>*>(p));
 #if USE_BUILDIN_LD
-template <int VecBytes>
-__device__ __forceinline__ typename VecTypeSelector<VecBytes>::dataType load(const void* addr);
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<1>::dataType load<1>(const void* addr) {
-  return __builtin_nontemporal_load((uint8_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<2>::dataType load<2>(const void* addr) {
-  return __builtin_nontemporal_load((uint16_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<4>::dataType load<4>(const void* addr) {
-  return __builtin_nontemporal_load((uint32_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<8>::dataType load<8>(const void* addr) {
-  return __builtin_nontemporal_load((uint64_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<16>::dataType load<16>(const void* addr) {
-  ulong2 result;
-  result.x = __builtin_nontemporal_load((uint64_t*)addr);
-  result.y = __builtin_nontemporal_load(((uint64_t*)addr) + 1);
-  return result;
-}
+  return __builtin_nontemporal_load(ptr);
 #else
-template <int VecBytes>
-__device__ __forceinline__ typename VecTypeSelector<VecBytes>::dataType load(const void* addr);
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<1>::dataType load<1>(const void* addr) {
-  return *static_cast<const uint8_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<2>::dataType load<2>(const void* addr) {
-  return *static_cast<const uint16_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<4>::dataType load<4>(const void* addr) {
-  return *static_cast<const uint32_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<8>::dataType load<8>(const void* addr) {
-  return *static_cast<const uint64_t*>(addr);
-}
-
-template <>
-__device__ __forceinline__ typename VecTypeSelector<16>::dataType load<16>(const void* addr) {
-  const uint64_t* ptr = static_cast<const uint64_t*>(addr);
-  ulong2 result;
-  result.x = ptr[0];
-  result.y = ptr[1];
-  return result;
-}
+  return *ptr;
 #endif
+}
 
+template <int VecBytes>
+__forceinline__ __device__ void store(void* p, VecTypeT<VecBytes> v) {
+  auto ptr = detail::global(static_cast<VecTypeT<VecBytes>*>(p));
 #if USE_BUILDIN_ST
-template <int VecBytes>
-__device__ __forceinline__ void store(void* addr,
-                                      typename VecTypeSelector<VecBytes>::dataType value);
-
-template <>
-__device__ __forceinline__ void store<1>(void* addr, typename VecTypeSelector<1>::dataType value) {
-  __builtin_nontemporal_store(value, (uint8_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<2>(void* addr, typename VecTypeSelector<2>::dataType value) {
-  __builtin_nontemporal_store(value, (uint16_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<4>(void* addr, typename VecTypeSelector<4>::dataType value) {
-  __builtin_nontemporal_store(value, (uint32_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<8>(void* addr, typename VecTypeSelector<8>::dataType value) {
-  __builtin_nontemporal_store(value, (uint64_t*)addr);
-}
-
-template <>
-__device__ __forceinline__ void store<16>(void* addr,
-                                          typename VecTypeSelector<16>::dataType value) {
-  __builtin_nontemporal_store(value.x, (uint64_t*)addr);
-  __builtin_nontemporal_store(value.y, ((uint64_t*)addr) + 1);
-}
+  __builtin_nontemporal_store(v, ptr);
 #else
-template <int VecBytes>
-__device__ __forceinline__ void store(void* addr,
-                                      typename VecTypeSelector<VecBytes>::dataType value);
-
-template <>
-__device__ __forceinline__ void store<1>(void* addr, typename VecTypeSelector<1>::dataType value) {
-  *((uint8_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<2>(void* addr, typename VecTypeSelector<2>::dataType value) {
-  *((uint16_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<4>(void* addr, typename VecTypeSelector<4>::dataType value) {
-  *((uint32_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<8>(void* addr, typename VecTypeSelector<8>::dataType value) {
-  *((uint64_t*)addr) = value;
-}
-
-template <>
-__device__ __forceinline__ void store<16>(void* addr,
-                                          typename VecTypeSelector<16>::dataType value) {
-  *((uint64_t*)addr) = value.x;
-  *(((uint64_t*)addr) + 1) = value.y;
-}
+  *ptr = v;
 #endif
+}
+
+// Element j of a vector value holding sizeof(V) / sizeof(T) elements of type T.
+// Sub-dword elements are read through their containing dword: indexing a <4 x i32> value as
+// T[] becomes a <16 x i8> / <8 x i16> extractelement, which the backend lowers to a separate
+// shifted copy per element instead of an SDWA byte/word select on the loaded register. In
+// load-first gathers those copies stay live across every source and spill.
+template <typename T, typename V>
+__forceinline__ __device__ T VecElem(const V& v, int j) {
+  static_assert(sizeof(V) % sizeof(T) == 0, "V must hold a whole number of T");
+  if constexpr (sizeof(T) >= 4 || sizeof(V) < 4) {
+    return reinterpret_cast<const T*>(&v)[j];
+  } else {
+    constexpr int kPerDword = 4 / sizeof(T);
+    using Bits = std::conditional_t<sizeof(T) == 1, uint8_t, uint16_t>;
+    const uint32_t dword = reinterpret_cast<const uint32_t*>(&v)[j / kPerDword];
+    return __builtin_bit_cast(T, static_cast<Bits>(dword >> (8 * sizeof(T) * (j % kPerDword))));
+  }
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                              Copy                                              */
@@ -277,7 +144,7 @@ inline __device__ void WarpCopyImpl(T* __restrict__ dst, const T* __restrict__ s
                                     size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
   int laneId = threadIdx.x & (warpSize - 1);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
 
   const int elemsPerWarp = Unroll * warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -339,7 +206,7 @@ inline __device__ void BlockCopyImpl(T* __restrict__ dst, const T* __restrict__ 
 
   const int threadId = FlatBlockThreadId();
   const int blockSize = FlatBlockSize();
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
 
   const size_t elemsPerBlock = static_cast<size_t>(Unroll) * blockSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerBlock;
@@ -500,7 +367,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
   const int laneId = threadIdx.x & (warpSize - 1);
   size_t offset = 0;
 
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
   const size_t laneOffset = laneId * vecSize;
@@ -535,7 +402,7 @@ __forceinline__ __device__ void WarpAccumDynamic(T* __restrict__ dest, T* const*
         float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVal)[j]) * srcScale;
+          accumValFp32[j] += AccumFp32Type(VecElem<T>(srcVal, j)) * srcScale;
         }
       }
     }
@@ -574,7 +441,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
                                               const float* __restrict__ srcScales, size_t& offset,
                                               size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
 
   const int elemsPerWarp = Unroll * warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -590,7 +457,11 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
 
   for (size_t iter = 0; iter < numIters; iter++) {
-    AccumFp32Type accumValFp32[Unroll][vecSize] = {0};
+    AccumFp32Type accumValFp32[Unroll][vecSize];
+#pragma unroll Unroll
+    for (int u = 0; u < Unroll; ++u)
+#pragma unroll vecSize
+      for (int j = 0; j < vecSize; ++j) accumValFp32[u][j] = AccumFp32Type{0};
 
 #pragma unroll AccumNum
     for (int i = 0; i < AccumNum; ++i) {
@@ -603,7 +474,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
         float srcScale = (srcScales == nullptr) ? 1.0f : srcScales[i];
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&srcVals)[j]) * srcScale;
+          accumValFp32[u][j] += AccumFp32Type(VecElem<T>(srcVals, j)) * srcScale;
         }
       }
     }
@@ -630,7 +501,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
                                               const float* __restrict__ srcScales, size_t& offset,
                                               size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
 
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -663,7 +534,7 @@ __forceinline__ __device__ void WarpAccumImpl(T* __restrict__ dest, T* const* __
       if (cached_srcs[i] != nullptr) {
 #pragma unroll vecSize
         for (int j = 0; j < vecSize; ++j) {
-          accumValFp32[j] += AccumFp32Type(reinterpret_cast<const T*>(srcVals + i)[j]) * scales[i];
+          accumValFp32[j] += AccumFp32Type(VecElem<T>(srcVals[i], j)) * scales[i];
         }
       }
     }
@@ -689,7 +560,7 @@ __forceinline__ __device__ void WarpAccumPipelineImpl(T* __restrict__ dest,
                                                       const float* __restrict__ srcScales,
                                                       size_t& offset, size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
 
   const int elemsPerWarp = warpSize * vecSize;
   const size_t numIters = (nelems - offset) / elemsPerWarp;
@@ -834,6 +705,124 @@ __forceinline__ __device__ void WarpAccum(T* __restrict__ dest, T* const* __rest
 #undef WARP_ACCUM_CASE
 }
 
+// E4M3 element types whose float conversions WarpAccumLFImpl does two at a time with the packed
+// cvt builtins. The per-element conversions of __hip_fp8_e4m3(_fnuz) spend one cvt per byte and
+// then reassemble the bytes, which on gfx950 is ~3x the VALU of the accumulation it feeds.
+template <typename T>
+inline constexpr bool kWarpAccumPackedFp8 =
+#if HIP_FP8_CVT_FAST_PATH
+#if defined(MORI_FP8_TYPE_OCP_ENABLED)
+    std::is_same_v<T, __hip_fp8_e4m3> ||
+#endif
+#if defined(MORI_FP8_TYPE_FNUZ_ENABLED)
+    std::is_same_v<T, __hip_fp8_e4m3_fnuz> ||
+#endif
+#endif
+    false;
+
+// hip_bfloat16(float) rounds in software (~5 VALU per element); gfx950 has v_cvt_pk_bf16_f32,
+// which rounds the same way (RNE) two at a time. gfx942 has no such instruction. Only NaN payload
+// bits can differ from the software path.
+template <typename T>
+inline constexpr bool kWarpAccumPackedBf16 =
+#if defined(__gfx950__)
+    std::is_same_v<T, hip_bfloat16> ||
+#endif
+    false;
+
+// mori_fp4x2_e2m1 already converts with the packed gfx950 cvts, but always through byte 0 of a
+// register, so every byte is shifted into and out of place. The byte-select operands of the same
+// cvts address the byte where it is, which gives the same bits without the shifts.
+template <typename T>
+inline constexpr bool kWarpAccumPackedFp4 =
+#if defined(__gfx950__) && defined(MORI_HAS_OCP_FP) && MORI_FP4_HW_CVT
+    std::is_same_v<T, mori_fp4x2_e2m1> ||
+#endif
+    false;
+
+#if HIP_FP8_CVT_FAST_PATH
+// Same saturation as the __HIP_SATFINITE float -> fp8 conversion of the HIP type: finite values
+// clamp to the largest finite fp8, NaN and Inf are passed to the cvt unclamped. Keeping it exact is
+// what makes the packed path bit-identical to T(float).
+template <typename T>
+__device__ __forceinline__ float SatFiniteForFp8(float v) {
+  constexpr float kMax = (T::__default_interpret == __HIP_E4M3_FNUZ) ? 240.0f : 448.0f;
+  return ((__float_as_uint(v) & 0x7F800000u) != 0x7F800000u)
+             ? __builtin_amdgcn_fmed3f(v, kMax, -kMax)
+             : v;
+}
+#endif
+
+template <typename T>
+inline constexpr bool kWarpAccumPackedDecode =
+    kWarpAccumPackedFp8<T> || kWarpAccumPackedFp4<T>;// || std::is_same_v<T, hip_bfloat16>;
+template <typename T>
+inline constexpr bool kWarpAccumPackedEncode =
+    kWarpAccumPackedFp8<T> || kWarpAccumPackedFp4<T>;// || kWarpAccumPackedBf16<T>;
+
+// acc[j] += element j of the VecBytes-wide source w, times scale. Element j is the j-th T, so for
+// fp4x2 one acc entry (a float2) is one byte.
+template <typename T, int VecBytes, typename AccT>
+__device__ __forceinline__ void WarpAccumPackedDecode(AccT* acc, const uint32_t* w, float scale) {
+#pragma unroll
+  for (int k = 0; k < VecBytes / 4; ++k) {
+    if constexpr (std::is_same_v<T, hip_bfloat16>) {
+      // bf16 is the top half of an f32, so both halves of a dword widen exactly with one op each.
+      acc[2 * k + 0] += __uint_as_float(w[k] << 16) * scale;
+      acc[2 * k + 1] += __uint_as_float(w[k] & 0xFFFF0000u) * scale;
+    }
+#if HIP_FP8_CVT_FAST_PATH
+    if constexpr (kWarpAccumPackedFp8<T>) {
+      const auto lo = __builtin_amdgcn_cvt_pk_f32_fp8(w[k], false);
+      const auto hi = __builtin_amdgcn_cvt_pk_f32_fp8(w[k], true);
+      acc[4 * k + 0] += lo[0] * scale;
+      acc[4 * k + 1] += lo[1] * scale;
+      acc[4 * k + 2] += hi[0] * scale;
+      acc[4 * k + 3] += hi[1] * scale;
+    }
+#endif
+#ifdef MORI_HAS_OCP_FP
+    if constexpr (kWarpAccumPackedFp4<T>) {
+      acc[4 * k + 0] += fp4x2_to_float2<0>(w[k]) * scale;
+      acc[4 * k + 1] += fp4x2_to_float2<1>(w[k]) * scale;
+      acc[4 * k + 2] += fp4x2_to_float2<2>(w[k]) * scale;
+      acc[4 * k + 3] += fp4x2_to_float2<3>(w[k]) * scale;
+    }
+#endif
+  }
+}
+
+// One output dword of T from the accumulators of its 4 / sizeof(T) elements; the packed
+// counterpart of T(acc[j]) for each of them.
+template <typename T, typename AccT>
+__device__ __forceinline__ uint32_t WarpAccumPackedEncodeWord(const AccT* acc) {
+  uint32_t word = 0;
+#if HIP_FP8_CVT_FAST_PATH
+  if constexpr (kWarpAccumPackedFp8<T>) {
+    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFiniteForFp8<T>(acc[0]), SatFiniteForFp8<T>(acc[1]),
+                                           word, false);
+    word = __builtin_amdgcn_cvt_pk_fp8_f32(SatFiniteForFp8<T>(acc[2]), SatFiniteForFp8<T>(acc[3]),
+                                           word, true);
+  }
+#endif
+#if defined(__gfx950__)
+  if constexpr (kWarpAccumPackedBf16<T>) {
+    typedef float F32x2 __attribute__((ext_vector_type(2)));
+    typedef __bf16 Bf16x2 __attribute__((ext_vector_type(2)));
+    word = __builtin_bit_cast(uint32_t, __builtin_convertvector((F32x2){acc[0], acc[1]}, Bf16x2));
+  }
+#endif
+#ifdef MORI_HAS_OCP_FP
+  if constexpr (kWarpAccumPackedFp4<T>) {
+    word = float2_to_fp4x2<0>(word, acc[0]);
+    word = float2_to_fp4x2<1>(word, acc[1]);
+    word = float2_to_fp4x2<2>(word, acc[2]);
+    word = float2_to_fp4x2<3>(word, acc[3]);
+  }
+#endif
+  return word;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                        Load-first + unroll combine gather (v2-style)                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -848,13 +837,10 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
                                                 const float* __restrict__ srcScales, size_t& offset,
                                                 size_t nelems) {
   constexpr int vecSize = VecBytes / sizeof(T);
-  using DataType = typename VecTypeSelector<VecBytes>::dataType;
+  using DataType = VecTypeT<VecBytes>;
   using AccumFp32Type = std::conditional_t<std::is_same_v<T, mori_fp4x2_e2m1>, float2, float>;
-
+  constexpr int elemsPerWarp = Unroll * warpSize * vecSize;
   const int laneId = threadIdx.x & (warpSize - 1);
-  const size_t laneOffset = laneId * vecSize;
-  const int elemsPerWarp = Unroll * warpSize * vecSize;
-  const size_t numIters = (nelems - offset) / elemsPerWarp;
 
   float scales[AccumNum];
   const T* csrcs[AccumNum];
@@ -864,15 +850,15 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
     csrcs[i] = srcs[i];
   }
 
-  for (size_t iter = 0; iter < numIters; ++iter) {
+  for(; offset + elemsPerWarp <= nelems; offset += elemsPerWarp) {
     DataType vals[Unroll][AccumNum];
     // Load-first: issue every load before touching the accumulators.
 #pragma unroll Unroll
     for (int u = 0; u < Unroll; ++u) {
 #pragma unroll AccumNum
       for (int i = 0; i < AccumNum; ++i) {
-        if (csrcs[i] != nullptr)
-          vals[u][i] = load<VecBytes>(csrcs[i] + offset + laneOffset + u * warpSize * vecSize);
+        const size_t ofs = offset + (laneId + u * warpSize) * vecSize;
+        vals[u][i] = csrcs[i] != nullptr ? load<VecBytes>(csrcs[i] + ofs) : DataType{0};
       }
     }
 
@@ -887,24 +873,40 @@ __forceinline__ __device__ void WarpAccumLFImpl(T* __restrict__ dest, T* const* 
 #pragma unroll AccumNum
       for (int i = 0; i < AccumNum; ++i) {
         if (csrcs[i] == nullptr) continue;
+        if constexpr (kWarpAccumPackedDecode<T>) {
+          WarpAccumPackedDecode<T, VecBytes>(acc[u], reinterpret_cast<const uint32_t*>(&vals[u][i]),
+                                             scales[i]);
+        } else {
 #pragma unroll vecSize
-        for (int j = 0; j < vecSize; ++j)
-          acc[u][j] += AccumFp32Type(reinterpret_cast<const T*>(&vals[u][i])[j]) * scales[i];
-      }
-    }
+          for (int j = 0; j < vecSize; ++j) {
+            acc[u][j] += AccumFp32Type(VecElem<T>(vals[u][i], j)) * scales[i];
+          }
+        }
+      } // for AccumNum
+    } // for Unroll
 
     union {
       DataType outVec[Unroll];
       T outVal[Unroll][vecSize];
+      uint32_t outWord[Unroll][VecBytes / 4];
     };
 #pragma unroll Unroll
     for (int u = 0; u < Unroll; ++u) {
+      if constexpr (kWarpAccumPackedEncode<T>) {
+#pragma unroll
+        for (int k = 0; k < VecBytes / 4; ++k) {
+          outWord[u][k] = WarpAccumPackedEncodeWord<T>(&acc[u][k * (4 / sizeof(T))]);
+        }
+      } else {
 #pragma unroll vecSize
-      for (int j = 0; j < vecSize; ++j) outVal[u][j] = T(acc[u][j]);
-      store<VecBytes>(dest + offset + laneOffset + u * warpSize * vecSize, outVec[u]);
-    }
-    offset += elemsPerWarp;
-  }
+        for (int j = 0; j < vecSize; ++j) {
+          outVal[u][j] = T(acc[u][j]);
+        }
+      }
+      const size_t ofs = offset + (laneId + u * warpSize) * vecSize;
+      store<VecBytes>(dest + ofs, outVec[u]);
+    } // for Unroll
+  } // for offset += elemsPerWarp
 }
 
 // Unroll is a template parameter so a caller can override it without changing
@@ -1002,17 +1004,8 @@ __device__ __forceinline__ uint32_t SubwarpAllReduceMaxU32(uint32_t val) {
 // Float32 (IEEE 754): 1 sign + 8 exp + 23 mantissa
 // BFloat16: 1 sign + 8 exp + 7 mantissa
 // Bf16BitsToF32 is faster than __bfloat162float
-__device__ __forceinline__ float BitCastU32ToF32(uint32_t u) {
-  union {
-    uint32_t u32;
-    float f32;
-  } tmp;
-  tmp.u32 = u;
-  return tmp.f32;
-}
-
 __device__ __forceinline__ float Bf16BitsToF32(uint16_t bf16_bits) {
-  return BitCastU32ToF32(static_cast<uint32_t>(bf16_bits) << 16);
+  return __uint_as_float(static_cast<uint32_t>(bf16_bits) << 16);
 }
 
 template <typename Fp8T>
@@ -1092,152 +1085,59 @@ __device__ __forceinline__ uint16_t Bf16AbsBits(uint16_t bits) {
 }
 
 template <int InVecBytes>
-struct Bf16Vec;
+struct Bf16Vec {
+  static_assert(InVecBytes == 4 || InVecBytes == 8 || InVecBytes == 16);
 
-template <>
-struct Bf16Vec<4> {
-  using LoadT = uint32_t;
-  static constexpr int kElems = 2;
+  using LoadT = VecTypeT<InVecBytes>;
+  using StoreT = VecTypeT<InVecBytes / 2>;
+  static constexpr int kElems = InVecBytes / sizeof(uint16_t);
+  static constexpr int kPairs = kElems / 2;
 
   __device__ __forceinline__ static uint32_t MaxAbsBits(LoadT packed) {
-    const uint16_t lo = Bf16AbsBits(static_cast<uint16_t>(packed & 0xFFFF));
-    const uint16_t hi = Bf16AbsBits(static_cast<uint16_t>(packed >> 16));
-    return static_cast<uint32_t>((lo > hi) ? lo : hi);
+    union {
+      LoadT load;
+      uint16_t bits[kElems];
+    } in = {packed};
+
+    uint16_t umax[kElems];
+#pragma unroll
+    for (int i = 0; i < kElems; ++i) {
+      umax[i] = Bf16AbsBits(in.bits[i]);
+    }
+    // Tree reduction to find the maximum absolute value
+#pragma unroll
+    for (int width = kElems; width > 1; width >>= 1) {
+#pragma unroll
+      for (int i = 0; i < width / 2; ++i) {
+        umax[i] = (umax[i] > umax[i + width / 2]) ? umax[i] : umax[i + width / 2];
+      }
+    }
+    return umax[0];
   }
 
   template <typename Fp8T>
   __device__ __forceinline__ static void QuantizeStore(__hip_fp8_storage_t* __restrict__ dstBytes,
                                                        int idx, LoadT packed, float invScale) {
-    float2 v;
-    if (invScale == 1.0f) {
-      v.x = Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF));
-      v.y = Bf16BitsToF32(static_cast<uint16_t>(packed >> 16));
-    } else {
-      v.x = Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF)) * invScale;
-      v.y = Bf16BitsToF32(static_cast<uint16_t>(packed >> 16)) * invScale;
+    union {
+      LoadT load;
+      uint16_t bits[kElems];
+    } in = {packed};
+    union {
+      StoreT store;
+      uint16_t pairs[kPairs];
+    } out{};
+
+#pragma unroll
+    for (int i = 0; i < kPairs; ++i) {
+      // Unconditional scale by the inverse scale to avoid branching even if
+      // the inverse scale is 1.0f. This avoids v_cmp_neq_f32 and v_cndmask_b32.
+      float2 values{
+          Bf16BitsToF32(in.bits[2 * i]) * invScale,
+          Bf16BitsToF32(in.bits[2 * i + 1]) * invScale,
+      };
+      out.pairs[i] = static_cast<uint16_t>(CvtFloat2ToFp8x2<Fp8T>(values));
     }
-    __hip_fp8x2_storage_t fp8 = CvtFloat2ToFp8x2<Fp8T>(v);
-    store<2>(dstBytes + idx, static_cast<uint16_t>(fp8));
-  }
-};
-
-template <>
-struct Bf16Vec<8> {
-  using LoadT = uint64_t;
-  static constexpr int kElems = 4;
-
-  __device__ __forceinline__ static uint32_t MaxAbsBits(LoadT packed) {
-    const uint16_t b0 = Bf16AbsBits(static_cast<uint16_t>(packed & 0xFFFF));
-    const uint16_t b1 = Bf16AbsBits(static_cast<uint16_t>((packed >> 16) & 0xFFFF));
-    const uint16_t b2 = Bf16AbsBits(static_cast<uint16_t>((packed >> 32) & 0xFFFF));
-    const uint16_t b3 = Bf16AbsBits(static_cast<uint16_t>((packed >> 48) & 0xFFFF));
-    const uint16_t m01 = (b0 > b1) ? b0 : b1;
-    const uint16_t m23 = (b2 > b3) ? b2 : b3;
-    return static_cast<uint32_t>((m01 > m23) ? m01 : m23);
-  }
-
-  template <typename Fp8T>
-  __device__ __forceinline__ static void QuantizeStore(__hip_fp8_storage_t* __restrict__ dstBytes,
-                                                       int idx, LoadT packed, float invScale) {
-    const uint16_t b0 = static_cast<uint16_t>(packed & 0xFFFF);
-    const uint16_t b1 = static_cast<uint16_t>((packed >> 16) & 0xFFFF);
-    const uint16_t b2 = static_cast<uint16_t>((packed >> 32) & 0xFFFF);
-    const uint16_t b3 = static_cast<uint16_t>((packed >> 48) & 0xFFFF);
-
-    float2 v01;
-    float2 v23;
-    if (invScale == 1.0f) {
-      v01.x = Bf16BitsToF32(b0);
-      v01.y = Bf16BitsToF32(b1);
-      v23.x = Bf16BitsToF32(b2);
-      v23.y = Bf16BitsToF32(b3);
-    } else {
-      v01.x = Bf16BitsToF32(b0) * invScale;
-      v01.y = Bf16BitsToF32(b1) * invScale;
-      v23.x = Bf16BitsToF32(b2) * invScale;
-      v23.y = Bf16BitsToF32(b3) * invScale;
-    }
-
-    const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(v01);
-    const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(v23);
-    const uint32_t packedFp8 = static_cast<uint32_t>(static_cast<uint16_t>(fp8_01)) |
-                               (static_cast<uint32_t>(static_cast<uint16_t>(fp8_23)) << 16);
-    store<4>(dstBytes + idx, packedFp8);
-  }
-};
-
-template <>
-struct Bf16Vec<16> {
-  using LoadT = ulong2;
-  static constexpr int kElems = 8;
-
-  __device__ __forceinline__ static uint32_t MaxAbsBits(LoadT packed) {
-    const uint64_t p0 = packed.x;
-    const uint64_t p1 = packed.y;
-    const uint16_t b0 = Bf16AbsBits(static_cast<uint16_t>(p0 & 0xFFFF));
-    const uint16_t b1 = Bf16AbsBits(static_cast<uint16_t>((p0 >> 16) & 0xFFFF));
-    const uint16_t b2 = Bf16AbsBits(static_cast<uint16_t>((p0 >> 32) & 0xFFFF));
-    const uint16_t b3 = Bf16AbsBits(static_cast<uint16_t>((p0 >> 48) & 0xFFFF));
-    const uint16_t b4 = Bf16AbsBits(static_cast<uint16_t>(p1 & 0xFFFF));
-    const uint16_t b5 = Bf16AbsBits(static_cast<uint16_t>((p1 >> 16) & 0xFFFF));
-    const uint16_t b6 = Bf16AbsBits(static_cast<uint16_t>((p1 >> 32) & 0xFFFF));
-    const uint16_t b7 = Bf16AbsBits(static_cast<uint16_t>((p1 >> 48) & 0xFFFF));
-    uint16_t m01 = (b0 > b1) ? b0 : b1;
-    uint16_t m23 = (b2 > b3) ? b2 : b3;
-    uint16_t m45 = (b4 > b5) ? b4 : b5;
-    uint16_t m67 = (b6 > b7) ? b6 : b7;
-    uint16_t m0123 = (m01 > m23) ? m01 : m23;
-    uint16_t m4567 = (m45 > m67) ? m45 : m67;
-    return static_cast<uint32_t>((m0123 > m4567) ? m0123 : m4567);
-  }
-
-  template <typename Fp8T>
-  __device__ __forceinline__ static void QuantizeStore(__hip_fp8_storage_t* __restrict__ dstBytes,
-                                                       int idx, LoadT packed, float invScale) {
-    const uint64_t p0 = packed.x;
-    const uint64_t p1 = packed.y;
-    const uint16_t b0 = static_cast<uint16_t>(p0 & 0xFFFF);
-    const uint16_t b1 = static_cast<uint16_t>((p0 >> 16) & 0xFFFF);
-    const uint16_t b2 = static_cast<uint16_t>((p0 >> 32) & 0xFFFF);
-    const uint16_t b3 = static_cast<uint16_t>((p0 >> 48) & 0xFFFF);
-    const uint16_t b4 = static_cast<uint16_t>(p1 & 0xFFFF);
-    const uint16_t b5 = static_cast<uint16_t>((p1 >> 16) & 0xFFFF);
-    const uint16_t b6 = static_cast<uint16_t>((p1 >> 32) & 0xFFFF);
-    const uint16_t b7 = static_cast<uint16_t>((p1 >> 48) & 0xFFFF);
-
-    float2 v01;
-    float2 v23;
-    float2 v45;
-    float2 v67;
-    if (invScale == 1.0f) {
-      v01.x = Bf16BitsToF32(b0);
-      v01.y = Bf16BitsToF32(b1);
-      v23.x = Bf16BitsToF32(b2);
-      v23.y = Bf16BitsToF32(b3);
-      v45.x = Bf16BitsToF32(b4);
-      v45.y = Bf16BitsToF32(b5);
-      v67.x = Bf16BitsToF32(b6);
-      v67.y = Bf16BitsToF32(b7);
-    } else {
-      v01.x = Bf16BitsToF32(b0) * invScale;
-      v01.y = Bf16BitsToF32(b1) * invScale;
-      v23.x = Bf16BitsToF32(b2) * invScale;
-      v23.y = Bf16BitsToF32(b3) * invScale;
-      v45.x = Bf16BitsToF32(b4) * invScale;
-      v45.y = Bf16BitsToF32(b5) * invScale;
-      v67.x = Bf16BitsToF32(b6) * invScale;
-      v67.y = Bf16BitsToF32(b7) * invScale;
-    }
-
-    const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(v01);
-    const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(v23);
-    const __hip_fp8x2_storage_t fp8_45 = CvtFloat2ToFp8x2<Fp8T>(v45);
-    const __hip_fp8x2_storage_t fp8_67 = CvtFloat2ToFp8x2<Fp8T>(v67);
-    const uint64_t packedFp8 = static_cast<uint64_t>(static_cast<uint16_t>(fp8_01)) |
-                               (static_cast<uint64_t>(static_cast<uint16_t>(fp8_23)) << 16) |
-                               (static_cast<uint64_t>(static_cast<uint16_t>(fp8_45)) << 32) |
-                               (static_cast<uint64_t>(static_cast<uint16_t>(fp8_67)) << 48);
-    store<8>(dstBytes + idx, packedFp8);
+    store<InVecBytes / 2>(dstBytes + idx, out.store);
   }
 };
 
@@ -1599,45 +1499,18 @@ __device__ __forceinline__ void WarpQuantizeToFp8Blockwise(Fp8T* __restrict__ ds
 namespace detail {
 
 template <int VecBytes>
-struct Fp8ByteVec;
-
-template <>
-struct Fp8ByteVec<4> {
-  using LoadT = uint32_t;
-  static constexpr int kSegs = 1;
-
-  template <int Seg>
-  __device__ __forceinline__ static uint32_t SegU32(LoadT v) {
-    static_assert(Seg == 0);
-    return v;
-  }
-};
-
-template <>
-struct Fp8ByteVec<8> {
-  using LoadT = uint64_t;
-  static constexpr int kSegs = 2;
+struct Fp8ByteVec {
+  using LoadT = VecTypeT<VecBytes>;
+  static constexpr int kSegs = VecBytes / 4;
 
   template <int Seg>
   __device__ __forceinline__ static uint32_t SegU32(LoadT v) {
     static_assert(Seg >= 0 && Seg < kSegs);
-    if constexpr (Seg == 0) return static_cast<uint32_t>(v & 0xFFFFFFFFu);
-    return static_cast<uint32_t>(v >> 32);
-  }
-};
-
-template <>
-struct Fp8ByteVec<16> {
-  using LoadT = ulong2;
-  static constexpr int kSegs = 4;
-
-  template <int Seg>
-  __device__ __forceinline__ static uint32_t SegU32(LoadT v) {
-    static_assert(Seg >= 0 && Seg < kSegs);
-    if constexpr (Seg == 0) return static_cast<uint32_t>(v.x & 0xFFFFFFFFull);
-    if constexpr (Seg == 1) return static_cast<uint32_t>(v.x >> 32);
-    if constexpr (Seg == 2) return static_cast<uint32_t>(v.y & 0xFFFFFFFFull);
-    return static_cast<uint32_t>(v.y >> 32);
+    union {
+      LoadT raw;
+      uint32_t u32[kSegs];
+    } in = {v};
+    return in.u32[Seg];
   }
 };
 
@@ -2846,19 +2719,15 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
 #pragma unroll 4
       for (int j = laneId * kVec8; j < vecEnd8; j += warpSize * kVec8) {
         union {
-          ulong2 u64x2;
-          uint32_t u32[4];
+          VecU32x4 u32x4;
+          uint16_t u16[8];
         } in;
-        in.u64x2 = load<16>(srcAligned + j);
+        in.u32x4 = load<16>(srcAligned + j);
 
-        const __hip_bfloat162_raw bf01{static_cast<unsigned short>(in.u32[0]),
-                                       static_cast<unsigned short>(in.u32[0] >> 16)};
-        const __hip_bfloat162_raw bf23{static_cast<unsigned short>(in.u32[1]),
-                                       static_cast<unsigned short>(in.u32[1] >> 16)};
-        const __hip_bfloat162_raw bf45{static_cast<unsigned short>(in.u32[2]),
-                                       static_cast<unsigned short>(in.u32[2] >> 16)};
-        const __hip_bfloat162_raw bf67{static_cast<unsigned short>(in.u32[3]),
-                                       static_cast<unsigned short>(in.u32[3] >> 16)};
+        const __hip_bfloat162_raw bf01{in.u16[0], in.u16[1]};
+        const __hip_bfloat162_raw bf23{in.u16[2], in.u16[3]};
+        const __hip_bfloat162_raw bf45{in.u16[4], in.u16[5]};
+        const __hip_bfloat162_raw bf67{in.u16[6], in.u16[7]};
 
         const __hip_fp8x2_storage_t fp01 = __hip_cvt_bfloat16raw2_to_fp8x2(
             bf01, Fp8x4T::__default_saturation, Fp8x4T::__default_interpret);
@@ -2988,9 +2857,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed(
       const uint32_t u45 = static_cast<uint32_t>(bf45r.x) | (static_cast<uint32_t>(bf45r.y) << 16);
       const uint32_t u67 = static_cast<uint32_t>(bf67r.x) | (static_cast<uint32_t>(bf67r.y) << 16);
 
-      const ulong2 packedOut{(static_cast<uint64_t>(u01) | (static_cast<uint64_t>(u23) << 32)),
-                             (static_cast<uint64_t>(u45) | (static_cast<uint64_t>(u67) << 32))};
-      store<16>(outAligned + j, packedOut);
+      store<16>(outAligned + j, VecTypeT<16>{u01, u23, u45, u67});
     }
 
     if (vecEnd8 < vecEnd4) {
