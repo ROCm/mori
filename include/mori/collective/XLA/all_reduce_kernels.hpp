@@ -105,8 +105,8 @@ template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                     T* __restrict__ output, uint32_t* __restrict__ groupCounters,
-                    size_t chunkElems, mori::cco::ccoDevComm devComm,
-                    T* __restrict__ staging, mori::cco::ccoWindow_t heapWin,
+                    size_t chunkElems, cco::ccoDevComm devComm,
+                    T* __restrict__ staging, cco::ccoWindow_t heapWin,
                     uint64_t* __restrict__ barrierCtr) {
 
   // My reduced shard lives in output slot myPe.
@@ -127,14 +127,12 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // until peers scatter to me, which needs my arrival. The previous launch's
       // counts are visible across the kernel boundary.
       for (uint32_t b = 0; b < 2; b++) {
-        flagEpoch[b] = __hip_atomic_load(cco::impl::global(bcastFlag(b)), __ATOMIC_RELAXED,
-                                         __HIP_MEMORY_SCOPE_SYSTEM) + gridDim.x;
+        flagEpoch[b] = AtomicLoad<ESystemScope>(bcastFlag(b)) + gridDim.x;
       }
       // Blocks of this launch read the b=1 target only after their last slice
       // wait, which is causally behind the barrier below; the release fence
       // orders this store before my arrival.
-      __hip_atomic_store(&groupCounters[kBcastTargetIdx], flagEpoch[1], __ATOMIC_RELAXED,
-                         __HIP_MEMORY_SCOPE_AGENT);
+      AtomicStore<EAgentScope>(&groupCounters[kBcastTargetIdx], flagEpoch[1]);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     }
     // Gate on every PE entering this launch: staging/signalBuf are shared with
@@ -227,8 +225,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
         const uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         if (b == 1) {
-          ownsTail = (old + 1 == __hip_atomic_load(&groupCounters[kBcastTargetIdx],
-                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT));
+          ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCounters[kBcastTargetIdx]));
         }
       }
     }
@@ -253,17 +250,17 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // thread here reads the slices peers DMA'd into output, and whoever consumes
   // them acquires at its own kernel boundary.
   if (threadIdx.x == 0 && ownsTail) {
-    StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kSliceSignalSlot], 0);
+    AtomicStore<ESystemScope>(&signalBuf[kSliceSignalSlot], 0UL);
     const uint32_t want = static_cast<uint32_t>(npes - 1);  // no self-copy
-    auto* addr = cco::impl::global(&signalBuf[kBcastSlot]);
+    auto* addr = &signalBuf[kBcastSlot];
     auto done = [=](uint64_t v) {
       return SliceSignalCount(v, 1) >= want && (S == 1 || SliceSignalCount(v, 0) >= want);
     };
-    while (!done(__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))) {
+    while (!done(AtomicLoad<EAgentScope>(addr))) {
       __builtin_amdgcn_s_sleep(1);
     }
     // System scope again: peers ADD into this slot from their Phase 4.
-    StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[kBcastSlot], 0);
+    AtomicStore<ESystemScope>(&signalBuf[kBcastSlot], 0UL);
   }
 }
 
@@ -305,7 +302,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 //                   collective (see GenBarrier).
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
-AllReducePullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
+AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
                     const T* __restrict__ input, T* __restrict__ output,
                     size_t chunkElems, uint32_t* __restrict__ groupCounters,
                     uint64_t* __restrict__ arrived) {
@@ -353,7 +350,7 @@ AllReducePullKernel(int myPe, mori::cco::ccoWindow_t heapWin,
   if (threadIdx.x < warpSize) {
     uint32_t last = 0;
     if (threadIdx.x == 0) {
-      last = atomicInc(&groupCounters[0], gridDim.x - 1) == gridDim.x - 1;
+      last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
     }
     if (BroadcastWarp(last, 0)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
   }

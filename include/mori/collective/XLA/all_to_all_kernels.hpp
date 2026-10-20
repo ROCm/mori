@@ -57,8 +57,8 @@ namespace collective {
 // blockDim.x must be >= npes for the fast-path packet build; launch <<<1, 256>>>
 // with npes <= 8 (SDMA fast path).
 __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __restrict__ pairs,
-                                   size_t chunkBytes, mori::cco::ccoDevComm devComm,
-                                   mori::cco::ccoWindow_t heapWin,
+                                   size_t chunkBytes, cco::ccoDevComm devComm,
+                                   cco::ccoWindow_t heapWin,
                                    uint64_t* __restrict__ barrierCtr) {
   const uint32_t stride4G = heapWin->stride4G;
   // A peer finishing its previous launch only proves our chunk reached it; gate
@@ -115,7 +115,7 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   // only ADDs here after passing its entry GenBarrier, which needs us to have
   // entered that launch too, i.e. after this kernel has retired.
   if (threadIdx.x == 0) {
-    StreamStore<ESystemScope, sizeof(uint64_t)>(&signalBuf[0], 0);
+    AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
 }
 } // namespace collective
