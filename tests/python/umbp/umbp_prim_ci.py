@@ -515,10 +515,8 @@ class Deployment:
         ready_timeout: float,
         backends: list[Backend] | None = None,
         ssd_staging_slots: int = 0,
-        ssd_staging_bytes: int = 0,
     ):
         self.ssd_staging_slots = ssd_staging_slots
-        self.ssd_staging_bytes = ssd_staging_bytes
         self.backends = backends or [Backend("dram", 100.0)]
         self.arm = arm
         self.with_master = arm == "master"
@@ -595,19 +593,12 @@ class Deployment:
     def _staging_env(self) -> dict:
         """Size the SSD read-staging arena for the batches actually issued.
 
-        A Resolve reserves one arena page per key IN THE WHOLE CALL, and if it
-        cannot get them all it rolls the reservation back and fails every key
-        with "staging arena busy" -- which surfaces as `seed put failed`, not
-        as anything mentioning staging.  The default arena is 16 slots, so a
-        default 128-key batch cannot ever succeed.  Slots must therefore scale
-        with the batch, and each slot must be at least one whole object (the
-        buffer is divided evenly among them).
+        Concurrent ranks each stage a whole batch, so slots scale with it.
         """
         if not self.ssd_staging_slots:
             return {}
         return {
             "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS": str(self.ssd_staging_slots),
-            "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE": str(self.ssd_staging_bytes),
         }
 
     def _media_env(self) -> dict:
@@ -870,16 +861,10 @@ def passes_for(args) -> list[Pass]:
     return out
 
 
-def ssd_staging(args) -> tuple[int, int]:
-    """(slots, bytes) for the SSD staging arena, from the widest call issued."""
-    specs = passes_for(args)
-    widest = max(p.batch for p in specs)
-    biggest = max(p.object_bytes for p in specs)
-    slot = max(args.page_bytes, biggest)
-    # 4x the widest call, so the ranks running concurrently are not each
-    # waiting on the last one to release before their own batch can reserve.
-    slots = max(64, widest * 4)
-    return slots, slots * slot
+def ssd_staging_slots(args) -> int:
+    """SSD staging pages: 4x the widest call, for the ranks running concurrently."""
+    widest = max(p.batch for p in passes_for(args))
+    return max(64, widest * 4)
 
 
 def pool_bytes(args, headroom: float) -> int:
@@ -912,7 +897,7 @@ def run_arm(arm: str, args, run_dir: Path, dram: int) -> dict:
         ),
         ready_timeout=args.ready_timeout,
         backends=args.backends,
-        **dict(zip(("ssd_staging_slots", "ssd_staging_bytes"), ssd_staging(args))),
+        ssd_staging_slots=ssd_staging_slots(args),
     ) as deploy:
         for spec in passes_for(args):
             path = run_dir / f"{arm}_{spec.name.replace('@', '_')}.json"

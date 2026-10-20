@@ -63,8 +63,8 @@ class PeerSsdManagerTest : public ::testing::Test {
     return cfg;
   }
 
-  static std::vector<std::pair<const void*, size_t>> OneSegment(const std::string& s) {
-    return {{s.data(), s.size()}};
+  static bool Put(PeerSsdManager& mgr, const std::string& key, const std::string& value) {
+    return mgr.WriteBatch({key}, {value.data()}, {value.size()})[0];
   }
 
   fs::path dir_;
@@ -75,7 +75,7 @@ TEST_F(PeerSsdManagerTest, WriteRecordsOwnershipAndQueuesAddEvent) {
   const std::string key = "key-1";
   const std::string value = "hello-ssd-payload";
 
-  ASSERT_TRUE(mgr.Write(key, OneSegment(value), value.size()));
+  ASSERT_TRUE(Put(mgr, key, value));
   EXPECT_TRUE(mgr.Exists(key));
 
   auto events = mgr.DrainPendingEvents();
@@ -95,19 +95,6 @@ TEST_F(PeerSsdManagerTest, WriteRecordsOwnershipAndQueuesAddEvent) {
   EXPECT_EQ(snap[0].size, value.size());
 }
 
-TEST_F(PeerSsdManagerTest, WriteAssemblesNonContiguousSegments) {
-  PeerSsdManager mgr(MakeConfig());
-  const std::string a = "abc";
-  const std::string b = "defgh";
-  std::vector<std::pair<const void*, size_t>> segs = {{a.data(), a.size()}, {b.data(), b.size()}};
-
-  ASSERT_TRUE(mgr.Write("multi", segs, a.size() + b.size()));
-  EXPECT_TRUE(mgr.Exists("multi"));
-  auto snap = mgr.SnapshotOwnedKeys();
-  ASSERT_EQ(snap.size(), 1u);
-  EXPECT_EQ(snap[0].size, a.size() + b.size());
-}
-
 TEST_F(PeerSsdManagerTest, CapacityReportsTotalAndGrowsWithWrites) {
   const size_t cap = 32ULL * 1024 * 1024;
   PeerSsdManager mgr(MakeConfig(cap));
@@ -116,7 +103,7 @@ TEST_F(PeerSsdManagerTest, CapacityReportsTotalAndGrowsWithWrites) {
   EXPECT_EQ(total_before, cap);
 
   std::string value(4096, 'x');
-  ASSERT_TRUE(mgr.Write("big", OneSegment(value), value.size()));
+  ASSERT_TRUE(Put(mgr, "big", value));
 
   auto [used_after, total_after] = mgr.Capacity();
   EXPECT_EQ(total_after, cap);
@@ -127,7 +114,7 @@ TEST_F(PeerSsdManagerTest, EvictRemovesOwnershipAndQueuesRemoveEvent) {
   PeerSsdManager mgr(MakeConfig());
   const std::string key = "key-evict";
   const std::string value = "payload";
-  ASSERT_TRUE(mgr.Write(key, OneSegment(value), value.size()));
+  ASSERT_TRUE(Put(mgr, key, value));
   mgr.DrainPendingEvents();  // discard the ADD
 
   EXPECT_TRUE(mgr.Evict(key));
@@ -148,7 +135,7 @@ TEST_F(PeerSsdManagerTest, PrepareReadReturnsBytesForOwnedKey) {
   PeerSsdManager mgr(MakeConfig());
   const std::string key = "key-read";
   const std::string value = "hello-ssd-read-path";
-  ASSERT_TRUE(mgr.Write(key, OneSegment(value), value.size()));
+  ASSERT_TRUE(Put(mgr, key, value));
 
   std::vector<char> staging(value.size());
   auto out = mgr.PrepareRead(key, staging.data(), staging.size());
@@ -168,7 +155,7 @@ TEST_F(PeerSsdManagerTest, PrepareReadRejectsOverCapBeforeIo) {
   PeerSsdManager mgr(MakeConfig());
   const std::string key = "key-big";
   const std::string value(4096, 'z');
-  ASSERT_TRUE(mgr.Write(key, OneSegment(value), value.size()));
+  ASSERT_TRUE(Put(mgr, key, value));
 
   // Capacity smaller than the actual size must be rejected as kSizeTooLarge
   // (and the reported size is the real size) without reading into the buffer.

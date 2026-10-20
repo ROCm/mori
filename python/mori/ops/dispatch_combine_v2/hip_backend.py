@@ -1195,10 +1195,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             combine={combine_spec: self._wrap_internode("combine")},
             dispatch_replay=None,
             stages_in_kernel=True,
-            # copystaging zeroes total_recv as its first act, so the host does not
-            # have to -- that zero_() was a fill kernel enqueued ahead of the
-            # dispatch sequence, delaying the kernels it protected.
-            self_resets_counters=True,
             capabilities=frozenset({"gather", "scales", "internode"}),
         )
 
@@ -1362,10 +1358,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # The combine kernel stages into out_tok itself (and skips the copy
             # when the caller already wrote there), so the op must not do it.
             stages_in_kernel=True,
-            # gfx1250 overwrites totalRecvTokenNum in the dispatch kernel's
-            # first-arriver, so the host zero_() is redundant.  gfx942/950 use
-            # atomicAdd and rely on the combine kernel to clear it.
-            self_resets_counters=self._is1250,
             capabilities=frozenset(
                 {"gather", "scales"} | ({"scatter"} if cfg.is_scatter else set())
             ),

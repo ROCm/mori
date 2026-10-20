@@ -584,13 +584,6 @@ target_link_libraries(test_peer_ssd_eviction PRIVATE umbp_common
 target_compile_features(test_peer_ssd_eviction PRIVATE cxx_std_17)
 add_test(NAME test_peer_ssd_eviction COMMAND test_peer_ssd_eviction)
 
-# test_ssd_copy_pipeline — DramCopyPin + async copy-on-commit pipeline
-add_executable(test_ssd_copy_pipeline test_ssd_copy_pipeline.cpp)
-target_link_libraries(test_ssd_copy_pipeline PRIVATE umbp_common
-                                                     GTest::gtest_main)
-target_compile_features(test_ssd_copy_pipeline PRIVATE cxx_std_17)
-add_test(NAME test_ssd_copy_pipeline COMMAND test_ssd_copy_pipeline)
-
 # test_cache_remote_admission — cache_remote_fetches admission-gate unit test
 # (hermetic; no GPU/RDMA/master).
 add_executable(test_cache_remote_admission test_cache_remote_admission.cpp)

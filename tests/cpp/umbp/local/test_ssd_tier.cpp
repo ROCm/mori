@@ -19,11 +19,15 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <unistd.h>
+
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
+#include "umbp/common/aligned_buffer.h"
 #include "umbp/local/tiers/ssd_tier.h"
 
 using namespace mori::umbp;
@@ -272,8 +276,44 @@ void test_ssd_batch_read_io_uring() {
   std::cout << "PASSED" << std::endl;
 }
 
+// A reserved record is invisible until committed; an aborted one mid-log is
+// skipped on reopen without hiding the records after it.
+void test_reserved_records() {
+  std::cout << "test_reserved_records... ";
+  const std::string dir = "/tmp/umbp_test_reserved_records";
+  UMBPConfig cfg;
+  cfg.ssd.storage_dir = dir;
+  cfg.ssd.capacity_bytes = 64 * 1024 * 1024;
+  const std::vector<char> kept(5000, 'K'), after(3000, 'A');
+  {
+    SSDTier tier(dir, cfg.ssd.capacity_bytes, cfg.ssd);
+    auto r = tier.ReserveRecord("kept", kept.size());
+    auto dropped = tier.ReserveRecord("dropped", 4096);
+    assert(r && dropped);
+    assert(tier.Write("after", after.data(), after.size()));
+    AlignedBuffer value(kept.size());  // O_DIRECT-legal when the tier runs direct
+    std::memcpy(value.data(), kept.data(), kept.size());
+    assert(::pwrite(r->location.fd, value.data(), value.padded_size(), r->location.value_offset) ==
+           static_cast<ssize_t>(value.padded_size()));
+    assert(tier.CommitRecord("kept", *r));
+    tier.AbortRecord("dropped", *dropped);
+    assert(!tier.Exists("dropped"));
+  }
+  SSDTier tier(dir, cfg.ssd.capacity_bytes, cfg.ssd);
+  std::vector<char> out(kept.size());
+  assert(tier.ReadIntoPtr("kept", reinterpret_cast<uintptr_t>(out.data()), out.size()));
+  assert(out == kept);
+  out.assign(after.size(), 0);
+  assert(tier.ReadIntoPtr("after", reinterpret_cast<uintptr_t>(out.data()), out.size()));
+  assert(out == after);
+  assert(!tier.Exists("dropped"));
+  tier.Clear();
+  std::cout << "PASSED" << std::endl;
+}
+
 int main() {
   std::cout << "=== Segmented SSD Tier Tests ===" << std::endl;
+  test_reserved_records();
   test_segmented_recovery();
   test_segmented_overwrite_generation();
   test_segmented_shared_reader_refresh();

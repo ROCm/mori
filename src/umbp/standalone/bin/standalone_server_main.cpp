@@ -41,7 +41,9 @@
 #include <vector>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/env_time.h"
 #include "umbp/common/fd_limit.h"
+#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 
@@ -198,16 +200,12 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
     return false;
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
     return false;
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SIZE", &dist.ssd_staging_buffer_size,
-                    error)) {
-    return false;
-  }
   if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
                    error)) {
     return false;
   }
-  if (dist.ssd_staging_buffer_slots <= 0) {
-    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be > 0";
+  if (dist.ssd_staging_buffer_slots < 0) {
+    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be >= 0 (0 = the preset)";
     return false;
   }
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,
@@ -289,6 +287,13 @@ int main(int argc, char** argv) {
   } else {
     address = mori::umbp::standalone::DefaultStandaloneAddress();
   }
+
+  // Before the server exists: registering its host pool, which carries on in
+  // the background, would slow each queue creation here to about a second.
+  // 8 covers the peak number of concurrent gathers per GPU under TP8 serving;
+  // 0 turns the prewarm off.
+  mori::umbp::HbmCopyEngine::Prewarm(
+      mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
 
   std::unique_ptr<mori::umbp::standalone::StandaloneServer> server;
   try {
