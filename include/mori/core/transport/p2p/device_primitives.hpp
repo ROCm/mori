@@ -69,12 +69,11 @@ using VecU32x4 = uint32_t __attribute__((ext_vector_type(4)));
 template <int VecBytes>
 using VecTypeSelector = std::conditional_t<
     VecBytes == 1, uint8_t,
-        std::conditional_t<VecBytes == 2, uint16_t,
-        std::conditional_t<VecBytes == 4, uint32_t,
-        std::conditional_t<VecBytes == 8, uint64_t,
-        std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
-
-
+    std::conditional_t<VecBytes == 2, uint16_t,
+                       std::conditional_t<VecBytes == 4, uint32_t,
+                                          std::conditional_t<VecBytes == 8, uint64_t,
+                                                             std::conditional_t<VecBytes == 16,
+                                                                                VecU32x4, void>>>>>;
 
 template <typename T, int VecSize>
 struct VecTypeAdaptor {
@@ -115,17 +114,17 @@ struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
 #define USE_BUILDIN_ST 1
 
 namespace impl {
-  
+
 template <typename T>
-inline  __device__ T* global(T* ptr) {
+inline __device__ T* global(T* ptr) {
   static_assert(!std::is_volatile<T>::value, "T must not be volatile");
   return (T*)(T __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
 }
-} // namespace impl
+}  // namespace impl
 
 template <int VecBytes>
 inline __device__ VecTypeSelector<VecBytes> load(const void* p) {
-  auto ptr = impl::global(static_cast<const VecTypeSelector<VecBytes>*>(p)); 
+  auto ptr = impl::global(static_cast<const VecTypeSelector<VecBytes>*>(p));
 #if USE_BUILDIN_LD
   return __builtin_nontemporal_load(ptr);
 #else
@@ -135,8 +134,8 @@ inline __device__ VecTypeSelector<VecBytes> load(const void* p) {
 
 template <int VecBytes, class T>
 inline __device__ void store(void* p, T v) {
-  static_assert(sizeof(T) == sizeof(VecTypeSelector<VecBytes>), 
-            "T must be the same size as VecTypeSelector<VecBytes>");
+  static_assert(sizeof(T) == sizeof(VecTypeSelector<VecBytes>),
+                "T must be the same size as VecTypeSelector<VecBytes>");
   store<VecBytes>(p, (VecTypeSelector<VecBytes>)v);
 }
 
@@ -156,7 +155,7 @@ inline __device__ void store(void* p, VecTypeSelector<VecBytes> v) {
 //                 "StreamLoad supports 1/2/4/8/16 byte accesses");
 //   // Intrinsic takes a non-const pointer
 //   auto non_const = const_cast<void*>(p);
-//   auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(non_const)); 
+//   auto ptr = cco::impl::global(static_cast<TVecType<Bytes>*>(non_const));
 //   if constexpr (Bytes == 16) {
 //     if constexpr (Scope == ESystemScope) {
 //       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
