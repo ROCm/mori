@@ -362,6 +362,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._gate(
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
+        # Active QP counts set_active_qps() may switch to. Each is compiled for
+        # every bucket geometry, so a switch never compiles at launch.
+        self._selectable_active_qps = tuple(cfg.active_qp_counts or ())
+        self._active_qps_override = None
 
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
@@ -484,10 +488,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         * RAIL rather than the CROSSNODE default. The kernels talk only to their
           own local rank on other nodes, so that is the only connection set they
           need, and asking for more costs QPs that never carry traffic.
-        * a context count of num_qp_per_pe. ccoGda picks its QP as
-          ``contextId % numQpPerPe``, so fewer contexts than QPs silently
-          collapses the stripes onto a subset of them -- no error, just less
-          bandwidth than the config asked for.
+        * num_qp_per_pe allocated contexts. Each kernel sends on a prefix of
+          them (its active count, KernelConfig.active_qps); the count stored in
+          the DevComm stays the allocation because it is also the endpoint-array
+          stride for world-rank addressing.
         """
         from mori.cco import cco as _cco
         from mori.cco.communicator import DevCommHandle
@@ -830,7 +834,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     }
 
     def _internode_request(
-        self, cfg, dtype_tag, block_num, warp_per_block, rdma_block_num
+        self,
+        cfg,
+        dtype_tag,
+        block_num,
+        warp_per_block,
+        rdma_block_num,
+        active_qps,
+        num_qp_to_drain,
     ):
         # Each phase uses its own dtype. FP4 dispatch counts packed bytes,
         # while combine and the shared arena keep the logical hidden dimension.
@@ -845,7 +856,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             numExpertPerToken=cfg.num_experts_per_token,
             maxTotalRecvTokens=cfg.max_total_recv_tokens,
             gpuPerNode=cfg.gpu_per_node,
-            numQpPerPe=cfg.num_qp_per_pe,
+            # The kernel's ACTIVE count; the allocation lives in the DevComm.
+            numQpPerPe=active_qps,
+            numQpToDrain=num_qp_to_drain,
             quantType=(
                 cfg.quant_type.replace("_", "").lower()
                 if cfg.quant_type != "none"
@@ -919,19 +932,49 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _build_internode_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
 
+        # set_active_qps() swaps the count of whatever spec a bucket picks, so
+        # each selectable count is built for every spec.
+        specs_by_phase = {
+            phase: tuple(
+                dict.fromkeys(
+                    variant
+                    for spec in specs
+                    for variant in (
+                        spec,
+                        *(
+                            spec._replace(active_qps=count)
+                            for count in self._selectable_active_qps
+                        ),
+                    )
+                )
+            )
+            for phase, specs in (
+                ("dispatch", self._dispatch_specs),
+                ("combine", self._combine_specs),
+            )
+        }
+        # Every QP any launch of this op can send on: dispatch drains them all,
+        # because a combine may use more QPs than the dispatch after it. One
+        # op-wide value, so it adds no compiled variants -- but it does mean a
+        # bucket with a high count makes every bucket's dispatch drain that many.
+        num_qp_to_drain = max(
+            spec.active_qps for specs in specs_by_phase.values() for spec in specs
+        )
         plans = {}
         kernels = {"dispatch": {}, "combine": {}}
-        for phase, dtype, specs in (
-            ("dispatch", cfg.dispatch_dtype, self._dispatch_specs),
-            ("combine", cfg.combine_dtype, self._combine_specs),
+        for phase, dtype in (
+            ("dispatch", cfg.dispatch_dtype),
+            ("combine", cfg.combine_dtype),
         ):
-            for spec in specs:
+            for spec in specs_by_phase[phase]:
                 request = self._internode_request(
                     cfg,
                     self._INTERNODE_DTYPE[dtype],
                     spec.block_num,
                     spec.warp_per_block,
                     spec.rdma_block_num,
+                    spec.active_qps,
+                    num_qp_to_drain,
                 )
                 group_plans = []
                 for pass_name in self._INTERNODE_SEQ[phase, spec.family]:
@@ -944,6 +987,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                         spec.block_num,
                         spec.warp_per_block,
                         spec.rdma_block_num,
+                        spec.active_qps,
                         load_first,
                     )
                     if key not in plans:
@@ -970,8 +1014,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         This reads the schedule prepared at construction: no table reload,
         compilation or device query. Both intra and inter use this same path.
+        A set_active_qps() override replaces both phases' active count.
         """
-        return tuning.pick_bucket(self._schedule, num_tokens)
+        selected = tuning.pick_bucket(self._schedule, num_tokens)
+        override = getattr(self, "_active_qps_override", None)
+        if override is None:
+            return selected
+        return selected._replace(
+            dispatch=selected.dispatch._replace(active_qps=override),
+            combine=selected.combine._replace(active_qps=override),
+        )
 
     def _pick(self, num_tokens):
         selected = self.kernel_config(num_tokens)
@@ -1242,6 +1294,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         raise NotImplementedError("StdMoE is flydsl-only; use backend='flydsl'")
 
     # -- ops ---------------------------------------------------------------
+
+    def set_active_qps(self, active_qps):
+        """Override the active QP count of every bucket, both phases, for the
+        launches that follow; None goes back to what each bucket resolved.
+
+        Only counts listed in cfg.active_qp_counts can be selected -- they are
+        the ones compiled for every bucket geometry. Rank-local: ranks, and the
+        dispatch and combine of one pair, may use different counts, because a
+        combine's barrier contribution does not depend on it (see
+        kCombineBarrierMarkerTotal). A captured graph keeps the plans it was
+        captured with.
+        """
+        if not self.cfg.is_internode:
+            raise ValueError("active_qps requires the internode HIP backend")
+        if active_qps is not None and (
+            type(active_qps) is not int or active_qps not in self._selectable_active_qps
+        ):
+            raise ValueError(
+                f"active_qps={active_qps!r} was not compiled; selectable counts "
+                f"are active_qp_counts={self._selectable_active_qps}"
+            )
+        self._active_qps_override = active_qps
 
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 

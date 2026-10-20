@@ -319,6 +319,10 @@ class KernelConfig(NamedTuple):
     # combine_load_first). Part of the key, so buckets that share a geometry
     # but differ here get separate kernels.
     load_first: bool = False
+    # Internode only: how many of the allocated QPs (cfg.num_qp_per_pe) this
+    # kernel sends on. A compile-time constant of each kernel, chosen per phase
+    # and per bucket (JSON active_qps), so it is part of the key too.
+    active_qps: int | None = None
 
 
 class ScheduleEntry(NamedTuple):
@@ -371,6 +375,7 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
                     block_num=dispatch[0],
                     warp_per_block=dispatch[2],
                     rdma_block_num=dispatch[1],
+                    active_qps=dispatch[3],
                 ),
                 KernelConfig(
                     family,
@@ -378,6 +383,7 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
                     warp_per_block=combine[2],
                     rdma_block_num=combine[1],
                     load_first=load_first,
+                    active_qps=combine[3],
                 ),
             )
         )
@@ -393,7 +399,7 @@ def describe_schedule(cfg, schedule) -> str:
         return (
             f"{spec.family} B/R/W="
             f"{spec.block_num}/{spec.rdma_block_num}/{spec.warp_per_block}"
-            + (" load-first" if spec.load_first else "")
+            f" qps={spec.active_qps}" + (" load-first" if spec.load_first else "")
         )
 
     num_experts = cfg.world_size * cfg.num_experts_per_rank
@@ -411,6 +417,10 @@ def describe_schedule(cfg, schedule) -> str:
         ]
         if overrides:
             lines.append(f"  tables bypassed by {', '.join(overrides)}")
+        lines.append(
+            f"  QPs allocated per peer: {cfg.num_qp_per_pe}"
+            + (f", active pinned to {cfg.active_qps}" if cfg.active_qps else "")
+        )
         pinned = sorted(getattr(cfg, "_pinned_geometry", ()))
         if pinned:
             lines.append(f"  pinned fields: {', '.join(pinned)}")
@@ -557,28 +567,53 @@ def internode_kernel_families(cfg):
 
 
 def fit_internode_geometry(geometry, *, clamp_to_cu=False):
-    """Leave at least one intra-node block; optionally cap tuned grids to CUs."""
+    """Leave at least one intra-node block; optionally cap tuned grids to CUs.
+    Fields after block, rdma, warp (the active QP count) pass through."""
     if geometry is None:
         return None
-    block, rdma, warp = geometry
+    block, rdma, warp, *rest = geometry
     if clamp_to_cu:
         block = min(block, _gpu.cu_count() or 80)
-    return (block, min(rdma, max(1, block - 1)), warp)
+    return (block, min(rdma, max(1, block - 1)), warp, *rest)
 
 
-def _geometry_from_env(name):
-    """Optional sweep override, read once when the op is built: B,R,W."""
+def resolve_active_qps(cfg, active_qps=None):
+    """The active QP count a kernel runs with: a configured cfg.active_qps wins;
+    otherwise the table's count, else min(2, allocation). A table count above
+    the allocation is clamped to it, the way block_num is clamped to the CU
+    count, so a row tuned under one allocation stays usable under another."""
+    if cfg.active_qps is not None:
+        return cfg.active_qps
+    if active_qps is None:
+        active_qps = 2
+    return min(active_qps, cfg.num_qp_per_pe)
+
+
+def _geometry_from_env(name, cfg):
+    """Optional sweep override, read once when the op is built:
+    B,R,W[,active_qps]. A fourth field beats cfg.active_qps and is rejected,
+    not clamped, outside the allocation: a sweep that silently ran a smaller
+    count would report a winner it never measured."""
     raw = os.environ.get(name)
     if not raw:
         return None
     geometry = tuple(int(x) for x in raw.replace(" ", "").split(","))
-    if len(geometry) != 3:
-        raise ValueError(f"{name}={raw!r}: want three ints, block,rdma,warp")
+    if len(geometry) == 3:
+        return geometry + (resolve_active_qps(cfg),)
+    if len(geometry) != 4:
+        raise ValueError(
+            f"{name}={raw!r}: want block,rdma,warp or block,rdma,warp,active_qps"
+        )
+    if not 1 <= geometry[3] <= cfg.num_qp_per_pe:
+        raise ValueError(
+            f"{name}: active_qps {geometry[3]} must be in "
+            f"[1, num_qp_per_pe={cfg.num_qp_per_pe}]"
+        )
     return geometry
 
 
 def internode_schedule(cfg):
-    """Resolve (inclusive token ceiling, dispatch B/R/W, combine B/R/W,
+    """Resolve (inclusive token ceiling, dispatch B/R/W/QPs, combine B/R/W/QPs,
     combine load-first).
 
     Either sweep env override bypasses both tables. Otherwise explicit config
@@ -587,12 +622,12 @@ def internode_schedule(cfg):
     fields are kept as given. All paths keep R < B.
     """
     defaults = [
-        tuple(getattr(cfg, name) for name in fields)
+        tuple(getattr(cfg, name) for name in fields) + (resolve_active_qps(cfg),)
         for fields in _INTERNODE_GEOMETRY_FIELDS
     ]
     overrides = [
-        _geometry_from_env("MORI_EP_DISP_GEOM"),
-        _geometry_from_env("MORI_EP_COMB_GEOM"),
+        _geometry_from_env("MORI_EP_DISP_GEOM", cfg),
+        _geometry_from_env("MORI_EP_COMB_GEOM", cfg),
     ]
     if any(overrides):
         return [
@@ -638,7 +673,9 @@ def internode_schedule(cfg):
             )
             geometry = tuple(
                 getattr(cfg, name) if name in pinned else value
-                for name, value in zip(fields, geometry)
+                for name, value in zip(fields, geometry[:3])
+            ) + (
+                resolve_active_qps(cfg, geometry[3]),
             )
             geometries.append(fit_internode_geometry(geometry))
         # The load-first gather exists in the ordinary combine only.
@@ -705,7 +742,8 @@ def internode_buckets(
     experts_per_rank=None,
 ):
     """Return (token ceiling, dispatch geometry, combine geometry,
-    combine load-first) rows.
+    combine load-first) rows. A geometry is (block, rdma, warp, active_qps);
+    active_qps is the rule's optional count, None when the rule names none.
 
     Each phase matches its own dtype and stored width (packed for FP4 dispatch).
     Total experts (world_size * experts_per_rank) and top-k name the table file
@@ -777,7 +815,12 @@ def internode_buckets(
         geometries = [
             fit_internode_geometry(
                 (
-                    (rule["block_num"], rule["rdma_block_num"], rule["warp_per_block"])
+                    (
+                        rule["block_num"],
+                        rule["rdma_block_num"],
+                        rule["warp_per_block"],
+                        rule.get("active_qps"),
+                    )
                     if rule is not None
                     else None
                 ),
