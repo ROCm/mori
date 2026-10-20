@@ -33,6 +33,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,6 +78,42 @@ class GatedBackend : public TierBackend {
     if (it == store_.end() || it->second.size() != size) return false;
     std::memcpy(reinterpret_cast<void*>(dst), it->second.data(), size);
     return true;
+  }
+
+  // Extent reads, gated like ReadIntoPtr: one gate pass per key.
+  TierCapabilities Capabilities() const override {
+    TierCapabilities caps;
+    caps.ranged_read = true;
+    return caps;
+  }
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override {
+    std::vector<bool> out(keys.size(), false);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      {
+        std::unique_lock<std::mutex> lk(gate_mu_);
+        ++reads_started_;
+        started_cv_.notify_all();
+        gate_cv_.wait(lk, [this] { return !blocked_; });
+        if (fail_) continue;
+      }
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = store_.find(keys[k]);
+      if (it == store_.end()) continue;
+      for (size_t r = 0; r < dst_ptrs[k].size(); ++r) {
+        std::memcpy(reinterpret_cast<void*>(dst_ptrs[k][r]), it->second.data() + src_offsets[k][r],
+                    sizes[k][r]);
+        bytes_read_ += sizes[k][r];
+      }
+      out[k] = true;
+    }
+    return out;
+  }
+  size_t bytes_read() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return bytes_read_;
   }
 
   bool Exists(const std::string& key) const override {
@@ -129,6 +166,7 @@ class GatedBackend : public TierBackend {
   mutable std::mutex mu_;
   std::unordered_map<std::string, std::vector<char>> store_;
   size_t used_ = 0;
+  size_t bytes_read_ = 0;  // ranged reads only
   size_t capacity_;
 
   mutable std::mutex gate_mu_;
@@ -296,6 +334,98 @@ TEST(PeerSsdSingleFlight, SequentialRoundsStayIndependent) {
       EXPECT_EQ(std::string(bufs[i].data(), outs[i].size), payload);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+//  Extent reads (design-ssd-ranged-io.md D1c): a reader joins an in-flight read
+//  only when that read covers its bytes.
+// ---------------------------------------------------------------------------
+
+const std::string kObject = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-";
+
+SsdReadOutcome ReadExtent(PeerSsdManager& mgr, const std::string& key, uint64_t offset,
+                          std::vector<char>* buf) {
+  const std::vector<ObjectExtent> extent = {{offset, buf->size()}};
+  return mgr.PrepareReadBatch({key}, {buf->data()}, {buf->size()}, &extent)[0];
+}
+
+// Holds `first` on the drive, starts `second`, and releases both once `second`
+// has attached to it (`second_follows`) or reached the drive itself.
+void RaceTwoReads(Harness& h, const std::function<void()>& first,
+                  const std::function<void()>& second, bool second_follows) {
+  h.backend->BlockReads();
+  std::thread a(first);
+  h.backend->WaitReadsStarted(1);
+  std::thread b(second);
+  if (second_follows) {
+    WaitForDups(*h.mgr, 1);
+  } else {
+    h.backend->WaitReadsStarted(2);
+  }
+  h.backend->UnblockReads();
+  a.join();
+  b.join();
+}
+
+// Attaching on the key alone would hand the second reader the first one's bytes.
+TEST(PeerSsdSingleFlight, DisjointExtentsOfOneKeyEachGetTheirOwnBytes) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+  std::vector<char> front(16), back(16);
+  SsdReadOutcome out_front, out_back;
+  RaceTwoReads(
+      h, [&] { out_front = ReadExtent(*h.mgr, "K", 0, &front); },
+      [&] { out_back = ReadExtent(*h.mgr, "K", 40, &back); }, /*second_follows=*/false);
+
+  EXPECT_EQ(h.mgr->ReadMerged(), 0u);
+  ASSERT_EQ(out_front.status, SsdReadStatus::kOk);
+  ASSERT_EQ(out_back.status, SsdReadStatus::kOk);
+  EXPECT_EQ(out_front.size, kObject.size()) << "outcome size is the object's, not the extent's";
+  EXPECT_EQ(std::string(front.begin(), front.end()), kObject.substr(0, 16));
+  EXPECT_EQ(std::string(back.begin(), back.end()), kObject.substr(40, 16));
+  EXPECT_EQ(h.backend->bytes_read(), 32u) << "only the two extents came off the drive";
+}
+
+TEST(PeerSsdSingleFlight, ExtentInsideAWholeReadFollowsAndTakesItsSlice) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+  std::vector<char> whole(kObject.size()), slice(20);
+  SsdReadOutcome out_whole, out_slice;
+  RaceTwoReads(
+      h, [&] { out_whole = h.mgr->PrepareRead("K", whole.data(), whole.size()); },
+      [&] { out_slice = ReadExtent(*h.mgr, "K", 23, &slice); }, /*second_follows=*/true);
+
+  EXPECT_EQ(h.backend->reads_started(), 1) << "the extent reader must not touch the drive";
+  EXPECT_EQ(h.mgr->ReadMerged(), 1u);
+  ASSERT_EQ(out_whole.status, SsdReadStatus::kOk);
+  ASSERT_EQ(out_slice.status, SsdReadStatus::kOk);
+  EXPECT_EQ(std::string(whole.begin(), whole.end()), kObject);
+  EXPECT_EQ(std::string(slice.begin(), slice.end()), kObject.substr(23, 20));
+}
+
+TEST(PeerSsdSingleFlight, WholeReadDoesNotFollowAnExtentLeader) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+  std::vector<char> slice(8), whole(kObject.size());
+  SsdReadOutcome out_slice, out_whole;
+  RaceTwoReads(
+      h, [&] { out_slice = ReadExtent(*h.mgr, "K", 8, &slice); },
+      [&] { out_whole = h.mgr->PrepareRead("K", whole.data(), whole.size()); },
+      /*second_follows=*/false);
+
+  EXPECT_EQ(h.mgr->ReadMerged(), 0u);
+  ASSERT_EQ(out_slice.status, SsdReadStatus::kOk);
+  ASSERT_EQ(out_whole.status, SsdReadStatus::kOk);
+  EXPECT_EQ(std::string(slice.begin(), slice.end()), kObject.substr(8, 8));
+  EXPECT_EQ(std::string(whole.begin(), whole.end()), kObject);
+}
+
+TEST(PeerSsdSingleFlight, ExtentPastTheObjectIsAnError) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+  std::vector<char> buf(16);
+  EXPECT_EQ(ReadExtent(*h.mgr, "K", kObject.size() - 8, &buf).status, SsdReadStatus::kError);
+  EXPECT_EQ(h.backend->reads_started(), 0);
 }
 
 }  // namespace
