@@ -27,12 +27,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/pool_client.h"
 
@@ -235,14 +238,16 @@ class CrossNodeMultiPage : public ::testing::Test {
 
   void TearDown() override { TearDownClients(); }
 
-  std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, const NodeSetup& setup) {
+  std::unique_ptr<PoolClient> MakeClient(const std::string& node_id, const NodeSetup& setup,
+                                         uint16_t peer_service_port = 0) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
     cfg.master_config.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
     cfg.io_engine.host = "0.0.0.0";
     cfg.io_engine.port = 0;
-    cfg.auto_peer_service_port = true;
+    cfg.peer_service_port = peer_service_port;
+    cfg.auto_peer_service_port = peer_service_port == 0;
     cfg.dram_page_size = kPageSize;
     cfg.dram.buffer_sizes = setup.buffer_sizes;
     // These tiers are filled on purpose; leave eviction to the master's rounds.
@@ -267,6 +272,58 @@ class CrossNodeMultiPage : public ::testing::Test {
   std::unique_ptr<PoolClient> client_a_;
   std::unique_ptr<PoolClient> client_b_;
 };
+
+// A tier server that restarts comes back under the same node id and peer
+// address, but as a new engine with new buffers.  A writer that talked to the
+// old process must pick up the new one, not keep RDMAing to the dead one.
+TEST_F(CrossNodeMultiPage, PutAndGetReachARestartedPeer) {
+  StartMaster();
+  client_a_ = MakeClient("node-a", NodeSetup{{kPageSize}});
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}});
+
+  // Learn node-b's peer address the way a writer does, so its replacement can
+  // bind the same one.
+  UMBPMasterClientConfig probe_cfg;
+  probe_cfg.node_id = "probe";
+  probe_cfg.node_address = "127.0.0.1";
+  probe_cfg.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
+  MasterClient probe(probe_cfg);
+  std::optional<RoutePutResult> route;
+  ASSERT_TRUE(probe.RoutePut("before", kPageSize, {}, &route).ok());
+  ASSERT_TRUE(route.has_value());
+  ASSERT_EQ(route->node_id, "node-b");
+  const auto colon = route->peer_address.rfind(':');
+  ASSERT_NE(colon, std::string::npos);
+  const auto peer_port = static_cast<uint16_t>(std::stoi(route->peer_address.substr(colon + 1)));
+
+  std::vector<char> src(kPageSize, 0x5A);
+  std::vector<char> dst(kPageSize, 0);
+  client_a_->RegisterMemory(src.data(), src.size());
+  client_a_->RegisterMemory(dst.data(), dst.size());
+  ASSERT_TRUE(client_a_->Put("before", src.data(), kPageSize));
+  ASSERT_TRUE(WaitForExists(client_a_.get(), "before"));
+  ASSERT_TRUE(client_a_->Get("before", dst.data(), kPageSize));
+
+  client_b_->Shutdown();
+  client_b_.reset();
+  client_b_ = MakeClient("node-b", NodeSetup{{kPageSize * 4}}, peer_port);
+
+  // The first call on the old channel may see the socket close; what must not
+  // happen is that the writer never reaches the new process.
+  auto eventually = [](const std::function<bool()>& op) {
+    for (int attempt = 0; attempt < 30; ++attempt) {
+      if (op()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  };
+  std::memset(src.data(), 0x6B, kPageSize);
+  std::memset(dst.data(), 0, kPageSize);
+  ASSERT_TRUE(eventually([&] { return client_a_->Put("after", src.data(), kPageSize); }));
+  ASSERT_TRUE(WaitForExists(client_a_.get(), "after"));
+  ASSERT_TRUE(eventually([&] { return client_a_->Get("after", dst.data(), kPageSize); }));
+  EXPECT_EQ(std::memcmp(src.data(), dst.data(), kPageSize), 0);
+}
 
 TEST_F(CrossNodeMultiPage, MultiPageSameBufferPutGet) {
   // Strategy 1: a single buffer with enough contiguous pages for a multi-
