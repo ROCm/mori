@@ -395,6 +395,7 @@ add_library(
   distributed/transfer/local_copy_engine.cpp
   distributed/transfer/hbm_copy_engine.cpp
   distributed/transfer/posix_engine.cpp
+  distributed/transfer/restore_scheduler.cpp
   distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
   distributed/pool/policy_config.cpp

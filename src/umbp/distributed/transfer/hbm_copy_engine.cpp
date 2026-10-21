@@ -41,6 +41,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
 #include "umbp/distributed/transfer/plan_builder.h"
+#include "umbp/distributed/transfer/restore_scheduler.h"
 
 namespace mori::umbp {
 
@@ -77,8 +78,6 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 //  fragments", and it is why device_gather moved out of the DRAM tier into
 //  common/ (upstream 93f2998a).
 // ---------------------------------------------------------------------------
-
-constexpr size_t kGatherFragmentThreshold = 128ULL << 10;
 
 // Staging each prewarmed stream starts with.  A long prefix read across every
 // layer reaches 8192 fragments; a bigger batch regrows its stream's staging.
@@ -137,6 +136,12 @@ size_t DebugEnvSize(const char* name, size_t fallback) {
   return static_cast<size_t>(parsed);
 }
 
+size_t GatherFragmentThreshold() {
+  static const size_t bytes =
+      DebugEnvSize("UMBP_HBM_GATHER_FRAGMENT_THRESHOLD_BYTES", 128ULL << 10);
+  return bytes;
+}
+
 bool DebugEnabled() {
   static const bool enabled = DebugEnvFlag("UMBP_HBM_COPY_DEBUG", false);
   return enabled;
@@ -155,6 +160,22 @@ size_t DebugMaxSegments() {
 size_t DebugSummarySeconds() {
   static const size_t n = DebugEnvSize("UMBP_HBM_COPY_DEBUG_SUMMARY_SEC", 10);
   return n;
+}
+
+bool ScheduledH2DEnabled() {
+  static const bool enabled = [] {
+    const char* policy = std::getenv("UMBP_HBM_RESTORE_SCHEDULER");
+    if (policy == nullptr || std::string(policy) == "off") return false;
+    if (std::string(policy) == "round_robin") return true;
+    MORI_UMBP_WARN("Unsupported UMBP_HBM_RESTORE_SCHEDULER '{}'; using native restores", policy);
+    return false;
+  }();
+  return enabled;
+}
+
+size_t RestoreChunkBytes() {
+  static const size_t bytes = DebugEnvSize("UMBP_HBM_RESTORE_CHUNK_BYTES", 128ULL << 20);
+  return bytes;
 }
 
 // One counter for the whole engine, so sampling thins the combined stream
@@ -670,7 +691,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kTooFewFragments);
       continue;
     }
-    if (bucket.total_bytes / bucket.fragments.size() >= kGatherFragmentThreshold) {
+    if (bucket.total_bytes / bucket.fragments.size() >= GatherFragmentThreshold()) {
       note_bucket(GatherSkip::kFragmentAtOrAboveThreshold);
       continue;
     }
@@ -747,6 +768,14 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
   } else {
     device_touched = true;
   }
+  auto map_host = [this](const void* ptr, size_t bytes, int device) {
+    return HostRegionDeviceAddress(ptr, bytes, device);
+  };
+  if (ScheduledH2DEnabled() && TryScheduledH2D(plans, map_host, RestoreChunkBytes())) {
+    if (device_touched && entry_device >= 0) (void)hipSetDevice(entry_device);
+    return std::make_unique<SettledHandle>(std::move(failures));
+  }
+
   const bool debug = DebugEnabled();
   std::vector<GatherSkip> skips;
   const std::vector<char> gathered = GatherEligiblePlans(plans, debug ? &skips : nullptr);
