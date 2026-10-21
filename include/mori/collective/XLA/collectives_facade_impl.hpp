@@ -94,6 +94,32 @@ hipError_t DispatchNpes(int npes, F&& f) {
 
 }  // namespace detail
 
+// The pull copy kernels run a fixed 16B (b128) body, valid only when every
+// per-segment base is 16B-aligned. Peer pointers differ from local ones by
+// multiples of 4GB, so OR-ing the byte count with the local pointers decides it.
+static bool PullCopy16Aligned(uintptr_t bits) { return (bits & (kPullCopyBytes - 1)) == 0; }
+
+// The all-gather / all-to-all pull kernels are peer-interleaved and templated on
+// a compile-time peer count that must divide kPullCopyVecs (8); only these counts
+// have a pull kernel, every other count falls through to push.
+static bool PullNpesSupported(int n) { return n == 2 || n == 4 || n == 8; }
+
+// Grid for a pull copy of totalBytes in 16B units: enough blocks for
+// kPullCopyVecs units per thread, capped to the CU count (the kernels spin on
+// in-kernel flags, so every block must be co-resident) and MORI_CCL_MAX_NBLOCKS.
+static int PullCopyBlocks(size_t totalBytes, int threads, int mpCount, int maxNBlocks) {
+  const size_t perBlock = static_cast<size_t>(threads) * kPullCopyBytes * kPullCopyVecs;
+  int blocks = static_cast<int>(
+      std::min<size_t>((totalBytes + perBlock - 1) / perBlock, std::max(1, mpCount)));
+  if (maxNBlocks > 0) blocks = std::min(blocks, maxNBlocks);
+  return std::max(1, blocks);
+}
+
+auto CollectivesFacade::resolveCopyMode(size_t totalBytes, size_t pullMaxBytes) const -> RsMode {
+  if (mode_ != RsMode::kAuto) return mode_;
+  return totalBytes < pullMaxBytes ? RsMode::kPull : RsMode::kPush;
+}
+
 auto CollectivesFacade::resolveMode(size_t totalBytes, bool allReduce) const -> RsMode
 {
   if (mode_ != RsMode::kAuto) return mode_;
@@ -134,10 +160,10 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   // passed to the kernels are in packs (kPack = sizeof(ComputeT)/sizeof(T)).
   constexpr size_t kPack = sizeof(ComputeT) / sizeof(T);
   const size_t chunkElemsC = chunkElems / kPack;
-  constexpr int NumPushVecs = 8, NumPullVecs = 8;
+  constexpr int NumVecs = 8;
   constexpr int VecSize = VecBytes / sizeof(ComputeT);
   constexpr int kThreads = 256;
-  size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
+  size_t totalVecs = chunkElemsC / (VecSize * NumVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   int blocks = std::min(wantBlocks, std::max(1, state_.MP_count));
   // MORI_CCL_MAX_NBLOCKS tightens (never raises) the grid; it stays co-resident.
@@ -152,7 +178,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
     // flat-VA rank delta the push path uses: input + (pe - myPe)*stride4G<<32,
     // with stride4G read from heapWin_.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
-      ReduceScatterPullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
+      ReduceScatterPullKernel<NumVecs, decltype(NPES_c)::value, ReduceOp>
           <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                   reinterpret_cast<const ComputeT*>(input),
                                   reinterpret_cast<ComputeT*>(output), chunkElemsC,
@@ -162,7 +188,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   } else {
     // Every block loops over all S slices (no block-to-slice mapping), so the
     // grid needs no rounding to a multiple of S.
-    ReduceScatterPushKernel<NumPushVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
+    ReduceScatterPushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<ComputeT*>(output),
         state_.groupCounters, chunkElemsC, state_.devComm, state_.heapWin,
         reinterpret_cast<const ComputeT*>(input),
@@ -205,10 +231,9 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
 
   constexpr size_t kPack = sizeof(ComputeT) / sizeof(T);
   const size_t chunkElemsC = chunkElems / kPack;
-  constexpr int NumPushVecs = 8, NumPullVecs = 8;
-  constexpr int VecSize = VecBytes / sizeof(ComputeT);
+  constexpr int NumVecs = 8, VecSize = VecBytes / sizeof(ComputeT);
   constexpr int kThreads = 256;
-  size_t totalVecs = chunkElemsC / (VecSize * NumPushVecs);
+  size_t totalVecs = chunkElemsC / (VecSize * NumVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   // Cap the grid to the SM count so all blocks are co-resident: push needs it
   // for the multi-producer broadcast submitPacket ordering, pull for the
@@ -226,7 +251,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
     // the result out to every peer from registers, in one pass. No SDMA and no
     // staging; entry and exit GenBarrier rounds on barrierCtr.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
-      AllReducePullKernel<NumPullVecs, decltype(NPES_c)::value, ReduceOp>
+      AllReducePullKernel<NumVecs, decltype(NPES_c)::value, ReduceOp>
           <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                             reinterpret_cast<const ComputeT*>(input),
                                             reinterpret_cast<ComputeT*>(output), chunkElemsC,
@@ -240,7 +265,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // needs no rounding to a multiple of S.
   // input/output/staging all live in the static heap (heapWin_); the kernel
   // derives each intra-heap offset from the raw pointer via ccoGetLocalPtr.
-  AllReducePushKernel<NumPushVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
+  AllReducePushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<const ComputeT*>(input),
         reinterpret_cast<ComputeT*>(output), state_.groupCounters, chunkElemsC, state_.devComm,
         reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin, state_.barrierCtr);
@@ -263,6 +288,26 @@ hipError_t CollectivesFacade::RunAllReduce(const void* input, void* output, size
 
 hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size_t chunkBytes,
                                            hipStream_t stream) {
+  const size_t totalBytes = chunkBytes * nPes_;
+  // Pull needs every peer slot (output + peer*chunkBytes) 16B-aligned, i.e.
+  // chunkBytes and both bases 16B-aligned; otherwise fall through to push.
+  const uintptr_t bits = chunkBytes | reinterpret_cast<uintptr_t>(input) |
+                         reinterpret_cast<uintptr_t>(output);
+  if (resolveCopyMode(totalBytes, kAutoPullMaxBytesAg) == RsMode::kPull &&
+      PullCopy16Aligned(bits) && PullNpesSupported(nPes_)) {
+    constexpr int kPullThreads = 256;
+    const int blocks =
+        PullCopyBlocks(totalBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
+    // Peer-interleaved kernels for the supported peer counts (NPES divides
+    // kPullCopyVecs=8), so all NPES XGMI read links run concurrently. The gate
+    // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
+    return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
+      AllGatherPullKernelN<decltype(NPES_c)::value><<<blocks, kPullThreads, 0, stream>>>(
+          myPe_, nPes_, state_.heapWin, input, output, chunkBytes, state_.groupCounters,
+          state_.barrierCtr);
+      return hipGetLastError();
+    });
+  }
   constexpr int kThreads = 64;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
@@ -278,6 +323,28 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   for (int p = 0; p < nPes_; ++p) {
     state_.pinnedPairs[p].source = addrs[p].first;
     state_.pinnedPairs[p].dest = addrs[p].second;
+  }
+  const size_t totalBytes = chunkBytes * nPes_;
+  uintptr_t bits = chunkBytes;
+  for (int p = 0; p < nPes_; ++p) {
+    bits |= reinterpret_cast<uintptr_t>(addrs[p].first) |
+            reinterpret_cast<uintptr_t>(addrs[p].second);
+  }
+  // Pull needs every send/recv slot 16B-aligned; otherwise fall through to push.
+  if (resolveCopyMode(totalBytes, kAutoPullMaxBytesA2a) == RsMode::kPull &&
+      PullCopy16Aligned(bits) && PullNpesSupported(nPes_)) {
+    constexpr int kPullThreads = 256;
+    const int blocks =
+        PullCopyBlocks(totalBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
+    // Peer-interleaved kernels for the supported peer counts (NPES divides
+    // kPullCopyVecs=8), so all NPES XGMI read links run concurrently. The gate
+    // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
+    return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
+      AllToAllPullKernelN<decltype(NPES_c)::value><<<blocks, kPullThreads, 0, stream>>>(
+          myPe_, nPes_, state_.heapWin, state_.pinnedPairs, chunkBytes, state_.groupCounters,
+          state_.barrierCtr);
+      return hipGetLastError();
+    });
   }
   constexpr int kThreads = 64;
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
@@ -316,6 +383,22 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
   const int dstPe = dstPes.empty() ? -1 : dstPes[0];
   if (dstPe < 0 && srcPe < 0) {
     return hipSuccess;
+  }
+  // Pull needs the buffer bases 16B-aligned; the kernel's byte tail covers a
+  // non-16B numBytes, so the size is not part of the gate. Else fall to push.
+  const uintptr_t bits =
+      reinterpret_cast<uintptr_t>(sendBuf) | reinterpret_cast<uintptr_t>(recvBuf);
+  if (resolveCopyMode(numBytes, kAutoPullMaxBytesPermute) == RsMode::kPull &&
+      PullCopy16Aligned(bits)) {
+    constexpr int kPullThreads = 256;
+    // A send-only rank copies nothing: one block runs the handshake.
+    const int blocks =
+        srcPe < 0 ? 1
+                  : PullCopyBlocks(numBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
+    CollectivePermutePullKernel<<<blocks, kPullThreads, 0, stream>>>(
+        nPes_, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteReady,
+        state_.permuteSendReady, state_.permuteReadDone, state_.permuteCnt, state_.groupCounters);
+    return hipGetLastError();
   }
   constexpr int kThreads = 64;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(
