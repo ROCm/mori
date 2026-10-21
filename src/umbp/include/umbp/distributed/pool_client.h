@@ -197,6 +197,8 @@ class PoolClient {
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
+  // Local SSD-resident keys copied into DRAM ahead of a read; see PeerPool::Prefetch.
+  size_t BatchPrefetch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 

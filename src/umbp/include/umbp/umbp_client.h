@@ -122,6 +122,10 @@ class IUMBPClient {
   /// Stops at the first key that does not exist (early-stop).
   virtual size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const = 0;
 
+  /// Hint that these keys are about to be read: copy the SSD-resident ones into
+  /// DRAM first. Returns the keys copied; 0 where unsupported.
+  virtual size_t BatchPrefetch(const std::vector<std::string>& /*keys*/) { return 0; }
+
   // ---- Lifecycle ----
 
   /// Remove all stored entries.  Returns true when the empty state is
