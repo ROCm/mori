@@ -20,8 +20,8 @@ extern "C" __global__ void mori_cast_float_to_fp4(float* src, mori_fp4_e2m1* dst
   constexpr int vecSize = std::min(static_cast<int>(srcVecBytes / sizeof(float)), srcVecBytes * 2);
   constexpr int dstVecBytes = vecSize / 2;
 
-  using SrcLoadType = VecTypeSelector<srcVecBytes>;
-  using DstStoreType = VecTypeSelector<dstVecBytes>;
+  using SrcLoadType = VecTypeT<srcVecBytes>;
+  using DstStoreType = VecTypeT<dstVecBytes>;
   using SrcVecType = typename VecTypeAdaptor<float, vecSize>::dataType;
   using DstVecType = typename VecTypeAdaptor<mori_fp4_e2m1, vecSize>::dataType;
 
