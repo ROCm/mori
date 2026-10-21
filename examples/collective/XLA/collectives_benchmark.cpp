@@ -95,6 +95,7 @@ struct Config {
   ReduceOpKind op{ReduceOpKind::SUM};
   RsMode mode{RsMode::kPush};
   bool modeSet{false};  // --mode given; otherwise keep the facade default
+  bool alternate{false};  // --mode alt: switch push/pull on every call
   int logS{0};
   int warmup{2};
   int iters{5};
@@ -389,6 +390,14 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
   auto blocksFor = [&](size_t n) {
     return static_cast<int>(std::min<size_t>(1024, (n + kThreads - 1) / kThreads));
   };
+  // --mode alt: every call flips push/pull, so back-to-back launches of the two
+  // paths must hand over their shared barrier/handshake state correctly.
+  bool nextPull = true;
+  auto toggle = [&] {
+    if (!cfg.alternate) return;
+    facade->SetReduceMode(nextPull ? RsMode::kPull : RsMode::kPush);
+    nextPull = !nextPull;
+  };
 
   switch (cfg.coll) {
     case Collective::kReduceScatter: {
@@ -404,7 +413,10 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
       return BenchAndVerify(
           cfg, comm, myPe, stream, static_cast<double>(N) * elemSize,
           detail::ReduceOpName(cfg.op),
-          [&] { return facade->RunReduceScatter(in, out, chunk, cfg.dt, cfg.op, stream); },
+          [&] {
+            toggle();
+            return facade->RunReduceScatter(in, out, chunk, cfg.dt, cfg.op, stream);
+          },
           [&](uint32_t* e) {
             LaunchVerifyReduce(dt, out, chunk, static_cast<size_t>(myPe) * chunk, npes, cfg.op, e,
                                blocksFor(chunk), kThreads, stream);
@@ -423,7 +435,10 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
       return BenchAndVerify(
           cfg, comm, myPe, stream, static_cast<double>(N) * elemSize,
           detail::ReduceOpName(cfg.op),
-          [&] { return facade->RunAllReduce(in, out, N, cfg.dt, cfg.op, stream); },
+          [&] {
+            toggle();
+            return facade->RunAllReduce(in, out, N, cfg.dt, cfg.op, stream);
+          },
           [&](uint32_t* e) {
             LaunchVerifyReduce(dt, out, N, 0, npes, cfg.op, e, blocksFor(N), kThreads, stream);
           });
@@ -441,7 +456,10 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
       ccoBarrierAll(comm);
       return BenchAndVerify(
           cfg, comm, myPe, stream, static_cast<double>(npes - 1) * chunkBytes, nullptr,
-          [&] { return facade->RunAllGather(in, out, chunkBytes, stream); },
+          [&] {
+            toggle();
+            return facade->RunAllGather(in, out, chunkBytes, stream);
+          },
           [&](uint32_t* e) {
             LaunchVerifyGather(dt, out, chunk, npes, e, blocksFor(N), kThreads, stream);
           });
@@ -466,7 +484,10 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
       }
       return BenchAndVerify(
           cfg, comm, myPe, stream, static_cast<double>(npes - 1) * chunkBytes, nullptr,
-          [&] { return facade->RunAllToAll(addrs, chunkBytes, stream); },
+          [&] {
+            toggle();
+            return facade->RunAllToAll(addrs, chunkBytes, stream);
+          },
           [&](uint32_t* e) {
             LaunchVerifyA2A(dt, recv, chunk, npes, myPe, e, blocksFor(N), kThreads, stream);
           });
@@ -488,6 +509,7 @@ static int RunCollective(const Config& cfg, CollectivesFacade* facade, ccoComm* 
       return BenchAndVerify(
           cfg, comm, myPe, stream, static_cast<double>(numBytes), nullptr,
           [&] {
+            toggle();
             return facade->RunCollectivePermute(send, recv, numBytes, srcPe, {dstPe}, stream);
           },
           [&](uint32_t* e) {
@@ -611,7 +633,7 @@ static const char* ModeName(RsMode m) {
 static void Usage(const char* prog) {
   XPUT("Usage: %s --coll <name> --npes <n> --size <num_elems> "
        "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] "
-       "[--mode push|pull|auto (reduce_scatter, all_reduce)] "
+       "[--mode push|pull|auto|alt (alt: flip push/pull every call)] "
        "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>]\n"
        "  coll: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute "
        "(rs|ar|ag|a2a|cp)",
@@ -682,7 +704,9 @@ int main(int argc, char* argv[]) {
     } else if (!std::strcmp(argv[i], "--op")) {
       if (!ParseOp(need("--op"), cfg.op)) { XPUT("ERROR: bad --op"); return 1; }
     } else if (!std::strcmp(argv[i], "--mode")) {
-      if (!ParseMode(need("--mode"), cfg.mode)) { XPUT("ERROR: bad --mode"); return 1; }
+      const char* m = need("--mode");
+      cfg.alternate = !std::strcmp(m, "alt");
+      if (!cfg.alternate && !ParseMode(m, cfg.mode)) { XPUT("ERROR: bad --mode"); return 1; }
       cfg.modeSet = true;
     } else if (!std::strcmp(argv[i], "--logS")) {
       cfg.logS = std::atoi(need("--logS"));
@@ -754,7 +778,8 @@ int main(int argc, char* argv[]) {
 
   XPUT("collectives_benchmark: coll=%s npes=%d size=%zu dtype=%s op=%s mode=%s logS=%d",
        CollName(cfg.coll), cfg.npes, cfg.numElems, detail::DataTypeName(cfg.dt),
-       detail::ReduceOpName(cfg.op), cfg.modeSet ? ModeName(cfg.mode) : "default", cfg.logS);
+       detail::ReduceOpName(cfg.op),
+       cfg.alternate ? "alt" : (cfg.modeSet ? ModeName(cfg.mode) : "default"), cfg.logS);
   XPUT("collectives_benchmark: heap=%zu staging=%zu perRankVmm=%zu", cfg.heapBytes,
        cfg.stagingBytes, cfg.perRankVmm);
 
