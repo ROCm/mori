@@ -135,6 +135,10 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // Copies keys held on an SSD member of their tier into a DRAM member of it, so
+  // the coming read is served from DRAM. The SSD copy stays, and the oldest
+  // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
+  size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
@@ -282,6 +286,15 @@ class PeerPool {
   // the set to drain so a late target commit cannot resurrect a wiped key.
   std::unordered_set<std::string> migrating_keys_;
   std::condition_variable transition_idle_cv_;
+  struct PrefetchedCopy {
+    std::string key;
+    uint32_t copy_id = BackendRegistry::kMaxBackends;    // DRAM copy
+    uint32_t source_id = BackendRegistry::kMaxBackends;  // SSD original
+    uint64_t bytes = 0;
+  };
+  // Oldest first. Approximate: a copy another path dropped still counts until popped.
+  std::deque<PrefetchedCopy> prefetched_;
+  uint64_t prefetched_bytes_ = 0;
   std::unordered_map<std::string, PendingPlacement> pending_keys_;
   std::map<std::pair<uint32_t, uint64_t>, std::string> pending_slots_;
   std::unordered_map<std::string, std::list<std::string>::iterator> last_access_;

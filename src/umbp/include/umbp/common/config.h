@@ -409,6 +409,10 @@ struct UMBPDistributedConfig {
   // 0 means unlimited (no size gate). Default 16 MB.
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
 
+  // DRAM held by BatchPrefetch copies of SSD-resident keys; past it the oldest
+  // copies are dropped. 0 turns prefetch off.
+  size_t prefetch_budget_bytes = 16ULL << 30;
+
   // Page size used by Master's PageBitmapAllocator for this node's medium.
   // Reported via RegisterClient.  Forwarded to PoolClientConfig::dram_page_size
   // by DistributedClient unmodified.  (Named for DRAM because the wire field
