@@ -112,5 +112,48 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
     AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
 }
+
+// Multi-block, SDMA-free all-gather: every PE reads each peer's shard straight
+// out of the peer's `input` over XGMI and stores it into its own output[peer].
+//   input  : raw symmetric-heap pointer, my shard of chunkBytes bytes
+//   output : local pointer, npes*chunkBytes bytes (all shards)
+//   chunkBytes    : bytes per shard.
+//   groupCounters : plain device buffer, [kArrivalIdx] elects the last block.
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
+//                   collective (see GenBarrier).
+//   NPES          : compile-time peer count (see PullCopyInterleaved).
+//
+// Peer-interleaved: the copy spreads its in-flight loads across all NPES peers at
+// once (PullCopyInterleaved) so NPES XGMI read links run concurrently instead of
+// one peer at a time. Two GenBarrier rounds: entry (gen+1) so no block reads a
+// peer's input before that peer entered this launch, and exit (gen+2) by the last
+// block so "kernel done" means "input reusable". The self shard is just peer myPe
+// (a local copy), so there is no in-place skip -- an in-place gather would
+// redundantly self-copy output[myPe], which is harmless.
+template <int NPES>
+__global__ void __launch_bounds__(256, 1)
+AllGatherPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
+                     const void* __restrict__ input, void* __restrict__ output,
+                     size_t chunkBytes, uint32_t* __restrict__ groupCounters,
+                     uint64_t* __restrict__ arrived) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // In block 0's first wave every lane loads this before lane myPe posts.
+  const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
+  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, npes, stride4G);
+  __syncthreads();
+
+  const auto* in = static_cast<const uint8_t*>(input);
+  auto* out = static_cast<uint8_t*>(output);
+  // System scope: the caller may hand output to a remote reader after the kernel.
+  PullCopyInterleaved<NPES>(
+      chunkBytes, [=](int j) { return PeerPtr(in, j, myPe, stride4G); },
+      [=](int j) { return out + static_cast<size_t>(j) * chunkBytes; });
+
+  // A block counts in only once all its waves are done reading peer inputs.
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    if (LastBlockOut(groupCounters)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
+  }
+}
 } // namespace collective
 } // namespace mori

@@ -148,5 +148,81 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
     AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
 }
+
+// Multi-block, SDMA-free collective-permute (one destination): every PE reads
+// srcPe's sendBuf straight over XGMI into its own recvBuf. Same arguments as
+// CollectivePermutePushKernel, plus:
+//   sendReady : symmetric-heap uint64[>= npes], zeroed once, never reset. Slot p
+//               of my copy is written only by PE p: the number of permutes in
+//               which p has entered to send to me.
+//   readDone  : symmetric-heap uint64[>= npes], same rules: the number of
+//               permutes in which p has finished reading my sendBuf.
+//   groupCounters : plain device buffer, [kArrivalIdx] elects the last block.
+//
+// Pull reverses the push dependencies: the receiver may read only once the
+// sender has entered (its producers of sendBuf have retired), and the sender may
+// complete only once the receiver is done reading sendBuf. Both sides number
+// their shared permutes with the same cnt[] as the push kernel (k-th send to p
+// pairs with p's k-th receive from me), so push and pull launches can be mixed:
+//   * entry, block 0: post k into dstPe's sendReady[me]; also post k into
+//     srcPe's ready[me], the push kernel's "receiver has entered" token.
+//   * every block of a receiver waits for sendReady[srcPe] >= k, then copies.
+//   * exit, last block: post k into srcPe's readDone[me], then, if sending, wait
+//     for readDone[dstPe] >= k; finally bump cnt.
+// Every block reads cnt at entry and only the last block, after every block has
+// counted in, writes it, so no block of this launch can see the new value. Every
+// PE posts before it waits, so rings and 2-cycles cannot deadlock (the grid is
+// co-resident). dstPe == srcPe == myPe is a plain local copy without handshake.
+__global__ void __launch_bounds__(256, 1)
+CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t heapWin,
+                            const void* __restrict__ sendBuf, void* __restrict__ recvBuf,
+                            size_t numBytes, uint64_t* __restrict__ ready,
+                            uint64_t* __restrict__ sendReady, uint64_t* __restrict__ readDone,
+                            uint64_t* __restrict__ cnt, uint32_t* __restrict__ groupCounters) {
+  const int me = heapWin->lsaRank;
+  const uint32_t stride4G = heapWin->stride4G;
+  const bool sends = dstPe >= 0 && dstPe != me;
+  const bool recvs = srcPe >= 0 && srcPe != me;
+  const uint64_t kSend = sends ? AtomicLoad<EAgentScope>(&cnt[dstPe]) + 1 : 0;
+  const uint64_t kRecv = recvs ? AtomicLoad<EAgentScope>(&cnt[kRSPushMaxPeers + srcPe]) + 1 : 0;
+
+  if (threadIdx.x == 0) {
+    if (blockIdx.x == 0) {
+      // Orders the stores of sendBuf's producers ahead of the post.
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      if (sends) AtomicStore<ESystemScope>(PeerPtr(&sendReady[me], dstPe, me, stride4G), kSend);
+      if (recvs) AtomicStore<ESystemScope>(PeerPtr(&ready[me], srcPe, me, stride4G), kRecv);
+    }
+    if (recvs) {
+      while (AtomicLoad<ESystemScope>(&sendReady[srcPe]) < kRecv) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+  }
+  __syncthreads();
+  if (recvs) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+  if (srcPe >= 0) {
+    const auto* src = PeerPtr(static_cast<const uint8_t*>(sendBuf), srcPe, me, stride4G);
+    auto* dst = static_cast<uint8_t*>(recvBuf);
+    if (src != dst) {
+      PullCopySegments(1, numBytes, [=](int) { return src; }, [=](int) { return dst; });
+    }
+  }
+
+  // A block counts in only once all its waves are done reading sendBuf.
+  __syncthreads();
+  if (threadIdx.x < warpSize && LastBlockOut(groupCounters) && threadIdx.x == 0) {
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "");
+    if (recvs) AtomicStore<ESystemScope>(PeerPtr(&readDone[me], srcPe, me, stride4G), kRecv);
+    if (sends) {
+      while (AtomicLoad<ESystemScope>(&readDone[dstPe]) < kSend) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      cnt[dstPe] = kSend;
+    }
+    if (recvs) cnt[kRSPushMaxPeers + srcPe] = kRecv;
+  }
+}
 } // namespace collective
 } // namespace mori

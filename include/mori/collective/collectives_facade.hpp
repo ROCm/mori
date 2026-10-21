@@ -70,8 +70,9 @@ namespace collective {
 class CollectivesFacade {
 
  public:
-  // Reduce algorithm selection for reduce-scatter and all-reduce (default
-  // auto: pull or push chosen per call by message size). Env overrides read in
+  // Push/pull algorithm selection for every collective (reduce-scatter,
+  // all-reduce, all-gather, all-to-all, collective-permute; default auto: pull
+  // or push chosen per call by message size). Env overrides read in
   // Create: MORI_CCL_FORCE_PUSH_N_SLICES=<S> (a power of two in {1,2,4,8})
   // forces push mode and pins the slice count, <=0/unset means no preference,
   // anything else is an error; MORI_CCL_FORCE_PULL!=0 forces pull (npes 4 or 8).
@@ -93,6 +94,11 @@ class CollectivesFacade {
   static constexpr size_t kAutoMinSliceBytes = 8ull << 20;
   static constexpr int kAutoMaxLogS = 2;
   static constexpr int kAutoAllReduceLogS = 1;
+  // Auto tuning of the copy collectives: pull below these total byte counts
+  // (all-gather/all-to-all: npes*chunkBytes, permute: numBytes).
+  static constexpr size_t kAutoPullMaxBytesAg = 4ull << 20;
+  static constexpr size_t kAutoPullMaxBytesA2a = 4ull << 20;
+  static constexpr size_t kAutoPullMaxBytesPermute = 1536ull << 10;
 
   // Per-peer all-to-all endpoints: addrs[p] = {chunk sent to peer p, recv slot
   // for sender p}. The facade copies these into its pinned AddressPair buffer.
@@ -194,7 +200,7 @@ class CollectivesFacade {
     // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
     state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
 
-    size_t controlBytes = kRSPushMaxPeers * sizeof(uint64_t) * 2;
+    size_t controlBytes = kRSPushMaxPeers * sizeof(uint64_t) * 4;
     size_t totalBytes = maxStagingBytes + controlBytes;
     state.staging = Allocate(totalBytes);
     if (state.staging == nullptr) {
@@ -212,6 +218,10 @@ class CollectivesFacade {
     // Collective-permute ready counts. Slot p of my copy is written only by PE p:
     // the number of permutes in which p has entered to receive from me; never reset.
     state.permuteReady = state.barrierCtr + kRSPushMaxPeers;
+    // Pull collective-permute handshake (see CollectivePermutePullKernel), same
+    // ownership rule: slot p of my copy is written only by PE p.
+    state.permuteSendReady = state.permuteReady + kRSPushMaxPeers;
+    state.permuteReadDone = state.permuteSendReady + kRSPushMaxPeers;
     HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
 
     // One local, zeroed-once buffer: the uint64 per-peer permute counts first
@@ -266,7 +276,7 @@ class CollectivesFacade {
   // raw local pointer (heapBase_ + offset). Every rank MUST issue the same
   // Allocate sequence (same sizes/order) so a given buffer sits at the same heap
   // offset on all ranks (symmetric addressing). Returns nullptr if the heap is
-  // exhausted. `align` defaults to 256B (SDMA/b128 friendly).
+  // exhausted. `align` defaults to 128B (SDMA/b128 friendly).
   static void* Allocate(size_t bytes, size_t align = kDefAlign) {
     auto *state = GetState();
     if (MORI_UNLIKELY(state == nullptr)) {
@@ -346,12 +356,14 @@ class CollectivesFacade {
   // All-gather: input is this PE's single shard (symmetric heap), output is the
   // gathered npes*chunk buffer (symmetric heap). Pure byte movement (element type
   // irrelevant); `chunkBytes` is this PE's per-rank shard size in bytes (the
-  // gathered output is npes*chunkBytes).
+  // gathered output is npes*chunkBytes). SetReduceMode() selects push (SDMA, one
+  // block) or pull (every PE reads the peers' shards over XGMI, multi-block).
   hipError_t RunAllGather(const void* input, void* output, size_t chunkBytes, hipStream_t stream);
 
   // All-to-all: addrs[p] = {chunk sent to peer p, recv slot for sender p}, one
   // pair per peer (addrs.size() == npes). Pure byte movement, so chunkBytes is
-  // the per-peer chunk byte count.
+  // the per-peer chunk byte count. Push needs the recv slots in the symmetric
+  // heap at the same offset on every rank; pull needs the same of the send slots.
   hipError_t RunAllToAll(const AddressVector& addrs, size_t chunkBytes, hipStream_t stream);
 
   // Device-wide barrier across all PEs on the given stream.
@@ -364,7 +376,8 @@ class CollectivesFacade {
   hipError_t RunRecv(void* recvBuf, size_t numBytes, int peer, hipStream_t stream);
 
   // Collective-permute: send my buffer to each target PE, recv from srcPe
-  // (srcPe < 0 means no source). v1: dstPes.size() == 1, SDMA push.
+  // (srcPe < 0 means no source). v1: dstPes.size() <= 1. SetReduceMode() selects
+  // push (SDMA) or pull (the receiver reads srcPe's sendBuf over XGMI).
   hipError_t RunCollectivePermute(const void* sendBuf, void* recvBuf, size_t numBytes,
                                   int srcPe, const std::vector<int>& dstPes,
                                   hipStream_t stream);
@@ -383,6 +396,8 @@ class CollectivesFacade {
     uint32_t* groupCounters{nullptr};  // local, sub-region of the permuteCnt buffer
     uint64_t* barrierCtr{nullptr};  // symmetric, gen-barrier flags of all collectives (slot p written by PE p)
     uint64_t* permuteReady{nullptr};  // symmetric, permute ready counts (slot p written by PE p)
+    uint64_t* permuteSendReady{nullptr};  // symmetric, pull-permute sender-entered counts
+    uint64_t* permuteReadDone{nullptr};   // symmetric, pull-permute receiver-done counts
     AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};
     // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -466,6 +481,7 @@ class CollectivesFacade {
            logS_(logS), mode_(mode) {}
 
   RsMode resolveMode(size_t totalBytes, bool allReduce) const;
+  RsMode resolveCopyMode(size_t totalBytes, size_t pullMaxBytes) const;
   int resolveLogS(size_t chunkBytes, bool allReduce) const;
 
   // Real reduce implementations, keyed by element type T and reduction Op. Defined

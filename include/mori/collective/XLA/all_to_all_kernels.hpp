@@ -118,5 +118,49 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
     AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
 }
+
+// Multi-block, SDMA-free all-to-all: every PE reads, from each peer p, the chunk
+// p sends to it and stores it into its own recv slot for sender p.
+//   pairs      : npes host-pinned endpoints; pairs[p].dest (local) receives
+//                peer p's chunk. Unlike the push kernel, the SEND slots must also
+//                be symmetric: peer p's chunk for me sits at the heap offset of my
+//                own pairs[myPe].source, so it is read at PeerPtr(that, p).
+//   chunkBytes : size in bytes of each per-peer chunk
+//   NPES       : compile-time peer count (see PullCopyInterleaved).
+//
+// Peer-interleaved: the copy reads all NPES peers' send slots concurrently
+// (PullCopyInterleaved), so every XGMI read link is busy at once instead of one
+// peer at a time. Synchronization is the two GenBarrier rounds of
+// AllGatherPullKernelN: entry (peers' send slots are ready) and exit by the last
+// block (peers are done reading my send slots).
+template <int NPES>
+__global__ void __launch_bounds__(256, 1)
+AllToAllPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
+                    const AddressPair* __restrict__ pairs, size_t chunkBytes,
+                    uint32_t* __restrict__ groupCounters, uint64_t* __restrict__ arrived) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // pairs lives in host memory: read it once per block, not once per copy unit.
+  __shared__ uint8_t* dsts[NPES];
+  if (threadIdx.x < NPES) {
+    dsts[threadIdx.x] = static_cast<uint8_t*>(pairs[threadIdx.x].dest);
+  }
+  const auto* src = static_cast<const uint8_t*>(pairs[myPe].source);
+
+  // In block 0's first wave every lane loads this before lane myPe posts.
+  const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
+  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, npes, stride4G);
+  __syncthreads();  // dsts visible to every thread before the copy
+
+  PullCopyInterleaved<NPES>(
+      chunkBytes,
+      [=](int j) { return PeerPtr(src, j, myPe, stride4G); },  // peer j's send slot for me
+      [&](int j) { return dsts[j]; });                         // my recv slot for sender j
+
+  // A block counts in only once all its waves are done reading peer send slots.
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    if (LastBlockOut(groupCounters)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
+  }
+}
 } // namespace collective
 } // namespace mori
