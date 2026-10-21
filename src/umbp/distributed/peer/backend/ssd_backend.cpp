@@ -424,6 +424,15 @@ std::vector<AllocateResult> SsdBackend::BatchAllocate(const std::vector<Allocate
     const StagingSpan span = AcquireStagingSpanLocked(page_count);
     if (span.page_count == 0) {
       // The arena is a real capacity limit, so this IS retry-elsewhere-worthy.
+      // A full arena fails every put; log a sample, not each key.
+      const uint64_t n = put_full_rejects_.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 16 || n % 10000 == 0) {
+        MORI_UMBP_WARN(
+            "[SsdBackend] Allocate key='{}' size={}: staging arena full ({} of {} pages in use) "
+            "[{} failed so far]",
+            req.key, req.size, staging_pages_in_use_.load(std::memory_order_relaxed),
+            staging_page_used_.size(), n);
+      }
       out.outcome = AllocateOutcome::kFailedNoSpace;
       continue;
     }
@@ -1109,6 +1118,8 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
   // that reported a miss for a key this node HOLDS, purely because the arena
   // was full — indistinguishable from a real miss anywhere else.
   event("staging_slot_full_reject", slot_full_rejects_.load(std::memory_order_relaxed));
+  // The put side of the same pressure: allocations refused for lack of a span.
+  event("staging_put_full_reject", put_full_rejects_.load(std::memory_order_relaxed));
   event("staging_expired_reclaim", staging_expired_reclaims_.load(std::memory_order_relaxed));
   // Reads that staged only an extent (D1), and their bytes.
   event("extent_stage", extent_stages_total_.load(std::memory_order_relaxed));

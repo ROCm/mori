@@ -257,6 +257,9 @@ class SsdBackend : public MediumBackend {
   // slot_full_rejects_ is the one to watch: it counts resolve batches that
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
+  // Puts refused because the arena had no span for them.  The master routes
+  // the next put the same way, so without this a full arena fails puts silently.
+  std::atomic<uint64_t> put_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
   std::atomic<uint64_t> extent_stages_total_{0};  // extent-scoped device reads
   std::atomic<uint64_t> extent_stage_bytes_{0};   // their window bytes
