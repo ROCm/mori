@@ -1331,11 +1331,59 @@ TEST(PeerPool, PrefetchBudgetRetriesACopyThatWasBeingRead) {
   ASSERT_TRUE(registry.Get("dram")->BatchResolve({"a"}, false).front().found);
   ASSERT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
   EXPECT_TRUE(registry.Get("dram")->Contains("a")) << "the lease did not hold the copy";
+  EXPECT_EQ(pool.PlacementBackend("a"), registry.BackendId(registry.Get("dram")));
 
   std::this_thread::sleep_for(kLease + std::chrono::milliseconds(50));
   ASSERT_EQ(pool.Prefetch({"c"}, kPageSize), 1u);
   EXPECT_FALSE(registry.Get("dram")->Contains("a"));
   EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
+}
+
+TEST(PeerPool, PrefetchCopiesIntoAnUpperTierAndDropsWithoutDemoting) {
+  constexpr uint64_t kPageSize = 64;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitKey(&pool, "a", "cold");
+  CommitKey(&pool, "b", "cold");
+
+  ASSERT_EQ(pool.Prefetch({"a"}, kPageSize), 1u);
+  EXPECT_EQ(pool.PlacementBackend("a"), registry.BackendId(registry.Get("hot")));
+  EXPECT_TRUE(registry.Get("cold")->Contains("a"));
+
+  // Past the budget a's copy is dropped at once, not queued for demotion.
+  ASSERT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
+  EXPECT_FALSE(registry.Get("hot")->Contains("a"));
+  EXPECT_EQ(pool.PlacementBackend("a"), registry.BackendId(registry.Get("cold")));
+}
+
+TEST(PeerPool, PrefetchPrefersDramInTheKeysOwnTier) {
+  // A system page, so 'near' really has one page (smaller buffers round up).
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "near", TierType::DRAM, kPageSize, 1);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+  tiers[1].members = {{"near", 1}, {"ssd", 1}};
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitKey(&pool, "a", "ssd");
+  CommitKey(&pool, "b", "ssd");
+
+  ASSERT_EQ(pool.Prefetch({"a", "b"}, 2 * kPageSize), 2u);
+  // One page in 'near', so one of them falls back to the tier above.
+  const auto near = registry.BackendId(registry.Get("near"));
+  const auto hot = registry.BackendId(registry.Get("hot"));
+  const auto a = pool.PlacementBackend("a");
+  const auto b = pool.PlacementBackend("b");
+  EXPECT_TRUE((a == near && b == hot) || (a == hot && b == near));
 }
 
 // ---- Local watermark eviction (frees through Evict(), as above) ----
