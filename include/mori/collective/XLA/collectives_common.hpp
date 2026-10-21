@@ -578,6 +578,147 @@ __device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, in
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
 
+// Peer `peer`'s copy of a local symmetric-heap pointer: the flat-VA rank delta
+// (peer - myPe)*stride4G<<32 used by every push and pull kernel.
+template <class T>
+__device__ __forceinline__ T* PeerPtr(T* p, int peer, int myPe, uint32_t stride4G) {
+  const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+  return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) +
+                              (static_cast<uint64_t>(diff) << 32));
+}
+
+// Elects the last block of the grid to arrive. Called by the whole first wave
+// of every block, after the block's __syncthreads; true in every lane of that
+// wave of the last block. groupCounters[kArrivalIdx] wraps back to 0 (atomicInc),
+// so it needs no reset.
+__device__ __forceinline__ bool LastBlockOut(uint32_t* groupCounters) {
+  uint32_t last = 0;
+  if (threadIdx.x == 0) {
+    last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
+  }
+  return BroadcastWarp(last, 0) != 0;
+}
+
+// Loads kept in flight per thread by PullCopySegments.
+static constexpr int kPullCopyVecs = 8;
+
+// Copy unit in bytes. Fixed at 16 (b128): every collective buffer base reaching
+// the facade is >= 16B-aligned, and the facade only takes the pull path when the
+// per-segment bases are 16B-aligned too (it routes anything else to push), so the
+// vectorized body is always valid; the byte tail only mops up a final <16B of a
+// segment whose byte count is not a 16B multiple (collective-permute / array
+// all-to-all with an odd size).
+static constexpr int kPullCopyBytes = 16;
+
+// Grid-strided copy of nSeg segments of `bytes` each, segment j going from
+// srcOf(j) to dstOf(j). Peer-outer / grid-strided-inner: each segment's base is
+// hoisted and every address is base + idx*16 (shift-add, no per-element divide),
+// so the M independent b128 loads issue back-to-back for maximum memory-level
+// parallelism across the long XGMI read latency (mirrors PullReduceShard). Loads
+// are system scope (sources are peers' buffers); stores use StoreScope.
+template <int M = kPullCopyVecs, StreamScope StoreScope = ESystemScope, class SrcFn, class DstFn>
+__device__ __forceinline__ void PullCopySegments(int nSeg, size_t bytes, SrcFn srcOf,
+                                                 DstFn dstOf) {
+  using Vec = TVecType<kPullCopyBytes>;
+  const size_t n = bytes / kPullCopyBytes;  // whole 16B units per segment
+  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  for (int seg = 0; seg < nSeg; ++seg) {
+    const uint8_t* __restrict__ src = srcOf(seg);
+    uint8_t* __restrict__ dst = dstOf(seg);
+    size_t u = gtid;
+    for (; u + (M - 1) * gstride < n; u += M * gstride) {
+      Vec v[M];
+#pragma unroll
+      for (int m = 0; m < M; m++) {
+        v[m] = StreamLoad<ESystemScope, kPullCopyBytes>(src + (u + m * gstride) * kPullCopyBytes);
+      }
+#pragma unroll
+      for (int m = 0; m < M; m++) {
+        StreamStore<StoreScope, kPullCopyBytes>(dst + (u + m * gstride) * kPullCopyBytes, v[m]);
+      }
+    }
+    for (; u < n; u += gstride) {
+      StreamStore<StoreScope, kPullCopyBytes>(
+          dst + u * kPullCopyBytes, StreamLoad<ESystemScope, kPullCopyBytes>(src + u * kPullCopyBytes));
+    }
+    // Byte tail for the final < 16B (only non-empty when bytes % 16 != 0).
+    for (size_t i = n * kPullCopyBytes + gtid; i < bytes; i += gstride) {
+      StreamStore<StoreScope, 1>(dst + i, StreamLoad<ESystemScope, 1>(src + i));
+    }
+  }
+}
+
+// Peer-interleaved pull copy. Unlike PullCopySegments (peer-outer: the whole grid
+// drains one peer before the next, so only one XGMI read link is busy at a time),
+// this issues NumVecs b128 loads spread across all NPES peers at once -- V =
+// NumVecs/NPES units per peer -- so NPES read links run concurrently and pull
+// bandwidth scales past a single link. NPES is a compile-time constant so the
+// peer bases live in SGPRs and the AA[] batch is statically indexed; requires
+// NPES to divide NumVecs. srcOf(j)/dstOf(j) return peer j's chunk base (src = a
+// peer pointer, dst = a local slot), both indexed by the same unit offset.
+// Loads are system scope (sources are peers' buffers); stores use StoreScope.
+template <int NPES, int NumVecs = kPullCopyVecs, StreamScope StoreScope = ESystemScope,
+          class SrcFn, class DstFn>
+__device__ __forceinline__ void PullCopyInterleaved(size_t bytes, SrcFn srcOf, DstFn dstOf) {
+  static_assert(NumVecs % NPES == 0, "NPES must divide NumVecs");
+  constexpr int V = NumVecs / NPES;  // units in flight per peer
+  using Vec = TVecType<kPullCopyBytes>;
+  const size_t n = bytes / kPullCopyBytes;  // whole 16B units per peer chunk
+  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  // Hoist the per-peer bases once (uniform across the block -> SGPRs).
+  const uint8_t* __restrict__ src[NPES];
+  uint8_t* __restrict__ dst[NPES];
+#pragma unroll
+  for (int j = 0; j < NPES; j++) {
+    src[j] = srcOf(j);
+    dst[j] = dstOf(j);
+  }
+
+  // Main batch: each thread holds V units for every peer => NumVecs loads in
+  // flight across NPES links before any store. Advance by V*gstride per step.
+  const size_t step = static_cast<size_t>(V) * gstride;
+  size_t u0 = gtid;
+  for (; u0 + (V - 1) * gstride < n; u0 += step) {
+    Vec aa[NumVecs];
+#pragma unroll
+    for (int j = 0; j < NPES; j++) {
+#pragma unroll
+      for (int i = 0; i < V; i++) {
+        aa[j * V + i] =
+            StreamLoad<ESystemScope, kPullCopyBytes>(src[j] + (u0 + i * gstride) * kPullCopyBytes);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < NPES; j++) {
+#pragma unroll
+      for (int i = 0; i < V; i++) {
+        StreamStore<StoreScope, kPullCopyBytes>(dst[j] + (u0 + i * gstride) * kPullCopyBytes,
+                                                aa[j * V + i]);
+      }
+    }
+  }
+  // Remainder units (still interleaved across peers to keep links busy).
+  for (size_t u = u0; u < n; u += gstride) {
+#pragma unroll
+    for (int j = 0; j < NPES; j++) {
+      StreamStore<StoreScope, kPullCopyBytes>(
+          dst[j] + u * kPullCopyBytes,
+          StreamLoad<ESystemScope, kPullCopyBytes>(src[j] + u * kPullCopyBytes));
+    }
+  }
+  // Byte tail for a final < 16B per peer (empty when bytes % 16 == 0).
+  for (size_t i = n * kPullCopyBytes + gtid; i < bytes; i += gstride) {
+#pragma unroll
+    for (int j = 0; j < NPES; j++) {
+      StreamStore<StoreScope, 1>(dst[j] + i, StreamLoad<ESystemScope, 1>(src[j] + i));
+    }
+  }
+}
+
 #endif  // __HIPCC__ || __HIP__
 
 }  // namespace collective
