@@ -1284,6 +1284,35 @@ TEST(PeerPool, ReadPromotesAboveHighWatermarkAndServesFromHotTier) {
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));  // copy mode keeps the source
 }
 
+TEST(PeerPool, PrefetchCopiesSsdKeysIntoDramWithinBudget) {
+  constexpr uint64_t kPageSize = 64;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  LogicalTierConfig kv;
+  kv.members = {{"dram", 1}, {"ssd", 1}};
+  auto compiled = LogicalTierGraph::Compile({kv}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  const std::optional<uint32_t> dram = registry.BackendId(registry.Get("dram"));
+  const std::optional<uint32_t> ssd = registry.BackendId(registry.Get("ssd"));
+  CommitKey(&pool, "a", "ssd");
+  CommitKey(&pool, "b", "ssd");
+
+  EXPECT_EQ(pool.Prefetch({"a"}, kPageSize), 1u);
+  EXPECT_EQ(pool.PlacementBackend("a"), dram);
+  EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
+  EXPECT_EQ(pool.Prefetch({"a"}, kPageSize), 0u);  // already in DRAM
+
+  // A one-key budget: b's copy pushes a back to its SSD copy.
+  EXPECT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
+  EXPECT_EQ(pool.PlacementBackend("b"), dram);
+  EXPECT_FALSE(registry.Get("dram")->Contains("a"));
+  EXPECT_EQ(pool.PlacementBackend("a"), ssd);
+  EXPECT_TRUE(pool.BatchResolve({"a"}, false).front().resolved.found);
+}
+
 // ---- Local watermark eviction (frees through Evict(), as above) ----
 
 bool WaitUntil(const std::function<bool()>& done,
