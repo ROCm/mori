@@ -23,6 +23,7 @@
 
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <cassert>
@@ -545,8 +546,16 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   // is never freed when its owner unmaps and releases it (e.g. vLLM sleep mode).
   // Exporting the allocation handle does not; it needs the allocation to have
   // been created with the POSIX fd handle type, otherwise fall through.
+  //
+  // hipMemRetainAllocationHandle segfaults inside HIP, instead of failing, on
+  // memory it did not map through hipMemMap: pinned host memory (hipHostMalloc,
+  // hipHostRegister) and hipMalloc alike. hipMalloc memory has exported through
+  // HSA above, and only device memory can be VMM, so ask only for that.
+  hipPointerAttribute_t attrs{};
+  const bool maybeVmm =
+      hipPointerGetAttributes(&attrs, ptr) == hipSuccess && attrs.type == hipMemoryTypeDevice;
   hipMemGenericAllocationHandle_t handle;
-  if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
+  if (maybeVmm && hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
     hipError_t exportErr =
         hipMemExportToShareableHandle(&fd, handle, hipMemHandleTypePosixFileDescriptor, 0);
     if (RetainAddsReference()) (void)hipMemRelease(handle);
@@ -616,10 +625,21 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
                      ptr, size, mr->lkey, mr->rkey);
       return makeHandle(mr);
     }
+    const int err = errno;
     MORI_APP_WARN(
         "RegisterRdmaMemoryRegionAuto {} registration failed (addr:{}, size:{}, "
         "errno:{} ({}))",
-        name, ptr, size, errno, strerror(errno));
+        name, ptr, size, err, strerror(err));
+    // Every NIC's registration of a buffer pins it again, against RLIMIT_MEMLOCK
+    // unless the process has CAP_IPC_LOCK in the initial user namespace (not
+    // inside a container's own user namespace).
+    rlimit memlock{};
+    if (!useDmabuf && err == ENOMEM && getrlimit(RLIMIT_MEMLOCK, &memlock) == 0 &&
+        memlock.rlim_cur != RLIM_INFINITY) {
+      MORI_APP_WARN("ibv_reg_mr ENOMEM with RLIMIT_MEMLOCK at {} KiB; raise it (ulimit -l)",
+                    memlock.rlim_cur >> 10);
+    }
+    errno = err;
   }
 
   MORI_APP_ERROR(
