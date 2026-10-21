@@ -61,10 +61,10 @@ using VecU32x4 = uint32_t __attribute__((ext_vector_type(4)));
 // clang-format off
 template <int VecBytes>
 using VecTypeT = std::conditional_t<VecBytes == 1,  uint8_t,
-                        std::conditional_t<VecBytes == 2,  uint16_t,
-                        std::conditional_t<VecBytes == 4,  uint32_t,
-                        std::conditional_t<VecBytes == 8,  uint64_t,
-                        std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
+                 std::conditional_t<VecBytes == 2,  uint16_t,
+                 std::conditional_t<VecBytes == 4,  uint32_t,
+                 std::conditional_t<VecBytes == 8,  uint64_t,
+                 std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
 // clang-format on
 
 template <typename T, int VecSize>
@@ -108,14 +108,14 @@ struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
 namespace detail {
 
 template <typename T>
-inline __device__ T* global(T* ptr) {
+__forceinline__ __device__ T* global(T* ptr) {
   static_assert(!std::is_volatile<T>::value, "T must not be volatile");
   return (T*)(T __attribute__((address_space(1)))*)reinterpret_cast<uintptr_t>(ptr);
 }
 }  // namespace detail
 
 template <int VecBytes>
-inline __device__ VecTypeT<VecBytes> load(const void* p) {
+__forceinline__ __device__ VecTypeT<VecBytes> load(const void* p) {
   auto ptr = detail::global(static_cast<const VecTypeT<VecBytes>*>(p));
 #if USE_BUILDIN_LD
   return __builtin_nontemporal_load(ptr);
@@ -125,7 +125,7 @@ inline __device__ VecTypeT<VecBytes> load(const void* p) {
 }
 
 template <int VecBytes>
-inline __device__ void store(void* p, VecTypeT<VecBytes> v) {
+__forceinline__ __device__ void store(void* p, VecTypeT<VecBytes> v) {
   auto ptr = detail::global(static_cast<VecTypeT<VecBytes>*>(p));
 #if USE_BUILDIN_ST
   __builtin_nontemporal_store(v, ptr);
@@ -2662,17 +2662,17 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
 
     const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(src);
     const uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dst);
-    const bool canVec8 = ((srcAddr & 0x7) == 0) && ((dstAddr & 0x7) == 0);
+    const bool canVec16 = ((srcAddr & 0xF) == 0) && ((dstAddr & 0xF) == 0);
     const bool canVec4 = ((srcAddr & 0x3) == 0) && ((dstAddr & 0x3) == 0);
 
     const int vecEnd8 = (hiddenDim / kVec8) * kVec8;
     const int vecEnd4 = (hiddenDim / kVec4) * kVec4;
 
-    if (canVec8) {
+    if (canVec16) {
       const auto* __restrict__ srcAligned =
-          static_cast<const hip_bfloat16*>(__builtin_assume_aligned(src, 8));
+          static_cast<const hip_bfloat16*>(__builtin_assume_aligned(src, 16));
       auto* __restrict__ dstAligned =
-          static_cast<CombineInternalFp8*>(__builtin_assume_aligned(dst, 8));
+          static_cast<CombineInternalFp8*>(__builtin_assume_aligned(dst, 16));
 
 #pragma unroll 4
       for (int j = laneId * kVec8; j < vecEnd8; j += warpSize * kVec8) {
@@ -2725,7 +2725,7 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
       }
     }
 
-    if (canVec8 || canVec4) {
+    if (canVec16 || canVec4) {
       for (int j = vecEnd4 + laneId; j < hiddenDim; j += warpSize) {
         dst[j] = Fp8T(src[j]);
       }
