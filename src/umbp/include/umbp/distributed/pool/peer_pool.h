@@ -135,7 +135,7 @@ class PeerPool {
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
-  // Copies keys held on an SSD member of their tier into a DRAM member of it, so
+  // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
   size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes);

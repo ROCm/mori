@@ -359,8 +359,8 @@ void PeerPool::PromoteForRead(const std::vector<std::string>& keys,
   }
 }
 
-// A copy promotion within the tier: the entry tier has no upper tier to promote
-// into, and the copy only has to outlive the read it was made for.
+// A copy, not a promotion: it only has to outlive the read it was made for, so
+// the budget can drop it without demoting anything.
 size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes) {
   if (budget_bytes == 0 || keys.empty()) return 0;
   size_t copied = 0;
@@ -379,8 +379,12 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
         auto* source = backends_->Get(source_id);
         const auto tier = tier_graph_->TierIndexForBackendId(source_id);
         if (source == nullptr || source->Tier() != TierType::SSD || !tier.has_value()) continue;
+        // DRAM in the key's own tier first (weighted), then in the tiers above it.
+        auto order = tier_graph_->WeightedMemberOrder(*tier, key);
+        const auto upper = tier_graph_->PromoteTargetOrder(*tier, key);
+        order.insert(order.end(), upper.begin(), upper.end());
         std::vector<uint32_t> dram;
-        for (uint32_t id : tier_graph_->WeightedMemberOrder(*tier, key)) {
+        for (uint32_t id : order) {
           auto* member = backends_->Get(id);
           if (member != nullptr && member->Tier() == TierType::DRAM) dram.push_back(id);
         }
@@ -415,7 +419,13 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
       prefetched_bytes_ -= std::min(prefetched_bytes_, oldest.bytes);
       // Never the key's last copy.
       auto* source = backends_->Get(oldest.source_id);
-      if (source != nullptr && source->Contains(oldest.key)) victims.push_back(std::move(oldest));
+      if (source == nullptr || !source->Contains(oldest.key)) continue;
+      // Back on the source, so a tier with offload_to drops the copy instead of demoting it.
+      auto placement = placements_.find(oldest.key);
+      if (placement != placements_.end() && placement->second == oldest.copy_id) {
+        placement->second = oldest.source_id;
+      }
+      victims.push_back(std::move(oldest));
     }
   }
   if (victims.empty()) return copied;
@@ -432,6 +442,10 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
     if (i < results.size() && results[i].outcome == PoolEvictOutcome::kFreed) continue;
     auto* copy = backends_->Get(victims[i].copy_id);
     if (copy == nullptr || !copy->Contains(victims[i].key)) continue;
+    auto placement = placements_.find(victims[i].key);
+    if (placement != placements_.end() && placement->second == victims[i].source_id) {
+      placement->second = victims[i].copy_id;
+    }
     prefetched_bytes_ += victims[i].bytes;
     prefetched_.push_front(std::move(victims[i]));
   }
