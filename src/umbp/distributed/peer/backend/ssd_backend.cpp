@@ -262,7 +262,8 @@ TierCapacity SsdBackend::Capacity() const {
 }
 
 uint64_t SsdBackend::OwnedKeyCount() const {
-  return static_cast<uint64_t>(ssd_->SnapshotOwnedKeys().size());
+  // Metrics poll this every second; a snapshot would copy every key under mutex_.
+  return static_cast<uint64_t>(ssd_->OwnedKeyCount());
 }
 
 std::vector<KvEvent> SsdBackend::DrainPendingEvents() {
