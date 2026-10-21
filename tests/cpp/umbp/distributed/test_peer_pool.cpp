@@ -1313,6 +1313,31 @@ TEST(PeerPool, PrefetchCopiesSsdKeysIntoDramWithinBudget) {
   EXPECT_TRUE(pool.BatchResolve({"a"}, false).front().resolved.found);
 }
 
+TEST(PeerPool, PrefetchBudgetRetriesACopyThatWasBeingRead) {
+  constexpr uint64_t kPageSize = 64;
+  constexpr auto kLease = std::chrono::milliseconds(300);
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kPageSize, 4, kLease);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  LogicalTierConfig kv;
+  kv.members = {{"dram", 1}, {"ssd", 1}};
+  auto compiled = LogicalTierGraph::Compile({kv}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  for (const char* key : {"a", "b", "c"}) CommitKey(&pool, key, "ssd");
+
+  ASSERT_EQ(pool.Prefetch({"a"}, kPageSize), 1u);
+  ASSERT_TRUE(registry.Get("dram")->BatchResolve({"a"}, false).front().found);
+  ASSERT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
+  EXPECT_TRUE(registry.Get("dram")->Contains("a")) << "the lease did not hold the copy";
+
+  std::this_thread::sleep_for(kLease + std::chrono::milliseconds(50));
+  ASSERT_EQ(pool.Prefetch({"c"}, kPageSize), 1u);
+  EXPECT_FALSE(registry.Get("dram")->Contains("a"));
+  EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
+}
+
 // ---- Local watermark eviction (frees through Evict(), as above) ----
 
 bool WaitUntil(const std::function<bool()>& done,
