@@ -364,7 +364,7 @@ void PeerPool::PromoteForRead(const std::vector<std::string>& keys,
 size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes) {
   if (budget_bytes == 0 || keys.empty()) return 0;
   size_t copied = 0;
-  std::vector<PoolEvictRequest> victims;
+  std::vector<PrefetchedCopy> victims;
   {
     std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
     std::vector<TransitionJob> jobs;
@@ -410,18 +410,31 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
       prefetched_bytes_ += results[j].bytes_moved;
     }
     while (prefetched_bytes_ > budget_bytes && !prefetched_.empty()) {
-      const PrefetchedCopy oldest = std::move(prefetched_.front());
+      PrefetchedCopy oldest = std::move(prefetched_.front());
       prefetched_.pop_front();
       prefetched_bytes_ -= std::min(prefetched_bytes_, oldest.bytes);
       // Never the key's last copy.
       auto* source = backends_->Get(oldest.source_id);
-      if (source != nullptr && source->Contains(oldest.key)) {
-        victims.push_back(PoolEvictRequest{oldest.key, TierType::UNKNOWN, oldest.copy_id});
-      }
+      if (source != nullptr && source->Contains(oldest.key)) victims.push_back(std::move(oldest));
     }
   }
+  if (victims.empty()) return copied;
   // Evict takes the lifecycle lock itself.
-  if (!victims.empty()) Evict(victims, PoolEvictMode::kReclaim);
+  std::vector<PoolEvictRequest> requests;
+  requests.reserve(victims.size());
+  for (const auto& victim : victims) {
+    requests.push_back(PoolEvictRequest{victim.key, TierType::UNKNOWN, victim.copy_id});
+  }
+  const auto results = Evict(requests, PoolEvictMode::kReclaim);
+  // A copy still being read frees nothing: keep counting it, oldest first.
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  for (size_t i = victims.size(); i-- > 0;) {
+    if (i < results.size() && results[i].outcome == PoolEvictOutcome::kFreed) continue;
+    auto* copy = backends_->Get(victims[i].copy_id);
+    if (copy == nullptr || !copy->Contains(victims[i].key)) continue;
+    prefetched_bytes_ += victims[i].bytes;
+    prefetched_.push_front(std::move(victims[i]));
+  }
   return copied;
 }
 
