@@ -4958,6 +4958,11 @@ bool PoolClient::Exists(const std::string& key) {
   return !v.empty() && v.front();
 }
 
+size_t PoolClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (!initialized_ || default_pool_ == nullptr) return 0;
+  return default_pool_->Prefetch(keys, config_.prefetch_budget_bytes);
+}
+
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {
   if (!initialized_ || keys.empty()) return std::vector<bool>(keys.size(), false);
 

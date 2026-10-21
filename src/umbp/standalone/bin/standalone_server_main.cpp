@@ -242,6 +242,8 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
     return false;
   }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_PREFETCH_BUDGET_BYTES", &dist.prefetch_budget_bytes, error))
+    return false;
   size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
   if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
   dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
