@@ -42,7 +42,9 @@ using namespace mori::application;
 using namespace mori::core;
 using namespace mori::shmem;
 
-static constexpr int32_t EP_CONFIG_I32_VERSION = 1;
+// Bumped for fuseSignalOnSendQp. A stale JIT kernel bundle now fails loudly in
+// FromPackedI32Array instead of silently mis-decoding the tail of the array.
+static constexpr int32_t EP_CONFIG_I32_VERSION = 2;
 
 // 56 → block_elems = 7168/56 = 128, matching the AccumNum=8 + VecBytes=8 dequant specialization.
 static constexpr int kDefaultFp8BlockwiseScaleDim = 56;
@@ -70,6 +72,7 @@ std::vector<int32_t> EpDispatchCombineConfig::ToPackedI32Array() const {
       numQpPerPe,
       static_cast<int32_t>(quantType),
       static_cast<int32_t>(enableSdma),
+      static_cast<int32_t>(fuseSignalOnSendQp),
   };
 }
 
@@ -103,6 +106,7 @@ EpDispatchCombineConfig EpDispatchCombineConfig::FromPackedI32Array(const int32_
   cfg.numQpPerPe = packed[17];
   cfg.quantType = static_cast<QuantType>(packed[18]);
   cfg.enableSdma = (packed[19] != 0);
+  cfg.fuseSignalOnSendQp = (packed[20] != 0);
   return cfg;
 }
 
@@ -144,6 +148,17 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
   config.enableSdma = useCcoComm ? false : ShmemSdmaEnabled();
   MORI_OPS_INFO("EpDispatchCombine SDMA {} (currently only effective for AsyncLL kernel type)",
                 config.enableSdma ? "enabled" : "disabled");
+
+  // Unlike MORI_ENABLE_SDMA (whose getenv must be read at Context construction
+  // because it changes allocation behaviour), this flag only selects which kernel
+  // branch runs -- no allocation, no Context interaction -- so reading it here is
+  // safe.
+  config.fuseSignalOnSendQp = env::IsEnvVarEnabled("MORI_EP_ASYNCLL_FUSE_SIGNAL");
+  if (config.fuseSignalOnSendQp && config.rank == 0) {
+    MORI_OPS_INFO(
+        "AsyncLL fused send-QP signal ENABLED (RDMA peers only); the local CQE "
+        "drain is deferred past the poll loop.");
+  }
   if (config.kernelType == KernelType::AsyncLL && !config.enableSdma && config.rank == 0) {
     MORI_OPS_WARN(
         "Mori AsyncLL is selected but SDMA is disabled. AsyncLL without SDMA uses compute units "
