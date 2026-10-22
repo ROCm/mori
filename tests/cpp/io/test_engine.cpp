@@ -2099,6 +2099,14 @@ void RunHiddenDeviceSplitVisibility(int exportDevice, const std::string& importe
   constexpr size_t kSize = 1024 * 1024;
   auto exportMem = RegisterGpuMemory(&engine, kSize, exportDevice);
 
+  // RegisterMemory switches to device 0 to export the IPC handle; it must hand
+  // the caller's current device back.
+  int currentDevice = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&currentDevice));
+  Require(currentDevice == exportDevice, "RegisterMemory changed the current device from " +
+                                             std::to_string(exportDevice) + " to " +
+                                             std::to_string(currentDevice));
+
   // Clear export buffer
   HIP_RUNTIME_CHECK(hipSetDevice(exportDevice));
   HIP_RUNTIME_CHECK(hipMemset(exportMem.ptr, 0x00, kSize));
