@@ -465,6 +465,16 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   return tableIt->second;
 }
 
+EpPairVec RdmaManager::GetLiveEndpoints(EngineKey engine, TopoKeyPair key) {
+  EpPairVec eps = GetAllEndpoint(engine, key);
+  eps.erase(std::remove_if(eps.begin(), eps.end(),
+                           [this](const EpPair& ep) {
+                             return !IsQpAlive(ep.ldevId, ep.local.handle.qpn);
+                           }),
+            eps.end());
+  return eps;
+}
+
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   const auto& [device, portId] = availDevices[devId];
   const auto* deviceAttr = device->GetDeviceAttr();
@@ -1778,10 +1788,15 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
   std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);
 
+  const int failedEpNum =
+      rdma->CountEndpoint(ekey, kp) - static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
+  int builtEpNum = 0;
+
   if (effectiveNumNics == 1) {
-    int epNum = rdma->CountEndpoint(ekey, kp);
+    int epNum = static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
     for (int i = epNum; i < config.qpPerTransfer; ++i) {
       server->BuildRdmaConn(ekey, kp, 0);
+      ++builtEpNum;
     }
   } else {
     std::unordered_map<int, int> rankByDev;
@@ -1789,7 +1804,7 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
       rankByDev[localCandidates[rank].first] = rank;
     }
 
-    EpPairVec existing = rdma->GetAllEndpoint(ekey, kp);
+    EpPairVec existing = rdma->GetLiveEndpoints(ekey, kp);
     std::vector<int> haveByRank(effectiveNumNics, 0);
     for (const auto& ep : existing) {
       auto it = rankByDev.find(ep.ldevId);
@@ -1799,11 +1814,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     for (int rank = 0; rank < effectiveNumNics; ++rank) {
       for (int count = haveByRank[rank]; count < desiredPerRank[rank]; ++count) {
         server->BuildRdmaConn(ekey, kp, rank);
+        ++builtEpNum;
       }
     }
   }
+  if (failedEpNum > 0 && builtEpNum > 0) {
+    MORI_IO_WARN(
+        "CreateSession: built {} QP(s) to engine {} in place of failed ones ({} failed so far)",
+        builtEpNum, ekey, failedEpNum);
+  }
 
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
+  EpPairVec eps = rdma->GetLiveEndpoints(ekey, kp);
   if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
     throw std::runtime_error("RdmaBackend::CreateSession: insufficient RDMA endpoints");
   }
@@ -1883,7 +1904,9 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      return it->second.get();
+      if (it->second->Alive()) return it->second.get();
+      retiredSessions.push_back(std::move(it->second));
+      sessionCache.erase(it);
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
