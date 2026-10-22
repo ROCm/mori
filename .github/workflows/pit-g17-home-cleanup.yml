@@ -1,0 +1,53 @@
+name: pit-g17 home quota cleanup
+
+# One-off maintenance for the MI355X-AINIC-PIT-G17 runner (pit2-p03-g17), whose
+# runner user's $HOME is over quota, so `docker build` dies with
+# "failed to update builder last activity time ... disk quota exceeded".
+# Lives on its own branch only; never merge to main.
+#
+# Push to the branch -> diagnose only.
+# Push a commit whose message contains [clean] -> diagnose, delete, diagnose.
+on:
+  push:
+    branches: [maint/pit-g17-home-cleanup]
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
+    timeout-minutes: 20
+    steps:
+      - name: Diagnose
+        run: |
+          set +e
+          id; echo "HOME=$HOME"; hostname
+          quota -s 2>&1
+          df -h "$HOME"; df -i "$HOME"
+          echo "== largest entries in \$HOME"
+          du -xsh "$HOME"/.[!.]* "$HOME"/* 2>/dev/null | sort -h | tail -30
+          echo "== ~/.docker"
+          du -xh --max-depth=3 "$HOME/.docker" 2>/dev/null | sort -h | tail -20
+          echo "buildx files: $(find "$HOME/.docker/buildx" -type f 2>/dev/null | wc -l)"
+          echo "== ~/.cache"
+          du -xsh "$HOME"/.cache/* 2>/dev/null | sort -h | tail -20
+          exit 0
+
+      - name: Clean regenerable caches
+        if: contains(github.event.head_commit.message, '[clean]')
+        run: |
+          set +e
+          # buildx client metadata only; the build cache itself lives in the daemon.
+          rm -rf "$HOME/.docker/buildx/refs" "$HOME/.docker/buildx/activity"
+          rm -rf "$HOME/.cache/pip"
+          exit 0
+
+      - name: Diagnose after clean
+        if: contains(github.event.head_commit.message, '[clean]')
+        run: |
+          set +e
+          quota -s 2>&1
+          df -h "$HOME"
+          du -xsh "$HOME"/.[!.]* "$HOME"/* 2>/dev/null | sort -h | tail -15
+          exit 0
