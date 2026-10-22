@@ -127,6 +127,8 @@ class RdmaManager {
   bool IsQpAlive(int devId, uint32_t qpNum) const;
   // Records IBV_WC_RETRY_EXC_ERR: the only place peer death is observable.
   void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
+  // Records any other error completion: the QP is in ERR, but no event is raised.
+  void RecordQpFailed(const EpPair& ep);
   // Name of an available device; availDevices is fixed, so this takes no lock.
   std::string DeviceName(int devId) const;
 

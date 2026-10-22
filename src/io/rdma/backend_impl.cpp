@@ -657,6 +657,10 @@ void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText
   peerFailures_.Report(report);
 }
 
+void RdmaManager::RecordQpFailed(const EpPair& ep) {
+  peerFailures_.MarkQpFailed(PeerFailureTracker::QpKey{DeviceName(ep.ldevId), ep.local.handle.qpn});
+}
+
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
   std::shared_lock<std::shared_mutex> lock(mu);
   auto it = endpointsById_.find(id);
@@ -886,6 +890,12 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           if (wc[i].status == IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
             rdma->RecordPeerUnreachable(ep, failureAdvice.statusText);
           }
+        }
+        // Any error completion, a flush included, means the QP is in the error
+        // state, so later sessions must not use it. Recorded before the status
+        // below: a caller that sees the failure and retries gets a new QP.
+        if (wc[i].status != IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
+          rdma->RecordQpFailed(ep);
         }
 
         int mergedBatchSize = 0;
