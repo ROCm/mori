@@ -336,6 +336,23 @@ struct UMBPDistributedConfig {
   // stops paying for an arena it does not use.
   size_t ranged_scratch_size = 0;
 
+  // Back both ranged scratch arenas with hugetlbfs pages.  Each arena is one
+  // NIC memory region, and a region's translation entries are its pages, so on
+  // 4 KiB pages an arena runs into ranged_scratch_max_mr_pages at 1 GiB; on
+  // 2 MiB pages the same limit is 512 GiB.  Falls back to 4 KiB pages when no
+  // hugetlb pages are free, and the page limit below is then checked against
+  // what was actually mapped.
+  bool ranged_scratch_use_hugepages = false;
+  size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
+  // Most pages one ranged scratch arena may span; 0 = no limit.  AINIC (ionic)
+  // refuses a region above 2^19 entries -- and mori's dmabuf fallback for that
+  // refusal segfaults on host memory -- while it TRANSLATES only the first
+  // 2^18: past that, RDMA reads and writes silently land 2^18 pages lower.  An
+  // arena over the limit is rejected at startup instead.  Raise it, or set 0,
+  // only on a NIC known to translate the whole region.
+  size_t ranged_scratch_max_mr_pages = size_t{1} << 18;
+
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.
   int ssd_staging_buffer_slots = 0;

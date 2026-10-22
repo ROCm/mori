@@ -29,9 +29,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -657,6 +659,69 @@ TEST_F(PoolClientRangesTest, DistributedScratchIsExplicitlyOptedIn) {
   ASSERT_NE(opted_in, nullptr);
   EXPECT_TRUE(opted_in->SupportsRangedIO());
   opted_in->Close();
+}
+
+// Each scratch arena is one NIC memory region, and AINIC silently wraps
+// addresses past the entries it translates, so an arena over the page limit
+// must fail at startup rather than on its first remote transfer.
+TEST_F(PoolClientRangesTest, DistributedScratchOverMrPageLimitFailsAtStartup) {
+  EXPECT_EQ(UMBPDistributedConfig{}.ranged_scratch_max_mr_pages, size_t{1} << 18);
+  constexpr size_t kArenaPages = 4;
+
+  auto expect_rejected = [](const UMBPConfig& config) {
+    try {
+      auto client = CreateUMBPClient(config);
+      ADD_FAILURE() << "an arena over ranged_scratch_max_mr_pages was accepted";
+      client->Close();
+    } catch (const std::runtime_error& error) {
+      EXPECT_NE(std::string(error.what()).find("ranged_scratch_max_mr_pages"), std::string::npos)
+          << error.what();
+    }
+  };
+
+  auto over = DistributedConfig("ranges-scratch-over-limit", kArenaPages * kPageSize);
+  over.distributed->ranged_scratch_max_mr_pages = kArenaPages - 1;
+  expect_rejected(over);
+
+  // Asking for hugepages does not satisfy the limit by itself: it is checked
+  // against the pages actually mapped. A hugepage size the allocator cannot
+  // use makes it fall back to 4 KiB pages, deterministically on any host.
+  auto fell_back = DistributedConfig("ranges-scratch-fell-back", kArenaPages * kPageSize);
+  fell_back.distributed->ranged_scratch_use_hugepages = true;
+  fell_back.distributed->ranged_scratch_hugepage_size = 3 * 1024 * 1024;
+  fell_back.distributed->ranged_scratch_max_mr_pages = kArenaPages - 1;
+  expect_rejected(fell_back);
+
+  auto at_limit = DistributedConfig("ranges-scratch-at-limit", kArenaPages * kPageSize);
+  at_limit.distributed->ranged_scratch_max_mr_pages = kArenaPages;
+  auto client = CreateUMBPClient(at_limit);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+  client->Close();
+}
+
+// With hugetlb pages free, a 2 MiB-paged arena spans one page and so passes a
+// limit that the same arena on 4 KiB pages would fail.
+TEST_F(PoolClientRangesTest, DistributedScratchOnHugepagesFitsUnderMrPageLimit) {
+  constexpr size_t kHugepage = 2 * 1024 * 1024;
+  size_t free_hugepages = 0;
+  if (FILE* f = std::fopen("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages", "r")) {
+    if (std::fscanf(f, "%zu", &free_hugepages) != 1) free_hugepages = 0;
+    std::fclose(f);
+  }
+  // Two arenas, plus slack for anything else in this process taking pages.
+  if (free_hugepages < 4) {
+    GTEST_SKIP() << "needs 4 free 2 MiB hugepages, have " << free_hugepages;
+  }
+
+  auto config = DistributedConfig("ranges-scratch-hugepages", kHugepage);
+  config.distributed->ranged_scratch_use_hugepages = true;
+  config.distributed->ranged_scratch_hugepage_size = kHugepage;
+  config.distributed->ranged_scratch_max_mr_pages = 1;
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+  client->Close();
 }
 
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
