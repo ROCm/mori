@@ -89,16 +89,17 @@ struct AddressPair {
 
 #if defined(__HIPCC__) || defined(__HIP__)
 
+#ifndef USE_NONTEMPORAL_LOAD
 #define USE_NONTEMPORAL_LOAD 0
+#endif
 #define GLOBAL_SPACE __attribute__((address_space(1)))
 
 // Streaming (cache-bypassing) 16-byte load/store.
-#if (defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__))
 #if __has_builtin(__builtin_amdgcn_global_load_b128) && \
     __has_builtin(__builtin_amdgcn_global_store_b128)
-#elif defined(__HIP_DEVICE_COMPILE__)
-#error "Global b128 load/store not supported on this architecture"
-#endif
+#define MORI_HAS_GLOBAL_B128 1
+#else
+#define MORI_HAS_GLOBAL_B128 0
 #endif
 
 constexpr uint32_t VecBytes = 16;
@@ -142,11 +143,21 @@ __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
   return __builtin_nontemporal_load(ptr);
 #else
   if constexpr (Bytes == 16) {
+#if MORI_HAS_GLOBAL_B128
     if constexpr (Scope == ESystemScope) {
       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
     } else {
       return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
     }
+#else
+    auto halves = reinterpret_cast<uint64_t*>(ptr);
+    constexpr int kScope =
+        Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM : __HIP_MEMORY_SCOPE_AGENT;
+    uint64_t lo = __hip_atomic_load(halves, __ATOMIC_RELAXED, kScope);
+    uint64_t hi = __hip_atomic_load(halves + 1, __ATOMIC_RELAXED, kScope);
+    return cco::ccoUint4{static_cast<uint32_t>(lo), static_cast<uint32_t>(lo >> 32),
+                         static_cast<uint32_t>(hi), static_cast<uint32_t>(hi >> 32)};
+#endif
   } else {
     return AtomicLoad<Scope>(ptr);
   }
@@ -162,11 +173,21 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
   __builtin_nontemporal_store(v, ptr);
 #else
   if constexpr (Bytes == 16) {
+#if MORI_HAS_GLOBAL_B128
     if constexpr (Scope == ESystemScope) {
       __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "");
     } else {
       __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
     }
+#else
+    auto halves = reinterpret_cast<uint64_t*>(ptr);
+    constexpr int kScope =
+        Scope == ESystemScope ? __HIP_MEMORY_SCOPE_SYSTEM : __HIP_MEMORY_SCOPE_AGENT;
+    __hip_atomic_store(halves, static_cast<uint64_t>(v.x) | (static_cast<uint64_t>(v.y) << 32),
+                       __ATOMIC_RELAXED, kScope);
+    __hip_atomic_store(halves + 1, static_cast<uint64_t>(v.z) | (static_cast<uint64_t>(v.w) << 32),
+                       __ATOMIC_RELAXED, kScope);
+#endif
   } else {
     AtomicStore<Scope>(ptr, v);
   }
