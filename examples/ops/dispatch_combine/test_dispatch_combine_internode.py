@@ -1223,9 +1223,10 @@ class EpDispatchCombineTestCase:
             self.combine_data_type
         ):
             raise ValueError("stress_accuracy does not support fp4")
+        rounds = int(os.environ.get("MORI_STRESS_ROUNDS") or rounds)
         op = mori.ops.EpDispatchCombineOp(self.config)
         if self.rank == 0:
-            print("Stress Accuracy Test (every round verified)")
+            print(f"Stress Accuracy Test (every round verified, {rounds} rounds)")
         self._stress_verified_rounds(op, rounds, num_datasets, check_interval)
         del op
 
