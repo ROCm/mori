@@ -5,8 +5,8 @@ name: pit-g17 home quota cleanup
 # "failed to update builder last activity time ... disk quota exceeded".
 # Lives on its own branch only; never merge to main.
 #
-# Push to the branch -> diagnose only.
-# Push a commit whose message contains [clean] -> diagnose, delete, diagnose.
+# Push to the branch -> probe only.
+# Push a commit whose message contains [clean] -> probe, delete, probe.
 on:
   push:
     branches: [maint/pit-g17-home-cleanup]
@@ -19,43 +19,6 @@ jobs:
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     timeout-minutes: 20
     steps:
-      - name: Diagnose
-        run: |
-          set +e
-          id; echo "HOME=$HOME"; hostname
-          quota -s 2>&1
-          df -h "$HOME"; df -i "$HOME"
-          echo "== largest entries in \$HOME"
-          du -xsh "$HOME"/.[!.]* "$HOME"/* 2>/dev/null | sort -h | tail -30
-          echo "== ~/.docker"
-          du -xh --max-depth=3 "$HOME/.docker" 2>/dev/null | sort -h | tail -20
-          echo "buildx files: $(find "$HOME/.docker/buildx" -type f 2>/dev/null | wc -l)"
-          echo "== ~/.cache"
-          du -xsh "$HOME"/.cache/* 2>/dev/null | sort -h | tail -20
-          exit 0
-
-      - name: Inspect editor caches (read-only)
-        run: |
-          set +e
-          echo "== running editor servers (this node)"
-          ps -u "$(id -u)" -o pid,lstart,args 2>/dev/null | grep -E 'vscode-server|cursor-server|cpptools' | grep -v grep | cut -c1-220 | head -20
-          echo "== ~/.cache/vscode-cpptools"
-          du -xh --max-depth=2 "$HOME/.cache/vscode-cpptools" 2>/dev/null | sort -h | tail -15
-          find "$HOME/.cache/vscode-cpptools" -xdev -type f -printf '%T@\t%TY-%Tm-%Td\n' 2>/dev/null | sort -n | tail -1 | cut -f2 | sed 's/^/newest mtime: /'
-          for s in vscode-server cursor-server; do
-            R="$HOME/.$s"
-            echo "== ~/.$s"
-            du -xh --max-depth=2 "$R" 2>/dev/null | sort -h | tail -20
-            echo "-- server builds (mtime size path)"
-            for b in "$R"/cli/servers/* "$R"/bin/*; do
-              [ -e "$b" ] && echo "$(stat -c '%y' "$b" | cut -c1-16)  $(du -xsh "$b" 2>/dev/null | cut -f1)  $b"
-            done
-            echo "-- caches"
-            du -xsh "$R"/data/logs "$R"/data/CachedExtensionVSIXs "$R"/data/CachedProfilesData "$R"/extensions 2>/dev/null
-            du -xsh "$R"/data/User/workspaceStorage/*/ms-vscode.cpptools 2>/dev/null | sort -h | tail -5
-          done
-          exit 0
-
       - name: Quota headroom probe (before)
         run: |
           set +e
@@ -63,13 +26,18 @@ jobs:
           rm -f "$HOME/.ci_quota_probe"
           exit 0
 
-      - name: Clean CI buildx state
+      - name: Clean regenerable editor caches and logs
         if: contains(github.event.head_commit.message, '[clean]')
         run: |
           set +e
-          # buildx client metadata written by CI builds; the build cache itself lives in the daemon.
-          rm -rf "$HOME/.docker/buildx/refs" "$HOME/.docker/buildx/activity"
-          du -xsh "$HOME/.docker"
+          # Caches and logs only; installed extensions, server builds and user data are left alone.
+          for d in "$HOME/.cache/vscode-cpptools/ipch" \
+                   "$HOME/.vscode-server/data/CachedExtensionVSIXs" \
+                   "$HOME/.vscode-server/data/logs" \
+                   "$HOME/.cursor-server/data/logs"; do
+            echo "$(du -xsh "$d" 2>/dev/null | cut -f1)  $d"
+            rm -rf "$d"
+          done
           exit 0
 
       - name: Quota headroom probe (after)
