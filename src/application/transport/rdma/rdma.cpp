@@ -670,6 +670,17 @@ bool RdmaDeviceContext::DestroyRdmaEndpointNoThrow(const RdmaEndpoint& ep) noexc
   return false;
 }
 
+bool RdmaDeviceContext::ModifyEndpointToErrorNoThrow(const RdmaEndpoint& ep) noexcept {
+  try {
+    MORI_APP_WARN(
+        "ModifyEndpointToErrorNoThrow is unsupported for provider vendorId={} qpn={}; "
+        "the peer cannot be fenced through this endpoint",
+        static_cast<uint32_t>(ep.vendorId), ep.handle.qpn);
+  } catch (...) {
+  }
+  return false;
+}
+
 ibv_srq* RdmaDeviceContext::CreateRdmaSrqIfNx(const RdmaEndpointConfig& config) {
   assert(config.maxMsgSge <= GetRdmaDevice()->GetDeviceAttr()->orig_attr.max_sge);
   if (srq == nullptr) {

@@ -107,6 +107,12 @@ class IOEngine {
   // Takes the oldest pending peer failure across all backends. False means
   // nothing has been observed to fail, not that peers are healthy.
   bool PopPeerFailure(PeerFailureEvent* out);
+  // Cuts `remote` off from this engine's memory: afterwards none of its connections
+  // can deliver another write, so buffers it was targeting may be reused. Unlike
+  // DeregisterRemoteEngine this drops the live connections, not just the address
+  // book entry. The peer can come back only by building new connections.
+  // Safe to call for an unknown peer; the result then reports nothing fenced.
+  FenceResult FenceRemoteEngine(const EngineKey& remote);
   // Wait for all statuses with failure-wins precedence. Empty input succeeds.
   StatusCode WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs = -1);
 
