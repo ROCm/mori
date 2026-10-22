@@ -34,20 +34,62 @@ jobs:
           du -xsh "$HOME"/.cache/* 2>/dev/null | sort -h | tail -20
           exit 0
 
-      - name: Clean regenerable caches
-        if: contains(github.event.head_commit.message, '[clean]')
+      - name: Inspect mori_epv2_recheck_20260917 (read-only)
         run: |
           set +e
-          # buildx client metadata only; the build cache itself lives in the daemon.
-          rm -rf "$HOME/.docker/buildx/refs" "$HOME/.docker/buildx/activity"
-          rm -rf "$HOME/.cache/pip"
+          D="$HOME/mori_epv2_recheck_20260917"
+          grep ' /home ' /proc/mounts
+          stat "$D"
+          echo "files: $(find "$D" -xdev -type f | wc -l)"
+          for d in 7 14 30; do
+            echo "last ${d}d: atime $(find "$D" -xdev -type f -atime -$d | wc -l)" \
+                 " mtime $(find "$D" -xdev -type f -mtime -$d | wc -l)" \
+                 " ctime $(find "$D" -xdev -type f -ctime -$d | wc -l)"
+          done
+          for t in A T C; do
+            echo "== newest %$t (A=access T=modify C=change)"
+            find "$D" -xdev -printf "%${t}@\t%${t}Y-%${t}m-%${t}d %${t}H:%${t}M\t%p\n" | sort -n | tail -5 | cut -f2-
+          done
+          echo "== top level"
+          du -xsh "$D"/* "$D"/.[!.]* 2>/dev/null | sort -h | tail -15
+          echo "== processes with cwd/fd inside"
+          for p in /proc/[0-9]*; do
+            if readlink "$p/cwd" "$p"/fd/* 2>/dev/null | grep -q "$D"; then
+              echo "$(basename $p) $(tr '\0' ' ' < $p/cmdline | cut -c1-150)"
+            fi
+          done
+          echo "== git repos"
+          find "$D" -xdev -maxdepth 3 -name .git | while read g; do
+            r=$(dirname "$g"); echo "-- $r"
+            git -C "$r" log -1 --format='HEAD %h %ci %s' 2>&1
+            git -C "$r" branch -vv --no-color 2>&1 | head -10
+            echo "uncommitted: $(git -C "$r" status --porcelain 2>/dev/null | wc -l)"
+            git -C "$r" status --porcelain 2>/dev/null | head -15
+            echo "unpushed commits:"; git -C "$r" log --branches --not --remotes --oneline 2>&1 | head -10
+            echo "stashes: $(git -C "$r" stash list 2>/dev/null | wc -l)"
+          done
           exit 0
 
-      - name: Diagnose after clean
+      - name: Quota headroom probe (before)
+        run: |
+          set +e
+          dd if=/dev/zero of="$HOME/.ci_quota_probe" bs=64K count=1024 conv=fsync 2>&1 | tail -2
+          rm -f "$HOME/.ci_quota_probe"
+          exit 0
+
+      - name: Clean CI buildx state
         if: contains(github.event.head_commit.message, '[clean]')
         run: |
           set +e
-          quota -s 2>&1
-          df -h "$HOME"
-          du -xsh "$HOME"/.[!.]* "$HOME"/* 2>/dev/null | sort -h | tail -15
+          # buildx client metadata written by CI builds; the build cache itself lives in the daemon.
+          rm -rf "$HOME/.docker/buildx/refs" "$HOME/.docker/buildx/activity"
+          du -xsh "$HOME/.docker"
+          exit 0
+
+      - name: Quota headroom probe (after)
+        if: contains(github.event.head_commit.message, '[clean]')
+        run: |
+          set +e
+          dd if=/dev/zero of="$HOME/.ci_quota_probe" bs=64K count=1024 conv=fsync 2>&1 | tail -2
+          rm -f "$HOME/.ci_quota_probe"
           exit 0
