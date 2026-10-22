@@ -114,13 +114,15 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
   std::string Describe() const;
 
  private:
+  // @p honor_floor (every selector): skip a logical tier whose min_object_bytes exceeds the block.
+
   /// Try only @p node_id on exactly @p tier; nullopt if it cannot fit
   /// @p block_size.  No cross-node, no cross-tier fallback.  Used by same-node
   /// affinity to pin a whole batch to one (node, tier) — stickiness, not a tier
   /// preference.
   std::optional<RoutePutResult> TrySelectOnNodeTier(
       const std::vector<ClientRecord>& candidates, const std::string& node_id, TierType tier,
-      uint64_t block_size, const std::unordered_set<std::string>& exclude_nodes,
+      uint64_t block_size, bool honor_floor, const std::unordered_set<std::string>& exclude_nodes,
       const std::string& logical_tier = {}) const;
 
   /// Try only @p node_id, on whichever of its tiers has the most room; nullopt
@@ -128,14 +130,14 @@ class ConfigurableRoutePutStrategy : public RoutePutStrategy {
   /// the caller's explicit job.
   std::optional<RoutePutResult> TrySelectOnNode(
       const std::vector<ClientRecord>& candidates, const std::string& node_id, uint64_t block_size,
-      const std::unordered_set<std::string>& exclude_nodes) const;
+      bool honor_floor, const std::unordered_set<std::string>& exclude_nodes) const;
 
   /// Base algorithm over every (node, tier) pair with room: most-available picks
   /// the largest free space, random draws weighted by it.  When @p preferred_node
   /// is set and has room on any of its tiers it wins over the algorithm outright.
   /// This is the explicit global-fallback entry point.
   std::optional<RoutePutResult> SelectByAlgo(
-      const std::vector<ClientRecord>& candidates, uint64_t block_size,
+      const std::vector<ClientRecord>& candidates, uint64_t block_size, bool honor_floor,
       const std::unordered_set<std::string>& exclude_nodes,
       const std::optional<std::string>& preferred_node = std::nullopt);
 

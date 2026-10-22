@@ -336,6 +336,7 @@ TEST_P(RedisStoreTest, PreservesLogicalTierPeakUtilization) {
   hot.capacity = TierCapacity{1024, 256, 128};
   hot.put_eligible = true;
   hot.peak_member_utilization = 0.875;
+  hot.min_object_bytes = 256 << 10;
   registration.logical_tier_capacities["hot"] = hot;
 
   ASSERT_TRUE(store_->RegisterClient(registration, now_, 30s));
@@ -343,6 +344,7 @@ TEST_P(RedisStoreTest, PreservesLogicalTierPeakUtilization) {
   ASSERT_TRUE(record.has_value());
   ASSERT_EQ(record->logical_tier_capacities.count("hot"), 1u);
   EXPECT_DOUBLE_EQ(record->logical_tier_capacities.at("hot").peak_member_utilization, 0.875);
+  EXPECT_EQ(record->logical_tier_capacities.at("hot").min_object_bytes, 256u << 10);
 }
 
 TEST_P(RedisStoreTest, RegisterRejectsAliveDuplicateButAllowsStale) {

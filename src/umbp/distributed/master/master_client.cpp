@@ -136,6 +136,7 @@ void FillLogicalTierCapacities(
     cap->set_max_allocatable_bytes(logical.capacity.max_allocatable_bytes);
     cap->set_put_eligible(logical.put_eligible);
     cap->set_peak_member_utilization(logical.peak_member_utilization);
+    cap->set_min_object_bytes(logical.min_object_bytes);
   }
 }
 
