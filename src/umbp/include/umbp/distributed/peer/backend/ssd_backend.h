@@ -72,10 +72,6 @@ class SsdBackend : public MediumBackend {
     bool staging_use_hugepages = false;
     uint64_t staging_hugepage_size = 2ULL * 1024 * 1024;
 
-    // Init fails if the mapped arena spans more pages than this; 0 = no check.
-    // Set when the arena becomes one RDMA region (see max_mr_pages in config.h).
-    uint64_t max_mr_pages = 0;
-
     PeerSsdConfig ssd;
 
     std::chrono::milliseconds pending_ttl{30000};
@@ -223,7 +219,7 @@ class SsdBackend : public MediumBackend {
   // The staging arena: ONE host buffer of staging_pages * page_size, so every
   // page is contiguous (PrepareRead's requirement) and one registration covers
   // the lot.  buffer_index is therefore always 0.
-  std::unique_ptr<HostPageMemorySource> staging_source_;
+  std::unique_ptr<PageMemorySource> staging_source_;
   void* staging_base_ = nullptr;
   uint64_t staging_size_ = 0;
   TransferRef buffer_ref_;

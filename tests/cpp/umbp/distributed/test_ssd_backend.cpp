@@ -104,10 +104,9 @@ class SsdBackendTest : public ::testing::Test {
 
   // `staging_pages` is the backend's real concurrency limit, so tests that care
   // about exhaustion set it small.
-  SsdBackend::Config MakeConfig(
-      uint32_t staging_pages = 8,
-      std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
-      uint64_t ssd_capacity = 64ULL * 1024 * 1024) {
+  SsdBackend* Start(uint32_t staging_pages = 8,
+                    std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
+                    uint64_t ssd_capacity = 64ULL * 1024 * 1024) {
     SsdBackend::Config cfg;
     cfg.page_size = kPageSize;
     cfg.staging_pages = staging_pages;
@@ -117,14 +116,9 @@ class SsdBackendTest : public ::testing::Test {
     cfg.ssd.ssd.storage_dir = dir_.string();
     cfg.ssd.ssd.capacity_bytes = ssd_capacity;
     cfg.ssd.ssd.io.backend = UMBPIoBackend::Posix;  // avoid io_uring container flakiness
-    return cfg;
-  }
 
-  SsdBackend* Start(uint32_t staging_pages = 8,
-                    std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
-                    uint64_t ssd_capacity = 64ULL * 1024 * 1024) {
-    backend_ =
-        std::make_unique<SsdBackend>(MakeConfig(staging_pages, read_lease_ttl, ssd_capacity));
+    auto owned = std::make_unique<SsdBackend>(std::move(cfg));
+    backend_ = std::move(owned);
     EXPECT_TRUE(backend_->Init(&registrar_));
     return backend_.get();
   }
@@ -298,17 +292,6 @@ TEST_F(SsdBackendTest, PublishesPlainHostMemorySoNoNewEngineIsNeeded) {
   // Which means the plain host engine claims its pairs, with nothing new added.
   LocalCopyEngine local;
   EXPECT_TRUE(local.CanHandle(ref, ref));
-}
-
-// The arena is one NIC region, so Init refuses one past what the NIC translates.
-TEST_F(SsdBackendTest, InitRejectsAStagingArenaOverMaxMrPages) {
-  const uint64_t pages = 8 * kPageSize / static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-  for (const uint64_t limit : {pages - 1, pages}) {
-    SsdBackend::Config cfg = MakeConfig(/*staging_pages=*/8);
-    cfg.max_mr_pages = limit;
-    SsdBackend backend(std::move(cfg));
-    EXPECT_EQ(backend.Init(&registrar_), limit == pages) << "max_mr_pages=" << limit;
-  }
 }
 
 TEST_F(SsdBackendTest, ReportsAnOutOfRangeBufferAsInvalid) {

@@ -88,8 +88,8 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // The ranged scratch arena. It is registered with the transfer engine below,
   // and unlike a medium pool it has no NUMA policy to honour — it is touched
   // once per remote ranged operation, not held as a cache. Its page size does
-  // matter: each arena is one NIC memory region, so hugepages are what let it
-  // grow past max_mr_pages worth of 4 KiB pages.
+  // matter: each arena is one NIC memory region, and hugepages cut its
+  // translation entries.
   //
   // Zero-sized is the default and means "this deployment does not do ranged
   // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
@@ -113,27 +113,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       allocator.Free(ranged_put_scratch_handle_);
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
-    // Checked against the pages actually mapped, not the ones asked for: with
-    // no hugetlb pages free the allocator falls back to 4 KiB pages, and an
-    // arena sized for hugepages then spans 512x the entries. Over the limit the
-    // NIC either refuses the region on the first remote transfer or, worse,
-    // accepts it and silently wraps addresses past the entries it translates.
-    for (const HostBufferHandle* handle :
-         {&ranged_get_scratch_handle_, &ranged_put_scratch_handle_}) {
-      const size_t pages = handle->mapped_size / handle->actual_alignment;
-      if (dc.max_mr_pages > 0 && pages > dc.max_mr_pages) {
-        const std::string detail = std::to_string(handle->mapped_size) + " bytes in " +
-                                   std::to_string(pages) + " pages of " +
-                                   std::to_string(handle->actual_alignment) + " bytes";
-        allocator.Free(ranged_get_scratch_handle_);
-        allocator.Free(ranged_put_scratch_handle_);
-        throw std::runtime_error(
-            "DistributedClient: ranged scratch arena spans " + detail +
-            ", above max_mr_pages=" + std::to_string(dc.max_mr_pages) +
-            " (each arena is one NIC memory region); enable ranged_scratch_use_hugepages with "
-            "enough free hugetlb pages, or shrink ranged_scratch_size");
-      }
-    }
+    // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
     MORI_UMBP_INFO("[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
                    ranged_get_scratch_handle_.mapped_size >> 20,
                    ranged_get_scratch_handle_.actual_alignment >> 10,

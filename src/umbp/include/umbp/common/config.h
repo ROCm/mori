@@ -337,22 +337,10 @@ struct UMBPDistributedConfig {
   size_t ranged_scratch_size = 0;
 
   // Back both ranged scratch arenas with hugetlbfs pages.  Each arena is one
-  // NIC memory region, and a region's translation entries are its pages, so on
-  // 4 KiB pages an arena runs into max_mr_pages at 1 GiB; on
-  // 2 MiB pages the same limit is 512 GiB.  Falls back to 4 KiB pages when no
-  // hugetlb pages are free, and the page limit below is then checked against
-  // what was actually mapped.
+  // NIC memory region, so hugepages cut its translation entries, which NICs
+  // cap per region.  Falls back to 4 KiB pages when no hugetlb pages are free.
   bool ranged_scratch_use_hugepages = false;
   size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
-
-  // Most pages one NIC memory region may span -- each ranged scratch arena and,
-  // with an RDMA engine, the SSD staging arena; 0 = no limit.  AINIC (ionic)
-  // refuses a region above 2^19 entries -- and mori's dmabuf fallback for that
-  // refusal segfaults on host memory -- while it TRANSLATES only the first
-  // 2^18: past that, RDMA reads and writes silently land 2^18 pages lower.  An
-  // arena over the limit is rejected at startup instead.  Raise it, or set 0,
-  // only on a NIC known to translate the whole region.
-  size_t max_mr_pages = size_t{1} << 18;
 
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.
@@ -362,8 +350,7 @@ struct UMBPDistributedConfig {
   // backend moves crosses that arena twice (device <-> arena, arena <-> wire),
   // so its TLB behaviour sits on the critical path in a way an ordinary
   // buffer's does not.  Falls back to 4 KiB pages when no hugetlb pages are
-  // free — a node must still come up, unless an RDMA engine would then
-  // register more than max_mr_pages.
+  // free — a node must still come up.
   bool ssd_staging_use_hugepages = false;
   size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 

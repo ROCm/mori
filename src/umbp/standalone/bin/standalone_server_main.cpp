@@ -208,9 +208,6 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
                     &dist.ranged_scratch_hugepage_size, error)) {
     return false;
   }
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_MAX_MR_PAGES", &dist.max_mr_pages, error)) {
-    return false;
-  }
   if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
                    error)) {
     return false;

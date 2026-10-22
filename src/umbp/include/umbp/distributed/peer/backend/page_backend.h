@@ -129,9 +129,6 @@ class HostPageMemorySource final : public PageMemorySource {
   int Device() const override { return -1; }
   const char* Name() const override { return "HostPageMemorySource"; }
 
-  // Page size buffer `index` was actually mapped with (hugetlb falls back to 4 KiB).
-  uint64_t MappedPageSize(size_t index) const { return handles_.at(index).actual_alignment; }
-
  private:
   Options opts_;
   std::vector<HostBufferHandle> handles_;
