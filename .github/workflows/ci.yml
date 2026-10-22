@@ -274,6 +274,19 @@ jobs:
               timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
           "
 
+      - name: MORI-IO C++ (test_engine)
+        run: |
+          # `pip install .` leaves BUILD_TESTS off, so test_engine is built here.
+          # Its XGMI hidden-device cases re-launch the binary under a narrower
+          # HIP_VISIBLE_DEVICES, so the parent must see every GPU.
+          $CT exec $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            cmake -B build_io -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
+            cmake --build build_io -j --target test_engine
+            timeout 300 ./build_io/tests/cpp/test_engine
+          "
+
       - name: MORI-IO fault catalog (ibverbs)
         # The catalog's known_bug expectations were measured on ionic; other NICs
         # join once verified.
