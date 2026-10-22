@@ -106,6 +106,12 @@ if(BUILD_IO)
   target_include_directories(test_peer_failure PUBLIC ${CMAKE_SOURCE_DIR})
   target_link_libraries(test_peer_failure mori_application mori_io)
 
+  add_executable(test_fence io/test_fence.cpp)
+
+  target_include_directories(test_fence PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_include_directories(test_fence PUBLIC ${CMAKE_SOURCE_DIR})
+  target_link_libraries(test_fence mori_application mori_io)
+
   add_executable(test_topology application/test_topology.cpp)
 
   target_include_directories(test_topology PUBLIC ${CMAKE_SOURCE_DIR}/include)

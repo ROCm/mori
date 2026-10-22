@@ -121,6 +121,14 @@ class RdmaManager {
   // to a failed state.
   int FailInFlightTransfers(const QpErrorEvent& event);
 
+  // Takes every connection to `remoteKey` out of service. Each QP is moved to
+  // Error so the peer can no longer write through it, then removed from the route
+  // table so no new session picks it up, and its in-flight transfers are failed.
+  // The QP objects stay allocated: the CQ poller still drains their flush CQEs, and
+  // freeing them under it would race. Registered memory is left untouched, so the
+  // peer can reconnect through the normal handshake.
+  FenceResult FenceRemoteEngine(const EngineKey& remoteKey);
+
   /* -------------------------------- Peer failure -------------------------------- */
   // Takes the oldest recorded failure; polled by an application thread.
   bool PopPeerFailure(PeerFailureEvent* out);
@@ -363,6 +371,7 @@ class RdmaBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool PopPeerFailure(PeerFailureEvent* out) override;
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:

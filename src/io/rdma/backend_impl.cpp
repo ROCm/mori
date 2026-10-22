@@ -744,6 +744,62 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
   return failed;
 }
 
+FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
+  // Detach the peer's endpoints under the lock so no new session can pick one up
+  // from here on. The verbs calls below run without it: FailAll() can wait for an
+  // in-flight post, and neither step needs the table.
+  EpPairVec victims;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    auto it = remotes.find(remoteKey);
+    if (it != remotes.end()) {
+      for (auto& [topo, eps] : it->second.rTable) {
+        victims.insert(victims.end(), eps.begin(), eps.end());
+      }
+      it->second.rTable.clear();
+      // Remote keys cached for the fenced incarnation must not outlive it: a peer
+      // that comes back may have registered different memory under the same ids.
+      it->second.mTable.clear();
+    }
+  }
+
+  FenceResult result;
+  result.supported = true;
+
+  const std::string message = "peer " + remoteKey + " was fenced; its connection was shut down";
+  for (const auto& ep : victims) {
+    // Cut the peer off first. This is the step the caller relies on, so it must not
+    // wait behind the local bookkeeping below.
+    application::RdmaDeviceContext* devCtx = GetRdmaDeviceContext(ep.ldevId);
+    if (devCtx == nullptr || !devCtx->ModifyEndpointToErrorNoThrow(ep.local)) {
+      ++result.endpointsFailed;
+      MORI_IO_ERROR("fence: could not move qpn={} (peer {}) to Error; peer may still write",
+                    ep.local.handle.qpn, remoteKey);
+      // Keep going: fencing the remaining QPs still narrows what the peer can do,
+      // and the caller learns from endpointsFailed that the fence is incomplete.
+    } else {
+      ++result.endpointsFenced;
+    }
+
+    // Same treatment as a fatal async event: refuse new posts, close the ledger,
+    // and fail whatever was in flight so no waiter hangs on a completion that the
+    // dead QP will never deliver.
+    if (ep.degraded) ep.degraded->store(true, kSqAdmissionOrder);
+    if (ep.ledger) {
+      result.transfersFailed +=
+          ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, ep.sqDepth.get());
+    }
+    NotifySqStateChanged(ep);
+  }
+
+  if (result.endpointsFailed > 0) {
+    result.message = std::to_string(result.endpointsFailed) + " of " +
+                     std::to_string(victims.size()) + " endpoint(s) of peer " + remoteKey +
+                     " could not be fenced";
+  }
+  return result;
+}
+
 bool RdmaManager::HasIonicDevice() const {
   for (const auto& [device, portId] : availDevices) {
     const ibv_device_attr_ex* attr = device->GetDeviceAttr();
@@ -1952,6 +2008,24 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
 bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
   if (!rdma) return false;
   return rdma->PopPeerFailure(out);
+}
+
+FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
+  if (!rdma) return FenceResult{};
+  // Fence before dropping sessions. The other way round, a CreateSession racing
+  // with us could still see the old endpoints, cache a session over them, and leave
+  // it pointing at dead QPs once the fence lands.
+  FenceResult result = rdma->FenceRemoteEngine(remote);
+
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+    if (it->first.remoteEngineKey == remote) {
+      it = sessionCache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return result;
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,

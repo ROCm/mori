@@ -388,6 +388,31 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
   MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
 }
 
+FenceResult IOEngine::FenceRemoteEngine(const EngineKey& remote) {
+  FenceResult total;
+  std::string unsupported;
+  for (auto& it : backends) {
+    FenceResult part = it.second->FenceRemoteEngine(remote);
+    if (!part.supported) {
+      // A backend with no way to cut the peer off (e.g. local-interconnect copies)
+      // does not weaken the guarantee for the transports that do.
+      continue;
+    }
+    total.supported = true;
+    total.endpointsFenced += part.endpointsFenced;
+    total.endpointsFailed += part.endpointsFailed;
+    total.transfersFailed += part.transfersFailed;
+    if (!part.message.empty()) {
+      if (!total.message.empty()) total.message += "; ";
+      total.message += part.message;
+    }
+  }
+  MORI_IO_INFO("Fence remote engine {}: supported={} fenced={} failed={} transfers_failed={}",
+               remote.c_str(), total.supported, total.endpointsFenced, total.endpointsFailed,
+               total.transfersFailed);
+  return total;
+}
+
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
   MemoryDesc memDesc;
   memDesc.engineKey = desc.key;

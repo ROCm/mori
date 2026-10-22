@@ -244,5 +244,15 @@ class IOEngine:
         """
         return self._engine.PopPeerFailure()
 
+    def fence_remote_engine(self, engine_key: str) -> "mori_cpp.FenceResult":
+        """Cut a peer off from this engine's memory.
+
+        Afterwards none of the peer's connections can deliver another write, so
+        buffers it was targeting can be reused. Only trust that when the result
+        has ``ok`` set; ``endpoints_failed > 0`` means the peer may still write.
+        Fencing a peer this engine has no connection to is ok and a no-op.
+        """
+        return self._engine.FenceRemoteEngine(engine_key)
+
     def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
         return self._engine.WaitAll(statuses, timeout_ms)
