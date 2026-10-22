@@ -80,6 +80,8 @@ struct LogicalTierCapacity {
   // tier it aggregates every tier reachable by offload, so neither of its
   // ratios can be checked against this tier's watermarks.
   double peak_member_utilization = 0.0;
+  // Smaller objects would land only on members whose min_object_size they are under.
+  uint64_t min_object_bytes = 0;
 };
 
 struct TierTransitionMetrics {

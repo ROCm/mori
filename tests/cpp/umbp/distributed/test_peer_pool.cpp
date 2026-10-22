@@ -647,6 +647,18 @@ TEST(TieredPlacementPolicy, SmallObjectsSkipMembersWithMinObjectSize) {
   }
 }
 
+TEST(TieredPlacementPolicy, AdvertisesLowestMinObjectSizePerTier) {
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<MockBackend>(TierType::DRAM)));
+  ASSERT_TRUE(registry.Register("ssd", std::make_unique<MockBackend>(TierType::SSD)));
+  auto mixed =
+      LogicalTierGraph::Compile({LogicalTierConfig{{{"dram", 1}, {"ssd", 1, 64 << 10}}}}, registry);
+  auto ssd_only = LogicalTierGraph::Compile({LogicalTierConfig{{{"ssd", 1, 64 << 10}}}}, registry);
+  ASSERT_TRUE(mixed.ok() && ssd_only.ok());
+  EXPECT_EQ(mixed.graph->CapacitySnapshot().begin()->second.min_object_bytes, 0u);
+  EXPECT_EQ(ssd_only.graph->CapacitySnapshot().begin()->second.min_object_bytes, 64u << 10);
+}
+
 TEST(TieredPlacementPolicy, RejectsTierGraphWithoutTransferEngine) {
   BackendRegistry registry;
   ASSERT_TRUE(registry.Register("only", std::make_unique<MockBackend>(TierType::DRAM)));
