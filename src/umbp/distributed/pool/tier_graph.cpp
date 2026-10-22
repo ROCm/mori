@@ -179,6 +179,15 @@ std::map<std::string, LogicalTierCapacity> LogicalTierGraph::CapacitySnapshot() 
           std::max(logical.capacity.max_allocatable_bytes, allocatable);
     }
     logical.peak_member_utilization = PeakMemberUtilization(tier);
+    // The lowest floor among the members a put into this tier can land on.
+    uint64_t floor = std::numeric_limits<uint64_t>::max();
+    for (TierIndex reachable : ReachableTierOrder(tier, false, true)) {
+      for (const auto& member : NodeAt(reachable).members) {
+        if (member.weight == 0 || backends_->GetEntry(member.backend_name) == nullptr) continue;
+        floor = std::min(floor, member.min_object_bytes);
+      }
+    }
+    logical.min_object_bytes = floor == std::numeric_limits<uint64_t>::max() ? 0 : floor;
     snapshot.emplace(NodeAt(tier).name, logical);
   }
   TierCapacity entry_pool;
