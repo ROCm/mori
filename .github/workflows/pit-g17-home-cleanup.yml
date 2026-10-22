@@ -34,39 +34,25 @@ jobs:
           du -xsh "$HOME"/.cache/* 2>/dev/null | sort -h | tail -20
           exit 0
 
-      - name: Inspect mori_epv2_recheck_20260917 (read-only)
+      - name: Inspect editor caches (read-only)
         run: |
           set +e
-          D="$HOME/mori_epv2_recheck_20260917"
-          grep ' /home ' /proc/mounts
-          stat "$D"
-          echo "files: $(find "$D" -xdev -type f | wc -l)"
-          for d in 7 14 30; do
-            echo "last ${d}d: atime $(find "$D" -xdev -type f -atime -$d | wc -l)" \
-                 " mtime $(find "$D" -xdev -type f -mtime -$d | wc -l)" \
-                 " ctime $(find "$D" -xdev -type f -ctime -$d | wc -l)"
-          done
-          for t in A T C; do
-            echo "== newest %$t (A=access T=modify C=change)"
-            find "$D" -xdev -printf "%${t}@\t%${t}Y-%${t}m-%${t}d %${t}H:%${t}M\t%p\n" | sort -n | tail -5 | cut -f2-
-          done
-          echo "== top level"
-          du -xsh "$D"/* "$D"/.[!.]* 2>/dev/null | sort -h | tail -15
-          echo "== processes with cwd/fd inside"
-          for p in /proc/[0-9]*; do
-            if readlink "$p/cwd" "$p"/fd/* 2>/dev/null | grep -q "$D"; then
-              echo "$(basename $p) $(tr '\0' ' ' < $p/cmdline | cut -c1-150)"
-            fi
-          done
-          echo "== git repos"
-          find "$D" -xdev -maxdepth 3 -name .git | while read g; do
-            r=$(dirname "$g"); echo "-- $r"
-            git -C "$r" log -1 --format='HEAD %h %ci %s' 2>&1
-            git -C "$r" branch -vv --no-color 2>&1 | head -10
-            echo "uncommitted: $(git -C "$r" status --porcelain 2>/dev/null | wc -l)"
-            git -C "$r" status --porcelain 2>/dev/null | head -15
-            echo "unpushed commits:"; git -C "$r" log --branches --not --remotes --oneline 2>&1 | head -10
-            echo "stashes: $(git -C "$r" stash list 2>/dev/null | wc -l)"
+          echo "== running editor servers (this node)"
+          ps -u "$(id -u)" -o pid,lstart,args 2>/dev/null | grep -E 'vscode-server|cursor-server|cpptools' | grep -v grep | cut -c1-220 | head -20
+          echo "== ~/.cache/vscode-cpptools"
+          du -xh --max-depth=2 "$HOME/.cache/vscode-cpptools" 2>/dev/null | sort -h | tail -15
+          find "$HOME/.cache/vscode-cpptools" -xdev -type f -printf '%T@\t%TY-%Tm-%Td\n' 2>/dev/null | sort -n | tail -1 | cut -f2 | sed 's/^/newest mtime: /'
+          for s in vscode-server cursor-server; do
+            R="$HOME/.$s"
+            echo "== ~/.$s"
+            du -xh --max-depth=2 "$R" 2>/dev/null | sort -h | tail -20
+            echo "-- server builds (mtime size path)"
+            for b in "$R"/cli/servers/* "$R"/bin/*; do
+              [ -e "$b" ] && echo "$(stat -c '%y' "$b" | cut -c1-16)  $(du -xsh "$b" 2>/dev/null | cut -f1)  $b"
+            done
+            echo "-- caches"
+            du -xsh "$R"/data/logs "$R"/data/CachedExtensionVSIXs "$R"/data/CachedProfilesData "$R"/extensions 2>/dev/null
+            du -xsh "$R"/data/User/workspaceStorage/*/ms-vscode.cpptools 2>/dev/null | sort -h | tail -5
           done
           exit 0
 
