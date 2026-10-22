@@ -840,7 +840,8 @@ std::vector<BackendInstanceConfig> EffectiveBackendConfigs(const PoolClientConfi
 
 std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig& config,
                                                      uint64_t page_size, bool staging_use_hugepages,
-                                                     uint64_t staging_hugepage_size) {
+                                                     uint64_t staging_hugepage_size,
+                                                     uint64_t staging_max_mr_pages) {
   switch (config.tier) {
     case TierType::DRAM: {
       PageBackend::OwnershipConfig ownership;
@@ -866,6 +867,7 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
                                               config.ssd.ssd.capacity_bytes, page_size);
       ssd_cfg.staging_use_hugepages = staging_use_hugepages;
       ssd_cfg.staging_hugepage_size = staging_hugepage_size;
+      ssd_cfg.max_mr_pages = staging_max_mr_pages;
       ssd_cfg.ssd = config.ssd;
       ssd_cfg.ssd.enabled = true;
       ssd_cfg.read_lease_ttl = SsdReadLeaseTtl();
@@ -1052,9 +1054,11 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
+    // Without an RDMA engine the staging arena never becomes a NIC region.
     auto backend =
         MakeConfiguredBackend(backend_config, page_size, config_.ssd_staging_use_hugepages,
-                              config_.ssd_staging_hugepage_size);
+                              config_.ssd_staging_hugepage_size,
+                              config_.io_engine.host.empty() ? 0 : config_.max_mr_pages);
     if (backend == nullptr) {
       MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}", backend_config.name,
                       static_cast<int>(backend_config.tier));

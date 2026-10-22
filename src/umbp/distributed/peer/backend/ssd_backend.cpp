@@ -98,7 +98,8 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
   // Every byte this backend moves crosses the arena twice (device <-> arena,
   // arena <-> wire), so hugepage backing matters here more than for an ordinary
   // buffer.  HostMemAllocator falls back to 4 KiB pages on its own when no
-  // hugetlb pages are free, which is what we want: a node must still come up.
+  // hugetlb pages are free, which is what we want: a node must still come up
+  // (unless that breaks max_mr_pages below).
   HostPageMemorySource::Options staging_opts;
   staging_opts.use_hugepages = cfg_.staging_use_hugepages;
   staging_opts.hugepage_size = cfg_.staging_hugepage_size;
@@ -112,6 +113,18 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
   }
   staging_base_ = buffers[0].base;
   staging_size_ = buffers[0].size;
+
+  // Past max_mr_pages the NIC refuses the region (the fallback segfaults) or corrupts it.
+  const uint64_t mr_pages = staging_size_ / staging_source_->MappedPageSize(0);
+  if (cfg_.max_mr_pages > 0 && mr_pages > cfg_.max_mr_pages) {
+    MORI_UMBP_ERROR(
+        "[SsdBackend] Init: staging arena spans {} pages, above max_mr_pages={}; give it "
+        "hugepages (UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES=1 + free hugetlb pages) or "
+        "shrink it",
+        mr_pages, cfg_.max_mr_pages);
+    registrar_ = nullptr;
+    return false;
+  }
 
   if (registrar != nullptr) {
     buffer_ref_ = registrar->RegisterMemory(

@@ -665,22 +665,21 @@ TEST_F(PoolClientRangesTest, DistributedScratchIsExplicitlyOptedIn) {
 // addresses past the entries it translates, so an arena over the page limit
 // must fail at startup rather than on its first remote transfer.
 TEST_F(PoolClientRangesTest, DistributedScratchOverMrPageLimitFailsAtStartup) {
-  EXPECT_EQ(UMBPDistributedConfig{}.ranged_scratch_max_mr_pages, size_t{1} << 18);
+  EXPECT_EQ(UMBPDistributedConfig{}.max_mr_pages, size_t{1} << 18);
   constexpr size_t kArenaPages = 4;
 
   auto expect_rejected = [](const UMBPConfig& config) {
     try {
       auto client = CreateUMBPClient(config);
-      ADD_FAILURE() << "an arena over ranged_scratch_max_mr_pages was accepted";
+      ADD_FAILURE() << "an arena over max_mr_pages was accepted";
       client->Close();
     } catch (const std::runtime_error& error) {
-      EXPECT_NE(std::string(error.what()).find("ranged_scratch_max_mr_pages"), std::string::npos)
-          << error.what();
+      EXPECT_NE(std::string(error.what()).find("max_mr_pages"), std::string::npos) << error.what();
     }
   };
 
   auto over = DistributedConfig("ranges-scratch-over-limit", kArenaPages * kPageSize);
-  over.distributed->ranged_scratch_max_mr_pages = kArenaPages - 1;
+  over.distributed->max_mr_pages = kArenaPages - 1;
   expect_rejected(over);
 
   // Asking for hugepages does not satisfy the limit by itself: it is checked
@@ -689,11 +688,11 @@ TEST_F(PoolClientRangesTest, DistributedScratchOverMrPageLimitFailsAtStartup) {
   auto fell_back = DistributedConfig("ranges-scratch-fell-back", kArenaPages * kPageSize);
   fell_back.distributed->ranged_scratch_use_hugepages = true;
   fell_back.distributed->ranged_scratch_hugepage_size = 3 * 1024 * 1024;
-  fell_back.distributed->ranged_scratch_max_mr_pages = kArenaPages - 1;
+  fell_back.distributed->max_mr_pages = kArenaPages - 1;
   expect_rejected(fell_back);
 
   auto at_limit = DistributedConfig("ranges-scratch-at-limit", kArenaPages * kPageSize);
-  at_limit.distributed->ranged_scratch_max_mr_pages = kArenaPages;
+  at_limit.distributed->max_mr_pages = kArenaPages;
   auto client = CreateUMBPClient(at_limit);
   ASSERT_NE(client, nullptr);
   EXPECT_TRUE(client->SupportsRangedIO());
@@ -717,7 +716,7 @@ TEST_F(PoolClientRangesTest, DistributedScratchOnHugepagesFitsUnderMrPageLimit) 
   auto config = DistributedConfig("ranges-scratch-hugepages", kHugepage);
   config.distributed->ranged_scratch_use_hugepages = true;
   config.distributed->ranged_scratch_hugepage_size = kHugepage;
-  config.distributed->ranged_scratch_max_mr_pages = 1;
+  config.distributed->max_mr_pages = 1;
   auto client = CreateUMBPClient(config);
   ASSERT_NE(client, nullptr);
   EXPECT_TRUE(client->SupportsRangedIO());

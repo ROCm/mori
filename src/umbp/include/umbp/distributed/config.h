@@ -283,6 +283,10 @@ struct PoolClientConfig {
   bool ssd_staging_use_hugepages = false;
   size_t ssd_staging_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
+  // See UMBPDistributedConfig::max_mr_pages; applied to SSD staging only when
+  // io_engine makes it an RDMA region.
+  size_t max_mr_pages = size_t{1} << 18;
+
   // Legacy one-medium selector. Used only when `backends` is empty; in that
   // mode PoolClient::Init reads exactly one ownership block below.
   TierType medium = TierType::DRAM;
@@ -402,6 +406,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.ssd_staging_buffer_slots = dc.ssd_staging_buffer_slots;
   pc.ssd_staging_use_hugepages = dc.ssd_staging_use_hugepages;
   pc.ssd_staging_hugepage_size = dc.ssd_staging_hugepage_size;
+  pc.max_mr_pages = dc.max_mr_pages;
   pc.peer_service_port = dc.peer_service_port;
   pc.auto_peer_service_port = dc.auto_peer_service_port;
   pc.cache_remote_fetches = dc.cache_remote_fetches;
