@@ -23,7 +23,6 @@
 
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
-#include <sys/resource.h>
 
 #include <algorithm>
 #include <cassert>
@@ -44,6 +43,7 @@
 #include "mori/application/transport/rdma/providers/mlx5/mlx5.hpp"
 #include "mori/hip_compat.hpp"
 #include "mori/utils/env_utils.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "mori/utils/mori_log.hpp"
 
 // mori::core::WcStatus is a device-safe mirror of ibverbs' ibv_wc_status so device
@@ -440,13 +440,6 @@ ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaul
 static constexpr const char* kRegFailureHint =
     "ENOMEM usually means RLIMIT_MEMLOCK is too low (ulimit -l) or the region needs more NIC "
     "translation entries than one MR allows (back it with hugepages or shrink it)";
-
-static std::string MemlockLimitString() {
-  rlimit memlock{};
-  if (getrlimit(RLIMIT_MEMLOCK, &memlock) != 0) return "unknown";
-  if (memlock.rlim_cur == RLIM_INFINITY) return "unlimited";
-  return std::to_string(memlock.rlim_cur >> 10) + " KiB";
-}
 
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
