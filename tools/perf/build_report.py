@@ -389,11 +389,11 @@ def _cmp_cell(base, new, unit):
 def _atomic_free_pairs(records):
     """Pair each atomic-free EP record with its atomics baseline.
 
-    A pair is only formed within one CI run (same run_id, platform, python, kernel and token
-    count), so the comparison never sets today's atomic-free number against an older night's
+    A pair is only formed within one CI run (same run_id, platform, python, kernel, dtype and
+    token count), so the comparison never sets today's atomic-free number against an older night's
     baseline, which is what the "latest record per config" collapse in the main tables would do
     if the atomic-free step were skipped or failed. Returns [(baseline_row, atomic_free_row)],
-    keeping the newest pair per (platform, kernel, tokens).
+    keeping the newest pair per (platform, kernel, dtype, tokens).
     """
     rows = [r for r in (_normalize_ep(rec) for rec in records) if r]
     baseline = {}
@@ -432,7 +432,12 @@ def _atomic_free_pairs(records):
 
     return sorted(
         newest.values(),
-        key=lambda p: (p[0]["platform"], p[0]["order"], p[0]["tokens"] or 0),
+        key=lambda p: (
+            p[0]["platform"],
+            p[0]["order"],
+            str(p[0]["dtype"]),
+            p[0]["tokens"] or 0,
+        ),
     )
 
 
@@ -454,6 +459,7 @@ def _atomic_free_section(records):
     headers = [
         "Hardware",
         "Kernels",
+        "Dtype",
         "Tokens",
         "Dispatch Latency",
         "Dispatch BW",
@@ -465,6 +471,7 @@ def _atomic_free_section(records):
         by_platform.setdefault(base["platform"], []).append(
             [
                 base["base_kernel"],
+                base["dtype"] or "—",
                 base["tokens"],
                 _cmp_cell(base["disp_lat"], af["disp_lat"], "µs"),
                 _cmp_cell(base["disp_bw"], af["disp_bw"], "GB/s"),
@@ -491,15 +498,15 @@ def _atomic_free_section(records):
         comb = [d for d in comb if d is not None]
         parts = []
         if disp:
-            parts.append(f"dispatch latency {sum(disp) / len(disp):+.1f}%")
-        if comb:
-            parts.append(f"combine latency {sum(comb) / len(comb):+.1f}%")
-        if parts:
-            lines.append(
-                f"**{plat}** mean over {len(by_platform[plat])} configs: "
-                + ", ".join(parts)
-                + "."
+            parts.append(
+                f"dispatch latency {sum(disp) / len(disp):+.1f}% over {len(disp)} configs"
             )
+        if comb:
+            parts.append(
+                f"combine latency {sum(comb) / len(comb):+.1f}% over {len(comb)} configs"
+            )
+        if parts:
+            lines.append(f"**{plat}** mean change: " + ", ".join(parts) + ".")
             lines.append("")
     return "\n".join(lines)
 

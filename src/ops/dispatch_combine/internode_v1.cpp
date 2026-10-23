@@ -72,21 +72,16 @@ inline __device__ size_t InterNodeBarrierQpSlot(const EpDispatchCombineConfig& c
   return config.worldSize + static_cast<size_t>(senderPe) * config.numQpPerPe + qpId;
 }
 
-template <bool NoRdmaAtomics, typename T>
-inline __device__ void SignalInterNodeBarrier(EpDispatchCombineArgs<T>& args, int proxyPe,
-                                              uint64_t barrierFlag) {
+// Write path only: the callers keep the atomic AMO_ADD loop inline, because moving it into this
+// helper changes the codegen of the default InterNodeV1LL combine kernels.
+template <typename T>
+inline __device__ void SignalInterNodeBarrierWrite(EpDispatchCombineArgs<T>& args, int proxyPe,
+                                                   uint64_t barrierFlag) {
   const EpDispatchCombineConfig& config = args.config;
   for (int i = 0; i < config.numQpPerPe; i++) {
-    if constexpr (NoRdmaAtomics) {
-      shmem::ShmemPutTypeImmNbiThread<uint64_t>(
-          args.crossDeviceBarrierMemObj,
-          InterNodeBarrierQpSlot(config, config.rank, i) * sizeof(uint64_t), barrierFlag, proxyPe,
-          i);
-    } else {
-      shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
-                                                     config.rank * sizeof(uint64_t), 1,
-                                                     core::AMO_ADD, proxyPe, i);
-    }
+    shmem::ShmemPutTypeImmNbiThread<uint64_t>(
+        args.crossDeviceBarrierMemObj,
+        InterNodeBarrierQpSlot(config, config.rank, i) * sizeof(uint64_t), barrierFlag, proxyPe, i);
   }
 }
 
@@ -1174,7 +1169,15 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      SignalInterNodeBarrier<NoRdmaAtomics>(args, proxyPe, barrierFlag);
+      if constexpr (NoRdmaAtomics) {
+        SignalInterNodeBarrierWrite(args, proxyPe, barrierFlag);
+      } else {
+        for (int i = 0; i < config.numQpPerPe; i++) {
+          shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                         args.config.rank * sizeof(uint64_t), 1,
+                                                         core::AMO_ADD, proxyPe, i);
+        }
+      }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
 
@@ -1312,7 +1315,15 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
     if ((laneId < nNodes) &&
         (laneId != myNode)) {  // avoid setting myNode, it will be set in intra node branch
       int proxyPe = laneId * config.gpuPerNode + (config.rank % config.gpuPerNode);
-      SignalInterNodeBarrier<NoRdmaAtomics>(args, proxyPe, barrierFlag);
+      if constexpr (NoRdmaAtomics) {
+        SignalInterNodeBarrierWrite(args, proxyPe, barrierFlag);
+      } else {
+        for (int i = 0; i < config.numQpPerPe; i++) {
+          shmem::ShmemAtomicTypeNonFetchThread<uint64_t>(args.crossDeviceBarrierMemObj,
+                                                         args.config.rank * sizeof(uint64_t), 1,
+                                                         core::AMO_ADD, proxyPe, i);
+        }
+      }
       __threadfence_system();
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
@@ -1328,10 +1339,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
 
 }  // namespace combine_impl
 
-// Force-inlined: the default and atomic-free combine kernels share this instantiation, and with
-// two callers the compiler stops inlining it for fp4, which adds a call frame to the kernel.
 template <typename T>
-__forceinline__ __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
+inline __device__ void CombineIntraNode(EpDispatchCombineArgs<T>& args) {
   DEF_COMMON_VARS;
   IF_ENABLE_PROFILER(
       INTERNODE_V1_PROFILER_INIT_CONTEXT(profiler, args.profilerConfig, globalWarpId, laneId));
