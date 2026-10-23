@@ -41,6 +41,7 @@ struct TierTransitionResult {
   bool success = false;
   uint32_t target_backend_id = BackendRegistry::kMaxBackends;
   uint64_t bytes_moved = 0;
+  uint64_t bytes_read = 0;  // copied off the source; 0 when the target already held it
   uint64_t bytes_freed = 0;
   bool source_draining = false;
   // Failed in a way that can clear (no space, or a copy/commit/read-back

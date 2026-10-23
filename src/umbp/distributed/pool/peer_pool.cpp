@@ -279,6 +279,11 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
                                       const TierTransitionResult& result) {
   migrating_keys_.erase(job.key);
   if (migrating_keys_.empty()) transition_idle_cv_.notify_all();
+  // Before the outcome: a copy whose commit failed still read its source.
+  auto* source = backends_ == nullptr ? nullptr : backends_->Get(job.source_backend_id);
+  if (source != nullptr && result.bytes_read != 0) {
+    transition_metrics_.read_bytes[TierTypeName(source->Tier())] += result.bytes_read;
+  }
   if (!result.success) {
     ++transition_metrics_.failed;
     if (job.kind == TierTransitionKind::kPromotion) ++transition_metrics_.promote_failed;

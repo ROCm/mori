@@ -128,6 +128,7 @@ TierTransitionResult TierTransitionExecutor::Execute(
         result.retryable = true;
         continue;
       }
+      result.bytes_read += resolved.size;
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
         target->BatchAbort({allocation.slot_id});
