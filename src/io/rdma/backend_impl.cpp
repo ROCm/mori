@@ -467,10 +467,9 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
 
 EpPairVec RdmaManager::GetLiveEndpoints(EngineKey engine, TopoKeyPair key) {
   EpPairVec eps = GetAllEndpoint(engine, key);
-  eps.erase(std::remove_if(eps.begin(), eps.end(),
-                           [this](const EpPair& ep) {
-                             return !IsQpAlive(ep.ldevId, ep.local.handle.qpn);
-                           }),
+  eps.erase(std::remove_if(
+                eps.begin(), eps.end(),
+                [this](const EpPair& ep) { return !IsQpAlive(ep.ldevId, ep.local.handle.qpn); }),
             eps.end());
   return eps;
 }
