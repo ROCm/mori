@@ -19,7 +19,16 @@ env:
   CT: docker
   BENCH: tools/ci/run_collective_bench.sh
   LOG_DIR: ci-logs/collective-bench
-  EXTRA_SIZES: "77776 9999984"
+  EXTRA_SIZES: "777777"
+  # Small / odd / non-divisible edge sizes for the variable-shard + idle-PE paths.
+  # All-reduce re-splits the buffer into its own 16B-aligned shards, so it takes
+  # any count: tiny sizes (fewer shards than PEs) fall back to pull, odd/non-
+  # divisible sizes get a shorter last shard. Reduce-scatter inherits the caller's
+  # shard layout, so bf16/f16 need an even per-shard base (count % npes == 0 and
+  # count/npes even) -- its edges stay multiples of 16. AG/A2A/CP just move bytes.
+  AR_EDGE_SIZES: "1 2 7 31 100 999 4099"
+  RS_EDGE_SIZES: "16 48 1008 4080"
+  EDGE_SIZES: "48 4080"
   # Message-size growth factor between benchmark runs (num/den).
   SIZE_STEP: "3/2"
 
@@ -79,19 +88,19 @@ jobs:
       # (logS = 2) over f32/bf16/f16, sum/prod, 1M-128M plus EXTRA_SIZES.
       - name: reduce_scatter push (S=4)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode push --logS 2
+        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $RS_EDGE_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode push --logS 2
 
       - name: reduce_scatter pull
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode pull
+        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $RS_EDGE_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode pull
 
       - name: all_reduce push (S=4)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode push --logS 2
+        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $AR_EDGE_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode push --logS 2
 
       - name: all_reduce pull
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode pull
+        run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $AR_EDGE_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode pull
 
       # Extra push coverage: S = 1,2,4,8 (logS 0..3), bf16/f32 sum, 16M-512M elems.
       - name: reduce_scatter push (S=1,2,4,8; 16M-1G)
@@ -120,15 +129,15 @@ jobs:
 
       - name: all_gather
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll all_gather
+        run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES $EDGE_SIZES" $CONTAINER bash $BENCH --coll all_gather
 
       - name: all_to_all
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll all_to_all
+        run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES $EDGE_SIZES" $CONTAINER bash $BENCH --coll all_to_all
 
       - name: collective_permute
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES" $CONTAINER bash $BENCH --coll collective_permute
+        run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES $EDGE_SIZES" $CONTAINER bash $BENCH --coll collective_permute
 
       - name: Publish summary
         if: always()
