@@ -363,6 +363,9 @@ void EpDispatchCombineHandle::InitializeShmemBuf() {
     bufs.staging = MallocSymm(maxStagingSize, hipDeviceMallocUncached);
     bufs.dispatchOut = MallocSymm(dispatchOutSize, hipDeviceMallocUncached);
     bufs.combineOut = MallocSymm(combineOutSize, hipDeviceMallocUncached);
+    if (config.kernelType == KernelType::AsyncLL) {
+      bufs.dispatchStaging = MallocSymm(maxStagingSize, hipDeviceMallocUncached);
+    }
   }
 
   size_t maxWeightSize =
@@ -427,6 +430,9 @@ void EpDispatchCombineHandle::FinalizeShmemBuf() {
     FreeSymmByLocalPtr(bufs.dispatchOut->localPtr);
     FreeSymmByLocalPtr(bufs.combineOut->localPtr);
     FreeSymmByLocalPtr(bufs.staging->localPtr);
+    if (config.kernelType == KernelType::AsyncLL) {
+      FreeSymmByLocalPtr(bufs.dispatchStaging->localPtr);
+    }
   }
   FreeSymmByLocalPtr(shmemInpWeightsMemObj->localPtr);
   FreeSymmByLocalPtr(shmemDispatchOutWeightsMemObj->localPtr);

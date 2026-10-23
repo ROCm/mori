@@ -231,13 +231,16 @@ struct ShmemBufsInterNodeV1 {
   mori::application::SymmMemObjPtr dispatchStaging;
 };
 
-// InterNode / AsyncLL: full 5-buffer set used by the non-V1 RDMA paths.
+// InterNode / AsyncLL: buffer set used by the non-V1 RDMA paths.
 struct ShmemBufsInterNode {
   mori::application::SymmMemObjPtr dispatchInp;
   mori::application::SymmMemObjPtr combineInp;
   mori::application::SymmMemObjPtr dispatchOut;
   mori::application::SymmMemObjPtr combineOut;
   mori::application::SymmMemObjPtr staging;
+  // Dispatch send source, separate from `staging` so combine can't overwrite it.
+  // Only allocated for the AsyncLL kernel.
+  mori::application::SymmMemObjPtr dispatchStaging;
 };
 
 class EpDispatchCombineHandle {
