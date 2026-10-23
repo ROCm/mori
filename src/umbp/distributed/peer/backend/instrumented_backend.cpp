@@ -21,6 +21,7 @@
 // SOFTWARE.
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -185,12 +186,21 @@ std::vector<ResolvedEntry> InstrumentedBackend::BatchResolve(
     out = inner_->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
   }
   uint64_t bytes = 0;
-  for (const ResolvedEntry& r : out) {
+  for (size_t i = 0; i < out.size(); ++i) {
+    const ResolvedEntry& r = out[i];
     switch (EffectiveResolveOutcome(r)) {
-      case ResolveOutcome::kFound:
+      case ResolveOutcome::kFound: {
         Add(kResolve, kOk, 1);
-        bytes += r.covered_size != 0 ? r.covered_size : r.size;
+        // Count what the reader touches, so a DRAM slice is not charged the whole object.
+        const ObjectExtent* e =
+            extents != nullptr && i < extents->size() ? &(*extents)[i] : nullptr;
+        if (e != nullptr && e->length != 0) {
+          bytes += e->offset < r.size ? std::min(e->length, r.size - e->offset) : 0;
+        } else {
+          bytes += r.covered_size != 0 ? r.covered_size : r.size;
+        }
         break;
+      }
       case ResolveOutcome::kMissing:
         Add(kResolve, kMiss, 1);
         break;
