@@ -1122,7 +1122,8 @@ std::vector<MetricSample> SsdBackend::SampleMetrics() const {
 
   // Bytes that actually crossed the device boundary, as opposed to the logical
   // bytes in mori_umbp_backend_bytes_total.  Reads exclude single-flight merges,
-  // so this stays a true measure of device traffic.
+  // so this stays a true measure of device traffic.  device_read is loads only:
+  // tier moves are in mori_umbp_client_tier_move_read_bytes_total, so the two add up.
   bytes("device_write", ssd_->CopyBytes());
   bytes("device_read", ssd_->ReadBytes());
 

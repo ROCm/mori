@@ -1045,6 +1045,19 @@ TEST_F(SsdBackendExtentTest, WholeObjectLeaseServesAnExtentWithoutReading) {
   EXPECT_EQ(DeviceReadBytes(), before);
 }
 
+// A staged tier move is counted by the pool, so device_read stays loads only.
+TEST_F(SsdBackendExtentTest, StagedMigrationReadIsNotADeviceRead) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "k", Aperiodic(kObject)));
+  const uint64_t before = DeviceReadBytes();
+
+  ResolvedEntry moved;
+  ASSERT_TRUE(backend_->AcquireMigrationRead("k", &moved, /*allow_file_ref=*/false));
+  EXPECT_FALSE(moved.pages.empty()) << "staged, not a file ref";
+  backend_->ReleaseMigrationRead("k");
+  EXPECT_EQ(DeviceReadBytes(), before);
+}
+
 // A remote reader's extent does not travel on the wire (D2): it stages whole.
 TEST_F(SsdBackendExtentTest, RemoteReaderStagesTheWholeObject) {
   Start(/*staging_pages=*/32, std::chrono::seconds{60});

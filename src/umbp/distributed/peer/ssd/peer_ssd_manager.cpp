@@ -521,7 +521,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     return SsdReadOutcome{SsdReadStatus::kError, size};
   }
   metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
-  metrics_.read_bytes.fetch_add(size, std::memory_order_relaxed);  // SSD read IO bandwidth source
+  // No read_bytes: only tier moves stage here, and the pool counts their bytes.
   return SsdReadOutcome{SsdReadStatus::kOk, size};
 }
 
