@@ -79,6 +79,8 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 //  common/ (upstream 93f2998a).
 // ---------------------------------------------------------------------------
 
+constexpr size_t kGatherFragmentThreshold = 128ULL << 10;
+
 // Staging each prewarmed stream starts with.  A long prefix read across every
 // layer reaches 8192 fragments; a bigger batch regrows its stream's staging.
 constexpr size_t kPrewarmGatherFragments = 8192;
@@ -134,12 +136,6 @@ size_t DebugEnvSize(const char* name, size_t fallback) {
   const unsigned long long parsed = std::strtoull(value, &end, 10);
   if (end == value || parsed > std::numeric_limits<size_t>::max()) return fallback;
   return static_cast<size_t>(parsed);
-}
-
-size_t GatherFragmentThreshold() {
-  static const size_t bytes =
-      DebugEnvSize("UMBP_HBM_GATHER_FRAGMENT_THRESHOLD_BYTES", 128ULL << 10);
-  return bytes;
 }
 
 bool DebugEnabled() {
@@ -691,7 +687,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kTooFewFragments);
       continue;
     }
-    if (bucket.total_bytes / bucket.fragments.size() >= GatherFragmentThreshold()) {
+    if (bucket.total_bytes / bucket.fragments.size() >= kGatherFragmentThreshold) {
       note_bucket(GatherSkip::kFragmentAtOrAboveThreshold);
       continue;
     }
