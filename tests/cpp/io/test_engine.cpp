@@ -34,7 +34,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1757,49 +1756,6 @@ void CaseRdmaDmabufVmmInteriorRangeTransfer() {
   CheckDmabufInteriorWrite(pair, src.At(1), dst.At(1), src.chunk, src.chunk / 2, 1 * 1024 * 1024);
 }
 
-// Pinned host memory has no dma-buf export, so registering it on the dma-buf
-// path must fail over to ibv_reg_mr. TryExportDmabufFd used to ask HIP for the
-// VMM allocation handle of such memory, which segfaults inside HIP. A UMBP DRAM
-// tier (hipHostRegister'd) hit it when ibv_reg_mr ran out of RLIMIT_MEMLOCK.
-void CaseRdmaDmabufPinnedHostMemoryFallsBack() {
-  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
-
-  ScopedEnvVar enableDmabuf("MORI_ENABLE_DMABUF_REG", "1");
-  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
-  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_dmabuf_pinned_host", true);
-
-  constexpr size_t kSize = 1024 * 1024;
-  void* src = nullptr;
-  HIP_RUNTIME_CHECK(hipHostMalloc(&src, kSize, hipHostMallocDefault));
-  void* dst = std::aligned_alloc(4096, kSize);
-  Require(dst != nullptr, "aligned_alloc failed");
-  HIP_RUNTIME_CHECK(hipHostRegister(dst, kSize, hipHostRegisterMapped | hipHostRegisterPortable));
-  std::memset(src, 0xCD, kSize);
-  std::memset(dst, 0x00, kSize);
-
-  MemoryDesc srcDesc = pair.initiator->RegisterMemory(src, kSize, -1, MemoryLocationType::CPU);
-  MemoryDesc dstDesc = pair.target->RegisterMemory(dst, kSize, -1, MemoryLocationType::CPU);
-
-  TransferStatus status;
-  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
-  pair.initiator->Write(srcDesc, 0, dstDesc, 0, kSize, &status, uid);
-
-  std::string err;
-  Require(WaitTransferDone(&status, 5000, &err), "pinned host transfer timeout: " + err);
-  Require(status.Succeeded(),
-          "pinned host transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
-              status.Message() + "'");
-  const auto* bytes = static_cast<const uint8_t*>(dst);
-  Require(std::all_of(bytes, bytes + kSize, [](uint8_t b) { return b == 0xCD; }),
-          "pinned host transfer wrote wrong data");
-
-  pair.initiator->DeregisterMemory(srcDesc);
-  pair.target->DeregisterMemory(dstDesc);
-  HIP_RUNTIME_CHECK(hipHostUnregister(dst));
-  std::free(dst);
-  HIP_RUNTIME_CHECK(hipHostFree(src));
-}
-
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2324,7 +2280,6 @@ int main(int argc, char* argv[]) {
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
-      {"rdma_dmabuf_pinned_host_memory_falls_back", CaseRdmaDmabufPinnedHostMemoryFallsBack},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},

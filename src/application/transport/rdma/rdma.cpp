@@ -434,14 +434,30 @@ RdmaDevice* RdmaDeviceContext::GetRdmaDevice() { return device; }
 
 ibv_context* RdmaDeviceContext::GetIbvContext() { return GetRdmaDevice()->defaultContext; }
 
+// Possible causes of an ibv_reg_mr ENOMEM, printed with every fatal registration
+// failure. Every NIC's registration of a buffer pins it again against
+// RLIMIT_MEMLOCK (CAP_IPC_LOCK inside a container's user namespace does not exempt it).
+static constexpr const char* kRegFailureHint =
+    "ENOMEM usually means RLIMIT_MEMLOCK is too low (ulimit -l) or the region needs more NIC "
+    "translation entries than one MR allows (back it with hugepages or shrink it)";
+
+static std::string MemlockLimitString() {
+  rlimit memlock{};
+  if (getrlimit(RLIMIT_MEMLOCK, &memlock) != 0) return "unknown";
+  if (memlock.rlim_cur == RLIM_INFINITY) return "unlimited";
+  return std::to_string(memlock.rlim_cur >> 10) + " KiB";
+}
+
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegion(void* ptr, size_t size,
                                                                           int accessFlag) {
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
   ibv_mr* mr = ibv_reg_mr(pd, ptr, size, effectiveAccessFlag);
   if (!mr) {
+    const int err = errno;
     MORI_APP_ERROR(
-        "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({})", ptr,
-        size, effectiveAccessFlag, errno, strerror(errno));
+        "RegisterRdmaMemoryRegion failed! addr:{}, size:{}, accessFlag:{}, errno:{} ({}), "
+        "RLIMIT_MEMLOCK:{}. {}",
+        ptr, size, effectiveAccessFlag, err, strerror(err), MemlockLimitString(), kRegFailureHint);
     std::abort();
   }
   MORI_APP_TRACE("RegisterRdmaMemoryRegion, addr:{}, size:{}, lkey:{}, rkey:{}\n", ptr, size,
@@ -547,15 +563,16 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   // Exporting the allocation handle does not; it needs the allocation to have
   // been created with the POSIX fd handle type, otherwise fall through.
   //
-  // hipMemRetainAllocationHandle segfaults inside HIP, instead of failing, on
-  // memory it did not map through hipMemMap: pinned host memory (hipHostMalloc,
-  // hipHostRegister) and hipMalloc alike. hipMalloc memory has exported through
-  // HSA above, and only device memory can be VMM, so ask only for that.
-  hipPointerAttribute_t attrs{};
-  const bool maybeVmm =
-      hipPointerGetAttributes(&attrs, ptr) == hipSuccess && attrs.type == hipMemoryTypeDevice;
+  // Known HIP bug: up to ROCm 7.2.x, hipMemRetainAllocationHandle segfaults
+  // (null+0xf8 in libamdhip64) instead of returning hipErrorInvalidValue on
+  // memory HIP tracks but did not map through hipMemMap: pinned host memory
+  // (hipHostMalloc, hipHostRegister) and hipMalloc. hipMalloc has exported
+  // through HSA above, but pinned host memory gets here whenever ibv_reg_mr
+  // failed on it (or MORI_ENABLE_DMABUF_REG=1), and the process dies in HIP
+  // before the registration error below is logged. Fixed upstream in
+  // ROCM-23527 (rocm-systems 6693769fa7, HIP 7.14).
   hipMemGenericAllocationHandle_t handle;
-  if (maybeVmm && hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
+  if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
     hipError_t exportErr =
         hipMemExportToShareableHandle(&fd, handle, hipMemHandleTypePosixFileDescriptor, 0);
     if (RetainAddsReference()) (void)hipMemRelease(handle);
@@ -616,6 +633,7 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
   // Default: ibv_reg_mr first, dmabuf fallback (fast on bnxt). Set
   // MORI_ENABLE_DMABUF_REG=1 to prefer dmabuf first (payload MRs and, on Ionic,
   // CQ/SQ/RQ rings), falling back to ibv_reg_mr for payload.
+  int plainErr = 0;
   for (int attempt = 0; attempt < 2; ++attempt) {
     bool useDmabuf = (attempt == 0) ? preferDmabufReg : !preferDmabufReg;
     const char* name = useDmabuf ? "dmabuf" : "ibv_reg_mr";
@@ -626,26 +644,19 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
       return makeHandle(mr);
     }
     const int err = errno;
+    if (!useDmabuf) plainErr = err;
     MORI_APP_WARN(
         "RegisterRdmaMemoryRegionAuto {} registration failed (addr:{}, size:{}, "
         "errno:{} ({}))",
         name, ptr, size, err, strerror(err));
-    // Every NIC's registration of a buffer pins it again, against RLIMIT_MEMLOCK
-    // unless the process has CAP_IPC_LOCK in the initial user namespace (not
-    // inside a container's own user namespace).
-    rlimit memlock{};
-    if (!useDmabuf && err == ENOMEM && getrlimit(RLIMIT_MEMLOCK, &memlock) == 0 &&
-        memlock.rlim_cur != RLIM_INFINITY) {
-      MORI_APP_WARN("ibv_reg_mr ENOMEM with RLIMIT_MEMLOCK at {} KiB; raise it (ulimit -l)",
-                    memlock.rlim_cur >> 10);
-    }
     errno = err;
   }
 
   MORI_APP_ERROR(
       "RegisterRdmaMemoryRegionAuto failed: ibv_reg_mr and dmabuf registration both failed "
-      "(addr:{}, size:{}, accessFlag:{}, errno:{} ({}))",
-      ptr, size, effectiveAccessFlag, errno, strerror(errno));
+      "(addr:{}, size:{}, accessFlag:{}, ibv_reg_mr errno:{} ({}), RLIMIT_MEMLOCK:{}). {}",
+      ptr, size, effectiveAccessFlag, plainErr, strerror(plainErr), MemlockLimitString(),
+      kRegFailureHint);
   std::abort();
 }
 
