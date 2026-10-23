@@ -63,6 +63,10 @@ export MORI_SOCKET_IFNAME=lo
 # this is go get rid of 'request to allocate mask for invalid number: Invalid argument'
 export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1 #:/lib/x86_64-linux-gnu/libibverbs.so.1
 
+TEST_NAME=collectives_benchmark
+pkill -9 -c -f $TEST_NAME
+#rm -f allgather_test_uid.bin zz*.log
+
 # Unified collectives_benchmark knobs (were RS_MODE / RS_LOG_PUSH_SLICES env vars,
 # now runtime CLI flags). Override any of these from the environment.
 #   COLL: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute
@@ -74,16 +78,11 @@ LOGS=${LOGS:-2}         # logS: S = 1<<LOGS slices (push path), -1 = auto
 DTYPE=${DTYPE:-f32}     # f32|bf16|f16|s32|s64 (reduction collectives)
 OP=${OP:-sum}           # sum|prod|min|max (reduction collectives)
 
-TEST_NAME=collectives_benchmark
-pkill -9 -c -f $TEST_NAME
-#rm -f allgather_test_uid.bin zz*.log
-
-NUM_GPUS=${NUM_GPUS:-4}
+NUM_GPUS=${NUM_GPUS:-8}
 MIN_SIZE=${MIN_SIZE:-1024*1024}
 MAX_SIZE=${MAX_SIZE:-1024*1024*128}
-
-# MIN_SIZE=77777*4
-# MAX_SIZE=77777991*4
+#   SIZES="256*1024 1024*1024 3*1024*1024 4*1024*1024"
+SIZES=${SIZES:-}
 
 TEST=./build/examples/$TEST_NAME
 rm -f zzout_*.log
@@ -91,10 +90,18 @@ rm -f zzout_*.log
 # /data/mori/perf record --call-graph fp -F 2999 -m 128M \
 #   -- $TEST --coll $COLL --npes $NUM_GPUS --size 1024*1024*128 "$@"
 
-for ((size = MIN_SIZE; size <= MAX_SIZE; size = size * 2)); do
-  $GDB $ROCPROF $TEST --coll $COLL --npes $NUM_GPUS --size $size \
-    --dtype $DTYPE --op $OP $MODE_ARG --logS $LOGS $@ 2>&1 | tee -a zzout_0.log
-done
+if [[ -n "$SIZES" ]]; then
+  # Explicit list: $((size)) evaluates arithmetic expressions like "1024*1024".
+  for size in $SIZES; do
+    $GDB $ROCPROF $TEST --coll $COLL --npes $NUM_GPUS --size $((size)) \
+      --dtype $DTYPE --op $OP $MODE_ARG --logS $LOGS $@ 2>&1 | tee -a zzout_0.log
+  done
+else
+  for ((size = MIN_SIZE; size <= MAX_SIZE; size = size * 2)); do
+    $GDB $ROCPROF $TEST --coll $COLL --npes $NUM_GPUS --size $size \
+      --dtype $DTYPE --op $OP $MODE_ARG --logS $LOGS $@ 2>&1 | tee -a zzout_0.log
+  done
+fi
 exit 0
 
 for ((pid = 0; pid < $NUM_PROCS; pid++ )); do
