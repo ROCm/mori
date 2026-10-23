@@ -39,6 +39,7 @@ namespace {
 constexpr size_t kDefaultCopyBytes = 1ULL << 30;
 constexpr int kGridSize = 256;
 constexpr int kBlockSize = 256;
+constexpr int kWarpSize = warpSize;
 
 __host__ __device__ uint8_t ExpectedByte(size_t index, int sourcePe) {
   return static_cast<uint8_t>(
@@ -112,8 +113,8 @@ struct CaseResult {
 };
 
 CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, int npes,
-                   int warpSizeHost, uint8_t* srcBase, uint8_t* dstBase,
-                   const SymmMemObjPtr srcMemObj, const SymmMemObjPtr dstMemObj, int* deviceError) {
+                   uint8_t* srcBase, uint8_t* dstBase, const SymmMemObjPtr srcMemObj,
+                   const SymmMemObjPtr dstMemObj, int* deviceError) {
   auto* src = srcBase + offset;
   auto* dst = dstBase + offset;
   const unsigned expectedMod16 = offset & 0xFU;
@@ -129,8 +130,8 @@ CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, in
   HIP_RUNTIME_CHECK(hipEventCreate(&start));
   HIP_RUNTIME_CHECK(hipEventCreate(&stop));
   HIP_RUNTIME_CHECK(hipEventRecord(start));
-  WarpCopyKernel<<<1, warpSizeHost>>>(myPe, npes, srcMemObj, dstMemObj, offset, offset, bytes,
-                                      expectedMod16, deviceError);
+  WarpCopyKernel<<<1, kWarpSize>>>(myPe, npes, srcMemObj, dstMemObj, offset, offset, bytes,
+                                   expectedMod16, deviceError);
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipEventRecord(stop));
   HIP_RUNTIME_CHECK(hipEventSynchronize(stop));
@@ -222,14 +223,14 @@ int main() {
 
   if (myPe == 0) {
     std::printf("WarpCopy peer-copy alignment test: %zu bytes, %s, warp size %d\n", bytes,
-                properties.name, properties.warpSize);
+                properties.name, kWarpSize);
     std::fflush(stdout);
   }
 
-  const CaseResult aligned = RunCase("16-byte aligned", 0, bytes, myPe, npes, properties.warpSize,
-                                     srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
-  const CaseResult misaligned = RunCase("8-byte aligned", 8, bytes, myPe, npes, properties.warpSize,
-                                        srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
+  const CaseResult aligned = RunCase("16-byte aligned", 0, bytes, myPe, npes, srcBase, dstBase,
+                                     srcMemObj, dstMemObj, deviceError);
+  const CaseResult misaligned = RunCase("8-byte aligned", 8, bytes, myPe, npes, srcBase, dstBase,
+                                        srcMemObj, dstMemObj, deviceError);
 
   if (myPe == 0 && aligned.milliseconds > 0.0f) {
     std::printf("8-byte / 16-byte runtime ratio: %.3fx\n",
