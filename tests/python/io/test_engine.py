@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import pytest
+import gc
 import os
 import time
 from contextlib import contextmanager
@@ -572,6 +573,55 @@ def test_multithread_batch_error_path_is_recoverable():
     ), "Expected inbound notification after successful transfer"
     assert inbound.Succeeded()
     assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+def _write_and_wait(initiator, initiator_mem, target_mem):
+    status = initiator.write(
+        initiator_mem, 0, target_mem, 0, 64, initiator.allocate_transfer_uid()
+    )
+    wait_status(status)
+    return status
+
+
+def _engine_pair_with_failed_qp(name):
+    """An engine pair whose one QP is in the error state: a write to memory the
+    target has deregistered ends with a remote access error."""
+    initiator, target = create_connected_engine_pair(
+        name, qp_per_transfer=1, post_batch_size=-1, num_worker_threads=1
+    )
+    initiator_tensor, _, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), (1, 64)
+    )
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Succeeded()
+    target.deregister_memory(target_mem)
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Failed()
+    return initiator, target, initiator_tensor, initiator_mem, target_mem
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_new_session_replaces_failed_qp():
+    initiator, target, initiator_tensor, initiator_mem, _ = _engine_pair_with_failed_qp(
+        "replace_failed_qp"
+    )
+    target_tensor = torch.zeros_like(initiator_tensor, device=torch.device("cuda", 1))
+    target_mem = target.register_torch_tensor(target_tensor)
+
+    status = _write_and_wait(initiator, initiator_mem, target_mem)
+    assert status.Succeeded(), status.Message()
+    assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_transfer_to_gone_peer_after_qp_failure_fails_without_raising():
+    initiator, target, _, initiator_mem, target_mem = _engine_pair_with_failed_qp(
+        "gone_peer"
+    )
+    del target
+    gc.collect()
+
+    # The session's QP failed, so the write tries to replace the session and cannot
+    # reach the target any more.
+    assert _write_and_wait(initiator, initiator_mem, target_mem).Failed()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")

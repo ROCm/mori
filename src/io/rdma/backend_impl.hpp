@@ -24,6 +24,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -421,6 +422,9 @@ class RdmaBackend : public Backend {
   // Sessions replaced because one of their QPs failed. GetOrCreateSessionCached hands out
   // raw pointers that callers use after dropping sessionCacheMu, so these are kept alive.
   std::vector<std::unique_ptr<RdmaBackendSession>> retiredSessions;
+  // After an attempt to replace a failed session to an engine failed (the peer may be
+  // gone), when to try again. Guarded by sessionCacheMu.
+  std::unordered_map<EngineKey, std::chrono::steady_clock::time_point> replaceRetryAt;
   std::mutex sessionCacheMu;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
