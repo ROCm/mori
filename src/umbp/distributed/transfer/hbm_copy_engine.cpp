@@ -158,7 +158,7 @@ size_t DebugSummarySeconds() {
   return n;
 }
 
-bool ScheduledH2DEnabled() {
+bool StripedRestoreEnabled() {
   static const bool enabled = [] {
     const char* policy = std::getenv("UMBP_HBM_RESTORE_SCHEDULER");
     if (policy == nullptr || std::string(policy) == "off") return false;
@@ -767,7 +767,7 @@ std::unique_ptr<TransferHandle> HbmCopyEngine::Submit(std::vector<TransferPlan> 
   auto map_host = [this](const void* ptr, size_t bytes, int device) {
     return HostRegionDeviceAddress(ptr, bytes, device);
   };
-  if (ScheduledH2DEnabled() && TryScheduledH2D(plans, map_host, RestoreChunkBytes())) {
+  if (StripedRestoreEnabled() && TryStripedRestore(plans, map_host, RestoreChunkBytes())) {
     if (device_touched && entry_device >= 0) (void)hipSetDevice(entry_device);
     return std::make_unique<SettledHandle>(std::move(failures));
   }

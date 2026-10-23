@@ -28,9 +28,10 @@
 namespace mori::umbp {
 struct TransferPlan;
 
+// Split a restore across peer GPUs, all writing to one destination GPU.
 // Completes synchronously. On failure, all submitted chunks are drained before
 // returning false, allowing the caller to safely overwrite via its direct path.
-bool TryScheduledH2D(const std::vector<TransferPlan>& plans,
-                     const std::function<void*(const void*, size_t, int)>& host_device_address,
-                     size_t chunk_bytes);
+bool TryStripedRestore(const std::vector<TransferPlan>& plans,
+                       const std::function<void*(const void*, size_t, int)>& host_device_address,
+                       size_t chunk_bytes);
 }  // namespace mori::umbp

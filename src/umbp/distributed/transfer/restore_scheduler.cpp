@@ -273,8 +273,8 @@ class RestoreScheduler {
 };
 }  // namespace
 
-bool TryScheduledH2D(const std::vector<TransferPlan>& plans, const HostMapper& map_host,
-                     size_t chunk_bytes) {
+bool TryStripedRestore(const std::vector<TransferPlan>& plans, const HostMapper& map_host,
+                       size_t chunk_bytes) {
   if (plans.empty() || chunk_bytes == 0 || !DeviceGatherEnabled()) return false;
   auto request = std::make_shared<RestoreRequest>();
   request->map_host = map_host;
