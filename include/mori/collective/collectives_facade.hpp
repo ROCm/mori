@@ -245,7 +245,9 @@ class CollectivesFacade {
     reqs.gdaContextCount = 0;
     reqs.gdaSignalCount = 0;
     reqs.gdaCounterCount = 0;
-    reqs.sdmaQueueCount = 0; // Use the context's SDMA queue count
+    reqs.sdmaQueueCount = 1; // The push/scatter kernels only ever use queue 0;
+                             // 0 means "all of the context's queues" and just
+                             // slows ccoDevCommCreate (more queues to set up).
     
     ret = cco::ccoDevCommCreate(comm, &reqs, &state.devComm);
     if (ret != 0 || state.devComm.sdma.sdmaNumQueue == 0) {
