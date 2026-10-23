@@ -203,6 +203,7 @@ def _normalize_ep(rec):
             "platform": plat,
             "kernel": f"EP{ws}",
             "base_kernel": f"EP{ws}",
+            "dtype": p.get("dtype"),
             "atomic_free": False,
             "run_id": rec.get("run_id", ""),
             "python": rec.get("python", ""),
@@ -228,6 +229,7 @@ def _normalize_ep(rec):
             # Atomic-free rows are listed right after their baseline kernel (order + 0.5).
             "kernel": f"{base_kernel} (atomic-free)" if atomic_free else base_kernel,
             "base_kernel": base_kernel,
+            "dtype": p.get("dtype"),
             "atomic_free": atomic_free,
             "run_id": rec.get("run_id", ""),
             "python": rec.get("python", ""),
@@ -398,7 +400,14 @@ def _atomic_free_pairs(records):
     for r in rows:
         if r["atomic_free"]:
             continue
-        key = (r["run_id"], r["platform"], r["python"], r["base_kernel"], r["tokens"])
+        key = (
+            r["run_id"],
+            r["platform"],
+            r["python"],
+            r["base_kernel"],
+            r["dtype"],
+            r["tokens"],
+        )
         if key not in baseline or r["ts"] > baseline[key]["ts"]:
             baseline[key] = r
 
@@ -406,11 +415,18 @@ def _atomic_free_pairs(records):
     for r in rows:
         if not r["atomic_free"]:
             continue
-        key = (r["run_id"], r["platform"], r["python"], r["base_kernel"], r["tokens"])
+        key = (
+            r["run_id"],
+            r["platform"],
+            r["python"],
+            r["base_kernel"],
+            r["dtype"],
+            r["tokens"],
+        )
         base = baseline.get(key)
         if base is None:
             continue
-        out_key = (r["platform"], r["base_kernel"], r["tokens"])
+        out_key = (r["platform"], r["base_kernel"], r["dtype"], r["tokens"])
         if out_key not in newest or r["ts"] > newest[out_key][1]["ts"]:
             newest[out_key] = (base, r)
 

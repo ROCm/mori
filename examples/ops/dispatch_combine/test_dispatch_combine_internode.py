@@ -265,11 +265,6 @@ def _perf_report():
 
 
 def _rdma_atomics_disabled():
-    """True when MORI_EP_DISABLE_RDMA_ATOMICS is on, parsed like env::IsEnvVarEnabled in C++.
-
-    Unset/empty is off, "0"/"false"/"off"/"no" (case-insensitive) is off, and any other value is
-    on. Mirroring the C++ rule keeps the perf record in step with what the kernel actually did.
-    """
     val = os.environ.get("MORI_EP_DISABLE_RDMA_ATOMICS", "")
     return val != "" and val.lower() not in ("0", "false", "off", "no")
 
