@@ -882,7 +882,7 @@ fields:
 | Section | Field | Default | Notes |
 |---|---|---|---|
 | `dram` | `capacity_bytes` | 4 GiB | Local DRAM tier size. |
-| `dram` | `high_watermark` / `low_watermark` | 0.9 / 0.7 | LRU eviction trigger band. |
+| `dram` | `high_watermark` / `low_watermark` | 0.95 / 0.9 | LRU eviction trigger band. |
 | `ssd` | `enabled` | true | Toggle SSD tier. |
 | `ssd` | `storage_dir` | `/tmp/umbp_ssd` | POSIX backend root. |
 | `ssd` | `capacity_bytes` | 32 GiB | |
