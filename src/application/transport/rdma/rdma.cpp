@@ -649,7 +649,6 @@ application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(vo
         "RegisterRdmaMemoryRegionAuto {} registration failed (addr:{}, size:{}, "
         "errno:{} ({}))",
         name, ptr, size, err, strerror(err));
-    errno = err;
   }
 
   MORI_APP_ERROR(
