@@ -36,6 +36,7 @@
 
 #include "umbp/common/env_time.h"
 #include "umbp/common/parallel_for.h"
+#include "umbp/common/resolve_prof.h"
 
 namespace mori::umbp {
 
@@ -791,7 +792,13 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   // A remote reader discards a response holding any kBusy key; a local one
   // reads its hits and comes back for the busy keys.
   const bool busy_discards = reader == ResolveReader::kRemote;
-  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  ProfTimer pool_timer(&ResolveProf::pool);
+  if (t_resolve_prof != nullptr) ++t_resolve_prof->attempts;
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_, std::defer_lock);
+  {
+    ProfTimer lifecycle_wait(&ResolveProf::pool_wait);
+    lifecycle_lock.lock();
+  }
   std::vector<PoolResolvedEntry> out(keys.size());
   if (keys.empty()) return out;
 
@@ -804,7 +811,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   uint32_t direct_backend_id = BackendRegistry::kMaxBackends;
   MediumBackend* direct_backend = nullptr;
   {
-    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    ProfLockGuard<std::mutex> operation_lock(operation_mutex_, &ResolveProf::pool_wait,
+                                             &ResolveProf::pool_hold);
     if (backends_ != nullptr && policy_ != nullptr && tier_graph_ == nullptr &&
         !track_access_order_ && backends_->Size() == 1) {
       const std::vector<uint32_t> order = policy_->ReadOrder(*backends_);
@@ -826,8 +834,12 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
   if (direct_backend != nullptr) {
-    auto resolved =
-        direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
+    std::vector<ResolvedEntry> resolved;
+    {
+      ProfTimer backend_timer(&ResolveProf::backend);
+      resolved =
+          direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
+    }
     bool batch_busy = false;
     bool all_found = resolved.size() == keys.size();
     std::vector<bool> failed_but_owned(keys.size(), false);
@@ -848,7 +860,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     // a backend can still own a key whose descriptor shape it cannot return.
     // Finalize stale placements here instead of running the whole routing
     // pipeline and resolving the same backend a second time.
-    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    ProfLockGuard<std::mutex> operation_lock(operation_mutex_, &ResolveProf::pool_wait,
+                                             &ResolveProf::pool_hold);
     for (size_t i = 0; i < out.size(); ++i) {
       if (out[i].resolved.found || failed_but_owned[i]) continue;
       if (EffectiveResolveOutcome(out[i].resolved) == ResolveOutcome::kBusy) continue;
@@ -864,7 +877,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
   std::vector<std::optional<uint32_t>> preferred(keys.size());
   std::vector<uint32_t> read_order;
   {
-    std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+    ProfLockGuard<std::mutex> operation_lock(operation_mutex_, &ResolveProf::pool_wait,
+                                             &ResolveProf::pool_hold);
     if (backends_ == nullptr || policy_ == nullptr) return out;
     planned_clear_epoch = clear_epoch_;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -873,7 +887,10 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
     read_order = policy_->ReadOrder(*backends_);
   }
-  PromoteForRead(keys, &preferred);
+  {
+    ProfTimer promote_timer(&ResolveProf::promote);
+    PromoteForRead(keys, &preferred);
+  }
 
   // A flat mask avoids one heap allocation per key in the common 1023-key
   // ranged-get batch.
@@ -896,6 +913,7 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
     const std::vector<ObjectExtent>* sub_extents =
         extents == nullptr ? nullptr : (identity ? extents : &backend_extents);
+    ProfTimer backend_timer(&ResolveProf::backend);
     auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs,
                                          allow_file_refs, reader, sub_extents);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
@@ -972,7 +990,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
 
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  ProfLockGuard<std::mutex> operation_lock(operation_mutex_, &ResolveProf::pool_wait,
+                                           &ResolveProf::pool_hold);
   // ClearLocal takes lifecycle_mutex_ exclusively, so this is defensive
   // against future lifecycle paths that may invalidate an in-flight plan.
   if (clear_epoch_ != planned_clear_epoch) return out;

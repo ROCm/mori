@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/resolve_prof.h"
 #include "umbp/distributed/master/master_metrics.h"
 
 namespace mori::umbp {
@@ -198,10 +199,14 @@ void SsdBackend::Shutdown() {
 
 SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count) {
   if (page_count == 0 || page_count > staging_page_used_.size()) return {};
+  ProfTimer scan_timer(&ResolveProf::ssd_scan);
 
   const auto first_fit = [&]() -> StagingSpan {
     uint32_t run_start = 0;
     uint32_t run_length = 0;
+    const auto walked = [](uint64_t pages) {
+      if (t_resolve_prof != nullptr) t_resolve_prof->scan_pages += pages;
+    };
     for (uint32_t i = 0; i < staging_page_used_.size(); ++i) {
       if (staging_page_used_[i]) {
         run_length = 0;
@@ -219,14 +224,18 @@ SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count
       if (in_use > staging_pages_peak_.load(std::memory_order_relaxed)) {
         staging_pages_peak_.store(in_use, std::memory_order_relaxed);
       }
+      walked(i + 1);
       return StagingSpan{run_start, page_count};
     }
+    walked(staging_page_used_.size());
     return {};
   };
   StagingSpan span = first_fit();
   // Finished local reads linger until the reaper; take their pages back now.
-  if (span.page_count == 0 && ReclaimReadLeasesLocked(std::chrono::steady_clock::now()) > 0) {
-    span = first_fit();
+  if (span.page_count == 0) {
+    const size_t reclaimed = ReclaimReadLeasesLocked(std::chrono::steady_clock::now());
+    if (t_resolve_prof != nullptr) t_resolve_prof->reclaims += reclaimed;
+    if (reclaimed > 0) span = first_fit();
   }
   return span;
 }
@@ -557,6 +566,7 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   const bool local = reader == ResolveReader::kLocal;
   std::vector<ResolvedEntry> results(keys.size());
   if (keys.empty()) return results;
+  ProfTimer ssd_timer(&ResolveProf::ssd);
   const auto now = std::chrono::steady_clock::now();
   // Stage only the bytes an in-process reader names (design-ssd-ranged-io.md D1).
   // A remote reader's extent does not travel on the wire (D2), so it stages whole.
@@ -604,7 +614,11 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   std::unordered_map<std::string, size_t> scheduled;  // key (+ window) -> its todo slot
   todo.reserve(keys.size());
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    ProfLockGuard<std::mutex> lock(mutex_, &ResolveProf::ssd_wait, &ResolveProf::ssd_hold);
+    if (t_resolve_prof != nullptr) {
+      t_resolve_prof->occupancy += staging_pages_in_use_.load(std::memory_order_relaxed);
+      ++t_resolve_prof->occupancy_n;
+    }
     for (size_t i = 0; i < keys.size(); ++i) {
       auto it = read_leases_.find(keys[i]);
       if (it != read_leases_.end()) {  // a whole-object lease serves any extent too
@@ -637,7 +651,11 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
         }
       }
 
-      const uint64_t size = ssd_->SizeOf(keys[i]);
+      uint64_t size = 0;
+      {
+        ProfTimer sizeof_timer(&ResolveProf::ssd_sizeof);
+        size = ssd_->SizeOf(keys[i]);
+      }
       if (size == 0) continue;
 
       // The extent widened to the 4 KiB record alignment (so O_DIRECT lands in
@@ -701,6 +719,10 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       for (size_t j = staged; j < todo.size(); ++j) {
         for (size_t index : result_groups[j]) results[index].outcome = ResolveOutcome::kBusy;
       }
+      if (t_resolve_prof != nullptr) {
+        t_resolve_prof->staged_keys += staged;
+        t_resolve_prof->busy_keys += todo.size() - staged;
+      }
       todo.resize(staged);
       read_extents.resize(staged);
       read_keys.resize(staged);
@@ -744,13 +766,16 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
   // this call were collapsed above; PeerSsdManager additionally coalesces reads
   // racing across calls.  It marks each key in-flight for the window, so
   // eviction already skips them.
-  const std::vector<SsdReadOutcome> outcomes =
-      ssd_->PrepareReadBatch(read_keys, dsts, caps, &read_extents);
+  std::vector<SsdReadOutcome> outcomes;
+  {
+    ProfTimer read_timer(&ResolveProf::ssd_read);
+    outcomes = ssd_->PrepareReadBatch(read_keys, dsts, caps, &read_extents);
+  }
 
   // Phase 3 (ONE lock): install a lease per key that landed, hand back the pages
   // of the ones that did not.
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    ProfLockGuard<std::mutex> lock(mutex_, &ResolveProf::ssd_wait, &ResolveProf::ssd_hold);
     for (size_t j = 0; j < todo.size(); ++j) {
       const size_t primary = todo[j];
       if (outcomes[j].status != SsdReadStatus::kOk) {

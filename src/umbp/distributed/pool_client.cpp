@@ -51,6 +51,7 @@
 #include "umbp/common/grpc_limits.h"
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
+#include "umbp/common/resolve_prof.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
@@ -274,6 +275,7 @@ struct RangedPhases {
   // size->component mapping is provable from the log rather than inferred.
   const std::string* key0 = nullptr;
   size_t object_size = 0;
+  ResolveProf rp;  // `resolve`, split across the pool and its backends
 };
 
 // Adds its lifetime to a sink.  A null sink makes it inert, which is how the
@@ -381,6 +383,8 @@ class RangedStats {
       c.bytes += p.bytes;
       c.total += total;
       c.xfer += p.xfer;
+      c.resolve += p.resolve;
+      c.rp.Add(p.rp);
       if (c.sample_key.empty() && p.key0 != nullptr) c.sample_key = *p.key0;
     }
 
@@ -421,7 +425,8 @@ class RangedStats {
   struct Component {
     uint64_t calls = 0;
     uint64_t keys = 0;
-    double bytes = 0, total = 0, xfer = 0;
+    double bytes = 0, total = 0, xfer = 0, resolve = 0;
+    ResolveProf rp;
     std::string sample_key;
   };
   static void Emit(const char* name, const Totals& t) {
@@ -465,6 +470,18 @@ class RangedStats {
           static_cast<double>(c.keys) / c.calls,
           c.xfer > 0 ? (c.bytes / c.xfer) / (1024.0 * 1024 * 1024) : 0.0,
           c.total > 0 ? (c.bytes / c.total) / (1024.0 * 1024 * 1024) : 0.0);
+      const ResolveProf& r = c.rp;
+      if (r.attempts == 0) continue;
+      MORI_UMBP_INFO(
+          "[RangedCall][dbg] RESOLVE {} obj={} calls={} resolve={:.3f}s | pool={:.3f}s "
+          "pool_wait={:.3f}s pool_hold={:.3f}s promote={:.3f}s backend={:.3f}s ssd={:.3f}s "
+          "ssd_wait={:.3f}s ssd_hold={:.3f}s ssd_scan={:.3f}s ssd_sizeof={:.3f}s "
+          "ssd_read={:.3f}s busy_sleep={:.3f}s | rounds={} attempts={} staged_keys={} "
+          "busy_keys={} scan_pages={} reclaims={} occupancy_mean={:.0f}pages",
+          id.first ? "GET" : "PUT", id.second, c.calls, c.resolve, r.pool, r.pool_wait, r.pool_hold,
+          r.promote, r.backend, r.ssd, r.ssd_wait, r.ssd_hold, r.ssd_scan, r.ssd_sizeof, r.ssd_read,
+          r.busy_sleep, r.rounds, r.attempts, r.staged_keys, r.busy_keys, r.scan_pages, r.reclaims,
+          r.occupancy_n > 0 ? static_cast<double>(r.occupancy) / r.occupancy_n : 0.0);
     }
   }
 
@@ -510,19 +527,28 @@ class ScopedRangedReport {
     const double other =
         total - (phases_.resolve + phases_.classify + phases_.build + phases_.validate +
                  phases_.commit + phases_.route + phases_.xfer + phases_.lock + phases_.remote);
+    const ResolveProf& rp = phases_.rp;
     MORI_UMBP_INFO(
         "[RangedCall][dbg] op={} obj={} key0='{}' keys={} items={} local={} remote={} bytes={} "
         "total={:.1f}us resolve={:.1f}us classify={:.1f}us build={:.1f}us validate={:.1f}us "
         "commit={:.1f}us route={:.1f}us xfer={:.1f}us(plan={:.1f} submit={:.1f} wait={:.1f}) "
         "lock={:.1f}us remote_phase={:.1f}us(rslv={:.1f} bld={:.1f} rdma={:.1f} scat={:.1f}) "
-        "other={:.1f}us",
+        "other={:.1f}us | rp_pool={:.1f} rp_pw={:.1f} rp_ph={:.1f} rp_promote={:.1f} "
+        "rp_backend={:.1f} rp_ssd={:.1f} rp_sw={:.1f} rp_sh={:.1f} rp_scan={:.1f} rp_sizeof={:.1f} "
+        "rp_read={:.1f} rp_sleep={:.1f} rp_rounds={} rp_attempts={} rp_staged={} rp_busy={} "
+        "rp_pages={} rp_occ={:.0f}",
         op_, phases_.object_size, phases_.key0 != nullptr ? *phases_.key0 : std::string("?"),
         phases_.keys, phases_.items, phases_.local_keys, phases_.remote_keys, phases_.bytes,
         total * 1e6, phases_.resolve * 1e6, phases_.classify * 1e6, phases_.build * 1e6,
         phases_.validate * 1e6, phases_.commit * 1e6, phases_.route * 1e6, phases_.xfer * 1e6,
         phases_.xfer_plan * 1e6, phases_.xfer_submit * 1e6, phases_.xfer_wait * 1e6,
         phases_.lock * 1e6, phases_.remote * 1e6, phases_.rmt_resolve * 1e6,
-        phases_.rmt_build * 1e6, phases_.rmt_wait * 1e6, phases_.rmt_scatter * 1e6, other * 1e6);
+        phases_.rmt_build * 1e6, phases_.rmt_wait * 1e6, phases_.rmt_scatter * 1e6, other * 1e6,
+        rp.pool * 1e6, rp.pool_wait * 1e6, rp.pool_hold * 1e6, rp.promote * 1e6, rp.backend * 1e6,
+        rp.ssd * 1e6, rp.ssd_wait * 1e6, rp.ssd_hold * 1e6, rp.ssd_scan * 1e6, rp.ssd_sizeof * 1e6,
+        rp.ssd_read * 1e6, rp.busy_sleep * 1e6, rp.rounds, rp.attempts, rp.staged_keys,
+        rp.busy_keys, rp.scan_pages,
+        rp.occupancy_n > 0 ? static_cast<double>(rp.occupancy) / rp.occupancy_n : 0.0);
   }
 
  private:
@@ -649,7 +675,10 @@ std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
     }
     const auto sleep_for =
         std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(remaining));
-    if (sleep_for.count() > 0) std::this_thread::sleep_for(sleep_for);
+    if (sleep_for.count() > 0) {
+      ProfTimer sleep_timer(&ResolveProf::busy_sleep);
+      std::this_thread::sleep_for(sleep_for);
+    }
     backoff = std::min(backoff * 2, std::chrono::milliseconds{50});
   }
 }
@@ -3593,6 +3622,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     std::vector<size_t> later;
     {
       PhaseTimer resolve_timer(dbg ? &dbg->resolve : nullptr);
+      ScopedResolveProf prof(dbg ? &dbg->rp : nullptr);
+      if (dbg != nullptr) ++dbg->rp.rounds;
       ResolveLocalBatch(
           keys, candidates, &holders, &resolutions,
           [&](size_t i) {
