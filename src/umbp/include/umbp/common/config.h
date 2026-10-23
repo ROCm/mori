@@ -336,6 +336,12 @@ struct UMBPDistributedConfig {
   // stops paying for an arena it does not use.
   size_t ranged_scratch_size = 0;
 
+  // Back both ranged scratch arenas with hugetlbfs pages.  Each arena is one
+  // NIC memory region, so hugepages cut its translation entries, which NICs
+  // cap per region.  Falls back to 4 KiB pages when no hugetlb pages are free.
+  bool ranged_scratch_use_hugepages = false;
+  size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.
   int ssd_staging_buffer_slots = 0;
