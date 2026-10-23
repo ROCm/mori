@@ -134,10 +134,15 @@ jobs:
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
           # rendezvous interface), not one of the 8 rails.
+          # qp_max_send_wr works around mlx5 rejecting mori-io's default QP
+          # (8192 send WRs + 64-byte notification inline) with EINVAL: mlx5
+          # sizes every WQE for its largest op (192-byte UMR header), so the
+          # SQ needs 4 MiB against a 2 MiB (32768 x 64-byte WQEBB) cap.
           - platform: MI300X_MLX
             runner: [self-hosted, 300_mlx_p19_29]
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             socket_ifname: ens14np0
+            qp_max_send_wr: 4096
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -151,6 +156,7 @@ jobs:
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
       NCCL_SOCKET_IFNAME: ${{ matrix.socket_ifname }}
+      MORI_IO_QP_MAX_SEND_WR: ${{ matrix.qp_max_send_wr }}
     timeout-minutes: 45
     steps:
       - name: Fix workspace permissions
@@ -181,6 +187,7 @@ jobs:
             -e MORI_RDMA_TC=$MORI_RDMA_TC \
             ${MORI_SOCKET_IFNAME:+-e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME} \
             ${NCCL_SOCKET_IFNAME:+-e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME} \
+            ${MORI_IO_QP_MAX_SEND_WR:+-e MORI_IO_QP_MAX_SEND_WR=$MORI_IO_QP_MAX_SEND_WR} \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -272,6 +279,19 @@ jobs:
             timeout 60 pytest tests/python/io/ -v
             MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD=4 \
               timeout 120 pytest tests/python/io/test_discrete_buffer.py -v -k 'not performance'
+          "
+
+      - name: MORI-IO C++ (test_engine)
+        run: |
+          # `pip install .` leaves BUILD_TESTS off, so test_engine is built here.
+          # Its XGMI hidden-device cases re-launch the binary under a narrower
+          # HIP_VISIBLE_DEVICES, so the parent must see every GPU.
+          $CT exec $CONTAINER bash -c "
+            set -e
+            cd $GITHUB_WORKSPACE
+            cmake -B build_io -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF
+            cmake --build build_io -j --target test_engine
+            timeout 300 ./build_io/tests/cpp/test_engine
           "
 
       - name: MORI-IO fault catalog (ibverbs)
