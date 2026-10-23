@@ -198,11 +198,13 @@ void SsdBackend::Shutdown() {
 
 SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count) {
   if (page_count == 0 || page_count > staging_page_used_.size()) return {};
+  if (returned_->count.load(std::memory_order_relaxed) != 0) DrainReturnedSpansLocked();
 
-  const auto first_fit = [&]() -> StagingSpan {
-    uint32_t run_start = 0;
+  // Next-fit: searching from page 0 rescanned every busy page per key (~25k at c48).
+  const auto fit_from = [&](uint32_t from) -> StagingSpan {
+    uint32_t run_start = from;
     uint32_t run_length = 0;
-    for (uint32_t i = 0; i < staging_page_used_.size(); ++i) {
+    for (uint32_t i = from; i < staging_page_used_.size(); ++i) {
       if (staging_page_used_[i]) {
         run_length = 0;
         continue;
@@ -219,16 +221,35 @@ SsdBackend::StagingSpan SsdBackend::AcquireStagingSpanLocked(uint32_t page_count
       if (in_use > staging_pages_peak_.load(std::memory_order_relaxed)) {
         staging_pages_peak_.store(in_use, std::memory_order_relaxed);
       }
+      staging_cursor_ = run_start + page_count;
       return StagingSpan{run_start, page_count};
     }
     return {};
   };
-  StagingSpan span = first_fit();
+  StagingSpan span = fit_from(staging_cursor_);
+  if (span.page_count == 0 && staging_cursor_ != 0) span = fit_from(0);
   // Finished local reads linger until the reaper; take their pages back now.
   if (span.page_count == 0 && ReclaimReadLeasesLocked(std::chrono::steady_clock::now()) > 0) {
-    span = first_fit();
+    span = fit_from(0);
   }
   return span;
+}
+
+void SsdBackend::ReturnedSpans::Return(StagingSpan span) {
+  std::lock_guard<std::mutex> lock(mu);
+  spans.push_back(span);
+  count.store(spans.size(), std::memory_order_relaxed);
+}
+
+size_t SsdBackend::DrainReturnedSpansLocked() {
+  std::vector<StagingSpan> spans;
+  {
+    std::lock_guard<std::mutex> lock(returned_->mu);
+    spans.swap(returned_->spans);
+    returned_->count.store(0, std::memory_order_relaxed);
+  }
+  for (const StagingSpan span : spans) ReleaseStagingSpanLocked(span);
+  return spans.size();
 }
 
 void SsdBackend::ReleaseStagingSpanLocked(StagingSpan span) {
@@ -766,10 +787,9 @@ std::vector<ResolvedEntry> SsdBackend::BatchResolve(const std::vector<std::strin
       if (read_extents[j].length != 0) {
         // Private to its readers and freed with their holds; never a read lease,
         // which promises the WHOLE object to the next resolve of the key.
-        extent_stages_.push_back(ExtentStage{spans[j], read_extents[j], std::make_shared<char>()});
+        const auto hold = std::make_shared<ExtentHold>(returned_, spans[j]);
         for (size_t result_index : result_groups[j]) {
-          publish_span(results[result_index], spans[j], outcomes[j].size,
-                       extent_stages_.back().hold, read_extents[j]);
+          publish_span(results[result_index], spans[j], outcomes[j].size, hold, read_extents[j]);
         }
         extent_stages_total_.fetch_add(1, std::memory_order_relaxed);
         extent_stage_bytes_.fetch_add(read_extents[j].length, std::memory_order_relaxed);
@@ -1021,6 +1041,7 @@ void SsdBackend::ReaperSweep() {
 }
 
 size_t SsdBackend::ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point now) {
+  const size_t returned = DrainReturnedSpansLocked();
   size_t reclaimed = 0;
   for (auto it = read_leases_.begin(); it != read_leases_.end();) {
     // use_count is exact here: holds are only copied under mutex_.
@@ -1043,7 +1064,7 @@ size_t SsdBackend::ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point
     }
   }
   staging_expired_reclaims_.fetch_add(reclaimed, std::memory_order_relaxed);
-  return reclaimed;
+  return returned + reclaimed;
 }
 
 std::unique_ptr<MediumBackend> MakeSsdBackend(SsdBackend::Config cfg) {
