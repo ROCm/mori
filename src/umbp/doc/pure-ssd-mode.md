@@ -198,7 +198,7 @@ for HiCache's L3 path to initialize, but `random` routing skips any node that
 | Adding drives or nodes doesn't add bandwidth | Writes are skewed. Set `UMBP_ROUTE_PUT_SELECT_ALGO=random`, check `UMBP_ROUTE_PUT_NODE_AFFINITY=none` |
 | `random` set but still skewed | It was set on the engine instead of `umbp_master`. Check the master's startup strategy line |
 | Reads report misses under load | Read staging slots exhausted. Raise `ssd_staging_buffer_slots` or `UMBP_SSD_GET_MAX_ATTEMPTS` |
-| Puts fail on an SSD node | The staging arena is exhausted, so `BatchAllocate` had no page to hand out. Check `mori_umbp_backend_medium_events_total{tier="SSD", event="staging_slot_full_reject"}` and raise `ssd_staging_buffer_slots` |
+| Puts fail on an SSD node | The staging arena is exhausted, so `BatchAllocate` had no page to hand out. Check `mori_umbp_backend_medium_events_total{tier="SSD", event="staging_put_full_reject"}` (the peer also logs a sampled `staging arena full` WARN) and raise `ssd_staging_buffer_slots`. `staging_slot_full_reject` counts the same pressure on reads |
 | Node comes up with an empty cache after an upgrade | On-disk record format changed; older records are dropped on version mismatch |
 | Tier fills far earlier than expected | Capacity is charged in padded bytes — small values pay up to 16× |
 | SSD used is well above the live data | Used counts dead records until their segment file empties. Compare `mori_umbp_backend_medium_state{state="live_bytes"}` with it; `medium_events_total{event="segment_deleted"}` should grow while the tier evicts |
