@@ -2840,6 +2840,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
 
     switch (outcome) {
       case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS:
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT:
         (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
         continue;
       case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED:
