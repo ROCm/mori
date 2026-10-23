@@ -672,7 +672,18 @@ static void SizeHeap(Config& cfg) {
   const bool isReduce =
       (cfg.coll == Collective::kReduceScatter || cfg.coll == Collective::kAllReduce) &&
       cfg.mode != RsMode::kPull;
-  const size_t staging = isReduce ? (npes - 1) * chunkBytes : 0;
+  // Match the facade's rounded per-shard scatter size so a non-divisible/odd
+  // count never trips the "staging too small" check. The compute pack is 4B
+  // (bf16/f16/f32/s32) or 8B (s64); reduce-scatter rounds each shard up to a
+  // whole pack, all-reduce rounds its uniform shard stride up to 16B.
+  const size_t packBytes = std::max<size_t>(4, elemSize);
+  size_t shardStage = 0;
+  if (isReduce) {
+    shardStage = (cfg.coll == Collective::kAllReduce)
+                     ? (((N + npes - 1) / npes + 15) & ~size_t(15))
+                     : (((chunkBytes + packBytes - 1) / packBytes) * packBytes);
+  }
+  const size_t staging = isReduce ? (npes - 1) * shardStage : 0;
   cfg.stagingBytes = std::max<size_t>(staging, CollectivesFacade::kDefAlign);
 
   cfg.heapBytes = AlignUp(bufBytes + cfg.stagingBytes + kHeapSlack, CollectivesFacade::kDefAlign);
@@ -733,40 +744,6 @@ int main(int argc, char* argv[]) {
     XPUT("ERROR: --npes must be in 1..%d (SDMA fast path caps at 8)", deviceCount);
     return 1;
   }
-
-  // Buffer-size validation (per-collective element size from dtype).
-  const size_t elemSize = DtypeSize(cfg.dt);
-  if (cfg.coll == Collective::kCollectivePermute) {
-    // collective_permute is a plain byte-granular SDMA copy (StartSdmaScatter
-    // with ElemBytes=1), so any positive size is valid.
-    if (cfg.numElems == 0) {
-      XPUT("ERROR: --size must be > 0");
-      return 1;
-    }
-  } else {
-    if (cfg.numElems % cfg.npes != 0) {
-      XPUT("ERROR: --size must be divisible by --npes");
-      return 1;
-    }
-
-    const size_t chunkBytes = (cfg.numElems / cfg.npes) * elemSize;
-    XPUT("numElems = %zu, npes = %d, chunkBytes = %zu, elemSize = %zu", cfg.numElems, cfg.npes, chunkBytes, elemSize);
-    if (chunkBytes < 4 || (chunkBytes % 4) != 0) {
-      XPUT("ERROR: per-shard bytes (size/npes * sizeof) must be a multiple of 4");
-      return 1;
-    }
-  }
-
-  // The Launch* wrappers dispatch dtype internally and would silently no-op on a
-  // type this build does not instantiate, so probe once up front (rank-independent)
-  // and emit the actionable diagnostic instead of reporting a bogus verify failure.
-  if (detail::DispatchReduceType(cfg.dt, [](auto) { return hipSuccess; }) == hipErrorNotSupported) {
-    XPUT("ERROR: dtype %s not supported by this build "
-         "(rebuild with FACADE_REDUCE_USE_ALL_TYPES=1)",
-         detail::DataTypeName(cfg.dt));
-    return 1;
-  }
-
   SizeHeap(cfg);
 
   ccoUniqueId uid;

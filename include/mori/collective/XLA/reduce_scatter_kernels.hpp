@@ -58,7 +58,8 @@ template <int NV, class ReduceOp, StreamScope Scope,
 __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input, 
                                                const T* __restrict__ staging, 
                                   T* __restrict__ output, int npes, int myPe,
-                                  size_t v, size_t lstride, size_t chunkElems) {
+                                  size_t v, size_t lstride, size_t inputStride,
+                                  size_t slotStride) {
   constexpr int vecSize = VecBytes / sizeof(T);
   using Vec = TVecType<VecBytes>;
   using AccType = typename AccumulatorType<T>::type;
@@ -68,7 +69,9 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
   Vec vec[NV];
   const T* p[NV];
   // Seed accumulators from peer 0: load its NV vectors, then upcast lanes.
-  p[0] = input + myPe * chunkElems;
+  // input base uses the uniform shard stride; staging slots use this PE's own
+  // shard length (slotStride) -- they differ when shards are variable-length.
+  p[0] = input + myPe * inputStride;
 #pragma unroll
   for (int i = 0; i < NV; i++) {
     const size_t idx = (v + i * lstride) * vecSize;
@@ -90,7 +93,7 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 #pragma unroll
     for (int i = 0; i < NV; i++) {
       vec[i] = StreamLoad<Scope>(p[i]);
-      p[i] += chunkElems;
+      p[i] += slotStride;
     }
 #pragma unroll
     for (int i = 0; i < NV; i++) {
@@ -167,8 +170,8 @@ template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __device__ __forceinline__ void WaitAndReduceSlice(
     uint64_t* signalBuf, uint64_t& seen, uint32_t slice, int myPe, int npes,
     const T* __restrict__ input, const T* __restrict__ staging,
-    T* __restrict__ shardOut, size_t sOfs, size_t sCnt, size_t chunkElems,
-    uint32_t lstride) {
+    T* __restrict__ shardOut, size_t sOfs, size_t sCnt, size_t inputStride,
+    size_t slotStride, uint32_t lstride) {
 
   const uint32_t BlockDimX = blockDim.x;
   constexpr int vecSize = VecBytes / sizeof(T);
@@ -211,23 +214,23 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   size_t v = blockIdx.x * BlockDimX + threadIdx.x;
   for (; v + (NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
     ReduceVecGroup<NumVecs, ReduceOp, EAgentScope>(input, staging, shardOut, 
-                                        npes, myPe, v, lstride, chunkElems);
+                                        npes, myPe, v, lstride, inputStride, slotStride);
   }
   // Trailing partial group: the remaining in-bounds vectors for this thread.
   for (; v < totalVecs; v += lstride) {
     ReduceVecGroup<1, ReduceOp, EAgentScope>(input, staging, shardOut, 
-                                        npes, myPe, v, lstride, chunkElems);
+                                        npes, myPe, v, lstride, inputStride, slotStride);
   }
   // Scalar tail (only the last slice can be non-vecSize-aligned).
   v = blockIdx.x * BlockDimX + threadIdx.x + totalVecs * vecSize;
   for (; v < sCnt; v += lstride) {
     using Vec = TVecType<sizeof(T)>;
     using AccType = typename AccumulatorType<T>::type;
-    const T *ptr = input + myPe * chunkElems;
+    const T *ptr = input + myPe * inputStride;
     Vec V = StreamLoad<EAgentScope, sizeof(T)>(ptr + v);
     AccType a = UpcastF<T>(__builtin_bit_cast(T, V));
     ptr = staging + v;
-    for (int pe = 1; pe < npes; pe++, ptr += chunkElems) {
+    for (int pe = 1; pe < npes; pe++, ptr += slotStride) {
       V = StreamLoad<EAgentScope, sizeof(T)>(ptr);
       a = ReduceOp()(a, UpcastF<T>(__builtin_bit_cast(T, V)));
     }
@@ -302,18 +305,23 @@ __device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, StoreFn s
 // the scalar tail, so one generic lambda covers both. Reduce-scatter stores once
 // at system scope (its caller reads the shard remotely); the fused all-reduce
 // stores locally at agent scope and fans the same registers out to every peer.
+// Generalized core: the shard's base offset within each peer's buffer
+// (baseElems) and its length (lenElems) are independent, so every PE can share a
+// uniform stride base (myPe*stride) while the last PE processes a shorter shard.
+// baseElems/lenElems are in T (= ComputeT) units. store(elemIdx, v) receives
+// elemIdx relative to the shard start (0..lenElems).
 template <int NumVecs, int NPES, class ReduceOp, class StoreFn,
           class T = typename ReduceOp::Type>
 __device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
                                     const T* __restrict__ input, StoreFn store,
-                                    size_t chunkElems) {
+                                    size_t baseElems, size_t lenElems) {
   constexpr int vecSize = VecBytes / sizeof(T);
   constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
   const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
-  const size_t totalVecs = chunkElems / vecSize;
+  const size_t totalVecs = lenElems / vecSize;
 
-  const T* __restrict__ myShard = input + myPe * chunkElems;
+  const T* __restrict__ myShard = input + baseElems;
   auto srcBase = [myShard, myPe, stride4G](int pe) -> const T* {
     int32_t diff = (pe - myPe) * static_cast<int32_t>(stride4G);
     return reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(myShard) +
@@ -333,7 +341,7 @@ __device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
   }
 
   // Scalar tail for elements not covered by the vectorized loop.
-  for (size_t i = totalVecs * vecSize + gtid; i < chunkElems; i += gstride) {
+  for (size_t i = totalVecs * vecSize + gtid; i < lenElems; i += gstride) {
     using Vec = TVecType<sizeof(T)>;
     using AccType = typename AccumulatorType<T>::type;
     auto V = StreamLoad<ESystemScope, sizeof(T)>(srcBase(0) + i);
@@ -382,7 +390,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
     // bijection over the npes-1 non-self peers.
     StartSdmaScatter<sizeof(T)>(
-        devComm.sdma, npes, logS, chunkElems,
+        devComm.sdma, npes, logS, [=](int) { return chunkElems; },
         [=](int peer) { return peer != myPe; },
         [=](int peer) -> const uint8_t* {
           return reinterpret_cast<const uint8_t*>(input + peer * chunkElems);
@@ -409,7 +417,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
     detail::WaitAndReduceSlice<NumVecs, ReduceOp>(devComm.sdma.signalBuf, seen, s, myPe,
                                                  npes, input, staging, output, sOfs, sCnt,
-                                                 chunkElems, lstride);
+                                                 chunkElems, chunkElems, lstride);
   }
 
   // === Reset: the last block of the grid zeroes the packed slice counter =======
@@ -467,7 +475,9 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
   auto store = [output](size_t elemIdx, auto v) {
     StreamStore<ESystemScope, sizeof(v)>(output + elemIdx, v);
   };
-  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store, chunkElems);
+  // Equal shards: shard myPe lives at myPe*chunkElems and is chunkElems long.
+  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(
+      myPe, stride4G, input, store, static_cast<size_t>(myPe) * chunkElems, chunkElems);
 
   // A block counts in only once all its waves are done reading peer inputs.
   __syncthreads();
