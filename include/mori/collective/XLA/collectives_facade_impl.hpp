@@ -149,17 +149,23 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
   const size_t chunkElems = count;
   const size_t chunkBytes = chunkElems * sizeof(T);
   const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/false);
-  // Staging is only needed by the push path; pull reads peers directly (no staging).
-  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > state_.stagingBytes) {
-    FACADE_PRINTF("ReduceScatter: staging too small; increase maxStagingBytes");
-    return hipErrorInvalidConfiguration;
-  }
 
   // The reduce runs on a compute type derived from T (float reduces as float,
   // bf16 reduces as a packed pair). Data buffers stay physically T; counts
   // passed to the kernels are in packs (kPack = sizeof(ComputeT)/sizeof(T)).
-  constexpr size_t kPack = sizeof(ComputeT) / sizeof(T);
-  const size_t chunkElemsC = chunkElems / kPack;
+  // Round the per-shard pack count UP (ceil) so an odd bf16/f16 count keeps its
+  // final straddling pack instead of truncating it; for a pack-aligned count
+  // (the common case: caller guarantees count % kPack == 0) this is a no-op.
+  const size_t chunkElemsC = (chunkBytes + sizeof(ComputeT) - 1) / sizeof(ComputeT);
+  const size_t chunkBytesC = chunkElemsC * sizeof(ComputeT);
+
+  // Staging is only needed by the push path; pull reads peers directly (no
+  // staging). Size it by the rounded pack bytes the scatter actually copies.
+  if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytesC > state_.stagingBytes) {
+    FACADE_PRINTF("ReduceScatter: staging too small; increase maxStagingBytes");
+    return hipErrorInvalidConfiguration;
+  }
+
   constexpr int NumVecs = 8;
   constexpr int VecSize = VecBytes / sizeof(ComputeT);
   constexpr int kThreads = 256;
@@ -219,21 +225,45 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   using ComputeT = typename detail::ReduceComputeType<T>::type;
   using ReduceOp = Op;
 
-  const size_t chunkElems = numElems / nPes_;
-  const size_t chunkBytes = chunkElems * sizeof(T);
-  const RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/true);
-  // Only the push path stages through peer-writable scratch; pull reads peers
-  // directly and gathers straight into output.
+  // 16B-aligned uniform shard STRIDE. Ceil-divide by nPes_ BEFORE the 16B
+  // round-up so chunkBytes*nPes_ >= msgBytes always (floor would drop up to
+  // nPes_-1 bytes the round-up may not recover -- e.g. msgBytes/nPes_ already
+  // 16B). The last active PE's shard is shorter; both pull and push tile
+  // [0, msgBytes) exactly with this, avoiding the old numElems/nPes_ truncation.
+  const size_t msgBytes = numElems * sizeof(T);
+  const size_t chunkBytes = ((msgBytes + nPes_ - 1) / nPes_ + 15) & ~15ULL;
+  const size_t myOfs = chunkBytes * myPe_;
+  const size_t myBytes = msgBytes <= myOfs ? 0 : std::min(chunkBytes, msgBytes - myOfs);
+  RsMode mode = resolveMode(chunkBytes * nPes_, /*allReduce=*/true);
+
+  // Shard sizes in ComputeT packs. strideElemsC is the uniform stride (16B is a
+  // whole number of packs); myElemsC rounds my own length UP to a whole pack so
+  // the final straddling pack (last real elem + <=1 pad past numElems) is
+  // processed, not dropped. The pad write stays inside my 16B stride slot and
+  // relies on allocations being padded to a 4B multiple (symmetric heap rounds
+  // up); totalElemsC is the whole-message pack count for the push shard split.
+  const size_t strideElemsC = chunkBytes / sizeof(ComputeT);
+  const size_t totalElemsC = (msgBytes + sizeof(ComputeT) - 1) / sizeof(ComputeT);
+
+  // Push's barrier/broadcast handshake counts all nPes_ PEs and assumes each
+  // owns a non-empty shard. When the 16B shard rounding leaves fewer shards
+  // than PEs (tiny messages), some PEs would be idle and deadlock waiting for a
+  // scatter that never comes, so fall back to pull (which idles empty PEs via
+  // barriers only). This only triggers below ~nPes_ packs of data.
+  const size_t activePes = (totalElemsC + strideElemsC - 1) / strideElemsC;
+  if (activePes < static_cast<size_t>(nPes_)) {
+    mode = RsMode::kPull;
+  }
+  // Push stages through peer-writable scratch sized by the max (full) shard.
+  // chunkBytes is the stride in bytes (16B-aligned == strideElemsC packs).
   if (mode != RsMode::kPull && (nPes_ - 1) * chunkBytes > state_.stagingBytes) {
     FACADE_PRINTF("AllReduce: staging too small; increase maxStagingBytes");
     return hipErrorInvalidConfiguration;
   }
 
-  constexpr size_t kPack = sizeof(ComputeT) / sizeof(T);
-  const size_t chunkElemsC = chunkElems / kPack;
   constexpr int NumVecs = 8, VecSize = VecBytes / sizeof(ComputeT);
   constexpr int kThreads = 256;
-  size_t totalVecs = chunkElemsC / (VecSize * NumVecs);
+  size_t totalVecs = strideElemsC / (VecSize * NumVecs);
   int wantBlocks = static_cast<int>(std::max<size_t>(1, (totalVecs + kThreads - 1) / kThreads));
   // Cap the grid to the SM count so all blocks are co-resident: push needs it
   // for the multi-producer broadcast submitPacket ordering, pull for the
@@ -242,33 +272,41 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // MORI_CCL_MAX_NBLOCKS tightens (never raises) the grid; it stays co-resident.
   if (state_.maxNBlocks > 0) blocks = std::min(blocks, state_.maxNBlocks);
 
-  int logS = resolveLogS(chunkBytes, /*allReduce=*/true);
-  const size_t maxSlicesByData = std::max<size_t>(1, chunkElemsC / VecSize);
-  while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
-
   if (mode == RsMode::kPull) {
-    // Fused pull: reduce this PE's shard straight off the peers' inputs and fan
-    // the result out to every peer from registers, in one pass. No SDMA and no
-    // staging; entry and exit GenBarrier rounds on barrierCtr.
+    const size_t myElemsC = (myBytes + sizeof(ComputeT) - 1) / sizeof(ComputeT);
+    // Fused pull: reduce my shard straight off the peers' inputs and fan the
+    // result out to every peer, in one pass. Leading PEs get full stride shards,
+    // one boundary PE the remainder, trailing PEs idle (myElemsC==0, barriers
+    // only). No SDMA/staging; entry+exit GenBarrier rounds on barrierCtr.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllReducePullKernel<NumVecs, decltype(NPES_c)::value, ReduceOp>
           <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                             reinterpret_cast<const ComputeT*>(input),
-                                            reinterpret_cast<ComputeT*>(output), chunkElemsC,
+                                            reinterpret_cast<ComputeT*>(output),
+                                            strideElemsC, myElemsC,
                                             state_.groupCounters, state_.barrierCtr);
       return hipGetLastError();
     });
   }
 
   // Sliced push reduce-scatter + pipelined per-slice broadcast, all in one kernel.
-  // Every block loops over all S slices (no block-to-slice mapping), so the grid
-  // needs no rounding to a multiple of S.
+  // Every block loops over all S slices; the grid needs no rounding to S.
+  // Clamp the slice count by the SMALLEST active shard so no slice is empty (the
+  // receiver still waits on all S slices).
+  const size_t minShardC =
+      std::min(strideElemsC, totalElemsC - (nPes_ - 1) * strideElemsC);
+
+  int logS = resolveLogS(chunkBytes, /*allReduce=*/true);
+  const size_t maxSlicesByData = std::max<size_t>(1, minShardC / VecSize);
+  while (logS > 0 && (1ULL << logS) > maxSlicesByData) logS--;
+
   // input/output/staging all live in the static heap (heapWin_); the kernel
   // derives each intra-heap offset from the raw pointer via ccoGetLocalPtr.
   AllReducePushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(output), state_.groupCounters, chunkElemsC, state_.devComm,
-        reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin, state_.barrierCtr);
+        reinterpret_cast<ComputeT*>(output), state_.groupCounters, strideElemsC, totalElemsC,
+        state_.devComm, reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin,
+        state_.barrierCtr);
   return hipGetLastError();
 }
 

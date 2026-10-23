@@ -105,19 +105,22 @@ template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                     T* __restrict__ output, uint32_t* __restrict__ groupCounters,
-                    size_t chunkElems, cco::ccoDevComm devComm,
+                    size_t strideElems, size_t totalElems, cco::ccoDevComm devComm,
                     T* __restrict__ staging, cco::ccoWindow_t heapWin,
                     uint64_t* __restrict__ barrierCtr) {
 
-  // My reduced shard lives in output slot myPe.
-  T* __restrict__ myShard = output + myPe * chunkElems;
+  // 16B-aligned uniform shard STRIDE; the last active PE's shard is shorter so
+  // the shards tile [0, totalElems) exactly (see allReduceImpl). shardLen(p) is
+  // peer p's length; my shard sits at the uniform offset myPe*strideElems.
+  auto shardLen = [=](int p) -> size_t {
+    const size_t ofs = p * strideElems;
+    return min(totalElems - ofs, strideElems);
+  };
   uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
   auto bcastFlag = [=](uint32_t b) { return &groupCounters[kBcastFlagIdx + b]; };
 
   constexpr int vecSize = VecBytes / sizeof(T);
   const uint32_t S = 1u << logS;
-  // vecSize-aligned slice length; the last slice absorbs the remainder.
-  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
 
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
@@ -149,17 +152,20 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
     // bijection over the npes-1 non-self peers. 
-    const size_t chunkBytes = chunkElems * sizeof(T);
+    // Per-peer copy length = destination shard's length (shardLen(peer)); self
+    // is skipped. The dst slot stride is the DESTINATION peer's length (its
+    // staging slots are that size). 
     StartSdmaScatter<sizeof(T)>(
-        devComm.sdma, npes, logS, chunkElems,
+        devComm.sdma, npes, logS,
+        [=](int peer) { return shardLen(peer); },
         [=](int peer) { return peer != myPe; },
         [=](int peer) -> const uint8_t* {
-          return reinterpret_cast<const uint8_t*>(input + peer * chunkElems);
+          return reinterpret_cast<const uint8_t*>(input + peer * strideElems);
         },
         [=](int peer) -> uint8_t* {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
           int32_t diff = (peer - myPe)*static_cast<int32_t>(heapWin->stride4G);
-          return reinterpret_cast<uint8_t*>(staging + slot * chunkElems) + 
+          return reinterpret_cast<uint8_t*>(staging + slot * shardLen(peer)) +
              (static_cast<uint64_t>(diff)<<32);
         });
 
@@ -173,7 +179,11 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
         [=](int peer, int sub, uint32_t* q, uint64_t base) {
           HSAuint64* sig = devComm.sdma.peerSignalPtrs[peer] + kBcastSlot;
           
-          const size_t lastOfs = (S - 1) * sliceLen; 
+          // My reduced shard lives in output slot myPe (at the uniform stride offset).
+          T* __restrict__ myShard = output + myPe * strideElems;
+          const size_t myElems = shardLen(myPe),
+                       sliceLen = ((myElems >> logS) / vecSize) * vecSize,
+                       lastOfs = (S - 1) * sliceLen; 
           int32_t diff = (peer - myPe) * static_cast<int32_t>(heapWin->stride4G);
           auto *peerDst = (uint8_t*)myShard + (static_cast<uint64_t>(diff) << 32);
           if (hasB0) {
@@ -184,7 +194,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
           }
           WriteGatedBroadcast(sub, q, base, myShard + lastOfs,
                               peerDst + lastOfs * sizeof(T),
-                             (chunkElems - lastOfs) * sizeof(T),
+                             (myElems - lastOfs) * sizeof(T),
                               sig, SliceSignalInc(1), bcastFlag(1), epoch1);
         });
   }
@@ -197,15 +207,20 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   uint64_t seen = 0;
 
   for (uint32_t s = 0; s < S; s++) {
+    // My reduced shard lives in output slot myPe (at the uniform stride offset).
+    T* __restrict__ myShard = output + myPe * strideElems;
+    const size_t myElems = shardLen(myPe),
+                 sliceLen = ((myElems >> logS) / vecSize) * vecSize;
     // Slice s covers [sOfs, sOfs+sCnt) of my shard -- Phase 3 reduces that range.
     const size_t sOfs = FORCE_SGPR(s * sliceLen);
-    const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
+    const size_t sCnt = FORCE_SGPR(s == S - 1 ? myElems - sOfs : sliceLen);
 
     // === Phase 2-3: shared per-slice front (completion wait + acquire +
     // grid-strided reduce) into MY shard slot within the full output. ===
+    // input base uses the uniform stride; staging slots use my own length.
     detail::WaitAndReduceSlice<NumVecs, ReduceOp>(signalBuf, seen, s, myPe, npes, input,
-                                                 staging, myShard, sOfs, sCnt, chunkElems,
-                                                 lstride);
+                                                 staging, myShard, sOfs, sCnt, strideElems,
+                                                 myElems, lstride);
 
     // === Phase 4: count in for slices S-2 (b=0) and S-1 (b=1) ==================
     // b=0 covers slices [0, S-1): every block reduces slices in order, so its
@@ -273,7 +288,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 // from the accumulator registers straight into my own output[myPe] AND, over
 // XGMI, into every peer's output[myPe]:
 //
-//   output_q[ myPe*chunkElems + j ] = REDUCE_p( input_p[ myPe*chunkElems + j ] )
+//   output_q[ myPe*strideElems + j ] = REDUCE_p( input_p[ myPe*strideElems + j ] )
 //                                                                for every q
 // Fusing is only legal because the reduce and the redistribution visit the same
 // indices in the same thread. PullReduceShard is grid-strided (thread t owns
@@ -292,10 +307,18 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 //     input and writing my output, so "kernel done" means "output complete and
 //     input reusable". Every other block returns the moment it has counted in.
 // ===========================================================================
-
-//   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
-//   output        : raw symmetric-heap pointer, N = npes*chunkElems elements (on
-//                   exit every slot p holds the reduction over all PEs of shard p)
+// The last active PE's myElems is rounded up to a whole ComputeT pack by the
+// facade; the straddling pad pack lands in the allocation's 4B padding and
+// never crosses into another shard (it stays inside this PE's 16B stride slot).
+// Tiny messages that would leave some PE with an empty shard are fine here: an
+// idle PE gets myElems == 0 and simply runs the two GenBarrier rounds. (The push
+// path cannot represent idle PEs, which is why the facade routes those to pull.)
+//
+//   input         : raw symmetric-heap pointer (npes shards of strideElems)
+//   output        : raw symmetric-heap pointer; on exit slot p holds the
+//                   reduction over all PEs of shard p
+//   strideElems   : uniform shard stride (ComputeT units), base = myPe*strideElems
+//   myElems       : THIS PE's shard length (ComputeT units); 0 == idle PE
 //   groupCounters : plain device buffer, zeroed once by the host. [0] elects the
 //                   last block; atomicInc wraps it back to 0, so no reset.
 //   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
@@ -303,34 +326,28 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
-                    const T* __restrict__ input, T* __restrict__ output,
-                    size_t chunkElems, uint32_t* __restrict__ groupCounters,
-                    uint64_t* __restrict__ arrived) {
+                       const T* __restrict__ input, T* __restrict__ output,
+                       size_t strideElems, size_t myElems,
+                       uint32_t* __restrict__ groupCounters,
+                       uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
-  // My reduced shard lives in output slot myPe, exactly as in the push kernel.
-  T* __restrict__ myShard = output + static_cast<size_t>(myPe) * chunkElems;
+  // My reduced shard sits at the uniform offset myPe*strideElems in every peer.
+  const size_t baseElems = static_cast<size_t>(myPe) * strideElems;
+  T* __restrict__ myShard = output + baseElems;
 
   // In block 0's first wave every lane loads this before lane myPe posts.
   const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
   if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
   __syncthreads();
 
-  // === Reduce + fan out, in one pass =========================================
-  // Every finished position goes to my own slot and to all NPES-1 peers' copies
-  // of that same slot. Peer p's copy of a local heap pointer sits at that
-  // pointer + (p - myPe)*stride4G<<32, the same rank delta the loads use.
-  //
-  // Local store is agent scope: nobody reads my shard remotely any more (they
-  // are handed it), so it may sit in L2 for whoever consumes the output next.
-  // Remote stores are system scope, and are what carries the collective.
+  // Each finished position goes to my own slot and to all NPES-1 peers' copies
+  // of that same slot (peer p's copy is mine + (p-myPe)*stride4G<<32).
   auto store = [myShard, myPe, stride4G](size_t elemIdx, auto v) {
     constexpr int B = sizeof(v);
     T* __restrict__ mine = myShard + elemIdx;
     StreamStore<EAgentScope, B>(mine, v);
 #pragma unroll
     for (int k = 1; k < NPES; k++) {
-      // Peer (myPe + k) % NPES, written as a delta so the modulo stays out of
-      // the address math. Loop-invariant, so it hoists out of the grid stride.
       const int32_t delta = (k < NPES - myPe) ? k : k - NPES;
       const int32_t diff = delta * static_cast<int32_t>(stride4G);
       StreamStore<ESystemScope, B>(
@@ -339,12 +356,11 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
           v);
     }
   };
-  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store, chunkElems);
+  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store,
+                                                   baseElems, myElems);
 
-  // === Exit barrier ==========================================================
-  // Unlike reduce-scatter, the remote stores ARE the payload: every wave must
-  // publish them before its block counts in, since the barrier's release fence
-  // only covers the last block's wave.
+  // Exit barrier: the remote stores ARE the payload, so every wave publishes
+  // before its block counts in (the barrier release fence only covers the last).
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");   // system-scope release only
   __syncthreads();
   if (threadIdx.x < warpSize) {

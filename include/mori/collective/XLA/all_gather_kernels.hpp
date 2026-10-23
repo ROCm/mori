@@ -75,7 +75,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // our single shard (same for all peers).
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(myPe) * chunkBytes;
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0, chunkBytes,
+      devComm.sdma, npes, /*logS=*/0, [=](int) { return chunkBytes; },
       [](int) { return true; },
       [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(input); },
       [=](int peer) -> uint8_t* {
