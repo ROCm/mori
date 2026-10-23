@@ -80,7 +80,7 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   // arbitrary per-peer local pointer (SDMA reads local VA directly).
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(pairs[myPe].dest);
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0, chunkBytes,
+      devComm.sdma, npes, /*logS=*/0, [=](int) { return chunkBytes; },
       [](int) { return true; },
       [=](int peer) -> const uint8_t* {
         return reinterpret_cast<const uint8_t*>(pairs[peer].source);

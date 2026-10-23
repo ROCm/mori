@@ -173,7 +173,7 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 #endif
 }
 
-#define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane(x)
+#define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane((x))
 
 // Fused 64B packet: [NOP][COPY_LINEAR src->dst][ATOMIC ADD64(addValue) into *signal].
 // Lane k writes dwords [4k, 4k+4): lane 2 carries SRC_DATA_LO, lane 3 SRC_DATA_HI.
@@ -381,9 +381,17 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // so the address-based SDMA put can translate local->peer (offset from
 // heapBaseAddr).
 // ---------------------------------------------------------------------------
-template <uint64_t ElemBytes = 1, class ActiveFn, class SrcFn, class DstFn>
+// sizeOf(peer) gives the DESTINATION shard's element count, so each peer's copy
+// can be a different length: the all-reduce push path uses 16B-aligned variable
+// shards, while the uniform callers (all-gather / all-to-all / collective-
+// permute / reduce-scatter push) pass a constant lambda. The slice geometry is
+// recomputed per peer from that length. Callers must pick logS small enough that
+// every active shard yields sliceLen >= vecSize (no empty slices), since the
+// receiver still waits on all S slices; the reduce facades clamp logS by the
+// smallest shard.
+template <uint64_t ElemBytes = 1, class SizeFn, class ActiveFn, class SrcFn, class DstFn>
 __device__ __forceinline__ void StartSdmaScatter(
-    cco::ccoSdmaContext sdma, int npes, int logS, size_t chunkElems,
+    cco::ccoSdmaContext sdma, int npes, int logS, SizeFn sizeOf,
     ActiveFn activeOf, SrcFn srcOf, DstFn dstOf) {
 
   static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
@@ -394,22 +402,23 @@ __device__ __forceinline__ void StartSdmaScatter(
   const int S = 1 << logS, tid = static_cast<int>(threadIdx.x),
             B = static_cast<int>(blockDim.x);
 
-  const uint32_t numSdmaQ = sdma.sdmaNumQueue;
-  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize,
-          sliceBytes = sliceLen * ElemBytes,
-          lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
-
   const int nWork = npes << 2, lane = tid % W;
   for (int i = tid; i < nWork; i += B) {
     const int peer = i >> 2, sub = i & 3, leader = lane & ~3;
     const bool active = activeOf(peer);
+
+    // Per-peer slice geometry derived from the destination shard's length.
+    const size_t chunkElems = active ? sizeOf(peer) : 0;
+    const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize,
+            sliceBytes = sliceLen * ElemBytes,
+            lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
 
     SdmaCollectiveHandle handle;
     SdmaCollectiveHandle* shared = nullptr;
     uint32_t* queueBuf = nullptr;
     uint64_t hint0 = 0;
     if (active && sub == 0) {
-      shared = GetSharedHandle(sdma.deviceHandles + peer * numSdmaQ);
+      shared = GetSharedHandle(sdma.deviceHandles + peer/* *sdma.sdmaNumQueue*/);
       handle = *cco::impl::global(shared);
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
@@ -474,7 +483,6 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
                                                 int myPe, int nSlots, WriteFn writeFn) {
   constexpr int W = warpSize;
   const int tid = static_cast<int>(threadIdx.x), B = static_cast<int>(blockDim.x);
-  const uint32_t numSdmaQ = sdma.sdmaNumQueue;
   const int nWork = npes << 2, lane = tid % W;
 
   for (int i = tid; i < nWork; i += B) {
@@ -486,7 +494,7 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
     uint32_t* queueBuf = nullptr;
     uint64_t hint0 = 0;
     if (active && sub == 0) {
-      shared = GetSharedHandle(sdma.deviceHandles + peer * numSdmaQ);
+      shared = GetSharedHandle(sdma.deviceHandles + peer/* *sdma.sdmaNumQueue*/);
       handle = *cco::impl::global(shared);
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
