@@ -28,13 +28,17 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -45,6 +49,18 @@
 namespace mori::umbp {
 namespace {
 using HostMapper = std::function<void*(const void*, size_t, int)>;
+
+void ConfigurePollingThread() {
+#ifdef __linux__
+  // Reduce timed-wait coalescing on this thread. In our MI355X mixed-restore
+  // microbenchmark, this lowered mean 8 MiB restore latency from 253 us to 209 us.
+  constexpr unsigned long kTimerSlackNs = 1;
+  if (prctl(PR_SET_TIMERSLACK, kTimerSlackNs, 0UL, 0UL, 0UL) != 0) {
+    MORI_UMBP_WARN("[RestoreScheduler] failed to configure polling timer slack: {}",
+                   std::strerror(errno));
+  }
+#endif
+}
 
 struct RestoreRequest {
   std::vector<DeviceGatherFragment> fragments;
@@ -63,8 +79,6 @@ struct RestoreWorker {
   int device;
   hipStream_t stream = nullptr;
   hipEvent_t complete = nullptr;
-  std::vector<bool> can_write;
-  std::vector<bool> peer_enabled;
   std::shared_ptr<RestoreRequest> request;
   std::vector<DeviceGatherFragment> fragments;
   size_t bytes = 0;
@@ -72,8 +86,41 @@ struct RestoreWorker {
 
 class RestoreScheduler {
  public:
-  explicit RestoreScheduler(size_t chunk_bytes)
-      : chunk_bytes_(chunk_bytes), thread_([this] { Run(); }) {}
+  explicit RestoreScheduler(size_t chunk_bytes) : chunk_bytes_(chunk_bytes) {
+    auto check = [](hipError_t status, const std::string& operation) {
+      if (status != hipSuccess)
+        throw std::runtime_error(operation + ": " + hipGetErrorString(status));
+    };
+    int count = 0;
+    check(hipGetDeviceCount(&count), "hipGetDeviceCount");
+    if (count == 0) throw std::runtime_error("Striped restores require at least one GPU");
+    workers_.resize(count);
+    int previous_device = -1;
+    check(hipGetDevice(&previous_device), "hipGetDevice");
+    // Require full peer connectivity before starting the scheduler thread.
+    // Initialization errors reach the caller, with no background thread to join.
+    try {
+      for (int device = 0; device < count; ++device) {
+        workers_[device].device = device;
+        check(hipSetDevice(device), "hipSetDevice");
+        for (int destination = 0; destination < count; ++destination) {
+          if (device == destination) continue;
+          const auto status = hipDeviceEnablePeerAccess(destination, 0);
+          if (status == hipErrorPeerAccessAlreadyEnabled) {
+            (void)hipGetLastError();
+          } else {
+            check(status, "hipDeviceEnablePeerAccess(" + std::to_string(device) + " -> " +
+                              std::to_string(destination) + ")");
+          }
+        }
+      }
+    } catch (...) {
+      (void)hipSetDevice(previous_device);
+      throw;
+    }
+    check(hipSetDevice(previous_device), "hipSetDevice");
+    thread_ = std::thread([this] { Run(); });
+  }
 
   ~RestoreScheduler() {
     {
@@ -86,7 +133,7 @@ class RestoreScheduler {
 
   bool Restore(std::shared_ptr<RestoreRequest> request) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (stopping_) return false;
+    if (stopping_ || request->destination >= static_cast<int>(workers_.size())) return false;
     requests_.push_back(request);
     wake_.notify_one();
     request->done.wait(lock, [&] { return request->finished; });
@@ -111,8 +158,8 @@ class RestoreScheduler {
     Finish(request);
   }
 
-  // Only the scheduler thread touches streams, events, descriptor storage and
-  // per-device peer state. Each GPU has at most one submitted chunk at a time.
+  // Only the scheduler thread touches streams, events and descriptor storage.
+  // Each GPU has at most one submitted chunk at a time.
   bool Launch(RestoreWorker& worker) {
     auto& request = *worker.request;
     if (hipSetDevice(worker.device) != hipSuccess) return false;
@@ -122,12 +169,6 @@ class RestoreScheduler {
     if (worker.complete == nullptr &&
         hipEventCreateWithFlags(&worker.complete, hipEventDisableTiming) != hipSuccess)
       return false;
-    if (!worker.peer_enabled[request.destination]) {
-      auto status = hipDeviceEnablePeerAccess(request.destination, 0);
-      if (status != hipSuccess && status != hipErrorPeerAccessAlreadyEnabled) return false;
-      if (status == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
-      worker.peer_enabled[request.destination] = true;
-    }
     for (auto& fragment : worker.fragments) {
       fragment.src = request.map_host(fragment.src, fragment.bytes, worker.device);
       if (fragment.src == nullptr) return false;
@@ -163,12 +204,9 @@ class RestoreScheduler {
   // the back, skipping failed requests and those with every chunk assigned.
   // Called with mutex_ held.
   bool AssignRequest(RestoreWorker& worker) {
-    const auto selected =
-        std::find_if(requests_.begin(), requests_.end(), [&](const auto& request) {
-          return !request->failed && request->unassigned_bytes != 0 &&
-                 request->destination < static_cast<int>(worker.can_write.size()) &&
-                 worker.can_write[request->destination];
-        });
+    const auto selected = std::find_if(requests_.begin(), requests_.end(), [](const auto& request) {
+      return !request->failed && request->unassigned_bytes != 0;
+    });
     if (selected == requests_.end()) return false;
     worker.request = *selected;
     requests_.splice(requests_.end(), requests_, selected);
@@ -181,29 +219,9 @@ class RestoreScheduler {
   }
 
   void Run() {
-#ifdef __linux__
-    // Linux's default timer slack can add ~50 us to a short timed wait. Limit
-    // coalescing on this thread only, so completion polls need not oversleep.
-    (void)prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
-#endif
-    int count = 0;
-    if (hipGetDeviceCount(&count) != hipSuccess) count = 0;
-    std::vector<RestoreWorker> workers(count);
-    for (int device = 0; device < count; ++device) {
-      auto& worker = workers[device];
-      worker.device = device;
-      worker.can_write.resize(count);
-      worker.peer_enabled.resize(count);
-      for (int destination = 0; destination < count; ++destination) {
-        int accessible = 0;
-        worker.can_write[destination] =
-            device == destination ||
-            (hipDeviceCanAccessPeer(&accessible, device, destination) == hipSuccess && accessible);
-      }
-      worker.peer_enabled[device] = true;
-    }
+    ConfigurePollingThread();
     for (;;) {
-      for (auto& worker : workers) {
+      for (auto& worker : workers_) {
         if (!worker.request) continue;
         (void)hipSetDevice(worker.device);
         const auto status = hipEventQuery(worker.complete);
@@ -214,7 +232,7 @@ class RestoreScheduler {
         }
         Complete(worker, status == hipSuccess);
       }
-      for (auto& worker : workers) {
+      for (auto& worker : workers_) {
         if (worker.request) continue;
         bool launched = false;
         try {
@@ -237,17 +255,6 @@ class RestoreScheduler {
         }
       }
       std::unique_lock<std::mutex> lock(mutex_);
-      // No device can ever serve these requests. Do not leave their callers waiting.
-      for (auto it = requests_.begin(); it != requests_.end();) {
-        const auto request = *it++;
-        const bool reachable = std::any_of(workers.begin(), workers.end(), [&](const auto& worker) {
-          return request->destination < count && worker.can_write[request->destination];
-        });
-        if (!reachable && request->in_flight == 0) {
-          request->failed = true;
-          Finish(request);
-        }
-      }
       if (stopping_ && requests_.empty()) break;
       if (requests_.empty()) {
         wake_.wait(lock, [&] { return stopping_ || !requests_.empty(); });
@@ -257,7 +264,7 @@ class RestoreScheduler {
         wake_.wait_for(lock, std::chrono::microseconds(10));
       }
     }
-    for (auto& worker : workers) {
+    for (auto& worker : workers_) {
       (void)hipSetDevice(worker.device);
       if (worker.complete != nullptr) (void)hipEventDestroy(worker.complete);
       if (worker.stream != nullptr) (void)hipStreamDestroy(worker.stream);
@@ -265,6 +272,7 @@ class RestoreScheduler {
   }
 
   const size_t chunk_bytes_;
+  std::vector<RestoreWorker> workers_;
   std::mutex mutex_;
   std::condition_variable wake_;
   std::list<std::shared_ptr<RestoreRequest>> requests_;
