@@ -55,9 +55,33 @@ __global__ void InitPatternKernel(uint8_t* buffer, size_t bytes, int sourcePe) {
   }
 }
 
+__device__ __forceinline__ void WarpCopy8(uint8_t* __restrict__ dst,
+                                          const uint8_t* __restrict__ src, size_t bytes) {
+  constexpr size_t kAccessBytes = 8;
+  constexpr size_t kBytesPerIteration = kWarpSize * kAccessBytes;
+  const int laneId = threadIdx.x & (kWarpSize - 1);
+
+  size_t offset = 0;
+  const size_t iterations = bytes / kBytesPerIteration;
+  for (size_t iteration = 0; iteration < iterations; ++iteration) {
+    const size_t laneOffset = offset + static_cast<size_t>(laneId) * kAccessBytes;
+    const uint64_t value = load<kAccessBytes>(src + laneOffset);
+    store<kAccessBytes>(dst + laneOffset, value);
+    offset += kBytesPerIteration;
+  }
+
+  offset += laneId;
+  while (offset < bytes) {
+    dst[offset] = src[offset];
+    offset += kWarpSize;
+  }
+}
+
+template <int AccessBytes>
 __global__ void WarpCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemObj,
                                const SymmMemObjPtr dstMemObj, size_t srcOffset, size_t dstOffset,
                                size_t bytes, unsigned expectedMod16, int* configError) {
+  static_assert(AccessBytes == 8 || AccessBytes == 16);
   const int laneId = threadIdx.x & (warpSize - 1);
   const int targetPe = (myPe + 1) % npes;
 
@@ -72,7 +96,11 @@ __global__ void WarpCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemObj
     return;
   }
 
-  WarpCopy<uint8_t>(dst, src, bytes);
+  if constexpr (AccessBytes == 16) {
+    WarpCopy<uint8_t>(dst, src, bytes);
+  } else {
+    WarpCopy8(dst, src, bytes);
+  }
   __threadfence_system();
 }
 
@@ -112,6 +140,7 @@ struct CaseResult {
   int errors;
 };
 
+template <int AccessBytes>
 CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, int npes,
                    uint8_t* srcBase, uint8_t* dstBase, const SymmMemObjPtr srcMemObj,
                    const SymmMemObjPtr dstMemObj, int* deviceError) {
@@ -130,8 +159,8 @@ CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, in
   HIP_RUNTIME_CHECK(hipEventCreate(&start));
   HIP_RUNTIME_CHECK(hipEventCreate(&stop));
   HIP_RUNTIME_CHECK(hipEventRecord(start));
-  WarpCopyKernel<<<1, kWarpSize>>>(myPe, npes, srcMemObj, dstMemObj, offset, offset, bytes,
-                                   expectedMod16, deviceError);
+  WarpCopyKernel<AccessBytes><<<1, kWarpSize>>>(myPe, npes, srcMemObj, dstMemObj, offset, offset,
+                                                bytes, expectedMod16, deviceError);
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipEventRecord(stop));
   HIP_RUNTIME_CHECK(hipEventSynchronize(stop));
@@ -227,17 +256,22 @@ int main() {
     std::fflush(stdout);
   }
 
-  const CaseResult aligned = RunCase("16-byte aligned", 0, bytes, myPe, npes, srcBase, dstBase,
-                                     srcMemObj, dstMemObj, deviceError);
-  const CaseResult misaligned = RunCase("8-byte aligned", 8, bytes, myPe, npes, srcBase, dstBase,
-                                        srcMemObj, dstMemObj, deviceError);
+  const CaseResult alignedB128 = RunCase<16>("16-byte ops, 16-byte aligned", 0, bytes, myPe, npes,
+                                             srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
+  const CaseResult misalignedB128 =
+      RunCase<16>("16-byte ops, 8-byte aligned", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
+                  dstMemObj, deviceError);
+  const CaseResult misalignedB64 = RunCase<8>("8-byte ops, 8-byte aligned", 8, bytes, myPe, npes,
+                                              srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
 
-  if (myPe == 0 && aligned.milliseconds > 0.0f) {
-    std::printf("8-byte / 16-byte runtime ratio: %.3fx\n",
-                misaligned.milliseconds / aligned.milliseconds);
+  if (myPe == 0 && alignedB128.milliseconds > 0.0f && misalignedB64.milliseconds > 0.0f) {
+    std::printf("Misaligned/aligned 16-byte-op runtime ratio: %.3fx\n",
+                misalignedB128.milliseconds / alignedB128.milliseconds);
+    std::printf("16-byte-op/8-byte-op runtime ratio at 8-byte alignment: %.3fx\n",
+                misalignedB128.milliseconds / misalignedB64.milliseconds);
   }
 
-  const int result = aligned.errors + misaligned.errors;
+  const int result = alignedB128.errors + misalignedB128.errors + misalignedB64.errors;
   HIP_RUNTIME_CHECK(hipFree(deviceError));
   ShmemFree(dstBase);
   ShmemFree(srcBase);
