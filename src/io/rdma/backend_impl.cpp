@@ -1906,28 +1906,56 @@ bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
   return rdma->PopPeerFailure(out);
 }
 
+namespace {
+constexpr std::chrono::milliseconds kReplaceRetryInterval{1000};
+}  // namespace
+
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
                                                           const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
+  RdmaBackendSession* failed = nullptr;
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
       if (it->second->Alive()) return it->second.get();
-      retiredSessions.push_back(std::move(it->second));
-      sessionCache.erase(it);
+      auto retry = replaceRetryAt.find(remote.engineKey);
+      if (retry != replaceRetryAt.end() && std::chrono::steady_clock::now() < retry->second) {
+        return it->second.get();
+      }
+      failed = it->second.get();
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
   auto newSess = std::make_unique<RdmaBackendSession>();
-  CreateSession(local, remote, *newSess);
-  std::lock_guard<std::mutex> lock(sessionCacheMu);
-  auto it = sessionCache.find(key);
-  if (it != sessionCache.end()) {
+  try {
+    CreateSession(local, remote, *newSess);
+  } catch (const std::exception& e) {
+    if (failed == nullptr) throw;
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    auto it = sessionCache.find(key);
+    if (it == sessionCache.end()) throw;
+    if (it->second.get() == failed) {
+      // The peer may be gone. Keep the failed session: a transfer on it ends with an
+      // error status, which callers handle, while an exception would escape them.
+      MORI_IO_WARN("Cannot replace a failed session to engine {}, retrying in {} ms: {}",
+                   remote.engineKey, kReplaceRetryInterval.count(), e.what());
+      replaceRetryAt[remote.engineKey] = std::chrono::steady_clock::now() + kReplaceRetryInterval;
+    }
     return it->second.get();
   }
-  auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second.get();
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  auto it = sessionCache.find(key);
+  if (it == sessionCache.end()) {
+    auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
+    return emplacedIt->second.get();
+  }
+  if (it->second.get() == failed) {
+    retiredSessions.push_back(std::move(it->second));
+    it->second = std::move(newSess);
+    replaceRetryAt.erase(remote.engineKey);
+  }
+  return it->second.get();
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {
