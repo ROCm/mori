@@ -5215,12 +5215,19 @@ void PoolClient::PublishComponentMetrics() {
            MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
     // Zero-seeded so rate() sees a medium's first move.
     std::map<std::string, uint64_t> move_reads = tiers.read_bytes;
+    std::map<std::string, uint64_t> move_writes = tiers.write_bytes;
     for (MediumBackend* backend : registry_.All()) {
-      if (backend != nullptr) move_reads.emplace(TierTypeName(backend->Tier()), 0);
+      if (backend == nullptr) continue;
+      move_reads.emplace(TierTypeName(backend->Tier()), 0);
+      move_writes.emplace(TierTypeName(backend->Tier()), 0);
     }
     for (const auto& [medium, bytes] : move_reads) {
       sample(MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES,
              MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES_HELP, {{"medium", medium}}, bytes);
+    }
+    for (const auto& [medium, bytes] : move_writes) {
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES,
+             MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES_HELP, {{"medium", medium}}, bytes);
     }
 
     for (const auto& [tier, hits] : default_pool_->TierReadHits()) {

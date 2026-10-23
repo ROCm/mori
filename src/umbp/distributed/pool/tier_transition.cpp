@@ -135,6 +135,7 @@ TierTransitionResult TierTransitionExecutor::Execute(
         result.retryable = true;
         continue;
       }
+      result.bytes_written.emplace_back(target->Tier(), committed.front().bytes_committed);
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
       // No space is pressure (staging full of reads, eviction catching up);
       // a shape failure (kFailed) stays final.
