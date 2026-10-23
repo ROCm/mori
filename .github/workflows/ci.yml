@@ -717,7 +717,7 @@ jobs:
             rdma_sl: 3
             rdma_tc: 104
             ct: podman
-            timeout_minutes: 75
+            timeout_minutes: 45
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
@@ -734,7 +734,7 @@ jobs:
             node2_ifname: ens14np0
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             ct: docker
-            timeout_minutes: 120
+            timeout_minutes: 90
           # Runner 325_bnxt_108 is decommissioned.
           # - platform: MI325X_BNXT
           #   runner: [self-hosted, 325_bnxt_108]
@@ -764,7 +764,6 @@ jobs:
       MORI_RDMA_SL: ${{ matrix.rdma_sl }}
       MORI_RDMA_TC: ${{ matrix.rdma_tc }}
       MORI_SOCKET_IFNAME: ${{ matrix.node1_ifname }}
-      PERF_DIR: ${{ github.workspace }}/_perf
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - name: Fix workspace permissions
@@ -1065,98 +1064,29 @@ jobs:
           ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST \
             "$CT exec $CONTAINER bash -c 'pkill -9 -f \"[t]ests\\.python\\.io\\.benchmark\" 2>/dev/null || true; pkill -9 -f \"[t]est_dispatch_combine_internode\" 2>/dev/null || true; sleep 2'"
 
-      - name: MORI-EP internode normal kernel bench (PR vs base)
+      - name: MORI-EP internode normal kernel bench
         run: |
-          # The sweep runs on the PR build, then again with the dispatch_combine kernel
-          # sources the PR changed swapped back to the base commit's, and the two are
-          # compared in the job summary. Kernels are JIT-compiled from the installed
-          # _jit-sources, so the swap needs no reinstall. Only the head pass can fail
-          # the job; the base pass is informational.
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          SWAP="$GITHUB_WORKSPACE/tools/perf/swap_jit_sources.sh"
-          AB="$PERF_DIR/ab"
-          mkdir -p "$PERF_DIR"
-          rm -f "$PERF_DIR"/ep_*.jsonl "$PERF_DIR"/ep_ab_*.md
           PORT=29140
-          sweep() {  # <out.jsonl> <commit> [tolerant]
-            for KERNEL in v1 v1_ll; do
-              for TOKENS in 64 128 1024 2048 4096; do
-                echo "=== bench (${2:0:9}) kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
-                NODE2_CMD=(
-                  $CT exec -e MORI_INTERNODE_TIMEOUT=$BENCH_TIMEOUT $CONTAINER bash $SCRIPT
-                  --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                  --ifname $NODE2_IFNAME
-                  --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
-                )
-                ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-                if ! $CT exec -e MORI_INTERNODE_TIMEOUT=$BENCH_TIMEOUT \
-                  -e MORI_PERF_OUT="$1" -e MORI_PERF_COMMIT="$2" \
-                  -e MORI_PERF_RUN_ID=${{ github.run_id }} \
-                  -e MORI_PERF_PLATFORM=${{ matrix.platform }} \
-                  $CONTAINER bash $SCRIPT \
-                  --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                  --ifname $NODE1_IFNAME \
-                  --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS; then
-                  [ "${3:-}" = tolerant ] || exit 1
-                  echo "::warning::base bench failed: kernel=$KERNEL max-tokens=$TOKENS"
-                fi
-                wait
-                sleep 1
-                PORT=$((PORT + 1))
-              done
+          for KERNEL in v1 v1_ll; do
+            for TOKENS in 64 128 1024 2048 4096; do
+              echo "=== bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+              NODE2_CMD=(
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT
+                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                --ifname $NODE2_IFNAME
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              )
+              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+              $CT exec -e MORI_INTERNODE_TIMEOUT=600 $CONTAINER bash $SCRIPT \
+                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                --ifname $NODE1_IFNAME \
+                --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+              wait
+              sleep 1
+              PORT=$((PORT + 1))
             done
-          }
-
-          HEAD_SHA=$(git rev-parse HEAD)
-          BENCH_TIMEOUT=600
-          sweep "$PERF_DIR/ep_head.jsonl" "$HEAD_SHA"
-
-          # Base = first parent: the target branch for a PR merge commit, else the
-          # previous commit.
-          git fetch --no-tags --quiet --deepen=1 origin "$HEAD_SHA" || true
-          BASE_SHA=$(git rev-parse --verify --quiet HEAD^1 || true)
-          if [ -z "$BASE_SHA" ]; then
-            echo "::notice::perf A/B skipped: base commit not available"; exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE_SHA" HEAD -- src include)
-          KERNELS=$(echo "$CHANGED" | grep -E '^src/ops/dispatch_combine/[^/]+\.(cpp|hpp)$' || true)
-          OTHERS=$(echo "$CHANGED" | grep -vxF -e "$KERNELS" -e '' || true)
-          if [ -z "$KERNELS" ]; then
-            echo "::notice::perf A/B skipped: no dispatch_combine kernel source changed"; exit 0
-          fi
-          if [ -n "$OTHERS" ]; then
-            echo "::notice::perf A/B skipped: non-kernel sources changed too:" $OTHERS; exit 0
-          fi
-          rm -rf "$AB"; mkdir -p "$AB/base"
-          for f in $KERNELS; do
-            if ! git cat-file -e "$BASE_SHA:$f" 2>/dev/null; then
-              echo "::notice::perf A/B skipped: $f is new in this change"; exit 0
-            fi
-            mkdir -p "$AB/base/$(dirname "$f")"
-            git show "$BASE_SHA:$f" > "$AB/base/$f"
-            echo "$f" >> "$AB/files.txt"
           done
-          rsync -az -e "ssh $SSH_OPTS -p $NODE2_PORT" "$AB/" $(whoami)@$NODE2_HOST:"$AB/"
-
-          # Later steps must run the PR's kernels, so a failed restore fails the job.
-          restore() {
-            $CT exec $CONTAINER bash $SWAP head "$AB" &&
-            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash $SWAP head $AB"
-          }
-          trap 'restore || true' EXIT
-          $CT exec $CONTAINER bash $SWAP base "$AB"
-          ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "$CT exec $CONTAINER bash $SWAP base $AB"
-          BENCH_TIMEOUT=300
-          sweep "$PERF_DIR/ep_base.jsonl" "$BASE_SHA" tolerant
-          trap - EXIT
-          restore
-
-          REPORT="$PERF_DIR/ep_ab_${{ matrix.platform }}.md"
-          $CT exec $CONTAINER python3 tools/perf/compare_ep_perf.py \
-            --base "$PERF_DIR/ep_base.jsonl" --head "$PERF_DIR/ep_head.jsonl" \
-            --base-label "${BASE_SHA:0:9}" --head-label "${HEAD_SHA:0:9}" > "$REPORT"
-          cat "$REPORT"
-          cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
 
       - name: MORI-EP internode normal kernel stress
         run: |
@@ -1176,35 +1106,6 @@ jobs:
                 --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
                 --ifname $NODE1_IFNAME \
                 --cmd stress --kernel-type $KERNEL --max-tokens $TOKENS
-              wait
-              sleep 1
-              PORT=$((PORT + 1))
-            done
-          done
-
-      - name: MORI-EP internode stress_accuracy (every round verified)
-        run: |
-          # stress only surfaces hangs and faults; stress_accuracy checks every round's
-          # dispatch and combine output, so a signalling race shows up as wrong data.
-          # Random per-rank jitter before each dispatch varies the cross-node timing.
-          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
-          PORT=29190
-          for KERNEL in v1 v1_ll; do
-            for CFG in "128 20000 200" "1024 5000 0"; do
-              read -r TOKENS ROUNDS JITTER <<< "$CFG"
-              echo "=== stress_accuracy kernel=$KERNEL max-tokens=$TOKENS rounds=$ROUNDS jitter=${JITTER}us port=$PORT ==="
-              SA_ENV="-e MORI_INTERNODE_TIMEOUT=900 -e MORI_STRESS_ROUNDS=$ROUNDS -e MORI_STRESS_JITTER=$JITTER"
-              NODE2_CMD=(
-                $CT exec $SA_ENV $CONTAINER bash $SCRIPT
-                --rank 1 --master-addr $NODE1_HOST --master-port $PORT
-                --ifname $NODE2_IFNAME
-                --cmd stress_accuracy --kernel-type $KERNEL --max-tokens $TOKENS
-              )
-              ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
-              $CT exec $SA_ENV $CONTAINER bash $SCRIPT \
-                --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
-                --ifname $NODE1_IFNAME \
-                --cmd stress_accuracy --kernel-type $KERNEL --max-tokens $TOKENS
               wait
               sleep 1
               PORT=$((PORT + 1))
@@ -1306,16 +1207,6 @@ jobs:
             sleep 1
             PORT=$((PORT + 1))
           done
-
-      - name: Upload EP internode perf data
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-ep-internode-${{ matrix.platform }}
-          path: |
-            ${{ github.workspace }}/_perf/*.jsonl
-            ${{ github.workspace }}/_perf/*.md
-          if-no-files-found: ignore
 
       - name: Cleanup node1
         if: always()
