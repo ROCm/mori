@@ -144,6 +144,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -477,6 +479,8 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -617,6 +621,8 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -628,8 +634,10 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
-  // Release this warp's destPeTokenCounter add before arriving; the last warp sums it.
-  __threadfence();
+  // The last warp sums destPeTokenCounter as soon as every warp has arrived, so each warp's add
+  // must be performed before it arrives. The add sites wait for the atomic's returned value,
+  // which orders it without the L2 writeback and invalidate of a __threadfence(); the counter
+  // is a device-scope atomic, so it is coherent across XCDs once performed.
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
