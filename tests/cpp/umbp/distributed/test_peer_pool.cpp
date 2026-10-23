@@ -1174,6 +1174,11 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
 
   EXPECT_TRUE(WaitForKey(&registry, "hot", "promote"));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));
+  pool.ClearLocal();  // drains the in-flight copy
+  // Only the source is charged the read, not the target's post-write pin.
+  const TierTransitionMetrics moves = pool.TransitionMetrics();
+  EXPECT_EQ(moves.read_bytes, (std::map<std::string, uint64_t>{{"SSD", 64}}));
+  EXPECT_EQ(moves.write_bytes, (std::map<std::string, uint64_t>{{"DRAM", 64}}));
 }
 
 // The on_hits trigger, which is what made promote_trigger a key-value policy

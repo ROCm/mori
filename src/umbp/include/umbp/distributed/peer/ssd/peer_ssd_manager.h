@@ -217,7 +217,7 @@ class PeerSsdManager {
   uint64_t ReadLead() const { return metrics_.read_lead.load(std::memory_order_relaxed); }
   uint64_t ReadDup() const { return metrics_.read_dup.load(std::memory_order_relaxed); }
   uint64_t ReadMerged() const { return metrics_.read_merged.load(std::memory_order_relaxed); }
-  // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
+  // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s); reads are loads only.
   uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
   uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
   uint64_t EvictionBackendFailures() const {

@@ -91,6 +91,8 @@ struct TierTransitionMetrics {
   uint64_t promote_failed = 0;  // of `failed`, promotions (the read stays on the source)
   uint64_t offloaded_bytes = 0;
   uint64_t promoted_bytes = 0;
+  std::map<std::string, uint64_t> read_bytes;   // read off each source medium, by TierTypeName
+  std::map<std::string, uint64_t> write_bytes;  // committed into each target medium
 };
 
 // Local watermark eviction counters; bytes freed are counted by
