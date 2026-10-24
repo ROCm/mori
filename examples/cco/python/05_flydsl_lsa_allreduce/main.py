@@ -53,12 +53,13 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
-from flydsl.expr import buffer_ops, range_constexpr
+from flydsl.expr import range_constexpr
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int32, Int64, T
 
 from mori.cco import Communicator, CCODevCommRequirements, GDA_CONNECTION_NONE
 import mori.cco.device.flydsl as cco
+from mori.cco.device.flydsl import buffer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cco_example_common import set_device, sync, fill, zero, read, F32  # noqa: E402
@@ -83,17 +84,15 @@ WIN_BYTES = OUT_OFF + NUM_ELEMS * 4
 
 
 def _rsrc(addr_i64):
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+    return buffer.create_buffer_resource_from_addr(addr_i64)
 
 
 def _store_u32_uncached(rsrc, val):
-    buffer_ops.buffer_store(val, rsrc, 0, cache_modifier=_CM_SC0_SC1)
+    buffer.buffer_store(val, rsrc, 0, cache_modifier=_CM_SC0_SC1)
 
 
 def _load_u32_uncached(rsrc):
-    return buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
-    )
+    return buffer.buffer_load(rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1)
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -142,11 +141,11 @@ def custom_ar_kernel(dev_comm: Int64, win: Int64, flag: Int32):
         acc = None
         for p in range_constexpr(WS):
             raw = fx.Vector(
-                buffer_ops.buffer_load(in_rsrc[p], elem_off, vec_width=4, dtype=T.i32)
+                buffer.buffer_load(in_rsrc[p], elem_off, vec_width=4, dtype=T.i32)
             )
             vf = raw.bitcast(fx.Float32)
             acc = vf if acc is None else acc + vf
-        buffer_ops.buffer_store(
+        buffer.buffer_store(
             acc.bitcast(fx.Int32), out_rsrc, elem_off, cache_modifier=_CM_CACHED
         )
 

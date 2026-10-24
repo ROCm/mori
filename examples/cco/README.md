@@ -49,13 +49,13 @@ Then install the two extra runtime deps the examples need (not pulled in by
 `pip install .`):
 
 ```bash
-pip install mpi4py "flydsl==0.2.2"
+pip install mpi4py "flydsl==0.4.0"
 ```
 
 - `mpi4py` — every example bootstraps the cco `UniqueId` over MPI.
-- `flydsl==0.2.2` — required by the Python **FlyDSL** examples (03–06). Pinned to
-  the FlyDSL ABI the device bitcode targets. (Also available as the optional
-  extra `pip install amd_mori[flydsl]`.) Not needed for `01`, `02`, or the C++
+- `flydsl` — required by the Python **FlyDSL** examples (03–08). 0.4.0 is what CI
+  and aiter use; 0.2.x and 0.3.x work too. (Also available as the optional extra
+  `pip install amd_mori[flydsl]`.) Not needed for `01`, `02`, `09`, or the C++
   examples.
 
 After `pip install .` you do **not** need `PYTHONPATH` / `LD_LIBRARY_PATH` /
