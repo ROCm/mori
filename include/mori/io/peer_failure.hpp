@@ -119,6 +119,11 @@ class PeerFailureTracker {
   // Records a failure, or clears one on recovery. Repeats fold into the first.
   void Report(const PeerFailureReport& report);
 
+  // Marks a QP dead after an error completion put it in ERR, without queuing an
+  // event: the transfer that hit the error already reports it. Kept apart from
+  // Report's records, so a later Report for the same QP still queues its event.
+  void MarkQpFailed(const QpKey& qp);
+
   // Takes the oldest pending failure. False when none is pending.
   bool Pop(PeerFailureEvent* out);
 
@@ -186,6 +191,7 @@ class PeerFailureTracker {
   mutable std::mutex mu_;
   std::unordered_map<QpKey, QpOwner, QpKeyHash> qpOwners_;
   std::unordered_set<QpKey, QpKeyHash> failedQps_;
+  std::unordered_set<QpKey, QpKeyHash> erroredQps_;
   std::unordered_set<PortKey, PortKeyHash> failedPorts_;
   std::unordered_set<CqKey, CqKeyHash> failedCqs_;
   std::unordered_set<std::string> failedDevices_;

@@ -181,7 +181,7 @@ bool FaultInjector::ShouldFire(FaultKind kind, uint32_t qpn, int wcOpcode, int* 
 
 void FaultInjector::RememberQp(ibv_qp* qp) {
   std::lock_guard<std::mutex> lock(mu_);
-  qps_[qp->qp_num] = qp;
+  qps_[{qp->context, qp->qp_num}] = qp;
 }
 
 void FaultInjector::MoveQpToError(ibv_qp* qp) {
@@ -235,7 +235,7 @@ int FaultInjector::PollCq(ibv_cq* cq, int numEntries, ibv_wc* wc) {
         ibv_qp* qp = nullptr;
         {
           std::lock_guard<std::mutex> lock(mu_);
-          auto it = qps_.find(wc[i].qp_num);
+          auto it = qps_.find({cq->context, wc[i].qp_num});
           if (it != qps_.end()) qp = it->second;
         }
         if (qp != nullptr) {

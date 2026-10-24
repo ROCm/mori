@@ -465,6 +465,15 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   return tableIt->second;
 }
 
+EpPairVec RdmaManager::GetLiveEndpoints(EngineKey engine, TopoKeyPair key) {
+  EpPairVec eps = GetAllEndpoint(engine, key);
+  eps.erase(std::remove_if(
+                eps.begin(), eps.end(),
+                [this](const EpPair& ep) { return !IsQpAlive(ep.ldevId, ep.local.handle.qpn); }),
+            eps.end());
+  return eps;
+}
+
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   const auto& [device, portId] = availDevices[devId];
   const auto* deviceAttr = device->GetDeviceAttr();
@@ -645,6 +654,10 @@ void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText
                         (statusText != nullptr ? statusText : "unknown") +
                         ": peer did not acknowledge within the transport retry budget";
   peerFailures_.Report(report);
+}
+
+void RdmaManager::RecordQpFailed(const EpPair& ep) {
+  peerFailures_.MarkQpFailed(PeerFailureTracker::QpKey{DeviceName(ep.ldevId), ep.local.handle.qpn});
 }
 
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
@@ -876,6 +889,12 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
           if (wc[i].status == IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
             rdma->RecordPeerUnreachable(ep, failureAdvice.statusText);
           }
+        }
+        // Any error completion, a flush included, means the QP is in the error
+        // state, so later sessions must not use it. Recorded before the status
+        // below: a caller that sees the failure and retries gets a new QP.
+        if (wc[i].status != IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
+          rdma->RecordQpFailed(ep);
         }
 
         int mergedBatchSize = 0;
@@ -1778,10 +1797,15 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
   std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);
 
+  const int failedEpNum =
+      rdma->CountEndpoint(ekey, kp) - static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
+  int builtEpNum = 0;
+
   if (effectiveNumNics == 1) {
-    int epNum = rdma->CountEndpoint(ekey, kp);
+    int epNum = static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
     for (int i = epNum; i < config.qpPerTransfer; ++i) {
       server->BuildRdmaConn(ekey, kp, 0);
+      ++builtEpNum;
     }
   } else {
     std::unordered_map<int, int> rankByDev;
@@ -1789,7 +1813,7 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
       rankByDev[localCandidates[rank].first] = rank;
     }
 
-    EpPairVec existing = rdma->GetAllEndpoint(ekey, kp);
+    EpPairVec existing = rdma->GetLiveEndpoints(ekey, kp);
     std::vector<int> haveByRank(effectiveNumNics, 0);
     for (const auto& ep : existing) {
       auto it = rankByDev.find(ep.ldevId);
@@ -1799,11 +1823,17 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
     for (int rank = 0; rank < effectiveNumNics; ++rank) {
       for (int count = haveByRank[rank]; count < desiredPerRank[rank]; ++count) {
         server->BuildRdmaConn(ekey, kp, rank);
+        ++builtEpNum;
       }
     }
   }
+  if (failedEpNum > 0 && builtEpNum > 0) {
+    MORI_IO_WARN(
+        "CreateSession: built {} QP(s) to engine {} in place of failed ones ({} failed so far)",
+        builtEpNum, ekey, failedEpNum);
+  }
 
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
+  EpPairVec eps = rdma->GetLiveEndpoints(ekey, kp);
   if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
     throw std::runtime_error("RdmaBackend::CreateSession: insufficient RDMA endpoints");
   }
@@ -1876,26 +1906,56 @@ bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
   return rdma->PopPeerFailure(out);
 }
 
+namespace {
+constexpr std::chrono::milliseconds kReplaceRetryInterval{1000};
+}  // namespace
+
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
                                                           const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
+  RdmaBackendSession* failed = nullptr;
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      return it->second.get();
+      if (it->second->Alive()) return it->second.get();
+      auto retry = replaceRetryAt.find(remote.engineKey);
+      if (retry != replaceRetryAt.end() && std::chrono::steady_clock::now() < retry->second) {
+        return it->second.get();
+      }
+      failed = it->second.get();
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
   auto newSess = std::make_unique<RdmaBackendSession>();
-  CreateSession(local, remote, *newSess);
-  std::lock_guard<std::mutex> lock(sessionCacheMu);
-  auto it = sessionCache.find(key);
-  if (it != sessionCache.end()) {
+  try {
+    CreateSession(local, remote, *newSess);
+  } catch (const std::exception& e) {
+    if (failed == nullptr) throw;
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    auto it = sessionCache.find(key);
+    if (it == sessionCache.end()) throw;
+    if (it->second.get() == failed) {
+      // The peer may be gone. Keep the failed session: a transfer on it ends with an
+      // error status, which callers handle, while an exception would escape them.
+      MORI_IO_WARN("Cannot replace a failed session to engine {}, retrying in {} ms: {}",
+                   remote.engineKey, kReplaceRetryInterval.count(), e.what());
+      replaceRetryAt[remote.engineKey] = std::chrono::steady_clock::now() + kReplaceRetryInterval;
+    }
     return it->second.get();
   }
-  auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second.get();
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  auto it = sessionCache.find(key);
+  if (it == sessionCache.end()) {
+    auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
+    return emplacedIt->second.get();
+  }
+  if (it->second.get() == failed) {
+    retiredSessions.push_back(std::move(it->second));
+    it->second = std::move(newSess);
+    replaceRetryAt.erase(remote.engineKey);
+  }
+  return it->second.get();
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {

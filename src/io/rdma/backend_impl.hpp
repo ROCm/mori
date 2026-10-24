@@ -24,6 +24,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -94,6 +95,9 @@ class RdmaManager {
   // Endpoint management APIs
   int CountEndpoint(EngineKey, TopoKeyPair);
   EpPairVec GetAllEndpoint(EngineKey, TopoKeyPair);
+  // GetAllEndpoint without the endpoints whose QP has been reported failed: an RC QP
+  // in the error state never carries traffic again, so it must not count or be reused.
+  EpPairVec GetLiveEndpoints(EngineKey, TopoKeyPair);
   application::RdmaEndpoint CreateEndpoint(int devId);
   bool DestroyEndpointNoThrow(int devId, const application::RdmaEndpoint& ep) noexcept;
   EndpointId ConnectEndpoint(EngineKey remoteKey, int ldevId, application::RdmaEndpoint local,
@@ -124,6 +128,8 @@ class RdmaManager {
   bool IsQpAlive(int devId, uint32_t qpNum) const;
   // Records IBV_WC_RETRY_EXC_ERR: the only place peer death is observable.
   void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
+  // Records any other error completion: the QP is in ERR, but no event is raised.
+  void RecordQpFailed(const EpPair& ep);
   // Name of an available device; availDevices is fixed, so this takes no lock.
   std::string DeviceName(int devId) const;
 
@@ -413,6 +419,12 @@ class RdmaBackend : public Backend {
   // session cache
   std::unordered_map<SessionCacheKey, std::unique_ptr<RdmaBackendSession>, SessionCacheKeyHash>
       sessionCache;
+  // Sessions replaced because one of their QPs failed. GetOrCreateSessionCached hands out
+  // raw pointers that callers use after dropping sessionCacheMu, so these are kept alive.
+  std::vector<std::unique_ptr<RdmaBackendSession>> retiredSessions;
+  // After an attempt to replace a failed session to an engine failed (the peer may be
+  // gone), when to try again. Guarded by sessionCacheMu.
+  std::unordered_map<EngineKey, std::chrono::steady_clock::time_point> replaceRetryAt;
   std::mutex sessionCacheMu;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
