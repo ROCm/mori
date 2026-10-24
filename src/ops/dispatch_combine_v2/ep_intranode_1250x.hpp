@@ -378,6 +378,15 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                 "MORI_EP_SCALE_STRIDE disagrees with EpScaleStride(Cfg) -- the staging "
                 "would be sized at one pitch and written at another");
 
+  // The staging extents EpCfgIsValid does not bound: it admits topk up to waveSize
+  // and, with aggReserve, blockNum < 4096. Both index regions sized from the
+  // constants -- `dt * topk` within a CUSPLIT_MAX_TOPK stride, `blockIdx.x * npes`
+  // over EpStagingMaxBlocks rows -- so exceeding one overruns in silence.
+  static_assert(kCfg.numExpertPerToken <= EpStagingMaxTopk,
+                "topk exceeds EpStagingMaxTopk -- the idx/wt rows are strided by it");
+  static_assert(kCfg.blockNum <= EpStagingMaxBlocks,
+                "blockNum exceeds EpStagingMaxBlocks -- blkBase/blkCount are sized by it");
+
   // Staging pointers from the dynamically-allocated base.  The EpStaging*Offset
   // functions are constexpr on kCfg, so each is base + compile-time constant.
   //
