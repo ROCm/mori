@@ -2662,17 +2662,15 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
 
     const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(src);
     const uintptr_t dstAddr = reinterpret_cast<uintptr_t>(dst);
-    // `src` is read via load<16> (128-bit) so it needs 16-byte alignment; `dst` is written via
-    // store<8> (64-bit) so 8-byte alignment suffices.
-    const bool canVec16 = ((srcAddr & 0xF) == 0) && ((dstAddr & 0x7) == 0);
+    const bool canVec8 = ((srcAddr & 0x7) == 0) && ((dstAddr & 0x7) == 0);
     const bool canVec4 = ((srcAddr & 0x3) == 0) && ((dstAddr & 0x3) == 0);
 
     const int vecEnd8 = (hiddenDim / kVec8) * kVec8;
     const int vecEnd4 = (hiddenDim / kVec4) * kVec4;
 
-    if (canVec16) {
+    if (canVec8) {
       const auto* __restrict__ srcAligned =
-          static_cast<const hip_bfloat16*>(__builtin_assume_aligned(src, 16));
+          static_cast<const hip_bfloat16*>(__builtin_assume_aligned(src, 8));
       auto* __restrict__ dstAligned =
           static_cast<CombineInternalFp8*>(__builtin_assume_aligned(dst, 8));
 
@@ -2723,7 +2721,7 @@ __forceinline__ __device__ void WarpCastBf16ToCombineInternalFp8(
       }
     }
 
-    if (canVec16 || canVec4) {
+    if (canVec8 || canVec4) {
       for (int j = vecEnd4 + laneId; j < hiddenDim; j += warpSize) {
         dst[j] = Fp8T(src[j]);
       }
@@ -2759,24 +2757,22 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed(
   constexpr int kVec4 = 4;
 
   const uintptr_t outAddr = reinterpret_cast<uintptr_t>(out);
-  // The vector path writes the output via store<16> (a 128-bit access), so `out` must be
-  // 16-byte aligned. The sources are read via load<8> (64-bit), so 8-byte alignment suffices.
-  bool canVec16 = ((outAddr & 0xF) == 0);
+  bool canVec8 = ((outAddr & 0x7) == 0);
   bool canVec4 = true;
 #pragma unroll
   for (int n = 0; n < AccumNum; n++) {
     const Fp8T* src = srcPtrs[n];
     if (src == nullptr) continue;
     const uintptr_t srcAddr = reinterpret_cast<uintptr_t>(src);
-    canVec16 &= ((srcAddr & 0x7) == 0);
+    canVec8 &= ((srcAddr & 0x7) == 0);
     canVec4 &= ((srcAddr & 0x3) == 0);
   }
 
   const int vecEnd8 = (hiddenDimSize / kVec8) * kVec8;
   const int vecEnd4 = (hiddenDimSize / kVec4) * kVec4;
 
-  if (canVec16) {
-    auto* __restrict__ outAligned = static_cast<hip_bfloat16*>(__builtin_assume_aligned(out, 16));
+  if (canVec8) {
+    auto* __restrict__ outAligned = static_cast<hip_bfloat16*>(__builtin_assume_aligned(out, 8));
 
 #pragma unroll 4
     for (int j = laneId * kVec8; j < vecEnd8; j += warpSize * kVec8) {
@@ -2867,7 +2863,7 @@ __forceinline__ __device__ void WarpAccumCombineInternalFp8ToBf16Fixed(
     }
   }
 
-  const int scalarStart = (canVec16 || canVec4) ? vecEnd4 : 0;
+  const int scalarStart = (canVec8 || canVec4) ? vecEnd4 : 0;
   for (int j = scalarStart + laneId; j < hiddenDimSize; j += warpSize) {
     float sum = 0.0f;
 #pragma unroll
