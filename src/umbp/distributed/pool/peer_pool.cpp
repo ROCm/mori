@@ -1008,6 +1008,24 @@ uint32_t PeerPool::EvictSourceLocked(const PoolEvictRequest& request) const {
   return kNone;
 }
 
+size_t PeerPool::BatchTouch(const std::vector<std::string>& keys) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  if (keys.empty() || backends_ == nullptr) return 0;
+  // Every copy, not just the first in read order: a key held by two media is
+  // just as recently used in both.  The backend calls take no pool lock.
+  size_t touched = 0;
+  for (auto* backend : backends_->All()) touched += backend->Touch(keys);
+  return touched;
+}
+
+size_t PeerPool::BatchSetEvictionClass(const std::vector<std::string>& keys, int eviction_class) {
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  if (keys.empty() || backends_ == nullptr) return 0;
+  size_t updated = 0;
+  for (auto* backend : backends_->All()) updated += backend->SetEvictionClass(keys, eviction_class);
+  return updated;
+}
+
 void PeerPool::RepairAfterDropLocked(const std::string& key) {
   auto draining = draining_sources_.find(key);
   if (draining != draining_sources_.end()) {

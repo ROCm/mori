@@ -334,6 +334,15 @@ void RegisterMoriUmbp(py::module_& m) {
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
+      .def("batch_touch", &IUMBPClient::BatchTouch, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>(),
+           "Recency hint for keys used from a faster cache, on this node's media; returns "
+           "the copies touched (0 from media without an eviction order or an older server).")
+      .def("batch_set_eviction_class", &IUMBPClient::BatchSetEvictionClass, py::arg("keys"),
+           py::arg("eviction_class"), py::call_guard<py::gil_scoped_release>(),
+           "Eviction class for stored keys (0 normal, 1 low priority), on this node's media; "
+           "returns the copies updated (0 from media without an eviction order or an older "
+           "server).")
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())
       .def("is_distributed", &IUMBPClient::IsDistributed)           // pure getter, no I/O
