@@ -12,7 +12,7 @@ on:
         description: Run UMBP single-node hicache smoke test
       sglang_repo:
         type: string
-        default: "sgl-team/sglang"
+        default: "sgl-project/sglang"
         description: owner/repo to checkout for SGLang
       sglang_ref:
         type: string
@@ -1247,7 +1247,7 @@ jobs:
   umbp-single-node-hicache:
     name: mori umbp single-node hicache smoke test
     needs: build
-    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache == 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.run_umbp_single_node_hicache
     runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
     timeout-minutes: 180
     steps:
