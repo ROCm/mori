@@ -35,7 +35,14 @@ result on every rank):
                  -> gather. gcnasm's "Direct LSA" shape: no staging, no copy
                  engine, and nothing to publish mid-kernel
     split-lsa    gemm -> LSA 2-stage all-reduce        (2 kernels)
+    split-rccl   gemm -> torch.distributed all_reduce / reduce_scatter_tensor
+                 over RCCL, i.e. what a serving stack runs when nothing is fused
     gemm-only    the GEMM alone, to size the ceiling
+
+``--collective rs`` stops every SDMA mode after the reduce (``rs_order`` /
+``fused_rs_order``), so ``output`` holds only this rank's row band of the sum:
+``[M/P, N]`` starting at row ``rank*M/P``. That is the reduce-scatter a
+sequence-parallel layer runs after its RowParallelLinear.
 
 ``split-*`` uses the *same* kernel as ``fused-sdma`` with the epilogue tail
 compiled out, so the two differ in one thing only. ``split-lsa`` is included
@@ -113,14 +120,23 @@ from mori.ops.gemm_ar import (
 from mori.tensor_utils import from_gpu_ptr
 
 VMM_SLACK = 512 * 1024 * 1024
-MODES = ("gemm-only", "split-sdma", "fused-sdma", "fused-lsa", "split-lsa")
+MODES = (
+    "gemm-only",
+    "split-sdma",
+    "fused-sdma",
+    "fused-lsa",
+    "split-lsa",
+    "split-rccl",
+)
 
 
 def _setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="cpu:gloo")
+        # nccl (RCCL here) only for the split-rccl baseline; its communicator is
+        # created on first use, so the other modes pay nothing for asking.
+        dist.init_process_group(backend="cpu:gloo,cuda:nccl")
     rank, world_size = dist.get_rank(), dist.get_world_size()
     payload = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
     dist.broadcast_object_list(payload, src=0)
@@ -282,6 +298,21 @@ def run(args) -> int:
             "--mode split-lsa has no fp8 gather leg (build_lsa_ar takes no "
             "gather_dtype); use split-sdma or fused-sdma for --gather-dtype fp8"
         )
+    rs = args.collective == "rs"
+    if rs and args.mode == "split-lsa":
+        raise SystemExit(
+            "--collective rs has no split-lsa form: build_lsa_ar is one kernel "
+            "with no point to stop at after the reduce"
+        )
+    if rs and args.gather_dtype == "fp8":
+        raise SystemExit(
+            "--collective rs has no gather leg, so --gather-dtype fp8 would be "
+            "silently ignored"
+        )
+    if args.mode == "split-rccl" and args.gather_dtype == "fp8":
+        raise SystemExit(
+            "--mode split-rccl moves bf16; --gather-dtype fp8 is SDMA only"
+        )
     local_rank, rank, world_size, uid = _setup_distributed()
     # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
     # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
@@ -356,6 +387,19 @@ def run(args) -> int:
         # the SDMA fusion needs.
         c = from_gpu_ptr(mem.ptr + cfg.input_off, (args.m, args.n), torch.bfloat16)
         out = from_gpu_ptr(mem.ptr + cfg.output_off, (args.m, args.n), torch.bfloat16)
+        # What each collective leaves behind, and where. The SDMA reduce writes
+        # my band at output + rank*slice; RCCL wants an output tensor of its own.
+        band = slice(rank * cfg.slice_rows, (rank + 1) * cfg.slice_rows)
+        if args.mode == "split-rccl":
+            result_t = (
+                c
+                if not rs
+                else torch.empty(
+                    cfg.slice_rows, args.n, device="cuda", dtype=torch.bfloat16
+                )
+            )
+        else:
+            result_t = out[band] if rs else out
         torch.cuda.synchronize()
 
         reqs = CCODevCommRequirements()
@@ -455,6 +499,13 @@ def run(args) -> int:
             if args.mode == "split-lsa":
                 lsa_ar(dc.ptr, win.handle, stream=stream)
                 return
+            if args.mode == "split-rccl":
+                # In place for the all-reduce: the GEMM rewrites c every call.
+                if rs:
+                    dist.reduce_scatter_tensor(result_t, c)
+                else:
+                    dist.all_reduce(c)
+                return
             # fused-sdma: the puts were issued from the epilogue, so only the
             # drain runs. fused-lsa: the epilogue already wrote into the peers,
             # so this is a pure cross-rank barrier (its quiet drains nothing).
@@ -462,7 +513,13 @@ def run(args) -> int:
             # parts["order"]/["fused_order"] rather than a literal list: the
             # fp8 gather inserts a quantise and a dequantise, and hardcoding the
             # three phases would skip them and all-reduce into zeros.
-            order = parts["fused_order" if fused else "order"]
+            order = parts[
+                (
+                    ("fused_rs_order" if fused else "rs_order")
+                    if rs
+                    else ("fused_order" if fused else "order")
+                )
+            ]
             parts[order[0]](dc.ptr, win.handle, stream=stream)
             if args.stop_after == "scatter":
                 return
@@ -502,7 +559,9 @@ def run(args) -> int:
             for r in range(world_size):
                 ar, br, sar, sbr = make_operands(r, args.m, args.n, args.k, args.quant)
                 acc += reference_partial(ar, br, sar, sbr, args.quant)
-            diff = (out.float() - acc).norm().item()
+            if rs:
+                acc = acc[band]
+            diff = (result_t.float() - acc).norm().item()
             denom = acc.norm().item()
             rel_l2 = diff / denom if denom else diff
             # fp8 inputs, so this is quantization error, not a collective error;
@@ -517,8 +576,16 @@ def run(args) -> int:
             # has to clear that, and is two-sided -- below 4e-2 says the kernel
             # is right (a broken one lands near 0.9), above 5e-3 says the fp8
             # wire was actually taken and not silently skipped.
+            #
+            # split-rccl sits above the 3e-3 gate for a reason that is not an
+            # error: RCCL's ring adds the partials in bf16, rounding after every
+            # hop, where the SDMA reduce accumulates in fp32 and rounds once --
+            # 3.15e-3 against 2.37e-3 at [4096, 5120] K=2048 on 4 ranks. A
+            # corrupt band still lands near 1.0, far above its own gate.
             if cfg.fp8_gather:
                 validated = 5e-3 < rel_l2 < 4e-2
+            elif args.mode == "split-rccl":
+                validated = rel_l2 < 6e-3
             else:
                 validated = rel_l2 < 3e-3
             if not validated:
@@ -542,6 +609,7 @@ def run(args) -> int:
         if rank == 0:
             result = {
                 "mode": args.mode,
+                "collective": args.collective,
                 "world_size": world_size,
                 "m": args.m,
                 "n": args.n,
@@ -583,7 +651,8 @@ def run(args) -> int:
             }
             print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
             print(
-                f"[gemm_ar] mode={args.mode} m={args.m} n={args.n} k={args.k} "
+                f"[gemm_ar] mode={args.mode} collective={args.collective} "
+                f"m={args.m} n={args.n} k={args.k} "
                 f"max_rank_time={per_rank[max_rank]:.2f}us "
                 f"relL2={rel_l2:.2e} validated={validated}",
                 flush=True,
@@ -599,6 +668,13 @@ def run(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=MODES, default="fused-sdma")
+    p.add_argument(
+        "--collective",
+        choices=("ar", "rs"),
+        default="ar",
+        help="ar: every rank ends with the whole sum. rs: every rank ends with "
+        "its own row band of it, [M/P, N] -- the sequence-parallel reduce-scatter",
+    )
     p.add_argument("-m", type=int, default=4096)
     p.add_argument("-n", type=int, default=7168)
     p.add_argument("-k", type=int, default=1024)

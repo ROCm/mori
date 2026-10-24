@@ -40,10 +40,19 @@ import sys
 import torch
 import torch.distributed as dist
 from mori.cco import Communicator, UniqueId
-from mori.ops.gemm_ar import GemmAllReduceOp, preshuffle_a_scale, preshuffle_b
+from mori.ops.gemm_ar import (
+    GemmAllReduceOp,
+    GemmReduceScatterOp,
+    preshuffle_a_scale,
+    preshuffle_b,
+)
 
 SCALE_BK = 128
 MXFP8_BK = 32
+
+#: GPU-side stall for the slow-reader case: tens of milliseconds at gfx950's
+#: clock, against a whole call of well under one at the test shape.
+SLOW_PEER_CYCLES = 100_000_000
 
 
 def _setup():
@@ -322,6 +331,85 @@ def case_mxfp8(comm, rank, world, m, n, k):
     )
 
 
+def case_reduce_scatter(comm, rank, world, n, k, m_small, m_large):
+    """``GemmReduceScatterOp``: my row band of the sum, and nothing else.
+
+    Its own op because the window is shared with nothing: the all-reduce's
+    output region is written whole by the gather, this one only band by band,
+    so reusing an all-reduce op's window would let a stale gathered band pass
+    for a reduced one.
+
+    Covers what the all-reduce cases cover for it -- the self-test and its
+    teeth, two M values through one instance, fresh operands each call -- plus
+    the two things only this op can get wrong: the returned shape, and that the
+    band is *mine* (row ``rank*M/P``), which a wrong offset would still return
+    at the right shape and at the fp8 floor for some other rank's rows.
+    """
+    import flydsl.expr as _fx
+    from mori.tensor_utils import from_gpu_ptr
+
+    out = {}
+    with GemmReduceScatterOp(comm, n=n, k=k, m_max=m_large) as op:
+        op.self_test()
+        out["self_test_passes"] = True
+
+        cfg = op._make_cfg(op.m_max)
+        from_gpu_ptr(op.mem.ptr + cfg.recv_off, (cfg.recv_bytes,), torch.uint8).zero_()
+        plan = op._compiled(op.m_max)
+        plan.input.fill_(float(rank + 1))
+        plan.output.zero_()
+        stream = _fx.Stream(torch.cuda.current_stream())
+        for name in plan.parts["rs_order"]:
+            if name != "scatter":
+                plan.parts[name](op.dev_comm.ptr, op.win.handle, stream=stream)
+        torch.cuda.current_stream().synchronize()
+        want = world * (world + 1) / 2
+        out["detects_missing_scatter"] = bool(
+            (plan.output.float() - want).abs().max().item() / want > 1e-2
+        )
+
+        for i, m in enumerate((m_small, m_large, m_small, m_large)):
+            a, b, sa, sb = _operands(rank, m, n, k, salt=i)
+            got = op(a, preshuffle_b(b), sa, sb).clone()
+            ref = _reference(world, m, n, k, salt=i)
+            band = m // world
+            out[f"call{i}_m{m}_shape_ok"] = list(got.shape) == [band, n]
+            out[f"call{i}_m{m}"] = _rel_l2(got, ref[rank * band : (rank + 1) * band])
+            # Another rank's band, to show the check above can tell them apart.
+            other = (rank + 1) % world
+            out[f"call{i}_m{m}_vs_other_band"] = _rel_l2(
+                got, ref[other * band : (other + 1) * band]
+            )
+
+        # A peer that is slow to *read*. The reduce reads recv slots the peers
+        # fill, and the next call's epilogue pushes into the same slots, so a
+        # rank that is still reducing when its peer starts the next call reads
+        # the next call's bytes. Hold one rank between its drain and its reduce
+        # -- a different one each call -- so the others are certainly ahead.
+        # Without the trailing barrier in fused_rs_order this is the race;
+        # with it the ahead ranks wait there.
+        m = m_large
+        plan = op._compiled(m)
+        names = plan.parts["fused_rs_order"]
+        out["slow_peer_order"] = list(names)
+        held = list(plan.tail)
+        held.insert(
+            names.index("reduce"),
+            lambda *_, stream: torch.cuda._sleep(SLOW_PEER_CYCLES),
+        )
+        fast = plan.tail
+        for i in range(4):
+            slow = i % world == rank
+            op._cache[m] = plan._replace(tail=tuple(held) if slow else fast)
+            a, b, sa, sb = _operands(rank, m, n, k, salt=10 + i)
+            got = op(a, preshuffle_b(b), sa, sb).clone()
+            ref = _reference(world, m, n, k, salt=10 + i)
+            band = m // world
+            out[f"slow{i}"] = _rel_l2(got, ref[rank * band : (rank + 1) * band])
+        op._cache[m] = plan
+    _emit(rank, case="reduce_scatter", **out)
+
+
 def case_close_is_idempotent(comm, rank, n, k, m_max):
     """close() releases, twice is a no-op, and a closed op refuses to run."""
     op = GemmAllReduceOp(comm, n=n, k=k, m_max=m_max)
@@ -397,6 +485,7 @@ def run_all(comm, rank, world, n, k):
     # released: mxfp8 compiles at a different BLOCK_M, and close() is about the
     # lifecycle.
     case_mxfp8(comm, rank, world, world * 256, n, k)
+    case_reduce_scatter(comm, rank, world, n, k, 512, 1024)
     case_close_is_idempotent(comm, rank, n, k, 512)
 
 

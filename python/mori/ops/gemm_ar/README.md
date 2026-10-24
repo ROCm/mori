@@ -1,11 +1,12 @@
 # `mori.ops.gemm_ar` -- an fp8 GEMM, with or without the all-reduce fused in
 
-Three operators over one mxfp8/blockscale GEMM kernel, for a tensor-parallel
+Four operators over one mxfp8/blockscale GEMM kernel, for a tensor-parallel
 attention block:
 
 | op | for | what it does |
 |---|---|---|
 | `GemmAllReduceOp` (`op.py`) | a `RowParallelLinear` at prefill M | the GEMM with the all-reduce's scatter fused into its epilogue |
+| `GemmReduceScatterOp` (`op.py`) | the same, under sequence parallelism | the same pipeline without the gather: each rank keeps its row band |
 | `Mxfp8GemmOp` (`gemm.py`) | any mxfp8 linear at prefill M | the same GEMM, nothing fused, no communicator |
 | `Mxfp8GemvOp` (`gemv.py`) | any mxfp8 linear at decode M (<= 32) | a skinny GEMM built for a handful of tokens |
 
@@ -29,6 +30,7 @@ Every full table lives here, next to the code it is about.
 - [What it does](#what-it-does)
 - [Using it](#using-it)
   - [Fused GEMM + all-reduce](#fused-gemm--all-reduce)
+  - [Fused GEMM + reduce-scatter](#fused-gemm--reduce-scatter)
   - [The GEMM without a collective](#the-gemm-without-a-collective)
   - [fp8 on the wire](#fp8-on-the-wire)
   - [Benchmarks and tests](#benchmarks-and-tests)
@@ -171,6 +173,61 @@ communicator. Synchronise first if anything may still be in flight.
 **dtype.** A and B must be `torch.float8_e4m3fn`. `float8_e4m3fnuz` is the same
 width but a different exponent bias, and the MMA atom implements OCP's, so it is
 rejected rather than silently returning a result 4x too large.
+
+### Fused GEMM + reduce-scatter
+
+`GemmReduceScatterOp` is the same pipeline stopped before the gather, for a
+sequence-parallel layer that keeps only its own rows after a RowParallelLinear.
+Rank `r` gets `[M/P, N]`: rows `r*M/P` onward of the summed GEMM, the dim-0
+split `torch.distributed.reduce_scatter_tensor` makes. Construction, operands,
+padding, scales, the collective contract and `self_test` are all
+`GemmAllReduceOp`'s; it has no wire options, because the scatter is its only
+leg.
+
+```python
+with GemmReduceScatterOp(comm, n=N, k=K, m_max=M_MAX, quant="mxfp8") as op:
+    band = op(a_fp8, b_shuffled, a_scale, b_scale)   # [m_pad / world, N]
+```
+
+No kernel is new. After the GEMM it runs `fused_rs_order` -- drain, reduce, and
+a barrier-only kernel, `rs_barrier`, that stands in for the one the gather used
+to provide. That barrier is load-bearing: the reduce reads recv slots the peers
+fill, and the next call's epilogue refills them, so without it a rank one call
+ahead overwrites a slower peer's slot mid-reduce. It was intermittent in the
+alternating-M test (relL2 0.71 on one call) and deterministic once one rank is
+held between drain and reduce (0.99 and 1.01; 2.4e-3 with the barrier) --
+which is what `test_reduce_scatter_survives_a_slow_reader` now does.
+
+**The padding decides the bands.** `M` has to be a multiple of
+`world_size * block_m` here as for the all-reduce, and the rows are split after
+that padding. A caller whose own sequence-parallel split is over a smaller
+granule (a multiple of `world_size` only) has to pad to this one *before* it
+shards, or the two disagree on which rows each rank holds.
+
+**Measured**, DeepSeek-V4.1-Flash `wo_b` (`[M, 5120]` K=2048, mxfp8) on 4x
+MI355X, `bench_gemm_ar.py --collective rs --sdma-queues 1`, graph replay, max
+over ranks, median of 3 interleaved rounds on an idle box (spread <= 2.9%);
+`split-rccl` is the GEMM followed by `reduce_scatter_tensor`, i.e. what a
+serving stack runs today:
+
+| M | `gemm-only` | `split-rccl` | `split-sdma` | `fused-sdma` | vs rccl | vs split-sdma |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 35.2 | 149.5 | 143.1 | 146.6 (c2) | -1.9% | +2.4% |
+| 4096 | 63.3 | 276.8 | 258.6 | **246.1** (c4) | -11.1% | -4.8% |
+| 8192 | 105.5 | 512.3 | 467.8 | **439.3** (c8) | -14.2% | -6.1% |
+| 16384 | 174.2 | 1005.9 | 892.8 | **793.0** (c8) | **-21.2%** | -11.2% |
+
+Two separate effects. The copy engines alone beat RCCL by 4-11% (`split-sdma`
+against `split-rccl`); fusing then hides about 100 of the 174us of GEMM at
+M=16384. At M=2048 there are only two chunks per destination and fusing loses
+to the split path, so a caller should keep the split form there. The link is
+still the limit: the unfused transfer is ~720us at M=16384, about 175 GB/s per
+rank over TP4's three links.
+
+`split-rccl` validates at relL2 3.15e-3 against everything else's 2.37e-3, and
+that is not an error: RCCL adds the partials in bf16 hop by hop, where the SDMA
+reduce accumulates in fp32 and rounds once. Its gate in the benchmark is
+correspondingly wider (6e-3).
 
 ### The GEMM without a collective
 

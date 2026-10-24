@@ -34,6 +34,7 @@ from .layout import MAX_WORLD, ArConfig, ar_config, select_stage
 
 _LAZY = {
     "GemmAllReduceOp": "op",
+    "GemmReduceScatterOp": "op",
     "counter_chunks": "op",
     "padded_m": "op",
     "supports": "op",
@@ -56,6 +57,7 @@ __all__ = [
     "MAX_WORLD",
     "ArConfig",
     "GemmAllReduceOp",
+    "GemmReduceScatterOp",
     "Mxfp8GemmOp",
     "Mxfp8GemvOp",
     "ar_config",
