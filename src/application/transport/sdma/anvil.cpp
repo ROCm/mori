@@ -53,13 +53,19 @@ namespace {
     }                                                                                        \
   } while (0)
 
-#define CHECK_HSAKMT_SUCCESS(call, msg)                                                       \
-  do {                                                                                        \
-    if ((call) != HSAKMT_STATUS_SUCCESS) {                                                    \
-      std::cout << "ERROR code: " << std::dec << call << " " << msg << " (File: " << __FILE__ \
-                << ", Line: " << __LINE__ << ")" << std::endl;                                \
-      exit(EXIT_FAILURE);                                                                     \
-    }                                                                                         \
+// `call` is evaluated ONCE, into _st. It used to appear twice -- in the test and
+// again in the error message -- so every failure ran the KFD call a second time:
+// hsaKmtAllocMemory leaked the first block, hsaKmtFreeMemory double-freed,
+// hsaKmtCreateQueueExt asked for a second queue, and the code printed was the
+// RETRY's, which need not equal the one that actually failed.
+#define CHECK_HSAKMT_SUCCESS(call, msg)                                                   \
+  do {                                                                                    \
+    const HSAKMT_STATUS _st = (call);                                                     \
+    if (_st != HSAKMT_STATUS_SUCCESS) {                                                   \
+      std::cout << "ERROR code: " << std::dec << _st << " " << msg << " (File: " __FILE__ \
+                << ", Line: " << __LINE__ << ")" << std::endl;                            \
+      exit(EXIT_FAILURE);                                                                 \
+    }                                                                                     \
   } while (0)
 
 // HSA agents

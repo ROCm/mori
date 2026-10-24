@@ -28,8 +28,10 @@
 
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -38,6 +40,7 @@
 #include "mori/jit/v2/render.hpp"
 #include "mori/jit/v2/toolchain.hpp"
 #include "mori/jit/v2/util.hpp"
+#include "mori/ops/dispatch_combine_v2/ep_asyncll_spec.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_cfg.hpp"
 #include "mori/ops/dispatch_combine_v2/ep_spec.hpp"
 
@@ -461,3 +464,166 @@ TEST(Nic, ArchAndNicAreIndependentComponents) {
   }
   EXPECT_EQ(digests.size(), 6u);
 }
+
+// --------------------------------------------------------------------------
+// AsyncLL protocol selection is part of a plan, not a mutable process-wide
+// codegen switch. These tests render and hash only; no GPU/compiler is invoked.
+// --------------------------------------------------------------------------
+
+namespace {
+EpInterNodeCfg AsyncLLCfgForMode(int mode) {
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = mode;
+  return MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                            EpInterNodeFamily::AsyncLL);
+}
+
+struct ScopedEnvValue {
+  ScopedEnvValue(const char* name, const char* value) : name_(name) {
+    const char* previous = std::getenv(name);
+    present_ = previous != nullptr;
+    if (previous) previous_ = previous;
+    ::setenv(name, value, 1);
+  }
+  ~ScopedEnvValue() {
+    if (present_) {
+      ::setenv(name_.c_str(), previous_.c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+  std::string name_;
+  std::string previous_;
+  bool present_ = false;
+};
+}  // namespace
+
+TEST(AsyncLLMode, BareRequestDefaultsToLegacyAndSchemaIncludesMode) {
+  EXPECT_EQ(EpInterNodeRequest{}.asyncLlMode, 0);
+  EXPECT_EQ(EpInterNodeCfg{}.asyncLlMode, 0);
+  EXPECT_EQ(AsyncLLCfgForMode(0).asyncLlMode, 0);
+  EXPECT_NE(EpInterNodeRequestSchema().find("asyncLlMode:i32=0"), std::string::npos);
+}
+
+TEST(AsyncLLMode, FactoryPreservesModeWithoutChangingDeviceConfiguration) {
+  const auto legacy = AsyncLLCfgForMode(0);
+  for (int mode : {0, 1, 2}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_EQ(cfg.asyncLlMode, mode);
+    EXPECT_EQ(Render(cfg.kernelCfg), Render(legacy.kernelCfg));
+    EXPECT_NE(Describe(cfg).find("asyncLlMode=" + std::to_string(mode) + "\n"), std::string::npos);
+    if (mode != 0) {
+      EXPECT_NE(Render(cfg).find(".asyncLlMode=" + std::to_string(mode)), std::string::npos);
+      EXPECT_FALSE(cfg == legacy);
+    }
+  }
+}
+
+TEST(AsyncLLMode, FactoryRejectsInvalidAndIncompatibleModes) {
+  for (int mode : {-1, 3}) EXPECT_THROW(AsyncLLCfgForMode(mode), std::runtime_error);
+
+  EpInterNodeRequest request;
+  for (int mode : {1, 2}) {
+    request.asyncLlMode = mode;
+    EXPECT_THROW(MakeEpInterNodeCfg("gfx942", request, EpInterNodeKernel::Dispatch),
+                 std::runtime_error);
+    request.worldSize = 16;
+    EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                    EpInterNodeFamily::AsyncLL),
+                 std::runtime_error);
+    request.worldSize = 8;
+  }
+  request.worldSize = 16;
+  request.asyncLlMode = 0;
+  EXPECT_NO_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                     EpInterNodeFamily::AsyncLL));
+}
+
+TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {
+  for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
+    const std::string stem = kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopy"
+                                                                       : "EpCombineAsyncLLRecvCopy";
+    for (int mode : {0, 1, 2}) {
+      const auto cfg = AsyncLLCfgForMode(mode);
+      const std::string entry = EpAsyncLLEntryName(cfg, kind);
+      const std::string source = EpAsyncLLRenderSource(cfg, kind);
+      EXPECT_NE(source.find("#define MORI_ASYNCLL_EARLY_NOTIFY " + std::to_string(mode > 0)),
+                std::string::npos);
+      EXPECT_NE(source.find("#define MORI_ASYNCLL_FUSED_RECV " + std::to_string(mode == 2)),
+                std::string::npos);
+      const std::string macro =
+          mode == 2 ? "MORI_EP_INTERNODE_CCO_ENTRY(" : "MORI_EP_INTERNODE_CCO_ENTRY_LOCAL(";
+      const std::string body = stem + (mode == 2 ? "Fused_body" : "_body");
+      EXPECT_NE(source.find(macro + entry + ", " + body + ")"), std::string::npos);
+    }
+  }
+}
+
+TEST(AsyncLLMode, RendererRejectsUnsafeHandBuiltConfigurations) {
+  for (int mode : {-1, 3}) {
+    auto cfg = AsyncLLCfgForMode(0);
+    cfg.asyncLlMode = mode;
+    EXPECT_THROW(EpAsyncLLRenderSource(cfg, EpAsyncLLKernel::DispatchRecvCopy), std::runtime_error);
+  }
+  for (int mode : {1, 2}) {
+    auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_THROW(EpInterNodeRenderSource(cfg, EpInterNodeKernel::Dispatch), std::runtime_error);
+    for (const auto kind :
+         {EpAsyncLLKernel::DispatchSendCopyLsa, EpAsyncLLKernel::DispatchSendTransferLsa,
+          EpAsyncLLKernel::DispatchRecvTransferLsa, EpAsyncLLKernel::CombineSendTransferLsa,
+          EpAsyncLLKernel::CombineRecvTransferLsa}) {
+      EXPECT_THROW(EpAsyncLLRenderSource(cfg, kind), std::runtime_error);
+    }
+    cfg.kernelCfg.worldSize = 8;
+    EXPECT_THROW(EpAsyncLLRenderSource(cfg, EpAsyncLLKernel::DispatchRecvCopy), std::runtime_error);
+  }
+}
+
+TEST(AsyncLLMode, ProtocolForksCacheButGeometryDoesNot) {
+  ToolchainOverride guard(FakeToolchain("gfx1250", "mlx5"));
+  for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
+    std::set<std::string> keys;
+    for (int mode : {0, 1, 2}) {
+      auto cfg = AsyncLLCfgForMode(mode);
+      const auto source = EpAsyncLLRenderSource(cfg, kind);
+      // Deliberately hold the name constant: the generated source must carry
+      // the mode even independently of the profile-facing entry-name prefix.
+      keys.insert(Compiler::Instance().CacheDirFor("asyncll_mode_test", source, {}));
+      cfg.mpCount *= 2;
+      cfg.warpPerBlock *= 2;
+      EXPECT_EQ(EpAsyncLLRenderSource(cfg, kind), source);
+    }
+    EXPECT_EQ(keys.size(), 3u);
+  }
+}
+
+TEST(AsyncLLMode, ExistingPlanIsUnaffectedByEnvironmentChanges) {
+  for (int mode : {0, 1, 2}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    const auto kind = EpAsyncLLKernel::DispatchRecvCopy;
+    const auto entry = EpAsyncLLEntryName(cfg, kind);
+    const auto source = EpAsyncLLRenderSource(cfg, kind);
+    for (const char* value : {"0", "1"}) {
+      ScopedEnvValue early("MORI_ASYNCLL_EARLY_NOTIFY", value);
+      ScopedEnvValue fused("MORI_ASYNCLL_FUSED_RECV", value);
+      EXPECT_EQ(EpAsyncLLEntryName(cfg, kind), entry);
+      EXPECT_EQ(EpAsyncLLRenderSource(cfg, kind), source);
+    }
+  }
+}
+
+#if MORI_JIT_HAS_FIELD_COUNT
+TEST(AsyncLLMode, HostCfgAndRequestFieldCountsMatchTheirVisitors) {
+  const EpInterNodeCfg cfg;
+  size_t cfgFields = 0;
+  VisitFields(cfg, cfg, [&cfgFields](const char*, const auto&, const auto&) { ++cfgFields; });
+  EXPECT_EQ(FieldCount<EpInterNodeCfg>(), cfgFields);
+  const EpInterNodeRequest request;
+  size_t requestFields = 0;
+  VisitFields(request, request,
+              [&requestFields](const char*, const auto&, const auto&) { ++requestFields; });
+  EXPECT_EQ(FieldCount<EpInterNodeRequest>(), requestFields);
+}
+#endif
