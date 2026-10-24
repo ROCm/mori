@@ -144,6 +144,8 @@ inline __device__ void DispatchIntraNode(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -477,6 +479,8 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -617,6 +621,8 @@ inline __device__ void DispatchInterNodeLLRecv(EpDispatchCombineArgs<T>& args) {
   if (laneId < config.gpuPerNode) {
     int destPe = myNode * config.gpuPerNode + laneId;
     int counter = atomicAdd(args.destPeTokenCounter + destPe, localPeTokenCounter);
+    // Wait for the add to be performed before this warp arrives in DispatchSync.
+    asm volatile("" ::"v"(counter) : "memory");
   }
 }
 
@@ -628,6 +634,10 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs<T>& args) {
   MORI_TRACE_SPAN(profiler, Slot::DispatchSync);
 
   int nodePeOffset = myNode * config.gpuPerNode;
+  // The last warp sums destPeTokenCounter as soon as every warp has arrived, so each warp's add
+  // must be performed before it arrives. The add sites wait for the atomic's returned value,
+  // which orders it without the L2 writeback and invalidate of a __threadfence(); the counter
+  // is a device-scope atomic, so it is coherent across XCDs once performed.
   int finishedWarp = 0;
   if (laneId == 0) finishedWarp = atomicAdd(args.dispatchGridBarrier, 1);
   finishedWarp = __shfl(finishedWarp, 0);
@@ -1095,6 +1105,12 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs<T>& 
   barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
+    // Consume this round's write before clearing it, or a late arrival leaks into the next round.
+    if ((laneId < nNodes) && (laneId != myNode)) {
+      while (core::AtomicLoadRelaxedSystem(
+                 args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId) == 0) {
+      }
+    }
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});
@@ -1141,8 +1157,11 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
   int rdmaWarpNum = args.rdmaBlockNum * warpNum;
   for (int n = 0; n < (nNodes - 1); n++) {
     int node = (myNode + n + 1) % nNodes;
-    uint64_t nodeCount = nodeRecvTokenNum[node];
-    if (nodeCount > 0) nodeCount -= 1;
+    // Dispatch can skip reading this when every chunk slot is flagged, so it may not have landed.
+    uint64_t nodeCount = 0;
+    while ((nodeCount = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node])) == 0) {
+    }
+    nodeCount -= 1;
     if (nodeCount == 0) continue;
 
     // One whole vector step per warp. warpsPerToken was a fixed 4, which for
@@ -1239,6 +1258,12 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs<T>
   barrierFlag = __shfl(barrierFlag, 0);
 
   if ((finishedWarp + 1) == (args.rdmaBlockNum * warpNum)) {
+    // Consume this round's write before clearing it, or a late arrival leaks into the next round.
+    if ((laneId < nNodes) && (laneId != myNode)) {
+      while (core::AtomicLoadRelaxedSystem(
+                 args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId) == 0) {
+      }
+    }
     if (laneId < nNodes) {
       core::AtomicStoreSeqCstSystem(
           args.nodeRecvTokenNumMemObj->template GetAs<uint64_t*>() + laneId, uint64_t{0});

@@ -3,7 +3,7 @@
 #
 # Usage:
 #   run_internode_test.sh --rank <0|1> --master-addr <ip> --ifname <nic> \
-#                         --cmd <bench|stress|test|test_sentinel> --max-tokens <N> \
+#                         --cmd <bench|stress|stress_accuracy|test|test_sentinel> --max-tokens <N> \
 #                         [--master-port <port>] [--kernel-type <see below>] \
 #                         [--num-qp <N>] [--quant-type <none|...>] [--dtype <bf16|...>] \
 #                         [--combine-dtype <bf16|...>] [--hidden-dim <N>] [--topk <N>] \
