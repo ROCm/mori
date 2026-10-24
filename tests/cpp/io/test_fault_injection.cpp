@@ -22,8 +22,9 @@
 
 // Runs a fault catalog: by default tests/cpp/io/fault_catalog/ibverbs.yaml, one
 // entry per real-world fault on the ibverbs data path (MORI-IO fault simulation,
-// part 1/N). The YAML file explains each field and the four checks every entry
-// is held to (ends, honest, recovers, alive); this file only runs them.
+// part 1/N). The YAML file explains each field and the checks every entry is held
+// to (ends, honest, recovers, alive, and waits where the entry asks for it); this
+// file only runs them.
 //
 // Processes, all on one node:
 //   runner     runs each entry in its own initiator process, so a crash or a
@@ -101,11 +102,12 @@ struct Entry {
   bool notify{false};
   int warmup{0};
   Side side{Side::Initiator};
+  bool waits{false};            // the fault hits after the data WRs are posted
   std::string knownBug;         // empty = expected to pass every check
   std::set<std::string> fails;  // with knownBug: the checks expected to fail today
 };
 
-const std::set<std::string> kChecks = {"ends", "honest", "recovers", "alive"};
+const std::set<std::string> kChecks = {"ends", "honest", "recovers", "alive", "waits"};
 
 std::string CatalogPath() {
   const char* path = std::getenv("MORI_IO_FAULT_CATALOG");
@@ -115,8 +117,8 @@ std::string CatalogPath() {
 // Loads and validates a catalog; throws with the file and entry on any mistake,
 // so a typo never silently drops or weakens an entry.
 std::vector<Entry> LoadCatalog(const std::string& path) {
-  const std::set<std::string> kFields = {"id",     "real_world", "rule",      "transfer", "notify",
-                                         "warmup", "side",       "known_bug", "fails"};
+  const std::set<std::string> kFields = {"id",     "real_world", "rule",  "transfer",  "notify",
+                                         "warmup", "side",       "waits", "known_bug", "fails"};
   std::vector<Entry> entries;
   std::set<std::string> ids;
   for (const mori::yaml::FlatMap& raw : mori::yaml::LoadFlatList(path)) {
@@ -153,6 +155,7 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
     } else {
       throw std::runtime_error(where + ": side must be initiator or target, got '" + side + "'");
     }
+    e.waits = mori::yaml::GetBool(raw, "waits", false, where);
     e.knownBug = mori::yaml::GetString(raw, "known_bug");
     std::istringstream fails(mori::yaml::GetString(raw, "fails"));
     for (std::string check; std::getline(fails, check, ',');) {
@@ -160,7 +163,7 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
       check.erase(check.find_last_not_of(' ') + 1);
       if (kChecks.count(check) == 0) {
         throw std::runtime_error(where + ": fails lists '" + check +
-                                 "'; checks are ends, honest, recovers, alive");
+                                 "'; checks are ends, honest, recovers, alive, waits");
       }
       e.fails.insert(check);
     }
@@ -605,7 +608,8 @@ class PeerRig {
   std::vector<std::unique_ptr<Transfer>> transfers_;  // MORI keeps pointers to their statuses
 };
 
-// Prints "RESULT ends=<0|1> honest=<0|1> recovers=<0|1> target=<0|1>" for the runner.
+// Prints "RESULT ends=<0|1> honest=<0|1> recovers=<0|1> target=<0|1> waits=<0|1>" for the
+// runner.
 int RunEntry(const Entry& e) {
   PeerRig rig(e);
   std::string why;
@@ -620,6 +624,13 @@ int RunEntry(const Entry& e) {
   if (faulted) rig.Arm(e.rule);
 
   Transfer* t = rig.Start(e.op);
+  // Read right away: a 1 MiB transfer is still on the wire microseconds after the call.
+  StatusCode atReturn = t->status.Code();
+  bool waits = !e.waits || atReturn == StatusCode::IN_PROGRESS;
+  if (!waits) {
+    std::printf("    the call returned %s while its data WRs were still on the wire\n",
+                CodeName(atReturn));
+  }
   StatusCode code = t->status.WaitFor(kDeadlineMs);
   bool ends = code != StatusCode::IN_PROGRESS;
   bool honest = true;
@@ -641,9 +652,9 @@ int RunEntry(const Entry& e) {
   bool targetAlive = rig.TargetAlive(&why);
   if (!targetAlive) std::printf("    target process: %s\n", why.c_str());
 
-  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d\n", ends, honest, recovers,
-              targetAlive);
-  return ends && honest && recovers && targetAlive ? kExitPass : kExitFail;
+  std::printf("RESULT ends=%d honest=%d recovers=%d target=%d waits=%d\n", ends, honest, recovers,
+              targetAlive, waits);
+  return ends && honest && recovers && targetAlive && waits ? kExitPass : kExitFail;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -655,7 +666,7 @@ struct Outcome {
   bool skipped{false};
   bool reported{false};  // the initiator printed its RESULT line
   // 1 = passed, 0 = failed, -1 = not reached (a process died before reporting)
-  int ends{-1}, honest{-1}, recovers{-1}, target{-1};
+  int ends{-1}, honest{-1}, recovers{-1}, target{-1}, waits{-1};
   bool alive{true};
   std::string note;      // how a process died, if one did
   std::string topology;  // "initiator GPU 0 ionic_0 -> target ... (cross-NIC)"
@@ -704,8 +715,9 @@ Outcome RunChild(const char* self, const Entry& e) {
     if (end == std::string::npos) end = text.size();
     std::string line = text.substr(start, end - start);
     if (line.rfind("RESULT ", 0) == 0) {
-      out.reported = std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d",
-                                 &out.ends, &out.honest, &out.recovers, &out.target) == 4;
+      out.reported =
+          std::sscanf(line.c_str(), "RESULT ends=%d honest=%d recovers=%d target=%d waits=%d",
+                      &out.ends, &out.honest, &out.recovers, &out.target, &out.waits) == 5;
     } else if (!line.empty()) {
       size_t topo = line.find("topology: ");
       if (topo != std::string::npos) out.topology = line.substr(topo + 10);
@@ -756,8 +768,11 @@ const char* const kVerdictNames[] = {"PASS", "XFAIL", "FAIL", "XPASS", "SKIP"};
 Verdict Judge(const Entry& e, const Outcome& o) {
   if (o.skipped) return {Verdict::Skip, ""};
   if (!o.reported && o.alive) return {Verdict::Fail, "no result; see the output above"};
-  const std::pair<const char*, int> checks[] = {
-      {"ends", o.ends}, {"honest", o.honest}, {"recovers", o.recovers}, {"alive", o.alive}};
+  const std::pair<const char*, int> checks[] = {{"ends", o.ends},
+                                                {"honest", o.honest},
+                                                {"recovers", o.recovers},
+                                                {"alive", o.alive},
+                                                {"waits", o.waits}};
   std::set<std::string> unexpected, fixed;
   for (const auto& [name, result] : checks) {
     bool expectedToFail = e.fails.count(name) > 0;
@@ -820,19 +835,20 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
   std::string topology, rows;
   const bool github = std::getenv("GITHUB_ACTIONS") != nullptr;
 
-  std::printf("\n%-36s %-6s %-6s %-8s %-6s %-7s %s\n", "entry", "ends", "honest", "recovers",
-              "alive", "verdict", "note");
+  std::printf("\n%-36s %-6s %-6s %-8s %-6s %-6s %-7s %s\n", "entry", "ends", "honest", "recovers",
+              "alive", "waits", "verdict", "note");
   for (const auto& [e, o] : results) {
     Verdict v = Judge(*e, o);
     counts[v.kind]++;
     if (v.kind == Verdict::XFail) knownBugs[e->knownBug].push_back(e->id);
     if (topology.empty()) topology = o.topology;
     const char* alive = o.skipped ? "-" : o.alive ? "ok" : "FAIL";
-    std::printf("%-36s %-6s %-6s %-8s %-6s %-7s %s\n", e->id.c_str(), Mark(o.ends), Mark(o.honest),
-                Mark(o.recovers), alive, kVerdictNames[v.kind], v.why.c_str());
+    std::printf("%-36s %-6s %-6s %-8s %-6s %-6s %-7s %s\n", e->id.c_str(), Mark(o.ends),
+                Mark(o.honest), Mark(o.recovers), alive, Mark(o.waits), kVerdictNames[v.kind],
+                v.why.c_str());
     rows += "| " + e->id + " | " + Mark(o.ends) + " | " + Mark(o.honest) + " | " +
-            Mark(o.recovers) + " | " + alive + " | " + kVerdictNames[v.kind] + " | " + v.why +
-            " |\n";
+            Mark(o.recovers) + " | " + alive + " | " + Mark(o.waits) + " | " +
+            kVerdictNames[v.kind] + " | " + v.why + " |\n";
     if (github && (v.kind == Verdict::Fail || v.kind == Verdict::XPass)) {
       std::printf("::error title=Fault catalog %s::%s %s\n", kVerdictNames[v.kind], e->id.c_str(),
                   v.why.c_str());
@@ -863,8 +879,8 @@ int Report(const std::vector<std::pair<const Entry*, Outcome>>& results,
        << "\n\n**" << summary << "**";
     if (!topology.empty()) md << "  \nTopology: " << topology;
     if (!bugs.empty()) md << "  \nKnown bugs: " << bugs;
-    md << "\n\n| entry | ends | honest | recovers | alive | verdict | note |\n"
-       << "|---|---|---|---|---|---|---|\n"
+    md << "\n\n| entry | ends | honest | recovers | alive | waits | verdict | note |\n"
+       << "|---|---|---|---|---|---|---|---|\n"
        << rows << "\n";
   }
   return counts[Verdict::Fail] + counts[Verdict::XPass] == 0 ? 0 : 1;

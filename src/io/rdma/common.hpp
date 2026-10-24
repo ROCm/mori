@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -169,6 +170,53 @@ struct CqCallbackMeta {
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
   internal::IoCallDiagnostics diagnostics{};
+
+  // Set before the data WRs are posted when a notification SEND follows them. The
+  // data WRs and the notification post then finish independently, and whichever
+  // finishes last reports the transfer: a notification that cannot be posted never
+  // turns it terminal while its data WRs are still on the wire, and is never lost
+  // behind a SUCCESS the data already reported.
+  bool awaitsNotification{false};
+
+  // Reports the data WRs' outcome through `s`, the status the caller claimed.
+  void ReportData(TransferStatus* s, StatusCode code, const std::string& message) {
+    if (!awaitsNotification) {
+      s->Update(code, message);
+      return;
+    }
+    Finish(s, &dataOutcome, code, message);
+  }
+
+  // Reports the notification post's outcome; `s` is the posting thread's own status.
+  void ReportNotification(TransferStatus* s, StatusCode code, const std::string& message) {
+    Finish(s, &notificationOutcome, code, message);
+  }
+
+ private:
+  struct Outcome {
+    StatusCode code{StatusCode::SUCCESS};
+    std::string message;
+  };
+
+  // A data failure wins over a notification failure; only both succeeding is SUCCESS.
+  void Finish(TransferStatus* s, Outcome* part, StatusCode code, const std::string& message) {
+    {
+      std::lock_guard<std::mutex> lock(outcomeMu);
+      *part = Outcome{code, message};
+    }
+    if (unfinishedParts.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    std::lock_guard<std::mutex> lock(outcomeMu);
+    const Outcome& report = dataOutcome.code <= StatusCode::ERR_BEGIN &&
+                                    notificationOutcome.code > StatusCode::ERR_BEGIN
+                                ? notificationOutcome
+                                : dataOutcome;
+    s->Update(report.code, report.message);
+  }
+
+  std::atomic<int> unfinishedParts{2};
+  std::mutex outcomeMu;
+  Outcome dataOutcome;
+  Outcome notificationOutcome;
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
