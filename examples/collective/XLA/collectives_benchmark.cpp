@@ -42,6 +42,8 @@
 //   --logS   push slice count log2, -1 = auto                          [0]
 //   --warmup <n>                                                       [2]
 //   --iters  <n>                                                       [5]
+//   --sub    base:n run on the contiguous sub-communicator of PEs
+//            [base, base+n); size is then split over n ranks        [0:npes]
 //
 // Note: dtype/op beyond f32/sum require a build with FACADE_REDUCE_USE_ALL_TYPES=1.
 
@@ -99,6 +101,11 @@ struct Config {
   int logS{0};
   int warmup{2};
   int iters{5};
+  // --sub base:n runs the collective on the contiguous sub-communicator of PEs
+  // [subBase, subBase + subN); the other PEs only join the host barriers.
+  // Defaults to the whole world (0:npes).
+  int subBase{0};
+  int subN{0};
   // Derived in main() by SizeHeap(): the facade's symmetric heap window, the
   // push-path staging carved from it, and the comm's flat-VA slot.
   size_t heapBytes{0};
@@ -536,22 +543,29 @@ static void RunThreaded(const Config& cfg, const ccoUniqueId& uid, ThreadInfo& i
     return;
   }
 
-  const int myPe = info.rank, npes = info.worldSize;
+  const int myPe = info.rank;
   hipStream_t stream;
   HIP_RUNTIME_CHECK(hipStreamCreate(&stream));
 
   int rc = 1;
+  const bool inSub = myPe >= cfg.subBase && myPe < cfg.subBase + cfg.subN;
   if (CollectivesFacade::Create(comm, cfg.heapBytes, cfg.stagingBytes) != 0) {
     XPUT("ERROR: Failed to create CollectivesFacade");
+  } else if (!inSub) {
+    // Match the two host barriers RunCollective issues on every participant.
+    ccoBarrierAll(comm);
+    ccoBarrierAll(comm);
+    rc = 0;
   } else {
-    std::vector<int> rank_to_pe(npes);
-    std::iota(rank_to_pe.begin(), rank_to_pe.end(), 0);
-    auto facade = CollectivesFacade::Get(myPe, npes, rank_to_pe.data());
+    std::vector<int> rank_to_pe(cfg.subN);
+    std::iota(rank_to_pe.begin(), rank_to_pe.end(), cfg.subBase);
+    const int subRank = myPe - cfg.subBase;
+    auto facade = CollectivesFacade::Get(subRank, cfg.subN, rank_to_pe.data());
     if (facade == nullptr) {
       XPUT("ERROR: No CollectivesFacade for device %d", info.deviceId);
     } else if ((!cfg.modeSet || facade->SetReduceMode(cfg.mode)) &&
                facade->SetPushLogSlices(cfg.logS)) {
-      rc = RunCollective(cfg, facade.get(), comm, myPe, npes, stream);
+      rc = RunCollective(cfg, facade.get(), comm, subRank, cfg.subN, stream);
     }
   }
 
@@ -634,7 +648,7 @@ static void Usage(const char* prog) {
   XPUT("Usage: %s --coll <name> --npes <n> --size <num_elems> "
        "[--dtype f32|bf16|f16|s32|s64] [--op sum|prod|min|max] "
        "[--mode push|pull|auto|alt (alt: flip push/pull every call)] "
-       "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>]\n"
+       "[--logS <n>, -1 = auto] [--warmup <n>] [--iters <n>] [--sub base:n]\n"
        "  coll: reduce_scatter|all_reduce|all_gather|all_to_all|collective_permute "
        "(rs|ar|ag|a2a|cp)",
        prog);
@@ -649,7 +663,7 @@ static void Usage(const char* prog) {
 // ---------------------------------------------------------------------------
 static void SizeHeap(Config& cfg) {
   const size_t elemSize = DtypeSize(cfg.dt);
-  const size_t npes = static_cast<size_t>(cfg.npes);
+  const size_t npes = static_cast<size_t>(cfg.subN);
   const size_t N = cfg.numElems * elemSize;
   // For collective_permute --size is already the per-rank count, so there is no
   // sharding and the whole buffer is the unit that moves.
@@ -725,6 +739,11 @@ int main(int argc, char* argv[]) {
       cfg.warmup = std::atoi(need("--warmup"));
     } else if (!std::strcmp(argv[i], "--iters")) {
       cfg.iters = std::atoi(need("--iters"));
+    } else if (!std::strcmp(argv[i], "--sub")) {
+      if (std::sscanf(need("--sub"), "%d:%d", &cfg.subBase, &cfg.subN) != 2) {
+        XPUT("ERROR: --sub expects base:n");
+        return 1;
+      }
     } else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
       Usage(argv[0]);
       return 0;
@@ -744,6 +763,14 @@ int main(int argc, char* argv[]) {
     XPUT("ERROR: --npes must be in 1..%d (SDMA fast path caps at 8)", deviceCount);
     return 1;
   }
+  if (cfg.subN == 0) {
+    cfg.subBase = 0;
+    cfg.subN = cfg.npes;
+  }
+  if (cfg.subBase < 0 || cfg.subN < 1 || cfg.subBase + cfg.subN > cfg.npes) {
+    XPUT("ERROR: --sub %d:%d must lie within [0, %d)", cfg.subBase, cfg.subN, cfg.npes);
+    return 1;
+  }
   SizeHeap(cfg);
 
   ccoUniqueId uid;
@@ -753,8 +780,10 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  XPUT("collectives_benchmark: coll=%s npes=%d size=%zu dtype=%s op=%s mode=%s logS=%d",
-       CollName(cfg.coll), cfg.npes, cfg.numElems, detail::DataTypeName(cfg.dt),
+  XPUT("collectives_benchmark: coll=%s npes=%d sub=%d:%d size=%zu dtype=%s op=%s mode=%s "
+       "logS=%d",
+       CollName(cfg.coll), cfg.npes, cfg.subBase, cfg.subN, cfg.numElems,
+       detail::DataTypeName(cfg.dt),
        detail::ReduceOpName(cfg.op),
        cfg.alternate ? "alt" : (cfg.modeSet ? ModeName(cfg.mode) : "default"), cfg.logS);
   XPUT("collectives_benchmark: heap=%zu staging=%zu perRankVmm=%zu", cfg.heapBytes,

@@ -107,11 +107,17 @@ class CollectivesFacade {
   CollectivesFacade(const CollectivesFacade&) = delete;
   CollectivesFacade& operator=(const CollectivesFacade&) = delete;
 
-  // This device's MORI PE id and the total PE count the facade was created with.
+  // This device's rank within the (sub-)communicator, the communicator size,
+  // and the global PE of rank 0 (rank r is PE PeBase() + r).
   int MyPe() const { return myPe_; }
   int NumPes() const { return nPes_; }
+  int PeBase() const { return peBase_; }
 
-  // creates a concrete facade for the given PE and PE count
+  // Creates a facade for rank `myPe` of a (sub-)communicator of `nPes` ranks,
+  // where rank r maps to global PE rank_to_pe[r]. Only contiguous mappings
+  // (rank_to_pe[r] == rank_to_pe[0] + r) within this node's LSA team are
+  // supported. Collectives of different communicators on the same device must
+  // not run concurrently: they share staging, SDMA queues and barrier slots.
   static std::unique_ptr< CollectivesFacade > Get(int myPe, int nPes,
                                                 const int *rank_to_pe) {
     auto *state = GetState();
@@ -119,8 +125,31 @@ class CollectivesFacade {
       FACADE_PRINTF("Get: no instance");
       return nullptr;
     }
-    if (nPes > kRSPushMaxPeers) {
-      FACADE_PRINTF("nPes too large (max %d)", kRSPushMaxPeers);
+    if (nPes <= 0 || nPes > kRSPushMaxPeers) {
+      FACADE_PRINTF("nPes must be in [1, %d], got %d", kRSPushMaxPeers, nPes);
+      return nullptr;
+    }
+    if (myPe < 0 || myPe >= nPes || rank_to_pe == nullptr) {
+      FACADE_PRINTF("invalid rank %d of %d or null rank_to_pe", myPe, nPes);
+      return nullptr;
+    }
+    const int peBase = rank_to_pe[0];
+    for (int i = 0; i < nPes; ++i) {
+      if (rank_to_pe[i] != peBase + i) {
+        FACADE_PRINTF("rank_to_pe must be contiguous: rank_to_pe[%d]=%d, expected %d",
+                      i, rank_to_pe[i], peBase + i);
+        return nullptr;
+      }
+    }
+    const int lsaSize = state->devComm.lsaSize;
+    if (peBase < 0 || peBase + nPes > lsaSize) {
+      FACADE_PRINTF("PE range [%d, %d) exceeds the LSA team size %d", peBase,
+                    peBase + nPes, lsaSize);
+      return nullptr;
+    }
+    if (peBase + myPe != state->devComm.lsaRank) {
+      FACADE_PRINTF("rank %d maps to PE %d, but this device is PE %d", myPe,
+                    peBase + myPe, state->devComm.lsaRank);
       return nullptr;
     }
 
@@ -157,7 +186,7 @@ class CollectivesFacade {
       }
     }
     return std::unique_ptr<CollectivesFacade>(
-                   new CollectivesFacade(*state, myPe, nPes, logS, mode));
+                   new CollectivesFacade(*state, myPe, nPes, peBase, logS, mode));
   }
 
   // CCO-backed factory. Records the device's CCO comm, and registers ONE big 
@@ -478,9 +507,18 @@ class CollectivesFacade {
     return v;
   }
 
-  CollectivesFacade(SharedState& state, int myPe, int nPes, int logS, RsMode mode) : 
-           state_(state), myPe_(myPe), nPes_(nPes), 
-           logS_(logS), mode_(mode) {}
+  // The kernels run in the communicator's local rank space [0, nPes): the flat-VA
+  // peer delta (peer - myPe) is unchanged by the PE base, while the per-PE SDMA
+  // tables and barrier slots are shifted so local rank r addresses global PE
+  // peBase + r.
+  CollectivesFacade(SharedState& state, int myPe, int nPes, int peBase, int logS,
+                    RsMode mode) :
+           state_(state), myPe_(myPe), nPes_(nPes), peBase_(peBase),
+           logS_(logS), mode_(mode), devComm_(state.devComm),
+           barrierCtr_(state.barrierCtr + peBase) {
+    devComm_.sdma.deviceHandles += static_cast<size_t>(peBase) * devComm_.sdma.sdmaNumQueue;
+    devComm_.sdma.peerSignalPtrs += peBase;
+  }
 
   RsMode resolveMode(size_t totalBytes, bool allReduce) const;
   RsMode resolveCopyMode(size_t totalBytes, size_t pullMaxBytes) const;
@@ -495,8 +533,10 @@ class CollectivesFacade {
 
 private:
   SharedState& state_;
-  int myPe_, nPes_, logS_;
+  int myPe_, nPes_, peBase_, logS_;
   RsMode mode_;
+  cco::ccoDevComm devComm_;  // state_.devComm with the SDMA tables shifted by peBase_
+  uint64_t* barrierCtr_;     // state_.barrierCtr + peBase_
 };
 
 }  // namespace collective
