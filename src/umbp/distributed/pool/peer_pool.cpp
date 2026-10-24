@@ -367,6 +367,99 @@ void PeerPool::PromoteForRead(const std::vector<std::string>& keys,
   }
 }
 
+// A copy, not a promotion: it only has to outlive the read it was made for, so
+// the budget can drop it without demoting anything.
+size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes) {
+  if (budget_bytes == 0 || keys.empty()) return 0;
+  size_t copied = 0;
+  std::vector<PrefetchedCopy> victims;
+  {
+    std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+    std::vector<TransitionJob> jobs;
+    std::vector<std::vector<uint32_t>> targets;
+    {
+      std::lock_guard<std::mutex> lock(operation_mutex_);
+      if (tier_graph_ == nullptr || backends_ == nullptr) return 0;
+      for (const auto& key : keys) {
+        const auto placement = placements_.find(key);
+        if (placement == placements_.end()) continue;
+        const uint32_t source_id = placement->second;
+        auto* source = backends_->Get(source_id);
+        const auto tier = tier_graph_->TierIndexForBackendId(source_id);
+        if (source == nullptr || source->Tier() != TierType::SSD || !tier.has_value()) continue;
+        // DRAM in the key's own tier first (weighted), then in the tiers above it.
+        auto order = tier_graph_->WeightedMemberOrder(*tier, key);
+        const auto upper = tier_graph_->PromoteTargetOrder(*tier, key);
+        order.insert(order.end(), upper.begin(), upper.end());
+        std::vector<uint32_t> dram;
+        for (uint32_t id : order) {
+          auto* member = backends_->Get(id);
+          if (member != nullptr && member->Tier() == TierType::DRAM) dram.push_back(id);
+        }
+        if (dram.empty() || !migrating_keys_.insert(key).second) continue;
+        ++transition_metrics_.attempted;
+        jobs.push_back(TransitionJob{TierTransitionKind::kPromotion, key, source_id, *tier});
+        targets.push_back(std::move(dram));
+      }
+    }
+    if (jobs.empty()) return 0;
+
+    // Several at once, so one request's keys keep every drive busy.
+    constexpr int kPrefetchThreads = 8;
+    std::vector<TierTransitionResult> results(jobs.size());
+    ParallelFor(jobs.size(), kPrefetchThreads, [&](size_t j) {
+      results[j] = transition_executor_.Execute(jobs[j].key, jobs[j].source_backend_id, targets[j],
+                                                /*remove_source=*/false);
+    });
+
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    for (size_t j = 0; j < jobs.size(); ++j) {
+      FinishTransitionLocked(jobs[j], results[j]);
+      if (!results[j].success) continue;
+      ++copied;
+      prefetched_.push_back(PrefetchedCopy{jobs[j].key, results[j].target_backend_id,
+                                           jobs[j].source_backend_id, results[j].bytes_moved});
+      prefetched_bytes_ += results[j].bytes_moved;
+    }
+    while (prefetched_bytes_ > budget_bytes && !prefetched_.empty()) {
+      PrefetchedCopy oldest = std::move(prefetched_.front());
+      prefetched_.pop_front();
+      prefetched_bytes_ -= std::min(prefetched_bytes_, oldest.bytes);
+      // Never the key's last copy.
+      auto* source = backends_->Get(oldest.source_id);
+      if (source == nullptr || !source->Contains(oldest.key)) continue;
+      // Back on the source, so a tier with offload_to drops the copy instead of demoting it.
+      auto placement = placements_.find(oldest.key);
+      if (placement != placements_.end() && placement->second == oldest.copy_id) {
+        placement->second = oldest.source_id;
+      }
+      victims.push_back(std::move(oldest));
+    }
+  }
+  if (victims.empty()) return copied;
+  // Evict takes the lifecycle lock itself.
+  std::vector<PoolEvictRequest> requests;
+  requests.reserve(victims.size());
+  for (const auto& victim : victims) {
+    requests.push_back(PoolEvictRequest{victim.key, TierType::UNKNOWN, victim.copy_id});
+  }
+  const auto results = Evict(requests, PoolEvictMode::kReclaim);
+  // A copy still being read frees nothing: keep counting it, oldest first.
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  for (size_t i = victims.size(); i-- > 0;) {
+    if (i < results.size() && results[i].outcome == PoolEvictOutcome::kFreed) continue;
+    auto* copy = backends_->Get(victims[i].copy_id);
+    if (copy == nullptr || !copy->Contains(victims[i].key)) continue;
+    auto placement = placements_.find(victims[i].key);
+    if (placement != placements_.end() && placement->second == victims[i].source_id) {
+      placement->second = victims[i].copy_id;
+    }
+    prefetched_bytes_ += victims[i].bytes;
+    prefetched_.push_front(std::move(victims[i]));
+  }
+  return copied;
+}
+
 TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,
                                              const TransitionJob& job) {
   TierTransitionResult result;
@@ -1433,6 +1526,8 @@ void PeerPool::ClearLocal() {
   last_access_.clear();
   access_order_.clear();
   promote_hit_counts_.clear();
+  prefetched_.clear();
+  prefetched_bytes_ = 0;
   ++clear_epoch_;
 }
 
