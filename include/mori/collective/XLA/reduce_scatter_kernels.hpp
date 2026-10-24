@@ -1,0 +1,496 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// ===========================================================================
+// reduce_scatter_kernels.hpp
+//
+// Device/template kernels for the reduce-scatter example. Both modes share the
+// same streaming load/store, reduction op functors (see reduce_ops.hpp), and the
+// generic vectorized reduce core (ReduceVecGroup):
+//
+//   * ReduceScatterPushKernel  — fused SDMA "push" scatter + receiver-side
+//                                completion signal + grid-strided reduce.
+//   * ReduceScatterPullKernel  — direct P2P "pull": read each peer's shard over
+//                                XGMI and reduce in one pass (no staging/SDMA).
+//
+// All host-only test code (fill/verify, threading, main) stays in the .cpp.
+// ===========================================================================
+#pragma once
+
+#include <array>
+#include <cstdint>
+
+#include "mori/collective/XLA/collectives_common.hpp"
+#include "mori/collective/XLA/reduce_ops.hpp"
+
+namespace mori {
+namespace collective {
+
+namespace detail {
+
+// Reduce one group of NV vectors (each NV-member at vector index g + i*gstride)
+// across all npes staging slots into the output. Callers guarantee every member
+// index is in-bounds, so there are NO per-lane guards here. Used with NV=NumVecs
+// for the full-group fast path and NV=1 for the single trailing partial group.
+// Generic core: srcBase(pe) returns the base pointer of peer pe's contribution
+// to THIS PE's shard. Peer 0 seeds the accumulators, peers 1..npes-1 reduce in.
+template <int NV, class ReduceOp, StreamScope Scope,
+          class T = typename ReduceOp::Type>
+__device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input, 
+                                               const T* __restrict__ staging, 
+                                  T* __restrict__ output, int npes, int myPe,
+                                  size_t v, size_t lstride, size_t inputStride,
+                                  size_t slotStride) {
+  constexpr int vecSize = VecBytes / sizeof(T);
+  using Vec = TVecType<VecBytes>;
+  using AccType = typename AccumulatorType<T>::type;
+  using Data = std::array<T, vecSize>;
+
+  AccType acc[NV][vecSize];
+  Vec vec[NV];
+  const T* p[NV];
+  // Seed accumulators from peer 0: load its NV vectors, then upcast lanes.
+  // input base uses the uniform shard stride; staging slots use this PE's own
+  // shard length (slotStride) -- they differ when shards are variable-length.
+  p[0] = input + myPe * inputStride;
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    const size_t idx = (v + i * lstride) * vecSize;
+    vec[i] = StreamLoad<Scope>(p[0] + idx);
+  }
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    Data lanes = __builtin_bit_cast(Data, vec[i]);
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) acc[i][j] = UpcastF<T>(lanes[j]);
+  }
+  
+  #pragma unroll
+  for (int i = 0; i < NV; i++) {
+    p[i] = staging + (v + i*lstride) * vecSize; // do manual hoisting
+  }
+  // Reduce peers 1..npes-1 in: load their NV vectors, then fold lanes into acc.
+  for (int pe = 1; pe < npes; pe++) {
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      vec[i] = StreamLoad<Scope>(p[i]);
+      p[i] += slotStride;
+    }
+#pragma unroll
+    for (int i = 0; i < NV; i++) {
+      Data lanes = __builtin_bit_cast(Data, vec[i]);
+#pragma unroll
+      for (int j = 0; j < vecSize; j++) {
+        acc[i][j] = ReduceOp()(acc[i][j], UpcastF<T>(lanes[j]));
+      }
+    }
+  }
+  // Downcast the accumulators back into NV vectors and store them.
+#pragma unroll
+  for (int i = 0; i < NV; i++) {
+    const size_t idx = v + i * lstride;
+    Data lanes;
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) lanes[j] = DowncastF<T>(acc[i][j]);
+    StreamStore<Scope>(output + idx * vecSize, __builtin_bit_cast(Vec, lanes));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused reduce-scatter kernel ("push", sliced into S = 1<<logS slices)
+//
+//   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
+//   staging       : raw symmetric-heap pointer, npes slots of chunkElems elements
+//   output        : raw symmetric-heap pointer, chunkElems elements
+//   groupCounters : plain device buffer (>= 1 uint32), local-only arrival counter;
+//                   atomicInc wraps [0] back to 0, so it is never reset
+//   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
+//                   collective (GenBarrier in block 0, before Phase 1), so
+//                   back-to-back launches need no host barrier
+//
+// Each shard is split into S slices. A sender issues S separate SDMA copies; copy
+// s bumps byte s of the receiver's packed completion counter
+// signalPtrs[kSliceSignalSlot] via an SDMA ADD64 of 1 << 8s (one copy + one atomic
+// per (sender,slice)). On the receive side EVERY block loops the S slices itself
+// and calls the shared per-slice reduce (detail::WaitAndReduceSlice): for slice s
+// it spins until byte s of that counter reaches npes-1 senders, then the WHOLE grid reduces slice s. Slice order matches
+// the senders' packet order, so the waits are satisfied in the order they are
+// performed and each slice's reduce overlaps the still-in-flight transfer of the
+// later slices (pipelining). The last block to finish the loop zeroes the packed
+// slice counter for the next launch.
+//
+// There is no block-to-slice mapping, so gridDim.x is unconstrained. All-reduce
+// loops the same per-slice reduce and appends its pipelined per-slice broadcast to
+// each iteration (see all_reduce_kernels.hpp).
+//
+// Phase 1: block 0, four consecutive lanes per peer (nWork = npes*4). sub==0
+// snapshots that peer's queue handle, then for each slice s reserves 64B, the
+// four lanes write the fused copy+atomic, and sub==0 rings that packet. One
+// leader per queue (peers map to distinct queues) so the commit chain cannot
+// deadlock; occupancy (rptr) is still checked, with cachedHwReadIndex kept local
+// across s and written back once if it moved. Wrap/NOP pad is gone: packets are
+// 64B and the ring is a 64B multiple.
+//
+// input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
+// the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
+// groupCounters is a plain hipMalloc'd buffer (never peer-written).
+// ---------------------------------------------------------------------------
+
+// Phases 2 + 3 for ONE slice: wait until slice `slice` has landed from every
+// sender, then reduce its element range [sOfs, sOfs+sCnt) of my shard with the
+// WHOLE grid. There is no block-to-slice mapping -- every block strides over all
+// of every slice -- so gridDim.x is unconstrained (need not be a multiple of S).
+//
+// The pointers are taken by value, so advancing them by the slice offset is
+// local to this call and the caller passes the same bases on every slice.
+//
+// `seen` is the last packed counter value thread 0 read. It is only meaningful
+// in thread 0 and must start at 0 before slice 0; the caller keeps it across the
+// slice loop so a slice that was already complete at an earlier read needs no load.
+template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
+__device__ __forceinline__ void WaitAndReduceSlice(
+    uint64_t* signalBuf, uint64_t& seen, uint32_t slice, int myPe, int npes,
+    const T* __restrict__ input, const T* __restrict__ staging,
+    T* __restrict__ shardOut, size_t sOfs, size_t sCnt, size_t inputStride,
+    size_t slotStride, uint32_t lstride) {
+
+  const uint32_t BlockDimX = blockDim.x;
+  constexpr int vecSize = VecBytes / sizeof(T);
+
+  // === Phase 2: wait until this slice's byte reaches all npes-1 senders ========
+  // The packed counter lives in my local HBM (bumped by remote SDMA ADD64s of
+  // 1 << 8*slice). One thread per block polls it; every block does its own
+  // wait+acquire (read-only -> L2 hits). At npes==1 want==0, so no spin.
+  if (threadIdx.x == 0) {
+    // Self-copy is skipped, so exactly npes-1 senders bump this slice's byte.
+    const uint32_t want = static_cast<uint32_t>(npes - 1);
+    auto* addr = cco::impl::global(&signalBuf[kSliceSignalSlot]);
+    if (SliceSignalCount(seen, slice) < want) {
+      while (SliceSignalCount(seen = __hip_atomic_load(addr, __ATOMIC_RELAXED,
+                                                       __HIP_MEMORY_SCOPE_AGENT),
+                              slice) < want) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+  }
+  __syncthreads();
+  // System-scope ACQUIRE (not the full seq_cst __threadfence_system): the staging
+  // was written by peers' SDMA over XGMI, so we must invalidate against another
+  // device's writes -- scope "" (system) is required -- but only the acquire half
+  // is needed here (we publish nothing at this point), so drop the release/waitcnt.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+  // === Phase 3: grid-strided vectorized reduce over this slice =================
+  // Streaming reduction over the slice only, strided over the whole grid. Uses
+  // the nontemporal load<16>/store<16> primitives (single-use, bypass L2).
+  input += sOfs;
+  staging += sOfs;
+  shardOut += sOfs;
+
+  // Push path: every source (input + staging) is LOCAL HBM and the Phase-2
+  // __threadfence_system() already made the remote-DMA'd staging visible, so the
+  // per-access loads/stores use agent scope (scope=EAgentScope).
+  const size_t totalVecs = sCnt / vecSize;
+  // Grid-strided thread id / stride. The grid is capped by CU count
+  size_t v = blockIdx.x * BlockDimX + threadIdx.x;
+  for (; v + (NumVecs - 1) * lstride < totalVecs; v += lstride * NumVecs) {
+    ReduceVecGroup<NumVecs, ReduceOp, EAgentScope>(input, staging, shardOut, 
+                                        npes, myPe, v, lstride, inputStride, slotStride);
+  }
+  // Trailing partial group: the remaining in-bounds vectors for this thread.
+  for (; v < totalVecs; v += lstride) {
+    ReduceVecGroup<1, ReduceOp, EAgentScope>(input, staging, shardOut, 
+                                        npes, myPe, v, lstride, inputStride, slotStride);
+  }
+  // Scalar tail (only the last slice can be non-vecSize-aligned).
+  v = blockIdx.x * BlockDimX + threadIdx.x + totalVecs * vecSize;
+  for (; v < sCnt; v += lstride) {
+    using Vec = TVecType<sizeof(T)>;
+    using AccType = typename AccumulatorType<T>::type;
+    const T *ptr = input + myPe * inputStride;
+    Vec V = StreamLoad<EAgentScope, sizeof(T)>(ptr + v);
+    AccType a = UpcastF<T>(__builtin_bit_cast(T, V));
+    ptr = staging + v;
+    for (int pe = 1; pe < npes; pe++, ptr += slotStride) {
+      V = StreamLoad<EAgentScope, sizeof(T)>(ptr);
+      a = ReduceOp()(a, UpcastF<T>(__builtin_bit_cast(T, V)));
+    }
+    V = __builtin_bit_cast(Vec, DowncastF<T>(a));
+    StreamStore<EAgentScope, sizeof(T)>(shardOut + v, V);
+  }
+}
+
+// Load M output positions x NPES peers ALL up front into distinct registers, then
+// reduce each position. Unlike ReduceVecGroup (which reuses one buffer per peer and
+// so serializes the remote loads peer-by-peer via a WAR dependency), every load
+// here is independent: with all indices compile-time the regs[][] array stays in
+// VGPRs and the M*NPES loads issue back-to-back, so the long remote-load latency is
+// paid once and the per-position reductions overlap with still-in-flight loads.
+// Callers guarantee every member index (g + m*gstride) is in-bounds.
+//
+// The reduced vector is handed to store(elemIdx, vec) rather than written to a
+// fixed destination: reduce-scatter drops it in one local buffer, while the fused
+// all-reduce fans the same registers out to every peer, which is what lets it skip
+// a second pass over the shard entirely.
+template <int M, int NPES, class ReduceOp, StreamScope LoadScope, class SrcBaseFn, class StoreFn,
+          class T = typename ReduceOp::Type>
+__device__ __forceinline__ void ReduceAllPeersGroup(SrcBaseFn srcBase, StoreFn store, size_t g,
+                                                    size_t gstride) {
+  constexpr int vecSize = VecBytes / sizeof(T);
+  using Vec = TVecType<VecBytes>;
+  using AccType = typename AccumulatorType<T>::type;
+  using Data = std::array<T, vecSize>;
+  Vec regs[M][NPES];
+#pragma unroll
+  for (int m = 0; m < M; m++) {
+    size_t idx = g + m * gstride;
+#pragma unroll
+    for (int pe = 0; pe < NPES; pe++)
+      regs[m][pe] = StreamLoad<LoadScope>(srcBase(pe) + idx * vecSize);
+  }
+#pragma unroll
+  for (int m = 0; m < M; m++) {
+    AccType acc[vecSize];
+    Data l0 = __builtin_bit_cast(Data, regs[m][0]);
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) acc[j] = UpcastF<T>(l0[j]);
+#pragma unroll
+    for (int pe = 1; pe < NPES; pe++) {
+      Data l = __builtin_bit_cast(Data, regs[m][pe]);
+#pragma unroll
+      for (int j = 0; j < vecSize; j++) {
+        acc[j] = ReduceOp()(acc[j], UpcastF<T>(l[j]));
+      }
+    }
+    Data o;
+#pragma unroll
+    for (int j = 0; j < vecSize; j++) o[j] = DowncastF<T>(acc[j]);
+    store((g + m * gstride) * vecSize, __builtin_bit_cast(Vec, o));
+  }
+}
+
+// Core of the pull collectives: reduce THIS PE's shard by reading it straight
+// out of every peer's input over the P2P fabric (XGMI), with no staging buffer,
+// no SDMA and no cross-block handoff:
+//
+//   store( j, REDUCE_p( input_p[ myPe*chunkElems + j ] ) )
+//
+// The fast path uses ReduceAllPeersGroup: each group reduces M = NumVecs/NPES
+// output positions and issues all M*NPES remote loads up front, for maximum
+// memory-level parallelism across peers (the long XGMI read latency is paid once
+// per group instead of once per peer). NPES is a compile-time template arg so the
+// per-position/per-peer register tile stays in VGPRs.
+//
+// Where the reduced vector goes is the caller's business: store(elemIdx, v) is
+// handed each finished position, with v either a 16-byte vector or a single T on
+// the scalar tail, so one generic lambda covers both. Reduce-scatter stores once
+// at system scope (its caller reads the shard remotely); the fused all-reduce
+// stores locally at agent scope and fans the same registers out to every peer.
+// Generalized core: the shard's base offset within each peer's buffer
+// (baseElems) and its length (lenElems) are independent, so every PE can share a
+// uniform stride base (myPe*stride) while the last PE processes a shorter shard.
+// baseElems/lenElems are in T (= ComputeT) units. store(elemIdx, v) receives
+// elemIdx relative to the shard start (0..lenElems).
+template <int NumVecs, int NPES, class ReduceOp, class StoreFn,
+          class T = typename ReduceOp::Type>
+__device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
+                                    const T* __restrict__ input, StoreFn store,
+                                    size_t baseElems, size_t lenElems) {
+  constexpr int vecSize = VecBytes / sizeof(T);
+  constexpr int M = NumVecs / NPES;  // output positions per group (M >= 1 for NPES <= NumVecs)
+  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  const size_t totalVecs = lenElems / vecSize;
+
+  const T* __restrict__ myShard = input + baseElems;
+  auto srcBase = [myShard, myPe, stride4G](int pe) -> const T* {
+    int32_t diff = (pe - myPe) * static_cast<int32_t>(stride4G);
+    return reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(myShard) +
+                                      (static_cast<uint64_t>(diff) << 32));
+  };
+
+  // Fast path: M positions per group, all M*NPES loads issued up front.
+  size_t g = gtid;
+  for (; g + (M - 1) * gstride < totalVecs; g += gstride * M) {
+    ReduceAllPeersGroup<M, NPES, ReduceOp, ESystemScope>(srcBase, store, g, gstride);
+  }
+  // Trailing in-bounds vectors for this thread (fewer than M left). Reuse the
+  // all-peers primitive with M=1 (one position, NPES loads up front) so the pull
+  // path stays on a single reduction path and needs no runtime-npes helper.
+  for (size_t idx = g; idx < totalVecs; idx += gstride) {
+    ReduceAllPeersGroup<1, NPES, ReduceOp, ESystemScope>(srcBase, store, idx, gstride);
+  }
+
+  // Scalar tail for elements not covered by the vectorized loop.
+  for (size_t i = totalVecs * vecSize + gtid; i < lenElems; i += gstride) {
+    using Vec = TVecType<sizeof(T)>;
+    using AccType = typename AccumulatorType<T>::type;
+    auto V = StreamLoad<ESystemScope, sizeof(T)>(srcBase(0) + i);
+    AccType a = UpcastF<T>(__builtin_bit_cast(T, V));
+    for (int pe = 1; pe < NPES; pe++) {
+      V = StreamLoad<ESystemScope, sizeof(T)>(srcBase(pe) + i);
+      a = ReduceOp()(a, UpcastF<T>(__builtin_bit_cast(T, V)));
+    }
+    store(i, __builtin_bit_cast(Vec, DowncastF<T>(a)));
+  }
+}
+
+}  // namespace detail
+
+template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
+__global__ void __launch_bounds__(256, 1)
+ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
+                                    uint32_t* __restrict__ groupCounters, size_t chunkElems,
+                                    cco::ccoDevComm devComm, cco::ccoWindow_t heapWin,
+                                    const T* __restrict__ input, T* __restrict__ staging,
+                                    uint64_t* __restrict__ barrierCtr) {
+
+  // gen = gen_ptr[0];
+  // __syncthreads();
+  // if (threadIdx.x == 0) {
+  //   cnt = 1 + atomicAdd(counter, 1);
+  //   if (cnt == gridDim.x) {
+  //     *counter = 0;
+  //     gen_ptr[0] = gen + 1;
+  //   }
+  // }
+  // Phase 1: scatter the input to the staging buffer
+  if (blockIdx.x == 0) {
+    // Finishing the previous launch only proves peers SENT to us, not that they
+    // are done reducing what we sent them: gate our writes into their staging /
+    // signalBuf until every PE has entered this launch.
+    int stride4G = heapWin->stride4G;
+    if (threadIdx.x < warpSize) {
+      // Every lane reads my slot before lane myPe overwrites it (same wave).
+      const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
+      GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
+    }
+    __syncthreads();
+    // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
+    // no self-copy (self is folded in by the Phase-3 reduce reading local input).
+    // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
+    // bijection over the npes-1 non-self peers.
+    StartSdmaScatter<sizeof(T)>(
+        devComm.sdma, npes, logS, [=](int) { return chunkElems; },
+        [=](int peer) { return peer != myPe; },
+        [=](int peer) -> const uint8_t* {
+          return reinterpret_cast<const uint8_t*>(input + peer * chunkElems);
+        },
+        [=](int peer) -> uint8_t* {
+          const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
+          int32_t diff = (peer - myPe)*stride4G;
+          return reinterpret_cast<uint8_t*>(staging + slot * chunkElems) + 
+             (static_cast<uint64_t>(diff)<<32);
+        });
+  }
+  
+  // Phase 2-3: walk all S slices in the order the senders queued them, reducing
+  // each into this PE's shard-sized output buffer. Nothing happens per slice --
+  // the packed counter is cleared once below, after every slice is done.
+  constexpr int vecSize = VecBytes / sizeof(T);
+  const uint32_t S = 1u << logS;
+  // vecSize-aligned slice length; the last slice absorbs the remainder.
+  const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
+  const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
+  uint64_t seen = 0;
+  for (uint32_t s = 0; s < S; s++) {
+    const size_t sOfs = FORCE_SGPR(s * sliceLen);
+    const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
+    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(devComm.sdma.signalBuf, seen, s, myPe,
+                                                 npes, input, staging, output, sOfs, sCnt,
+                                                 chunkElems, chunkElems, lstride);
+  }
+
+  // === Reset: the last block of the grid zeroes the packed slice counter =======
+  // A block only reaches here after passing the Phase-2 wait on EVERY slice, so
+  // when the last block counts in every sender's add has landed and clearing the
+  // counter cannot drop an unseen signal. atomicInc wraps the arrival counter
+  // back to 0 on the last block, so it needs no reset of its own.
+  if (threadIdx.x == 0 &&
+      atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
+    AtomicStore<ESystemScope>(&devComm.sdma.signalBuf[kSliceSignalSlot], 0UL);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Direct "pull" reduce-scatter kernel (no staging, no SDMA scatter) — CCO/LSA.
+//
+// A thin wrapper over detail::PullReduceShard, which is the whole collective
+// here: every PE reads its shard out of every peer's input over XGMI and
+// reduces it in one fused grid-strided pass. There is no staging buffer and no
+// cross-block data handoff. The all-reduce pull kernel runs the same core as its
+// shot 1.
+//
+// Two GenBarrier rounds per launch on `arrived` make back-to-back launches and
+// input reuse safe without a host barrier: entry posts gen+1, exit posts gen+2.
+// The launch gen needs no counter: my own slot arrived[myPe] holds gen (even,
+// left by the previous launch) or gen+1 (this launch's entry, already posted by
+// block 0), so arrived[myPe] & ~1 is gen in every block. gen+2 is posted only
+// after every block has counted in, so no block of this launch can read it.
+//   * entry: no block may read a peer's input before that peer has entered this
+//     launch (its producer kernels have retired). GenBarrier<Block0Only>: block 0
+//     posts; every block waits on the local slots itself, so blocks never wait
+//     on each other.
+//   * exit: the last block out waits until every peer has finished reading MY
+//     input, so the kernel completing means the caller may overwrite it.
+//
+//   groupCounters : plain device buffer, zeroed once by the host. [0] elects the
+//                   last block; atomicInc wraps it back to 0, so no reset.
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
+//                   collective (see GenBarrier).
+// ---------------------------------------------------------------------------
+template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
+__global__ void __launch_bounds__(256, 1)
+ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
+                        const T* __restrict__ input, T* __restrict__ output,
+                        size_t chunkElems, uint32_t* __restrict__ groupCounters,
+                        uint64_t* __restrict__ arrived) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // In block 0's first wave every lane loads this before lane myPe posts.
+  const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
+  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
+  __syncthreads();
+
+  // System scope: the caller hands output to a remote reader after the kernel,
+  // so it must not linger in a local cache line.
+  auto store = [output](size_t elemIdx, auto v) {
+    StreamStore<ESystemScope, sizeof(v)>(output + elemIdx, v);
+  };
+  // Equal shards: shard myPe lives at myPe*chunkElems and is chunkElems long.
+  detail::PullReduceShard<NumVecs, NPES, ReduceOp>(
+      myPe, stride4G, input, store, static_cast<size_t>(myPe) * chunkElems, chunkElems);
+
+  // A block counts in only once all its waves are done reading peer inputs.
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    uint32_t last = 0;
+    if (threadIdx.x == 0) {
+      last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
+    }
+    if (BroadcastWarp(last, 0)) {
+      GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
+    }
+  }
+}
+
+} // namespace collective
+} // namespace mori
