@@ -169,6 +169,10 @@ class SsdBackendTest : public ::testing::Test {
     return v;
   }
 
+  uint64_t PagesInUse() {
+    return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE)["staging_pages_in_use"];
+  }
+
   SsdBackendTest() {
     engine_.AddEngine(std::make_unique<LocalCopyEngine>());
     engine_.AddEngine(std::make_unique<PosixEngine>());
@@ -602,10 +606,8 @@ TEST_F(SsdBackendTest, BusyBatchRollsBackEveryNewReservation) {
   EXPECT_EQ(resolved[0].outcome, ResolveOutcome::kBusy);
   EXPECT_EQ(resolved[1].outcome, ResolveOutcome::kBusy);
 
-  // The first two-page reservation was returned when the second could not fit:
-  // all three pages not held by blocker are available to one writer.
-  auto allocated = backend->BatchAllocate({AllocateRequest{"three-pages", 3 * kPageSize}});
-  EXPECT_EQ(allocated[0].outcome, AllocateOutcome::kSuccessAllocated);
+  // The first two-page reservation was returned when the second could not fit.
+  EXPECT_EQ(PagesInUse(), 1u);
 }
 
 TEST_F(SsdBackendTest, BatchLargerThanArenaFailsWithoutRetryLoop) {
@@ -935,9 +937,6 @@ class SsdBackendExtentTest : public SsdBackendTest {
   uint64_t DeviceReadBytes() {
     return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_BYTES_TOTAL)["device_read"];
   }
-  uint64_t PagesInUse() {
-    return Samples(*backend_, MORI_UMBP_METRIC_BACKEND_MEDIUM_STATE)["staging_pages_in_use"];
-  }
 
   std::vector<ResolvedEntry> ResolveExtents(const std::vector<std::string>& keys,
                                             const std::vector<ObjectExtent>& extents,
@@ -986,6 +985,17 @@ TEST_F(SsdBackendExtentTest, LocalExtentResolveReadsOnlyTheWindow) {
   got.clear();
   backend_->RunReaperOnceForTest();
   EXPECT_EQ(PagesInUse(), 0u) << "an extent stage goes back with its last hold";
+}
+
+// A dropped extent hold frees its span at the next resolve, not at the next reaper sweep.
+TEST_F(SsdBackendExtentTest, ADroppedHoldFreesItsSpanWithoutTheReaper) {
+  Start(/*staging_pages=*/32, std::chrono::seconds{60});
+  ASSERT_TRUE(Put(backend_.get(), "a", Aperiodic(kObject)));
+  ASSERT_TRUE(Put(backend_.get(), "b", Aperiodic(kObject)));
+  ASSERT_TRUE(ResolveExtents({"a"}, {ObjectExtent{0, 4096}})[0].found);  // hold dropped here
+  auto held = ResolveExtents({"b"}, {ObjectExtent{0, 4096}});
+  ASSERT_TRUE(held[0].found);
+  EXPECT_EQ(PagesInUse(), 1u);
 }
 
 // A Clear must not hand a span to the next reader while a local reader copies out of it.

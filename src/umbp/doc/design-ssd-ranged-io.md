@@ -312,6 +312,8 @@ needs a test that asserts *content*, not success.
   O_DIRECT lands in the staging span. Extent stages are private to their
   readers, never in `read_leases_` (which promise the whole object). Identical
   windows in one call share a read; a whole-object lease serves any window.
+  An extent span goes back to the arena when its last hold drops, not at the
+  next reaper sweep; span search is next-fit.
 - `PeerSsdManager::PrepareReadBatch` takes the extents too, and single flight
   attaches a reader only to a read that covers its bytes (D1c).
 - `UMBP_SSD_EXTENT_STAGING=0` restores whole-object staging. `extent_stage`
