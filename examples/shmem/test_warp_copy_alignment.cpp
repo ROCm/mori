@@ -43,7 +43,8 @@ constexpr size_t kCopyTileBytes = 1ULL << 20;
 
 __host__ __device__ uint8_t ExpectedByte(size_t index, int sourcePe) {
   return static_cast<uint8_t>(
-             ((index * 131U) ^ (static_cast<size_t>(sourcePe) * 17U) ^ (index >> 8)) & 0xFFU) | 1U;
+             ((index * 131U) ^ (static_cast<size_t>(sourcePe) * 17U) ^ (index >> 8)) & 0xFFU) |
+         1U;
 }
 
 __global__ void InitPatternKernel(uint8_t* buffer, size_t bytes, int sourcePe) {
@@ -273,21 +274,21 @@ int main() {
   HIP_RUNTIME_CHECK(hipMalloc(&deviceError, sizeof(int)));
 
   if (myPe == 0) {
-    std::printf("BlockCopy peer-copy alignment test: %zu bytes, %s, %d blocks x %d threads\n", bytes,
-                properties.name, kGridSize, kBlockSize);
+    std::printf("BlockCopy peer-copy alignment test: %zu bytes, %s, %d blocks x %d threads\n",
+                bytes, properties.name, kGridSize, kBlockSize);
     std::fflush(stdout);
   }
 
-  const CaseResult alignedB128 = RunCase<16>("ld/st 16b, 16b align", 0, bytes, myPe, npes,
-                                             srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
+  const CaseResult alignedB128 = RunCase<16>("ld/st 16b, 16b align", 0, bytes, myPe, npes, srcBase,
+                                             dstBase, srcMemObj, dstMemObj, deviceError);
   const CaseResult misalignedB128 =
       RunCase<16>("ld/st 16b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
                   dstMemObj, deviceError);
-  const CaseResult misalignedB64 = RunCase<8>("ld/st 8b, 8b align", 8, bytes, myPe, npes,
-                                              srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
+  const CaseResult misalignedB64 = RunCase<8>("ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase,
+                                              dstBase, srcMemObj, dstMemObj, deviceError);
   const CaseResult misalignedB64flat =
-      RunCase<8, true>("flat ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase,
-                       srcMemObj, dstMemObj, deviceError);
+      RunCase<8, true>("flat ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
+                       dstMemObj, deviceError);
 
   if (myPe == 0 && alignedB128.milliseconds > 0.0f && misalignedB64.milliseconds > 0.0f) {
     std::printf("Misaligned/aligned 16-byte-op runtime ratio: %.3fx\n",
