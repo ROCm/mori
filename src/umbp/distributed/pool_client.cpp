@@ -851,6 +851,7 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
       ownership.prefault = config.dram.prefault;
       ownership.numa_strict = config.dram.numa_strict;
       ownership.prefault_threads = config.dram.prefault_threads;
+      ownership.max_mr_bytes = config.dram.max_mr_bytes;
       return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
                              /*pending_ttl=*/std::chrono::milliseconds{30000},
                              /*read_lease_ttl=*/DramReadLeaseTtl());
