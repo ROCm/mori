@@ -69,6 +69,7 @@ option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
 option(ENABLE_STANDARD_MOE_ADAPT "Enable standard moe adapt" OFF)
 option(BUILD_OPS_DEVICE "AOT compile EP kernels to .hsaco(requires hipcc)" OFF)
+option(BUILD_OPS_KIWI "Build the KIWI EP dispatch/combine kernels (ROCm only)" OFF)
 option(MORI_MULTITHREAD_SUPPORT
        "Enable single-process multi-thread multi-GPU support in mori_shmem" OFF)
 
@@ -348,6 +349,14 @@ add_subdirectory(src/ops/dispatch_combine_v2)
 
 if(BUILD_OPS)
   add_subdirectory(src/ops)
+endif()
+
+if(BUILD_OPS_KIWI)
+  if(NOT USE_ROCM)
+    message(FATAL_ERROR "BUILD_OPS_KIWI=ON requires USE_ROCM=ON")
+  endif()
+  add_subdirectory(src/kiwi)
+  add_subdirectory(src/ops/dispatch_combine_kiwi)
 endif()
 
 if(BUILD_IO)
