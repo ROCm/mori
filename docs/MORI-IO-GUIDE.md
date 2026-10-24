@@ -178,6 +178,7 @@ See `examples/io/example.py` for more complete examples including batch transfer
 | `RdmaBackendConfig.num_nics_per_transfer` | Stripe a transfer across this many NICs (default `1`). Adaptive by memory type: GPU memory stays single-NIC (PCIe-bound); host memory stripes across NUMA-local NICs. Env: `MORI_IO_NUM_NICS_PER_TRANSFER` |
 | RC retry budget | The RC QP retry attributes applied at RTS, bounded so an out-of-range value is ignored rather than failing QP setup. `MORI_IO_QP_TIMEOUT` (0–31, default `14`; local ACK timeout = `4.096us * 2^timeout`; `0` disables it and lets an unresponsive peer stall indefinitely), `MORI_IO_QP_RETRY_CNT` (0–7, default `7`), `MORI_IO_QP_RNR_RETRY` (0–7, default `7`; `7` = retry RNR NAKs forever), `MORI_IO_QP_MIN_RNR_TIMER` (0–31, default `12`; IB-spec RNR NAK backoff). Each also honors a transport-wide `MORI_RDMA_QP_*` fallback (e.g. `MORI_RDMA_QP_TIMEOUT`) that tunes the shmem/CCO QPs sharing this path. The `MORI_IO_QP_*` name wins whenever it is set, including when its value is out of range — an invalid IO-specific value falls back to the built-in default, never to the `MORI_RDMA_QP_*` value. |
 | `MORI_IO_FAIL_ON_ASYNC_EVENT` | When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set `0` to disable and restore the previous hang-until-timeout behavior. |
+| `MORI_IO_PORT_DOWN_FAIL_FAST` | Default on. After local PORT_ERR, new transfers using that port fail synchronously until PORT_ACTIVE or a one-second port recheck confirms ACTIVE. Already admitted transfers and their notification SENDs keep their normal retry behavior. Set `0` to disable admission rejection; peer failure reporting remains enabled. Port recovery does not rebuild QPs that exhausted their retry budget. |
 | `IOEngineConfig.port = 0` | Auto-bind to a free port |
 | `LD_LIBRARY_PATH` | MORI-IO loads libibverbs dynamically at runtime (`dlopen` of `libibverbs.so` / `libibverbs.so.1`) rather than linking it. To use an out-of-tree libibverbs, put its directory on `LD_LIBRARY_PATH`. |
 
@@ -230,3 +231,26 @@ Either variable can be enabled alone. Enabled values include `1`, `on`, and
 | `tests/cpp/io/bench_engine.cpp` | Performance benchmark (default, nixlbench-matching) |
 | `tests/python/io/benchmark.py` | Performance benchmark (Python, kept for parity) |
 | `docs/MORI-IO-BENCHMARK.md` | Benchmark commands and results |
+
+### NIC fault injection (test builds)
+
+Configure with `-DENABLE_IO_FAULT_INJECTION=ON`. Production builds leave this off.
+`MORI_IO_FAULT` accepts one rule (an invalid rule aborts the process, so a typo never runs fault-free), for example
+`async_event:value=cq_err:op=write`, `port_down:op=write`, or
+`port_flap:value=200:op=write`. Async event rules require a supported event name
+or its numeric `ibv_event_type`; `skip`, `count`, `qpn`, and `op` filter matching
+posts. SRQ events are rejected because MORI-IO does not use an SRQ. Port rules
+accept only `count=1`. Runtime injection errors are logged and fail the catalog
+without throwing through the data path. QP/CQ/device fatal injections change the
+corresponding data-path state; dead CQ/device markers survive Disarm. Port down
+lasts until explicit Disarm, while flap recovers after its duration even if the
+rule is disarmed earlier. Automatic
+rule exhaustion stops new triggers without clearing a port-down interval.
+
+Run `MORI_IO_FAULT_CATALOG=async_events.yaml ./build_fault/tests/cpp/test_fault_injection`
+for the async catalog, or add `--check-catalog` to validate rules without GPU/NIC
+access. `--check-async-sources` exercises the async source plumbing on the CPU.
+The default catalog is `ibverbs.yaml`. Each hardware entry uses GPU 0 and GPU 1;
+the CPU checks create no engine.
+Synthetic events must not race endpoint destruction: they do not acquire the
+provider's event lifetime protection. The fault catalog exits without teardown.

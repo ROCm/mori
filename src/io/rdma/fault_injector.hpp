@@ -24,10 +24,16 @@
 #ifdef MORI_IO_FAULT_INJECTION
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "src/io/rdma/verbs_ops.hpp"
 
@@ -43,33 +49,38 @@ enum class FaultKind : uint8_t {
   CqeError,      // rewrite a successful CQE's status to `value` (ibv_wc_status) and move
                  // its QP to IBV_QPS_ERR, as the NIC does after any error completion
   CqeDrop,       // swallow a successful CQE: the completion never arrives
+  AsyncEvent,    // synthesize a verbs async event after posting
+  PortDown,      // PORT_ERR until explicit Disarm(), then PORT_ACTIVE
+  PortFlap,      // PORT_ERR followed by PORT_ACTIVE after value milliseconds
 };
 
 struct FaultRule {
   FaultKind kind{FaultKind::CqeDrop};
   uint64_t skip{0};   // let this many matching ops through first
   uint64_t count{1};  // then fire this many times; 0 = forever
-  int value{0};       // errno for *Fail kinds, ibv_wc_status for CqeError
-  int wcOpcode{-1};   // CQE kinds: only match this ibv_wc_opcode; -1 = any
+  int value{0};       // errno, WC status, async event type, or flap duration (ms)
+  int wcOpcode{-1};   // only match this ibv_wc_opcode; -1 = any
   uint32_t qpn{0};    // only match this QP number; 0 = any
 };
 
 // Parses "kind[:key=value]...", e.g. "cqe_drop:op=write:skip=10:count=1" or
 // "cqe_error:value=retry_exc". Kinds: post_send_fail, post_recv_fail, qp_error,
-// cqe_error, cqe_drop. Keys: skip, count, value, op (write|read|send|recv|<int>),
+// cqe_error, cqe_drop, async_event, port_down, port_flap. Keys: skip, count,
+// value, op (write|read|send|recv|<int>),
 // qpn. Throws std::invalid_argument on a malformed spec.
 FaultRule ParseFaultRule(const std::string& spec);
 const char* FaultKindName(FaultKind kind);
 
-// Decorates RealVerbs with a single armed FaultRule. Disarmed, each hook costs
-// one relaxed atomic load. Arms itself at first use from MORI_IO_FAULT if set.
+// Decorates RealVerbs with a single armed FaultRule. Without active faults the
+// data path checks relaxed atomics only. Arms at first use from MORI_IO_FAULT.
 class FaultInjector final : public VerbsOps {
  public:
   static FaultInjector& Instance();
 
   void Arm(const FaultRule& rule);
-  void Disarm();
+  void Disarm() noexcept;
   uint64_t Fired() const { return fired_.load(std::memory_order_relaxed); }
+  bool Failed() const { return failed_.load(std::memory_order_relaxed); }
 
   int PostSend(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad) override;
   int PostRecv(ibv_qp* qp, ibv_recv_wr* wr, ibv_recv_wr** bad) override;
@@ -77,26 +88,58 @@ class FaultInjector final : public VerbsOps {
   int GetCqEvent(ibv_comp_channel* ch, ibv_cq** cq, void** cqCtx) override {
     return real_.GetCqEvent(ch, cq, cqCtx);
   }
-  int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) override {
-    return real_.GetAsyncEvent(ctx, event);
-  }
+  int GetAsyncEvent(ibv_context* ctx, ibv_async_event* event) noexcept override;
+  void AckAsyncEvent(ibv_async_event* event) override;
+  int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) noexcept override;
+  int WatchAsyncContext(ibv_context* ctx) override;
+  void UnwatchAsyncContext(ibv_context* ctx) override;
 
  private:
   FaultInjector();
   // True if the armed rule matches and is due; `value` gets the rule's value.
   bool ShouldFire(FaultKind kind, uint32_t qpn, int wcOpcode, int* value);
+  bool ShouldFireLocked(FaultKind kind, uint32_t qpn, int wcOpcode, int* value);
+  void RecordInjection(FaultKind kind, uint32_t qpn, int wcOpcode, int value) noexcept;
+  void FailInjection(const char* operation, int error = 0) noexcept;
   // CQEs carry only a QP number; remember QPs seen at post time so an injected
   // error CQE can move its QP to ERR. Only recorded while armed.
   void RememberQp(ibv_qp* qp);
-  void MoveQpToError(ibv_qp* qp);
+  bool MoveQpToError(ibv_qp* qp);
+  bool PrepareAsyncEvent(ibv_qp* qp, int wcOpcode, ibv_async_event* event);
+  bool DeviceDead(ibv_context* ctx);
+  void PublishAsyncEvent(ibv_qp* qp, int wcOpcode, const ibv_async_event& event) noexcept;
+  bool QueueEventLocked(ibv_context* ctx, const ibv_async_event& event);
+  void RestorePortLocked(ibv_context* ctx, int port);
+  void PortTimerLoop();
+
+  struct AsyncSource {
+    int fd;
+    std::deque<ibv_async_event> queue;
+  };
+  using Clock = std::chrono::steady_clock;
+  using PortKey = std::pair<ibv_context*, int>;
+  struct DownPort {
+    Clock::time_point restoreAt;
+    int durationMs;  // zero = port_down; positive = flap, even before publication
+  };
 
   RealVerbs real_;
   std::atomic<bool> armed_{false};
   std::atomic<uint64_t> fired_{0};
+  std::atomic<bool> failed_{false};
   std::mutex mu_;
   FaultRule rule_;
   uint64_t matched_{0};
-  std::unordered_map<uint32_t, ibv_qp*> qps_;
+  uint64_t triggered_{0};  // rule count includes attempted injections, even if they fail
+  // QP numbers are unique only within one context/device.
+  std::unordered_map<ibv_context*, std::unordered_map<uint32_t, ibv_qp*>> qps_;
+  std::unordered_map<ibv_context*, AsyncSource> sources_;
+  std::unordered_set<ibv_cq*> deadCqs_;
+  std::unordered_set<ibv_context*> deadDevices_;
+  std::atomic<bool> hasDeadResources_{false};
+  std::map<PortKey, DownPort> downPorts_;
+  std::condition_variable timerCv_;
+  std::thread timer_;
 };
 
 }  // namespace io
