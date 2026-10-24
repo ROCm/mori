@@ -1252,11 +1252,15 @@ struct ccoSdmaQueueDeviceHandle {
   // rptr — an uncached SYSTEM load worth ~2600 cycles, paid on every put once
   // wptr passes the ring size. The hint only moves forward to a value rptr
   // actually had, so racing writers are harmless.
+  //
+  // The ring is never filled completely: the engine reads wptr == rptr (mod the
+  // ring) as empty, so a full ring would look idle and stall every waiter. Hence
+  // `>=`, the same rule as anvil_device.hpp's CanWriteUpto.
   __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes,
                                                   ccoSdmaQueueDeviceHandle* shared) {
     uint64_t base = __hip_atomic_fetch_add(impl::global(cachedWptr), slotBytes, __ATOMIC_RELAXED,
                                            __HIP_MEMORY_SCOPE_AGENT);
-    if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
+    if ((base + slotBytes) - cachedHwReadIndex >= CCO_SDMA_QUEUE_SIZE) {
       [[maybe_unused]] int retries = 0;
       do {
         cachedHwReadIndex =
@@ -1267,7 +1271,7 @@ struct ccoSdmaQueueDeviceHandle {
             break;
           }
         }
-      } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
+      } while ((base + slotBytes) - cachedHwReadIndex >= CCO_SDMA_QUEUE_SIZE);
       __hip_atomic_store(impl::global(&shared->cachedHwReadIndex), cachedHwReadIndex,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
