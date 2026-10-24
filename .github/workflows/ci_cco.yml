@@ -219,6 +219,20 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 1800 pytest -v -s tests/python/cco/test_gemm_ar_bench.py"
 
+      # After the GEMM+AR steps on purpose. Each of these spawns 8-rank SDMA
+      # process groups, and their queues take seconds to come back; the gemm_ag
+      # tests settle and retry around that (anvil.cpp), the gemm_ar ones do not,
+      # so running gemm_ar right after this step fails in hsaKmtCreateQueueExt.
+      - name: Run CCO GEMM+AG numerics and benchmark (up to 8 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_ag as g; print(g.__file__)' && \
+            timeout 2400 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_bench.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_pipeline.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ag_sdma_drain.py"
+
       - name: Validate CCO ROCm runtime import order
         run: |
           $CT exec $CONTAINER bash -c "\
