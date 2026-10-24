@@ -188,7 +188,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
           <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                   reinterpret_cast<const ComputeT*>(input),
                                   reinterpret_cast<ComputeT*>(output), chunkElemsC,
-                                  state_.groupCounters, state_.barrierCtr);
+                                  state_.groupCounters, barrierCtr_);
       return hipGetLastError();
     });
   } else {
@@ -196,9 +196,9 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
     // grid needs no rounding to a multiple of S.
     ReduceScatterPushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<ComputeT*>(output),
-        state_.groupCounters, chunkElemsC, state_.devComm, state_.heapWin,
+        state_.groupCounters, chunkElemsC, devComm_, state_.heapWin,
         reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(state_.staging), state_.barrierCtr);
+        reinterpret_cast<ComputeT*>(state_.staging), barrierCtr_);
   }
   return hipGetLastError();
 }
@@ -284,7 +284,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
                                             reinterpret_cast<const ComputeT*>(input),
                                             reinterpret_cast<ComputeT*>(output),
                                             strideElemsC, myElemsC,
-                                            state_.groupCounters, state_.barrierCtr);
+                                            state_.groupCounters, barrierCtr_);
       return hipGetLastError();
     });
   }
@@ -305,8 +305,8 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   AllReducePushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<const ComputeT*>(input),
         reinterpret_cast<ComputeT*>(output), state_.groupCounters, strideElemsC, totalElemsC,
-        state_.devComm, reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin,
-        state_.barrierCtr);
+        devComm_, reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin,
+        barrierCtr_);
   return hipGetLastError();
 }
 
@@ -342,14 +342,14 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllGatherPullKernelN<decltype(NPES_c)::value><<<blocks, kPullThreads, 0, stream>>>(
           myPe_, nPes_, state_.heapWin, input, output, chunkBytes, state_.groupCounters,
-          state_.barrierCtr);
+          barrierCtr_);
       return hipGetLastError();
     });
   }
   constexpr int kThreads = 64;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
-                                     state_.devComm, state_.heapWin, state_.barrierCtr);
+                                     devComm_, state_.heapWin, barrierCtr_);
   return hipGetLastError();
 }
 
@@ -380,15 +380,15 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllToAllPullKernelN<decltype(NPES_c)::value><<<blocks, kPullThreads, 0, stream>>>(
           myPe_, nPes_, state_.heapWin, state_.pinnedPairs, chunkBytes, state_.groupCounters,
-          state_.barrierCtr);
+          barrierCtr_);
       return hipGetLastError();
     });
   }
   constexpr int kThreads = 64;
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
-                    state_.pinnedPairs, chunkBytes, state_.devComm,
-                    state_.heapWin, state_.barrierCtr);
+                    state_.pinnedPairs, chunkBytes, devComm_,
+                    state_.heapWin, barrierCtr_);
   return hipGetLastError();
 }
 
@@ -418,10 +418,20 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
     return hipErrorNotSupported;
   }
   // Empty dstPes: receive-only rank (nobody receives from us).
-  const int dstPe = dstPes.empty() ? -1 : dstPes[0];
+  int dstPe = dstPes.empty() ? -1 : dstPes[0];
   if (dstPe < 0 && srcPe < 0) {
     return hipSuccess;
   }
+  if (dstPe >= nPes_ || srcPe >= nPes_) {
+    FACADE_PRINTF("CollectivePermute: peer out of range (src=%d, dst=%d, npes=%d)", srcPe,
+                  dstPe, nPes_);
+    return hipErrorInvalidValue;
+  }
+  // The permute kernels address peers by global LSA rank (heapWin->lsaRank) with
+  // the unshifted devComm, so map the communicator-local ranks to global PEs.
+  if (dstPe >= 0) dstPe += peBase_;
+  if (srcPe >= 0) srcPe += peBase_;
+  const int npes = peBase_ + nPes_;
   // Pull needs the buffer bases 16B-aligned; the kernel's byte tail covers a
   // non-16B numBytes, so the size is not part of the gate. Else fall to push.
   const uintptr_t bits =
@@ -434,13 +444,13 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
         srcPe < 0 ? 1
                   : PullCopyBlocks(numBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
     CollectivePermutePullKernel<<<blocks, kPullThreads, 0, stream>>>(
-        nPes_, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteReady,
+        npes, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteReady,
         state_.permuteSendReady, state_.permuteReadDone, state_.permuteCnt, state_.groupCounters);
     return hipGetLastError();
   }
   constexpr int kThreads = 64;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(
-                nPes_, dstPe, srcPe, sendBuf, recvBuf,
+                npes, dstPe, srcPe, sendBuf, recvBuf,
                 numBytes, state_.devComm, state_.heapWin, state_.permuteReady,
                 state_.permuteCnt);
   return hipGetLastError();
