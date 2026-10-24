@@ -1,0 +1,103 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx942",
+  "gpu_model": "mi308x",
+  "kernel_type": "IntraNodeV2",
+  "ep_size": 8,
+  "num_experts": 256,
+  "topk": 6,
+  "phase": "dispatch",
+  "rules": [
+    {
+      "dtype": "bf16",
+      "num_tokens": 64,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 126.22,
+      "avg_xgmi_bandwidth_gbps": 126.22,
+      "avg_latency_us": 32.35,
+      "bandwidth_metric": "grand_mean"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 128,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 170.78,
+      "avg_xgmi_bandwidth_gbps": 170.78,
+      "avg_latency_us": 47.97,
+      "bandwidth_metric": "grand_mean"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 256,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 212.44,
+      "avg_xgmi_bandwidth_gbps": 212.44,
+      "avg_latency_us": 76.71,
+      "bandwidth_metric": "grand_mean"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 512,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 242.7,
+      "avg_xgmi_bandwidth_gbps": 242.7,
+      "avg_latency_us": 134.82,
+      "bandwidth_metric": "grand_mean"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 1024,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 64,
+      "rdma_block_num": 0,
+      "warp_per_block": 8,
+      "bandwidth_gbps": 271.49,
+      "avg_xgmi_bandwidth_gbps": 271.49,
+      "avg_latency_us": 240.28,
+      "bandwidth_metric": "grand_mean"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 2048,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 279.66,
+      "avg_xgmi_bandwidth_gbps": 279.66,
+      "avg_latency_us": 466.54,
+      "bandwidth_metric": "grand_mean"
+    },
+    {
+      "dtype": "bf16",
+      "num_tokens": 4096,
+      "hidden_dim": 7168,
+      "topk": 6,
+      "block_num": 80,
+      "rdma_block_num": 0,
+      "warp_per_block": 4,
+      "bandwidth_gbps": 293.82,
+      "avg_xgmi_bandwidth_gbps": 293.82,
+      "avg_latency_us": 887.53,
+      "bandwidth_metric": "grand_mean"
+    }
+  ]
+}

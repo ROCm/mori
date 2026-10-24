@@ -222,16 +222,17 @@ __device__ __forceinline__ void EpInterNodePut(const ::mori::cco::ccoDevComm& co
       ::mori::cco::ccoCoopThread{});
 }
 
-// Drains every stripe: flush(peer) only polls the QP belonging to its own
-// context, so flushing one would leave the puts issued on the other qpIds
-// outstanding. numQp is config.numQpPerPe, which is also what the devComm was
-// created with (gdaContextCount).
+// Drains one stripe: flush(peer) only polls the QP belonging to its own
+// context, so each QP a peer was sent on has to be flushed separately.
 __device__ __forceinline__ void EpInterNodeQuiet(const ::mori::cco::ccoDevComm& comm, int pe,
-                                                 int numQp) {
-  for (int qpId = 0; qpId < numQp; ++qpId) {
-    ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
-    gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
-  }
+                                                 int qpId) {
+  ::mori::cco::ccoGda<kEpInterNodeProvider> gda{comm, qpId};
+  gda.template flush<::mori::cco::CCO_TEAM_WORLD>(pe, ::mori::cco::ccoCoopWarp{});
+}
+
+// The value a combine adds on QP qpId; see kCombineBarrierMarkerTotal.
+__device__ __forceinline__ constexpr uint64_t CombineBarrierMarker(int qpId, int activeQps) {
+  return qpId == 0 ? uint64_t(kCombineBarrierMarkerTotal - (activeQps - 1)) : uint64_t{1};
 }
 
 // Spin on a local symmetric slot until a peer publishes a positive value. No
@@ -593,44 +594,55 @@ inline __device__ void DispatchInterNodeRecv(EpDispatchCombineArgs& args) {
       index_t srcTokId = reinterpret_cast<index_t*>(stagingPtr + tokIdx * xferBytes + hiddenBytes +
                                                     indexBytes + weightBytes + scaleBytes)[0];
 
+      // Allocate slots in parallel across distinct destination PEs after deduplication.
+      // Payload copies remain sequential per peer.
+      bool laneValid = false;
+      if (laneId < config.numExpertPerToken) {
+        // Validate the peer before GetAs/atomicAdd, including Release builds.
+        bool oob = (lanePe < 0) || (lanePe >= config.worldSize);
+        laneValid = !oob && (lanePe / config.gpuPerNode == myNode);
+      }
       for (int e = 0; e < config.numExpertPerToken; e++) {
-        int destPe = __shfl(lanePe, e);
-        bool isSentinelSlot = (destPe < 0);
-        int destNode = isSentinelSlot ? -1 : destPe / config.gpuPerNode;
+        int peOfE = __shfl(lanePe, e);
+        // Keep only the first expert slot for each destination PE.
+        bool dup = __any((laneId < e) && (peOfE == lanePe));
+        if (dup && laneId == e) laneValid = false;
+      }
 
-        // HSA-RCA Signature 1 guard: in Release builds NDEBUG strips the
-        // assert above, so an out-of-range expert id (e.g. EPLB physical id
-        // >= worldSize*numExpertPerRank, PR #254) yields destPe >= worldSize
-        // and an OOB GetAs/WarpCopy/atomicAdd -> HSA page fault. Treat any
-        // out-of-range destPe as a dropped token via the existing skip path.
-        bool peOutOfRange = (destPe < 0) || (destPe >= config.worldSize);
-        bool shouldSkip = peOutOfRange || isSentinelSlot || (destNode != myNode) ||
-                          __any((laneId < e) && (destPe == lanePe));
-        if (shouldSkip) {
-          if (!args.replayMode && laneId == 0)
-            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
-                NullFlatTokenIndex(config);
-          continue;
-        }
-        int destTokId = 0;
+      index_t laneDestTokId = 0;
+      if (laneId < config.numExpertPerToken) {
+        index_t* mapSlot =
+            args.interNodeDispDestTokIdMap + tokIdx * config.numExpertPerToken + laneId;
         if (!args.replayMode) {
-          if (laneId == 0) {
-            destTokId =
-                atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(destPe), 1);
-            assert(destTokId < config.MaxNumTokensToRecv() &&
+          if (laneValid) {
+            laneDestTokId =
+                atomicAdd(args.reg(args.offDispTokOffset)->template GetAs<index_t*>(lanePe), 1);
+            assert(laneDestTokId < config.MaxNumTokensToRecv() &&
                    "Total recv token overflow: increase maxTotalRecvTokens");
-            args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e] =
-                FlatTokenIndex(config, destPe, destTokId);
-            args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(destPe)[destTokId] =
+            *mapSlot = FlatTokenIndex(config, lanePe, laneDestTokId);
+            args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>(lanePe)[laneDestTokId] =
                 srcTokId;
+          } else {
+            *mapSlot = NullFlatTokenIndex(config);
           }
-          destTokId = __shfl(destTokId, 0);
-        } else {
-          // Replay: pull cached recv-side slot.
-          index_t flat = args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + e];
-          destTokId = LocalTokIdFromFlatTokenIndex(config, flat);
+        } else if (laneValid) {
+          laneDestTokId = LocalTokIdFromFlatTokenIndex(config, *mapSlot);
         }
-        if (!args.replayMode && (destPe % config.gpuPerNode) == laneId) localPeTokenCounter++;
+      }
+
+      // Per-destination-PE counter. It is owned by lane (destPe % gpuPerNode),
+      // not by the lane that took the slot, so this stays a loop.
+      if (!args.replayMode) {
+        for (int e = 0; e < config.numExpertPerToken; e++) {
+          if (!__shfl(static_cast<int>(laneValid), e)) continue;
+          if ((__shfl(lanePe, e) % config.gpuPerNode) == laneId) localPeTokenCounter++;
+        }
+      }
+
+      for (int e = 0; e < config.numExpertPerToken; e++) {
+        if (!__shfl(static_cast<int>(laneValid), e)) continue;
+        int destPe = __shfl(lanePe, e);
+        index_t destTokId = __shfl(laneDestTokId, e);
         core::WarpCopy<uint8_t, 4>(args.reg(args.offDispatchOut)->template GetAs<uint8_t*>(destPe) +
                                        destTokId * hiddenBytes,
                                    stagingPtr + tokIdx * xferBytes, hiddenBytes);
@@ -836,18 +848,33 @@ inline __device__ void DispatchSync(EpDispatchCombineArgs& args,
     }
   }
 
-  for (int i = globalWarpId; i < nNodes; i += globalWarpNum) {
-    // The send loops above target only remote nodes ((myNode + 1 + i) % nNodes),
-    // so the local node never has GDA traffic to drain. Skipping it is not just
-    // an optimisation: endpoints is world-indexed but RAIL only connects
-    // cross-node same-rail peers, so a local proxyPe's slot is zero-filled --
-    // and on a single node the mask collapses to NONE and endpoints is null.
-    // flush() indexes it without a reachability check, so quieting the local
-    // node faults. shmem's ShmemQuietThread tolerated the self peer, which is
-    // why the original loop covered every node.
-    if (i == myNode) continue;
-    int proxyPe = i * config.gpuPerNode + (myPe % config.gpuPerNode);
-    EpInterNodeQuiet(comm, proxyPe, config.numQpPerPe);
+  // Every QP any kernel of this op may send on (kConfig.numQpToDrain), not just
+  // the ones this dispatch used. The combine before it may have used more --
+  // the two phases choose their counts independently -- and nothing else polls
+  // a QP no dispatch uses. Leaving those unpolled is not incorrect (the send
+  // path polls for itself once the queue is full), but it turns into a stall
+  // inside a later combine instead of a cost paid here. Not the whole
+  // allocation either: flushing a QP that never carries traffic still costs a
+  // system fence, which measurably slows dispatch. Capped by the allocation:
+  // ccoGda takes the context id modulo it, so a qpId past it would only flush
+  // one of the same peer's lower QPs a second time.
+  //
+  // One (node, QP) pair per warp so different QPs drain concurrently, over the
+  // remote nodes only and numbered from warp 0. The send loops above target
+  // only remote nodes ((myNode + 1 + i) % nNodes), so the local node never has
+  // GDA traffic to drain. Skipping it is not just an optimisation: endpoints is
+  // world-indexed but RAIL only connects cross-node same-rail peers, so a local
+  // proxyPe's slot is zero-filled -- and on a single node the mask collapses to
+  // NONE and endpoints is null. flush() indexes it without a reachability
+  // check, so quieting the local node faults. Enumerating remote pairs directly
+  // also keeps the drains on the lowest warps rather than a later block.
+  constexpr int kDrainQps =
+      kConfig.numQpToDrain > kConfig.numQpPerPe ? kConfig.numQpToDrain : kConfig.numQpPerPe;
+  const int drainQps = min(kDrainQps, comm.ibgda.numQpPerPe);
+  for (int pair = globalWarpId; pair < (nNodes - 1) * drainQps; pair += globalWarpNum) {
+    int node = (myNode + 1 + pair / drainQps) % nNodes;
+    int proxyPe = node * config.gpuPerNode + (myPe % config.gpuPerNode);
+    EpInterNodeQuiet(comm, proxyPe, pair % drainQps);
   }
 }
 
@@ -951,21 +978,21 @@ inline __device__ void CombineSync(EpDispatchCombineArgs& args) {
 
 namespace combine_impl {
 
-// Gathering a token from its experts reads from up to numExpertPerToken peer
-// GPUs over xGMI, and peer-read *latency* -- not bandwidth -- is what caps it.
-// core::WarpAccum issues all AccumNum of those loads before accumulating any of
-// them so they overlap; moving 16B per lane instead of 4B puts 4x the bytes in
-// flight behind each outstanding read.
+// The LL gather uses 16-byte loads per lane. Gathering a token from its experts
+// can be limited by xGMI peer-read latency: core::WarpAccum issues AccumNum
+// loads before accumulating, and wider loads put more bytes in flight.
+// The ordinary path has a separate 4-byte load-first policy below.
 //
-// Two constraints come with it:
+// Alignment and slice sizing matter here:
 //   - Both ends must be 16B-aligned. A combine staging slot interleaves the
 //     hidden payload with the per-token weights, so its stride is only aligned
 //     for some topk/dtype combinations; CombineVecAligned() decides per launch
 //     and the caller falls back to the 4B path when it cannot.
-//   - The vector loop advances CombineVecStep() elements per iteration and drops
-//     to a per-lane scalar tail below that. A slice shorter than one step is
-//     *slower* than not vectorizing at all, so slices must be a whole multiple
-//     of it.
+//   - A partial vector step is handled by a per-lane scalar tail. LL slices are
+//     rounded to CombineVecStep() to avoid short scalar-only gathers. This is a
+//     performance choice; a tail does not make the gather incorrect.
+// CombineVecStep() controls how work is divided between warps for each token.
+// CombineGather() chooses the vector width from the alignment check.
 constexpr size_t kCombineVecBytes = 16;
 
 // How many vector steps of a token's hidden dimension go into one warp's slice.
@@ -998,6 +1025,28 @@ inline __device__ void CombineGather(TokT* dest, TokT** srcPtrs, int accumNum, s
   } else {
     core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
   }
+}
+
+template <EpInterNodeKernelCfg kConfig>
+__forceinline__ __device__ constexpr bool UseCombineLoadFirst() {
+  return kConfig.combineLoadFirst;
+}
+
+// Ordinary gather: load-first or plain, fixed at compile time per token bucket
+// by the tuning JSON's combine_load_first. The LL gather uses its separate path.
+template <EpInterNodeKernelCfg kConfig, typename TokT>
+__forceinline__ __device__ void CombineGatherNormal(TokT* dest, TokT** srcPtrs, int accumNum,
+                                                    size_t nelems, size_t tokHiddenBytes,
+                                                    size_t tokCombXferBytes) {
+  constexpr bool useLoadFirst = UseCombineLoadFirst<kConfig>();
+  if constexpr (useLoadFirst) {
+    // Arena bases are aligned; require aligned row and staging strides.
+    if ((tokHiddenBytes % 4 == 0) && (tokCombXferBytes % 4 == 0)) {
+      core::WarpAccumLF<TokT, 4, 2>(dest, srcPtrs, nullptr, accumNum, nelems);
+      return;
+    }
+  }
+  core::WarpAccum<TokT, 4>(dest, srcPtrs, nullptr, accumNum, nelems);
 }
 
 template <EpInterNodeKernelCfg kConfig, typename TokT, typename T>
@@ -1035,8 +1084,9 @@ __forceinline__ __device__ void CombineIntraNodeTyped(EpDispatchCombineArgs& arg
                                 destLocalTokId * config.numExpertPerToken;
       }
     }
-    core::WarpAccum<TokT, 4>(reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes),
-                             srcPtrs, nullptr, config.numExpertPerToken, hiddenDim);
+    CombineGatherNormal<kConfig, TokT>(
+        reinterpret_cast<TokT*>(stagingPtr + tokenId * tokCombXferBytes), srcPtrs,
+        config.numExpertPerToken, hiddenDim, tokHiddenBytes, tokCombXferBytes);
     if (args.weightsBuf) {
       core::WarpAccum<float, 4>(
           reinterpret_cast<float*>(stagingPtr + tokenId * tokCombXferBytes + tokHiddenBytes),
@@ -1188,9 +1238,9 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
                 args.interNodeDispDestTokIdMap[tokIdx * config.numExpertPerToken + laneId] = 0;
               }
 
-              core::WarpAccum<TokT, 4>(
-                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs, nullptr,
-                  config.numExpertPerToken, hiddenDim);
+              CombineGatherNormal<kConfig, TokT>(
+                  reinterpret_cast<TokT*>(stagingPtr + tokIdx * tokCombXferBytes), srcPtrs,
+                  config.numExpertPerToken, hiddenDim, tokHiddenBytes, tokCombXferBytes);
 
               if (args.weightsBuf) {
                 core::WarpAccum<float, 4>(
@@ -1200,12 +1250,17 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
               }
             }
 
+            // Join the producers before the leader's release publishes their stores.
+            ::mori::cco::ccoCoopWarp{}.sync();
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
             index_t finished = 0;
             if (laneId == 0)
               finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
             finished = __shfl(finished, 0);
             if ((finished + 1) >= (numRecvBlock * warpNum)) {
               if (laneId == 0) {
+                // Acquire all producers through the completion-counter RMW chain.
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
                 core::AtomicStoreSeqCstSystem(
                     args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum +
                         k,
@@ -1256,7 +1311,8 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t), 1, proxyPe, i);
+                             args.rank * sizeof(uint64_t),
+                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
       }
     }
     if (laneId == 0) args.interNodeBlocksBarrier[0] = 0;
@@ -1265,7 +1321,7 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
       }
     }
   }
@@ -1293,8 +1349,15 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
   int rdmaWarpNum = args.rdmaBlockNum * warpNum;
   for (int n = 0; n < (nNodes - 1); n++) {
     int node = (myNode + n + 1) % nNodes;
-    uint64_t nodeCount = nodeRecvTokenNum[node];
-    if (nodeCount > 0) nodeCount -= 1;
+    // Full chunk flags can arrive before the final node count. Zero means
+    // unpublished, whereas one is the completed empty-node sentinel.
+    uint64_t nodeCount = 0;
+    if (laneId == 0) {
+      do {
+        nodeCount = core::AtomicLoadRelaxedSystem(&nodeRecvTokenNum[node]);
+      } while (nodeCount == 0);
+    }
+    nodeCount = __shfl(nodeCount, 0) - 1;
     if (nodeCount == 0) continue;
 
     // One whole vector step per warp: the split never hands a warp less than one
@@ -1350,12 +1413,17 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
         }
       }
 
+      // Join the producers before the leader's release publishes their stores.
+      ::mori::cco::ccoCoopWarp{}.sync();
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
       index_t finished = 0;
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
       if ((finished + 1) >= (warpsPerToken * warpSize)) {
         if (laneId == 0) {
+          // Acquire all producers through the completion-counter RMW chain.
+          __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
           core::AtomicStoreSeqCstSystem(
               args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum + k,
               uint64_t{0});
@@ -1396,7 +1464,8 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       for (int i = 0; i < config.numQpPerPe; i++) {
         EpInterNodeAtomicAdd(comm, args.reg(args.offCrossDeviceBarrier),
-                             args.rank * sizeof(uint64_t), 1, proxyPe, i);
+                             args.rank * sizeof(uint64_t),
+                             CombineBarrierMarker(i, config.numQpPerPe), proxyPe, i);
       }
       __threadfence_system();
     }
@@ -1407,7 +1476,7 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
     if ((laneId < nNodes) && (laneId != myNode)) {
       int proxyPe = laneId * config.gpuPerNode + (myPe % config.gpuPerNode);
       while (core::AtomicLoadRelaxedSystem(localBarrierPtr + proxyPe) !=
-             (barrierFlag * config.numQpPerPe)) {
+             (barrierFlag * kCombineBarrierMarkerTotal)) {
       }
     }
   }
