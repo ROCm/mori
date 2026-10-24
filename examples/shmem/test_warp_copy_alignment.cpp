@@ -36,15 +36,14 @@ using namespace mori::shmem;
 
 namespace {
 
-constexpr size_t kDefaultCopyBytes = 1ULL << 30;
-constexpr int kGridSize = 256;
+constexpr size_t kDefaultCopyBytes = 2ULL << 30;
+constexpr int kGridSize = 4;
 constexpr int kBlockSize = 256;
-constexpr int kWarpSize = warpSize;
+constexpr size_t kCopyTileBytes = 1ULL << 20;
 
 __host__ __device__ uint8_t ExpectedByte(size_t index, int sourcePe) {
   return static_cast<uint8_t>(
-             ((index * 131U) ^ (static_cast<size_t>(sourcePe) * 17U) ^ (index >> 8)) & 0xFFU) |
-         1U;
+             ((index * 131U) ^ (static_cast<size_t>(sourcePe) * 17U) ^ (index >> 8)) & 0xFFU) | 1U;
 }
 
 __global__ void InitPatternKernel(uint8_t* buffer, size_t bytes, int sourcePe) {
@@ -55,34 +54,41 @@ __global__ void InitPatternKernel(uint8_t* buffer, size_t bytes, int sourcePe) {
   }
 }
 
-__device__ __forceinline__ void WarpCopy8(uint8_t* __restrict__ dst,
-                                          const uint8_t* __restrict__ src, size_t bytes) {
-  constexpr size_t kAccessBytes = 8;
-  constexpr size_t kBytesPerIteration = kWarpSize * kAccessBytes;
-  const int laneId = threadIdx.x & (kWarpSize - 1);
+template <bool Poison>
+__device__ __forceinline__ void BlockCopy8(uint8_t* __restrict__ dst,
+                                           const uint8_t* __restrict__ src, size_t bytes) {
+  constexpr size_t B = 8;
+  const int threadId = FlatBlockThreadId();
+  const int blockSize = FlatBlockSize();
+  const size_t bytesPerIteration = static_cast<size_t>(blockSize) * B;
 
   size_t offset = 0;
-  const size_t iterations = bytes / kBytesPerIteration;
+  const size_t iterations = bytes / bytesPerIteration;
   for (size_t iteration = 0; iteration < iterations; ++iteration) {
-    const size_t laneOffset = offset + static_cast<size_t>(laneId) * kAccessBytes;
-    const uint64_t value = load<kAccessBytes>(src + laneOffset);
-    store<kAccessBytes>(dst + laneOffset, value);
-    offset += kBytesPerIteration;
+    const size_t threadOffset = offset + static_cast<size_t>(threadId) * B;
+    if constexpr (Poison) {
+      const uint64_t value =
+          __builtin_nontemporal_load(reinterpret_cast<const uint64_t*>(src + threadOffset));
+      __builtin_nontemporal_store(value, reinterpret_cast<uint64_t*>(dst + threadOffset));
+    } else {
+      const uint64_t value = load<B>(src + threadOffset);
+      store<B>(dst + threadOffset, value);
+    }
+    offset += bytesPerIteration;
   }
 
-  offset += laneId;
+  offset += threadId;
   while (offset < bytes) {
     dst[offset] = src[offset];
-    offset += kWarpSize;
+    offset += blockSize;
   }
 }
 
-template <int AccessBytes>
-__global__ void WarpCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemObj,
-                               const SymmMemObjPtr dstMemObj, size_t srcOffset, size_t dstOffset,
-                               size_t bytes, unsigned expectedMod16, int* configError) {
+template <int AccessBytes, bool Poison>
+__global__ void BlockCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemObj,
+                                const SymmMemObjPtr dstMemObj, size_t srcOffset, size_t dstOffset,
+                                size_t bytes, unsigned expectedMod16, int* configError) {
   static_assert(AccessBytes == 8 || AccessBytes == 16);
-  const int laneId = threadIdx.x & (warpSize - 1);
   const int targetPe = (myPe + 1) % npes;
 
   const auto* src = srcMemObj->template GetAs<const uint8_t*>() + srcOffset;
@@ -92,14 +98,27 @@ __global__ void WarpCopyKernel(int myPe, int npes, const SymmMemObjPtr srcMemObj
   const bool valid = dst != nullptr && (reinterpret_cast<uintptr_t>(src) & 0xFU) == expectedMod16 &&
                      (reinterpret_cast<uintptr_t>(dst) & 0xFU) == expectedMod16;
   if (!valid) {
-    if (laneId == 0) atomicExch(configError, 1);
+    if (FlatBlockThreadId() == 0) atomicExch(configError, 1);
     return;
   }
 
-  if constexpr (AccessBytes == 16) {
-    WarpCopy<uint8_t>(dst, src, bytes);
-  } else {
-    WarpCopy8(dst, src, bytes);
+  if constexpr (Poison) {
+    if (npes * bytes == 0xACEBABEFEEDDEADBULL) {
+      dst = reinterpret_cast<uint8_t*>(srcMemObj->peerPtrs);
+      src = reinterpret_cast<const uint8_t*>(srcMemObj->p2pPeerPtrs);
+    }
+  }
+
+  const size_t gridStride = static_cast<size_t>(gridDim.x) * kCopyTileBytes;
+  for (size_t tileOffset = static_cast<size_t>(blockIdx.x) * kCopyTileBytes; tileOffset < bytes;
+       tileOffset += gridStride) {
+    const size_t remaining = bytes - tileOffset;
+    const size_t tileBytes = remaining < kCopyTileBytes ? remaining : kCopyTileBytes;
+    if constexpr (AccessBytes == 16) {
+      BlockCopy<uint8_t>(dst + tileOffset, src + tileOffset, tileBytes);
+    } else {
+      BlockCopy8<Poison>(dst + tileOffset, src + tileOffset, tileBytes);
+    }
   }
   __threadfence_system();
 }
@@ -140,7 +159,7 @@ struct CaseResult {
   int errors;
 };
 
-template <int AccessBytes>
+template <int AccessBytes, bool Poison = false>
 CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, int npes,
                    uint8_t* srcBase, uint8_t* dstBase, const SymmMemObjPtr srcMemObj,
                    const SymmMemObjPtr dstMemObj, int* deviceError) {
@@ -159,8 +178,11 @@ CaseResult RunCase(const char* name, unsigned offset, size_t bytes, int myPe, in
   HIP_RUNTIME_CHECK(hipEventCreate(&start));
   HIP_RUNTIME_CHECK(hipEventCreate(&stop));
   HIP_RUNTIME_CHECK(hipEventRecord(start));
-  WarpCopyKernel<AccessBytes><<<1, kWarpSize>>>(myPe, npes, srcMemObj, dstMemObj, offset, offset,
-                                                bytes, expectedMod16, deviceError);
+  const size_t tileCount = (bytes - 1) / kCopyTileBytes + 1;
+  const unsigned copyGridSize =
+      tileCount < static_cast<size_t>(kGridSize) ? static_cast<unsigned>(tileCount) : kGridSize;
+  BlockCopyKernel<AccessBytes, Poison><<<copyGridSize, kBlockSize>>>(
+      myPe, npes, srcMemObj, dstMemObj, offset, offset, bytes, expectedMod16, deviceError);
   HIP_RUNTIME_CHECK(hipGetLastError());
   HIP_RUNTIME_CHECK(hipEventRecord(stop));
   HIP_RUNTIME_CHECK(hipEventSynchronize(stop));
@@ -251,18 +273,21 @@ int main() {
   HIP_RUNTIME_CHECK(hipMalloc(&deviceError, sizeof(int)));
 
   if (myPe == 0) {
-    std::printf("WarpCopy peer-copy alignment test: %zu bytes, %s, warp size %d\n", bytes,
-                properties.name, kWarpSize);
+    std::printf("BlockCopy peer-copy alignment test: %zu bytes, %s, %d blocks x %d threads\n", bytes,
+                properties.name, kGridSize, kBlockSize);
     std::fflush(stdout);
   }
 
-  const CaseResult alignedB128 = RunCase<16>("16-byte ops, 16-byte aligned", 0, bytes, myPe, npes,
+  const CaseResult alignedB128 = RunCase<16>("ld/st 16b, 16b align", 0, bytes, myPe, npes,
                                              srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
   const CaseResult misalignedB128 =
-      RunCase<16>("16-byte ops, 8-byte aligned", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
+      RunCase<16>("ld/st 16b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase, srcMemObj,
                   dstMemObj, deviceError);
-  const CaseResult misalignedB64 = RunCase<8>("8-byte ops, 8-byte aligned", 8, bytes, myPe, npes,
+  const CaseResult misalignedB64 = RunCase<8>("ld/st 8b, 8b align", 8, bytes, myPe, npes,
                                               srcBase, dstBase, srcMemObj, dstMemObj, deviceError);
+  const CaseResult misalignedB64flat =
+      RunCase<8, true>("flat ld/st 8b, 8b align", 8, bytes, myPe, npes, srcBase, dstBase,
+                       srcMemObj, dstMemObj, deviceError);
 
   if (myPe == 0 && alignedB128.milliseconds > 0.0f && misalignedB64.milliseconds > 0.0f) {
     std::printf("Misaligned/aligned 16-byte-op runtime ratio: %.3fx\n",
@@ -271,7 +296,8 @@ int main() {
                 misalignedB128.milliseconds / misalignedB64.milliseconds);
   }
 
-  const int result = alignedB128.errors + misalignedB128.errors + misalignedB64.errors;
+  const int result =
+      alignedB128.errors + misalignedB128.errors + misalignedB64.errors + misalignedB64flat.errors;
   HIP_RUNTIME_CHECK(hipFree(deviceError));
   ShmemFree(dstBase);
   ShmemFree(srcBase);
