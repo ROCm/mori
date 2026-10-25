@@ -1,0 +1,164 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+// ===========================================================================
+// all_gather_kernels.hpp
+//
+// SDMA-based "push" all-gather. All-gather is the mirror of reduce-scatter's
+// scatter step with NO reduction: each PE pushes its single local shard into
+// every peer's output[myPe] slot -- including itself (SDMA self-copy). Since
+// there is no GPU compute to overlap, this uses a single block and logS=0
+// (S=1, one slice, one completion flag), reusing the generalized fused SDMA
+// scatter (StartSdmaScatter, byte-based) from collectives_common.hpp.
+// ===========================================================================
+#pragma once
+
+#include <cstdint>
+#include "mori/collective/XLA/collectives_common.hpp"
+
+namespace mori {
+namespace collective {
+
+// Single-block, compute-free all-gather.
+//   input  : raw symmetric-heap pointer, my shard of chunkBytes bytes
+//   output : raw symmetric-heap pointer, npes*chunkBytes bytes (all shards)
+//
+// Phase 1: SDMA scatters my shard into every peer's output[myPe] slot (self
+// included), each copy trailed by an ADD64 of 1 into the receiver's
+// signalPtrs[0] counter. Phase 2: thread 0 waits until the counter reaches npes
+// (self-copy included), then an acquire fence makes the peer SDMA writes to
+// output visible. No Phase 3 -- output is already fully written by SDMA. Finally
+// thread 0 resets the counter for the next launch.
+//
+// blockDim.x must be >= npes for block 0's fast-path packet build; launch with
+// npes <= 8 (SDMA fast path) and a comfortable blockDim (256).
+__global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__ input,
+                                    void* __restrict__ output, size_t chunkBytes,
+                                    cco::ccoDevComm devComm,
+                                    cco::ccoWindow_t heapWin,
+                                    uint64_t* __restrict__ barrierCtr) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // A peer finishing its previous launch only proves our shard reached it.
+  // Publish entry globally, then let each peer's SDMA queue wait independently
+  // before writing that peer's output / signalBuf[0].
+  __shared__ uint64_t scatterGen;
+  if (threadIdx.x < warpSize) {
+    // Every lane reads my slot before lane myPe overwrites it (same wave).
+    const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
+    const uint64_t next = gen + 2;
+    if (threadIdx.x == 0) scatterGen = next;
+    PublishGen(barrierCtr, next, myPe, npes, stride4G);
+  }
+  __syncthreads();
+
+  // Single block: push my shard to every peer's output[myPe] slot (+ self). The
+  // destination slot is myPe for every peer, so my local output[myPe] pointer
+  // maps to peer p's copy by the flat-VA rank delta (pe - myPe)*stride4G<<32 --
+  // the same inline LSA addressing the reduce-scatter/all-reduce push kernels
+  // use. winBase cancels out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr
+  // round trip and keeps no "output at heap offset 0" assumption. The source is
+  // our single shard (same for all peers).
+  uint8_t* const localDst = reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(myPe) * chunkBytes;
+  StartSdmaScatter(
+      devComm.sdma, npes, /*logS=*/0, [=](int) { return chunkBytes; },
+      [](int) { return true; },
+      [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(input); },
+      [=](int peer) -> uint8_t* {
+        int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+        return localDst + (static_cast<uint64_t>(diff) << 32);
+      },
+      barrierCtr, static_cast<uint32_t>(scatterGen));
+
+  uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
+
+  // === Phase 2: wait until the counter reaches all npes senders. ===============
+  if (threadIdx.x == 0) {
+    const uint32_t want = static_cast<uint32_t>(npes);  // self-copy included
+    // 32-bit ADD into the low dword -> poll 32 bits of the single counter.
+    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
+    while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  __syncthreads();
+  // System-scope ACQUIRE: output was written by peers' SDMA over XGMI, so
+  // invalidate against another device's writes before any reader trusts output.
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+
+  // No Phase 3: output already fully written by SDMA. Reset the counter for reuse.
+  // SYSTEM scope (sc0 sc1: write-through past L2) because peers ADD into this slot
+  // by SDMA straight into HBM -- a plain store would leave a dirty line that could
+  // evict on top of a later ADD and swallow it. That is also why no release fence
+  // follows: there is nothing left in L2 to write back.
+  //
+  // Clearing at kernel END is safe without a host barrier: a peer's NEXT launch
+  // only ADDs here after its queue poll sees our next entry generation, which we
+  // publish only after this kernel has retired.
+  if (threadIdx.x == 0) {
+    AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
+  }
+}
+
+// Multi-block, SDMA-free all-gather: every PE reads each peer's shard straight
+// out of the peer's `input` over XGMI and stores it into its own output[peer].
+//   input  : raw symmetric-heap pointer, my shard of chunkBytes bytes
+//   output : local pointer, npes*chunkBytes bytes (all shards)
+//   chunkBytes    : bytes per shard.
+//   groupCounters : plain device buffer, [kArrivalIdx] elects the last block.
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
+//                   collective (see GenBarrier).
+//   NPES          : compile-time peer count (see PullCopyInterleaved).
+//
+// Peer-interleaved: the copy spreads its in-flight loads across all NPES peers at
+// once (PullCopyInterleaved) so NPES XGMI read links run concurrently instead of
+// one peer at a time. Two GenBarrier rounds: entry (gen+1) so no block reads a
+// peer's input before that peer entered this launch, and exit (gen+2) by the last
+// block so "kernel done" means "input reusable". The self shard is just peer myPe
+// (a local copy), so there is no in-place skip -- an in-place gather would
+// redundantly self-copy output[myPe], which is harmless.
+template <int NPES>
+__global__ void __launch_bounds__(256, 1)
+AllGatherPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
+                     const void* __restrict__ input, void* __restrict__ output,
+                     size_t chunkBytes, uint32_t* __restrict__ groupCounters,
+                     uint64_t* __restrict__ arrived) {
+  const uint32_t stride4G = heapWin->stride4G;
+  // In block 0's first wave every lane loads this before lane myPe posts.
+  const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
+  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, npes, stride4G);
+  __syncthreads();
+
+  const auto* in = static_cast<const uint8_t*>(input);
+  auto* out = static_cast<uint8_t*>(output);
+  // System scope: the caller may hand output to a remote reader after the kernel.
+  PullCopyInterleaved<NPES>(
+      chunkBytes, [=](int j) { return PeerPtr(in, j, myPe, stride4G); },
+      [=](int j) { return out + static_cast<size_t>(j) * chunkBytes; });
+
+  // A block counts in only once all its waves are done reading peer inputs.
+  __syncthreads();
+  if (threadIdx.x < warpSize) {
+    if (LastBlockOut(groupCounters)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
+  }
+}
+} // namespace collective
+} // namespace mori
