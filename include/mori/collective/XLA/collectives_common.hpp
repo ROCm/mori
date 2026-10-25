@@ -46,8 +46,6 @@ static_assert(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC)
 static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopyAtomicPktSize == 0,
               "SDMA ring must be a multiple of the 64B fused packet");
 #endif
-static constexpr size_t kSDMAQueueUnit = sizeof(SDMA_PKT_ATOMIC);
-static_assert(kSDMAQueueUnit == 32, "collective ring writers require 32B SDMA units");
 
 static constexpr int kRSPushMaxPeers = 16;
 static constexpr int kRSPushMaxSlices = 8;
@@ -177,23 +175,11 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 
 #define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane((x))
 
-// Return the independently wrapped address for one 16B cooperative ring store.
-// The shared CCO queue advances in 32B units, so a 64B logical slot may begin at
-// ring_end-32 after a generic CCO operation. Wrapping every b128 store keeps
-// each physical 32B SDMA packet intact in that case and also handles a logical
-// 128B poll+copy reservation crossing the ring end.
-__device__ __forceinline__ uint32_t* SdmaRingStorePtr(uint32_t* queueBuf, uint64_t at) {
-  constexpr uint64_t ringDwords = cco::CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
-  static_assert((ringDwords & (ringDwords - 1)) == 0,
-                "SDMA ring must be a power of two");
-  return queueBuf + ((at / sizeof(uint32_t)) & (ringDwords - 1));
-}
-
 // Fused 64B packet: [NOP][COPY_LINEAR src->dst][ATOMIC ADD64(addValue) into *signal].
 // Lane k writes dwords [4k, 4k+4): lane 2 carries SRC_DATA_LO, lane 3 SRC_DATA_HI.
 __device__ __forceinline__ void WriteFusedPacket(int lane, 
      const void* srcBuf, const void* dstBuf, size_t packetSize, HSAuint64* signal,
-     uint64_t addValue, uint32_t* queueBuf, uint64_t pktBase) {
+     uint64_t addValue, uint32_t* outBasePtr) {
   
   uint32_t dw[4];
   // if (lane == 0) {
@@ -243,7 +229,7 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
     dw[3] = (uint32_t)((uintptr_t)dstBuf >> 32) & mask;
   }
   const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
-  StreamStore<EAgentScope, 16>(SdmaRingStorePtr(queueBuf, pktBase + lane * 16), v);
+  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
 } 
 
 // SDMA re-reads the flag every `interval` clocks while parked on a POLL_REGMEM.
@@ -258,7 +244,7 @@ static_assert(sizeof(SDMA_PKT_POLL_REGMEM) == 6 * sizeof(uint32_t),
 // engine stalls this queue until *flag == value; retry_count 0xfff = forever.
 // Four consecutive lanes each write one b128, like WriteFusedPacket.
 __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, uint32_t value,
-                                                uint32_t* queueBuf, uint64_t pktBase) {
+                                                uint32_t* outBasePtr) {
   uint32_t dw[4] = {0, 0, 0, 0};
   if (lane == 0) {
     decltype(SDMA_PKT_POLL_REGMEM::HEADER_UNION) hdr;
@@ -279,7 +265,7 @@ __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, 
     dw[1] = d5.DW_5_DATA;
   }
   const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
-  StreamStore<EAgentScope, 16>(SdmaRingStorePtr(queueBuf, pktBase + lane * 16), v);
+  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
 }
 
 // Broadcast `v` from `srcLane` of this wave. ds_bpermute is lane-addressed;
@@ -324,9 +310,10 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   // lane per distinct queue). Claim-then-wait like cco ReserveSlot: fetch_add
   // first, then poll rptr if occupancy exceeds the ring.
   //
-  // Reservations are multiples of kSDMACopyAtomicPktSize and the ring is a
-  // multiple of that, so a multi-packet reservation may span the wrap but no
-  // single 64B packet straddles it: wrap each packet's offset separately.
+  // These collective queues contain only 64B slots: both the initial write
+  // pointer and every reservation are kSDMACopyAtomicPktSize-aligned. The ring
+  // is a multiple of that size, so a multi-packet reservation may span the wrap
+  // but no single 64B packet straddles it; wrap each packet independently.
   //
   // cachedHwReadIndex is by-value. The caller snapshots the handle once and
   // reuses it across packets so a refreshed rptr stays in the local copy;
@@ -338,6 +325,11 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
         __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
     const uint64_t end = base + size_in_bytes;
+    if constexpr (cco::CCO_SDMA_BREAK_ON_RETRIES) {
+      if ((base % kSDMACopyAtomicPktSize) != 0 ||
+          (size_in_bytes % kSDMACopyAtomicPktSize) != 0)
+        __builtin_trap();
+    }
     if (end - cachedHwReadIndex > q_size) {
       int64_t retries = 0;
       do {
@@ -463,12 +455,15 @@ __device__ __forceinline__ void StartSdmaScatter(
         auto* signal = sdma.peerSignalPtrs[peer] + kSliceSignalSlot;
         uint64_t copyBase = pktBase;
         if (gated) {
-          WritePollPacket(sub, reinterpret_cast<const uint32_t*>(&ready[peer]), readyValue,
-                          queueBuf, pktBase);
+          WritePollPacket(
+              sub, reinterpret_cast<const uint32_t*>(&ready[peer]), readyValue,
+              queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
           copyBase += kSDMACopyAtomicPktSize;
         }
+        const uint64_t ringDw =
+            SdmaCollectiveHandle::WrapIntoRing(copyBase) / sizeof(uint32_t);
         WriteFusedPacket(sub, srcp, dstp, sz, signal, SliceSignalInc(s),
-                         queueBuf, copyBase);
+                         queueBuf + ringDw);
       }
 
       cco::ccoSdmaPublishStores();
@@ -494,9 +489,11 @@ __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf,
                                                     const void* src, const void* dst, size_t bytes,
                                                     HSAuint64* signal, uint64_t addValue,
                                                     const uint32_t* flag, uint32_t value) {
-  WritePollPacket(sub, flag, value, queueBuf, pktBase);
-  WriteFusedPacket(sub, src, dst, bytes, signal, addValue, queueBuf,
-                   pktBase + kSDMACopyAtomicPktSize);
+  WritePollPacket(sub, flag, value,
+                  queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
+  WriteFusedPacket(sub, src, dst, bytes, signal, addValue,
+                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopyAtomicPktSize) /
+                                  sizeof(uint32_t));
 }
 
 // Per peer queue 0: one reservation of nSlots*64B, filled by
