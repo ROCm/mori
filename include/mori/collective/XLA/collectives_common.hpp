@@ -46,6 +46,8 @@ static_assert(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC)
 static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopyAtomicPktSize == 0,
               "SDMA ring must be a multiple of the 64B fused packet");
 #endif
+static constexpr size_t kSDMAQueueUnit = sizeof(SDMA_PKT_ATOMIC);
+static_assert(kSDMAQueueUnit == 32, "collective ring writers require 32B SDMA units");
 
 static constexpr int kRSPushMaxPeers = 16;
 static constexpr int kRSPushMaxSlices = 8;
@@ -175,11 +177,23 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 
 #define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane((x))
 
+// Return the independently wrapped address for one 16B cooperative ring store.
+// The shared CCO queue advances in 32B units, so a 64B logical slot may begin at
+// ring_end-32 after a generic CCO operation. Wrapping every b128 store keeps
+// each physical 32B SDMA packet intact in that case and also handles a logical
+// 128B poll+copy reservation crossing the ring end.
+__device__ __forceinline__ uint32_t* SdmaRingStorePtr(uint32_t* queueBuf, uint64_t at) {
+  constexpr uint64_t ringDwords = cco::CCO_SDMA_QUEUE_SIZE / sizeof(uint32_t);
+  static_assert((ringDwords & (ringDwords - 1)) == 0,
+                "SDMA ring must be a power of two");
+  return queueBuf + ((at / sizeof(uint32_t)) & (ringDwords - 1));
+}
+
 // Fused 64B packet: [NOP][COPY_LINEAR src->dst][ATOMIC ADD64(addValue) into *signal].
 // Lane k writes dwords [4k, 4k+4): lane 2 carries SRC_DATA_LO, lane 3 SRC_DATA_HI.
 __device__ __forceinline__ void WriteFusedPacket(int lane, 
      const void* srcBuf, const void* dstBuf, size_t packetSize, HSAuint64* signal,
-     uint64_t addValue, uint32_t* outBasePtr) {
+     uint64_t addValue, uint32_t* queueBuf, uint64_t pktBase) {
   
   uint32_t dw[4];
   // if (lane == 0) {
@@ -229,7 +243,7 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
     dw[3] = (uint32_t)((uintptr_t)dstBuf >> 32) & mask;
   }
   const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
-  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
+  StreamStore<EAgentScope, 16>(SdmaRingStorePtr(queueBuf, pktBase + lane * 16), v);
 } 
 
 // SDMA re-reads the flag every `interval` clocks while parked on a POLL_REGMEM.
@@ -244,7 +258,7 @@ static_assert(sizeof(SDMA_PKT_POLL_REGMEM) == 6 * sizeof(uint32_t),
 // engine stalls this queue until *flag == value; retry_count 0xfff = forever.
 // Four consecutive lanes each write one b128, like WriteFusedPacket.
 __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, uint32_t value,
-                                                uint32_t* outBasePtr) {
+                                                uint32_t* queueBuf, uint64_t pktBase) {
   uint32_t dw[4] = {0, 0, 0, 0};
   if (lane == 0) {
     decltype(SDMA_PKT_POLL_REGMEM::HEADER_UNION) hdr;
@@ -265,7 +279,7 @@ __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, 
     dw[1] = d5.DW_5_DATA;
   }
   const cco::ccoUint4 v = {dw[0], dw[1], dw[2], dw[3]};
-  StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
+  StreamStore<EAgentScope, 16>(SdmaRingStorePtr(queueBuf, pktBase + lane * 16), v);
 }
 
 // Broadcast `v` from `srcLane` of this wave. ds_bpermute is lane-addressed;
@@ -355,6 +369,12 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // Occupancy (rptr) stays; the local cachedHwReadIndex is reused across s and
 // written back once if it moved.
 //
+// When `ready` is non-null, the first reservation for each peer is 128B:
+// [POLL_REGMEM ready[peer] == readyValue][copy+atomic for slice 0]. The SDMA
+// queue, rather than the issuing CU, waits for that peer to enter the launch.
+// Distinct peer queues therefore start independently as their destinations
+// become reusable; later slices follow slice 0 in queue order and need no poll.
+//
 // Each shard is split into S = 1<<logS slices. Slice s is an SDMA copy from
 // srcOf(peer) into dstOf(peer), followed by an ADD64(1 << 8s) into byte s of
 // peer's packed completion counter signalPtrs[kSliceSignalSlot] (S=1 adds 1).
@@ -392,7 +412,8 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 template <uint64_t ElemBytes = 1, class SizeFn, class ActiveFn, class SrcFn, class DstFn>
 __device__ __forceinline__ void StartSdmaScatter(
     cco::ccoSdmaContext sdma, int npes, int logS, SizeFn sizeOf,
-    ActiveFn activeOf, SrcFn srcOf, DstFn dstOf) {
+    ActiveFn activeOf, SrcFn srcOf, DstFn dstOf,
+    const uint64_t* ready = nullptr, uint32_t readyValue = 0) {
 
   static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
                 "ElemBytes must divide VecBytes");
@@ -426,9 +447,12 @@ __device__ __forceinline__ void StartSdmaScatter(
     queueBuf = BroadcastWarp(queueBuf, leader);
 
     for (int s = 0; s < S; s++) {
+      const bool gated = ready != nullptr && s == 0;
+      const uint64_t reservationBytes =
+          gated ? 2 * kSDMACopyAtomicPktSize : kSDMACopyAtomicPktSize;
       uint64_t pktBase = 0;
       if (active && sub == 0) {
-        pktBase = handle.ReserveSingleProducer(kSDMACopyAtomicPktSize);
+        pktBase = handle.ReserveSingleProducer(reservationBytes);
       }
       pktBase = BroadcastWarp(pktBase, leader);
 
@@ -437,17 +461,21 @@ __device__ __forceinline__ void StartSdmaScatter(
         auto* dstp = dstOf(peer) + s * sliceBytes;
         const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
         auto* signal = sdma.peerSignalPtrs[peer] + kSliceSignalSlot;
-        const uint64_t ringDw =
-            SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t);
+        uint64_t copyBase = pktBase;
+        if (gated) {
+          WritePollPacket(sub, reinterpret_cast<const uint32_t*>(&ready[peer]), readyValue,
+                          queueBuf, pktBase);
+          copyBase += kSDMACopyAtomicPktSize;
+        }
         WriteFusedPacket(sub, srcp, dstp, sz, signal, SliceSignalInc(s),
-                         queueBuf + ringDw);
+                         queueBuf, copyBase);
       }
 
       cco::ccoSdmaPublishStores();
       __builtin_amdgcn_wave_barrier();
 
       if (active && sub == 0) {
-        handle.submitPacket(pktBase, pktBase + kSDMACopyAtomicPktSize);
+        handle.submitPacket(pktBase, pktBase + reservationBytes);
       }
     }
 
@@ -466,11 +494,9 @@ __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf,
                                                     const void* src, const void* dst, size_t bytes,
                                                     HSAuint64* signal, uint64_t addValue,
                                                     const uint32_t* flag, uint32_t value) {
-  WritePollPacket(sub, flag, value,
-                  queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
-  WriteFusedPacket(sub, src, dst, bytes, signal, addValue,
-                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopyAtomicPktSize) /
-                                  sizeof(uint32_t));
+  WritePollPacket(sub, flag, value, queueBuf, pktBase);
+  WriteFusedPacket(sub, src, dst, bytes, signal, addValue, queueBuf,
+                   pktBase + kSDMACopyAtomicPktSize);
 }
 
 // Per peer queue 0: one reservation of nSlots*64B, filled by
@@ -525,7 +551,7 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
 }
 
 // ---------------------------------------------------------------------------
-// Generation barrier shared by every push and pull collective.
+// Generation protocol shared by every push and pull collective.
 //
 // The array is a symmetric-heap uint64[npes] (barrierCtr; zeroed once at facade
 // creation, never reset). Slot p of every PE's copy is written only by PE p, so
@@ -535,17 +561,42 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
 // gen+1 at entry and gen+2 at exit -- so as long as every PE issues the same
 // sequence of collectives, every PE posts the same value in every round.
 //
-// Arriving posts the value into slot myPe of every PE's copy (plain one-way
-// stores, no remote RMW), then waits on local loads only, until every slot of my
-// copy has reached it. Lane p posts to and polls for PE p, so one load + wave
-// vote checks every slot. `>=` tolerates a fast peer that already posted a
-// later round.
+// A full GenBarrier posts the value into slot myPe of every PE's copy (plain
+// one-way stores, no remote RMW), then waits on local loads until every slot of
+// my copy has reached it. Push kernels instead call PublishGen and put a
+// POLL_REGMEM for slot p directly on peer p's SDMA queue.
 //
 // A peer that has arrived has entered this launch, so its previous kernel on its
 // stream has retired: it no longer reads the staging / recv slots we are about
 // to overwrite, and its end-of-kernel signalBuf resets have landed, so our ADDs
 // cannot be erased.
 // ---------------------------------------------------------------------------
+
+// Publish one generation without waiting for the other PEs. Push collectives
+// use this before queuing one POLL_REGMEM per destination: ready peer queues can
+// start immediately while late peers remain parked in their own queues.
+//
+// This must be executed by one full wave. Every lane publishes this PE's slot
+// into one destination PE's copy of the symmetric array. The release preserves
+// the GenBarrier entry invariant: observing the generation means this PE's
+// previous stream work, including completion-counter resets, has retired.
+//
+// POLL_REGMEM compares only the low 32 bits for equality. It cannot miss the
+// value: a peer cannot finish this push and publish its next generation until
+// every current sender's completion atomic has landed, which means each sender's
+// poll for this generation has already passed.
+__device__ __forceinline__ void PublishGen(uint64_t* arrived, uint64_t value, int myPe,
+                                           int npes, int32_t stride4G) {
+  const int lane = __lane_id();
+  const bool active = lane < npes;
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+  if (active) {
+    const int32_t diff = (lane - myPe) * stride4G;
+    auto* dst = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&arrived[myPe]) +
+                                           (static_cast<uint64_t>(diff) << 32));
+    AtomicStore<ESystemScope>(dst, value);
+  }
+}
 
 // One barrier round on a symmetric uint64[npes] `arrived` array: post `value`
 // into slot myPe of every PE's copy, then wait (local loads only) until every
