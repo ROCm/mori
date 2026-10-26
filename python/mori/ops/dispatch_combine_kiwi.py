@@ -65,6 +65,15 @@ def _load_ext():
     return _ext
 
 
+def is_available():
+    """Whether this mori build includes the KIWI EP kernels (BUILD_OPS_KIWI=ON)."""
+    try:
+        _load_ext()
+    except ImportError:
+        return False
+    return True
+
+
 @dataclass
 class EpDispatchCombineKiwiConfig:
     """Same fields as ``mori.ops.EpDispatchCombineConfig``.
@@ -490,4 +499,4 @@ class EpDispatchCombineKiwiOp:
             raise ValueError(f"{name} must be contiguous")
 
 
-__all__ = ["EpDispatchCombineKiwiConfig", "EpDispatchCombineKiwiOp"]
+__all__ = ["EpDispatchCombineKiwiConfig", "EpDispatchCombineKiwiOp", "is_available"]
