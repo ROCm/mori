@@ -2840,6 +2840,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
 
     switch (outcome) {
       case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS:
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT:
         (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
         continue;
       case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED:
@@ -5213,6 +5214,22 @@ void PoolClient::PublishComponentMetrics() {
            MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
            MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
+    // Zero-seeded so rate() sees a medium's first move.
+    std::map<std::string, uint64_t> move_reads = tiers.read_bytes;
+    std::map<std::string, uint64_t> move_writes = tiers.write_bytes;
+    for (MediumBackend* backend : registry_.All()) {
+      if (backend == nullptr) continue;
+      move_reads.emplace(TierTypeName(backend->Tier()), 0);
+      move_writes.emplace(TierTypeName(backend->Tier()), 0);
+    }
+    for (const auto& [medium, bytes] : move_reads) {
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES,
+             MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES_HELP, {{"medium", medium}}, bytes);
+    }
+    for (const auto& [medium, bytes] : move_writes) {
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES,
+             MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES_HELP, {{"medium", medium}}, bytes);
+    }
 
     for (const auto& [tier, hits] : default_pool_->TierReadHits()) {
       sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,

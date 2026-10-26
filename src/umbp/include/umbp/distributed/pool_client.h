@@ -73,6 +73,8 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
       return "FAILED";
     case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE:
       return "NO_SPACE";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT:
+      return "IN_FLIGHT";
     default:
       return "UNKNOWN";
   }

@@ -186,7 +186,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
         return grpc::Status::OK;
       case AllocateOutcome::kFailed:
-        response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+        response->set_outcome(pool_result.in_flight ? ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT
+                                                    : ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
         return grpc::Status::OK;
       case AllocateOutcome::kFailedNoSpace:
         response->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE);
@@ -303,7 +304,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
           continue;
         case AllocateOutcome::kFailed:
-          out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
+          out->set_outcome(results[i].in_flight ? ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT
+                                                : ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED);
           continue;
         case AllocateOutcome::kFailedNoSpace:
           out->set_outcome(::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE);

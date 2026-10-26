@@ -326,8 +326,8 @@ struct PoolClientConfig {
   // Local eviction watermarks for DRAM/HBM (SSD has its own pair).  Unless
   // eviction_mode is kMaster, a tiered policy's per-tier pair takes
   // precedence.  From UMBPDramConfig.
-  double local_evict_high_watermark = 0.9;
-  double local_evict_low_watermark = 0.7;
+  double local_evict_high_watermark = 0.95;
+  double local_evict_low_watermark = 0.9;
 
   // How this node evicts when it has a master (env UMBP_EVICTION_MODE =
   // local | master_ranked | master).  Without a master it always evicts
@@ -391,8 +391,8 @@ struct PoolClientConfig {
 // after Init (backend-agnostic refactor Phase 2).
 inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
                                            DramOwnershipConfig dram, PeerSsdConfig ssd = {},
-                                           double dram_high_watermark = 0.9,
-                                           double dram_low_watermark = 0.7) {
+                                           double dram_high_watermark = 0.95,
+                                           double dram_low_watermark = 0.9) {
   PoolClientConfig pc;
   pc.master_config = dc.master_config;
   pc.io_engine = dc.io_engine;

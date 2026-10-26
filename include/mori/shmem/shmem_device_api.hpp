@@ -35,6 +35,10 @@
 namespace mori {
 namespace shmem {
 
+inline __device__ bool IsSdmaPeer(int destPe) {
+  return GetGlobalGpuStatesPtr()->transportTypes[destPe] == application::TransportType::SDMA;
+}
+
 #ifdef MORI_PROXY_ENABLED
 #define _PROXY_ELSE(func, ...)                                   \
   else if (transportType == application::TransportType::PROXY) { \

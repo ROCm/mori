@@ -323,6 +323,15 @@ TEST_F(InstrumentedBackendMetrics, MetricsAreGenericOverBackends) {
   EXPECT_DOUBLE_EQ(Bytes("evict"), 2048.0);
 }
 
+TEST_F(InstrumentedBackendMetrics, RangedResolveCountsTheSliceNotTheObject) {
+  PutKey("k", 8192);
+  const std::vector<ObjectExtent> slices = {{1024, 512}};
+  backend_->BatchResolve({"k"}, false, false, ResolveReader::kLocal, &slices);
+  backend_->BatchResolve({"k"}, false);
+  Publish();
+  EXPECT_DOUBLE_EQ(Bytes("resolve"), 512.0 + 8192.0);
+}
+
 TEST_F(InstrumentedBackendMetrics, LabelsCarryTheMediumSoOnePanelShowsThemAll) {
   // The medium must appear as a LABEL VALUE and never inside a metric name —
   // that is what lets one panel render every backend.
