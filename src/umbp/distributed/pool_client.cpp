@@ -45,6 +45,7 @@
 #include <unordered_set>
 
 #include "mori/application/utils/cpu_affinity.hpp"
+#include "mori/io/enum.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_copy.h"
 #include "umbp/common/env_time.h"
@@ -5093,6 +5094,10 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
   // go straight into the engine's remote cache.
   auto hydrate_from_peer = [&](::umbp::UMBPPeer::Stub* stub) -> bool {
     ::umbp::GetPeerInfoRequest req;
+    req.set_protocol_version(mori::io::kMoriIoProtocolVersion);
+    req.set_agent_mode(static_cast<uint32_t>(mori::io::AgentMode::READ_WRITE));
+    if (registry_.PageSize() > 0) req.set_block_size(registry_.PageSize());
+
     ::umbp::GetPeerInfoResponse resp;
     grpc::ClientContext ctx;
     auto status = stub->GetPeerInfo(&ctx, req, &resp);
@@ -5101,6 +5106,28 @@ bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
                       status.error_message());
       return false;
     }
+
+    if (resp.protocol_version() != 0 &&
+        resp.protocol_version() != mori::io::kMoriIoProtocolVersion) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] Rejecting peer '{}': protocol version mismatch "
+          "(local={}, remote={})",
+          peer.peer_address, mori::io::kMoriIoProtocolVersion, resp.protocol_version());
+      return false;
+    }
+
+    if (resp.block_size() != 0 && registry_.PageSize() > 0 &&
+        resp.block_size() != registry_.PageSize()) {
+      MORI_UMBP_ERROR(
+          "[PoolClient] Rejecting peer '{}': block size mismatch "
+          "(local={}, remote={})",
+          peer.peer_address, registry_.PageSize(), resp.block_size());
+      return false;
+    }
+
+    MORI_UMBP_INFO(
+        "[PoolClient] Peer '{}' handshake: protocol_version={} agent_mode={:#x} block_size={}",
+        peer.peer_address, resp.protocol_version(), resp.agent_mode(), resp.block_size());
 
     if (peer_directory_ != nullptr) {
       if (!peer_directory_->EnsureRemoteEngine(peer.node_id, resp.engine_desc())) return false;

@@ -161,6 +161,15 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def("WaitFor", &mori::io::TransferStatus::WaitFor, py::arg("timeout_ms") = -1,
            py::call_guard<py::gil_scoped_release>());
 
+  py::enum_<mori::io::AgentMode>(m, "AgentMode")
+      .value("NONE", mori::io::AgentMode::NONE)
+      .value("READ", mori::io::AgentMode::READ)
+      .value("WRITE", mori::io::AgentMode::WRITE)
+      .value("READ_WRITE", mori::io::AgentMode::READ_WRITE)
+      .export_values();
+
+  m.attr("MORI_IO_PROTOCOL_VERSION") = mori::io::kMoriIoProtocolVersion;
+
   py::class_<mori::io::EngineDesc>(m, "EngineDesc")
       .def_readonly("key", &mori::io::EngineDesc::key)
       .def_readonly("node_id", &mori::io::EngineDesc::nodeId)
@@ -168,6 +177,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def_readonly("host", &mori::io::EngineDesc::host)
       .def_readonly("port", &mori::io::EngineDesc::port)
       .def_readonly("pid", &mori::io::EngineDesc::pid)
+      .def_readonly("protocol_version", &mori::io::EngineDesc::protocolVersion)
+      .def_readonly("agent_mode", &mori::io::EngineDesc::agentMode)
+      .def_readonly("block_size", &mori::io::EngineDesc::blockSize)
       .def_property_readonly("backend_descs",
                              [](const mori::io::EngineDesc& d) {
                                py::dict out;
