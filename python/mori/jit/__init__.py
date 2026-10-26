@@ -60,7 +60,6 @@ def precompile():
         "ep_internode_v1ll",
         "ep_async_ll",
         "ep_local_expert_count",
-        "cast_kernel",
     ]
 
     # IO kernels use a different source directory

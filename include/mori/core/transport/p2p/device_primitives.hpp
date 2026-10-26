@@ -67,38 +67,6 @@ using VecTypeT = std::conditional_t<VecBytes == 1,  uint8_t,
                  std::conditional_t<VecBytes == 16, VecU32x4, void>>>>>;
 // clang-format on
 
-template <typename T, int VecSize>
-struct VecTypeAdaptor {
-  using type = void;
-};
-
-template <>
-struct VecTypeAdaptor<float, 1> {
-  using dataType = float;
-};
-
-template <>
-struct VecTypeAdaptor<float, 2> {
-  using dataType = float2;
-};
-
-template <>
-struct VecTypeAdaptor<float, 4> {
-  using dataType = float4;
-};
-
-#ifdef MORI_HAS_OCP_FP
-template <>
-struct VecTypeAdaptor<mori_fp4_e2m1, 2> {
-  using dataType = mori_fp4x2_e2m1;
-};
-
-template <>
-struct VecTypeAdaptor<mori_fp4_e2m1, 4> {
-  using dataType = mori_fp4x4_e2m1;
-};
-#endif  // MORI_HAS_OCP_FP
-
 /* ---------------------------------------------------------------------------------------------- */
 /*                                           Load/Store                                           */
 /* ---------------------------------------------------------------------------------------------- */
@@ -828,17 +796,8 @@ __device__ __forceinline__ uint32_t SubwarpAllReduceMaxU32(uint32_t val) {
 // Float32 (IEEE 754): 1 sign + 8 exp + 23 mantissa
 // BFloat16: 1 sign + 8 exp + 7 mantissa
 // Bf16BitsToF32 is faster than __bfloat162float
-__device__ __forceinline__ float BitCastU32ToF32(uint32_t u) {
-  union {
-    uint32_t u32;
-    float f32;
-  } tmp;
-  tmp.u32 = u;
-  return tmp.f32;
-}
-
 __device__ __forceinline__ float Bf16BitsToF32(uint16_t bf16_bits) {
-  return BitCastU32ToF32(static_cast<uint32_t>(bf16_bits) << 16);
+  return __uint_as_float(static_cast<uint32_t>(bf16_bits) << 16);
 }
 
 template <typename Fp8T>
@@ -918,148 +877,59 @@ __device__ __forceinline__ uint16_t Bf16AbsBits(uint16_t bits) {
 }
 
 template <int InVecBytes>
-struct Bf16Vec;
+struct Bf16Vec {
+  static_assert(InVecBytes == 4 || InVecBytes == 8 || InVecBytes == 16);
 
-template <>
-struct Bf16Vec<4> {
-  using LoadT = VecTypeT<4>;
-  static constexpr int kElems = 2;
-
-  __device__ __forceinline__ static uint32_t MaxAbsBits(LoadT packed) {
-    const uint16_t lo = Bf16AbsBits(static_cast<uint16_t>(packed & 0xFFFF));
-    const uint16_t hi = Bf16AbsBits(static_cast<uint16_t>(packed >> 16));
-    return static_cast<uint32_t>((lo > hi) ? lo : hi);
-  }
-
-  template <typename Fp8T>
-  __device__ __forceinline__ static void QuantizeStore(__hip_fp8_storage_t* __restrict__ dstBytes,
-                                                       int idx, LoadT packed, float invScale) {
-    float2 v;
-    if (invScale == 1.0f) {
-      v.x = Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF));
-      v.y = Bf16BitsToF32(static_cast<uint16_t>(packed >> 16));
-    } else {
-      v.x = Bf16BitsToF32(static_cast<uint16_t>(packed & 0xFFFF)) * invScale;
-      v.y = Bf16BitsToF32(static_cast<uint16_t>(packed >> 16)) * invScale;
-    }
-    __hip_fp8x2_storage_t fp8 = CvtFloat2ToFp8x2<Fp8T>(v);
-    store<2>(dstBytes + idx, static_cast<uint16_t>(fp8));
-  }
-};
-
-template <>
-struct Bf16Vec<8> {
-  using LoadT = VecTypeT<8>;
-  static constexpr int kElems = 4;
-
-  __device__ __forceinline__ static uint32_t MaxAbsBits(LoadT packed) {
-    const uint16_t b0 = Bf16AbsBits(static_cast<uint16_t>(packed & 0xFFFF));
-    const uint16_t b1 = Bf16AbsBits(static_cast<uint16_t>((packed >> 16) & 0xFFFF));
-    const uint16_t b2 = Bf16AbsBits(static_cast<uint16_t>((packed >> 32) & 0xFFFF));
-    const uint16_t b3 = Bf16AbsBits(static_cast<uint16_t>((packed >> 48) & 0xFFFF));
-    const uint16_t m01 = (b0 > b1) ? b0 : b1;
-    const uint16_t m23 = (b2 > b3) ? b2 : b3;
-    return static_cast<uint32_t>((m01 > m23) ? m01 : m23);
-  }
-
-  template <typename Fp8T>
-  __device__ __forceinline__ static void QuantizeStore(__hip_fp8_storage_t* __restrict__ dstBytes,
-                                                       int idx, LoadT packed, float invScale) {
-    const uint16_t b0 = static_cast<uint16_t>(packed & 0xFFFF);
-    const uint16_t b1 = static_cast<uint16_t>((packed >> 16) & 0xFFFF);
-    const uint16_t b2 = static_cast<uint16_t>((packed >> 32) & 0xFFFF);
-    const uint16_t b3 = static_cast<uint16_t>((packed >> 48) & 0xFFFF);
-
-    float2 v01;
-    float2 v23;
-    if (invScale == 1.0f) {
-      v01.x = Bf16BitsToF32(b0);
-      v01.y = Bf16BitsToF32(b1);
-      v23.x = Bf16BitsToF32(b2);
-      v23.y = Bf16BitsToF32(b3);
-    } else {
-      v01.x = Bf16BitsToF32(b0) * invScale;
-      v01.y = Bf16BitsToF32(b1) * invScale;
-      v23.x = Bf16BitsToF32(b2) * invScale;
-      v23.y = Bf16BitsToF32(b3) * invScale;
-    }
-
-    const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(v01);
-    const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(v23);
-    const uint32_t packedFp8 = static_cast<uint32_t>(static_cast<uint16_t>(fp8_01)) |
-                               (static_cast<uint32_t>(static_cast<uint16_t>(fp8_23)) << 16);
-    store<4>(dstBytes + idx, packedFp8);
-  }
-};
-
-template <>
-struct Bf16Vec<16> {
-  using LoadT = VecTypeT<16>;
-  static constexpr int kElems = 8;
+  using LoadT = VecTypeT<InVecBytes>;
+  using StoreT = VecTypeT<InVecBytes / 2>;
+  static constexpr int kElems = InVecBytes / sizeof(uint16_t);
+  static constexpr int kPairs = kElems / 2;
 
   __device__ __forceinline__ static uint32_t MaxAbsBits(LoadT packed) {
     union {
-      LoadT u128;
-      uint16_t u16[8];
+      LoadT load;
+      uint16_t bits[kElems];
     } in = {packed};
-    const uint16_t b0 = Bf16AbsBits(in.u16[0]);
-    const uint16_t b1 = Bf16AbsBits(in.u16[1]);
-    const uint16_t b2 = Bf16AbsBits(in.u16[2]);
-    const uint16_t b3 = Bf16AbsBits(in.u16[3]);
-    const uint16_t b4 = Bf16AbsBits(in.u16[4]);
-    const uint16_t b5 = Bf16AbsBits(in.u16[5]);
-    const uint16_t b6 = Bf16AbsBits(in.u16[6]);
-    const uint16_t b7 = Bf16AbsBits(in.u16[7]);
-    uint16_t m01 = (b0 > b1) ? b0 : b1;
-    uint16_t m23 = (b2 > b3) ? b2 : b3;
-    uint16_t m45 = (b4 > b5) ? b4 : b5;
-    uint16_t m67 = (b6 > b7) ? b6 : b7;
-    uint16_t m0123 = (m01 > m23) ? m01 : m23;
-    uint16_t m4567 = (m45 > m67) ? m45 : m67;
-    return static_cast<uint32_t>((m0123 > m4567) ? m0123 : m4567);
+
+    uint16_t umax[kElems];
+#pragma unroll
+    for (int i = 0; i < kElems; ++i) {
+      umax[i] = Bf16AbsBits(in.bits[i]);
+    }
+    // Tree reduction to find the maximum absolute value
+#pragma unroll
+    for (int width = kElems; width > 1; width >>= 1) {
+#pragma unroll
+      for (int i = 0; i < width / 2; ++i) {
+        umax[i] = (umax[i] > umax[i + width / 2]) ? umax[i] : umax[i + width / 2];
+      }
+    }
+    return umax[0];
   }
 
   template <typename Fp8T>
   __device__ __forceinline__ static void QuantizeStore(__hip_fp8_storage_t* __restrict__ dstBytes,
                                                        int idx, LoadT packed, float invScale) {
     union {
-      LoadT u128;
-      uint16_t u16[8];
+      LoadT load;
+      uint16_t bits[kElems];
     } in = {packed};
+    union {
+      StoreT store;
+      uint16_t pairs[kPairs];
+    } out{};
 
-    float2 v01;
-    float2 v23;
-    float2 v45;
-    float2 v67;
-    if (invScale == 1.0f) {
-      v01.x = Bf16BitsToF32(in.u16[0]);
-      v01.y = Bf16BitsToF32(in.u16[1]);
-      v23.x = Bf16BitsToF32(in.u16[2]);
-      v23.y = Bf16BitsToF32(in.u16[3]);
-      v45.x = Bf16BitsToF32(in.u16[4]);
-      v45.y = Bf16BitsToF32(in.u16[5]);
-      v67.x = Bf16BitsToF32(in.u16[6]);
-      v67.y = Bf16BitsToF32(in.u16[7]);
-    } else {
-      v01.x = Bf16BitsToF32(in.u16[0]) * invScale;
-      v01.y = Bf16BitsToF32(in.u16[1]) * invScale;
-      v23.x = Bf16BitsToF32(in.u16[2]) * invScale;
-      v23.y = Bf16BitsToF32(in.u16[3]) * invScale;
-      v45.x = Bf16BitsToF32(in.u16[4]) * invScale;
-      v45.y = Bf16BitsToF32(in.u16[5]) * invScale;
-      v67.x = Bf16BitsToF32(in.u16[6]) * invScale;
-      v67.y = Bf16BitsToF32(in.u16[7]) * invScale;
+#pragma unroll
+    for (int i = 0; i < kPairs; ++i) {
+      // Unconditional scale by the inverse scale to avoid branching even if
+      // the inverse scale is 1.0f. This avoids v_cmp_neq_f32 and v_cndmask_b32.
+      float2 values{
+          Bf16BitsToF32(in.bits[2 * i]) * invScale,
+          Bf16BitsToF32(in.bits[2 * i + 1]) * invScale,
+      };
+      out.pairs[i] = static_cast<uint16_t>(CvtFloat2ToFp8x2<Fp8T>(values));
     }
-
-    const __hip_fp8x2_storage_t fp8_01 = CvtFloat2ToFp8x2<Fp8T>(v01);
-    const __hip_fp8x2_storage_t fp8_23 = CvtFloat2ToFp8x2<Fp8T>(v23);
-    const __hip_fp8x2_storage_t fp8_45 = CvtFloat2ToFp8x2<Fp8T>(v45);
-    const __hip_fp8x2_storage_t fp8_67 = CvtFloat2ToFp8x2<Fp8T>(v67);
-    const uint64_t packedFp8 = static_cast<uint64_t>(static_cast<uint16_t>(fp8_01)) |
-                               (static_cast<uint64_t>(static_cast<uint16_t>(fp8_23)) << 16) |
-                               (static_cast<uint64_t>(static_cast<uint16_t>(fp8_45)) << 32) |
-                               (static_cast<uint64_t>(static_cast<uint16_t>(fp8_67)) << 48);
-    store<8>(dstBytes + idx, packedFp8);
+    store<InVecBytes / 2>(dstBytes + idx, out.store);
   }
 };
 
