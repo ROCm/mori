@@ -366,7 +366,10 @@ class RdmaBackend : public Backend {
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:
-  void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess);
+  // With paceQpReplacement, building QPs in place of failed ones is refused with
+  // QpReplacementBackoff while PaceQpReplacement says to wait.
+  void CreateSession(const MemoryDesc& local, const MemoryDesc& remote, RdmaBackendSession& sess,
+                     bool paceQpReplacement = false);
   // Session cache helpers
   struct SessionCacheKey {
     EngineKey remoteEngineKey;  // use remote memory's engine key
@@ -404,6 +407,13 @@ class RdmaBackend : public Backend {
       return topoHash ^ (engineHash + 0x9e3779b97f4a7c15ULL + (topoHash << 6) + (topoHash >> 2));
     }
   };
+  struct QpReplacementPacing {
+    std::chrono::steady_clock::time_point lastAt{};
+    std::chrono::milliseconds interval{0};
+  };
+  // Records a replacement of failed QPs to `key` and returns how long the next one waits;
+  // with `enforce`, throws QpReplacementBackoff instead while the last one says to wait.
+  std::chrono::milliseconds PaceQpReplacement(const ConnBuildKey& key, bool enforce);
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
@@ -422,12 +432,16 @@ class RdmaBackend : public Backend {
   // Sessions replaced because one of their QPs failed. GetOrCreateSessionCached hands out
   // raw pointers that callers use after dropping sessionCacheMu, so these are kept alive.
   std::vector<std::unique_ptr<RdmaBackendSession>> retiredSessions;
-  // After an attempt to replace a failed session to an engine failed (the peer may be
-  // gone), when to try again. Guarded by sessionCacheMu.
-  std::unordered_map<EngineKey, std::chrono::steady_clock::time_point> replaceRetryAt;
+  // After an attempt to replace a failed session failed (the peer may be gone, or the
+  // replacement backed off), when to try again. Guarded by sessionCacheMu.
+  std::unordered_map<ConnBuildKey, std::chrono::steady_clock::time_point, ConnBuildKeyHash>
+      replaceRetryAt;
   std::mutex sessionCacheMu;
   std::mutex connBuildMapMu_;
   std::unordered_map<ConnBuildKey, std::shared_ptr<std::mutex>, ConnBuildKeyHash> connBuildMu_;
+  // Failed QPs stay allocated, so QPs that fail again soon after being replaced, as on a
+  // path that stays down, are replaced at a growing interval. Guarded by connBuildMapMu_.
+  std::unordered_map<ConnBuildKey, QpReplacementPacing, ConnBuildKeyHash> qpReplacementPacing_;
 };
 
 }  // namespace io

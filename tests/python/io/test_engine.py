@@ -625,6 +625,26 @@ def test_transfer_to_gone_peer_after_qp_failure_fails_without_raising():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_failed_qp_replacements_back_off():
+    initiator, target, _, initiator_mem, target_mem = _engine_pair_with_failed_qp(
+        "replacement_backoff"
+    )
+
+    def write_builds_qp():
+        # A write on a new QP fails on the deregistered memory again; one on the
+        # failed QP is flushed.
+        status = _write_and_wait(initiator, initiator_mem, target_mem)
+        assert status.Failed()
+        return "Flushed" not in status.Message()
+
+    assert write_builds_qp()
+    # The new QP failed at once, so the next replacement waits a second.
+    assert not any(write_builds_qp() for _ in range(5))
+    time.sleep(1.2)
+    assert write_builds_qp()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
 def test_successful_writes_always_have_inbound_notification_under_pressure():
     """Regression for notify all-or-none behavior.
 

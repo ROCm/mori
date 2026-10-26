@@ -1773,8 +1773,43 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
   return sess;
 }
 
+namespace {
+constexpr std::chrono::milliseconds kReplaceRetryInterval{1000};
+constexpr std::chrono::milliseconds kMinQpReplacementInterval{1000};
+constexpr std::chrono::milliseconds kMaxQpReplacementInterval{60000};
+
+// CreateSession refused to build QPs in place of failed ones until retryAt.
+class QpReplacementBackoff : public std::runtime_error {
+ public:
+  QpReplacementBackoff(const std::string& what, std::chrono::steady_clock::time_point retryAt)
+      : std::runtime_error(what), retryAt(retryAt) {}
+  std::chrono::steady_clock::time_point retryAt;
+};
+}  // namespace
+
+std::chrono::milliseconds RdmaBackend::PaceQpReplacement(const ConnBuildKey& key, bool enforce) {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> guard(connBuildMapMu_);
+  QpReplacementPacing& pacing = qpReplacementPacing_[key];
+  const auto allowedAt = pacing.lastAt + pacing.interval;
+  if (enforce && now < allowedAt) {
+    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - pacing.lastAt);
+    throw QpReplacementBackoff("QPs failed again " + std::to_string(since.count()) +
+                                   " ms after their last replacement; replacements are " +
+                                   std::to_string(pacing.interval.count()) + " ms apart",
+                               allowedAt);
+  }
+  // Needing another replacement within twice the wait means the path is still bad, so
+  // the wait doubles; needing one later than that starts over.
+  pacing.interval = pacing.interval.count() > 0 && now < allowedAt + pacing.interval
+                        ? std::min(pacing.interval * 2, kMaxQpReplacementInterval)
+                        : kMinQpReplacementInterval;
+  pacing.lastAt = now;
+  return pacing.interval;
+}
+
 void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
-                                RdmaBackendSession& sess) {
+                                RdmaBackendSession& sess, bool paceQpReplacement) {
   TopoKey localKey{local.deviceId, local.loc, local.numaNode};
   TopoKey remoteKey{remote.deviceId, remote.loc, remote.numaNode};
   TopoKeyPair kp{localKey, remoteKey};
@@ -1800,9 +1835,16 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   const int failedEpNum =
       rdma->CountEndpoint(ekey, kp) - static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
   int builtEpNum = 0;
+  std::chrono::milliseconds nextReplacementWait{0};
+  auto paceReplacement = [&](int missing) {
+    if (failedEpNum > 0 && missing > 0) {
+      nextReplacementWait = PaceQpReplacement(ConnBuildKey{ekey, kp}, paceQpReplacement);
+    }
+  };
 
   if (effectiveNumNics == 1) {
     int epNum = static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
+    paceReplacement(config.qpPerTransfer - epNum);
     for (int i = epNum; i < config.qpPerTransfer; ++i) {
       server->BuildRdmaConn(ekey, kp, 0);
       ++builtEpNum;
@@ -1820,6 +1862,11 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
       if (it != rankByDev.end()) haveByRank[it->second] += 1;
     }
 
+    int missing = 0;
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      missing += std::max(0, desiredPerRank[rank] - haveByRank[rank]);
+    }
+    paceReplacement(missing);
     for (int rank = 0; rank < effectiveNumNics; ++rank) {
       for (int count = haveByRank[rank]; count < desiredPerRank[rank]; ++count) {
         server->BuildRdmaConn(ekey, kp, rank);
@@ -1829,8 +1876,9 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
   if (failedEpNum > 0 && builtEpNum > 0) {
     MORI_IO_WARN(
-        "CreateSession: built {} QP(s) to engine {} in place of failed ones ({} failed so far)",
-        builtEpNum, ekey, failedEpNum);
+        "CreateSession: built {} QP(s) to engine {} in place of failed ones ({} failed so far); "
+        "another replacement within {} ms waits until then",
+        builtEpNum, ekey, failedEpNum, nextReplacementWait.count());
   }
 
   EpPairVec eps = rdma->GetLiveEndpoints(ekey, kp);
@@ -1906,20 +1954,19 @@ bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
   return rdma->PopPeerFailure(out);
 }
 
-namespace {
-constexpr std::chrono::milliseconds kReplaceRetryInterval{1000};
-}  // namespace
-
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
                                                           const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
+  const ConnBuildKey connKey{remote.engineKey,
+                             TopoKeyPair{TopoKey{local.deviceId, local.loc, local.numaNode},
+                                         TopoKey{remote.deviceId, remote.loc, remote.numaNode}}};
   RdmaBackendSession* failed = nullptr;
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
       if (it->second->Alive()) return it->second.get();
-      auto retry = replaceRetryAt.find(remote.engineKey);
+      auto retry = replaceRetryAt.find(connKey);
       if (retry != replaceRetryAt.end() && std::chrono::steady_clock::now() < retry->second) {
         return it->second.get();
       }
@@ -1929,18 +1976,23 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   // create outside lock (CreateSession may allocate / block); then insert
   auto newSess = std::make_unique<RdmaBackendSession>();
   try {
-    CreateSession(local, remote, *newSess);
+    CreateSession(local, remote, *newSess, /*paceQpReplacement=*/failed != nullptr);
   } catch (const std::exception& e) {
     if (failed == nullptr) throw;
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it == sessionCache.end()) throw;
     if (it->second.get() == failed) {
-      // The peer may be gone. Keep the failed session: a transfer on it ends with an
-      // error status, which callers handle, while an exception would escape them.
-      MORI_IO_WARN("Cannot replace a failed session to engine {}, retrying in {} ms: {}",
-                   remote.engineKey, kReplaceRetryInterval.count(), e.what());
-      replaceRetryAt[remote.engineKey] = std::chrono::steady_clock::now() + kReplaceRetryInterval;
+      // The peer may be gone, or the path keeps failing. Keep the failed session: a
+      // transfer on it ends with an error status, which callers handle, while an
+      // exception would escape them.
+      const auto now = std::chrono::steady_clock::now();
+      const auto* backoff = dynamic_cast<const QpReplacementBackoff*>(&e);
+      const auto retryAt = backoff != nullptr ? backoff->retryAt : now + kReplaceRetryInterval;
+      MORI_IO_WARN(
+          "Cannot replace a failed session to engine {}, retrying in {} ms: {}", remote.engineKey,
+          std::chrono::duration_cast<std::chrono::milliseconds>(retryAt - now).count(), e.what());
+      replaceRetryAt[connKey] = retryAt;
     }
     return it->second.get();
   }
@@ -1953,7 +2005,7 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
   if (it->second.get() == failed) {
     retiredSessions.push_back(std::move(it->second));
     it->second = std::move(newSess);
-    replaceRetryAt.erase(remote.engineKey);
+    replaceRetryAt.erase(connKey);
   }
   return it->second.get();
 }
