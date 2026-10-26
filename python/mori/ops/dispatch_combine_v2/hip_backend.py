@@ -252,10 +252,12 @@ def ll_bf16_row_bytes(cfg) -> int:
 
 
 def _mtype_local_rw() -> bool:
-    """amdgpu's mtype_local is 0, MTYPE_RW. Unreadable counts as not."""
+    """amdgpu's mtype_local is 0 (MTYPE_RW) or -1, the driver default, which amdgpu 7.1
+    takes as RW on gfx1250. A part whose driver resolves -1 to NC (f01-2) must load with
+    mtype_local=1 to keep LL128 off. Unreadable counts as not."""
     try:
         with open("/sys/module/amdgpu/parameters/mtype_local") as f:
-            return f.read().strip() == "0"
+            return f.read().strip() in ("0", "-1")
     except OSError:
         return False
 
