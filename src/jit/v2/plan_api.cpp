@@ -146,7 +146,7 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
 }  // namespace mori
 
 // ===========================================================================
-// C ABI — eleven symbols, the same for every kernel. ctypes rather than pybind11: this
+// C ABI — twelve symbols, the same for every kernel. ctypes rather than pybind11: this
 // carries only pointers and scalars, and it keeps torch out of every header on
 // this side (MORI_JIT_V2_DESIGN §3.5).
 // ===========================================================================
@@ -249,6 +249,34 @@ MORI_JIT_API void* mori_jit_plan_create(const char* kernel, const char* arch,
       throw std::runtime_error(msg);
     }
     return new PlanHandle{vt, impl};
+  } catch (const std::exception& e) {
+    SetPlanError(e.what());
+    return nullptr;
+  }
+}
+
+// The info a plan for this request would report, without compiling it: sizes a
+// caller allocates before the plan exists. Valid until the next call on this thread.
+MORI_JIT_API const char* mori_jit_plan_describe(const char* kernel, const char* arch,
+                                                const char* const* names, const long long* values,
+                                                int count) {
+  static thread_local std::string s;
+  try {
+    const PlanVTable* vt = FindPlan(kernel);
+    if (!vt)
+      throw std::runtime_error(std::string("unknown kernel '") + (kernel ? kernel : "(null)") +
+                               "'");
+    ResolveArch(arch);
+    FieldBag bag(names, values, count);
+    std::string out = vt->describe(bag);
+    const auto unread = bag.Unread();
+    if (!unread.empty()) {
+      std::string msg = "unknown request field(s):";
+      for (const auto& u : unread) msg += " " + u;
+      throw std::runtime_error(msg);
+    }
+    s = std::move(out);
+    return s.c_str();
   } catch (const std::exception& e) {
     SetPlanError(e.what());
     return nullptr;

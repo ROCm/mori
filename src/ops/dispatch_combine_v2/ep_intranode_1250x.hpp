@@ -2430,12 +2430,11 @@ struct EpFp4Wire {
   // Payload bytes of the 32 elements one lane reduces per pass.
   static constexpr int kLaneB = kFp8 ? 32 : 16;
   static constexpr int kScB = kCfg.hiddenDim / kQGroup * (kF32Scale ? 4 : 1);
-  static constexpr int kWireB =
-      (kPayB + kScB + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
+  static constexpr int kWireB = EpCombinePushWireBytes(kCfg);
   static constexpr int kWireDw = kWireB / 4;
   static constexpr int kCap = (EpCombine1250xLdsBudget / kCfg.warpPerBlock) / kWireB;
   static constexpr int kItemPass = 2;
-  static constexpr size_t kLandOff = (size_t)EpMaxRecv(kCfg) * kTokB;
+  static constexpr size_t kLandOff = EpCombinePushLandOff(kCfg);
   static_assert(kWireB % kTdmRowBytes == 0 && kTokB % kTdmRowBytes == 0,
                 "every row a TDM transfer touches must start on a 128 B row");
 };
@@ -2520,28 +2519,28 @@ __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
 
 // At four ranks only 24-warp blocks take the overlapped path: the 8- and 16-warp units the table
 // runs below them keep the per-warp send. The host sizes the row flags for every world size the
-// path can run at (hip_backend.py, out_tok).
+// path can run at (EpCombinePushOvlAny, EpRegionOutTokBytes).
 template <EpCfg kCfg>
 constexpr bool EpFp4Ovl() {
-  return EpCombinePush(kCfg) && !kCfg.combineFp4F32Scale && !EpIsWideEp(kCfg) &&
+  return EpCombinePushOvlAny(kCfg) &&
          (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
-                              : (kCfg.worldSize >= 4 && kCfg.warpPerBlock == 24));
+                              : kCfg.warpPerBlock == 24);
 }
 // A token lands one row per distinct destination rank of its top-k experts.
 template <EpCfg kCfg>
 constexpr int EpFp4Rows() {
-  return kCfg.worldSize < kCfg.numExpertPerToken ? kCfg.worldSize : kCfg.numExpertPerToken;
+  return EpCombinePushRows(kCfg);
 }
 // The landing holds every row this rank's tokens get back: the rows from one destination are one
 // run, after the rows from every destination below it (the dispatch signal's high word), so the
 // runs tile at most this many.
 template <EpCfg kCfg>
 constexpr int EpFp4LandRows() {
-  return kCfg.maxTokPerRank * EpFp4Rows<kCfg>();
+  return EpCombinePushLandRows(kCfg);
 }
 template <EpCfg kCfg>
 constexpr size_t EpFp4FlagOff() {
-  return EpFp4Wire<kCfg>::kLandOff + (size_t)EpFp4LandRows<kCfg>() * EpFp4Wire<kCfg>::kWireB;
+  return EpCombinePushFlagOff(kCfg);
 }
 // Per lane d < worldSize: the landing offset of the rows from d (sender) or to d (receiver).
 __device__ __forceinline__ int EpFp4LandFrom(const EpArgs& args, int npes, int laneId) {

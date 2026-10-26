@@ -70,6 +70,9 @@ struct PlanVTable {
   void (*launch)(void*, const void* argBuf, size_t argSize, void* stream);
   // "key=value\n..." — geometry, the full Cfg, and the cache directory.
   std::string (*info)(void*);
+  // `info` for a request, without compiling: what a caller sizes before the plan
+  // exists. cacheDir is empty.
+  std::string (*describe)(const FieldBag&);
   // Fill the disk cache for the declared coverage; no GPU touched.
   int (*precompile)(const std::string& arch);
   // "name:tag=default,..." for the request; nested flattened as parent.child.
@@ -110,7 +113,7 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
 // comes from here.
 //
 //   RequestFn : FieldBag  -> Spec::Cfg          (named, no layout)
-//   InfoFn    : Spec::Cfg -> "k=v\n..."         (usually Describe(cfg))
+//   InfoFn    : Spec::Cfg -> "k=v\n..."         (usually Describe(cfg); describe reports it too)
 //   PrecompFn : arch      -> kernel count
 // ---------------------------------------------------------------------------
 #define MORI_JIT_DEFINE_PLAN(NAME, SPEC, REQUEST_FN, REQUEST_SCHEMA_FN, INFO_FN, PRECOMPILE_FN,  \
@@ -150,12 +153,22 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
                                                    h->plan.geom.sharedBytes, h->cfgKeyValues,    \
                                                    h->cfgText, h->cacheDir);                     \
   }                                                                                              \
+  std::string NAME##PlanDescribe(const ::mori::jit::v2::FieldBag& f) {                           \
+    const auto cfg = REQUEST_FN(f);                                                              \
+    /* Rendered but not compiled: describe fails where create would, short of a compile error */ \
+    (void)SPEC::RenderSource(cfg);                                                               \
+    const auto g = SPEC::Geometry(cfg);                                                          \
+    const std::string kv = INFO_FN(cfg);                                                         \
+    return ::mori::jit::v2::detail::FormatPlanInfo(g.gridX, g.blockX, g.sharedBytes, kv,         \
+                                                   Render(cfg), "");                             \
+  }                                                                                              \
   const struct NAME##PlanRegistrar {                                                             \
     NAME##PlanRegistrar() {                                                                      \
       ::mori::jit::v2::RegisterPlan(                                                             \
-          #NAME, ::mori::jit::v2::PlanVTable{&NAME##PlanCreate, &NAME##PlanDestroy,              \
-                                             &NAME##PlanLaunch, &NAME##PlanInfo, &PRECOMPILE_FN, \
-                                             &REQUEST_SCHEMA_FN, ARGS_SCHEMA, sizeof(ARGS_T)});  \
+          #NAME,                                                                                 \
+          ::mori::jit::v2::PlanVTable{&NAME##PlanCreate, &NAME##PlanDestroy, &NAME##PlanLaunch,  \
+                                      &NAME##PlanInfo, &NAME##PlanDescribe, &PRECOMPILE_FN,      \
+                                      &REQUEST_SCHEMA_FN, ARGS_SCHEMA, sizeof(ARGS_T)});         \
     }                                                                                            \
   } NAME##PlanRegistrarInstance;                                                                 \
   }  // namespace
