@@ -1663,6 +1663,13 @@ check_atomic() {
     fi
     local n=${#AR[@]}
 
+    # A non-number would abort the arithmetic under `set -u`; 0 would run
+    # nothing and then report every rail as failed.
+    if [[ ! "$ATOMIC_RUNS" =~ ^[1-9][0-9]*$ ]]; then
+        log_warn "MORI_CHECK_ATOMIC_RUNS='$ATOMIC_RUNS' is not a positive integer, using 3"
+        ATOMIC_RUNS=3
+    fi
+
     MESH_CLI_BIN=$(resolve_perftest ib_atomic_bw)
     if [[ -z "$MESH_CLI_BIN" ]]; then
         log_warn "ib_atomic_bw not found (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
@@ -1739,11 +1746,12 @@ check_atomic() {
         local -A GGATE=()
         for (( i=0; i<n; i++ )); do [[ -n "${HGATE[$i,$i]:-}" ]] && GGATE[$i,$i]=1; done
         MESH_GPU_DMABUF=1
+        # The full GPU budget even though the client is on host memory: perftest
+        # accepts the connection before it allocates and registers its buffer,
+        # so the server's HIP init and dma-buf registration run inside the
+        # client's timeout. A rail leaves the gate at its first failure, so a
+        # broken host pays this timeout once per rail, not once per run.
         mesh_gpu_on
-        # The server pays the HIP init and mesh_gpu_on scales its wait for it;
-        # the client is on host memory, so it keeps a short timeout and a hung
-        # atomic costs seconds, not the full GPU budget.
-        MESH_CLI_TIMEOUT=$(( _MESH_CLI_TIMEOUT0 * 2 ))
         for (( run=0; run<ATOMIC_RUNS; run++ )); do
             (( ${#GGATE[@]} > 0 )) || break
             IB_PORT=$(( port0 + pblock * 4 * n * n )); pblock=$(( pblock + 1 ))
