@@ -376,17 +376,13 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
     // Finishing the previous launch only proves peers SENT to us, not that they
-    // are done reducing what we sent them. Publish our entry generation, then
-    // let each peer's SDMA queue wait independently before writing its staging /
-    // signalBuf. This removes the all-peer CU barrier from the send critical path.
+    // are done reducing what we sent them: gate our writes into their staging /
+    // signalBuf until every PE has entered this launch.
     int stride4G = heapWin->stride4G;
-    __shared__ uint64_t scatterGen;
     if (threadIdx.x < warpSize) {
       // Every lane reads my slot before lane myPe overwrites it (same wave).
       const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-      const uint64_t next = gen + 2;
-      if (threadIdx.x == 0) scatterGen = next;
-      PublishGen(barrierCtr, next, myPe, npes, stride4G);
+      GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
     }
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
@@ -404,8 +400,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
           int32_t diff = (peer - myPe)*stride4G;
           return reinterpret_cast<uint8_t*>(staging + slot * chunkElems) + 
              (static_cast<uint64_t>(diff)<<32);
-        },
-        barrierCtr, static_cast<uint32_t>(scatterGen));
+        });
   }
   
   // Phase 2-3: walk all S slices in the order the senders queued them, reducing
