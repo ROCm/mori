@@ -529,9 +529,12 @@ same intent):
    undetectable) **warns** rather than fails: the host-proxy backend
    (`MORI_ENABLE_HOST_PROXY=1`) does cross-node RDMA without IBGDA, so only
    IBGDA needs the minimum.
-   **AINIC in a KVM guest** gets its own firmware step: `nicctl` cannot see the
-   NICs from inside a VM, so the version is read from
-   `/sys/class/infiniband/*/fw_ver` and **warns** below `1.117.5-a-230`, where
+   **AINIC without a usable `nicctl`** — it needs root, and inside a VM it sees
+   no card — falls back to sysfs: firmware from `/sys/class/infiniband/*/fw_ver`,
+   driver from `/sys/module/ionic`, both unprivileged. `nicctl` runs directly as
+   root, otherwise via `sudo -n`, so a missing password skips the QoS/DCQCN
+   steps with the reason (SL/TC then stay 0) instead of aborting the run.
+   **In a KVM guest** the firmware also **warns** below `1.117.5-a-230`, where
    RDMA atomics into GPU (dma-buf) memory fail while writes still work.
 2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices

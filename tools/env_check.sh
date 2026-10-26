@@ -1324,15 +1324,22 @@ detect_virt() {
     HOST_VIRT="$v"
 }
 
-# check_ainic_vm_firmware
-#   Firmware check for an AINIC guest. Reads fw_ver from sysfs rather than
-#   nicctl: nicctl manages the physical card and finds nothing inside a guest
-#   (it reports "No AMD NICs detected"), so check_versions never runs there.
-#   Warns, does not fail: a guest below the minimum still does RDMA writes, and
-#   MORI-EP runs with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step reports
-#   whether atomics actually work.
-check_ainic_vm_firmware() {
-    step "check AINIC firmware for a virtualized host ($HOST_VIRT)"
+# check_ainic_sysfs_versions <ibgda_check:true|false>
+#   AINIC firmware and driver from sysfs, for hosts where nicctl cannot report
+#   them: nicctl needs root, and inside a VM it finds no card at all (it manages
+#   the physical NIC; a guest only has the SR-IOV VF). Both files are readable
+#   unprivileged.
+#   ibgda_check=true applies the IBGDA minimum as well -- check_versions did not
+#   run, so nothing else has. On a virtualized host it also applies the guest
+#   minimum, which check_versions knows nothing about.
+#   Warns, does not fail: firmware below the guest minimum still does RDMA
+#   writes, and MORI-EP runs with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step
+#   reports whether atomics actually work.
+check_ainic_sysfs_versions() {
+    local ibgda_check="$1" title="check AINIC firmware and driver version (sysfs)"
+    [[ -n "$HOST_VIRT" ]] && title+=", $HOST_VIRT guest"
+    step "$title"
+
     local d fw; local -a fws=()
     for d in /sys/class/infiniband/*; do
         [[ "$(ib_pci_vendor "$d")" == "0x1dd8" ]] || continue
@@ -1340,32 +1347,39 @@ check_ainic_vm_firmware() {
         [[ -n "$fw" ]] && fws+=("$fw")
     done
     if (( ${#fws[@]} == 0 )); then
-        log_warn "cannot read AINIC firmware from /sys/class/infiniband/*/fw_ver"; return 0
+        log_warn "cannot read AINIC firmware from /sys/class/infiniband/*/fw_ver"
+    else
+        report_uniform "AINIC firmware" "${fws[@]}"
+        local v
+        while read -r v; do
+            [[ "$ibgda_check" == "true" ]] && check_ainic_version_recommendation "$v"
+            [[ -n "$HOST_VIRT" ]] || continue
+            if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                log_warn "cannot parse AINIC firmware version '$v' against the $HOST_VIRT guest minimum"
+            elif version_ge "$v" "$AINIC_KVM_MIN_VER"; then
+                log_ok "AINIC firmware $v meets the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
+            else
+                log_warn "AINIC firmware $v is below the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
+                log_warn "  RDMA atomics into GPU (dma-buf) memory fail on this firmware in a VM, while"
+                log_warn "  RDMA writes work -- so the bandwidth meshes pass and MORI-EP's atomic"
+                log_warn "  signalling hangs. Upgrade the host firmware, or run MORI-EP (InterNodeV1/V1LL)"
+                log_warn "  with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step below tests it directly."
+            fi
+        done < <(printf '%s\n' "${fws[@]}" | sort -u)
     fi
-    report_uniform "AINIC firmware (sysfs)" "${fws[@]}"
 
-    local v
-    while read -r v; do
-        if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            log_warn "cannot parse AINIC firmware version '$v' against the $HOST_VIRT minimum"
-        elif version_ge "$v" "$AINIC_KVM_MIN_VER"; then
-            log_ok "AINIC firmware $v meets the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
-        else
-            log_warn "AINIC firmware $v is below the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
-            log_warn "  RDMA atomics into GPU (dma-buf) memory fail on this firmware in a VM, while"
-            log_warn "  RDMA writes work -- so the bandwidth meshes pass and MORI-EP's atomic"
-            log_warn "  signalling hangs. Upgrade the host firmware, or run MORI-EP (InterNodeV1/V1LL)"
-            log_warn "  with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step below tests it directly."
-        fi
-    done < <(printf '%s\n' "${fws[@]}" | sort -u)
+    # Loaded vs on-disk, which nicctl's "ionic driver" line never compared: a
+    # driver installed but not in the initramfs keeps the old one running.
+    [[ "$ibgda_check" == "true" ]] && report_driver_version ionic
+    return 0
 }
 
 check_versions() {
     step "check ainic firmware and driver version"
 
     local fw_output sw_output
-    fw_output=$(sudo nicctl show version firmware)
-    sw_output=$(sudo nicctl show version host-software)
+    fw_output=$("${NICCTL[@]}" show version firmware)
+    sw_output=$("${NICCTL[@]}" show version host-software)
 
     local fw_versions fw_count
     fw_versions=$(echo "$fw_output" | grep -i "firmware" | awk '{print $NF}' | sort -u)
@@ -1395,7 +1409,7 @@ check_qos() {
     step "check QoS and derive SL/TC"
 
     local qos_output
-    qos_output=$(sudo nicctl show qos)
+    qos_output=$("${NICCTL[@]}" show qos)
 
     # classification type
     local class_type
@@ -1503,7 +1517,7 @@ check_dcqcn() {
     step "check DCQCN"
 
     local dcqcn_output
-    dcqcn_output=$(sudo nicctl show dcqcn)
+    dcqcn_output=$("${NICCTL[@]}" show dcqcn)
 
     local total
     total=$(echo "$dcqcn_output" | grep -c "ROCE device")
@@ -2603,12 +2617,37 @@ for _nv in "${_VENDOR_IDS[@]}"; do
     fi
 done
 
-# ionic checks shell out to `sudo nicctl`; probe it can actually see a card
-# before relying on it, to skip gracefully instead of spewing driver errors.
-_nicctl_ok=false
-if (( ${_VENDOR_COUNT[ionic]} > 0 )) && command -v nicctl >/dev/null 2>&1; then
-    _nicctl_out=$(sudo nicctl show version firmware 2>&1 || true)
-    echo "$_nicctl_out" | grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC' || _nicctl_ok=true
+# ionic checks shell out to nicctl, which needs root (unprivileged it only
+# prints "nicctl requires root privileges"). Run it directly as root, otherwise
+# through `sudo -n` so a missing password fails at once instead of waiting on a
+# prompt -- in a Slurm step, CI, or a container there is no TTY to answer it.
+NICCTL=(nicctl)
+[[ $EUID -eq 0 ]] || NICCTL=(sudo -n nicctl)
+
+# Probe that nicctl actually reports a firmware version, the same field
+# check_versions parses, rather than grepping for known failure strings: a
+# sudo password error matched none of those, so the probe passed, every
+# nicctl step then read empty output, and check_qos died -- ending the run
+# before the later steps. _nicctl_why says why nicctl was not usable.
+_nicctl_ok=false; _nicctl_why=""
+if (( ${_VENDOR_COUNT[ionic]} > 0 )); then
+    if ! command -v nicctl >/dev/null 2>&1; then
+        _nicctl_why="nicctl is not installed"
+    else
+        _nicctl_out=$("${NICCTL[@]}" show version firmware 2>&1 || true)
+        # Capture, then match: under pipefail a `grep -q` at the end of the
+        # pipe can SIGPIPE awk and turn a match into a failure.
+        _nicctl_fw=$(grep -i "firmware" <<<"$_nicctl_out" | awk '{print $NF}')
+        if grep -qE '^[0-9]+\.[0-9]+' <<<"$_nicctl_fw"; then
+            _nicctl_ok=true
+        elif grep -qiE 'password is required|terminal is required|not in the sudoers|requires root' <<<"$_nicctl_out"; then
+            _nicctl_why="nicctl needs root: run as root or with passwordless sudo"
+        elif grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC' <<<"$_nicctl_out"; then
+            _nicctl_why="nicctl sees no AINIC card (expected in a VM, where the host owns the card)"
+        else
+            _nicctl_why="nicctl reported no firmware version"
+        fi
+    fi
 fi
 
 # warn about non-dominant vendors present but not checked above
@@ -2629,11 +2668,14 @@ case "$_dominant_vendor" in
             check_versions
             check_qos
             check_dcqcn
+            # check_versions already covered the IBGDA minimum and the driver;
+            # a guest still needs its own firmware minimum.
+            [[ -n "$HOST_VIRT" ]] && check_ainic_sysfs_versions false
         else
-            log_warn "ionic NICs present but nicctl is unavailable or cannot access them — skipping nicctl-based checks (firmware / QoS / DCQCN)"
+            check_ainic_sysfs_versions true
+            log_warn "skipping nicctl-based QoS/DCQCN checks: $_nicctl_why"
+            log_warn "  SL/TC cannot be derived without nicctl; the meshes run with SL=$MORI_RDMA_SL"
         fi
-        # Independent of nicctl, which cannot see the NICs from inside a guest.
-        [[ -n "$HOST_VIRT" ]] && check_ainic_vm_firmware
         ;;
     bnxt)
         check_bnxt_versions
