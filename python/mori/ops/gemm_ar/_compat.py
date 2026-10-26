@@ -19,18 +19,21 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Signal and atomic accessors for the gemm_ar kernels, on flydsl 0.2.x and later.
+"""Atomic accessors and fences for the gemm_ar kernels, on flydsl 0.2.x and later.
 
 Buffer load/store with a working cache policy lives in
-:mod:`mori.cco.device.flydsl.buffer`, shared with the cco examples, and is
-re-exported here so the kernels keep one import site.
+:mod:`mori.cco.device.flydsl.buffer` and the u32 signal-slot accessors in
+:mod:`mori.cco.device.flydsl.signals`, both shared with the cco examples. They
+are re-exported here so the kernels keep one import site. What stays here is
+tuned for gemm_ar: the scope and ordering of its tile-counter atomics and the
+copy-engine release fence.
 """
 
 from __future__ import annotations
 
 import flydsl
 import flydsl.expr as fx
-from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import rocdl as _rocdl
 
 from mori.cco.device.flydsl.buffer import (  # noqa: F401  (re-exported)
@@ -45,27 +48,17 @@ from mori.cco.device.flydsl.buffer import (  # noqa: F401  (re-exported)
     buffer_store,
     create_buffer_resource_from_addr,
 )
+from mori.cco.device.flydsl.signals import (  # noqa: F401  (re-exported)
+    _AGENT_SCOPE,
+    i32_type,
+    local_load_u32,
+    local_store_u32,
+    signal_load_u32,
+    signal_ptr,
+    signal_store_u32,
+)
 
 FLYDSL_VERSION = getattr(flydsl, "__version__", "unknown")
-
-# --- signal slot accessors -------------------------------------------------
-#
-# These are **atomic**, not plain buffer accesses with a cache modifier, for two
-# independent reasons -- both found by reading the emitted ISA:
-#
-# 1. A ``rocdl.raw.ptr.buffer.load`` is side-effect-free, so the spin loop that
-#    reloads it was dead-code-eliminated outright: the barrier compiled down to
-#    a signal store and nothing else. An atomic is never removed.
-# 2. The syncscope tells the AMDGPU backend which cache levels to bypass, so we
-#    stop hand-encoding ``aux`` bits whose meaning changes between CDNA3 and
-#    CDNA4 (see the CM_* note in mori.cco.device.flydsl.buffer).
-#
-# Scopes mirror aiter's start_sync/end_sync: publish at **system** scope (the
-# store must cross xGMI), poll at **agent** scope (we only read our own HBM).
-from flydsl._mlir.dialects import llvm as _llvm_d  # noqa: E402
-
-_SYSTEM_SCOPE = ""  # LLVM AMDGPU: the empty syncscope is system-wide
-_AGENT_SCOPE = "agent"
 
 
 def wave_uniform_i64(addr):
@@ -85,60 +78,6 @@ def wave_uniform_i64(addr):
     lo = _rocdl.readfirstlane(_dtype("i32"), fx.Uint32(v))
     hi = _rocdl.readfirstlane(_dtype("i32"), fx.Uint32(v >> 32))
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
-
-
-#: AMDGPU's LLVM address space for global memory. `fx.to_llvm_ptr` would
-#: resolve this from the active backend, but it does not exist before flydsl
-#: 0.3, and 0.2.x is still supported (nightly.yml's flydsl-compat job).
-#: `llvm.inttoptr` is identical in
-#: both -- same signature, same dialect module -- so going straight to an
-#: `!llvm.ptr` keeps one code path instead of a version probe.
-_GLOBAL_LLVM_AS = 1
-_LLVM_GLOBAL_PTR = f"!llvm.ptr<{_GLOBAL_LLVM_AS}>"
-
-
-def signal_ptr(addr_i64):
-    """Raw i64 device address -> ``!llvm.ptr`` over one u32 signal slot.
-
-    The llvm dialect ops below (atomic store/load/cmpxchg) need a lowered
-    ``!llvm.ptr``, not the ``!fly.ptr`` that ``fly``'s own ``inttoptr`` yields.
-    """
-    return _llvm_d.inttoptr(
-        ir.Type.parse(_LLVM_GLOBAL_PTR), fx.Int64(addr_i64).ir_value()
-    )
-
-
-def signal_store_u32(ptr, value):
-    _llvm_d.store(
-        fx.Int32(value).ir_value(),
-        ptr,
-        alignment=4,
-        ordering=_llvm_d.AtomicOrdering.monotonic,
-        syncscope=_SYSTEM_SCOPE,
-    )
-
-
-def signal_load_u32(ptr):
-    return _llvm_d.load(
-        _dtype("i32"),
-        ptr,
-        alignment=4,
-        ordering=_llvm_d.AtomicOrdering.monotonic,
-        syncscope=_AGENT_SCOPE,
-    )
-
-
-# The per-block ``_flag`` counter is private to this rank: only our own block
-# reads and writes it, so it needs no atomic and no scope. Making it atomic had
-# all 512 lanes issue an agent-scope atomic against one address every launch,
-# which measurably serialised the prologue. ``volatile`` is still required so the
-# load is not hoisted above the barrier that publishes the previous value.
-def local_load_u32(ptr):
-    return _llvm_d.load(_dtype("i32"), ptr, alignment=4, volatile_=True)
-
-
-def local_store_u32(ptr, value):
-    _llvm_d.store(fx.Int32(value).ir_value(), ptr, alignment=4, volatile_=True)
 
 
 def atomic_add_u32(ptr, value, *, ordering="monotonic"):
@@ -198,10 +137,6 @@ def release_fence(scope="agent"):
     that are not the reader here.
     """
     _llvm_d.fence(_llvm_d.AtomicOrdering.release, syncscope=scope)
-
-
-def i32_type():
-    return _dtype("i32")
 
 
 __all__ = [

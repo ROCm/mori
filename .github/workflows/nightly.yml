@@ -1062,7 +1062,8 @@ jobs:
             mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
             mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
-            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py"
+            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
+            torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
 
       - name: Cleanup
         if: always()

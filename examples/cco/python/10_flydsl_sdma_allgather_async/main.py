@@ -85,9 +85,8 @@ from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
 from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements, Communicator, UniqueId
 
-# flydsl moved its buffer/atomic helpers between 0.2 and 0.3; this module is the
-# one place that papers over it, so the example runs on either.
-from mori.ops.gemm_ar._compat import (
+# Signal-slot accessors that behave the same on every FlyDSL mori supports.
+from mori.cco.device.flydsl.signals import (
     i32_type,
     local_load_u32,
     local_store_u32,
