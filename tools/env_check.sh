@@ -2626,22 +2626,53 @@ for _nv in "${_VENDOR_IDS[@]}"; do
 done
 
 # ionic checks shell out to nicctl, which needs root (unprivileged it only
-# prints "nicctl requires root privileges"). Run it directly as root, otherwise
-# through `sudo -n` so a missing password fails at once instead of waiting on a
-# prompt -- in a Slurm step, CI, or a container there is no TTY to answer it.
-NICCTL=(nicctl)
-[[ $EUID -eq 0 ]] || NICCTL=(sudo -n nicctl)
+# prints "nicctl requires root privileges"). sudo is the default; rootless is
+# the fallback when it is not available. In order:
+#   1. already root            -> nicctl
+#   2. passwordless sudo       -> sudo -n nicctl
+#   3. sudo with a password    -> ask once (sudo true) on the terminal; sudo caches
+#                                 the credential, so the later nicctl calls in
+#                                 check_qos / check_dcqcn do not prompt again
+#   4. none of those           -> rootless: no nicctl, firmware and driver from
+#                                 sysfs (check_ainic_sysfs_versions)
+# Step 3 needs a terminal: sudo reads the password from /dev/tty, and in a Slurm
+# step, CI, or a container there is none, so it would only fail or hang. It
+# authenticates with `sudo true`, not `sudo -v`: under a sudoers `verifypw`
+# policy -v exits 0 without asking for anything, which proves nothing about
+# whether sudo will run a command.
+NICCTL=(); _nicctl_why=""
 
-# Probe that nicctl actually reports a firmware version, the same field
-# check_versions parses, rather than grepping for known failure strings: a
-# sudo password error matched none of those, so the probe passed, every
-# nicctl step then read empty output, and check_qos died -- ending the run
-# before the later steps. _nicctl_why says why nicctl was not usable.
-_nicctl_ok=false; _nicctl_why=""
+# _have_tty -- true if /dev/tty can be opened, i.e. sudo has somewhere to prompt.
+_have_tty() { ( exec </dev/tty ) 2>/dev/null; }
+
+_nicctl_ok=false
 if (( ${_VENDOR_COUNT[ionic]} > 0 )); then
     if ! command -v nicctl >/dev/null 2>&1; then
         _nicctl_why="nicctl is not installed"
+    elif [[ $EUID -eq 0 ]]; then
+        NICCTL=(nicctl)
+    elif ! command -v sudo >/dev/null 2>&1; then
+        _nicctl_why="nicctl needs root and sudo is not installed"
+    elif sudo -n true 2>/dev/null; then
+        NICCTL=(sudo -n nicctl)
+    elif _have_tty; then
+        echo "nicctl needs root for the AINIC firmware/QoS/DCQCN checks."
+        echo "Enter your sudo password, or press Ctrl-D to continue rootless."
+        if sudo -p "[sudo] password for %u: " true; then
+            NICCTL=(sudo nicctl)
+        else
+            _nicctl_why="sudo authentication failed or not permitted for $(id -un)"
+        fi
     else
+        _nicctl_why="nicctl needs root: not root, no passwordless sudo, and no terminal to ask for a password"
+    fi
+
+    # Probe that nicctl actually reports a firmware version, the same field
+    # check_versions parses, rather than grepping for known failure strings: a
+    # sudo password error matched none of those, so the probe passed, every
+    # nicctl step then read empty output, and check_qos died -- ending the run
+    # before the later steps.
+    if (( ${#NICCTL[@]} > 0 )); then
         _nicctl_out=$("${NICCTL[@]}" show version firmware 2>&1 || true)
         # Capture, then match: under pipefail a `grep -q` at the end of the
         # pipe can SIGPIPE awk and turn a match into a failure.
@@ -2649,7 +2680,7 @@ if (( ${_VENDOR_COUNT[ionic]} > 0 )); then
         if grep -qE '^[0-9]+\.[0-9]+' <<<"$_nicctl_fw"; then
             _nicctl_ok=true
         elif grep -qiE 'password is required|terminal is required|not in the sudoers|requires root' <<<"$_nicctl_out"; then
-            _nicctl_why="nicctl needs root: run as root or with passwordless sudo"
+            _nicctl_why="nicctl could not get root via ${NICCTL[*]}"
         elif grep -qiE 'No AMD NICs|Invalid card handle|Failed to get NIC' <<<"$_nicctl_out"; then
             _nicctl_why="nicctl sees no AINIC card (expected in a VM, where the host owns the card)"
         else
