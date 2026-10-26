@@ -92,14 +92,9 @@ _COMBINE_DTYPES = {torch.bfloat16: 2, torch.float32: 4}
 # Must match EpScaleAlign in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _SCALE_ALIGN = 128
 
-# Must match kEpStageOff / kEpStageRegionTok in ep_intranode_1250x.hpp: the LL128
-# dispatch's area past the slot word, a 256 B counter area, two parities of one 128 B
-# header a source, then room for two parities of _STAGE_TOK rows a source.
 _STAGE_OFF = 512
 _STAGE_TOK = 512
 
-# Ints of an LL128 op's count buffer: one 64-bit word, the count in its low half and the call number it
-# is for in its high half (ep_intranode_1250x.hpp). Needs 8-byte alignment, which torch gives.
 _LL_CTR_INTS = 2
 
 
@@ -434,7 +429,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
-        # Read by _regions and _build_kernels, so it is fixed before the arena exists.
         self._ll128_geom = self._ll128_plan(cfg)
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
@@ -473,9 +467,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dev = self.dev
         self.arena.zero()
 
-        # An LL128 op runs every call on one dispatch and one combine plan (_LL128_TABLE in
-        # hip_tuning_configs); with the LL128 combine alone, on the schedule's dispatch and one
-        # combine plan. A geometry the caller pinned is one plan already.
         if self._ll128_geom is not None and cfg.schedule:
             cb, cw = self._ll128_geom["combine"]
             if "dispatch" in self._ll128_geom:
@@ -501,8 +492,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.dispatch_staging = None
         if self._is1250 and not cfg.is_internode:
             raw_scale = self._scale_i32(cfg) * 4
-            # The plans below get tok_off_ext from this same flag, and EpCfg
-            # derives aggReserve from it (ep_spec.cpp).
             stg_bytes = ep_staging_bytes(
                 cfg.world_size,
                 cfg.effective_max_recv,
@@ -543,8 +532,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if self._tokoff_wanted:
             self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
             self.tok_off_peers = self._tokoff_ext.peers
-        # An LL128 dispatch keeps the call number its count is for behind the count, which callers
-        # and routing handles still see as one int.
         ll_disp = self._ll128_geom is not None and "dispatch" in self._ll128_geom
         self._recv_ctr = torch.zeros(_LL_CTR_INTS if ll_disp else 1, **i32)
         self.total_recv = self._recv_ctr[:1]
@@ -870,15 +857,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
             # which runs from four ranks up.
             row = push_wire_nbytes(cfg) + (8 if cfg.world_size >= 4 else 0)
-            # The LL128 combine lands the same rows, as lines, from the same offset.
             out_tok += land_rows * (max(row, ll_comb_row_bytes(cfg)) if llc else row)
         elif ll:
-            # The bf16 LL128 combine lands a token's rows from each of its ranks past the staging.
             out_tok += push_land_rows(cfg) * ll_bf16_row_bytes(cfg)
         tok_off = 4
         if ll:
-            # Past the slot word, at _STAGE_OFF: the LL128 dispatch's count words and the
-            # rows it stores at each destination.
             tok_off = _STAGE_OFF + _stage_bytes(cfg, self._scale_stride_i32(cfg) * 4)
         regions = [
             ("tok_off", tok_off),
@@ -1487,7 +1470,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         if cfg.quant_type == "fp8_blockwise":
             comb_cfg["combine_fp8"] = True
         if self._ll128_geom is not None and "dispatch" in self._ll128_geom:
-            # MakeEpCfg checks the dispatch's request against the combine it pairs with.
             disp_cfg.update(
                 ll128=True,
                 combine_fp4=comb_cfg.get("combine_fp4", False),
@@ -1726,8 +1708,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _wrap_combine(self, plan):
         push = self.cfg.quant_type in _PUSH_QUANT_TYPES
-        # Where the bf16 LL128 combine reads each slot's source and ids unless a snapshot handle
-        # brings its copies (EpArgs::recvToSrc / recvIdx); the other combines do not read them.
         src_ptr = self.arena.local_ptr("recv_to_src_token")
         idx_ptr = self.arena.local_ptr("out_idx")
 

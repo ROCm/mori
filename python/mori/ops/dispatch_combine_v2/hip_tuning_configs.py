@@ -174,39 +174,10 @@ _DISPATCH_TABLE: dict = {
         },
         # EP16 on four 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11. 128x16 is the only geometry
         # that builds the pinned-destination dispatch (kDPin in ep_intranode_1250x.hpp). 128x16
-        # minus 64x16, dispatch us, graph, 3 alternating rounds: M=512 plan, 64 / 256 / 384 / 512
-        # tokens a rank +3.0 / +3.9..+4.1 / +2.5..+2.8 / +1.7..+2.0 (ab_1011_233137_978008); M=4096
-        # plan, 768 / 1024 / 1280 / 1536 / 2048 / 2560 / 3072 / 4096 -18.2..-18.7 / -18.4..-18.6 /
-        # -12.4..-12.5 / -9.3 / -4.8..-5.1 / -29.0..-29.1 / -35.9..-36.0 / -37.0..-37.1
-        # (ab_1011_232944_972647); M=16384 plan, 8192 -14.7..-15.3, 16384 -80.9..-83.3. The 512
-        # bucket is its own variant: at most 512 tokens a call compiles out the tile path (kCuAlways).
         (16, 7168, 6, None): {
             None: ((None, 64, 16),),
             "fp4": ((512, 64, 16), (None, 128, 16)),
         },
-        # EP32 on eight 4-GPU hosts, topk 6, fp4 dispatch, 2026-10-11, one M=16384 plan, 3
-        # alternating rounds, dispatch us (ab_1011_213858_566770):
-        #   ct     64x16  128x16 256x16
-        #   64     33.60  33.97  33.12
-        #   512    38.14  39.26  41.06
-        #   1024   57.01  47.75  50.79
-        #   2048   97.24  80.83  68.47
-        #   4096  144.96 145.69 133.17
-        #   8192  239.43 226.28 239.29
-        #   16384 459.61 432.08 414.95
-        # 384 and 512 blocks hang (384 at 16384 tokens, 512 at the first call). The edges between
-        # the swept points are unswept.
-        # fp8 dispatch, 2026-10-18, C2 C5 C6 C7 C9 C11 C14 C17, 12 experts a rank, one M=16384 plan,
-        # combine pinned beside it, 3 alternating rounds, every difference one-signed (ab_1018_053343_1616815):
-        #   ct     64x16  128x16 256x16
-        #   512    43.98  44.58  45.82
-        #   1024   74.55  64.01  67.56
-        #   2048  132.38 127.69 117.81
-        #   4096  225.27 231.13 228.21
-        #   8192  427.62 404.23 424.08
-        #   16384 829.91 789.81 773.33
-        # EP32 takes EP4's block count at every token count (the rest of the CUs belong to the
-        # co-resident GEMM); warps may be more: up to 512 tokens 64 x 16, which runs the LDS metadata path.
         (32, 7168, 6, None): {
             None: ((512, 64, 16), (2048, 64, 16), (None, 128, 16)),
             "fp4": ((512, 64, 16), (1024, 64, 16), (None, 128, 16)),
@@ -290,19 +261,6 @@ _COMBINE_PUSH_TABLE: dict = {
                 (8192, 128, 16),
                 (None, 128, 24),
             ),
-            # EP32, 2026-10-11, the run of the EP32 dispatch entry, combine us:
-            #   ct     64x8   128x16 128x24 256x8  256x16
-            #   64     16.19  22.65  23.19  16.07  22.02
-            #   512    32.70  34.52  35.56  28.03  34.50
-            #   1024   48.40  45.94  47.71  46.74  44.17
-            #   2048   77.71  63.25  65.13  76.20  64.69
-            #   4096  134.05 105.14 105.87 112.95 106.61
-            #   8192  243.99 191.68 197.61 209.69 195.29
-            #   16384 462.90 371.53 358.19 402.34 368.26
-            # EP4's block counts, as the EP32 dispatch entry. Up to 512 tokens 8 warps: 16 take the
-            # overlapped path, which there loses (2026-10-18, 12 experts a rank, an op a size,
-            # 3 alternating rounds, 64x16 -> 64x8: 384 / 512 tokens 36.03 -> 28.60 / 38.59 -> 33.77,
-            # 1024 +0.3; at 512 64x16 with the overlap off measured 38.43).
             (32, 7168, 6, None): (
                 (512, 64, 8),
                 (2047, 64, 16),
@@ -334,19 +292,6 @@ _COMBINE_PUSH_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
-            # EP32, 2026-10-18, the run of the EP32 fp8 dispatch entry, combine us. Without an entry
-            # the op took the plain combine table's 64x8, below the overlapped path's 16 or 24 warps:
-            #   ct     64x8   128x16 128x24 256x16 256x8
-            #   512    55.58  46.32  48.50  46.74  44.01
-            #   1024   76.64  65.06  68.92  66.82  82.53
-            #   2048  134.22 110.36 114.01 108.65 178.19
-            #   4096  240.54 191.73 199.64 200.24 223.46
-            #   8192  448.19 375.14 362.76 364.97 415.45
-            #   16384 868.81 711.16 696.19 714.86 783.73
-            # EP4's block counts, as the EP32 dispatch entry, and 8 warps up to 384 tokens: the
-            # overlapped path of 16 loses there (2026-10-18, 12 experts a rank, an op a size,
-            # 3 alternating rounds: 384 tokens 128x16 / 128x8 / 64x8 42.20 / 38.05 / 48.27,
-            # 512 46.07 / 47.73).
             (32, 7168, 6, None): (
                 (256, 64, 8),
                 (384, 128, 8),
@@ -358,49 +303,6 @@ _COMBINE_PUSH_TABLE: dict = {
     },
 }
 
-# The LL128 protocol (EpCfg::ll128 in ep_cfg.hpp): an op of at most `max_tok` tokens a rank
-# runs every call on one dispatch and one combine plan, block x warp each, instead of the
-# schedule. One plan each because the per-block call numbers are module globals, which a
-# second plan would not share. The plans stay on 64 blocks at these token counts (the rest of
-# the CUs belong to the co-resident GEMM); dispatch and combine may differ in warps a block.
-# max_tok is the largest op whose dispatch and combine are both faster than the schedule's at
-# every token count. Keyed by quant_type, then (world, hidden, topk, experts a rank) and the
-# dispatch dtype. EP4 on C17, 2026-10-16, 3 alternating rounds, us against the schedule:
-#   fp4 on 64x16 + 64x16, an op of 256, at 1 / 64 / 128 / 256: dispatch 18.0 -> 8.1,
-#     22.9 -> 10.9, 21.1 -> 12.2, 22.4 -> 18.9; combine 12.2 -> 7.6, 14.7 -> 8.7, 15.1 -> 9.9,
-#     16.7 -> 15.1. At 512, in an op of 512, both lose (24.3 -> 29.0, 20.4 -> 26.1).
-#   fp8 on 64x8 + 64x8, an op of 128, at 1 / 16 / 64 / 128: dispatch 18.2 -> 8.2, 22.8 -> 9.5,
-#     24.2 -> 12.6, 24.6 -> 14.5; combine 12.2 -> 8.1, 13.7 -> 8.6, 15.2 -> 9.9, 16.3 -> 13.7.
-#     Its combine loses at 256 (18.9 -> 21.9), and on 64x16 from 64 (15.2 -> 15.8).
-#   bf16 on 64x16 + 64x16, an op of 64, at 1 / 16 / 64: dispatch 18.5 -> 9.6, 25.2 -> 10.8,
-#     27.2 -> 14.7; combine 19.5 -> 9.9, 16.1 -> 10.6, 16.4 -> 16.0. Its combine loses at 128
-#     (17.6 -> 23.6).
-# The fp4 push combine on 64x32 does not build.
-# From 8 ranks the combines run on 64x8: on 64x16 (256 VGPRs a lane) fp4's spills 230. From 8 ranks
-# the dispatch sends a row's units past the first only to the ranks it is routed to, and fp8's
-# takes 64x16 there: it receives 4 to 5 rows a token from each of 8 or 16 sources. EP16 on C1 C4
-# C11 C14, 2026-10-17, 3 alternating rounds, us against the schedule, at 1 / 16 / 64 / 128:
-#   fp4 dispatch 19.8 -> 9.3, 24.0 -> 12.2, 24.9 -> 15.0, 25.2 -> 21.8; combine 14.3 -> 8.5,
-#     14.8 -> 9.1, 15.8 -> 11.0, 17.4 -> 16.8.
-#   fp8 dispatch 20.6 -> 9.7, 25.3 -> 14.6, 25.9 -> 18.4, 27.9 -> 27.3; combine 15.8 -> 8.8,
-#     16.8 -> 10.0, 18.5 -> 14.6, 21.3 -> 20.8.
-#   bf16 at 1 / 4 / 16: dispatch 22.8 -> 10.7, 23.1 -> 11.4, 25.1 -> 12.9; combine 28.2 -> 10.6,
-#     31.9 -> 11.2, 15.7 -> 12.1 on 64x8. Its combine loses at 64 (18.0 -> 26.0). On 64x16 (parts
-#     of 4 units; C1 C4 C13 C14) the combine is 26.4 -> 8.9, 30.7 -> 9.5, 15.8 -> 10.7.
-# EP8 on C1 C4, same day and method, at 1 / 16 / 64 / 128:
-#   fp4 dispatch 18.6 -> 8.6, 22.7 -> 9.5, 23.6 -> 12.6, 24.4 -> 16.1; combine 13.3 -> 8.0,
-#     14.0 -> 8.7, 14.8 -> 10.5, 16.0 -> 15.3.
-#   fp8 dispatch 18.8 -> 9.0, 22.8 -> 10.7, 24.1 -> 14.8, 25.4 -> 19.3; combine 14.7 -> 8.5,
-#     15.6 -> 9.7, 17.0 -> 13.6, 19.2 -> 18.7.
-#   bf16 at 1 / 4 / 16: dispatch 20.4 -> 9.9, 20.1 -> 10.7, 22.5 -> 11.5; combine 24.3 -> 10.1,
-#     26.9 -> 10.5, 14.9 -> 11.2 on 64x8, and on 64x16 (parts of 4 units) another 1.7 less:
-#     10.3 -> 8.6, 10.6 -> 8.9, 11.3 -> 9.6.
-# EP32 on C1 C2 C4 C6 C9 C11 C14 C17, same day and method: fp4 up to 64 tokens a rank, fp8 up to 16.
-#   fp4 at 1 / 4 / 16 / 64: dispatch 22.1 -> 13.1, 23.2 -> 13.3, 25.9 -> 15.9, 26.5 -> 20.4;
-#     combine 14.8 -> 8.5, 15.3 -> 9.2, 15.5 -> 9.4, 16.2 -> 11.7. At 128 the dispatch loses.
-#   fp8 at 1 / 4 / 16: dispatch 21.7 -> 13.2, 22.5 -> 13.3, 25.8 -> 24.0; combine 16.3 -> 9.1,
-#     16.8 -> 9.6, 17.1 -> 10.5. At 64 the dispatch loses.
-#   bf16 has no EP32 entry: the schedule's bf16 op failed its window import there (no baseline).
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
@@ -439,7 +341,6 @@ _LL128_TABLE: dict = {
             (4, 7168, 6, None): {
                 "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))
             },
-            # From 8 ranks past 16 tokens the bf16 combine is slower than the pull.
             (8, 7168, 6, None): {
                 "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))
             },

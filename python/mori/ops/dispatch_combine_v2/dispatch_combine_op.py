@@ -680,8 +680,6 @@ class EpDispatchRoutingHandle:
         recv_maps=None,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
-        # (recv_to_src, recv_idx) copies a snapshot handle owns when its combine reads them back
-        # (EpDispatchCombineOp._snapshot_recv_views); None otherwise.
         self.recv_maps = recv_maps
         self.inter_node_disp_dest_tok_id_map = inter_node_disp_dest_tok_id_map
         self.inter_node_disp_send_map = inter_node_disp_send_map
@@ -1025,7 +1023,6 @@ class EpDispatchCombineOp:
             dest_map=dest_map,
             num_tokens=n,
         )
-        # Behind the kernel on the stream, so the copies hold what this dispatch wrote.
         recv_maps = None if recv_views is None else tuple(v.clone() for v in recv_views)
 
         base = (
@@ -1061,7 +1058,6 @@ class EpDispatchCombineOp:
             total_recv_token_num=(
                 self.total_recv.clone() if snapshot else self.total_recv
             ),
-            # The handle's copy of the reverse map when it took one, no clone needed.
             disp_tok_id_to_src_tok_id_local=None if recv_maps is None else recv_maps[0],
             cur_rank_num_token=n,
             reverse_src_view=reverse,
@@ -1141,7 +1137,6 @@ class EpDispatchCombineOp:
             tokoff_ext.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
-        # The whole buffer behind the count: an LL128 op keeps the count's call number there too.
         getattr(self, "_recv_ctr", self.total_recv).zero_()
         # The two backends seed this differently -- intranode starts the epoch at
         # 1, internode at 0 (see the two constructors in hip_backend) -- so a

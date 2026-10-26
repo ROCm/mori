@@ -267,9 +267,6 @@ def main():
         .sum(1)
     )
 
-    # Every rank's ids and weights, [world, M, TOPK]: unlike the payload and the scale
-    # rows, a receiver cannot rebuild them from (rank, token), and dispatch forwards
-    # both next to every row it delivers.
     def gather_all(t):
         parts = [torch.empty_like(t.cpu()) for _ in range(world)]
         dist.all_gather(parts, t.cpu().contiguous())
@@ -341,8 +338,6 @@ def main():
         """
         if not CHECK:
             return 0
-        # A rank that received nothing still takes part in the all_reduce below, or the
-        # other ranks wait in it for good.
         if total == 0:
             print(f"[EMPTY] rank {rank} received no token", flush=True)
         tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
@@ -359,10 +354,6 @@ def main():
                 constant=CONST_VAL,
             ).view(torch.uint8)
             bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
-        # The scale rows travel with the payload rows. A source row's scale bytes are a
-        # pure function of (rank, token) -- see `scales` above -- so the reverse map
-        # alone gives the expected row. The control compares against the next token's
-        # row, which must fail every row: a comparison that cannot fail proves nothing.
         sbad = sctl = 0
         if SCALE_DIM:
             sc_n_i32 = (SCALE_DIM + 3) // 4
@@ -375,11 +366,6 @@ def main():
 
             sbad = int((gs != sref(src_tok)).any(dim=1).sum())
             sctl = int((gs != sref(src_tok + 1)).any(dim=1).sum())
-        # The ids and weights of every row against its sender's, through the same reverse
-        # map. A source rank out of range fails its row instead of raising here, which would
-        # leave the other ranks in the all_reduce. The control is the next rank's ids and
-        # weights for the same token, which must differ from every row; the next token's
-        # would not exist at one token a rank.
         inr = (src_pe >= 0) & (src_pe < world)
         pe_c = torch.where(inr, src_pe, torch.zeros_like(src_pe))
         got_i = op.recv_indices()[:total].cpu()
@@ -601,7 +587,6 @@ def main():
             buf = op.combine_in_view().clone()[:total]
         else:
             buf = stage
-        # A checked call also asks a pull combine for its weight fold; a push combine has none.
         out, outw = op.combine(
             buf, weights=w_ if checked and not _PUSH else None, routing=r
         )
@@ -639,8 +624,6 @@ def main():
                 f"[{int(U[:ct].min())},{int(U[:ct].max())}])",
                 flush=True,
             )
-        # The weight fold sums the weights row each of the token's U ranks was forwarded, so it is
-        # U[t] times the row; U[t] + 1 times the row is the control, which must miss every row.
         w_ref = wts[:ct].float().cpu()
         ew = U[:ct].view(ct, 1).float() * w_ref
         gw = outw.float().cpu()

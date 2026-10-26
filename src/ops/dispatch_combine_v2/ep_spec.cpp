@@ -72,8 +72,6 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
   c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
-  // Kept off the combine and the other arches, whose code does not read it: their Cfg,
-  // and so their cache key, stays the one maxTokPerRank alone gives.
   c.callTokMax = isDispatch && arch.rfind("gfx125", 0) == 0 && req.callTokMax > 0 &&
                          req.callTokMax < req.maxTokPerRank
                      ? req.callTokMax
@@ -84,10 +82,6 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
 
-  // The LL128 combine is the push combine with e8m0 scales or, for a bf16 op, the bf16 sum, and
-  // its dispatch fills the map only that combine reads; both kernels see the same request, so they
-  // agree. The grid bounds are the per-block call numbers (_llSeq, _lcSeq) and the dispatch's
-  // count headers.
   if (req.ll128) {
     const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
     const bool bf16 = !req.combineFp4 && !req.combineFp8 && req.dtype == EpDType::Bf16;
@@ -99,8 +93,6 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
     }
     c.ll128 = true;
   }
-  // The LL128 push combine alone, after the original dispatch, whose Cfg stays as it was: the
-  // combine takes each id's rank from the flat index that dispatch leaves in the map.
   if (req.ll128CombineOnly && !isDispatch) {
     const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
     if (req.ll128 || arch.rfind("gfx125", 0) != 0 || !pushE8m0 || c.waveSize != 32 ||
@@ -185,11 +177,6 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   // text, same sha256, same cache entry.
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
-    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + row
-    // (EpScaleRows, EpScaleRow), and EpStagingScaleBytes sizes the region from the
-    // same function. NOT the smaller per-peer share of the idx/wt pool. BYTES is the
-    // caller's row, STRIDE what we lay it down at: staging reads one and writes the
-    // other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
                 "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpScaleRows(cfg)) + "\n";

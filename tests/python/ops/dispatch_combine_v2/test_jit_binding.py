@@ -311,18 +311,11 @@ def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
 
 
 def test_staging_bytes_agg_reserve_scale_rows():
-    # Under aggReserve the scale part is EpScaleRows = 2 * pow2ceil(maxTokPerRank)
-    # rows a peer instead of the peer's recv capacity (ep_cfg.hpp); the other five
-    # sub-arrays do not move. Numbers re-derived from EpStagingTotalBytes.
     from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
-    # EP8, 512 tok/rank: 8 * 1024 * 256 B of scale against 8 * 4096 * 256.
     assert ep_staging_bytes(8, 4096, 224, 512, agg_reserve=True) == 6455296
     assert ep_staging_bytes(32, 4096, 224, 128, agg_reserve=True) == 19529728
-    # No scale row, nothing for the flag to change.
     assert ep_staging_bytes(8, 4096, 0, 512, agg_reserve=True) == 4358144
-    # EP2: the wrap (512 for 300 tokens) doubled is past the 600-slot recv cap, so
-    # the linear numbering is the LARGER one here and sizing from recv would be short.
     assert ep_staging_bytes(2, 600, 224, 300, agg_reserve=True) == 690944
     assert ep_staging_bytes(2, 600, 224, 300) == 473856
     with pytest.raises(ValueError, match="max_tok_per_rank"):
@@ -400,8 +393,6 @@ def test_the_fallback_follows_the_scale_row_numbering(launched, stages):
 
     from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
-    # One rank with a scale row: under aggReserve the rows wrap at 2 * 64 a peer,
-    # past the 64-slot recv cap, so a buffer sized from recv would be short.
     p = _plan(scale_bytes=224)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)

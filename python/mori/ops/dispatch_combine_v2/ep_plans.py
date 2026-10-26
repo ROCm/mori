@@ -117,7 +117,6 @@ def _staging_key(info: dict) -> tuple:
     # The cap EpMaxRecv resolves, so maxRecv=0 and its resolved value share.
     max_recv = info["maxRecv"]
     recv = max_recv if max_recv > 0 else info["worldSize"] * info["maxTokPerRank"]
-    # key[1:] is ep_staging_bytes()'s argument list, in its order.
     return (
         torch.cuda.current_device(),
         info["worldSize"],

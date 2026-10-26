@@ -156,9 +156,6 @@ struct EpArgs {
   // used instead of the window's offTokOff. Null (the default) keeps the window.
   int* const* tokOffPeers = nullptr;
   void* stagingBase = nullptr;  // gfx1250 dispatch staging (EpStagingTotalBytes)
-  // Where the gfx1250 bf16 LL128 combine reads [maxRecv] slot -> src token and [maxRecv * topk]
-  // forwarded expert ids: the op's own at offRecvToSrc / offOutIdx, or a snapshot routing handle's
-  // copies of them, since the next dispatch overwrites the op's.
   int* recvToSrc = nullptr;
   int* recvIdx = nullptr;
 
@@ -266,19 +263,8 @@ struct EpCfg {
   // cco window. Off, every block holding tokens for a destination makes its own RMW.
   // Off is free for the same reason as scaleBytes.
   bool aggReserve = false;
-  // Dispatch only: the most tokens a call of this variant is handed, when the caller
-  // knows it is fewer than maxTokPerRank (a token-count bucket). 0 = maxTokPerRank.
-  // Only the code sized to one call reads it (EpCallTok); maxTokPerRank stays the
-  // stride every source token is encoded with, which combine decodes.
   int callTokMax = 0;
-  // gfx125x, both kernels of an op alike (MakeEpCfg): every call takes the LL128 dispatch
-  // and the LL128 combine, the push combine's or a bf16 op's sum (ep_intranode_1250x.hpp).
-  // That dispatch only pairs with that combine, so the op chooses for both. Off is free for
-  // the same reason as scaleBytes.
   bool ll128 = false;
-  // gfx125x, combine only (MakeEpCfg): the LL128 push combine after the original dispatch, for ops
-  // the LL128 dispatch is too slow for. The map then holds the original dispatch's flat indices,
-  // and the combine takes each id's rank from them. Off is free for the same reason as scaleBytes.
   bool ll128CombineOnly = false;
 };
 
@@ -371,7 +357,6 @@ constexpr int EpMaxRecv(const EpCfg& c) {
   return c.maxRecv > 0 ? c.maxRecv : c.worldSize * c.maxTokPerRank;
 }
 
-// The most tokens one call holds. Not a stride: indices keep maxTokPerRank.
 constexpr int EpCallTok(const EpCfg& c) {
   return c.callTokMax > 0 && c.callTokMax < c.maxTokPerRank ? c.callTokMax : c.maxTokPerRank;
 }
@@ -398,8 +383,6 @@ constexpr bool EpCombinePush(const EpCfg& c) { return c.combineFp4 || c.combineF
 //
 // Padded on every arch so the destination layout does not fork per arch. The pad
 // is unconditional, so small rows amplify: 224->256 is 1.14x, 32->128 is 4x,
-// 4->128 is 32x, and the gfx1250 scale staging is worldSize * EpScaleRows * THIS
-// (EpStagingScaleBytes), one host allocation per op.
 //
 // Everything reading the destination uses this, not Cfg.scaleBytes; it assumes
 // the arena aligns the region too (SymmArena._ALIGN, checked in hip_backend).
@@ -408,15 +391,6 @@ constexpr int EpScaleStride(const EpCfg& c) {
   return c.scaleBytes <= 0 ? 0 : (c.scaleBytes + EpScaleAlign - 1) / EpScaleAlign * EpScaleAlign;
 }
 
-// The gfx1250 scale staging: a block lays the row for destination slot s of peer p
-// at row (b mod EpScaleWrap) + (s - b) of p's part, b being the block's first slot at
-// p. Under aggReserve a rank holds one run of at most EpCallTok slots at p, and
-// the wrap is a power of two at least that long, so a block's rows never wrap, two
-// blocks of the rank never share a row, and every row is below twice the wrap --
-// the part is linear in maxTokPerRank instead of p's whole recv capacity
-// (EP32 16384 tokens: 256 MiB against 4 GiB). Without aggReserve every block
-// reserves on its own, the rank's slots at p are spread over the capacity, and the
-// wrap is past it, so the row is the slot.
 constexpr int EpPow2Ceil(int v) {
   int r = 1;
   while (r < v) r <<= 1;
