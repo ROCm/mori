@@ -125,6 +125,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
     __shared__ uint32_t flagEpoch[2];
+    __shared__ uint64_t scatterGen;
     if (threadIdx.x == 0) {
       // Read the counters BEFORE arriving: no block of this launch can count in
       // until peers scatter to me, which needs my arrival. The previous launch's
@@ -138,14 +139,16 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       AtomicStore<EAgentScope>(&groupCounters[kBcastTargetIdx], flagEpoch[1]);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     }
-    // Gate on every PE entering this launch: staging/signalBuf are shared with
-    // the other push collectives, and the slice counter is cleared only after
-    // the b=1 release, so a peer may finish before my previous launch is done
-    // with them. Lane 0 enters after its stores above, in program order.
+    // Publish entry to every PE, but do not wait for a global rendezvous:
+    // staging/signalBuf are shared with the other push collectives, so each
+    // destination queue will POLL_REGMEM its own peer's generation before its
+    // first scatter copy. Lane 0 enters after its stores above, in program order.
     if (threadIdx.x < warpSize) {
       // Every lane reads my slot before lane myPe overwrites it (same wave).
       const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-      GenBarrier(barrierCtr, gen + 2, myPe, npes, heapWin->stride4G);
+      const uint64_t next = gen + 2;
+      if (threadIdx.x == 0) scatterGen = next;
+      PublishGen(barrierCtr, next, myPe, npes, heapWin->stride4G);
     }
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
@@ -167,7 +170,8 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
           int32_t diff = (peer - myPe)*static_cast<int32_t>(heapWin->stride4G);
           return reinterpret_cast<uint8_t*>(staging + slot * shardLen(peer)) +
              (static_cast<uint64_t>(diff)<<32);
-        });
+        },
+        barrierCtr, static_cast<uint32_t>(scatterGen));
 
     // Pre-post both broadcasts behind the scatter, each parked on its counter
     // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole

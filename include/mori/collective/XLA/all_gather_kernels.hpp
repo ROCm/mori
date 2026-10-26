@@ -57,12 +57,16 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
                                     cco::ccoWindow_t heapWin,
                                     uint64_t* __restrict__ barrierCtr) {
   const uint32_t stride4G = heapWin->stride4G;
-  // A peer finishing its previous launch only proves our shard reached it; gate
-  // our writes into its output / signalBuf[0] until every PE entered this one.
+  // A peer finishing its previous launch only proves our shard reached it.
+  // Publish entry globally, then let each peer's SDMA queue wait independently
+  // before writing that peer's output / signalBuf[0].
+  __shared__ uint64_t scatterGen;
   if (threadIdx.x < warpSize) {
     // Every lane reads my slot before lane myPe overwrites it (same wave).
     const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-    GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
+    const uint64_t next = gen + 2;
+    if (threadIdx.x == 0) scatterGen = next;
+    PublishGen(barrierCtr, next, myPe, npes, stride4G);
   }
   __syncthreads();
 
@@ -81,7 +85,8 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
       [=](int peer) -> uint8_t* {
         int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
         return localDst + (static_cast<uint64_t>(diff) << 32);
-      });
+      },
+      barrierCtr, static_cast<uint32_t>(scatterGen));
 
   uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
 
@@ -106,8 +111,8 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // follows: there is nothing left in L2 to write back.
   //
   // Clearing at kernel END is safe without a host barrier: a peer's NEXT launch
-  // only ADDs here after passing its entry GenBarrier, which needs us to have
-  // entered that launch too, i.e. after this kernel has retired.
+  // only ADDs here after its queue poll sees our next entry generation, which we
+  // publish only after this kernel has retired.
   if (threadIdx.x == 0) {
     AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
