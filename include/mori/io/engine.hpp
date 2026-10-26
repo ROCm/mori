@@ -113,6 +113,14 @@ class IOEngine {
   // book entry. The peer can come back only by building new connections.
   // Safe to call for an unknown peer; the result then reports nothing fenced.
   FenceResult FenceRemoteEngine(const EngineKey& remote);
+  // Lets a fenced peer connect again. Until then it is refused, in either direction,
+  // so a peer that noticed its connection die cannot quietly rebuild it and land
+  // writes it still had queued. Call it once nothing the peer has in flight can reach
+  // buffers that were handed out. Returns whether the peer was fenced.
+  // A peer whose reconnects were refused meanwhile backs off before trying again; it
+  // can drop its dead sessions and reconnect at once by fencing and unfencing this
+  // engine on its side.
+  bool UnfenceRemoteEngine(const EngineKey& remote);
   // Wait for all statuses with failure-wins precedence. Empty input succeeds.
   StatusCode WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs = -1);
 
