@@ -756,6 +756,25 @@ jobs:
               wait
               sleep 1
               PORT=$((PORT + 1))
+              if [[ "${{ matrix.platform }}" == "MI355X_AINIC" && ( "$TOKENS" == 128 || "$TOKENS" == 1024 || "$TOKENS" == 4096 ) ]]; then
+                echo "=== atomic-free bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+                NODE2_CMD=(
+                  $CT exec -e MORI_INTERNODE_TIMEOUT=600 -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO
+                  -e MORI_EP_DISABLE_RDMA_ATOMICS=1 $CONTAINER bash $SCRIPT
+                  --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                  --ifname $NODE2_IFNAME
+                  --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+                )
+                ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+                  -e MORI_EP_DISABLE_RDMA_ATOMICS=1 $CONTAINER bash $SCRIPT \
+                  --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                  --ifname $NODE1_IFNAME \
+                  --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+                wait
+                sleep 1
+                PORT=$((PORT + 1))
+              fi
             done
           done
 

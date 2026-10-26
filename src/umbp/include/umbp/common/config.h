@@ -61,8 +61,8 @@ struct UMBPDramConfig {
   size_t capacity_bytes = 4ULL * 1024 * 1024 * 1024;
   bool use_shared_memory = false;
   std::string shm_name = "/umbp_dram";
-  double high_watermark = 0.9;
-  double low_watermark = 0.7;
+  double high_watermark = 0.95;
+  double low_watermark = 0.9;
 
   // Host memory options (ignored when use_shared_memory=true).
   bool use_hugepages = false;
