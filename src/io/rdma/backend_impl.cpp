@@ -603,6 +603,13 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
                                         int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
 
+  // Checked under the same lock FenceRemoteEngine takes, so a handshake already in
+  // flight cannot slip an endpoint in behind the fence.
+  if (fencedPeers_.count(remoteKey) != 0) {
+    throw std::runtime_error("engine " + remoteKey +
+                             " is fenced; connections are refused until it is unfenced");
+  }
+
   // Before the transition below, which can itself raise a fatal event.
   peerFailures_.RegisterQp(
       PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
@@ -751,6 +758,7 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
   EpPairVec victims;
   {
     std::unique_lock<std::shared_mutex> lock(mu);
+    fencedPeers_.insert(remoteKey);
     auto it = remotes.find(remoteKey);
     if (it != remotes.end()) {
       for (auto& [topo, eps] : it->second.rTable) {
@@ -798,6 +806,16 @@ FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
                      " could not be fenced";
   }
   return result;
+}
+
+bool RdmaManager::IsPeerFenced(const EngineKey& remoteKey) const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  return fencedPeers_.count(remoteKey) != 0;
+}
+
+bool RdmaManager::UnfenceRemoteEngine(const EngineKey& remoteKey) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  return fencedPeers_.erase(remoteKey) != 0;
 }
 
 bool RdmaManager::HasIonicDevice() const {
@@ -1260,6 +1278,12 @@ std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& e
 }
 
 void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nicRank) {
+  // Refuse before the handshake: the peer would otherwise build its half of a
+  // connection that this side then has to throw away.
+  if (rdma->IsPeerFenced(ekey)) {
+    throw std::runtime_error("BuildRdmaConn: engine " + ekey +
+                             " is fenced; connections are refused until it is unfenced");
+  }
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -1361,6 +1385,12 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
       int rdevId = msg.devId;
+
+      // A fenced peer gets no connection: dropping the handshake makes its connect
+      // fail, which is how it learns it was cut off. Nothing is built for it.
+      if (rdma->IsPeerFenced(msg.ekey)) {
+        throw ProtocolError("RegEndpoint refused: engine " + msg.ekey + " is fenced");
+      }
 
       // Rail affinity: if the sender provided a valid railId, use the same
       // availDevices index so that both endpoints sit on the same network rail
@@ -2020,12 +2050,17 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
   std::lock_guard<std::mutex> lock(sessionCacheMu);
   for (auto it = sessionCache.begin(); it != sessionCache.end();) {
     if (it->first.remoteEngineKey == remote) {
+      retiredSessions.push_back(std::move(it->second));
       it = sessionCache.erase(it);
     } else {
       ++it;
     }
   }
   return result;
+}
+
+bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
+  return rdma && rdma->UnfenceRemoteEngine(remote);
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,

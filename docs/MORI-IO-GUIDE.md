@@ -89,7 +89,8 @@ from mori.io import (
 | `remove_backend(type)` | Remove a backend |
 | `register_remote_engine(desc)` | Register a remote engine |
 | `deregister_remote_engine(desc)` | Deregister a remote engine |
-| `fence_remote_engine(engine_key)` | Cut a peer off from this engine's memory so buffers it was writing into can be reused. Returns a `FenceResult`; only trust it when `ok` is set (`endpoints_failed == 0`). Currently RDMA only |
+| `fence_remote_engine(engine_key)` | Cut a peer off from this engine's memory so buffers it was writing into can be reused. Returns a `FenceResult`; only trust it when `ok` is set (`endpoints_failed == 0`). Currently RDMA only. The peer stays fenced (refused in both directions) until `unfence_remote_engine` |
+| `unfence_remote_engine(engine_key)` | Let a fenced peer connect again; returns whether it was fenced. Call once nothing the peer still has in flight can reach buffers that were handed out |
 | `register_memory(ptr, size, device_id, mem_loc)` | Register memory by raw pointer |
 | `register_torch_tensor(tensor)` | Register a PyTorch tensor |
 | `deregister_memory(mem_desc)` | Deregister memory |

@@ -36,8 +36,10 @@
 //   2. stale writer        after the fence, the same peer's write must NOT land
 //   3. scoped to one peer  another peer still writes normally
 //   4. unknown / repeated  fencing nobody, or fencing twice, is a harmless no-op
-//   5. initiator reconnect the fencing engine can still initiate to the fenced peer
-//   6. peer restart        a restarted peer with the same key reconnects and writes
+//   5. initiator reconnect a fenced peer is refused in both directions until unfenced
+//   6. live producer       a fenced peer that kept running is refused, then rebuilds
+//                          and writes again once unfenced
+//   7. peer restart        a restarted peer with the same key reconnects and writes
 //
 // Every case runs over host memory and, when a GPU is visible, again over device
 // memory, so the NIC is also shown to stop writing into VRAM.
@@ -79,18 +81,21 @@ struct TestFailure : public std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-#define CHECK(cond, msg)                                                                  \
-  do {                                                                                    \
-    if (!(cond)) {                                                                        \
-      throw TestFailure(std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " +   \
-                        (msg) + " [" #cond "]");                                          \
-    }                                                                                     \
+#define CHECK(cond, msg)                                                                        \
+  do {                                                                                          \
+    if (!(cond)) {                                                                              \
+      throw TestFailure(std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " + (msg) + \
+                        " [" #cond "]");                                                        \
+    }                                                                                           \
   } while (0)
 
 constexpr size_t kBufSize = 4096;
 constexpr int kTransferTimeoutMs = 10000;
 // Longer than the NIC's default retry budget, so a stale write has run its course.
 constexpr int kStaleWriteTimeoutMs = 30000;
+// A peer whose rebuild was refused while fenced waits before trying again (failed QP
+// replacement backs off), so after unfencing it may take a few attempts to get back.
+constexpr int kRebuildBudgetMs = 15000;
 
 const char* const kProducer = "fence_producer";
 const char* const kReceiver = "fence_receiver";
@@ -150,12 +155,12 @@ std::unique_ptr<IOEngine> CreateEngine(const std::string& name) {
 MemoryLocationType g_loc = MemoryLocationType::CPU;
 constexpr int kGpuDevice = 0;
 
-#define HIP_OK(expr)                                                                   \
-  do {                                                                                 \
-    hipError_t e_ = (expr);                                                            \
-    if (e_ != hipSuccess) {                                                            \
-      throw TestFailure(std::string(#expr) + " failed: " + hipGetErrorString(e_));     \
-    }                                                                                  \
+#define HIP_OK(expr)                                                               \
+  do {                                                                             \
+    hipError_t e_ = (expr);                                                        \
+    if (e_ != hipSuccess) {                                                        \
+      throw TestFailure(std::string(#expr) + " failed: " + hipGetErrorString(e_)); \
+    }                                                                              \
   } while (0)
 
 bool GpuAvailable() {
@@ -223,6 +228,29 @@ bool WriteAndWait(IOEngine* from, const Buffer& src, const Buffer& dst,
   from->Write(src.desc, 0, dst.desc, 0, kBufSize, &status, from->AllocateTransferUniqueId());
   if (!WaitTerminal(&status, timeoutMs)) return false;
   return status.Succeeded();
+}
+
+// True if the write threw or did not succeed: what a refused connection looks like.
+bool WriteRefused(IOEngine* from, const Buffer& src, const Buffer& dst) {
+  try {
+    return !WriteAndWait(from, src, dst, 15000);
+  } catch (const std::exception&) {
+    return true;
+  }
+}
+
+// Retries the write, as a connector retrying a request would, until it succeeds or
+// `budgetMs` runs out.
+bool WriteEventually(IOEngine* from, const Buffer& src, const Buffer& dst, int budgetMs) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(budgetMs);
+  do {
+    try {
+      if (WriteAndWait(from, src, dst)) return true;
+    } catch (const std::exception&) {
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
 }
 
 void Link(IOEngine* a, IOEngine* b) {
@@ -329,11 +357,38 @@ void TestInitiatorReconnectsAfterFence(Rig& rig) {
   CHECK(fence.Ok(), "fence must succeed: " + fence.message);
   CHECK(fence.endpointsFenced >= 1, "the receiver's own connection to `other` must be cut");
 
+  // A fenced peer is cut off in both directions, not just for its own writes.
   dst.Fill(0x00);
   src.Fill(0xE5);
+  CHECK(WriteRefused(rig.receiver.get(), src, dst), "a fenced peer must be refused");
+  CHECK(dst.AllEqual(0x00), "a refused write must not land");
+
+  // After being let back in, the initiator builds a fresh connection and writes.
+  CHECK(rig.receiver->UnfenceRemoteEngine(kOther), "peer must have been fenced");
   CHECK(WriteAndWait(rig.receiver.get(), src, dst),
-        "after a fence the initiator must rebuild its connection and succeed");
+        "after unfencing, the initiator must rebuild its connection and succeed");
   CHECK(dst.AllEqual(0xE5), "the write over the rebuilt connection must land");
+}
+
+void TestLiveProducerRebuildsAfterFence(Rig& rig) {
+  // `producer` was fenced in case 2 and never restarted. It still holds its half of
+  // the old connection, which is dead.
+  Buffer src(rig.producer.get(), 0x77);
+  Buffer dst(rig.receiver.get(), 0x00);
+
+  // While fenced it must not be able to get back in. If its next write rebuilt a
+  // connection on its own, anything it still had queued for the abandoned transfer
+  // would land in buffers the receiver may have handed to someone else.
+  CHECK(WriteRefused(rig.producer.get(), src, dst), "a fenced producer must be refused");
+  CHECK(dst.AllEqual(0x00), "a refused write must not land");
+
+  // Once the receiver lets it back in, its writes notice the dead connection, rebuild
+  // through the normal handshake, and land. Its rebuild while fenced was refused, so
+  // the next one may first wait out the replacement backoff.
+  CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
+  CHECK(WriteEventually(rig.producer.get(), src, dst, kRebuildBudgetMs),
+        "an unfenced producer that kept running must be able to write again");
+  CHECK(dst.AllEqual(0x77), "the write over the rebuilt connection must land");
 }
 
 void TestRestartedPeerReconnects(Rig& rig) {
@@ -375,8 +430,11 @@ int main() {
       {"2. stale writer: a write after the fence must not land", TestStaleWriterCannotLand},
       {"3. scoped: other peers are unaffected", TestOtherPeersUnaffected},
       {"4. unknown / repeated fence is a no-op", TestUnknownAndRepeatedFence},
-      {"5. initiator reconnects after fencing a peer", TestInitiatorReconnectsAfterFence},
-      {"6. restarted peer with the same key reconnects", TestRestartedPeerReconnects},
+      {"5. fenced peer is refused both ways, then reconnects once unfenced",
+       TestInitiatorReconnectsAfterFence},
+      {"6. live producer: refused while fenced, rebuilds once unfenced",
+       TestLiveProducerRebuildsAfterFence},
+      {"7. restarted peer with the same key reconnects", TestRestartedPeerReconnects},
   };
 
   int passed = 0;

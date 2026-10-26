@@ -268,6 +268,8 @@ void RegisterMoriIo(pybind11::module_& m) {
           py::call_guard<py::gil_scoped_release>())
       .def("FenceRemoteEngine", &mori::io::IOEngine::FenceRemoteEngine,
            py::call_guard<py::gil_scoped_release>())
+      .def("UnfenceRemoteEngine", &mori::io::IOEngine::UnfenceRemoteEngine,
+           py::call_guard<py::gil_scoped_release>())
       .def("PopInboundTransferStatus", &mori::io::IOEngine::PopInboundTransferStatus,
            py::call_guard<py::gil_scoped_release>())
       .def("WaitAll", &mori::io::IOEngine::WaitAll, py::arg("statuses"), py::arg("timeout_ms") = -1,

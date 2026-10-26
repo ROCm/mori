@@ -413,6 +413,15 @@ FenceResult IOEngine::FenceRemoteEngine(const EngineKey& remote) {
   return total;
 }
 
+bool IOEngine::UnfenceRemoteEngine(const EngineKey& remote) {
+  bool wasFenced = false;
+  for (auto& it : backends) {
+    wasFenced = it.second->UnfenceRemoteEngine(remote) || wasFenced;
+  }
+  MORI_IO_INFO("Unfence remote engine {}: was_fenced={}", remote.c_str(), wasFenced);
+  return wasFenced;
+}
+
 MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryLocationType loc) {
   MemoryDesc memDesc;
   memDesc.engineKey = desc.key;

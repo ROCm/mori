@@ -251,8 +251,24 @@ class IOEngine:
         buffers it was targeting can be reused. Only trust that when the result
         has ``ok`` set; ``endpoints_failed > 0`` means the peer may still write.
         Fencing a peer this engine has no connection to is ok and a no-op.
+
+        The peer stays fenced: it cannot reconnect, in either direction, until
+        ``unfence_remote_engine``. Otherwise a peer that noticed its connection
+        died would rebuild it and land the writes it still had queued.
         """
         return self._engine.FenceRemoteEngine(engine_key)
+
+    def unfence_remote_engine(self, engine_key: str) -> bool:
+        """Let a fenced peer connect again; True if it was fenced.
+
+        Call this once nothing the peer still has in flight can reach buffers that
+        were handed out, for example after telling it to abort the request.
+
+        A peer whose reconnects were refused meanwhile backs off before trying
+        again. It can drop its dead sessions and reconnect at once by fencing and
+        unfencing this engine on its side.
+        """
+        return self._engine.UnfenceRemoteEngine(engine_key)
 
     def wait_all(self, statuses, timeout_ms: int = -1) -> "mori_cpp.StatusCode":
         return self._engine.WaitAll(statuses, timeout_ms)
