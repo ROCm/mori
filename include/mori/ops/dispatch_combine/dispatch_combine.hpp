@@ -378,6 +378,12 @@ class EpDispatchCombineHandle {
 
   int fp8BlockwiseCombineScaleDim{0};
   int fp8BlockwiseCombineScaleTypeSize{0};
+  // Temporary workaround for AINIC/KVM environments where RDMA atomics do not land.
+  // Fixed in AINIC firmware 1.117.5-a-230; remove this flag and the "_atomicfree" kernels
+  // once that firmware is deployed on the KVM hosts.
+  // InterNodeV1/V1LL signal remote PEs with RDMA WRITEs instead of RDMA atomics when enabled.
+  // Selects the "_atomicfree" kernel variants at launch; it is not passed to the kernels.
+  bool disableRdmaAtomics{false};
   // Routed expert indices for tokens
   index_t* tokenIndices{nullptr};
 
