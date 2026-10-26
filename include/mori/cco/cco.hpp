@@ -1258,7 +1258,7 @@ struct ccoSdmaQueueDeviceHandle {
   // most CCO_SDMA_QUEUE_SIZE - CCO_SDMA_UNIT bytes are outstanding, an Aggregate
   // batch included: the put that would fill the ring waits for rptr, which an
   // uncommitted batch never moves. Same rule as anvil_device.hpp's CanWriteUpto.
-  __device__ __forceinline__ static bool RingHasRoom(uint64_t end, uint64_t readIndex) {
+  __device__ __forceinline__ static bool CanWriteUpto(uint64_t end, uint64_t readIndex) {
     return end - readIndex < CCO_SDMA_QUEUE_SIZE;
   }
 
@@ -1269,7 +1269,7 @@ struct ccoSdmaQueueDeviceHandle {
     }
     uint64_t base = __hip_atomic_fetch_add(impl::global(cachedWptr), slotBytes, __ATOMIC_RELAXED,
                                            __HIP_MEMORY_SCOPE_AGENT);
-    if (!RingHasRoom(base + slotBytes, cachedHwReadIndex)) {
+    if (!CanWriteUpto(base + slotBytes, cachedHwReadIndex)) {
       [[maybe_unused]] int retries = 0;
       do {
         cachedHwReadIndex =
@@ -1280,7 +1280,7 @@ struct ccoSdmaQueueDeviceHandle {
             break;
           }
         }
-      } while (!RingHasRoom(base + slotBytes, cachedHwReadIndex));
+      } while (!CanWriteUpto(base + slotBytes, cachedHwReadIndex));
       __hip_atomic_store(impl::global(&shared->cachedHwReadIndex), cachedHwReadIndex,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }

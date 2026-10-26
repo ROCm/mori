@@ -127,7 +127,7 @@ struct SdmaQueueDeviceHandle {
     return index % queue_size_in_bytes;
   }
 
-  // Leaves one slot free, as cco.hpp's RingHasRoom: a full ring reads as empty.
+  // Leaves one slot free, as cco.hpp's CanWriteUpto does: a full ring reads as empty.
   __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
     if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
