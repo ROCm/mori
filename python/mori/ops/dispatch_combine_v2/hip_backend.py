@@ -248,15 +248,6 @@ def ll_bf16_row_bytes(cfg) -> int:
     return ((cfg.combine_token_nbytes + wt + 119) // 120 + 7) // 8 * 1024
 
 
-def _mtype_local_rw() -> bool:
-    """amdgpu's mtype_local is 0, MTYPE_RW. Unreadable counts as not."""
-    try:
-        with open("/sys/module/amdgpu/parameters/mtype_local") as f:
-            return f.read().strip() == "0"
-    except OSError:
-        return False
-
-
 def ll_comb_row_bytes(cfg) -> int:
     """A landing row of the LL128 combine (EpCombineLl1250x): the wire row's payload and scale
     bytes in 128 B lines of 120 data bytes each, in whole units of eight lines."""
@@ -783,9 +774,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _ll128_plan(self, cfg):
         """The LL128 plans of this op ({"dispatch": (block, warp), "combine": (block, warp)},
         without "dispatch" when only the combine takes LL128; hip_tuning_configs.ll128), or None.
-        Only on local memory of MTYPE RW: on the MTYPE NC parts (f01-2) a poll kept reading
-        stale lines and rows went missing."""
-        if not self._is1250 or cfg.is_internode or not _mtype_local_rw():
+        """
+        if not self._is1250 or cfg.is_internode:
             return None
         if cfg.is_fp4:
             dt = "fp4"
