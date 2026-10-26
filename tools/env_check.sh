@@ -13,6 +13,12 @@
 #                 old for IBGDA.
 #   - Mellanox  : good backward compatibility, no known minimum version.
 # For all NICs, the userspace library must match the corresponding kernel driver.
+#
+# AINIC inside a KVM guest (SR-IOV VF) needs newer firmware than bare metal:
+# below 1.117.5-a-230, RDMA atomics into GPU (dma-buf) memory fail even though
+# RDMA writes into the same memory work, so the ib_write_bw meshes pass while
+# MORI's atomic signalling hangs. `mori check` warns on the firmware and runs an
+# ib_atomic_bw step against GPU memory to catch it directly.
 
 set -uo pipefail
 
@@ -41,6 +47,12 @@ MSG_SIZE=65536      # 64K
 LAT_MSG_SIZE=2      # bytes (small message for latency)
 IB_PORT=18515       # base port for ib_write_bw / ib_write_lat
 AINIC_MIN_VER="1.117.5-a-45"       # minimum recommended AINIC firmware for IBGDA
+AINIC_KVM_MIN_VER="1.117.5-a-230"  # minimum AINIC firmware in a KVM guest (GPU dma-buf atomics)
+# ib_atomic_bw runs per rail and memory type. A broken rail can still pass a
+# single run: on affected firmware the outcome depends on which QP slot the run
+# lands on, and that changes from run to run. Three runs catch a slot-dependent
+# rail ~7 times in 8.
+ATOMIC_RUNS="${MORI_CHECK_ATOMIC_RUNS:-3}"
 BNXT_MIN_VER_235="235.2.86.0"      # minimum solid version on the 235.x branch
 BNXT_MIN_VER_237="237.1.137.0"     # minimum solid version on the 237.x branch
 # Kept <= sshd MaxSessions (default 10): all remote servers multiplex over one
@@ -96,8 +108,9 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options] [peer_ip]
 
-  peer_ip                 run the inter-node bandwidth/latency checks against
-                          this host as well (steps 5 and 6). Local-only if omitted.
+  peer_ip                 run the inter-node bandwidth/atomic/latency checks
+                          against this host as well. Local-only if omitted (the
+                          atomic check then loops back on each local NIC).
 
 Options:
   --no-gpu-mem            run the bandwidth/latency mesh on host memory instead
@@ -107,6 +120,7 @@ Options:
 
 Environment:
   MORI_PERFTEST_PREFIX    where to find perftest (searched before \$PATH)
+  MORI_CHECK_ATOMIC_RUNS  ib_atomic_bw runs per rail and memory type (default 3)
   SSH_USER                user for peer access (default \$SUDO_USER, else \$(whoami))
 
 Exit status:
@@ -843,6 +857,38 @@ report_fabric_topology() {
     esac
 }
 
+# rail_pairs <cell_assoc> <row_arr> <col_arr> <out_rows> <out_cols>
+#   Fills out_rows/out_cols with the rail-aligned pairs of a host-memory mesh.
+#   A rail is the reachable pair for local NIC i, not blindly local[i] <->
+#   remote[i]: if the two nodes enumerate their devices in different orders the
+#   physical rail is a permuted pair, and the diagonal would either skip a good
+#   rail (rail-only fabric) or measure a cross-rail pair as if it were on-rail
+#   (fully routed). So take the diagonal when it is reachable, else fall back to
+#   the single reachable pair in that row -- which on a rail-only fabric is the
+#   actual rail. When a row has several reachable pairs (fully routed) the
+#   diagonal is reachable too, so the ambiguous case never reaches the fallback.
+#   Namerefs carry a __rp_ prefix so a caller's own names cannot alias them.
+rail_pairs() {
+    local -n __rp_cell="$1" __rp_rows="$2" __rp_cols="$3" __rp_or="$4" __rp_oc="$5"
+    __rp_or=(); __rp_oc=()
+    local i jj jsel jreach nreach
+    for (( i=0; i<${#__rp_rows[@]}; i++ )); do
+        jsel=-1
+        if [[ "${__rp_cell[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
+            jsel=$i
+        else
+            jreach=-1; nreach=0
+            for (( jj=0; jj<${#__rp_cols[@]}; jj++ )); do
+                [[ "${__rp_cell[$i,$jj]:-x}" =~ ^[0-9.]+$ ]] || continue
+                jreach=$jj; nreach=$(( nreach + 1 ))
+            done
+            (( nreach == 1 )) && jsel=$jreach
+        fi
+        (( jsel >= 0 )) || continue
+        __rp_or+=("${__rp_rows[$i]}"); __rp_oc+=("${__rp_cols[$jsel]}")
+    done
+}
+
 # gpu_mesh_check <tool> <peer> <row_arr> <col_arr> <rgid_assoc> <cgid_assoc>
 #                <host_cell_assoc> <label> <unit> <fmt>
 #   Full NxM GPU-memory mesh, mirroring the host-memory mesh that just ran.
@@ -930,31 +976,9 @@ gpu_mesh_check() {
     # oversubscribes the host badly enough that some land at a third of line rate
     # (69a3027b). n probes at a few seconds each is a cheap price for numbers
     # that mean something -- and unlike Phase A, these are worth judging.
-    #
-    # A rail is the reachable pair for local NIC i, not blindly local[i] <->
-    # remote[i]: if the two nodes enumerate their devices in different orders the
-    # physical rail is a permuted pair, and the diagonal would either skip a good
-    # rail (rail-only fabric) or measure a cross-rail pair as if it were on-rail
-    # (fully routed). So take the diagonal when it is reachable, else fall back to
-    # the single reachable pair in that row -- which on a rail-only fabric is the
-    # actual rail. When a row has several reachable pairs (fully routed) the
-    # diagonal is reachable too, so the ambiguous case never reaches the fallback.
-    local -a R=() C=(); local diag_gated=0
-    for (( i=0; i<${#_rr[@]}; i++ )); do
-        local jsel=-1
-        if [[ "${_hc[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
-            jsel=$i
-        else
-            local jreach=-1 nreach=0 jj
-            for (( jj=0; jj<${#_cc[@]}; jj++ )); do
-                [[ "${_hc[$i,$jj]:-x}" =~ ^[0-9.]+$ ]] || continue
-                jreach=$jj; nreach=$(( nreach + 1 ))
-            done
-            (( nreach == 1 )) && jsel=$jreach
-        fi
-        (( jsel >= 0 )) || continue
-        R+=("${_rr[$i]}"); C+=("${_cc[$jsel]}"); diag_gated=$(( diag_gated + 1 ))
-    done
+    local -a R=() C=(); local diag_gated
+    rail_pairs "$hc_name" "$3" "$4" R C
+    diag_gated=${#R[@]}
     if (( diag_gated == 0 )); then
         log_warn "$label GPU memory: no rail-aligned pair reachable on host memory, skipping the serial pass"
         return 0
@@ -1038,7 +1062,8 @@ intra_reachable() {
 # mesh_execute fills <cell_assoc>[i,j] with a numeric metric, "x" (fail) or "-" (self).
 #   mesh_execute <cell_assoc> <tool> <server_host> <self_skip> <iters> \
 #                <row_gid_assoc> <col_gid_assoc> <row_arr> <col_arr>
-#   tool=ib_write_bw -> BW avg (Gbps);  tool=ib_write_lat -> avg latency (us).
+#   tool=ib_write_bw -> BW avg (Gbps);  tool=ib_write_lat -> avg latency (us);
+#   tool=ib_atomic_bw -> BW avg (Gbps) of the 8-byte atomic stream.
 #   iters: empty = ib_* default; otherwise "-n <iters>".
 #   Probes run in parallel, throttled to MESH_PARALLEL. Each pair uses a unique
 #   port so concurrent runs don't collide.
@@ -1056,6 +1081,9 @@ mesh_execute() {
     if [[ "$tool" == "ib_write_bw" ]]; then
         extra="-s $MSG_SIZE --report_gbits"; key="$MSG_SIZE"; col='$(NF-1)'
         [[ "$BW_QP" -gt 1 ]] && extra="$extra -q $BW_QP"
+    elif [[ "$tool" == "ib_atomic_bw" ]]; then
+        # Atomics are always 8 bytes; -F keeps the cpufreq warning off the result.
+        extra="-F --report_gbits"; key="8[[:space:]]"; col='$(NF-1)'
     else
         extra="-s $LAT_MSG_SIZE"; key="$LAT_MSG_SIZE"; col='$6'
     fi
@@ -1267,6 +1295,70 @@ dominant_group() {
 }
 
 # ======================== check functions =======================
+
+# Rail-aligned inter-node pairs (local dev, remote dev) the host-memory mesh in
+# check_inter_node_bw proved reachable. Reused by check_atomic, so the atomic
+# step runs over the same rails without probing the mesh again.
+INTER_RAIL_L=()
+INTER_RAIL_R=()
+
+# Hypervisor this host runs under ("kvm", ...), empty on bare metal. Set by
+# detect_virt.
+HOST_VIRT=""
+
+# detect_virt
+#   systemd-detect-virt answers directly ("kvm" under Cloud Hypervisor and
+#   QEMU/KVM alike); --vm keeps a container on bare metal from reading as
+#   virtualized. Without systemd, the CPUID hypervisor bit still says "a VM",
+#   just not which one.
+detect_virt() {
+    HOST_VIRT=""
+    local v=""
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        v=$(systemd-detect-virt --vm 2>/dev/null) || v=""
+        [[ "$v" == "none" ]] && v=""
+    fi
+    if [[ -z "$v" ]] && grep -qw hypervisor /proc/cpuinfo 2>/dev/null; then
+        v="vm"
+    fi
+    HOST_VIRT="$v"
+}
+
+# check_ainic_vm_firmware
+#   Firmware check for an AINIC guest. Reads fw_ver from sysfs rather than
+#   nicctl: nicctl manages the physical card and finds nothing inside a guest
+#   (it reports "No AMD NICs detected"), so check_versions never runs there.
+#   Warns, does not fail: a guest below the minimum still does RDMA writes, and
+#   MORI-EP runs with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step reports
+#   whether atomics actually work.
+check_ainic_vm_firmware() {
+    step "check AINIC firmware for a virtualized host ($HOST_VIRT)"
+    local d fw; local -a fws=()
+    for d in /sys/class/infiniband/*; do
+        [[ "$(ib_pci_vendor "$d")" == "0x1dd8" ]] || continue
+        fw=$(cat "$d/fw_ver" 2>/dev/null)
+        [[ -n "$fw" ]] && fws+=("$fw")
+    done
+    if (( ${#fws[@]} == 0 )); then
+        log_warn "cannot read AINIC firmware from /sys/class/infiniband/*/fw_ver"; return 0
+    fi
+    report_uniform "AINIC firmware (sysfs)" "${fws[@]}"
+
+    local v
+    while read -r v; do
+        if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            log_warn "cannot parse AINIC firmware version '$v' against the $HOST_VIRT minimum"
+        elif version_ge "$v" "$AINIC_KVM_MIN_VER"; then
+            log_ok "AINIC firmware $v meets the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
+        else
+            log_warn "AINIC firmware $v is below the $HOST_VIRT guest minimum (>= $AINIC_KVM_MIN_VER)"
+            log_warn "  RDMA atomics into GPU (dma-buf) memory fail on this firmware in a VM, while"
+            log_warn "  RDMA writes work -- so the bandwidth meshes pass and MORI-EP's atomic"
+            log_warn "  signalling hangs. Upgrade the host firmware, or run MORI-EP (InterNodeV1/V1LL)"
+            log_warn "  with MORI_EP_DISABLE_RDMA_ATOMICS=1. The atomic step below tests it directly."
+        fi
+    done < <(printf '%s\n' "${fws[@]}" | sort -u)
+}
 
 check_versions() {
     step "check ainic firmware and driver version"
@@ -1507,12 +1599,201 @@ check_inter_node_bw() {
     mesh_execute CELL ib_write_bw "$PEER_IP" false 1000 LGID RGID LOCAL_DEVS REMOTE_DEVS
     mesh_report CELL LOCAL_DEVS REMOTE_DEVS "inter-node BW" "Gbps" int
     assess_fabric_topology CELL "${#LOCAL_DEVS[@]}" "${#REMOTE_DEVS[@]}"
+    rail_pairs CELL LOCAL_DEVS REMOTE_DEVS INTER_RAIL_L INTER_RAIL_R
 
     # The mesh above ran on host memory. MORI transfers VRAM-to-VRAM, so repeat
     # it on GPU memory: a pair that passed on host memory and fails here is a
     # GPUDirect fault, not a fabric one.
     gpu_mesh_check ib_write_bw "$PEER_IP" LOCAL_DEVS REMOTE_DEVS LGID RGID CELL \
                    "inter-node BW" "Gbps" int
+}
+
+# check_atomic
+#   ib_atomic_bw per rail with the responder's buffer in GPU memory via dma-buf,
+#   the path MORI's atomic signalling (IBGDA, MORI-EP) takes. The write meshes
+#   cannot stand in for it: on an AINIC KVM guest below AINIC_KVM_MIN_VER every
+#   rail passes ib_write_bw on GPU memory and fails every atomic into it.
+#
+#   With a peer, the rails are the rail-aligned pairs the inter-node BW step
+#   proved on host memory, with the server on the peer. Without one, each local
+#   NIC loops back to itself, which exercises the same responder path.
+#
+#   Only the server side uses GPU memory. The atomic executes at the responder,
+#   so that is where the GPU buffer belongs; keeping the client on host memory
+#   stops a client-side registration problem from being blamed on atomics. A
+#   host-memory pass runs first, so a GPU-only failure points at the dma-buf
+#   target rather than atomics as a whole. Each pass repeats ATOMIC_RUNS times:
+#   the AINIC failure is QP-slot dependent and a single run can miss it.
+check_atomic() {
+    step "RDMA atomic check (ib_atomic_bw, responder on GPU memory via dma-buf)"
+
+    local shost srv_host="" where noun
+    local -a AR=() AC=()
+    if [[ -n "$PEER_IP" ]]; then
+        if (( ${#INTER_RAIL_L[@]} == 0 )); then
+            log_skip "no rail-aligned inter-node pair reachable on host memory, nothing to test"; return 0
+        fi
+        AR=("${INTER_RAIL_L[@]}"); AC=("${INTER_RAIL_R[@]}")
+        shost="$PEER_IP"; srv_host="$PEER_IP"; where="inter-node atomics"; noun="rail"
+    else
+        # The intra-node step fills LOCAL_DEVS, unless it bailed out first.
+        if (( ${#LOCAL_DEVS[@]} == 0 )); then
+            local all_devs=(); mapfile -t all_devs < <(query_rdma_devices)
+            (( ${#all_devs[@]} > 0 )) || { log_fail "no local RDMA devices found (check ibv_devices)"; return 0; }
+            dominant_group LOCAL_DEVS "${all_devs[@]}"
+            filter_fabric_devs LOCAL_DEVS "" "${LOCAL_DEVS[@]}"
+        fi
+        (( ${#LOCAL_DEVS[@]} > 0 )) || { log_fail "no usable local RDMA devices"; return 0; }
+        AR=("${LOCAL_DEVS[@]}"); AC=("${LOCAL_DEVS[@]}")
+        shost=localhost; where="loopback atomics"; noun="NIC"
+    fi
+    local n=${#AR[@]}
+
+    MESH_CLI_BIN=$(resolve_perftest ib_atomic_bw)
+    if [[ -z "$MESH_CLI_BIN" ]]; then
+        log_warn "ib_atomic_bw not found (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
+        perftest_hint; return 0
+    fi
+    MESH_SRV_BIN="$MESH_CLI_BIN"
+    if [[ -n "$srv_host" ]]; then
+        MESH_SRV_BIN=$(resolve_perftest ib_atomic_bw "$srv_host")
+        if [[ -z "$MESH_SRV_BIN" ]]; then
+            log_warn "ib_atomic_bw not found on $srv_host (searched $MORI_PERFTEST_PREFIX/bin and \$PATH), skipping"
+            perftest_hint; return 0
+        fi
+    fi
+
+    local -A AGL=() AGR=()
+    build_gid_map AGL "" "${AR[@]}"
+    build_gid_map AGR "$srv_host" "${AC[@]}"
+
+    # One rail at a time, like the serial BW pass: these are per-rail verdicts.
+    # Every run gets its own port block (mesh_execute derives ports from
+    # IB_PORT): a hung atomic leaves its server running until its own timeout,
+    # and on a peer killing the local ssh does not stop it, so reusing the port
+    # in the next run would connect to that stale server.
+    local MESH_PARALLEL=1 port0=$(( IB_PORT + 3000 )) pblock=0
+    local IB_PORT=$port0
+    local i run
+    MESH_RGPU=(); MESH_CGPU=(); MESH_GPU_DMABUF=""
+    mesh_gpu_off
+
+    # Host memory, every rail, every run. Not a clean control on affected
+    # AINIC firmware: there host-memory atomics hang too whenever the QP pair
+    # lands on the bad slot, so one passing run proves the rail is reachable,
+    # not that its atomics work.
+    local -A HPASS=() HVAL=() HGATE=()
+    for (( run=0; run<ATOMIC_RUNS; run++ )); do
+        IB_PORT=$(( port0 + pblock * 4 * n * n )); pblock=$(( pblock + 1 ))
+        local -A HCELL=()
+        mesh_execute HCELL ib_atomic_bw "$shost" false "" AGL AGR AR AC true
+        for (( i=0; i<n; i++ )); do
+            [[ "${HCELL[$i,$i]:-x}" =~ ^[0-9.]+$ ]] || continue
+            HPASS[$i]=$(( ${HPASS[$i]:-0} + 1 )); HVAL[$i]="${HCELL[$i,$i]}"; HGATE[$i,$i]=1
+        done
+    done
+
+    # GPU memory on the server side only, and only via dma-buf: that is the
+    # registration MORI uses on AINIC, and peer_mem is not on offer in a guest.
+    local gpu_ok=""
+    if [[ "$USE_GPU_MEM" != "true" ]]; then
+        log_skip "--no-gpu-mem: GPU-memory atomic pass skipped"
+    elif ! perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$srv_host"; then
+        log_warn "ib_atomic_bw on ${srv_host:-this host} lacks --use_rocm_dmabuf -- GPU-memory atomic pass skipped"
+        perftest_hint
+    else
+        # Same KFD-vs-HIP ordinal reasoning as mesh_prepare; only matters when
+        # the server (and so the GPU) is on this host.
+        if [[ -z "$srv_host" && -n "${HIP_VISIBLE_DEVICES:-}${ROCR_VISIBLE_DEVICES:-}${CUDA_VISIBLE_DEVICES:-}" ]]; then
+            log_warn "clearing HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES for the GPU-memory pass (KFD ordinals must match HIP's)"
+            unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+        fi
+        if build_gpu_map MESH_CGPU "$srv_host"; then
+            gpu_ok=1
+        else
+            log_warn "no GPUs found via KFD topology on ${srv_host:-this host} -- GPU-memory atomic pass skipped"
+        fi
+    fi
+
+    # GPU memory: only the rails host memory reached at least once (a rail with
+    # no path at all says nothing about GPU memory), and a rail leaves the gate
+    # at its first failure -- one failed atomic is the verdict, and every
+    # further run on it would only burn a timeout.
+    local -A GPASS=() GVAL=() GFAILRUN=() SGPU=()
+    if [[ -n "$gpu_ok" ]]; then
+        for (( i=0; i<n; i++ )); do SGPU[$i]="${MESH_CGPU[${AC[$i]}]:-?}"; done
+        local -A GGATE=()
+        for (( i=0; i<n; i++ )); do [[ -n "${HGATE[$i,$i]:-}" ]] && GGATE[$i,$i]=1; done
+        MESH_GPU_DMABUF=1
+        mesh_gpu_on
+        # The server pays the HIP init and mesh_gpu_on scales its wait for it;
+        # the client is on host memory, so it keeps a short timeout and a hung
+        # atomic costs seconds, not the full GPU budget.
+        MESH_CLI_TIMEOUT=$(( _MESH_CLI_TIMEOUT0 * 2 ))
+        for (( run=0; run<ATOMIC_RUNS; run++ )); do
+            (( ${#GGATE[@]} > 0 )) || break
+            IB_PORT=$(( port0 + pblock * 4 * n * n )); pblock=$(( pblock + 1 ))
+            local -A GCELL=()
+            mesh_execute GCELL ib_atomic_bw "$shost" false "" AGL AGR AR AC true GGATE
+            for (( i=0; i<n; i++ )); do
+                [[ -n "${GGATE[$i,$i]:-}" ]] || continue
+                if [[ "${GCELL[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
+                    GPASS[$i]=$(( ${GPASS[$i]:-0} + 1 )); GVAL[$i]="${GCELL[$i,$i]}"
+                else
+                    GFAILRUN[$i]=$(( run + 1 )); unset "GGATE[$i,$i]"
+                fi
+            done
+        done
+        mesh_gpu_off
+        MESH_GPU_DMABUF=""; MESH_CGPU=()
+    fi
+
+    # No bandwidth threshold: 8-byte atomics measure op latency, not the fabric,
+    # and loopback numbers are not comparable to inter-node ones. Pass/fail only.
+    local hdead=0 hflaky=0 gfail=0 gpass=0 hp line
+    for (( i=0; i<n; i++ )); do
+        hp=${HPASS[$i]:-0}
+        line=$(printf "  %-12s <-> %-12s :" "${AR[$i]}" "${AC[$i]}")
+        if (( hp == 0 )); then
+            hdead=$(( hdead + 1 ))
+            echo "$line host memory FAILED (0/$ATOMIC_RUNS runs)"; continue
+        elif (( hp < ATOMIC_RUNS )); then
+            hflaky=$(( hflaky + 1 ))
+            line+=" host FAILED $(( ATOMIC_RUNS - hp ))/$ATOMIC_RUNS runs"
+        else
+            line+=" host ${HVAL[$i]} Gbps"
+        fi
+        if [[ -z "$gpu_ok" ]]; then
+            :
+        elif [[ -n "${GFAILRUN[$i]:-}" ]]; then
+            gfail=$(( gfail + 1 ))
+            line+=" | gpu ${SGPU[$i]} dma-buf FAILED on run ${GFAILRUN[$i]}/$ATOMIC_RUNS"
+        else
+            gpass=$(( gpass + 1 ))
+            line+=" | gpu ${SGPU[$i]} dma-buf ${GVAL[$i]} Gbps"
+        fi
+        echo "$line"
+    done
+
+    (( hdead )) && log_fail "$where: $hdead/$n $noun(s) failed every ib_atomic_bw run on host memory"
+    # A rail that fails some runs is as broken as one that fails all of them:
+    # MORI-EP hangs on the first atomic that does not complete.
+    (( hflaky )) && log_fail "$where: $hflaky/$n $noun(s) failed some host-memory runs -- RDMA atomics are unreliable there"
+    if [[ -n "$gpu_ok" ]]; then
+        (( gfail )) && log_fail "$where: $gfail/$(( n - hdead )) $noun(s) failed into GPU dma-buf memory"
+        (( gfail == 0 && hdead + hflaky == 0 && gpass > 0 )) && \
+            log_ok "$where: all $gpass $noun(s) passed on host and GPU dma-buf memory ($ATOMIC_RUNS runs each)"
+    elif (( hdead + hflaky == 0 )); then
+        log_ok "$where: all $n $noun(s) passed on host memory ($ATOMIC_RUNS runs each; GPU-memory pass not run)"
+    fi
+    if (( hdead + hflaky + gfail > 0 )); then
+        log_warn "  MORI-EP signals with RDMA atomics by default and hangs on these ${noun}s;"
+        log_warn "  MORI_EP_DISABLE_RDMA_ATOMICS=1 switches InterNodeV1/V1LL to write-based signalling."
+        if [[ "$_dominant_vendor" == "ionic" && -n "$HOST_VIRT" ]]; then
+            log_warn "  On an AINIC $HOST_VIRT guest this is the firmware: it needs >= $AINIC_KVM_MIN_VER."
+        fi
+    fi
+    return 0
 }
 
 # =================== bnxt_re (Broadcom) checks =================
@@ -2340,6 +2621,8 @@ minority_note() {
     done
 }
 
+detect_virt
+
 case "$_dominant_vendor" in
     ionic)
         if [[ "$_nicctl_ok" == "true" ]]; then
@@ -2349,6 +2632,8 @@ case "$_dominant_vendor" in
         else
             log_warn "ionic NICs present but nicctl is unavailable or cannot access them — skipping nicctl-based checks (firmware / QoS / DCQCN)"
         fi
+        # Independent of nicctl, which cannot see the NICs from inside a guest.
+        [[ -n "$HOST_VIRT" ]] && check_ainic_vm_firmware
         ;;
     bnxt)
         check_bnxt_versions
@@ -2368,6 +2653,7 @@ minority_note
 
 check_intra_node_bw
 check_inter_node_bw
+check_atomic
 check_inter_node_lat
 
 # Cluster-level findings the per-step output cannot express, reported once here.
