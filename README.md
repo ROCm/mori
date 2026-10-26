@@ -221,7 +221,6 @@ cd mori && docker build -t rocm/mori:dev -f docker/Dockerfile.dev .
 | Vendor | Recommendation |
 |--------|-----------------|
 | AMD Pollara (AINIC) | `>= 1.117.5-a-45` (`1.117.1` major lacks IBGDA support) |
-| AMD Pollara (AINIC), KVM guest | `>= 1.117.5-a-230`; older firmware fails RDMA atomics into GPU (dma-buf) memory |
 | Broadcom (Thor2) | `237.1.137.x` / `235.2.86.x`; known bad: `231.x`, `232.x` |
 | Mellanox (ConnectX, mlx5) | No known minimum; tested on `ConnectX-7` |
 
@@ -233,11 +232,10 @@ Before a cross-node run, check the fabric:
 mori check <peer_ip>          # or: tools/env_check.sh <peer_ip>
 ```
 
-NIC firmware and driver, QoS/PFC, DCQCN, then intra-node, inter-node bandwidth
-and latency meshes over every NIC pair, on host memory and on GPU memory, plus
-an `ib_atomic_bw` check per rail with the responder on GPU memory via dma-buf
-(per-NIC loopback without a peer). Exits non-zero if any check failed, and
-reports the fabric topology, which decides what can run on it.
+Six steps — NIC firmware and driver, QoS/PFC, DCQCN, then intra-node,
+inter-node bandwidth and latency meshes over every NIC pair, on host memory and
+on GPU memory. Exits non-zero if any check failed, and reports the fabric
+topology, which decides what can run on it.
 
 ### Install
 
