@@ -47,7 +47,8 @@ namespace anvil {
 
 class SdmaQueue {
  public:
-  SdmaQueue(uint32_t localNodeId, uint32_t engineId);
+  // hsakmtNodeId is libhsakmt's node id, not the sysfs one (see connect()).
+  SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId);
   ~SdmaQueue();
 
   SdmaQueueDeviceHandle* deviceHandle() const;
@@ -75,24 +76,24 @@ class AnvilLib {
 
  public:
   void init();
-  // srcNode/dstNode are KFD topology node ids (== HSA_AGENT_INFO_NODE), a
-  // host-global GPU identity that does NOT depend on HIP_VISIBLE_DEVICES. This
-  // is the correct key for a peer even when the peer GPU is not in this
-  // process's HIP device list. Channels for a pair are shared process-wide.
+  // srcNode/dstNode are KFD sysfs node ids (N in /sys/class/kfd/kfd/topology/nodes/N),
+  // a host-global GPU identity that depends neither on HIP_VISIBLE_DEVICES nor on
+  // which GPUs a container exposes. libhsakmt numbers only the nodes this process
+  // can open, so anvil reads topology from sysfs and translates the local node
+  // only to create its queues. Channels for a pair are shared process-wide.
   bool connect(int srcNode, int dstNode, int numChannels = 1);
 
   // Get the SDMA queue for a given src/dst node pair and channel index.
   SdmaQueue* getSdmaQueue(int srcNode, int dstNode, int channelIdx = 0);
 
-  // Map a HIP device ordinal to its KFD node id. For single-process callers
+  // Map a HIP device ordinal to its KFD sysfs node id. For single-process callers
   // (e.g. the examples) that only have HIP device ids; multi-process collectives
   // should exchange node ids out-of-band instead (see Context::KfdNodeId).
   static uint32_t nodeForHipDevice(int hipDev);
 
-  // Resolve the KFD topology node id of the given HIP device WITHOUT initializing
-  // HSA. The KFD node id (the directory index under /sys/class/kfd/kfd/topology/nodes)
-  // is identical to what HSA_AGENT_INFO_NODE / hsaKmtGetNodeProperties report,
-  // and is a host-global identity independent of HIP_VISIBLE_DEVICES.
+  // Resolve the KFD sysfs node id (the directory index under
+  // /sys/class/kfd/kfd/topology/nodes) of the given HIP device WITHOUT initializing
+  // HSA. It equals HSA_AGENT_INFO_NODE only when this process can open every GPU.
   static int kfdNodeIdForHipDevice(int hipDev);
 
  private:
