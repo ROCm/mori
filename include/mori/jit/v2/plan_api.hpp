@@ -70,9 +70,6 @@ struct PlanVTable {
   void (*launch)(void*, const void* argBuf, size_t argSize, void* stream);
   // "key=value\n..." — geometry, the full Cfg, and the cache directory.
   std::string (*info)(void*);
-  // `info` for a request, without compiling: what a caller sizes before the plan
-  // exists. cacheDir is empty.
-  std::string (*describe)(const FieldBag&);
   // Fill the disk cache for the declared coverage; no GPU touched.
   int (*precompile)(const std::string& arch);
   // "name:tag=default,..." for the request; nested flattened as parent.child.
@@ -82,6 +79,9 @@ struct PlanVTable {
   const char* argsSchema;
   // sizeof the args struct; the binding asserts its schema-built struct against it.
   size_t argsSize;
+  // `info` for a request, without compiling: what a caller sizes before the plan
+  // exists. cacheDir is empty. Last, so the fields above keep their offsets.
+  std::string (*describe)(const FieldBag&);
 };
 
 void RegisterPlan(const char* name, const PlanVTable& vt);
@@ -167,8 +167,8 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
       ::mori::jit::v2::RegisterPlan(                                                             \
           #NAME,                                                                                 \
           ::mori::jit::v2::PlanVTable{&NAME##PlanCreate, &NAME##PlanDestroy, &NAME##PlanLaunch,  \
-                                      &NAME##PlanInfo, &NAME##PlanDescribe, &PRECOMPILE_FN,      \
-                                      &REQUEST_SCHEMA_FN, ARGS_SCHEMA, sizeof(ARGS_T)});         \
+                                      &NAME##PlanInfo, &PRECOMPILE_FN, &REQUEST_SCHEMA_FN,       \
+                                      ARGS_SCHEMA, sizeof(ARGS_T), &NAME##PlanDescribe});        \
     }                                                                                            \
   } NAME##PlanRegistrarInstance;                                                                 \
   }  // namespace

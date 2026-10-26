@@ -386,6 +386,53 @@ def test_staging_bytes_come_from_the_kernel_layout():
         assert d["stagingBytes"] == 0  # only the gfx125x dispatch stages
 
 
+def test_scale_stride_matches_the_plan():
+    # scale_stride_bytes() stays for callers that size without a plan.
+    from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
+
+    for scale in (0, 4, 32, 224, 256, 260):
+        info = cb.EpDispatchPlan.describe(scale_bytes=scale)
+        assert info["scaleStride"] == scale_stride_bytes(scale)
+
+
+_PUSH_KW = {
+    "fp4_blockwise": dict(combine_fp4=1),
+    "fp4_blockwise_fp32": dict(combine_fp4=1, combine_fp4_f32_scale=1),
+    "fp8_blockwise": dict(combine_fp8=1),
+}
+
+
+@pytest.mark.parametrize("quant", sorted(_PUSH_KW))
+@pytest.mark.parametrize("ws", [2, 4, 8])
+def test_push_compat_sizes_match_the_cpp_layout(quant, ws):
+    # push_wire_nbytes()/push_land_rows() stay for callers that size without a
+    # plan (aiter): the same values Sizes.PushWireRowsAndLanding pins in C++,
+    # and, where the push combine builds, what the plan itself reports.
+    from types import SimpleNamespace
+
+    from mori.ops.dispatch_combine_v2.hip_backend import (
+        push_land_rows,
+        push_wire_nbytes,
+    )
+
+    cfg = SimpleNamespace(
+        hidden_dim=7168,
+        quant_type=quant,
+        max_num_inp_token_per_rank=128,
+        world_size=ws,
+        num_experts_per_token=8,
+    )
+    assert push_wire_nbytes(cfg) == (7424 if quant == "fp8_blockwise" else 3840)
+    assert push_land_rows(cfg) == 128 * min(ws, 8)
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        return  # the push combine is gfx125x only
+    info = cb.EpCombinePlan.describe(
+        world_size=ws, max_tok_per_rank=128, hidden_dim=7168, **_PUSH_KW[quant]
+    )
+    assert info["pushWireBytes"] == push_wire_nbytes(cfg)
+    assert info["pushLandRows"] == push_land_rows(cfg)
+
+
 class _SizedArena:
     handle = 0xDEAD0000
 
@@ -393,14 +440,25 @@ class _SizedArena:
         self.sizes = sizes
 
     def offset(self, name):
+        if name not in self.sizes:
+            raise KeyError(name)  # as SymmArena does for a region it lacks
         return 0
 
     def size(self, name):
         return self.sizes[name]
 
 
+def _small_regions():
+    # Every plan the arena serves: dispatch and combine each size part of it.
+    return dict(
+        cb.arena_regions(
+            cb.EpDispatchPlan.describe(**_SMALL), cb.EpCombinePlan.describe(**_SMALL)
+        )
+    )
+
+
 def test_an_arena_too_small_for_the_plan_is_refused():
-    sizes = dict(cb.arena_regions(cb.EpDispatchPlan.describe(**_SMALL)))
+    sizes = _small_regions()
     cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(sizes)).close()
     short = dict(sizes, dispOut=sizes["dispOut"] - 1)
     with pytest.raises(ValueError, match="'dispOut'"):
@@ -410,9 +468,17 @@ def test_an_arena_too_small_for_the_plan_is_refused():
 def test_a_region_the_other_kernel_sizes_is_not_checked():
     # dispatch does not size outTok (combine does), so a dispatch-only caller may
     # bind it to a region of any size -- aiter binds it to its own comb_inp.
-    sizes = dict(cb.arena_regions(cb.EpDispatchPlan.describe(**_SMALL)))
-    assert "outTok" not in sizes
+    d = cb.EpDispatchPlan.describe(**_SMALL)
+    assert "outTok" not in dict(cb.arena_regions(d))
+    sizes = _small_regions()
     cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(dict(sizes, outTok=0))).close()
+
+
+def test_one_plans_regions_do_not_make_an_arena_it_can_bind():
+    # A dispatch-only arena lacks outTok, which the dispatch args still bind.
+    sizes = dict(cb.arena_regions(cb.EpDispatchPlan.describe(**_SMALL)))
+    with pytest.raises(KeyError):
+        cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(sizes))
 
 
 # --------------------------------------------------------------------------
@@ -595,6 +661,9 @@ def test_a_staging_tensor_is_checked_against_the_plan(launched, stages):
     buf = torch.zeros(need + 1, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="128 B aligned"):
         p.bind(staging_base=buf[1:])
+    pool = torch.zeros(need * 2, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="stagingBytes"):
+        p.bind(staging_base=pool[: need - 128])  # short, however large its pool
     p.bind(staging_base=buf)
     # Held, and bound by address so the launch struct caches it.
     assert p._staging is buf

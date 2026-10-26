@@ -93,8 +93,10 @@ class EpDispatchPlan(_EpDispatchJitPlan):
 
     def _checked_staging(self, buf) -> int:
         need = self.info["stagingBytes"]
-        storage = buf.untyped_storage()
-        have = storage.nbytes() - (buf.data_ptr() - storage.data_ptr())
+        # The tensor's own extent: a short slice of a larger buffer is still short.
+        if not buf.is_contiguous():
+            raise ValueError("ep_dispatch: staging_base must be contiguous")
+        have = buf.numel() * buf.element_size()
         if have < need:
             raise ValueError(
                 f"ep_dispatch: staging_base has {have} bytes, the plan needs {need} "

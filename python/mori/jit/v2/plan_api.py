@@ -217,7 +217,7 @@ def load_library(name: str = _ABI_NAME, extra_dirs=None) -> None:
 
 
 def _bind(lib: ctypes.CDLL) -> None:
-    """The whole ABI: ten symbols, the same for every kernel."""
+    """The whole ABI: twelve symbols, the same for every kernel."""
     lib.mori_jit_last_error.restype = ctypes.c_char_p
     lib.mori_jit_last_error.argtypes = []
 
@@ -456,6 +456,9 @@ def arena_regions(*infos, region_names=None) -> list[tuple[str, int]]:
     a region takes the largest any of them asks for, in the order they first
     report it, and one no plan needs (0 everywhere) is left out. ``region_names``
     maps a stem to the arena's name for it, as it does for ``arena=``.
+
+    Pass the info of every plan bound to the arena: a plan reports 0 for a region
+    another plan sizes (EP dispatch vs combine), yet binding still needs it to exist.
     """
     names = region_names or {}
     need = {}
@@ -618,7 +621,8 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                     self.close()
                     raise ValueError(
                         f"{kernel}: arena region {name!r} is {have} bytes, the plan "
-                        f"needs {need} (size it with arena_regions(plan.info))"
+                        f"needs {need} (size the arena with arena_regions() over the "
+                        f"info of every plan bound to it)"
                     )
 
         @classmethod

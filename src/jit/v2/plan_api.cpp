@@ -266,6 +266,8 @@ MORI_JIT_API const char* mori_jit_plan_describe(const char* kernel, const char* 
     if (!vt)
       throw std::runtime_error(std::string("unknown kernel '") + (kernel ? kernel : "(null)") +
                                "'");
+    if (!vt->describe)
+      throw std::runtime_error(std::string("kernel '") + kernel + "' registers no describe");
     ResolveArch(arch);
     FieldBag bag(names, values, count);
     std::string out = vt->describe(bag);

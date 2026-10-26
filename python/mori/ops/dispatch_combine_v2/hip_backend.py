@@ -370,6 +370,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             dev
         ).multi_processor_count
 
+        # Decided before the gate, which rejects the push combine with it, and before
+        # the plans are described: how the dispatch plans reserve slots follows where
+        # the slot allocator word lives (see TokOffExt below).
+        self._tokoff_wanted = (
+            not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
+        )
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
         # point of the gate is that an unsupported config never gets that far.
@@ -378,11 +384,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
-        # Decided before the plans are described: how the dispatch plans reserve
-        # slots follows where the slot allocator word lives (see TokOffExt below).
-        self._tokoff_wanted = (
-            not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
-        )
         # What the intranode plans report, per variant; _regions fills them.
         self._disp_infos, self._comb_infos = (), ()
         self.arena = SymmArena(comm, self._regions(cfg))
