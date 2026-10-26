@@ -60,7 +60,6 @@ NBYTES = NUM_ELEMS * 8
 NUM_PACKS = NBYTES // 16  # 16 B (vector<4xi32>) per pack
 THREADS = 256
 DST_RANK = 1  # rank 1's LSA rank
-_CM_UNCACHED = 3  # SC0|SC1: store bypasses L1+L2 -> reaches peer HBM
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -77,7 +76,8 @@ def lsa_put_kernel(dev_comm: Int64, win_handle: Int64):
     for pk in range(tid, NUM_PACKS, THREADS):
         off = pk * 4  # i32-element offset of this 16 B pack
         v = buffer.buffer_load(src_rsrc, off, vec_width=4, dtype=T.i32)
-        buffer.buffer_store(v, dst_rsrc, off, cache_modifier=_CM_UNCACHED)
+        # Past L1+L2 so the store reaches the peer's HBM.
+        buffer.buffer_store(v, dst_rsrc, off, cache_modifier=buffer.CM_SC0_SC1)
     rocdl.s_waitcnt(0)
 
 

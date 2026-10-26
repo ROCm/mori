@@ -24,11 +24,16 @@
 flydsl 0.3.0 removed ``flydsl.expr.buffer_ops``. ``mori.ops.dispatch_combine_v2
 .flydsl_compat`` bridges that for EPv2, but there ``cache_modifier`` is
 *accepted and ignored* on 0.3.0 and later. That is fine for a hint and wrong
-wherever the policy is the point -- a spin on a slot a **peer** writes needs a
-load that bypasses L2, and a signal store must be visible past L1+L2:
+wherever the policy is the point -- reading what a **peer** wrote into our memory
+needs a load that bypasses L2 (a remote store never invalidates our L2), and a
+store meant for a peer must be visible past L1+L2:
 
-* ``mori.ops.gemm_ar``'s cross-GPU barrier and SDMA signals, and
+* ``mori.ops.gemm_ar``'s loads of data a peer's copy engine delivered
+  (``kernels_sdma``, ``CM_SC1``), and
 * the cco FlyDSL examples, which load and store through LSA peer pointers.
+
+gemm_ar's barrier and signal slots are atomics instead
+(:mod:`mori.cco.device.flydsl.signals`) and use no ``aux`` bits.
 
 So on 0.3.0 and later this is built directly on ``rocdl.MakeBufferRsrcOp`` +
 ``rocdl.raw_ptr_buffer_{load,store}``, which still carry an explicit ``aux``
@@ -36,14 +41,17 @@ cache-policy operand; on 0.2.x it is ``flydsl.expr.buffer_ops`` itself. Only
 the primitives those callers need are implemented;
 ``aiter/ops/flydsl/kernels/buffer_ops.py`` is the full-featured version of the
 same idea and was the reference for the descriptor encoding.
+
+Offsets are in elements and are scaled to bytes in i32, as 0.2.x ``buffer_ops``
+does, so a byte offset must stay below 2 GiB.
 """
 
 from __future__ import annotations
 
 import inspect
 
+import flydsl
 from flydsl._mlir import ir
-from flydsl.expr import rocdl as _rocdl
 
 # Cache-modifier (``aux``) values. This is the LLVM ``CPol`` operand, **not** the
 # hardware bit positions, and the two do not line up -- which is worth stating
@@ -83,12 +91,16 @@ _CDNA_BUFFER_FLAGS = (7 << 12) | (4 << 15)
 _NO_OOB_LIMIT = 0xFFFFFFFF
 
 try:  # flydsl <= 0.2.x
-    # ImportError, not ModuleNotFoundError: on 0.3.0 ``buffer_ops`` is neither a
-    # submodule nor a name in ``flydsl.expr``, so this form raises the parent.
-    from flydsl.expr import buffer_ops as _bo
-    from flydsl.expr.typing import T as _T
+    import flydsl.expr.buffer_ops as _bo
+except ModuleNotFoundError as e:  # flydsl >= 0.3.0 removed the module
+    if e.name != "flydsl.expr.buffer_ops":  # anything else is a broken install
+        raise
+    _bo = None
 
-    HAS_BUFFER_OPS = True
+HAS_BUFFER_OPS = _bo is not None
+
+if HAS_BUFFER_OPS:
+    from flydsl.expr.typing import T as _T
 
     def _dtype(name):
         return getattr(_T, name)
@@ -97,12 +109,14 @@ try:  # flydsl <= 0.2.x
     buffer_load = _bo.buffer_load
     buffer_store = _bo.buffer_store
 
-except ImportError:  # flydsl >= 0.3.0
+else:
     from flydsl._mlir.dialects import arith as _arith
     from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr.typing import T as _T
 
-    HAS_BUFFER_OPS = False
+    # The generated ops, not `flydsl.expr.rocdl`: from 0.3.1 that wraps the load
+    # (only) and drops an `aux` that is neither int nor Attribute.
+    from flydsl._mlir.dialects import rocdl as _rocdl
+    from flydsl.expr.typing import T as _T
 
     def _dtype(name):
         # A property returning the type, or a factory returning it when called.
@@ -150,16 +164,26 @@ except ImportError:  # flydsl >= 0.3.0
         elem_bytes = elem_ty.width // 8
         return _arith.MulIOp(_as_i32(offset), _const(elem_bytes, 32)).result
 
-    # FlyDSL 0.3.1 moved `aux` on the raw buffer ops from a positional i32
-    # *value* to a keyword-only *attribute*. Both spellings are in use here --
-    # aiter's venv has 0.3.0, sglang's has 0.3.2 -- so probe once and adapt
-    # rather than pinning either.
-    _AUX_IS_KWARG = (
-        "aux"
-        in getattr(inspect.signature(_rocdl.raw_ptr_buffer_store), "parameters", {})
-        and inspect.signature(_rocdl.raw_ptr_buffer_store).parameters["aux"].kind
-        is inspect.Parameter.KEYWORD_ONLY
-    )
+    # `aux` on the raw buffer ops is a positional i32 *value* on 0.3.0 and a
+    # keyword-only *attribute* from 0.3.1 (checked against the 0.3.0 to 0.4.0
+    # wheels). Probe once rather than pin, and refuse any other shape.
+    def _aux_is_kwarg():
+        param = inspect.Parameter
+        kinds = {
+            getattr(inspect.signature(op).parameters.get("aux"), "kind", None)
+            for op in (_rocdl.raw_ptr_buffer_load, _rocdl.raw_ptr_buffer_store)
+        }
+        if kinds == {param.KEYWORD_ONLY}:
+            return True
+        if kinds == {param.POSITIONAL_OR_KEYWORD}:
+            return False
+        raise ImportError(
+            f"flydsl {getattr(flydsl, '__version__', '?')}: unrecognised `aux` on "
+            f"rocdl.raw_ptr_buffer_load/store ({kinds}); "
+            "mori.cco.device.flydsl.buffer needs updating"
+        )
+
+    _AUX_IS_KWARG = _aux_is_kwarg()
 
     def _aux_args(cache_modifier):
         """Positional tail / kwargs for the raw buffer ops' ``aux`` operand."""
@@ -172,7 +196,10 @@ except ImportError:  # flydsl >= 0.3.0
         return (_const(cache_modifier, 32),), {}
 
     def buffer_load(rsrc, offset, vec_width=4, dtype=None, cache_modifier=CM_CACHED):
-        """Load ``vec_width`` x ``dtype`` at ELEMENT ``offset`` of ``rsrc``."""
+        """Load ``vec_width`` x ``dtype`` at ELEMENT ``offset`` of ``rsrc``.
+
+        The byte offset is computed in i32, so it must stay below 2 GiB.
+        """
         elem = dtype if dtype is not None else _dtype("f32")
         if hasattr(elem, "ir_type"):
             elem = elem.ir_type
@@ -183,7 +210,10 @@ except ImportError:  # flydsl >= 0.3.0
         )
 
     def buffer_store(data, rsrc, offset, cache_modifier=CM_CACHED):
-        """Store ``data`` at ELEMENT ``offset`` of ``rsrc``."""
+        """Store ``data`` at ELEMENT ``offset`` of ``rsrc``.
+
+        The byte offset is computed in i32, so it must stay below 2 GiB.
+        """
         value = _raw(data)
         ty = value.type
         try:  # this binding has no VectorType.isinstance; construction is the probe

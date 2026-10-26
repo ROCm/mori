@@ -193,6 +193,13 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
+      - name: Run CCO FlyDSL buffer cache-policy check
+        run: |
+          # A wrong cache policy still runs, so check the bits in the emitted ISA.
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
+
       - name: Run CCO GEMM+AR numerics (up to 8 ranks)
         run: |
           # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a

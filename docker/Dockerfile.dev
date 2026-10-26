@@ -16,12 +16,6 @@ ARG GPU_ARCHS="gfx942 gfx950"
 ARG ROCM_APT_VERSION=7.14
 ARG ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
 ARG ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
-# 1 installs flydsl, which only the cco Python examples need.
-ARG WITH_FLYDSL=0
-# The version aiter pins, so CI runs mori against the FlyDSL it ships with.
-# mori itself also runs on 0.2.x and 0.3.x; nightly.yml's flydsl-compat job
-# builds this image with an older one to keep those paths covered.
-ARG FLYDSL_VERSION=0.4.0
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -78,4 +72,12 @@ RUN set -ex; \
 # distro kernel's amdgpu, so bumping the Ubuntu kernel alone does nothing.
 ENV MALLOC_MMAP_THRESHOLD_=131072
 
+# Declared here, next to their only use: every RUN after an ARG has it in its
+# cache key, so up top a new FlyDSL version would rebuild the ROCm layers too.
+# 1 installs flydsl, which only the cco Python examples need.
+ARG WITH_FLYDSL=0
+# The version aiter pins, so CI runs mori against the FlyDSL it ships with.
+# mori itself also runs on 0.2.x and 0.3.x; nightly.yml's flydsl-compat job
+# builds this image with an older one to keep those paths covered.
+ARG FLYDSL_VERSION=0.4.0
 RUN if [ "${WITH_FLYDSL}" = "1" ]; then pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}"; fi

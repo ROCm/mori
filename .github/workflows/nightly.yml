@@ -998,9 +998,13 @@ jobs:
     runs-on: [self-hosted, MI355X-AINIC]
     strategy:
       fail-fast: false
+      max-parallel: 1  # each leg uses all 8 GPUs; never share a host
       matrix:
         flydsl: ["0.2.4", "0.3.0"]
     env:
+      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7  # as ci_cco.yml
+      MORI_RDMA_SL: 3
+      MORI_RDMA_TC: 104
       IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
       BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
       CONTAINER: mori_flydsl_compat_${{ github.run_id }}_${{ strategy.job-index }}
@@ -1023,6 +1027,9 @@ jobs:
         run: |
           $CT rm -f $CONTAINER 2>/dev/null || true
           CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
             -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
             -w $GITHUB_WORKSPACE \
             $IMAGE sleep infinity
@@ -1039,6 +1046,12 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: FlyDSL buffer cache-policy check
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
 
       - name: GEMM+AR numerics
         run: |
@@ -1070,3 +1083,5 @@ jobs:
         run: |
           $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+          # Only this leg's FlyDSL layer is unique; the rest is shared with ci-cco.
+          $CT rmi -f $IMAGE 2>/dev/null || true

@@ -43,7 +43,6 @@ from mori.cco.device.flydsl.buffer import (  # noqa: F401  (re-exported)
     CM_SC0_SC1,
     CM_SC1,
     HAS_BUFFER_OPS,
-    _dtype,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -75,8 +74,8 @@ def wave_uniform_i64(addr):
     ``kernels/flydsl_dispatch_combine_intranode_kernel.py::_wave_uniform_i64``.
     """
     v = fx.Uint64(addr)
-    lo = _rocdl.readfirstlane(_dtype("i32"), fx.Uint32(v))
-    hi = _rocdl.readfirstlane(_dtype("i32"), fx.Uint32(v >> 32))
+    lo = _rocdl.readfirstlane(i32_type(), fx.Uint32(v))
+    hi = _rocdl.readfirstlane(i32_type(), fx.Uint32(v >> 32))
     return (fx.Uint64(hi) << 32) | fx.Uint64(lo)
 
 
@@ -157,6 +156,8 @@ __all__ = [
     "atomic_store_u32",
     "i32_type",
     "CM_CACHED",
+    "CM_SC0",
+    "CM_NT",
     "CM_SC1",
     "CM_SC0_SC1",
 ]

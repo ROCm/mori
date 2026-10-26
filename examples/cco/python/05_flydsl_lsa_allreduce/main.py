@@ -64,11 +64,6 @@ from mori.cco.device.flydsl import buffer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cco_example_common import set_device, sync, fill, zero, read, F32  # noqa: E402
 
-# Cache-modifier aux bits (GFX942): SC0=bypass L1, SC1=bypass L2.
-_CM_CACHED = 0
-_CM_SC1 = 2  # uncached read  (see peers' fresh signal writes)
-_CM_SC0_SC1 = 3  # uncached write (signal stores)
-
 WS = 2  # world size (ranks, one GPU each)
 THREADS = 256
 NUM_ELEMS = 256 * 1024  # f32 elements to all-reduce (1 MiB)
@@ -88,11 +83,13 @@ def _rsrc(addr_i64):
 
 
 def _store_u32_uncached(rsrc, val):
-    buffer.buffer_store(val, rsrc, 0, cache_modifier=_CM_SC0_SC1)
+    buffer.buffer_store(val, rsrc, 0, cache_modifier=buffer.CM_SC0_SC1)
 
 
 def _load_u32_uncached(rsrc):
-    return buffer.buffer_load(rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1)
+    return buffer.buffer_load(
+        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=buffer.CM_SC1
+    )
 
 
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
@@ -146,7 +143,7 @@ def custom_ar_kernel(dev_comm: Int64, win: Int64, flag: Int32):
             vf = raw.bitcast(fx.Float32)
             acc = vf if acc is None else acc + vf
         buffer.buffer_store(
-            acc.bitcast(fx.Int32), out_rsrc, elem_off, cache_modifier=_CM_CACHED
+            acc.bitcast(fx.Int32), out_rsrc, elem_off, cache_modifier=buffer.CM_CACHED
         )
 
 

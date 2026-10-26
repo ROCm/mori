@@ -53,9 +53,9 @@ _AGENT_SCOPE = "agent"
 #: AMDGPU's LLVM address space for global memory. `fx.to_llvm_ptr` would
 #: resolve this from the active backend, but it does not exist before flydsl
 #: 0.3, and 0.2.x is still supported (nightly.yml's flydsl-compat job).
-#: `llvm.inttoptr` is identical in
-#: both -- same signature, same dialect module -- so going straight to an
-#: `!llvm.ptr` keeps one code path instead of a version probe.
+#: `llvm.inttoptr` is identical in both -- same signature, same dialect module
+#: -- so going straight to an `!llvm.ptr` keeps one code path instead of a
+#: version probe.
 _GLOBAL_LLVM_AS = 1
 _LLVM_GLOBAL_PTR = f"!llvm.ptr<{_GLOBAL_LLVM_AS}>"
 
