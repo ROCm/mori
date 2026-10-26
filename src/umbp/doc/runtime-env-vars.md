@@ -134,7 +134,7 @@ Python wrapper construct one) — they are read once.
 | Env var | Default | Description |
 |---|---|---|
 | `UMBP_DRAM_CAPACITY` | 4 GiB | `dram.capacity_bytes`. |
-| `UMBP_DRAM_HIGH_WM` / `UMBP_DRAM_LOW_WM` | `0.9` / `0.7` | DRAM tier eviction watermarks. |
+| `UMBP_DRAM_HIGH_WM` / `UMBP_DRAM_LOW_WM` | `0.95` / `0.9` | DRAM tier eviction watermarks. |
 | `UMBP_SSD_ENABLED` | `1` | `0` to disable the SSD tier entirely.  **This no longer selects a medium**: a single-medium SSD node is chosen with `UMBP_DISTRIBUTED_MEDIUM=SSD` (or `distributed.medium`), or named as a backend in `UMBP_BACKEND_POLICY`, and `umbp_standalone_server` refuses to start if this is set while neither named one, rather than quietly serving DRAM. |
 | `UMBP_EMBEDDED_DRAM_PAGE_SIZE` | 2 MiB | Allocation granularity of the pool an **embedded** deployment gets when the config names no deployment at all.  The pool is paged, so a value smaller than a page still occupies one: a caller storing KV pages should set this to the page's exact byte size, and one storing small values wants it smaller.  Ignored once `distributed` is configured — set `distributed.dram_page_size` there instead. |
 | `UMBP_SSD_DIR` | `/tmp/umbp_ssd` | POSIX backend root(s).  **Comma-separated for multi-drive**, one directory per physical drive (e.g. `/mnt/nvme0,/mnt/nvme1`).  More than one turns the tier into a `ShardedSsdTier`: keys are placed on the drive with the most free space and batch IO runs on every drive at once, so the tier delivers their aggregate bandwidth. |
