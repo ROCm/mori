@@ -93,7 +93,7 @@ class AnvilLib {
 
   // Resolve the KFD sysfs node id (the directory index under
   // /sys/class/kfd/kfd/topology/nodes) of the given HIP device WITHOUT initializing
-  // HSA. It equals HSA_AGENT_INFO_NODE only when this process can open every GPU.
+  // HSA. It can differ from HSA_AGENT_INFO_NODE when this process cannot open every GPU.
   static int kfdNodeIdForHipDevice(int hipDev);
 
  private:

@@ -140,13 +140,19 @@ std::tuple<uint32_t, uint32_t, bool> locIdAndDomainForNode(int node) {
   return std::tuple{locId, domain, true};
 }
 
-// "name value" pairs of a KFD sysfs properties file; empty if it does not exist.
-std::unordered_map<std::string, uint64_t> readKfdProperties(const std::string& path) {
+// "name value" pairs of a KFD sysfs properties file. Empty if the file is missing,
+// or if KFD refuses the read (EPERM) because it belongs to a GPU the device cgroup
+// keeps from this process.
+std::unordered_map<std::string, uint64_t> readKfdProperties(std::istream& in) {
   std::unordered_map<std::string, uint64_t> props;
-  std::ifstream f(path);
   std::string key, val;
-  while (f >> key >> val) props[key] = std::strtoull(val.c_str(), nullptr, 0);
+  while (in >> key >> val) props[key] = std::strtoull(val.c_str(), nullptr, 0);
   return props;
+}
+
+std::unordered_map<std::string, uint64_t> readKfdProperties(const std::string& path) {
+  std::ifstream f(path);
+  return readKfdProperties(f);
 }
 
 std::string kfdNodePath(int node) {
@@ -172,15 +178,18 @@ struct KfdLink {
   uint32_t recSdmaEngIdMask;
 };
 
-// io_links then p2p_links, as libhsakmt lists them, but in sysfs node ids and
-// including links to GPUs this process cannot open (libhsakmt drops those).
+// io_links then p2p_links, as libhsakmt lists them, in sysfs node ids. A node's
+// own io_links stay readable even to GPUs this process cannot open, which
+// libhsakmt drops. A link KFD gates on such a GPU (a p2p link carries the peer's
+// device) reads as EPERM and is skipped, as libhsakmt skips it.
 std::vector<KfdLink> kfdLinks(int node) {
   std::vector<KfdLink> links;
   for (const char* dir : {"io_links", "p2p_links"}) {
     for (int i = 0;; ++i) {
-      auto props = readKfdProperties(kfdNodePath(node) + "/" + dir + "/" + std::to_string(i) +
-                                     "/properties");
-      if (props.empty()) break;
+      std::ifstream f(kfdNodePath(node) + "/" + dir + "/" + std::to_string(i) + "/properties");
+      if (!f.is_open()) break;
+      auto props = readKfdProperties(f);
+      if (props.empty()) continue;
       links.push_back({static_cast<int>(props["node_to"]),
                        static_cast<uint32_t>(props["recommended_sdma_engine_id_mask"])});
     }
@@ -201,8 +210,10 @@ uint32_t hsakmtNodeForKfdNode(int node) {
         return n;
     }
   }
-  throw std::runtime_error("SDMA: the GPU at KFD node " + std::to_string(node) +
-                           " is not accessible to this process");
+  // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
+  // and blame the network, and cco cannot propagate one into Python.
+  MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
+  exit(EXIT_FAILURE);
 }
 
 }  // namespace
@@ -418,7 +429,9 @@ uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
 // (non-xGMI) ones. Zero if the node reports no such link.
 uint32_t AnvilLib::getHostLinkEngineMask(int srcNode) {
   for (const auto& link : kfdLinks(srcNode)) {
-    if (kfdNodeProperty(link.nodeTo, "simd_count") != 0) continue;  // GPU node, not the host
+    // A GPU, or a node KFD will not show us (only a GPU is ever hidden): not the host.
+    auto to = readKfdProperties(kfdNodePath(link.nodeTo) + "/properties");
+    if (to.empty() || to["simd_count"] != 0) continue;
     if (link.recSdmaEngIdMask) return link.recSdmaEngIdMask;
   }
   return 0;
@@ -465,6 +478,10 @@ AnvilLib& AnvilLib::getInstance() {
 
 int AnvilLib::getOamId(int node) {
   auto [locId, domain, valid] = locIdAndDomainForNode(node);
+  if (valid && locId == ~0u) {
+    throw std::runtime_error("SDMA: cannot read KFD node " + std::to_string(node) +
+                             " (a GPU this process cannot open) to find its xGMI id");
+  }
   uint32_t bus = (locId >> 8) & 0xFF, dev = (locId >> 3) & 0x1F, func = locId & 0x7;
 
   char fpath[128];
