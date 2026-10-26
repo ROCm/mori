@@ -404,32 +404,62 @@ _COMBINE_PUSH_TABLE: dict = {
 _LL128_TABLE: dict = {
     "fp4_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): {"fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))},
-            (8, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
-            (16, 7168, 6, None): {"fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
-            (32, 7168, 6, None): {"fp4": dict(max_tok=64, dispatch=(64, 16), combine=(64, 8))},
+            (4, 7168, 6, None): {
+                "fp4": dict(max_tok=256, dispatch=(64, 16), combine=(64, 16))
+            },
+            (8, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (16, 7168, 6, None): {
+                "fp4": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (32, 7168, 6, None): {
+                "fp4": dict(max_tok=64, dispatch=(64, 16), combine=(64, 8))
+            },
         },
     },
     "fp8_blockwise": {
         "gfx1250": {
-            (4, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))},
-            (8, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
-            (16, 7168, 6, None): {"fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))},
-            (32, 7168, 6, None): {"fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))},
+            (4, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 8), combine=(64, 8))
+            },
+            (8, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (16, 7168, 6, None): {
+                "fp8": dict(max_tok=128, dispatch=(64, 16), combine=(64, 8))
+            },
+            (32, 7168, 6, None): {
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 8))
+            },
         },
     },
     "none": {
         "gfx1250": {
-            (4, 7168, 6, None): {"bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))},
+            (4, 7168, 6, None): {
+                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))
+            },
             # From 8 ranks past 16 tokens the bf16 combine is slower than the pull.
-            (8, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))},
-            (16, 7168, 6, None): {"bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))},
+            (8, 7168, 6, None): {
+                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))
+            },
+            (16, 7168, 6, None): {
+                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))
+            },
         },
     },
 }
 
 
-def ll128(world_size, hidden_dim, topk, dtype, max_tok, experts_per_rank=None, quant_type="none"):
+def ll128(
+    world_size,
+    hidden_dim,
+    topk,
+    dtype,
+    max_tok,
+    experts_per_rank=None,
+    quant_type="none",
+):
     """The LL128 plan geometry for an op of this shape, dispatch dtype and capacity:
     {"dispatch": (block, warp), "combine": (block, warp)} when both kernels take LL128,
     {"combine": (block, warp)} when only the combine does, or None when the op keeps the

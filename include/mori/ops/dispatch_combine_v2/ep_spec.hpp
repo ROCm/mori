@@ -56,8 +56,8 @@ struct EpRequest {
   bool combineFp4F32Scale = false;
   bool combineFp8 = false;
   bool tokOffExt = false;
-  int callTokMax = 0;  // dispatch only; 0 = maxTokPerRank (EpCfg::callTokMax)
-  bool ll128 = false;  // both kernels of the op take the LL128 protocol (EpCfg::ll128)
+  int callTokMax = 0;             // dispatch only; 0 = maxTokPerRank (EpCfg::callTokMax)
+  bool ll128 = false;             // both kernels of the op take the LL128 protocol (EpCfg::ll128)
   bool ll128CombineOnly = false;  // combine only: the LL128 combine after the original dispatch
 };
 

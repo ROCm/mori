@@ -1026,9 +1026,7 @@ class EpDispatchCombineOp:
             num_tokens=n,
         )
         # Behind the kernel on the stream, so the copies hold what this dispatch wrote.
-        recv_maps = (
-            None if recv_views is None else tuple(v.clone() for v in recv_views)
-        )
+        recv_maps = None if recv_views is None else tuple(v.clone() for v in recv_views)
 
         base = (
             self.recv_tokens(),

@@ -572,9 +572,9 @@ constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
 // rank is not checked: it is a launch argument, so the op layer owns that bound.
 constexpr bool EpCfgIsValid(const EpCfg& c) {
   return c.worldSize > 0 && c.hiddenDim > 0 && c.maxTokPerRank > 0 && c.callTokMax >= 0 &&
-         c.numExpertPerToken > 0 &&
-         c.numExpertPerRank > 0 && c.blockNum > 0 && (c.waveSize == 32 || c.waveSize == 64) &&
-         c.warpPerBlock > 0 && EpBlockThreads(c) <= 1024 &&
+         c.numExpertPerToken > 0 && c.numExpertPerRank > 0 && c.blockNum > 0 &&
+         (c.waveSize == 32 || c.waveSize == 64) && c.warpPerBlock > 0 &&
+         EpBlockThreads(c) <= 1024 &&
          // The recv capacity must cover the worst case: the device slot counter is
          // unbounded, and since EpMaxRecv is also the flat-index stride an overflow
          // re-encodes to the next peer and combine folds in a stranger's token.

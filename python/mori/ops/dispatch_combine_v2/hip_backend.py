@@ -109,6 +109,7 @@ def _stage_bytes(cfg, scale_stride):
     ws = cfg.world_size
     return 256 + 2 * ws * 128 + 2 * ws * _STAGE_TOK * row
 
+
 # Which tuning-table dtype column a dispatch dtype reads.
 _FP8_TUNING_DTYPES = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
 
@@ -246,7 +247,8 @@ def push_land_rows(cfg) -> int:
 
 def ll_bf16_row_bytes(cfg) -> int:
     """A landing row of the bf16 LL128 combine (EpCombineLlBf16_1250x): the bf16 row and the
-    weights, two a line, in 128 B lines of 120 data bytes each, in whole units of eight lines."""
+    weights, two a line, in 128 B lines of 120 data bytes each, in whole units of eight lines.
+    """
     wt = 8 * ((cfg.num_experts_per_token + 1) // 2)
     return ((cfg.combine_token_nbytes + wt + 119) // 120 + 7) // 8 * 1024
 
@@ -480,7 +482,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 db, dw = self._ll128_geom["dispatch"]
                 cfg.schedule = ((None, db, dw, cb, cw),)
             else:
-                cfg.schedule = tuple((e, db, dw, cb, cw) for (e, db, dw, _, _) in cfg.schedule)
+                cfg.schedule = tuple(
+                    (e, db, dw, cb, cw) for (e, db, dw, _, _) in cfg.schedule
+                )
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
@@ -836,7 +840,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         cap = self._recv_cap
         return (
-            from_gpu_ptr(self.arena.local_ptr("recv_to_src_token"), (cap,), torch.int32),
+            from_gpu_ptr(
+                self.arena.local_ptr("recv_to_src_token"), (cap,), torch.int32
+            ),
             from_gpu_ptr(
                 self.arena.local_ptr("out_idx"),
                 (cap * self.cfg.num_experts_per_token,),

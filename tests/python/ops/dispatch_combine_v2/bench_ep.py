@@ -266,6 +266,7 @@ def main():
         .scatter_(1, (idx.cpu().long() // EPR), True)
         .sum(1)
     )
+
     # Every rank's ids and weights, [world, M, TOPK]: unlike the payload and the scale
     # rows, a receiver cannot rebuild them from (rank, token), and dispatch forwards
     # both next to every row it delivers.
@@ -601,7 +602,9 @@ def main():
         else:
             buf = stage
         # A checked call also asks a pull combine for its weight fold; a push combine has none.
-        out, outw = op.combine(buf, weights=w_ if checked and not _PUSH else None, routing=r)
+        out, outw = op.combine(
+            buf, weights=w_ if checked and not _PUSH else None, routing=r
+        )
         lockstep()
         if dispatch_bad:
             return total, buf, False, True
@@ -642,7 +645,9 @@ def main():
         ew = U[:ct].view(ct, 1).float() * w_ref
         gw = outw.float().cpu()
         wbad = int((~torch.isclose(gw, ew, rtol=1e-6, atol=1e-7)).any(dim=1).sum())
-        wctl = int((~torch.isclose(gw, ew + w_ref, rtol=1e-6, atol=1e-7)).any(dim=1).sum())
+        wctl = int(
+            (~torch.isclose(gw, ew + w_ref, rtol=1e-6, atol=1e-7)).any(dim=1).sum()
+        )
         nw = torch.tensor([wbad, wctl, ct])
         dist.all_reduce(nw)
         wt_ok = int(nw[0]) == 0 and int(nw[1]) == int(nw[2])
