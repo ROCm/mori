@@ -409,9 +409,9 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
         "Rejecting remote engine {} (node_id {}): block size mismatch "
         "(local={}, remote={})",
         remote.key, remote.nodeId, desc.blockSize, remote.blockSize);
-    throw std::runtime_error("MoRI-IO handshake failed: block size mismatch (local=" +
-                             std::to_string(desc.blockSize) +
-                             ", remote=" + std::to_string(remote.blockSize) + ")");
+    throw std::runtime_error(
+        "MoRI-IO handshake failed: block size mismatch (local=" + std::to_string(desc.blockSize) +
+        ", remote=" + std::to_string(remote.blockSize) + ")");
   }
 
   for (auto& it : backends) {

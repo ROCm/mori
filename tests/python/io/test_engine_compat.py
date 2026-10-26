@@ -21,7 +21,6 @@
 # SOFTWARE.
 """Tests for EngineDesc handshake compatibility fields (Gap 12)."""
 import os
-import pytest
 from contextlib import contextmanager
 
 from mori.io import (
@@ -30,7 +29,6 @@ from mori.io import (
     IOEngine,
     EngineDesc,
     RdmaBackendConfig,
-    set_log_level,
 )
 from mori import cpp as mori_cpp
 

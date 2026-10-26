@@ -21,6 +21,7 @@
 // SOFTWARE.
 
 #include <gtest/gtest.h>
+
 #include <msgpack.hpp>
 
 #include "mori/io/common.hpp"
@@ -99,11 +100,11 @@ TEST(EngineDescCompat, EqualityIncludesNewFields) {
   EXPECT_EQ(a, b);
 
   b.blockSize = 8192;
-  EXPECT_NE(a, b);
+  EXPECT_FALSE(a == b);
 
   b.blockSize = a.blockSize;
   b.protocolVersion = 99;
-  EXPECT_NE(a, b);
+  EXPECT_FALSE(a == b);
 }
 
 TEST(AgentModeEnum, BitfieldValues) {
