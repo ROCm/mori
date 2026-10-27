@@ -114,6 +114,7 @@ import ctypes
 import dataclasses
 import math
 import os
+import re
 import sys
 import time
 from numbers import Real
@@ -232,16 +233,25 @@ def _parse_args(argv):
     # Smoke-test / bisect aid: stop after N candidates (0 = sweep all).
     parser.add_argument("--tuning-limit", type=int, default=0)
     parser.add_argument(
-        "--tuning-phase", default="dispatch", choices=["dispatch", "combine"]
+        "--tuning-phase", default="dispatch", choices=["dispatch", "combine", "pair"]
     )
     # Validation mode: sweep exactly one named candidate against the shipped
     # geometry. A sweep winner is chosen by a greedy chain of paired tests, each
     # with its own error; before it is written into the table it gets one long
-    # head-to-head against what it would replace. block,rdma,warp[,active_qps].
+    # head-to-head against what it would replace. block,rdma,warp[,active_qps];
+    # under --tuning-phase pair, dispatch,combine QP counts per pair, separated by
+    # '/' (or ';', which a remote shell would split on).
     parser.add_argument("--tuning-candidate", default=None)
     # Active QP counts to cross with every geometry, e.g. 1,2,4,8. Each must be
     # within --num-qp, the allocation. Unset keeps the shipped count.
     parser.add_argument("--tuning-qps", default=None)
+    # "shipped" keeps each phase's table geometry and varies only the active QP
+    # count (--tuning-qps). --tuning-phase pair always does: it crosses the
+    # dispatch and combine counts, because the op drains the larger of the two,
+    # so neither phase's best count is independent of the other's.
+    parser.add_argument(
+        "--tuning-geometry", default="sweep", choices=["sweep", "shipped"]
+    )
     # Dispatch geometry can affect the following combine, so select on the
     # pair total by default. "phase" is available for individual-op diagnostics.
     parser.add_argument("--tuning-metric", default="total", choices=["total", "phase"])
@@ -1301,7 +1311,7 @@ def _row_metrics(
 
     One CPU all-gather follows all synchronized timing passes. An optional
     callback receives every rank's byte counts and raw rounds for replay;
-    those evidence fields are not added to tuning JSON entries.
+    those evidence fields are not added to tuning table rules.
     """
     if (
         args.tuning_reps < 1
@@ -1667,22 +1677,55 @@ def _tune(cfg, dist_handle, device, args, comm):
         ),
     )
     phase = args.tuning_phase
-    shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
+    pair = phase == "pair"
+    if pair:
+        # A candidate is a (dispatch, combine) geometry pair.
+        shipped = (incumbent_dispatch, incumbent_combine)
+    else:
+        shipped = incumbent_dispatch if phase == "dispatch" else incumbent_combine
+    if pair and (
+        not cfg.is_internode or not (args.tuning_qps or args.tuning_candidate)
+    ):
+        raise SystemExit(
+            "--tuning-phase pair is internode only and needs --tuning-qps or "
+            "--tuning-candidate"
+        )
+    if args.tuning_geometry == "shipped" and not pair:
+        geometry_candidates = [shipped[:3]]
 
     # --tuning-qps crosses every geometry with every active count. Without it the
     # sweep keeps the shipped count and varies the geometry alone, as before.
     active_qp_candidates = (
         [checked(int(count)) for count in args.tuning_qps.split(",")]
         if args.tuning_qps
-        else [shipped[3]]
+        else ([] if pair else [shipped[3]])
     )
-    candidates = [
-        geometry + (active_qps,)
-        for geometry in geometry_candidates
-        for active_qps in active_qp_candidates
-    ]
+    if pair:
+        # Table geometry for both phases; every (dispatch, combine) count pair,
+        # or just the pairs --tuning-candidate names ("1,4/1,2": dispatch,combine
+        # counts per pair) to confirm a sweep's winners with more --tuning-reps.
+        count_pairs = (
+            [
+                tuple(checked(int(x)) for x in item.split(","))
+                for item in re.split(r"[;/]", args.tuning_candidate)
+            ]
+            if args.tuning_candidate
+            else [
+                (dq, cq) for dq in active_qp_candidates for cq in active_qp_candidates
+            ]
+        )
+        candidates = [
+            (incumbent_dispatch[:3] + (dq,), incumbent_combine[:3] + (cq,))
+            for dq, cq in count_pairs
+        ]
+    else:
+        candidates = [
+            geometry + (active_qps,)
+            for geometry in geometry_candidates
+            for active_qps in active_qp_candidates
+        ]
     candidate_fields = ()
-    if args.tuning_candidate:
+    if args.tuning_candidate and not pair:
         candidate_fields = tuple(int(x) for x in args.tuning_candidate.split(","))
         # Three fields keep the shipped count, so a validation run changes the
         # geometry alone; a fourth names the count.
@@ -1749,13 +1792,15 @@ def _tune(cfg, dist_handle, device, args, comm):
     # after it slower) and a per-phase argmin measured against a DIFFERENT other
     # phase does not carry over.
     def geometries(geometry):
+        if pair:
+            return geometry
         return (
             (geometry, incumbent_combine)
             if phase == "dispatch"
             else (incumbent_dispatch, geometry)
         )
 
-    if args.tuning_metric == "total":
+    if args.tuning_metric == "total" or pair:
 
         def metric(dispatch_value, combine_value):
             return dispatch_value + combine_value
@@ -1950,8 +1995,11 @@ def _tune(cfg, dist_handle, device, args, comm):
         best = fixed_wins[0][2]
         best_median = fixed_wins[0][3]
 
-    dispatch_row = best if phase == "dispatch" else incumbent_dispatch
-    combine_row = best if phase == "combine" else incumbent_combine
+    if pair:
+        dispatch_row, combine_row = best
+    else:
+        dispatch_row = best if phase == "dispatch" else incumbent_dispatch
+        combine_row = best if phase == "combine" else incumbent_combine
 
     # Measure the pair that will actually be written, on every rank: the row's
     # bandwidth and latency fields are v1's, and v1's mean them for the
@@ -2008,16 +2056,22 @@ def _tune(cfg, dist_handle, device, args, comm):
             flush=True,
         )
         if args.tuning_save:
-            _save_tuning_row(
-                cfg,
-                args,
-                phase=phase,
-                dtype_key=dtype_keys[phase],
-                kernel_family=kernel_family,
-                geometry=best,
-                metrics=metrics[phase],
-                record_active_qps=report_active_qps and cfg.is_internode,
-            )
+            # pair writes both phases' rules; each names its measured count.
+            for saved_phase, row in (
+                (("dispatch", dispatch_row), ("combine", combine_row))
+                if pair
+                else ((phase, best),)
+            ):
+                _save_tuning_row(
+                    cfg,
+                    args,
+                    phase=saved_phase,
+                    dtype_key=dtype_keys[saved_phase],
+                    kernel_family=kernel_family,
+                    geometry=row,
+                    metrics=metrics[saved_phase],
+                    record_active_qps=report_active_qps and cfg.is_internode,
+                )
     return 0
 
 
@@ -2053,17 +2107,17 @@ def _save_tuning_row(
     metrics,
     record_active_qps=False,
 ):
-    """Merge one swept phase's rule into its own file, one per expert count,
-    top-k and phase (hip_tuning_configs.v2_table_filename).
+    """Merge one swept phase's rule into the model's table for this kernel
+    family and EP size (hip_tuning_configs.v2_table_filename), which holds
+    every expert count, top-k and phase.
 
     The rule names its active QP count only when the sweep measured it (or the
     shipped rule already named one); otherwise the count is this run's resolved
     default, and writing it would pin production to it.
 
-    Only the phase that was swept is written, and it goes in that phase's file,
-    so the other phase's rule is untouched by construction -- writing the
-    incumbent back as if it were a result would claim a measurement that was
-    never made.
+    Only the phase that was swept is written, as that phase's rule, so the
+    other phase's rule is untouched by construction -- writing the incumbent
+    back as if it were a result would claim a measurement that was never made.
     """
     from mori.ops.dispatch_combine_v2.hip_tuning_configs import save_internode_result
 
@@ -2081,10 +2135,9 @@ def _save_tuning_row(
         "num_tokens": args.max_tokens,
         "hidden_dim": cfg.hidden_dim,
         "topk": cfg.num_experts_per_token,
-        # world_size x this is the model's expert count, which picks the file
-        # and is not stored in the rule, so two expert counts at the same
-        # (dtype, hidden, topk, num_tokens) land in two files rather than one
-        # overwriting the other.
+        # world_size x this is the model's expert count, which the rule stores
+        # as num_experts, so two expert counts at the same (dtype, hidden,
+        # topk, num_tokens) are two rules rather than one overwriting the other.
         "experts_per_rank": cfg.num_experts_per_rank,
         "block_num": block_num,
         "rdma_block_num": rdma_block_num,

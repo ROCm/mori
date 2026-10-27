@@ -167,7 +167,7 @@ inline constexpr int kCombineBarrierMarkerTotal = 64;
 //   from kConfig. See the note there.
 //
 // One field is not shape: combineLoadFirst selects the ordinary combine's
-// gather per token bucket, from the tuning JSON rather than from any config field.
+// gather per token bucket, from the tuning table rather than from any config field.
 //
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.
@@ -196,7 +196,7 @@ struct EpInterNodeKernelCfg {
   int numQpToDrain{0};
   EpQuantType quantType{EpQuantType::None};
   // Ordinary-v2 combine only: gather with load-first peer reads. Chosen per
-  // token bucket by the tuning JSON (combine_load_first), so it is part of the
+  // token bucket by the tuning table (combine_load_first), so it is part of the
   // compiled identity; every other pass is built with the default.
   bool combineLoadFirst{false};
 };

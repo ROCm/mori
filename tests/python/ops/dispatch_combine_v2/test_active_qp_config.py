@@ -21,7 +21,6 @@
 # SOFTWARE.
 """Active QP bounds, fixed allocation, and precompiled subset selection."""
 
-import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -190,43 +189,36 @@ def test_fit_keeps_the_active_count_and_forces_rdma_below_block():
     assert tuning.fit_internode_geometry((16, 16, 8, 1)) == (16, 15, 8, 1)
 
 
-# -- JSON tables ------------------------------------------------------------
+# -- tables -----------------------------------------------------------------
 
 ARCH, MODEL = "gfx942", "testgpu"
 
 
 def write_tables(directory, kernel_type, dispatch_rules, combine_rules):
-    for phase, rules in (("dispatch", dispatch_rules), ("combine", combine_rules)):
-        name = tuning.v2_table_filename(ARCH, MODEL, kernel_type, 16, 64, 4, phase)
-        body = {
-            "version": "1.0",
-            "gpu_arch": ARCH,
-            "gpu_model": MODEL,
-            "kernel_type": kernel_type,
-            "ep_size": 16,
-            "num_experts": 64,
-            "topk": 4,
-            "phase": phase,
-            "rules": [
-                dict(
-                    dtype="bf16",
-                    num_tokens=tokens,
-                    hidden_dim=1024,
-                    topk=4,
-                    block_num=block,
-                    rdma_block_num=rdma,
-                    warp_per_block=warp,
-                    **(
-                        {"zero_copy": False, "quant_type": "none"}
-                        if phase == "combine"
-                        else {}
-                    ),
-                    **({"active_qps": qps} if qps is not None else {}),
-                )
-                for tokens, block, rdma, warp, qps in rules
-            ],
-        }
-        (directory / name).write_text(json.dumps(body))
+    rules = [
+        dict(
+            num_experts=64,
+            topk=4,
+            phase=phase,
+            dtype="bf16",
+            hidden_dim=1024,
+            num_tokens=tokens,
+            block_num=block,
+            rdma_block_num=rdma,
+            warp_per_block=warp,
+            **(
+                {"zero_copy": False, "quant_type": "none"} if phase == "combine" else {}
+            ),
+            **({"active_qps": qps} if qps is not None else {}),
+        )
+        for phase, phase_rules in (
+            ("dispatch", dispatch_rules),
+            ("combine", combine_rules),
+        )
+        for tokens, block, rdma, warp, qps in phase_rules
+    ]
+    name = tuning.v2_table_filename(ARCH, MODEL, kernel_type, 16)
+    tuning.write_v2_table(directory / name, rules, kernel_type)
 
 
 @pytest.fixture

@@ -254,6 +254,14 @@ jobs:
             cd $GITHUB_WORKSPACE && timeout 60 pytest tests/python/test_tuning_config_quant_types.py -v
           "
 
+      - name: MORI-EP (V2 tuning tables, CPU)
+        run: |
+          # Loads every shipped V2 table from the installed package, so a table
+          # that fails to parse or is missing from package_data fails here.
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 60 pytest tests/python/ops/dispatch_combine_v2/test_v2_tuning_tables.py -v
+          "
+
       - name: MORI-EP bench
         run: |
           $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "

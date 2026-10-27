@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility lookup backed by the HIP V2 internode JSON rules.
+"""Compatibility lookup backed by the HIP V2 internode tables.
 
 The active HIP backend uses hip_tuning_configs.resolve_schedule(). This older
 entry point keeps its fp8-dispatch/bf16-combine defaults.
@@ -44,7 +44,7 @@ def lookup(
     experts_per_rank,
     kernel_family="v2",
 ):
-    """Return dispatch/combine B/R/W from the selected family's JSON rules.
+    """Return dispatch/combine B/R/W from the selected family's table rules.
 
     ``dtype`` accepts a torch dtype, a shared config string, or ``"fp8"``
     (FNUZ on gfx942, OCP elsewhere). Combine remains BF16. Missing rules use

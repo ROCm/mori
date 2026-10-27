@@ -1033,7 +1033,7 @@ __forceinline__ __device__ constexpr bool UseCombineLoadFirst() {
 }
 
 // Ordinary gather: load-first or plain, fixed at compile time per token bucket
-// by the tuning JSON's combine_load_first. The LL gather uses its separate path.
+// by the tuning table's combine_load_first. The LL gather uses its separate path.
 template <EpInterNodeKernelCfg kConfig, typename TokT>
 __forceinline__ __device__ void CombineGatherNormal(TokT* dest, TokT** srcPtrs, int accumNum,
                                                     size_t nelems, size_t tokHiddenBytes,

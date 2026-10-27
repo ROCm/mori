@@ -341,7 +341,7 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 
 HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 backend 入口，返回统一的
 `ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R 的 `KernelConfig`。
-单机先查 `IntraNodeV2` JSON，某相没有规则时回退到 Python 表，显式 `cfg.schedule` 优先；跨机只查 JSON。
+单机先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，显式 `cfg.schedule` 优先；跨机只查表。
 `op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
 HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyDSL 表。
@@ -349,18 +349,19 @@ HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyD
 跨机的数据解析中，`internode_schedule(cfg)` 合并查表结果、手动覆盖和 token 边界，
 `internode_buckets()` 读取单个 family 的规则，
 `lookup_internode()` 解析单个 token 数，`save_internode_result()` 保存调优结果，
-`internode_kernel_family()` 解析本次调用的 kernel family。规则校验、lookup 和合并保存复用
-`mori.ops.tuning_config`，文件命名由 V2 自己的 `v2_table_filename()` 决定；`MORI_EP_V2_TUNING_DIR`
-可指定 JSON 目录。没有匹配 JSON 规则的相使用配置默认几何。
+`internode_kernel_family()` 解析本次调用的 kernel family。表的格式由 `hip_tuning_configs.py`
+自己负责：`v2_table_filename()` 决定文件名，`read_v2_table()` 读取并校验，`write_v2_table()`
+按选择键排序写回；`MORI_EP_V2_TUNING_DIR` 可指定表目录。没有匹配规则的相使用配置默认几何。
 
-JSON 按 kernel（`InterNodeV2`/`InterNodeV2LL`/`IntraNodeV2`）、EP、总专家数、topk 和 dispatch/combine
-分文件，命名为 `{arch}_{model}_{kernel}_ep{n}_expert{experts}_top{k}_{phase}.json`，例如
-`gfx950_mi355x_InterNodeV2_ep16_expert256_top6_dispatch.json`。各相按**自身 dtype**查找：
+每个 GPU 型号、kernel（`InterNodeV2`/`InterNodeV2LL`/`IntraNodeV2`）和 EP 一个 CSV，两相都在其中，
+命名为 `{arch}_{model}_{kernel}_ep{n}.csv`，例如 `gfx950_mi355x_InterNodeV2_ep16.csv`。每行一条规则，
+前八列 `num_experts,topk,phase,dtype,hidden_dim,zero_copy,quant_type,num_tokens` 是选择键，
+各列含义见 tuning_configs/README.md。各相按**自身 dtype**查找：
 fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
-ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）和 `topk` 决定读哪个
-文件：例如 EP16 的 256/8 读 `expert256_top8`，384/6 读 `expert384_top6`；只读当前型号自己的文件，不跨型号或专家组合回退。规则必须
-显式记录 `topk`，缺这个字段的旧规则不参与 V2 查表；专家数由文件确定，不逐条记录。未调优的相使用默认几何。
-保存结果时用这两个值选择文件。V1 的历史通配兼容行为不变。
+ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）、`topk`、dtype 和
+hidden 都必须精确匹配：例如 EP16 的 256/8 只用 `num_experts=256, topk=8` 的行；只读当前型号自己的
+文件，不跨型号或专家组合回退。未调优的相使用默认几何。表在加载时整体校验，格式错误直接报错而不是
+跳过。保存结果时按选择键替换或追加一行。V1 的历史通配兼容行为不变。
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
 
 internode 几何增加了 `rdma_block_num`，把 grid 分成 RDMA 和 node 内两部分。
