@@ -383,7 +383,6 @@ add_library(
   ${UMBP_STANDALONE_GRPC_SRCS}
   ${UMBP_WORKLOAD_PROTO_SRCS}
   ${UMBP_INDEXER_SRCS}
-  distributed/indexer/kv_indexer_reporter.cpp
   # Trace capture is a client feature: PoolClient records live traffic when
   # UMBP_WORKLOAD_TRACE_PATH is set, so the writer ships with the library. The
   # rest of the workload harness drives benchmarks and lives in
