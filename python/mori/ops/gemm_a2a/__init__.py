@@ -33,7 +33,13 @@
 # touching the kernels raises.
 import importlib
 
-from .layout import A2aConfig, MAX_WORLD, a2a_config, counter_chunks
+from .layout import (
+    A2aConfig,
+    MAX_WORLD,
+    a2a_config,
+    counter_chunks,
+    default_block_m,
+)
 from ..gemm_ar import preshuffle_b
 
 _LAZY = {
@@ -54,6 +60,7 @@ __all__ = [
     "compile_fused_gemm_a2a",
     "compile_gemm_local",
     "counter_chunks",
+    "default_block_m",
     "preshuffle_b",
 ]
 

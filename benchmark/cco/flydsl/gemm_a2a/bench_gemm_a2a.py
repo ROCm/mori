@@ -75,7 +75,7 @@ from mori.ops.gemm_a2a import (
     preshuffle_b,
 )
 from mori.ops.gemm_a2a import timeline
-from mori.ops.gemm_a2a.layout import DEFAULT_BLOCK_M, MXFP8_BLOCK_M
+from mori.ops.gemm_a2a.layout import default_block_m
 from mori.ops.gemm_a2a.kernels_fused import (
     compile_fused_gemm_a2a,
     compile_gemm_local,
@@ -291,10 +291,15 @@ def run(args) -> int:
 
     # All three want the [dst][M][shard_n] slab; only two of them push it
     # with the copy engine.
-    if args.quant == "mxfp8" and args.block_m == DEFAULT_BLOCK_M:
-        # mxfp8's BLOCK_M is a property of the packed A scale, not a tuning
-        # choice, so take it rather than making every caller pass it.
-        args.block_m = MXFP8_BLOCK_M
+    if args.block_m == 0:
+        # mxfp8's 256 is a property of the packed A scale; ptpc's is the larger
+        # tile whenever there are at least two waves of it.
+        args.block_m = default_block_m(
+            args.m,
+            args.n,
+            args.quant,
+            num_cus=torch.cuda.get_device_properties(local_rank).multi_processor_count,
+        )
     needs_staging = args.mode in (
         "split-sdma",
         "fused-sdma",
@@ -674,6 +679,7 @@ def run(args) -> int:
                 "quant": args.quant,
                 "world_size": world_size,
                 "shard_n": cfg.shard_n,
+                "block_m": args.block_m,
                 "chunks": chunks,
                 "chunk_plan": list(cfg.chunk_tiles) if needs_sdma else [],
                 "us": max(g["us"] for g in gathered),
@@ -697,7 +703,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", type=int, default=18432)
     p.add_argument("-k", type=int, default=8192)
     p.add_argument("--quant", choices=("ptpc", "blockscale", "mxfp8"), default="ptpc")
-    p.add_argument("--block-m", type=int, default=DEFAULT_BLOCK_M)
+    p.add_argument(
+        "--block-m",
+        type=int,
+        default=0,
+        help="0 picks the tile from the shape (layout.default_block_m)",
+    )
     p.add_argument("--block-n", type=int, default=256)
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)

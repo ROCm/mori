@@ -102,6 +102,34 @@ TILE_M_GRANULE = 128
 
 MXFP8_BLOCK_M = 256
 
+#: ptpc's tile when there is enough work for it. 256x256 moves a third less A+B
+#: per output element than 128x256 and measured 12-32% faster as a plain GEMM
+#: at every model shape here except the one below two waves (8x MI355X, see the
+#: README). DEFAULT_BLOCK_M stays the 128 that ``A2aConfig`` defaults to.
+LARGE_BLOCK_M = 256
+
+#: Waves of 256x256 tiles below which ptpc falls back to 128x256. At 70B M=2048
+#: 256x256 is 1.25 waves, so the second wave runs a quarter of the CUs and the
+#: tail costs more than the reuse saves.
+LARGE_TILE_MIN_WAVES = 2
+
+
+def default_block_m(m: int, n: int, quant: str = "ptpc", *, num_cus: int = 256) -> int:
+    """BLOCK_M for a shape: 256 for mxfp8, 256 for ptpc/blockscale with enough work.
+
+    blockscale is left at 128: its per-K-block promotion doubles the
+    accumulators and 256x256 spills there (``gemm_ar/op.py``).
+    """
+    if quant == "mxfp8":
+        return MXFP8_BLOCK_M
+    if quant != "ptpc" or m % LARGE_BLOCK_M:
+        return DEFAULT_BLOCK_M
+    tiles = (m // LARGE_BLOCK_M) * (n // DEFAULT_BLOCK_N)
+    if tiles < LARGE_TILE_MIN_WAVES * num_cus:
+        return DEFAULT_BLOCK_M
+    return LARGE_BLOCK_M
+
+
 #: The ue8m0 group, on both operands: A is 1x32, B is 32x32.
 MXFP8_BLOCK = 32
 
@@ -515,8 +543,11 @@ __all__ = [
     "A2aConfig",
     "a2a_config",
     "counter_chunks",
+    "default_block_m",
     "DEFAULT_BLOCK_M",
     "DEFAULT_BLOCK_N",
+    "LARGE_BLOCK_M",
+    "LARGE_TILE_MIN_WAVES",
     "MXFP8_BLOCK",
     "MXFP8_BLOCK_M",
     "LSA_BLOCK_CAP",

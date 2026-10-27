@@ -67,6 +67,23 @@ CONFIGS = [
     ("fused-sdma", ["--chunks", "8"]),
 ]
 
+#: ``--alt-tile``: the same GEMM-bearing configs at the tile ``default_block_m``
+#: did *not* pick, so every table carries the evidence for its own tile choice.
+ALT_CONFIGS = [
+    ("gemm-only", []),
+    ("fused-sdma", ["--chunks", "4"]),
+    ("fused-sdma", ["--chunks", "8"]),
+]
+
+
+def alt_block_m(shape, quant):
+    """The other legal ptpc tile for ``shape``, or None (mxfp8 has only one)."""
+    if quant != "ptpc" or shape["m"] % 256:
+        return None
+    from mori.ops.gemm_a2a.layout import default_block_m
+
+    return 128 if default_block_m(shape["m"], shape["n"], quant) == 256 else 256
+
 
 def foreign_pids():
     """KFD processes that are not ours. Empty list means the box is ours.
@@ -180,6 +197,11 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--quant", choices=("ptpc", "blockscale", "mxfp8"), default="ptpc")
     ap.add_argument("--out", default="a2a_models.jsonl")
+    ap.add_argument(
+        "--alt-tile",
+        action="store_true",
+        help="also run gemm-only and fused-sdma at the tile not picked by default",
+    )
     args = ap.parse_args()
 
     samples = {}
@@ -187,7 +209,13 @@ def main():
         for rnd in range(1, args.rounds + 1):
             print(f"######## round {rnd}/{args.rounds}", flush=True)
             for sname, shape in SHAPES.items():
-                for mode, extra in CONFIGS:
+                alt = alt_block_m(shape, args.quant) if args.alt_tile else None
+                configs = list(CONFIGS)
+                if alt:
+                    configs += [
+                        (m, [*e, "--block-m", str(alt)]) for m, e in ALT_CONFIGS
+                    ]
+                for mode, extra in configs:
                     key = f"{sname} {mode} {' '.join(extra)}".strip()
                     r = None
                     for _ in range(3):
@@ -212,6 +240,7 @@ def main():
                         "shape": sname,
                         "mode": mode,
                         "extra": extra,
+                        "block_m": r.get("block_m"),
                         "us": r["us"],
                         "comm": r.get("phase_comm"),
                         "compute": r.get("phase_compute"),
@@ -224,7 +253,7 @@ def main():
                     fh.flush()
                     c = f"  comm {r['phase_comm']:.1f}" if r.get("phase_comm") else ""
                     print(
-                        f"  {key:<34}{r['us']:>9.1f}us{c}"
+                        f"  {key:<48}{r['us']:>9.1f}us{c}"
                         f"   [clk {r['_clk_mhz']}MHz {r['_temp_c']:.0f}C]",
                         flush=True,
                     )
@@ -233,7 +262,7 @@ def main():
     for key, xs in samples.items():
         sp = (max(xs) - min(xs)) / min(xs) * 100 if len(xs) > 1 else 0.0
         print(
-            f"  {key:<34}{statistics.median(xs):>9.1f}us  spread {sp:>5.1f}%  n={len(xs)}",
+            f"  {key:<48}{statistics.median(xs):>9.1f}us  spread {sp:>5.1f}%  n={len(xs)}",
             flush=True,
         )
     print("MODELSWEEPDONE", flush=True)
