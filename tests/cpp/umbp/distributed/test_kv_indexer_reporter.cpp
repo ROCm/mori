@@ -74,69 +74,6 @@ class Receiver : public pb::KVIndexer::Service {
   std::vector<pb::ApplyExternalKvBatchRequest> requests;
 };
 
-TEST(KvIndexerReporter, WireContractValidationAndRpcErrors) {
-  Receiver receiver;
-  grpc::ServerBuilder builder;
-  int port = 0;
-  builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
-  builder.RegisterService(&receiver);
-  auto server = builder.BuildAndStart();
-  ASSERT_NE(server, nullptr);
-  const auto endpoint = "127.0.0.1:" + std::to_string(port);
-  KvIndexerReporter reporter(endpoint, "worker", "http://worker:30000", 7, 32, 30);
-  const int64_t root = -9007199254740993LL;
-  reporter.Report({root}, std::nullopt, 16, 7);
-  reporter.Report({42, 43}, root, 16, 3);
-  reporter.Revoke({42});
-  reporter.Clear();
-  reporter.Report({}, std::nullopt, 16);
-  reporter.Revoke({});
-  EXPECT_THROW(KvIndexerReporter(endpoint, "worker", "address", 3), std::invalid_argument);
-  EXPECT_THROW(reporter.Report({1}, {}, 0), std::invalid_argument);
-  EXPECT_THROW(reporter.Report({1}, {}, 16, 2), std::invalid_argument);
-  EXPECT_THROW(reporter.Report({1}, {}, 16, 9), std::invalid_argument);
-  EXPECT_THROW(reporter.Report(std::vector<int64_t>(16385), {}, 16), std::invalid_argument);
-  EXPECT_THROW(reporter.Revoke(std::vector<int64_t>(16385)), std::invalid_argument);
-  receiver.mode = 1;
-  EXPECT_THROW(reporter.Report({1}, {}, 16), std::runtime_error);
-  receiver.mode = 2;
-  const auto start = std::chrono::steady_clock::now();
-  EXPECT_THROW(reporter.Revoke({1}), std::runtime_error);
-  EXPECT_LT(std::chrono::steady_clock::now() - start, 2s);
-  receiver.mode = 0;
-  reporter.Clear();
-  server->Shutdown();
-  server->Wait();
-  const auto& requests = receiver.requests;
-  ASSERT_EQ(requests.size(), 7u);  // No retries, implicit clear, or empty reports.
-  for (size_t i = 0; i < requests.size(); ++i) {
-    EXPECT_EQ(requests[i].worker_id(), "worker");
-    EXPECT_EQ(requests[i].worker_address(), "http://worker:30000");
-    EXPECT_EQ(requests[i].seq(), i + 1);
-    EXPECT_EQ(requests[i].cache_spec().components(), 7u);
-    EXPECT_EQ(requests[i].cache_spec().swa_window_tokens(), 32u);
-    ASSERT_EQ(requests[i].actions_size(), 1);
-    EXPECT_EQ(requests[i].actions(0).tier(), pb::TIER_DRAM);
-  }
-  EXPECT_FALSE(requests[0].actions(0).has_parent_block_hash());
-  EXPECT_EQ(requests[0].actions(0).hashes(0), root);
-  const auto& chain = requests[1].actions(0);
-  EXPECT_EQ(chain.type(), pb::ACTION_REPORT);
-  EXPECT_EQ(chain.parent_block_hash(), root);
-  ASSERT_EQ(chain.hashes_size(), 2);
-  ASSERT_EQ(chain.component_masks_size(), 2);
-  ASSERT_EQ(chain.block_sizes_size(), 2);
-  for (int i = 0; i < 2; ++i) {
-    EXPECT_EQ(chain.hashes(i), 42 + i);
-    EXPECT_EQ(chain.component_masks(i), 3u);
-    EXPECT_EQ(chain.block_sizes(i), 16u);
-  }
-  EXPECT_EQ(requests[2].actions(0).type(), pb::ACTION_REVOKE);
-  EXPECT_EQ(requests[2].actions(0).hashes(0), 42);
-  EXPECT_EQ(requests[3].actions(0).type(), pb::ACTION_CLEAR_ALL_AT_TIER);
-  EXPECT_EQ(requests[6].actions(0).type(), pb::ACTION_CLEAR_ALL_AT_TIER);
-}
-
 class AutomaticKvIndexer : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -153,6 +90,52 @@ class AutomaticKvIndexer : public ::testing::Test {
   std::unique_ptr<grpc::Server> server;
   KvIndexerConfig config;
 };
+
+TEST_F(AutomaticKvIndexer, BatchesRespectWireLimitsAndPreserveCanonicalMetadata) {
+  PoolClientConfig cfg;
+  cfg.master_config.node_id = "indexer-batch-test";
+  cfg.dram_page_size = 4096;
+  cfg.dram.buffer_sizes = {4096};
+  cfg.local_evict_high_watermark = 1;
+  PoolClient pool(cfg);
+  ASSERT_TRUE(pool.Init());
+  config.components = 1;
+  config.swa_window_tokens = 0;
+  pool.ConfigureKvIndexer(config);
+  std::map<int64_t, uint32_t> expected;
+  const int64_t root = -9007199254740993LL;
+  for (int i = 0; i < 300; ++i) {
+    pool.RegisterKvBlock(
+        {root + i, i ? std::optional<int64_t>(root + i - 1) : std::nullopt, 16, {{1, {"shared"}}}});
+    expected[root + i] = 1;
+  }
+  ASSERT_TRUE(pool.Put("shared", "data", 4));
+  ASSERT_TRUE(receiver.WaitFor(expected));
+  pool.Shutdown();
+  size_t reported = 0, batches = 0;
+  std::lock_guard<std::mutex> lock(receiver.mutex);
+  for (const auto& request : receiver.requests) {
+    EXPECT_EQ(request.worker_id(), config.worker_id);
+    EXPECT_EQ(request.worker_address(), config.worker_address);
+    EXPECT_EQ(request.cache_spec().full_tier_mask(), 6u);
+    EXPECT_LE(request.actions_size(), 256);
+    bool has_report = false;
+    for (const auto& action : request.actions()) {
+      EXPECT_EQ(action.tier(), pb::TIER_DRAM);
+      if (action.type() != pb::ACTION_REPORT) continue;
+      has_report = true;
+      EXPECT_EQ(action.hashes(0), root + reported);
+      EXPECT_EQ(action.has_parent_block_hash(), reported != 0);
+      if (reported) EXPECT_EQ(action.parent_block_hash(), root + reported - 1);
+      EXPECT_EQ(action.block_sizes(0), 16u);
+      EXPECT_EQ(action.component_masks(0), 1u);
+      ++reported;
+    }
+    batches += has_report;
+  }
+  EXPECT_EQ(reported, 300u);
+  EXPECT_EQ(batches, 2u);
+}
 
 TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
   PoolClientConfig cfg;
@@ -213,6 +196,10 @@ TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
   ASSERT_TRUE(pool.FlushKvIndexer());
   ASSERT_TRUE(pool.Put("v", data.data(), data.size()));
   ASSERT_TRUE(receiver.WaitFor({{block.hash, 1}}));
+  receiver.mode = 2;
+  pool.RegisterKvBlock({block.hash, {}, 0, {}});
+  EXPECT_FALSE(pool.FlushKvIndexer());  // A stalled RPC is bounded by the configured deadline.
+  receiver.mode = 0;
   pool.Shutdown();
   EXPECT_TRUE(receiver.WaitFor({}));
 }

@@ -23,82 +23,197 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
-#include <string>
-#include <vector>
+#include <thread>
+#include <unordered_set>
+#include <utility>
 
+#include "mori/utils/mori_log.hpp"
 #include "sgl_kv_indexer.grpc.pb.h"
+#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 namespace indexer_pb = ::kv_indexer::v1;
 
-// Synchronous DRAM reporting. Call after commit/eviction; metadata and recovery
-// belong to the caller. One writer per worker's DRAM tier. RPC errors throw.
+// Event-driven reconciliation of caller metadata with committed local DRAM.
+// Backend callbacks only wake this worker; snapshots and RPCs run off-path.
 class KvIndexerReporter {
  public:
-  KvIndexerReporter(const std::string& endpoint, const std::string& worker_id,
-                    const std::string& address, uint32_t components = 1,
-                    uint32_t swa_window_tokens = 0, uint32_t timeout_ms = 200)
-      : timeout_(timeout_ms) {
-    if (endpoint.empty() || worker_id.empty() || address.empty() || !(components & 1) ||
-        (components & ~7u) || ((components & 2) && !swa_window_tokens) || !timeout_ms)
+  using Snapshot = std::function<std::unordered_set<std::string>()>;
+  KvIndexerReporter(const KvIndexerConfig& config, Snapshot snapshot)
+      : components_(config.components),
+        timeout_(config.timeout_ms),
+        snapshot_(std::move(snapshot)) {
+    if (config.endpoint.empty() || config.worker_id.empty() || config.worker_address.empty() ||
+        !(components_ & 1) || (components_ & ~7u) ||
+        ((components_ & 2) && !config.swa_window_tokens) || !config.timeout_ms)
       throw std::invalid_argument("invalid KV Indexer identity, cache spec or timeout");
     stub_ = indexer_pb::KVIndexer::NewStub(
-        grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials()));
-    request_.set_worker_id(worker_id);
-    request_.set_worker_address(address);
+        grpc::CreateChannel(config.endpoint, grpc::InsecureChannelCredentials()));
+    request_.set_worker_id(config.worker_id);
+    request_.set_worker_address(config.worker_address);
     auto* spec = request_.mutable_cache_spec();
     spec->set_version(1);
-    spec->set_components(components);
-    spec->set_swa_window_tokens(swa_window_tokens);
+    spec->set_components(components_);
+    spec->set_swa_window_tokens(config.swa_window_tokens);
     spec->set_full_tier_mask(6);  // HBM + DRAM are eligible for prefix reuse.
     spec->set_swa_tier_mask(6);
     spec->set_mamba_tier_mask(6);
+    thread_ = std::thread([this] { Run(); });
+  }
+  ~KvIndexerReporter() { Stop(); }
+
+  void Notify() {
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
+      dirty_ = true;
+    }
+    cv_.notify_one();
+  }
+  void Register(const KvBlockMetadata& block) {
+    uint32_t mask = 0;
+    for (const auto& [component, keys] : block.component_keys) {
+      if ((component != 1 && component != 2 && component != 4) || keys.empty() ||
+          std::any_of(keys.begin(), keys.end(), [](const auto& key) { return key.empty(); }))
+        throw std::invalid_argument("invalid KV component or physical keys");
+      mask |= component;
+    }
+    if (mask && (mask != components_ || !block.block_size || block.parent == block.hash))
+      throw std::invalid_argument(
+          "metadata must describe all configured components and token count");
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      auto old = blocks_.find(block.hash);
+      if (mask && old != blocks_.end() &&
+          (old->second.parent != block.parent || old->second.block_size != block.block_size))
+        throw std::invalid_argument("a block hash cannot change parent or token count");
+      if (mask)
+        blocks_.insert_or_assign(block.hash, block);
+      else
+        blocks_.erase(block.hash);
+    }
+    Notify();
   }
 
-  // Consecutive canonical hashes; nullopt parent means root. Size is in tokens.
-  void Report(const std::vector<int64_t>& hashes, std::optional<int64_t> parent_hash,
-              uint32_t block_size, uint32_t component_mask = 1) {
-    Apply(indexer_pb::ACTION_REPORT, hashes, parent_hash, block_size, component_mask);
+  bool Sync() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    try {
+      request_.clear_actions();
+      const auto resident = snapshot_();
+      std::map<int64_t, uint32_t> desired;
+      for (const auto& [hash, block] : blocks_) {
+        uint32_t mask = 0;
+        for (const auto& [component, keys] : block.component_keys) {
+          if (std::all_of(keys.begin(), keys.end(),
+                          [&](const auto& key) { return resident.count(key); }))
+            mask |= component;
+        }
+        if (mask & 1) desired[hash] = mask;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      // Rebuild from fresh state after ambiguous failures and quiet Indexer restarts.
+      if (retry_ || now - last_full_ >= std::chrono::seconds(30)) {
+        Add(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
+        reported_.clear();
+        last_full_ = now;
+      }
+      for (const auto& [hash, mask] : reported_) {
+        if (stopping_) return false;
+        if (!desired.count(hash)) Add(indexer_pb::ACTION_REVOKE, hash);
+      }
+      for (const auto& [hash, mask] : desired) {
+        if (stopping_) return false;
+        auto old = reported_.find(hash);
+        if (old == reported_.end() || old->second != mask) {
+          Add(indexer_pb::ACTION_REPORT, hash, mask);
+        }
+      }
+      Send();
+      reported_ = std::move(desired);
+      retry_ = false;
+      return true;
+    } catch (const std::exception& error) {
+      retry_ = true;
+      MORI_UMBP_WARN("[KVIndexer] sync failed: {}", error.what());
+      return false;
+    }
   }
-  void Revoke(const std::vector<int64_t>& hashes) { Apply(indexer_pb::ACTION_REVOKE, hashes); }
-  void Clear() { Apply(indexer_pb::ACTION_CLEAR_ALL_AT_TIER, {}); }
+  void Stop() {
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_one();
+    if (!thread_.joinable()) return;
+    thread_.join();
+    try {
+      request_.clear_actions();
+      Add(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
+      Send();
+    } catch (const std::exception& error) {
+      MORI_UMBP_WARN("[KVIndexer] withdrawal failed: {}", error.what());
+    }
+  }
 
  private:
-  void Apply(indexer_pb::ExternalKvActionType type, const std::vector<int64_t>& hashes,
-             std::optional<int64_t> parent = {}, uint32_t size = 0, uint32_t mask = 0) {
-    if (hashes.size() > 16384) throw std::invalid_argument("at most 16384 hashes per call");
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (type == indexer_pb::ACTION_REPORT &&
-        (!size || !(mask & 1) || (mask & ~request_.cache_spec().components())))
-      throw std::invalid_argument(
-          "report requires token count and declared components including FULL");
-    if (hashes.empty() && type != indexer_pb::ACTION_CLEAR_ALL_AT_TIER) return;
-    request_.set_seq(request_.seq() + 1);
-    request_.clear_actions();
+  void Add(indexer_pb::ExternalKvActionType type, int64_t hash = 0, uint32_t mask = 0) {
     auto* action = request_.add_actions();
     action->set_type(type);
     action->set_tier(indexer_pb::TIER_DRAM);
-    for (auto hash : hashes) action->add_hashes(hash);
+    if (type != indexer_pb::ACTION_CLEAR_ALL_AT_TIER) action->add_hashes(hash);
     if (type == indexer_pb::ACTION_REPORT) {
-      if (parent) action->set_parent_block_hash(*parent);
-      action->mutable_block_sizes()->Resize(hashes.size(), size);
-      action->mutable_component_masks()->Resize(hashes.size(), mask);
+      const auto& block = blocks_.at(hash);
+      if (block.parent) action->set_parent_block_hash(*block.parent);
+      action->add_block_sizes(block.block_size);
+      action->add_component_masks(mask);
     }
+    // One hash per action: also below the Indexer's 16384-hash request limit.
+    if (request_.actions_size() == 256) Send();
+  }
+  void Send() {
+    if (request_.actions().empty()) return;
+    request_.set_seq(request_.seq() + 1);
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + timeout_);
     indexer_pb::ApplyExternalKvBatchResponse response;
     auto status = stub_->ApplyExternalKvBatch(&context, request_, &response);
-    if (!status.ok())
-      throw std::runtime_error("KV Indexer RPC " + std::to_string(status.error_code()) + ": " +
-                               status.error_message());
+    if (!status.ok()) throw std::runtime_error(status.error_message());
+    request_.clear_actions();
+  }
+  void Run() {
+    auto periodic = std::chrono::steady_clock::now();
+    while (true) {
+      std::unique_lock<std::mutex> lock(wake_mutex_);
+      cv_.wait_for(lock, std::chrono::seconds(1), [this] { return dirty_ || stopping_; });
+      if (stopping_) return;
+      bool work = std::exchange(dirty_, false);
+      lock.unlock();
+      const auto now = std::chrono::steady_clock::now();
+      if (work || retry_ || now - periodic >= std::chrono::seconds(30)) {
+        Sync();
+        periodic = now;
+      }
+    }
   }
   std::unique_ptr<indexer_pb::KVIndexer::Stub> stub_;
   indexer_pb::ApplyExternalKvBatchRequest request_;
-  std::chrono::milliseconds timeout_;
-  std::mutex mutex_;
+  const uint32_t components_;
+  const std::chrono::milliseconds timeout_;
+  Snapshot snapshot_;
+  std::mutex state_mutex_, wake_mutex_;
+  std::condition_variable cv_;
+  std::map<int64_t, KvBlockMetadata> blocks_;
+  std::map<int64_t, uint32_t> reported_;
+  std::chrono::steady_clock::time_point last_full_{};
+  std::atomic<bool> retry_{true};
+  bool dirty_ = true;
+  std::atomic<bool> stopping_{false};
+  std::thread thread_;
 };
 }  // namespace mori::umbp

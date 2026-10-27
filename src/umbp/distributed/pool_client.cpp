@@ -52,7 +52,7 @@
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
-#include "umbp/distributed/indexer/kv_indexer_observer.h"
+#include "umbp/distributed/indexer/kv_indexer_reporter.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -1421,7 +1421,7 @@ void PoolClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
     throw std::logic_error("pool must be initialized and Indexer configured once");
   if (registry_.Get(TierType::DRAM) == nullptr)
     throw std::invalid_argument("KV Indexer reporting requires a local DRAM backend");
-  kv_indexer_ = std::make_shared<KvIndexerObserver>(config, [this] {
+  kv_indexer_ = std::make_shared<KvIndexerReporter>(config, [this] {
     std::unordered_set<std::string> resident;
     for (const auto* backend : registry_.All()) {
       if (backend->Tier() != TierType::DRAM) continue;
@@ -1429,11 +1429,11 @@ void PoolClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
     }
     return resident;
   });
-  std::weak_ptr<KvIndexerObserver> weak = kv_indexer_;
+  std::weak_ptr<KvIndexerReporter> weak = kv_indexer_;
   for (auto* backend : registry_.All()) {
     if (backend->Tier() == TierType::DRAM)
       backend->SetChangeHook([weak] {
-        if (auto observer = weak.lock()) observer->Notify();
+        if (auto reporter = weak.lock()) reporter->Notify();
       });
   }
   kv_indexer_->Notify();

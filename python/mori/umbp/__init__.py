@@ -99,7 +99,6 @@ _load_umbp()
 from mori.cpp import (  # noqa: E402
     CacheRemoteAdmission,
     UMBPClient,
-    UMBPIndexerReporter,
     UMBPConfig,
     UMBPCopyPipelineConfig,
     UMBPDeploymentMode,
@@ -126,7 +125,6 @@ from mori.cpp import (  # noqa: E402
 __all__ = [
     "CacheRemoteAdmission",
     "UMBPClient",
-    "UMBPIndexerReporter",
     "UMBPConfig",
     "UMBPCopyPipelineConfig",
     "UMBPDeploymentMode",
