@@ -323,6 +323,13 @@ std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>&
   return pool_client_->BatchExists(keys);
 }
 
+size_t DistributedClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (closing_) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  return pool_client_->BatchPrefetch(keys);
+}
+
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
   if (closing_) return 0;
   std::shared_lock lk(op_mutex_);

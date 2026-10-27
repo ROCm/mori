@@ -1203,6 +1203,32 @@ TEST_F(PoolClientRangesTest, LocalityPrefetchOffLeavesNothingLocal) {
   quiet->Shutdown();
 }
 
+// A queued request's keys pulled from their owner before the read, so the read
+// is local; locality prefetch is off, so BatchPrefetch is the only pull.
+TEST_F(PoolClientRangesTest, BatchPrefetchPullsAPeersKeyIntoThisNode) {
+  std::vector<char> node_get(kScratchSize), node_put(kScratchSize);
+  auto node = MakeClient("ranges-batch-prefetch", kCallerCapacity, node_get, node_put,
+                         /*locality_prefetch=*/false);
+
+  const std::string key = "batch-prefetch";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 41 + 5) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  node->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(node.get(), key));
+  ASSERT_FALSE(LocallyResident(node.get(), key));
+
+  EXPECT_EQ(node->BatchPrefetch({key}), 1u);
+  ASSERT_TRUE(WaitLocallyResident(node.get(), key));
+
+  target_->Shutdown();
+  std::vector<char> out(kObjectSize, 0);
+  ASSERT_TRUE(node->BatchGet({key}, {out.data()}, {kObjectSize}).front());
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+  node->Shutdown();
+}
+
 // Eight layer groups over one cold key must schedule ONE whole-object pull, not
 // one per group: the dedup set is what keeps the duplicate traffic bounded at
 // 1x the object instead of 8x.
