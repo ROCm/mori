@@ -153,11 +153,8 @@ class KvIndexerReporter {
     }
   }
   void Stop() {
-    {
-      std::lock_guard<std::mutex> lock(wake_mutex_);
-      stopping_ = true;
-    }
-    cv_.notify_one();
+    stopping_ = true;
+    Notify();
     if (!thread_.joinable()) return;
     thread_.join();
     try {

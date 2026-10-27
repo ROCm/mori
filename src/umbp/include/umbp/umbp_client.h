@@ -84,7 +84,10 @@ class IUMBPClient {
   // ---- Core KV Operations ----
 
   /// Write `size` bytes from address `src` into the store under `key`.
-  virtual bool Put(const std::string& key, uintptr_t src, size_t size) = 0;
+  virtual bool Put(const std::string& key, uintptr_t src, size_t size) {
+    const auto results = BatchPut({key}, {src}, {size});
+    return !results.empty() && results.front();
+  }
 
   /// Read stored value for `key` into address `dst`.
   virtual bool Get(const std::string& key, uintptr_t dst, size_t size) = 0;
@@ -98,14 +101,14 @@ class IUMBPClient {
                                      const std::vector<uintptr_t>& srcs,
                                      const std::vector<size_t>& sizes) = 0;
 
-  /// Depth-aware batch put.  depths[i] is the radix-tree chain depth for
-  /// keys[i].  Standalone uses depth for local eviction priority; Distributed
-  /// forwards it to the Master for global eviction decisions.
-  /// Empty depths vector or depth == -1 falls back to plain LRU.
+  /// Optional radix-depth hints. Backends that do not use them share BatchPut;
+  /// standalone overrides this to preserve hints on its existing wire protocol.
   virtual std::vector<bool> BatchPutWithDepth(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& srcs,
                                               const std::vector<size_t>& sizes,
-                                              const std::vector<int>& depths) = 0;
+                                              const std::vector<int>& /*depths*/) {
+    return BatchPut(keys, srcs, sizes);
+  }
 
   virtual std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dsts,

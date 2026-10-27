@@ -267,7 +267,9 @@ TEST_F(AutomaticKvIndexer, StandaloneForwardsMetadataToTheStorageOwner) {
   cfg.standalone_process->address = address;
   standalone::StandaloneServer owner(cfg, address);
   ASSERT_TRUE(owner.Start());
-  config.metadata_provider = [](const auto&) {
+  int callbacks = 0;
+  config.metadata_provider = [&](const auto&) {
+    ++callbacks;
     return std::vector<KvBlockMetadata>{{42, {}, 16, {{1, {"key"}}}}};
   };
   cfg.kv_indexer = config;
@@ -282,6 +284,9 @@ TEST_F(AutomaticKvIndexer, StandaloneForwardsMetadataToTheStorageOwner) {
   ASSERT_TRUE(client->RegisterMemory(ptr, buffer.mapped_size));
   std::memset(buffer.ptr, 0x5a, 128);
   ASSERT_TRUE(client->Put("key", ptr, 128));
+  ASSERT_EQ(client->BatchPut({"key"}, {ptr}, {128}), std::vector<bool>{true});
+  ASSERT_EQ(client->BatchPutWithDepth({"key"}, {ptr}, {128}, {}), std::vector<bool>{true});
+  EXPECT_EQ(callbacks, 3);  // Each public write invokes the shared preparation once.
   ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
   ASSERT_TRUE(client->Get("key", ptr + 128, 128));
   EXPECT_EQ(std::memcmp(buffer.ptr, static_cast<char*>(buffer.ptr) + 128, 128), 0);
