@@ -157,7 +157,10 @@ A bitmask, and a template argument. Two bits:
 
 `ccoSdmaOptFlagsAggregate` posts without ringing the doorbell — issue N puts,
 then one `commit(peer, queueId)` rings the batch. Amortises the doorbell; sweet
-spot around N = 8–16.
+spot around N = 8–16. A batch must fit in the ring with one unit to spare: at
+most 256 KB − 32 B on a queue before `commit` (8191 single-copy puts without
+signals). The put that would fill the ring waits for the engine, which an
+uncommitted batch never starts, so it hangs.
 
 `ccoSdmaOptFlagsSignalPerCopy` gives every copy its own signal packet. **You
 rarely want this.** By default a group of lanes signals once, after all of its
@@ -315,6 +318,7 @@ unpack on the receiver.
 | `ccoSdma` undeclared | kernel TU missing `-DBUILD_CCO_SDMA=1` |
 | `waitSignal` never returns | `expected` shared across queues, `comm.rank` passed where `comm.lsaRank` was meant, or `expected` counted per lane when the sender signals once per group |
 | `quiet` returns but data is stale | aggregate puts never `commit`ed — `quiet` drains to the last *rung* packet. Traps under `MORI_CCO_SDMA_DEBUG` |
+| a `put` inside an `Aggregate` batch never returns | over 256 KB − 32 B posted on one queue without `commit` — commit sooner. Traps under `MORI_CCO_SDMA_DEBUG` |
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
 
