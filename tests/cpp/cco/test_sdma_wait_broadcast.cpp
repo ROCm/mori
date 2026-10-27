@@ -31,6 +31,8 @@
 //      raises the flag, and must all arrive afterwards. Default and Aggregate.
 //   C  postWaitSignal: each rank's engine relays what it received from prev on to
 //      next once prev's signal lands, with no CU in the forwarding path.
+//   E  thread scope with every lane of a wave posting to one queue: must not
+//      deadlock (the lanes are serialized).
 //   D  broadcast ring wrap: enough 3-unit broadcasts that one is placed on the
 //      last unit of the ring, which must be padded rather than split.
 
@@ -153,6 +155,24 @@ __global__ void BroadcastWrapKernel(ccoWindowDevice* sendWin, ccoWindowDevice* r
   sdma.quiet(next);
 }
 
+/* ---------------------------------- part E ---------------------------------- */
+
+// Every lane posts a wait to the same queue. The wait never blocks (Always), so
+// this only returns if the lanes are serialized instead of racing in ReserveSlot.
+__global__ void MultiLaneWaitKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                                    ccoWindowDevice* flagWin, size_t bytes, int qid,
+                                    ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoSdma sdma{devComm};
+  const int next = (devComm.lsaRank + 1) % devComm.lsaSize;
+  sdma.postWaitMem(next, qid, reinterpret_cast<ccoWindow_t>(flagWin), 0, 0, ccoSdmaCmpAlways);
+  if (threadIdx.x == 0) {
+    sdma.put(next, reinterpret_cast<ccoWindow_t>(recvWin), 0,
+             reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, qid);
+    sdma.quiet(next);
+  }
+}
+
 /* ---------------------------------- driver ---------------------------------- */
 
 int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
@@ -172,7 +192,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   void *sendBuf = nullptr, *recvBuf = nullptr, *recv2Buf = nullptr, *flagBuf = nullptr,
        *fwdBuf = nullptr;
   if (ccoMemAlloc(comm, BUF_BYTES, &sendBuf) || ccoMemAlloc(comm, BUF_BYTES, &recvBuf) ||
-      ccoMemAlloc(comm, BUF_BYTES, &recv2Buf) || ccoMemAlloc(comm, 4096, &flagBuf) ||
+      ccoMemAlloc(comm, BUF_BYTES, &recv2Buf) || ccoMemAlloc(comm, BUF_BYTES, &flagBuf) ||
       ccoMemAlloc(comm, BUF_BYTES, &fwdBuf)) {
     fprintf(stderr, "[rank %d] MemAlloc failed\n", rank);
     return 1;
@@ -182,7 +202,7 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
   if (ccoWindowRegister(comm, sendBuf, BUF_BYTES, &sendWin) ||
       ccoWindowRegister(comm, recvBuf, BUF_BYTES, &recvWin) ||
       ccoWindowRegister(comm, recv2Buf, BUF_BYTES, &recv2Win) ||
-      ccoWindowRegister(comm, flagBuf, 4096, &flagWin) ||
+      ccoWindowRegister(comm, flagBuf, BUF_BYTES, &flagWin) ||
       ccoWindowRegister(comm, fwdBuf, BUF_BYTES, &fwdWin)) {
     fprintf(stderr, "[rank %d] WindowRegister failed\n", rank);
     return 1;
@@ -198,8 +218,17 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     return 1;
   }
 
+  // putBroadcast/postWait* compile for gfx12.5 but trap there (packet layout not validated).
+  hipDeviceProp_t prop;
+  HIP_CHECK(hipGetDeviceProperties(&prop, rank % numDevices));
+  const bool isGfx125 = strstr(prop.gcnArchName, "gfx125") != nullptr;
+
   bool ok = true;
-  if (devComm.sdma.sdmaNumQueue < static_cast<uint32_t>(NUM_QUEUES)) {
+  if (isGfx125) {
+    printf("[rank %d] SKIP — %s: SDMA wait/broadcast packet layout not validated\n", rank,
+           prop.gcnArchName);
+    fflush(stdout);
+  } else if (devComm.sdma.sdmaNumQueue < static_cast<uint32_t>(NUM_QUEUES)) {
     printf("[rank %d] SKIP — %u SDMA queues (set MORI_ENABLE_SDMA=1)\n", rank,
            devComm.sdma.sdmaNumQueue);
     fflush(stdout);
@@ -361,13 +390,22 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     HIP_CHECK(hipMemcpy(host.data(), recv2Buf, 64, hipMemcpyDeviceToHost));
     for (size_t i = 0; i < 16; i++) okD = okD && host[i] == Pattern(me, i);
 
-    ok = okA && okB && okC && okD;
+    /* ---- E ---- */
+    resetRecv();
+    ccoBarrierAll(comm);
+    MultiLaneWaitKernel<<<1, 32, 0, stream>>>(sendWin, recvWin, flagWin, BUF_BYTES, 4, devComm);
+    HIP_CHECK(hipStreamSynchronize(stream));
+    ccoBarrierAll(comm);
+    const bool okE = matches(recvBuf, BUF_BYTES, prev, "multi-lane wait");
+
+    ok = okA && okB && okC && okD && okE;
     HIP_CHECK(hipStreamDestroy(stream));
     printf(
         "[rank %d] A(broadcast)=%s(%d/%d) B(waitMem)=%s(%d/%d) C(relay)=%s "
-        "D(wrap, %u straddles)=%s %s\n",
+        "D(wrap, %u straddles)=%s E(multi-lane)=%s %s\n",
         rank, okA ? "PASS" : "FAIL", aPass, aTotal, okB ? "PASS" : "FAIL", bPass, bTotal,
-        okC ? "PASS" : "FAIL", straddles, okD ? "PASS" : "FAIL", ok ? "PASSED" : "FAILED");
+        okC ? "PASS" : "FAIL", straddles, okD ? "PASS" : "FAIL", okE ? "PASS" : "FAIL",
+        ok ? "PASSED" : "FAILED");
     fflush(stdout);
   }
 

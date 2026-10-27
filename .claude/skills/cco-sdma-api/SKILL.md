@@ -315,12 +315,14 @@ unpack on the receiver.
 
 ## Engine-side wait and broadcast
 
-Two more packets, both gfx9 layouts validated on gfx950. They do not compile on
-gfx12.5 (`static_assert`) until the layouts are checked there.
+Two more packets, both gfx9 layouts validated on gfx950. On gfx12.5 they compile
+but trap when called, until the layouts are checked there; a multi-arch build
+still builds, and the caller must not reach them on gfx12.5.
 
-Unlike `put`, these post from a **single issuer**: thread scope takes exactly one
-active lane (traps under `MORI_CCO_SDMA_DEBUG` otherwise), warp/block scope lets the
-leader post. Only `ccoSdmaOptFlagsAggregate` is accepted.
+Unlike `put`, these post from a **single issuer** and do no lane grouping: thread
+scope posts one active lane at a time (several lanes are serialized, so they may
+share a queue), warp/block scope lets the leader post. Only
+`ccoSdmaOptFlagsAggregate` is accepted.
 
 ### postWaitMem / postWaitSignal
 
@@ -344,7 +346,9 @@ sdma.postWaitSignal(next, relayQ, prev, hopQ, 1);   // prev's hop landed
 sdma.put<ccoCoopThread, false, true>(next, fwdWin, 0, recvWin, 0, bytes, relayQ);
 ```
 
-`expected` is taken modulo 2^32 here, so it stops working after 4G signals on one slot.
+The engine compares 32 bits, so `expected` must stay below 2^32. A larger value is
+truncated and releases early: `2^32 + 5` waits for `low32 >= 5`, which a counter of
+100 already meets. Traps under `MORI_CCO_SDMA_DEBUG`.
 
 Pre-posting everything and ringing once is `postWaitMem<.., Aggregate>` +
 `put<.., Aggregate>` + `commit`.
@@ -391,7 +395,8 @@ a NOP, so the packet is never split across the ring end.
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
 | a queue stops moving after `postWaitMem` | the flag never reached the value, or it points at another GPU's memory — `win`/`offset` must be local |
-| `putBroadcast`/`postWait*` fail to compile | gfx12.5 build: those packet layouts are not validated there |
+| `putBroadcast`/`postWait*` trap | gfx12.5 build: those packet layouts are not validated there |
+| `postWaitSignal` releases too early | `expected` is 2^32 or more and was truncated to 32 bits |
 
 Build with `-DMORI_CCO_SDMA_DEBUG` when any of these appear: it turns the
 misuse checks into traps at the offending call instead of a hang or corruption.
