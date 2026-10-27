@@ -616,13 +616,21 @@ __device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, in
 // as done). Executed by ONE full wave (npes <= warpSize): lane q polls row q,
 // one load + wave vote per round. No fence: the caller syncs its block and
 // issues the acquire before reading the copied bytes.
+// Debug: a non-null firstSeen gets, per active lane q, the wall_clock64() of the
+// first poll that saw row q reach `gen` (inactive lanes leave it untouched).
 __device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, uint64_t gen,
-                                            int myPe, int npes, bool skipSelf) {
+                                            int myPe, int npes, bool skipSelf,
+                                            uint64_t* firstSeen = nullptr) {
   const int lane = __lane_id();
   const bool active = lane < npes && !(skipSelf && lane == myPe);
   const uint64_t* addr = arrived + lane * kArrivedStride + slot;
+  bool seen = !active;
   while (true) {
     const uint64_t v = active ? AtomicLoad<ESystemScope>(addr) : gen;
+    if (firstSeen != nullptr && !seen && v >= gen) {
+      seen = true;
+      firstSeen[lane] = wall_clock64();
+    }
     if (__all(v >= gen)) break;
     __builtin_amdgcn_s_sleep(1);
   }

@@ -42,10 +42,119 @@
 #include "mori/collective/XLA/collectives_common.hpp"
 #include "mori/collective/XLA/reduce_ops.hpp"
 
+// ---------------------------------------------------------------------------
+// RS push slice timing (debug, -DRS_PUSH_TIMING=1; off by default, zero cost).
+//
+// Blocks [0, RS_PUSH_TIMING_BLOCKS) record wall_clock64() at kernel entry (t0),
+// and per slice s after the arrival poll + acquire (t3[s]) and after the slice
+// reduce (t4[s], behind an extra __syncthreads only those blocks execute). Block 0
+// also records before (t1, i.e. after the entry GenBarrier) and after (t2) issuing
+// its SDMA scatter. One block (block 1, or 0 for a 1-block grid) records, per
+// slice and sender, the first poll that saw that sender's slot land (arr).
+// Every block runs the same grid-strided reduce over every slice, so a few
+// blocks are representative; block 0 is the outlier since it also issues SDMA.
+//
+// The last block out of launches [RS_PUSH_TIMING_LAUNCH, +RS_PUSH_TIMING_NPRINT)
+// (counted per device, every RS push launch) printf's a per-PE summary, all
+// times in us relative to block 0's entry. wall_clock64 is per-GPU, so values
+// are comparable only within one PE.
+// ---------------------------------------------------------------------------
+#ifndef RS_PUSH_TIMING
+#define RS_PUSH_TIMING 0
+#endif
+
+#if RS_PUSH_TIMING
+#ifndef RS_PUSH_TIMING_BLOCKS
+#define RS_PUSH_TIMING_BLOCKS 4
+#endif
+#ifndef RS_PUSH_TIMING_LAUNCH
+#define RS_PUSH_TIMING_LAUNCH 2
+#endif
+#ifndef RS_PUSH_TIMING_NPRINT
+#define RS_PUSH_TIMING_NPRINT 1
+#endif
+// wall_clock64 rate. Not queried: hipDeviceAttributeWallClockRate is 0 on gfx1250.
+#ifndef RS_PUSH_TIMING_MHZ
+#define RS_PUSH_TIMING_MHZ 100
+#endif
+// Also print every sender's arrival time per slice (not just first/last).
+#ifndef RS_PUSH_TIMING_VERBOSE
+#define RS_PUSH_TIMING_VERBOSE 0
+#endif
+#endif  // RS_PUSH_TIMING
+
 namespace mori {
 namespace collective {
 
 namespace detail {
+
+#if RS_PUSH_TIMING
+static constexpr int kRsTimingBlocks = RS_PUSH_TIMING_BLOCKS;
+
+struct RsPushTiming {
+  uint64_t t0[kRsTimingBlocks];
+  uint64_t t1, t2;
+  uint64_t t3[kRsTimingBlocks][kRSPushMaxSlices];
+  uint64_t t4[kRsTimingBlocks][kRSPushMaxSlices];
+  uint64_t arr[kRSPushMaxSlices][kRSPushMaxPeers];
+  uint32_t launch;
+};
+
+static __device__ RsPushTiming gRsPushTiming;
+
+__device__ __forceinline__ bool RsTimedBlock() {
+  return blockIdx.x < static_cast<uint32_t>(kRsTimingBlocks);
+}
+
+__device__ __forceinline__ uint32_t RsArrBlock() { return gridDim.x > 1 ? 1 : 0; }
+
+__device__ __forceinline__ float RsUs(uint64_t t, uint64_t base) {
+  return static_cast<float>(static_cast<int64_t>(t - base)) / RS_PUSH_TIMING_MHZ;
+}
+
+// Called by thread 0 of the last block out, after every block counted in.
+__device__ inline void RsPushTimingReport(int myPe, int npes, uint32_t S, size_t chunkBytes) {
+  __threadfence();
+  volatile RsPushTiming& T = gRsPushTiming;
+  const uint32_t launch = T.launch;
+  T.launch = launch + 1;
+  if (launch < RS_PUSH_TIMING_LAUNCH || launch >= RS_PUSH_TIMING_LAUNCH + RS_PUSH_TIMING_NPRINT)
+    return;
+
+  const int nb = min(static_cast<int>(gridDim.x), kRsTimingBlocks);
+  const uint64_t base = T.t0[0];
+  printf("[RS-T pe=%d L=%u] S=%u grid=%u chunk=%lluB | blk0: barrier=%.2f issue=%.2f "
+         "(t1=%.2f t2=%.2f) us\n",
+         myPe, launch, S, gridDim.x, static_cast<unsigned long long>(chunkBytes),
+         RsUs(T.t1, T.t0[0]), RsUs(T.t2, T.t1),
+         RsUs(T.t1, base), RsUs(T.t2, base));
+  for (uint32_t s = 0; s < S; s++) {
+    int pMin = -1, pMax = -1;
+    uint64_t aMin = 0, aMax = 0;
+    for (int p = 0; p < npes; p++) {
+      if (p == myPe) continue;
+      const uint64_t a = T.arr[s][p];
+      if (pMin < 0 || a < aMin) aMin = a, pMin = p;
+      if (pMax < 0 || a > aMax) aMax = a, pMax = p;
+#if RS_PUSH_TIMING_VERBOSE
+      printf("[RS-T pe=%d L=%u] s=%u arrive p%d=%.2f us\n", myPe, launch, s, p, RsUs(a, base));
+#endif
+    }
+    if (pMin >= 0) {
+      printf("[RS-T pe=%d L=%u] s=%u arrive first=p%d@%.2f last=p%d@%.2f spread=%.2f us "
+             "(seen by blk%u)\n",
+             myPe, launch, s, pMin, RsUs(aMin, base), pMax, RsUs(aMax, base), RsUs(aMax, aMin),
+             RsArrBlock());
+    }
+    for (int b = 0; b < nb; b++) {
+      const uint64_t prev = s == 0 ? T.t0[b] : T.t4[b][s - 1];
+      printf("[RS-T pe=%d L=%u] s=%u blk%d wait=%.2f reduce=%.2f | ready=%.2f done=%.2f us\n",
+             myPe, launch, s, b, RsUs(T.t3[b][s], prev), RsUs(T.t4[b][s], T.t3[b][s]),
+             RsUs(T.t3[b][s], base), RsUs(T.t4[b][s], base));
+    }
+  }
+}
+#endif  // RS_PUSH_TIMING
 
 // Reduce one group of NV vectors (each NV-member at vector index g + i*gstride)
 // across all npes staging slots into the output. Callers guarantee every member
@@ -167,7 +276,10 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //
 // `gen` is this launch's push generation: every sender's swap for this slice
 // stores it into its row of my `arrived` copy.
-template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
+//
+// Timed (only meaningful with RS_PUSH_TIMING) records t3/t4 for this slice in the
+// first kRsTimingBlocks blocks; all-reduce leaves it off.
+template <int NumVecs, class ReduceOp, bool Timed = false, class T = typename ReduceOp::Type>
 __device__ __forceinline__ void WaitAndReduceSlice(
     const uint64_t* arrived, uint64_t gen, uint32_t slice, int myPe, int npes,
     const T* __restrict__ input, const T* __restrict__ staging,
@@ -182,7 +294,14 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   // wave of every block polls them itself (one lane per sender); self-copy is
   // skipped, so row myPe is not waited on. At npes==1 there is nothing to wait for.
   if (threadIdx.x < warpSize) {
-    WaitArrived(arrived, static_cast<int>(slice), gen, myPe, npes, /*skipSelf=*/true);
+    uint64_t* firstSeen = nullptr;
+#if RS_PUSH_TIMING
+    if constexpr (Timed) {
+      if (blockIdx.x == RsArrBlock()) firstSeen = gRsPushTiming.arr[slice];
+    }
+#endif
+    WaitArrived(arrived, static_cast<int>(slice), gen, myPe, npes, /*skipSelf=*/true,
+                firstSeen);
   }
   __syncthreads();
   // System-scope ACQUIRE (not the full seq_cst __threadfence_system): the staging
@@ -190,6 +309,11 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   // device's writes -- scope "" (system) is required -- but only the acquire half
   // is needed here (we publish nothing at this point), so drop the release/waitcnt.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+#if RS_PUSH_TIMING
+  if constexpr (Timed) {
+    if (RsTimedBlock() && threadIdx.x == 0) gRsPushTiming.t3[blockIdx.x][slice] = wall_clock64();
+  }
+#endif
 
   // === Phase 3: grid-strided vectorized reduce over this slice =================
   // Streaming reduction over the slice only, strided over the whole grid. Uses
@@ -229,6 +353,15 @@ __device__ __forceinline__ void WaitAndReduceSlice(
     V = __builtin_bit_cast(Vec, DowncastF<T>(a));
     StreamStore<EAgentScope, sizeof(T)>(shardOut + v, V);
   }
+#if RS_PUSH_TIMING
+  if constexpr (Timed) {
+    // Block-uniform branch: only the timed blocks pay the extra barrier.
+    if (RsTimedBlock()) {
+      __syncthreads();
+      if (threadIdx.x == 0) gRsPushTiming.t4[blockIdx.x][slice] = wall_clock64();
+    }
+  }
+#endif
 }
 
 // Load M output positions x NPES peers ALL up front into distinct registers, then
@@ -367,6 +500,11 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 
   // Every block reads the launch generation before counting in; only the last
   // block out advances it, after every block has counted in.
+#if RS_PUSH_TIMING
+  if (detail::RsTimedBlock() && threadIdx.x == 0) {
+    detail::gRsPushTiming.t0[blockIdx.x] = wall_clock64();
+  }
+#endif
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
@@ -376,6 +514,9 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     int stride4G = heapWin->stride4G;
     if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
+#if RS_PUSH_TIMING
+    if (threadIdx.x == 0) detail::gRsPushTiming.t1 = wall_clock64();
+#endif
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
@@ -392,6 +533,11 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
               PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
         },
         pushGen);
+#if RS_PUSH_TIMING
+    // The scatter runs in wave 0 only (npes*4 <= warpSize lanes), so thread 0
+    // leaves it after every doorbell was rung.
+    if (threadIdx.x == 0) detail::gRsPushTiming.t2 = wall_clock64();
+#endif
   }
   
   // Phase 2-3: walk all S slices in the order the senders queued them, reducing
@@ -404,18 +550,25 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   for (uint32_t s = 0; s < S; s++) {
     const size_t sOfs = FORCE_SGPR(s * sliceLen);
     const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
-    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(arrived, pushGen, s, myPe,
-                                                 npes, input, staging, output, sOfs, sCnt,
-                                                 chunkElems, chunkElems, lstride);
+    detail::WaitAndReduceSlice<NumVecs, ReduceOp, /*Timed=*/RS_PUSH_TIMING != 0>(
+        arrived, pushGen, s, myPe, npes, input, staging, output, sOfs, sCnt, chunkElems,
+        chunkElems, lstride);
   }
 
   // === Gen bump: the last block of the grid advances the push generation =======
   // Every block read pushGen at entry, before counting in here, so no block of
   // this launch can see the new value. atomicInc wraps the arrival counter back
   // to 0 on the last block, so it needs no reset of its own.
+#if RS_PUSH_TIMING
+  // Publish this block's timestamps (all written by wave 0) before counting in.
+  if (threadIdx.x == 0 && detail::RsTimedBlock()) __threadfence();
+#endif
   if (threadIdx.x == 0 &&
       atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
     AdvancePushGen(barrierCtr, myPe, pushGen);
+#if RS_PUSH_TIMING
+    detail::RsPushTimingReport(myPe, npes, S, chunkElems * sizeof(T));
+#endif
   }
 }
 
