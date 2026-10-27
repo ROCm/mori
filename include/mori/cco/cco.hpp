@@ -1652,17 +1652,15 @@ inline __device__ void ccoSdmaWriteCopy2D(uint32_t* queueBuf, uint64_t at, const
 // once the pitch needs the slice field. Pieces of these sizes keep the element.
 __device__ __forceinline__ void ccoSdma2DPieceLimits(const ccoSdmaRect& r, uint32_t& maxW,
                                                      uint32_t& maxH) {
-  const uint32_t e =
-      ccoSdma2DElement(reinterpret_cast<uintptr_t>(r.src), r.srcPitch,
-                       reinterpret_cast<uintptr_t>(r.dst), r.dstPitch, r.widthBytes);
+  const uint32_t e = ccoSdma2DElement(reinterpret_cast<uintptr_t>(r.src), r.srcPitch,
+                                      reinterpret_cast<uintptr_t>(r.dst), r.dstPitch, r.widthBytes);
   maxW = 0x10000u << e;
   maxH = ccoSdma2DPitchFits(r.srcPitch, r.dstPitch, e) ? 0x10000u : 0x4000u;
 }
 
 // Piece i of r cut into maxW x maxH tiles, row-major with nx tiles per row.
-__device__ __forceinline__ ccoSdmaRect ccoSdma2DPiece(const ccoSdmaRect& r, uint32_t i,
-                                                      uint32_t nx, uint32_t maxW,
-                                                      uint32_t maxH) {
+__device__ __forceinline__ ccoSdmaRect ccoSdma2DPiece(const ccoSdmaRect& r, uint32_t i, uint32_t nx,
+                                                      uint32_t maxW, uint32_t maxH) {
   const uint32_t x = (i % nx) * maxW;
   const uint32_t y = (i / nx) * maxH;
   return ccoSdmaRect{static_cast<char*>(r.src) + size_t(y) * r.srcPitch + x,
@@ -1983,20 +1981,20 @@ inline __device__ void ccoSdmaPutBlock(void* srcBuf, void* dstBuf, size_t copy_s
                                                         queueKey, keyBits);
 }
 
-// 2D post, thread scope. Every active lane posts its own rectangle and all of
-// them must share one queue (ccoSdmaThreadSameQueue's promise, trapped under
-// MORI_CCO_SDMA_DEBUG): the lowest lane reserves one run, each lane fills its
-// slot, and one doorbell covers the lot. One active lane is the plain single
-// put; a full wave is a 64-rectangle batch for the price of one submission.
-//     [NOP]xlead ([2D COPY][NOP])xn [ATOMIC local] [ATOMIC remote] [NOP]x(3-lead)
-// Signals ride the end of the run, so `expected` advances by one per call.
+// 2D post, thread scope. Every active lane posts its own rectangle. Lanes are
+// grouped by queue, one group per pass as in ccoSdmaPutGrouped: the group's
+// lowest lane reserves one run, each lane fills its slot, and one doorbell
+// covers the group. Lanes on one queue -- the batching case -- are one pass; a
+// full wave is a 64-rectangle batch for the price of one submission.
+//     [NOP]xlead ([2D COPY][NOP...])xn [ATOMIC local] [ATOMIC remote] [NOP]x(slack-lead)
+// Signals ride the end of each group's run, so `expected` advances by one per
+// call on every queue the call touched, as with put().
 template <bool localSignal = false, bool remoteSignal = false,
           uint32_t optFlags = ccoSdmaOptFlagsDefault>
 inline __device__ void ccoSdmaPut2DThread(const ccoSdmaRect& rect,
                                           ccoSdmaQueueDeviceHandle** deviceHandles,
                                           HSAuint64* localTarget, HSAuint64* remoteTarget,
-                                          uint32_t queNum, uint32_t qId, uint32_t queueKey,
-                                          uint32_t keyBits) {
+                                          uint32_t queNum, uint32_t qId, uint32_t queueKey) {
   static_assert(!(optFlags & ccoSdmaOptFlagsSignalPerCopy),
                 "2D puts signal once per run; SignalPerCopy is not supported");
   if (qId >= queNum) return;  // out-of-range queue: no-op, not OOB
@@ -2006,34 +2004,43 @@ inline __device__ void ccoSdmaPut2DThread(const ccoSdmaRect& rect,
   constexpr uint64_t kSigBytes = CCO_SDMA_UNIT * ccoSdmaSignalUnits<localSignal, remoteSignal>();
   ccoSdmaQueueDeviceHandle* shared = *impl::global(deviceHandles + qId);
 
-  const uint64_t active = impl::waveBallot(true);
-  const unsigned nActive = __builtin_popcountll(active);
-  if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
-    // Broken promise: lanes would write slots reserved on another queue.
-    if (impl::waveMatchAny(queueKey, keyBits) != active) __builtin_trap();
-  }
-  const unsigned myIdx = impl::waveLanesBelow(active);
+  // Uniform loop: `rem` and `group` are ballot results, identical in every lane.
+  const unsigned myLane = impl::waveLaneId();
+  uint64_t rem = impl::waveBallot(true);
+  while (rem) {
+    const int probe = __builtin_ctzll(rem);  // lowest lane still to post
+    const uint32_t k = impl::waveBcastLane32(queueKey, probe);
+    const bool inGroup = ((rem >> myLane) & 1ull) && (queueKey == k);
+    const uint64_t group = impl::waveBallot(inGroup);
+    if (inGroup) {
+      const unsigned cnt = __builtin_popcountll(group);
+      const unsigned myIdx = impl::waveLanesBelow(group);
 
-  ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
-  const uint64_t runBytes = CCO_SDMA_2D_SLACK + nActive * CCO_SDMA_2D_SLOT + kSigBytes;
-  uint64_t base = (myIdx == 0) ? handle.ReserveSlot(runBytes, shared) : 0;
-  base = impl::waveBcastFirstLane(base);  // leader is the lowest active lane
-  const uint64_t first = (base + CCO_SDMA_2D_SLOT - 1) & ~(CCO_SDMA_2D_SLOT - 1);
-  const uint64_t lead = first - base;
+      ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
+      const uint64_t runBytes = CCO_SDMA_2D_SLACK + cnt * CCO_SDMA_2D_SLOT + kSigBytes;
+      uint64_t base = (myIdx == 0) ? handle.ReserveSlot(runBytes, shared) : 0;
+      base = impl::waveBcastLane(base, probe);  // the leader is the probe lane
+      const uint64_t first = (base + CCO_SDMA_2D_SLOT - 1) & ~(CCO_SDMA_2D_SLOT - 1);
+      const uint64_t lead = first - base;
 
-  if (myIdx == 0) {
-    ccoSdmaWriteNops(handle.queueBuf, base, lead);
-    ccoSdmaWriteNops(handle.queueBuf, first + nActive * CCO_SDMA_2D_SLOT + kSigBytes,
-                     CCO_SDMA_2D_SLACK - lead);
-  }
-  ccoSdmaWriteCopy2D(handle.queueBuf, first + myIdx * CCO_SDMA_2D_SLOT, rect);
-  if (myIdx == nActive - 1)
-    ccoSdmaWriteSignals<localSignal, remoteSignal>(
-        handle.queueBuf, first + nActive * CCO_SDMA_2D_SLOT, localTarget, remoteTarget);
-  ccoSdmaPublishStores();  // per-lane: the leader cannot publish for us
-  __builtin_amdgcn_wave_barrier();
-  if constexpr (kRing) {
-    if (myIdx == 0) handle.submitPacket(base, base + runBytes);
+      if (myIdx == 0) {
+        ccoSdmaWriteNops(handle.queueBuf, base, lead);
+        ccoSdmaWriteNops(handle.queueBuf, first + cnt * CCO_SDMA_2D_SLOT + kSigBytes,
+                         CCO_SDMA_2D_SLACK - lead);
+      }
+      ccoSdmaWriteCopy2D(handle.queueBuf, first + myIdx * CCO_SDMA_2D_SLOT, rect);
+      if (myIdx == cnt - 1)
+        ccoSdmaWriteSignals<localSignal, remoteSignal>(
+            handle.queueBuf, first + cnt * CCO_SDMA_2D_SLOT, localTarget, remoteTarget);
+      ccoSdmaPublishStores();  // per-lane: the leader cannot publish for us
+      __builtin_amdgcn_wave_barrier();
+      // Ring before the next group reserves, so the wave never holds two
+      // unpublished reservations (see ccoSdmaPutThread).
+      if constexpr (kRing) {
+        if (myIdx == 0) handle.submitPacket(base, base + runBytes);
+      }
+    }
+    rem &= ~group;
   }
 }
 
@@ -2146,11 +2153,11 @@ __device__ inline void ccoSdmaDispatchChunked(const ccoSdmaContext& s, int peer,
 }
 
 // Dispatch a rectangle copy to the coop scope's post. warp/block: the leader
-// posts alone; thread: the active lanes post as one batch on one queue.
+// posts alone; thread: the active lanes post as one batch per queue.
 template <typename Coop, bool localSignal, bool remoteSignal, uint32_t optFlags>
 __device__ inline void ccoSdmaDispatchPut2D(const ccoSdmaContext& s, int peer, uint32_t n,
                                             const ccoSdmaRect& rect, int queueId,
-                                            uint32_t myLsaRank, uint32_t lsaSize) {
+                                            uint32_t myLsaRank) {
   if constexpr (!std::is_same_v<Coop, ccoCoopThread>) {
     if (Coop{}.thread_rank() != 0) return;
   }
@@ -2160,8 +2167,6 @@ __device__ inline void ccoSdmaDispatchPut2D(const ccoSdmaContext& s, int peer, u
   if constexpr (localSignal) localTarget = s.signalBuf + slot;
   if constexpr (remoteSignal) remoteTarget = s.peerSignalPtrs[peer] + slot;
   const uint32_t queueKey = static_cast<uint32_t>(peer) * n + static_cast<uint32_t>(queueId);
-  const uint32_t span = lsaSize * n;
-  const uint32_t keyBits = span > 1 ? (32u - static_cast<uint32_t>(__builtin_clz(span - 1))) : 1u;
 #if defined(__gfx1250__)
   // Past one packet's extents: split. Every lane posts its last piece in one
   // converged call, so a batch still carries one signal.
@@ -2172,13 +2177,13 @@ __device__ inline void ccoSdmaDispatchPut2D(const ccoSdmaContext& s, int peer, u
   for (uint32_t i = 0; i + 1 < pieces; i++)
     ccoSdmaPut2DThread<false, false, optFlags>(ccoSdma2DPiece(rect, i, nx, maxW, maxH),
                                                s.deviceHandles + peer * n, nullptr, nullptr, n,
-                                               queueId, queueKey, keyBits);
+                                               queueId, queueKey);
   ccoSdmaPut2DThread<localSignal, remoteSignal, optFlags>(
       pieces > 1 ? ccoSdma2DPiece(rect, pieces - 1, nx, maxW, maxH) : rect,
-      s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId, queueKey, keyBits);
+      s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId, queueKey);
 #else
   ccoSdmaPut2DThread<localSignal, remoteSignal, optFlags>(
-      rect, s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId, queueKey, keyBits);
+      rect, s.deviceHandles + peer * n, localTarget, remoteTarget, n, queueId, queueKey);
 #endif
 }
 
@@ -2243,9 +2248,8 @@ struct ccoSdma {
   // put2d: local src -> peer dst, one rectangle of `height` rows x `widthBytes`
   // in a single packet. Offsets locate the rectangle's first byte; pitches are
   // the row strides of the two buffers, in bytes. Same Coop/signal/optFlags
-  // meaning as put(), except at thread scope every active lane must target the
-  // same (peer, queueId): their rectangles are posted as one batch, one doorbell
-  // and one signal for all of them.
+  // meaning as put(). At thread scope, lanes targeting the same (peer, queueId)
+  // are posted as one batch: one doorbell and one signal for all of them.
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
             uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void put2d(int peer, ccoWindow_t dstWin, size_t dstOffset, uint32_t dstPitch,
@@ -2264,8 +2268,7 @@ struct ccoSdma {
                            widthBytes,
                            height};
     ccoSdmaDispatchPut2D<Coop, localSignal, remoteSignal, optFlags>(
-        s, peer, s.sdmaNumQueue, rect, queueId, static_cast<uint32_t>(comm.lsaRank),
-        static_cast<uint32_t>(comm.lsaSize));
+        s, peer, s.sdmaNumQueue, rect, queueId, static_cast<uint32_t>(comm.lsaRank));
   }
 
   // get2d: peer src -> local dst. Same arguments as put2d().
@@ -2287,8 +2290,7 @@ struct ccoSdma {
                            widthBytes,
                            height};
     ccoSdmaDispatchPut2D<Coop, localSignal, remoteSignal, optFlags>(
-        s, peer, s.sdmaNumQueue, rect, queueId, static_cast<uint32_t>(comm.lsaRank),
-        static_cast<uint32_t>(comm.lsaSize));
+        s, peer, s.sdmaNumQueue, rect, queueId, static_cast<uint32_t>(comm.lsaRank));
   }
 
   // quiet: wait until every queue toward `peer` has drained. warp/block take one

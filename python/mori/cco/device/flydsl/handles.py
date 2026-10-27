@@ -459,8 +459,8 @@ class Sdma:
         """One rectangle, ``height`` rows of ``width_bytes``, in a single packet.
 
         Offsets locate the rectangle's first byte, pitches are the two buffers'
-        row strides in bytes. At THREAD coop every active lane must target the
-        same (peer, qid): their rectangles go out as one batch, one signal.
+        row strides in bytes. At THREAD coop, lanes targeting the same
+        (peer, qid) go out as one batch with one signal.
         """
         self._xfer2d(
             "put",

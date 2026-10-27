@@ -35,6 +35,10 @@
 //               extents of the 13-dword sub_op 4 packet
 //   warp_batch  64 lanes post 64 tiles, one run and one remote signal per
 //               wavefront; the receiver waits on the signal, not on a barrier
+//   mixed_queues one wave, lane l sends row l to peer others[l % (n-1)] on
+//               queue (l / (n-1)) % 2, with a remote signal: lanes split into
+//               one group per (peer, queue), and every group must land and
+//               signal (it used to be dropped silently)
 //   get2d       pull a rect from the peer
 //   aggregate   four rects posted without the doorbell, then commit()
 //   ring_wrap   thousands of small rects interleaved with 1-unit linear puts,
@@ -121,6 +125,37 @@ __global__ void WaitSignalsKernel(ccoDevComm dc, uint64_t expected) {
   const int s = threadIdx.x;
   if (s >= dc.lsaSize || s == dc.rank) return;
   sdma.waitSignal(s, 0, expected);
+}
+
+// mixed queues: lane l -> peer MixedPeer(l), queue MixedQueue(l), row l of a
+// MIXED_W-wide column. Runs as one block of 64 threads.
+static const uint32_t MIXED_W = 512;
+static const uint32_t MIXED_DX = 2048;
+__host__ __device__ inline int MixedPeer(uint32_t lane, int rank, int nranks) {
+  const int i = static_cast<int>(lane % uint32_t(nranks - 1));
+  return i < rank ? i : i + 1;  // skip ourselves
+}
+__host__ __device__ inline int MixedQueue(uint32_t lane, int nranks, uint32_t nq) {
+  return static_cast<int>((lane / uint32_t(nranks - 1)) % (nq < 2 ? nq : 2));
+}
+__global__ void Put2DMixedQueuesKernel(ccoWindowDevice* src, ccoWindowDevice* dst, ccoDevComm dc) {
+  ccoSdma sdma{dc};
+  const uint32_t lane = threadIdx.x;
+  const int p = MixedPeer(lane, dc.rank, dc.lsaSize);
+  const int q = MixedQueue(lane, dc.lsaSize, dc.sdma.sdmaNumQueue);
+  Rect t{0, lane, MIXED_DX, lane, MIXED_W, 1};
+  sdma.put2d<ccoCoopThread, false, true>(p, reinterpret_cast<ccoWindow_t>(dst), DstOff(dc.rank, t),
+                                         DST_PITCH, reinterpret_cast<ccoWindow_t>(src), SrcOff(t),
+                                         SRC_PITCH, t.w, t.h, q);
+}
+
+// Wait until signal[s][q] reaches expected[s * 2 + q], for every sender s and
+// queue q < 2.
+__global__ void WaitSignals2Kernel(ccoDevComm dc, const uint64_t* expected) {
+  ccoSdma sdma{dc};
+  const int s = threadIdx.x / 2, q = threadIdx.x % 2;
+  if (s >= dc.lsaSize || s == dc.rank || expected[s * 2 + q] == 0) return;
+  sdma.waitSignal(s, q, expected[s * 2 + q]);
 }
 
 // get2d: lane 0 of block p pulls peer p's rect into our slot p.
@@ -304,6 +339,45 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
       WaitSignalsKernel<<<1, 64, 0, stream>>>(devComm, 64 / warpSize);
       fetch();
       ok &= checkAll("warp_batch", {r});
+    }
+    // mixed_queues. Remote signals never reset, so the expected count per
+    // (sender, queue) is warp_batch's queue-0 signals plus one per wavefront
+    // that has a lane sending to us on that queue.
+    {
+      int warpSize = 64;
+      HIP_CHECK(hipDeviceGetAttribute(&warpSize, hipDeviceAttributeWarpSize, rank % numDevices));
+      const uint32_t nq = devComm.sdma.sdmaNumQueue;
+      std::vector<uint64_t> expected(size_t(nranks) * 2, 0);
+      for (int s = 0; s < nranks; s++) {
+        if (s == rank) continue;
+        expected[s * 2 + 0] = 64 / warpSize;  // from warp_batch
+        for (int w = 0; w < 64 / warpSize; w++)
+          for (int q = 0; q < 2; q++)
+            for (uint32_t l = w * warpSize; l < uint32_t(w + 1) * warpSize; l++)
+              if (MixedPeer(l, s, nranks) == rank && MixedQueue(l, nranks, nq) == q) {
+                expected[s * 2 + q]++;
+                break;
+              }
+      }
+      uint64_t* dExpected = nullptr;
+      HIP_CHECK(hipMalloc(&dExpected, expected.size() * sizeof(uint64_t)));
+      HIP_CHECK(hipMemcpy(dExpected, expected.data(), expected.size() * sizeof(uint64_t),
+                          hipMemcpyHostToDevice));
+      reset();
+      Put2DMixedQueuesKernel<<<1, 64, 0, stream>>>(sW, dW, devComm);
+      WaitSignals2Kernel<<<1, 64, 0, stream>>>(devComm, dExpected);
+      fetch();
+      bool pass = true;
+      for (int s = 0; s < nranks; s++) {
+        if (s == rank) continue;
+        std::vector<Rect> mine;
+        for (uint32_t l = 0; l < 64; l++)
+          if (MixedPeer(l, s, nranks) == rank) mine.push_back(Rect{0, l, MIXED_DX, l, MIXED_W, 1});
+        pass &= CheckSlot(host, s, s, mine, "mixed_queues", rank);
+      }
+      printf("[rank %d] %-10s %s\n", rank, "mixed_queues", pass ? "PASS" : "FAIL");
+      ok &= pass;
+      HIP_CHECK(hipFree(dExpected));
     }
     // get2d
     {

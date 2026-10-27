@@ -81,7 +81,11 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
 }
 
 // One packet for `height` rows of `widthBytes`; offsets are folded into the
-// base addresses, so the packet's x/y/z stay 0.
+// base addresses, so the packet's x/y/z stay 0. sub_op 36 is SDMA 4.4.x only,
+// so the 2D path is left undefined on gfx1250: a caller fails to compile
+// rather than posting a packet that engine does not decode. (cco's put2d posts
+// the gfx12 rect packet there.)
+#if !defined(__gfx1250__)
 __device__ __forceinline__ SDMA_PKT_COPY_LARGE_SUB_WINDOW
 CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
                    uint32_t widthBytes, uint32_t height) {
@@ -101,6 +105,7 @@ CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPi
 
   return packet;
 }
+#endif  // !__gfx1250__
 
 __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
   SDMA_PKT_ATOMIC packet = {};
@@ -294,6 +299,7 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   handle.submitPacket(base, pendingWptr);
 }
 
+#if !defined(__gfx1250__)  // see CreateCopy2DPacket
 __device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, uint32_t dstPitch,
                                       void* src, uint32_t srcPitch, uint32_t widthBytes,
                                       uint32_t height) {
@@ -304,6 +310,7 @@ __device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, 
   handle.placePacket(packet, pendingWptr, offset);
   handle.submitPacket(base, pendingWptr);
 }
+#endif  // !__gfx1250__
 
 __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, void* signal) {
   uint64_t offset;
