@@ -64,6 +64,9 @@ option(BUILD_PYBINDS "Whether to build mori python bindings" ON)
 option(BUILD_XLA_FFI_OPS "Whether to build mori xla ffi python bindings" OFF)
 option(BUILD_UMBP "Whether to build UMBP (Unified Memory/Bandwidth Pool)" OFF)
 option(BUILD_METRICS "Whether to build the Prometheus metrics server module" ON)
+# The runtime is built in but off until MORI_RAS_ENABLE=1. OFF builds it out: every RAS call in
+# the subsystems compiles to a no-op, and nothing links libmori_ras.
+option(BUILD_RAS "Whether to build the MORI RAS runtime" ON)
 option(BUILD_TESTS "Whether to build mori CPP tests" ON)
 option(ENABLE_PROFILER "Enable kernel profiling" OFF)
 option(ENABLE_DEBUG_PRINTF "Enable debug printf in device kernels" OFF)
@@ -370,6 +373,10 @@ if(BUILD_METRICS)
   add_subdirectory(src/metrics)
 endif()
 
+if(BUILD_RAS)
+  add_subdirectory(src/ras)
+endif()
+
 if(BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests/cpp)
@@ -396,6 +403,9 @@ if(BUILD_IO)
 endif()
 if(BUILD_METRICS)
   install(TARGETS mori_metrics LIBRARY DESTINATION lib)
+endif()
+if(BUILD_RAS)
+  install(TARGETS mori_ras LIBRARY DESTINATION lib)
 endif()
 
 # Public headers
