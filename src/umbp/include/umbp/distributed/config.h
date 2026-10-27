@@ -253,6 +253,10 @@ enum class PeerEvictionMode {
   kMaster,        // the master's EvictKey rounds (SSD still evicts locally)
 };
 
+// UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS, capped at 64; 0 when it is unset or not
+// a positive number.
+size_t RangedScratchShardsFromEnv();
+
 struct PoolClientConfig {
   UMBPSimConfig sim;
   UMBPMasterClientConfig master_config;

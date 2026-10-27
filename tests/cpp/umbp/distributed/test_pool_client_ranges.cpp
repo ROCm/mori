@@ -703,6 +703,29 @@ TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
   client->Close();
 }
 
+// The standalone server's layout: each arena split across the NUMA nodes that have
+// GPUs, one shard per GPU, and a remote ranged read round-trips through it.
+TEST_F(PoolClientRangesTest, DistributedScratchLaidOutByNumaNode) {
+  auto config = DistributedConfig("ranges-numa-layout", 16 * kObjectSize);
+  config.distributed->ranged_scratch_numa_layout = true;
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 7 + 5) & 0xff);
+  const std::string key = "numa-layout-remote";
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(client.get(), key));
+  std::vector<char> out(4000, 0);
+  ASSERT_EQ(client->BatchGetRanges({key}, {{reinterpret_cast<uintptr_t>(out.data())}},
+                                   {{out.size()}}, {{100}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(out.data(), object.data() + 100, out.size()), 0);
+  client->Close();
+}
+
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
   const std::string key = "range-stale-self";
   std::vector<char> stale_object(kObjectSize, 0x11);
