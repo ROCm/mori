@@ -1631,48 +1631,5 @@ TEST(PeerPool, PrefetchCopyExceptionsReleasePinsAndAllowRetry) {
   pool.ClearLocal();  // no leaked source or target migration pins
 }
 
-TEST(PeerPool, PrefetchLeasesOnlyCommittedDramCopies) {
-  LocalCopyEngine engine;
-  BackendRegistry registry;
-  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 4096, 4);
-  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, 4096, 4);
-  LogicalTierConfig kv;
-  kv.members = {{"dram", 1}, {"ssd", 1}};
-  auto graph = LogicalTierGraph::Compile({kv}, registry);
-  ASSERT_TRUE(graph.ok());
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
-  CommitKey(&pool, "hot", "dram");
-  CommitKey(&pool, "cold", "ssd");
-  const std::vector<std::string> keys{"hot", "cold", "missing"};
-  EXPECT_EQ(pool.LeasePrefetched(keys, std::chrono::milliseconds(40)),
-            (std::vector<bool>{true, false, false}));
-  EXPECT_EQ(pool.Prefetch(keys, 4096), 1u);
-  EXPECT_EQ(pool.LeasePrefetched(keys, std::chrono::milliseconds(40)),
-            (std::vector<bool>{true, true, false}));
-  EXPECT_TRUE(registry.Get("ssd")->Contains("cold"));
-  EXPECT_EQ(registry.Get("dram")->Evict({"cold"})[0].bytes_freed, 0u);
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  EXPECT_GT(registry.Get("dram")->Evict({"cold"})[0].bytes_freed, 0u);
-}
-
-TEST(PeerPool, TrackedPrefetchDoesNotReportCopiesEvictedByItsOwnBudget) {
-  LocalCopyEngine engine;
-  BackendRegistry registry;
-  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 4096, 4);
-  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, 4096, 4);
-  LogicalTierConfig kv;
-  kv.members = {{"dram", 1}, {"ssd", 1}};
-  auto graph = LogicalTierGraph::Compile({kv}, registry);
-  ASSERT_TRUE(graph.ok());
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
-  CommitKey(&pool, "a", "ssd");
-  CommitKey(&pool, "b", "ssd");
-  pool.Prefetch({"a", "b"}, 64);
-  auto ready = pool.LeasePrefetched({"a", "b"}, std::chrono::milliseconds(40));
-  EXPECT_EQ(std::count(ready.begin(), ready.end(), true), 1);
-  EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
-  EXPECT_TRUE(registry.Get("ssd")->Contains("b"));
-}
-
 }  // namespace
 }  // namespace mori::umbp

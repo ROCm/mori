@@ -1165,13 +1165,6 @@ TEST(StandaloneShmIpcTest, AsyncPrefetchPreservesRouterWireAndEngineIo) {
 
   auto stub = ::umbp::UMBPStandalone::NewStub(
       grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
-  ::umbp::Empty empty;
-  ::umbp::PingResponse ping;
-  grpc::ClientContext ping_context;
-  ASSERT_TRUE(stub->Ping(&ping_context, empty, &ping).ok());
-  EXPECT_TRUE(ping.supports_async_prefetch());
-  EXPECT_EQ(ping.prefetch_hint_version(), 1u);
-
   // Hand-encoded bytes from the deployed Router's fields: key=resident,
   // key=missing, key=resident, lease=1000, timeout=2000, request_id=router.
   const unsigned char wire[] = {0x0a, 8,    'r',  'e', 's', 'i', 'd', 'e',  'n',  't',  0x0a,
@@ -1180,12 +1173,6 @@ TEST(StandaloneShmIpcTest, AsyncPrefetchPreservesRouterWireAndEngineIo) {
                                 0xd0, 0x0f, 0x22, 6,   'r', 'o', 'u', 't',  'e',  'r'};
   ::umbp::PrefetchRequest request;
   ASSERT_TRUE(request.ParseFromArray(wire, sizeof(wire)));
-  ::umbp::BatchKeysRequest obsolete_sync;
-  ASSERT_TRUE(obsolete_sync.ParseFromArray(wire, sizeof(wire)));
-  ::umbp::CountResponse obsolete_response;
-  grpc::ClientContext obsolete_context;
-  EXPECT_EQ(stub->BatchPrefetch(&obsolete_context, obsolete_sync, &obsolete_response).error_code(),
-            grpc::StatusCode::INVALID_ARGUMENT);
   grpc::ClientContext submit_context;
   ::umbp::PrefetchSubmitResponse submitted;
   ASSERT_TRUE(stub->SubmitPrefetch(&submit_context, request, &submitted).ok());

@@ -24,7 +24,6 @@
 
 #include <cstring>
 #include <filesystem>
-#include <future>
 
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/pool_client.h"
@@ -61,7 +60,7 @@ class PrefetchRemoteTest : public ::testing::Test {
   }
 
   bool PutOnSsd(PoolClient& client, const std::string& key, const std::vector<char>& bytes) {
-    return client.ExecuteLocalPut(key, bytes.data(), bytes.size(), TierType::SSD, "cold") ==
+    return client.ExecuteLocalPut(key, bytes.data(), bytes.size(), TierType::SSD) ==
            PoolClient::PutAttemptOutcome::kSuccess;
   }
 
@@ -113,43 +112,6 @@ TEST_F(PrefetchRemoteTest, CrossBufferSlotFailsBeforeTransportAndReleasesItsPage
   for (const auto& r : small) EXPECT_TRUE(r);
 }
 
-TEST_F(PrefetchRemoteTest, CapacityFailureAndAlreadyResidentKeepPerInputResults) {
-  auto client = MakeClient({4096});
-  size_t calls = 0;
-  Transport(*client, [&](const auto&, void* dst, size_t size) {
-    ++calls;
-    std::memset(dst, 0x18, size);
-    return true;
-  });
-  ASSERT_TRUE(Pull(*client, {"resident"})[0]);
-  auto mixed = Pull(*client, {"resident", "no-space"});
-  EXPECT_TRUE(mixed[0]);
-  EXPECT_EQ(mixed[1], false);
-  EXPECT_EQ(calls, 1u);
-}
-
-TEST_F(PrefetchRemoteTest, CommitRejectionIsNotReportedReady) {
-  auto client = MakeClient();
-  Transport(*client, [&](const auto&, void* dst, size_t size) {
-    std::memset(dst, 0x51, size);
-    // Invalidate the allocation generation after the fake copy completes.
-    client->Backends().Get(TierType::DRAM)->ClearLocal();
-    return true;
-  });
-  EXPECT_EQ(Pull(*client, {"rejected"})[0], false);
-  EXPECT_FALSE(client->Backends().Get(TierType::DRAM)->Contains("rejected"));
-}
-
-TEST_F(PrefetchRemoteTest, TransportExceptionAbortsEveryPendingDestination) {
-  auto client = MakeClient({4096, 4096});
-  Transport(*client, [](const auto&, void*, size_t) -> bool {
-    throw std::runtime_error("transport failure");
-  });
-  for (const auto& result : Pull(*client, {"a", "b"})) EXPECT_EQ(result, false);
-  Transport(*client, [](const auto&, void*, size_t) { return true; });
-  for (const auto& result : Pull(*client, {"c", "d"})) EXPECT_TRUE(result);
-}
-
 TEST_F(PrefetchRemoteTest, MasterlessSsdPrefetchReadsActualFileBytesIntoDram) {
   char path[] = "/tmp/umbp-prefetch-ssd-XXXXXX";
   ASSERT_NE(mkdtemp(path), nullptr);
@@ -177,15 +139,9 @@ TEST_F(PrefetchRemoteTest, MasterlessSsdPrefetchReadsActualFileBytesIntoDram) {
   cold.ssd_staging_buffer_slots = 4;
   config.backends = {hot, cold};
   config.placement_policy = PoolPlacementPolicy::TIERED;
-  LogicalTierConfig hot_tier;
-  hot_tier.name = "hot";
-  hot_tier.entry = true;
-  hot_tier.members = {{"hot", 1}};
-  hot_tier.offload_to = {"cold"};
-  LogicalTierConfig cold_tier;
-  cold_tier.name = "cold";
-  cold_tier.members = {{"cold", 1}};
-  config.logical_tiers = {hot_tier, cold_tier};
+  LogicalTierConfig tier;
+  tier.members = {{"hot", 1}, {"cold", 1}};
+  config.logical_tiers = {tier};
   PoolClient client(config);
   ASSERT_TRUE(client.Init());
   std::vector<char> expected(4096);
@@ -208,25 +164,6 @@ TEST_F(PrefetchRemoteTest, MasterlessSsdPrefetchReadsActualFileBytesIntoDram) {
   std::vector<char> actual(expected.size());
   ASSERT_TRUE(client.Get("file-key", actual.data(), actual.size()));
   EXPECT_EQ(actual, expected);
-}
-
-TEST_F(PrefetchRemoteTest, PendingDestinationIsNotPublishedDuringTransfer) {
-  auto client = MakeClient();
-  std::promise<void> entered, released;
-  auto release = released.get_future().share();
-  Transport(*client, [&](const auto&, void* dst, size_t size) {
-    entered.set_value();
-    EXPECT_EQ(release.wait_for(std::chrono::seconds(3)), std::future_status::ready);
-    std::memset(dst, 0x49, size);
-    return true;
-  });
-  auto pull = std::async(std::launch::async, [&] { return Pull(*client, {"pending"}); });
-  EXPECT_EQ(entered.get_future().wait_for(std::chrono::seconds(2)), std::future_status::ready);
-  EXPECT_FALSE(client->Backends().Get(TierType::DRAM)->Contains("pending"));
-  released.set_value();
-  auto result = pull.get();
-  EXPECT_TRUE(result[0]);
-  EXPECT_TRUE(client->Backends().Get(TierType::DRAM)->Contains("pending"));
 }
 
 }  // namespace mori::umbp

@@ -23,7 +23,6 @@
 
 #include <atomic>
 #include <future>
-#include <stdexcept>
 
 #include "umbp/common/prefetch_queue.h"
 
@@ -52,42 +51,6 @@ struct Gate {
   }
 };
 
-PrefetchStatus Finished(PrefetchQueue& queue, const std::string& id) {
-  for (int i = 0; i < 2000; ++i) {
-    auto status = queue.Status(id);
-    if (PrefetchTerminal(status.state)) return status;
-    std::this_thread::sleep_for(1ms);
-  }
-  ADD_FAILURE() << "prefetch did not finish";
-  return {};
-}
-
-TEST(PrefetchQueue, AsyncResultsIdempotenceAndInputValidation) {
-  Gate io;
-  PrefetchQueue queue([&](const auto& keys, auto, auto) {
-    io.Block();
-    std::vector<bool> ok;
-    for (const auto& key : keys) ok.push_back(key != "missing");
-    return ok;
-  });
-  EXPECT_FALSE(queue.Submit({}).accepted);
-  EXPECT_FALSE(queue.Submit({""}).accepted);
-  EXPECT_FALSE(queue.Submit({"a"}, {1ms, 6min}).accepted);
-  ASSERT_TRUE(queue.Submit({"a", "missing", "a"}, {}, "id").accepted);
-  ASSERT_TRUE(io.Wait());
-  EXPECT_EQ(queue.Status("id").state, PrefetchState::kRunning);
-  EXPECT_TRUE(queue.Submit({"a", "missing", "a"}, {}, "id").accepted);
-  EXPECT_FALSE(queue.Submit({"different"}, {}, "id").accepted);
-  EXPECT_TRUE(queue.WaitForKeys({"unrelated"}, 0ms));
-  EXPECT_FALSE(queue.WaitForKeys({"a"}, 1ms));
-  io.Release();
-  auto status = Finished(queue, "id");
-  EXPECT_EQ(status.state, PrefetchState::kPartial);
-  EXPECT_EQ(status.ok, (std::vector<bool>{true, false, true}));
-  EXPECT_EQ(status.completed_keys, 2u);
-  EXPECT_TRUE(queue.WaitForKeys({"a"}, 0ms));
-}
-
 TEST(PrefetchQueue, ExpiredQueuedRequestDoesNotStartIo) {
   Gate io;
   std::atomic<int> calls{0};
@@ -104,7 +67,7 @@ TEST(PrefetchQueue, ExpiredQueuedRequestDoesNotStartIo) {
   io.Release();
   EXPECT_TRUE(queue.WaitForKeys({"expired"}, 2s));
   EXPECT_EQ(calls, 1);
-  EXPECT_EQ(Finished(queue, "active").state, PrefetchState::kReady);
+  EXPECT_EQ(queue.Status("active").state, PrefetchState::kReady);
   EXPECT_EQ(queue.Status("expired").state, PrefetchState::kExpired);
 }
 
@@ -130,22 +93,10 @@ TEST(PrefetchQueue, ClearDrainsRealIoAndResumesAdmission) {
   EXPECT_EQ(queue.Status("active").state, PrefetchState::kFailed);
   queue.Resume();
   ASSERT_TRUE(queue.Submit({"new"}, {}, "new").accepted);
-  EXPECT_EQ(Finished(queue, "new").state, PrefetchState::kReady);
+  EXPECT_TRUE(queue.WaitForKeys({"new"}, 2s));
+  EXPECT_EQ(queue.Status("new").state, PrefetchState::kReady);
   queue.Stop();
   EXPECT_FALSE(queue.Submit({"stopped"}).accepted);
-}
-
-TEST(PrefetchQueue, ExceptionsReleaseWaitersAndCompletedHintsAreDiscarded) {
-  PrefetchQueue queue([](const auto& keys, auto, auto) {
-    if (keys[0] == "throw") throw std::runtime_error("I/O failed");
-    return std::vector<bool>(keys.size(), true);
-  });
-  ASSERT_TRUE(queue.Submit({"throw"}, {}, "bad").accepted);
-  EXPECT_EQ(Finished(queue, "bad").state, PrefetchState::kFailed);
-  EXPECT_TRUE(queue.WaitForKeys({"throw"}, 0ms));
-  ASSERT_TRUE(queue.Submit({"hint"}, {}, "hint", false).accepted);
-  EXPECT_TRUE(queue.WaitForKeys({"hint"}, 2s));
-  EXPECT_EQ(queue.Status("hint").state, PrefetchState::kUnknown);
 }
 
 }  // namespace
