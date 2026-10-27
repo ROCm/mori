@@ -22,6 +22,7 @@ examples/cco/
 | `python/08_torch_symm_import` | py | import a `torch.symm_mem` tensor into the flat LSA space, no copy |
 | `python/09_torch_symm_lsa_all2all` | py | mori's own torch symm-mem backend + Triton `lsa_ptr` all-to-all |
 | `python/10_flydsl_sdma_allgather_async` | py | FlyDSL SDMA all-gather split into `start_async` / `wait_async`, overlapped with a GEMM |
+| `python/11_flydsl_mega_moe_sdma` | py | MoE GEMM2 (gfx950) writing a rank-sorted send buffer, shipped by SDMA `put`s from comm waves (one per peer) inside the GEMM kernel (needs aiter) |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -88,6 +89,19 @@ Example 10 bootstraps with `torchrun` instead of MPI and needs SDMA:
 ```bash
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
   examples/cco/python/10_flydsl_sdma_allgather_async/main.py
+```
+
+Example 11 also uses `torchrun` and SDMA, and additionally needs aiter (it reuses
+`MegaMoEV2` for the reference and the GEMM2 mainloop) on a gfx950 node with 8 GPUs:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py --network glm52 --bs 128
+
+# latency vs aiter's MegaMoEV2 (mori.shmem P2P scatter), sweeping token counts
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/bench.py --network glm52 \
+  --bs-list 16,128,1024,4096 --chunk-tiles 2,4,8,16
 ```
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one
