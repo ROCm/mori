@@ -397,7 +397,10 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
           auto* member = backends_->Get(id);
           if (member != nullptr && member->Tier() == TierType::DRAM) dram.push_back(id);
         }
-        if (dram.empty() || !migrating_keys_.insert(key).second) continue;
+        if (dram.empty()) continue;
+        // Reuse this plan for tracked failure reporting as well as execution.
+        if (failures) (*failures)[key] = PrefetchCode::kNoSpace;
+        if (!migrating_keys_.insert(key).second) continue;
         ++transition_metrics_.attempted;
         jobs.push_back(TransitionJob{TierTransitionKind::kPromotion, key, source_id, *tier});
         targets.push_back(std::move(dram));
@@ -489,20 +492,8 @@ std::vector<PrefetchKeyResult> PeerPool::PrefetchToDram(const std::vector<std::s
       out[i].source = backend->Tier() == TierType::DRAM  ? PrefetchSource::kDram
                       : backend->Tier() == TierType::SSD ? PrefetchSource::kSsd
                                                          : PrefetchSource::kUnknown;
-      out[i].code = PrefetchCode::kNoDram;
-      if (backend->Tier() == TierType::DRAM) {
-        out[i].code = PrefetchCode::kReady;
-      } else if (backend->Tier() == TierType::SSD && tier_graph_ != nullptr) {
-        const auto tier = tier_graph_->TierIndexForBackendId(id);
-        if (!tier) continue;
-        auto targets = tier_graph_->WeightedMemberOrder(*tier, keys[i]);
-        auto upper = tier_graph_->PromoteTargetOrder(*tier, keys[i]);
-        targets.insert(targets.end(), upper.begin(), upper.end());
-        for (auto target : targets) {
-          auto* member = backends_->Get(target);
-          if (member && member->Tier() == TierType::DRAM) out[i].code = PrefetchCode::kNoSpace;
-        }
-      }
+      out[i].code =
+          backend->Tier() == TierType::DRAM ? PrefetchCode::kNotResident : PrefetchCode::kNoDram;
     }
   }
   std::unordered_map<std::string, PrefetchCode> failures;
@@ -510,7 +501,8 @@ std::vector<PrefetchKeyResult> PeerPool::PrefetchToDram(const std::vector<std::s
   {
     std::lock_guard<std::mutex> lock(operation_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
-      if (failures.count(keys[i])) out[i].code = failures.at(keys[i]);
+      const auto failure = failures.find(keys[i]);
+      if (failure != failures.end()) out[i].code = failure->second;
       RepairAfterDropLocked(keys[i]);
       const auto placement = placements_.find(keys[i]);
       auto* backend = placement == placements_.end() ? nullptr : backends_->Get(placement->second);

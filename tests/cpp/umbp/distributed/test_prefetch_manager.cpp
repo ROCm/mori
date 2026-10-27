@@ -253,6 +253,22 @@ TEST(PrefetchManager, ExecutionFailureNotifiesWaitersAndWorkerSurvives) {
   EXPECT_EQ(Finished(manager, "good").state, PrefetchState::kReady);
 }
 
+TEST(PrefetchManager, ProtectionFailurePreservesExistingCopyFailure) {
+  PrefetchManager manager(
+      [](const auto& keys) {
+        auto results = Ready(keys);
+        results.back().code = PrefetchCode::kMissing;
+        return results;
+      },
+      [](const auto&, auto*, auto) { throw std::runtime_error("lease failed"); }, {});
+  ASSERT_TRUE(manager.Submit({"copied", "missing"}, {}, "lease-failure").accepted);
+  const auto status = Finished(manager, "lease-failure");
+  ASSERT_EQ(status.results.size(), 2u);
+  EXPECT_EQ(status.state, PrefetchState::kFailed);
+  EXPECT_EQ(status.results[0].code, PrefetchCode::kNotResident);
+  EXPECT_EQ(status.results[1].code, PrefetchCode::kMissing);
+}
+
 TEST(PrefetchManager, EventsCountAdmissionsSharedKeysAndFinalResults) {
   std::atomic<uint64_t> admissions{0}, joined{0}, ready{0}, rejected{0};
   PrefetchManager manager(Ready, Protect, {}, [&](const char* event, uint64_t count) {

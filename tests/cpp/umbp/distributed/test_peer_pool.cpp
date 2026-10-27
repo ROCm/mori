@@ -1677,6 +1677,24 @@ TEST(PeerPool, SsdOnlyContainmentDoesNotMeanPrefetchReady) {
   EXPECT_TRUE(pool.BatchContains({"cold"})[0]);
 }
 
+TEST(PeerPool, DramPrefetchRequiresSuccessfulResolve) {
+  class UnreadableBackend final : public MockBackend {
+   public:
+    UnreadableBackend() : MockBackend(TierType::DRAM) {}
+    std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool, bool,
+                                            ResolveReader,
+                                            const std::vector<ObjectExtent>*) override {
+      return std::vector<ResolvedEntry>(keys.size());
+    }
+  };
+  BackendRegistry registry;
+  ASSERT_TRUE(registry.Register("dram", std::make_unique<UnreadableBackend>()));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "unreadable");
+  ASSERT_TRUE(pool.BatchContains({"unreadable"})[0]);
+  EXPECT_EQ(pool.PrefetchToDram({"unreadable"}, 4096)[0].code, PrefetchCode::kNotResident);
+}
+
 TEST(PeerPool, TrackedPrefetchDoesNotReportCopiesEvictedByItsOwnBudget) {
   LocalCopyEngine engine;
   BackendRegistry registry;

@@ -2261,19 +2261,11 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
   }
 }
 
-void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size,
-                                          const RouteGetResult& route) {
-  if (LocalityPrefetchAdmits(object_size)) QueueWholeObjectPull(key, object_size, route);
-}
-
-bool PoolClient::QueueWholeObjectPull(const std::string& key, size_t object_size,
-                                      const RouteGetResult& route) {
-  // Re-resolve in the shared executor: an advisory captured by the foreground
-  // read may be stale by the time its background copy starts.
-  if (!prefetch_manager_) return false;
-  const bool accepted = prefetch_manager_->Submit({key}, {}, {}, /*retain=*/false).accepted;
-  if (accepted) recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
-  return accepted;
+void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size) {
+  if (!prefetch_manager_ || !LocalityPrefetchAdmits(object_size)) return;
+  // Resolve the route when execution starts; the foreground read's route may be stale.
+  if (prefetch_manager_->Submit({key}, {}, {}, /*retain=*/false).accepted)
+    recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::vector<PrefetchKeyResult> PoolClient::FetchWholeObjectsIntoMedium(
@@ -2303,7 +2295,13 @@ std::vector<PrefetchKeyResult> PoolClient::FetchWholeObjectsIntoMedium(
         selected.push_back(i);
         batch.push_back(ReCacheJob{jobs[i].key, nullptr, jobs[i].size, jobs[i].route});
       }
-      auto results = FetchWholeObjectsIntoBackend(batch, id);
+      std::vector<PrefetchKeyResult> results;
+      try {
+        results = FetchWholeObjectsIntoBackend(batch, id);
+      } catch (...) {
+        // A failed backend batch must not discard other batches' committed results.
+        results.assign(batch.size(), {PrefetchCode::kTransferFailed, PrefetchSource::kRemote});
+      }
       for (size_t j = 0; j < selected.size(); ++j) out[selected[j]] = results[j];
     }
   }
@@ -2396,9 +2394,6 @@ std::vector<PrefetchKeyResult> PoolClient::FetchWholeObjectsIntoBackend(
     if (!contiguous || !slot_buffer.Valid()) {
       out[wanted[w]].code = PrefetchCode::kFragmented;
       recache_stats_.fragmented.fetch_add(1, std::memory_order_relaxed);
-      // Aborted here and never revisited: the commit/abort pass below walks
-      // `planned`, which this key does not enter.
-      backend->BatchAbort({alloc.slot_id});
       continue;
     }
 
@@ -2429,7 +2424,6 @@ std::vector<PrefetchKeyResult> PoolClient::FetchWholeObjectsIntoBackend(
 
   std::vector<CommitRequest> commits;
   std::vector<size_t> commit_indices;
-  std::vector<uint64_t> aborts;
   commits.reserve(planned.size());
   // Everything this pass wanted but could not plan -- no slot, or a slot that
   // is not one addressable run -- already failed to become local.
@@ -2438,7 +2432,6 @@ std::vector<PrefetchKeyResult> PoolClient::FetchWholeObjectsIntoBackend(
     auto& alloc = allocs[planned[i]];
     out[wanted[planned[i]]].code = PrefetchCode::kTransferFailed;
     if (!fetched[i]) {
-      aborts.push_back(alloc.slot_id);
       ++not_installed;
       continue;
     }
@@ -2449,14 +2442,13 @@ std::vector<PrefetchKeyResult> PoolClient::FetchWholeObjectsIntoBackend(
     const auto results = backend->BatchCommit(commits);
     for (size_t c = 0; c < commits.size(); ++c) {
       if (c >= results.size() || !results[c].success) {
-        aborts.push_back(commits[c].slot_id);
         ++not_installed;
       } else {
         out[commit_indices[c]].code = PrefetchCode::kReady;
       }
     }
   }
-  if (!aborts.empty()) backend->BatchAbort(aborts);
+  // The pending-slot guard releases every allocation that did not commit.
   // Reported in one go rather than per key: this is a background pass, and the
   // counter is there to say how much locality is being lost, not to trace it.
   NoteRangedInstallFailure(not_installed);
@@ -4112,7 +4104,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
       if (unit.holds_whole_object) {
         MaybeInstallCompleteArenaObject(sub_keys[j], sub_dsts[j], unit.object_size);
       } else {
-        MaybePrefetchWholeObject(sub_keys[j], unit.object_size, *unit.route);
+        MaybePrefetchWholeObject(sub_keys[j], unit.object_size);
       }
     }
     pos = end;
@@ -5053,54 +5045,48 @@ PrefetchStatus PoolClient::GetPrefetchStatus(const std::string& id) {
 }
 
 std::vector<PrefetchKeyResult> PoolClient::ExecutePrefetch(const std::vector<std::string>& keys) {
-  std::vector<std::string> local_keys;
   std::vector<size_t> local_indices, elsewhere;
   std::vector<PrefetchKeyResult> results(keys.size(), PrefetchKeyResult{PrefetchCode::kExpired});
   const auto here = default_pool_->BatchContains(keys);
   for (size_t i = 0; i < keys.size(); ++i) {
     if (!prefetch_manager_->ShouldRun(keys[i])) continue;
     if (i < here.size() && here[i]) {
-      local_keys.push_back(keys[i]);
       local_indices.push_back(i);
     } else {
       results[i].code = PrefetchCode::kMissing;
       elsewhere.push_back(i);
     }
   }
-  auto prepare_local = [this, &local_keys] {
+  auto prepare_local = [&] {
     MarkThreadBackgroundCopies();
-    std::vector<std::string> active;
-    std::vector<size_t> indices;
-    std::vector<PrefetchKeyResult> out(local_keys.size(),
-                                       PrefetchKeyResult{PrefetchCode::kExpired});
-    for (size_t i = 0; i < local_keys.size(); ++i) {
-      if (prefetch_manager_->ShouldRun(local_keys[i])) {
-        active.push_back(local_keys[i]);
-        indices.push_back(i);
+    try {
+      std::vector<std::string> active;
+      std::vector<size_t> indices;
+      for (auto i : local_indices) {
+        if (prefetch_manager_->ShouldRun(keys[i])) {
+          active.push_back(keys[i]);
+          indices.push_back(i);
+        }
       }
+      auto prepared = default_pool_->PrefetchToDram(active, config_.prefetch_budget_bytes);
+      for (size_t i = 0; i < indices.size(); ++i) results[indices[i]] = prepared[i];
+    } catch (...) {
+      for (auto i : local_indices) results[i].code = PrefetchCode::kTransferFailed;
     }
-    auto prepared = default_pool_->PrefetchToDram(active, config_.prefetch_budget_bytes);
-    for (size_t i = 0; i < indices.size(); ++i) out[indices[i]] = prepared[i];
-    return out;
   };
-  // Local SSD copying and remote RDMA keep their own batched executors and
-  // overlap even when both sources occur in the same submitted request.
-  std::future<std::vector<PrefetchKeyResult>> local_work;
-  if (!local_keys.empty() && !elsewhere.empty())
+  // SSD and remote executors overlap, writing disjoint positions in results.
+  std::future<void> local_work;
+  if (!local_indices.empty() && !elsewhere.empty())
     local_work = std::async(std::launch::async, prepare_local);
   try {
     ExecuteRemotePrefetch(keys, elsewhere, &results);
   } catch (...) {
     for (auto i : elsewhere) results[i].code = PrefetchCode::kTransferFailed;
   }
-  if (!local_keys.empty()) {
-    try {
-      auto local = local_work.valid() ? local_work.get() : prepare_local();
-      for (size_t j = 0; j < local_indices.size(); ++j) results[local_indices[j]] = local[j];
-    } catch (...) {
-      for (auto i : local_indices) results[i].code = PrefetchCode::kTransferFailed;
-    }
-  }
+  if (local_work.valid())
+    local_work.get();
+  else if (!local_indices.empty())
+    prepare_local();
   return results;
 }
 
@@ -5122,15 +5108,7 @@ void PoolClient::ExecuteRemotePrefetch(const std::vector<std::string>& keys,
   uint64_t bytes = 0;
   auto flush = [&] {
     if (jobs.empty()) return;
-    // Remove only work whose last subscriber has expired; another request
-    // for the same key keeps its shared transfer alive.
-    for (size_t j = jobs.size(); j-- > 0;) {
-      if (!prefetch_manager_->ShouldRun(jobs[j].key)) {
-        results[indices[j]].code = PrefetchCode::kExpired;
-        jobs.erase(jobs.begin() + j);
-        indices.erase(indices.begin() + j);
-      }
-    }
+    // Each backend batch rechecks subscriber deadlines before starting I/O.
     auto pulled = FetchWholeObjectsIntoMedium(jobs, /*respect_deadlines=*/true);
     for (size_t j = 0; j < indices.size(); ++j) results[indices[j]] = pulled[j];
     recache_stats_.prefetched.fetch_add(
@@ -5141,7 +5119,11 @@ void PoolClient::ExecuteRemotePrefetch(const std::vector<std::string>& keys,
     bytes = 0;
   };
   auto enqueue = [&](size_t i) {
-    if (!routes[i] || !prefetch_manager_->ShouldRun(keys[i])) return;
+    if (!prefetch_manager_->ShouldRun(keys[i])) {
+      results[i].code = PrefetchCode::kExpired;
+      return;
+    }
+    if (!routes[i]) return;
     if (routes[i]->size > kBatchBytes ||
         !ShouldAdmitReCache(true, config_.cache_remote_admission, config_.admission_max_block_bytes,
                             routes[i]->size)) {
@@ -5187,7 +5169,6 @@ void PoolClient::ExecuteRemotePrefetch(const std::vector<std::string>& keys,
     }
   }
   flush();
-  return;
 }
 
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {

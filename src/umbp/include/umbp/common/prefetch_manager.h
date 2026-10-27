@@ -77,6 +77,7 @@ class PrefetchManager {
   struct Operation;
   struct Task;
   void Worker();
+  void FinalizeTask(Task& task);
   void RefreshLocked(Clock::time_point now);
   void FinishLocked(Task& task, PrefetchState state, Clock::time_point now);
   void CancelLocked();

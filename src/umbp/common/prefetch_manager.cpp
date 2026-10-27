@@ -113,30 +113,27 @@ void PrefetchManager::RefreshLocked(Clock::time_point now) {
 PrefetchSubmitResult PrefetchManager::Submit(const std::vector<std::string>& keys,
                                              PrefetchOptions options, std::string id, bool retain) {
   PrefetchSubmitResult out;
+  auto reject = [&](const char* error) {
+    out.error = error;
+    Note("rejected_request");
+    return out;
+  };
   if (keys.empty() || keys.size() > limits_.keys_per_task ||
       std::any_of(keys.begin(), keys.end(),
                   [](const auto& key) { return key.empty() || key.size() > 4096; }) ||
       id.size() > 256) {
-    out.error = "invalid prefetch keys or request_id";
-    if (!out.accepted) Note("rejected_request");
-    return out;
+    return reject("invalid prefetch keys or request_id");
   }
   if (options.timeout.count() == 0) options.timeout = PrefetchOptions{}.timeout;
   if (options.lease_ttl.count() == 0) options.lease_ttl = PrefetchOptions{}.lease_ttl;
   if (options.timeout.count() < 0 || options.lease_ttl.count() < 0 ||
       options.timeout > std::chrono::minutes(5) || options.lease_ttl > std::chrono::minutes(5)) {
-    out.error = "prefetch timeout or lease exceeds the accepted bound";
-    if (!out.accepted) Note("rejected_request");
-    return out;
+    return reject("prefetch timeout or lease exceeds the accepted bound");
   }
   std::lock_guard<std::mutex> lock(mutex_);
   const auto now = Clock::now();
   RefreshLocked(now);
-  if (stopped_ || paused_) {
-    out.error = "prefetch is stopped or clearing";
-    if (!out.accepted) Note("rejected_request");
-    return out;
-  }
+  if (stopped_ || paused_) return reject("prefetch is stopped or clearing");
   if (id.empty()) {
     do {
       id = "prefetch-" + std::to_string(now.time_since_epoch().count()) + "-" +
@@ -147,10 +144,10 @@ PrefetchSubmitResult PrefetchManager::Submit(const std::vector<std::string>& key
   auto existing = tasks_.find(id);
   if (existing != tasks_.end()) {
     const auto& task = *existing->second;
-    out.accepted = task.keys == keys && task.options.timeout == options.timeout &&
-                   task.options.lease_ttl == options.lease_ttl;
-    if (!out.accepted) out.error = "request_id already names a different prefetch";
-    if (!out.accepted) Note("rejected_request");
+    if (task.keys != keys || task.options.timeout != options.timeout ||
+        task.options.lease_ttl != options.lease_ttl)
+      return reject("request_id already names a different prefetch");
+    out.accepted = true;
     return out;
   }
   size_t input_keys = keys.size();
@@ -166,9 +163,7 @@ PrefetchSubmitResult PrefetchManager::Submit(const std::vector<std::string>& key
   if (tasks_.size() >= limits_.tasks ||
       operations_.size() + new_keys.size() > limits_.inflight_keys ||
       input_keys > limits_.retained_input_keys || key_bytes > limits_.retained_key_bytes) {
-    out.error = "prefetch task or key queue is full";
-    if (!out.accepted) Note("rejected_request");
-    return out;
+    return reject("prefetch task or key queue is full");
   }
   auto task = std::make_shared<Task>();
   task->keys = keys;
@@ -275,12 +270,10 @@ void PrefetchManager::Worker() {
         operations_.erase(batch[i]->key);
       }
       RefreshLocked(Clock::now());
-      std::unordered_set<Task*> notified;
-      std::vector<std::shared_ptr<Task>> affected;
+      std::unordered_set<std::shared_ptr<Task>> affected;
       for (const auto& op : batch) {
         for (const auto& weak : op->subscribers) {
-          auto task = weak.lock();
-          if (task && notified.insert(task.get()).second) affected.push_back(std::move(task));
+          if (auto task = weak.lock()) affected.insert(std::move(task));
         }
       }
       for (const auto& task : affected) {
@@ -299,44 +292,7 @@ void PrefetchManager::Worker() {
       }
       cv_.notify_all();
     }
-    for (const auto& task : finishing) {
-      // Work on a private result vector: Status may expire this task concurrently.
-      auto protected_results = std::vector<PrefetchKeyResult>{};
-      for (const auto& op : task->operations) protected_results.push_back(op->result);
-      const auto lease_start = Clock::now();
-      try {
-        protect_(task->keys, &protected_results, task->options.lease_ttl);
-      } catch (...) {
-        for (auto& r : protected_results) r.code = PrefetchCode::kNotResident;
-      }
-      const auto now = Clock::now();
-      if (now >= lease_start + task->options.lease_ttl) {
-        for (auto& result : protected_results)
-          if (result.Ready()) result.code = PrefetchCode::kNotResident;
-      }
-      std::lock_guard<std::mutex> lock(mutex_);
-      task->finalizing = false;
-      if (PrefetchTerminal(task->status.state)) continue;
-      task->status.results = std::move(protected_results);
-      if (now >= task->deadline) {
-        task->status.error = "prefetch completed after its deadline";
-        FinishLocked(*task, PrefetchState::kExpired, now);
-        Note("expired_request");
-      } else {
-        const size_t ready = std::count_if(task->status.results.begin(), task->status.results.end(),
-                                           [](const auto& r) { return r.Ready(); });
-        Note("ready_key", ready);
-        Note("failed_key", task->keys.size() - ready);
-        if (ready) task->lease_until = lease_start + task->options.lease_ttl;
-        if (ready != task->keys.size())
-          task->status.error = "some keys could not be prepared in DRAM";
-        FinishLocked(*task,
-                     ready == task->keys.size() ? PrefetchState::kReady
-                     : ready                    ? PrefetchState::kPartial
-                                                : PrefetchState::kFailed,
-                     now);
-      }
-    }
+    for (const auto& task : finishing) FinalizeTask(*task);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       --active_;
@@ -344,6 +300,47 @@ void PrefetchManager::Worker() {
       cv_.notify_all();
     }
   }
+}
+
+void PrefetchManager::FinalizeTask(Task& task) {
+  // All operations are done and immutable. Keep results private while Status
+  // or Clear can still expire/cancel the task during lease validation.
+  std::vector<PrefetchKeyResult> results;
+  results.reserve(task.operations.size());
+  for (const auto& op : task.operations) results.push_back(op->result);
+  const auto lease_until = Clock::now() + task.options.lease_ttl;
+  bool protected_ok = true;
+  try {
+    protect_(task.keys, &results, task.options.lease_ttl);
+  } catch (...) {
+    protected_ok = false;
+  }
+  const auto now = Clock::now();
+  if (!protected_ok || now >= lease_until) {
+    for (auto& result : results)
+      if (result.Ready()) result.code = PrefetchCode::kNotResident;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  task.finalizing = false;
+  if (PrefetchTerminal(task.status.state)) return;
+  task.status.results = std::move(results);
+  if (now >= task.deadline) {
+    task.status.error = "prefetch completed after its deadline";
+    FinishLocked(task, PrefetchState::kExpired, now);
+    Note("expired_request");
+    return;
+  }
+  const size_t ready = std::count_if(task.status.results.begin(), task.status.results.end(),
+                                     [](const auto& result) { return result.Ready(); });
+  Note("ready_key", ready);
+  Note("failed_key", task.keys.size() - ready);
+  if (ready) task.lease_until = lease_until;
+  if (ready != task.keys.size()) task.status.error = "some keys could not be prepared in DRAM";
+  FinishLocked(task,
+               ready == task.keys.size() ? PrefetchState::kReady
+               : ready                   ? PrefetchState::kPartial
+                                         : PrefetchState::kFailed,
+               now);
 }
 
 bool PrefetchManager::WaitForKeys(const std::vector<std::string>& keys,

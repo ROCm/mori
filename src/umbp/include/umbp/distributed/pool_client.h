@@ -618,11 +618,7 @@ class PoolClient {
   // re-cache admission policy, deduplicated against both the queue and this
   // node's medium, bounded, and silent on failure.  It never runs on, and never
   // blocks, the read that scheduled it.
-  void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
-                                const RouteGetResult& route);
-  // Queues the pull with no admission check; false if not queued.
-  bool QueueWholeObjectPull(const std::string& key, size_t object_size,
-                            const RouteGetResult& route);
+  void MaybePrefetchWholeObject(const std::string& key, size_t object_size);
   // The other half of the same decision: the arena slice already holds the
   // whole object (the caller's ranges tiled it in order), so locality costs one
   // local copy instead of a second trip to the peer.  Synchronous because the
