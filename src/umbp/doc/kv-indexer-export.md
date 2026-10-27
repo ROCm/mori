@@ -67,6 +67,10 @@ all required keys reside: reporting covers local DRAM backends, not cross-owner
 aggregation. Use one writer per worker's DRAM bucket and match the Router worker
 URL and any HBM publisher's identity/cache spec. Startup and graceful owner
 shutdown clear DRAM only. The protocol has no TTL/fencing for crash-time cleanup.
+An engine bridge sharing this identity must only mutate HBM. The upstream bridge
+also maps `CPU_PINNED` to DRAM and clears all tiers by default. Set its
+`KV_INDEXER_CLEAR_TIERS=HBM` and exclude non-HBM store/remove events before they
+reach the bridge. Tier eligibility masks do not filter these mutations.
 
 Reporting is opt-in and requires the endpoint and metadata above. No manual
 report/revoke calls are needed; wiring the metadata callback is the integration's
