@@ -25,9 +25,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "src/io/rdma/verbs_ops.hpp"
 
@@ -96,7 +98,8 @@ class FaultInjector final : public VerbsOps {
   std::mutex mu_;
   FaultRule rule_;
   uint64_t matched_{0};
-  std::unordered_map<uint32_t, ibv_qp*> qps_;
+  // QP numbers are unique only within a device, so key by the verbs context too.
+  std::map<std::pair<ibv_context*, uint32_t>, ibv_qp*> qps_;
 };
 
 }  // namespace io

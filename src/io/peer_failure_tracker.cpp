@@ -84,6 +84,11 @@ void PeerFailureTracker::Report(const PeerFailureReport& report) {
   Enqueue(std::move(event));
 }
 
+void PeerFailureTracker::MarkQpFailed(const QpKey& qp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  erroredQps_.insert(qp);
+}
+
 bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
   if (out == nullptr) return false;
   std::lock_guard<std::mutex> lock(mu_);
@@ -95,7 +100,7 @@ bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
 
 bool PeerFailureTracker::IsQpAlive(const QpKey& qp) const {
   std::lock_guard<std::mutex> lock(mu_);
-  if (failedQps_.count(qp) != 0) return false;
+  if (failedQps_.count(qp) != 0 || erroredQps_.count(qp) != 0) return false;
   // Device-wide, so it applies whether or not this QP was ever registered.
   if (failedDevices_.count(qp.deviceName) != 0) return false;
 
