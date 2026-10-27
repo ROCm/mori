@@ -515,21 +515,30 @@ more.
 
 It is not free: six more VGPRs are live, in a kernel already at 256. So
 `scale_prefetch` is on by default only for `quant="mxfp8"` at
-`K >= SCALE_PREFETCH_MIN_K` (8192). GEMM only, 256x256, MI355X, CUDA-graph
-timed with B rotated past the LLC, median of three interleaved rounds:
+`K >= SCALE_PREFETCH_MIN_K` (4096). GEMM only, 256x256, MI355X, FlyDSL 0.4.0,
+CUDA-graph timed with B rotated past the LLC, median of two to three
+interleaved rounds, relL2 1.66e-3 throughout:
 
-| M x N x K | off | on | |
-|---|---:|---:|---:|
-| 4096 x 10240 x 8192 | 282.8 | 267.5 | **-5.4%** |
-| 16384 x 10240 x 8192 | 1097.6 | 990.7 | **-9.7%** |
-| 2048 x 18432 x 16384 | 590.3 | 526.5 | **-10.8%** |
-| 8192 x 18432 x 16384 | 1932.8 | 1831.7 | **-5.2%** |
+| M x N x K | | off | on | |
+|---|---|---:|---:|---:|
+| 1024 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 49.6 | 44.4 | **-10.4%** |
+| 4096 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 95.9 | 90.3 | **-5.8%** |
+| 8192 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 151.5 | 146.8 | **-3.1%** |
+| 16384 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 274.9 | 265.2 | **-3.5%** |
+| 8192 x 7168 x 4096 | | 204.3 | 201.7 | -1.2% |
+| 8192 x 5120 x 8192 | V4.1-Flash `wo_b`, TP1 | 281.5 | 271.4 | **-3.6%** |
+| 16384 x 5120 x 8192 | V4.1-Flash `wo_b`, TP1 | 546.1 | 504.0 | **-7.7%** |
+| 4096 x 10240 x 8192 | | 282.8 | 267.6 | **-5.4%** |
+| 16384 x 10240 x 8192 | | 1099.5 | 989.2 | **-10.0%** |
+| 2048 x 18432 x 16384 | | 590.1 | 527.7 | **-10.6%** |
+| 8192 x 18432 x 16384 | | 1939.0 | 1835.8 | **-5.3%** |
 
-Below that it is shape-dependent rather than a win: forced on, it was 1-8%
-*slower* on the eight 256x256 shapes at K = 512 and 1280-2048 and neutral at
-8192x7168x4096, while faster at K = 256, 640 and 1792 and on the 256x128 tile.
-That is why the default threshold sits where every measured shape gains.
-`scale_prefetch=True/False` overrides it.
+Below 4096 it is shape-dependent rather than a win. Forced on, V4.1-Flash's
+TP2 `wq_b` (16384 x 1280) is 0-5% slower from M=1024 to 8192 and level at
+16384, and the 256x256 shapes at K = 512 and 1280-2048 measured 1-8% slower;
+it was faster at K = 256, 640 and 1792 and on the 256x128 tile. 8192x7168x4096
+is the one shape at the threshold that does not gain, and it is level hot
+(+0.9%). `scale_prefetch=True/False` overrides the default.
 
 **Against the alternatives**, bf16 in and bf16 out, the whole pipeline including
 quantisation, M=16384:

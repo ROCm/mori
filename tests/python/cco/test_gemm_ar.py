@@ -435,8 +435,9 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k, scale_prefetch):
     land near the floor: it misses by the ratio of two random powers of two.
 
     ``n=5120, k=2048`` is ``wo_b`` per rank at TP4 on V4.1-Flash. ``k=256``
-    runs no main-loop step at all, only the two peeled ones; ``k=8192`` is where
-    ``scale_prefetch`` turns on by default, and ``True`` forces it everywhere.
+    runs no main-loop step at all, only the two peeled ones; ``k=8192`` is above
+    the K where ``scale_prefetch`` turns on by default, and ``True`` forces it
+    everywhere.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU")

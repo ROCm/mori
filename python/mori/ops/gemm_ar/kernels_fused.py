@@ -918,7 +918,7 @@ BLOCK_K = 128
 #: K at and above which ``quant="mxfp8"`` loads its scales one K step ahead by
 #: default (``scale_prefetch``). Below it the extra live registers cost more
 #: than the unblocked wait saves on most measured shapes.
-SCALE_PREFETCH_MIN_K = 8192
+SCALE_PREFETCH_MIN_K = 4096
 
 
 def compile_fused_gemm_scatter(
@@ -998,8 +998,8 @@ def compile_fused_gemm_scatter(
     too: the pipeline loses about half a step of latency hiding every step.
     One step earlier the wait becomes ``vmcnt(17..20)`` and no longer blocks,
     but six more VGPRs stay live, and at short K the kernel spills more. So it
-    is on by default only for ``quant="mxfp8"`` at ``K >= 8192``, where it
-    measured 3-11% faster on every shape tried (README); ``None`` picks that.
+    is on by default only for ``quant="mxfp8"`` at ``K >= 4096``, where it
+    measured faster or level on every shape tried (README); ``None`` picks that.
 
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``.
