@@ -1,4 +1,4 @@
-set(MORI_RAS_SOURCES protocol.cpp types.cpp)
+set(MORI_RAS_SOURCES event_queue.cpp protocol.cpp types.cpp)
 
 set_source_files_properties(${MORI_RAS_SOURCES} PROPERTIES LANGUAGE CXX)
 # Shared, never static: the runtime is a per-process singleton, so every subsystem library has

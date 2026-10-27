@@ -8,3 +8,4 @@ function(mori_ras_test name)
 endfunction()
 
 mori_ras_test(protocol)
+mori_ras_test(bounded_queues)
