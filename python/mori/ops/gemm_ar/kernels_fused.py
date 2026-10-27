@@ -1187,7 +1187,8 @@ def compile_fused_gemm_scatter(
     input_scale_off = cfg.input_scale_off
     scatter_elem_bytes = cfg.scatter_elem_bytes
     scatter_scale_slice_bytes = cfg.scatter_scale_slice_bytes
-    recv_scale_slot = cfg.recv_scale_slot_off(rank)
+    # Only the FP8 scatter has scale slots; the call raises without recv slots.
+    recv_scale_slot = cfg.recv_scale_slot_off(rank) if fp8_scatter else 0
     slice_bytes_rec = cfg.slice_bytes
     # Options off by default add to the name only when on, so the default
     # kernels keep the names profiles and traces filter on.
