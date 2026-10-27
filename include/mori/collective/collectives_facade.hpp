@@ -113,6 +113,8 @@ class CollectivesFacade {
   int NumPes() const { return nPes_; }
   int PeBase() const { return peBase_; }
 
+  static bool PullNpesSupported(int n) { return n == 2 || n == 4 || n == 8; }
+
   // Creates a facade for rank `myPe` of a (sub-)communicator of `nPes` ranks,
   // where rank r maps to global PE rank_to_pe[r]. Only contiguous mappings
   // (rank_to_pe[r] == rank_to_pe[0] + r) within this node's LSA team are
@@ -179,7 +181,7 @@ class CollectivesFacade {
       mode = RsMode::kPush;
       logS = __builtin_ctz(static_cast<uint32_t>(forcePushS));  // log2(S)
     } else if (forcePull) {
-      if (nPes == 2 || nPes == 4 || nPes == 8) {
+      if (PullNpesSupported(nPes)) {
         mode = RsMode::kPull;
       } else {
         FACADE_PRINTF("MORI_CCL_FORCE_PULL needs nPes 2, 4 or 8; using auto");
@@ -229,7 +231,7 @@ class CollectivesFacade {
     // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
     state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
 
-    size_t controlBytes = kRSPushMaxPeers * sizeof(uint64_t) * 4;
+    size_t controlBytes = kRSPushMaxPeers * sizeof(uint64_t) * 4 + kArrivedBytes;
     size_t totalBytes = maxStagingBytes + controlBytes;
     state.staging = Allocate(totalBytes);
     if (state.staging == nullptr) {
@@ -251,6 +253,9 @@ class CollectivesFacade {
     // ownership rule: slot p of my copy is written only by PE p.
     state.permuteSendReady = state.permuteReady + kRSPushMaxPeers;
     state.permuteReadDone = state.permuteSendReady + kRSPushMaxPeers;
+    // SDMA completion slots of the push collectives (see kArrivedStride): row p of
+    // my copy is written only by PE p's SDMA swaps; never reset after this.
+    state.arrived = state.permuteReadDone + kRSPushMaxPeers;
     HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
 
     // One local, zeroed-once buffer: the uint64 per-peer permute counts first
@@ -260,8 +265,7 @@ class CollectivesFacade {
     const size_t localCtrBytes = permuteCntBytes + kGroupCounterCount * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.permuteCnt), localCtrBytes));
     HIP_RUNTIME_CHECK(hipMemset(state.permuteCnt, 0, localCtrBytes));
-    state.groupCounters = reinterpret_cast<uint32_t*>(state.permuteCnt + 2 * kRSPushMaxPeers);
-    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
+    state.groupCounters = reinterpret_cast<uint32_t*>(state.permuteCnt + 2 * kRSPushMaxPeers);    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
     // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
     // device alloc/copy). Sized for the max supported peer count.
     HIP_RUNTIME_CHECK(hipHostMalloc(reinterpret_cast<void**>(&state.pinnedPairs),
@@ -281,16 +285,6 @@ class CollectivesFacade {
     ret = cco::ccoDevCommCreate(comm, &reqs, &state.devComm);
     if (ret != 0 || state.devComm.sdma.sdmaNumQueue == 0) {
       FACADE_PRINTF("ccoDevCommCreate failed or no SDMA queues allocated.");
-      return -1;
-    }
-    // The push collectives use signal slots [0, kSdmaSignalSlotsUsed) of the
-    // lsaSize * sdmaNumQueue pool.
-    const uint32_t signalSlots =
-        state.devComm.lsaSize * state.devComm.sdma.sdmaNumQueue;
-    if (signalSlots < static_cast<uint32_t>(kSdmaSignalSlotsUsed)) {
-      FACADE_PRINTF("SDMA signal pool has %u slots, need %d (lsaSize=%d, sdmaNumQueue=%u)",
-                    signalSlots, kSdmaSignalSlotsUsed, state.devComm.lsaSize,
-                    state.devComm.sdma.sdmaNumQueue);
       return -1;
     }
     return 0;
@@ -429,6 +423,7 @@ class CollectivesFacade {
     uint64_t* permuteReady{nullptr};  // symmetric, permute ready counts (slot p written by PE p)
     uint64_t* permuteSendReady{nullptr};  // symmetric, pull-permute sender-entered counts
     uint64_t* permuteReadDone{nullptr};   // symmetric, pull-permute receiver-done counts
+    uint64_t* arrived{nullptr};  // symmetric, SDMA completion slots (row p written by PE p)
     AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};
     // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -515,7 +510,8 @@ class CollectivesFacade {
                     RsMode mode) :
            state_(state), myPe_(myPe), nPes_(nPes), peBase_(peBase),
            logS_(logS), mode_(mode), devComm_(state.devComm),
-           barrierCtr_(state.barrierCtr + peBase) {
+           barrierCtr_(state.barrierCtr + peBase),
+           arrived_(state.arrived + static_cast<size_t>(peBase) * kArrivedStride) {
     devComm_.sdma.deviceHandles += static_cast<size_t>(peBase) * devComm_.sdma.sdmaNumQueue;
     devComm_.sdma.peerSignalPtrs += peBase;
   }
@@ -537,6 +533,7 @@ private:
   RsMode mode_;
   cco::ccoDevComm devComm_;  // state_.devComm with the SDMA tables shifted by peBase_
   uint64_t* barrierCtr_;     // state_.barrierCtr + peBase_
+  uint64_t* arrived_;        // state_.arrived + peBase_ rows
 };
 
 }  // namespace collective

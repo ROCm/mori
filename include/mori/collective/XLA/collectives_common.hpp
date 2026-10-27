@@ -33,53 +33,54 @@
 // ---------------------------------------------------------------------------
 // Shared building blocks for collective kernels: cache-bypassing vector
 // load/store (StreamLoad/StreamStore), a 128-bit SDMA ring-store helper, and the
-// warp-cooperative fused copy+atomic SDMA put used by the push collectives.
+// warp-cooperative fused copy+signal SDMA put used by the push collectives.
 // ---------------------------------------------------------------------------
 namespace mori {
 namespace collective {
 
-static constexpr size_t kSDMACopyAtomicPktSize = 64;
-static_assert(sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC) 
-                                  + sizeof(uint32_t) == kSDMACopyAtomicPktSize,
+// Fused 64B packet: [NOP][COPY_LINEAR][ATOMIC SWAP64].
+static constexpr size_t kSDMACopySignalPktSize = 64;
+static_assert(sizeof(uint32_t) + sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC) ==
+                      kSDMACopySignalPktSize,
               "Packet size mismatch: copy+atomic must be 64B");
 #if defined(__HIPCC__) || defined(__HIP__)
-static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopyAtomicPktSize == 0,
+static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopySignalPktSize == 0,
               "SDMA ring must be a multiple of the 64B fused packet");
 #endif
 
 static constexpr int kRSPushMaxPeers = 16;
 static constexpr int kRSPushMaxSlices = 8;
 
-// All slice completions land in ONE 64-bit counter, signalBuf[kSliceSignalSlot]:
-// byte s counts the senders whose slice s has landed (each adds 1 << 8s). A byte
-// never exceeds kRSPushMaxPeers-1 < 256, so no add carries into the next slice's
-// byte -- the bytes are independent and a torn 2x32-bit read is still exact.
-static constexpr int kSliceSignalSlot = 0;
-// Signal slots the push collectives touch: the slice counter plus all-reduce's
-// packed broadcast counter. The default pool is lsaSize * sdmaNumQueue, which
-// the facade checks is at least this.
-static constexpr int kSdmaSignalSlotsUsed = 2;
-// All-reduce's packed broadcast counter: byte b counts peers whose broadcast b
-// has landed.
-static constexpr int kBcastSlot = kSliceSignalSlot + 1;
-static_assert(kBcastSlot < kSdmaSignalSlotsUsed, "broadcast counter must be a checked slot");
+// Completion slots: a symmetric-heap uint64 arrived[kRSPushMaxPeers][kArrivedStride]
+// (zeroed once, never reset). Row p of my copy is written only by PE p's SDMA: each
+// copy is trailed by an atomic swap storing the sender's generation into its slot, and
+// the receiver waits until the slot reaches the generation it expects. Slots only
+// grow, so nothing is ever cleared. 64 bits because a slot a launch does not use
+// (e.g. slice 3 under logS < 2) falls arbitrarily far behind the generation; a
+// 32-bit wrap-safe compare would misread it as reached after 2^31 launches.
+//   [0, kRSPushMaxSlices) : scatter slice s (all push collectives, launch gen)
+//   kBcastArrived + b     : all-reduce broadcast b (launch gen)
+//   kPermuteArrived       : push collective-permute (pairwise permute count)
+static constexpr int kBcastArrived = kRSPushMaxSlices;
+static constexpr int kPermuteArrived = kBcastArrived + 2;
+static constexpr int kArrivedStride = 16;
+static_assert(kPermuteArrived < kArrivedStride, "arrived row too small");
+static constexpr size_t kArrivedBytes = kRSPushMaxPeers * kArrivedStride * sizeof(uint64_t);
 
 // groupCounters layout (local uint32 buffer): [0] grid-wide last-block arrival
-// counter (reduce-scatter's packed-counter reset and all-reduce-pull's exit
-// barrier elect the tail block through it), then all-reduce's two broadcast
-// release counters, then all-reduce's per-launch b=1 release target (elects the
-// tail owner).
+// counter (reduce-scatter's gen bump and the pull kernels' exit barrier elect the
+// tail block through it), then all-reduce's two broadcast release counters, then
+// all-reduce's per-launch b=1 release target (elects the tail owner), then the
+// uint64 push-collective generation (two dwords, see PushGen): the number of push
+// launches (all-gather, all-to-all, reduce-scatter, all-reduce) this device has
+// completed. Every PE runs the same sequence of push launches, so launch n
+// signals gen = n on every PE.
 static constexpr int kArrivalIdx = 0;
 static constexpr int kBcastFlagIdx = kArrivalIdx + 1;
 static constexpr int kBcastTargetIdx = kBcastFlagIdx + 2;
-static constexpr int kGroupCounterCount = kBcastTargetIdx + 1;
-static_assert(kRSPushMaxSlices * 8 <= 64 && kRSPushMaxPeers - 1 < 256,
-              "slice counters must fit one byte each of a uint64");
-
-constexpr uint64_t SliceSignalInc(uint32_t slice) { return 1ull << (8 * slice); }
-constexpr uint32_t SliceSignalCount(uint64_t v, uint32_t slice) {
-  return static_cast<uint32_t>(v >> (8 * slice)) & 0xffu;
-}
+static constexpr int kPushGenIdx = kBcastTargetIdx + 1;
+static constexpr int kGroupCounterCount = kPushGenIdx + 2;
+static_assert(kPushGenIdx % 2 == 0, "push generation must be 8B-aligned in groupCounters");
 
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
 struct AddressPair {
@@ -175,11 +176,30 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 
 #define FORCE_SGPR(x) __builtin_amdgcn_readfirstlane((x))
 
-// Fused 64B packet: [NOP][COPY_LINEAR src->dst][ATOMIC ADD64(addValue) into *signal].
-// Lane k writes dwords [4k, 4k+4): lane 2 carries SRC_DATA_LO, lane 3 SRC_DATA_HI.
+// Peer `peer`'s copy of a local symmetric-heap pointer: the flat-VA rank delta
+// (peer - myPe)*stride4G<<32 used by every push and pull kernel.
+template <class T>
+__device__ __forceinline__ T* PeerPtr(T* p, int peer, int myPe, uint32_t stride4G) {
+  const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+  return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) +
+                              (static_cast<uint64_t>(diff) << 32));
+}
+
+// SDMA ATOMIC `operation` takes TC atomic opcodes (SDMA_ATOMIC_ADD64 = 47 is
+// TC_OP_ATOMIC_ADD_RTN_64); this is TC_OP_ATOMIC_SWAP_RTN_64. A swap stores the
+// generation like a FENCE would, but a FENCE costs the engine ~2-4us more.
+// TC_OP_WRITE (0x20) is no substitute: it stores only the low dword.
+static constexpr uint32_t kSdmaAtomicSwap64 = 0x27;
+
+// Fused 64B packet: [NOP][COPY_LINEAR src->dst][ATOMIC SWAP64 *slot = value].
+// The atomic is ordered after the copy's writes, so a receiver observing
+// `value` may read the copied bytes (after an acquire). `slot` is 8B-aligned.
+// Lane k writes dwords [4k, 4k+4): lane 0 NOP + copy header/count/param, lane 1
+// the copy addresses, lane 2 atomic header/address/data lo, lane 3 data hi,
+// then compare data and loop (0).
 __device__ __forceinline__ void WriteFusedPacket(int lane, 
-     const void* srcBuf, const void* dstBuf, size_t packetSize, HSAuint64* signal,
-     uint64_t addValue, uint32_t* outBasePtr) {
+     const void* srcBuf, const void* dstBuf, size_t packetSize, const uint64_t* slot,
+     uint64_t value, uint32_t* outBasePtr) {
   
   uint32_t dw[4];
   // if (lane == 0) {
@@ -209,21 +229,21 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
     cp.DW_0_DATA = 0;
     cp.op = SDMA_OP_COPY;
     cp.sub_op = SDMA_SUBOP_COPY_LINEAR;
-    decltype(SDMA_PKT_ATOMIC::HEADER_UNION) inc;
-    inc.DW_0_DATA = 0;
-    inc.op = SDMA_OP_ATOMIC;
-    inc.operation = SDMA_ATOMIC_ADD64;
+    decltype(SDMA_PKT_ATOMIC::HEADER_UNION) swp;
+    swp.DW_0_DATA = 0;
+    swp.op = SDMA_OP_ATOMIC;
+    swp.operation = kSdmaAtomicSwap64;
 
     uint32_t flag = lane >> 1;
-    dw[0] = inc.DW_0_DATA & -flag;
-    dw[1] = flag == 0 ? cp.DW_0_DATA : (uint32_t)((uintptr_t)signal);
+    dw[0] = swp.DW_0_DATA & -flag;
+    dw[1] = flag == 0 ? cp.DW_0_DATA : (uint32_t)((uintptr_t)slot);
     dw[2] = flag == 0 ? static_cast<uint32_t>(packetSize) - 1 : 
-                        (uint32_t)((uintptr_t)signal >> 32);
-    dw[3] = static_cast<uint32_t>(addValue) & -flag;
+                        (uint32_t)((uintptr_t)slot >> 32);
+    dw[3] = static_cast<uint32_t>(value) & -flag;
   } else {
-    // lane 1 - real addresses, lane 3 - SRC_DATA_HI then zero CMP_DATA / LOOP
+    // lane 1 - copy addresses, lane 3 - data hi, zero compare / loop
     uint32_t mask = lane == 1 ? ~0u : 0;
-    dw[0] = lane == 1 ? (uint32_t)(uintptr_t)srcBuf : static_cast<uint32_t>(addValue >> 32);
+    dw[0] = lane == 1 ? (uint32_t)(uintptr_t)srcBuf : static_cast<uint32_t>(value >> 32);
     dw[1] = (uint32_t)((uintptr_t)srcBuf >> 32) & mask;
     dw[2] = (uint32_t)(uintptr_t)dstBuf & mask;
     dw[3] = (uint32_t)((uintptr_t)dstBuf >> 32) & mask;
@@ -240,7 +260,7 @@ static_assert(sizeof(SDMA_PKT_POLL_REGMEM) == 6 * sizeof(uint32_t),
               "POLL_REGMEM must be 6 DW so the 64B slot pads with 10 NOPs");
 
 // One POLL_REGMEM (6 DW) padded with single-DW NOPs (zero dwords) to a full
-// 64B ring slot, so every ring reservation stays kSDMACopyAtomicPktSize. The
+// 64B ring slot, so every ring reservation stays kSDMACopySignalPktSize. The
 // engine stalls this queue until *flag == value; retry_count 0xfff = forever.
 // Four consecutive lanes each write one b128, like WriteFusedPacket.
 __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, uint32_t value,
@@ -268,19 +288,36 @@ __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, 
   StreamStore<EAgentScope, 16>(outBasePtr + lane * 4, v);
 }
 
-// Broadcast `v` from `srcLane` of this wave. ds_bpermute is lane-addressed;
-// srcLane must be < warpSize (64 on gfx950, 32 on gfx1250).
+// Broadcast `v` from lane 4k to lanes 4k..4k+3 (DPP quad_perm [0,0,0,0]: a VALU
+// modifier, no LDS round trip). Lane 4k must be active.
 template <typename T>
-__device__ __forceinline__ T BroadcastWarp(T v, int srcLane) {
-  static_assert(sizeof(T) % sizeof(uint32_t) == 0, 
-                        "T must be a multiple of uint32_t");
+__device__ __forceinline__ T BroadcastQuad(T v) {
+  static_assert(sizeof(T) % sizeof(uint32_t) == 0, "T must be a multiple of uint32_t");
   union {
     T v;
-    uint32_t dw[sizeof(T) / sizeof(uint32_t)];
+    int dw[sizeof(T) / sizeof(int)];
   } S = {.v = v};
 #pragma unroll
-  for (int i = 0; i < sizeof(T) / sizeof(uint32_t); i++) {
-    S.dw[i] = __builtin_amdgcn_ds_bpermute(srcLane << 2, S.dw[i]);
+  for (int i = 0; i < sizeof(T) / sizeof(int); i++) {
+    S.dw[i] = __builtin_amdgcn_update_dpp(0, S.dw[i], 
+            /*quad_perm [0,0,0,0]*/ 0x00, 0xF, 0xF, false);
+  }
+  return S.v;
+}
+
+// Broadcast `v` from lane 0 to the whole wave. Lane 0 must be active.
+// ds_bpermute, not v_readlane: the scalar result measured ~1us slower on the
+// election paths (LastBlockOut, all-reduce tail).
+template <typename T>
+__device__ __forceinline__ T BroadcastLane0(T v) {
+  static_assert(sizeof(T) % sizeof(uint32_t) == 0, "T must be a multiple of uint32_t");
+  union {
+    T v;
+    int dw[sizeof(T) / sizeof(int)];
+  } S = {.v = v};
+#pragma unroll
+  for (int i = 0; i < sizeof(T) / sizeof(int); i++) {
+    S.dw[i] = __builtin_amdgcn_ds_bpermute(0, S.dw[i]);
   }
   return S.v;
 }
@@ -295,14 +332,14 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   }
 
   __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) {
-    const uint64_t queue_size_in_bytes = cco::CCO_SDMA_QUEUE_SIZE;
-    if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
+    const uint64_t qSize = cco::CCO_SDMA_QUEUE_SIZE;
+    if ((uptoIndex - cachedHwReadIndex) < qSize) {
       return true;
     }
     // Only read hardware register if the queue is full based on cached index
     cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
-    return (uptoIndex - cachedHwReadIndex) < queue_size_in_bytes;
+    return (uptoIndex - cachedHwReadIndex) < qSize;
   }
 
   // Sole-producer reservation: no CAS. Valid only when this queue has exactly
@@ -310,7 +347,7 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   // lane per distinct queue). Claim-then-wait like cco ReserveSlot: fetch_add
   // first, then poll rptr if occupancy exceeds the ring.
   //
-  // Reservations are multiples of kSDMACopyAtomicPktSize and the ring is a
+  // Reservations are multiples of kSDMACopySignalPktSize and the ring is a
   // multiple of that, so a multi-packet reservation may span the wrap but no
   // single 64B packet straddles it: wrap each packet's offset separately.
   //
@@ -319,12 +356,12 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   // write the hint back to `shared` once at the end if it moved. The hint only
   // moves forward to a value rptr actually had, so a later writer is harmless.
   __device__ __forceinline__ uint64_t ReserveSingleProducer(const size_t size_in_bytes) {
-    constexpr uint64_t q_size = cco::CCO_SDMA_QUEUE_SIZE;
+    constexpr uint64_t qSize = cco::CCO_SDMA_QUEUE_SIZE;
     uint64_t base =
         __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
     const uint64_t end = base + size_in_bytes;
-    if (end - cachedHwReadIndex > q_size) {
+    if (end - cachedHwReadIndex > qSize) {
       int64_t retries = 0;
       do {
         cachedHwReadIndex =
@@ -332,7 +369,7 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
         if constexpr (cco::CCO_SDMA_BREAK_ON_RETRIES) {
           if (retries++ == cco::CCO_SDMA_MAX_RETRIES) __builtin_trap();
         }
-      } while (end - cachedHwReadIndex > q_size);
+      } while (end - cachedHwReadIndex > qSize);
     }
     return base;
   }
@@ -346,7 +383,7 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 
 // ---------------------------------------------------------------------------
 // Fused SDMA "push" scatter shared by the push collectives (reduce-scatter and
-// all-gather). Four consecutive lanes write one fused 64B copy+atomic via
+// all-gather). Four consecutive lanes write one fused 64B copy+signal via
 // WriteFusedPacket (one b128 store each). nWork = npes*4; a peer never straddles
 // a warp (warpSize % 4 == 0). sub==0 snapshots the queue handle once, then for
 // each slice s: reserves 64B, the four lanes write, sub==0 rings that packet.
@@ -356,59 +393,60 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // written back once if it moved.
 //
 // Each shard is split into S = 1<<logS slices. Slice s is an SDMA copy from
-// srcOf(peer) into dstOf(peer), followed by an ADD64(1 << 8s) into byte s of
-// peer's packed completion counter signalPtrs[kSliceSignalSlot] (S=1 adds 1).
-// The atomic targets the *receiver's* counter,
-// so completion is observed on the receive side -- fire-and-forget, no local
-// quiet, no cross-PE barrier.
+// p.src + s*sliceBytes to p.dst + s*sliceBytes, followed by an atomic swap
+// storing `value` into p.sigBase[s]. sigBase is the peer's copy of MY row of the
+// symmetric arrived array (PeerPtr(&arrived[myPe*kArrivedStride + slotBase])),
+// so the swap lands in a slot only I write on that peer. Completion is observed
+// on the receive side (WaitArrived) -- fire-and-forget, no local quiet, no
+// cross-PE barrier.
 //
-// The three peer-indexed quantities are supplied by the caller as device
-// callables (all warp-uniform at peer granularity):
-//   activeOf(peer) -> bool         : whether this peer's copy is issued
-//   srcOf(peer)    -> const uint8_t*: local source base for peer's chunk (pre-slice)
-//   dstOffOf(peer) -> size_t        : byte offset of the destination slot within
-//                                     the (symmetric) peer heap
-// Callers build these per collective, e.g.:
+// The caller describes each peer's copy with peerOf(peer) -> ScatterPeer
+// (warp-uniform at peer granularity). dst and sigBase are peer addresses,
+// usually built with PeerPtr. Examples:
 //   reduce-scatter: active=peer!=myPe, src=input+peer*chunkElems, dst slot packs
 //                   staging densely (slot = myPe<peer?myPe:myPe-1). Self folded in
 //                   by the reduce.
 //   all-gather:     active=true, src=input (single shard to everyone incl. self),
-//                   dst slot = myPe (constant offset).
-//   all-to-all:     active=true, src=srcPtrs[peer], dst offset = dstPtrs[myPe] slot
-//                   (constant, symmetric-heap layout).
+//                   dst = output[myPe] (constant).
+//   all-to-all:     active=true, src=srcPtrs[peer], dst = dstPtrs[myPe] (constant).
 //
-// srcOf(peer)/dstOffOf(peer) MUST reference the symmetric static heap (ShmemMalloc)
-// so the address-based SDMA put can translate local->peer (offset from
-// heapBaseAddr).
+// src/dst MUST reference the symmetric static heap (ShmemMalloc) so the
+// address-based SDMA put can translate local->peer.
 // ---------------------------------------------------------------------------
-// sizeOf(peer) gives the DESTINATION shard's element count, so each peer's copy
-// can be a different length: the all-reduce push path uses 16B-aligned variable
-// shards, while the uniform callers (all-gather / all-to-all / collective-
-// permute / reduce-scatter push) pass a constant lambda. The slice geometry is
-// recomputed per peer from that length. Callers must pick logS small enough that
-// every active shard yields sliceLen >= vecSize (no empty slices), since the
-// receiver still waits on all S slices; the reduce facades clamp logS by the
-// smallest shard.
-template <uint64_t ElemBytes = 1, class SizeFn, class ActiveFn, class SrcFn, class DstFn>
-__device__ __forceinline__ void StartSdmaScatter(
-    cco::ccoSdmaContext sdma, int npes, int logS, SizeFn sizeOf,
-    ActiveFn activeOf, SrcFn srcOf, DstFn dstOf) {
+// elems is the DESTINATION shard's element count, so each peer's copy can be a
+// different length: the all-reduce push path uses 16B-aligned variable shards,
+// while the uniform callers (all-gather / all-to-all / collective-permute /
+// reduce-scatter push) pass a constant. The slice geometry is recomputed per peer
+// from that length. Callers must pick logS small enough that every active shard
+// yields sliceLen >= vecSize (no empty slices), since the receiver still waits on
+// all S slices; the reduce facades clamp logS by the smallest shard.
+struct ScatterPeer {
+  bool active;         // issue this peer's copy
+  size_t elems;        // destination shard length, in ElemBytes units
+  const uint8_t* src;  // local source base (pre-slice)
+  uint8_t* dst;        // peer's destination base (pre-slice)
+  uint64_t* sigBase;   // peer's copy of my arrived row; slice s signals sigBase[s]
+};
+
+template <uint64_t ElemBytes = 1, class PeerFn>
+__device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int npes, int logS,
+                                                 PeerFn peerOf, uint64_t value) {
 
   static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
                 "ElemBytes must divide VecBytes");
   constexpr size_t vecSize = VecBytes / ElemBytes;
-  constexpr int W = warpSize;
 
   const int S = 1 << logS, tid = static_cast<int>(threadIdx.x),
             B = static_cast<int>(blockDim.x);
 
-  const int nWork = npes << 2, lane = tid % W;
+  const int nWork = npes << 2;
   for (int i = tid; i < nWork; i += B) {
-    const int peer = i >> 2, sub = i & 3, leader = lane & ~3;
-    const bool active = activeOf(peer);
+    const int peer = i >> 2, sub = i & 3;
+    const ScatterPeer p = peerOf(peer);
+    const bool active = p.active;
 
     // Per-peer slice geometry derived from the destination shard's length.
-    const size_t chunkElems = active ? sizeOf(peer) : 0;
+    const size_t chunkElems = active ? p.elems : 0;
     const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize,
             sliceBytes = sliceLen * ElemBytes,
             lastBytes = (chunkElems - (sliceLen << logS) + sliceLen) * ElemBytes;
@@ -423,31 +461,30 @@ __device__ __forceinline__ void StartSdmaScatter(
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
     }
-    queueBuf = BroadcastWarp(queueBuf, leader);
+    queueBuf = BroadcastQuad(queueBuf);
 
     for (int s = 0; s < S; s++) {
       uint64_t pktBase = 0;
       if (active && sub == 0) {
-        pktBase = handle.ReserveSingleProducer(kSDMACopyAtomicPktSize);
+        pktBase = handle.ReserveSingleProducer(kSDMACopySignalPktSize);
       }
-      pktBase = BroadcastWarp(pktBase, leader);
+      pktBase = BroadcastQuad(pktBase);
 
       if (active) {
-        auto* srcp = srcOf(peer) + s * sliceBytes;
-        auto* dstp = dstOf(peer) + s * sliceBytes;
+        auto* srcp = p.src + s * sliceBytes;
+        auto* dstp = p.dst + s * sliceBytes;
         const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
-        auto* signal = sdma.peerSignalPtrs[peer] + kSliceSignalSlot;
+        const uint64_t* sig = p.sigBase + s;
         const uint64_t ringDw =
             SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t);
-        WriteFusedPacket(sub, srcp, dstp, sz, signal, SliceSignalInc(s),
-                         queueBuf + ringDw);
+        WriteFusedPacket(sub, srcp, dstp, sz, sig, value, queueBuf + ringDw);
       }
 
       cco::ccoSdmaPublishStores();
       __builtin_amdgcn_wave_barrier();
 
       if (active && sub == 0) {
-        handle.submitPacket(pktBase, pktBase + kSDMACopyAtomicPktSize);
+        handle.submitPacket(pktBase, pktBase + kSDMACopySignalPktSize);
       }
     }
 
@@ -459,17 +496,17 @@ __device__ __forceinline__ void StartSdmaScatter(
 }
 
 // Writes one pre-posted broadcast into the two 64B ring slots starting at pktBase:
-// [POLL *flag == value][COPY src->dst + ADD64(addValue) into signal]. The copy reads
+// [POLL *flag == value][COPY src->dst + SWAP *slot = slotValue]. The copy reads
 // src only once its poll passes, so src need not be ready yet. Each slot wraps on its
 // own: the reservation may span the ring end, a 64B packet never does.
 __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf, uint64_t pktBase,
                                                     const void* src, const void* dst, size_t bytes,
-                                                    HSAuint64* signal, uint64_t addValue,
+                                                    const uint64_t* slot, uint64_t slotValue,
                                                     const uint32_t* flag, uint32_t value) {
   WritePollPacket(sub, flag, value,
                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
-  WriteFusedPacket(sub, src, dst, bytes, signal, addValue,
-                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopyAtomicPktSize) /
+  WriteFusedPacket(sub, src, dst, bytes, slot, slotValue,
+                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopySignalPktSize) /
                                   sizeof(uint32_t));
 }
 
@@ -481,12 +518,11 @@ __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf,
 template <class WriteFn>
 __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int npes,
                                                 int myPe, int nSlots, WriteFn writeFn) {
-  constexpr int W = warpSize;
   const int tid = static_cast<int>(threadIdx.x), B = static_cast<int>(blockDim.x);
-  const int nWork = npes << 2, lane = tid % W;
+  const int nWork = npes << 2;
 
   for (int i = tid; i < nWork; i += B) {
-    const int peer = i >> 2, sub = i & 3, leader = lane & ~3;
+    const int peer = i >> 2, sub = i & 3;
     const bool active = peer != myPe;
 
     SdmaCollectiveHandle handle;
@@ -499,14 +535,14 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
       hint0 = handle.cachedHwReadIndex;
       queueBuf = handle.queueBuf;
     }
-    queueBuf = BroadcastWarp(queueBuf, leader);
+    queueBuf = BroadcastQuad(queueBuf);
 
-    const uint64_t bytes = static_cast<uint64_t>(nSlots) * kSDMACopyAtomicPktSize;
+    const uint64_t bytes = nSlots * kSDMACopySignalPktSize;
     uint64_t pktBase = 0;
     if (active && sub == 0) {
       pktBase = handle.ReserveSingleProducer(bytes);
     }
-    pktBase = BroadcastWarp(pktBase, leader);
+    pktBase = BroadcastQuad(pktBase);
 
     if (active) writeFn(peer, sub, queueBuf, pktBase);
 
@@ -543,8 +579,8 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
 //
 // A peer that has arrived has entered this launch, so its previous kernel on its
 // stream has retired: it no longer reads the staging / recv slots we are about
-// to overwrite, and its end-of-kernel signalBuf resets have landed, so our ADDs
-// cannot be erased.
+// to overwrite. (Completion slots need no such ordering: they only grow, see
+// kArrivedStride.)
 // ---------------------------------------------------------------------------
 
 // One barrier round on a symmetric uint64[npes] `arrived` array: post `value`
@@ -564,9 +600,7 @@ __device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, in
     // One system release orders the caller's prior stores ahead of every arrival.
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
     if (active) {
-      const int32_t diff = (lane - myPe) * stride4G;
-      auto* dst = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&arrived[myPe]) +
-                                             (static_cast<uint64_t>(diff) << 32));
+      auto* dst = PeerPtr(&arrived[myPe], lane, myPe, stride4G);
       AtomicStore<ESystemScope>(dst, value);
     }
   }
@@ -586,13 +620,26 @@ __device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, in
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
 
-// Peer `peer`'s copy of a local symmetric-heap pointer: the flat-VA rank delta
-// (peer - myPe)*stride4G<<32 used by every push and pull kernel.
-template <class T>
-__device__ __forceinline__ T* PeerPtr(T* p, int peer, int myPe, uint32_t stride4G) {
-  const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
-  return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) +
-                              (static_cast<uint64_t>(diff) << 32));
+// Waits until completion slot `slot` of every sender row in my local copy of
+// `arrived` has reached `gen` (rows q >= npes, and row myPe with skipSelf, count
+// as done). Executed by ONE full wave (npes <= warpSize): lane q polls row q,
+// one load + wave vote per round. No fence: the caller syncs its block and
+// issues the acquire before reading the copied bytes.
+__device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, uint64_t gen,
+                                            int myPe, int npes, bool skipSelf) {
+  const int lane = __lane_id();
+  const bool active = lane < npes && !(skipSelf && lane == myPe);
+  const uint64_t* addr = arrived + lane * kArrivedStride + slot;
+  while (true) {
+    const uint64_t v = active ? AtomicLoad<ESystemScope>(addr) : gen;
+    if (__all(v >= gen)) break;
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
+// The uint64 push generation inside the (8B-aligned) groupCounters buffer.
+__device__ __forceinline__ uint64_t* PushGen(uint32_t* groupCounters) {
+  return reinterpret_cast<uint64_t*>(groupCounters + kPushGenIdx);
 }
 
 // Elects the last block of the grid to arrive. Called by the whole first wave
@@ -604,31 +651,20 @@ __device__ __forceinline__ bool LastBlockOut(uint32_t* groupCounters) {
   if (threadIdx.x == 0) {
     last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
   }
-  return BroadcastWarp(last, 0) != 0;
+  return BroadcastLane0(last) != 0;
 }
-
-// Loads kept in flight per thread by PullCopySegments.
-static constexpr int kPullCopyVecs = 8;
-
-// Copy unit in bytes. Fixed at 16 (b128): every collective buffer base reaching
-// the facade is >= 16B-aligned, and the facade only takes the pull path when the
-// per-segment bases are 16B-aligned too (it routes anything else to push), so the
-// vectorized body is always valid; the byte tail only mops up a final <16B of a
-// segment whose byte count is not a 16B multiple (collective-permute / array
-// all-to-all with an odd size).
-static constexpr int kPullCopyBytes = 16;
 
 // Grid-strided copy of nSeg segments of `bytes` each, segment j going from
 // srcOf(j) to dstOf(j). Peer-outer / grid-strided-inner: each segment's base is
 // hoisted and every address is base + idx*16 (shift-add, no per-element divide),
-// so the M independent b128 loads issue back-to-back for maximum memory-level
+// so the NumVecs independent b128 loads issue back-to-back for maximum memory-level
 // parallelism across the long XGMI read latency (mirrors PullReduceShard). Loads
 // are system scope (sources are peers' buffers); stores use StoreScope.
-template <int M = kPullCopyVecs, StreamScope StoreScope = ESystemScope, class SrcFn, class DstFn>
+template <int NumVecs, StreamScope StoreScope = ESystemScope, class SrcFn, class DstFn>
 __device__ __forceinline__ void PullCopySegments(int nSeg, size_t bytes, SrcFn srcOf,
                                                  DstFn dstOf) {
-  using Vec = TVecType<kPullCopyBytes>;
-  const size_t n = bytes / kPullCopyBytes;  // whole 16B units per segment
+  using Vec = TVecType<VecBytes>;
+  const size_t n = bytes / VecBytes;  // whole 16B units per segment
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
   const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -636,23 +672,23 @@ __device__ __forceinline__ void PullCopySegments(int nSeg, size_t bytes, SrcFn s
     const uint8_t* __restrict__ src = srcOf(seg);
     uint8_t* __restrict__ dst = dstOf(seg);
     size_t u = gtid;
-    for (; u + (M - 1) * gstride < n; u += M * gstride) {
-      Vec v[M];
+    for (; u + (NumVecs - 1) * gstride < n; u += NumVecs * gstride) {
+      Vec v[NumVecs];
 #pragma unroll
-      for (int m = 0; m < M; m++) {
-        v[m] = StreamLoad<ESystemScope, kPullCopyBytes>(src + (u + m * gstride) * kPullCopyBytes);
+      for (int m = 0; m < NumVecs; m++) {
+        v[m] = StreamLoad<ESystemScope>(src + (u + m * gstride) * VecBytes);
       }
 #pragma unroll
-      for (int m = 0; m < M; m++) {
-        StreamStore<StoreScope, kPullCopyBytes>(dst + (u + m * gstride) * kPullCopyBytes, v[m]);
+      for (int m = 0; m < NumVecs; m++) {
+        StreamStore<StoreScope>(dst + (u + m * gstride) * VecBytes, v[m]);
       }
     }
     for (; u < n; u += gstride) {
-      StreamStore<StoreScope, kPullCopyBytes>(
-          dst + u * kPullCopyBytes, StreamLoad<ESystemScope, kPullCopyBytes>(src + u * kPullCopyBytes));
+      StreamStore<StoreScope>(
+          dst + u * VecBytes, StreamLoad<ESystemScope>(src + u * VecBytes));
     }
     // Byte tail for the final < 16B (only non-empty when bytes % 16 != 0).
-    for (size_t i = n * kPullCopyBytes + gtid; i < bytes; i += gstride) {
+    for (size_t i = n * VecBytes + gtid; i < bytes; i += gstride) {
       StreamStore<StoreScope, 1>(dst + i, StreamLoad<ESystemScope, 1>(src + i));
     }
   }
@@ -667,13 +703,13 @@ __device__ __forceinline__ void PullCopySegments(int nSeg, size_t bytes, SrcFn s
 // NPES to divide NumVecs. srcOf(j)/dstOf(j) return peer j's chunk base (src = a
 // peer pointer, dst = a local slot), both indexed by the same unit offset.
 // Loads are system scope (sources are peers' buffers); stores use StoreScope.
-template <int NPES, int NumVecs = kPullCopyVecs, StreamScope StoreScope = ESystemScope,
+template <int NPES, int NumVecs, StreamScope StoreScope = ESystemScope,
           class SrcFn, class DstFn>
 __device__ __forceinline__ void PullCopyInterleaved(size_t bytes, SrcFn srcOf, DstFn dstOf) {
   static_assert(NumVecs % NPES == 0, "NPES must divide NumVecs");
   constexpr int V = NumVecs / NPES;  // units in flight per peer
-  using Vec = TVecType<kPullCopyBytes>;
-  const size_t n = bytes / kPullCopyBytes;  // whole 16B units per peer chunk
+  using Vec = TVecType<VecBytes>;
+  const size_t n = bytes / VecBytes;  // whole 16B units per peer chunk
   const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
   const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -697,14 +733,14 @@ __device__ __forceinline__ void PullCopyInterleaved(size_t bytes, SrcFn srcOf, D
 #pragma unroll
       for (int i = 0; i < V; i++) {
         aa[j * V + i] =
-            StreamLoad<ESystemScope, kPullCopyBytes>(src[j] + (u0 + i * gstride) * kPullCopyBytes);
+            StreamLoad<ESystemScope>(src[j] + (u0 + i * gstride) * VecBytes);
       }
     }
 #pragma unroll
     for (int j = 0; j < NPES; j++) {
 #pragma unroll
       for (int i = 0; i < V; i++) {
-        StreamStore<StoreScope, kPullCopyBytes>(dst[j] + (u0 + i * gstride) * kPullCopyBytes,
+        StreamStore<StoreScope>(dst[j] + (u0 + i * gstride) * VecBytes,
                                                 aa[j * V + i]);
       }
     }
@@ -713,16 +749,17 @@ __device__ __forceinline__ void PullCopyInterleaved(size_t bytes, SrcFn srcOf, D
   for (size_t u = u0; u < n; u += gstride) {
 #pragma unroll
     for (int j = 0; j < NPES; j++) {
-      StreamStore<StoreScope, kPullCopyBytes>(
-          dst[j] + u * kPullCopyBytes,
-          StreamLoad<ESystemScope, kPullCopyBytes>(src[j] + u * kPullCopyBytes));
+      StreamStore<StoreScope>(
+          dst[j] + u * VecBytes,
+          StreamLoad<ESystemScope>(src[j] + u * VecBytes));
     }
   }
   // Byte tail for a final < 16B per peer (empty when bytes % 16 == 0).
-  for (size_t i = n * kPullCopyBytes + gtid; i < bytes; i += gstride) {
+  for (size_t i = n * VecBytes + gtid; i < bytes; i += gstride) {
 #pragma unroll
     for (int j = 0; j < NPES; j++) {
-      StreamStore<StoreScope, 1>(dst[j] + i, StreamLoad<ESystemScope, 1>(src[j] + i));
+      StreamStore<StoreScope, 1>(dst[j] + i, 
+        StreamLoad<ESystemScope, 1>(src[j] + i));
     }
   }
 }

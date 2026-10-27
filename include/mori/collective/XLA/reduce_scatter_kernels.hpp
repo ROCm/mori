@@ -121,22 +121,24 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
 //   staging       : raw symmetric-heap pointer, npes slots of chunkElems elements
 //   output        : raw symmetric-heap pointer, chunkElems elements
-//   groupCounters : plain device buffer (>= 1 uint32), local-only arrival counter;
-//                   atomicInc wraps [0] back to 0, so it is never reset
+//   groupCounters : plain device buffer (kGroupCounterCount uint32), local-only.
+//                   [kArrivalIdx] elects the last block (atomicInc wraps it back
+//                   to 0); [kPushGenIdx] is the push generation it advances
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (GenBarrier in block 0, before Phase 1), so
 //                   back-to-back launches need no host barrier
+//   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
 //
 // Each shard is split into S slices. A sender issues S separate SDMA copies; copy
-// s bumps byte s of the receiver's packed completion counter
-// signalPtrs[kSliceSignalSlot] via an SDMA ADD64 of 1 << 8s (one copy + one atomic
-// per (sender,slice)). On the receive side EVERY block loops the S slices itself
+// s is trailed by an atomic swap storing this launch's push generation into slot s of
+// the sender's row of the receiver's `arrived` (one copy + one swap per
+// (sender,slice)). On the receive side EVERY block loops the S slices itself
 // and calls the shared per-slice reduce (detail::WaitAndReduceSlice): for slice s
-// it spins until byte s of that counter reaches npes-1 senders, then the WHOLE grid reduces slice s. Slice order matches
-// the senders' packet order, so the waits are satisfied in the order they are
-// performed and each slice's reduce overlaps the still-in-flight transfer of the
-// later slices (pipelining). The last block to finish the loop zeroes the packed
-// slice counter for the next launch.
+// it spins until all npes-1 senders' slot s reached the generation, then the WHOLE
+// grid reduces slice s. Slice order matches the senders' packet order, so the
+// waits are satisfied in the order they are performed and each slice's reduce
+// overlaps the still-in-flight transfer of the later slices (pipelining). The
+// last block to finish the loop advances the generation for the next launch.
 //
 // There is no block-to-slice mapping, so gridDim.x is unconstrained. All-reduce
 // loops the same per-slice reduce and appends its pipelined per-slice broadcast to
@@ -144,7 +146,7 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //
 // Phase 1: block 0, four consecutive lanes per peer (nWork = npes*4). sub==0
 // snapshots that peer's queue handle, then for each slice s reserves 64B, the
-// four lanes write the fused copy+atomic, and sub==0 rings that packet. One
+// four lanes write the fused copy+signal, and sub==0 rings that packet. One
 // leader per queue (peers map to distinct queues) so the commit chain cannot
 // deadlock; occupancy (rptr) is still checked, with cachedHwReadIndex kept local
 // across s and written back once if it moved. Wrap/NOP pad is gone: packets are
@@ -163,12 +165,11 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 // The pointers are taken by value, so advancing them by the slice offset is
 // local to this call and the caller passes the same bases on every slice.
 //
-// `seen` is the last packed counter value thread 0 read. It is only meaningful
-// in thread 0 and must start at 0 before slice 0; the caller keeps it across the
-// slice loop so a slice that was already complete at an earlier read needs no load.
+// `gen` is this launch's push generation: every sender's swap for this slice
+// stores it into its row of my `arrived` copy.
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __device__ __forceinline__ void WaitAndReduceSlice(
-    uint64_t* signalBuf, uint64_t& seen, uint32_t slice, int myPe, int npes,
+    const uint64_t* arrived, uint64_t gen, uint32_t slice, int myPe, int npes,
     const T* __restrict__ input, const T* __restrict__ staging,
     T* __restrict__ shardOut, size_t sOfs, size_t sCnt, size_t inputStride,
     size_t slotStride, uint32_t lstride) {
@@ -176,21 +177,12 @@ __device__ __forceinline__ void WaitAndReduceSlice(
   const uint32_t BlockDimX = blockDim.x;
   constexpr int vecSize = VecBytes / sizeof(T);
 
-  // === Phase 2: wait until this slice's byte reaches all npes-1 senders ========
-  // The packed counter lives in my local HBM (bumped by remote SDMA ADD64s of
-  // 1 << 8*slice). One thread per block polls it; every block does its own
-  // wait+acquire (read-only -> L2 hits). At npes==1 want==0, so no spin.
-  if (threadIdx.x == 0) {
-    // Self-copy is skipped, so exactly npes-1 senders bump this slice's byte.
-    const uint32_t want = static_cast<uint32_t>(npes - 1);
-    auto* addr = cco::impl::global(&signalBuf[kSliceSignalSlot]);
-    if (SliceSignalCount(seen, slice) < want) {
-      while (SliceSignalCount(seen = __hip_atomic_load(addr, __ATOMIC_RELAXED,
-                                                       __HIP_MEMORY_SCOPE_AGENT),
-                              slice) < want) {
-        __builtin_amdgcn_s_sleep(1);
-      }
-    }
+  // === Phase 2: wait until all npes-1 senders signalled this slice =============
+  // The slots live in my local HBM (written by remote SDMA swaps). The first
+  // wave of every block polls them itself (one lane per sender); self-copy is
+  // skipped, so row myPe is not waited on. At npes==1 there is nothing to wait for.
+  if (threadIdx.x < warpSize) {
+    WaitArrived(arrived, static_cast<int>(slice), gen, myPe, npes, /*skipSelf=*/true);
   }
   __syncthreads();
   // System-scope ACQUIRE (not the full seq_cst __threadfence_system): the staging
@@ -323,9 +315,7 @@ __device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
 
   const T* __restrict__ myShard = input + baseElems;
   auto srcBase = [myShard, myPe, stride4G](int pe) -> const T* {
-    int32_t diff = (pe - myPe) * static_cast<int32_t>(stride4G);
-    return reinterpret_cast<const T*>(reinterpret_cast<const uint8_t*>(myShard) +
-                                      (static_cast<uint64_t>(diff) << 32));
+    return PeerPtr(myShard, pe, myPe, stride4G);
   };
 
   // Fast path: M positions per group, all M*NPES loads issued up front.
@@ -362,22 +352,17 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
                                     uint32_t* __restrict__ groupCounters, size_t chunkElems,
                                     cco::ccoDevComm devComm, cco::ccoWindow_t heapWin,
                                     const T* __restrict__ input, T* __restrict__ staging,
-                                    uint64_t* __restrict__ barrierCtr) {
+                                    uint64_t* __restrict__ barrierCtr,
+                                    uint64_t* __restrict__ arrived) {
 
-  // gen = gen_ptr[0];
-  // __syncthreads();
-  // if (threadIdx.x == 0) {
-  //   cnt = 1 + atomicAdd(counter, 1);
-  //   if (cnt == gridDim.x) {
-  //     *counter = 0;
-  //     gen_ptr[0] = gen + 1;
-  //   }
-  // }
+  // Every block reads the launch generation before counting in; only the last
+  // block out bumps it, after every block has counted in.
+  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
     // Finishing the previous launch only proves peers SENT to us, not that they
-    // are done reducing what we sent them: gate our writes into their staging /
-    // signalBuf until every PE has entered this launch.
+    // are done reducing what we sent them: gate our writes into their staging
+    // until every PE has entered this launch.
     int stride4G = heapWin->stride4G;
     if (threadIdx.x < warpSize) {
       // Every lane reads my slot before lane myPe overwrites it (same wave).
@@ -390,44 +375,41 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
     // bijection over the npes-1 non-self peers.
     StartSdmaScatter<sizeof(T)>(
-        devComm.sdma, npes, logS, [=](int) { return chunkElems; },
-        [=](int peer) { return peer != myPe; },
-        [=](int peer) -> const uint8_t* {
-          return reinterpret_cast<const uint8_t*>(input + peer * chunkElems);
-        },
-        [=](int peer) -> uint8_t* {
+        devComm.sdma, npes, logS,
+        [=](int peer) {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
-          int32_t diff = (peer - myPe)*stride4G;
-          return reinterpret_cast<uint8_t*>(staging + slot * chunkElems) + 
-             (static_cast<uint64_t>(diff)<<32);
-        });
+          return ScatterPeer{
+              peer != myPe, chunkElems,
+              reinterpret_cast<const uint8_t*>(input + peer * chunkElems),
+              PeerPtr(reinterpret_cast<uint8_t*>(staging + slot * chunkElems), peer, myPe,
+                      stride4G),
+              PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
+        },
+        pushGen);
   }
   
   // Phase 2-3: walk all S slices in the order the senders queued them, reducing
-  // each into this PE's shard-sized output buffer. Nothing happens per slice --
-  // the packed counter is cleared once below, after every slice is done.
+  // each into this PE's shard-sized output buffer.
   constexpr int vecSize = VecBytes / sizeof(T);
   const uint32_t S = 1u << logS;
   // vecSize-aligned slice length; the last slice absorbs the remainder.
   const size_t sliceLen = ((chunkElems >> logS) / vecSize) * vecSize;
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
-  uint64_t seen = 0;
   for (uint32_t s = 0; s < S; s++) {
     const size_t sOfs = FORCE_SGPR(s * sliceLen);
     const size_t sCnt = FORCE_SGPR((s == S - 1) ? (chunkElems - sOfs) : sliceLen);
-    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(devComm.sdma.signalBuf, seen, s, myPe,
+    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(arrived, pushGen, s, myPe,
                                                  npes, input, staging, output, sOfs, sCnt,
                                                  chunkElems, chunkElems, lstride);
   }
 
-  // === Reset: the last block of the grid zeroes the packed slice counter =======
-  // A block only reaches here after passing the Phase-2 wait on EVERY slice, so
-  // when the last block counts in every sender's add has landed and clearing the
-  // counter cannot drop an unseen signal. atomicInc wraps the arrival counter
-  // back to 0 on the last block, so it needs no reset of its own.
+  // === Gen bump: the last block of the grid advances the push generation =======
+  // Every block read pushGen at entry, before counting in here, so no block of
+  // this launch can see the new value. atomicInc wraps the arrival counter back
+  // to 0 on the last block, so it needs no reset of its own.
   if (threadIdx.x == 0 &&
       atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
-    AtomicStore<ESystemScope>(&devComm.sdma.signalBuf[kSliceSignalSlot], 0UL);
+    AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
   }
 }
 
@@ -486,7 +468,7 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
     if (threadIdx.x == 0) {
       last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
     }
-    if (BroadcastWarp(last, 0)) {
+    if (BroadcastLane0(last)) {
       GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
     }
   }

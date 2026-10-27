@@ -49,20 +49,23 @@ namespace collective {
 //   chunkBytes : size in bytes of each per-peer chunk.
 //
 // Phase 1: SDMA scatters each chunk into every peer's recv slot (self included),
-// each copy trailed by an ADD64 of 1 into the receiver's signalPtrs[0] counter.
-// Phase 2: thread 0 waits until the counter reaches npes (self-copy included),
-// then an acquire fence makes the peer SDMA writes visible. No Phase 3. Finally
-// thread 0 resets the counter for the next launch.
+// each copy trailed by an atomic swap storing the push generation into slot 0 of my row
+// of the receiver's `arrived`. Phase 2: the first wave waits until every row
+// (self included) reached the generation, then an acquire fence makes the peer
+// SDMA writes visible. No Phase 3. Finally thread 0 advances the generation.
 //
 // blockDim.x must be >= npes for the fast-path packet build; launch <<<1, 256>>>
 // with npes <= 8 (SDMA fast path).
 __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __restrict__ pairs,
                                    size_t chunkBytes, cco::ccoDevComm devComm,
                                    cco::ccoWindow_t heapWin,
-                                   uint64_t* __restrict__ barrierCtr) {
+                                   uint64_t* __restrict__ barrierCtr,
+                                   uint32_t* __restrict__ groupCounters,
+                                   uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
+  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
   // A peer finishing its previous launch only proves our chunk reached it; gate
-  // our writes into its recv slot / signalBuf[0] until every PE entered this one.
+  // our writes into its recv slot until every PE entered this one.
   if (threadIdx.x < warpSize) {
     // Every lane reads my slot before lane myPe overwrites it (same wave).
     const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
@@ -80,42 +83,27 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   // arbitrary per-peer local pointer (SDMA reads local VA directly).
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(pairs[myPe].dest);
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0, [=](int) { return chunkBytes; },
-      [](int) { return true; },
-      [=](int peer) -> const uint8_t* {
-        return reinterpret_cast<const uint8_t*>(pairs[peer].source);
+      devComm.sdma, npes, /*logS=*/0,
+      [=](int peer) {
+        return ScatterPeer{true, chunkBytes,
+                           reinterpret_cast<const uint8_t*>(pairs[peer].source),
+                           PeerPtr(localDst, peer, myPe, stride4G),
+                           PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
       },
-      [=](int peer) -> uint8_t* {
-        int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
-        return localDst + (static_cast<uint64_t>(diff) << 32);
-      });
+      pushGen);
 
-  uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
-
-  // === Phase 2: wait until the counter reaches all npes senders. ===============
-  if (threadIdx.x == 0) {
-    const uint32_t want = static_cast<uint32_t>(npes);  // self-copy included
-    // 32-bit ADD into the low dword -> poll 32 bits of the single counter.
-    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
-    while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
-      __builtin_amdgcn_s_sleep(1);
-    }
+  // === Phase 2: wait until all npes senders (self-copy included) signalled. ===
+  if (threadIdx.x < warpSize) {
+    WaitArrived(arrived, /*slot=*/0, pushGen, myPe, npes, /*skipSelf=*/false);
   }
   __syncthreads();
   // System-scope ACQUIRE: recv slots were written by peers' SDMA over XGMI.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 
-  // No Phase 3: recv buffers already fully written by SDMA. Reset counter for reuse.
-  // SYSTEM scope (sc0 sc1: write-through past L2) because peers ADD into this slot
-  // by SDMA straight into HBM -- a plain store would leave a dirty line that could
-  // evict on top of a later ADD and swallow it. That is also why no release fence
-  // follows: there is nothing left in L2 to write back.
-  //
-  // Clearing at kernel END is safe without a host barrier: a peer's NEXT launch
-  // only ADDs here after passing its entry GenBarrier, which needs us to have
-  // entered that launch too, i.e. after this kernel has retired.
+  // No Phase 3: recv buffers already fully written by SDMA. The block read
+  // pushGen at entry, so it can advance the generation for the next launch now.
   if (threadIdx.x == 0) {
-    AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
+    AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
   }
 }
 
@@ -133,7 +121,7 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
 // peer at a time. Synchronization is the two GenBarrier rounds of
 // AllGatherPullKernelN: entry (peers' send slots are ready) and exit by the last
 // block (peers are done reading my send slots).
-template <int NPES>
+template <int NPES, int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 AllToAllPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
                     const AddressPair* __restrict__ pairs, size_t chunkBytes,
@@ -151,7 +139,7 @@ AllToAllPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
   if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, npes, stride4G);
   __syncthreads();  // dsts visible to every thread before the copy
 
-  PullCopyInterleaved<NPES>(
+  PullCopyInterleaved<NPES, NumVecs>(
       chunkBytes,
       [=](int j) { return PeerPtr(src, j, myPe, stride4G); },  // peer j's send slot for me
       [&](int j) { return dsts[j]; });                         // my recv slot for sender j
