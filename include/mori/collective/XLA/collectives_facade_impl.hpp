@@ -347,8 +347,7 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
   constexpr int kThreads = 64;
   // Single block: SDMA pushes my shard to every peer's output[myPe] slot (+ self).
   AllGatherPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, input, output, chunkBytes,
-                                     devComm_, state_.heapWin, barrierCtr_,
-                                     state_.groupCounters, arrived_);
+                                     devComm_, state_.heapWin, barrierCtr_, arrived_);
   return hipGetLastError();
 }
 
@@ -387,7 +386,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
   // Single block: SDMA pushes each send slot p to peer p's recv slot (+ self).
   AllToAllPushKernel<<<1, kThreads, 0, stream>>>(myPe_, nPes_, 
                     state_.pinnedPairs, chunkBytes, devComm_,
-                    state_.heapWin, barrierCtr_, state_.groupCounters, arrived_);
+                    state_.heapWin, barrierCtr_, arrived_);
   return hipGetLastError();
 }
 

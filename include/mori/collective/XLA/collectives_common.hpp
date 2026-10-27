@@ -70,17 +70,11 @@ static constexpr size_t kArrivedBytes = kRSPushMaxPeers * kArrivedStride * sizeo
 // groupCounters layout (local uint32 buffer): [0] grid-wide last-block arrival
 // counter (reduce-scatter's gen bump and the pull kernels' exit barrier elect the
 // tail block through it), then all-reduce's two broadcast release counters, then
-// all-reduce's per-launch b=1 release target (elects the tail owner), then the
-// uint64 push-collective generation (two dwords, see PushGen): the number of push
-// launches (all-gather, all-to-all, reduce-scatter, all-reduce) this device has
-// completed. Every PE runs the same sequence of push launches, so launch n
-// signals gen = n on every PE.
+// all-reduce's per-launch b=1 release target (elects the tail owner).
 static constexpr int kArrivalIdx = 0;
 static constexpr int kBcastFlagIdx = kArrivalIdx + 1;
 static constexpr int kBcastTargetIdx = kBcastFlagIdx + 2;
-static constexpr int kPushGenIdx = kBcastTargetIdx + 1;
-static constexpr int kGroupCounterCount = kPushGenIdx + 2;
-static_assert(kPushGenIdx % 2 == 0, "push generation must be 8B-aligned in groupCounters");
+static constexpr int kGroupCounterCount = kBcastTargetIdx + 1;
 
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
 struct AddressPair {
@@ -337,7 +331,7 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
       return true;
     }
     // Only read hardware register if the queue is full based on cached index
-    cachedHwReadIndex = __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    cachedHwReadIndex = AtomicLoad<ESystemScope>(rptr);
     __atomic_signal_fence(__ATOMIC_SEQ_CST);
     return (uptoIndex - cachedHwReadIndex) < qSize;
   }
@@ -358,14 +352,13 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   __device__ __forceinline__ uint64_t ReserveSingleProducer(const size_t size_in_bytes) {
     constexpr uint64_t qSize = cco::CCO_SDMA_QUEUE_SIZE;
     uint64_t base =
-        __hip_atomic_fetch_add(cachedWptr, size_in_bytes, __ATOMIC_RELAXED,
+        __hip_atomic_fetch_add(cco::impl::global(cachedWptr), size_in_bytes, __ATOMIC_RELAXED,
                                __HIP_MEMORY_SCOPE_AGENT);
     const uint64_t end = base + size_in_bytes;
     if (end - cachedHwReadIndex > qSize) {
       int64_t retries = 0;
       do {
-        cachedHwReadIndex =
-            __hip_atomic_load(rptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        cachedHwReadIndex = AtomicLoad<ESystemScope>(rptr);
         if constexpr (cco::CCO_SDMA_BREAK_ON_RETRIES) {
           if (retries++ == cco::CCO_SDMA_MAX_RETRIES) __builtin_trap();
         }
@@ -489,8 +482,7 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
     }
 
     if (active && sub == 0 && handle.cachedHwReadIndex != hint0) {
-      __hip_atomic_store(&shared->cachedHwReadIndex, handle.cachedHwReadIndex,
-                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, handle.cachedHwReadIndex);
     }
   }
 }
@@ -554,8 +546,7 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
     }
 
     if (active && sub == 0 && handle.cachedHwReadIndex != hint0) {
-      __hip_atomic_store(&shared->cachedHwReadIndex, handle.cachedHwReadIndex,
-                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+      AtomicStore<EAgentScope>(&shared->cachedHwReadIndex, handle.cachedHwReadIndex);
     }
   }
 }
@@ -637,9 +628,22 @@ __device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, u
   }
 }
 
-// The uint64 push generation inside the (8B-aligned) groupCounters buffer.
-__device__ __forceinline__ uint64_t* PushGen(uint32_t* groupCounters) {
-  return reinterpret_cast<uint64_t*>(groupCounters + kPushGenIdx);
+// Push-collective launch generation, derived from the gen-barrier flags like the
+// pull kernels' gen: a push launch enters with gen+1 (odd, posted by block 0)
+// and its tail stores gen+2 into my own slot (AdvancePushGen) once no block of
+// the launch can still read it. My slot therefore holds gen or gen+1 while the
+// launch runs, so every block reads the same value; the launch signals gen+2.
+// Every PE runs the same collective sequence, so every PE signals the same value.
+__device__ __forceinline__ uint64_t LoadPushGen(const uint64_t* barrierCtr, int myPe) {
+  return (AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL) + 2;
+}
+
+// Ends a push launch: my slot moves from pushGen-1 to pushGen. Only my own copy:
+// peers' copies keep pushGen-1 until my next entry post, and no barrier round
+// waits for a value between the two.
+__device__ __forceinline__ void AdvancePushGen(uint64_t* barrierCtr, int myPe,
+                                               uint64_t pushGen) {
+  AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
 }
 
 // Elects the last block of the grid to arrive. Called by the whole first wave

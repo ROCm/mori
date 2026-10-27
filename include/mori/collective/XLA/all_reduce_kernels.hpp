@@ -60,7 +60,7 @@ namespace collective {
 //                   by the host. [kBcastFlagIdx + b]: broadcast b's release
 //                   counter (every block counts in once per launch, never
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
-//                   which elects the tail owner. [kPushGenIdx]: push generation.
+//                   which elects the tail owner.
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (GenBarrier in block 0, before Phase 1)
 //   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
@@ -116,8 +116,8 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     return min(totalElems - ofs, strideElems);
   };
   // Every block reads the launch generation before counting in at Phase 4; only
-  // the tail owner (the last b=1 count) bumps it.
-  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
+  // the tail owner (the last b=1 count) advances it.
+  const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   auto bcastFlag = [=](uint32_t b) { return &groupCounters[kBcastFlagIdx + b]; };
 
   constexpr int vecSize = VecBytes / sizeof(T);
@@ -144,11 +144,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // Gate on every PE entering this launch: staging is shared with the other
     // push collectives, so a peer may finish before my previous launch is done
     // with it. Lane 0 enters after its stores above, in program order.
-    if (threadIdx.x < warpSize) {
-      // Every lane reads my slot before lane myPe overwrites it (same wave).
-      const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-      GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
-    }
+    if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -261,9 +257,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     if (S > 1) {
       WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
     }
-    if (threadIdx.x == 0) {
-      AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
-    }
+    if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
   }
 }
 
