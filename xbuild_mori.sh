@@ -38,7 +38,7 @@ if [[ ${full} -eq 1 ]]; then
 fi
 
 
-make VERBOSE=1 -j 2>&1 | tee ../yyybuild.log
+make -j 2>&1 | tee ../yyybuild.log
 
 rm -f $SCRIPT_DIR/python/mori/*.so
 find src -name "*.so" -exec cp {} $SCRIPT_DIR/python/mori \;

@@ -52,6 +52,8 @@ namespace collective {
 //   cnt      : local uint64[2*kRSPushMaxPeers], zeroed once, thread 0 only.
 //              cnt[p] counts my permutes sending to p, cnt[kRSPushMaxPeers+p]
 //              my permutes receiving from p.
+//   arrived  : symmetric-heap SDMA completion slots (see kArrivedStride), global
+//              PE rows; this kernel uses column kPermuteArrived only.
 //
 // Phase 0: pairwise handshake, no global barrier -- only the PEs of a send/recv
 // pair synchronize, so PEs that do not launch this kernel are never waited on.
@@ -61,10 +63,16 @@ namespace collective {
 // waits until its destination's slot reaches its own count k. The slot only
 // grows, so nothing is consumed or cleared.
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
-// dstPe == myPe), trailed by an ADD64 of 1 into the receiver's signalPtrs[0].
-// Phase 2: if srcPe >= 0, thread 0 waits until the counter reaches 1, then an
-// acquire fence makes the peer SDMA write visible. Finally thread 0 resets the
-// counter for the next launch.
+// dstPe == myPe), trailed by an atomic swap storing my send count k into my row's
+// kPermuteArrived slot of the receiver's `arrived`.
+// Phase 2: if srcPe >= 0, thread 0 waits until srcPe's slot reaches my receive
+// count k, then an acquire fence makes the peer SDMA write visible. The slot only
+// grows, so nothing is reset.
+//
+// A self-permute (dstPe == srcPe == myPe) counts in cnt[myPe] and
+// cnt[kRSPushMaxPeers+myPe] too, so the self send and self receive stay paired;
+// the pull kernel never counts self-permutes, so mixing push and pull keeps them
+// in step.
 //
 // With dstPe == -1 no peer is active, so Phase 1 issues no packets.
 //
@@ -75,32 +83,36 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             cco::ccoDevComm devComm,
                                             cco::ccoWindow_t heapWin,
                                             uint64_t* __restrict__ ready,
-                                            uint64_t* __restrict__ cnt) {
+                                            uint64_t* __restrict__ cnt,
+                                            uint64_t* __restrict__ arrived) {
   const int myLsaRank = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
+  __shared__ uint64_t sendK, recvK;
   // dstPe reaching count k proves it has entered this launch, so by its stream
-  // order its previous kernel (of any collective) is done with recvBuf and has
-  // cleared signalBuf[0]. Without it, my copy could overwrite recvBuf before
-  // dstPe consumed it, or my ADD could land before its end-of-launch reset and be
-  // lost. Every PE posts before waiting, so a ring cannot deadlock. A self-send
-  // needs no handshake: stream order covers it.
+  // order its previous kernel (of any collective) is done with recvBuf. Without
+  // it, my copy could overwrite recvBuf before dstPe consumed it. Every PE posts
+  // before waiting, so a ring cannot deadlock. A self-send needs no handshake:
+  // stream order covers it.
   //
   // No fences: the post only says "I have entered", and everything before it in
   // my stream is ordered by the kernel boundary; after the wait nothing reads
   // data dstPe wrote. `>=` cannot miss: dstPe posts k+1 for me only after my
   // k-th copy lands, which needs this wait to pass first.
   if (threadIdx.x == 0) {
-    if (srcPe >= 0 && srcPe != myLsaRank) {
+    if (srcPe >= 0) {
       const uint64_t k = ++cnt[kRSPushMaxPeers + srcPe];
-      const int32_t diff = (srcPe - myLsaRank) * static_cast<int32_t>(stride4G);
-      auto* tok = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&ready[myLsaRank]) +
-                                              (static_cast<uint64_t>(diff) << 32));
-      AtomicStore<ESystemScope>(tok, k);
+      recvK = k;
+      if (srcPe != myLsaRank) {
+        AtomicStore<ESystemScope>(PeerPtr(&ready[myLsaRank], srcPe, myLsaRank, stride4G), k);
+      }
     }
-    if (dstPe >= 0 && dstPe != myLsaRank) {
+    if (dstPe >= 0) {
       const uint64_t k = ++cnt[dstPe];
-      while (AtomicLoad<ESystemScope>(&ready[dstPe]) < k) {
-        __builtin_amdgcn_s_sleep(1);
+      sendK = k;
+      if (dstPe != myLsaRank) {
+        while (AtomicLoad<ESystemScope>(&ready[dstPe]) < k) {
+          __builtin_amdgcn_s_sleep(1);
+        }
       }
     }
   }
@@ -113,39 +125,26 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip.
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0, [=](int) { return numBytes; },
-      [=](int peer) { return peer == dstPe; },
-      [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(sendBuf); },
-      [=](int peer) -> uint8_t* {
-        int32_t diff = (peer - myLsaRank) * static_cast<int32_t>(stride4G);
-        return localDst + (static_cast<uint64_t>(diff) << 32);
-      });
+      devComm.sdma, npes, /*logS=*/0,
+      [=](int peer) {
+        return ScatterPeer{
+            peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
+            PeerPtr(localDst, peer, myLsaRank, stride4G),
+            PeerPtr(arrived + myLsaRank * kArrivedStride + kPermuteArrived, peer, myLsaRank,
+                    stride4G)};
+      },
+      sendK);
 
-  uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
-  const uint32_t want = (srcPe >= 0) ? 1u : 0u;
-
-  if (threadIdx.x == 0 && want) {
-    auto* addr = reinterpret_cast<uint32_t*>(&signalBuf[0]);  // S=1
-    while (AtomicLoad<EAgentScope>(addr) < want) {
-      __builtin_amdgcn_s_sleep(1);
+  if (srcPe >= 0) {
+    if (threadIdx.x == 0) {
+      const uint64_t* addr = arrived + srcPe * kArrivedStride + kPermuteArrived;
+      while (AtomicLoad<ESystemScope>(addr) < recvK) {
+        __builtin_amdgcn_s_sleep(1);
+      }
     }
-  }
-  __syncthreads();
-  if (want) {
+    __syncthreads();
     // System-scope ACQUIRE: recvBuf was written by srcPe's SDMA over XGMI.
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
-  }
-
-  // Reset the counter for reuse. SYSTEM scope (sc0 sc1: write-through past L2)
-  // because srcPe ADDs into this slot by SDMA straight into HBM -- a plain store
-  // would leave a dirty line that could evict on top of a later ADD and swallow
-  // it. That is also why no release fence follows: there is nothing left in L2 to
-  // write back.
-  //
-  // Clearing at kernel END is safe: srcPe's next ADD only follows my next
-  // post to it, which I make only once my next launch has started.
-  if (threadIdx.x == 0) {
-    AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
   }
 }
 
@@ -173,6 +172,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
 // counted in, writes it, so no block of this launch can see the new value. Every
 // PE posts before it waits, so rings and 2-cycles cannot deadlock (the grid is
 // co-resident). dstPe == srcPe == myPe is a plain local copy without handshake.
+template <int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t heapWin,
                             const void* __restrict__ sendBuf, void* __restrict__ recvBuf,
@@ -206,7 +206,7 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
     const auto* src = PeerPtr(static_cast<const uint8_t*>(sendBuf), srcPe, me, stride4G);
     auto* dst = static_cast<uint8_t*>(recvBuf);
     if (src != dst) {
-      PullCopySegments(1, numBytes, [=](int) { return src; }, [=](int) { return dst; });
+      PullCopySegments<NumVecs>(1, numBytes, [=](int) { return src; }, [=](int) { return dst; });
     }
   }
 

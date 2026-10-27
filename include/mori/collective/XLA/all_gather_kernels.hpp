@@ -43,11 +43,11 @@ namespace collective {
 //   output : raw symmetric-heap pointer, npes*chunkBytes bytes (all shards)
 //
 // Phase 1: SDMA scatters my shard into every peer's output[myPe] slot (self
-// included), each copy trailed by an ADD64 of 1 into the receiver's
-// signalPtrs[0] counter. Phase 2: thread 0 waits until the counter reaches npes
-// (self-copy included), then an acquire fence makes the peer SDMA writes to
-// output visible. No Phase 3 -- output is already fully written by SDMA. Finally
-// thread 0 resets the counter for the next launch.
+// included), each copy trailed by an atomic swap storing the push generation into slot
+// 0 of my row of the receiver's `arrived`. Phase 2: the first wave waits until
+// every row (self included) reached the generation, then an acquire fence makes
+// the peer SDMA writes to output visible. No Phase 3 -- output is already fully
+// written by SDMA. Finally thread 0 advances the generation.
 //
 // blockDim.x must be >= npes for block 0's fast-path packet build; launch with
 // npes <= 8 (SDMA fast path) and a comfortable blockDim (256).
@@ -55,10 +55,13 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
                                     void* __restrict__ output, size_t chunkBytes,
                                     cco::ccoDevComm devComm,
                                     cco::ccoWindow_t heapWin,
-                                    uint64_t* __restrict__ barrierCtr) {
+                                    uint64_t* __restrict__ barrierCtr,
+                                    uint32_t* __restrict__ groupCounters,
+                                    uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
+  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
   // A peer finishing its previous launch only proves our shard reached it; gate
-  // our writes into its output / signalBuf[0] until every PE entered this one.
+  // our writes into its output until every PE entered this one.
   if (threadIdx.x < warpSize) {
     // Every lane reads my slot before lane myPe overwrites it (same wave).
     const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
@@ -75,41 +78,27 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // our single shard (same for all peers).
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(myPe) * chunkBytes;
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0, [=](int) { return chunkBytes; },
-      [](int) { return true; },
-      [=](int) -> const uint8_t* { return reinterpret_cast<const uint8_t*>(input); },
-      [=](int peer) -> uint8_t* {
-        int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
-        return localDst + (static_cast<uint64_t>(diff) << 32);
-      });
+      devComm.sdma, npes, /*logS=*/0,
+      [=](int peer) {
+        return ScatterPeer{true, chunkBytes, reinterpret_cast<const uint8_t*>(input),
+                           PeerPtr(localDst, peer, myPe, stride4G),
+                           PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
+      },
+      pushGen);
 
-  uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
-
-  // === Phase 2: wait until the counter reaches all npes senders. ===============
-  if (threadIdx.x == 0) {
-    const uint32_t want = static_cast<uint32_t>(npes);  // self-copy included
-    // 32-bit ADD into the low dword -> poll 32 bits of the single counter.
-    auto* addr = cco::impl::global(reinterpret_cast<uint32_t*>(&signalBuf[0]));  // S=1
-    while (__hip_atomic_load(addr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < want) {
-      __builtin_amdgcn_s_sleep(1);
-    }
+  // === Phase 2: wait until all npes senders (self-copy included) signalled. ===
+  if (threadIdx.x < warpSize) {
+    WaitArrived(arrived, /*slot=*/0, pushGen, myPe, npes, /*skipSelf=*/false);
   }
   __syncthreads();
   // System-scope ACQUIRE: output was written by peers' SDMA over XGMI, so
   // invalidate against another device's writes before any reader trusts output.
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 
-  // No Phase 3: output already fully written by SDMA. Reset the counter for reuse.
-  // SYSTEM scope (sc0 sc1: write-through past L2) because peers ADD into this slot
-  // by SDMA straight into HBM -- a plain store would leave a dirty line that could
-  // evict on top of a later ADD and swallow it. That is also why no release fence
-  // follows: there is nothing left in L2 to write back.
-  //
-  // Clearing at kernel END is safe without a host barrier: a peer's NEXT launch
-  // only ADDs here after passing its entry GenBarrier, which needs us to have
-  // entered that launch too, i.e. after this kernel has retired.
+  // No Phase 3: output already fully written by SDMA. The block read pushGen at
+  // entry, so it can advance the generation for the next launch now.
   if (threadIdx.x == 0) {
-    AtomicStore<ESystemScope>(&signalBuf[0], 0UL);
+    AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
   }
 }
 
@@ -130,7 +119,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
 // block so "kernel done" means "input reusable". The self shard is just peer myPe
 // (a local copy), so there is no in-place skip -- an in-place gather would
 // redundantly self-copy output[myPe], which is harmless.
-template <int NPES>
+template <int NPES, int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 AllGatherPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
                      const void* __restrict__ input, void* __restrict__ output,
@@ -145,7 +134,7 @@ AllGatherPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
   const auto* in = static_cast<const uint8_t*>(input);
   auto* out = static_cast<uint8_t*>(output);
   // System scope: the caller may hand output to a remote reader after the kernel.
-  PullCopyInterleaved<NPES>(
+  PullCopyInterleaved<NPES, NumVecs>(
       chunkBytes, [=](int j) { return PeerPtr(in, j, myPe, stride4G); },
       [=](int j) { return out + static_cast<size_t>(j) * chunkBytes; });
 

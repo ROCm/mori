@@ -60,14 +60,15 @@ namespace collective {
 //                   by the host. [kBcastFlagIdx + b]: broadcast b's release
 //                   counter (every block counts in once per launch, never
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
-//                   which elects the tail owner.
+//                   which elects the tail owner. [kPushGenIdx]: push generation.
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (GenBarrier in block 0, before Phase 1)
+//   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
 //
 // Phase 1-3 are the reduce-scatter push algorithm: block 0 SDMA-scatters each
 // peer's source slice into that peer's staging slot, then every block loops the S
 // slices itself and calls the shared per-slice reduce
-// (detail::WaitAndReduceSlice), which waits on that slice's completion counter and
+// (detail::WaitAndReduceSlice), which waits on that slice's completion slots and
 // reduces it with the whole grid into output[myPe] (= myShard).
 //
 // Phase 4 (two-copy broadcast) is the rest of that same loop iteration. Both
@@ -78,10 +79,9 @@ namespace collective {
 // S-1) it does a system fence (publishing its reduce stores) and adds 1 to
 // counter b=0 (resp. b=1); the add that brings the counter to its target
 // releases the copy -- no election, packet build or doorbell on the critical
-// path. Slices 0..S-3 need no count. Each copy trails an
-// ADD64(1 << 8b) into byte b of the receiver's DEDICATED packed broadcast counter
-// signalPtrs[kBcastSlot] -- distinct from the packed reduce-scatter slice
-// counter, so no ADD can be miscounted by any other wait.
+// path. Slices 0..S-3 need no count. Each copy trails an atomic swap storing the push
+// generation into the sender's broadcast slot kBcastArrived + b of the
+// receiver's `arrived` -- distinct from the scatter slice slots.
 //
 // Why not one broadcast per slice: all packets to a peer share one SDMA queue
 // (one engine per peer pair), so no broadcast can start before the S scatter
@@ -89,16 +89,15 @@ namespace collective {
 // Per-slice copies only added packets; the scatter and broadcast also share the
 // same link direction, so they could not overlap usefully anyway.
 //
-// The release counters live in groupCounters, not signalBuf: they are local
-// atomics, and sharing a uint64 with a counter that peers' SDMA ADD64s rewrite
-// in full could lose an update. Only this PE's own SDMA engine polls them.
+// The release counters live in groupCounters: they are local atomics, and only
+// this PE's own SDMA engine polls them.
 // They are never reset: the queue polls for == (value Phase 1 read + gridDim.x),
 // exact modulo 2^32. A reset could not be ordered after the engine's last poll
 // sample, and an equality poll that misses its value hangs. The counter cannot
 // overshoot its target while polled: the next launch's adds need peers' next
 // scatters, which follow the entry barrier, which follows this launch's b=1
 // (and, in queue order, b=0) landing at every peer.
-// kBcastSlot / kBcastFlagIdx / kBcastTargetIdx are defined in
+// kBcastArrived / kBcastFlagIdx / kBcastTargetIdx are defined in
 // collectives_common.hpp.
 
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
@@ -107,7 +106,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                     T* __restrict__ output, uint32_t* __restrict__ groupCounters,
                     size_t strideElems, size_t totalElems, cco::ccoDevComm devComm,
                     T* __restrict__ staging, cco::ccoWindow_t heapWin,
-                    uint64_t* __restrict__ barrierCtr) {
+                    uint64_t* __restrict__ barrierCtr, uint64_t* __restrict__ arrived) {
 
   // 16B-aligned uniform shard STRIDE; the last active PE's shard is shorter so
   // the shards tile [0, totalElems) exactly (see allReduceImpl). shardLen(p) is
@@ -116,7 +115,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     const size_t ofs = p * strideElems;
     return min(totalElems - ofs, strideElems);
   };
-  uint64_t* __restrict__ signalBuf = devComm.sdma.signalBuf;
+  // Every block reads the launch generation before counting in at Phase 4; only
+  // the tail owner (the last b=1 count) bumps it.
+  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
   auto bcastFlag = [=](uint32_t b) { return &groupCounters[kBcastFlagIdx + b]; };
 
   constexpr int vecSize = VecBytes / sizeof(T);
@@ -138,14 +139,15 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       AtomicStore<EAgentScope>(&groupCounters[kBcastTargetIdx], flagEpoch[1]);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     }
-    // Gate on every PE entering this launch: staging/signalBuf are shared with
-    // the other push collectives, and the slice counter is cleared only after
-    // the b=1 release, so a peer may finish before my previous launch is done
-    // with them. Lane 0 enters after its stores above, in program order.
+
+    uint32_t stride4G = heapWin->stride4G;
+    // Gate on every PE entering this launch: staging is shared with the other
+    // push collectives, so a peer may finish before my previous launch is done
+    // with it. Lane 0 enters after its stores above, in program order.
     if (threadIdx.x < warpSize) {
       // Every lane reads my slot before lane myPe overwrites it (same wave).
       const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-      GenBarrier(barrierCtr, gen + 2, myPe, npes, heapWin->stride4G);
+      GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
     }
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
@@ -157,17 +159,15 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // staging slots are that size). 
     StartSdmaScatter<sizeof(T)>(
         devComm.sdma, npes, logS,
-        [=](int peer) { return shardLen(peer); },
-        [=](int peer) { return peer != myPe; },
-        [=](int peer) -> const uint8_t* {
-          return reinterpret_cast<const uint8_t*>(input + peer * strideElems);
-        },
-        [=](int peer) -> uint8_t* {
+        [=](int peer) {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
-          int32_t diff = (peer - myPe)*static_cast<int32_t>(heapWin->stride4G);
-          return reinterpret_cast<uint8_t*>(staging + slot * shardLen(peer)) +
-             (static_cast<uint64_t>(diff)<<32);
-        });
+          const size_t len = shardLen(peer);
+          return ScatterPeer{
+              peer != myPe, len, reinterpret_cast<const uint8_t*>(input + peer * strideElems),
+              PeerPtr(reinterpret_cast<uint8_t*>(staging + slot * len), peer, myPe, stride4G),
+              PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
+        },
+        pushGen);
 
     // Pre-post both broadcasts behind the scatter, each parked on its counter
     // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole
@@ -177,34 +177,33 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     const uint32_t epoch0 = flagEpoch[0], epoch1 = flagEpoch[1];
     SdmaPostPerPeer(devComm.sdma, npes, myPe, hasB0 ? 4 : 2,
         [=](int peer, int sub, uint32_t* q, uint64_t base) {
-          HSAuint64* sig = devComm.sdma.peerSignalPtrs[peer] + kBcastSlot;
+          const uint64_t* bcastSlot = PeerPtr(arrived + myPe * kArrivedStride + kBcastArrived,
+                                              peer, myPe, stride4G);
           
           // My reduced shard lives in output slot myPe (at the uniform stride offset).
           T* __restrict__ myShard = output + myPe * strideElems;
           const size_t myElems = shardLen(myPe),
                        sliceLen = ((myElems >> logS) / vecSize) * vecSize,
                        lastOfs = (S - 1) * sliceLen; 
-          int32_t diff = (peer - myPe) * static_cast<int32_t>(heapWin->stride4G);
-          auto *peerDst = (uint8_t*)myShard + (static_cast<uint64_t>(diff) << 32);
+          auto* peerDst = PeerPtr(reinterpret_cast<uint8_t*>(myShard), peer, myPe, stride4G);
           if (hasB0) {
             WriteGatedBroadcast(sub, q, base, myShard, peerDst,
-                          lastOfs * sizeof(T), sig, SliceSignalInc(0),
+                          lastOfs * sizeof(T), bcastSlot, pushGen,
                           bcastFlag(0), epoch0);
-            base += 2 * kSDMACopyAtomicPktSize;
+            base += 2 * kSDMACopySignalPktSize;
           }
           WriteGatedBroadcast(sub, q, base, myShard + lastOfs,
                               peerDst + lastOfs * sizeof(T),
                              (myElems - lastOfs) * sizeof(T),
-                              sig, SliceSignalInc(1), bcastFlag(1), epoch1);
+                              bcastSlot + 1, pushGen, bcastFlag(1), epoch1);
         });
   }
 
-  // Whether this block's count released b=1, so it owes the slice-counter reset
-  // and the completion wait for BOTH broadcasts. Only meaningful in thread 0.
+  // Whether this block's count released b=1, so it owes the generation bump and
+  // the completion wait for BOTH broadcasts. Only meaningful in thread 0.
   bool ownsTail = false;
 
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
-  uint64_t seen = 0;
 
   for (uint32_t s = 0; s < S; s++) {
     // My reduced shard lives in output slot myPe (at the uniform stride offset).
@@ -218,7 +217,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // === Phase 2-3: shared per-slice front (completion wait + acquire +
     // grid-strided reduce) into MY shard slot within the full output. ===
     // input base uses the uniform stride; staging slots use my own length.
-    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(signalBuf, seen, s, myPe, npes, input,
+    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(arrived, pushGen, s, myPe, npes, input,
                                                  staging, myShard, sOfs, sCnt, strideElems,
                                                  myElems, lstride);
 
@@ -246,36 +245,25 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     }
   } // for s
 
-  // === Tail: reset the slice counter, collect every peer's broadcasts =========
-  // The block whose count completed b=1 is the last one out of every slice wait,
-  // so no add to the packed slice counter is still unseen and it may clear it.
-  // That need not precede the b=1 release: peers only ADD into it again from
-  // their next launch's scatter, behind the entry GenBarrier, which needs my next
-  // launch to have started.
+  // === Tail: collect every peer's broadcasts, advance the generation ==========
+  // The block whose count completed b=1 is the last one to count in, and every
+  // block read pushGen at entry, so it may bump the generation: no block of this
+  // launch can see the new value.
   //
-  // Both broadcasts share one packed counter, so it can only be cleared once
-  // both bytes are complete; the tail owner waits for both (b=0 does not exist
-  // at S==1). Each peer's queue carries b=0 ahead of b=1, so byte 0 is normally
-  // complete by the time byte 1 is.
+  // The tail owner waits for both broadcasts (b=0 does not exist at S==1), so
+  // "kernel done" means every peer's shard has landed in output. Each peer's
+  // queue carries b=0 ahead of b=1, so b=0 is normally complete by then.
   //
-  // No fence closes the kernel. The resets are system-scope stores, so they need
-  // no writeback, and nothing beyond the kernel boundary races them: these slots
-  // are only touched again by a peer's next scatter or broadcast, which cannot
-  // run before my NEXT launch's entry barrier. Nor is an acquire needed -- no
-  // thread here reads the slices peers DMA'd into output, and whoever consumes
-  // them acquires at its own kernel boundary.
-  if (threadIdx.x == 0 && ownsTail) {
-    AtomicStore<ESystemScope>(&signalBuf[kSliceSignalSlot], 0UL);
-    const uint32_t want = static_cast<uint32_t>(npes - 1);  // no self-copy
-    auto* addr = &signalBuf[kBcastSlot];
-    auto done = [=](uint64_t v) {
-      return SliceSignalCount(v, 1) >= want && (S == 1 || SliceSignalCount(v, 0) >= want);
-    };
-    while (!done(AtomicLoad<EAgentScope>(addr))) {
-      __builtin_amdgcn_s_sleep(1);
+  // No acquire closes the kernel -- no thread here reads the slices peers DMA'd
+  // into output, and whoever consumes them acquires at its own kernel boundary.
+  if (threadIdx.x < warpSize && BroadcastLane0(static_cast<uint32_t>(ownsTail))) {
+    WaitArrived(arrived, kBcastArrived + 1, pushGen, myPe, npes, /*skipSelf=*/true);
+    if (S > 1) {
+      WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
     }
-    // System scope again: peers ADD into this slot from their Phase 4.
-    AtomicStore<ESystemScope>(&signalBuf[kBcastSlot], 0UL);
+    if (threadIdx.x == 0) {
+      AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
+    }
   }
 }
 
@@ -349,11 +337,7 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
 #pragma unroll
     for (int k = 1; k < NPES; k++) {
       const int32_t delta = (k < NPES - myPe) ? k : k - NPES;
-      const int32_t diff = delta * static_cast<int32_t>(stride4G);
-      StreamStore<ESystemScope, B>(
-          reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(mine) +
-                               (static_cast<uint64_t>(diff) << 32)),
-          v);
+      StreamStore<ESystemScope, B>(PeerPtr(mine, myPe + delta, myPe, stride4G), v);
     }
   };
   detail::PullReduceShard<NumVecs, NPES, ReduceOp>(myPe, stride4G, input, store,
@@ -368,7 +352,7 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
     if (threadIdx.x == 0) {
       last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
     }
-    if (BroadcastWarp(last, 0)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
+    if (BroadcastLane0(last)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
   }
 }
 } // namespace collective
