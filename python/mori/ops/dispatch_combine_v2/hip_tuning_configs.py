@@ -19,32 +19,23 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Launch-geometry tuning for the HIP/JIT EP kernels — separate from FlyDSL's.
+"""HIP V2 configuration: resolve_schedule(cfg) -> ScheduleEntry rows.
 
-Different kernels, different optima, so never borrow FlyDSL's schedule. This module
-does not import ``tuning_configs``; it shares only ``mori.ops.utils`` for device
-detection.
-
-Dispatch and combine get INDEPENDENT tables: dispatch depends on the dtype it
-transports, combine does not (it only ever reduces the bf16/fp32 staging region).
-Both are keyed by (world_size, hidden_dim, topk, experts_per_rank); an
-``experts_per_rank`` of None is a wildcard, used only where a sweep showed the expert
-count does not move the optimum. A bucket is (max_tok_inclusive | None, block, warp),
-ascending, and ``lookup`` merges the two into the op's
-(max_tok, disp_block, disp_warp, comb_block, comb_warp) schedule.
-
-An unswept shape returns schedule=None and the single-shot default below. Add one by
-sweeping with ``bench_ep.py``. fp32 combine is untuned and takes the bf16 buckets.
-
-Dispatch dtype keys name only what dispatch transports: "bf16", "fp8", "fp4"
-(``EpDispatchCombineConfig.dispatch_dtype_str``). The combine side has no dtype here --
-it always reduces bf16 rows, and whether those go out as mxfp4 is ``quant_type``'s
-table. "fp4_disp_bf16_comb" is FlyDSL's key for the same fp4 dispatch (its table does
-name both halves); ``lookup`` still reads it as "fp4" for callers that pass
-``dtype_str``.
+Both paths use KernelConfig keys and pick_bucket() with inclusive token ceilings.
+Intra lookup() reads the IntraNodeV2 table first and falls back to the Python
+tables per phase; internode_buckets() reads the CSV table v2_table_filename()
+names for the GPU model, kernel family and EP size (read_v2_table()).
 """
 
 from __future__ import annotations
+
+import csv
+import io
+import numbers
+import os
+import tempfile
+from pathlib import Path
+from typing import NamedTuple
 
 from mori.ops import utils as _gpu
 
@@ -81,6 +72,9 @@ def _hip_default() -> dict:
 # The tables. bucket = (max_tok_inclusive | None, block, warp), ascending.
 # key = (world_size, hidden_dim, topk, experts_per_rank); experts_per_rank None
 # means "measured not to matter here", and an exact key wins over the wildcard.
+# Dispatch dtype keys name only what dispatch transports: "bf16" / "fp8" / "fp4"
+# (EpDispatchCombineConfig.dispatch_dtype_str). Combine has no dtype key; whether
+# its bf16 rows go out as mxfp4 is quant_type's table.
 # ---------------------------------------------------------------------------
 
 # Entries are the smallest geometry within ~3% of the best: fewer blocks holds fewer
@@ -306,6 +300,150 @@ def _bucket_key(table, world_size, hidden_dim, topk, experts_per_rank):
     return None
 
 
+def pick_bucket(buckets, num_tokens):
+    """Pick an inclusive ceiling, clamping above the last bucket.
+
+    A None bound is open-ended; a None query requests the terminal bucket.
+    Empty tables return None so callers can apply their own fallback policy.
+    """
+    for row in buckets:
+        if row[0] is None or (num_tokens is not None and num_tokens <= row[0]):
+            return row
+    return buckets[-1] if buckets else None
+
+
+class KernelConfig(NamedTuple):
+    """One HIP kernel choice; intra has no RDMA split."""
+
+    family: str
+    block_num: int
+    warp_per_block: int
+    rdma_block_num: int | None = None
+    # Ordinary-v2 combine only: compile the load-first gather (the table's
+    # combine_load_first). Part of the key, so buckets that share a geometry
+    # but differ here get separate kernels.
+    load_first: bool = False
+    # Internode only: how many of the allocated QPs (cfg.num_qp_per_pe) this
+    # kernel sends on. A compile-time constant of each kernel, chosen per phase
+    # and per bucket (the table's active_qps), so it is part of the key too.
+    active_qps: int | None = None
+
+
+class ScheduleEntry(NamedTuple):
+    max_tokens: int | None
+    dispatch: KernelConfig
+    combine: KernelConfig
+
+
+def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
+    """The HIP V2 schedule consumed by both construction and token selection.
+
+    Intra adapts the Python-table/explicit schedule resolved by Config. Inter
+    resolves the tables and overrides, then includes the family crossover in the
+    schedule. Loading and selection never depend on the declared token capacity;
+    that includes the combine load-first choice, which comes from each bucket's
+    rule (combine_load_first).
+    """
+    if not cfg.is_internode:
+        rows = cfg.schedule or (
+            (
+                None,
+                cfg.dispatch_block_num,
+                cfg.warp_num_per_block,
+                cfg.combine_block_num,
+                cfg.combine_warp_num_per_block,
+            ),
+        )
+        return tuple(
+            ScheduleEntry(
+                ceiling, KernelConfig("intra", db, dw), KernelConfig("intra", cb, cw)
+            )
+            for ceiling, db, dw, cb, cw in rows
+        )
+
+    geometries = internode_schedule(cfg)
+    edges = {row[0] for row in geometries if row[0] is not None}
+    if cfg.internode_kernel == "auto":
+        # Keep a zero-token LL entry when the crossover is zero, too.
+        edges.add(cfg.internode_auto_ll_max_tokens)
+    entries = []
+    for ceiling in [*sorted(edges), None]:
+        probe = ceiling if ceiling is not None else max(edges, default=0) + 1
+        family = internode_kernel_family(cfg, probe)
+        _, dispatch, combine, load_first = pick_bucket(geometries, probe)
+        entries.append(
+            ScheduleEntry(
+                ceiling,
+                KernelConfig(
+                    family,
+                    block_num=dispatch[0],
+                    warp_per_block=dispatch[2],
+                    rdma_block_num=dispatch[1],
+                    active_qps=dispatch[3],
+                ),
+                KernelConfig(
+                    family,
+                    block_num=combine[0],
+                    warp_per_block=combine[2],
+                    rdma_block_num=combine[1],
+                    load_first=load_first,
+                    active_qps=combine[3],
+                ),
+            )
+        )
+    return tuple(entries)
+
+
+def describe_schedule(cfg, schedule) -> str:
+    """Multi-line summary of a resolved schedule and the tables it came from."""
+
+    def fmt(spec):
+        if spec.rdma_block_num is None:
+            return f"{spec.family} B/W={spec.block_num}/{spec.warp_per_block}"
+        return (
+            f"{spec.family} B/R/W="
+            f"{spec.block_num}/{spec.rdma_block_num}/{spec.warp_per_block}"
+            f" qps={spec.active_qps}" + (" load-first" if spec.load_first else "")
+        )
+
+    num_experts = cfg.world_size * cfg.num_experts_per_rank
+    lines = [
+        f"HIP V2 schedule: {_gpu.arch_name()}/{_gpu.detect_model()} "
+        f"ep{cfg.world_size} expert{num_experts} top{cfg.num_experts_per_token} "
+        f"hidden{cfg.hidden_dim} dispatch={cfg.dispatch_dtype} combine={cfg.combine_dtype}"
+    ]
+    if cfg.is_internode:
+        families = [_V2_KERNEL_TYPES[f] for f in internode_kernel_families(cfg)]
+        overrides = [
+            name
+            for name in ("MORI_EP_DISP_GEOM", "MORI_EP_COMB_GEOM")
+            if os.environ.get(name)
+        ]
+        if overrides:
+            lines.append(f"  tables bypassed by {', '.join(overrides)}")
+        lines.append(
+            f"  QPs allocated per peer: {cfg.num_qp_per_pe}"
+            + (f", active pinned to {cfg.active_qps}" if cfg.active_qps else "")
+        )
+        pinned = sorted(getattr(cfg, "_pinned_geometry", ()))
+        if pinned:
+            lines.append(f"  pinned fields: {', '.join(pinned)}")
+    else:
+        families = [_V2_KERNEL_TYPES["intra"]]
+    for kernel_type in families:
+        path = internode_table_dir() / v2_table_filename(
+            _gpu.arch_name(), _gpu.detect_model(), kernel_type, cfg.world_size
+        )
+        lines.append(f"  {'found' if path.is_file() else 'missing'}: {path}")
+    for row in schedule:
+        ceiling = "rest" if row.max_tokens is None else f"<={row.max_tokens}"
+        lines.append(
+            f"  tokens {ceiling:>7}: dispatch {fmt(row.dispatch)}, "
+            f"combine {fmt(row.combine)}"
+        )
+    return "\n".join(lines)
+
+
 def _merge(disp, comb):
     """Interleave two independent bucket lists into the op's one schedule.
 
@@ -317,13 +455,10 @@ def _merge(disp, comb):
         | {b[0] for b in comb if b[0] is not None}
     ) + [None]
 
-    def pick(buckets, edge):
-        for mx, blk, wrp in buckets:
-            if mx is None or (edge is not None and edge <= mx):
-                return blk, wrp
-        return buckets[-1][1], buckets[-1][2]
-
-    return tuple((edge,) + pick(disp, edge) + pick(comb, edge) for edge in edges)
+    return tuple(
+        (edge,) + pick_bucket(disp, edge)[1:] + pick_bucket(comb, edge)[1:]
+        for edge in edges
+    )
 
 
 # FlyDSL's dtype_str spelling, still accepted from callers that pass it (aiter's MegaMoE).
@@ -337,6 +472,8 @@ def lookup(
     dtype="bf16",
     experts_per_rank=None,
     quant_type="none",
+    dispatch_dtype=None,
+    combine_dtype=None,
 ) -> dict:
     """HIP geometry for this device/shape/dtype, composed from HIP's own two tables.
 
@@ -345,12 +482,19 @@ def lookup(
     single-shot default (schedule=None). A swept one gets a per-token-count schedule
     built from the dispatch and combine tables independently, so either half can be
     re-tuned without touching the other.
+
+    Given both legs' dtypes, the IntraNodeV2 table comes first. Each phase
+    takes its table rules when it has any and the Python table otherwise, so the
+    table can be filled one phase at a time.
     """
     base = _hip_default()
     dev = _device_key()
     disp = _bucket_key(
         _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
     )
+    if disp is not None:
+        # None is the "every dtype measured the same" key; an exact dtype overrides it.
+        disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
     comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
         comb = _bucket_key(
@@ -364,11 +508,636 @@ def lookup(
         comb = _bucket_key(
             _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
         )
+    if dispatch_dtype is not None and quant_type == "none":
+        table_disp, table_comb = intranode_buckets(
+            world_size,
+            hidden_dim,
+            topk,
+            dispatch_dtype,
+            combine_dtype,
+            experts_per_rank=experts_per_rank,
+        )
+        if table_disp or table_comb:
+            disp = table_disp or disp
+            comb = table_comb or comb
+            disp = disp or (
+                (None, base["dispatch_block_num"], base["warp_num_per_block"]),
+            )
+            comb = comb or (
+                (None, base["combine_block_num"], base["combine_warp_num_per_block"]),
+            )
+            base["schedule"] = _merge(disp, comb)
+            return base
     if disp is None or comb is None:
         return base  # half a schedule is not a schedule
-    # None is the "every dtype measured the same" key; an exact dtype overrides it.
-    disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
-    if disp is None:
-        return base
     base["schedule"] = _merge(disp, comb)
     return base
+
+
+_INTERNODE_TABLE_DIR = Path(__file__).parent / "tuning_configs"
+# Table kernel_type per family. "intra" is the single-node HIP op, which
+# shares the internode loader, matching rules and save path.
+_V2_KERNEL_TYPES = {
+    "v2": "InterNodeV2",
+    "v2_ll": "InterNodeV2LL",
+    "intra": "IntraNodeV2",
+}
+_INTERNODE_PHASES = ("dispatch", "combine")
+_INTERNODE_GEOMETRY_FIELDS = (
+    ("dispatch_block_num", "dispatch_rdma_block_num", "warp_num_per_block"),
+    ("combine_block_num", "combine_rdma_block_num", "combine_warp_num_per_block"),
+)
+
+
+def internode_kernel_family(cfg, num_tokens):
+    """Resolve auto using live tokens, independently of the declared capacity."""
+    if cfg.internode_kernel != "auto":
+        return cfg.internode_kernel
+    return "v2_ll" if num_tokens <= cfg.internode_auto_ll_max_tokens else "v2"
+
+
+def internode_kernel_families(cfg):
+    """Families to prepare before launch; only auto needs both."""
+    return (
+        ("v2", "v2_ll") if cfg.internode_kernel == "auto" else (cfg.internode_kernel,)
+    )
+
+
+def fit_internode_geometry(geometry, *, clamp_to_cu=False):
+    """Leave at least one intra-node block; optionally cap tuned grids to CUs.
+    Fields after block, rdma, warp (the active QP count) pass through."""
+    if geometry is None:
+        return None
+    block, rdma, warp, *rest = geometry
+    if clamp_to_cu:
+        block = min(block, _gpu.cu_count() or 80)
+    return (block, min(rdma, max(1, block - 1)), warp, *rest)
+
+
+def resolve_active_qps(cfg, active_qps=None):
+    """The active QP count a kernel runs with: a configured cfg.active_qps wins;
+    otherwise the table's count, else min(2, allocation). A table count above
+    the allocation is clamped to it, the way block_num is clamped to the CU
+    count, so a row tuned under one allocation stays usable under another."""
+    if cfg.active_qps is not None:
+        return cfg.active_qps
+    if active_qps is None:
+        active_qps = 2
+    return min(active_qps, cfg.num_qp_per_pe)
+
+
+def _geometry_from_env(name, cfg):
+    """Optional sweep override, read once when the op is built:
+    B,R,W[,active_qps]. A fourth field beats cfg.active_qps and is rejected,
+    not clamped, outside the allocation: a sweep that silently ran a smaller
+    count would report a winner it never measured."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    geometry = tuple(int(x) for x in raw.replace(" ", "").split(","))
+    if len(geometry) == 3:
+        return geometry + (resolve_active_qps(cfg),)
+    if len(geometry) != 4:
+        raise ValueError(
+            f"{name}={raw!r}: want block,rdma,warp or block,rdma,warp,active_qps"
+        )
+    if not 1 <= geometry[3] <= cfg.num_qp_per_pe:
+        raise ValueError(
+            f"{name}: active_qps {geometry[3]} must be in "
+            f"[1, num_qp_per_pe={cfg.num_qp_per_pe}]"
+        )
+    return geometry
+
+
+def internode_schedule(cfg):
+    """Resolve (inclusive token ceiling, dispatch B/R/W/QPs, combine B/R/W/QPs,
+    combine load-first).
+
+    Either sweep env override bypasses both tables. Otherwise explicit config
+    fields override the selected family's table, with config defaults for an
+    untuned phase. Table values and unpinned defaults are CU-clamped; pinned
+    fields are kept as given. All paths keep R < B.
+    """
+    defaults = [
+        tuple(getattr(cfg, name) for name in fields) + (resolve_active_qps(cfg),)
+        for fields in _INTERNODE_GEOMETRY_FIELDS
+    ]
+    overrides = [
+        _geometry_from_env("MORI_EP_DISP_GEOM", cfg),
+        _geometry_from_env("MORI_EP_COMB_GEOM", cfg),
+    ]
+    if any(overrides):
+        return [
+            (
+                None,
+                *(fit_internode_geometry(g or d) for g, d in zip(overrides, defaults)),
+                False,
+            )
+        ]
+
+    tables = {
+        family: internode_buckets(
+            cfg.world_size,
+            cfg.hidden_dim,
+            cfg.num_experts_per_token,
+            cfg.dispatch_dtype,
+            cfg.combine_dtype,
+            kernel_family=family,
+            experts_per_rank=cfg.num_experts_per_rank,
+        )
+        or []
+        for family in internode_kernel_families(cfg)
+    }
+    edges = {row[0] for table in tables.values() for row in table if row[0] is not None}
+    if cfg.internode_kernel == "auto":
+        edges.add(cfg.internode_auto_ll_max_tokens)
+
+    pinned = getattr(cfg, "_pinned_geometry", frozenset())
+    rows = []
+    for ceiling in [*sorted(edges), None]:
+        # The terminal bucket uses the family selected past every finite edge.
+        probe = ceiling if ceiling is not None else max(edges, default=0) + 1
+        family = internode_kernel_family(cfg, probe)
+        tuned = pick_bucket(tables[family], probe)
+        geometries = []
+        for index, (fields, fallback) in enumerate(
+            zip(_INTERNODE_GEOMETRY_FIELDS, defaults), start=1
+        ):
+            geometry = (
+                tuned[index]
+                if tuned and tuned[index]
+                else fit_internode_geometry(fallback, clamp_to_cu=True)
+            )
+            geometry = tuple(
+                getattr(cfg, name) if name in pinned else value
+                for name, value in zip(fields, geometry[:3])
+            ) + (
+                resolve_active_qps(cfg, geometry[3]),
+            )
+            geometries.append(fit_internode_geometry(geometry))
+        # The load-first gather exists in the ordinary combine only.
+        load_first = bool(tuned and tuned[3]) and family == "v2"
+        row = (ceiling, *geometries, load_first)
+        # Equal geometry can span a crossover here. resolve_schedule() restores
+        # the family boundary when producing the executable configurations.
+        if rows and rows[-1][1:] == row[1:]:
+            rows[-1] = row
+        else:
+            rows.append(row)
+    return rows
+
+
+def internode_table_dir():
+    """V2 reads only this directory; V1's MORI_EP_TUNING_CONFIG never applies."""
+    return Path(os.environ.get("MORI_EP_V2_TUNING_DIR") or _INTERNODE_TABLE_DIR)
+
+
+def v2_table_filename(gpu_arch, gpu_model, kernel_type, ep_size):
+    """One V2 table per GPU model, kernel family and EP size, holding both
+    phases, e.g. ``gfx950_mi355x_InterNodeV2_ep16.csv``."""
+    return f"{gpu_arch}_{gpu_model}_{kernel_type}_ep{ep_size}.csv"
+
+
+# One rule per row. The first eight columns are the selector and the sort
+# order, then the geometry and its per-bucket flags, then metrics, which are
+# for readers only. An empty cell is an absent field: the combine-only fields
+# of a dispatch rule, and active_qps or combine_load_first left at the default.
+_TABLE_SELECTOR = (
+    "num_experts",
+    "topk",
+    "phase",
+    "dtype",
+    "hidden_dim",
+    "zero_copy",
+    "quant_type",
+    "num_tokens",
+)
+_TABLE_COLUMNS = _TABLE_SELECTOR + (
+    "block_num",
+    "rdma_block_num",
+    "warp_per_block",
+    "active_qps",
+    "combine_load_first",
+    "avg_latency_us",
+    "bandwidth_gbps",
+    "avg_rdma_bandwidth_gbps",
+    "avg_xgmi_bandwidth_gbps",
+    "avg_ll_bandwidth_gbps",
+    "bandwidth_metric",
+)
+_TABLE_REQUIRED = (
+    "num_experts",
+    "topk",
+    "phase",
+    "dtype",
+    "hidden_dim",
+    "num_tokens",
+    "block_num",
+    "rdma_block_num",
+    "warp_per_block",
+)
+_TABLE_INT_MINIMUM = {
+    "num_experts": 1,
+    "topk": 1,
+    "hidden_dim": 1,
+    "num_tokens": 1,
+    "block_num": 1,
+    "rdma_block_num": 0,
+    "warp_per_block": 1,
+    "active_qps": 1,
+}
+_TABLE_BOOLS = frozenset({"zero_copy", "combine_load_first"})
+_TABLE_FLOATS = frozenset(
+    {
+        "avg_latency_us",
+        "bandwidth_gbps",
+        "avg_rdma_bandwidth_gbps",
+        "avg_xgmi_bandwidth_gbps",
+        "avg_ll_bandwidth_gbps",
+    }
+)
+# Config strings rather than this torch build's dtype registry, so a table
+# loads the same whichever dtypes torch has.
+_TABLE_DTYPES = frozenset({"bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"})
+
+
+def _table_key(rule):
+    return (
+        rule["num_experts"],
+        rule["topk"],
+        rule["phase"],
+        rule["dtype"],
+        rule["hidden_dim"],
+        bool(rule.get("zero_copy")),
+        rule.get("quant_type") or "",
+        rule["num_tokens"],
+    )
+
+
+def _parse_table_row(cells, kernel_type, where):
+    """One rule from a row's cells: typed, empty cells left out, and checked
+    against what this kernel family's lookup reads."""
+    rule = {}
+    for name in _TABLE_COLUMNS:
+        text = cells.get(name)
+        if text is None:
+            raise ValueError(f"{where}: fewer cells than columns")
+        text = text.strip()
+        if not text:
+            continue
+        try:
+            if name in _TABLE_INT_MINIMUM:
+                value = int(text)
+            elif name in _TABLE_BOOLS:
+                if text not in ("0", "1"):
+                    raise ValueError("want 0 or 1")
+                value = text == "1"
+            elif name in _TABLE_FLOATS:
+                value = float(text)
+            else:
+                value = text
+        except ValueError as exc:
+            raise ValueError(f"{where}: {name}={text!r}: {exc}") from None
+        rule[name] = value
+    problems = [f"missing {name}" for name in _TABLE_REQUIRED if name not in rule]
+    combine_only = ("zero_copy", "quant_type", "combine_load_first")
+    phase = rule.get("phase")
+    if phase == "combine":
+        problems += [f"missing {name}" for name in combine_only[:2] if name not in rule]
+    elif phase == "dispatch":
+        problems += [f"{name} is combine-only" for name in combine_only if name in rule]
+    elif phase is not None:
+        problems.append(f"phase {phase!r} is neither dispatch nor combine")
+    if "dtype" in rule and rule["dtype"] not in _TABLE_DTYPES:
+        problems.append(f"unknown dtype {rule['dtype']!r}")
+    if "combine_load_first" in rule and kernel_type != "InterNodeV2":
+        problems.append("combine_load_first is read by InterNodeV2 only")
+    if "active_qps" in rule and kernel_type == "IntraNodeV2":
+        problems.append("active_qps is internode only")
+    problems += [
+        f"{name}={rule[name]} is below {low}"
+        for name, low in _TABLE_INT_MINIMUM.items()
+        if name in rule and rule[name] < low
+    ]
+    if problems:
+        raise ValueError(f"{where}: {'; '.join(problems)}")
+    return rule
+
+
+def read_v2_table(path, kernel_type):
+    """Rules of one V2 table, sorted by selector. Anything malformed raises: a
+    table that loaded wrong would run untuned geometry without a word."""
+    path = Path(path)
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames or []
+        if len(header) != len(set(header)) or set(header) != set(_TABLE_COLUMNS):
+            raise ValueError(
+                f"{path}: columns must be {','.join(_TABLE_COLUMNS)}, "
+                f"got {','.join(header)}"
+            )
+        rules, first_line = [], {}
+        for cells in reader:
+            where = f"{path}:{reader.line_num}"
+            if None in cells:
+                raise ValueError(f"{where}: more cells than columns")
+            rule = _parse_table_row(cells, kernel_type, where)
+            key = _table_key(rule)
+            if key in first_line:
+                raise ValueError(f"{where}: same selector as line {first_line[key]}")
+            first_line[key] = reader.line_num
+            rules.append(rule)
+    return tuple(sorted(rules, key=_table_key))
+
+
+def _table_cell(value):
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, numbers.Integral):
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        # float(): repr of a NumPy scalar is "np.float64(...)", not a number.
+        # A whole number drops ".0" so a cell rewrites as it was read.
+        value = float(value)
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return repr(value)
+    return str(value)
+
+
+def _checked_rule(rule, kernel_type, where):
+    """(the rule as read_v2_table() will read it back, its cells)."""
+    extra = sorted(set(rule) - set(_TABLE_COLUMNS))
+    if extra:
+        raise ValueError(f"{where}: fields the table has no column for: {extra}")
+    cells = {name: _table_cell(rule.get(name)) for name in _TABLE_COLUMNS}
+    return _parse_table_row(cells, kernel_type, where), cells
+
+
+def write_v2_table(path, rules, kernel_type):
+    """Write rules as one V2 table, sorted by selector, replacing the file
+    atomically. Each rule is checked as read_v2_table() reads it, so a save
+    cannot leave a table that then fails to load."""
+    path = Path(path)
+    rows = {}
+    for rule in rules:
+        selector = ",".join(_table_cell(rule.get(name)) for name in _TABLE_SELECTOR)
+        where = f"{path}: rule {selector}"
+        parsed, cells = _checked_rule(rule, kernel_type, where)
+        key = _table_key(parsed)
+        if key in rows:
+            raise ValueError(f"{where}: selector appears twice")
+        rows[key] = cells
+    text = io.StringIO()
+    writer = csv.writer(text, lineterminator="\n")
+    writer.writerow(_TABLE_COLUMNS)
+    for key in sorted(rows):
+        writer.writerow([rows[key][name] for name in _TABLE_COLUMNS])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.stem, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            f.write(text.getvalue())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Container sweeps may run as root; keep their output readable on the host.
+    os.chmod(path, 0o644)
+
+
+_V2_RULES_CACHE: dict = {}
+
+
+def _v2_rules(gpu_arch, gpu_model, kernel_type, ep_size):
+    """This model's own V2 table for one family and EP size; () when there is none."""
+    path = internode_table_dir() / v2_table_filename(
+        gpu_arch, gpu_model, kernel_type, ep_size
+    )
+    if path not in _V2_RULES_CACHE:
+        _V2_RULES_CACHE[path] = (
+            read_v2_table(path, kernel_type) if path.is_file() else ()
+        )
+    return _V2_RULES_CACHE[path]
+
+
+def internode_buckets(
+    world_size,
+    hidden_dim,
+    topk,
+    dispatch_dtype,
+    combine_dtype=None,
+    kernel_family="v2",
+    experts_per_rank=None,
+):
+    """Return (token ceiling, dispatch geometry, combine geometry,
+    combine load-first) rows. A geometry is (block, rdma, warp, active_qps);
+    active_qps is the rule's optional count, None when the rule names none.
+
+    Each phase matches its own dtype and stored width (packed for FP4 dispatch).
+    A rule must match every selector exactly -- total experts (world_size *
+    experts_per_rank), top-k, dtype and width -- so no shape borrows another's.
+    An untuned phase is None, and a wholly untuned shape returns None.
+    A combine rule's optional ``combine_load_first`` (default false) selects
+    the load-first gather for its bucket.
+    """
+    if topk is None or experts_per_rank is None:
+        return None
+
+    from mori.ops.tuning_config import DTYPE_TO_CONFIG_STR
+
+    kernel_type = _V2_KERNEL_TYPES.get(kernel_family)
+    if kernel_type is None:
+        return None
+    model, arch = _gpu.detect_model(), _gpu.arch_name()
+    if model is None or arch is None:
+        return None
+    num_experts = world_size * experts_per_rank
+    dtypes = {
+        "dispatch": dispatch_dtype,
+        "combine": combine_dtype if combine_dtype is not None else dispatch_dtype,
+    }
+    packed_dispatch = DTYPE_TO_CONFIG_STR.get(dispatch_dtype) == "fp4"
+    if packed_dispatch and hidden_dim % 2:
+        return None
+    hidden_dims = {
+        "dispatch": hidden_dim // 2 if packed_dispatch else hidden_dim,
+        "combine": hidden_dim,
+    }
+    rules = _v2_rules(arch, model, kernel_type, world_size)
+    edges, matched = set(), {}
+    for phase in _INTERNODE_PHASES:
+        dtype_str = DTYPE_TO_CONFIG_STR.get(dtypes[phase])
+        # The table is sorted by selector, so each phase's matches ascend in
+        # num_tokens.
+        matched[phase] = [
+            rule
+            for rule in rules
+            if rule["phase"] == phase
+            and rule["num_experts"] == num_experts
+            and rule["topk"] == topk
+            and rule["dtype"] == dtype_str
+            and rule["hidden_dim"] == hidden_dims[phase]
+            and (
+                phase == "dispatch"
+                or (not rule["zero_copy"] and rule["quant_type"] == "none")
+            )
+        ]
+        edges.update(rule["num_tokens"] for rule in matched[phase])
+    if not edges:
+        return None
+
+    table = []
+    for num_tokens in sorted(edges):
+        selected = {}
+        for phase in _INTERNODE_PHASES:
+            # Rules are sorted by num_tokens: the tightest ceiling, else the last.
+            rules = matched[phase]
+            selected[phase] = next(
+                (rule for rule in rules if num_tokens <= rule["num_tokens"]),
+                rules[-1] if rules else None,
+            )
+        geometries = [
+            fit_internode_geometry(
+                (
+                    (
+                        rule["block_num"],
+                        rule["rdma_block_num"],
+                        rule["warp_per_block"],
+                        rule.get("active_qps"),
+                    )
+                    if rule is not None
+                    else None
+                ),
+                clamp_to_cu=True,
+            )
+            for rule in selected.values()
+        ]
+        combine = selected["combine"]
+        load_first = bool(combine is not None and combine.get("combine_load_first"))
+        table.append((num_tokens, *geometries, load_first))
+    return table
+
+
+def intranode_buckets(
+    world_size,
+    hidden_dim,
+    topk,
+    dispatch_dtype,
+    combine_dtype=None,
+    experts_per_rank=None,
+):
+    """(dispatch, combine) bucket lists from the IntraNodeV2 table.
+
+    Each is ((max_tok_inclusive, block, warp), ...) ascending, or None when that
+    phase has no rule. Matching is internode_buckets', so dtype, top-k and the
+    expert count must all be exact; intranode has no RDMA split to keep.
+    """
+    rows = internode_buckets(
+        world_size,
+        hidden_dim,
+        topk,
+        dispatch_dtype,
+        combine_dtype,
+        kernel_family="intra",
+        experts_per_rank=experts_per_rank,
+    )
+    if not rows:
+        return None, None
+    phases = []
+    for index in (1, 2):
+        buckets = tuple(
+            (row[0], row[index][0], row[index][2])
+            for row in rows
+            if row[index] is not None
+        )
+        phases.append(buckets or None)
+    return phases[0], phases[1]
+
+
+def lookup_internode(
+    world_size,
+    hidden_dim,
+    topk,
+    num_tokens,
+    dispatch_dtype,
+    combine_dtype=None,
+    kernel_family="v2",
+    experts_per_rank=None,
+):
+    """Resolve one token count; backend construction uses internode_buckets."""
+    table = internode_buckets(
+        world_size,
+        hidden_dim,
+        topk,
+        dispatch_dtype,
+        combine_dtype,
+        kernel_family,
+        experts_per_rank,
+    )
+    row = pick_bucket(table, num_tokens) if table else None
+    if row is None or (row[1] is None and row[2] is None):
+        return None
+    return {"dispatch": row[1], "combine": row[2], "combine_load_first": row[3]}
+
+
+def save_internode_result(
+    world_size,
+    phase,
+    entry,
+    *,
+    kernel_family="v2",
+    directory=None,
+    path=None,
+):
+    """Merge one rule into the table v2_table_filename() names for this GPU
+    model, kernel family and EP size, replacing the rule with the same selector,
+    then invalidate the cache. The rule's total experts is world_size *
+    entry["experts_per_rank"]; the table stores the total."""
+    from mori.ops.tuning_config import _report_rule_added, _report_rule_change
+
+    if phase not in _INTERNODE_PHASES:
+        raise ValueError(f"phase must be one of {_INTERNODE_PHASES}, got {phase!r}")
+    kernel_type = _V2_KERNEL_TYPES.get(kernel_family)
+    if kernel_type is None:
+        raise ValueError(f"unsupported V2 kernel family: {kernel_family!r}")
+    entry = dict(entry)
+    for name in ("topk", "experts_per_rank"):
+        value = entry.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"V2 internode tuning requires a positive integer {name}")
+    entry["num_experts"] = world_size * entry.pop("experts_per_rank")
+    entry["phase"] = phase
+    if phase == "combine":
+        entry.setdefault("zero_copy", False)
+        entry.setdefault("quant_type", "none")
+    if path is None:
+        model, arch = _gpu.detect_model(), _gpu.arch_name()
+        if model is None or arch is None:
+            raise RuntimeError(
+                "cannot save internode tuning for an unknown GPU; pass an explicit path"
+            )
+        path = Path(directory or internode_table_dir()) / v2_table_filename(
+            arch, model, kernel_type, world_size
+        )
+    else:
+        path = Path(path)
+    entry, _ = _checked_rule(entry, kernel_type, f"{path}: new {phase} rule")
+    rules = list(read_v2_table(path, kernel_type)) if path.is_file() else []
+    key = _table_key(entry)
+    for index, rule in enumerate(rules):
+        if _table_key(rule) == key:
+            _report_rule_change(phase, key, rule, entry)
+            rules[index] = entry
+            break
+    else:
+        _report_rule_added(phase, key, entry)
+        rules.append(entry)
+    write_v2_table(path, rules, kernel_type)
+    _V2_RULES_CACHE.clear()
+    return path
