@@ -322,6 +322,23 @@ void RegisterMoriUmbp(py::module_& m) {
   py::class_<IUMBPClient, std::unique_ptr<IUMBPClient>>(m, "UMBPClient")
       .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
            py::arg("config") = UMBPConfig{})
+      .def(
+          "configure_kv_indexer",
+          [](IUMBPClient& self, const std::string& endpoint, const std::string& worker,
+             const std::string& address, uint32_t components, uint32_t window, uint32_t timeout) {
+            self.ConfigureKvIndexer({endpoint, worker, address, components, window, timeout});
+          },
+          py::arg("endpoint"), py::arg("worker_id"), py::arg("worker_address"),
+          py::arg("components") = 1, py::arg("swa_window_tokens") = 0, py::arg("timeout_ms") = 200,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "register_kv_block",
+          [](IUMBPClient& self, int64_t hash, std::optional<int64_t> parent, uint32_t size,
+             const std::map<uint32_t, std::vector<std::string>>& keys) {
+            self.RegisterKvBlock({hash, parent, size, keys});
+          },
+          py::arg("hash"), py::arg("parent_hash"), py::arg("block_size"), py::arg("component_keys"),
+          py::call_guard<py::gil_scoped_release>())
       // All I/O-path methods release the GIL: they block on RDMA, SSD, or gRPC
       // and never call back into Python, so releasing is always safe.
       .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"),

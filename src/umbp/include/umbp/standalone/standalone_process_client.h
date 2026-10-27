@@ -71,6 +71,8 @@ class StandaloneProcessClient : public IUMBPClient {
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
 
   bool Clear() override;
+  void ConfigureKvIndexer(const KvIndexerConfig& config) override;
+  void RegisterKvBlock(const KvBlockMetadata& block) override;
   bool Flush() override;
   void Close() override;
   bool IsDistributed() const override { return false; }

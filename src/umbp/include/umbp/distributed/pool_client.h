@@ -58,6 +58,7 @@ class WorkloadTraceRecorder;
 class PeerServiceServer;
 class PeerPool;
 class HbmCopyEngine;
+class KvIndexerObserver;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -130,6 +131,9 @@ class PoolClient {
   // chosen peer reports ENOSPC (Put) or unknown-key (Get); each retry
   // adds the failed node to the exclude set.
   bool Put(const std::string& key, const void* src, size_t size);
+  void ConfigureKvIndexer(const KvIndexerConfig& config);
+  void RegisterKvBlock(const KvBlockMetadata& block);
+  bool FlushKvIndexer();
   bool Get(const std::string& key, void* dst, size_t size);
 
   std::vector<bool> BatchPut(const std::vector<std::string>& keys,
@@ -342,6 +346,7 @@ class PoolClient {
   // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
   // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
+  std::shared_ptr<KvIndexerObserver> kv_indexer_;
 
   // The implicit default logical pool. It borrows registry_, owns placement
   // state and policy, and is the dispatch surface for local and peer RPC paths.

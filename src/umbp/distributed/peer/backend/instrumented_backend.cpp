@@ -162,6 +162,7 @@ std::vector<CommitResult> InstrumentedBackend::BatchCommit(const std::vector<Com
     }
   }
   if (bytes > 0) ops_[kCommit].bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (bytes > 0) NotifyChange();
   return out;
 }
 
@@ -234,6 +235,7 @@ std::vector<EvictResult> InstrumentedBackend::Evict(const std::vector<std::strin
     }
   }
   if (bytes > 0) ops_[kEvict].bytes.fetch_add(bytes, std::memory_order_relaxed);
+  if (bytes > 0) NotifyChange();
   return out;
 }
 

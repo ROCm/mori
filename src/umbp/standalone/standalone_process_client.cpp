@@ -645,6 +645,44 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
+void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
+  std::shared_lock lock(op_mutex_);
+  if (closed_ || closing_) throw std::logic_error("client is closed");
+  ::umbp::StandaloneKvIndexerConfig request;
+  request.set_endpoint(config.endpoint);
+  request.set_worker_id(config.worker_id);
+  request.set_worker_address(config.worker_address);
+  request.set_components(config.components);
+  request.set_swa_window_tokens(config.swa_window_tokens);
+  request.set_timeout_ms(config.timeout_ms);
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  ::umbp::BoolResponse response;
+  auto status = stub_->ConfigureKvIndexer(&context, request, &response);
+  if (!status.ok()) throw std::runtime_error(status.error_message());
+  if (!response.ok()) throw std::invalid_argument(response.error());
+}
+
+void StandaloneProcessClient::RegisterKvBlock(const KvBlockMetadata& block) {
+  std::shared_lock lock(op_mutex_);
+  if (closed_ || closing_) throw std::logic_error("client is closed");
+  ::umbp::StandaloneKvBlock request;
+  request.set_hash(block.hash);
+  if (block.parent) request.set_parent(*block.parent);
+  request.set_block_size(block.block_size);
+  for (const auto& [bit, keys] : block.component_keys) {
+    auto* component = request.add_components();
+    component->set_component(bit);
+    for (const auto& key : keys) component->add_keys(key);
+  }
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  ::umbp::BoolResponse response;
+  auto status = stub_->RegisterKvBlock(&context, request, &response);
+  if (!status.ok()) throw std::runtime_error(status.error_message());
+  if (!response.ok()) throw std::invalid_argument(response.error());
+}
+
 bool StandaloneProcessClient::Clear() {
   if (closing_) return true;
   std::unique_lock lk(op_mutex_);

@@ -842,6 +842,44 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
+  grpc::Status ConfigureKvIndexer(grpc::ServerContext*,
+                                  const ::umbp::StandaloneKvIndexerConfig* request,
+                                  ::umbp::BoolResponse* response) override {
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_) return {grpc::StatusCode::UNAVAILABLE, "server is shutting down"};
+    try {
+      client_->ConfigureKvIndexer({request->endpoint(), request->worker_id(),
+                                   request->worker_address(), request->components(),
+                                   request->swa_window_tokens(), request->timeout_ms()});
+      SetBool(response, true);
+    } catch (const std::exception& error) {
+      SetBool(response, false, error.what());
+    }
+    return grpc::Status::OK;
+  }
+
+  grpc::Status RegisterKvBlock(grpc::ServerContext*, const ::umbp::StandaloneKvBlock* request,
+                               ::umbp::BoolResponse* response) override {
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_) return {grpc::StatusCode::UNAVAILABLE, "server is shutting down"};
+    try {
+      KvBlockMetadata block{request->hash(), std::nullopt, request->block_size(), {}};
+      if (request->has_parent()) block.parent = request->parent();
+      for (const auto& component : request->components()) {
+        if (!block.component_keys
+                 .emplace(component.component(), std::vector<std::string>(component.keys().begin(),
+                                                                          component.keys().end()))
+                 .second)
+          throw std::invalid_argument("duplicate KV component");
+      }
+      client_->RegisterKvBlock(block);
+      SetBool(response, true);
+    } catch (const std::exception& error) {
+      SetBool(response, false, error.what());
+    }
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

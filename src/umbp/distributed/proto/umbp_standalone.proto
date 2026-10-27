@@ -19,6 +19,8 @@ service UMBPStandalone {
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
+  rpc ConfigureKvIndexer(StandaloneKvIndexerConfig) returns (BoolResponse);
+  rpc RegisterKvBlock(StandaloneKvBlock) returns (BoolResponse);
   rpc RegisterMemory(RegisterMemoryRequest) returns (BoolResponse);
   rpc DeregisterMemory(DeregisterMemoryRequest) returns (Empty);
 
@@ -31,6 +33,27 @@ service UMBPStandalone {
 }
 
 message Empty {}
+
+message StandaloneKvIndexerConfig {
+  string endpoint = 1;
+  string worker_id = 2;
+  string worker_address = 3;
+  uint32 components = 4;
+  uint32 swa_window_tokens = 5;
+  uint32 timeout_ms = 6;
+}
+
+message StandaloneKvComponent {
+  uint32 component = 1;
+  repeated string keys = 2;
+}
+
+message StandaloneKvBlock {
+  sfixed64 hash = 1;
+  optional sfixed64 parent = 2;
+  uint32 block_size = 3;
+  repeated StandaloneKvComponent components = 4;
+}
 
 message PingResponse {
   bool ready = 1;

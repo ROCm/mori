@@ -299,6 +299,9 @@ class MediumBackend : public MetricSource {
   // call (the default) simply has no outbox worth gating.
   virtual void SetEventPublishing(bool /*enabled*/) {}
 
+  // Installed on the operation decorator. Notify only; never perform I/O here.
+  virtual void SetChangeHook(std::function<void()> /*callback*/) {}
+
   // ---- eviction ordering: the pool decides; a medium only supplies order ----
 
   // Start the recency order EvictionCandidates() reads.  Off by default (it
