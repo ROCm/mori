@@ -29,6 +29,7 @@
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/distributed_client.h"
+#include "umbp/distributed/indexer/kv_indexer_reporter.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/types.h"
 #include "umbp/local/host_mem_allocator.h"
@@ -39,6 +40,17 @@ namespace py = pybind11;
 namespace mori {
 using namespace umbp;
 void RegisterMoriUmbp(py::module_& m) {
+  py::class_<KvIndexerReporter>(m, "UMBPIndexerReporter")
+      .def(py::init<const std::string&, std::string, std::string, uint32_t, uint32_t, uint32_t>(),
+           py::arg("endpoint"), py::arg("worker_id"), py::arg("worker_address"),
+           py::arg("components") = 1, py::arg("swa_window_tokens") = 0, py::arg("timeout_ms") = 200)
+      .def("report", &KvIndexerReporter::Report, py::arg("hashes"), py::arg("parent_hash"),
+           py::arg("block_size"), py::arg("component_mask") = 1,
+           py::call_guard<py::gil_scoped_release>())
+      .def("revoke", &KvIndexerReporter::Revoke, py::arg("hashes"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("clear", &KvIndexerReporter::Clear, py::call_guard<py::gil_scoped_release>());
+
   py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
       .value("Anonymous", HostBufferBacking::kAnonymous)
       .value("AnonymousHugetlb", HostBufferBacking::kAnonymousHugetlb)

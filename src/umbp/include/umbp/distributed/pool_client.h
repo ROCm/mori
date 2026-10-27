@@ -58,7 +58,6 @@ class WorkloadTraceRecorder;
 class PeerServiceServer;
 class PeerPool;
 class HbmCopyEngine;
-class KvIndexerExporter;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -343,7 +342,6 @@ class PoolClient {
   // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
   // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
-  std::unique_ptr<KvIndexerExporter> kv_indexer_exporter_;
 
   // The implicit default logical pool. It borrows registry_, owns placement
   // state and policy, and is the dispatch surface for local and peer RPC paths.

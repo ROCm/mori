@@ -52,7 +52,6 @@
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
-#include "umbp/distributed/indexer/kv_indexer_exporter.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -1326,29 +1325,6 @@ bool PoolClient::Init() {
     }
   }
 
-  if (const char* path = std::getenv("UMBP_KV_INDEXER_CONFIG"); path && *path) {
-    try {
-      auto exporter_config = KvIndexerExporter::LoadConfig(path);
-      kv_indexer_exporter_ =
-          std::make_unique<KvIndexerExporter>(std::move(exporter_config), [this] {
-            std::vector<KvEvent> snapshot;
-            for (const auto* backend : registry_.All()) {
-              if (backend->Tier() != TierType::DRAM) continue;
-              auto keys = backend->SnapshotOwnedKeys();
-              snapshot.insert(snapshot.end(), std::make_move_iterator(keys.begin()),
-                              std::make_move_iterator(keys.end()));
-            }
-            return snapshot;
-          });
-      kv_indexer_exporter_->Start(path);
-    } catch (const std::exception& exception) {
-      MORI_UMBP_ERROR("[PoolClient] invalid KV Indexer exporter config '{}': {}", path,
-                      exception.what());
-      Shutdown();
-      return false;
-    }
-  }
-
   MORI_UMBP_INFO("[PoolClient] Initialized node_id='{}'", config_.master_config.node_id);
   return true;
 }
@@ -1356,12 +1332,6 @@ bool PoolClient::Init() {
 void PoolClient::Shutdown() {
   if (!initialized_) return;
   initialized_ = false;
-
-  // The exporter borrows the registry. Join it before tearing down backends.
-  if (kv_indexer_exporter_) {
-    kv_indexer_exporter_->Stop();
-    kv_indexer_exporter_.reset();
-  }
 
   // Stop the async re-cache worker first: it calls ExecuteLocalPut (which uses
   // the registry + master_client_), so it must be joined before those are torn

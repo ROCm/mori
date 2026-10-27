@@ -3,4 +3,4 @@
 at commit `e4d4a9a7de5454cd8b854b21af723c2155a55a3d`.
 It is Copyright (c) 2026 The SGLang Authors, licensed under Apache-2.0;
 see [LICENSE.sgl-kv-indexer](LICENSE.sgl-kv-indexer).
-The filename is prefixed to avoid collisions with MoRI's configuration proto.
+The filename is prefixed to identify the upstream protocol.
