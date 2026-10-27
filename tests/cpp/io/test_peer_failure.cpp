@@ -200,6 +200,9 @@ void CasePortFailureScopedToPort() {
 
   Require(!tracker.IsQpAlive(Qp(10)), "QP on the downed port must be dead");
   Require(tracker.IsQpAlive(Qp(11)), "QP on another port of the same device must stay alive");
+  Require(!tracker.NeedsQpReplacement(Qp(10)), "a temporary port error must not replace its QP");
+  tracker.MarkQpFailed(Qp(10));
+  Require(tracker.NeedsQpReplacement(Qp(10)), "a QP error must still replace a QP on a down port");
 }
 
 // A link flap must not condemn the NIC for the rest of the process.

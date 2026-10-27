@@ -263,6 +263,13 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   }
 
   deviceCtxs.resize(availDevices.size(), nullptr);
+  portDown_ = std::make_unique<std::atomic<bool>[]>(availDevices.size());
+  portRejected_ = std::make_unique<std::atomic<uint64_t>[]>(availDevices.size());
+  for (size_t i = 0; i < availDevices.size(); ++i) {
+    portDown_[i].store(false, std::memory_order_relaxed);
+    portRejected_[i].store(0, std::memory_order_relaxed);
+  }
+  env::Override("MORI_IO_PORT_DOWN_FAIL_FAST", portDownFailFast_, mori::env::detail::ParseBool);
   topo.reset(new application::TopoSystem());
 
   bool enableAsyncEvents = true;
@@ -278,8 +285,30 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
     asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(
-        devices, logger, std::move(handler),
-        [this](const PeerFailureReport& report) { peerFailures_.Report(report); });
+        devices, logger, std::move(handler), [this](const PeerFailureReport& report) {
+          if (portDownFailFast_ && report.scope == FailureScope::kPort) {
+            for (size_t i = 0; i < availDevices.size(); ++i) {
+              const auto& [device, port] = availDevices[i];
+              if (device->Name() != report.event.deviceName || port != report.event.portNum)
+                continue;
+              bool down = !report.recovery;
+              bool previous = portDown_[i].exchange(down, std::memory_order_relaxed);
+              // Publish before logging: a logging failure must not hide the event.
+              peerFailures_.Report(report);
+              if (down && !previous) {
+                MORI_IO_ERROR("local port {}:{} is down; rejecting new submissions until ACTIVE",
+                              device->Name(), port);
+              } else if (!down && previous) {
+                MORI_IO_INFO("local port {}:{} is ACTIVE; rejected {} submission(s) while down",
+                             device->Name(), port,
+                             portRejected_[i].exchange(0, std::memory_order_relaxed));
+              }
+              return;
+            }
+          }
+          // Publish after the gate update, so consumers observe consistent admission.
+          peerFailures_.Report(report);
+        });
     if (!asyncEventMonitor_ && logger) {
       logger->error("Failed to start RDMA async event monitor; continuing without it");
     }
@@ -290,6 +319,10 @@ RdmaManager::~RdmaManager() {
   // Join the monitor thread first: its handlers reach back into this object and
   // into endpoint ledgers, neither of which may be torn down under it.
   asyncEventMonitor_.reset();
+
+  for (const auto& [device, port] : availDevices) {
+    Verbs().ReleaseAsyncContext(device->GetIbvContext());
+  }
 
   for (auto* devCtx : deviceCtxs) {
     if (devCtx != nullptr) {
@@ -467,9 +500,10 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
 
 EpPairVec RdmaManager::GetLiveEndpoints(EngineKey engine, TopoKeyPair key) {
   EpPairVec eps = GetAllEndpoint(engine, key);
-  eps.erase(std::remove_if(
-                eps.begin(), eps.end(),
-                [this](const EpPair& ep) { return !IsQpAlive(ep.ldevId, ep.local.handle.qpn); }),
+  eps.erase(std::remove_if(eps.begin(), eps.end(),
+                           [this](const EpPair& ep) {
+                             return NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn);
+                           }),
             eps.end());
   return eps;
 }
@@ -569,6 +603,8 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
 
   application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
+  // A newly allocated CQ/QP may reuse an address from a retired endpoint.
+  Verbs().ForgetAsyncEndpoint(devCtx->GetIbvContext(), rdmaEp.handle.qpn, rdmaEp.ibvHandle.cq);
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
@@ -584,6 +620,8 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
     const bool destroyed = deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
     // Drop it only once gone, so the number cannot be reused under a stale owner.
     if (destroyed) {
+      Verbs().ForgetAsyncEndpoint(availDevices[devId].first->GetIbvContext(), ep.handle.qpn,
+                                  ep.ibvHandle.cq);
       peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
     }
     return destroyed;
@@ -640,6 +678,30 @@ bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.P
 
 bool RdmaManager::IsQpAlive(int devId, uint32_t qpNum) const {
   return peerFailures_.IsQpAlive(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
+}
+
+bool RdmaManager::NeedsQpReplacement(int devId, uint32_t qpNum) const {
+  return peerFailures_.NeedsQpReplacement(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
+}
+
+bool RdmaManager::RejectIfPortDown(const EpPairVec& eps, TransferStatus* status) {
+  for (const auto& ep : eps) {
+    if (!portDown_[ep.ldevId].load(std::memory_order_relaxed)) continue;
+    portRejected_[ep.ldevId].fetch_add(1, std::memory_order_relaxed);
+    // Reuse the engine's existing log deduplication. The port transition was
+    // already logged once; do not emit an ERROR for every rejected transfer.
+    auto meta = std::make_shared<CqCallbackMeta>(status, 0, 0);
+    internal::PublishCurrentIoCallDiagnostics(meta);
+    meta->diagnostics.MarkRootCause();
+    meta->diagnostics.TryMarkLogged(internal::IoFailureKind::RootCause);
+    const auto& [device, port] = availDevices[ep.ldevId];
+    status->Update(
+        StatusCode::ERR_RDMA_OP,
+        "local port " + device->Name() + ":" + std::to_string(port) +
+            " is down (IBV_EVENT_PORT_ERR); rejecting new submissions until it is ACTIVE again");
+    return true;
+  }
+  return false;
 }
 
 void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText) {
@@ -1513,6 +1575,7 @@ void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
+  if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
@@ -1538,6 +1601,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
+  if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
 
   const bool chunk = config.enableTransferChunking;
   const bool canUseWorkerChunking =
@@ -1640,6 +1704,14 @@ bool RdmaBackendSession::Alive() const {
     if (!rdma_->IsQpAlive(ep.ldevId, ep.local.handle.qpn)) return false;
   }
   return true;
+}
+
+bool RdmaBackendSession::NeedsQpReplacement() const {
+  if (rdma_ == nullptr) return false;
+  for (const auto& ep : eps) {
+    if (rdma_->NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn)) return true;
+  }
+  return false;
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -1965,7 +2037,7 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      if (it->second->Alive()) return it->second.get();
+      if (!it->second->NeedsQpReplacement()) return it->second.get();
       auto retry = replaceRetryAt.find(connKey);
       if (retry != replaceRetryAt.end() && std::chrono::steady_clock::now() < retry->second) {
         return it->second.get();

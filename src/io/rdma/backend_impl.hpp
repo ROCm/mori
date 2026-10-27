@@ -126,12 +126,15 @@ class RdmaManager {
   bool PopPeerFailure(PeerFailureEvent* out);
   // False once a failure covering this QP is observed; a slow QP stays alive.
   bool IsQpAlive(int devId, uint32_t qpNum) const;
+  bool NeedsQpReplacement(int devId, uint32_t qpNum) const;
   // Records IBV_WC_RETRY_EXC_ERR: the only place peer death is observable.
   void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
   // Records any other error completion: the QP is in ERR, but no event is raised.
   void RecordQpFailed(const EpPair& ep);
   // Name of an available device; availDevices is fixed, so this takes no lock.
   std::string DeviceName(int devId) const;
+  // Session admission only: never reject part-way through posting a transfer.
+  bool RejectIfPortDown(const EpPairVec& eps, TransferStatus* status);
 
  private:
   application::RdmaDeviceContext* GetOrCreateDeviceContext(int devId);
@@ -155,6 +158,9 @@ class RdmaManager {
 
   // Self-synchronizing, so not guarded by `mu`; its writer threads join first.
   PeerFailureTracker peerFailures_;
+  bool portDownFailFast_{true};
+  std::unique_ptr<std::atomic<bool>[]> portDown_;
+  std::unique_ptr<std::atomic<uint64_t>[]> portRejected_;
 
   // Declared last so it is the first member destroyed, and explicitly reset at
   // the top of ~RdmaManager: the monitor thread calls into peerFailures_.
@@ -317,6 +323,7 @@ class RdmaBackendSession : public BackendSession {
                       bool isRead);
 
   bool Alive() const;
+  bool NeedsQpReplacement() const;
 
  private:
   RdmaBackendConfig config{};
