@@ -127,6 +127,42 @@ TEST(PageBackend, NumaBindingAndPreferredAllocationAgree) {
 #endif
 }
 
+// Placement only: the buffers need not actually be bound (not strict), so this runs on a
+// single-node host too.
+std::unique_ptr<PageBackend> MakeTwoNodeBackend() {
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {64 * 4096, 64 * 4096};
+  cfg.numa_nodes = {0, 1};
+  cfg.numa_strict = false;
+  auto backend = std::make_unique<PageBackend>(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  return backend->Init(nullptr) ? std::move(backend) : nullptr;
+}
+
+TEST(PageBackend, NumaWithoutHintFillsBuffersEvenly) {
+  auto backend = MakeTwoNodeBackend();
+  ASSERT_NE(backend, nullptr);
+  std::vector<uint32_t> buffers;
+  for (int i = 0; i < 4; ++i) {
+    auto r =
+        backend->BatchAllocate({AllocateRequest{"k" + std::to_string(i), 16 * 4096, -1}}).front();
+    ASSERT_EQ(r.outcome, AllocateOutcome::kSuccessAllocated);
+    for (const auto& page : r.pages) EXPECT_EQ(page.buffer_index, r.pages.front().buffer_index);
+    buffers.push_back(r.pages.front().buffer_index);
+  }
+  EXPECT_EQ(buffers, (std::vector<uint32_t>{0, 1, 0, 1}));
+}
+
+TEST(PageBackend, NumaHintStillWinsOverAnEvenFill) {
+  auto backend = MakeTwoNodeBackend();
+  ASSERT_NE(backend, nullptr);
+  for (int i = 0; i < 3; ++i) {
+    auto r =
+        backend->BatchAllocate({AllocateRequest{"k" + std::to_string(i), 16 * 4096, 0}}).front();
+    ASSERT_EQ(r.outcome, AllocateOutcome::kSuccessAllocated);
+    for (const auto& page : r.pages) EXPECT_EQ(page.buffer_index, 0u);
+  }
+}
+
 TEST(PageBackend, NumaRejectsMismatchedLayoutBeforeAllocating) {
   HostPageMemorySource::Options opts;
   opts.numa_nodes = {0, 1};
