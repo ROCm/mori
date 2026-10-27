@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /**
  * @file slot.hip.hpp
  * @brief Wave-slot packing/unpacking utilities for the host-to-device queues
@@ -33,16 +54,15 @@ namespace mori::kiwi::queue {
  * @param wave_slot_id Which wave-slot in a multi-slot push (default 0)
  * @return Packed 64-bit value for this lane
  */
-__host__ __device__ inline uint64_t pack_wave_lane(
-    const void* data, int lane_id, uint8_t epoch, int wave_slot_id = 0)
-{
-    if (lane_id < 7) {
-        uint64_t val;
-        const unsigned char* src = reinterpret_cast<const unsigned char*>(data);
-        __builtin_memcpy(&val, src + wave_slot_id * 56 + lane_id * 8, 8);
-        return val;
-    }
-    return static_cast<uint64_t>(epoch);
+__host__ __device__ inline uint64_t pack_wave_lane(const void* data, int lane_id, uint8_t epoch,
+                                                   int wave_slot_id = 0) {
+  if (lane_id < 7) {
+    uint64_t val;
+    const unsigned char* src = reinterpret_cast<const unsigned char*>(data);
+    __builtin_memcpy(&val, src + wave_slot_id * 56 + lane_id * 8, 8);
+    return val;
+  }
+  return static_cast<uint64_t>(epoch);
 }
 
 /**
@@ -54,11 +74,11 @@ __host__ __device__ inline uint64_t pack_wave_lane(
  * @param buf Output buffer (must be at least 56 bytes)
  */
 __host__ __device__ inline void unpack_wave_slot(const uint64_t slot[8], void* buf) {
-    unsigned char* dst = reinterpret_cast<unsigned char*>(buf);
-    for (int lane = 0; lane < 7; ++lane) {
-        __builtin_memcpy(dst + lane * 8, &slot[lane], 8);
-    }
-    // Lane 7 is epoch-only, no payload to extract
+  unsigned char* dst = reinterpret_cast<unsigned char*>(buf);
+  for (int lane = 0; lane < 7; ++lane) {
+    __builtin_memcpy(dst + lane * 8, &slot[lane], 8);
+  }
+  // Lane 7 is epoch-only, no payload to extract
 }
 
 /**
@@ -70,7 +90,7 @@ __host__ __device__ inline void unpack_wave_slot(const uint64_t slot[8], void* b
  * @return Epoch value (0-255)
  */
 __host__ __device__ inline uint8_t get_epoch(uint64_t slot_val) {
-    return static_cast<uint8_t>(slot_val & 0xFF);
+  return static_cast<uint8_t>(slot_val & 0xFF);
 }
 
-} // namespace kiwi::queue
+}  // namespace mori::kiwi::queue

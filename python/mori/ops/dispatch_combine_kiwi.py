@@ -144,7 +144,9 @@ def _element_size(dtype):
 def _combine_dtype(config):
     dispatch_dtype = config.data_type
     dispatch_size = _element_size(dispatch_dtype)
-    max_size = config.max_token_type_size if config.max_token_type_size > 0 else dispatch_size
+    max_size = (
+        config.max_token_type_size if config.max_token_type_size > 0 else dispatch_size
+    )
     if max_size == dispatch_size:
         return dispatch_dtype
     if max_size == 2:
@@ -210,7 +212,9 @@ class EpDispatchCombineKiwiOp:
         self.config = config
         self.device = torch.device("cuda", torch.cuda.current_device())
         self._dispatch_dtype = config.data_type
-        self._combine_dtype = combine_dtype if combine_dtype is not None else _combine_dtype(config)
+        self._combine_dtype = (
+            combine_dtype if combine_dtype is not None else _combine_dtype(config)
+        )
 
         cfg = ext.KiwiEpOpConfig()
         cfg.rank = config.rank
@@ -224,7 +228,9 @@ class EpDispatchCombineKiwiOp:
         cfg.dispatch_quant_format = _quant_format(self._dispatch_dtype)
         cfg.combine_quant_format = _quant_format(self._combine_dtype)
         cfg.dispatch_scale_dim = config.scale_dim
-        cfg.dispatch_scale_type_size = config.scale_type_size if config.scale_dim > 0 else 0
+        cfg.dispatch_scale_type_size = (
+            config.scale_type_size if config.scale_dim > 0 else 0
+        )
         cfg.num_blocks = num_blocks
         cfg.num_proxy_threads = num_proxy_threads
         cfg.queue_capacity = queue_capacity
@@ -247,7 +253,9 @@ class EpDispatchCombineKiwiOp:
         topk = config.num_experts_per_token
         h = self._handle
         self._out = _view(
-            h.recv_hidden_ptr(), (self._max_slots, self._dispatch_hidden), self._dispatch_dtype,
+            h.recv_hidden_ptr(),
+            (self._max_slots, self._dispatch_hidden),
+            self._dispatch_dtype,
             self.device,
         )
         self._out_weights = _view(
@@ -264,7 +272,9 @@ class EpDispatchCombineKiwiOp:
             device=self.device,
         )
         self._combine_out_weights = torch.empty(
-            (config.max_num_inp_token_per_rank, topk), dtype=torch.float32, device=self.device
+            (config.max_num_inp_token_per_rank, topk),
+            dtype=torch.float32,
+            device=self.device,
         )
         self._registered_combine_input = None
         self._last_combine = None
@@ -288,7 +298,9 @@ class EpDispatchCombineKiwiOp:
         stride = self.max_num_tokens_to_send()
         return int(flat_idx) // stride, int(flat_idx) % stride
 
-    def get_registered_combine_input_buffer(self, dtype: torch.dtype, hidden_dim: int = -1):
+    def get_registered_combine_input_buffer(
+        self, dtype: torch.dtype, hidden_dim: int = -1
+    ):
         hidden = hidden_dim if hidden_dim > 0 else self._combine_hidden
         if hidden != self._combine_hidden:
             raise ValueError(
@@ -297,7 +309,9 @@ class EpDispatchCombineKiwiOp:
             )
         buf = self._registered_combine_input
         if buf is None or buf.dtype != dtype:
-            buf = torch.empty((self._max_slots, hidden), dtype=dtype, device=self.device)
+            buf = torch.empty(
+                (self._max_slots, hidden), dtype=dtype, device=self.device
+            )
             self._registered_combine_input = buf
         return buf
 
@@ -323,21 +337,35 @@ class EpDispatchCombineKiwiOp:
         rows; the first ``total_recv[0]`` rows are valid.
         """
         if routing is not None or return_routing:
-            raise NotImplementedError("EpDispatchCombineKiwiOp has no routing-handle path")
+            raise NotImplementedError(
+                "EpDispatchCombineKiwiOp has no routing-handle path"
+            )
         if call_local_expert_count:
-            raise NotImplementedError("EpDispatchCombineKiwiOp does not count local experts")
+            raise NotImplementedError(
+                "EpDispatchCombineKiwiOp does not count local experts"
+            )
         num_tokens = int(input.size(0))
-        self._check_tensor("input", input, self._dispatch_dtype, (num_tokens, self._dispatch_hidden))
         self._check_tensor(
-            "weights", weights, torch.float32, (num_tokens, self.config.num_experts_per_token)
+            "input", input, self._dispatch_dtype, (num_tokens, self._dispatch_hidden)
         )
         self._check_tensor(
-            "indices", indices, torch.int32, (num_tokens, self.config.num_experts_per_token)
+            "weights",
+            weights,
+            torch.float32,
+            (num_tokens, self.config.num_experts_per_token),
+        )
+        self._check_tensor(
+            "indices",
+            indices,
+            torch.int32,
+            (num_tokens, self.config.num_experts_per_token),
         )
         scales_ptr = 0
         out_scales = None
         if scales is not None and scales.numel() > 0 and self.config.scale_dim > 0:
-            self._check_tensor("scales", scales, scales.dtype, (num_tokens, self.config.scale_dim))
+            self._check_tensor(
+                "scales", scales, scales.dtype, (num_tokens, self.config.scale_dim)
+            )
             if scales.element_size() != self.config.scale_type_size:
                 raise ValueError(
                     f"scales element size {scales.element_size()} != "
@@ -354,7 +382,13 @@ class EpDispatchCombineKiwiOp:
             num_tokens,
             _current_stream(),
         )
-        return (self._out, self._out_weights, out_scales, self._out_indices, self._total_recv)
+        return (
+            self._out,
+            self._out_weights,
+            out_scales,
+            self._out_indices,
+            self._total_recv,
+        )
 
     def dispatch_send(
         self,
@@ -367,11 +401,18 @@ class EpDispatchCombineKiwiOp:
         call_local_expert_count: bool = False,
     ):
         return self.dispatch(
-            input, weights, scales, indices, call_local_expert_count=call_local_expert_count
+            input,
+            weights,
+            scales,
+            indices,
+            call_local_expert_count=call_local_expert_count,
         )
 
     def dispatch_recv(
-        self, block_num: int = -1, warp_per_block: int = -1, call_local_expert_count: bool = False
+        self,
+        block_num: int = -1,
+        warp_per_block: int = -1,
+        call_local_expert_count: bool = False,
     ):
         """No-op: dispatch_send already completes the receive on the stream."""
 
@@ -398,14 +439,20 @@ class EpDispatchCombineKiwiOp:
         when ``weights`` is None.
         """
         if routing is not None:
-            raise NotImplementedError("EpDispatchCombineKiwiOp has no routing-handle path")
+            raise NotImplementedError(
+                "EpDispatchCombineKiwiOp has no routing-handle path"
+            )
         num_tokens = self._handle.num_input_tokens()
         if input.dtype != self._combine_dtype:
             raise ValueError(
                 f"combine input dtype {input.dtype} != configured combine dtype "
                 f"{self._combine_dtype}"
             )
-        if input.dim() != 2 or input.size(1) != self._combine_hidden or not input.is_contiguous():
+        if (
+            input.dim() != 2
+            or input.size(1) != self._combine_hidden
+            or not input.is_contiguous()
+        ):
             raise ValueError(
                 f"combine input must be contiguous [rows, {self._combine_hidden}], "
                 f"got {tuple(input.shape)}"
@@ -446,7 +493,9 @@ class EpDispatchCombineKiwiOp:
     def combine_recv(self, block_num: int = -1, warp_per_block: int = -1):
         """Returns the outputs of the preceding combine_send."""
         if self._last_combine is None:
-            raise RuntimeError("combine_recv requires a prior combine/combine_send call")
+            raise RuntimeError(
+                "combine_recv requires a prior combine/combine_send call"
+            )
         return self._last_combine
 
     # ----- state -----
@@ -460,7 +509,10 @@ class EpDispatchCombineKiwiOp:
         ``src_rank * max_num_tokens_to_send() + src_token_id``."""
         count = self._handle.copy_recv_count_to_host(_current_stream())
         return _view(
-            self._handle.recv_src_token_pos_ptr(), (self._max_slots,), torch.int32, self.device
+            self._handle.recv_src_token_pos_ptr(),
+            (self._max_slots,),
+            torch.int32,
+            self.device,
         )[:count]
 
     def set_debug_timing_enabled(self, enabled: bool):
@@ -494,7 +546,9 @@ class EpDispatchCombineKiwiOp:
         if tensor.dtype != dtype:
             raise ValueError(f"{name} dtype must be {dtype}, got {tensor.dtype}")
         if tuple(tensor.shape) != tuple(shape):
-            raise ValueError(f"{name} shape must be {tuple(shape)}, got {tuple(tensor.shape)}")
+            raise ValueError(
+                f"{name} shape must be {tuple(shape)}, got {tuple(tensor.shape)}"
+            )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 

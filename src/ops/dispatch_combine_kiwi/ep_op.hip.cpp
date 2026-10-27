@@ -140,8 +140,8 @@ void ep_op_t::dispatch(const void* input, const float* weights, const void* scal
   dispatch_enqueue(*ctx_, *gctx_, input, indices, weights, scales, num_tokens, stream);
 }
 
-void ep_op_t::combine(const void* input, const float* weights, const int32_t* indices,
-                      void* output, float* output_weights, int num_tokens, hipStream_t stream) {
+void ep_op_t::combine(const void* input, const float* weights, const int32_t* indices, void* output,
+                      float* output_weights, int num_tokens, hipStream_t stream) {
   combine_enqueue(*ctx_, *gctx_, input, weights, nullptr, indices, output,
                   weights != nullptr ? output_weights : nullptr, num_tokens, stream);
 }

@@ -1,3 +1,24 @@
+// Copyright © Advanced Micro Devices, Inc. All rights reserved.
+//
+// MIT License
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 /**
  * @file chunk.hip.hpp
  * @brief Device-to-host wire format and device push API
@@ -41,13 +62,14 @@
 
 #pragma once
 
-#include "address_space.hpp"
-#include "../error.hpp"
-
 #include <hip/hip_runtime.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+
+#include "../error.hpp"
+#include "address_space.hpp"
 
 // Every device-to-host push is wavefront-collective over 64 lanes (one chunk
 // per lane). GFX9 (CDNA: gfx90a, gfx942, gfx950) runs only wave64.
@@ -81,15 +103,14 @@ inline constexpr size_t kLineBytes = kChunksPerLine * sizeof(Chunk);
 /// Chunks a message of `bytes` payload bytes uses (a header-only message
 /// still uses one).
 __host__ __device__ constexpr size_t message_chunks(size_t bytes) {
-    return bytes == 0 ? 1 : (bytes + kChunkPayloadBytes - 1) / kChunkPayloadBytes;
+  return bytes == 0 ? 1 : (bytes + kChunkPayloadBytes - 1) / kChunkPayloadBytes;
 }
 
-} // namespace detail
+}  // namespace detail
 
 /// Ring lines a message of `bytes` payload bytes occupies.
 __host__ __device__ constexpr size_t message_lines(size_t bytes) {
-    return (detail::message_chunks(bytes) + detail::kChunksPerLine - 1) /
-           detail::kChunksPerLine;
+  return (detail::message_chunks(bytes) + detail::kChunksPerLine - 1) / detail::kChunksPerLine;
 }
 
 static_assert(message_lines(kMaxMessageBytes) == kMaxMessageLines);
@@ -99,31 +120,30 @@ namespace detail {
 /// Signal word of a chunk; `bytes` and `metadata` are nonzero only in chunk 0.
 __host__ __device__ constexpr uint64_t make_signal(uint8_t epoch, uint32_t bytes,
                                                    uint32_t metadata) {
-    return static_cast<uint64_t>(epoch)
-         | (static_cast<uint64_t>(bytes & 0xffffu) << 16)
-         | (static_cast<uint64_t>(metadata) << 32);
+  return static_cast<uint64_t>(epoch) | (static_cast<uint64_t>(bytes & 0xffffu) << 16) |
+         (static_cast<uint64_t>(metadata) << 32);
 }
 __host__ __device__ constexpr uint8_t signal_epoch(uint64_t signal) {
-    return static_cast<uint8_t>(signal);
+  return static_cast<uint8_t>(signal);
 }
 __host__ __device__ constexpr uint32_t signal_bytes(uint64_t signal) {
-    return static_cast<uint32_t>(signal >> 16) & 0xffffu;
+  return static_cast<uint32_t>(signal >> 16) & 0xffffu;
 }
 __host__ __device__ constexpr uint32_t signal_metadata(uint64_t signal) {
-    return static_cast<uint32_t>(signal >> 32);
+  return static_cast<uint32_t>(signal >> 32);
 }
 
 /// Lap epoch of absolute line index `line`.
 __host__ __device__ constexpr uint8_t line_epoch(uint64_t line, uint32_t log2_capacity) {
-    return static_cast<uint8_t>(line >> log2_capacity);
+  return static_cast<uint8_t>(line >> log2_capacity);
 }
 
 /// Lane 0's value in every lane, kept wave-uniform (v_readfirstlane_b32, so
 /// the result lives in SGPRs). The whole wavefront must be active.
 __device__ __forceinline__ uint64_t broadcast_lane0(uint64_t value) {
-    const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(value));
-    const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(value >> 32));
-    return (static_cast<uint64_t>(hi) << 32) | lo;
+  const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(value));
+  const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(value >> 32));
+  return (static_cast<uint64_t>(hi) << 32) | lo;
 }
 
 /// Lane 0's copy of `value` in every lane, word by word, so the result lives
@@ -132,43 +152,43 @@ __device__ __forceinline__ uint64_t broadcast_lane0(uint64_t value) {
 /// (queue indices, pointers) would otherwise stay in VGPRs and every push
 /// would run per-lane compares and branches. One wave must own the value and
 /// the whole wavefront must be active.
-template<typename T>
+template <typename T>
 __device__ __forceinline__ T wave_uniform(const T& value) {
-    static_assert(sizeof(T) % sizeof(uint32_t) == 0, "whole 32-bit words only");
-    uint32_t words[sizeof(T) / sizeof(uint32_t)];
-    __builtin_memcpy(words, &value, sizeof(T));
+  static_assert(sizeof(T) % sizeof(uint32_t) == 0, "whole 32-bit words only");
+  uint32_t words[sizeof(T) / sizeof(uint32_t)];
+  __builtin_memcpy(words, &value, sizeof(T));
 #pragma unroll
-    for (uint32_t& w : words) w = __builtin_amdgcn_readfirstlane(w);
-    T out;
-    __builtin_memcpy(&out, words, sizeof(T));
-    return out;
+  for (uint32_t& w : words) w = __builtin_amdgcn_readfirstlane(w);
+  T out;
+  __builtin_memcpy(&out, words, sizeof(T));
+  return out;
 }
 
 /// Published consumer index, re-read from host memory on every call.
 __device__ __forceinline__ uint64_t load_published(global_ptr<const uint64_t> index) {
-    return __hip_atomic_load(index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  return __hip_atomic_load(index, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 /// Payload word `__lane_id()` of `message`. Every word is read at a constant
 /// offset and picked with selects, so a message held in registers stays there
 /// (no dynamically indexed private array, no scratch).
-template<typename T>
+template <typename T>
 __device__ __forceinline__ uint64_t select_lane_word(const T& message) {
-    constexpr size_t bytes = sizeof(T);
-    const unsigned char* src = reinterpret_cast<const unsigned char*>(&message);
-    const size_t lane = __lane_id();
-    uint64_t selected = 0;
+  constexpr size_t bytes = sizeof(T);
+  const unsigned char* src = reinterpret_cast<const unsigned char*>(&message);
+  const size_t lane = __lane_id();
+  uint64_t selected = 0;
 #pragma unroll
-    for (size_t k = 0; k < message_chunks(bytes); ++k) {
-        uint64_t word = 0;
-        if (k < bytes / kChunkPayloadBytes) {
-            __builtin_memcpy(&word, src + k * kChunkPayloadBytes, kChunkPayloadBytes);
-        } else {
-            __builtin_memcpy(&word, src + k * kChunkPayloadBytes, bytes % kChunkPayloadBytes);
-        }
-        selected = lane == k ? word : selected;
+  for (size_t k = 0; k < message_chunks(bytes); ++k) {
+    uint64_t word = 0;
+    if (k < bytes / kChunkPayloadBytes) {
+      __builtin_memcpy(&word, src + k * kChunkPayloadBytes, kChunkPayloadBytes);
+    } else {
+      __builtin_memcpy(&word, src + k * kChunkPayloadBytes, bytes % kChunkPayloadBytes);
     }
-    return selected;
+    selected = lane == k ? word : selected;
+  }
+  return selected;
 }
 
 /// Lane c stores chunk c of a `bytes`-byte message of `lines` lines starting
@@ -177,32 +197,32 @@ __device__ __forceinline__ uint64_t select_lane_word(const T& message) {
 __device__ __forceinline__ void write_message(global_ptr<Chunk> ring, uint32_t log2_capacity,
                                               uint64_t base, uint64_t word, uint32_t bytes,
                                               uint32_t metadata, uint64_t lines) {
-    const size_t lane = __lane_id();
-    if (lane < lines * kChunksPerLine) {
-        const uint64_t line = base + lane / kChunksPerLine;
-        const uint8_t epoch = line_epoch(line, log2_capacity);
-        const uint64_t data = lane * kChunkPayloadBytes < bytes ? word : 0;
-        // Lane 0's header carries no epoch, so it is loop-invariant in a push
-        // loop; every lane ORs in its line's epoch (make_signal's low byte).
-        const uint64_t header = lane == 0 ? make_signal(0, bytes, metadata) : 0;
-        const uint64_t signal = header | epoch;
-        const uint64_t mask = (uint64_t{1} << log2_capacity) - 1;
-        ring[(line & mask) * kChunksPerLine + lane % kChunksPerLine] = Chunk{data, signal};
-    }
+  const size_t lane = __lane_id();
+  if (lane < lines * kChunksPerLine) {
+    const uint64_t line = base + lane / kChunksPerLine;
+    const uint8_t epoch = line_epoch(line, log2_capacity);
+    const uint64_t data = lane * kChunkPayloadBytes < bytes ? word : 0;
+    // Lane 0's header carries no epoch, so it is loop-invariant in a push
+    // loop; every lane ORs in its line's epoch (make_signal's low byte).
+    const uint64_t header = lane == 0 ? make_signal(0, bytes, metadata) : 0;
+    const uint64_t signal = header | epoch;
+    const uint64_t mask = (uint64_t{1} << log2_capacity) - 1;
+    ring[(line & mask) * kChunksPerLine + lane % kChunksPerLine] = Chunk{data, signal};
+  }
 }
 
 /// Debug builds trap unless all 64 lanes call the push (the wavefront
 /// contract); release builds check nothing.
 __device__ __forceinline__ void assert_full_wave() {
-    KIWI_QUEUE_ASSERT(__builtin_amdgcn_read_exec() == ~uint64_t{0});
+  KIWI_QUEUE_ASSERT(__builtin_amdgcn_read_exec() == ~uint64_t{0});
 }
 
 /// Wave-uniform message length; traps on a message that can never be framed.
 __device__ __forceinline__ uint32_t checked_bytes(size_t bytes) {
-    if (bytes > kMaxMessageBytes) {
-        __builtin_trap();
-    }
-    return static_cast<uint32_t>(bytes);
+  if (bytes > kMaxMessageBytes) {
+    __builtin_trap();
+  }
+  return static_cast<uint32_t>(bytes);
 }
 
 /**
@@ -212,55 +232,55 @@ __device__ __forceinline__ uint32_t checked_bytes(size_t bytes) {
  * device operations are wavefront-collective: all 64 lanes call them with
  * identical arguments.
  */
-template<typename Handle>
+template <typename Handle>
 struct PushApi {
-    /**
-     * @brief Push `message` (sizeof(T) bytes) held in registers
-     *
-     * Lane c selects payload word c with compile-time offsets, so the
-     * message is never placed in scratch. The whole message lives in every
-     * lane's registers; prefer push_shared() for large messages built in LDS.
-     */
-    template<typename T>
-    __device__ bool push_reg(const T& message, uint32_t metadata = 0) {
-        static_assert(std::is_trivially_copyable_v<T>, "push_reg() copies the message bytes");
-        static_assert(sizeof(T) <= kMaxMessageBytes, "message exceeds kMaxMessageBytes");
-        return handle().push_lanes(select_lane_word(message), sizeof(T), metadata);
-    }
+  /**
+   * @brief Push `message` (sizeof(T) bytes) held in registers
+   *
+   * Lane c selects payload word c with compile-time offsets, so the
+   * message is never placed in scratch. The whole message lives in every
+   * lane's registers; prefer push_shared() for large messages built in LDS.
+   */
+  template <typename T>
+  __device__ bool push_reg(const T& message, uint32_t metadata = 0) {
+    static_assert(std::is_trivially_copyable_v<T>, "push_reg() copies the message bytes");
+    static_assert(sizeof(T) <= kMaxMessageBytes, "message exceeds kMaxMessageBytes");
+    return handle().push_lanes(select_lane_word(message), sizeof(T), metadata);
+  }
 
-    /**
-     * @brief Push `bytes` bytes staged in shared memory
-     *
-     * Lane c reads payload word c (one ds_read_b64). `lds` is 8-byte aligned
-     * shared memory readable for round_up(bytes, 8) bytes and published (LDS
-     * barrier) before the call. Bytes of the last word past `bytes` are
-     * written to the ring but never returned by pop().
-     */
-    __device__ bool push_shared(const void* lds, size_t bytes, uint32_t metadata = 0) {
-        using LdsWord = const __attribute__((address_space(3))) uint64_t;
-        return push_words((LdsWord*)lds, bytes, metadata);  // address-space cast
-    }
+  /**
+   * @brief Push `bytes` bytes staged in shared memory
+   *
+   * Lane c reads payload word c (one ds_read_b64). `lds` is 8-byte aligned
+   * shared memory readable for round_up(bytes, 8) bytes and published (LDS
+   * barrier) before the call. Bytes of the last word past `bytes` are
+   * written to the ring but never returned by pop().
+   */
+  __device__ bool push_shared(const void* lds, size_t bytes, uint32_t metadata = 0) {
+    using LdsWord = const __attribute__((address_space(3))) uint64_t;
+    return push_words((LdsWord*)lds, bytes, metadata);  // address-space cast
+  }
 
-    /**
-     * @brief Push `bytes` bytes from global memory
-     *
-     * Same contract as push_shared() for an 8-byte aligned global pointer
-     * (one global_load_dwordx2 per lane).
-     */
-    __device__ bool push_global(const void* ptr, size_t bytes, uint32_t metadata = 0) {
-        return push_words((global_ptr<const uint64_t>)ptr, bytes, metadata);  // address-space cast
-    }
+  /**
+   * @brief Push `bytes` bytes from global memory
+   *
+   * Same contract as push_shared() for an 8-byte aligned global pointer
+   * (one global_load_dwordx2 per lane).
+   */
+  __device__ bool push_global(const void* ptr, size_t bytes, uint32_t metadata = 0) {
+    return push_words((global_ptr<const uint64_t>)ptr, bytes, metadata);  // address-space cast
+  }
 
-private:
-    __device__ Handle& handle() { return static_cast<Handle&>(*this); }
+ private:
+  __device__ Handle& handle() { return static_cast<Handle&>(*this); }
 
-    template<typename WordPtr>
-    __device__ bool push_words(WordPtr words, size_t bytes, uint32_t metadata) {
-        const uint32_t n = checked_bytes(bytes);
-        const size_t lane = __lane_id();
-        const uint64_t word = lane * kChunkPayloadBytes < n ? words[lane] : 0;
-        return handle().push_lanes(word, n, metadata);
-    }
+  template <typename WordPtr>
+  __device__ bool push_words(WordPtr words, size_t bytes, uint32_t metadata) {
+    const uint32_t n = checked_bytes(bytes);
+    const size_t lane = __lane_id();
+    const uint64_t word = lane * kChunkPayloadBytes < n ? words[lane] : 0;
+    return handle().push_lanes(word, n, metadata);
+  }
 };
 
 /**
@@ -272,32 +292,29 @@ private:
  * Context::progress()). ready() is a hint: it can be true while pop() still
  * returns false, when chunk 0 is visible before the message's other chunks.
  */
-template<typename Queue>
+template <typename Queue>
 class HostPollState {
-public:
-    __host__ bool ready() const {
-        return signal_epoch(*signal_) == expected_epoch_;
-    }
+ public:
+  __host__ bool ready() const { return signal_epoch(*signal_) == expected_epoch_; }
 
-    /// Rebind to the queue's current consumer position.
-    __host__ void refresh() {
-        const uint64_t head = queue_->consumer_position();
-        signal_ = reinterpret_cast<const volatile uint64_t*>(
-                      queue_->chunks_ + (head & queue_->capacity_mask_) * kChunksPerLine) + 1;
-        expected_epoch_ = line_epoch(head, queue_->log2_capacity_);
-    }
+  /// Rebind to the queue's current consumer position.
+  __host__ void refresh() {
+    const uint64_t head = queue_->consumer_position();
+    signal_ = reinterpret_cast<const volatile uint64_t*>(
+                  queue_->chunks_ + (head & queue_->capacity_mask_) * kChunksPerLine) +
+              1;
+    expected_epoch_ = line_epoch(head, queue_->log2_capacity_);
+  }
 
-private:
-    friend Queue;
+ private:
+  friend Queue;
 
-    __host__ explicit HostPollState(const Queue* queue) : queue_(queue) {
-        refresh();
-    }
+  __host__ explicit HostPollState(const Queue* queue) : queue_(queue) { refresh(); }
 
-    const Queue* queue_;
-    const volatile uint64_t* signal_ = nullptr;  ///< forces a fresh coherent load
-    uint8_t expected_epoch_ = 0;
+  const Queue* queue_;
+  const volatile uint64_t* signal_ = nullptr;  ///< forces a fresh coherent load
+  uint8_t expected_epoch_ = 0;
 };
 
-} // namespace detail
-} // namespace kiwi::queue
+}  // namespace detail
+}  // namespace mori::kiwi::queue

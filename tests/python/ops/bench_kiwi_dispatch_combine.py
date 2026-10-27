@@ -69,12 +69,19 @@ def fp8_dtype():
 
 def make_inputs(rank, num_tokens, args, dispatch_dtype, num_experts, device):
     gen = torch.Generator(device="cpu").manual_seed(4321 + rank)
-    tokens = torch.randn((num_tokens, args.hidden_dim), generator=gen).to(dispatch_dtype)
+    tokens = torch.randn((num_tokens, args.hidden_dim), generator=gen).to(
+        dispatch_dtype
+    )
     indices = torch.stack(
-        [torch.randperm(num_experts, generator=gen)[: args.topk] for _ in range(num_tokens)]
+        [
+            torch.randperm(num_experts, generator=gen)[: args.topk]
+            for _ in range(num_tokens)
+        ]
     ).to(torch.int32)
     weights = torch.rand((num_tokens, args.topk), generator=gen, dtype=torch.float32)
-    scales = torch.rand((num_tokens, args.scale_dim), generator=gen, dtype=torch.float32)
+    scales = torch.rand(
+        (num_tokens, args.scale_dim), generator=gen, dtype=torch.float32
+    )
     return tokens.to(device), weights.to(device), scales.to(device), indices.to(device)
 
 
@@ -182,8 +189,16 @@ def bench_one(op, args, num_tokens, dispatch_dtype, rank, world_size, device):
     op.reset()
     dist.barrier()
 
-    disp_bytes = recv * op._dispatch_hidden * torch.empty((), dtype=dispatch_dtype).element_size()
-    comb_bytes = recv * op._combine_hidden * torch.empty((), dtype=op._combine_dtype).element_size()
+    disp_bytes = (
+        recv
+        * op._dispatch_hidden
+        * torch.empty((), dtype=dispatch_dtype).element_size()
+    )
+    comb_bytes = (
+        recv
+        * op._combine_hidden
+        * torch.empty((), dtype=op._combine_dtype).element_size()
+    )
     local = {
         "recv": recv,
         "disp_us": disp_us,
@@ -222,7 +237,9 @@ def summarize(num_tokens, per_rank):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--num-tokens", default="1,32,128,1024", help="comma-separated tokens per rank to sweep"
+        "--num-tokens",
+        default="1,32,128,1024",
+        help="comma-separated tokens per rank to sweep",
     )
     parser.add_argument(
         "--max-num-inp-token-per-rank",
@@ -235,7 +252,10 @@ def main():
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--dtype", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
-        "--scale-dim", type=int, default=0, help="float32 scales per token (e.g. 56 for fp8)"
+        "--scale-dim",
+        type=int,
+        default=0,
+        help="float32 scales per token (e.g. 56 for fp8)",
     )
     parser.add_argument(
         "--combine-weights",
@@ -245,7 +265,9 @@ def main():
     parser.add_argument("--timing", choices=("graph", "eager"), default="graph")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--rcomp-backend", default="auto", help="auto, rdma-only, or hybrid")
+    parser.add_argument(
+        "--rcomp-backend", default="auto", help="auto, rdma-only, or hybrid"
+    )
     parser.add_argument("--num-blocks", type=int, default=0, help="0 picks it per call")
     parser.add_argument("--num-proxy-threads", type=int, default=4)
     parser.add_argument("--queue-capacity", type=int, default=2048)
@@ -303,7 +325,9 @@ def main():
             flush=True,
         )
     for num_tokens in token_counts:
-        per_rank = bench_one(op, args, num_tokens, dispatch_dtype, rank, world_size, device)
+        per_rank = bench_one(
+            op, args, num_tokens, dispatch_dtype, rank, world_size, device
+        )
         if rank == 0:
             summarize(num_tokens, per_rank)
 

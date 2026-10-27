@@ -44,9 +44,7 @@ namespace {
   throw std::runtime_error("mori::kiwi::rdma: " + what);
 }
 
-[[noreturn]] void fail_errno(const std::string& what) {
-  fail(what + ": " + std::strerror(errno));
-}
+[[noreturn]] void fail_errno(const std::string& what) { fail(what + ": " + std::strerror(errno)); }
 
 bool env_flag(const char* name) {
   const char* value = std::getenv(name);
@@ -271,15 +269,14 @@ void net_context_t::deregister_memory(mr_t& mr) {
   mr = mr_t{};
 }
 
-device_t::device_t(net_context_t& net, bootstrap_t& bootstrap, size_t max_sends,
-                   size_t max_inline)
+device_t::device_t(net_context_t& net, bootstrap_t& bootstrap, size_t max_sends, size_t max_inline)
     : net_(net) {
   const int nranks = bootstrap.size();
   const int me = bootstrap.rank();
   const ibv_device_attr& dev_attr = net.device_attr();
   max_sends_ = std::min(max_sends, static_cast<size_t>(dev_attr.max_qp_wr));
-  const size_t cqes = std::min(max_sends_ * static_cast<size_t>(nranks),
-                               static_cast<size_t>(dev_attr.max_cqe));
+  const size_t cqes =
+      std::min(max_sends_ * static_cast<size_t>(nranks), static_cast<size_t>(dev_attr.max_cqe));
 
   cq_ = ibv_create_cq(net.context(), static_cast<int>(cqes), nullptr, nullptr, 0);
   if (cq_ == nullptr) fail_errno("ibv_create_cq");
@@ -337,8 +334,7 @@ device_t::device_t(net_context_t& net, bootstrap_t& bootstrap, size_t max_sends,
   const uint8_t sl = static_cast<uint8_t>(env_int("MORI_KIWI_SL", 0));
   const uint8_t traffic_class = static_cast<uint8_t>(env_int("MORI_KIWI_TRAFFIC_CLASS", 0));
   for (int rank = 0; rank < nranks; ++rank) {
-    const qp_endpoint_t& remote =
-        all[static_cast<size_t>(rank) * nranks + static_cast<size_t>(me)];
+    const qp_endpoint_t& remote = all[static_cast<size_t>(rank) * nranks + static_cast<size_t>(me)];
     if (remote.source_rank != rank || remote.target_rank != me) {
       fail("QP endpoint exchange returned mismatched ranks");
     }
@@ -365,8 +361,8 @@ device_t::device_t(net_context_t& net, bootstrap_t& bootstrap, size_t max_sends,
       attr.ah_attr.grh.traffic_class = traffic_class;
     }
     if (ibv_modify_qp(qp, &attr,
-                      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                          IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
+                      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                          IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
       fail_errno("ibv_modify_qp(RTR) for rank " + std::to_string(rank));
     }
 
@@ -427,8 +423,7 @@ post_status_t device_t::post_put(int rank, const void* local, size_t size, uint3
 post_status_t device_t::post_puts(int rank, const void* local, size_t size, uint64_t remote_disp,
                                   const rmr_t& rmr) {
   if (size > max_inline_) {
-    fail("inline put of " + std::to_string(size) + " bytes exceeds " +
-         std::to_string(max_inline_));
+    fail("inline put of " + std::to_string(size) + " bytes exceeds " + std::to_string(max_inline_));
   }
   ibv_sge sge{};
   ibv_send_wr wr{};
@@ -446,8 +441,8 @@ post_status_t device_t::post_puts(int rank, const void* local, size_t size, uint
 }
 
 int device_t::rank_of_qp(uint32_t qp_num) const {
-  auto it = std::lower_bound(qp_num_to_rank_.begin(), qp_num_to_rank_.end(),
-                             std::make_pair(qp_num, -1));
+  auto it =
+      std::lower_bound(qp_num_to_rank_.begin(), qp_num_to_rank_.end(), std::make_pair(qp_num, -1));
   if (it == qp_num_to_rank_.end() || it->first != qp_num) return -1;
   return it->second;
 }

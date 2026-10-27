@@ -63,7 +63,9 @@ def _test_dispatch_combine(
         num_experts_per_token=num_experts_per_token,
         max_token_type_size=2,
     )
-    op = dispatch_combine_kiwi.EpDispatchCombineKiwiOp(config, rcomp_backend=rcomp_backend)
+    op = dispatch_combine_kiwi.EpDispatchCombineKiwiOp(
+        config, rcomp_backend=rcomp_backend
+    )
     test_case = EpDispatchCombineTestCase(
         config,
         combine_data_type=combine_data_type,

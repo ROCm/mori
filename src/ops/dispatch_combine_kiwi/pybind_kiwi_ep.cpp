@@ -96,8 +96,8 @@ PYBIND11_MODULE(libmori_kiwi_ep_pybinds, m) {
            py::arg("config"), py::arg("allgather"))
       .def(
           "dispatch",
-          [](ep_op_t& self, uintptr_t input, uintptr_t weights, uintptr_t scales,
-             uintptr_t indices, int num_tokens, uintptr_t stream) {
+          [](ep_op_t& self, uintptr_t input, uintptr_t weights, uintptr_t scales, uintptr_t indices,
+             int num_tokens, uintptr_t stream) {
             self.dispatch(as_ptr<const void>(input), as_ptr<const float>(weights),
                           as_ptr<const void>(scales), as_ptr<const int32_t>(indices), num_tokens,
                           as_stream(stream));
@@ -106,8 +106,8 @@ PYBIND11_MODULE(libmori_kiwi_ep_pybinds, m) {
           py::arg("num_tokens"), py::arg("stream"), py::call_guard<py::gil_scoped_release>())
       .def(
           "combine",
-          [](ep_op_t& self, uintptr_t input, uintptr_t weights, uintptr_t indices,
-             uintptr_t output, uintptr_t output_weights, int num_tokens, uintptr_t stream) {
+          [](ep_op_t& self, uintptr_t input, uintptr_t weights, uintptr_t indices, uintptr_t output,
+             uintptr_t output_weights, int num_tokens, uintptr_t stream) {
             self.combine(as_ptr<const void>(input), as_ptr<const float>(weights),
                          as_ptr<const int32_t>(indices), as_ptr<void>(output),
                          as_ptr<float>(output_weights), num_tokens, as_stream(stream));

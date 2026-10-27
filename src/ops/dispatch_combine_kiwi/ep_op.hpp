@@ -68,8 +68,8 @@ class ep_op_t {
   ep_op_t(const ep_op_t&) = delete;
   ep_op_t& operator=(const ep_op_t&) = delete;
 
-  void dispatch(const void* input, const float* weights, const void* scales,
-                const int32_t* indices, int num_tokens, hipStream_t stream);
+  void dispatch(const void* input, const float* weights, const void* scales, const int32_t* indices,
+                int num_tokens, hipStream_t stream);
 
   // `output` holds [num_tokens, combine_hidden_elems]; `output_weights` holds
   // [num_tokens, topk] and is written only when `weights` is non-null.
