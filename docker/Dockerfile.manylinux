@@ -1,0 +1,93 @@
+# Build image for the wheels mori publishes. It is the PyPA manylinux_2_28 image
+# (AlmaLinux 8, glibc 2.28, gcc-toolset) plus a ROCm dev stack, so a wheel built
+# here needs nothing newer than glibc 2.28 and installs on any distro at or above
+# it. A wheel built in docker/Dockerfile.dev inherits that image's glibc and
+# libstdc++ instead (manylinux_2_35 on Ubuntu 22.04, _2_39 on 24.04).
+# tools/build_manylinux_wheel.py is the build entry point.
+#
+# ROCm comes from AMD's RHEL 8 repos. The defaults install the 7.14 multi-arch
+# packages; the classic 7.2.x releases need:
+#   ROCM_VERSION=7.2.4
+#   ROCM_REPO=https://repo.radeon.com/rocm/rhel8/7.2.4/main
+#   ROCM_GPG=https://repo.radeon.com/rocm/rocm.gpg.key
+#   ROCM_PACKAGES="rocm-hip-runtime-devel rocm-smi-lib"
+ARG BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
+FROM ${BASE_IMAGE}
+
+ARG GPU_ARCHS="gfx942 gfx950"
+ARG ROCM_VERSION=7.14
+ARG ROCM_REPO=https://repo.amd.com/rocm/packages-multi-arch/rhel8/x86_64
+ARG ROCM_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+# Space-separated; {version} expands to ROCM_VERSION, {arch} to each GPU_ARCHS entry.
+ARG ROCM_PACKAGES="amdrocm-core-devel{version}-{arch}"
+# Same gRPC as Ubuntu 24.04 (protobuf 3.21), which UMBP is already built against there.
+ARG GRPC_VERSION=v1.51.1
+
+# libibverbs is dlopen'ed at runtime, so rdma-core-devel is here for its headers
+# only. openssl/zlib are gRPC's.
+RUN dnf install -y numactl-devel libdrm-devel rdma-core-devel openssl-devel zlib-devel && \
+    dnf clean all
+
+# ROCm's packages pull in EL8's python36, whose alternative outranks the image's
+# python3, so python3 is pointed back afterwards.
+RUN set -ex; \
+    py3="$(readlink -f /usr/bin/python3)"; \
+    printf '[rocm]\nname=ROCm %s\nbaseurl=%s\nenabled=1\ngpgcheck=1\ngpgkey=%s\n' \
+      "${ROCM_VERSION}" "${ROCM_REPO}" "${ROCM_GPG}" > /etc/yum.repos.d/rocm.repo; \
+    pkgs=""; \
+    for p in $(echo "${ROCM_PACKAGES}" | sed "s/{version}/${ROCM_VERSION}/g"); do \
+      case "$p" in \
+        *"{arch}"*) for a in ${GPU_ARCHS}; do pkgs="$pkgs $(echo "$p" | sed "s/{arch}/$a/g")"; done ;; \
+        *) pkgs="$pkgs $p" ;; \
+      esac; \
+    done; \
+    dnf install -y ${pkgs}; \
+    dnf clean all; \
+    alternatives --set python3 "${py3}"; \
+    test -e /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake
+
+# Left to find ROCm on its own, clang takes /opt/rocm-7.2.x/lib for the root of
+# the 7.2.x layout (llvm under lib/) and then cannot link -lamdhip64.
+ENV ROCM_PATH=/opt/rocm
+
+# CMake picks ROCm's clang for mori's C and C++ as well as its HIP, and that clang
+# settles on EL8's GCC 8 -- headers and libstdc++ -- instead of gcc-toolset's.
+# Config files beside it fix that for every clang, amdclang and hipcc run.
+RUN set -ex; \
+    bindir="$(dirname "$(readlink -f /opt/rocm/llvm/bin/clang++)")"; \
+    gccdir="$(dirname "$(gcc -print-libgcc-file-name)")"; \
+    for d in clang clang++; do echo "--gcc-install-dir=${gccdir}" > "${bindir}/${d}.cfg"; done
+
+# UMBP's control plane needs gRPC + Protobuf, which EL8 does not package. Built
+# shared into /usr/local, where tools/build_manylinux_wheel.py has auditwheel
+# vendor them into the wheel for libmori_umbp_pybinds.so and the UMBP servers.
+RUN set -ex; \
+    git clone --quiet --depth 1 --branch "${GRPC_VERSION}" --recurse-submodules \
+      --shallow-submodules https://github.com/grpc/grpc /tmp/grpc; \
+    cmake -S /tmp/grpc -B /tmp/grpc/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DBUILD_SHARED_LIBS=ON \
+      -DgRPC_INSTALL=ON \
+      -DgRPC_BUILD_TESTS=OFF \
+      -DgRPC_SSL_PROVIDER=package \
+      -DgRPC_ZLIB_PROVIDER=package \
+      -DgRPC_BUILD_CSHARP_EXT=OFF \
+      -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
+      -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF \
+      -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF \
+      -DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF \
+      -DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF \
+      -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF \
+      -Dprotobuf_BUILD_TESTS=OFF \
+      -DABSL_PROPAGATE_CXX_STD=ON; \
+    cmake --build /tmp/grpc/build -j"$(nproc)"; \
+    cmake --install /tmp/grpc/build; \
+    ldconfig; \
+    rm -rf /tmp/grpc
+
+# manylinux keeps every CPython off PATH, which leaves a shell here without pip.
+# Default to 3.12; tools/build_manylinux_wheel.py still puts the --python one first.
+ENV PATH=/opt/python/cp312-cp312/bin:${PATH}

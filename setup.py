@@ -170,6 +170,7 @@ def _detect_missing_umbp_deps() -> list:
             [
                 "/usr/include/grpcpp/grpcpp.h",
                 "/usr/include/x86_64-linux-gnu/grpcpp/grpcpp.h",
+                "/usr/local/include/grpcpp/grpcpp.h",
             ],
             "libgrpc++-dev",
         ),
@@ -177,6 +178,7 @@ def _detect_missing_umbp_deps() -> list:
             [
                 "/usr/include/google/protobuf/message.h",
                 "/usr/include/x86_64-linux-gnu/google/protobuf/message.h",
+                "/usr/local/include/google/protobuf/message.h",
             ],
             "libprotobuf-dev",
         ),
