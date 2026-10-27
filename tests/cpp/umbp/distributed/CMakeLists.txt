@@ -14,6 +14,10 @@
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+add_executable(test_kv_indexer_exporter test_kv_indexer_exporter.cpp)
+target_link_libraries(test_kv_indexer_exporter PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_kv_indexer_exporter PRIVATE cxx_std_17)
+add_test(NAME umbp_kv_indexer_exporter COMMAND test_kv_indexer_exporter)
 if(TARGET gRPC::grpc++)
   set(_TEST_GRPCPP_LIB gRPC::grpc++)
 elseif(TARGET grpc++)

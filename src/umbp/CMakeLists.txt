@@ -356,6 +356,27 @@ add_custom_target(umbp_workload_proto
                           ${UMBP_WORKLOAD_PROTO_HDRS})
 
 # ---------- Static library: umbp_common ---------------------------------------
+set(UMBP_INDEXER_SRCS)
+foreach(_indexer_proto sgl_kv_indexer kv_indexer_exporter)
+  set(_indexer_outputs
+      "${UMBP_PROTO_GEN_DIR}/${_indexer_proto}.pb.cc"
+      "${UMBP_PROTO_GEN_DIR}/${_indexer_proto}.pb.h"
+      "${UMBP_PROTO_GEN_DIR}/${_indexer_proto}.grpc.pb.cc"
+      "${UMBP_PROTO_GEN_DIR}/${_indexer_proto}.grpc.pb.h")
+  add_custom_command(
+    OUTPUT ${_indexer_outputs}
+    COMMAND
+      ${_PROTOBUF_PROTOC} --proto_path=${UMBP_PROTO_DIR}
+      --cpp_out=${UMBP_PROTO_GEN_DIR} --grpc_out=${UMBP_PROTO_GEN_DIR}
+      --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
+      ${_PROTOC_PROTO3_OPTIONAL_ARGS} ${UMBP_PROTO_DIR}/${_indexer_proto}.proto
+    DEPENDS ${UMBP_PROTO_DIR}/${_indexer_proto}.proto
+            ${UMBP_PROTO_DIR}/sgl_kv_indexer.proto
+    COMMENT "Generating ${_indexer_proto} C++ sources"
+    VERBATIM)
+  list(APPEND UMBP_INDEXER_SRCS ${_indexer_outputs})
+endforeach()
+
 # Shared between PoolClient integration and standalone control-plane tools.
 
 add_library(
@@ -367,6 +388,8 @@ add_library(
   ${UMBP_STANDALONE_PROTO_SRCS}
   ${UMBP_STANDALONE_GRPC_SRCS}
   ${UMBP_WORKLOAD_PROTO_SRCS}
+  ${UMBP_INDEXER_SRCS}
+  distributed/indexer/kv_indexer_exporter.cpp
   # Trace capture is a client feature: PoolClient records live traffic when
   # UMBP_WORKLOAD_TRACE_PATH is set, so the writer ships with the library. The
   # rest of the workload harness drives benchmarks and lives in
