@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI-IO Introduction &mdash; MORI development (6ff5a93a) documentation</title>
+  <title>MORI-IO Introduction &mdash; MORI development (a2c99bc7) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=86350990"></script>
+      <script src="_static/documentation_options.js?v=d892084b"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -227,7 +227,10 @@
 <li class="toctree-l2"><a class="reference internal" href="#example-basic-read-write">Example: Basic Read/Write</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#environment-configuration">Environment &amp; Configuration</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
-<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#nic-fault-injection-test-builds">NIC fault injection (test builds)</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">MORI UMBP Single-Node Smoke Test</a><ul>
@@ -823,10 +826,13 @@
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_FAIL_ON_ASYNC_EVENT</span></code></p></td>
 <td><p>When enabled, a fatal verbs async event (QP/CQ/device fatal) fails every in-flight transfer on the affected endpoints and marks them degraded so later submissions fail fast instead of hanging on a dead QP. Default on; set <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable and restore the previous hang-until-timeout behavior.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">IOEngineConfig.port</span> <span class="pre">=</span> <span class="pre">0</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_PORT_DOWN_FAIL_FAST</span></code></p></td>
+<td><p>Default on. After local PORT_ERR, new transfers using that port fail synchronously until PORT_ACTIVE or a one-second port recheck confirms ACTIVE. Already admitted transfers and their notification SENDs keep their normal retry behavior. Set <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable admission rejection; peer failure reporting remains enabled. Port recovery does not rebuild QPs that exhausted their retry budget.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">IOEngineConfig.port</span> <span class="pre">=</span> <span class="pre">0</span></code></p></td>
 <td><p>Auto-bind to a free port</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code></p></td>
 <td><p>MORI-IO loads libibverbs dynamically at runtime (<code class="docutils literal notranslate"><span class="pre">dlopen</span></code> of <code class="docutils literal notranslate"><span class="pre">libibverbs.so</span></code> / <code class="docutils literal notranslate"><span class="pre">libibverbs.so.1</span></code>) rather than linking it. To use an out-of-tree libibverbs, put its directory on <code class="docutils literal notranslate"><span class="pre">LD_LIBRARY_PATH</span></code>.</p></td>
 </tr>
 </tbody>
@@ -902,6 +908,34 @@ rocprofv3<span class="w"> </span>--marker-trace<span class="w"> </span>--<span c
 </tr>
 </tbody>
 </table>
+<section id="nic-fault-injection-test-builds">
+<h3>NIC fault injection (test builds)<a class="headerlink" href="#nic-fault-injection-test-builds" title="Link to this heading"></a></h3>
+<p>Configure with <code class="docutils literal notranslate"><span class="pre">-DENABLE_IO_FAULT_INJECTION=ON</span></code>. Production builds leave this off.
+<code class="docutils literal notranslate"><span class="pre">MORI_IO_FAULT</span></code> accepts one rule (an invalid rule aborts the process, so a typo never runs fault-free), for example
+<code class="docutils literal notranslate"><span class="pre">async_event:value=cq_err:op=write</span></code>, <code class="docutils literal notranslate"><span class="pre">port_down:op=write</span></code>, or
+<code class="docutils literal notranslate"><span class="pre">port_flap:value=200:op=write</span></code>. Async event rules require a supported event name
+or its numeric <code class="docutils literal notranslate"><span class="pre">ibv_event_type</span></code>; <code class="docutils literal notranslate"><span class="pre">skip</span></code>, <code class="docutils literal notranslate"><span class="pre">count</span></code>, <code class="docutils literal notranslate"><span class="pre">qpn</span></code>, and <code class="docutils literal notranslate"><span class="pre">op</span></code> filter matching
+posts. SRQ events are rejected because MORI-IO does not use an SRQ. Port rules
+accept only <code class="docutils literal notranslate"><span class="pre">count=1</span></code>. Runtime injection errors are logged and fail the catalog
+without throwing through the data path. QP/CQ/device fatal injections change the
+corresponding data-path state; dead CQ/device markers survive Disarm and watch removal, and are retired with
+their owning endpoint/context. New allocations do not inherit those markers. Port down
+lasts until explicit Disarm, while flap recovers after its duration even if the
+rule is disarmed earlier. Automatic
+rule exhaustion stops new triggers without clearing a port-down interval.</p>
+<p>Run <code class="docutils literal notranslate"><span class="pre">MORI_IO_FAULT_CATALOG=async_events.yaml</span> <span class="pre">./build_fault/tests/cpp/test_fault_injection</span></code>
+for the async catalog, or add <code class="docutils literal notranslate"><span class="pre">--check-catalog</span></code> to validate rules without GPU/NIC
+access. <code class="docutils literal notranslate"><span class="pre">--check-async-sources</span></code> exercises the async source plumbing on the CPU.
+The default catalog is <code class="docutils literal notranslate"><span class="pre">ibverbs.yaml</span></code>. Each hardware entry uses GPU 0 and GPU 1;
+the CPU checks create no engine.
+Synthetic events must not race endpoint destruction: they do not acquire the
+provider’s event lifetime protection. The fault catalog exits without teardown.</p>
+<p>Port overrides and events are published together before the triggering post,
+so concurrent Disarm queues recovery after PORT_ERR. For a fatal async rule
+matching notification SEND, the FI-only BeforeNotify hook waits up to 5 s for
+the data status to reach SUCCESS before sending the notification. This makes
+notification failure tests reproducible; normal builds add no wait.</p>
+</section>
 </section>
 </section>
 
