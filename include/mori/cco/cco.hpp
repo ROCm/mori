@@ -1250,13 +1250,26 @@ struct ccoSdmaQueueDeviceHandle {
   // cachedHwReadIndex is by-value, so a refreshed read index must be published
   // back to `shared` (the handle this was copied from) or every caller re-reads
   // rptr — an uncached SYSTEM load worth ~2600 cycles, paid on every put once
-  // wptr passes the ring size. The hint only moves forward to a value rptr
-  // actually had, so racing writers are harmless.
+  // wptr passes the ring size. The publish is a plain store, so racing waves can
+  // set it back to an older rptr; an older value only costs another rptr load.
+  //
+  // The ring is never filled completely: the engine reads wptr == rptr (mod the
+  // ring) as empty, so a full ring would look idle and stall every waiter. So at
+  // most CCO_SDMA_QUEUE_SIZE - CCO_SDMA_UNIT bytes are outstanding, an Aggregate
+  // batch included: the put that would fill the ring waits for rptr, which an
+  // uncommitted batch never moves. Same rule as anvil_device.hpp's CanWriteUpto.
+  __device__ __forceinline__ static bool CanWriteUpto(uint64_t end, uint64_t readIndex) {
+    return end - readIndex < CCO_SDMA_QUEUE_SIZE;
+  }
+
   __device__ __forceinline__ uint64_t ReserveSlot(uint64_t slotBytes,
                                                   ccoSdmaQueueDeviceHandle* shared) {
+    if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+      if (slotBytes >= CCO_SDMA_QUEUE_SIZE) __builtin_trap();  // can never fit
+    }
     uint64_t base = __hip_atomic_fetch_add(impl::global(cachedWptr), slotBytes, __ATOMIC_RELAXED,
                                            __HIP_MEMORY_SCOPE_AGENT);
-    if ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE) {
+    if (!CanWriteUpto(base + slotBytes, cachedHwReadIndex)) {
       [[maybe_unused]] int retries = 0;
       do {
         cachedHwReadIndex =
@@ -1267,7 +1280,7 @@ struct ccoSdmaQueueDeviceHandle {
             break;
           }
         }
-      } while ((base + slotBytes) - cachedHwReadIndex > CCO_SDMA_QUEUE_SIZE);
+      } while (!CanWriteUpto(base + slotBytes, cachedHwReadIndex));
       __hip_atomic_store(impl::global(&shared->cachedHwReadIndex), cachedHwReadIndex,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
@@ -1852,19 +1865,31 @@ struct ccoSdma {
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
   __device__ inline void put(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes, int queueId = 0) {
+    putPtr<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+        peer, ccoGetLsaPeerPtr(dstWin, peer, dstOffset), ccoGetLocalPtr(srcWin, srcOffset), bytes,
+        queueId);
+  }
+
+  // putPtr: put() on addresses the caller already resolved. `dst` must be in
+  // `peer`'s memory as mapped here (e.g. ccoGetLsaPeerPtr); `src` must be local.
+  // Nothing checks either: a wrong address faults in the SDMA engine, or, if it
+  // is mapped, is silently written.
+  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault,
+            ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
+  __device__ inline void putPtr(int peer, void* dst, void* src, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
-                  "ccoSdma::put supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+                  "ccoSdma::put/putPtr supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate |
                                                      ccoSdmaOptFlagsSignalPerCopy)) == 0,
-                  "ccoSdma::put: unknown ccoSdmaOptFlags bit");
+                  "ccoSdma::put/putPtr: unknown ccoSdmaOptFlags bit");
     static_assert(threadMode == ccoSdmaThreadIndependent || std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter put");
+                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter "
+                  "put/putPtr");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
-    void* dst = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
-    void* src = ccoGetLocalPtr(srcWin, srcOffset);
     ccoSdmaDispatchChunked<Coop, localSignal, remoteSignal, optFlags, threadMode>(
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
@@ -1875,19 +1900,29 @@ struct ccoSdma {
             ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
   __device__ inline void get(int peer, ccoWindow_t dstWin, size_t dstOffset, ccoWindow_t srcWin,
                              size_t srcOffset, size_t bytes, int queueId = 0) {
+    getPtr<Coop, localSignal, remoteSignal, optFlags, threadMode>(
+        peer, ccoGetLocalPtr(dstWin, dstOffset), ccoGetLsaPeerPtr(srcWin, peer, srcOffset), bytes,
+        queueId);
+  }
+
+  // getPtr: get() on resolved addresses, the mirror of putPtr: `dst` local,
+  // `src` in `peer`'s memory as mapped here. Unchecked the same way.
+  template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault,
+            ccoSdmaThreadMode threadMode = ccoSdmaThreadIndependent>
+  __device__ inline void getPtr(int peer, void* dst, void* src, size_t bytes, int queueId = 0) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
                       std::is_same_v<Coop, ccoCoopBlock>,
-                  "ccoSdma::get supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
+                  "ccoSdma::get/getPtr supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate |
                                                      ccoSdmaOptFlagsSignalPerCopy)) == 0,
-                  "ccoSdma::get: unknown ccoSdmaOptFlags bit");
+                  "ccoSdma::get/getPtr: unknown ccoSdmaOptFlags bit");
     static_assert(threadMode == ccoSdmaThreadIndependent || std::is_same_v<Coop, ccoCoopThread>,
-                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter get");
+                  "ccoSdmaThreadSameQueue requires ccoCoopThread — all warp lanes must enter "
+                  "get/getPtr");
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     const uint32_t myLsaRank = static_cast<uint32_t>(comm.lsaRank);
-    void* dst = ccoGetLocalPtr(dstWin, dstOffset);
-    void* src = ccoGetLsaPeerPtr(srcWin, peer, srcOffset);
     ccoSdmaDispatchChunked<Coop, localSignal, remoteSignal, optFlags, threadMode>(
         s, peer, n, dst, src, bytes, queueId, myLsaRank, static_cast<uint32_t>(comm.lsaSize));
   }
@@ -1947,6 +1982,20 @@ struct ccoSdma {
            expected) {
       __builtin_amdgcn_s_sleep(2);
     }
+  }
+
+  // signalSlot: the counter waitSignal polls, for callers that poll it
+  // themselves. The SDMA engine writes it, so read it with a system-scope
+  // atomic load, with acquire ordering if the caller then reads the data the
+  // signal covers. nullptr when srcRank or queueId is out of range.
+  __device__ inline uint64_t* signalSlot(int srcRank, int queueId) const {
+    const ccoSdmaContext& s = comm.sdma;
+    const uint32_t n = s.sdmaNumQueue;
+    if (srcRank < 0 || srcRank >= comm.lsaSize || queueId < 0 ||
+        static_cast<uint32_t>(queueId) >= n) {
+      return nullptr;
+    }
+    return s.signalBuf + (static_cast<uint32_t>(srcRank) * n + static_cast<uint32_t>(queueId));
   }
 
   // commit: ring the doorbell for Aggregate-posted ops, then drain with quiet().

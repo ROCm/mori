@@ -45,6 +45,7 @@
 
 #include "mori/application/utils/check.hpp"
 #include "mori/io/io.hpp"
+#include "mori/utils/host_utils.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 #include "src/io/rdma/common.hpp"
 
@@ -1967,22 +1968,22 @@ void CaseXgmiCrossEngineIpc() {
 // we launch a subprocess with restricted HIP_VISIBLE_DEVICES.
 //
 // Protocol (via shared memory file in /dev/shm):
-//   1. Exporter (this process, GPU 0):  allocates GPU memory, registers it with
-//      an IOEngine to populate the IPC handle, writes a MemoryDesc blob to the
-//      shared file, and waits for the importer to signal completion.
-//   2. Importer (subprocess, HIP_VISIBLE_DEVICES=<last_gpu>):  reads the
-//      MemoryDesc, creates its own IOEngine, and does a Write from its local
-//      GPU to the exporter's memory.  The exporter's bus ID is NOT in the
-//      importer's localDeviceByBusId, so it must go through the hidden-device
-//      branch.
+//   1. Exporter (this process, GPU <exportDevice>):  allocates GPU memory,
+//      registers it with an IOEngine to populate the IPC handle, writes a
+//      MemoryDesc blob to the shared file, and waits for the importer to signal
+//      completion.
+//   2. Importer (subprocess, restricted HIP_VISIBLE_DEVICES that excludes the
+//      exporter's GPU):  reads the MemoryDesc, creates its own IOEngine, and
+//      does a Write from its local GPU <importerDevice> to the exporter's
+//      memory.  The exporter's bus ID is NOT in the importer's
+//      localDeviceByBusId, so it must go through the hidden-device branch.
 // --------------------------------------------------------------------------
-int RunHiddenDeviceImporter(const char* shmPath) {
+int RunHiddenDeviceImporter(const char* shmPath, int localDevice) {
   // This function runs in a subprocess with restricted HIP_VISIBLE_DEVICES.
-  // It only sees one GPU (the last physical GPU), while the exporter used GPU 0.
   SetLogLevel("info");
   int gpuCount = GetGpuCount();
-  if (gpuCount < 1) {
-    std::fprintf(stderr, "importer: no GPUs visible\n");
+  if (gpuCount <= localDevice) {
+    std::fprintf(stderr, "importer: device %d not visible (%d GPUs)\n", localDevice, gpuCount);
     return 1;
   }
 
@@ -2026,19 +2027,21 @@ int RunHiddenDeviceImporter(const char* shmPath) {
     char hostname[HOST_NAME_MAX];
     gethostname(hostname, HOST_NAME_MAX);
     remoteEngDesc.hostname = std::string(hostname);
-    remoteEngDesc.nodeId = remoteEngDesc.hostname;
+    // Match the node id the exporter's backend resolves (MORI_NODE_ID, then
+    // boot_id, then hostname), or IsSameNodeEngine rejects the peer.
+    remoteEngDesc.nodeId = mori::ResolveNodeId(remoteEngDesc.hostname);
   }
   remoteEngDesc.host = "127.0.0.1";
   remoteEngDesc.port = 0;
   remoteEngDesc.pid = 0;
   engine.RegisterRemoteEngine(remoteEngDesc);
 
-  // Allocate local memory on device 0 (importer's only visible GPU)
+  // Allocate local memory on the importer's chosen local device
   constexpr size_t kSize = 1024 * 1024;
-  auto localMem = RegisterGpuMemory(&engine, kSize, 0);
+  auto localMem = RegisterGpuMemory(&engine, kSize, localDevice);
 
   // Fill local source with 0xCD
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipSetDevice(localDevice));
   HIP_RUNTIME_CHECK(hipMemset(localMem.ptr, 0xCD, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
@@ -2074,16 +2077,18 @@ int RunHiddenDeviceImporter(const char* shmPath) {
   return 0;
 }
 
-void CaseXgmiHiddenDeviceSplitVisibility() {
-  int totalGpus = GetGpuCount();
-  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
-
+// Exports from physical GPU `exportDevice` in this process (which sees every
+// GPU) and imports from a subprocess that sees only `importerVisible`, writing
+// from that subprocess's local device `importerDevice`.
+void RunHiddenDeviceSplitVisibility(int exportDevice, const std::string& importerVisible,
+                                    int importerDevice) {
   // Create shared memory file for IPC
   std::string shmPath = "/dev/shm/mori_test_hidden_" + std::to_string(getpid());
   int shmFd = open(shmPath.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
   Require(shmFd >= 0, "failed to create shared memory file");
 
-  // Exporter: allocate on GPU 0, register, and serialize the descriptor
+  // Exporter: allocate on GPU exportDevice, register, and serialize the descriptor.
+  // RegisterGpuMemory leaves exportDevice current, as a per-rank process would.
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
   cfg.port = 0;
@@ -2092,10 +2097,18 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
   engine.CreateBackend(BackendType::XGMI, xgmiCfg);
 
   constexpr size_t kSize = 1024 * 1024;
-  auto exportMem = RegisterGpuMemory(&engine, kSize, 0);
+  auto exportMem = RegisterGpuMemory(&engine, kSize, exportDevice);
+
+  // RegisterMemory switches to device 0 to export the IPC handle; it must hand
+  // the caller's current device back.
+  int currentDevice = -1;
+  HIP_RUNTIME_CHECK(hipGetDevice(&currentDevice));
+  Require(currentDevice == exportDevice, "RegisterMemory changed the current device from " +
+                                             std::to_string(exportDevice) + " to " +
+                                             std::to_string(currentDevice));
 
   // Clear export buffer
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipSetDevice(exportDevice));
   HIP_RUNTIME_CHECK(hipMemset(exportMem.ptr, 0x00, kSize));
   HIP_RUNTIME_CHECK(hipDeviceSynchronize());
 
@@ -2112,11 +2125,11 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
   Require(len > 0, "failed to read /proc/self/exe");
   selfExe[len] = '\0';
 
-  // Launch importer subprocess with the LAST GPU only visible
-  // (so GPU 0's bus ID is NOT in the importer's localDeviceByBusId)
-  std::string visibleDevices = std::to_string(totalGpus - 1);
-  std::string cmd = "HIP_VISIBLE_DEVICES=" + visibleDevices + " " + std::string(selfExe) +
-                    " --hidden-device-importer " + shmPath + " 2>&1";
+  // Launch the importer subprocess with only importerVisible visible
+  // (so the exporter's bus ID is NOT in the importer's localDeviceByBusId)
+  std::string cmd = "HIP_VISIBLE_DEVICES=" + importerVisible + " " + std::string(selfExe) +
+                    " --hidden-device-importer " + shmPath + " " + std::to_string(importerDevice) +
+                    " 2>&1";
   int rc = system(cmd.c_str());
   int exitCode = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
   Require(exitCode == 0, "importer subprocess failed with exit code " + std::to_string(exitCode));
@@ -2131,9 +2144,9 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
   unlink(shmPath.c_str());
   Require(std::string(doneBuf, 4) == "done", "importer did not signal completion");
 
-  // Verify the exporter's GPU 0 buffer now contains 0xCD (written by importer)
+  // Verify the exporter's buffer now contains 0xCD (written by importer)
   std::vector<uint8_t> hostBuf(kSize);
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
+  HIP_RUNTIME_CHECK(hipSetDevice(exportDevice));
   HIP_RUNTIME_CHECK(hipMemcpy(hostBuf.data(), exportMem.ptr, kSize, hipMemcpyDeviceToHost));
   bool allMatch = true;
   for (size_t i = 0; i < kSize; ++i) {
@@ -2143,6 +2156,32 @@ void CaseXgmiHiddenDeviceSplitVisibility() {
     }
   }
   Require(allMatch, "hidden-device data verification failed: expected 0xCD in exporter buffer");
+}
+
+void CaseXgmiHiddenDeviceSplitVisibility() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  // Exporter on GPU 0, importer sees only the last GPU.
+  RunHiddenDeviceSplitVisibility(0, std::to_string(totalGpus - 1), 0);
+}
+
+// Regression: the exporter registers memory on a non-zero device that is also
+// the current device, and the importer sees fewer GPUs than that ordinal.
+// hipIpcGetMemHandle records the current ordinal in the handle, so before the
+// fix hipIpcOpenMemHandle failed with hipErrorInvalidValue and CreateSession
+// returned nullopt. This is prefill TP1 -> decode TP2 rank 1 on one node.
+void CaseXgmiHiddenDeviceExportFromNonZeroDevice() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 2) throw TestSkip("requires at least 2 GPUs");
+  RunHiddenDeviceSplitVisibility(totalGpus - 1, "0", 0);
+}
+
+// Same as above, but the importer sees two GPUs and writes from its local
+// device 1, so the importer's own device is not ordinal 0 either.
+void CaseXgmiHiddenDeviceImporterNonZeroDevice() {
+  int totalGpus = GetGpuCount();
+  if (totalGpus < 4) throw TestSkip("requires at least 4 GPUs");
+  RunHiddenDeviceSplitVisibility(totalGpus - 1, "0,1", 1);
 }
 
 void CaseXgmiInboundNotificationIsUnsupported() {
@@ -2218,7 +2257,7 @@ struct TestCase {
 int main(int argc, char* argv[]) {
   // Subprocess entry point for hidden-device importer
   if (argc >= 3 && std::string(argv[1]) == "--hidden-device-importer") {
-    return RunHiddenDeviceImporter(argv[2]);
+    return RunHiddenDeviceImporter(argv[2], argc >= 4 ? std::atoi(argv[3]) : 0);
   }
 
   SetLogLevel("info");
@@ -2288,6 +2327,9 @@ int main(int argc, char* argv[]) {
       {"xgmi_visible_device_regression", CaseXgmiVisibleDeviceRegression},
       {"xgmi_cross_engine_ipc", CaseXgmiCrossEngineIpc},
       {"xgmi_hidden_device_split_visibility", CaseXgmiHiddenDeviceSplitVisibility},
+      {"xgmi_hidden_device_export_from_nonzero_device",
+       CaseXgmiHiddenDeviceExportFromNonZeroDevice},
+      {"xgmi_hidden_device_importer_nonzero_device", CaseXgmiHiddenDeviceImporterNonZeroDevice},
       {"xgmi_inbound_notification_is_unsupported", CaseXgmiInboundNotificationIsUnsupported},
       {"xgmi_concurrent_wait_and_poll_is_safe", CaseXgmiConcurrentWaitAndPollIsSafe},
   };

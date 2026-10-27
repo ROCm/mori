@@ -607,6 +607,21 @@ def test_swap_ab_is_bitwise_identical(m, n, k):
         ), f"swap_ab {extra} is not bit-identical to the unswapped path"
 
 
+def test_fused_kernel_reads_no_config_object():
+    """Config the fused kernel reads must reach it as scalars.
+
+    FlyDSL keys its compile cache on a kernel's scalar closure values; an
+    ``ArConfig`` read inside the body is not part of the key, so two configs
+    differing only there could share a cached kernel with the wrong offsets.
+    """
+    import re
+
+    src = (REPO_ROOT / "python/mori/ops/gemm_ar/kernels_fused.py").read_text()
+    start = src.index("    @flyc.kernel(name=_kname")
+    body = src[start : src.index("\n    @flyc.jit", start)]
+    assert not re.findall(r"\bcfg\.\w+", body)
+
+
 def test_rotated_tile_order_is_a_permutation_of_the_linear_one():
     """Reordering tiles must not change which tiles exist -- checked on the host.
 

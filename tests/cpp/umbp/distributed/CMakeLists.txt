@@ -539,7 +539,7 @@ add_test(NAME test_hbm_backend COMMAND test_hbm_backend)
 add_executable(test_ssd_backend test_ssd_backend.cpp)
 target_link_libraries(test_ssd_backend PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_ssd_backend PRIVATE cxx_std_17)
-add_test(NAME test_ssd_backend COMMAND test_ssd_backend)
+add_test(NAME umbp_ssd_backend COMMAND test_ssd_backend)
 
 # test_peer_service_dispatch — PeerServiceServer dispatch through
 # BackendRegistry: tier compatibility, named same-tier instances, the
@@ -575,7 +575,7 @@ add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
 target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
                                                           GTest::gtest_main)
 target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
-add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
+add_test(NAME umbp_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)

@@ -28,19 +28,21 @@
 namespace mori {
 namespace moe {
 
-template <typename T>
+// NoRdmaAtomics selects the MORI_EP_DISABLE_RDMA_ATOMICS variant, which signals remote PEs with
+// RDMA WRITEs instead of RDMA atomics.
+template <typename T, bool NoRdmaAtomics = false>
 __global__ void EpDispatchInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
 template <typename T>
 __global__ void EpDispatchCopyToStaging(EpDispatchCombineArgs<T> args);
 
-template <typename T, bool EnableStdMoE = false>
+template <typename T, bool EnableStdMoE = false, bool NoRdmaAtomics = false>
 __global__ void EpDispatchInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
 
-template <typename T>
+template <typename T, bool NoRdmaAtomics = false>
 __global__ void EpCombineInterNodeV1Kernel(EpDispatchCombineArgs<T> args);
 
-template <typename T, bool EnableStdMoE = false>
+template <typename T, bool EnableStdMoE = false, bool NoRdmaAtomics = false>
 __global__ void EpCombineInterNodeV1KernelLowLatency(EpDispatchCombineArgs<T> args);
 
 template <typename T>

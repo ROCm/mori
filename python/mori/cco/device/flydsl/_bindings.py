@@ -51,14 +51,22 @@ from mori.cco.device.ops import (
 from ._internal import _ffi
 
 
-def _binding(name):
-    meta = CCO_DEVICE_FUNCTIONS[name]
+def _make(meta):
     return _ffi(
         meta["symbol"],
         meta["args"],
         meta["ret"],
         pure=meta.get("pure", False),
     )
+
+
+# Every registered function, keyed like CCO_DEVICE_FUNCTIONS; the tables below
+# are views of it, so a registered function always has a binding.
+ALL = {name: _make(meta) for name, meta in CCO_DEVICE_FUNCTIONS.items()}
+
+
+def _binding(name):
+    return ALL[name]
 
 
 # ── monomorphized op tables (keyed by tag) ──
@@ -94,6 +102,12 @@ SDMA_XFER = {
 SDMA_QUIET = {s: _binding(f"sdma_quiet_{s}") for s in ("thread", "warp", "block")}
 SDMA_COMMIT = {s: _binding(f"sdma_commit_{s}") for s in ("thread", "warp", "block")}
 cco_sdma_quiet_queue = _binding("sdma_quiet_queue")
+# ccoSdma::putPtr / getPtr by coop tag; the last argument is SdmaFlags.
+SDMA_PUT_PTR = {s: _binding(f"sdma_put_ptr_{s}") for s in ("thread", "warp", "block")}
+SDMA_GET_PTR = {s: _binding(f"sdma_get_ptr_{s}") for s in ("thread", "warp", "block")}
+cco_sdma_wait_signal = _binding("sdma_wait_signal")
+cco_sdma_put_ptr_rsig_thread = _binding("sdma_put_ptr_rsig_thread")
+cco_sdma_signal_slot = _binding("sdma_signal_slot")
 
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
@@ -101,6 +115,7 @@ cco_lsa_ptr = _binding("lsa_ptr")
 # Window geometry: one global_load each, for callers that take it once.
 cco_lsa_win_base = _binding("lsa_win_base")
 cco_lsa_stride = _binding("lsa_stride")
+cco_local_ptr = _binding("local_ptr")
 cco_system_fence = _binding("system_fence")
 
 cco_devcomm_rank = _binding("devcomm_rank")

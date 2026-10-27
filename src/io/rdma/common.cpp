@@ -592,7 +592,6 @@ static void ResetMergedWorkRequestPointers(MergedWorkRequest* wr) {
 
 RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id) {
   MORI_IO_FUNCTION_TIMER;
-  (void)status;
 
   std::string reserveErr;
   int reserved = 0;
@@ -609,6 +608,7 @@ RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, Trans
 
   for (size_t i = 0; i < eps.size(); i++) {
     const application::RdmaEndpoint& ep = eps[i].local;
+    Verbs().BeforeNotify(ep.ibvHandle.qp, status);
     NotifMessage msg{id, static_cast<int>(i), static_cast<int>(eps.size())};
 
     struct ibv_sge sge{};
