@@ -299,6 +299,7 @@ bool StandaloneProcessClient::OffsetForLocked(uintptr_t ptr, size_t size, uint64
 
 bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t size) {
   if (closing_) return false;
+  if (kv_metadata_provider_) PrepareKvMetadata({key});
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   uint64_t offset = 0;
@@ -351,6 +352,7 @@ std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::strin
                                                     const std::vector<uintptr_t>& srcs,
                                                     const std::vector<size_t>& sizes) {
   if (closing_) return std::vector<bool>(keys.size(), false);
+  PrepareKvMetadata(keys);
   std::shared_lock lk(op_mutex_);
   if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) {
     return std::vector<bool>(keys.size(), false);
@@ -382,6 +384,7 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
                                                              const std::vector<size_t>& sizes,
                                                              const std::vector<int>& depths) {
   if (closing_) return std::vector<bool>(keys.size(), false);
+  PrepareKvMetadata(keys);
   std::shared_lock lk(op_mutex_);
   if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) {
     return std::vector<bool>(keys.size(), false);
@@ -584,6 +587,7 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
     const std::vector<std::vector<size_t>>& dst_offsets) {
   std::vector<bool> failed(keys.size(), false);
   if (closing_) return failed;
+  PrepareKvMetadata(keys);
   std::shared_lock lk(op_mutex_);
   if (closed_ || object_sizes.size() != keys.size() ||
       !RangeBatchShapeValid(keys.size(), srcs, sizes, dst_offsets)) {
@@ -661,6 +665,7 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   auto status = stub_->ConfigureKvIndexer(&context, request, &response);
   if (!status.ok()) throw std::runtime_error(status.error_message());
   if (!response.ok()) throw std::invalid_argument(response.error());
+  kv_metadata_provider_ = config.metadata_provider;
 }
 
 void StandaloneProcessClient::RegisterKvBlock(const KvBlockMetadata& block) {

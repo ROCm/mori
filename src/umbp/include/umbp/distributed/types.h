@@ -33,20 +33,6 @@
 
 namespace mori::umbp {
 
-struct KvIndexerConfig {
-  std::string endpoint, worker_id, worker_address;
-  uint32_t components = 1, swa_window_tokens = 0, timeout_ms = 200;
-};
-
-struct KvBlockMetadata {
-  int64_t hash = 0;
-  std::optional<int64_t> parent;
-  uint32_t block_size = 0;  // Token count.
-  // Every physical object needed for each FULL=1/SWA=2/MAMBA=4 component.
-  // Empty map unregisters this logical block.
-  std::map<uint32_t, std::vector<std::string>> component_keys;
-};
-
 enum class TierType : int {
   UNKNOWN = 0,
   HBM = 1,

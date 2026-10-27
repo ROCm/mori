@@ -24,6 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -472,11 +474,28 @@ struct UMBPStandaloneProcessConfig {
   std::vector<std::string> tags;
 };
 
+struct KvBlockMetadata {
+  int64_t hash = 0;
+  std::optional<int64_t> parent;
+  uint32_t block_size = 0;  // Token count.
+  // Every physical object needed for each FULL=1/SWA=2/MAMBA=4 component.
+  std::map<uint32_t, std::vector<std::string>> component_keys;
+};
+
+struct KvIndexerConfig {
+  std::string endpoint, worker_id, worker_address;
+  uint32_t components = 1, swa_window_tokens = 0, timeout_ms = 200;
+  // Called before each write with its physical keys; empty means no blocks to track.
+  std::function<std::vector<KvBlockMetadata>(const std::vector<std::string>&)> metadata_provider;
+};
+
 struct UMBPConfig {
   UMBPDramConfig dram;
   UMBPSsdConfig ssd;
   UMBPEvictionConfig eviction;
   UMBPCopyPipelineConfig copy_pipeline;
+  // Unset disables Indexer reporting; configure once per storage owner.
+  std::optional<KvIndexerConfig> kv_indexer;
 
   // Compatibility only.  These selected the shared-SSD leader/follower
   // behaviour of the local storage manager, which is gone: a shared pool is a

@@ -267,9 +267,11 @@ TEST_F(AutomaticKvIndexer, StandaloneForwardsMetadataToTheStorageOwner) {
   cfg.standalone_process->address = address;
   standalone::StandaloneServer owner(cfg, address);
   ASSERT_TRUE(owner.Start());
+  config.metadata_provider = [](const auto&) {
+    return std::vector<KvBlockMetadata>{{42, {}, 16, {{1, {"key"}}}}};
+  };
+  cfg.kv_indexer = config;
   auto client = CreateUMBPClient(cfg);
-  client->ConfigureKvIndexer(config);
-  client->RegisterKvBlock({42, {}, 16, {{1, {"key"}}}});
   EXPECT_THROW(client->RegisterKvBlock({43, {}, 16, {{2, {"key"}}}}), std::invalid_argument);
   HostMemAllocator allocator;
   HostBufferOptions opts;
@@ -293,6 +295,34 @@ TEST_F(AutomaticKvIndexer, StandaloneForwardsMetadataToTheStorageOwner) {
   EXPECT_THROW(client->RegisterKvBlock({42, {}, 0, {}}), std::logic_error);
   allocator.Free(buffer);
   owner.Shutdown();
+  EXPECT_TRUE(receiver.WaitFor({}));
+}
+
+TEST_F(AutomaticKvIndexer, ClientConfigControlsAutomaticMetadataAndReporting) {
+  UMBPConfig cfg;
+  cfg.dram.capacity_bytes = 1 << 20;
+  cfg.ssd.enabled = false;
+  cfg.page_size = 4096;
+  const std::string data = "value";
+  const auto ptr = reinterpret_cast<uintptr_t>(data.data());
+  auto client = CreateUMBPClient(cfg);
+  ASSERT_TRUE(client->Put("key", ptr, data.size()));
+  ASSERT_TRUE(client->Flush());
+  {
+    std::lock_guard<std::mutex> lock(receiver.mutex);
+    EXPECT_TRUE(receiver.requests.empty());
+  }
+  client->Close();
+
+  config.metadata_provider = [](const auto& keys) {
+    EXPECT_EQ(keys, (std::vector<std::string>{"key"}));
+    return std::vector<KvBlockMetadata>{{42, {}, 16, {{1, {"key"}}}}};
+  };
+  cfg.kv_indexer = config;
+  client = CreateUMBPClient(cfg);
+  ASSERT_TRUE(client->Put("key", ptr, data.size()));
+  EXPECT_TRUE(receiver.WaitFor({{42, 1}}));
+  client->Close();
   EXPECT_TRUE(receiver.WaitFor({}));
 }
 

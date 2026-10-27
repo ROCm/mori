@@ -1,20 +1,46 @@
 # UMBP → SGLang KV Indexer
 
-Configure an existing DRAM `UMBPClient` once and register canonical metadata:
+Enable reporting through `UMBPConfig.kv_indexer`. Existing Python and C++ writes
+keep their original signatures; there is no Python `register_kv_block` call:
 
 ```python
-client.configure_kv_indexer("127.0.0.1:50051", "worker-0", "http://worker-0:30000")
-client.register_kv_block(101, None, 16, {1: ["block101-k", "block101-v"]})
-client.put_from_ptr("block101-k", k_ptr, nbytes)
-client.put_from_ptr("block101-v", v_ptr, nbytes)  # Automatically reports FULL.
-client.register_kv_block(101, None, 0, {})  # Unregister when no longer needed.
+from mori.umbp import UMBPClient, KvIndexerConfig, KvBlockMetadata
+
+# Connect this callback to the integration's existing logical-block metadata.
+# Called once per write/batch with the physical keys; return [] to skip them.
+def metadata_for_keys(keys):
+    hashes = {key_to_hash[key] for key in keys if key in key_to_hash}
+    return [metadata_by_hash[h] for h in hashes]
+
+# Each metadata_by_hash value describes the COMPLETE logical block, for example:
+# KvBlockMetadata(block_hash, parent_hash, token_count, {1: [k_key, v_key]})
+config.kv_indexer = KvIndexerConfig(
+    "127.0.0.1:50051", "worker-0", "http://worker-0:30000",
+    metadata_provider=metadata_for_keys,
+)
+client = UMBPClient(config)  # Existing DRAM configuration.
+client.put_from_ptr(key, ptr, nbytes)
+client.batch_put_from_ptr([k_key, v_key], [k_ptr, v_ptr], [k_nbytes, v_nbytes])
 ```
+
+Leave `config.kv_indexer = None` (the default) to disable reporting at owner
+creation. Configuring an endpoint alone cannot recover logical metadata from
+arbitrary physical keys: the integration supplies the callback, including its
+lookup state. It also works with depth-aware and ranged batch writes. The
+callback runs synchronously before storage writes, outside storage locks; Python
+callbacks acquire the GIL. Invalid metadata or callback errors fail the call
+before writing. Actual commit/eviction hooks, not callback execution, determine
+residency. Indexer RPC failures do not fail successful storage writes.
+
+Configure once before issuing writes. Changing the config after construction
+does not toggle the client. Metadata for blocks written before enabling is not
+automatically recovered; subsequent writes invoke the callback normally.
 
 The integration supplies signed int64 hashes, true parent (`None` for roots),
 block size in tokens, and all physical keys per component: FULL=1, SWA=2, MAMBA=4.
 Keys must identify immutable content. For hybrid caches configure `components`
 and `swa_window_tokens`; metadata must describe every configured component.
-Registered parent links must be acyclic. Registration may precede or follow writes. Each component is reported only when
+Registered parent links must be acyclic. Each component is reported only when
 all its keys are committed; FULL is required. Eviction updates/revokes the mask.
 
 Commit, eviction and clear hooks wake one background reporter, including batch,
@@ -25,15 +51,22 @@ failure. Background retries wait one second even during writes and resample
 current state. A rebuild every 30 seconds also repairs quiet Indexer restarts;
 rebuilds may briefly reduce hits.
 
-Configure once per storage owner. Standalone clients forward metadata to that
-owner; closing a forwarder does not withdraw shared data. Register metadata where
+Promotion into DRAM uses the same commit hook and reports known blocks when
+complete; moving the last DRAM copy out revokes it. Copying to another tier while
+retaining DRAM leaves its residency intact. HBM/SSD residency is not published by
+this reporter. Promotion of a block with no known metadata cannot advertise it.
+
+Configure once per storage owner. Standalone clients run their configured
+callback and forward metadata to that owner; closing a forwarder does not
+withdraw shared data. Supply metadata where
 all required keys reside: reporting covers local DRAM backends, not cross-owner
 aggregation. Use one writer per worker's DRAM bucket and match the Router worker
 URL and any HBM publisher's identity/cache spec. Startup and graceful owner
 shutdown clear DRAM only. The protocol has no TTL/fencing for crash-time cleanup.
 
-Reporting is opt-in and requires the endpoint and metadata above. No SGLang
-changes or manual report/revoke calls are needed. The existing
+Reporting is opt-in and requires the endpoint and metadata above. No manual
+report/revoke calls are needed; wiring the metadata callback is the integration's
+responsibility. The existing
 `report_external_kv_blocks` API targets the UMBP master and is unrelated.
 RPCs use insecure gRPC with `timeout_ms=200` by default; Python calls release the
 GIL. Build with `BUILD_UMBP=ON`, `BUILD_PYBINDS=ON`, and run

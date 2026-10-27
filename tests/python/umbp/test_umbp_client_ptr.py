@@ -99,6 +99,57 @@ def test_put_from_ptr_get_into_ptr_round_trip():
     assert client.clear()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("method", ["scalar", "batch", "depth", "ranges"])
+def test_configured_kv_metadata_preserves_write_api(enabled, method):
+    config = UMBPConfig()
+    config.dram.capacity_bytes = 1 << 20
+    config.ssd.enabled = False
+    config.page_size = 4096
+    metadata = umbp.KvBlockMetadata(42, 42, 16, {1: ["key"]})
+    calls = []
+
+    def provider(keys):
+        calls.append(keys)
+        return [metadata]
+
+    if enabled:
+        # An unavailable Indexer must not fail a successful storage write.
+        config.kv_indexer = umbp.KvIndexerConfig(
+            "127.0.0.1:1", "worker", "http://worker:30000", provider, timeout_ms=10
+        )
+    client = UMBPClient(config)
+    assert not hasattr(client, "register_kv_block")
+    data = ctypes.create_string_buffer(b"value")
+    ptr, size = ctypes.addressof(data), len(data)
+
+    def put():
+        if method == "scalar":
+            return client.put_from_ptr("key", ptr, size)
+        if method == "ranges":
+            return all(
+                client.batch_put_ranges_from_ptr(
+                    ["key"], [size], [[ptr]], [[size]], [[0]]
+                )
+            )
+        args = (["key"], [ptr], [size])
+        if method == "depth":
+            return all(client.batch_put_from_ptr_with_depth(*args, [0]))
+        return all(client.batch_put_from_ptr(*args))
+
+    if enabled:
+        with pytest.raises(ValueError, match="cycle"):
+            put()
+        assert not client.exists("key")
+    metadata = umbp.KvBlockMetadata(42, None, 16, {1: ["key"]})
+    assert put()
+    assert calls == ([["key"], ["key"]] if enabled else [])
+    out = ctypes.create_string_buffer(size)
+    assert client.get_into_ptr("key", ctypes.addressof(out), size)
+    assert out.raw == data.raw
+    assert client.clear()
+
+
 def test_batch_put_get_ranges_round_trip_and_shape_failure():
     client = _make_client()
     a = (ctypes.c_ubyte * 4)(*b"AAAA")

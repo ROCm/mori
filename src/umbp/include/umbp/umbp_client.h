@@ -238,6 +238,13 @@ class IUMBPClient {
       const std::vector<std::string>& /*hashes*/) {
     return {};
   }
+
+ protected:
+  void PrepareKvMetadata(const std::vector<std::string>& keys) {
+    if (!kv_metadata_provider_) return;
+    for (const auto& block : kv_metadata_provider_(keys)) RegisterKvBlock(block);
+  }
+  decltype(KvIndexerConfig::metadata_provider) kv_metadata_provider_;
 };
 
 /// Fill in an embedded (in-process, no master, no networking) distributed

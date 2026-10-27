@@ -36,6 +36,7 @@
 
 #include "mori/utils/mori_log.hpp"
 #include "sgl_kv_indexer.grpc.pb.h"
+#include "umbp/common/config.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {

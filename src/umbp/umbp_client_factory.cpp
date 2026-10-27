@@ -207,13 +207,15 @@ UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config) {
 }
 
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config) {
+  std::unique_ptr<IUMBPClient> client;
   if (config.standalone_process.has_value()) {
-    return std::make_unique<standalone::StandaloneProcessClient>(config);
+    client = std::make_unique<standalone::StandaloneProcessClient>(config);
+  } else {
+    // Fill embedded defaults only when no master-led deployment is configured.
+    client = std::make_unique<DistributedClient>(WithEmbeddedDefaults(config));
   }
-  // One class for every in-process store, whether it names a master, names none
-  // but configures itself, or names nothing at all.  WithEmbeddedDefaults fills
-  // whatever was left blank and returns a cluster member's config untouched.
-  return std::make_unique<DistributedClient>(WithEmbeddedDefaults(config));
+  if (config.kv_indexer) client->ConfigureKvIndexer(*config.kv_indexer);
+  return client;
 }
 
 }  // namespace mori::umbp
