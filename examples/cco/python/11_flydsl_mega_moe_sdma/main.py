@@ -50,6 +50,7 @@ Needs aiter (MegaMoEV2 and the GEMM2 mainloop), FlyDSL, and mori built with SDMA
 """
 
 import argparse
+from dataclasses import replace
 import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "20G")
@@ -169,10 +170,31 @@ def main():
     parser.add_argument(
         "--chunk-tiles",
         type=int,
-        default=4,
+        default=16,
         help="sort tiles per shipped chunk",
     )
-    parser.add_argument("--queues", type=int, default=8)
+    parser.add_argument(
+        "--queues", type=int, default=1,
+        help="SDMA channels per (src, dst) pair. More than one measured "
+        "slower: KFD recommends a single engine per peer link here, so "
+        "extra channels share it and only add descriptors.",
+    )
+    parser.add_argument("--row-slack", type=float, default=1.5)
+    parser.add_argument(
+        "--signal-mode", choices=("quiet", "remote"), default="remote",
+        help="how a sender tells a peer its rows landed",
+    )
+    parser.add_argument(
+        "--no-aligned-pair", action="store_true",
+        help="force aiter off its common-pair stage2 so both paths run the "
+        "same config. It is picked only at bucket 8192, where SortedCombine "
+        "has no equivalent -- and measured 1.5%% slower than without it on "
+        "uniform routing anyway.",
+    )
+    parser.add_argument(
+        "--quant", choices=("none", "fp8_blockwise_1x32"), default="fp8_blockwise_1x32",
+        help="quantise the send buffer; halves the bytes SDMA moves",
+    )
     args = parser.parse_args()
 
     rank, world, device = _setup()
@@ -210,6 +232,11 @@ def main():
         ref = moe(x, wts, ids)[: args.bs].clone()
         torch.cuda.synchronize()
         config = moe._active_config
+        if args.no_aligned_pair and config.stage2.aligned_pair:
+            config = replace(
+                config,
+                stage2=replace(config.stage2, aligned_pair=False, pair_cu=0, skew_cu=96),
+            )
         if config.stage2.aligned_pair:
             raise SystemExit(
                 "this config selects aligned-pair stage2, which SortedCombine does not cover"
@@ -225,7 +252,9 @@ def main():
             lambda: moe._run_stage2(args.bs, None, True, config), args.iters
         )
         failures = []
-        sc = SortedCombine(moe, queues=args.queues, chunk_tiles=args.chunk_tiles)
+        sc = SortedCombine(moe, queues=args.queues, chunk_tiles=args.chunk_tiles, quant=args.quant,
+            row_slack=args.row_slack,
+            signal_mode=args.signal_mode)
         worst = 0.0
         # Repeated calls with no host sync between them also exercise the epoch counter,
         # the flags and the "consumed" handshake that stops a fast rank overrunning a slow one.

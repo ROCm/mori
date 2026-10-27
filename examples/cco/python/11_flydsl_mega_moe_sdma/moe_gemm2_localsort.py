@@ -36,9 +36,22 @@ workgroups are still computing. A GEMM unit signals ``cdone[chunk]`` after its s
 Each comm WAVE owns its own peers (peer ``p`` belongs to wave ``p % n_comm_waves``): it
 spins on the chunk counter itself, then puts that chunk's rows for its peers on its own
 SDMA queue, so peers neither wait for each other's spin nor share a wave's issue slot.
+
+Two things about the publish are load-bearing and were each worth more than a
+factor on this kernel. The epilogue stores the rows write-through (sc0|sc1) so
+that retiring them is the release a copy engine needs; releasing at system scope
+instead is a whole-L2 write-back per unit. And the per-chunk counters sit a
+cache line apart, because every unit of a chunk bumps one.
 """
 
 from dataclasses import dataclass
+
+#: i32 slots between consecutive chunk-completion counters. Every unit of a
+#: chunk bumps its counter, so packing them adjacent puts all of a launch's
+#: atomics on one or two cache lines: 128 B apart instead is worth ~8% of the
+#: GEMM2 kernel at bs=4096. Spreading a chunk's count over several counters on
+#: top of this buys nothing -- the atomic itself is not the cost.
+CDONE_STRIDE = 32
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -49,6 +62,7 @@ from flydsl.runtime.device import get_rocm_arch
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
+    buffer_store,
     create_buffer_resource_from_addr,
 )
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
@@ -77,15 +91,22 @@ from sorted_combine import (
 )
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage2 import (
     _BUFFER_OFFSET_ABI_BYTES,
+    _fp8_scale_for_leader,
     _stage2_lds_bytes,
 )
+from aiter.ops.flydsl.kernels.mxfp4_gemm_common import _fabs_f32 as fabs_f32
 
 
 @dataclass(frozen=True)
 class CommSpec:
     """Compile-time description of the fused SDMA comm workgroups.
 
-    ``comm_wgs`` workgroups of 4 waves each; one wave per peer needs ``comm_wgs * 4 >= npes``.
+    ``comm_wgs`` workgroups of 4 waves each; one wave per peer needs
+    ``comm_wgs * 4 >= npes``. ``queues`` is the SDMA channels reserved per
+    (src, dst) pair; peer ``p`` uses channel ``p % queues`` for everything it
+    sends, so a chunk is never split across channels -- splitting measured
+    slower, and on this topology KFD recommends one engine per peer link
+    anyway, which makes extra channels pure overhead.
     """
 
     layout: ArenaLayout
@@ -93,11 +114,16 @@ class CommSpec:
     queues: int
     chunk_tiles: int
     comm_wgs: int = 1
+    #: How a sender tells a peer its rows have landed; see
+    #: ``sorted_combine.sdma_finish_peer``. "remote" needs the signal to ride
+    #: the channel the data went out on, which ``queues`` already guarantees.
+    signal_mode: str = "remote"
 
 
 # fmt: off
 def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *, N_OUT, BM, BN,
-    send_nbytes, lds_outrow_off, lds_weight_off, g2_bf16_lds=False, scatter_vec=8):
+    send_nbytes, lds_outrow_off, lds_weight_off, g2_bf16_lds=False, scatter_vec=8, store_cm=0,
+    quant="none"):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and store them at their send-buffer index."""
     kMChunks = BM // 16
@@ -111,7 +137,15 @@ def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *,
         if const_expr(g2_bf16_lds)
         else None
     )
-    row_nbytes = N_OUT * 2
+    quant_fp8 = quant == "fp8_blockwise_1x32"
+    if quant not in ("none", "fp8_blockwise_1x32"):
+        raise ValueError(f"unsupported quant={quant!r}")
+    if quant_fp8 and g2_bf16_lds:
+        raise ValueError("fp8_blockwise_1x32 needs the f32 CShuffle (g2_bf16_lds=False)")
+    out_elem_bytes = 1 if quant_fp8 else 2
+    # Row layout matches aiter's P2P scatter: N_OUT payload bytes followed by the
+    # N_OUT/32 e8m0 block scales, so one contiguous SDMA put ships both.
+    row_nbytes = N_OUT + N_OUT // 32 if quant_fp8 else N_OUT * 2
 
     fx.barrier()
 
@@ -140,12 +174,21 @@ def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *,
 
     fx.barrier()
 
-    output_buf = ptr_buf_tensor(
-        send_base,
-        fx.BFloat16,
-        unit_elems=scatter_vec,
-        num_records_bytes=send_nbytes,
-    )
+    # ``buf_copy_store``'s cache_modifier is a BufferCopy enum (0=cached, 2=nt),
+    # so sc0|sc1 cannot be reached through it -- flydsl's own type stub says so,
+    # and so does mori/ops/gemm_ar/_compat.py. ``buffer_store`` passes the value
+    # through as the instruction's aux field, so the write-through path uses it.
+    if const_expr(store_cm or quant_fp8):
+        output_buf = create_buffer_resource_from_addr(
+            send_base, num_records_bytes=send_nbytes
+        )
+    else:
+        output_buf = ptr_buf_tensor(
+            send_base,
+            fx.BFloat16,
+            unit_elems=scatter_vec,
+            num_records_bytes=send_nbytes,
+        )
     # Inactive lanes read safe LDS and issue a bounded OOB store.
     active = lane < fx.Int32(BN // scatter_vec)
     col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
@@ -182,22 +225,84 @@ def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *,
                     align=16,
                 )
             )
-            pk = fx.Vector.from_elements(
+            weighted = fx.Vector.from_elements(
                 [v8[i] * weight for i in range_constexpr(scatter_vec)],
                 fx.Float32,
-            ).to(fx.BFloat16)
-        row_off = out_row * fx.Int32(row_nbytes) + n_block_idx * fx.Int32(BN * 2)
-        off = ((out_row >= fx.Int32(0)) & active).select(
-            row_off + col * fx.Int32(2), fx.Int32(send_nbytes)
-        )
-        buf_copy_store(
-            output_buf,
-            off // fx.Int32(scatter_vec * 2),
-            pk,
-            fx.BFloat16,
-            unit_elems=scatter_vec,
-            cache_modifier=0,
-        )
+            )
+            if const_expr(not quant_fp8):
+                pk = weighted.to(fx.BFloat16)
+        row_base = out_row * fx.Int32(row_nbytes)
+        valid = (out_row >= fx.Int32(0)) & active
+        if const_expr(quant_fp8):
+            # One e8m0 per 32 contiguous values, i.e. per 32//scatter_vec lanes.
+            vals = [fx.Float32(weighted[i]) for i in range_constexpr(scatter_vec)]
+            local_max = fabs_f32(vals[0])
+            for q in range_constexpr(1, scatter_vec):
+                local_max = local_max.maximumf(fabs_f32(vals[q]))
+            max_bits = local_max.bitcast(fx.Int32)
+            for xor_lane in (1, 2):
+                if xor_lane < 32 // scatter_vec:
+                    remote = rocdl.ds_bpermute(
+                        T.i32, (lane ^ fx.Int32(xor_lane)) * fx.Int32(4), max_bits
+                    )
+                    local_max = local_max.maximumf(fx.Int32(remote).bitcast(fx.Float32))
+                    max_bits = local_max.bitcast(fx.Int32)
+            group_lanes = 32 // scatter_vec
+            leader_lane = lane & fx.Int32(~(group_lanes - 1))
+            is_leader = (lane & fx.Int32(group_lanes - 1)) == fx.Int32(0)
+            e8m0 = fx.Int32(
+                rocdl.ds_bpermute(
+                    T.i32,
+                    leader_lane * fx.Int32(4),
+                    _fp8_scale_for_leader(is_leader, local_max),
+                )
+            )
+            block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+            pk_ty = T.vec(2, T.i16)
+            words = []
+            for word in range_constexpr(scatter_vec // 4):
+                packed = fx.Vector.filled(2, 0, fx.Int16).ir_value()
+                for pair in range_constexpr(2):
+                    e = word * 4 + pair * 2
+                    packed = rocdl.cvt_scalef32_pk_fp8_f32(
+                        pk_ty, packed, vals[e].ir_value(), vals[e + 1].ir_value(),
+                        block_scale.ir_value(), pair,
+                    )
+                words.append(fx.Vector(packed).bitcast(fx.Int32)[0])
+            payload = fx.Vector.from_elements(words, fx.Int32)
+            off = valid.select(
+                row_base + n_block_idx * fx.Int32(BN) + col, fx.Int32(send_nbytes)
+            )
+            buffer_store(
+                payload, output_buf, off,
+                cache_modifier=store_cm, offset_is_bytes=True,
+            )
+            # Only the lane that owns a 32-value block writes its scale byte.
+            scale_off = (valid & is_leader).select(
+                row_base + fx.Int32(N_OUT) + n_block_idx * fx.Int32(BN // 32)
+                + lane // fx.Int32(group_lanes),
+                fx.Int32(send_nbytes),
+            )
+            buffer_store(
+                e8m0.to(fx.Int8), output_buf, scale_off,
+                cache_modifier=store_cm, offset_is_bytes=True,
+            )
+        else:
+            off = valid.select(
+                row_base + n_block_idx * fx.Int32(BN * 2) + col * fx.Int32(2),
+                fx.Int32(send_nbytes),
+            )
+            if const_expr(store_cm):
+                buffer_store(pk, output_buf, off, cache_modifier=store_cm, offset_is_bytes=True)
+            else:
+                buf_copy_store(
+                    output_buf,
+                    off // fx.Int32(scatter_vec * 2),
+                    pk,
+                    fx.BFloat16,
+                    unit_elems=scatter_vec,
+                    cache_modifier=0,
+                )
 
 
 # fmt: off
@@ -206,7 +311,7 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
     HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8", SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None,
     g2_ascale_pf=None, g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False,
-    skew_cu: int = 0, scatter_vec: int = 8, comm=None):
+    skew_cu: int = 0, scatter_vec: int = 8, comm=None, quant: str = "none"):
 # fmt: on
     """Compile GEMM2 with the rank-sorted local-output epilogue (optionally fused with SDMA)."""
     arch = str(get_rocm_arch() or "")
@@ -233,8 +338,17 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
         raise ValueError("MegaMoE v2 stage2 send buffer exceeds the 32-bit buffer-resource ABI")
     fuse = comm is not None
     NC = comm.comm_wgs if fuse else 0
+    # comm_wgs == 0 is a diagnostic build: the GEMM units still publish each chunk
+    # (s_waitcnt + barrier + atomic), but no comm wave is traced and nothing ships.
     if fuse and (comm.comm_wgs < 1 or comm.chunk_tiles < 1):
         raise ValueError("fused comm needs comm_wgs >= 1 and chunk_tiles >= 1")
+    # The rows are stored sc0|sc1 -- past L1 (GLC) and past L2 (SCC) -- so they
+    # are in memory when the store retires and the ``s_waitcnt vmcnt(0)`` in
+    # front of the publish is the release the copy engine needs. Leaving them in
+    # L2 and issuing a system-scope release instead costs a whole-L2 write-back
+    # per unit (``buffer_wbl2`` on gfx950): measured 2.4x on the GEMM2 kernel.
+    # See mori/ops/gemm_ar/_compat.py for the encoding, and why sc1 is 16 not 4.
+    STORE_CM = 1 | 16 if fuse else 0
     N_OUT = model_dim
     g2_bhoist, g2_ascale_pf, g2_spart, g2_group_num, g2_m01, _g2_bf16_lds = _resolve_g2_knobs(
         g2_bhoist, g2_ascale_pf, g2_spart, False, False
@@ -260,8 +374,13 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
         f"_p{int(persist)}cu{cu_num}s{int(persist_strided)}_pad{int(has_pad)}"
         f"_sk{skew_cu}"
         f"_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}sp{g2_group_num}x{g2_m01}"
-        f"_bf16lds{int(g2_bf16_lds)}_sv{scatter_vec}"
-        + (f"_fuse{comm.chunk_tiles}q{comm.queues}r{comm.rank}" if fuse else "")
+        f"_bf16lds{int(g2_bf16_lds)}_sv{scatter_vec}_{quant}"
+        + (
+            f"_fuse{comm.chunk_tiles}q{comm.queues}w{comm.comm_wgs}"
+            f"sm{comm.signal_mode[0]}r{comm.rank}"
+            if fuse
+            else ""
+        )
     )
 
     # fmt: off
@@ -325,7 +444,8 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
             send_base = rocdl.readfirstlane(T.i64, fx.Int64(arg_send).ir_value())
             local_sort_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, send_base,
                 N_OUT=N_OUT, BM=BM, BN=BN, send_nbytes=send_nbytes, lds_outrow_off=lds_outrow_off,
-                lds_weight_off=lds_weight_off, g2_bf16_lds=g2_bf16_lds, scatter_vec=scatter_vec)
+                lds_weight_off=lds_weight_off, g2_bf16_lds=g2_bf16_lds, scatter_vec=scatter_vec,
+                store_cm=STORE_CM, quant=quant)
             # fmt: on
 
         def run_one(unit_bx, m_block_idx):
@@ -333,16 +453,16 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
             rocdl.sched_barrier(0)
             run_unit(unit_bx, m_block_idx)
             if const_expr(fuse):
-                # Every thread's stores must be complete before one thread publishes
-                # the unit; the copy engine reads them from memory, so release at
-                # system scope.
-                rocdl.s_waitcnt(0)
+                # The rows went past L2 on the way out, so retiring the stores
+                # is all the release the copy engine needs; the barrier makes it
+                # the whole workgroup's stores, not just this wave's.
+                rocdl.s_waitcnt(vmcnt=0)
                 fx.barrier()
                 if tx_i32 == fx.Int32(0):
-                    comm_ops.fence_system_release()
                     chunk = (m_block_idx * fx.Int32(BM)) // fx.Int32(SBM * comm.chunk_tiles)
                     comm_ops.atomic_add_agent(
-                        fx.Int64(arg_cdone) + fx.Int64(chunk) * fx.Int64(4), fx.Int32(1)
+                        fx.Int64(arg_cdone) + fx.Int64(chunk) * fx.Int64(CDONE_STRIDE * 4),
+                        fx.Int32(1),
                     )
 
         cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
@@ -459,9 +579,10 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
                     m_lo = ci * fx.Int32(CT * mb_per_tile)
                     m_hi = m_lo + fx.Int32(CT * mb_per_tile)
                     m_hi = (m_hi < total_m_blocks).select(m_hi, total_m_blocks)
+                    # Every (m_block, n_block) unit of this chunk has stored.
                     if is_lane0:
                         comm_ops.spin_until_ge_i32_agent(
-                            fx.Int64(arg_cdone) + fx.Int64(ci) * fx.Int64(4),
+                            fx.Int64(arg_cdone) + fx.Int64(ci) * fx.Int64(CDONE_STRIDE * 4),
                             (m_hi - m_lo) * num_n_blocks,
                         )
                     comm_ops.fence_agent_acquire()
@@ -476,15 +597,18 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
                                 hi = tile_base_buf[t1 * fx.Int32(npes) + peer]
                                 if hi > lo:
                                     if is_lane0:
-                                        sdma_put_run(sdma, arg_win, peer, peer % fx.Int32(comm.queues),
+                                        sdma_put_run(sdma, arg_win, peer,
+                                                     peer % fx.Int32(comm.queues),
                                                      layout=lay, rank=rank, lo=lo, hi=hi, cco=cco)
                 for j in range_constexpr(n_mine):
                     peer = owner + fx.Int32(j * n_waves)
                     if peer < fx.Int32(npes):
                         if peer != fx.Int32(rank):
                             if is_lane0:
-                                sdma_finish_peer(sdma, w, arg_win, peer, peer % fx.Int32(comm.queues),
-                                                 cursor_buf[peer], phase, layout=lay, rank=rank, cco=cco)
+                                sdma_finish_peer(sdma, w, arg_win, peer,
+                                                 peer % fx.Int32(comm.queues),
+                                                 cursor_buf[peer], phase, layout=lay, rank=rank,
+                                                 cco=cco, signal_mode=comm.signal_mode)
 
         if const_expr(fuse):
             if bid < fx.Int32(NC):
@@ -523,7 +647,8 @@ def run_moe_gemm2_localsort(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     arg_cdone, arg_tile_base, arg_cursor, row_capacity, i32_inter, i32_hidden, stream, *,
     model_dim, inter_dim, experts, rank, send_nbytes, BM, SBM, HIDDEN_MAX, INTER_MAX, cu_num,
     BN=256, BK=256, use_nt=True, g2_bhoist=True, g2_ascale_pf=True, g2_spart=402, persist=False,
-    persist_cu=0, persist_strided=False, g2_bf16_lds=False, skew_cu=0, scatter_vec=8, comm=None):
+    persist_cu=0, persist_strided=False, g2_bf16_lds=False, skew_cu=0, scatter_vec=8, comm=None,
+    quant="none"):
     # fmt: on
     """Compile or reuse one configuration and launch it."""
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
@@ -533,7 +658,7 @@ def run_moe_gemm2_localsort(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
         INTER_MAX=INTER_MAX, SBM=SBM, persist=persist, cu_num=launch_cu_num,
         g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf, g2_spart=g2_spart,
         persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds, skew_cu=skew_cu,
-        scatter_vec=scatter_vec, comm=comm,
+        scatter_vec=scatter_vec, comm=comm, quant=quant,
     )
     key = tuple(sorted(compile_kw.items()))
     launch = _LAUNCH_CACHE.get(key)

@@ -40,14 +40,15 @@ Per token count it reports, as mean/max over ranks:
     breakdown        per-stage time of one eager call (rank 0), to see where the
                      new path spends its time
 
-CUDA Graph timing by default (what the production path uses); ``--no-graph`` times
-eager launches.
+Eager launches by default, which is what prefill does; ``--graph`` switches to
+the two-graph slope used by ``bench_ep.py``.
 
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 bench.py \\
         --network glm52 --bs-list 16,128,1024,4096
 """
 
 import argparse
+from dataclasses import replace
 
 from main import NETWORKS, _make_inputs, _next_pow2, _quantize_weights, _setup
 
@@ -75,18 +76,55 @@ def _sync():
     dist.barrier()
 
 
-def _time(fn, iters, graph):
-    """Mean/max-over-ranks ms per call. Falls back to eager if the graph cannot be captured."""
+#: Calls captured per graph for the slope measurement, as ``bench_ep.py`` does.
+GRAPH_REPS = 10
+
+
+def _replay_ms(g, n):
+    """Mean ms of one ``g.replay()`` over ``n`` replays."""
+    _sync()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+        enable_timing=True
+    )
+    start.record()
+    for _ in range(n):
+        g.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / n
+
+
+def _graph_of(fn, reps):
+    """Capture ``reps`` back-to-back calls, warm it up, lockstep the ranks."""
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=torch.cuda.Stream()):
+        for _ in range(reps):
+            fn()
+    _sync()
+    for _ in range(5):
+        g.replay()
+    _sync()
+    return g
+
+
+def _time(fn, iters, graph, reps=GRAPH_REPS):
+    """Mean/max-over-ranks ms per call.
+
+    With ``graph``, this is the *marginal* cost of one call: two graphs holding
+    ``reps`` and ``2*reps`` calls are replayed and differenced, so the per-replay
+    launch overhead -- which at bs=16 is the same order as the work -- cancels
+    instead of being charged to every call. Same two-graph slope as
+    ``mori/tests/python/ops/dispatch_combine_v2/bench_ep.py``. Falls back to
+    eager timing if the capture fails.
+    """
     _sync()
     fn()
     _sync()
-    replay = fn
     if graph:
         try:
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, stream=torch.cuda.Stream()):
-                fn()
-            replay = g.replay
+            g1, g2 = _graph_of(fn, reps), _graph_of(fn, 2 * reps)
+            t1, t2 = _replay_ms(g1, iters), _replay_ms(g2, iters)
+            return _over_ranks((t2 - t1) / reps)
         except Exception as exc:  # noqa: BLE001
             if dist.get_rank() == 0:
                 print(
@@ -95,14 +133,14 @@ def _time(fn, iters, graph):
                 )
             torch.cuda.synchronize()
     for _ in range(5):
-        replay()
+        fn()
     _sync()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
         enable_timing=True
     )
     start.record()
     for _ in range(iters):
-        replay()
+        fn()
     end.record()
     torch.cuda.synchronize()
     return _over_ranks(start.elapsed_time(end) / iters)
@@ -135,20 +173,48 @@ def _rel_l2(out, ref):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="glm52")
-    parser.add_argument("--bs-list", default="16,128,1024,4096", help="tokens per rank")
+    parser.add_argument(
+        "--bs-list", default="128,512,2048,4096,8192", help="tokens per rank"
+    )
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--rtol", type=float, default=0.05)
     parser.add_argument(
-        "--chunk-tiles", default="4", help="fused chunk sizes to sweep, e.g. 2,4,8,16"
+        "--chunk-tiles", default="16", help="fused chunk sizes to sweep, e.g. 8,16,32"
     )
-    parser.add_argument("--queues", type=int, default=8)
-    parser.add_argument("--no-graph", action="store_true")
+    parser.add_argument(
+        "--queues", type=int, default=1,
+        help="SDMA channels per (src, dst) pair. More than one measured "
+        "slower: KFD recommends a single engine per peer link here, so "
+        "extra channels share it and only add descriptors.",
+    )
+    parser.add_argument("--row-slack", type=float, default=1.5)
+    parser.add_argument(
+        "--signal-mode", choices=("quiet", "remote"), default="remote",
+        help="how a sender tells a peer its rows landed",
+    )
+    parser.add_argument(
+        "--no-aligned-pair", action="store_true",
+        help="force aiter off its common-pair stage2 so both paths run the "
+        "same config. It is picked only at bucket 8192, where SortedCombine "
+        "has no equivalent -- and measured 1.5%% slower than without it on "
+        "uniform routing anyway.",
+    )
+    parser.add_argument(
+        "--quant", choices=("none", "fp8_blockwise_1x32"), default="fp8_blockwise_1x32",
+        help="quantise the send buffer; halves the bytes SDMA moves",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="time CUDA Graph replays instead of eager launches. Off by "
+        "default: prefill does not capture, so eager is the shape that matters.",
+    )
     args = parser.parse_args()
 
     batch_sizes = [int(v) for v in args.bs_list.split(",")]
     chunk_list = [int(v) for v in args.chunk_tiles.split(",")]
-    graph = not args.no_graph
+    graph = args.graph
 
     rank, world, device = _setup()
     rows = []  # (bs, label, s2_mean, s2_max, e2e_mean, e2e_max, relL2)
@@ -186,7 +252,9 @@ def main():
             fanout_masks=(),
             **net,
         )
-        sc = SortedCombine(moe, queues=args.queues)
+        sc = SortedCombine(moe, queues=args.queues, quant=args.quant,
+                           row_slack=args.row_slack,
+            signal_mode=args.signal_mode)
 
         for bs in batch_sizes:
             x, wts, ids = (
@@ -197,6 +265,13 @@ def main():
             ref = moe(x, wts, ids)[:bs].clone()
             torch.cuda.synchronize()
             config = moe._active_config
+            if args.no_aligned_pair and config.stage2.aligned_pair:
+                config = replace(
+                    config,
+                    stage2=replace(
+                        config.stage2, aligned_pair=False, pair_cu=0, skew_cu=96
+                    ),
+                )
             if rank == 0:
                 print(
                     f"\n=== bs={bs} tokens/rank  p2p_quant={config.p2p_quant} "
