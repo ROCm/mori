@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import warnings
 from pathlib import Path
 
 __all__ = [
@@ -605,11 +606,20 @@ def make_plan(kernel: str, enums: dict | None = None) -> type:
                         self._defaults[wire] = 0
                 if hasattr(arena, "size"):
                     self._check_arena(arena, names)
+                else:
+                    warnings.warn(
+                        f"{kernel}: the arena has no size(), so its regions are not "
+                        "checked against what the plan needs; give it one "
+                        "(SymmArena has it). Unchecked arenas will be refused.",
+                        FutureWarning,
+                        stacklevel=2,
+                    )
 
         def _check_arena(self, arena, names) -> None:
             # A region smaller than the plan needs is overrun by the kernel, on a
-            # peer as often as here; refuse it now. An arena without size() is
-            # trusted, as before.
+            # peer as often as here; refuse it now. A region the plan reports as 0
+            # is one its kernel never dereferences (dispatch and outTok), however
+            # the arena sizes it.
             info = self.info
             for region in arg_regions.values():
                 need = int(info.get(_REGION_KEY + region, 0))

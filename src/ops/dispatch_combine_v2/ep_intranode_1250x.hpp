@@ -3775,6 +3775,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   T* const stage = EpLocal<T>(win, args.offOutTok);
   bool staged = false;
   [[maybe_unused]] EpFp4First<kCfg> rFirst{};
+  // The overlapped reduce's row flags sit where EpRegionOutTokBytes sizes them, which it does only
+  // under OvlAny; a path that takes it outside OvlAny writes past out_tok.
+  static_assert(!EpFp4Ovl<kCfg>() || EpCombinePushOvlAny(kCfg),
+                "EpFp4Ovl must imply EpCombinePushOvlAny, which sizes its row flags");
   if constexpr (EpFp4Ovl<kCfg>()) {
     constexpr int kOvlW = kCfg.warpPerBlock / 2;
     constexpr int kOvlR = kCfg.warpPerBlock - kOvlW;

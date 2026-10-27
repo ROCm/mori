@@ -50,6 +50,7 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -132,23 +133,23 @@ def _raw_stream(device_index: int) -> int:
 
 
 def scale_stride_bytes(scale_bytes: int) -> int:
-    """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
+    """What a DESTINATION scale row is laid down at (EpScaleStride in ep_cfg.hpp).
 
     Anything addressing the region itself strides by this; recv_scales() hides it.
-    A mirror kept for callers sizing without a plan; the op reads info["scaleStride"].
+    For callers sizing without a plan: the plan's own info["scaleStride"], asked
+    of describe().
     """
     if scale_bytes <= 0:
         return 0
-    return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
+    return _dispatch_info(scale_bytes=int(scale_bytes))["scaleStride"]
 
 
 def ep_staging_bytes(
     world_size: int, max_recv: int, scale_bytes: int, max_tok_per_rank: int = 0
 ) -> int:
-    """Total bytes for the gfx1250 dispatch staging buffer.
-
-    Mirrors EpStagingTotalBytes in ep_cfg.hpp, for callers sizing without a plan;
-    the op reads info["stagingBytes"] (EpDispatchPlan.describe).
+    """Bytes of the dispatch staging buffer (EpStagingTotalBytes in ep_cfg.hpp): the
+    plan's info["stagingBytes"], asked of describe(). 0 where the dispatch does not
+    stage (anything but gfx125x).
 
     ``max_recv`` is EpCfg.maxRecv, where 0 is not a cap of zero but "ask
     EpMaxRecv", which answers world_size * max_tok_per_rank -- and that is the
@@ -164,46 +165,62 @@ def ep_staging_bytes(
             "no max_tok_per_rank was given, so the receive cap is unknown. Pass "
             "max_tok_per_rank, or pass an already-resolved cap as max_recv."
         )
-    pool = world_size * recv
-    max_topk = 16
-    max_blocks = 512
+    # The staging layout reads only the resolved cap; any per-rank count the cap
+    # covers makes a request describe() accepts.
+    return _dispatch_info(
+        world_size=int(world_size),
+        max_recv=int(recv),
+        max_tok_per_rank=int(max_tok_per_rank or recv // world_size),
+        scale_bytes=int(scale_bytes),
+    )["stagingBytes"]
 
-    def a128(x):
-        return (x + 127) & ~127
 
-    off = a128(pool * max_topk * 4)  # stgIdx
-    off = a128(off + pool * max_topk * 4)  # stgWt
-    off = a128(off + pool * 4)  # stgSrc
-    off = a128(off + max_blocks * world_size * 4)  # blkBase
-    off = a128(off + max_blocks * world_size * 4)  # blkCount
-    if scale_bytes > 0:
-        s_stride = scale_stride_bytes(scale_bytes)
-        off = a128(off + world_size * recv * s_stride)
-    return off
+@functools.lru_cache(maxsize=None)
+def _dispatch_info_cached(fields: tuple) -> dict:
+    return cb.EpDispatchPlan.describe(**dict(fields))
+
+
+def _dispatch_info(**fields) -> dict:
+    return _dispatch_info_cached(tuple(sorted(fields.items())))
+
+
+@functools.lru_cache(maxsize=None)
+def _combine_info_cached(fields: tuple) -> dict:
+    return cb.EpCombinePlan.describe(**dict(fields))
 
 
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-_PUSH_SLOT_ALIGN = 128
 PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
-_PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4, "fp8_blockwise": 1}
-_PUSH_ELEM_BITS = {"fp4_blockwise": 4, "fp4_blockwise_fp32": 4, "fp8_blockwise": 8}
+# The combine request fields each push quant type turns on.
+_PUSH_REQUEST = {
+    "fp4_blockwise": (("combine_fp4", 1),),
+    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise": (("combine_fp8", 1),),
+}
 
 
 def push_wire_nbytes(cfg) -> int:
-    """EpCombinePushWireBytes, for callers sizing without a plan (info["pushWireBytes"])."""
-    h = cfg.hidden_dim
-    q = cfg.quant_type
-    wire = h * _PUSH_ELEM_BITS[q] // 8 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
-    return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
+    """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
+    plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
+    cfg.quant_type; the push combine, and so this, is gfx125x only."""
+    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
 def push_land_rows(cfg) -> int:
-    """EpCombinePushLandRows: one row per token and destination rank (info["pushLandRows"])."""
-    return cfg.max_num_inp_token_per_rank * min(
-        cfg.world_size, cfg.num_experts_per_token
+    """Landing rows of the push combine, one per token and destination rank
+    (EpCombinePushLandRows): the plan's info["pushLandRows"], asked of describe().
+    Reads cfg.max_num_inp_token_per_rank, cfg.world_size and
+    cfg.num_experts_per_token; gfx125x only, as the push combine is."""
+    fields = (
+        ("world_size", int(cfg.world_size)),
+        ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
+        ("num_expert_per_token", int(cfg.num_experts_per_token)),
+        *_PUSH_REQUEST["fp4_blockwise"],
     )
+    return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
 
 
 class TokOffExt:
@@ -384,8 +401,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
         self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
-        # What the intranode plans report, per variant; _regions fills them.
-        self._disp_infos, self._comb_infos = (), ()
+        # What each intranode plan will report, per variant -- its arena regions,
+        # staging, push landing -- asked before any of them is built.
+        self._disp_infos, self._comb_infos = self._describe(cfg)
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
             self._build(cfg, comm)
@@ -698,6 +716,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self._scale_row_bytes()
         return self._disp_infos[0]["scaleStride"]
 
+    def _describe(self, cfg):
+        """(dispatch infos, combine infos): every intranode variant, asked of
+        describe(), which compiles nothing. Empty on the internode path."""
+        if cfg.is_internode:
+            return (), ()
+        disp, comb = self._plan_requests(cfg)
+        return (
+            tuple(
+                cb.EpDispatchPlan.describe(**disp, block_num=b, warp_per_block=w)
+                for b, w in self._dispatch_specs
+            ),
+            tuple(
+                cb.EpCombinePlan.describe(**comb, block_num=b, warp_per_block=w)
+                for b, w in self._combine_specs
+            ),
+        )
+
     def _regions(self, cfg):
         if cfg.is_internode:
             # Sized exactly, region by region. v1 sizes its arena with a 256 MB
@@ -707,16 +742,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # compares every entry against what v1 allocates for the same config.
             return internode_regions(cfg)
         # Sized by the plans themselves (EpRegion* in ep_cfg.hpp), every variant
-        # asked, so the arena covers each one; describe() compiles nothing.
-        disp, comb = self._plan_requests(cfg)
-        self._disp_infos = tuple(
-            cb.EpDispatchPlan.describe(**disp, block_num=b, warp_per_block=w)
-            for b, w in self._dispatch_specs
-        )
-        self._comb_infos = tuple(
-            cb.EpCombinePlan.describe(**comb, block_num=b, warp_per_block=w)
-            for b, w in self._combine_specs
-        )
+        # asked, so the arena covers each one.
         regions = cb.arena_regions(
             *self._disp_infos, *self._comb_infos, region_names=_REGIONS
         )
@@ -815,9 +841,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # of merely overrunning the region.
         # The push combine's landing offsets ride the aggregated reservation's
         # dispatch signal, which TokOffExt turns off.
-        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(
-            self, "_tokoff_wanted", False
-        ):
+        if cfg.quant_type in _PUSH_QUANT_TYPES and self._tokoff_wanted:
             bad.append(
                 f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
                 "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
@@ -1523,7 +1547,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         view = self._views.get("push_landing")
         if view is None:
-            info = self._comb_infos[0]
+            info = next((i for i in self._comb_infos if "pushLandRows" in i), None)
+            if info is None:
+                raise RuntimeError(
+                    f"no landing rows: none of this op's {len(self._comb_infos)} "
+                    "combine plans reports a push landing (info['pushLandRows'])"
+                )
             view = from_gpu_ptr(
                 self.arena.local_ptr("out_tok") + info["pushLandOff"],
                 (info["pushLandRows"], info["pushWireBytes"]),

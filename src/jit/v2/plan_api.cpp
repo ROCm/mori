@@ -252,6 +252,9 @@ MORI_JIT_API void* mori_jit_plan_create(const char* kernel, const char* arch,
   } catch (const std::exception& e) {
     SetPlanError(e.what());
     return nullptr;
+  } catch (...) {
+    SetPlanError("mori_jit_plan_create: unknown exception");
+    return nullptr;
   }
 }
 
@@ -281,6 +284,9 @@ MORI_JIT_API const char* mori_jit_plan_describe(const char* kernel, const char* 
     return s.c_str();
   } catch (const std::exception& e) {
     SetPlanError(e.what());
+    return nullptr;
+  } catch (...) {
+    SetPlanError("mori_jit_plan_describe: unknown exception");
     return nullptr;
   }
 }

@@ -380,19 +380,25 @@ def test_staging_bytes_come_from_the_kernel_layout():
     d = cb.EpDispatchPlan.describe(
         world_size=8, max_tok_per_rank=512, max_recv=4096, scale_bytes=224
     )
-    if d["sharedBytes"]:
-        assert d["stagingBytes"] == ep_staging_bytes(8, 4096, 224) == 12746752
-    else:
-        assert d["stagingBytes"] == 0  # only the gfx125x dispatch stages
+    # Only the gfx125x dispatch stages.
+    want = 12746752 if d["sharedBytes"] else 0
+    assert d["stagingBytes"] == ep_staging_bytes(8, 4096, 224) == want
 
 
 def test_scale_stride_matches_the_plan():
     # scale_stride_bytes() stays for callers that size without a plan.
     from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
 
-    for scale in (0, 4, 32, 224, 256, 260):
+    for scale, stride in (
+        (0, 0),
+        (4, 128),
+        (32, 128),
+        (224, 256),
+        (256, 256),
+        (260, 384),
+    ):
         info = cb.EpDispatchPlan.describe(scale_bytes=scale)
-        assert info["scaleStride"] == scale_stride_bytes(scale)
+        assert info["scaleStride"] == scale_stride_bytes(scale) == stride
 
 
 _PUSH_KW = {
@@ -406,8 +412,8 @@ _PUSH_KW = {
 @pytest.mark.parametrize("ws", [2, 4, 8])
 def test_push_compat_sizes_match_the_cpp_layout(quant, ws):
     # push_wire_nbytes()/push_land_rows() stay for callers that size without a
-    # plan (aiter): the same values Sizes.PushWireRowsAndLanding pins in C++,
-    # and, where the push combine builds, what the plan itself reports.
+    # plan (aiter): describe()'s values, which Sizes.PushWireRowsAndLanding pins
+    # in C++.
     from types import SimpleNamespace
 
     from mori.ops.dispatch_combine_v2.hip_backend import (
@@ -422,10 +428,13 @@ def test_push_compat_sizes_match_the_cpp_layout(quant, ws):
         world_size=ws,
         num_experts_per_token=8,
     )
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        # The push combine is gfx125x only, and so are the sizes of it.
+        with pytest.raises(RuntimeError, match="gfx125x only"):
+            push_wire_nbytes(cfg)
+        return
     assert push_wire_nbytes(cfg) == (7424 if quant == "fp8_blockwise" else 3840)
     assert push_land_rows(cfg) == 128 * min(ws, 8)
-    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
-        return  # the push combine is gfx125x only
     info = cb.EpCombinePlan.describe(
         world_size=ws, max_tok_per_rank=128, hidden_dim=7168, **_PUSH_KW[quant]
     )
@@ -463,6 +472,18 @@ def test_an_arena_too_small_for_the_plan_is_refused():
     short = dict(sizes, dispOut=sizes["dispOut"] - 1)
     with pytest.raises(ValueError, match="'dispOut'"):
         cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(short))
+
+
+def test_an_arena_without_size_is_bound_with_a_warning():
+    class Unsized:
+        handle = _SizedArena.handle
+        offset = _SizedArena.offset
+
+        def __init__(self, sizes):
+            self.sizes = sizes
+
+    with pytest.warns(FutureWarning, match="no size"):
+        cb.EpDispatchPlan(**_SMALL, arena=Unsized(_small_regions())).close()
 
 
 def test_a_region_the_other_kernel_sizes_is_not_checked():
@@ -510,16 +531,16 @@ def test_per_block_reservation_follows_the_slot_word():
 
 
 def test_staging_bytes_matches_the_device_layout():
-    # ep_staging_bytes() hand-mirrors EpStagingTotalBytes (ep_cfg.hpp): six
-    # sub-arrays, each rounded up to EpScaleAlign. EpArgs carries the base but no
-    # length, so the kernel cannot bounds-check what it was given -- a mirror that
-    # drifts low is not an error but a silent write past the end of a torch tensor,
-    # into whatever the caching allocator handed out next. The numbers below come
-    # from EpStagingTotalBytes and are the only thing holding the mirror to it; if
-    # the layout moves, re-derive them there rather than pasting whatever this
-    # function starts returning.
+    # EpStagingTotalBytes (ep_cfg.hpp): six sub-arrays, each rounded up to
+    # EpScaleAlign. EpArgs carries the base but no length, so the kernel cannot
+    # bounds-check what it was given -- a size that drifts low is not an error but
+    # a silent write past the end of a torch tensor, into whatever the caching
+    # allocator handed out next. If the layout moves, re-derive these from it
+    # rather than pasting whatever ep_staging_bytes() starts returning.
     from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        pytest.skip("only the gfx125x dispatch stages")
     assert ep_staging_bytes(8, 4096, 224) == 12746752
     assert ep_staging_bytes(8, 4096, 0) == 4358144
     assert ep_staging_bytes(32, 4096, 224) == 50987008
@@ -560,16 +581,10 @@ def launched(monkeypatch):
 def _shared_bytes(monkeypatch, n):
     # The staging decision on any arch: the gfx125x dispatch is the one with
     # dynamic LDS and a staging size, so faking both runs the fallback where CI runs.
-    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
-
     real = cb._EpDispatchJitPlan.info.fget
 
     def info(self):
-        i = real(self)
-        stg = ep_staging_bytes(
-            i["worldSize"], i["maxRecv"], i["scaleBytes"], i["maxTokPerRank"]
-        )
-        return {**i, "sharedBytes": n, "stagingBytes": stg if n else 0}
+        return {**real(self), "sharedBytes": n, "stagingBytes": 1 << 16 if n else 0}
 
     monkeypatch.setattr(cb.EpDispatchPlan, "info", property(info))
 
@@ -672,6 +687,23 @@ def test_a_staging_tensor_is_checked_against_the_plan(launched, stages):
     assert p._defaults["stagingBase"] == 1 << 20
     p.close()
     assert p._staging is None
+
+
+def test_a_staging_tensor_off_the_plans_device_is_refused(launched, stages):
+    p = _plan()
+    with pytest.raises(ValueError, match="launches on"):
+        p.bind(staging_base=torch.zeros(p.info["stagingBytes"], dtype=torch.uint8))
+    assert p._staging is None
+    p.close()
+
+
+def test_a_failed_bind_holds_no_staging(launched, stages):
+    p = _plan()
+    buf = torch.zeros(p.info["stagingBytes"], dtype=torch.uint8, device="cuda")
+    with pytest.raises(TypeError, match="no_such_arg"):
+        p.bind(staging_base=buf, no_such_arg=1)
+    assert p._staging is None
+    p.close()
 
 
 def test_staging_passed_per_launch_is_left_alone(launched, stages):

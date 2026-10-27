@@ -83,16 +83,29 @@ class EpDispatchPlan(_EpDispatchJitPlan):
             self.bind(staging_base=_FallbackStaging(self, info))
 
     def bind(self, **args) -> None:
-        # A staging tensor is checked against info["stagingBytes"], held, and bound
-        # by address; an int address is taken on trust.
+        # A staging tensor is checked against info["stagingBytes"], bound by
+        # address, and held once the bind succeeds. An int address is taken on
+        # trust, and any other object with data_ptr() -- the fallback below among
+        # them -- is read at each launch, as before.
+        staging = None
         for key in ("staging_base", "stagingBase"):
             buf = args.get(key)
             if hasattr(buf, "untyped_storage"):
                 args[key] = self._checked_staging(buf)
+                staging = buf
         super().bind(**args)
+        if staging is not None:
+            self._staging = staging
 
     def _checked_staging(self, buf) -> int:
+        import torch
+
         need = self.info["stagingBytes"]
+        if buf.device.type != "cuda" or buf.device.index != torch.cuda.current_device():
+            raise ValueError(
+                f"ep_dispatch: staging_base is on {buf.device}, the plan launches on "
+                f"cuda:{torch.cuda.current_device()}"
+            )
         # The tensor's own extent: a short slice of a larger buffer is still short.
         if not buf.is_contiguous():
             raise ValueError("ep_dispatch: staging_base must be contiguous")
@@ -104,7 +117,6 @@ class EpDispatchPlan(_EpDispatchJitPlan):
             )
         if buf.data_ptr() % 128:
             raise ValueError("ep_dispatch: staging_base must be 128 B aligned")
-        self._staging = buf
         return buf.data_ptr()
 
     def close(self) -> None:
@@ -151,7 +163,6 @@ def _staging_key(info: dict) -> tuple:
         recv,
         info["scaleBytes"],
         info["maxTokPerRank"],
-        info["stagingBytes"],
     )
 
 

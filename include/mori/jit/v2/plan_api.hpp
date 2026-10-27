@@ -126,17 +126,35 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
     std::string cfgKeyValues;                                                                    \
   };                                                                                             \
                                                                                                  \
+  /* The request resolved the one way create and describe both use. */                           \
+  struct NAME##PlanResolved {                                                                    \
+    SPEC::Cfg cfg;                                                                               \
+    std::string cfgText;                                                                         \
+    std::string cfgKeyValues;                                                                    \
+    std::string source;                                                                          \
+    ::mori::jit::v2::LaunchGeometry geom;                                                        \
+  };                                                                                             \
+  NAME##PlanResolved NAME##PlanResolve(const ::mori::jit::v2::FieldBag& f) {                     \
+    NAME##PlanResolved r{REQUEST_FN(f)};                                                         \
+    r.cfgText = Render(r.cfg);                                                                   \
+    r.cfgKeyValues = INFO_FN(r.cfg);                                                             \
+    r.source = SPEC::RenderSource(r.cfg);                                                        \
+    r.geom = SPEC::Geometry(r.cfg);                                                              \
+    return r;                                                                                    \
+  }                                                                                              \
+                                                                                                 \
   void* NAME##PlanCreate(const ::mori::jit::v2::FieldBag& f) {                                   \
-    auto* h = new NAME##PlanHandle();                                                            \
-    const auto cfg = REQUEST_FN(f);                                                              \
-    h->cfgText = Render(cfg);                                                                    \
-    h->cfgKeyValues = INFO_FN(cfg);                                                              \
+    const auto r = NAME##PlanResolve(f);                                                         \
+    /* Owned until Prepare returns: a compile error must not leak it */                          \
+    auto h = std::make_unique<NAME##PlanHandle>();                                               \
+    h->cfgText = r.cfgText;                                                                      \
+    h->cfgKeyValues = r.cfgKeyValues;                                                            \
     /* Same deps Prepare compiles with. Defaulting them here would report a                      \
        directory nobody ever writes for any Spec that overrides SourceDeps. */                   \
-    h->cacheDir = ::mori::jit::v2::Compiler::Instance().CacheDirFor(                             \
-        SPEC::kName, SPEC::RenderSource(cfg), SPEC::SourceDeps());                               \
-    h->plan = SPEC::Prepare(cfg);                                                                \
-    return h;                                                                                    \
+    h->cacheDir = ::mori::jit::v2::Compiler::Instance().CacheDirFor(SPEC::kName, r.source,       \
+                                                                    SPEC::SourceDeps());         \
+    h->plan = SPEC::Prepare(r.cfg);                                                              \
+    return h.release();                                                                          \
   }                                                                                              \
   void NAME##PlanDestroy(void* p) { delete static_cast<NAME##PlanHandle*>(p); }                  \
   void NAME##PlanLaunch(void* p, const void* buf, size_t size, void* stream) {                   \
@@ -154,13 +172,10 @@ std::string FormatPlanInfo(unsigned grid, unsigned block, unsigned sharedBytes,
                                                    h->cfgText, h->cacheDir);                     \
   }                                                                                              \
   std::string NAME##PlanDescribe(const ::mori::jit::v2::FieldBag& f) {                           \
-    const auto cfg = REQUEST_FN(f);                                                              \
-    /* Rendered but not compiled: describe fails where create would, short of a compile error */ \
-    (void)SPEC::RenderSource(cfg);                                                               \
-    const auto g = SPEC::Geometry(cfg);                                                          \
-    const std::string kv = INFO_FN(cfg);                                                         \
-    return ::mori::jit::v2::detail::FormatPlanInfo(g.gridX, g.blockX, g.sharedBytes, kv,         \
-                                                   Render(cfg), "");                             \
+    /* Resolved as create resolves it, short of the compile -- what create refuses fails here */ \
+    const auto r = NAME##PlanResolve(f);                                                         \
+    return ::mori::jit::v2::detail::FormatPlanInfo(                                              \
+        r.geom.gridX, r.geom.blockX, r.geom.sharedBytes, r.cfgKeyValues, r.cfgText, "");         \
   }                                                                                              \
   const struct NAME##PlanRegistrar {                                                             \
     NAME##PlanRegistrar() {                                                                      \
