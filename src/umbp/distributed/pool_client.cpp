@@ -5169,15 +5169,21 @@ void PoolClient::ExecuteRemotePrefetch(const std::vector<std::string>& keys,
   }
   for (const auto& [failed_node, retry_indices] : retries) {
     std::vector<std::string> retry_keys;
-    for (auto i : retry_indices) retry_keys.push_back(keys[i]);
+    std::vector<size_t> active_indices;
+    for (auto i : retry_indices) {
+      if (!prefetch_manager_->ShouldRun(keys[i])) continue;
+      retry_keys.push_back(keys[i]);
+      active_indices.push_back(i);
+    }
+    if (retry_keys.empty()) continue;
     std::vector<std::optional<RouteGetResult>> answers;
     const auto status = master_client_->BatchRouteGet(
         retry_keys, {config_.master_config.node_id, failed_node}, &answers);
     if (!status.ok()) continue;
-    for (size_t j = 0; j < retry_indices.size() && j < answers.size(); ++j) {
+    for (size_t j = 0; j < active_indices.size() && j < answers.size(); ++j) {
       if (!answers[j]) continue;
-      routes[retry_indices[j]] = answers[j];
-      enqueue(retry_indices[j]);
+      routes[active_indices[j]] = answers[j];
+      enqueue(active_indices[j]);
     }
   }
   flush();
