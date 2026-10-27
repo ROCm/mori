@@ -103,7 +103,8 @@ class Mxfp8ScaleLds:
         self.srcs = []
         for arg, first, rows_per in ((A_scale, row0, 1), (B_scale, col0, 32)):
             # The descriptor takes the tensor's own extent, so rows past M or
-            # N/32, and the last chunk's bytes past K, read as zero.
+            # N/32, and the last chunk's bytes past the tensor's end, read as
+            # zero. That needs the chunk offset in the VGPR offset (see dma).
             src = fx.logical_divide(
                 make_fp8_buffer_tensor(arg, fp8_ir_t), fx.make_layout(1, 1)
             )
@@ -128,7 +129,17 @@ class Mxfp8ScaleLds:
         ]
 
     def dma(self, chunk):
-        """Copy chunk ``chunk`` into slot ``chunk % 2``; past K reads zero, unused."""
+        """Copy chunk ``chunk`` into slot ``chunk % 2``.
+
+        The chunk offset goes in the per-lane offset, not ``soffset``: the raw
+        buffer range check covers the VGPR and instruction offsets only, so via
+        ``soffset`` the last row's bytes past K would come from beyond the
+        tensor. K % 128 == 0 keeps each row whole dwords, so a dword is either
+        in the tensor or zero-filled; the bytes past K are never read anyway.
+        Not the immediate offset either: on an LDS-direct load it also moves
+        the LDS destination, and slot 0 starts at LDS 0, so it cannot be
+        compensated in M0.
+        """
         base_i32 = fx.Int32(fx.ptrtoint(self.lds.ptr))
         for op in range_constexpr(2):
             src, offs = self.srcs[op]
@@ -145,9 +156,8 @@ class Mxfp8ScaleLds:
                 )
                 fx.copy(
                     self.atom,
-                    fx.slice(src, (None, fx.Int32(offs[step]))),
+                    fx.slice(src, (None, fx.Int32(offs[step]) + chunk * 16)),
                     dst,
-                    soffset=fx.Int32(chunk * 16),
                 )
 
     def _read(self, op, half_row, n_tiles, k):

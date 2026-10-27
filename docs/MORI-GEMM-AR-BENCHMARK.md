@@ -142,10 +142,10 @@ MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
 `--quant` picks the operand contract, and it is per model -- `blockscale` for
 V4-Pro (A 1x128, B 128x128, fp32 scales), `mxfp8` for V4.1-Flash (32-wide ue8m0
 on both, int32). `mxfp8_raw` is the same quantisation with the scales as
-row-major uint8 bytes, staged through LDS; it is the faster of the two (see the
-op README). Two more exist and are not for use: `mxfp8_unpacked` and
-`mxfp8_row` are the scale layouts `mxfp8` was chosen over, kept so the choice
-stays measurable.
+row-major uint8 bytes, staged through LDS; it is the faster of the two cold
+and at large M (see the op README). Two more exist and are not for use:
+`mxfp8_unpacked` and `mxfp8_row` are the scale layouts `mxfp8` was chosen over,
+kept so the choice stays measurable.
 
 > **Pin `--quant` when comparing anything against anything.** The benchmark
 > defaults to `ptpc`, which is ~3% faster than `blockscale` and a different

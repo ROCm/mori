@@ -366,7 +366,8 @@ the permutation stays inside the 64 bytes one program already owns, so it is
 address arithmetic rather than traffic, and measures slightly *faster* than the
 stock kernel.
 
-**Row-major scales through LDS (`quant="mxfp8_raw"`) beat both.** The packed
+**Row-major scales through LDS (`quant="mxfp8_raw"`) beat both, cold and at
+large M** (the table below has where they do not). The packed
 layout fixes the addresses but still reads from global once per K step, and that
 costs in two ways the counters above do not show. The MFMA that consumes a scale
 waits for it with `vmcnt`, which retires in issue order, so it also waits for

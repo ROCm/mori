@@ -65,8 +65,9 @@ MXFP8_BLOCK = 32
 #: ``"mxfp8"``       32-wide ue8m0 on both, fed to the scaled MFMA as
 #:                   instruction operands. DeepSeek-V4.1-Flash.
 #: ``"mxfp8_raw"``   the same numbers, in the quantiser's own row-major bytes,
-#:                   which the kernel stages through LDS. Faster than
-#:                   ``"mxfp8"``, and needs no host shuffle.
+#:                   which the kernel stages through LDS. Needs no host
+#:                   shuffle; faster cold and at large M, can be a few percent
+#:                   slower hot at small M or short K.
 #:
 #: They differ in more than a group size: the mxfp8 forms need BLOCK_M=256 (see
 #: MXFP8_BLOCK_M); ``"mxfp8"`` takes its A scale through ``preshuffle_a_scale``
