@@ -1201,15 +1201,19 @@ __forceinline__ __device__ void CombineInterNodeTyped(EpDispatchCombineArgs& arg
             }
 
             // Join the producers before the leader's release publishes their stores.
+            // Agent scope is enough: the completing lane's seq_cst system stores
+            // publish them to the NIC.
             ::mori::cco::ccoCoopWarp{}.sync();
-            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
             index_t finished = 0;
             if (laneId == 0)
               finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
             finished = __shfl(finished, 0);
             if ((finished + 1) >= (numRecvBlock * warpNum)) {
               if (laneId == 0) {
-                // Acquire all producers through the completion-counter RMW chain.
+                // Acquire all producers through the completion-counter RMW chain. No
+                // separate system release: this seq_cst store and the put's seq_cst
+                // doorbell store already publish the staging rows to the NIC.
                 __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
                 core::AtomicStoreSeqCstSystem(
                     args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum +
@@ -1363,15 +1367,19 @@ __forceinline__ __device__ void CombineInterNodeLLTyped(EpDispatchCombineArgs& a
       }
 
       // Join the producers before the leader's release publishes their stores.
+      // Agent scope is enough: the completing lane's seq_cst system stores
+      // publish them to the NIC.
       ::mori::cco::ccoCoopWarp{}.sync();
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       index_t finished = 0;
       if (laneId == 0)
         finished = atomicAdd(&args.interNodeChunkFlagCombine[node * maxChunkNum + k], 1);
       finished = __shfl(finished, 0);
       if ((finished + 1) >= (warpsPerToken * warpSize)) {
         if (laneId == 0) {
-          // Acquire all producers through the completion-counter RMW chain.
+          // Acquire all producers through the completion-counter RMW chain. No
+          // separate system release: this seq_cst store and the put's seq_cst
+          // doorbell store already publish the staging rows to the NIC.
           __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
           core::AtomicStoreSeqCstSystem(
               args.reg(args.offChunkFlag)->template GetAs<uint64_t*>() + node * maxChunkNum + k,
