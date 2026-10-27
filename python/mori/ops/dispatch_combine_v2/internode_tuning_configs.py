@@ -44,7 +44,11 @@ def lookup(
     experts_per_rank,
     kernel_family="v2",
 ):
-    """Return dispatch/combine B/R/W from the selected family's table rules.
+    """Return the selected family's rules for one token count, as
+    lookup_internode() does: ``{"dispatch": (block, rdma, warp, active_qps),
+    "combine": (block, rdma, warp, active_qps), "combine_load_first": bool}``.
+    active_qps is None when the rule names none, and a phase without rules is
+    None.
 
     ``dtype`` accepts a torch dtype, a shared config string, or ``"fp8"``
     (FNUZ on gfx942, OCP elsewhere). Combine remains BF16. Missing rules use

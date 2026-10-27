@@ -166,8 +166,9 @@ inline constexpr int kCombineBarrierMarkerTotal = 64;
 //   header, because the kernel reads its grid from gridDim/blockDim rather than
 //   from kConfig. See the note there.
 //
-// One field is not shape: combineLoadFirst selects the ordinary combine's
-// gather per token bucket, from the tuning table rather than from any config field.
+// Three fields are not shape: numQpPerPe (the active QP count) and
+// combineLoadFirst are chosen per token bucket from the tuning table, and
+// numQpToDrain is the op's largest active count.
 //
 // Defaults mirror EpDispatchCombineConfig's, except worldSize: 0 there means
 // "not filled in yet", which is nothing that can be compiled for.

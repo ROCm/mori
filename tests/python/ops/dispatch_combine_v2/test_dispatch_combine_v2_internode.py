@@ -1080,16 +1080,17 @@ def _timed_pass(
 
 
 def _build_op(cfg, comm, dispatch_geometry, combine_geometry):
-    """An op whose dispatch plans are compiled for `dispatch_geometry` and its
-    combine plans for `combine_geometry`. Goes through the MORI_EP_*_GEOM hook
-    the backend already exposes for sweeps: a geometry is a compile-time identity
-    there, read once at build time, so it cannot be selected per launch the way
-    v1's can.
+    """An op whose dispatch plans run `dispatch_geometry` and its combine plans
+    `combine_geometry`. Goes through the MORI_EP_*_GEOM hook the backend already
+    exposes for sweeps: it is read once, when the op resolves its schedule, so
+    each candidate needs an op of its own and cannot be selected per launch the
+    way v1's can.
 
     The two are SEPARATE because the shipped table gives them separate values
-    (tokens 4: dispatch 64/32/8, combine 32/21/6). Driving both from one geometry
-    means the sweep's incumbent is not the configuration actually shipped, so
-    "beats the incumbent" would not mean "beats what we ship".
+    (MI308X 256/8 hidden 7168 bf16 at 4 tokens: dispatch 64/42/4, combine
+    16/10/4). Driving both from one geometry means the sweep's incumbent is not
+    the configuration actually shipped, so "beats the incumbent" would not mean
+    "beats what we ship".
 
     The intranode backend has no such hook; there the geometry is pinned through
     the config fields, which also drops the tuned schedule.
@@ -1269,7 +1270,7 @@ def _summarize_metric_samples(
 
     evidence = {
         "schema_version": 1,
-        "method": "dispatch.md:2026-09-30/grand_mean",
+        "method": "grand_mean",
         "parameters": {
             "num_passes": num_passes,
             "num_rounds": num_rounds,

@@ -118,8 +118,10 @@ every rank. The wait target is the rank's own dispatch count times that fixed
 total, so a dispatch without its combine, or a second combine, leaves a peer
 waiting for a value that never comes. Complete each dispatch/combine pair
 before starting the next, and order arena reuse across streams and graph
-replays. All ranks should also run the same kernel family in a cycle; the
-active count is the only per-cycle choice that may differ between them.
+replays. Everything else a launch picks from its own token count may differ
+between ranks in one cycle: the family under `auto`, the geometry, the active
+count and load-first. Both families exchange the same chunk flags, node counts
+and send-slot layout and share the combine barrier.
 
 Two further internode-only rules `__post_init__` applies: `quant_type` must be
 `"none"` (the internode combine's fp8 staging path is incomplete and returns
@@ -135,7 +137,7 @@ unpacked `[received_tokens, hidden_dim]` BF16 or FP32 tensor to combine;
 FP4 combine and FP4 dispatch with FP8 combine are unsupported.
 
 For ordinary `internode_kernel="v2"`, a combine rule with
-`"combine_load_first": true` compiles that token bucket's combine with
+`combine_load_first` set to 1 compiles that token bucket's combine with
 4-byte-per-lane load-first peer gathers (`WarpAccumLF<T, 4, 2>`, when the row
 and staging strides are 4-byte aligned); other buckets use `WarpAccum<T, 4>`.
 The choice is per bucket and per GPU model, independent of the declared
@@ -150,28 +152,29 @@ Leave `dispatch_block_num` / `combine_block_num` / `warp_num_per_block` /
 for this GPU model, shape and dtype out of `tuning_configs/`, one bucket per
 token range, with plans prepared up front. A pinned config field overrides only that
 field; the remaining fields stay tuned. The sweep hooks `MORI_EP_DISP_GEOM` /
-`MORI_EP_COMB_GEOM` (`"block,rdma,warp"`) bypass table selection for both phases
-when either is set. Clear both when checking automatic selection.
+`MORI_EP_COMB_GEOM` (`"block,rdma,warp[,active_qps]"`) bypass table selection for
+both phases when either is set. Clear both when checking automatic selection.
 
 `MORI_EP_V2_TUNING_DIR` selects an alternate V2 table directory (intra and inter).
 `hip_tuning_configs.py` owns the table format (filenames, loading, checks and
 merge-on-save) as well as the HIP schedule and CU limits.
 
-- Only the current GPU model's own files are read; a model without a file uses
-  the default geometry instead of another model's table.
+- Only the current GPU model's own files are read. A model without one does not
+  borrow another model's CSV: inter-node uses the config's default geometry, and
+  intra-node the Python tables in `hip_tuning_configs.py`, where MI350X shares
+  MI355X's entries.
 - Each phase matches **its own dtype**: fp8 dispatch + bf16 combine reads the
   arch's fp8 dispatch rules (`fp8_e4m3_fnuz` on gfx942, `fp8_e4m3` on gfx950)
   and the same `bf16` combine rules as bf16 dispatch.
 - `num_tokens` is an inclusive ceiling; the largest matching rule also serves
   larger token counts. Dispatch/combine bucket edges are combined into a schedule,
   while a phase without matching rules keeps its default geometry.
-- Total experts (`ep_size * experts_per_rank`) and top-k pick the file: at EP16,
-  256/8 (`experts_per_rank=16, topk=8`) reads `expert256_top8`, while 384/6
-  (`experts_per_rank=24, topk=6`) reads `expert384_top6`. Unknown combinations use
-  the default geometry. Rules record `topk`, and a rule without it is not a
-  wildcard in V2; the expert count is fixed by the file and not repeated per rule.
-  Saving needs both values to pick the file. V1's legacy wildcard lookup is
-  unchanged.
+- Total experts (`ep_size * experts_per_rank`) and top-k are selector columns of
+  every rule (`num_experts`, `topk`): at EP16, 256/8 (`experts_per_rank=16,
+  topk=8`) matches only `num_experts=256, topk=8` rules, and 384/6
+  (`experts_per_rank=24, topk=6`) only `num_experts=384, topk=6`. Unknown
+  combinations use the default geometry; V2 has no wildcard rule. Saving needs
+  both values to fill the selector. V1's legacy wildcard lookup is unchanged.
 - `InterNodeV2` and `InterNodeV2LL` have separate files. In `auto` mode the family
   crossover is also a bucket edge, so each launch uses its own family's rules.
 
@@ -205,13 +208,14 @@ per-field tuning overrides as described above.
 Intra B/W participate in compilation. Inter B/R/W are plan launch settings:
 different geometries can share a compiled module while retaining separate plans
 for their grid, block size and bound RDMA split. Inter shape/dtype still specialize
-the compiled kernel.
+the compiled kernel, and so do each bucket's active QP count, the op's drain count
+and, for the ordinary combine, `combine_load_first`.
 
 Run a sweep on both nodes through the existing wrapper, using rank 0 on one
 node and rank 1 on the other, with the same rendezvous and tuning arguments:
 
 ```bash
-# Match the current MI355X tuning campaign with ionic CCQE disabled.
+# The MI355X tables were tuned with ionic CCQE disabled; match that.
 MORI_DISABLE_IONIC_CCQE=1 tools/run_internode_test.sh \
     --rank <0-or-1> --master-addr <ip> --ifname <nic> \
     --entry tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py \
@@ -223,7 +227,7 @@ MORI_DISABLE_IONIC_CCQE=1 tools/run_internode_test.sh \
 
 Repeat for each token ceiling and phase being tuned. `--tuning-save` merges the
 selected rule into the model's table; without it the sweep only reports results.
-`--tuning-candidate block,rdma,warp` restricts the sweep to one candidate. Selection
+`--tuning-candidate block,rdma,warp[,active_qps]` restricts the sweep to one candidate. Selection
 defaults to the dispatch+combine pair's total latency (`--tuning-metric total`),
 with the other phase held at its selected geometry. A bf16 combine rule is shared
 by bf16, fp8 and fp4 dispatch, so validate the affected input dtypes before
@@ -236,7 +240,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | file | role |
 |---|---|
 | `test_dispatch_combine_v2_intranode.py` | pytest wrapper: runs `test_op.py` under torchrun for the representative modes and asserts every line PASS |
-| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (QPs allocated, default 1), `--active-qps`, `--active-qp-counts` (under `--cmd test`/`stress` the ranks switch among them, deliberately out of step), `--tuning-qps` (active counts crossed with the geometry sweep), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. `--cmd tuning` sweeps one phase (`--tuning-phase`) against the other's shipped value and, with `--tuning-save`, merges the winner into `tuning_configs/` (`--tuning-config-dir`). **Needs two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it |
+| `test_dispatch_combine_v2_internode.py` | the internode entry: a torchrun script (not a pytest wrapper) for correctness, bench and tuning over CCO/GDA. `--cmd test\|bench\|tuning\|stress`, `--max-tokens`, `--hidden-dim`, `--topk`, `--dtype`/`--combine-dtype`, `--num-qp` (QPs allocated, default 1), `--active-qps`, `--active-qp-counts` (under `--cmd test`/`stress` the ranks switch among them, deliberately out of step), `--tuning-qps` (active counts crossed with the geometry sweep), `--kernel-type auto\|v2\|v2_ll`, `--auto-ll-max-tokens`, `--rounds`, `--spawn`. `--cmd tuning` sweeps one phase (`--tuning-phase dispatch\|combine`) against the other's shipped value, or with `--tuning-phase pair` the dispatch/combine active QP pairs at the shipped geometry, and, with `--tuning-save`, merges the winner into `tuning_configs/` (`--tuning-config-dir`). **`bench` and `stress` need two nodes**: the op refuses a config whose node grouping disagrees with the communicator's LSA team, so one host cannot emulate it. On one node, `test` and `tuning` build the intranode op instead, which is how the `IntraNodeV2` tables are tuned |
 | `test_internode_regions.py` | pure-Python invariants of `internode_regions()`: the name contract with the backend and the capacity bounds the kernel's indexing implies. No GPU, no process group |
 | `test_op_lifecycle.py` | arena-leak regression: rebuilding the op on one long-lived `Communicator`; `close()` must free and untrack the window. `torchrun --standalone --nproc_per_node=2` |
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
