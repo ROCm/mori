@@ -96,8 +96,19 @@ if(BUILD_IO)
       test_fault_injection
       PRIVATE
         MORI_IO_FAULT_CATALOG_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog/ibverbs.yaml"
+        MORI_IO_FAULT_CATALOG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/io/fault_catalog"
     )
     target_link_libraries(test_fault_injection mori_application mori_io)
+
+    # CPU-only regression checks with provider stand-ins; no libibverbs link.
+    add_executable(test_fault_injector io/test_fault_injector.cpp
+                   ${CMAKE_SOURCE_DIR}/src/io/rdma/fault_injector.cpp)
+    target_include_directories(test_fault_injector PRIVATE ${CMAKE_SOURCE_DIR}
+                               ${CMAKE_SOURCE_DIR}/include
+                               ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
+    target_compile_definitions(test_fault_injector PRIVATE MORI_IO_FAULT_INJECTION
+                                                          MSGPACK_NO_BOOST)
+    target_link_libraries(test_fault_injector mori_logging hip::host)
   endif()
 
   add_executable(test_peer_failure io/test_peer_failure.cpp)

@@ -34,7 +34,6 @@
 # `fails` checks fail. The run fails on any other failed check (a new bug or a
 # regression), and on a known_bug entry whose `fails` checks now pass (XPASS):
 # the fix PR then deletes that entry's known_bug and fails lines.
-#   no-qp-rebuild           a QP in ERR is never rebuilt; later transfers flush
 #   no-completion-deadline  a lost CQE leaves the transfer IN_PROGRESS forever
 #   target-not-notified     the target can wait forever for a lost notification
 #   exit-on-post-recv-fail  a failed ibv_post_recv calls exit(-1)
@@ -88,58 +87,42 @@
   real_world: link down or peer gone during a write
   rule: cqe_error:op=write:value=retry_exc
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.retry_exc.mid_run
   real_world: same, after 10 good transfers
   rule: cqe_error:op=write:value=retry_exc
   transfer: write
   warmup: 10
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.read.retry_exc
   real_world: link down or peer gone during a read
   rule: cqe_error:op=read:value=retry_exc
   transfer: read
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.rem_access
   real_world: "stale rkey: peer deregistered the memory"
   rule: cqe_error:op=write:value=rem_access
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.read.rem_op
   real_world: peer rejected the operation
   rule: cqe_error:op=read:value=rem_op
   transfer: read
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.loc_prot
   real_world: local buffer deregistered under an in-flight write
   rule: cqe_error:op=write:value=loc_prot
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.write.fatal
   real_world: NIC internal error on one WR
   rule: cqe_error:op=write:value=fatal
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: cqe_error.batch.one_qp
   real_world: one of two QPs fails mid-batch
   rule: cqe_error:op=write
   transfer: batch
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 # Initiator side only: the injected error lands after the real SEND was
 # delivered, so the target is still told. cqe_drop.notify.recv covers the target side.
@@ -148,8 +131,6 @@
   rule: cqe_error:op=send:value=rnr_retry_exc
   transfer: write
   notify: true
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 # ---- Lost completion: the WR finishes but its CQE never arrives ----------------
 
@@ -189,27 +170,19 @@
   real_world: QP dies before the first write
   rule: qp_error
   transfer: write
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: qp_error.write.mid_run
   real_world: QP dies after 10 good transfers
   rule: qp_error
   transfer: write
   warmup: 10
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: qp_error.read
   real_world: QP dies before a read
   rule: qp_error
   transfer: read
-  known_bug: no-qp-rebuild
-  fails: recovers
 
 - id: qp_error.batch.one_qp
   real_world: one of two QPs dies
   rule: qp_error
   transfer: batch
-  known_bug: no-qp-rebuild
-  fails: recovers
