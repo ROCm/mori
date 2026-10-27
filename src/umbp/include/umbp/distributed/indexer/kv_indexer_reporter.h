@@ -37,7 +37,6 @@
 #include "mori/utils/mori_log.hpp"
 #include "sgl_kv_indexer.grpc.pb.h"
 #include "umbp/common/config.h"
-#include "umbp/distributed/types.h"
 
 namespace mori::umbp {
 namespace indexer_pb = ::kv_indexer::v1;
@@ -94,6 +93,8 @@ class KvIndexerReporter {
       if (mask && old != blocks_.end() &&
           (old->second.parent != block.parent || old->second.block_size != block.block_size))
         throw std::invalid_argument("a block hash cannot change parent or token count");
+      if (mask && old != blocks_.end() && old->second.component_keys == block.component_keys)
+        return;  // Repeated physical writes need no metadata update or ancestor walk.
       if (mask) {
         // Forward references are allowed, but cannot close a parent cycle.
         for (auto parent = block.parent; parent;) {

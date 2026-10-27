@@ -31,6 +31,10 @@ callback runs synchronously before storage writes, outside storage locks; Python
 callbacks acquire the GIL. Invalid metadata or callback errors fail the call
 before writing. Actual commit/eviction hooks, not callback execution, determine
 residency. Indexer RPC failures do not fail successful storage writes.
+The callback must be callable (`None` is rejected). Python bound methods retain
+their owner weakly to avoid an owner/client reference cycle; keep that owner
+alive while using the client. Other callable objects/closures must not own the
+client themselves. Repeating identical block metadata is a no-op.
 
 Configure once before issuing writes. Changing the config after construction
 does not toggle the client. Metadata for blocks written before enabling is not

@@ -273,15 +273,7 @@ std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::st
   // Depth was a master-side hint for the prior allocator; in the
   // master-as-advisor design master no longer tracks per-key depth.
   // Forward to the depth-less BatchPut and silently drop the hint.
-  if (closing_) return std::vector<bool>(keys.size(), false);
-  PrepareKvMetadata(keys);
-  std::shared_lock lk(op_mutex_);
-  if (closed_) return std::vector<bool>(keys.size(), false);
-  std::vector<const void*> src_ptrs(srcs.size());
-  for (size_t i = 0; i < srcs.size(); ++i) {
-    src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
-  }
-  return pool_client_->BatchPut(keys, src_ptrs, sizes);
+  return BatchPut(keys, srcs, sizes);
 }
 
 std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& keys,

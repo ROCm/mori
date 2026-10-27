@@ -20,6 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import ctypes
+import gc
+import weakref
 
 import pytest
 
@@ -148,6 +150,42 @@ def test_configured_kv_metadata_preserves_write_api(enabled, method):
     assert client.get_into_ptr("key", ctypes.addressof(out), size)
     assert out.raw == data.raw
     assert client.clear()
+
+
+def test_indexer_requires_callable_metadata_provider():
+    with pytest.raises(TypeError):
+        umbp.KvIndexerConfig("127.0.0.1:1", "worker", "http://worker:30000", None)
+
+
+def test_bound_metadata_provider_does_not_retain_client_owner():
+    class Adapter:
+        def __init__(self):
+            config = UMBPConfig()
+            config.dram.capacity_bytes = 1 << 20
+            config.ssd.enabled = False
+            config.page_size = 4096
+            config.kv_indexer = umbp.KvIndexerConfig(
+                "127.0.0.1:1",
+                "worker",
+                "http://worker:30000",
+                self.metadata,
+                timeout_ms=10,
+            )
+            self.client = UMBPClient(config)
+
+        def metadata(self, keys):
+            return [umbp.KvBlockMetadata(42, None, 16, {1: keys})]
+
+    adapter = Adapter()
+    client = adapter.client
+    data = ctypes.create_string_buffer(b"value")
+    assert client.put_from_ptr("key", ctypes.addressof(data), len(data))
+    ref = weakref.ref(adapter)
+    del adapter
+    gc.collect()
+    assert ref() is None
+    with pytest.raises(RuntimeError, match="owner was released"):
+        client.put_from_ptr("key", ctypes.addressof(data), len(data))
 
 
 def test_batch_put_get_ranges_round_trip_and_shape_failure():
