@@ -149,3 +149,83 @@ def internode_regions(cfg):
         regions.append(("out_scales", max_tokens_to_recv * scale_bytes))
 
     return regions
+
+
+def asyncll_regions(cfg):
+    """``[(name, nbytes)]`` for the AsyncLL family.
+
+    Same names as :func:`internode_regions` so the backend's region lookups and
+    the kernel's offset fields are unchanged, with three differences that all come
+    from one fact: **AsyncLL's send buffers are indexed per RANK, not per NODE.**
+
+    Its slot arithmetic is ``SendBufSlotOffset(pe, slot) = pe *
+    MaxNumTokensToSendPerRank + slot`` (ep_internode_args.hpp), where the v1/v1_ll
+    protocol aggregates a whole node behind one proxy rank and sizes the same
+    buffers ``n_nodes * max_send_per_rank``. On one node that is a factor of
+    ``gpu_per_node`` too small, and the overrun lands in whatever region follows --
+    silently, since it is all one window.
+
+      * ``inter_staging`` / ``inter_dispatch_inp`` grow to the per-rank extent;
+      * ``inter_combine_inp`` is addressed with the same slot arithmetic but a
+        hidden-only stride, because the combine payload carries no metadata;
+      * ``send_count`` is new -- two u64 per peer (token count, barrier epoch) to
+        source the small SDMA writes from, which ccoSdma needs because it moves
+        window to window and has no immediate form.
+    """
+    regions = dict(internode_regions(cfg))
+    order = [name for name, _ in internode_regions(cfg)]
+
+    world_size = cfg.world_size
+    max_send_per_rank = cfg.max_num_inp_token_per_rank
+    topk = cfg.num_experts_per_token
+    hidden_bytes = cfg.hidden_dim * cfg.max_token_type_size
+    scale_bytes = cfg.scale_dim * cfg.scale_type_size
+    xfer_bytes = hidden_bytes + topk * _I32 + topk * _F32 + _I32 + scale_bytes
+
+    send_slots = world_size * max_send_per_rank
+    regions["inter_staging"] = send_slots * xfer_bytes
+    regions["inter_dispatch_inp"] = send_slots * xfer_bytes
+    regions["inter_combine_inp"] = send_slots * hidden_bytes
+
+    # The combine INPUT -- what the caller's expert writes and what
+    # combine_in_view() hands it -- gets its own region, addressed densely by
+    # recv slot. It cannot share inter_combine_inp, which is where PEERS land
+    # their combine payloads at SendBufSlotOffset strides: those two address
+    # ranges overlap, and a peer's transfer would then overwrite the local expert
+    # output while CombineSendCopy is still reading it. The internode family
+    # avoids the same collision by staging through EpCombineSync behind a
+    # grid-wide barrier pass; AsyncLL has no such barrier in its send half by
+    # design, so the buffers are kept apart instead.
+    #
+    # inter_dispatch_staging is free for it: the AsyncLL kernels never touch the
+    # region that name was coined for.
+    if cfg.max_total_recv_tokens > 0:
+        per_rank = min(
+            (cfg.max_total_recv_tokens + world_size - 1) // world_size,
+            max_send_per_rank,
+        )
+    else:
+        per_rank = max_send_per_rank
+    regions["inter_dispatch_staging"] = world_size * per_rank * hidden_bytes
+
+    order.append("send_count")
+    regions["send_count"] = world_size * 2 * _U64
+
+    # Combine gets its OWN send staging rather than reusing inter_staging.
+    #
+    # Sharing one buffer is correct but couples the two phases: dispatch's
+    # transfer reads inter_staging asynchronously, and combine's SendCopy writes
+    # the same bytes (at a different stride), so the only thing standing between
+    # them is dispatch's quiet. That makes the quiet load-bearing for SOURCE
+    # SAFETY as well as for ordering, and pins it to "before the next phase
+    # writes" -- which is exactly the point in the pipeline AsyncLL wants to be
+    # free to move past.
+    #
+    # Split, the write-after-read hazard does not exist, and the only remaining
+    # job of the quiet is to keep the count word behind the payload. Costs one
+    # more hidden-sized buffer per rank; at EP8 / 128 tokens / 7168 that is tens
+    # of MB against an arena already measured in hundreds.
+    order.append("inter_combine_staging")
+    regions["inter_combine_staging"] = send_slots * hidden_bytes
+
+    return [(name, regions[name]) for name in order]
