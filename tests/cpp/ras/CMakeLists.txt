@@ -9,3 +9,4 @@ endfunction()
 
 mori_ras_test(protocol)
 mori_ras_test(bounded_queues)
+mori_ras_test(link_timing)
