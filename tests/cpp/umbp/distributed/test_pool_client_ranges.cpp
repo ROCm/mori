@@ -285,6 +285,39 @@ class PoolClientRangesTest : public ::testing::Test {
     return client;
   }
 
+  // MakeClient with its arenas laid out by NUMA node instead: one GET and one PUT
+  // buffer per entry of `nodes`, in that order, and no locality prefetch, so every
+  // read of a remote key goes through an arena.
+  std::unique_ptr<PoolClient> MakeGroupedClient(const std::string& node_id,
+                                                const std::vector<int>& nodes,
+                                                std::vector<std::vector<char>>& get_groups,
+                                                std::vector<std::vector<char>>& put_groups) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = node_id;
+    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.master_address = master_address_;
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = 0;
+    cfg.auto_peer_service_port = true;
+    cfg.dram_page_size = kPageSize;
+    cfg.staging_buffer_size = 1024;
+    cfg.dram.buffer_sizes = {kCallerCapacity};
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      cfg.ranged_get_scratch_groups.push_back(
+          {get_groups[i].data(), get_groups[i].size(), nodes[i], 1});
+      cfg.ranged_put_scratch_groups.push_back(
+          {put_groups[i].data(), put_groups[i].size(), nodes[i], 1});
+    }
+    cfg.cache_remote_fetches = false;
+    cfg.ranged_locality_prefetch = false;
+    auto client = std::make_unique<PoolClient>(std::move(cfg));
+    EXPECT_TRUE(client->Init());
+    for (auto* groups : {&get_groups, &put_groups}) {
+      for (auto& group : *groups) EXPECT_TRUE(client->RegisterMemory(group.data(), group.size()));
+    }
+    return client;
+  }
+
   // A full DistributedClient (not the bare PoolClient the other cases drive),
   // because the opt-in this asserts lives in DistributedClient's constructor
   // and in SupportsRangedIO(), neither of which PoolClient sees.
@@ -810,6 +843,77 @@ TEST_F(PoolClientRangesTest, SplitRemotePutThenGetRoundTrips) {
   for (size_t k = 0; k < kKeys; ++k) {
     EXPECT_EQ(std::memcmp(out[k].data(), objects[k].data(), kObjectSize), 0) << "key=" << keys[k];
   }
+}
+
+// Arenas laid out by NUMA node: a remote ranged call stages through the group on
+// its caller buffer's node -- a GPU's for device memory -- and a caller whose node
+// is unknown through the first group.
+TEST_F(PoolClientRangesTest, NumaGroupedArenasStageOnTheCallersNode) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices < 1) GTEST_SKIP() << "no GPU";
+  int first_node = -1;
+  int last_node = -1;
+  mori::application::detail::GpuLocalCpuList(0, first_node);
+  mori::application::detail::GpuLocalCpuList(devices - 1, last_node);
+  if (first_node < 0 || last_node < 0 || first_node == last_node) {
+    GTEST_SKIP() << "needs GPUs on two NUMA nodes";
+  }
+  constexpr char kPoison = static_cast<char>(0x6b);
+  const auto poisoned = [&](const std::vector<char>& v) {
+    return std::all_of(v.begin(), v.end(), [&](char c) { return c == kPoison; });
+  };
+  std::vector<std::vector<char>> get_groups(2, std::vector<char>(kScratchSize, kPoison));
+  std::vector<std::vector<char>> put_groups(2, std::vector<char>(kScratchSize, kPoison));
+  auto grouped =
+      MakeGroupedClient("ranges-grouped", {first_node, last_node}, get_groups, put_groups);
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 31 + 3) & 0xff);
+  const std::string key = "numa-grouped";
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  grouped->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(grouped.get(), key));
+
+  int previous = 0;
+  ASSERT_EQ(hipGetDevice(&previous), hipSuccess);
+  ASSERT_EQ(hipSetDevice(devices - 1), hipSuccess);
+  void* gpu = nullptr;
+  const hipError_t malloc_rc = hipMalloc(&gpu, kObjectSize);
+  ASSERT_EQ(hipSetDevice(previous), hipSuccess);
+  ASSERT_EQ(malloc_rc, hipSuccess);
+  struct Release {
+    void* ptr;
+    ~Release() { (void)hipFree(ptr); }
+  } release{gpu};
+
+  // A span, not the whole object, so the read cannot bypass the arena.
+  constexpr size_t kOffset = 100;
+  constexpr size_t kSpan = 4000;
+  ASSERT_EQ(grouped->BatchGetRanges({key}, {{gpu}}, {{kSpan}}, {{kOffset}}),
+            std::vector<bool>({true}));
+  std::vector<char> actual(kSpan);
+  ASSERT_EQ(hipMemcpy(actual.data(), gpu, kSpan, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_EQ(std::memcmp(get_groups[1].data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_TRUE(poisoned(get_groups[0]));
+
+  std::fill(get_groups[1].begin(), get_groups[1].end(), kPoison);
+  std::vector<char> host(kSpan, 0);
+  ASSERT_EQ(grouped->BatchGetRanges({key}, {{host.data()}}, {{kSpan}}, {{kOffset}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(host.data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_EQ(std::memcmp(get_groups[0].data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_TRUE(poisoned(get_groups[1]));
+
+  // A write from the last GPU assembles its object in that node's PUT group.
+  ASSERT_EQ(hipMemcpy(gpu, object.data(), kObjectSize, hipMemcpyHostToDevice), hipSuccess);
+  const std::string put_key = "numa-grouped-put";
+  ASSERT_EQ(grouped->BatchPutRanges({put_key}, {kObjectSize}, {{gpu}}, {{kObjectSize}}, {{0}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(put_groups[1].data(), object.data(), kObjectSize), 0);
+  EXPECT_TRUE(poisoned(put_groups[0]));
+  grouped->Shutdown();
 }
 
 // One object too big for the WHOLE arena must not decide arena sizing for its
