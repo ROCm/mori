@@ -130,6 +130,15 @@ class DistributedClient : public IUMBPClient {
   void* ranged_put_scratch_ = nullptr;
   size_t ranged_put_scratch_size_ = 0;
   HostBufferHandle ranged_put_scratch_handle_;
+  // The same arenas laid out by NUMA node instead
+  // (config.distributed.ranged_scratch_numa_layout): one buffer per node and
+  // direction, while the single buffers above stay unset.  The sizes above then
+  // hold each direction's total.
+  std::vector<PoolClientConfig::RangedScratchGroup> ranged_get_groups_;
+  std::vector<PoolClientConfig::RangedScratchGroup> ranged_put_groups_;
+  std::vector<HostBufferHandle> ranged_group_handles_;
+  void LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base);
+  void FreeRangedScratch();
   // No master address => no routing => this node can never hold, fetch or
   // serve a remote key.  Set once at construction; read by SupportsRangedIO,
   // which is the one place the distinction changes an answer rather than just
