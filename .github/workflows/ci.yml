@@ -295,6 +295,7 @@ jobs:
           "
 
       - name: MORI-IO fault catalog (ibverbs)
+        id: fault_ibverbs
         # The catalog's known_bug expectations were measured on ionic; other NICs
         # join once verified.
         if: matrix.platform == 'MI355X_AINIC'
@@ -324,7 +325,8 @@ jobs:
           exit $rc
 
       - name: MORI-IO fault catalog (async events)
-        if: ${{ !cancelled() && matrix.platform == 'MI355X_AINIC' }}
+        # Runs the binary the ibverbs step builds, so that step must have run (pass or fail).
+        if: ${{ !cancelled() && matrix.platform == 'MI355X_AINIC' && steps.fault_ibverbs.outcome != 'skipped' }}
         run: |
           REPORT=$GITHUB_WORKSPACE/build_fault/fault_report.md
           set +e
