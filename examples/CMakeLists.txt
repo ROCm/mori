@@ -118,6 +118,15 @@ target_link_libraries(collectives_benchmark mori_cco hip::host hip::device)
 # compiler remarks during the normal build of this TU.
 target_compile_options(collectives_benchmark PRIVATE -Rpass-analysis=kernel-resource-usage)
 
+# Same benchmark with the reduce-scatter push slice timing printf's compiled in
+# (RS_PUSH_TIMING, see reduce_scatter_kernels.hpp). Opt-in through the configure
+# environment, since setup.py does not forward arbitrary -D options.
+if(DEFINED ENV{MORI_RS_PUSH_TIMING_BENCH})
+  add_executable(collectives_benchmark_rs_timing collective/XLA/collectives_benchmark.cpp)
+  target_link_libraries(collectives_benchmark_rs_timing mori_cco hip::host hip::device)
+  target_compile_definitions(collectives_benchmark_rs_timing PRIVATE RS_PUSH_TIMING=1)
+endif()
+
 # Find MPI package (required by intra-node examples)
 find_package(MPI REQUIRED)
 

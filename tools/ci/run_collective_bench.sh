@@ -18,6 +18,10 @@
 #   WARMUP/ITERS benchmark iterations      [2/5]
 #   RUN_TIMEOUT  seconds per run           [120]
 #   LOG_DIR      per-run logs + summary.md [ci-logs/collective-bench]
+#   LABEL        prefix for run names and the summary title (e.g. "timing ") []
+#
+# Logs from a binary built with RS_PUSH_TIMING=1 carry "[RS-T ...]" lines; each
+# such run also gets a per-slice wait/reduce table in summary.md.
 set -uo pipefail
 
 COLL=
@@ -80,9 +84,62 @@ if [[ -f /lib/x86_64-linux-gnu/libnuma.so.1 ]]; then
   export LD_PRELOAD=/lib/x86_64-linux-gnu/libnuma.so.1${LD_PRELOAD:+:$LD_PRELOAD}
 fi
 
-title="$COLL mode=$MODE logS=$LOGS npes=$NPES"
-tag="${COLL}_${MODE}_logS${LOGS}"
+LABEL=${LABEL:-}
+title="${LABEL}$COLL mode=$MODE logS=$LOGS npes=$NPES"
+tag="${LABEL// /_}${COLL}_${MODE}_logS${LOGS}"
 rows=()
+timingTables=()
+
+# Condenses the RS_PUSH_TIMING printf's of one run into a markdown table: per
+# slice, mean/max over PEs of the waits and reduces of blocks 1.. (block 0 also
+# issues the SDMA scatter, so it gets its own column) and of the sender arrival
+# spread. All values in us.
+rs_timing_table() {
+  awk '
+    function num(key,   r) {
+      if (match($0, key "=-?[0-9.]+")) {
+        r = substr($0, RSTART + length(key) + 1, RLENGTH - length(key) - 1); return r + 0
+      }
+      return 0
+    }
+    function acc(name, s, v) {
+      sum[name, s] += v; cnt[name, s]++
+      if (!((name, s) in mx) || v > mx[name, s]) mx[name, s] = v
+    }
+    function cell(name, s) {
+      if (!cnt[name, s]) return "-"
+      return sprintf("%.2f / %.2f", sum[name, s] / cnt[name, s], mx[name, s])
+    }
+    !/\[RS-T / { next }
+    / S=[0-9]+ grid=/ {
+      S = num("S"); grid = num("grid"); acc("barrier", 0, num("barrier")); acc("issue", 0, num("issue"))
+      next
+    }
+    / arrive first=/ {
+      s = num(" s"); acc("spread", s, num("spread"))
+      if (match($0, /last=p[0-9]+@-?[0-9.]+/)) acc("last", s, substr($0, RSTART + index(substr($0, RSTART), "@"), RLENGTH) + 0)
+      if (match($0, /first=p[0-9]+@-?[0-9.]+/)) acc("first", s, substr($0, RSTART + index(substr($0, RSTART), "@"), RLENGTH) + 0)
+      next
+    }
+    / blk[0-9]+ wait=/ {
+      s = num(" s"); b = ($0 ~ / blk0 /) ? "0" : "n"
+      acc("wait" b, s, num("wait")); acc("reduce" b, s, num("reduce")); acc("done", s, num("done"))
+      if (S > nS) nS = S
+      next
+    }
+    END {
+      if (!nS) exit
+      printf "S=%d grid=%d | blk0 entry barrier %s, SDMA issue %s (mean / max over PEs)\n\n", \
+             nS, grid, cell("barrier", 0), cell("issue", 0)
+      print "| slice | wait blk1+ | reduce blk1+ | wait blk0 | reduce blk0 | first arrival | last arrival | arrival spread | slice done |"
+      print "|---|---|---|---|---|---|---|---|---|"
+      for (s = 0; s < nS; s++)
+        printf "| %d | %s | %s | %s | %s | %s | %s | %s | %s |\n", s, cell("waitn", s), \
+               cell("reducen", s), cell("wait0", s), cell("reduce0", s), cell("first", s), \
+               cell("last", s), cell("spread", s), cell("done", s)
+    }
+  ' "$1"
+}
 nPass=0; nFail=0; nSkip=0
 
 for size in $SIZES; do
@@ -113,6 +170,11 @@ for size in $SIZES; do
       fi
       printf '%-8s %s\n' "$status" "$name"
       rows+=("| $dtype | $op | $size | $status | $avg |")
+      if grep -q '\[RS-T ' "$log"; then
+        table=$(rs_timing_table "$log")
+        echo "$table"
+        timingTables+=("#### $name ($avg)" "" "$table" "")
+      fi
     done
   done
 done
@@ -125,6 +187,12 @@ summary="$LOG_DIR/summary.md"
   echo "|---|---|---|---|---|---|"
   printf '%s\n' "${rows[@]}"
   echo
+  if [[ ${#timingTables[@]} -gt 0 ]]; then
+    echo "RS push slice timing, us, mean / max over PEs (and over blocks 1.. for blk1+)."
+    echo "Arrival and done times are relative to block 0 entry on the receiving PE."
+    echo
+    printf '%s\n' "${timingTables[@]}"
+  fi
 } >>"$summary"
 
 echo "== $title: $nPass pass, $nFail fail, $nSkip skip =="

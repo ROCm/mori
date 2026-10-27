@@ -1,7 +1,7 @@
 name: MoRI collectives benchmark CI
 on:
   push:
-    branches: [main]
+    branches: [main, pemeliya/rs-push-slice-timing-41bf]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -31,6 +31,8 @@ env:
   EDGE_SIZES: "48 4080"
   # Message-size growth factor between benchmark runs (num/den).
   SIZE_STEP: "3/2"
+  # The RS push timing branch runs only its own step, not the regular matrix.
+  TIMING_ONLY: ${{ github.ref == 'refs/heads/pemeliya/rs-push-slice-timing-41bf' || github.head_ref == 'pemeliya/rs-push-slice-timing-41bf' }}
 
 jobs:
   collective-bench:
@@ -79,32 +81,53 @@ jobs:
       - name: Build mori + collectives_benchmark
         id: build
         run: |
-          $CT exec $CONTAINER bash -c "BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install ."
+          $CT exec $CONTAINER bash -c "MORI_RS_PUSH_TIMING_BENCH=1 BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install ."
           $CT exec $CONTAINER test -x build/examples/collectives_benchmark
+          $CT exec $CONTAINER test -x build/examples/collectives_benchmark_rs_timing
           rm -rf $LOG_DIR
+
+      # Temporary (RS push slice timing investigation): reduce-scatter push only,
+      # S = 1,2,4,8 at large sizes, once with the normal binary (baseline timings)
+      # and once with RS_PUSH_TIMING compiled in (per-slice wait/reduce tables in
+      # the job summary; raw [RS-T] lines in the uploaded logs).
+      - name: reduce_scatter push slice timing (S=1,2,4,8; 16M-1G)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY == 'true' }}
+        run: |
+          fail=0
+          for logS in 0 1 2 3; do
+            for bin in collectives_benchmark collectives_benchmark_rs_timing; do
+              label=""
+              [ "$bin" = collectives_benchmark_rs_timing ] && label="timing "
+              $CT exec -e DTYPES="bf16" -e OPS=sum \
+                -e SIZES="16777216 67108864 268435456 1073741824" \
+                -e RUN_TIMEOUT=180 -e BIN=./build/examples/$bin -e LABEL="$label" \
+                $CONTAINER bash $BENCH --coll reduce_scatter --mode push --logS $logS || fail=1
+            done
+          done
+          exit $fail
 
       # Each group runs even if an earlier one failed, so one broken kernel does
       # not hide the state of the others. Default push coverage is S = 4
       # (logS = 2) over f32/bf16/f16, sum/prod, 1M-128M plus EXTRA_SIZES.
       - name: reduce_scatter push (S=4)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $RS_EDGE_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode push --logS 2
 
       - name: reduce_scatter pull
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $RS_EDGE_SIZES" $CONTAINER bash $BENCH --coll reduce_scatter --mode pull
 
       - name: all_reduce push (S=4)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $AR_EDGE_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode push --logS 2
 
       - name: all_reduce pull
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e EXTRA_SIZES="$EXTRA_SIZES $AR_EDGE_SIZES" $CONTAINER bash $BENCH --coll all_reduce --mode pull
 
       # Extra push coverage: S = 1,2,4,8 (logS 0..3), bf16/f32 sum, 16M-512M elems.
       - name: reduce_scatter push (S=1,2,4,8; 16M-1G)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: |
           fail=0
           for logS in 0 1 2 3; do
@@ -116,7 +139,7 @@ jobs:
           exit $fail
 
       - name: all_reduce push (S=1,2,4,8; 16M-1G)
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: |
           fail=0
           for logS in 0 1 2 3; do
@@ -128,15 +151,15 @@ jobs:
           exit $fail
 
       - name: all_gather
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES $EDGE_SIZES" $CONTAINER bash $BENCH --coll all_gather
 
       - name: all_to_all
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES $EDGE_SIZES" $CONTAINER bash $BENCH --coll all_to_all
 
       - name: collective_permute
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY != 'true' }}
         run: $CT exec -e SIZE_STEP -e DTYPES=bf16 -e EXTRA_SIZES="$EXTRA_SIZES $EDGE_SIZES" $CONTAINER bash $BENCH --coll collective_permute
 
       - name: Publish summary
