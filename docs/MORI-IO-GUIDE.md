@@ -242,7 +242,8 @@ or its numeric `ibv_event_type`; `skip`, `count`, `qpn`, and `op` filter matchin
 posts. SRQ events are rejected because MORI-IO does not use an SRQ. Port rules
 accept only `count=1`. Runtime injection errors are logged and fail the catalog
 without throwing through the data path. QP/CQ/device fatal injections change the
-corresponding data-path state; dead CQ/device markers survive Disarm. Port down
+corresponding data-path state; dead CQ/device markers survive Disarm and watch removal, and are retired with
+their owning endpoint/context. New allocations do not inherit those markers. Port down
 lasts until explicit Disarm, while flap recovers after its duration even if the
 rule is disarmed earlier. Automatic
 rule exhaustion stops new triggers without clearing a port-down interval.
@@ -254,3 +255,9 @@ The default catalog is `ibverbs.yaml`. Each hardware entry uses GPU 0 and GPU 1;
 the CPU checks create no engine.
 Synthetic events must not race endpoint destruction: they do not acquire the
 provider's event lifetime protection. The fault catalog exits without teardown.
+
+Port overrides and events are published together before the triggering post,
+so concurrent Disarm queues recovery after PORT_ERR. For a fatal async rule
+matching notification SEND, the FI-only BeforeNotify hook waits up to 5 s for
+the data status to reach SUCCESS before sending the notification. This makes
+notification failure tests reproducible; normal builds add no wait.

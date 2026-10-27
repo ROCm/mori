@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "mori/io/common.hpp"
 #include "mori/io/logging.hpp"
 
 namespace mori {
@@ -476,6 +477,7 @@ bool FaultInjector::PrepareAsyncEvent(ibv_qp* qp, int wcOpcode, ibv_async_event*
   event->event_type =
       rule_.kind == FaultKind::AsyncEvent ? static_cast<ibv_event_type>(value) : IBV_EVENT_PORT_ERR;
   const char* state = "unchanged";
+  bool portEvent = false;
   switch (event->event_type) {
     case IBV_EVENT_QP_FATAL:
     case IBV_EVENT_QP_REQ_ERR:
@@ -491,7 +493,7 @@ bool FaultInjector::PrepareAsyncEvent(ibv_qp* qp, int wcOpcode, ibv_async_event*
         deadDevices_.insert(qp->context);
       else {
         event->element.cq = qp->send_cq;
-        deadCqs_.insert(qp->send_cq);
+        deadCqs_[qp->send_cq] = qp->context;
       }
       hasDeadResources_.store(true, std::memory_order_relaxed);
       for (const auto& [qpn, known] : qps_[qp->context]) {
@@ -510,6 +512,7 @@ bool FaultInjector::PrepareAsyncEvent(ibv_qp* qp, int wcOpcode, ibv_async_event*
       event->element.qp = qp;
       break;
     default: {
+      portEvent = true;
       ibv_qp_attr attr{};
       ibv_qp_init_attr init{};
       int ret = ibv_query_qp(qp, &attr, IBV_QP_PORT, &init);
@@ -546,12 +549,27 @@ bool FaultInjector::PrepareAsyncEvent(ibv_qp* qp, int wcOpcode, ibv_async_event*
                  state);
   } catch (...) {
   }
+  if (portEvent) {
+    // Port events do not call FailAll. Publish them with the override under the
+    // same lock, before posting, so Disarm can only queue ACTIVE after ERR.
+    PublishAsyncEventLocked(qp, wcOpcode, *event);
+    return false;  // already published; the caller still performs the real post
+  }
   return true;
 }
 
 void FaultInjector::PublishAsyncEvent(ibv_qp* qp, int wcOpcode,
                                       const ibv_async_event& event) noexcept try {
   std::lock_guard<std::mutex> lock(mu_);
+  PublishAsyncEventLocked(qp, wcOpcode, event);
+} catch (const std::exception& error) {
+  FailInjection(error.what());
+} catch (...) {
+  FailInjection("publishing async event");
+}
+
+void FaultInjector::PublishAsyncEventLocked(ibv_qp* qp, int wcOpcode,
+                                            const ibv_async_event& event) {
   ibv_context* ctx = qp->context;
   if (!QueueEventLocked(ctx, event)) return;
   if (event.event_type == IBV_EVENT_PORT_ERR) {
@@ -564,10 +582,6 @@ void FaultInjector::PublishAsyncEvent(ibv_qp* qp, int wcOpcode,
     }
   }
   RecordInjection(rule_.kind, qp->qp_num, wcOpcode, static_cast<int>(event.event_type));
-} catch (const std::exception& error) {
-  FailInjection(error.what());
-} catch (...) {
-  FailInjection("publishing async event");
 }
 
 int FaultInjector::WatchAsyncContext(ibv_context* ctx) {
@@ -602,9 +616,68 @@ void FaultInjector::UnwatchAsyncContext(ibv_context* ctx) {
     else
       ++port;
   }
-  // Fatal resources do not heal when their async watch is removed. Keep their
-  // dead markers until process exit; do not dereference the cached objects here.
+  // Removing a watch does not retire its live QPs/CQs. Their fault markers
+  // are cleared by the owning endpoint/context's lifecycle callbacks.
   timerCv_.notify_all();
+}
+
+void FaultInjector::ReleaseAsyncContext(ibv_context* ctx) noexcept try {
+  UnwatchAsyncContext(ctx);
+  std::lock_guard<std::mutex> lock(mu_);
+  qps_.erase(ctx);
+  deadDevices_.erase(ctx);
+  for (auto it = deadCqs_.begin(); it != deadCqs_.end();) {
+    if (it->second == ctx)
+      it = deadCqs_.erase(it);
+    else
+      ++it;
+  }
+  hasDeadResources_.store(!deadCqs_.empty() || !deadDevices_.empty(), std::memory_order_relaxed);
+} catch (const std::exception& error) {
+  FailInjection(error.what());
+} catch (...) {
+  FailInjection("releasing async context");
+}
+
+void FaultInjector::ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* cq) noexcept try {
+  std::lock_guard<std::mutex> lock(mu_);
+  auto qps = qps_.find(ctx);
+  if (qps != qps_.end()) qps->second.erase(qpn);
+  deadCqs_.erase(cq);
+  hasDeadResources_.store(!deadCqs_.empty() || !deadDevices_.empty(), std::memory_order_relaxed);
+} catch (const std::exception& error) {
+  FailInjection(error.what());
+} catch (...) {
+  FailInjection("forgetting async endpoint");
+}
+
+void FaultInjector::BeforeNotify(ibv_qp* qp, TransferStatus* status) noexcept try {
+  if (!armed_.load(std::memory_order_relaxed)) return;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!armed_.load(std::memory_order_relaxed) || rule_.kind != FaultKind::AsyncEvent ||
+        rule_.wcOpcode != IBV_WC_SEND || (rule_.qpn != 0 && rule_.qpn != qp->qp_num))
+      return;
+    switch (rule_.value) {
+      case IBV_EVENT_QP_FATAL:
+      case IBV_EVENT_QP_REQ_ERR:
+      case IBV_EVENT_QP_ACCESS_ERR:
+      case IBV_EVENT_CQ_ERR:
+      case IBV_EVENT_DEVICE_FATAL:
+        break;
+      default:
+        return;
+    }
+  }
+  // The normal CQ consumer updates status after retiring the data record.
+  // Wait outside mu_; no post guard remains when RdmaNotifyTransfer is entered.
+  if (status == nullptr || status->WaitFor(5000) != StatusCode::SUCCESS) {
+    FailInjection("data did not complete before notification fault");
+  }
+} catch (const std::exception& error) {
+  FailInjection(error.what());
+} catch (...) {
+  FailInjection("staging notification fault");
 }
 
 bool FaultInjector::QueueEventLocked(ibv_context* ctx, const ibv_async_event& event) {

@@ -126,6 +126,7 @@ class RdmaManager {
   bool PopPeerFailure(PeerFailureEvent* out);
   // False once a failure covering this QP is observed; a slow QP stays alive.
   bool IsQpAlive(int devId, uint32_t qpNum) const;
+  bool NeedsQpReplacement(int devId, uint32_t qpNum) const;
   // Records IBV_WC_RETRY_EXC_ERR: the only place peer death is observable.
   void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
   // Records any other error completion: the QP is in ERR, but no event is raised.
@@ -322,6 +323,7 @@ class RdmaBackendSession : public BackendSession {
                       bool isRead);
 
   bool Alive() const;
+  bool NeedsQpReplacement() const;
 
  private:
   RdmaBackendConfig config{};

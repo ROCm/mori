@@ -168,8 +168,8 @@ std::vector<Entry> LoadCatalog(const std::string& path) {
                                            "PEER_UNREACHABLE"};
     if (!reasons.count(e.peerFailure)) throw std::runtime_error(where + ": bad peer_failure");
     e.during = mori::yaml::GetString(raw, "during");
-    if (!e.during.empty() && e.during != "reject" && e.during != "succeed") {
-      throw std::runtime_error(where + ": during must be reject or succeed");
+    if (!e.during.empty() && e.during != "reject" && e.during != "succeed" && e.during != "fail") {
+      throw std::runtime_error(where + ": during must be reject, succeed or fail");
     }
     e.env = mori::yaml::GetString(raw, "env");
     std::istringstream vars(e.env);
@@ -755,8 +755,14 @@ int RunEntry(const Entry& e) {
   if (!e.during.empty()) {
     if (e.peerFailure.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     Transfer* next = rig.Start(e.op);
-    during = e.during == "reject" ? next->status.Code() == StatusCode::ERR_RDMA_OP
-                                  : rig.Completes(next, &why);
+    if (e.during == "reject") {
+      during = next->status.Code() == StatusCode::ERR_RDMA_OP;
+    } else if (e.during == "fail") {
+      next->status.WaitFor(kDeadlineMs);
+      during = next->status.Failed();
+    } else {
+      during = rig.Completes(next, &why);
+    }
     std::printf("    during fault: %s %s\n", CodeName(next->status.Code()),
                 next->status.Message().c_str());
   }

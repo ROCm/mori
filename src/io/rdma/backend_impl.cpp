@@ -320,6 +320,10 @@ RdmaManager::~RdmaManager() {
   // into endpoint ledgers, neither of which may be torn down under it.
   asyncEventMonitor_.reset();
 
+  for (const auto& [device, port] : availDevices) {
+    Verbs().ReleaseAsyncContext(device->GetIbvContext());
+  }
+
   for (auto* devCtx : deviceCtxs) {
     if (devCtx != nullptr) {
       delete devCtx;
@@ -496,9 +500,10 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
 
 EpPairVec RdmaManager::GetLiveEndpoints(EngineKey engine, TopoKeyPair key) {
   EpPairVec eps = GetAllEndpoint(engine, key);
-  eps.erase(std::remove_if(
-                eps.begin(), eps.end(),
-                [this](const EpPair& ep) { return !IsQpAlive(ep.ldevId, ep.local.handle.qpn); }),
+  eps.erase(std::remove_if(eps.begin(), eps.end(),
+                           [this](const EpPair& ep) {
+                             return NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn);
+                           }),
             eps.end());
   return eps;
 }
@@ -598,6 +603,8 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
 
   application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
+  // A newly allocated CQ/QP may reuse an address from a retired endpoint.
+  Verbs().ForgetAsyncEndpoint(devCtx->GetIbvContext(), rdmaEp.handle.qpn, rdmaEp.ibvHandle.cq);
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
@@ -613,6 +620,8 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
     const bool destroyed = deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
     // Drop it only once gone, so the number cannot be reused under a stale owner.
     if (destroyed) {
+      Verbs().ForgetAsyncEndpoint(availDevices[devId].first->GetIbvContext(), ep.handle.qpn,
+                                  ep.ibvHandle.cq);
       peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
     }
     return destroyed;
@@ -669,6 +678,10 @@ bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.P
 
 bool RdmaManager::IsQpAlive(int devId, uint32_t qpNum) const {
   return peerFailures_.IsQpAlive(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
+}
+
+bool RdmaManager::NeedsQpReplacement(int devId, uint32_t qpNum) const {
+  return peerFailures_.NeedsQpReplacement(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
 }
 
 bool RdmaManager::RejectIfPortDown(const EpPairVec& eps, TransferStatus* status) {
@@ -1693,6 +1706,14 @@ bool RdmaBackendSession::Alive() const {
   return true;
 }
 
+bool RdmaBackendSession::NeedsQpReplacement() const {
+  if (rdma_ == nullptr) return false;
+  for (const auto& ep : eps) {
+    if (rdma_->NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn)) return true;
+  }
+  return false;
+}
+
 /* ----------------------------------------------------------------------------------------------
  */
 /*                                           RdmaBackend */
@@ -2016,7 +2037,7 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      if (it->second->Alive()) return it->second.get();
+      if (!it->second->NeedsQpReplacement()) return it->second.get();
       auto retry = replaceRetryAt.find(connKey);
       if (retry != replaceRetryAt.end() && std::chrono::steady_clock::now() < retry->second) {
         return it->second.get();

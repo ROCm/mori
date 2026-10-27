@@ -34,6 +34,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "src/io/rdma/verbs_ops.hpp"
 
@@ -93,6 +94,9 @@ class FaultInjector final : public VerbsOps {
   int QueryPort(ibv_context* ctx, uint8_t port, ibv_port_attr* attr) noexcept override;
   int WatchAsyncContext(ibv_context* ctx) override;
   void UnwatchAsyncContext(ibv_context* ctx) override;
+  void ReleaseAsyncContext(ibv_context* ctx) noexcept override;
+  void ForgetAsyncEndpoint(ibv_context* ctx, uint32_t qpn, ibv_cq* cq) noexcept override;
+  void BeforeNotify(ibv_qp* qp, TransferStatus* status) noexcept override;
 
  private:
   FaultInjector();
@@ -108,6 +112,7 @@ class FaultInjector final : public VerbsOps {
   bool PrepareAsyncEvent(ibv_qp* qp, int wcOpcode, ibv_async_event* event);
   bool DeviceDead(ibv_context* ctx);
   void PublishAsyncEvent(ibv_qp* qp, int wcOpcode, const ibv_async_event& event) noexcept;
+  void PublishAsyncEventLocked(ibv_qp* qp, int wcOpcode, const ibv_async_event& event);
   bool QueueEventLocked(ibv_context* ctx, const ibv_async_event& event);
   void RestorePortLocked(ibv_context* ctx, int port);
   void PortTimerLoop();
@@ -134,7 +139,7 @@ class FaultInjector final : public VerbsOps {
   // QP numbers are unique only within one context/device.
   std::unordered_map<ibv_context*, std::unordered_map<uint32_t, ibv_qp*>> qps_;
   std::unordered_map<ibv_context*, AsyncSource> sources_;
-  std::unordered_set<ibv_cq*> deadCqs_;
+  std::unordered_map<ibv_cq*, ibv_context*> deadCqs_;
   std::unordered_set<ibv_context*> deadDevices_;
   std::atomic<bool> hasDeadResources_{false};
   std::map<PortKey, DownPort> downPorts_;

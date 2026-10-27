@@ -129,6 +129,8 @@ class PeerFailureTracker {
 
   // False once this QP, or the port, CQ or device it uses, has been seen to fail.
   bool IsQpAlive(const QpKey& qp) const;
+  // Port down is temporary; replacing its QP cannot repair the port.
+  bool NeedsQpReplacement(const QpKey& qp) const;
 
   // Number of failures dropped because the pending queue was full.
   uint64_t Dropped() const;
@@ -187,6 +189,7 @@ class PeerFailureTracker {
 
   // Appends to the queue, dropping and counting on overflow. Caller holds mu_.
   void Enqueue(PeerFailureEvent event);
+  bool NeedsQpReplacementLocked(const QpKey& qp) const;
 
   mutable std::mutex mu_;
   std::unordered_map<QpKey, QpOwner, QpKeyHash> qpOwners_;

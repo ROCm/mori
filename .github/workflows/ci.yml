@@ -310,11 +310,12 @@ jobs:
             set -e
             cd $GITHUB_WORKSPACE
             cmake -B build_fault -DBUILD_IO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF -DBUILD_PYBINDS=OFF -DBUILD_OPS=OFF -DBUILD_SHMEM=OFF -DBUILD_CCO=OFF -DBUILD_COLLECTIVE=OFF -DBUILD_METRICS=OFF -DENABLE_IO_FAULT_INJECTION=ON
-            cmake --build build_fault -j --target test_fault_injection test_flat_yaml
+            cmake --build build_fault -j --target test_fault_injection test_fault_injector test_flat_yaml
             timeout 60 ./build_fault/tests/cpp/test_flat_yaml
             MORI_IO_LOG_LEVEL=error ./build_fault/tests/cpp/test_fault_injection --check-catalog
             MORI_IO_LOG_LEVEL=error MORI_IO_FAULT_CATALOG=async_events.yaml ./build_fault/tests/cpp/test_fault_injection --check-catalog
             MORI_IO_LOG_LEVEL=error ./build_fault/tests/cpp/test_fault_injection --check-async-sources
+            timeout 60 ./build_fault/tests/cpp/test_fault_injector
             rm -f $REPORT
             HIP_VISIBLE_DEVICES=0,1 timeout 900 ./build_fault/tests/cpp/test_fault_injection
           "
