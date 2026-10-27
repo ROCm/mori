@@ -359,6 +359,35 @@ the permutation stays inside the 64 bytes one program already owns, so it is
 address arithmetic rather than traffic, and measures slightly *faster* than the
 stock kernel.
 
+**At long K the scales are loaded one K step ahead.** At the same 256x256 tile
+the mxfp8 GEMM measured 15-20% slower than ptpc, and none of that is the scaled
+MFMA: with constant scales instead of loaded ones it runs at ptpc's speed (899
+vs 905us at 16384x10240x8192). The cost is where the scale loads sit. They are
+issued at the top of a K step, after the previous step's tile prefetches, and
+the first MFMA waits for them with `s_waitcnt vmcnt(3)` -- which, because vmcnt
+retires in issue order, also waits for those prefetches. Every step loses about
+half a step of latency hiding. Issued one step earlier, the wait becomes
+`vmcnt(17..20)` and stops blocking; loading them two steps earlier gains nothing
+more.
+
+It is not free: six more VGPRs are live, in a kernel already at 256. So
+`scale_prefetch` is on by default only for `quant="mxfp8"` at
+`K >= SCALE_PREFETCH_MIN_K` (8192). GEMM only, 256x256, MI355X, CUDA-graph
+timed with B rotated past the LLC, median of three interleaved rounds:
+
+| M x N x K | off | on | |
+|---|---:|---:|---:|
+| 4096 x 10240 x 8192 | 282.8 | 267.5 | **-5.4%** |
+| 16384 x 10240 x 8192 | 1097.6 | 990.7 | **-9.7%** |
+| 2048 x 18432 x 16384 | 590.3 | 526.5 | **-10.8%** |
+| 8192 x 18432 x 16384 | 1932.8 | 1831.7 | **-5.2%** |
+
+Below that it is shape-dependent rather than a win: forced on, it was 1-8%
+*slower* on the eight 256x256 shapes at K = 512 and 1280-2048 and neutral at
+8192x7168x4096, while faster at K = 256, 640 and 1792 and on the 256x128 tile.
+That is why the default threshold sits where every measured shape gains.
+`scale_prefetch=True/False` overrides it.
+
 **Against the alternatives**, bf16 in and bf16 out, the whole pipeline including
 quantisation, M=16384:
 
