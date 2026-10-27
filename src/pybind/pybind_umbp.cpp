@@ -84,50 +84,6 @@ void RegisterMoriUmbp(py::module_& m) {
           "free", [](HostMemAllocator& self, HostBufferHandle& handle) { self.Free(handle); },
           py::arg("handle"), py::call_guard<py::gil_scoped_release>());
 
-  py::enum_<PrefetchState>(m, "UMBPPrefetchState")
-      .value("UNKNOWN", PrefetchState::kUnknown)
-      .value("QUEUED", PrefetchState::kQueued)
-      .value("RUNNING", PrefetchState::kRunning)
-      .value("READY", PrefetchState::kReady)
-      .value("PARTIAL", PrefetchState::kPartial)
-      .value("FAILED", PrefetchState::kFailed)
-      .value("EXPIRED", PrefetchState::kExpired);
-  py::enum_<PrefetchCode>(m, "UMBPPrefetchCode")
-      .value("PENDING", PrefetchCode::kPending)
-      .value("READY", PrefetchCode::kReady)
-      .value("MISSING", PrefetchCode::kMissing)
-      .value("NO_DRAM", PrefetchCode::kNoDram)
-      .value("NO_SPACE", PrefetchCode::kNoSpace)
-      .value("TRANSFER_FAILED", PrefetchCode::kTransferFailed)
-      .value("FRAGMENTED", PrefetchCode::kFragmented)
-      .value("NOT_RESIDENT", PrefetchCode::kNotResident)
-      .value("EXPIRED", PrefetchCode::kExpired)
-      .value("STOPPED", PrefetchCode::kStopped);
-  py::enum_<PrefetchSource>(m, "UMBPPrefetchSource")
-      .value("UNKNOWN", PrefetchSource::kUnknown)
-      .value("DRAM", PrefetchSource::kDram)
-      .value("SSD", PrefetchSource::kSsd)
-      .value("REMOTE", PrefetchSource::kRemote);
-  py::class_<PrefetchKeyResult>(m, "UMBPPrefetchKeyResult")
-      .def_readonly("code", &PrefetchKeyResult::code)
-      .def_readonly("source", &PrefetchKeyResult::source)
-      .def_readonly("backend_id", &PrefetchKeyResult::backend_id)
-      .def_readonly("bytes", &PrefetchKeyResult::bytes)
-      .def_property_readonly("ok", &PrefetchKeyResult::Ready);
-  py::class_<PrefetchSubmitResult>(m, "UMBPPrefetchSubmitResult")
-      .def_readonly("accepted", &PrefetchSubmitResult::accepted)
-      .def_readonly("request_id", &PrefetchSubmitResult::request_id)
-      .def_readonly("error", &PrefetchSubmitResult::error);
-  py::class_<PrefetchStatus>(m, "UMBPPrefetchStatus")
-      .def_readonly("state", &PrefetchStatus::state)
-      .def_readonly("results", &PrefetchStatus::results)
-      .def_readonly("completed_keys", &PrefetchStatus::completed_keys)
-      .def_readonly("error", &PrefetchStatus::error)
-      .def_readonly("queue_latency_us", &PrefetchStatus::queue_latency_us)
-      .def_readonly("execution_latency_us", &PrefetchStatus::execution_latency_us)
-      .def_readonly("total_latency_us", &PrefetchStatus::total_latency_us)
-      .def_readonly("lease_remaining_ms", &PrefetchStatus::lease_remaining_ms);
-
   py::enum_<TierType>(m, "UMBPTierType")
       .value("Unknown", TierType::UNKNOWN)
       .value("HBM", TierType::HBM)
@@ -380,22 +336,6 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_prefetch", &IUMBPClient::BatchPrefetch, py::arg("keys"),
-           py::call_guard<py::gil_scoped_release>())
-      .def(
-          "submit_prefetch",
-          [](IUMBPClient& self, const std::vector<std::string>& keys, uint64_t lease_ttl_ms,
-             uint64_t timeout_ms, std::string request_id) {
-            if (lease_ttl_ms > 300000 || timeout_ms > 300000)
-              throw std::invalid_argument("prefetch timeout or lease exceeds 300000 ms");
-            PrefetchOptions options{std::chrono::milliseconds(lease_ttl_ms),
-                                    std::chrono::milliseconds(timeout_ms)};
-            return self.SubmitPrefetch(keys, options, std::move(request_id));
-          },
-          py::arg("keys"), py::arg("lease_ttl_ms") = 500, py::arg("timeout_ms") = 5000,
-          py::arg("request_id") = "", py::call_guard<py::gil_scoped_release>())
-      .def("get_prefetch_status", &IUMBPClient::GetPrefetchStatus, py::arg("request_id"),
-           py::call_guard<py::gil_scoped_release>())
-      .def("supports_async_prefetch", &IUMBPClient::SupportsAsyncPrefetch,
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())

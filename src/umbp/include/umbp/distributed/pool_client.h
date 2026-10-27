@@ -40,7 +40,7 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
-#include "umbp/common/prefetch_manager.h"
+#include "umbp/common/prefetch_queue.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/metrics/activity_summary.h"
@@ -615,8 +615,8 @@ class PoolClient {
   // twice, once for itself and once for a cache it just filled.
   //
   // Best-effort in every direction: gated by ranged_locality_prefetch and the
-  // re-cache admission policy, deduplicated against both the queue and this
-  // node's medium, bounded, and silent on failure.  It never runs on, and never
+  // re-cache admission policy, rechecks local residency when executed, and is
+  // bounded and silent on failure. It never runs on, and never
   // blocks, the read that scheduled it.
   void MaybePrefetchWholeObject(const std::string& key, size_t object_size);
   // The other half of the same decision: the arena slice already holds the
@@ -672,10 +672,7 @@ class PoolClient {
   // Best-effort per key: already-local keys are dropped before allocating (the
   // alternative wastes a whole object of wire), and any key whose allocation or
   // transfer fails is aborted without affecting the others.
-  std::vector<PrefetchKeyResult> FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs,
-                                                             bool respect_deadlines = false);
-  std::vector<PrefetchKeyResult> FetchWholeObjectsIntoBackend(std::vector<ReCacheJob>& jobs,
-                                                              uint32_t backend_id);
+  void FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs);
 #ifdef MORI_UMBP_TESTING
   friend class PrefetchRemoteTest;
   struct BatchGetPlan;
@@ -684,11 +681,9 @@ class PoolClient {
   std::function<void(const BatchGetPlan&, std::vector<bool>*)> prefetch_transport_for_test_;
 #endif
 
-  std::vector<PrefetchKeyResult> ExecutePrefetch(const std::vector<std::string>& keys);
-  void ExecuteRemotePrefetch(const std::vector<std::string>& keys,
-                             const std::vector<size_t>& elsewhere,
-                             std::vector<PrefetchKeyResult>* results);
-  std::unique_ptr<PrefetchManager> prefetch_manager_;
+  std::vector<bool> ExecutePrefetch(const std::vector<std::string>& keys, PrefetchOptions options,
+                                    PrefetchQueue::Clock::time_point deadline);
+  std::unique_ptr<PrefetchQueue> prefetch_queue_;
   std::mutex clear_mutex_;
   bool recache_paused_ = false;
   bool recache_active_ = false;

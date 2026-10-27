@@ -369,8 +369,7 @@ void PeerPool::PromoteForRead(const std::vector<std::string>& keys,
 
 // A copy, not a promotion: it only has to outlive the read it was made for, so
 // the budget can drop it without demoting anything.
-size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes,
-                          std::unordered_map<std::string, PrefetchCode>* failures) {
+size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes) {
   if (budget_bytes == 0 || keys.empty()) return 0;
   size_t copied = 0;
   std::vector<PrefetchedCopy> victims;
@@ -397,10 +396,7 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
           auto* member = backends_->Get(id);
           if (member != nullptr && member->Tier() == TierType::DRAM) dram.push_back(id);
         }
-        if (dram.empty()) continue;
-        // Reuse this plan for tracked failure reporting as well as execution.
-        if (failures) (*failures)[key] = PrefetchCode::kNoSpace;
-        if (!migrating_keys_.insert(key).second) continue;
+        if (dram.empty() || !migrating_keys_.insert(key).second) continue;
         ++transition_metrics_.attempted;
         jobs.push_back(TransitionJob{TierTransitionKind::kPromotion, key, source_id, *tier});
         targets.push_back(std::move(dram));
@@ -416,21 +412,14 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
         results[j] =
             transition_executor_.Execute(jobs[j].key, jobs[j].source_backend_id, targets[j],
                                          /*remove_source=*/false);
-      } catch (...) {
-        results[j].failure = TierTransitionFailure::kCopy;
+      } catch (...) { /* FinishTransitionLocked releases the failed job's reservation. */
       }
     });
 
     std::lock_guard<std::mutex> lock(operation_mutex_);
     for (size_t j = 0; j < jobs.size(); ++j) {
       FinishTransitionLocked(jobs[j], results[j]);
-      if (!results[j].success) {
-        if (failures)
-          (*failures)[jobs[j].key] = results[j].failure == TierTransitionFailure::kNoSpace
-                                         ? PrefetchCode::kNoSpace
-                                         : PrefetchCode::kTransferFailed;
-        continue;
-      }
+      if (!results[j].success) continue;
       ++copied;
       prefetched_.push_back(PrefetchedCopy{jobs[j].key, results[j].target_backend_id,
                                            jobs[j].source_backend_id, results[j].bytes_moved});
@@ -475,89 +464,17 @@ size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_
   return copied;
 }
 
-std::vector<PrefetchKeyResult> PeerPool::PrefetchToDram(const std::vector<std::string>& keys,
-                                                        uint64_t budget_bytes) {
-  std::vector<PrefetchKeyResult> out(keys.size());
-  {
-    std::lock_guard<std::mutex> lock(operation_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      RepairAfterDropLocked(keys[i]);
-      const auto placement = placements_.find(keys[i]);
-      const auto id =
-          placement == placements_.end() ? BackendRegistry::kMaxBackends : placement->second;
-      auto* backend = backends_ == nullptr ? nullptr : backends_->Get(id);
-      out[i].code = PrefetchCode::kMissing;
-      if (backend == nullptr) continue;
-      out[i].backend_id = id;
-      out[i].source = backend->Tier() == TierType::DRAM  ? PrefetchSource::kDram
-                      : backend->Tier() == TierType::SSD ? PrefetchSource::kSsd
-                                                         : PrefetchSource::kUnknown;
-      out[i].code =
-          backend->Tier() == TierType::DRAM ? PrefetchCode::kNotResident : PrefetchCode::kNoDram;
-    }
-  }
-  std::unordered_map<std::string, PrefetchCode> failures;
-  Prefetch(keys, budget_bytes, &failures);
-  {
-    std::lock_guard<std::mutex> lock(operation_mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      const auto failure = failures.find(keys[i]);
-      if (failure != failures.end()) out[i].code = failure->second;
-      RepairAfterDropLocked(keys[i]);
-      const auto placement = placements_.find(keys[i]);
-      auto* backend = placement == placements_.end() ? nullptr : backends_->Get(placement->second);
-      if (backend == nullptr || backend->Tier() != TierType::DRAM) continue;
-      // Only the committed DRAM placement is eligible. SSD staging is never
-      // confused with a prepared DRAM object.
-      const auto resolved = backend->BatchResolve({keys[i]}, false, false, ResolveReader::kLocal);
-      if (resolved.empty() || !resolved[0].found) continue;
-      out[i].code = PrefetchCode::kReady;
-      out[i].backend_id = backends_->BackendId(backend);
-      out[i].bytes = resolved[0].size;
-    }
-  }
-  return out;
-}
-
-std::vector<uint32_t> PeerPool::RemotePrefetchTargets(const std::string& key,
-                                                      uint64_t bytes) const {
-  std::lock_guard<std::mutex> lock(operation_mutex_);
-  if (backends_ == nullptr || policy_ == nullptr) return {};
-  PoolPlacementRequest request;
-  request.key = key;
-  request.size = bytes;
-  request.tier = TierType::DRAM;
-  auto targets = policy_->PutOrder(*backends_, request);
-  targets.erase(std::remove_if(targets.begin(), targets.end(),
-                               [&](uint32_t id) {
-                                 auto* backend = backends_->Get(id);
-                                 return backend == nullptr || backend->Tier() != TierType::DRAM;
-                               }),
-                targets.end());
-  return targets;
-}
-
-void PeerPool::ProtectPrefetched(const std::vector<std::string>& keys,
-                                 std::vector<PrefetchKeyResult>* results,
-                                 std::chrono::milliseconds ttl) {
+std::vector<bool> PeerPool::LeasePrefetched(const std::vector<std::string>& keys,
+                                            std::chrono::milliseconds ttl) {
   std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
-  std::lock_guard<std::mutex> lock(operation_mutex_);
-  std::map<uint32_t, std::vector<size_t>> groups;
-  for (size_t i = 0; i < results->size(); ++i) {
-    if ((*results)[i].Ready()) groups[(*results)[i].backend_id].push_back(i);
+  std::vector<bool> ready(keys.size(), false);
+  if (backends_ == nullptr) return ready;
+  for (auto* backend : backends_->All()) {
+    if (backend->Tier() != TierType::DRAM) continue;
+    const auto leased = backend->ExtendReadLease(keys, ttl);
+    for (size_t i = 0; i < keys.size() && i < leased.size(); ++i) ready[i] = ready[i] || leased[i];
   }
-  for (const auto& [id, indices] : groups) {
-    auto* backend = backends_ == nullptr ? nullptr : backends_->Get(id);
-    std::vector<std::string> group;
-    for (auto i : indices) group.push_back(keys[i]);
-    const auto leased = backend && backend->Tier() == TierType::DRAM
-                            ? backend->ExtendReadLease(group, ttl)
-                            : std::vector<bool>{};
-    for (size_t j = 0; j < indices.size(); ++j) {
-      if (j >= leased.size() || !leased[j])
-        (*results)[indices[j]].code = PrefetchCode::kNotResident;
-    }
-  }
+  return ready;
 }
 
 TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,

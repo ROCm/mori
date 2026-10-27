@@ -130,7 +130,7 @@ class IUMBPClient {
   virtual size_t BatchPrefetch(const std::vector<std::string>& /*keys*/) { return 0; }
 
   /// Tracked prefetch to local DRAM. Submission only acknowledges admission;
-  /// query until terminal for per-input results and the remaining read lease.
+  /// query until terminal for per-input results.
   virtual PrefetchSubmitResult SubmitPrefetch(const std::vector<std::string>& keys,
                                               PrefetchOptions options = {},
                                               std::string request_id = {}) {

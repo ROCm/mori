@@ -1626,17 +1626,16 @@ TEST(PeerPool, PrefetchCopyExceptionsReleasePinsAndAllowRetry) {
   PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
   CommitKey(&pool, "retry", "ssd");
   engine.ThrowNext();
-  EXPECT_EQ(pool.PrefetchToDram({"retry"}, 4096)[0].code, PrefetchCode::kTransferFailed);
-  EXPECT_TRUE(pool.PrefetchToDram({"retry"}, 4096)[0].Ready());
+  EXPECT_EQ(pool.Prefetch({"retry"}, 4096), 0u);
+  EXPECT_EQ(pool.Prefetch({"retry"}, 4096), 1u);
   pool.ClearLocal();  // no leaked source or target migration pins
 }
 
-TEST(PeerPool, TrackedPrefetchReportsMixedInputsAndLeasesActualDramCopies) {
-  constexpr uint64_t kPageSize = 4096;
+TEST(PeerPool, PrefetchLeasesOnlyCommittedDramCopies) {
   LocalCopyEngine engine;
   BackendRegistry registry;
-  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kPageSize, 4);
-  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, 4096, 4);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, 4096, 4);
   LogicalTierConfig kv;
   kv.members = {{"dram", 1}, {"ssd", 1}};
   auto graph = LogicalTierGraph::Compile({kv}, registry);
@@ -1644,55 +1643,16 @@ TEST(PeerPool, TrackedPrefetchReportsMixedInputsAndLeasesActualDramCopies) {
   PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
   CommitKey(&pool, "hot", "dram");
   CommitKey(&pool, "cold", "ssd");
-  const std::vector<std::string> keys{"hot", "cold", "cold", "missing"};
-  auto results = pool.PrefetchToDram(keys, 2 * kPageSize);
-  ASSERT_EQ(results.size(), keys.size());
-  EXPECT_TRUE(results[0].Ready());
-  EXPECT_EQ(results[0].source, PrefetchSource::kDram);
-  EXPECT_TRUE(results[1].Ready());
-  EXPECT_EQ(results[1].source, PrefetchSource::kSsd);
-  EXPECT_TRUE(results[2].Ready());
-  EXPECT_EQ(results[3].code, PrefetchCode::kMissing);
+  const std::vector<std::string> keys{"hot", "cold", "missing"};
+  EXPECT_EQ(pool.LeasePrefetched(keys, std::chrono::milliseconds(40)),
+            (std::vector<bool>{true, false, false}));
+  EXPECT_EQ(pool.Prefetch(keys, 4096), 1u);
+  EXPECT_EQ(pool.LeasePrefetched(keys, std::chrono::milliseconds(40)),
+            (std::vector<bool>{true, true, false}));
   EXPECT_TRUE(registry.Get("ssd")->Contains("cold"));
-  pool.ProtectPrefetched(keys, &results, std::chrono::milliseconds(40));
   EXPECT_EQ(registry.Get("dram")->Evict({"cold"})[0].bytes_freed, 0u);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   EXPECT_GT(registry.Get("dram")->Evict({"cold"})[0].bytes_freed, 0u);
-  pool.ProtectPrefetched(keys, &results, std::chrono::milliseconds(40));
-  EXPECT_EQ(results[1].code, PrefetchCode::kNotResident);
-}
-
-TEST(PeerPool, SsdOnlyContainmentDoesNotMeanPrefetchReady) {
-  LocalCopyEngine engine;
-  BackendRegistry registry;
-  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, 4096, 4);
-  LogicalTierConfig kv;
-  kv.members = {{"ssd", 1}};
-  auto graph = LogicalTierGraph::Compile({kv}, registry);
-  ASSERT_TRUE(graph.ok());
-  PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
-  CommitKey(&pool, "cold", "ssd");
-  auto result = pool.PrefetchToDram({"cold"}, 4096);
-  EXPECT_EQ(result[0].code, PrefetchCode::kNoDram);
-  EXPECT_TRUE(pool.BatchContains({"cold"})[0]);
-}
-
-TEST(PeerPool, DramPrefetchRequiresSuccessfulResolve) {
-  class UnreadableBackend final : public MockBackend {
-   public:
-    UnreadableBackend() : MockBackend(TierType::DRAM) {}
-    std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool, bool,
-                                            ResolveReader,
-                                            const std::vector<ObjectExtent>*) override {
-      return std::vector<ResolvedEntry>(keys.size());
-    }
-  };
-  BackendRegistry registry;
-  ASSERT_TRUE(registry.Register("dram", std::make_unique<UnreadableBackend>()));
-  PeerPool pool(&registry, MakeSingleBackendPolicy());
-  CommitKey(&pool, "unreadable");
-  ASSERT_TRUE(pool.BatchContains({"unreadable"})[0]);
-  EXPECT_EQ(pool.PrefetchToDram({"unreadable"}, 4096)[0].code, PrefetchCode::kNotResident);
 }
 
 TEST(PeerPool, TrackedPrefetchDoesNotReportCopiesEvictedByItsOwnBudget) {
@@ -1707,9 +1667,9 @@ TEST(PeerPool, TrackedPrefetchDoesNotReportCopiesEvictedByItsOwnBudget) {
   PeerPool pool(&registry, MakeTieredPlacementPolicy(graph.graph), &engine);
   CommitKey(&pool, "a", "ssd");
   CommitKey(&pool, "b", "ssd");
-  auto results = pool.PrefetchToDram({"a", "b"}, 64);
-  EXPECT_EQ(std::count_if(results.begin(), results.end(), [](const auto& r) { return r.Ready(); }),
-            1);
+  pool.Prefetch({"a", "b"}, 64);
+  auto ready = pool.LeasePrefetched({"a", "b"}, std::chrono::milliseconds(40));
+  EXPECT_EQ(std::count(ready.begin(), ready.end(), true), 1);
   EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
   EXPECT_TRUE(registry.Get("ssd")->Contains("b"));
 }

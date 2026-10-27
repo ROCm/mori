@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <future>
 
+#include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/pool_client.h"
 
 namespace mori::umbp {
@@ -55,33 +56,8 @@ class PrefetchRemoteTest : public ::testing::Test {
       job.route->size = size;
       jobs.push_back(std::move(job));
     }
-    return client.FetchWholeObjectsIntoMedium(jobs);
-  }
-
-  std::unique_ptr<PoolClient> MakeTieredClient() {
-    PoolClientConfig config;
-    config.master_config.node_id = "prefetch-tiered";
-    config.dram_page_size = 4096;
-    BackendInstanceConfig cold;
-    cold.name = "cold";
-    cold.tier = TierType::DRAM;
-    cold.dram.buffer_sizes = {4096};
-    BackendInstanceConfig hot = cold;
-    hot.name = "hot";
-    config.backends = {cold, hot};  // registry order intentionally opposes policy
-    config.placement_policy = PoolPlacementPolicy::TIERED;
-    LogicalTierConfig hot_tier;
-    hot_tier.name = "hot";
-    hot_tier.entry = true;
-    hot_tier.members = {{"hot", 1}};
-    hot_tier.offload_to = {"cold"};
-    LogicalTierConfig cold_tier;
-    cold_tier.name = "cold";
-    cold_tier.members = {{"cold", 1}};
-    config.logical_tiers = {hot_tier, cold_tier};
-    auto client = std::make_unique<PoolClient>(config);
-    EXPECT_TRUE(client->Init());
-    return client;
+    client.FetchWholeObjectsIntoMedium(jobs);
+    return client.default_pool_->LeasePrefetched(keys, std::chrono::milliseconds(500));
   }
 
   bool PutOnSsd(PoolClient& client, const std::string& key, const std::vector<char>& bytes) {
@@ -111,15 +87,15 @@ TEST_F(PrefetchRemoteTest, OnlyCommittedTransfersAreReadyAndFailedSlotsAreReusab
   });
   auto results = Pull(*client, {"ready", "failed"});
   ASSERT_EQ(results.size(), 2u);
-  EXPECT_TRUE(results[0].Ready());
-  EXPECT_EQ(results[1].code, PrefetchCode::kTransferFailed);
+  EXPECT_TRUE(results[0]);
+  EXPECT_EQ(results[1], false);
   EXPECT_FALSE(client->Backends().Get(TierType::DRAM)->Contains("failed"));
   std::vector<char> bytes(4096);
   ASSERT_TRUE(client->Get("ready", bytes.data(), bytes.size()));
   EXPECT_EQ(bytes, std::vector<char>(4096, 0x37));
   // Reuse every other page. A leaked failed allocation would prevent this.
   auto retry = Pull(*client, {"b", "c", "d"});
-  for (const auto& result : retry) EXPECT_TRUE(result.Ready());
+  for (const auto& result : retry) EXPECT_TRUE(result);
 }
 
 TEST_F(PrefetchRemoteTest, CrossBufferSlotFailsBeforeTransportAndReleasesItsPages) {
@@ -130,11 +106,11 @@ TEST_F(PrefetchRemoteTest, CrossBufferSlotFailsBeforeTransportAndReleasesItsPage
     return true;
   });
   auto result = Pull(*client, {"cross-mr"}, 8192);
-  EXPECT_EQ(result[0].code, PrefetchCode::kFragmented);
+  EXPECT_EQ(result[0], false);
   EXPECT_EQ(calls, 0u);
   EXPECT_FALSE(client->Backends().Get(TierType::DRAM)->Contains("cross-mr"));
   auto small = Pull(*client, {"a", "b"});
-  for (const auto& r : small) EXPECT_TRUE(r.Ready());
+  for (const auto& r : small) EXPECT_TRUE(r);
 }
 
 TEST_F(PrefetchRemoteTest, CapacityFailureAndAlreadyResidentKeepPerInputResults) {
@@ -145,10 +121,10 @@ TEST_F(PrefetchRemoteTest, CapacityFailureAndAlreadyResidentKeepPerInputResults)
     std::memset(dst, 0x18, size);
     return true;
   });
-  ASSERT_TRUE(Pull(*client, {"resident"})[0].Ready());
+  ASSERT_TRUE(Pull(*client, {"resident"})[0]);
   auto mixed = Pull(*client, {"resident", "no-space"});
-  EXPECT_TRUE(mixed[0].Ready());
-  EXPECT_EQ(mixed[1].code, PrefetchCode::kNoSpace);
+  EXPECT_TRUE(mixed[0]);
+  EXPECT_EQ(mixed[1], false);
   EXPECT_EQ(calls, 1u);
 }
 
@@ -160,7 +136,7 @@ TEST_F(PrefetchRemoteTest, CommitRejectionIsNotReportedReady) {
     client->Backends().Get(TierType::DRAM)->ClearLocal();
     return true;
   });
-  EXPECT_EQ(Pull(*client, {"rejected"})[0].code, PrefetchCode::kTransferFailed);
+  EXPECT_EQ(Pull(*client, {"rejected"})[0], false);
   EXPECT_FALSE(client->Backends().Get(TierType::DRAM)->Contains("rejected"));
 }
 
@@ -169,41 +145,9 @@ TEST_F(PrefetchRemoteTest, TransportExceptionAbortsEveryPendingDestination) {
   Transport(*client, [](const auto&, void*, size_t) -> bool {
     throw std::runtime_error("transport failure");
   });
-  for (const auto& result : Pull(*client, {"a", "b"}))
-    EXPECT_EQ(result.code, PrefetchCode::kTransferFailed);
+  for (const auto& result : Pull(*client, {"a", "b"})) EXPECT_EQ(result, false);
   Transport(*client, [](const auto&, void*, size_t) { return true; });
-  for (const auto& result : Pull(*client, {"c", "d"})) EXPECT_TRUE(result.Ready());
-}
-
-TEST_F(PrefetchRemoteTest, RemoteCopiesUsePolicyOrderAndFallBackWhenFirstBackendIsFull) {
-  auto client = MakeTieredClient();
-  Transport(*client, [](const auto&, void* dst, size_t size) {
-    std::memset(dst, 0x42, size);
-    return true;
-  });
-  ASSERT_TRUE(Pull(*client, {"first"})[0].Ready());
-  EXPECT_TRUE(client->Backends().Get("hot")->Contains("first"));
-  ASSERT_TRUE(Pull(*client, {"second"})[0].Ready());
-  EXPECT_TRUE(client->Backends().Get("cold")->Contains("second"));
-}
-
-TEST_F(PrefetchRemoteTest, BackendExceptionPreservesOtherBatchesAndReleasesFailedSlots) {
-  auto client = MakeTieredClient();
-  Transport(*client, [](const auto& key, void* dst, size_t size) {
-    if (key == "failed") throw std::runtime_error("transport failure");
-    std::memset(dst, 0x42, size);
-    return true;
-  });
-  // The first key fills hot DRAM; the second falls back to cold DRAM and throws.
-  const auto results = Pull(*client, {"kept", "failed"});
-  ASSERT_EQ(results.size(), 2u);
-  EXPECT_TRUE(results[0].Ready());
-  EXPECT_EQ(results[1].code, PrefetchCode::kTransferFailed);
-  std::vector<char> bytes(4096);
-  ASSERT_TRUE(client->Get("kept", bytes.data(), bytes.size()));
-  EXPECT_EQ(bytes, std::vector<char>(4096, 0x42));
-  EXPECT_FALSE(client->Backends().Get("cold")->Contains("failed"));
-  EXPECT_TRUE(Pull(*client, {"recovered"})[0].Ready());
+  for (const auto& result : Pull(*client, {"c", "d"})) EXPECT_TRUE(result);
 }
 
 TEST_F(PrefetchRemoteTest, MasterlessSsdPrefetchReadsActualFileBytesIntoDram) {
@@ -258,7 +202,7 @@ TEST_F(PrefetchRemoteTest, MasterlessSsdPrefetchReadsActualFileBytesIntoDram) {
   }
   ASSERT_EQ(status.state, PrefetchState::kPartial);
   EXPECT_EQ(status.completed_keys, 2u);
-  EXPECT_EQ(status.results[0].source, PrefetchSource::kSsd);
+  EXPECT_EQ(status.ok, (std::vector<bool>{true, false, true}));
   EXPECT_TRUE(client.Backends().Get("hot")->Contains("file-key"));
   EXPECT_TRUE(client.Backends().Get("cold")->Contains("file-key"));
   std::vector<char> actual(expected.size());
@@ -281,7 +225,7 @@ TEST_F(PrefetchRemoteTest, PendingDestinationIsNotPublishedDuringTransfer) {
   EXPECT_FALSE(client->Backends().Get(TierType::DRAM)->Contains("pending"));
   released.set_value();
   auto result = pull.get();
-  EXPECT_TRUE(result[0].Ready());
+  EXPECT_TRUE(result[0]);
   EXPECT_TRUE(client->Backends().Get(TierType::DRAM)->Contains("pending"));
 }
 

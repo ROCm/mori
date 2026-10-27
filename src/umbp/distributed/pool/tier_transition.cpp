@@ -92,16 +92,12 @@ TierTransitionResult TierTransitionExecutor::Execute(
     const std::string& key, uint32_t source_backend_id,
     const std::vector<uint32_t>& target_backend_ids, bool remove_source) const {
   TierTransitionResult result;
-  result.failure = TierTransitionFailure::kNoTarget;
   if (backends_ == nullptr || transfer_engine_ == nullptr || target_backend_ids.empty()) {
     return result;
   }
 
   MediumBackend* source = backends_->Get(source_backend_id);
-  if (source == nullptr) {
-    result.failure = TierTransitionFailure::kNoSource;
-    return result;
-  }
+  if (source == nullptr) return result;
   // A file-backed side skips staging when an engine joins its file to the other
   // side's memory.
   bool targets_reach_files = true;
@@ -111,7 +107,6 @@ TierTransitionResult TierTransitionExecutor::Execute(
   }
   ResolvedEntry resolved;
   if (!source->AcquireMigrationRead(key, &resolved, targets_reach_files) || !resolved.found) {
-    result.failure = TierTransitionFailure::kNoSource;
     return result;
   }
   // Both background prefetch and ordinary tier transitions must release pins
@@ -135,10 +130,7 @@ TierTransitionResult TierTransitionExecutor::Execute(
 
     auto allocations =
         target->BatchAllocate({AllocateRequest{key, resolved.size, -1, source_reaches_files}});
-    if (allocations.empty()) {
-      result.failure = TierTransitionFailure::kNoSpace;
-      continue;
-    }
+    if (allocations.empty()) continue;
     AllocateResult& allocation = allocations.front();
 
     struct PendingSlot {
@@ -154,14 +146,12 @@ TierTransitionResult TierTransitionExecutor::Execute(
       std::vector<TransferItem> transfers;
       if (!BuildTransfers(source, resolved, target, allocation, &transfers) ||
           !transfer_engine_->Transfer(transfers, nullptr)) {
-        result.failure = TierTransitionFailure::kCopy;
         result.retryable = true;
         continue;
       }
       result.bytes_read += resolved.size;
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
-        result.failure = TierTransitionFailure::kCommit;
         result.retryable = true;
         continue;
       }
@@ -170,7 +160,6 @@ TierTransitionResult TierTransitionExecutor::Execute(
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
       // No space is pressure (staging full of reads, eviction catching up);
       // a shape failure (kFailed) stays final.
-      result.failure = TierTransitionFailure::kNoSpace;
       if (allocation.outcome == AllocateOutcome::kFailedNoSpace) result.retryable = true;
       continue;
     }
@@ -181,14 +170,12 @@ TierTransitionResult TierTransitionExecutor::Execute(
         target_read.size != resolved.size) {
       if (target_read.found) target->ReleaseMigrationRead(key);
       if (allocation.outcome == AllocateOutcome::kSuccessAllocated) target->Evict({key});
-      result.failure = TierTransitionFailure::kCopy;
       result.retryable = true;
       continue;
     }
     ReadPin target_pin{target, key};
 
     result.success = true;
-    result.failure = TierTransitionFailure::kNone;
     result.retryable = false;
     result.target_backend_id = target_backend_id;
     result.bytes_moved = resolved.size;

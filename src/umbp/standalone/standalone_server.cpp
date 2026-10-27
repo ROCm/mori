@@ -877,20 +877,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     const auto status = client_->GetPrefetchStatus(request->request_id());
     response->set_state(static_cast<::umbp::PrefetchState>(status.state));
     response->set_completed_keys(status.completed_keys);
-    response->set_total_keys(status.results.size());
+    response->set_total_keys(status.ok.size());
     response->set_error(status.error);
     response->set_queue_latency_us(status.queue_latency_us);
     response->set_execution_latency_us(status.execution_latency_us);
     response->set_total_latency_us(status.total_latency_us);
-    response->set_lease_remaining_ms(status.lease_remaining_ms);
-    for (const auto& result : status.results) {
-      response->add_ok(result.Ready());
-      auto* detail = response->add_results();
-      detail->set_code(static_cast<uint32_t>(result.code));
-      detail->set_source(static_cast<uint32_t>(result.source));
-      detail->set_backend_id(result.backend_id);
-      detail->set_bytes(result.bytes);
-    }
+    for (bool ok : status.ok) response->add_ok(ok);
     return grpc::Status::OK;
   }
 

@@ -705,17 +705,7 @@ PrefetchStatus StandaloneProcessClient::GetPrefetchStatus(const std::string& id)
   out.queue_latency_us = response.queue_latency_us();
   out.execution_latency_us = response.execution_latency_us();
   out.total_latency_us = response.total_latency_us();
-  out.lease_remaining_ms = response.lease_remaining_ms();
-  for (const auto& result : response.results()) {
-    out.results.push_back({static_cast<PrefetchCode>(result.code()),
-                           static_cast<PrefetchSource>(result.source()), result.backend_id(),
-                           result.bytes()});
-  }
-  // A legacy Router-compatible server may not send the additive detail field.
-  if (out.results.empty()) {
-    for (bool ok : response.ok())
-      out.results.push_back({ok ? PrefetchCode::kReady : PrefetchCode::kMissing});
-  }
+  out.ok.assign(response.ok().begin(), response.ok().end());
   return out;
 }
 

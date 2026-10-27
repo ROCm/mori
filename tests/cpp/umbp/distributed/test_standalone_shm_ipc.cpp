@@ -1198,12 +1198,8 @@ TEST(StandaloneShmIpcTest, AsyncPrefetchPreservesRouterWireAndEngineIo) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   EXPECT_EQ(status.state, PrefetchState::kPartial);
-  ASSERT_EQ(status.results.size(), 3u);
+  EXPECT_EQ(status.ok, (std::vector<bool>{true, false, true}));
   EXPECT_EQ(status.completed_keys, 2u);
-  EXPECT_TRUE(status.results[0].Ready());
-  EXPECT_EQ(status.results[1].code, PrefetchCode::kMissing);
-  EXPECT_TRUE(status.results[2].Ready());
-  EXPECT_GT(status.lease_remaining_ms, 0u);
   EXPECT_TRUE(client
                   ->SubmitPrefetch(
                       {"resident", "missing", "resident"},

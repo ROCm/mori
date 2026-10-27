@@ -1229,9 +1229,6 @@ TEST_F(PoolClientRangesTest, BatchPrefetchPullsAPeersKeyIntoThisNode) {
   node->Shutdown();
 }
 
-// Eight layer groups over one cold key must schedule ONE whole-object pull, not
-// one per group: the dedup set is what keeps the duplicate traffic bounded at
-// 1x the object instead of 8x.
 // The switch buys off the SECOND fetch, not locality itself.  A whole-object
 // read already has every byte in hand, so landing it in a slot costs nothing on
 // the wire and must still happen -- gating it would silently undo what the
@@ -1274,11 +1271,8 @@ TEST_F(PoolClientRangesTest, WholeObjectReadStillInstallsWithPrefetchOff) {
 // key, with the object only ever arriving from the peer.  Every group must
 // return its own bytes and the key must end up local.
 //
-// This does NOT pin the in-flight dedup (prefetch_inflight_).  Dedup has no
-// external observable -- a duplicate pull is absorbed by the worker's
-// BatchResolve check and by kSuccessAlreadyExists, so removing the set changes
-// nothing a caller can see.  Naming it here would claim coverage that does not
-// exist; it is a throughput guard, and the bench is where it shows up.
+// This verifies returned bytes and local residency, not the number of queued
+// hints or wire transfers; those need separate performance measurements.
 TEST_F(PoolClientRangesTest, LayerWiseGroupsOverOneColdKeyAllReturnTheirBytes) {
   const std::string key = "prefetch-dedup";
   std::vector<char> object(kObjectSize);
