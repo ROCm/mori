@@ -123,7 +123,7 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //   output        : raw symmetric-heap pointer, chunkElems elements
 //   groupCounters : plain device buffer (kGroupCounterCount uint32), local-only.
 //                   [kArrivalIdx] elects the last block (atomicInc wraps it back
-//                   to 0); [kPushGenIdx] is the push generation it advances
+//                   to 0) to advance the push generation (AdvancePushGen)
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (GenBarrier in block 0, before Phase 1), so
 //                   back-to-back launches need no host barrier
@@ -354,21 +354,27 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
                                     const T* __restrict__ input, T* __restrict__ staging,
                                     uint64_t* __restrict__ barrierCtr,
                                     uint64_t* __restrict__ arrived) {
+// Original gen counter idea:
+// gen = gen_ptr[0];
+// __syncthreads();
+// if (threadIdx.x == 0) {
+//   cnt = 1 + atomicAdd(counter, 1);
+//   if (cnt == gridDim.x) {
+//     *counter = 0;
+//     gen_ptr[0] = gen + 1;
+//   }
+// }
 
   // Every block reads the launch generation before counting in; only the last
-  // block out bumps it, after every block has counted in.
-  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
+  // block out advances it, after every block has counted in.
+  const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
     // Finishing the previous launch only proves peers SENT to us, not that they
     // are done reducing what we sent them: gate our writes into their staging
     // until every PE has entered this launch.
     int stride4G = heapWin->stride4G;
-    if (threadIdx.x < warpSize) {
-      // Every lane reads my slot before lane myPe overwrites it (same wave).
-      const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-      GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
-    }
+    if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -409,7 +415,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // to 0 on the last block, so it needs no reset of its own.
   if (threadIdx.x == 0 &&
       atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
-    AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
+    AdvancePushGen(barrierCtr, myPe, pushGen);
   }
 }
 

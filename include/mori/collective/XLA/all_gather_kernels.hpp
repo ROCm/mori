@@ -56,17 +56,13 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
                                     cco::ccoDevComm devComm,
                                     cco::ccoWindow_t heapWin,
                                     uint64_t* __restrict__ barrierCtr,
-                                    uint32_t* __restrict__ groupCounters,
                                     uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
-  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
+  // Every lane of the first wave reads my slot before lane myPe posts.
+  const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   // A peer finishing its previous launch only proves our shard reached it; gate
   // our writes into its output until every PE entered this one.
-  if (threadIdx.x < warpSize) {
-    // Every lane reads my slot before lane myPe overwrites it (same wave).
-    const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-    GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
-  }
+  if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
   __syncthreads();
 
   // Single block: push my shard to every peer's output[myPe] slot (+ self). The
@@ -76,10 +72,10 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // use. winBase cancels out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr
   // round trip and keeps no "output at heap offset 0" assumption. The source is
   // our single shard (same for all peers).
-  uint8_t* const localDst = reinterpret_cast<uint8_t*>(output) + static_cast<size_t>(myPe) * chunkBytes;
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0,
       [=](int peer) {
+        auto *localDst = reinterpret_cast<uint8_t*>(output) + myPe * chunkBytes;
         return ScatterPeer{true, chunkBytes, reinterpret_cast<const uint8_t*>(input),
                            PeerPtr(localDst, peer, myPe, stride4G),
                            PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
@@ -97,9 +93,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
 
   // No Phase 3: output already fully written by SDMA. The block read pushGen at
   // entry, so it can advance the generation for the next launch now.
-  if (threadIdx.x == 0) {
-    AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
-  }
+  if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
 }
 
 // Multi-block, SDMA-free all-gather: every PE reads each peer's shard straight

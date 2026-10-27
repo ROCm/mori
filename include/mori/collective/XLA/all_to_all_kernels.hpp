@@ -60,17 +60,13 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
                                    size_t chunkBytes, cco::ccoDevComm devComm,
                                    cco::ccoWindow_t heapWin,
                                    uint64_t* __restrict__ barrierCtr,
-                                   uint32_t* __restrict__ groupCounters,
                                    uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
-  const uint64_t pushGen = AtomicLoad<EAgentScope>(PushGen(groupCounters)) + 1;
+  // Every lane of the first wave reads my slot before lane myPe posts.
+  const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   // A peer finishing its previous launch only proves our chunk reached it; gate
   // our writes into its recv slot until every PE entered this one.
-  if (threadIdx.x < warpSize) {
-    // Every lane reads my slot before lane myPe overwrites it (same wave).
-    const uint64_t gen = AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL;
-    GenBarrier(barrierCtr, gen + 2, myPe, npes, stride4G);
-  }
+  if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
   __syncthreads();
 
   // Phase 1: push each send slot p to peer p's recv slot for sender myPe (self
@@ -102,9 +98,7 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
 
   // No Phase 3: recv buffers already fully written by SDMA. The block read
   // pushGen at entry, so it can advance the generation for the next launch now.
-  if (threadIdx.x == 0) {
-    AtomicStore<EAgentScope>(PushGen(groupCounters), pushGen);
-  }
+  if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
 }
 
 // Multi-block, SDMA-free all-to-all: every PE reads, from each peer p, the chunk
