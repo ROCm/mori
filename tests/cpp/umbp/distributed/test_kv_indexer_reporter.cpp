@@ -43,9 +43,12 @@ class Receiver : public pb::KVIndexer::Service {
   grpc::Status ApplyExternalKvBatch(grpc::ServerContext* context,
                                     const pb::ApplyExternalKvBatchRequest* request,
                                     pb::ApplyExternalKvBatchResponse*) override {
+    const int fault = mode.load();
+    if (fault == 3) mode = 1;  // One successful batch, then apply-and-fail subsequent batches.
     {
       std::lock_guard<std::mutex> lock(mutex);
       requests.push_back(*request);
+      if (fault == 1) ++failures;
       for (const auto& action : request->actions()) {
         if (action.type() == pb::ACTION_CLEAR_ALL_AT_TIER) masks.clear();
         for (int i = 0; i < action.hashes_size(); ++i) {
@@ -57,7 +60,6 @@ class Receiver : public pb::KVIndexer::Service {
       }
     }
     changed.notify_all();
-    const int fault = mode.load();
     if (fault == 2) {
       while (!context->IsCancelled()) std::this_thread::sleep_for(1ms);
     }
@@ -67,15 +69,27 @@ class Receiver : public pb::KVIndexer::Service {
     std::unique_lock<std::mutex> lock(mutex);
     return changed.wait_for(lock, 3s, [&] { return masks == expected; });
   }
+  bool WaitForFailure() {
+    std::unique_lock<std::mutex> lock(mutex);
+    return changed.wait_for(lock, 3s, [&] { return failures > 0; });
+  }
   std::mutex mutex;
   std::condition_variable changed;
   std::map<int64_t, uint32_t> masks;
   std::atomic<int> mode{0};
+  size_t failures = 0;
   std::vector<pb::ApplyExternalKvBatchRequest> requests;
 };
 
 class AutomaticKvIndexer : public ::testing::Test {
  protected:
+  static PoolClientConfig PoolConfig(size_t pages = 16) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = "indexer-test";
+    cfg.dram_page_size = 4096;
+    cfg.dram.buffer_sizes = {pages * 4096};
+    return cfg;
+  }
   void SetUp() override {
     grpc::ServerBuilder builder;
     int port = 0;
@@ -92,12 +106,7 @@ class AutomaticKvIndexer : public ::testing::Test {
 };
 
 TEST_F(AutomaticKvIndexer, BatchesRespectWireLimitsAndPreserveCanonicalMetadata) {
-  PoolClientConfig cfg;
-  cfg.master_config.node_id = "indexer-batch-test";
-  cfg.dram_page_size = 4096;
-  cfg.dram.buffer_sizes = {4096};
-  cfg.local_evict_high_watermark = 1;
-  PoolClient pool(cfg);
+  PoolClient pool(PoolConfig(2));
   ASSERT_TRUE(pool.Init());
   config.components = 1;
   config.swa_window_tokens = 0;
@@ -138,11 +147,7 @@ TEST_F(AutomaticKvIndexer, BatchesRespectWireLimitsAndPreserveCanonicalMetadata)
 }
 
 TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
-  PoolClientConfig cfg;
-  cfg.master_config.node_id = "indexer-test";
-  cfg.dram_page_size = 4096;
-  cfg.dram.buffer_sizes = {16 * 4096};
-  PoolClient pool(cfg);
+  PoolClient pool(PoolConfig());
   ASSERT_TRUE(pool.Init());
   EXPECT_THROW(pool.RegisterKvBlock({1, {}, 16, {{1, {"k"}}}}), std::logic_error);
   pool.ConfigureKvIndexer(config);
@@ -155,6 +160,10 @@ TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
   EXPECT_THROW(pool.RegisterKvBlock({1, {}, 16, {{1, {"k"}}}}), std::invalid_argument);
   EXPECT_THROW(pool.RegisterKvBlock({block.hash, 42, 16, block.component_keys}),
                std::invalid_argument);
+  pool.RegisterKvBlock({10, 11, 16, block.component_keys});
+  EXPECT_THROW(pool.RegisterKvBlock({11, 10, 16, block.component_keys}), std::invalid_argument);
+  pool.RegisterKvBlock({10, {}, 0, {}});
+  pool.RegisterKvBlock({11, {}, 0, {}});
   const std::string data(128, 'x');
   ASSERT_TRUE(pool.Put("k", data.data(), data.size()));
   auto pending = backend->BatchAllocate({{"v", data.size()}});
@@ -205,10 +214,7 @@ TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
 }
 
 TEST_F(AutomaticKvIndexer, LocalWatermarkEvictionWithdrawsWithoutCallerEvents) {
-  PoolClientConfig cfg;
-  cfg.master_config.node_id = "indexer-eviction-test";
-  cfg.dram_page_size = 4096;
-  cfg.dram.buffer_sizes = {8 * 4096};
+  auto cfg = PoolConfig(8);
   cfg.local_evict_high_watermark = 0.75;
   cfg.local_evict_low_watermark = 0.5;
   PoolClient pool(cfg);
@@ -230,6 +236,29 @@ TEST_F(AutomaticKvIndexer, LocalWatermarkEvictionWithdrawsWithoutCallerEvents) {
   for (const auto& event : backend->SnapshotOwnedKeys()) expected[std::stoll(event.key)] = 1;
   ASSERT_FALSE(expected.empty());
   ASSERT_LT(expected.size(), 7u);
+  EXPECT_TRUE(receiver.WaitFor(expected));
+}
+
+TEST_F(AutomaticKvIndexer, PartialBatchFailureResamplesAfterEviction) {
+  PoolClient pool(PoolConfig(2));
+  ASSERT_TRUE(pool.Init());
+  config.components = 1;
+  config.swa_window_tokens = 0;
+  pool.ConfigureKvIndexer(config);
+  std::map<int64_t, uint32_t> expected;
+  for (int64_t hash = 0; hash < 300; ++hash) {
+    pool.RegisterKvBlock({hash, {}, 16, {{1, {"shared"}}}});
+    expected[hash] = 1;
+  }
+  ASSERT_TRUE(pool.FlushKvIndexer());  // Finish startup before injecting a mid-report failure.
+  receiver.mode = 3;
+  ASSERT_TRUE(pool.Put("shared", "data", 4));
+  ASSERT_TRUE(receiver.WaitForFailure());
+  ASSERT_GT(pool.Backends().Get(TierType::DRAM)->Evict({"shared"})[0].bytes_freed, 0u);
+  receiver.mode = 0;
+  ASSERT_TRUE(pool.FlushKvIndexer());
+  EXPECT_TRUE(receiver.WaitFor({}));  // Neither successful nor ambiguous batches may be replayed.
+  ASSERT_TRUE(pool.Put("shared", "data", 4));
   EXPECT_TRUE(receiver.WaitFor(expected));
 }
 

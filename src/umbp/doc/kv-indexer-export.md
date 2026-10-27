@@ -14,7 +14,7 @@ The integration supplies signed int64 hashes, true parent (`None` for roots),
 block size in tokens, and all physical keys per component: FULL=1, SWA=2, MAMBA=4.
 Keys must identify immutable content. For hybrid caches configure `components`
 and `swa_window_tokens`; metadata must describe every configured component.
-Registration may precede or follow writes. Each component is reported only when
+Registered parent links must be acyclic. Registration may precede or follow writes. Each component is reported only when
 all its keys are committed; FULL is required. Eviction updates/revokes the mask.
 
 Commit, eviction and clear hooks wake one background reporter, including batch,

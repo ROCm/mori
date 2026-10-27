@@ -127,13 +127,15 @@ class PoolClient {
 
   void DeregisterMemory(void* ptr);
 
+  // Optional Indexer reporting, configured once at the storage owner.
+  void ConfigureKvIndexer(const KvIndexerConfig& config);
+  void RegisterKvBlock(const KvBlockMetadata& block);
+  bool FlushKvIndexer();
+
   // Hot paths.  Both retry up to `max_route_retries` times when the
   // chosen peer reports ENOSPC (Put) or unknown-key (Get); each retry
   // adds the failed node to the exclude set.
   bool Put(const std::string& key, const void* src, size_t size);
-  void ConfigureKvIndexer(const KvIndexerConfig& config);
-  void RegisterKvBlock(const KvBlockMetadata& block);
-  bool FlushKvIndexer();
   bool Get(const std::string& key, void* dst, size_t size);
 
   std::vector<bool> BatchPut(const std::vector<std::string>& keys,

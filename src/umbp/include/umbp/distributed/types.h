@@ -39,9 +39,9 @@ struct KvIndexerConfig {
 };
 
 struct KvBlockMetadata {
-  int64_t hash;
+  int64_t hash = 0;
   std::optional<int64_t> parent;
-  uint32_t block_size;
+  uint32_t block_size = 0;  // Token count.
   // Every physical object needed for each FULL=1/SWA=2/MAMBA=4 component.
   // Empty map unregisters this logical block.
   std::map<uint32_t, std::vector<std::string>> component_keys;

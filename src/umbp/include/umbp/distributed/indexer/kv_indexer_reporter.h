@@ -84,7 +84,7 @@ class KvIndexerReporter {
         throw std::invalid_argument("invalid KV component or physical keys");
       mask |= component;
     }
-    if (mask && (mask != components_ || !block.block_size || block.parent == block.hash))
+    if (mask && (mask != components_ || !block.block_size))
       throw std::invalid_argument(
           "metadata must describe all configured components and token count");
     {
@@ -93,10 +93,17 @@ class KvIndexerReporter {
       if (mask && old != blocks_.end() &&
           (old->second.parent != block.parent || old->second.block_size != block.block_size))
         throw std::invalid_argument("a block hash cannot change parent or token count");
-      if (mask)
+      if (mask) {
+        // Forward references are allowed, but cannot close a parent cycle.
+        for (auto parent = block.parent; parent;) {
+          if (*parent == block.hash) throw std::invalid_argument("KV parent cycle");
+          auto ancestor = blocks_.find(*parent);
+          parent = ancestor == blocks_.end() ? std::nullopt : ancestor->second.parent;
+        }
         blocks_.insert_or_assign(block.hash, block);
-      else
+      } else {
         blocks_.erase(block.hash);
+      }
     }
     Notify();
   }
@@ -119,22 +126,22 @@ class KvIndexerReporter {
       const auto now = std::chrono::steady_clock::now();
       // Rebuild from fresh state after ambiguous failures and quiet Indexer restarts.
       if (retry_ || now - last_full_ >= std::chrono::seconds(30)) {
-        Add(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
+        AddAction(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
         reported_.clear();
         last_full_ = now;
       }
       for (const auto& [hash, mask] : reported_) {
         if (stopping_) return false;
-        if (!desired.count(hash)) Add(indexer_pb::ACTION_REVOKE, hash);
+        if (!desired.count(hash)) AddAction(indexer_pb::ACTION_REVOKE, hash);
       }
       for (const auto& [hash, mask] : desired) {
         if (stopping_) return false;
         auto old = reported_.find(hash);
         if (old == reported_.end() || old->second != mask) {
-          Add(indexer_pb::ACTION_REPORT, hash, mask);
+          AddAction(indexer_pb::ACTION_REPORT, hash, mask);
         }
       }
-      Send();
+      SendBatch();
       reported_ = std::move(desired);
       retry_ = false;
       return true;
@@ -154,15 +161,16 @@ class KvIndexerReporter {
     thread_.join();
     try {
       request_.clear_actions();
-      Add(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
-      Send();
+      AddAction(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
+      SendBatch();
     } catch (const std::exception& error) {
       MORI_UMBP_WARN("[KVIndexer] withdrawal failed: {}", error.what());
     }
   }
 
  private:
-  void Add(indexer_pb::ExternalKvActionType type, int64_t hash = 0, uint32_t mask = 0) {
+  // Append an action and flush when the protocol's batch limit is reached.
+  void AddAction(indexer_pb::ExternalKvActionType type, int64_t hash = 0, uint32_t mask = 0) {
     auto* action = request_.add_actions();
     action->set_type(type);
     action->set_tier(indexer_pb::TIER_DRAM);
@@ -174,16 +182,17 @@ class KvIndexerReporter {
       action->add_component_masks(mask);
     }
     // One hash per action: also below the Indexer's 16384-hash request limit.
-    if (request_.actions_size() == 256) Send();
+    if (request_.actions_size() == 256) SendBatch();
   }
-  void Send() {
+  void SendBatch() {
     if (request_.actions().empty()) return;
     request_.set_seq(request_.seq() + 1);
     grpc::ClientContext context;
     context.set_deadline(std::chrono::system_clock::now() + timeout_);
     indexer_pb::ApplyExternalKvBatchResponse response;
     auto status = stub_->ApplyExternalKvBatch(&context, request_, &response);
-    if (!status.ok()) throw std::runtime_error(status.error_message());
+    if (!status.ok())
+      throw std::runtime_error(std::to_string(status.error_code()) + ": " + status.error_message());
     request_.clear_actions();
   }
   void Run() {
@@ -206,6 +215,7 @@ class KvIndexerReporter {
   const uint32_t components_;
   const std::chrono::milliseconds timeout_;
   Snapshot snapshot_;
+  // State/RPC serialization is separate from the short storage-notification lock.
   std::mutex state_mutex_, wake_mutex_;
   std::condition_variable cv_;
   std::map<int64_t, KvBlockMetadata> blocks_;
