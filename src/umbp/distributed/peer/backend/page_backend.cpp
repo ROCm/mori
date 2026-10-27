@@ -598,6 +598,21 @@ std::vector<ResolvedEntry> PageBackend::BatchResolve(const std::vector<std::stri
   return out;
 }
 
+std::vector<bool> PageBackend::ExtendReadLease(const std::vector<std::string>& keys,
+                                               std::chrono::milliseconds ttl) {
+  std::vector<bool> out(keys.size(), false);
+  if (ttl <= std::chrono::milliseconds::zero() || ttl > std::chrono::minutes(5)) return out;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const int64_t deadline = SteadyNs(std::chrono::steady_clock::now() + ttl);
+  for (size_t i = 0; i < keys.size(); ++i) {
+    auto it = owned_.find(keys[i]);
+    if (it == owned_.end()) continue;
+    RenewLeaseAtomic(it->second, deadline);
+    out[i] = true;
+  }
+  return out;
+}
+
 bool PageBackend::AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                                        bool /*allow_file_ref*/) {
   if (resolved == nullptr) return false;

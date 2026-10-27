@@ -241,6 +241,8 @@ bool StandaloneProcessClient::WaitReady(int timeout_ms) {
     if (status.ok() && resp.ready()) {
       backend_mode_ = BackendModeFromProto(resp.deployment_mode());
       supports_ranged_io_ = resp.supports_ranged_io();
+      supports_async_prefetch_ = resp.supports_async_prefetch();
+      prefetch_hint_version_ = resp.prefetch_hint_version();
       return true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -648,13 +650,73 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
 size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& keys) {
   if (closing_) return 0;
   std::shared_lock lk(op_mutex_);
-  if (closed_) return 0;
+  if (closed_ || prefetch_hint_version_ != 1) return 0;
   grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
   ::umbp::BatchKeysRequest req;
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
   grpc::Status status = stub_->BatchPrefetch(&ctx, req, &resp);
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+}
+
+bool StandaloneProcessClient::SupportsAsyncPrefetch() const { return supports_async_prefetch_; }
+
+PrefetchSubmitResult StandaloneProcessClient::SubmitPrefetch(const std::vector<std::string>& keys,
+                                                             PrefetchOptions options,
+                                                             std::string id) {
+  if (closing_) return {false, std::move(id), "client is closing"};
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !supports_async_prefetch_)
+    return {false, std::move(id), "async prefetch is unsupported"};
+  if (options.timeout.count() < 0 || options.lease_ttl.count() < 0)
+    return {false, std::move(id), "invalid prefetch duration"};
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  ::umbp::PrefetchRequest request;
+  for (const auto& key : keys) request.add_keys(key);
+  request.set_lease_ttl_ms(options.lease_ttl.count());
+  request.set_timeout_ms(options.timeout.count());
+  request.set_request_id(id);
+  ::umbp::PrefetchSubmitResponse response;
+  const auto rpc = stub_->SubmitPrefetch(&ctx, request, &response);
+  if (!rpc.ok()) return {false, std::move(id), rpc.error_message()};
+  return {response.accepted(), response.request_id(), response.error()};
+}
+
+PrefetchStatus StandaloneProcessClient::GetPrefetchStatus(const std::string& id) {
+  if (closing_) return {};
+  std::shared_lock lk(op_mutex_);
+  if (closed_ || !supports_async_prefetch_) return {};
+  grpc::ClientContext ctx;
+  ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  ::umbp::PrefetchStatusRequest request;
+  request.set_request_id(id);
+  ::umbp::PrefetchStatusResponse response;
+  const auto rpc = stub_->GetPrefetchStatus(&ctx, request, &response);
+  PrefetchStatus out;
+  if (!rpc.ok()) {
+    out.error = rpc.error_message();
+    return out;
+  }
+  out.state = static_cast<PrefetchState>(response.state());
+  out.completed_keys = response.completed_keys();
+  out.error = response.error();
+  out.queue_latency_us = response.queue_latency_us();
+  out.execution_latency_us = response.execution_latency_us();
+  out.total_latency_us = response.total_latency_us();
+  out.lease_remaining_ms = response.lease_remaining_ms();
+  for (const auto& result : response.results()) {
+    out.results.push_back({static_cast<PrefetchCode>(result.code()),
+                           static_cast<PrefetchSource>(result.source()), result.backend_id(),
+                           result.bytes()});
+  }
+  // A legacy Router-compatible server may not send the additive detail field.
+  if (out.results.empty()) {
+    for (bool ok : response.ok())
+      out.results.push_back({ok ? PrefetchCode::kReady : PrefetchCode::kMissing});
+  }
+  return out;
 }
 
 bool StandaloneProcessClient::Clear() {

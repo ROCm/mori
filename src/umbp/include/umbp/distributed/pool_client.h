@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "mori/io/engine.hpp"
+#include "umbp/common/prefetch_manager.h"
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/metrics/activity_summary.h"
@@ -202,6 +203,10 @@ class PoolClient {
   // Ahead of a read: local SSD keys are copied into DRAM (PeerPool::Prefetch),
   // and keys on peers are pulled into this node's medium in the background.
   size_t BatchPrefetch(const std::vector<std::string>& keys);
+  PrefetchSubmitResult SubmitPrefetch(const std::vector<std::string>& keys,
+                                      PrefetchOptions options = {}, std::string request_id = {});
+  PrefetchStatus GetPrefetchStatus(const std::string& request_id);
+  bool SupportsAsyncPrefetch() const { return config_.prefetch_budget_bytes > 0; }
 
   MasterClient& Master();
 
@@ -644,14 +649,10 @@ class PoolClient {
   // Shutdown before peer_alloc_ is torn down.
   void ReCacheWorkerLoop();
 
-  // Async re-cache install queue. MaybeReCacheAfterRemote copies the block bytes
-  // into a job here (the source buffer is not owned past the Get return), and the
-  // worker thread installs it. Bounded to keep memory + publish churn in check.
-  // Two shapes share one queue and one worker so they also share its lifecycle,
-  // its bound and its drain-on-shutdown:
-  //   bytes != nullptr  -> install this buffer (MaybeReCacheAfterRemote)
-  //   bytes == nullptr  -> pull the object from `route` first
-  //                        (MaybePrefetchWholeObject)
+  // Foreground reads that already own complete bytes queue a bounded local
+  // install. The same job descriptor also describes a routed whole-object
+  // pull inside the unified prefetch executor; those jobs never enter the
+  // recache install queue.
   struct ReCacheJob {
     std::string key;
     std::unique_ptr<char[]> bytes;
@@ -675,15 +676,29 @@ class PoolClient {
   // Best-effort per key: already-local keys are dropped before allocating (the
   // alternative wastes a whole object of wire), and any key whose allocation or
   // transfer fails is aborted without affecting the others.
-  void FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs);
+  std::vector<PrefetchKeyResult> FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs,
+                                                             bool respect_deadlines = false);
+  std::vector<PrefetchKeyResult> FetchWholeObjectsIntoBackend(std::vector<ReCacheJob>& jobs,
+                                                              uint32_t backend_id);
+#ifdef MORI_UMBP_TESTING
+  friend class PrefetchRemoteTest;
+  struct BatchGetPlan;
+  // Transport seam: exercise real destination allocation/commit/abort without
+  // an RDMA device. Production always executes the peer plan below.
+  std::function<void(const BatchGetPlan&, std::vector<bool>*)> prefetch_transport_for_test_;
+#endif
+
+  std::vector<PrefetchKeyResult> ExecutePrefetch(const std::vector<std::string>& keys);
+  void ExecuteRemotePrefetch(const std::vector<std::string>& keys,
+                             const std::vector<size_t>& elsewhere,
+                             std::vector<PrefetchKeyResult>* results);
+  std::unique_ptr<PrefetchManager> prefetch_manager_;
+  std::mutex clear_mutex_;
+  bool recache_paused_ = false;
+  bool recache_active_ = false;
 
   std::deque<ReCacheJob> recache_queue_;
   std::mutex recache_mutex_;
-  // Keys with a whole-object pull already queued or running.  A layer-wise
-  // reader names the same key once per layer group, so without this every group
-  // that misses locally would queue another pull of bytes already in flight.
-  std::unordered_set<std::string> prefetch_inflight_;
-
   // One caller-owned ranged scratch buffer, split into equal shards that are
   // leased independently.  Only the remote half of a ranged operation takes a
   // shard — keys served by this node's own medium never touch an arena and stay

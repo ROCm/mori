@@ -111,6 +111,11 @@ class InstrumentedBackend final : public MediumBackend {
   // medium's half.
   std::vector<MetricSample> SampleMetrics() const override;
 
+  std::vector<bool> ExtendReadLease(const std::vector<std::string>& keys,
+                                    std::chrono::milliseconds ttl) override {
+    return inner_->ExtendReadLease(keys, ttl);
+  }
+
   // ---- slot lifecycle: measured, then forwarded ----
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& reqs) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& reqs) override;

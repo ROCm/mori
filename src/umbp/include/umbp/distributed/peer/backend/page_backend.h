@@ -260,6 +260,8 @@ class PageBackend : public MediumBackend {
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
       ResolveReader reader = ResolveReader::kRemote,
       const std::vector<ObjectExtent>* extents = nullptr) override;
+  std::vector<bool> ExtendReadLease(const std::vector<std::string>& keys,
+                                    std::chrono::milliseconds ttl) override;
   bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
                             bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;

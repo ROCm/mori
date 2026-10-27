@@ -43,6 +43,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "umbp/common/prefetch.h"
 #include "umbp/distributed/pool/pool_policy.h"
 #include "umbp/distributed/pool/tier_transition.h"
 
@@ -138,7 +139,17 @@ class PeerPool {
   // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
   // the coming read is served from DRAM. The SSD copy stays, and the oldest
   // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
-  size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes);
+  size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes,
+                  std::unordered_map<std::string, PrefetchCode>* failures = nullptr);
+  // The tracked API reports actual DRAM residency, including already-local
+  // hits, in input order. Budget eviction can downgrade an attempted copy.
+  std::vector<PrefetchKeyResult> PrefetchToDram(const std::vector<std::string>& keys,
+                                                uint64_t budget_bytes);
+  // Ordinary-resident remote copies use the policy's placement order, filtered
+  // to DRAM. SSD promotion still uses its source tier's promotion order.
+  std::vector<uint32_t> RemotePrefetchTargets(const std::string& key, uint64_t bytes) const;
+  void ProtectPrefetched(const std::vector<std::string>& keys,
+                         std::vector<PrefetchKeyResult>* results, std::chrono::milliseconds ttl);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.

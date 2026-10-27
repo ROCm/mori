@@ -38,6 +38,8 @@ enum class TierTransitionKind {
   kPromotion,
 };
 
+enum class TierTransitionFailure { kNone, kNoSource, kNoTarget, kNoSpace, kCopy, kCommit };
+
 struct TierTransitionResult {
   bool success = false;
   uint32_t target_backend_id = BackendRegistry::kMaxBackends;
@@ -49,6 +51,7 @@ struct TierTransitionResult {
   // Failed in a way that can clear (no space, or a copy/commit/read-back
   // error), so a later attempt may succeed.  False for a shape failure.
   bool retryable = false;
+  TierTransitionFailure failure = TierTransitionFailure::kNone;
 };
 
 // Executes one peer-local copy or move. Placement policy and scheduling remain
