@@ -274,6 +274,20 @@ struct PoolClientConfig {
   void* ranged_put_scratch_buffer = nullptr;
   size_t ranged_put_scratch_size = 0;
 
+  // The same arenas laid out by NUMA node instead: one registered buffer per
+  // node and direction, cut into `shards` like the single arena.  When given, a
+  // remote ranged call stages through the group on its caller buffer's node, the
+  // first group also serves callers whose node is unknown, and the single arenas
+  // above stay unset.
+  struct RangedScratchGroup {
+    void* buffer = nullptr;
+    size_t size = 0;
+    int numa_node = -1;
+    size_t shards = 1;
+  };
+  std::vector<RangedScratchGroup> ranged_get_scratch_groups;
+  std::vector<RangedScratchGroup> ranged_put_scratch_groups;
+
   // SSD staging pages per SsdBackend; 0 = the preset (SsdStagingPages).  Its
   // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
   int ssd_staging_buffer_slots = 0;

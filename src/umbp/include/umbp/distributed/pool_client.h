@@ -780,6 +780,26 @@ class PoolClient {
 
   ScratchArena ranged_get_scratch_;
   ScratchArena ranged_put_scratch_;
+
+  // The arenas of PoolClientConfig::ranged_*_scratch_groups, one per NUMA node.
+  struct ScratchGroup {
+    int numa_node = -1;
+    char* base = nullptr;
+    size_t size = 0;
+    std::unique_ptr<ScratchArena> arena;
+  };
+  std::vector<ScratchGroup> ranged_get_groups_;
+  std::vector<ScratchGroup> ranged_put_groups_;
+  struct ArenaRef {
+    ScratchArena* arena = nullptr;
+    char* base = nullptr;
+    size_t size = 0;
+  };
+  // The arena a remote ranged call stages through, given its first caller
+  // buffer: the group on that buffer's NUMA node when the arenas are laid out by
+  // node, else the single arena.  Its RDMA leg then uses that node's NICs, and
+  // the copy between the arena and a GPU stays on the GPU's socket.
+  ArenaRef RangedArenaFor(bool get, const void* caller_buffer);
   std::condition_variable recache_cv_;
   std::thread recache_worker_;
   bool recache_stop_ = false;

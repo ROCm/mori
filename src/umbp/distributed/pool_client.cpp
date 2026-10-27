@@ -1032,7 +1032,10 @@ bool PoolClient::Init() {
       std::any_of(backend_configs.begin(), backend_configs.end(), [](const auto& backend) {
         return backend.tier == TierType::DRAM && backend.dram.numa_nodes.size() > 1;
       });
-  if (numa_placement) {
+  // Arenas laid out by NUMA node are picked by the caller's GPU's node too.
+  const bool numa_scratch =
+      !config_.ranged_get_scratch_groups.empty() || !config_.ranged_put_scratch_groups.empty();
+  if (numa_placement || numa_scratch) {
     int count = 0;
     if (hipGetDeviceCount(&count) == hipSuccess) {
       for (int device = 0; device < count; ++device) {
@@ -1043,7 +1046,7 @@ bool PoolClient::Init() {
     }
     if (gpu_to_numa_.empty()) {
       MORI_UMBP_WARN(
-          "[PoolClient] NUMA tier configured but GPU affinity is unavailable; no steering");
+          "[PoolClient] NUMA placement configured but GPU affinity is unavailable; no steering");
     }
   }
   for (const auto& backend_config : backend_configs) {
@@ -1166,6 +1169,14 @@ bool PoolClient::Init() {
       hbm_engine_->AddHostGatherRegion(config_.ranged_put_scratch_buffer,
                                        config_.ranged_put_scratch_size);
     }
+    for (const auto* groups :
+         {&config_.ranged_get_scratch_groups, &config_.ranged_put_scratch_groups}) {
+      for (const auto& group : *groups) {
+        if (group.buffer != nullptr && group.size > 0) {
+          hbm_engine_->AddHostGatherRegion(group.buffer, group.size);
+        }
+      }
+    }
   }
 
   // Registration above covers the whole buffer; the shards below are slices of
@@ -1179,6 +1190,29 @@ bool PoolClient::Init() {
     MORI_UMBP_INFO("[PoolClient] ranged scratch: shards={} get_shard={}B put_shard={}B",
                    scratch_shards, ranged_get_scratch_.ShardBytes(),
                    ranged_put_scratch_.ShardBytes());
+  }
+  const auto make_groups = [](const std::vector<PoolClientConfig::RangedScratchGroup>& configured,
+                              std::vector<ScratchGroup>* out) {
+    out->clear();
+    for (const auto& group : configured) {
+      if (group.buffer == nullptr || group.size == 0) continue;
+      ScratchGroup made;
+      made.numa_node = group.numa_node;
+      made.base = static_cast<char*>(group.buffer);
+      made.size = group.size;
+      made.arena = std::make_unique<ScratchArena>();
+      made.arena->Reset(group.buffer, group.size, std::max<size_t>(group.shards, 1));
+      out->push_back(std::move(made));
+    }
+  };
+  make_groups(config_.ranged_get_scratch_groups, &ranged_get_groups_);
+  make_groups(config_.ranged_put_scratch_groups, &ranged_put_groups_);
+  for (const auto* groups : {&ranged_get_groups_, &ranged_put_groups_}) {
+    for (const auto& group : *groups) {
+      MORI_UMBP_INFO("[PoolClient] ranged {} scratch on NUMA node {}: {}B in {}B shards",
+                     groups == &ranged_get_groups_ ? "get" : "put", group.numa_node, group.size,
+                     group.arena->ShardBytes());
+    }
   }
   // The switches that decide how much of a ranged call is even reachable, said
   // once at startup so a run can assert which configuration it got.  An arm
@@ -1585,6 +1619,23 @@ int PoolClient::SourceNumaHint(const void* src, size_t size) const {
   const auto reg = FindRegisteredMemory(src, size);
   if (reg && reg->first.loc == mori::io::MemoryLocationType::CPU) return reg->first.mem.numaNode;
   return -1;
+}
+
+PoolClient::ArenaRef PoolClient::RangedArenaFor(bool get, const void* caller_buffer) {
+  const auto& groups = get ? ranged_get_groups_ : ranged_put_groups_;
+  if (!groups.empty()) {
+    const int node = caller_buffer != nullptr ? SourceNumaHint(caller_buffer, 1) : -1;
+    const auto it = std::find_if(groups.begin(), groups.end(),
+                                 [node](const ScratchGroup& g) { return g.numa_node == node; });
+    const ScratchGroup& group = it != groups.end() ? *it : groups.front();
+    return {group.arena.get(), group.base, group.size};
+  }
+  if (get) {
+    return {&ranged_get_scratch_, static_cast<char*>(config_.ranged_get_scratch_buffer),
+            config_.ranged_get_scratch_size};
+  }
+  return {&ranged_put_scratch_, static_cast<char*>(config_.ranged_put_scratch_buffer),
+          config_.ranged_put_scratch_size};
 }
 
 int PoolClient::PreferredNumaNodeFor(void* ptr, size_t size) const {
@@ -3749,9 +3800,17 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // GET has its own arena, so it overlaps a concurrent remote PUT (which uses
   // the separate PUT arena).  Sizing below is against ONE SHARD, not the whole
   // buffer: a unit that fits the buffer but not a shard would never get a slice.
-  char* const scratch_all = static_cast<char*>(config_.ranged_get_scratch_buffer);
-  if (scratch_all == nullptr || ranged_get_scratch_.ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, config_.ranged_get_scratch_size).has_value()) {
+  const void* caller_buffer = nullptr;
+  for (size_t index : missed) {
+    if (!dsts[index].empty()) {
+      caller_buffer = dsts[index].front();
+      break;
+    }
+  }
+  const ArenaRef arena = RangedArenaFor(/*get=*/true, caller_buffer);
+  char* const scratch_all = arena.base;
+  if (scratch_all == nullptr || arena.arena->ShardBytes() == 0 ||
+      !FindRegisteredMemory(scratch_all, arena.size).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
     return results;
   }
@@ -3767,8 +3826,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // even the full arena is no better off exclusive, so it must not answer for
   // the others: taking the max let one such key veto exclusivity for a
   // batch-mate that needed it and would have fitted.
-  const size_t shard_bytes = ranged_get_scratch_.ShardBytes();
-  const size_t full_bytes = config_.ranged_get_scratch_size;
+  const size_t shard_bytes = arena.arena->ShardBytes();
+  const size_t full_bytes = arena.size;
   bool exclusive_arena = false;
   for (size_t index : missed) {
     size_t key_total = 0;
@@ -3908,8 +3967,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease =
-        exclusive_arena ? ranged_get_scratch_.AcquireAll() : ranged_get_scratch_.Acquire();
+    scratch_lease = exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire();
   }
   char* const scratch_base = scratch_lease.base();
   // The arena described ONCE, by its registered base.  Plans key on (src base,
@@ -4191,9 +4249,17 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // so this is the one direction that needs the arena.  PUT has its own arena,
   // so it overlaps a concurrent remote GET (which uses the separate GET arena).
   // Sizing is against ONE SHARD; see the GET path for why.
-  char* const scratch_all = static_cast<char*>(config_.ranged_put_scratch_buffer);
-  if (scratch_all == nullptr || ranged_put_scratch_.ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, config_.ranged_put_scratch_size).has_value()) {
+  const void* caller_buffer = nullptr;
+  for (size_t r : remote) {
+    if (!srcs[valid[r]].empty()) {
+      caller_buffer = srcs[valid[r]].front();
+      break;
+    }
+  }
+  const ArenaRef arena = RangedArenaFor(/*get=*/false, caller_buffer);
+  char* const scratch_all = arena.base;
+  if (scratch_all == nullptr || arena.arena->ShardBytes() == 0 ||
+      !FindRegisteredMemory(scratch_all, arena.size).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
@@ -4202,8 +4268,8 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // the get path spells out: a batch-wide max lets an object too big for the
   // whole arena veto exclusivity for one that needed it, and that one then gets
   // rejected at shard size though it was servable before sharding existed.
-  const size_t put_shard_bytes = ranged_put_scratch_.ShardBytes();
-  const size_t put_full_bytes = config_.ranged_put_scratch_size;
+  const size_t put_shard_bytes = arena.arena->ShardBytes();
+  const size_t put_full_bytes = arena.size;
   bool exclusive_arena = false;
   for (size_t r : remote) {
     const size_t object_size = object_sizes[valid[r]];
@@ -4216,8 +4282,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease =
-        exclusive_arena ? ranged_put_scratch_.AcquireAll() : ranged_put_scratch_.Acquire();
+    scratch_lease = exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire();
   }
   char* const scratch_base = scratch_lease.base();
   // The arena named once, by its registered base -- the read side's reason
