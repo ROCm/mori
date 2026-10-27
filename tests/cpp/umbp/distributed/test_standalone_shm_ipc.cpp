@@ -1141,5 +1141,87 @@ TEST(StandaloneShmIpcTest, DisablingKeyHandlesAlsoStopsTheServerRemembering) {
   unlink(fd_path.c_str());
 }
 
+TEST(StandaloneShmIpcTest, AsyncPrefetchPreservesRouterWireAndEngineIo) {
+  const std::string address = "unix:///tmp/umbp_prefetch_" + std::to_string(getpid()) + ".sock";
+  UMBPConfig config;
+  config.dram.capacity_bytes = 4 << 20;
+  config.ssd.enabled = false;
+  UMBPStandaloneProcessConfig standalone_config;
+  standalone_config.address = address;
+  config.standalone_process = standalone_config;
+  standalone::StandaloneServer server(config, address);
+  ASSERT_TRUE(server.Start());
+  auto client = CreateUMBPClient(config);
+  ASSERT_TRUE(client->SupportsAsyncPrefetch());
+  HostMemAllocator allocator;
+  HostBufferOptions options;
+  options.backing = HostBufferBacking::kAnonymousShm;
+  auto memory = allocator.Alloc(4096, options);
+  ASSERT_TRUE(memory.valid());
+  const auto ptr = reinterpret_cast<uintptr_t>(memory.ptr);
+  ASSERT_TRUE(client->RegisterMemory(ptr, memory.mapped_size));
+  std::memset(memory.ptr, 0x6b, 4096);
+  ASSERT_TRUE(client->Put("resident", ptr, 4096));
+
+  auto stub = ::umbp::UMBPStandalone::NewStub(
+      grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+  ::umbp::Empty empty;
+  ::umbp::PingResponse ping;
+  grpc::ClientContext ping_context;
+  ASSERT_TRUE(stub->Ping(&ping_context, empty, &ping).ok());
+  EXPECT_TRUE(ping.supports_async_prefetch());
+  EXPECT_EQ(ping.prefetch_hint_version(), 1u);
+
+  // Hand-encoded bytes from the deployed Router's fields: key=resident,
+  // key=missing, key=resident, lease=1000, timeout=2000, request_id=router.
+  const unsigned char wire[] = {0x0a, 8,    'r',  'e', 's', 'i', 'd', 'e',  'n',  't',  0x0a,
+                                7,    'm',  'i',  's', 's', 'i', 'n', 'g',  0x0a, 8,    'r',
+                                'e',  's',  'i',  'd', 'e', 'n', 't', 0x10, 0xe8, 0x07, 0x18,
+                                0xd0, 0x0f, 0x22, 6,   'r', 'o', 'u', 't',  'e',  'r'};
+  ::umbp::PrefetchRequest request;
+  ASSERT_TRUE(request.ParseFromArray(wire, sizeof(wire)));
+  ::umbp::BatchKeysRequest obsolete_sync;
+  ASSERT_TRUE(obsolete_sync.ParseFromArray(wire, sizeof(wire)));
+  ::umbp::CountResponse obsolete_response;
+  grpc::ClientContext obsolete_context;
+  EXPECT_EQ(stub->BatchPrefetch(&obsolete_context, obsolete_sync, &obsolete_response).error_code(),
+            grpc::StatusCode::INVALID_ARGUMENT);
+  grpc::ClientContext submit_context;
+  ::umbp::PrefetchSubmitResponse submitted;
+  ASSERT_TRUE(stub->SubmitPrefetch(&submit_context, request, &submitted).ok());
+  ASSERT_TRUE(submitted.accepted()) << submitted.error();
+  EXPECT_EQ(submitted.request_id(), "router");
+  PrefetchStatus status;
+  for (int i = 0; i < 200; ++i) {
+    status = client->GetPrefetchStatus("router");
+    if (PrefetchTerminal(status.state)) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(status.state, PrefetchState::kPartial);
+  ASSERT_EQ(status.results.size(), 3u);
+  EXPECT_EQ(status.completed_keys, 2u);
+  EXPECT_TRUE(status.results[0].Ready());
+  EXPECT_EQ(status.results[1].code, PrefetchCode::kMissing);
+  EXPECT_TRUE(status.results[2].Ready());
+  EXPECT_GT(status.lease_remaining_ms, 0u);
+  EXPECT_TRUE(client
+                  ->SubmitPrefetch(
+                      {"resident", "missing", "resident"},
+                      {std::chrono::milliseconds(1000), std::chrono::milliseconds(2000)}, "router")
+                  .accepted);
+  EXPECT_FALSE(client->SubmitPrefetch({"different"}, {}, "router").accepted);
+  EXPECT_EQ(client->BatchPrefetch({"resident"}), 1u);
+  std::memset(memory.ptr, 0, 4096);
+  EXPECT_EQ(client->BatchGetRanges({"resident"}, {{ptr}}, {{4096}}, {{0}}),
+            std::vector<bool>{true});
+  EXPECT_EQ(static_cast<unsigned char*>(memory.ptr)[2048], 0x6b);
+  EXPECT_TRUE(client->Clear());
+  EXPECT_EQ(client->GetPrefetchStatus("router").state, PrefetchState::kFailed);
+  client->DeregisterMemory(ptr);
+  client->Close();
+  allocator.Free(memory);
+  server.Shutdown();
+}
+
 }  // namespace
 }  // namespace mori::umbp
