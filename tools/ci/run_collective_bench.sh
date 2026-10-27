@@ -110,7 +110,9 @@ rs_timing_table() {
       if (!cnt[name, s]) return "-"
       return sprintf("%.2f / %.2f", sum[name, s] / cnt[name, s], mx[name, s])
     }
-    !/\[RS-T / { next }
+    # Device printf (stdout) and the host PASS line (stderr) share the log, so a
+    # line can be cut by the other stream: only take lines ending in " us".
+    !/\[RS-T / || !/ us( \(seen by blk[0-9]+\))?$/ { next }
     / S=[0-9]+ grid=/ {
       S = num("S"); grid = num("grid"); acc("barrier", 0, num("barrier")); acc("issue", 0, num("issue"))
       next
