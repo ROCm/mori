@@ -25,6 +25,7 @@
 // byte budget.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <string>
@@ -67,8 +68,31 @@ TEST(LruMasterEvictStrategy, PicksOldestFirstUntilBudgetMet) {
   ASSERT_EQ(victims.count("n1"), 1u);
   // Oldest-first: a, then b; c (newest) is spared once the 150-byte budget met.
   ASSERT_EQ(victims["n1"].size(), 2u);
-  EXPECT_EQ(victims["n1"][0], "a");
-  EXPECT_EQ(victims["n1"][1], "b");
+  EXPECT_EQ(victims["n1"][0].key, "a");
+  EXPECT_EQ(victims["n1"][1].key, "b");
+}
+
+TEST(LruMasterEvictStrategy, KeyOverBudgetInTwoTiersIsOneVictimPerTier) {
+  // A key in DRAM and SSD, both over budget: one victim per (key, tier), each
+  // carrying the tier its copy was charged to.
+  LruMasterEvictStrategy strategy;
+  auto now = Clock::now();
+  std::vector<EvictionCandidate> candidates = {
+      MakeCandidate("k", "n1", TierType::DRAM, 100, now - std::chrono::seconds(1)),
+      MakeCandidate("k", "n1", TierType::SSD, 100, now - std::chrono::seconds(1)),
+  };
+  std::unordered_map<std::string, std::map<TierType, int64_t>> budget;
+  budget["n1"][TierType::DRAM] = 100;
+  budget["n1"][TierType::SSD] = 100;
+
+  auto victims = strategy.SelectVictims(candidates, budget);
+  ASSERT_EQ(victims["n1"].size(), 2u);
+  EXPECT_NE(
+      std::find(victims["n1"].begin(), victims["n1"].end(), EvictionVictim{"k", TierType::DRAM}),
+      victims["n1"].end());
+  EXPECT_NE(
+      std::find(victims["n1"].begin(), victims["n1"].end(), EvictionVictim{"k", TierType::SSD}),
+      victims["n1"].end());
 }
 
 TEST(LruMasterEvictStrategy, HonoursPerNodeTierBudgetIndependently) {
@@ -85,9 +109,9 @@ TEST(LruMasterEvictStrategy, HonoursPerNodeTierBudgetIndependently) {
 
   auto victims = strategy.SelectVictims(candidates, budget);
   ASSERT_EQ(victims["n1"].size(), 1u);
-  EXPECT_EQ(victims["n1"][0], "n1-old");
+  EXPECT_EQ(victims["n1"][0].key, "n1-old");
   ASSERT_EQ(victims["n2"].size(), 1u);
-  EXPECT_EQ(victims["n2"][0], "n2-old");
+  EXPECT_EQ(victims["n2"][0].key, "n2-old");
 }
 
 TEST(LruMasterEvictStrategy, SkipsTiersWithNoBudget) {

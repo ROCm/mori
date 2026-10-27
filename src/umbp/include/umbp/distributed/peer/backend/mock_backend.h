@@ -156,9 +156,13 @@ class MockBackend : public MediumBackend {
     return out;
   }
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override {
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
     (void)allow_file_refs;  // this mock stages everything; it publishes no file refs
+    (void)reader;           // ...and its map entries never move under a reader
+    (void)extents;          // ...and always publishes the whole object
     std::vector<ResolvedEntry> out(keys.size());
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {

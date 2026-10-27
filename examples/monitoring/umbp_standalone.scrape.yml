@@ -1,0 +1,16 @@
+# Prometheus scrape fragment for a MASTERLESS UMBP node, where the standalone
+# server serves its own metrics instead of reporting them to a master.
+# Drop this file into the directory pointed to by `scrape_config_files`
+# in your prometheus.yml (requires Prometheus >= 2.43).
+#
+# The port is 9092, not the master's 9091, so a node running both is scraped
+# twice without the two processes contending for one port. It follows
+# UMBP_STANDALONE_METRICS_PORT; change the target here if you change that.
+#
+# Every series a standalone server publishes already carries a `node` label
+# (the server stamps the one the master used to add on ingest), so listing
+# several nodes here keeps them as separate series rather than collapsing them.
+scrape_configs:
+  - job_name: umbp_standalone
+    static_configs:
+      - targets: ['127.0.0.1:9092']

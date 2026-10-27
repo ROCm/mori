@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -40,63 +41,17 @@
 
 namespace mori::umbp {
 
-// SSD as a MediumBackend, staged through registered host DRAM.
-//
-// WHY STAGED, AND NOT A FileRef.  transfer_engine.h reserves a file endpoint
-// for exactly this backend ("SsdBackend is what needs a FileRef, so SsdBackend
-// brings it").  This implementation deliberately does NOT take that option, and
-// the reason is worth stating because it is the whole design:
-//
-//   SSD bytes are not addressable.  Every endpoint UMBP moves bytes between is
-//   a memory range — a raw pointer locally, an RDMA MR remotely.  A file offset
-//   is neither.  Two ways to close that gap:
-//
-//     (a) teach the transfer layer a file endpoint — a new TransferRef kind, a
-//         PosixFileEngine, and CHAINING in CompositeTransferEngine for the
-//         remote reader (file -> bounce -> wire), which that class explicitly
-//         does not implement today;
-//     (b) make the SSD's published endpoint ordinary registered host memory,
-//         and move bytes between it and the device inside the backend.
-//
-//   (b) is what this class does.  The cost is a host-DRAM copy on each side;
-//   the benefit is that SSD reaches the data plane with ZERO new transfer-layer
-//   concepts — no new endpoint kind, no new engine, no chaining — and a remote
-//   peer reading from this node's SSD sees a perfectly ordinary registered
-//   buffer and needs no code at all.  A FileRef backend remains the right
-//   answer for a zero-copy / GDS path; it is a strictly larger change and this
-//   one does not block it.
-//
-// SO: THE STAGING ARENA IS THE MEDIUM, as far as everything outside this class
-// is concerned.  The pages this backend publishes are host DRAM.  What makes it
-// SSD is where the bytes live BETWEEN a Commit and the next Resolve, which is
-// the only window in which a cache tier's capacity actually means anything.
-//
-// LIFECYCLE OF A PUT
-//   1. BatchAllocate(key, size) reserves a staging page and publishes it.
-//   2. The writer RDMAs (or memcpys) into that page — normal data plane, no
-//      SSD awareness anywhere.
-//   3. BatchCommit spills the staging page to the SSD via PeerSsdManager::Write,
-//      frees the page, and queues an ADD event.  The staging page is NOT the
-//      key's home; it is borrowed for the duration of the write.
-//
-// LIFECYCLE OF A GET
-//   1. BatchResolve fills a staging page from the SSD (PeerSsdManager::
-//      PrepareRead) and publishes that page under a READ LEASE.
-//   2. The reader moves bytes out of it, exactly as it would from DRAM.
-//   3. The reaper frees the staging page when the lease expires.
-//
-//   This is the one place SSD's asymmetry with DRAM shows through the
-//   interface: a Resolve does real IO and can fail, and it consumes a scarce
-//   resource (staging pages) that a DRAM resolve does not.  A transient
-//   shortfall is reported as kBusy, after rolling back every reservation made
-//   by that backend batch.  PoolClient retries the whole response so no page
-//   location survives across attempts.  A batch whose own working set exceeds
-//   the arena is kFailed instead: unchanged retries can never make it fit.
-//
-// A key may span several staging pages.  Runs are contiguous inside the one
-// registered arena because PeerSsdManager::PrepareRead takes one (ptr,
-// capacity), while AllocateResult / ResolvedEntry publish every page so the
-// ordinary transfer path can address the object at page granularity.
+// SSD as a MediumBackend.  Bytes reach the drive one of two ways:
+//   * in place, through a File TransferRef that a local file engine moves
+//     (PosixEngine for tier migrations, GdsEngine for reads into the GPU);
+//   * through the staging arena, registered host DRAM a remote peer can RDMA:
+//     Allocate lends pages and Commit writes them out; Resolve fills pages under
+//     a read lease (a remote reader) or a hold (a local one, see ResolveReader).
+//     A remote batch is staged all or nothing: kBusy while the arena is full,
+//     kFailed if it can never fit.  A local batch is staged up to half the
+//     arena and the rest is kBusy.  A key's pages are one contiguous run of the
+//     arena.  A staged page goes back once its lease has expired and no hold is
+//     left: at the next reaper sweep, or at once when the arena is short.
 class SsdBackend : public MediumBackend {
  public:
   struct Config {
@@ -161,12 +116,19 @@ class SsdBackend : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false) override;
-  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved) override;
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override;
+  bool AcquireMigrationRead(const std::string& key, ResolvedEntry* resolved,
+                            bool allow_file_ref) override;
   void ReleaseMigrationRead(const std::string& key) override;
   bool Contains(const std::string& key) const override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
+  // The manager's order (the file tier's segment order, or its LRU) minus keys
+  // a staged or migration read holds.
+  std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
+  bool OwnsEvictionOrder() const override;
 
   void SetAutoFlushHook(size_t threshold, std::function<void()> cb) override;
 
@@ -192,25 +154,61 @@ class SsdBackend : public MediumBackend {
     uint32_t page_count = 0;
   };
 
-  // A contiguous staging span borrowed for a write (pending slot) or read.
+  // A write in flight: a staging span, or a reserved file range (`record`)
+  // that a local file engine fills directly.
   struct PendingSlot {
     uint64_t slot_id = 0;
     std::string key;
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point deadline;
+    std::optional<RecordReservation> record;
   };
 
   struct ReadLease {
     StagingSpan span;
     uint64_t size = 0;
     std::chrono::steady_clock::time_point expires_at;
+    std::shared_ptr<const void> hold;  // copied into each kLocal hit
   };
 
+  // A lease ClearLocal took while a local reader still held it; freed once
+  // those holds are gone.
+  struct ExtentStage {
+    StagingSpan span;
+    ObjectExtent window;
+    std::shared_ptr<const void> hold;
+  };
+
+  // Spans handed back by their last hold, on their own lock so a reader never
+  // waits on mutex_ to return one.
+  struct ReturnedSpans {
+    std::mutex mu;
+    std::vector<StagingSpan> spans;
+    std::atomic<size_t> count{0};
+    void Return(StagingSpan span);
+  };
+
+  // The hold on a span holding only object bytes `window` (D1): it goes back
+  // when the last reader drops it.
+  struct ExtentHold {
+    ExtentHold(std::shared_ptr<ReturnedSpans> to, StagingSpan s) : sink(std::move(to)), span(s) {}
+    ~ExtentHold() { sink->Return(span); }
+    std::shared_ptr<ReturnedSpans> sink;
+    StagingSpan span;
+  };
+  static constexpr uint64_t kExtentAlign = 4096;  // the SSD record alignment
+
   // Caller MUST hold mutex_.  A zero-length result means no contiguous run of
-  // the requested size is currently available.
+  // the requested size is currently available, even after reclaiming leases.
   StagingSpan AcquireStagingSpanLocked(uint32_t page_count);
   void ReleaseStagingSpanLocked(StagingSpan span);
+  // Caller MUST hold mutex_.  Frees every returned span, every read lease that
+  // has expired and has no hold left, and every extent stage with no hold left;
+  // returns how many.
+  size_t ReclaimReadLeasesLocked(std::chrono::steady_clock::time_point now);
+  // Caller MUST hold mutex_.  Frees the spans in returned_; returns how many.
+  size_t DrainReturnedSpansLocked();
 
   // Local address of a staging page.  Valid after Init.
   void* StagingPagePtr(uint32_t page_index) const;
@@ -218,8 +216,10 @@ class SsdBackend : public MediumBackend {
   // hipFile handle for a segment fd, obtained lazily from the registrar's file
   // engine (GdsEngine) and shared by every key on that segment.  Returns nullptr
   // when no file engine is configured; that result is cached so a fd is probed
-  // at most once.  Deregistered in Shutdown.
+  // at most once.  Deregistered in Shutdown, or when the tier deletes the
+  // segment (DropGdsHandle), before the fd number can be reused.
   void* GdsHandleForFd(int fd);
+  void DropGdsHandle(int fd);
 
   // Caller MUST hold mutex_.  Bumps the unshipped-event count and fires the
   // auto-flush hook once it crosses the threshold.
@@ -245,10 +245,14 @@ class SsdBackend : public MediumBackend {
   TransferRef buffer_ref_;
   std::vector<uint8_t> buffer_desc_;
   std::vector<bool> staging_page_used_;
+  uint32_t staging_cursor_ = 0;  // next-fit: where the last span search stopped
+  std::shared_ptr<ReturnedSpans> returned_ = std::make_shared<ReturnedSpans>();
 
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, ReadLease> read_leases_;
   std::unordered_map<std::string, ReadLease> migration_reads_;
+  std::vector<ExtentStage> extent_stages_;
+  bool extent_staging_ = false;  // set at Init (UMBP_SSD_EXTENT_STAGING)
 
   // Opt-in switch (UMBP_ENABLE_GDS=1): route SSD reads of O_DIRECT records
   // through the file->GPU GdsEngine instead of the staging arena.  Off by
@@ -275,11 +279,20 @@ class SsdBackend : public MediumBackend {
   // slot_full_rejects_ is the one to watch: it counts resolve batches that
   // returned BUSY because the arena was temporarily full.
   std::atomic<uint64_t> slot_full_rejects_{0};
+  // Puts refused because the arena had no span for them.  The master routes
+  // the next put the same way, so without this a full arena fails puts silently.
+  std::atomic<uint64_t> put_full_rejects_{0};
   std::atomic<uint64_t> staging_expired_reclaims_{0};
+  std::atomic<uint64_t> extent_stages_total_{0};  // extent-scoped device reads
+  std::atomic<uint64_t> extent_stage_bytes_{0};   // their window bytes
+  // Migration pins (a source read, or a target after commit): file range or staging.
+  std::atomic<uint64_t> migrations_in_place_{0};
+  std::atomic<uint64_t> migrations_staged_{0};
   // Live arena occupancy, mirrored out of staging_page_used_ so SampleMetrics
   // can read it without taking mutex_ (the metrics tick must never contend with
   // a read).
   std::atomic<uint64_t> staging_pages_in_use_{0};
+  std::atomic<uint64_t> staging_pages_peak_{0};  // written under mutex_
   bool initialized_ = false;
   MemoryRegistrar* registrar_ = nullptr;
 

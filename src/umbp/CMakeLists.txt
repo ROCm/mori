@@ -384,6 +384,8 @@ add_library(
   distributed/routing/route_get_strategy.cpp
   distributed/routing/route_put_strategy.cpp
   distributed/metrics/component_metrics.cpp
+  distributed/metrics/prometheus_metric_sink.cpp
+  distributed/metrics/activity_summary.cpp
   distributed/peer/backend/page_backend.cpp
   distributed/peer/backend/hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
@@ -392,9 +394,9 @@ add_library(
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp
   distributed/transfer/hbm_copy_engine.cpp
+  distributed/transfer/posix_engine.cpp
   distributed/transfer/composite_transfer_engine.cpp
   distributed/peer/ssd/peer_ssd_manager.cpp
-  distributed/peer/ssd/ssd_copy_pipeline.cpp
   distributed/pool/policy_config.cpp
   distributed/pool/tier_graph.cpp
   distributed/pool/tier_transition.cpp
@@ -445,6 +447,9 @@ target_compile_features(umbp_common PUBLIC cxx_std_17)
 # costs nothing where it does not.
 # GLOBAL so tests/cpp/umbp/distributed can still gate test_gds_engine on the
 # same target; nothing links it.
+#
+# hipFile (https://github.com/ROCm/hipFile, MIT License) is the work of its
+# authors and contributors; see the acknowledgement in gds_engine.h.
 find_package(hipfile QUIET CONFIG GLOBAL)
 if(TARGET hip::hipfile)
   message(STATUS "[UMBP] hipfile headers found — GDS transfer engine ENABLED "

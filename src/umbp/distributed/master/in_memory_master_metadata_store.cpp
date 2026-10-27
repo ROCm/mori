@@ -351,10 +351,14 @@ HeartbeatResult InMemoryMasterMetadataStore::ApplyHeartbeat(
     // re-baselines last_applied_seq.
     if (!is_full_sync && seq != record.last_applied_seq + 1) {
       // SEQ_GAP: keep the node alive (it IS heartbeating, just mid-recovery) but
-      // do NOT advance caps or last_applied_seq. See hazard #1.
-      MORI_UMBP_WARN(
-          "[MetadataStore] Heartbeat seq gap from {}: got {}, expected {} — requesting full sync",
-          node_id, seq, record.last_applied_seq + 1);
+      // do NOT advance caps or last_applied_seq. See hazard #1.  Seq 0 is the
+      // keepalive an idle node sends every heartbeat, which is no gap at all.
+      if (seq != 0) {
+        MORI_UMBP_WARN(
+            "[MetadataStore] Heartbeat seq gap from {}: got {}, expected {} — requesting full "
+            "sync",
+            node_id, seq, record.last_applied_seq + 1);
+      }
       record.last_heartbeat = now;
       record.status = ClientStatus::ALIVE;
       return HeartbeatResult{HeartbeatResult::SEQ_GAP, record.last_applied_seq};
@@ -544,6 +548,23 @@ std::vector<std::vector<Location>> InMemoryMasterMetadataStore::BatchLookupBlock
     for (size_t i : idx_by_shard[si]) resolve_one(sh, i);
   }
   return out;
+}
+
+void InMemoryMasterMetadataStore::RecordLocalReads(const std::vector<std::string>& keys,
+                                                   std::chrono::system_clock::time_point now) {
+  if (keys.empty()) return;
+  // An access bump is atomic, so the shard's shared lock is enough.
+  std::vector<std::vector<size_t>> idx_by_shard(num_shards_);
+  for (size_t i = 0; i < keys.size(); ++i) idx_by_shard[shard_index(keys[i])].push_back(i);
+  for (size_t si = 0; si < num_shards_; ++si) {
+    if (idx_by_shard[si].empty()) continue;
+    auto& sh = shard_at(si);
+    std::shared_lock lock(sh.mutex);
+    for (size_t i : idx_by_shard[si]) {
+      auto it = sh.entries.find(keys[i]);
+      if (it != sh.entries.end()) it->second.RecordAccessAtomic(now);
+    }
+  }
 }
 
 std::vector<bool> InMemoryMasterMetadataStore::BatchExistsBlock(

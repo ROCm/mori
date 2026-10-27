@@ -57,8 +57,6 @@ class ProxyShmRegion {
   void Detach();
 
   bool IsValid() const { return base_ != nullptr; }
-  bool IsServer() const { return is_server_; }
-  bool IsHugepage() const { return is_hugepage_; }
 
   // Access the header
   ProxyShmHeader* Header() { return static_cast<ProxyShmHeader*>(base_); }
@@ -80,13 +78,6 @@ class ProxyShmRegion {
   size_t Size() const { return size_; }
 
   // ---- Lifecycle helpers (static, for use before attach) ----
-
-  // Probe whether a live proxy already owns SHM |name|.
-  //   1 = proxy alive and READY
-  //   0 = no SHM or proxy is dead
-  //  -1 = proxy alive but not READY yet
-  //  -2 = proxy alive but protocol version mismatches
-  static int ProbeExisting(const std::string& name);
 
   // Forcefully unlink any stale SHM (hugepage file + shm_open).
   static void CleanupStale(const std::string& name);

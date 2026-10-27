@@ -19,13 +19,18 @@ target_link_libraries(test_umbp_ssd_tier_ranges PRIVATE umbp_core GTest::gtest_m
 target_compile_features(test_umbp_ssd_tier_ranges PRIVATE cxx_std_17)
 add_test(NAME umbp_ssd_tier_ranges COMMAND test_umbp_ssd_tier_ranges)
 
+add_executable(test_umbp_ssd_segment_reclaim test_ssd_segment_reclaim.cpp)
+target_link_libraries(test_umbp_ssd_segment_reclaim PRIVATE umbp_core GTest::gtest_main)
+target_compile_features(test_umbp_ssd_segment_reclaim PRIVATE cxx_std_17)
+add_test(NAME umbp_ssd_segment_reclaim COMMAND test_umbp_ssd_segment_reclaim)
+
 add_executable(test_segment_crc test_segment_crc.cpp)
 target_link_libraries(test_segment_crc PRIVATE umbp_core)
 add_test(NAME test_segment_crc COMMAND test_segment_crc)
 
 add_executable(test_sharded_ssd_tier test_sharded_ssd_tier.cpp)
 target_link_libraries(test_sharded_ssd_tier PRIVATE umbp_core)
-add_test(NAME test_sharded_ssd_tier COMMAND test_sharded_ssd_tier)
+add_test(NAME umbp_sharded_ssd_tier COMMAND test_sharded_ssd_tier)
 
 add_executable(test_ssd_direct_io test_ssd_direct_io.cpp)
 target_link_libraries(test_ssd_direct_io PRIVATE umbp_core)

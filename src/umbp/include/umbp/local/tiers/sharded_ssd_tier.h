@@ -78,10 +78,17 @@ class ShardedSsdTier : public TierBackend {
   TierCapabilities Capabilities() const override;
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
-  std::optional<std::string> GetLocationId(const std::string& key) const override;
-  std::optional<RecordLocation> LocateRecord(const std::string& key) const override;
+  // The fullest drive's order first, then the next fullest: the drive closest
+  // to full is the one that has to give space back.
+  std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  void SetRetiredFileHook(std::function<void(int fd)> on_close,
+                          std::chrono::milliseconds grace) override;
+  TierSpaceStats SpaceStats() const override;
+  std::optional<RecordLocation> LocateRecord(const std::string& key) override;
+  std::optional<RecordReservation> ReserveRecord(const std::string& key, size_t size) override;
+  bool CommitRecord(const std::string& key, const RecordReservation& r) override;
+  void AbortRecord(const std::string& key, const RecordReservation& r) override;
   bool Flush() override;
-  void SetColdRead(bool enable) override;
 
   // Parallel across shards: keys are bucketed by their (assigned or resolved)
   // shard and each bucket is handed to its own worker.  This is the whole point
@@ -97,8 +104,19 @@ class ShardedSsdTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  // Like BatchReadIntoPtr: one call per shard, all shards at once.
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
 
  private:
+  // Bucket a read batch by shard, run op(shard, key indices) on every busy
+  // shard at once, and log the fan-out as `label`; key_bytes[i] is key i's.
+  template <typename ShardOp>
+  std::vector<bool> FanOutRead(const char* label, const std::vector<std::string>& keys,
+                               const std::vector<size_t>& key_bytes, ShardOp&& op);
+
   // Shard for a new key of @p size: the one with the most projected free space
   // that can still fit it, or -1 when none can.  Caller holds map_mu_ exclusively
   // and passes the projected reservation through free_hint_ (see ReserveLocked).
@@ -113,6 +131,12 @@ class ShardedSsdTier : public TierBackend {
   // balance, never correctness.
   void ReserveLocked(int shard, size_t size);
   void ReleaseLocked(int shard, size_t size);
+  // Re-reads every shard's usage into used_hint_ before a placement.  A drive's
+  // disk use only drops when a whole segment goes, so a hint kept up by adding
+  // and subtracting value sizes drifts away from what the drive can take.
+  void RefreshHintsLocked();
+  // Drops the placement of a key its shard no longer holds (a failed write).
+  void ForgetIfGone(const std::string& key, int shard);
 
   // Shard assignment + the byte count needed to release the placement hint on
   // evict, so eviction never has to re-read a key just to learn its size.

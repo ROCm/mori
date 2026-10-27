@@ -105,13 +105,8 @@ class HbmCopyEngine final : public TransferEngine {
   // Both endpoints addressable in this process, at least one of them GPU.
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
 
-  // Group by (src base, dst base) and coalesce exactly-contiguous segments —
-  // same shape as LocalCopyEngine::Plan, and it pays MORE here.  Each hipMemcpy
-  // carries a fixed launch/synchronization cost that a memcpy does not, so
-  // collapsing a run of adjacent pages into one call removes real overhead
-  // rather than just loop iterations.  This is the concrete instance of the
-  // reason Plan() is virtual rather than a base-class helper.
-  TransferPlanSet Plan(const std::vector<TransferItem>& items) const override;
+  // One plan per buffer pair, contiguous segments merged (each hipMemcpy has a
+  // launch cost); a segment never crosses a host registration piece.
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
 
   // Performs the copies inline; the returned handle is already settled.
@@ -125,6 +120,25 @@ class HbmCopyEngine final : public TransferEngine {
   // worker threads concurrently — cost with no matching win at KV-block sizes,
   // where a multi-MiB copy dwarfs the per-call launch overhead.
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
+
+  // Gather streams created since process start, across all engines.  They are
+  // pooled per device and outlive the thread that first used them, so this
+  // tracks the peak number of gathers in flight at once, not the number of
+  // threads that have called Submit.  Lets a test assert the reuse.
+  static uint64_t GatherStreamsCreated();
+
+  // Creates `gather_streams_per_device` gather streams on every GPU, runs an
+  // empty gather on each and a hipMemcpy each way on the null stream, so that
+  // the hardware queues (compute, and SDMA for each copy engine those copies
+  // are given), descriptor staging and kernel code object that copies would
+  // otherwise create on first use already exist.  It also caps each device at
+  // that many gather streams, so that later gathers wait for one rather than
+  // create more.  Call it before serving.  Creating a hardware queue migrates
+  // its context-save area into VRAM, and with the GPU nearly full, as it is
+  // next to an inference server, that has been seen to stall the whole process
+  // for 30-46 s at a time (amdgpu 6.16); so has loading the kernel's code
+  // object on its first launch.
+  static void Prewarm(size_t gather_streams_per_device);
 
  private:
   // Why a plan did not take the gather kernel.  The hot path never computes

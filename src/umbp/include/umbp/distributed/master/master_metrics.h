@@ -174,12 +174,28 @@
 #define MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP \
   "Bytes moved to an earlier tier by promote-on-read"
 
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES "mori_umbp_client_tier_move_read_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES_HELP \
+  "Bytes tier moves read off each source medium (not in resolve bytes)"
+
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES "mori_umbp_client_tier_move_write_bytes_total"
+#define MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES_HELP \
+  "Bytes tier moves wrote into each target medium (already in commit bytes)"
+
 // Labelled by logical tier, so which tier served a read stays visible even
 // though the per-backend labels collapse every instance of a medium into one
 // series.
 #define MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS "mori_umbp_client_tier_read_hits_total"
 #define MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP \
   "Reads served by each logical tier of this client's pool"
+
+// --- Local watermark eviction ----------------------------------------------
+// event=round|key|no_candidate|stalled|master_key (LocalEvictionMetrics); bytes
+// freed are in the backend evict series.
+
+#define MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT "mori_umbp_client_local_evict_total"
+#define MORI_UMBP_METRIC_CLIENT_LOCAL_EVICT_HELP \
+  "Local watermark eviction on this client's pool, by event"
 
 // --- Per-client RPC call counters ------------------------------------------
 // Full name: prefix + sanitized_node_id

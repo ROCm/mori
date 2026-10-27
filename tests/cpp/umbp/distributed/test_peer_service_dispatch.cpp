@@ -155,6 +155,39 @@ TEST_F(PeerServiceDispatchTest, AllocateRoutesToTheBackendForItsTier) {
   EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 0u);
 }
 
+// A second writer of a key whose slot is still pending must hear that the key
+// is in flight, not a plain FAILED: a local put counts it as stored, and a
+// remote writer has to be able to do the same.
+TEST_F(PeerServiceDispatchTest, AllocateOfAKeyAnotherWriterHoldsReportsInFlight) {
+  auto held = Allocate("held", 16, kFirstByTier);
+  ASSERT_EQ(held.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+
+  EXPECT_EQ(Allocate("held", 16, kFirstByTier).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT);
+
+  ASSERT_TRUE(Commit(held.slot_id(), "held"));
+  EXPECT_EQ(Allocate("held", 16, kFirstByTier).outcome(),
+            ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS);
+}
+
+TEST_F(PeerServiceDispatchTest, BatchAllocateReportsInFlightPerEntry) {
+  auto held = Allocate("held", 16, kFirstByTier);
+  ASSERT_EQ(held.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+
+  ::umbp::BatchAllocateSlotsRequest req;
+  for (const char* key : {"held", "fresh"}) {
+    auto* entry = req.add_entries();
+    entry->set_key(key);
+    entry->set_size(16);
+    entry->set_tier(Proto(kFirstByTier));
+  }
+  ::umbp::BatchAllocateSlotsResponse resp;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->BatchAllocateSlots(&ctx, req, &resp).ok());
+  ASSERT_EQ(resp.entries_size(), 2);
+  EXPECT_EQ(resp.entries(0).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT);
+  EXPECT_EQ(resp.entries(1).outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+}
+
 TEST_F(PeerServiceDispatchTest, AllocateForATierWithNoBackendFailsCleanly) {
   // SSD is a valid wire tier with no backend registered here — a normal
   // deployment shape, so it must be a FAILED outcome and not fall through to
@@ -420,11 +453,30 @@ TEST_F(PeerServiceDispatchTest, BatchResolveReportsTheServingTier) {
   EXPECT_EQ(resp.size(1), 55u);
 }
 
-TEST_F(PeerServiceDispatchTest, EvictFansOutAcrossEveryMedium) {
-  // A key mirrored across media must disappear from ALL of them, and the freed
-  // bytes master sizes its next round from are the sum.
+TEST_F(PeerServiceDispatchTest, EvictWithATierFreesOnlyThatMedium) {
+  // A mirrored key charged to the second medium loses only that copy.
   SeedKey(kFirstByTier, "mirrored", 111);
   SeedKey(kSecondByTier, "mirrored", 222);
+
+  ::umbp::EvictKeyRequest req;
+  req.add_keys("mirrored");
+  req.add_tiers(Proto(kSecondByTier));
+  ::umbp::EvictKeyResponse resp;
+  grpc::ClientContext ctx;
+  ASSERT_TRUE(stub_->EvictKey(&ctx, req, &resp).ok());
+  ASSERT_EQ(resp.evicted_size(), 1);
+  EXPECT_EQ(resp.evicted(0).key(), "mirrored");
+  EXPECT_EQ(resp.evicted(0).bytes_freed(), 222u);
+  EXPECT_TRUE(Backend(kFirstByTier)->Contains("mirrored"));
+  EXPECT_FALSE(Backend(kSecondByTier)->Contains("mirrored"));
+}
+
+TEST_F(PeerServiceDispatchTest, EvictWithoutUsableTiersFreesTheCopyThatHoldsTheKey) {
+  // No tiers (an older master), or a count that does not match `keys`: each
+  // key is freed from the one medium that holds it, never from every medium.
+  SeedKey(kFirstByTier, "mirrored", 111);
+  SeedKey(kSecondByTier, "mirrored", 222);
+  SeedKey(kSecondByTier, "b", 20);
 
   ::umbp::EvictKeyRequest req;
   req.add_keys("mirrored");
@@ -432,10 +484,20 @@ TEST_F(PeerServiceDispatchTest, EvictFansOutAcrossEveryMedium) {
   grpc::ClientContext ctx;
   ASSERT_TRUE(stub_->EvictKey(&ctx, req, &resp).ok());
   ASSERT_EQ(resp.evicted_size(), 1);
-  EXPECT_EQ(resp.evicted(0).key(), "mirrored");
-  EXPECT_EQ(resp.evicted(0).bytes_freed(), 333u);
-  EXPECT_EQ(Backend(kFirstByTier)->OwnedKeyCount(), 0u);
-  EXPECT_EQ(Backend(kSecondByTier)->OwnedKeyCount(), 0u);
+  EXPECT_EQ(resp.evicted(0).bytes_freed(), 111u);  // first owner in read order
+  EXPECT_FALSE(Backend(kFirstByTier)->Contains("mirrored"));
+  EXPECT_TRUE(Backend(kSecondByTier)->Contains("mirrored"));
+
+  ::umbp::EvictKeyRequest mismatched;
+  mismatched.add_keys("mirrored");
+  mismatched.add_keys("b");
+  mismatched.add_tiers(Proto(kFirstByTier));
+  ::umbp::EvictKeyResponse resp2;
+  grpc::ClientContext ctx2;
+  ASSERT_TRUE(stub_->EvictKey(&ctx2, mismatched, &resp2).ok());
+  ASSERT_EQ(resp2.evicted_size(), 2);
+  EXPECT_EQ(resp2.evicted(0).bytes_freed(), 222u);  // the tier was not misapplied
+  EXPECT_EQ(resp2.evicted(1).bytes_freed(), 20u);
 }
 
 TEST_F(PeerServiceDispatchTest, EvictOfAnAbsentKeyReportsZeroBytes) {

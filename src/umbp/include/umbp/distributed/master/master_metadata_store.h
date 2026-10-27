@@ -415,6 +415,12 @@ class IMasterMetadataStore {
       std::chrono::system_clock::time_point now,
       std::chrono::system_clock::duration lease_duration) = 0;
 
+  // Records an access (last_accessed_at = now, access_count + 1) for every key
+  // that still exists: reads a peer served locally (heartbeat local_reads),
+  // which RouteGet never sees.  No lease.  One round trip.
+  virtual void RecordLocalReads(const std::vector<std::string>& keys,
+                                std::chrono::system_clock::time_point now) = 0;
+
   // Batched existence — pure read, no lease grant, no access record.
   // Used by BatchRoutePut for dedup (router.cpp:112): a writer
   // landing on an existing key isn't a "read" and must not extend

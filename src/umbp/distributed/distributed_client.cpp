@@ -85,16 +85,21 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // directly from dc — no ownership struct crosses this boundary the way dram's
   // hugepages/NUMA/prefault knobs do, because hipMalloc has none of those
   // dimensions.
-  // The ranged scratch arena. Plain anonymous host pages: it is registered with
-  // the transfer engine below, and unlike a medium pool it has no hugepage/NUMA
-  // policy to honour — it is touched once per remote ranged operation, not held
-  // as a cache.
+  // The ranged scratch arena. It is registered with the transfer engine below,
+  // and unlike a medium pool it has no NUMA policy to honour — it is touched
+  // once per remote ranged operation, not held as a cache. Its page size does
+  // matter: each arena is one NIC memory region, and hugepages cut its
+  // translation entries.
   //
   // Zero-sized is the default and means "this deployment does not do ranged
   // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
   // a client that never issues ranged operations stops paying for the arena.
   HostMemAllocator allocator;
   HostBufferOptions scratch_opts;
+  if (dc.ranged_scratch_use_hugepages) {
+    scratch_opts.backing = HostBufferBacking::kAnonymousHugetlb;
+    scratch_opts.hugepage_size = dc.ranged_scratch_hugepage_size;
+  }
   // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
   // directions never share a buffer or a lock and can run concurrently.
   if (dc.ranged_scratch_size > 0) {
@@ -108,6 +113,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
       allocator.Free(ranged_put_scratch_handle_);
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
+    // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
+    MORI_UMBP_INFO("[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
+                   ranged_get_scratch_handle_.mapped_size >> 20,
+                   ranged_get_scratch_handle_.actual_alignment >> 10,
+                   ranged_get_scratch_handle_.actual_backing == HostBufferBacking::kAnonymousHugetlb
+                       ? "hugetlb"
+                       : "anonymous");
     ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
     ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
     ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
@@ -174,20 +186,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
           "HBM pool=" + mb(dc.hbm.capacity_bytes) + "MB device=" + std::to_string(dc.hbm.device);
       break;
     case UMBPMedium::SSD:
-      // Slot COUNT only, not ssd_staging_buffer_size.  The arena SsdBackend
-      // actually allocates is staging_pages * page_size (see its own
-      // "[SsdBackend] Init ... arena_bytes=" line, which is authoritative);
-      // ssd_staging_buffer_size does not size it, so printing that number here
-      // stated a capacity the node did not have — 6144MB against a real 4096MB
-      // arena in a 2 MiB-page run.
-      //
-      // The slot count is the number worth showing, because it is the SSD
-      // medium's read-concurrency limit.  Transient shortfalls now surface as
-      // BUSY and are retried; a batch whose own working set exceeds the arena
-      // is a permanent resolve failure.
+      // The arena's bytes are on SsdBackend's own Init line.
       medium_desc = "SSD pool=" + mb(config_.ssd.capacity_bytes) +
                     "MB backend=" + config_.ssd.ssd_backend + " dir=" + config_.ssd.storage_dir +
-                    " staging_slots=" + std::to_string(dc.ssd_staging_buffer_slots);
+                    " staging_slots=" +
+                    (dc.ssd_staging_buffer_slots > 0 ? std::to_string(dc.ssd_staging_buffer_slots)
+                                                     : std::string("preset"));
       break;
   }
 
@@ -432,14 +436,10 @@ bool DistributedClient::SupportsRangedIO() const {
   // walking (ssd_backend.h).  All four ranged paths therefore work on an SSD
   // node: get and put, each local and remote.
   //
-  // What the medium changes is the saving, not the correctness.  A resolve
-  // stages the whole object before anyone says which bytes they want, so a
-  // ranged get off SSD still reads the full object from the device and saves
-  // only the final copy into the caller's buffers.  Ranged put is unaffected:
-  // it tiles its object, so the single whole-object write was always going to
-  // happen.  Making the device read follow the requested extent needs an extent
-  // on the resolve path and is a separate change (doc/design-ssd-ranged-io.md,
-  // D1) -- this flag was never what stood in its way.
+  // What the medium changes is the saving, not the correctness.  A local
+  // ranged get off SSD reads only its extent (design-ssd-ranged-io.md D1); a
+  // remote one still stages the whole object (D2).  Ranged put tiles its
+  // object, so the single whole-object write was always going to happen.
   //
   // The one exception is a node with no master.  Nothing can route a key off
   // this node, so every ranged operation it will ever serve is the local path

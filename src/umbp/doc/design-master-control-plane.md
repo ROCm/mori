@@ -549,7 +549,7 @@ has a DRAM/HBM tier or an SSD tier.
 | RPC | Purpose |
 |---|---|
 | `GetPeerInfo` | First-contact hydration: packed `engine_desc`, SSD staging buffer descriptor, all DRAM/HBM `BufferMemoryDesc`s, and the tier `dram_page_size`. |
-| `AllocateSlot(key, size, tier)` | Reserve a pending **DRAM/HBM** slot (`tier` is HBM or DRAM only — SSD is never a direct put target). Response carries an `AllocateSlotOutcome` and, on success, `slot_id`, the `pages` it covers, `page_size`, the dedup'd `descs` for those pages, and a `pending_ttl_ms`. Outcomes: `SUCCESS_ALLOCATED`, `FAILED_NO_SPACE` (ENOSPC — writer retries `RoutePut` with the node added to `exclude_nodes`), or `FAILED` (generic). **Duplicate-key dedup**: if `owned_[key]` is already present (master-index-lag fallback), outcome is `SUCCESS_ALREADY_EXISTS` — caller treats it as a no-op success and skips RDMA. |
+| `AllocateSlot(key, size, tier)` | Reserve a pending **DRAM/HBM** slot (`tier` is HBM or DRAM only — SSD is never a direct put target). Response carries an `AllocateSlotOutcome` and, on success, `slot_id`, the `pages` it covers, `page_size`, the dedup'd `descs` for those pages, and a `pending_ttl_ms`. Outcomes: `SUCCESS_ALLOCATED`, `FAILED_NO_SPACE` (ENOSPC — writer retries `RoutePut` with the node added to `exclude_nodes`), or `FAILED` (generic). **Duplicate-key dedup**: if `owned_[key]` is already present (master-index-lag fallback), outcome is `SUCCESS_ALREADY_EXISTS` — caller treats it as a no-op success and skips RDMA. If another writer holds the key's pending slot, outcome is `IN_FLIGHT`, which the caller treats the same way: that writer's commit stores the bytes. |
 | `CommitSlot(slot_id, key)` | Move pending → owned. Queues `KvEvent{ADD, key, tier, size}` for the next heartbeat, and — when the SSD tier is enabled — enqueues an async copy-on-commit task so the bytes are mirrored to SSD (best-effort; the eventual SSD copy emits its own `KvEvent{ADD, tier=SSD}`). |
 | `AbortSlot(slot_id)` | Drop a pending slot. Idempotent. |
 | `ResolveKey(key)` | DRAM/HBM read-side lookup. Bumps the per-key read-lease counter (Bug #7 mitigation). Returns `pages`, `page_size`, `descs`, `size`. |
@@ -882,7 +882,7 @@ fields:
 | Section | Field | Default | Notes |
 |---|---|---|---|
 | `dram` | `capacity_bytes` | 4 GiB | Local DRAM tier size. |
-| `dram` | `high_watermark` / `low_watermark` | 0.9 / 0.7 | LRU eviction trigger band. |
+| `dram` | `high_watermark` / `low_watermark` | 0.95 / 0.9 | LRU eviction trigger band. |
 | `ssd` | `enabled` | true | Toggle SSD tier. |
 | `ssd` | `storage_dir` | `/tmp/umbp_ssd` | POSIX backend root. |
 | `ssd` | `capacity_bytes` | 32 GiB | |
@@ -908,8 +908,7 @@ fields:
 | `io_engine.host` | "" | Empty selects RDMA; sites typically use `127.0.0.1` for local IO engine. |
 | `io_engine.port` | 0 | `0` = OS-assigned ephemeral. |
 | `staging_buffer_size` | 64 MiB | Host staging for non-zero-copy RDMA. |
-| `ssd_staging_buffer_size` | 256 MiB | Dedicated SSD read staging, allocated only when SSD is enabled. A slot (`ssd_staging_buffer_size / ssd_staging_buffer_slots`) must fit the largest single-key value. |
-| `ssd_staging_buffer_slots` | 16 | Number of remote SSD read staging slots. |
+| `ssd_staging_buffer_slots` | 0 | SSD staging arena in pages; 0 = 4 GiB capped at the SSD tier. |
 | `peer_service_port` | 0 | `0` = OS-assigned. |
 | `cache_remote_fetches` | true | Locally re-cache blocks fetched from a remote peer. |
 | `dram_page_size` | 0 | `0` ⇒ use master's `default_dram_page_size` (2 MiB). |

@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "umbp/distributed/peer/backend/medium_backend.h"
@@ -41,8 +42,13 @@ struct TierTransitionResult {
   bool success = false;
   uint32_t target_backend_id = BackendRegistry::kMaxBackends;
   uint64_t bytes_moved = 0;
+  uint64_t bytes_read = 0;  // copied off the source; 0 when the target already held it
+  std::vector<std::pair<TierType, uint64_t>> bytes_written;  // each commit, by target medium
   uint64_t bytes_freed = 0;
   bool source_draining = false;
+  // Failed in a way that can clear (no space, or a copy/commit/read-back
+  // error), so a later attempt may succeed.  False for a shape failure.
+  bool retryable = false;
 };
 
 // Executes one peer-local copy or move. Placement policy and scheduling remain
@@ -60,6 +66,7 @@ class TierTransitionExecutor {
   static bool BuildTransfers(MediumBackend* source, const ResolvedEntry& resolved,
                              MediumBackend* target, const AllocateResult& allocation,
                              std::vector<TransferItem>* items);
+  bool FileReachable(MediumBackend* backend) const;
 
   BackendRegistry* backends_;
   TransferEngine* transfer_engine_;

@@ -44,8 +44,7 @@ static constexpr uint32_t kMaxKeyLen = 256;
 static constexpr uint32_t kRingSize = 256;
 static constexpr uint32_t kMaxChannels = 64;
 static constexpr uint32_t kMaxTenants = 64;
-static constexpr size_t kDefaultDataRegionPerChannel = 32ULL * 1024 * 1024;        // 32MB
-static constexpr size_t kDefaultDataRegionPerRank = kDefaultDataRegionPerChannel;  // legacy alias
+static constexpr size_t kDefaultDataRegionPerChannel = 32ULL * 1024 * 1024;  // 32MB
 static constexpr size_t kDmaAlignment = 4096;
 static constexpr size_t kHugepageSize = 2ULL * 1024 * 1024;
 static constexpr size_t kCacheRingAlign = 64;
@@ -152,8 +151,6 @@ struct ClientChannel {
 
   RingSlot slots[kRingSize];
 };
-
-using RankChannel = ClientChannel;  // legacy alias
 
 // ---- Batch descriptor (stored in data region for BATCH_PUT/BATCH_GET) ----
 struct BatchEntry {

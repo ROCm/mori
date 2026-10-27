@@ -53,6 +53,23 @@ void Writer::Build(const std::string& key, const void* data, size_t size,
   std::memcpy(out->record.data() + prefix, data, size);
 }
 
+void Writer::BuildPrefix(const std::string& key, size_t size, PreparedRecord* out) const {
+  if (!out) return;
+  out->crc_valid = false;
+  out->crc32 = 0;
+
+  RecordHeader hdr;
+  hdr.magic = kRecordMagic;
+  hdr.version = kRecordVersion;
+  hdr.flags = kFlagNoCrc;
+  hdr.key_len = static_cast<uint32_t>(key.size());
+  hdr.value_size = static_cast<uint32_t>(size);
+
+  out->record.Resize(static_cast<size_t>(PrefixBytes(key.size())));
+  std::memcpy(out->record.data(), &hdr, sizeof(hdr));
+  std::memcpy(out->record.data() + sizeof(hdr), key.data(), key.size());
+}
+
 bool Writer::Reserve(const std::string& key, size_t size, Meta* segment_meta, Index& index,
                      PreparedRecord* out) const {
   if (!segment_meta || !out) return false;

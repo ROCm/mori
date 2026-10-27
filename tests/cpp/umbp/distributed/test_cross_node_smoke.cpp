@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -28,13 +29,16 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "umbp/distributed/config.h"
+#include "umbp/distributed/master/master_client.h"
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/pool_client.h"
+#include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
@@ -98,6 +102,8 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_a.auto_peer_service_port = true;
     cfg_a.dram.buffer_sizes = {kBlockSize};
     cfg_a.dram_page_size = kBlockSize;
+    // These tiers are filled on purpose; leave eviction to the master's rounds.
+    cfg_a.eviction_mode = PeerEvictionMode::kMaster;
     client_a_ = std::make_unique<PoolClient>(std::move(cfg_a));
     ASSERT_TRUE(client_a_->Init());
 
@@ -110,6 +116,7 @@ class CrossNodeSmoke : public ::testing::Test {
     cfg_b.auto_peer_service_port = true;
     cfg_b.dram.buffer_sizes = {kBufSize};
     cfg_b.dram_page_size = kBlockSize;
+    cfg_b.eviction_mode = PeerEvictionMode::kMaster;
     client_b_ = std::make_unique<PoolClient>(std::move(cfg_b));
     ASSERT_TRUE(client_b_->Init());
 
@@ -198,6 +205,46 @@ TEST_F(CrossNodeSmoke, FinalizeIdempotentE2E) {
   EXPECT_EQ(std::memcmp(caller_buf_, read_buf_, kBlockSize), 0);
 }
 
+// Two writers of one key race whenever ranks share a prefix: the loser finds
+// the winner's slot still pending on the peer.  A local put counts that key as
+// stored; a remote put must too, or the loser reports the offload as failed
+// although the winner's commit stores the bytes.
+TEST_F(CrossNodeSmoke, RemotePutOfAKeyAnotherWriterHoldsCountsAsStored) {
+  // The master places puts without regard to the caller, so a probe sees the
+  // node client_a_'s put will go to.
+  UMBPMasterClientConfig probe_cfg;
+  probe_cfg.node_id = "probe";
+  probe_cfg.node_address = "127.0.0.1";
+  probe_cfg.master_address = "localhost:" + std::to_string(master_->GetBoundPort());
+  MasterClient probe(probe_cfg);
+  std::optional<RoutePutResult> route;
+  ASSERT_TRUE(probe.RoutePut("held-key", kBlockSize, {}, &route).ok());
+  ASSERT_TRUE(route.has_value());
+  ASSERT_EQ(route->node_id, "node-b");
+
+  // Hold the key's slot on node-b as the other writer would, mid-transfer.
+  auto stub = ::umbp::UMBPPeer::NewStub(
+      grpc::CreateChannel(route->peer_address, grpc::InsecureChannelCredentials()));
+  ::umbp::AllocateSlotRequest alloc_req;
+  alloc_req.set_key("held-key");
+  alloc_req.set_size(kBlockSize);
+  alloc_req.set_tier(static_cast<::umbp::TierType>(route->tier));
+  alloc_req.set_logical_tier(route->logical_tier);
+  ::umbp::AllocateSlotResponse held;
+  grpc::ClientContext alloc_ctx;
+  ASSERT_TRUE(stub->AllocateSlot(&alloc_ctx, alloc_req, &held).ok());
+  ASSERT_EQ(held.outcome(), ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALLOCATED);
+
+  std::memset(caller_buf_, 0xEF, kBlockSize);
+  EXPECT_TRUE(client_a_->Put("held-key", caller_buf_, kBlockSize));
+
+  ::umbp::AbortSlotRequest abort_req;
+  abort_req.set_slot_id(held.slot_id());
+  ::umbp::AbortSlotResponse abort_resp;
+  grpc::ClientContext abort_ctx;
+  EXPECT_TRUE(stub->AbortSlot(&abort_ctx, abort_req, &abort_resp).ok());
+}
+
 // ===========================================================================
 // Phase 2 multi-page scatter-gather tests.  These exercise the
 // RemoteDramScatterWrite/Read code path across the PageBitmapAllocator
@@ -242,6 +289,8 @@ class CrossNodeMultiPage : public ::testing::Test {
     cfg.auto_peer_service_port = true;
     cfg.dram_page_size = kPageSize;
     cfg.dram.buffer_sizes = setup.buffer_sizes;
+    // These tiers are filled on purpose; leave eviction to the master's rounds.
+    cfg.eviction_mode = PeerEvictionMode::kMaster;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(cli->Init());
     return cli;
@@ -542,6 +591,8 @@ class CrossNodeOverlap : public ::testing::Test {
     cfg.dram_page_size = kPageSize;
     if (staging_buffer_size > 0) cfg.staging_buffer_size = staging_buffer_size;
     cfg.dram.buffer_sizes = buffer_sizes;
+    // These tiers are filled on purpose; leave eviction to the master's rounds.
+    cfg.eviction_mode = PeerEvictionMode::kMaster;
     auto cli = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(cli->Init());
     clients_.push_back(std::move(cli));

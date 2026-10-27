@@ -290,13 +290,7 @@ TEST(BackendPolicyConfig, LowersPromoteTriggerAndRejectsIncoherentThresholds) {
   }
 }
 
-// An SSD backend's staging arena is staging_slots * page_size, and a read that
-// cannot claim a slot is reported as a miss rather than as backpressure, so the
-// slot count is a hard read-concurrency ceiling. Left at the default of 16 a
-// 64 KiB-page backend has a 1 MiB arena, which under a mixed workload fails the
-// majority of its reads and, because the offload target then refuses pages,
-// most of its writes too. Omitting the field must keep the previous default so
-// existing policies are unaffected.
+// An omitted staging_slots takes the 4 GiB preset, capped at the tier.
 TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
   auto loaded = LoadBackendPolicyJson(R"json(
     {"backends":{
@@ -319,7 +313,12 @@ TEST(BackendPolicyConfig, LowersSsdStagingSlotsAndDefaultsWhenAbsent) {
     return -1;
   };
   EXPECT_EQ(slots_of("with_slots"), 512);
-  EXPECT_EQ(slots_of("without"), BackendInstanceConfig{}.ssd_staging_buffer_slots);
+  EXPECT_EQ(slots_of("without"), 0);
+
+  constexpr uint64_t kPage = 64ULL << 10;
+  EXPECT_EQ(SsdStagingPages(512, 1ULL << 30, kPage), 512u);
+  EXPECT_EQ(SsdStagingPages(0, 1ULL << 40, kPage), (4ULL << 30) / kPage);
+  EXPECT_EQ(SsdStagingPages(0, 1ULL << 30, kPage), (1ULL << 30) / kPage);
 
   // A DRAM backend has no staging arena, so the field must not be silently
   // accepted there and then ignored.

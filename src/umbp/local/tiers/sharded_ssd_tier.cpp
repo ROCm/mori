@@ -34,9 +34,9 @@ namespace mori::umbp {
 
 namespace {
 
-// Gather each shard's sub-batch, run `op` on it in parallel across drives, and
-// scatter the per-key results back.  Shared by the put and get paths, which
-// differ only in the pointer type and the backend call.  Buckets touch disjoint
+// Run `op(shard, key indices)` on every busy shard in parallel across drives,
+// and scatter the per-key results back; `op` gathers its own sub-batch (see
+// Gather) and makes the backend call.  Buckets touch disjoint
 // shards and disjoint result indices, so nothing here needs a lock -- PROVIDED
 // the per-key slots are separate memory locations.  std::vector<bool> packs
 // them into shared words, and two drives finishing together would each
@@ -44,28 +44,16 @@ namespace {
 // came back false (seen as rare "PrepareReadBatch read failed" under parallel
 // SSD load).  So the workers fill a vector<char> and `results` is written once
 // they have all joined.
-template <typename PtrT, typename Op>
+template <typename Op>
 void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::vector<int>& busy,
-                   int io_threads, const std::vector<std::string>& keys,
-                   const std::vector<PtrT>& ptrs, const std::vector<size_t>& sizes,
-                   std::vector<bool>& results, std::vector<double>& shard_ms, Op&& op) {
+                   int io_threads, std::vector<bool>& results, std::vector<double>& shard_ms,
+                   Op&& op) {
   std::vector<char> ok(results.size(), 0);
   ParallelFor(busy.size(), io_threads, [&](size_t bi) {
     const int s = busy[bi];
     const auto t_shard = ssdperf::Now();
     const auto& idxs = buckets[s];
-    std::vector<std::string> k;
-    std::vector<PtrT> d;
-    std::vector<size_t> z;
-    k.reserve(idxs.size());
-    d.reserve(idxs.size());
-    z.reserve(idxs.size());
-    for (size_t i : idxs) {
-      k.push_back(keys[i]);
-      d.push_back(ptrs[i]);
-      z.push_back(sizes[i]);
-    }
-    const auto shard_res = op(s, k, d, z);
+    const auto shard_res = op(s, idxs);
     for (size_t j = 0; j < idxs.size(); ++j) {
       ok[idxs[j]] = (j < shard_res.size() && shard_res[j]) ? 1 : 0;
     }
@@ -74,6 +62,15 @@ void FanOutBatches(const std::vector<std::vector<size_t>>& buckets, const std::v
   for (int s : busy) {
     for (size_t i : buckets[s]) results[i] = ok[i] != 0;
   }
+}
+
+// The entries of `v` at `idxs`, in order: one shard's slice of a batch argument.
+template <typename T>
+std::vector<T> Gather(const std::vector<T>& v, const std::vector<size_t>& idxs) {
+  std::vector<T> out;
+  out.reserve(idxs.size());
+  for (size_t i : idxs) out.push_back(v[i]);
+  return out;
 }
 
 // Indices of the shards this batch actually touches.
@@ -157,6 +154,10 @@ void ShardedSsdTier::ReleaseLocked(int shard, size_t size) {
   used_hint_[shard] = used_hint_[shard] > size ? used_hint_[shard] - size : 0;
 }
 
+void ShardedSsdTier::RefreshHintsLocked() {
+  for (size_t i = 0; i < shards_.size(); ++i) used_hint_[i] = shards_[i]->Capacity().first;
+}
+
 int ShardedSsdTier::ShardOf(const std::string& key) const {
   std::shared_lock<std::shared_mutex> lock(map_mu_);
   return LookupLocked(key);
@@ -177,6 +178,7 @@ bool ShardedSsdTier::Write(const std::string& key, const void* data, size_t size
     shard = LookupLocked(key);
     is_new = shard < 0;
     if (is_new) {
+      RefreshHintsLocked();
       shard = PickShardLocked(size);
       if (shard < 0) {
         MORI_UMBP_WARN("[ShardedSsdTier] Write key={} size={}: no shard has room", key, size);
@@ -251,8 +253,14 @@ TierCapabilities ShardedSsdTier::Capabilities() const {
   caps.batch_write = true;
   caps.batch_read = true;
   caps.zero_copy_read = true;
+  caps.ranged_read = !shards_.empty();
+  caps.orders_eviction = true;
   for (const auto& s : shards_) {
-    if (!s->Capabilities().zero_copy_read) caps.zero_copy_read = false;
+    const auto shard_caps = s->Capabilities();
+    if (!shard_caps.zero_copy_read) caps.zero_copy_read = false;
+    // Ranged only if every shard is: elsewhere a ranged read looks like a miss.
+    if (!shard_caps.ranged_read) caps.ranged_read = false;
+    if (!shard_caps.orders_eviction) caps.orders_eviction = false;
   }
   return caps;
 }
@@ -295,29 +303,97 @@ std::vector<std::string> ShardedSsdTier::GetLRUCandidates(size_t max_candidates)
   return out;
 }
 
-std::optional<std::string> ShardedSsdTier::GetLocationId(const std::string& key) const {
-  const int shard = ShardOf(key);
-  if (shard < 0) return std::nullopt;
-  auto inner = shards_[shard]->GetLocationId(key);
-  if (!inner) return std::nullopt;
-  // Prefix the drive so a location string identifies which device holds the key.
-  return "s" + std::to_string(shard) + ":" + *inner;
+std::vector<EvictionHint> ShardedSsdTier::EvictionOrder(size_t max_keys) {
+  std::vector<EvictionHint> out;
+  if (max_keys == 0) return out;
+  std::vector<std::pair<double, size_t>> fullness;  // (used / total, shard)
+  fullness.reserve(shards_.size());
+  for (size_t i = 0; i < shards_.size(); ++i) {
+    const auto [used, total] = shards_[i]->Capacity();
+    fullness.emplace_back(total > 0 ? static_cast<double>(used) / static_cast<double>(total) : 0.0,
+                          i);
+  }
+  std::stable_sort(fullness.begin(), fullness.end(),
+                   [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& [ratio, shard] : fullness) {
+    if (out.size() >= max_keys) break;
+    auto hints = shards_[shard]->EvictionOrder(max_keys - out.size());
+    for (auto& hint : hints) out.push_back(std::move(hint));
+  }
+  return out;
 }
 
-std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) const {
+void ShardedSsdTier::SetRetiredFileHook(std::function<void(int fd)> on_close,
+                                        std::chrono::milliseconds grace) {
+  for (auto& s : shards_) s->SetRetiredFileHook(on_close, grace);
+}
+
+TierSpaceStats ShardedSsdTier::SpaceStats() const {
+  TierSpaceStats sum;
+  for (const auto& s : shards_) {
+    const TierSpaceStats one = s->SpaceStats();
+    sum.live_bytes += one.live_bytes;
+    sum.files += one.files;
+    sum.files_deleted += one.files_deleted;
+    sum.bytes_deleted += one.bytes_deleted;
+    sum.no_room += one.no_room;
+  }
+  return sum;
+}
+
+std::optional<RecordLocation> ShardedSsdTier::LocateRecord(const std::string& key) {
   const int shard = ShardOf(key);
   if (shard < 0) return std::nullopt;
   return shards_[shard]->LocateRecord(key);
+}
+
+std::optional<RecordReservation> ShardedSsdTier::ReserveRecord(const std::string& key,
+                                                               size_t size) {
+  int shard;
+  {
+    std::unique_lock<std::shared_mutex> lock(map_mu_);
+    shard = LookupLocked(key);
+    if (shard < 0) {
+      RefreshHintsLocked();
+      shard = PickShardLocked(size);
+      if (shard < 0) return std::nullopt;
+      key_shard_[key] = KeyLoc{static_cast<uint32_t>(shard), size};
+      ReserveLocked(shard, size);
+    }
+  }
+  auto r = shards_[shard]->ReserveRecord(key, size);
+  if (!r) ForgetIfGone(key, shard);
+  return r;
+}
+
+bool ShardedSsdTier::CommitRecord(const std::string& key, const RecordReservation& r) {
+  const int shard = ShardOf(key);
+  if (shard < 0) return false;
+  if (shards_[shard]->CommitRecord(key, r)) return true;
+  ForgetIfGone(key, shard);
+  return false;
+}
+
+void ShardedSsdTier::AbortRecord(const std::string& key, const RecordReservation& r) {
+  const int shard = ShardOf(key);
+  if (shard < 0) return;
+  shards_[shard]->AbortRecord(key, r);
+  ForgetIfGone(key, shard);
+}
+
+void ShardedSsdTier::ForgetIfGone(const std::string& key, int shard) {
+  if (shards_[shard]->Exists(key)) return;
+  std::unique_lock<std::shared_mutex> lock(map_mu_);
+  auto it = key_shard_.find(key);
+  if (it == key_shard_.end() || static_cast<int>(it->second.shard) != shard) return;
+  ReleaseLocked(shard, it->second.size);
+  key_shard_.erase(it);
 }
 
 bool ShardedSsdTier::Flush() {
   bool ok = true;
   for (auto& s : shards_) ok = s->Flush() && ok;
   return ok;
-}
-
-void ShardedSsdTier::SetColdRead(bool enable) {
-  for (auto& s : shards_) s->SetColdRead(enable);
 }
 
 std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& keys,
@@ -337,6 +413,7 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   std::vector<char> is_new(keys.size(), 0);
   {
     std::unique_lock<std::shared_mutex> lock(map_mu_);
+    RefreshHintsLocked();
     for (size_t i = 0; i < keys.size(); ++i) {
       int shard = LookupLocked(keys[i]);
       if (shard < 0) {
@@ -354,9 +431,10 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   const auto t_fanout = ssdperf::Now();
   std::vector<double> shard_ms(shards_.size(), 0.0);
 
-  FanOutBatches(buckets, busy, io_threads_, keys, data_ptrs, sizes, results, shard_ms,
-                [&](int s, const auto& k, const auto& d, const auto& z) {
-                  return shards_[s]->BatchWrite(k, d, z);
+  FanOutBatches(buckets, busy, io_threads_, results, shard_ms,
+                [&](int s, const std::vector<size_t>& idx) {
+                  return shards_[s]->BatchWrite(Gather(keys, idx), Gather(data_ptrs, idx),
+                                                Gather(sizes, idx));
                 });
 
   if (ssdperf::Enabled()) {
@@ -389,17 +467,12 @@ std::vector<bool> ShardedSsdTier::BatchWrite(const std::vector<std::string>& key
   return results;
 }
 
-std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
-                                                   const std::vector<uintptr_t>& dst_ptrs,
-                                                   const std::vector<size_t>& sizes) {
+template <typename ShardOp>
+std::vector<bool> ShardedSsdTier::FanOutRead(const char* label,
+                                             const std::vector<std::string>& keys,
+                                             const std::vector<size_t>& key_bytes, ShardOp&& op) {
   std::vector<bool> results(keys.size(), false);
   if (keys.empty()) return results;
-  if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size()) {
-    MORI_UMBP_ERROR("[ShardedSsdTier] BatchReadIntoPtr: mismatched input lengths ({} / {} / {})",
-                    keys.size(), dst_ptrs.size(), sizes.size());
-    return results;
-  }
-
   std::vector<std::vector<size_t>> buckets(shards_.size());
   {
     std::shared_lock<std::shared_mutex> lock(map_mu_);
@@ -412,16 +485,12 @@ std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string
   const std::vector<int> busy = BusyShards(buckets);
   const auto t_fanout = ssdperf::Now();
   std::vector<double> shard_ms(shards_.size(), 0.0);
-
-  FanOutBatches(buckets, busy, io_threads_, keys, dst_ptrs, sizes, results, shard_ms,
-                [&](int s, const auto& k, const auto& d, const auto& z) {
-                  return shards_[s]->BatchReadIntoPtr(k, d, z);
-                });
+  FanOutBatches(buckets, busy, io_threads_, results, shard_ms, op);
 
   if (ssdperf::Enabled()) {
     const double total_ms = ssdperf::MsSince(t_fanout);
     uint64_t bytes = 0, missing = 0;
-    for (size_t i = 0; i < keys.size(); ++i) bytes += sizes[i];
+    for (size_t i = 0; i < keys.size(); ++i) bytes += key_bytes[i];
     for (const auto& b : buckets) missing += b.size();
     missing = keys.size() - missing;
     double slowest = 0.0;
@@ -429,14 +498,28 @@ std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string
     // overlap = sum(per-drive time) / wall time.  ~1.0 means the drives ran one
     // after another (no parallelism); ~N means all N drives were busy at once.
     MORI_UMBP_INFO(
-        "[SsdPerf/shard] GET drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
+        "[SsdPerf/shard] {} drives={} io_threads={} busy={} keys={} unmapped={} bytes={} "
         "total_ms={:.3f} GB_s={:.2f} slowest_drive_ms={:.3f} overlap={:.2f}x | {}",
-        shards_.size(), io_threads_, busy.size(), keys.size(), missing, bytes, total_ms,
+        label, shards_.size(), io_threads_, busy.size(), keys.size(), missing, bytes, total_ms,
         ssdperf::GbPerSec(bytes, total_ms), slowest,
         total_ms > 0.0 ? std::accumulate(shard_ms.begin(), shard_ms.end(), 0.0) / total_ms : 0.0,
-        FormatShardFanout(busy, buckets, sizes, shard_ms, shards_.size()));
+        FormatShardFanout(busy, buckets, key_bytes, shard_ms, shards_.size()));
   }
   return results;
+}
+
+std::vector<bool> ShardedSsdTier::BatchReadIntoPtr(const std::vector<std::string>& keys,
+                                                   const std::vector<uintptr_t>& dst_ptrs,
+                                                   const std::vector<size_t>& sizes) {
+  if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size()) {
+    MORI_UMBP_ERROR("[ShardedSsdTier] BatchReadIntoPtr: mismatched input lengths ({} / {} / {})",
+                    keys.size(), dst_ptrs.size(), sizes.size());
+    return std::vector<bool>(keys.size(), false);
+  }
+  return FanOutRead("GET", keys, sizes, [&](int s, const std::vector<size_t>& idx) {
+    return shards_[s]->BatchReadIntoPtr(Gather(keys, idx), Gather(dst_ptrs, idx),
+                                        Gather(sizes, idx));
+  });
 }
 
 bool ShardedSsdTier::WriteBatch(const std::vector<std::string>& keys,
@@ -450,6 +533,25 @@ std::vector<bool> ShardedSsdTier::ReadBatchIntoPtr(const std::vector<std::string
                                                    const std::vector<uintptr_t>& dst_ptrs,
                                                    const std::vector<size_t>& sizes) {
   return BatchReadIntoPtr(keys, dst_ptrs, sizes);
+}
+
+std::vector<bool> ShardedSsdTier::ReadBatchRangesIntoPtr(
+    const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+    const std::vector<std::vector<size_t>>& sizes,
+    const std::vector<std::vector<size_t>>& src_offsets) {
+  if (dst_ptrs.size() != keys.size() || sizes.size() != keys.size() ||
+      src_offsets.size() != keys.size()) {
+    MORI_UMBP_ERROR("[ShardedSsdTier] ReadBatchRangesIntoPtr: mismatched input lengths");
+    return std::vector<bool>(keys.size(), false);
+  }
+  std::vector<size_t> key_bytes(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    key_bytes[i] = std::accumulate(sizes[i].begin(), sizes[i].end(), size_t{0});
+  }
+  return FanOutRead("GET_RANGES", keys, key_bytes, [&](int s, const std::vector<size_t>& idx) {
+    return shards_[s]->ReadBatchRangesIntoPtr(Gather(keys, idx), Gather(dst_ptrs, idx),
+                                              Gather(sizes, idx), Gather(src_offsets, idx));
+  });
 }
 
 }  // namespace mori::umbp

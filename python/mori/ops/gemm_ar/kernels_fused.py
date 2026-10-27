@@ -110,6 +110,7 @@ from ._gemm_a8w8_8wave import (
     compute_global_swizzle,
     make_fp8_buffer_tensor,
     split_row_major_2d,
+    read_done_barrier,
     wait_barrier,
 )
 
@@ -1502,7 +1503,10 @@ def compile_fused_gemm_scatter(
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
+            # The leading wave group refills the B0 slot just read one stage
+            # after the barrier the lagging group's S0 pairs with; make the
+            # reads complete before advertising it.
+            read_done_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
@@ -1519,26 +1523,11 @@ def compile_fused_gemm_scatter(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            # aiter has `2 * N_LDS_STEPS_A + N_LDS_STEPS_B` here, which lets
-            # too many global->LDS prefetches stay in flight across the barrier:
-            # a wave passes it and refills an LDS buffer that another wave has
-            # not finished consuming. The result is a silent, non-deterministic
-            # partial corruption -- always a whole (wave_m sub-tile x all four
-            # wave_n) region, which is the signature of a shared A-side LDS
-            # buffer -- that only shows up on large grids. Measured boundary at
-            # [16384, 7168] K=512 on 8x MI355X, 4-5 runs each: at 256x256 the
-            # counts 6 (aiter's), 5 and 4 all corrupt while 3, 2 and 0 are
-            # clean; at 128x256 the counts 4 (aiter's) and 3 corrupt while 2, 1
-            # and 0 are clean. Both thresholds are N_LDS_STEPS_A +
-            # N_LDS_STEPS_B - 1. Costs nothing: 241/240/245 us against
-            # 240/246/237 us for aiter's count at [16384, 7168] K=2048.
-            #
-            # Not a complete theory -- 128x512 does not reproduce at all, so the
-            # count is not the only variable, and the same under-wait may exist
-            # at the other sync points (forcing *any* of the 14 in this loop to
-            # vmcnt(0) also fixes it). This is the smallest change that is
-            # measurably correct here, not a proven-general formula.
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
+            # The original count. Lowering it to A+B-1 used to be the fix for
+            # the large-grid corruption, but it only made the peeled tail's
+            # tiles land sooner; the tail now drains them itself (below), and
+            # this count is clean on the shape that motivated the change.
+            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
@@ -1566,7 +1555,12 @@ def compile_fused_gemm_scatter(
             )
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+        # The peeled steps pre-read step K_ITERS - 1's B0 (end of this step)
+        # and A0 (top of the next), both before the last step's
+        # wait_barrier(0). Drain their producers here. At K=256 the main loop
+        # runs zero times, so no count inside it can cover this. The last
+        # step's wait stays: it still covers the final A1, issued below.
+        wait_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 

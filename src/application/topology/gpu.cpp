@@ -25,9 +25,11 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <vector>
 
 #include "mori/application/utils/check.hpp"
+#include "mori/utils/mori_log.hpp"
 
 namespace mori {
 namespace application {
@@ -100,7 +102,13 @@ Fn Sym(void* handle, const char* name) {
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          TopoSystemGpu                                         */
 /* ---------------------------------------------------------------------------------------------- */
-TopoSystemGpu::TopoSystemGpu() { Load(); }
+// amd_smi before rocm-systems#12998 does not serialize init/shut_down: comms
+// built on several threads at once can see 0 sockets. Load one at a time.
+TopoSystemGpu::TopoSystemGpu() {
+  static std::mutex loadMutex;
+  std::lock_guard<std::mutex> lock(loadMutex);
+  Load();
+}
 
 TopoSystemGpu::~TopoSystemGpu() {}
 
