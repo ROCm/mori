@@ -166,7 +166,9 @@ jobs:
             mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
-            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py"
+            MORI_ENABLE_SDMA=1 mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
+            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
+            MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
             # GDA (device-initiated RDMA) examples fail on the runner (cross-rail
             # RDMA); re-enable once that is fixed.
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
@@ -190,6 +192,13 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: Run CCO FlyDSL buffer cache-policy check
+        run: |
+          # A wrong cache policy still runs, so check the bits in the emitted ISA.
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
 
       - name: Run CCO GEMM+AR numerics (up to 8 ranks)
         run: |

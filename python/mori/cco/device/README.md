@@ -26,6 +26,8 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
 | Triton extern wrappers | `python/mori/ir/triton/cco/ops.py` |
 | OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp/ThreadMode`) | `python/mori/cco/device/flydsl/handles.py` |
 | `_ffi` factory + `cco_struct` (handle keeps methods across `if`/`for`) | `flydsl/_internal.py` |
+| Buffer load/store with a cache policy that holds on every FlyDSL version | `flydsl/buffer.py` |
+| u32 signal-slot accessors (peer flags, rank-private epochs) | `flydsl/signals.py` |
 | How the `.bc` is located at runtime | `python/mori/cco/device/bitcode.py` (`find_cco_bitcode`) |
 | How the `.bc` is built (JIT, per arch+NIC+cov) | `bitcode.py::_jit_compile` (reuses `mori.jit`) |
 | How to prebuild the `.bc` manually | `tools/build_cco_bitcode.sh` |
@@ -80,7 +82,7 @@ then install MORI and the example runtime deps:
 
 ```bash
 pip install .                          # builds + co-locates all libmori_*.so
-pip install mpi4py "flydsl==0.2.2"     # mpi4py: bootstrap; flydsl: the device bindings
+pip install mpi4py "flydsl==0.4.0"     # mpi4py: bootstrap; flydsl: the device bindings
 ```
 
 After `pip install .` no `PYTHONPATH` / `LD_LIBRARY_PATH` / `MORI_CCO_BC` is
