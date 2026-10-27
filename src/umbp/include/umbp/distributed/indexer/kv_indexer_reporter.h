@@ -108,7 +108,7 @@ class KvIndexerReporter {
     Notify();
   }
 
-  bool Sync() {
+  bool Sync(bool rebuild = false) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     try {
       request_.clear_actions();
@@ -123,12 +123,10 @@ class KvIndexerReporter {
         }
         if (mask & 1) desired[hash] = mask;
       }
-      const auto now = std::chrono::steady_clock::now();
       // Rebuild from fresh state after ambiguous failures and quiet Indexer restarts.
-      if (retry_ || now - last_full_ >= std::chrono::seconds(30)) {
+      if (retry_ || rebuild) {
         AddAction(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
         reported_.clear();
-        last_full_ = now;
       }
       for (const auto& [hash, mask] : reported_) {
         if (stopping_) return false;
@@ -147,6 +145,7 @@ class KvIndexerReporter {
       return true;
     } catch (const std::exception& error) {
       retry_ = true;
+      Notify();  // A failed caller-initiated flush must also wake the worker.
       MORI_UMBP_WARN("[KVIndexer] sync failed: {}", error.what());
       return false;
     }
@@ -196,18 +195,21 @@ class KvIndexerReporter {
     request_.clear_actions();
   }
   void Run() {
-    auto periodic = std::chrono::steady_clock::now();
-    while (true) {
-      std::unique_lock<std::mutex> lock(wake_mutex_);
-      cv_.wait_for(lock, std::chrono::seconds(1), [this] { return dirty_ || stopping_; });
-      if (stopping_) return;
-      bool work = std::exchange(dirty_, false);
-      lock.unlock();
+    auto next_rebuild = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::unique_lock<std::mutex> lock(wake_mutex_);
+    while (!stopping_) {
       const auto now = std::chrono::steady_clock::now();
-      if (work || retry_ || now - periodic >= std::chrono::seconds(30)) {
-        Sync();
-        periodic = now;
-      }
+      const bool rebuild = now >= next_rebuild;
+      if (rebuild) next_rebuild = now + std::chrono::seconds(30);
+      dirty_ = false;
+      lock.unlock();
+      const bool ok = Sync(rebuild);
+      lock.lock();
+      if (ok)
+        cv_.wait_until(lock, next_rebuild, [this] { return dirty_ || stopping_; });
+      else
+        // Writes must not turn an unavailable Indexer into a retry storm.
+        cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stopping_.load(); });
     }
   }
   std::unique_ptr<indexer_pb::KVIndexer::Stub> stub_;
@@ -220,9 +222,7 @@ class KvIndexerReporter {
   std::condition_variable cv_;
   std::map<int64_t, KvBlockMetadata> blocks_;
   std::map<int64_t, uint32_t> reported_;
-  std::chrono::steady_clock::time_point last_full_{};
-  std::atomic<bool> retry_{true};
-  bool dirty_ = true;
+  bool retry_ = true, dirty_ = true;
   std::atomic<bool> stopping_{false};
   std::thread thread_;
 };

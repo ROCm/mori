@@ -97,7 +97,7 @@ class AutomaticKvIndexer : public ::testing::Test {
     builder.RegisterService(&receiver);
     server = builder.BuildAndStart();
     ASSERT_NE(server, nullptr);
-    config = {"127.0.0.1:" + std::to_string(port), "worker", "http://worker:30000", 7, 32, 50};
+    config = {"127.0.0.1:" + std::to_string(port), "worker", "http://worker:30000", 1, 0, 50};
   }
   void TearDown() override { server->Shutdown(); }
   Receiver receiver;
@@ -108,8 +108,6 @@ class AutomaticKvIndexer : public ::testing::Test {
 TEST_F(AutomaticKvIndexer, BatchesRespectWireLimitsAndPreserveCanonicalMetadata) {
   PoolClient pool(PoolConfig(2));
   ASSERT_TRUE(pool.Init());
-  config.components = 1;
-  config.swa_window_tokens = 0;
   pool.ConfigureKvIndexer(config);
   std::map<int64_t, uint32_t> expected;
   const int64_t root = -9007199254740993LL;
@@ -150,6 +148,8 @@ TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
   PoolClient pool(PoolConfig());
   ASSERT_TRUE(pool.Init());
   EXPECT_THROW(pool.RegisterKvBlock({1, {}, 16, {{1, {"k"}}}}), std::logic_error);
+  config.components = 7;
+  config.swa_window_tokens = 32;
   pool.ConfigureKvIndexer(config);
   EXPECT_THROW(pool.ConfigureKvIndexer(config), std::logic_error);
   auto* backend = pool.Backends().Get(TierType::DRAM);
@@ -219,8 +219,6 @@ TEST_F(AutomaticKvIndexer, LocalWatermarkEvictionWithdrawsWithoutCallerEvents) {
   cfg.local_evict_low_watermark = 0.5;
   PoolClient pool(cfg);
   ASSERT_TRUE(pool.Init());
-  config.components = 1;
-  config.swa_window_tokens = 0;
   pool.ConfigureKvIndexer(config);
   const std::string data(4096, 'x');
   for (int64_t i = 0; i < 7; ++i) {
@@ -242,8 +240,6 @@ TEST_F(AutomaticKvIndexer, LocalWatermarkEvictionWithdrawsWithoutCallerEvents) {
 TEST_F(AutomaticKvIndexer, PartialBatchFailureResamplesAfterEviction) {
   PoolClient pool(PoolConfig(2));
   ASSERT_TRUE(pool.Init());
-  config.components = 1;
-  config.swa_window_tokens = 0;
   pool.ConfigureKvIndexer(config);
   std::map<int64_t, uint32_t> expected;
   for (int64_t hash = 0; hash < 300; ++hash) {
@@ -272,8 +268,6 @@ TEST_F(AutomaticKvIndexer, StandaloneForwardsMetadataToTheStorageOwner) {
   standalone::StandaloneServer owner(cfg, address);
   ASSERT_TRUE(owner.Start());
   auto client = CreateUMBPClient(cfg);
-  config.components = 1;
-  config.swa_window_tokens = 0;
   client->ConfigureKvIndexer(config);
   client->RegisterKvBlock({42, {}, 16, {{1, {"key"}}}});
   EXPECT_THROW(client->RegisterKvBlock({43, {}, 16, {{2, {"key"}}}}), std::invalid_argument);
@@ -300,6 +294,31 @@ TEST_F(AutomaticKvIndexer, StandaloneForwardsMetadataToTheStorageOwner) {
   allocator.Free(buffer);
   owner.Shutdown();
   EXPECT_TRUE(receiver.WaitFor({}));
+}
+
+TEST_F(AutomaticKvIndexer, WriteNotificationsDoNotBypassRetryBackoff) {
+  receiver.mode = 1;
+  std::atomic<bool> resident{true};
+  KvIndexerReporter reporter(config, [&] {
+    return resident ? std::unordered_set<std::string>{"key"} : std::unordered_set<std::string>{};
+  });
+  reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  ASSERT_TRUE(receiver.WaitForFailure());
+  for (int i = 0; i < 20; ++i) {
+    reporter.Notify();
+    std::this_thread::sleep_for(5ms);
+  }
+  {
+    std::lock_guard<std::mutex> lock(receiver.mutex);
+    EXPECT_EQ(receiver.failures, 1u);
+  }
+  resident = false;
+  receiver.mode = 0;
+  reporter.Notify();
+  ASSERT_TRUE(receiver.WaitFor({}));
+  resident = true;
+  reporter.Notify();
+  EXPECT_TRUE(receiver.WaitFor({{42, 1}}));
 }
 }  // namespace
 }  // namespace mori::umbp

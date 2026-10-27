@@ -21,8 +21,9 @@ Commit, eviction and clear hooks wake one background reporter, including batch,
 ranged and peer operations. It batches changes into at most 256 actions per RPC
 and leaves the UMBP master's event queue untouched. RPC failures do not change
 PUT success. `flush()` synchronizes current residency and returns false on RPC
-failure. Retries resample current state; a rebuild approximately every 30 seconds
-also repairs quiet Indexer restarts. Rebuilds may briefly reduce hits.
+failure. Background retries wait one second even during writes and resample
+current state. A rebuild every 30 seconds also repairs quiet Indexer restarts;
+rebuilds may briefly reduce hits.
 
 Configure once per storage owner. Standalone clients forward metadata to that
 owner; closing a forwarder does not withdraw shared data. Register metadata where
