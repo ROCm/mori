@@ -3440,16 +3440,31 @@ void PoolClient::ScratchArena::Reset(void* base, size_t bytes, size_t shards) {
   for (size_t i = 0; i < shards; ++i) bases_.push_back(static_cast<char*>(base) + i * shard);
 }
 
-PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
+PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire(size_t wanted) {
   std::unique_lock<std::mutex> lock(mutex_);
   if (bases_.empty()) return Lease{};
-  // Uncontended: nothing is queued, so nobody can be jumped.
+  wanted = std::max<size_t>(wanted, 1);
+  // Uncontended: nothing is queued, so nobody can be jumped, and nobody waits on
+  // the shards this call borrows beyond its first.
   if (waiters_.empty()) {
-    for (size_t i = 0; i < busy_.size(); ++i) {
-      if (busy_[i] == 0) {
-        busy_[i] = 1;
-        return Lease{this, i, 1, bases_[i]};
+    size_t best = 0;
+    size_t best_len = 0;
+    for (size_t i = 0; i < busy_.size() && best_len < wanted;) {
+      if (busy_[i] != 0) {
+        ++i;
+        continue;
       }
+      size_t end = i;
+      while (end < busy_.size() && busy_[end] == 0 && end - i < wanted) ++end;
+      if (end - i > best_len) {
+        best = i;
+        best_len = end - i;
+      }
+      i = end;
+    }
+    if (best_len > 0) {
+      std::fill(busy_.begin() + best, busy_.begin() + best + best_len, 1);
+      return Lease{this, best, best_len, bases_[best]};
     }
   }
   size_t index = bases_.size();
@@ -3965,17 +3980,26 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   }
 
   // Only arena users wait, and only for a free SHARD; the local hits above were
-  // fully concurrent, and so were the routing RPC and the slot-served units.
+  // fully concurrent, and so were the routing RPC and the slot-served units.  A
+  // call nobody waits behind may borrow as many adjacent shards as its units fill.
+  size_t wanted_shards = 1;
+  if (!exclusive_arena) {
+    size_t need = 0;
+    for (const auto& unit : units) need += unit.bytes + kRangedScratchAlignment;
+    wanted_shards = (need + shard_bytes - 1) / shard_bytes;
+  }
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease = exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire();
+    scratch_lease =
+        exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire(wanted_shards);
   }
   char* const scratch_base = scratch_lease.base();
+  const size_t lease_bytes = exclusive_arena ? scratch_size : scratch_lease.count() * shard_bytes;
   // The arena described ONCE, by its registered base.  Plans key on (src base,
   // dst base), so a per-unit slice ref made every unit x destination pair its
   // own single-segment plan (~8k of them for a layer-wise load).
-  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
+  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, lease_bytes);
 
   // Pack as many units into the arena as fit, fetch that group, then repeat.
   // Units are 64 B apart so two concurrently-filled slices never share a cache
@@ -4008,14 +4032,14 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     for (; end < units.size(); ++end) {
       size_t aligned = 0;
       if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          aligned > scratch_size - units[end].bytes) {
+          aligned > lease_bytes - units[end].bytes) {
         break;
       }
       scratch_offsets.push_back(aligned);
       cursor = aligned + units[end].bytes;
     }
-    // Unit sizing already caps every unit at scratch_size, so the first one
-    // always fits and this loop always advances.
+    // Unit sizing already caps every unit at scratch_size, no more than the lease
+    // holds, so the first one always fits and this loop always advances.
     const size_t count = end - pos;
 
     PhaseTimer sub_timer(dbg ? &dbg->rmt_sub : nullptr);
@@ -4281,15 +4305,25 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     }
   }
   const size_t scratch_size = exclusive_arena ? put_full_bytes : put_shard_bytes;
+  // As on the read side, a call nobody waits behind may borrow adjacent shards.
+  size_t wanted_shards = 1;
+  if (!exclusive_arena) {
+    size_t need = 0;
+    for (size_t r : remote) need += object_sizes[valid[r]] + kRangedScratchAlignment;
+    wanted_shards = (need + put_shard_bytes - 1) / put_shard_bytes;
+  }
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease = exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire();
+    scratch_lease =
+        exclusive_arena ? arena.arena->AcquireAll() : arena.arena->Acquire(wanted_shards);
   }
   char* const scratch_base = scratch_lease.base();
+  const size_t lease_bytes =
+      exclusive_arena ? scratch_size : scratch_lease.count() * put_shard_bytes;
   // The arena named once, by its registered base -- the read side's reason
   // (see BatchGetRanges) applies unchanged to the assemble side.
-  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
+  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, lease_bytes);
 
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   size_t pos = 0;
@@ -4301,7 +4335,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
       const size_t object_size = object_sizes[valid[remote[end]]];
       size_t aligned = 0;
       if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          object_size > scratch_size || aligned > scratch_size - object_size) {
+          object_size > scratch_size || aligned > lease_bytes - object_size) {
         break;
       }
       scratch_offsets.push_back(aligned);

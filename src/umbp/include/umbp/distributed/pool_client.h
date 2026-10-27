@@ -734,6 +734,8 @@ class PoolClient {
         if (owner_ != nullptr) owner_->Release(index_, count_);
       }
       char* base() const { return base_; }
+      // Adjacent shards held, from base().
+      size_t count() const { return count_; }
 
      private:
       ScratchArena* owner_ = nullptr;
@@ -744,7 +746,11 @@ class PoolClient {
 
     // Blocks until a shard is free, and until no AcquireAll is queued.  Empty
     // lease if Reset never got a usable buffer; the caller rejects that upstream.
-    Lease Acquire();
+    // When nothing is queued the call may instead take the longest run of free
+    // adjacent shards, up to `wanted`: a call that is alone then fills idle
+    // shards rather than taking more arena rounds, while under contention every
+    // call still gets one.
+    Lease Acquire(size_t wanted = 1);
 
     // Blocks until EVERY shard is free, then leases the whole buffer.  Sharding
     // must not shrink what a call can serve, so a call needing more than a shard
