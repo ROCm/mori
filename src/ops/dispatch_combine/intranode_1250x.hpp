@@ -328,7 +328,11 @@ __device__ __forceinline__ gfx1250_TDM_GROUP1 TdmSplitShape(const TdmSplit128& s
 // ordered SoA arrays (sequential reads of tokenIndices/weights/scales by srcTok, sequential writes
 // by destTokId).
 #define CUSPLIT_MAX_TOPK 16
-#define CUSPLIT_MAX_SCALE_BYTES 128
+// DSV4.1 MXFP8 dispatch carries 5120 / 32 = 160 scale bytes per token.
+// Each peer owns this many bytes per slot; a smaller reservation overlaps
+// adjacent peer regions and overruns the final region at full receive capacity.
+// Keep the Python constructor capacity check in sync.
+#define CUSPLIT_MAX_SCALE_BYTES 256
 
 inline __host__ __device__ index_t CusplitSlotsPerPeer(const EpDispatchCombineConfig& config) {
   const int ws = (config.worldSize > 0) ? config.worldSize : 1;

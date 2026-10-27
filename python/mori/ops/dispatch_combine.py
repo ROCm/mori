@@ -422,6 +422,17 @@ def _load_hip_modules(kernel_type, init_shmem=True):
 class EpDispatchCombineOp:
     def __init__(self, config):
         self.config = config
+        # Must match CUSPLIT_MAX_SCALE_BYTES in intranode_1250x.hpp.
+        # Reject unsupported scale rows before allocating collective buffers.
+        if (
+            config.kernel_type.value == EpDispatchCombineKernelType.IntraNode.value
+            and _is_gfx125x()
+            and config.scale_dim * config.scale_type_size > 256
+        ):
+            raise ValueError(
+                "gfx125x IntraNode dispatch supports at most 256 scale bytes "
+                f"per token, got {config.scale_dim * config.scale_type_size}"
+            )
         # Wavefront size of THIS device (32 on gfx1250, 64 on gfx9xx). Used for
         # every kernel launch's block dim; keep consistent with the device-side
         # warpNum = blockDim.x / warpSize so combine LDS sizing stays in bounds.
