@@ -159,6 +159,20 @@ class _RowPlan(NamedTuple):
     relaxed_rows: bool = False
 
 
+#: The arch the wo_b profile was fitted on. Elsewhere it falls back to the
+#: default plan rather than applying MI355X timings to other hardware.
+_SCHEDULE_ARCH = "gfx950"
+
+
+def _device_arch() -> str | None:
+    """The current GPU's gfx target (``gfx950``), or None without a GPU."""
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.split(":")[0]
+
+
 class _Schedule:
     """Finite MI355X wo_b profile, with legacy dispatch for unmeasured inputs.
 
@@ -183,7 +197,7 @@ class _Schedule:
             raise ValueError(f"unknown schedule={schedule!r}; use 'default' or 'wo_b'")
         self.world_size, self.block_m = world_size, block_m
         self.overrides = {}
-        if schedule == "wo_b" and block_n == 256:
+        if schedule == "wo_b" and block_n == 256 and _device_arch() == _SCHEDULE_ARCH:
             target = (world_size, n, k, block_m, quant)
             bf16 = scatter_dtype == gather_dtype == "bf16"
             if target == (8, 7168, 2048, 128, "blockscale") and bf16:

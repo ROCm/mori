@@ -70,26 +70,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 
 from ._gemm_a8w8_8wave import Mfma16x16x128, ceildiv, pack_i32x4_i32x8
-from ._gemm_a8w8_8wave import wait_barrier
-from ._compat import (
-    CM_SC1,
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-    signal_ptr,
-    signal_store_u32,
-    local_load_u32,
-    local_store_u32,
-    wave_uniform_i64,
-    i32_type,
-)
-from .kernels_lsa import _spin_until
-import mori.cco.device.flydsl as cco
-from mori.cco.device.flydsl import _bindings as raw_cco
 
 #: K per MFMA, and so per step.
 STEP_K = 128
@@ -228,9 +210,6 @@ def compile_mxfp8_gemv(
     tokens: int = 32,
     ksplit: bool = True,
     valid_tokens: int = 0,
-    ar_cfg=None,
-    ar_rank: int = 0,
-    ar_tagged: bool = False,
 ):
     """A skinny mxfp8 matmul: ``out[M, N] = X[M, K] @ W[N, K].T``, M <= ``m_max``.
 
@@ -276,22 +255,9 @@ def compile_mxfp8_gemv(
     RED_SLOTS = rows * RED_TOKENS
     RED_FLOATS = RED_WAVES * RED_SLOTS
     BLOCK = waves * 64
-    fuse_ar = ar_cfg is not None
-    AR_WORLD = ar_cfg.world_size if fuse_ar else 1
-    if fuse_ar:
-        ar_cfg.validate()
-        if not ksplit or ceildiv(n, WG_ROWS) > 256:
-            raise ValueError(
-                "fused GEMV AR requires ksplit and at most 256 resident CTAs"
-            )
-        AR_START, AR_END, AR_FLAG = ar_cfg.start_off, ar_cfg.end_off, ar_cfg.flag_off
-        AR_INPUT, AR_OUTPUT = ar_cfg.input_off, ar_cfg.output_off
-        AR_TAGGED = ar_cfg.window_bytes
-        AR_TAGGED_SLOT = ar_cfg.m * n * 4
-
     _kname = (
         f"mori_mxfp8_gemv_n{n}k{k}_w{waves}s{steps}r{rows}t{tokens}"
-        f"{'_ks' if ksplit else ''}_valid{valid_tokens}_ar{AR_WORLD}r{ar_rank}t{int(ar_tagged)}"
+        f"{'_ks' if ksplit else ''}{f'_valid{valid_tokens}' if valid_tokens else ''}"
     )
 
     @fx.struct
@@ -307,7 +273,6 @@ def compile_mxfp8_gemv(
         C: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
-        win: fx.Int64,
     ):
         wave = fx.thread_idx.x // 64
         gv = _Gemv(W, WS, X, XS, n=n, k=k, at=AT, bt=BT, m_max=m_max)
@@ -510,139 +475,6 @@ def compile_mxfp8_gemv(
                     for r in range_constexpr(4):
                         store(vec[r].to(fx.BFloat16), tok, col_base + fx.Int32(r))
 
-        if const_expr(fuse_ar and ar_tagged):
-            tid, bid = fx.thread_idx.x, fx.block_idx.x
-            wait_barrier(0)
-            w = cco.CachedWindow(win)
-            flag_ptr = signal_ptr(
-                fx.Int64(w.lsa_ptr(ar_rank, AR_FLAG)) + fx.Int64(bid) * 4
-            )
-            epoch = fx.Int32(local_load_u32(flag_ptr)) + fx.Int32(1)
-            tagged_slot = fx.Int64(epoch & 1) * fx.Int64(AR_TAGGED_SLOT)
-            mine = fx.Int64(w.lsa_ptr(ar_rank, AR_TAGGED)) + tagged_slot
-            peer_bases = [
-                fx.Int64(w.lsa_ptr(p, AR_TAGGED)) + tagged_slot for p in range(AR_WORLD)
-            ]
-            raw_input = create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(ar_rank, AR_INPUT))
-            )
-            ar_out = create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(ar_rank, AR_OUTPUT))
-            )
-
-            def load_tagged(ptr):
-                return fx.Int64(
-                    llvm.load(
-                        ir.IntegerType.get_signless(64),
-                        ptr,
-                        alignment=8,
-                        ordering=llvm.AtomicOrdering.monotonic,
-                        syncscope="",
-                    )
-                )
-
-            for pair in range(tid, c_m * fx.Int32(rows // 2), BLOCK):
-                token = pair // fx.Int32(rows // 2)
-                col = tile * fx.Int32(TILE) + (pair % fx.Int32(rows // 2)) * 2
-                pos = token * c_n + col
-                bits = fx.Int32(
-                    buffer_load(raw_input, pos // 2, vec_width=1, dtype=i32_type())
-                )
-                word = fx.Int64(
-                    (fx.Uint64(fx.Uint32(epoch)) << 32) | fx.Uint64(fx.Uint32(bits))
-                )
-                llvm.store(
-                    word.ir_value(),
-                    signal_ptr(mine + fx.Int64(pos) * 4),
-                    alignment=8,
-                    ordering=llvm.AtomicOrdering.monotonic,
-                    syncscope="",
-                )
-            fx.barrier()
-            for pair in range(tid, c_m * fx.Int32(rows // 2), BLOCK):
-                token = pair // fx.Int32(rows // 2)
-                col = tile * fx.Int32(TILE) + (pair % fx.Int32(rows // 2)) * 2
-                pos = token * c_n + col
-                low, high = fx.Float32(0.0), fx.Float32(0.0)
-                for p in range_constexpr(AR_WORLD):
-                    ptr = signal_ptr(peer_bases[p] + fx.Int64(pos) * 4)
-                    word = load_tagged(ptr)
-                    while fx.Int32(word >> 32) != epoch:
-                        word = load_tagged(ptr)
-                    bits = fx.Int32(word)
-                    low = low + (bits << 16).bitcast(fx.Float32)
-                    high = high + (bits & fx.Int32(-65536)).bitcast(fx.Float32)
-                result = (
-                    Vec.from_elements([low, high], fx.Float32)
-                    .to(fx.BFloat16)
-                    .bitcast(fx.Int32)[0]
-                )
-                buffer_store(result, ar_out, pos // 2)
-            fx.barrier()
-            if tid == 0:
-                local_store_u32(flag_ptr, epoch)
-
-        if const_expr(fuse_ar and not ar_tagged):
-            # Resident CTAs exchange matching N tiles. The second handshake
-            # protects input reuse across back-to-back graph invocations.
-            tid = fx.thread_idx.x
-            bid = fx.block_idx.x
-            wait_barrier(0)
-            if tid == 0:
-                raw_cco.cco_system_fence(fx.Int32(1))
-            fx.barrier()
-            w = cco.CachedWindow(win)
-            flag_ptr = signal_ptr(
-                fx.Int64(w.lsa_ptr(ar_rank, AR_FLAG)) + fx.Int64(bid) * 4
-            )
-            epoch = fx.Int32(local_load_u32(flag_ptr)) + fx.Int32(1)
-            start_dst = (
-                fx.Int64(w.lsa_ptr(tid, AR_START)) + fx.Int64(bid * 8 + ar_rank) * 4
-            )
-            start_src = (
-                fx.Int64(w.lsa_ptr(ar_rank, AR_START)) + fx.Int64(bid * 8 + tid) * 4
-            )
-            end_dst = fx.Int64(w.lsa_ptr(tid, AR_END)) + fx.Int64(bid * 8 + ar_rank) * 4
-            end_src = fx.Int64(w.lsa_ptr(ar_rank, AR_END)) + fx.Int64(bid * 8 + tid) * 4
-            if tid < AR_WORLD:
-                signal_store_u32(signal_ptr(start_dst), epoch)
-                _spin_until(signal_ptr(start_src), epoch)
-            fx.barrier()
-            peer_inputs = [
-                create_buffer_resource_from_addr(
-                    wave_uniform_i64(w.lsa_ptr(p, AR_INPUT))
-                )
-                for p in range(AR_WORLD)
-            ]
-            ar_out = create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(ar_rank, AR_OUTPUT))
-            )
-            for pack in range(tid, c_m * fx.Int32(rows // 8), BLOCK):
-                token = pack // fx.Int32(rows // 8)
-                col = tile * fx.Int32(TILE) + (pack % fx.Int32(rows // 8)) * 8
-                off = (token * c_n + col) // 2
-                total = None
-                for p in range_constexpr(AR_WORLD):
-                    raw = Vec(
-                        buffer_load(
-                            peer_inputs[p],
-                            off,
-                            vec_width=4,
-                            dtype=i32_type(),
-                            cache_modifier=CM_SC1,
-                        )
-                    )
-                    value = raw.bitcast(fx.BFloat16).to(fx.Float32)
-                    total = value if total is None else total + value
-                buffer_store(total.to(fx.BFloat16).bitcast(fx.Int32), ar_out, off)
-            wait_barrier(0)
-            if tid < AR_WORLD:
-                signal_store_u32(signal_ptr(end_dst), epoch)
-                _spin_until(signal_ptr(end_src), epoch)
-            fx.barrier()
-            if tid == 0:
-                local_store_u32(flag_ptr, epoch)
-
     @flyc.jit
     def launch_gemv(
         W: fx.Tensor,
@@ -653,7 +485,6 @@ def compile_mxfp8_gemv(
         c_m: fx.Int32,
         c_n: fx.Int32,
         stream: fx.Stream,
-        win: fx.Int64 = 0,
     ):
         grid_x = ceildiv(c_n, WG_ROWS)
         kernel_gemv(
@@ -664,43 +495,10 @@ def compile_mxfp8_gemv(
             C,
             c_m,
             c_n,
-            win,
             value_attrs={
                 "rocdl.waves_per_eu": 1,
                 "rocdl.flat_work_group_size": f"{BLOCK},{BLOCK}",
             },
         ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
-    if not fuse_ar:
-        # Preserve the public positional ABI so _PinnedLaunch can still bind
-        # args + stream without an extra optional window argument.
-        @flyc.jit
-        def launch_plain(
-            W: fx.Tensor,
-            WS: fx.Tensor,
-            X: fx.Tensor,
-            XS: fx.Tensor,
-            C: fx.Tensor,
-            c_m: fx.Int32,
-            c_n: fx.Int32,
-            stream: fx.Stream,
-        ):
-            kernel_gemv(
-                W,
-                WS,
-                X,
-                XS,
-                C,
-                c_m,
-                c_n,
-                fx.Int64(0),
-                value_attrs={
-                    "rocdl.waves_per_eu": 1,
-                    "rocdl.flat_work_group_size": f"{BLOCK},{BLOCK}",
-                },
-            ).launch(
-                grid=(ceildiv(c_n, WG_ROWS), 1, 1), block=(BLOCK, 1, 1), stream=stream
-            )
-
-        return launch_plain
     return launch_gemv

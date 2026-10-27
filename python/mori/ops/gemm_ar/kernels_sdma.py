@@ -255,7 +255,6 @@ def build_sdma_phases(
     """
     cfg.validate()
     ws = cfg.world_size
-    gather_group = getattr(cfg, "gather_group", 0)
     specialization = hashlib.sha256(
         repr(
             (
@@ -272,10 +271,6 @@ def build_sdma_phases(
             )
         ).encode()
     ).hexdigest()[:16]
-    if gather_group and (not cfg.lsa_gather or gather_group not in (128, 256, 512)):
-        raise ValueError(
-            "group quantization requires FP8 LSA gather and group 128/256/512"
-        )
     if cfg.recv_slots < ws:
         raise ValueError(
             f"SDMA needs a landing slot per peer: build the ArConfig with "
@@ -489,17 +484,6 @@ def build_sdma_phases(
                 )
                 for j in range(1, ws)
             ]
-        group_out = group_scale = None
-        if const_expr(gather_group > 0):
-            group_out = create_buffer_resource_from_addr(
-                wave_uniform_i64(
-                    w.lsa_ptr(rank, cfg.gout_off + rank * cfg.slice_rows * cfg.n)
-                )
-            )
-            group_scale = create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(rank, cfg.gout_scale_slice_off(rank)))
-            )
-
         gtid = bid * threads + tid
         for pk in range(gtid, part, red_stride):
             i32_off = pk * I32_PER_PACK
@@ -546,21 +530,6 @@ def build_sdma_phases(
                 else acc.to(elem_dtype).bitcast(fx.Int32)
             )
             buffer_store(packed, out, i32_off, cache_modifier=CM_CACHED)
-            if const_expr(gather_group > 0):
-                values = packed.bitcast(fx.BFloat16).to(fx.Float32)
-                amax = fx.Float32(0.0)
-                for ee in range_constexpr(8):
-                    amax = amax.maximumf(values[ee].maximumf(-values[ee]))
-                for shift in range_constexpr((gather_group // 8).bit_length() - 1):
-                    amax = amax.maximumf(_bpermute_f32(amax, (tid % 64) ^ (1 << shift)))
-                scale = (amax == fx.Float32(0.0)).select(
-                    fx.Float32(1.0), amax / fx.Float32(448.0)
-                )
-                inv = fx.Float32(1.0) / scale
-                q = _pack8_fp8([values[ee] * inv for ee in range_constexpr(8)])
-                buffer_store(q, group_out, pk * 2)
-                if tid % (gather_group // 8) == 0:
-                    buffer_store(scale, group_scale, pk * 8 // gather_group)
 
     # --- reduce with the gather's puts fired from inside it -------------------
     #
@@ -1144,19 +1113,6 @@ def build_sdma_phases(
                 ]
                 for c in range_constexpr(chunks_per_row):
                     off = row * cfg.n + (c * WAVE + lane) * CHUNK_ELEMS
-                    if const_expr(gather_group > 0):
-                        scales = [
-                            fx.Float32(
-                                buffer_load(
-                                    scas[i],
-                                    off // gather_group,
-                                    vec_width=1,
-                                    dtype=fx.Float32,
-                                    cache_modifier=CM_SC1,
-                                )
-                            )
-                            for i in range_constexpr(ws - 1)
-                        ]
                     vals = [
                         buffer_load(
                             srcs[i],
@@ -1268,11 +1224,7 @@ def build_sdma_phases(
         # Folding the narrowing into the reduce replaces two phases with one.
         # `fuse_quantize=False` keeps them split, which is how the two are
         # compared.
-        head = (
-            ("reduce",)
-            if gather_group
-            else (("reduce_quant",) if fuse_quantize else ("reduce", "quantize"))
-        )
+        head = ("reduce_quant",) if fuse_quantize else ("reduce", "quantize")
         tail = head + (
             ("gather_barrier", "pull") if cfg.lsa_gather else ("gather", "dequantize")
         )

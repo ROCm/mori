@@ -73,7 +73,6 @@ see the comment at that line. The bug is still live in aiter.
 # the string "fx.Array[fx.Float8E4M3FN, a_lds_size, 16]" -- whose size operands
 # are locals of this factory and so cannot be resolved from the module globals.
 
-import hashlib
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -1163,7 +1162,7 @@ def compile_fused_gemm_scatter(
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
     chunk_bytes = m_tiles_per_chunk * BLOCK_M * N * cfg.scatter_elem_bytes
 
-    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}b{chunk_bands}"
+    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1178,10 +1177,25 @@ def compile_fused_gemm_scatter(
     if fp8_scatter and BLOCK_N != cfg.scatter_scale_n:
         raise ValueError("scatter scale tile must match BLOCK_N")
 
-    # Window offsets, wire formats and row masks are compile-time constants.
-    _kname_tag += (
-        "_cfg_" + hashlib.sha256(repr((cfg, relaxed_rows)).encode()).hexdigest()[:12]
-    )
+    # The kernel body reads these as compile-time constants. They are bound to
+    # scalars here, not read off ``cfg`` inside it, because FlyDSL keys its
+    # compile cache on scalar closure values only: a value read through ``cfg``
+    # would not be part of the key, and two configs differing only in it could
+    # share a cached kernel.
+    output_off = cfg.output_off
+    input_scale_off = cfg.input_scale_off
+    scatter_elem_bytes = cfg.scatter_elem_bytes
+    scatter_scale_slice_bytes = cfg.scatter_scale_slice_bytes
+    recv_scale_slot = cfg.recv_scale_slot_off(rank)
+    slice_bytes_rec = cfg.slice_bytes
+    # Options off by default add to the name only when on, so the default
+    # kernels keep the names profiles and traces filter on.
+    if chunk_bands:
+        _kname_tag += f"b{chunk_bands}"
+    if relaxed_rows:
+        _kname_tag += "R"
+    if fp8_scatter:
+        _kname_tag += "F"
 
     _kname = (
         f"mori_fused_{(transport if fuse else 'split')}_8w_"
@@ -1344,7 +1358,7 @@ def compile_fused_gemm_scatter(
                 N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
-                    num_records_bytes=cfg.slice_bytes,
+                    num_records_bytes=slice_bytes_rec,
                 ),
                 elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
             )
@@ -1361,7 +1375,7 @@ def compile_fused_gemm_scatter(
                 N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
-                    num_records_bytes=cfg.slice_bytes,
+                    num_records_bytes=slice_bytes_rec,
                 ),
                 elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
             )
@@ -1378,7 +1392,7 @@ def compile_fused_gemm_scatter(
                 N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
-                    num_records_bytes=cfg.slice_bytes,
+                    num_records_bytes=slice_bytes_rec,
                 ),
                 elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
             )
@@ -1397,7 +1411,7 @@ def compile_fused_gemm_scatter(
                 N_TILES_B,
                 peer_rsrc=create_buffer_resource_from_addr(
                     wave_uniform_i64(w_pre.lsa_ptr(dest_blk, my_recv_slot)),
-                    num_records_bytes=cfg.slice_bytes,
+                    num_records_bytes=slice_bytes_rec,
                 ),
                 elem_base=dest_blk * fx.Int32(slice_rows) * c_n,
             )
@@ -1681,13 +1695,13 @@ def compile_fused_gemm_scatter(
             # Sixteen lanes own a 256-column row segment; no inter-CTA amax.
             wait_barrier(0)
             qsrc = create_buffer_resource_from_addr(
-                wave_uniform_i64(w_pre.lsa_ptr(rank, cfg.output_off))
+                wave_uniform_i64(w_pre.lsa_ptr(rank, output_off))
             )
             qdst = create_buffer_resource_from_addr(
-                wave_uniform_i64(w_pre.lsa_ptr(rank, cfg.input_off))
+                wave_uniform_i64(w_pre.lsa_ptr(rank, in_off))
             )
             qscale = create_buffer_resource_from_addr(
-                wave_uniform_i64(w_pre.lsa_ptr(rank, cfg.input_scale_off))
+                wave_uniform_i64(w_pre.lsa_ptr(rank, input_scale_off))
             )
             qlane = fx.thread_idx.x % 16
             qrow = fx.thread_idx.x // 16
@@ -1792,7 +1806,7 @@ def compile_fused_gemm_scatter(
                                 lock = signal_ptr(lock_base + fx.Int64(dest) * 4)
                                 _acquire_peer_lock(lock)
                                 byte_off = fx.Int64(seg_lo) * fx.Int64(
-                                    N * cfg.scatter_elem_bytes
+                                    N * scatter_elem_bytes
                                 )
                                 sdma.put(
                                     dest,
@@ -1801,9 +1815,9 @@ def compile_fused_gemm_scatter(
                                     win,
                                     fx.Int64(in_off)
                                     + fx.Int64(global_lo)
-                                    * fx.Int64(N * cfg.scatter_elem_bytes),
+                                    * fx.Int64(N * scatter_elem_bytes),
                                     fx.Int64(seg_hi - seg_lo)
-                                    * fx.Int64(N * cfg.scatter_elem_bytes),
+                                    * fx.Int64(N * scatter_elem_bytes),
                                     dest % fx.Int32(sdma_queues),
                                     coop=cco.CoopScope.THREAD,
                                     signal=False,
@@ -1812,11 +1826,11 @@ def compile_fused_gemm_scatter(
                                     sdma.put(
                                         dest,
                                         win,
-                                        fx.Int64(cfg.recv_scale_slot_off(rank))
+                                        fx.Int64(recv_scale_slot)
                                         + fx.Int64(seg_lo)
                                         * fx.Int64((N // BLOCK_N) * 4),
                                         win,
-                                        fx.Int64(cfg.input_scale_off)
+                                        fx.Int64(input_scale_off)
                                         + fx.Int64(global_lo)
                                         * fx.Int64((N // BLOCK_N) * 4),
                                         fx.Int64(seg_hi - seg_lo)
@@ -1876,7 +1890,7 @@ def compile_fused_gemm_scatter(
                     )
                     ready_tiles = live_bands * fx.Int32(n_blocks_const)
                     put_bytes = fx.Int64(live_bands) * fx.Int64(
-                        BLOCK_M * N * cfg.scatter_elem_bytes
+                        BLOCK_M * N * scatter_elem_bytes
                     )
                 if seq % ready_tiles == fx.Int32(0):
                     if const_expr(emit_put) and dest != fx.Int32(rank):
@@ -1921,11 +1935,10 @@ def compile_fused_gemm_scatter(
                             sdma.put(
                                 dest,
                                 win,
-                                fx.Int64(cfg.recv_scale_slot_off(rank)) + scale_off,
+                                fx.Int64(recv_scale_slot) + scale_off,
                                 win,
-                                fx.Int64(cfg.input_scale_off)
-                                + fx.Int64(dest)
-                                * fx.Int64(cfg.scatter_scale_slice_bytes)
+                                fx.Int64(input_scale_off)
+                                + fx.Int64(dest) * fx.Int64(scatter_scale_slice_bytes)
                                 + scale_off,
                                 put_bytes * fx.Int64(4) // fx.Int64(BLOCK_N),
                                 dest % fx.Int32(sdma_queues),

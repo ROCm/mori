@@ -19,8 +19,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Public scheduling contracts, without acquiring GPU resources."""
+"""Public scheduling contracts: the planner without GPU resources, then its plans
+on real ranks through gemm_ar_schedule_worker.py."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -125,6 +130,22 @@ def test_unmeasured_inputs_keep_legacy_policy(make_op, world):
         assert other._schedule.counter_capacity == 8
 
 
+@pytest.mark.parametrize("world", [8, 4])
+def test_profile_applies_only_on_the_arch_it_was_fitted_on(make_op, monkeypatch, world):
+    """The wo_b plans are MI355X timings; MI300X/MI308X keep the default plan."""
+    monkeypatch.setattr("mori.ops.gemm_ar.op._device_arch", lambda: "gfx950")
+    assert make_op(world)._schedule.overrides
+    for arch in ("gfx942", None):
+        monkeypatch.setattr("mori.ops.gemm_ar.op._device_arch", lambda arch=arch: arch)
+        op = make_op(world)
+        assert not op._schedule.overrides
+        assert op._row_plan(op.padded_m(4200), 4200) == (
+            padded_m(4200, world, op.block_m),
+            0,
+            False,
+        )
+
+
 @pytest.mark.parametrize("gather", ["bf16", "fp8"])
 def test_fp8_wire_has_explicit_storage_and_profile(make_op, gather):
     op = make_op(4, scatter_dtype="fp8", gather_dtype=gather)
@@ -181,3 +202,57 @@ def test_tuned_self_test_rejects_nonfinite_output(make_op, monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", Mock())
     with pytest.raises(RuntimeError, match="self-test failed"):
         op.self_test(4200)
+
+
+# ── the public op on real ranks (gemm_ar_schedule_worker.py) ─────────────────
+
+_WORKER = Path(__file__).resolve().parent / "gemm_ar_schedule_worker.py"
+
+
+@pytest.mark.parametrize(
+    "world,args",
+    [
+        (8, ["--quant", "blockscale"]),
+        (8, ["--quant", "blockscale", "--schedule", "default"]),
+        (4, ["--quant", "mxfp8"]),
+        (4, ["--quant", "mxfp8", "--scatter", "fp8"]),
+        (4, ["--quant", "mxfp8", "--scatter", "fp8", "--gather", "fp8"]),
+    ],
+    ids=[
+        "tp8-blockscale",
+        "tp8-blockscale-default",
+        "tp4-mxfp8",
+        "tp4-fp8-scatter",
+        "tp4-fp8-both",
+    ],
+)
+def test_schedule_worker_on_real_ranks(world, args):
+    """The planner's plans executed: mixed-M graph replay, changed inputs, the
+    window guards and the FP8 wire payloads, which the host tests above cannot
+    reach."""
+    import torch
+
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    env = os.environ.copy()
+    env.setdefault("MORI_SOCKET_IFNAME", "lo")
+    env.setdefault("MORI_ENABLE_SDMA", "1")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={world}",
+            str(_WORKER),
+            *args,
+        ],
+        cwd=_WORKER.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output[-4000:]
+    assert "RESULT_JSON " in output, output[-4000:]

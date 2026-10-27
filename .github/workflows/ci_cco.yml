@@ -206,6 +206,7 @@ jobs:
             timeout 1800 python -m pytest -v \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
 
       - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
