@@ -178,7 +178,12 @@ std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPl
       finish = std::max(finish, available);
     }
   }
-  std::this_thread::sleep_until(finish);
+  // Linux sleep wakeups can add tens of microseconds, dwarfing a small KV copy.
+  // Sleep for the coarse part, then spend at most the final 100 us polling.
+  constexpr auto spin_tail = std::chrono::microseconds{100};
+  if (finish - Clock::now() > spin_tail) std::this_thread::sleep_until(finish - spin_tail);
+  while (Clock::now() < finish) {
+  }
   return std::make_unique<CompletedTransfer>();
 }
 

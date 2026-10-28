@@ -104,10 +104,14 @@ files are appended, and IDs restart with each client. Completion order can diffe
 from ID order. An empty trace path writes JSON through the UMBP INFO logger.
 
 `elapsed_ns` includes real control code, lock/queue waits and modeled transfer
-waits, ending before trace serialization/output. Trace output still costs wall
-time between calls. Timer/scheduler granularity can dominate very short modeled
-transfers. Background work contributes when it blocks an API or competes for a
-channel; its independent lifetime is not attributed to individual API calls.
+waits, ending before trace serialization/output. Trace output still delays the
+API return, so a caller timing the whole call also pays that overhead.
+The transfer wait sleeps until 100 microseconds before its
+completion deadline, then busy-waits for the remaining tail. This avoids the
+roughly 50-microsecond sleep overshoot seen on the initial CPU test host, at the
+cost of CPU time; scheduling contention can still delay completion. Very short
+operations can also be dominated by control and trace overhead. Background work
+contributes when it blocks an API or competes for a channel; its independent lifetime is not attributed to individual API calls.
 
 ## Boundaries
 
@@ -119,7 +123,9 @@ channel; its independent lifetime is not attributed to individual API calls.
 - This version does not replace framework-owned buffers, HBM-to-host L2 copies,
   model computation, or other framework latency. It is intended for trace/dummy
   execution; restored bytes and generated tokens cannot be checked for correctness.
-- The estimates depend on the control host, workload and supplied coefficients.
+- The estimates depend on the control host, workload, copy-thread count and supplied
+  coefficients. A profile calibrated with one concurrency configuration does not
+  establish accuracy for another.
   Full SGLang integration and calibration are follow-up validation work, not
   accuracy guarantees established by the unit tests.
 
