@@ -180,6 +180,12 @@ inline const char* ToString(LinkError e) {
   return "UNKNOWN";
 }
 
+struct LinkTransition {
+  int64_t agoMs{0};  // before the snapshot was published
+  LinkState state{LinkState::kIdle};
+  LinkError error{LinkError::kNone};
+};
+
 struct LinkInfo {
   RuntimeUuid peer;
   std::string peerHost;  // the endpoint this side connects to; empty if it never registered
@@ -205,6 +211,7 @@ struct LinkInfo {
   int64_t rttNs{0};          // latest round-trip time
   int64_t offsetNs{0};       // best clock-offset estimate: peer wall clock minus ours
   int64_t offsetBoundNs{0};  // its error bound
+  std::vector<LinkTransition> transitions;  // the last few state changes, oldest first
 };
 
 struct EventStats {
