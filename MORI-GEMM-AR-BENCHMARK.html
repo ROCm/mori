@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI GEMM + All-Reduce Benchmark &mdash; MORI development (69776c59) documentation</title>
+  <title>MORI GEMM + All-Reduce Benchmark &mdash; MORI development (9efd2648) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=9656bdc6"></script>
+      <script src="_static/documentation_options.js?v=2f79a335"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -722,9 +722,11 @@ than silently overwriting itself.</p>
 </table>
 <p><code class="docutils literal notranslate"><span class="pre">--quant</span></code> picks the operand contract, and it is per model – <code class="docutils literal notranslate"><span class="pre">blockscale</span></code> for
 V4-Pro (A 1x128, B 128x128, fp32 scales), <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> for V4.1-Flash (32-wide ue8m0
-on both, int32). Two more exist and are not for use: <code class="docutils literal notranslate"><span class="pre">mxfp8_unpacked</span></code> and
-<code class="docutils literal notranslate"><span class="pre">mxfp8_row</span></code> are the scale layouts <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> was chosen over, kept so the choice
-stays measurable.</p>
+on both, int32). <code class="docutils literal notranslate"><span class="pre">mxfp8_raw</span></code> is the same quantisation with the scales as
+row-major uint8 bytes, staged through LDS; it is the faster of the two cold
+and at large M (see the op README). Two more exist and are not for use:
+<code class="docutils literal notranslate"><span class="pre">mxfp8_unpacked</span></code> and <code class="docutils literal notranslate"><span class="pre">mxfp8_row</span></code> are the scale layouts <code class="docutils literal notranslate"><span class="pre">mxfp8</span></code> was chosen over,
+kept so the choice stays measurable.</p>
 <blockquote>
 <div><p><strong>Pin <code class="docutils literal notranslate"><span class="pre">--quant</span></code> when comparing anything against anything.</strong> The benchmark
 defaults to <code class="docutils literal notranslate"><span class="pre">ptpc</span></code>, which is ~3% faster than <code class="docutils literal notranslate"><span class="pre">blockscale</span></code> and a different
@@ -899,7 +901,7 @@ regression</strong> that did not exist.</p>
 
   <div role="contentinfo">
     <p>&#169; Copyright 2026, AMD.
-      <span class="lastupdated">Last updated on 2026-10-27.
+      <span class="lastupdated">Last updated on 2026-10-28.
       </span></p>
   </div>
 
