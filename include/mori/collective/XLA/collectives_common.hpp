@@ -179,19 +179,18 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 // (peer - myPe)*stride4G<<32 used by every push and pull kernel.
 template <class T>
 __device__ __forceinline__ T* PeerPtr(T* p, int peer, int myPe, uint32_t stride4G) {
-  const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
-  return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) +
-                              (static_cast<uint64_t>(diff) << 32));
+  const int32_t stride = (peer - myPe) * static_cast<int32_t>(stride4G);
+  const uint64_t ofs = static_cast<uint64_t>(stride) << 32;
+  return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) + ofs);
 }
 
 template <class A, class B>
 __device__ __forceinline__ std::pair<A*, B*> PeerPtrs(A* a, B* b, 
                                       int peer, int myPe, uint32_t stride4G) {
-  const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
-  return std::make_pair(reinterpret_cast<A*>(reinterpret_cast<uintptr_t>(a) +
-                              (static_cast<uint64_t>(diff) << 32)),
-                        reinterpret_cast<B*>(reinterpret_cast<uintptr_t>(b) +
-                              (static_cast<uint64_t>(diff) << 32)));
+  const int32_t stride = (peer - myPe) * static_cast<int32_t>(stride4G);
+  const uint64_t ofs = static_cast<uint64_t>(stride) << 32;
+  return std::make_pair(reinterpret_cast<A*>(reinterpret_cast<uintptr_t>(a) + ofs),
+                        reinterpret_cast<B*>(reinterpret_cast<uintptr_t>(b) + ofs));
 }
 
 // SDMA ATOMIC `operation` takes TC atomic opcodes (SDMA_ATOMIC_ADD64 = 47 is
@@ -435,7 +434,7 @@ struct ScatterPeer {
 
 template <uint64_t ElemBytes = 1, class PeerFn>
 __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int npes, int logS,
-                                                 PeerFn peerOf, uint64_t value) {
+                                                 uint64_t value, PeerFn peerOf) {
 
   static_assert(ElemBytes > 0 && VecBytes % ElemBytes == 0,
                 "ElemBytes must divide VecBytes");

@@ -381,17 +381,16 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
     // bijection over the npes-1 non-self peers.
     StartSdmaScatter<sizeof(T)>(
-        devComm.sdma, npes, logS,
+        devComm.sdma, npes, logS, pushGen,
         [=](int peer) {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
+          auto [stagingP, arrivedP] = PeerPtrs(staging + slot * chunkElems, 
+                        arrived + myPe * kArrivedStride, peer, myPe, stride4G);
           return ScatterPeer{
               peer != myPe, chunkElems,
               reinterpret_cast<const uint8_t*>(input + peer * chunkElems),
-              PeerPtr(reinterpret_cast<uint8_t*>(staging + slot * chunkElems), peer, myPe,
-                      stride4G),
-              PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
-        },
-        pushGen);
+              reinterpret_cast<uint8_t*>(stagingP), arrivedP};
+        });
   }
   
   // Phase 2-3: walk all S slices in the order the senders queued them, reducing

@@ -154,16 +154,16 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // is skipped. The dst slot stride is the DESTINATION peer's length (its
     // staging slots are that size). 
     StartSdmaScatter<sizeof(T)>(
-        devComm.sdma, npes, logS,
+        devComm.sdma, npes, logS, pushGen,
         [=](int peer) {
           const int slot = (myPe < peer ? myPe : myPe - 1);   // my slot in peer's staging
           const size_t len = shardLen(peer);
+          auto [dstP, sigP] = PeerPtrs(reinterpret_cast<uint8_t*>(staging + slot * len),
+                                       arrived + myPe * kArrivedStride, peer, myPe, stride4G);
           return ScatterPeer{
               peer != myPe, len, reinterpret_cast<const uint8_t*>(input + peer * strideElems),
-              PeerPtr(reinterpret_cast<uint8_t*>(staging + slot * len), peer, myPe, stride4G),
-              PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
-        },
-        pushGen);
+              dstP, sigP};
+        });
 
     // Pre-post both broadcasts behind the scatter, each parked on its counter
     // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole

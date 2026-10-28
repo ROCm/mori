@@ -73,14 +73,14 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
   // round trip and keeps no "output at heap offset 0" assumption. The source is
   // our single shard (same for all peers).
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0,
+      devComm.sdma, npes, /*logS=*/0, pushGen,
       [=](int peer) {
         auto *localDst = reinterpret_cast<uint8_t*>(output) + myPe * chunkBytes;
+        auto [dstP, sigP] = PeerPtrs(localDst, arrived + myPe * kArrivedStride,
+                                     peer, myPe, stride4G);
         return ScatterPeer{true, chunkBytes, reinterpret_cast<const uint8_t*>(input),
-                           PeerPtr(localDst, peer, myPe, stride4G),
-                           PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
-      },
-      pushGen);
+                           dstP, sigP};
+      });
 
   // === Phase 2: wait until all npes senders (self-copy included) signalled. ===
   if (threadIdx.x < warpSize) {
