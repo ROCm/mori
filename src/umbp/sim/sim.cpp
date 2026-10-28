@@ -271,7 +271,7 @@ std::unique_ptr<TransferPlanBuilder> SimTransferEngine::CreatePlanBuilder(size_t
       *this, MakeRdmaPlanBuilder(engine_key_, bounce_ref_.size, bounce_ref_));
 }
 
-std::optional<SimTransferEngine::Clock::time_point> SimTransferEngine::Reserve(
+std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
     const std::vector<TransferPlan>& plans, Clock::time_point submitted, bool serial_cpu) {
   // Profiles measure submit-to-completion; model calculation consumes that same budget.
   std::array<long double, 6> bytes{};
@@ -294,8 +294,8 @@ std::optional<SimTransferEngine::Clock::time_point> SimTransferEngine::Reserve(
     }
   }
   // Charge fixed latency once per path in this submit batch, independent of page fragmentation.
-  std::array<long double, 6> service_ns{};
-  long double private_ns = 0;
+  std::array<long double, 6> service_ns{}, local_service_ns{};
+  long double private_ns = 0, local_private_ns = 0;
   for (size_t i = 0; i < bytes.size(); ++i) {
     if (bytes[i] == 0) continue;
     const auto& path = *paths_[i];
@@ -308,9 +308,13 @@ std::optional<SimTransferEngine::Clock::time_point> SimTransferEngine::Reserve(
                               : 1;
     const auto latency =
         AtThreads(path.latency_ns, threads) + copies[i] * AtThreads(path.copy_latency_ns, threads);
-    private_ns =
-        std::max(private_ns, latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads));
+    const auto duration = latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads);
+    private_ns = std::max(private_ns, duration);
     service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
+    if (i < 4) {
+      local_private_ns = std::max(local_private_ns, duration);
+      local_service_ns[path.channel] = service_ns[path.channel];
+    }
   }
   auto deadline = [](Clock::time_point start, long double ns) -> std::optional<Clock::time_point> {
     const auto remaining =
@@ -320,39 +324,52 @@ std::optional<SimTransferEngine::Clock::time_point> SimTransferEngine::Reserve(
     return start + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns)));
   };
   auto finish = deadline(submitted, private_ns);
-  if (!finish) return std::nullopt;
+  auto local_finish = deadline(submitted, local_private_ns);
+  if (!finish || !local_finish) return std::nullopt;
   std::lock_guard<std::mutex> lock(mutex_);
   auto next = available_;
   for (size_t i = 0; i < service_ns.size(); ++i) {
     if (service_ns[i] == 0) continue;
-    const auto end = deadline(std::max(submitted, next[i]), service_ns[i]);
+    const auto start = std::max(submitted, next[i]);
+    const auto end = deadline(start, service_ns[i]);
     if (!end) return std::nullopt;
+    // Local paths precede remote paths on a shared channel, but only the local
+    // prefix must finish inline. Reserve the entire batch atomically below.
+    if (local_service_ns[i] > 0) {
+      const auto local_end = deadline(start, local_service_ns[i]);
+      if (!local_end) return std::nullopt;
+      local_finish = std::max(*local_finish, *local_end);
+    }
     next[i] = *end;
     finish = std::max(*finish, *end);
   }
   available_ = next;  // Commit only after every deadline has passed overflow validation.
-  return finish;
+  return Reservation{*finish, *local_finish};
 }
 
 std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPlan> plans) {
   const auto submitted = Clock::now();
   if (plans.empty()) return nullptr;
   if (std::none_of(plans.begin(), plans.end(), [](const auto& plan) { return plan.uses_bounce; })) {
-    const auto finish = Reserve(plans, submitted);
-    if (!finish) return nullptr;
-    if (std::all_of(plans.begin(), plans.end(),
-                    [](const auto& plan) { return plan.dir == TransferDirection::kLocal; }))
-      WaitUntil(*finish);
-    return std::make_unique<SimHandle>(*finish);
+    const auto reservation = Reserve(plans, submitted);
+    if (!reservation) return nullptr;
+    WaitUntil(reservation->local_finish);
+    return std::make_unique<SimHandle>(reservation->finish);
   }
   std::vector<TransferPlan> direct, bounced;
   for (auto& plan : plans) {
     if (plan.uses_bounce && plan.dir == TransferDirection::kLocal) return nullptr;
     (plan.uses_bounce ? bounced : direct).push_back(std::move(plan));
   }
-  const auto finish = Reserve(direct, submitted);
-  if (!finish) return nullptr;
-  auto handle = std::make_unique<SimHandle>(*finish);
+  const auto reservation = Reserve(direct, submitted);
+  if (!reservation) return nullptr;
+  WaitUntil(reservation->local_finish);
+  auto handle = std::make_unique<SimHandle>(reservation->finish);
+  auto reserve_and_wait = [&](const std::vector<TransferPlan>& plans, bool serial_cpu = false) {
+    const auto next = Reserve(plans, Clock::now(), serial_cpu);
+    if (next) WaitUntil(next->finish);
+    return next.has_value();
+  };
   // Reuse mori-io's submit-direct-first, inline-staging ordering. No payload access.
   for (auto& plan : bounced) {
     std::lock_guard<std::mutex> lock(bounce_mutex_);
@@ -369,16 +386,10 @@ std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPl
       auto planned = Plan(copies);
       if (!planned.rejected_tags.empty()) return false;
       // MoriIoEngine stages with serial HostCopyBlock calls, without CPU fan-out.
-      const auto deadline = Reserve(planned.plans, Clock::now(), true);
-      if (deadline) WaitUntil(*deadline);
-      return deadline.has_value();
+      return reserve_and_wait(planned.plans, true);
     };
     bool ok = !copies.empty() && (!push || stage());
-    if (ok) {
-      const auto deadline = Reserve({plan}, Clock::now());
-      ok = deadline.has_value();
-      if (ok) WaitUntil(*deadline);
-    }
+    if (ok) ok = reserve_and_wait({plan});
     if (ok && !push) ok = stage();
     if (!ok) {
       TransferFailure failure;

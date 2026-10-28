@@ -471,7 +471,7 @@ bool DistributedClient::SupportsRangedIO() const {
   // touches an arena.  Requiring one there would make an embedded deployment
   // either report ranged I/O as unsupported or allocate two arenas it cannot
   // use.
-  if (config_.sim.enabled || local_only_) return true;
+  if (local_only_) return true;
   return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
 }
 

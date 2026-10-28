@@ -141,18 +141,15 @@ def main():
         default=256,
         help="maximum aggregate payload MiB per case, across all callers",
     )
-    for phase in ("train", "validation"):
+    for phase, option in itertools.product(
+        ("train", "validation"), ("block-bytes", "batches")
+    ):
+        label = "block sizes in bytes" if option == "block-bytes" else "batch sizes"
         parser.add_argument(
-            f"--{phase}-block-bytes",
+            f"--{phase}-{option}",
             type=int,
             nargs="+",
-            help=f"{phase} block sizes in bytes; replaces the default list",
-        )
-        parser.add_argument(
-            f"--{phase}-batches",
-            type=int,
-            nargs="+",
-            help=f"{phase} batch sizes; replaces the default list",
+            help=f"{phase} {label}; replaces the default list",
         )
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--rounds", type=int, default=3)
@@ -233,18 +230,15 @@ def main():
             raise ValueError("probe returned no measurements")
         for row in rows:
             row = {k: v if k == "api" else int(v) for k, v in row.items()}
-            if (
-                min(
-                    row[k]
-                    for k in (
-                        "block_bytes",
-                        "batch",
-                        "effective_threads",
-                        "concurrency",
-                        "elapsed_ns",
-                    )
+            if any(
+                row[k] <= 0
+                for k in (
+                    "block_bytes",
+                    "batch",
+                    "effective_threads",
+                    "concurrency",
+                    "elapsed_ns",
                 )
-                <= 0
             ):
                 raise ValueError("probe returned invalid measurements")
             shape = (row["block_bytes"], row["batch"])

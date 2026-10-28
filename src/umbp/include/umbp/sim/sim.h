@@ -89,8 +89,12 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
     std::vector<double> copy_latency_ns;
     double capacity;
   };
-  std::optional<Clock::time_point> Reserve(const std::vector<TransferPlan>& plans,
-                                           Clock::time_point submitted, bool serial_cpu = false);
+  struct Reservation {
+    Clock::time_point finish;
+    Clock::time_point local_finish;
+  };
+  std::optional<Reservation> Reserve(const std::vector<TransferPlan>& plans,
+                                     Clock::time_point submitted, bool serial_cpu = false);
   // Four local memory paths, remote_read, remote_write; channels may be shared.
   std::array<std::optional<Path>, 6> paths_;
   std::mutex mutex_;

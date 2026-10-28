@@ -876,47 +876,30 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "client/server sim mode mismatch");
       return grpc::Status::OK;
     }
-    if (request->simulation()) {
-      std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
-      RegisterSimMemory(*request, response);
-      if (response->ok() && !EnsureExternalIdentity(*request))
-        MORI_UMBP_WARN("[StandaloneServer] sim external-KV identity registration failed");
-      return grpc::Status::OK;
-    }
-    if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
-      std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
-      RegisterGpuIpc(*request, response);
-      if (response->ok() && !EnsureExternalIdentity(*request)) {
-        MORI_UMBP_WARN(
-            "[StandaloneServer] external-KV identity registration failed for client_id={} "
-            "worker_node_id={}; continuing with core GPU registration",
-            request->client_id(), request->worker_node_id());
-      }
-      return grpc::Status::OK;
-    }
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
-    bool ok = false;
-    {
-      std::shared_lock<std::shared_mutex> lock(memory_mu_);
-      auto it = memory_.find(request->client_id());
-      if (it != memory_.end()) {
-        ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
-          return mem.worker_base == request->worker_base() && mem.size >= request->size();
-        });
+    if (request->simulation()) {
+      RegisterSimMemory(*request, response);
+    } else if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
+      RegisterGpuIpc(*request, response);
+    } else {
+      bool ok = false;
+      {
+        std::shared_lock<std::shared_mutex> lock(memory_mu_);
+        auto it = memory_.find(request->client_id());
+        if (it != memory_.end()) {
+          ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+            return mem.worker_base == request->worker_base() && mem.size >= request->size();
+          });
+        }
       }
+      SetBool(response, ok, ok ? "" : "fd handoff registration was not found");
     }
-    if (!ok) {
-      SetBool(response, false, "fd handoff registration was not found");
-      return grpc::Status::OK;
-    }
-
-    if (!EnsureExternalIdentity(*request)) {
+    if (response->ok() && !EnsureExternalIdentity(*request)) {
       MORI_UMBP_WARN(
           "[StandaloneServer] external-KV identity registration failed for client_id={} "
           "worker_node_id={}; continuing with core memory registration",
           request->client_id(), request->worker_node_id());
     }
-    SetBool(response, true);
     return grpc::Status::OK;
   }
 

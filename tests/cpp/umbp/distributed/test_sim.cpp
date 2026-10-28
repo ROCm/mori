@@ -57,7 +57,10 @@ class SimTest : public ::testing::Test {
     Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":1000000,
                            "bandwidth_bytes_per_second":4096000}})");
   }
-  void TearDown() override { std::filesystem::remove_all(dir_); }
+  void TearDown() override {
+    servers_.clear();
+    std::filesystem::remove_all(dir_);
+  }
   void Profile(const std::string& paths) {
     std::ofstream(dir_ + "/profile.json") << R"({"id":"test","paths":)" << paths << "}";
   }
@@ -78,6 +81,21 @@ class SimTest : public ::testing::Test {
     config.standalone_process.emplace();
     config.standalone_process->address = "unix:" + dir_ + "/server.sock";
     return config;
+  }
+  std::unique_ptr<IUMBPClient> Client(UMBPConfig config, bool use_standalone) {
+    if (use_standalone) {
+      auto rank = RankConfig();
+      rank.sim.trace_path = config.sim.trace_path;
+      rank.standalone_process->address =
+          "unix:" + dir_ + "/server-" + std::to_string(servers_.size()) + ".sock";
+      config.sim.trace_path += ".server";
+      auto server =
+          std::make_unique<standalone::StandaloneServer>(config, rank.standalone_process->address);
+      if (!server->Start()) throw std::runtime_error("standalone server failed to start");
+      servers_.push_back(std::move(server));
+      config = rank;
+    }
+    return CreateUMBPClient(config);
   }
   std::unique_ptr<PageBackend> Backend(SimTransferEngine& engine, MemLoc loc, size_t pages = 4) {
     auto backend = std::make_unique<PageBackend>(
@@ -103,35 +121,17 @@ class SimTest : public ::testing::Test {
   }
   SimPageMemorySource memory_{MemLoc::CPU, -1};
   std::string dir_;
+  std::vector<std::unique_ptr<standalone::StandaloneServer>> servers_;
 };
 
 // Exercise the same API contract embedded and through the standalone IPC boundary.
-class SimApiTest : public SimTest, public ::testing::WithParamInterface<bool> {
- protected:
-  std::unique_ptr<IUMBPClient> Client(UMBPConfig config) {
-    if (GetParam()) {
-      auto rank = RankConfig();
-      rank.sim.trace_path = config.sim.trace_path;
-      config.sim.trace_path += ".server";
-      server_ =
-          std::make_unique<standalone::StandaloneServer>(config, rank.standalone_process->address);
-      if (!server_->Start()) throw std::runtime_error("standalone server failed to start");
-      config = rank;
-    }
-    return CreateUMBPClient(config);
-  }
-  void TearDown() override {
-    server_.reset();
-    SimTest::TearDown();
-  }
-  std::unique_ptr<standalone::StandaloneServer> server_;
-};
+class SimApiTest : public SimTest, public ::testing::WithParamInterface<bool> {};
 INSTANTIATE_TEST_SUITE_P(EmbeddedAndStandalone, SimApiTest, ::testing::Bool());
 
 TEST_P(SimApiTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   auto config = Config();
   const auto ptr = Buffer(8 * kPage);
-  auto client = Client(config);
+  auto client = Client(config, GetParam());
   ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage));
   EXPECT_TRUE(client->Put("scalar", ptr, 2 * kPage));
   EXPECT_TRUE(client->Get("scalar", ptr, 2 * kPage));
@@ -201,7 +201,7 @@ TEST_P(SimApiTest, RegisteredGpuCallerToDramAndHbmNeedsNoDevice) {
     config.distributed->medium = medium;
     config.distributed->hbm.capacity_bytes = 32 * kPage;
     const auto ptr = Buffer(4 * kPage);
-    auto client = Client(config);
+    auto client = Client(config, GetParam());
     ASSERT_TRUE(client->RegisterMemory(ptr, 4 * kPage, MemLoc::GPU, 0));
     EXPECT_TRUE(client->Put("gpu", ptr + kPage, kPage));
     EXPECT_TRUE(client->Get("gpu", ptr + 2 * kPage, kPage));
@@ -283,7 +283,8 @@ TEST_F(SimTest, BufferedTracePreservesEscapingAndIntegerPrecision) {
   std::ifstream input(config.trace_path);
   std::string line;
   ASSERT_TRUE(std::getline(input, line));
-  EXPECT_NE(line.find(std::to_string(id)), std::string::npos);
+  EXPECT_NE(line.find("\"call_id\":" + std::to_string(id) + ","), std::string::npos);
+  EXPECT_NE(line.find("\"start_ns\":" + std::to_string(id) + ","), std::string::npos);
   google::protobuf::Struct record;
   ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(line, &record).ok());
   EXPECT_EQ(record.fields().at("profile_path").string_value(), config.profile_path);
@@ -534,6 +535,39 @@ std::string Packed(const PeerDirectory& engine) {
   return {bytes.begin(), bytes.end()};
 }
 
+TEST_F(SimTest, MixedSubmitWaitsForLocalPrefixAndReservesRemoteCompletion) {
+  for (bool shared : {false, true}) {
+    SCOPED_TRACE(shared ? "shared channel" : "independent channels");
+    Profile(std::string(R"({"cpu_cpu":{"channel":"host","latency_ns":20000000,
+      "bandwidth_bytes_per_second":1e12},"remote_write":{"channel":")") +
+            (shared ? "host" : "nic") +
+            R"(","latency_ns":100000000,"bandwidth_bytes_per_second":1e12}})");
+    SimTransferEngine caller(Config().sim.profile_path, "caller");
+    SimTransferEngine owner(Config().sim.profile_path, "owner");
+    ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
+    auto* buffer = reinterpret_cast<void*>(Buffer(kPage));
+    const auto local = caller.RegisterMemory(buffer, kPage, MemLoc::CPU, -1);
+    const auto remote =
+        TransferRef::Remote(owner.RegisterMemory(buffer, kPage, MemLoc::CPU, -1).mem);
+    auto plans = caller.Plan({{local, 0, local, 0, kPage, 0}, {local, 0, remote, 0, kPage, 1}});
+    ASSERT_EQ(plans.plans.size(), 2u);
+    const auto start = Clock::now();
+    auto mixed = caller.Submit(std::move(plans.plans));
+    ASSERT_NE(mixed, nullptr);
+    EXPECT_GE(Clock::now() - start, 20ms);
+    EXPECT_LT(Clock::now() - start, 80ms);  // The remote part remains asynchronous.
+    auto next = caller.Plan({{local, 0, remote, 0, kPage, 0}});
+    auto queued = caller.Submit(std::move(next.plans));
+    ASSERT_NE(queued, nullptr);
+    std::vector<TransferFailure> failures;
+    mixed->Wait(&failures);
+    EXPECT_GE(Clock::now() - start, shared ? 120ms : 100ms);
+    queued->Wait(&failures);
+    EXPECT_GE(Clock::now() - start, shared ? 220ms : 200ms);
+    EXPECT_TRUE(failures.empty());
+  }
+}
+
 TEST_F(SimTest, RemotePlansPreservePeerIdentityAndAsynchronousCompletion) {
   Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e12},
     "remote_read":{"channel":"nic-rx","latency_ns":80000000,"bandwidth_bytes_per_second":1e12},
@@ -607,9 +641,9 @@ class SimClusterTest : public SimTest {
     ptr_ = Buffer(64 * kPage);
   }
   void TearDown() override {
+    SimTest::TearDown();
     master_->Shutdown();
     if (thread_.joinable()) thread_.join();
-    SimTest::TearDown();
   }
   UMBPConfig Node(const std::string& id, size_t pages = 32) {
     auto config = Config();
@@ -646,11 +680,16 @@ class SimClusterTest : public SimTest {
   std::thread thread_;
 };
 
-TEST_F(SimClusterTest, PublicShareAndRangedOffloadRunRealControlRpcs) {
-  auto owner = CreateUMBPClient(Node("owner", 64));
+class SimClusterApiTest : public SimClusterTest, public ::testing::WithParamInterface<bool> {};
+INSTANTIATE_TEST_SUITE_P(EmbeddedAndStandalone, SimClusterApiTest, ::testing::Bool());
+
+TEST_P(SimClusterApiTest, PublicShareAndRangedOffloadRunRealControlRpcs) {
+  auto owner = Client(Node("owner", 64), GetParam());
+  ASSERT_TRUE(owner->RegisterMemory(ptr_, 64 * kPage));
   ASSERT_TRUE(owner->Put("shared", ptr_, 2 * kPage));
   ASSERT_TRUE(owner->Flush());
-  auto reader = CreateUMBPClient(Node("reader", 1));
+  auto reader = Client(Node("reader", 1), GetParam());
+  ASSERT_TRUE(reader->SupportsRangedIO());
   ASSERT_TRUE(reader->RegisterMemory(ptr_, 64 * kPage));
   ASSERT_TRUE(Await([&] { return reader->Exists("shared"); }));
   auto start = Clock::now();
@@ -686,6 +725,24 @@ TEST_F(SimClusterTest, PublicShareAndRangedOffloadRunRealControlRpcs) {
     }
   }
   EXPECT_TRUE(timed_remote_get);
+}
+
+TEST_P(SimClusterApiTest, RemoteRangedIoRequiresScratch) {
+  auto owner = Client(Node("owner", 64), GetParam());
+  ASSERT_TRUE(owner->RegisterMemory(ptr_, 64 * kPage));
+  ASSERT_TRUE(owner->Put("shared", ptr_, 2 * kPage));
+  ASSERT_TRUE(owner->Flush());
+  auto config = Node("reader", 1);
+  config.distributed->ranged_scratch_size = 0;
+  auto reader = Client(config, GetParam());
+  EXPECT_FALSE(reader->SupportsRangedIO());
+  ASSERT_TRUE(reader->RegisterMemory(ptr_, 64 * kPage));
+  ASSERT_TRUE(reader->Get("shared", ptr_, 2 * kPage));
+  EXPECT_EQ(reader->BatchGetRanges({"shared"}, {{ptr_}}, {{kPage}}, {{0}}),
+            std::vector<bool>{false});
+  EXPECT_EQ(reader->BatchPutRanges({"offload"}, {2 * kPage}, {{ptr_}}, {{2 * kPage}}, {{0}}),
+            std::vector<bool>{false});
+  EXPECT_FALSE(owner->Exists("offload"));
 }
 
 TEST_F(SimClusterTest, RemoteRecacheAndEvictionKeepRealMetadata) {
