@@ -1421,19 +1421,18 @@ void PoolClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
     throw std::logic_error("pool must be initialized and Indexer configured once");
   if (registry_.Get(TierType::DRAM) == nullptr)
     throw std::invalid_argument("KV Indexer reporting requires a local DRAM backend");
-  kv_indexer_ = std::make_shared<KvIndexerReporter>(config, [this] {
-    std::unordered_set<std::string> resident;
+  kv_indexer_ = std::make_shared<KvIndexerReporter>(config, [this](const std::string& key) {
     for (const auto* backend : registry_.All()) {
       if (backend->Tier() != TierType::DRAM) continue;
-      for (const auto& event : backend->SnapshotOwnedKeys()) resident.insert(event.key);
+      if (backend->Contains(key)) return true;
     }
-    return resident;
+    return false;
   });
   std::weak_ptr<KvIndexerReporter> weak = kv_indexer_;
   for (auto* backend : registry_.All()) {
     if (backend->Tier() == TierType::DRAM)
-      backend->SetChangeHook([weak] {
-        if (auto reporter = weak.lock()) reporter->Notify();
+      backend->SetChangeHook([weak](const auto& keys) {
+        if (auto reporter = weak.lock()) reporter->Notify(keys);
       });
   }
   kv_indexer_->Notify();

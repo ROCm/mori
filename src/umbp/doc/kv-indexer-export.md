@@ -47,13 +47,14 @@ and `swa_window_tokens`; metadata must describe every configured component.
 Registered parent links must be acyclic. Each component is reported only when
 all its keys are committed; FULL is required. Eviction updates/revokes the mask.
 
-Commit, eviction and clear hooks wake one background reporter, including batch,
-ranged and peer operations. It batches changes into at most 256 actions per RPC
-and leaves the UMBP master's event queue untouched. RPC failures do not change
-PUT success. `flush()` synchronizes current residency and returns false on RPC
-failure. Background retries wait one second even during writes and resample
-current state. A rebuild every 30 seconds also repairs quiet Indexer restarts;
-rebuilds may briefly reduce hits.
+Commit and eviction hooks identify affected blocks by key; clear checks all
+registered blocks. Residency checks and RPCs run outside the metadata lock, and
+the UMBP master's event queue is untouched. REPORT actions pack parent-child
+chains, with at most 256 actions and 16384 hashes per RPC. `flush()` synchronizes
+pending changes and returns false on RPC failure. Background retries wait one
+second even during writes, resample current state and retain ambiguous reports
+for withdrawal. Every 30 seconds the reporter checks and re-reports all known
+live blocks to repair quiet Indexer restarts, without clearing DRAM first.
 
 Promotion into DRAM uses the same commit hook and reports known blocks when
 complete; moving the last DRAM copy out revokes it. Copying to another tier while
@@ -61,7 +62,9 @@ retaining DRAM leaves its residency intact. HBM/SSD residency is not published b
 this reporter. Promotion of a block with no known metadata cannot advertise it.
 
 Configure once per storage owner. Standalone clients run their configured
-callback and forward metadata to that owner; closing a forwarder does not
+callback and send metadata with each batch write; the owner validates it before
+writing. New forwarders require an owner advertising batched metadata support.
+Closing a forwarder does not
 withdraw shared data. Supply metadata where
 all required keys reside: reporting covers local DRAM backends, not cross-owner
 aggregation. Use one writer per worker's DRAM bucket and match the Router worker
@@ -71,6 +74,12 @@ An engine bridge sharing this identity must only mutate HBM. The upstream bridge
 also maps `CPU_PINNED` to DRAM and clears all tiers by default. Set its
 `KV_INDEXER_CLEAR_TIERS=HBM` and exclude non-HBM store/remove events before they
 reach the bridge. Tier eligibility masks do not filter these mutations.
+
+Shared DRAM across multiple Indexer worker identities requires an upstream pool
+identity protocol and is not supported here. Metadata is retained after eviction
+to support SSD promotion; automatic reclamation remains open. Incremental work
+avoids scanning this history on every write, but memory use and the periodic
+repair still grow with registered metadata.
 
 Reporting is opt-in and requires the endpoint and metadata above. No manual
 report/revoke calls are needed; wiring the metadata callback is the integration's

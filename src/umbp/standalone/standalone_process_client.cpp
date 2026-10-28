@@ -53,6 +53,22 @@ namespace {
 
 std::atomic<uint64_t> g_client_counter{0};
 
+void EncodeKvBlock(const KvBlockMetadata& block, ::umbp::StandaloneKvBlock* request) {
+  request->set_hash(block.hash);
+  if (block.parent) request->set_parent(*block.parent);
+  request->set_block_size(block.block_size);
+  for (const auto& [bit, keys] : block.component_keys) {
+    auto* component = request->add_components();
+    component->set_component(bit);
+    for (const auto& key : keys) component->add_keys(key);
+  }
+}
+
+void CheckKvMetadataStatus(const grpc::Status& status) {
+  if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT)
+    throw std::invalid_argument(status.error_message());
+}
+
 // Travels with a ranged get that names its keys by handle, so the server can
 // check the handle still stands for the list the caller means. It is a check,
 // not the lookup: both sides also hold the keys themselves and the client side
@@ -336,8 +352,10 @@ std::vector<bool> StandaloneProcessClient::BatchPutRequest(const std::vector<std
                                                            Request& req, Rpc rpc) {
   const std::vector<bool> failed(keys.size(), false);
   if (closing_) return failed;
-  PrepareKvMetadata(keys);
+  if (kv_metadata_provider_)
+    for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
   std::shared_lock lk(op_mutex_);
+  if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
   if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) return failed;
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
@@ -351,6 +369,7 @@ std::vector<bool> StandaloneProcessClient::BatchPutRequest(const std::vector<std
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
   auto status = (stub_.get()->*rpc)(&ctx, req, &resp);
+  CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
@@ -546,14 +565,16 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
     const std::vector<std::vector<size_t>>& dst_offsets) {
   std::vector<bool> failed(keys.size(), false);
   if (closing_) return failed;
-  PrepareKvMetadata(keys);
+  ::umbp::BatchRangeDataRequest req;
+  if (kv_metadata_provider_)
+    for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
   std::shared_lock lk(op_mutex_);
+  if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
   if (closed_ || object_sizes.size() != keys.size() ||
       !RangeBatchShapeValid(keys.size(), srcs, sizes, dst_offsets)) {
     return failed;
   }
 
-  ::umbp::BatchRangeDataRequest req;
   req.set_client_id(ClientId());
   {
     std::lock_guard<std::mutex> registration_lock(registration_mu_);
@@ -577,6 +598,7 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
   const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
+  CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
@@ -624,6 +646,8 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   auto status = stub_->ConfigureKvIndexer(&context, request, &response);
   if (!status.ok()) throw std::runtime_error(status.error_message());
   if (!response.ok()) throw std::invalid_argument(response.error());
+  if (!response.supports_kv_metadata())
+    throw std::runtime_error("standalone owner requires an upgrade for batched KV metadata");
   kv_metadata_provider_ = config.metadata_provider;
 }
 
@@ -631,14 +655,7 @@ void StandaloneProcessClient::RegisterKvBlock(const KvBlockMetadata& block) {
   std::shared_lock lock(op_mutex_);
   if (closed_ || closing_) throw std::logic_error("client is closed");
   ::umbp::StandaloneKvBlock request;
-  request.set_hash(block.hash);
-  if (block.parent) request.set_parent(*block.parent);
-  request.set_block_size(block.block_size);
-  for (const auto& [bit, keys] : block.component_keys) {
-    auto* component = request.add_components();
-    component->set_component(bit);
-    for (const auto& key : keys) component->add_keys(key);
-  }
+  EncodeKvBlock(block, &request);
   grpc::ClientContext context;
   context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
   ::umbp::BoolResponse response;

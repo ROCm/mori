@@ -92,9 +92,8 @@ class InstrumentedBackend final : public MediumBackend {
     inner_->ClearLocal();
     NotifyChange();
   }
-  void SetChangeHook(std::function<void()> callback) override {
-    std::atomic_store(&change_hook_,
-                      std::make_shared<const std::function<void()>>(std::move(callback)));
+  void SetChangeHook(ChangeHook callback) override {
+    std::atomic_store(&change_hook_, std::make_shared<const ChangeHook>(std::move(callback)));
   }
   void ClearFullSyncAcked() override { inner_->ClearFullSyncAcked(); }
   bool IsClearFullSyncPending() const override { return inner_->IsClearFullSyncPending(); }
@@ -139,11 +138,11 @@ class InstrumentedBackend final : public MediumBackend {
   }
 
  private:
-  void NotifyChange() {
+  void NotifyChange(const std::vector<std::string>& keys = {}) {
     auto callback = std::atomic_load(&change_hook_);
-    if (callback && *callback) (*callback)();
+    if (callback && *callback) (*callback)(keys);
   }
-  std::shared_ptr<const std::function<void()>> change_hook_;
+  std::shared_ptr<const ChangeHook> change_hook_;
 
   // One op's accumulators.  Relaxed atomics: these are read once per metrics
   // tick from another thread and are never correctness state, so ordering

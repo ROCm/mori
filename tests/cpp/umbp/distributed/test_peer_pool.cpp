@@ -1163,7 +1163,10 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
   RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 2);
   RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 2);
   std::atomic<int> dram_changes{0};
-  registry.Get("hot")->SetChangeHook([&] { ++dram_changes; });
+  registry.Get("hot")->SetChangeHook([&](const auto& keys) {
+    if (!keys.empty()) EXPECT_EQ(keys, (std::vector<std::string>{"promote"}));
+    ++dram_changes;
+  });
 
   auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
   tiers.back().promote_trigger = PoolPromoteTrigger::kOnRead;

@@ -28,9 +28,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -42,14 +44,14 @@ namespace mori::umbp {
 namespace indexer_pb = ::kv_indexer::v1;
 
 // Event-driven reconciliation of caller metadata with committed local DRAM.
-// Backend callbacks only wake this worker; snapshots and RPCs run off-path.
+// Backend callbacks identify changed keys; residency checks and RPCs run off-path.
 class KvIndexerReporter {
  public:
-  using Snapshot = std::function<std::unordered_set<std::string>()>;
-  KvIndexerReporter(const KvIndexerConfig& config, Snapshot snapshot)
+  using Contains = std::function<bool(const std::string&)>;
+  KvIndexerReporter(const KvIndexerConfig& config, Contains contains)
       : components_(config.components),
         timeout_(config.timeout_ms),
-        snapshot_(std::move(snapshot)) {
+        contains_(std::move(contains)) {
     if (config.endpoint.empty() || config.worker_id.empty() || config.worker_address.empty() ||
         !(components_ & 1) || (components_ & ~7u) ||
         ((components_ & 2) && !config.swa_window_tokens) || !config.timeout_ms)
@@ -69,12 +71,17 @@ class KvIndexerReporter {
   }
   ~KvIndexerReporter() { Stop(); }
 
-  void Notify() {
+  // Empty means a clear or an explicit request to check all registered blocks.
+  void Notify(const std::vector<std::string>& keys = {}) {
     {
-      std::lock_guard<std::mutex> lock(wake_mutex_);
-      dirty_ = true;
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (keys.empty()) rescan_ = true;
+      for (const auto& key : keys) {
+        auto it = key_blocks_.find(key);
+        if (it != key_blocks_.end()) pending_.insert(it->second.begin(), it->second.end());
+      }
     }
-    cv_.notify_one();
+    Wake();
   }
   void Register(const KvBlockMetadata& block) {
     uint32_t mask = 0;
@@ -91,74 +98,139 @@ class KvIndexerReporter {
       std::lock_guard<std::mutex> lock(state_mutex_);
       auto old = blocks_.find(block.hash);
       if (mask && old != blocks_.end() &&
-          (old->second.parent != block.parent || old->second.block_size != block.block_size))
+          (old->second->parent != block.parent || old->second->block_size != block.block_size))
         throw std::invalid_argument("a block hash cannot change parent or token count");
-      if (mask && old != blocks_.end() && old->second.component_keys == block.component_keys)
+      if (mask && old != blocks_.end() && old->second->component_keys == block.component_keys)
         return;  // Repeated physical writes need no metadata update or ancestor walk.
-      if (mask) {
+      if (mask && (block.parent == block.hash || parent_refs_.count(block.hash))) {
         // Forward references are allowed, but cannot close a parent cycle.
+        // A new leaf with no incoming references cannot introduce a cycle.
         for (auto parent = block.parent; parent;) {
           if (*parent == block.hash) throw std::invalid_argument("KV parent cycle");
           auto ancestor = blocks_.find(*parent);
-          parent = ancestor == blocks_.end() ? std::nullopt : ancestor->second.parent;
+          parent = ancestor == blocks_.end() ? std::nullopt : ancestor->second->parent;
         }
-        blocks_.insert_or_assign(block.hash, block);
-      } else {
-        blocks_.erase(block.hash);
       }
+      if (old != blocks_.end()) {
+        if (old->second->parent && --parent_refs_.at(*old->second->parent) == 0)
+          parent_refs_.erase(*old->second->parent);
+        for (const auto& [component, keys] : old->second->component_keys) {
+          for (const auto& key : keys) {
+            auto it = key_blocks_.find(key);
+            if (it == key_blocks_.end()) continue;
+            auto& hashes = it->second;
+            hashes.erase(std::remove(hashes.begin(), hashes.end(), block.hash), hashes.end());
+            if (it->second.empty()) key_blocks_.erase(it);
+          }
+        }
+        blocks_.erase(old);
+      }
+      if (mask) {
+        blocks_[block.hash] = std::make_shared<const KvBlockMetadata>(block);
+        if (block.parent) ++parent_refs_[*block.parent];
+        for (const auto& [component, keys] : block.component_keys) {
+          for (const auto& key : keys) {
+            auto& hashes = key_blocks_[key];
+            if (hashes.empty() || hashes.back() != block.hash) hashes.push_back(block.hash);
+          }
+        }
+      }
+      pending_.insert(block.hash);
     }
-    Notify();
+    Wake();
   }
 
   bool Sync(bool rebuild = false) {
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::lock_guard<std::mutex> sync_lock(sync_mutex_);
+    if (stopping_) return false;
+    std::map<int64_t, std::shared_ptr<const KvBlockMetadata>> work;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (rescan_ || rebuild) {
+        work = blocks_;
+        rescan_ = false;
+      }
+      for (int64_t hash : pending_) {
+        auto it = blocks_.find(hash);
+        work[hash] = it == blocks_.end() ? nullptr : it->second;
+      }
+      pending_.clear();
+    }
     try {
       request_.clear_actions();
-      const auto resident = snapshot_();
-      std::map<int64_t, uint32_t> desired;
-      for (const auto& [hash, block] : blocks_) {
-        uint32_t mask = 0;
-        for (const auto& [component, keys] : block.component_keys) {
-          if (std::all_of(keys.begin(), keys.end(),
-                          [&](const auto& key) { return resident.count(key); }))
-            mask |= component;
-        }
-        if (mask & 1) desired[hash] = mask;
-      }
-      // Rebuild from fresh state after ambiguous failures and quiet Indexer restarts.
-      if (retry_ || rebuild) {
+      batch_hashes_ = 0;
+      // Only startup clears a previous owner's bucket. Periodic repair and retries
+      // upsert live blocks without temporarily hiding the entire DRAM tier.
+      if (startup_) {
         AddAction(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
-        reported_.clear();
+        SendBatch();
+        startup_ = false;
       }
-      for (const auto& [hash, mask] : reported_) {
+      if (rebuild)
+        for (auto& [hash, mask] : reported_) mask = 0;
+      std::map<int64_t, uint32_t> desired, reports;
+      std::unordered_map<int64_t, int64_t> next;
+      for (const auto& [hash, block] : work) {
         if (stopping_) return false;
-        if (!desired.count(hash)) AddAction(indexer_pb::ACTION_REVOKE, hash);
-      }
-      for (const auto& [hash, mask] : desired) {
-        if (stopping_) return false;
-        auto old = reported_.find(hash);
-        if (old == reported_.end() || old->second != mask) {
-          AddAction(indexer_pb::ACTION_REPORT, hash, mask);
+        uint32_t mask = 0;
+        if (block) {
+          for (const auto& [component, keys] : block->component_keys)
+            if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
         }
+        if (!(mask & 1)) mask = 0;
+        desired[hash] = mask;
+        auto old = reported_.find(hash);
+        if (!mask) {
+          if (old != reported_.end()) AddAction(indexer_pb::ACTION_REVOKE, hash);
+        } else if (rebuild || old == reported_.end() || old->second != mask) {
+          reports[hash] = mask;
+          if (block->parent) next[*block->parent] = hash;
+        }
+      }
+      while (!reports.empty()) {
+        int64_t hash = reports.begin()->first;
+        // Find the start of an unreported chain, even for randomly ordered hashes.
+        while (work.at(hash)->parent && reports.count(*work.at(hash)->parent))
+          hash = *work.at(hash)->parent;
+        do {
+          if (stopping_) return false;
+          uint32_t mask = reports.at(hash);
+          reports.erase(hash);
+          // An applied-but-failed RPC must remain revocable after an eviction.
+          reported_[hash] = 0;
+          AddAction(indexer_pb::ACTION_REPORT, hash, mask, work.at(hash).get());
+          auto child = next.find(hash);
+          if (child == next.end()) break;
+          hash = child->second;
+        } while (reports.count(hash));
       }
       SendBatch();
-      reported_ = std::move(desired);
-      retry_ = false;
+      for (const auto& [hash, mask] : desired) {
+        if (mask)
+          reported_[hash] = mask;
+        else
+          reported_.erase(hash);
+      }
       return true;
     } catch (const std::exception& error) {
-      retry_ = true;
-      Notify();  // A failed caller-initiated flush must also wake the worker.
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        for (const auto& [hash, block] : work) pending_.insert(hash);
+      }
+      Wake();  // A failed caller-initiated flush must also wake the worker.
       MORI_UMBP_WARN("[KVIndexer] sync failed: {}", error.what());
       return false;
     }
   }
   void Stop() {
     stopping_ = true;
-    Notify();
+    Wake();
     if (!thread_.joinable()) return;
     thread_.join();
+    std::lock_guard<std::mutex> lock(sync_mutex_);
     try {
       request_.clear_actions();
+      batch_hashes_ = 0;
       AddAction(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
       SendBatch();
     } catch (const std::exception& error) {
@@ -167,20 +239,39 @@ class KvIndexerReporter {
   }
 
  private:
-  // Append an action and flush when the protocol's batch limit is reached.
-  void AddAction(indexer_pb::ExternalKvActionType type, int64_t hash = 0, uint32_t mask = 0) {
-    auto* action = request_.add_actions();
-    action->set_type(type);
-    action->set_tier(indexer_pb::TIER_DRAM);
-    if (type != indexer_pb::ACTION_CLEAR_ALL_AT_TIER) action->add_hashes(hash);
-    if (type == indexer_pb::ACTION_REPORT) {
-      const auto& block = blocks_.at(hash);
-      if (block.parent) action->set_parent_block_hash(*block.parent);
-      action->add_block_sizes(block.block_size);
+  void Wake() {
+    {
+      std::lock_guard<std::mutex> lock(wake_mutex_);
+      dirty_ = true;
+    }
+    cv_.notify_one();
+  }
+  // REPORT hashes form a parent-child chain, never an arbitrary list. REVOKE
+  // may group unrelated hashes. Both protocol limits apply to each request.
+  void AddAction(indexer_pb::ExternalKvActionType type, int64_t hash = 0, uint32_t mask = 0,
+                 const KvBlockMetadata* block = nullptr) {
+    auto* action =
+        request_.actions_size() ? request_.mutable_actions(request_.actions_size() - 1) : nullptr;
+    bool append = action && action->type() == type &&
+                  (type == indexer_pb::ACTION_REVOKE ||
+                   (block && block->parent && action->hashes_size() &&
+                    action->hashes(action->hashes_size() - 1) == *block->parent));
+    if (!append) {
+      if (request_.actions_size() == 256) SendBatch();
+      action = request_.add_actions();
+      action->set_type(type);
+      action->set_tier(indexer_pb::TIER_DRAM);
+      if (block && block->parent) action->set_parent_block_hash(*block->parent);
+    }
+    if (type != indexer_pb::ACTION_CLEAR_ALL_AT_TIER) {
+      action->add_hashes(hash);
+      ++batch_hashes_;
+    }
+    if (block) {
+      action->add_block_sizes(block->block_size);
       action->add_component_masks(mask);
     }
-    // One hash per action: also below the Indexer's 16384-hash request limit.
-    if (request_.actions_size() == 256) SendBatch();
+    if (batch_hashes_ == 16384) SendBatch();
   }
   void SendBatch() {
     if (request_.actions().empty()) return;
@@ -192,6 +283,7 @@ class KvIndexerReporter {
     if (!status.ok())
       throw std::runtime_error(std::to_string(status.error_code()) + ": " + status.error_message());
     request_.clear_actions();
+    batch_hashes_ = 0;
   }
   void Run() {
     auto next_rebuild = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -215,13 +307,17 @@ class KvIndexerReporter {
   indexer_pb::ApplyExternalKvBatchRequest request_;
   const uint32_t components_;
   const std::chrono::milliseconds timeout_;
-  Snapshot snapshot_;
-  // State/RPC serialization is separate from the short storage-notification lock.
-  std::mutex state_mutex_, wake_mutex_;
+  Contains contains_;
+  // Serialize RPCs/flush/shutdown independently from write-path metadata.
+  std::mutex state_mutex_, sync_mutex_, wake_mutex_;
   std::condition_variable cv_;
-  std::map<int64_t, KvBlockMetadata> blocks_;
+  std::map<int64_t, std::shared_ptr<const KvBlockMetadata>> blocks_;
+  std::unordered_map<std::string, std::vector<int64_t>> key_blocks_;
+  std::unordered_map<int64_t, size_t> parent_refs_;
+  std::unordered_set<int64_t> pending_;
   std::map<int64_t, uint32_t> reported_;
-  bool retry_ = true, dirty_ = true;
+  size_t batch_hashes_ = 0;
+  bool startup_ = true, rescan_ = true, dirty_ = true;
   std::atomic<bool> stopping_{false};
   std::thread thread_;
 };

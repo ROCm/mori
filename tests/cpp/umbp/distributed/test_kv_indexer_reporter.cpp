@@ -25,6 +25,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <future>
 #include <thread>
 
 #include "umbp/distributed/indexer/kv_indexer_reporter.h"
@@ -116,6 +117,7 @@ TEST_F(AutomaticKvIndexer, BatchesRespectWireLimitsAndPreserveCanonicalMetadata)
         {root + i, i ? std::optional<int64_t>(root + i - 1) : std::nullopt, 16, {{1, {"shared"}}}});
     expected[root + i] = 1;
   }
+  ASSERT_TRUE(pool.FlushKvIndexer());
   ASSERT_TRUE(pool.Put("shared", "data", 4));
   ASSERT_TRUE(receiver.WaitFor(expected));
   pool.Shutdown();
@@ -134,14 +136,17 @@ TEST_F(AutomaticKvIndexer, BatchesRespectWireLimitsAndPreserveCanonicalMetadata)
       EXPECT_EQ(action.hashes(0), root + reported);
       EXPECT_EQ(action.has_parent_block_hash(), reported != 0);
       if (reported) EXPECT_EQ(action.parent_block_hash(), root + reported - 1);
-      EXPECT_EQ(action.block_sizes(0), 16u);
-      EXPECT_EQ(action.component_masks(0), 1u);
-      ++reported;
+      for (int i = 0; i < action.hashes_size(); ++i) {
+        EXPECT_EQ(action.hashes(i), root + reported);
+        EXPECT_EQ(action.block_sizes(i), 16u);
+        EXPECT_EQ(action.component_masks(i), 1u);
+        ++reported;
+      }
     }
     batches += has_report;
   }
   EXPECT_EQ(reported, 300u);
-  EXPECT_EQ(batches, 2u);
+  EXPECT_EQ(batches, 1u);
 }
 
 TEST_F(AutomaticKvIndexer, CommittedComponentsEvictionClearAndRecovery) {
@@ -331,12 +336,45 @@ TEST_F(AutomaticKvIndexer, ClientConfigControlsAutomaticMetadataAndReporting) {
   EXPECT_TRUE(receiver.WaitFor({}));
 }
 
+TEST_F(AutomaticKvIndexer, DeltaRepairAndStalledRpcDoNotBlockMetadata) {
+  config.timeout_ms = 2000;
+  std::atomic<size_t> lookups{0};
+  KvIndexerReporter reporter(config, [&](const auto&) {
+    ++lookups;
+    return true;
+  });
+  reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  ASSERT_TRUE(reporter.Sync());
+  {
+    std::lock_guard<std::mutex> lock(receiver.mutex);
+    receiver.requests.clear();
+  }
+  lookups = 0;
+  reporter.Notify({"unrelated"});
+  ASSERT_TRUE(reporter.Sync());
+  EXPECT_EQ(lookups, 0u);
+  receiver.mode = 2;
+  auto repair = std::async(std::launch::async, [&] { return reporter.Sync(true); });
+  {
+    std::unique_lock<std::mutex> lock(receiver.mutex);
+    ASSERT_TRUE(receiver.changed.wait_for(lock, 1s, [&] { return !receiver.requests.empty(); }));
+    for (const auto& action : receiver.requests.back().actions())
+      EXPECT_NE(action.type(), pb::ACTION_CLEAR_ALL_AT_TIER);
+  }
+  auto registration =
+      std::async(std::launch::async, [&] { reporter.Register({43, 42, 16, {{1, {"new"}}}}); });
+  EXPECT_EQ(registration.wait_for(200ms), std::future_status::ready);
+  EXPECT_FALSE(repair.get());
+  registration.get();
+  receiver.mode = 0;
+  EXPECT_TRUE(reporter.Sync());
+  EXPECT_TRUE(receiver.WaitFor({{42, 1}, {43, 1}}));
+}
+
 TEST_F(AutomaticKvIndexer, WriteNotificationsDoNotBypassRetryBackoff) {
   receiver.mode = 1;
   std::atomic<bool> resident{true};
-  KvIndexerReporter reporter(config, [&] {
-    return resident ? std::unordered_set<std::string>{"key"} : std::unordered_set<std::string>{};
-  });
+  KvIndexerReporter reporter(config, [&](const auto&) { return resident.load(); });
   reporter.Register({42, {}, 16, {{1, {"key"}}}});
   ASSERT_TRUE(receiver.WaitForFailure());
   for (int i = 0; i < 20; ++i) {
