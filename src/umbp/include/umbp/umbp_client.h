@@ -32,6 +32,7 @@
 
 #include "mori/io/enum.hpp"
 #include "umbp/common/config.h"
+#include "umbp/common/prefetch.h"
 #include "umbp/distributed/types.h"
 
 namespace mori::umbp {
@@ -121,6 +122,22 @@ class IUMBPClient {
   /// Returns the number of keys that exist consecutively from index 0.
   /// Stops at the first key that does not exist (early-stop).
   virtual size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const = 0;
+
+  /// Hint that these keys are about to be read: copy this node's SSD-resident
+  /// ones into DRAM and pull other nodes' into this node's DRAM in the
+  /// background. Returns the number of input keys admitted, not completed;
+  /// 0 where unsupported or the bounded queue cannot accept this hint.
+  virtual size_t BatchPrefetch(const std::vector<std::string>& /*keys*/) { return 0; }
+
+  /// Tracked prefetch to local DRAM. Submission only acknowledges admission;
+  /// query until terminal for per-input results.
+  virtual PrefetchSubmitResult SubmitPrefetch(const std::vector<std::string>& keys,
+                                              PrefetchOptions options = {},
+                                              std::string request_id = {}) {
+    return {false, std::move(request_id), "async prefetch is unsupported"};
+  }
+  virtual PrefetchStatus GetPrefetchStatus(const std::string& request_id) { return {}; }
+  virtual bool SupportsAsyncPrefetch() const { return false; }
 
   // ---- Lifecycle ----
 

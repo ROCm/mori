@@ -275,6 +275,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("local_first", &UMBPDistributedConfig::local_first)
       .def_readwrite("cache_remote_admission", &UMBPDistributedConfig::cache_remote_admission)
       .def_readwrite("admission_max_block_bytes", &UMBPDistributedConfig::admission_max_block_bytes)
+      .def_readwrite("prefetch_budget_bytes", &UMBPDistributedConfig::prefetch_budget_bytes)
       .def_readwrite("dram_page_size", &UMBPDistributedConfig::dram_page_size)
       .def_readwrite("backend_policy_path", &UMBPDistributedConfig::backend_policy_path)
       .def_readwrite("workload_trace_path", &UMBPDistributedConfig::workload_trace_path)
@@ -333,6 +334,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_prefetch", &IUMBPClient::BatchPrefetch, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())

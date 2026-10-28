@@ -323,6 +323,33 @@ std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>&
   return pool_client_->BatchExists(keys);
 }
 
+size_t DistributedClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (closing_) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  return pool_client_->BatchPrefetch(keys);
+}
+
+PrefetchSubmitResult DistributedClient::SubmitPrefetch(const std::vector<std::string>& keys,
+                                                       PrefetchOptions options, std::string id) {
+  if (closing_) return {false, std::move(id), "client is closing"};
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return {false, std::move(id), "client is closed"};
+  return pool_client_->SubmitPrefetch(keys, options, std::move(id));
+}
+
+PrefetchStatus DistributedClient::GetPrefetchStatus(const std::string& id) {
+  if (closing_) return {};
+  std::shared_lock lk(op_mutex_);
+  return closed_ ? PrefetchStatus{} : pool_client_->GetPrefetchStatus(id);
+}
+
+bool DistributedClient::SupportsAsyncPrefetch() const {
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  return !closed_ && pool_client_->SupportsAsyncPrefetch();
+}
+
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
   if (closing_) return 0;
   std::shared_lock lk(op_mutex_);

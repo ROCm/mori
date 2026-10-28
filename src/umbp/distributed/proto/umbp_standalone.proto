@@ -16,6 +16,10 @@ service UMBPStandalone {
   rpc Exists(KeyRequest) returns (BoolResponse);
   rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
   rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
+  // #823 hint API: count means admitted, not complete.
+  rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
+  rpc SubmitPrefetch(PrefetchRequest) returns (PrefetchSubmitResponse);
+  rpc GetPrefetchStatus(PrefetchStatusRequest) returns (PrefetchStatusResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
@@ -36,6 +40,10 @@ message PingResponse {
   bool ready = 1;
   StandaloneBackendMode deployment_mode = 2;
   bool supports_ranged_io = 3;
+  bool supports_async_prefetch = 4;
+  // 1 = BatchKeysRequest -> CountResponse. The old experimental synchronous
+  // PrefetchRequest -> BatchBoolResponse is not this protocol.
+  uint32 prefetch_hint_version = 5;
 }
 
 message BoolResponse {
@@ -199,4 +207,38 @@ message StandaloneExternalKvHitCountEntry {
 
 message StandaloneExternalKvHitCountsResponse {
   repeated StandaloneExternalKvHitCountEntry entries = 1;
+}
+
+// Preserve the deployed Router's RPC fields and state numbers.
+message PrefetchRequest {
+  repeated string keys = 1;
+  uint64 lease_ttl_ms = 2;
+  uint64 timeout_ms = 3;
+  string request_id = 4;
+}
+message PrefetchSubmitResponse {
+  bool accepted = 1;
+  string request_id = 2;
+  string error = 3;
+}
+message PrefetchStatusRequest { string request_id = 1; }
+enum PrefetchState {
+  PREFETCH_STATE_UNKNOWN = 0;
+  PREFETCH_STATE_QUEUED = 1;
+  PREFETCH_STATE_RUNNING = 2;
+  PREFETCH_STATE_READY = 3;
+  PREFETCH_STATE_PARTIAL = 4;
+  PREFETCH_STATE_FAILED = 5;
+  PREFETCH_STATE_EXPIRED = 6;
+}
+message PrefetchStatusResponse {
+  PrefetchState state = 1;
+  repeated bool ok = 2;
+  uint64 completed_keys = 3;
+  uint64 total_keys = 4;
+  string error = 5;
+  uint64 queue_latency_us = 6;
+  uint64 execution_latency_us = 7;
+  uint64 total_latency_us = 8;
+  reserved 9, 10;
 }

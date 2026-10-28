@@ -680,3 +680,16 @@ endif()
 target_link_libraries(
   bench_umbp_gds_ssd_get
   PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+
+# Bounded asynchronous prefetch queue; no fabric or device needed.
+add_executable(test_prefetch_queue test_prefetch_queue.cpp)
+target_link_libraries(test_prefetch_queue PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_prefetch_queue PRIVATE cxx_std_17)
+add_test(NAME umbp_prefetch_queue COMMAND test_prefetch_queue)
+
+if(MORI_UMBP_TESTING)
+  add_executable(test_prefetch_remote test_prefetch_remote.cpp)
+  target_link_libraries(test_prefetch_remote PRIVATE umbp_common GTest::gtest_main)
+  target_compile_features(test_prefetch_remote PRIVATE cxx_std_17)
+  add_test(NAME umbp_prefetch_remote COMMAND test_prefetch_remote)
+endif()

@@ -69,6 +69,12 @@ class StandaloneProcessClient : public IUMBPClient {
                                    const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
+  size_t BatchPrefetch(const std::vector<std::string>& keys) override;
+  PrefetchSubmitResult SubmitPrefetch(const std::vector<std::string>& keys,
+                                      PrefetchOptions options = {},
+                                      std::string request_id = {}) override;
+  PrefetchStatus GetPrefetchStatus(const std::string& request_id) override;
+  bool SupportsAsyncPrefetch() const override;
 
   bool Clear() override;
   bool Flush() override;
@@ -125,6 +131,8 @@ class StandaloneProcessClient : public IUMBPClient {
   bool closed_ = false;
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;
+  bool supports_async_prefetch_ = false;
+  uint32_t prefetch_hint_version_ = 0;
 
   enum class RegionKind { kHostShm, kGpuIpc };
 

@@ -77,6 +77,25 @@ std::optional<AllocateResult> AllocateOk(PageBackend& a, const std::string& key,
   return r;
 }
 
+TEST(PageBackend, ExplicitLeaseVerifiesCommittedKeysAndNeverShortensProtection) {
+  auto backend =
+      std::make_unique<PageBackend>(TierType::DRAM, kPageSize, MakeDramCfg(),
+                                    std::chrono::milliseconds(5000), std::chrono::milliseconds(1));
+  auto slot = AllocateOk(*backend, "ready", kPageSize);
+  auto pending = AllocateOk(*backend, "pending", kPageSize);
+  uint64_t bytes = 0;
+  ASSERT_TRUE(backend->Commit(slot->slot_id, "ready", bytes));
+  EXPECT_EQ(
+      backend->ExtendReadLease({"ready", "missing", "pending"}, std::chrono::milliseconds(80)),
+      (std::vector<bool>{true, false, false}));
+  EXPECT_EQ(backend->ExtendReadLease({"ready"}, std::chrono::milliseconds(1)),
+            std::vector<bool>{true});
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_EQ(backend->Evict({"ready"})[0].bytes_freed, 0u);
+  std::this_thread::sleep_for(std::chrono::milliseconds(85));
+  EXPECT_EQ(backend->Evict({"ready"})[0].bytes_freed, kPageSize);
+}
+
 }  // namespace
 
 // ---- Allocate / Commit / Resolve happy path ---------------------------------

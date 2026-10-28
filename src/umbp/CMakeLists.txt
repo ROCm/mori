@@ -402,6 +402,7 @@ add_library(
   distributed/pool/tier_transition.cpp
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
+  common/prefetch_queue.cpp
   distributed/pool_client.cpp
   distributed/distributed_client.cpp
   standalone/external_kv_identity_client.cpp

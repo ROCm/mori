@@ -506,6 +506,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
     int selected_port = 0;
     builder.AddListeningPort(address_, grpc::InsecureServerCredentials(), &selected_port);
+    // Optional control listener used by the existing Router. It carries no
+    // caller memory mappings; keep the UDS + FD handoff for Engine data I/O.
+    if (const char* address = std::getenv("UMBP_PREFETCH_CONTROL_ADDRESS");
+        address != nullptr && *address != '\0') {
+      builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    }
     builder.RegisterService(this);
     mode_t old_umask = umask(0077);
     server_ = builder.BuildAndStart();
@@ -569,6 +575,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // The inner client is the authority now that local SSD serves ranges; the
     // extra ssd.enabled veto here would keep refusing a backend that can.
     response->set_supports_ranged_io(client_->SupportsRangedIO());
+    response->set_supports_async_prefetch(client_->SupportsAsyncPrefetch());
+    response->set_prefetch_hint_version(1);
     return grpc::Status::OK;
   }
 
@@ -839,6 +847,59 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       return grpc::Status::OK;
     }
     response->set_count(client_->BatchExistsConsecutive(keys));
+    return grpc::Status::OK;
+  }
+
+  grpc::Status SubmitPrefetch(grpc::ServerContext*, const ::umbp::PrefetchRequest* request,
+                              ::umbp::PrefetchSubmitResponse* response) override {
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_.load()) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is stopping");
+    // Check unsigned wire values before converting to signed chrono durations.
+    if (request->lease_ttl_ms() > 300000 || request->timeout_ms() > 300000) {
+      response->set_error("prefetch timeout or lease exceeds the accepted bound");
+      return grpc::Status::OK;
+    }
+    PrefetchOptions options;
+    options.lease_ttl = std::chrono::milliseconds(request->lease_ttl_ms());
+    options.timeout = std::chrono::milliseconds(request->timeout_ms());
+    const auto result = client_->SubmitPrefetch({request->keys().begin(), request->keys().end()},
+                                                options, request->request_id());
+    response->set_accepted(result.accepted);
+    response->set_request_id(result.request_id);
+    response->set_error(result.error);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status GetPrefetchStatus(grpc::ServerContext*, const ::umbp::PrefetchStatusRequest* request,
+                                 ::umbp::PrefetchStatusResponse* response) override {
+    std::shared_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_.load()) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is stopping");
+    const auto status = client_->GetPrefetchStatus(request->request_id());
+    response->set_state(static_cast<::umbp::PrefetchState>(status.state));
+    response->set_completed_keys(status.completed_keys);
+    response->set_total_keys(status.ok.size());
+    response->set_error(status.error);
+    response->set_queue_latency_us(status.queue_latency_us);
+    response->set_execution_latency_us(status.execution_latency_us);
+    response->set_total_latency_us(status.total_latency_us);
+    for (bool ok : status.ok) response->add_ok(ok);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status BatchPrefetch(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
+                             ::umbp::CountResponse* response) override {
+    // The experimental synchronous API used fields 2..4 for lease, deadline
+    // and request_id but expected BatchBoolResponse. Reject that identifiable
+    // wire shape rather than returning a count it could misinterpret as bools.
+    const auto& unknown = request->GetReflection()->GetUnknownFields(*request);
+    for (int i = 0; i < unknown.field_count(); ++i) {
+      if (unknown.field(i).number() >= 2 && unknown.field(i).number() <= 4)
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "BatchPrefetch is a count hint; use SubmitPrefetch/GetPrefetchStatus");
+    }
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    response->set_count(shutdown_.load() ? 0 : client_->BatchPrefetch(keys));
     return grpc::Status::OK;
   }
 

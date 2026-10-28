@@ -372,6 +372,14 @@ class MediumBackend : public MetricSource {
       ResolveReader reader = ResolveReader::kRemote,
       const std::vector<ObjectExtent>* extents = nullptr) = 0;
 
+  // Atomically verify committed keys and extend their eviction fence. A
+  // successful result guarantees protection for at least ttl from this call;
+  // unsupported backends must return false, never merely Contains().
+  virtual std::vector<bool> ExtendReadLease(const std::vector<std::string>& keys,
+                                            std::chrono::milliseconds ttl) {
+    return std::vector<bool>(keys.size(), false);
+  }
+
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful
   // acquisition after its synchronous transfer completes.  `allow_file_ref`:
