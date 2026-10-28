@@ -38,6 +38,7 @@
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/sim/sim.h"
 #include "umbp/sim/trace.h"
+#include "umbp/standalone/standalone_server.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -70,6 +71,14 @@ class SimTest : public ::testing::Test {
     config.ssd.enabled = false;
     return config;
   }
+  UMBPConfig RankConfig() {
+    UMBPConfig config;
+    config.sim.enabled = true;
+    config.sim.trace_path = dir_ + "/rank.jsonl";
+    config.standalone_process.emplace();
+    config.standalone_process->address = "unix:" + dir_ + "/server.sock";
+    return config;
+  }
   std::unique_ptr<PageBackend> Backend(SimTransferEngine& engine, MemLoc loc, size_t pages = 4) {
     auto backend = std::make_unique<PageBackend>(
         loc == MemLoc::GPU ? TierType::HBM : TierType::DRAM, kPage,
@@ -96,10 +105,33 @@ class SimTest : public ::testing::Test {
   std::string dir_;
 };
 
-TEST_F(SimTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
+// Exercise the same API contract embedded and through the standalone IPC boundary.
+class SimApiTest : public SimTest, public ::testing::WithParamInterface<bool> {
+ protected:
+  std::unique_ptr<IUMBPClient> Client(UMBPConfig config) {
+    if (GetParam()) {
+      auto rank = RankConfig();
+      rank.sim.trace_path = config.sim.trace_path;
+      config.sim.trace_path += ".server";
+      server_ =
+          std::make_unique<standalone::StandaloneServer>(config, rank.standalone_process->address);
+      if (!server_->Start()) throw std::runtime_error("standalone server failed to start");
+      config = rank;
+    }
+    return CreateUMBPClient(config);
+  }
+  void TearDown() override {
+    server_.reset();
+    SimTest::TearDown();
+  }
+  std::unique_ptr<standalone::StandaloneServer> server_;
+};
+INSTANTIATE_TEST_SUITE_P(EmbeddedAndStandalone, SimApiTest, ::testing::Bool());
+
+TEST_P(SimApiTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   auto config = Config();
   const auto ptr = Buffer(8 * kPage);
-  auto client = CreateUMBPClient(config);
+  auto client = Client(config);
   ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage));
   EXPECT_TRUE(client->Put("scalar", ptr, 2 * kPage));
   EXPECT_TRUE(client->Get("scalar", ptr, 2 * kPage));
@@ -155,21 +187,90 @@ TEST_F(SimTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   EXPECT_TRUE(saw_put && saw_partial);
 }
 
-TEST_F(SimTest, HbmAndRegisteredGpuCallerNeedNoDevice) {
-  // CPU paths deliberately absent: accidentally classifying the caller as host must fail.
-  Profile(R"({"gpu_gpu":{"channel":"hbm","latency_ns":0,
-                           "bandwidth_bytes_per_second":1e12}})");
+TEST_P(SimApiTest, RegisteredGpuCallerToDramAndHbmNeedsNoDevice) {
+  for (auto medium : {UMBPMedium::DRAM, UMBPMedium::HBM}) {
+    // Omit CPU-caller paths so incorrect pointer classification fails.
+    Profile(medium == UMBPMedium::HBM ? R"({"gpu_gpu":{"channel":"hbm","latency_ns":0,
+                                 "bandwidth_bytes_per_second":1e12}})"
+                                      : R"({"gpu_cpu":{"channel":"pcie","latency_ns":0,
+                                 "bandwidth_bytes_per_second":1e12},
+                      "cpu_gpu":{"channel":"pcie","latency_ns":0,
+                                 "bandwidth_bytes_per_second":1e12}})");
+    auto config = Config();
+    config.distributed.emplace();
+    config.distributed->medium = medium;
+    config.distributed->hbm.capacity_bytes = 32 * kPage;
+    const auto ptr = Buffer(4 * kPage);
+    auto client = Client(config);
+    ASSERT_TRUE(client->RegisterMemory(ptr, 4 * kPage, MemLoc::GPU, 0));
+    EXPECT_TRUE(client->Put("gpu", ptr + kPage, kPage));
+    EXPECT_TRUE(client->Get("gpu", ptr + 2 * kPage, kPage));
+    EXPECT_EQ(client->BatchGetRanges({"gpu"}, {{ptr + 3 * kPage}}, {{128}}, {{0}}),
+              std::vector<bool>{true});
+  }
+}
+
+TEST_F(SimTest, StandaloneRanksShareCapacityLruAndRegistrationLifetime) {
   auto config = Config();
-  config.distributed.emplace();
-  config.distributed->medium = UMBPMedium::HBM;
-  config.distributed->hbm.capacity_bytes = 32 * kPage;
-  const auto ptr = Buffer(4 * kPage);
-  auto client = CreateUMBPClient(config);
-  ASSERT_TRUE(client->RegisterMemory(ptr, 4 * kPage, MemLoc::GPU, 0));
-  EXPECT_TRUE(client->Put("gpu", ptr + kPage, kPage));
-  EXPECT_TRUE(client->Get("gpu", ptr + 2 * kPage, kPage));
-  EXPECT_EQ(client->BatchGetRanges({"gpu"}, {{ptr + 3 * kPage}}, {{128}}, {{0}}),
-            std::vector<bool>{true});
+  config.dram.high_watermark = 0.6;
+  config.dram.low_watermark = 0.5;
+  standalone::StandaloneServer server(config, RankConfig().standalone_process->address);
+  ASSERT_TRUE(server.Start());
+  auto rank0 = CreateUMBPClient(RankConfig());
+  auto other = RankConfig();
+  other.sim.trace_path = dir_ + "/rank1.jsonl";
+  auto rank1 = CreateUMBPClient(other);
+  const auto ptr = Buffer(8 * kPage);
+  const auto extra = Buffer(8 * kPage);
+  // Identical virtual addresses in separate ranks must remain independent registrations.
+  ASSERT_TRUE(rank0->RegisterMemory(ptr, 8 * kPage));
+  ASSERT_TRUE(rank1->RegisterMemory(ptr, 8 * kPage));
+  ASSERT_TRUE(rank1->RegisterMemory(extra, 8 * kPage));
+  ASSERT_TRUE(rank0->Put("a", ptr, 8 * kPage));
+  ASSERT_TRUE(rank1->Put("b", ptr, 8 * kPage));
+  ASSERT_TRUE(rank1->Get("a", ptr, 8 * kPage));  // Touch a; b is now the oldest.
+  ASSERT_TRUE(rank1->Put("c", ptr, 8 * kPage));
+  ASSERT_TRUE(Await([&] { return !rank0->Exists("b"); }));
+  EXPECT_EQ(rank1->BatchExists({"a", "b", "c"}), (std::vector<bool>{true, false, true}));
+  EXPECT_TRUE(rank1->Get("c", extra, 8 * kPage));
+  EXPECT_FALSE(rank1->Get("c", extra + 8 * kPage - 1, 8 * kPage));
+  EXPECT_FALSE(rank1->RegisterMemory(0, kPage));
+  EXPECT_FALSE(rank1->RegisterMemory(ptr, 0));
+  EXPECT_FALSE(rank1->RegisterMemory(UINTPTR_MAX - 8, 16));
+  ASSERT_TRUE(rank1->RegisterMemory(extra, 4 * kPage));  // Replace the server mapping.
+  EXPECT_FALSE(rank1->Get("c", extra, 8 * kPage));
+  EXPECT_EQ(rank1->BatchGetRanges({"c"}, {{extra}}, {{4 * kPage}}, {{0}}), std::vector<bool>{true});
+  rank0->Close();
+  EXPECT_TRUE(rank1->Exists("a"));  // Rank exit does not clear the shared tier.
+  rank1->DeregisterMemory(ptr);
+  EXPECT_FALSE(rank1->Get("a", ptr, 8 * kPage));
+  ASSERT_TRUE(rank1->RegisterMemory(ptr, 8 * kPage));
+  EXPECT_TRUE(rank1->Get("a", ptr, 8 * kPage));
+  rank0 = CreateUMBPClient(RankConfig());
+  EXPECT_TRUE(rank0->Exists("c"));
+  EXPECT_TRUE(rank0->Clear());
+  EXPECT_FALSE(rank1->Exists("a"));
+}
+
+TEST_F(SimTest, StandaloneRejectsMismatchedModesAndRequiresBackendProfile) {
+  for (bool sim : {false, true}) {
+    auto config = Config();
+    config.sim.enabled = sim;
+    standalone::StandaloneServer server(config, RankConfig().standalone_process->address);
+    ASSERT_TRUE(server.Start());
+    auto rank = RankConfig();
+    rank.sim.enabled = !sim;
+    EXPECT_THROW(CreateUMBPClient(rank), std::runtime_error);
+  }
+  auto rank = RankConfig();
+  EXPECT_TRUE(rank.Validate());  // Forwarding ranks need no profile.
+  rank.standalone_process->auto_start = true;
+  EXPECT_FALSE(rank.Validate());
+  rank.sim.profile_path = Config().sim.profile_path;
+  EXPECT_TRUE(rank.Validate());
+  rank.sim.profile_path.clear();
+  EXPECT_THROW(standalone::StandaloneServer(rank, rank.standalone_process->address),
+               std::runtime_error);
 }
 
 TEST_F(SimTest, BufferedTracePreservesEscapingAndIntegerPrecision) {
@@ -380,9 +481,6 @@ TEST_F(SimTest, TierDemotionUsesVirtualBuffersAndSimEngine) {
 
 TEST_F(SimTest, RejectsUnsupportedConfigurationsAndBadProfiles) {
   auto config = Config();
-  config.standalone_process.emplace();
-  EXPECT_THROW(CreateUMBPClient(config), std::invalid_argument);
-  config = Config();
   config.sim.profile_path.clear();
   EXPECT_THROW(CreateUMBPClient(config), std::runtime_error);
   config = Config();

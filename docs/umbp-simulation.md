@@ -39,12 +39,41 @@ buffer = mmap.mmap(-1, nbytes)
 ptr = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
 ```
 
-Only effective DRAM/HBM backends are supported; SSD and standalone-process mode
-are rejected. The default embedded backend is DRAM; `ssd.enabled` alone does not
+Only effective DRAM/HBM backends are supported; SSD is rejected.
+The default embedded backend is DRAM; `ssd.enabled` alone does not
 select an SSD backend. Virtual GPU caller buffers need GPU location/device
 metadata through the existing C++ `RegisterMemory` API. Real framework pointers
 can use existing classification. A virtual HBM backend needs no GPU, but the
 normal UMBP build dependencies, including HIP, still apply.
+
+### Standalone server shared by ranks
+
+Keep CI's one-server-per-node deployment and existing rank APIs. Add these settings
+to the server's usual environment; capacity, page size and policies belong to the
+server and apply to **all ranks together**:
+
+```bash
+export UMBP_SIM_ENABLE=1
+export UMBP_SIM_PROFILE=/path/to/profile.json
+export UMBP_SIM_TRACE=/tmp/umbp-sim-server.jsonl
+umbp_standalone_server unix:/tmp/umbp.sock
+```
+
+On each rank, keep its existing `standalone_process` config pointing to the same
+socket, set `config.sim.enabled = True` and use a distinct `config.sim.trace_path`.
+Forwarding ranks need no profile: the server models transfers. With
+`auto_start=True`, supply the profile in the client config; it is forwarded to the
+server, whose trace uses the client's trace path plus `.server`.
+
+Server and ranks must both use a build with standalone sim support and agree on sim
+mode; a mismatch is rejected. Memory registration sends only address/size/location
+metadata and reserves inaccessible server-side mappings, without SHM fd or GPU IPC
+payload mappings. Existing range checks, shared capacity/LRU, queries and cleanup
+remain active. Closing a rank releases its registrations, not the shared KV tier.
+
+Rank traces measure API time including IPC, server control work, queueing and modeled
+transfers. Server traces describe the nested backend calls; **do not add them to
+rank times**. Channel queues belong to the server backend, shared by its ranks.
 
 ## Calibrate on the target platform
 
@@ -190,8 +219,8 @@ Transfers sleep until 100 µs before their deadline, then spin to reduce sleep
 overshoot. Scheduling and control overhead still limit accuracy on short operations.
 Independent background work is counted only when it delays an API or its channel.
 
-- Channel queues are per client: they do not aggregate multiple initiators at a
-  remote NIC or model switch congestion. Actual control RPC failures are retained;
+- Channel queues are per backend client (one per standalone server): they do not
+  aggregate multiple initiators at a remote NIC or model switch congestion. Actual control RPC failures are retained;
   payload transport failures during modeled waits are not synthesized.
 - Same-host peers exercise the protocol with that host's RPC cost, not a different
   cluster's latency. Profiles depend on platform, concurrency and workload.

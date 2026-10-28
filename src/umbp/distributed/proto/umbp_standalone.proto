@@ -36,6 +36,7 @@ message PingResponse {
   bool ready = 1;
   StandaloneBackendMode deployment_mode = 2;
   bool supports_ranged_io = 3;
+  bool simulation = 4;
 }
 
 message BoolResponse {
@@ -154,6 +155,8 @@ message RegisterMemoryRequest {
   bytes ipc_handle = 9;
   uint64 ipc_offset = 10;
   uint64 alloc_base = 11;
+  // Simulation registers only address/size/location metadata; no fd or GPU IPC handle.
+  bool simulation = 12;
 }
 
 message DeregisterMemoryRequest {

@@ -63,6 +63,7 @@
 #include "umbp/distributed/config.h"
 #include "umbp/distributed/metrics/prometheus_metric_sink.h"
 #include "umbp/distributed/tier_proto.h"
+#include "umbp/sim/sim.h"
 #include "umbp/standalone/external_kv_identity_client.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/umbp_client.h"
@@ -569,6 +570,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     // The inner client is the authority now that local SSD serves ranges; the
     // extra ssd.enabled veto here would keep refusing a backend that can.
     response->set_supports_ranged_io(client_->SupportsRangedIO());
+    response->set_simulation(backend_config_.sim.enabled);
     return grpc::Status::OK;
   }
 
@@ -870,6 +872,17 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
+    if (request->simulation() != backend_config_.sim.enabled) {
+      SetBool(response, false, "client/server sim mode mismatch");
+      return grpc::Status::OK;
+    }
+    if (request->simulation()) {
+      std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
+      RegisterSimMemory(*request, response);
+      if (response->ok() && !EnsureExternalIdentity(*request))
+        MORI_UMBP_WARN("[StandaloneServer] sim external-KV identity registration failed");
+      return grpc::Status::OK;
+    }
     if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
       std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
       RegisterGpuIpc(*request, response);
@@ -999,7 +1012,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
  private:
-  enum class MemoryKind { kHostShm, kGpuIpc };
+  enum class MemoryKind { kHostShm, kGpuIpc, kSim };
 
   struct RegisteredMemory {
     void* base = nullptr;
@@ -1225,6 +1238,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   bool RegisterFd(int fd, const FdRegistrationMessage& msg) {
+    if (backend_config_.sim.enabled) {
+      close(fd);
+      return false;
+    }
     void* mapped =
         mmap(nullptr, static_cast<size_t>(msg.size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
@@ -1280,6 +1297,41 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     RegisteredMemory old = *existing;
     *existing = entry;
     return old;
+  }
+
+  void RegisterSimMemory(const ::umbp::RegisterMemoryRequest& request,
+                         ::umbp::BoolResponse* response) {
+    const bool gpu = request.kind() == ::umbp::MEMORY_KIND_GPU_IPC;
+    if (request.client_id().empty() || request.worker_base() == 0 || request.size() == 0 ||
+        request.size() > std::numeric_limits<uintptr_t>::max() - request.worker_base() ||
+        (!gpu && request.kind() != ::umbp::MEMORY_KIND_HOST_SHM) ||
+        (gpu && request.device_id() < 0)) {
+      SetBool(response, false, "invalid simulated memory registration");
+      return;
+    }
+    const auto buffer = AllocateSimMemory(static_cast<size_t>(request.size()));
+    if (!buffer.valid()) {
+      SetBool(response, false, "simulated address reservation failed");
+      return;
+    }
+    if (!RegisterBackendMemory(
+            buffer.ptr, buffer.mapped_size,
+            gpu ? mori::io::MemoryLocationType::GPU : mori::io::MemoryLocationType::CPU,
+            request.device_id(),
+            gpu ? MemoryRegistration::kLocalCopyOnly : MemoryRegistration::kPinned)) {
+      munmap(buffer.ptr, buffer.mapped_size);
+      SetBool(response, false, "simulated backend registration failed");
+      return;
+    }
+    RegisteredMemory entry;
+    entry.base = buffer.ptr;
+    entry.worker_base = request.worker_base();
+    entry.size = request.size();
+    entry.kind = MemoryKind::kSim;
+    entry.client_id = request.client_id();
+    auto old = InsertOrReplaceRegion(request.client_id(), entry);
+    if (old) ReleaseRegisteredMemory(*old);
+    SetBool(response, true);
   }
 
   void RegisterGpuIpc(const ::umbp::RegisterMemoryRequest& request,
@@ -1700,9 +1752,6 @@ int ResolveMetricsPortFromEnv(bool* ok, std::string* error) {
 
 StandaloneServer::StandaloneServer(UMBPConfig config, std::string address)
     : config_(NormalizeBackendConfig(std::move(config))), address_(std::move(address)) {
-  if (config_.sim.enabled) {
-    throw std::invalid_argument("UMBP sim does not support standalone servers");
-  }
   // Metrics are only this process's job when it has no master.  With one, the
   // PoolClient below ships every series to that master, which already owns a
   // MetricsServer and merges them there — binding a second endpoint here would

@@ -515,8 +515,9 @@ struct UMBPConfig {
   UMBPSimConfig sim;
 
   bool ValidateStorageConfig(std::string* error_message = nullptr) const {
-    if (sim.enabled && (sim.profile_path.empty() || standalone_process.has_value())) {
-      if (error_message) *error_message = "sim requires profile_path and an in-process client";
+    if (sim.enabled && sim.profile_path.empty() &&
+        (!standalone_process.has_value() || standalone_process->auto_start)) {
+      if (error_message) *error_message = "sim backend requires profile_path";
       return false;
     }
     if (page_size.has_value() && *page_size == 0) {

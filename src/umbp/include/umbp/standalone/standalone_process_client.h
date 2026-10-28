@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "umbp/sim/trace.h"
 #include "umbp/umbp_client.h"
 #include "umbp_standalone.grpc.pb.h"
 
@@ -112,8 +113,10 @@ class StandaloneProcessClient : public IUMBPClient {
   void DeregisterMemoryLocked();
   bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
   bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
+  bool RegisterSimMemory(uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc, int device);
 
   UMBPConfig config_;
+  std::unique_ptr<SimTrace> sim_trace_;
   UMBPStandaloneProcessConfig standalone_config_;
   std::string address_;
   std::string fd_socket_path_;
@@ -126,7 +129,7 @@ class StandaloneProcessClient : public IUMBPClient {
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;
 
-  enum class RegionKind { kHostShm, kGpuIpc };
+  enum class RegionKind { kHostShm, kGpuIpc, kSim };
 
   // A hybrid worker can register several non-contiguous host or GPU regions.
   // `base` is the worker VA used as region_base in data requests.
