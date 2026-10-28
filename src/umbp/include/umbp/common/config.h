@@ -25,9 +25,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "umbp/common/env_parse.h"
 #include "umbp/common/numa_config.h"
 
 namespace mori::umbp {
@@ -476,7 +478,94 @@ struct UMBPDistributedConfig {
   // Caller-owned, must outlive the client, null disables. Ignored when
   // master_config.master_address is set.
   MetricSink* metric_sink = nullptr;
+
+  // Each UMBP_DISTRIBUTED_* variable that is set and not blank, over its field;
+  // the rest stay as they are.  The standalone server configures itself this
+  // way, and an in-process caller can start from FromEnvironment() and set what
+  // it was given explicitly on top, so the same variables configure both and an
+  // explicit setting still wins.  Identity and ports (UMBP_MASTER_ADDRESS,
+  // UMBP_NODE_*, UMBP_IO_ENGINE_*, UMBP_PEER_SERVICE_PORT) are left to the
+  // caller, which knows how its processes share them, and so is
+  // UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA, which only a client that many GPUs
+  // share wants.  False, with the reason in *error, on a malformed value.
+  bool ApplyEnvironment(std::string* error);
+
+  // The defaults with ApplyEnvironment() over them.  Throws
+  // std::invalid_argument on a malformed value.
+  static UMBPDistributedConfig FromEnvironment();
 };
+
+inline bool UMBPDistributedConfig::ApplyEnvironment(std::string* error) {
+  using namespace env_parse;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", &staging_buffer_size, error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &ranged_scratch_size, error)) {
+    return false;
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES", &ranged_scratch_use_hugepages,
+                    error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_HUGEPAGE_SIZE", &ranged_scratch_hugepage_size,
+                    error)) {
+    return false;
+  }
+  int slots = 0;
+  if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &slots, error)) return false;
+  if (slots < 0) {
+    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be >= 0 (0 = the preset)";
+    return false;
+  }
+  if (EnvString("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS")) ssd_staging_buffer_slots = slots;
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &ssd_staging_use_hugepages,
+                    error)) {
+    return false;
+  }
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE", &ssd_staging_hugepage_size,
+                    error)) {
+    return false;
+  }
+  // The one medium this node serves.  Selecting SSD here is the whole opt-in
+  // for a storage node — there is no separate "pure-SSD mode" flag.  Unknown
+  // values are rejected rather than silently defaulting to DRAM, since serving
+  // the wrong medium is not something a node should discover at runtime.
+  if (const char* medium_env = std::getenv("UMBP_DISTRIBUTED_MEDIUM")) {
+    const std::string m(medium_env);
+    if (m == "DRAM" || m == "dram") {
+      medium = UMBPMedium::DRAM;
+    } else if (m == "HBM" || m == "hbm") {
+      medium = UMBPMedium::HBM;
+    } else if (m == "SSD" || m == "ssd") {
+      medium = UMBPMedium::SSD;
+    } else {
+      *error = "UMBP_DISTRIBUTED_MEDIUM must be one of: DRAM, HBM, SSD";
+      return false;
+    }
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &cache_remote_fetches, error)) {
+    return false;
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH", &ranged_locality_prefetch,
+                    error)) {
+    return false;
+  }
+  if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &local_first, error)) return false;
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_PREFETCH_BUDGET_BYTES", &prefetch_budget_bytes, error)) {
+    return false;
+  }
+  size_t page_size = static_cast<size_t>(dram_page_size);
+  if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &page_size, error)) return false;
+  dram_page_size = static_cast<uint64_t>(page_size);
+  return true;
+}
+
+inline UMBPDistributedConfig UMBPDistributedConfig::FromEnvironment() {
+  UMBPDistributedConfig cfg;
+  std::string error;
+  if (!cfg.ApplyEnvironment(&error)) throw std::invalid_argument(error);
+  return cfg;
+}
 
 // User-facing same-host standalone-process configuration.  Set
 // UMBPConfig::standalone_process to make CreateUMBPClient construct a
