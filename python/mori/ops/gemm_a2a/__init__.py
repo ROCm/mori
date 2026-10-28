@@ -43,6 +43,7 @@ from .layout import (
 from ..gemm_ar import preshuffle_b
 
 _LAZY = {
+    "GemmA2AOp": "op",
     "build_lsa_a2a": "kernels_lsa",
     "build_lsa_barrier": "kernels_lsa",
     "build_sdma_phases": "kernels_sdma",
@@ -52,6 +53,7 @@ _LAZY = {
 
 __all__ = [
     "A2aConfig",
+    "GemmA2AOp",
     "MAX_WORLD",
     "a2a_config",
     "build_lsa_a2a",
