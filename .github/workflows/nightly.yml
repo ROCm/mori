@@ -93,8 +93,9 @@ jobs:
 
               # The builder is an MI355X box, so setup.py would otherwise detect
               # gfx950 and emit a single-arch wheel that cannot launch a kernel on
-              # the MI300X_MLX test runners (gfx942).
-              export MORI_GPU_ARCHS='gfx942;gfx950'
+              # the MI300X_MLX test runners (gfx942). No runner has gfx1250, but the
+              # published wheels need its ahead-of-time code (UMBP's gather kernel).
+              export MORI_GPU_ARCHS='gfx942;gfx950;gfx1250'
 
               # The script's auditwheel repair tags each wheel manylinux_2_28 and
               # fails the build if it needs a newer glibc or libstdc++.

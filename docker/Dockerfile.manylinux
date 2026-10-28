@@ -14,14 +14,18 @@
 ARG BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
 FROM ${BASE_IMAGE}
 
+# Only picks the per-arch ROCm packages ({arch} in ROCM_PACKAGES): their kernels
+# serve ROCm's own libraries, which mori does not link. The archs mori compiles
+# for come from MORI_GPU_ARCHS (see setup.py), so gfx1250 builds without them.
 ARG GPU_ARCHS="gfx942 gfx950"
 ARG ROCM_VERSION=7.14
 ARG ROCM_REPO=https://repo.amd.com/rocm/packages-multi-arch/rhel8/x86_64
 ARG ROCM_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
 # Space-separated; {version} expands to ROCM_VERSION, {arch} to each GPU_ARCHS entry.
 ARG ROCM_PACKAGES="amdrocm-core-devel{version}-{arch}"
-# Same gRPC as Ubuntu 24.04 (protobuf 3.21), which UMBP is already built against there.
-ARG GRPC_VERSION=v1.51.1
+# Still protobuf 21.12, the 3.21 line UMBP builds against on Ubuntu 24.04, and past
+# the fixes for CVE-2023-1428, CVE-2023-33953 and CVE-2023-4785 that 1.51 lacks.
+ARG GRPC_VERSION=v1.54.3
 
 # libibverbs is dlopen'ed at runtime, so rdma-core-devel is here for its headers
 # only. zlib is gRPC's.
@@ -61,8 +65,10 @@ RUN set -ex; \
 # UMBP's control plane needs gRPC + Protobuf, which EL8 does not package. Built
 # shared into /usr/local, where tools/build_manylinux_wheel.py has auditwheel
 # vendor them into the wheel for libmori_umbp_pybinds.so and the UMBP servers.
-# BoringSSL from gRPC's own tree, so the wheel does not carry EL8's OpenSSL 1.1.1,
-# which is end-of-life and which no system update could patch inside the wheel.
+# UMBP links gRPC's unsecure libraries, so the TLS provider -- gRPC's own BoringSSL
+# rather than EL8's end-of-life OpenSSL -- only serves the secure ones it also builds.
+# The wheel has to carry the licenses of what it vendors: gRPC (gpr, grpc with c-ares
+# and xxhash), upb with utf8_range, address_sorting, re2, protobuf and abseil.
 RUN set -ex; \
     git clone --quiet --depth 1 --branch "${GRPC_VERSION}" --recurse-submodules \
       --shallow-submodules https://github.com/grpc/grpc /tmp/grpc; \
@@ -88,8 +94,19 @@ RUN set -ex; \
     cmake --build /tmp/grpc/build -j"$(nproc)"; \
     cmake --install /tmp/grpc/build; \
     ldconfig; \
+    lic=/usr/local/share/licenses/vendored; \
+    install -Dm644 /tmp/grpc/LICENSE "${lic}/grpc/LICENSE"; \
+    install -Dm644 /tmp/grpc/NOTICE.txt "${lic}/grpc/NOTICE.txt"; \
+    for p in abseil-cpp:abseil-cpp/LICENSE address_sorting:address_sorting/LICENSE \
+             c-ares:cares/cares/LICENSE.md protobuf:protobuf/LICENSE re2:re2/LICENSE \
+             upb:upb/LICENSE utf8_range:protobuf/third_party/utf8_range/LICENSE \
+             xxhash:xxhash/LICENSE; do \
+      src="/tmp/grpc/third_party/${p#*:}"; \
+      install -Dm644 "${src}" "${lic}/${p%%:*}/$(basename "${src}")"; \
+    done; \
     rm -rf /tmp/grpc
 
 # manylinux keeps every CPython off PATH, which leaves a shell here without pip.
-# Default to 3.12; tools/build_manylinux_wheel.py still puts the --python one first.
+# Default to 3.12; a build does not depend on it, since setup.py hands CMake the
+# interpreter that runs it.
 ENV PATH=/opt/python/cp312-cp312/bin:${PATH}

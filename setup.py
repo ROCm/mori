@@ -737,6 +737,9 @@ class CMakeBuild(build_ext):
         cmake_args = [
             "cmake",
             "-DUSE_ROCM=ON",
+            # Otherwise src/pybind/CMakeLists.txt builds the modules for whichever
+            # python3 is first on PATH, not for the interpreter running this build.
+            f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DWARP_ACCUM_UNROLL={unroll_value}",
             f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",

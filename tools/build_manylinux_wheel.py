@@ -31,8 +31,9 @@ Run inside the docker/Dockerfile.manylinux image, from a mori checkout:
 The wheel is built against glibc 2.28 and gcc-toolset's libstdc++. ``auditwheel
 repair`` then checks that it needs nothing newer, vendors UMBP's gRPC stack into
 it and tags it manylinux_2_28, so it installs on any distro at or above glibc
-2.28. setup.py's environment variables (SETUPTOOLS_SCM_PRETEND_VERSION,
-MORI_GPU_ARCHS, ...) pass through.
+2.28; the vendored code's licenses go into the wheel's dist-info. setup.py's
+environment variables (SETUPTOOLS_SCM_PRETEND_VERSION, MORI_GPU_ARCHS, ...) pass
+through.
 """
 
 import argparse
@@ -61,6 +62,23 @@ EXCLUDE = (
     "libnuma.so*",
 )
 
+# Everything auditwheel may vendor comes from the gRPC build in
+# docker/Dockerfile.manylinux, which collects its license texts here. A vendored
+# library outside these prefixes fails the build rather than ship unlicensed.
+VENDORED_PREFIXES = (
+    "libabsl_",
+    "libaddress_sorting",
+    "libgpr",
+    "libgrpc",
+    "libprotobuf",
+    "libre2",
+    "libupb",
+)
+VENDORED_LICENSES = "/usr/local/share/licenses/vendored"
+# gRPC and abseil: Apache-2.0. protobuf, re2, upb, address_sorting: BSD-3-Clause.
+# xxhash: BSD-2-Clause. c-ares, utf8_range: MIT.
+VENDORED_SPDX = ("Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "MIT")
+
 
 def _run(cmd, **kwargs):
     print("+ " + " ".join(cmd), flush=True)
@@ -78,23 +96,27 @@ def _interpreter_bindir(version: str) -> str:
     return bindir
 
 
-def _build(bindir: str, repo: str, out_dir: str) -> str:
+def _build(bindir: str, repo: str, work: str) -> str:
     env = dict(os.environ)
-    # setup.py does not hand CMake an interpreter: src/pybind/CMakeLists.txt takes
-    # the first python3 on PATH, and the image has one per CPython version.
-    env["PATH"] = bindir + os.pathsep + env["PATH"]
     # A CMake cache remembers the Python it was configured with.
     env.setdefault(
         "MORI_PYBUILD_DIR",
         "build/manylinux-" + os.path.basename(os.path.dirname(bindir)),
     )
     env.setdefault("MORI_SKIP_PRECOMPILE", "1")
+    # setuptools stages the package in build/lib.* and never empties it, so a
+    # checkout that saw a `pip install .` could leak stale extensions into the wheel.
+    cfg = os.path.join(work, "setuptools.cfg")
+    with open(cfg, "w") as f:
+        f.write(f"[build]\nbuild_base = {os.path.join(work, 'setuptools')}\n")
+    env["DIST_EXTRA_CONFIG"] = cfg
     # The checkout is usually owned by someone else than the container's root,
     # and setuptools_scm silently falls back to version 0.1.0 when git refuses it.
     count = int(env.get("GIT_CONFIG_COUNT", "0"))
     env["GIT_CONFIG_COUNT"] = str(count + 1)
     env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
     env[f"GIT_CONFIG_VALUE_{count}"] = repo
+    out_dir = os.path.join(work, "built")
     _run(
         [
             os.path.join(bindir, "python"),
@@ -137,23 +159,33 @@ def _record_hash(data: bytes) -> str:
     return "sha256=" + digest.decode()
 
 
-def _replace_members(wheel: str, replace: dict) -> None:
-    """Rewrite `wheel` in place with the members in `replace` swapped in."""
+def _rewrite_wheel(wheel: str, replace=None, add=None) -> None:
+    """Rewrite `wheel` in place with `replace` swapped in and `add` appended."""
+    replace, add = replace or {}, add or {}
     tmp = wheel + ".tmp"
     with zipfile.ZipFile(wheel) as zin, zipfile.ZipFile(tmp, "w") as zout:
         record = next(n for n in zin.namelist() if n.endswith(".dist-info/RECORD"))
-        rows = list(csv.reader(io.StringIO(zin.read(record).decode())))
+        rows = [r for r in csv.reader(io.StringIO(zin.read(record).decode())) if r]
         for row in rows:
-            if row and row[0] in replace:
-                row[1:] = [_record_hash(replace[row[0]]), str(len(replace[row[0]]))]
+            data = replace.get(row[0])
+            if data is not None:
+                row[1:] = [_record_hash(data), str(len(data))]
+        at = next(i for i, row in enumerate(rows) if row[0] == record)
+        rows[at:at] = [[n, _record_hash(d), str(len(d))] for n, d in add.items()]
         buf = io.StringIO()
         csv.writer(buf, lineterminator="\n").writerows(rows)
+
         for info in zin.infolist():
-            if info.filename == record:
-                data = buf.getvalue().encode()
-            else:
-                data = replace.get(info.filename) or zin.read(info.filename)
+            if info.filename != record:
+                data = replace.get(info.filename)
+                zout.writestr(info, data if data is not None else zin.read(info))
+        stamp = zin.getinfo(record).date_time
+        for name, data in add.items():
+            info = zipfile.ZipInfo(name, date_time=stamp)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
             zout.writestr(info, data)
+        zout.writestr(zin.getinfo(record), buf.getvalue().encode())
     os.replace(tmp, wheel)
 
 
@@ -175,8 +207,59 @@ def _restore_runpaths(built: str, repaired: str, workdir: str) -> list:
         with open(path, "rb") as f:
             replace[name] = f.read()
     if replace:
-        _replace_members(repaired, replace)
+        _rewrite_wheel(repaired, replace=replace)
     return sorted(replace)
+
+
+def _add_vendored_licenses(wheel: str) -> list:
+    """Ship the license texts of the code auditwheel vendored into `wheel`.
+
+    Their licenses require the notices to travel with every binary copy. They go
+    under <dist-info>/licenses/third_party/, listed by License-File, and
+    License-Expression grows to cover them.
+    """
+    with zipfile.ZipFile(wheel) as zf:
+        names = zf.namelist()
+        meta_name = next(n for n in names if n.endswith(".dist-info/METADATA"))
+        metadata = zf.read(meta_name).decode()
+    libs = [os.path.basename(n) for n in names if ".libs/" in n and n[-1] != "/"]
+    if not libs:
+        return []
+    unknown = [lib for lib in libs if not lib.startswith(VENDORED_PREFIXES)]
+    if unknown:
+        sys.exit(
+            f"build_manylinux_wheel: no license on file for vendored {unknown}. Collect "
+            "it in docker/Dockerfile.manylinux and extend VENDORED_PREFIXES."
+        )
+
+    licenses_dir = os.path.dirname(meta_name) + "/licenses/"
+    add = {}
+    for root, _, files in os.walk(VENDORED_LICENSES):
+        for f in files:
+            path = os.path.join(root, f)
+            rel = os.path.relpath(path, VENDORED_LICENSES)
+            with open(path, "rb") as fh:
+                add[licenses_dir + "third_party/" + rel] = fh.read()
+    if not add:
+        sys.exit(f"build_manylinux_wheel: no license texts under {VENDORED_LICENSES}")
+    listed = sorted(n[len(licenses_dir) :] for n in add)
+
+    head, sep, body = metadata.partition("\n\n")
+    lines = head.split("\n")
+    expr = next(
+        i for i, line in enumerate(lines) if line.startswith("License-Expression:")
+    )
+    ids = [p.strip() for p in lines[expr].split(":", 1)[1].split(" AND ")]
+    lines[expr] = "License-Expression: " + " AND ".join(
+        ids + [i for i in VENDORED_SPDX if i not in ids]
+    )
+    files = [i for i, line in enumerate(lines) if line.startswith("License-File:")]
+    at = (files[-1] if files else expr) + 1
+    lines[at:at] = ["License-File: " + f for f in listed]
+    replace = {meta_name: ("\n".join(lines) + sep + body).encode()}
+
+    _rewrite_wheel(wheel, replace=replace, add=add)
+    return listed
 
 
 def main() -> None:
@@ -197,7 +280,7 @@ def main() -> None:
     bindir = _interpreter_bindir(args.python)
     os.makedirs(args.out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
-        built = _build(bindir, repo, os.path.join(tmp, "built"))
+        built = _build(bindir, repo, tmp)
         repaired_dir = os.path.join(tmp, "repaired")
         # --only-plat: otherwise auditwheel also adds every older tag the wheel happens
         # to meet (manylinux_2_27 today), which changes with the symbols the code uses.
@@ -228,6 +311,9 @@ def main() -> None:
             print(
                 f"build_manylinux_wheel: restored the RUNPATH auditwheel trimmed from {member}"
             )
+        licenses = _add_vendored_licenses(repaired)
+        if licenses:
+            print(f"build_manylinux_wheel: added {len(licenses)} third-party licenses")
         dest = os.path.join(args.out_dir, name)
         shutil.move(repaired, dest)
     print(f"build_manylinux_wheel: {dest}")
