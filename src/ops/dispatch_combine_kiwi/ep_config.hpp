@@ -83,10 +83,9 @@ struct runtime_defaults_t {
 // and combine policy can then select a smaller launch from the active token
 // count without changing those allocations.
 //
-// The common block bands combine the 2026-08 BF16 Banff one-token result,
-// the RAD OCI 1/2/4/8-node small-token sweeps, and the existing high-token
-// bands. ws8 uses its measured backend threshold; every other topology uses
-// the ws16-derived fallback threshold.
+// The common block bands combine a BF16 single-node (MI300X) one-token result,
+// 1/2/4/8-node small-token sweeps, and the existing high-token bands. ws8 uses its measured backend
+// threshold; every other topology uses the ws16-derived fallback threshold.
 inline runtime_defaults_t recommended_runtime_defaults(int num_tokens, int world_size) {
   if (num_tokens <= 0) {
     throw std::invalid_argument(

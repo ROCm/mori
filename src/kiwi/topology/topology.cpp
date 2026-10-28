@@ -159,6 +159,32 @@ std::optional<pci_bdf_t> get_gpu_bdf(int hip_device) {
   return bdf;
 }
 
+// Linux CPU ids local to a PCI device, parsed from its sysfs local_cpulist
+// (for example "56-111,168-223"). Empty if the file is missing or malformed.
+std::vector<int> read_pci_local_cpus(const pci_bdf_t& bdf) {
+  char path[96];
+  std::snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.%x/local_cpulist",
+                bdf.domain, bdf.bus, bdf.device, bdf.function);
+  std::ifstream in(path);
+  std::vector<int> cpus;
+  std::string range;
+  while (std::getline(in, range, ',')) {
+    int first = -1;
+    int last = -1;
+    const int fields = std::sscanf(range.c_str(), "%d-%d", &first, &last);
+    if (fields == 1) {
+      last = first;
+    }
+    if (fields < 1 || first < 0 || last < first) {
+      return {};
+    }
+    for (int cpu = first; cpu <= last; ++cpu) {
+      cpus.push_back(cpu);
+    }
+  }
+  return cpus;
+}
+
 bool location_matches_bdf(const kfd_node_t& node, const pci_bdf_t& bdf) {
   if (node.location_id < 0 || bdf.bus < 0 || bdf.device < 0 || bdf.function < 0) {
     return false;
@@ -356,6 +382,10 @@ gpu_locality_t query_current_gpu_locality() {
   }
   locality.bdf = *bdf;
   locality.has_bdf = true;
+  // KFD's cpu_core_id_base is a hardware (APIC) id, not a Linux CPU id: on
+  // two-socket SMT hosts the second socket reports 128 while Linux numbers
+  // its CPUs 56-111,168-223. The PCI device's local_cpulist uses Linux ids.
+  locality.local_cpus = read_pci_local_cpus(*bdf);
 
   auto nodes = read_kfd_nodes();
   for (const auto& [node_id, node] : nodes) {
@@ -378,11 +408,6 @@ gpu_locality_t query_current_gpu_locality() {
   if (cpu_node == nodes.end() || cpu_node->second.cpu_core_id_base < 0 ||
       cpu_node->second.cpu_cores_count <= 0) {
     return locality;
-  }
-
-  locality.local_cpus.reserve(static_cast<size_t>(cpu_node->second.cpu_cores_count));
-  for (int offset = 0; offset < cpu_node->second.cpu_cores_count; ++offset) {
-    locality.local_cpus.push_back(cpu_node->second.cpu_core_id_base + offset);
   }
 
   std::vector<gpu_slot_candidate_t> peers;
@@ -461,14 +486,14 @@ std::vector<int> build_proxy_thread_cpus(int num_proxy_threads) {
   const gpu_locality_t locality = query_current_gpu_locality();
   const std::vector<int> local_allowed =
       intersect_cpus_preserve_order(locality.local_cpus, allowed);
-  // Partition the *pin-able* local CPU mask when available. Some rad-c42
+  // Partition the *pin-able* local CPU mask when available. Some cluster
   // launch paths expose holes in the NUMA-local CPU range, for example CPU1-2
   // unavailable while CPU0,3-55 are allowed. Selecting only from CPUs that are
   // already in the process affinity mask avoids per-thread fallback pinning.
   const bool use_local_allowed = !local_allowed.empty();
   const std::vector<int>& selected_pool = use_local_allowed ? local_allowed : allowed;
   const char* selected_source =
-      use_local_allowed ? "local_kfd_allowed_cpu_slice" : "allowed_cpu_slice_by_hip_device";
+      use_local_allowed ? "local_pci_allowed_cpu_slice" : "allowed_cpu_slice_by_hip_device";
   const int selected_slot = use_local_allowed ? locality.gpu_slot_on_cpu_node : locality.hip_device;
 
   for (int thread_id = 0; thread_id < num_proxy_threads; ++thread_id) {

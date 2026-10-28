@@ -25,35 +25,38 @@
  *
  * Ring layout. A device-to-host ring is `capacity` 64-byte lines of four
  * 16-byte chunks. Lane c of the pushing wavefront writes chunk c of a message
- * with one 16-byte store (global_store_dwordx4):
+ * with one 16-byte store (global_store_dwordx4). A chunk is two 8-byte
+ * halves, each 4 B of data and a 4 B signal (the LL8 format):
  *
- *   line = 64 B   +-------------+-------------+-------------+-------------+
- *                 |   chunk 0   |   chunk 1   |   chunk 2   |   chunk 3   |
- *                 +------+------+------+------+------+------+------+------+
- *                 | data | sig  | data | sig  | data | sig  | data | sig  |
- *                 |  8 B |  8 B |  8 B |  8 B |  8 B |  8 B |  8 B |  8 B |
- *                 +------+------+------+------+------+------+------+------+
+ *   chunk = 16 B  +---------+---------+---------+---------+
+ *                 | data lo |  sig 0  | data hi |  sig 1  |
+ *                 |   4 B   |   4 B   |   4 B   |   4 B   |
+ *                 +---------+---------+---------+---------+
  *
- *   data: payload bytes [8c, 8c + 8) of the message. Chunks wholly past the
- *         payload carry zero; the bytes of the last word past the payload
- *         are unspecified (push_shared/push_global/push_lanes pass them
- *         through) and never returned by pop().
- *   sig:  bits  0-7   epoch = (line index >> log2(capacity)) & 0xff, in every
- *                     chunk, including the padding chunks of the last line
- *         bits  8-15  reserved, zero
- *         bits 16-31  payload length in bytes  (chunk 0 only)
- *         bits 32-63  32-bit metadata          (chunk 0 only), e.g. the
- *                     invoke callback id
+ *   data:  payload bytes [8c, 8c + 4) and [8c + 4, 8c + 8) of the message.
+ *          Chunks wholly past the payload carry zero; the bytes of the last
+ *          word past the payload are unspecified (push_shared/push_global/
+ *          push_lanes pass them through) and never returned by pop().
+ *   sig 0: bits  0-7   epoch = (line index >> log2(capacity)) & 0xff, in every
+ *                      signal, including the padding chunks of the last line
+ *          bits  8-15  metadata bits 0-7   (chunk 0 only)
+ *          bits 16-31  payload length in bytes  (chunk 0 only)
+ *   sig 1: bits  0-7   epoch, as in sig 0
+ *          bits  8-31  metadata bits 8-31  (chunk 0 only)
+ *
+ * The 32-bit metadata is e.g. the invoke callback id. The code handles a
+ * chunk's two signals as one 64-bit signal pair, sig 0 | sig 1 << 32.
  *
  * A message of B bytes uses message_chunks(B) = max(1, ceil(B / 8)) chunks,
  * at most one per lane, so B <= kMaxMessageBytes = 512. It starts on a line
  * and occupies message_lines(B) whole lines; a message that reaches the end
  * of the ring continues at line 0 of the next lap.
  *
- * The host consumes a message only when every chunk of its lines, padding
+ * The host consumes a message only when every signal of its lines, padding
  * included, carries the lap epoch of its own line, so a partly visible
- * message is never consumed. This relies on 16-byte GPU stores to host memory and
- * aligned 16-byte host loads being single-copy atomic (x86-64 consumer).
+ * message is never consumed. Each signal guards the 4 data bytes beside it,
+ * so this relies only on aligned 8-byte halves of a GPU store to host memory
+ * and of a host load being single-copy atomic, not on 16-byte atomicity.
  * Producers never write line i + capacity before the consumer has published
  * a position past line i, so a line holds either the expected lap or the one
  * before it, and an 8-bit epoch tells them apart. Empty lines start as lap -1
@@ -92,9 +95,9 @@ inline constexpr size_t kMaxCapacityLines = size_t{1} << 31;
 
 namespace detail {
 
-/// One 16-byte chunk: [0] payload word, [1] signal word. A vector type, so a
+/// One 16-byte chunk: {data lo, sig 0, data hi, sig 1}. A vector type, so a
 /// chunk is moved with one 16-byte access.
-using Chunk = uint64_t __attribute__((ext_vector_type(2)));
+using Chunk = uint32_t __attribute__((ext_vector_type(4)));
 
 inline constexpr size_t kChunkPayloadBytes = 8;
 inline constexpr size_t kChunksPerLine = 4;
@@ -117,12 +120,16 @@ static_assert(message_lines(kMaxMessageBytes) == kMaxMessageLines);
 
 namespace detail {
 
-/// Signal word of a chunk; `bytes` and `metadata` are nonzero only in chunk 0.
+/// Signal pair (sig 0 | sig 1 << 32) of a chunk; `bytes` and `metadata` are
+/// nonzero only in chunk 0.
 __host__ __device__ constexpr uint64_t make_signal(uint8_t epoch, uint32_t bytes,
                                                    uint32_t metadata) {
-  return static_cast<uint64_t>(epoch) | (static_cast<uint64_t>(bytes & 0xffffu) << 16) |
-         (static_cast<uint64_t>(metadata) << 32);
+  return static_cast<uint64_t>(epoch) * 0x100000001u |
+         (static_cast<uint64_t>(metadata & 0xffu) << 8) |
+         (static_cast<uint64_t>(bytes & 0xffffu) << 16) |
+         (static_cast<uint64_t>(metadata >> 8) << 40);
 }
+/// Epoch of sig 0.
 __host__ __device__ constexpr uint8_t signal_epoch(uint64_t signal) {
   return static_cast<uint8_t>(signal);
 }
@@ -130,7 +137,21 @@ __host__ __device__ constexpr uint32_t signal_bytes(uint64_t signal) {
   return static_cast<uint32_t>(signal >> 16) & 0xffffu;
 }
 __host__ __device__ constexpr uint32_t signal_metadata(uint64_t signal) {
-  return static_cast<uint32_t>(signal >> 32);
+  return (static_cast<uint32_t>(signal >> 8) & 0xffu) | static_cast<uint32_t>(signal >> 40) << 8;
+}
+
+/// The chunk carrying payload word `data` and signal pair `signal`.
+__host__ __device__ constexpr Chunk make_chunk(uint64_t data, uint64_t signal) {
+  return Chunk{static_cast<uint32_t>(data), static_cast<uint32_t>(signal),
+               static_cast<uint32_t>(data >> 32), static_cast<uint32_t>(signal >> 32)};
+}
+/// Payload word of a chunk.
+__host__ __device__ constexpr uint64_t chunk_data(const Chunk& c) {
+  return c[0] | static_cast<uint64_t>(c[2]) << 32;
+}
+/// Signal pair of a chunk.
+__host__ __device__ constexpr uint64_t chunk_signal(const Chunk& c) {
+  return c[1] | static_cast<uint64_t>(c[3]) << 32;
 }
 
 /// Lap epoch of absolute line index `line`.
@@ -203,11 +224,12 @@ __device__ __forceinline__ void write_message(global_ptr<Chunk> ring, uint32_t l
     const uint8_t epoch = line_epoch(line, log2_capacity);
     const uint64_t data = lane * kChunkPayloadBytes < bytes ? word : 0;
     // Lane 0's header carries no epoch, so it is loop-invariant in a push
-    // loop; every lane ORs in its line's epoch (make_signal's low byte).
+    // loop; every lane ORs in its line's epoch (the low byte of each
+    // signal).
     const uint64_t header = lane == 0 ? make_signal(0, bytes, metadata) : 0;
-    const uint64_t signal = header | epoch;
+    const uint64_t signal = header | make_signal(epoch, 0, 0);
     const uint64_t mask = (uint64_t{1} << log2_capacity) - 1;
-    ring[(line & mask) * kChunksPerLine + lane % kChunksPerLine] = Chunk{data, signal};
+    ring[(line & mask) * kChunksPerLine + lane % kChunksPerLine] = make_chunk(data, signal);
   }
 }
 
@@ -286,7 +308,7 @@ struct PushApi {
 /**
  * @brief Cached readiness state for a device-to-host queue's host consumer
  *
- * ready() is one load of the next message's chunk-0 signal word and an epoch
+ * ready() is one load of the next message's chunk-0 sig 0 and an epoch
  * compare; it never reads the shared consumer index. Call refresh() after
  * any operation that may have consumed messages (pop(), invoke
  * Context::progress()). ready() is a hint: it can be true while pop() still
@@ -300,7 +322,7 @@ class HostPollState {
   /// Rebind to the queue's current consumer position.
   __host__ void refresh() {
     const uint64_t head = queue_->consumer_position();
-    signal_ = reinterpret_cast<const volatile uint64_t*>(
+    signal_ = reinterpret_cast<const volatile uint32_t*>(
                   queue_->chunks_ + (head & queue_->capacity_mask_) * kChunksPerLine) +
               1;
     expected_epoch_ = line_epoch(head, queue_->log2_capacity_);
@@ -312,7 +334,7 @@ class HostPollState {
   __host__ explicit HostPollState(const Queue* queue) : queue_(queue) { refresh(); }
 
   const Queue* queue_;
-  const volatile uint64_t* signal_ = nullptr;  ///< forces a fresh coherent load
+  const volatile uint32_t* signal_ = nullptr;  ///< sig 0; forces a fresh coherent load
   uint8_t expected_epoch_ = 0;
 };
 

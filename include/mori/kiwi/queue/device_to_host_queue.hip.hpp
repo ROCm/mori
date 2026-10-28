@@ -23,7 +23,7 @@
  * @file device_to_host_queue.hip.hpp
  * @brief Queue<Direction::DeviceToHost, Concurrency::SPSC>: GPU-push, CPU-pop
  *
- * One GPU wavefront pushes, one CPU thread pops, in the 16-byte chunk format
+ * One GPU wavefront pushes, one CPU thread pops, in the LL8 chunk format
  * of detail/chunk.hip.hpp. The producer keeps its index and a cached copy of
  * the consumer index in registers and reads the published consumer index
  * over PCIe only when the ring looks full. No read-modify-write atomics.

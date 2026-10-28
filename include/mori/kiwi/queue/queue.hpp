@@ -30,7 +30,8 @@
  * - Device-to-host and host-to-device queues
  * - SPSC queues in both directions, an MPSC device-to-host queue and an
  *   MPMC host-to-device queue
- * - Device-to-host: 16-byte chunks (8 B payload + 8 B signal per lane),
+ * - Device-to-host: 16-byte chunks per lane, each two halves of 4 B payload
+ *   + 4 B signal (LL8),
  *   messages of up to 512 bytes plus 32-bit metadata, and one push API
  *   (push_reg, push_shared, push_global, push_lanes)
  * - Host-to-device: 64-byte wave-slots (56-byte payload in lanes 0-6)

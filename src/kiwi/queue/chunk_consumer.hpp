@@ -36,13 +36,14 @@
 #include <mori/kiwi/queue/error.hpp>
 
 #if !defined(__x86_64__) && !defined(__HIP_DEVICE_COMPILE__)
-#error "The device-to-host consumer requires single-copy-atomic 16-byte loads (x86-64)"
+#error "The device-to-host consumer loads chunks with movdqa (x86-64)"
 #endif
 
 namespace mori::kiwi::queue::detail {
 
-/// One aligned 16-byte load (movdqa), single-copy atomic on AVX-capable
-/// x86-64 processors. The volatile asm is re-executed on every call because
+/// One aligned 16-byte load (movdqa). The format needs only each aligned
+/// 8-byte half to be single-copy atomic (each half is 4 B data + its signal).
+/// The volatile asm is re-executed on every call because
 /// the GPU writes the ring, and its memory clobber keeps the compiler from
 /// moving other memory accesses (the consumer index publish) across it.
 inline Chunk load_chunk(const Chunk* p) {
@@ -85,7 +86,7 @@ inline Chunk* allocate_ring(size_t capacity) {
   }
   Chunk* ring = host_malloc_uc<Chunk>(capacity * kChunksPerLine);
   for (size_t i = 0; i < capacity * kChunksPerLine; ++i) {
-    ring[i] = Chunk{0, make_signal(0xff, 0, 0)};
+    ring[i] = make_chunk(0, make_signal(0xff, 0, 0));
   }
   return ring;
 }
@@ -104,8 +105,7 @@ struct MessageInfo {
   uint32_t metadata;
 };
 
-/// Out of line and cold, so that read_message() stays small enough to inline
-/// into pop().
+/// Out of line and cold, to keep it off read_message()'s hot path.
 [[noreturn]] __attribute__((noinline, cold)) inline void throw_bad_message_length() {
   throw queue_error("device-to-host queue: message length exceeds kMaxMessageBytes");
 }
@@ -131,8 +131,8 @@ inline void copy_partial_word(unsigned char* dst, uint64_t word, size_t n) {
   }
 }
 
-/// Loads the four chunks of absolute line `line` into `c`; true if all of
-/// them carry the line's lap epoch.
+/// Loads the four chunks of absolute line `line` into `c`; true if all eight
+/// of their signals carry the line's lap epoch.
 inline bool load_line(const Chunk* ring, uint64_t mask, uint32_t log2_capacity, uint64_t line,
                       Chunk (&c)[kChunksPerLine]) {
   const Chunk* chunks = ring + (line & mask) * kChunksPerLine;
@@ -140,17 +140,19 @@ inline bool load_line(const Chunk* ring, uint64_t mask, uint32_t log2_capacity, 
   for (size_t j = 0; j < kChunksPerLine; ++j) {
     c[j] = load_chunk(chunks + j);
   }
-  // The four signal words as two vectors, all epochs compared at once.
-  const Chunk signals01 = {c[0][1], c[1][1]};
-  const Chunk signals23 = {c[2][1], c[3][1]};
-  const Chunk stale = ((signals01 ^ epoch) | (signals23 ^ epoch)) & 0xff;
-  return (stale[0] | stale[1]) == 0;
+  // All eight epochs compared at once: XOR each chunk with the expected
+  // signals and keep only the signals' epoch bytes.
+  const Chunk expected = {0, epoch, 0, epoch};
+  const Chunk stale =
+      ((c[0] ^ expected) | (c[1] ^ expected) | (c[2] ^ expected) | (c[3] ^ expected)) &
+      Chunk{0, 0xff, 0, 0xff};
+  return (stale[1] | stale[3]) == 0;
 }
 
 /**
  * @brief Copy the message starting at absolute line `head` if it is whole
  *
- * Validates chunk 0, then every other chunk of the message's lines, padding
+ * Validates chunk 0, then every signal of the message's lines, padding
  * included, against the lap of its own line. Returns false if any of them
  * is not visible yet. Otherwise copies exactly the message's bytes into
  * `buf`, fills `info`, and returns true.
@@ -161,17 +163,19 @@ inline bool load_line(const Chunk* ring, uint64_t mask, uint32_t log2_capacity, 
  * wavefront can never land on top of another wavefront's next-lap chunk.
  *
  * This runs once per message on the proxy thread, so it loads a whole line
- * at a time, compares its four epochs at once, and copies with
- * constant-size moves only.
+ * at a time, compares its eight epochs at once, and copies with
+ * constant-size moves only. Forced inline: the compiler otherwise keeps it
+ * out of line, which costs a call and register saves per pop.
  *
  * @throws queue_error if chunk 0 is visible but its length exceeds
  *         kMaxMessageBytes (a corrupted ring).
  */
-inline bool read_message(const Chunk* ring, uint64_t mask, uint32_t log2_capacity, uint64_t head,
-                         void* buf, MessageInfo& info) {
+__attribute__((always_inline)) inline bool read_message(const Chunk* ring, uint64_t mask,
+                                                        uint32_t log2_capacity, uint64_t head,
+                                                        void* buf, MessageInfo& info) {
   Chunk c[kChunksPerLine];
   const bool line_visible = load_line(ring, mask, log2_capacity, head, c);
-  const uint64_t signal = c[0][1];
+  const uint64_t signal = chunk_signal(c[0]);
   if (signal_epoch(signal) != line_epoch(head, log2_capacity)) {
     return false;
   }
@@ -180,7 +184,7 @@ inline bool read_message(const Chunk* ring, uint64_t mask, uint32_t log2_capacit
     throw_bad_message_length();
   }
   if (!line_visible) {
-    return false;  // chunk 0 is visible, another chunk of its line not yet
+    return false;  // chunk 0's header is visible, another signal of its line not yet
   }
 
   // Whole payload words straight from the validated lines. The partial
@@ -191,11 +195,16 @@ inline bool read_message(const Chunk* ring, uint64_t mask, uint32_t log2_capacit
   const size_t whole_words = len / kChunkPayloadBytes;
   const size_t lines = message_lines(len);
   for (size_t l = 0;;) {
-    for (size_t j = 0; j < kChunksPerLine; ++j) {
-      const size_t k = l * kChunksPerLine + j;
-      if (k < whole_words) {
-        const uint64_t word = c[j][0];
-        std::memcpy(out + k * kChunkPayloadBytes, &word, kChunkPayloadBytes);
+    // Two payload words per shuffle: the data halves (elements 0 and 2)
+    // of two adjacent chunks form 16 contiguous payload bytes.
+    const Chunk pairs[2] = {__builtin_shufflevector(c[0], c[1], 0, 2, 4, 6),
+                            __builtin_shufflevector(c[2], c[3], 0, 2, 4, 6)};
+    for (size_t h = 0; h < 2; ++h) {
+      const size_t k = l * kChunksPerLine + 2 * h;
+      if (k + 2 <= whole_words) {
+        std::memcpy(out + k * kChunkPayloadBytes, &pairs[h], 2 * kChunkPayloadBytes);
+      } else if (k < whole_words) {
+        std::memcpy(out + k * kChunkPayloadBytes, &pairs[h], kChunkPayloadBytes);
       }
     }
     if (++l == lines) {
@@ -209,7 +218,7 @@ inline bool read_message(const Chunk* ring, uint64_t mask, uint32_t log2_capacit
     const uint64_t line = head + whole_words / kChunksPerLine;
     const Chunk last =
         load_chunk(ring + (line & mask) * kChunksPerLine + whole_words % kChunksPerLine);
-    copy_partial_word(out + whole_words * kChunkPayloadBytes, last[0], tail);
+    copy_partial_word(out + whole_words * kChunkPayloadBytes, chunk_data(last), tail);
   }
   info = MessageInfo{len, signal_metadata(signal)};
   return true;
