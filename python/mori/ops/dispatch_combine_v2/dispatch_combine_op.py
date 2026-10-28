@@ -677,6 +677,7 @@ class EpDispatchRoutingHandle:
         cur_rank_num_token=0,
         *,
         reverse_src_view=None,
+        reverse_encode=None,
         recv_maps=None,
     ):
         self.disp_dest_tok_id_map = disp_dest_tok_id_map
@@ -689,13 +690,16 @@ class EpDispatchRoutingHandle:
         # a live arena view to clone on first access (dispatch()).
         self._reverse_cache = disp_tok_id_to_src_tok_id_local
         self._reverse_src_view = reverse_src_view
+        self._reverse_encode = reverse_encode
 
     @property
     def disp_tok_id_to_src_tok_id_local(self):
         if self._reverse_cache is None:
             # First access (post-barrier): clone off the arena so it survives the
             # next dispatch overwriting the region.
-            self._reverse_cache = self._reverse_src_view.clone()
+            src = self._reverse_src_view
+            encode = self._reverse_encode
+            self._reverse_cache = src.clone() if encode is None else encode(src)
         return self._reverse_cache
 
     def tensors(self):
@@ -851,11 +855,12 @@ class EpDispatchCombineOp:
 
     # -- shared: variant selection -----------------------------------------
 
-    def _pick(self, num_tokens):
+    def _pick(self, num_tokens, snapshot=False):
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
         otherwise. Clamped to variants that were actually built, so the hot path
-        can never trigger a compile."""
+        can never trigger a compile. `snapshot`: the call's handle owns its routing
+        (dispatch(snapshot=True)), which a backend may pick other plans for."""
         schedule = self.cfg.schedule
         disp_spec = comb_spec = None
         if schedule:
@@ -927,11 +932,30 @@ class EpDispatchCombineOp:
             )
         return cache
 
-    def _snapshot_recv_views(self):
+    def _snapshot_recv_views(self, disp_spec):
         """What a snapshot handle must copy out of the arena because this backend's combine
         reads it back, as (recv_to_src, recv_idx) views, copied once the dispatch has written
         them; None when the combine routes from the dest map and the count alone."""
         return None
+
+    def _reverse_source(self, disp_spec):
+        """The arena view a dispatch through disp_spec leaves its reverse map in, and the
+        function that re-encodes it as src_rank * max_num_inp_token_per_rank + src_tok, or
+        None when it already is."""
+        # A live arena view: the reverse map is cloned lazily on first access,
+        # which must happen after the caller's post-dispatch barrier (see
+        # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
+        # fixed for the op's lifetime, and rebuilding it per dispatch is pure
+        # host cost on a path where the host already paces the GPU.
+        reverse = getattr(self, "_reverse_view", None)
+        if reverse is None:
+            reverse = from_gpu_ptr(
+                self.arena.local_ptr(self._region("recv_to_src_token")),
+                (self._recv_cap,),
+                torch.int32,
+            )
+            self._reverse_view = reverse
+        return reverse, None
 
     # -- shared: the ops ---------------------------------------------------
 
@@ -993,7 +1017,7 @@ class EpDispatchCombineOp:
         cap = self.cfg.max_num_inp_token_per_rank
         if n > cap:
             raise ValueError(f"{n} tokens exceeds max_num_inp_token_per_rank={cap}")
-        disp_spec, _ = self._pick(n)
+        disp_spec, _ = self._pick(n, snapshot)
 
         recv_views = None
         if routing is not None:
@@ -1009,7 +1033,7 @@ class EpDispatchCombineOp:
                 # No fill: dispatch writes every (tok, k) entry below n, and
                 # nothing reads past n.
                 dest_map = torch.empty_like(self.routing_dest_map)
-                recv_views = self._snapshot_recv_views()
+                recv_views = self._snapshot_recv_views(disp_spec)
             elif return_routing:
                 dest_map = self.routing_dest_map
             else:
@@ -1035,19 +1059,8 @@ class EpDispatchCombineOp:
         if not return_routing:
             return base
 
-        # A live arena view: the reverse map is cloned lazily on first access,
-        # which must happen after the caller's post-dispatch barrier (see
-        # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
-        # fixed for the op's lifetime, and rebuilding it per dispatch is pure
-        # host cost on a path where the host already paces the GPU.
-        reverse = getattr(self, "_reverse_view", None)
-        if reverse is None:
-            reverse = from_gpu_ptr(
-                self.arena.local_ptr(self._region("recv_to_src_token")),
-                (self._recv_cap,),
-                torch.int32,
-            )
-            self._reverse_view = reverse
+        reverse, encode = self._reverse_source(disp_spec)
+        own = recv_maps is not None and encode is None
         handle = EpDispatchRoutingHandle(
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
@@ -1058,9 +1071,10 @@ class EpDispatchCombineOp:
             total_recv_token_num=(
                 self.total_recv.clone() if snapshot else self.total_recv
             ),
-            disp_tok_id_to_src_tok_id_local=None if recv_maps is None else recv_maps[0],
+            disp_tok_id_to_src_tok_id_local=recv_maps[0] if own else None,
             cur_rank_num_token=n,
-            reverse_src_view=reverse,
+            reverse_src_view=reverse if recv_maps is None else recv_maps[0],
+            reverse_encode=encode,
             recv_maps=recv_maps,
         )
         return base + (handle,)
@@ -1078,7 +1092,9 @@ class EpDispatchCombineOp:
 
         Returns (out [ct,hidden], out_weights [ct,topk] or None)."""
         ct = routing.cur_rank_num_token
-        _, comb_spec = self._pick(ct)
+        _, comb_spec = self._pick(
+            ct, routing.total_recv_token_num is not self.total_recv
+        )
 
         if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
             # StdMoE has already written the weighted-reduced tokens into out_tok;

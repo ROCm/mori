@@ -363,7 +363,8 @@ def ll128(
 ):
     """The LL128 plan geometry for an op of this shape, dispatch dtype and capacity:
     {"dispatch": (block, warp), "combine": (block, warp)} when both kernels take LL128,
-    {"combine": (block, warp)} when only the combine does, or None when the op keeps the
+    {"combine": (block, warp)} when only the combine does, the first with "max_tok": n when
+    only the calls of at most n tokens a rank take it, or None when the op keeps the
     schedule."""
     per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
     entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
@@ -374,7 +375,11 @@ def ll128(
         return {"dispatch": plan["dispatch"], "combine": plan["combine"]}
     if max_tok <= plan.get("combine_max_tok", 0):
         return {"combine": plan["combine"]}
-    return None
+    return {
+        "dispatch": plan["dispatch"],
+        "combine": plan["combine"],
+        "max_tok": plan["max_tok"],
+    }
 
 
 # THE ROUND RULE outranks every shape choice above: _tpi = warpSize/topk tokens are

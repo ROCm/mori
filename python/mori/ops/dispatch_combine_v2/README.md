@@ -106,6 +106,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
+| `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |
