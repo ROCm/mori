@@ -78,7 +78,7 @@ class CollectivesFacade {
   // anything else is an error; MORI_CCL_FORCE_PULL!=0 forces pull (npes 4 or 8).
   // Set at runtime via SetReduceMode(); the push slice count via
   // SetPushLogSlices() (-1 = auto). MORI_CCL_MAX_NBLOCKS caps the launch grid
-  // (<= 0/unset = no cap).
+  // (default 128; <= 0 = no cap, use the full CU count).
   enum class RsMode { kPush, kPull, kAuto };
 
   static constexpr size_t kDefAlign = 128;
@@ -227,9 +227,13 @@ class CollectivesFacade {
     HIP_RUNTIME_CHECK(hipGetDeviceProperties(&prop, dev));
     state.MP_count = prop.multiProcessorCount;
 
-    // Optional hard cap on the launch grid of the reduce-scatter/all-reduce
-    // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
-    state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
+    // Hard cap on the launch grid of the reduce-scatter/all-reduce kernels
+    // (tightens, never raises, the CU-count cap). Defaults to 128: large-message
+    // push/pull saturate XGMI bandwidth well below the full CU count, and a
+    // smaller co-resident grid cuts per-block barrier/atomic contention (measured
+    // ~1-4% faster than the full 256-CU grid on gfx950, never slower). Override
+    // with MORI_CCL_MAX_NBLOCKS; <= 0 disables the cap (use the full CU count).
+    state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 128));
 
     size_t controlBytes = kCCLMaxPeers * sizeof(uint64_t) * 4 + kArrivedBytes;
     size_t totalBytes = maxStagingBytes + controlBytes;
@@ -435,7 +439,7 @@ class CollectivesFacade {
     // SDMA target); devComm is the SDMA device comm.
     cco::ccoDevComm devComm{};
     int MP_count{0};    // Number of CUs per device
-    int maxNBlocks{0};  // MORI_CCL_MAX_NBLOCKS grid cap; <= 0 means no cap
+    int maxNBlocks{0};  // MORI_CCL_MAX_NBLOCKS grid cap (default 128); <= 0 means no cap
 
     // Release this device's heap window, counters, and SDMA comm. Staging is a
     // sub-region of heapWin, so it needs no separate deregistration.

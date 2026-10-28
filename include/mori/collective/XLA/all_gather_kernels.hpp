@@ -93,7 +93,9 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
 
   // No Phase 3: output already fully written by SDMA. The block read pushGen at
   // entry, so it can advance the generation for the next launch now.
-  if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
+  if (threadIdx.x == 0) {
+    AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
+  }
 }
 
 // Multi-block, SDMA-free all-gather: every PE reads each peer's shard straight

@@ -98,7 +98,9 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
 
   // No Phase 3: recv buffers already fully written by SDMA. The block read
   // pushGen at entry, so it can advance the generation for the next launch now.
-  if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
+  if (threadIdx.x == 0) {
+    AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
+  }
 }
 
 // Multi-block, SDMA-free all-to-all: every PE reads, from each peer p, the chunk

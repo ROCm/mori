@@ -123,7 +123,7 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //   output        : raw symmetric-heap pointer, chunkElems elements
 //   groupCtr : plain device buffer (kGroupCtrTotal uint32), local-only.
 //                   [kArrivalIdx] elects the last block (atomicInc wraps it back
-//                   to 0) to advance the push generation (AdvancePushGen)
+//                   to 0) to advance the push generation
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (GenBarrier in block 0, before Phase 1), so
 //                   back-to-back launches need no host barrier
@@ -374,7 +374,9 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // are done reducing what we sent them: gate our writes into their staging
     // until every PE has entered this launch.
     int stride4G = heapWin->stride4G;
-    if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    if (threadIdx.x < warpSize) {
+      GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    }
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -414,7 +416,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // to 0 on the last block, so it needs no reset of its own.
   if (threadIdx.x == 0 &&
       atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
-    AdvancePushGen(barrierCtr, myPe, pushGen);
+    AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
   }
 }
 
@@ -469,13 +471,7 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
   // A block counts in only once all its waves are done reading peer inputs.
   __syncthreads();
   if (threadIdx.x < warpSize) {
-    uint32_t last = 0;
-    if (threadIdx.x == 0) {
-      last = atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
-    }
-    if (BroadcastLane0(last)) {
-      GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
-    }
+    if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
   }
 }
 
