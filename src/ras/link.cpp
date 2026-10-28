@@ -411,30 +411,33 @@ void LinkManager::AcceptAll(uint64_t now) {
 }
 
 void LinkManager::HandleEvent(RasEvent& ev, uint64_t now) {
-  std::visit(Overloaded{
-                 [&](EngineRegistered& e) { localEngines_.insert(e.engineKey); },
-                 [&](EngineUnregistered& e) {
-                   localEngines_.erase(e.engineKey);
-                   std::vector<std::pair<std::string, std::string>> gone;
-                   for (const auto& entry : relations_) {
-                     if (entry.first.first == e.engineKey) gone.push_back(entry.first);
-                   }
-                   for (const auto& key : gone) RemoveRelation(key.first, key.second, now);
-                 },
-                 [&](PeerAdded& e) {
-                   if (!e.endpoint.Valid()) {
-                     ++peersWithoutRas_;
-                     RAS_LOG_DEBUG("engine {} registered {}, which advertises no RAS endpoint",
-                                   e.localEngine, e.remoteEngine);
-                   } else if (e.endpoint.uuid == opts_.uuid) {
-                     ++sameProcessPeers_;
-                   } else {
-                     AddRelation(e, now);
-                   }
-                 },
-                 [&](PeerRemoved& e) { RemoveRelation(e.localEngine, e.remoteEngine, now); },
-             },
-             ev);
+  std::visit(
+      Overloaded{
+          [&](EngineRegistered& e) { localEngines_.insert(e.engineKey); },
+          [&](EngineUnregistered& e) {
+            localEngines_.erase(e.engineKey);
+            DetachOwner(e.engineKey, &self_);
+            std::vector<std::pair<std::string, std::string>> gone;
+            for (const auto& entry : relations_) {
+              if (entry.first.first == e.engineKey) gone.push_back(entry.first);
+            }
+            for (const auto& key : gone) RemoveRelation(key.first, key.second, now);
+          },
+          [&](PeerAdded& e) {
+            if (!e.endpoint.Valid()) {
+              ++peersWithoutRas_;
+              RAS_LOG_DEBUG("engine {} registered {}, which advertises no RAS endpoint",
+                            e.localEngine, e.remoteEngine);
+            } else if (e.endpoint.uuid == opts_.uuid) {
+              ++sameProcessPeers_;
+            } else {
+              AddRelation(e, now);
+            }
+          },
+          [&](PeerRemoved& e) { RemoveRelation(e.localEngine, e.remoteEngine, now); },
+          [&](EngineGpuAttached& e) { AttachGpu(e.engineKey, e.gpu, e.pciBusId, e.nics, &self_); },
+      },
+      ev);
   MarkDirty();
 }
 

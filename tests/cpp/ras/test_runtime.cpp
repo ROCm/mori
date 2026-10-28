@@ -269,6 +269,40 @@ TEST(RasRuntime, EventsReachTheRasThread) {
   EXPECT_TRUE(s.links.empty());
 }
 
+TEST(RasRuntime, EngineGpuEventsBuildTheIdentitysAttachments) {
+  RasCore core(LocalCore());
+  ASSERT_TRUE(core.Start(nullptr));
+  NicAttachment nic;
+  nic.device = "ionic_7";
+  nic.port = 1;
+  EXPECT_TRUE(core.Enqueue(EngineRegistered{"engine-a"}));
+  EXPECT_TRUE(core.Enqueue(EngineRegistered{"engine-b"}));
+  EXPECT_TRUE(core.Enqueue(EngineGpuAttached{"engine-a", 1, "0000:15:00.0", {}}));
+  EXPECT_TRUE(core.Enqueue(EngineGpuAttached{"engine-a", 0, "0000:05:00.0", {}}));
+  EXPECT_TRUE(core.Enqueue(EngineGpuAttached{"engine-b", 0, "0000:05:00.0", {}}));
+  EXPECT_TRUE(core.Enqueue(EngineGpuAttached{"engine-a", 0, "0000:05:00.0", {nic}}));
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        RuntimeSnapshot s = core.Snapshot();
+        return s.self.attachments.size() == 3 && !s.self.attachments[0].nics.empty();
+      },
+      2000));
+  std::vector<GpuAttachment> a = core.Snapshot().self.attachments;
+  EXPECT_EQ(a[0].owner, "engine-a");
+  EXPECT_EQ(a[0].gpu, 0);
+  EXPECT_EQ(a[0].pciBusId, "0000:05:00.0");
+  ASSERT_EQ(a[0].nics.size(), 1u);
+  EXPECT_EQ(a[0].nics[0].device, "ionic_7");
+  EXPECT_EQ(a[1].owner, "engine-a");
+  EXPECT_EQ(a[1].gpu, 1);
+  EXPECT_TRUE(a[1].nics.empty());
+  EXPECT_EQ(a[2].owner, "engine-b");
+
+  EXPECT_TRUE(core.Enqueue(EngineUnregistered{"engine-a"}));
+  ASSERT_TRUE(WaitFor([&] { return core.Snapshot().self.attachments.size() == 1; }, 2000));
+  EXPECT_EQ(core.Snapshot().self.attachments[0].owner, "engine-b");
+}
+
 TEST(RasRuntime, StoppingClosesTheListenerAndRefusesLaterEvents) {
   RasCore core(LocalCore());
   ASSERT_TRUE(core.Start(nullptr));

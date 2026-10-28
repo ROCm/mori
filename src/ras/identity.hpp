@@ -21,14 +21,15 @@
 // SOFTWARE.
 #pragma once
 
-// Builds a runtime's RasProcessId. Every source is unprivileged and read once at startup.
+// Builds a runtime's RasProcessId. Every source is unprivileged and read once at startup,
+// except the attachments, which the engines report later (AttachGpu).
 //
 // - Process facts from /proc: the PID namespace (inode of /proc/self/ns/pid), the start time
 //   (field 22 of /proc/self/stat), and the boot ID that scopes it.
 // - NICs from /sys/class/infiniband: every RDMA port on the host, filtered by
 //   MORI_RDMA_DEVICES the way MORI's RDMA context filters it, with its RoCEv2 GID address and
-//   netdev. The rail is the address's subnet, from the netdev's prefix length. A port's
-//   relationship to the engines that use it arrives with the QP table in P4.
+//   netdev. The rail is the address's subnet, from the netdev's prefix length. This is the
+//   host's inventory; the attachments say which engine and GPU use each port.
 // - Rack, leaf switch, rail names, and LLDP neighbors from the file MORI_RAS_TOPOLOGY_FILE
 //   names, written by site tooling. It holds key=value lines:
 //       rack=<name>
@@ -42,6 +43,7 @@
 // - The leaf switch from Slurm's SLURM_TOPOLOGY_ADDR and SLURM_TOPOLOGY_ADDR_PATTERN, when the
 //   topology file doesn't name one.
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -85,6 +87,20 @@ void ApplySlurmTopology(const std::string& addr, const std::string& pattern, Top
 RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostname,
                              const std::string& host, int32_t pid, RuntimeUuid uuid,
                              const IdentitySources& src);
+
+// Attachments, and NICs in one, past these are ignored, so no caller can grow the identity
+// without bound.
+constexpr size_t kMaxAttachments = 256;
+constexpr size_t kMaxAttachmentNics = 16;
+
+// Records in id->attachments that `owner` uses GPU `gpu`, through `nics` if any. Each NIC is
+// matched to the host inventory (id->topology.nics) by device and port, which fills in its
+// address, rail, and switch; one missing there keeps only its device and port. A repeat
+// changes nothing, and an empty bus ID never replaces a known one.
+void AttachGpu(const std::string& owner, int32_t gpu, const std::string& pciBusId,
+               const std::vector<NicAttachment>& nics, RasProcessId* id);
+// Drops every attachment of `owner`.
+void DetachOwner(const std::string& owner, RasProcessId* id);
 
 // A random version-4 UUID. Its variant bits keep `lo` nonzero, so it can be a header sender.
 RuntimeUuid NewRuntimeUuid();

@@ -106,6 +106,20 @@ int DetectNumaNode(void* addr) {
 #endif
 }
 
+// Tells RAS that `engineKey` uses GPU `device`. `reported` holds a bit per device index, so
+// each GPU is reported once per engine. A bit is cleared again if RAS drops the event, and a
+// device past 63 is reported every time, which RAS merges.
+void ReportGpuToRas(const EngineKey& engineKey, int device, const std::string& busId,
+                    std::atomic<uint64_t>& reported) {
+  ras::RasRuntime* rt = ras::RasRuntime::Get();
+  if (rt == nullptr || device < 0) return;
+  const uint64_t bit = device < 64 ? 1ull << device : 0;
+  if (bit != 0 && (reported.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) return;
+  if (!rt->Enqueue(ras::EngineGpuAttached{engineKey, device, busId, {}}) && bit != 0) {
+    reported.fetch_and(~bit, std::memory_order_relaxed);
+  }
+}
+
 }  // namespace
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -427,6 +441,9 @@ MemoryDesc IOEngine::RegisterMemory(void* data, size_t size, int device, MemoryL
   }
 
   memPool.insert({memDesc.id, memDesc});
+  if (loc == MemoryLocationType::GPU) {
+    ReportGpuToRas(desc.key, device, memDesc.deviceBusId, rasGpusReported);
+  }
   MORI_IO_TRACE("Register memory address {} size {} device {} loc {} with id {}", data, size,
                 device, static_cast<uint32_t>(loc), memDesc.id);
   return memDesc;

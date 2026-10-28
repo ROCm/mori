@@ -456,6 +456,46 @@ RasProcessId CollectIdentity(const std::string& nodeId, const std::string& hostn
   return id;
 }
 
+void AttachGpu(const std::string& owner, int32_t gpu, const std::string& pciBusId,
+               const std::vector<NicAttachment>& nics, RasProcessId* id) {
+  std::vector<GpuAttachment>& list = id->attachments;
+  auto it = std::find_if(list.begin(), list.end(), [&](const GpuAttachment& a) {
+    return a.owner != owner ? a.owner > owner : a.gpu >= gpu;
+  });
+  if (it == list.end() || it->owner != owner || it->gpu != gpu) {
+    if (list.size() >= kMaxAttachments) return;
+    GpuAttachment a;
+    a.owner = owner;
+    a.gpu = gpu;
+    it = list.insert(it, std::move(a));
+  }
+  if (it->pciBusId.empty()) it->pciBusId = pciBusId;
+  for (const NicAttachment& picked : nics) {
+    if (it->nics.size() >= kMaxAttachmentNics) break;
+    auto isPicked = [&](const NicAttachment& n) {
+      return n.device == picked.device && n.port == picked.port;
+    };
+    if (std::any_of(it->nics.begin(), it->nics.end(), isPicked)) continue;
+    const std::vector<NicAttachment>& inventory = id->topology.nics;
+    auto known = std::find_if(inventory.begin(), inventory.end(), isPicked);
+    if (known != inventory.end()) {
+      it->nics.push_back(*known);
+    } else {
+      NicAttachment bare;
+      bare.device = picked.device;
+      bare.port = picked.port;
+      it->nics.push_back(std::move(bare));
+    }
+  }
+}
+
+void DetachOwner(const std::string& owner, RasProcessId* id) {
+  std::vector<GpuAttachment>& list = id->attachments;
+  list.erase(std::remove_if(list.begin(), list.end(),
+                            [&](const GpuAttachment& a) { return a.owner == owner; }),
+             list.end());
+}
+
 RuntimeUuid NewRuntimeUuid() {
   RuntimeUuid u;
   FillRandom(&u.hi, sizeof(u.hi));

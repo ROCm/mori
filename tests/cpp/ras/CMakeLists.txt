@@ -31,6 +31,9 @@ if(BUILD_IO)
   target_link_libraries(test_ras_engine_desc_compat PRIVATE mori_io)
   mori_ras_test(two_process)
   target_link_libraries(test_ras_two_process PRIVATE mori_io)
+  # One process with one thread per GPU, each with its own IOEngine.
+  mori_ras_test(spmt)
+  target_link_libraries(test_ras_spmt PRIVATE mori_io hip::host)
 
   # MORI RAS beside RCCL RAS in one process. Built only where RCCL is installed.
   find_library(MORI_RAS_RCCL_LIBRARY rccl HINTS ${ROCM_PATH}/lib)

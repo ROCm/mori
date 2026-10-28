@@ -27,6 +27,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "src/ras/identity.hpp"
 #include "src/ras/protocol.hpp"
@@ -269,6 +270,7 @@ TEST(RasIdentity, CollectsEverySourceIntoOneIdentity) {
   EXPECT_EQ(FindNic(id.topology.nics, "ionic_0")->switchPort, "7");
   EXPECT_EQ(id.topology.source, "sysfs,file,lldp,slurm");
   EXPECT_TRUE(id.labels.empty());
+  EXPECT_TRUE(id.attachments.empty());  // they arrive later, from the engines
 
   // A missing topology file is skipped, not an error.
   s.topologyFile = t.Root() + "/does-not-exist";
@@ -311,4 +313,77 @@ TEST(RasIdentity, LabelLimitsMatchWhatPeersAccept) {
   EXPECT_FALSE(ValidLabels({{std::string(proto::kMaxLabelKey + 1, 'k'), "v"}}));
   EXPECT_FALSE(ValidLabels({{"k", std::string(proto::kMaxLabelValue + 1, 'v')}}));
   EXPECT_FALSE(ValidLabels({{"", "v"}}));
+}
+
+namespace {
+
+NicAttachment Picked(const std::string& device, uint32_t port) {
+  NicAttachment n;
+  n.device = device;
+  n.port = port;
+  return n;
+}
+
+}  // namespace
+
+TEST(RasIdentity, KeepsOneAttachmentPerEngineAndGpu) {
+  RasProcessId id;
+  AttachGpu("engine-b", 1, "0000:15:00.0", {}, &id);
+  AttachGpu("engine-a", 1, "0000:15:00.0", {}, &id);
+  AttachGpu("engine-a", 0, "0000:05:00.0", {}, &id);
+  AttachGpu("engine-a", 0, "0000:05:00.0", {}, &id);  // another registration on GPU 0
+  ASSERT_EQ(id.attachments.size(), 3u);
+  // Ordered by engine, then GPU.
+  EXPECT_EQ(id.attachments[0].owner, "engine-a");
+  EXPECT_EQ(id.attachments[0].gpu, 0);
+  EXPECT_EQ(id.attachments[0].pciBusId, "0000:05:00.0");
+  EXPECT_EQ(id.attachments[1].owner, "engine-a");
+  EXPECT_EQ(id.attachments[1].gpu, 1);
+  EXPECT_EQ(id.attachments[2].owner, "engine-b");
+  EXPECT_EQ(id.attachments[2].gpu, 1);
+  for (const GpuAttachment& a : id.attachments) EXPECT_TRUE(a.nics.empty());
+}
+
+TEST(RasIdentity, AttachedNicsComeFromTheHostInventory) {
+  RasProcessId id;
+  const NicAttachment inventory{"ionic_0", 1, "enp9s0", "10.3.0.7", "10.3.0.0/24", "sw1", "7"};
+  id.topology.nics.push_back(inventory);
+  id.topology.nics.push_back({"ionic_0", 2, "enp9s1", "10.4.0.7", "10.4.0.0/24", "sw2", "9"});
+
+  // A session's NICs can arrive before the registration, if RAS dropped that event.
+  AttachGpu("engine-a", 0, "0000:05:00.0", {Picked("ionic_0", 1)}, &id);
+  AttachGpu("engine-a", 0, "", {}, &id);
+  AttachGpu("engine-a", 0, "0000:05:00.0", {Picked("ionic_0", 1), Picked("ionic_9", 1)}, &id);
+  ASSERT_EQ(id.attachments.size(), 1u);
+  const GpuAttachment& a = id.attachments[0];
+  EXPECT_EQ(a.pciBusId, "0000:05:00.0");
+  ASSERT_EQ(a.nics.size(), 2u);
+  EXPECT_EQ(a.nics[0], inventory);  // matched by device and port, so not ionic_0 port 2
+  // A NIC missing from the inventory keeps its device and port only.
+  EXPECT_EQ(a.nics[1], Picked("ionic_9", 1));
+}
+
+TEST(RasIdentity, DetachingAnEngineDropsOnlyItsAttachments) {
+  RasProcessId id;
+  AttachGpu("engine-a", 0, "0000:05:00.0", {}, &id);
+  AttachGpu("engine-a", 1, "0000:15:00.0", {}, &id);
+  AttachGpu("engine-b", 0, "0000:05:00.0", {}, &id);
+  DetachOwner("engine-a", &id);
+  ASSERT_EQ(id.attachments.size(), 1u);
+  EXPECT_EQ(id.attachments[0].owner, "engine-b");
+  DetachOwner("engine-unknown", &id);
+  EXPECT_EQ(id.attachments.size(), 1u);
+}
+
+TEST(RasIdentity, AttachmentsAreBounded) {
+  RasProcessId id;
+  for (size_t i = 0; i < kMaxAttachments + 3; ++i) {
+    AttachGpu("engine-" + std::to_string(1000 + i), 0, "", {}, &id);
+  }
+  EXPECT_EQ(id.attachments.size(), kMaxAttachments);
+  std::vector<NicAttachment> nics;
+  for (size_t i = 0; i < kMaxAttachmentNics + 3; ++i)
+    nics.push_back(Picked("nic" + std::to_string(i), 1));
+  AttachGpu("engine-1000", 0, "", nics, &id);
+  EXPECT_EQ(id.attachments[0].nics.size(), kMaxAttachmentNics);
 }
