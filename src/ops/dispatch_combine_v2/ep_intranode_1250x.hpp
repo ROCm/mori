@@ -459,9 +459,8 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
                          ((unsigned long long)seq << 32) | (unsigned)N, __ATOMIC_RELAXED,
                          __HIP_MEMORY_SCOPE_SYSTEM);
     if (laneId < npes) {
-      if constexpr (kCfg.aggReserve)
-        __hip_atomic_store(EpLocal<unsigned>(wr, args.offRecvNum) + 2 * laneId + 1, 0u,
-                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __hip_atomic_store(EpLocal<unsigned>(wr, args.offRecvNum) + 2 * laneId + 1, 0u,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       args.destPeTokenCounter[npes + laneId] = 0;
       args.destPeTokenCounter[laneId] = 0;
     }
@@ -745,6 +744,9 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   static_assert(kEpScaleStride == 0 || EpScaleRows(kCfg) == (int)kEpScaleRows,
                 "MORI_EP_SCALE_ROWS disagrees with EpScaleRows(Cfg) -- the staging would "
                 "be sized for one row numbering and indexed with another");
+  static_assert(kCfg.aggReserve,
+                "the gfx125x dispatch reserves a destination's slots with one RMW a call; "
+                "MakeEpCfg sets Cfg.aggReserve for every gfx125x dispatch");
   if constexpr (kCfg.ll128) {
     EpDispatchLl1250x<kCfg, T>(args);
     return;
@@ -803,8 +805,8 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr int kTokB = kCfg.hiddenDim * (int)sizeof(T);
   constexpr bool kFp4Pack4 = kCfg.dtype == EpDType::Fp4x2 && kSlabBytes >= 4 * kTokB;
   constexpr bool kDPin = kFp4Pack4 && kMetaSlabBytes == 0 && npes == 16 &&
-                         kCfg.warpPerBlock == npes && kCfg.blockNum == 128 && kCfg.aggReserve &&
-                         kEpScaleBytes > 0 && kEpScaleBytes % 8 == 0 && kEpScaleStride == 8 * WS;
+                         kCfg.warpPerBlock == npes && kCfg.blockNum == 128 && kEpScaleBytes > 0 &&
+                         kEpScaleBytes % 8 == 0 && kEpScaleStride == 8 * WS;
   // The payload pass splits each destination's run across warp units instead of
   // walking the token map.
   // kUnitW: the same split at a warp a rank, warp w carrying rank w's run, its metadata and its
@@ -861,7 +863,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr bool kScPayOn =
       npes >= 32 && kMetaDtOk && EpCallTok(kCfg) > kCfg.blockNum * kEpTokChunk;
   constexpr bool kDynTok = kScPayOn;
-  constexpr bool kGDyn = kDynTok && kCfg.aggReserve;
+  constexpr bool kGDyn = kDynTok;
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
   __shared__ index_t s_run[kMaxNpes + (kDynTok ? 1 : 0)];
@@ -1014,9 +1016,9 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   constexpr int kRbSrcB = (kRbRows * 4 + 255) / 256 * 256;
   constexpr int kRbPeerB = 2 * kRbIdxB + kRbSrcB + kRbRows * kEpScaleStride;
   constexpr bool kLdsMeta =
-      kMetaDtOk && kPayFirst && !kPayFirstPlain && kCfg.aggReserve && npes >= 32 &&
-      (kEpScaleBytes == 0 || kScWave) && topk <= WS &&
-      EpCallTok(kCfg) <= kCfg.blockNum * kEpTokChunk && kCfg.warpPerBlock >= 2 * kEpTokChunk &&
+      kMetaDtOk && kPayFirst && !kPayFirstPlain && npes >= 32 && (kEpScaleBytes == 0 || kScWave) &&
+      topk <= WS && EpCallTok(kCfg) <= kCfg.blockNum * kEpTokChunk &&
+      kCfg.warpPerBlock >= 2 * kEpTokChunk &&
       (long long)npes * kRbPeerB <= (long long)(kCfg.warpPerBlock - kEpTokChunk) * kSlabBytes;
   const bool _ldsMeta = kLdsMeta && _tokChunk && _etpi == 1 && _preKOk && _dedupOk &&
                         args.tokenIndices && args.inpTokenBuf && (kEpScaleBytes == 0 || _scWave);
@@ -1129,84 +1131,69 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   const int _bmPerTok = topk * 4 + topk * 4 + 4;
   const int _bmTileB = (int)(hiddenDim * sizeof(T));
   const bool _blkMapNeeded = !((_bmPerTok > 0) && (((_bmTileB - 384) / _bmPerTok) > 0));
-  // Cfg.aggReserve: the call number this call publishes under. A plain load on purpose:
-  // every thread runs it, and an atomic load would queue the whole grid on one
-  // address; the previous call's store is visible across the kernel boundary.
-  [[maybe_unused]] unsigned resSeq = 0;
+  // The call number this call publishes under. A plain load on purpose: every thread runs it,
+  // and an atomic load would queue the whole grid on one address; the previous call's store is
+  // visible across the kernel boundary.
+  const unsigned resSeq = *EpResSeq<npes>() + 1u;
   // p's base for this rank's rows, for the push combine's landing offset that the signal to p
   // carries. An RMW like the send counts beside it, so the highest ticket sees it as it sees them.
-  [[maybe_unused]] auto keepBase = [&](int p, index_t base) {
+  auto keepBase = [&](int p, index_t base) {
     __hip_atomic_exchange(&args.destPeTokenCounter[npes + p], base, __ATOMIC_RELAXED,
                           __HIP_MEMORY_SCOPE_AGENT);
   };
-  if constexpr (kCfg.aggReserve) {
-    resSeq = *EpResSeq<npes>() + 1u;
-    // In each block holding tokens lane p of warp 0 adds the block's count for destination p,
-    // this rank included, into the rank's total for p and keeps its offset in it; the last of
-    // those blocks to arrive reserves the total with one RMW on p's slot word and publishes the
-    // base with the call number in one word.
-    static_assert(npes <= WS, "one lane per destination");
-    static_assert(kCfg.maxTokPerRank < (1 << 20), "a destination's total is kept in 20 bits");
-    if (warpId == (_ldsMeta ? warpNum - 1 : 0)) {
-      constexpr int R = __ATOMIC_RELAXED;
-      constexpr int A = __HIP_MEMORY_SCOPE_AGENT;
-      const int p = laneId;
-      const bool dest = p < npes;
-      unsigned* cnt = EpResCnt<npes>(dest ? p : 0);
-      unsigned long long* pub = EpResPub<npes>(dest ? p : 0);
-      const index_t n = dest ? s_N[p] : 0;
-      // Only the blocks holding tokens meet: a call of fewer units than blocks waits on those.
-      const unsigned nHold = (unsigned)EpTokBlocks<kCfg>(_tokChunk, (int)args.numTokens, _etpi);
-      const bool joins = dest && blockIdx.x < nHold;
-      // Tokens outside [0, nHold) would take slots past the total reserved.
-      if (n > 0 && !joins) __builtin_trap();
-      if (dest && _blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
-      if (n > 0) atomicAdd(&args.destPeTokenCounter[p], n);
-      unsigned old = 0;
-      if (joins) old = __hip_atomic_fetch_add(cnt, (1u << 20) | (unsigned)n, R, A);
-      const index_t loc = (index_t)(old & 0xfffffu);
-      const bool last = joins && (old >> 20) == nHold - 1u;
-      index_t base = 0;
-      if (_ls) {
-        if (_blkMapNeeded) __builtin_trap();
-        if (last) __hip_atomic_store(cnt, 0u, R, A);
-        _lsLast = last;
-        _lsTot = loc + n;
-      } else if (last) {
-        const index_t tot = loc + n;
-        if (tot > 0)
-          base = __hip_atomic_fetch_add(EpTokOff(args, p), tot, R, __HIP_MEMORY_SCOPE_SYSTEM);
-        __hip_atomic_store(cnt, 0u, R, A);
-        __hip_atomic_store(pub, ((unsigned long long)resSeq << 32) | (unsigned)base, R, A);
-        if (tot > 0) keepBase(p, base);
-      }
-      // The blocks holding tokens wait here for the last of them, so they must all be
-      // resident at once.
-      if (!_ls && n > 0 && !last) {
-        unsigned long long w = __hip_atomic_load(pub, R, A);
-        while ((unsigned)(w >> 32) != resSeq) {
-          __builtin_amdgcn_s_sleep(1);
-          w = __hip_atomic_load(pub, R, A);
-        }
-        base = (index_t)(unsigned)w;
-      }
-      if (_ls && n > 0) s_base[p] = loc;
-      if (!_ls && n > 0) {
-        s_base[p] = base + loc;
-        if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
-      }
+  // In each block holding tokens lane p of warp 0 adds the block's count for destination p,
+  // this rank included, into the rank's total for p and keeps its offset in it; the last of
+  // those blocks to arrive reserves the total with one RMW on p's slot word and publishes the
+  // base with the call number in one word.
+  static_assert(npes <= WS, "one lane per destination");
+  static_assert(kCfg.maxTokPerRank < (1 << 20), "a destination's total is kept in 20 bits");
+  if (warpId == (_ldsMeta ? warpNum - 1 : 0)) {
+    constexpr int R = __ATOMIC_RELAXED;
+    constexpr int A = __HIP_MEMORY_SCOPE_AGENT;
+    const int p = laneId;
+    const bool dest = p < npes;
+    unsigned* cnt = EpResCnt<npes>(dest ? p : 0);
+    unsigned long long* pub = EpResPub<npes>(dest ? p : 0);
+    const index_t n = dest ? s_N[p] : 0;
+    // Only the blocks holding tokens meet: a call of fewer units than blocks waits on those.
+    const unsigned nHold = (unsigned)EpTokBlocks<kCfg>(_tokChunk, (int)args.numTokens, _etpi);
+    const bool joins = dest && blockIdx.x < nHold;
+    // Tokens outside [0, nHold) would take slots past the total reserved.
+    if (n > 0 && !joins) __builtin_trap();
+    if (dest && _blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
+    if (n > 0) atomicAdd(&args.destPeTokenCounter[p], n);
+    unsigned old = 0;
+    if (joins) old = __hip_atomic_fetch_add(cnt, (1u << 20) | (unsigned)n, R, A);
+    const index_t loc = (index_t)(old & 0xfffffu);
+    const bool last = joins && (old >> 20) == nHold - 1u;
+    index_t base = 0;
+    if (_ls) {
+      if (_blkMapNeeded) __builtin_trap();
+      if (last) __hip_atomic_store(cnt, 0u, R, A);
+      _lsLast = last;
+      _lsTot = loc + n;
+    } else if (last) {
+      const index_t tot = loc + n;
+      if (tot > 0)
+        base = __hip_atomic_fetch_add(EpTokOff(args, p), tot, R, __HIP_MEMORY_SCOPE_SYSTEM);
+      __hip_atomic_store(cnt, 0u, R, A);
+      __hip_atomic_store(pub, ((unsigned long long)resSeq << 32) | (unsigned)base, R, A);
+      if (tot > 0) keepBase(p, base);
     }
-  } else {
-    // Every block holding tokens for p reserves them with an RMW of its own on p's slot word.
-    for (int p = thdId; p < npes; p += blockDim.x) {
-      index_t n = s_N[p];
-      if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
-      if (n > 0) {
-        s_base[p] = __hip_atomic_fetch_add(EpTokOff(args, p), n, __ATOMIC_RELAXED,
-                                           __HIP_MEMORY_SCOPE_SYSTEM);
-        if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
-        atomicAdd(&args.destPeTokenCounter[p], n);
+    // The blocks holding tokens wait here for the last of them, so they must all be
+    // resident at once.
+    if (!_ls && n > 0 && !last) {
+      unsigned long long w = __hip_atomic_load(pub, R, A);
+      while ((unsigned)(w >> 32) != resSeq) {
+        __builtin_amdgcn_s_sleep(1);
+        w = __hip_atomic_load(pub, R, A);
       }
+      base = (index_t)(unsigned)w;
+    }
+    if (_ls && n > 0) s_base[p] = loc;
+    if (!_ls && n > 0) {
+      s_base[p] = base + loc;
+      if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
     }
   }
   if constexpr (kUnitW) {
@@ -2823,51 +2810,34 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                            __HIP_MEMORY_SCOPE_AGENT);
       }
     }
-    if constexpr (kCfg.aggReserve) {
-      // The signal to p carries in its high word where p's rows from this rank go in this
-      // rank's push combine landing: after the rows to every destination below p, so a row at
-      // slot s of p lands at s + dl and the runs tile [0, the rows this rank sent).
-      const int p = laneId;
-      index_t n = 0, base = 0;
-      if (p < npes) {
-        n = __hip_atomic_load(args.destPeTokenCounter + p, __ATOMIC_RELAXED,
-                              __HIP_MEMORY_SCOPE_AGENT);
-        base = __hip_atomic_load(args.destPeTokenCounter + npes + p, __ATOMIC_RELAXED,
-                                 __HIP_MEMORY_SCOPE_AGENT);
-      }
-      index_t below = n;
+    // The signal to p carries in its high word where p's rows from this rank go in this
+    // rank's push combine landing: after the rows to every destination below p, so a row at
+    // slot s of p lands at s + dl and the runs tile [0, the rows this rank sent).
+    const int p = laneId;
+    index_t n = 0, base = 0;
+    if (p < npes) {
+      n = __hip_atomic_load(args.destPeTokenCounter + p, __ATOMIC_RELAXED,
+                            __HIP_MEMORY_SCOPE_AGENT);
+      base = __hip_atomic_load(args.destPeTokenCounter + npes + p, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+    }
+    index_t below = n;
 #pragma unroll
-      for (int off = 1; off < WS; off <<= 1) {
-        const index_t v = __shfl_up(below, off, WS);
-        if (laneId >= off) below += v;
-      }
-      if (p < npes) {
-        const index_t dl = below - n - base;
-        unsigned long long* signal = EpPeer<unsigned long long>(win, p, args.offRecvNum) + myPe;
-        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-        __hip_atomic_store(signal, ((unsigned long long)(unsigned)dl << 32) | (unsigned)(n + 1),
-                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        args.destPeTokenCounter[npes + p] = dl;
-        args.destPeTokenCounter[p] = 0;
-      }
-    } else {
-      for (int destPe = laneId; destPe < npes; destPe += WS) {
-        index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
-        index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
-                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
-                                 1;
-        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-        __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        // Cleared here, not in the inbound loop: that runs on another block now,
-        // and a peer signalling this rank says nothing about whether this rank has
-        // read its own send counts yet.
-        args.destPeTokenCounter[destPe] = 0;
-      }
+    for (int off = 1; off < WS; off <<= 1) {
+      const index_t v = __shfl_up(below, off, WS);
+      if (laneId >= off) below += v;
+    }
+    if (p < npes) {
+      const index_t dl = below - n - base;
+      unsigned long long* signal = EpPeer<unsigned long long>(win, p, args.offRecvNum) + myPe;
+      __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      __hip_atomic_store(signal, ((unsigned long long)(unsigned)dl << 32) | (unsigned)(n + 1),
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      args.destPeTokenCounter[npes + p] = dl;
+      args.destPeTokenCounter[p] = 0;
     }
     __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    if constexpr (kCfg.aggReserve) {
-      if (laneId == 0) *EpResSeq<npes>() = resSeq;
-    }
+    if (laneId == 0) *EpResSeq<npes>() = resSeq;
   }
   // Inbound rides the first arriver so it is already parked when the peers'
   // signals land. It cannot simply move above the outbound store on the same
@@ -2876,22 +2846,14 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   if (isFirstArriver) {
     index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
-      index_t recvTokenNum;
-      if constexpr (kCfg.aggReserve) {
-        // Only the count is cleared: the landing offset in the high word stays for the combine.
-        unsigned long long* signal = reinterpret_cast<unsigned long long*>(recvTokenNums) + srcPe;
-        unsigned long long got;
-        do {
-          got = __hip_atomic_load(signal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        } while ((index_t)(unsigned)got <= 0);
-        recvTokenNum = (index_t)(unsigned)got - 1;
-        __hip_atomic_store(recvTokenNums + 2 * srcPe, 0, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
-      } else {
-        index_t* signal = recvTokenNums + srcPe;
-        recvTokenNum = EpWaitGt(signal, 0) - 1;
-        __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      }
+      // Only the count is cleared: the landing offset in the high word stays for the combine.
+      unsigned long long* signal = reinterpret_cast<unsigned long long*>(recvTokenNums) + srcPe;
+      unsigned long long got;
+      do {
+        got = __hip_atomic_load(signal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      } while ((index_t)(unsigned)got <= 0);
+      const index_t recvTokenNum = (index_t)(unsigned)got - 1;
+      __hip_atomic_store(recvTokenNums + 2 * srcPe, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       myRecv += recvTokenNum;
     }
     for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);

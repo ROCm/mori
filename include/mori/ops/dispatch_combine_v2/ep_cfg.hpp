@@ -254,13 +254,12 @@ struct EpCfg {
   // combineFp4's push combine with an MXFP8 wire: e4m3 plus one e8m0 scale per 32
   // elements. Exclusive with combineFp4 (MakeEpCfg).
   bool combineFp8 = false;
-  // Dispatch only, gfx125x only (MakeEpCfg): how the blocks take their slots at a
-  // destination. On, the blocks of a rank add up their tokens for each destination in
-  // the state EpResStateBytes lays out, and the last of them to arrive reserves the total
-  // with one RMW on the destination's slot allocator word: one RMW per call for each
-  // pair of ranks, which matters where the RMWs on one word serialize, as they do in the
-  // cco window. Off, every block holding tokens for a destination makes its own RMW.
-  // Off is free for the same reason as scaleBytes.
+  // Set for every gfx125x dispatch (MakeEpCfg), and that kernel requires it: the blocks of a
+  // rank add up their tokens for each destination in the state EpResStateBytes lays out, and
+  // the last of them to arrive reserves the total with one RMW on the destination's slot
+  // allocator word: one RMW per call for each pair of ranks, since the RMWs on one word
+  // serialize in the cco window. No other kernel reads it; off is free for the same reason
+  // as scaleBytes.
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
