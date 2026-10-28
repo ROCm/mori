@@ -157,6 +157,33 @@ def test_m_must_be_whole_row_tiles_and_chunks_must_divide_them():
         layout.ag_config(**MODEL, counter_chunks=5)
 
 
+def test_kernels_read_no_config_object():
+    """Config a kernel body reads must reach it as scalars.
+
+    FlyDSL keys its compile cache on a kernel's scalar closure values; an
+    ``AgConfig`` read inside the body is not part of the key, so two configs
+    differing only there -- the window capacity behind every receive-slot
+    offset, say -- could share a cached kernel with the wrong offsets. gemm_ar
+    pinned the same rule in #748; the LSA copy kernel here broke it.
+    """
+    import re
+
+    root = REPO_ROOT / "python/mori/ops/gemm_ag"
+    for name in (
+        "kernels_fused.py",
+        "kernels_lsa.py",
+        "kernels_sdma.py",
+        "_gemm_a16w16_8wave.py",
+    ):
+        src = (root / name).read_text()
+        bodies = 0
+        for m in re.finditer(r"\n( +)@flyc\.kernel", src):
+            end = src.index(f"\n{m.group(1)}@flyc.jit", m.end())
+            assert not re.findall(r"\bcfg\.\w+", src[m.end() : end]), name
+            bodies += 1
+        assert bodies, f"no @flyc.kernel found in {name}"
+
+
 def test_counter_region_is_one_slot_per_chunk_and_lane():
     """``world`` counters per chunk, sized for the *posting*, not the counting.
 

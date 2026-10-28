@@ -261,6 +261,12 @@ def build_lsa_ag(
     # stripe scheduling. Self is excluded: on push my slab is already in my own
     # recv slot, and on pull it is the slot I would be reading.
     peers = [(rank + j) % ws for j in range(1, ws)]
+    # Every rank's receive-slot offset, bound here rather than read off ``cfg``
+    # in the kernel body: FlyDSL keys its compile cache on scalar closure
+    # values, and the offsets depend on the window's capacity, which neither
+    # the kernel name nor any other scalar here carries. gemm_ar learned this
+    # in #748. A tuple of ints is a scalar closure value.
+    slot_off = tuple(cfg.recv_slot_off(r) for r in range(ws))
 
     def _next_flag(w, bid):
         """``_flag[block] + 1`` -- monotonic, never reset (graph-replay safe)."""
@@ -331,25 +337,25 @@ def build_lsa_ag(
         # both cases the *index* into them is the same `pk`.
         if const_expr(direction == "push"):
             local = create_buffer_resource_from_addr(
-                wave_uniform_i64(w.lsa_ptr(rank, cfg.recv_slot_off(rank)))
+                wave_uniform_i64(w.lsa_ptr(rank, slot_off[rank]))
             )
             srcs = [local] * (ws - 1)
             dsts = [
                 create_buffer_resource_from_addr(
-                    wave_uniform_i64(w.lsa_ptr(d, cfg.recv_slot_off(rank)))
+                    wave_uniform_i64(w.lsa_ptr(d, slot_off[rank]))
                 )
                 for d in peers
             ]
         else:
             srcs = [
                 create_buffer_resource_from_addr(
-                    wave_uniform_i64(w.lsa_ptr(d, cfg.recv_slot_off(d)))
+                    wave_uniform_i64(w.lsa_ptr(d, slot_off[d]))
                 )
                 for d in peers
             ]
             dsts = [
                 create_buffer_resource_from_addr(
-                    wave_uniform_i64(w.lsa_ptr(rank, cfg.recv_slot_off(d)))
+                    wave_uniform_i64(w.lsa_ptr(rank, slot_off[d]))
                 )
                 for d in peers
             ]
