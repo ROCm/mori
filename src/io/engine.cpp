@@ -36,6 +36,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/ras/ras.hpp"
 #include "mori/utils/host_utils.hpp"
 #include "src/io/call_diagnostics_internal.hpp"
 #include "src/io/fabric/backend_impl.hpp"
@@ -182,10 +183,20 @@ IOEngine::IOEngine(EngineKey key, IOEngineConfig config) : config(config) {
   desc.host = config.host;
   desc.port = config.port;
   desc.pid = static_cast<int>(getpid());
+  // RAS starts with the process's first engine. Built out, disabled, or failed to start, it
+  // returns nullptr and the engine advertises no RAS endpoint.
+  if (ras::RasRuntime* rt =
+          ras::RasRuntime::EnsureStarted({desc.nodeId, desc.hostname, desc.host, desc.pid})) {
+    ras::RasEndpoint ep = rt->Endpoint();
+    desc.ras = RasDesc{ep.host, ep.port, ep.token, ep.uuid.hi, ep.uuid.lo};
+    rt->Enqueue(ras::EngineRegistered{desc.key});
+  }
   MORI_IO_INFO("Create engine key {} node_id {} hostname {}", key, desc.nodeId, hostname);
 }
 
-IOEngine::~IOEngine() {}
+IOEngine::~IOEngine() {
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) rt->Enqueue(ras::EngineUnregistered{desc.key});
+}
 
 void IOEngine::CreateBackend(BackendType type, const BackendConfig& beConfig) {
   if (backends.find(type) != backends.end()) {
@@ -376,6 +387,11 @@ void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
     it.second->RegisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
+    const RasDesc& r = remote.ras;
+    rt->Enqueue(ras::PeerAdded{desc.key, remote.key, remote.nodeId, remote.hostname, remote.pid,
+                               ras::RasEndpoint{r.host, r.port, r.token, {r.uuidHi, r.uuidLo}}});
+  }
   MORI_IO_INFO("Register remote engine {} node_id {} hostname {}", remote.key.c_str(),
                remote.nodeId.c_str(), remote.hostname.c_str());
 }
@@ -385,6 +401,9 @@ void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {
     it.second->DeregisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
+  if (ras::RasRuntime* rt = ras::RasRuntime::Get()) {
+    rt->Enqueue(ras::PeerRemoved{desc.key, remote.key});
+  }
   MORI_IO_INFO("Deregister remote engine {}", remote.key.c_str());
 }
 

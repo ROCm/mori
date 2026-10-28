@@ -691,6 +691,7 @@ class CMakeBuild(build_ext):
         build_examples = os.environ.get("BUILD_EXAMPLES", "OFF")
         build_benchmark = os.environ.get("BUILD_BENCHMARK", "OFF")
         build_tests = os.environ.get("BUILD_TESTS", "OFF")
+        build_ras = "ON" if _env_flag("BUILD_RAS", "ON") else "OFF"
         build_umbp = "ON" if build_umbp_enabled else "OFF"
         build_umbp_spdk = "ON" if build_umbp_spdk_enabled else "OFF"
         use_redis_backend = os.environ.get("USE_REDIS_BACKEND", "OFF")
@@ -746,6 +747,7 @@ class CMakeBuild(build_ext):
             f"-DBUILD_EXAMPLES={build_examples}",
             f"-DBUILD_BENCHMARK={build_benchmark}",
             f"-DBUILD_TESTS={build_tests}",
+            f"-DBUILD_RAS={build_ras}",
             f"-DBUILD_UMBP={build_umbp}",
             f"-DUSE_REDIS_BACKEND={use_redis_backend}",
             f"-DUSE_SPDK={build_umbp_spdk}",
@@ -834,6 +836,10 @@ class CMakeBuild(build_ext):
             files_to_copy.append(
                 (collective_so, root_dir / "python/mori/libmori_collective.so")
             )
+        # libmori_io.so needs it beside it unless BUILD_RAS=OFF built RAS out.
+        ras_so = build_dir / "src/ras/libmori_ras.so"
+        if build_ras == "ON":
+            files_to_copy.append((ras_so, root_dir / "python/mori/libmori_ras.so"))
         for src_path, dst_path in files_to_copy:
             shutil.copyfile(src_path, dst_path)
 
@@ -1084,6 +1090,7 @@ mori_package_data = [
     "libmori_application.so",
     "libmori_metrics.so",
     "libmori_collective.so",  # optional: only present when BUILD_COLLECTIVE=ON
+    "libmori_ras.so",  # optional: absent when BUILD_RAS=OFF
     "libmori_jit.so",  # JIT v2 C ABI + plan registry
     "libmori_ops_v2.so",  # v2 EP kernels' host side; registers into libmori_jit
     "libmori_umbp_pybinds.so",  # optional: only present when BUILD_UMBP=ON

@@ -25,6 +25,14 @@ mori_ras_test(runtime)
 mori_ras_test(fork)
 mori_ras_test(links)
 
+# RAS through MORI-IO: EngineDesc compatibility, and two IOEngine processes linked by RAS.
+if(BUILD_IO)
+  mori_ras_test(engine_desc_compat)
+  target_link_libraries(test_ras_engine_desc_compat PRIVATE mori_io)
+  mori_ras_test(two_process)
+  target_link_libraries(test_ras_two_process PRIVATE mori_io)
+endif()
+
 # Coverage-guided fuzzing of the protocol decoder. Needs clang's libFuzzer, so it is opt-in;
 # test_ras_protocol replays its seed corpus with fixed mutations in every build.
 option(MORI_RAS_FUZZ "Build fuzz_ras_protocol, a libFuzzer target for the RAS decoder" OFF)
