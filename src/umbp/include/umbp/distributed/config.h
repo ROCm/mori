@@ -181,6 +181,7 @@ struct DramOwnershipConfig {
   bool prefault = true;
   bool numa_strict = false;
   int prefault_threads = 0;
+  uint64_t max_mr_bytes = kDefaultDramMaxMrBytes;  // see UMBPDramConfig
 };
 
 // HBM-tier ownership knobs.  Deliberately NOT a superset of the DRAM ones:

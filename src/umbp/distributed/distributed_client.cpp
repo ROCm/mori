@@ -67,6 +67,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   dram_ownership.prefault = config.dram.prefault;
   dram_ownership.numa_strict = config.dram.numa_strict;
   dram_ownership.prefault_threads = config.dram.prefault_threads;
+  dram_ownership.max_mr_bytes = config.dram.max_mr_bytes;
 
   // SSD came back to the distributed data plane as a MediumBackend: Phase 0
   // unwired the old PeerSsdManager special case, and PoolClient::Init builds an
