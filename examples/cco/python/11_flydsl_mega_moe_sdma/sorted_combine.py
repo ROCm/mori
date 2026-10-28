@@ -108,6 +108,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 BLOCK = 256
+WAVE = 64
+BAR_STRIDE = 32  # ints per flag_barrier slot: one 128 B cache line
 MIN_SBM = 16
 _ALIGN = 128
 
@@ -199,44 +201,82 @@ def grid_barrier(bar_addr, nblocks, tid):
     fx.barrier()
 
 
-def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, slot_cap,
-                         local_experts):
+@comm_ops.traced
+def flag_barrier(bar_addr, nblocks, tid, bid):
+    """All blocks of a resident grid rendezvous without a contended atomic.
+
+    Block ``i`` bumps its own cache-line-sized slot ``bar[i]`` and every block polls
+    all slots, so arrival costs one uncontended atomic instead of ``nblocks`` of them
+    queueing on one address. Slots are never reset: a block's target is its own slot's
+    value at entry plus one, and every block bumps once per launch.
+    """
+    target = fx.Int32(
+        comm_ops.load_i32_global_agent(
+            bar_addr + fx.Int64(bid) * fx.Int64(BAR_STRIDE * 4)
+        )
+    ) + fx.Int32(1)
+    rocdl.s_waitcnt(0)
+    fx.barrier()
+    if tid == fx.Int32(0):
+        comm_ops.fence_agent_release()
+        comm_ops.atomic_add_agent(
+            bar_addr + fx.Int64(bid) * fx.Int64(BAR_STRIDE * 4), fx.Int32(1)
+        )
+    for i in range(tid, nblocks, fx.Int32(BLOCK)):
+        comm_ops.spin_until_ge_i32_agent(
+            bar_addr + fx.Int64(i) * fx.Int64(BAR_STRIDE * 4), target
+        )
+    comm_ops.fence_agent_acquire()
+    fx.barrier()
+
+
+def build_rank_sort_plan(
+    *, SBM, topk, log2_max_tok, recv_cap, npes, cap, slot_cap, local_experts
+):
     """Kernel 1: give every valid sorted row a stable index in its rank's run.
 
     * count:  ``tile_cnt[tile][pe]`` = rows of the sort tile bound for ``pe``
-    * scan:   ``tile_base[tile][pe]`` = rows for ``pe`` in earlier tiles (so the
+    * prefix: ``tile_base[tile][pe]`` = rows for ``pe`` in earlier tiles (so the
               rows of a tile range are contiguous in the run), ``cursor[pe]`` = total
     * assign: ``out_row = pe*cap + tile_base + (earlier rows of this tile for pe)``,
               and ``idx_send[out_row] = origin_lid*topk + k``
 
-    Only ONE grid barrier, between count and scan. The scan has to see every
-    block's counts, so that one is unavoidable; a second barrier after it is not,
-    because the thing being scanned is tiny -- at most ``cap/SBM`` tiles times
-    ``npes``, i.e. 2048 int32 -- so every block redundantly scans the whole array
-    into its own LDS instead of one block scanning it and the rest waiting to read
-    the result. That also replaces the serial prefix sum (8 threads walking
-    ``tiles`` dependent global loads, the single most expensive thing in this
-    kernel) with a Hillis-Steele scan in LDS.
+    One rendezvous, between count and prefix; the prefix needs every earlier tile's
+    count. It is a ``flag_barrier`` (no single contended atomic). After it, a block
+    does not scan the whole ``tile_cnt`` array: for each tile it owns it sums the
+    counts of the earlier tiles with one pass of the block's threads (thread ``t``
+    handles pe ``t % npes``) and a short LDS reduction -- a parallel sum, not a
+    log-depth scan with a barrier per step.
 
-    Row loops read the tile's SBM rows from global memory instead of using LDS
-    scans; SBM is small and the rows are L2-resident.
+    Count and assign each run one block per tile with one thread per row: a row
+    is decoded once, a wave ballot per pe gives the rows of the wave bound for it,
+    and the per-wave counts go through a few LDS words. A row's rank among the
+    earlier rows for its pe is then a popcount, not a walk over the tile.
     """
     dec = dict(log2_max_tok=log2_max_tok, recv_cap=recv_cap, topk=topk, npes=npes)
 
-    # Bound on the tile count, so the scan buffers can live in LDS. Tiles cover
-    # the sorted rows, so this is sized from the token-slot space, NOT from
+    if SBM > BLOCK:
+        raise ValueError(
+            f"plan needs one thread per row of a sort tile: SBM={SBM} > {BLOCK}"
+        )
+    if BLOCK % npes:
+        raise ValueError(f"plan needs npes to divide {BLOCK}, got {npes}")
+    # Bound on the tile count, so the prefix loop has a static trip count. Tiles
+    # cover the sorted rows, so this is sized from the token-slot space, NOT from
     # ``cap`` -- ``cap`` is the per-peer row reservation and is npes times
     # smaller. Stage1 also pads each local expert's rows up to an SBM boundary,
     # so num_valid runs past slot_cap by up to local_experts * (SBM - 1).
     TILES_MAX = (slot_cap + SBM - 1) // SBM + local_experts + 1
-    SCAN_N = (TILES_MAX + 1) * npes
-    STEPS = max(1, (TILES_MAX - 1).bit_length())
-    lds_bytes = 2 * SCAN_N * 4
-    if lds_bytes > 160 * 1024:
-        raise ValueError(f"plan scan needs {lds_bytes} B of LDS, over the 160 KiB budget")
+    PREFIX_J = -(-TILES_MAX * npes // BLOCK)
+    GROUPS = BLOCK // npes
+    WAVES = BLOCK // WAVE
+    # LDS words: per-wave per-pe counts | per-thread partial sums | the tile's prefix.
+    OFF_PART = WAVES * npes
+    OFF_PREF = OFF_PART + BLOCK
+    lds_bytes = (OFF_PREF + npes) * 4
 
     @fx.struct
-    class ScanShared:
+    class PlanShared:
         buf: fx.Array[Int8, lds_bytes, 16]
 
     # fmt: off
@@ -260,78 +300,94 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, slot_c
         out_buf = ptr_buf_tensor(arg_out_row, fx.Int32)
         cdone = ptr_buf_tensor(arg_cdone, fx.Int32)
 
-        lds = fx.SharedAllocator().allocate(ScanShared).peek()
+        lds = fx.SharedAllocator().allocate(PlanShared).peek()
         lds_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
 
-        def sc(half, i):
-            """LDS i32 slot ``i`` of ping(0)/pong(1)."""
-            return lds_typed_ptr(
-                lds_i32 + (fx.Int32(half * SCAN_N) + i) * fx.Int32(4), T.i32, align=4
-            )
+        def lw(i):
+            """LDS i32 word ``i`` of the block's scratch."""
+            return lds_typed_ptr(lds_i32 + i * fx.Int32(4), T.i32, align=4)
 
         # The GEMM2 kernel's per-chunk completion counters start from zero every call.
         for g in range(gid, i32_cdone_n, stride):
             cdone[g] = fx.Int32(0)
 
-        for g in range(gid, tiles * fx.Int32(npes), stride):
-            tile = g // fx.Int32(npes)
-            pe = g - tile * fx.Int32(npes)
-            base = trb[tile]
-            cnt = fx.Int32(0)
-            for r in range_constexpr(SBM):
-                valid, dest_pe, _, _ = _decode(stids[base + fx.Int32(r)], **dec)
-                cnt = cnt + (valid & (dest_pe == pe)).select(fx.Int32(1), fx.Int32(0))
-            tile_cnt[g] = cnt
-        grid_barrier(arg_bar, i32_nblocks, tid)
+        lane = tid % fx.Int32(WAVE)
+        wave = tid // fx.Int32(WAVE)
+        row_ok = tid < fx.Int32(SBM)
 
-        # Inclusive Hillis-Steele over the tile axis, all npes lanes at once,
-        # run identically by every block.
-        n = tiles * fx.Int32(npes)
-        for i in range(tid, n, fx.Int32(BLOCK)):
-            fx.ptr_store(tile_cnt[i], sc(0, i))
-        fx.barrier()
-        for step in range_constexpr(STEPS):
-            src, dst = step % 2, (step + 1) % 2
-            back = fx.Int32((1 << step) * npes)
-            for i in range(tid, n, fx.Int32(BLOCK)):
-                v = fx.Int32(fx.ptr_load(sc(src, i)))
-                v = (i >= back).select(
-                    v + fx.Int32(fx.ptr_load(sc(src, i - back))), v
-                )
-                fx.ptr_store(v, sc(dst, i))
+        def tile_masks(tile):
+            """One thread per row of ``tile``: decode it once, then a ballot per pe
+            gives the wave's rows bound for that pe. Returns the row's decode and
+            those masks; the per-wave counts are published to LDS and made
+            visible (barrier) before returning."""
+            base = trb[tile]
+            valid, dest_pe, dest_lid, s = _decode(stids[base + row_ok.select(tid, fx.Int32(0))], **dec)
+            valid = valid & row_ok
+            masks = [
+                fx.Int64(rocdl.ballot(T.i64, valid & (dest_pe == fx.Int32(p))))
+                for p in range_constexpr(npes)
+            ]
+            if lane == fx.Int32(0):
+                for p in range_constexpr(npes):
+                    fx.ptr_store(fx.Int32(fx.math.ctpop(masks[p])), lw(wave * fx.Int32(npes) + fx.Int32(p)))
             fx.barrier()
-        final = STEPS % 2
-        # Exclusive = inclusive - own count; the extra row holds the totals the
-        # comm waves read as a chunk's end.
-        if bid == fx.Int32(0):
-            for i in range(tid, n, fx.Int32(BLOCK)):
-                tile_base[i] = fx.Int32(fx.ptr_load(sc(final, i))) - tile_cnt[i]
+            return valid, dest_pe, dest_lid, s, masks
+
+        # One block per tile; no thread walks a tile's rows.
+        for tile in range(bid, tiles, i32_nblocks):
+            tile_masks(tile)
             if tid < fx.Int32(npes):
-                total = fx.Int32(
-                    fx.ptr_load(sc(final, (tiles - fx.Int32(1)) * fx.Int32(npes) + tid))
-                )
-                capped = (total < fx.Int32(cap)).select(total, fx.Int32(cap))
-                tile_base[tiles * fx.Int32(npes) + tid] = capped
-                ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = capped
+                total = fx.Int32(0)
+                for w in range_constexpr(WAVES):
+                    total = total + fx.Int32(fx.ptr_load(lw(fx.Int32(w * npes) + tid)))
+                tile_cnt[tile * fx.Int32(npes) + tid] = total
+            fx.barrier()
+        flag_barrier(arg_bar, i32_nblocks, tid, bid)
 
         idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
-        final = STEPS % 2
-        for g in range(gid, tiles * fx.Int32(SBM), stride):
-            tile = g // fx.Int32(SBM)
-            row = g - tile * fx.Int32(SBM)
-            base = trb[tile]
-            valid, dest_pe, dest_lid, s = _decode(stids[base + row], **dec)
-            out_buf[g] = fx.Int32(-1)
+        lane_lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
+        for tile in range(bid, tiles, i32_nblocks):
+            # Rows for pe in the tiles before this one. Element e of tile_cnt is
+            # (tile e // npes, pe e % npes), and BLOCK % npes == 0, so each thread
+            # always sums one pe.
+            lim = tile * fx.Int32(npes)
+            part = fx.Int32(0)
+            for j in range_constexpr(PREFIX_J):
+                e = tid + fx.Int32(j * BLOCK)
+                before = e < lim
+                part = part + before.select(tile_cnt[before.select(e, fx.Int32(0))], fx.Int32(0))
+            fx.ptr_store(part, lw(fx.Int32(OFF_PART) + tid))
+            fx.barrier()
+            if tid < fx.Int32(npes):
+                pre = fx.Int32(0)
+                for k in range_constexpr(GROUPS):
+                    pre = pre + fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PART + k * npes) + tid)))
+                fx.ptr_store(pre, lw(fx.Int32(OFF_PREF) + tid))
+                tile_base[tile * fx.Int32(npes) + tid] = pre
+                # The extra row holds the totals the comm waves read as a chunk's end.
+                if tile == tiles - fx.Int32(1):
+                    total = pre + tile_cnt[tile * fx.Int32(npes) + tid]
+                    capped = (total < fx.Int32(cap)).select(total, fx.Int32(cap))
+                    tile_base[tiles * fx.Int32(npes) + tid] = capped
+                    ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = capped
+            fx.barrier()
+
+            valid, dest_pe, dest_lid, s, masks = tile_masks(tile)
+            g = tile * fx.Int32(SBM) + tid
+            if row_ok:
+                out_buf[g] = fx.Int32(-1)
             if valid:
-                within = fx.Int32(0)
-                for rp in range_constexpr(SBM):
-                    v2, pe2, _, _ = _decode(stids[base + fx.Int32(rp)], **dec)
-                    earlier = (fx.Int32(rp) < row) & v2 & (pe2 == dest_pe)
-                    within = within + earlier.select(fx.Int32(1), fx.Int32(0))
-                slot = tile * fx.Int32(npes) + dest_pe
-                # This block scanned the whole array itself, so the prefix is
-                # in its own LDS -- no barrier between the scan and this.
-                excl = fx.Int32(fx.ptr_load(sc(final, slot))) - tile_cnt[slot]
+                # Rank among this wave's rows for my pe, plus the rows of the
+                # earlier waves of the tile for it.
+                mine = masks[0]
+                for p in range_constexpr(1, npes):
+                    mine = (dest_pe == fx.Int32(p)).select(masks[p], mine)
+                within = fx.Int32(fx.math.ctpop(mine & lane_lt))
+                for w in range_constexpr(WAVES):
+                    within = within + (fx.Int32(w) < wave).select(
+                        fx.Int32(fx.ptr_load(lw(fx.Int32(w * npes) + dest_pe))), fx.Int32(0)
+                    )
+                excl = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PREF) + dest_pe)))
                 place = excl + within
                 # Past the per-pair reservation there is nowhere to put this
                 # row. Drop it rather than write into the next peer's run,
@@ -342,6 +398,7 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, slot_c
                     out_row = dest_pe * fx.Int32(cap) + place
                     out_buf[g] = out_row
                     idx_buf[out_row] = dest_lid * fx.Int32(topk) + s
+            fx.barrier()
 
     # fmt: off
     @flyc.jit
@@ -392,8 +449,9 @@ def sdma_put_run(sdma, win, peer, queue, *, layout, rank, lo, hi, cco):
 
 
 @comm_ops.traced
-def sdma_finish_peer(sdma, w, win, peer, queue, cnt, phase, *, layout, rank, cco,
-                     signal_mode="remote"):
+def sdma_finish_peer(
+    sdma, w, win, peer, queue, cnt, phase, *, layout, rank, cco, signal_mode="remote"
+):
     """Ship idx, tell ``peer`` its rows have landed, and publish ``cnt``.
 
     Two ways to say "landed":
@@ -687,7 +745,9 @@ class SortedCombine:
         # what put bs=8192 over the 4 GiB buffer-resource range.
         self.row_slack = row_slack
         if signal_mode not in ("quiet", "remote"):
-            raise ValueError(f"signal_mode must be quiet or remote, got {signal_mode!r}")
+            raise ValueError(
+                f"signal_mode must be quiet or remote, got {signal_mode!r}"
+            )
         if signal_mode == "remote" and queues != 1:
             raise ValueError(
                 "signal_mode='remote' hangs the completion signal on the last put "
@@ -741,7 +801,10 @@ class SortedCombine:
         self.cdone_stride = CDONE_STRIDE
         self.cdone = torch.zeros((max_tiles + 1) * CDONE_STRIDE, **i32)
         # Never-reset counters for the two grid barriers and the combine's last-block count.
-        self.plan_bar = torch.zeros(1, **i32)
+        self.plan_bar = torch.zeros(
+            torch.cuda.get_device_properties(dev).multi_processor_count * BAR_STRIDE,
+            **i32,
+        )
         # Rows the per-pair reservation had no room for; must stay 0.
         self.overflow = torch.zeros(1, **i32)
         self.combine_bar = torch.zeros(1, **i32)
@@ -768,7 +831,11 @@ class SortedCombine:
         )
         self._plans = {}
         self._combine = build_combine(
-            layout=lay, rank=self.rank, hidden=self.hidden, topk=self.topk, quant=quant,
+            layout=lay,
+            rank=self.rank,
+            hidden=self.hidden,
+            topk=self.topk,
+            quant=quant,
             signal_mode=signal_mode,
         )
 
@@ -891,10 +958,9 @@ class SortedCombine:
         import torch
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-        moe, lay = self.moe, self.layout
+        moe = self.moe
         config = moe._active_config if config is None else config
         s_fx = fx.Stream(torch.cuda.current_stream().cuda_stream)
-        op = moe._s1_op
 
         def mark(stage):
             if profile is not None:
