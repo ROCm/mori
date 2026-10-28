@@ -178,6 +178,8 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
     entry.tier = TierFromProto(request->tier());
     entry.backend_name = request->backend_name();
     entry.logical_tier = request->logical_tier();
+    if (request->has_preferred_numa_node())
+      entry.preferred_numa_node = request->preferred_numa_node();
     auto pool_result = pool_->BatchAllocate({entry}).front();
     auto* backend = Backend(pool_result.backend_id);
     const auto& result = pool_result.allocation;
@@ -293,6 +295,9 @@ class PeerServiceServer::UMBPPeerServiceImpl final : public ::umbp::UMBPPeer::Se
       entry.tier = TierFromProto(request->entries(i).tier());
       entry.backend_name = request->entries(i).backend_name();
       entry.logical_tier = request->entries(i).logical_tier();
+      if (request->entries(i).has_preferred_numa_node()) {
+        entry.preferred_numa_node = request->entries(i).preferred_numa_node();
+      }
       entries.push_back(std::move(entry));
     }
     auto results = pool_->BatchAllocate(entries);

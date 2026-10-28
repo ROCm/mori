@@ -436,11 +436,28 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
 
   if (!allocator_) return fail(AllocateOutcome::kFailed, "NOT_CONFIGURED");
   std::optional<size_t> preferred_buffer;
-  if (preferred_numa_node >= 0) {
+  int node = preferred_numa_node;
+  if (node < 0) {
+    // No hint (a CPU caller, or a remote writer that sent none): with buffers on
+    // more than one node, start on the node with the most free pages, so the nodes
+    // fill evenly and readers' NICs on every node share the traffic.
+    std::map<int, uint64_t> free_on_node;
+    for (size_t i = 0; i < buffer_numa_nodes_.size(); ++i) {
+      if (buffer_numa_nodes_[i] >= 0) {
+        free_on_node[buffer_numa_nodes_[i]] += allocator_->BufferFreePages(i);
+      }
+    }
+    if (free_on_node.size() > 1) {
+      node = std::max_element(free_on_node.begin(), free_on_node.end(),
+                              [](const auto& a, const auto& b) { return a.second < b.second; })
+                 ->first;
+    }
+  }
+  if (node >= 0) {
     // A node's memory can span several buffers (one per NIC registration).
     // Prefer the first that holds the whole request, else the node's first.
     for (size_t i = 0; i < buffer_numa_nodes_.size(); ++i) {
-      if (buffer_numa_nodes_[i] != preferred_numa_node) continue;
+      if (buffer_numa_nodes_[i] != node) continue;
       if (!preferred_buffer) preferred_buffer = i;
       if (allocator_->BufferFreePages(i) >= num_pages) {
         preferred_buffer = i;

@@ -402,6 +402,9 @@ class PoolClient {
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
   int PreferredNumaNodeFor(void* ptr, size_t size) const;
+  // The NUMA node a write's source lives on: its GPU's, or the node its registered
+  // host region was placed on; -1 when unknown.
+  int SourceNumaHint(const void* src, size_t size) const;
   std::unordered_map<int, int> gpu_to_numa_;
 
   // Zero-copy registered memory regions, kept sorted by `base`.
@@ -807,6 +810,9 @@ class PoolClient {
     const void* src;
     size_t size;
     RoutePutResult route;
+    // The writer's NUMA node when `src` is a staging copy; -1 lets the slot
+    // request derive it from `src`.
+    int numa_hint = -1;
   };
   // One byte range of a stored object, named by the caller.
   struct ByteSpan {
@@ -870,7 +876,8 @@ class PoolClient {
                                         const std::vector<const void*>& srcs,
                                         const std::vector<size_t>& sizes,
                                         const std::vector<std::optional<RoutePutResult>>& routes,
-                                        std::vector<PutEntryOutcome>* results);
+                                        std::vector<PutEntryOutcome>* results,
+                                        const std::vector<int>* numa_hints = nullptr);
   // Execute a BatchPutPlan.  Zero-copy submits all peers (not waited), runs the
   // deferred local puts in that window, then waits all + commits; staging runs
   // per peer serially.  Writes per-key outcomes into *results.
