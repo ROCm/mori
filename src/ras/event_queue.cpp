@@ -27,6 +27,8 @@
 #include <cerrno>
 #include <new>
 
+#include "src/ras/fd_registry.hpp"
+
 namespace mori {
 namespace ras {
 
@@ -51,14 +53,14 @@ EventQueue::EventQueue(size_t capacity) {
   cells_.reset(new Cell[cap]);
   mask_ = cap - 1;
   for (size_t i = 0; i < cap; ++i) cells_[i].seq.store(i, std::memory_order_relaxed);
-  wakeFd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  wakeFd_ = fdreg::EventFd(0, EFD_NONBLOCK);
 }
 
 EventQueue::~EventQueue() {
   RasEvent ev;
   while (TryPop(&ev)) {
   }
-  if (wakeFd_ >= 0) close(wakeFd_);
+  fdreg::Close(wakeFd_);
 }
 
 bool EventQueue::TryPush(RasEvent&& ev) {
@@ -103,14 +105,19 @@ bool EventQueue::Enqueue(RasEvent&& ev) {
   enqueued_.fetch_add(1, std::memory_order_relaxed);
   // The exchange orders the push before the consumer's exchange in ConsumeWakeup, so a
   // producer that skips the write still has its event seen by the drain that follows.
-  if (!wakePending_.exchange(true, std::memory_order_acq_rel) && wakeFd_ >= 0) {
-    uint64_t one = 1;
-    ssize_t rc;
-    do {
-      rc = write(wakeFd_, &one, sizeof(one));
-    } while (rc < 0 && errno == EINTR);
-  }
+  if (!wakePending_.exchange(true, std::memory_order_acq_rel)) Wake();
   return true;
+}
+
+void EventQueue::Wake() {
+  wakePending_.store(true, std::memory_order_release);
+  int fd = wakeFd_;
+  if (fd < 0) return;
+  uint64_t one = 1;
+  ssize_t rc;
+  do {
+    rc = write(fd, &one, sizeof(one));
+  } while (rc < 0 && errno == EINTR);
 }
 
 void EventQueue::ConsumeWakeup() {
@@ -147,21 +154,6 @@ EventQueueStats EventQueue::Stats() const {
   }
   s.depthHighWater = depthHighWater_.load(std::memory_order_relaxed);
   return s;
-}
-
-const char* EventKindName(size_t kind) {
-  switch (kind) {
-    case 0:
-      return "EngineRegistered";
-    case 1:
-      return "EngineUnregistered";
-    case 2:
-      return "PeerAdded";
-    case 3:
-      return "PeerRemoved";
-    default:
-      return "Unknown";
-  }
 }
 
 }  // namespace ras

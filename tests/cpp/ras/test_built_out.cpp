@@ -19,21 +19,32 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include "mori/ras/types.hpp"
 
+// The RAS API with RAS built out: compiled without MORI_ENABLE_RAS and linked without
+// mori_ras, the way a subsystem builds with BUILD_RAS=OFF. Every call must compile, link, and
+// do nothing.
 #include <cstdio>
 
-namespace mori {
-namespace ras {
+#include "mori/ras/ras.hpp"
 
-std::string RuntimeUuid::ToString() const {
-  char buf[37];
-  std::snprintf(buf, sizeof(buf), "%08x-%04x-%04x-%04x-%012llx", static_cast<unsigned>(hi >> 32),
-                static_cast<unsigned>((hi >> 16) & 0xffff), static_cast<unsigned>(hi & 0xffff),
-                static_cast<unsigned>(lo >> 48),
-                static_cast<unsigned long long>(lo & 0xffffffffffffull));
-  return buf;
+#if defined(MORI_ENABLE_RAS)
+#error "test_ras_built_out must build without MORI_ENABLE_RAS"
+#endif
+
+int main() {
+  using namespace mori::ras;
+  if (RasRuntime::Get() != nullptr) return 1;
+  if (RasRuntime::EnsureStarted(StartParams{"node", "host", "127.0.0.1", 1}) != nullptr) return 2;
+  RuntimeStatus st = RasRuntime::Status();
+  if (st.state != RunState::kBuiltOut || st.degraded != 0) return 3;
+  // How subsystems call it: everything behind the null check.
+  if (RasRuntime* r = RasRuntime::Get()) {
+    r->Enqueue(PeerAdded{});
+    r->SetLabels(Labels{{"role", "x"}});
+    (void)r->Endpoint();
+    (void)r->Snapshot();
+    return 4;
+  }
+  std::printf("RAS built out: every call is a no-op\n");
+  return 0;
 }
-
-}  // namespace ras
-}  // namespace mori

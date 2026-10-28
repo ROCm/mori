@@ -83,7 +83,12 @@ using RasEvent = std::variant<EngineRegistered, EngineUnregistered, PeerAdded, P
 constexpr size_t kNumEventKinds = std::variant_size_v<RasEvent>;
 
 // "EngineRegistered" and so on, for an index of RasEvent.
-const char* EventKindName(size_t kind);
+inline const char* EventKindName(size_t kind) {
+  static constexpr const char* kNames[] = {"EngineRegistered", "EngineUnregistered", "PeerAdded",
+                                           "PeerRemoved"};
+  static_assert(sizeof(kNames) / sizeof(kNames[0]) == kNumEventKinds, "one name per event");
+  return kind < kNumEventKinds ? kNames[kind] : "Unknown";
+}
 
 }  // namespace ras
 }  // namespace mori

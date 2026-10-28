@@ -1,4 +1,12 @@
-set(MORI_RAS_SOURCES event_queue.cpp heartbeat.cpp identity.cpp protocol.cpp types.cpp)
+set(MORI_RAS_SOURCES
+    config.cpp
+    event_queue.cpp
+    fd_registry.cpp
+    heartbeat.cpp
+    identity.cpp
+    link.cpp
+    protocol.cpp
+    runtime.cpp)
 
 set_source_files_properties(${MORI_RAS_SOURCES} PROPERTIES LANGUAGE CXX)
 # Shared, never static: the runtime is a per-process singleton, so every subsystem library has

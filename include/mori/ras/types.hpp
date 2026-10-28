@@ -26,6 +26,7 @@
 // RAS is built out.
 
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <string>
 #include <vector>
@@ -43,7 +44,14 @@ struct RuntimeUuid {
   bool operator==(const RuntimeUuid& o) const { return hi == o.hi && lo == o.lo; }
   bool operator!=(const RuntimeUuid& o) const { return !(*this == o); }
   bool operator<(const RuntimeUuid& o) const { return hi != o.hi ? hi < o.hi : lo < o.lo; }
-  std::string ToString() const;
+  std::string ToString() const {
+    char buf[37];
+    std::snprintf(buf, sizeof(buf), "%08x-%04x-%04x-%04x-%012llx", static_cast<unsigned>(hi >> 32),
+                  static_cast<unsigned>((hi >> 16) & 0xffff), static_cast<unsigned>(hi & 0xffff),
+                  static_cast<unsigned>(lo >> 48),
+                  static_cast<unsigned long long>(lo & 0xffffffffffffull));
+    return buf;
+  }
 };
 
 // One RDMA port this host offers, with where it attaches in the fabric when that is known.
@@ -95,6 +103,129 @@ struct RasProcessId {
            pid == o.pid && pidNamespace == o.pidNamespace && startTimeTicks == o.startTimeTicks &&
            bootId == o.bootId && topology == o.topology && labels == o.labels;
   }
+};
+
+// Why a runtime is RAS_DEGRADED: it runs, but its view may be incomplete.
+enum DegradedReason : uint32_t {
+  kDegradedInitFailed = 1u << 0,  // the runtime couldn't start; engines advertise no endpoint
+  kDegradedLoopError = 1u << 1,   // the RAS thread hit an unexpected error and carried on
+  kDegradedForTest = 1u << 31,    // set by tests
+};
+
+// One RAS link, to one remote runtime. P3 replaces this with the membership, connectivity,
+// and progress state machines; part 1 tracks only the link itself.
+enum class LinkState : uint8_t {
+  kIdle,          // registered; the first connect is pending
+  kConnecting,    // TCP connect or HELLO in progress
+  kConnected,     // HELLO done; heartbeats flow
+  kDisconnected,  // no connection; a reconnect is scheduled
+  kPeerLeft,      // the peer sent LEAVE for its exit; its runtime UUID is gone for good
+};
+
+inline const char* ToString(LinkState s) {
+  switch (s) {
+    case LinkState::kIdle:
+      return "IDLE";
+    case LinkState::kConnecting:
+      return "CONNECTING";
+    case LinkState::kConnected:
+      return "CONNECTED";
+    case LinkState::kDisconnected:
+      return "DISCONNECTED";
+    case LinkState::kPeerLeft:
+      return "PEER_LEFT";
+  }
+  return "UNKNOWN";
+}
+
+enum class LinkError : uint8_t {
+  kNone,
+  kRasEndpointUnavailable,  // the connect was refused: nothing listens at the peer's endpoint
+  kConnectTimeout,          // the connect or HELLO took longer than the handshake timeout
+  kConnectFailed,           // the connect failed otherwise, e.g. the network is unreachable
+  kLinkClosed,              // the peer closed or reset the link without LEAVE
+  kLinkReleased,            // the peer closed the link with LEAVE: it no longer needs it
+  kTokenMismatch,           // the peer rejected the token from its EngineDesc
+  kEndpointReused,          // a different runtime answers at the peer's endpoint
+  kVersionMismatch,         // no common protocol version or security capability
+  kDuplicate,               // the peer kept a crossing connection instead of this one
+  kProtocolError,           // a malformed or out-of-sequence message
+};
+
+inline const char* ToString(LinkError e) {
+  switch (e) {
+    case LinkError::kNone:
+      return "NONE";
+    case LinkError::kRasEndpointUnavailable:
+      return "RAS_ENDPOINT_UNAVAILABLE";
+    case LinkError::kConnectTimeout:
+      return "CONNECT_TIMEOUT";
+    case LinkError::kConnectFailed:
+      return "CONNECT_FAILED";
+    case LinkError::kLinkClosed:
+      return "LINK_CLOSED";
+    case LinkError::kLinkReleased:
+      return "LINK_RELEASED";
+    case LinkError::kTokenMismatch:
+      return "TOKEN_MISMATCH";
+    case LinkError::kEndpointReused:
+      return "ENDPOINT_REUSED";
+    case LinkError::kVersionMismatch:
+      return "VERSION_MISMATCH";
+    case LinkError::kDuplicate:
+      return "DUPLICATE";
+    case LinkError::kProtocolError:
+      return "PROTOCOL_ERROR";
+  }
+  return "UNKNOWN";
+}
+
+struct LinkInfo {
+  RuntimeUuid peer;
+  std::string peerHost;  // the endpoint this side connects to; empty if it never registered
+  uint16_t peerPort{0};
+  std::string peerHostname;
+  int32_t peerPid{0};
+  LinkState state{LinkState::kIdle};
+  LinkError lastError{LinkError::kNone};
+  std::string lastErrorDetail;
+  bool outbound{false};  // the current or last connection was opened by this side
+  bool peerDegraded{false};
+  uint16_t version{0};    // negotiated protocol version
+  uint32_t relations{0};  // local-to-remote engine registrations that use this link
+  uint64_t connectAttempts{0};
+  uint64_t connects{0};  // HELLO handshakes completed, either direction
+  uint64_t disconnects{0};
+  uint64_t heartbeatsSent{0};
+  uint64_t heartbeatsReceived{0};
+  uint64_t acksSent{0};
+  uint64_t acksReceived{0};
+  int64_t lastRxAgeMs{-1};  // since the last message from the peer; -1 if none
+  bool hasTiming{false};
+  int64_t rttNs{0};          // latest round-trip time
+  int64_t offsetNs{0};       // best clock-offset estimate: peer wall clock minus ours
+  int64_t offsetBoundNs{0};  // its error bound
+};
+
+struct EventStats {
+  size_t capacity{0};
+  uint64_t enqueued{0};
+  uint64_t dropped{0};
+  std::vector<uint64_t> droppedByKind;  // indexed like RasEvent's alternatives
+  size_t depthHighWater{0};
+};
+
+struct RuntimeSnapshot {
+  RasProcessId self;
+  uint16_t listenPort{0};
+  uint32_t degraded{0};  // DegradedReason bits
+  std::vector<LinkInfo> links;
+  EventStats events;
+  uint64_t inboundAccepted{0};   // TCP connections accepted
+  uint64_t inboundRejected{0};   // HELLOs refused: token, version, duplicate, ...
+  uint64_t protocolErrors{0};    // connections dropped for malformed messages
+  uint64_t peersWithoutRas{0};   // registrations of engines that advertise no endpoint
+  uint64_t sameProcessPeers{0};  // registrations of engines in this process
 };
 
 }  // namespace ras
