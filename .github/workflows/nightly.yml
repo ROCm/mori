@@ -130,6 +130,21 @@ jobs:
               done
             "
 
+      - name: Load wheel on glibc 2.28
+        # The only glibc 2.28 the wheels meet in this workflow: the test jobs run on
+        # Ubuntu, and auditwheel's check is static and skips the excluded
+        # ROCm/libdrm/libnuma. This resolves every packaged library against EL8's
+        # glibc and libstdc++ for real. mori.io/ops/ccl import torch, so they stay out.
+        run: |
+          PYTAG=cp$(echo "${{ matrix.python }}" | tr -d .)
+          $CT run --rm -v ${{ runner.temp }}/dist-pypi:/tmp/dist-pypi $IMAGE bash -c "
+            set -e
+            PY=/opt/python/${PYTAG}-${PYTAG}/bin/python
+            \$PY -m pip install -q /tmp/dist-pypi/*.whl
+            cd /tmp
+            \$PY -c 'import ctypes, glob, os, mori.cpp, mori.cco.cco, mori.jit, mori.shmem, mori.umbp; [ctypes.CDLL(p, os.RTLD_NOW) for p in glob.glob(os.path.dirname(mori.__file__) + \"/lib*.so\")]'
+          "
+
       - name: Upload CI test wheel (amd_mori)
         uses: actions/upload-artifact@v4
         with:

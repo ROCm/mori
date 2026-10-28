@@ -24,8 +24,8 @@ ARG ROCM_PACKAGES="amdrocm-core-devel{version}-{arch}"
 ARG GRPC_VERSION=v1.51.1
 
 # libibverbs is dlopen'ed at runtime, so rdma-core-devel is here for its headers
-# only. openssl/zlib are gRPC's.
-RUN dnf install -y numactl-devel libdrm-devel rdma-core-devel openssl-devel zlib-devel && \
+# only. zlib is gRPC's.
+RUN dnf install -y numactl-devel libdrm-devel rdma-core-devel zlib-devel && \
     dnf clean all
 
 # ROCm's packages pull in EL8's python36, whose alternative outranks the image's
@@ -61,6 +61,8 @@ RUN set -ex; \
 # UMBP's control plane needs gRPC + Protobuf, which EL8 does not package. Built
 # shared into /usr/local, where tools/build_manylinux_wheel.py has auditwheel
 # vendor them into the wheel for libmori_umbp_pybinds.so and the UMBP servers.
+# BoringSSL from gRPC's own tree, so the wheel does not carry EL8's OpenSSL 1.1.1,
+# which is end-of-life and which no system update could patch inside the wheel.
 RUN set -ex; \
     git clone --quiet --depth 1 --branch "${GRPC_VERSION}" --recurse-submodules \
       --shallow-submodules https://github.com/grpc/grpc /tmp/grpc; \
@@ -72,7 +74,7 @@ RUN set -ex; \
       -DBUILD_SHARED_LIBS=ON \
       -DgRPC_INSTALL=ON \
       -DgRPC_BUILD_TESTS=OFF \
-      -DgRPC_SSL_PROVIDER=package \
+      -DgRPC_SSL_PROVIDER=module \
       -DgRPC_ZLIB_PROVIDER=package \
       -DgRPC_BUILD_CSHARP_EXT=OFF \
       -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF \
