@@ -963,6 +963,8 @@ MasterServer::MasterServer(MasterServerConfig config)
                                                           peer_stub_pool_.get(),
                                                           std::move(config_.evict_strategy))) {
   router_.SetLeaseDuration(config_.eviction_config.lease_duration);
+  // A writer's ADD reaches the master within one heartbeat interval (ttl / divisor).
+  router_.SetInflightPutTtl(config_.registry_config.heartbeat_ttl);
   service_->SetEvictionManager(eviction_manager_.get());
 }
 
