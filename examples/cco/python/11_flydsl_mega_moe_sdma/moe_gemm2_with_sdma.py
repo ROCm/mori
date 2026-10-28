@@ -78,6 +78,7 @@ from aiter.ops.flydsl.kernels.mega_moe.gemm2 import (
 )
 from sorted_combine import (
     ArenaLayout,
+    _store_i32_relaxed_system,
     sdma_finish_peer,
     sdma_put_run,
     sdma_wait_consumed,
@@ -96,6 +97,10 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import _fabs_f32 as fabs_f32
 #: GEMM2 kernel at bs=4096. Spreading a chunk's count over several counters on
 #: top of this buys nothing -- the atomic itself is not the cost.
 CDONE_STRIDE = 32
+
+#: Rows a comm wave pushes into a peer's inv per lane per loop trip, so that many
+#: independent idx loads are in flight before their stores.
+PUSH_U = 8
 
 
 @dataclass(frozen=True)
@@ -306,7 +311,7 @@ def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *,
 
 
 # fmt: off
-def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int, rank: int,
+def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int, rank: int,
     send_nbytes: int, BM: int = 32, BN: int = 256, BK: int = 256, use_nt: bool = True,
     HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8", SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None,
@@ -369,7 +374,7 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
         buf: fx.Array[Int8, lds_bytes, 16]
 
     kernel_name = (
-        f"megamoe_stage2_localsort_t{BM}x{BN}x{BK}"
+        f"megamoe_stage2_with_sdma_t{BM}x{BN}x{BK}"
         f"_sbm{SBM}_{a_dtype}_nt{int(use_nt)}"
         f"_p{int(persist)}cu{cu_num}s{int(persist_strided)}_pad{int(has_pad)}"
         f"_sk{skew_cu}"
@@ -385,12 +390,12 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
 
     # fmt: off
     @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
-    def kernel_localsort(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
+    def kernel_with_sdma(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64,
         arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_send: fx.Int64, arg_out_row: fx.Int64,
         arg_dev_comm: fx.Int64, arg_win: fx.Int64, arg_cdone: fx.Int64, arg_tile_base: fx.Int64,
-        arg_cursor: fx.Int64, i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32,
-        i32_kpad: fx.Int32, i32_npad: fx.Int32):
+        arg_cursor: fx.Int64, arg_idx: fx.Int64, i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32,
+        i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32):
     # fmt: on
         tx_i32 = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -572,6 +577,33 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
                         if peer != fx.Int32(rank):
                             if is_lane0:
                                 sdma_wait_consumed(w, peer, phase, layout=lay, rank=rank)
+                # Fill each peer's inv for the rows I send it: slot -> where the row lands
+                # there (its R rows follow its S rows, my run starts at rank * cap). This
+                # runs while the GEMM computes its first chunk, and has to be performed
+                # before any put or signal of mine, hence the wait on vmcnt.
+                idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
+                land0 = fx.Int32(npes * lay.cap + rank * lay.cap)
+                for j in range_constexpr(n_mine):
+                    peer = owner + fx.Int32(j * n_waves)
+                    if peer < fx.Int32(npes):
+                        if peer != fx.Int32(rank):
+                            cnt = cursor_buf[peer]
+                            inv_peer = fx.Int64(w.lsa_ptr(peer, lay.off_inv))
+                            for base in range(fx.Int32(0), cnt, fx.Int32(64 * PUSH_U)):
+                                ok, js, sl = [], [], []
+                                for u in range_constexpr(PUSH_U):
+                                    jj = base + fx.Int32(u * 64) + lane
+                                    o = jj < cnt
+                                    ok.append(o)
+                                    js.append(jj)
+                                    sl.append(idx_buf[peer * fx.Int32(lay.cap) + o.select(jj, fx.Int32(0))])
+                                for u in range_constexpr(PUSH_U):
+                                    if ok[u]:
+                                        _store_i32_relaxed_system(
+                                            inv_peer + fx.Int64(sl[u]) * fx.Int64(4),
+                                            land0 + js[u],
+                                        )
+                rocdl.s_waitcnt(vmcnt=0)
                 total_tiles = (cumsum0 + fx.Int32(SBM - 1)) // fx.Int32(SBM)
                 n_chunks = (total_tiles + fx.Int32(CT - 1)) // fx.Int32(CT)
                 for c in range(fx.Int32(0), n_chunks, fx.Int32(1)):
@@ -624,15 +656,16 @@ def compile_moe_gemm2_localsort(*, model_dim: int, inter_dim: int, experts: int,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64,
         arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_send: fx.Int64, arg_out_row: fx.Int64,
         arg_dev_comm: fx.Int64, arg_win: fx.Int64, arg_cdone: fx.Int64, arg_tile_base: fx.Int64,
-        arg_cursor: fx.Int64, i32_max_m_blocks: fx.Int32, i32_grid_blocks: fx.Int32, i32_inter: fx.Int32,
-        i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32, stream: fx.Stream):
+        arg_cursor: fx.Int64, arg_idx: fx.Int64, i32_max_m_blocks: fx.Int32, i32_grid_blocks: fx.Int32,
+        i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32,
+        stream: fx.Stream):
     # fmt: on
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         grid_x = i32_grid_blocks * num_n_blocks + fx.Int32(NC)
-        kernel_localsort(
+        kernel_with_sdma(
             arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles,
             arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win, arg_cdone,
-            arg_tile_base, arg_cursor, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad,
+            arg_tile_base, arg_cursor, arg_idx, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch
@@ -642,9 +675,9 @@ _LAUNCH_CACHE = {}
 
 
 # fmt: off
-def run_moe_gemm2_localsort(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
     arg_max_expert_tiles, arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win,
-    arg_cdone, arg_tile_base, arg_cursor, row_capacity, i32_inter, i32_hidden, stream, *,
+    arg_cdone, arg_tile_base, arg_cursor, arg_idx, row_capacity, i32_inter, i32_hidden, stream, *,
     model_dim, inter_dim, experts, rank, send_nbytes, BM, SBM, HIDDEN_MAX, INTER_MAX, cu_num,
     BN=256, BK=256, use_nt=True, g2_bhoist=True, g2_ascale_pf=True, g2_spart=402, persist=False,
     persist_cu=0, persist_strided=False, g2_bf16_lds=False, skew_cu=0, scatter_vec=8, comm=None,
@@ -663,12 +696,12 @@ def run_moe_gemm2_localsort(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     key = tuple(sorted(compile_kw.items()))
     launch = _LAUNCH_CACHE.get(key)
     if launch is None:
-        launch = _LAUNCH_CACHE[key] = compile_moe_gemm2_localsort(**compile_kw)
+        launch = _LAUNCH_CACHE[key] = compile_moe_gemm2_with_sdma(**compile_kw)
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
     _run_compiled(
         launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win,
-        arg_cdone, arg_tile_base, arg_cursor, fx.Int32(max_m_blocks), fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden),
+        arg_cdone, arg_tile_base, arg_cursor, arg_idx, fx.Int32(max_m_blocks), fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden),
         fx.Int32(0), fx.Int32(0), stream,
     )

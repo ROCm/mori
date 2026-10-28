@@ -34,21 +34,28 @@ GEMM2 kernel ship chunks while it is still computing.
 
 Three kernels on one stream (the P2P-scatter baseline has two):
 
-    1. rank_sort_plan   persistent grid; count -> scan -> assign with grid barriers:
-                        out_row per sorted row, idx_send, tile_base, cursor; zeroes cdone
-    2. gemm2_localsort  writes S[out_row]; extra comm waves (one per peer) put finished
+    1. rank_sort_plan   persistent grid; count -> prefix -> assign with one rendezvous:
+                        out_row per sorted row, tile_base, cursor; zeroes cdone; and writes
+                        every row's slot -> landing-row entry into its DESTINATION's ``inv``
+    2. gemm2_with_sdma  writes S[out_row]; extra comm waves (one per peer) put finished
                         chunks with SDMA while the GEMM tiles are still computing
-    3. combine          persistent grid; wait for the peers' flags -> build slot->row
-                        table -> grid barrier -> top-k reduce -> publish "consumed"
+    3. combine          persistent grid; wait for the peers' flags -> top-k reduce
+                        -> publish "consumed"
 
 Everything lives in ONE cco window, so ``put`` names the same window for source
 and destination and only the byte offsets differ::
 
-    [ S | R | idx_send | idx_land | flags | done | counter ]
+    [ S | R | inv | sig | flags | done | counter ]
+
+``inv[slot]`` is the landing row of the row for token slot ``slot`` (``origin_lid*topk
++ k``), or -1. The SENDER writes it, in the plan kernel, where a row's destination,
+slot and position are all known at once -- so no index travels with the data and the
+receiver builds no table. ``sig`` is scratch for the 4-byte put that carries the
+completion signal.
 
 ``flags[src]`` says "src's data for call n has landed" (and how many rows).
 ``done[dst]`` says "dst has finished reading call n": a sender waits for it before
-overwriting that peer's ``R``/``idx_land`` with call n+1, which keeps a fast rank
+overwriting that peer's ``R`` and ``inv`` with call n+1, which keeps a fast rank
 from running into a slow one. ``counter`` is the call number; only the combine
 kernel advances it, after every reader of it has run.
 
@@ -69,8 +76,8 @@ aiter's P2P scatter lays them out -- payload then scales, inline -- so one
 contiguous put still carries a whole row. bf16 doubles the bytes and the
 transfer stops fitting under the GEMM.
 
-Both persistent kernels use grid-wide barriers, so their grid must be fully
-resident (one block per CU is).
+The plan kernel rendezvouses across its grid, so that grid must be fully resident
+(one block per CU is). The combine has no grid-wide rendezvous and is not resident.
 """
 
 from dataclasses import dataclass
@@ -109,7 +116,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 BLOCK = 256
 WAVE = 64
-BAR_STRIDE = 32  # ints per flag_barrier slot: one 128 B cache line
+BAR_STRIDE = 32  # ints per tree_barrier counter: one 128 B cache line
+BAR_GROUP = 32  # blocks per tree_barrier group
 MIN_SBM = 16
 _ALIGN = 128
 
@@ -125,6 +133,7 @@ class ArenaLayout:
     npes: int
     cap: int
     row_bytes: int
+    slot_cap: int
 
     @property
     def n_rows(self):
@@ -139,16 +148,16 @@ class ArenaLayout:
         return self.off_s + self.n_rows * self.row_bytes
 
     @property
-    def off_idx_send(self):
+    def off_inv(self):
         return self.off_r + self.n_rows * self.row_bytes
 
     @property
-    def off_idx_land(self):
-        return self.off_idx_send + _align(self.n_rows * 4)
+    def off_sig(self):
+        return self.off_inv + _align(self.slot_cap * 4)
 
     @property
     def off_flags(self):
-        return self.off_idx_land + _align(self.n_rows * 4)
+        return self.off_sig + _align(self.npes * 4)
 
     @property
     def off_done(self):
@@ -171,6 +180,21 @@ class ArenaLayout:
 def _uniform_i64(x):
     """A wave-uniform i64 (SGPR) copy of ``x``, as a buffer-resource base needs."""
     return fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(x).ir_value()))
+
+
+def _store_i32_relaxed_system(addr_i64, val):
+    """Relaxed i32 store that is visible system-wide once it retires.
+
+    Unlike ``comm_ops.store_i32_global_system_release`` it carries no release, so
+    it does not write back the whole L2; it is the store for a row's ``inv`` entry
+    in a peer's window, one per row.
+    """
+    comm_ops._llvm_d.StoreOp(
+        val.ir_value(),
+        comm_ops._to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=comm_ops._llvm_d.AtomicOrdering.monotonic,
+    )
 
 
 def _decode(p, *, log2_max_tok, recv_cap, topk, npes):
@@ -202,31 +226,40 @@ def grid_barrier(bar_addr, nblocks, tid):
 
 
 @comm_ops.traced
-def flag_barrier(bar_addr, nblocks, tid, bid):
-    """All blocks of a resident grid rendezvous without a contended atomic.
+def tree_barrier(bar_addr, nblocks, tid, bid):
+    """All blocks of a resident grid rendezvous with two levels of small atomics.
 
-    Block ``i`` bumps its own cache-line-sized slot ``bar[i]`` and every block polls
-    all slots, so arrival costs one uncontended atomic instead of ``nblocks`` of them
-    queueing on one address. Slots are never reset: a block's target is its own slot's
-    value at entry plus one, and every block bumps once per launch.
+    Blocks are grouped ``BAR_GROUP`` to a counter; the last block of a group bumps a
+    top counter; everyone polls only the top one. No address sees more than
+    ``BAR_GROUP`` atomics, and a round of polling is one load per block, not
+    ``nblocks`` of them (which, spun on by every thread of every block, slowed the
+    very stores it was waiting for). Counters are never reset: a group's counter
+    advances by its size per launch, so the launch number is ``old // size``.
+    Each counter sits on its own cache line.
     """
-    target = fx.Int32(
-        comm_ops.load_i32_global_agent(
-            bar_addr + fx.Int64(bid) * fx.Int64(BAR_STRIDE * 4)
-        )
-    ) + fx.Int32(1)
+    group = bid // fx.Int32(BAR_GROUP)
+    n_groups = (nblocks + fx.Int32(BAR_GROUP - 1)) // fx.Int32(BAR_GROUP)
+    size = nblocks - group * fx.Int32(BAR_GROUP)
+    size = (size < fx.Int32(BAR_GROUP)).select(size, fx.Int32(BAR_GROUP))
     rocdl.s_waitcnt(0)
     fx.barrier()
     if tid == fx.Int32(0):
         comm_ops.fence_agent_release()
-        comm_ops.atomic_add_agent(
-            bar_addr + fx.Int64(bid) * fx.Int64(BAR_STRIDE * 4), fx.Int32(1)
+        old = fx.Int32(
+            comm_ops.atomic_add_agent(
+                bar_addr + fx.Int64(group) * fx.Int64(BAR_STRIDE * 4), fx.Int32(1)
+            )
         )
-    for i in range(tid, nblocks, fx.Int32(BLOCK)):
+        launch = old // size
+        if old - launch * size == size - fx.Int32(1):
+            comm_ops.atomic_add_agent(
+                bar_addr + fx.Int64(n_groups) * fx.Int64(BAR_STRIDE * 4), fx.Int32(1)
+            )
         comm_ops.spin_until_ge_i32_agent(
-            bar_addr + fx.Int64(i) * fx.Int64(BAR_STRIDE * 4), target
+            bar_addr + fx.Int64(n_groups) * fx.Int64(BAR_STRIDE * 4),
+            (launch + fx.Int32(1)) * n_groups,
         )
-    comm_ops.fence_agent_acquire()
+        comm_ops.fence_agent_acquire()
     fx.barrier()
 
 
@@ -237,10 +270,12 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
     * prefix: ``tile_base[tile][pe]`` = rows for ``pe`` in earlier tiles (so the
               rows of a tile range are contiguous in the run), ``cursor[pe]`` = total
     * assign: ``out_row = pe*cap + tile_base + (earlier rows of this tile for pe)``,
-              and ``idx_send[out_row] = origin_lid*topk + k``
+              and ``idx_send[out_row] = origin_lid*topk + k``. Rows bound for this rank
+              also get their ``inv`` entry here; the other ranks' entries are pushed by
+              the GEMM2 kernel's comm waves, off this kernel's critical path
 
     One rendezvous, between count and prefix; the prefix needs every earlier tile's
-    count. It is a ``flag_barrier`` (no single contended atomic). After it, a block
+    count. It is a ``tree_barrier`` (no address takes more than a group's worth of atomics). After it, a block
     does not scan the whole ``tile_cnt`` array: for each tile it owns it sums the
     counts of the earlier tiles with one pass of the block's threads (thread ``t``
     handles pe ``t % npes``) and a short LDS reduction -- a parallel sum, not a
@@ -250,7 +285,7 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
 
     Before it writes anything the kernel waits until every peer has consumed the
     previous call: that is what guarantees this rank's own outbound puts have
-    finished reading ``S`` and ``idx_send``, which this call is about to rewrite.
+    finished reading ``S`` (rewritten by the GEMM2 that follows).
     ``tile_base`` is clamped to ``cap``, so a chunk that crosses the per-pair
     reservation is cut at it instead of shipping the next peer's rows.
 
@@ -283,8 +318,8 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
                  known_block_size=[BLOCK, 1, 1])
     def plan(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
-        arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_cdone: fx.Int64, arg_bar: fx.Int64,
-        arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
+        arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_inv: fx.Int64, arg_cdone: fx.Int64,
+        arg_bar: fx.Int64, arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
         i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
@@ -307,9 +342,9 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
             """LDS i32 word ``i`` of the block's scratch."""
             return lds_typed_ptr(lds_i32 + i * fx.Int32(4), T.i32, align=4)
 
-        # S and idx_send are rewritten from here on. A peer's done flag says it has
-        # read everything I sent it last call, and with the copy engine's FIFO that
-        # means my puts have finished reading them.
+        # S and the peers' inv are rewritten from here on. A peer's done flag says it
+        # has read everything I sent it last call, and with the copy engine's FIFO that
+        # means my puts have finished reading S and it has reset its inv.
         consumed = global_typed_ptr(arg_counter, T.i32)[0]
         if tid < fx.Int32(npes):
             if tid != fx.Int32(rank):
@@ -355,7 +390,7 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
                     total = total + fx.Int32(fx.ptr_load(lw(fx.Int32(w * npes) + tid)))
                 tile_cnt[tile * fx.Int32(npes) + tid] = total
             fx.barrier()
-        flag_barrier(arg_bar, i32_nblocks, tid, bid)
+        tree_barrier(arg_bar, i32_nblocks, tid, bid)
 
         # No rows at all: the loop below never runs, so say so explicitly.
         if (tiles == fx.Int32(0)) & (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
@@ -363,6 +398,7 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
             ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = fx.Int32(0)
 
         idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
+        inv_buf = ptr_buf_tensor(arg_inv, fx.Int32)
         lane_lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
         for tile in range(bid, tiles, i32_nblocks):
             # Rows for pe in the tiles before this one. Element e of tile_cnt is
@@ -414,19 +450,22 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
                 else:
                     out_row = dest_pe * fx.Int32(cap) + place
                     out_buf[g] = out_row
-                    idx_buf[out_row] = dest_lid * fx.Int32(topk) + s
+                    slot = dest_lid * fx.Int32(topk) + s
+                    idx_buf[out_row] = slot
+                    if dest_pe == fx.Int32(rank):
+                        inv_buf[slot] = out_row
             fx.barrier()
 
     # fmt: off
     @flyc.jit
     def launch(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
-        arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_cdone: fx.Int64, arg_bar: fx.Int64,
-        arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
+        arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_inv: fx.Int64, arg_cdone: fx.Int64,
+        arg_bar: fx.Int64, arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
         i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32, stream: fx.Stream):
     # fmt: on
         plan(arg_stids, arg_trb, arg_num_valid, arg_tile_cnt, arg_tile_base, arg_cursor,
-             arg_out_row, arg_idx, arg_cdone, arg_bar, arg_over, arg_done, arg_counter,
+             arg_out_row, arg_idx, arg_inv, arg_cdone, arg_bar, arg_over, arg_done, arg_counter,
              i32_nblocks, i32_cdone_n).launch(
             grid=(i32_nblocks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
@@ -471,7 +510,7 @@ def sdma_put_run(sdma, win, peer, queue, *, layout, rank, lo, hi, cco):
 def sdma_finish_peer(
     sdma, w, win, peer, queue, cnt, phase, *, layout, rank, cco, signal_mode="remote"
 ):
-    """Ship idx, tell ``peer`` its rows have landed, and publish ``cnt``.
+    """Tell ``peer`` its rows have landed, and publish ``cnt``.
 
     Two ways to say "landed":
 
@@ -496,19 +535,18 @@ def sdma_finish_peer(
     if signal_mode not in ("quiet", "remote"):
         raise ValueError(f"signal_mode must be quiet or remote, got {signal_mode!r}")
     remote = signal_mode == "remote"
-    # Under `remote` this put carries the signal, so it is issued even when
-    # there is no idx to ship -- 4 bytes the peer never reads.
-    if const_expr(remote) or cnt > fx.Int32(0):
+    # Under `remote` this put carries the signal: 4 bytes the peer never reads.
+    if const_expr(remote):
         sdma.put(
             peer,
             win,
-            fx.Int64(layout.off_idx_land + rank * layout.cap * 4),
+            fx.Int64(layout.off_sig + rank * 4),
             win,
-            fx.Int64(layout.off_idx_send) + fx.Int64(peer) * fx.Int64(layout.cap * 4),
-            fx.Int64((cnt > fx.Int32(0)).select(cnt, fx.Int32(1))) * fx.Int64(4),
+            fx.Int64(layout.off_sig + peer * 4),
+            fx.Int64(4),
             queue,
             coop=cco.CoopScope.THREAD,
-            remote_signal=True if remote else None,
+            remote_signal=True,
         )
     if const_expr(not remote):
         sdma.quiet_queue(peer, queue)
@@ -525,16 +563,13 @@ def sdma_finish_peer(
 def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remote"):
     """Kernel 3: finish the transfer and reduce.
 
-    One persistent launch (grid resident), in phases:
+    One launch, in phases:
 
-      A. wait for every peer's flag for this call (acquire), which also says how many
-         rows each sent;
-      B. ``inv[idx[src][j]] = landing row`` for every landed row, spread over the grid;
-      -- grid barrier --
-      C. ``out[t] = sum_k row[inv[t*topk+k]]`` in f32, one block per token in turn. A slot's
+      A. wait for every peer's flag for this call (acquire);
+      B. ``out[t] = sum_k row[inv[t*topk+k]]`` in f32, one block per token in turn. A slot's
          ``inv`` entry is reset to -1 once read, so it starts clean next call and nothing
          has to refill it; slots no route filled stay -1 and contribute zero;
-      D. the last block to finish publishes ``done`` to every peer and advances ``counter``.
+      C. the last block to finish publishes ``done`` to every peer and advances ``counter``.
     """
     import mori.cco.device.flydsl as cco
 
@@ -553,8 +588,8 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
     # fmt: off
     @flyc.kernel(name=f"mega_combine_p{npes}_c{cap}_h{hidden}_k{topk}_{quant}_{signal_mode}"
                  f"_r{rank}", known_block_size=[BLOCK, 1, 1])
-    def combine(win: fx.Int64, arg_cursor: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64,
-        arg_bar: fx.Int64, arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
+    def combine(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64,
+        arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
         i32_nblocks: fx.Int32, i32_tokens: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
@@ -585,27 +620,9 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
                     comm_ops.fence_system_acquire()
         fx.barrier()
 
-        # B. slot -> landing row
-        idx_send = fx.Int64(w.lsa_ptr(rank, layout.off_idx_send))
-        idx_land = fx.Int64(w.lsa_ptr(rank, layout.off_idx_land))
         inv_buf = ptr_buf_tensor(arg_inv, fx.Int32)
-        cursor = ptr_buf_tensor(arg_cursor, fx.Int32)
-        gid = bid * fx.Int32(BLOCK) + tid
-        stride = i32_nblocks * fx.Int32(BLOCK)
-        for g in range(gid, fx.Int32(npes * cap), stride):
-            src = g // fx.Int32(cap)
-            is_self = src == fx.Int32(rank)
-            theirs = fx.Int32(
-                comm_ops.load_i32_global_system(flags_base + fx.Int64(src) * fx.Int64(8) + fx.Int64(4))
-            )
-            cnt = is_self.select(cursor[fx.Int32(rank)], theirs)
-            if (g - src * fx.Int32(cap)) < cnt:
-                base = is_self.select(idx_send, idx_land)
-                slot = global_typed_ptr(base + fx.Int64(g) * fx.Int64(4), T.i32)[0]
-                inv_buf[slot] = is_self.select(g, g + fx.Int32(npes * cap))
-        grid_barrier(arg_bar, i32_nblocks, tid)
 
-        # C. top-k reduce
+        # B. top-k reduce
         s_base = _uniform_i64(w.lsa_ptr(rank, layout.off_s))
         if const_expr(quant_fp8):
             # Payload is 8 fp8 bytes (2 i32) per thread; the 32-value block they
@@ -664,7 +681,7 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
             if tid < fx.Int32(topk):
                 inv_buf[tok * fx.Int32(topk) + tid] = fx.Int32(-1)
 
-        # D. the last block out tells the peers this call's data has been consumed
+        # C. the last block out tells the peers this call's data has been consumed
         rocdl.s_waitcnt(0)
         fx.barrier()
         if tid == fx.Int32(0):
@@ -682,11 +699,11 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
 
     # fmt: off
     @flyc.jit
-    def launch(win: fx.Int64, arg_cursor: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64,
-        arg_bar: fx.Int64, arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
+    def launch(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64,
+        arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
         i32_nblocks: fx.Int32, i32_tokens: fx.Int32, stream: fx.Stream):
     # fmt: on
-        combine(win, arg_cursor, arg_inv, arg_out, arg_bar, arg_fin, arg_dev_comm,
+        combine(win, arg_inv, arg_out, arg_fin, arg_dev_comm,
                 i32_nblocks, i32_tokens).launch(
             grid=(i32_nblocks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
@@ -741,7 +758,7 @@ class SortedCombine:
             Communicator,
         )
 
-        from moe_gemm2_localsort import CommSpec
+        from moe_gemm2_with_sdma import CommSpec
 
         cfg = moe.comb_cfg
         self.moe = moe
@@ -784,7 +801,7 @@ class SortedCombine:
             if quant == "fp8_blockwise_1x32"
             else self.hidden * 2
         )
-        self.layout = ArenaLayout(self.npes, self.cap, row_bytes)
+        self.layout = ArenaLayout(self.npes, self.cap, row_bytes, self.slot_cap)
         self.layout.check()
         dev = torch.device("cuda", self.rank)
         lay = self.layout
@@ -815,7 +832,7 @@ class SortedCombine:
         self.cursor = torch.zeros(self.npes, **i32)
         # One completion counter per chunk, each on its own cache line; the plan
         # kernel zeroes the prefix a launch can touch.
-        from moe_gemm2_localsort import CDONE_STRIDE
+        from moe_gemm2_with_sdma import CDONE_STRIDE
 
         self.cdone_stride = CDONE_STRIDE
         self.cdone = torch.zeros((max_tiles + 1) * CDONE_STRIDE, **i32)
@@ -826,15 +843,25 @@ class SortedCombine:
         )
         # Rows the per-pair reservation had no room for; must stay 0.
         self.overflow = torch.zeros(1, **i32)
-        self.combine_bar = torch.zeros(1, **i32)
         self.combine_fin = torch.zeros(1, **i32)
-        # -1 means "no row for this slot"; the combine kernel puts it back after reading.
-        self.inv = torch.full((self.slot_cap,), -1, **i32)
+        # In the window, so a sender can fill it: -1 means "no row for this slot"; the
+        # combine kernel puts it back after reading. Set before the barrier below, so
+        # no peer's first plan can write into it first.
+        self.inv = _torch_view(
+            self.mem.ptr + lay.off_inv, self.slot_cap * 4, torch.int32
+        )
+        self.inv.fill_(-1)
+        # The plan's per-row slot, read back by the comm waves that push the peers' inv.
+        self.idx_send = torch.zeros(self.npes * self.cap, **i32)
         self.out = torch.empty(
             self.max_tok * self.hidden, dtype=torch.bfloat16, device=dev
         )
-        # Both persistent kernels barrier across the grid, so keep it resident: one block per CU.
+        # The plan kernel barriers across its grid, so keep it resident: one block per CU.
         self.nblocks = torch.cuda.get_device_properties(dev).multi_processor_count
+        # The combine has no grid-wide rendezvous, so it need not be resident. Two blocks
+        # per CU keep more row loads in flight for the reduce: 1.5-2x measured 1-2% faster
+        # stage2+combine at 2048-8192 tokens per rank, 4x and up was already slower.
+        self.comb_blocks = 2 * self.nblocks
         torch.cuda.synchronize()
         self.comm.barrier()
 
@@ -902,7 +929,8 @@ class SortedCombine:
             fx.Int64(self.tile_base.data_ptr()),
             fx.Int64(self.cursor.data_ptr()),
             fx.Int64(self.out_row.data_ptr()),
-            fx.Int64(self.mem.ptr + lay.off_idx_send),
+            fx.Int64(self.idx_send.data_ptr()),
+            fx.Int64(self.inv.data_ptr()),
             fx.Int64(self.cdone.data_ptr()),
             fx.Int64(self.plan_bar.data_ptr()),
             fx.Int64(self.overflow.data_ptr()),
@@ -915,12 +943,12 @@ class SortedCombine:
 
     def _launch_gemm2(self, config, s_fx):
         import flydsl.expr as fx
-        from moe_gemm2_localsort import run_moe_gemm2_localsort
+        from moe_gemm2_with_sdma import run_moe_gemm2_with_sdma
 
         moe, op, lay = self.moe, self.moe._s1_op, self.layout
         ws, stage2 = moe._s1_dispatch_workspace, config.stage2
         inv = moe._g2_invariants_by_quant["none"]
-        run_moe_gemm2_localsort(
+        run_moe_gemm2_with_sdma(
             fx.Int64(moe._s1_out.view(-1).data_ptr()),
             fx.Int64(moe._s1_osd.data_ptr()),
             fx.Int64(moe.w2.data_ptr()),
@@ -937,6 +965,7 @@ class SortedCombine:
             fx.Int64(self.cdone.data_ptr()),
             fx.Int64(self.tile_base.data_ptr()),
             fx.Int64(self.cursor.data_ptr()),
+            fx.Int64(self.idx_send.data_ptr()),
             moe._s1_nvm,
             moe._g2v2_inter,
             moe._g2v2_hidden,
@@ -996,13 +1025,11 @@ class SortedCombine:
         _run_compiled(
             self._combine,
             fx.Int64(self.win.handle),
-            fx.Int64(self.cursor.data_ptr()),
             fx.Int64(self.inv.data_ptr()),
             fx.Int64(self.out.data_ptr()),
-            fx.Int64(self.combine_bar.data_ptr()),
             fx.Int64(self.combine_fin.data_ptr()),
             fx.Int64(self.dev_comm.ptr),
-            fx.Int32(self.nblocks),
+            fx.Int32(self.comb_blocks),
             fx.Int32(run_tokens),
             s_fx,
         )

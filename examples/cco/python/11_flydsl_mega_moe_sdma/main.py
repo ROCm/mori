@@ -33,7 +33,7 @@ not occupy CUs:
 Three kernels on one stream (see ``sorted_combine.py``; the P2P baseline has two):
 
     1. rank_sort_plan   count -> scan -> assign: a stable send-buffer index per row
-    2. gemm2            writes S[out_row] (``moe_gemm2_localsort.py``); extra comm waves,
+    2. gemm2            writes S[out_row] (``moe_gemm2_with_sdma.py``); extra comm waves,
                         one per peer, wait for a chunk of sort tiles to be written (a
                         per-chunk counter the GEMM workgroups bump after their stores) and
                         put that chunk for their peer on their own SDMA queue while the
