@@ -893,19 +893,6 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
   }
 
-  grpc::Status RegisterKvBlock(grpc::ServerContext*, const ::umbp::StandaloneKvBlock* request,
-                               ::umbp::BoolResponse* response) override {
-    std::shared_lock<std::shared_mutex> lock(client_mu_);
-    if (shutdown_) return {grpc::StatusCode::UNAVAILABLE, "server is shutting down"};
-    try {
-      RegisterKvMetadata(*request);
-      SetBool(response, true);
-    } catch (const std::exception& error) {
-      SetBool(response, false, error.what());
-    }
-    return grpc::Status::OK;
-  }
-
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

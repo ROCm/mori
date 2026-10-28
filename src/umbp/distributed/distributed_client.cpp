@@ -225,6 +225,14 @@ void DistributedClient::RegisterKvBlock(const KvBlockMetadata& block) {
   pool_client_->RegisterKvBlock(block);
 }
 
+bool DistributedClient::Put(const std::string& key, uintptr_t src, size_t size) {
+  if (closing_) return false;
+  PrepareKvMetadata({key});
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return false;
+  return pool_client_->Put(key, reinterpret_cast<const void*>(src), size);
+}
+
 bool DistributedClient::Get(const std::string& key, uintptr_t dst, size_t size) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
@@ -251,6 +259,24 @@ std::vector<bool> DistributedClient::BatchPut(const std::vector<std::string>& ke
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
 
+  std::vector<const void*> src_ptrs(srcs.size());
+  for (size_t i = 0; i < srcs.size(); ++i) {
+    src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
+  }
+  return pool_client_->BatchPut(keys, src_ptrs, sizes);
+}
+
+std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::string>& keys,
+                                                       const std::vector<uintptr_t>& srcs,
+                                                       const std::vector<size_t>& sizes,
+                                                       const std::vector<int>& /*depths*/) {
+  // Depth was a master-side hint for the prior allocator; in the
+  // master-as-advisor design master no longer tracks per-key depth.
+  // Forward to the depth-less BatchPut and silently drop the hint.
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  PrepareKvMetadata(keys);
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return std::vector<bool>(keys.size(), false);
   std::vector<const void*> src_ptrs(srcs.size());
   for (size_t i = 0; i < srcs.size(); ++i) {
     src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);

@@ -313,6 +313,29 @@ bool StandaloneProcessClient::OffsetForLocked(uintptr_t ptr, size_t size, uint64
   return false;
 }
 
+bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t size) {
+  if (kv_metadata_provider_) {
+    const auto result = BatchPut({key}, {src}, {size});
+    return !result.empty() && result.front();
+  }
+  if (closing_) return false;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return false;
+  uint64_t offset = 0;
+  uint64_t region_base = 0;
+  if (!OffsetFor(src, size, &offset, &region_base)) return false;
+  grpc::ClientContext ctx;
+  ::umbp::PutRequest req;
+  req.set_key(key);
+  req.set_client_id(ClientId());
+  req.set_shm_offset(offset);
+  req.set_size(size);
+  req.set_region_base(region_base);
+  ::umbp::BoolResponse resp;
+  grpc::Status status = stub_->Put(&ctx, req, &resp);
+  return status.ok() && resp.ok();
+}
+
 bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t size) {
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
@@ -344,23 +367,25 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   return status.ok() && resp.ok();
 }
 
-// Both wire formats share validation, metadata preparation and pointer translation.
-template <typename Request, typename Rpc>
-std::vector<bool> StandaloneProcessClient::BatchPutRequest(const std::vector<std::string>& keys,
-                                                           const std::vector<uintptr_t>& srcs,
-                                                           const std::vector<size_t>& sizes,
-                                                           Request& req, Rpc rpc) {
-  const std::vector<bool> failed(keys.size(), false);
-  if (closing_) return failed;
+std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::string>& keys,
+                                                    const std::vector<uintptr_t>& srcs,
+                                                    const std::vector<size_t>& sizes) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
+  ::umbp::BatchDataRequest req;
   if (kv_metadata_provider_)
     for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
   std::shared_lock lk(op_mutex_);
   if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
-  if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) return failed;
+  if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) {
+    return std::vector<bool>(keys.size(), false);
+  }
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
-    uint64_t offset = 0, region_base = 0;
-    if (!OffsetFor(srcs[i], sizes[i], &offset, &region_base)) return failed;
+    uint64_t offset = 0;
+    uint64_t region_base = 0;
+    if (!OffsetFor(srcs[i], sizes[i], &offset, &region_base)) {
+      return std::vector<bool>(keys.size(), false);
+    }
     req.add_keys(keys[i]);
     req.add_shm_offsets(offset);
     req.add_region_bases(region_base);
@@ -368,26 +393,48 @@ std::vector<bool> StandaloneProcessClient::BatchPutRequest(const std::vector<std
   }
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
-  auto status = (stub_.get()->*rpc)(&ctx, req, &resp);
+  grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
   CheckKvMetadataStatus(status);
-  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
+  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    return std::vector<bool>(keys.size(), false);
+  }
   return std::vector<bool>(resp.ok().begin(), resp.ok().end());
-}
-
-std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::string>& keys,
-                                                    const std::vector<uintptr_t>& srcs,
-                                                    const std::vector<size_t>& sizes) {
-  ::umbp::BatchDataRequest req;
-  return BatchPutRequest(keys, srcs, sizes, req, &::umbp::UMBPStandalone::Stub::BatchPut);
 }
 
 std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<std::string>& keys,
                                                              const std::vector<uintptr_t>& srcs,
                                                              const std::vector<size_t>& sizes,
                                                              const std::vector<int>& depths) {
+  if (closing_) return std::vector<bool>(keys.size(), false);
   ::umbp::BatchDataWithDepthRequest req;
-  for (size_t i = 0; i < keys.size(); ++i) req.add_depths(i < depths.size() ? depths[i] : -1);
-  return BatchPutRequest(keys, srcs, sizes, req, &::umbp::UMBPStandalone::Stub::BatchPutWithDepth);
+  if (kv_metadata_provider_)
+    for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
+  std::shared_lock lk(op_mutex_);
+  if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
+  if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) {
+    return std::vector<bool>(keys.size(), false);
+  }
+  req.set_client_id(ClientId());
+  for (size_t i = 0; i < keys.size(); ++i) {
+    uint64_t offset = 0;
+    uint64_t region_base = 0;
+    if (!OffsetFor(srcs[i], sizes[i], &offset, &region_base)) {
+      return std::vector<bool>(keys.size(), false);
+    }
+    req.add_keys(keys[i]);
+    req.add_shm_offsets(offset);
+    req.add_region_bases(region_base);
+    req.add_sizes(sizes[i]);
+    req.add_depths(i < depths.size() ? depths[i] : -1);
+  }
+  grpc::ClientContext ctx;
+  ::umbp::BatchBoolResponse resp;
+  grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
+  CheckKvMetadataStatus(status);
+  if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
+    return std::vector<bool>(keys.size(), false);
+  }
+  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
 }
 
 std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::string>& keys,
@@ -650,19 +697,6 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   if (!response.supports_kv_metadata())
     throw std::runtime_error("standalone owner requires an upgrade for batched KV metadata");
   kv_metadata_provider_ = config.metadata_provider;
-}
-
-void StandaloneProcessClient::RegisterKvBlock(const KvBlockMetadata& block) {
-  std::shared_lock lock(op_mutex_);
-  if (closed_ || closing_) throw std::logic_error("client is closed");
-  ::umbp::StandaloneKvBlock request;
-  EncodeKvBlock(block, &request);
-  grpc::ClientContext context;
-  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
-  ::umbp::BoolResponse response;
-  auto status = stub_->RegisterKvBlock(&context, request, &response);
-  if (!status.ok()) throw std::runtime_error(status.error_message());
-  if (!response.ok()) throw std::invalid_argument(response.error());
 }
 
 bool StandaloneProcessClient::Clear() {

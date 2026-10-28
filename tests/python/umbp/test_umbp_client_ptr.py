@@ -74,8 +74,9 @@ class MockPageFirstKVCache:
         return bytes(ctypes.string_at(self._buffer_ptr + v_offset, self.element_size))
 
 
-def _make_client(dram_capacity_bytes=4 * 1024 * 1024, ssd_dir=None):
+def _make_client(dram_capacity_bytes=4 * 1024 * 1024, ssd_dir=None, kv_indexer=None):
     config = UMBPConfig()
+    config.kv_indexer = kv_indexer
     config.dram.capacity_bytes = dram_capacity_bytes
     config.ssd.enabled = ssd_dir is not None
     if ssd_dir is not None:
@@ -101,94 +102,65 @@ def test_put_from_ptr_get_into_ptr_round_trip():
     assert client.clear()
 
 
-@pytest.mark.parametrize("enabled", [False, True, "pool"])
-@pytest.mark.parametrize("method", ["scalar", "batch", "depth", "ranges"])
-def test_configured_kv_metadata_preserves_write_api(enabled, method):
-    config = UMBPConfig()
-    config.dram.capacity_bytes = 1 << 20
-    config.ssd.enabled = False
-    config.page_size = 4096
-    metadata = umbp.KvBlockMetadata(42, 42, 16, {1: ["key"]})
-    calls = []
+@pytest.mark.parametrize("pool", [False, True])
+def test_indexer_callback_preserves_write_apis(pool):
+    parent, calls = 42, []
 
-    def provider(keys):
+    def metadata(keys):
         calls.append(keys)
-        return [metadata]
+        return [umbp.KvBlockMetadata(42, parent, 16, {1: ["key"]})]
 
-    if enabled:
-        # An unavailable Indexer must not fail a successful storage write.
-        identity = (
-            {"dram_pool_id": "shared"}
-            if enabled == "pool"
-            else {"worker_id": "worker", "worker_address": "http://worker:30000"}
+    identity = (
+        {"dram_pool_id": "shared"}
+        if pool
+        else {"worker_id": "worker", "worker_address": "http://worker:30000"}
+    )
+    client = _make_client(
+        kv_indexer=umbp.KvIndexerConfig(
+            "127.0.0.1:1", metadata_provider=metadata, timeout_ms=10, **identity
         )
-        config.kv_indexer = umbp.KvIndexerConfig(
-            "127.0.0.1:1", metadata_provider=provider, timeout_ms=10, **identity
-        )
-    client = UMBPClient(config)
-    assert not hasattr(client, "register_kv_block")
+    )
     data = ctypes.create_string_buffer(b"value")
     ptr, size = ctypes.addressof(data), len(data)
-
-    def put():
-        if method == "scalar":
-            return client.put_from_ptr("key", ptr, size)
-        if method == "ranges":
-            return all(
-                client.batch_put_ranges_from_ptr(
-                    ["key"], [size], [[ptr]], [[size]], [[0]]
-                )
-            )
-        args = (["key"], [ptr], [size])
-        if method == "depth":
-            return all(client.batch_put_from_ptr_with_depth(*args, [0]))
-        return all(client.batch_put_from_ptr(*args))
-
-    if enabled:
-        with pytest.raises(ValueError, match="cycle"):
-            put()
-        assert not client.exists("key")
-    metadata = umbp.KvBlockMetadata(42, None, 16, {1: ["key"]})
-    assert put()
-    assert calls == ([["key"], ["key"]] if enabled else [])
-    out = ctypes.create_string_buffer(size)
-    assert client.get_into_ptr("key", ctypes.addressof(out), size)
-    assert out.raw == data.raw
-    assert client.clear()
-
-
-def test_indexer_requires_callable_metadata_provider():
-    with pytest.raises(TypeError):
-        umbp.KvIndexerConfig("127.0.0.1:1", "worker", "http://worker:30000", None)
+    with pytest.raises(ValueError, match="cycle"):
+        client.put_from_ptr("key", ptr, size)
+    assert not client.exists("key")
+    parent = None
+    # An unavailable Indexer must not fail storage writes.
+    assert client.put_from_ptr("key", ptr, size)
+    assert client.batch_put_from_ptr(["key"], [ptr], [size]) == [True]
+    assert client.batch_put_from_ptr_with_depth(["key"], [ptr], [size], [0]) == [True]
+    assert client.batch_put_ranges_from_ptr(
+        ["key"], [size], [[ptr]], [[size]], [[0]]
+    ) == [True]
+    assert calls == [["key"]] * 5
 
 
 def test_bound_metadata_provider_does_not_retain_client_owner():
+    with pytest.raises(TypeError):
+        umbp.KvIndexerConfig("127.0.0.1:1", metadata_provider=None)
+
     class Adapter:
         def __init__(self):
-            config = UMBPConfig()
-            config.dram.capacity_bytes = 1 << 20
-            config.ssd.enabled = False
-            config.page_size = 4096
-            config.kv_indexer = umbp.KvIndexerConfig(
-                "127.0.0.1:1",
-                "worker",
-                "http://worker:30000",
-                self.metadata,
-                timeout_ms=10,
+            self.client = _make_client(
+                kv_indexer=umbp.KvIndexerConfig(
+                    "127.0.0.1:1",
+                    "worker",
+                    "http://worker:30000",
+                    self.metadata,
+                    timeout_ms=10,
+                )
             )
-            self.client = UMBPClient(config)
 
         def metadata(self, keys):
             return [umbp.KvBlockMetadata(42, None, 16, {1: keys})]
 
     adapter = Adapter()
-    client = adapter.client
-    data = ctypes.create_string_buffer(b"value")
-    assert client.put_from_ptr("key", ctypes.addressof(data), len(data))
-    ref = weakref.ref(adapter)
+    client, ref = adapter.client, weakref.ref(adapter)
     del adapter
     gc.collect()
     assert ref() is None
+    data = ctypes.create_string_buffer(b"value")
     with pytest.raises(RuntimeError, match="owner was released"):
         client.put_from_ptr("key", ctypes.addressof(data), len(data))
 

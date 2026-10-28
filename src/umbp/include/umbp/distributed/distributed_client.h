@@ -50,12 +50,17 @@ class DistributedClient : public IUMBPClient {
   void RegisterKvBlock(const KvBlockMetadata& block) override;
 
   // ---- IUMBPClient interface ----
+  bool Put(const std::string& key, uintptr_t src, size_t size) override;
   bool Get(const std::string& key, uintptr_t dst, size_t size) override;
   bool Exists(const std::string& key) const override;
 
   std::vector<bool> BatchPut(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& srcs,
                              const std::vector<size_t>& sizes) override;
+  std::vector<bool> BatchPutWithDepth(const std::vector<std::string>& keys,
+                                      const std::vector<uintptr_t>& srcs,
+                                      const std::vector<size_t>& sizes,
+                                      const std::vector<int>& depths) override;
   std::vector<bool> BatchGet(const std::vector<std::string>& keys,
                              const std::vector<uintptr_t>& dsts,
                              const std::vector<size_t>& sizes) override;

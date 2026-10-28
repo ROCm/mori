@@ -20,7 +20,6 @@ service UMBPStandalone {
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
   rpc ConfigureKvIndexer(StandaloneKvIndexerConfig) returns (BoolResponse);
-  rpc RegisterKvBlock(StandaloneKvBlock) returns (BoolResponse);
   rpc RegisterMemory(RegisterMemoryRequest) returns (BoolResponse);
   rpc DeregisterMemory(DeregisterMemoryRequest) returns (Empty);
 

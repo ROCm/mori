@@ -105,18 +105,19 @@ class KvIndexerReporter {
         throw std::invalid_argument("invalid KV component or physical keys");
       mask |= component;
     }
-    if (mask && (mask != components_ || !block.block_size))
+    if (mask != components_ || !block.block_size)
       throw std::invalid_argument(
           "metadata must describe all configured components and token count");
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       auto old = blocks_.find(block.hash);
-      if (mask && old != blocks_.end() &&
-          (old->second->parent != block.parent || old->second->block_size != block.block_size))
-        throw std::invalid_argument("a block hash cannot change parent or token count");
-      if (mask && old != blocks_.end() && old->second->component_keys == block.component_keys)
-        return;  // Repeated physical writes need no metadata update or ancestor walk.
-      if (mask && (block.parent == block.hash || parent_refs_.count(block.hash))) {
+      if (old != blocks_.end()) {
+        if (old->second->parent != block.parent || old->second->block_size != block.block_size ||
+            old->second->component_keys != block.component_keys)
+          throw std::invalid_argument("a block hash must keep the same KV metadata");
+        return;
+      }
+      if (block.parent == block.hash || parents_.count(block.hash)) {
         // Forward references are allowed, but cannot close a parent cycle.
         // A new leaf with no incoming references cannot introduce a cycle.
         for (auto parent = block.parent; parent;) {
@@ -125,28 +126,12 @@ class KvIndexerReporter {
           parent = ancestor == blocks_.end() ? std::nullopt : ancestor->second->parent;
         }
       }
-      if (old != blocks_.end()) {
-        if (old->second->parent && --parent_refs_.at(*old->second->parent) == 0)
-          parent_refs_.erase(*old->second->parent);
-        for (const auto& [component, keys] : old->second->component_keys) {
-          for (const auto& key : keys) {
-            auto it = key_blocks_.find(key);
-            if (it == key_blocks_.end()) continue;
-            auto& hashes = it->second;
-            hashes.erase(std::remove(hashes.begin(), hashes.end(), block.hash), hashes.end());
-            if (it->second.empty()) key_blocks_.erase(it);
-          }
-        }
-        blocks_.erase(old);
-      }
-      if (mask) {
-        blocks_[block.hash] = std::make_shared<const KvBlockMetadata>(block);
-        if (block.parent) ++parent_refs_[*block.parent];
-        for (const auto& [component, keys] : block.component_keys) {
-          for (const auto& key : keys) {
-            auto& hashes = key_blocks_[key];
-            if (hashes.empty() || hashes.back() != block.hash) hashes.push_back(block.hash);
-          }
+      blocks_[block.hash] = std::make_shared<const KvBlockMetadata>(block);
+      if (block.parent) parents_.insert(*block.parent);
+      for (const auto& [component, keys] : block.component_keys) {
+        for (const auto& key : keys) {
+          auto& hashes = key_blocks_[key];
+          if (hashes.empty() || hashes.back() != block.hash) hashes.push_back(block.hash);
         }
       }
       pending_.insert(block.hash);
@@ -164,10 +149,7 @@ class KvIndexerReporter {
         work = blocks_;
         rescan_ = false;
       }
-      for (int64_t hash : pending_) {
-        auto it = blocks_.find(hash);
-        work[hash] = it == blocks_.end() ? nullptr : it->second;
-      }
+      for (int64_t hash : pending_) work[hash] = blocks_.at(hash);
       pending_.clear();
     }
     try {
@@ -187,10 +169,8 @@ class KvIndexerReporter {
       for (const auto& [hash, block] : work) {
         if (stopping_) return false;
         uint32_t mask = 0;
-        if (block) {
-          for (const auto& [component, keys] : block->component_keys)
-            if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
-        }
+        for (const auto& [component, keys] : block->component_keys)
+          if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
         // A shared pool may supply SWA/MAMBA while the worker supplies FULL in HBM.
         if (pool_id_.empty() && !(mask & 1)) mask = 0;
         desired[hash] = mask;
@@ -329,7 +309,7 @@ class KvIndexerReporter {
   std::condition_variable cv_;
   std::map<int64_t, std::shared_ptr<const KvBlockMetadata>> blocks_;
   std::unordered_map<std::string, std::vector<int64_t>> key_blocks_;
-  std::unordered_map<int64_t, size_t> parent_refs_;
+  std::unordered_set<int64_t> parents_;
   std::unordered_set<int64_t> pending_;
   std::map<int64_t, uint32_t> reported_;
   size_t batch_hashes_ = 0;
