@@ -35,13 +35,16 @@ namespace io {
 void* FabricMalloc(size_t size, int device);
 void FabricFree(void* ptr);
 namespace sim {
-bool IsEnabled();  // defined in src/io/sim/backend_impl.cpp
+// Defined in src/io/sim/backend_impl.cpp.
+bool IsEnabled();
+std::map<std::string, double> ProfileValues(BackendType type);
 }  // namespace sim
 }  // namespace io
 
 void RegisterMoriIo(pybind11::module_& m) {
   m.def("set_log_level", &mori::io::SetLogLevel);
   m.def("io_sim_enabled", &mori::io::sim::IsEnabled);
+  m.def("io_sim_profile", &mori::io::sim::ProfileValues, py::arg("backend_type"));
 
   py::enum_<mori::io::BackendType>(m, "BackendType")
       .value("Unknown", mori::io::BackendType::Unknown)

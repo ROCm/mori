@@ -28,11 +28,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <msgpack.hpp>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -41,6 +44,7 @@
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
 #include "mori/utils/env_utils.hpp"
+#include "mori/utils/flat_yaml.hpp"
 #include "src/io/rdma/backend_impl.hpp"
 
 namespace mori {
@@ -189,38 +193,98 @@ std::string BackendTypeName(BackendType type) {
   }
 }
 
-LinkProfile LoadLinkProfile(BackendType type) {
-  // RDMA and XGMI are fitted with tests/python/io/calibrate_sim.py on MI355X GPU to GPU: RDMA
-  // over two 400G ionic NICs with sglang's settings (4 QPs, 4 workers), XGMI over one link with
-  // the scatter/gather kernel off (the default). mori has no hardware TCP backend, so TCP is a
-  // guess for kernel TCP on a 100G NIC.
-  double gbps = 47.4;
-  double latencyUs = 20.0;
-  double segmentNs = 255.0;
-  double opUs = 4.3;
-  if (type == BackendType::TCP) {
-    gbps = 10.0;
-    latencyUs = 30.0;
-    segmentNs = 200.0;
-    opUs = 0.0;
-  } else if (type == BackendType::XGMI) {
-    gbps = 61.4;
-    latencyUs = 9.0;
-    segmentNs = 19500.0;  // one hipMemcpyPeerAsync per segment
-    opUs = 0.0;
-  }
-  const std::string prefix = "MORI_IO_SIM_" + BackendTypeName(type);
-  env::Override((prefix + "_BW_GBPS").c_str(), gbps, ParsePositiveDouble);
-  env::Override((prefix + "_LATENCY_US").c_str(), latencyUs, ParseNonNegativeDouble);
-  env::Override((prefix + "_SEGMENT_NS").c_str(), segmentNs, ParseNonNegativeDouble);
-  env::Override((prefix + "_OP_US").c_str(), opUs, ParseNonNegativeDouble);
+namespace {
 
-  LinkProfile p;
-  p.bytesPerNs = gbps;
-  p.latency = ToNs(latencyUs * 1000.0);
-  p.perSegment = ToNs(segmentNs);
-  p.perOp = ToNs(opUs * 1000.0);
-  return p;
+const std::set<std::string> kProfileKeys = {"backend", "bandwidth_gbps", "latency_us",
+                                            "per_segment_ns", "per_op_us", "qp_per_transfer",
+                                            "num_worker_threads",
+                                            // Free text: what the numbers were measured on, since
+                                            // they change with each GPU and NIC generation.
+                                            "name", "gpu", "nic", "link", "measured", "notes"};
+
+struct ProfileEntry {
+  double gbps, latencyUs, segmentNs, opUs;
+  int qpPerTransfer, numWorkerThreads;
+};
+
+// Validates every entry of the file and returns the one for `backend`, if any.
+std::optional<ProfileEntry> ReadProfileFile(const std::string& path, const std::string& backend) {
+  std::optional<ProfileEntry> found;
+  auto entries = yaml::LoadFlatList(path);
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const yaml::FlatMap& e = entries[i];
+    const std::string where = path + ": entry " + std::to_string(i + 1);
+    yaml::CheckKeys(e, kProfileKeys, where);
+    std::string name = yaml::GetString(e, "backend");
+    if (name != "rdma" && name != "tcp" && name != "xgmi") {
+      throw std::runtime_error(where + ": backend must be rdma, tcp or xgmi, got '" + name + "'");
+    }
+    for (const char* key : {"bandwidth_gbps", "latency_us", "per_segment_ns", "per_op_us"}) {
+      if (e.count(key) == 0) throw std::runtime_error(where + ": missing " + key);
+    }
+    ProfileEntry p{yaml::GetDouble(e, "bandwidth_gbps", 0, where),
+                   yaml::GetDouble(e, "latency_us", 0, where),
+                   yaml::GetDouble(e, "per_segment_ns", 0, where),
+                   yaml::GetDouble(e, "per_op_us", 0, where),
+                   static_cast<int>(yaml::GetInt(e, "qp_per_transfer", -1, where)),
+                   static_cast<int>(yaml::GetInt(e, "num_worker_threads", -1, where))};
+    if (!(p.gbps > 0) || p.latencyUs < 0 || p.segmentNs < 0 || p.opUs < 0) {
+      throw std::runtime_error(where + ": bandwidth must be positive and costs non-negative");
+    }
+    if (name != backend) continue;
+    if (found) throw std::runtime_error(where + ": second entry for backend " + name);
+    found = p;
+  }
+  return found;
+}
+
+}  // namespace
+
+LinkProfile LoadLinkProfile(BackendType type) {
+  // Uncalibrated guesses, for when no profile is given: a 400G RoCE NIC, kernel TCP on a 100G
+  // NIC, one MI3xx XGMI link. Measured profiles are in python/mori/io/sim_profiles/.
+  ProfileEntry p{45.0, 5.0, 20.0, 0.0, -1, -1};
+  if (type == BackendType::TCP) {
+    p = {10.0, 30.0, 200.0, 0.0, -1, -1};
+  } else if (type == BackendType::XGMI) {
+    p = {50.0, 10.0, 0.0, 0.0, -1, -1};
+  }
+  LinkProfile out;
+  out.source = "built-in";
+
+  std::string backend = BackendTypeName(type);
+  std::transform(backend.begin(), backend.end(), backend.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  std::stringstream paths(mori::env::GetString("MORI_IO_SIM_PROFILE").value_or(""));
+  for (std::string path; std::getline(paths, path, ',');) {
+    if (path.empty()) continue;
+    if (auto entry = ReadProfileFile(path, backend)) {
+      p = *entry;
+      out.source = path;
+    }
+  }
+
+  const std::string prefix = "MORI_IO_SIM_" + BackendTypeName(type);
+  env::Override((prefix + "_BW_GBPS").c_str(), p.gbps, ParsePositiveDouble);
+  env::Override((prefix + "_LATENCY_US").c_str(), p.latencyUs, ParseNonNegativeDouble);
+  env::Override((prefix + "_SEGMENT_NS").c_str(), p.segmentNs, ParseNonNegativeDouble);
+  env::Override((prefix + "_OP_US").c_str(), p.opUs, ParseNonNegativeDouble);
+
+  out.bytesPerNs = p.gbps;
+  out.latency = ToNs(p.latencyUs * 1000.0);
+  out.perSegment = ToNs(p.segmentNs);
+  out.perOp = ToNs(p.opUs * 1000.0);
+  out.measuredQpPerTransfer = p.qpPerTransfer;
+  out.measuredNumWorkerThreads = p.numWorkerThreads;
+  return out;
+}
+
+std::map<std::string, double> ProfileValues(BackendType type) {
+  LinkProfile p = LoadLinkProfile(type);
+  return {{"bw_gbps", p.bytesPerNs},
+          {"latency_us", p.latency.count() / 1e3},
+          {"per_segment_ns", static_cast<double>(p.perSegment.count())},
+          {"per_op_us", p.perOp.count() / 1e3}};
 }
 
 }  // namespace sim
@@ -271,11 +335,17 @@ SimBackend::SimBackend(BackendType type, const EngineDesc& self, const IOEngineC
   timerThd_ = std::thread([this] { TimerLoop(); });
 
   MORI_IO_INFO(
-      "SimBackend({}) created for engine {}: bw {} GB/s latency {} ns segment {} ns op {} ns "
-      "time_scale {} notification {} port {}",
-      sim::BackendTypeName(type_), self_.key, profile_.bytesPerNs, profile_.latency.count(),
-      profile_.perSegment.count(), profile_.perOp.count(), timeScale_, enableNotification_,
-      ctx_ ? static_cast<int>(ctx_->GetPort()) : -1);
+      "SimBackend({}) created for engine {}: profile {}, bw {} GB/s latency {} ns segment {} ns "
+      "op {} ns time_scale {} notification {} port {}",
+      sim::BackendTypeName(type_), self_.key, profile_.source, profile_.bytesPerNs,
+      profile_.latency.count(), profile_.perSegment.count(), profile_.perOp.count(), timeScale_,
+      enableNotification_, ctx_ ? static_cast<int>(ctx_->GetPort()) : -1);
+  if (profile_.source == "built-in") {
+    MORI_IO_WARN(
+        "SimBackend({}) uses uncalibrated built-in timing; set MORI_IO_SIM_PROFILE to a measured "
+        "profile (python/mori/io/sim_profiles/)",
+        sim::BackendTypeName(type_));
+  }
 }
 
 SimBackend::~SimBackend() {

@@ -1,0 +1,30 @@
+# MORI-IO simulation profile (MORI_IO_SIM_PROFILE) for an MI355X node with one
+# AMD Pensando Pollara 400 NIC per GPU. The numbers belong to these GPU and NIC
+# generations and, for RDMA, to the QP and worker counts below; measure a new
+# profile for other hardware with tests/python/io/calibrate_sim.py.
+#
+# Measured 2026-10-28 on ROCm 7.2.0 (amdgpu 6.16.13), mori main 09aa23be with
+# ROCm/mori#867: GPU 0 -> GPU 1 batch writes between two processes, sizes 4 KiB
+# to 256 MiB and 1 to 1024 segments of 16 KiB, the mean of two hardware runs,
+# refined once against the simulator.
+
+- backend: rdma
+  bandwidth_gbps: 47.4
+  latency_us: 20
+  per_segment_ns: 255
+  per_op_us: 4.3
+  qp_per_transfer: 4  # sglang's mori connector defaults
+  num_worker_threads: 4
+  gpu: "AMD Instinct MI355X (gfx950, CDNA 4), OAM, PCIe Gen5 x16"
+  nic: "AMD Pensando Pollara 400 (POLLARA-1Q400P), 1x 400GbE RoCEv2, PCIe Gen5 x16, MTU 4096, firmware 1.117.5-a-45, ionic 25.11.1.001"
+  link: "GPU 0 -> its NUMA-local NIC -> switch -> another NIC -> GPU 1"
+  notes: "One transfer alone reaches about 25 GB/s; two or more in flight reach the full bandwidth."
+
+- backend: xgmi
+  bandwidth_gbps: 61.4
+  latency_us: 9
+  per_segment_ns: 19500  # one hipMemcpyPeerAsync per segment
+  per_op_us: 0
+  gpu: "AMD Instinct MI355X (gfx950, CDNA 4), OAM"
+  link: "xGMI full mesh of 8 GPUs, 16 lanes x 36 Gb/s = 72 GB/s per direction per GPU pair"
+  notes: "Scatter/gather kernel off (MORI_IO_XGMI_SCATTER_GATHER_THRESHOLD unset, the default)."

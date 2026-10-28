@@ -25,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -57,9 +58,18 @@ struct LinkProfile {
   std::chrono::nanoseconds latency{0};
   std::chrono::nanoseconds perSegment{0};
   std::chrono::nanoseconds perOp{0};  // link occupancy per transfer call
+  std::string source;                 // "built-in" or the profile file it came from
+  // The RDMA config a profile was measured with; -1 when the profile does not say.
+  int measuredQpPerTransfer{-1};
+  int measuredNumWorkerThreads{-1};
 };
 
+// Built-in guesses, then each file in MORI_IO_SIM_PROFILE (comma-separated, a later file
+// replaces an earlier one per backend), then the per-value MORI_IO_SIM_<BACKEND>_* variables.
 LinkProfile LoadLinkProfile(BackendType type);
+// The profile a backend of this type would get now, for tools: bw_gbps, latency_us,
+// per_segment_ns, per_op_us.
+std::map<std::string, double> ProfileValues(BackendType type);
 
 }  // namespace sim
 
@@ -90,6 +100,7 @@ class SimBackend : public Backend {
   ~SimBackend() override;
 
   BackendType Type() const { return type_; }
+  const sim::LinkProfile& Profile() const { return profile_; }
   std::optional<uint16_t> GetListenPort() const;
 
   void RegisterRemoteEngine(const EngineDesc&) override;

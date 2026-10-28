@@ -19,7 +19,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Fit the simulated backend's link profile (MORI_IO_SIM_<BACKEND>_*) to real hardware.
+"""Fit a MORI-IO simulation profile (MORI_IO_SIM_PROFILE) to real hardware.
 
 Times GPU-to-GPU batch writes between two engines in two processes, the way a
 prefill and a decode engine use MORI-IO, and fits
@@ -27,14 +27,23 @@ prefill and a decode engine use MORI-IO, and fits
     occupancy = segments * (segment_bytes / BW + per_segment) + per_op
     latency   = single-transfer time - occupancy
 
-Run it on hardware to get the profile, then with MORI_IO_SIM_ENABLE=1 and the
-printed variables plus --compare <hardware json> to check the simulation:
+The simulator adds host costs of its own (the Python call, thread wakeups), so
+the hardware fit is refined against a simulated run of the same sweep:
 
-    python calibrate_sim.py --backend rdma --json rdma.json
-    env MORI_IO_SIM_ENABLE=1 <printed vars> python calibrate_sim.py \
-        --backend rdma --compare rdma.json
+    # 1. on the hardware to profile
+    python calibrate_sim.py --backend rdma --json rdma_hw.json
+    # 2. anywhere, no GPU needed: simulate the fit, refine it, write the profile
+    MORI_IO_SIM_ENABLE=1 python calibrate_sim.py --backend rdma \
+        --compare rdma_hw.json --start-from-fit --profile-out rdma.yaml
+    # 3. check: the ratios to hardware should be close to 1
+    MORI_IO_SIM_ENABLE=1 MORI_IO_SIM_PROFILE=rdma.yaml python calibrate_sim.py \
+        --backend rdma --compare rdma_hw.json
+
+Each run of step 2 or 3 prints a refined profile; repeat while it still moves.
 """
 import argparse
+import datetime
+import glob
 import json
 import os
 import statistics
@@ -55,7 +64,7 @@ from mori.io import (
     RdmaBackendConfig,
     StatusCode,
 )
-from mori.cpp import io_sim_enabled
+from mori.cpp import io_sim_enabled, io_sim_profile
 
 KiB, MiB, GiB = 1 << 10, 1 << 20, 1 << 30
 FAKE_PTR = 0x7F0000000000
@@ -81,8 +90,19 @@ def parse_args():
     p.add_argument(
         "--compare", help="a --json file to compare these measurements against"
     )
+    p.add_argument(
+        "--start-from-fit",
+        action="store_true",
+        help="simulate with the --compare file's fit instead of the active profile",
+    )
+    p.add_argument(
+        "--profile-out", help="write the refined profile entry here (with --compare)"
+    )
     p.add_argument("--role", choices=("initiator", "target"), default="initiator")
-    return p.parse_args()
+    args = p.parse_args()
+    if (args.start_from_fit or args.profile_out) and not args.compare:
+        p.error("--start-from-fit and --profile-out need --compare")
+    return args
 
 
 def make_engine(args, key, gpu):
@@ -241,6 +261,54 @@ PARAMS = (  # fit key, env suffix, format
 )
 
 
+def read_sysfs(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
+
+def describe_hardware(args):
+    """What the numbers were measured on, since they change with each GPU and NIC generation."""
+    import torch
+
+    props = torch.cuda.get_device_properties(args.src_gpu)
+    hw = {
+        "gpu": f"{props.name} ({props.gcnArchName.split(':')[0]})",
+        "measured": f"{datetime.date.today()}, ROCm {torch.version.hip}",
+    }
+    if args.backend == "rdma":
+        nics = set()
+        for dev in glob.glob("/sys/class/infiniband/*"):
+            driver = os.path.basename(os.path.realpath(f"{dev}/device/driver"))
+            rate = read_sysfs(f"{dev}/ports/1/rate")
+            nics.add(f"{driver}, {rate}, firmware {read_sysfs(f'{dev}/fw_ver')}")
+        hw["nic"] = "; ".join(sorted(nics))
+    return hw
+
+
+def write_profile_entry(path, args, profile, hardware):
+    lines = [
+        f"- backend: {args.backend}",
+        f"  bandwidth_gbps: {profile['bw_gbps']:.2f}",
+        f"  latency_us: {profile['latency_us']:.2f}",
+        f"  per_segment_ns: {profile['per_segment_ns']:.1f}",
+        f"  per_op_us: {profile['per_op_us']:.2f}",
+    ]
+    if args.backend == "rdma":
+        lines += [
+            f"  qp_per_transfer: {args.qp}",
+            f"  num_worker_threads: {args.workers}",
+        ]
+    for key in ("gpu", "nic", "measured"):
+        if hardware.get(key):
+            lines.append(f'  {key}: "{hardware[key]}"')
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\nwrote {path}")
+
+
 def print_profile(title, backend, profile):
     print(f"\n{title}:")
     for key, suffix, fmt in PARAMS:
@@ -264,29 +332,31 @@ def compare(args, points, result, ref_path):
         return
     # The simulator adds its own host costs (Python calls, thread wakeups) on top of the
     # profile, so move each parameter by the gap between the two fits.
-    prefix = f"MORI_IO_SIM_{args.backend.upper()}_"
-    env = {}
-    for key, suffix, _ in PARAMS:
-        if prefix + suffix not in os.environ:
-            print(f"\nset all four {prefix}* variables to get a refined profile")
-            return
-        env[key] = float(os.environ[prefix + suffix])
+    active = io_sim_profile(getattr(BackendType, args.backend.upper()))
     target, got = ref["fit"], result
     refined = {
         "bw_gbps": 1.0
         / max(
-            1e-9, 1.0 / env["bw_gbps"] + 1.0 / target["bw_gbps"] - 1.0 / got["bw_gbps"]
+            1e-9,
+            1.0 / active["bw_gbps"] + 1.0 / target["bw_gbps"] - 1.0 / got["bw_gbps"],
         ),
     }
     for key in ("latency_us", "per_segment_ns", "per_op_us"):
-        refined[key] = max(0.0, env[key] + target[key] - got[key])
-    print_profile("refined profile (rerun with it to check)", args.backend, refined)
+        refined[key] = max(0.0, active[key] + target[key] - got[key])
+    print_profile("refined profile", args.backend, refined)
+    if args.profile_out:
+        write_profile_entry(args.profile_out, args, refined, ref.get("hardware", {}))
 
 
 def main():
     args = parse_args()
     if args.role == "target":
         return run_target(args)
+    if args.start_from_fit:
+        # Per-value variables beat any profile file; the target process inherits them.
+        fit_ = json.load(open(args.compare))["fit"]
+        for key, suffix, _ in PARAMS:
+            os.environ[f"MORI_IO_SIM_{args.backend.upper()}_{suffix}"] = str(fit_[key])
 
     cmd = [sys.executable, os.path.abspath(__file__), "--role", "target"]
     for flag in ("backend", "dst_gpu", "host", "buffer_mb", "qp", "workers"):
@@ -333,6 +403,7 @@ def main():
                         if k.startswith("MORI_IO_SIM")
                     },
                     "args": vars(args),
+                    "hardware": {} if mode == "sim" else describe_hardware(args),
                     "points": points,
                     "fit": result,
                 },

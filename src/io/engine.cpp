@@ -316,12 +316,27 @@ void IOEngine::CreateSimBackend(BackendType requested, const BackendConfig& beCo
     }
   }
 
-  bool enableNotification = true;
+  std::optional<RdmaBackendConfig> rdmaConfig;
   if (requested == BackendType::RDMA) {
-    enableNotification = ResolveRdmaBackendConfig(static_cast<const RdmaBackendConfig&>(beConfig))
-                             .enableNotification;
+    rdmaConfig = ResolveRdmaBackendConfig(static_cast<const RdmaBackendConfig&>(beConfig));
   }
+  bool enableNotification = rdmaConfig ? rdmaConfig->enableNotification : true;
   auto backend = std::make_unique<SimBackend>(type, desc, config, enableNotification);
+
+  // RDMA timing depends on the QP and worker counts, so a profile measured with other counts
+  // is only an approximation.
+  const sim::LinkProfile& profile = backend->Profile();
+  if (type == BackendType::RDMA && rdmaConfig &&
+      ((profile.measuredQpPerTransfer > 0 &&
+        profile.measuredQpPerTransfer != rdmaConfig->qpPerTransfer) ||
+       (profile.measuredNumWorkerThreads > 0 &&
+        profile.measuredNumWorkerThreads != rdmaConfig->numWorkerThreads))) {
+    MORI_IO_WARN(
+        "Simulated RDMA profile {} was measured with qp_per_transfer={} num_worker_threads={}, "
+        "this engine uses {} and {}",
+        profile.source, profile.measuredQpPerTransfer, profile.measuredNumWorkerThreads,
+        rdmaConfig->qpPerTransfer, rdmaConfig->numWorkerThreads);
+  }
 
   if (requested == BackendType::RDMA && type == BackendType::XGMI) {
     // Same engine desc as the XGMI-only fallback taken on a host without RDMA devices.

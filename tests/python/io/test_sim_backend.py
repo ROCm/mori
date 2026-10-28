@@ -24,6 +24,7 @@
 Memory pointers are fake and never dereferenced; control flow, timing and
 notifications are real.
 """
+import glob
 import os
 import subprocess
 import sys
@@ -31,6 +32,8 @@ import time
 
 import pytest
 
+import mori.io
+from mori.cpp import io_sim_profile
 from mori.io import (
     BackendType,
     EngineDesc,
@@ -105,8 +108,10 @@ def timed_wait(a, statuses, t0):
     return rc, (time.perf_counter() - t0) * 1e3
 
 
-def model_ms(nbytes, gbps, lat_us, segs=1, seg_ns=0.0):
-    return nbytes / (gbps * 1e9) * 1e3 + lat_us / 1e3 + segs * seg_ns / 1e6
+def model_ms(nbytes, gbps, lat_us, segs=1, seg_ns=0.0, op_us=0.0):
+    return (
+        nbytes / (gbps * 1e9) * 1e3 + lat_us / 1e3 + segs * seg_ns / 1e6 + op_us / 1e3
+    )
 
 
 def assert_close_ms(got, want, tol=0.25, slack_ms=1.5):
@@ -287,6 +292,85 @@ def test_peer_death_fails_transfers_and_reports():
     assert ev is not None and ev.remote_engine_key == edesc.key
     _, st = write(a, src, mdesc, [MiB])
     assert st.Failed()
+
+
+def use_profile(sim_env, tmp_path, *texts):
+    """Profile files in order, with the fixture's per-value variables cleared."""
+    for backend, profile in PROFILES.items():
+        for k in profile:
+            sim_env.delenv(f"MORI_IO_SIM_{backend}_{k}")
+    paths = []
+    for i, text in enumerate(texts):
+        paths.append(tmp_path / f"profile{i}.yaml")
+        paths[-1].write_text(text)
+    sim_env.setenv("MORI_IO_SIM_PROFILE", ",".join(map(str, paths)))
+
+
+def entry(backend, bw, lat=1, seg=0, op=0, extra=""):
+    return (
+        f"- backend: {backend}\n  bandwidth_gbps: {bw}\n  latency_us: {lat}\n"
+        f"  per_segment_ns: {seg}\n  per_op_us: {op}\n{extra}"
+    )
+
+
+def test_profile_file_sets_timing(sim_env, tmp_path):
+    use_profile(sim_env, tmp_path, entry("rdma", 20, lat=50, seg=1000, op=30))
+    assert io_sim_profile(BackendType.RDMA) == {
+        "bw_gbps": 20,
+        "latency_us": 50,
+        "per_segment_ns": 1000,
+        "per_op_us": 30,
+    }
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    t0 = time.perf_counter()
+    _, st = write(a, gpu_mem(a, 1 << 30), gpu_mem(b, 1 << 30), [MiB] * 64)
+    rc, ms = timed_wait(a, [st], t0)
+    assert rc == StatusCode.SUCCESS
+    assert_close_ms(ms, model_ms(64 * MiB, 20, 50, 64, 1000, 30))
+
+
+def test_profile_files_layer_and_variables_win(sim_env, tmp_path):
+    use_profile(
+        sim_env,
+        tmp_path,
+        entry("rdma", 20) + entry("xgmi", 30),
+        "# a later file replaces the rdma entry only\n" + entry("rdma", 40),
+    )
+    assert io_sim_profile(BackendType.RDMA)["bw_gbps"] == 40
+    assert io_sim_profile(BackendType.XGMI)["bw_gbps"] == 30
+    assert io_sim_profile(BackendType.TCP)["bw_gbps"] == 10  # built-in
+    sim_env.setenv("MORI_IO_SIM_RDMA_LATENCY_US", "7")
+    assert io_sim_profile(BackendType.RDMA)["latency_us"] == 7
+    assert io_sim_profile(BackendType.RDMA)["bw_gbps"] == 40
+
+
+@pytest.mark.parametrize(
+    "text, error",
+    [
+        ("- backend: rdma\n  bandwidth_gbps: 1\n", "missing latency_us"),
+        (entry("nvlink", 1), "backend must be rdma, tcp or xgmi"),
+        (entry("rdma", "fast"), "bandwidth_gbps must be a number"),
+        (entry("rdma", 0), "bandwidth must be positive"),
+        (entry("rdma", 1, extra="  per_op_ns: 3\n"), "unknown field 'per_op_ns'"),
+        (entry("rdma", 1) + entry("rdma", 2), "second entry for backend rdma"),
+    ],
+)
+def test_bad_profile_is_rejected(sim_env, tmp_path, text, error):
+    use_profile(sim_env, tmp_path, text)
+    with pytest.raises(RuntimeError, match=error):
+        make_engine("pf")
+
+
+def test_shipped_profiles_load(sim_env):
+    shipped = glob.glob(
+        os.path.join(os.path.dirname(mori.io.__file__), "sim_profiles", "*.yaml")
+    )
+    assert shipped
+    for path in shipped:
+        sim_env.setenv("MORI_IO_SIM_PROFILE", path)
+        for backend in (BackendType.RDMA, BackendType.TCP, BackendType.XGMI):
+            io_sim_profile(backend)  # parses and checks every entry
 
 
 if __name__ == "__main__" and "--target" in sys.argv:

@@ -10,6 +10,7 @@ MORI-IO is AMD's point-to-point communication library that leverages GDR (GPU Di
 - [Python API Quick Reference](#python-api-quick-reference)
 - [Example: Basic Read/Write](#example-basic-readwrite)
 - [Environment & Configuration](#environment--configuration)
+- [Simulation Mode](#simulation-mode)
 - [Profiling MORI-IO with ROCTX Markers](#profiling-mori-io-with-roctx-markers)
 - [Source Files](#source-files)
 
@@ -185,6 +186,49 @@ See `examples/io/example.py` for more complete examples including batch transfer
 UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see [`src/umbp/doc/runtime-env-vars.md`](https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md).
+
+## Simulation Mode
+
+With `MORI_IO_SIM_ENABLE=1`, MORI-IO runs without GPUs or NICs: `create_backend` builds a
+simulated RDMA, TCP or XGMI backend. Engines, routing, sessions, transfer status, a TCP
+control plane (remote memory check, notifications, peer failure) all run for real; no bytes
+move, and each transfer completes after a modelled delay. This lets a GPU-free simulator run
+real inference processes, for example sglang PD disaggregation, through their MORI-IO code.
+
+A transfer of `n` segments and `b` bytes holds its link for
+`b / bandwidth + n * per_segment + per_op` and completes `latency` after that. Each engine has
+one link per direction, and transfers queue on it in order.
+
+| Setting | Description |
+|---------|-------------|
+| `MORI_IO_SIM_ENABLE` | `1` to simulate. |
+| `MORI_IO_SIM_BACKEND` | `tcp` or `xgmi`: simulate an RDMA request as that backend. TCP exists only in simulation. |
+| `MORI_IO_SIM_PROFILE` | Timing profile file(s), comma-separated. A later file replaces an earlier one's entry for the same backend, so one GPU generation's XGMI entry can be paired with another NIC's RDMA entry. Without a profile, built-in uncalibrated guesses are used and a warning is logged. |
+| `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value of the profile. |
+| `MORI_IO_SIM_TIME_SCALE` | Divide every delay by this factor. |
+| `MORI_NODE_ID` | Node identity for XGMI's same-node check, to simulate several nodes on one host. |
+
+Profiles are flat YAML, one entry per backend, and say what they were measured on, since the
+numbers change with each GPU and NIC generation. Measured profiles ship in
+`mori/io/sim_profiles/` (for example `mi355x_pollara400.yaml`):
+
+```yaml
+- backend: rdma
+  bandwidth_gbps: 47.4
+  latency_us: 20
+  per_segment_ns: 255
+  per_op_us: 4.3
+  qp_per_transfer: 4        # the RDMA config it was measured with
+  num_worker_threads: 4
+  gpu: "AMD Instinct MI355X (gfx950, CDNA 4), OAM, PCIe Gen5 x16"
+  nic: "AMD Pensando Pollara 400 (POLLARA-1Q400P), 1x 400GbE RoCEv2, ..."
+```
+
+RDMA timing depends on the config, so an engine whose `qp_per_transfer` or
+`num_worker_threads` differ from the profile's logs a warning. To profile other hardware or
+another config, run `tests/python/io/calibrate_sim.py` on it; its docstring has the steps. The
+model does not cap a single transfer's bandwidth: without `enable_transfer_chunking`, one RDMA
+transfer alone reaches only about half the link, which the simulator does not reproduce.
 
 ## Profiling MORI-IO with ROCTX Markers
 
