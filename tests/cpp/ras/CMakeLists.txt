@@ -31,6 +31,18 @@ if(BUILD_IO)
   target_link_libraries(test_ras_engine_desc_compat PRIVATE mori_io)
   mori_ras_test(two_process)
   target_link_libraries(test_ras_two_process PRIVATE mori_io)
+
+  # MORI RAS beside RCCL RAS in one process. Built only where RCCL is installed.
+  find_library(MORI_RAS_RCCL_LIBRARY rccl HINTS ${ROCM_PATH}/lib)
+  find_path(MORI_RAS_RCCL_INCLUDE rccl/rccl.h HINTS ${ROCM_PATH}/include)
+  if(MORI_RAS_RCCL_LIBRARY AND MORI_RAS_RCCL_INCLUDE)
+    mori_ras_test(rccl_coexistence)
+    target_include_directories(test_ras_rccl_coexistence PRIVATE ${MORI_RAS_RCCL_INCLUDE})
+    target_link_libraries(test_ras_rccl_coexistence PRIVATE mori_io ${MORI_RAS_RCCL_LIBRARY}
+                                                            hip::host)
+  else()
+    message(STATUS "RCCL not found: test_ras_rccl_coexistence is not built")
+  endif()
 endif()
 
 # Coverage-guided fuzzing of the protocol decoder. Needs clang's libFuzzer, so it is opt-in;
