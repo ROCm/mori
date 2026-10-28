@@ -79,14 +79,14 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   // arbitrary per-peer local pointer (SDMA reads local VA directly).
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(pairs[myPe].dest);
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0,
+      devComm.sdma, npes, /*logS=*/0, pushGen,
       [=](int peer) {
+        auto [dstP, sigP] = PeerPtrs(localDst, arrived + myPe * kArrivedStride,
+                                     peer, myPe, stride4G);
         return ScatterPeer{true, chunkBytes,
                            reinterpret_cast<const uint8_t*>(pairs[peer].source),
-                           PeerPtr(localDst, peer, myPe, stride4G),
-                           PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
-      },
-      pushGen);
+                           dstP, sigP};
+      });
 
   // === Phase 2: wait until all npes senders (self-copy included) signalled. ===
   if (threadIdx.x < warpSize) {
