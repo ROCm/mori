@@ -449,7 +449,7 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
 
 bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
   // An equal part of the bytes per node that has GPUs, cut into one shard per
-  // GPU on it unless UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS gives a count.
+  // GPU on it.
   std::map<int, size_t> gpus_on_node;
   for (const auto& [device, node] : GpuNumaNodes()) ++gpus_on_node[node];
   if (gpus_on_node.empty()) {
@@ -463,11 +463,9 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
         bytes, gpus_on_node.size());
     return false;
   }
-  const size_t asked = RangedScratchShardsFromEnv();
 
   std::string layout;
   for (const auto& [node, gpus] : gpus_on_node) {
-    const size_t shards = asked > 0 ? asked : gpus;
     HostBufferOptions opts = base;
     opts.numa_node = node;
     opts.numa_bind_mode = NumaBindMode::kBind;
@@ -481,11 +479,11 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
         FreeRangedScratch();
         return false;
       }
-      arenas->push_back({handle.ptr, part, node, shards});
+      arenas->push_back({handle.ptr, part, node, gpus});
       ranged_scratch_handles_.push_back(handle);
     }
     layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
-              std::to_string(shards) + " x " + std::to_string((part / shards) >> 10) + " KiB";
+              std::to_string(gpus) + " x " + std::to_string((part / gpus) >> 10) + " KiB";
   }
   const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
