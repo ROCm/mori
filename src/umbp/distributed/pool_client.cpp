@@ -943,12 +943,13 @@ bool PoolClient::Init() {
     }
   }
 
+  auto backend_configs = EffectiveBackendConfigs(config_);
   std::unique_ptr<SimTransferEngine> sim_engine;
   if (config_.sim.enabled) {
-    const auto backends = EffectiveBackendConfigs(config_);
-    const bool unsupported = std::any_of(backends.begin(), backends.end(), [](const auto& backend) {
-      return backend.tier != TierType::DRAM && backend.tier != TierType::HBM;
-    });
+    const bool unsupported =
+        std::any_of(backend_configs.begin(), backend_configs.end(), [](const auto& backend) {
+          return backend.tier != TierType::DRAM && backend.tier != TierType::HBM;
+        });
     if (unsupported) {
       MORI_UMBP_ERROR("[UMBP sim] only DRAM/HBM storage is supported");
       initialized_.store(false);
@@ -1037,7 +1038,6 @@ bool PoolClient::Init() {
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
 
-  auto backend_configs = EffectiveBackendConfigs(config_);
   if (backend_configs.empty()) {
     MORI_UMBP_ERROR("[PoolClient] no backend instances configured");
     Shutdown();

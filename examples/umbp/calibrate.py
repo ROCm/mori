@@ -210,18 +210,6 @@ def main():
             row["outside_training_working_set"] = (
                 row["block_bytes"] * row["batch"] > max_bytes
             )
-        topology = {}
-        for cpu in cpus:
-            base = Path(f"/sys/devices/system/cpu/cpu{cpu}")
-            topology[cpu] = {
-                str(path.relative_to(base)): path.read_text().strip()
-                for path in [
-                    base / "topology/core_id",
-                    base / "topology/physical_package_id",
-                    base / "cache/index3/shared_cpu_list",
-                ]
-                if path.exists()
-            }
         report = {
             "profile_id": profile["id"],
             "profile_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
@@ -235,7 +223,6 @@ def main():
                 ),
                 "unknown",
             ),
-            "cpu_topology": topology,
             "probe_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
             "cpus": cpus,
             "threads": threads,

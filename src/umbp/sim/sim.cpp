@@ -200,19 +200,23 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
   if (id.empty() || paths.fields().empty() || profile.fields().size() != 2) {
     throw std::invalid_argument("UMBP sim profile requires id and nonempty paths only");
   }
+  std::vector<std::string> channels;
   for (const auto& [name, value] : paths.fields()) {
     const auto at = std::find(names.begin(), names.end(), name);
     if (at == names.end() || value.kind_case() != Value::kStructValue) {
       throw std::invalid_argument("UMBP sim profile: invalid path " + name);
     }
     const auto& object = value.struct_value();
-    Path path{Field(object, "channel", Value::kStringValue).string_value(),
-              Curve(object, "latency_ns", false), Curve(object, "bandwidth_bytes_per_second", true),
+    const auto& channel = Field(object, "channel", Value::kStringValue).string_value();
+    const size_t channel_id =
+        std::find(channels.begin(), channels.end(), channel) - channels.begin();
+    if (channel_id == channels.size()) channels.push_back(channel);
+    Path path{channel_id, Curve(object, "latency_ns", false),
+              Curve(object, "bandwidth_bytes_per_second", true),
               object.fields().count("copy_latency_ns") ? Curve(object, "copy_latency_ns", false)
                                                        : std::vector<double>{0},
               0};
-    if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") ||
-        path.channel.empty() ||
+    if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") || channel.empty() ||
         (name != "cpu_cpu" && (path.latency_ns.size() != 1 || path.bandwidth.size() != 1 ||
                                path.copy_latency_ns.size() != 1))) {
       throw std::invalid_argument("UMBP sim profile: invalid coefficients for " + name);
@@ -223,7 +227,6 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
                                : 1;
     path.capacity = *std::max_element(
         path.bandwidth.begin(), path.bandwidth.begin() + std::min(threads, path.bandwidth.size()));
-    available_.try_emplace(path.channel);
     paths_[at - names.begin()] = std::move(path);
   }
   if (bounce_bytes > 0 && (paths_[4] || paths_[5])) {
@@ -291,7 +294,7 @@ std::optional<SimTransferEngine::Clock::time_point> SimTransferEngine::Reserve(
     }
   }
   // Charge fixed latency once per path in this submit batch, independent of page fragmentation.
-  std::unordered_map<std::string, long double> service_ns;
+  std::array<long double, 6> service_ns{};
   long double private_ns = 0;
   for (size_t i = 0; i < bytes.size(); ++i) {
     if (bytes[i] == 0) continue;
@@ -309,33 +312,25 @@ std::optional<SimTransferEngine::Clock::time_point> SimTransferEngine::Reserve(
         std::max(private_ns, latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads));
     service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
   }
-  auto finish = submitted;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto now = submitted;
+  auto deadline = [](Clock::time_point start, long double ns) -> std::optional<Clock::time_point> {
     const auto remaining =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - now)
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - start)
             .count();
-    if (!std::isfinite(private_ns) || std::ceil(private_ns) >= remaining) return std::nullopt;
-    finish = now + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(private_ns)));
-    // Validate all deadlines before reserving any channel.
-    for (const auto& [channel, ns] : service_ns) {
-      const auto start = std::max(now, available_.at(channel));
-      const auto remaining =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - start)
-              .count();
-      if (!std::isfinite(ns) || std::ceil(ns) >= remaining) {
-        MORI_UMBP_ERROR("[UMBP sim] modeled transfer duration overflows clock");
-        return std::nullopt;
-      }
-    }
-    for (const auto& [channel, ns] : service_ns) {
-      auto& available = available_.at(channel);
-      available =
-          std::max(now, available) + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns)));
-      finish = std::max(finish, available);
-    }
+    if (!std::isfinite(ns) || std::ceil(ns) >= remaining) return std::nullopt;
+    return start + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns)));
+  };
+  auto finish = deadline(submitted, private_ns);
+  if (!finish) return std::nullopt;
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto next = available_;
+  for (size_t i = 0; i < service_ns.size(); ++i) {
+    if (service_ns[i] == 0) continue;
+    const auto end = deadline(std::max(submitted, next[i]), service_ns[i]);
+    if (!end) return std::nullopt;
+    next[i] = *end;
+    finish = std::max(*finish, *end);
   }
+  available_ = next;  // Commit only after every deadline has passed overflow validation.
   return finish;
 }
 

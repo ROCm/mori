@@ -78,15 +78,27 @@ class SimTest : public ::testing::Test {
     EXPECT_TRUE(backend->Init(&engine));
     return backend;
   }
+  uintptr_t Buffer(size_t bytes) {
+    std::vector<PageMemorySource::Buffer> buffers;
+    if (!memory_.Allocate({bytes}, &buffers)) throw std::bad_alloc();
+    return reinterpret_cast<uintptr_t>(buffers.front().base);
+  }
+  template <class Predicate>
+  bool Await(Predicate ready) {
+    const auto deadline = Clock::now() + 2s;
+    while (!ready()) {
+      if (Clock::now() >= deadline) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return true;
+  }
+  SimPageMemorySource memory_{MemLoc::CPU, -1};
   std::string dir_;
 };
 
 TEST_F(SimTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   auto config = Config();
-  SimPageMemorySource caller(MemLoc::CPU, -1);
-  std::vector<PageMemorySource::Buffer> buffers;
-  ASSERT_TRUE(caller.Allocate({8 * kPage}, &buffers));
-  const auto ptr = reinterpret_cast<uintptr_t>(buffers[0].base);
+  const auto ptr = Buffer(8 * kPage);
   auto client = CreateUMBPClient(config);
   ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage));
   EXPECT_TRUE(client->Put("scalar", ptr, 2 * kPage));
@@ -112,6 +124,8 @@ TEST_F(SimTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   EXPECT_EQ(client->BatchExists({"a", "scalar", "range"}), std::vector<bool>(3, false));
   client->DeregisterMemory(ptr);
   client->Close();
+  EXPECT_FALSE(client->Get("closed", ptr, kPage));
+  EXPECT_TRUE(client->Flush());
 
   std::ifstream trace(config.sim.trace_path);
   std::string line;
@@ -123,6 +137,10 @@ TEST_F(SimTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
     const auto& f = record.fields();
     EXPECT_EQ(f.at("call_id").number_value(), id++);
     EXPECT_FALSE(f.at("exception").bool_value());
+    if (f.at("api").string_value() == "get")
+      EXPECT_EQ(f.at("result_count").number_value(), f.at("bytes").number_value() == 2 * kPage);
+    if (f.at("api").string_value() == "close" || f.at("api").string_value() == "deregister_memory")
+      EXPECT_EQ(f.at("result_count").number_value(), -1);
     if (f.at("api").string_value() == "put") {
       saw_put = true;
       EXPECT_EQ(f.at("bytes").number_value(), 2 * kPage);
@@ -145,10 +163,7 @@ TEST_F(SimTest, HbmAndRegisteredGpuCallerNeedNoDevice) {
   config.distributed.emplace();
   config.distributed->medium = UMBPMedium::HBM;
   config.distributed->hbm.capacity_bytes = 32 * kPage;
-  SimPageMemorySource caller(MemLoc::GPU, 0);
-  std::vector<PageMemorySource::Buffer> buffers;
-  ASSERT_TRUE(caller.Allocate({4 * kPage}, &buffers));
-  const auto ptr = reinterpret_cast<uintptr_t>(buffers[0].base);
+  const auto ptr = Buffer(4 * kPage);
   auto client = CreateUMBPClient(config);
   ASSERT_TRUE(client->RegisterMemory(ptr, 4 * kPage, MemLoc::GPU, 0));
   EXPECT_TRUE(client->Put("gpu", ptr + kPage, kPage));
@@ -175,6 +190,18 @@ TEST_F(SimTest, BufferedTracePreservesEscapingAndIntegerPrecision) {
   EXPECT_EQ(record.fields().at("result_count").number_value(), -1);
   ASSERT_TRUE(std::getline(input, line));
   EXPECT_FALSE(std::getline(input, line));
+  EXPECT_THROW(
+      {
+        SimCall call(&trace, "get", 1, kPage);
+        throw std::runtime_error("test exception");
+      },
+      std::runtime_error);
+  trace.Write(id + 2, "flush", 0, 0, 0, 0, 1, false);
+  input.clear();
+  ASSERT_TRUE(std::getline(input, line));
+  ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(line, &record).ok());
+  EXPECT_TRUE(record.fields().at("exception").bool_value());
+  EXPECT_EQ(record.fields().at("result_count").number_value(), -1);
 }
 
 TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
@@ -184,12 +211,10 @@ TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
   constexpr size_t bytes = 1 << 20;
   if (LocalCopyThreads(4 * bytes, 4) < 4) GTEST_SKIP() << "requires four copy threads";
   SimTransferEngine engine(Config().sim.profile_path);
-  SimPageMemorySource memory(MemLoc::CPU, -1);
-  std::vector<PageMemorySource::Buffer> buffers;
-  ASSERT_TRUE(memory.Allocate({4 * bytes}, &buffers));
+  const auto ptr = Buffer(4 * bytes);
   std::vector<TransferItem> items;
   for (size_t i = 0; i < 4; ++i) {
-    auto ref = TransferRef::HostBytes(static_cast<char*>(buffers[0].base) + i * bytes, bytes);
+    auto ref = TransferRef::HostBytes(reinterpret_cast<void*>(ptr + i * bytes), bytes);
     items.push_back({ref, 0, ref, 0, bytes, i});
   }
   auto start = Clock::now();
@@ -221,7 +246,6 @@ TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
   config.page_size = bytes;
   config.dram.capacity_bytes = 8 * bytes;
   auto client = CreateUMBPClient(config);
-  const auto ptr = reinterpret_cast<uintptr_t>(buffers[0].base);
   ASSERT_TRUE(client->RegisterMemory(ptr, 4 * bytes));
   const std::vector<std::string> keys{"a", "b", "c", "d"};
   const std::vector<uintptr_t> ptrs{ptr, ptr + bytes, ptr + 2 * bytes, ptr + 3 * bytes};
@@ -272,11 +296,7 @@ TEST_F(SimTest, ReusesCapacityLruLeasesEventsAndProductionReaper) {
   ASSERT_EQ(pending.outcome, AllocateOutcome::kSuccessAllocated);
   EXPECT_FALSE(backend->Contains("uncommitted"));
   // No manual reaper call: the production Init must have started it.
-  const auto deadline = Clock::now() + 2s;
-  while (backend->Capacity().available_bytes != 3 * kPage && Clock::now() < deadline) {
-    std::this_thread::sleep_for(5ms);
-  }
-  EXPECT_EQ(backend->Capacity().available_bytes, 3 * kPage);
+  ASSERT_TRUE(Await([&] { return backend->Capacity().available_bytes == 3 * kPage; }));
   EXPECT_EQ(backend->Evict({"a"})[0].bytes_freed, kPage);
   EXPECT_EQ(backend->Capacity().available_bytes, 4 * kPage);
 }
@@ -353,10 +373,7 @@ TEST_F(SimTest, TierDemotionUsesVirtualBuffersAndSimEngine) {
   const auto start = Clock::now();
   EXPECT_EQ(pool.Evict({"move"}, PoolEvictMode::kReclaim).front().outcome,
             PoolEvictOutcome::kDemotionQueued);
-  while (registry.Get("hot")->Contains("move") && Clock::now() - start < 2s) {
-    std::this_thread::sleep_for(1ms);
-  }
-  EXPECT_FALSE(registry.Get("hot")->Contains("move"));
+  ASSERT_TRUE(Await([&] { return !registry.Get("hot")->Contains("move"); }));
   EXPECT_TRUE(registry.Get("cold")->Contains("move"));
   EXPECT_GE(Clock::now() - start, 10ms);
 }
@@ -428,13 +445,11 @@ TEST_F(SimTest, RemotePlansPreservePeerIdentityAndAsynchronousCompletion) {
   SimTransferEngine second(Config().sim.profile_path, "second");
   ASSERT_TRUE(caller.EnsureRemoteEngine("first", Packed(first)));
   ASSERT_TRUE(caller.EnsureRemoteEngine("second", Packed(second)));
-  SimPageMemorySource memory(MemLoc::CPU, -1);
-  std::vector<PageMemorySource::Buffer> buffers;
-  ASSERT_TRUE(memory.Allocate({4 * kPage}, &buffers));
-  auto local = caller.RegisterMemory(buffers[0].base, 4 * kPage, MemLoc::CPU, -1);
+  auto* buffer = reinterpret_cast<void*>(Buffer(4 * kPage));
+  auto local = caller.RegisterMemory(buffer, 4 * kPage, MemLoc::CPU, -1);
   // Deliberately equal virtual addresses and memory IDs on different peers.
-  auto a = TransferRef::Remote(first.RegisterMemory(buffers[0].base, kPage, MemLoc::CPU, -1).mem);
-  auto b = TransferRef::Remote(second.RegisterMemory(buffers[0].base, kPage, MemLoc::CPU, -1).mem);
+  auto a = TransferRef::Remote(first.RegisterMemory(buffer, kPage, MemLoc::CPU, -1).mem);
+  auto b = TransferRef::Remote(second.RegisterMemory(buffer, kPage, MemLoc::CPU, -1).mem);
   auto plans = caller.Plan({{a, 0, local, 0, kPage, 0}, {b, 0, local, kPage, kPage, 1}});
   ASSERT_EQ(plans.plans.size(), 2u);
   EXPECT_NE(plans.plans[0].src.mem.engineKey, plans.plans[1].src.mem.engineKey);
@@ -454,7 +469,7 @@ TEST_F(SimTest, RemotePlansPreservePeerIdentityAndAsynchronousCompletion) {
   EXPECT_FALSE(caller.CanHandle(a, b));
   EXPECT_EQ(caller.Plan({{local, 0, a, kPage, 1, 0}}).rejected_tags.size(), 1u);
 
-  auto unregistered = TransferRef::HostBytes(buffers[0].base, 4 * kPage);
+  auto unregistered = TransferRef::HostBytes(buffer, 4 * kPage);
   auto staged = caller.Plan({{unregistered, 0, a, 0, kPage, 0}});
   ASSERT_EQ(staged.plans.size(), 1u);
   EXPECT_TRUE(staged.plans[0].uses_bounce);
@@ -491,8 +506,7 @@ class SimClusterTest : public SimTest {
     thread_ = std::thread([this] { master_->Run(); });
     for (int i = 0; i < 200 && master_->GetBoundPort() == 0; ++i) std::this_thread::sleep_for(5ms);
     ASSERT_NE(master_->GetBoundPort(), 0);
-    ASSERT_TRUE(memory_.Allocate({64 * kPage}, &buffers_));
-    ptr_ = reinterpret_cast<uintptr_t>(buffers_[0].base);
+    ptr_ = Buffer(64 * kPage);
   }
   void TearDown() override {
     master_->Shutdown();
@@ -529,17 +543,6 @@ class SimClusterTest : public SimTest {
     EXPECT_TRUE(client->RegisterMemory(reinterpret_cast<void*>(ptr_), 64 * kPage));
     return client;
   }
-  template <class Predicate>
-  bool Await(Predicate ready) {
-    const auto deadline = Clock::now() + 2s;
-    while (!ready()) {
-      if (Clock::now() >= deadline) return false;
-      std::this_thread::sleep_for(1ms);
-    }
-    return true;
-  }
-  SimPageMemorySource memory_{MemLoc::CPU, -1};
-  std::vector<PageMemorySource::Buffer> buffers_;
   uintptr_t ptr_ = 0;
   std::unique_ptr<MasterServer> master_;
   std::thread thread_;
@@ -597,9 +600,7 @@ TEST_F(SimClusterTest, RemoteRecacheAndEvictionKeepRealMetadata) {
   ASSERT_TRUE(Await([&] { return reader->Exists("cached"); }));
   ASSERT_TRUE(reader->Get("cached", payload, kPage));
   auto* backend = reader->Backends().Get(TierType::DRAM);
-  auto deadline = Clock::now() + 2s;
-  while (!backend->Contains("cached") && Clock::now() < deadline) std::this_thread::sleep_for(1ms);
-  ASSERT_TRUE(backend->Contains("cached"));
+  ASSERT_TRUE(Await([&] { return backend->Contains("cached"); }));
   EXPECT_EQ(owner->Backends().Get(TierType::DRAM)->Evict({"evicted"}).front().bytes_freed, kPage);
   owner->Master().FlushHeartbeat();
   EXPECT_FALSE(reader->Get("evicted", payload, kPage));
@@ -679,12 +680,9 @@ TEST_F(SimTest, BounceCopiesUseSerialCpuBandwidth) {
   SimTransferEngine caller(Config().sim.profile_path, "caller", bytes);
   SimTransferEngine owner(Config().sim.profile_path, "owner");
   ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
-  SimPageMemorySource memory(MemLoc::CPU, -1);
-  std::vector<PageMemorySource::Buffer> buffers;
-  ASSERT_TRUE(memory.Allocate({bytes}, &buffers));
-  auto local = TransferRef::HostBytes(buffers[0].base, bytes);
-  auto remote =
-      TransferRef::Remote(owner.RegisterMemory(buffers[0].base, bytes, MemLoc::CPU, -1).mem);
+  auto* buffer = reinterpret_cast<void*>(Buffer(bytes));
+  auto local = TransferRef::HostBytes(buffer, bytes);
+  auto remote = TransferRef::Remote(owner.RegisterMemory(buffer, bytes, MemLoc::CPU, -1).mem);
   std::vector<TransferItem> items;
   for (size_t i = 0; i < 4; ++i)
     items.push_back({local, i * bytes / 4, remote, i * bytes / 4, bytes / 4, i});

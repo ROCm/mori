@@ -66,10 +66,11 @@ SimCall::~SimCall() {
   const auto end = std::chrono::steady_clock::now();
   using Ns = std::chrono::nanoseconds;
   try {
+    const bool exception = std::uncaught_exceptions() > exceptions_;
     trace_->Write(id_, api_, keys_, bytes_,
                   std::chrono::duration_cast<Ns>(start_.time_since_epoch()).count(),
-                  std::chrono::duration_cast<Ns>(end - start_).count(), result_count_,
-                  std::uncaught_exceptions() > exceptions_);
+                  std::chrono::duration_cast<Ns>(end - start_).count(),
+                  exception ? -1 : result_count_, exception);
   } catch (const std::exception& e) {
     MORI_UMBP_ERROR("{}", e.what());
   }

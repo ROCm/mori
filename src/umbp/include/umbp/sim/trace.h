@@ -51,8 +51,8 @@ class SimTrace {
 class SimCall {
  public:
   template <typename Sizes>
-  SimCall(SimTrace* trace, const char* api, size_t keys, const Sizes& sizes)
-      : trace_(trace), api_(api), keys_(keys) {
+  SimCall(SimTrace* trace, const char* api, size_t keys, const Sizes& sizes, int64_t result = 0)
+      : trace_(trace), api_(api), keys_(keys), result_count_(result) {
     if (trace_) {
       start_ = std::chrono::steady_clock::now();
       id_ = trace_->next_id.fetch_add(1, std::memory_order_relaxed);
@@ -61,11 +61,8 @@ class SimCall {
     }
   }
   ~SimCall();
-  bool Result(bool result) {
-    result_count_ = result;
-    return result;
-  }
-  size_t Result(size_t result) {
+  template <typename T>
+  T Result(T result) {
     result_count_ = result;
     return result;
   }
@@ -86,7 +83,7 @@ class SimCall {
   const char* api_;
   size_t keys_;
   uint64_t bytes_ = 0, id_ = 0;
-  int64_t result_count_ = -1;  // void API or no result (exception)
+  int64_t result_count_;  // Defaults to failure (0); void APIs pass -1.
   int exceptions_ = 0;
   std::chrono::steady_clock::time_point start_;
 };

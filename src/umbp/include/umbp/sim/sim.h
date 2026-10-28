@@ -82,7 +82,7 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
  private:
   using Clock = std::chrono::steady_clock;
   struct Path {
-    std::string channel;
+    size_t channel;
     // Scalars in old profiles become one-element curves; index = threads - 1.
     std::vector<double> latency_ns;
     std::vector<double> bandwidth;
@@ -94,7 +94,7 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
   // Four local memory paths, remote_read, remote_write; channels may be shared.
   std::array<std::optional<Path>, 6> paths_;
   std::mutex mutex_;
-  std::unordered_map<std::string, Clock::time_point> available_;
+  std::array<Clock::time_point, 6> available_{};
   std::string engine_key_;
   std::atomic<uint32_t> next_memory_id_{1};
   struct RemoteNode {
