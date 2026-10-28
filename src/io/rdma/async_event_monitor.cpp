@@ -26,6 +26,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +44,7 @@ namespace {
 // back to epoll, so a single busy context can neither starve the others nor the
 // shutdown wake fd. Level-triggered epoll re-reports any remainder.
 constexpr int kFairnessCap = 32;
+constexpr uint64_t kInjectedTag = uint64_t{1} << 63;
 
 enum class Severity { kInfo, kWarn, kError };
 enum class Category { kPort, kQp, kCq, kSrq, kDevice, kOther };
@@ -128,7 +130,7 @@ std::optional<PeerFailureClass> ClassifyPeerFailure(ibv_event_type type) {
 class AsyncEventAckGuard {
  public:
   explicit AsyncEventAckGuard(ibv_async_event* event) noexcept : event_(event) {}
-  ~AsyncEventAckGuard() { ibv_ack_async_event(event_); }
+  ~AsyncEventAckGuard() { Verbs().AckAsyncEvent(event_); }
 
   AsyncEventAckGuard(const AsyncEventAckGuard&) = delete;
   AsyncEventAckGuard& operator=(const AsyncEventAckGuard&) = delete;
@@ -222,6 +224,15 @@ bool RdmaAsyncEventMonitor::Start(const application::RdmaDeviceList& devices) {
       return false;
     }
     watches_[i].registered = true;
+    watches_[i].injectedFd = Verbs().WatchAsyncContext(watches_[i].context);
+    if (watches_[i].injectedFd >= 0) {
+      ev.data.u64 |= kInjectedTag;
+      if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, watches_[i].injectedFd, &ev) < 0) {
+        SafeLog(spdlog::level::err, "RDMA async monitor: epoll_ctl(injected) failed: {}",
+                std::strerror(errno));
+        return false;
+      }
+    }
   }
 
   thread_ = std::thread([this] { MainLoop(); });
@@ -232,7 +243,14 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
   constexpr int kMaxEvents = 16;
   epoll_event events[kMaxEvents];
   while (!stopRequested_.load(std::memory_order_acquire)) {
-    int n = epoll_wait(epollFd_, events, kMaxEvents, -1);
+    int timeout = -1;
+    if (HasDownPorts()) {
+      const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            nextRecheck_ - std::chrono::steady_clock::now())
+                            .count();
+      timeout = static_cast<int>(std::max<int64_t>(0, left));
+    }
+    int n = epoll_wait(epollFd_, events, kMaxEvents, timeout);
     if (n < 0) {
       if (errno == EINTR) continue;
       SafeLog(spdlog::level::err, "RDMA async monitor: epoll_wait failed: {}; stopping",
@@ -247,7 +265,7 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
         continue;
       }
 
-      Watch& watch = watches_[id - 1];
+      Watch& watch = watches_[(id & ~kInjectedTag) - 1];
       if (!watch.registered) continue;
 
       bool terminal = (events[i].events & (EPOLLERR | EPOLLHUP)) != 0;
@@ -266,6 +284,8 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
       if (terminal && watch.registered && drained) RemoveWatch(watch);
     }
 
+    if (HasDownPorts() && std::chrono::steady_clock::now() >= nextRecheck_) RecheckPorts();
+
     bool anyRegistered = false;
     for (const Watch& watch : watches_) {
       if (watch.registered) {
@@ -273,7 +293,7 @@ void RdmaAsyncEventMonitor::MainLoop() noexcept {
         break;
       }
     }
-    if (!anyRegistered) {
+    if (!anyRegistered && !HasDownPorts()) {
       SafeLog(spdlog::level::err, "RDMA async monitor: all async fds removed; stopping");
       return;
     }
@@ -325,8 +345,7 @@ RdmaAsyncEventMonitor::GetResult RdmaAsyncEventMonitor::ProcessOneEvent(Watch& w
   return GetResult::kEvent;
 }
 
-void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
-                                                 const EventInfo& info) noexcept {
+void RdmaAsyncEventMonitor::ReportTransportEvent(Watch& watch, const EventInfo& info) noexcept {
   if (!onPeerFailure_) return;
 
   const bool portScoped = DescribeAsyncEvent(info.type).category == Category::kPort;
@@ -347,6 +366,8 @@ void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
       report.event.deviceName = watch.deviceName;
       report.event.portNum = portNum;
       onPeerFailure_(report);
+      auto& down = watch.downPorts;
+      down.erase(std::remove(down.begin(), down.end(), portNum), down.end());
       return;
     }
 
@@ -361,6 +382,12 @@ void RdmaAsyncEventMonitor::ReportTransportEvent(const Watch& watch,
       return;
     }
 
+    if (info.type == IBV_EVENT_PORT_ERR && std::find(watch.downPorts.begin(), watch.downPorts.end(),
+                                                     portNum) == watch.downPorts.end()) {
+      if (!HasDownPorts())
+        nextRecheck_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      watch.downPorts.push_back(static_cast<uint8_t>(portNum));
+    }
     EventDescriptor desc = DescribeAsyncEvent(info.type);
     PeerFailureReport report;
     report.scope = failure->scope;
@@ -443,7 +470,7 @@ void RdmaAsyncEventMonitor::DescribeAndLog(const Watch& watch, const EventInfo& 
         int off = std::snprintf(detail, sizeof(detail), " port=%d", info.portNum);
         if (desc.queryPort && off > 0) {
           ibv_port_attr attr{};
-          int qret = ibv_query_port(watch.context, static_cast<uint8_t>(info.portNum), &attr);
+          int qret = Verbs().QueryPort(watch.context, static_cast<uint8_t>(info.portNum), &attr);
           if (qret == 0) {
             std::snprintf(detail + off, sizeof(detail) - off,
                           " state=%d phys_state=%d link_layer=%d lid=%u active_speed=%u"
@@ -484,6 +511,34 @@ void RdmaAsyncEventMonitor::DescribeAndLog(const Watch& watch, const EventInfo& 
           watch.asyncFd, detail);
 }
 
+bool RdmaAsyncEventMonitor::HasDownPorts() const noexcept {
+  for (const Watch& watch : watches_) {
+    if (!watch.downPorts.empty()) return true;
+  }
+  return false;
+}
+
+void RdmaAsyncEventMonitor::RecheckPorts() noexcept {
+  for (Watch& watch : watches_) {
+    // A successful recovery erases this port in ReportTransportEvent.
+    for (size_t i = 0; i < watch.downPorts.size();) {
+      uint8_t port = watch.downPorts[i];
+      ibv_port_attr attr{};
+      if (Verbs().QueryPort(watch.context, port, &attr) == 0 && attr.state == IBV_PORT_ACTIVE) {
+        SafeLog(
+            spdlog::level::warn,
+            "RDMA async monitor: PORT_ACTIVE not received; dev={} port={} found ACTIVE by recheck",
+            watch.deviceName, port);
+        const size_t before = watch.downPorts.size();
+        ReportTransportEvent(watch, EventInfo{IBV_EVENT_PORT_ACTIVE, nullptr, 0, 0, port});
+        if (watch.downPorts.size() < before) continue;
+      }
+      ++i;
+    }
+  }
+  nextRecheck_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+}
+
 void RdmaAsyncEventMonitor::RestoreWatchFd(Watch& watch) noexcept {
   if (!watch.changedFdFlags) return;
   int ret;
@@ -502,6 +557,11 @@ void RdmaAsyncEventMonitor::RemoveWatch(Watch& watch) noexcept {
   if (!watch.registered) return;
   epoll_ctl(epollFd_, EPOLL_CTL_DEL, watch.asyncFd, nullptr);
   watch.registered = false;
+  if (watch.injectedFd >= 0) {
+    epoll_ctl(epollFd_, EPOLL_CTL_DEL, watch.injectedFd, nullptr);
+    Verbs().UnwatchAsyncContext(watch.context);
+    watch.injectedFd = -1;
+  }
   RestoreWatchFd(watch);
 }
 
@@ -524,6 +584,13 @@ void RdmaAsyncEventMonitor::Shutdown() noexcept {
       }
     }
     thread_.join();
+  }
+  for (Watch& watch : watches_) {
+    if (watch.injectedFd >= 0) {
+      if (epollFd_ >= 0) epoll_ctl(epollFd_, EPOLL_CTL_DEL, watch.injectedFd, nullptr);
+      Verbs().UnwatchAsyncContext(watch.context);
+      watch.injectedFd = -1;
+    }
   }
   RestoreFdFlags();
   if (epollFd_ >= 0) {

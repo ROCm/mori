@@ -927,8 +927,26 @@ bool SocketBootstrapNetwork::SendMessage(int peer, int tag, const void* data, si
     return false;
   }
 
-  if (!ConnectSocket(sock, peer_addresses_[peer])) {
-    return false;
+  // Retry ConnectSocket with back-off bounded by the shared bootstrap
+  // timeout budget, matching the ring-connect retry pattern above.
+  {
+    constexpr int kRetryDelayMs = 200;
+    const int kMaxRetries = std::max(1, BootstrapTimeoutMs() / kRetryDelayMs);
+    bool connected = false;
+    for (int retry = 0; retry < kMaxRetries; retry++) {
+      if (ConnectSocket(sock, peer_addresses_[peer])) {
+        connected = true;
+        break;
+      }
+      CloseSocket(sock);
+      if (retry + 1 < kMaxRetries) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
+      }
+      if (!InitializeSocket(sock)) return false;
+      MORI_APP_TRACE("SendMessage: rank {} retrying connect to peer {} ({}/{})", localRank, peer,
+                     retry + 1, kMaxRetries);
+    }
+    if (!connected) return false;
   }
 
   // Send header: rank, tag, size

@@ -29,6 +29,7 @@
 #include <limits>
 #include <map>
 #include <msgpack.hpp>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -129,6 +130,7 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig owne
                       ownership.prefault, ownership.numa_strict, ownership.prefault_threads}),
                   ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval) {
   buffer_numa_nodes_ = NormalizeNumaNodes(std::move(ownership.numa_nodes));
+  max_mr_bytes_ = ownership.max_mr_bytes;
 }
 
 PageBackend::PageBackend(TierType tier, uint64_t page_size,
@@ -212,6 +214,15 @@ void PageBackend::BuildBufferRefs() {
   }
 }
 
+// Whole backing pages, so every region starts on one and spans exactly
+// size / backing_page_size NIC page entries; whole allocator pages, so no page
+// straddles two registrations.  A limit below one such unit still gets one.
+uint64_t PageBackend::RegionBytes(uint64_t backing_page_size) const {
+  if (max_mr_bytes_ == 0 || backing_page_size == 0) return 0;
+  const uint64_t unit = std::lcm(backing_page_size, page_size_);
+  return std::max(unit, max_mr_bytes_ / unit * unit);
+}
+
 // ---------------------------------------------------------------------------
 //  MediumBackend — identity + ownership
 // ---------------------------------------------------------------------------
@@ -244,25 +255,45 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
   cfg.buffer_descs.reserve(buffers.size());
   cfg.buffer_bases.reserve(buffers.size());
 
-  for (const auto& buffer : buffers) {
-    std::vector<uint8_t> desc_bytes;
-    if (registrar != nullptr) {
-      // The backend supplies the facts a descriptor cannot recover — location
-      // type and device — because the backend is the allocator (design doc §6).
-      // They come from the source, which is the thing that actually knows.
-      TransferRef ref = registrar->RegisterMemory(buffer.base, buffer.size, loc, device);
-      owned_refs_.push_back(ref);
-      if (ref.HasMemoryDesc()) {
-        msgpack::sbuffer sbuf;
-        msgpack::pack(sbuf, ref.mem);
-        desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
-      }
+  // A buffer above max_mr_bytes_ is registered as several regions, each its
+  // own allocator buffer on the same NUMA node.
+  std::vector<int> region_numa_nodes;
+  for (size_t b = 0; b < buffers.size(); ++b) {
+    const auto& buffer = buffers[b];
+    const uint64_t region_size = RegionBytes(buffer.backing_page_size);
+    const uint64_t step = region_size == 0 ? buffer.size : region_size;
+    if (step < buffer.size) {
+      MORI_UMBP_INFO(
+          "[PageBackend] Init: buffer {} ({} bytes of {}-byte pages) registered as {} regions of "
+          "at most {} bytes (UMBP_DRAM_MAX_MR_BYTES={})",
+          b, buffer.size, buffer.backing_page_size, (buffer.size + step - 1) / step, step,
+          max_mr_bytes_);
     }
+    for (uint64_t offset = 0; offset < buffer.size; offset += step) {
+      const uint64_t size = std::min(step, buffer.size - offset);
+      if (offset > 0 && size < page_size_) break;  // slack no page can use
+      void* base = static_cast<char*>(buffer.base) + offset;
+      std::vector<uint8_t> desc_bytes;
+      if (registrar != nullptr) {
+        // The backend supplies the facts a descriptor cannot recover — location
+        // type and device — because the backend is the allocator (design doc §6).
+        // They come from the source, which is the thing that actually knows.
+        TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
+        owned_refs_.push_back(ref);
+        if (ref.HasMemoryDesc()) {
+          msgpack::sbuffer sbuf;
+          msgpack::pack(sbuf, ref.mem);
+          desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
+        }
+      }
 
-    cfg.buffer_sizes.push_back(buffer.size);
-    cfg.buffer_descs.push_back(std::move(desc_bytes));
-    cfg.buffer_bases.push_back(buffer.base);
+      cfg.buffer_sizes.push_back(size);
+      cfg.buffer_descs.push_back(std::move(desc_bytes));
+      cfg.buffer_bases.push_back(base);
+      if (b < buffer_numa_nodes_.size()) region_numa_nodes.push_back(buffer_numa_nodes_[b]);
+    }
   }
+  if (!buffer_numa_nodes_.empty()) buffer_numa_nodes_ = std::move(region_numa_nodes);
 
   const size_t buffer_count = cfg.buffer_sizes.size();
   InstallTierConfig(std::move(cfg));
@@ -347,7 +378,7 @@ bool HostPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vec
       return false;
     }
     // mapped_size, not the request: hugepage rounding makes the extra usable.
-    staged.push_back(Buffer{handle.ptr, handle.mapped_size});
+    staged.push_back(Buffer{handle.ptr, handle.mapped_size, handle.actual_alignment});
     if (!nodes.empty() || opts_.prefault) LogNumaPlacement(i, handle, !nodes.empty());
   }
 
@@ -406,9 +437,16 @@ AllocateResult PageBackend::AllocateLocked(const std::string& key, uint64_t size
   if (!allocator_) return fail(AllocateOutcome::kFailed, "NOT_CONFIGURED");
   std::optional<size_t> preferred_buffer;
   if (preferred_numa_node >= 0) {
-    const auto it =
-        std::find(buffer_numa_nodes_.begin(), buffer_numa_nodes_.end(), preferred_numa_node);
-    if (it != buffer_numa_nodes_.end()) preferred_buffer = it - buffer_numa_nodes_.begin();
+    // A node's memory can span several buffers (one per NIC registration).
+    // Prefer the first that holds the whole request, else the node's first.
+    for (size_t i = 0; i < buffer_numa_nodes_.size(); ++i) {
+      if (buffer_numa_nodes_[i] != preferred_numa_node) continue;
+      if (!preferred_buffer) preferred_buffer = i;
+      if (allocator_->BufferFreePages(i) >= num_pages) {
+        preferred_buffer = i;
+        break;
+      }
+    }
   }
   auto pages = allocator_->Allocate(num_pages, preferred_buffer);
   if (!pages) return fail(AllocateOutcome::kFailedNoSpace, "NO_SPACE");

@@ -19,12 +19,9 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
-#include <arpa/inet.h>
 #include <fcntl.h>
 #include <hip/hip_runtime_api.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -143,48 +140,17 @@ bool WaitInboundStatusWithTimeout(IOEngine* engine, const EngineKey& remoteKey, 
   return false;
 }
 
-int GetFreePort() {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
-
-  int opt = 1;
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = 0;
-  addr.sin_addr.s_addr = INADDR_ANY;
-
-  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  socklen_t len = sizeof(addr);
-  if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  int port = ntohs(addr.sin_port);
-
-  close(fd);
-  return port;
-}
-
 ConnectedEnginePair CreateConnectedRdmaPair(const std::string& prefix, bool enableNotification) {
   if (!RdmaBackend::HasActiveDevices()) {
     throw TestSkip("requires at least one active RDMA device");
   }
 
+  // Port 0 lets each backend bind its own ephemeral port. A port probed up front
+  // is only free until CreateBackend binds it, and two probes can return the same one.
   IOEngineConfig cfg;
   cfg.host = "127.0.0.1";
-  cfg.port = GetFreePort();
-  Require(cfg.port > 0, "failed to allocate free tcp port for initiator");
+  cfg.port = 0;
   auto initiator = std::make_unique<IOEngine>(prefix + "_initiator", cfg);
-
-  cfg.port = GetFreePort();
-  Require(cfg.port > 0, "failed to allocate free tcp port for target");
   auto target = std::make_unique<IOEngine>(prefix + "_target", cfg);
 
   RdmaBackendConfig rdmaCfg{};

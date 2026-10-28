@@ -84,6 +84,11 @@ void PeerFailureTracker::Report(const PeerFailureReport& report) {
   Enqueue(std::move(event));
 }
 
+void PeerFailureTracker::MarkQpFailed(const QpKey& qp) {
+  std::lock_guard<std::mutex> lock(mu_);
+  erroredQps_.insert(qp);
+}
+
 bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
   if (out == nullptr) return false;
   std::lock_guard<std::mutex> lock(mu_);
@@ -95,20 +100,30 @@ bool PeerFailureTracker::Pop(PeerFailureEvent* out) {
 
 bool PeerFailureTracker::IsQpAlive(const QpKey& qp) const {
   std::lock_guard<std::mutex> lock(mu_);
-  if (failedQps_.count(qp) != 0) return false;
+  if (NeedsQpReplacementLocked(qp)) return false;
+  auto it = qpOwners_.find(qp);
+  return it == qpOwners_.end() ||
+         failedPorts_.count(PortKey{qp.deviceName, it->second.portNum}) == 0;
+}
+
+bool PeerFailureTracker::NeedsQpReplacement(const QpKey& qp) const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return NeedsQpReplacementLocked(qp);
+}
+
+bool PeerFailureTracker::NeedsQpReplacementLocked(const QpKey& qp) const {
+  if (failedQps_.count(qp) != 0 || erroredQps_.count(qp) != 0) return true;
   // Device-wide, so it applies whether or not this QP was ever registered.
-  if (failedDevices_.count(qp.deviceName) != 0) return false;
+  if (failedDevices_.count(qp.deviceName) != 0) return true;
 
   // An unregistered QP has no port or CQ, so nothing else here can condemn it.
   auto it = qpOwners_.find(qp);
-  if (it == qpOwners_.end()) return true;
-
-  if (failedPorts_.count(PortKey{qp.deviceName, it->second.portNum}) != 0) return false;
+  if (it == qpOwners_.end()) return false;
   if (it->second.cqHandle != nullptr &&
       failedCqs_.count(CqKey{qp.deviceName, it->second.cqHandle}) != 0) {
-    return false;
+    return true;
   }
-  return true;
+  return false;
 }
 
 uint64_t PeerFailureTracker::Dropped() const {
