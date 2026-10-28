@@ -1147,10 +1147,6 @@ class EpDispatchCombineOp:
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)
         self.dest_pe_counter.zero_()
-        # tokoff-ext keeps the slot allocator outside the arena (gfx1250).
-        tokoff_ext = getattr(self, "_tokoff_ext", None)
-        if tokoff_ext is not None:
-            tokoff_ext.zero()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
         getattr(self, "_recv_ctr", self.total_recv).zero_()

@@ -56,19 +56,14 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 
 ## gfx125x dispatch: slot reservation
 
-Where the slot allocator word lives in the cco window, which is the default, the
-blocks of a rank reserve their slots together: each block adds its token count for
+The slot allocator word lives in the cco window, and the blocks of a rank
+reserve their slots together: each block adds its token count for
 every destination, this rank included, into the rank's total for it, and the last
 block to arrive reserves the total with one RMW on that destination's word and
 publishes the first slot to the others. In the window the RMWs on one word
 serialize, so a rank makes one per destination per call instead of one per block.
 The blocks meet in a few hundred bytes of a `__device__` array in the dispatch
 kernel's own module, so neither the arena nor the caller allocates anything for it.
-
-`MORI_EP_TOKOFF_EXT=1` (default off) moves the word of a single-host EP into a separate
-allocation (`TokOffExt` in `hip_backend.py`), and there every block reserves its
-own slots. An EP spanning hosts always keeps the word in the window, since its
-ranks cannot open each other's hipIpc handles.
 
 A call small enough to give every block at most 8 warp work units (512 tokens on
 the default 64 × 16 geometry at top-k 6) is spread over all the blocks instead of

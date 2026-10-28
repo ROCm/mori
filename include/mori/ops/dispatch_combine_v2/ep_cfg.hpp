@@ -151,9 +151,8 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
-  // MORI_EP_TOKOFF_EXT only: [worldSize] pointers, entry p = PE p's dispatch slot
-  // allocator word in hipExtMallocWithFlags(Uncached) memory shared by IPC handle,
-  // used instead of the window's offTokOff. Null (the default) keeps the window.
+  // Read by no kernel. aiter's mega_moe still passes tok_off_peers, and the binding
+  // rejects a launch argument the schema lacks; drop it once aiter stops.
   int* const* tokOffPeers = nullptr;
   void* stagingBase = nullptr;  // gfx1250 dispatch staging (EpStagingTotalBytes)
   int* recvToSrc = nullptr;

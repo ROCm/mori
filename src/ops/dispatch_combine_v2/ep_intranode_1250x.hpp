@@ -237,13 +237,9 @@ __device__ __forceinline__ size_t EpScaleRow(index_t b, index_t s) {
   return (size_t)((unsigned)b & (unsigned)(EpScaleWrap(kCfg) - 1)) + (size_t)(s - b);
 }
 
-// The dispatch slot allocator word of PE `pe`. MORI_EP_TOKOFF_EXT (hip_backend.py)
-// moves it out of the cco window into hipExtMallocWithFlags(hipDeviceMallocUncached)
-// memory the ranks share by IPC handle, and binds args.tokOffPeers; otherwise it is
-// the window's offTokOff. Same word, same protocol -- only the memory differs.
+// The dispatch slot allocator word of PE `pe`: the window's offTokOff.
 __device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
-  return args.tokOffPeers != nullptr ? args.tokOffPeers[pe]
-                                     : EpPeer<index_t>(EpWinC{args.window}, pe, args.offTokOff);
+  return EpPeer<index_t>(EpWinC{args.window}, pe, args.offTokOff);
 }
 
 // The Cfg.aggReserve state, laid out by EpResStateBytes (ep_cfg.hpp). Zero when the module

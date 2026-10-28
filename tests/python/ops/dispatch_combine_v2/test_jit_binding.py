@@ -261,13 +261,6 @@ def test_agg_reserve_is_the_default_and_takes_no_argument():
     assert "resState" not in cb.EpDispatchPlan._arg_names
 
 
-def test_per_block_reservation_follows_the_slot_word():
-    # The slot word outside the cco window: every block reserves its own.
-    p = _plan(tok_off_ext=1)
-    assert not p.info.get("aggReserve")
-    p.close()
-
-
 # --------------------------------------------------------------------------
 # The gfx1250 dispatch staging buffer: the caller sizes it, so the size has to
 # be the one the kernel lays out

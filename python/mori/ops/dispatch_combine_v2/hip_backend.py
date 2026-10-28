@@ -186,8 +186,8 @@ def ep_staging_bytes(
     resolved, so a buffer sized at 0 is not a short allocation that faults but a
     write past the end of whatever the caller handed us.
 
-    ``agg_reserve`` is EpCfg.aggReserve: true for every gfx1250 intranode dispatch
-    built without tok_off_ext. It switches the scale part to EpScaleRows' linear
+    ``agg_reserve`` is EpCfg.aggReserve: true for every gfx1250 intranode
+    dispatch. It switches the scale part to EpScaleRows' linear
     numbering, 2 * pow2ceil(max_tok_per_rank) rows a peer (a variant built with a
     smaller callTokMax numbers fewer and shares the buffer), which can be MORE than
     max_recv at EP1/EP2 -- so it needs ``max_tok_per_rank`` too, and passing the
@@ -313,139 +313,22 @@ def ll128_layout(cfg):
 
 
 class TokOffExt:
-    """Dispatch's slot allocator word outside the cco window (single-host gfx1250 EP, opt-in: MORI_EP_TOKOFF_EXT=1).
+    """Allocates nothing; aiter's mega_moe still builds one and passes ``peers`` to dispatch.
 
-    One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
-    opened on every peer by IPC handle. ``peers`` is the device array of
-    world_size pointers the kernel indexes by PE (EpArgs.tokOffPeers). The
-    window's hipMemCreate mapping serializes returning SYSTEM RMWs from several
-    GPUs on one int; this allocation does not.
-
-    PROTOTYPE: the 64-byte handles are exchanged over torch.distributed, which
-    the caller must have initialised.
+    The slot allocator word is always the cco window's tok_off, and no kernel reads
+    EpArgs.tokOffPeers. Remove this once aiter stops importing it.
     """
 
-    _BYTES = 4096
-    _UNCACHED = 0x3  # hipDeviceMallocUncached
-    _LAZY_PEER = 0x1  # hipIpcMemLazyEnablePeerAccess
+    peers = None
 
-    @staticmethod
-    def wanted(world) -> bool:
-        """MORI_EP_TOKOFF_EXT=1 (default off), and every rank on this host.
-
-        The peers' words are opened by hipIpc handle, which no other host can open;
-        an EP spanning hosts keeps the word in the cco window, which is mapped across
-        them. Collective over the default process group, like the constructor.
-        """
-        v = os.environ.get("MORI_EP_TOKOFF_EXT", "").strip().lower()
-        if v not in ("1", "true", "yes", "on"):
-            return False
-        import socket
-
-        import torch.distributed as dist
-
-        if not (dist.is_available() and dist.is_initialized()):
-            return True  # the constructor reports the missing process group
-        # The kernel's boot id, not the hostname: containers on one host each have
-        # a hostname of their own.
-        try:
-            with open("/proc/sys/kernel/random/boot_id") as f:
-                host = f.read().strip()
-        except OSError:
-            host = socket.gethostname()
-        hosts = [None] * world
-        dist.all_gather_object(hosts, host)
-        return len(set(hosts)) == 1
-
-    def __init__(self, rank, world, dev):
-        import ctypes
-
-        import torch.distributed as dist
-
-        from mori.jit.hip_driver import _get_hip_lib
-
-        if not (dist.is_available() and dist.is_initialized()):
-            raise RuntimeError(
-                "tokoff-ext exchanges IPC handles over torch.distributed; "
-                "initialise a process group first"
-            )
-
-        class _Handle(ctypes.Structure):
-            _fields_ = [("reserved", ctypes.c_char * 64)]
-
-        hip = _get_hip_lib()
-        vp = ctypes.c_void_p
-        hip.hipExtMallocWithFlags.argtypes = [
-            ctypes.POINTER(vp),
-            ctypes.c_size_t,
-            ctypes.c_uint,
-        ]
-        hip.hipMemset.argtypes = [vp, ctypes.c_int, ctypes.c_size_t]
-        hip.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_Handle), vp]
-        hip.hipIpcOpenMemHandle.argtypes = [ctypes.POINTER(vp), _Handle, ctypes.c_uint]
-        hip.hipIpcCloseMemHandle.argtypes = [vp]
-        hip.hipFree.argtypes = [vp]
-        self._hip, self._dev, self._mine, self._opened = hip, dev, None, []
-
-        def chk(err, what):
-            if err != 0:
-                raise RuntimeError(
-                    f"MORI_EP_TOKOFF_EXT: {what} returned hipError {err}"
-                )
-
-        with torch.cuda.device(dev):
-            mine = vp()
-            chk(
-                hip.hipExtMallocWithFlags(
-                    ctypes.byref(mine), self._BYTES, self._UNCACHED
-                ),
-                "hipExtMallocWithFlags",
-            )
-            self._mine = mine.value
-            chk(hip.hipMemset(self._mine, 0, self._BYTES), "hipMemset")
-            chk(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
-            handle = _Handle()
-            chk(
-                hip.hipIpcGetMemHandle(ctypes.byref(handle), self._mine),
-                "hipIpcGetMemHandle",
-            )
-            # string_at, not .reserved: a c_char array field reads back cut at the first NUL.
-            raw = ctypes.string_at(ctypes.addressof(handle), 64)
-            handles = [None] * world
-            dist.all_gather_object(handles, raw)
-            ptrs = []
-            for pe in range(world):
-                if pe == rank:
-                    ptrs.append(self._mine)
-                    continue
-                peer = vp()
-                err = hip.hipIpcOpenMemHandle(
-                    ctypes.byref(peer),
-                    _Handle.from_buffer_copy(handles[pe]),
-                    self._LAZY_PEER,
-                )
-                # Lazy peer setup can leave hipErrorPeerAccessAlreadyEnabled sticky
-                # even on success (see ccoDevCommCreate); consume it.
-                hip.hipGetLastError()
-                chk(err, f"hipIpcOpenMemHandle(pe {pe})")
-                ptrs.append(peer.value)
-                self._opened.append(peer.value)
-            self.peers = torch.tensor(ptrs, dtype=torch.int64, device=dev)
-        dist.barrier()
+    def __init__(self, rank=0, world=1, dev=None):
+        pass
 
     def zero(self):
-        """Collective, like the op's reset(): every rank zeroes its own word."""
-        with torch.cuda.device(self._dev):
-            self._hip.hipMemset(self._mine, 0, 4)
-            self._hip.hipDeviceSynchronize()
+        pass
 
     def close(self):
-        for p in self._opened:
-            self._hip.hipIpcCloseMemHandle(p)
-        self._opened = []
-        if self._mine is not None:
-            self._hip.hipFree(self._mine)
-            self._mine = None
+        pass
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
@@ -531,12 +414,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         self._dev_comm = self._make_dev_comm(cfg, comm) if cfg.is_internode else None
-        # Decided before the kernels are built: how the dispatch plans reserve slots
-        # follows where the slot allocator word lives (see TokOffExt below).
-        self._tokoff_wanted = (
-            not cfg.is_internode and self._is1250 and TokOffExt.wanted(cfg.world_size)
-        )
-
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
         # because dispatch plans bind the pointer at construction time.
@@ -548,7 +425,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 cfg.effective_max_recv,
                 raw_scale,
                 max_tok_per_rank=cfg.max_num_inp_token_per_rank,
-                agg_reserve=not self._tokoff_wanted,
+                agg_reserve=True,
             )
             if stg_bytes > 0:
                 self.dispatch_staging = torch.zeros(
@@ -571,18 +448,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # dispatch signal on, the push combine's landing offset of the rows it
         # returns (EpFp4LandTo; dispatch writes it, combine reads it).
         self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
-        # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
-        # memory instead of the cco window (see TokOffExt): the cco-window slot
-        # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
-        # only kernel that reads tokOffPeers. Opt-in for a single-host EP with
-        # MORI_EP_TOKOFF_EXT=1; otherwise, and always for an EP spanning hosts, the
-        # word stays in the cco window (tokOffPeers stays None -> kernel EpTokOff
-        # falls back to the VMM hipMemCreate window).
-        self._tokoff_ext = None
-        self.tok_off_peers = None
-        if self._tokoff_wanted:
-            self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
-            self.tok_off_peers = self._tokoff_ext.peers
         ll_disp = self._ll128_split is not None or (
             self._ll128_geom is not None and "dispatch" in self._ll128_geom
         )
@@ -1012,15 +877,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
-        # The push combine's landing offsets ride the aggregated reservation's
-        # dispatch signal, which TokOffExt turns off.
-        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(
-            self, "_tokoff_wanted", False
-        ):
-            bad.append(
-                f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
-                "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
-            )
         worst = cfg.world_size * cfg.max_num_inp_token_per_rank
         if cfg.effective_max_recv < worst:
             bad.append(
@@ -1556,10 +1412,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
         self._plans = []
-        # The RMWs on one slot word serialize in the cco window, so there a rank's
-        # blocks add up their tokens and reserve once per destination; in TokOffExt's
-        # allocation every block reserves its own.
-        ext = int(getattr(self, "_tokoff_wanted", False))
         for b, w in self._dispatch_specs:
             sized = []
             for cap in self._dispatch_caps(cfg, (b, w)):
@@ -1568,7 +1420,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     **disp_cfg,
                     block_num=b,
                     warp_per_block=w,
-                    tok_off_ext=ext,
                     call_tok_max=cap,
                 )
                 plan.bind(rank=cfg.rank)
@@ -1600,7 +1451,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 combine_fp8=comb_cfg.get("combine_fp8", False),
                 block_num=b,
                 warp_per_block=w,
-                tok_off_ext=ext,
                 call_tok_max=n,
             )
             plan.bind(rank=cfg.rank)
@@ -1634,11 +1484,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # After the plans: they carry staging_base by value, so nothing may still be
         # able to launch when the tensor behind it goes.
         self.dispatch_staging = None
-        ext = getattr(self, "_tokoff_ext", None)
-        if ext is not None:
-            self._tokoff_ext = None
-            self.tok_off_peers = None
-            ext.close()
         # After the plans: they embed the ccoDevComm by value and their kernels
         # dereference its QPs. The static args cache the host struct's address, so
         # it goes too -- nothing may re-read it once the handle is gone.
@@ -1816,8 +1661,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
-                # None -> 0 -> the window's offTokOff (MORI_EP_TOKOFF_EXT off)
-                tok_off_peers=getattr(self, "tok_off_peers", None),
                 total_recv_token_num=self.total_recv,
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
