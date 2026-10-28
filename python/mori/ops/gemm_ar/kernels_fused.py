@@ -113,6 +113,7 @@ from ._gemm_a8w8_8wave import (
     read_done_barrier,
     wait_barrier,
 )
+from ._mxfp8_scale_lds import Mxfp8ScaleLds
 
 
 def _acquire_peer_lock(lock_ptr):
@@ -1025,21 +1026,31 @@ def compile_fused_gemm_scatter(
             "--lane-transpose for the real thing on --mode fused-lsa"
         )
     direct_lsa = fuse and transport == "lsa"
-    if quant not in ("ptpc", "blockscale", "mxfp8", "mxfp8_unpacked", "mxfp8_row"):
+    if quant not in (
+        "ptpc",
+        "blockscale",
+        "mxfp8",
+        "mxfp8_raw",
+        "mxfp8_unpacked",
+        "mxfp8_row",
+    ):
         raise ValueError(
-            f"quant must be ptpc, blockscale, mxfp8, mxfp8_unpacked or "
-            f"mxfp8_row, got {quant!r}"
+            f"quant must be ptpc, blockscale, mxfp8, mxfp8_raw, mxfp8_unpacked "
+            f"or mxfp8_row, got {quant!r}"
         )
     blockscale = quant == "blockscale"
     # ``mxfp8`` takes ``preshuffle_a_scale``'s layout: K-block major with a
     # lane's four M tiles packed into one dword, the byte picked by the MFMA's
-    # opsel. The other two are the layouts it was chosen over, kept so the
-    # choice stays measurable rather than asserted:
+    # opsel. ``mxfp8_raw`` takes the quantiser's own row-major bytes and stages
+    # them through LDS (see _mxfp8_scale_lds.py). The other two are layouts
+    # ``mxfp8`` was chosen over, read from global like it, kept so the choice
+    # stays measurable rather than asserted:
     #   mxfp8_unpacked  K-block major, one int32 per scale   (+5 to +7.5%)
     #   mxfp8_row       the quantiser's own [M, K/32] bytes  (+50 to +67%)
     mxfp8_row = quant == "mxfp8_row"
     mxfp8_pack = quant == "mxfp8"
-    mxfp8 = quant in ("mxfp8", "mxfp8_unpacked") or mxfp8_row
+    mxfp8_raw = quant == "mxfp8_raw"
+    mxfp8 = quant in ("mxfp8", "mxfp8_unpacked", "mxfp8_raw") or mxfp8_row
     if (blockscale or mxfp8) and not swap_ab:
         raise ValueError(
             f"--quant {quant} needs --swap-ab: the unswapped epilogue "
@@ -1058,6 +1069,11 @@ def compile_fused_gemm_scatter(
             raise ValueError(f"mxfp8 needs K % 128 == 0, got K={K}")
         if N % _Mxfp8ScaleK.BLOCK:
             raise ValueError(f"mxfp8 needs N % {_Mxfp8ScaleK.BLOCK} == 0, got N={N}")
+    if mxfp8_raw and max(BLOCK_M, BLOCK_N) > Mxfp8ScaleLds.ROWS:
+        raise ValueError(
+            f"mxfp8_raw stages {Mxfp8ScaleLds.ROWS} scale rows per operand, "
+            f"got BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N}"
+        )
     rotated = fuse if rotated is None else rotated
     # n_stripe spans 1..N//BLOCK_N; the top of the range *is* chunk-major, so
     # 0 ("per-mode default") resolves to it rather than to a separate branch.
@@ -1114,6 +1130,7 @@ def compile_fused_gemm_scatter(
         )
 
     K_ITERS = K // BLOCK_K
+    n_scale_chunks = ceildiv(K_ITERS, Mxfp8ScaleLds.CHUNK)
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
     N_ACCUMS = N_TILES_A * N_TILES_B
@@ -1163,7 +1180,7 @@ def compile_fused_gemm_scatter(
     tiles_per_chunk = m_tiles_per_chunk * n_blocks_const
     chunk_bytes = m_tiles_per_chunk * BLOCK_M * N * cfg.scatter_elem_bytes
 
-    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}"
+    _kname_tag = f"{'B' if blockscale else ''}{'S' if swap_ab else ''}{'P' if permlane else ''}{'T' if lane_transpose else ''}{'H' if hoist_scales else ''}{'R' if mxfp8_raw else ''}{'U' if peer_uncached else ''}{direct_fence[0]}{'W' if store_probe else ''}c{chunks}{'r' if rotated else 'l'}q{sdma_queues}{'' if n_stripe == 1 else f's{n_stripe}'}"
     counter_off = cfg.counter_off
     lock_off = cfg.lock_off
     in_off = cfg.input_off
@@ -1207,6 +1224,9 @@ def compile_fused_gemm_scatter(
 
     @fx.struct
     class SharedStorage:
+        # First, so its reads' constant offsets fit the ds_read offset field.
+        if mxfp8_raw:
+            S_lds: fx.Array[fx.Float8E4M3FN, 2 * Mxfp8ScaleLds.BYTES, 16]
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -1431,17 +1451,33 @@ def compile_fused_gemm_scatter(
             # Same deal as blockscale: the scales land in the accumulator during
             # the mainloop, so the epilogue must not apply them again.
             store_c._preapplied = True
-            msk = _Mxfp8ScaleK(
-                A_scale,
-                B_scale,
-                c_m,
-                N,
-                K,
-                n_tiles_a=N_TILES_A,
-                n_tiles_b=N_TILES_B,
-                row_major=mxfp8_row,
-                packed_a=mxfp8_pack,
-            )
+            if const_expr(mxfp8_raw):
+                msk = Mxfp8ScaleLds(
+                    A_scale,
+                    B_scale,
+                    K,
+                    block_m * BLOCK_M,
+                    block_n * BLOCK_N,
+                    wave_id,
+                    wave_m * (N_TILES_A * 16),
+                    wave_n * (N_TILES_B * 16),
+                    lds.S_lds,
+                    F8_IR_t,
+                    n_tiles_a=N_TILES_A,
+                    n_tiles_b=N_TILES_B,
+                )
+            else:
+                msk = _Mxfp8ScaleK(
+                    A_scale,
+                    B_scale,
+                    c_m,
+                    N,
+                    K,
+                    n_tiles_a=N_TILES_A,
+                    n_tiles_b=N_TILES_B,
+                    row_major=mxfp8_row,
+                    packed_a=mxfp8_pack,
+                )
             base_row_pre = block_m * BLOCK_M + wave_m * (N_TILES_A * 16)
             base_col_pre = block_n * BLOCK_N + wave_n * (N_TILES_B * 16)
         if blockscale:
@@ -1468,6 +1504,10 @@ def compile_fused_gemm_scatter(
         c10_frag = [mfma.zero_value] * N_ACCUMS
         c11_frag = [mfma.zero_value] * N_ACCUMS
 
+        if const_expr(mxfp8_raw):
+            # Ahead of the prologue's tile loads, so its waits cover these too.
+            for chunk in range_constexpr(min(2, n_scale_chunks)):
+                msk.dma(chunk)
         b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
@@ -1508,6 +1548,15 @@ def compile_fused_gemm_scatter(
             # after the barrier the lagging group's S0 pairs with; make the
             # reads complete before advertising it.
             read_done_barrier()
+            if const_expr(
+                mxfp8_raw
+                and k > 0
+                and k % Mxfp8ScaleLds.CHUNK == 0
+                and k // Mxfp8ScaleLds.CHUNK + 1 < n_scale_chunks
+            ):
+                # The slot last held chunk k // CHUNK - 1, whose final reads
+                # both wave groups drained before this barrier.
+                msk.dma(k // Mxfp8ScaleLds.CHUNK + 1)
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
