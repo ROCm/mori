@@ -253,6 +253,11 @@ class RdmaDeviceContext {
     assert(false && "not implemented");
   }
   virtual bool DestroyRdmaEndpointNoThrow(const RdmaEndpoint&) noexcept;
+  // Moves the QP to the Error state. A QP in Error accepts no further inbound
+  // requests, so a peer's writes through it stop landing in local memory. Returns
+  // true only once the transition has completed; the default does nothing and
+  // returns false, so a provider that cannot do this is never reported as fenced.
+  virtual bool ModifyEndpointToErrorNoThrow(const RdmaEndpoint&) noexcept;
 
   ibv_srq* CreateRdmaSrqIfNx(const RdmaEndpointConfig&);
 

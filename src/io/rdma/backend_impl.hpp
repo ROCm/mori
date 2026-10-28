@@ -31,6 +31,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "mori/application/topology/topology.hpp"
@@ -121,6 +122,28 @@ class RdmaManager {
   // to a failed state.
   int FailInFlightTransfers(const QpErrorEvent& event);
 
+  // Takes every connection to `remoteKey` out of service. Each QP is moved to
+  // Error so the peer can no longer write through it, then removed from the route
+  // table so no new session picks it up, and its in-flight transfers are failed.
+  // The QP objects stay allocated: the CQ poller still drains their flush CQEs, and
+  // freeing them under it would race. Registered memory is left untouched, so the
+  // peer can reconnect through the normal handshake.
+  //
+  // The peer also stays fenced: ConnectEndpoint refuses it, in either direction,
+  // until UnfenceRemoteEngine. Cutting the QPs alone is not enough, because a peer
+  // that notices its connection died would rebuild one and keep writing; whatever
+  // it still had queued for the abandoned transfer would then land in memory that
+  // may already belong to someone else.
+  FenceResult FenceRemoteEngine(const EngineKey& remoteKey);
+
+  // Lets a fenced peer connect again. The caller decides when that is safe, which is
+  // once nothing the peer still has queued can reach buffers that were handed out.
+  // Returns whether the peer was fenced.
+  bool UnfenceRemoteEngine(const EngineKey& remoteKey);
+  // Whether connections with `remoteKey` are currently refused. Callers use it to
+  // refuse early; ConnectEndpoint still enforces it under the lock.
+  bool IsPeerFenced(const EngineKey& remoteKey) const;
+
   /* -------------------------------- Peer failure -------------------------------- */
   // Takes the oldest recorded failure; polled by an application thread.
   bool PopPeerFailure(PeerFailureEvent* out);
@@ -152,6 +175,9 @@ class RdmaManager {
   std::atomic<EndpointId> nextEndpointId_{1};
   std::unordered_map<EndpointId, std::shared_ptr<EndpointRuntime>> endpointsById_;
   std::atomic<uint64_t> endpointsEpoch_{0};
+  // Peers fenced and not yet unfenced; guarded by `mu`, like `remotes`, so the
+  // fence and the check in ConnectEndpoint cannot interleave.
+  std::unordered_set<EngineKey> fencedPeers_;
 
   std::unique_ptr<application::TopoSystem> topo{nullptr};
   std::atomic<uint32_t> roundRobinCounter{0};
@@ -370,6 +396,8 @@ class RdmaBackend : public Backend {
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
   bool PopPeerFailure(PeerFailureEvent* out) override;
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
+  bool UnfenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
  private:

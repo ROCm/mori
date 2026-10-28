@@ -69,6 +69,27 @@ struct PeerFailureEvent {
   std::string detail;
 };
 
+// Outcome of IOEngine::FenceRemoteEngine: whether a peer can still write into
+// this engine's registered memory. A WRITE target never learns that a transfer
+// was abandoned, so the only way to make its buffers safe to reuse is to cut the
+// peer's queue pairs on the receiving side.
+struct FenceResult {
+  // False when no backend could revoke the peer's access. Nothing was fenced.
+  bool supported{false};
+  // Connections to the peer that were taken out of service.
+  int endpointsFenced{0};
+  // Connections that could not be taken out of service. While any remain, the peer
+  // can still write, so the caller must not hand its buffers to anyone else.
+  int endpointsFailed{0};
+  // Local transfers toward the peer that were failed because their QP was cut.
+  int transfersFailed{0};
+  std::string message;
+
+  // True only when the peer provably can no longer write into this engine.
+  // Fencing a peer this engine has no connection to is ok: there is nothing to cut.
+  bool Ok() const { return supported && endpointsFailed == 0; }
+};
+
 // Which resource a failure invalidates; each covers a different set of sessions.
 enum class FailureScope : uint32_t {
   kQp = 0,

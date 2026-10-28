@@ -641,6 +641,13 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
                                         int weight) {
   std::unique_lock<std::shared_mutex> lock(mu);
 
+  // Checked under the same lock FenceRemoteEngine takes, so a handshake already in
+  // flight cannot slip an endpoint in behind the fence.
+  if (fencedPeers_.count(remoteKey) != 0) {
+    throw std::runtime_error("engine " + remoteKey +
+                             " is fenced; connections are refused until it is unfenced");
+  }
+
   // Before the transition below, which can itself raise a fatal event.
   peerFailures_.RegisterQp(
       PeerFailureTracker::QpKey{availDevices[devId].first->Name(), local.handle.qpn}, remoteKey,
@@ -804,6 +811,73 @@ int RdmaManager::FailInFlightTransfers(const QpErrorEvent& event) {
     MORI_IO_WARN("async event {}: no live endpoint matched; nothing to fail", event.eventName);
   }
   return failed;
+}
+
+FenceResult RdmaManager::FenceRemoteEngine(const EngineKey& remoteKey) {
+  // Detach the peer's endpoints under the lock so no new session can pick one up
+  // from here on. The verbs calls below run without it: FailAll() can wait for an
+  // in-flight post, and neither step needs the table.
+  EpPairVec victims;
+  {
+    std::unique_lock<std::shared_mutex> lock(mu);
+    fencedPeers_.insert(remoteKey);
+    auto it = remotes.find(remoteKey);
+    if (it != remotes.end()) {
+      for (auto& [topo, eps] : it->second.rTable) {
+        victims.insert(victims.end(), eps.begin(), eps.end());
+      }
+      it->second.rTable.clear();
+      // Remote keys cached for the fenced incarnation must not outlive it: a peer
+      // that comes back may have registered different memory under the same ids.
+      it->second.mTable.clear();
+    }
+  }
+
+  FenceResult result;
+  result.supported = true;
+
+  const std::string message = "peer " + remoteKey + " was fenced; its connection was shut down";
+  for (const auto& ep : victims) {
+    // Cut the peer off first. This is the step the caller relies on, so it must not
+    // wait behind the local bookkeeping below.
+    application::RdmaDeviceContext* devCtx = GetRdmaDeviceContext(ep.ldevId);
+    if (devCtx == nullptr || !devCtx->ModifyEndpointToErrorNoThrow(ep.local)) {
+      ++result.endpointsFailed;
+      MORI_IO_ERROR("fence: could not move qpn={} (peer {}) to Error; peer may still write",
+                    ep.local.handle.qpn, remoteKey);
+      // Keep going: fencing the remaining QPs still narrows what the peer can do,
+      // and the caller learns from endpointsFailed that the fence is incomplete.
+    } else {
+      ++result.endpointsFenced;
+    }
+
+    // Same treatment as a fatal async event: refuse new posts, close the ledger,
+    // and fail whatever was in flight so no waiter hangs on a completion that the
+    // dead QP will never deliver.
+    if (ep.degraded) ep.degraded->store(true, kSqAdmissionOrder);
+    if (ep.ledger) {
+      result.transfersFailed +=
+          ep.ledger->FailAll(StatusCode::ERR_RDMA_OP, message, ep.sqDepth.get());
+    }
+    NotifySqStateChanged(ep);
+  }
+
+  if (result.endpointsFailed > 0) {
+    result.message = std::to_string(result.endpointsFailed) + " of " +
+                     std::to_string(victims.size()) + " endpoint(s) of peer " + remoteKey +
+                     " could not be fenced";
+  }
+  return result;
+}
+
+bool RdmaManager::IsPeerFenced(const EngineKey& remoteKey) const {
+  std::shared_lock<std::shared_mutex> lock(mu);
+  return fencedPeers_.count(remoteKey) != 0;
+}
+
+bool RdmaManager::UnfenceRemoteEngine(const EngineKey& remoteKey) {
+  std::unique_lock<std::shared_mutex> lock(mu);
+  return fencedPeers_.erase(remoteKey) != 0;
 }
 
 bool RdmaManager::HasIonicDevice() const {
@@ -1267,6 +1341,12 @@ std::optional<int> ControlPlaneServer::TryGetRemoteEnginePort(const EngineKey& e
 }
 
 void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nicRank) {
+  // Refuse before the handshake: the peer would otherwise build its half of a
+  // connection that this side then has to throw away.
+  if (rdma->IsPeerFenced(ekey)) {
+    throw std::runtime_error("BuildRdmaConn: engine " + ekey +
+                             " is fenced; connections are refused until it is unfenced");
+  }
   application::TCPEndpointHandle tcph;
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -1368,6 +1448,12 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
     case MessageType::RegEndpoint: {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
       int rdevId = msg.devId;
+
+      // A fenced peer gets no connection: dropping the handshake makes its connect
+      // fail, which is how it learns it was cut off. Nothing is built for it.
+      if (rdma->IsPeerFenced(msg.ekey)) {
+        throw ProtocolError("RegEndpoint refused: engine " + msg.ekey + " is fenced");
+      }
 
       // Rail affinity: if the sender provided a valid railId, use the same
       // availDevices index so that both endpoints sit on the same network rail
@@ -2027,6 +2113,29 @@ bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id
 bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
   if (!rdma) return false;
   return rdma->PopPeerFailure(out);
+}
+
+FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
+  if (!rdma) return FenceResult{};
+  // Fence before dropping sessions. The other way round, a CreateSession racing
+  // with us could still see the old endpoints, cache a session over them, and leave
+  // it pointing at dead QPs once the fence lands.
+  FenceResult result = rdma->FenceRemoteEngine(remote);
+
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  for (auto it = sessionCache.begin(); it != sessionCache.end();) {
+    if (it->first.remoteEngineKey == remote) {
+      retiredSessions.push_back(std::move(it->second));
+      it = sessionCache.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return result;
+}
+
+bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
+  return rdma && rdma->UnfenceRemoteEngine(remote);
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
