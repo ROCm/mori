@@ -186,9 +186,6 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("tier_io_threads", &UMBPSsdConfig::tier_io_threads)
       .def_readwrite("direct_io", &UMBPSsdConfig::direct_io)
       .def_readwrite("verify_crc", &UMBPSsdConfig::verify_crc)
-      // sglang's UMBPStore builds UMBPConfig directly rather than via
-      // FromEnvironment(), so UMBP_SSD_SINGLE_FLIGHT never reaches it — this is
-      // the only way to turn coalescing off on that path.
       .def_readwrite("single_flight_reads", &UMBPSsdConfig::single_flight_reads)
       .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
       .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
