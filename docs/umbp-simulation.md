@@ -58,7 +58,8 @@ python examples/umbp/calibrate.py \
   --probe build/src/umbp/umbp_sim_probe \
   --output /tmp/umbp-calibration \
   --cpus 4,5,6,7 --threads 1 2 4 \
-  --cache cold --samples 24 --rounds 3
+  --cache cold --samples 24 --rounds 3 \
+  --max-mib 256 --concurrency 1 2 4
 ```
 
 Use a Release build, NumPy, Linux `taskset`, a new output directory and available
@@ -66,6 +67,13 @@ physical CPUs representative of deployment. Each N-thread probe uses the first
 N listed CPUs and sets `UMBP_DRAM_COPY_THREADS` and `UMBP_DRAM_WRITE_THREADS` to N.
 Sampling supports 1/2/4/8 threads and must include 1. Defaults use up to eight
 allowed CPUs. Keep copy settings and CPU/NUMA placement consistent during simulation.
+`--concurrency` defaults to 1/2/4 and must include 1. It adds a sparse validation
+sweep of simultaneous calls sharing one client/engine, with disjoint keys and
+buffers. Callers start together; thread creation is outside API timers. Each run
+uses the first `min(N * callers, listed CPUs)` cores, so limited CPU lists can
+oversubscribe. This tests concurrent reads and concurrent writes separately;
+it does not simulate independent ranks/processes or simultaneous read/write mixes.
+Use `--concurrency 1` to skip that sweep.
 
 - `profile.json` loads directly through `UMBP_SIM_PROFILE`; only `cpu_cpu` is fitted.
 - `report.json` contains platform/CPU identity, affinity, copy settings, profile/probe
@@ -73,11 +81,18 @@ allowed CPUs. Keep copy settings and CPU/NUMA placement consistent during simula
   error). Tolerance is `max(2 µs, 10% of real median)`. High error is reported;
   failed operations or invalid fits fail the run.
 
-Training measures real `LocalCopyEngine` Submit+Wait with 4 KiB–4 MiB blocks and
-batches 1/8/32, capped at 64 MiB. Validation uses 8 KiB–8 MiB and batches 1/4/16
-for engine transfers and real `BatchPut`/`BatchGet` APIs. Only training transfers
-fit the nonnegative coefficients: API/control overhead is not charged twice.
-API measurements include trace formatting/output to `/dev/null`, excluding Python.
+Training measures real `LocalCopyEngine` Submit+Wait with 512 B–4 MiB blocks and
+batches 1/8/32/64/128. Independent validation uses different block sizes from
+1 KiB–8 MiB and batches 1/4/16/128 for transfers and `BatchPut`/`BatchGet` APIs.
+Both reach 256 MiB aggregate payload by default. `--max-mib` bounds that payload
+across all callers; actual memory also includes destinations and storage pools.
+Increase it if necessary to exceed the target cache (the fixed grid tops out at
+512 MiB training and 1 GiB single-caller validation).
+Concurrent validation samples 8 KiB, 512 KiB and 2 MiB blocks with batches 1/16/128,
+subject to the same aggregate cap. Small blocks represent copy sizes, not a full
+framework's layer/ranged-call geometry. Only real single-caller training transfers
+fit coefficients: API/control/queue time is not charged twice. Reports separate
+concurrency levels. API timings include trace output to `/dev/null`, excluding Python.
 
 `cold` flushes the caller source before each transfer/put, outside the timer
 (x86 only); get reads the just-written store. `reuse` repeats buffers and caps

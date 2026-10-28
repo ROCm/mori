@@ -56,6 +56,7 @@ def test_fit_recovers_model_without_validation_leakage():
     rows += [dict(row, phase="api", elapsed_ns=1e12) for row in rows]
     rows += [dict(row, phase="engine", elapsed_ns=1e12) for row in measurements()]
     rows += [dict(row, mode="sim", elapsed_ns=1e12) for row in measurements()]
+    rows += [dict(row, concurrency=4, elapsed_ns=1e12) for row in measurements()]
     path = calibrate.fit_profile(rows, [1, 4])
     assert path["latency_ns"] == pytest.approx([1000] * 4)
     assert path["copy_latency_ns"] == pytest.approx([50] * 4)
@@ -110,3 +111,28 @@ def test_report_keeps_absolute_floor_and_large_relative_errors_visible():
     assert result["real_p95_ns"] > result["real_median_ns"]
     rows = [dict(row, elapsed_ns=row["elapsed_ns"] / 10) for row in rows]
     assert calibrate.compare(rows)[0]["within_tolerance"]
+
+
+def test_report_separates_concurrency():
+    rows = [
+        dict(
+            phase="api",
+            threads=1,
+            concurrency=c,
+            block_bytes=4096,
+            batch=1,
+            api="get",
+            mode=mode,
+            elapsed_ns=ns,
+        )
+        for c, mode, ns in [
+            (1, "real", 10000),
+            (1, "sim", 10000),
+            (4, "real", 20000),
+            (4, "sim", 30000),
+        ]
+    ]
+    reports = calibrate.compare(rows)
+    assert [row["concurrency"] for row in reports] == [1, 4]
+    assert [row["error_pct"] for row in reports] == [0, 50]
+    assert [row["within_tolerance"] for row in reports] == [True, False]

@@ -42,7 +42,11 @@ def fit_profile(records, threads):
     """Fit only real training transfers; control-path time is never added twice."""
     groups = defaultdict(list)
     for row in records:
-        if row["phase"] == "train" and row["mode"] == "real":
+        if (
+            row["phase"] == "train"
+            and row["mode"] == "real"
+            and row.get("concurrency", 1) == 1
+        ):
             key = (row["effective_threads"], row["block_bytes"], row["batch"])
             groups[key].append(row["elapsed_ns"])
     curves = {}
@@ -89,19 +93,18 @@ def fit_profile(records, threads):
 
 
 def compare(records):
+    fields = ("phase", "threads", "concurrency", "block_bytes", "batch", "api")
     groups = defaultdict(lambda: defaultdict(list))
     for row in records:
         if row["phase"] != "train":
-            key = tuple(
-                row[k] for k in ("phase", "threads", "block_bytes", "batch", "api")
-            )
+            key = tuple(row.get(k, 1) if k == "concurrency" else row[k] for k in fields)
             groups[key][row["mode"]].append(row["elapsed_ns"])
     results = []
     for key, modes in sorted(groups.items()):
         real, sim = (statistics.median(modes[mode]) for mode in ("real", "sim"))
         results.append(
             dict(
-                zip(("phase", "threads", "block_bytes", "batch", "api"), key),
+                zip(fields, key),
                 real_median_ns=real,
                 sim_median_ns=sim,
                 real_p95_ns=float(np.percentile(modes["real"], 95)),
@@ -124,6 +127,20 @@ def main():
     )
     parser.add_argument("--threads", nargs="+", type=int, choices=(1, 2, 4, 8))
     parser.add_argument("--cache", choices=("cold", "reuse"), default="cold")
+    parser.add_argument(
+        "--concurrency",
+        nargs="+",
+        type=int,
+        choices=(1, 2, 4),
+        default=[1, 2, 4],
+        help="simultaneous callers sharing one client; validation only",
+    )
+    parser.add_argument(
+        "--max-mib",
+        type=int,
+        default=256,
+        help="maximum aggregate payload MiB per case, across all callers",
+    )
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--rounds", type=int, default=3)
     args = parser.parse_args()
@@ -142,6 +159,9 @@ def main():
         parser.error(
             "need valid distinct CPUs, threads including 1, and positive samples/rounds"
         )
+    if args.max_mib < 1 or 1 not in args.concurrency:
+        parser.error("need positive --max-mib and --concurrency including 1")
+    concurrency = sorted(set(args.concurrency))
     probe = args.probe.resolve(strict=True)
     env = dict(
         os.environ, MORI_UMBP_LOG_LEVEL="warn", UMBP_HBM_GATHER_PREWARM_STREAMS="0"
@@ -149,16 +169,23 @@ def main():
     records = []
     args.output.mkdir(parents=True, exist_ok=False)
 
-    def collect(phase, mode, round_id, p, profile=None):
-        print(f"{phase} {mode}: round {round_id + 1}, {p} threads", flush=True)
+    def collect(phase, mode, round_id, p, c=1, profile=None):
+        print(
+            f"{phase} {mode}: round {round_id + 1}, {p} threads, {c} callers",
+            flush=True,
+        )
         command = [
             "taskset",
             "-c",
-            ",".join(map(str, cpus[:p])),
+            ",".join(map(str, cpus[: p * c])),
             str(probe),
             phase,
             args.cache,
             str(args.samples),
+            "--concurrency",
+            str(c),
+            "--max-mib",
+            str(args.max_mib),
         ]
         if profile:
             command.append(str(profile))
@@ -179,7 +206,13 @@ def main():
             if (
                 min(
                     row[k]
-                    for k in ("block_bytes", "batch", "effective_threads", "elapsed_ns")
+                    for k in (
+                        "block_bytes",
+                        "batch",
+                        "effective_threads",
+                        "concurrency",
+                        "elapsed_ns",
+                    )
                 )
                 <= 0
             ):
@@ -198,17 +231,18 @@ def main():
         candidate = Path(temporary) / "profile.json"
         candidate.write_text(json.dumps(profile, indent=2, allow_nan=False) + "\n")
         for r in range(args.rounds):
-            for p in threads:
-                for phase in ("engine", "api"):
-                    # Alternate order to reduce systematic real/sim drift.
-                    for mode in ("real", "sim") if r % 2 == 0 else ("sim", "real"):
-                        collect(phase, mode, r, p, candidate if mode == "sim" else None)
+            for p, c, phase in itertools.product(
+                threads, concurrency, ("engine", "api")
+            ):
+                # Alternate order to reduce systematic real/sim drift.
+                for mode in ("real", "sim") if r % 2 == 0 else ("sim", "real"):
+                    collect(phase, mode, r, p, c, candidate if mode == "sim" else None)
         comparisons = compare(records)
         training = [row for row in records if row["phase"] == "train"]
         max_bytes = max(row["block_bytes"] * row["batch"] for row in training)
         for row in comparisons:
             row["outside_training_working_set"] = (
-                row["block_bytes"] * row["batch"] > max_bytes
+                row["block_bytes"] * row["batch"] * row["concurrency"] > max_bytes
             )
         report = {
             "profile_id": profile["id"],
@@ -226,6 +260,8 @@ def main():
             "probe_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
             "cpus": cpus,
             "threads": threads,
+            "concurrency": concurrency,
+            "max_mib": args.max_mib,
             "cache": args.cache,
             "samples": args.samples,
             "rounds": args.rounds,
@@ -237,7 +273,7 @@ def main():
                     "UMBP_DRAM_COPY_THREADS_MIN_BYTES",
                 )
             },
-            "scope": "CPU copies only; cold flushes the caller source before put/transfer. Get reads the just-written store. Reuse is not a guaranteed cache hit. API validation includes trace output to /dev/null. No GPU or framework accuracy claim.",
+            "scope": "CPU copies only; cold flushes the caller source before put/transfer. Get reads the just-written store. Concurrent validation uses disjoint keys/buffers in one client, on the first min(threads * callers, available CPUs) listed CPUs; thread creation is outside API timers. Reuse is not a guaranteed cache hit. API validation includes trace output to /dev/null. No GPU or framework accuracy claim.",
             "tolerance": "absolute median error <= max(2000 ns, 10% of real median)",
             "comparisons": comparisons,
             "measurements": records,
@@ -246,12 +282,17 @@ def main():
             json.dumps(report, indent=2, allow_nan=False) + "\n"
         )
         candidate.replace(args.output / "profile.json")
-    for phase in ("engine", "api"):
-        rows = [row for row in comparisons if row["phase"] == phase]
+    for phase, c in itertools.product(("engine", "api"), concurrency):
+        rows = [
+            row
+            for row in comparisons
+            if row["phase"] == phase and row["concurrency"] == c
+        ]
         error = statistics.median(abs(row["error_pct"]) for row in rows)
         passed = sum(row["within_tolerance"] for row in rows)
         print(
-            f"{phase}: median absolute error {error:.1f}%; {passed}/{len(rows)} within tolerance"
+            f"{phase}, {c} callers: median absolute error {error:.1f}%; "
+            f"{passed}/{len(rows)} within tolerance"
         )
     print(f"Profile and measurements: {args.output.resolve()}")
 

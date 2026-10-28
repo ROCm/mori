@@ -21,13 +21,16 @@
 // SOFTWARE.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__x86_64__)
@@ -66,109 +69,180 @@ void Check(const std::vector<bool>& result, size_t count) {
     throw std::runtime_error("UMBP calibration operation failed");
 }
 
-void Measure(const std::string& phase, bool cold, int samples, const std::string& profile) {
+// Start callers together; thread creation and wake-up are outside each API timer.
+// Each caller owns disjoint keys/buffers but shares the same client/transfer engine.
+template <class Fn>
+std::vector<int64_t> Concurrent(size_t count, Fn run) {
+  if (count == 1) return {run(0)};
+  std::promise<void> start;
+  auto gate = start.get_future().share();
+  std::atomic<size_t> ready{0};
+  std::vector<std::future<int64_t>> pending;
+  pending.reserve(count);
+  try {
+    for (size_t i = 0; i < count; ++i) {
+      pending.push_back(std::async(std::launch::async, [&, i] {
+        ++ready;
+        gate.wait();
+        return run(i);
+      }));
+    }
+    while (ready.load() != count) std::this_thread::yield();
+  } catch (...) {
+    start.set_value();  // Drain already-created callers if thread creation failed.
+    throw;
+  }
+  start.set_value();
+  std::vector<int64_t> times;
+  for (auto& call : pending) times.push_back(call.get());
+  return times;
+}
+
+void Measure(const std::string& phase, bool cold, int samples, const std::string& profile,
+             size_t concurrency, size_t max_bytes) {
   const bool training = phase == "train", sim = !profile.empty();
-  const std::vector<size_t> blocks = training ? std::vector<size_t>{4, 64, 256, 1024, 4096}
-                                              : std::vector<size_t>{8, 128, 512, 2048, 8192};
+  const std::vector<size_t> blocks =
+      training ? std::vector<size_t>{512, 2048, 4096, 65536, 262144, 1048576, 4194304}
+               : std::vector<size_t>{1024, 8192, 32768, 131072, 524288, 2097152, 8388608};
   const std::vector<size_t> batches =
-      training ? std::vector<size_t>{1, 8, 32} : std::vector<size_t>{1, 4, 16};
-  std::cout << "block_bytes,batch,effective_threads,api,iteration,elapsed_ns\n";
-  for (size_t kib : blocks) {
+      training ? std::vector<size_t>{1, 8, 32, 64, 128} : std::vector<size_t>{1, 4, 16, 128};
+  if (training && !cold) max_bytes = std::min(max_bytes, size_t{8} << 20);
+  std::cout << "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns\n";
+  for (size_t block : blocks) {
     for (size_t count : batches) {
-      const size_t block = kib * 1024, bytes = block * count;
-      if (bytes > ((training && !cold ? 8ULL : 64ULL) << 20)) continue;
-      auto src = Allocate(bytes, 0x5a), dst = Allocate(bytes, 0);
+      const size_t bytes = block * count, total = bytes * concurrency;
+      if (total > max_bytes) continue;
+      // A sparse concurrent sweep keeps calibration affordable; never used for fitting.
+      if (concurrency > 1 && ((block != 8192 && block != 524288 && block != 2097152) || count == 4))
+        continue;
+      auto src = Allocate(total, 0x5a), dst = Allocate(total, 0);
       std::unique_ptr<TransferEngine> engine;
       std::unique_ptr<IUMBPClient> client;
       if (phase == "api") {
         UMBPConfig config;
         config.page_size = block;
-        config.dram.capacity_bytes = std::max(bytes * 2, size_t{16} << 20);
+        config.dram.capacity_bytes = std::max(total * 2, size_t{16} << 20);
         config.dram.prefault_threads = 1;
         config.ssd.enabled = false;
         config.sim.enabled = sim;
         config.sim.profile_path = profile;
-        config.sim.trace_path = "/dev/null";  // Include formatting and buffered output costs.
+        config.sim.trace_path = "/dev/null";
         client = CreateUMBPClient(config);
-        if (!client->RegisterMemory(reinterpret_cast<uintptr_t>(src.get()), bytes) ||
-            !client->RegisterMemory(reinterpret_cast<uintptr_t>(dst.get()), bytes))
+        if (!client->RegisterMemory(reinterpret_cast<uintptr_t>(src.get()), total) ||
+            !client->RegisterMemory(reinterpret_cast<uintptr_t>(dst.get()), total))
           throw std::runtime_error("UMBP calibration registration failed");
       } else if (sim) {
         engine = std::make_unique<SimTransferEngine>(profile);
       } else {
         engine = std::make_unique<LocalCopyEngine>();
       }
-      std::vector<std::string> keys;
-      std::vector<uintptr_t> srcs, dsts;
+      struct Request {
+        std::vector<std::string> keys;
+        std::vector<uintptr_t> srcs, dsts;
+        std::vector<TransferItem> items;
+      };
+      std::vector<Request> requests(concurrency);
       std::vector<size_t> sizes(count, block);
-      std::vector<TransferItem> items;
-      for (size_t k = 0; k < count; ++k) {
-        char* source = src.get() + k * block;
-        char* target = dst.get() + k * block;
-        keys.push_back(std::to_string(k));
-        srcs.push_back(reinterpret_cast<uintptr_t>(source));
-        dsts.push_back(reinterpret_cast<uintptr_t>(target));
-        items.push_back({TransferRef::HostBytes(source, block), 0,
-                         TransferRef::HostBytes(target, block), 0, block, k});
+      for (size_t c = 0; c < concurrency; ++c) {
+        auto& request = requests[c];
+        for (size_t k = 0; k < count; ++k) {
+          const size_t index = c * count + k;
+          char* source = src.get() + index * block;
+          char* target = dst.get() + index * block;
+          // Detect accidental key/caller aliasing in the real-payload check.
+          std::memcpy(source, &index, sizeof(index));
+          request.keys.push_back(std::to_string(index));
+          request.srcs.push_back(reinterpret_cast<uintptr_t>(source));
+          request.dsts.push_back(reinterpret_cast<uintptr_t>(target));
+          request.items.push_back({TransferRef::HostBytes(source, block), 0,
+                                   TransferRef::HostBytes(target, block), 0, block, k});
+        }
       }
-      std::vector<std::pair<int64_t, int64_t>> times;
       auto elapsed = [](Clock::time_point start) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
       };
+      std::vector<std::pair<bool, std::vector<int64_t>>> measurements;
       for (int i = -8; i < samples; ++i) {
         if (client && !client->Clear()) throw std::runtime_error("UMBP calibration clear failed");
-        if (cold && !sim) FlushSource(src.get(), bytes);
-        int64_t first, second = 0;
-        if (engine) {
-          auto plan = engine->Plan(items);
-          const auto start = Clock::now();
-          auto handle = engine->Submit(std::move(plan.plans));
-          if (!handle) throw std::runtime_error("UMBP calibration transfer failed");
-          std::vector<TransferFailure> failures;
-          handle->Wait(&failures);
-          first = elapsed(start);
-          if (!failures.empty()) throw std::runtime_error("UMBP calibration copy failed");
-        } else {
-          auto start = Clock::now();
-          auto result = client->BatchPut(keys, srcs, sizes);
-          first = elapsed(start);
-          Check(result, count);
-          start = Clock::now();
-          result = client->BatchGet(keys, dsts, sizes);
-          second = elapsed(start);
-          Check(result, count);
+        if (cold && !sim) FlushSource(src.get(), total);
+        for (bool get : {false, true}) {
+          if (engine && get) continue;
+          auto times = Concurrent(concurrency, [&](size_t c) {
+            const auto& request = requests[c];
+            if (engine) {
+              auto plan = engine->Plan(request.items);
+              if (!plan.rejected_tags.empty()) throw std::runtime_error("rejected transfer");
+              const auto start = Clock::now();
+              auto handle = engine->Submit(std::move(plan.plans));
+              if (!handle) throw std::runtime_error("UMBP calibration transfer failed");
+              std::vector<TransferFailure> failures;
+              handle->Wait(&failures);
+              const auto ns = elapsed(start);
+              if (!failures.empty()) throw std::runtime_error("UMBP calibration copy failed");
+              return ns;
+            }
+            const auto start = Clock::now();
+            const auto result = get ? client->BatchGet(request.keys, request.dsts, sizes)
+                                    : client->BatchPut(request.keys, request.srcs, sizes);
+            const auto ns = elapsed(start);
+            Check(result, count);
+            return ns;
+          });
+          if (i >= 0) measurements.emplace_back(get, std::move(times));
         }
-        if (i >= 0) times.emplace_back(first, second);
       }
-      if (!sim && std::memcmp(src.get(), dst.get(), bytes) != 0)
+      if (!sim && std::memcmp(src.get(), dst.get(), total) != 0)
         throw std::runtime_error("UMBP calibration payload mismatch");
-      for (size_t i = 0; i < times.size(); ++i) {
-        auto emit = [&](const char* api, int64_t ns) {
-          std::cout << block << ',' << count << ',' << LocalCopyThreads(bytes, count) << ',' << api
-                    << ',' << i << ',' << ns << '\n';
-        };
-        emit(client ? "put" : "transfer", times[i].first);
-        if (client) emit("get", times[i].second);
+      for (size_t i = 0; i < measurements.size(); ++i) {
+        const auto& [get, times] = measurements[i];
+        for (auto ns : times)
+          std::cout << block << ',' << count << ',' << LocalCopyThreads(bytes, count) << ','
+                    << concurrency << ','
+                    << (engine ? "transfer"
+                        : get  ? "get"
+                               : "put")
+                    << ',' << (engine ? i : i / 2) << ',' << ns << '\n';
       }
     }
   }
+}
+
+int Positive(const char* text) {
+  size_t parsed = 0;
+  const int value = std::stoi(text, &parsed);
+  if (value <= 0 || parsed != std::strlen(text))
+    throw std::invalid_argument("expected a positive integer");
+  return value;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc < 4 || argc > 5 ||
+    if (argc < 4 ||
         (std::string(argv[1]) != "train" && std::string(argv[1]) != "engine" &&
          std::string(argv[1]) != "api") ||
-        (std::string(argv[2]) != "cold" && std::string(argv[2]) != "reuse") ||
-        (argc == 5 && std::string(argv[1]) == "train"))
+        (std::string(argv[2]) != "cold" && std::string(argv[2]) != "reuse"))
       throw std::invalid_argument(
-          "usage: umbp_sim_probe train|engine|api cold|reuse samples [profile]");
-    size_t parsed = 0;
-    const int samples = std::stoi(argv[3], &parsed);
-    if (samples <= 0 || parsed != std::strlen(argv[3]))
-      throw std::invalid_argument("samples must be a positive integer");
-    Measure(argv[1], std::string(argv[2]) == "cold", samples, argc == 5 ? argv[4] : "");
+          "usage: umbp_sim_probe train|engine|api cold|reuse samples [profile] "
+          "[--concurrency 1|2|4] [--max-mib 256]");
+    std::string profile;
+    int concurrency = 1, max_mib = 256;
+    for (int i = 4; i < argc; ++i) {
+      const std::string arg = argv[i];
+      if ((arg == "--concurrency" || arg == "--max-mib") && i + 1 < argc) {
+        (arg == "--concurrency" ? concurrency : max_mib) = Positive(argv[++i]);
+      } else if (profile.empty() && arg.rfind("--", 0) != 0) {
+        profile = arg;
+      } else {
+        throw std::invalid_argument("unknown or incomplete option: " + arg);
+      }
+    }
+    if ((concurrency != 1 && concurrency != 2 && concurrency != 4) ||
+        (std::string(argv[1]) == "train" && (!profile.empty() || concurrency != 1)))
+      throw std::invalid_argument(
+          "training requires real single-caller transfers; concurrency is 1/2/4");
+    Measure(argv[1], std::string(argv[2]) == "cold", Positive(argv[3]), profile, concurrency,
+            static_cast<size_t>(max_mib) << 20);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
