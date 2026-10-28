@@ -949,17 +949,14 @@ bool PoolClient::Init() {
     const bool unsupported = std::any_of(backends.begin(), backends.end(), [](const auto& backend) {
       return backend.tier != TierType::DRAM && backend.tier != TierType::HBM;
     });
-    if (unsupported || !config_.io_engine.host.empty() || config_.ranged_get_scratch_size != 0 ||
-        config_.ranged_put_scratch_size != 0 || config_.peer_service_port != 0 ||
-        config_.auto_peer_service_port) {
-      MORI_UMBP_ERROR(
-          "[UMBP sim] only in-process DRAM/HBM supported; disable RDMA, peer service and remote "
-          "scratch");
+    if (unsupported) {
+      MORI_UMBP_ERROR("[UMBP sim] only DRAM/HBM storage is supported");
       initialized_.store(false);
       return false;
     }
     try {
-      sim_engine = std::make_unique<SimTransferEngine>(config_.sim.profile_path);
+      sim_engine = std::make_unique<SimTransferEngine>(
+          config_.sim.profile_path, config_.master_config.node_id, config_.staging_buffer_size);
     } catch (const std::exception& e) {
       MORI_UMBP_ERROR("[UMBP sim] {}", e.what());
       initialized_.store(false);
@@ -985,6 +982,7 @@ bool PoolClient::Init() {
   // holds TransferEngine / MemoryRegistrar / PeerDirectory.
   auto composite = std::make_unique<CompositeTransferEngine>();
   if (config_.sim.enabled) {
+    peer_directory_ = sim_engine.get();
     composite->AddEngine(std::move(sim_engine));
   } else {
     composite->AddEngine(std::make_unique<LocalCopyEngine>());
@@ -2194,13 +2192,27 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   // serialize unrelated Get finalizers behind this memcpy.
   ReCacheJob job;
   job.key = key;
-  job.bytes = std::unique_ptr<char[]>(new (std::nothrow) char[size]);
+  if (config_.sim.enabled) {
+    auto buffer = AllocateSimMemory(size);
+    job.bytes = decltype(job.bytes)(static_cast<char*>(buffer.ptr), {buffer.mapped_size});
+  } else {
+    job.bytes.reset(new (std::nothrow) char[size]);
+  }
   if (!job.bytes) {
     recache_stats_.alloc_failed.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   job.size = size;
-  HostCopyBlock(job.bytes.get(), src, size);
+  if (config_.sim.enabled) {
+    const auto [ref, offset] = UserBufferRef(const_cast<void*>(src), size);
+    if (!transfer_engine_->Transfer(
+            {{ref, offset, TransferRef::HostBytes(job.bytes.get(), size), 0, size, 0}}, nullptr)) {
+      recache_stats_.install_failed.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  } else {
+    HostCopyBlock(job.bytes.get(), src, size);
+  }
 
   // Enqueue for asynchronous install. The actual DRAM Allocate + copy +
   // Commit→KvEvent::ADD publish is performed by ReCacheWorkerLoop OFF the Get
@@ -5107,10 +5119,6 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(const std::string& node
 // ---------------------------------------------------------------------------
 
 bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
-  if (config_.sim.enabled) {
-    MORI_UMBP_ERROR("[UMBP sim] remote owner '{}' is unsupported", peer.node_id);
-    return false;
-  }
   std::lock_guard<std::mutex> lock(peer.conn_mutex);
   if (peer.peer_address.empty()) {
     return false;

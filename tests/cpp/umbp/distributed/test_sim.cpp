@@ -30,10 +30,12 @@
 #include <future>
 #include <thread>
 
+#include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/pool/tier_graph.h"
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
+#include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/sim/sim.h"
 #include "umbp/sim/trace.h"
 #include "umbp/umbp_client.h"
@@ -372,10 +374,9 @@ TEST_F(SimTest, RejectsUnsupportedConfigurationsAndBadProfiles) {
   EXPECT_THROW(CreateUMBPClient(config), std::runtime_error);
   config.distributed->medium = UMBPMedium::DRAM;
   config.distributed->io_engine.host = "127.0.0.1";
-  EXPECT_THROW(CreateUMBPClient(config), std::runtime_error);
-  config.distributed->io_engine.host.clear();
+  EXPECT_NO_THROW(CreateUMBPClient(config));  // Sim replaces the configured RDMA engine.
   config.distributed->ranged_scratch_size = kPage;
-  EXPECT_THROW(CreateUMBPClient(config), std::invalid_argument);
+  EXPECT_NO_THROW(CreateUMBPClient(config));
   Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
                            "bandwidth_bytes_per_second":0}})");
   EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
@@ -411,6 +412,285 @@ TEST_F(SimTest, MissingPathAbortsReservationAndDefaultModeStillCopies) {
   EXPECT_TRUE(real->Put("real", reinterpret_cast<uintptr_t>(&src), 1));
   EXPECT_TRUE(real->Get("real", reinterpret_cast<uintptr_t>(&dst), 1));
   EXPECT_EQ(dst, src);
+}
+
+std::string Packed(const PeerDirectory& engine) {
+  const auto bytes = engine.PackedLocalEngineDesc();
+  return {bytes.begin(), bytes.end()};
+}
+
+TEST_F(SimTest, RemotePlansPreservePeerIdentityAndAsynchronousCompletion) {
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+    "remote_read":{"channel":"nic-rx","latency_ns":80000000,"bandwidth_bytes_per_second":1e12},
+    "remote_write":{"channel":"nic-tx","latency_ns":80000000,"bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine caller(Config().sim.profile_path, "caller", 2 * kPage);
+  SimTransferEngine first(Config().sim.profile_path, "first");
+  SimTransferEngine second(Config().sim.profile_path, "second");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("first", Packed(first)));
+  ASSERT_TRUE(caller.EnsureRemoteEngine("second", Packed(second)));
+  SimPageMemorySource memory(MemLoc::CPU, -1);
+  std::vector<PageMemorySource::Buffer> buffers;
+  ASSERT_TRUE(memory.Allocate({4 * kPage}, &buffers));
+  auto local = caller.RegisterMemory(buffers[0].base, 4 * kPage, MemLoc::CPU, -1);
+  // Deliberately equal virtual addresses and memory IDs on different peers.
+  auto a = TransferRef::Remote(first.RegisterMemory(buffers[0].base, kPage, MemLoc::CPU, -1).mem);
+  auto b = TransferRef::Remote(second.RegisterMemory(buffers[0].base, kPage, MemLoc::CPU, -1).mem);
+  auto plans = caller.Plan({{a, 0, local, 0, kPage, 0}, {b, 0, local, kPage, kPage, 1}});
+  ASSERT_EQ(plans.plans.size(), 2u);
+  EXPECT_NE(plans.plans[0].src.mem.engineKey, plans.plans[1].src.mem.engineKey);
+  EXPECT_EQ(plans.plans[0].dir, TransferDirection::kPull);
+  auto start = Clock::now();
+  auto read = caller.Submit(std::move(plans.plans));
+  auto writes = caller.Plan({{local, 0, a, 0, kPage, 0}});
+  auto write = caller.Submit(std::move(writes.plans));
+  ASSERT_NE(read, nullptr);
+  ASSERT_NE(write, nullptr);
+  EXPECT_LT(Clock::now() - start, 60ms);  // Both posted, neither has completed yet.
+  std::vector<TransferFailure> failures;
+  read->Wait(&failures);
+  write->Wait(&failures);
+  EXPECT_GE(Clock::now() - start, 80ms);
+  EXPECT_TRUE(failures.empty());
+  EXPECT_FALSE(caller.CanHandle(a, b));
+  EXPECT_EQ(caller.Plan({{local, 0, a, kPage, 1, 0}}).rejected_tags.size(), 1u);
+
+  auto unregistered = TransferRef::HostBytes(buffers[0].base, 4 * kPage);
+  auto staged = caller.Plan({{unregistered, 0, a, 0, kPage, 0}});
+  ASSERT_EQ(staged.plans.size(), 1u);
+  EXPECT_TRUE(staged.plans[0].uses_bounce);
+  start = Clock::now();
+  auto staged_handle = caller.Submit(std::move(staged.plans));
+  ASSERT_NE(staged_handle, nullptr);
+  EXPECT_GE(Clock::now() - start, 80ms);  // Staging completes inside Submit, as in RDMA.
+  staged_handle->Wait(&failures);
+  EXPECT_TRUE(failures.empty());
+  EXPECT_TRUE(caller.Transfer({{a, 0, unregistered, 0, kPage, 0}}, nullptr));
+
+  caller.ForgetRemote("first");
+  EXPECT_FALSE(caller.CanHandle(a, local));
+  mori::io::IOEngineConfig io;
+  MoriIoEngine real("real", io, 0);  // No RDMA initialization needed for handshake rejection.
+  EXPECT_FALSE(real.EnsureRemoteEngine("sim", Packed(caller)));
+  mori::io::EngineDesc real_desc{};
+  real_desc.key = "real";
+  msgpack::sbuffer packed;
+  msgpack::pack(packed, real_desc);
+  EXPECT_FALSE(caller.EnsureRemoteEngine("real", {packed.data(), packed.size()}));
+}
+
+class SimClusterTest : public SimTest {
+ protected:
+  void SetUp() override {
+    SimTest::SetUp();
+    Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+      "remote_read":{"channel":"nic","latency_ns":1000000,"bandwidth_bytes_per_second":4096000},
+      "remote_write":{"channel":"nic","latency_ns":1000000,"bandwidth_bytes_per_second":4096000}})");
+    MasterServerConfig config;
+    config.listen_address = "127.0.0.1:0";
+    master_ = std::make_unique<MasterServer>(std::move(config));
+    thread_ = std::thread([this] { master_->Run(); });
+    for (int i = 0; i < 200 && master_->GetBoundPort() == 0; ++i) std::this_thread::sleep_for(5ms);
+    ASSERT_NE(master_->GetBoundPort(), 0);
+    ASSERT_TRUE(memory_.Allocate({64 * kPage}, &buffers_));
+    ptr_ = reinterpret_cast<uintptr_t>(buffers_[0].base);
+  }
+  void TearDown() override {
+    master_->Shutdown();
+    if (thread_.joinable()) thread_.join();
+    SimTest::TearDown();
+  }
+  UMBPConfig Node(const std::string& id, size_t pages = 32) {
+    auto config = Config();
+    config.dram.capacity_bytes = pages * kPage;
+    config.distributed.emplace();
+    auto& dc = *config.distributed;
+    dc.master_config.node_id = id;
+    dc.master_config.node_address = "127.0.0.1";
+    dc.master_config.master_address = "127.0.0.1:" + std::to_string(master_->GetBoundPort());
+    dc.auto_peer_service_port = true;
+    dc.io_engine.host = "0.0.0.0";  // Existing deployment setting, no actual RDMA started.
+    dc.ranged_scratch_size = 32 * kPage;
+    dc.cache_remote_fetches = false;
+    dc.ranged_locality_prefetch = false;
+    config.sim.trace_path = dir_ + "/" + id + ".jsonl";
+    return config;
+  }
+  std::unique_ptr<PoolClient> Pool(const std::string& id, bool recache) {
+    const auto config = Node(id);
+    PoolClientConfig pc;
+    pc.sim = config.sim;
+    pc.master_config = config.distributed->master_config;
+    pc.auto_peer_service_port = true;
+    pc.dram.buffer_sizes = {32 * kPage};
+    pc.dram_page_size = kPage;
+    pc.cache_remote_fetches = recache;
+    auto client = std::make_unique<PoolClient>(pc);
+    EXPECT_TRUE(client->Init());
+    EXPECT_TRUE(client->RegisterMemory(reinterpret_cast<void*>(ptr_), 64 * kPage));
+    return client;
+  }
+  template <class Predicate>
+  bool Await(Predicate ready) {
+    const auto deadline = Clock::now() + 2s;
+    while (!ready()) {
+      if (Clock::now() >= deadline) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return true;
+  }
+  SimPageMemorySource memory_{MemLoc::CPU, -1};
+  std::vector<PageMemorySource::Buffer> buffers_;
+  uintptr_t ptr_ = 0;
+  std::unique_ptr<MasterServer> master_;
+  std::thread thread_;
+};
+
+TEST_F(SimClusterTest, PublicShareAndRangedOffloadRunRealControlRpcs) {
+  auto owner = CreateUMBPClient(Node("owner", 64));
+  ASSERT_TRUE(owner->Put("shared", ptr_, 2 * kPage));
+  ASSERT_TRUE(owner->Flush());
+  auto reader = CreateUMBPClient(Node("reader", 1));
+  ASSERT_TRUE(reader->RegisterMemory(ptr_, 64 * kPage));
+  ASSERT_TRUE(Await([&] { return reader->Exists("shared"); }));
+  auto start = Clock::now();
+  ASSERT_TRUE(reader->Get("shared", ptr_, 2 * kPage));
+  EXPECT_GE(Clock::now() - start, 3ms);
+  EXPECT_EQ(reader->BatchGet({"shared", "missing"}, {ptr_, ptr_}, {2 * kPage, kPage}),
+            (std::vector<bool>{true, false}));
+  EXPECT_EQ(reader->BatchGetRanges({"shared"}, {{ptr_, ptr_ + kPage}}, {{128, 128}},
+                                   {{kPage - 64, 2 * kPage - 128}}),
+            std::vector<bool>{true});
+  // Object exceeds reader capacity: Master must place both forms on owner.
+  EXPECT_TRUE(reader->Put("offload", ptr_, 4 * kPage));
+  EXPECT_EQ(reader->BatchPutRanges({"ranged-offload"}, {4 * kPage}, {{ptr_, ptr_ + 2 * kPage}},
+                                   {{2 * kPage, 2 * kPage}}, {{0, 2 * kPage}}),
+            std::vector<bool>{true});
+  EXPECT_TRUE(owner->Get("offload", ptr_, 4 * kPage));
+  EXPECT_TRUE(owner->Get("ranged-offload", ptr_, 4 * kPage));
+  ASSERT_TRUE(owner->Clear());
+  EXPECT_FALSE(reader->Get("shared", ptr_, 2 * kPage));
+  EXPECT_FALSE(reader->Get("offload", ptr_, 4 * kPage));
+  EXPECT_FALSE(reader->Get("ranged-offload", ptr_, 4 * kPage));
+  reader->Close();
+  std::ifstream trace(dir_ + "/reader.jsonl");
+  std::string line;
+  bool timed_remote_get = false;
+  while (std::getline(trace, line)) {
+    google::protobuf::Struct record;
+    ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(line, &record).ok());
+    const auto& f = record.fields();
+    if (f.at("api").string_value() == "get" && f.at("result_count").number_value() == 1) {
+      timed_remote_get = true;
+      EXPECT_GE(f.at("elapsed_ns").number_value(), 3000000);
+    }
+  }
+  EXPECT_TRUE(timed_remote_get);
+}
+
+TEST_F(SimClusterTest, RemoteRecacheAndEvictionKeepRealMetadata) {
+  auto owner = Pool("owner", false);
+  auto* payload = reinterpret_cast<void*>(ptr_);
+  ASSERT_TRUE(owner->Put("cached", payload, kPage));
+  ASSERT_TRUE(owner->Put("evicted", payload, kPage));
+  owner->Master().FlushHeartbeat();
+  auto reader = Pool("reader", true);
+  ASSERT_TRUE(Await([&] { return reader->Exists("cached"); }));
+  ASSERT_TRUE(reader->Get("cached", payload, kPage));
+  auto* backend = reader->Backends().Get(TierType::DRAM);
+  auto deadline = Clock::now() + 2s;
+  while (!backend->Contains("cached") && Clock::now() < deadline) std::this_thread::sleep_for(1ms);
+  ASSERT_TRUE(backend->Contains("cached"));
+  EXPECT_EQ(owner->Backends().Get(TierType::DRAM)->Evict({"evicted"}).front().bytes_freed, kPage);
+  owner->Master().FlushHeartbeat();
+  EXPECT_FALSE(reader->Get("evicted", payload, kPage));
+  ASSERT_TRUE(owner->Clear());
+  EXPECT_TRUE(reader->Get("cached", payload, kPage));
+  reader->Master().FlushHeartbeat();
+  auto observer = Pool("observer", false);
+  ASSERT_TRUE(Await([&] { return observer->Exists("cached"); }));
+  EXPECT_TRUE(observer->Get("cached", payload, kPage));  // Re-cached replica serves another peer.
+}
+
+TEST_F(SimClusterTest, MissingNetworkPathAbortsRemoteWrite) {
+  auto owner = Pool("owner", false);
+  auto* backend = owner->Backends().Get(TierType::DRAM);
+  const auto available = backend->Capacity().available_bytes;
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e10}})");
+  auto reader = CreateUMBPClient(Node("reader", 1));
+  ASSERT_TRUE(reader->RegisterMemory(ptr_, 64 * kPage));
+  EXPECT_FALSE(reader->Put("failed", ptr_, 2 * kPage));
+  EXPECT_FALSE(owner->Exists("failed"));
+  EXPECT_EQ(backend->Capacity().available_bytes, available);
+  EXPECT_TRUE(owner->Put("failed", reinterpret_cast<void*>(ptr_), 2 * kPage));
+}
+
+TEST_F(SimTest, RemoteDescriptorsKeepBackendAndGenerationIdentity) {
+  SimTransferEngine caller(Config().sim.profile_path, "caller");
+  SimTransferEngine owner(Config().sim.profile_path, "owner");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
+  auto first = owner.RegisterMemory(reinterpret_cast<void*>(0x10000), kPage, MemLoc::CPU, -1);
+  auto second = owner.RegisterMemory(reinterpret_cast<void*>(0x20000), kPage, MemLoc::GPU, 0);
+  auto descriptor = [](const TransferRef& ref, uint32_t backend) {
+    msgpack::sbuffer bytes;
+    msgpack::pack(bytes, ref.mem);
+    BufferMemoryDescBytes desc;
+    desc.backend_id = backend;
+    desc.buffer_index = 0;
+    desc.desc_bytes.assign(bytes.data(), bytes.data() + bytes.size());
+    return desc;
+  };
+  caller.CacheRemoteBuffers("owner", {descriptor(first, 0), descriptor(second, 1)});
+  ASSERT_TRUE(caller.HasRemoteBuffers("owner"));
+  EXPECT_EQ(caller.RemoteBufferSnapshot("owner", 0).front().mem.id, first.mem.id);
+  EXPECT_EQ(caller.RemoteBufferSnapshot("owner", 1).front().mem.id, second.mem.id);
+  caller.CacheRemoteBuffers("owner", {descriptor(second, 0)});
+  EXPECT_EQ(caller.RemoteBufferSnapshot("owner", 0).front().mem.id, first.mem.id);
+  SimTransferEngine restarted(Config().sim.profile_path, "owner");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(restarted)));
+  EXPECT_FALSE(caller.HasRemoteBuffers("owner"));
+  caller.CacheRemoteBuffers("owner", {descriptor(first, 0)});  // Old process generation.
+  EXPECT_FALSE(caller.HasRemoteBuffers("owner"));
+}
+
+TEST_F(SimClusterTest, VirtualHbmOwnerServesRegisteredGpuCaller) {
+  Profile(R"({"gpu_gpu":{"channel":"hbm","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+    "remote_read":{"channel":"nic","latency_ns":1000000,"bandwidth_bytes_per_second":4096000},
+    "remote_write":{"channel":"nic","latency_ns":1000000,"bandwidth_bytes_per_second":4096000}})");
+  auto config = Node("hbm-owner", 64);
+  config.distributed->medium = UMBPMedium::HBM;
+  config.distributed->hbm.capacity_bytes = 64 * kPage;
+  auto owner = CreateUMBPClient(config);
+  ASSERT_TRUE(owner->RegisterMemory(ptr_, 64 * kPage, MemLoc::GPU, 0));
+  ASSERT_TRUE(owner->Put("hbm-shared", ptr_, 2 * kPage));
+  ASSERT_TRUE(owner->Flush());
+  auto reader = CreateUMBPClient(Node("gpu-reader", 1));
+  ASSERT_TRUE(reader->RegisterMemory(ptr_, 64 * kPage, MemLoc::GPU, 0));
+  ASSERT_TRUE(Await([&] { return reader->Exists("hbm-shared"); }));
+  EXPECT_TRUE(reader->Get("hbm-shared", ptr_, 2 * kPage));
+  EXPECT_TRUE(reader->Put("hbm-offload", ptr_, 4 * kPage));
+  EXPECT_TRUE(owner->Get("hbm-offload", ptr_, 4 * kPage));
+}
+
+TEST_F(SimTest, BounceCopiesUseSerialCpuBandwidth) {
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
+    "bandwidth_bytes_per_second":[10485760,20971520,31457280,41943040]},
+    "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
+  constexpr size_t bytes = 1 << 20;
+  SimTransferEngine caller(Config().sim.profile_path, "caller", bytes);
+  SimTransferEngine owner(Config().sim.profile_path, "owner");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
+  SimPageMemorySource memory(MemLoc::CPU, -1);
+  std::vector<PageMemorySource::Buffer> buffers;
+  ASSERT_TRUE(memory.Allocate({bytes}, &buffers));
+  auto local = TransferRef::HostBytes(buffers[0].base, bytes);
+  auto remote =
+      TransferRef::Remote(owner.RegisterMemory(buffers[0].base, bytes, MemLoc::CPU, -1).mem);
+  std::vector<TransferItem> items;
+  for (size_t i = 0; i < 4; ++i)
+    items.push_back({local, i * bytes / 4, remote, i * bytes / 4, bytes / 4, i});
+  const auto start = Clock::now();
+  ASSERT_TRUE(caller.Transfer(items, nullptr));
+  EXPECT_GE(Clock::now() - start, 100ms);  // CPU staging is serial even with four copy threads.
 }
 
 }  // namespace

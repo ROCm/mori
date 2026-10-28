@@ -1,12 +1,12 @@
-# UMBP local storage and transfer simulation
+# UMBP storage and transfer simulation
 
 Simulation estimates the time spent **inside UMBP APIs** while running the real
 allocation, placement, commit/abort, lookup, LRU, lease, watermark and local tier
 transition code. It reserves virtual DRAM/HBM capacity and waits for modeled
 transfers without accessing KV payloads. Simulation is off by default.
 
-This first version supports one in-process storage owner with DRAM/HBM
-PageBackends, including policies containing both. It uses wall-clock delays:
+This version supports in-process storage owners with DRAM/HBM PageBackends,
+including policies containing both and sharing KV across peers. It uses wall-clock delays:
 heartbeats, leases and background workers retain their existing timing.
 
 ## Enable
@@ -120,7 +120,8 @@ export UMBP_SIM_TRACE=/tmp/umbp-sim-worker-0.jsonl
 
 [`sim_profile.json`](../examples/umbp/sim_profile.json) contains **illustrative,
 uncalibrated estimates**. Replace the coefficients with measured values.
-Each configured path (`cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`) has:
+Each configured path (`cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`, `remote_read`,
+`remote_write`) has:
 
 - `latency_ns`: nonnegative fixed overhead per submitted batch on that path.
 - `bandwidth_bytes_per_second`: positive effective bandwidth.
@@ -158,8 +159,11 @@ limit. It approximates throughput and per-submission latency, not dynamic fair
 sharing or exact completion order among competing streams.
 
 Foreground copies and background tier transitions use the same engine and
-channel queues. Submit waits until all its channels finish, matching existing
-synchronous local copies. Fragmenting one transfer into pages does not multiply
+channel queues. Local copies finish inside Submit; registered remote transfers
+return a handle and finish in Wait, preserving the existing overlap with other
+peers and local work. Unregistered CPU buffers use the RDMA planner's bounce
+geometry and complete staging inside Submit, including modeled CPU copies.
+Fragmenting one transfer into pages does not multiply
 fixed submission latency. The optional per-copy cost applies after adjacent
 segments have been coalesced by the real planner. One UMBP batch API may issue multiple Submit calls; its existing
 control flow determines those boundaries. Zero-byte work adds no modeled delay.
@@ -171,6 +175,57 @@ the trace for reproducibility. Calibration must also match source-buffer reuse
 and working-set size: cold DRAM and a repeatedly reused cached source can have
 very different effective bandwidths. There is no automatic cache-state inference,
 device topology or cross-process queue.
+
+## Cross-node sharing
+
+Run the normal Master and configure each peer as usual: distinct node IDs,
+reachable node addresses and peer-service ports, DRAM/HBM capacity, and optionally
+`ranged_scratch_size`. Enable simulation and supply a profile on **every peer**.
+The Master and peer RPCs still run over the real network: registration, routing,
+allocation, resolve, commit/abort, leases, heartbeats and eviction are unchanged.
+The configured RDMA engine is replaced with the simulator; no NIC registration
+or payload traffic occurs. Simulated and real transfer engines reject each
+other's handshake. Use a dedicated simulation Master to keep their metadata apart.
+
+Add network parameters to the profile's existing `paths`. These example numbers
+are **illustrative, not measured**:
+
+```json
+"remote_read": {
+  "channel": "nic",
+  "latency_ns": 8000,
+  "copy_latency_ns": 0,
+  "bandwidth_bytes_per_second": 25000000000
+},
+"remote_write": {
+  "channel": "nic",
+  "latency_ns": 8000,
+  "copy_latency_ns": 0,
+  "bandwidth_bytes_per_second": 25000000000
+}
+```
+
+Read/write are from the initiating client's perspective. The same channel shares
+capacity across peers and directions in that client; separate names model
+independent directions. Network coefficients are scalars and apply to the endpoint
+types represented by the measurements. Use target-link **transfer Submit+Wait**
+measurements for fitting; API or ping RTT includes different control work and
+must not be charged again. The packaged automatic sampler currently calibrates
+CPU copies only; it does not measure RDMA or supply calibrated network values.
+
+Ordinary and ranged load/offload use the real peer control paths. Storage pools,
+ranged scratch, bounce buffers and asynchronous re-cache payloads are virtual.
+Remote reads can still create local replicas using the existing admission and
+queue policies, and those replicas can subsequently serve other peers. The
+same JSONL API trace includes real RPC/control time, modeled transfer waits and
+any on-path staging. Waits that overlap are not summed twice.
+
+Channel queues are local to each client. This models one initiator's configured
+link capacity; it does not aggregate different initiators contending for the same
+remote NIC or model switch congestion. Transport failures during a modeled delay
+are not synthesized; actual control RPC failures still follow normal failure paths.
+Running peers on one machine exercises the control protocol but measures that
+machine's RPC costs, not the RPC latency of a different physical cluster.
 
 ## Storage and timing records
 
@@ -209,21 +264,20 @@ contributes when it blocks an API or competes for a channel; its independent lif
 
 ## Boundaries
 
-- Standalone-process/standalone server, SSD, RDMA and remote ranged scratch are
-  rejected. Peer serving must be disabled. Remote owner connections are refused.
-- A dedicated Master may register/query this single owner and receive its real
-  metadata events. Use a simulation-only Master; virtual capacity must not be
-  advertised to production clients. Multi-owner payload routing is unsupported.
+- Standalone-process/standalone server and SSD remain unsupported. In-process
+  peers use simulated payload transfers and real Master/peer control RPCs.
 - This version does not replace framework-owned buffers, HBM-to-host L2 copies,
   model computation, or other framework latency. It is intended for trace/dummy
   execution; restored bytes and generated tokens cannot be checked for correctness.
 - The estimates depend on the control host, workload, copy-thread count and supplied
   coefficients. A profile calibrated with one concurrency configuration does not
   establish accuracy for another.
-  Full SGLang integration and calibration are follow-up validation work, not
+  Full SGLang integration and GPU/network calibration are follow-up validation work, not
   accuracy guarantees established by the unit tests.
 
 Focused checks: build `test_umbp_sim` and run `ctest -R '^umbp_sim$'` from the
 build directory. Tests exercise inaccessible payload buffers, real API results,
 virtual HBM, capacity/LRU/leases/reaper/events, local demotion, modeled delay and
-channel contention, configuration rejection, and default real-copy behavior.
+channel contention, remote/ranged share, re-cache, eviction visibility, failed-write
+rollback, distinct peer descriptors, staging, asynchronous completion, mixed-mode
+rejection, configuration rejection, and default real-copy behavior.

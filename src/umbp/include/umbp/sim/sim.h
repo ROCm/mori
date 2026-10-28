@@ -22,6 +22,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <optional>
@@ -31,8 +32,12 @@
 
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
+#include "umbp/local/host_mem_allocator.h"
 
 namespace mori::umbp {
+
+// Same ownership/freeing contract as HostMemAllocator, without payload pages.
+HostBufferHandle AllocateSimMemory(size_t size);
 
 // Address identities only. PROT_NONE makes accidental payload access fail.
 class SimPageMemorySource final : public PageMemorySource {
@@ -51,19 +56,28 @@ class SimPageMemorySource final : public PageMemorySource {
   std::vector<Buffer> buffers_;
 };
 
-// Models local memory copies, completing inside Submit just like the real local engines.
-class SimTransferEngine final : public TransferEngine {
+// Local copies finish in Submit; remote direct copies finish in Wait, like mori-io.
+class SimTransferEngine final : public TransferEngine, public PeerDirectory {
  public:
-  explicit SimTransferEngine(const std::string& profile_path);
+  explicit SimTransferEngine(const std::string& profile_path, std::string node_id = "",
+                             uint64_t bounce_bytes = 0);
   const char* Name() const override { return "SimTransferEngine"; }
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
-                             int device) override {
-    return TransferRef::HostBytes(base, size, loc, device);
-  }
+                             int device) override;
   void Deregister(const TransferRef&) override {}
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
+
+  std::vector<uint8_t> PackedLocalEngineDesc() const override;
+  bool EnsureRemoteEngine(const std::string& node_id, const std::string& packed) override;
+  bool HasRemoteEngine(const std::string& node_id) const override;
+  void ForgetRemote(const std::string& node_id) override;
+  void CacheRemoteBuffers(const std::string& node_id,
+                          const std::vector<BufferMemoryDescBytes>& descs) override;
+  bool HasRemoteBuffers(const std::string& node_id) const override;
+  std::vector<TransferRef> RemoteBufferSnapshot(const std::string& node_id,
+                                                uint32_t backend_id) const override;
 
  private:
   using Clock = std::chrono::steady_clock;
@@ -75,10 +89,23 @@ class SimTransferEngine final : public TransferEngine {
     std::vector<double> copy_latency_ns;
     double capacity;
   };
-  // CPU->CPU, CPU->GPU, GPU->CPU, GPU->GPU. Channels may be shared across paths.
-  std::array<std::optional<Path>, 4> paths_;
+  std::optional<Clock::time_point> Reserve(const std::vector<TransferPlan>& plans,
+                                           Clock::time_point submitted, bool serial_cpu = false);
+  // Four local memory paths, remote_read, remote_write; channels may be shared.
+  std::array<std::optional<Path>, 6> paths_;
   std::mutex mutex_;
   std::unordered_map<std::string, Clock::time_point> available_;
+  std::string engine_key_;
+  std::atomic<uint32_t> next_memory_id_{1};
+  struct RemoteNode {
+    std::string engine_key;
+    std::array<std::vector<TransferRef>, kMaxBackendsPerPeer> buffers;
+  };
+  mutable std::mutex remotes_mutex_;
+  std::unordered_map<std::string, RemoteNode> remotes_;
+  SimPageMemorySource bounce_memory_{mori::io::MemoryLocationType::CPU, -1};
+  TransferRef bounce_ref_;
+  std::mutex bounce_mutex_;
 };
 
 }  // namespace mori::umbp

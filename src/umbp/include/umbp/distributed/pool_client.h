@@ -47,6 +47,7 @@
 #include "umbp/distributed/peer/backend/medium_backend.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -647,8 +648,21 @@ class PoolClient {
   //   bytes == nullptr  -> pull the object from `route` first
   //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
+    struct BufferDeleter {
+      size_t virtual_size = 0;
+      void operator()(char* ptr) const {
+        if (virtual_size == 0) {
+          delete[] ptr;
+        } else {
+          HostBufferHandle handle;
+          handle.ptr = ptr;
+          handle.mapped_size = virtual_size;
+          HostMemAllocator().Free(handle);
+        }
+      }
+    };
     std::string key;
-    std::unique_ptr<char[]> bytes;
+    std::unique_ptr<char[], BufferDeleter> bytes{nullptr, BufferDeleter{}};
     size_t size = 0;
     std::optional<RouteGetResult> route;
   };

@@ -30,6 +30,7 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
+#include "umbp/sim/sim.h"
 
 namespace mori::umbp {
 
@@ -46,9 +47,6 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   auto dc = config.distributed.value();
   if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
   if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;
-  if (config.sim.enabled && dc.ranged_scratch_size != 0) {
-    throw std::invalid_argument("UMBP sim does not support remote ranged scratch buffers");
-  }
   local_only_ = dc.master_config.master_address.empty();
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
@@ -107,8 +105,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
   // directions never share a buffer or a lock and can run concurrently.
   if (dc.ranged_scratch_size > 0) {
-    ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
-    ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    auto allocate = [&] {
+      return config.sim.enabled ? AllocateSimMemory(dc.ranged_scratch_size)
+                                : allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
+    };
+    ranged_get_scratch_handle_ = allocate();
+    ranged_put_scratch_handle_ = allocate();
     if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
       // HostBufferHandle is not RAII and the destructor/Close() won't run when a
       // constructor throws, so free whatever did allocate before bailing out
