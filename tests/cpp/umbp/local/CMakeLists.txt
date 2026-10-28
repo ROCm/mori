@@ -30,7 +30,7 @@ add_test(NAME test_segment_crc COMMAND test_segment_crc)
 
 add_executable(test_sharded_ssd_tier test_sharded_ssd_tier.cpp)
 target_link_libraries(test_sharded_ssd_tier PRIVATE umbp_core)
-add_test(NAME test_sharded_ssd_tier COMMAND test_sharded_ssd_tier)
+add_test(NAME umbp_sharded_ssd_tier COMMAND test_sharded_ssd_tier)
 
 add_executable(test_ssd_direct_io test_ssd_direct_io.cpp)
 target_link_libraries(test_ssd_direct_io PRIVATE umbp_core)

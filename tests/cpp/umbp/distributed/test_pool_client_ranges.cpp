@@ -659,6 +659,17 @@ TEST_F(PoolClientRangesTest, DistributedScratchIsExplicitlyOptedIn) {
   opted_in->Close();
 }
 
+// A hugepage request the host cannot serve falls back to 4 KiB pages; the node still comes up.
+TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
+  auto config = DistributedConfig("ranges-scratch-fell-back", 4 * kPageSize);
+  config.distributed->ranged_scratch_use_hugepages = true;
+  config.distributed->ranged_scratch_hugepage_size = 3 * 1024 * 1024;  // no such hugepage size
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+  client->Close();
+}
+
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
   const std::string key = "range-stale-self";
   std::vector<char> stale_object(kObjectSize, 0x11);
@@ -1190,6 +1201,32 @@ TEST_F(PoolClientRangesTest, LocalityPrefetchOffLeavesNothingLocal) {
   // Give a prefetch every chance to appear, then assert it did not.
   EXPECT_FALSE(WaitLocallyResident(quiet.get(), key, std::chrono::milliseconds(750)));
   quiet->Shutdown();
+}
+
+// A queued request's keys pulled from their owner before the read, so the read
+// is local; locality prefetch is off, so BatchPrefetch is the only pull.
+TEST_F(PoolClientRangesTest, BatchPrefetchPullsAPeersKeyIntoThisNode) {
+  std::vector<char> node_get(kScratchSize), node_put(kScratchSize);
+  auto node = MakeClient("ranges-batch-prefetch", kCallerCapacity, node_get, node_put,
+                         /*locality_prefetch=*/false);
+
+  const std::string key = "batch-prefetch";
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 41 + 5) & 0xff);
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  node->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(node.get(), key));
+  ASSERT_FALSE(LocallyResident(node.get(), key));
+
+  EXPECT_EQ(node->BatchPrefetch({key}), 1u);
+  ASSERT_TRUE(WaitLocallyResident(node.get(), key));
+
+  target_->Shutdown();
+  std::vector<char> out(kObjectSize, 0);
+  ASSERT_TRUE(node->BatchGet({key}, {out.data()}, {kObjectSize}).front());
+  EXPECT_EQ(std::memcmp(out.data(), object.data(), kObjectSize), 0);
+  node->Shutdown();
 }
 
 // Eight layer groups over one cold key must schedule ONE whole-object pull, not

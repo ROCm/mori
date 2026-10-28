@@ -39,6 +39,7 @@ from mori.cco.device.ops import (
     SignalOp,
     ThreadMode,
     SdmaOptFlags,
+    SdmaFlags,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "SignalOp",
     "ThreadMode",
     "SdmaOptFlags",
+    "SdmaFlags",
 ]

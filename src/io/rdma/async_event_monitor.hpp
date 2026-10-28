@@ -24,6 +24,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -71,6 +72,8 @@ class RdmaAsyncEventMonitor {
     int originalFdFlags;
     bool registered;
     bool changedFdFlags;
+    int injectedFd{-1};
+    std::vector<uint8_t> downPorts;
   };
 
   // POD copied out of ibv_async_event before it is acked; the union members are
@@ -94,7 +97,9 @@ class RdmaAsyncEventMonitor {
   void DescribeAndLog(const Watch& watch, const EventInfo& info) noexcept;
   void ReportUncompletableIfNeeded(const Watch& watch, const EventInfo& info) noexcept;
   // Scopes the event to the resource it invalidates and reports it.
-  void ReportTransportEvent(const Watch& watch, const EventInfo& info) noexcept;
+  void ReportTransportEvent(Watch& watch, const EventInfo& info) noexcept;
+  bool HasDownPorts() const noexcept;
+  void RecheckPorts() noexcept;
   void RemoveWatch(Watch& watch) noexcept;
   void RestoreWatchFd(Watch& watch) noexcept;
   void DrainWake() noexcept;
@@ -122,6 +127,7 @@ class RdmaAsyncEventMonitor {
   int wakeFd_{-1};
   std::atomic<bool> stopRequested_{false};
   std::thread thread_;
+  std::chrono::steady_clock::time_point nextRecheck_{};
 };
 
 }  // namespace io

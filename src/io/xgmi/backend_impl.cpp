@@ -809,8 +809,22 @@ void XgmiBackend::RegisterMemory(MemoryDesc& desc) {
     desc.ipcOffset = 0;
   }
 
+  // HIP records the *current* device ordinal in the handle (owners_device_id),
+  // and hipIpcOpenMemHandle rejects a handle whose ordinal is >= the importer's
+  // visible device count. That ordinal is local to this process, so a peer with
+  // a different HIP_VISIBLE_DEVICES (e.g. prefill on 1 GPU, decode TP2 on two
+  // other GPUs) cannot open handles exported while device >= 1 is current.
+  // Export with device 0 current: ordinal 0 exists in every importer, and the
+  // handle still identifies the allocation, which may live on any device.
   hipIpcMemHandle_t handle;
-  hipError_t err = hipIpcGetMemHandle(&handle, allocBase);
+  hipError_t err;
+  {
+    ScopedHipDeviceGuard deviceGuard;
+    err = hipSetDevice(0);
+    if (err == hipSuccess) {
+      err = hipIpcGetMemHandle(&handle, allocBase);
+    }
+  }
   if (err != hipSuccess) {
     MORI_IO_WARN("XGMI: Failed to get IPC handle for memory id={}: {}", desc.id,
                  hipGetErrorString(err));

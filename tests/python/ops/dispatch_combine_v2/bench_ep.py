@@ -25,11 +25,7 @@ Every backend is driven through EpDispatchCombineOp, so one script covers all of
 them and BACKENDS=flydsl,hip compares them in a single process on one input.
 
 dispatch and combine ALTERNATE, one pair per iteration, because that is the order
-a layer runs them in. Timing N dispatches and then N combines instead leaves
-combine's staging copy unmeasured: combine reads totalRecvTokenNum to size that
-copy and clears it on the way out (ep_intranode_kernel.hpp:343, and
-intranode_kernels.py:1209 for flydsl), so with no dispatch in between only the
-first combine of the loop copies anything.
+a layer runs them in.
 
 dispatch is called with return_routing=True, the way a serving stack calls it, so
 the routing handle is inside the measured window. Each leg gets its own cuda event
@@ -97,6 +93,14 @@ MODES = os.environ.get("MODES", "eager,graph").split(",")
 # copy -- what a real pipeline does. "staged": a separate buffer, copy included.
 COMBINE_IN = os.environ.get("COMBINE_IN", "inplace")
 COMB_MODE = os.environ.get("COMB_MODE", "push")
+# ASYNC_LL=1 benches the AsyncLL family (hip backend) through the ordinary
+# dispatch()/combine() entry points, which run both halves back to back. That is
+# the right comparison against v1's --kernel-type async_ll bench, which likewise
+# times the whole phase; the send/recv seam only pays off with real work in it,
+# and this bench has none to put there.
+ASYNC_LL = int(os.environ.get("ASYNC_LL", 0)) == 1
+# "sdma" (copy engine, overlappable) or "lsa" (peer stores, faster on one node).
+ASYNC_LL_TRANSPORT = os.environ.get("ASYNC_LL_TRANSPORT", "sdma")
 if COMB_MODE not in ("pull", "push"):
     raise ValueError(f"COMB_MODE={COMB_MODE!r}: want pull|push")
 _PUSH = COMB_MODE == "push"
@@ -296,6 +300,8 @@ def main():
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
             quant_type=PUSH_QUANT if _PUSH else "none",
+            async_ll=ASYNC_LL,
+            async_ll_transport=ASYNC_LL_TRANSPORT,
         )
         return EpDispatchCombineOp(cfg, comm)
 

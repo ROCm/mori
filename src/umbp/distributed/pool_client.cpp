@@ -622,16 +622,16 @@ inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
   return std::chrono::milliseconds(std::min<uint64_t>(ms, 300000));
 }
 
-std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(PeerPool* pool,
-                                                              const std::vector<std::string>& keys,
-                                                              bool include_descs,
-                                                              bool allow_file_refs) {
+std::vector<PoolResolvedEntry> ResolveLocalBatchWithBusyRetry(
+    PeerPool* pool, const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs,
+    const std::vector<ObjectExtent>* extents = nullptr) {
   if (pool == nullptr) return std::vector<PoolResolvedEntry>(keys.size());
   const auto deadline = std::chrono::steady_clock::now() + ResolveBusyRetryTimeout();
   std::chrono::milliseconds backoff{1};
   size_t attempts = 0;
   while (true) {
-    auto resolved = pool->BatchResolve(keys, include_descs, allow_file_refs, ResolveReader::kLocal);
+    auto resolved =
+        pool->BatchResolve(keys, include_descs, allow_file_refs, ResolveReader::kLocal, extents);
     bool busy = false;
     bool served = false;
     for (const auto& entry : resolved) {
@@ -851,6 +851,7 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
       ownership.prefault = config.dram.prefault;
       ownership.numa_strict = config.dram.numa_strict;
       ownership.prefault_threads = config.dram.prefault_threads;
+      ownership.max_mr_bytes = config.dram.max_mr_bytes;
       return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
                              /*pending_ttl=*/std::chrono::milliseconds{30000},
                              /*read_lease_ttl=*/DramReadLeaseTtl());
@@ -1296,10 +1297,11 @@ bool PoolClient::Init() {
   }
 
   // Start the async re-cache worker only when something can feed it and this
-  // node has an exportable local medium to install into.  Two independent
-  // producers share it: cache_remote_fetches (whole-object BatchGet) and
-  // ranged_locality_prefetch (remote ranged reads).
-  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch) &&
+  // node has an exportable local medium to install into.  Three independent
+  // producers share it: cache_remote_fetches (whole-object BatchGet),
+  // ranged_locality_prefetch (remote ranged reads) and BatchPrefetch.
+  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch ||
+       config_.prefetch_budget_bytes > 0) &&
       registry_.Get(medium_) != nullptr) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
@@ -1577,6 +1579,14 @@ std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t siz
   return {ClassifiedUserBytes(ptr, size), 0};
 }
 
+int PoolClient::SourceNumaHint(const void* src, size_t size) const {
+  const int gpu_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
+  if (gpu_node >= 0) return gpu_node;
+  const auto reg = FindRegisteredMemory(src, size);
+  if (reg && reg->first.loc == mori::io::MemoryLocationType::CPU) return reg->first.mem.numaNode;
+  return -1;
+}
+
 int PoolClient::PreferredNumaNodeFor(void* ptr, size_t size) const {
   if (gpu_to_numa_.empty()) return -1;
   const auto ref = UserBufferRef(ptr, size).first;
@@ -1702,7 +1712,8 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
                                    std::vector<MediumBackend*>* holders,
                                    std::vector<ResolvedEntry>* resolutions,
                                    const std::function<bool(size_t)>& dst_is_device,
-                                   std::vector<size_t>* busy) {
+                                   std::vector<size_t>* busy,
+                                   const std::vector<ObjectExtent>* extents) {
   holders->assign(keys.size(), nullptr);
   if (resolutions != nullptr) resolutions->assign(keys.size(), ResolvedEntry{});
   if (candidates.empty() || default_pool_ == nullptr || registry_.Empty()) return;
@@ -1714,10 +1725,17 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   // A partial batch still has to be gathered.
   std::vector<std::string> gathered;
   const std::vector<std::string>* batch = &keys;
+  std::vector<ObjectExtent> gathered_extents;
+  const std::vector<ObjectExtent>* batch_extents = extents;
   if (candidates.size() != keys.size()) {
     gathered.reserve(candidates.size());
     for (size_t i : candidates) gathered.push_back(keys[i]);
     batch = &gathered;
+    if (extents != nullptr) {
+      gathered_extents.reserve(candidates.size());
+      for (size_t i : candidates) gathered_extents.push_back((*extents)[i]);
+      batch_extents = &gathered_extents;
+    }
   }
 
   // Both readers fed from here — ServeLocalGets and BatchGetRanges — can
@@ -1726,7 +1744,7 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   const bool want_file_refs = static_cast<bool>(dst_is_device);
   auto found = ResolveLocalBatchWithBusyRetry(default_pool_.get(), *batch,
                                               /*include_descs=*/false,
-                                              /*allow_file_refs=*/want_file_refs);
+                                              /*allow_file_refs=*/want_file_refs, batch_extents);
 
   // A file ref is unreadable into HOST memory, and the medium cannot know the
   // destination at resolve time.  Re-resolve those keys with file refs off so
@@ -1737,17 +1755,20 @@ void PoolClient::ResolveLocalBatch(const std::vector<std::string>& keys,
   // and the ordinary local read pays no extra HIP call at all.
   if (want_file_refs) {
     std::vector<std::string> restage;
+    std::vector<ObjectExtent> restage_extents;
     std::vector<size_t> restage_at;
     for (size_t j = 0; j < candidates.size() && j < found.size(); ++j) {
       if (!found[j].resolved.file_ref.IsFile()) continue;
       if (dst_is_device(candidates[j])) continue;
       restage.push_back((*batch)[j]);
+      if (batch_extents != nullptr) restage_extents.push_back((*batch_extents)[j]);
       restage_at.push_back(j);
     }
     if (!restage.empty()) {
-      auto staged = ResolveLocalBatchWithBusyRetry(default_pool_.get(), restage,
-                                                   /*include_descs=*/false,
-                                                   /*allow_file_refs=*/false);
+      auto staged = ResolveLocalBatchWithBusyRetry(
+          default_pool_.get(), restage,
+          /*include_descs=*/false,
+          /*allow_file_refs=*/false, batch_extents != nullptr ? &restage_extents : nullptr);
       for (size_t k = 0; k < restage_at.size() && k < staged.size(); ++k) {
         found[restage_at[k]] = std::move(staged[k]);
       }
@@ -2222,8 +2243,11 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
 
 void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size,
                                           const RouteGetResult& route) {
-  if (!LocalityPrefetchAdmits(object_size)) return;
+  if (LocalityPrefetchAdmits(object_size)) QueueWholeObjectPull(key, object_size, route);
+}
 
+bool PoolClient::QueueWholeObjectPull(const std::string& key, size_t object_size,
+                                      const RouteGetResult& route) {
   ReCacheJob job;
   job.key = key;
   job.size = object_size;
@@ -2231,16 +2255,17 @@ void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_
 
   {
     std::lock_guard<std::mutex> lk(recache_mutex_);
-    if (recache_stop_) return;
+    if (recache_stop_) return false;
     if (recache_queue_.size() >= recache_queue_max_) {
       recache_stats_.queue_full.fetch_add(1, std::memory_order_relaxed);
-      return;
+      return false;
     }
-    if (!prefetch_inflight_.insert(key).second) return;  // already queued or running
+    if (!prefetch_inflight_.insert(key).second) return false;  // already queued or running
     recache_queue_.push_back(std::move(job));
   }
   recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
   recache_cv_.notify_one();
+  return true;
 }
 
 void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
@@ -2504,7 +2529,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
 PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
     const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
     const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
-    std::vector<PutEntryOutcome>* results) {
+    std::vector<PutEntryOutcome>* results, const std::vector<int>* numa_hints) {
   BatchPutPlan plan;
   const size_t count = keys.size();
   for (size_t i = 0; i < count; ++i) {
@@ -2532,7 +2557,12 @@ PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
     // put path is the same for all of them.  The old DRAM/HBM allowlist here
     // silently dropped puts master routed to a peer's SSD.
     plan.remote_groups[route.node_id].push_back(BatchPutItem{
-        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
+        .index = i,
+        .key = &keys[i],
+        .src = srcs[i],
+        .size = sizes[i],
+        .route = route,
+        .numa_hint = numa_hints != nullptr && i < numa_hints->size() ? (*numa_hints)[i] : -1});
   }
   return plan;
 }
@@ -2809,6 +2839,8 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
     entry->set_logical_tier(item.route.logical_tier);
+    const int numa = item.numa_hint >= 0 ? item.numa_hint : SourceNumaHint(item.src, item.size);
+    if (numa >= 0) entry->set_preferred_numa_node(numa);
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -2829,6 +2861,7 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
 
     switch (outcome) {
       case ::umbp::ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS:
+      case ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT:
         (*results)[item.index] = PutEntryOutcome::kAlreadyExists;
         continue;
       case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED:
@@ -3293,6 +3326,33 @@ void FillReadRanges(const std::vector<void*>& dsts, const std::vector<size_t>& s
   for (size_t r = 0; r < dsts.size(); ++r) out->push_back({dsts[r], sizes[r], offsets[r]});
 }
 
+// [first byte, last byte) of a key's ranges: what a staging medium needs to read.
+ObjectExtent ReadExtent(const std::vector<size_t>& sizes, const std::vector<size_t>& offsets) {
+  uint64_t lo = std::numeric_limits<uint64_t>::max();
+  uint64_t hi = 0;
+  for (size_t r = 0; r < sizes.size() && r < offsets.size(); ++r) {
+    if (sizes[r] == 0) continue;
+    lo = std::min<uint64_t>(lo, offsets[r]);
+    hi = std::max<uint64_t>(hi, static_cast<uint64_t>(offsets[r]) + sizes[r]);
+  }
+  if (hi <= lo) return ObjectExtent{};  // nothing to read: let the medium decide
+  return ObjectExtent{lo, hi - lo};
+}
+
+// Moves a key's ranges onto the window its resolve staged, if it staged only
+// part of the object.  False if any range falls outside that window.
+bool RebaseRangesOntoCoveredWindow(const ResolvedEntry& resolved,
+                                   std::vector<PoolClient::ObjectRange>* ranges) {
+  if (resolved.covered_size == 0) return true;
+  for (auto& range : *ranges) {
+    if (!RebaseRangeOntoWindow(resolved.covered_offset, resolved.covered_size, &range.object_offset,
+                               range.size)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const void*>& srcs,
                                                      const std::vector<size_t>& sizes,
                                                      const std::vector<size_t>& offsets) {
@@ -3543,6 +3603,10 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   for (size_t i = 0; i < n; ++i) {
     if (!sizes[i].empty()) candidates.push_back(i);
   }
+  // What each key will touch, so SSD stages one layer group, not the whole
+  // object once per group (design-ssd-ranged-io.md D1).
+  std::vector<ObjectExtent> extents(n);
+  for (size_t i : candidates) extents[i] = ReadExtent(sizes[i], src_offsets[i]);
   // A staged medium may publish the batch in parts: each part is planned and
   // copied, and its holds dropped, before the next part is resolved.
   while (!candidates.empty()) {
@@ -3563,7 +3627,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
             }
             return !key_dsts.empty();
           },
-          &later);
+          &later, &extents);
     }
     std::vector<char> is_later(later.empty() ? 0 : n, 0);
     for (size_t i : later) is_later[i] = 1;
@@ -3602,18 +3666,26 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
         // Refilled per key rather than returned fresh: one allocation for the
         // call instead of one per key.
         FillReadRanges(dsts[i], sizes[i], src_offsets[i], &key_ranges);
-        built =
-            resolved.file_ref.IsFile()
-                ? BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items)
-                : BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size,
-                                           resolved.size, key_ranges, /*to_backend=*/false,
+        if (resolved.file_ref.IsFile()) {
+          built =
+              BuildLocalFileRangeTransfers(resolved.file_ref, key_ranges, /*tag=*/i, &key_items);
+        } else if (!RebaseRangesOntoCoveredWindow(resolved, &key_ranges)) {
+          MORI_UMBP_ERROR(
+              "[PoolClient] BatchGetRanges: key='{}' staged [{}, +{}) does not cover its ranges",
+              keys[i], resolved.covered_offset, resolved.covered_size);
+          built = false;
+        } else {
+          // The pages tile the staged window (the whole object, or its extent).
+          const uint64_t staged_size =
+              resolved.covered_size != 0 ? resolved.covered_size : resolved.size;
+          built = BuildLocalRangeTransfers(holder, resolved.pages, resolved.page_size, staged_size,
+                                           key_ranges, /*to_backend=*/false,
                                            /*tag=*/i, &key_items, dbg ? &dbg->classify : nullptr);
+        }
       }
       if (!built) {
-        // The medium holds the key but cannot be read in-process.  Same call as
-        // Same disposition the local get path takes on a size mismatch: look
-        // reporting a miss the caller cannot distinguish from absence.
-        key_items.clear();
+        // Held but not readable in-process: look elsewhere, as the local get
+        // path does on a size mismatch.
         missed.push_back(i);
         continue;
       }
@@ -4183,11 +4255,15 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     std::vector<size_t> sub_sizes;
     std::vector<std::optional<RoutePutResult>> sub_routes;
     std::vector<size_t> sub_originals;
+    // The writer's GPU node per object: its bytes leave from the shared arena, whose
+    // node says nothing about where the reader of the object will be.
+    std::vector<int> sub_numa;
     sub_keys.reserve(count);
     sub_srcs.reserve(count);
     sub_sizes.reserve(count);
     sub_routes.reserve(count);
     sub_originals.reserve(count);
+    sub_numa.reserve(count);
     // Assemble EVERY object in this arena round with ONE transfer.
     //
     // This used to copy per key, and each of those copies was a
@@ -4238,6 +4314,9 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
       sub_keys.push_back(keys[original]);
       sub_srcs.push_back(slice);
       sub_sizes.push_back(object_sizes[original]);
+      sub_numa.push_back(srcs[original].empty()
+                             ? -1
+                             : SourceNumaHint(srcs[original].front(), sizes[original].front()));
       sub_routes.push_back(routes[route_index]);
       sub_originals.push_back(original);
     }
@@ -4245,7 +4324,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     if (!sub_keys.empty()) {
       std::vector<PutEntryOutcome> outcomes(sub_keys.size(), PutEntryOutcome::kFailed);
       BatchPutPlan plan =
-          PartitionBatchPutTargets(sub_keys, sub_srcs, sub_sizes, sub_routes, &outcomes);
+          PartitionBatchPutTargets(sub_keys, sub_srcs, sub_sizes, sub_routes, &outcomes, &sub_numa);
       ExecuteBatchPutPlan(plan, &outcomes);
       for (size_t j = 0; j < outcomes.size(); ++j) {
         results[sub_originals[j]] = outcomes[j] != PutEntryOutcome::kFailed;
@@ -4908,6 +4987,36 @@ bool PoolClient::Exists(const std::string& key) {
   return !v.empty() && v.front();
 }
 
+size_t PoolClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (!initialized_ || default_pool_ == nullptr || config_.prefetch_budget_bytes == 0) return 0;
+  const auto here = default_pool_->BatchContains(keys);
+  std::vector<std::string> local;
+  std::vector<size_t> elsewhere;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (i < here.size() && here[i]) {
+      local.push_back(keys[i]);
+    } else {
+      elsewhere.push_back(i);
+    }
+  }
+  size_t started = default_pool_->Prefetch(local, config_.prefetch_budget_bytes);
+  if (elsewhere.empty() || !CanInstallLocally()) return started;
+
+  // Pulled from their owners into this node's medium, so the read is local.
+  std::vector<std::optional<RouteGetResult>> routes(keys.size());
+  if (!RouteGetsInto(keys, elsewhere, /*exclude_self=*/true, &routes)) return started;
+  for (size_t i : elsewhere) {
+    const auto& route = routes[i];
+    if (route.has_value() &&
+        ShouldAdmitReCache(/*cache_remote_fetches=*/true, config_.cache_remote_admission,
+                           config_.admission_max_block_bytes, route->size) &&
+        QueueWholeObjectPull(keys[i], route->size, *route)) {
+      ++started;
+    }
+  }
+  return started;
+}
+
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {
   if (!initialized_ || keys.empty()) return std::vector<bool>(keys.size(), false);
 
@@ -5163,6 +5272,22 @@ void PoolClient::PublishComponentMetrics() {
            MORI_UMBP_METRIC_CLIENT_TIER_OFFLOADED_BYTES_HELP, {}, tiers.offloaded_bytes);
     sample(MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES,
            MORI_UMBP_METRIC_CLIENT_TIER_PROMOTED_BYTES_HELP, {}, tiers.promoted_bytes);
+    // Zero-seeded so rate() sees a medium's first move.
+    std::map<std::string, uint64_t> move_reads = tiers.read_bytes;
+    std::map<std::string, uint64_t> move_writes = tiers.write_bytes;
+    for (MediumBackend* backend : registry_.All()) {
+      if (backend == nullptr) continue;
+      move_reads.emplace(TierTypeName(backend->Tier()), 0);
+      move_writes.emplace(TierTypeName(backend->Tier()), 0);
+    }
+    for (const auto& [medium, bytes] : move_reads) {
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES,
+             MORI_UMBP_METRIC_CLIENT_TIER_MOVE_READ_BYTES_HELP, {{"medium", medium}}, bytes);
+    }
+    for (const auto& [medium, bytes] : move_writes) {
+      sample(MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES,
+             MORI_UMBP_METRIC_CLIENT_TIER_MOVE_WRITE_BYTES_HELP, {{"medium", medium}}, bytes);
+    }
 
     for (const auto& [tier, hits] : default_pool_->TierReadHits()) {
       sample(MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS, MORI_UMBP_METRIC_CLIENT_TIER_READ_HITS_HELP,

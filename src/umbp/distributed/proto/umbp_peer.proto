@@ -72,6 +72,11 @@ message AllocateSlotRequest {
   // backend registered for `tier`.
   optional string backend_name = 4;
   string logical_tier = 5;
+  // The NUMA node the writer's source lives on (its GPU's, or its staging
+  // arena's).  A peer whose DRAM tier has one buffer per node prefers the
+  // buffer on that node, so the reader that wrote the object fetches it through
+  // NICs on the same node index at both ends.  Absent: no preference.
+  optional int32 preferred_numa_node = 6;
 }
 // AllocateSlot / BatchAllocateSlots per-entry outcome.
 // FAILED_NO_SPACE is split out so the writer can keep retrying with
@@ -84,6 +89,9 @@ enum AllocateSlotOutcome {
   ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS = 2;  // owned_[key] dedup hit
   ALLOCATE_SLOT_OUTCOME_FAILED                 = 3;  // generic — see peer log for reason
   ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE        = 4;  // tier exhausted; retry on another peer
+  // Another writer holds this key's pending slot and its commit stores the
+  // bytes, so the writer counts the key as stored, as a local put does.
+  ALLOCATE_SLOT_OUTCOME_IN_FLIGHT              = 5;
 }
 
 message AllocateSlotResponse {
