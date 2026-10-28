@@ -386,6 +386,31 @@ TEST(PeerSsdSingleFlight, DisjointExtentsOfOneKeyEachGetTheirOwnBytes) {
   EXPECT_EQ(h.backend->bytes_read(), 32u) << "only the two extents came off the drive";
 }
 
+// CP ranks read each object as several layer-group extents at once; every one must be joinable.
+TEST(PeerSsdSingleFlight, ReaderJoinsItsExtentWhileAnotherExtentIsInFlight) {
+  auto h = MakeHarness();
+  ASSERT_TRUE(Put(*h.mgr, "K", kObject));
+  std::vector<char> front(16), back(16), back_again(16);
+  h.backend->BlockReads();
+  std::thread a([&] { ReadExtent(*h.mgr, "K", 0, &front); });
+  h.backend->WaitReadsStarted(1);
+  std::thread b([&] { ReadExtent(*h.mgr, "K", 40, &back); });
+  h.backend->WaitReadsStarted(2);
+  SsdReadOutcome out;
+  std::thread c([&] { out = ReadExtent(*h.mgr, "K", 40, &back_again); });
+  WaitForDups(*h.mgr, 2);
+  h.backend->UnblockReads();
+  a.join();
+  b.join();
+  c.join();
+
+  EXPECT_EQ(h.backend->reads_started(), 2)
+      << "the second reader of [40, 56) must join, not re-read";
+  EXPECT_EQ(h.mgr->ReadMerged(), 1u);
+  ASSERT_EQ(out.status, SsdReadStatus::kOk);
+  EXPECT_EQ(std::string(back_again.begin(), back_again.end()), kObject.substr(40, 16));
+}
+
 TEST(PeerSsdSingleFlight, ExtentInsideAWholeReadFollowsAndTakesItsSlice) {
   auto h = MakeHarness();
   ASSERT_TRUE(Put(*h.mgr, "K", kObject));
