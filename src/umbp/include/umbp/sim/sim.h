@@ -27,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "umbp/distributed/peer/backend/page_backend.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
@@ -68,8 +69,11 @@ class SimTransferEngine final : public TransferEngine {
   using Clock = std::chrono::steady_clock;
   struct Path {
     std::string channel;
-    double latency_ns;
-    double bandwidth;
+    // Scalars in old profiles become one-element curves; index = threads - 1.
+    std::vector<double> latency_ns;
+    std::vector<double> bandwidth;
+    std::vector<double> copy_latency_ns;
+    double capacity;
   };
   // CPU->CPU, CPU->GPU, GPU->CPU, GPU->GPU. Channels may be shared across paths.
   std::array<std::optional<Path>, 4> paths_;

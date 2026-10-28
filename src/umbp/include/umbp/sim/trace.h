@@ -42,7 +42,7 @@ class SimTrace {
   std::atomic<uint64_t> next_id{0};
 
  private:
-  std::string profile_path_;
+  std::string profile_json_;
   std::ofstream output_;
   std::mutex mutex_;
 };

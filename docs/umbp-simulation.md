@@ -60,27 +60,53 @@ Each configured path (`cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`) has:
 
 - `latency_ns`: nonnegative fixed overhead per submitted batch on that path.
 - `bandwidth_bytes_per_second`: positive effective bandwidth.
-- `channel`: paths sharing this name serialize; different names may overlap.
+- `copy_latency_ns`: optional nonnegative overhead per coalesced copy (default 0).
+- `channel`: paths sharing this name share a service queue; different names may overlap.
 
-For the total bytes on a path within one `TransferEngine::Submit`:
+For `cpu_cpu`, each coefficient can also be an array indexed by the number of
+copy threads minus one. For example, `[4e10, 6e10, 7e10, 8e10]` supplies bandwidths
+for 1, 2, 3 and 4 threads. These are illustrative values, not measurements.
+Scalars retain their original meaning; arrays clamp to their last entry beyond
+their calibrated range. Other paths currently use one coefficient per field.
+
+The simulator reuses LocalCopyEngine's thread selection, including the byte
+threshold, copy count and background-thread restriction. Channel capacity is
+the maximum calibrated bandwidth up to the larger of `UMBP_DRAM_COPY_THREADS`
+and `UMBP_DRAM_WRITE_THREADS`. Set these before creating the client, as in real
+mode. A CPU path with scalar coefficients still acts as a serial channel.
+
+For the bytes and coalesced copies on a path within one `TransferEngine::Submit`:
 
 ```text
-service_ns = latency_ns + bytes * 1e9 / bandwidth_bytes_per_second
-start = max(now, channel_available)
-finish = start + service_ns
+overhead = latency_ns[p] + copies * copy_latency_ns[p]
+private_ns = overhead + bytes * 1e9 / bandwidth[p]
+service_ns = overhead + bytes * 1e9 / channel_capacity
+channel_available = max(now, channel_available) + service_ns
+finish = max(now + private_ns, channel_available)
 ```
+
+`now` is the Submit entry timestamp: computing the model consumes its time
+budget instead of adding a second setup cost to the calibrated duration.
+
+This preserves a single stream's latency while allowing independent submissions,
+including BatchPut's cross-key copies, to overlap within the aggregate bandwidth
+limit. It approximates throughput and per-submission latency, not dynamic fair
+sharing or exact completion order among competing streams.
 
 Foreground copies and background tier transitions use the same engine and
 channel queues. Submit waits until all its channels finish, matching existing
 synchronous local copies. Fragmenting one transfer into pages does not multiply
-fixed latency. One UMBP batch API may issue multiple Submit calls; its existing
+fixed submission latency. The optional per-copy cost applies after adjacent
+segments have been coalesced by the real planner. One UMBP batch API may issue multiple Submit calls; its existing
 control flow determines those boundaries. Zero-byte work adds no modeled delay.
 Missing paths reject transfers and the existing failure path aborts reservations.
 
-Use a few measured sizes to fit `time = latency + size / bandwidth`; validate
-against separate sizes and the relevant concurrency. Keep the profile alongside
-the trace for reproducibility. Each channel currently models a serial server;
-there is no device topology, dynamic bandwidth sharing or cross-process queue.
+Use measured sizes, copy counts and thread settings to fit these coefficients;
+validate against separate sizes and batch shapes. Keep the profile alongside
+the trace for reproducibility. Calibration must also match source-buffer reuse
+and working-set size: cold DRAM and a repeatedly reused cached source can have
+very different effective bandwidths. There is no automatic cache-state inference,
+device topology or cross-process queue.
 
 ## Storage and timing records
 
@@ -102,6 +128,10 @@ consecutive exists, register/deregister, clear, flush and close. IDs distinguish
 concurrent calls within a client. Use a separate trace file per client/run;
 files are appended, and IDs restart with each client. Completion order can differ
 from ID order. An empty trace path writes JSON through the UMBP INFO logger.
+File output is buffered; `flush`, `close`, and client destruction flush remaining
+records. Disabling INFO with no trace file skips record formatting. Paths are
+JSON-escaped once at initialization, and per-call integer fields use lightweight
+formatting without a protobuf object allocation.
 
 `elapsed_ns` includes real control code, lock/queue waits and modeled transfer
 waits, ending before trace serialization/output. Trace output still delays the

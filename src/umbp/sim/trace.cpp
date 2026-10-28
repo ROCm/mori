@@ -25,12 +25,17 @@
 #include <google/protobuf/util/json_util.h>
 
 #include <stdexcept>
+#include <string_view>
 
 #include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 
-SimTrace::SimTrace(const UMBPSimConfig& config) : profile_path_(config.profile_path) {
+SimTrace::SimTrace(const UMBPSimConfig& config) {
+  google::protobuf::Value profile;
+  profile.set_string_value(config.profile_path);
+  const auto status = google::protobuf::util::MessageToJsonString(profile, &profile_json_);
+  if (!status.ok()) throw std::invalid_argument(status.ToString());
   if (!config.trace_path.empty()) {
     output_.open(config.trace_path, std::ios::app);
     if (!output_) throw std::invalid_argument("UMBP sim: cannot open trace " + config.trace_path);
@@ -39,24 +44,17 @@ SimTrace::SimTrace(const UMBPSimConfig& config) : profile_path_(config.profile_p
 
 void SimTrace::Write(uint64_t id, const char* api, size_t keys, uint64_t bytes, uint64_t start_ns,
                      uint64_t elapsed_ns, int64_t result_count, bool exception) {
-  google::protobuf::Struct record;
-  auto& fields = *record.mutable_fields();
-  fields["call_id"].set_number_value(id);
-  fields["api"].set_string_value(api);
-  fields["key_count"].set_number_value(keys);
-  fields["bytes"].set_number_value(bytes);
-  fields["start_ns"].set_number_value(start_ns);
-  fields["elapsed_ns"].set_number_value(elapsed_ns);
-  fields["result_count"].set_number_value(result_count);
-  fields["exception"].set_bool_value(exception);
-  fields["profile_path"].set_string_value(profile_path_);
-  std::string json;
-  const auto status = google::protobuf::util::MessageToJsonString(record, &json);
-  if (!status.ok()) throw std::runtime_error(status.ToString());
+  static auto logger = MORI_GET_LOGGER(mori::modules::UMBP);
+  if (!output_.is_open() && !logger->should_log(spdlog::level::info)) return;
+  // API names are fixed internal identifiers; the user-supplied path is escaped once.
+  const auto json = fmt::format(
+      R"({{"call_id":{},"api":"{}","key_count":{},"bytes":{},"start_ns":{},)"
+      R"("elapsed_ns":{},"result_count":{},"exception":{},"profile_path":{}}})",
+      id, api, keys, bytes, start_ns, elapsed_ns, result_count, exception, profile_json_);
   std::lock_guard<std::mutex> lock(mutex_);
   if (output_.is_open()) {
     output_ << json << '\n';
-    output_.flush();
+    if (std::string_view(api) == "flush" || std::string_view(api) == "close") output_.flush();
     if (!output_) throw std::runtime_error("UMBP sim: trace write failed");
   } else {
     MORI_UMBP_INFO("[UMBP sim] {}", json);

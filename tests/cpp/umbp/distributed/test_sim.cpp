@@ -33,7 +33,9 @@
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/pool/tier_graph.h"
 #include "umbp/distributed/pool_client.h"
+#include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/sim/sim.h"
+#include "umbp/sim/trace.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -151,6 +153,99 @@ TEST_F(SimTest, HbmAndRegisteredGpuCallerNeedNoDevice) {
   EXPECT_TRUE(client->Get("gpu", ptr + 2 * kPage, kPage));
   EXPECT_EQ(client->BatchGetRanges({"gpu"}, {{ptr + 3 * kPage}}, {{128}}, {{0}}),
             std::vector<bool>{true});
+}
+
+TEST_F(SimTest, BufferedTracePreservesEscapingAndIntegerPrecision) {
+  auto config = Config().sim;
+  config.profile_path = "quoted\"path\\with\nnewline";
+  SimTrace trace(config);
+  constexpr uint64_t id = (uint64_t{1} << 53) + 1;
+  trace.Write(id, "get", 1, kPage, id, 123, -1, true);
+  trace.Write(id + 1, "flush", 0, 0, 0, 0, 1, false);
+  std::ifstream input(config.trace_path);
+  std::string line;
+  ASSERT_TRUE(std::getline(input, line));
+  EXPECT_NE(line.find(std::to_string(id)), std::string::npos);
+  google::protobuf::Struct record;
+  ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(line, &record).ok());
+  EXPECT_EQ(record.fields().at("profile_path").string_value(), config.profile_path);
+  EXPECT_TRUE(record.fields().at("exception").bool_value());
+  EXPECT_EQ(record.fields().at("result_count").number_value(), -1);
+  ASSERT_TRUE(std::getline(input, line));
+  EXPECT_FALSE(std::getline(input, line));
+}
+
+TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
+  // A 1 MiB copy needs 80 ms alone, while four copies share a 4x faster channel.
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
+      "bandwidth_bytes_per_second":[13107200,26214400,39321600,52428800]}})");
+  constexpr size_t bytes = 1 << 20;
+  if (LocalCopyThreads(4 * bytes, 4) < 4) GTEST_SKIP() << "requires four copy threads";
+  SimTransferEngine engine(Config().sim.profile_path);
+  SimPageMemorySource memory(MemLoc::CPU, -1);
+  std::vector<PageMemorySource::Buffer> buffers;
+  ASSERT_TRUE(memory.Allocate({4 * bytes}, &buffers));
+  std::vector<TransferItem> items;
+  for (size_t i = 0; i < 4; ++i) {
+    auto ref = TransferRef::HostBytes(static_cast<char*>(buffers[0].base) + i * bytes, bytes);
+    items.push_back({ref, 0, ref, 0, bytes, i});
+  }
+  auto start = Clock::now();
+  EXPECT_TRUE(engine.Transfer({items[0]}, nullptr));
+  EXPECT_GE(Clock::now() - start, 80ms);
+  start = Clock::now();
+  EXPECT_TRUE(engine.Transfer(items, nullptr));
+  EXPECT_GE(Clock::now() - start, 80ms);
+  EXPECT_LT(Clock::now() - start, 250ms);  // Old serial model would take 320 ms.
+
+  std::promise<void> go;
+  const auto gate = go.get_future().share();
+  std::vector<std::future<bool>> pending;
+  for (size_t i = 0; i < 8; ++i) {
+    pending.push_back(std::async(std::launch::async, [&, i] {
+      gate.wait();
+      return engine.Transfer({items[i % 4]}, nullptr);
+    }));
+  }
+  start = Clock::now();
+  go.set_value();
+  for (auto& result : pending) EXPECT_TRUE(result.get());
+  EXPECT_GE(Clock::now() - start, 160ms);  // Concurrent streams still share the cap.
+  EXPECT_LT(Clock::now() - start, 500ms);
+
+  // A registered caller arena must not merge the API's distinct KV blocks into
+  // one copy: real BuildLocalPageTransfers retains a per-key buffer view.
+  auto config = Config();
+  config.page_size = bytes;
+  config.dram.capacity_bytes = 8 * bytes;
+  auto client = CreateUMBPClient(config);
+  const auto ptr = reinterpret_cast<uintptr_t>(buffers[0].base);
+  ASSERT_TRUE(client->RegisterMemory(ptr, 4 * bytes));
+  const std::vector<std::string> keys{"a", "b", "c", "d"};
+  const std::vector<uintptr_t> ptrs{ptr, ptr + bytes, ptr + 2 * bytes, ptr + 3 * bytes};
+  const std::vector<size_t> sizes(4, bytes);
+  ASSERT_EQ(client->BatchPut(keys, ptrs, sizes), std::vector<bool>(4, true));
+  start = Clock::now();
+  EXPECT_EQ(client->BatchGet(keys, ptrs, sizes), std::vector<bool>(4, true));
+  EXPECT_GE(Clock::now() - start, 80ms);
+  EXPECT_LT(Clock::now() - start, 250ms);
+}
+
+TEST_F(SimTest, PerCopyCostUsesCoalescedSegments) {
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"copy_latency_ns":40000000,
+                           "bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  auto backend = Backend(engine, MemLoc::CPU);
+  const auto ref = backend->BufferRef(0);
+  auto start = Clock::now();
+  EXPECT_TRUE(
+      engine.Transfer({{ref, 0, ref, 0, kPage, 0}, {ref, kPage, ref, kPage, kPage, 1}}, nullptr));
+  EXPECT_GE(Clock::now() - start, 40ms);
+  EXPECT_LT(Clock::now() - start, 70ms);
+  start = Clock::now();
+  EXPECT_TRUE(engine.Transfer(
+      {{ref, 0, ref, 0, kPage, 0}, {ref, 2 * kPage, ref, 2 * kPage, kPage, 1}}, nullptr));
+  EXPECT_GE(Clock::now() - start, 80ms);
 }
 
 TEST_F(SimTest, ReusesCapacityLruLeasesEventsAndProductionReaper) {
@@ -284,6 +379,12 @@ TEST_F(SimTest, RejectsUnsupportedConfigurationsAndBadProfiles) {
   Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
                            "bandwidth_bytes_per_second":0}})");
   EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  for (const auto* curve : {"[]", "[1,0]", "[1,-1]", "[1,\"fast\"]"}) {
+    Profile(std::string(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
+                           "bandwidth_bytes_per_second":)") +
+            curve + "}}");
+    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  }
   PoolClientConfig pool_config;
   pool_config.sim = Config().sim;
   pool_config.dram.buffer_sizes = {32 * kPage};

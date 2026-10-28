@@ -594,25 +594,6 @@ class ScopedBatchBandwidth {
 //  Page / size math
 // ---------------------------------------------------------------------------
 
-// --- Cross-key parallelism for the self-target (local) paths. --------------
-// In distributed mode 1 key == 1 page (master page_size == KV block size), so
-// a self-target Put/Get copies one ~MiB-scale block per key.  The parallelism
-// that pays is therefore ACROSS the many keys of one BatchPut/BatchGet
-// (different threads -> different keys), not within one key's pages.  The
-// per-key copy itself lives in LocalCopyEngine since Phase 6.  Threads via
-// UMBP_DRAM_{READ,WRITE}_THREADS (same envs as local mode's DRAMTier).
-inline int LocalCopyThreads(const char* env_name) {
-  int t = 4;
-  if (const char* e = std::getenv(env_name)) {
-    int x = std::atoi(e);
-    if (x >= 1) t = x;
-  }
-  unsigned hc = std::thread::hardware_concurrency();
-  if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
-  if (t < 1) t = 1;
-  return t;
-}
-
 inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
   uint64_t ms = 30000;
   if (const char* value = std::getenv("UMBP_RESOLVE_BUSY_TIMEOUT_MS")) {
@@ -1647,9 +1628,12 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
   // Classified, not assumed host: this is the self-target path, where a device
   // user buffer paired with a host DRAM page must reach HbmCopyEngine rather
   // than LocalCopyEngine.  One classification per batch, not per page.
-  const auto [user_ref, user_offset] =
-      config_.sim.enabled ? UserBufferRef(user, size)
-                          : std::pair<TransferRef, uint64_t>{ClassifiedUserBytes(user, size), 0};
+  auto user_ref =
+      config_.sim.enabled ? UserBufferRef(user, size).first : ClassifiedUserBytes(user, size);
+  // Preserve the real path's per-key view (and therefore copy parallelism), while
+  // retaining registered location metadata for virtual GPU caller buffers.
+  if (config_.sim.enabled)
+    user_ref = TransferRef::HostBytes(user, size, user_ref.loc, user_ref.device);
   items->reserve(pages.size());
   for (size_t i = 0; i < pages.size(); ++i) {
     TransferRef buf = backend->BufferRef(pages[i].buffer_index);
@@ -1663,14 +1647,14 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
     item.tag = i;
     if (to_backend) {
       item.src = user_ref;
-      item.src_offset = user_offset + i * page_size;
+      item.src_offset = i * page_size;
       item.dst = std::move(buf);
       item.dst_offset = PageOffset(pages[i], page_size);
     } else {
       item.src = std::move(buf);
       item.src_offset = PageOffset(pages[i], page_size);
       item.dst = user_ref;
-      item.dst_offset = user_offset + i * page_size;
+      item.dst_offset = i * page_size;
     }
     items->push_back(std::move(item));
   }
@@ -2606,7 +2590,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
       MORI_UMBP_ERROR("[PoolClient] Local Put requested but no default pool is initialized");
       return;
     }
-    const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
+    const int nthr = LocalCopyThreadLimit("UMBP_DRAM_WRITE_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
 
     std::vector<PoolPlacementRequest> asks;

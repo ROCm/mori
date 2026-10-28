@@ -34,6 +34,7 @@
 #include <thread>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/plan_builder.h"
 
 namespace mori::umbp {
@@ -57,6 +58,31 @@ const google::protobuf::Value& Field(const google::protobuf::Struct& object,
     throw std::invalid_argument("UMBP sim profile: missing or invalid " + name);
   }
   return it->second;
+}
+
+std::vector<double> Curve(const google::protobuf::Struct& object, const std::string& name,
+                          bool positive) {
+  const auto it = object.fields().find(name);
+  if (it == object.fields().end()) throw std::invalid_argument("UMBP sim profile: missing " + name);
+  std::vector<double> values;
+  auto append = [&](const google::protobuf::Value& value) {
+    const double n = value.number_value();
+    if (value.kind_case() != google::protobuf::Value::kNumberValue || !std::isfinite(n) ||
+        (positive ? n <= 0 : n < 0))
+      throw std::invalid_argument("UMBP sim profile: invalid " + name);
+    values.push_back(n);
+  };
+  if (it->second.kind_case() == google::protobuf::Value::kListValue) {
+    for (const auto& value : it->second.list_value().values()) append(value);
+  } else {
+    append(it->second);
+  }
+  if (values.empty()) throw std::invalid_argument("UMBP sim profile: empty " + name);
+  return values;
+}
+
+double AtThreads(const std::vector<double>& curve, size_t threads) {
+  return curve[std::min(threads, curve.size()) - 1];
 }
 }  // namespace
 
@@ -106,12 +132,22 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path) {
     }
     const auto& object = value.struct_value();
     Path path{Field(object, "channel", Value::kStringValue).string_value(),
-              Field(object, "latency_ns", Value::kNumberValue).number_value(),
-              Field(object, "bandwidth_bytes_per_second", Value::kNumberValue).number_value()};
-    if (object.fields().size() != 3 || path.channel.empty() || !std::isfinite(path.latency_ns) ||
-        path.latency_ns < 0 || !std::isfinite(path.bandwidth) || path.bandwidth <= 0) {
+              Curve(object, "latency_ns", false), Curve(object, "bandwidth_bytes_per_second", true),
+              object.fields().count("copy_latency_ns") ? Curve(object, "copy_latency_ns", false)
+                                                       : std::vector<double>{0},
+              0};
+    if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") ||
+        path.channel.empty() ||
+        (name != "cpu_cpu" && (path.latency_ns.size() != 1 || path.bandwidth.size() != 1 ||
+                               path.copy_latency_ns.size() != 1))) {
       throw std::invalid_argument("UMBP sim profile: invalid coefficients for " + name);
     }
+    const size_t threads = name == "cpu_cpu"
+                               ? std::max(LocalCopyThreadLimit("UMBP_DRAM_COPY_THREADS"),
+                                          LocalCopyThreadLimit("UMBP_DRAM_WRITE_THREADS"))
+                               : 1;
+    path.capacity = *std::max_element(
+        path.bandwidth.begin(), path.bandwidth.begin() + std::min(threads, path.bandwidth.size()));
     available_.try_emplace(path.channel);
     paths_[at - names.begin()] = std::move(path);
   }
@@ -134,8 +170,11 @@ std::unique_ptr<TransferPlanBuilder> SimTransferEngine::CreatePlanBuilder(size_t
 }
 
 std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPlan> plans) {
+  // Profiles measure submit-to-completion; model calculation consumes that same budget.
+  const auto submitted = Clock::now();
   if (plans.empty()) return nullptr;
   std::array<long double, 4> bytes{};
+  std::array<size_t, 4> copies{};
   for (const auto& plan : plans) {
     if (!CanHandle(plan.src, plan.dst) || plan.dir != TransferDirection::kLocal ||
         plan.uses_bounce || plan.sizes.size() != plan.src_offsets.size() ||
@@ -147,19 +186,37 @@ std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPl
           !RangeFits(plan.dst_offsets[i], plan.sizes[i], plan.dst.size))
         return nullptr;
       bytes[PathIndex(plan.src, plan.dst)] += plan.sizes[i];
+      if (plan.sizes[i] != 0) ++copies[PathIndex(plan.src, plan.dst)];
     }
   }
   // Charge fixed latency once per path in this submit batch, independent of page fragmentation.
   std::unordered_map<std::string, long double> service_ns;
+  long double private_ns = 0;
   for (size_t i = 0; i < bytes.size(); ++i) {
     if (bytes[i] == 0) continue;
     const auto& path = *paths_[i];
-    service_ns[path.channel] += path.latency_ns + bytes[i] * 1e9L / path.bandwidth;
+    // One submit may fan out internally; independent submits (e.g. BatchPut keys)
+    // can overlap, but all reserve service on the same aggregate-bandwidth channel.
+    const size_t threads =
+        i == 0 ? LocalCopyThreads(static_cast<size_t>(std::min<long double>(
+                                      bytes[i], std::numeric_limits<size_t>::max())),
+                                  copies[i])
+               : 1;
+    const auto latency =
+        AtThreads(path.latency_ns, threads) + copies[i] * AtThreads(path.copy_latency_ns, threads);
+    private_ns =
+        std::max(private_ns, latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads));
+    service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
   }
-  auto finish = Clock::now();
+  auto finish = submitted;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto now = Clock::now();
+    const auto now = submitted;
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - now)
+            .count();
+    if (!std::isfinite(private_ns) || std::ceil(private_ns) >= remaining) return nullptr;
+    finish = now + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(private_ns)));
     // Validate all deadlines before reserving any channel.
     for (const auto& [channel, ns] : service_ns) {
       const auto start = std::max(now, available_.at(channel));
