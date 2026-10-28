@@ -183,25 +183,32 @@ def main():
         "--chunk-tiles", default="16", help="fused chunk sizes to sweep, e.g. 8,16,32"
     )
     parser.add_argument(
-        "--queues", type=int, default=1,
+        "--queues",
+        type=int,
+        default=1,
         help="SDMA channels per (src, dst) pair. More than one measured "
         "slower: KFD recommends a single engine per peer link here, so "
         "extra channels share it and only add descriptors.",
     )
     parser.add_argument("--row-slack", type=float, default=1.5)
     parser.add_argument(
-        "--signal-mode", choices=("quiet", "remote"), default="remote",
+        "--signal-mode",
+        choices=("quiet", "remote"),
+        default="remote",
         help="how a sender tells a peer its rows landed",
     )
     parser.add_argument(
-        "--no-aligned-pair", action="store_true",
+        "--no-aligned-pair",
+        action="store_true",
         help="force aiter off its common-pair stage2 so both paths run the "
         "same config. It is picked only at bucket 8192, where SortedCombine "
         "has no equivalent -- and measured 1.5%% slower than without it on "
         "uniform routing anyway.",
     )
     parser.add_argument(
-        "--quant", choices=("none", "fp8_blockwise_1x32"), default="fp8_blockwise_1x32",
+        "--quant",
+        choices=("none", "fp8_blockwise_1x32"),
+        default="fp8_blockwise_1x32",
         help="quantise the send buffer; halves the bytes SDMA moves",
     )
     parser.add_argument(
@@ -252,9 +259,13 @@ def main():
             fanout_masks=(),
             **net,
         )
-        sc = SortedCombine(moe, queues=args.queues, quant=args.quant,
-                           row_slack=args.row_slack,
-            signal_mode=args.signal_mode)
+        sc = SortedCombine(
+            moe,
+            queues=args.queues,
+            quant=args.quant,
+            row_slack=args.row_slack,
+            signal_mode=args.signal_mode,
+        )
 
         for bs in batch_sizes:
             x, wts, ids = (
@@ -347,6 +358,7 @@ def main():
                     raise AssertionError(
                         f"bs={bs} {label}: relL2={rel:.3e} exceeds {args.rtol}"
                     )
+                sc.check_overflow()
 
         if rank == 0:
             print(

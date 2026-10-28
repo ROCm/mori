@@ -230,9 +230,7 @@ def flag_barrier(bar_addr, nblocks, tid, bid):
     fx.barrier()
 
 
-def build_rank_sort_plan(
-    *, SBM, topk, log2_max_tok, recv_cap, npes, cap, slot_cap, local_experts
-):
+def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
     """Kernel 1: give every valid sorted row a stable index in its rank's run.
 
     * count:  ``tile_cnt[tile][pe]`` = rows of the sort tile bound for ``pe``
@@ -246,7 +244,15 @@ def build_rank_sort_plan(
     does not scan the whole ``tile_cnt`` array: for each tile it owns it sums the
     counts of the earlier tiles with one pass of the block's threads (thread ``t``
     handles pe ``t % npes``) and a short LDS reduction -- a parallel sum, not a
-    log-depth scan with a barrier per step.
+    log-depth scan with a barrier per step. The sum runs to the tile's own index,
+    so nothing here is sized by a bound on the tile count: a rank that receives
+    far more rows than an even share (skewed routing) is handled the same way.
+
+    Before it writes anything the kernel waits until every peer has consumed the
+    previous call: that is what guarantees this rank's own outbound puts have
+    finished reading ``S`` and ``idx_send``, which this call is about to rewrite.
+    ``tile_base`` is clamped to ``cap``, so a chunk that crosses the per-pair
+    reservation is cut at it instead of shipping the next peer's rows.
 
     Count and assign each run one block per tile with one thread per row: a row
     is decoded once, a wave ballot per pe gives the rows of the wave bound for it,
@@ -261,13 +267,6 @@ def build_rank_sort_plan(
         )
     if BLOCK % npes:
         raise ValueError(f"plan needs npes to divide {BLOCK}, got {npes}")
-    # Bound on the tile count, so the prefix loop has a static trip count. Tiles
-    # cover the sorted rows, so this is sized from the token-slot space, NOT from
-    # ``cap`` -- ``cap`` is the per-peer row reservation and is npes times
-    # smaller. Stage1 also pads each local expert's rows up to an SBM boundary,
-    # so num_valid runs past slot_cap by up to local_experts * (SBM - 1).
-    TILES_MAX = (slot_cap + SBM - 1) // SBM + local_experts + 1
-    PREFIX_J = -(-TILES_MAX * npes // BLOCK)
     GROUPS = BLOCK // npes
     WAVES = BLOCK // WAVE
     # LDS words: per-wave per-pe counts | per-thread partial sums | the tile's prefix.
@@ -285,7 +284,8 @@ def build_rank_sort_plan(
     def plan(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
         arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_cdone: fx.Int64, arg_bar: fx.Int64,
-        arg_over: fx.Int64, i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32):
+        arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
+        i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -306,6 +306,19 @@ def build_rank_sort_plan(
         def lw(i):
             """LDS i32 word ``i`` of the block's scratch."""
             return lds_typed_ptr(lds_i32 + i * fx.Int32(4), T.i32, align=4)
+
+        # S and idx_send are rewritten from here on. A peer's done flag says it has
+        # read everything I sent it last call, and with the copy engine's FIFO that
+        # means my puts have finished reading them.
+        consumed = global_typed_ptr(arg_counter, T.i32)[0]
+        if tid < fx.Int32(npes):
+            if tid != fx.Int32(rank):
+                comm_ops.spin_until_ge_i32_system(
+                    fx.Int64(arg_done) + fx.Int64(tid) * fx.Int64(4),
+                    consumed,
+                    acquire=True,
+                )
+        fx.barrier()
 
         # The GEMM2 kernel's per-chunk completion counters start from zero every call.
         for g in range(gid, i32_cdone_n, stride):
@@ -344,18 +357,20 @@ def build_rank_sort_plan(
             fx.barrier()
         flag_barrier(arg_bar, i32_nblocks, tid, bid)
 
+        # No rows at all: the loop below never runs, so say so explicitly.
+        if (tiles == fx.Int32(0)) & (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
+            tile_base[tid] = fx.Int32(0)
+            ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = fx.Int32(0)
+
         idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
         lane_lt = (fx.Int64(1) << fx.Int64(lane)) - fx.Int64(1)
         for tile in range(bid, tiles, i32_nblocks):
             # Rows for pe in the tiles before this one. Element e of tile_cnt is
             # (tile e // npes, pe e % npes), and BLOCK % npes == 0, so each thread
             # always sums one pe.
-            lim = tile * fx.Int32(npes)
             part = fx.Int32(0)
-            for j in range_constexpr(PREFIX_J):
-                e = tid + fx.Int32(j * BLOCK)
-                before = e < lim
-                part = part + before.select(tile_cnt[before.select(e, fx.Int32(0))], fx.Int32(0))
+            for e in range(tid, tile * fx.Int32(npes), fx.Int32(BLOCK)):
+                part = part + tile_cnt[e]
             fx.ptr_store(part, lw(fx.Int32(OFF_PART) + tid))
             fx.barrier()
             if tid < fx.Int32(npes):
@@ -363,7 +378,9 @@ def build_rank_sort_plan(
                 for k in range_constexpr(GROUPS):
                     pre = pre + fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PART + k * npes) + tid)))
                 fx.ptr_store(pre, lw(fx.Int32(OFF_PREF) + tid))
-                tile_base[tile * fx.Int32(npes) + tid] = pre
+                tile_base[tile * fx.Int32(npes) + tid] = (pre < fx.Int32(cap)).select(
+                    pre, fx.Int32(cap)
+                )
                 # The extra row holds the totals the comm waves read as a chunk's end.
                 if tile == tiles - fx.Int32(1):
                     total = pre + tile_cnt[tile * fx.Int32(npes) + tid]
@@ -405,10 +422,12 @@ def build_rank_sort_plan(
     def launch(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
         arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_cdone: fx.Int64, arg_bar: fx.Int64,
-        arg_over: fx.Int64, i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32, stream: fx.Stream):
+        arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
+        i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32, stream: fx.Stream):
     # fmt: on
         plan(arg_stids, arg_trb, arg_num_valid, arg_tile_cnt, arg_tile_base, arg_cursor,
-             arg_out_row, arg_idx, arg_cdone, arg_bar, arg_over, i32_nblocks, i32_cdone_n).launch(
+             arg_out_row, arg_idx, arg_cdone, arg_bar, arg_over, arg_done, arg_counter,
+             i32_nblocks, i32_cdone_n).launch(
             grid=(i32_nblocks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch
@@ -852,8 +871,7 @@ class SortedCombine:
                 recv_cap=int(self.moe.max_recv),
                 npes=self.npes,
                 cap=self.cap,
-                slot_cap=self.slot_cap,
-                local_experts=int(self.moe.w2.shape[0]),
+                rank=self.rank,
             )
         return self._plans[sbm]
 
@@ -888,6 +906,8 @@ class SortedCombine:
             fx.Int64(self.cdone.data_ptr()),
             fx.Int64(self.plan_bar.data_ptr()),
             fx.Int64(self.overflow.data_ptr()),
+            fx.Int64(self.mem.ptr + lay.off_done),
+            fx.Int64(self.mem.ptr + lay.off_counter),
             fx.Int32(self.nblocks),
             fx.Int32(self._cdone_used(config)),
             s_fx,
@@ -989,5 +1009,46 @@ class SortedCombine:
         mark("combine")
         return self.out[: run_tokens * self.hidden].view(run_tokens, self.hidden)
 
+    def check_overflow(self):
+        """Raise if the plan dropped rows since the last check (syncs the device).
+
+        A row that does not fit its peer's per-pair reservation is dropped, so
+        the output is silently wrong unless the host looks at this counter.
+        """
+        import torch
+
+        torch.cuda.synchronize()
+        dropped = int(self.overflow.item())
+        self.overflow.zero_()
+        if dropped:
+            raise RuntimeError(
+                f"rank {self.rank}: {dropped} rows did not fit the per-pair reservation "
+                f"(cap={self.cap} rows, row_slack={self.row_slack}); raise row_slack"
+            )
+
+    def _wait_peers_consumed(self, timeout_s=30.0):
+        """Wait until every peer has read what this rank last sent it.
+
+        Under ``remote`` signalling a rank's last call can return while its own
+        puts are still in flight; freeing the window then would pull it out from
+        under the copy engine.
+        """
+        import time
+
+        import torch
+
+        torch.cuda.synchronize()
+        lay = self.layout
+        counter = _torch_view(self.mem.ptr + lay.off_counter, 4, torch.int32)
+        done = _torch_view(self.mem.ptr + lay.off_done, self.npes * 4, torch.int32)
+        calls = int(counter.item())
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            flags = done.tolist()
+            if all(f >= calls for r, f in enumerate(flags) if r != self.rank):
+                return
+            time.sleep(0.001)
+
     def close(self):
+        self._wait_peers_consumed()
         self.comm.close_all_resources()

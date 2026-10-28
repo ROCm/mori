@@ -82,7 +82,11 @@ def _next_pow2(v):
     return 1 << (int(v) - 1).bit_length()
 
 
-def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
+def _make_inputs(
+    tokens, model_dim, experts, topk, rank, seed, device, hot_bias=0.0, hot_experts=0
+):
+    """``hot_bias`` raises the router score of the first ``hot_experts`` experts, i.e.
+    skews routing toward rank 0; 0 is the uniform routing everything else uses."""
     g = torch.Generator(device=device).manual_seed(seed + rank)
     x = torch.randn(
         (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=g
@@ -90,6 +94,8 @@ def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
     scores = torch.randn(
         (tokens, experts), dtype=torch.float32, device=device, generator=g
     )
+    if hot_bias:
+        scores[:, :hot_experts] += hot_bias
     values, ids = torch.topk(scores, topk, dim=-1)
     return (
         x.contiguous(),
@@ -174,25 +180,39 @@ def main():
         help="sort tiles per shipped chunk",
     )
     parser.add_argument(
-        "--queues", type=int, default=1,
+        "--queues",
+        type=int,
+        default=1,
         help="SDMA channels per (src, dst) pair. More than one measured "
         "slower: KFD recommends a single engine per peer link here, so "
         "extra channels share it and only add descriptors.",
     )
     parser.add_argument("--row-slack", type=float, default=1.5)
     parser.add_argument(
-        "--signal-mode", choices=("quiet", "remote"), default="remote",
+        "--hot-bias",
+        type=float,
+        default=0.0,
+        help="add this to the router scores of rank 0's experts: skewed routing, "
+        "where one rank receives more than an even share of the rows",
+    )
+    parser.add_argument(
+        "--signal-mode",
+        choices=("quiet", "remote"),
+        default="remote",
         help="how a sender tells a peer its rows landed",
     )
     parser.add_argument(
-        "--no-aligned-pair", action="store_true",
+        "--no-aligned-pair",
+        action="store_true",
         help="force aiter off its common-pair stage2 so both paths run the "
         "same config. It is picked only at bucket 8192, where SortedCombine "
         "has no equivalent -- and measured 1.5%% slower than without it on "
         "uniform routing anyway.",
     )
     parser.add_argument(
-        "--quant", choices=("none", "fp8_blockwise_1x32"), default="fp8_blockwise_1x32",
+        "--quant",
+        choices=("none", "fp8_blockwise_1x32"),
+        default="fp8_blockwise_1x32",
         help="quantise the send buffer; halves the bytes SDMA moves",
     )
     args = parser.parse_args()
@@ -216,6 +236,8 @@ def main():
             rank,
             args.seed,
             device,
+            hot_bias=args.hot_bias,
+            hot_experts=net["experts"] // world,
         )
         moe = MegaMoEV2(
             rank=rank,
@@ -235,7 +257,9 @@ def main():
         if args.no_aligned_pair and config.stage2.aligned_pair:
             config = replace(
                 config,
-                stage2=replace(config.stage2, aligned_pair=False, pair_cu=0, skew_cu=96),
+                stage2=replace(
+                    config.stage2, aligned_pair=False, pair_cu=0, skew_cu=96
+                ),
             )
         if config.stage2.aligned_pair:
             raise SystemExit(
@@ -252,10 +276,16 @@ def main():
             lambda: moe._run_stage2(args.bs, None, True, config), args.iters
         )
         failures = []
-        sc = SortedCombine(moe, queues=args.queues, chunk_tiles=args.chunk_tiles, quant=args.quant,
+        sc = SortedCombine(
+            moe,
+            queues=args.queues,
+            chunk_tiles=args.chunk_tiles,
+            quant=args.quant,
             row_slack=args.row_slack,
-            signal_mode=args.signal_mode)
+            signal_mode=args.signal_mode,
+        )
         worst = 0.0
+        mismatched = 0
         # Repeated calls with no host sync between them also exercise the epoch counter,
         # the flags and the "consumed" handshake that stops a fast rank overrunning a slow one.
         for _ in range(4):
@@ -263,22 +293,34 @@ def main():
             torch.cuda.synchronize()
             diff = out.float() - ref.float()
             worst = max(worst, float(diff.norm() / ref.float().norm().clamp_min(1e-9)))
-        t = torch.tensor([worst], dtype=torch.float64)
+            mismatched = max(mismatched, int((out != ref).any(dim=1).sum()))
+        t = torch.tensor([worst, mismatched], dtype=torch.float64)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
-        worst = float(t.item())
+        worst, mismatched = float(t[0].item()), int(t[1].item())
         ms_per = _timeit(lambda: sc.run(args.bs, config), args.iters)
         ok = worst < args.rtol
+        # Both sides move fp8 rows in aiter's layout and reduce in the same order, so
+        # they must agree exactly; relL2 alone would let a few wrong rows through.
+        exact = config.p2p_quant == args.quant == "fp8_blockwise_1x32"
+        if exact and mismatched:
+            ok = False
         if not ok:
             failures.append("sdma")
+        try:
+            sc.check_overflow()
+        except RuntimeError as e:
+            failures.append(f"overflow ({e})")
+            ok = False
         if rank == 0:
             print(
-                f"relL2={worst:.3e} {'PASS' if ok else 'FAIL'} "
+                f"relL2={worst:.3e} mismatched_rows={mismatched} "
+                f"{'PASS' if ok else 'FAIL'} "
                 f"time={ms_per:.4f}ms (reference stage2+combine {ref_ms:.4f}ms)",
                 flush=True,
             )
         sc.close()
         if failures:
-            raise AssertionError(f"relL2 above {args.rtol} for {failures}")
+            raise AssertionError(f"sdma path failed: {failures}")
         if rank == 0:
             print("SUCCESS", flush=True)
     finally:
