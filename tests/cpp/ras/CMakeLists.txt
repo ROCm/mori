@@ -24,3 +24,18 @@ mori_ras_test(config)
 mori_ras_test(runtime)
 mori_ras_test(fork)
 mori_ras_test(links)
+
+# Coverage-guided fuzzing of the protocol decoder. Needs clang's libFuzzer, so it is opt-in;
+# test_ras_protocol replays its seed corpus with fixed mutations in every build.
+option(MORI_RAS_FUZZ "Build fuzz_ras_protocol, a libFuzzer target for the RAS decoder" OFF)
+if(MORI_RAS_FUZZ)
+  add_executable(fuzz_ras_protocol fuzz_protocol.cpp ${CMAKE_SOURCE_DIR}/src/ras/protocol.cpp)
+  target_include_directories(
+    fuzz_ras_protocol PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include
+                              ${CMAKE_SOURCE_DIR}/3rdparty/msgpack-c/include)
+  target_compile_definitions(fuzz_ras_protocol PRIVATE MSGPACK_NO_BOOST)
+  # Not UBSan too: with ROCm's clang, UBSan's source-location strings trip a false ASan ODR
+  # report.
+  target_compile_options(fuzz_ras_protocol PRIVATE -fsanitize=fuzzer,address)
+  target_link_options(fuzz_ras_protocol PRIVATE -fsanitize=fuzzer,address)
+endif()
