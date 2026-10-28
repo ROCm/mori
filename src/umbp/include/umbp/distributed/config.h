@@ -253,6 +253,7 @@ enum class PeerEvictionMode {
 };
 
 struct PoolClientConfig {
+  UMBPSimConfig sim;
   UMBPMasterClientConfig master_config;
   UMBPIoEngineConfig io_engine;
 

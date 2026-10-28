@@ -390,6 +390,8 @@ add_library(
   distributed/peer/backend/hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
   distributed/peer/backend/instrumented_backend.cpp
+  sim/sim.cpp
+  sim/trace.cpp
   distributed/transfer/transfer_engine.cpp
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp

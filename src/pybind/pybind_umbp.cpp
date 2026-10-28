@@ -292,9 +292,16 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
       .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);
 
+  py::class_<UMBPSimConfig>(m, "UMBPSimConfig")
+      .def(py::init<>())
+      .def_readwrite("enabled", &UMBPSimConfig::enabled)
+      .def_readwrite("profile_path", &UMBPSimConfig::profile_path)
+      .def_readwrite("trace_path", &UMBPSimConfig::trace_path);
+
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
       .def_static("from_environment", &UMBPConfig::FromEnvironment)
+      .def_readwrite("sim", &UMBPConfig::sim)
       .def_readwrite("dram", &UMBPConfig::dram)
       .def_readwrite("ssd", &UMBPConfig::ssd)
       .def_readwrite("eviction", &UMBPConfig::eviction)

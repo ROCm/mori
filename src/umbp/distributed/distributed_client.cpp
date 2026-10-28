@@ -42,9 +42,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   if (!config.ValidateStorageConfig(&config_error)) {
     throw std::runtime_error("invalid UMBP storage config: " + config_error);
   }
+  if (config.sim.enabled) sim_trace_ = std::make_unique<SimTrace>(config.sim);
   auto dc = config.distributed.value();
   if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
   if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;
+  if (config.sim.enabled && dc.ranged_scratch_size != 0) {
+    throw std::invalid_argument("UMBP sim does not support remote ranged scratch buffers");
+  }
   local_only_ = dc.master_config.master_address.empty();
 
   // All three ownership blocks are lowered unconditionally; dc.medium selects
@@ -133,6 +137,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
   pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
+  pc_config.sim = config_.sim;
 
   auto release_scratch = [this] {
     HostMemAllocator cleanup;
@@ -213,24 +218,27 @@ DistributedClient::~DistributedClient() { Close(); }
 // ---------------------------------------------------------------------------
 
 bool DistributedClient::Put(const std::string& key, uintptr_t src, size_t size) {
-  if (closing_) return false;
+  SimCall call(sim_trace_.get(), "put", 1, size);
+  if (closing_) return call.Result(false);
   std::shared_lock lk(op_mutex_);
-  if (closed_) return false;
-  return pool_client_->Put(key, reinterpret_cast<const void*>(src), size);
+  if (closed_) return call.Result(false);
+  return call.Result(pool_client_->Put(key, reinterpret_cast<const void*>(src), size));
 }
 
 bool DistributedClient::Get(const std::string& key, uintptr_t dst, size_t size) {
-  if (closing_) return false;
+  SimCall call(sim_trace_.get(), "get", 1, size);
+  if (closing_) return call.Result(false);
   std::shared_lock lk(op_mutex_);
-  if (closed_) return false;
-  return pool_client_->Get(key, reinterpret_cast<void*>(dst), size);
+  if (closed_) return call.Result(false);
+  return call.Result(pool_client_->Get(key, reinterpret_cast<void*>(dst), size));
 }
 
 bool DistributedClient::Exists(const std::string& key) const {
-  if (closing_) return false;
+  SimCall call(sim_trace_.get(), "exists", 1, 0);
+  if (closing_) return call.Result(false);
   std::shared_lock lk(op_mutex_);
-  if (closed_) return false;
-  return pool_client_->Exists(key);
+  if (closed_) return call.Result(false);
+  return call.Result(pool_client_->Exists(key));
 }
 
 // ---------------------------------------------------------------------------
@@ -240,93 +248,101 @@ bool DistributedClient::Exists(const std::string& key) const {
 std::vector<bool> DistributedClient::BatchPut(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& srcs,
                                               const std::vector<size_t>& sizes) {
-  if (closing_) return std::vector<bool>(keys.size(), false);
+  SimCall call(sim_trace_.get(), "batch_put", keys.size(), sizes);
+  if (closing_) return call.Result(std::vector<bool>(keys.size(), false));
   std::shared_lock lk(op_mutex_);
-  if (closed_) return std::vector<bool>(keys.size(), false);
+  if (closed_) return call.Result(std::vector<bool>(keys.size(), false));
 
   std::vector<const void*> src_ptrs(srcs.size());
   for (size_t i = 0; i < srcs.size(); ++i) {
     src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
   }
-  return pool_client_->BatchPut(keys, src_ptrs, sizes);
+  return call.Result(pool_client_->BatchPut(keys, src_ptrs, sizes));
 }
 
 std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::string>& keys,
                                                        const std::vector<uintptr_t>& srcs,
                                                        const std::vector<size_t>& sizes,
                                                        const std::vector<int>& /*depths*/) {
+  SimCall call(sim_trace_.get(), "batch_put_with_depth", keys.size(), sizes);
   // Depth was a master-side hint for the prior allocator; in the
   // master-as-advisor design master no longer tracks per-key depth.
   // Forward to the depth-less BatchPut and silently drop the hint.
-  if (closing_) return std::vector<bool>(keys.size(), false);
+  if (closing_) return call.Result(std::vector<bool>(keys.size(), false));
   std::shared_lock lk(op_mutex_);
-  if (closed_) return std::vector<bool>(keys.size(), false);
+  if (closed_) return call.Result(std::vector<bool>(keys.size(), false));
   std::vector<const void*> src_ptrs(srcs.size());
   for (size_t i = 0; i < srcs.size(); ++i) {
     src_ptrs[i] = reinterpret_cast<const void*>(srcs[i]);
   }
-  return pool_client_->BatchPut(keys, src_ptrs, sizes);
+  return call.Result(pool_client_->BatchPut(keys, src_ptrs, sizes));
 }
 
 std::vector<bool> DistributedClient::BatchGet(const std::vector<std::string>& keys,
                                               const std::vector<uintptr_t>& dsts,
                                               const std::vector<size_t>& sizes) {
-  if (closing_) return std::vector<bool>(keys.size(), false);
+  SimCall call(sim_trace_.get(), "batch_get", keys.size(), sizes);
+  if (closing_) return call.Result(std::vector<bool>(keys.size(), false));
   std::shared_lock lk(op_mutex_);
-  if (closed_) return std::vector<bool>(keys.size(), false);
+  if (closed_) return call.Result(std::vector<bool>(keys.size(), false));
 
   std::vector<void*> dst_ptrs(dsts.size());
   for (size_t i = 0; i < dsts.size(); ++i) {
     dst_ptrs[i] = reinterpret_cast<void*>(dsts[i]);
   }
-  return pool_client_->BatchGet(keys, dst_ptrs, sizes);
+  return call.Result(pool_client_->BatchGet(keys, dst_ptrs, sizes));
 }
 
 std::vector<bool> DistributedClient::BatchGetRanges(
     const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
     const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& src_offsets) {
-  if (closing_) return std::vector<bool>(keys.size(), false);
+  SimCall call(sim_trace_.get(), "batch_get_ranges", keys.size(), sizes);
+  if (closing_) return call.Result(std::vector<bool>(keys.size(), false));
   std::shared_lock lk(op_mutex_);
-  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  if (closed_ || !pool_client_) return call.Result(std::vector<bool>(keys.size(), false));
   std::vector<std::vector<void*>> dst_ptrs(dsts.size());
   for (size_t i = 0; i < dsts.size(); ++i) {
     dst_ptrs[i].reserve(dsts[i].size());
     for (uintptr_t ptr : dsts[i]) dst_ptrs[i].push_back(reinterpret_cast<void*>(ptr));
   }
-  return pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets);
+  return call.Result(pool_client_->BatchGetRanges(keys, dst_ptrs, sizes, src_offsets));
 }
 
 std::vector<bool> DistributedClient::BatchPutRanges(
     const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
     const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& dst_offsets) {
-  if (closing_) return std::vector<bool>(keys.size(), false);
+  SimCall call(sim_trace_.get(), "batch_put_ranges", keys.size(), sizes);
+  if (closing_) return call.Result(std::vector<bool>(keys.size(), false));
   std::shared_lock lk(op_mutex_);
-  if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
+  if (closed_ || !pool_client_) return call.Result(std::vector<bool>(keys.size(), false));
   std::vector<std::vector<const void*>> src_ptrs(srcs.size());
   for (size_t i = 0; i < srcs.size(); ++i) {
     src_ptrs[i].reserve(srcs[i].size());
     for (uintptr_t ptr : srcs[i]) src_ptrs[i].push_back(reinterpret_cast<const void*>(ptr));
   }
-  return pool_client_->BatchPutRanges(keys, object_sizes, src_ptrs, sizes, dst_offsets);
+  return call.Result(
+      pool_client_->BatchPutRanges(keys, object_sizes, src_ptrs, sizes, dst_offsets));
 }
 
 std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>& keys) const {
-  if (closing_) return std::vector<bool>(keys.size(), false);
+  SimCall call(sim_trace_.get(), "batch_exists", keys.size(), 0);
+  if (closing_) return call.Result(std::vector<bool>(keys.size(), false));
   std::shared_lock lk(op_mutex_);
-  if (closed_) return std::vector<bool>(keys.size(), false);
+  if (closed_) return call.Result(std::vector<bool>(keys.size(), false));
 
   // Single batched gRPC instead of N per-key Lookup RPCs (was the #5
   // bottleneck — sglang probes with batch_size=128 used to emit 128
   // roundtrips per BatchExists call).
-  return pool_client_->BatchExists(keys);
+  return call.Result(pool_client_->BatchExists(keys));
 }
 
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
-  if (closing_) return 0;
+  SimCall call(sim_trace_.get(), "batch_exists_consecutive", keys.size(), 0);
+  if (closing_) return call.Result(size_t{0});
   std::shared_lock lk(op_mutex_);
-  if (closed_) return 0;
+  if (closed_) return call.Result(size_t{0});
 
   // One batched gRPC, then scan the parallel result vector for the first
   // missing key.  A wire failure or size mismatch surfaces as an all-false
@@ -334,9 +350,9 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
   // the old loop-over-Exists path).
   auto found = pool_client_->BatchExists(keys);
   for (size_t i = 0; i < found.size(); ++i) {
-    if (!found[i]) return i;
+    if (!found[i]) return call.Result(i);
   }
-  return keys.size();
+  return call.Result(keys.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -345,13 +361,16 @@ size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>&
 
 bool DistributedClient::RegisterMemory(uintptr_t ptr, size_t size, mori::io::MemoryLocationType loc,
                                        int device, MemoryRegistration mode) {
-  if (closing_) return false;
+  SimCall call(sim_trace_.get(), "register_memory", 0, size);
+  if (closing_) return call.Result(false);
   std::shared_lock lk(op_mutex_);
-  if (closed_) return false;
-  return pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device, mode);
+  if (closed_) return call.Result(false);
+  return call.Result(
+      pool_client_->RegisterMemory(reinterpret_cast<void*>(ptr), size, loc, device, mode));
 }
 
 void DistributedClient::DeregisterMemory(uintptr_t ptr) {
+  SimCall call(sim_trace_.get(), "deregister_memory", 0, 0);
   if (closing_) return;
   std::shared_lock lk(op_mutex_);
   if (closed_) return;
@@ -363,37 +382,40 @@ void DistributedClient::DeregisterMemory(uintptr_t ptr) {
 // ---------------------------------------------------------------------------
 
 bool DistributedClient::Clear() {
+  SimCall call(sim_trace_.get(), "clear", 0, 0);
   // Vacuously done during shutdown / teardown: there is no live client to
   // converge with master, so callers in close paths should not see a
   // spurious failure.
-  if (closing_) return true;
+  if (closing_) return call.Result(true);
   // Exclusive lock: Clear races with every Put/Get/Batch* (which take
   // shared_lock) and with Close (which takes unique_lock).  Holding it
   // here keeps local in-flight public API calls out of the clear
   // window — remote in-flight RDMA reads are not in scope (best
   // effort; see distributed-clear-full-sync-plan-zh.md).
   std::unique_lock lk(op_mutex_);
-  if (closed_ || !pool_client_) return true;
+  if (closed_ || !pool_client_) return call.Result(true);
   const bool ok = pool_client_->Clear();
   if (ok) {
     MORI_UMBP_INFO("[DistributedClient] Clear() completed full-sync empty snapshot");
   } else {
     MORI_UMBP_WARN("[DistributedClient] Clear() full-sync empty snapshot failed");
   }
-  return ok;
+  return call.Result(ok);
 }
 
 bool DistributedClient::Flush() {
-  if (closing_) return true;
+  SimCall call(sim_trace_.get(), "flush", 0, 0);
+  if (closing_) return call.Result(true);
   std::shared_lock lk(op_mutex_);
-  if (closed_ || !pool_client_) return true;
+  if (closed_ || !pool_client_) return call.Result(true);
   // Nothing to flush to on a node with no master; the local media are already
   // authoritative for everything they hold.
   if (pool_client_->HasMaster()) pool_client_->Master().FlushHeartbeat();
-  return true;
+  return call.Result(true);
 }
 
 void DistributedClient::Close() {
+  SimCall call(sim_trace_.get(), "close", 0, 0);
   closing_ = true;
   std::unique_lock lk(op_mutex_);
   if (closed_) return;
@@ -447,7 +469,7 @@ bool DistributedClient::SupportsRangedIO() const {
   // touches an arena.  Requiring one there would make an embedded deployment
   // either report ranged I/O as unsupported or allocate two arenas it cannot
   // use.
-  if (local_only_) return true;
+  if (config_.sim.enabled || local_only_) return true;
   return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
 }
 

@@ -31,6 +31,7 @@
 
 #include "umbp/distributed/pool_client.h"
 #include "umbp/local/host_mem_allocator.h"
+#include "umbp/sim/trace.h"
 #include "umbp/umbp_client.h"
 
 namespace mori::umbp {
@@ -134,6 +135,7 @@ class DistributedClient : public IUMBPClient {
   // which is the one place the distinction changes an answer rather than just
   // a code path.
   bool local_only_ = false;
+  std::unique_ptr<SimTrace> sim_trace_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
   mutable std::shared_mutex op_mutex_;

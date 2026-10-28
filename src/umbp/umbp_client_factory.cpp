@@ -207,6 +207,9 @@ UMBPConfig WithEmbeddedDefaults(const UMBPConfig& config) {
 }
 
 std::unique_ptr<IUMBPClient> CreateUMBPClient(const UMBPConfig& config) {
+  if (config.sim.enabled && config.standalone_process.has_value()) {
+    throw std::invalid_argument("UMBP sim does not support standalone-process mode");
+  }
   if (config.standalone_process.has_value()) {
     return std::make_unique<standalone::StandaloneProcessClient>(config);
   }

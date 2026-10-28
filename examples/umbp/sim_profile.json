@@ -1,0 +1,25 @@
+{
+  "id": "example-estimates-not-calibrated",
+  "paths": {
+    "cpu_cpu": {
+      "channel": "host-memory",
+      "latency_ns": 2000,
+      "bandwidth_bytes_per_second": 40000000000
+    },
+    "cpu_gpu": {
+      "channel": "host-device-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "gpu_cpu": {
+      "channel": "host-device-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "gpu_gpu": {
+      "channel": "device-memory",
+      "latency_ns": 5000,
+      "bandwidth_bytes_per_second": 1000000000000
+    }
+  }
+}

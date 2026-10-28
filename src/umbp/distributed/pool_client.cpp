@@ -66,6 +66,7 @@
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/distributed/transfer/posix_engine.h"
+#include "umbp/sim/sim.h"
 #ifdef UMBP_ENABLE_GDS
 #include "umbp/distributed/transfer/gds_engine.h"
 #endif
@@ -840,7 +841,17 @@ std::vector<BackendInstanceConfig> EffectiveBackendConfigs(const PoolClientConfi
 
 std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig& config,
                                                      uint64_t page_size, bool staging_use_hugepages,
-                                                     uint64_t staging_hugepage_size) {
+                                                     uint64_t staging_hugepage_size, bool sim) {
+  if (sim) {
+    const bool hbm = config.tier == TierType::HBM;
+    if (!hbm && config.tier != TierType::DRAM) return nullptr;
+    auto source = std::make_unique<SimPageMemorySource>(
+        hbm ? mori::io::MemoryLocationType::GPU : mori::io::MemoryLocationType::CPU,
+        hbm ? config.hbm.device : -1);
+    return std::make_unique<PageBackend>(config.tier, page_size, std::move(source),
+                                         hbm ? config.hbm.buffer_sizes : config.dram.buffer_sizes,
+                                         std::chrono::milliseconds{30000}, DramReadLeaseTtl());
+  }
   switch (config.tier) {
     case TierType::DRAM: {
       PageBackend::OwnershipConfig ownership;
@@ -951,6 +962,30 @@ bool PoolClient::Init() {
     }
   }
 
+  std::unique_ptr<SimTransferEngine> sim_engine;
+  if (config_.sim.enabled) {
+    const auto backends = EffectiveBackendConfigs(config_);
+    const bool unsupported = std::any_of(backends.begin(), backends.end(), [](const auto& backend) {
+      return backend.tier != TierType::DRAM && backend.tier != TierType::HBM;
+    });
+    if (unsupported || !config_.io_engine.host.empty() || config_.ranged_get_scratch_size != 0 ||
+        config_.ranged_put_scratch_size != 0 || config_.peer_service_port != 0 ||
+        config_.auto_peer_service_port) {
+      MORI_UMBP_ERROR(
+          "[UMBP sim] only in-process DRAM/HBM supported; disable RDMA, peer service and remote "
+          "scratch");
+      initialized_.store(false);
+      return false;
+    }
+    try {
+      sim_engine = std::make_unique<SimTransferEngine>(config_.sim.profile_path);
+    } catch (const std::exception& e) {
+      MORI_UMBP_ERROR("[UMBP sim] {}", e.what());
+      initialized_.store(false);
+      return false;
+    }
+  }
+
   // No address, no master.  Everything below -- backends, transfer engine, peer
   // service -- is built either way; only routing, registration and the
   // heartbeat are skipped.  That is what lets one binary be a single node or a
@@ -968,46 +1003,50 @@ bool PoolClient::Init() {
   // named — the same rule Phase 5 applies to backends.  Everything downstream
   // holds TransferEngine / MemoryRegistrar / PeerDirectory.
   auto composite = std::make_unique<CompositeTransferEngine>();
-  composite->AddEngine(std::make_unique<LocalCopyEngine>());
-  // Both-local pairs with a GPU endpoint.  Disjoint from LocalCopyEngine (which
-  // requires both sides CPU) and from MoriIoEngine (which requires exactly one
-  // side remote), so this is registration order as documentation, not as a
-  // tie-break — but it must come before the wire engine on principle, since an
-  // HBM pair that reached mori-io would be refused rather than served slowly.
-  auto hbm = std::make_unique<HbmCopyEngine>();
-  // Kept as a raw observer so the live medium's host buffers can be declared
-  // kernel-addressable once it has allocated them, below.  This is the one
-  // engine-specific reference PoolClient holds, and it carries no data-plane
-  // call: everything that moves bytes still goes through transfer_engine_.
-  hbm_engine_ = hbm.get();
-  composite->AddEngine(std::move(hbm));
-  // (file, host memory): SSD migrations to and from DRAM pages, no staging.
-  composite->AddEngine(std::make_unique<PosixEngine>());
-#ifdef UMBP_ENABLE_GDS
-  // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
-  // device) pairs, which no memory engine touches, so registration order is
-  // documentation.  Compiled in when the build found the hipfile headers, and
-  // registered only when libhipfile actually dlopen's on this host.
-  if (GdsEngine::Available()) {
-    composite->AddEngine(std::make_unique<GdsEngine>());
+  if (config_.sim.enabled) {
+    composite->AddEngine(std::move(sim_engine));
   } else {
-    MORI_UMBP_INFO("[PoolClient] libhipfile unavailable — SSD reads stay host-staged");
-  }
-#endif
-  if (!config_.io_engine.host.empty()) {
-    mori::io::IOEngineConfig io_cfg;
-    io_cfg.host = config_.io_engine.host;
-    io_cfg.port = config_.io_engine.port;
-    auto rdma = std::make_unique<MoriIoEngine>(config_.master_config.node_id, io_cfg,
-                                               config_.staging_buffer_size);
-    if (!rdma->Init()) {
-      MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config_.io_engine.host,
-                      config_.io_engine.port);
-      Shutdown();
-      return false;
+    composite->AddEngine(std::make_unique<LocalCopyEngine>());
+    // Both-local pairs with a GPU endpoint.  Disjoint from LocalCopyEngine (which
+    // requires both sides CPU) and from MoriIoEngine (which requires exactly one
+    // side remote), so this is registration order as documentation, not as a
+    // tie-break — but it must come before the wire engine on principle, since an
+    // HBM pair that reached mori-io would be refused rather than served slowly.
+    auto hbm = std::make_unique<HbmCopyEngine>();
+    // Kept as a raw observer so the live medium's host buffers can be declared
+    // kernel-addressable once it has allocated them, below.  This is the one
+    // engine-specific reference PoolClient holds, and it carries no data-plane
+    // call: everything that moves bytes still goes through transfer_engine_.
+    hbm_engine_ = hbm.get();
+    composite->AddEngine(std::move(hbm));
+    // (file, host memory): SSD migrations to and from DRAM pages, no staging.
+    composite->AddEngine(std::make_unique<PosixEngine>());
+#ifdef UMBP_ENABLE_GDS
+    // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
+    // device) pairs, which no memory engine touches, so registration order is
+    // documentation.  Compiled in when the build found the hipfile headers, and
+    // registered only when libhipfile actually dlopen's on this host.
+    if (GdsEngine::Available()) {
+      composite->AddEngine(std::make_unique<GdsEngine>());
+    } else {
+      MORI_UMBP_INFO("[PoolClient] libhipfile unavailable — SSD reads stay host-staged");
     }
-    peer_directory_ = rdma.get();
-    composite->AddEngine(std::move(rdma));
+#endif
+    if (!config_.io_engine.host.empty()) {
+      mori::io::IOEngineConfig io_cfg;
+      io_cfg.host = config_.io_engine.host;
+      io_cfg.port = config_.io_engine.port;
+      auto rdma = std::make_unique<MoriIoEngine>(config_.master_config.node_id, io_cfg,
+                                                 config_.staging_buffer_size);
+      if (!rdma->Init()) {
+        MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config_.io_engine.host,
+                        config_.io_engine.port);
+        Shutdown();
+        return false;
+      }
+      peer_directory_ = rdma.get();
+      composite->AddEngine(std::move(rdma));
+    }
   }
   transfer_engine_ = std::move(composite);
 
@@ -1054,7 +1093,7 @@ bool PoolClient::Init() {
     }
     auto backend =
         MakeConfiguredBackend(backend_config, page_size, config_.ssd_staging_use_hugepages,
-                              config_.ssd_staging_hugepage_size);
+                              config_.ssd_staging_hugepage_size, config_.sim.enabled);
     if (backend == nullptr) {
       MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}", backend_config.name,
                       static_cast<int>(backend_config.tier));
@@ -1608,7 +1647,9 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
   // Classified, not assumed host: this is the self-target path, where a device
   // user buffer paired with a host DRAM page must reach HbmCopyEngine rather
   // than LocalCopyEngine.  One classification per batch, not per page.
-  const TransferRef user_ref = ClassifiedUserBytes(user, size);
+  const auto [user_ref, user_offset] =
+      config_.sim.enabled ? UserBufferRef(user, size)
+                          : std::pair<TransferRef, uint64_t>{ClassifiedUserBytes(user, size), 0};
   items->reserve(pages.size());
   for (size_t i = 0; i < pages.size(); ++i) {
     TransferRef buf = backend->BufferRef(pages[i].buffer_index);
@@ -1622,14 +1663,14 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
     item.tag = i;
     if (to_backend) {
       item.src = user_ref;
-      item.src_offset = i * page_size;
+      item.src_offset = user_offset + i * page_size;
       item.dst = std::move(buf);
       item.dst_offset = PageOffset(pages[i], page_size);
     } else {
       item.src = std::move(buf);
       item.src_offset = PageOffset(pages[i], page_size);
       item.dst = user_ref;
-      item.dst_offset = i * page_size;
+      item.dst_offset = user_offset + i * page_size;
     }
     items->push_back(std::move(item));
   }
@@ -5082,6 +5123,10 @@ PoolClient::PeerConnection& PoolClient::GetOrConnectPeer(const std::string& node
 // ---------------------------------------------------------------------------
 
 bool PoolClient::EnsurePeerServiceConnection(PeerConnection& peer) {
+  if (config_.sim.enabled) {
+    MORI_UMBP_ERROR("[UMBP sim] remote owner '{}' is unsupported", peer.node_id);
+    return false;
+  }
   std::lock_guard<std::mutex> lock(peer.conn_mutex);
   if (peer.peer_address.empty()) {
     return false;

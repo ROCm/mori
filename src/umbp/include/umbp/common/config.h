@@ -472,6 +472,12 @@ struct UMBPStandaloneProcessConfig {
   std::vector<std::string> tags;
 };
 
+struct UMBPSimConfig {
+  bool enabled = false;
+  std::string profile_path;
+  std::string trace_path;  // Optional JSONL output; empty uses the UMBP INFO logger.
+};
+
 struct UMBPConfig {
   UMBPDramConfig dram;
   UMBPSsdConfig ssd;
@@ -506,8 +512,13 @@ struct UMBPConfig {
   // Unset values preserve the existing deployment-specific defaults.
   std::string backend_policy_path;
   std::optional<uint64_t> page_size;
+  UMBPSimConfig sim;
 
   bool ValidateStorageConfig(std::string* error_message = nullptr) const {
+    if (sim.enabled && (sim.profile_path.empty() || standalone_process.has_value())) {
+      if (error_message) *error_message = "sim requires profile_path and an in-process client";
+      return false;
+    }
     if (page_size.has_value() && *page_size == 0) {
       if (error_message) *error_message = "page_size must be > 0 when supplied";
       return false;
@@ -653,6 +664,10 @@ struct UMBPConfig {
       const char* v = std::getenv(name);
       return v ? std::atof(v) : def;
     };
+
+    cfg.sim.enabled = getenv_int("UMBP_SIM_ENABLE", 0) != 0;
+    cfg.sim.profile_path = getenv_str("UMBP_SIM_PROFILE", "");
+    cfg.sim.trace_path = getenv_str("UMBP_SIM_TRACE", "");
 
     cfg.dram.capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram.capacity_bytes);
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;

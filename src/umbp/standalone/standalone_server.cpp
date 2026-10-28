@@ -1700,6 +1700,9 @@ int ResolveMetricsPortFromEnv(bool* ok, std::string* error) {
 
 StandaloneServer::StandaloneServer(UMBPConfig config, std::string address)
     : config_(NormalizeBackendConfig(std::move(config))), address_(std::move(address)) {
+  if (config_.sim.enabled) {
+    throw std::invalid_argument("UMBP sim does not support standalone servers");
+  }
   // Metrics are only this process's job when it has no master.  With one, the
   // PoolClient below ships every series to that master, which already owns a
   // MetricsServer and merges them there — binding a second endpoint here would
