@@ -114,6 +114,16 @@ SDMA_GET_PTR = {s: _binding(f"sdma_get_ptr_{s}") for s in ("thread", "warp", "bl
 cco_sdma_wait_signal = _binding("sdma_wait_signal")
 cco_sdma_put_ptr_rsig_thread = _binding("sdma_put_ptr_rsig_thread")
 cco_sdma_signal_slot = _binding("sdma_signal_slot")
+# ccoSdma::postWaitMem / postWaitSignal / putBroadcast by coop tag.
+SDMA_POST_WAIT_MEM = {
+    s: _binding(f"sdma_post_wait_mem_{s}") for s in ("thread", "warp", "block")
+}
+SDMA_POST_WAIT_SIGNAL = {
+    s: _binding(f"sdma_post_wait_signal_{s}") for s in ("thread", "warp", "block")
+}
+SDMA_PUT_BROADCAST = {
+    s: _binding(f"sdma_put_broadcast_{s}") for s in ("thread", "warp", "block")
+}
 
 # ── axis-free symbols ──
 # cco_lsa_ptr(window, peerLsaRank, offset) -> peer's load/store-accessible VA.
