@@ -57,9 +57,10 @@ enum class UMBPDurabilityMode : int {
   Relaxed = 1,
 };
 
-// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) translates only
-// the first 2^18 page entries of a memory region and silently aliases the rest,
-// which with 2 MiB pages is 512 GiB.  On 4 KiB pages the safe value is 1 GiB.
+// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) firmware before
+// 1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+// and silently aliases the rest, which with 2 MiB pages is 512 GiB.  On 4 KiB
+// pages the safe value is 1 GiB; PageBackend warns about a larger region.
 inline constexpr uint64_t kDefaultDramMaxMrBytes = 512ULL << 30;
 
 struct UMBPDramConfig {

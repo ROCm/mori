@@ -71,10 +71,14 @@ leaves all bitmaps unchanged. HBM and SSD backends ignore the hint.
 
 A host buffer larger than `UMBP_DRAM_MAX_MR_BYTES` (default 512 GiB) is
 registered with the NIC as several memory regions of at most that size, in
-whole backing and allocator pages. AMD Pensando AINIC translates only the first
-2^18 page entries of a memory region and silently aliases the rest, so the
-limit must not exceed 2^18 backing pages: 512 GiB with 2 MiB pages, 1 GiB with
-4 KiB pages. `0` registers each buffer whole. Each region is its own buffer on
+whole backing and allocator pages. AMD Pensando AINIC firmware before
+1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+and silently aliases the rest, so the limit must not exceed 2^18 backing
+pages: 512 GiB with 2 MiB pages, 1 GiB with 4 KiB pages. On such a host the
+DRAM tier and the ranged scratch warn at startup about a region with more,
+counted from the pages that actually back it, since a hugepage request that
+fell back to 4 KiB pages has 512 times the entries; the warning names the
+firmware. `0` registers each buffer whole. Each region is its own buffer on
 the same node; a node preference takes the first of that node's regions that
 holds the request.
 

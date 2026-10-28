@@ -29,25 +29,16 @@
 #include "mori/io/engine.hpp"
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
+#include "umbp/common/nic_region_limit.h"
 #include "umbp/distributed/config.h"
 
 namespace mori::umbp {
 
 namespace {
 
-// Each ranged scratch arena, or each NUMA part of one, is one NIC memory region,
-// and AINIC translates only the first 2^18 page entries of a region and silently
-// aliases the rest (see UMBP_DRAM_MAX_MR_BYTES).
-void WarnIfNicAliases(const HostBufferHandle& handle, size_t bytes) {
-  constexpr size_t kNicRegionPages = size_t{1} << 18;
-  const size_t page = handle.actual_alignment;
-  if (page == 0 || bytes / page <= kNicRegionPages) return;
-  MORI_UMBP_WARN(
-      "[DistributedClient] ranged scratch region of {} MiB on {} KiB pages exceeds the {} pages "
-      "an AINIC memory region translates; use UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES or a "
-      "smaller UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES",
-      bytes >> 20, page >> 10, kNicRegionPages);
-}
+constexpr const char* kScratchRemedy =
+    "Use UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES or a smaller "
+    "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES.";
 
 }  // namespace
 
@@ -429,7 +420,8 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
       "[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
       first.mapped_size >> 20, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
-  WarnIfNicAliases(first, first.mapped_size);
+  WarnIfNicRegionAliases("Ranged scratch arena", first.mapped_size, first.actual_alignment,
+                         kScratchRemedy);
 }
 
 bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
@@ -470,7 +462,8 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
       arenas->push_back({handle.ptr, part, node, shards});
       ranged_scratch_handles_.push_back(handle);
     }
-    WarnIfNicAliases(ranged_scratch_handles_.back(), part);
+    WarnIfNicRegionAliases("Ranged scratch part on NUMA node " + std::to_string(node), part,
+                           ranged_scratch_handles_.back().actual_alignment, kScratchRemedy);
     layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
               std::to_string(shards) + " x " + std::to_string((part / shards) >> 10) + " KiB";
   }

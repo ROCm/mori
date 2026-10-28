@@ -92,6 +92,7 @@ endif()
 # Core static library
 set(UMBP_CORE_SRCS
     common/device_copy.cpp
+    common/nic_region_limit.cpp
     storage/io/storage_io_driver.cpp
     storage/io/posix_storage_io_driver.cpp
     storage/io/io_uring_storage_io_driver.cpp
