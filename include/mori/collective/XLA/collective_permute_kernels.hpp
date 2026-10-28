@@ -125,15 +125,15 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // out, so this needs no ccoGetLocalPtr/ccoGetLsaPeerPtr round trip.
   uint8_t* const localDst = reinterpret_cast<uint8_t*>(recvBuf);
   StartSdmaScatter(
-      devComm.sdma, npes, /*logS=*/0,
+      devComm.sdma, npes, /*logS=*/0, sendK,
       [=](int peer) {
+        auto [dstP, sigP] = PeerPtrs(localDst,
+                    arrived + myLsaRank * kArrivedStride + kPermuteArrived,
+                    peer, myLsaRank, stride4G);
         return ScatterPeer{
             peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
-            PeerPtr(localDst, peer, myLsaRank, stride4G),
-            PeerPtr(arrived + myLsaRank * kArrivedStride + kPermuteArrived, peer, myLsaRank,
-                    stride4G)};
-      },
-      sendK);
+            dstP, sigP};
+      });
 
   if (srcPe >= 0) {
     if (threadIdx.x == 0) {
