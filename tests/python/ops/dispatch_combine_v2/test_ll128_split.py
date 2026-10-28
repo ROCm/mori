@@ -29,8 +29,11 @@ rest on the schedule's. One sequence of call sizes crosses max_tok both ways, an
   says, delivers every source row, id, weight and scale row to the slot its reverse map
   names (src_rank * M + src_tok on both plans), and a bf16 combine returns U * x;
 - back to back, eager and then replaying one graph a call size;
-- as snapshot handles, two dispatches before both combines, for each pairing of the sides;
-  a push-quant op takes the schedule's plans for these.
+- as snapshot handles, two dispatches before both combines, for each pairing of the sides,
+  a barrier after every call as test_routing_snapshot.py has: a peer's next schedule
+  dispatch writes into this rank's receive rows, and its next schedule combine restages
+  the rows this rank reads. Gather ops only: every push-quant op scatters, and dispatch
+  rejects snapshot=True there.
 
 Every combine of the last two equals the synced one bit for bit. The expert is the identity
 on the received rows (fp8 / fp4 decoded to bf16), so a combine row is U copies of one row,
@@ -134,8 +137,8 @@ def run(cfg, comm, dev, lut, lim, sizes, args):
         torch.cuda.synchronize()
         comm.barrier()
 
-    def rows(n, snapshot=False):
-        return world * (lim if n <= lim and not (snapshot and push) else M)
+    def rows(n):
+        return world * (lim if n <= lim else M)
 
     def sources(i, n):
         return [make_inputs(cfg, i, src, n) for src in range(world)]
@@ -219,32 +222,29 @@ def run(cfg, comm, dev, lut, lim, sizes, args):
 
     small = [i for i, n in enumerate(sizes) if n <= lim]
     large = [i for i, n in enumerate(sizes) if n > lim]
-    for a, b in (small[:2], (small[0], large[0]), (large[0], small[0]), large[:2]):
-        x, idx, w, s = args[a]
-        out, _, _, _, _, ha = op.dispatch(
-            x, w, s, idx, return_routing=True, snapshot=True
-        )
-        rows_a = out.shape[0]
-        ya = expert(out, lut).clone()
-        x, idx, w, s = args[b]
-        out, _, _, _, _, hb = op.dispatch(
-            x, w, s, idx, return_routing=True, snapshot=True
-        )
-        rows_b = out.shape[0]
-        yb = expert(out, lut).clone()
-        oa = op.combine(ya, routing=ha)[0].clone()
-        ob = op.combine(yb, routing=hb)[0].clone()
-        sync()
-        check(
-            "snapshot_path",
-            rows_a == rows(sizes[a], True) and rows_b == rows(sizes[b], True),
-        )
-        check("snapshot_combine", torch.equal(oa, refs[a]) and torch.equal(ob, refs[b]))
+    pairs = (small[:2], (small[0], large[0]), (large[0], small[0]), large[:2])
+    for a, b in () if push else pairs:
+        side = "_".join("ll128" if sizes[i] <= lim else "sched" for i in (a, b))
+        ins, handles = [], []
+        for i in (a, b):
+            x, idx, w, s = args[i]
+            out, _, _, _, _, h = op.dispatch(
+                x, w, s, idx, return_routing=True, snapshot=True
+            )
+            check(f"snapshot_path_{side}", out.shape[0] == rows(sizes[i]))
+            ins.append(expert(out, lut).clone())
+            handles.append(h)
+            sync()
+        for i, y, h in zip((a, b), ins, handles):
+            o = op.combine(y, routing=h)[0].clone()
+            sync()
+            check(f"snapshot_combine_{side}", torch.equal(o, refs[i]))
+        ha = handles[0]
         if ha.recv_maps is not None:
             tot = int(ha.total_recv_token_num.item())
             rev = ha.disp_tok_id_to_src_tok_id_local[:tot].cpu()
             want = keys(sources(a, sizes[a]))
-            check("snapshot_own_reverse_map", sorted(rev.tolist()) == want)
+            check(f"snapshot_own_reverse_map_{side}", sorted(rev.tolist()) == want)
 
     op.close()
     failures = 0
