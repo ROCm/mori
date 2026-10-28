@@ -1,7 +1,25 @@
 #!/usr/bin/env python3
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
-# SPDX-License-Identifier: MIT
+# MIT License
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 """What one cco SDMA channel actually moves, with no GEMM in the way.
 
 Same shape as the fused combine's transport -- one comm wave per peer, each
@@ -35,13 +53,13 @@ def build_xfer(*, npes, rank, comm_wgs, queues, split, puts):
     """One wave per peer: ``puts`` back-to-back runs, then drain every channel."""
     import mori.cco.device.flydsl as cco
 
-    n_waves = comm_wgs * 4
-
     @flyc.kernel(
         name=f"sdmabw_p{npes}_w{comm_wgs}q{queues}s{split}n{puts}_r{rank}",
         known_block_size=[WAVE * 4, 1, 1],
     )
-    def xfer(dev_comm: fx.Int64, win: fx.Int64, i64_bytes: fx.Int64, i64_stride: fx.Int64):
+    def xfer(
+        dev_comm: fx.Int64, win: fx.Int64, i64_bytes: fx.Int64, i64_stride: fx.Int64
+    ):
         tid = fx.thread_idx.x
         lane = tid % fx.Int32(WAVE)
         wave = rocdl.readfirstlane(T.i32, tid // fx.Int32(WAVE))
@@ -69,8 +87,13 @@ def build_xfer(*, npes, rank, comm_wgs, queues, split, puts):
                     sdma.quiet(owner)
 
     @flyc.jit
-    def launch(dev_comm: fx.Int64, win: fx.Int64, i64_bytes: fx.Int64,
-               i64_stride: fx.Int64, stream: fx.Stream):
+    def launch(
+        dev_comm: fx.Int64,
+        win: fx.Int64,
+        i64_bytes: fx.Int64,
+        i64_stride: fx.Int64,
+        stream: fx.Stream,
+    ):
         xfer(dev_comm, win, i64_bytes, i64_stride).launch(
             grid=(comm_wgs, 1, 1), block=(WAVE * 4, 1, 1), stream=stream
         )
@@ -83,7 +106,9 @@ def main():
     parser.add_argument("--mb", default="0.36,0.72,1.44,2.89,5.78", help="MB per put")
     parser.add_argument("--queues", default="1,2", help="channels per peer")
     parser.add_argument("--split", default="1", help="split one put across channels")
-    parser.add_argument("--puts", type=int, default=8, help="back-to-back puts per peer")
+    parser.add_argument(
+        "--puts", type=int, default=8, help="back-to-back puts per peer"
+    )
     parser.add_argument("--iters", type=int, default=50)
     args = parser.parse_args()
 
@@ -126,8 +151,12 @@ def main():
                 if split > queues:
                     continue
                 fn = build_xfer(
-                    npes=world, rank=rank, comm_wgs=comm_wgs,
-                    queues=queues, split=split, puts=args.puts,
+                    npes=world,
+                    rank=rank,
+                    comm_wgs=comm_wgs,
+                    queues=queues,
+                    split=split,
+                    puts=args.puts,
                 )
                 for mb in sizes:
                     nbytes = int(mb * (1 << 20))
@@ -137,8 +166,12 @@ def main():
                         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
                         _run_compiled(
-                            fn, fx.Int64(dev_comm.ptr), fx.Int64(win.handle),
-                            fx.Int64(nbytes), fx.Int64(stride), s_fx,
+                            fn,
+                            fx.Int64(dev_comm.ptr),
+                            fx.Int64(win.handle),
+                            fx.Int64(nbytes),
+                            fx.Int64(stride),
+                            s_fx,
                         )
 
                     once()

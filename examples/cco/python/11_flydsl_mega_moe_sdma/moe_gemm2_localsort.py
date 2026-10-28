@@ -46,13 +46,6 @@ cache line apart, because every unit of a chunk bumps one.
 
 from dataclasses import dataclass
 
-#: i32 slots between consecutive chunk-completion counters. Every unit of a
-#: chunk bumps its counter, so packing them adjacent puts all of a launch's
-#: atomics on one or two cache lines: 128 B apart instead is worth ~8% of the
-#: GEMM2 kernel at bs=4096. Spreading a chunk's count over several counters on
-#: top of this buys nothing -- the atomic itself is not the cost.
-CDONE_STRIDE = 32
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
@@ -95,6 +88,14 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage2 import (
     _stage2_lds_bytes,
 )
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import _fabs_f32 as fabs_f32
+
+
+#: i32 slots between consecutive chunk-completion counters. Every unit of a
+#: chunk bumps its counter, so packing them adjacent puts all of a launch's
+#: atomics on one or two cache lines: 128 B apart instead is worth ~8% of the
+#: GEMM2 kernel at bs=4096. Spreading a chunk's count over several counters on
+#: top of this buys nothing -- the atomic itself is not the cost.
+CDONE_STRIDE = 32
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,6 @@ def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *,
         raise ValueError(f"unsupported quant={quant!r}")
     if quant_fp8 and g2_bf16_lds:
         raise ValueError("fp8_blockwise_1x32 needs the f32 CShuffle (g2_bf16_lds=False)")
-    out_elem_bytes = 1 if quant_fp8 else 2
     # Row layout matches aiter's P2P scatter: N_OUT payload bytes followed by the
     # N_OUT/32 e8m0 block scales, so one contiguous SDMA put ships both.
     row_nbytes = N_OUT + N_OUT // 32 if quant_fp8 else N_OUT * 2
