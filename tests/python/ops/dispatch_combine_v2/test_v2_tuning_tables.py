@@ -106,10 +106,11 @@ def test_round_trip(tmp_path):
     )
     lines = path.read_text().splitlines()
     assert lines[0] == ",".join(tuning._TABLE_COLUMNS)
-    # Sorted by selector; booleans 0/1; absent fields empty; 2.0 written as 2.
-    assert lines[1] == "64,4,combine,bf16,1024,0,none,16,80,40,4,4,1,,,,,,"
-    assert lines[3] == "64,4,dispatch,bf16,1024,,,16,80,40,4,,,,,,,,"
-    assert lines[4] == "64,4,dispatch,bf16,1024,,,128,80,40,4,1,,75.12,2,,,,"
+    # Grouped by shape, dispatch before combine; booleans 0/1; absent fields
+    # empty; 2.0 written as 2.
+    assert lines[1] == "64,4,dispatch,bf16,1024,,,16,80,40,4,,,,,,,,"
+    assert lines[2] == "64,4,dispatch,bf16,1024,,,128,80,40,4,1,,75.12,2,,,,"
+    assert lines[3] == "64,4,combine,bf16,1024,0,none,16,80,40,4,4,1,,,,,,"
 
 
 def test_numpy_metrics_are_written_as_numbers(tmp_path):
@@ -242,8 +243,8 @@ def test_save_merges_by_selector(table_dir):
         (r["phase"], r["num_experts"], r["block_num"], r.get("active_qps"))
         for r in rules
     ] == [
-        ("combine", 64, 80, 4),
         ("dispatch", 64, 64, 2),
+        ("combine", 64, 80, 4),
         ("dispatch", 128, 80, None),
     ]
     # Lookup sees the saved rules, and each expert count only its own.

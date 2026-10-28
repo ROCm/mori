@@ -23,8 +23,8 @@ Each row is one rule, a launch geometry for one shape, phase and token ceiling:
 
 ```csv
 num_experts,topk,phase,dtype,hidden_dim,zero_copy,quant_type,num_tokens,block_num,rdma_block_num,warp_per_block,active_qps,combine_load_first,avg_latency_us,bandwidth_gbps,avg_rdma_bandwidth_gbps,avg_xgmi_bandwidth_gbps,avg_ll_bandwidth_gbps,bandwidth_metric
-256,8,combine,bf16,7168,0,none,4,16,10,4,1,1,84.85,1.35,1.35,4.5,4.97,grand_mean
 256,8,dispatch,bf16,7168,,,4,64,42,4,2,,75.12,1.52,1.52,5.1,5.63,grand_mean
+256,8,combine,bf16,7168,0,none,4,16,10,4,1,1,84.85,1.35,1.35,4.5,4.97,grand_mean
 ```
 
 - The first eight columns are the selector. `num_experts` is the total expert
@@ -35,8 +35,10 @@ num_experts,topk,phase,dtype,hidden_dim,zero_copy,quant_type,num_tokens,block_nu
 - `active_qps` and `combine_load_first` are the optional per-bucket flags below;
   empty means the default. Booleans are written 0 or 1.
 - The metric columns are for reference only; lookup never reads them.
-- Rows are sorted by the selector. The tuning save rewrites the file in that
-  order, so a diff shows only the rules that changed.
+- Rows are grouped by shape (`num_experts`, `topk`, `hidden_dim`). Within a
+  shape, dispatch rows come before combine rows, then by dtype, the combine
+  fields and `num_tokens`. The tuning save rewrites the file in that order, so a
+  diff shows only the rules that changed.
 - A table is checked when it is loaded: an unknown or missing column, a cell
   that does not parse, a field the kernel family does not read, or two rows
   with the same selector raise instead of being skipped.

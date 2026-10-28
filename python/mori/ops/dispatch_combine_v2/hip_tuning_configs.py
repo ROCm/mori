@@ -698,8 +698,8 @@ def v2_table_filename(gpu_arch, gpu_model, kernel_type, ep_size):
     return f"{gpu_arch}_{gpu_model}_{kernel_type}_ep{ep_size}.csv"
 
 
-# One rule per row. The first eight columns are the selector and the sort
-# order, then the geometry and its per-bucket flags, then metrics, which are
+# One rule per row. The first eight columns are the selector (rows are ordered by
+# _table_key), then the geometry and its per-bucket flags, then metrics, which are
 # for readers only. An empty cell is an absent field: the combine-only fields
 # of a dispatch rule, and active_qps or combine_load_first left at the default.
 _TABLE_SELECTOR = (
@@ -761,13 +761,18 @@ _TABLE_FLOATS = frozenset(
 _TABLE_DTYPES = frozenset({"bf16", "fp8_e4m3_fnuz", "fp8_e4m3", "fp4"})
 
 
+# A table's rows group by shape (experts, top-k, hidden), dispatch before combine within a
+# shape. num_tokens stays last: lookup relies on each selector's rules ascending in it.
+_PHASE_ORDER = {"dispatch": 0, "combine": 1}
+
+
 def _table_key(rule):
     return (
         rule["num_experts"],
         rule["topk"],
-        rule["phase"],
-        rule["dtype"],
         rule["hidden_dim"],
+        _PHASE_ORDER[rule["phase"]],
+        rule["dtype"],
         bool(rule.get("zero_copy")),
         rule.get("quant_type") or "",
         rule["num_tokens"],
