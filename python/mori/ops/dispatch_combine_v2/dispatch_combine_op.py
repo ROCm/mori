@@ -781,6 +781,11 @@ class EpDispatchCombineOp:
     _async_pending_dispatch_map = None
     _async_pending_combine = None
 
+    # True where a dispatch takes its receive slots off total_recv counting from 0 and only
+    # a combine of the op's own count clears it (hip, gfx1250 LL128): a snapshot dispatch
+    # then zeroes the op's count once its handle has the copy.
+    _snapshot_zeroes_count = False
+
     # -- registration / selection -----------------------------------------
 
     def __init_subclass__(cls, backend: str | None = None, **kw):
@@ -1042,7 +1047,7 @@ class EpDispatchCombineOp:
         (the kernel writes it directly, no copy) and its own copy of total_recv --
         on an LL128 op also its own reverse map and forwarded ids, written by the
         kernel next to the arena's -- so it outlives later return_routing
-        dispatches on this op. Without it the
+        dispatches on this op. The total_recv returned is that copy. Without it the
         handle is valid only until the next one; see EpDispatchRoutingHandle.
         Intranode gather combine without StdMoE only: the internode and scatter
         combines also read routing state the op keeps in the arena, and StdMoE's
@@ -1055,6 +1060,10 @@ class EpDispatchCombineOp:
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
+
+        On a gfx1250 LL128 plan a dispatch without snapshot= has to be followed by
+        its combine before the next dispatch: the dispatch counts its receive slots
+        up from total_recv, and only that combine clears it (leaving it at 0).
         """
         with self._asyncll_call("dispatch"):
             return self._dispatch_impl(
@@ -1160,12 +1169,18 @@ class EpDispatchCombineOp:
             self._async_pending_dispatch_input = input
             self._async_pending_dispatch_map = dest_map
 
+        # A copy rather than a buffer handed to the kernel: total_recv is
+        # also read through the op (local_expert_count, StdMoE convert), so
+        # the kernel keeps writing the op's.
+        count = self.total_recv.clone() if snapshot else self.total_recv
+        if snapshot and self._snapshot_zeroes_count:
+            self.total_recv.zero_()
         base = (
             self.recv_tokens(),
             self.recv_weights(),
             self.recv_scales(),
             self.recv_indices(),
-            self.total_recv,
+            count,
         )
         if not return_routing:
             return base
@@ -1176,12 +1191,7 @@ class EpDispatchCombineOp:
             disp_dest_tok_id_map=dest_map,
             inter_node_disp_dest_tok_id_map=self._empty_i32,
             inter_node_disp_send_map=self._empty_i32,
-            # A copy rather than a buffer handed to the kernel: total_recv is
-            # also read through the op (local_expert_count, StdMoE convert), so
-            # the kernel keeps writing the op's.
-            total_recv_token_num=(
-                self.total_recv.clone() if snapshot else self.total_recv
-            ),
+            total_recv_token_num=count,
             disp_tok_id_to_src_tok_id_local=recv_maps[0] if own else None,
             cur_rank_num_token=n,
             reverse_src_view=reverse if recv_maps is None else recv_maps[0],
@@ -1457,7 +1467,7 @@ class EpDispatchCombineOp:
         self.dest_pe_counter.zero_()
         self.dispatch_barrier.zero_()
         self.combine_barrier.zero_()
-        getattr(self, "_recv_ctr", self.total_recv).zero_()
+        self.total_recv.zero_()
         # The two backends seed this differently -- intranode starts the epoch at
         # 1, internode at 0 (see the two constructors in hip_backend) -- so a
         # single literal here silently desynchronises one of them from its peers.

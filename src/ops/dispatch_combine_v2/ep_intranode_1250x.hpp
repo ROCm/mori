@@ -438,13 +438,10 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   const EpWinRegs wr = EpWinRegsLoad(args.window);
   const unsigned long long stOff = args.offTokOff + kEpStageOff;
   char* const stLocal = EpLocal<char>(wr, stOff);
-  unsigned long long* const cnt = reinterpret_cast<unsigned long long*>(args.totalRecvTokenNum);
+  unsigned* const slotCtr = reinterpret_cast<unsigned*>(args.totalRecvTokenNum);
   const unsigned seq =
       __hip_atomic_load(_llSeq + blockIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + 1u;
   const unsigned long long flag = seq;
-  if (blockIdx.x == 0 && thdId == 0)
-    __hip_atomic_store(cnt, (unsigned long long)seq << 32, __ATOMIC_RELAXED,
-                       __HIP_MEMORY_SCOPE_AGENT);
   const size_t par = seq & 1u;
   auto tmo = [&](int what, int s, int t) {
     if (laneId == 0 && atomicAdd(&_llTmo, 1u) < 8u)
@@ -675,20 +672,8 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     const int e = laneId < topk ? (int)idw : -1;
     if (__ballot(e >= 0 && e / kEpr == myPe) == 0ull) continue;
     int slot = 0;
-    if (laneId == 0) {
-      unsigned long long c =
-          __hip_atomic_fetch_add(cnt, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      for (unsigned spin = 0; (unsigned)(c >> 32) != seq && spin < kSpinMax; ++spin)
-        if ((unsigned)(__hip_atomic_load(cnt, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) >> 32) ==
-            seq)
-          c = __hip_atomic_fetch_add(cnt, 1ull, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      if ((unsigned)(c >> 32) == seq) {
-        slot = (int)(unsigned)c;
-      } else {
-        tmo(3, s, t);
-        slot = EpMaxRecv(kCfg);
-      }
-    }
+    if (laneId == 0)
+      slot = (int)__hip_atomic_fetch_add(slotCtr, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     slot = __shfl(slot, 0, WS);
     if (slot >= EpMaxRecv(kCfg)) continue;
     if (laneId < topk) {
@@ -4362,6 +4347,7 @@ __device__ __forceinline__ int EpLlMapRank(const int m) {
   else
     return m;
 }
+__device__ unsigned _lcTicket;
 __device__ unsigned _lcTmo;
 template <EpCfg kCfg, typename T>
 __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
@@ -4420,6 +4406,15 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
   const unsigned long long flag = seq;
   const int nRecv = min((int)args.totalRecvTokenNum[0], EpMaxRecv(kCfg));
   asm volatile("" ::"s"(nRecv), "v"(seq) : "memory");
+  __syncthreads();
+  if (thdId == (kLlWarps - 1) * WS) {
+    const unsigned d =
+        __hip_atomic_fetch_add(&_lcTicket, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (d == (unsigned)(G - 1)) {
+      *args.totalRecvTokenNum = 0;
+      __hip_atomic_store(&_lcTicket, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
   extern __shared__ char sharedMem[];
   unsigned char* const tile = reinterpret_cast<unsigned char*>(sharedMem) + (size_t)warpId * kTileB;
 
@@ -4773,6 +4768,15 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   const unsigned long long flag = seq;
   const int nRecv = min((int)args.totalRecvTokenNum[0], EpMaxRecv(kCfg));
   asm volatile("" ::"s"(nRecv), "v"(seq) : "memory");
+  __syncthreads();
+  if (thdId == (kCfg.warpPerBlock - 1) * WS) {
+    const unsigned d =
+        __hip_atomic_fetch_add(&_lcTicket, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    if (d == (unsigned)(G - 1)) {
+      *args.totalRecvTokenNum = 0;
+      __hip_atomic_store(&_lcTicket, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+  }
   auto firsts = [&](const int rq) -> unsigned long long {
     bool f = rq >= 0;
 #pragma unroll

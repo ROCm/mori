@@ -109,8 +109,6 @@ _SCALE_ALIGN = 128
 _STAGE_OFF = 512
 _STAGE_TOK = 512
 
-_LL_CTR_INTS = 2
-
 
 def _stage_bytes(cfg, scale_stride):
     row = cfg.token_nbytes + scale_stride + 4 + 8 * cfg.num_experts_per_token
@@ -492,11 +490,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # dispatch signal on, the push combine's landing offset of the rows it
         # returns (EpFp4LandTo; dispatch writes it, combine reads it).
         self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
-        ll_disp = self._ll128_split is not None or (
+        self.total_recv = torch.zeros(1, **i32)
+        # A split op's LL128 calls count on their own int: the schedule's dispatch stores its
+        # total and leaves it there, while the LL128 dispatch adds from 0 and its combine clears.
+        # total_recv is whichever of the two the last dispatch used.
+        self._recv = self.total_recv
+        self._ll_recv = torch.zeros(1, **i32) if self._ll128_split is not None else None
+        self._snapshot_zeroes_count = self._ll128_split is not None or (
             self._ll128_geom is not None and "dispatch" in self._ll128_geom
         )
-        self._recv_ctr = torch.zeros(_LL_CTR_INTS if ll_disp else 1, **i32)
-        self.total_recv = self._recv_ctr[:1]
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         # Monotone epoch. Starts at 1 so the zeroed barrier slots cannot alias
@@ -695,6 +697,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             torch.zeros(cfg.effective_max_recv, **i32) if cfg.async_ll else None
         )
         self.total_recv = torch.zeros(1, **i32)
+        self._recv, self._ll_recv = self.total_recv, None
         self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.inter_blocks_barrier = torch.zeros(4, dtype=torch.uint32, device=dev)
@@ -1894,6 +1897,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    def reset(self):
+        super().reset()
+        self._recv.zero_()
+        if self._ll_recv is not None:
+            self._ll_recv.zero_()
+
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
             plan.close()
@@ -2078,6 +2087,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"dispatch of {num_tokens} tokens is past this variant's largest "
                     f"call size {sized[-1][0]}"
                 )
+            count = self._ll_recv if ll else self._recv
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 token_indices=indices,
@@ -2086,10 +2096,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
-                total_recv_token_num=self.total_recv,
+                total_recv_token_num=count,
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
             )
+            self.total_recv = count
             self._ll_last = ll
 
         return run
@@ -2100,6 +2111,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             "ll_recv_to_src_token" if ll else "recv_to_src_token"
         )
         idx_ptr = self.arena.local_ptr("ll_out_idx" if ll else "out_idx")
+        clears = ll or self._ll128_geom is not None
 
         def run(
             *,
@@ -2116,6 +2128,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     f"quant_type={self.cfg.quant_type!r} folds no weights; call combine "
                     "with weights=None"
                 )
+            own = total_recv is self._recv or total_recv is self._ll_recv
+            if clears and not own:
+                # The LL128 combine clears the count it reads; a snapshot handle combines again.
+                total_recv = total_recv.clone()
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 inp_token_buf=input,
