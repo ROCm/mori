@@ -141,6 +141,24 @@ MXFP8_BLOCK = 32
 LSA_BLOCK_CAP = 24
 
 
+#: The most chunks a destination's slab is pushed in, and the smallest chunk
+#: worth a put. Below ~1 MiB the per-packet cost starts to dominate (README), so
+#: the default chunk count is the largest one at or below MAX_CHUNKS that keeps
+#: a chunk at or above MIN_CHUNK_BYTES.
+MAX_CHUNKS = 8
+MIN_CHUNK_BYTES = 1 << 20
+
+
+def default_chunks(m: int, shard_n: int, block_m: int) -> int:
+    """Chunks per destination for this M: as many as keep each put >= 1 MiB."""
+    m_tiles = m // block_m
+    best = 1
+    for c in range(1, min(MAX_CHUNKS, m_tiles) + 1):
+        if m_tiles % c == 0 and (m // c) * shard_n * 2 >= MIN_CHUNK_BYTES:
+            best = c
+    return best
+
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -360,9 +378,26 @@ class A2aConfig:
         return _align_up(self.world_size * 4, SIGNAL_ALIGN)
 
     @property
-    def signal_bytes(self) -> int:
-        """Everything before the payload: barriers, counters, locks."""
+    def credit_off(self) -> int:
+        """One u32 per source rank: the call that source has started.
+
+        Source ``s`` writes ``e`` into slot ``s`` of every peer's window when it
+        starts call ``e``. Starting a call means its stream has finished
+        everything before it, including whatever read call ``e-1``'s recv, so a
+        sender may write into ``s``'s recv once slot ``s`` reads ``>= e``. The
+        end-of-call barrier alone does not give that: it says every rank has
+        *written* call ``e-1``, not that every rank has *read* it.
+        """
         return self.lock_off + self.lock_bytes
+
+    @property
+    def credit_bytes(self) -> int:
+        return _align_up(self.world_size * 4, SIGNAL_ALIGN)
+
+    @property
+    def signal_bytes(self) -> int:
+        """Everything before the payload: barriers, counters, locks, credits."""
+        return self.credit_off + self.credit_bytes
 
     @property
     def staging_off(self) -> int:
@@ -394,9 +429,17 @@ class A2aConfig:
         return self.world_size * self.cap_slab_bytes
 
     def recv_slot_off(self, src_rank: int) -> int:
-        """Byte offset of ``src_rank``'s contribution in *any* rank's window."""
+        """Byte offset of ``src_rank``'s contribution in *any* rank's window.
+
+        The region starts at the capacity-pinned ``recv_off``, but inside it the
+        slots are packed by *this* call's ``m``: the result is then one
+        contiguous ``[world*m, shard_n]`` block whatever the capacity, which is
+        what a caller can take as a tensor view. Two shapes do overlap inside
+        the region, the same way two calls of one shape do -- each call's recv
+        replaces the previous one's, and the recv-reuse credit orders that.
+        """
         self._check_rank(src_rank)
-        return self.recv_off + src_rank * self.cap_slab_bytes
+        return self.recv_off + src_rank * self.slab_bytes
 
     @property
     def window_bytes(self) -> int:
@@ -544,6 +587,9 @@ __all__ = [
     "a2a_config",
     "counter_chunks",
     "default_block_m",
+    "default_chunks",
+    "MAX_CHUNKS",
+    "MIN_CHUNK_BYTES",
     "DEFAULT_BLOCK_M",
     "DEFAULT_BLOCK_N",
     "LARGE_BLOCK_M",

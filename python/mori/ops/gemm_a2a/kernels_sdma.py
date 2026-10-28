@@ -61,6 +61,7 @@ from ..gemm_ar._compat import (
     signal_ptr,
     signal_store_u32,
 )
+from ._credit import post_credit, wait_credit
 from .kernels_lsa import _spin_until
 from .timeline import stamp
 
@@ -77,6 +78,7 @@ def build_sdma_phases(
     signal: bool = False,
     stamp_off: int = 0,
     stamp_drain: int = 0,
+    war_credit: bool = True,
 ):
     """Compile the push phases for ``cfg`` on ``rank``.
 
@@ -100,6 +102,10 @@ def build_sdma_phases(
     ``quiet_queue`` drains the queue's read pointer independently of signals and
     nothing here polls one, so the packet would be pure overhead.
 
+    ``war_credit`` makes ``scatter`` post this rank's credit to each peer and
+    wait for the peer's before pushing into its recv (see ``_credit``). Off
+    exists only as the negative control for the race test.
+
     ``stamp_off``/``stamp_drain`` place ``timeline`` stamps (byte offset of the
     region, u64 slot of the drain block); ``stamp_off=0`` compiles them out.
     """
@@ -115,6 +121,7 @@ def build_sdma_phases(
 
     ws = cfg.world_size
     start_off, flag_off = cfg.start_off, cfg.flag_off
+    credit_off = cfg.credit_off
     staging_off = cfg.staging_off
     slab_bytes = cfg.slab_bytes
     cap_slab_bytes = cfg.cap_slab_bytes
@@ -158,6 +165,11 @@ def build_sdma_phases(
                     stamp(ts_base, stamp_drain)
             if tid < ws:
                 if tid != rank:
+                    if const_expr(pushes and war_credit):
+                        # `flag` is this call's number (see _next_flag), the
+                        # same value _credit.call_epoch derives in the GEMM.
+                        post_credit(w, rank, tid, credit_off, flag)
+                        wait_credit(w, rank, tid, credit_off, flag)
                     if const_expr(pushes):
                         # Lane `tid` owns peer `tid` and queue `tid`: distinct
                         # queues per lane, so the posts do not serialise on one
@@ -202,7 +214,9 @@ def build_sdma_phases(
 
     return {
         "scatter": _push_kernel(
-            True, f"mori_a2a_sdma_scatter_r{rank}_q{queues}{'_ts' if stamp_off else ''}"
+            True,
+            f"mori_a2a_sdma_scatter_r{rank}_q{queues}{'_ts' if stamp_off else ''}"
+            f"{'' if war_credit else '_nc'}",
         ),
         "drain": _push_kernel(
             False, f"mori_a2a_sdma_drain_r{rank}_q{queues}{'_ts' if stamp_off else ''}"

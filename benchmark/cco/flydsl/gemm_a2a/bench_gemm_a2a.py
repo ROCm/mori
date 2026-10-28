@@ -401,6 +401,7 @@ def run(args) -> int:
                 self_to_recv=args.mode != "split-rccl",
                 staging_store=args.staging_store,
                 stamp_off=stamp_off,
+                war_credit=not args.no_war_credit,
             )
         elif args.mode == "fused-lsa":
             # The epilogue writes into the peers, so there is no separate
@@ -488,6 +489,7 @@ def run(args) -> int:
                 queues=args.sdma_queues,
                 stamp_off=stamp_off,
                 stamp_drain=stamp_drain,
+                war_credit=not args.no_war_credit,
             )
             if needs_sdma
             else None
@@ -740,6 +742,11 @@ def build_parser() -> argparse.ArgumentParser:
         "by construction and validation is skipped",
     )
     p.add_argument("--skip-validation", action="store_true")
+    p.add_argument(
+        "--no-war-credit",
+        action="store_true",
+        help="drop the recv-reuse credit (to price it; unsafe for real use)",
+    )
     p.add_argument(
         "--timeline",
         default="",

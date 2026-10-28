@@ -118,6 +118,7 @@ from ..gemm_ar.kernels_fused import (
     _PermlaneStoreC,
     _SwappedMfma,
 )
+from ._credit import call_epoch, post_credit, wait_credit
 from .timeline import chunk_slot, stamp
 from .layout import (  # noqa: F401
     DEFAULT_BLOCK_M,
@@ -276,8 +277,14 @@ def compile_fused_gemm_a2a(
     direct_fence: str = "leader",
     emit_put: bool = True,
     stamp_off: int = 0,
+    war_credit: bool = True,
 ):
     """The GEMM with its C stored straight into the destinations' windows.
+
+    ``war_credit`` (fused SDMA path) posts this rank's credit to every peer at
+    kernel entry and has each put wait for its destination's credit, so a push
+    never lands in a recv its owner is still reading (see ``_credit``). Off
+    exists only as the negative control for the race test.
 
     ``stamp_off`` (SDMA path only) is the byte offset in this rank's window of a
     ``timeline`` stamp region; 0 compiles the stamps out. See ``timeline``.
@@ -362,7 +369,11 @@ def compile_fused_gemm_a2a(
     cap_slab_bytes = cfg.cap_slab_bytes
     staging_off = cfg.staging_off if cfg.staged else 0
     counter_off, lock_off = cfg.counter_off, cfg.lock_off
+    credit_off, flag_off = cfg.credit_off, cfg.flag_off
     direct_lsa = transport == "lsa"
+    # Only the fused SDMA path pushes from this kernel; the staging GEMM's
+    # pushes come from the scatter kernel, which carries its own credit.
+    credit = war_credit and fuse and not direct_lsa
     if not direct_lsa and cfg.counter_chunks != chunks:
         raise ValueError(
             f"chunks={chunks} disagrees with the config's counter_chunks="
@@ -412,7 +423,7 @@ def compile_fused_gemm_a2a(
         f"c{chunks}{'p' + '_'.join(map(str, chunk_sizes)) if uneven else ''}"
         f"q{sdma_queues}{'S' if self_to_recv else 'A'}"
         f"{direct_fence[0]}{'p' if emit_put else 'x'}"
-        f"{'_ts' if stamp_off else ''}_r{rank}"
+        f"{'_ts' if stamp_off else ''}{'' if credit or not fuse else '_nc'}_r{rank}"
     )
 
     @fx.struct
@@ -516,6 +527,16 @@ def compile_fused_gemm_a2a(
             stamp_base = fx.Int64(w_pre.lsa_ptr(rank, stamp_off))
             if fx.thread_idx.x == 0:
                 stamp(stamp_base, fx.block_idx.x)
+        if const_expr(credit):
+            # Block 0's first world_size lanes, before any GEMM work: block 0
+            # is in the first wave, so a peer waiting on this never waits on a
+            # block that has not been scheduled.
+            if fx.block_idx.x == 0:
+                tid = fx.thread_idx.x
+                if tid < fx.Int32(ws) and tid != fx.Int32(rank):
+                    post_credit(
+                        w_pre, rank, tid, credit_off, call_epoch(w_pre, rank, flag_off)
+                    )
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
@@ -960,6 +981,15 @@ def compile_fused_gemm_a2a(
                         ) * fx.Int32(3)
                         if const_expr(stamp_off):
                             stamp(stamp_base, ts_slot)
+                        if const_expr(credit):
+                            # Before the lock, so a wait never holds it.
+                            wait_credit(
+                                w_pre,
+                                rank,
+                                dest,
+                                credit_off,
+                                call_epoch(w_pre, rank, flag_off),
+                            )
                         if const_expr(chunks > 1):
                             # Two chunks of one destination can be elected at
                             # nearly the same moment and would then post to the

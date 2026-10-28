@@ -88,6 +88,7 @@ def test_every_region_is_disjoint_and_inside_the_window():
             ("flag", c.flag_off, c.max_blocks * 4),
             ("counters", c.counter_region_off, c.counter_bytes),
             ("locks", c.lock_off, c.lock_bytes),
+            ("credits", c.credit_off, c.credit_bytes),
             ("staging", c.staging_off, c.staging_bytes),
             ("recv", c.recv_off, c.recv_bytes),
         ]
@@ -232,8 +233,15 @@ def test_capacity_m_pins_the_offsets_so_two_shapes_cannot_alias():
 
     assert small_unpinned.recv_off != big.recv_off  # the trap
     assert small_pinned.recv_off == big.recv_off
-    assert small_pinned.recv_slot_off(1) == big.recv_slot_off(1)
     assert small_pinned.staging_slot_off(1) == big.staging_slot_off(1)
+    # Recv slots are packed by the call's own m inside the pinned region, so the
+    # result is one contiguous [world*m, shard_n] block at any capacity.
+    assert small_pinned.recv_slot_off(1) == (
+        small_pinned.recv_off + small_pinned.slab_bytes
+    )
+    assert small_pinned.recv_slot_off(1) + small_pinned.slab_bytes <= (
+        big.recv_off + big.recv_bytes
+    )
     # Sizes still follow the real m -- pinning moves where, not how much.
     assert small_pinned.slab_bytes == big.slab_bytes // 2
 
@@ -266,6 +274,33 @@ def test_counter_chunks_reports_the_shape_rather_than_dividing_by_zero():
         layout.counter_chunks(0, 8)
     with pytest.raises(ValueError, match="requested chunks"):
         layout.counter_chunks(16, 0)
+
+
+def test_credit_slots_hold_one_word_per_source_and_precede_the_payload():
+    c = layout.a2a_config(**MODEL, staged=True, counter_chunks=4)
+    assert c.credit_bytes >= c.world_size * 4
+    assert c.credit_off + c.credit_bytes == c.signal_bytes <= c.staging_off
+
+
+@pytest.mark.parametrize(
+    "m, shard_n, block_m, want",
+    [
+        # The measured best on 8x MI355X (README): c4 where c8's puts would
+        # drop below 1 MiB, c8 everywhere else.
+        (2048, 1280, 128, 4),
+        (4096, 1280, 256, 8),
+        (16384, 1280, 256, 8),
+        (2048, 2304, 256, 8),
+        (16384, 2304, 256, 8),
+        # Too small for even one 1 MiB put: one chunk.
+        (256, 512, 128, 1),
+    ],
+)
+def test_default_chunks_keeps_every_put_at_least_a_mib(m, shard_n, block_m, want):
+    c = layout.default_chunks(m, shard_n, block_m)
+    assert c == want
+    assert (m // block_m) % c == 0
+    assert c == 1 or (m // c) * shard_n * 2 >= layout.MIN_CHUNK_BYTES
 
 
 # --------------------------------------------------------------------------
