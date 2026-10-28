@@ -199,6 +199,9 @@ class PoolClient {
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
+  // Ahead of a read: local SSD keys are copied into DRAM (PeerPool::Prefetch),
+  // and keys on peers are pulled into this node's medium in the background.
+  size_t BatchPrefetch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
@@ -612,6 +615,9 @@ class PoolClient {
   // blocks, the read that scheduled it.
   void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
                                 const RouteGetResult& route);
+  // Queues the pull with no admission check; false if not queued.
+  bool QueueWholeObjectPull(const std::string& key, size_t object_size,
+                            const RouteGetResult& route);
   // The other half of the same decision: the arena slice already holds the
   // whole object (the caller's ranges tiled it in order), so locality costs one
   // local copy instead of a second trip to the peer.  Synchronous because the

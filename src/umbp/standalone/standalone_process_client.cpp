@@ -646,6 +646,18 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
+size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (closing_) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  grpc::ClientContext ctx;
+  ::umbp::BatchKeysRequest req;
+  for (const auto& key : keys) req.add_keys(key);
+  ::umbp::CountResponse resp;
+  grpc::Status status = stub_->BatchPrefetch(&ctx, req, &resp);
+  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+}
+
 bool StandaloneProcessClient::Clear() {
   if (closing_) return true;
   std::unique_lock lk(op_mutex_);

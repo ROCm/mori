@@ -304,6 +304,8 @@ struct PoolClientConfig {
   bool cache_remote_fetches = true;
   CacheRemoteAdmission cache_remote_admission = CacheRemoteAdmission::SIZE;
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
+  // See UMBPDistributedConfig::prefetch_budget_bytes.
+  size_t prefetch_budget_bytes = 16ULL << 30;
 
   // Background whole-object pull after a remote ranged read; see
   // UMBPDistributedConfig::ranged_locality_prefetch for why it is not folded
@@ -408,6 +410,7 @@ inline PoolClientConfig ToPoolClientConfig(const UMBPDistributedConfig& dc,
   pc.cache_remote_fetches = dc.cache_remote_fetches;
   pc.cache_remote_admission = dc.cache_remote_admission;
   pc.admission_max_block_bytes = dc.admission_max_block_bytes;
+  pc.prefetch_budget_bytes = dc.prefetch_budget_bytes;
   pc.ranged_locality_prefetch = dc.ranged_locality_prefetch;
   pc.local_first = dc.local_first;
   // 0 propagates through PoolClient -> MasterClient::RegisterSelf ->
