@@ -48,13 +48,14 @@ namespace indexer_pb = ::kv_indexer::v1;
 class KvIndexerReporter {
  public:
   using Contains = std::function<bool(const std::string&)>;
-  KvIndexerReporter(const KvIndexerConfig& config, Contains contains)
+  KvIndexerReporter(const KvIndexerConfig& config, Contains contains, Contains retained = {})
       : endpoint_(config.endpoint),
         pool_id_(config.dram_pool_id),
         window_(config.swa_window_tokens),
         components_(config.components),
         timeout_(config.timeout_ms),
-        contains_(std::move(contains)) {
+        contains_(std::move(contains)),
+        retained_(retained ? std::move(retained) : contains_) {
     const bool valid_identity = pool_id_.empty()
                                     ? !config.worker_id.empty() && !config.worker_address.empty()
                                     : config.worker_id.empty() && config.worker_address.empty();
@@ -97,7 +98,8 @@ class KvIndexerReporter {
     }
     Wake();
   }
-  void Register(const KvBlockMetadata& block) {
+  KvMetadataPin Register(const KvBlockMetadata& block) {
+    KvMetadataPin metadata;
     uint32_t mask = 0;
     for (const auto& [component, keys] : block.component_keys) {
       if ((component != 1 && component != 2 && component != 4) || keys.empty() ||
@@ -115,7 +117,7 @@ class KvIndexerReporter {
         if (old->second->parent != block.parent || old->second->block_size != block.block_size ||
             old->second->component_keys != block.component_keys)
           throw std::invalid_argument("a block hash must keep the same KV metadata");
-        return;
+        return old->second;
       }
       if (block.parent == block.hash || parents_.count(block.hash)) {
         // Forward references are allowed, but cannot close a parent cycle.
@@ -126,8 +128,9 @@ class KvIndexerReporter {
           parent = ancestor == blocks_.end() ? std::nullopt : ancestor->second->parent;
         }
       }
-      blocks_[block.hash] = std::make_shared<const KvBlockMetadata>(block);
-      if (block.parent) parents_.insert(*block.parent);
+      metadata = std::make_shared<const KvBlockMetadata>(block);
+      blocks_[block.hash] = metadata;
+      if (block.parent) ++parents_[*block.parent];
       for (const auto& [component, keys] : block.component_keys) {
         for (const auto& key : keys) {
           auto& hashes = key_blocks_[key];
@@ -137,82 +140,71 @@ class KvIndexerReporter {
       pending_.insert(block.hash);
     }
     Wake();
+    return metadata;
   }
 
   bool Sync(bool rebuild = false) {
     std::lock_guard<std::mutex> sync_lock(sync_mutex_);
     if (stopping_) return false;
-    std::map<int64_t, std::shared_ptr<const KvBlockMetadata>> work;
+    rebuild |= repair_;
+    std::unordered_set<int64_t> changed;
+    std::optional<int64_t> last, cursor;
+    bool scan;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (rescan_ || rebuild) {
-        work = blocks_;
-        rescan_ = false;
-      }
-      for (int64_t hash : pending_) work[hash] = blocks_.at(hash);
-      pending_.clear();
+      scan = rescan_ || rebuild;
+      rescan_ = false;
+      if (scan && !blocks_.empty()) last = blocks_.rbegin()->first;
+      changed.swap(pending_);
     }
+    if (scan) changed.clear();
+    std::map<int64_t, KvMetadataPin> work;
     try {
       request_.clear_actions();
       batch_hashes_ = 0;
-      // Only startup clears a previous owner's bucket. Periodic repair and retries
-      // upsert live blocks without temporarily hiding the entire DRAM tier.
+      // Startup alone clears a previous owner. Repair never hides live DRAM.
       if (startup_) {
         AddAction(indexer_pb::ACTION_CLEAR_ALL_AT_TIER);
         SendBatch();
         startup_ = false;
       }
-      if (rebuild)
-        for (auto& [hash, mask] : reported_) mask = 0;
-      std::map<int64_t, uint32_t> desired, reports;
-      std::unordered_map<int64_t, int64_t> next;
-      for (const auto& [hash, block] : work) {
-        if (stopping_) return false;
-        uint32_t mask = 0;
-        for (const auto& [component, keys] : block->component_keys)
-          if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
-        // A shared pool may supply SWA/MAMBA while the worker supplies FULL in HBM.
-        if (pool_id_.empty() && !(mask & 1)) mask = 0;
-        desired[hash] = mask;
-        auto old = reported_.find(hash);
-        if (!mask) {
-          if (old != reported_.end()) AddAction(indexer_pb::ACTION_REVOKE, hash);
-        } else if (rebuild || old == reported_.end() || old->second != mask) {
-          reports[hash] = mask;
-          if (block->parent) next[*block->parent] = hash;
+      while (!stopping_) {
+        work.clear();  // Release retired metadata outside the write-path lock.
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          if (scan) {
+            auto it = cursor ? blocks_.upper_bound(*cursor) : blocks_.begin();
+            while (last && it != blocks_.end() && it->first <= *last && work.size() < 4096) {
+              cursor = it->first;
+              work.insert(*it++);
+            }
+          } else {
+            while (!changed.empty() && work.size() < 4096) {
+              auto hash = changed.extract(changed.begin()).value();
+              auto it = blocks_.find(hash);
+              if (it != blocks_.end()) work.insert(*it);
+            }
+          }
+        }
+        if (work.empty()) break;
+        Reconcile(work, rebuild);
+      }
+      repair_ = false;
+      return !stopping_;
+    } catch (const std::exception& error) {
+      if (scan) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        rescan_ = true;
+        repair_ = rebuild;
+      } else {
+        for (const auto& [hash, block] : work) changed.insert(hash);
+        while (!changed.empty()) {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          for (size_t i = 0; i < 4096 && !changed.empty(); ++i)
+            pending_.insert(changed.extract(changed.begin()));
         }
       }
-      while (!reports.empty()) {
-        int64_t hash = reports.begin()->first;
-        // Find the start of an unreported chain, even for randomly ordered hashes.
-        while (work.at(hash)->parent && reports.count(*work.at(hash)->parent))
-          hash = *work.at(hash)->parent;
-        do {
-          if (stopping_) return false;
-          uint32_t mask = reports.at(hash);
-          reports.erase(hash);
-          // An applied-but-failed RPC must remain revocable after an eviction.
-          reported_[hash] = 0;
-          AddAction(indexer_pb::ACTION_REPORT, hash, mask, work.at(hash).get());
-          auto child = next.find(hash);
-          if (child == next.end()) break;
-          hash = child->second;
-        } while (reports.count(hash));
-      }
-      SendBatch();
-      for (const auto& [hash, mask] : desired) {
-        if (mask)
-          reported_[hash] = mask;
-        else
-          reported_.erase(hash);
-      }
-      return true;
-    } catch (const std::exception& error) {
-      {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        for (const auto& [hash, block] : work) pending_.insert(hash);
-      }
-      Wake();  // A failed caller-initiated flush must also wake the worker.
+      Wake();
       MORI_UMBP_WARN("[KVIndexer] sync failed: {}", error.what());
       return false;
     }
@@ -234,6 +226,79 @@ class KvIndexerReporter {
   }
 
  private:
+  void Reconcile(const std::map<int64_t, KvMetadataPin>& work, bool rebuild) {
+    std::map<int64_t, uint32_t> desired, reports;
+    std::unordered_map<int64_t, int64_t> next;
+    std::vector<int64_t> garbage;
+    for (const auto& [hash, block] : work) {
+      if (stopping_) return;
+      uint32_t mask = 0;
+      for (const auto& [component, keys] : block->component_keys)
+        if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
+      // A shared pool may supply SWA/MAMBA while the worker supplies FULL in HBM.
+      if (pool_id_.empty() && !(mask & 1)) mask = 0;
+      desired[hash] = mask;
+      auto old = reported_.find(hash);
+      if (!mask) {
+        if (old != reported_.end()) AddAction(indexer_pb::ACTION_REVOKE, hash);
+        if (std::none_of(block->component_keys.begin(), block->component_keys.end(),
+                         [&](const auto& part) {
+                           return std::any_of(part.second.begin(), part.second.end(), retained_);
+                         }))
+          garbage.push_back(hash);
+      } else if (rebuild || old == reported_.end() || old->second != mask) {
+        reports[hash] = mask;
+        if (block->parent) next[*block->parent] = hash;
+      }
+    }
+    while (!reports.empty()) {
+      int64_t hash = reports.begin()->first;
+      // Find the start of an unreported chain, even for randomly ordered hashes.
+      while (work.at(hash)->parent && reports.count(*work.at(hash)->parent))
+        hash = *work.at(hash)->parent;
+      do {
+        if (stopping_) return;
+        uint32_t mask = reports.at(hash);
+        reports.erase(hash);
+        // An applied-but-failed RPC must remain revocable after an eviction.
+        reported_[hash] = 0;
+        AddAction(indexer_pb::ACTION_REPORT, hash, mask, work.at(hash).get());
+        auto child = next.find(hash);
+        if (child == next.end()) break;
+        hash = child->second;
+      } while (reports.count(hash));
+    }
+    SendBatch();
+    for (const auto& [hash, mask] : desired) {
+      if (mask)
+        reported_[hash] = mask;
+      else
+        reported_.erase(hash);
+    }
+    for (int64_t hash : garbage) Retire(work.at(hash));
+  }
+
+  void Retire(const KvMetadataPin& block) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    // The map and this sync own two references. Writers hold additional pins;
+    // a concurrent commit/eviction queues another check before we can retire.
+    if (block.use_count() != 2 || pending_.count(block->hash)) return;
+    blocks_.erase(block->hash);
+    if (block->parent) {
+      auto parent = parents_.find(*block->parent);
+      if (--parent->second == 0) parents_.erase(parent);
+    }
+    for (const auto& [component, keys] : block->component_keys) {
+      for (const auto& key : keys) {
+        auto it = key_blocks_.find(key);
+        if (it == key_blocks_.end()) continue;
+        auto& hashes = it->second;
+        hashes.erase(std::remove(hashes.begin(), hashes.end(), block->hash), hashes.end());
+        if (hashes.empty()) key_blocks_.erase(it);
+      }
+    }
+  }
+
   void Wake() {
     {
       std::lock_guard<std::mutex> lock(wake_mutex_);
@@ -303,17 +368,17 @@ class KvIndexerReporter {
   const std::string endpoint_, pool_id_;
   const uint32_t window_, components_;
   const std::chrono::milliseconds timeout_;
-  Contains contains_;
+  Contains contains_, retained_;
   // Serialize RPCs/flush/shutdown independently from write-path metadata.
   std::mutex state_mutex_, sync_mutex_, wake_mutex_;
   std::condition_variable cv_;
-  std::map<int64_t, std::shared_ptr<const KvBlockMetadata>> blocks_;
+  std::map<int64_t, KvMetadataPin> blocks_;
   std::unordered_map<std::string, std::vector<int64_t>> key_blocks_;
-  std::unordered_set<int64_t> parents_;
+  std::unordered_map<int64_t, size_t> parents_;
   std::unordered_set<int64_t> pending_;
   std::map<int64_t, uint32_t> reported_;
   size_t batch_hashes_ = 0;
-  bool startup_ = true, rescan_ = true, dirty_ = true;
+  bool startup_ = true, rescan_ = true, dirty_ = true, repair_ = false;
   std::atomic<bool> stopping_{false};
   std::thread thread_;
 };

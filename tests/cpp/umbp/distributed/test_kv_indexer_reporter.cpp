@@ -94,7 +94,7 @@ TEST_F(AutomaticKvIndexer, SharedPoolReportsCommittedComponentsAndWithdraws) {
   conflict.dram_pool_id = "other";
   EXPECT_THROW(pool.ConfigureKvIndexer(conflict), std::logic_error);
   const KvBlockMetadata block{42, {}, 16, {{1, {"k", "v"}}, {2, {"swa"}}, {4, {"mamba"}}}};
-  pool.RegisterKvBlock(block);
+  auto metadata = pool.RegisterKvBlock(block);
   EXPECT_NO_THROW(pool.RegisterKvBlock(block));
   EXPECT_THROW(pool.RegisterKvBlock({42, {}, 32, block.component_keys}), std::invalid_argument);
   EXPECT_THROW(pool.RegisterKvBlock({43, 43, 16, block.component_keys}), std::invalid_argument);
@@ -131,7 +131,7 @@ TEST_F(AutomaticKvIndexer, RetryWithdrawsAmbiguousReportsAndRepairDoesNotClear) 
   });
   ASSERT_TRUE(reporter.Sync());
   receiver.fail = true;
-  reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  auto metadata = reporter.Register({42, {}, 16, {{1, {"key"}}}});
   EXPECT_FALSE(reporter.Sync());
   ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
   resident = false;
@@ -157,6 +157,38 @@ TEST_F(AutomaticKvIndexer, RetryWithdrawsAmbiguousReportsAndRepairDoesNotClear) 
   for (const auto& request : receiver.requests)
     for (const auto& action : request.actions())
       EXPECT_NE(action.type(), pb::ACTION_CLEAR_ALL_AT_TIER);
+}
+TEST_F(AutomaticKvIndexer, MetadataSurvivesWritesAndSsdThenRetiresAfterWithdrawal) {
+  std::atomic<bool> dram{false}, ssd{false};
+  KvIndexerReporter reporter(
+      config, [&](const auto&) { return dram.load(); }, [&](const auto&) { return dram || ssd; });
+  auto writing = reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  std::weak_ptr<const KvBlockMetadata> metadata = writing;
+  ASSERT_TRUE(reporter.Sync(true));
+  EXPECT_FALSE(metadata.expired());  // Registration precedes the actual write.
+  ssd = true;
+  writing.reset();
+  ASSERT_TRUE(reporter.Sync(true));
+  EXPECT_FALSE(metadata.expired());  // SSD still holds the bytes for promotion.
+  dram = true;
+  reporter.Notify({"key"});
+  ASSERT_TRUE(reporter.Sync());
+  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
+  dram = false;
+  ssd = false;
+  receiver.fail = true;
+  reporter.Notify({"key"});
+  EXPECT_FALSE(reporter.Sync());
+  EXPECT_FALSE(metadata.expired());  // An ambiguous withdrawal must be retried.
+  receiver.fail = false;
+  ASSERT_TRUE(reporter.Sync());
+  ASSERT_TRUE(receiver.WaitFor({}));
+  EXPECT_TRUE(metadata.expired());
+  auto next_write = reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  dram = true;
+  reporter.Notify({"key"});
+  ASSERT_TRUE(reporter.Sync());
+  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
 }
 }  // namespace
 }  // namespace mori::umbp

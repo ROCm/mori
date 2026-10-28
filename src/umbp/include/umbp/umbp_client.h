@@ -76,8 +76,8 @@ class IUMBPClient {
   virtual void ConfigureKvIndexer(const KvIndexerConfig&) {
     throw std::logic_error("KV Indexer reporting is unsupported by this client");
   }
-  /// Supply immutable canonical metadata, not a residency claim.
-  virtual void RegisterKvBlock(const KvBlockMetadata&) {
+  /// Supply canonical metadata; hold the returned pin through the write.
+  virtual KvMetadataPin RegisterKvBlock(const KvBlockMetadata&) {
     throw std::logic_error("KV Indexer metadata is unsupported by this client");
   }
 
@@ -240,9 +240,11 @@ class IUMBPClient {
   }
 
  protected:
-  void PrepareKvMetadata(const std::vector<std::string>& keys) {
-    if (!kv_metadata_provider_) return;
-    for (const auto& block : kv_metadata_provider_(keys)) RegisterKvBlock(block);
+  std::vector<KvMetadataPin> PrepareKvMetadata(const std::vector<std::string>& keys) {
+    std::vector<KvMetadataPin> pins;
+    if (kv_metadata_provider_)
+      for (const auto& block : kv_metadata_provider_(keys)) pins.push_back(RegisterKvBlock(block));
+    return pins;
   }
   decltype(KvIndexerConfig::metadata_provider) kv_metadata_provider_;
 };

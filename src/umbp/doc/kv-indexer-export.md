@@ -19,7 +19,7 @@ client = UMBPClient(config)
 
 Each metadata record is `KvBlockMetadata(hash, parent_hash, token_count,
 component_keys)`: signed int64 hash, `None` for a root, and all physical keys for
-FULL=1/SWA=2/MAMBA=4. Records are immutable per hash; repeating one is a no-op.
+FULL=1/SWA=2/MAMBA=4. Records are immutable while tracked; repeats reuse metadata.
 The callback runs before writes, outside storage locks. Invalid metadata fails
 before writing; Indexer outages do not fail successful storage writes. Bound
 Python methods are held weakly: keep the adapter alive while using its client.
@@ -34,6 +34,8 @@ its engine bridge must publish and clear HBM only.
 
 Commit/eviction hooks send deltas; metadata travels with standalone batch writes.
 `flush()` awaits reporting. Retries resample residency, and 30s repair re-reports
-without clearing first. Graceful owner shutdown withdraws DRAM. There is no
-crash-time TTL/fencing or HBM/SSD publication. Metadata is retained for later
-promotion; reclamation and production-scale validation remain follow-up work.
+in bounded batches without clearing first. Metadata is reclaimed after its last
+local physical copy and in-flight write are gone and withdrawal succeeds; SSD
+copies retain metadata for promotion. C++ callers hold the `RegisterKvBlock`
+return value through their write. Graceful owner shutdown withdraws DRAM.
+There is no crash-time TTL/fencing or HBM/SSD publication.

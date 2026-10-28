@@ -620,7 +620,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    auto metadata_status = PrepareKvMetadata(request->kv_blocks());
+    std::vector<KvMetadataPin> metadata;
+    auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
     if (!metadata_status.ok()) return metadata_status;
     FillResults(client_->BatchPut(keys, ptrs, sizes), response);
     return grpc::Status::OK;
@@ -670,7 +671,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
             static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
       }
     }
-    auto metadata_status = PrepareKvMetadata(request->kv_blocks());
+    std::vector<KvMetadataPin> metadata;
+    auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
     if (!metadata_status.ok()) return metadata_status;
     FillResults(client_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets), response);
     return grpc::Status::OK;
@@ -710,7 +712,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
-    auto metadata_status = PrepareKvMetadata(request->kv_blocks());
+    std::vector<KvMetadataPin> metadata;
+    auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
     if (!metadata_status.ok()) return metadata_status;
     FillResults(client_->BatchPutWithDepth(keys, ptrs, sizes, depths), response);
     return grpc::Status::OK;
@@ -870,7 +873,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return grpc::Status::OK;
   }
 
-  void RegisterKvMetadata(const ::umbp::StandaloneKvBlock& request) {
+  KvMetadataPin RegisterKvMetadata(const ::umbp::StandaloneKvBlock& request) {
     KvBlockMetadata block{request.hash(), std::nullopt, request.block_size(), {}};
     if (request.has_parent()) block.parent = request.parent();
     for (const auto& component : request.components()) {
@@ -880,13 +883,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
                .second)
         throw std::invalid_argument("duplicate KV component");
     }
-    client_->RegisterKvBlock(block);
+    return client_->RegisterKvBlock(block);
   }
 
   grpc::Status PrepareKvMetadata(
-      const google::protobuf::RepeatedPtrField<::umbp::StandaloneKvBlock>& blocks) {
+      const google::protobuf::RepeatedPtrField<::umbp::StandaloneKvBlock>& blocks,
+      std::vector<KvMetadataPin>& pins) {
     try {
-      for (const auto& block : blocks) RegisterKvMetadata(block);
+      for (const auto& block : blocks) pins.push_back(RegisterKvMetadata(block));
       return grpc::Status::OK;
     } catch (const std::exception& error) {
       return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};

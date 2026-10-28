@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -481,6 +482,9 @@ struct KvBlockMetadata {
   // Every physical object needed for each FULL=1/SWA=2/MAMBA=4 component.
   std::map<uint32_t, std::vector<std::string>> component_keys;
 };
+
+// Keep canonical metadata alive from registration until its write completes.
+using KvMetadataPin = std::shared_ptr<const KvBlockMetadata>;
 
 struct KvIndexerConfig {
   std::string endpoint, worker_id, worker_address;

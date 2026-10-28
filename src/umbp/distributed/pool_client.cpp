@@ -1424,26 +1424,30 @@ void PoolClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
   }
   if (registry_.Get(TierType::DRAM) == nullptr)
     throw std::invalid_argument("KV Indexer reporting requires a local DRAM backend");
-  kv_indexer_ = std::make_shared<KvIndexerReporter>(config, [this](const std::string& key) {
-    for (const auto* backend : registry_.All()) {
-      if (backend->Tier() != TierType::DRAM) continue;
-      if (backend->Contains(key)) return true;
-    }
-    return false;
-  });
+  kv_indexer_ = std::make_shared<KvIndexerReporter>(
+      config,
+      [this](const std::string& key) {
+        for (const auto* backend : registry_.All())
+          if (backend->Tier() == TierType::DRAM && backend->Contains(key)) return true;
+        return false;
+      },
+      [this](const std::string& key) {
+        for (const auto* backend : registry_.All())
+          if (backend->Contains(key)) return true;
+        return false;
+      });
   std::weak_ptr<KvIndexerReporter> weak = kv_indexer_;
   for (auto* backend : registry_.All()) {
-    if (backend->Tier() == TierType::DRAM)
-      backend->SetChangeHook([weak](const auto& keys) {
-        if (auto reporter = weak.lock()) reporter->Notify(keys);
-      });
+    backend->SetChangeHook([weak](const auto& keys) {
+      if (auto reporter = weak.lock()) reporter->Notify(keys);
+    });
   }
   kv_indexer_->Notify();
 }
 
-void PoolClient::RegisterKvBlock(const KvBlockMetadata& block) {
+KvMetadataPin PoolClient::RegisterKvBlock(const KvBlockMetadata& block) {
   if (!kv_indexer_) throw std::logic_error("configure KV Indexer before registering metadata");
-  kv_indexer_->Register(block);
+  return kv_indexer_->Register(block);
 }
 
 bool PoolClient::FlushKvIndexer() { return !kv_indexer_ || kv_indexer_->Sync(); }

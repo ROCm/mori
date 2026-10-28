@@ -129,7 +129,7 @@ class PoolClient {
 
   // Optional Indexer reporting, configured once at the storage owner.
   void ConfigureKvIndexer(const KvIndexerConfig& config);
-  void RegisterKvBlock(const KvBlockMetadata& block);
+  KvMetadataPin RegisterKvBlock(const KvBlockMetadata& block);
   bool FlushKvIndexer();
 
   // Hot paths.  Both retry up to `max_route_retries` times when the
