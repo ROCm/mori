@@ -78,9 +78,9 @@ __global__ void PutRectsKernel(ccoWindowDevice* src, ccoWindowDevice* dst, const
   auto sW = reinterpret_cast<ccoWindow_t>(src);
   const size_t slot = size_t(dc.rank) * sh.SlotBytes();
   auto post = [&](const Rect& r) {
-    sdma.put2d<ccoCoopThread, false, kSignal>(
-        p, dW, slot + size_t(r.dy) * sh.dstPitch + r.dx, sh.dstPitch, sW,
-        size_t(r.sy) * sh.srcPitch + r.sx, sh.srcPitch, r.w, r.h);
+    sdma.put2d<ccoCoopThread, false, kSignal>(p, dW, slot + size_t(r.dy) * sh.dstPitch + r.dx,
+                                              sh.dstPitch, sW, size_t(r.sy) * sh.srcPitch + r.sx,
+                                              sh.srcPitch, r.w, r.h);
   };
   if (lanes == 1) {
     if (threadIdx.x != 0) return;
@@ -116,7 +116,8 @@ static bool CheckSlot(const std::vector<uint8_t>& host, const Shape& sh, int s,
   for (size_t i = 0; i < slotBytes; i++) {
     if (slot[i] == want[i]) continue;
     if (bad < 5)
-      fprintf(stderr, "[rank %d] %s slot %d mismatch at (row %zu, byte %zu): got 0x%02x want 0x%02x\n",
+      fprintf(stderr,
+              "[rank %d] %s slot %d mismatch at (row %zu, byte %zu): got 0x%02x want 0x%02x\n",
               rank, name, s, i / sh.dstPitch, i % sh.dstPitch, slot[i], want[i]);
     bad++;
   }
@@ -179,8 +180,8 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
     uint64_t expectedSig = 0;
 
     // signal: one remote signal per sender per call; checked to land exactly once.
-    auto runCase = [&](const char* name, const Shape& sh, const std::vector<Rect>& rects,
-                       int lanes, bool signal) {
+    auto runCase = [&](const char* name, const Shape& sh, const std::vector<Rect>& rects, int lanes,
+                       bool signal) {
       if (sh.SrcBytes() > srcCap || sh.SlotBytes() > slotCap) {
         fprintf(stderr, "[rank %d] %s: shape too big\n", rank, name);
         return false;
@@ -190,16 +191,16 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
         for (uint32_t x = 0; x < sh.srcPitch; x++) h[size_t(y) * sh.srcPitch + x] = pat(rank, y, x);
       HIP_CHECK(hipMemcpy(srcBuf, h.data(), h.size(), hipMemcpyHostToDevice));
       HIP_CHECK(hipMemset(dstBuf, SENTINEL, sh.SlotBytes() * nranks));
-      HIP_CHECK(hipMemcpy(dRects, rects.data(), rects.size() * sizeof(Rect),
-                          hipMemcpyHostToDevice));
+      HIP_CHECK(
+          hipMemcpy(dRects, rects.data(), rects.size() * sizeof(Rect), hipMemcpyHostToDevice));
       HIP_CHECK(hipDeviceSynchronize());
       ccoBarrierAll(comm);
       if (signal)
-        PutRectsKernel<true><<<nranks, 64, 0, stream>>>(sW, dW, dRects, int(rects.size()), lanes,
-                                                        sh, devComm);
+        PutRectsKernel<true>
+            <<<nranks, 64, 0, stream>>>(sW, dW, dRects, int(rects.size()), lanes, sh, devComm);
       else
-        PutRectsKernel<false><<<nranks, 64, 0, stream>>>(sW, dW, dRects, int(rects.size()), lanes,
-                                                         sh, devComm);
+        PutRectsKernel<false>
+            <<<nranks, 64, 0, stream>>>(sW, dW, dRects, int(rects.size()), lanes, sh, devComm);
       bool pass = true;
       if (signal) {
         expectedSig++;
@@ -251,12 +252,11 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
     ok &= runCase("e4_misal", Shape{4096, 4096, 64, 64},
                   {Rect{4, 1, 8, 2, 2048, 16}, Rect{12, 20, 40, 30, 512, 9}}, 1, false);
     ok &= runCase("wide_x", Shape{70003, 70003, 3, 3}, {Rect{1, 0, 2, 0, 70001, 3}}, 1, false);
-    ok &= runCase("xz_rows", Shape{70003, 69999, 500, 500}, {Rect{5, 7, 3, 11, 100, 480}}, 1,
-                  false);
-    ok &= runCase("tall_y", Shape{16, 24, 70000, 70000}, {Rect{8, 0, 16, 0, 8, 70000}}, 1,
-                  false);
-    ok &= runCase("wide_e4", Shape{2097216, 2097216, 2, 2}, {Rect{0, 0, 0, 0, 2097152, 2}}, 1,
-                  false);
+    ok &=
+        runCase("xz_rows", Shape{70003, 69999, 500, 500}, {Rect{5, 7, 3, 11, 100, 480}}, 1, false);
+    ok &= runCase("tall_y", Shape{16, 24, 70000, 70000}, {Rect{8, 0, 16, 0, 8, 70000}}, 1, false);
+    ok &=
+        runCase("wide_e4", Shape{2097216, 2097216, 2, 2}, {Rect{0, 0, 0, 0, 2097152, 2}}, 1, false);
     {
       std::vector<Rect> v;
       for (uint32_t l = 0; l < 8; l++)
@@ -281,6 +281,5 @@ int run_test(int rank, int nranks, const ccoUniqueId& uid) {
 }
 
 int main(int argc, char** argv) {
-  return ccoTestMain(argc, argv, "CCO SDMA put2d shapes", "/tmp/cco_sdma_put2d_shapes_uid",
-                     19901);
+  return ccoTestMain(argc, argv, "CCO SDMA put2d shapes", "/tmp/cco_sdma_put2d_shapes_uid", 19901);
 }
