@@ -52,6 +52,70 @@ The driver requires a new trace filename. It prints the mean and median API
 latencies. The usual UMBP build dependencies (including HIP) still apply; this
 is not a separate CPU-only build.
 
+## Calibrate on the target platform
+
+The optional calibration tool implements two stages: real sampling and profile
+fitting, followed by simulation with those saved parameters. It currently
+calibrates **CPU→CPU copies only**. It does not change runtime APIs or perform
+calibration during client initialization.
+
+Build the sampler in an existing Release build with UMBP enabled, then run the
+Python driver (requires NumPy and Linux `taskset`):
+
+```bash
+cmake --build build --target umbp_sim_probe -j 8
+python examples/umbp/calibrate.py \
+  --probe build/src/umbp/umbp_sim_probe \
+  --output /tmp/umbp-calibration \
+  --cpus 4,5,6,7 --threads 1 2 4 \
+  --cache cold --samples 24 --rounds 3
+```
+
+Use a new output directory and available physical CPU cores representative of
+deployment. Each N-thread probe runs on the first N listed CPUs and sets both
+`UMBP_DRAM_COPY_THREADS` and `UMBP_DRAM_WRITE_THREADS` to N. Thread counts must
+include 1; supported sampling points are 1, 2, 4 and 8. Without explicit options,
+the tool uses up to eight allowed CPUs and those thread counts that fit. Preserve
+the same copy settings, CPU/NUMA placement and workload conditions for simulation.
+
+The tool writes:
+
+- `profile.json`: load directly using `UMBP_SIM_PROFILE`. It contains the fitted
+  fixed latency, per-copy cost and bandwidth for `cpu_cpu`, with interpolation
+  between measured thread counts. Other transfer paths remain unconfigured.
+- `report.json`: platform, CPU affinity/topology, copy environment, profile/probe
+  hashes, raw samples and independent real/sim comparisons. Each comparison
+  includes medians, p95s and signed median error; the reported tolerance is
+  `max(2 µs, 10% of the real median)`. High error remains visible and does not
+  prevent writing the profile; failed operations or invalid fits fail the run.
+
+Training uses real `LocalCopyEngine` Submit+Wait timings across 4 KiB–4 MiB
+blocks and batches of 1, 8 and 32, capped at 64 MiB total. Only these measurements
+fit the nonnegative model. Separate 8 KiB–8 MiB blocks and batches of 1, 4 and 16
+validate transfers and actual `BatchPut`/`BatchGet` calls. Existing allocation,
+lookup and other control costs still run; API totals are not added to the model.
+API validation includes simulation trace formatting and buffered `/dev/null`
+output, but excludes Python/framework overhead.
+
+`cold` flushes the caller's source outside the timer before each transfer/put
+(x86 only). Get reads the just-written store; it is not an independently flushed
+read. `reuse` repeats with the same buffers and limits training to 8 MiB total;
+larger validation working sets are flagged in the report. Reuse does not
+guarantee a cache hit. Neither profile infers changing cache state or system load.
+In particular, a reused-source engine profile can underestimate store reads:
+the engine's source may stay cached while data just written to the store does
+not. Use the API error report to judge suitability, not just the transfer fit.
+GPU copies and framework end-to-end accuracy require separate calibration.
+
+The simulation stage only loads the generated profile:
+
+```bash
+export UMBP_SIM_ENABLE=1
+export UMBP_SIM_PROFILE=/tmp/umbp-calibration/profile.json
+export UMBP_SIM_TRACE=/tmp/umbp-sim-worker-0.jsonl
+# Keep existing UMBP configuration and put/get call sites.
+```
+
 ## Transfer model
 
 [`sim_profile.json`](../examples/umbp/sim_profile.json) contains **illustrative,
