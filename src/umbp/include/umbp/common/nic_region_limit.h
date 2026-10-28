@@ -22,7 +22,6 @@
 #pragma once
 
 #include <cstdint>
-#include <string>
 #include <string_view>
 
 namespace mori::umbp {
@@ -36,9 +35,5 @@ namespace mori::umbp {
 // times the entries.  0 skips the check.
 void WarnIfNicRegionAliases(std::string_view what, uint64_t bytes, uint64_t page_size,
                             std::string_view remedy);
-
-// Whether AINIC firmware `version` (an ionic device's fw_ver) is at or past the
-// fix, comparing its numbers in order; a prefix of the fix's numbers is not.
-bool AinicFirmwareTranslatesEveryPage(const std::string& version);
 
 }  // namespace mori::umbp

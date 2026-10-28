@@ -22,78 +22,65 @@
 #include "umbp/common/nic_region_limit.h"
 
 #include <algorithm>
-#include <cctype>
 #include <filesystem>
-#include <fstream>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "mori/application/transport/rdma/providers/ionic/ionic_fw_version.hpp"
 #include "mori/utils/mori_log.hpp"
 
 namespace mori::umbp {
 namespace {
 
 constexpr uint64_t kNicRegionPages = uint64_t{1} << 18;
-constexpr const char* kFixedFirmware = "1.117.5-a-190";
+constexpr application::IonicFwVersion kFixedFirmware{1, 117, 5, 190};
+
+std::string Name(const std::optional<application::IonicFwVersion>& v) {
+  if (!v) return "unknown";
+  const auto& [major, minor, patch, build] = *v;
+  return std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch) + "-a-" +
+         std::to_string(build);
+}
 
 // The firmware of this host's AINICs, the RDMA devices the ionic driver binds;
-// "unknown" for one whose version cannot be read.  Read once.
-const std::set<std::string>& AinicFirmware() {
-  static const std::set<std::string> versions = [] {
-    std::set<std::string> found;
+// nullopt for one whose version cannot be read.  Read once.
+const std::vector<std::optional<application::IonicFwVersion>>& AinicFirmware() {
+  static const auto versions = [] {
+    std::vector<std::optional<application::IonicFwVersion>> found;
     std::error_code ec;
     for (const auto& dev : std::filesystem::directory_iterator("/sys/class/infiniband", ec)) {
       std::error_code link_ec;
       const auto driver = std::filesystem::read_symlink(dev.path() / "device" / "driver", link_ec);
       if (link_ec || driver.filename() != "ionic") continue;
-      std::ifstream in(dev.path() / "fw_ver");
-      std::string version;
-      found.insert(std::getline(in, version) && !version.empty() ? version : "unknown");
+      found.push_back(application::ReadIonicFwVersion(dev.path().filename().c_str()));
     }
     return found;
   }();
   return versions;
 }
 
-// A version's numbers in order: "1.117.5-a-77" is 1 117 5 77.
-std::vector<uint64_t> Numbers(const std::string& version) {
-  std::vector<uint64_t> numbers;
-  for (size_t i = 0; i < version.size();) {
-    if (!std::isdigit(static_cast<unsigned char>(version[i]))) {
-      ++i;
-      continue;
-    }
-    uint64_t n = 0;
-    for (; i < version.size() && std::isdigit(static_cast<unsigned char>(version[i])); ++i) {
-      n = n * 10 + static_cast<uint64_t>(version[i] - '0');
-    }
-    numbers.push_back(n);
-  }
-  return numbers;
-}
-
 }  // namespace
-
-bool AinicFirmwareTranslatesEveryPage(const std::string& version) {
-  static const std::vector<uint64_t> fixed = Numbers(kFixedFirmware);
-  return !(Numbers(version) < fixed);
-}
 
 void WarnIfNicRegionAliases(std::string_view what, uint64_t bytes, uint64_t page_size,
                             std::string_view remedy) {
   if (page_size == 0 || bytes / page_size <= kNicRegionPages) return;
+  // Quiet with no AINIC here, or with every one at or past the fix.
   const auto& firmware = AinicFirmware();
-  if (firmware.empty() ||
-      std::all_of(firmware.begin(), firmware.end(), AinicFirmwareTranslatesEveryPage))
+  if (std::all_of(firmware.begin(), firmware.end(),
+                  [](const auto& v) { return v && *v >= kFixedFirmware; })) {
     return;
+  }
+  std::set<std::string> names;
+  for (const auto& v : firmware) names.insert(Name(v));
   std::string versions;
-  for (const auto& version : firmware) versions += (versions.empty() ? "" : ", ") + version;
+  for (const auto& name : names) versions += (versions.empty() ? "" : ", ") + name;
   MORI_UMBP_WARN(
       "[UMBP] {} of {} MiB on {} KiB pages is {} NIC page entries; AINIC firmware before {} "
       "translates only the first {} of a memory region and silently aliases the rest "
       "(this host's AINICs: {}). {}",
-      what, bytes >> 20, page_size >> 10, bytes / page_size, kFixedFirmware, kNicRegionPages,
+      what, bytes >> 20, page_size >> 10, bytes / page_size, Name(kFixedFirmware), kNicRegionPages,
       versions, remedy);
 }
 

@@ -42,7 +42,6 @@
 #include <unistd.h>
 #endif
 
-#include "umbp/common/nic_region_limit.h"
 #include "umbp/distributed/peer/backend/page_backend.h"
 
 namespace mori::umbp {
@@ -239,17 +238,6 @@ class RecordingRegistrar final : public MemoryRegistrar {
 
 // 4 KiB-backed, at most 8 pages per registration: the 20-page buffer becomes
 // 8 + 8 + 4.
-TEST(NicRegionLimit, FirmwareFromTheFixOnTranslatesEveryPage) {
-  for (const char* version : {"1.117.5-a-190", "1.117.5-a-191", "1.117.6-a-1", "1.118.0",
-                              "2.0.0-a-0", "1.117.5-a-190-b-1"}) {
-    EXPECT_TRUE(AinicFirmwareTranslatesEveryPage(version)) << version;
-  }
-  for (const char* version :
-       {"1.117.5-a-77", "1.117.5-a-189", "1.117.4-a-500", "1.116.9", "1.117.5", "unknown", ""}) {
-    EXPECT_FALSE(AinicFirmwareTranslatesEveryPage(version)) << version;
-  }
-}
-
 TEST(PageBackend, LargeBufferRegistersAsSeveralRegions) {
   PageBackend::OwnershipConfig cfg;
   cfg.buffer_sizes = {20 * 4096};
