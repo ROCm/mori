@@ -43,7 +43,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   if (!config.ValidateStorageConfig(&config_error)) {
     throw std::runtime_error("invalid UMBP storage config: " + config_error);
   }
-  if (config.sim.enabled) sim_trace_ = std::make_unique<SimTrace>(config.sim);
+  if (config.sim.enabled) sim_trace_ = std::make_unique<SimTrace>(config.sim.trace_path);
   auto dc = config.distributed.value();
   if (!config.backend_policy_path.empty()) dc.backend_policy_path = config.backend_policy_path;
   if (config.page_size.has_value()) dc.dram_page_size = *config.page_size;

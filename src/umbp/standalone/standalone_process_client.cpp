@@ -219,7 +219,7 @@ StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : con
   if (!WaitReady(standalone_config_.startup_timeout_ms)) {
     throw std::runtime_error("StandaloneProcessClient: server is not ready at " + address_);
   }
-  if (config_.sim.enabled) sim_trace_ = std::make_unique<SimTrace>(config_.sim);
+  if (config_.sim.enabled) sim_trace_ = std::make_unique<SimTrace>(config_.sim.trace_path);
 
   MORI_UMBP_INFO("[StandaloneProcessClient] connected address={} fd_socket={}", address_,
                  fd_socket_path_);

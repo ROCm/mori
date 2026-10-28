@@ -22,27 +22,24 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include "umbp/common/config.h"
-
 namespace mori::umbp {
 
 class SimTrace {
  public:
-  explicit SimTrace(const UMBPSimConfig& config);
-  void Write(uint64_t id, const char* api, size_t keys, uint64_t bytes, uint64_t start_ns,
-             uint64_t elapsed_ns, int64_t result_count, bool exception);
-  std::atomic<uint64_t> next_id{0};
+  explicit SimTrace(const std::string& trace_path);
+  void Write(const char* api, size_t keys, uint64_t bytes, uint64_t start_ns, uint64_t elapsed_ns,
+             int64_t result_count, bool exception);
 
  private:
-  std::string profile_json_;
   std::ofstream output_;
   std::mutex mutex_;
 };
@@ -55,7 +52,6 @@ class SimCall {
       : trace_(trace), api_(api), keys_(keys), result_count_(result) {
     if (trace_) {
       start_ = std::chrono::steady_clock::now();
-      id_ = trace_->next_id.fetch_add(1, std::memory_order_relaxed);
       exceptions_ = std::uncaught_exceptions();
       bytes_ = Bytes(sizes);
     }
@@ -82,7 +78,7 @@ class SimCall {
   SimTrace* trace_;
   const char* api_;
   size_t keys_;
-  uint64_t bytes_ = 0, id_ = 0;
+  uint64_t bytes_ = 0;
   int64_t result_count_;  // Defaults to failure (0); void APIs pass -1.
   int exceptions_ = 0;
   std::chrono::steady_clock::time_point start_;

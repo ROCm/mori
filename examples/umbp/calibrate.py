@@ -27,7 +27,6 @@ import hashlib
 import itertools
 import json
 import os
-import platform
 import statistics
 import subprocess
 import tempfile
@@ -107,8 +106,6 @@ def compare(records):
                 zip(fields, key),
                 real_median_ns=real,
                 sim_median_ns=sim,
-                real_p95_ns=float(np.percentile(modes["real"], 95)),
-                sim_p95_ns=float(np.percentile(modes["sim"], 95)),
                 error_pct=100 * (sim / real - 1),
                 within_tolerance=abs(sim - real) <= max(2000, 0.1 * real),
             )
@@ -269,26 +266,9 @@ def main():
                 for mode in ("real", "sim") if r % 2 == 0 else ("sim", "real"):
                     collect(phase, mode, r, p, c, candidate if mode == "sim" else None)
         comparisons = compare(records)
-        training = [row for row in records if row["phase"] == "train"]
-        max_bytes = max(row["block_bytes"] * row["batch"] for row in training)
-        for row in comparisons:
-            row["outside_training_working_set"] = (
-                row["block_bytes"] * row["batch"] * row["concurrency"] > max_bytes
-            )
         report = {
             "profile_id": profile["id"],
             "profile_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
-            "created_utc": created,
-            "platform": platform.uname()._asdict(),
-            "cpu_model": next(
-                (
-                    line.split(":", 1)[1].strip()
-                    for line in Path("/proc/cpuinfo").read_text().splitlines()
-                    if line.startswith("model name")
-                ),
-                "unknown",
-            ),
-            "probe_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
             "cpus": cpus,
             "threads": threads,
             "concurrency": concurrency,
@@ -297,15 +277,6 @@ def main():
             "cache": args.cache,
             "samples": args.samples,
             "rounds": args.rounds,
-            "copy_environment": {
-                k: env.get(k)
-                for k in (
-                    "UMBP_DRAM_NT_COPY",
-                    "UMBP_DRAM_NT_COPY_MIN_BYTES",
-                    "UMBP_DRAM_COPY_THREADS_MIN_BYTES",
-                )
-            },
-            "scope": "CPU copies only; cold flushes the caller source before put/transfer. Get reads the just-written store. Concurrent validation uses disjoint keys/buffers in one client, on the first min(threads * callers, available CPUs) listed CPUs; thread creation is outside API timers. Reuse is not a guaranteed cache hit. API validation includes trace output to /dev/null. No GPU or framework accuracy claim.",
             "tolerance": "absolute median error <= max(2000 ns, 10% of real median)",
             "comparisons": comparisons,
             "measurements": records,
@@ -314,18 +285,6 @@ def main():
             json.dumps(report, indent=2, allow_nan=False) + "\n"
         )
         candidate.replace(args.output / "profile.json")
-    for phase, c in itertools.product(("engine", "api"), concurrency):
-        rows = [
-            row
-            for row in comparisons
-            if row["phase"] == phase and row["concurrency"] == c
-        ]
-        error = statistics.median(abs(row["error_pct"]) for row in rows)
-        passed = sum(row["within_tolerance"] for row in rows)
-        print(
-            f"{phase}, {c} callers: median absolute error {error:.1f}%; "
-            f"{passed}/{len(rows)} within tolerance"
-        )
     print(f"Profile and measurements: {args.output.resolve()}")
 
 

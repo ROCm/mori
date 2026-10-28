@@ -21,9 +21,6 @@
 // SOFTWARE.
 #include "umbp/sim/trace.h"
 
-#include <google/protobuf/struct.pb.h>
-#include <google/protobuf/util/json_util.h>
-
 #include <stdexcept>
 #include <string_view>
 
@@ -31,26 +28,21 @@
 
 namespace mori::umbp {
 
-SimTrace::SimTrace(const UMBPSimConfig& config) {
-  google::protobuf::Value profile;
-  profile.set_string_value(config.profile_path);
-  const auto status = google::protobuf::util::MessageToJsonString(profile, &profile_json_);
-  if (!status.ok()) throw std::invalid_argument(status.ToString());
-  if (!config.trace_path.empty()) {
-    output_.open(config.trace_path, std::ios::app);
-    if (!output_) throw std::invalid_argument("UMBP sim: cannot open trace " + config.trace_path);
+SimTrace::SimTrace(const std::string& trace_path) {
+  if (!trace_path.empty()) {
+    output_.open(trace_path, std::ios::app);
+    if (!output_) throw std::invalid_argument("UMBP sim: cannot open trace " + trace_path);
   }
 }
 
-void SimTrace::Write(uint64_t id, const char* api, size_t keys, uint64_t bytes, uint64_t start_ns,
+void SimTrace::Write(const char* api, size_t keys, uint64_t bytes, uint64_t start_ns,
                      uint64_t elapsed_ns, int64_t result_count, bool exception) {
   static auto logger = MORI_GET_LOGGER(mori::modules::UMBP);
   if (!output_.is_open() && !logger->should_log(spdlog::level::info)) return;
-  // API names are fixed internal identifiers; the user-supplied path is escaped once.
-  const auto json = fmt::format(
-      R"({{"call_id":{},"api":"{}","key_count":{},"bytes":{},"start_ns":{},)"
-      R"("elapsed_ns":{},"result_count":{},"exception":{},"profile_path":{}}})",
-      id, api, keys, bytes, start_ns, elapsed_ns, result_count, exception, profile_json_);
+  // API names are fixed internal identifiers.
+  const auto json = fmt::format(R"({{"api":"{}","key_count":{},"bytes":{},"start_ns":{},)"
+                                R"("elapsed_ns":{},"result_count":{},"exception":{}}})",
+                                api, keys, bytes, start_ns, elapsed_ns, result_count, exception);
   std::lock_guard<std::mutex> lock(mutex_);
   if (output_.is_open()) {
     output_ << json << '\n';
@@ -67,7 +59,7 @@ SimCall::~SimCall() {
   using Ns = std::chrono::nanoseconds;
   try {
     const bool exception = std::uncaught_exceptions() > exceptions_;
-    trace_->Write(id_, api_, keys_, bytes_,
+    trace_->Write(api_, keys_, bytes_,
                   std::chrono::duration_cast<Ns>(start_.time_since_epoch()).count(),
                   std::chrono::duration_cast<Ns>(end - start_).count(),
                   exception ? -1 : result_count_, exception);

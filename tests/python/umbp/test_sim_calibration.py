@@ -112,7 +112,6 @@ def test_report_keeps_absolute_floor_and_large_relative_errors_visible():
     result = calibrate.compare(rows)[0]
     assert result["error_pct"] == 50
     assert not result["within_tolerance"]
-    assert result["real_p95_ns"] > result["real_median_ns"]
     rows = [dict(row, elapsed_ns=row["elapsed_ns"] / 10) for row in rows]
     assert calibrate.compare(rows)[0]["within_tolerance"]
 
@@ -152,7 +151,7 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
     train = [4096, 65536, 1048576]
     validation = [4096] if overlap else [8192, 131072]
     argv = ["calibrate", "--probe", str(probe), "--output", str(output)]
-    argv += "--cpus 0 --threads 1 --concurrency 1 --rounds 1".split()
+    argv += "--cpus 0 --threads 1 --concurrency 1 --rounds 1 --max-mib 1".split()
     argv += ["--train-block-bytes", *map(str, train), "--train-batches", "1", "8", "32"]
     argv += [
         "--validation-block-bytes",
@@ -164,21 +163,21 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(calibrate.os, "sched_getaffinity", lambda _: {0})
     phases = set()
-    native_run = calibrate.subprocess.run
 
     def run(command, **kwargs):
-        if str(probe) not in command:
-            return native_run(command, **kwargs)
         phase = command[command.index(str(probe)) + 1]
         phases.add(phase)
         blocks = train if phase == "train" else validation
         batches = [1, 8, 32] if phase == "train" else [1, 4]
         assert command[command.index("--block-bytes") + 1] == ",".join(map(str, blocks))
         assert command[command.index("--batches") + 1] == ",".join(map(str, batches))
+        assert command[command.index("--max-mib") + 1] == "1"
         csv = (
             "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns\n"
         )
         for block, batch in itertools.product(blocks, batches):
+            if block * batch > 1048576:
+                continue
             for api in ("put", "get") if phase == "api" else ("transfer",):
                 csv += f"{block},{batch},1,1,{api},0,{int(1000 + block * batch / 40 + batch * 50)}\n"
         return SimpleNamespace(stdout=csv)
