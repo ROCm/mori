@@ -12,16 +12,6 @@ enum TierType {
   TIER_SSD = 3;
 }
 
-message WorkerCacheSpec {
-  uint32 version = 1;
-  uint32 components = 2;
-  uint32 swa_window_tokens = 3;
-  uint32 full_tier_mask = 4;
-  uint32 swa_tier_mask = 5;
-  uint32 mamba_tier_mask = 6;
-  string dram_pool_id = 7;
-}
-
 enum ExternalKvActionType {
   ACTION_UNKNOWN = 0;
   ACTION_REPORT = 1;
@@ -44,7 +34,6 @@ message ApplyExternalKvBatchRequest {
   repeated ExternalKvAction actions = 3;
   string worker_address = 4;
   reserved 5;
-  WorkerCacheSpec cache_spec = 6;
   string dram_pool_id = 7;
 }
 

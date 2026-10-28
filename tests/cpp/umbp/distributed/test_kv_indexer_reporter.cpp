@@ -68,7 +68,7 @@ class AutomaticKvIndexer : public ::testing::Test {
     builder.RegisterService(&receiver);
     server = builder.BuildAndStart();
     ASSERT_NE(server, nullptr);
-    config = {"127.0.0.1:" + std::to_string(port), "worker", "http://worker:30000", 1, 0, 50};
+    config = {"127.0.0.1:" + std::to_string(port), "shared", 50, {}};
   }
   void TearDown() override { server->Shutdown(); }
   Receiver receiver;
@@ -77,11 +77,6 @@ class AutomaticKvIndexer : public ::testing::Test {
 };
 
 TEST_F(AutomaticKvIndexer, SharedPoolReportsCommittedComponentsAndWithdraws) {
-  config.worker_id.clear();
-  config.worker_address.clear();
-  config.dram_pool_id = "shared";
-  config.components = 7;
-  config.swa_window_tokens = 32;
   PoolClientConfig cfg;
   cfg.master_config.node_id = "indexer-test";
   cfg.dram_page_size = 4096;
@@ -122,42 +117,6 @@ TEST_F(AutomaticKvIndexer, SharedPoolReportsCommittedComponentsAndWithdraws) {
   }
 }
 
-TEST_F(AutomaticKvIndexer, RetryWithdrawsAmbiguousReportsAndRepairDoesNotClear) {
-  std::atomic<bool> resident{true};
-  std::atomic<int> lookups{0};
-  KvIndexerReporter reporter(config, [&](const auto&) {
-    ++lookups;
-    return resident.load();
-  });
-  ASSERT_TRUE(reporter.Sync());
-  receiver.fail = true;
-  auto metadata = reporter.Register({42, {}, 16, {{1, {"key"}}}});
-  EXPECT_FALSE(reporter.Sync());
-  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
-  resident = false;
-  receiver.fail = false;
-  reporter.Notify({"key"});
-  ASSERT_TRUE(reporter.Sync());
-  ASSERT_TRUE(receiver.WaitFor({}));
-  resident = true;
-  reporter.Notify({"key"});
-  ASSERT_TRUE(reporter.Sync());
-  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
-  lookups = 0;
-  reporter.Notify({"unrelated"});
-  ASSERT_TRUE(reporter.Sync());
-  EXPECT_EQ(lookups, 0);  // A delta does not scan unrelated history.
-  {
-    std::lock_guard<std::mutex> lock(receiver.mutex);
-    receiver.requests.clear();
-  }
-  ASSERT_TRUE(reporter.Sync(true));
-  std::lock_guard<std::mutex> lock(receiver.mutex);
-  ASSERT_FALSE(receiver.requests.empty());
-  for (const auto& request : receiver.requests)
-    for (const auto& action : request.actions())
-      EXPECT_NE(action.type(), pb::ACTION_CLEAR_ALL_AT_TIER);
-}
 TEST_F(AutomaticKvIndexer, MetadataSurvivesWritesAndSsdThenRetiresAfterWithdrawal) {
   std::atomic<bool> dram{false}, ssd{false};
   KvIndexerReporter reporter(

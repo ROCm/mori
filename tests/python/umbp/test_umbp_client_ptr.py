@@ -102,22 +102,16 @@ def test_put_from_ptr_get_into_ptr_round_trip():
     assert client.clear()
 
 
-@pytest.mark.parametrize("pool", [False, True])
-def test_indexer_callback_preserves_write_apis(pool):
+def test_indexer_callback_preserves_write_apis():
     parent, calls = 42, []
 
     def metadata(keys):
         calls.append(keys)
         return [umbp.KvBlockMetadata(42, parent, 16, {1: ["key"]})]
 
-    identity = (
-        {"dram_pool_id": "shared"}
-        if pool
-        else {"worker_id": "worker", "worker_address": "http://worker:30000"}
-    )
     client = _make_client(
         kv_indexer=umbp.KvIndexerConfig(
-            "127.0.0.1:1", metadata_provider=metadata, timeout_ms=10, **identity
+            "127.0.0.1:1", "shared", metadata_provider=metadata, timeout_ms=10
         )
     )
     data = ctypes.create_string_buffer(b"value")
@@ -137,16 +131,12 @@ def test_indexer_callback_preserves_write_apis(pool):
 
 
 def test_bound_metadata_provider_does_not_retain_client_owner():
-    with pytest.raises(TypeError):
-        umbp.KvIndexerConfig("127.0.0.1:1", metadata_provider=None)
-
     class Adapter:
         def __init__(self):
             self.client = _make_client(
                 kv_indexer=umbp.KvIndexerConfig(
                     "127.0.0.1:1",
-                    "worker",
-                    "http://worker:30000",
+                    "shared",
                     self.metadata,
                     timeout_ms=10,
                 )

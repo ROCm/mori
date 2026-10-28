@@ -682,10 +682,6 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   if (closed_ || closing_) throw std::logic_error("client is closed");
   ::umbp::StandaloneKvIndexerConfig request;
   request.set_endpoint(config.endpoint);
-  request.set_worker_id(config.worker_id);
-  request.set_worker_address(config.worker_address);
-  request.set_components(config.components);
-  request.set_swa_window_tokens(config.swa_window_tokens);
   request.set_timeout_ms(config.timeout_ms);
   request.set_dram_pool_id(config.dram_pool_id);
   grpc::ClientContext context;

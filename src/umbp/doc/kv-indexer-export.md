@@ -12,7 +12,7 @@ def metadata_for_keys(keys):
 
 config.kv_indexer = KvIndexerConfig(
     "indexer:50051", dram_pool_id="model/node-0/dram",
-    metadata_provider=metadata_for_keys, components=7, swa_window_tokens=512,
+    metadata_provider=metadata_for_keys,
 )
 client = UMBPClient(config)
 ```
@@ -20,17 +20,15 @@ client = UMBPClient(config)
 Each metadata record is `KvBlockMetadata(hash, parent_hash, token_count,
 component_keys)`: signed int64 hash, `None` for a root, and all physical keys for
 FULL=1/SWA=2/MAMBA=4. Records are immutable while tracked; repeats reuse metadata.
-The callback runs before writes, outside storage locks. Invalid metadata fails
-before writing; Indexer outages do not fail successful storage writes. Bound
+The callback runs before writes, outside storage locks. Indexer outages do not
+fail successful storage writes. Bound
 Python methods are held weakly: keep the adapter alive while using its client.
 
 Pool mode requires [SGLang's shared-pool protocol](../distributed/proto/README.sgl-kv-indexer.md).
 Use one owner per pool and compatible model/page/key layouts. All forwarders use
 the same pool configuration; each HBM bridge sets `KV_INDEXER_DRAM_POOL_ID` and
-matching component/window settings. The owner reports DRAM once and the Indexer
+its own component/window settings. The owner reports DRAM once and the Indexer
 combines it with each member's HBM. Closing a forwarder preserves the pool.
-For private worker mode, leave the pool id empty and set `worker_id`/`worker_address`;
-its engine bridge must publish and clear HBM only.
 
 Commit/eviction hooks send deltas; metadata travels with standalone batch writes.
 `flush()` awaits reporting. Retries resample residency, and 30s repair re-reports
