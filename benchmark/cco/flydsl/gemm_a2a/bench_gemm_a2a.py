@@ -418,7 +418,6 @@ def run(args) -> int:
                 n_stripe=args.n_stripe,
                 direct_fence=args.direct_fence,
                 emit_put=not args.no_put,
-                fence=args.fence,
             )
         else:
             gemm = compile_gemm_local(
@@ -724,7 +723,6 @@ def build_parser() -> argparse.ArgumentParser:
         "m/block_m and overrides --chunks",
     )
     p.add_argument("--direct-fence", choices=("leader", "all"), default="leader")
-    p.add_argument("--fence", choices=("none", "leader", "all"), default="leader")
     p.add_argument("--copy-blocks", type=int, default=0)
     p.add_argument(
         "--lsa-uncached", action=argparse.BooleanOptionalAction, default=True

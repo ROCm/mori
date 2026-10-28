@@ -275,7 +275,6 @@ def compile_fused_gemm_a2a(
     staging_store: str = "buffer",
     direct_fence: str = "leader",
     emit_put: bool = True,
-    fence: str = "leader",
     stamp_off: int = 0,
 ):
     """The GEMM with its C stored straight into the destinations' windows.
@@ -317,8 +316,6 @@ def compile_fused_gemm_a2a(
             "the staging GEMM for the split path; an unfused LSA GEMM is just "
             "compile_gemm_local"
         )
-    if fence not in ("none", "leader", "all"):
-        raise ValueError(f"fence must be none, leader or all, got {fence!r}")
     if direct_fence not in ("leader", "all"):
         raise ValueError(f"direct_fence must be leader or all, got {direct_fence!r}")
     if staging_store not in ("buffer", "copy"):
@@ -414,7 +411,7 @@ def compile_fused_gemm_a2a(
         # `_`, not `-`: the name becomes an assembler symbol.
         f"c{chunks}{'p' + '_'.join(map(str, chunk_sizes)) if uneven else ''}"
         f"q{sdma_queues}{'S' if self_to_recv else 'A'}"
-        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}"
+        f"{direct_fence[0]}{'p' if emit_put else 'x'}"
         f"{'_ts' if stamp_off else ''}_r{rank}"
     )
 
@@ -902,9 +899,7 @@ def compile_fused_gemm_a2a(
             # ranks while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the
             # copy engine reads some tiles stale.
             wait_barrier(0)
-            if const_expr(fuse and fence == "all"):
-                raw_cco.cco_system_fence(fx.Int32(0))
-            elif const_expr(fuse and fence == "leader"):
+            if const_expr(fuse):
                 # One wave per block, not every lane. Every lane costs a whole-L2
                 # writeback each, and at M=16384 there are 9216 blocks: the
                 # epilogue's bookkeeping measured 2358us against a 2798us GEMM,
@@ -917,11 +912,6 @@ def compile_fused_gemm_a2a(
                 # really does mean every wave's stores have retired into this
                 # CU's L2 and one wave writing it back covers all eight.
                 raw_cco.cco_system_fence(fx.Int32(1))
-            # "none": gemm_ar's own default here. Its stores go through the
-            # same L2 the copy engine reads, and it measured the fence as
-            # unnecessary on that path -- but it also measured dropping it as
-            # taking relL2 from 2.35e-3 to 3.76e-3 on 8 ranks, so it stays
-            # selectable rather than assumed.
 
             # Both bases are rank-local and constant-offset, so they are the same
             # for every thread. Taking them here rather than inside the `if` also
