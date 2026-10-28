@@ -22,8 +22,8 @@ examples/cco/
 | `python/08_torch_symm_import` | py | import a `torch.symm_mem` tensor into the flat LSA space, no copy |
 | `python/09_torch_symm_lsa_all2all` | py | mori's own torch symm-mem backend + Triton `lsa_ptr` all-to-all |
 | `python/10_flydsl_sdma_allgather_async` | py | FlyDSL SDMA all-gather split into `start_async` / `wait_async`, overlapped with a GEMM |
-| `python/11_flydsl_mega_moe_sdma` | py | MoE GEMM2 (gfx950) writing a rank-sorted send buffer, shipped by SDMA `put`s from comm waves (one per peer) inside the GEMM kernel (needs aiter) |
-| `python/11_flydsl_mega_moe_sdma/sdmabw.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
+| `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `main.py` its test and benchmark against aiter (needs aiter) |
+| `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -97,30 +97,28 @@ Example 11 also uses `torchrun` and SDMA, and additionally needs aiter (it reuse
 
 ```bash
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
-  examples/cco/python/11_flydsl_mega_moe_sdma/main.py --network glm52 --bs 4096
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py test --network glm52 --bs 4096
 
 # latency vs aiter's MegaMoEV2 (mori.shmem P2P scatter), sweeping token counts
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
-  examples/cco/python/11_flydsl_mega_moe_sdma/bench.py --network glm52 \
-  --bs-list 128,512,2048,4096,8192 --no-aligned-pair
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py bench --network glm52 \
+  --bs-list 128,512,2048,4096,8192,16384 --no-aligned-pair
 
 # what one SDMA channel actually moves, to size the above against the hardware
 MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
-  examples/cco/python/11_flydsl_mega_moe_sdma/sdmabw.py
+  examples/cco/python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py
 ```
 
 It is worth it only at large per-rank batches. `stage2+combine` against aiter,
 eager, fp8 transport, `--chunk-tiles 16`, glm52 on 8x MI355, matching aiter's
-output exactly (relL2 0) at every size:
+output exactly (relL2 0) at every size (`--no-aligned-pair` for 8192 and up):
 
-| tokens/rank | 128 | 512 | 2048 | 4096 | 8192 |
-|---|---|---|---|---|---|
-| vs aiter | 0.63x | 0.69x | 0.97x | **1.08x** | **1.18x** |
-| whole MoE layer | 0.86x | 0.84x | 1.00x | 1.05x | **1.08x** |
+| tokens/rank | 128 | 512 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|
+| vs aiter | 0.71x | 0.78x | 1.01x | **1.12x** | **1.23x** | **1.35x** |
 
-Below ~2048 the three kernels' fixed costs -- the plan launch and its grid
-barrier, and the combine's extra index inversion -- outweigh what the copy
-engine saves, and aiter's P2P scatter wins.
+Below ~2048 the fixed costs of the extra plan kernel and of the combine outweigh
+what the copy engine saves, and aiter's P2P scatter wins.
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one
 node; LSA examples (02, 04, 05) ignore it. Each example prints `SUCCESS` on pass.

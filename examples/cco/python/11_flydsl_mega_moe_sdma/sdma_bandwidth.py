@@ -28,7 +28,7 @@ but nothing else in the kernel. Reports per-link and per-rank bandwidth for a
 sweep of transfer sizes and channel counts, so the fused kernel's exposed
 transfer time can be checked against what the hardware will actually do.
 
-    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 sdmabw.py \\
+    MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 sdma_bandwidth.py \\
         --mb 0.36,0.72,1.44,2.89,5.78 --queues 1,2
 """
 
@@ -54,7 +54,7 @@ def build_xfer(*, npes, rank, comm_wgs, queues, split, puts):
     import mori.cco.device.flydsl as cco
 
     @flyc.kernel(
-        name=f"sdmabw_p{npes}_w{comm_wgs}q{queues}s{split}n{puts}_r{rank}",
+        name=f"sdma_bandwidth_p{npes}_w{comm_wgs}q{queues}s{split}n{puts}_r{rank}",
         known_block_size=[WAVE * 4, 1, 1],
     )
     def xfer(
