@@ -1302,9 +1302,21 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
   std::vector<std::vector<int>> p2pFds;
   bool exchangeSuccess = localBootstrap.ExchangeFileDescriptors(localFdsForExchange, p2pFds);
 
+  // Received peer fds are only needed for the import; our own row is our exported fds.
+  auto closeReceivedFds = [&p2pFds, myPeerRank]() {
+    for (int pr = 0; pr < static_cast<int>(p2pFds.size()); ++pr) {
+      if (pr == myPeerRank) continue;
+      for (int fd : p2pFds[pr]) {
+        if (fd >= 0) close(fd);
+      }
+    }
+    p2pFds.clear();
+  };
+
   if (!exchangeSuccess) {
     MORI_APP_ERROR("VMMAlloc: rank={} FD exchange failed! P2P requires same physical machine",
                    rank);
+    closeReceivedFds();
     localBootstrap.Finalize();
     return false;
   }
@@ -1355,6 +1367,9 @@ bool SymmMemManager::RegisterP2PPeerMemory(const std::vector<int>& localShareabl
                       rank, currentDev);
     }
   }
+
+  // Includes fds skipped above (already mapped, or the import failed).
+  closeReceivedFds();
 
   // Clean up LocalBootstrapNetwork
   localBootstrap.Finalize();
