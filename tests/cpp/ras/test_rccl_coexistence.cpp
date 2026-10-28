@@ -169,8 +169,8 @@ int Body() {
   CHILD_CHECK(hipStreamCreate(&stream) == hipSuccess);
   CHILD_CHECK(ncclAllReduce(buf, buf, 1024, ncclFloat, ncclSum, comm, stream) == ncclSuccess);
   CHILD_CHECK(hipStreamSynchronize(stream) == hipSuccess);
-  hipStreamDestroy(stream);
-  hipFree(buf);
+  CHILD_CHECK(hipStreamDestroy(stream) == hipSuccess);
+  CHILD_CHECK(hipFree(buf) == hipSuccess);
   CHILD_CHECK(ncclCommDestroy(comm) == ncclSuccess);
   return 0;
 }
