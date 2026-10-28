@@ -51,7 +51,9 @@ with a largest count of 4, a bucket sending on 2 pays about 1–2 µs per
 dispatch at T ≤ 64. The dispatch also drains the completions its own bucket's
 combine left on QPs it did not send on, so a dispatch count below the combine's
 can be slower than either count alone: the two are chosen as a pair.
-MI308X inter-node rules set the count per bucket and phase (1, 2 or 4).
+MI308X inter-node rules set the count per bucket and phase (1, 2 or 4), except
+the FP4 dispatch and FP8 combine rows. Every MI300X inter-node rule sets one
+(1, 2, 4 or 8); MI355X rules set none.
 
 `InterNodeV2` combine rules may set `combine_load_first` to 1 (empty means 0).
 That bucket's combine pass is then compiled with the load-first peer gather
@@ -69,14 +71,16 @@ other tables may not set it. Current settings:
   896/16 likewise, A/B against the defaults: on for bf16 H3584 at T16, T32 and
   T4096.
   Off elsewhere.
+- MI300X: on for T64–128 in 256/8 bf16 H7168 and H6144 and 384/6 bf16 H7168.
+  Off elsewhere.
 
 ## Lookup
 
 - **Only the current model's own file is read.** A model without a file, such
-  as MI350X or MI325X today, does not borrow another model's table; it falls
+  as MI350X or MI325X today, does not borrow another model's CSV; it falls
   back to the default geometry (inter-node: the config defaults clamped to the
-  CU count; intra-node: the Python tables in `hip_tuning_configs.py`, then
-  `_hip_default()`).
+  CU count; intra-node: the Python tables in `hip_tuning_configs.py`, where
+  MI350X shares MI355X's entries, then `_hip_default()`).
 - `num_experts`, `topk`, `dtype` and `hidden_dim` must match exactly. Dispatch
   and combine are matched independently, each with its own dtype.
 - FP4 dispatch rows store the packed width: `hidden_dim` 3584 means a logical
@@ -87,8 +91,8 @@ other tables may not set it. Current settings:
   `rdma_block_num < block_num`. Fields set explicitly on the config override
   the table, and are not clamped.
 - `MORI_EP_V2_TUNING_DIR` points lookup at another directory.
-  `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`B,R,W`) bypass the tables
-  entirely, for sweeps.
+  `MORI_EP_DISP_GEOM` / `MORI_EP_COMB_GEOM` (`B,R,W[,active_qps]`) bypass the
+  tables entirely, for sweeps.
 
 ## Coverage
 

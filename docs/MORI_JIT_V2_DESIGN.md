@@ -340,7 +340,8 @@ dispatch 的 dtype**——它只归约 bf16/fp32 的暂存区，不管前面搬�
 **策略不是测量**（单次 bench 偶尔会偏 20%）；真正由数据定的是桶的**边界**，它们来自 10~40% 的差异。
 
 HIP V2 的单机和跨机都以 `hip_tuning_configs.resolve_schedule(cfg)` 为 backend 入口，返回统一的
-`ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R 的 `KernelConfig`。
+`ScheduleEntry(max_tokens, dispatch, combine)`，每相是带 family、B/W/R、active QP 数和 load-first 的
+`KernelConfig`。
 单机先查 `IntraNodeV2` 表，某相没有规则时回退到 Python 表，显式 `cfg.schedule` 优先；跨机只查表。
 `op.kernel_config(num_tokens)` 负责一次选桶，HIP 的 `_pick()` 与报告接口使用同一结果；
 绑定的单 kernel 或 pass group 直接执行，不再另选一遍 family/geometry。
@@ -360,15 +361,17 @@ HIP 的 `Config.tuned()` 与普通构造走同一 HIP 入口，不再预读 FlyD
 fp8 dispatch + bf16 combine 使用 fp8 dispatch 行和 bf16 combine 行。`num_tokens` 是包含上界的
 ceiling，最大一档也服务更大的 token 数。总专家数（`ep_size * experts_per_rank`）、`topk`、dtype 和
 hidden 都必须精确匹配：例如 EP16 的 256/8 只用 `num_experts=256, topk=8` 的行；只读当前型号自己的
-文件，不跨型号或专家组合回退。未调优的相使用默认几何。表在加载时整体校验，格式错误直接报错而不是
-跳过。保存结果时按选择键替换或追加一行。V1 的历史通配兼容行为不变。
+CSV，不跨型号或专家组合回退；未调优的相在跨机时使用配置默认几何，在单机时回退到 Python 表（其中
+MI350X 沿用 MI355X 的条目）。表在加载时整体校验，格式错误直接报错而不是跳过。
+保存结果时按选择键替换或追加一行。V1 的历史通配兼容行为不变。
 两相可分别调优，默认按完整 dispatch+combine 周期评估收益，另一相保持选定几何。
 
 internode 几何增加了 `rdma_block_num`，把 grid 分成 RDMA 和 node 内两部分。
 `internode_schedule()` 在构建期合并两相和 family 的桶边界，每桶保留独立的 dispatch/combine 几何。
 `resolve_schedule()` 将 family 分界写入统一 schedule；backend 为可选的配置建立 callable，
-按 `(pass, geometry)` 复用 plan，按阶段和 family 的 pass 顺序建立 launch group。
-shape/dtype 决定编译特化；B/R/W 只影响 plan 的启动配置，相同源码可以共享编译缓存。
+按 `(pass, geometry, active QP 数, load-first)` 复用 plan，按阶段和 family 的 pass 顺序建立 launch group。
+shape/dtype、每档的 active QP 数、op 的 drain QP 数和普通 combine 的 load-first 决定编译特化；B/R/W
+只影响 plan 的启动配置，相同源码可以共享编译缓存。
 运行时选中的配置直接索引到已绑定的 group callable，不会触发编译。
 表中参数限制 `block_num <= CU 数`；手动参数保留指定的 grid，所有路径都限制 `rdma_block_num < block_num`。具体调优用法见
 [包 README](https://github.com/ROCm/mori/blob/main/python/mori/ops/dispatch_combine_v2/README.md#internode-geometry-tuned-by-default)，

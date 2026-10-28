@@ -125,11 +125,10 @@ struct EpInterNodeRegion {
 // Geometry is deliberately NOT here. blockNum and warpNumPerBlock come from
 // gridDim/blockDim, and rdmaBlockNum is a per-launch field of the args below --
 // not for tidiness, but because dispatch and combine are tuned to DIFFERENT
-// values for the same op (hip_tuning_configs: at 8 tokens dispatch runs
-// rdma=32/warp=8 while combine runs rdma=21/warp=6, and the table comment
-// records that the coupling is deliberate). Folding geometry into the config,
-// and thus later into the NTTP, would give the two phases disagreeing configs
-// over one shared arena.
+// values for the same op (the MI308X InterNodeV2 table, 256/8 hidden 7168 bf16:
+// at 8 tokens dispatch runs rdma=24/warp=4 while combine runs rdma=10/warp=8).
+// Folding geometry into the config, and thus later into the NTTP, would give the
+// two phases disagreeing configs over one shared arena.
 // ---------------------------------------------------------------------------
 struct EpInterNodeDeviceCfg {
   // No `rank`. Every field here is a compiled-in shape constant, so the whole
