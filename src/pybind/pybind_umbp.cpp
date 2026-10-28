@@ -262,6 +262,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
+      .def_readwrite("ranged_scratch_use_hugepages",
+                     &UMBPDistributedConfig::ranged_scratch_use_hugepages)
+      .def_readwrite("ranged_scratch_hugepage_size",
+                     &UMBPDistributedConfig::ranged_scratch_hugepage_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("ssd_staging_use_hugepages", &UMBPDistributedConfig::ssd_staging_use_hugepages)
       .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)

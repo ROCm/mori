@@ -68,7 +68,8 @@ jobs:
 
       - name: Build wheels
         run: |
-          BASE_VER=$(git describe --tags --abbrev=0 | sed 's/^v//')
+          # v1.2.4.post1 -> 1.2.4; else the nightly is 1.2.4.1.devN, below 1.2.5.devN
+          BASE_VER=$(git describe --tags --abbrev=0 --match 'v[0-9]*' | sed -E 's/^v([0-9]+(\.[0-9]+)*).*/\1/')
           NEXT_VER=$(echo "$BASE_VER" | awk -F. '{$NF=$NF+1; print}' OFS=.)
           DATE=$(date +%Y%m%d)
           SHA=$(git rev-parse --short HEAD)
@@ -756,6 +757,25 @@ jobs:
               wait
               sleep 1
               PORT=$((PORT + 1))
+              if [[ "${{ matrix.platform }}" == "MI355X_AINIC" && ( "$TOKENS" == 128 || "$TOKENS" == 1024 || "$TOKENS" == 4096 ) ]]; then
+                echo "=== atomic-free bench kernel=$KERNEL max-tokens=$TOKENS port=$PORT ==="
+                NODE2_CMD=(
+                  $CT exec -e MORI_INTERNODE_TIMEOUT=600 -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO
+                  -e MORI_EP_DISABLE_RDMA_ATOMICS=1 $CONTAINER bash $SCRIPT
+                  --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+                  --ifname $NODE2_IFNAME
+                  --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+                )
+                ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+                $CT exec -e MORI_INTERNODE_TIMEOUT=600 -e MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+                  -e MORI_EP_DISABLE_RDMA_ATOMICS=1 $CONTAINER bash $SCRIPT \
+                  --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+                  --ifname $NODE1_IFNAME \
+                  --cmd bench --kernel-type $KERNEL --max-tokens $TOKENS
+                wait
+                sleep 1
+                PORT=$((PORT + 1))
+              fi
             done
           done
 
@@ -985,3 +1005,103 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+
+  flydsl-compat:
+    # CI proper runs the FlyDSL that aiter pins (docker/Dockerfile.dev). mori's
+    # FlyDSL shims (mori.cco.device.flydsl.buffer and
+    # ops/dispatch_combine_v2/flydsl_compat.py) still carry 0.2.x and 0.3.x paths
+    # for environments pinned to an older one; this runs the FlyDSL-backed tests
+    # on those so the paths stay exercised: 0.2.4 is flydsl.expr.buffer_ops, and
+    # 0.3.0 still takes `aux` on the raw buffer ops positionally (0.3.1 made it the
+    # keyword attribute that CI's 0.4.0 covers).
+    name: FlyDSL ${{ matrix.flydsl }} compat (MI355X_AINIC)
+    runs-on: [self-hosted, MI355X-AINIC]
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # each leg uses all 8 GPUs; never share a host
+      matrix:
+        flydsl: ["0.2.4", "0.3.0"]
+    env:
+      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7  # as ci_cco.yml
+      MORI_RDMA_SL: 3
+      MORI_RDMA_TC: 104
+      IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
+      BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+      CONTAINER: mori_flydsl_compat_${{ github.run_id }}_${{ strategy.job-index }}
+      CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build image
+        run: |
+          $CT build --network=host --build-arg BASE_IMAGE=$BASE_IMAGE \
+            --build-arg GPU_ARCHS="gfx950" --build-arg WITH_FLYDSL=1 \
+            --build-arg FLYDSL_VERSION=${{ matrix.flydsl }} \
+            -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Build mori
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_UMBP=OFF BUILD_CCO_SDMA=ON pip install . && pip show flydsl"
+
+      - name: CCO SDMA Python API
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
+
+      - name: FlyDSL buffer cache-policy check
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
+
+      - name: GEMM+AR numerics
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
+      - name: ops-v2 dispatch/combine, FlyDSL backend (EP8)
+        run: |
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            python -m pytest tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_intranode.py -v"
+
+      - name: CCO FlyDSL examples (2 ranks)
+        run: |
+          $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "pip install mpi4py && \
+            cd $GITHUB_WORKSPACE/examples/cco/python && \
+            mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
+            mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
+            mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
+            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
+            torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT exec $CONTAINER chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT bash docker/ci_stop.sh $CONTAINER || true
+          # Only this leg's FlyDSL layer is unique; the rest is shared with ci-cco.
+          $CT rmi -f $IMAGE 2>/dev/null || true

@@ -279,6 +279,14 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
                                       const TierTransitionResult& result) {
   migrating_keys_.erase(job.key);
   if (migrating_keys_.empty()) transition_idle_cv_.notify_all();
+  // Before the outcome: a failed move may still have read and written.
+  auto* source = backends_ == nullptr ? nullptr : backends_->Get(job.source_backend_id);
+  if (source != nullptr && result.bytes_read != 0) {
+    transition_metrics_.read_bytes[TierTypeName(source->Tier())] += result.bytes_read;
+  }
+  for (const auto& [tier, bytes] : result.bytes_written) {
+    transition_metrics_.write_bytes[TierTypeName(tier)] += bytes;
+  }
   if (!result.success) {
     ++transition_metrics_.failed;
     if (job.kind == TierTransitionKind::kPromotion) ++transition_metrics_.promote_failed;
@@ -580,7 +588,9 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
 
 std::vector<PoolCommitResult> PeerPool::BatchCommit(
     const std::vector<PoolCommitRequest>& requests) {
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  // Backend commits run without operation_mutex_; this keeps ClearLocal out meanwhile.
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<PoolCommitResult> out(requests.size());
   if (backends_ == nullptr) return out;
 
@@ -614,38 +624,48 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
       release_pending(requests[i].slot);
       continue;
     }
+    // Claimed: a second commit of this slot finds nothing, and the key stays
+    // reserved so racing puts see it in flight. No expiry: a hung commit pins it.
     accepted_slots.insert(slot_key);
+    pending_slots_.erase(slot);
+    pending->second.expires_at = std::chrono::steady_clock::time_point::max();
     by_backend[requests[i].slot.backend_id].push_back(i);
   }
 
+  // Unlocked: an SSD commit is the device write, and every lookup and read
+  // needs this lock.
+  operation_lock.unlock();
+  std::map<uint32_t, std::vector<CommitResult>> results;
   for (const auto& [backend_id, indices] : by_backend) {
     auto* backend = backends_->Get(backend_id);
-    if (backend == nullptr) {
-      for (size_t index : indices) release_pending(requests[index].slot);
-      continue;
-    }
-
+    if (backend == nullptr) continue;
     std::vector<CommitRequest> backend_requests;
     backend_requests.reserve(indices.size());
     for (size_t index : indices) {
       backend_requests.push_back(
           CommitRequest{requests[index].slot.local_slot_id, requests[index].key});
     }
+    results[backend_id] = backend->BatchCommit(backend_requests);
+  }
+  operation_lock.lock();
 
-    auto results = backend->BatchCommit(backend_requests);
+  for (const auto& [backend_id, indices] : by_backend) {
+    const auto& backend_results = results[backend_id];
     for (size_t i = 0; i < indices.size(); ++i) {
-      const size_t index = indices[i];
-      if (i >= results.size()) {
-        release_pending(requests[index].slot);
-        continue;
+      const PoolCommitRequest& request = requests[indices[i]];
+      if (i < backend_results.size()) {
+        out[indices[i]].backend_id = backend_id;
+        out[indices[i]].commit = backend_results[i];
+        if (backend_results[i].success) {
+          placements_[request.key] = backend_id;
+          TouchLocked(request.key);
+        }
       }
-      out[index].backend_id = backend_id;
-      out[index].commit = results[i];
-      if (results[i].success) {
-        placements_[requests[index].key] = backend_id;
-        TouchLocked(requests[index].key);
+      auto pending = pending_keys_.find(request.key);
+      if (pending != pending_keys_.end() && pending->second.backend_id == backend_id &&
+          pending->second.local_slot_id == request.slot.local_slot_id) {
+        pending_keys_.erase(pending);
       }
-      release_pending(requests[index].slot);
     }
   }
   MaybeEnqueueWatermarkOffloadLocked();
@@ -694,7 +714,9 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
                                                       bool include_descs, bool allow_file_refs,
-                                                      ResolveReader reader) {
+                                                      ResolveReader reader,
+                                                      const std::vector<ObjectExtent>* extents) {
+  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;
   // A remote reader discards a response holding any kBusy key; a local one
   // reads its hits and comes back for the busy keys.
   const bool busy_discards = reader == ResolveReader::kRemote;
@@ -733,7 +755,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
   if (direct_backend != nullptr) {
-    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader);
+    auto resolved =
+        direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     bool batch_busy = false;
     bool all_found = resolved.size() == keys.size();
     std::vector<bool> failed_but_owned(keys.size(), false);
@@ -792,13 +815,18 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     bool identity = indices.size() == keys.size();
     for (size_t i = 0; identity && i < indices.size(); ++i) identity = indices[i] == i;
     std::vector<std::string> backend_keys;
+    std::vector<ObjectExtent> backend_extents;
     if (!identity) backend_keys.reserve(indices.size());
+    if (!identity && extents != nullptr) backend_extents.reserve(indices.size());
     for (size_t index : indices) {
       attempted[index] |= static_cast<uint16_t>(1u << backend_id);
       if (!identity) backend_keys.push_back(keys[index]);
+      if (!identity && extents != nullptr) backend_extents.push_back((*extents)[index]);
     }
+    const std::vector<ObjectExtent>* sub_extents =
+        extents == nullptr ? nullptr : (identity ? extents : &backend_extents);
     auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs,
-                                         allow_file_refs, reader);
+                                         allow_file_refs, reader, sub_extents);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
       const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);

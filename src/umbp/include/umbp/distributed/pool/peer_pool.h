@@ -124,10 +124,12 @@ class PeerPool {
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
-  // `reader` is passed to every backend asked (see MediumBackend::BatchResolve).
+  // `reader` and `extents` (parallel to `keys`, or null) are passed to every
+  // backend asked (see MediumBackend::BatchResolve).
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                               bool include_descs, bool allow_file_refs = false,
-                                              ResolveReader reader = ResolveReader::kRemote);
+                                              ResolveReader reader = ResolveReader::kRemote,
+                                              const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
   // check discards. Takes no read lease and does not touch recency: asking
@@ -258,10 +260,10 @@ class PeerPool {
   // name their victim explicitly, and non-tiered pools never read the LRU.
   bool track_access_order_ = false;
 
-  // Resolve dispatch deliberately drops operation_mutex_ while thread-safe
-  // backends do their work. ClearLocal takes this exclusively so it cannot
-  // invalidate an SSD staging result while a resolve is between its plan and
-  // publish phases.
+  // Resolve and commit dispatch deliberately drop operation_mutex_ while
+  // thread-safe backends do their work. ClearLocal takes this exclusively so it
+  // cannot invalidate an SSD staging result while a resolve is between its plan
+  // and publish phases, or wipe a key a commit is still writing.
   mutable std::shared_mutex lifecycle_mutex_;
   // Serializes policy decisions with backend lifecycle operations. The first
   // Pool still uses one metadata lock, but slow resolve dispatch does not hold

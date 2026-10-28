@@ -659,6 +659,17 @@ TEST_F(PoolClientRangesTest, DistributedScratchIsExplicitlyOptedIn) {
   opted_in->Close();
 }
 
+// A hugepage request the host cannot serve falls back to 4 KiB pages; the node still comes up.
+TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
+  auto config = DistributedConfig("ranges-scratch-fell-back", 4 * kPageSize);
+  config.distributed->ranged_scratch_use_hugepages = true;
+  config.distributed->ranged_scratch_hugepage_size = 3 * 1024 * 1024;  // no such hugepage size
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+  client->Close();
+}
+
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
   const std::string key = "range-stale-self";
   std::vector<char> stale_object(kObjectSize, 0x11);

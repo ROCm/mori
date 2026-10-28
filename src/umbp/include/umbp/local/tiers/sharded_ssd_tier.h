@@ -104,8 +104,19 @@ class ShardedSsdTier : public TierBackend {
   std::vector<bool> ReadBatchIntoPtr(const std::vector<std::string>& keys,
                                      const std::vector<uintptr_t>& dst_ptrs,
                                      const std::vector<size_t>& sizes) override;
+  // Like BatchReadIntoPtr: one call per shard, all shards at once.
+  std::vector<bool> ReadBatchRangesIntoPtr(
+      const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dst_ptrs,
+      const std::vector<std::vector<size_t>>& sizes,
+      const std::vector<std::vector<size_t>>& src_offsets) override;
 
  private:
+  // Bucket a read batch by shard, run op(shard, key indices) on every busy
+  // shard at once, and log the fan-out as `label`; key_bytes[i] is key i's.
+  template <typename ShardOp>
+  std::vector<bool> FanOutRead(const char* label, const std::vector<std::string>& keys,
+                               const std::vector<size_t>& key_bytes, ShardOp&& op);
+
   // Shard for a new key of @p size: the one with the most projected free space
   // that can still fit it, or -1 when none can.  Caller holds map_mu_ exclusively
   // and passes the projected reservation through free_hint_ (see ReserveLocked).

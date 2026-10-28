@@ -135,6 +135,17 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
   const uint64_t moves_failed = Delta(now.transitions.failed, before.transitions.failed);
   const uint64_t moves_retried = Delta(now.transitions.retried, before.transitions.retried);
   const uint64_t moves_dropped = Delta(now.transitions.dropped, before.transitions.dropped);
+  const auto per_medium = [](const std::map<std::string, uint64_t>& now_bytes,
+                             const std::map<std::string, uint64_t>& before_bytes) {
+    std::map<std::string, uint64_t> out;
+    for (const auto& [medium, bytes] : now_bytes) {
+      const auto it = before_bytes.find(medium);
+      out[medium] = Delta(bytes, it == before_bytes.end() ? 0 : it->second);
+    }
+    return out;
+  };
+  const auto move_reads = per_medium(now.transitions.read_bytes, before.transitions.read_bytes);
+  const auto move_writes = per_medium(now.transitions.write_bytes, before.transitions.write_bytes);
 
   const ReCacheActivity& rc_now = now.recache;
   const ReCacheActivity& rc_old = before.recache;
@@ -254,10 +265,15 @@ std::vector<std::string> ActivitySummary::Render(const ActivitySnapshot& now,
       const double pct = d.capacity_bytes == 0 ? 0.0
                                                : 100.0 * static_cast<double>(d.used_bytes) /
                                                      static_cast<double>(d.capacity_bytes);
+      const auto move_read = move_reads.find(tier);
+      const auto move_write = move_writes.find(tier);
       std::snprintf(buf.data(), buf.size(),
-                    "[UMBP]   %s: offload %s load %s evict %s | resident %s/%s (%.0f%%) %llu keys",
+                    "[UMBP]   %s: offload %s load %s evict %s move-read %s move-write %s | "
+                    "resident %s/%s (%.0f%%) %llu keys",
                     tier.c_str(), FormatBytes(d.offload_bytes).c_str(),
                     FormatBytes(d.load_bytes).c_str(), FormatBytes(d.evict_bytes).c_str(),
+                    FormatBytes(move_read == move_reads.end() ? 0 : move_read->second).c_str(),
+                    FormatBytes(move_write == move_writes.end() ? 0 : move_write->second).c_str(),
                     used.c_str(), cap.c_str(), pct,
                     static_cast<unsigned long long>(d.resident_keys));
       lines.emplace_back(buf.data());
