@@ -58,6 +58,7 @@ remote segment and keeps every later ``s_waitcnt`` count conservative.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import gpu as fgpu
@@ -85,7 +86,7 @@ from ..gemm_ar._gemm_a8w8_8wave import (
 )
 from ..gemm_ar.kernels_fused import _LaneTransposeStoreC, _SwappedMfma
 from ..gemm_ar.kernels_lsa import _spin_until
-from .layout import BLOCK_K, MAX_WORLD
+from .layout import BLOCK_K, MAX_CHUNKS, MAX_WORLD
 
 #: Wave width; the push kernel and the barriers use one wave, a lane per peer.
 PUSH_THREADS = 64
@@ -168,6 +169,34 @@ def _band_target(base, stride, rank, cfg, src, ep, chunk):
     return fx.Int32(local_load_u32(sig_base)) + done
 
 
+def _realtime():
+    """``s_memrealtime``: a 64-bit 100 MHz clock, constant across DVFS."""
+    i64 = ir.IntegerType.get_signless(64)
+    return fx.Int64(
+        _llvm_d.call_intrinsic(i64, "llvm.amdgcn.s.memrealtime", [], [], [])
+    )
+
+
+def _stamp(base_i64, slot):
+    """Diagnostic: now, at u64 slot ``slot`` (a runtime or compile-time index)."""
+    addr = fx.Int64(base_i64) + fx.Int64(slot) * fx.Int64(8)
+    _llvm_d.store(_realtime().ir_value(), signal_ptr(addr), alignment=8, volatile_=True)
+
+
+def _observe_bands(sdma, base, stride, rank, cfg, peer, ep, qid, stamps):
+    """Diagnostic: lane ``peer`` stamps when each of ``peer``'s bands lands here."""
+    sig_base = signal_ptr(
+        _lsa(base, stride, rank, cfg.sig_base_off) + fx.Int64(peer) * fx.Int64(4)
+    )
+    first = fx.Int32(local_load_u32(sig_base)) + (ep - fx.Int32(1)) * fx.Int32(
+        cfg.chunks
+    )
+    slot = signal_ptr(sdma.signal_slot(peer, qid))
+    for c in range_constexpr(cfg.chunks):
+        _spin_until(slot, first + fx.Int32(c + 1))
+        _stamp(stamps, fx.Int32(3) + peer * fx.Int32(MAX_CHUNKS) + fx.Int32(c))
+
+
 def _wait_band(sdma, base, stride, rank, cfg, src, ep, chunk, qid):
     """Spin until ``src``'s band ``chunk`` of this call has landed here."""
     target = _band_target(base, stride, rank, cfg, src, ep, chunk)
@@ -187,6 +216,8 @@ def compile_a2a_gemm(
     wait: str = "segment",
     acquire: str = "inv",
     _post: bool = True,
+    _timeline: bool = False,
+    _grid: int = 0,
 ):
     """Compile the all-to-all + GEMM (``fuse=True``) or the plain GEMM over an
     already-filled ``recv`` (``fuse=False``).
@@ -206,6 +237,8 @@ def compile_a2a_gemm(
         raise ValueError(
             "the fused path pushes from send, so it reads its own from there"
         )
+    if _timeline and not (fuse and cfg.timeline):
+        raise ValueError("_timeline needs fuse=True and a cfg with timeline=True")
     ws = cfg.world_size
     K = cfg.k
     KS = cfg.k_steps_per_shard
@@ -253,7 +286,7 @@ def compile_a2a_gemm(
     _kname = (
         f"mori_a2a_gemm_{'fused' if fuse else 'plain'}"
         f"{'' if self_from_send else '_rv'}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}"
-        f"_k{K}_n{N}_ml{M}_w{ws}_c{cfg.chunks}{'_wt' if wait == 'tile' else ('_wn' if wait == _DIAG_WAIT else '')}{'_an' if acquire == 'none' else ''}{'' if _post else '_np'}"
+        f"_k{K}_n{N}_ml{M}_w{ws}_c{cfg.chunks}{'_wt' if wait == 'tile' else ('_wn' if wait == _DIAG_WAIT else '')}{'_an' if acquire == 'none' else ''}{'' if _post else '_np'}{'_tl' if _timeline else ''}"
         f"_r{rank}"
     )
 
@@ -290,6 +323,14 @@ def compile_a2a_gemm(
             # and those have to be single MLIR values.
             sdma = cco.DevComm(dev_comm).sdma()
 
+            # Every source pushes to this rank on its queue rank % sdma_queues.
+            qid = fx.Int32(rank % sdma_queues)
+            stamps = _lsa(wbase, wstride, rank, cfg.stamp_off)
+            if const_expr(_timeline):
+                if t == fx.Int32(0):
+                    if tid == fx.Int32(0):
+                        _stamp(stamps, 0)
+
             # ---- the poster: block 0, one lane per peer ----
             # (_post=False is diagnostic: no block index matches -1.)
             if t == fx.Int32(0 if _post else -1):
@@ -307,6 +348,12 @@ def compile_a2a_gemm(
                             tid % fx.Int32(sdma_queues),
                             quiet=False,
                         )
+                        if const_expr(_timeline):
+                            if tid == fx.Int32((rank + 1) % ws):
+                                _stamp(stamps, 1)
+                            _observe_bands(
+                                sdma, wbase, wstride, rank, cfg, tid, ep, qid, stamps
+                            )
             # Block 0 takes the last tile, which waits for the last band
             # regardless. Its quiet waits until after that tile: draining first
             # put the whole transfer *and then* a full tile on the critical path
@@ -314,8 +361,10 @@ def compile_a2a_gemm(
             tile = (t + fx.Int32(tiles - 1)) % fx.Int32(tiles)
             block_m, block_n = split_row_major_2d(tile, nb)
             chunk = block_m // fx.Int32(mtpc)
-            # Every source pushes to this rank on its queue rank % sdma_queues.
-            qid = fx.Int32(rank % sdma_queues)
+            tile_slot = fx.Int32(cfg.STAMP_FIXED) + tile * fx.Int32(2)
+            if const_expr(_timeline):
+                if tid == fx.Int32(0):
+                    _stamp(stamps, tile_slot)
             if const_expr(wait == "tile"):
                 if tid == fx.Int32(0):
                     for j in range_constexpr(1, ws):
@@ -497,10 +546,16 @@ def compile_a2a_gemm(
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
         if const_expr(fuse):
+            if const_expr(_timeline):
+                if tid == fx.Int32(0):
+                    _stamp(stamps, tile_slot + fx.Int32(1))
             if t == fx.Int32(0 if _post else -1):
                 if tid < ws:
                     if tid != rank:
                         sdma.quiet_queue(tid, tid % fx.Int32(sdma_queues))
+                        if const_expr(_timeline):
+                            if tid == fx.Int32((rank + 1) % ws):
+                                _stamp(stamps, 2)
 
     @flyc.jit
     def launch(
@@ -525,7 +580,7 @@ def compile_a2a_gemm(
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": "512,512",
             },
-        ).launch(grid=(tiles, 1, 1), block=(512, 1, 1), stream=stream)
+        ).launch(grid=(_grid or tiles, 1, 1), block=(512, 1, 1), stream=stream)
 
     return launch
 

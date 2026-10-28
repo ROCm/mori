@@ -144,16 +144,45 @@ Every fused configuration:
   of six cells, and wins whenever the tiles fit in one wave (`m_local=2048`):
   there, starting on the own segment is the only overlap there is. `tile` is
   ahead only at P=8, M >= 4096, by 0.4-3%.
-- **At P=8 the transfer slows down under the GEMM.** With the waits switched
-  off (`--wait none`) the fused kernel ends within 9us of `gemm-only` at
-  `m_local=4096`, so all seven slabs land inside the GEMM; yet with the waits
-  on, the second wave of tiles sits on the last bands for ~70us, which fits a
-  transfer running at roughly half its idle rate (an inference from the two
-  times, not a measurement of the copy engines). This is why 70B gains
-  4-14% where M3 gains 8-32%. Not a polling cost -- an `s_sleep` backoff in the
-  spin changed nothing -- and not the window's cache mode: a cached window
-  (`CCO_UNCACHED_WINDOW=0`, `acquire="inv"`) measured the same in `tile` mode.
-  What the copy engines contend with is not yet identified.
+- **At P=8 the first wave of tiles waits on bands it cannot do without.** The
+  transfer is short there (below) and fused still trails `gemm-only` by
+  40-80us; the next section shows where that goes.
+
+### Where the time goes at P=8
+
+`timeline_a2a_gemm.py` stamps, on every rank, when each band has landed from
+every source and when each tile starts and ends (70B shape, P=8, medians of 10;
+`idle` is block 0 alone on the GPU, `nowait` the full grid with the waits
+switched off):
+
+| m_local | chunks | last band landed: idle | under the GEMM (`nowait`) | `tile` | fused ends (`tile`) | `gemm-only` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 1 | 84-93 | 87-98 | 85-93 | 259-268 | 183 |
+| 4096 | 8 | 120-127 | 121-141 | 117-129 | 252-263 | 183 |
+| 8192 | 1 | 154-178 | 152-175 | 145-177 | 495-532 | 356 |
+| 8192 | 8 | 186-211 | 193-207 | 182-208 | 425-447 | 356 |
+
+(ranges over the eight ranks, us from block 0's start.)
+
+* **The copy engines are not slowed by the GEMM.** Every band lands within a few
+  us of where it lands on an idle GPU, and the whole exchange is done long
+  before the GEMM is: ~90-130us of a 183us GEMM at `m_local=4096`.
+* **The tiles are.** 512 tiles are two waves on 256 CUs, and the first wave
+  covers bands 0-3. At `c8` those land at 30, 44, 58 and 72us, and a tile
+  holds its CU while it waits -- ~50us idle per CU on average before the
+  first wave is done, which is most of the 75us gap to `gemm-only`. With `c1`
+  every tile waits the full ~90us, then the GEMM runs as if alone.
+* **`segment` cannot fill that wait at P=8.** A tile's own segment is 1/8 of
+  its K -- about 11us of a ~87us tile -- against a quarter at P=4, where the
+  same mechanism gives 8-32%.
+* **The slowest link sets the end.** Bands from the slowest rank's peers land
+  up to ~25us after the fastest rank's at `m_local=8192`, and fused time is the
+  max over ranks.
+
+The floor for this static band-major schedule is roughly the last first-wave
+band plus the rest of the GEMM; recovering more needs the first wave to have
+work that does not wait -- more of K local (smaller P), or tiles scheduled by
+arrival rather than by index.
 
 ## Running it
 
@@ -168,7 +197,8 @@ HIP_VISIBLE_DEVICES=0,1,2,3 MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 \
 MORI_ENABLE_SDMA=1 pytest -q tests/python/cco/test_a2a_gemm.py
 ```
 
-`--wait none` and `--no-post` are diagnostics (no waits, so not validated; no
+`timeline_a2a_gemm.py` produces the timeline above. `--wait none` and
+`--no-post` are diagnostics (no waits, so not validated; no
 puts): they split a fused time into what the poster costs and what the waits
 cost. `--back-to-back R` adds R calls with no host sync between them, each with its
 own operands and output, one rank held on the GPU before each, and validates
@@ -176,7 +206,7 @@ every one.
 
 ## Not done yet
 
-Why the P=8 transfer halves under the GEMM (a timeline, as `gemm_a2a --timeline`
-has); a public op wrapper with `self_test` and a per-M tile/chunk choice; blockscale
+A schedule that keeps the first wave busy at P=8 (see above); a public op
+wrapper with `self_test` and a per-M tile/chunk choice; blockscale
 and mxfp8; N that is not a multiple of 256; fp8 head shards quantized against a
 per-shard scale (the scale has to be global, see above); a model integration.

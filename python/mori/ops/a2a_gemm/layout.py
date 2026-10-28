@@ -83,6 +83,8 @@ class A2aGemmConfig:
     k: int
     block_m: int = 256
     chunks: int = 1
+    #: Diagnostic: reserve a stamp region after ``recv`` (see ``stamp_slots``).
+    timeline: bool = False
 
     @property
     def k_shard(self) -> int:
@@ -157,13 +159,33 @@ class A2aGemmConfig:
         return self.recv_off + src * self.slab_bytes
 
     @property
+    def recv_end(self) -> int:
+        return self.recv_off + self.world_size * self.slab_bytes
+
+    # --- diagnostic timeline: u64 s_memrealtime stamps ---
+    #: [0] block 0 start, [1] its puts issued, [2] its quiet done,
+    #: [3 + src*MAX_CHUNKS + c] band c from src observed here,
+    #: then a (start, end) pair per tile.
+    STAMP_FIXED = 3 + MAX_WORLD * MAX_CHUNKS
+
+    @property
+    def stamp_off(self) -> int:
+        return _align(self.recv_end, 4096)
+
+    def stamp_slots(self, tiles: int) -> int:
+        return self.STAMP_FIXED + 2 * tiles
+
+    @property
     def window_bytes(self) -> int:
-        return _align(self.recv_off + self.world_size * self.slab_bytes, 4096)
+        if not self.timeline:
+            return _align(self.recv_end, 4096)
+        # Room for the tile pairs of any N up to 64 column tiles.
+        return _align(self.stamp_off + 8 * self.stamp_slots(self.m_tiles * 64), 4096)
 
     @property
     def operand_bytes(self) -> int:
         """The span the GEMM's A descriptor covers: ``send`` through ``recv``."""
-        return self.window_bytes - self.send_off
+        return self.recv_end - self.send_off
 
     def segment_off(self, src: int, rank: int, *, self_from_send: bool) -> int:
         """Where source ``src``'s K segment starts, relative to ``send_off``."""
