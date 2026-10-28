@@ -124,15 +124,21 @@ class PeerPool {
   std::vector<PoolAllocateResult> BatchAllocate(const std::vector<PoolPlacementRequest>& requests);
   std::vector<PoolCommitResult> BatchCommit(const std::vector<PoolCommitRequest>& requests);
   std::vector<bool> BatchAbort(const std::vector<PoolSlotRef>& slots);
-  // `reader` is passed to every backend asked (see MediumBackend::BatchResolve).
+  // `reader` and `extents` (parallel to `keys`, or null) are passed to every
+  // backend asked (see MediumBackend::BatchResolve).
   std::vector<PoolResolvedEntry> BatchResolve(const std::vector<std::string>& keys,
                                               bool include_descs, bool allow_file_refs = false,
-                                              ResolveReader reader = ResolveReader::kRemote);
+                                              ResolveReader reader = ResolveReader::kRemote,
+                                              const std::vector<ObjectExtent>* extents = nullptr);
   // Existence only, in request order. Cheaper than BatchResolve, which
   // heap-copies the page vector of every key it finds -- work an existence
   // check discards. Takes no read lease and does not touch recency: asking
   // whether a key is here is not a read of it.
   std::vector<bool> BatchContains(const std::vector<std::string>& keys);
+  // Copies keys held on SSD into DRAM of the same tier, else of a tier above, so
+  // the coming read is served from DRAM. The SSD copy stays, and the oldest
+  // prefetched copies are dropped past `budget_bytes`. Returns the keys copied.
+  size_t Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes);
   // The single eviction entry point (master EvictKey and local eviction).
   // Drops happen before it returns; demotions are only queued.  One result per
   // request, in order.
@@ -258,10 +264,10 @@ class PeerPool {
   // name their victim explicitly, and non-tiered pools never read the LRU.
   bool track_access_order_ = false;
 
-  // Resolve dispatch deliberately drops operation_mutex_ while thread-safe
-  // backends do their work. ClearLocal takes this exclusively so it cannot
-  // invalidate an SSD staging result while a resolve is between its plan and
-  // publish phases.
+  // Resolve and commit dispatch deliberately drop operation_mutex_ while
+  // thread-safe backends do their work. ClearLocal takes this exclusively so it
+  // cannot invalidate an SSD staging result while a resolve is between its plan
+  // and publish phases, or wipe a key a commit is still writing.
   mutable std::shared_mutex lifecycle_mutex_;
   // Serializes policy decisions with backend lifecycle operations. The first
   // Pool still uses one metadata lock, but slow resolve dispatch does not hold
@@ -280,6 +286,15 @@ class PeerPool {
   // the set to drain so a late target commit cannot resurrect a wiped key.
   std::unordered_set<std::string> migrating_keys_;
   std::condition_variable transition_idle_cv_;
+  struct PrefetchedCopy {
+    std::string key;
+    uint32_t copy_id = BackendRegistry::kMaxBackends;    // DRAM copy
+    uint32_t source_id = BackendRegistry::kMaxBackends;  // SSD original
+    uint64_t bytes = 0;
+  };
+  // Oldest first. Approximate: a copy another path dropped still counts until popped.
+  std::deque<PrefetchedCopy> prefetched_;
+  uint64_t prefetched_bytes_ = 0;
   std::unordered_map<std::string, PendingPlacement> pending_keys_;
   std::map<std::pair<uint32_t, uint64_t>, std::string> pending_slots_;
   std::unordered_map<std::string, std::list<std::string>::iterator> last_access_;

@@ -102,7 +102,8 @@ jobs:
           $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge \
-                     test_sdma_signal test_sdma_warp_issue; do \
+                     test_sdma_signal test_sdma_warp_issue test_sdma_put2d \
+                     test_sdma_put2d_shapes; do \
               echo \"=== \$t ===\" && \
               out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1) || { echo \"\$out\"; exit 1; }; \
               echo \"\$out\"; \
@@ -166,7 +167,9 @@ jobs:
             mpirun --allow-run-as-root -np 2 python 02_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 04_flydsl_lsa_put/main.py && \
             mpirun --allow-run-as-root -np 2 python 05_flydsl_lsa_allreduce/main.py && \
-            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py"
+            MORI_ENABLE_SDMA=1 mpirun --allow-run-as-root -np 2 -x MORI_ENABLE_SDMA python 07_flydsl_sdma/main.py && \
+            mpirun --allow-run-as-root -np 2 python 08_torch_symm_import/main.py && \
+            MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=2 10_flydsl_sdma_allgather_async/main.py --iters 5 --timing-iters 5"
             # GDA (device-initiated RDMA) examples fail on the runner (cross-rail
             # RDMA); re-enable once that is fixed.
             # mpirun --allow-run-as-root -np 2 python 03_flydsl_put/main.py
@@ -191,6 +194,13 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             timeout 300 pytest tests/python/cco/test_sdma_api.py -v"
 
+      - name: Run CCO FlyDSL buffer cache-policy check
+        run: |
+          # A wrong cache policy still runs, so check the bits in the emitted ISA.
+          $CT exec $CONTAINER bash -c "\
+            cd /tmp && \
+            timeout 600 python -m pytest -v $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_buffer.py"
+
       - name: Run CCO GEMM+AR numerics (up to 8 ranks)
         run: |
           # The op ships in mori.ops.gemm_ar, so run pytest from /tmp: from a
@@ -206,6 +216,7 @@ jobs:
             timeout 1800 python -m pytest -v \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
 
       - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
@@ -365,6 +376,28 @@ jobs:
           $CT exec $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
             timeout 900 torchrun --standalone --nproc_per_node=8 test_ep_backend_parity.py"
+
+      - name: Run ops-v2 AsyncLL (EP8, sdma and lsa transports)
+        run: |
+          # The only CI coverage of the v2 AsyncLL family: ci.yml's async_ll steps
+          # run v1's test_dispatch_combine_async_ll.py, which never touches it.
+          #
+          # Both transports, because they share the protocol but not the transfer
+          # passes -- the LSA count-reset race lived only in the lsa ones. The
+          # script exits non-zero on a failed check; the PASS grep is there for a
+          # run that died before reporting, which would otherwise read as green.
+          #
+          # MORI_ENABLE_SDMA=1 matters for the sdma leg: without SDMA queues every
+          # put is a no-op and the receiver spins until the timeout, so a runner
+          # that quietly lost SDMA shows up as this step timing out, not passing.
+          for transport in sdma lsa; do
+            $CT exec -e MORI_ENABLE_SDMA=1 -e TRANSPORT=$transport $CONTAINER bash -c "\
+              cd $GITHUB_WORKSPACE/tests/python/ops/dispatch_combine_v2 && \
+              out=\$(timeout 900 torchrun --standalone --nproc_per_node=8 test_asyncll.py 2>&1) || \
+                { echo \"\$out\"; exit 1; }; \
+              echo \"\$out\"; \
+              case \"\$out\" in *'# PASS:'*) ;; *) echo 'no PASS line: nothing ran'; exit 1;; esac" || exit 1
+          done
 
       - name: Run ops-v2 routing snapshot handles (EP8, both backends)
         run: |

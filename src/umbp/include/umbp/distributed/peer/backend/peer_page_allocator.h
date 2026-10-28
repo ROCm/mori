@@ -166,6 +166,9 @@ class PageBitmapAllocator : public PagePool {
   uint32_t BufferPageCount(size_t buffer_index) const override {
     return buffer_index < buffers_.size() ? buffers_[buffer_index].total_pages : 0;
   }
+  uint32_t BufferFreePages(size_t buffer_index) const override {
+    return buffer_index < buffers_.size() ? buffers_[buffer_index].free_count : 0;
+  }
 
   // Read-only access to per-buffer state (e.g. for diagnostics / Heartbeat
   // status reporting).  Returned reference is invalidated by any subsequent
