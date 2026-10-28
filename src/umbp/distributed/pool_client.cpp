@@ -73,6 +73,18 @@
 
 namespace mori::umbp {
 
+std::unordered_map<int, int> GpuNumaNodes() {
+  std::unordered_map<int, int> nodes;
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess) return nodes;
+  for (int device = 0; device < count; ++device) {
+    int node = -1;
+    mori::application::detail::GpuLocalCpuList(device, node);
+    if (node >= 0) nodes.emplace(device, node);
+  }
+  return nodes;
+}
+
 size_t RangedScratchShardsFromEnv() {
   static const size_t n = [] {
     size_t shards = 0;
@@ -1042,14 +1054,7 @@ bool PoolClient::Init() {
   const bool numa_scratch =
       placed(config_.ranged_get_scratch) || placed(config_.ranged_put_scratch);
   if (numa_placement || numa_scratch) {
-    int count = 0;
-    if (hipGetDeviceCount(&count) == hipSuccess) {
-      for (int device = 0; device < count; ++device) {
-        int node = -1;
-        mori::application::detail::GpuLocalCpuList(device, node);
-        if (node >= 0) gpu_to_numa_.emplace(device, node);
-      }
-    }
+    gpu_to_numa_ = GpuNumaNodes();
     if (gpu_to_numa_.empty()) {
       MORI_UMBP_WARN(
           "[PoolClient] NUMA placement configured but GPU affinity is unavailable; no steering");

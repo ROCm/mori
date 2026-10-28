@@ -80,6 +80,10 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
   }
 }
 
+// The NUMA node of each GPU this process sees, by device ordinal; a GPU with no
+// node is left out.
+std::unordered_map<int, int> GpuNumaNodes();
+
 // In the master-as-advisor design, PoolClient drives the Put/Get
 // pipeline: master gives a routing advisory, then the writer talks
 // directly to the peer (AllocateSlot → RDMA → CommitSlot or
