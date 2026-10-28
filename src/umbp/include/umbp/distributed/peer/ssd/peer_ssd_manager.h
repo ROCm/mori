@@ -168,10 +168,18 @@ class PeerSsdManager {
   // key and leaves every drive but one idle, so a multi-drive tier can only be
   // saturated through here.
   //
-  // @p dsts and @p caps are parallel to @p keys; the result is too.
+  // @p dsts and @p caps are parallel to @p keys; the result is too.  A key
+  // whose @p extents entry has a nonzero length reads only those object bytes
+  // (unverified: a record's CRC covers the whole value); its outcome `size` is
+  // still the object's, and an extent outside the object is kError.  Single
+  // flight attaches a reader only to a read that covers all of its bytes.
   std::vector<SsdReadOutcome> PrepareReadBatch(const std::vector<std::string>& keys,
                                                const std::vector<void*>& dsts,
-                                               const std::vector<size_t>& caps);
+                                               const std::vector<size_t>& caps,
+                                               const std::vector<ObjectExtent>* extents = nullptr);
+
+  // Whether PrepareReadBatch can take extents: the tier reads sub-object ranges.
+  bool SupportsRangedRead() const;
 
   // Same shape as OwnedLocationSource (see the class comment above) — all
   // events carry TierType::SSD.
@@ -182,6 +190,7 @@ class PeerSsdManager {
   // master would otherwise grow it by one entry per written key forever.
   void SetEventPublishing(bool enabled);
   std::vector<KvEvent> SnapshotOwnedKeys() const;
+  size_t OwnedKeyCount() const;
 
   // Full-sync snapshot that also atomically drops the event outbox under the
   // same lock.
@@ -208,7 +217,7 @@ class PeerSsdManager {
   uint64_t ReadLead() const { return metrics_.read_lead.load(std::memory_order_relaxed); }
   uint64_t ReadDup() const { return metrics_.read_dup.load(std::memory_order_relaxed); }
   uint64_t ReadMerged() const { return metrics_.read_merged.load(std::memory_order_relaxed); }
-  // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s).
+  // Byte counters for SSD IO bandwidth (rate() in Grafana = bytes/s); reads are loads only.
   uint64_t CopyBytes() const { return metrics_.copy_bytes.load(std::memory_order_relaxed); }
   uint64_t ReadBytes() const { return metrics_.read_bytes.load(std::memory_order_relaxed); }
   uint64_t EvictionBackendFailures() const {
@@ -263,7 +272,9 @@ class PeerSsdManager {
   // slot can be recycled underneath the memcpy.
   struct FollowerTarget {
     void* dst = nullptr;
-    size_t cap = 0;
+    // Object bytes [offset, offset + length) the leader copies out of its buffer.
+    uint64_t offset = 0;
+    uint64_t length = 0;
     // Written by the leader before it sets episode->done, read by the follower
     // after it wakes.
     bool ok = false;
@@ -283,6 +294,13 @@ class PeerSsdManager {
   struct ReadEpisode {
     bool sealed = false;  // snapshot taken; late arrivals must not attach
     bool done = false;    // leader finished (read + fan-out)
+    // Object bytes the leader reads; only a reader whose bytes lie inside attaches.
+    uint64_t offset = 0;
+    uint64_t length = 0;
+    bool Covers(uint64_t want_offset, uint64_t want_length) const {
+      return want_offset >= offset && want_offset - offset <= length &&
+             want_length <= length - (want_offset - offset);
+    }
     std::vector<std::shared_ptr<FollowerTarget>> followers;
     std::condition_variable cv;  // waited on under mutex_
   };

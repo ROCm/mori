@@ -464,6 +464,11 @@ class EpDispatchCombineOp:
             config.kernel_type, init_shmem=self._cco_comm is None
         )
         self._handle_info = mori_cpp.get_handle_info(self._handle)
+        # MORI_EP_DISABLE_RDMA_ATOMICS: the InterNodeV1/V1LL dispatch and combine kernels are
+        # compiled twice, and this selects the variant that signals with RDMA WRITEs.
+        self._atomic_free_sfx = (
+            "_atomicfree" if self._handle_info["disable_rdma_atomics"] else ""
+        )
 
         self._fp8_blockwise_combine_scale_dim = self._handle_info[
             "fp8_blockwise_combine_scale_dim"
@@ -1286,7 +1291,7 @@ class EpDispatchCombineOp:
             self._launch_multi(
                 [
                     f"EpDispatchCopyToStaging_{sfx}",
-                    f"EpDispatchInterNodeV1Kernel_{sfx}",
+                    f"EpDispatchInterNodeV1Kernel_{sfx}{self._atomic_free_sfx}",
                 ],
                 [mp, actual_bn],
                 [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
@@ -1299,7 +1304,7 @@ class EpDispatchCombineOp:
             self._launch_multi(
                 [
                     f"EpDispatchCopyToStaging_{sfx}",
-                    f"EpDispatchInterNodeV1KernelLowLatency_{sfx}",
+                    f"EpDispatchInterNodeV1KernelLowLatency_{sfx}{self._atomic_free_sfx}",
                 ],
                 [mp, actual_bn],
                 [self._warp_size * actual_wpb, self._warp_size * actual_wpb],
@@ -1622,7 +1627,7 @@ class EpDispatchCombineOp:
                 [
                     f"EpCombineSync_{sfx}",
                     f"EpCombineSyncBarrier_{sfx}",
-                    f"EpCombineInterNodeV1Kernel_{sfx}",
+                    f"EpCombineInterNodeV1Kernel_{sfx}{self._atomic_free_sfx}",
                     f"EpCombineAll_{sfx}",
                 ],
                 [mp, 1, actual_bn, mp],
@@ -1638,7 +1643,7 @@ class EpDispatchCombineOp:
                 [
                     f"EpCombineSync_{sfx}",
                     f"EpCombineSyncBarrier_{sfx}",
-                    f"EpCombineInterNodeV1KernelLowLatency_{sfx}",
+                    f"EpCombineInterNodeV1KernelLowLatency_{sfx}{self._atomic_free_sfx}",
                     f"EpCombineAll_{sfx}",
                 ],
                 [mp, 1, actual_bn, mp],
@@ -1966,7 +1971,7 @@ class EpDispatchCombineOp:
                 f"EpDispatchCopyToStaging_{sfx}", (mp,), block, 0, stream, args_ptr
             )
             self._launch(
-                f"EpDispatchInterNodeV1KernelLowLatency_{sfx}_stdmoe",
+                f"EpDispatchInterNodeV1KernelLowLatency_{sfx}_stdmoe{self._atomic_free_sfx}",
                 grid,
                 block,
                 shared_mem,
@@ -2074,7 +2079,7 @@ class EpDispatchCombineOp:
                 args_ptr,
             )
             self._launch(
-                f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe",
+                f"EpCombineInterNodeV1KernelLowLatency_{sfx}_stdmoe{self._atomic_free_sfx}",
                 grid,
                 block,
                 shared_mem,

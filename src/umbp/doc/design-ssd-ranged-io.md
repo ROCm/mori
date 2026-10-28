@@ -16,6 +16,10 @@ and the sglang tree connector falls back to whole-object I/O for every request.
 tested; D1, D1c, X1 and D2 remain open. §3.1 records one thing the
 implementation corrected about the shape of the fix.
 
+**Update: D1a + D1b + D1c implemented** (§4.5); X1 and D2 remain open. A
+layer-wise restore (1024 x 1.97 MB objects, 8 groups, two NVMe drives,
+io_uring) reads 1.88 GiB off the drives instead of 15.00 GiB, 0.32 s vs 1.52 s.
+
 This document covers the distributed data plane only — a client talking to a
 master, whether that client is a `DistributedClient` in-process or a standalone
 UMBP server forwarding for one. Written against `refactor/umbp-backend-agnostic`
@@ -297,6 +301,23 @@ attaching on key alone — produces correct-looking bytes and no error, so this
 needs a test that asserts *content*, not success.
 
 ---
+
+### 4.5 As implemented
+
+- `BatchResolve(..., const std::vector<ObjectExtent>* extents)`, parallel to
+  `keys`; `ResolvedEntry::covered_offset` / `covered_size` name the window the
+  pages hold, and `size` stays the object's. Only `ResolveReader::kLocal`
+  honours extents; a remote reader stages the whole object until D2.
+- `SsdBackend` widens each extent to 4 KiB and clamps it to the object, so
+  O_DIRECT lands in the staging span. Extent stages are private to their
+  readers, never in `read_leases_` (which promise the whole object). Identical
+  windows in one call share a read; a whole-object lease serves any window.
+  An extent span goes back to the arena when its last hold drops, not at the
+  next reaper sweep; span search is next-fit.
+- `PeerSsdManager::PrepareReadBatch` takes the extents too, and single flight
+  attaches a reader only to a read that covers its bytes (D1c).
+- `UMBP_SSD_EXTENT_STAGING=0` restores whole-object staging. `extent_stage`
+  counts extent reads; `device_read` bytes count the window.
 
 ## 5. D2 — ranged resolve on the peer wire
 

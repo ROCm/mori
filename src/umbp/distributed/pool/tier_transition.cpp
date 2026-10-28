@@ -128,12 +128,14 @@ TierTransitionResult TierTransitionExecutor::Execute(
         result.retryable = true;
         continue;
       }
+      result.bytes_read += resolved.size;
       auto committed = target->BatchCommit({CommitRequest{allocation.slot_id, key}});
       if (committed.empty() || !committed.front().success) {
         target->BatchAbort({allocation.slot_id});
         result.retryable = true;
         continue;
       }
+      result.bytes_written.emplace_back(target->Tier(), committed.front().bytes_committed);
     } else if (allocation.outcome != AllocateOutcome::kSuccessAlreadyExists) {
       // No space is pressure (staging full of reads, eviction catching up);
       // a shape failure (kFailed) stays final.
