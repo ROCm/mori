@@ -67,7 +67,7 @@ physical CPUs representative of deployment. Each N-thread probe uses the first
 N listed CPUs and sets `UMBP_DRAM_COPY_THREADS` and `UMBP_DRAM_WRITE_THREADS` to N.
 Sampling supports 1/2/4/8 threads and must include 1. Defaults use up to eight
 allowed CPUs. Keep copy settings and CPU/NUMA placement consistent during simulation.
-`--concurrency` defaults to 1/2/4 and must include 1. It adds a sparse validation
+`--concurrency` defaults to 1/2/4 and must include 1. By default it adds a sparse validation
 sweep of simultaneous calls sharing one client/engine, with disjoint keys and
 buffers. Callers start together; thread creation is outside API timers. Each run
 uses the first `min(N * callers, listed CPUs)` cores, so limited CPU lists can
@@ -81,14 +81,31 @@ Use `--concurrency 1` to skip that sweep.
   error). Tolerance is `max(2 µs, 10% of real median)`. High error is reported;
   failed operations or invalid fits fail the run.
 
-Training measures real `LocalCopyEngine` Submit+Wait with 512 B–4 MiB blocks and
+Override training and validation independently with positive integer lists (block
+sizes are **bytes**, batch sizes are counts):
+
+```bash
+python examples/umbp/calibrate.py \
+  --probe build/src/umbp/umbp_sim_probe --output /tmp/umbp-calibration-custom \
+  --train-block-bytes 4096 65536 1048576 --train-batches 1 8 32 \
+  --validation-block-bytes 8192 131072 2097152 --validation-batches 1 4 16
+```
+
+Omitted lists keep their defaults. A customized phase samples the full product of
+its block/batch lists, bounded by `--max-mib`, including concurrent validation.
+Duplicates are sampled once. Training and validation must not share a sampled
+`(block_bytes, batch)` pair; overlap aborts the run without publishing a profile.
+An empty capped grid or insufficient independent training points also fails.
+Requested lists are saved in `report.json` (`null` means the sampler default).
+
+By default, training measures real `LocalCopyEngine` Submit+Wait with 512 B–4 MiB blocks and
 batches 1/8/32/64/128. Independent validation uses different block sizes from
 1 KiB–8 MiB and batches 1/4/16/128 for transfers and `BatchPut`/`BatchGet` APIs.
 Both reach 256 MiB aggregate payload by default. `--max-mib` bounds that payload
 across all callers; actual memory also includes destinations and storage pools.
-Increase it if necessary to exceed the target cache (the fixed grid tops out at
-512 MiB training and 1 GiB single-caller validation).
-Concurrent validation samples 8 KiB, 512 KiB and 2 MiB blocks with batches 1/16/128,
+Increase the cap and customize the lists as needed to exceed the target cache.
+The default grid tops out at 512 MiB training and 1 GiB single-caller validation.
+Default concurrent validation samples 8 KiB, 512 KiB and 2 MiB blocks with batches 1/16/128,
 subject to the same aggregate cap. Small blocks represent copy sizes, not a full
 framework's layer/ranged-call geometry. Only real single-caller training transfers
 fit coefficients: API/control/queue time is not charged twice. Reports separate
@@ -96,7 +113,8 @@ concurrency levels. API timings include trace output to `/dev/null`, excluding P
 
 `cold` flushes the caller source before each transfer/put, outside the timer
 (x86 only); get reads the just-written store. `reuse` repeats buffers and caps
-training at 8 MiB; larger validation working sets are flagged. Neither guarantees
+default training at 8 MiB. Explicit training lists instead use `--max-mib`;
+larger validation working sets are flagged. Neither guarantees
 cache hits or infers cache state. A reused-source profile can underestimate store
 reads, so judge the **API** validation report as well as the transfer fit.
 

@@ -27,7 +27,9 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -99,22 +101,29 @@ std::vector<int64_t> Concurrent(size_t count, Fn run) {
 }
 
 void Measure(const std::string& phase, bool cold, int samples, const std::string& profile,
-             size_t concurrency, size_t max_bytes) {
+             size_t concurrency, size_t max_bytes, std::vector<size_t> blocks,
+             std::vector<size_t> batches) {
   const bool training = phase == "train", sim = !profile.empty();
-  const std::vector<size_t> blocks =
-      training ? std::vector<size_t>{512, 2048, 4096, 65536, 262144, 1048576, 4194304}
-               : std::vector<size_t>{1024, 8192, 32768, 131072, 524288, 2097152, 8388608};
-  const std::vector<size_t> batches =
-      training ? std::vector<size_t>{1, 8, 32, 64, 128} : std::vector<size_t>{1, 4, 16, 128};
-  if (training && !cold) max_bytes = std::min(max_bytes, size_t{8} << 20);
+  const bool custom = !blocks.empty() || !batches.empty();
+  if (blocks.empty())
+    blocks = training ? std::vector<size_t>{512, 2048, 4096, 65536, 262144, 1048576, 4194304}
+                      : std::vector<size_t>{1024, 8192, 32768, 131072, 524288, 2097152, 8388608};
+  if (batches.empty())
+    batches =
+        training ? std::vector<size_t>{1, 8, 32, 64, 128} : std::vector<size_t>{1, 4, 16, 128};
+  if (training && !cold && !custom) max_bytes = std::min(max_bytes, size_t{8} << 20);
+  size_t cases = 0;
   std::cout << "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns\n";
   for (size_t block : blocks) {
     for (size_t count : batches) {
+      // Check the aggregate cap before multiplying user-supplied dimensions.
+      if (block > max_bytes / concurrency / count) continue;
       const size_t bytes = block * count, total = bytes * concurrency;
-      if (total > max_bytes) continue;
       // A sparse concurrent sweep keeps calibration affordable; never used for fitting.
-      if (concurrency > 1 && ((block != 8192 && block != 524288 && block != 2097152) || count == 4))
+      if (!custom && concurrency > 1 &&
+          ((block != 8192 && block != 524288 && block != 2097152) || count == 4))
         continue;
+      ++cases;
       auto src = Allocate(total, 0x5a), dst = Allocate(total, 0);
       std::unique_ptr<TransferEngine> engine;
       std::unique_ptr<IUMBPClient> client;
@@ -150,7 +159,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
           char* source = src.get() + index * block;
           char* target = dst.get() + index * block;
           // Detect accidental key/caller aliasing in the real-payload check.
-          std::memcpy(source, &index, sizeof(index));
+          std::memcpy(source, &index, std::min(block, sizeof(index)));
           request.keys.push_back(std::to_string(index));
           request.srcs.push_back(reinterpret_cast<uintptr_t>(source));
           request.dsts.push_back(reinterpret_cast<uintptr_t>(target));
@@ -205,14 +214,27 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
       }
     }
   }
+  if (cases == 0) throw std::invalid_argument("no workload fits --max-mib for this concurrency");
 }
 
-int Positive(const char* text) {
+size_t Positive(const std::string& text) {
   size_t parsed = 0;
-  const int value = std::stoi(text, &parsed);
-  if (value <= 0 || parsed != std::strlen(text))
+  const auto value = std::stoull(text, &parsed);
+  if (text.front() < '0' || text.front() > '9' || value == 0 || parsed != text.size() ||
+      value > std::numeric_limits<size_t>::max())
     throw std::invalid_argument("expected a positive integer");
-  return value;
+  return static_cast<size_t>(value);
+}
+
+std::vector<size_t> Sizes(const std::string& text) {
+  if (text.empty() || text.back() == ',') throw std::invalid_argument("empty size list entry");
+  std::istringstream input(text);
+  std::string item;
+  std::vector<size_t> out;
+  while (std::getline(input, item, ',')) out.push_back(Positive(item));
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
 }
 }  // namespace
 
@@ -224,13 +246,16 @@ int main(int argc, char** argv) {
         (std::string(argv[2]) != "cold" && std::string(argv[2]) != "reuse"))
       throw std::invalid_argument(
           "usage: umbp_sim_probe train|engine|api cold|reuse samples [profile] "
-          "[--concurrency 1|2|4] [--max-mib 256]");
+          "[--concurrency 1|2|4] [--max-mib 256] [--block-bytes B,...] [--batches N,...]");
     std::string profile;
-    int concurrency = 1, max_mib = 256;
+    size_t concurrency = 1, max_mib = 256;
+    std::vector<size_t> blocks, batches;
     for (int i = 4; i < argc; ++i) {
       const std::string arg = argv[i];
       if ((arg == "--concurrency" || arg == "--max-mib") && i + 1 < argc) {
         (arg == "--concurrency" ? concurrency : max_mib) = Positive(argv[++i]);
+      } else if ((arg == "--block-bytes" || arg == "--batches") && i + 1 < argc) {
+        (arg == "--block-bytes" ? blocks : batches) = Sizes(argv[++i]);
       } else if (profile.empty() && arg.rfind("--", 0) != 0) {
         profile = arg;
       } else {
@@ -241,8 +266,12 @@ int main(int argc, char** argv) {
         (std::string(argv[1]) == "train" && (!profile.empty() || concurrency != 1)))
       throw std::invalid_argument(
           "training requires real single-caller transfers; concurrency is 1/2/4");
-    Measure(argv[1], std::string(argv[2]) == "cold", Positive(argv[3]), profile, concurrency,
-            static_cast<size_t>(max_mib) << 20);
+    const auto samples = Positive(argv[3]);
+    if (samples > std::numeric_limits<int>::max() ||
+        max_mib > std::numeric_limits<size_t>::max() / (size_t{2} << 20))
+      throw std::invalid_argument("samples or --max-mib is too large");
+    Measure(argv[1], std::string(argv[2]) == "cold", static_cast<int>(samples), profile,
+            concurrency, max_mib << 20, std::move(blocks), std::move(batches));
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

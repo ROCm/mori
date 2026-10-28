@@ -141,6 +141,19 @@ def main():
         default=256,
         help="maximum aggregate payload MiB per case, across all callers",
     )
+    for phase in ("train", "validation"):
+        parser.add_argument(
+            f"--{phase}-block-bytes",
+            type=int,
+            nargs="+",
+            help=f"{phase} block sizes in bytes; replaces the default list",
+        )
+        parser.add_argument(
+            f"--{phase}-batches",
+            type=int,
+            nargs="+",
+            help=f"{phase} batch sizes; replaces the default list",
+        )
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--rounds", type=int, default=3)
     args = parser.parse_args()
@@ -162,6 +175,18 @@ def main():
     if args.max_mib < 1 or 1 not in args.concurrency:
         parser.error("need positive --max-mib and --concurrency including 1")
     concurrency = sorted(set(args.concurrency))
+    workloads = {}
+    for phase in ("train", "validation"):
+        workloads[phase] = {
+            "block-bytes": getattr(args, f"{phase}_block_bytes"),
+            "batches": getattr(args, f"{phase}_batches"),
+        }
+        if any(
+            values is not None and min(values) <= 0
+            for values in workloads[phase].values()
+        ):
+            parser.error("block and batch sizes must be positive integers")
+    training_shapes = set()
     probe = args.probe.resolve(strict=True)
     env = dict(
         os.environ, MORI_UMBP_LOG_LEVEL="warn", UMBP_HBM_GATHER_PREWARM_STREAMS="0"
@@ -187,6 +212,11 @@ def main():
             "--max-mib",
             str(args.max_mib),
         ]
+        for option, values in workloads[
+            "train" if phase == "train" else "validation"
+        ].items():
+            if values is not None:
+                command.extend([f"--{option}", ",".join(map(str, values))])
         if profile:
             command.append(str(profile))
         result = subprocess.run(
@@ -217,6 +247,13 @@ def main():
                 <= 0
             ):
                 raise ValueError("probe returned invalid measurements")
+            shape = (row["block_bytes"], row["batch"])
+            if phase == "train":
+                training_shapes.add(shape)
+            elif shape in training_shapes:
+                raise ValueError(
+                    f"training and validation overlap at block_bytes,batch={shape}"
+                )
             records.append(dict(row, phase=phase, mode=mode, round=round_id, threads=p))
 
     for r in range(args.rounds):
@@ -262,6 +299,7 @@ def main():
             "threads": threads,
             "concurrency": concurrency,
             "max_mib": args.max_mib,
+            "workloads": workloads,
             "cache": args.cache,
             "samples": args.samples,
             "rounds": args.rounds,

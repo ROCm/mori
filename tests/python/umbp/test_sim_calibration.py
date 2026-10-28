@@ -22,7 +22,11 @@
 """Check calibration math without a UMBP build or performance assertions in CI."""
 
 import importlib.util
+import itertools
+import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,3 +140,59 @@ def test_report_separates_concurrency():
     assert [row["concurrency"] for row in reports] == [1, 4]
     assert [row["error_pct"] for row in reports] == [0, 50]
     assert [row["within_tolerance"] for row in reports] == [True, False]
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_custom_grids_reach_probe_and_keep_validation_independent(
+    tmp_path, monkeypatch, overlap
+):
+    probe = tmp_path / "probe"
+    probe.touch()
+    output = tmp_path / "output"
+    train = [4096, 65536, 1048576]
+    validation = [4096] if overlap else [8192, 131072]
+    argv = ["calibrate", "--probe", str(probe), "--output", str(output)]
+    argv += "--cpus 0 --threads 1 --concurrency 1 --rounds 1".split()
+    argv += ["--train-block-bytes", *map(str, train), "--train-batches", "1", "8", "32"]
+    argv += [
+        "--validation-block-bytes",
+        *map(str, validation),
+        "--validation-batches",
+        "1",
+        "4",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(calibrate.os, "sched_getaffinity", lambda _: {0})
+    phases = set()
+    native_run = calibrate.subprocess.run
+
+    def run(command, **kwargs):
+        if str(probe) not in command:
+            return native_run(command, **kwargs)
+        phase = command[command.index(str(probe)) + 1]
+        phases.add(phase)
+        blocks = train if phase == "train" else validation
+        batches = [1, 8, 32] if phase == "train" else [1, 4]
+        assert command[command.index("--block-bytes") + 1] == ",".join(map(str, blocks))
+        assert command[command.index("--batches") + 1] == ",".join(map(str, batches))
+        csv = (
+            "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns\n"
+        )
+        for block, batch in itertools.product(blocks, batches):
+            for api in ("put", "get") if phase == "api" else ("transfer",):
+                csv += f"{block},{batch},1,1,{api},0,{int(1000 + block * batch / 40 + batch * 50)}\n"
+        return SimpleNamespace(stdout=csv)
+
+    monkeypatch.setattr(calibrate.subprocess, "run", run)
+    if overlap:
+        with pytest.raises(ValueError, match="training and validation overlap"):
+            calibrate.main()
+        assert not (output / "profile.json").exists()
+        assert not (output / "report.json").exists()
+    else:
+        calibrate.main()
+        assert phases == {"train", "engine", "api"}
+        report = json.loads((output / "report.json").read_text())
+        assert report["workloads"]["validation"]["block-bytes"] == validation
+        assert {r["block_bytes"] for r in report["comparisons"]} == set(validation)
+        assert (output / "profile.json").exists()
