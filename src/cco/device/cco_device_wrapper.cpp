@@ -186,6 +186,42 @@ CCO_DEF_SDMA_XFER(get, block_ns, ccoCoopBlock, false)
 
 #undef CCO_DEF_SDMA_XFER
 
+// 2D put/get: same tags; dP/sP are row pitches in bytes, w (bytes) x h (rows)
+// the rect. They cross the FFI as int32 (the scalar types the bindings declare).
+#define CCO_DEF_SDMA_XFER2D(OP, TAG, COOP, SIG)                                                 \
+  CCO_DEV int cco_sdma_##OP##2d__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO, int dP, \
+                                       uint64_t sW, uint64_t sO, int sP, int w, int h, int qid, \
+                                       int flags) {                                             \
+    Sdma sdma{*AsDevComm(dc)};                                                                  \
+    const uint32_t dPitch = static_cast<uint32_t>(dP), sPitch = static_cast<uint32_t>(sP);      \
+    const uint32_t width = static_cast<uint32_t>(w), height = static_cast<uint32_t>(h);         \
+    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                              \
+      sdma.OP##2d < COOP, SIG, false,                                                           \
+          ccoSdmaOptFlagsAggregate >                                                            \
+              (peer, AsWindow(dW), dO, dPitch, AsWindow(sW), sO, sPitch, width, height, qid);   \
+    } else {                                                                                    \
+      sdma.OP##2d < COOP, SIG, false,                                                           \
+          ccoSdmaOptFlagsDefault >                                                              \
+              (peer, AsWindow(dW), dO, dPitch, AsWindow(sW), sO, sPitch, width, height, qid);   \
+    }                                                                                           \
+    return 0;                                                                                   \
+  }
+
+CCO_DEF_SDMA_XFER2D(put, thread, ccoCoopThread, true)
+CCO_DEF_SDMA_XFER2D(put, warp, ccoCoopWarp, true)
+CCO_DEF_SDMA_XFER2D(put, block, ccoCoopBlock, true)
+CCO_DEF_SDMA_XFER2D(put, thread_ns, ccoCoopThread, false)
+CCO_DEF_SDMA_XFER2D(put, warp_ns, ccoCoopWarp, false)
+CCO_DEF_SDMA_XFER2D(put, block_ns, ccoCoopBlock, false)
+CCO_DEF_SDMA_XFER2D(get, thread, ccoCoopThread, true)
+CCO_DEF_SDMA_XFER2D(get, warp, ccoCoopWarp, true)
+CCO_DEF_SDMA_XFER2D(get, block, ccoCoopBlock, true)
+CCO_DEF_SDMA_XFER2D(get, thread_ns, ccoCoopThread, false)
+CCO_DEF_SDMA_XFER2D(get, warp_ns, ccoCoopWarp, false)
+CCO_DEF_SDMA_XFER2D(get, block_ns, ccoCoopBlock, false)
+
+#undef CCO_DEF_SDMA_XFER2D
+
 // ── SDMA quiet: cco_sdma_quiet__<coop> (wait for outstanding ops to peer) ──
 #define CCO_DEF_SDMA_QUIET(TAG, COOP)                        \
   CCO_DEV int cco_sdma_quiet__##TAG(uint64_t dc, int peer) { \
