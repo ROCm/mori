@@ -251,23 +251,23 @@ granule (a multiple of `world_size` only) has to pad to this one *before* it
 shards, or the two disagree on which rows each rank holds.
 
 **Measured**, DeepSeek-V4.1-Flash `wo_b` (`[M, 5120]` K=2048, mxfp8) on 4x
-MI355X, `bench_gemm_ar.py --collective rs --sdma-queues 1`, graph replay, max
-over ranks, median of 3 interleaved rounds on an idle box (spread <= 2.9%);
-`split-rccl` is the GEMM followed by `reduce_scatter_tensor`, i.e. what a
-serving stack runs today:
+MI355X (ROCm 7.2, FlyDSL 0.4.0), `bench_gemm_ar.py --collective rs
+--sdma-queues 1`, graph replay, max over ranks, median of 3 interleaved rounds on
+an idle box (spread <= 4.7% at M=2048, <= 2.7% above); `split-rccl` is the GEMM
+followed by `reduce_scatter_tensor`, i.e. what a serving stack runs today:
 
 | M | `gemm-only` | `split-rccl` | `split-sdma` | `fused-sdma` | vs rccl | vs split-sdma |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2048 | 35.2 | 149.5 | 143.1 | 146.6 (c2) | -1.9% | +2.4% |
-| 4096 | 63.3 | 276.8 | 258.6 | **246.1** (c4) | -11.1% | -4.8% |
-| 8192 | 105.5 | 512.3 | 467.8 | **439.3** (c8) | -14.2% | -6.1% |
-| 16384 | 174.2 | 1005.9 | 892.8 | **793.0** (c8) | **-21.2%** | -11.2% |
+| 2048 | 39.6 | 161.7 | 152.8 | 156.6 (c2) | -3.2% | +2.5% |
+| 4096 | 66.4 | 295.4 | 269.9 | **262.9** (c4) | -11.0% | -2.6% |
+| 8192 | 104.4 | 540.5 | 484.2 | **460.2** (c8) | -14.9% | -5.0% |
+| 16384 | 174.9 | 1065.3 | 917.3 | **834.5** (c8) | **-21.7%** | -9.0% |
 
-Two separate effects. The copy engines alone beat RCCL by 4-11% (`split-sdma`
-against `split-rccl`); fusing then hides about 100 of the 174us of GEMM at
+Two separate effects. The copy engines alone beat RCCL by 5-14% (`split-sdma`
+against `split-rccl`); fusing then hides about 83 of the 175us of GEMM at
 M=16384. At M=2048 there are only two chunks per destination and fusing loses
 to the split path, so a caller should keep the split form there. The link is
-still the limit: the unfused transfer is ~720us at M=16384, about 175 GB/s per
+still the limit: the unfused transfer is ~740us at M=16384, about 170 GB/s per
 rank over TP4's three links.
 
 `split-rccl` validates at relL2 3.15e-3 against everything else's 2.37e-3, and
