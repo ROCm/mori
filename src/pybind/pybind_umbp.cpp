@@ -258,7 +258,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("capacity_bytes", &UMBPHbmConfig::capacity_bytes);
 
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
-      .def(py::init<>())
+      // The UMBP_DISTRIBUTED_* variables over the defaults, as the standalone
+      // server configures itself: a caller that builds its config here (sglang's
+      // UMBPStore) gets them, and a field it sets afterwards wins over its
+      // variable.  Raises ValueError on a malformed one.
+      .def(py::init(&UMBPDistributedConfig::FromEnvironment))
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)

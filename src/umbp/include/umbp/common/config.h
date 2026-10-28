@@ -481,11 +481,11 @@ struct UMBPDistributedConfig {
 
   // Each UMBP_DISTRIBUTED_* variable that is set and not blank, over its field;
   // the rest stay as they are.  The standalone server configures itself this
-  // way, and an in-process caller can start from FromEnvironment() and set what
-  // it was given explicitly on top, so the same variables configure both and an
-  // explicit setting still wins.  Identity and ports (UMBP_MASTER_ADDRESS,
-  // UMBP_NODE_*, UMBP_IO_ENGINE_*, UMBP_PEER_SERVICE_PORT) are left to the
-  // caller, which knows how its processes share them, and so is
+  // way, and Python's UMBPDistributedConfig() is FromEnvironment(), so an
+  // in-process caller that builds its config there (sglang's UMBPStore) gets
+  // the same variables, and what it sets afterwards wins.  Identity and ports
+  // (UMBP_MASTER_ADDRESS, UMBP_NODE_*, UMBP_IO_ENGINE_*, UMBP_PEER_SERVICE_PORT)
+  // are left to the caller, which knows how its processes share them, and so is
   // UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA, which only a client that many GPUs
   // share wants.  False, with the reason in *error, on a malformed value.
   bool ApplyEnvironment(std::string* error);
