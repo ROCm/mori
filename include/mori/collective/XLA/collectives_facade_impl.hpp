@@ -186,7 +186,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
           <<<blocks, kThreads, 0, stream>>>(myPe_, state_.heapWin,
                                   reinterpret_cast<const ComputeT*>(input),
                                   reinterpret_cast<ComputeT*>(output), chunkElemsC,
-                                  state_.groupCounters, barrierCtr_);
+                                  state_.groupCtr, barrierCtr_);
       return hipGetLastError();
     });
   } else {
@@ -194,7 +194,7 @@ hipError_t CollectivesFacade::reduceScatterImpl(const void* input_v, void* outpu
     // grid needs no rounding to a multiple of S.
     ReduceScatterPushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<ComputeT*>(output),
-        state_.groupCounters, chunkElemsC, devComm_, state_.heapWin,
+        state_.groupCtr, chunkElemsC, devComm_, state_.heapWin,
         reinterpret_cast<const ComputeT*>(input),
         reinterpret_cast<ComputeT*>(state_.staging), barrierCtr_, arrived_);
   }
@@ -282,7 +282,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
                                             reinterpret_cast<const ComputeT*>(input),
                                             reinterpret_cast<ComputeT*>(output),
                                             strideElemsC, myElemsC,
-                                            state_.groupCounters, barrierCtr_);
+                                            state_.groupCtr, barrierCtr_);
       return hipGetLastError();
     });
   }
@@ -302,7 +302,7 @@ hipError_t CollectivesFacade::allReduceImpl(const void* input_v, void* output_v,
   // derives each intra-heap offset from the raw pointer via ccoGetLocalPtr.
   AllReducePushKernel<NumVecs, ReduceOp><<<blocks, kThreads, 0, stream>>>(
         myPe_, nPes_, logS, reinterpret_cast<const ComputeT*>(input),
-        reinterpret_cast<ComputeT*>(output), state_.groupCounters, strideElemsC, totalElemsC,
+        reinterpret_cast<ComputeT*>(output), state_.groupCtr, strideElemsC, totalElemsC,
         devComm_, reinterpret_cast<ComputeT*>(state_.staging), state_.heapWin,
         barrierCtr_, arrived_);
   return hipGetLastError();
@@ -339,7 +339,7 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
     // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllGatherPullKernelN<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
-          myPe_, nPes_, state_.heapWin, input, output, chunkBytes, state_.groupCounters,
+          myPe_, nPes_, state_.heapWin, input, output, chunkBytes, state_.groupCtr,
           barrierCtr_);
       return hipGetLastError();
     });
@@ -377,7 +377,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
       AllToAllPullKernelN<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
-          myPe_, nPes_, state_.heapWin, state_.pinnedPairs, chunkBytes, state_.groupCounters,
+          myPe_, nPes_, state_.heapWin, state_.pinnedPairs, chunkBytes, state_.groupCtr,
           barrierCtr_);
       return hipGetLastError();
     });
@@ -443,7 +443,7 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
                   : PullCopyBlocks(numBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
     CollectivePermutePullKernel<kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
         npes, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteReady,
-        state_.permuteSendReady, state_.permuteReadDone, state_.permuteCnt, state_.groupCounters);
+        state_.permuteSendReady, state_.permuteReadDone, state_.permuteCnt, state_.groupCtr);
     return hipGetLastError();
   }
   constexpr int kThreads = 64;
