@@ -1283,7 +1283,8 @@ static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12) == 13 * sizeof(uint32_
 
 // POLL_REGMEM and COPY_BROADCAST use the gfx9 layouts (validated on gfx950).
 // gfx12.5 lays both out differently, so ccoSdma::putBroadcast / postWaitMem /
-// postWaitSignal refuse to compile there rather than post a misread packet.
+// postWaitSignal trap there (device side, so multi-arch builds still compile)
+// rather than post a misread packet.
 //
 // POLL_REGMEM parks the queue until (*addr & mask) <func> value holds.
 typedef struct CCO_SDMA_PKT_POLL_REGMEM_TAG {
@@ -2643,6 +2644,13 @@ struct ccoSdma {
   //   localSignal:  one trailing ATOMIC into our own signalBuf[myLsaRank*n+q].
   //   remoteSignal: one ATOMIC into each destination peer's pool at the same
   //                 index, skipping ourselves and a repeated peer.
+  // A signal slot counts per (source rank, queueId), not per physical queue. The
+  // broadcast is posted on queue (peer, queueId) but its remote signal bumps
+  // peer2's [myLsaRank, queueId] slot, which put() only ever advances from queue
+  // (peer2, queueId). A waiter that reads the count as "the Nth packet on (peer2, q) has
+  // landed" can therefore be released by a broadcast's signal while an earlier put
+  // on (peer2, q) is still in flight; only the cumulative total is reliable. Use a
+  // distinct queueId for broadcasts if you wait on per-queue completion.
   // Measured slower than two put()s when either destination is remote (one
   // engine cannot overlap the two writes); it only wins when both are local.
   template <typename Coop = ccoCoopThread, bool localSignal = false, bool remoteSignal = false,

@@ -31,8 +31,10 @@
 //      raises the flag, and must all arrive afterwards. Default and Aggregate.
 //   C  postWaitSignal: each rank's engine relays what it received from prev on to
 //      next once prev's signal lands, with no CU in the forwarding path.
-//   E  thread scope with every lane of a wave posting to one queue: must not
-//      deadlock (the lanes are serialized).
+//   E  thread scope with every lane of a wave posting a wait to one queue: must
+//      not deadlock (the lanes are serialized).
+//   F  same, with putBroadcast: every lane broadcasts its own slice to {next, self}
+//      on one queue; both destinations must hold every slice.
 //   D  broadcast ring wrap: enough 3-unit broadcasts that one is placed on the
 //      last unit of the ring, which must be padded rather than split.
 
@@ -171,6 +173,25 @@ __global__ void MultiLaneWaitKernel(ccoWindowDevice* sendWin, ccoWindowDevice* r
              reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, qid);
     sdma.quiet(next);
   }
+}
+
+/* ---------------------------------- part F ---------------------------------- */
+
+constexpr int F_LANES = 32;
+constexpr size_t F_SLICE = 128;  // bytes per lane
+
+// Every lane broadcasts its own slice on the same queue. putBroadcast reserves a
+// slack unit as well, so this pins the serialization for the 3-unit path.
+__global__ void MultiLaneBroadcastKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                                         ccoWindowDevice* recv2Win, int qid, ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoSdma sdma{devComm};
+  const int me = devComm.lsaRank, next = (me + 1) % devComm.lsaSize;
+  const size_t off = static_cast<size_t>(threadIdx.x) * F_SLICE;
+  sdma.putBroadcast(next, reinterpret_cast<ccoWindow_t>(recvWin), off, me,
+                    reinterpret_cast<ccoWindow_t>(recv2Win), off,
+                    reinterpret_cast<ccoWindow_t>(sendWin), off, F_SLICE, qid);
+  if (threadIdx.x == 0) sdma.quiet(next);
 }
 
 /* ---------------------------------- driver ---------------------------------- */
@@ -398,14 +419,33 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     ccoBarrierAll(comm);
     const bool okE = matches(recvBuf, BUF_BYTES, prev, "multi-lane wait");
 
-    ok = okA && okB && okC && okD && okE;
+    /* ---- F ---- */
+    resetRecv();
+    ccoBarrierAll(comm);
+    MultiLaneBroadcastKernel<<<1, F_LANES, 0, stream>>>(sendWin, recvWin, recv2Win, 4, devComm);
+    HIP_CHECK(hipStreamSynchronize(stream));
+    ccoBarrierAll(comm);
+    constexpr size_t kFBytes = F_LANES * F_SLICE;
+    bool okF = matches(recvBuf, kFBytes, prev, "multi-lane broadcast (peer)") &&
+               matches(recv2Buf, kFBytes, me, "multi-lane broadcast (self)");
+    {
+      // nothing may land past the last slice
+      std::vector<uint32_t> tail(16);
+      for (void* buf : {recvBuf, recv2Buf}) {
+        HIP_CHECK(
+            hipMemcpy(tail.data(), static_cast<char*>(buf) + kFBytes, 64, hipMemcpyDeviceToHost));
+        for (uint32_t w : tail) okF = okF && w == 0xffffffffu;
+      }
+    }
+
+    ok = okA && okB && okC && okD && okE && okF;
     HIP_CHECK(hipStreamDestroy(stream));
     printf(
         "[rank %d] A(broadcast)=%s(%d/%d) B(waitMem)=%s(%d/%d) C(relay)=%s "
-        "D(wrap, %u straddles)=%s E(multi-lane)=%s %s\n",
+        "D(wrap, %u straddles)=%s E(multi-lane wait)=%s F(multi-lane bcast)=%s %s\n",
         rank, okA ? "PASS" : "FAIL", aPass, aTotal, okB ? "PASS" : "FAIL", bPass, bTotal,
         okC ? "PASS" : "FAIL", straddles, okD ? "PASS" : "FAIL", okE ? "PASS" : "FAIL",
-        ok ? "PASSED" : "FAILED");
+        okF ? "PASS" : "FAIL", ok ? "PASSED" : "FAILED");
     fflush(stdout);
   }
 

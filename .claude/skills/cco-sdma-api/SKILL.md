@@ -374,6 +374,14 @@ One COPY packet, two destinations; `peer`/`dstWin` is the first and selects the
 queue, `peer2` may be your own rank. `remoteSignal` bumps each distinct destination
 peer other than yourself once; `localSignal` is one atomic for the call.
 
+A signal slot counts per (source rank, `queueId`), not per physical queue. The
+broadcast is posted on queue `(peer, q)` but its remote signal bumps `peer2`'s
+`[you, q]` slot, which `put` only advances from queue `(peer2, q)`. A waiter that reads
+the count as "the Nth packet on `(peer2, q)` has landed" can be released by a
+broadcast's signal while an earlier `put` on `(peer2, q)` is still in flight; only
+the cumulative total is reliable. If you wait on per-queue completion, give
+broadcasts their own `queueId`.
+
 **Do not reach for it to save time.** One engine does not overlap the two writes:
 broadcast to two remote GPUs ran at 38 GB/s against 61 GB/s for two `put`s on one
 queue (122 GB/s for two `put`s on two queues), and local + remote was the same 43 vs
