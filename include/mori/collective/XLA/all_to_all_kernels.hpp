@@ -119,7 +119,7 @@ template <int NPES, int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 AllToAllPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
                     const AddressPair* __restrict__ pairs, size_t chunkBytes,
-                    uint32_t* __restrict__ groupCounters, uint64_t* __restrict__ arrived) {
+                    uint32_t* __restrict__ groupCtr, uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
   // pairs lives in host memory: read it once per block, not once per copy unit.
   __shared__ uint8_t* dsts[NPES];
@@ -141,7 +141,7 @@ AllToAllPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
   // A block counts in only once all its waves are done reading peer send slots.
   __syncthreads();
   if (threadIdx.x < warpSize) {
-    if (LastBlockOut(groupCounters)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
+    if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
   }
 }
 } // namespace collective

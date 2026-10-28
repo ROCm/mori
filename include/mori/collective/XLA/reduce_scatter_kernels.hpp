@@ -121,7 +121,7 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //   input         : raw symmetric-heap pointer, N = npes*chunkElems elements
 //   staging       : raw symmetric-heap pointer, npes slots of chunkElems elements
 //   output        : raw symmetric-heap pointer, chunkElems elements
-//   groupCounters : plain device buffer (kGroupCounterCount uint32), local-only.
+//   groupCtr : plain device buffer (kGroupCtrTotal uint32), local-only.
 //                   [kArrivalIdx] elects the last block (atomicInc wraps it back
 //                   to 0) to advance the push generation (AdvancePushGen)
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
@@ -154,7 +154,7 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //
 // input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
-// groupCounters is a plain hipMalloc'd buffer (never peer-written).
+// groupCtr is a plain hipMalloc'd buffer (never peer-written).
 // ---------------------------------------------------------------------------
 
 // Phases 2 + 3 for ONE slice: wait until slice `slice` has landed from every
@@ -349,7 +349,7 @@ __device__ __forceinline__ void PullReduceShard(int myPe, uint32_t stride4G,
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
-                                    uint32_t* __restrict__ groupCounters, size_t chunkElems,
+                                    uint32_t* __restrict__ groupCtr, size_t chunkElems,
                                     cco::ccoDevComm devComm, cco::ccoWindow_t heapWin,
                                     const T* __restrict__ input, T* __restrict__ staging,
                                     uint64_t* __restrict__ barrierCtr,
@@ -414,7 +414,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // this launch can see the new value. atomicInc wraps the arrival counter back
   // to 0 on the last block, so it needs no reset of its own.
   if (threadIdx.x == 0 &&
-      atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
+      atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1) {
     AdvancePushGen(barrierCtr, myPe, pushGen);
   }
 }
@@ -441,7 +441,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 //   * exit: the last block out waits until every peer has finished reading MY
 //     input, so the kernel completing means the caller may overwrite it.
 //
-//   groupCounters : plain device buffer, zeroed once by the host. [0] elects the
+//   groupCtr : plain device buffer, zeroed once by the host. [0] elects the
 //                   last block; atomicInc wraps it back to 0, so no reset.
 //   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (see GenBarrier).
@@ -450,7 +450,7 @@ template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Ty
 __global__ void __launch_bounds__(256, 1)
 ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
                         const T* __restrict__ input, T* __restrict__ output,
-                        size_t chunkElems, uint32_t* __restrict__ groupCounters,
+                        size_t chunkElems, uint32_t* __restrict__ groupCtr,
                         uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
   // In block 0's first wave every lane loads this before lane myPe posts.
@@ -472,7 +472,7 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
   if (threadIdx.x < warpSize) {
     uint32_t last = 0;
     if (threadIdx.x == 0) {
-      last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
+      last = atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
     }
     if (BroadcastLane0(last)) {
       GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
