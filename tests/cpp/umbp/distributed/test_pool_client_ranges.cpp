@@ -272,10 +272,8 @@ class PoolClientRangesTest : public ::testing::Test {
     // test hands it a size rather than a buffer.
     cfg.dram.buffer_sizes = {dram_capacity};
     // Separate GET and PUT arenas so remote ranged get/put run concurrently.
-    cfg.ranged_get_scratch_buffer = get_scratch.data();
-    cfg.ranged_get_scratch_size = get_scratch.size();
-    cfg.ranged_put_scratch_buffer = put_scratch.data();
-    cfg.ranged_put_scratch_size = put_scratch.size();
+    cfg.ranged_get_scratch = {{get_scratch.data(), get_scratch.size()}};
+    cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
@@ -304,9 +302,9 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     cfg.dram.buffer_sizes = {kCallerCapacity};
     for (size_t i = 0; i < nodes.size(); ++i) {
-      cfg.ranged_get_scratch_groups.push_back(
+      cfg.ranged_get_scratch.push_back(
           {get_groups[i].data(), get_groups[i].size(), nodes[i], shards});
-      cfg.ranged_put_scratch_groups.push_back(
+      cfg.ranged_put_scratch.push_back(
           {put_groups[i].data(), put_groups[i].size(), nodes[i], shards});
     }
     cfg.cache_remote_fetches = false;
@@ -413,10 +411,8 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     tiered_get_scratch_.resize(kScratchSize);
     tiered_put_scratch_.resize(kScratchSize);
-    cfg.ranged_get_scratch_buffer = tiered_get_scratch_.data();
-    cfg.ranged_get_scratch_size = tiered_get_scratch_.size();
-    cfg.ranged_put_scratch_buffer = tiered_put_scratch_.data();
-    cfg.ranged_put_scratch_size = tiered_put_scratch_.size();
+    cfg.ranged_get_scratch = {{tiered_get_scratch_.data(), tiered_get_scratch_.size()}};
+    cfg.ranged_put_scratch = {{tiered_put_scratch_.data(), tiered_put_scratch_.size()}};
     cfg.cache_remote_fetches = false;
 
     BackendInstanceConfig cold;
