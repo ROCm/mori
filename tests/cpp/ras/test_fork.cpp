@@ -86,11 +86,12 @@ TEST(RasFork, AChildStartsAFreshRuntime) {
               });
               CHILD_CHECK(rc == 0);
 
-              // The parent's runtime is untouched by the fork.
+              // The parent's runtime is untouched by the fork: same runtime, every fd still open,
+              // and the listener still accepts.
               CHILD_CHECK(RasRuntime::Get() == parent);
               CHILD_CHECK(parent->Endpoint().uuid == before.uuid);
+              for (int fd : rasFds) CHILD_CHECK(IsOpen(fd));
               CHILD_CHECK(ras_test::CanConnect("127.0.0.1", before.port));
-              CHILD_CHECK(fdreg::Count() == rasFds.size());
               return 0;
             }),
             0);
