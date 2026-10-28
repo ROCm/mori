@@ -34,10 +34,14 @@ namespace io {
 // Forward-declared here to avoid pulling internal backend headers into pybind.
 void* FabricMalloc(size_t size, int device);
 void FabricFree(void* ptr);
+namespace sim {
+bool IsEnabled();  // defined in src/io/sim/backend_impl.cpp
+}  // namespace sim
 }  // namespace io
 
 void RegisterMoriIo(pybind11::module_& m) {
   m.def("set_log_level", &mori::io::SetLogLevel);
+  m.def("io_sim_enabled", &mori::io::sim::IsEnabled);
 
   py::enum_<mori::io::BackendType>(m, "BackendType")
       .value("Unknown", mori::io::BackendType::Unknown)
@@ -116,6 +120,9 @@ void RegisterMoriIo(pybind11::module_& m) {
       .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
       .def_readwrite("num_streams", &mori::io::XgmiBackendConfig::numStreams)
       .def_readwrite("num_events", &mori::io::XgmiBackendConfig::numEvents);
+
+  py::class_<mori::io::TcpBackendConfig, mori::io::BackendConfig>(m, "TcpBackendConfig")
+      .def(py::init<>());
 
   py::class_<mori::io::FabricBackendConfig, mori::io::BackendConfig>(m, "FabricBackendConfig")
       .def(py::init<int, int>(), py::arg("num_streams") = 64, py::arg("num_events") = 64)
