@@ -117,6 +117,11 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   };
   // Every block reads the launch generation before counting in at Phase 4; only
   // the tail owner (the last b=1 count) advances it.
+#if RS_PUSH_TIMING
+  if (detail::RsTimedBlock() && threadIdx.x == 0) {
+    detail::gRsPushTiming.t0[blockIdx.x] = wall_clock64();
+  }
+#endif
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
   auto bcastFlag = [=](uint32_t b) { return &groupCounters[kBcastFlagIdx + b]; };
 
@@ -146,6 +151,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // with it. Lane 0 enters after its stores above, in program order.
     if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
+#if RS_PUSH_TIMING
+    if (threadIdx.x == 0) detail::gRsPushTiming.t1 = wall_clock64();
+#endif
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
     // Staging is packed densely (no self hole): slot = myPe<peer?myPe:myPe-1, a
@@ -164,6 +172,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
               PeerPtr(arrived + myPe * kArrivedStride, peer, myPe, stride4G)};
         },
         pushGen);
+#if RS_PUSH_TIMING
+    if (threadIdx.x == 0) detail::gRsPushTiming.t2 = wall_clock64();
+#endif
 
     // Pre-post both broadcasts behind the scatter, each parked on its counter
     // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole
@@ -193,6 +204,10 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                              (myElems - lastOfs) * sizeof(T),
                               bcastSlot + 1, pushGen, bcastFlag(1), epoch1);
         });
+#if RS_PUSH_TIMING
+    // Like the scatter, the pre-post runs in wave 0 only.
+    if (threadIdx.x == 0) detail::gRsPushTiming.tPost = wall_clock64();
+#endif
   }
 
   // Whether this block's count released b=1, so it owes the generation bump and
@@ -213,9 +228,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // === Phase 2-3: shared per-slice front (completion wait + acquire +
     // grid-strided reduce) into MY shard slot within the full output. ===
     // input base uses the uniform stride; staging slots use my own length.
-    detail::WaitAndReduceSlice<NumVecs, ReduceOp>(arrived, pushGen, s, myPe, npes, input,
-                                                 staging, myShard, sOfs, sCnt, strideElems,
-                                                 myElems, lstride);
+    detail::WaitAndReduceSlice<NumVecs, ReduceOp, /*Timed=*/RS_PUSH_TIMING != 0>(
+        arrived, pushGen, s, myPe, npes, input, staging, myShard, sOfs, sCnt, strideElems,
+        myElems, lstride);
 
     // === Phase 4: count in for slices S-2 (b=0) and S-1 (b=1) ==================
     // b=0 covers slices [0, S-1): every block reduces slices in order, so its
@@ -232,10 +247,23 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // count releases the pre-posted copy with no further step. System scope:
       // the SDMA engine must observe the RMW.
       if (threadIdx.x == 0) {
+#if RS_PUSH_TIMING
+        // Published by the fence before the count, so the tail owner sees it.
+        if (detail::RsTimedBlock()) {
+          detail::gRsPushTiming.tCount[b][blockIdx.x] = wall_clock64();
+          __threadfence();
+        }
+#endif
         const uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         if (b == 1) {
           ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCounters[kBcastTargetIdx]));
+#if RS_PUSH_TIMING
+          if (ownsTail) {
+            detail::gRsPushTiming.tOwn = wall_clock64();
+            detail::gRsPushTiming.ownBlk = blockIdx.x;
+          }
+#endif
         }
       }
     }
@@ -253,11 +281,26 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // No acquire closes the kernel -- no thread here reads the slices peers DMA'd
   // into output, and whoever consumes them acquires at its own kernel boundary.
   if (threadIdx.x < warpSize && BroadcastLane0(static_cast<uint32_t>(ownsTail))) {
+#if RS_PUSH_TIMING
+    auto& TT = detail::gRsPushTiming;
+    WaitArrived(arrived, kBcastArrived + 1, pushGen, myPe, npes, /*skipSelf=*/true, TT.bArr[1]);
+    if (threadIdx.x == 0) TT.tBDone[1] = wall_clock64();
+    if (S > 1) {
+      WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true, TT.bArr[0]);
+      if (threadIdx.x == 0) TT.tBDone[0] = wall_clock64();
+    }
+#else
     WaitArrived(arrived, kBcastArrived + 1, pushGen, myPe, npes, /*skipSelf=*/true);
     if (S > 1) {
       WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
     }
+#endif
     if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
+#if RS_PUSH_TIMING
+    if (threadIdx.x == 0) {
+      detail::RsPushTimingReport(myPe, npes, S, shardLen(myPe) * sizeof(T), /*allReduce=*/true);
+    }
+#endif
   }
 }
 

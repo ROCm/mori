@@ -57,7 +57,8 @@
 // The last block out of launches [RS_PUSH_TIMING_LAUNCH, +RS_PUSH_TIMING_NPRINT)
 // (counted per device, every RS push launch) printf's a per-PE summary, all
 // times in us relative to block 0's entry. wall_clock64 is per-GPU, so values
-// are comparable only within one PE.
+// are comparable only within one PE. The all-reduce push kernel records the same
+// points plus its broadcast phase, and its tail owner prints the report.
 // ---------------------------------------------------------------------------
 #ifndef RS_PUSH_TIMING
 #define RS_PUSH_TIMING 0
@@ -97,6 +98,16 @@ struct RsPushTiming {
   uint64_t t3[kRsTimingBlocks][kRSPushMaxSlices];
   uint64_t t4[kRsTimingBlocks][kRSPushMaxSlices];
   uint64_t arr[kRSPushMaxSlices][kRSPushMaxPeers];
+  // All-reduce push only. tPost: block 0 after pre-posting both broadcasts.
+  // tCount[b][blk]: just before that block's count-in for broadcast b (after its
+  // system fence + __syncthreads). The tail owner (last b=1 count) records
+  // tOwn after its count, tBDone[b] once broadcast b landed from every peer,
+  // and bArr[b][peer], the first poll that saw peer's broadcast b land.
+  uint64_t tPost;
+  uint64_t tCount[2][kRsTimingBlocks];
+  uint64_t tOwn, tBDone[2];
+  uint64_t bArr[2][kRSPushMaxPeers];
+  uint32_t ownBlk;
   uint32_t launch;
 };
 
@@ -112,8 +123,22 @@ __device__ __forceinline__ float RsUs(uint64_t t, uint64_t base) {
   return static_cast<float>(static_cast<int64_t>(t - base)) / RS_PUSH_TIMING_MHZ;
 }
 
+// Earliest / latest of bArr-style per-sender stamps, skipping myPe.
+__device__ inline void RsPeerSpan(const volatile uint64_t* a, int myPe, int npes, int& pMin,
+                                  uint64_t& aMin, int& pMax, uint64_t& aMax) {
+  pMin = pMax = -1;
+  for (int p = 0; p < npes; p++) {
+    if (p == myPe) continue;
+    const uint64_t v = a[p];
+    if (pMin < 0 || v < aMin) aMin = v, pMin = p;
+    if (pMax < 0 || v > aMax) aMax = v, pMax = p;
+  }
+}
+
 // Called by thread 0 of the last block out, after every block counted in.
-__device__ inline void RsPushTimingReport(int myPe, int npes, uint32_t S, size_t chunkBytes) {
+// allReduce adds the broadcast count-in and tail lines.
+__device__ inline void RsPushTimingReport(int myPe, int npes, uint32_t S, size_t chunkBytes,
+                                          bool allReduce = false) {
   __threadfence();
   volatile RsPushTiming& T = gRsPushTiming;
   const uint32_t launch = T.launch;
@@ -152,6 +177,31 @@ __device__ inline void RsPushTimingReport(int myPe, int npes, uint32_t S, size_t
              myPe, launch, s, b, RsUs(T.t3[b][s], prev), RsUs(T.t4[b][s], T.t3[b][s]),
              RsUs(T.t3[b][s], base), RsUs(T.t4[b][s], base));
     }
+  }
+  if (!allReduce) return;
+
+  // Count-in b follows the reduce of slice S-2 (b=0) or S-1 (b=1); "fence" is the
+  // system fence + __syncthreads between that reduce and the count.
+  printf("[RS-T pe=%d L=%u] bcast prepost=%.2f (done at %.2f) us\n", myPe, launch,
+         RsUs(T.tPost, T.t2), RsUs(T.tPost, base));
+  for (uint32_t b = (S > 1 ? 0u : 1u); b < 2; b++) {
+    const uint32_t s = b == 1 ? S - 1 : S - 2;
+    for (int bl = 0; bl < nb; bl++) {
+      printf("[RS-T pe=%d L=%u] count b=%u blk%d fence=%.2f at=%.2f us\n", myPe, launch, b, bl,
+             RsUs(T.tCount[b][bl], T.t4[bl][s]), RsUs(T.tCount[b][bl], base));
+    }
+  }
+  printf("[RS-T pe=%d L=%u] tail owner=blk%u counted=%.2f us\n", myPe, launch, T.ownBlk,
+         RsUs(T.tOwn, base));
+  for (uint32_t b = (S > 1 ? 0u : 1u); b < 2; b++) {
+    int pMin, pMax;
+    uint64_t aMin = 0, aMax = 0;
+    RsPeerSpan(T.bArr[b], myPe, npes, pMin, aMin, pMax, aMax);
+    if (pMin < 0) continue;
+    printf("[RS-T pe=%d L=%u] bcast b=%u arrive first=p%d@%.2f last=p%d@%.2f done=%.2f "
+           "after-own=%.2f us\n",
+           myPe, launch, b, pMin, RsUs(aMin, base), pMax, RsUs(aMax, base),
+           RsUs(T.tBDone[b], base), RsUs(T.tBDone[b], T.tOwn));
   }
 }
 #endif  // RS_PUSH_TIMING

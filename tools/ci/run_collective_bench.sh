@@ -117,10 +117,18 @@ rs_timing_table() {
       S = num("S"); grid = num("grid"); acc("barrier", 0, num("barrier")); acc("issue", 0, num("issue"))
       next
     }
-    / arrive first=/ {
+    / s=[0-9]+ arrive first=/ {
       s = num(" s"); acc("spread", s, num("spread"))
       if (match($0, /last=p[0-9]+@-?[0-9.]+/)) acc("last", s, substr($0, RSTART + index(substr($0, RSTART), "@"), RLENGTH) + 0)
       if (match($0, /first=p[0-9]+@-?[0-9.]+/)) acc("first", s, substr($0, RSTART + index(substr($0, RSTART), "@"), RLENGTH) + 0)
+      next
+    }
+    # All-reduce push broadcast phase.
+    / bcast prepost=/ { ar = 1; acc("prepost", 0, num("prepost")); next }
+    / count b=[01] blk[1-9][0-9]* fence=/ { acc("fence", num(" b"), num("fence")); next }
+    / tail owner=/ { acc("own", 0, num("counted")); next }
+    / bcast b=[01] arrive first=/ {
+      b = num(" b"); acc("bdone", b, num("done")); acc("bafter", b, num("after-own"))
       next
     }
     / blk[0-9]+ wait=/ {
@@ -139,6 +147,11 @@ rs_timing_table() {
         printf "| %d | %s | %s | %s | %s | %s | %s | %s | %s |\n", s, cell("waitn", s), \
                cell("reducen", s), cell("wait0", s), cell("reduce0", s), cell("first", s), \
                cell("last", s), cell("spread", s), cell("done", s)
+      if (ar) {
+        printf "\nbroadcast: prepost %s | count-in fence+sync blk1+ b0 %s, b1 %s | tail owner counted at %s | b0 landed at %s (+%s after count) | b1 landed at %s (+%s after count)\n", \
+               cell("prepost", 0), cell("fence", 0), cell("fence", 1), cell("own", 0), \
+               cell("bdone", 0), cell("bafter", 0), cell("bdone", 1), cell("bafter", 1)
+      }
     }
   ' "$1"
 }
