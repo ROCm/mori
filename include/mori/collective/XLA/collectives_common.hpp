@@ -606,19 +606,11 @@ __device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, in
       AtomicStore<ESystemScope>(dst, value);
     }
   }
-  while (true) {
-    const uint64_t v = active ? AtomicLoad<ESystemScope>(&arrived[lane]) : value;
-    if (__all(v >= value)) break;
+  while (active) {
+    const uint64_t v = AtomicLoad<ESystemScope>(&arrived[lane]);
+    if (v >= value) break;
     __builtin_amdgcn_s_sleep(1);
   }
-  /*if(active) {
-    while (true) {
-      const uint64_t v =AtomicLoad<ESystemScope>(&arrived[lane]);
-      if (v >= value) break;
-      __builtin_amdgcn_s_sleep(1);
-    }
-  }*/
-  
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
 }
 
@@ -632,29 +624,21 @@ __device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, u
   const int lane = __lane_id();
   const bool active = lane < npes && !(skipSelf && lane == myPe);
   const uint64_t* addr = arrived + lane * kArrivedStride + slot;
-  while (true) {
-    const uint64_t v = active ? AtomicLoad<ESystemScope>(addr) : gen;
-    if (__all(v >= gen)) break;
+  while (active) {
+    const uint64_t v = AtomicLoad<ESystemScope>(addr);
+    if (v >= gen) break;
     __builtin_amdgcn_s_sleep(1);
   }
 }
 
 // Push-collective launch generation, derived from the gen-barrier flags like the
 // pull kernels' gen: a push launch enters with gen+1 (odd, posted by block 0)
-// and its tail stores gen+2 into my own slot (AdvancePushGen) once no block of
+// and its tail stores gen+2 into my own slot once no block of
 // the launch can still read it. My slot therefore holds gen or gen+1 while the
 // launch runs, so every block reads the same value; the launch signals gen+2.
 // Every PE runs the same collective sequence, so every PE signals the same value.
 __device__ __forceinline__ uint64_t LoadPushGen(const uint64_t* barrierCtr, int myPe) {
   return (AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL) + 2;
-}
-
-// Ends a push launch: my slot moves from pushGen-1 to pushGen. Only my own copy:
-// peers' copies keep pushGen-1 until my next entry post, and no barrier round
-// waits for a value between the two.
-__device__ __forceinline__ void AdvancePushGen(uint64_t* barrierCtr, int myPe,
-                                               uint64_t pushGen) {
-  AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
 }
 
 // Elects the last block of the grid to arrive. Called by the whole first wave

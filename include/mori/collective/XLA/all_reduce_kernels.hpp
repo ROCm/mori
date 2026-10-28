@@ -144,7 +144,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // Gate on every PE entering this launch: staging is shared with the other
     // push collectives, so a peer may finish before my previous launch is done
     // with it. Lane 0 enters after its stores above, in program order.
-    if (threadIdx.x < warpSize) GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    if (threadIdx.x < warpSize) {
+      GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    }
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -169,9 +171,8 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // until every block has counted in at Phase 4. b=0: slices [0, S-1); b=1: the last slice (the whole
     // shard at S==1, where b=0 does not exist).
     // Both broadcasts go out per peer as one reservation and one doorbell.
-    const bool hasB0 = S > 1;
     const uint32_t epoch0 = flagEpoch[0], epoch1 = flagEpoch[1];
-    SdmaPostPerPeer(devComm.sdma, npes, myPe, hasB0 ? 4 : 2,
+    SdmaPostPerPeer(devComm.sdma, npes, myPe, S > 1 ? 4 : 2,
         [=](int peer, int sub, uint32_t* q, uint64_t base) {
           const uint64_t* bcastSlot = PeerPtr(arrived + myPe * kArrivedStride + kBcastArrived,
                                               peer, myPe, stride4G);
@@ -182,7 +183,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                        sliceLen = ((myElems >> logS) / vecSize) * vecSize,
                        lastOfs = (S - 1) * sliceLen; 
           auto* peerDst = PeerPtr(reinterpret_cast<uint8_t*>(myShard), peer, myPe, stride4G);
-          if (hasB0) {
+          if (S > 1) {
             WriteGatedBroadcast(sub, q, base, myShard, peerDst,
                           lastOfs * sizeof(T), bcastSlot, pushGen,
                           bcastFlag(0), epoch0);
@@ -198,7 +199,6 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // Whether this block's count released b=1, so it owes the generation bump and
   // the completion wait for BOTH broadcasts. Only meaningful in thread 0.
   bool ownsTail = false;
-
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
 
   for (uint32_t s = 0; s < S; s++) {
@@ -233,7 +233,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // the SDMA engine must observe the RMW.
       if (threadIdx.x == 0) {
         const uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
-                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         if (b == 1) {
           ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCtr[kBcastTargetIdx]));
         }
@@ -257,7 +257,9 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     if (S > 1) {
       WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
     }
-    if (threadIdx.x == 0) AdvancePushGen(barrierCtr, myPe, pushGen);
+    if (threadIdx.x == 0) {
+      AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
+    }
   }
 }
 
@@ -342,11 +344,7 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");   // system-scope release only
   __syncthreads();
   if (threadIdx.x < warpSize) {
-    uint32_t last = 0;
-    if (threadIdx.x == 0) {
-      last = atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
-    }
-    if (BroadcastLane0(last)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
+    if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
   }
 }
 } // namespace collective
