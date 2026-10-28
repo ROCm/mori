@@ -120,7 +120,6 @@ __device__ inline T* global(T* ptr) {
   static_assert(!std::is_volatile<T>::value, "T must not be volatile");
   return (T*)(T CCO_GLOBAL_SPACE*)reinterpret_cast<uintptr_t>(ptr);
 }
-#undef CCO_GLOBAL_SPACE
 
 /* ── Wavefront primitives ─────────────────────────────────────────────────────
  * Every arch mori targets is wave64 except gfx1250. The ballot builtin is not

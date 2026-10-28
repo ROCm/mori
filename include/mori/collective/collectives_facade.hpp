@@ -127,8 +127,8 @@ class CollectivesFacade {
       FACADE_PRINTF("Get: no instance");
       return nullptr;
     }
-    if (nPes <= 0 || nPes > kRSPushMaxPeers) {
-      FACADE_PRINTF("nPes must be in [1, %d], got %d", kRSPushMaxPeers, nPes);
+    if (nPes <= 0 || nPes > kCCLMaxPeers) {
+      FACADE_PRINTF("nPes must be in [1, %d], got %d", kCCLMaxPeers, nPes);
       return nullptr;
     }
     if (myPe < 0 || myPe >= nPes || rank_to_pe == nullptr) {
@@ -161,7 +161,7 @@ class CollectivesFacade {
     // Reset here: a device's facade is reused across Create/TearDown.
     //
     // MORI_CCL_FORCE_PUSH_N_SLICES is the actual push slice count S: a
-    // power-of-two value in {1, 2, ..., kRSPushMaxSlices} forces push mode AND
+    // power-of-two value in {1, 2, ..., kPushMaxSlices} forces push mode AND
     // pins the slice count (logS_ = log2(S)); a value <= 0 (or unset) means no
     // preference; any other value is an error.
     RsMode mode = RsMode::kAuto;
@@ -171,10 +171,10 @@ class CollectivesFacade {
     bool forcePull = EnvInt("MORI_CCL_FORCE_PULL", 0) != 0;
     
     if (forcePushS <= 0) pushOk = false;
-    if (pushOk && (forcePushS > kRSPushMaxSlices || 
+    if (pushOk && (forcePushS > kPushMaxSlices || 
                   (forcePushS & (forcePushS - 1)) != 0)) {
       FACADE_PRINTF("MORI_CCL_FORCE_PUSH_N_SLICES must be a power of two in range [1,%d]",
-                    kRSPushMaxSlices);
+                    kPushMaxSlices);
       pushOk = false;
     }
     if (pushOk) {
@@ -231,7 +231,7 @@ class CollectivesFacade {
     // kernels (tightens, never raises, the CU-count cap). <= 0 / unset = no cap.
     state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 0));
 
-    size_t controlBytes = kRSPushMaxPeers * sizeof(uint64_t) * 4 + kArrivedBytes;
+    size_t controlBytes = kCCLMaxPeers * sizeof(uint64_t) * 4 + kArrivedBytes;
     size_t totalBytes = maxStagingBytes + controlBytes;
     state.staging = Allocate(totalBytes);
     if (state.staging == nullptr) {
@@ -248,28 +248,28 @@ class CollectivesFacade {
              static_cast<uint8_t*>(state.staging) + maxStagingBytes);
     // Collective-permute ready counts. Slot p of my copy is written only by PE p:
     // the number of permutes in which p has entered to receive from me; never reset.
-    state.permuteReady = state.barrierCtr + kRSPushMaxPeers;
+    state.permuteReady = state.barrierCtr + kCCLMaxPeers;
     // Pull collective-permute handshake (see CollectivePermutePullKernel), same
     // ownership rule: slot p of my copy is written only by PE p.
-    state.permuteSendReady = state.permuteReady + kRSPushMaxPeers;
-    state.permuteReadDone = state.permuteSendReady + kRSPushMaxPeers;
+    state.permuteSendReady = state.permuteReady + kCCLMaxPeers;
+    state.permuteReadDone = state.permuteSendReady + kCCLMaxPeers;
     // SDMA completion slots of the push collectives (see kArrivedStride): row p of
     // my copy is written only by PE p's SDMA swaps; never reset after this.
-    state.arrived = state.permuteReadDone + kRSPushMaxPeers;
+    state.arrived = state.permuteReadDone + kCCLMaxPeers;
     HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
 
     // One local, zeroed-once buffer: the uint64 per-peer permute counts first
-    // (see CollectivePermutePushKernel: [p] sends to p, [kRSPushMaxPeers + p]
-    // receives from p), then the uint32 groupCounters.
-    const size_t permuteCntBytes = 2 * kRSPushMaxPeers * sizeof(uint64_t);
-    const size_t localCtrBytes = permuteCntBytes + kGroupCounterCount * sizeof(uint32_t);
+    // (see CollectivePermutePushKernel: [p] sends to p, [kCCLMaxPeers + p]
+    // receives from p), then the uint32 groupCtr.
+    const size_t permuteCntBytes = 2 * kCCLMaxPeers * sizeof(uint64_t);
+    const size_t localCtrBytes = permuteCntBytes + kGroupCtrTotal * sizeof(uint32_t);
     HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.permuteCnt), localCtrBytes));
     HIP_RUNTIME_CHECK(hipMemset(state.permuteCnt, 0, localCtrBytes));
-    state.groupCounters = reinterpret_cast<uint32_t*>(state.permuteCnt + 2 * kRSPushMaxPeers);    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
+    state.groupCtr = reinterpret_cast<uint32_t*>(state.permuteCnt + 2 * kCCLMaxPeers);    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
     // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
     // device alloc/copy). Sized for the max supported peer count.
     HIP_RUNTIME_CHECK(hipHostMalloc(reinterpret_cast<void**>(&state.pinnedPairs),
-                                    kRSPushMaxPeers * sizeof(AddressPair), 
+                                    kCCLMaxPeers * sizeof(AddressPair), 
                                     hipHostMallocDefault));
 
     // SDMA device comm for the push path (passed by value into the push kernel).
@@ -351,7 +351,7 @@ class CollectivesFacade {
   }
   // logS < 0 selects the slice count automatically per call.
   bool SetPushLogSlices(int logS) {
-    if (logS >= 0 && (1 << logS) > kRSPushMaxSlices) {
+    if (logS >= 0 && (1 << logS) > kPushMaxSlices) {
       FACADE_PRINTF("logS out of range!");
       return false;
     }
@@ -418,7 +418,7 @@ class CollectivesFacade {
     void* staging{nullptr};
     size_t stagingBytes{0};
     uint64_t* permuteCnt{nullptr};    // local, per-peer permute send/recv counts (owns the buffer)
-    uint32_t* groupCounters{nullptr};  // local, sub-region of the permuteCnt buffer
+    uint32_t* groupCtr{nullptr};  // local, sub-region of the permuteCnt buffer
     uint64_t* barrierCtr{nullptr};  // symmetric, gen-barrier flags of all collectives (slot p written by PE p)
     uint64_t* permuteReady{nullptr};  // symmetric, permute ready counts (slot p written by PE p)
     uint64_t* permuteSendReady{nullptr};  // symmetric, pull-permute sender-entered counts
@@ -447,7 +447,7 @@ class CollectivesFacade {
         cco::ccoDevCommDestroy(ccoComm, &devComm);
         cco::ccoCommDestroy(ccoComm);
       }
-      if (permuteCnt != nullptr) {  // also backs groupCounters
+      if (permuteCnt != nullptr) {  // also backs groupCtr
         HIP_RUNTIME_CHECK(hipFree(permuteCnt));
       }
       if (pinnedPairs != nullptr) {

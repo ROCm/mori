@@ -56,7 +56,7 @@ namespace collective {
 //   output        : raw symmetric-heap pointer, N = npes*chunkElems elements
 //                   (the FULL reduced vector; on exit every slot p holds the
 //                    reduction over all PEs of shard p)
-//   groupCounters : plain device buffer (kGroupCounterCount uint32), zeroed once
+//   groupCtr : plain device buffer (kGroupCtrTotal uint32), zeroed once
 //                   by the host. [kBcastFlagIdx + b]: broadcast b's release
 //                   counter (every block counts in once per launch, never
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
@@ -75,7 +75,7 @@ namespace collective {
 // broadcast copies (b=0: slices [0, S-1), b=1: the last slice) into every peer's
 // output[myPe] are pre-posted by block 0 in Phase 1, right behind the scatter,
 // each preceded by a POLL_REGMEM (padded to 64B with NOPs) on a local counter
-// groupCounters[kBcastFlagIdx+b]. Once a block has reduced slice S-2 (resp.
+// groupCtr[kBcastFlagIdx+b]. Once a block has reduced slice S-2 (resp.
 // S-1) it does a system fence (publishing its reduce stores) and adds 1 to
 // counter b=0 (resp. b=1); the add that brings the counter to its target
 // releases the copy -- no election, packet build or doorbell on the critical
@@ -89,7 +89,7 @@ namespace collective {
 // Per-slice copies only added packets; the scatter and broadcast also share the
 // same link direction, so they could not overlap usefully anyway.
 //
-// The release counters live in groupCounters: they are local atomics, and only
+// The release counters live in groupCtr: they are local atomics, and only
 // this PE's own SDMA engine polls them.
 // They are never reset: the queue polls for == (value Phase 1 read + gridDim.x),
 // exact modulo 2^32. A reset could not be ordered after the engine's last poll
@@ -103,7 +103,7 @@ namespace collective {
 template <int NumVecs, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
-                    T* __restrict__ output, uint32_t* __restrict__ groupCounters,
+                    T* __restrict__ output, uint32_t* __restrict__ groupCtr,
                     size_t strideElems, size_t totalElems, cco::ccoDevComm devComm,
                     T* __restrict__ staging, cco::ccoWindow_t heapWin,
                     uint64_t* __restrict__ barrierCtr, uint64_t* __restrict__ arrived) {
@@ -118,7 +118,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // Every block reads the launch generation before counting in at Phase 4; only
   // the tail owner (the last b=1 count) advances it.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
-  auto bcastFlag = [=](uint32_t b) { return &groupCounters[kBcastFlagIdx + b]; };
+  auto bcastFlag = [=](uint32_t b) { return &groupCtr[kBcastFlagIdx + b]; };
 
   constexpr int vecSize = VecBytes / sizeof(T);
   const uint32_t S = 1u << logS;
@@ -136,7 +136,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // Blocks of this launch read the b=1 target only after their last slice
       // wait, which is causally behind the barrier below; the release fence
       // orders this store before my arrival.
-      AtomicStore<EAgentScope>(&groupCounters[kBcastTargetIdx], flagEpoch[1]);
+      AtomicStore<EAgentScope>(&groupCtr[kBcastTargetIdx], flagEpoch[1]);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
     }
 
@@ -186,7 +186,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
             WriteGatedBroadcast(sub, q, base, myShard, peerDst,
                           lastOfs * sizeof(T), bcastSlot, pushGen,
                           bcastFlag(0), epoch0);
-            base += 2 * kSDMACopySignalPktSize;
+            base += 2 * kSDMACopySignalPkt;
           }
           WriteGatedBroadcast(sub, q, base, myShard + lastOfs,
                               peerDst + lastOfs * sizeof(T),
@@ -235,7 +235,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
         const uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         if (b == 1) {
-          ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCounters[kBcastTargetIdx]));
+          ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCtr[kBcastTargetIdx]));
         }
       }
     }
@@ -301,7 +301,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 //                   reduction over all PEs of shard p
 //   strideElems   : uniform shard stride (ComputeT units), base = myPe*strideElems
 //   myElems       : THIS PE's shard length (ComputeT units); 0 == idle PE
-//   groupCounters : plain device buffer, zeroed once by the host. [0] elects the
+//   groupCtr : plain device buffer, zeroed once by the host. [0] elects the
 //                   last block; atomicInc wraps it back to 0, so no reset.
 //   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (see GenBarrier).
@@ -310,7 +310,7 @@ __global__ void __launch_bounds__(256, 1)
 AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
                        const T* __restrict__ input, T* __restrict__ output,
                        size_t strideElems, size_t myElems,
-                       uint32_t* __restrict__ groupCounters,
+                       uint32_t* __restrict__ groupCtr,
                        uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
   // My reduced shard sits at the uniform offset myPe*strideElems in every peer.
@@ -344,7 +344,7 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
   if (threadIdx.x < warpSize) {
     uint32_t last = 0;
     if (threadIdx.x == 0) {
-      last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
+      last = atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
     }
     if (BroadcastLane0(last)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
   }

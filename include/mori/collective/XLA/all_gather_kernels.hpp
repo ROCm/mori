@@ -101,7 +101,7 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
 //   input  : raw symmetric-heap pointer, my shard of chunkBytes bytes
 //   output : local pointer, npes*chunkBytes bytes (all shards)
 //   chunkBytes    : bytes per shard.
-//   groupCounters : plain device buffer, [kArrivalIdx] elects the last block.
+//   groupCtr : plain device buffer, [kArrivalIdx] elects the last block.
 //   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
 //                   collective (see GenBarrier).
 //   NPES          : compile-time peer count (see PullCopyInterleaved).
@@ -117,7 +117,7 @@ template <int NPES, int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 AllGatherPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
                      const void* __restrict__ input, void* __restrict__ output,
-                     size_t chunkBytes, uint32_t* __restrict__ groupCounters,
+                     size_t chunkBytes, uint32_t* __restrict__ groupCtr,
                      uint64_t* __restrict__ arrived) {
   const uint32_t stride4G = heapWin->stride4G;
   // In block 0's first wave every lane loads this before lane myPe posts.
@@ -135,7 +135,7 @@ AllGatherPullKernelN(int myPe, int npes, cco::ccoWindow_t heapWin,
   // A block counts in only once all its waves are done reading peer inputs.
   __syncthreads();
   if (threadIdx.x < warpSize) {
-    if (LastBlockOut(groupCounters)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
+    if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, npes, stride4G);
   }
 }
 } // namespace collective

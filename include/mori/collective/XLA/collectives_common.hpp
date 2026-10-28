@@ -39,42 +39,47 @@ namespace mori {
 namespace collective {
 
 // Fused 64B packet: [NOP][COPY_LINEAR][ATOMIC SWAP64].
-static constexpr size_t kSDMACopySignalPktSize = 64;
+static constexpr size_t kSDMACopySignalPkt = 64;
+static constexpr int kSDMAPollInterval = 4;
 static_assert(sizeof(uint32_t) + sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC) ==
-                      kSDMACopySignalPktSize,
+                      kSDMACopySignalPkt,
               "Packet size mismatch: copy+atomic must be 64B");
 #if defined(__HIPCC__) || defined(__HIP__)
-static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopySignalPktSize == 0,
+static_assert(cco::CCO_SDMA_QUEUE_SIZE % kSDMACopySignalPkt == 0,
               "SDMA ring must be a multiple of the 64B fused packet");
 #endif
 
-static constexpr int kRSPushMaxPeers = 16;
-static constexpr int kRSPushMaxSlices = 8;
+static constexpr int kCCLMaxPeers = 16;
+static constexpr int kPushMaxSlices = 8;
 
-// Completion slots: a symmetric-heap uint64 arrived[kRSPushMaxPeers][kArrivedStride]
+// Completion slots: a symmetric-heap uint64 arrived[kCCLMaxPeers][kArrivedStride]
 // (zeroed once, never reset). Row p of my copy is written only by PE p's SDMA: each
 // copy is trailed by an atomic swap storing the sender's generation into its slot, and
 // the receiver waits until the slot reaches the generation it expects. Slots only
 // grow, so nothing is ever cleared. 64 bits because a slot a launch does not use
 // (e.g. slice 3 under logS < 2) falls arbitrarily far behind the generation; a
 // 32-bit wrap-safe compare would misread it as reached after 2^31 launches.
-//   [0, kRSPushMaxSlices) : scatter slice s (all push collectives, launch gen)
+//   [0, kPushMaxSlices) : scatter slice s (all push collectives, launch gen)
 //   kBcastArrived + b     : all-reduce broadcast b (launch gen)
 //   kPermuteArrived       : push collective-permute (pairwise permute count)
-static constexpr int kBcastArrived = kRSPushMaxSlices;
-static constexpr int kPermuteArrived = kBcastArrived + 2;
-static constexpr int kArrivedStride = 16;
+enum ArrivedIdx {
+  kBcastArrived = kPushMaxSlices,
+  kPermuteArrived = kBcastArrived + 2,
+  kArrivedStride = 16,
+};
 static_assert(kPermuteArrived < kArrivedStride, "arrived row too small");
-static constexpr size_t kArrivedBytes = kRSPushMaxPeers * kArrivedStride * sizeof(uint64_t);
+static constexpr size_t kArrivedBytes = kCCLMaxPeers * kArrivedStride * sizeof(uint64_t);
 
-// groupCounters layout (local uint32 buffer): [0] grid-wide last-block arrival
+// groupCtr layout (local uint32 buffer): [0] grid-wide last-block arrival
 // counter (reduce-scatter's gen bump and the pull kernels' exit barrier elect the
 // tail block through it), then all-reduce's two broadcast release counters, then
 // all-reduce's per-launch b=1 release target (elects the tail owner).
-static constexpr int kArrivalIdx = 0;
-static constexpr int kBcastFlagIdx = kArrivalIdx + 1;
-static constexpr int kBcastTargetIdx = kBcastFlagIdx + 2;
-static constexpr int kGroupCounterCount = kBcastTargetIdx + 1;
+enum GroupCtrIdx {
+  kArrivalIdx = 0,
+  kBcastFlagIdx = kArrivalIdx + 1,
+  kBcastTargetIdx = kBcastFlagIdx + 2,
+  kGroupCtrTotal = kBcastTargetIdx + 1,
+};
 
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
 struct AddressPair {
@@ -85,7 +90,6 @@ struct AddressPair {
 #if defined(__HIPCC__) || defined(__HIP__)
 
 #define USE_NONTEMPORAL_LOAD 0
-#define GLOBAL_SPACE __attribute__((address_space(1)))
 
 // Streaming (cache-bypassing) 16-byte load/store.
 #if (defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1250__))
@@ -98,7 +102,6 @@ struct AddressPair {
 
 constexpr uint32_t VecBytes = 16;
 
-using V128_GLOBAL = GLOBAL_SPACE cco::ccoUint4*;
 template <int TVecBytes>
 using TVecType = std::conditional_t<
     TVecBytes == 1, uint8_t,
@@ -136,11 +139,12 @@ __device__ __forceinline__ TVecType<Bytes> StreamLoad(const void* p) {
 #if USE_NONTEMPORAL_LOAD
   return __builtin_nontemporal_load(ptr);
 #else
+  using V128 = CCO_GLOBAL_SPACE cco::ccoUint4*;
   if constexpr (Bytes == 16) {
     if constexpr (Scope == ESystemScope) {
-      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "");
+      return __builtin_amdgcn_global_load_b128((V128)ptr, "");
     } else {
-      return __builtin_amdgcn_global_load_b128((V128_GLOBAL)ptr, "agent");
+      return __builtin_amdgcn_global_load_b128((V128)ptr, "agent");
     }
   } else {
     return AtomicLoad<Scope>(ptr);
@@ -156,11 +160,12 @@ __device__ __forceinline__ void StreamStore(void* p, TVecType<Bytes> v) {
 #if USE_NONTEMPORAL_LOAD
   __builtin_nontemporal_store(v, ptr);
 #else
+  using V128 = CCO_GLOBAL_SPACE cco::ccoUint4*;
   if constexpr (Bytes == 16) {
     if constexpr (Scope == ESystemScope) {
-      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "");
+      __builtin_amdgcn_global_store_b128((V128)ptr, v, "");
     } else {
-      __builtin_amdgcn_global_store_b128((V128_GLOBAL)ptr, v, "agent");
+      __builtin_amdgcn_global_store_b128((V128)ptr, v, "agent");
     }
   } else {
     AtomicStore<Scope>(ptr, v);
@@ -177,6 +182,16 @@ __device__ __forceinline__ T* PeerPtr(T* p, int peer, int myPe, uint32_t stride4
   const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
   return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(p) +
                               (static_cast<uint64_t>(diff) << 32));
+}
+
+template <class A, class B>
+__device__ __forceinline__ std::pair<A*, B*> PeerPtrs(A* a, B* b, 
+                                      int peer, int myPe, uint32_t stride4G) {
+  const int32_t diff = (peer - myPe) * static_cast<int32_t>(stride4G);
+  return std::make_pair(reinterpret_cast<A*>(reinterpret_cast<uintptr_t>(a) +
+                              (static_cast<uint64_t>(diff) << 32)),
+                        reinterpret_cast<B*>(reinterpret_cast<uintptr_t>(b) +
+                              (static_cast<uint64_t>(diff) << 32)));
 }
 
 // SDMA ATOMIC `operation` takes TC atomic opcodes (SDMA_ATOMIC_ADD64 = 47 is
@@ -247,14 +262,11 @@ __device__ __forceinline__ void WriteFusedPacket(int lane,
 } 
 
 // SDMA re-reads the flag every `interval` clocks while parked on a POLL_REGMEM.
-#ifndef RS_BCAST_POLL_INTERVAL
-#define RS_BCAST_POLL_INTERVAL 4
-#endif
 static_assert(sizeof(SDMA_PKT_POLL_REGMEM) == 6 * sizeof(uint32_t),
               "POLL_REGMEM must be 6 DW so the 64B slot pads with 10 NOPs");
 
 // One POLL_REGMEM (6 DW) padded with single-DW NOPs (zero dwords) to a full
-// 64B ring slot, so every ring reservation stays kSDMACopySignalPktSize. The
+// 64B ring slot, so every ring reservation stays kSDMACopySignalPkt. The
 // engine stalls this queue until *flag == value; retry_count 0xfff = forever.
 // Four consecutive lanes each write one b128, like WriteFusedPacket.
 __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, uint32_t value,
@@ -273,7 +285,7 @@ __device__ __forceinline__ void WritePollPacket(int lane, const uint32_t* flag, 
   } else if (lane == 1) {
     decltype(SDMA_PKT_POLL_REGMEM::DW5_UNION) d5;
     d5.DW_5_DATA = 0;
-    d5.interval = RS_BCAST_POLL_INTERVAL;
+    d5.interval = kSDMAPollInterval;
     d5.retry_count = 0xfff;
     dw[0] = 0xffffffffu;  // mask: compare the whole dword
     dw[1] = d5.DW_5_DATA;
@@ -341,7 +353,7 @@ struct SdmaCollectiveHandle : cco::ccoSdmaQueueDeviceHandle {
   // lane per distinct queue). Claim-then-wait like cco ReserveSlot: fetch_add
   // first, then poll rptr if occupancy exceeds the ring.
   //
-  // Reservations are multiples of kSDMACopySignalPktSize and the ring is a
+  // Reservations are multiples of kSDMACopySignalPkt and the ring is a
   // multiple of that, so a multi-packet reservation may span the wrap but no
   // single 64B packet straddles it: wrap each packet's offset separately.
   //
@@ -459,7 +471,7 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
     for (int s = 0; s < S; s++) {
       uint64_t pktBase = 0;
       if (active && sub == 0) {
-        pktBase = handle.ReserveSingleProducer(kSDMACopySignalPktSize);
+        pktBase = handle.ReserveSingleProducer(kSDMACopySignalPkt);
       }
       pktBase = BroadcastQuad(pktBase);
 
@@ -477,7 +489,7 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
       __builtin_amdgcn_wave_barrier();
 
       if (active && sub == 0) {
-        handle.submitPacket(pktBase, pktBase + kSDMACopySignalPktSize);
+        handle.submitPacket(pktBase, pktBase + kSDMACopySignalPkt);
       }
     }
 
@@ -498,7 +510,7 @@ __device__ __forceinline__ void WriteGatedBroadcast(int sub, uint32_t* queueBuf,
   WritePollPacket(sub, flag, value,
                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
   WriteFusedPacket(sub, src, dst, bytes, slot, slotValue,
-                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopySignalPktSize) /
+                   queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase + kSDMACopySignalPkt) /
                                   sizeof(uint32_t));
 }
 
@@ -529,7 +541,7 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
     }
     queueBuf = BroadcastQuad(queueBuf);
 
-    const uint64_t bytes = nSlots * kSDMACopySignalPktSize;
+    const uint64_t bytes = nSlots * kSDMACopySignalPkt;
     uint64_t pktBase = 0;
     if (active && sub == 0) {
       pktBase = handle.ReserveSingleProducer(bytes);
@@ -648,12 +660,12 @@ __device__ __forceinline__ void AdvancePushGen(uint64_t* barrierCtr, int myPe,
 
 // Elects the last block of the grid to arrive. Called by the whole first wave
 // of every block, after the block's __syncthreads; true in every lane of that
-// wave of the last block. groupCounters[kArrivalIdx] wraps back to 0 (atomicInc),
+// wave of the last block. groupCtr[kArrivalIdx] wraps back to 0 (atomicInc),
 // so it needs no reset.
-__device__ __forceinline__ bool LastBlockOut(uint32_t* groupCounters) {
+__device__ __forceinline__ bool LastBlockOut(uint32_t* groupCtr) {
   uint32_t last = 0;
   if (threadIdx.x == 0) {
-    last = atomicInc(&groupCounters[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
+    last = atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
   }
   return BroadcastLane0(last) != 0;
 }

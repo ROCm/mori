@@ -49,8 +49,8 @@ namespace collective {
 //
 //   ready    : symmetric-heap uint64[>= npes] ready counts, zeroed once, never
 //              reset. Slot p of my copy is written only by PE p.
-//   cnt      : local uint64[2*kRSPushMaxPeers], zeroed once, thread 0 only.
-//              cnt[p] counts my permutes sending to p, cnt[kRSPushMaxPeers+p]
+//   cnt      : local uint64[2*kCCLMaxPeers], zeroed once, thread 0 only.
+//              cnt[p] counts my permutes sending to p, cnt[kCCLMaxPeers+p]
 //              my permutes receiving from p.
 //   arrived  : symmetric-heap SDMA completion slots (see kArrivedStride), global
 //              PE rows; this kernel uses column kPermuteArrived only.
@@ -70,7 +70,7 @@ namespace collective {
 // grows, so nothing is reset.
 //
 // A self-permute (dstPe == srcPe == myPe) counts in cnt[myPe] and
-// cnt[kRSPushMaxPeers+myPe] too, so the self send and self receive stay paired;
+// cnt[kCCLMaxPeers+myPe] too, so the self send and self receive stay paired;
 // the pull kernel never counts self-permutes, so mixing push and pull keeps them
 // in step.
 //
@@ -100,7 +100,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // k-th copy lands, which needs this wait to pass first.
   if (threadIdx.x == 0) {
     if (srcPe >= 0) {
-      const uint64_t k = ++cnt[kRSPushMaxPeers + srcPe];
+      const uint64_t k = ++cnt[kCCLMaxPeers + srcPe];
       recvK = k;
       if (srcPe != myLsaRank) {
         AtomicStore<ESystemScope>(PeerPtr(&ready[myLsaRank], srcPe, myLsaRank, stride4G), k);
@@ -156,7 +156,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
 //               which p has entered to send to me.
 //   readDone  : symmetric-heap uint64[>= npes], same rules: the number of
 //               permutes in which p has finished reading my sendBuf.
-//   groupCounters : plain device buffer, [kArrivalIdx] elects the last block.
+//   groupCtr : plain device buffer, [kArrivalIdx] elects the last block.
 //
 // Pull reverses the push dependencies: the receiver may read only once the
 // sender has entered (its producers of sendBuf have retired), and the sender may
@@ -178,13 +178,13 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
                             const void* __restrict__ sendBuf, void* __restrict__ recvBuf,
                             size_t numBytes, uint64_t* __restrict__ ready,
                             uint64_t* __restrict__ sendReady, uint64_t* __restrict__ readDone,
-                            uint64_t* __restrict__ cnt, uint32_t* __restrict__ groupCounters) {
+                            uint64_t* __restrict__ cnt, uint32_t* __restrict__ groupCtr) {
   const int me = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
   const bool sends = dstPe >= 0 && dstPe != me;
   const bool recvs = srcPe >= 0 && srcPe != me;
   const uint64_t kSend = sends ? AtomicLoad<EAgentScope>(&cnt[dstPe]) + 1 : 0;
-  const uint64_t kRecv = recvs ? AtomicLoad<EAgentScope>(&cnt[kRSPushMaxPeers + srcPe]) + 1 : 0;
+  const uint64_t kRecv = recvs ? AtomicLoad<EAgentScope>(&cnt[kCCLMaxPeers + srcPe]) + 1 : 0;
 
   if (threadIdx.x == 0) {
     if (blockIdx.x == 0) {
@@ -212,7 +212,7 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
 
   // A block counts in only once all its waves are done reading sendBuf.
   __syncthreads();
-  if (threadIdx.x < warpSize && LastBlockOut(groupCounters) && threadIdx.x == 0) {
+  if (threadIdx.x < warpSize && LastBlockOut(groupCtr) && threadIdx.x == 0) {
     __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "");
     if (recvs) AtomicStore<ESystemScope>(PeerPtr(&readDone[me], srcPe, me, stride4G), kRecv);
     if (sends) {
@@ -221,7 +221,7 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
       }
       cnt[dstPe] = kSend;
     }
-    if (recvs) cnt[kRSPushMaxPeers + srcPe] = kRecv;
+    if (recvs) cnt[kCCLMaxPeers + srcPe] = kRecv;
   }
 }
 } // namespace collective
