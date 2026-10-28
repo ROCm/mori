@@ -96,8 +96,8 @@ jobs:
               # the MI300X_MLX test runners (gfx942).
               export MORI_GPU_ARCHS='gfx942;gfx950'
 
-              # The script's auditwheel repair tags each wheel manylinux_2_28 (or
-              # older) and fails the build if it needs a newer glibc or libstdc++.
+              # The script's auditwheel repair tags each wheel manylinux_2_28 and
+              # fails the build if it needs a newer glibc or libstdc++.
               echo '=== Building CI test wheel (amd_mori ${GH_VERSION}) ==='
               SETUPTOOLS_SCM_PRETEND_VERSION=${GH_VERSION} \
                 python3 tools/build_manylinux_wheel.py \

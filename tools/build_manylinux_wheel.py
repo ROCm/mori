@@ -30,9 +30,9 @@ Run inside the docker/Dockerfile.manylinux image, from a mori checkout:
 
 The wheel is built against glibc 2.28 and gcc-toolset's libstdc++. ``auditwheel
 repair`` then checks that it needs nothing newer, vendors UMBP's gRPC stack into
-it and tags it manylinux_2_28 (or older, if it qualifies), so it installs on any
-distro at or above glibc 2.28. setup.py's environment variables
-(SETUPTOOLS_SCM_PRETEND_VERSION, MORI_GPU_ARCHS, ...) pass through.
+it and tags it manylinux_2_28, so it installs on any distro at or above glibc
+2.28. setup.py's environment variables (SETUPTOOLS_SCM_PRETEND_VERSION,
+MORI_GPU_ARCHS, ...) pass through.
 """
 
 import argparse
@@ -199,7 +199,17 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         built = _build(bindir, repo, os.path.join(tmp, "built"))
         repaired_dir = os.path.join(tmp, "repaired")
-        cmd = ["auditwheel", "repair", "--plat", PLAT, "-w", repaired_dir]
+        # --only-plat: otherwise auditwheel also adds every older tag the wheel happens
+        # to meet (manylinux_2_27 today), which changes with the symbols the code uses.
+        cmd = [
+            "auditwheel",
+            "repair",
+            "--plat",
+            PLAT,
+            "--only-plat",
+            "-w",
+            repaired_dir,
+        ]
         for pattern in EXCLUDE:
             cmd += ["--exclude", pattern]
         _run(cmd + [built])
