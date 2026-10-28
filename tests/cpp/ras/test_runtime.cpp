@@ -26,14 +26,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "mori/ras/ras.hpp"
+#include "src/ras/fd_registry.hpp"
 #include "src/ras/runtime.hpp"
 #include "tests/cpp/ras/ras_test_util.hpp"
 
@@ -52,19 +55,25 @@ std::string ReadAll(const std::string& path) {
   return ss.str();
 }
 
-// The TID of this process's thread named `name`, or -1.
-int FindThread(const std::string& name) {
+// The TIDs of this process's threads named `name`.
+std::vector<int> ThreadsNamed(const std::string& name) {
+  std::vector<int> tids;
   DIR* d = opendir("/proc/self/task");
-  if (d == nullptr) return -1;
-  int found = -1;
+  if (d == nullptr) return tids;
   while (dirent* e = readdir(d)) {
     if (e->d_name[0] == '.') continue;
     std::string comm = ReadAll(std::string("/proc/self/task/") + e->d_name + "/comm");
     if (!comm.empty() && comm.back() == '\n') comm.pop_back();
-    if (comm == name) found = std::atoi(e->d_name);
+    if (comm == name) tids.push_back(std::atoi(e->d_name));
   }
   closedir(d);
-  return found;
+  return tids;
+}
+
+// The TID of this process's thread named `name`, or -1.
+int FindThread(const std::string& name) {
+  std::vector<int> tids = ThreadsNamed(name);
+  return tids.empty() ? -1 : tids.back();
 }
 
 CoreParams LocalCore() {
@@ -122,6 +131,50 @@ TEST(RasRuntime, StartsOnceAndAdvertisesItsEndpoint) {
               return 0;
             }),
             0);
+}
+
+// In SPMT mode every GPU's thread creates its first engine or communicator, so first starts
+// race. They must still make one runtime: one RAS thread, and the fds of one listener.
+TEST(RasRuntime, ThreadsThatStartAtOnceShareOneRuntime) {
+  int fdsOfOneRuntime = RunInChild([] {
+    setenv("MORI_RAS_ENABLE", "1", 1);
+    if (RasRuntime::EnsureStarted(Params()) == nullptr) return 0;
+    return static_cast<int>(fdreg::Count());
+  });
+  ASSERT_GT(fdsOfOneRuntime, 0);
+
+  for (int round = 0; round < 20; ++round) {
+    ASSERT_EQ(RunInChild([fdsOfOneRuntime] {
+                setenv("MORI_RAS_ENABLE", "1", 1);
+                constexpr int kThreads = 16;
+                std::atomic<int> waiting{0};
+                std::atomic<bool> go{false};
+                std::vector<RasRuntime*> got(kThreads, nullptr);
+                std::vector<std::thread> threads;
+                for (int i = 0; i < kThreads; ++i) {
+                  threads.emplace_back([&, i] {
+                    waiting.fetch_add(1);
+                    while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                    got[i] = RasRuntime::EnsureStarted(Params());
+                  });
+                }
+                while (waiting.load() < kThreads) std::this_thread::yield();
+                go.store(true, std::memory_order_release);
+                for (std::thread& t : threads) t.join();
+
+                CHILD_CHECK(got[0] != nullptr);
+                for (RasRuntime* r : got) CHILD_CHECK(r == got[0]);
+                CHILD_CHECK(RasRuntime::Status().state == RunState::kRunning);
+                CHILD_CHECK(static_cast<int>(fdreg::Count()) == fdsOfOneRuntime);
+                // The thread names itself once it is configured, so give a second one time to.
+                CHILD_CHECK(WaitFor([] { return ThreadsNamed("mori-ras").size() == 1; }, 2000));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                CHILD_CHECK(ThreadsNamed("mori-ras").size() == 1);
+                return 0;
+              }),
+              0)
+        << "round " << round;
+  }
 }
 
 TEST(RasRuntime, ABlockedPortLeavesRasOffAndDegraded) {
