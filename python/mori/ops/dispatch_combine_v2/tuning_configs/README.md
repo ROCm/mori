@@ -64,6 +64,10 @@ other tables may not set it. Current settings:
   where a whole-table A/B against the previous tables confirmed it: on for
   256/8 bf16 H7168 at T4–512, T2048 and T4096; 256/8 bf16 H6144 at T4–128 and
   T2048; 256/6 bf16 H7168 at T64–128; 384/6 bf16 H7168 and H5120 at T64–256.
+  272/9 had no previous table; its whole-table A/B was against the defaults
+  and the 256/8 rules, and it is on for bf16 H7168 at T8, T256, T512 and T2048.
+  896/16 likewise, A/B against the defaults: on for bf16 H3584 at T16, T32 and
+  T4096.
   Off elsewhere.
 
 ## Lookup
@@ -91,13 +95,42 @@ other tables may not set it. Current settings:
 | GPU (arch, CUs) | Shapes (experts / top-k) | Hidden | Dispatch dtypes |
 | --- | --- | --- | --- |
 | MI355X (gfx950, 256) | 256/8, 256/6, 384/6 | 7168; 5120 for 384/6 | bf16, fp8_e4m3 |
-| MI308X (gfx942, 80) | 256/8, 256/6, 384/6 | 7168; 6144 for inter 256/8; 5120 for 384/6 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
+| MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
 | MI300X (gfx942, 304) | 256/8, 384/6 | 7168; 6144 for 256/8 | bf16, fp8_e4m3_fnuz |
 
-Each model has IntraNodeV2 (EP8), InterNodeV2 (EP16) and InterNodeV2LL (EP16)
-tables with both phases for every shape. Not every dtype appears in every
-shape; see the files.
-Token ceilings are 64–4096, plus 4–32 for MI308X inter-node 256/8.
+Each GPU model has IntraNodeV2 (EP8), InterNodeV2 (EP16) and InterNodeV2LL
+(EP16) tables, and every shape in a table has both phases. Not every shape is
+in every table, and not every dtype appears in every shape; see the files.
+Token ceilings are 64–4096, plus 4–32 for MI308X inter-node 256/8, 272/9 and
+896/16.
+
+The model behind each shape:
+
+| Model | Experts / top-k | Hidden the dispatch carries | Tables |
+| --- | --- | --- | --- |
+| DeepSeek-V3/R1 | 256/8 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; FP4 dispatch (stored as 3584, packed) on MI308X EP16 |
+| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI308X |
+| GLM-5, GLM-5.3 | 256/8 | 6144 | MI308X, MI300X: EP8 and EP16 |
+| DeepSeek-V4-Pro | 384/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
+| DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X: EP8 and EP16 |
+| Kimi K3 | 896/16 | 3584 | MI308X: EP16 |
+| none known | 256/6 | 7168 | MI355X, MI308X: EP8 and EP16, bf16 dispatch only |
+
+A shape without rows runs on the default geometry: for example DeepSeek-V4-Flash
+(256/6 at hidden 4096), the DSpark draft layers of DeepSeek-V4.1-Flash (128/3 at
+hidden 5120), GLM-5.3 with its shared expert fused in (264/9 and 272/9 at
+hidden 6144), and every shape on a GPU or EP size its table lacks.
+
+MI308X 264/9 and 272/9 are DeepSeek-V3/R1 with the shared expert fused in as
+a routed one, laid out as ATOM's `SharedExpertMode.LOCAL_REPLICA` does: every
+rank holds its 256/EP routed experts plus one replica of the shared expert in
+its last slot, and each token's ninth expert is its own rank's replica. The
+expert count depends on the EP size, so 264/9 (33 a rank) is only in the EP8
+table and 272/9 (17 a rank) only in the EP16 tables.
+
+MI308X 896/16 is Kimi K3. Its routed experts run on a 3584-wide latent (the
+model projects the 7168-wide hidden state down before the dispatch and back
+up after the combine), so 3584 is the width the dispatch carries.
 
 FP8 uses the arch's native encoding: `fp8_e4m3_fnuz` on gfx942 and
 `fp8_e4m3` (OCP) on gfx950. Combine rows are BF16, except MI308X inter-node
@@ -116,7 +149,9 @@ Metrics are only comparable between rows measured under the same conditions.
   measured with an allocation of 8 and each rule's own count, except FP4
   dispatch and FP8 combine rows, which keep earlier two-QP measurements.
 - **Protocol.** Uniform routing, `scale_dim=0`, capacity equal to the token
-  count, `quant_type="none"`. Timing uses 3 passes × (20 warmup + 30 timed
+  count, `quant_type="none"`. The 264/9 and 272/9 rows use replica routing
+  (`--routing replica`): eight distinct routed experts drawn uniformly, plus
+  the token's own rank's replica. Timing uses 3 passes × (20 warmup + 30 timed
   rounds), dropping the first timed round of each pass. A measurement is
   accepted only after correctness checks, and only if each phase has
   mean/median ≤ 1.10 and max/median ≤ 5, and the per-pass D+C means vary by
@@ -138,8 +173,10 @@ it.
 - Record the allocation (`num_qp_per_pe`) with the results. A per-bucket
   `active_qps` changes the drain of every bucket in the op, so accept a new
   count only from a whole-table A/B, not from the single-bucket sweep.
-- Never copy rows from another GPU model. A missing row is safer than a
-  borrowed one.
+- Never copy rows from another GPU model or another shape. A missing row is
+  safer than a borrowed one: on MI308X the 256/8 rules, copied whole to 264/9
+  and 272/9, are up to a third slower than the defaults in some buckets
+  (InterNodeV2 T64 and T512, IntraNodeV2 T4096).
 - Store the geometry that actually ran: keep `block_num` within the CU count.
 - `--cmd tuning` measures candidates with load-first off and rewrites the whole
   rule, so re-saving a combine rule clears `combine_load_first`. Re-measure with

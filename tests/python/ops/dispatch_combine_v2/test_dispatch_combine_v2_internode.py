@@ -203,7 +203,9 @@ def _parse_args(argv):
     # Where tokens go. "uniform" keeps every chunk full and so never exercises
     # the empty-chunk path; "skewed" and "local" do. See _generate_round.
     parser.add_argument(
-        "--routing", default="uniform", choices=["uniform", "skewed", "local"]
+        "--routing",
+        default="uniform",
+        choices=["uniform", "skewed", "local", "replica"],
     )
     parser.add_argument("--dtype", default="bf16", choices=list(_DTYPES))
     parser.add_argument("--combine-dtype", default=None, choices=list(_DTYPES))
@@ -324,12 +326,38 @@ def _generate_round(rng, cfg, num_tokens, device, dtype, routing="uniform"):
                  on the per-node token count to retire them.
     ``local``    every expert is on the sender's own node, so a peer receives
                  NOTHING and every one of its chunks is empty. The extreme.
+    ``replica``  one shared expert fused in as a routed one, the way ATOM lays it
+                 out (SharedExpertMode.LOCAL_REPLICA): every rank's last expert
+                 slot is a replica of the shared expert and each token's last
+                 column is its own rank's replica; the other topk - 1 columns are
+                 distinct routed experts drawn uniformly over every rank's other
+                 slots. DeepSeek-V3/R1 at EP16 is 17 experts a rank, topk 9.
     """
     inp = torch.randn(num_tokens, cfg.hidden_dim, generator=rng, device=device).to(
         dtype
     )
     num_experts = cfg.world_size * cfg.num_experts_per_rank
-    if routing == "uniform":
+    if routing == "replica":
+        routed_per_rank = cfg.num_experts_per_rank - 1
+        routed = torch.stack(
+            [
+                torch.randperm(
+                    cfg.world_size * routed_per_rank, generator=rng, device=device
+                )[: cfg.num_experts_per_token - 1]
+                for _ in range(num_tokens)
+            ]
+        )
+        # Routed expert p of rank p // routed_per_rank sits in the slot after the
+        # replicas of the ranks before it.
+        routed = routed + routed // routed_per_rank
+        shared = torch.full(
+            (num_tokens, 1),
+            cfg.rank * cfg.num_experts_per_rank + routed_per_rank,
+            dtype=routed.dtype,
+            device=device,
+        )
+        idx = torch.cat((routed, shared), dim=1).to(torch.int32)
+    elif routing == "uniform":
         idx = torch.stack(
             [
                 torch.randperm(num_experts, generator=rng, device=device)[
