@@ -119,25 +119,18 @@ class DistributedClient : public IUMBPClient {
   // client-side staging regions for objects fetched from, or assembled for,
   // another node, so they belong to whoever owns the PoolClient.
   //
-  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
-  // — each RDMA-registered and each under its own mutex in PoolClient, so a
-  // remote get and a remote put run concurrently instead of serializing on one
-  // lock (the load/offload overlap sglang's direct linker wants). Each is sized
-  // to config.distributed.ranged_scratch_size; allocated only when that is > 0.
-  void* ranged_get_scratch_ = nullptr;
-  size_t ranged_get_scratch_size_ = 0;
-  HostBufferHandle ranged_get_scratch_handle_;
-  void* ranged_put_scratch_ = nullptr;
-  size_t ranged_put_scratch_size_ = 0;
-  HostBufferHandle ranged_put_scratch_handle_;
-  // The same arenas laid out by NUMA node instead
-  // (config.distributed.ranged_scratch_numa_layout): one buffer per node and
-  // direction, while the single buffers above stay unset.  The sizes above then
-  // hold each direction's total.
-  std::vector<PoolClientConfig::RangedScratchGroup> ranged_get_groups_;
-  std::vector<PoolClientConfig::RangedScratchGroup> ranged_put_groups_;
-  std::vector<HostBufferHandle> ranged_group_handles_;
-  void LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base);
+  // Separate arenas for remote ranged GET and remote ranged PUT — each
+  // RDMA-registered and each under its own mutex in PoolClient, so a remote get
+  // and a remote put run concurrently instead of serializing on one lock (the
+  // load/offload overlap sglang's direct linker wants). Each direction has
+  // config.distributed.ranged_scratch_size in one arena, or laid out by NUMA node
+  // (config.distributed.ranged_scratch_numa_layout); allocated only when the
+  // size is > 0.
+  std::vector<PoolClientConfig::RangedScratchArena> ranged_get_scratch_;
+  std::vector<PoolClientConfig::RangedScratchArena> ranged_put_scratch_;
+  std::vector<HostBufferHandle> ranged_scratch_handles_;
+  void AllocateRangedScratch(const UMBPDistributedConfig& dc);
+  bool LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base);
   void FreeRangedScratch();
   // No master address => no routing => this node can never hold, fetch or
   // serve a remote key.  Set once at construction; read by SupportsRangedIO,

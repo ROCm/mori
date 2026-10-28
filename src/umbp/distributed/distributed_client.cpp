@@ -118,50 +118,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // Zero-sized is the default and means "this deployment does not do ranged
   // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
   // a client that never issues ranged operations stops paying for the arena.
-  HostMemAllocator allocator;
-  HostBufferOptions scratch_opts;
-  if (dc.ranged_scratch_use_hugepages) {
-    scratch_opts.backing = HostBufferBacking::kAnonymousHugetlb;
-    scratch_opts.hugepage_size = dc.ranged_scratch_hugepage_size;
-  }
-  if (dc.ranged_scratch_size > 0 && dc.ranged_scratch_numa_layout) {
-    LayOutRangedScratchByNuma(dc.ranged_scratch_size, scratch_opts);
-  }
-  // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
-  // directions never share a buffer or a lock and can run concurrently.
-  if (dc.ranged_scratch_size > 0 && ranged_get_groups_.empty()) {
-    ranged_get_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
-    ranged_put_scratch_handle_ = allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
-    if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
-      // HostBufferHandle is not RAII and the destructor/Close() won't run when a
-      // constructor throws, so free whatever did allocate before bailing out
-      // (Free() is a no-op on an invalid handle).
-      allocator.Free(ranged_get_scratch_handle_);
-      allocator.Free(ranged_put_scratch_handle_);
-      throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
-    }
-    // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
-    MORI_UMBP_INFO("[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
-                   ranged_get_scratch_handle_.mapped_size >> 20,
-                   ranged_get_scratch_handle_.actual_alignment >> 10,
-                   ranged_get_scratch_handle_.actual_backing == HostBufferBacking::kAnonymousHugetlb
-                       ? "hugetlb"
-                       : "anonymous");
-    WarnIfNicAliases(ranged_get_scratch_handle_, ranged_get_scratch_handle_.mapped_size);
-    ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
-    ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
-    ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
-    ranged_put_scratch_size_ = ranged_put_scratch_handle_.mapped_size;
-  }
+  if (dc.ranged_scratch_size > 0) AllocateRangedScratch(dc);
 
   auto pc_config = ToPoolClientConfig(dc, std::move(dram_ownership), std::move(ssd_ownership),
                                       config.dram.high_watermark, config.dram.low_watermark);
-  pc_config.ranged_get_scratch_buffer = ranged_get_scratch_;
-  pc_config.ranged_get_scratch_size = ranged_get_scratch_size_;
-  pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
-  pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
-  pc_config.ranged_get_scratch_groups = ranged_get_groups_;
-  pc_config.ranged_put_scratch_groups = ranged_put_groups_;
+  pc_config.ranged_get_scratch = ranged_get_scratch_;
+  pc_config.ranged_put_scratch = ranged_put_scratch_;
   pc_config.copy_pipeline = config_.copy_pipeline;
 
   pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
@@ -172,15 +134,12 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   }
   // Registered explicitly rather than through a backend: each arena is a remote
   // endpoint for RDMA reads and writes, so it needs a memory region even though
-  // no medium owns it. Skipped entirely when the deployment did not opt in.  A
-  // NUMA-laid-out arena is one region per node, so each records its own node.
-  bool registered = (!ranged_get_scratch_ ||
-                     pool_client_->RegisterMemory(ranged_get_scratch_, ranged_get_scratch_size_)) &&
-                    (!ranged_put_scratch_ ||
-                     pool_client_->RegisterMemory(ranged_put_scratch_, ranged_put_scratch_size_));
-  for (const auto* groups : {&ranged_get_groups_, &ranged_put_groups_}) {
-    for (const auto& group : *groups) {
-      registered = registered && pool_client_->RegisterMemory(group.buffer, group.size);
+  // no medium owns it. Skipped entirely when the deployment did not opt in.  An
+  // arena laid out by NUMA node is one region per node, so each records its own.
+  bool registered = true;
+  for (const auto* arenas : {&ranged_get_scratch_, &ranged_put_scratch_}) {
+    for (const auto& arena : *arenas) {
+      registered = registered && pool_client_->RegisterMemory(arena.buffer, arena.size);
     }
   }
   if (!registered) {
@@ -445,7 +404,39 @@ void DistributedClient::Close() {
   MORI_UMBP_INFO("[DistributedClient] closed");
 }
 
-void DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
+void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
+  HostBufferOptions opts;
+  if (dc.ranged_scratch_use_hugepages) {
+    opts.backing = HostBufferBacking::kAnonymousHugetlb;
+    opts.hugepage_size = dc.ranged_scratch_hugepage_size;
+  }
+  if (dc.ranged_scratch_numa_layout && LayOutRangedScratchByNuma(dc.ranged_scratch_size, opts)) {
+    return;
+  }
+  // One arena per direction, each of ranged_scratch_size, so the two
+  // directions never share a buffer or a lock and can run concurrently.
+  HostMemAllocator allocator;
+  for (auto* arenas : {&ranged_get_scratch_, &ranged_put_scratch_}) {
+    HostBufferHandle handle = allocator.Alloc(dc.ranged_scratch_size, opts);
+    if (!handle.valid()) {
+      // HostBufferHandle is not RAII and the destructor/Close() won't run when a
+      // constructor throws, so free whatever did allocate before bailing out.
+      FreeRangedScratch();
+      throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
+    }
+    ranged_scratch_handles_.push_back(handle);
+    arenas->push_back({handle.ptr, handle.mapped_size});
+  }
+  // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
+  const HostBufferHandle& first = ranged_scratch_handles_.front();
+  MORI_UMBP_INFO(
+      "[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
+      first.mapped_size >> 20, first.actual_alignment >> 10,
+      first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
+  WarnIfNicAliases(first, first.mapped_size);
+}
+
+bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
   // Each node's share of the bytes follows its GPU count, and so does its shard
   // count: one shard per GPU, unless UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS asks
   // for another total.
@@ -460,7 +451,7 @@ void DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
   }
   if (gpus_on_node.empty()) {
     MORI_UMBP_INFO("[DistributedClient] ranged scratch: no GPU NUMA affinity, so one arena");
-    return;
+    return false;
   }
   size_t gpus = 0;
   for (const auto& entry : gpus_on_node) gpus += entry.second;
@@ -482,7 +473,7 @@ void DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
     MORI_UMBP_WARN(
         "[DistributedClient] ranged scratch: {} B is too small for {} shards, so one arena", bytes,
         shards);
-    return;
+    return false;
   }
 
   HostMemAllocator allocator;
@@ -492,43 +483,38 @@ void DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
     opts.numa_node = node;
     opts.numa_bind_mode = NumaBindMode::kBind;
     opts.require_numa_binding = true;
-    for (auto* groups : {&ranged_get_groups_, &ranged_put_groups_}) {
+    for (auto* arenas : {&ranged_get_scratch_, &ranged_put_scratch_}) {
       HostBufferHandle handle = allocator.Alloc(n * shard, opts);
       if (!handle.valid()) {
         MORI_UMBP_WARN(
             "[DistributedClient] ranged scratch: {} B on NUMA node {} unavailable, so one arena",
             n * shard, node);
         FreeRangedScratch();
-        return;
+        return false;
       }
-      groups->push_back({handle.ptr, n * shard, node, n});
-      ranged_group_handles_.push_back(handle);
+      arenas->push_back({handle.ptr, n * shard, node, n});
+      ranged_scratch_handles_.push_back(handle);
     }
-    WarnIfNicAliases(ranged_group_handles_.back(), n * shard);
+    WarnIfNicAliases(ranged_scratch_handles_.back(), n * shard);
     layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
               std::to_string(n) + " x " + std::to_string(shard >> 10) + " KiB";
   }
-  for (const auto& group : ranged_get_groups_) ranged_get_scratch_size_ += group.size;
-  for (const auto& group : ranged_put_groups_) ranged_put_scratch_size_ += group.size;
-  const HostBufferHandle& first = ranged_group_handles_.front();
+  size_t total = 0;
+  for (const auto& arena : ranged_get_scratch_) total += arena.size;
+  const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
       "[DistributedClient] ranged scratch: 2 arenas x {} KiB by NUMA node ({}), {} KiB pages ({})",
-      ranged_get_scratch_size_ >> 10, layout, first.actual_alignment >> 10,
+      total >> 10, layout, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
+  return true;
 }
 
 void DistributedClient::FreeRangedScratch() {
   HostMemAllocator allocator;
-  allocator.Free(ranged_get_scratch_handle_);
-  allocator.Free(ranged_put_scratch_handle_);
-  for (auto& handle : ranged_group_handles_) allocator.Free(handle);
-  ranged_group_handles_.clear();
-  ranged_get_groups_.clear();
-  ranged_put_groups_.clear();
-  ranged_get_scratch_ = nullptr;
-  ranged_get_scratch_size_ = 0;
-  ranged_put_scratch_ = nullptr;
-  ranged_put_scratch_size_ = 0;
+  for (auto& handle : ranged_scratch_handles_) allocator.Free(handle);
+  ranged_scratch_handles_.clear();
+  ranged_get_scratch_.clear();
+  ranged_put_scratch_.clear();
 }
 
 bool DistributedClient::IsDistributed() const { return true; }
@@ -560,7 +546,7 @@ bool DistributedClient::SupportsRangedIO() const {
   // either report ranged I/O as unsupported or allocate two arenas it cannot
   // use.
   if (local_only_) return true;
-  return ranged_get_scratch_size_ != 0 && ranged_put_scratch_size_ != 0;
+  return !ranged_get_scratch_.empty() && !ranged_put_scratch_.empty();
 }
 
 bool DistributedClient::ReportExternalKvBlocks(const std::vector<std::string>& hashes,

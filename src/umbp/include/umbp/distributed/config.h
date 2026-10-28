@@ -267,30 +267,23 @@ struct PoolClientConfig {
   // owns the backing mappings and frees them only after PoolClient::Shutdown has
   // deregistered the regions. Direct PoolClient tests may provide their own.
   //
-  // Two separate arenas — one for remote ranged GET, one for remote ranged PUT
-  // — each under its own mutex in PoolClient, so a remote get and a remote put
-  // run concurrently instead of serializing on one lock (the load/offload
-  // overlap sglang's direct linker wants). Each must hold at least one whole
-  // object. Both zero keeps ranged remote I/O disabled with no host memory
-  // registered; SupportsRangedIO() requires both to be set.
-  void* ranged_get_scratch_buffer = nullptr;
-  size_t ranged_get_scratch_size = 0;
-  void* ranged_put_scratch_buffer = nullptr;
-  size_t ranged_put_scratch_size = 0;
-
-  // The same arenas laid out by NUMA node instead: one registered buffer per
-  // node and direction, cut into `shards` like the single arena.  When given, a
-  // remote ranged call stages through the group on its caller buffer's node, the
-  // first group also serves callers whose node is unknown, and the single arenas
-  // above stay unset.
-  struct RangedScratchGroup {
+  // Separate arenas for remote ranged GET and remote ranged PUT, each under its
+  // own mutex in PoolClient, so a remote get and a remote put run concurrently
+  // instead of serializing on one lock (the load/offload overlap sglang's direct
+  // linker wants). A direction has one arena that every caller shares, or one
+  // per NUMA node: a remote ranged call then stages through the arena on its
+  // caller buffer's node, and the first one serves a caller whose node is
+  // unknown. Each must hold at least one whole object. None keeps ranged remote
+  // I/O disabled with no host memory registered; SupportsRangedIO() requires
+  // both directions to have one.
+  struct RangedScratchArena {
     void* buffer = nullptr;
     size_t size = 0;
-    int numa_node = -1;
-    size_t shards = 1;
+    int numa_node = -1;  // -1: not placed by node
+    size_t shards = 0;   // 0: UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS, else 1
   };
-  std::vector<RangedScratchGroup> ranged_get_scratch_groups;
-  std::vector<RangedScratchGroup> ranged_put_scratch_groups;
+  std::vector<RangedScratchArena> ranged_get_scratch;
+  std::vector<RangedScratchArena> ranged_put_scratch;
 
   // SSD staging pages per SsdBackend; 0 = the preset (SsdStagingPages).  Its
   // read lease is resolved from UMBP_SSD_READ_LEASE_MS during PoolClient::Init.
