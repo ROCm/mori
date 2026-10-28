@@ -86,27 +86,26 @@ jobs:
           $CT exec $CONTAINER test -x build/examples/collectives_benchmark_rs_timing
           rm -rf $LOG_DIR
 
-      # Temporary (push slice timing investigation): all-reduce push only, 128
-      # blocks (MORI_CCL_MAX_NBLOCKS), S = 1,2,4 at large sizes. Each point runs
-      # once with the normal binary (kernel time) and once with RS_PUSH_TIMING
-      # compiled in (per-slice wait/reduce + broadcast tables in the job summary;
-      # raw [RS-T] lines in the uploaded logs).
-      - name: all_reduce push timing (nblocks 128; S=1,2,4; 64M-1G)
+      # Temporary (push timing investigation): is all-reduce push limited by the
+      # SDMA engines or by xGMI? Pure-copy references at the same byte counts as
+      # one all-reduce leg (all-gather / all-to-all, SDMA push vs CU pull), plus
+      # all-reduce pull and the all-reduce push baseline (S=2, 128 blocks).
+      # Normal binary only.
+      - name: SDMA vs xGMI ceiling probe (256M, 1G)
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY == 'true' }}
         run: |
           fail=0
-          nb=128
-          for logS in 0 1 2; do
-            for bin in collectives_benchmark collectives_benchmark_rs_timing; do
-              label="nb${nb} "
-              [ "$bin" = collectives_benchmark_rs_timing ] && label="timing nb${nb} "
-              $CT exec -e DTYPES="bf16" -e OPS=sum \
-                -e SIZES="67108864 268435456 1073741824" \
-                -e MORI_CCL_MAX_NBLOCKS=$nb \
-                -e RUN_TIMEOUT=180 -e BIN=./build/examples/$bin -e LABEL="$label" \
-                $CONTAINER bash $BENCH --coll all_reduce --mode push --logS $logS || fail=1
-            done
+          run() {
+            $CT exec -e DTYPES="bf16" -e OPS=sum -e SIZES="268435456 1073741824" \
+              -e RUN_TIMEOUT=180 "$@" || fail=1
+          }
+          for mode in push pull; do
+            run $CONTAINER bash $BENCH --coll all_gather --mode $mode
+            run $CONTAINER bash $BENCH --coll all_to_all --mode $mode
           done
+          run $CONTAINER bash $BENCH --coll all_reduce --mode pull
+          run -e MORI_CCL_MAX_NBLOCKS=128 -e LABEL="nb128 " \
+            $CONTAINER bash $BENCH --coll all_reduce --mode push --logS 1
           exit $fail
 
       # Each group runs even if an earlier one failed, so one broken kernel does
