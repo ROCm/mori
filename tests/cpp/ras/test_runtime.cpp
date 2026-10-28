@@ -20,8 +20,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include <dirent.h>
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sched.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -29,6 +31,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "mori/ras/ras.hpp"
 #include "src/ras/runtime.hpp"
@@ -226,6 +229,37 @@ TEST(RasRuntime, StoppingClosesTheListenerAndRefusesLaterEvents) {
   EXPECT_EQ(err, ECONNREFUSED);
   EXPECT_FALSE(core.Enqueue(EngineRegistered{"late"}));
   core.Stop(true);  // a second stop is harmless
+}
+
+TEST(RasRuntime, ExitIsCleanWhileTheRasThreadIsLogging) {
+  // Every garbage connection makes the RAS thread log a protocol error, and a helper keeps
+  // sending them while the process exits, so the RAS thread logs as static destructors run.
+  // Run under ASan or TSan, this catches a logger destroyed under the RAS thread.
+  auto start = std::chrono::steady_clock::now();
+  EXPECT_EQ(RunInChild([] {
+              int devnull = open("/dev/null", O_WRONLY);
+              dup2(devnull, STDOUT_FILENO);
+              setenv("MORI_RAS_ENABLE", "1", 1);
+              setenv("MORI_RAS_LOG_LEVEL", "debug", 1);
+              RasRuntime* r = RasRuntime::EnsureStarted(Params());
+              CHILD_CHECK(r != nullptr);
+              uint16_t port = r->Endpoint().port;
+              std::thread([port] {
+                const std::string junk(64, 'x');
+                for (;;) {
+                  int fd = ras_test::ConnectTcp("127.0.0.1", port, nullptr);
+                  if (fd >= 0) {
+                    send(fd, junk.data(), junk.size(), MSG_NOSIGNAL);
+                    close(fd);
+                  }
+                }
+              }).detach();
+              CHILD_CHECK(WaitFor([&] { return r->Snapshot().protocolErrors >= 10; }, 2000));
+              std::exit(0);
+              return 1;
+            }),
+            0);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
 }
 
 TEST(RasRuntime, ExitStopsTheRuntimeWithoutHangingOrLogging) {

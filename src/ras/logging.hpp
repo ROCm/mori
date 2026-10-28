@@ -25,30 +25,30 @@
 // teardown, or a port already in use, log at debug: operators and post-mortem tools read
 // warnings as failures.
 //
-// Logging stops for good once process exit begins. MORI_LOG caches each logger in a
-// function-local static that may already be destroyed by the time the atexit handler stops
-// the RAS thread.
+// RAS logs through RasLogger(), not MORI_LOG. MORI_LOG caches each logger in a function-local
+// static, and at exit those statics, spdlog's registry with them, can be destroyed while the
+// RAS thread is still running, before the atexit handler that stops it. RasLogger() holds the
+// "ras" logger for the life of the process, so it is never freed under the RAS thread, and
+// returns nullptr once exit begins, so nothing logs on the way out.
 
-#include "mori/utils/mori_log.hpp"
+#include "spdlog/spdlog.h"
 
 namespace mori {
 namespace ras {
 
-bool LogEnabled();
+// The "ras" module logger, or nullptr once process exit begins.
+spdlog::logger* RasLogger();
 void DisableLoggingForExit();
 
 }  // namespace ras
 }  // namespace mori
 
-#define RAS_LOG_DEBUG(...)                                      \
-  do {                                                          \
-    if (::mori::ras::LogEnabled()) MORI_RAS_DEBUG(__VA_ARGS__); \
+#define RAS_LOG_AT(method, ...)                                     \
+  do {                                                              \
+    if (::spdlog::logger* _ras_logger = ::mori::ras::RasLogger()) { \
+      _ras_logger->method(__VA_ARGS__);                             \
+    }                                                               \
   } while (0)
-#define RAS_LOG_INFO(...)                                      \
-  do {                                                         \
-    if (::mori::ras::LogEnabled()) MORI_RAS_INFO(__VA_ARGS__); \
-  } while (0)
-#define RAS_LOG_WARN(...)                                      \
-  do {                                                         \
-    if (::mori::ras::LogEnabled()) MORI_RAS_WARN(__VA_ARGS__); \
-  } while (0)
+#define RAS_LOG_DEBUG(...) RAS_LOG_AT(debug, __VA_ARGS__)
+#define RAS_LOG_INFO(...) RAS_LOG_AT(info, __VA_ARGS__)
+#define RAS_LOG_WARN(...) RAS_LOG_AT(warn, __VA_ARGS__)

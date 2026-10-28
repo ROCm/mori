@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "mori/ras/ras.hpp"
+#include "mori/utils/mori_log.hpp"
 #include "src/ras/fd_registry.hpp"
 #include "src/ras/logging.hpp"
 
@@ -134,7 +135,15 @@ std::string InterfaceAddress(const std::string& ifname) {
 
 }  // namespace
 
-bool LogEnabled() { return g_logEnabled.load(std::memory_order_acquire); }
+spdlog::logger* RasLogger() {
+  if (!g_logEnabled.load(std::memory_order_acquire)) return nullptr;
+  // A pointer, deliberately leaked: no destructor runs at exit, so the logger outlives
+  // spdlog's registry and the ModuleLogger that hand it out.
+  static auto* logger =
+      new std::shared_ptr<spdlog::logger>(ModuleLogger::GetInstance().GetLogger(modules::RAS));
+  return logger->get();
+}
+
 void DisableLoggingForExit() { g_logEnabled.store(false, std::memory_order_release); }
 
 RasCore::RasCore(CoreParams params) : params_(std::move(params)) {
@@ -323,6 +332,9 @@ RasRuntime* RasRuntime::EnsureStarted(const StartParams& params) {
   g_core.store(core, std::memory_order_release);
   status = RuntimeStatus{RunState::kRunning, 0, ""};
   if (!g_atexitRegistered) {
+    // Exit runs atexit handlers and static destructors in reverse order of registration, so
+    // building the logging statics first makes StopAtExit run before they are destroyed.
+    (void)RasLogger();
     std::atexit(StopAtExit);
     g_atexitRegistered = true;
   }
