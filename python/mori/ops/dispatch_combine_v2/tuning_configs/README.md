@@ -100,7 +100,7 @@ other tables may not set it. Current settings:
 | --- | --- | --- | --- |
 | MI355X (gfx950, 256) | 256/8, 256/6, 384/6 | 7168; 5120 for 384/6 | bf16, fp8_e4m3 |
 | MI308X (gfx942, 80) | 256/8, 256/6, 384/6; 264/9 intra; 272/9, 896/16 inter | 7168; 6144 for 256/8; 5120 for 384/6; 3584 for 896/16 | bf16, fp8_e4m3_fnuz; fp4 for inter 256/8 |
-| MI300X (gfx942, 304) | 256/8, 384/6 | 7168; 6144 for 256/8 | bf16, fp8_e4m3_fnuz |
+| MI300X (gfx942, 304) | 256/8, 384/6; 256/6, 264/9 intra | 7168; 6144 for 256/8; 5120 for intra 384/6 | bf16, fp8_e4m3_fnuz |
 
 Each GPU model has IntraNodeV2 (EP8), InterNodeV2 (EP16) and InterNodeV2LL
 (EP16) tables, and every shape in a table has both phases. Not every shape is
@@ -113,24 +113,25 @@ The model behind each shape:
 | Model | Experts / top-k | Hidden the dispatch carries | Tables |
 | --- | --- | --- | --- |
 | DeepSeek-V3/R1 | 256/8 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16; FP4 dispatch (stored as 3584, packed) on MI308X EP16 |
-| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI308X |
+| DeepSeek-V3/R1, shared expert fused in | 264/9 at EP8, 272/9 at EP16 | 7168 | MI308X; MI300X: EP8 |
 | GLM-5, GLM-5.3 | 256/8 | 6144 | MI308X, MI300X: EP8 and EP16 |
 | DeepSeek-V4-Pro | 384/6 | 7168 | MI355X, MI308X, MI300X: EP8 and EP16 |
-| DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X: EP8 and EP16 |
+| DeepSeek-V4.1-Flash | 384/6 | 5120 | MI355X, MI308X: EP8 and EP16; MI300X: EP8 |
 | Kimi K3 | 896/16 | 3584 | MI308X: EP16 |
-| none known | 256/6 | 7168 | MI355X, MI308X: EP8 and EP16, bf16 dispatch only |
+| none known | 256/6 | 7168 | MI355X, MI308X: EP8 and EP16; MI300X: EP8; bf16 dispatch only |
 
 A shape without rows runs on the default geometry: for example DeepSeek-V4-Flash
 (256/6 at hidden 4096), the DSpark draft layers of DeepSeek-V4.1-Flash (128/3 at
 hidden 5120), GLM-5.3 with its shared expert fused in (264/9 and 272/9 at
 hidden 6144), and every shape on a GPU or EP size its table lacks.
 
-MI308X 264/9 and 272/9 are DeepSeek-V3/R1 with the shared expert fused in as
-a routed one, laid out as ATOM's `SharedExpertMode.LOCAL_REPLICA` does: every
-rank holds its 256/EP routed experts plus one replica of the shared expert in
-its last slot, and each token's ninth expert is its own rank's replica. The
-expert count depends on the EP size, so 264/9 (33 a rank) is only in the EP8
-table and 272/9 (17 a rank) only in the EP16 tables.
+MI308X 264/9 and 272/9, and MI300X 264/9, are DeepSeek-V3/R1 with the shared
+expert fused in as a routed one, laid out as ATOM's
+`SharedExpertMode.LOCAL_REPLICA` does: every rank holds its 256/EP routed
+experts plus one replica of the shared expert in its last slot, and each
+token's ninth expert is its own rank's replica. The expert count depends on the
+EP size, so 264/9 (33 a rank) is only in the EP8 table and 272/9 (17 a rank)
+only in the EP16 tables.
 
 MI308X 896/16 is Kimi K3. Its routed experts run on a 3584-wide latent (the
 model projects the 7168-wide hidden state down before the dispatch and back
@@ -160,6 +161,14 @@ Metrics are only comparable between rows measured under the same conditions.
   accepted only after correctness checks, and only if each phase has
   mean/median ≤ 1.10 and max/median ≤ 5, and the per-pass D+C means vary by
   ≤ 1.20×.
+- **MI300X EP8 256/6, 264/9 and 384/6 at H5120.** Tuned with the harness
+  sweep (`--cmd tuning --tuning-save`, quick scope, the harness's default
+  `scale_dim` of 32), not with the protocol above: 3 paired reps per candidate
+  against the default geometry, then a non-default winner rechecked against the
+  default with 7 paired reps, once on the tuning node and up to twice on a second
+  MI300X. A winner was kept only if it won the majority of its rechecks; the three
+  that did not were put back to the default and re-measured. Their metrics are not
+  comparable with rows measured under the protocol above.
 - **Metrics.** `avg_latency_us` is the mean over all retained samples.
   Bandwidths are grand means of per-rank, per-round `bytes / time`, not
   `bytes / mean latency`. `bandwidth_gbps` is XGMI for intra-node rows, RDMA for
