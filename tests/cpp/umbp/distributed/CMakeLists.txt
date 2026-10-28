@@ -14,7 +14,13 @@
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
-if(TARGET gRPC::grpc++)
+# The flavor src/umbp/CMakeLists.txt picks: umbp_common brings that one in, and a
+# test linking the other as well would load two copies of gRPC. Its gRPC targets
+# are not visible from this directory, hence the second find_package.
+find_package(gRPC CONFIG QUIET)
+if(TARGET gRPC::grpc++_unsecure)
+  set(_TEST_GRPCPP_LIB gRPC::grpc++_unsecure)
+elseif(TARGET gRPC::grpc++)
   set(_TEST_GRPCPP_LIB gRPC::grpc++)
 elseif(TARGET grpc++)
   set(_TEST_GRPCPP_LIB grpc++)
