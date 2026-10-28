@@ -37,6 +37,24 @@
 
 namespace mori::umbp {
 
+namespace {
+
+// Each ranged scratch arena, or each NUMA part of one, is one NIC memory region,
+// and AINIC translates only the first 2^18 page entries of a region and silently
+// aliases the rest (see UMBP_DRAM_MAX_MR_BYTES).
+void WarnIfNicAliases(const HostBufferHandle& handle, size_t bytes) {
+  constexpr size_t kNicRegionPages = size_t{1} << 18;
+  const size_t page = handle.actual_alignment;
+  if (page == 0 || bytes / page <= kNicRegionPages) return;
+  MORI_UMBP_WARN(
+      "[DistributedClient] ranged scratch region of {} MiB on {} KiB pages exceeds the {} pages "
+      "an AINIC memory region translates; use UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES or a "
+      "smaller UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES",
+      bytes >> 20, page >> 10, kNicRegionPages);
+}
+
+}  // namespace
+
 DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config) {
   if (!config.distributed.has_value()) {
     throw std::runtime_error("DistributedClient requires UMBPConfig::distributed to be set");
@@ -129,6 +147,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
                    ranged_get_scratch_handle_.actual_backing == HostBufferBacking::kAnonymousHugetlb
                        ? "hugetlb"
                        : "anonymous");
+    WarnIfNicAliases(ranged_get_scratch_handle_, ranged_get_scratch_handle_.mapped_size);
     ranged_get_scratch_ = ranged_get_scratch_handle_.ptr;
     ranged_get_scratch_size_ = ranged_get_scratch_handle_.mapped_size;
     ranged_put_scratch_ = ranged_put_scratch_handle_.ptr;
@@ -440,7 +459,7 @@ void DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
     }
   }
   if (gpus_on_node.empty()) {
-    MORI_UMBP_WARN("[DistributedClient] ranged scratch: no GPU NUMA affinity, so one arena");
+    MORI_UMBP_INFO("[DistributedClient] ranged scratch: no GPU NUMA affinity, so one arena");
     return;
   }
   size_t gpus = 0;
@@ -485,6 +504,7 @@ void DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
       groups->push_back({handle.ptr, n * shard, node, n});
       ranged_group_handles_.push_back(handle);
     }
+    WarnIfNicAliases(ranged_group_handles_.back(), n * shard);
     layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
               std::to_string(n) + " x " + std::to_string(shard >> 10) + " KiB";
   }
