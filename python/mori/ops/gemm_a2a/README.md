@@ -40,39 +40,50 @@ it unless `--block-m` is given:
   and 256x256 spills (`gemm_ar/op.py`).
 
 The ptpc rule was measured, not assumed — every ptpc cell below was also run at
-the tile the rule did *not* pick (`sweep_models.py --alt-tile`):
+the tile the rule did *not* pick (`sweep_inproc.py --alt-tile`):
 
 | model | M | waves at 256x256 | picked | gemm-only 128 | gemm-only 256 | best fused 128 | best fused 256 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 70B | 2048 | 1.25 | **128** | 169 | 169 (-0%) | **213** | 217 (+2%) |
-| 70B | 4096 | 2.50 | 256 | 287 | 269 (-6%) | 358 | **338** (-6%) |
-| 70B | 8192 | 5.00 | 256 | 532 | 459 (-14%) | 646 | **588** (-9%) |
-| 70B | 16384 | 10.00 | 256 | 1372 | 911 (-34%) | 1730 | **1118** (-35%) |
-| 405B | 2048 | 2.25 | 256 | 623 | 509 (-18%) | 734 | **578** (-21%) |
-| 405B | 4096 | 4.50 | 256 | 1148 | 889 (-23%) | 1323 | **980** (-26%) |
-| 405B | 8192 | 9.00 | 256 | 2289 | 1692 (-26%) | 2626 | **1839** (-30%) |
-| 405B | 16384 | 18.00 | 256 | 4554 | 3404 (-25%) | 5269 | **3668** (-30%) |
+| 70B | 2048 | 1.25 | **128** | **151** | 159 (+5%) | **203** | 210 (+3%) |
+| 70B | 4096 | 2.50 | 256 | 264 | 257 (-2%) | 349 | **328** (-6%) |
+| 70B | 8192 | 5.00 | 256 | 524 | 451 (-14%) | 640 | **578** (-10%) |
+| 70B | 16384 | 10.00 | 256 | 1359 | 918 (-32%) | 1737 | **1138** (-35%) |
+| 405B | 2048 | 2.25 | 256 | 618 | 502 (-19%) | 729 | **568** (-22%) |
+| 405B | 4096 | 4.50 | 256 | 1157 | 899 (-22%) | 1330 | **989** (-26%) |
+| 405B | 8192 | 9.00 | 256 | 2301 | 1699 (-26%) | 2645 | **1858** (-30%) |
+| 405B | 16384 | 18.00 | 256 | 4576 | 3383 (-26%) | 5307 | **3678** (-31%) |
 
 The picked tile has the faster fused path in all eight cells. 128x256 was the
 ptpc default before this table existed; it was inherited from `gemm_ar`'s
 blockscale path, where it is a spill limit, and under ptpc it has no such
 reason.
 
+The rule was fitted at P=8 and does not carry over to P=4 unchanged: on
+MiniMax-M3's QKV at P=4 ([below](#against-aiter-6689--minimax-m3-qkv-at-p4))
+128x256 has the fastest fused arm at every M, 1–7% ahead of the 256x256 the
+rule picks at M=4096 and 8192.
+
 ## Conditions
 
-8x MI355X (gfx950), one node (`crsuse2-m2m-v3-054`, 2026-10-27), fp8 e4m3 in /
-bf16 out, CUDA graph replay, median of 21 iterations after 30 warmups, max over
-ranks. FlyDSL 0.2.4, torch 2.12.0+rocm7.14.0.
+8x MI355X (gfx950), one node (`crsuse2-m2m-v3-095`, 2026-10-28), nothing else
+on it, fp8 e4m3 in / bf16 out, FlyDSL 0.4.0, torch 2.12.0+rocm7.14.0.
 
-**Three independent launches per configuration, interleaved.** Every
-configuration is measured once per round and the rounds repeat, so machine
-drift lands inside each configuration's own samples where the spread shows it,
-rather than between the things being compared. Every launch waits for an idle
-box; any sample taken with a neighbour present is discarded, not averaged in.
-Junction temperature stayed at 58–60 °C across the run.
+**Timing.** Every case of a table runs in one process on one communicator
+(`sweep_inproc.py`). A case replays its CUDA graph back to back, 50 launches
+to a batch with an event between each, until at least 3 s (8 s for the last
+ptpc round and the mxfp8 rounds) and 100 launches have run; the number is the
+median launch-to-launch gap, max over ranks. The GPU never waits on the host,
+so there is no per-launch submit gap in the number. That makes small-M cells a
+few percent faster than in this file's earlier tables, which timed each launch
+with its own sync; the fused-vs-split margins moved by at most two points.
 
-Reported spread is 0.1–3.6% on every configuration, and all 192 samples
-validated against a host reference on every source rank.
+**Three rounds per configuration, interleaved.** Every configuration is measured
+once per round and the rounds repeat, alternating direction, so machine drift
+lands inside each configuration's own samples where the spread shows it, rather
+than between the things being compared.
+
+Spread across rounds is 0.0–3.3% on every ptpc configuration, and all 192 ptpc
+samples validated against a host reference on every source rank.
 
 > **This protocol is not optional here, and the cost of skipping it was most of
 > a day.** A neighbour on the box is worth 9% on a *pure GEMM* — a kernel that
@@ -90,50 +101,51 @@ validated against a host reference on every source rank.
 
 | M | S | tile | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
 |---:|---:|---|---:|---:|---:|---|---:|---:|
-| 2048 | 16k | 128×256 | 169 | 254 | 352 | **213** `c4` | 16.0% | 39.4% |
-| 4096 | 32k | 256×256 | 269 | 443 | 513 | **338** `c8` | 23.6% | 34.1% |
-| 8192 | 64k | 256×256 | 459 | 814 | 931 | **588** `c4` | 27.8% | 36.8% |
-| 16384 | 128k | 256×256 | 911 | 1613 | 1821 | **1118** `c8` | **30.7%** | 38.6% |
+| 2048 | 16k | 128×256 | 151 | 244 | 344 | **203** `c4` | 16.6% | 40.9% |
+| 4096 | 32k | 256×256 | 257 | 441 | 513 | **328** `c8` | 25.5% | 36.0% |
+| 8192 | 64k | 256×256 | 451 | 813 | 930 | **578** `c4` | 28.8% | 37.8% |
+| 16384 | 128k | 256×256 | 918 | 1619 | 1824 | **1138** `c8` | **29.7%** | 37.6% |
 
 ### PTPC — Llama-3.1-405B — `N=18432 K=16384` (s=2304)
 
 | M | S | tile | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
 |---:|---:|---|---:|---:|---:|---|---:|---:|
-| 2048 | 16k | 256×256 | 509 | 687 | 744 | **578** `c8` | 15.9% | 22.4% |
-| 4096 | 32k | 256×256 | 889 | 1204 | 1304 | **980** `c8` | 18.6% | 24.8% |
-| 8192 | 64k | 256×256 | 1692 | 2275 | 2451 | **1839** `c8` | 19.1% | 25.0% |
-| 16384 | 128k | 256×256 | 3404 | 4676 | 4989 | **3668** `c8` | **21.6%** | 26.5% |
+| 2048 | 16k | 256×256 | 502 | 681 | 738 | **568** `c8` | 16.6% | 23.1% |
+| 4096 | 32k | 256×256 | 899 | 1204 | 1303 | **989** `c8` | 17.9% | 24.1% |
+| 8192 | 64k | 256×256 | 1699 | 2280 | 2457 | **1858** `c8` | 18.5% | 24.4% |
+| 16384 | 128k | 256×256 | 3383 | 4694 | 4998 | **3678** `c8` | **21.6%** | 26.4% |
 
 All modes agree to the digit on relL2 — 1.66e-3, fp8's own floor at these
 operands — so the transports write identical bytes and the numbers above are
 comparing the same computation.
 
-### MXFP8 — earlier run, not re-measured on this node
+### MXFP8 — 256x256
 
-The table below was taken on a different node with the same protocol (two
-rounds, spread 0.1–1.0%), before the ptpc tile changed. Its absolute times are
-not comparable with the ptpc tables above.
+Same node and run as the ptpc tables, two rounds, spread 0.0–2.3%, all 80
+samples validated.
 
 | M | S | gemm-only | split-sdma | split-rccl | best fused | vs split | vs rccl |
 |---:|---:|---:|---:|---:|---|---:|---:|
 | **70B** | | | | | | | |
-| 2048 | 16k | 197 | 294 | 322 | **249** `c4` | 15.3% | 22.8% |
-| 4096 | 32k | 305 | 481 | 552 | **391** `c4` | 18.7% | 29.1% |
-| 8192 | 64k | 596 | 898 | 1047 | **681** `c4` | 24.2% | 35.0% |
-| 16384 | 128k | 1211 | 1916 | 2121 | **1443** `c8` | **24.7%** | 32.0% |
+| 2048 | 16k | 182 | 282 | 382 | **230** `c4` | 18.3% | 39.8% |
+| 4096 | 32k | 289 | 465 | 560 | **369** `c4` | 20.6% | 34.1% |
+| 8192 | 64k | 545 | 861 | 1001 | **651** `c4` | 24.4% | 35.0% |
+| 16384 | 128k | 1121 | 1798 | 2000 | **1374** `c8` | **23.6%** | 31.3% |
 | **405B** | | | | | | | |
-| 2048 | 16k | 669 | 826 | 872 | **733** `c8` | 11.3% | 16.0% |
-| 4096 | 32k | 1151 | 1465 | 1546 | **1257** `c8` | 14.2% | 18.7% |
-| 8192 | 64k | 2129 | 2788 | 2959 | **2341** `c8` | 16.1% | 20.9% |
-| 16384 | 128k | 4230 | 5649 | 5988 | **4696** `c8` | **16.9%** | 21.6% |
+| 2048 | 16k | 603 | 761 | 828 | **676** `c8` | 11.2% | 18.4% |
+| 4096 | 32k | 1065 | 1333 | 1456 | **1174** `c8` | 11.9% | 19.3% |
+| 8192 | 64k | 1989 | 2619 | 2792 | **2198** `c8` | 16.1% | 21.3% |
+| 16384 | 128k | 4016 | 5332 | 5692 | **4395** `c8` | **17.6%** | 22.8% |
 
-An earlier version of this file read this table as "mxfp8 is faster than ptpc
-at large M" and "fusing pays twice as much under mxfp8". Both were the tile,
-not the format: that comparison ran ptpc at 128x256 and mxfp8 at 256x256. At
-the **same** 256x256 tile, on one node with interleaved rounds, mxfp8's GEMM is
-**15–18% slower** than ptpc's in every one of six cells (70B and 405B at
-M = 2048 / 8192 / 16384; e.g. 405B M=16384 gemm-only 3921 vs 3378us), and its
-best fused path 10–17% slower.
+At the same 256x256 tile, mxfp8's GEMM is **13–22% slower** than ptpc's in
+every cell (405B M=16384 gemm-only 4016 vs 3383us), and its best fused path
+10–21% slower. An earlier version of this file read an mxfp8 table as "mxfp8 is
+faster than ptpc at large M"; that comparison ran ptpc at 128x256 and mxfp8 at
+256x256, so it was the tile, not the format. The gap is the scale loads
+stalling the tile prefetch — loads retire in order, so a scale load issued
+after the prefetch waits behind it. mori #857 prefetches the scales one K step
+ahead in `gemm_ar`'s fused kernel; this operator's GEMM does not have that
+yet, and this table is without it.
 
 ### The full mode table at one cell, `M=2048` — earlier run, 128x256
 
@@ -156,22 +168,62 @@ the modes the model tables do not carry (`split-lsa`, `fused-lsa`, `c2`).
 the *unhidden tail*, not wire time — the transfer is inside the GEMM — so it is
 comparable across fused configurations but not against the split ones.
 
+## Against aiter #6689 — MiniMax-M3 QKV at P=4
+
+aiter #6689 fuses the same operation for MiniMax-M3's QKV projection under
+Ulysses SP4 (its `sp_qkv` large path): `K=6144`, and per destination either Q|K|V
+(**dense**, 2304 columns, `N=9216`) or Q|K|V|IQ|IK (**indexer**, 2560 columns,
+`N=10240`). aiter computes the indexer's IK once and sends it to every rank;
+mori can only express that with IK's 128 weight rows replicated per destination,
+so on the indexer case mori does 3.9% more GEMM work than aiter.
+
+Same node, same day, GPUs 0–3, three interleaved rounds. aiter ran its
+`fp8_a2a_sdma_{dense,indexer}` standalone harness (PR revision r11) with the two
+configurations its tuning profile lists for each shape, 3000 back-to-back
+iterations after 50 warmups, max over ranks; the better of the two is shown.
+mori ran `fused-sdma` with `sweep_inproc.py --suite minimax`, timed as above.
+Both sides time back-to-back launches on the GPU, but the loops are not the same
+code: aiter reports the mean over its loop, mori the median launch gap. Every
+sample on both sides validated, and the spread across rounds is under 1% in
+every cell.
+
+| case | M | aiter, best tuned | mori, `GemmA2AOp` default | vs aiter | mori, best arm | vs aiter |
+|---|---:|---:|---|---:|---|---:|
+| dense | 2048 | 245.4 | 243.2 `128 c8` | -0.9% | **232.1** `128 c4` | -5.4% |
+| dense | 4096 | 439.7 | 431.6 `256 c8` | -1.8% | **404.2** `128 c8` | -8.1% |
+| dense | 8192 | 772.1 | 751.2 `256 c8` | -2.7% | **746.4** `128 c16` | -3.3% |
+| indexer | 2048 | 283.6 | 259.6 `128 c8` | -8.5% | **249.4** `128 c4` | -12.1% |
+| indexer | 4096 | 468.3 | 467.8 `256 c8` | -0.1% | **440.0** `128 c8` | -6.0% |
+| indexer | 8192 | 871.9 | 824.5 `256 c8` | -5.4% | **815.4** `128 c16` | -6.5% |
+
+Times in us; "vs aiter" is negative where mori is faster. For scale, dense
+`gemm-only` is 117.5 / 195.7 / 336.0us and dense `split-rccl` 325.3 / 602.7 /
+1131.3us at M = 2048 / 4096 / 8192.
+
+mori is ahead in every cell, by 0–9% with the operator's own picks and 3–12%
+with the best arm, and that is with the indexer doing 3.9% more GEMM. The
+defaults leave time on the table at P=4: 128x256 wins at every M (the tile rule
+was fitted at P=8), and at M=2048 four chunks beat the eight that
+`default_chunks` picks. aiter's tuning was done for its own kernel, so the "best
+tuned" column is aiter's best foot forward; mori's "best arm" is the best of
+three tried, not a tuned optimum either.
+
 ## Reading the tables
 
 **Fusing wins in all eight cells, and the margin grows with sequence length
-on both shapes.** 70B: 16.0% → 23.6% → 27.8% → 30.7%; 405B: 15.9% → 18.6% →
-19.1% → 21.6%. At larger M there is more GEMM after the first chunk completes
+on both shapes.** 70B: 16.6% → 25.5% → 28.8% → 29.7%; 405B: 16.6% → 17.9% →
+18.5% → 21.6%. At larger M there is more GEMM after the first chunk completes
 for its PUT to overlap with. The 128x256 tables in this file's history had 70B
 peak at S=64k and fall back at 128k; at 256x256 the curve is monotone, so that
 fall-back was a property of the 128x256 kernel.
 
 **The tile is worth more than the fusion at large M.** At 70B M=16384, moving
-ptpc from 128x256 to 256x256 takes the fused path from 1730 to 1118us (-35%),
-against the 30.7% that fusion itself buys over `split-sdma`. Two things move
-together: the GEMM is 25–34% cheaper at large M, and with half the blocks the
+ptpc from 128x256 to 256x256 takes the fused path from 1737 to 1138us (-35%),
+against the 29.7% that fusion itself buys over `split-sdma`. Two things move
+together: the GEMM is 26–32% cheaper at large M, and with half the blocks the
 epilogue's per-block release fence and completion counter cost half as much —
-the fused kernel alone (`--phase-split` compute) is 2.5% above `gemm-only` at
-405B M=16384 with 256x256 against 10.3% with 128x256, and 12% against 17% at
+the fused kernel alone (`--phase-split` compute) is 3.5% above `gemm-only` at
+405B M=16384 with 256x256 against 11.1% with 128x256, and 11% against 19% at
 70B M=16384.
 
 **The best chunk count is `c8` almost everywhere.** 405B wants `c8` at every M;
@@ -180,15 +232,16 @@ Each chunk is a run of row tiles, so at 256x256 `c8` at M=2048 is one row tile
 per chunk; going further cannot start the first PUT earlier, because a chunk
 cannot complete before the GEMM wave that computes it does.
 
-**RCCL is last in every cell**, 22–39% behind the best fused path and 6–28%
+**RCCL is last in every cell**, 23–41% behind the best fused path and 6–29%
 behind `split-sdma`. That comparison is clean: `split-rccl` and `split-sdma`
-run the same GEMM over the same bytes in the same layout. RCCL on this node is
-slower at small M than on the earlier one (70B M=2048: 352 vs 298us), so the
-"vs rccl" column is not comparable across the two.
+run the same GEMM over the same bytes in the same layout. RCCL on the crsuse2
+nodes is slower at small M than on the node of the 128x256 mode table below
+(70B M=2048: 344 vs 298us), so the "vs rccl" column is not comparable across
+the two.
 
 **Fusing nearly eliminates the exposed transfer, and that bounds the win.** At
-405B/M=16384 the communication drops 1344us → 175us, −87%, yet end to end the
-gain is 21.6%. The GEMM is 93% of the fused total, so there is very little left
+405B/M=16384 the communication drops 1372us → 176us, −87%, yet end to end the
+gain is 21.6%. The GEMM is 95% of the fused total, so there is very little left
 to hide. Of the remaining tail, about 90us is the last wave's chunk on the wire
 and the rest is rank-to-rank skew in GEMM speed (`--timeline`).
 
@@ -244,32 +297,47 @@ MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
   --mode fused-sdma --chunks 8 -m 16384 -n 18432 -k 16384 \
   --warmup 30 --iters 21 --phase-split
 
-# the ptpc tables and the tile table, with the idle-box protocol
-python benchmark/cco/flydsl/gemm_a2a/sweep_models.py --rounds 3 --alt-tile \
-  --out models.jsonl
-python benchmark/cco/flydsl/gemm_a2a/sweep_models.py --quant mxfp8 --rounds 2 \
-  --out mxfp8.jsonl
+# the ptpc tables and the tile table; the mxfp8 table
+MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+  python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  benchmark/cco/flydsl/gemm_a2a/sweep_inproc.py --suite models --quant ptpc \
+  --alt-tile --rounds 3 --out models.jsonl
+MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+  python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  benchmark/cco/flydsl/gemm_a2a/sweep_inproc.py --suite models --quant mxfp8 \
+  --rounds 2 --out mxfp8.jsonl
+
+# mori's side of the aiter comparison, on four GPUs
+HIP_VISIBLE_DEVICES=0,1,2,3 MORI_ENABLE_SDMA=1 MORI_SOCKET_IFNAME=lo \
+  python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  benchmark/cco/flydsl/gemm_a2a/sweep_inproc.py --suite minimax --rounds 3 \
+  --out minimax.jsonl
 
 # the mode/chunk sweep at one shape
 python benchmark/cco/flydsl/gemm_a2a/sweep_a2a.py --out sweep.jsonl
 ```
+
+`sweep_inproc.py` skips the rows its `--out` already holds, so a sweep that was
+stopped resumes where it was by running the same command again.
 
 `BUILD_CCO_SDMA=ON` is required for the SDMA modes. Without it every put is a
 silent no-op; that is caught here — the received slabs stay zero and validation
 reports relL2 1.0 — but only because validation reads what arrived, per source
 rank, rather than this rank's own block.
 
-Back-to-back launches lose the SDMA queue reclamation race (`anvil.cpp:237`)
-often enough that a bare loop cannot finish a table. Both drivers settle
-between launches and retry a lost race rather than recording it.
+Launching one process per case (`sweep_models.py`, `sweep_a2a.py`) loses the
+SDMA queue reclamation race (`anvil.cpp:237`) often enough that a bare loop
+cannot finish a table; those drivers settle between launches and retry a lost
+race rather than recording it. `sweep_inproc.py` keeps one communicator for
+the whole sweep and did not hit it once in the runs behind these tables.
 
 ## Not measured
 
 * `--quant blockscale`. `gemm_ar` found the fused margin *grew* under
   blockscale.
-* The mxfp8 tables on the node the ptpc tables were taken on.
-* `--chunks` past 8, and `--chunks 2` anywhere but `M=2048`.
+* `--chunks` past 8 at P=8, and `--chunks 2` anywhere but `M=2048`.
 * The other validated shapes — 8B, Qwen3-32B.
 * fp8 on the wire. The transfer is already 87% hidden at the large end, so this
   would help the small-M cells rather than the large ones.
-* Anything at P != 8.
+* P other than 8, beyond the MiniMax-M3 comparison at P=4 — in particular, a
+  tile rule fitted at P=4.

@@ -52,6 +52,8 @@ import json
 import os
 import statistics
 import sys
+import time
+from types import SimpleNamespace
 
 import flydsl.expr as fx
 import torch
@@ -216,6 +218,18 @@ def reference_gemm(a, b, sa, sb, quant: str) -> torch.Tensor:
     return out
 
 
+#: How a launch is timed. ``sync`` (default): its own event pair and a sync per
+#: launch, which also charges it the host's submit gap. ``b2b`` (--b2b):
+#: ``iters`` launches back to back under one event pair, five repeats, median
+#: of the per-launch mean -- how aiter's sp_qkv standalone times its epochs.
+#: ``stream``: launches back to back with an event between each, kept going
+#: for at least ``MIN_SECONDS``; median of the per-launch gaps. The GPU never
+#: waits on the host, which is what keeps a long sweep from looking idle.
+B2B = False
+TIMING = "sync"
+MIN_SECONDS = 3.0
+
+
 def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
     if graph:
         side = torch.cuda.Stream()
@@ -234,6 +248,29 @@ def _median_us(fn, warmup: int, iters: int, *, graph: bool = True) -> float:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
+    if TIMING == "stream":
+        gaps, t0 = [], time.monotonic()
+        while time.monotonic() - t0 < MIN_SECONDS or len(gaps) < iters:
+            ev = [torch.cuda.Event(enable_timing=True) for _ in range(51)]
+            ev[0].record()
+            for i in range(50):
+                fn()
+                ev[i + 1].record()
+            ev[-1].synchronize()
+            gaps += [ev[i].elapsed_time(ev[i + 1]) * 1000.0 for i in range(50)]
+        return statistics.median(gaps)
+    if B2B or TIMING == "b2b":
+        means = []
+        for _ in range(5):
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            for _ in range(iters):
+                fn()
+            e1.record()
+            e1.synchronize()
+            means.append(e0.elapsed_time(e1) * 1000.0 / iters)
+        return statistics.median(means)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     samples = []
@@ -282,13 +319,8 @@ def _validate_recv(recv, a, b, sa, sb, args, rank, world_size) -> tuple[float, b
     return worst, worst < args.tolerance
 
 
-def run(args) -> int:
-    local_rank, rank, world_size, uid = _setup_distributed()
-    if args.mode in NOT_YET:
-        if rank == 0:
-            print(f"--mode {args.mode} is not implemented yet", file=sys.stderr)
-        return 2
-
+def _plan_case(args, world_size: int, rank: int, local_rank: int):
+    """Everything one case needs before any window exists."""
     # All three want the [dst][M][shard_n] slab; only two of them push it
     # with the copy engine.
     if args.block_m == 0:
@@ -345,172 +377,317 @@ def run(args) -> int:
         n_stamps = timeline.stamp_slots(stamp_grid, world_size, chunks)
         alloc_bytes = stamp_off + n_stamps * 8
 
-    # The window holds only what peers must reach: recv. C is local.
-    vmm = 2 * alloc_bytes + (64 << 20)
-    with Communicator.init(world_size, rank, uid, per_rank_vmm=vmm) as comm:
-        mem = comm.alloc_mem(alloc_bytes)
-        win = comm.register_window(mem.ptr, mem.size)
-        from_gpu_ptr(mem.ptr, (alloc_bytes,), torch.uint8).zero_()
-        recv = from_gpu_ptr(
-            mem.ptr + cfg.recv_off,
+    return SimpleNamespace(
+        cfg=cfg,
+        chunks=chunks,
+        needs_staging=needs_staging,
+        needs_sdma=needs_sdma,
+        a=a,
+        b=b,
+        sa=sa,
+        sb=sb,
+        b_shuf=b_shuf,
+        alloc_bytes=alloc_bytes,
+        stamp_off=stamp_off,
+        stamp_drain=stamp_drain,
+        stamp_grid=stamp_grid if args.timeline else 0,
+        n_stamps=n_stamps if args.timeline else 0,
+    )
+
+
+def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None):
+    """One case on an existing communicator, window and (optionally) dev-comm.
+
+    Returns rank 0's result dict (``None`` on other ranks). ``sweep_inproc.py``
+    calls this once per case on one communicator, so the GPUs never sit idle
+    behind a process launch.
+    """
+    cfg, chunks = P.cfg, P.chunks
+    needs_staging, needs_sdma = P.needs_staging, P.needs_sdma
+    a, b, sa, sb, b_shuf = P.a, P.b, P.sa, P.sb, P.b_shuf
+    alloc_bytes, stamp_off, stamp_drain = P.alloc_bytes, P.stamp_off, P.stamp_drain
+    stamp_grid, n_stamps = P.stamp_grid, P.n_stamps
+    # The caller's window, sized for the largest case it serves. Zeroed per
+    # case: the election counters, flags and credits are read before they are
+    # written, and a previous case's residue would elect on the wrong count.
+    from_gpu_ptr(mem.ptr, (alloc_bytes,), torch.uint8).zero_()
+    recv = from_gpu_ptr(
+        mem.ptr + cfg.recv_off,
+        (world_size * args.m, cfg.shard_n),
+        torch.bfloat16,
+    )
+    if args.mode == "gemm-to-window":
+        # The control that separates "the staging GEMM's address map is
+        # slower" from "writing cco's window is slower". recv is exactly
+        # M*N*2 bytes, so gemm-only's kernel can target it unchanged: same
+        # instructions, same address map, same descriptor size -- only the
+        # memory differs. Its contents are then meaningless, so this mode
+        # does not validate.
+        c = from_gpu_ptr(mem.ptr + cfg.recv_off, (args.m, args.n), torch.bfloat16)
+    else:
+        c = torch.empty(args.m, args.n, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+
+    reqs = CCODevCommRequirements()
+    reqs.gda_connection_type = GDA_CONNECTION_NONE
+    reqs.gda_signal_count = 0
+    reqs.gda_counter_count = 0
+    if needs_sdma:
+        reqs.sdma_queue_count = args.sdma_queues
+    dc = dev_comm if dev_comm is not None else comm.create_dev_comm(reqs)
+
+    if needs_staging:
+        # The same kernel for every staging mode, differing only in whether the
+        # epilogue posts the puts. That is the point of a split baseline:
+        # one changed thing, not two.
+        gemm = compile_fused_gemm_a2a(
+            cfg,
+            rank,
+            K=args.k,
+            BLOCK_M=args.block_m,
+            BLOCK_N=args.block_n,
+            quant=args.quant,
+            waves_per_eu=args.waves_per_eu,
+            xcd_swizzle=args.xcd_swizzle,
+            rotated=args.rotated,
+            n_stripe=args.n_stripe,
+            transport="sdma",
+            fuse=args.mode == "fused-sdma",
+            chunks=chunks,
+            sdma_queues=args.sdma_queues,
+            # RCCL takes one input covering every destination,
+            # self included, so the self-to-recv shortcut has to
+            # be off or it reads a hole.
+            self_to_recv=args.mode != "split-rccl",
+            staging_store=args.staging_store,
+            stamp_off=stamp_off,
+            war_credit=not args.no_war_credit,
+        )
+    elif args.mode == "fused-lsa":
+        # The epilogue writes into the peers, so there is no separate
+        # collective -- only the barrier below.
+        gemm = compile_fused_gemm_a2a(
+            cfg,
+            rank,
+            K=args.k,
+            BLOCK_M=args.block_m,
+            BLOCK_N=args.block_n,
+            quant=args.quant,
+            waves_per_eu=args.waves_per_eu,
+            xcd_swizzle=args.xcd_swizzle,
+            rotated=args.rotated,
+            n_stripe=args.n_stripe,
+            direct_fence=args.direct_fence,
+            emit_put=not args.no_put,
+        )
+    else:
+        gemm = compile_gemm_local(
+            cfg,
+            rank,
+            K=args.k,
+            BLOCK_M=args.block_m,
+            BLOCK_N=args.block_n,
+            quant=args.quant,
+            waves_per_eu=args.waves_per_eu,
+            xcd_swizzle=args.xcd_swizzle,
+            swap_ab=args.swap_ab,
+            permlane=args.permlane,
+        )
+    if needs_staging and args.staging_store == "copy":
+        # The copy path's descriptor is the staging region, so that is what
+        # the kernel's C argument has to be.
+        # staging and recv, as one contiguous descriptor: the store
+        # selects between them by row offset rather than by base address.
+        c_for_gemm = from_gpu_ptr(
+            mem.ptr + cfg.staging_off,
+            (2 * world_size * args.m, cfg.shard_n),
+            torch.bfloat16,
+        )
+    else:
+        c_for_gemm = c
+    a_i8 = a.contiguous().view(torch.int8).view(-1)
+    b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
+    c_flat = c_for_gemm.reshape(-1)
+    # The kernel indexes both scale buffers linearly, so it needs the
+    # *physical* element order. sa is logically [M, K/128] but column-major,
+    # so its physical order is sa.t().
+    if args.quant == "blockscale":
+        sa_arg = sa.t().reshape(-1).contiguous()
+        sb_arg = sb.reshape(-1).contiguous()
+    elif args.quant == "mxfp8":
+        # Exponent bytes widened to int32 with the byte in the low 8 bits:
+        # the MFMA's scale operand is a 32-bit register read at op_sel 0.
+        # A goes through gemm_ar's preshuffle_a_scale; B stays K-block major
+        # because a 16-column tile never straddles a 32-column group, so its
+        # load is already a broadcast.
+        sa_arg = preshuffle_a_scale(sa)
+        sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
+    else:
+        sa_arg, sb_arg = sa, sb
+
+    # Same kernel, same store side, same bytes over the fabric. Only the
+    # *read* layout differs: [M,N] strided against the compacted slab. That
+    # is the one variable this pair isolates.
+    copy = (
+        build_lsa_a2a(
+            cfg,
+            rank,
+            src="staging" if args.mode == "split-lsa-staged" else "local",
+            uncached=args.lsa_uncached,
+        )
+        if args.mode in ("split-lsa", "split-lsa-staged")
+        else None
+    )
+    # fused-lsa has no collective kernel -- the epilogue already wrote into
+    # the peers -- but it still needs the agreement that every peer
+    # *finished*, or a rank reads a slab a peer is still writing.
+    barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
+    parts = (
+        build_sdma_phases(
+            cfg,
+            rank,
+            queues=args.sdma_queues,
+            stamp_off=stamp_off,
+            stamp_drain=stamp_drain,
+            war_credit=not args.no_war_credit,
+        )
+        if needs_sdma
+        else None
+    )
+    staging = (
+        from_gpu_ptr(
+            mem.ptr + cfg.staging_off,
             (world_size * args.m, cfg.shard_n),
             torch.bfloat16,
         )
+        if needs_staging
+        else None
+    )
+    rccl = args.mode == "split-rccl"
+    c_ptr = (
+        mem.ptr + cfg.staging_off if args.mode == "split-lsa-staged" else c.data_ptr()
+    )
+
+    def once():
+        stream = fx.Stream(torch.cuda.current_stream())
+        gemm(
+            a_i8,
+            b_i8,
+            c_flat,
+            sa_arg,
+            sb_arg,
+            args.m,
+            args.n,
+            dc.ptr,
+            win.handle,
+            stream=stream,
+        )
+        if copy is not None:
+            copy(c_ptr, dc.ptr, win.handle, stream=stream)
+        if barrier is not None:
+            barrier(dc.ptr, win.handle, stream=stream)
+        if rccl:
+            # Same bytes, same layout, same GEMM as split-sdma: only the
+            # transport differs. all_to_all_single splits the input along
+            # dim 0 into world chunks and gives back the concatenation of
+            # what each rank sent, which is exactly staging -> recv.
+            dist.all_to_all_single(recv, staging)
+        if parts is not None:
+            # fused-sdma: the puts left from the epilogue, so only the drain
+            # runs. split-sdma: the full scatter.
+            phase = "drain" if args.mode == "fused-sdma" else "scatter"
+            parts[phase](dc.ptr, win.handle, stream=stream)
+
+    comm.barrier()
+    once()
+    torch.cuda.synchronize()
+    comm.barrier()
+
+    rel_l2 = float("nan")
+    validated = True
+    if args.no_put:
+        # Nothing was transferred; the received buffer holds this
+        # rank's own block and stale peer blocks. Timing only.
+        rel_l2, validated = float("nan"), True
+    elif not args.skip_validation:
         if args.mode == "gemm-to-window":
-            # The control that separates "the staging GEMM's address map is
-            # slower" from "writing cco's window is slower". recv is exactly
-            # M*N*2 bytes, so gemm-only's kernel can target it unchanged: same
-            # instructions, same address map, same descriptor size -- only the
-            # memory differs. Its contents are then meaningless, so this mode
-            # does not validate.
-            c = from_gpu_ptr(mem.ptr + cfg.recv_off, (args.m, args.n), torch.bfloat16)
+            # Writing [M,N] over the recv region does not produce the
+            # all-to-all's answer, and is not meant to. Only the time
+            # is of interest.
+            rel_l2, validated = float("nan"), True
+        elif args.mode == "gemm-staging":
+            # Nothing is transferred, so recv is meaningless except for this
+            # rank's own block, which the GEMM routes there directly. Check
+            # that *and* the remote destinations' staging slabs: a timing of
+            # a kernel that is not doing the work is worth nothing, and the
+            # whole point of this mode is to be subtracted from another.
+            ref = reference_gemm(a, b, sa, sb, args.quant)
+            worst = 0.0
+            for d in range(world_size):
+                cols = slice(d * cfg.shard_n, (d + 1) * cfg.shard_n)
+                want = ref[:, cols]
+                if d == rank:
+                    got = recv[rank * args.m : (rank + 1) * args.m]
+                else:
+                    got = staging[d * args.m : (d + 1) * args.m]
+                den = want.norm().item()
+                worst = max(
+                    worst, (got.float() - want).norm().item() / den if den else 0.0
+                )
+            rel_l2, validated = worst, worst < args.tolerance
+            del ref
+        elif args.mode == "gemm-only":
+            # The GEMM on its own. Without this control a GEMM bug reads as
+            # a transport bug: every other mode validates what arrived, so a
+            # corrupt C and a corrupt copy are indistinguishable.
+            ref = reference_gemm(a, b, sa, sb, args.quant)
+            denom = ref.norm().item()
+            rel_l2 = (c.float() - ref).norm().item() / denom if denom else 0.0
+            validated = rel_l2 < args.tolerance
+            del ref
         else:
-            c = torch.empty(args.m, args.n, device="cuda", dtype=torch.bfloat16)
+            rel_l2, validated = _validate_recv(
+                recv, a, b, sa, sb, args, rank, world_size
+            )
+        if not validated:
+            print(
+                f"[rank {rank}] {args.mode} VALIDATION FAILED relL2={rel_l2:.3e}",
+                flush=True,
+            )
+
+    us = _median_us(once, args.warmup, args.iters, graph=not args.no_graph)
+    stamps = None
+    if args.timeline:
+        # Before the phase split, whose GEMM-only launches would overwrite
+        # the block stamps without a matching drain.
         torch.cuda.synchronize()
-
-        reqs = CCODevCommRequirements()
-        reqs.gda_connection_type = GDA_CONNECTION_NONE
-        reqs.gda_signal_count = 0
-        reqs.gda_counter_count = 0
-        if needs_sdma:
-            reqs.sdma_queue_count = args.sdma_queues
-        dc = comm.create_dev_comm(reqs)
-
-        if needs_staging:
-            # The same kernel for every staging mode, differing only in whether the
-            # epilogue posts the puts. That is the point of a split baseline:
-            # one changed thing, not two.
-            gemm = compile_fused_gemm_a2a(
-                cfg,
-                rank,
-                K=args.k,
-                BLOCK_M=args.block_m,
-                BLOCK_N=args.block_n,
-                quant=args.quant,
-                waves_per_eu=args.waves_per_eu,
-                xcd_swizzle=args.xcd_swizzle,
-                rotated=args.rotated,
-                n_stripe=args.n_stripe,
-                transport="sdma",
-                fuse=args.mode == "fused-sdma",
-                chunks=chunks,
-                sdma_queues=args.sdma_queues,
-                # RCCL takes one input covering every destination,
-                # self included, so the self-to-recv shortcut has to
-                # be off or it reads a hole.
-                self_to_recv=args.mode != "split-rccl",
-                staging_store=args.staging_store,
-                stamp_off=stamp_off,
-                war_credit=not args.no_war_credit,
-            )
-        elif args.mode == "fused-lsa":
-            # The epilogue writes into the peers, so there is no separate
-            # collective -- only the barrier below.
-            gemm = compile_fused_gemm_a2a(
-                cfg,
-                rank,
-                K=args.k,
-                BLOCK_M=args.block_m,
-                BLOCK_N=args.block_n,
-                quant=args.quant,
-                waves_per_eu=args.waves_per_eu,
-                xcd_swizzle=args.xcd_swizzle,
-                rotated=args.rotated,
-                n_stripe=args.n_stripe,
-                direct_fence=args.direct_fence,
-                emit_put=not args.no_put,
-            )
-        else:
-            gemm = compile_gemm_local(
-                cfg,
-                rank,
-                K=args.k,
-                BLOCK_M=args.block_m,
-                BLOCK_N=args.block_n,
-                quant=args.quant,
-                waves_per_eu=args.waves_per_eu,
-                xcd_swizzle=args.xcd_swizzle,
-                swap_ab=args.swap_ab,
-                permlane=args.permlane,
-            )
-        if needs_staging and args.staging_store == "copy":
-            # The copy path's descriptor is the staging region, so that is what
-            # the kernel's C argument has to be.
-            # staging and recv, as one contiguous descriptor: the store
-            # selects between them by row offset rather than by base address.
-            c_for_gemm = from_gpu_ptr(
-                mem.ptr + cfg.staging_off,
-                (2 * world_size * args.m, cfg.shard_n),
-                torch.bfloat16,
-            )
-        else:
-            c_for_gemm = c
-        a_i8 = a.contiguous().view(torch.int8).view(-1)
-        b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
-        c_flat = c_for_gemm.reshape(-1)
-        # The kernel indexes both scale buffers linearly, so it needs the
-        # *physical* element order. sa is logically [M, K/128] but column-major,
-        # so its physical order is sa.t().
-        if args.quant == "blockscale":
-            sa_arg = sa.t().reshape(-1).contiguous()
-            sb_arg = sb.reshape(-1).contiguous()
-        elif args.quant == "mxfp8":
-            # Exponent bytes widened to int32 with the byte in the low 8 bits:
-            # the MFMA's scale operand is a 32-bit register read at op_sel 0.
-            # A goes through gemm_ar's preshuffle_a_scale; B stays K-block major
-            # because a 16-column tile never straddles a 32-column group, so its
-            # load is already a broadcast.
-            sa_arg = preshuffle_a_scale(sa)
-            sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
-        else:
-            sa_arg, sb_arg = sa, sb
-
-        # Same kernel, same store side, same bytes over the fabric. Only the
-        # *read* layout differs: [M,N] strided against the compacted slab. That
-        # is the one variable this pair isolates.
-        copy = (
-            build_lsa_a2a(
-                cfg,
-                rank,
-                src="staging" if args.mode == "split-lsa-staged" else "local",
-                uncached=args.lsa_uncached,
-            )
-            if args.mode in ("split-lsa", "split-lsa-staged")
-            else None
+        raw = from_gpu_ptr(mem.ptr + stamp_off, (n_stamps,), torch.int64).cpu().tolist()
+        chunk_bytes = [t * args.block_m * cfg.shard_n * 2 for t in cfg.chunk_tiles]
+        stamps = timeline.decode(
+            raw,
+            grid=stamp_grid,
+            world=world_size,
+            chunks=chunks,
+            rank=rank,
+            chunk_bytes=chunk_bytes,
         )
-        # fused-lsa has no collective kernel -- the epilogue already wrote into
-        # the peers -- but it still needs the agreement that every peer
-        # *finished*, or a rank reads a slab a peer is still writing.
-        barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
-        parts = (
-            build_sdma_phases(
-                cfg,
-                rank,
-                queues=args.sdma_queues,
-                stamp_off=stamp_off,
-                stamp_drain=stamp_drain,
-                war_credit=not args.no_war_credit,
-            )
-            if needs_sdma
-            else None
-        )
-        staging = (
-            from_gpu_ptr(
-                mem.ptr + cfg.staging_off,
-                (world_size * args.m, cfg.shard_n),
-                torch.bfloat16,
-            )
-            if needs_staging
-            else None
-        )
-        rccl = args.mode == "split-rccl"
-        c_ptr = (
-            mem.ptr + cfg.staging_off
-            if args.mode == "split-lsa-staged"
-            else c.data_ptr()
-        )
+    # Same-run phase split, as gcnasm's strict_timing does. The headline
+    # `us` stays the whole thing; these two are only for attribution, and
+    # they exist because "mode E2E minus a separate gemm-only run" charges
+    # the transfer for any difference between two process groups.
+    phase_us = {}
+    # Every communicating mode, rccl included -- it has neither `copy` nor
+    # `parts` because the collective is a torch call.
+    #
+    # Order matters and is the same for all of them: the full thing first,
+    # then the GEMM alone. Measuring the GEMM in a *separate run* gave
+    # 324.4us where the same kernel measured here gives 297.3 -- 27us of
+    # clock ramp, which a cross-run subtraction charges to the transport.
+    # That is how split-sdma came to look like 94% of line rate when it is
+    # 81%.
+    if args.phase_split and (copy is not None or parts is not None or rccl):
 
-        def once():
+        def _gemm_only():
             stream = fx.Stream(torch.cuda.current_stream())
             gemm(
                 a_i8,
@@ -524,173 +701,71 @@ def run(args) -> int:
                 win.handle,
                 stream=stream,
             )
-            if copy is not None:
-                copy(c_ptr, dc.ptr, win.handle, stream=stream)
-            if barrier is not None:
-                barrier(dc.ptr, win.handle, stream=stream)
-            if rccl:
-                # Same bytes, same layout, same GEMM as split-sdma: only the
-                # transport differs. all_to_all_single splits the input along
-                # dim 0 into world chunks and gives back the concatenation of
-                # what each rank sent, which is exactly staging -> recv.
-                dist.all_to_all_single(recv, staging)
-            if parts is not None:
-                # fused-sdma: the puts left from the epilogue, so only the drain
-                # runs. split-sdma: the full scatter.
-                phase = "drain" if args.mode == "fused-sdma" else "scatter"
-                parts[phase](dc.ptr, win.handle, stream=stream)
 
         comm.barrier()
-        once()
-        torch.cuda.synchronize()
-        comm.barrier()
-
-        rel_l2 = float("nan")
-        validated = True
-        if args.no_put:
-            # Nothing was transferred; the received buffer holds this
-            # rank's own block and stale peer blocks. Timing only.
-            rel_l2, validated = float("nan"), True
-        elif not args.skip_validation:
-            if args.mode == "gemm-to-window":
-                # Writing [M,N] over the recv region does not produce the
-                # all-to-all's answer, and is not meant to. Only the time
-                # is of interest.
-                rel_l2, validated = float("nan"), True
-            elif args.mode == "gemm-staging":
-                # Nothing is transferred, so recv is meaningless except for this
-                # rank's own block, which the GEMM routes there directly. Check
-                # that *and* the remote destinations' staging slabs: a timing of
-                # a kernel that is not doing the work is worth nothing, and the
-                # whole point of this mode is to be subtracted from another.
-                ref = reference_gemm(a, b, sa, sb, args.quant)
-                worst = 0.0
-                for d in range(world_size):
-                    cols = slice(d * cfg.shard_n, (d + 1) * cfg.shard_n)
-                    want = ref[:, cols]
-                    if d == rank:
-                        got = recv[rank * args.m : (rank + 1) * args.m]
-                    else:
-                        got = staging[d * args.m : (d + 1) * args.m]
-                    den = want.norm().item()
-                    worst = max(
-                        worst, (got.float() - want).norm().item() / den if den else 0.0
-                    )
-                rel_l2, validated = worst, worst < args.tolerance
-                del ref
-            elif args.mode == "gemm-only":
-                # The GEMM on its own. Without this control a GEMM bug reads as
-                # a transport bug: every other mode validates what arrived, so a
-                # corrupt C and a corrupt copy are indistinguishable.
-                ref = reference_gemm(a, b, sa, sb, args.quant)
-                denom = ref.norm().item()
-                rel_l2 = (c.float() - ref).norm().item() / denom if denom else 0.0
-                validated = rel_l2 < args.tolerance
-                del ref
-            else:
-                rel_l2, validated = _validate_recv(
-                    recv, a, b, sa, sb, args, rank, world_size
-                )
-            if not validated:
-                print(
-                    f"[rank {rank}] {args.mode} VALIDATION FAILED relL2={rel_l2:.3e}",
-                    flush=True,
-                )
-
-        us = _median_us(once, args.warmup, args.iters, graph=not args.no_graph)
-        stamps = None
-        if args.timeline:
-            # Before the phase split, whose GEMM-only launches would overwrite
-            # the block stamps without a matching drain.
-            torch.cuda.synchronize()
-            raw = (
-                from_gpu_ptr(mem.ptr + stamp_off, (n_stamps,), torch.int64)
-                .cpu()
-                .tolist()
-            )
-            chunk_bytes = [t * args.block_m * cfg.shard_n * 2 for t in cfg.chunk_tiles]
-            stamps = timeline.decode(
-                raw,
-                grid=stamp_grid,
-                world=world_size,
-                chunks=chunks,
-                rank=rank,
-                chunk_bytes=chunk_bytes,
-            )
-        # Same-run phase split, as gcnasm's strict_timing does. The headline
-        # `us` stays the whole thing; these two are only for attribution, and
-        # they exist because "mode E2E minus a separate gemm-only run" charges
-        # the transfer for any difference between two process groups.
-        phase_us = {}
-        # Every communicating mode, rccl included -- it has neither `copy` nor
-        # `parts` because the collective is a torch call.
-        #
-        # Order matters and is the same for all of them: the full thing first,
-        # then the GEMM alone. Measuring the GEMM in a *separate run* gave
-        # 324.4us where the same kernel measured here gives 297.3 -- 27us of
-        # clock ramp, which a cross-run subtraction charges to the transport.
-        # That is how split-sdma came to look like 94% of line rate when it is
-        # 81%.
-        if args.phase_split and (copy is not None or parts is not None or rccl):
-
-            def _gemm_only():
-                stream = fx.Stream(torch.cuda.current_stream())
-                gemm(
-                    a_i8,
-                    b_i8,
-                    c_flat,
-                    sa_arg,
-                    sb_arg,
-                    args.m,
-                    args.n,
-                    dc.ptr,
-                    win.handle,
-                    stream=stream,
-                )
-
-            comm.barrier()
-            phase_us["compute"] = _median_us(
-                _gemm_only, args.warmup, args.iters, graph=not args.no_graph
-            )
-            comm.barrier()
-            phase_us["comm"] = us - phase_us["compute"]
-        comm.barrier()
-
-        gathered = [None] * world_size
-        dist.all_gather_object(
-            gathered, {"rank": rank, "us": us, "ok": validated, "stamps": stamps}
+        phase_us["compute"] = _median_us(
+            _gemm_only, args.warmup, args.iters, graph=not args.no_graph
         )
-        if rank == 0 and args.timeline:
-            with open(args.timeline, "w") as f:
-                json.dump(
-                    {
-                        "args": vars(args),
-                        "chunk_plan": list(cfg.chunk_tiles),
-                        "us": [g["us"] for g in gathered],
-                        "ranks": [g["stamps"] for g in gathered],
-                    },
-                    f,
-                )
-        if rank == 0:
-            result = {
-                "mode": args.mode,
-                "m": args.m,
-                "n": args.n,
-                "k": args.k,
-                "quant": args.quant,
-                "world_size": world_size,
-                "shard_n": cfg.shard_n,
-                "block_m": args.block_m,
-                "chunks": chunks,
-                "chunk_plan": list(cfg.chunk_tiles) if needs_sdma else [],
-                "us": max(g["us"] for g in gathered),
-                "rel_l2": rel_l2,
-                "validated": all(g["ok"] for g in gathered),
-                "remote_bytes_per_rank": cfg.remote_bytes_per_rank,
-                **{f"phase_{k}": v for k, v in phase_us.items()},
-            }
-            print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
+        comm.barrier()
+        phase_us["comm"] = us - phase_us["compute"]
+    comm.barrier()
 
+    gathered = [None] * world_size
+    dist.all_gather_object(
+        gathered, {"rank": rank, "us": us, "ok": validated, "stamps": stamps}
+    )
+    if rank == 0 and args.timeline:
+        with open(args.timeline, "w") as f:
+            json.dump(
+                {
+                    "args": vars(args),
+                    "chunk_plan": list(cfg.chunk_tiles),
+                    "us": [g["us"] for g in gathered],
+                    "ranks": [g["stamps"] for g in gathered],
+                },
+                f,
+            )
+    if rank == 0:
+        result = {
+            "mode": args.mode,
+            "m": args.m,
+            "n": args.n,
+            "k": args.k,
+            "quant": args.quant,
+            "world_size": world_size,
+            "shard_n": cfg.shard_n,
+            "block_m": args.block_m,
+            "chunks": chunks,
+            "chunk_plan": list(cfg.chunk_tiles) if needs_sdma else [],
+            "us": max(g["us"] for g in gathered),
+            "rel_l2": rel_l2,
+            "validated": all(g["ok"] for g in gathered),
+            "remote_bytes_per_rank": cfg.remote_bytes_per_rank,
+            **{f"phase_{k}": v for k, v in phase_us.items()},
+        }
+        print("RESULT_JSON " + json.dumps(result, sort_keys=True), flush=True)
+        return result
+
+    return None
+
+
+def run(args) -> int:
+    local_rank, rank, world_size, uid = _setup_distributed()
+    if args.mode in NOT_YET:
+        if rank == 0:
+            print(f"--mode {args.mode} is not implemented yet", file=sys.stderr)
+        return 2
+    P = _plan_case(args, world_size, rank, local_rank)
+    # The window holds only what peers must reach: recv. C is local.
+    vmm = 2 * P.alloc_bytes + (64 << 20)
+    validated = True
+    with Communicator.init(world_size, rank, uid, per_rank_vmm=vmm) as comm:
+        mem = comm.alloc_mem(P.alloc_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        res = _run_case(comm, mem, win, args, P, rank, world_size)
+        ok = [None] * world_size
+        dist.all_gather_object(ok, res["validated"] if res is not None else None)
+        validated = ok[0]
         win.close()
         mem.close()
     dist.barrier()
@@ -734,6 +809,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--no-graph", action="store_true")
+    p.add_argument(
+        "--b2b", action="store_true", help="time launches back to back (see B2B)"
+    )
+    p.add_argument("--timing", choices=("sync", "b2b", "stream"), default="sync")
+    p.add_argument("--min-seconds", type=float, default=3.0)
     p.add_argument("--phase-split", action="store_true")
     p.add_argument(
         "--no-put",
@@ -762,4 +842,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    sys.exit(run(build_parser().parse_args()))
+    _args = build_parser().parse_args()
+    B2B = _args.b2b
+    TIMING, MIN_SECONDS = _args.timing, _args.min_seconds
+    sys.exit(run(_args))
