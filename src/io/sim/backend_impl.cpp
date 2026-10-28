@@ -23,6 +23,7 @@
 
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -189,20 +190,24 @@ std::string BackendTypeName(BackendType type) {
 }
 
 LinkProfile LoadLinkProfile(BackendType type) {
-  // Arbitrary defaults in the range of a 400G RoCE NIC, kernel TCP on a 100G NIC, and one
-  // MI3xx XGMI link; override them per run rather than trusting them.
-  double gbps = 45.0;
-  double latencyUs = 5.0;
-  double segmentNs = 20.0;
-  double opUs = 0.0;
+  // RDMA and XGMI are fitted with tests/python/io/calibrate_sim.py on MI355X GPU to GPU: RDMA
+  // over two 400G ionic NICs with sglang's settings (4 QPs, 4 workers), XGMI over one link with
+  // the scatter/gather kernel off (the default). mori has no hardware TCP backend, so TCP is a
+  // guess for kernel TCP on a 100G NIC.
+  double gbps = 47.4;
+  double latencyUs = 20.0;
+  double segmentNs = 255.0;
+  double opUs = 4.3;
   if (type == BackendType::TCP) {
     gbps = 10.0;
     latencyUs = 30.0;
     segmentNs = 200.0;
+    opUs = 0.0;
   } else if (type == BackendType::XGMI) {
-    gbps = 50.0;
-    latencyUs = 10.0;
-    segmentNs = 0.0;
+    gbps = 61.4;
+    latencyUs = 9.0;
+    segmentNs = 19500.0;  // one hipMemcpyPeerAsync per segment
+    opUs = 0.0;
   }
   const std::string prefix = "MORI_IO_SIM_" + BackendTypeName(type);
   env::Override((prefix + "_BW_GBPS").c_str(), gbps, ParsePositiveDouble);
@@ -519,6 +524,8 @@ std::chrono::steady_clock::time_point SimBackend::ReserveLink(bool isRead, size_
 }
 
 void SimBackend::TimerLoop() {
+  // The default 50 us timer slack would make every simulated transfer complete that much late.
+  prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL);
   std::unique_lock<std::mutex> lock(timerMu_);
   while (!stopping_) {
     if (timerQ_.empty()) {

@@ -306,6 +306,15 @@ void IOEngine::CreateSimBackend(BackendType requested, const BackendConfig& beCo
                  sim::BackendTypeName(type));
     return;
   }
+  // Both serve their control plane on the engine port, so one engine can only have one of them.
+  for (BackendType other : {BackendType::RDMA, BackendType::TCP}) {
+    if (type != BackendType::XGMI && other != type && backends.count(other) != 0) {
+      throw std::runtime_error("Simulated " + sim::BackendTypeName(type) +
+                               " cannot be added to an engine that has simulated " +
+                               sim::BackendTypeName(other) +
+                               "; use MORI_IO_SIM_BACKEND to choose the network instead");
+    }
+  }
 
   bool enableNotification = true;
   if (requested == BackendType::RDMA) {

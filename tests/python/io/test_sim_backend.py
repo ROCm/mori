@@ -48,11 +48,22 @@ FAKE_PTR = 0x7F0000000000
 _counter = [0]
 
 
+# Fixed profiles, so the timing checks do not move with the calibrated defaults.
+PROFILES = {
+    "RDMA": {"BW_GBPS": 45, "LATENCY_US": 5, "SEGMENT_NS": 20, "OP_US": 0},
+    "TCP": {"BW_GBPS": 10, "LATENCY_US": 30, "SEGMENT_NS": 200, "OP_US": 0},
+    "XGMI": {"BW_GBPS": 50, "LATENCY_US": 10, "SEGMENT_NS": 0, "OP_US": 0},
+}
+
+
 @pytest.fixture(autouse=True)
 def sim_env(monkeypatch):
     monkeypatch.setenv("MORI_IO_SIM_ENABLE", "1")
     for k in ("MORI_NODE_ID", "MORI_IO_SIM_BACKEND", "MORI_IO_SIM_TIME_SCALE"):
         monkeypatch.delenv(k, raising=False)
+    for backend, profile in PROFILES.items():
+        for k, v in profile.items():
+            monkeypatch.setenv(f"MORI_IO_SIM_{backend}_{k}", str(v))
     return monkeypatch
 
 
@@ -206,6 +217,12 @@ def test_explicit_tcp_backend_notifies():
     uid, st = write(a, gpu_mem(a, 1 << 30), gpu_mem(b, 1 << 30), [64 * MiB])
     assert a.wait_all([st]) == StatusCode.SUCCESS
     assert pop_inbound(b, a.get_engine_desc().key, uid) is not None
+
+
+def test_rdma_and_tcp_cannot_share_an_engine():
+    a = make_engine("pf")
+    with pytest.raises(RuntimeError, match="MORI_IO_SIM_BACKEND"):
+        a.create_backend(BackendType.TCP)
 
 
 def test_xgmi_only_for_same_node_gpu_pairs(sim_env):
