@@ -19,6 +19,7 @@ message WorkerCacheSpec {
   uint32 full_tier_mask = 4;
   uint32 swa_tier_mask = 5;
   uint32 mamba_tier_mask = 6;
+  string dram_pool_id = 7;
 }
 
 enum ExternalKvActionType {
@@ -44,6 +45,7 @@ message ApplyExternalKvBatchRequest {
   string worker_address = 4;
   reserved 5;
   WorkerCacheSpec cache_spec = 6;
+  string dram_pool_id = 7;
 }
 
 message ApplyExternalKvBatchResponse {

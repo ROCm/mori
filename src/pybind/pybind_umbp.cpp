@@ -297,7 +297,7 @@ void RegisterMoriUmbp(py::module_& m) {
   py::class_<KvIndexerConfig>(m, "KvIndexerConfig")
       .def(py::init([](const std::string& endpoint, const std::string& worker,
                        const std::string& address, py::function provider, uint32_t components,
-                       uint32_t window, uint32_t timeout) {
+                       uint32_t window, uint32_t timeout, const std::string& pool_id) {
              // A bound method must not keep its owner (and that owner's client) alive.
              if (py::hasattr(provider, "__self__") && py::hasattr(provider, "__func__")) {
                auto weak = py::module_::import("weakref").attr("WeakMethod")(provider);
@@ -314,11 +314,13 @@ void RegisterMoriUmbp(py::module_& m) {
                                     components,
                                     window,
                                     timeout,
-                                    provider.cast<decltype(KvIndexerConfig::metadata_provider)>()};
+                                    provider.cast<decltype(KvIndexerConfig::metadata_provider)>(),
+                                    pool_id};
            }),
-           py::arg("endpoint"), py::arg("worker_id"), py::arg("worker_address"),
-           py::arg("metadata_provider").none(false), py::arg("components") = 1,
-           py::arg("swa_window_tokens") = 0, py::arg("timeout_ms") = 200);
+           py::arg("endpoint"), py::arg("worker_id") = "", py::arg("worker_address") = "",
+           py::arg("metadata_provider").none(false) = py::none(), py::arg("components") = 1,
+           py::arg("swa_window_tokens") = 0, py::arg("timeout_ms") = 200,
+           py::arg("dram_pool_id") = "");
   py::class_<KvBlockMetadata>(m, "KvBlockMetadata")
       .def(py::init([](int64_t hash, std::optional<int64_t> parent, uint32_t size,
                        const std::map<uint32_t, std::vector<std::string>>& keys) {

@@ -41,6 +41,7 @@ message StandaloneKvIndexerConfig {
   uint32 components = 4;
   uint32 swa_window_tokens = 5;
   uint32 timeout_ms = 6;
+  string dram_pool_id = 7;
 }
 
 message StandaloneKvComponent {

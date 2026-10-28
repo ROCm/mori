@@ -487,6 +487,8 @@ struct KvIndexerConfig {
   uint32_t components = 1, swa_window_tokens = 0, timeout_ms = 200;
   // Called before each write with its physical keys; empty means no blocks to track.
   std::function<std::vector<KvBlockMetadata>(const std::vector<std::string>&)> metadata_provider;
+  // Shared owner identity; mutually exclusive with worker_id/worker_address.
+  std::string dram_pool_id;
 };
 
 struct UMBPConfig {

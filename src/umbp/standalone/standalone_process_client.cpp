@@ -640,6 +640,7 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   request.set_components(config.components);
   request.set_swa_window_tokens(config.swa_window_tokens);
   request.set_timeout_ms(config.timeout_ms);
+  request.set_dram_pool_id(config.dram_pool_id);
   grpc::ClientContext context;
   context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
   ::umbp::BoolResponse response;

@@ -1417,8 +1417,11 @@ void PoolClient::Shutdown() {
 }
 
 void PoolClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
-  if (!initialized_ || kv_indexer_)
-    throw std::logic_error("pool must be initialized and Indexer configured once");
+  if (!initialized_) throw std::logic_error("pool must be initialized before configuring Indexer");
+  if (kv_indexer_) {
+    if (kv_indexer_->MatchesPool(config)) return;
+    throw std::logic_error("owner already has a different Indexer configuration");
+  }
   if (registry_.Get(TierType::DRAM) == nullptr)
     throw std::invalid_argument("KV Indexer reporting requires a local DRAM backend");
   kv_indexer_ = std::make_shared<KvIndexerReporter>(config, [this](const std::string& key) {

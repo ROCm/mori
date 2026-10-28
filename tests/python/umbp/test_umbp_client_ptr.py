@@ -101,7 +101,7 @@ def test_put_from_ptr_get_into_ptr_round_trip():
     assert client.clear()
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("enabled", [False, True, "pool"])
 @pytest.mark.parametrize("method", ["scalar", "batch", "depth", "ranges"])
 def test_configured_kv_metadata_preserves_write_api(enabled, method):
     config = UMBPConfig()
@@ -117,8 +117,13 @@ def test_configured_kv_metadata_preserves_write_api(enabled, method):
 
     if enabled:
         # An unavailable Indexer must not fail a successful storage write.
+        identity = (
+            {"dram_pool_id": "shared"}
+            if enabled == "pool"
+            else {"worker_id": "worker", "worker_address": "http://worker:30000"}
+        )
         config.kv_indexer = umbp.KvIndexerConfig(
-            "127.0.0.1:1", "worker", "http://worker:30000", provider, timeout_ms=10
+            "127.0.0.1:1", metadata_provider=provider, timeout_ms=10, **identity
         )
     client = UMBPClient(config)
     assert not hasattr(client, "register_kv_block")

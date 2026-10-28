@@ -45,7 +45,9 @@ block size in tokens, and all physical keys per component: FULL=1, SWA=2, MAMBA=
 Keys must identify immutable content. For hybrid caches configure `components`
 and `swa_window_tokens`; metadata must describe every configured component.
 Registered parent links must be acyclic. Each component is reported only when
-all its keys are committed; FULL is required. Eviction updates/revokes the mask.
+all its keys are committed. Worker-identity mode requires FULL in DRAM; pool mode
+also reports partial components to combine with a member's HBM. Eviction updates
+or revokes the mask.
 
 Commit and eviction hooks identify affected blocks by key; clear checks all
 registered blocks. Residency checks and RPCs run outside the metadata lock, and
@@ -61,25 +63,44 @@ complete; moving the last DRAM copy out revokes it. Copying to another tier whil
 retaining DRAM leaves its residency intact. HBM/SSD residency is not published by
 this reporter. Promotion of a block with no known metadata cannot advertise it.
 
-Configure once per storage owner. Standalone clients run their configured
-callback and send metadata with each batch write; the owner validates it before
-writing. New forwarders require an owner advertising batched metadata support.
-Closing a forwarder does not
-withdraw shared data. Supply metadata where
+Each storage owner has one reporting identity. Standalone clients run their
+configured callback and send metadata with each batch write; the owner validates
+it before writing. New forwarders require an owner advertising batched metadata
+support.
+Closing a forwarder does not withdraw shared data. Supply metadata where
 all required keys reside: reporting covers local DRAM backends, not cross-owner
-aggregation. Use one writer per worker's DRAM bucket and match the Router worker
-URL and any HBM publisher's identity/cache spec. Startup and graceful owner
-shutdown clear DRAM only. The protocol has no TTL/fencing for crash-time cleanup.
+aggregation. In worker-identity mode, use one reporter per worker's DRAM bucket
+and match the Router worker URL and any HBM publisher's identity/cache spec.
+Startup and graceful owner shutdown clear DRAM only. The protocol has no
+TTL/fencing for crash-time cleanup.
 An engine bridge sharing this identity must only mutate HBM. The upstream bridge
 also maps `CPU_PINNED` to DRAM and clears all tiers by default. Set its
 `KV_INDEXER_CLEAR_TIERS=HBM` and exclude non-HBM store/remove events before they
 reach the bridge. Tier eligibility masks do not filter these mutations.
 
-Shared DRAM across multiple Indexer worker identities requires an upstream pool
-identity protocol and is not supported here. Metadata is retained after eviction
-to support SSD promotion; automatic reclamation remains open. Incremental work
-avoids scanning this history on every write, but memory use and the periodic
-repair still grow with registered metadata.
+For multiple workers sharing one owner, use the matching
+[Indexer shared-pool protocol](../distributed/proto/README.sgl-kv-indexer.md)
+and configure every forwarding client with the same owner configuration:
+
+```python
+config.kv_indexer = KvIndexerConfig(
+    "127.0.0.1:50051", dram_pool_id="model-layout/node-0/dram",
+    metadata_provider=metadata_for_keys,
+)
+```
+
+Leave `worker_id` and `worker_address` empty in pool mode. Repeated matching pool
+configuration attaches to the existing reporter; conflicting configurations fail.
+Each worker's HBM bridge sets `KV_INDEXER_DRAM_POOL_ID` to this pool id and declares
+matching `KV_INDEXER_CACHE_COMPONENTS` and SWA window. The bridge publishes HBM
+only and refreshes the access binding while idle. Use one reporter per pool and
+one bridge per worker. Members must share the model, page size and key layout;
+an id does not itself provide access to another owner's storage. Worker and pool
+ids are separate namespaces; pool ids never become Router worker addresses.
+
+Metadata is retained after eviction to support SSD promotion; automatic
+reclamation remains open. Incremental work avoids scanning this history on every
+write, but memory use and the periodic repair still grow with registered metadata.
 
 Reporting is opt-in and requires the endpoint and metadata above. No manual
 report/revoke calls are needed; wiring the metadata callback is the integration's

@@ -49,17 +49,23 @@ class KvIndexerReporter {
  public:
   using Contains = std::function<bool(const std::string&)>;
   KvIndexerReporter(const KvIndexerConfig& config, Contains contains)
-      : components_(config.components),
+      : endpoint_(config.endpoint),
+        pool_id_(config.dram_pool_id),
+        window_(config.swa_window_tokens),
+        components_(config.components),
         timeout_(config.timeout_ms),
         contains_(std::move(contains)) {
-    if (config.endpoint.empty() || config.worker_id.empty() || config.worker_address.empty() ||
-        !(components_ & 1) || (components_ & ~7u) ||
+    const bool valid_identity = pool_id_.empty()
+                                    ? !config.worker_id.empty() && !config.worker_address.empty()
+                                    : config.worker_id.empty() && config.worker_address.empty();
+    if (config.endpoint.empty() || !valid_identity || !(components_ & 1) || (components_ & ~7u) ||
         ((components_ & 2) && !config.swa_window_tokens) || !config.timeout_ms)
       throw std::invalid_argument("invalid KV Indexer identity, cache spec or timeout");
     stub_ = indexer_pb::KVIndexer::NewStub(
         grpc::CreateChannel(config.endpoint, grpc::InsecureChannelCredentials()));
     request_.set_worker_id(config.worker_id);
     request_.set_worker_address(config.worker_address);
+    request_.set_dram_pool_id(pool_id_);
     auto* spec = request_.mutable_cache_spec();
     spec->set_version(1);
     spec->set_components(components_);
@@ -70,6 +76,14 @@ class KvIndexerReporter {
     thread_ = std::thread([this] { Run(); });
   }
   ~KvIndexerReporter() { Stop(); }
+
+  // Forwarders may attach to the same pool without replacing its reporter.
+  bool MatchesPool(const KvIndexerConfig& config) const {
+    return !pool_id_.empty() && config.dram_pool_id == pool_id_ && config.endpoint == endpoint_ &&
+           config.worker_id.empty() && config.worker_address.empty() &&
+           config.components == components_ && config.swa_window_tokens == window_ &&
+           std::chrono::milliseconds(config.timeout_ms) == timeout_;
+  }
 
   // Empty means a clear or an explicit request to check all registered blocks.
   void Notify(const std::vector<std::string>& keys = {}) {
@@ -177,7 +191,8 @@ class KvIndexerReporter {
           for (const auto& [component, keys] : block->component_keys)
             if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
         }
-        if (!(mask & 1)) mask = 0;
+        // A shared pool may supply SWA/MAMBA while the worker supplies FULL in HBM.
+        if (pool_id_.empty() && !(mask & 1)) mask = 0;
         desired[hash] = mask;
         auto old = reported_.find(hash);
         if (!mask) {
@@ -305,7 +320,8 @@ class KvIndexerReporter {
   }
   std::unique_ptr<indexer_pb::KVIndexer::Stub> stub_;
   indexer_pb::ApplyExternalKvBatchRequest request_;
-  const uint32_t components_;
+  const std::string endpoint_, pool_id_;
+  const uint32_t window_, components_;
   const std::chrono::milliseconds timeout_;
   Contains contains_;
   // Serialize RPCs/flush/shutdown independently from write-path metadata.

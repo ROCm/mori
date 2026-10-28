@@ -336,6 +336,35 @@ TEST_F(AutomaticKvIndexer, ClientConfigControlsAutomaticMetadataAndReporting) {
   EXPECT_TRUE(receiver.WaitFor({}));
 }
 
+TEST_F(AutomaticKvIndexer, SharedPoolAcceptsMatchingConfigAndReportsPartialComponents) {
+  config.worker_id.clear();
+  config.worker_address.clear();
+  config.dram_pool_id = "shared";
+  config.components = 7;
+  config.swa_window_tokens = 32;
+  PoolClient pool(PoolConfig());
+  ASSERT_TRUE(pool.Init());
+  pool.ConfigureKvIndexer(config);
+  EXPECT_NO_THROW(pool.ConfigureKvIndexer(config));
+  auto conflict = config;
+  conflict.dram_pool_id = "different";
+  EXPECT_THROW(pool.ConfigureKvIndexer(conflict), std::logic_error);
+  pool.RegisterKvBlock({42, {}, 16, {{1, {"full"}}, {2, {"swa"}}, {4, {"mamba"}}}});
+  ASSERT_EQ(pool.BatchPut({"full", "swa", "mamba"}, {"data", "data", "data"}, {4, 4, 4}),
+            (std::vector<bool>{true, true, true}));
+  ASSERT_TRUE(receiver.WaitFor({{42, 7}}));
+  ASSERT_GT(pool.Backends().Get(TierType::DRAM)->Evict({"full"})[0].bytes_freed, 0u);
+  ASSERT_TRUE(receiver.WaitFor({{42, 6}}));  // FULL may still be in a member's HBM.
+  pool.Shutdown();
+  ASSERT_TRUE(receiver.WaitFor({}));
+  std::lock_guard<std::mutex> lock(receiver.mutex);
+  for (const auto& request : receiver.requests) {
+    EXPECT_EQ(request.dram_pool_id(), "shared");
+    EXPECT_TRUE(request.worker_id().empty());
+    EXPECT_TRUE(request.worker_address().empty());
+  }
+}
+
 TEST_F(AutomaticKvIndexer, DeltaRepairAndStalledRpcDoNotBlockMetadata) {
   config.timeout_ms = 2000;
   std::atomic<size_t> lookups{0};
