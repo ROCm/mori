@@ -80,6 +80,33 @@ __device__ __forceinline__ SDMA_PKT_COPY_LINEAR CreateCopyPacket(void* srcBuf, v
   return copy_packet;
 }
 
+// One packet for `height` rows of `widthBytes`; offsets are folded into the
+// base addresses, so the packet's x/y/z stay 0. sub_op 36 is SDMA 4.4.x only,
+// so the 2D path is left undefined on gfx1250: a caller fails to compile
+// rather than posting a packet that engine does not decode. (cco's put2d posts
+// the gfx12 rect packet there.)
+#if !defined(__gfx1250__)
+__device__ __forceinline__ SDMA_PKT_COPY_LARGE_SUB_WINDOW
+CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPitch,
+                   uint32_t widthBytes, uint32_t height) {
+  SDMA_PKT_COPY_LARGE_SUB_WINDOW packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_COPY;
+  packet.HEADER_UNION.sub_op = SDMA_SUBOP_COPY_LINEAR_LARGE_SUB_WINDOW;
+
+  packet.src_addr_31_0 = (uint32_t)(uintptr_t)srcBuf;
+  packet.src_addr_63_32 = (uint32_t)((uintptr_t)srcBuf >> 32);
+  packet.src_pitch = srcPitch - 1;
+  packet.dst_addr_31_0 = (uint32_t)(uintptr_t)dstBuf;
+  packet.dst_addr_63_32 = (uint32_t)((uintptr_t)dstBuf >> 32);
+  packet.dst_pitch = dstPitch - 1;
+  packet.rect_x = widthBytes - 1;
+  packet.rect_y = height - 1;
+
+  return packet;
+}
+#endif  // !__gfx1250__
+
 __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
   SDMA_PKT_ATOMIC packet = {};
 
@@ -127,6 +154,7 @@ struct SdmaQueueDeviceHandle {
     return index % queue_size_in_bytes;
   }
 
+  // Leaves one slot free, as cco.hpp's CanWriteUpto does: a full ring reads as empty.
   __device__ __forceinline__ bool CanWriteUpto(uint64_t uptoIndex) {
     const uint64_t queue_size_in_bytes = SDMA_QUEUE_SIZE;
     if ((uptoIndex - cachedHwReadIndex) < queue_size_in_bytes) {
@@ -271,6 +299,19 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   handle.placePacket(packet, pendingWptr, offset);
   handle.submitPacket(base, pendingWptr);
 }
+
+#if !defined(__gfx1250__)  // see CreateCopy2DPacket
+__device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, uint32_t dstPitch,
+                                      void* src, uint32_t srcPitch, uint32_t widthBytes,
+                                      uint32_t height) {
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_LARGE_SUB_WINDOW), offset);
+  auto packet = CreateCopy2DPacket(src, srcPitch, dst, dstPitch, widthBytes, height);
+  uint64_t pendingWptr = base;
+  handle.placePacket(packet, pendingWptr, offset);
+  handle.submitPacket(base, pendingWptr);
+}
+#endif  // !__gfx1250__
 
 __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, void* signal) {
   uint64_t offset;

@@ -408,8 +408,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   // Resolve size and mark the read in flight under the lock, then run the
   // blocking SSD IO outside it (so a concurrent copy Write is not serialized).
   size_t size = 0;
-  bool leading = false;    // we own the device read and the fan-out
-  bool following = false;  // a leader will fill our buffer; we only wait
+  bool following = false;  // a leader will fill our buffer; else we lead
   std::shared_ptr<ReadEpisode> episode;
   // Our own slot in the leader's fan-out list, kept because the leader swaps
   // that list out of the episode when it seals.
@@ -444,20 +443,20 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     const int prior = slot->refs++;
     metrics_.read_dup.fetch_add(prior > 0 ? 1 : 0, std::memory_order_relaxed);
     metrics_.read_lead.fetch_add(prior > 0 ? 0 : 1, std::memory_order_relaxed);
-    if (!slot->episode) {
-      slot->episode = std::make_shared<ReadEpisode>();
-      episode = slot->episode;
-      leading = true;
-    } else if (single_flight_ && !slot->episode->sealed) {
+    // An extent leader lacks the rest of the object, so only a whole-object one joins.
+    episode = single_flight_ ? slot->Joinable(0, size) : nullptr;
+    if (episode) {
       my_target = std::make_shared<FollowerTarget>();
       my_target->dst = staging_ptr;
-      my_target->cap = staging_cap;
-      slot->episode->followers.push_back(my_target);
-      episode = slot->episode;
+      my_target->length = size;  // size <= staging_cap, checked above
+      episode->followers.push_back(my_target);
       following = true;
       metrics_.read_merged.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      episode = std::make_shared<ReadEpisode>();
+      episode->length = size;  // a whole-object read: [0, size)
+      slot->episodes.push_back(episode);
     }
-    // else: missed the merge window — fall through and read it ourselves.
   }
 
   bool read_ok = false;
@@ -473,28 +472,27 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     read_ok = signalled && my_target->ok;
   } else {
     read_ok = backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size);
-    if (leading) {
-      // Publish to whoever attached while we were on the device.  Failures are
-      // published too, so a follower is never left to time out.
-      std::vector<std::shared_ptr<FollowerTarget>> fanout;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        episode->sealed = true;
-        fanout.swap(episode->followers);
-        auto it = inflight_reads_.find(key);
-        if (it != inflight_reads_.end() && it->second->episode == episode) {
-          it->second->episode.reset();
-        }
+    // Publish to whoever attached while we were on the device.  Failures are
+    // published too, so a follower is never left to time out.
+    std::vector<std::shared_ptr<FollowerTarget>> fanout;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      episode->sealed = true;
+      fanout.swap(episode->followers);
+      auto it = inflight_reads_.find(key);
+      if (it != inflight_reads_.end()) it->second->Retire(episode);
+    }
+    for (const auto& f : fanout) {
+      f->ok = read_ok;
+      if (read_ok) {
+        std::memcpy(f->dst, static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
+                    f->length);
       }
-      for (const auto& f : fanout) {
-        f->ok = read_ok;
-        if (read_ok) std::memcpy(f->dst, staging_ptr, std::min(size, f->cap));
-      }
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        episode->done = true;
-        episode->cv.notify_all();
-      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      episode->done = true;
+      episode->cv.notify_all();
     }
   }
 
@@ -516,25 +514,28 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     return SsdReadOutcome{SsdReadStatus::kError, size};
   }
   metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
-  metrics_.read_bytes.fetch_add(size, std::memory_order_relaxed);  // SSD read IO bandwidth source
+  // No read_bytes: only tier moves stage here, and the pool counts their bytes.
   return SsdReadOutcome{SsdReadStatus::kOk, size};
 }
 
-std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<std::string>& keys,
-                                                             const std::vector<void*>& dsts,
-                                                             const std::vector<size_t>& caps) {
+std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
+    const std::vector<std::string>& keys, const std::vector<void*>& dsts,
+    const std::vector<size_t>& caps, const std::vector<ObjectExtent>* extents) {
   std::vector<SsdReadOutcome> out(keys.size(), SsdReadOutcome{SsdReadStatus::kNotFound, 0});
   if (keys.empty()) return out;
   if (!backend_) {
     metrics_.read_not_found.fetch_add(keys.size(), std::memory_order_relaxed);
     return out;
   }
-  if (dsts.size() != keys.size() || caps.size() != keys.size()) {
+  if (dsts.size() != keys.size() || caps.size() != keys.size() ||
+      (extents != nullptr && extents->size() != keys.size())) {
     MORI_UMBP_ERROR("[PeerSsdManager] PrepareReadBatch: mismatched input lengths ({} / {} / {})",
                     keys.size(), dsts.size(), caps.size());
     for (auto& o : out) o = SsdReadOutcome{SsdReadStatus::kError, 0};
     return out;
   }
+  const auto is_ranged = [&](size_t i) { return extents != nullptr && (*extents)[i].length != 0; };
+  std::vector<ObjectExtent> wants(keys.size());  // what each key reads: its extent, or [0, size)
 
   // Stage timers for the [SsdPerf/peer] GET breakdown (no-ops unless
   // UMBP_SSD_TIMING is set).
@@ -550,9 +551,8 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
 
   // Pass 1 — resolve sizes and mark every servable key in flight under ONE lock
   // acquisition (the per-key path pays two per key).
-  std::vector<size_t> todo;   // I lead (or independently read) these
+  std::vector<size_t> todo;   // I lead these
   std::vector<size_t> waits;  // I follow these; a leader will fill my buffer
-  std::vector<bool> is_leader(keys.size(), false);
   // Per-request handle on the episode we lead or follow.  Held as a shared_ptr
   // so it stays valid even after the slot moves on to a new leader.
   std::vector<std::shared_ptr<ReadEpisode>> episodes(keys.size());
@@ -574,10 +574,18 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
         continue;  // stays kNotFound
       }
       const size_t size = it->second.size;
-      if (size > caps[i]) {
+      wants[i] = is_ranged(i) ? (*extents)[i] : ObjectExtent{0, size};
+      if (wants[i].offset > size || wants[i].length > size - wants[i].offset) {
+        metrics_.read_error.fetch_add(1, std::memory_order_relaxed);
+        MORI_UMBP_WARN("[PeerSsdManager] SSD read key={} extent [{}, +{}) outside size {}", keys[i],
+                       wants[i].offset, wants[i].length, size);
+        out[i] = SsdReadOutcome{SsdReadStatus::kError, size};
+        continue;
+      }
+      if (wants[i].length > caps[i]) {
         metrics_.read_size_too_large.fetch_add(1, std::memory_order_relaxed);
         MORI_UMBP_WARN("[PeerSsdManager] SSD read key={} size={}B exceeds its {}B buffer", keys[i],
-                       size, caps[i]);
+                       wants[i].length, caps[i]);
         out[i] = SsdReadOutcome{SsdReadStatus::kSizeTooLarge, size};
         continue;
       }
@@ -589,24 +597,23 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
         ++dup;
         if (prior > max_concurrent) max_concurrent = prior;
       }
-      if (!slot->episode) {
-        // First in: this request owns the device read and the fan-out.
-        slot->episode = std::make_shared<ReadEpisode>();
-        episodes[i] = slot->episode;
-        is_leader[i] = true;
-        todo.push_back(i);
-      } else if (single_flight_ && !slot->episode->sealed) {
-        // Merge window open: hand the leader our buffer and wait on its episode.
+      episodes[i] = single_flight_ ? slot->Joinable(wants[i].offset, wants[i].length) : nullptr;
+      if (episodes[i]) {
+        // A leader mid-read covers our bytes: hand it our buffer and wait on it.
         my_targets[i] = std::make_shared<FollowerTarget>();
         my_targets[i]->dst = dsts[i];
-        my_targets[i]->cap = caps[i];
-        slot->episode->followers.push_back(my_targets[i]);
-        episodes[i] = slot->episode;
+        my_targets[i]->offset = wants[i].offset;
+        my_targets[i]->length = wants[i].length;
+        episodes[i]->followers.push_back(my_targets[i]);
         waits.push_back(i);
         ++merged;
       } else {
-        // Missed the window (or single flight off): read it ourselves.  This is
-        // the pre-single-flight path and is always correct, just not merged.
+        // Lead even beside another extent's leader, so the next reader of these
+        // bytes has one to join.
+        episodes[i] = std::make_shared<ReadEpisode>();
+        episodes[i]->offset = wants[i].offset;
+        episodes[i]->length = wants[i].length;
+        slot->episodes.push_back(episodes[i]);
         todo.push_back(i);
       }
     }
@@ -626,24 +633,40 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
     return out;
   }
 
-  // Pass 2 — one batched backend read outside the lock; ShardedSsdTier turns
-  // this into concurrent IO on every drive holding part of the batch.
-  std::vector<std::string> k;
-  std::vector<uintptr_t> d;
-  std::vector<size_t> z;
-  k.reserve(todo.size());
-  d.reserve(todo.size());
-  z.reserve(todo.size());
-  for (size_t i : todo) {
-    k.push_back(keys[i]);
-    d.push_back(reinterpret_cast<uintptr_t>(dsts[i]));
-    z.push_back(out[i].size);
-  }
-  std::vector<bool> ok;
+  // Pass 2 — batched backend reads outside the lock, one for whole objects and
+  // one for extents; ShardedSsdTier turns each into concurrent IO on every
+  // drive holding part of the batch.
+  std::vector<bool> ok(todo.size(), false);
   if (!todo.empty()) {
     const auto t_backend = ssdperf::Now();
-    ok = backend_->BatchReadIntoPtr(k, d, z);
-    ok.resize(todo.size(), false);
+    std::vector<size_t> whole, ranged;  // positions in todo
+    for (size_t j = 0; j < todo.size(); ++j) (is_ranged(todo[j]) ? ranged : whole).push_back(j);
+    if (!whole.empty()) {
+      std::vector<std::string> k;
+      std::vector<uintptr_t> d;
+      std::vector<size_t> z;
+      for (size_t j : whole) {
+        k.push_back(keys[todo[j]]);
+        d.push_back(reinterpret_cast<uintptr_t>(dsts[todo[j]]));
+        z.push_back(out[todo[j]].size);
+      }
+      const auto got = backend_->BatchReadIntoPtr(k, d, z);
+      for (size_t w = 0; w < whole.size() && w < got.size(); ++w) ok[whole[w]] = got[w];
+    }
+    if (!ranged.empty()) {
+      std::vector<std::string> k;
+      std::vector<std::vector<uintptr_t>> d;
+      std::vector<std::vector<size_t>> z, o;
+      for (size_t j : ranged) {
+        const size_t i = todo[j];
+        k.push_back(keys[i]);
+        d.push_back({reinterpret_cast<uintptr_t>(dsts[i])});
+        z.push_back({static_cast<size_t>(wants[i].length)});
+        o.push_back({static_cast<size_t>(wants[i].offset)});
+      }
+      const auto got = backend_->ReadBatchRangesIntoPtr(k, d, z, o);
+      for (size_t r = 0; r < ranged.size() && r < got.size(); ++r) ok[ranged[r]] = got[r];
+    }
     backend_ms = ssdperf::MsSince(t_backend);
   }
 
@@ -657,26 +680,24 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
   const auto t_fanout = ssdperf::Now();
   for (size_t j = 0; j < todo.size(); ++j) {
     const size_t i = todo[j];
-    if (!is_leader[i]) continue;  // independent read: nobody is waiting on it
     const auto& ep = episodes[i];
     std::vector<std::shared_ptr<FollowerTarget>> fanout;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      ep->sealed = true;  // late arrivals now go independent instead of waiting
+      ep->sealed = true;  // late arrivals now lead their own read instead of waiting
       fanout.swap(ep->followers);
       // Retire the episode so the next arrival starts a fresh one rather than
       // attaching to a read that is already past its snapshot.
       auto it = inflight_reads_.find(keys[i]);
-      if (it != inflight_reads_.end() && it->second->episode == ep) it->second->episode.reset();
+      if (it != inflight_reads_.end()) it->second->Retire(ep);
     }
     // Deliver outside the lock: holding mutex_ across a page-sized memcpy would
     // stall every other read/evict here.
     for (const auto& f : fanout) {
       f->ok = ok[j];
       if (!ok[j]) continue;
-      const size_t n = std::min(out[i].size, f->cap);
-      std::memcpy(f->dst, dsts[i], n);
-      fanout_bytes += n;
+      std::memcpy(f->dst, static_cast<const char*>(dsts[i]) + (f->offset - ep->offset), f->length);
+      fanout_bytes += f->length;
       ++fanout_count;
     }
     {
@@ -727,7 +748,7 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
       out[i].status = SsdReadStatus::kOk;
       // read_bytes is device traffic only, so merged reads are excluded — the
       // counter stays a true measure of what the drive moved.
-      if (from_device) read_bytes += out[i].size;
+      if (from_device) read_bytes += wants[i].length;
       metrics_.read_ok.fetch_add(1, std::memory_order_relaxed);
     } else {
       // owned_ had the key but it couldn't be served (a local evict raced us, a
@@ -774,6 +795,10 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(const std::vector<s
   return out;
 }
 
+bool PeerSsdManager::SupportsRangedRead() const {
+  return backend_ != nullptr && backend_->Capabilities().ranged_read;
+}
+
 // ---------------------------------------------------------------------------
 //  OwnedLocationSource (heartbeat event drain / snapshot)
 // ---------------------------------------------------------------------------
@@ -803,6 +828,11 @@ std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeysLocked() const {
 std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeys() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return SnapshotOwnedKeysLocked();
+}
+
+size_t PeerSsdManager::OwnedKeyCount() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return owned_.size();
 }
 
 std::vector<KvEvent> PeerSsdManager::SnapshotOwnedKeysForFullSync() {

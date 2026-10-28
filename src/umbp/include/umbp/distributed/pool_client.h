@@ -73,6 +73,8 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
       return "FAILED";
     case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE:
       return "NO_SPACE";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT:
+      return "IN_FLIGHT";
     default:
       return "UNKNOWN";
   }
@@ -197,6 +199,9 @@ class PoolClient {
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
+  // Ahead of a read: local SSD keys are copied into DRAM (PeerPool::Prefetch),
+  // and keys on peers are pulled into this node's medium in the background.
+  size_t BatchPrefetch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
@@ -451,12 +456,15 @@ class PoolClient {
   // Each hit's bytes stay put while its resolutions[i].hold lives.  `busy`
   // receives the candidates a staged medium left for a later call while
   // serving others; without it, or when nothing was served, they are misses.
+  // `extents` (parallel to `keys`, or null) lets a staging medium publish only
+  // what each reader touches (ResolvedEntry::covered_offset / covered_size).
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
                          std::vector<ResolvedEntry>* resolutions,
                          const std::function<bool(size_t)>& dst_is_device = {},
-                         std::vector<size_t>* busy = nullptr);
+                         std::vector<size_t>* busy = nullptr,
+                         const std::vector<ObjectExtent>* extents = nullptr);
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -607,6 +615,9 @@ class PoolClient {
   // blocks, the read that scheduled it.
   void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
                                 const RouteGetResult& route);
+  // Queues the pull with no admission check; false if not queued.
+  bool QueueWholeObjectPull(const std::string& key, size_t object_size,
+                            const RouteGetResult& route);
   // The other half of the same decision: the arena slice already holds the
   // whole object (the caller's ranges tiled it in order), so locality costs one
   // local copy instead of a second trip to the peer.  Synchronous because the

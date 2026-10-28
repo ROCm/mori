@@ -92,6 +92,9 @@ class PagePool {
   // free-list or slab implementation awkward to write.
   virtual size_t NumBuffers() const = 0;
   virtual uint32_t BufferPageCount(size_t buffer_index) const = 0;
+  // Free pages in one buffer, so a caller can pick among several buffers that
+  // share a NUMA node.  0 for an out-of-range index.
+  virtual uint32_t BufferFreePages(size_t buffer_index) const = 0;
 
  protected:
   PagePool() = default;

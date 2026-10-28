@@ -263,6 +263,13 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
   }
 
   deviceCtxs.resize(availDevices.size(), nullptr);
+  portDown_ = std::make_unique<std::atomic<bool>[]>(availDevices.size());
+  portRejected_ = std::make_unique<std::atomic<uint64_t>[]>(availDevices.size());
+  for (size_t i = 0; i < availDevices.size(); ++i) {
+    portDown_[i].store(false, std::memory_order_relaxed);
+    portRejected_[i].store(0, std::memory_order_relaxed);
+  }
+  env::Override("MORI_IO_PORT_DOWN_FAIL_FAST", portDownFailFast_, mori::env::detail::ParseBool);
   topo.reset(new application::TopoSystem());
 
   bool enableAsyncEvents = true;
@@ -278,8 +285,30 @@ RdmaManager::RdmaManager(const RdmaBackendConfig cfg, application::RdmaContext* 
 
     auto logger = mori::ModuleLogger::GetInstance().GetLogger(mori::modules::IO);
     asyncEventMonitor_ = RdmaAsyncEventMonitor::Create(
-        devices, logger, std::move(handler),
-        [this](const PeerFailureReport& report) { peerFailures_.Report(report); });
+        devices, logger, std::move(handler), [this](const PeerFailureReport& report) {
+          if (portDownFailFast_ && report.scope == FailureScope::kPort) {
+            for (size_t i = 0; i < availDevices.size(); ++i) {
+              const auto& [device, port] = availDevices[i];
+              if (device->Name() != report.event.deviceName || port != report.event.portNum)
+                continue;
+              bool down = !report.recovery;
+              bool previous = portDown_[i].exchange(down, std::memory_order_relaxed);
+              // Publish before logging: a logging failure must not hide the event.
+              peerFailures_.Report(report);
+              if (down && !previous) {
+                MORI_IO_ERROR("local port {}:{} is down; rejecting new submissions until ACTIVE",
+                              device->Name(), port);
+              } else if (!down && previous) {
+                MORI_IO_INFO("local port {}:{} is ACTIVE; rejected {} submission(s) while down",
+                             device->Name(), port,
+                             portRejected_[i].exchange(0, std::memory_order_relaxed));
+              }
+              return;
+            }
+          }
+          // Publish after the gate update, so consumers observe consistent admission.
+          peerFailures_.Report(report);
+        });
     if (!asyncEventMonitor_ && logger) {
       logger->error("Failed to start RDMA async event monitor; continuing without it");
     }
@@ -290,6 +319,10 @@ RdmaManager::~RdmaManager() {
   // Join the monitor thread first: its handlers reach back into this object and
   // into endpoint ledgers, neither of which may be torn down under it.
   asyncEventMonitor_.reset();
+
+  for (const auto& [device, port] : availDevices) {
+    Verbs().ReleaseAsyncContext(device->GetIbvContext());
+  }
 
   for (auto* devCtx : deviceCtxs) {
     if (devCtx != nullptr) {
@@ -465,6 +498,16 @@ EpPairVec RdmaManager::GetAllEndpoint(EngineKey engine, TopoKeyPair key) {
   return tableIt->second;
 }
 
+EpPairVec RdmaManager::GetLiveEndpoints(EngineKey engine, TopoKeyPair key) {
+  EpPairVec eps = GetAllEndpoint(engine, key);
+  eps.erase(std::remove_if(eps.begin(), eps.end(),
+                           [this](const EpPair& ep) {
+                             return NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn);
+                           }),
+            eps.end());
+  return eps;
+}
+
 application::RdmaEndpointConfig RdmaManager::GetRdmaEndpointConfig(int devId) {
   const auto& [device, portId] = availDevices[devId];
   const auto* deviceAttr = device->GetDeviceAttr();
@@ -560,6 +603,8 @@ application::RdmaEndpoint RdmaManager::CreateEndpoint(int devId) {
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
 
   application::RdmaEndpoint rdmaEp = devCtx->CreateRdmaEndpoint(GetRdmaEndpointConfig(devId));
+  // A newly allocated CQ/QP may reuse an address from a retired endpoint.
+  Verbs().ForgetAsyncEndpoint(devCtx->GetIbvContext(), rdmaEp.handle.qpn, rdmaEp.ibvHandle.cq);
   if (config.pollCqMode == PollCqMode::EVENT)
     SYSCALL_RETURN_ZERO(ibv_req_notify_cq(rdmaEp.ibvHandle.cq, 0));
   return rdmaEp;
@@ -575,6 +620,8 @@ bool RdmaManager::DestroyEndpointNoThrow(int devId, const application::RdmaEndpo
     const bool destroyed = deviceCtxs[devId]->DestroyRdmaEndpointNoThrow(ep);
     // Drop it only once gone, so the number cannot be reused under a stale owner.
     if (destroyed) {
+      Verbs().ForgetAsyncEndpoint(availDevices[devId].first->GetIbvContext(), ep.handle.qpn,
+                                  ep.ibvHandle.cq);
       peerFailures_.ForgetQp(PeerFailureTracker::QpKey{DeviceName(devId), ep.handle.qpn});
     }
     return destroyed;
@@ -633,6 +680,30 @@ bool RdmaManager::IsQpAlive(int devId, uint32_t qpNum) const {
   return peerFailures_.IsQpAlive(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
 }
 
+bool RdmaManager::NeedsQpReplacement(int devId, uint32_t qpNum) const {
+  return peerFailures_.NeedsQpReplacement(PeerFailureTracker::QpKey{DeviceName(devId), qpNum});
+}
+
+bool RdmaManager::RejectIfPortDown(const EpPairVec& eps, TransferStatus* status) {
+  for (const auto& ep : eps) {
+    if (!portDown_[ep.ldevId].load(std::memory_order_relaxed)) continue;
+    portRejected_[ep.ldevId].fetch_add(1, std::memory_order_relaxed);
+    // Reuse the engine's existing log deduplication. The port transition was
+    // already logged once; do not emit an ERROR for every rejected transfer.
+    auto meta = std::make_shared<CqCallbackMeta>(status, 0, 0);
+    internal::PublishCurrentIoCallDiagnostics(meta);
+    meta->diagnostics.MarkRootCause();
+    meta->diagnostics.TryMarkLogged(internal::IoFailureKind::RootCause);
+    const auto& [device, port] = availDevices[ep.ldevId];
+    status->Update(
+        StatusCode::ERR_RDMA_OP,
+        "local port " + device->Name() + ":" + std::to_string(port) +
+            " is down (IBV_EVENT_PORT_ERR); rejecting new submissions until it is ACTIVE again");
+    return true;
+  }
+  return false;
+}
+
 void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText) {
   PeerFailureReport report;
   report.scope = FailureScope::kQp;
@@ -645,6 +716,10 @@ void RdmaManager::RecordPeerUnreachable(const EpPair& ep, const char* statusText
                         (statusText != nullptr ? statusText : "unknown") +
                         ": peer did not acknowledge within the transport retry budget";
   peerFailures_.Report(report);
+}
+
+void RdmaManager::RecordQpFailed(const EpPair& ep) {
+  peerFailures_.MarkQpFailed(PeerFailureTracker::QpKey{DeviceName(ep.ldevId), ep.local.handle.qpn});
 }
 
 std::shared_ptr<EndpointRuntime> RdmaManager::GetEndpointRuntime(EndpointId id) {
@@ -877,6 +952,12 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
             rdma->RecordPeerUnreachable(ep, failureAdvice.statusText);
           }
         }
+        // Any error completion, a flush included, means the QP is in the error
+        // state, so later sessions must not use it. Recorded before the status
+        // below: a caller that sees the failure and retries gets a new QP.
+        if (wc[i].status != IBV_WC_RETRY_EXC_ERR && rdma != nullptr) {
+          rdma->RecordQpFailed(ep);
+        }
 
         int mergedBatchSize = 0;
         auto meta = ep.ledger
@@ -897,7 +978,8 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                                           failureAdvice.ComposeStatusMessage());
           TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
           if (statusPtr != nullptr) {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
+            meta->ReportData(statusPtr, StatusCode::ERR_RDMA_OP,
+                             failureAdvice.ComposeStatusMessage());
           }
           // A closed ledger means a fatal async event already retired this
           // endpoint, so its degraded flag is terminal rather than the
@@ -1003,7 +1085,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
             // then overwrite a transfer that actually completed.
             TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
             if (statusPtr != nullptr) {
-              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+              meta->ReportData(statusPtr, StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
             }
           }
           MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
@@ -1490,28 +1572,39 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
       rdma_(rdma),
       localLoc_(localLoc) {}
 
+// After the data WRs of a transfer were posted (`ret`): reports a post that ended the
+// transfer by itself, then posts the notification when notifications are on.
+static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallbackMeta>& meta,
+                             TransferStatus* status, TransferUniqueId id, RdmaOpRet ret,
+                             bool notify) {
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    // Nothing was posted, or the post gave up: no CQE ends this transfer, and the CQE
+    // of a WR posted before the failure must not report it a second time.
+    if (TransferStatus* s = meta->status.exchange(nullptr, std::memory_order_acq_rel)) {
+      meta->ReportData(s, ret.code, ret.message);
+    }
+  }
+  if (!notify) return;
+  RdmaOpRet notifRet = ret.Failed() ? RdmaOpRet{StatusCode::SUCCESS, ""}
+                                    : RdmaNotifyTransfer(eps, &meta->dataStatus, id);
+  meta->ReportNotification(status, notifRet.code, notifRet.message);
+}
+
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
+  if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  callbackMeta->awaitsNotification = config.enableNotification;
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
   RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
                                      {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
                                      config.enableTransferChunking ? config.chunkBytes : 0,
                                      config.maxChunksPerTransfer, config.enableTransferChunking);
-
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->Update(ret.code, ret.message);
-  }
-  if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
-    if (notifRet.Failed()) {
-      status->Update(notifRet.code, notifRet.message);
-    }
-  }
+  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
 }
 
 void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
@@ -1519,6 +1612,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
                                         TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
+  if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
 
   const bool chunk = config.enableTransferChunking;
   const bool canUseWorkerChunking =
@@ -1563,6 +1657,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
+  callbackMeta->awaitsNotification = config.enableNotification;
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (canUseWorkerChunking) {
@@ -1601,16 +1696,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
                              callbackMeta, id, isRead, config.postBatchSize, control);
   }
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->Update(ret.code, ret.message);
-  }
-  if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
-    if (notifRet.Failed()) {
-      status->Update(notifRet.code, notifRet.message);
-    }
-  }
+  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
 }
 
 bool RdmaBackendSession::Alive() const {
@@ -1621,6 +1707,14 @@ bool RdmaBackendSession::Alive() const {
     if (!rdma_->IsQpAlive(ep.ldevId, ep.local.handle.qpn)) return false;
   }
   return true;
+}
+
+bool RdmaBackendSession::NeedsQpReplacement() const {
+  if (rdma_ == nullptr) return false;
+  for (const auto& ep : eps) {
+    if (rdma_->NeedsQpReplacement(ep.ldevId, ep.local.handle.qpn)) return true;
+  }
+  return false;
 }
 
 /* ----------------------------------------------------------------------------------------------
@@ -1754,8 +1848,43 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
   return sess;
 }
 
+namespace {
+constexpr std::chrono::milliseconds kReplaceRetryInterval{1000};
+constexpr std::chrono::milliseconds kMinQpReplacementInterval{1000};
+constexpr std::chrono::milliseconds kMaxQpReplacementInterval{60000};
+
+// CreateSession refused to build QPs in place of failed ones until retryAt.
+class QpReplacementBackoff : public std::runtime_error {
+ public:
+  QpReplacementBackoff(const std::string& what, std::chrono::steady_clock::time_point retryAt)
+      : std::runtime_error(what), retryAt(retryAt) {}
+  std::chrono::steady_clock::time_point retryAt;
+};
+}  // namespace
+
+std::chrono::milliseconds RdmaBackend::PaceQpReplacement(const ConnBuildKey& key, bool enforce) {
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> guard(connBuildMapMu_);
+  QpReplacementPacing& pacing = qpReplacementPacing_[key];
+  const auto allowedAt = pacing.lastAt + pacing.interval;
+  if (enforce && now < allowedAt) {
+    const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(now - pacing.lastAt);
+    throw QpReplacementBackoff("QPs failed again " + std::to_string(since.count()) +
+                                   " ms after their last replacement; replacements are " +
+                                   std::to_string(pacing.interval.count()) + " ms apart",
+                               allowedAt);
+  }
+  // Needing another replacement within twice the wait means the path is still bad, so
+  // the wait doubles; needing one later than that starts over.
+  pacing.interval = pacing.interval.count() > 0 && now < allowedAt + pacing.interval
+                        ? std::min(pacing.interval * 2, kMaxQpReplacementInterval)
+                        : kMinQpReplacementInterval;
+  pacing.lastAt = now;
+  return pacing.interval;
+}
+
 void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote,
-                                RdmaBackendSession& sess) {
+                                RdmaBackendSession& sess, bool paceQpReplacement) {
   TopoKey localKey{local.deviceId, local.loc, local.numaNode};
   TopoKey remoteKey{remote.deviceId, remote.loc, remote.numaNode};
   TopoKeyPair kp{localKey, remoteKey};
@@ -1778,10 +1907,22 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
   }
   std::vector<int> desiredPerRank = BuildDesiredQpCounts(config.qpPerTransfer, effectiveNumNics);
 
+  const int failedEpNum =
+      rdma->CountEndpoint(ekey, kp) - static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
+  int builtEpNum = 0;
+  std::chrono::milliseconds nextReplacementWait{0};
+  auto paceReplacement = [&](int missing) {
+    if (failedEpNum > 0 && missing > 0) {
+      nextReplacementWait = PaceQpReplacement(ConnBuildKey{ekey, kp}, paceQpReplacement);
+    }
+  };
+
   if (effectiveNumNics == 1) {
-    int epNum = rdma->CountEndpoint(ekey, kp);
+    int epNum = static_cast<int>(rdma->GetLiveEndpoints(ekey, kp).size());
+    paceReplacement(config.qpPerTransfer - epNum);
     for (int i = epNum; i < config.qpPerTransfer; ++i) {
       server->BuildRdmaConn(ekey, kp, 0);
+      ++builtEpNum;
     }
   } else {
     std::unordered_map<int, int> rankByDev;
@@ -1789,21 +1930,33 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
       rankByDev[localCandidates[rank].first] = rank;
     }
 
-    EpPairVec existing = rdma->GetAllEndpoint(ekey, kp);
+    EpPairVec existing = rdma->GetLiveEndpoints(ekey, kp);
     std::vector<int> haveByRank(effectiveNumNics, 0);
     for (const auto& ep : existing) {
       auto it = rankByDev.find(ep.ldevId);
       if (it != rankByDev.end()) haveByRank[it->second] += 1;
     }
 
+    int missing = 0;
+    for (int rank = 0; rank < effectiveNumNics; ++rank) {
+      missing += std::max(0, desiredPerRank[rank] - haveByRank[rank]);
+    }
+    paceReplacement(missing);
     for (int rank = 0; rank < effectiveNumNics; ++rank) {
       for (int count = haveByRank[rank]; count < desiredPerRank[rank]; ++count) {
         server->BuildRdmaConn(ekey, kp, rank);
+        ++builtEpNum;
       }
     }
   }
+  if (failedEpNum > 0 && builtEpNum > 0) {
+    MORI_IO_WARN(
+        "CreateSession: built {} QP(s) to engine {} in place of failed ones ({} failed so far); "
+        "another replacement within {} ms waits until then",
+        builtEpNum, ekey, failedEpNum, nextReplacementWait.count());
+  }
 
-  EpPairVec eps = rdma->GetAllEndpoint(ekey, kp);
+  EpPairVec eps = rdma->GetLiveEndpoints(ekey, kp);
   if (static_cast<int>(eps.size()) < config.qpPerTransfer) {
     throw std::runtime_error("RdmaBackend::CreateSession: insufficient RDMA endpoints");
   }
@@ -1879,23 +2032,57 @@ bool RdmaBackend::PopPeerFailure(PeerFailureEvent* out) {
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
                                                           const MemoryDesc& remote) {
   SessionCacheKey key{remote.engineKey, local.id, remote.id};
+  const ConnBuildKey connKey{remote.engineKey,
+                             TopoKeyPair{TopoKey{local.deviceId, local.loc, local.numaNode},
+                                         TopoKey{remote.deviceId, remote.loc, remote.numaNode}}};
+  RdmaBackendSession* failed = nullptr;
   {
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it != sessionCache.end()) {
-      return it->second.get();
+      if (!it->second->NeedsQpReplacement()) return it->second.get();
+      auto retry = replaceRetryAt.find(connKey);
+      if (retry != replaceRetryAt.end() && std::chrono::steady_clock::now() < retry->second) {
+        return it->second.get();
+      }
+      failed = it->second.get();
     }
   }
   // create outside lock (CreateSession may allocate / block); then insert
   auto newSess = std::make_unique<RdmaBackendSession>();
-  CreateSession(local, remote, *newSess);
-  std::lock_guard<std::mutex> lock(sessionCacheMu);
-  auto it = sessionCache.find(key);
-  if (it != sessionCache.end()) {
+  try {
+    CreateSession(local, remote, *newSess, /*paceQpReplacement=*/failed != nullptr);
+  } catch (const std::exception& e) {
+    if (failed == nullptr) throw;
+    std::lock_guard<std::mutex> lock(sessionCacheMu);
+    auto it = sessionCache.find(key);
+    if (it == sessionCache.end()) throw;
+    if (it->second.get() == failed) {
+      // The peer may be gone, or the path keeps failing. Keep the failed session: a
+      // transfer on it ends with an error status, which callers handle, while an
+      // exception would escape them.
+      const auto now = std::chrono::steady_clock::now();
+      const auto* backoff = dynamic_cast<const QpReplacementBackoff*>(&e);
+      const auto retryAt = backoff != nullptr ? backoff->retryAt : now + kReplaceRetryInterval;
+      MORI_IO_WARN(
+          "Cannot replace a failed session to engine {}, retrying in {} ms: {}", remote.engineKey,
+          std::chrono::duration_cast<std::chrono::milliseconds>(retryAt - now).count(), e.what());
+      replaceRetryAt[connKey] = retryAt;
+    }
     return it->second.get();
   }
-  auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
-  return emplacedIt->second.get();
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  auto it = sessionCache.find(key);
+  if (it == sessionCache.end()) {
+    auto [emplacedIt, inserted] = sessionCache.emplace(key, std::move(newSess));
+    return emplacedIt->second.get();
+  }
+  if (it->second.get() == failed) {
+    retiredSessions.push_back(std::move(it->second));
+    it->second = std::move(newSess);
+    replaceRetryAt.erase(connKey);
+  }
+  return it->second.get();
 }
 
 void RdmaBackend::InvalidateSessionsForMemory(MemoryUniqueId id) {

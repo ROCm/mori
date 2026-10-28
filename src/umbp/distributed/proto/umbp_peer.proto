@@ -84,6 +84,9 @@ enum AllocateSlotOutcome {
   ALLOCATE_SLOT_OUTCOME_SUCCESS_ALREADY_EXISTS = 2;  // owned_[key] dedup hit
   ALLOCATE_SLOT_OUTCOME_FAILED                 = 3;  // generic — see peer log for reason
   ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE        = 4;  // tier exhausted; retry on another peer
+  // Another writer holds this key's pending slot and its commit stores the
+  // bytes, so the writer counts the key as stored, as a local put does.
+  ALLOCATE_SLOT_OUTCOME_IN_FLIGHT              = 5;
 }
 
 message AllocateSlotResponse {

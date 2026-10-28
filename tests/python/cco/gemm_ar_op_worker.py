@@ -294,7 +294,7 @@ def _mxfp8_reference(world: int, m: int, n: int, k: int) -> torch.Tensor:
     return acc
 
 
-def case_mxfp8(comm, rank, world, m, n, k):
+def case_mxfp8(comm, rank, world, m, n, k, quant="mxfp8"):
     """``quant="mxfp8"`` end to end: DeepSeek-V4.1-Flash's quantisation.
 
     Its own op rather than a case on the shared one: mxfp8 compiles at
@@ -304,19 +304,19 @@ def case_mxfp8(comm, rank, world, m, n, k):
     The A scale goes through ``preshuffle_a_scale`` and the B scale is the
     ``[N/32, K/32]`` exponent bytes K-block major, which is exactly what
     sglang's ``prepare_mxfp8_native_weight`` leaves on the layer.
+    ``"mxfp8_raw"`` takes both as the quantiser's row-major bytes instead.
     """
-    with GemmAllReduceOp(comm, n=n, k=k, m_max=m, quant="mxfp8") as op:
+    with GemmAllReduceOp(comm, n=n, k=k, m_max=m, quant=quant) as op:
         op.self_test()
         a, b, ea, eb = _mxfp8_operands(rank, m, n, k)
-        got = op(
-            a,
-            preshuffle_b(b),
-            preshuffle_a_scale(ea),
-            eb.t().reshape(-1).contiguous(),
-        ).clone()
+        if quant == "mxfp8_raw":
+            sa, sb = ea.to(torch.uint8), eb.to(torch.uint8)
+        else:
+            sa, sb = preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
+        got = op(a, preshuffle_b(b), sa, sb).clone()
     _emit(
         rank,
-        case="mxfp8",
+        case=quant,
         rel_l2=_rel_l2(got, _mxfp8_reference(world, m, n, k)),
         m=m,
     )
@@ -397,6 +397,7 @@ def run_all(comm, rank, world, n, k):
     # released: mxfp8 compiles at a different BLOCK_M, and close() is about the
     # lifecycle.
     case_mxfp8(comm, rank, world, world * 256, n, k)
+    case_mxfp8(comm, rank, world, world * 256, n, k, quant="mxfp8_raw")
     case_close_is_idempotent(comm, rank, n, k, 512)
 
 

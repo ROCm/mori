@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -159,7 +160,9 @@ void PlanSgeStreamChunks(std::vector<ChunkedSgeSegment>& plan, const std::vector
 
 struct CqCallbackMeta {
   CqCallbackMeta(TransferStatus* s, TransferUniqueId id_, int n)
-      : status(s), id(id_), totalBatchSize(n) {}
+      : status(s), id(id_), totalBatchSize(n) {
+    dataStatus.SetCode(StatusCode::IN_PROGRESS);
+  }
 
   // Claimed with exchange(nullptr) by whoever completes the transfer first, so a
   // terminal update happens exactly once even though the CQ poller and the async
@@ -169,6 +172,58 @@ struct CqCallbackMeta {
   int totalBatchSize{0};
   std::atomic<uint32_t> finishedBatchSize{0};
   internal::IoCallDiagnostics diagnostics{};
+
+  // Set before the data WRs are posted when a notification SEND follows them. The
+  // data WRs and the notification post then finish independently, and whichever
+  // finishes last reports the transfer: a notification that cannot be posted never
+  // turns it terminal while its data WRs are still on the wire, and is never lost
+  // behind a SUCCESS the data already reported.
+  bool awaitsNotification{false};
+
+  // Reports the data WRs' outcome through `s`, the status the caller claimed.
+  void ReportData(TransferStatus* s, StatusCode code, const std::string& message) {
+    if (!awaitsNotification) {
+      s->Update(code, message);
+      return;
+    }
+    dataStatus.Update(code, message);
+    Finish(s, &dataOutcome, code, message);
+  }
+
+  // The data WRs' own outcome while the caller's status waits for the notification too;
+  // a notification fault staged in test builds waits for it.
+  TransferStatus dataStatus;
+
+  // Reports the notification post's outcome; `s` is the posting thread's own status.
+  void ReportNotification(TransferStatus* s, StatusCode code, const std::string& message) {
+    Finish(s, &notificationOutcome, code, message);
+  }
+
+ private:
+  struct Outcome {
+    StatusCode code{StatusCode::SUCCESS};
+    std::string message;
+  };
+
+  // A data failure wins over a notification failure; only both succeeding is SUCCESS.
+  void Finish(TransferStatus* s, Outcome* part, StatusCode code, const std::string& message) {
+    {
+      std::lock_guard<std::mutex> lock(outcomeMu);
+      *part = Outcome{code, message};
+    }
+    if (unfinishedParts.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    std::lock_guard<std::mutex> lock(outcomeMu);
+    const Outcome& report = dataOutcome.code <= StatusCode::ERR_BEGIN &&
+                                    notificationOutcome.code > StatusCode::ERR_BEGIN
+                                ? notificationOutcome
+                                : dataOutcome;
+    s->Update(report.code, report.message);
+  }
+
+  std::atomic<int> unfinishedParts{2};
+  std::mutex outcomeMu;
+  Outcome dataOutcome;
+  Outcome notificationOutcome;
 };
 
 // SubmissionLedger: tracks per-EP WR submissions and enables precise sqDepth release.
@@ -395,7 +450,8 @@ struct RdmaOpRet {
 
 void NotifySqStateChanged(const EpPair& ep);
 
-RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* status, TransferUniqueId id);
+// `dataStatus` holds the outcome of the transfer's data WRs (CqCallbackMeta::dataStatus).
+RdmaOpRet RdmaNotifyTransfer(const EpPairVec& eps, TransferStatus* dataStatus, TransferUniqueId id);
 
 namespace detail {
 
