@@ -124,8 +124,8 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //   groupCtr : plain device buffer (kGroupCtrTotal uint32), local-only.
 //                   [kArrivalIdx] elects the last block (atomicInc wraps it back
 //                   to 0) to advance the push generation
-//   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
-//                   collective (GenBarrier in block 0, before Phase 1), so
+//   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags of this communicator
+//                   (GenBarrier in block 0, before Phase 1), so
 //                   back-to-back launches need no host barrier
 //   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
 //
@@ -442,8 +442,8 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
 //
 //   groupCtr : plain device buffer, zeroed once by the host. [0] elects the
 //                   last block; atomicInc wraps it back to 0, so no reset.
-//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
-//                   collective (see GenBarrier).
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags of this communicator
+//                   (see GenBarrier).
 // ---------------------------------------------------------------------------
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)

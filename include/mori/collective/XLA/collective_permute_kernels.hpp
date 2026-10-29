@@ -50,12 +50,10 @@ namespace collective {
 //   permuteCtr : symmetric-heap uint64[kPermuteFlagSlots][kCCLMaxPeers]
 //              handshake flags, zeroed once, never reset. Slot [idx][p] of my
 //              copy is written only by PE p (permSlot(idx, p)); the push
-//              kernel uses only the kReadyFlag row.
+//              kernel uses the kReadyFlag and kArrivedFlag rows.
 //   permuteNum      : local uint64[2*kCCLMaxPeers], zeroed once, thread 0 only.
 //              permuteNum[p] counts my permutes sending to p, permuteNum[kCCLMaxPeers+p]
 //              my permutes receiving from p.
-//   arrived  : symmetric-heap SDMA completion slots (see kArrivedStride), global
-//              PE rows; this kernel uses column kPermuteArrived only.
 //
 // Phase 0: pairwise handshake, no global barrier -- only the PEs of a send/recv
 // pair synchronize, so PEs that do not launch this kernel are never waited on.
@@ -65,8 +63,8 @@ namespace collective {
 // waits until its destination's slot reaches its own count k. The slot only
 // grows, so nothing is consumed or cleared.
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
-// dstPe == myPe), trailed by an atomic swap storing my send count k into my row's
-// kPermuteArrived slot of the receiver's `arrived`.
+// dstPe == myPe), trailed by an atomic swap storing my send count k into my
+// kArrivedFlag slot of the receiver's permuteCtr.
 // Phase 2: if srcPe >= 0, thread 0 waits until srcPe's slot reaches my receive
 // count k, then an acquire fence makes the peer SDMA write visible. The slot only
 // grows, so nothing is reset.
@@ -85,8 +83,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             cco::ccoDevComm devComm,
                                             cco::ccoWindow_t heapWin,
                                             uint64_t* __restrict__ permuteCtr,
-                                            uint64_t* __restrict__ permuteNum,
-                                            uint64_t* __restrict__ arrived) {
+                                            uint64_t* __restrict__ permuteNum) {
   const int myLsa = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
   __shared__ uint64_t sendK, recvK;
@@ -137,9 +134,8 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   StartSdmaScatter(
       devComm.sdma, npes, /*logS=*/0, sendK,
       [=](int peer) {
-        auto [dstP, sigP] = PeerPtrs(localDst,
-                    arrived + myLsa * kArrivedStride + kPermuteArrived,
-                    peer, myLsa, stride4G);
+        auto [dstP, sigP] = PeerPtrs(localDst, permSlot(kArrivedFlag, myLsa),
+                                     peer, myLsa, stride4G);
         return ScatterPeer{
             peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
             dstP, sigP};
@@ -147,7 +143,7 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
 
   if (srcPe >= 0) {
     if (threadIdx.x == 0) {
-      const uint64_t* addr = arrived + srcPe * kArrivedStride + kPermuteArrived;
+      const uint64_t* addr = permSlot(kArrivedFlag, srcPe);
       while (AtomicLoad<ESystemScope>(addr) < recvK) {
         __builtin_amdgcn_s_sleep(1);
       }

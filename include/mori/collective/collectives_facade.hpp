@@ -118,8 +118,10 @@ class CollectivesFacade {
   // Creates a facade for rank `myPe` of a (sub-)communicator of `nPes` ranks,
   // where rank r maps to global PE rank_to_pe[r]. Only contiguous mappings
   // (rank_to_pe[r] == rank_to_pe[0] + r) within this node's LSA team are
-  // supported. Collectives of different communicators on the same device must
-  // not run concurrently: they share staging, SDMA queues and barrier slots.
+  // supported. Collectives of different communicators on the same device may
+  // interleave but must not run concurrently: they share staging and SDMA queues.
+  // Gen-barrier and completion flags are per PE range (kCommCtlWords); permute
+  // flags are pairwise and global.
   static std::unique_ptr< CollectivesFacade > Get(int myPe, int nPes,
                                                 const int *rank_to_pe) {
     auto *state = GetState();
@@ -236,7 +238,7 @@ class CollectivesFacade {
     state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 128));
 
     size_t controlBytes =
-        kCCLMaxPeers * sizeof(uint64_t) * (1 + kPermuteFlagSlots) + kArrivedBytes;
+        kCCLMaxPeers * sizeof(uint64_t) * kPermuteFlagSlots + kCommCtlBytes;
     size_t totalBytes = maxStagingBytes + controlBytes;
     state.staging = Allocate(totalBytes);
     if (state.staging == nullptr) {
@@ -246,19 +248,15 @@ class CollectivesFacade {
     }
     state.stagingBytes = maxStagingBytes;
 
-    // Generation-barrier flags shared by every push and pull collective (see
-    // GenBarrier in collectives_common.hpp): slot p of every copy is written only
-    // by PE p; never reset after this.
-    state.barrierCtr = reinterpret_cast<uint64_t*>(
-             static_cast<uint8_t*>(state.staging) + maxStagingBytes);
     // Collective-permute handshake flags (see PermuteFlagIdx / CollectivePermute*
     // kernels), consolidated into one [kPermuteFlagSlots][kCCLMaxPeers] buffer.
     // Slot [idx][p] of my copy is written only by PE p; never reset.
-    state.permuteCtr = state.barrierCtr + kCCLMaxPeers;
-    // SDMA completion slots of the push collectives (see kArrivedStride): row p of
-    // my copy is written only by PE p's SDMA swaps; never reset after this.
-    state.arrived = state.permuteCtr + kPermuteFlagSlots * kCCLMaxPeers;
-    HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
+    state.permuteCtr = reinterpret_cast<uint64_t*>(
+             static_cast<uint8_t*>(state.staging) + maxStagingBytes);
+    // Per-communicator gen-barrier flags and SDMA completion slots, one slot per
+    // contiguous PE range (see kCommCtlWords); never reset after this.
+    state.commCtl = state.permuteCtr + kPermuteFlagSlots * kCCLMaxPeers;
+    HIP_RUNTIME_CHECK(hipMemset(state.permuteCtr, 0, controlBytes));
 
     // One local, zeroed-once buffer: the uint64 per-peer permute counts first
     // (see CollectivePermutePushKernel: [p] sends to p, [kCCLMaxPeers + p]
@@ -287,6 +285,12 @@ class CollectivesFacade {
     ret = cco::ccoDevCommCreate(comm, &reqs, &state.devComm);
     if (ret != 0 || state.devComm.sdma.sdmaNumQueue == 0) {
       FACADE_PRINTF("ccoDevCommCreate failed or no SDMA queues allocated.");
+      return -1;
+    }
+    // The kernels index deviceHandles by peer alone (queue 0 of each peer).
+    if (state.devComm.sdma.sdmaNumQueue != 1) {
+      FACADE_PRINTF("expected exactly one SDMA queue per peer, got %u",
+                    state.devComm.sdma.sdmaNumQueue);
       return -1;
     }
     return 0;
@@ -421,10 +425,10 @@ class CollectivesFacade {
     size_t stagingBytes{0};
     uint64_t* permuteNum{nullptr};    // local, per-peer permute send/recv counts (owns the buffer)
     uint32_t* groupCtr{nullptr};  // local, sub-region of the permuteNum buffer
-    uint64_t* barrierCtr{nullptr};  // symmetric, gen-barrier flags of all collectives (slot p written by PE p)
     uint64_t* permuteCtr{nullptr};  // symmetric, consolidated permute handshake flags
                                       // [kPermuteFlagSlots][kCCLMaxPeers] (slot [idx][p] written by PE p)
-    uint64_t* arrived{nullptr};  // symmetric, SDMA completion slots (row p written by PE p)
+    uint64_t* commCtl{nullptr};  // symmetric, [kCommCtlSlots][kCommCtlWords] per-range
+                                 // gen-barrier flags + SDMA completion slots
     AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};
     // Static heap: one symmetric window backing all user buffers (bump allocator).
@@ -504,17 +508,17 @@ class CollectivesFacade {
   }
 
   // The kernels run in the communicator's local rank space [0, nPes): the flat-VA
-  // peer delta (peer - myPe) is unchanged by the PE base, while the per-PE SDMA
-  // tables and barrier slots are shifted so local rank r addresses global PE
-  // peBase + r.
+  // peer delta (peer - myPe) is unchanged by the PE base, the SDMA queue table is
+  // shifted so local rank r addresses global PE peBase + r, and the barrier and
+  // completion slots come from this range's own control slot.
   CollectivesFacade(SharedState& state, int myPe, int nPes, int peBase, int logS,
                     RsMode mode) :
            state_(state), myPe_(myPe), nPes_(nPes), peBase_(peBase),
            logS_(logS), mode_(mode), devComm_(state.devComm),
-           barrierCtr_(state.barrierCtr + peBase),
-           arrived_(state.arrived + static_cast<size_t>(peBase) * kArrivedStride) {
-    devComm_.sdma.deviceHandles += static_cast<size_t>(peBase) * devComm_.sdma.sdmaNumQueue;
-    devComm_.sdma.peerSignalPtrs += peBase;
+           barrierCtr_(state.commCtl +
+                       (static_cast<size_t>(peBase) * kCCLMaxPeers + nPes - 1) * kCommCtlWords),
+           arrived_(barrierCtr_ + kCCLMaxPeers) {
+    devComm_.sdma.deviceHandles += peBase;
   }
 
   RsMode resolveMode(size_t totalBytes, bool allReduce) const;
@@ -533,8 +537,8 @@ private:
   int myPe_, nPes_, peBase_, logS_;
   RsMode mode_;
   cco::ccoDevComm devComm_;  // state_.devComm with the SDMA tables shifted by peBase_
-  uint64_t* barrierCtr_;     // state_.barrierCtr + peBase_
-  uint64_t* arrived_;        // state_.arrived + peBase_ rows
+  uint64_t* barrierCtr_;     // this range's control slot in state_.commCtl
+  uint64_t* arrived_;        // barrierCtr_ + kCCLMaxPeers
 };
 
 }  // namespace collective

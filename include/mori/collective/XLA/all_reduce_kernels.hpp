@@ -61,8 +61,8 @@ namespace collective {
 //                   counter (every block counts in once per launch, never
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
 //                   which elects the tail owner.
-//   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags shared by every
-//                   collective (GenBarrier in block 0, before Phase 1)
+//   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags of this communicator
+//                   (GenBarrier in block 0, before Phase 1)
 //   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
 //
 // Phase 1-3 are the reduce-scatter push algorithm: block 0 SDMA-scatters each
@@ -303,8 +303,8 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 //   myElems       : THIS PE's shard length (ComputeT units); 0 == idle PE
 //   groupCtr : plain device buffer, zeroed once by the host. [0] elects the
 //                   last block; atomicInc wraps it back to 0, so no reset.
-//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
-//                   collective (see GenBarrier).
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags of this communicator
+//                   (see GenBarrier).
 template <int NumVecs, int NPES, class ReduceOp, class T = typename ReduceOp::Type>
 __global__ void __launch_bounds__(256, 1)
 AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
