@@ -442,15 +442,15 @@ hipError_t CollectivesFacade::RunCollectivePermute(const void* sendBuf, void* re
         srcPe < 0 ? 1
                   : PullCopyBlocks(numBytes, kPullThreads, state_.MP_count, state_.maxNBlocks);
     CollectivePermutePullKernel<kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
-        npes, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteReady,
-        state_.permuteSendReady, state_.permuteReadDone, state_.permuteCnt, state_.groupCtr);
+        npes, dstPe, srcPe, state_.heapWin, sendBuf, recvBuf, numBytes, state_.permuteCtr,
+        state_.permuteNum, state_.groupCtr);
     return hipGetLastError();
   }
   constexpr int kThreads = 64;
   CollectivePermutePushKernel<<<1, kThreads, 0, stream>>>(
                 npes, dstPe, srcPe, sendBuf, recvBuf,
-                numBytes, state_.devComm, state_.heapWin, state_.permuteReady,
-                state_.permuteCnt, state_.arrived);
+                numBytes, state_.devComm, state_.heapWin, state_.permuteCtr,
+                state_.permuteNum, state_.arrived);
   return hipGetLastError();
 }
 
