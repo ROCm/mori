@@ -587,14 +587,6 @@ set_target_properties(umbp_tier_bench PROPERTIES BUILD_RPATH "$ORIGIN"
                                                   INSTALL_RPATH "$ORIGIN"
                                                   BUILD_WITH_INSTALL_RPATH TRUE)
 
-# Optional sampler for examples/umbp/calibrate.py; never linked into the runtime.
-add_executable(umbp_sim_probe EXCLUDE_FROM_ALL sim/calibrate.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(umbp_sim_probe PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(umbp_sim_probe PRIVATE umbp_core umbp_common
-                                             ${_PROTOBUF_LIBS} ${_GRPCPP_LIB})
-
 # ---------- Standalone-process executable ------------------------------------
 
 add_executable(umbp_standalone_server standalone/bin/standalone_server_main.cpp)

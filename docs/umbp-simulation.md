@@ -44,63 +44,18 @@ Both sides need the updated build and matching sim mode. Range checks remain act
 closing a rank releases registrations while other ranks retain the shared KV tier.
 Rank timings include IPC and server work; **do not add server trace times to rank times**.
 
-## Calibrate once, reuse the profile
-
-The packaged sampler fits **CPU→CPU only**. Use a Release build, NumPy, Linux `taskset`,
-a new output directory and available physical CPUs representative of deployment:
-
-```bash
-cmake --build build --target umbp_sim_probe -j 8
-python examples/umbp/calibrate.py \
-  --probe build/src/umbp/umbp_sim_probe --output /tmp/umbp-calibration \
-  --cpus 4,5,6,7 --threads 1 2 4 --cache cold \
-  --samples 24 --rounds 3 --max-mib 256 --concurrency 1 2 4
-```
-
-| Option | Meaning and defaults |
-| --- | --- |
-| `--cpus`, `--threads` | Threads are 1/2/4/8, including 1; defaults use up to eight allowed CPUs. Each N-thread run sets both `UMBP_DRAM_COPY_THREADS` and `UMBP_DRAM_WRITE_THREADS` to N. |
-| `--concurrency` | 1/2/4 callers, default all three, including 1. Use `1` to skip concurrent validation. |
-| `--max-mib` | Aggregate payload across all callers, default 256 MiB; destinations and storage pools need additional memory. |
-| `--samples`, `--rounds` | Samples per workload and repeated rounds; defaults 24 and 3. |
-| `--train-block-bytes`, `--train-batches` | Positive integer training lists, e.g. `4096 65536 1048576` and `1 8 32`. |
-| `--validation-block-bytes`, `--validation-batches` | Independent validation lists, e.g. `8192 131072 2097152` and `1 4 16`. |
-| `--cache` | `cold` (default, x86 source flush outside timers) or `reuse`. |
-
-| Default workload | Block sizes | Batch counts | Uncapped grid maximum |
-| --- | --- | --- | --- |
-| Training | 512 B–4 MiB | 1/8/32/64/128 | 512 MiB |
-| Single-caller validation | Independent sizes, 1 KiB–8 MiB | 1/4/16/128 | 1 GiB |
-| Concurrent validation | 8 KiB, 512 KiB, 2 MiB | 1/16/128 | Subject to the aggregate cap |
-
-Custom lists sample their full block/batch product, including concurrent validation;
-omitted lists retain defaults and duplicates are sampled once. Training and validation
-must not share a sampled `(block_bytes, batch)` pair. Overlap, empty capped grids or
-insufficient independent training points fail without publishing a profile. Increase the
-cap/lists to cover the working set; copy blocks do not represent full layer/ranged geometry.
-
-Callers share one client/engine with disjoint keys/buffers and start together; thread
-creation is outside timers. Runs use the first `min(N * callers, listed CPUs)` cores,
-which can oversubscribe a short CPU list. Reads and writes are tested separately;
-independent ranks/processes and simultaneous read/write mixes are outside this sweep.
-Keep copy settings and CPU/NUMA placement consistent when reusing a profile.
-
-`cold` flushes sources before transfer/put; get reads the just-written store. `reuse`
-repeats buffers and caps default training at 8 MiB; explicit lists use `--max-mib`.
-Neither mode guarantees cache hits; a reused-source fit may underestimate store reads,
-so inspect API validation too.
-
-Only real single-caller `LocalCopyEngine` Submit+Wait training fits coefficients.
-Independent validation compares transfers and `BatchPut`/`BatchGet`; API timings include
-trace output to `/dev/null` and exclude Python. `profile.json` loads via `UMBP_SIM_PROFILE`.
-`report.json` records sampling parameters, profile hash, raw measurements and
-per-concurrency median/signed errors. Tolerance is `max(2 µs, 10% of real median)`;
-high error is reported, while operation/fit failures fail the run.
-
-## Model and cross-peer sharing
+## Profile and model
 
 [sim_profile.json](../examples/umbp/sim_profile.json) contains illustrative, uncalibrated
-values. Paths are `cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`, `remote_read`, `remote_write`:
+estimates for `cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`, `remote_read` and `remote_write`.
+Copy it and adjust the coefficients for your platform.
+Each path names its source/destination memory type, except the remote paths, which use
+the initiator's read/write direction. Configure every path your workload uses; a missing
+path rejects the transfer. Unused paths may be omitted.
+
+This first version uses manually supplied parameters. Automatic calibration belongs in
+a follow-up PR covering the actual engines (`LocalCopyEngine`, `HbmCopyEngine` and
+`MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers.
 
 | Field | Meaning |
 | --- | --- |
@@ -109,9 +64,9 @@ values. Paths are `cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`, `remote_read`, `re
 | `copy_latency_ns` | Nonnegative cost per coalesced copy; default 0. |
 | `bandwidth_bytes_per_second` | Positive effective bandwidth. |
 
-CPU coefficients may be arrays indexed by copy threads minus one, clamped to the last
+`cpu_cpu` coefficients may be arrays indexed by copy threads minus one, clamped to the last
 entry; other paths use scalars. Existing thread selection/thresholds still apply.
-Channel capacity is the maximum calibrated bandwidth up to the larger configured
+Channel capacity is the maximum configured bandwidth up to the larger configured
 copy/write thread limit; set those limits before creating the client.
 
 ```text
@@ -124,11 +79,14 @@ finish = max(submitted + private_ns, channel_available)
 
 Shared paths sum service costs; zero bytes add no delay and missing paths abort normally.
 
+## Cross-peer sharing
+
 For share, keep normal Master/peer configuration, distinct node IDs and reachable
 addresses/ports. Use a dedicated Master, enable sim on **every peer**, and configure
 `remote_read`/`remote_write` from the initiator's perspective. Separate channel names
 allow independent directions. Fit target-link **Submit+Wait**, not API totals or ping
-RTT; GPU/network coefficients require separate measurements, with no automatic RDMA sampler.
+RTT when replacing estimates with measurements. GPU/network coefficients are not calibrated
+by this PR.
 Local copies finish in Submit; registered remote copies finish in Wait. Unregistered
 CPU callers retain RDMA bounce geometry and serial staging inside Submit. Ranged
 scratch and re-cache payloads are virtual; a re-cached replica can serve other peers.
@@ -154,5 +112,4 @@ Workers/timers use wall time; background work counts when it delays an API/chann
 - Virtual addresses and page/key metadata consume resources. Framework buffers, external copies and model execution remain real; use trace/dummy execution, not generated-token correctness checks.
 - GPU/network accuracy and full SGLang performance validation require separate work.
 
-Build `test_umbp_sim` and run `ctest -R '^umbp_sim$'`. Calibration math tests are in
-`tests/python/umbp/test_sim_calibration.py`; neither functional suite needs GPUs.
+Build `test_umbp_sim` and run `ctest -R '^umbp_sim$'`; these functional tests need no GPUs.

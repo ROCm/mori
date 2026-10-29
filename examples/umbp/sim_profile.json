@@ -20,6 +20,16 @@
       "channel": "device-memory",
       "latency_ns": 5000,
       "bandwidth_bytes_per_second": 1000000000000
+    },
+    "remote_read": {
+      "channel": "network-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "remote_write": {
+      "channel": "network-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
     }
   }
 }
