@@ -27,6 +27,7 @@
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -37,6 +38,7 @@
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/sim/sim.h"
+#include "umbp/sim/ssd.h"
 #include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 #include "umbp/umbp_client.h"
@@ -48,6 +50,21 @@ using MemLoc = mori::io::MemoryLocationType;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 constexpr size_t kPage = 4096;
+
+class ScopedEnv {
+ public:
+  ScopedEnv(const char* key, const char* value) : key_(key) {
+    if (const char* old = std::getenv(key)) old_ = old;
+    setenv(key, value, 1);
+  }
+  ~ScopedEnv() {
+    if (old_) setenv(key_, old_->c_str(), 1);
+    else unsetenv(key_);
+  }
+ private:
+  const char* key_;
+  std::optional<std::string> old_;
+};
 
 class SimTest : public ::testing::Test {
  protected:
@@ -82,6 +99,26 @@ class SimTest : public ::testing::Test {
     config.standalone_process.emplace();
     config.standalone_process->address = "unix:" + dir_ + "/server.sock";
     return config;
+  }
+  SsdBackend::Config SsdConfig() {
+    SsdBackend::Config config;
+    config.page_size = kPage;
+    config.staging_pages = 8;
+    config.ssd.enabled = true;
+    config.ssd.ssd.storage_dir = dir_ + "/ssd";
+    config.ssd.ssd.capacity_bytes = 32 * kPage;
+    config.ssd.ssd.segment_size_bytes = 4 * kPage;
+    config.read_lease_ttl = 40ms;
+    config.reaper_interval = 5ms;
+    return config;
+  }
+  void SsdProfile() {
+    Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+      "gpu_cpu":{"channel":"link","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+      "cpu_gpu":{"channel":"link","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+      "cpu_file":{"channel":"disk","latency_ns":1000000,"bandwidth_bytes_per_second":1e12},
+      "file_cpu":{"channel":"disk","latency_ns":3000000,"bandwidth_bytes_per_second":1e12},
+      "file_gpu":{"channel":"disk","latency_ns":7000000,"bandwidth_bytes_per_second":1e12}})");
   }
   std::unique_ptr<IUMBPClient> Client(UMBPConfig config, bool use_standalone) {
     if (use_standalone) {
@@ -188,6 +225,181 @@ TEST_P(SimApiTest, VirtualGpuCallerLoadsAndOffloadsWithoutDevice) {
     ASSERT_TRUE(client->RegisterMemory(ptr, kPage, MemLoc::GPU, 0));
     EXPECT_TRUE(client->Put("gpu", ptr, kPage));
     EXPECT_TRUE(client->Get("gpu", ptr, kPage));
+  }
+}
+
+TEST_P(SimApiTest, SsdApisKeepSharedStorageVirtualAndGpuRegistrationsWork) {
+  SsdProfile();
+  auto config = Config();
+  config.ssd = SsdConfig().ssd.ssd;
+  config.distributed.emplace();
+  config.distributed->medium = UMBPMedium::SSD;
+  config.distributed->master_config.node_id = "ssd-api";
+  config.distributed->master_config.node_address = "127.0.0.1:0";
+  config.distributed->ssd_staging_buffer_slots = 8;
+  const auto ptr = Buffer(8 * kPage);
+  for (bool gds : {false, true}) {
+    ScopedEnv mode("UMBP_ENABLE_GDS", gds ? "1" : "0");
+    auto client = Client(config, GetParam());
+    ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage));
+    EXPECT_EQ(client->BatchPutRanges({"range"}, {2 * kPage}, {{ptr, ptr + kPage}},
+                                     {{kPage, kPage}}, {{0, kPage}}), std::vector<bool>{true});
+    EXPECT_EQ(client->BatchGetRanges({"range"}, {{ptr}}, {{128}}, {{kPage - 64}}),
+              std::vector<bool>{true});
+    EXPECT_FALSE(client->Get("range", ptr, 3 * kPage));
+    EXPECT_FALSE(client->Get("missing", ptr, kPage));
+    client->DeregisterMemory(ptr);
+    ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage, MemLoc::GPU, 0));
+    ASSERT_TRUE(client->Put("gpu", ptr, kPage));
+    const auto start = Clock::now();
+    EXPECT_TRUE(client->Get("gpu", ptr, kPage));
+    EXPECT_GE(Clock::now() - start, gds ? 7ms : 3ms);
+    if (gds) {
+      const auto ranged_start = Clock::now();
+      EXPECT_EQ(client->BatchGetRanges({"gpu"}, {{ptr}}, {{128}}, {{64}}),
+                std::vector<bool>{true});
+      EXPECT_GE(Clock::now() - ranged_start, 7ms);
+    }
+    EXPECT_TRUE(client->Clear());
+    EXPECT_EQ(client->BatchExists({"gpu", "range"}), std::vector<bool>(2, false));
+    EXPECT_FALSE(std::filesystem::exists(config.ssd.storage_dir));
+  }
+}
+
+TEST_F(SimTest, SsdSegmentCapacityReservationsAndClearPreserveControlContracts) {
+  SsdProfile();
+  SimTransferEngine engine(Config().sim.profile_path);
+  auto backend = MakeSimSsdBackend(SsdConfig(), engine);
+  ASSERT_TRUE(backend->Init(&engine));
+  const auto available = [&] { return backend->Capacity().available_bytes; };
+  const auto capacity = available();
+  auto reserve = [&](const std::string& key) {
+    return backend->BatchAllocate({AllocateRequest{key, kPage, -1, true}}).front();
+  };
+  // A 4 KiB value occupies a padded 4 KiB prefix and 4 KiB value extent.
+  for (const char* key : {"a", "b", "c"}) {
+    auto slot = reserve(key);
+    ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+    ASSERT_TRUE(slot.file_ref.IsFile());
+    ASSERT_TRUE(backend->BatchCommit({{slot.slot_id, key}}).front().success);
+  }
+  EXPECT_EQ(available(), capacity - 6 * kPage);
+  EXPECT_EQ(backend->DrainPendingEvents().size(), 3u);
+  EXPECT_TRUE(backend->OwnsEvictionOrder());
+  backend->Evict({"a"});
+  EXPECT_EQ(available(), capacity - 6 * kPage);  // b keeps a's segment live.
+  backend->Evict({"b"});
+  EXPECT_EQ(available(), capacity - 2 * kPage);
+  auto aborted = reserve("pending");
+  ASSERT_TRUE(aborted.file_ref.IsFile());
+  EXPECT_TRUE(backend->BatchAbort({aborted.slot_id}).front());
+  EXPECT_FALSE(backend->Contains("pending"));
+  EXPECT_EQ(available(), capacity - 2 * kPage);
+  auto stale = reserve("pending");
+  backend->ClearLocal();
+  EXPECT_TRUE(backend->IsClearFullSyncPending());
+  EXPECT_NE(reserve("blocked").outcome, AllocateOutcome::kSuccessAllocated);
+  backend->ClearFullSyncAcked();
+  auto current = reserve("pending");
+  ASSERT_TRUE(current.file_ref.IsFile());
+  EXPECT_NE(stale.file_ref.file_fd, current.file_ref.file_fd);
+  EXPECT_FALSE(backend->BatchCommit({{stale.slot_id, "pending"}}).front().success);
+  EXPECT_TRUE(backend->BatchAbort({stale.slot_id}).front());  // Abort remains idempotent.
+  EXPECT_TRUE(backend->BatchCommit({{current.slot_id, "pending"}}).front().success);
+  EXPECT_TRUE(backend->Contains("pending"));
+  EXPECT_FALSE(std::filesystem::exists(SsdConfig().ssd.ssd.storage_dir));
+}
+
+TEST_F(SimTest, SsdMissingModelRollsBackAndUnsupportedBackendsFailFast) {
+  SimTransferEngine engine(Config().sim.profile_path);  // cpu_cpu only.
+  auto config = SsdConfig();
+  auto backend = MakeSimSsdBackend(config, engine);
+  ASSERT_TRUE(backend->Init(&engine));
+  const auto available = backend->Capacity().available_bytes;
+  // The failed prefix reservation falls back to staging; the failed commit
+  // must return both disk accounting and the staging slot.
+  auto slot = backend->BatchAllocate({AllocateRequest{"failed", kPage, -1, true}}).front();
+  ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_FALSE(slot.file_ref.IsFile());
+  EXPECT_FALSE(backend->BatchCommit({{slot.slot_id, "failed"}}).front().success);
+  EXPECT_FALSE(backend->Contains("failed"));
+  EXPECT_EQ(backend->Capacity().available_bytes, available);
+  EXPECT_TRUE(backend->DrainPendingEvents().empty());
+  for (const char* kind : {"spdk", "spdk_proxy", "dummy_storage"}) {
+    config.ssd.ssd.ssd_backend = kind;
+    EXPECT_THROW(MakeSimSsdBackend(config, engine), std::invalid_argument);
+  }
+  config.ssd.ssd.ssd_backend = "file";
+  config.ssd.enabled = false;
+  EXPECT_THROW(MakeSimSsdBackend(config, engine), std::invalid_argument);
+}
+
+TEST_F(SimTest, FilePathsPreserveGroupingBoundsAndRejectGpuWrites) {
+  SsdProfile();
+  SimTransferEngine engine(Config().sim.profile_path);
+  auto* ptr = reinterpret_cast<void*>(Buffer(2 * kPage));
+  const auto small = TransferRef::HostBytes(ptr, kPage);
+  const auto large = TransferRef::HostBytes(ptr, 2 * kPage);
+  const auto file = engine.RegisterFile(123, 0, 2 * kPage);
+  const auto gpu = TransferRef::HostBytes(ptr, 2 * kPage, MemLoc::GPU, 0);
+  EXPECT_FALSE(engine.CanHandle(gpu, file));
+  auto items = std::vector<TransferItem>{{small, 0, engine.RegisterFile(123, 0, kPage), 0, kPage, 0},
+                                         {large, kPage, file, kPage, kPage, 1}};
+  auto plans = engine.Plan(items);
+  ASSERT_EQ(plans.plans.size(), 1u);
+  EXPECT_EQ(plans.plans.front().src.size, 2 * kPage);
+  EXPECT_EQ(plans.plans.front().dst.size, 2 * kPage);
+  EXPECT_TRUE(engine.Transfer(items, nullptr));
+  items.push_back({large, 0, engine.RegisterFile(124, 0, 2 * kPage), 0, kPage, 2});
+  EXPECT_EQ(engine.Plan(items).plans.size(), 2u);  // Distinct files cannot merge.
+  EXPECT_FALSE(engine.Transfer({{file, 0, small, kPage, 1, 0}}, nullptr));
+  EXPECT_FALSE(engine.Transfer({{engine.RegisterFile(125, INT64_MAX, kPage), 0, small, 0, 1, 0}},
+                               nullptr));
+  const auto start = Clock::now();
+  EXPECT_TRUE(engine.Transfer({{file, 0, gpu, 0, kPage, 0}}, nullptr));
+  EXPECT_GE(Clock::now() - start, 7ms);
+  EXPECT_FALSE(engine.Transfer({{TransferRef::File(123, 0, kPage), 0, gpu, 0, kPage, 0}},
+                               nullptr));  // GDS reads require a registered handle.
+}
+
+TEST_F(SimTest, SsdSingleFlightCopyFailureWakesWholeAndRangeFollowers) {
+  // No cpu_cpu model: the leader reads successfully, but simulated follower
+  // fan-out fails without accessing its PROT_NONE staging pages.
+  Profile(R"({"cpu_file":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+      "file_cpu":{"channel":"disk","latency_ns":200000000,"bandwidth_bytes_per_second":1e12}})");
+  for (bool ranged : {false, true}) {
+    SimTransferEngine engine(Config().sim.profile_path);
+    auto backend = MakeSimSsdBackend(SsdConfig(), engine);
+    ASSERT_TRUE(backend->Init(&engine));
+    auto slot = backend->BatchAllocate({AllocateRequest{"shared", 4 * kPage, -1, true}}).front();
+    ASSERT_TRUE(slot.file_ref.IsFile());
+    ASSERT_TRUE(backend->BatchCommit({{slot.slot_id, "shared"}}).front().success);
+    std::vector<ObjectExtent> extents{{kPage, kPage}};
+    auto read = [&] {
+      return backend->BatchResolve({"shared"}, false, false, ResolveReader::kLocal,
+                                    ranged ? &extents : nullptr).front();
+    };
+    auto metric = [&](const char* name) {
+      for (const auto& sample : backend->SampleMetrics())
+        if (sample.labels.front().second == name) return sample.value;
+      return uint64_t{0};
+    };
+    auto leader = std::async(std::launch::async, read);
+    ASSERT_TRUE(Await([&] { return metric("single_flight_lead") != 0; }));
+    auto follower = std::async(std::launch::async, read);
+    ASSERT_TRUE(Await([&] { return metric("single_flight_merged") != 0; }));
+    EXPECT_EQ(backend->Evict({"shared"}).front().bytes_freed, 0u);
+    ASSERT_EQ(follower.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(follower.get().outcome, ResolveOutcome::kFailed);
+    auto loaded = leader.get();
+    ASSERT_TRUE(loaded.found);
+    // Whole reads lease the key; extent holds retain only their private staging
+    // span, so deleting the original SSD record is safe while the extent lives.
+    if (ranged) EXPECT_NE(backend->Evict({"shared"}).front().bytes_freed, 0u);
+    else EXPECT_EQ(backend->Evict({"shared"}).front().bytes_freed, 0u);
+    loaded.hold.reset();
+    if (!ranged)
+      ASSERT_TRUE(Await([&] { return backend->Evict({"shared"}).front().bytes_freed != 0; }));
   }
 }
 
@@ -408,6 +620,29 @@ TEST_F(SimTest, DefaultGpuPointerClassificationKeepsRealAndSimCopies) {
     // Embedded callers may omit registration; standalone keeps its existing requirement.
     EXPECT_TRUE(simulated->Put("gpu", ptr, kPage));
     EXPECT_TRUE(simulated->Get("gpu", ptr, kPage));
+  }
+  SsdProfile();
+  auto ssd = Config();
+  ssd.ssd = SsdConfig().ssd.ssd;
+  ssd.distributed.emplace();
+  ssd.distributed->medium = UMBPMedium::SSD;
+  ssd.distributed->master_config.node_id = "ssd-gpu";
+  ssd.distributed->master_config.node_address = "127.0.0.1:0";
+  ssd.distributed->ssd_staging_buffer_slots = 8;
+  for (bool standalone : {false, true}) {
+    for (bool gds : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "standalone=" << standalone << " gds=" << gds);
+      ScopedEnv mode("UMBP_ENABLE_GDS", gds ? "1" : "0");
+      auto simulated = Client(ssd, standalone);
+      // Distributed registration's location is explicit; the standalone client
+      // also detects physical GPU pointers when the location is omitted.
+      ASSERT_TRUE(standalone ? simulated->RegisterMemory(ptr, kPage)
+                             : simulated->RegisterMemory(ptr, kPage, MemLoc::GPU, 0));
+      ASSERT_TRUE(simulated->Put("gpu", ptr, kPage));
+      const auto start = Clock::now();
+      EXPECT_TRUE(simulated->Get("gpu", ptr, kPage));
+      EXPECT_GE(Clock::now() - start, gds ? 7ms : 3ms);
+    }
   }
 }
 

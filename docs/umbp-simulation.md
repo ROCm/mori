@@ -25,7 +25,7 @@ Existing APIs and return types remain available. Use a separate trace file per c
 DRAM, HBM and file-backed SSD tiers are supported. Embedded mode defaults to DRAM;
 select SSD through the existing backend policy or distributed medium configuration;
 `ssd.enabled` alone does not select SSD. Virtual GPU callers require location/device
-metadata via C++ `RegisterMemory`; real pointers use existing classification.
+metadata via C++ `RegisterMemory`; unregistered real pointers use existing classification.
 Virtual HBM needs no GPU, but normal build dependencies, including HIP, still apply.
 
 SSD uses the existing `SsdBackend`, `PeerSsdManager`, segment index and multi-drive
