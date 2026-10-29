@@ -205,7 +205,43 @@ const std::vector<std::string>& EpSourceDeps() {
   return deps;
 }
 
+std::string EpKv(const char* key, size_t value) {
+  return std::string(key) + "=" + std::to_string(value) + "\n";
+}
+
+// Every arena region, in EpArgs order: what this kernel's Cfg needs, 0 for the
+// regions the other kernel's Cfg sizes.
+std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
+  const bool disp = kind == EpKernelKind::Dispatch;
+  return EpKv("region.tokOff", disp && c.ll128 ? EpLl128StageBytes(c) : EpRegionTokOffBytes(c)) +
+         EpKv("region.recvNum", EpRegionRecvNumBytes(c)) +
+         EpKv("region.recvToSrc", EpRegionRecvToSrcBytes(c)) +
+         EpKv("region.outIdx", EpRegionOutIdxBytes(c)) +
+         EpKv("region.outWts", EpRegionOutWtsBytes(c)) +
+         EpKv("region.dispOut", disp ? EpRegionDispOutBytes(c) : 0) +
+         EpKv("region.outTok", disp ? 0 : EpRegionOutTokBytes(c)) +
+         EpKv("region.xdb", EpRegionXdbBytes(c)) +
+         EpKv("region.outScales", disp ? EpRegionOutScalesBytes(c) : 0);
+}
+
 }  // namespace
+
+// Plan info: the Cfg, plus the sizes a caller allocates for it.
+std::string EpDispatchInfo(const EpCfg& c) {
+  return Describe(c) + EpKv("scaleStride", EpScaleStride(c)) +
+         EpKv("stagingBytes", EpArchIs1250() ? EpStagingTotalBytes(c) : 0) +
+         EpRegionInfo(c, EpKernelKind::Dispatch);
+}
+
+std::string EpCombineInfo(const EpCfg& c) {
+  std::string s = Describe(c);
+  if (EpCombinePush(c)) {
+    s += EpKv("pushWireBytes", EpCombinePushWireBytes(c)) +
+         EpKv("pushLandRows", EpCombinePushLandRows(c)) +
+         EpKv("pushLandOff", EpCombinePushLandOff(c));
+  }
+  return s + EpRegionInfo(c, EpKernelKind::Combine);
+}
 
 std::string EpDispatchSpec::EntryName(const Cfg& cfg) { return EpEntryName(cfg, "dispatch"); }
 std::string EpCombineSpec::EntryName(const Cfg& cfg) {
@@ -291,9 +327,9 @@ int EpNoPrecompile(const std::string&) { return 0; }
 // MORI_EP_ARGS_SCHEMA is generated from MORI_EP_ARGS_FIELDS next to the struct
 // (ep_cfg.hpp), which also static_asserts that the list is in declaration order.
 MORI_JIT_DEFINE_PLAN(ep_dispatch, mori::ops::v2::EpDispatchSpec, EpDispatchFromFields,
-                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::EpDispatchInfo, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)
 
 MORI_JIT_DEFINE_PLAN(ep_combine, mori::ops::v2::EpCombineSpec, EpCombineFromFields,
-                     mori::ops::v2::EpRequestSchema, mori::ops::v2::Describe, EpNoPrecompile,
+                     mori::ops::v2::EpRequestSchema, mori::ops::v2::EpCombineInfo, EpNoPrecompile,
                      mori::ops::v2::EpArgs, MORI_EP_ARGS_SCHEMA)

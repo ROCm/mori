@@ -247,6 +247,262 @@ def test_arena_offsets_are_launch_defaults_not_part_of_the_key():
 
 
 # --------------------------------------------------------------------------
+# Sizes: a plan reports what it binds (EpRegion*, EpStagingTotalBytes), and
+# describe() reports it before the plan exists, so a caller sizes nothing by hand
+# --------------------------------------------------------------------------
+
+_SMALL = dict(
+    world_size=1,
+    hidden_dim=1024,
+    max_tok_per_rank=64,
+    num_expert_per_rank=4,
+    num_expert_per_token=4,
+    max_recv=64,
+)
+
+
+def test_describe_reports_what_the_plan_would_without_building_it():
+    for cls in (cb.EpDispatchPlan, cb.EpCombinePlan):
+        described = cls.describe(**_SMALL)
+        p = cls(**_SMALL)
+        built = p.info
+        p.close()
+        assert described.pop("cacheDir") == ""
+        built.pop("cacheDir")
+        assert described == built
+
+
+def test_describe_rejects_what_the_constructor_rejects():
+    with pytest.raises(TypeError, match="unknown argument"):
+        cb.EpDispatchPlan.describe(world_size=1, bogus=1)
+    with pytest.raises(RuntimeError, match="inconsistent config"):
+        cb.EpDispatchPlan.describe(hidden_dim=7)
+
+
+def test_every_arena_region_is_reported_in_args_order():
+    stems = [
+        n[3].lower() + n[4:]
+        for n in cb.EpDispatchPlan._arg_names
+        if n.startswith("off") and n[3:4].isupper()
+    ]
+    for cls in (cb.EpDispatchPlan, cb.EpCombinePlan):
+        info = cls.describe()
+        assert [k[len("region.") :] for k in info if k.startswith("region.")] == stems
+
+
+def _reference_regions(
+    ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave
+):
+    """hip_backend._regions as it was before the plans reported sizes.
+
+    The one deliberate change: the push combine's row flags are only reserved
+    where the overlapped reduce can run (EpCombinePushOvlAny).
+    """
+    cap = ws * max_tok
+    out_tok = cap * comb_tok
+    if push:
+        q, bits, sb = {"fp4": (32, 4, 1), "fp4b": (128, 4, 4), "fp8": (32, 8, 1)}[push]
+        wire = (hidden * bits // 8 + hidden // q * sb + 127) // 128 * 128
+        rows = max_tok * min(ws, topk)
+        out_tok += rows * wire
+        if push != "fp4b" and 4 <= ws <= wave:
+            out_tok += rows * 8
+    regions = [
+        ("tok_off", 4),
+        ("recv_num", 2 * ws * 4),
+        ("recv_to_src_token", cap * 4),
+        ("out_idx", cap * topk * 4),
+        ("out_wts", cap * topk * 4),
+        ("disp_out", cap * disp_tok),
+        ("out_tok", out_tok),
+        ("cross_device_barrier", ws * 8),
+    ]
+    if scale:
+        regions.append(("out_scales", cap * ((scale + 127) // 128 * 128)))
+    return regions
+
+
+@pytest.mark.parametrize("ws", [1, 2, 4, 8])
+@pytest.mark.parametrize("topk", [4, 8])
+@pytest.mark.parametrize(
+    "dispatch,scale,push",
+    [
+        ("bf16", 0, None),
+        ("fp8", 224, None),
+        ("fp4x2", 32, None),
+        ("fp32", 0, None),
+        ("fp4x2", 32, "fp4"),
+        ("fp4x2", 32, "fp4b"),
+        ("fp8", 224, "fp8"),
+    ],
+)
+def test_arena_regions_match_the_layout_the_op_used_to_build(
+    ws, topk, dispatch, scale, push
+):
+    from mori.ops.dispatch_combine_v2.hip_backend import _REGIONS
+
+    hidden, max_tok = 7168, 128
+    common = dict(
+        world_size=ws,
+        max_tok_per_rank=max_tok,
+        num_expert_per_rank=8,
+        num_expert_per_token=topk,
+        max_recv=ws * max_tok,
+    )
+    disp_hidden = hidden // 2 if dispatch == "fp4x2" else hidden
+    d = cb.EpDispatchPlan.describe(
+        **common, hidden_dim=disp_hidden, dtype=dispatch, scale_bytes=scale
+    )
+    comb = {"fp4": dict(combine_fp4=1), "fp8": dict(combine_fp8=1)}.get(push, {})
+    if push == "fp4b":
+        comb = dict(combine_fp4=1, combine_fp4_f32_scale=1)
+    if push and not d["sharedBytes"]:
+        pytest.skip("the push combine is gfx125x only")
+    c = cb.EpCombinePlan.describe(**common, hidden_dim=hidden, dtype="bf16", **comb)
+    elem = {"bf16": 2, "fp32": 4, "fp8": 1, "fp4x2": 1}[dispatch]
+    want = _reference_regions(
+        ws,
+        hidden,
+        max_tok,
+        topk,
+        disp_hidden * elem,
+        hidden * 2,
+        scale,
+        push,
+        d["waveSize"],
+    )
+    assert cb.arena_regions(d, c, region_names=_REGIONS) == want
+
+
+def test_staging_bytes_come_from_the_kernel_layout():
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    d = cb.EpDispatchPlan.describe(
+        world_size=8, max_tok_per_rank=512, max_recv=4096, scale_bytes=224
+    )
+    # Only the gfx125x dispatch stages.
+    want = 6455296 if d["sharedBytes"] else 0
+    assert d["stagingBytes"] == ep_staging_bytes(8, 4096, 224) == want
+
+
+def test_scale_stride_matches_the_plan():
+    # scale_stride_bytes() stays for callers that size without a plan.
+    from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
+
+    for scale, stride in (
+        (0, 0),
+        (4, 128),
+        (32, 128),
+        (224, 256),
+        (256, 256),
+        (260, 384),
+    ):
+        info = cb.EpDispatchPlan.describe(scale_bytes=scale)
+        assert info["scaleStride"] == scale_stride_bytes(scale) == stride
+
+
+_PUSH_KW = {
+    "fp4_blockwise": dict(combine_fp4=1),
+    "fp4_blockwise_fp32": dict(combine_fp4=1, combine_fp4_f32_scale=1),
+    "fp8_blockwise": dict(combine_fp8=1),
+}
+
+
+@pytest.mark.parametrize("quant", sorted(_PUSH_KW))
+@pytest.mark.parametrize("ws", [2, 4, 8])
+def test_push_compat_sizes_match_the_cpp_layout(quant, ws):
+    # push_wire_nbytes()/push_land_rows() stay for callers that size without a
+    # plan (aiter): describe()'s values, which Sizes.PushWireRowsAndLanding pins
+    # in C++.
+    from types import SimpleNamespace
+
+    from mori.ops.dispatch_combine_v2.hip_backend import (
+        push_land_rows,
+        push_wire_nbytes,
+    )
+
+    cfg = SimpleNamespace(
+        hidden_dim=7168,
+        quant_type=quant,
+        max_num_inp_token_per_rank=128,
+        world_size=ws,
+        num_experts_per_token=8,
+    )
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        # The push combine is gfx125x only, and so are the sizes of it.
+        with pytest.raises(RuntimeError, match="gfx125x only"):
+            push_wire_nbytes(cfg)
+        return
+    assert push_wire_nbytes(cfg) == (7424 if quant == "fp8_blockwise" else 3840)
+    assert push_land_rows(cfg) == 128 * min(ws, 8)
+    info = cb.EpCombinePlan.describe(
+        world_size=ws, max_tok_per_rank=128, hidden_dim=7168, **_PUSH_KW[quant]
+    )
+    assert info["pushWireBytes"] == push_wire_nbytes(cfg)
+    assert info["pushLandRows"] == push_land_rows(cfg)
+
+
+class _SizedArena:
+    handle = 0xDEAD0000
+
+    def __init__(self, sizes):
+        self.sizes = sizes
+
+    def offset(self, name):
+        if name not in self.sizes:
+            raise KeyError(name)  # as SymmArena does for a region it lacks
+        return 0
+
+    def size(self, name):
+        return self.sizes[name]
+
+
+def _small_regions():
+    # Every plan the arena serves: dispatch and combine each size part of it.
+    return dict(
+        cb.arena_regions(
+            cb.EpDispatchPlan.describe(**_SMALL), cb.EpCombinePlan.describe(**_SMALL)
+        )
+    )
+
+
+def test_an_arena_too_small_for_the_plan_is_refused():
+    sizes = _small_regions()
+    cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(sizes)).close()
+    short = dict(sizes, dispOut=sizes["dispOut"] - 1)
+    with pytest.raises(ValueError, match="'dispOut'"):
+        cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(short))
+
+
+def test_an_arena_without_size_is_bound_with_a_warning():
+    class Unsized:
+        handle = _SizedArena.handle
+        offset = _SizedArena.offset
+
+        def __init__(self, sizes):
+            self.sizes = sizes
+
+    with pytest.warns(FutureWarning, match="no size"):
+        cb.EpDispatchPlan(**_SMALL, arena=Unsized(_small_regions())).close()
+
+
+def test_a_region_the_other_kernel_sizes_is_not_checked():
+    # dispatch does not size outTok (combine does), so a dispatch-only caller may
+    # bind it to a region of any size -- aiter binds it to its own comb_inp.
+    d = cb.EpDispatchPlan.describe(**_SMALL)
+    assert "outTok" not in dict(cb.arena_regions(d))
+    sizes = _small_regions()
+    cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(dict(sizes, outTok=0))).close()
+
+
+def test_one_plans_regions_do_not_make_an_arena_it_can_bind():
+    # A dispatch-only arena lacks outTok, which the dispatch args still bind.
+    sizes = dict(cb.arena_regions(cb.EpDispatchPlan.describe(**_SMALL)))
+    with pytest.raises(KeyError):
+        cb.EpDispatchPlan(**_SMALL, arena=_SizedArena(sizes))
+
+
+# --------------------------------------------------------------------------
 # aggReserve: the blocks meet in a module global of the kernel, so the caller
 # allocates and binds nothing for it
 # --------------------------------------------------------------------------
@@ -268,19 +524,20 @@ def test_agg_reserve_is_the_default_and_takes_no_argument():
 
 
 def test_staging_bytes_matches_the_device_layout():
-    # ep_staging_bytes() hand-mirrors EpStagingTotalBytes (ep_cfg.hpp): six
-    # sub-arrays, each rounded up to EpScaleAlign. EpArgs carries the base but no
-    # length, so the kernel cannot bounds-check what it was given -- a mirror that
-    # drifts low is not an error but a silent write past the end of a torch tensor,
-    # into whatever the caching allocator handed out next. The numbers below come
-    # from EpStagingTotalBytes and are the only thing holding the mirror to it; if
-    # the layout moves, re-derive them there rather than pasting whatever this
-    # function starts returning.
+    # EpStagingTotalBytes (ep_cfg.hpp): six sub-arrays, each rounded up to
+    # EpScaleAlign. EpArgs carries the base but no length, so the kernel cannot
+    # bounds-check what it was given -- a size that drifts low is not an error but
+    # a silent write past the end of a torch tensor, into whatever the caching
+    # allocator handed out next. If the layout moves, re-derive these from it
+    # rather than pasting whatever ep_staging_bytes() starts returning.
     from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
-    assert ep_staging_bytes(8, 4096, 224) == 12746752
+    if not cb.EpDispatchPlan.describe()["sharedBytes"]:
+        pytest.skip("only the gfx125x dispatch stages")
+    assert ep_staging_bytes(8, 4096, 224) == 6455296
     assert ep_staging_bytes(8, 4096, 0) == 4358144
-    assert ep_staging_bytes(32, 4096, 224) == 50987008
+    assert ep_staging_bytes(32, 4096, 224) == 19529728
+    assert ep_staging_bytes(2, 600, 224, 300) == 690944
     # max_recv not a multiple of 32 is the only shape among realistic configs
     # where a sub-array size is not already a multiple of 128, so it is the only
     # case that exercises the mirror's rounding at all.
@@ -296,23 +553,11 @@ def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
 
     assert ep_staging_bytes(8, 0, 224, 512) == ep_staging_bytes(8, 8 * 512, 224)
     # A resolved cap wins over the fallback, as EpMaxRecv's ternary does.
-    assert ep_staging_bytes(8, 4096, 224, 1) == ep_staging_bytes(8, 4096, 224)
+    assert ep_staging_bytes(8, 4096, 0, 1) == ep_staging_bytes(8, 4096, 0)
     # Neither spelling given is the case that used to return a short buffer in
     # silence; there is no size to compute, so it cannot be a return value.
     with pytest.raises(ValueError, match="max_tok_per_rank"):
         ep_staging_bytes(8, 0, 224)
-
-
-def test_staging_bytes_agg_reserve_scale_rows():
-    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
-
-    assert ep_staging_bytes(8, 4096, 224, 512, agg_reserve=True) == 6455296
-    assert ep_staging_bytes(32, 4096, 224, 128, agg_reserve=True) == 19529728
-    assert ep_staging_bytes(8, 4096, 0, 512, agg_reserve=True) == 4358144
-    assert ep_staging_bytes(2, 600, 224, 300, agg_reserve=True) == 690944
-    assert ep_staging_bytes(2, 600, 224, 300) == 473856
-    with pytest.raises(ValueError, match="max_tok_per_rank"):
-        ep_staging_bytes(8, 4096, 224, agg_reserve=True)
 
 
 # --------------------------------------------------------------------------
@@ -329,13 +574,13 @@ def launched(monkeypatch):
 
 def _shared_bytes(monkeypatch, n):
     # The staging decision on any arch: the gfx125x dispatch is the one with
-    # dynamic LDS, so faking it runs the fallback where CI runs.
+    # dynamic LDS and a staging size, so faking both runs the fallback where CI runs.
     real = cb._EpDispatchJitPlan.info.fget
-    monkeypatch.setattr(
-        cb.EpDispatchPlan,
-        "info",
-        property(lambda self: {**real(self), "sharedBytes": n}),
-    )
+
+    def info(self):
+        return {**real(self), "sharedBytes": n, "stagingBytes": 1 << 16 if n else 0}
+
+    monkeypatch.setattr(cb.EpDispatchPlan, "info", property(info))
 
 
 @pytest.fixture
@@ -358,8 +603,6 @@ def test_a_dispatch_that_does_not_stage_binds_nothing(launched, no_staging):
 
 
 def test_an_unbound_plan_gets_staging_at_its_first_launch(launched, stages):
-    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
-
     p = _plan()
     assert not cb._FALLBACK_STAGING  # nothing until a launch needs it
     with pytest.warns(FutureWarning, match="staging_base is not bound") as warned:
@@ -367,33 +610,10 @@ def test_an_unbound_plan_gets_staging_at_its_first_launch(launched, stages):
     assert warned[0].filename == __file__  # the caller's line, not mori's
     buf = p._fallback_staging
     assert p._buf.stagingBase == buf.data_ptr()
-    info = p.info
-    assert buf.numel() == ep_staging_bytes(
-        info["worldSize"],
-        info["maxRecv"],
-        info["scaleBytes"],
-        info["maxTokPerRank"],
-        info["aggReserve"],
-    )
+    assert buf.numel() == p.info["stagingBytes"]
     # Settled to an address: later launches reuse the cached struct untouched.
     assert p._defaults["stagingBase"] == buf.data_ptr()
     assert "stagingBase" not in p._dyn_defs
-    p.close()
-
-
-def test_the_fallback_follows_the_scale_row_numbering(launched, stages):
-    import warnings
-
-    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
-
-    p = _plan(scale_bytes=224)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        p.launch()
-    agg = p.info["aggReserve"]
-    assert p._fallback_staging.numel() == ep_staging_bytes(1, 64, 224, 64, agg)
-    if agg:
-        assert p._fallback_staging.numel() > ep_staging_bytes(1, 64, 224, 64)
     p.close()
 
 
@@ -431,14 +651,52 @@ def test_a_bound_staging_base_is_left_alone(launched, stages, as_tensor):
     import warnings
 
     p = _plan()
-    staging = torch.zeros(4096, dtype=torch.uint8, device="cuda")
-    # An address, as mori's op layer and aiter bind it, or the tensor itself.
+    staging = torch.zeros(p.info["stagingBytes"], dtype=torch.uint8, device="cuda")
+    # An address, as aiter binds it, or the tensor itself, as mori's op layer does.
     p.bind(staging_base=staging if as_tensor else staging.data_ptr())
     with warnings.catch_warnings():
         warnings.simplefilter("error", FutureWarning)
         p.launch()
     assert p._buf.stagingBase == staging.data_ptr()
     assert not cb._FALLBACK_STAGING
+    p.close()
+
+
+def test_a_staging_tensor_is_checked_against_the_plan(launched, stages):
+    p = _plan()
+    need = p.info["stagingBytes"]
+    with pytest.raises(ValueError, match="stagingBytes"):
+        p.bind(staging_base=torch.zeros(need - 128, dtype=torch.uint8, device="cuda"))
+    buf = torch.zeros(need + 1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="128 B aligned"):
+        p.bind(staging_base=buf[1:])
+    pool = torch.zeros(need * 2, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="stagingBytes"):
+        p.bind(staging_base=pool[: need - 128])  # short, however large its pool
+    p.bind(staging_base=buf)
+    # Held, and bound by address so the launch struct caches it.
+    assert p._staging is buf
+    assert p._defaults["stagingBase"] == buf.data_ptr()
+    p.bind(staging_base=1 << 20)  # an int is taken on trust
+    assert p._defaults["stagingBase"] == 1 << 20
+    p.close()
+    assert p._staging is None
+
+
+def test_a_staging_tensor_off_the_plans_device_is_refused(launched, stages):
+    p = _plan()
+    with pytest.raises(ValueError, match="launches on"):
+        p.bind(staging_base=torch.zeros(p.info["stagingBytes"], dtype=torch.uint8))
+    assert p._staging is None
+    p.close()
+
+
+def test_a_failed_bind_holds_no_staging(launched, stages):
+    p = _plan()
+    buf = torch.zeros(p.info["stagingBytes"], dtype=torch.uint8, device="cuda")
+    with pytest.raises(TypeError, match="no_such_arg"):
+        p.bind(staging_base=buf, no_such_arg=1)
+    assert p._staging is None
     p.close()
 
 

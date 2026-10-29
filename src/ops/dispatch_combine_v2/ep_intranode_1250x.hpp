@@ -412,6 +412,8 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
   static_assert(EpStageOk<kCfg, T>(), "the LL128 dispatch serves this shape");
   static_assert(2ull * npes * kT * kLlRowB <= 2ull * npes * kEpStageRegionTok * kRowB,
                 "both parities of the LL128 rows must fit the stage rows");
+  static_assert(kEpStageOff + kRowsOff + 2ull * npes * kT * kLlRowB <= EpLl128StageBytes(kCfg),
+                "EpLl128StageBytes sizes the stage");
   static_assert(kMetaB <= kLinesU * kLinePay, "the ids and weights must sit in a row's first unit");
   static_assert(kTokB % 8 == 0 && kScB % 4 == 0, "an 8-byte half must not straddle two regions");
   static_assert(kCfg.blockNum * 4 <= npes * kHdrB && kCfg.blockNum <= 256,
@@ -3016,12 +3018,11 @@ struct EpFp4Wire {
   // Payload bytes of the 32 elements one lane reduces per pass.
   static constexpr int kLaneB = kFp8 ? 32 : 16;
   static constexpr int kScB = kCfg.hiddenDim / kQGroup * (kF32Scale ? 4 : 1);
-  static constexpr int kWireB =
-      (kPayB + kScB + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
+  static constexpr int kWireB = EpCombinePushWireBytes(kCfg);
   static constexpr int kWireDw = kWireB / 4;
   static constexpr int kCap = (EpCombine1250xLdsBudget / kCfg.warpPerBlock) / kWireB;
   static constexpr int kItemPass = 2;
-  static constexpr size_t kLandOff = (size_t)EpMaxRecv(kCfg) * kTokB;
+  static constexpr size_t kLandOff = EpCombinePushLandOff(kCfg);
   static_assert(kWireB % kTdmRowBytes == 0 && kTokB % kTdmRowBytes == 0,
                 "every row a TDM transfer touches must start on a 128 B row");
 };
@@ -3106,28 +3107,28 @@ __device__ __forceinline__ void EpWaitTensorAtMost(int n) {
 
 // At four ranks only 24-warp blocks take the overlapped path: the 8- and 16-warp units the table
 // runs below them keep the per-warp send. The host sizes the row flags for every world size the
-// path can run at (hip_backend.py, out_tok).
+// path can run at (EpCombinePushOvlAny, EpRegionOutTokBytes).
 template <EpCfg kCfg>
 constexpr bool EpFp4Ovl() {
-  return EpCombinePush(kCfg) && !kCfg.combineFp4F32Scale && !EpIsWideEp(kCfg) &&
+  return EpCombinePushOvlAny(kCfg) &&
          (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
-                              : (kCfg.worldSize >= 4 && kCfg.warpPerBlock == 24));
+                              : kCfg.warpPerBlock == 24);
 }
 // A token lands one row per distinct destination rank of its top-k experts.
 template <EpCfg kCfg>
 constexpr int EpFp4Rows() {
-  return kCfg.worldSize < kCfg.numExpertPerToken ? kCfg.worldSize : kCfg.numExpertPerToken;
+  return EpCombinePushRows(kCfg);
 }
 // The landing holds every row this rank's tokens get back: the rows from one destination are one
 // run, after the rows from every destination below it (the dispatch signal's high word), so the
 // runs tile at most this many.
 template <EpCfg kCfg>
 constexpr int EpFp4LandRows() {
-  return kCfg.maxTokPerRank * EpFp4Rows<kCfg>();
+  return EpCombinePushLandRows(kCfg);
 }
 template <EpCfg kCfg>
 constexpr size_t EpFp4FlagOff() {
-  return EpFp4Wire<kCfg>::kLandOff + (size_t)EpFp4LandRows<kCfg>() * EpFp4Wire<kCfg>::kWireB;
+  return EpCombinePushFlagOff(kCfg);
 }
 // Per lane d < worldSize: the landing offset of the rows from d (sender) or to d (receiver).
 __device__ __forceinline__ int EpFp4LandFrom(const EpArgs& args, int npes, int laneId) {
@@ -4382,8 +4383,7 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
   static_assert(kCfg.hiddenDim % (32 * WS) == 0, "a pass is 32 elements a lane, inside one group");
   static_assert(kLlWarps >= 1 && (size_t)kLlWarps * kTileB <= (size_t)EpCombine1250xLdsBudget,
                 "a token's landed rows fit the warp's tile");
-  static_assert(kLlRowB <= ((kDataB + 119) / 120 + 7) / 8 * 1024,
-                "hip_backend.ll_comb_row_bytes sizes the landing rows");
+  static_assert(kLlRowB <= EpLl128LandRowBytes(kCfg), "EpLl128LandRowBytes sizes the landing rows");
   static_assert(kCfg.blockNum <= 256, "the per-block call numbers hold 256 blocks");
 
   const int thdId = threadIdx.x;
@@ -4746,8 +4746,7 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   constexpr unsigned kSpinMax = 1u << 22;
   static_assert(kTokB % 16 == 0 && kMainB % 16 == 0, "every lane's bytes are aligned");
   static_assert(kTailLines + kWtPairs <= kLines, "the tail and the weights fit 8 B a line");
-  static_assert(kLlRowB <= ((kTokB + 8 * kWtPairs + 119) / 120 + 7) / 8 * 1024,
-                "hip_backend.ll_bf16_row_bytes sizes the landing rows");
+  static_assert(kLlRowB <= EpLl128LandRowBytes(kCfg), "EpLl128LandRowBytes sizes the landing rows");
   static_assert(kCfg.blockNum <= 256, "the per-block call numbers hold 256 blocks");
 
   const int thdId = threadIdx.x;
@@ -4971,6 +4970,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   T* const stage = EpLocal<T>(win, args.offOutTok);
   bool staged = false;
   [[maybe_unused]] EpFp4First<kCfg> rFirst{};
+  // The overlapped reduce's row flags sit where EpRegionOutTokBytes sizes them, which it does only
+  // under OvlAny; a path that takes it outside OvlAny writes past out_tok.
+  static_assert(!EpFp4Ovl<kCfg>() || EpCombinePushOvlAny(kCfg),
+                "EpFp4Ovl must imply EpCombinePushOvlAny, which sizes its row flags");
   if constexpr (EpFp4Ovl<kCfg>()) {
     constexpr int kOvlW = kCfg.warpPerBlock / 2;
     constexpr int kOvlR = kCfg.warpPerBlock - kOvlW;

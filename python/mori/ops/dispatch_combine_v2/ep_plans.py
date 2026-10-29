@@ -45,6 +45,7 @@ from mori.jit.v2 import plan_api
 _LIB_NAME = "libmori_ops_v2.so"
 DTYPES = plan_api.DTYPES
 make_plan = plan_api.make_plan
+arena_regions = plan_api.arena_regions
 registered_plans = plan_api.registered_plans
 precompile = plan_api.precompile
 library_path = plan_api.library_path
@@ -73,6 +74,7 @@ class EpDispatchPlan(_EpDispatchJitPlan):
     __doc__ = _EpDispatchJitPlan.__doc__
 
     def __init__(self, **kwargs):
+        self._staging = None
         super().__init__(**kwargs)
         self._fallback_staging = None
         info = self.info
@@ -80,9 +82,47 @@ class EpDispatchPlan(_EpDispatchJitPlan):
         if info["sharedBytes"]:
             self.bind(staging_base=_FallbackStaging(self, info))
 
+    def bind(self, **args) -> None:
+        # A staging tensor is checked against info["stagingBytes"], bound by
+        # address, and held once the bind succeeds. An int address is taken on
+        # trust, and any other object with data_ptr() -- the fallback below among
+        # them -- is read at each launch, as before.
+        staging = None
+        for key in ("staging_base", "stagingBase"):
+            buf = args.get(key)
+            if hasattr(buf, "untyped_storage"):
+                args[key] = self._checked_staging(buf)
+                staging = buf
+        super().bind(**args)
+        if staging is not None:
+            self._staging = staging
+
+    def _checked_staging(self, buf) -> int:
+        import torch
+
+        need = self.info["stagingBytes"]
+        if buf.device.type != "cuda" or buf.device.index != torch.cuda.current_device():
+            raise ValueError(
+                f"ep_dispatch: staging_base is on {buf.device}, the plan launches on "
+                f"cuda:{torch.cuda.current_device()}"
+            )
+        # The tensor's own extent: a short slice of a larger buffer is still short.
+        if not buf.is_contiguous():
+            raise ValueError("ep_dispatch: staging_base must be contiguous")
+        have = buf.numel() * buf.element_size()
+        if have < need:
+            raise ValueError(
+                f"ep_dispatch: staging_base has {have} bytes, the plan needs {need} "
+                "(info['stagingBytes'])"
+            )
+        if buf.data_ptr() % 128:
+            raise ValueError("ep_dispatch: staging_base must be 128 B aligned")
+        return buf.data_ptr()
+
     def close(self) -> None:
         super().close()
         self._fallback_staging = None
+        self._staging = None
 
 
 class _FallbackStaging:
@@ -124,13 +164,12 @@ def _staging_key(info: dict) -> tuple:
         info["scaleBytes"],
         info["maxTokPerRank"],
         bool(info["aggReserve"]),
+        info["callTokMax"],
     )
 
 
 def _fallback_staging(info: dict):
     import torch
-
-    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
 
     key = _staging_key(info)
     device = key[0]
@@ -140,16 +179,17 @@ def _fallback_staging(info: dict):
             raise RuntimeError(
                 "ep_dispatch: staging_base is not bound, and the buffer it falls back "
                 "to cannot be allocated inside a graph capture; bind one "
-                "(ep_staging_bytes) or launch once before capturing"
+                "(info['stagingBytes']) or launch once before capturing"
             )
-        nbytes = ep_staging_bytes(*key[1:])
+        nbytes = info["stagingBytes"]
         buf = _FALLBACK_STAGING[key] = torch.zeros(
             nbytes, dtype=torch.uint8, device=device
         )
         warnings.warn(
             f"ep_dispatch: staging_base is not bound; allocated {nbytes:,} bytes for "
-            "it. Allocate ep_staging_bytes() bytes once, keep them alive, and "
-            "bind(staging_base=buf.data_ptr()) on every dispatch plan "
+            "it. Allocate info['stagingBytes'] bytes once (EpDispatchPlan.describe "
+            "gives it before the plan exists), keep them alive, and "
+            "bind(staging_base=buf) on every dispatch plan "
             "(ROCm/mori#703); this fallback will be removed.",
             FutureWarning,
             stacklevel=_caller_stacklevel(),

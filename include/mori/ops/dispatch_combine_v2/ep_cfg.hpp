@@ -374,6 +374,31 @@ constexpr int EpCombinePushSlotAlign = 128;
 // and the receiver reduces what landed.
 constexpr bool EpCombinePush(const EpCfg& c) { return c.combineFp4 || c.combineFp8; }
 
+// The push combine's layout in outTok, shared with the host so it sizes the region.
+// After the pull rows: one wire row per token and destination rank, then one u64 flag
+// per row when the overlapped reduce can run.
+constexpr int EpCombinePushRows(const EpCfg& c) {
+  return c.worldSize < c.numExpertPerToken ? c.worldSize : c.numExpertPerToken;
+}
+constexpr int EpCombinePushLandRows(const EpCfg& c) {
+  return c.maxTokPerRank * EpCombinePushRows(c);
+}
+constexpr int EpCombinePushWireBytes(const EpCfg& c) {
+  const int pay = c.combineFp8 ? c.hiddenDim : c.hiddenDim / 2;
+  const int sc = c.combineFp4F32Scale ? c.hiddenDim / 128 * 4 : c.hiddenDim / 32;
+  return (pay + sc + EpCombinePushSlotAlign - 1) / EpCombinePushSlotAlign * EpCombinePushSlotAlign;
+}
+constexpr size_t EpCombinePushLandOff(const EpCfg& c) {
+  return (size_t)EpMaxRecv(c) * EpTokenBytes(c);
+}
+constexpr size_t EpCombinePushFlagOff(const EpCfg& c) {
+  return EpCombinePushLandOff(c) + (size_t)EpCombinePushLandRows(c) * EpCombinePushWireBytes(c);
+}
+// True when some warp count takes the overlapped reduce (EpFp4Ovl), the row flags' user.
+constexpr bool EpCombinePushOvlAny(const EpCfg& c) {
+  return EpCombinePush(c) && !c.combineFp4F32Scale && !EpIsWideEp(c) && c.worldSize >= 4;
+}
+
 // The scale row's SLOT stride: the caller's row padded to 128 B. A transfer is a
 // run of consecutive slots, and TdmWholeOrSplit128 only gives a body to the part
 // of a run that starts aligned -- at the natural 224 B only every 4th one does.
@@ -500,6 +525,46 @@ constexpr size_t EpStagingScaleBytes(const EpCfg& c) {
 // caller always has something to allocate.
 constexpr size_t EpStagingTotalBytes(const EpCfg& c) {
   return EpAlignUp128(EpStagingScaleOffset(c) + EpStagingScaleBytes(c));
+}
+
+// ---------------------------------------------------------------------------
+// Arena region sizes, reported through plan info (ep_spec.cpp). dispOut and outScales
+// are sized by the dispatch Cfg, outTok by the combine one; the arena takes the largest
+// any plan asks for. None depends on geometry, so one arena serves every variant.
+// ---------------------------------------------------------------------------
+constexpr size_t EpLl128StageBytes(const EpCfg& c) {
+  const size_t row =
+      ((size_t)EpTokenBytes(c) + EpScaleStride(c) + 4 + 8 * (size_t)c.numExpertPerToken + 127) /
+      128 * 128;
+  return 512 + 256 + 2 * (size_t)c.worldSize * 128 + 2 * (size_t)c.worldSize * 512 * row;
+}
+constexpr int EpLl128LandRowBytes(const EpCfg& c) {
+  const int data = EpCombinePush(c)
+                       ? (c.combineFp8 ? c.hiddenDim : c.hiddenDim / 2) + c.hiddenDim / 32
+                       : EpTokenBytes(c) + 8 * ((c.numExpertPerToken + 1) / 2);
+  return ((data + 119) / 120 + 7) / 8 * 1024;
+}
+constexpr size_t EpRegionTokOffBytes(const EpCfg&) { return 4; }
+// Two words per source: the count, and the push combine's landing offset.
+constexpr size_t EpRegionRecvNumBytes(const EpCfg& c) { return 8 * (size_t)c.worldSize; }
+constexpr size_t EpRegionRecvToSrcBytes(const EpCfg& c) { return (size_t)EpMaxRecv(c) * 4; }
+constexpr size_t EpRegionOutIdxBytes(const EpCfg& c) {
+  return (size_t)EpMaxRecv(c) * c.numExpertPerToken * 4;
+}
+constexpr size_t EpRegionOutWtsBytes(const EpCfg& c) { return EpRegionOutIdxBytes(c); }
+constexpr size_t EpRegionDispOutBytes(const EpCfg& c) {
+  return (size_t)EpMaxRecv(c) * EpTokenBytes(c);
+}
+constexpr size_t EpRegionOutTokBytes(const EpCfg& c) {
+  if (c.ll128 || c.ll128CombineOnly)
+    return EpCombinePushLandOff(c) + (size_t)EpCombinePushLandRows(c) * EpLl128LandRowBytes(c);
+  if (!EpCombinePush(c)) return EpCombinePushLandOff(c);
+  return EpCombinePushFlagOff(c) +
+         (EpCombinePushOvlAny(c) ? (size_t)EpCombinePushLandRows(c) * 8 : 0);
+}
+constexpr size_t EpRegionXdbBytes(const EpCfg& c) { return 8 * (size_t)c.worldSize; }
+constexpr size_t EpRegionOutScalesBytes(const EpCfg& c) {
+  return (size_t)EpMaxRecv(c) * EpScaleStride(c);
 }
 
 // Per-warp LDS slab. The metadata tile and the payload tile share it (same

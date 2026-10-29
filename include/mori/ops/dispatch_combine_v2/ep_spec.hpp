@@ -94,6 +94,11 @@ enum class EpKernelKind { Dispatch, Combine };
 
 EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind);
 
+// Plan info: Describe(cfg) plus what a caller sizes for the plan -- arena regions
+// (region.<stem>), dispatch staging (stagingBytes), the push combine's landing.
+std::string EpDispatchInfo(const EpCfg& cfg);
+std::string EpCombineInfo(const EpCfg& cfg);
+
 // ---------------------------------------------------------------------------
 // The two Specs. Same Cfg, same Args, different body and different geometry.
 // ---------------------------------------------------------------------------
@@ -113,9 +118,9 @@ class EpDispatchSpec : public mori::jit::v2::KernelSpec<EpDispatchSpec, EpCfg> {
   static void LaunchRaw(const Plan& plan, const void* argBuf, size_t argSize, hipStream_t stream) {
     if (plan.geom.sharedBytes > 0 && !static_cast<const Args*>(argBuf)->stagingBase) {
       throw std::runtime_error(
-          "ep_dispatch on gfx125x: staging_base was not bound. Allocate "
-          "ep_staging_bytes(world_size, max_recv, scale_bytes, max_tok_per_rank) bytes "
-          "and plan.bind(staging_base=ptr) -- a null base faults in the kernel.");
+          "ep_dispatch on gfx125x: staging_base was not bound. Allocate the plan's "
+          "info['stagingBytes'] bytes (EpDispatchPlan.describe gives it before the plan "
+          "exists) and plan.bind(staging_base=buf) -- a null base faults in the kernel.");
     }
     // EpStaging*Offset are EpScaleAlign multiples OF THE BASE, so the base owns the
     // alignment the .bss arrays used to declare themselves. A caller carving staging
