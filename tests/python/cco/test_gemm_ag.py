@@ -254,23 +254,59 @@ def test_byte_swizzle_is_a_bijection_at_bf16_width():
     assert len(seen) == 16 * 64
 
 
-def test_pick_tile_only_returns_validated_tiles():
-    """``BLOCK_N=128`` is the fastest tile measured and is excluded anyway.
+def test_pick_tile_matches_the_measured_best():
+    """Each shape's fastest tile from the 2026-10-29 sweep, split and fused.
 
-    It produced a wrong fp32 C once in 48 single-GPU runs and failed about half
-    the ranks per 8-rank launch; ``BLOCK_N=256`` was 48/48 clean on the same
-    probe. ``tile_constants`` still accepts it so the measurement stays
-    reproducible behind an explicit flag, but nothing may pick it by default.
+    The split rule takes the largest tile whose grid covers the 256 CUs; the
+    fused one needs at least two workgroup rounds to overlap anything, and
+    pairs the tile with one chunk per round. See ``pick_tile``'s tables.
     """
-    for m in (512, 1024, 2048, 4096, 8192):
-        for od in ("bf16", "fp32"):
-            assert bf16gemm.pick_tile(m, 2048, od)[1] == 256
-    # Both tiles smaller than the template's measure faster and neither
-    # validates reliably, so the only shippable candidate is the template's.
-    assert bf16gemm.TILE_CANDIDATES == ((256, 256),)
-    for m in (512, 2048, 4096, 8192):
-        assert bf16gemm.pick_tile(m, 2048, "fp32") == (256, 256)
+    split = {
+        (2048, 2048): (128, 128),
+        (4096, 2048): (128, 256),
+        (8192, 2048): (256, 256),
+        (16384, 2048): (256, 256),
+        (2048, 1024): (128, 128),
+        (16384, 1024): (256, 256),
+    }
+    for (m, n), tile in split.items():
+        assert bf16gemm.pick_tile(m, n, "fp32") == tile, (m, n)
+    fused = {
+        (8192, 2048): ((128, 256), 2),
+        (16384, 2048): ((128, 256), 4),
+        (16384, 1024): ((128, 256), 2),
+    }
+    for (m, n), (tile, chunks) in fused.items():
+        assert bf16gemm.pick_tile(m, n, "fp32", fused=True) == tile, (m, n)
+        assert bf16gemm.pick_chunks(m, n, tile) == chunks, (m, n)
+    # BLOCK_N=128 stays fp32-only: a bf16 C never gets it.
+    for m in (2048, 4096, 8192, 16384):
+        for fused_ in (False, True):
+            assert bf16gemm.pick_tile(m, 2048, "bf16", fused=fused_)[1] == 256
     assert bf16gemm.tile_grid(8192, 2048, (256, 256)) == 256
+    # A chunk count has to divide the row tiles.
+    assert bf16gemm.pick_chunks(384, 2048, (128, 128), cus=8) == 3
+
+
+@pytest.mark.parametrize("bm,bn", [(128, 128), (128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("mode", ["split-sdma", "fused-sdma"])
+def test_every_tile_validates_split_and_fused(bm, bn, mode):
+    """Every tile pick_tile may now choose, on 8 ranks, with chunking on.
+
+    The smaller tiles were kept out of the defaults until the LDS ordering
+    fix had coverage beyond one tile. This is that coverage in CI: BF16 in,
+    FP32 out, the received buffer validated per source rank.
+    """
+    if torch.cuda.device_count() < 8:
+        pytest.skip("requires 8 GPUs")
+    pytest.importorskip("flydsl")
+    extra = ["--in-dtype", "bf16", "--out-dtype", "fp32"]
+    extra += ["--block-m", str(bm), "--block-n", str(bn)]
+    if mode == "fused-sdma":
+        extra += ["--chunks", "2", "--peer-uncached", "--fence", "release"]
+    record = _run_bench(8, mode, 4096, 2048, 7168, tuple(extra))
+    assert record["validated"] is True, record
+    assert record["rel_l2"] < 1e-5, record
 
 
 def test_bf16_tile_constants_match_the_template():

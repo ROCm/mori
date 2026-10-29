@@ -1070,56 +1070,65 @@ def compile_bf16_gemm_ag(
     return launch_gemm
 
 
-#: Keep the previously validated default while the repaired smaller tiles get
-#: broader performance coverage. Explicit BLOCK_M/BLOCK_N still select them.
-#: The former intermittent failures were compatible with two missing LDS
-#: ordering edges, now covered by test_gemm_ag_pipeline.py; ISA instruction
-#: counts alone had incorrectly been taken as evidence that the kernel was safe.
-TILE_CANDIDATES = ((256, 256),)
+#: Largest first; at equal area 128x256 before 256x128, which measured the
+#: faster GEMM (Pro M=4096: 112.5 against 116.4 us) and the faster fused
+#: path (Flash M=16384: 1265.7 against 1298.1 us). The smaller tiles were held
+#: back until the two missing LDS ordering edges behind their old intermittent
+#: failures were fixed (now covered by test_gemm_ag_pipeline.py) and they had
+#: broader coverage: every tile is validated by test_bf16_gemm_pipeline_numerics
+#: and, on 8 ranks, by test_every_tile_validates_split_and_fused.
+TILE_CANDIDATES = ((256, 256), (128, 256), (256, 128), (128, 128))
 
 #: CUs on the part this was tuned on (MI355X). The grid heuristic wants the
 #: real number, so it is a parameter of ``pick_tile`` rather than a constant.
 DEFAULT_CUS = 256
 
+#: Workgroup rounds a fused tile needs. A chunk can only overlap its transfer
+#: with GEMM work still to come, and a grid that runs in one round completes
+#: every chunk at once.
+FUSED_MIN_ROUNDS = 2
 
-def pick_tile(m, n, out_dtype="bf16", cus=DEFAULT_CUS):
+
+def pick_tile(m, n, out_dtype="bf16", cus=DEFAULT_CUS, *, fused=False):
     """Choose ``(BLOCK_M, BLOCK_N)`` for a shape. Measured, not guessed.
 
-    The template instantiates ``256x256``, and at the shapes this operator runs
-    that is the **single worst choice on the table** -- it launches
-    ``ceil(M/256) * ceil(N/256)`` workgroups, which at ``M=N=2048`` is 64
-    against an MI355X's 256 CUs. Three quarters of the GPU idles regardless of
-    how good the mainloop is, and no amount of ``waves_per_eu`` or
-    ``xcd_swizzle`` touches it (both measured inert, within 1%).
+    **Unfused** (``gemm-only`` and the split paths): the largest tile whose
+    grid still covers the CUs, or the largest grid available if none does. The
+    template's ``256x256`` launches ``ceil(M/256) * ceil(N/256)`` workgroups --
+    64 at ``M=N=2048`` against an MI355X's 256 CUs -- so at small M it idles
+    three quarters of the GPU, while at large M it is the fastest tile. GEMM
+    alone, BF16 in / FP32 out, 8x MI355X, 2026-10-29 (us)::
 
-    Measured at ``M=2048 N=2048 K=7168``, fp32 out, across every tile::
+        shape           M      torch  128/128  128/256  256/128  256/256
+        N=2048 K=7168   2048    71.0   *73.3     91.0     93.0    132.0
+                        4096   146.0   120.9   *112.5    116.4    143.4
+                        8192   181.2   223.0    211.4    212.2   *185.0
+                       16384   365.1   527.1    455.9    465.5   *364.6
+        N=1024 K=5120   2048    43.9   *54.0     65.7     68.6     99.2
+                       16384   140.0   212.2    156.4    209.8   *138.0
 
-        tile      grid      us    TF/s
-        256/256     64   176.0     342
-        256/128    128   139.6     431
-        128/256    128   134.2     448
-        128/128    256   116.5     516   (races -- see TILE_CANDIDATES)
+    The rule picks the starred tile at every shape. It is **not** "maximise the
+    grid": once there is a workgroup per CU, the larger tile amortises better.
 
-    and per shape at ``128/256`` (before the synchronization repair), against
-    ``torch.matmul``::
+    **Fused** (``fused=True``): the largest tile *other than* ``256x256`` whose
+    grid runs at least ``FUSED_MIN_ROUNDS`` rounds, or the largest grid
+    available if none does. Fusion overlaps a chunk's transfer with the GEMM
+    rounds still to come, so a tile that finishes the whole grid in one round
+    leaves nothing to overlap -- ``256x256`` at Pro M=8192 runs 1.0% *behind*
+    split at the same tile. And with a chunk per round (``pick_chunks``) the
+    first chunk is ready after about GEMM / rounds: ``256x256`` at Pro M=16384
+    is the faster GEMM (364.6 against 455.9 us) but two rounds to
+    ``128x256``'s four, and measured 1.9% behind it fused. It was the best
+    fused tile at none of the three shapes.
+    Fused SDMA, ``sc_release``, best chunk count per tile (us)::
 
-          M   grid     us    TF/s   torch    ratio
-        512     32  128.4     117    39.0    3.29x
-       1024     64  128.4     234    53.1    2.42x
-       2048    128  134.2     448    84.8    1.58x
-       4096    256  155.2     775   122.9    1.26x
+        shape           M      split*   128/128  128/256  256/128  256/256
+        N=2048 K=7168   8192   1341.6   1314.2  *1289.6   1291.0   1354.9
+                       16384   2676.2   2525.8  *2479.2   2479.0   2527.1
+        N=1024 K=5120  16384   1294.2   1310.0  *1265.7   1298.1   1307.4
 
-    The rule that fits those measurements is **not** "maximise the grid": at
-    ``M=4096``, ``128/128`` gives 512 workgroups and measures 162.8us against
-    ``128/256``'s 256 workgroups at 155.2, so once there is at least one
-    workgroup per CU the larger tile amortises better. Hence **the largest tile
-    whose grid still covers the CUs, or the largest grid available if none
-    does**, which reproduces the measured best at every shape.
-
-    The candidate set remains ``((256, 256),)`` to preserve the shipped
-    default. The timing table predates the synchronization repair and is not
-    evidence of correctness. Smaller tiles are available through explicit
-    arguments; see the benchmark document for post-fix validation.
+    ``split*`` is split SDMA at the unfused rule's tile. See ``pick_chunks``
+    for the chunk count that goes with the fused tile.
     """
     cands = [
         (bm, bn)
@@ -1131,13 +1140,31 @@ def pick_tile(m, n, out_dtype="bf16", cus=DEFAULT_CUS):
             f"no validated tile divides m={m} n={n} for out_dtype={out_dtype!r}; "
             f"candidates are {TILE_CANDIDATES} and BLOCK_N=128 is fp32-only"
         )
-    grid = lambda t: (m // t[0]) * (n // t[1])  # noqa: E731
-    covering = [t for t in cands if grid(t) >= cus]
+    if fused and len(cands) > 1:
+        cands = [t for t in cands if t != (256, 256)]
+    need = cus * (FUSED_MIN_ROUNDS if fused else 1)
+    covering = [t for t in cands if tile_grid(m, n, t) >= need]
     if covering:
         # Largest area among those that fill the machine; TILE_CANDIDATES is
         # ordered largest-first so the first match is it.
         return covering[0]
-    return max(cands, key=grid)
+    return max(cands, key=lambda t: tile_grid(m, n, t))
+
+
+def pick_chunks(m, n, tile, cus=DEFAULT_CUS, max_chunks=8):
+    """Fused chunk count for ``tile``: one chunk per workgroup round.
+
+    Measured best at every fused shape in ``pick_tile``'s table: two rounds
+    take two chunks (Pro M=8192, Flash M=16384), four take four (Pro
+    M=16384, 2479.2 us against 2520.7 at eight). Rounded down to a divisor of
+    the row tiles, which the completion counter needs.
+    """
+    rounds = max(1, tile_grid(m, n, tile) // cus)
+    m_tiles = m // tile[0]
+    for c in range(min(rounds, max_chunks, m_tiles), 0, -1):
+        if m_tiles % c == 0:
+            return c
+    return 1
 
 
 def tile_grid(m, n, tile):
@@ -1149,6 +1176,7 @@ __all__ = [
     "AgStoreC",
     "BLOCK_K",
     "compile_bf16_gemm_ag",
+    "pick_chunks",
     "pick_tile",
     "TILE_CANDIDATES",
     "E_K",

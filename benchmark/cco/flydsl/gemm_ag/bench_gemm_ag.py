@@ -90,6 +90,7 @@ from mori.ops.gemm_ag.kernels_fused import (
 from mori.ops.gemm_ag._gemm_a16w16_8wave import (
     BLOCK_K as BF16_BLOCK_K,
     compile_bf16_gemm_ag,
+    pick_chunks,
     pick_tile,
 )
 
@@ -367,10 +368,14 @@ def run(args) -> int:
         if args.k % BF16_BLOCK_K:
             raise SystemExit(f"--in-dtype bf16 needs k % {BF16_BLOCK_K} == 0")
         if args.block_m == 0 or args.block_n == 0:
-            # The tile is the dominant knob at these shapes and the template's
-            # 256x256 is the worst of them -- 64 workgroups against 256 CUs at
-            # M=N=2048. pick_tile's docstring carries the measurements.
-            bm, bn = pick_tile(args.m, args.n, args.out_dtype)
+            # The tile is the dominant knob at these shapes: the template's
+            # 256x256 is the fastest GEMM at large M and the slowest at
+            # M=N=2048 (64 workgroups against 256 CUs), and the fused path
+            # wants a different tile from the split one. pick_tile's
+            # docstring carries the measurements.
+            bm, bn = pick_tile(
+                args.m, args.n, args.out_dtype, fused=args.mode == "fused-sdma"
+            )
             args.block_m = args.block_m or bm
             args.block_n = args.block_n or bn
     if not bf16_in:
@@ -396,7 +401,15 @@ def run(args) -> int:
         )
     # A chunk is a run of row tiles; the count has to divide them, and the
     # request is rounded down rather than rejected so a sweep stays usable.
-    chunks = counter_chunks(args.m // args.block_m, args.chunks) if needs_sdma else 1
+    if not needs_sdma:
+        chunks = 1
+    elif args.chunks:
+        chunks = counter_chunks(args.m // args.block_m, args.chunks)
+    elif args.mode == "fused-sdma":
+        # One chunk per workgroup round of the tile -- see pick_chunks.
+        chunks = pick_chunks(args.m, args.n, (args.block_m, args.block_n))
+    else:
+        chunks = 1
     if args.mode == "fused-sdma" and args.post == "lanes" and chunks > 1:
         # The lane-parallel epilogue has no submit lock, so two chunks of one
         # destination are kept apart by queue instead. Derived, not a choice --
@@ -756,7 +769,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--xcd-swizzle", type=int, default=0)
     p.add_argument("--swap-ab", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--permlane", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--chunks", type=int, default=1)
+    p.add_argument(
+        "--chunks",
+        type=int,
+        default=0,
+        help="fused-sdma chunk count; 0 picks one per workgroup round of the "
+        "tile (see pick_chunks)",
+    )
     p.add_argument(
         "--split-gemm",
         choices=("local", "epilogue"),
