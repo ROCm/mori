@@ -125,8 +125,9 @@ arena out by NUMA node (`UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA`): the configured
 bytes are split evenly over the nodes that have GPUs, each part is bound to its
 node and registered on its own, and is cut into one shard per GPU on it unless
 `UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS` sets the arena's total. A call stages
-through a shard on its caller buffer's node, or that node's whole part when it
-needs more than a shard. Memory is the same as one arena per direction. Each
+through a shard on its caller buffer's node; one that nobody waits behind may
+take as many adjacent idle shards as it fills, and one that needs more than a
+shard takes that node's whole part. Memory is the same as one arena per direction. Each
 part is one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the
 AINIC limit above, or back the arenas with hugepages
 (`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`).
