@@ -67,7 +67,8 @@ other tables may not set it. Current settings:
 - MI308X: chosen per bucket together with the active QP counts, and kept only
   where a whole-table A/B against the previous tables confirmed it: on for
   256/8 bf16 H7168 at T4–512, T2048 and T4096; 256/8 bf16 H6144 at T4–128 and
-  T2048; 256/6 bf16 H7168 at T64–128; 384/6 bf16 H7168 and H5120 at T64–256.
+  T2048; 256/6 bf16 H7168 at T64–128; 384/6 bf16 H7168 at T64–256; 384/6
+  bf16 H5120, re-tuned with its geometry, at T4–256, T2048 and T4096.
   272/9 had no previous table; its whole-table A/B was against the defaults
   and the 256/8 rules, and it is on for bf16 H7168 at T8, T256, T512 and T2048.
   896/16 likewise, A/B against the defaults: on for bf16 H3584 at T16, T32 and
@@ -107,8 +108,9 @@ other tables may not set it. Current settings:
 Each GPU model has IntraNodeV2 (EP8), InterNodeV2 (EP16) and InterNodeV2LL
 (EP16) tables, and every shape in a table has both phases. Not every shape is
 in every table, and not every dtype appears in every shape; see the files.
-Token ceilings are 64–4096, plus 4–32 for MI308X inter-node 256/8, 272/9 and
-896/16.
+Token ceilings are 64–4096, plus 4–32 for MI308X inter-node 256/8, 272/9,
+896/16 and 384/6 at hidden 5120 (InterNodeV2LL 384/6: 4–16, so T32 uses the
+T64 rule).
 
 The model behind each shape:
 
@@ -142,9 +144,6 @@ up after the combine), so 3584 is the width the dispatch carries.
 FP8 uses the arch's native encoding: `fp8_e4m3_fnuz` on gfx942 and
 `fp8_e4m3` (OCP) on gfx950. Combine rows are BF16, except MI308X inter-node
 256/8, which also has FP8 combine rows for symmetric FP8 runs.
-
-Known gap: MI308X InterNodeV2LL 384/6 at hidden 5120 has no T4096 rows, so
-batches above 2048 tokens use the T2048 rule.
 
 ## Measurement conditions
 
