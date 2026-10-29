@@ -379,7 +379,10 @@ a few lines. This branch keeps the original rationale — the measured
 per-fragment costs that justify a kernel over `hipMemcpy` / `hipMemcpy2DAsync`,
 the ~128 KiB crossover, and why registration is single-shot and all-or-nothing.
 Those numbers are why the code has the shape it has, and §10.3 depends on the
-crossover being written down.
+crossover being written down. (The crossover was later re-measured with 8 GPUs
+copying at once: host to device the kernel stays ahead up to 64 MiB fragments,
+device to host the copy engine takes over at about 4 MiB. `HbmCopyEngine`
+carries the current rule.)
 
 ### 10.2 `1d3c859e` — bound heartbeat event batches
 
