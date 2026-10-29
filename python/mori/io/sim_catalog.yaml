@@ -1,0 +1,31 @@
+# MORI-IO simulation catalog: link timing for each GPU (XGMI) and each NIC (RDMA, TCP).
+# Read at run time from the files in MORI_IO_SIM_CATALOG; MORI_IO_SIM_GPU and MORI_IO_SIM_NIC
+# pick the entries by name. This file ships in the wheel as mori/io/sim_catalog.yaml.
+#
+# To add hardware, add an entry with its measured numbers. RDMA numbers also depend on the
+# QP and worker counts they were measured with.
+#
+# Entries measured 2026-10-28 on ROCm 7.2.0: GPU 0 -> GPU 1 batch writes between two
+# processes, sizes 4 KiB to 256 MiB and 1 to 1024 segments of 16 KiB, the mean of two
+# hardware runs, refined once against the simulator.
+
+- backend: xgmi
+  gpu: mi355x
+  bandwidth_gbps: 61.4
+  latency_us: 9
+  per_segment_ns: 19500  # one hipMemcpyPeerAsync per segment
+  per_op_us: 0
+  hardware: "AMD Instinct MI355X, xGMI full mesh, 72 GB/s per direction per GPU pair"
+  measured: "2026-10-28, ROCm 7.2.0, scatter/gather kernel off (the default)"
+
+- backend: rdma
+  nic: pollara400
+  bandwidth_gbps: 47.4
+  latency_us: 20
+  per_segment_ns: 255
+  per_op_us: 4.3
+  qp_per_transfer: 4  # sglang's mori connector defaults
+  num_worker_threads: 4
+  hardware: "AMD Pensando Pollara 400, 400GbE"
+  measured: "2026-10-28, ROCm 7.2.0, MI355X GPUs on one node, each through its own NIC"
+  notes: "One transfer alone reaches about 25 GB/s; two or more in flight reach the full bandwidth."

@@ -64,32 +64,40 @@ MXFP8_BLOCK = 32
 #: ``"blockscale"``  A 1x128 fp32 scales, B 128x128. DeepSeek-V4-Pro.
 #: ``"mxfp8"``       32-wide ue8m0 on both, fed to the scaled MFMA as
 #:                   instruction operands. DeepSeek-V4.1-Flash.
+#: ``"mxfp8_raw"``   the same numbers, in the quantiser's own row-major bytes,
+#:                   which the kernel stages through LDS. Needs no host
+#:                   shuffle; faster cold and at large M, can be a few percent
+#:                   slower hot at small M or short K.
 #:
-#: They differ in more than a group size: mxfp8 needs BLOCK_M=256 (see
-#: MXFP8_BLOCK_M) and takes its A scale through ``preshuffle_a_scale`` as
-#: int32, where blockscale takes fp32. Both are checked, not assumed.
-QUANTS = ("blockscale", "mxfp8")
+#: They differ in more than a group size: the mxfp8 forms need BLOCK_M=256 (see
+#: MXFP8_BLOCK_M); ``"mxfp8"`` takes its A scale through ``preshuffle_a_scale``
+#: as int32 and ``"mxfp8_raw"`` takes uint8, where blockscale takes fp32. All
+#: are checked, not assumed.
+MXFP8_QUANTS = ("mxfp8", "mxfp8_raw")
+QUANTS = ("blockscale",) + MXFP8_QUANTS
 
 
 #: mxfp8's BLOCK_M is not a preference. The kernel packs a lane's four M tiles
 #: into one dword and picks the byte with the MFMA's ``opsel``, and there are
-#: four tiles only when ``BLOCK_M // 64 == 4``. blockscale has no such rule --
+#: four tiles only when ``BLOCK_M // 64 == 4``. ``"mxfp8_raw"`` has no packing,
+#: but 256 is the only tile it has been measured and tested at, so it is held
+#: to the same one. blockscale has no such rule --
 #: its 128 is the measured tile (256x256 spills the doubled accumulator VGPRs),
 #: so other granule-legal tiles stay expressible there.
 MXFP8_BLOCK_M = 256
 
 
 def _default_block_m(quant: str) -> int:
-    return MXFP8_BLOCK_M if quant == "mxfp8" else DEFAULT_BLOCK_M
+    return MXFP8_BLOCK_M if quant in MXFP8_QUANTS else DEFAULT_BLOCK_M
 
 
 def _quant_tile_constraint(quant: str, block_m: int) -> str | None:
     """Why this BLOCK_M cannot serve this quantisation, or None."""
-    if quant == "mxfp8" and block_m != MXFP8_BLOCK_M:
+    if quant in MXFP8_QUANTS and block_m != MXFP8_BLOCK_M:
         return (
-            f"quant='mxfp8' requires block_m={MXFP8_BLOCK_M}, got {block_m}: the "
-            f"packed A scale puts a lane's four M tiles in one dword, which is "
-            f"four tiles only at BLOCK_M//64 == 4"
+            f"quant={quant!r} requires block_m={MXFP8_BLOCK_M}, got {block_m}: "
+            f"the packed A scale puts a lane's four M tiles in one dword, which "
+            f"is four tiles only at BLOCK_M//64 == 4"
         )
     return None
 
@@ -296,7 +304,7 @@ def _gemm_constraints(
         )
     if n % block_n:
         return f"N={n} must be a multiple of block_n={block_n}"
-    b_group = MXFP8_BLOCK if quant == "mxfp8" else SCALE_BLOCK_K
+    b_group = MXFP8_BLOCK if quant in MXFP8_QUANTS else SCALE_BLOCK_K
     if n % b_group:
         return f"N={n} must be a multiple of {b_group} (the B scale group)"
     return None
@@ -512,6 +520,30 @@ def _flatten_mxfp8_a_scale(a_scale: torch.Tensor, m: int, k: int) -> torch.Tenso
             f"(M*K/32 ue8m0 bytes, four to an int32)"
         )
     return a_scale
+
+
+def _flatten_mxfp8_raw_scale(
+    name: str, scale: torch.Tensor, rows: int, cols: int
+) -> torch.Tensor:
+    """A ``[rows, cols]`` row-major ue8m0 scale, flat, as ``mxfp8_raw`` reads it.
+
+    The 2-D form is taken in its logical order whatever its strides -- that is
+    the quantiser's ``[M, K/32]`` (or ``[N/32, K/32]``) and nothing else -- and
+    a flat one is taken as already row major. Bytes, not int32: the kernel
+    copies 16 of a row at a time into LDS and reads them back one by one.
+    """
+    if scale.dtype != torch.uint8:
+        raise ValueError(f"{name} must be torch.uint8, got {scale.dtype}")
+    if scale.device.type != "cuda":
+        raise ValueError(f"{name} must be on a GPU, got {scale.device}")
+    if scale.dim() == 2 and tuple(scale.shape) == (rows, cols):
+        return scale.reshape(-1)
+    if scale.dim() == 1 and scale.numel() == rows * cols:
+        return scale
+    raise ValueError(
+        f"{name} must be {(rows, cols)} uint8 or that flat, got "
+        f"{tuple(scale.shape)}"
+    )
 
 
 class _PinnedLaunch:
@@ -1088,6 +1120,11 @@ class GemmAllReduceOp:
             K-block major and widened, i.e. ``e.t().contiguous().to(int32)``,
             flat. Both int32.
 
+        ``mxfp8_raw``
+            ``a_scale`` is ``[M, K/32]`` and ``b_scale`` ``[N/32, K/32]``, the
+            ue8m0 bytes as the quantiser emits them: uint8, row major, 2-D or
+            flat.
+
         ``logical_m`` is the original row count before padding. Pass it when
         using the fitted schedule so chunk selection matches padded_m().
         The result still includes padding; slice it to logical_m if needed.
@@ -1100,17 +1137,24 @@ class GemmAllReduceOp:
         m = a_fp8.shape[0]
         self._row_plan(m, logical_m)
         self._check_operands(a_fp8, b_preshuffled, a_scale, b_scale, m)
+        if self.quant == "mxfp8_raw":
+            a_scale = _flatten_mxfp8_raw_scale(
+                "a_scale", a_scale, m, self.k // MXFP8_BLOCK
+            )
+            b_scale = _flatten_mxfp8_raw_scale(
+                "b_scale", b_scale, self.n // MXFP8_BLOCK, self.k // MXFP8_BLOCK
+            )
+        elif self.quant == "mxfp8":
+            a_scale = _flatten_mxfp8_a_scale(a_scale, m, self.k)
+        else:
+            a_scale = _flatten_a_scale(a_scale, m, self.k // SCALE_BLOCK_K)
         plan = self._compiled(m, logical_m)
         stream = fx.Stream(torch.cuda.current_stream())
         plan.gemm(
             a_fp8.contiguous().view(torch.int8).view(-1),
             b_preshuffled.contiguous().view(torch.int8).view(-1),
             plan.input.view(-1),
-            (
-                _flatten_mxfp8_a_scale(a_scale, m, self.k)
-                if self.quant == "mxfp8"
-                else _flatten_a_scale(a_scale, m, self.k // SCALE_BLOCK_K)
-            ),
+            a_scale,
             b_scale.reshape(-1),
             m,
             self.n,
@@ -1132,7 +1176,6 @@ class GemmAllReduceOp:
         """
         if self.mem is None:
             raise RuntimeError("this GemmAllReduceOp has been closed")
-        mxfp8 = self.quant == "mxfp8"
         kb = self.k // SCALE_BLOCK_K
         for name, t, shape in (
             ("a_fp8", a_fp8, (m, self.k)),
@@ -1152,8 +1195,11 @@ class GemmAllReduceOp:
         # an element on A and one per 32x32 block on B. blockscale's are fp32.
         # The dtype is load-bearing on both: the kernel indexes dwords, so a
         # tensor of the right element count in the wrong dtype spans the wrong
-        # bytes and returns finite nonsense.
-        if mxfp8:
+        # bytes and returns finite nonsense. mxfp8_raw's are checked where
+        # they are flattened, in __call__.
+        if self.quant == "mxfp8_raw":
+            return
+        if self.quant == "mxfp8":
             want_dtype = torch.int32
             sizes = (
                 ("a_scale", a_scale, m * self.k // (4 * MXFP8_BLOCK)),

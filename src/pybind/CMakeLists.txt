@@ -18,12 +18,12 @@ else()
 endif()
 
 set(Python_EXECUTABLE ${PYTHON_EXECUTABLE})
-find_package(Python REQUIRED COMPONENTS Interpreter Development)
+# Development.Module, not Development: the modules never link libpython, and the
+# manylinux interpreters the published wheels are built with do not ship one.
+find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 
 set(PYTHON_INCLUDE_DIRS ${Python_INCLUDE_DIRS})
-set(PYTHON_LIBRARIES ${Python_LIBRARIES})
 message(STATUS "Python include dirs: ${PYTHON_INCLUDE_DIRS}")
-message(STATUS "Python libraries: ${PYTHON_LIBRARIES}")
 
 execute_process(
   COMMAND ${PYTHON_EXECUTABLE} -c

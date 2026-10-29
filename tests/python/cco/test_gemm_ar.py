@@ -417,8 +417,21 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     assert rel < 3e-3, f"blockscale relL2 {rel:.3e} against the fp32 reference"
 
 
-@pytest.mark.parametrize("m,n,k", [(1024, 512, 512), (2048, 5120, 2048)])
-def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
+@pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
+@pytest.mark.parametrize(
+    "m,n,k",
+    # K=256, 640 and 1280 put the raw path's last scale chunk at 2, 1 and 2 of
+    # its 4 K steps: one chunk only, then the prologue's two, then one refilled
+    # in the loop.
+    [
+        (1024, 512, 256),
+        (1024, 512, 512),
+        (1024, 512, 640),
+        (2048, 5120, 1280),
+        (2048, 5120, 2048),
+    ],
+)
+def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant):
     """``quant="mxfp8"`` -- DeepSeek-V4.1-Flash's quantisation -- against fp32.
 
     32-wide ue8m0 on both sides, which is the scaled MFMA's own operand format:
@@ -477,17 +490,22 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
         swap_ab=True,
         permlane=True,
         lane_transpose=True,
-        quant="mxfp8",
+        quant=quant,
     )
+    if quant == "mxfp8_raw":
+        # The quantiser's own row-major bytes, staged through LDS.
+        sa, sb = ea.to(torch.uint8).reshape(-1), eb.to(torch.uint8).reshape(-1)
+    else:
+        # A goes through preshuffle_a_scale (K-block major, four M tiles to a
+        # dword); B stays K-block major [K/32, N/32] int32.
+        sa, sb = preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
     ours = torch.zeros(m, n, device="cuda", dtype=torch.bfloat16)
     gemm(
         a.contiguous().view(torch.int8).view(-1),
         b_shuf.contiguous().view(torch.int8).view(-1),
         ours.view(-1),
-        # A goes through preshuffle_a_scale (K-block major, four M tiles to a
-        # dword); B stays K-block major [K/32, N/32] int32.
-        preshuffle_a_scale(ea),
-        eb.t().reshape(-1).contiguous(),
+        sa,
+        sb,
         m,
         n,
         0,
@@ -497,7 +515,7 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k):
     torch.cuda.synchronize()
 
     rel = ((ours.float() - ref).norm() / rn).item()
-    assert rel < 3e-3, f"mxfp8 relL2 {rel:.3e} against the fp32 reference"
+    assert rel < 3e-3, f"{quant} relL2 {rel:.3e} against the fp32 reference"
 
 
 @pytest.mark.parametrize("m,n,k", [(512, 512, 256), (4096, 7168, 1024)])

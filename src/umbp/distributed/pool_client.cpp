@@ -851,6 +851,7 @@ std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig
       ownership.prefault = config.dram.prefault;
       ownership.numa_strict = config.dram.numa_strict;
       ownership.prefault_threads = config.dram.prefault_threads;
+      ownership.max_mr_bytes = config.dram.max_mr_bytes;
       return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
                              /*pending_ttl=*/std::chrono::milliseconds{30000},
                              /*read_lease_ttl=*/DramReadLeaseTtl());
@@ -1296,10 +1297,11 @@ bool PoolClient::Init() {
   }
 
   // Start the async re-cache worker only when something can feed it and this
-  // node has an exportable local medium to install into.  Two independent
-  // producers share it: cache_remote_fetches (whole-object BatchGet) and
-  // ranged_locality_prefetch (remote ranged reads).
-  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch) &&
+  // node has an exportable local medium to install into.  Three independent
+  // producers share it: cache_remote_fetches (whole-object BatchGet),
+  // ranged_locality_prefetch (remote ranged reads) and BatchPrefetch.
+  if ((config_.cache_remote_fetches || config_.ranged_locality_prefetch ||
+       config_.prefetch_budget_bytes > 0) &&
       registry_.Get(medium_) != nullptr) {
     {
       std::lock_guard<std::mutex> lk(recache_mutex_);
@@ -1575,6 +1577,14 @@ std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t siz
   auto reg = FindRegisteredMemory(ptr, size);
   if (reg.has_value()) return {reg->first, reg->second};
   return {ClassifiedUserBytes(ptr, size), 0};
+}
+
+int PoolClient::SourceNumaHint(const void* src, size_t size) const {
+  const int gpu_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
+  if (gpu_node >= 0) return gpu_node;
+  const auto reg = FindRegisteredMemory(src, size);
+  if (reg && reg->first.loc == mori::io::MemoryLocationType::CPU) return reg->first.mem.numaNode;
+  return -1;
 }
 
 int PoolClient::PreferredNumaNodeFor(void* ptr, size_t size) const {
@@ -2233,8 +2243,11 @@ void PoolClient::MaybeInstallCompleteArenaObject(const std::string& key, const v
 
 void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_size,
                                           const RouteGetResult& route) {
-  if (!LocalityPrefetchAdmits(object_size)) return;
+  if (LocalityPrefetchAdmits(object_size)) QueueWholeObjectPull(key, object_size, route);
+}
 
+bool PoolClient::QueueWholeObjectPull(const std::string& key, size_t object_size,
+                                      const RouteGetResult& route) {
   ReCacheJob job;
   job.key = key;
   job.size = object_size;
@@ -2242,16 +2255,17 @@ void PoolClient::MaybePrefetchWholeObject(const std::string& key, size_t object_
 
   {
     std::lock_guard<std::mutex> lk(recache_mutex_);
-    if (recache_stop_) return;
+    if (recache_stop_) return false;
     if (recache_queue_.size() >= recache_queue_max_) {
       recache_stats_.queue_full.fetch_add(1, std::memory_order_relaxed);
-      return;
+      return false;
     }
-    if (!prefetch_inflight_.insert(key).second) return;  // already queued or running
+    if (!prefetch_inflight_.insert(key).second) return false;  // already queued or running
     recache_queue_.push_back(std::move(job));
   }
   recache_stats_.admitted.fetch_add(1, std::memory_order_relaxed);
   recache_cv_.notify_one();
+  return true;
 }
 
 void PoolClient::FetchWholeObjectsIntoMedium(std::vector<ReCacheJob>& jobs) {
@@ -2515,7 +2529,7 @@ std::vector<bool> PoolClient::BatchPut(const std::vector<std::string>& keys,
 PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
     const std::vector<std::string>& keys, const std::vector<const void*>& srcs,
     const std::vector<size_t>& sizes, const std::vector<std::optional<RoutePutResult>>& routes,
-    std::vector<PutEntryOutcome>* results) {
+    std::vector<PutEntryOutcome>* results, const std::vector<int>* numa_hints) {
   BatchPutPlan plan;
   const size_t count = keys.size();
   for (size_t i = 0; i < count; ++i) {
@@ -2543,7 +2557,12 @@ PoolClient::BatchPutPlan PoolClient::PartitionBatchPutTargets(
     // put path is the same for all of them.  The old DRAM/HBM allowlist here
     // silently dropped puts master routed to a peer's SSD.
     plan.remote_groups[route.node_id].push_back(BatchPutItem{
-        .index = i, .key = &keys[i], .src = srcs[i], .size = sizes[i], .route = route});
+        .index = i,
+        .key = &keys[i],
+        .src = srcs[i],
+        .size = sizes[i],
+        .route = route,
+        .numa_hint = numa_hints != nullptr && i < numa_hints->size() ? (*numa_hints)[i] : -1});
   }
   return plan;
 }
@@ -2820,6 +2839,8 @@ bool PoolClient::AllocateRemotePutEntries(const std::vector<BatchPutItem>& items
     entry->set_tier(static_cast<::umbp::TierType>(item.route.tier));
     entry->set_key(*item.key);
     entry->set_logical_tier(item.route.logical_tier);
+    const int numa = item.numa_hint >= 0 ? item.numa_hint : SourceNumaHint(item.src, item.size);
+    if (numa >= 0) entry->set_preferred_numa_node(numa);
   }
 
   ::umbp::BatchAllocateSlotsResponse alloc_resp;
@@ -4234,11 +4255,15 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     std::vector<size_t> sub_sizes;
     std::vector<std::optional<RoutePutResult>> sub_routes;
     std::vector<size_t> sub_originals;
+    // The writer's GPU node per object: its bytes leave from the shared arena, whose
+    // node says nothing about where the reader of the object will be.
+    std::vector<int> sub_numa;
     sub_keys.reserve(count);
     sub_srcs.reserve(count);
     sub_sizes.reserve(count);
     sub_routes.reserve(count);
     sub_originals.reserve(count);
+    sub_numa.reserve(count);
     // Assemble EVERY object in this arena round with ONE transfer.
     //
     // This used to copy per key, and each of those copies was a
@@ -4289,6 +4314,9 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
       sub_keys.push_back(keys[original]);
       sub_srcs.push_back(slice);
       sub_sizes.push_back(object_sizes[original]);
+      sub_numa.push_back(srcs[original].empty()
+                             ? -1
+                             : SourceNumaHint(srcs[original].front(), sizes[original].front()));
       sub_routes.push_back(routes[route_index]);
       sub_originals.push_back(original);
     }
@@ -4296,7 +4324,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     if (!sub_keys.empty()) {
       std::vector<PutEntryOutcome> outcomes(sub_keys.size(), PutEntryOutcome::kFailed);
       BatchPutPlan plan =
-          PartitionBatchPutTargets(sub_keys, sub_srcs, sub_sizes, sub_routes, &outcomes);
+          PartitionBatchPutTargets(sub_keys, sub_srcs, sub_sizes, sub_routes, &outcomes, &sub_numa);
       ExecuteBatchPutPlan(plan, &outcomes);
       for (size_t j = 0; j < outcomes.size(); ++j) {
         results[sub_originals[j]] = outcomes[j] != PutEntryOutcome::kFailed;
@@ -4957,6 +4985,36 @@ void PoolClient::FinalizeRemoteGetEntries(std::vector<RemoteGetEntry>& entries,
 bool PoolClient::Exists(const std::string& key) {
   auto v = BatchExists({key});
   return !v.empty() && v.front();
+}
+
+size_t PoolClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (!initialized_ || default_pool_ == nullptr || config_.prefetch_budget_bytes == 0) return 0;
+  const auto here = default_pool_->BatchContains(keys);
+  std::vector<std::string> local;
+  std::vector<size_t> elsewhere;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    if (i < here.size() && here[i]) {
+      local.push_back(keys[i]);
+    } else {
+      elsewhere.push_back(i);
+    }
+  }
+  size_t started = default_pool_->Prefetch(local, config_.prefetch_budget_bytes);
+  if (elsewhere.empty() || !CanInstallLocally()) return started;
+
+  // Pulled from their owners into this node's medium, so the read is local.
+  std::vector<std::optional<RouteGetResult>> routes(keys.size());
+  if (!RouteGetsInto(keys, elsewhere, /*exclude_self=*/true, &routes)) return started;
+  for (size_t i : elsewhere) {
+    const auto& route = routes[i];
+    if (route.has_value() &&
+        ShouldAdmitReCache(/*cache_remote_fetches=*/true, config_.cache_remote_admission,
+                           config_.admission_max_block_bytes, route->size) &&
+        QueueWholeObjectPull(keys[i], route->size, *route)) {
+      ++started;
+    }
+  }
+  return started;
 }
 
 std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) {

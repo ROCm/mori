@@ -50,8 +50,9 @@ the final buffer. The policy JSON's DRAM `numa_node` also accepts a list:
 ```
 
 Policy-created DRAM backends inherit the configured hugepage, prefault, strict
-binding and prefault thread options. Python exposes `dram.numa_nodes`,
-`dram.numa_strict`, and `dram.prefault_threads`. The deprecated `dram.numa_node`
+binding, prefault thread and memory-region size options. Python exposes
+`dram.numa_nodes`, `dram.numa_strict`, `dram.prefault_threads`, and
+`dram.max_mr_bytes`. The deprecated `dram.numa_node`
 property reads the first node (or `-1`); assigning it replaces the entire list.
 The standalone client's child server receives the same configuration.
 
@@ -67,6 +68,15 @@ satisfy a request, contiguous pages are preferred over scattered pages within
 that buffer. Otherwise, a global capacity check precedes allocation of the
 local remainder and then pages from other buffers. Insufficient global space
 leaves all bitmaps unchanged. HBM and SSD backends ignore the hint.
+
+A host buffer larger than `UMBP_DRAM_MAX_MR_BYTES` (default 512 GiB) is
+registered with the NIC as several memory regions of at most that size, in
+whole backing and allocator pages. AMD Pensando AINIC translates only the first
+2^18 page entries of a memory region and silently aliases the rest, so the
+limit must not exceed 2^18 backing pages: 512 GiB with 2 MiB pages, 1 GiB with
+4 KiB pages. `0` registers each buffer whole. Each region is its own buffer on
+the same node; a node preference takes the first of that node's regions that
+holds the request.
 
 Logical page spill and physical memory spill are distinct: the former uses
 another tier buffer when the local buffer is full; `MPOL_PREFERRED` also lets
@@ -86,6 +96,20 @@ prefault. GPU registration and the transfer path are unchanged.
 This policy favors locality over the opportunity to put an entire object in a
 remote contiguous run. Its net benefit depends on fragmentation and workload.
 It does not migrate existing objects or replicate shared keys across sockets.
+
+## Remote writes
+
+A write routed to another node carries the same advisory hint in its slot
+request: the node of the writer's GPU, also when a ranged put stages the bytes
+through the ranged PUT arena, otherwise the node of a registered host source.
+The peer prefers its regions on that node. Without a hint (a CPU caller, or a
+writer that sends none), a tier with buffers on several nodes starts on the node
+with the most free pages instead of the first one, so the nodes fill evenly; a
+tier on one node keeps its order.
+
+Each side of an RDMA transfer picks its NICs from the node of its own memory, so
+the object then travels between NICs on the same node at both ends when the
+reader is the GPU that wrote it.
 
 ## Measured effect
 

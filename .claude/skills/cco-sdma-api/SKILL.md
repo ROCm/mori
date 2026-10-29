@@ -78,6 +78,9 @@ Everything hangs off `ccoSdma sdma{devComm}`, constructed per kernel.
 | `quietQueue<Coop>(peer, queueId)` | wait until one queue has drained |
 | `quiet<Coop>(peer)` | wait until every queue toward `peer` has drained |
 | `waitSignal(srcRank, queueId, expected)` | wait for a signal counter to reach `expected` |
+| `putBroadcast(peer, dstWin, dstOff, peer2, dstWin2, dstOff2, srcWin, srcOff, bytes, queueId)` | one local source to two destinations in a single packet |
+| `postWaitMem(peer, queueId, win, off, value, cmp, mask)` | park a queue until a local flag holds — the engine polls, not a CU |
+| `postWaitSignal(peer, queueId, srcRank, sigQueueId, expected)` | `postWaitMem` on a signal slot |
 
 `put`/`get` are non-blocking: they place a packet and (unless `Aggregate`) ring
 the doorbell. Nothing has happened when they return — you must drain.
@@ -310,6 +313,84 @@ directly when the chunks are large (≳1 MB, where the 2 µs is noise), when the
 must stay free for compute, or when you want the data to land in place with no
 unpack on the receiver.
 
+## Engine-side wait and broadcast
+
+Two more packets, both gfx9 layouts validated on gfx950. On gfx12.5 they compile
+but trap when called, until the layouts are checked there; a multi-arch build
+still builds, and the caller must not reach them on gfx12.5.
+
+Unlike `put`, these post from a **single issuer** and do no lane grouping: thread
+scope posts one active lane at a time (several lanes are serialized, so they may
+share a queue), warp/block scope lets the leader post. Only
+`ccoSdmaOptFlagsAggregate` is accepted.
+
+### postWaitMem / postWaitSignal
+
+```cpp
+// park queue (next, q) until the local flag reads 1; the put behind it then runs
+sdma.postWaitMem(next, q, flagWin, 0, 1u);                  // cmp defaults to ccoSdmaCmpEq
+sdma.put<ccoCoopThread, false, true>(next, dstWin, 0, srcWin, 0, bytes, q);
+// kernel can return here: no CU is polling or has to ring anything later
+```
+
+The engine runs the queue in order, so everything posted after the wait runs only
+once it holds. `win`/`offset` address memory on **this** GPU (a flag a peer writes
+with `put`, a CU store, a host write). `cmp` is `ccoSdmaCmp{Always,Lt,Le,Eq,Ne,Ge,Gt}`
+on `(*addr & mask)`; only 32 bits are compared.
+
+`postWaitSignal(peer, q, srcRank, sigQueueId, expected)` waits on a signal slot, so
+one engine can forward what another delivered with no CU in the path:
+
+```cpp
+sdma.postWaitSignal(next, relayQ, prev, hopQ, 1);   // prev's hop landed
+sdma.put<ccoCoopThread, false, true>(next, fwdWin, 0, recvWin, 0, bytes, relayQ);
+```
+
+The engine compares 32 bits, so `expected` must stay below 2^32. A larger value is
+truncated and releases early: `2^32 + 5` waits for `low32 >= 5`, which a counter of
+100 already meets. Traps under `MORI_CCO_SDMA_DEBUG`.
+
+Pre-posting everything and ringing once is `postWaitMem<.., Aggregate>` +
+`put<.., Aggregate>` + `commit`.
+
+Measured on gfx950, flag set to copy complete, median of 100: a CU polling the flag
+and then issuing a put costs 7.1 µs at 4 KB, 8.5 µs at 64 KB; pre-placing the
+packets and having the CU only ring costs 5.9 / 7.3 µs; `postWaitMem` costs
+4.4 / 5.8 µs. The gap is a fixed ~1.5–3 µs and is gone by 16 MB. What it really buys
+is that no CU waits.
+
+Sharp edges: the queue is blocked until the condition holds, so anything else
+posted to it waits too, and a flag that never arrives parks it for good (retry is
+unbounded). A full ring spins the poster until the wait clears. Give a waiting queue
+its own `queueId`.
+
+### putBroadcast
+
+```cpp
+sdma.putBroadcast(next, recvWin, 0,  /*peer2=*/me, localCopyWin, 0,  sendWin, 0, bytes, q);
+```
+
+One COPY packet, two destinations; `peer`/`dstWin` is the first and selects the
+queue, `peer2` may be your own rank. `remoteSignal` bumps each distinct destination
+peer other than yourself once; `localSignal` is one atomic for the call.
+
+A signal slot counts per (source rank, `queueId`), not per physical queue. The
+broadcast is posted on queue `(peer, q)` but its remote signal bumps `peer2`'s
+`[you, q]` slot, which `put` only advances from queue `(peer2, q)`. A waiter that reads
+the count as "the Nth packet on `(peer2, q)` has landed" can be released by a
+broadcast's signal while an earlier `put` on `(peer2, q)` is still in flight; only
+the cumulative total is reliable. If you wait on per-queue completion, give
+broadcasts their own `queueId`.
+
+**Do not reach for it to save time.** One engine does not overlap the two writes:
+broadcast to two remote GPUs ran at 38 GB/s against 61 GB/s for two `put`s on one
+queue (122 GB/s for two `put`s on two queues), and local + remote was the same 43 vs
+61. It was faster only when both destinations are local (68 vs 61 GB/s). For
+fan-out to peers, issue puts on separate queues.
+
+The packet is 36 B, so it takes two ring units plus one of slack that is padded with
+a NOP, so the packet is never split across the ring end.
+
 ## Failure modes
 
 | symptom | cause |
@@ -321,6 +402,9 @@ unpack on the receiver.
 | a `put` inside an `Aggregate` batch never returns | over 256 KB − 32 B posted on one queue without `commit` — commit sooner. Traps under `MORI_CCO_SDMA_DEBUG` |
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
+| a queue stops moving after `postWaitMem` | the flag never reached the value, or it points at another GPU's memory — `win`/`offset` must be local |
+| `putBroadcast`/`postWait*` trap | gfx12.5 build: those packet layouts are not validated there |
+| `postWaitSignal` releases too early | `expected` is 2^32 or more and was truncated to 32 bits |
 
 Build with `-DMORI_CCO_SDMA_DEBUG` when any of these appear: it turns the
 misuse checks into traps at the offending call instead of a hang or corruption.

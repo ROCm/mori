@@ -170,6 +170,7 @@ def _detect_missing_umbp_deps() -> list:
             [
                 "/usr/include/grpcpp/grpcpp.h",
                 "/usr/include/x86_64-linux-gnu/grpcpp/grpcpp.h",
+                "/usr/local/include/grpcpp/grpcpp.h",
             ],
             "libgrpc++-dev",
         ),
@@ -177,6 +178,7 @@ def _detect_missing_umbp_deps() -> list:
             [
                 "/usr/include/google/protobuf/message.h",
                 "/usr/include/x86_64-linux-gnu/google/protobuf/message.h",
+                "/usr/local/include/google/protobuf/message.h",
             ],
             "libprotobuf-dev",
         ),
@@ -736,6 +738,9 @@ class CMakeBuild(build_ext):
         cmake_args = [
             "cmake",
             "-DUSE_ROCM=ON",
+            # Otherwise src/pybind/CMakeLists.txt builds the modules for whichever
+            # python3 is first on PATH, not for the interpreter running this build.
+            f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DWARP_ACCUM_UNROLL={unroll_value}",
             f"-DBUILD_SHMEM_DEVICE_WRAPPER={build_shmem_device_wrapper}",
@@ -1112,6 +1117,7 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
+    "io/sim_catalog.yaml",  # MORI_IO_SIM_CATALOG timing for measured hardware
     "tools/*.sh",
     "tools/mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)

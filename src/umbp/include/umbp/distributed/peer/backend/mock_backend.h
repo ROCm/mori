@@ -109,11 +109,18 @@ class MockBackend : public MediumBackend {
     auto_flush_cb_ = std::move(cb);
   }
 
+  // Every allocation's preferred_numa_node, in arrival order (test introspection).
+  std::vector<int> AllocateNumaHints() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return allocate_numa_hints_;
+  }
+
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& entries) override {
     std::vector<AllocateResult> out(entries.size());
     std::lock_guard<std::mutex> lock(mutex_);
     for (size_t i = 0; i < entries.size(); ++i) {
       const auto& req = entries[i];
+      allocate_numa_hints_.push_back(req.preferred_numa_node);
       if (req.size == 0) {
         out[i].outcome = AllocateOutcome::kFailed;
         continue;
@@ -276,6 +283,7 @@ class MockBackend : public MediumBackend {
   uint64_t page_size_ = 1;
   bool initialized_ = false;
   mutable std::mutex mutex_;
+  std::vector<int> allocate_numa_hints_;
   uint64_t next_slot_id_ = 1;
   std::unordered_map<uint64_t, PendingSlot> pending_;
   std::unordered_map<std::string, std::vector<uint8_t>> owned_;

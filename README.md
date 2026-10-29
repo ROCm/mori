@@ -194,6 +194,7 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 ### Prerequisites
 
 - ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+  - On RHEL/Rocky/AlmaLinux also install `gcc-c++`: that JIT needs the C++ standard headers, which ROCm's RPMs do not pull in. Without them every kernel compile fails with `Could not find standard C++ header 'cmath'`.
 - System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
   - `libibverbs-dev`, `ibverbs-utils`
   See [docker/Dockerfile.dev](https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev) for the full apt list used in CI/dev images.

@@ -242,6 +242,12 @@ m_pad = op.padded_m(x.shape[0])
 a_fp8, a_exps = quantize_mxfp8(op.pad_rows(x, m_pad))   # pad before quantising
 out = op(a_fp8, b_shuffled, preshuffle_a_scale(a_exps), b_scale)[: x.shape[0]]
 
+# Or with the scales exactly as the quantiser and the checkpoint have them --
+# faster, any M, no shuffle. See "Row-major scales through LDS" below.
+op_raw = Mxfp8GemmOp(n=N, k=K, quant="mxfp8_raw")
+a_fp8, a_exps = quantize_mxfp8(x)
+out = op_raw(a_fp8, b_shuffled, a_exps, w_exps)
+
 # Decode. No padding and none needed; M is a runtime argument, and both scales
 # go in as the checkpoint stores them -- w_exps itself, not b_scale.
 assert supports_gemv(N, K)
@@ -249,10 +255,11 @@ gemv = Mxfp8GemvOp(n=N, k=K)
 out = gemv(x_fp8, b_shuffled, x_exps, w_exps)
 ```
 
-**They share the weight and not the scales.** `preshuffle_b` output serves both,
-so a server shuffles once. But `Mxfp8GemmOp` wants the A scale through
-`preshuffle_a_scale` -- K-block major, four M tiles to a dword -- while
-`Mxfp8GemvOp` takes **both scales exactly as the checkpoint stores them**,
+**They share the weight and, with `quant="mxfp8_raw"`, the scales too.**
+`preshuffle_b` output serves both, so a server shuffles once. The default
+`quant="mxfp8"` wants the A scale through `preshuffle_a_scale` -- K-block major,
+four M tiles to a dword -- while `Mxfp8GemvOp` and `"mxfp8_raw"` take **both
+scales exactly as the checkpoint stores them**,
 row-major ue8m0 bytes, `[M, K/32]` and `[N/32, K/32]`. That is not an
 inconsistency: the GEMM's sixteen lanes want sixteen *rows* of one K block and
 have to be coalesced, where the GEMV's are sixteen *tokens*, M is at most 32, and
@@ -501,6 +508,45 @@ state, so the mainloop is untouched.
 the permutation stays inside the 64 bytes one program already owns, so it is
 address arithmetic rather than traffic, and measures slightly *faster* than the
 stock kernel.
+
+**Row-major scales through LDS (`quant="mxfp8_raw"`) beat both, cold and at
+large M** (the table below has where they do not). The packed
+layout fixes the addresses but still reads from global once per K step, and that
+costs in two ways the counters above do not show. The MFMA that consumes a scale
+waits for it with `vmcnt`, which retires in issue order, so it also waits for
+the tile prefetches issued before it: 63 `vmcnt` waits in the K=2048 kernel.
+And the scale registers stay live across the step in a kernel already at 256
+VGPRs, which spills 8 of them at K=512. `"mxfp8_raw"`, after aiter's
+`ScaleRawLds`, has each wave copy its share of four K steps of scales into LDS
+with `buffer_load ... lds`, double-buffered, and read them back with
+`ds_read_u8`: 20 `vmcnt` waits, no spill at K=512. The row-major address problem
+does not come back, because the copy moves 16 bytes of a row per lane and the
+reads are LDS. GEMM only, MI355X, graph-timed, idle-gated, min of three passes
+with the two alternating:
+
+| M x N x K | tile | `mxfp8` cold | `mxfp8_raw` cold | | hot |
+|---|---|---:|---:|---:|---:|
+| 64 x 8192 x 1280 | 256x128 | 14.5 | 12.4 | -14.6% | +4.5% |
+| 1024 x 8192 x 1280 | 256x128 | 19.6 | 17.8 | -9.2% | +0.1% |
+| 64 x 5120 x 2048 | 256x128 | 18.8 | 16.7 | -11.4% | +6.0% |
+| 1024 x 5120 x 2048 | 256x128 | 22.5 | 20.2 | -10.4% | -0.2% |
+| 4096 x 5120 x 2048 | 256x256 | 51.6 | 48.5 | -5.9% | -5.8% |
+| 16384 x 5120 x 2048 | 256x256 | 149.2 | 146.5 | -1.8% | -2.3% |
+| 4096 x 7168 x 256 | 256x256 | 17.9 | 17.4 | -2.3% | -2.2% |
+| 16384 x 7168 x 512 | 256x256 | 86.7 | 76.7 | -11.5% | -12.0% |
+| 8192 x 7168 x 640 | 256x256 | 50.7 | 51.2 | +0.9% | +2.0% |
+| 8192 x 7168 x 1280 | 256x256 | 78.6 | 77.0 | -2.1% | -2.5% |
+| 4096 x 7168 x 2048 | 256x256 | 56.8 | 54.8 | -3.5% | -2.6% |
+| 16384 x 7168 x 2048 | 256x256 | 209.1 | 201.7 | -3.5% | -2.9% |
+| 32768 x 7168 x 1792 | 256x256 | 424.4 | 394.8 | -7.0% | -6.7% |
+| 8192 x 7168 x 4096 | 256x256 | 194.2 | 191.8 | -1.2% | -0.8% |
+
+Cold is the number a forward pass sees. The two places it loses are where the
+staging is not amortised: K=640 is five K steps in two chunks, and hot at M=64
+copies 256 rows of A scale for 64 real ones. It also takes any M, since there is
+no packed group to pad to. `"mxfp8"` stays the default so that callers whose
+quantiser writes the packed layout keep working; new callers should take
+`"mxfp8_raw"`.
 
 **Against the alternatives**, bf16 in and bf16 out, the whole pipeline including
 quantisation, M=16384:

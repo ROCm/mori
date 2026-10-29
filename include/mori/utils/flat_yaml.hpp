@@ -159,5 +159,18 @@ inline long GetInt(const FlatMap& map, const std::string& key, long fallback,
   return v;
 }
 
+inline double GetDouble(const FlatMap& map, const std::string& key, double fallback,
+                        const std::string& where) {
+  auto it = map.find(key);
+  if (it == map.end()) return fallback;
+  const char* s = it->second.c_str();
+  char* end = nullptr;
+  double v = std::strtod(s, &end);
+  if (end == s || *end != '\0') {
+    throw std::runtime_error(where + ": " + key + " must be a number, got '" + it->second + "'");
+  }
+  return v;
+}
+
 }  // namespace yaml
 }  // namespace mori

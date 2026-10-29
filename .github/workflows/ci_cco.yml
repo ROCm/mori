@@ -102,7 +102,8 @@ jobs:
           $CT exec -e MORI_ENABLE_SDMA=1 $CONTAINER bash -c "\
             cd $GITHUB_WORKSPACE && \
             for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge \
-                     test_sdma_signal test_sdma_warp_issue; do \
+                     test_sdma_signal test_sdma_warp_issue test_sdma_put2d \
+                     test_sdma_put2d_shapes test_sdma_wait_broadcast; do \
               echo \"=== \$t ===\" && \
               out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1) || { echo \"\$out\"; exit 1; }; \
               echo \"\$out\"; \
