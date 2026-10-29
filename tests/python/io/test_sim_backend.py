@@ -24,7 +24,6 @@
 Memory pointers are fake and never dereferenced; control flow, timing and
 notifications are real.
 """
-import glob
 import os
 import subprocess
 import sys
@@ -32,7 +31,6 @@ import time
 
 import pytest
 
-import mori.io
 from mori.cpp import io_sim_profile
 from mori.io import (
     BackendType,
@@ -294,27 +292,31 @@ def test_peer_death_fails_transfers_and_reports():
     assert st.Failed()
 
 
-def use_profile(sim_env, tmp_path, *texts):
-    """Profile files in order, with the fixture's per-value variables cleared."""
+def use_catalog(sim_env, tmp_path, *texts):
+    """Catalog files in order, with the fixture's per-value variables cleared."""
     for backend, profile in PROFILES.items():
         for k in profile:
             sim_env.delenv(f"MORI_IO_SIM_{backend}_{k}")
     paths = []
     for i, text in enumerate(texts):
-        paths.append(tmp_path / f"profile{i}.yaml")
+        paths.append(tmp_path / f"catalog{i}.yaml")
         paths[-1].write_text(text)
-    sim_env.setenv("MORI_IO_SIM_PROFILE", ",".join(map(str, paths)))
+    sim_env.setenv("MORI_IO_SIM_CATALOG", ",".join(map(str, paths)))
 
 
-def entry(backend, bw, lat=1, seg=0, op=0, extra=""):
+def entry(backend, hardware, bw, lat=1, seg=0, op=0, extra=""):
+    key = "gpu" if backend == "xgmi" else "nic"
     return (
-        f"- backend: {backend}\n  bandwidth_gbps: {bw}\n  latency_us: {lat}\n"
-        f"  per_segment_ns: {seg}\n  per_op_us: {op}\n{extra}"
+        f"- backend: {backend}\n  {key}: {hardware}\n  bandwidth_gbps: {bw}\n"
+        f"  latency_us: {lat}\n  per_segment_ns: {seg}\n  per_op_us: {op}\n{extra}"
     )
 
 
-def test_profile_file_sets_timing(sim_env, tmp_path):
-    use_profile(sim_env, tmp_path, entry("rdma", 20, lat=50, seg=1000, op=30))
+def test_catalog_entry_sets_timing(sim_env, tmp_path):
+    use_catalog(
+        sim_env, tmp_path, entry("rdma", "testnic", 20, lat=50, seg=1000, op=30)
+    )
+    sim_env.setenv("MORI_IO_SIM_NIC", "testnic")
     assert io_sim_profile(BackendType.RDMA) == {
         "bw_gbps": 20,
         "latency_us": 50,
@@ -330,16 +332,18 @@ def test_profile_file_sets_timing(sim_env, tmp_path):
     assert_close_ms(ms, model_ms(64 * MiB, 20, 50, 64, 1000, 30))
 
 
-def test_profile_files_layer_and_variables_win(sim_env, tmp_path):
-    use_profile(
+def test_catalogs_layer_and_variables_win(sim_env, tmp_path):
+    use_catalog(
         sim_env,
         tmp_path,
-        entry("rdma", 20) + entry("xgmi", 30),
-        "# a later file replaces the rdma entry only\n" + entry("rdma", 40),
+        entry("rdma", "testnic", 20) + entry("xgmi", "testgpu", 30),
+        "# a later file replaces the rdma entry only\n" + entry("rdma", "testnic", 40),
     )
+    sim_env.setenv("MORI_IO_SIM_GPU", "testgpu")
+    sim_env.setenv("MORI_IO_SIM_NIC", "testnic")
     assert io_sim_profile(BackendType.RDMA)["bw_gbps"] == 40
     assert io_sim_profile(BackendType.XGMI)["bw_gbps"] == 30
-    assert io_sim_profile(BackendType.TCP)["bw_gbps"] == 10  # built-in
+    assert io_sim_profile(BackendType.TCP)["bw_gbps"] == 10  # no tcp entry: the default
     sim_env.setenv("MORI_IO_SIM_RDMA_LATENCY_US", "7")
     assert io_sim_profile(BackendType.RDMA)["latency_us"] == 7
     assert io_sim_profile(BackendType.RDMA)["bw_gbps"] == 40
@@ -348,29 +352,41 @@ def test_profile_files_layer_and_variables_win(sim_env, tmp_path):
 @pytest.mark.parametrize(
     "text, error",
     [
-        ("- backend: rdma\n  bandwidth_gbps: 1\n", "missing latency_us"),
-        (entry("nvlink", 1), "backend must be rdma, tcp or xgmi"),
-        (entry("rdma", "fast"), "bandwidth_gbps must be a number"),
-        (entry("rdma", 0), "bandwidth must be positive"),
-        (entry("rdma", 1, extra="  per_op_ns: 3\n"), "unknown field 'per_op_ns'"),
-        (entry("rdma", 1) + entry("rdma", 2), "second entry for backend rdma"),
+        ("- backend: rdma\n  nic: n\n  bandwidth_gbps: 1\n", "missing latency_us"),
+        (entry("rdma", "n", 1).replace("  nic: n\n", ""), "missing nic"),
+        (
+            entry("xgmi", "g", 1, extra="  nic: n\n"),
+            "a xgmi entry names a gpu, not a nic",
+        ),
+        (entry("nvlink", "n", 1), "backend must be rdma, tcp or xgmi"),
+        (entry("rdma", "n", "fast"), "bandwidth_gbps must be a number"),
+        (entry("rdma", "n", 0), "bandwidth must be positive"),
+        (entry("rdma", "n", 1, extra="  per_op_ns: 3\n"), "unknown field 'per_op_ns'"),
+        (entry("rdma", "n", 1) + entry("rdma", "n", 2), "second rdma entry for nic n"),
     ],
 )
-def test_bad_profile_is_rejected(sim_env, tmp_path, text, error):
-    use_profile(sim_env, tmp_path, text)
+def test_bad_catalog_is_rejected(sim_env, tmp_path, text, error):
+    use_catalog(sim_env, tmp_path, text)
     with pytest.raises(RuntimeError, match=error):
         make_engine("pf")
 
 
-def test_shipped_profiles_load(sim_env):
-    shipped = glob.glob(
-        os.path.join(os.path.dirname(mori.io.__file__), "sim_profiles", "*.yaml")
-    )
-    assert shipped
-    for path in shipped:
-        sim_env.setenv("MORI_IO_SIM_PROFILE", path)
-        for backend in (BackendType.RDMA, BackendType.TCP, BackendType.XGMI):
-            io_sim_profile(backend)  # parses and checks every entry
+def test_unknown_hardware_lists_the_catalog(sim_env):
+    sim_env.setenv("MORI_IO_SIM_NIC", "nosuchnic")
+    with pytest.raises(
+        RuntimeError,
+        match="MORI_IO_SIM_NIC=nosuchnic is not in the catalog, "
+        "which has .*pollara400",
+    ):
+        make_engine("pf")
+
+
+def test_built_in_catalog(sim_env, tmp_path):
+    use_catalog(sim_env, tmp_path)
+    sim_env.setenv("MORI_IO_SIM_GPU", "mi355x")
+    sim_env.setenv("MORI_IO_SIM_NIC", "pollara400")
+    assert io_sim_profile(BackendType.XGMI)["bw_gbps"] == 61.4
+    assert io_sim_profile(BackendType.RDMA)["bw_gbps"] == 47.4
 
 
 if __name__ == "__main__" and "--target" in sys.argv:

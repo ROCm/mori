@@ -58,14 +58,17 @@ struct LinkProfile {
   std::chrono::nanoseconds latency{0};
   std::chrono::nanoseconds perSegment{0};
   std::chrono::nanoseconds perOp{0};  // link occupancy per transfer call
-  std::string source;                 // "built-in" or the profile file it came from
-  // The RDMA config a profile was measured with; -1 when the profile does not say.
+  bool calibrated{false};             // from a catalog entry
+  std::string source;                 // the entry, or why there is none
+  // The RDMA config a catalog entry was measured with; -1 when the entry does not say.
   int measuredQpPerTransfer{-1};
   int measuredNumWorkerThreads{-1};
 };
 
-// Built-in guesses, then each file in MORI_IO_SIM_PROFILE (comma-separated, a later file
-// replaces an earlier one per backend), then the per-value MORI_IO_SIM_<BACKEND>_* variables.
+// The catalog entry for MORI_IO_SIM_GPU (XGMI) or MORI_IO_SIM_NIC (RDMA, TCP), else uncalibrated
+// guesses, then the per-value MORI_IO_SIM_<BACKEND>_* variables. The catalog is
+// src/io/sim/catalog.yaml plus each file in MORI_IO_SIM_CATALOG (comma-separated); a later entry
+// for the same backend and hardware replaces an earlier one.
 LinkProfile LoadLinkProfile(BackendType type);
 // The profile a backend of this type would get now, for tools: bw_gbps, latency_us,
 // per_segment_ns, per_op_us.

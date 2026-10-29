@@ -195,73 +195,129 @@ std::string BackendTypeName(BackendType type) {
 
 namespace {
 
-const std::set<std::string> kProfileKeys = {"backend", "bandwidth_gbps", "latency_us",
+// From src/io/sim/catalog.yaml.
+#include "mori_io_sim_catalog.inc"
+
+const std::set<std::string> kCatalogKeys = {"backend", "gpu", "nic", "bandwidth_gbps", "latency_us",
                                             "per_segment_ns", "per_op_us", "qp_per_transfer",
                                             "num_worker_threads",
-                                            // Free text: what the numbers were measured on, since
-                                            // they change with each GPU and NIC generation.
-                                            "name", "gpu", "nic", "link", "measured", "notes"};
+                                            // Free text.
+                                            "hardware", "measured", "notes"};
 
 struct ProfileEntry {
   double gbps, latencyUs, segmentNs, opUs;
   int qpPerTransfer, numWorkerThreads;
+  std::string source;
 };
 
-// Validates every entry of the file and returns the one for `backend`, if any.
-std::optional<ProfileEntry> ReadProfileFile(const std::string& path, const std::string& backend) {
-  std::optional<ProfileEntry> found;
-  auto entries = yaml::LoadFlatList(path);
+// XGMI timing belongs to a GPU, RDMA and TCP timing to a NIC.
+std::string HardwareKey(const std::string& backend) { return backend == "xgmi" ? "gpu" : "nic"; }
+
+// (backend, GPU or NIC name) -> timing.
+using Catalog = std::map<std::pair<std::string, std::string>, ProfileEntry>;
+
+// Validates every entry; an entry replaces one with the same backend and hardware from an
+// earlier source.
+void AddToCatalog(Catalog& catalog, const std::vector<yaml::FlatMap>& entries,
+                  const std::string& source) {
+  std::set<std::pair<std::string, std::string>> seen;
   for (size_t i = 0; i < entries.size(); ++i) {
     const yaml::FlatMap& e = entries[i];
-    const std::string where = path + ": entry " + std::to_string(i + 1);
-    yaml::CheckKeys(e, kProfileKeys, where);
-    std::string name = yaml::GetString(e, "backend");
-    if (name != "rdma" && name != "tcp" && name != "xgmi") {
-      throw std::runtime_error(where + ": backend must be rdma, tcp or xgmi, got '" + name + "'");
+    const std::string where = source + ": entry " + std::to_string(i + 1);
+    yaml::CheckKeys(e, kCatalogKeys, where);
+    std::string backend = yaml::GetString(e, "backend");
+    if (backend != "rdma" && backend != "tcp" && backend != "xgmi") {
+      throw std::runtime_error(where + ": backend must be rdma, tcp or xgmi, got '" + backend +
+                               "'");
     }
-    for (const char* key : {"bandwidth_gbps", "latency_us", "per_segment_ns", "per_op_us"}) {
-      if (e.count(key) == 0) throw std::runtime_error(where + ": missing " + key);
+    const std::string key = HardwareKey(backend);
+    const std::string otherKey = key == "gpu" ? "nic" : "gpu";
+    if (e.count(otherKey)) {
+      throw std::runtime_error(where + ": a " + backend + " entry names a " + key + ", not a " +
+                               otherKey);
+    }
+    std::string hardware = yaml::GetString(e, key);
+    if (hardware.empty()) throw std::runtime_error(where + ": missing " + key);
+    for (const char* field : {"bandwidth_gbps", "latency_us", "per_segment_ns", "per_op_us"}) {
+      if (e.count(field) == 0) throw std::runtime_error(where + ": missing " + field);
     }
     ProfileEntry p{yaml::GetDouble(e, "bandwidth_gbps", 0, where),
                    yaml::GetDouble(e, "latency_us", 0, where),
                    yaml::GetDouble(e, "per_segment_ns", 0, where),
                    yaml::GetDouble(e, "per_op_us", 0, where),
                    static_cast<int>(yaml::GetInt(e, "qp_per_transfer", -1, where)),
-                   static_cast<int>(yaml::GetInt(e, "num_worker_threads", -1, where))};
+                   static_cast<int>(yaml::GetInt(e, "num_worker_threads", -1, where)),
+                   source};
     if (!(p.gbps > 0) || p.latencyUs < 0 || p.segmentNs < 0 || p.opUs < 0) {
       throw std::runtime_error(where + ": bandwidth must be positive and costs non-negative");
     }
-    if (name != backend) continue;
-    if (found) throw std::runtime_error(where + ": second entry for backend " + name);
-    found = p;
+    if (!seen.emplace(backend, hardware).second) {
+      throw std::runtime_error(where + ": second " + backend + " entry for " + key + " " +
+                               hardware);
+    }
+    catalog[{backend, hardware}] = p;
   }
-  return found;
+}
+
+Catalog LoadCatalog() {
+  Catalog catalog;
+  std::istringstream builtin(kBuiltinCatalog);
+  AddToCatalog(catalog, yaml::ParseFlatList(builtin, "built-in catalog"), "built-in catalog");
+  std::stringstream paths(mori::env::GetString("MORI_IO_SIM_CATALOG").value_or(""));
+  for (std::string path; std::getline(paths, path, ',');) {
+    if (!path.empty()) AddToCatalog(catalog, yaml::LoadFlatList(path), path);
+  }
+  return catalog;
+}
+
+std::string KnownHardware(const Catalog& catalog, const std::string& key) {
+  std::set<std::string> names;
+  for (const auto& item : catalog) {
+    if (HardwareKey(item.first.first) == key) names.insert(item.first.second);
+  }
+  std::string list;
+  for (const std::string& name : names) list += (list.empty() ? "" : ", ") + name;
+  return list.empty() ? "none" : list;
 }
 
 }  // namespace
 
 LinkProfile LoadLinkProfile(BackendType type) {
-  // Uncalibrated guesses, for when no profile is given: a 400G RoCE NIC, kernel TCP on a 100G
-  // NIC, one MI3xx XGMI link. Measured profiles are in python/mori/io/sim_profiles/.
-  ProfileEntry p{45.0, 5.0, 20.0, 0.0, -1, -1};
+  // Uncalibrated guesses, for hardware the catalog does not have: a 400G RoCE NIC, kernel TCP on
+  // a 100G NIC, one MI3xx XGMI link.
+  ProfileEntry p{45.0, 5.0, 20.0, 0.0, -1, -1, ""};
   if (type == BackendType::TCP) {
-    p = {10.0, 30.0, 200.0, 0.0, -1, -1};
+    p = {10.0, 30.0, 200.0, 0.0, -1, -1, ""};
   } else if (type == BackendType::XGMI) {
-    p = {50.0, 10.0, 0.0, 0.0, -1, -1};
+    p = {50.0, 10.0, 0.0, 0.0, -1, -1, ""};
   }
   LinkProfile out;
-  out.source = "built-in";
 
   std::string backend = BackendTypeName(type);
   std::transform(backend.begin(), backend.end(), backend.begin(),
                  [](unsigned char c) { return std::tolower(c); });
-  std::stringstream paths(mori::env::GetString("MORI_IO_SIM_PROFILE").value_or(""));
-  for (std::string path; std::getline(paths, path, ',');) {
-    if (path.empty()) continue;
-    if (auto entry = ReadProfileFile(path, backend)) {
-      p = *entry;
-      out.source = path;
+  const std::string key = HardwareKey(backend);
+  const std::string var = key == "gpu" ? "MORI_IO_SIM_GPU" : "MORI_IO_SIM_NIC";
+  Catalog catalog = LoadCatalog();
+  std::string hardware = mori::env::GetString(var.c_str()).value_or("");
+  if (hardware.empty()) {
+    out.source = "uncalibrated defaults: " + var + " is not set (the catalog has " +
+                 KnownHardware(catalog, key) + ")";
+  } else if (auto it = catalog.find({backend, hardware}); it != catalog.end()) {
+    p = it->second;
+    out.calibrated = true;
+    out.source = key + " " + hardware + " (" + p.source + ")";
+  } else {
+    bool known = false;
+    for (const auto& item : catalog) {
+      known |= HardwareKey(item.first.first) == key && item.first.second == hardware;
     }
+    if (!known) {
+      throw std::runtime_error(var + "=" + hardware + " is not in the catalog, which has " +
+                               KnownHardware(catalog, key));
+    }
+    out.source = "uncalibrated defaults: the catalog has no " + backend + " entry for " + key +
+                 " " + hardware;
   }
 
   const std::string prefix = "MORI_IO_SIM_" + BackendTypeName(type);
@@ -340,11 +396,8 @@ SimBackend::SimBackend(BackendType type, const EngineDesc& self, const IOEngineC
       sim::BackendTypeName(type_), self_.key, profile_.source, profile_.bytesPerNs,
       profile_.latency.count(), profile_.perSegment.count(), profile_.perOp.count(), timeScale_,
       enableNotification_, ctx_ ? static_cast<int>(ctx_->GetPort()) : -1);
-  if (profile_.source == "built-in") {
-    MORI_IO_WARN(
-        "SimBackend({}) uses uncalibrated built-in timing; set MORI_IO_SIM_PROFILE to a measured "
-        "profile (python/mori/io/sim_profiles/)",
-        sim::BackendTypeName(type_));
+  if (!profile_.calibrated) {
+    MORI_IO_WARN("SimBackend({}) uses {}", sim::BackendTypeName(type_), profile_.source);
   }
 }
 

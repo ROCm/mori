@@ -1100,7 +1100,6 @@ mori_package_data = [
     "_jit-sources/3rdparty/**/*.hpp",
     "_jit-sources/tools/**/*.py",
     "ops/tuning_configs/*.json",
-    "io/sim_profiles/*.yaml",  # MORI_IO_SIM_PROFILE timing profiles
     "tools/*.sh",
     "tools/mori.conf",
     "examples/cco/*",  # CCO C++ example binaries (only present when BUILD_EXAMPLES=ON)

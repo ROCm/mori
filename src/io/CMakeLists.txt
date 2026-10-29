@@ -26,6 +26,13 @@ target_include_directories(
 target_link_libraries(mori_io mori_application hip::host mori_logging
                       mori_ibv_shim)
 target_compile_definitions(mori_io PUBLIC MSGPACK_NO_BOOST)
+# Compile the simulation catalog in, so it needs no install path.
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/sim/catalog.yaml MORI_IO_SIM_CATALOG)
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mori_io_sim_catalog.inc
+     CONTENT "static const char kBuiltinCatalog[] = R\"mori_catalog(@MORI_IO_SIM_CATALOG@)mori_catalog\";\n"
+     @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS sim/catalog.yaml)
+target_include_directories(mori_io PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 if(ENABLE_IO_FAULT_INJECTION)
   target_sources(mori_io PRIVATE rdma/fault_injector.cpp)
   set_source_files_properties(rdma/fault_injector.cpp PROPERTIES LANGUAGE CXX)

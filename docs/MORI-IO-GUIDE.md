@@ -203,30 +203,46 @@ one link per direction, and transfers queue on it in order.
 |---------|-------------|
 | `MORI_IO_SIM_ENABLE` | `1` to simulate. |
 | `MORI_IO_SIM_BACKEND` | `tcp` or `xgmi`: simulate an RDMA request as that backend. TCP exists only in simulation. |
-| `MORI_IO_SIM_PROFILE` | Timing profile file(s), comma-separated. A later file replaces an earlier one's entry for the same backend, so one GPU generation's XGMI entry can be paired with another NIC's RDMA entry. Without a profile, built-in uncalibrated guesses are used and a warning is logged. |
-| `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value of the profile. |
+| `MORI_IO_SIM_GPU` | The GPU whose catalog entry times XGMI, for example `mi355x`. |
+| `MORI_IO_SIM_NIC` | The NIC whose catalog entries time RDMA and TCP, for example `pollara400`. |
+| `MORI_IO_SIM_CATALOG` | Catalog file(s) of your own, comma-separated, read after the built-in one. An entry replaces an earlier one for the same backend and GPU or NIC. |
+| `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value. |
 | `MORI_IO_SIM_TIME_SCALE` | Divide every delay by this factor. |
 | `MORI_NODE_ID` | Node identity for XGMI's same-node check, to simulate several nodes on one host. |
 
-Profiles are flat YAML, one entry per backend, and say what they were measured on, since the
-numbers change with each GPU and NIC generation. Measured profiles ship in
-`mori/io/sim_profiles/` (for example `mi355x_pollara400.yaml`):
+The timing of each backend comes from a catalog of measured hardware,
+[`src/io/sim/catalog.yaml`](https://github.com/ROCm/mori/blob/main/src/io/sim/catalog.yaml),
+which is compiled into the library. XGMI entries are per GPU and RDMA and TCP entries per NIC,
+since the numbers change with each generation:
 
 ```yaml
+- backend: xgmi
+  gpu: mi355x
+  bandwidth_gbps: 61.4
+  latency_us: 9
+  per_segment_ns: 19500
+  per_op_us: 0
+  hardware: "AMD Instinct MI355X, xGMI full mesh, 72 GB/s per direction per GPU pair"
+
 - backend: rdma
+  nic: pollara400
   bandwidth_gbps: 47.4
   latency_us: 20
   per_segment_ns: 255
   per_op_us: 4.3
   qp_per_transfer: 4        # the RDMA config it was measured with
   num_worker_threads: 4
-  gpu: "AMD Instinct MI355X (gfx950, CDNA 4), OAM, PCIe Gen5 x16"
-  nic: "AMD Pensando Pollara 400 (POLLARA-1Q400P), 1x 400GbE RoCEv2, ..."
+  hardware: "AMD Pensando Pollara 400, 400GbE"
 ```
 
+`MORI_IO_SIM_GPU=mi355x MORI_IO_SIM_NIC=pollara400` selects these. A name the catalog does not
+have is an error that lists the names it has. Without a selection, or for a backend the
+selected hardware has no entry for (TCP above), uncalibrated guesses are used and a warning is
+logged.
+
 RDMA timing depends on the config, so an engine whose `qp_per_transfer` or
-`num_worker_threads` differ from the profile's logs a warning. To profile other hardware or
-another config, run `tests/python/io/calibrate_sim.py` on it; its docstring has the steps. The
+`num_worker_threads` differ from the entry's logs a warning. To time other hardware or another
+config, put an entry with its measured numbers in a file passed with `MORI_IO_SIM_CATALOG`. The
 model does not cap a single transfer's bandwidth: without `enable_transfer_chunking`, one RDMA
 transfer alone reaches only about half the link, which the simulator does not reproduce.
 

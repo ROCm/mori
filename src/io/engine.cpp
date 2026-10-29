@@ -323,8 +323,8 @@ void IOEngine::CreateSimBackend(BackendType requested, const BackendConfig& beCo
   bool enableNotification = rdmaConfig ? rdmaConfig->enableNotification : true;
   auto backend = std::make_unique<SimBackend>(type, desc, config, enableNotification);
 
-  // RDMA timing depends on the QP and worker counts, so a profile measured with other counts
-  // is only an approximation.
+  // RDMA timing depends on the QP and worker counts, so a catalog entry measured with other
+  // counts is only an approximation.
   const sim::LinkProfile& profile = backend->Profile();
   if (type == BackendType::RDMA && rdmaConfig &&
       ((profile.measuredQpPerTransfer > 0 &&
@@ -332,7 +332,7 @@ void IOEngine::CreateSimBackend(BackendType requested, const BackendConfig& beCo
        (profile.measuredNumWorkerThreads > 0 &&
         profile.measuredNumWorkerThreads != rdmaConfig->numWorkerThreads))) {
     MORI_IO_WARN(
-        "Simulated RDMA profile {} was measured with qp_per_transfer={} num_worker_threads={}, "
+        "Simulated RDMA timing from {} was measured with qp_per_transfer={} num_worker_threads={}, "
         "this engine uses {} and {}",
         profile.source, profile.measuredQpPerTransfer, profile.measuredNumWorkerThreads,
         rdmaConfig->qpPerTransfer, rdmaConfig->numWorkerThreads);
