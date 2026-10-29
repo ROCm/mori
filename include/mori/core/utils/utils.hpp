@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include "mori/core/arch.hpp"
 #include "mori/hip_compat.hpp"
 // The device helpers below use HIP builtins (blockDim/threadIdx/__ballot/
 // __popcll/atomicCAS/...). Include the runtime directly so this header is
@@ -32,7 +33,10 @@
 // `warpSize` is only used by the __device__ helpers below. Define it as a macro
 // solely under device compilation.
 #ifndef warpSize
-#if defined(__GFX8__) || defined(__GFX9__)
+// MORI_WAVE32 first: CMake adds -D__GFX9__ to every pass of a fat build led by a gfx9 target.
+#if defined(MORI_WAVE32)
+#define warpSize 32
+#elif defined(__GFX8__) || defined(__GFX9__)
 #define warpSize 64
 #else
 #define warpSize 32

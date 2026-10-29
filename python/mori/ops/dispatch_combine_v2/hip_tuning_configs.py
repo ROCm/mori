@@ -46,6 +46,8 @@ name both halves); ``lookup`` still reads it as "fp4" for callers that pass
 
 from __future__ import annotations
 
+import functools
+
 from mori.ops import utils as _gpu
 
 # Models with no table of their own that reuse a tuned sibling's key.
@@ -61,6 +63,54 @@ def _device_key():
         return _MODEL_ALIAS.get(model, model)
     if _gpu.topology()[1] == 120500:  # gfx1250 has no MI model name
         return "gfx1250"
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _detected_arch():
+    try:
+        from mori.jit.config import detect_gpu_arch
+
+        return detect_gpu_arch()
+    except Exception:
+        return None
+
+
+def _device_keys():
+    """Table keys to try, most specific first. KFD reports gfx1250 for every ASIC
+    revision and either code target, so revision 0 is told apart by its revision (a
+    gfx1250-strict target implies it). It uses its own rows when it has them.
+    """
+    key = _device_key()
+    if key != "gfx1250":
+        return (key,)
+    rev = _gpu.asic_revision()
+    if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
+        return ("gfx1250-a0", "gfx1250")
+    return (key,)
+
+
+def _fit_cus(t: dict) -> dict:
+    """Blocks capped at the CU count: a gfx125x EP kernel holds a CU per block and
+    waits for its whole grid, so a wider grid never finishes."""
+    cu = _gpu.cu_count()
+    if cu <= 0:
+        return t
+    t["dispatch_block_num"] = min(t["dispatch_block_num"], cu)
+    t["combine_block_num"] = min(t["combine_block_num"], cu)
+    if t["schedule"]:
+        t["schedule"] = tuple(
+            (edge, min(db, cu), dw, min(cb, cu), cw)
+            for edge, db, dw, cb, cw in t["schedule"]
+        )
+    return t
+
+
+def _first_bucket(table, devs, *shape):
+    for dev in devs:
+        found = _bucket_key(table.get(dev, {}), *shape)
+        if found is not None:
+            return found
     return None
 
 
@@ -182,6 +232,47 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((4095, 64, 16), (None, 128, 16)),
         },
     },
+    # gfx1250 at ASIC revision 0 (gfx1250 or gfx1250-strict code), EP4, hidden 7168.
+    # Dispatch and combine hold one block per CU (LDS) while a block waits for the
+    # whole grid, and this part has fewer CUs than the 256-block gfx1250 rows assume,
+    # so those would hang on it.
+    # Graph-timed, median of 3 rounds; within 3% the smaller geometry wins.
+    "gfx1250-a0": {
+        (4, 7168, 8, None): {
+            None: ((1024, 64, 16), (4096, 64, 8), (None, 64, 16)),
+            "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
+            "fp4": (
+                (256, 64, 8),
+                (512, 128, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        (4, 7168, 9, None): {
+            None: ((1024, 64, 16), (None, 128, 16)),
+            "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+        (4, 7168, 6, None): {
+            None: ((64, 128, 16), (1024, 64, 16), (1536, 128, 16), (None, 64, 16)),
+            "fp8": ((1024, 64, 8), (1536, 64, 24), (2048, 64, 16), (None, 64, 32)),
+            "fp4": (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 64, 24),
+                (8192, 64, 32),
+                (None, 128, 16),
+            ),
+        },
+    },
 }
 
 # No dtype axis: combine reduces the bf16 staging region whatever dispatch carried,
@@ -211,6 +302,12 @@ _COMBINE_TABLE: dict = {
         # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
+    },
+    # ASIC revision 0, as its dispatch rows.
+    "gfx1250-a0": {
+        (4, 7168, 8, None): ((64, 64, 4), (None, 64, 8)),
+        (4, 7168, 9, None): ((256, 64, 4), (4096, 64, 8), (None, 64, 4)),
+        (4, 7168, 6, None): ((256, 64, 4), (None, 64, 8)),
     },
 }
 
@@ -260,10 +357,31 @@ _COMBINE_PUSH_TABLE: dict = {
                 (None, 128, 24),
             ),
         },
+        # ASIC revision 0, EP4. No 24-warp geometry: several times slower on this part.
+        "gfx1250-a0": {
+            (4, 7168, 6, None): ((256, 64, 8), (1024, 64, 16), (None, 128, 8)),
+            (4, 7168, 9, None): (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (1536, 128, 8),
+                (2048, 128, 16),
+                (4096, 192, 8),
+                (None, 128, 8),
+            ),
+        },
     },
     "fp4_blockwise_fp32": {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
+        },
+        "gfx1250-a0": {
+            (4, 7168, 6, None): (
+                (512, 64, 8),
+                (1024, 64, 16),
+                (4096, 128, 8),
+                (8192, 192, 8),
+                (None, 128, 8),
+            ),
         },
     },
     "fp8_blockwise": {
@@ -283,6 +401,11 @@ _COMBINE_PUSH_TABLE: dict = {
                 (16384, 128, 24),
                 (None, 64, 16),
             ),
+        },
+        # ASIC revision 0, EP4: no 24-warp geometry, as above.
+        "gfx1250-a0": {
+            (4, 7168, 6, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
+            (4, 7168, 9, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
         },
     },
 }
@@ -347,28 +470,19 @@ def lookup(
     re-tuned without touching the other.
     """
     base = _hip_default()
-    dev = _device_key()
-    disp = _bucket_key(
-        _DISPATCH_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-    )
+    devs = _device_keys()
+    shape = (world_size, hidden_dim, topk, experts_per_rank)
+    disp = _first_bucket(_DISPATCH_TABLE, devs, *shape)
     comb = None
     if quant_type in _COMBINE_PUSH_TABLE:
-        comb = _bucket_key(
-            _COMBINE_PUSH_TABLE[quant_type].get(dev, {}),
-            world_size,
-            hidden_dim,
-            topk,
-            experts_per_rank,
-        )
+        comb = _first_bucket(_COMBINE_PUSH_TABLE[quant_type], devs, *shape)
     if comb is None:
-        comb = _bucket_key(
-            _COMBINE_TABLE.get(dev, {}), world_size, hidden_dim, topk, experts_per_rank
-        )
+        comb = _first_bucket(_COMBINE_TABLE, devs, *shape)
     if disp is None or comb is None:
-        return base  # half a schedule is not a schedule
+        return _fit_cus(base)  # half a schedule is not a schedule
     # None is the "every dtype measured the same" key; an exact dtype overrides it.
     disp = disp.get(_DISPATCH_DTYPE_ALIAS.get(dtype, dtype)) or disp.get(None)
     if disp is None:
-        return base
+        return _fit_cus(base)
     base["schedule"] = _merge(disp, comb)
-    return base
+    return _fit_cus(base)

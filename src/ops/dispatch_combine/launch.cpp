@@ -452,7 +452,7 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
   //
   // Keyed on the RUNTIME arch, not on a build macro. It used to be #ifdef MORI_DISP_TDM, which is
   // the same condition the kernel used to compile its body under; now that the body is selected by
-  // __gfx1250__/__gfx1251__ alone, a host built without that macro would under-reserve LDS for a
+  // MORI_GFX125X alone, a host built without that macro would under-reserve LDS for a
   // kernel that stages tiles into it. detect_hardware() has already cached the arch string.
   detect_hardware();
   if (s_cached_arch.rfind("gfx125", 0) == 0) {

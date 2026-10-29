@@ -187,6 +187,12 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 
 ✅ Supported &emsp; 🚧 Under Development
 
+A gfx1250 device can run as `gfx1250` or as `gfx1250-strict`, depending on the runtime.
+MORI JIT-compiles its kernels for whichever target the device reports, so one install
+serves both. The exception is UMBP's prebuilt gather kernel: build with
+`gfx1250-strict` in `MORI_GPU_ARCHS` to use it there (without it UMBP copies through
+the copy engine).
+
 <!-- mori-installation-start -->
 
 ## Installation

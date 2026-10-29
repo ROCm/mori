@@ -42,7 +42,7 @@ try:
 except ImportError:
     _HAVE_CYTHON = False
 
-_supported_arch_list = ["gfx942", "gfx950", "gfx1250"]
+_supported_arch_list = ["gfx942", "gfx950", "gfx1250", "gfx1250-strict"]
 
 _REQUIRED_SYSTEM_DEPS: list = []
 
@@ -325,10 +325,10 @@ def _get_gpu_archs() -> str:
         if valid_arch_list:
             return ";".join(valid_arch_list)
 
-    print(
-        f"[mori] No GPU arch specified — building fat binary for {_supported_arch_list}"
-    )
-    return ";".join(_supported_arch_list)
+    # gfx1250-strict only by name or detection: older toolchains reject the target.
+    fat = [a for a in _supported_arch_list if not a.endswith("-strict")]
+    print(f"[mori] No GPU arch specified — building fat binary for {fat}")
+    return ";".join(fat)
 
 
 def _copy_jit_sources(root_dir: Path) -> None:

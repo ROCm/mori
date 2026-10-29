@@ -54,6 +54,12 @@
 #include "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp"
 #include "src/ops/dispatch_combine_v2/tdm_align.hpp"
 
+// The host picks this body by the "gfx125" arch prefix; the cco code it calls
+// keys on CCO_GFX125X. Fail here if the two ever disagree.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(CCO_GFX125X)
+#error "ep_intranode_1250x.hpp compiled for a target outside CCO_GFX125X"
+#endif
+
 namespace mori {
 namespace ops {
 namespace v2 {

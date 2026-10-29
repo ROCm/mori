@@ -1368,7 +1368,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 raise ValueError(f"{name} must be '0' or '1', got {value!r}")
             return value == "1"
 
-        early = flag("MORI_ASYNCLL_EARLY_NOTIFY", arch == "gfx1250")
+        early = flag("MORI_ASYNCLL_EARLY_NOTIFY", arch in ("gfx1250", "gfx1250-strict"))
         fused = flag("MORI_ASYNCLL_FUSED_RECV", False)
         skip_reset = flag("MORI_ASYNCLL_SKIP_RESET", early)
         if (fused or skip_reset) and not early:

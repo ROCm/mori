@@ -256,7 +256,7 @@ Bitcode search order in `find_bitcode()`:
 | `MORI_PRECOMPILE=1` | off | Pre-compile all kernels on `import mori` |
 | `MORI_DISABLE_JIT=1` | off | Disable bitcode JIT (error if no pre-built .bc) |
 | `MORI_JIT_CACHE_DIR` | `~/.mori/jit/` | Custom cache directory |
-| `MORI_GPU_ARCHS` | auto-detect | Override GPU architecture (e.g. `gfx942`) |
+| `MORI_GPU_ARCHS` | auto-detect | One arch overrides detection (e.g. `gfx942`, `gfx1250-strict`); a list (a build's targets) is used only when no GPU is detected |
 | `MORI_SHMEM_BC` | auto | Explicit path to shmem bitcode |
 | `USE_BNXT=ON` | auto-detect | Override NIC type to Broadcom BNXT |
 | `USE_IONIC=ON` | auto-detect | Override NIC type to AMD/Pensando IONIC |

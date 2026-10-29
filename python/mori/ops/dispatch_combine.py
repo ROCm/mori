@@ -353,7 +353,7 @@ def _is_gfx125x():
     """Whether this device takes the TDM code paths.
 
     Single source of truth on the host side, because three things have to agree with the kernel's
-    own `#if defined(__gfx1250__) || defined(__gfx1251__)` and with each other: which dispatch body
+    own `#if defined(MORI_GFX125X)` and with each other: which dispatch body
     runs, how much dynamic LDS is reserved for it, and what launch geometry it is given. They used
     to be keyed on the MORI_DISP_TDM env instead, which let all three disagree with the compiled
     kernel whenever the variable was unset.
