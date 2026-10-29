@@ -32,6 +32,8 @@
 namespace mori::umbp {
 
 // Allocation and transport composition; KV placement and control stay in PoolClient.
+// One instance per PoolClient. Its owning DistributedClient may share it for
+// allocations; engine observers must not be shared with another PoolClient.
 class PoolPlatform {
  public:
   struct Engines {
