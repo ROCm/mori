@@ -58,9 +58,12 @@ class ScopedEnv {
     setenv(key, value, 1);
   }
   ~ScopedEnv() {
-    if (old_) setenv(key_, old_->c_str(), 1);
-    else unsetenv(key_);
+    if (old_)
+      setenv(key_, old_->c_str(), 1);
+    else
+      unsetenv(key_);
   }
+
  private:
   const char* key_;
   std::optional<std::string> old_;
@@ -242,8 +245,9 @@ TEST_P(SimApiTest, SsdApisKeepSharedStorageVirtualAndGpuRegistrationsWork) {
     ScopedEnv mode("UMBP_ENABLE_GDS", gds ? "1" : "0");
     auto client = Client(config, GetParam());
     ASSERT_TRUE(client->RegisterMemory(ptr, 8 * kPage));
-    EXPECT_EQ(client->BatchPutRanges({"range"}, {2 * kPage}, {{ptr, ptr + kPage}},
-                                     {{kPage, kPage}}, {{0, kPage}}), std::vector<bool>{true});
+    EXPECT_EQ(client->BatchPutRanges({"range"}, {2 * kPage}, {{ptr, ptr + kPage}}, {{kPage, kPage}},
+                                     {{0, kPage}}),
+              std::vector<bool>{true});
     EXPECT_EQ(client->BatchGetRanges({"range"}, {{ptr}}, {{128}}, {{kPage - 64}}),
               std::vector<bool>{true});
     EXPECT_FALSE(client->Get("range", ptr, 3 * kPage));
@@ -256,8 +260,7 @@ TEST_P(SimApiTest, SsdApisKeepSharedStorageVirtualAndGpuRegistrationsWork) {
     EXPECT_GE(Clock::now() - start, gds ? 7ms : 3ms);
     if (gds) {
       const auto ranged_start = Clock::now();
-      EXPECT_EQ(client->BatchGetRanges({"gpu"}, {{ptr}}, {{128}}, {{64}}),
-                std::vector<bool>{true});
+      EXPECT_EQ(client->BatchGetRanges({"gpu"}, {{ptr}}, {{128}}, {{64}}), std::vector<bool>{true});
       EXPECT_GE(Clock::now() - ranged_start, 7ms);
     }
     EXPECT_TRUE(client->Clear());
@@ -343,8 +346,9 @@ TEST_F(SimTest, FilePathsPreserveGroupingBoundsAndRejectGpuWrites) {
   const auto file = engine.RegisterFile(123, 0, 2 * kPage);
   const auto gpu = TransferRef::HostBytes(ptr, 2 * kPage, MemLoc::GPU, 0);
   EXPECT_FALSE(engine.CanHandle(gpu, file));
-  auto items = std::vector<TransferItem>{{small, 0, engine.RegisterFile(123, 0, kPage), 0, kPage, 0},
-                                         {large, kPage, file, kPage, kPage, 1}};
+  auto items =
+      std::vector<TransferItem>{{small, 0, engine.RegisterFile(123, 0, kPage), 0, kPage, 0},
+                                {large, kPage, file, kPage, kPage, 1}};
   auto plans = engine.Plan(items);
   ASSERT_EQ(plans.plans.size(), 1u);
   EXPECT_EQ(plans.plans.front().src.size, 2 * kPage);
@@ -353,8 +357,8 @@ TEST_F(SimTest, FilePathsPreserveGroupingBoundsAndRejectGpuWrites) {
   items.push_back({large, 0, engine.RegisterFile(124, 0, 2 * kPage), 0, kPage, 2});
   EXPECT_EQ(engine.Plan(items).plans.size(), 2u);  // Distinct files cannot merge.
   EXPECT_FALSE(engine.Transfer({{file, 0, small, kPage, 1, 0}}, nullptr));
-  EXPECT_FALSE(engine.Transfer({{engine.RegisterFile(125, INT64_MAX, kPage), 0, small, 0, 1, 0}},
-                               nullptr));
+  EXPECT_FALSE(
+      engine.Transfer({{engine.RegisterFile(125, INT64_MAX, kPage), 0, small, 0, 1, 0}}, nullptr));
   const auto start = Clock::now();
   EXPECT_TRUE(engine.Transfer({{file, 0, gpu, 0, kPage, 0}}, nullptr));
   EXPECT_GE(Clock::now() - start, 7ms);
@@ -376,8 +380,10 @@ TEST_F(SimTest, SsdSingleFlightCopyFailureWakesWholeAndRangeFollowers) {
     ASSERT_TRUE(backend->BatchCommit({{slot.slot_id, "shared"}}).front().success);
     std::vector<ObjectExtent> extents{{kPage, kPage}};
     auto read = [&] {
-      return backend->BatchResolve({"shared"}, false, false, ResolveReader::kLocal,
-                                    ranged ? &extents : nullptr).front();
+      return backend
+          ->BatchResolve({"shared"}, false, false, ResolveReader::kLocal,
+                         ranged ? &extents : nullptr)
+          .front();
     };
     auto metric = [&](const char* name) {
       for (const auto& sample : backend->SampleMetrics())
@@ -395,8 +401,10 @@ TEST_F(SimTest, SsdSingleFlightCopyFailureWakesWholeAndRangeFollowers) {
     ASSERT_TRUE(loaded.found);
     // Whole reads lease the key; extent holds retain only their private staging
     // span, so deleting the original SSD record is safe while the extent lives.
-    if (ranged) EXPECT_NE(backend->Evict({"shared"}).front().bytes_freed, 0u);
-    else EXPECT_EQ(backend->Evict({"shared"}).front().bytes_freed, 0u);
+    if (ranged)
+      EXPECT_NE(backend->Evict({"shared"}).front().bytes_freed, 0u);
+    else
+      EXPECT_EQ(backend->Evict({"shared"}).front().bytes_freed, 0u);
     loaded.hold.reset();
     if (!ranged)
       ASSERT_TRUE(Await([&] { return backend->Evict({"shared"}).front().bytes_freed != 0; }));
