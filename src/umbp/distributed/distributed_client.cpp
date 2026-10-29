@@ -67,6 +67,7 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   dram_ownership.prefault = config.dram.prefault;
   dram_ownership.numa_strict = config.dram.numa_strict;
   dram_ownership.prefault_threads = config.dram.prefault_threads;
+  dram_ownership.max_mr_bytes = config.dram.max_mr_bytes;
 
   // SSD came back to the distributed data plane as a MediumBackend: Phase 0
   // unwired the old PeerSsdManager special case, and PoolClient::Init builds an
@@ -338,6 +339,13 @@ std::vector<bool> DistributedClient::BatchExists(const std::vector<std::string>&
   // bottleneck — sglang probes with batch_size=128 used to emit 128
   // roundtrips per BatchExists call).
   return pool_client_->BatchExists(keys);
+}
+
+size_t DistributedClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (closing_) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  return pool_client_->BatchPrefetch(keys);
 }
 
 size_t DistributedClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {

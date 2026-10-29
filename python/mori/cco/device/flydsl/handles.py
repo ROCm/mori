@@ -485,6 +485,117 @@ class Sdma:
             self.dev_comm, peer, dst_ptr, src_ptr, nbytes, qid, flags
         )
 
+    def _xfer2d(
+        self,
+        op,
+        peer,
+        dst_win,
+        dst_off,
+        dst_pitch,
+        src_win,
+        src_off,
+        src_pitch,
+        width_bytes,
+        height,
+        qid,
+        coop,
+        signal,
+        aggregate,
+    ):
+        tag = _COOP_TAG[_const(coop, "coop")]
+        if not signal:
+            tag += "_ns"
+        flags = 1 if aggregate else 0
+        raw.SDMA_XFER2D[f"{op}2d__{tag}"](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            dst_pitch,
+            _win(src_win),
+            src_off,
+            src_pitch,
+            width_bytes,
+            height,
+            qid,
+            flags,
+        )
+
+    def put2d(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        dst_pitch,
+        src_win,
+        src_off,
+        src_pitch,
+        width_bytes,
+        height,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
+    ):
+        """One rectangle, ``height`` rows of ``width_bytes``, in a single packet.
+
+        Offsets locate the rectangle's first byte, pitches are the two buffers'
+        row strides in bytes. At THREAD coop, lanes targeting the same
+        (peer, qid) go out as one batch with one signal.
+        """
+        self._xfer2d(
+            "put",
+            peer,
+            dst_win,
+            dst_off,
+            dst_pitch,
+            src_win,
+            src_off,
+            src_pitch,
+            width_bytes,
+            height,
+            qid,
+            coop,
+            signal,
+            aggregate,
+        )
+
+    def get2d(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        dst_pitch,
+        src_win,
+        src_off,
+        src_pitch,
+        width_bytes,
+        height,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
+    ):
+        """Peer -> local counterpart of :meth:`put2d`."""
+        self._xfer2d(
+            "get",
+            peer,
+            dst_win,
+            dst_off,
+            dst_pitch,
+            src_win,
+            src_off,
+            src_pitch,
+            width_bytes,
+            height,
+            qid,
+            coop,
+            signal,
+            aggregate,
+        )
+
     def commit(self, peer, qid=0, *, coop=CoopScope.THREAD):
         """Ring the doorbell for aggregate=True ops (thread: queue `qid`; warp/block: all)."""
         raw.SDMA_COMMIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer, qid)

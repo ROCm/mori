@@ -45,7 +45,7 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 | `dispatch_combine_op.py` | backend-agnostic base + entry: `EpDispatchCombineConfig` (+`.tuned()`), `EpDispatchCombineOp` (backend selector + shared dispatch/combine/reset/lifecycle), `EpDispatchRoutingHandle`, `KernelSet` |
 | `flydsl_backend.py` | **flydsl** backend subclass (`EpDispatchCombineOpFlyDSL`): arena layout + FlyDSL kernel binding for the full feature set |
 | `hip_backend.py` | **hip** backend subclass (`EpDispatchCombineOpHip`): arena layout + C++/JIT plan binding, gather only; rejects unsupported configs at construction. Holds the internode path too — device communicator, per-geometry plan sets for the `copystaging`/`dispatch{,_ll}` and `combinesync`/`combinesyncbarrier`/`combine{,_ll}`/`combineall` pass sequences, and its own unsupported-config gate |
-| `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `ep_staging_bytes(...)` bytes once, keep them alive, and `bind(staging_base=buf.data_ptr())` on every dispatch plan (an int is cached in the launch struct; a bound tensor is re-read every launch) |
+| `ep_plans.py` | EP-specific shim: loads `libmori_ops_v2.so` and exposes `EpDispatchPlan`/`EpCombinePlan`. The generic ctypes binding it calls lives in `mori.jit.v2.plan_api` (the plan_api C ABI), not here. A gfx125x `EpDispatchPlan` whose caller binds no `staging_base` gets one at its first launch, shared by the unbound plans of its layout, with a `FutureWarning`; instead, allocate `info["stagingBytes"]` bytes once, keep them alive, and `bind(staging_base=buf)` on every dispatch plan (a tensor is checked against that size and held; an int address is taken on trust). Sizes come from the plans: `EpDispatchPlan.describe(**request)` / `EpCombinePlan.describe(...)` return the info a plan would report without compiling it, and `arena_regions(*infos, region_names=...)` turns their `region.<stem>` keys into a `SymmArena` region list; binding checks an arena that has `size()` |
 | `symm_arena.py` | `SymmArena`: one cco-LSA window carved into named regions |
 | `internode_regions.py` | `internode_regions(cfg)`: the internode op's `SymmArena` region list — 17 named `(name, nbytes)` regions (16 plus `out_scales` when scales are on), in v1's allocation order and transcribed from what `EpDispatchCombineHandle` allocated |
 | `flydsl_prims.py` | FlyDSL device primitives: system atomics / ordered stores / fences / volatile-spin waits |
@@ -181,3 +181,221 @@ payload per dtype, `hidden*2` for bf16). Indicative bf16 numbers on **MI308X
 | 8192 | 314 GB/s | 323 GB/s |
 
 Cross-impl (v2 vs mori v1) latency tables for fp8/fp4 are in PR ROCm/mori#448.
+
+## Perf (AsyncLL)
+
+AsyncLL (`async_ll=True`) splits each phase into a send half and a recv half, so
+a caller can put compute between them. The nine kernels and the transports are
+described in `src/ops/dispatch_combine_v2/ep_asyncll_kernel.hpp`.
+
+**Read the numbers below with one caveat.** The benchmark calls `send` and then
+`recv` with nothing in between, which is the one thing AsyncLL exists to fill.
+It therefore measures the cost of the protocol -- a payload staged three times
+(input -> staging, staging -> peer, peer -> output), because that is the shape an
+RDMA leg needs -- and none of the benefit. These tables say the port is correct
+and what it costs; whether AsyncLL pays for itself needs an end-to-end MoE run
+with real expert compute in the seam, which is not measured here.
+
+### Cross-node, EP16 (2 x MI355X gfx950, 8 GPUs each)
+
+hidden 7168, top-k 8, bf16, `--cmd bench`. Totals in us (dispatch + combine);
+each token count's three arms were run interleaved in one window, so a node
+stolen mid-batch biases all three equally.
+
+| tok/rank | v2 asyncll | v2_ll | v1 async_ll | vs v1 |
+|---:|---:|---:|---:|---:|
+| 64   |  320.1 |  252.9 |  561.7 | -43.0% |
+| 128  |  419.9 |  212.6 |  430.6 |  -2.4% |
+| 256  |  684.0 |  322.5 |  694.0 |  -1.4% |
+| 512  | 1243.9 |  521.0 | 1232.1 |  +0.9% |
+| 1024 | 2618.8 | 1585.9 | 2441.2 |  +7.3% |
+| 2048 | 4559.6 | 1755.7 | 4545.2 |  +0.3% |
+
+**Against v1: parity.** Within ±7% from 128 tokens up, +0.3% at 2048. The two are
+the same protocol over different transports, so tracking this closely is the
+evidence that the cco port preserves it. RDMA bandwidth agrees digit for digit
+at 2048 -- 25.2/26.2 GB/s for v2 against 25.7/25.8 for v1.
+
+The -43% at 64 tokens is **not** a win. v1 launches with `block=auto warp=auto
+rdma=auto` and its autotune picks badly in that band: v1 is *slower* at 64
+tokens (561.7 us) than at 128 (430.6 us). Our geometry is fixed, so we do not
+share the dip.
+
+**Against v2_ll: 1.3x to 2.6x slower, and that is topological, not a tuning
+gap.** v2_ll's RDMA bandwidth at 2048 is 64/71 GB/s against our 25/26. Its proxy
+model has each rank talk only to its own-numbered rank on the far node, so the
+traffic rides one fat same-rail link; AsyncLL addresses peers individually
+(`SendBufSlotOffset` is per-PE), which spreads the same bytes over eight thinner
+cross-rail QPs that never fill. That is the cost of the per-PE addressing, not
+something a knob reaches. See `_make_dev_comm` in `hip_backend.py` for why
+AsyncLL has to ask for `GDA_CONNECTION_CROSSNODE` where the others take RAIL.
+
+### Single-node, EP4 (gfx1250, wave32)
+
+hidden 7168, top-k 8, bf16, CUDA graph, 50 iters. `pair_us` = dispatch +
+combine, median of three interleaved rounds, no excluded samples.
+
+| tok/rank | v2 native | asyncll sdma | asyncll lsa (fused) | asyncll lsa (unfused) |
+|---:|---:|---:|---:|---:|
+| 64   |  65.7 |  90.9 |  676.4 | 1071.3 |
+| 128  |  70.3 | 100.6 |  646.2 | 1053.8 |
+| 256  |  74.3 | 122.0 |  677.7 | 1108.8 |
+| 512  |  95.2 | 155.8 |  717.6 | 1207.2 |
+| 1024 | 149.1 | 222.1 |  789.2 | 1329.7 |
+| 2048 | 246.1 | 355.4 |  972.9 | 1706.9 |
+
+The fused LSA column was re-measured after the `Unroll=4` change to the
+peer-facing copies (see the LSA section of `ep_asyncll_kernel.hpp`), three
+interleaved rounds against an unmodified tree on the same node and harness. The
+unmodified arm reproduced the column this replaces to within ~1% at five of the
+six points -- 676.4/655.5/717.2/821.3/1357.2 against 676.5/659.3/714.5/826.5/1370.2
+-- so the two are comparable; 1024 is the exception (991.1 against 1130.1) and
+the 1130.1 reading is the suspect one, being non-monotonic with its neighbours.
+The unfused column predates the change and is left as measured; it would move
+too, since the same three sites serve both.
+
+Losing to the native intranode path is expected and is the same shape MI355X
+shows at EP8: native writes straight into the peer, AsyncLL stages. On a single
+node the staging buys nothing, because there is no RDMA leg for it to feed.
+
+**LSA is usable on this arch but not useful.** It runs 2.7-7.4x slower than
+sdma and 4.0-10.3x slower than native, which is nothing like MI355X, where the
+two transports trade places (lsa 4% ahead at 64 tokens, 11% behind at 2048).
+Whatever makes a peer store competitive on wave64 does not hold here. sdma
+stays the default and the gap is wide enough that it is not close.
+
+Note which end `Unroll=4` moved: -28.3% at 2048 and nothing at 64. The small
+end of this transport is not store-bound, so the remaining 7.4x there is a
+different problem from the 2.7x at the top.
+
+The 512 row is from a separate six-repeat run. The three-round sweep put it at
+331 us, non-monotonic between 256 and 1024; six repeats give 155.8 us with 1.2
+us of spread, and the neighbouring 384 showed an 810 us spread over the same
+six. This box throws an occasional large outlier that a median of three does
+not absorb -- 256 and 1024 reproduced to within 0.5% across both runs, so the
+rest of the column stands.
+
+The LSA rows above could not be measured at all until recently: the transport
+hung intermittently on gfx125x **under CUDA graph capture**, which is what this
+benchmark uses.
+
+The cause was a count-reuse race. LSA announced the combine epoch and only then
+cleared the dispatch receive counts, so a peer that passed the epoch handshake
+could publish its next dispatch count before the old round's clear erased it,
+leaving dispatch waiting on a count that would never come again. SDMA clears in
+`CombineSendTransfer`, before its epoch announcement, which is why it was never
+affected. LSA now clears each peer's count before publishing its epoch, with
+system release/acquire ordering.
+
+Eight interleaved pairs at EP4, hidden 7168, 64 tokens, on an idle gfx1250, no
+contaminated samples:
+
+| | pass / hang |
+|---|---|
+| baseline | 1 / 7 |
+| fixed | 8 / 0 |
+
+Two things about that measurement are worth copying rather than the number
+itself. The arms shared one host library and differed only in
+`MORI_SOURCE_ROOT`, and that this actually selected different kernels was
+*checked* -- an `#error` planted in the baseline tree fired when the root
+pointed there and not when it pointed at the fixed tree. And the node was idle:
+an earlier 55-run matrix on a busy box recorded 0 hangs for the same baseline,
+because an interfering job widens the window the race needs.
+
+Eager never hit this even though the race does not need graphs: the window is
+the gap between a peer clearing the handshake and our clear landing, and eager's
+host round trip between kernels is wide enough that ranks rarely sit in it.
+"Eager passes" was therefore never evidence against the race.
+
+Measure the rate before trusting any single run here. Several conclusions about
+this bug were each drawn from one run and were wrong -- that the kernels were
+broken on wave32, that the LSA fusion caused it, that the iteration count was a
+threshold, that a lane guard fixed it, and that the race could not be the cause
+because eager passed.
+
+`v1_asyncll` has no row either -- v1 is the shmem path and does not run on this
+arch.
+
+### Tried and rejected
+
+The first two follow from the same picture -- AsyncLL stages the payload three
+times and runs nine kernels, so the obvious targets are the extra passes and the
+extra launches -- and both were measured on an MI355X at EP8, six interleaved
+pairs, every pair agreeing in sign. All of them are recorded because the
+reasoning behind them is sound enough to be had again.
+
+**Pipelining the send half over PE groups.** `SendTransfer` only posts SDMA
+descriptors; the engine's copy is not on the stream, so splitting the send into
+PE groups and alternating copy/post launches should let the engine move group 0
+while the grid stages group 1. Measured +20% (2048 tokens) to +61% (64), worse
+everywhere. Each `SendCopy` launch still walks every entry and copies only its
+share, so half the grid idles through the scan and the fixed costs double, while
+the overlap it was supposed to buy never showed up.
+
+**Fusing SlotAssign and SendCopy behind a grid rendezvous.** One launch instead
+of two, keeping both decompositions (SlotAssign is top-k parallel, SendCopy is
+hidden-dim parallel) rather than interleaving per warp. Measured +12% (2048) to
++104% (64). A spin barrier waits for the slowest block, and SlotAssign's work is
+uneven across blocks by nature; the kernel boundary it replaced was synchronised
+by the hardware scheduler for less. Launch overhead is not the bottleneck here,
+which is also why the first experiment failed -- its small-batch penalty was
+load imbalance, not the extra launches.
+
+**Fusing the cross-node count onto the payload's WQE.** `EpInterNodePutSignal`
+instead of `EpInterNodePut`, so the stripe's token count rides its own QP and
+`RecvTransfer` can drop both the `EpInterNodeQuiet` drain and the separate count
+send. Needs per-(srcPe, qpId) count slots, because a fused flag is ordered
+behind the data only on its own QP and the payload is striped across
+`num_qp_per_pe` of them. Never got correct: 16 of 16 ranks disagreed at EP16,
+`max|diff|` around 24 with `got_nonzero` at or near full, i.e. every output
+position written but some holding the wrong value -- the signature of a wrong
+offset rather than of data that has not arrived. The suspect is the count
+arithmetic the new layout needs (`sum(row) - num_qp_per_pe`), which feeds the
+per-PE output prefix sum. Abandoned rather than chased: even correct, the
+cross-node leg is bandwidth-bound on per-PE cross-rail QPs at ~25 GB/s against
+v2_ll's 64-71, so a CQE drain is not what is costing it.
+
+**Moving the LSA transfer onto the gfx1250 TDM engine.** `benchmark/cco/ualoe_metric`
+establishes that TDM reaches the xGMI ceiling (~1640 GB/s one-way) on 512 blocks
+where a CU vector copy needs 8192, so a transport whose whole cost is CU-issued
+peer stores looks like the case for it. Written as a global -> LDS -> peer
+double-buffered copy, following `src/ops/dispatch_combine/intranode_1250x.hpp`,
+which is where the non-obvious part comes from: a TDM store can target a PEER's
+flat address, not only local memory. Measured on an idle gfx1250 node at EP4,
+five interleaved rounds, and it is a wash or slightly negative -- combine +1.6%
+at 2048, dispatch flat, and still a wash after `Unroll=4` removed the real
+bottleneck. Two reasons, and the second is the general one:
+
+* Dispatch never reached the TDM path at all. `XferBytesPerToken` is
+  7168*2 + 32 + 32 + 4 = 14404, so the slot stride is 4-byte aligned and source
+  and destination never share a 128 B phase.
+* The same ualoe data says TDM's advantage is a *grid-width* one, and below
+  about 1 MB neither transport is grid-limited -- there the CU path is often the
+  faster of the two. AsyncLL's transfer hands each warp tens of KB, so it sits in
+  the latency regime, not the bandwidth regime, and the extra trip through LDS is
+  pure cost. TDM pays in a kernel that has other work for the freed VGPRs; a
+  transfer pass has none.
+
+**Padding the slot stride to a 128 B row.** The alignment above is real, and
+fixing it (`XferBytesPerToken` rounded up to 128, with `internode_regions.py`
+following) is worth ~3.4% on the dispatch half and ~1% on the pair, measured in
+the same matrix. Not taken here because it changes the arena layout shared with
+the v2 / v2_ll families for a gain that `Unroll=4` dwarfs; it is a reasonable
+separate change.
+
+### Reproducing
+
+```bash
+# four-way single-node comparison, writes JSON + a table under /tmp/mori_bench
+MORI_ENABLE_SDMA=1 bash tools/bench_ep_asyncll_compare.sh --world-size 8
+
+# cross-node, one arm at a time (the v2 and v1 entries take different flags)
+tools/run_internode_test.sh --rank {0,1} --master-addr <ip> --ifname <nic> \
+  --entry tests/python/ops/dispatch_combine_v2/test_dispatch_combine_v2_internode.py \
+  --cmd bench --kernel-type asyncll --dtype bf16 --hidden-dim 7168 --topk 8 \
+  --max-tokens 128
+```
+
+Both need `MORI_ENABLE_SDMA=1` for the sdma transport; without it cco creates no
+queues and every transfer is a silent no-op (the host gate catches this).

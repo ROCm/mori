@@ -891,6 +891,14 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
   }
 
+  grpc::Status BatchPrefetch(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
+                             ::umbp::CountResponse* response) override {
+    std::vector<std::string> keys(request->keys().begin(), request->keys().end());
+    DataPathLock lock(client_mu_, LookupLocking());
+    response->set_count(shutdown_.load() ? 0 : client_->BatchPrefetch(keys));
+    return grpc::Status::OK;
+  }
+
   grpc::Status Clear(grpc::ServerContext*, const ::umbp::Empty*,
                      ::umbp::BoolResponse* response) override {
     std::unique_lock<std::shared_mutex> lock(client_mu_);

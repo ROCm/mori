@@ -145,6 +145,7 @@ void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
   SetEnv("UMBP_DRAM_CAPACITY", config.dram.capacity_bytes);
   SetEnv("UMBP_DRAM_USE_HUGEPAGES", config.dram.use_hugepages);
   SetEnv("UMBP_DRAM_HUGEPAGE_SIZE", config.dram.hugepage_size);
+  SetEnv("UMBP_DRAM_MAX_MR_BYTES", config.dram.max_mr_bytes);
   SetEnv("UMBP_DRAM_NUMA_NODE", FormatNumaNodes(config.dram.numa_nodes));
   SetEnv("UMBP_DRAM_NUMA_STRICT", config.dram.numa_strict);
   SetEnv("UMBP_DRAM_PREFAULT_THREADS", config.dram.prefault_threads);
@@ -693,6 +694,18 @@ void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) 
   if (!response.supports_kv_metadata())
     throw std::runtime_error("standalone owner requires an upgrade for batched KV metadata");
   kv_metadata_provider_ = config.metadata_provider;
+}
+
+size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& keys) {
+  if (closing_) return 0;
+  std::shared_lock lk(op_mutex_);
+  if (closed_) return 0;
+  grpc::ClientContext ctx;
+  ::umbp::BatchKeysRequest req;
+  for (const auto& key : keys) req.add_keys(key);
+  ::umbp::CountResponse resp;
+  grpc::Status status = stub_->BatchPrefetch(&ctx, req, &resp);
+  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
 bool StandaloneProcessClient::Clear() {
