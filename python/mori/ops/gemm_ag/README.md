@@ -15,12 +15,17 @@ results. The retained measurements show:
   against native Torch's **77.8 µs** on the current stack (72.0 vs 71.1 in
   September -- Torch moved, not MORI). The default remains `256x256`.
 - At that shape, non-fused GEMM + SDMA takes **355.9 µs**; fused SDMA takes
-  **360.6 µs** with one chunk (373.2 / 376.3 µs after merging `main`, on the
-  crsuse2 stack -- see [below](#re-measured-after-merging-main-2026-10-29)).
+  **360.6 µs** with one chunk (373.4 / 376.6 µs after merging `main`, on the
+  crsuse2 stack, against 415.1 for Torch + RCCL -- see
+  [below](#re-measured-after-merging-main-2026-10-29)).
 - At larger M the same shape gains from four-chunk single-stream fusion:
   **5.3% at M=8192** and **11.9% at M=16384**, with no benefit at M=4096
   (re-measured 2026-10-19; September's v2-015 pairs gave 4.9–5.2% and 11.1%,
-  and the 2026-10-29 re-measurement after merging `main` 4.8% and 11.2%).
+  and the 2026-10-29 re-measurement after merging `main` 4.8% and 11.1%).
+- Against Torch + RCCL the best MORI path is 10-16% faster on Pro and 6-11%
+  on Flash (2026-10-29). The steady part is the transport -- SDMA's AG is
+  ~13% under RCCL's -- while the `128x128` GEMM falls behind Torch's at large
+  M, so Torch's GEMM followed by SDMA is a strong non-fused baseline.
   Fusion performance depends on shape and chunk size.
 
 ## Model shapes
@@ -86,29 +91,59 @@ its `serial` control retains those streams but disables compute/transfer overlap
 
 On **crsuse2-m2m-v3-054, eight MI355X GPUs**, ROCm 7.2, PyTorch
 `2.11.0+rocm7.2`, FlyDSL 0.4.0, this branch merged with `main` at `b853716`.
-BF16 in / FP32 out, `128x128`, 50 warmups and 101 graph samples, maximum over
-ranks; every configuration in a fresh process group on an idle box, three
-interleaved rounds, median of rounds (spread <= 0.8%; 3.0% on Flash M=2048).
-Fused rows use `--peer-uncached --fence release`, as the 2026-10-19 larger-M
-and Flash rows did; the default fence measured within 0.2% of it at M >= 4096,
-1.3% slower on Flash M=2048 (inside that cell's spread) and 2.5% slower at Pro
-M=2048 c1 (385.7 µs). All 144 samples validated, worst relL2 `9.93e-7`.
+BF16 in / FP32 out, MORI at `128x128`, 50 warmups and 101 graph samples,
+maximum over ranks; every configuration in a fresh process group on an idle
+box. The three columns of each row ran interleaved in one session, three
+rounds, median of rounds (spread <= 2.0%; 3.0% on Flash M=2048 split).
+Fused rows use `--peer-uncached --fence release` at the chunk count a separate
+sweep found best. All samples validated, worst relL2 `9.93e-7`.
 
-| Shape | M | Torch + RCCL | MORI GEMM + SDMA | best fused SDMA | fused vs split |
+| Shape | M | Torch + RCCL | MORI GEMM + SDMA | best fused SDMA | best vs Torch + RCCL |
 |---|---:|---:|---:|---:|---:|
-| Pro `wkv_gate`, N=2048 K=7168 | 2048 | 416.2 | **373.2** | 376.3 (c1) | -0.8% |
-| | 4096 | | **704.4** | 718.2 (c2) | -2.0% |
-| | 8192 | | 1382.9 | **1317.0** (c4) | **4.8%** |
-| | 16384 | | 2845.5 | **2525.6** (c8) | **11.2%** |
-| Flash combined, N=1024 K=5120 | 2048 | | 214.4 | 215.3 (c1) | -0.4% |
-| | 16384 | | 1373.7 | **1308.3** (c4) | **4.8%** |
+| Pro `wkv_gate`, N=2048 K=7168 | 2048 | 415.1 | **373.4** | 376.6 (c1) | **-10.0%** |
+| | 4096 | 823.2 | **705.6** | 716.8 (c2) | **-14.3%** |
+| | 8192 | 1510.5 | 1381.7 | **1314.8** (c4) | **-13.0%** |
+| | 16384 | 3008.2 | 2844.2 | **2527.7** (c8) | **-16.0%** |
+| Flash combined, N=1024 K=5120 | 2048 | 227.6 | 213.6 | **213.5** (c1) | **-6.2%** |
+| | 16384 | 1465.9 | 1372.7 | **1309.2** (c4) | **-10.7%** |
 
-Every conclusion of the 2026-10-19 tables holds: split SDMA is 10.4% under
-Torch + RCCL at Pro M=2048 (372.9 against 416.2 in the same session), fusion
-does not pay below M=8192, and the combined Flash projection gains about 5%
-at M=16384. Absolute times sit 3-5% above mi355-gpu-51's and match
-September's v2-015 numbers (1382.3 / 1314.3 at M=8192, 2841.4 / 2526.1 at
-M=16384), so read the gpu-51 tables as that host's.
+Fusion pays from M=8192 (4.8% / 11.1% over split SDMA on Pro, 4.6% on Flash
+at M=16384) and not below it; the default fence measured within 0.2% of
+`sc_release` at M >= 4096, 1.3% slower on Flash M=2048 and 2.5% slower at Pro
+M=2048 c1. Absolute times sit
+3-5% above mi355-gpu-51's 2026-10-19 tables and match September's v2-015
+numbers (1382.3 / 1314.3 at M=8192, 2841.4 / 2526.1 at M=16384), so read the
+gpu-51 tables as that host's.
+
+### Where the gain over Torch + RCCL comes from
+
+`--phase-split` times the GEMM alone in the same process after the end-to-end
+measurement; the AG is the difference. Same box, three interleaved rounds of
+all four combinations, µs:
+
+| Shape | M | GEMM Torch | GEMM MORI | AG RCCL | AG SDMA | Torch+RCCL | Torch+SDMA | MORI+RCCL | MORI+SDMA |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Pro | 2048 | 71.4 | 73.2 | 344.9 | 300.3 | 416.4 | **370.0** | 426.6 | 373.6 |
+| | 4096 | 144.3 | **118.8** | 679.3 | 585.1 | 823.6 | 737.2 | 815.6 | **704.2** |
+| | 8192 | **180.8** | 224.0 | 1329.2 | 1159.5 | 1510.0 | **1343.7** | 1605.3 | 1383.5 |
+| | 16384 | **361.5** | 526.6 | 2648.0 | 2317.7 | 3009.5 | **2673.3** | 3195.0 | 2844.3 |
+| Flash | 2048 | **44.2** | 54.0 | 185.2 | 161.3 | 228.2 | **203.0** | 238.6 | 215.3 |
+| | 16384 | **139.4** | 212.4 | 1329.5 | 1160.3 | 1468.6 | **1296.6** | 1564.0 | 1372.5 |
+
+GEMM columns are from the Torch+RCCL and MORI+SDMA runs, AG columns likewise.
+
+* **The transport is the steady part of the gain.** SDMA's AG is 12.5-13.9%
+  under RCCL's at every shape, with either GEMM in front of it.
+* **The `128x128` GEMM is not.** It is level with Torch at Pro M=2048 and 18%
+  faster at M=4096, but 24% slower at M=8192, 46% at M=16384 and 22-52% on
+  Flash. The tile was chosen at M=2048, where `256x256` launches 64 workgroups
+  on 256 CUs; at large M that argument no longer holds, and this sweep did not
+  retune it.
+* **So Torch's GEMM + SDMA is the best non-fused path almost everywhere**, and
+  beats MORI's own split path by 1-6%. Fusion still wins on Pro at large M
+  despite its slower GEMM -- 1314.8 against 1343.7 at M=8192 and 2527.7
+  against 2673.3 at M=16384 (cross-session, same box and day) -- but not on
+  Flash, where Torch + SDMA (1296.6) edges the fused c4 (1309.2).
 
 `main`'s short final chunk for `gemm_ar` (#748's `chunk_bands`) was tried
 here and does not help: see [EXPERIMENTS.md](EXPERIMENTS.md#short-final-chunk-748).
