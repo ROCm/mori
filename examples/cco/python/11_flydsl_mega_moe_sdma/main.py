@@ -76,6 +76,9 @@ NETWORKS = {
     "v4_pro": dict(
         model_dim=7168, inter_dim=3072, experts=384, topk=6, swiglu_limit=10.0
     ),
+    "flash": dict(
+        model_dim=5120, inter_dim=2304, experts=384, topk=6, swiglu_limit=10.0
+    ),
 }
 
 

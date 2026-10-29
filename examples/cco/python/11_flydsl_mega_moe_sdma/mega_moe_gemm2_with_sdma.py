@@ -90,6 +90,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Int8, T
 from flydsl.compiler.ast_rewriter import ASTRewriter
+from flydsl.compiler.llvm_options import llvm_options
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
@@ -1229,6 +1230,16 @@ def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     quant="none"):
     # fmt: on
     """Compile or reuse one configuration and launch it."""
+    if comm is not None and persist and 0 < persist_cu < cu_num:
+        # A comm workgroup holds one of its CU's two workgroup slots for the whole
+        # kernel: ktrace shows those CUs run 8 GEMM workgroups where the rest run
+        # 15-18. The displaced work has to go somewhere, and at the bucket's tuned
+        # persist_cu=192 one workgroup is ~13% of the kernel span, so the tail
+        # quantises badly -- the last CU finishes 3.3% late while every workgroup
+        # runs at its normal speed. More, shorter workgroups absorb it: the fused
+        # kernel's cost over plain GEMM2 drops a third at 16384 tokens per rank
+        # (V4.1-Flash 0.200 -> 0.133 ms, V4-Pro 0.274 -> 0.184 ms).
+        persist_cu = cu_num
     launch_cu_num = min(cu_num, persist_cu) if persist and persist_cu > 0 else cu_num
     compile_kw = dict(
         model_dim=model_dim, inter_dim=inter_dim, experts=experts, rank=rank,
@@ -1240,16 +1251,32 @@ def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     )
     key = tuple(sorted(compile_kw.items()))
     launch = _LAUNCH_CACHE.get(key)
-    if launch is None:
-        launch = _LAUNCH_CACHE[key] = compile_moe_gemm2_with_sdma(**compile_kw)
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
-    _run_compiled(
-        launch, arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
+    run_args = (
+        arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win,
-        arg_cdone, arg_tile_base, arg_cursor, arg_idx, fx.Int32(max_m_blocks), fx.Int32(grid_blocks), fx.Int32(i32_inter), fx.Int32(i32_hidden),
-        fx.Int32(0), fx.Int32(0), stream,
+        arg_cdone, arg_tile_base, arg_cursor, arg_idx, fx.Int32(max_m_blocks), fx.Int32(grid_blocks),
+        fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
     )
+    if launch is None:
+        # The comm role's live ranges lift this function's register pressure over the
+        # threshold that turns on the AMDGPU UnclusteredHighRPReschedule stage, and
+        # that stage then breaks the GEMM main loop's clustering: the MFMAs move 23
+        # instructions earlier and the mean load -> s_waitcnt distance falls from
+        # 20.9 to 13.6, so the loop hides less latency. Same instruction multiset,
+        # worse order, and the loop pays it on every trip -- 8.5% of GEMM2 at 16384
+        # tokens per rank, present even when the comm role never runs. The register
+        # allocation is fine either way: 13 SGPR spills, all in the prologue, all
+        # filling s_nop slots.
+        #
+        # FlyDSL emits code on the first launch, not in the call below, so the option
+        # has to stay set across that launch as well.
+        with llvm_options({"amdgpu-disable-unclustered-high-rp-reschedule": True}):
+            launch = _LAUNCH_CACHE[key] = compile_moe_gemm2_with_sdma(**compile_kw)
+            _run_compiled(launch, *run_args)
+        return
+    _run_compiled(launch, *run_args)
 
 
 # --- Kernel 3: combine --------------------------------------------------------
