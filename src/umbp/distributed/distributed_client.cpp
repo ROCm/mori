@@ -21,8 +21,10 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -425,25 +427,35 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
 }
 
 bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
-  // An equal part of the bytes per node that has GPUs, cut into one shard per
-  // GPU on it.
-  std::map<int, size_t> gpus_on_node;
-  for (const auto& [device, node] : GpuNumaNodes()) ++gpus_on_node[node];
-  if (gpus_on_node.empty()) {
+  // An equal part of the bytes per node that has GPUs.  The shards are counted
+  // over the whole arena, as they are for one arena, so a shard is
+  // bytes / shards either way; unset, there is one per GPU.
+  const auto gpus = GpuNumaNodes();
+  std::set<int> nodes;
+  for (const auto& [device, node] : gpus) nodes.insert(node);
+  if (nodes.empty()) {
     MORI_UMBP_INFO("[DistributedClient] ranged scratch: no GPU NUMA affinity, so one arena");
     return false;
   }
-  const size_t part = bytes / gpus_on_node.size() / 64 * 64;
+  const size_t part = bytes / nodes.size() / 64 * 64;
   if (part == 0) {
     MORI_UMBP_WARN(
         "[DistributedClient] ranged scratch: {} B is too small for {} NUMA nodes, so one arena",
-        bytes, gpus_on_node.size());
+        bytes, nodes.size());
     return false;
+  }
+  const size_t asked = RangedScratchShardsFromEnv();
+  const size_t shards = std::max<size_t>(1, (asked > 0 ? asked : gpus.size()) / nodes.size());
+  if (asked > 0 && shards * nodes.size() != asked) {
+    MORI_UMBP_WARN(
+        "[DistributedClient] ranged scratch: UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS={} is not a "
+        "multiple of the {} NUMA nodes with GPUs, so {} shards",
+        asked, nodes.size(), shards * nodes.size());
   }
 
   HostMemAllocator allocator;
   std::string layout;
-  for (const auto& [node, gpus] : gpus_on_node) {
+  for (const int node : nodes) {
     HostBufferOptions opts = base;
     opts.numa_node = node;
     opts.numa_bind_mode = NumaBindMode::kBind;
@@ -457,18 +469,18 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
         FreeRangedScratch();
         return false;
       }
-      arenas->push_back({handle.ptr, part, node, gpus});
+      arenas->push_back({handle.ptr, part, node, shards});
       ranged_scratch_handles_.push_back(handle);
     }
     WarnIfNicRegionAliases("Ranged scratch part on NUMA node " + std::to_string(node), part,
                            ranged_scratch_handles_.back().actual_alignment, kScratchRemedy);
     layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
-              std::to_string(gpus) + " x " + std::to_string((part / gpus) >> 10) + " KiB";
+              std::to_string(shards) + " x " + std::to_string((part / shards) >> 10) + " KiB";
   }
   const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
       "[DistributedClient] ranged scratch: 2 arenas x {} KiB by NUMA node ({}), {} KiB pages ({})",
-      (part * gpus_on_node.size()) >> 10, layout, first.actual_alignment >> 10,
+      (part * nodes.size()) >> 10, layout, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
   return true;
 }

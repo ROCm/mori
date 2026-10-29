@@ -85,6 +85,19 @@ std::unordered_map<int, int> GpuNumaNodes() {
   return nodes;
 }
 
+size_t RangedScratchShardsFromEnv() {
+  static const size_t n = [] {
+    size_t shards = 0;
+    if (const char* value = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS")) {
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(value, &end, 10);
+      if (end != value && *end == '\0' && parsed > 0) shards = static_cast<size_t>(parsed);
+    }
+    return std::min<size_t>(shards, 64);
+  }();
+  return n;
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -718,18 +731,7 @@ constexpr size_t kRangedScratchAlignment = 64;
 // How many shards each ranged scratch arena is cut into.  1 is the historical
 // single-arena behaviour; 8 is one shard per rank of a TP8 node, which is what
 // the single arena mutex was serializing.
-size_t RangedScratchShards() {
-  static const size_t n = [] {
-    size_t shards = 1;
-    if (const char* value = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS")) {
-      char* end = nullptr;
-      const unsigned long long parsed = std::strtoull(value, &end, 10);
-      if (end != value && *end == '\0' && parsed > 0) shards = static_cast<size_t>(parsed);
-    }
-    return std::min<size_t>(shards, 64);
-  }();
-  return n;
-}
+size_t RangedScratchShards() { return std::max<size_t>(RangedScratchShardsFromEnv(), 1); }
 
 bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
   if (!out || alignment == 0) return false;
