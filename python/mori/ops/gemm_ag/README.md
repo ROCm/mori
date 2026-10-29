@@ -25,7 +25,11 @@ results. The retained measurements show:
 - Against Torch + RCCL the best MORI path is 10-16% faster on Pro and 6-11%
   on Flash (2026-10-29). The steady part is the transport -- SDMA's AG is
   ~13% under RCCL's -- while the `128x128` GEMM falls behind Torch's at large
-  M, so Torch's GEMM followed by SDMA is a strong non-fused baseline.
+  M at `128x128`. Retuning the tile per shape closes that gap from M=8192
+  (23% ahead at M=4096) and speeds the split path, but not the fused one:
+  a tile big enough to launch only one round of workgroups leaves fusion
+  nothing to overlap. See
+  [GEMM tile, retuned per shape](#gemm-tile-retuned-per-shape).
   Fusion performance depends on shape and chunk size.
 
 ## Model shapes
@@ -144,6 +148,47 @@ GEMM columns are from the Torch+RCCL and MORI+SDMA runs, AG columns likewise.
   despite its slower GEMM -- 1314.8 against 1343.7 at M=8192 and 2527.7
   against 2673.3 at M=16384 (cross-session, same box and day) -- but not on
   Flash, where Torch + SDMA (1296.6) edges the fused c4 (1309.2).
+
+### GEMM tile, retuned per shape
+
+The `128x128` tile above was picked at M=2048. Sweeping all four BF16 tiles
+with the same phase split (same box, three interleaved rounds, µs; GEMM is
+the same-run GEMM-alone time):
+
+| Shape | M | GEMM Torch | 128x128 | 128x256 | 256x128 | 256x256 |
+|---|---:|---:|---:|---:|---:|---:|
+| Pro | 2048 | 71.0 | **73.3** | 91.0 | 93.0 | 132.0 |
+| | 4096 | 146.0 | 120.9 | **112.5** | 116.4 | 143.4 |
+| | 8192 | 181.2 | 223.0 | 211.4 | 212.2 | **185.0** |
+| | 16384 | 365.1 | 527.1 | 455.9 | 465.5 | **364.6** |
+| Flash | 2048 | 43.9 | **54.0** | 65.7 | 68.6 | 99.2 |
+| | 16384 | 140.0 | 212.2 | 156.4 | 209.8 | **138.0** |
+
+With the right tile MORI's GEMM matches Torch's from M=8192 and beats it by
+23% at Pro M=4096; only Flash M=2048 stays behind (54.0 against 43.9) with
+every tile. `pick_tile`'s rule -- the largest tile whose grid still covers
+the 256 CUs, else the largest grid -- names the measured best at all six
+shapes, but `TILE_CANDIDATES` holds only `256x256`, so it cannot choose them.
+
+Then the fused path at that tile, in one session with the baselines (µs):
+
+| Shape | M | Torch + RCCL | Torch GEMM + SDMA | MORI split, best tile | fused, 128x128 | fused, best tile | best vs Torch + RCCL |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Pro | 4096 | 823.8 | 736.1 | **697.4** (128x256) | 718.1 (c2) | 699.7 (128x256 c1) | **-15.3%** |
+| | 8192 | 1508.4 | 1342.4 | 1340.2 (256x256) | **1314.5** (c4) | 1352.9 (256x256 c2) | **-12.9%** |
+| | 16384 | 3010.9 | 2671.0 | 2675.6 (256x256) | 2526.7 (c8) | **2525.2** (256x256 c2) | **-16.1%** |
+| Flash | 16384 | 1466.8 | 1296.7 | **1294.9** (256x256) | 1308.0 (c4) | 1308.1 (256x256 c2) | **-11.7%** |
+
+**A faster tile speeds the split path, not the fused one.** Fusion overlaps
+a chunk's transfer with the GEMM rounds still to come, and a larger tile
+removes those rounds: `256x256` launches 256 workgroups at Pro M=8192 and
+Flash M=16384 -- one per CU, a single round -- so every chunk completes at
+once and fused runs about 1% *behind* split at the same tile. At Pro M=16384
+it launches 512, two rounds, and exactly two chunks is the only count that
+still overlaps (c2 2525.2; c4 2545.0, c8 2584.2). `128x128` keeps four or
+more rounds and so stays the better fused tile at M=8192. The best path per
+shape is therefore MORI split at the best tile below M=8192 and on Flash, and
+fused at Pro M >= 8192 -- 11.7-16.1% under Torch + RCCL at M >= 4096.
 
 `main`'s short final chunk for `gemm_ar` (#748's `chunk_bands`) was tried
 here and does not help: see [EXPERIMENTS.md](EXPERIMENTS.md#short-final-chunk-748).
