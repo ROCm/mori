@@ -179,8 +179,8 @@ __global__ void AllGatherPushKernel(int myPe, int npes, const void* __restrict__
 //   output : local pointer, npes*chunkBytes bytes (all shards)
 //   chunkBytes    : bytes per shard.
 //   groupCtr : plain device buffer, [kArrivalIdx] elects the last block.
-//   arrived       : symmetric-heap uint64[npes] gen-barrier flags shared by every
-//                   collective (see GenBarrier).
+//   arrived       : symmetric-heap uint64[npes] gen-barrier flags of this communicator
+//                   (see GenBarrier).
 //   NPES          : compile-time peer count (see PullCopyInterleaved).
 //
 // Peer-interleaved: the copy spreads its in-flight loads across all NPES peers at

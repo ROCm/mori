@@ -53,7 +53,8 @@ static constexpr int kCCLMaxPeers = 16;
 static constexpr int kPushMaxSlices = 8;
 
 // Completion slots: a symmetric-heap uint64 arrived[kCCLMaxPeers][kArrivedStride]
-// (zeroed once, never reset). Row p of my copy is written only by PE p's SDMA: each
+// per communicator range (see kCommCtlWords; zeroed once, never reset). Row p of
+// my copy is written only by PE p's SDMA: each
 // copy is trailed by an atomic swap storing the sender's generation into its slot, and
 // the receiver waits until the slot reaches the generation it expects. Slots only
 // grow, so nothing is ever cleared. 64 bits because a slot a launch does not use
@@ -61,14 +62,23 @@ static constexpr int kPushMaxSlices = 8;
 // 32-bit wrap-safe compare would misread it as reached after 2^31 launches.
 //   [0, kPushMaxSlices) : scatter slice s (all push collectives, launch gen)
 //   kBcastArrived + b     : all-reduce broadcast b (launch gen)
-//   kPermuteArrived       : push collective-permute (pairwise permute count)
 enum ArrivedIdx {
   kBcastArrived = kPushMaxSlices,
-  kPermuteArrived = kBcastArrived + 2,
   kArrivedStride = 16,
 };
-static_assert(kPermuteArrived < kArrivedStride, "arrived row too small");
-static constexpr size_t kArrivedBytes = kCCLMaxPeers * kArrivedStride * sizeof(uint64_t);
+static_assert(kBcastArrived + 2 <= kArrivedStride, "arrived row too small");
+
+// Per-communicator control slot: uint64 barrierCtr[kCCLMaxPeers] (gen-barrier
+// flags, see GenBarrier) followed by arrived[kCCLMaxPeers][kArrivedStride]. Both
+// count launches of one communicator, so communicators with different members
+// must not share them. The facade carves one slot per contiguous PE range
+// (peBase, nPes) at index peBase * kCCLMaxPeers + nPes - 1: a fixed layout, so
+// every rank finds the same slot without a collective allocation. Communicators
+// over the same range share a slot, so their members must issue them in the
+// same order.
+static constexpr size_t kCommCtlWords = kCCLMaxPeers + kCCLMaxPeers * kArrivedStride;
+static constexpr size_t kCommCtlSlots = kCCLMaxPeers * kCCLMaxPeers;
+static constexpr size_t kCommCtlBytes = kCommCtlSlots * kCommCtlWords * sizeof(uint64_t);
 
 // groupCtr layout (local uint32 buffer): [0] grid-wide last-block arrival
 // counter (reduce-scatter's gen bump and the pull kernels' exit barrier elect the
@@ -84,13 +94,17 @@ enum GroupCtrIdx {
 // Collective-permute pairwise handshake flags, consolidated into one
 // symmetric-heap uint64[kPermuteFlagSlots][kCCLMaxPeers] buffer (permuteCtr;
 // zeroed once, never reset). Slot [idx][p] of my copy is written only by PE p,
-// addressed by the permSlot(idx, p) helper in the permute kernels. The three
-// rows used to be three separate buffers (ready / sendReady / readDone).
+// addressed by the permSlot(idx, p) helper in the permute kernels. Every row
+// counts the permutes shared by a PE pair (global PEs), which is the same on
+// both sides whatever communicator issued them, so one buffer serves all
+// communicators.
 enum PermuteFlagIdx {
   kReadyFlag = 0, // receiver's "I have entered to receive from you" token. 
                   // Written into the sender's row, polled by the sender.
   kSendReadyFlag, // pull-only sender's "I have entered to send to you" token.
   kReadDoneFlag,  // pull-only receiver's "I am done reading your sendBuf" token.
+  kArrivedFlag,   // push-only completion: the sender's SDMA swap stores its send
+                  // count after the copy lands; polled by the receiver.
   kPermuteFlagSlots,
 };
 
@@ -576,15 +590,17 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
 }
 
 // ---------------------------------------------------------------------------
-// Generation barrier shared by every push and pull collective.
+// Generation barrier shared by every push and pull collective of a communicator.
 //
-// The array is a symmetric-heap uint64[npes] (barrierCtr; zeroed once at facade
-// creation, never reset). Slot p of every PE's copy is written only by PE p, so
-// my own slot doubles as the launch generation: between launches it is always
-// even, and gen = slot & ~1. Every launch advances it by exactly 2 whatever the
-// collective -- push kernels post gen+2 in one entry round, pull kernels post
-// gen+1 at entry and gen+2 at exit -- so as long as every PE issues the same
-// sequence of collectives, every PE posts the same value in every round.
+// The array is a symmetric-heap uint64[npes] (barrierCtr, the communicator's
+// control slot, see kCommCtlWords; zeroed once at facade creation, never reset).
+// Slot p of every PE's copy is written only by PE p, so my own slot doubles as
+// the launch generation: between launches it is always even, and gen = slot & ~1.
+// Every launch advances it by exactly 2 whatever the collective -- push kernels
+// post gen+2 in one entry round, pull kernels post gen+1 at entry and gen+2 at
+// exit -- so as long as every PE issues the same sequence of collectives on this
+// communicator, every PE posts the same value in every round. This is why the
+// array must not be shared with a communicator over a different PE range.
 //
 // Arriving posts the value into slot myPe of every PE's copy (plain one-way
 // stores, no remote RMW), then waits on local loads only, until every slot of my
@@ -658,7 +674,8 @@ __device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, u
 // and its tail stores gen+2 into my own slot once no block of
 // the launch can still read it. My slot therefore holds gen or gen+1 while the
 // launch runs, so every block reads the same value; the launch signals gen+2.
-// Every PE runs the same collective sequence, so every PE signals the same value.
+// Every PE runs the same collective sequence on this communicator, so every PE
+// signals the same value.
 __device__ __forceinline__ uint64_t LoadPushGen(const uint64_t* barrierCtr, int myPe) {
   return (AtomicLoad<EAgentScope>(&barrierCtr[myPe]) & ~1ULL) + 2;
 }
