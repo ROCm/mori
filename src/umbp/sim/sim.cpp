@@ -179,7 +179,8 @@ bool SimPageMemorySource::Allocate(const std::vector<uint64_t>& sizes, std::vect
       for (const auto& buffer : fresh) munmap(buffer.base, buffer.size);
       return false;
     }
-    fresh.push_back({buffer.ptr, size});
+    fresh.push_back({buffer.ptr, size,
+                     loc_ == mori::io::MemoryLocationType::CPU ? buffer.actual_alignment : 0});
   }
   buffers_.insert(buffers_.end(), fresh.begin(), fresh.end());
   out->insert(out->end(), fresh.begin(), fresh.end());
