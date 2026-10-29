@@ -58,15 +58,12 @@ it has to solve. Two things make it tractable:
   different one. That turns each destination's payload into one contiguous slab,
   which is what SDMA needs.
 
-The LSA paths skip staging entirely: a vector store can be strided, so they
-write straight into the peer's ``recv`` region.
-
 ## Window layout
 
     [ signal | counters | locks | staging | recv ]
 
-``staging`` is zero-sized when nothing on the configured path needs it (the LSA
-transports), and ``recv`` is always present -- it is the operation's output.
+``staging`` is zero-sized when nothing on the configured path needs it (the
+GEMM alone), and ``recv`` is always present -- it is the operation's output.
 """
 
 from __future__ import annotations
@@ -133,14 +130,6 @@ def default_block_m(m: int, n: int, quant: str = "ptpc", *, num_cus: int = 256) 
 #: The ue8m0 group, on both operands: A is 1x32, B is 32x32.
 MXFP8_BLOCK = 32
 
-# Grid cap for the LSA copy kernel. Same reasoning as gemm_ar's LSA_BLOCK_CAP --
-# these stores go over xGMI and over-subscribing the request queues costs time
-# rather than saving it -- but the number is deliberately not shared: that one
-# was measured on an all-reduce's access pattern, and this one has to be measured
-# on this one before it means anything. Until then it is a starting point.
-LSA_BLOCK_CAP = 24
-
-
 #: The most chunks a destination's slab is pushed in, and the smallest chunk
 #: worth a put. Below ~1 MiB the per-packet cost starts to dominate (README), so
 #: the default chunk count is the largest one at or below MAX_CHUNKS that keeps
@@ -182,11 +171,9 @@ class A2aConfig:
     block_n: int = DEFAULT_BLOCK_N
     threads: int = THREADS
     max_blocks: int = K_MAX_BLOCKS
-    block_cap: int = LSA_BLOCK_CAP
     #: Whether the window reserves the ``[dst][M][shard_n]`` staging slab. The
     #: SDMA paths need it -- a copy engine reads a contiguous source range and
-    #: cannot gather -- and the LSA paths do not, because they store straight
-    #: into the peer. Sizing it is ``world_size * m * shard_n * 2`` bytes, so on
+    #: cannot gather -- and the GEMM alone does not. Sizing it is ``world_size * m * shard_n * 2`` bytes, so on
     #: the model shape that is 75 MiB it is worth not reserving when unused.
     staged: bool = False
     #: Sub-slices each destination's slab is pushed in, for the fused GEMM.
@@ -217,10 +204,6 @@ class A2aConfig:
     #: identical, so a region only ever aliases *itself*. Sizes stay ``m``-based:
     #: this moves where things are, not how much is moved. 0 means "same as m".
     capacity_m: int = 0
-    #: Override the computed grid for the copy kernel. Only ``max_blocks`` bounds
-    #: it for correctness (the signal array has one row per block), so raising
-    #: this past that needs ``max_blocks`` raised too.
-    force_blocks: int | None = None
 
     # --- basic sizes -------------------------------------------------------
 
@@ -310,17 +293,6 @@ class A2aConfig:
     def _check_rank(self, r: int) -> None:
         if not 0 <= r < self.world_size:
             raise IndexError(f"rank {r} outside [0, {self.world_size})")
-
-    # --- launch geometry ---------------------------------------------------
-
-    @property
-    def copy_blocks(self) -> int:
-        """Grid for the standalone LSA copy kernel."""
-        if self.force_blocks is not None:
-            return self.force_blocks
-        # One block per (destination, slice) with at least one slice each; the
-        # cap is what actually binds on any real shape.
-        return max(self.world_size, min(self.block_cap, self.world_size * 4))
 
     # --- symmetric window layout: [ signal | counters | locks | staging | recv ]
 
@@ -416,8 +388,8 @@ class A2aConfig:
         self._check_rank(dst_rank)
         if not self.staged:
             raise ValueError(
-                "this config has no staging region (staged=False); the LSA "
-                "transports store into the peer window directly"
+                "this config has no staging region (staged=False); build it "
+                "with staged=True for the SDMA paths"
             )
         return self.staging_off + dst_rank * self.cap_slab_bytes
 
@@ -547,14 +519,6 @@ class A2aConfig:
                 f"a slab is {self.slab_bytes}B and must be a multiple of "
                 f"{PACK_BYTES} so the copy kernels can move whole packs"
             )
-        if (
-            self.force_blocks is not None
-            and not 1 <= self.force_blocks <= self.max_blocks
-        ):
-            raise ValueError(
-                f"force_blocks={self.force_blocks} outside [1, {self.max_blocks}]; "
-                f"the signal array has one row per block, so raise max_blocks too"
-            )
 
 
 def a2a_config(**kwargs) -> A2aConfig:
@@ -598,7 +562,6 @@ __all__ = [
     "LARGE_TILE_MIN_WAVES",
     "MXFP8_BLOCK",
     "MXFP8_BLOCK_M",
-    "LSA_BLOCK_CAP",
     "MAX_WORLD",
     "PACK_BYTES",
     "THREADS",

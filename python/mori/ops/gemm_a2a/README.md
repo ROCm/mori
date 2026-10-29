@@ -16,14 +16,15 @@ head shard, and **`M = S/P`** — so sweeping `M` is sweeping the sequence lengt
 | mode | what it does |
 |---|---|
 | `gemm-only` | the GEMM alone, to size the ceiling |
-| `split-lsa` | `gemm()`; a copy kernel reads `[M,N]` and vector-stores into the peers |
 | `split-sdma` | `gemm()` into `[dst][M][shard_n]`; one SDMA push per destination |
 | `split-rccl` | the same staging GEMM; then `all_to_all_single` |
-| `fused-lsa` | C stored straight into the peers from the epilogue |
 | `fused-sdma` | C staged per destination, pushed by the copy engine per chunk |
 
 `split-sdma`, `split-rccl` and `fused-sdma` share a GEMM byte for byte, so the
-differences between them are transport and nothing else.
+differences between them are transport and nothing else. Two LSA transports --
+`split-lsa` (a copy kernel storing into the peers) and `fused-lsa` (the
+epilogue doing so itself) -- were measured and removed: they lose to the copy
+engines (below).
 
 ## Tile
 
@@ -150,7 +151,8 @@ yet, and this table is without it.
 ### The full mode table at one cell, `M=2048` — earlier run, 128x256
 
 Taken on the earlier node with ptpc at 128x256; not re-measured. It is kept for
-the modes the model tables do not carry (`split-lsa`, `fused-lsa`, `c2`).
+the modes the model tables do not carry: `c2`, and the two LSA transports, which
+this table is the reason for removing.
 
 | | 70B | | 405B | |
 |---|---:|---:|---:|---:|
@@ -246,16 +248,19 @@ gain is 21.6%. The GEMM is 95% of the fused total, so there is very little left
 to hide. Of the remaining tail, about 90us is the last wave's chunk on the wire
 and the rest is rank-to-rank skew in GEMM speed (`--timeline`).
 
-**LSA loses to SDMA on this operator.** `split-lsa` reaches only ~60% of the
-76.8 GB/s line rate where the copy engines reach ~75%; `fused-lsa` is the
-slowest mode at both shapes. Ruled out as causes: grid size (24/48/80 blocks
+**LSA loses to SDMA on this operator, so it was removed.** `split-lsa` reached
+only ~60% of the 76.8 GB/s line rate where the copy engines reach ~75%;
+`fused-lsa` was the slowest mode at both shapes. Ruled out as causes: grid size (24/48/80 blocks
 within 0.6%), cache policy (`sc0|sc1` worth 1.7%), local memory bandwidth
 (10.6us of an 88us gap), and the read layout — `split-lsa-staged` reads a
 compacted slab instead of a strided `[M,N]`, moves 12% fewer bytes, and takes
 the same time, so LSA's cost is its peer stores alone. gcnasm's independent
 measurement of the same kind of store puts it at 46.1 GB/s per link against our
 48.3, and its ATT capture found 99% of that time was stall. (Measured at
-128x256; not re-measured.)
+128x256, before the LSA paths were removed.) Not measured: small M, where a
+copy engine's per-put cost dominates and LSA may be the better transport --
+aiter #6689 uses peer stores below 256 rows per rank. The removed kernels are in
+this branch's history.
 
 ## Shape constraints
 

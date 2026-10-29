@@ -44,8 +44,6 @@ from ..gemm_ar import preshuffle_b
 
 _LAZY = {
     "GemmA2AOp": "op",
-    "build_lsa_a2a": "kernels_lsa",
-    "build_lsa_barrier": "kernels_lsa",
     "build_sdma_phases": "kernels_sdma",
     "compile_fused_gemm_a2a": "kernels_fused",
     "compile_gemm_local": "kernels_fused",
@@ -56,8 +54,6 @@ __all__ = [
     "GemmA2AOp",
     "MAX_WORLD",
     "a2a_config",
-    "build_lsa_a2a",
-    "build_lsa_barrier",
     "build_sdma_phases",
     "compile_fused_gemm_a2a",
     "compile_gemm_local",

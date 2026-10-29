@@ -47,13 +47,40 @@ first put waits for a whole wave of GEMM tiles.
 """
 
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 
 from mori.cco.device.flydsl.signals import (
+    i32_type,
     local_load_u32,
+    signal_load_u32,
     signal_ptr,
     signal_store_u32,
 )
-from .kernels_lsa import _spin_until
+
+
+def _spin_until(rsrc, flag):
+    """Block until the u32 at ``rsrc`` reaches ``flag`` (unsigned compare).
+
+    Unsigned so a wrapped counter still terminates; ``>=`` so an increment can
+    never be missed. Same construction as ``gemm_ar.kernels_lsa._spin_until`` --
+    duplicated rather than imported because that module is the all-reduce's,
+    and importing a private helper across ops to save nine lines would tie this
+    file's correctness to an unrelated one's refactors.
+    """
+    i32 = i32_type()
+    first = signal_load_u32(rsrc)
+    first_v = first.ir_value() if hasattr(first, "ir_value") else first
+    loop = scf.WhileOp([i32], [first_v])
+    cond = ir.Block.create_at_start(loop.before, [i32])
+    body = ir.Block.create_at_start(loop.after, [i32])
+    with ir.InsertionPoint(cond):
+        cur = fx.Int32(cond.arguments[0])
+        should_wait = fx.Uint32(cur) < fx.Uint32(flag)
+        scf.ConditionOp(should_wait.ir_value(), [cond.arguments[0]])
+    with ir.InsertionPoint(body):
+        nxt = signal_load_u32(rsrc)
+        scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
 
 
 def call_epoch(w, rank: int, flag_off: int):

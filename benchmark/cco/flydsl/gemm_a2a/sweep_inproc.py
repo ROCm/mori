@@ -110,8 +110,6 @@ for _name in (
     "compile_fused_gemm_a2a",
     "compile_gemm_local",
     "build_sdma_phases",
-    "build_lsa_a2a",
-    "build_lsa_barrier",
 ):
     setattr(B, _name, _memo(getattr(B, _name)))
 

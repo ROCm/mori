@@ -61,8 +61,7 @@ from mori.cco.device.flydsl.signals import (
     signal_ptr,
     signal_store_u32,
 )
-from ._credit import post_credit, wait_credit
-from .kernels_lsa import _spin_until
+from ._credit import _spin_until, post_credit, wait_credit
 from .timeline import stamp
 
 #: One wave is enough: the kernel issues at most ``world_size`` puts and then
@@ -141,9 +140,9 @@ def build_sdma_phases(
         wants single ones. Inlining it raises ``Cannot extract IR values from
         CachedWindow``.
 
-        Slot map is ``rank*4`` within ``start_off``, which is block 0's row of
-        the ``(bid*MAX_WORLD + rank)*4`` map the LSA kernels use -- these kernels
-        are one block, so the two agree.
+        Slot map is ``rank*4`` within ``start_off``: block 0's row of the
+        layout's ``(bid*MAX_WORLD + rank)*4`` signal array, and these kernels are
+        one block.
         """
         peer_arr = fx.Int64(w.lsa_ptr(tid, start_off))
         signal_store_u32(signal_ptr(peer_arr + fx.Int64(rank * 4)), flag)

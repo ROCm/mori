@@ -24,10 +24,12 @@
     gemm-only    the GEMM alone, to size the ceiling
     gemm-staging the staging GEMM alone -- what split-sdma/rccl subtract
     gemm-to-window  gemm-only's kernel, writing the window instead of a tensor
-    split-lsa    gemm(); then the standalone LSA all-to-all
-    split-sdma   gemm(); then staged SDMA pushes            (not yet)
-    fused-lsa    C stored straight into the peers            (not yet)
-    fused-sdma   C staged per destination, pushed per chunk  (not yet)
+    split-sdma   the staging GEMM; then one SDMA push per destination
+    split-rccl   the staging GEMM; then all_to_all_single
+    fused-sdma   C staged per destination, pushed per chunk from the epilogue
+
+The LSA transports (a copy kernel storing into the peers, or the epilogue doing
+so itself) lost to SDMA on this operator and were removed; see the README.
 
 Every rank holds its own ``A [M, K]`` and a **replicated** ``B [N, K]``,
 computes the whole ``[M, N]``, and sends column block ``j`` to rank ``j``. That
@@ -38,12 +40,12 @@ function of different rows, and the collective only moves bytes. So B is seeded
 identically on every rank and A is not -- get that wrong and each rank validates
 happily against its own wrong reference.
 
-Shape to compare against gcnasm's ``opus_gemm_a2a_lsa``:
+Shape to compare against gcnasm's ``opus_gemm_a2a_lsa`` (an LSA kernel):
 ``-m 2048 -n 18432 -k 8192`` at 8 ranks, giving ``shard_n = 2304``. Its numbers
 are bf16; this is fp8, so only the *fused-vs-split ratio* is comparable between
 the two, never the absolute times.
 
-    mpirun/torchrun --nproc_per_node=8 bench_gemm_a2a.py --mode split-lsa \\
+    mpirun/torchrun --nproc_per_node=8 bench_gemm_a2a.py --mode fused-sdma \\
       -m 2048 -n 18432 -k 8192 --warmup 10 --iters 30
 """
 
@@ -70,8 +72,6 @@ from mori.tensor_utils import from_gpu_ptr
 from mori.ops.gemm_ar import preshuffle_a_scale
 from mori.ops.gemm_a2a import (
     a2a_config,
-    build_lsa_a2a,
-    build_lsa_barrier,
     build_sdma_phases,
     counter_chunks,
     preshuffle_b,
@@ -86,18 +86,14 @@ from mori.ops.gemm_a2a.kernels_fused import (
 #: gemm-staging exists to make the split-sdma subtraction honest. Its GEMM
 #: writes [dst][M][shard_n] and is a *different kernel* from gemm-only's
 #: [M,N] one, so "split-sdma minus gemm-only" silently charges the transfer
-#: for however much the two GEMMs differ. split-lsa has no such problem --
-#: its GEMM is gemm-only's, literally.
+#: for however much the two GEMMs differ.
 MODES = (
     "gemm-only",
     "gemm-staging",
-    "split-lsa",
-    "fused-lsa",
     "split-sdma",
     "fused-sdma",
     "split-rccl",
     "gemm-to-window",
-    "split-lsa-staged",
 )
 NOT_YET = ()
 
@@ -337,7 +333,6 @@ def _plan_case(args, world_size: int, rank: int, local_rank: int):
         "fused-sdma",
         "gemm-staging",
         "split-rccl",
-        "split-lsa-staged",
     )
     needs_sdma = args.mode in ("split-sdma", "fused-sdma")
     # A chunk is a run of row tiles; the count has to divide them, and the
@@ -359,7 +354,6 @@ def _plan_case(args, world_size: int, rank: int, local_rank: int):
         staged=needs_staging,
         counter_chunks=chunks,
         chunk_plan=plan,
-        force_blocks=args.copy_blocks or None,
     )
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
     b_shuf = preshuffle_b(b)
@@ -451,7 +445,6 @@ def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None
             xcd_swizzle=args.xcd_swizzle,
             rotated=args.rotated,
             n_stripe=args.n_stripe,
-            transport="sdma",
             fuse=args.mode == "fused-sdma",
             chunks=chunks,
             sdma_queues=args.sdma_queues,
@@ -462,22 +455,6 @@ def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None
             staging_store=args.staging_store,
             stamp_off=stamp_off,
             war_credit=not args.no_war_credit,
-        )
-    elif args.mode == "fused-lsa":
-        # The epilogue writes into the peers, so there is no separate
-        # collective -- only the barrier below.
-        gemm = compile_fused_gemm_a2a(
-            cfg,
-            rank,
-            K=args.k,
-            BLOCK_M=args.block_m,
-            BLOCK_N=args.block_n,
-            quant=args.quant,
-            waves_per_eu=args.waves_per_eu,
-            xcd_swizzle=args.xcd_swizzle,
-            rotated=args.rotated,
-            n_stripe=args.n_stripe,
-            direct_fence=args.direct_fence,
             emit_put=not args.no_put,
         )
     else:
@@ -525,23 +502,6 @@ def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None
     else:
         sa_arg, sb_arg = sa, sb
 
-    # Same kernel, same store side, same bytes over the fabric. Only the
-    # *read* layout differs: [M,N] strided against the compacted slab. That
-    # is the one variable this pair isolates.
-    copy = (
-        build_lsa_a2a(
-            cfg,
-            rank,
-            src="staging" if args.mode == "split-lsa-staged" else "local",
-            uncached=args.lsa_uncached,
-        )
-        if args.mode in ("split-lsa", "split-lsa-staged")
-        else None
-    )
-    # fused-lsa has no collective kernel -- the epilogue already wrote into
-    # the peers -- but it still needs the agreement that every peer
-    # *finished*, or a rank reads a slab a peer is still writing.
-    barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
     parts = (
         build_sdma_phases(
             cfg,
@@ -564,9 +524,6 @@ def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None
         else None
     )
     rccl = args.mode == "split-rccl"
-    c_ptr = (
-        mem.ptr + cfg.staging_off if args.mode == "split-lsa-staged" else c.data_ptr()
-    )
 
     def once():
         stream = fx.Stream(torch.cuda.current_stream())
@@ -582,10 +539,6 @@ def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None
             win.handle,
             stream=stream,
         )
-        if copy is not None:
-            copy(c_ptr, dc.ptr, win.handle, stream=stream)
-        if barrier is not None:
-            barrier(dc.ptr, win.handle, stream=stream)
         if rccl:
             # Same bytes, same layout, same GEMM as split-sdma: only the
             # transport differs. all_to_all_single splits the input along
@@ -685,7 +638,7 @@ def _run_case(comm, mem, win, args, P, rank: int, world_size: int, dev_comm=None
     # clock ramp, which a cross-run subtraction charges to the transport.
     # That is how split-sdma came to look like 94% of line rate when it is
     # 81%.
-    if args.phase_split and (copy is not None or parts is not None or rccl):
+    if args.phase_split and (parts is not None or rccl):
 
         def _gemm_only():
             stream = fx.Stream(torch.cuda.current_stream())
@@ -774,7 +727,7 @@ def run(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=MODES + NOT_YET, default="split-lsa")
+    p.add_argument("--mode", choices=MODES + NOT_YET, default="fused-sdma")
     p.add_argument("-m", type=int, default=2048)
     p.add_argument("-n", type=int, default=18432)
     p.add_argument("-k", type=int, default=8192)
@@ -798,11 +751,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="row tiles per chunk, comma-separated, e.g. 1,3,8,3,1; must sum to "
         "m/block_m and overrides --chunks",
-    )
-    p.add_argument("--direct-fence", choices=("leader", "all"), default="leader")
-    p.add_argument("--copy-blocks", type=int, default=0)
-    p.add_argument(
-        "--lsa-uncached", action=argparse.BooleanOptionalAction, default=True
     )
     p.add_argument("--staging-store", choices=("buffer", "copy"), default="buffer")
     p.add_argument("--sdma-queues", type=int, default=1)

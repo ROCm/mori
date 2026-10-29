@@ -34,9 +34,8 @@ Two modes, both over the copy engines:
     The same GEMM writes the per-destination staging slabs, then one push per
     destination. The baseline ``fused`` is measured against, and a fallback.
 
-The LSA paths in this package are not offered here: on this operator they lose
-to SDMA, and the fused one writes into peers from every GEMM block, which the
-recv-reuse credit (below) would have to check in every block.
+There is no LSA transport: on this operator it lost to SDMA both split and
+fused, and it was removed (README).
 
 **Recv reuse.** The returned tensor is this op's receive buffer, and the next
 call writes it. A peer must not do that while this rank is still reading the
@@ -296,7 +295,6 @@ class GemmA2AOp:
             BLOCK_M=cfg.block_m,
             BLOCK_N=cfg.block_n,
             quant=self.quant,
-            transport="sdma",
             fuse=fused,
             chunks=cfg.counter_chunks,
             sdma_queues=self.sdma_queues,

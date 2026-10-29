@@ -140,11 +140,9 @@ def main():
 
     plan = [
         ("gemm-only", []),
-        ("split-lsa", []),
         ("split-sdma", []),
-        ("fused-lsa", ["--rotated", "--n-stripe", "1"]),
-        ("fused-lsa", ["--no-rotated"]),
-        ("fused-lsa", ["--rotated", "--n-stripe", "3"]),
+        ("split-rccl", []),
+        ("fused-sdma", ["--chunks", "8", "--no-rotated"]),
         ("fused-sdma", ["--chunks", "1"]),
         ("fused-sdma", ["--chunks", "2"]),
         ("fused-sdma", ["--chunks", "4"]),

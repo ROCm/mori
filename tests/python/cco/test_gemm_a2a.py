@@ -209,7 +209,6 @@ def test_chunk_plan_rejects(plan, chunks, match):
         ),
         (dict(world_size=8, m=128, n=2048, counter_shape_index=1), "shape_index"),
         (dict(world_size=8, m=256, n=2048, capacity_m=128), "capacity_m"),
-        (dict(world_size=8, m=128, n=2048, force_blocks=999), "force_blocks"),
     ],
 )
 def test_validate_rejects(kwargs, match):
