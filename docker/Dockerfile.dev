@@ -1,21 +1,23 @@
 # Tested base images (the apt ROCm install below must match the base's ROCm
-# major; mixing them would end up with two ROCm installs stacked):
-#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0  (default)
-#   rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0  (ROCM_APT_* below)
-ARG BASE_IMAGE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+# version: the base's rocm_sdk wheels warn on every import of a mori built
+# against another one, and a different major stacks two ROCm installs):
+#   rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0  (default)
+#   rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0
+#   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0  (ROCM_APT_* below)
+ARG BASE_IMAGE=rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
 FROM ${BASE_IMAGE}
 
 # Space-separated gfx targets to pull ROCm device packages for. The CCO CI
 # image uses "gfx950 gfx1250".
 ARG GPU_ARCHS="gfx942 gfx950"
 # apt ROCm to install when the base image ships no dev stack (see below).
-# 10.0 lives in a different repo than 7.x, so the URLs are args too:
-#   ROCM_APT_VERSION=10.0
-#   ROCM_APT_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg
-#   ROCM_APT_LIST="https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main"
-ARG ROCM_APT_VERSION=7.14
-ARG ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
-ARG ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
+# 7.14 lives in a different repo than 10.x, so the URLs are args too:
+#   ROCM_APT_VERSION=7.14
+#   ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+#   ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main"
+ARG ROCM_APT_VERSION=10.0
+ARG ROCM_APT_GPG=https://stable.repo.amd.com/rocm/gpg/packages.gpg
+ARG ROCM_APT_LIST="https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main"
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -36,8 +38,7 @@ RUN apt-get update && \
 # registers /opt/rocm/{bin,lib,include,...} via update-alternatives, the layout
 # mori expects.
 #
-# Older base images (the 7.2.4 ones the py3.10 nightly lane still uses) already
-# ship a full ROCm dev stack, and its apt repo is ubuntu2404-only anyway — so
+# Older base images (the 7.2.x ones) already ship a full ROCm dev stack, so
 # probe for the same file mori's CMakeLists checks and skip if it is there.
 RUN set -ex; \
     if [ -e /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake ]; then \

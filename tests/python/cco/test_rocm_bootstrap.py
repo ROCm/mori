@@ -129,3 +129,14 @@ def test_baked_version_uses_major_minor_compatibility_pattern():
 
     major, minor, *_ = bootstrap.ROCM_BUILD_VERSION.split(".")
     assert bootstrap.ROCM_VERSION_PATTERN == f"{major}.{minor}.*"
+
+
+def test_baked_version_matches_the_installed_rocm_sdk():
+    # A mismatch only warns at import time, from inside rocm_sdk, so nothing
+    # else in the suite would notice it.
+    if bootstrap.ROCM_VERSION_PATTERN is None:
+        pytest.skip("ROCm build metadata is generated while building the package")
+    rocm_sdk = pytest.importorskip("rocm_sdk")
+
+    major, minor, *_ = rocm_sdk.__version__.split(".")
+    assert bootstrap.ROCM_VERSION_PATTERN == f"{major}.{minor}.*"

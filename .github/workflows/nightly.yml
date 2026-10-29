@@ -31,16 +31,13 @@ jobs:
           # Built in docker/Dockerfile.manylinux, so a wheel needs nothing newer
           # than glibc 2.28 instead of the glibc/libstdc++ of the Ubuntu image that
           # ships its Python. Each lane builds against the ROCm its test image
-          # below runs: 7.2.4 for py3.10, 7.14 for py3.12.
-          - python: "3.10"
-            rocm: "7.2.4"
-            rocm_build_args: >-
-              --build-arg ROCM_VERSION=7.2.4
-              --build-arg ROCM_REPO=https://repo.radeon.com/rocm/rhel8/7.2.4/main
-              --build-arg ROCM_GPG=https://repo.radeon.com/rocm/rocm.gpg.key
-              --build-arg "ROCM_PACKAGES=rocm-hip-runtime-devel rocm-smi-lib"
+          # below runs: 10.0 for both, the Dockerfile's default (its header lists
+          # the args for other ROCm releases).
+          - python: "3.11"
+            rocm: "10.0"
+            rocm_build_args: ""
           - python: "3.12"
-            rocm: "7.14"
+            rocm: "10.0"
             rocm_build_args: ""
     steps:
       # Must precede Checkout: later steps run as root inside the CI container
@@ -187,9 +184,9 @@ jobs:
           # TCP connections from the host itself, so rank 1 spins in "retrying
           # connection to root" for 1500 attempts instead of failing.
           - platform: MI355X_AINIC
-            python: "3.10"
+            python: "3.11"
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -199,7 +196,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0
             rdma_devices: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
             rdma_sl: 3
             rdma_tc: 104
@@ -208,12 +205,12 @@ jobs:
           # 8x ConnectX-7 NDR on InfiniBand, so no rdma_sl/rdma_tc: mlx5 applies
           # both only on the RoCE path. mlx5_8 is deliberately not in
           # rdma_devices -- it is the 100GbE port behind ens14np0 (the TCP
-          # rendezvous interface), not one of the 8 rails. py3.12 only: that base
+          # rendezvous interface), not one of the 8 rails. py3.11 only: that base
           # image is what ci.yml validates this runner against.
           - platform: MI300X_MLX
-            python: "3.12"
+            python: "3.11"
             runner: [self-hosted, 300_mlx_p19_29]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
             rdma_devices: mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
             socket_ifname: ens14np0
             timeout_minutes: 90
@@ -434,9 +431,9 @@ jobs:
       matrix:
         include:
           - platform: MI355X_AINIC
-            python: "3.10"
+            python: "3.11"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
             node1_host: 10.2.80.20
             node2_host: 10.2.80.10
             node2_port: 22
@@ -450,7 +447,7 @@ jobs:
           - platform: MI355X_AINIC
             python: "3.12"
             runner: [self-hosted, MI355X-AINIC]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0
             node1_host: 10.2.80.20
             node2_host: 10.2.80.10
             node2_port: 22
@@ -469,9 +466,9 @@ jobs:
           # it drives over ssh (banff-ccs-aus-p19-14). Both addresses are the
           # ens14np0 100GbE port used for TCP rendezvous.
           - platform: MI300X_MLX
-            python: "3.12"
+            python: "3.11"
             runner: [self-hosted, 300_mlx_p19_29]
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
             node1_host: 10.194.132.110
             node2_host: 10.194.132.71
             node2_port: 22
@@ -934,10 +931,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python: "3.10"
-            base_image: rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.8.0
+          - python: "3.11"
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
           - python: "3.12"
-            base_image: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+            base_image: rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0
     env:
       IMAGE: rocm/mori:ci-py${{ matrix.python }}
     steps:
@@ -1017,7 +1014,7 @@ jobs:
       MORI_RDMA_SL: 3
       MORI_RDMA_TC: 104
       IMAGE: rocm/mori:ci-flydsl-${{ matrix.flydsl }}
-      BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+      BASE_IMAGE: rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0
       CONTAINER: mori_flydsl_compat_${{ github.run_id }}_${{ strategy.job-index }}
       CT: podman  # MI355X-AINIC runner is podman rootless (no docker daemon)
     timeout-minutes: 90

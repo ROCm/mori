@@ -10,7 +10,7 @@ if(WITH_MPI)
 endif()
 find_package(hsa-runtime64 REQUIRED)
 
-# ROCm 7.14's hsakmtTargets.cmake leaks its build machine into
+# The hsakmtTargets.cmake of ROCm 7.14 and 10.0 leaks its build machine into
 # hsakmt::hsakmt's INTERFACE_LINK_LIBRARIES; undone here and after
 # find_package(hsakmt) below (both no-ops on 7.2.4, which is clean).
 #
