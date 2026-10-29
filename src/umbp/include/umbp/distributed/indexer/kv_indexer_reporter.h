@@ -47,7 +47,7 @@ namespace indexer_pb = ::kv_indexer::v1;
 class KvIndexerReporter {
   struct Block : KvBlockMetadata {
     explicit Block(const KvBlockMetadata& metadata) : KvBlockMetadata(metadata) {}
-    int reported = -1;  // -1: absent; 0: an ambiguous REPORT may have been applied.
+    int reported = -1;  // -1: absent; 0: an ambiguous mutation may have been applied.
     uint32_t desired = 0;
   };
   using Blocks = std::map<int64_t, std::shared_ptr<Block>>;
@@ -58,10 +58,12 @@ class KvIndexerReporter {
       : endpoint_(config.endpoint),
         pool_id_(config.dram_pool_id),
         timeout_(config.timeout_ms),
+        repair_interval_(config.repair_interval_ms),
         contains_(std::move(contains)),
         retained_(retained ? std::move(retained) : contains_) {
-    if (endpoint_.empty() || pool_id_.empty() || !config.timeout_ms)
-      throw std::invalid_argument("KV Indexer requires an endpoint, pool id and timeout");
+    if (endpoint_.empty() || pool_id_.empty() || !config.timeout_ms || !config.repair_interval_ms)
+      throw std::invalid_argument(
+          "KV Indexer requires an endpoint, pool id and positive intervals");
     stub_ = indexer_pb::KVIndexer::NewStub(
         grpc::CreateChannel(config.endpoint, grpc::InsecureChannelCredentials()));
     request_.set_dram_pool_id(pool_id_);
@@ -72,7 +74,8 @@ class KvIndexerReporter {
   // Forwarders may attach to the same pool without replacing its reporter.
   bool MatchesPool(const KvIndexerConfig& config) const {
     return config.dram_pool_id == pool_id_ && config.endpoint == endpoint_ &&
-           std::chrono::milliseconds(config.timeout_ms) == timeout_;
+           std::chrono::milliseconds(config.timeout_ms) == timeout_ &&
+           std::chrono::milliseconds(config.repair_interval_ms) == repair_interval_;
   }
 
   // Empty means a clear or an explicit request to check all registered blocks.
@@ -168,7 +171,11 @@ class KvIndexerReporter {
         repair_ = rebuild;
       }
       cv_.notify_one();
-      MORI_UMBP_WARN("[KVIndexer] sync failed: {}", error.what());
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_warning_) {
+        MORI_UMBP_WARN("[KVIndexer] sync failed: {}", error.what());
+        next_warning_ = now + std::chrono::seconds(60);
+      }
       return false;
     }
   }
@@ -200,7 +207,10 @@ class KvIndexerReporter {
         if (std::all_of(keys.begin(), keys.end(), contains_)) mask |= component;
       block->desired = mask;
       if (!mask) {
-        if (block->reported >= 0) AddAction(indexer_pb::ACTION_REVOKE, hash);
+        if (block->reported >= 0) {
+          block->reported = 0;
+          AddAction(indexer_pb::ACTION_REVOKE, hash);
+        }
       } else if (rebuild || block->reported != static_cast<int>(mask)) {
         // An applied-but-failed RPC must remain revocable after an eviction.
         block->reported = 0;
@@ -276,17 +286,17 @@ class KvIndexerReporter {
     batch_hashes_ = 0;
   }
   void Run() {
-    auto next_rebuild = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto next_rebuild = std::chrono::steady_clock::now() + repair_interval_;
     std::unique_lock<std::mutex> lock(state_mutex_);
     while (!stopping_) {
       cv_.wait_until(lock, next_rebuild,
                      [this] { return !pending_.empty() || rescan_ || stopping_; });
       const auto now = std::chrono::steady_clock::now();
       const bool rebuild = now >= next_rebuild;
-      if (rebuild) next_rebuild = now + std::chrono::seconds(30);
       lock.unlock();
       const bool ok = Sync(rebuild);
       lock.lock();
+      if (rebuild) next_rebuild = std::chrono::steady_clock::now() + repair_interval_;
       if (!ok)
         // Writes must not turn an unavailable Indexer into a retry storm.
         cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stopping_.load(); });
@@ -295,7 +305,8 @@ class KvIndexerReporter {
   std::unique_ptr<indexer_pb::KVIndexer::Stub> stub_;
   indexer_pb::ApplyExternalKvBatchRequest request_;
   const std::string endpoint_, pool_id_;
-  const std::chrono::milliseconds timeout_;
+  const std::chrono::milliseconds timeout_, repair_interval_;
+  std::chrono::steady_clock::time_point next_warning_{};
   Contains contains_, retained_;
   // Serialize RPCs/flush/shutdown independently from write-path metadata.
   std::mutex state_mutex_, sync_mutex_;

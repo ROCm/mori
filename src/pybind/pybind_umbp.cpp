@@ -297,7 +297,7 @@ void RegisterMoriUmbp(py::module_& m) {
 
   py::class_<KvIndexerConfig>(m, "KvIndexerConfig")
       .def(py::init([](const std::string& endpoint, const std::string& pool_id,
-                       py::function provider, uint32_t timeout) {
+                       py::function provider, uint32_t timeout, uint32_t repair_interval) {
              // A bound method must not keep its owner (and that owner's client) alive.
              if (py::hasattr(provider, "__self__") && py::hasattr(provider, "__func__")) {
                auto weak = py::module_::import("weakref").attr("WeakMethod")(provider);
@@ -309,10 +309,11 @@ void RegisterMoriUmbp(py::module_& m) {
                });
              }
              return KvIndexerConfig{endpoint, pool_id, timeout,
-                                    provider.cast<decltype(KvIndexerConfig::metadata_provider)>()};
+                                    provider.cast<decltype(KvIndexerConfig::metadata_provider)>(),
+                                    repair_interval};
            }),
            py::arg("endpoint"), py::arg("dram_pool_id"), py::arg("metadata_provider").none(false),
-           py::arg("timeout_ms") = 200);
+           py::arg("timeout_ms") = 2000, py::arg("repair_interval_ms") = 30000);
   py::class_<KvBlockMetadata>(m, "KvBlockMetadata")
       .def(py::init([](int64_t hash, std::optional<int64_t> parent, uint32_t size,
                        const std::map<uint32_t, std::vector<std::string>>& keys) {

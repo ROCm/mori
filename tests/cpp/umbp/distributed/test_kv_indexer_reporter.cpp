@@ -149,5 +149,38 @@ TEST_F(AutomaticKvIndexer, MetadataSurvivesWritesAndSsdThenRetiresAfterWithdrawa
   ASSERT_TRUE(reporter.Sync());
   ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
 }
+
+TEST_F(AutomaticKvIndexer, FailedRevokeThenSameMaskReinsertionReportsAgain) {
+  std::atomic<bool> dram{true};
+  KvIndexerReporter reporter(config, [&](const auto&) { return dram.load(); });
+  auto metadata = reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  ASSERT_TRUE(reporter.Sync());
+  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
+  receiver.fail = true;
+  dram = false;
+  reporter.Notify({"key"});
+  EXPECT_FALSE(reporter.Sync());
+  ASSERT_TRUE(receiver.WaitFor({}));  // REVOKE applied, but its acknowledgement was lost.
+  dram = true;
+  receiver.fail = false;
+  reporter.Notify({"key"});
+  ASSERT_TRUE(reporter.Sync());  // Ordinary reconciliation must restore the same mask.
+  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
+}
+
+TEST_F(AutomaticKvIndexer, ConfiguredRepairRestoresIdleResidency) {
+  config.repair_interval_ms = 0;
+  EXPECT_THROW(KvIndexerReporter(config, [](const auto&) { return true; }), std::invalid_argument);
+  config.repair_interval_ms = 50;
+  KvIndexerReporter reporter(config, [](const auto&) { return true; });
+  auto metadata = reporter.Register({42, {}, 16, {{1, {"key"}}}});
+  ASSERT_TRUE(reporter.Sync());
+  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
+  {
+    std::lock_guard<std::mutex> lock(receiver.mutex);
+    receiver.masks.clear();  // Simulate loss of Indexer state with no storage events.
+  }
+  ASSERT_TRUE(receiver.WaitFor({{42, 1}}));
+}
 }  // namespace
 }  // namespace mori::umbp

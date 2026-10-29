@@ -857,8 +857,11 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     std::unique_lock<std::shared_mutex> lock(client_mu_);
     if (shutdown_) return {grpc::StatusCode::UNAVAILABLE, "server is shutting down"};
     try {
-      client_->ConfigureKvIndexer(
-          {request->endpoint(), request->dram_pool_id(), request->timeout_ms(), {}});
+      KvIndexerConfig config{
+          request->endpoint(), request->dram_pool_id(), request->timeout_ms(), {}};
+      if (request->has_repair_interval_ms())
+        config.repair_interval_ms = request->repair_interval_ms();
+      client_->ConfigureKvIndexer(config);
       response->set_supports_kv_metadata(true);
       SetBool(response, true);
     } catch (const std::exception& error) {

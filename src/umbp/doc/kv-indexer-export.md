@@ -31,8 +31,11 @@ its own component/window settings. The owner reports DRAM once and the Indexer
 combines it with each member's HBM. Closing a forwarder preserves the pool.
 
 Commit/eviction hooks send deltas; metadata travels with standalone batch writes.
-`flush()` awaits reporting. Retries resample residency, and 30s repair re-reports
-in bounded batches without clearing first. Metadata is reclaimed after its last
+`flush()` awaits reporting. RPCs default to a 2s `timeout_ms`; periodic repair uses
+`repair_interval_ms` (default 30000, must be positive) and re-reports in bounded
+batches without clearing first. Longer intervals reduce work but delay idle
+Indexer restart recovery. Repeated sync-failure warnings are limited to once per
+minute. Metadata is reclaimed after its last
 local physical copy and in-flight write are gone and withdrawal succeeds; SSD
 copies retain metadata for promotion. C++ callers hold the `RegisterKvBlock`
 return value through their write. Graceful owner shutdown withdraws DRAM.

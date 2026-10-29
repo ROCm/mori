@@ -36,8 +36,9 @@ message Empty {}
 
 message StandaloneKvIndexerConfig {
   string endpoint = 1;
-  uint32 timeout_ms = 6;
-  string dram_pool_id = 7;
+  uint32 timeout_ms = 2;
+  string dram_pool_id = 3;
+  optional uint32 repair_interval_ms = 4;
 }
 
 message StandaloneKvComponent {

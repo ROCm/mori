@@ -501,9 +501,10 @@ using KvMetadataPin = std::shared_ptr<const KvBlockMetadata>;
 
 struct KvIndexerConfig {
   std::string endpoint, dram_pool_id;
-  uint32_t timeout_ms = 200;
+  uint32_t timeout_ms = 2000;
   // Called before each write with its physical keys; empty means no blocks to track.
   std::function<std::vector<KvBlockMetadata>(const std::vector<std::string>&)> metadata_provider;
+  uint32_t repair_interval_ms = 30000;
 };
 
 struct UMBPConfig {
