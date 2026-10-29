@@ -65,7 +65,7 @@ void all2all_t::initialize(char* heap_base,
   local_hostname.back() = '\0';
 
   std::vector<char> all_hostnames(static_cast<size_t>(rank_n) * EP_HOSTNAME_BYTES, '\0');
-  comm_ctx_.bootstrap().allgather(local_hostname.data(), all_hostnames.data(), EP_HOSTNAME_BYTES);
+  comm_ctx_.bootstrap().Allgather(local_hostname.data(), all_hostnames.data(), EP_HOSTNAME_BYTES);
 
   std::vector<std::string> hostnames(static_cast<size_t>(rank_n));
   for (int rank = 0; rank < rank_n; ++rank) {
@@ -124,7 +124,7 @@ void all2all_t::initialize(char* heap_base,
     hipIpcMemHandle_t local_heap_handle{};
     HIP_CHECK(hipIpcGetMemHandle(&local_heap_handle, heap_base));
     std::vector<hipIpcMemHandle_t> peer_heap_handles(static_cast<size_t>(rank_n));
-    comm_ctx_.bootstrap().allgather(&local_heap_handle, peer_heap_handles.data(),
+    comm_ctx_.bootstrap().Allgather(&local_heap_handle, peer_heap_handles.data(),
                                     sizeof(hipIpcMemHandle_t));
 
     for (int lane = 0; lane < local_size_; ++lane) {

@@ -33,9 +33,9 @@
 
 #include "comm/active_queue_state.hpp"
 #include "comm/device_context.hip.hpp"
+#include "comm/rdma.hpp"
+#include "mori/application/bootstrap/base_bootstrap.hpp"
 #include "mori/kiwi/invoke/invoke.hpp"
-#include "mori/kiwi/rdma/bootstrap.hpp"
-#include "mori/kiwi/rdma/ibverbs.hpp"
 
 namespace mori::kiwi::ep {
 
@@ -60,9 +60,9 @@ using ep_heap_table_t = std::vector<ep_heap_entry_t>;
 
 class ep_comm_context_t {
  public:
-  explicit ep_comm_context_t(std::shared_ptr<rdma::bootstrap_t> bootstrap, int num_endpoints = 1,
-                             int num_devices = 1, std::string requested_device_name = {},
-                             size_t queue_capacity = 2048);
+  explicit ep_comm_context_t(std::shared_ptr<application::BootstrapNetwork> bootstrap,
+                             int num_endpoints = 1, int num_devices = 1,
+                             std::string requested_device_name = {}, size_t queue_capacity = 2048);
   ~ep_comm_context_t();
 
   ep_comm_context_t(const ep_comm_context_t&) = delete;
@@ -87,9 +87,9 @@ class ep_comm_context_t {
   rdma::device_t& get_device(int index = 0) const { return *devices_[index]; }
   int num_devices_count() const { return num_devices_; }
 
-  rdma::bootstrap_t& bootstrap() const { return *bootstrap_; }
-  int rank_me() const { return bootstrap_->rank(); }
-  int rank_n() const { return bootstrap_->size(); }
+  application::BootstrapNetwork& bootstrap() const { return *bootstrap_; }
+  int rank_me() const { return bootstrap_->GetLocalRank(); }
+  int rank_n() const { return bootstrap_->GetWorldSize(); }
 
   const internal::ep_heap_table_t& heap_table() const { return heap_table_; }
 
@@ -97,7 +97,7 @@ class ep_comm_context_t {
   void wait_drained();
   void proxy_thread_func(int thread_id, int num_proxy_threads, int selected_cpu);
 
-  std::shared_ptr<rdma::bootstrap_t> bootstrap_;
+  std::shared_ptr<application::BootstrapNetwork> bootstrap_;
   int num_queues_ = 0;
   int num_devices_ = 0;
   std::unique_ptr<rdma::net_context_t> net_;

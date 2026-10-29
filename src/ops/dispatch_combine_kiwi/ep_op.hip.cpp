@@ -103,13 +103,15 @@ config_t make_config(const ep_op_config_t& in) {
 
 }  // namespace
 
-ep_op_t::ep_op_t(const ep_op_config_t& config, std::shared_ptr<rdma::bootstrap_t> bootstrap) {
+ep_op_t::ep_op_t(const ep_op_config_t& config,
+                 std::shared_ptr<application::BootstrapNetwork> bootstrap) {
   if (!bootstrap) throw std::invalid_argument("KIWI EP bootstrap is null");
-  if (bootstrap->size() != config.world_size || bootstrap->rank() != config.rank) {
-    throw std::invalid_argument(
-        "KIWI EP config rank/world_size (" + std::to_string(config.rank) + "/" +
-        std::to_string(config.world_size) + ") does not match the bootstrap (" +
-        std::to_string(bootstrap->rank()) + "/" + std::to_string(bootstrap->size()) + ")");
+  if (bootstrap->GetWorldSize() != config.world_size || bootstrap->GetLocalRank() != config.rank) {
+    throw std::invalid_argument("KIWI EP config rank/world_size (" + std::to_string(config.rank) +
+                                "/" + std::to_string(config.world_size) +
+                                ") does not match the bootstrap (" +
+                                std::to_string(bootstrap->GetLocalRank()) + "/" +
+                                std::to_string(bootstrap->GetWorldSize()) + ")");
   }
   const config_t cfg = make_config(config);
   ctx_ = std::make_unique<ep_context_t>(cfg, std::move(bootstrap));
@@ -122,7 +124,7 @@ ep_op_t::ep_op_t(const ep_op_config_t& config, std::shared_ptr<rdma::bootstrap_t
   ctx_->stream_sync(stream);
   HIP_CHECK_THROW(hipStreamDestroy(stream));
   // Every rank must finish resetting its heap before any peer writes to it.
-  ctx_->bootstrap().barrier();
+  ctx_->bootstrap().Barrier();
 }
 
 ep_op_t::~ep_op_t() {
@@ -182,24 +184,5 @@ int ep_op_t::max_num_tokens_to_send_per_rank() const {
 }
 int ep_op_t::rank() const { return ctx_->rank_me(); }
 int ep_op_t::world_size() const { return ctx_->config().world_size; }
-
-void ep_op_t::set_debug_timing_enabled(bool enabled) { ctx_->set_debug_timing_enabled(enabled); }
-bool ep_op_t::debug_timing_enabled() const { return ctx_->debug_timing_enabled(); }
-
-std::vector<uint64_t> ep_op_t::debug_time_words() const {
-  std::vector<uint64_t> words(DEBUG_TIME_WORDS, 0);
-  if (const uint64_t* src = ctx_->debug_time_buf()) {
-    std::memcpy(words.data(), src, words.size() * sizeof(uint64_t));
-  }
-  return words;
-}
-
-std::vector<int32_t> ep_op_t::debug_meta_words() const {
-  std::vector<int32_t> words(DEBUG_META_WORDS, 0);
-  if (const int32_t* src = ctx_->debug_time_meta()) {
-    std::memcpy(words.data(), src, words.size() * sizeof(int32_t));
-  }
-  return words;
-}
 
 }  // namespace mori::kiwi::ep

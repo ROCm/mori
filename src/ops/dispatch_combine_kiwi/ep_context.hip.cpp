@@ -102,7 +102,8 @@ std::string hostname_from_fixed_buffer(const char* data) {
 
 }  // namespace
 
-ep_context_t::ep_context_t(const config_t& cfg, std::shared_ptr<rdma::bootstrap_t> bootstrap)
+ep_context_t::ep_context_t(const config_t& cfg,
+                           std::shared_ptr<application::BootstrapNetwork> bootstrap)
     : cfg_(cfg), device_workspace_layout_(cfg) {
   if (cfg_.topk > MAX_TOPK_SUPPORTED) {
     fprintf(stderr, "mori::kiwi::ep::ep_context_t: topk=%d exceeds MAX_TOPK_SUPPORTED=%d\n",
@@ -155,7 +156,7 @@ ep_context_t::ep_context_t(const config_t& cfg, std::shared_ptr<rdma::bootstrap_
     const std::string local_hostname_string = hostname_from_fixed_buffer(local_hostname.data());
 
     std::vector<char> all_hostnames(static_cast<size_t>(rank_n) * EP_HOSTNAME_BYTES, '\0');
-    comm_ctx_->bootstrap().allgather(local_hostname.data(), all_hostnames.data(),
+    comm_ctx_->bootstrap().Allgather(local_hostname.data(), all_hostnames.data(),
                                      EP_HOSTNAME_BYTES);
 
     rcomp_peer_is_local_.assign(static_cast<size_t>(rank_n), 0);
@@ -189,7 +190,7 @@ ep_context_t::ep_context_t(const config_t& cfg, std::shared_ptr<rdma::bootstrap_
     }
 
     std::vector<char> all_hip_pci_bus_ids(static_cast<size_t>(rank_n) * EP_PCI_BUS_ID_BYTES, '\0');
-    comm_ctx_->bootstrap().allgather(local_hip_pci_bus_id.data(), all_hip_pci_bus_ids.data(),
+    comm_ctx_->bootstrap().Allgather(local_hip_pci_bus_id.data(), all_hip_pci_bus_ids.data(),
                                      EP_PCI_BUS_ID_BYTES);
 
     rcomp_peer_hip_pci_bus_ids_.resize(static_cast<size_t>(rank_n));
@@ -337,7 +338,7 @@ ep_context_t::ep_context_t(const config_t& cfg, std::shared_ptr<rdma::bootstrap_
     std::vector<hipIpcMemHandle_t> peer_ipc_handles(static_cast<size_t>(cfg_.world_size));
     // This is intentionally a world communicator collective so every rank
     // keeps the same setup ordering.  Only exact-hostname peers are opened.
-    comm_ctx_->bootstrap().allgather(&local_heap_ipc_handle, peer_ipc_handles.data(),
+    comm_ctx_->bootstrap().Allgather(&local_heap_ipc_handle, peer_ipc_handles.data(),
                                      sizeof(hipIpcMemHandle_t));
 
     rcomp_peer_heap_bases_.assign(static_cast<size_t>(cfg_.world_size), uintptr_t{0});
@@ -420,8 +421,6 @@ ep_context_t::~ep_context_t() {
   if (d_recv_weights_) (void)hipFree(d_recv_weights_);
   if (d_recv_src_token_pos_) (void)hipFree(d_recv_src_token_pos_);
   if (d_recv_scales_) (void)hipFree(d_recv_scales_);
-  if (debug_time_buf_) (void)hipFree(debug_time_buf_);
-  if (debug_time_meta_) (void)hipFree(debug_time_meta_);
   if (d_device_workspace_) {
     (void)hipFree(d_device_workspace_);
     d_device_workspace_ = nullptr;
@@ -496,22 +495,6 @@ void ep_context_t::spawn_proxy_threads(int num_threads) {
 }
 
 void ep_context_t::join_proxy_threads() { comm_ctx_->join_proxy_threads(); }
-
-void ep_context_t::set_debug_timing_enabled(bool enabled) {
-  if (enabled && debug_time_buf_ == nullptr) {
-    HIP_CHECK(hipMallocManaged(&debug_time_buf_, DEBUG_TIME_WORDS * sizeof(uint64_t)));
-  }
-  if (enabled && debug_time_meta_ == nullptr) {
-    HIP_CHECK(hipMallocManaged(&debug_time_meta_, DEBUG_META_WORDS * sizeof(int32_t)));
-  }
-  debug_timing_enabled_ = enabled;
-  if (debug_time_buf_) {
-    memset(debug_time_buf_, 0, DEBUG_TIME_WORDS * sizeof(uint64_t));
-  }
-  if (debug_time_meta_) {
-    memset(debug_time_meta_, 0, DEBUG_META_WORDS * sizeof(int32_t));
-  }
-}
 
 void ep_context_t::reset(hipStream_t stream) {
   HIP_CHECK(

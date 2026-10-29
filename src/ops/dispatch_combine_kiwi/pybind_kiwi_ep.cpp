@@ -25,8 +25,11 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "ep_op.hpp"
+#include "mori/application/bootstrap/base_bootstrap.hpp"
 
 namespace py = pybind11;
 using mori::kiwi::ep::ep_op_config_t;
@@ -41,27 +44,52 @@ T* as_ptr(uintptr_t value) {
 
 hipStream_t as_stream(uintptr_t value) { return reinterpret_cast<hipStream_t>(value); }
 
-// `allgather(payload: bytes) -> bytes` must return the rank-ordered
-// concatenation of every rank's payload. It is called only from the
-// constructor, which holds the GIL.
-std::shared_ptr<mori::kiwi::rdma::bootstrap_t> make_bootstrap(int rank, int world_size,
-                                                              py::function allgather) {
-  auto fn = std::make_shared<py::function>(std::move(allgather));
-  auto call = [fn, world_size](const void* send, void* recv, size_t bytes) {
+// BootstrapNetwork over a Python `allgather(payload: bytes) -> bytes`, which
+// must return the rank-ordered concatenation of every rank's payload. It is
+// called only from the constructor, which holds the GIL.
+class callback_bootstrap_t : public mori::application::BootstrapNetwork {
+ public:
+  callback_bootstrap_t(int rank, int world_size, py::function allgather)
+      : allgather_(std::move(allgather)) {
+    localRank = rank;
+    worldSize = world_size;
+  }
+
+  void Initialize() override {}
+  void Finalize() override {}
+
+  void Allgather(void* send, void* recv, size_t bytes) override {
     py::gil_scoped_acquire gil;
     py::bytes payload(static_cast<const char*>(send), bytes);
-    py::bytes gathered = (*fn)(payload).cast<py::bytes>();
-    std::string data = gathered;
-    if (data.size() != bytes * static_cast<size_t>(world_size)) {
+    std::string data = allgather_(payload).cast<py::bytes>();
+    if (data.size() != bytes * static_cast<size_t>(worldSize)) {
       throw std::runtime_error("KIWI EP bootstrap allgather returned " +
                                std::to_string(data.size()) + " bytes, expected " +
-                               std::to_string(bytes * static_cast<size_t>(world_size)));
+                               std::to_string(bytes * static_cast<size_t>(worldSize)));
     }
     std::memcpy(recv, data.data(), data.size());
-  };
-  return std::make_shared<mori::kiwi::rdma::callback_bootstrap_t>(rank, world_size,
-                                                                  std::move(call));
-}
+  }
+
+  // Row r of the gathered matrix is rank r's send buffer; keep column localRank.
+  void AllToAll(void* send, void* recv, size_t bytes) override {
+    const size_t n = static_cast<size_t>(worldSize);
+    std::vector<char> all(bytes * n * n);
+    Allgather(send, all.data(), bytes * n);
+    for (size_t r = 0; r < n; ++r) {
+      std::memcpy(static_cast<char*>(recv) + r * bytes,
+                  all.data() + (r * n + static_cast<size_t>(localRank)) * bytes, bytes);
+    }
+  }
+
+  void Barrier() override {
+    char token = 0;
+    std::vector<char> tokens(static_cast<size_t>(worldSize));
+    Allgather(&token, tokens.data(), sizeof(token));
+  }
+
+ private:
+  py::function allgather_;
+};
 
 }  // namespace
 
@@ -90,7 +118,8 @@ PYBIND11_MODULE(libmori_kiwi_ep_pybinds, m) {
 
   py::class_<ep_op_t>(m, "KiwiEpOpHandle")
       .def(py::init([](const ep_op_config_t& config, py::function allgather) {
-             auto bootstrap = make_bootstrap(config.rank, config.world_size, std::move(allgather));
+             auto bootstrap = std::make_shared<callback_bootstrap_t>(config.rank, config.world_size,
+                                                                     std::move(allgather));
              return std::make_unique<ep_op_t>(config, std::move(bootstrap));
            }),
            py::arg("config"), py::arg("allgather"))
@@ -147,9 +176,5 @@ PYBIND11_MODULE(libmori_kiwi_ep_pybinds, m) {
       .def("max_num_tokens_to_send_per_rank", &ep_op_t::max_num_tokens_to_send_per_rank)
       .def("num_input_tokens", &ep_op_t::num_input_tokens)
       .def("rank", &ep_op_t::rank)
-      .def("world_size", &ep_op_t::world_size)
-      .def("set_debug_timing_enabled", &ep_op_t::set_debug_timing_enabled)
-      .def("debug_timing_enabled", &ep_op_t::debug_timing_enabled)
-      .def("debug_time_words", &ep_op_t::debug_time_words)
-      .def("debug_meta_words", &ep_op_t::debug_meta_words);
+      .def("world_size", &ep_op_t::world_size);
 }

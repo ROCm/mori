@@ -36,14 +36,11 @@
 #include "ep_config.hpp"
 #include "ep_gcontext.hip.hpp"
 #include "memory_scope.hip.hpp"
-#include "mori/kiwi/rdma/bootstrap.hpp"
+#include "mori/application/bootstrap/base_bootstrap.hpp"
 #include "utils.hpp"
 #include "workspace/device_workspace.hpp"
 
 namespace mori::kiwi::ep {
-
-static constexpr int DEBUG_TIME_WORDS = 64;
-static constexpr int DEBUG_META_WORDS = 32;
 
 // MORI-style helper for mapping a global set of wavefronts onto a
 // (num_items x dim_size) loop.  When the launch has more wavefronts than
@@ -308,8 +305,8 @@ __device__ inline void publish_active_queue_count(const ep_gcontext_t& gctx,
 class ep_context_t {
  public:
   // Construction is collective over `bootstrap`; config.world_size must
-  // equal bootstrap->size().
-  ep_context_t(const config_t& cfg, std::shared_ptr<rdma::bootstrap_t> bootstrap);
+  // equal bootstrap->GetWorldSize().
+  ep_context_t(const config_t& cfg, std::shared_ptr<application::BootstrapNetwork> bootstrap);
   ~ep_context_t();
 
   ep_context_t(const ep_context_t&) = delete;
@@ -329,7 +326,7 @@ class ep_context_t {
   // Access
   const config_t& config() const { return cfg_; }
   int rank_me() const { return comm_ctx_->rank_me(); }
-  rdma::bootstrap_t& bootstrap() const { return comm_ctx_->bootstrap(); }
+  application::BootstrapNetwork& bootstrap() const { return comm_ctx_->bootstrap(); }
   const internal::ep_heap_table_t& heap_table() const { return comm_ctx_->heap_table(); }
   // Route-capability hook for native tests and diagnostics. A one denotes a
   // provisioned HIP-IPC-capable payload route for that peer; zero means no
@@ -358,14 +355,6 @@ class ep_context_t {
 
   // Host-side stream synchronization wrapper.
   void stream_sync(hipStream_t stream);
-
-  // Optional low-level device timing buffer for benchmark/debug runs.
-  // The hot path passes nullptr into kernels unless this is explicitly
-  // enabled, keeping production graph replay behavior unchanged.
-  void set_debug_timing_enabled(bool enabled);
-  bool debug_timing_enabled() const { return debug_timing_enabled_; }
-  uint64_t* debug_time_buf() const { return debug_time_buf_; }
-  int32_t* debug_time_meta() const { return debug_time_meta_; }
 
  private:
   config_t cfg_;
@@ -407,12 +396,6 @@ class ep_context_t {
   float* d_recv_weights_ = nullptr;
   void* d_recv_scales_ = nullptr;
   int32_t* d_recv_src_token_pos_ = nullptr;
-
-  // Optional managed debug timing storage.  Allocated once and populated
-  // only when debug_timing_enabled_ is true.
-  bool debug_timing_enabled_ = false;
-  uint64_t* debug_time_buf_ = nullptr;
-  int32_t* debug_time_meta_ = nullptr;
 };
 
 // ----- Dispatch -----

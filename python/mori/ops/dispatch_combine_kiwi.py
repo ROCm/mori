@@ -515,17 +515,6 @@ class EpDispatchCombineKiwiOp:
             self.device,
         )[:count]
 
-    def set_debug_timing_enabled(self, enabled: bool):
-        self._handle.set_debug_timing_enabled(enabled)
-
-    def get_debug_timing_snapshot(self):
-        torch.cuda.synchronize()
-        return {
-            "enabled": self._handle.debug_timing_enabled(),
-            "time_ticks": self._handle.debug_time_words(),
-            "meta": self._handle.debug_meta_words(),
-        }
-
     # ----- helpers -----
 
     def _scales_view(self, dtype):

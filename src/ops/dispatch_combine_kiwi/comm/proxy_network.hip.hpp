@@ -24,7 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "mori/kiwi/rdma/ibverbs.hpp"
+#include "comm/rdma.hpp"
 
 namespace mori::kiwi::ep::internal {
 

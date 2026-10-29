@@ -31,61 +31,9 @@
 #endif
 #include <cstdio>
 
-// Diagnostic-only compile-time toggles for issue #10 payload-bandwidth
-// experiments.  The default build keeps normal correctness-preserving behavior.
-// Enabling either toggle is intentionally timing-only: hidden outputs become
-// invalid, but slot metadata is still transferred so the benchmark can keep
-// exercising the routing/control path without crashing.
-#ifndef KIWI_EP_DIAG_SKIP_HIDDEN_COPY
-#define KIWI_EP_DIAG_SKIP_HIDDEN_COPY 0
-#endif
-
-#ifndef KIWI_EP_DIAG_METADATA_ONLY_PUT
-#define KIWI_EP_DIAG_METADATA_ONLY_PUT 0
-#endif
-
 namespace mori::kiwi::ep {
 
 inline constexpr int DISPATCH_PRESCAN_LANES_PER_TOKEN = 8;
-
-namespace dispatch_debug_slot {
-
-inline constexpr int entry = 0;
-inline constexpr int count_prescan_done = 1;
-inline constexpr int count_all2all_started = 2;
-inline constexpr int rcomp_rdma_posted = 3;
-inline constexpr int rcomp_ipc_copies_complete = 4;
-inline constexpr int incoming_count_all2all_wait_start = 5;
-inline constexpr int incoming_counts_observed = 6;
-inline constexpr int rank_slot_maps_built = 7;
-inline constexpr int unpack_barrier_released = 8;
-inline constexpr int unpack_done = 9;
-
-}  // namespace dispatch_debug_slot
-
-__device__ inline char* dispatch_put_src_ptr(const ep_gcontext_t& gctx, char* slot) {
-#if KIWI_EP_DIAG_METADATA_ONLY_PUT
-  return slot + gctx.dispatch_layout.slot.indices_offset;
-#else
-  return slot;
-#endif
-}
-
-__device__ inline uintptr_t dispatch_put_remote_disp(const ep_gcontext_t& gctx, int recv_slot) {
-  uintptr_t remote_disp = gctx.dispatch_remote_disp(recv_slot);
-#if KIWI_EP_DIAG_METADATA_ONLY_PUT
-  remote_disp += gctx.dispatch_layout.slot.indices_offset;
-#endif
-  return remote_disp;
-}
-
-__device__ inline size_t dispatch_put_bytes(const ep_gcontext_t& gctx) {
-#if KIWI_EP_DIAG_METADATA_ONLY_PUT
-  return gctx.dispatch_layout.slot.payload_size - gctx.dispatch_layout.slot.indices_offset;
-#else
-  return gctx.dispatch_layout.slot.stride;
-#endif
-}
 
 __device__ inline uint8_t* dispatch_payload_readiness_flag(const ep_gcontext_t& gctx,
                                                            int source_rank, int source_local_slot) {
@@ -100,30 +48,15 @@ __device__ inline void dispatch_pack_slot_part(const ep_gcontext_t& gctx, const 
                                                int topk, size_t hidden_offset, int hidden_bytes,
                                                int scale_bytes, char* dst_slot, bool copy_metadata,
                                                int lane) {
-  if (!KIWI_EP_DIAG_SKIP_HIDDEN_COPY) {
-    void* dst_hidden =
-        static_cast<char*>(gctx.dispatch_layout.slot.hidden(dst_slot)) + hidden_offset;
-    copy_hidden_payload_block<SystemScopeStore>(src_hidden, dst_hidden, hidden_bytes, lane,
-                                                EP_WAVE_SIZE);
-  }
+  void* dst_hidden = static_cast<char*>(gctx.dispatch_layout.slot.hidden(dst_slot)) + hidden_offset;
+  copy_hidden_payload_block<SystemScopeStore>(src_hidden, dst_hidden, hidden_bytes, lane,
+                                              EP_WAVE_SIZE);
   if (copy_metadata) {
     copy_slot_metadata_block<SystemScopeStore>(
         src_indices, src_weights, src_scales, src_token_id, topk, scale_bytes,
         gctx.dispatch_layout.slot.indices(dst_slot), gctx.dispatch_layout.slot.weights(dst_slot),
         gctx.dispatch_layout.slot.src_id(dst_slot), gctx.dispatch_layout.slot.scales(dst_slot),
         lane, EP_WAVE_SIZE);
-  }
-}
-
-__device__ inline void dispatch_debug_store_time(uint64_t* debug_time_buf, int idx) {
-  if (debug_time_buf != nullptr) {
-    debug_time_buf[idx] = static_cast<uint64_t>(wall_clock64());
-  }
-}
-
-__device__ inline void dispatch_debug_store_meta(int32_t* debug_time_meta, int idx, int32_t value) {
-  if (debug_time_meta != nullptr) {
-    debug_time_meta[idx] = value;
   }
 }
 
@@ -281,7 +214,7 @@ __device__ inline void dispatch_prescan_unique_dest_counts(const ep_gcontext_t& 
 //   and submit one multicast descriptor covering all unique remote ranks.
 //   Additionally populates
 //   token_to_producer_rank for later combine accumulation and
-//   token_to_dispatch_recv_slot for dispatch/debug metadata.
+//   token_to_dispatch_recv_slot for dispatch metadata.
 //
 // Grid barrier: all blocks arrive after phase 1, then wait while block 0
 //   completes receive setup.  The reusable generation-counted barrier lets the
@@ -302,7 +235,7 @@ template <bool UseHybridRcomp>
 __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
                          const int32_t* __restrict__ d_expert_indices,
                          const float* __restrict__ d_weights, const void* __restrict__ d_scales,
-                         int num_tokens, uint64_t* debug_time_buf, int32_t* debug_time_meta) {
+                         int num_tokens) {
   const ep_device_workspace_t& device_workspace = gctx.device_workspace;
   const int lane = threadIdx.x % EP_WAVE_SIZE;
   const int wf_in_blk = threadIdx.x / EP_WAVE_SIZE;
@@ -336,19 +269,6 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
   // active endpoint prefix through endpoint 0 before any EP traffic uses it.
   if (bid == 0 && wf_in_blk == 0) {
     publish_active_queue_count(gctx, dispatch_handle);
-  }
-
-  if (bid == 0 && threadIdx.x == 0) {
-    dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::entry);
-    dispatch_debug_store_meta(debug_time_meta, 0, rank_me);
-    dispatch_debug_store_meta(debug_time_meta, 1, world_size);
-    dispatch_debug_store_meta(debug_time_meta, 2, num_tokens);
-    dispatch_debug_store_meta(debug_time_meta, 3,
-                              gctx.max_num_inp_token_per_rank);  // dispatch staging slots
-    dispatch_debug_store_meta(debug_time_meta, 4, 0);            // total recv; filled later
-    dispatch_debug_store_meta(debug_time_meta, 5, num_blocks);
-    dispatch_debug_store_meta(debug_time_meta, 6, 0);  // remote recv; filled later
-    dispatch_debug_store_meta(debug_time_meta, 7, 0);  // self recv; filled later
   }
 
   __shared__ int s_num_unique[kDispatchWavesPerBlock];  // number of unique destinations for each
@@ -388,17 +308,11 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
   if (bid == 0) {
     dispatch_prescan_unique_dest_counts(gctx, d_expert_indices, num_tokens,
                                         dispatch_dest_token_counts);
-    if (tid == 0) {
-      dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::count_prescan_done);
-    }
 
     if (wf_in_blk == 0) {
       __builtin_amdgcn_s_waitcnt(0);
       count_all2all_ticket = post_all2all(
           gctx, dispatch_handle, reinterpret_cast<const uint32_t*>(dispatch_dest_token_counts));
-      if (lane == 0) {
-        dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::count_all2all_started);
-      }
     }
   }
 
@@ -549,26 +463,18 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
                                 ? (num_post - base)
                                 : internal::EP_COMM_MAX_DESTS;
         if (out_idx >= base && out_idx < base + chunk_n) {
-          ep_multicast_desc_set_rank_disp(
-              payload_mc, out_idx - base, s_item_unique_dests[lane],
-              dispatch_put_remote_disp(gctx, s_item_unique_recv_slots[lane]),
-              s_item_unique_recv_slots[lane]);
+          ep_multicast_desc_set_rank_disp(payload_mc, out_idx - base, s_item_unique_dests[lane],
+                                          gctx.dispatch_remote_disp(s_item_unique_recv_slots[lane]),
+                                          s_item_unique_recv_slots[lane]);
         }
         if (lane == 0) {
-          ep_multicast_desc_set_scalars(gctx, payload_mc, dispatch_put_src_ptr(gctx, staging),
-                                        dispatch_put_bytes(gctx), heap_id, chunk_n,
-                                        gctx.dispatch_readiness_flags_offset);
+          ep_multicast_desc_set_scalars(gctx, payload_mc, staging, gctx.dispatch_layout.slot.stride,
+                                        heap_id, chunk_n, gctx.dispatch_readiness_flags_offset);
         }
         __builtin_amdgcn_s_waitcnt(0);
         __builtin_amdgcn_wave_barrier();
         post_put_multicast(gctx, dispatch_handle, payload_mc);
         __builtin_amdgcn_wave_barrier();
-      }
-
-      if constexpr (UseHybridRcomp) {
-        if (bid == 0 && wf_in_blk == 0 && t == 0 && lane == 0) {
-          dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::rcomp_rdma_posted);
-        }
       }
     }
 
@@ -628,9 +534,6 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
     __syncthreads();
 
     if constexpr (UseHybridRcomp) {
-      if (bid == 0 && t == 0 && tid == 0) {
-        dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::rcomp_ipc_copies_complete);
-      }
       if (route_owner) {
         for (int u = lane; u < *s_item_num_unique; u += EP_WAVE_SIZE) {
           if ((ipc_route_mask & (1u << u)) != 0u) {
@@ -657,31 +560,21 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
       // Fused receive-count all2all and map building.  Wave 0 performs
       // the dynamic collective-control work once; all block-0 threads join
       // below to parallelize the row-map construction.
-      if (lane == 0) {
-        dispatch_debug_store_time(debug_time_buf,
-                                  dispatch_debug_slot::incoming_count_all2all_wait_start);
-      }
       volatile uint64_t* all2all_recv =
           reinterpret_cast<volatile uint64_t*>(device_workspace.all2all_counts_recv());
       wait_all2all(gctx, count_all2all_ticket, device_workspace.all2all_counts_recv());
       // all2all_recv[r] is the number of dispatch rows this rank will
       // receive from producer rank r.  Load the per-source vector across
       // wave lanes, publish recv_counts[r] for map construction, and
-      // reduce the same values to the total and peer-only incoming row
-      // counts in lane 0.
+      // reduce the same values to the total incoming row count in lane 0.
       int32_t lane_total = 0;
-      int32_t lane_remote = 0;
       for (int r = lane; r < world_size; r += EP_WAVE_SIZE) {
         const int32_t c = static_cast<int32_t>(all2all_recv[r]);
         recv_counts[r] = c;
         lane_total += c;
-        if (r != rank_me) {
-          lane_remote += c;
-        }
       }
       for (int offset = EP_WAVE_SIZE / 2; offset > 0; offset >>= 1) {
         lane_total += __shfl_down(lane_total, offset);
-        lane_remote += __shfl_down(lane_remote, offset);
       }
       // The wave barrier only synchronizes control flow.  Drain the lanes'
       // recv_counts[] stores before lane 0 reads that vector below.
@@ -689,16 +582,8 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
       __builtin_amdgcn_wave_barrier();
 
       if (lane == 0) {
-        const int32_t total = lane_total;
-        const int32_t remote_recv = lane_remote;
-        dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::incoming_counts_observed);
-
-        recv_counts[world_size] = total;
-        *device_workspace.recv_count() = total;
-        dispatch_debug_store_meta(debug_time_meta, 4, total);
-        dispatch_debug_store_meta(debug_time_meta, 6, remote_recv);
-        dispatch_debug_store_meta(debug_time_meta, 7, recv_counts[gctx.rank_me]);
-
+        recv_counts[world_size] = lane_total;
+        *device_workspace.recv_count() = lane_total;
         device_workspace.recv_begin()[0] = 0;
       }
 
@@ -733,9 +618,6 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
       }
     }
     __syncthreads();
-    if (tid == 0) {
-      dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::rank_slot_maps_built);
-    }
   }
 
   grid_barrier_ticket_t unpack_ready_ticket =
@@ -749,9 +631,6 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
   if (bid == 0) {
     for (int r = tid; r < world_size; r += blockDim.x) {
       device_workspace.dest_token_counts()[r] = 0;
-    }
-    if (tid == 0) {
-      dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::unpack_barrier_released);
     }
   }
 
@@ -845,10 +724,6 @@ __global__ void dispatch(ep_gcontext_t gctx, const void* __restrict__ d_tokens,
   }
 
   __syncthreads();
-
-  if (bid == 0 && threadIdx.x == 0) {
-    dispatch_debug_store_time(debug_time_buf, dispatch_debug_slot::unpack_done);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -881,14 +756,10 @@ static void launch_dispatch_round(ep_context_t& ctx, ep_gcontext_t& gctx, const 
 
   if (launch_policy.rcomp_backend == rcomp_backend_t::HYBRID) {
     dispatch<true><<<launch_num_blocks, EP_THREADS_PER_BLOCK, 0, stream>>>(
-        gctx, d_tokens, d_expert_indices, d_weights, d_scales, num_tokens,
-        ctx.debug_timing_enabled() ? ctx.debug_time_buf() : nullptr,
-        ctx.debug_timing_enabled() ? ctx.debug_time_meta() : nullptr);
+        gctx, d_tokens, d_expert_indices, d_weights, d_scales, num_tokens);
   } else {
     dispatch<false><<<launch_num_blocks, EP_THREADS_PER_BLOCK, 0, stream>>>(
-        gctx, d_tokens, d_expert_indices, d_weights, d_scales, num_tokens,
-        ctx.debug_timing_enabled() ? ctx.debug_time_buf() : nullptr,
-        ctx.debug_timing_enabled() ? ctx.debug_time_meta() : nullptr);
+        gctx, d_tokens, d_expert_indices, d_weights, d_scales, num_tokens);
   }
   HIP_CHECK(hipGetLastError());
 }

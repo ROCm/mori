@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-#include "mori/kiwi/rdma/bootstrap.hpp"
+#include "mori/application/bootstrap/base_bootstrap.hpp"
 
 namespace mori::kiwi::ep {
 
@@ -62,7 +62,7 @@ class ep_op_t {
  public:
   // Collective over `bootstrap`. The calling thread's current HIP device is
   // used.
-  ep_op_t(const ep_op_config_t& config, std::shared_ptr<rdma::bootstrap_t> bootstrap);
+  ep_op_t(const ep_op_config_t& config, std::shared_ptr<application::BootstrapNetwork> bootstrap);
   ~ep_op_t();
 
   ep_op_t(const ep_op_t&) = delete;
@@ -98,11 +98,6 @@ class ep_op_t {
   int rank() const;
   int world_size() const;
   int num_input_tokens() const { return num_input_tokens_; }
-
-  void set_debug_timing_enabled(bool enabled);
-  bool debug_timing_enabled() const;
-  std::vector<uint64_t> debug_time_words() const;
-  std::vector<int32_t> debug_meta_words() const;
 
  private:
   std::unique_ptr<ep_context_t> ctx_;

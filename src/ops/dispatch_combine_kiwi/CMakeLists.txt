@@ -1,7 +1,8 @@
-# KIWI EP dispatch/combine kernels and their Python module. Self-contained:
-# depends only on mori_kiwi.
+# KIWI EP dispatch/combine kernels and their Python module. The proxy transport
+# uses mori_application's RDMA layer, topology and bootstrap.
 set(MORI_OPS_KIWI_SOURCES
     comm/context.hip.cpp
+    comm/rdma.cpp
     comm/transport_callbacks.hip.cpp
     all2all.hip.cpp
     ep_context.hip.cpp
@@ -12,7 +13,9 @@ set_source_files_properties(${MORI_OPS_KIWI_SOURCES} PROPERTIES LANGUAGE HIP)
 
 add_library(mori_ops_kiwi SHARED ${MORI_OPS_KIWI_SOURCES})
 target_include_directories(mori_ops_kiwi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mori_ops_kiwi PUBLIC mori_kiwi)
+# libibverbs is loaded at runtime via dlopen; embed the shim (hidden visibility)
+# so the proxy's own ibv_* references resolve without linking libibverbs.
+target_link_libraries(mori_ops_kiwi PUBLIC mori_kiwi mori_application PRIVATE mori_ibv_shim)
 set_target_properties(
   mori_ops_kiwi
   PROPERTIES HIP_STANDARD 17

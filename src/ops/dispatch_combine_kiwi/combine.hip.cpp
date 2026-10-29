@@ -30,44 +30,7 @@
 #endif
 #include <cstdio>
 
-// Diagnostic-only compile-time toggles for issue #10 payload-bandwidth
-// experiments.  The default build keeps normal correctness-preserving behavior.
-// Enabling either toggle is intentionally timing-only: hidden outputs become
-// invalid, but slot metadata is still transferred so the benchmark can keep
-// exercising the routing/control path without crashing.
-#ifndef KIWI_EP_DIAG_SKIP_HIDDEN_COPY
-#define KIWI_EP_DIAG_SKIP_HIDDEN_COPY 0
-#endif
-
-#ifndef KIWI_EP_DIAG_METADATA_ONLY_PUT
-#define KIWI_EP_DIAG_METADATA_ONLY_PUT 0
-#endif
-
 namespace mori::kiwi::ep {
-
-__device__ inline char* combine_put_src_ptr(const ep_gcontext_t& gctx, char* slot) {
-#if KIWI_EP_DIAG_METADATA_ONLY_PUT
-  return slot + gctx.combine_layout.slot.weights_offset;
-#else
-  return slot;
-#endif
-}
-
-__device__ inline uintptr_t combine_put_remote_disp(const ep_gcontext_t& gctx, int recv_slot) {
-  uintptr_t remote_disp = gctx.combine_remote_disp(recv_slot);
-#if KIWI_EP_DIAG_METADATA_ONLY_PUT
-  remote_disp += gctx.combine_layout.slot.weights_offset;
-#endif
-  return remote_disp;
-}
-
-__device__ inline size_t combine_put_bytes(const ep_gcontext_t& gctx) {
-#if KIWI_EP_DIAG_METADATA_ONLY_PUT
-  return gctx.combine_layout.slot.payload_size - gctx.combine_layout.slot.weights_offset;
-#else
-  return gctx.combine_layout.slot.stride;
-#endif
-}
 
 __device__ inline uint8_t* dispatch_payload_readiness_flag(const ep_gcontext_t& gctx,
                                                            int source_rank, int source_local_slot) {
@@ -88,28 +51,13 @@ __device__ inline void combine_pack_slot_part(const ep_gcontext_t& gctx, const c
                                               size_t hidden_offset, int hidden_bytes,
                                               char* dst_slot, bool copy_weights, int thread_idx,
                                               int thread_count) {
-  if (!KIWI_EP_DIAG_SKIP_HIDDEN_COPY) {
-    void* dst_hidden =
-        static_cast<char*>(gctx.combine_layout.slot.hidden(dst_slot)) + hidden_offset;
-    copy_hidden_payload_block<SystemScopeStore>(src_hidden, dst_hidden, hidden_bytes, thread_idx,
-                                                thread_count);
-  }
+  void* dst_hidden = static_cast<char*>(gctx.combine_layout.slot.hidden(dst_slot)) + hidden_offset;
+  copy_hidden_payload_block<SystemScopeStore>(src_hidden, dst_hidden, hidden_bytes, thread_idx,
+                                              thread_count);
   if (copy_weights) {
     copy_bytes_block<SystemScopeStore, MetadataSystemScopeLoad>(
         src_weights, gctx.combine_layout.slot.weights(dst_slot),
         topk * static_cast<int>(sizeof(float)), thread_idx, thread_count);
-  }
-}
-
-__device__ inline void debug_store_time(uint64_t* debug_time_buf, int idx) {
-  if (debug_time_buf != nullptr) {
-    debug_time_buf[idx] = static_cast<uint64_t>(wall_clock64());
-  }
-}
-
-__device__ inline void debug_store_meta(int32_t* debug_time_meta, int idx, int32_t value) {
-  if (debug_time_meta != nullptr) {
-    debug_time_meta[idx] = value;
   }
 }
 
@@ -506,7 +454,7 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
                                const float* d_expert_weights,
                                void* d_output,  // [num_tokens][combine_hidden_elems], pre-zeroed
                                float* d_output_weights,  // optional [num_tokens][topk]
-                               int num_tokens, uint64_t* debug_time_buf, int32_t* debug_time_meta) {
+                               int num_tokens) {
   const ep_device_workspace_t& device_workspace = gctx.device_workspace;
   const int lane = threadIdx.x % EP_WAVE_SIZE;
   const int wf_in_blk = threadIdx.x / EP_WAVE_SIZE;
@@ -543,28 +491,7 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
   __shared__ int s_num_valid[kCombineWavesPerBlock];
   __shared__ int s_valid_producer_rank[kCombineWavesPerBlock][MAX_TOPK_SUPPORTED];
 
-  if (bid == 0 && threadIdx.x == 0) {
-    debug_store_time(debug_time_buf, 0);  // kernel entry
-    debug_store_meta(debug_time_meta, 0, rank_me);
-    debug_store_meta(debug_time_meta, 1, world_size);
-    debug_store_meta(debug_time_meta, 2, num_tokens);
-    debug_store_meta(debug_time_meta, 3, total_recv);
-    debug_store_meta(debug_time_meta, 4, gridDim.x);
-    debug_store_meta(debug_time_meta, 5, gridDim.x);
-    debug_store_meta(debug_time_meta, 6, total_recv - recv_counts[rank_me]);
-    debug_store_meta(debug_time_meta, 7, recv_counts[rank_me]);
-    debug_store_meta(debug_time_meta, 8, combine_hidden_elems);
-    debug_store_meta(debug_time_meta, 9, combine_elem_size);
-    debug_store_meta(debug_time_meta, 10, gctx.combine_hidden_elems);
-  }
-
   ep_barrier_ticket_t combine_pack_barrier{};
-
-  if (bid == 0 && is_first_wf) {
-    if (lane == 0) {
-      debug_store_time(debug_time_buf, 1);  // rcomp combine work start
-    }
-  }
 
   // =================================================================
   // Phase 1 + 2: dynamically group waves per incoming row while preserving
@@ -676,10 +603,9 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
         copy_bytes_block(packed_slot, gctx.combine_recv_slot(rank_me, combine_slot),
                          slot_payload_size, group_thread_idx, group_thread_count);
       } else if (combine_row_comm_owner) {
-        uintptr_t remote_disp = combine_put_remote_disp(gctx, combine_slot);
-        ep_post_put(gctx, combine_handle, heap_id, src_rank, combine_put_src_ptr(gctx, packed_slot),
-                    combine_put_bytes(gctx), remote_disp, gctx.combine_readiness_flags_offset,
-                    combine_slot);
+        ep_post_put(gctx, combine_handle, heap_id, src_rank, packed_slot,
+                    gctx.combine_layout.slot.stride, gctx.combine_remote_disp(combine_slot),
+                    gctx.combine_readiness_flags_offset, combine_slot);
       }
 
       if (src_rank != rank_me && combine_row_comm_owner && lane == 0) {
@@ -688,20 +614,10 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
     }
   }
 
-  if (bid == 0 && threadIdx.x == 0) {
-    debug_store_time(debug_time_buf, 2);  // block 0 pack/post done
-  }
-
   // Dispatch readiness resets are raw system-scope VMEM stores.  Drain them
   // on every block before the local pack barrier lets block 0 publish the
   // cross-rank pack-release barrier below.
   __builtin_amdgcn_s_waitcnt(0);
-
-  if (bid == 0 && is_first_wf) {
-    if (lane == 0) {
-      debug_store_time(debug_time_buf, 3);  // comm path wait start
-    }
-  }
 
   grid_barrier_ticket_t local_pack_ticket =
       grid_barrier_arrive(device_workspace.grid_barrier(), static_cast<uint32_t>(gridDim.x));
@@ -709,16 +625,6 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
 
   if (bid == 0 && is_first_wf) {
     combine_pack_barrier = post_barrier(gctx, combine_handle);
-    if (lane == 0) {
-      debug_store_time(debug_time_buf, 4);  // combine-exit barrier posted after pack
-    }
-  }
-
-  if (bid == 0 && threadIdx.x == 0) {
-    debug_store_time(debug_time_buf, 5);  // all blocks completed local pack
-  }
-  if (bid == 0 && threadIdx.x == 0) {
-    debug_store_time(debug_time_buf, 6);  // accumulation start
   }
 
   // =================================================================
@@ -826,9 +732,6 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
     }
     __builtin_amdgcn_wave_barrier();
   }
-  if (bid == 0 && threadIdx.x == 0) {
-    debug_store_time(debug_time_buf, 7);  // block 0 accumulation done
-  }
 
   // =================================================================
   // Phase 5: every block arrives only after its local accumulation and rcomp
@@ -858,17 +761,8 @@ __global__ void combine_kernel(ep_gcontext_t gctx, const void* d_expert_output,
     }
     __builtin_amdgcn_s_waitcnt(0);
     __syncthreads();
-    if (threadIdx.x == 0) {
-      debug_store_time(debug_time_buf, 8);  // all local blocks done
-    }
     if (is_first_wf) {
-      if (lane == 0) {
-        debug_store_time(debug_time_buf, 9);  // wait for combine-exit barrier
-      }
       wait_barrier(gctx, combine_pack_barrier);
-      if (lane == 0) {
-        debug_store_time(debug_time_buf, 10);  // rcomp exit barrier complete
-      }
     }
   }
 }
@@ -915,14 +809,10 @@ void combine_enqueue(ep_context_t& ctx, ep_gcontext_t& gctx, const void* d_exper
 
   if (launch_policy.rcomp_backend == rcomp_backend_t::HYBRID) {
     combine_kernel<true><<<launch_num_blocks, EP_THREADS_PER_BLOCK, 0, stream>>>(
-        gctx, d_expert_output, d_expert_weights, d_output, d_output_weights, num_tokens,
-        ctx.debug_timing_enabled() ? ctx.debug_time_buf() : nullptr,
-        ctx.debug_timing_enabled() ? ctx.debug_time_meta() : nullptr);
+        gctx, d_expert_output, d_expert_weights, d_output, d_output_weights, num_tokens);
   } else {
     combine_kernel<false><<<launch_num_blocks, EP_THREADS_PER_BLOCK, 0, stream>>>(
-        gctx, d_expert_output, d_expert_weights, d_output, d_output_weights, num_tokens,
-        ctx.debug_timing_enabled() ? ctx.debug_time_buf() : nullptr,
-        ctx.debug_timing_enabled() ? ctx.debug_time_meta() : nullptr);
+        gctx, d_expert_output, d_expert_weights, d_output, d_output_weights, num_tokens);
   }
   HIP_CHECK(hipGetLastError());
 }

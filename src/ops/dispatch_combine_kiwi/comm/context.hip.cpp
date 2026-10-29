@@ -117,9 +117,9 @@ void proxy_network_put_inline(int rank, const void* local, size_t size, uint64_t
 
 }  // namespace internal
 
-ep_comm_context_t::ep_comm_context_t(std::shared_ptr<rdma::bootstrap_t> bootstrap, int num_queues,
-                                     int num_devices, std::string requested_device_name,
-                                     size_t queue_capacity)
+ep_comm_context_t::ep_comm_context_t(std::shared_ptr<application::BootstrapNetwork> bootstrap,
+                                     int num_queues, int num_devices,
+                                     std::string requested_device_name, size_t queue_capacity)
     : bootstrap_(std::move(bootstrap)),
       num_queues_(num_queues),
       num_devices_(num_devices),
@@ -146,7 +146,7 @@ ep_comm_context_t::ep_comm_context_t(std::shared_ptr<rdma::bootstrap_t> bootstra
       std::make_unique<mori::kiwi::invoke::Context<ep_queue_t>>(num_queues_, queue_capacity);
 
   // One NIC context per EP context; each proxy thread owns one device with
-  // its own CQ and RC QPs to every rank. Device creation is collective.
+  // an RC endpoint (QP and CQ) to every rank. Device creation is collective.
   net_ = std::make_unique<rdma::net_context_t>(requested_device_name);
   devices_.reserve(num_devices_);
   for (int i = 0; i < num_devices_; i++) {
@@ -174,12 +174,12 @@ ep_comm_device_context_t ep_comm_context_t::get_device_context(uint8_t all2all_c
 int ep_comm_context_t::alloc_symmetric(void* buf, size_t size) {
   assert(!devices_.empty());
 
-  const int nranks = bootstrap_->size();
+  const int nranks = bootstrap_->GetWorldSize();
   internal::ep_heap_entry_t heap_entry;
   heap_entry.mr = net_->register_memory(buf, size);
-  const rdma::rmr_t my_rmr = heap_entry.mr.rmr();
+  rdma::rmr_t my_rmr = heap_entry.mr.rmr();
   heap_entry.rmrs.resize(static_cast<size_t>(nranks));
-  bootstrap_->allgather(&my_rmr, heap_entry.rmrs.data(), sizeof(rdma::rmr_t));
+  bootstrap_->Allgather(&my_rmr, heap_entry.rmrs.data(), sizeof(rdma::rmr_t));
 
   int heap_id = static_cast<int>(heap_table_.size());
   heap_table_.push_back(std::move(heap_entry));
