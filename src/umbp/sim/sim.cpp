@@ -385,7 +385,7 @@ std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPl
     auto stage = [&] {
       auto planned = Plan(copies);
       if (!planned.rejected_tags.empty()) return false;
-      // MoriIoEngine stages with serial HostCopyBlock calls, without CPU fan-out.
+      // MoriIoEngine stages with serial memcpy calls, without CPU fan-out.
       return reserve_and_wait(planned.plans, true);
     };
     bool ok = !copies.empty() && (!push || stage());

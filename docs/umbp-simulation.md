@@ -90,6 +90,9 @@ by this PR.
 Local copies finish in Submit; registered remote copies finish in Wait. Unregistered
 CPU callers retain RDMA bounce geometry and serial staging inside Submit. Ranged
 scratch and re-cache payloads are virtual; a re-cached replica can serve other peers.
+Staging shares the single-thread `cpu_cpu` coefficients with local copies. The model
+does not distinguish memcpy staging from non-temporal local copies; validate staged
+timings separately.
 Sim/real engines reject each other's handshake. Distributed ranged I/O still needs scratch.
 Remote GPU callers retain real registration restrictions; standalone GPU IPC is local-copy-only.
 
