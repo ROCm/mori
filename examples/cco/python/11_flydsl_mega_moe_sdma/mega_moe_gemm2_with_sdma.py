@@ -220,8 +220,17 @@ def sdma_wait_consumed(w, peer, phase, *, layout, rank):
     )
 
 
-def sdma_put_run(sdma, win, peer, queue, *, layout, rank, lo, hi, cco):
+def sdma_put_run(
+    sdma, win, peer, queue, *, layout, rank, lo, hi, cco, remote_signal=False
+):
     """Ship rows ``[lo, hi)`` of my run for ``peer``.
+
+    No local signal: a put that names none keeps cco's old default, a trailing
+    ATOMIC into our own signal pool, and nothing here waits on it -- completion
+    is the peer's remote signal or ``quiet_queue``. Dropping it is one packet
+    less per put (-3.6% stage2+combine at 2048 tokens/rank, -0.5% at 8192).
+    ``remote_signal`` hangs the completion signal on this put instead (see
+    ``sdma_finish_peer``).
 
     One put for the whole run. Puts are asynchronous -- each reserves a slot,
     writes the copy descriptor and rings the doorbell -- but a queue is a ring
@@ -242,12 +251,25 @@ def sdma_put_run(sdma, win, peer, queue, *, layout, rank, lo, hi, cco):
         fx.Int64(hi - lo) * fx.Int64(rb),
         queue,
         coop=cco.CoopScope.THREAD,
+        local_signal=False,
+        remote_signal=remote_signal,
     )
 
 
 @comm_ops.traced
 def sdma_finish_peer(
-    sdma, w, win, peer, queue, phase, *, layout, rank, cco, signal_mode="remote"
+    sdma,
+    w,
+    win,
+    peer,
+    queue,
+    phase,
+    *,
+    layout,
+    rank,
+    cco,
+    signal_mode="remote",
+    signalled=False,
 ):
     """Tell ``peer`` its rows have landed.
 
@@ -270,12 +292,15 @@ def sdma_finish_peer(
 
     Either way the flag carries the call number. Under ``remote`` it says nothing
     about the data -- the signal does that.
+
+    ``signalled``: the last data put for ``peer`` already carried the signal, so
+    the 4-byte put is skipped. Only a peer whose last chunk was empty needs it.
     """
     if signal_mode not in ("quiet", "remote"):
         raise ValueError(f"signal_mode must be quiet or remote, got {signal_mode!r}")
     remote = signal_mode == "remote"
     # Under `remote` this put carries the signal: 4 bytes the peer never reads.
-    if const_expr(remote):
+    if const_expr(remote and not signalled):
         sdma.put(
             peer,
             win,
@@ -1102,6 +1127,9 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
 
                 total_tiles = (cumsum0 + fx.Int32(SBM - 1)) // fx.Int32(SBM)
                 n_chunks = (total_tiles + fx.Int32(CT - 1)) // fx.Int32(CT)
+                last = n_chunks - fx.Int32(1)
+                # Under "remote" the last chunk's put carries the completion signal.
+                sig_on_put = comm.signal_mode == "remote"
                 for c in range(fx.Int32(0), n_chunks, fx.Int32(1)):
                     ci = fx.Int32(c)
                     m_lo = ci * fx.Int32(CT * mb_per_tile)
@@ -1123,14 +1151,41 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                             hi = tile_base_buf[t1 * fx.Int32(npes) + peer]
                             if hi > lo:
                                 if is_lane0:
-                                    sdma_put_run(sdma, arg_win, peer, queue_of(peer),
-                                                 layout=lay, rank=rank, lo=lo, hi=hi, cco=cco)
+                                    if const_expr(sig_on_put):
+                                        if ci == last:
+                                            sdma_put_run(sdma, arg_win, peer, queue_of(peer),
+                                                         layout=lay, rank=rank, lo=lo, hi=hi,
+                                                         cco=cco, remote_signal=True)
+                                        else:
+                                            sdma_put_run(sdma, arg_win, peer, queue_of(peer),
+                                                         layout=lay, rank=rank, lo=lo, hi=hi,
+                                                         cco=cco)
+                                    else:
+                                        sdma_put_run(sdma, arg_win, peer, queue_of(peer),
+                                                     layout=lay, rank=rank, lo=lo, hi=hi, cco=cco)
                 for peer in my_peers:
                     if sends_to(peer):
                         if is_lane0:
-                            sdma_finish_peer(sdma, w, arg_win, peer, queue_of(peer), phase,
-                                             layout=lay, rank=rank, cco=cco,
-                                             signal_mode=comm.signal_mode)
+                            if const_expr(sig_on_put):
+                                # Did the last chunk's put carry the signal? Not if that
+                                # chunk was empty for this peer, or there were no chunks.
+                                t_last = last * fx.Int32(CT)
+                                t_last = (t_last > fx.Int32(0)).select(t_last, fx.Int32(0))
+                                lo_l = tile_base_buf[t_last * fx.Int32(npes) + peer]
+                                hi_l = tile_base_buf[total_tiles * fx.Int32(npes) + peer]
+                                if (n_chunks > fx.Int32(0)) & (hi_l > lo_l):
+                                    sdma_finish_peer(sdma, w, arg_win, peer, queue_of(peer),
+                                                     phase, layout=lay, rank=rank, cco=cco,
+                                                     signal_mode=comm.signal_mode,
+                                                     signalled=True)
+                                else:
+                                    sdma_finish_peer(sdma, w, arg_win, peer, queue_of(peer),
+                                                     phase, layout=lay, rank=rank, cco=cco,
+                                                     signal_mode=comm.signal_mode)
+                            else:
+                                sdma_finish_peer(sdma, w, arg_win, peer, queue_of(peer), phase,
+                                                 layout=lay, rank=rank, cco=cco,
+                                                 signal_mode=comm.signal_mode)
 
         if const_expr(fuse):
             if bid < fx.Int32(NC):
