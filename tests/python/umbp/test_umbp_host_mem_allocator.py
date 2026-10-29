@@ -59,6 +59,23 @@ def test_numa_config_environment_and_python_properties(monkeypatch):
         umbp.UMBPConfig.from_environment()
 
 
+def test_distributed_config_starts_from_the_environment(monkeypatch):
+    monkeypatch.setenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", str(256 << 20))
+    monkeypatch.setenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES", "1")
+    # A per-rank port list is the caller's to resolve, not an error here.
+    monkeypatch.setenv("UMBP_IO_ENGINE_PORT", "25192,25193")
+    dist = umbp.UMBPDistributedConfig()
+    assert dist.ranged_scratch_size == 256 << 20
+    assert dist.ranged_scratch_use_hugepages
+    assert dist.io_engine.port == 0
+    # What the caller sets afterwards wins, as an sglang extra_config key does.
+    dist.ranged_scratch_size = 1 << 30
+    assert dist.ranged_scratch_size == 1 << 30
+    monkeypatch.setenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", "lots")
+    with pytest.raises(ValueError):
+        umbp.UMBPDistributedConfig()
+
+
 def _touch(handle, value: int = 0x5A) -> None:
     assert handle
     data = (ctypes.c_ubyte * handle.requested_size).from_address(handle.ptr)

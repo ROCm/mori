@@ -186,9 +186,6 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("tier_io_threads", &UMBPSsdConfig::tier_io_threads)
       .def_readwrite("direct_io", &UMBPSsdConfig::direct_io)
       .def_readwrite("verify_crc", &UMBPSsdConfig::verify_crc)
-      // sglang's UMBPStore builds UMBPConfig directly rather than via
-      // FromEnvironment(), so UMBP_SSD_SINGLE_FLIGHT never reaches it — this is
-      // the only way to turn coalescing off on that path.
       .def_readwrite("single_flight_reads", &UMBPSsdConfig::single_flight_reads)
       .def_readwrite("high_watermark", &UMBPSsdConfig::high_watermark)
       .def_readwrite("low_watermark", &UMBPSsdConfig::low_watermark)
@@ -258,7 +255,11 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("capacity_bytes", &UMBPHbmConfig::capacity_bytes);
 
   py::class_<UMBPDistributedConfig>(m, "UMBPDistributedConfig")
-      .def(py::init<>())
+      // The UMBP_DISTRIBUTED_* variables over the defaults, as the standalone
+      // server configures itself: a caller that builds its config here (sglang's
+      // UMBPStore) gets them, and a field it sets afterwards wins over its
+      // variable.  Raises ValueError on a malformed one.
+      .def(py::init(&UMBPDistributedConfig::FromEnvironment))
       .def_readwrite("master_config", &UMBPDistributedConfig::master_config)
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)

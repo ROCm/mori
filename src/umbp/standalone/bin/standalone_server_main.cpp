@@ -26,7 +26,6 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -49,69 +48,9 @@
 
 namespace {
 
-std::optional<std::string> EnvString(const char* name) {
-  const char* value = std::getenv(name);
-  if (!value || value[0] == '\0') return std::nullopt;
-  return std::string(value);
-}
-
-bool ParseSizeEnv(const char* name, size_t* out, std::string* error) {
-  auto raw = EnvString(name);
-  if (!raw.has_value()) return true;
-  try {
-    *out = static_cast<size_t>(std::stoull(*raw));
-    return true;
-  } catch (const std::exception& exc) {
-    *error = std::string("invalid ") + name + ": " + exc.what();
-    return false;
-  }
-}
-
-bool ParseUint16Env(const char* name, uint16_t* out, std::string* error) {
-  auto raw = EnvString(name);
-  if (!raw.has_value()) return true;
-  try {
-    unsigned long value = std::stoul(*raw);
-    if (value > 65535) {
-      *error = std::string(name) + " must be <= 65535";
-      return false;
-    }
-    *out = static_cast<uint16_t>(value);
-    return true;
-  } catch (const std::exception& exc) {
-    *error = std::string("invalid ") + name + ": " + exc.what();
-    return false;
-  }
-}
-
-bool ParseIntEnv(const char* name, int* out, std::string* error) {
-  auto raw = EnvString(name);
-  if (!raw.has_value()) return true;
-  try {
-    *out = std::stoi(*raw);
-    return true;
-  } catch (const std::exception& exc) {
-    *error = std::string("invalid ") + name + ": " + exc.what();
-    return false;
-  }
-}
-
-bool ParseBoolEnv(const char* name, bool* out, std::string* error) {
-  auto raw = EnvString(name);
-  if (!raw.has_value()) return true;
-  std::string value = *raw;
-  for (char& ch : value) ch = static_cast<char>(std::tolower(ch));
-  if (value == "1" || value == "true" || value == "yes" || value == "on") {
-    *out = true;
-    return true;
-  }
-  if (value == "0" || value == "false" || value == "no" || value == "off") {
-    *out = false;
-    return true;
-  }
-  *error = std::string("invalid boolean ") + name + "=" + *raw;
-  return false;
-}
+using mori::umbp::env_parse::EnvString;
+using mori::umbp::env_parse::ParseBoolEnv;
+using mori::umbp::env_parse::ParseUint16Env;
 
 // Identity for a masterless server: unique enough to tell two of them apart in
 // a log, and never published anywhere.
@@ -196,71 +135,13 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
 
   if (!ParseUint16Env("UMBP_IO_ENGINE_PORT", &dist.io_engine.port, error)) return false;
   if (!ParseUint16Env("UMBP_PEER_SERVICE_PORT", &dist.peer_service_port, error)) return false;
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_STAGING_BUFFER_SIZE", &dist.staging_buffer_size, error))
-    return false;
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES", &dist.ranged_scratch_size, error))
-    return false;
-  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES",
-                    &dist.ranged_scratch_use_hugepages, error)) {
-    return false;
-  }
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_HUGEPAGE_SIZE",
-                    &dist.ranged_scratch_hugepage_size, error)) {
-    return false;
-  }
   // Every GPU on the node shares this server's arenas.
   dist.ranged_scratch_numa_layout = true;
   if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA", &dist.ranged_scratch_numa_layout,
                     error)) {
     return false;
   }
-  if (!ParseIntEnv("UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS", &dist.ssd_staging_buffer_slots,
-                   error)) {
-    return false;
-  }
-  if (dist.ssd_staging_buffer_slots < 0) {
-    *error = "UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS must be >= 0 (0 = the preset)";
-    return false;
-  }
-  if (!ParseBoolEnv("UMBP_DISTRIBUTED_SSD_STAGING_USE_HUGEPAGES", &dist.ssd_staging_use_hugepages,
-                    error)) {
-    return false;
-  }
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_SSD_STAGING_HUGEPAGE_SIZE", &dist.ssd_staging_hugepage_size,
-                    error)) {
-    return false;
-  }
-  // The one medium this node serves.  Selecting SSD here is the whole opt-in
-  // for a storage node — there is no separate "pure-SSD mode" flag.  Unknown
-  // values are rejected rather than silently defaulting to DRAM, since serving
-  // the wrong medium is not something a node should discover at runtime.
-  if (const char* medium_env = std::getenv("UMBP_DISTRIBUTED_MEDIUM")) {
-    const std::string m(medium_env);
-    if (m == "DRAM" || m == "dram") {
-      dist.medium = mori::umbp::UMBPMedium::DRAM;
-    } else if (m == "HBM" || m == "hbm") {
-      dist.medium = mori::umbp::UMBPMedium::HBM;
-    } else if (m == "SSD" || m == "ssd") {
-      dist.medium = mori::umbp::UMBPMedium::SSD;
-    } else {
-      *error = "UMBP_DISTRIBUTED_MEDIUM must be one of: DRAM, HBM, SSD";
-      return false;
-    }
-  }
-  if (!ParseBoolEnv("UMBP_DISTRIBUTED_CACHE_REMOTE_FETCHES", &dist.cache_remote_fetches, error))
-    return false;
-  if (!ParseBoolEnv("UMBP_DISTRIBUTED_RANGED_LOCALITY_PREFETCH", &dist.ranged_locality_prefetch,
-                    error)) {
-    return false;
-  }
-  if (!ParseBoolEnv("UMBP_DISTRIBUTED_LOCAL_FIRST", &dist.local_first, error)) {
-    return false;
-  }
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_PREFETCH_BUDGET_BYTES", &dist.prefetch_budget_bytes, error))
-    return false;
-  size_t dram_page_size = static_cast<size_t>(dist.dram_page_size);
-  if (!ParseSizeEnv("UMBP_DISTRIBUTED_DRAM_PAGE_SIZE", &dram_page_size, error)) return false;
-  dist.dram_page_size = static_cast<uint64_t>(dram_page_size);
+  if (!dist.ApplyEnvironment(error)) return false;
   // Local pools can use MORI's default. Cluster members must agree on a page size.
   if (has_master && dist.dram_page_size == 0) {
     *error = "UMBP_DISTRIBUTED_DRAM_PAGE_SIZE must be explicitly set to > 0";
