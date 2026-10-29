@@ -137,6 +137,13 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
     FreeRangedScratch();
     throw std::runtime_error("DistributedClient: ranged scratch registration failed");
   }
+  // An arena is a NIC memory region only where this node has an RDMA engine.
+  if (!dc.io_engine.host.empty()) {
+    for (const auto& handle : ranged_scratch_handles_) {
+      WarnIfNicRegionAliases("Ranged scratch arena", handle.mapped_size, handle.actual_alignment,
+                             kScratchRemedy);
+    }
+  }
 
   std::string tags_str;
   for (const auto& t : dc.master_config.tags) {
@@ -422,8 +429,6 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
       "[DistributedClient] ranged scratch: 2 arenas x {} MiB, {} KiB pages ({})",
       first.mapped_size >> 20, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
-  WarnIfNicRegionAliases("Ranged scratch arena", first.mapped_size, first.actual_alignment,
-                         kScratchRemedy);
 }
 
 bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
@@ -472,8 +477,6 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
       arenas->push_back({handle.ptr, part, node, shards});
       ranged_scratch_handles_.push_back(handle);
     }
-    WarnIfNicRegionAliases("Ranged scratch part on NUMA node " + std::to_string(node), part,
-                           ranged_scratch_handles_.back().actual_alignment, kScratchRemedy);
     layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
               std::to_string(shards) + " x " + std::to_string((part / shards) >> 10) + " KiB";
   }

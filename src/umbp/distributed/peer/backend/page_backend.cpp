@@ -274,13 +274,6 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
       const uint64_t size = std::min(step, buffer.size - offset);
       if (offset > 0 && size < page_size_) break;  // slack no page can use
       void* base = static_cast<char*>(buffer.base) + offset;
-      if (loc == mori::io::MemoryLocationType::CPU) {
-        WarnIfNicRegionAliases(
-            "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
-                " MiB",
-            size, buffer.backing_page_size,
-            "Use UMBP_DRAM_USE_HUGEPAGES, or UMBP_DRAM_MAX_MR_BYTES of at most 2^18 pages.");
-      }
       std::vector<uint8_t> desc_bytes;
       if (registrar != nullptr) {
         // The backend supplies the facts a descriptor cannot recover — location
@@ -289,6 +282,12 @@ bool PageBackend::Init(MemoryRegistrar* registrar) {
         TransferRef ref = registrar->RegisterMemory(base, size, loc, device);
         owned_refs_.push_back(ref);
         if (ref.HasMemoryDesc()) {
+          WarnIfNicRegionAliases(
+              "DRAM buffer " + std::to_string(b) + " region at " + std::to_string(offset >> 20) +
+                  " MiB",
+              size, buffer.backing_page_size,
+              "Use UMBP_DRAM_USE_HUGEPAGES, or a UMBP_DRAM_MAX_MR_BYTES of at most 2^18 pages "
+              "(1 GiB of 4 KiB ones).");
           msgpack::sbuffer sbuf;
           msgpack::pack(sbuf, ref.mem);
           desc_bytes.assign(sbuf.data(), sbuf.data() + sbuf.size());
