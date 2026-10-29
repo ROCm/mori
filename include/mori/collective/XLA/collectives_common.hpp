@@ -81,6 +81,19 @@ enum GroupCtrIdx {
   kGroupCtrTotal = kBcastTargetIdx + 1,
 };
 
+// Collective-permute pairwise handshake flags, consolidated into one
+// symmetric-heap uint64[kPermuteFlagSlots][kCCLMaxPeers] buffer (permuteCtr;
+// zeroed once, never reset). Slot [idx][p] of my copy is written only by PE p,
+// addressed by the permSlot(idx, p) helper in the permute kernels. The three
+// rows used to be three separate buffers (ready / sendReady / readDone).
+enum PermuteFlagIdx {
+  kReadyFlag = 0, // receiver's "I have entered to receive from you" token. 
+                  // Written into the sender's row, polled by the sender.
+  kSendReadyFlag, // pull-only sender's "I have entered to send to you" token.
+  kReadDoneFlag,  // pull-only receiver's "I am done reading your sendBuf" token.
+  kPermuteFlagSlots,
+};
+
 // Per-peer all-to-all endpoints: chunk sent from `source` to peer p / received// into `dest` from peer p. Host-fillable, device-readable (host-pinned buffer).
 struct AddressPair {
   const void* source;

@@ -235,7 +235,8 @@ class CollectivesFacade {
     // with MORI_CCL_MAX_NBLOCKS; <= 0 disables the cap (use the full CU count).
     state.maxNBlocks = static_cast<int>(EnvInt("MORI_CCL_MAX_NBLOCKS", 128));
 
-    size_t controlBytes = kCCLMaxPeers * sizeof(uint64_t) * 4 + kArrivedBytes;
+    size_t controlBytes =
+        kCCLMaxPeers * sizeof(uint64_t) * (1 + kPermuteFlagSlots) + kArrivedBytes;
     size_t totalBytes = maxStagingBytes + controlBytes;
     state.staging = Allocate(totalBytes);
     if (state.staging == nullptr) {
@@ -250,26 +251,23 @@ class CollectivesFacade {
     // by PE p; never reset after this.
     state.barrierCtr = reinterpret_cast<uint64_t*>(
              static_cast<uint8_t*>(state.staging) + maxStagingBytes);
-    // Collective-permute ready counts. Slot p of my copy is written only by PE p:
-    // the number of permutes in which p has entered to receive from me; never reset.
-    state.permuteReady = state.barrierCtr + kCCLMaxPeers;
-    // Pull collective-permute handshake (see CollectivePermutePullKernel), same
-    // ownership rule: slot p of my copy is written only by PE p.
-    state.permuteSendReady = state.permuteReady + kCCLMaxPeers;
-    state.permuteReadDone = state.permuteSendReady + kCCLMaxPeers;
+    // Collective-permute handshake flags (see PermuteFlagIdx / CollectivePermute*
+    // kernels), consolidated into one [kPermuteFlagSlots][kCCLMaxPeers] buffer.
+    // Slot [idx][p] of my copy is written only by PE p; never reset.
+    state.permuteCtr = state.barrierCtr + kCCLMaxPeers;
     // SDMA completion slots of the push collectives (see kArrivedStride): row p of
     // my copy is written only by PE p's SDMA swaps; never reset after this.
-    state.arrived = state.permuteReadDone + kCCLMaxPeers;
+    state.arrived = state.permuteCtr + kPermuteFlagSlots * kCCLMaxPeers;
     HIP_RUNTIME_CHECK(hipMemset(state.barrierCtr, 0, controlBytes));
 
     // One local, zeroed-once buffer: the uint64 per-peer permute counts first
     // (see CollectivePermutePushKernel: [p] sends to p, [kCCLMaxPeers + p]
     // receives from p), then the uint32 groupCtr.
-    const size_t permuteCntBytes = 2 * kCCLMaxPeers * sizeof(uint64_t);
-    const size_t localCtrBytes = permuteCntBytes + kGroupCtrTotal * sizeof(uint32_t);
-    HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.permuteCnt), localCtrBytes));
-    HIP_RUNTIME_CHECK(hipMemset(state.permuteCnt, 0, localCtrBytes));
-    state.groupCtr = reinterpret_cast<uint32_t*>(state.permuteCnt + 2 * kCCLMaxPeers);    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
+    const size_t permuteNumBytes = 2 * kCCLMaxPeers * sizeof(uint64_t);
+    const size_t localCtrBytes = permuteNumBytes + kGroupCtrTotal * sizeof(uint32_t);
+    HIP_RUNTIME_CHECK(hipMalloc(reinterpret_cast<void**>(&state.permuteNum), localCtrBytes));
+    HIP_RUNTIME_CHECK(hipMemset(state.permuteNum, 0, localCtrBytes));
+    state.groupCtr = reinterpret_cast<uint32_t*>(state.permuteNum + 2 * kCCLMaxPeers);    // Preallocate the pinned (host-visible, device-readable) all-to-all pointer
     // buffer once, so each RunAllToAll is a plain host fill + launch (no per-call
     // device alloc/copy). Sized for the max supported peer count.
     HIP_RUNTIME_CHECK(hipHostMalloc(reinterpret_cast<void**>(&state.pinnedPairs),
@@ -421,12 +419,11 @@ class CollectivesFacade {
    struct SharedState {
     void* staging{nullptr};
     size_t stagingBytes{0};
-    uint64_t* permuteCnt{nullptr};    // local, per-peer permute send/recv counts (owns the buffer)
-    uint32_t* groupCtr{nullptr};  // local, sub-region of the permuteCnt buffer
+    uint64_t* permuteNum{nullptr};    // local, per-peer permute send/recv counts (owns the buffer)
+    uint32_t* groupCtr{nullptr};  // local, sub-region of the permuteNum buffer
     uint64_t* barrierCtr{nullptr};  // symmetric, gen-barrier flags of all collectives (slot p written by PE p)
-    uint64_t* permuteReady{nullptr};  // symmetric, permute ready counts (slot p written by PE p)
-    uint64_t* permuteSendReady{nullptr};  // symmetric, pull-permute sender-entered counts
-    uint64_t* permuteReadDone{nullptr};   // symmetric, pull-permute receiver-done counts
+    uint64_t* permuteCtr{nullptr};  // symmetric, consolidated permute handshake flags
+                                      // [kPermuteFlagSlots][kCCLMaxPeers] (slot [idx][p] written by PE p)
     uint64_t* arrived{nullptr};  // symmetric, SDMA completion slots (row p written by PE p)
     AddressPair* pinnedPairs{nullptr};  // host-pinned, device-readable
     cco::ccoComm* ccoComm{nullptr};
@@ -451,8 +448,8 @@ class CollectivesFacade {
         cco::ccoDevCommDestroy(ccoComm, &devComm);
         cco::ccoCommDestroy(ccoComm);
       }
-      if (permuteCnt != nullptr) {  // also backs groupCtr
-        HIP_RUNTIME_CHECK(hipFree(permuteCnt));
+      if (permuteNum != nullptr) {  // also backs groupCtr
+        HIP_RUNTIME_CHECK(hipFree(permuteNum));
       }
       if (pinnedPairs != nullptr) {
         HIP_RUNTIME_CHECK(hipHostFree(pinnedPairs));

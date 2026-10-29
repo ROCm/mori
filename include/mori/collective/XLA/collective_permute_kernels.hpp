@@ -47,10 +47,12 @@ namespace collective {
 //   dstPe    : peer that receives our sendBuf (may be myPe), or -1 if nobody does
 //   srcPe    : peer that sends into our recvBuf, or -1 if nobody does
 //
-//   ready    : symmetric-heap uint64[>= npes] ready counts, zeroed once, never
-//              reset. Slot p of my copy is written only by PE p.
-//   cnt      : local uint64[2*kCCLMaxPeers], zeroed once, thread 0 only.
-//              cnt[p] counts my permutes sending to p, cnt[kCCLMaxPeers+p]
+//   permuteCtr : symmetric-heap uint64[kPermuteFlagSlots][kCCLMaxPeers]
+//              handshake flags, zeroed once, never reset. Slot [idx][p] of my
+//              copy is written only by PE p (permSlot(idx, p)); the push
+//              kernel uses only the kReadyFlag row.
+//   permuteNum      : local uint64[2*kCCLMaxPeers], zeroed once, thread 0 only.
+//              permuteNum[p] counts my permutes sending to p, permuteNum[kCCLMaxPeers+p]
 //              my permutes receiving from p.
 //   arrived  : symmetric-heap SDMA completion slots (see kArrivedStride), global
 //              PE rows; this kernel uses column kPermuteArrived only.
@@ -59,7 +61,7 @@ namespace collective {
 // pair synchronize, so PEs that do not launch this kernel are never waited on.
 // Each side counts the permutes it shares with its partner: whenever I send to
 // dstPe, dstPe receives from me, so my k-th send pairs with its k-th receive.
-// The receiver posts its count k into its source's ready[myPe]; the sender
+// The receiver posts its count k into its source's kReadyFlag[myPe]; the sender
 // waits until its destination's slot reaches its own count k. The slot only
 // grows, so nothing is consumed or cleared.
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
@@ -69,8 +71,8 @@ namespace collective {
 // count k, then an acquire fence makes the peer SDMA write visible. The slot only
 // grows, so nothing is reset.
 //
-// A self-permute (dstPe == srcPe == myPe) counts in cnt[myPe] and
-// cnt[kCCLMaxPeers+myPe] too, so the self send and self receive stay paired;
+// A self-permute (dstPe == srcPe == myPe) counts in permuteNum[myPe] and
+// permuteNum[kCCLMaxPeers+myPe] too, so the self send and self receive stay paired;
 // the pull kernel never counts self-permutes, so mixing push and pull keeps them
 // in step.
 //
@@ -82,12 +84,18 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                             void* __restrict__ recvBuf, size_t numBytes,
                                             cco::ccoDevComm devComm,
                                             cco::ccoWindow_t heapWin,
-                                            uint64_t* __restrict__ ready,
-                                            uint64_t* __restrict__ cnt,
+                                            uint64_t* __restrict__ permuteCtr,
+                                            uint64_t* __restrict__ permuteNum,
                                             uint64_t* __restrict__ arrived) {
-  const int myLsaRank = heapWin->lsaRank;
+  const int myLsa = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
   __shared__ uint64_t sendK, recvK;
+
+  // Flat offset of flag `idx`'s slot for peer `peer` in the permuteCtr buffer.
+  auto permSlot = [=](PermuteFlagIdx idx, int pe) -> uint64_t* { 
+    return permuteCtr + idx * kCCLMaxPeers + pe; 
+  };
+
   // dstPe reaching count k proves it has entered this launch, so by its stream
   // order its previous kernel (of any collective) is done with recvBuf. Without
   // it, my copy could overwrite recvBuf before dstPe consumed it. Every PE posts
@@ -100,17 +108,19 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   // k-th copy lands, which needs this wait to pass first.
   if (threadIdx.x == 0) {
     if (srcPe >= 0) {
-      const uint64_t k = ++cnt[kCCLMaxPeers + srcPe];
+      const uint64_t k = ++permuteNum[kCCLMaxPeers + srcPe];
       recvK = k;
-      if (srcPe != myLsaRank) {
-        AtomicStore<ESystemScope>(PeerPtr(&ready[myLsaRank], srcPe, myLsaRank, stride4G), k);
+      if (srcPe != myLsa) {
+        AtomicStore<ESystemScope>(
+            PeerPtr(permSlot(kReadyFlag, myLsa), srcPe, myLsa, stride4G),
+            k);
       }
     }
     if (dstPe >= 0) {
-      const uint64_t k = ++cnt[dstPe];
+      const uint64_t k = ++permuteNum[dstPe];
       sendK = k;
-      if (dstPe != myLsaRank) {
-        while (AtomicLoad<ESystemScope>(&ready[dstPe]) < k) {
+      if (dstPe != myLsa) {
+        while (AtomicLoad<ESystemScope>(permSlot(kReadyFlag, dstPe)) < k) {
           __builtin_amdgcn_s_sleep(1);
         }
       }
@@ -128,8 +138,8 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
       devComm.sdma, npes, /*logS=*/0, sendK,
       [=](int peer) {
         auto [dstP, sigP] = PeerPtrs(localDst,
-                    arrived + myLsaRank * kArrivedStride + kPermuteArrived,
-                    peer, myLsaRank, stride4G);
+                    arrived + myLsa * kArrivedStride + kPermuteArrived,
+                    peer, myLsa, stride4G);
         return ScatterPeer{
             peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
             dstP, sigP};
@@ -150,25 +160,25 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
 
 // Multi-block, SDMA-free collective-permute (one destination): every PE reads
 // srcPe's sendBuf straight over XGMI into its own recvBuf. Same arguments as
-// CollectivePermutePushKernel, plus:
-//   sendReady : symmetric-heap uint64[>= npes], zeroed once, never reset. Slot p
-//               of my copy is written only by PE p: the number of permutes in
-//               which p has entered to send to me.
-//   readDone  : symmetric-heap uint64[>= npes], same rules: the number of
-//               permutes in which p has finished reading my sendBuf.
+// CollectivePermutePushKernel. It shares the same permuteCtr buffer and uses
+// three of its rows (slot [idx][p] written only by PE p):
+//   kReadyFlag     : posted into srcPe's row as the "receiver has entered" token.
+//   kSendReadyFlag : the number of permutes in which p has entered to send to me.
+//   kReadDoneFlag  : the number of permutes in which p has finished reading my
+//                    sendBuf.
 //   groupCtr : plain device buffer, [kArrivalIdx] elects the last block.
 //
 // Pull reverses the push dependencies: the receiver may read only once the
 // sender has entered (its producers of sendBuf have retired), and the sender may
 // complete only once the receiver is done reading sendBuf. Both sides number
-// their shared permutes with the same cnt[] as the push kernel (k-th send to p
+// their shared permutes with the same permuteNum[] as the push kernel (k-th send to p
 // pairs with p's k-th receive from me), so push and pull launches can be mixed:
-//   * entry, block 0: post k into dstPe's sendReady[me]; also post k into
-//     srcPe's ready[me], the push kernel's "receiver has entered" token.
-//   * every block of a receiver waits for sendReady[srcPe] >= k, then copies.
-//   * exit, last block: post k into srcPe's readDone[me], then, if sending, wait
-//     for readDone[dstPe] >= k; finally bump cnt.
-// Every block reads cnt at entry and only the last block, after every block has
+//   * entry, block 0: post k into dstPe's kSendReadyFlag[me]; also post k into
+//     srcPe's kReadyFlag[me], the push kernel's "receiver has entered" token.
+//   * every block of a receiver waits for kSendReadyFlag[srcPe] >= k, then copies.
+//   * exit, last block: post k into srcPe's kReadDoneFlag[me], then, if sending,
+//     wait for kReadDoneFlag[dstPe] >= k; finally bump permuteNum.
+// Every block reads permuteNum at entry and only the last block, after every block has
 // counted in, writes it, so no block of this launch can see the new value. Every
 // PE posts before it waits, so rings and 2-cycles cannot deadlock (the grid is
 // co-resident). dstPe == srcPe == myPe is a plain local copy without handshake.
@@ -176,25 +186,33 @@ template <int NumVecs>
 __global__ void __launch_bounds__(256, 1)
 CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t heapWin,
                             const void* __restrict__ sendBuf, void* __restrict__ recvBuf,
-                            size_t numBytes, uint64_t* __restrict__ ready,
-                            uint64_t* __restrict__ sendReady, uint64_t* __restrict__ readDone,
-                            uint64_t* __restrict__ cnt, uint32_t* __restrict__ groupCtr) {
+                            size_t numBytes, uint64_t* __restrict__ permuteCtr,
+                            uint64_t* __restrict__ permuteNum, uint32_t* __restrict__ groupCtr) {
   const int me = heapWin->lsaRank;
   const uint32_t stride4G = heapWin->stride4G;
   const bool sends = dstPe >= 0 && dstPe != me;
   const bool recvs = srcPe >= 0 && srcPe != me;
-  const uint64_t kSend = sends ? AtomicLoad<EAgentScope>(&cnt[dstPe]) + 1 : 0;
-  const uint64_t kRecv = recvs ? AtomicLoad<EAgentScope>(&cnt[kCCLMaxPeers + srcPe]) + 1 : 0;
+  const uint64_t kSend = sends ? AtomicLoad<EAgentScope>(&permuteNum[dstPe]) + 1 : 0;
+  const uint64_t kRecv = recvs ? AtomicLoad<EAgentScope>(&permuteNum[kCCLMaxPeers + srcPe]) + 1 : 0;
+
+  // Flat offset of flag `idx`'s slot for peer `peer` in the permuteCtr buffer.
+  auto permSlot = [=](PermuteFlagIdx idx, int pe) -> uint64_t* { 
+    return permuteCtr + idx * kCCLMaxPeers + pe; 
+  };
 
   if (threadIdx.x == 0) {
     if (blockIdx.x == 0) {
       // Orders the stores of sendBuf's producers ahead of the post.
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
-      if (sends) AtomicStore<ESystemScope>(PeerPtr(&sendReady[me], dstPe, me, stride4G), kSend);
-      if (recvs) AtomicStore<ESystemScope>(PeerPtr(&ready[me], srcPe, me, stride4G), kRecv);
+      if (sends)
+        AtomicStore<ESystemScope>(
+            PeerPtr(permSlot(kSendReadyFlag, me), dstPe, me, stride4G), kSend);
+      if (recvs)
+        AtomicStore<ESystemScope>(
+            PeerPtr(permSlot(kReadyFlag, me), srcPe, me, stride4G), kRecv);
     }
     if (recvs) {
-      while (AtomicLoad<ESystemScope>(&sendReady[srcPe]) < kRecv) {
+      while (AtomicLoad<ESystemScope>(permSlot(kSendReadyFlag, srcPe)) < kRecv) {
         __builtin_amdgcn_s_sleep(1);
       }
     }
@@ -214,14 +232,16 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
   __syncthreads();
   if (threadIdx.x < warpSize && LastBlockOut(groupCtr) && threadIdx.x == 0) {
     __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "");
-    if (recvs) AtomicStore<ESystemScope>(PeerPtr(&readDone[me], srcPe, me, stride4G), kRecv);
+    if (recvs)
+      AtomicStore<ESystemScope>(
+          PeerPtr(permSlot(kReadDoneFlag, me), srcPe, me, stride4G), kRecv);
     if (sends) {
-      while (AtomicLoad<ESystemScope>(&readDone[dstPe]) < kSend) {
+      while (AtomicLoad<ESystemScope>(permSlot(kReadDoneFlag, dstPe)) < kSend) {
         __builtin_amdgcn_s_sleep(1);
       }
-      cnt[dstPe] = kSend;
+      permuteNum[dstPe] = kSend;
     }
-    if (recvs) cnt[kCCLMaxPeers + srcPe] = kRecv;
+    if (recvs) permuteNum[kCCLMaxPeers + srcPe] = kRecv;
   }
 }
 } // namespace collective
