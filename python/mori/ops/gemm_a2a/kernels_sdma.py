@@ -55,7 +55,7 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
-from ..gemm_ar._compat import (
+from mori.cco.device.flydsl.signals import (
     local_load_u32,
     local_store_u32,
     signal_ptr,

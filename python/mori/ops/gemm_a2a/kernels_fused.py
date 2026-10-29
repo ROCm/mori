@@ -85,11 +85,11 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
+from mori.cco.device.flydsl.buffer import create_buffer_resource_from_addr
+from mori.cco.device.flydsl.signals import signal_ptr
 from ..gemm_ar._compat import (
     atomic_add_u32,
     atomic_store_u32,
-    create_buffer_resource_from_addr,
-    signal_ptr,
     wave_uniform_i64,
 )
 from ..gemm_ar._gemm_a8w8_8wave import (
@@ -341,6 +341,11 @@ def compile_fused_gemm_a2a(
             f"the config's, so the two must be the same"
         )
     assert K % BLOCK_K == 0
+    if K < 2 * BLOCK_K:
+        raise ValueError(
+            f"K={K} is below {2 * BLOCK_K}: the mainloop prefetches a second K "
+            f"block and runs two tail steps"
+        )
     blockscale = quant == "blockscale"
     mxfp8 = quant == "mxfp8"
     if mxfp8:
@@ -450,6 +455,9 @@ def compile_fused_gemm_a2a(
         win: Int64,
     ):
         # ---- begin pinned copy of _gemm_a8w8_8wave kernel_gemm ----
+        # A copy, so a change to gemm_ar's main loop does not reach it: #785's
+        # fix was mirrored by hand, and #857 (the mxfp8 scale prefetch one K
+        # step ahead) will have to be too once it lands.
         F8_IR_t = fx.Float8E4M3FN.ir_type
 
         n_blocks = ceildiv(c_n, BLOCK_N)
@@ -967,12 +975,15 @@ def compile_fused_gemm_a2a(
                 # _compat's "monotonic": the election has to order
                 # against the stores the fence above published.
                 seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
-                # Monotonic: the counters are never reset, so "last tile of this
-                # chunk, this epoch" is a modulo test rather than a compare --
-                # the same property that makes graph replay behave like a fresh
-                # launch. Each counter only ever sees its own chunk's tiles, so
-                # an uneven plan's per-chunk divisor keeps that true.
-                if seq % c_tiles == fx.Int32(0):
+                # The c_tiles-th arrival is the chunk's last tile this call. It
+                # puts the counter back to zero for the next call -- every one of
+                # this call's increments has already landed, and the next call's
+                # cannot start before this kernel ends -- so a graph replay still
+                # behaves like a fresh launch. A counter left to run on and
+                # tested modulo c_tiles elects the wrong tile once it crosses
+                # 2^31 (signed) or 2^32 (unless c_tiles is a power of two).
+                if seq == c_tiles:
+                    atomic_add_u32(ctr, fx.Int32(0) - c_tiles)
                     if const_expr(fuse and emit_put) and dest != fx.Int32(rank):
                         off = c_off
                         lock = signal_ptr(lock_base + fx.Int64(dest) * fx.Int64(4))

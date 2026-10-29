@@ -39,7 +39,13 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from mori.cco import Communicator, UniqueId
+from mori.cco import (
+    GDA_CONNECTION_NONE,
+    CCODevCommRequirements,
+    Communicator,
+    UniqueId,
+)
+from mori.tensor_utils import from_gpu_ptr
 from mori.ops.gemm_a2a import GemmA2AOp
 from mori.ops.gemm_ar import preshuffle_a_scale, preshuffle_b
 
@@ -118,7 +124,50 @@ def case_correct(op, rank, world, n, k, quant):
         g.replay()
         torch.cuda.synchronize()
         out.append(("graph", m, _worst(recv, rank, world, salt, m, n, k, quant)[0]))
-    return {"checks": out, "ok": all(w < TOL for *_, w in out)}
+    # Every call puts its election counters back to zero; one left running is
+    # one that will cross 2^31 and elect the wrong tile.
+    left = 0
+    for m, slot in op._shape_slot.items():
+        cfg = op._cfg(m, slot=slot)
+        ctr = from_gpu_ptr(
+            op.mem.ptr + cfg.counter_off, (cfg.counter_set_bytes // 4,), torch.int32
+        )
+        left += int(ctr.count_nonzero())
+    return {
+        "checks": out,
+        "counters_left": left,
+        "ok": all(w < TOL for *_, w in out) and left == 0,
+    }
+
+
+def case_reject(comm, n, k):
+    """What the constructor must refuse rather than return wrong bytes from.
+
+    The communicator's first dev-comm fixes its SDMA queue count (one here, or
+    none with SDMA off); a later request for more only logs.
+    """
+    reqs = CCODevCommRequirements()
+    reqs.gda_connection_type = GDA_CONNECTION_NONE
+    reqs.gda_signal_count = 0
+    reqs.gda_counter_count = 0
+    reqs.sdma_queue_count = 1
+    first = comm.create_dev_comm(reqs)
+
+    def verdict(**kw):
+        try:
+            with GemmA2AOp(comm, n=n, m_max=256, **kw):
+                return "accepted"
+        except (ValueError, RuntimeError) as e:
+            return f"rejected: {type(e).__name__}"
+
+    out = {
+        "queues_on_comm": first.sdma_num_queue,
+        "k128": verdict(k=128),
+        "one_queue": verdict(k=k, sdma_queues=1),
+        "two_queues": verdict(k=k, sdma_queues=2),
+    }
+    first.close()
+    return out
 
 
 def _delay(ms: float):
@@ -155,7 +204,9 @@ def case_race(op, rank, world, n, k, quant, victim_delay_ms):
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--case", choices=("correct", "race", "self_test"), required=True)
+    p.add_argument(
+        "--case", choices=("correct", "race", "self_test", "reject"), required=True
+    )
     p.add_argument("--mode", default="fused")
     p.add_argument("--quant", default="ptpc")
     p.add_argument("--no-credit", action="store_true")
@@ -168,6 +219,16 @@ def main() -> int:
     m_max = 2048
     wb = GemmA2AOp.window_bytes_for(world, n=args.n, m_max=m_max, quant=args.quant)
     with Communicator.init(world, rank, uid, per_rank_vmm=2 * wb + (256 << 20)) as comm:
+        if args.case == "reject":
+            res = case_reject(comm, args.n, args.k)
+            gathered = [None] * world
+            dist.all_gather_object(gathered, res)
+            if rank == 0:
+                print(
+                    "RESULT_JSON " + json.dumps({"case": args.case, "ranks": gathered})
+                )
+            dist.barrier()
+            return 0
         with GemmA2AOp(
             comm,
             n=args.n,

@@ -58,7 +58,7 @@ import torch
 from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
 from mori.tensor_utils import from_gpu_ptr
 
-from ..gemm_ar.op import FP8_DTYPES, _flatten_mxfp8_a_scale, _PinnedLaunch
+from ..gemm_ar.op import MIN_K, FP8_DTYPES, _flatten_mxfp8_a_scale, _PinnedLaunch
 from .kernels_fused import BLOCK_K, compile_fused_gemm_a2a
 from .kernels_sdma import build_sdma_phases
 from .layout import (
@@ -127,6 +127,11 @@ class GemmA2AOp:
             raise ValueError(f"chunks must be >= 1, got {chunks}")
         if k % BLOCK_K:
             raise ValueError(f"k={k} must be a multiple of {BLOCK_K}")
+        if k < MIN_K:
+            raise ValueError(
+                f"k={k} is below the minimum {MIN_K}: the mainloop prefetches a "
+                f"second K block and runs two tail steps, so k/{BLOCK_K} must be >= 2"
+            )
         if quant == "mxfp8" and n % MXFP8_BLOCK:
             raise ValueError(f"mxfp8 needs n % {MXFP8_BLOCK} == 0, got n={n}")
         self.comm = comm
@@ -160,6 +165,28 @@ class GemmA2AOp:
             reqs.gda_counter_count = 0
             reqs.sdma_queue_count = sdma_queues
             self.dev_comm = comm.create_dev_comm(reqs)
+            # Both modes push over SDMA. cco fixes the queue count at the comm's
+            # first dev-comm and only logs when a later one asks for more, or
+            # when SDMA is off altogether; a put on a queue that does not exist
+            # moves nothing, so the op would return stale bytes without a word.
+            if self.dev_comm.sdma_num_queue < sdma_queues:
+                raise RuntimeError(
+                    f"GemmA2AOp needs {sdma_queues} SDMA queue(s) per peer but the "
+                    f"communicator has {self.dev_comm.sdma_num_queue}: build mori "
+                    f"with BUILD_CCO_SDMA=ON, set MORI_ENABLE_SDMA=1, and make sure "
+                    f"the first dev-comm created on this communicator asked for at "
+                    f"least that many"
+                )
+            # World ranks are used as LSA ranks throughout.
+            if self.dev_comm.lsa_size != self.world_size:
+                raise RuntimeError(
+                    f"GemmA2AOp needs every rank in one LSA domain (one node); "
+                    f"lsa_size={self.dev_comm.lsa_size}, world_size={self.world_size}"
+                )
+            # Every rank's zeroing has to land before any peer's first push or
+            # credit into this window.
+            torch.cuda.synchronize()
+            comm.barrier()
         except Exception:
             self._closed = False
             self.close()
@@ -216,8 +243,9 @@ class GemmA2AOp:
         return 1
 
     def _slot(self, m: int) -> int:
-        """This M's counter set, assigned on first sight. The election counters
-        are never reset, so two M values must never share a set."""
+        """This M's counter set, assigned on first sight. Every call leaves its
+        election counters back at zero; a set per M is still kept, so a shape's
+        counters never depend on another shape's calls having completed."""
         slot = self._shape_slot.get(m)
         if slot is None:
             if len(self._shape_slot) >= self.max_shapes:
@@ -416,7 +444,9 @@ class GemmA2AOp:
         A mori built with ``BUILD_CCO_SDMA=OFF``, or run without
         ``MORI_ENABLE_SDMA=1``, still launches every kernel and returns from
         every put -- the puts move nothing, and the result is this rank's own
-        block plus whatever the window held. So: write ``src+1`` into every
+        block plus whatever the window held. The constructor refuses a
+        communicator that reports fewer SDMA queues than asked for; this checks
+        that the bytes actually move. So: write ``src+1`` into every
         staging slab, run the split push at ``m_max``, and check every remote
         block of recv came back as its source's value.
         """

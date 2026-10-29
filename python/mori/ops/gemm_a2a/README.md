@@ -177,36 +177,37 @@ Ulysses SP4 (its `sp_qkv` large path): `K=6144`, and per destination either Q|K|
 mori can only express that with IK's 128 weight rows replicated per destination,
 so on the indexer case mori does 3.9% more GEMM work than aiter.
 
-Same node, same day, GPUs 0–3, three interleaved rounds. aiter ran its
-`fp8_a2a_sdma_{dense,indexer}` standalone harness (PR revision r11) with the two
-configurations its tuning profile lists for each shape, 3000 back-to-back
-iterations after 50 warmups, max over ranks; the better of the two is shown.
-mori ran `fused-sdma` with `sweep_inproc.py --suite minimax`, timed as above.
-Both sides time back-to-back launches on the GPU, but the loops are not the same
-code: aiter reports the mean over its loop, mori the median launch gap. Every
-sample on both sides validated, and the spread across rounds is under 1% in
-every cell.
+Measured against aiter's current head (474128f), whose shipped profile selects
+its r13 kernels for every large row. aiter's side was timed through its public
+plan API -- `SpQkvLarge.run` with the profile-selected parameters, i.e. its GEMM,
+SDMA exchange and `quiet_ready` -- and mori's with `sweep_inproc.py --suite
+minimax`. Both sides: CUDA graph replay, back to back with an event between
+launches, median launch gap, max over ranks, GPUs 0-3 of one node, three
+interleaved rounds (spread <= 0.4%), every result validated at 1.66e-3. These
+numbers come from the review of this PR (8x MI355X, ROCm 7.14 CI image, FlyDSL
+0.4.0); times in us:
 
-| case | M | aiter, best tuned | mori, `GemmA2AOp` default | vs aiter | mori, best arm | vs aiter |
+| case | M | aiter r13 | mori, `GemmA2AOp` default | vs aiter | mori, best arm | vs aiter |
 |---|---:|---:|---|---:|---|---:|
-| dense | 2048 | 245.4 | 243.2 `128 c8` | -0.9% | **232.1** `128 c4` | -5.4% |
-| dense | 4096 | 439.7 | 431.6 `256 c8` | -1.8% | **404.2** `128 c8` | -8.1% |
-| dense | 8192 | 772.1 | 751.2 `256 c8` | -2.7% | **746.4** `128 c16` | -3.3% |
-| indexer | 2048 | 283.6 | 259.6 `128 c8` | -8.5% | **249.4** `128 c4` | -12.1% |
-| indexer | 4096 | 468.3 | 467.8 `256 c8` | -0.1% | **440.0** `128 c8` | -6.0% |
-| indexer | 8192 | 871.9 | 824.5 `256 c8` | -5.4% | **815.4** `128 c16` | -6.5% |
+| dense | 2048 | 247.0 | 242.4 `128 c8` | -1.8% | **231.8** `128 c4` | -6.2% |
+| dense | 4096 | 439.3 | 431.0 `256 c8` | -1.9% | **404.4** `128 c8` | -7.9% |
+| dense | 8192 | 778.1 | 751.7 `256 c8` | -3.4% | **747.2** `128 c16` | -4.0% |
+| indexer | 2048 | 289.6 | 259.5 `128 c8` | -10.4% | **248.6** `128 c4` | -14.2% |
+| indexer | 4096 | 475.2 | 467.4 `256 c8` | -1.6% | **438.8** `128 c8` | -7.7% |
+| indexer | 8192 | 870.6 | 825.4 `256 c8` | -5.2% | **814.9** `128 c16` | -6.4% |
 
-Times in us; "vs aiter" is negative where mori is faster. For scale, dense
-`gemm-only` is 117.5 / 195.7 / 336.0us and dense `split-rccl` 325.3 / 602.7 /
-1131.3us at M = 2048 / 4096 / 8192.
+"vs aiter" is negative where mori is faster. For scale, dense `gemm-only` is
+117.5 / 195.7 / 336.0us and dense `split-rccl` 325.3 / 602.7 / 1131.3us at
+M = 2048 / 4096 / 8192 (this file's own run).
 
-mori is ahead in every cell, by 0–9% with the operator's own picks and 3–12%
-with the best arm, and that is with the indexer doing 3.9% more GEMM. The
-defaults leave time on the table at P=4: 128x256 wins at every M (the tile rule
-was fitted at P=8), and at M=2048 four chunks beat the eight that
-`default_chunks` picks. aiter's tuning was done for its own kernel, so the "best
-tuned" column is aiter's best foot forward; mori's "best arm" is the best of
-three tried, not a tuned optimum either.
+mori is ahead in every cell, by 1.6-10.4% with the operator's own picks and
+4.0-14.2% with the best arm, and that is with the indexer doing 3.9% more GEMM.
+An earlier run here against aiter's r11 kernels, through a standalone harness
+and the two configurations its profile listed per shape, agreed within about a
+point. The defaults leave time on the table at P=4 -- up to 6.6% (dense and
+indexer M=4096): 128x256 wins at every M (the tile rule was fitted at P=8), and
+at M=2048 four chunks beat the eight that `default_chunks` picks. A
+world-size-aware rule is left for a follow-up.
 
 ## Reading the tables
 

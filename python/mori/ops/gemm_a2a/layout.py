@@ -207,8 +207,9 @@ class A2aConfig:
     #: a single window serves several ``m``. 0 means "same as counter_chunks".
     counter_capacity: int = 0
     #: Independent counter sets the region holds, and which one this config
-    #: uses. The election test is a residue on a counter that is never reset, so
-    #: two shapes sharing a set would elect on each other's leftovers.
+    #: uses. Every call's elected tile puts its counter back to zero, so sets
+    #: could be shared; one per shape is kept so no shape's election depends on
+    #: another's calls having completed.
     counter_shape_slots: int = 1
     counter_shape_index: int = 0
     #: Lay the payload regions out for this ``m`` instead of for ``m``. Pinning
@@ -342,7 +343,8 @@ class A2aConfig:
 
     @property
     def counter_region_off(self) -> int:
-        """Monotonic tile counters for the fused GEMM, one per (dest, chunk)."""
+        """Tile counters for the fused GEMM's election, one per (dest, chunk);
+        each call's last tile resets its counter to zero."""
         return _align_up(self.flag_off + self.max_blocks * 4, SIGNAL_ALIGN)
 
     @property

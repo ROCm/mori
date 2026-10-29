@@ -58,9 +58,9 @@ requires_world = pytest.mark.skipif(
 )
 
 
-def _spawn(*args: str, timeout: int = 900, last: bool = False):
+def _spawn(*args: str, timeout: int = 900, last: bool = False, env=None):
     time.sleep(_SETTLE_SECONDS)
-    env = os.environ.copy()
+    env = {**os.environ, **(env or {})}
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
     result = subprocess.run(
@@ -89,11 +89,11 @@ def _spawn(*args: str, timeout: int = 900, last: bool = False):
     return json.loads(lines[-1].removeprefix("RESULT_JSON "))
 
 
-def _run(*args: str):
-    rec = _spawn(*args)
+def _run(*args: str, env=None):
+    rec = _spawn(*args, env=env)
     if rec is None:
         time.sleep(_SETTLE_SECONDS * 3)
-        rec = _spawn(*args, last=True)
+        rec = _spawn(*args, last=True, env=env)
     return rec["ranks"]
 
 
@@ -131,3 +131,21 @@ def test_without_the_credit_the_race_is_real(mode):
         r for r in _run("--case", "race", "--mode", mode, "--no-credit") if r["victim"]
     )
     assert not victim["ok"], victim
+
+
+@requires_world
+def test_constructor_refuses_what_would_return_wrong_bytes():
+    """K below two K blocks, and more SDMA queues than the communicator has: both
+    used to construct fine and return relL2 ~1.0 on every rank."""
+    for r in _run("--case", "reject"):
+        assert r["queues_on_comm"] == 1, r
+        assert r["k128"].startswith("rejected: ValueError"), r
+        assert r["one_queue"] == "accepted", r
+        assert r["two_queues"].startswith("rejected: RuntimeError"), r
+
+
+@requires_world
+def test_constructor_refuses_a_communicator_without_sdma():
+    for r in _run("--case", "reject", env={"MORI_ENABLE_SDMA": "0"}):
+        assert r["queues_on_comm"] == 0, r
+        assert r["one_queue"].startswith("rejected: RuntimeError"), r

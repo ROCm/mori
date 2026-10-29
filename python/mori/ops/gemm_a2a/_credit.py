@@ -48,7 +48,11 @@ first put waits for a whole wave of GEMM tiles.
 
 import flydsl.expr as fx
 
-from ..gemm_ar._compat import local_load_u32, signal_ptr, signal_store_u32
+from mori.cco.device.flydsl.signals import (
+    local_load_u32,
+    signal_ptr,
+    signal_store_u32,
+)
 from .kernels_lsa import _spin_until
 
 

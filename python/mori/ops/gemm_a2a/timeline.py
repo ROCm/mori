@@ -41,7 +41,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 
-from ..gemm_ar._compat import signal_ptr
+from mori.cco.device.flydsl.signals import signal_ptr
 
 #: s_memrealtime ticks per microsecond.
 TICKS_PER_US = 100.0

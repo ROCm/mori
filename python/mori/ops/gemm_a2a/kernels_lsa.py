@@ -64,24 +64,23 @@ from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
 
 import mori.cco.device.flydsl as cco
-
-# The GEMM, the buffer primitives and the cache-policy constants are gemm_ar's:
-# this op differs in where C goes, not in how any of that works, and a second
-# copy of them would be a second thing to keep in step with flydsl's API.
-from ..gemm_ar._compat import (
+from mori.cco.device.flydsl import _bindings as raw_cco
+from mori.cco.device.flydsl.buffer import (
     CM_CACHED,
     CM_SC0_SC1,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
+)
+from mori.cco.device.flydsl.signals import (
     i32_type,
     local_load_u32,
     local_store_u32,
     signal_load_u32,
     signal_ptr,
     signal_store_u32,
-    wave_uniform_i64,
 )
+from ..gemm_ar._compat import wave_uniform_i64
 from .layout import MAX_WORLD
 
 #: A 16B pack is always moved as 4 x i32, so buffer offsets are in i32 units
@@ -273,6 +272,11 @@ def build_lsa_a2a(cfg, rank: int, *, src: str = "local", uncached: bool = True):
 
         # Every store must be visible to the destination before it is told the
         # data is there, and the flag update must not be reordered before them.
+        # A barrier alone only gathers the block: nothing waits on vmcnt before
+        # the flag store. So every lane fences its own stores out first (the
+        # system release gemm_ar's 2-stage AR issues), and the barrier then
+        # holds the signalling lanes until all of them have.
+        raw_cco.cco_system_fence(fx.Int32(0))
         fgpu.barrier()
         flag, flag_rsrc = _next_flag(w, bid)
         if tid < ws:
