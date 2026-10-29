@@ -6,14 +6,14 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MORI-IO Introduction &mdash; MORI development (00f2bde2) documentation</title>
+  <title>MORI-IO Introduction &mdash; MORI development (55643233) documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
   
       <script src="_static/jquery.js?v=5d32c60e"></script>
       <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
-      <script src="_static/documentation_options.js?v=b14fc2c8"></script>
+      <script src="_static/documentation_options.js?v=944e8fd1"></script>
       <script src="_static/doctools.js?v=9bcbadda"></script>
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
@@ -226,6 +226,7 @@
 <li class="toctree-l2"><a class="reference internal" href="#python-api-quick-reference">Python API Quick Reference</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#example-basic-read-write">Example: Basic Read/Write</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#simulation-mode">Simulation Mode</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
 <li class="toctree-l2"><a class="reference internal" href="#source-files">Source Files</a><ul>
 <li class="toctree-l3"><a class="reference internal" href="#nic-fault-injection-test-builds">NIC fault injection (test builds)</a></li>
@@ -541,6 +542,7 @@
 <li><p><a class="reference internal" href="#python-api-quick-reference">Python API Quick Reference</a></p></li>
 <li><p><a class="reference internal" href="#example-basic-read-write">Example: Basic Read/Write</a></p></li>
 <li><p><a class="reference internal" href="#environment-configuration">Environment &amp; Configuration</a></p></li>
+<li><p><a class="reference internal" href="#simulation-mode">Simulation Mode</a></p></li>
 <li><p><a class="reference internal" href="#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></p></li>
 <li><p><a class="reference internal" href="#source-files">Source Files</a></p></li>
 </ul>
@@ -843,6 +845,87 @@
 <p>UMBP (the upper-layer cache pool) exposes a separate set of runtime-tunable
 env vars for distributed master / pool client / SPDK proxy timing. Those are
 out of scope for MORI-IO; see <a class="reference external" href="https://github.com/ROCm/mori/blob/main/src/umbp/doc/runtime-env-vars.md"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></a>.</p>
+</section>
+<section id="simulation-mode">
+<h2>Simulation Mode<a class="headerlink" href="#simulation-mode" title="Link to this heading"></a></h2>
+<p>With <code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_ENABLE=1</span></code>, MORI-IO runs without GPUs or NICs: <code class="docutils literal notranslate"><span class="pre">create_backend</span></code> builds a
+simulated RDMA, TCP or XGMI backend. Engines, routing, sessions, transfer status, a TCP
+control plane (remote memory check, notifications, peer failure) all run for real; no bytes
+move, and each transfer completes after a modelled delay. This lets a GPU-free simulator run
+real inference processes, for example sglang PD disaggregation, through their MORI-IO code.</p>
+<p>A transfer of <code class="docutils literal notranslate"><span class="pre">n</span></code> segments and <code class="docutils literal notranslate"><span class="pre">b</span></code> bytes holds its link for
+<code class="docutils literal notranslate"><span class="pre">b</span> <span class="pre">/</span> <span class="pre">bandwidth</span> <span class="pre">+</span> <span class="pre">n</span> <span class="pre">*</span> <span class="pre">per_segment</span> <span class="pre">+</span> <span class="pre">per_op</span></code> and completes <code class="docutils literal notranslate"><span class="pre">latency</span></code> after that. Each engine has
+one link per direction, and transfers queue on it in order.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Setting</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_ENABLE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> to simulate.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_BACKEND</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tcp</span></code> or <code class="docutils literal notranslate"><span class="pre">xgmi</span></code>: simulate an RDMA request as that backend. TCP exists only in simulation.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_GPU</span></code></p></td>
+<td><p>The GPU whose catalog entry times XGMI, for example <code class="docutils literal notranslate"><span class="pre">mi355x</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_NIC</span></code></p></td>
+<td><p>The NIC whose catalog entries time RDMA and TCP, for example <code class="docutils literal notranslate"><span class="pre">pollara400</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_CATALOG</span></code></p></td>
+<td><p>Catalog file(s) to read, comma-separated. An entry replaces an earlier one for the same backend and GPU or NIC.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_&lt;RDMA|TCP|XGMI&gt;_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}</span></code></p></td>
+<td><p>Override one value.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_IO_SIM_TIME_SCALE</span></code></p></td>
+<td><p>Divide every delay by this factor.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_NODE_ID</span></code></p></td>
+<td><p>Node identity for XGMI’s same-node check, to simulate several nodes on one host.</p></td>
+</tr>
+</tbody>
+</table>
+<p>The timing of each backend comes from a catalog of measured hardware, a flat YAML file read
+when a simulated backend is created. The wheel ships one as <code class="docutils literal notranslate"><span class="pre">mori/io/sim_catalog.yaml</span></code>
+(<a class="reference external" href="https://github.com/ROCm/mori/blob/main/python/mori/io/sim_catalog.yaml">source</a>). XGMI
+entries are per GPU and RDMA and TCP entries per NIC, since the numbers change with each
+generation:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">xgmi</span>
+<span class="w">  </span><span class="nt">gpu</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mi355x</span>
+<span class="w">  </span><span class="nt">bandwidth_gbps</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">61.4</span>
+<span class="w">  </span><span class="nt">latency_us</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">9</span>
+<span class="w">  </span><span class="nt">per_segment_ns</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">19500</span>
+<span class="w">  </span><span class="nt">per_op_us</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0</span>
+<span class="w">  </span><span class="nt">hardware</span><span class="p">:</span><span class="w"> </span><span class="s">"AMD</span><span class="nv"> </span><span class="s">Instinct</span><span class="nv"> </span><span class="s">MI355X,</span><span class="nv"> </span><span class="s">xGMI</span><span class="nv"> </span><span class="s">full</span><span class="nv"> </span><span class="s">mesh,</span><span class="nv"> </span><span class="s">72</span><span class="nv"> </span><span class="s">GB/s</span><span class="nv"> </span><span class="s">per</span><span class="nv"> </span><span class="s">direction</span><span class="nv"> </span><span class="s">per</span><span class="nv"> </span><span class="s">GPU</span><span class="nv"> </span><span class="s">pair"</span>
+
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rdma</span>
+<span class="w">  </span><span class="nt">nic</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pollara400</span>
+<span class="w">  </span><span class="nt">bandwidth_gbps</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">47.4</span>
+<span class="w">  </span><span class="nt">latency_us</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20</span>
+<span class="w">  </span><span class="nt">per_segment_ns</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">255</span>
+<span class="w">  </span><span class="nt">per_op_us</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4.3</span>
+<span class="w">  </span><span class="nt">qp_per_transfer</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">        </span><span class="c1"># the RDMA config it was measured with</span>
+<span class="w">  </span><span class="nt">num_worker_threads</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">  </span><span class="nt">hardware</span><span class="p">:</span><span class="w"> </span><span class="s">"AMD</span><span class="nv"> </span><span class="s">Pensando</span><span class="nv"> </span><span class="s">Pollara</span><span class="nv"> </span><span class="s">400,</span><span class="nv"> </span><span class="s">400GbE"</span>
+</pre></div>
+</div>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MORI_IO_SIM_CATALOG</span><span class="o">=</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import mori.io, os; print(os.path.join(os.path.dirname(mori.io.__file__), 'sim_catalog.yaml'))"</span><span class="k">)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_IO_SIM_GPU</span><span class="o">=</span>mi355x<span class="w"> </span><span class="nv">MORI_IO_SIM_NIC</span><span class="o">=</span>pollara400
+</pre></div>
+</div>
+<p>selects these. A name the catalog does not have is an error that lists the names it has.
+Without a selection, or for a backend the
+selected hardware has no entry for (TCP above), uncalibrated guesses are used and a warning is
+logged.</p>
+<p>RDMA timing depends on the config, so an engine whose <code class="docutils literal notranslate"><span class="pre">qp_per_transfer</span></code> or
+<code class="docutils literal notranslate"><span class="pre">num_worker_threads</span></code> differ from the entry’s logs a warning. To time other hardware or another
+config, add an entry with its measured numbers to a catalog file of your own. The
+model does not cap a single transfer’s bandwidth: without <code class="docutils literal notranslate"><span class="pre">enable_transfer_chunking</span></code>, one RDMA
+transfer alone reaches only about half the link, which the simulator does not reproduce.</p>
 </section>
 <section id="profiling-mori-io-with-roctx-markers">
 <h2>Profiling MORI-IO with ROCTX Markers<a class="headerlink" href="#profiling-mori-io-with-roctx-markers" title="Link to this heading"></a></h2>
