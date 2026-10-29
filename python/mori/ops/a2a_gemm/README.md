@@ -184,6 +184,25 @@ band plus the rest of the GEMM; recovering more needs the first wave to have
 work that does not wait -- more of K local (smaller P), or tiles scheduled by
 arrival rather than by index.
 
+**Tried and dropped: every tile's own K first.** Two kernels: the first posts
+and computes the own segment of *every* tile, storing fp32 partial sums; the
+second loads them, waits for its band and finishes the tile. Its first wave
+starts with the bands already ~25us on the wire. One round, 70B shape:
+
+| m_local | chunks | wait | one kernel | own first |
+|---:|---:|---|---:|---:|
+| 4096 | 1 | segment | 262.1 | 284.5 |
+| 4096 | 4 | tile | 261.3 | **245.6** |
+| 4096 | 8 | tile | **257.8** | 258.6 |
+| 8192 | 8 | tile | **433.9** | 493.2 |
+
+It wins one cell (-4.7% against the best one-kernel time) and loses the rest.
+The `c1` row, where neither schedule can start before everything has landed,
+prices the overhead at ~20us for 512 tiles: a second kernel, a second pipeline
+fill per tile, and 256 KiB of partials per tile written and read back -- 512
+MiB at `m_local=8192`, where it costs 40-70us. The own segment it moves forward
+is 1/8 of the GEMM, which bounds what it can save.
+
 ## Running it
 
 ```bash
