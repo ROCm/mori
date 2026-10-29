@@ -305,6 +305,33 @@ path. The prototypes and full records are archived outside the repository;
 the production kernel's supported tiles and defaults are unchanged. Archive:
 `v2-015:/mnt/m2m_nobackup/feiyzhai/mori-gemm-ag-m-sweep-20260928/small-tile/`.
 
+## Short final chunk (#748)
+
+`gemm_ar` gained an opt-in short tail in #748 (`chunk_bands`): chunks of a
+fixed number of row tiles, the last taking the rest, so a chunk count need not
+divide the tiles. It was ported to both fused epilogues here and measured on
+2026-10-29 alongside the [re-measured tables](README.md#re-measured-after-merging-main-2026-10-29)
+(crsuse2 v3-054, same protocol, default fence, µs; `bN` is N row tiles per
+chunk):
+
+| Shape | M | split | best even | short tails |
+|---|---:|---:|---:|---|
+| Pro, N=2048 | 2048 | **372.9** | 385.7 (c1) | b12 398.4, b6 407.4 |
+| | 4096 | **705.8** | 718.9 (c2) | b24 746.7, b11 729.6 |
+| | 8192 | 1381.5 | **1315.9** (c4) | b48 1423.2, b22 1342.4 |
+| | 16384 | 2844.2 | **2528.0** (c8) | b96 2840.2, b43 2626.6 |
+| Flash, N=1024 | 2048 | **212.8** | 218.0 (c1) | b12 229.9 |
+| | 16384 | 1375.2 | **1311.1** (c4) | b96 1409.8 |
+
+No short tail beat the best even split, and the head-heavy ones (b48, b96:
+one large chunk then a quarter) are as slow as not fusing. That is what the
+AG's balance predicts. A short tail shortens the transfer exposed after the
+GEMM ends, which is what `gemm_ar` was paying at its single-chunk shapes; here
+the transfer is several times the GEMM (Pro M=2048: 69 µs of GEMM against
+about 300 of AG), so the end time is set by when the link starts and how long
+it stays busy, not by the last chunk. A large first chunk delays the start.
+The port was not kept; it validated on both GEMMs before it was dropped.
+
 ## Reproduction and scope
 
 Use `bench_gemm_ag.py` for single-stream transports and

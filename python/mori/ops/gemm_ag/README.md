@@ -15,10 +15,12 @@ results. The retained measurements show:
   against native Torch's **77.8 µs** on the current stack (72.0 vs 71.1 in
   September -- Torch moved, not MORI). The default remains `256x256`.
 - At that shape, non-fused GEMM + SDMA takes **355.9 µs**; fused SDMA takes
-  **360.6 µs** with one chunk.
+  **360.6 µs** with one chunk (373.2 / 376.3 µs after merging `main`, on the
+  crsuse2 stack -- see [below](#re-measured-after-merging-main-2026-10-29)).
 - At larger M the same shape gains from four-chunk single-stream fusion:
   **5.3% at M=8192** and **11.9% at M=16384**, with no benefit at M=4096
-  (re-measured 2026-10-19; September's v2-015 pairs gave 4.9–5.2% and 11.1%).
+  (re-measured 2026-10-19; September's v2-015 pairs gave 4.9–5.2% and 11.1%,
+  and the 2026-10-29 re-measurement after merging `main` 4.8% and 11.2%).
   Fusion performance depends on shape and chunk size.
 
 ## Model shapes
@@ -79,6 +81,37 @@ its `serial` control retains those streams but disables compute/transfer overlap
 - Fused chunks divide the M tiles. Lane-parallel posting requires at least
   one queue per chunk per peer; the benchmark derives that queue count.
   `build_sdma_chunk_post` instead uses queue 0 and requires serialized submissions.
+
+## Re-measured after merging `main` (2026-10-29)
+
+On **crsuse2-m2m-v3-054, eight MI355X GPUs**, ROCm 7.2, PyTorch
+`2.11.0+rocm7.2`, FlyDSL 0.4.0, this branch merged with `main` at `b853716`.
+BF16 in / FP32 out, `128x128`, 50 warmups and 101 graph samples, maximum over
+ranks; every configuration in a fresh process group on an idle box, three
+interleaved rounds, median of rounds (spread <= 0.8%; 3.0% on Flash M=2048).
+Fused rows use `--peer-uncached --fence release`, as the 2026-10-19 larger-M
+and Flash rows did; the default fence measured within 0.2% of it at M >= 4096,
+1.3% slower on Flash M=2048 (inside that cell's spread) and 2.5% slower at Pro
+M=2048 c1 (385.7 µs). All 144 samples validated, worst relL2 `9.93e-7`.
+
+| Shape | M | Torch + RCCL | MORI GEMM + SDMA | best fused SDMA | fused vs split |
+|---|---:|---:|---:|---:|---:|
+| Pro `wkv_gate`, N=2048 K=7168 | 2048 | 416.2 | **373.2** | 376.3 (c1) | -0.8% |
+| | 4096 | | **704.4** | 718.2 (c2) | -2.0% |
+| | 8192 | | 1382.9 | **1317.0** (c4) | **4.8%** |
+| | 16384 | | 2845.5 | **2525.6** (c8) | **11.2%** |
+| Flash combined, N=1024 K=5120 | 2048 | | 214.4 | 215.3 (c1) | -0.4% |
+| | 16384 | | 1373.7 | **1308.3** (c4) | **4.8%** |
+
+Every conclusion of the 2026-10-19 tables holds: split SDMA is 10.4% under
+Torch + RCCL at Pro M=2048 (372.9 against 416.2 in the same session), fusion
+does not pay below M=8192, and the combined Flash projection gains about 5%
+at M=16384. Absolute times sit 3-5% above mi355-gpu-51's and match
+September's v2-015 numbers (1382.3 / 1314.3 at M=8192, 2841.4 / 2526.1 at
+M=16384), so read the gpu-51 tables as that host's.
+
+`main`'s short final chunk for `gemm_ar` (#748's `chunk_bands`) was tried
+here and does not help: see [EXPERIMENTS.md](EXPERIMENTS.md#short-final-chunk-748).
 
 ## BF16 benchmarks: DeepSeek-V4-Pro
 
