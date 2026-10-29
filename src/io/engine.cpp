@@ -449,12 +449,57 @@ void IOEngine::CaptureBackendDesc(BackendType type) {
 }
 
 void IOEngine::RegisterRemoteEngine(const EngineDesc& remote) {
+  if (remote.protocolVersion != 0 && desc.protocolVersion != 0 &&
+      remote.protocolVersion != desc.protocolVersion) {
+    MORI_IO_ERROR(
+        "Rejecting remote engine {} (node_id {}): protocol version mismatch "
+        "(local={}, remote={})",
+        remote.key, remote.nodeId, desc.protocolVersion, remote.protocolVersion);
+    throw std::runtime_error("MoRI-IO handshake failed: protocol version mismatch (local=" +
+                             std::to_string(desc.protocolVersion) +
+                             ", remote=" + std::to_string(remote.protocolVersion) + ")");
+  }
+
+  if (remote.protocolVersion == 0) {
+    MORI_IO_WARN(
+        "Remote engine {} (node_id {}) has protocolVersion=0; assuming legacy peer — "
+        "skipping strict compatibility checks",
+        remote.key, remote.nodeId);
+  }
+
+  if (remote.agentMode != 0 && desc.agentMode != 0) {
+    bool localReads = (desc.agentMode & static_cast<uint32_t>(AgentMode::READ)) != 0;
+    bool localWrites = (desc.agentMode & static_cast<uint32_t>(AgentMode::WRITE)) != 0;
+    bool remoteReads = (remote.agentMode & static_cast<uint32_t>(AgentMode::READ)) != 0;
+    bool remoteWrites = (remote.agentMode & static_cast<uint32_t>(AgentMode::WRITE)) != 0;
+    bool compatible = (localReads && remoteWrites) || (localWrites && remoteReads);
+    if (!compatible) {
+      MORI_IO_WARN(
+          "Remote engine {} (node_id {}): no complementary transfer direction "
+          "(local mode={:#x}, remote mode={:#x})",
+          remote.key, remote.nodeId, desc.agentMode, remote.agentMode);
+    }
+  }
+
+  if (remote.blockSize != 0 && desc.blockSize != 0 && remote.blockSize != desc.blockSize) {
+    MORI_IO_ERROR(
+        "Rejecting remote engine {} (node_id {}): block size mismatch "
+        "(local={}, remote={})",
+        remote.key, remote.nodeId, desc.blockSize, remote.blockSize);
+    throw std::runtime_error(
+        "MoRI-IO handshake failed: block size mismatch (local=" + std::to_string(desc.blockSize) +
+        ", remote=" + std::to_string(remote.blockSize) + ")");
+  }
+
   for (auto& it : backends) {
     it.second->RegisterRemoteEngine(remote);
   }
   InvalidateRouteCache();
-  MORI_IO_INFO("Register remote engine {} node_id {} hostname {}", remote.key.c_str(),
-               remote.nodeId.c_str(), remote.hostname.c_str());
+  MORI_IO_INFO(
+      "Register remote engine {} node_id {} hostname {} "
+      "(protocol_version={} agent_mode={:#x} block_size={})",
+      remote.key, remote.nodeId, remote.hostname, remote.protocolVersion, remote.agentMode,
+      remote.blockSize);
 }
 
 void IOEngine::DeregisterRemoteEngine(const EngineDesc& remote) {

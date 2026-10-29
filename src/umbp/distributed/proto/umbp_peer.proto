@@ -30,7 +30,11 @@ service UMBPPeer {
 //  Handshake
 // ============================================================
 
-message GetPeerInfoRequest {}
+message GetPeerInfoRequest {
+  uint32 protocol_version = 1;
+  uint32 agent_mode       = 2;
+  uint64 block_size       = 3;
+}
 message GetPeerInfoResponse {
   bytes  engine_desc           = 1;
   // SSD capacity is reported via heartbeat tier_capacities, not here.
@@ -54,6 +58,11 @@ message GetPeerInfoResponse {
   // Uniform across backends — BackendRegistry refuses to register a backend
   // that disagrees, because every wire carrying pages carries ONE page_size.
   uint64 page_size                       = 11;
+
+  // Compatibility metadata (Gap 12). Zero means unset / legacy peer.
+  uint32 protocol_version = 12;
+  uint32 agent_mode       = 13;
+  uint64 block_size       = 14;
 }
 
 // ============================================================

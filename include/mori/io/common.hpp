@@ -100,14 +100,20 @@ struct EngineDesc {
   // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
   BackendDescBlobMap backendDescs;
 
+  uint32_t protocolVersion{kMoriIoProtocolVersion};
+  uint32_t agentMode{static_cast<uint32_t>(AgentMode::READ_WRITE)};
+  uint64_t blockSize{0};
+
   bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
            (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid) &&
-           (backendDescs == rhs.backendDescs);
+           (backendDescs == rhs.backendDescs) && (protocolVersion == rhs.protocolVersion) &&
+           (agentMode == rhs.agentMode) && (blockSize == rhs.blockSize);
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, protocolVersion, agentMode,
+                 blockSize);
 };
 
 using MemoryUniqueId = uint32_t;
