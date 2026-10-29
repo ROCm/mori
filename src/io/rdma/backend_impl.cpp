@@ -978,7 +978,8 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
                                           failureAdvice.ComposeStatusMessage());
           TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
           if (statusPtr != nullptr) {
-            statusPtr->Update(StatusCode::ERR_RDMA_OP, failureAdvice.ComposeStatusMessage());
+            meta->ReportData(statusPtr, StatusCode::ERR_RDMA_OP,
+                             failureAdvice.ComposeStatusMessage());
           }
           // A closed ledger means a fatal async event already retired this
           // endpoint, so its degraded flag is terminal rather than the
@@ -1084,7 +1085,7 @@ NotifManager::FlushDrainStats NotifManager::ProcessOneCqe(
             // then overwrite a transfer that actually completed.
             TransferStatus* statusPtr = meta->status.exchange(nullptr, std::memory_order_acq_rel);
             if (statusPtr != nullptr) {
-              statusPtr->Update(StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
+              meta->ReportData(statusPtr, StatusCode::SUCCESS, ibv_wc_status_str(wc[i].status));
             }
           }
           MORI_IO_TRACE("ProcessOneCqe: batch CQE for task {} total={} finished={} cur={}",
@@ -1571,29 +1572,39 @@ RdmaBackendSession::RdmaBackendSession(const RdmaBackendConfig& config,
       rdma_(rdma),
       localLoc_(localLoc) {}
 
+// After the data WRs of a transfer were posted (`ret`): reports a post that ended the
+// transfer by itself, then posts the notification when notifications are on.
+static void FinishSubmission(const EpPairVec& eps, const std::shared_ptr<CqCallbackMeta>& meta,
+                             TransferStatus* status, TransferUniqueId id, RdmaOpRet ret,
+                             bool notify) {
+  assert(!ret.Init());
+  if (ret.Failed() || ret.Succeeded()) {
+    // Nothing was posted, or the post gave up: no CQE ends this transfer, and the CQE
+    // of a WR posted before the failure must not report it a second time.
+    if (TransferStatus* s = meta->status.exchange(nullptr, std::memory_order_acq_rel)) {
+      meta->ReportData(s, ret.code, ret.message);
+    }
+  }
+  if (!notify) return;
+  RdmaOpRet notifRet = ret.Failed() ? RdmaOpRet{StatusCode::SUCCESS, ""}
+                                    : RdmaNotifyTransfer(eps, &meta->dataStatus, id);
+  meta->ReportNotification(status, notifRet.code, notifRet.message);
+}
+
 void RdmaBackendSession::ReadWrite(size_t localOffset, size_t remoteOffset, size_t size,
                                    TransferStatus* status, TransferUniqueId id, bool isRead) {
   MORI_IO_FUNCTION_TIMER;
   status->SetCode(StatusCode::IN_PROGRESS);
   if (rdma_ && rdma_->RejectIfPortDown(eps, status)) return;
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, 1);
+  callbackMeta->awaitsNotification = config.enableNotification;
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
 
   RdmaOpRet ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, {localOffset},
                                      {remoteOffset}, {size}, callbackMeta, id, isRead, 1,
                                      config.enableTransferChunking ? config.chunkBytes : 0,
                                      config.maxChunksPerTransfer, config.enableTransferChunking);
-
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->Update(ret.code, ret.message);
-  }
-  if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
-    if (notifRet.Failed()) {
-      status->Update(notifRet.code, notifRet.message);
-    }
-  }
+  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
 }
 
 void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeVec& remoteOffsets,
@@ -1646,6 +1657,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
   }
 
   auto callbackMeta = std::make_shared<CqCallbackMeta>(status, id, totalCredit);
+  callbackMeta->awaitsNotification = config.enableNotification;
   internal::PublishCurrentIoCallDiagnostics(callbackMeta);
   RdmaOpRet ret;
   if (canUseWorkerChunking) {
@@ -1684,16 +1696,7 @@ void RdmaBackendSession::BatchReadWrite(const SizeVec& localOffsets, const SizeV
     ret = RdmaBatchReadWrite(eps, localMrPerEp, remoteMrPerEp, localOffsets, remoteOffsets, sizes,
                              callbackMeta, id, isRead, config.postBatchSize, control);
   }
-  assert(!ret.Init());
-  if (ret.Failed() || ret.Succeeded()) {
-    status->Update(ret.code, ret.message);
-  }
-  if (!ret.Failed() && config.enableNotification) {
-    RdmaOpRet notifRet = RdmaNotifyTransfer(eps, status, id);
-    if (notifRet.Failed()) {
-      status->Update(notifRet.code, notifRet.message);
-    }
-  }
+  FinishSubmission(eps, callbackMeta, status, id, ret, config.enableNotification);
 }
 
 bool RdmaBackendSession::Alive() const {

@@ -74,7 +74,10 @@ class SimPoolPlatform final : public PoolPlatform {
         "UMBP_DRAM_READ_LEASE_MS", std::chrono::milliseconds(500), /*min_allowed=*/1);
     return std::make_unique<PageBackend>(config.tier, page_size, std::move(source),
                                          hbm ? config.hbm.buffer_sizes : config.dram.buffer_sizes,
-                                         std::chrono::milliseconds{30000}, read_lease_ttl);
+                                         std::chrono::milliseconds{30000}, read_lease_ttl,
+                                         std::chrono::milliseconds{200},
+                                         hbm ? kDefaultDramMaxMrBytes : config.dram.max_mr_bytes,
+                                         hbm ? std::vector<int>{} : config.dram.numa_nodes);
   }
   TransferRef LocalUserBytes(void* ptr, size_t size,
                              const TransferRef& registered_ref) const override {

@@ -421,8 +421,7 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
   // Resolve size and mark the read in flight under the lock, then run the
   // blocking SSD IO outside it (so a concurrent copy Write is not serialized).
   size_t size = 0;
-  bool leading = false;    // we own the device read and the fan-out
-  bool following = false;  // a leader will fill our buffer; we only wait
+  bool following = false;  // a leader will fill our buffer; else we lead
   std::shared_ptr<ReadEpisode> episode;
   // Our own slot in the leader's fan-out list, kept because the leader swaps
   // that list out of the episode when it seals.
@@ -457,22 +456,20 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     const int prior = slot->refs++;
     metrics_.read_dup.fetch_add(prior > 0 ? 1 : 0, std::memory_order_relaxed);
     metrics_.read_lead.fetch_add(prior > 0 ? 0 : 1, std::memory_order_relaxed);
-    if (!slot->episode) {
-      slot->episode = std::make_shared<ReadEpisode>();
-      slot->episode->length = size;  // a whole-object read: [0, size)
-      episode = slot->episode;
-      leading = true;
-    } else if (single_flight_ && !slot->episode->sealed && slot->episode->Covers(0, size)) {
-      // An extent leader lacks the rest of the object: then read it ourselves.
+    // An extent leader lacks the rest of the object, so only a whole-object one joins.
+    episode = single_flight_ ? slot->Joinable(0, size) : nullptr;
+    if (episode) {
       my_target = std::make_shared<FollowerTarget>();
       my_target->dst = staging_ptr;
       my_target->length = size;  // size <= staging_cap, checked above
-      slot->episode->followers.push_back(my_target);
-      episode = slot->episode;
+      episode->followers.push_back(my_target);
       following = true;
       metrics_.read_merged.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      episode = std::make_shared<ReadEpisode>();
+      episode->length = size;  // a whole-object read: [0, size)
+      slot->episodes.push_back(episode);
     }
-    // else: missed the merge window — fall through and read it ourselves.
   }
 
   bool read_ok = false;
@@ -488,30 +485,26 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
     read_ok = signalled && my_target->ok;
   } else {
     read_ok = backend_->ReadIntoPtr(key, reinterpret_cast<uintptr_t>(staging_ptr), size);
-    if (leading) {
-      // Publish to whoever attached while we were on the device.  Failures are
-      // published too, so a follower is never left to time out.
-      std::vector<std::shared_ptr<FollowerTarget>> fanout;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        episode->sealed = true;
-        fanout.swap(episode->followers);
-        auto it = inflight_reads_.find(key);
-        if (it != inflight_reads_.end() && it->second->episode == episode) {
-          it->second->episode.reset();
-        }
-      }
-      for (const auto& f : fanout) {
-        f->ok = read_ok &&
-                CopyFollower(f->dst,
-                             static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
-                             f->length);
-      }
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        episode->done = true;
-        episode->cv.notify_all();
-      }
+    // Publish to whoever attached while we were on the device.  Failures are
+    // published too, so a follower is never left to time out.
+    std::vector<std::shared_ptr<FollowerTarget>> fanout;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      episode->sealed = true;
+      fanout.swap(episode->followers);
+      auto it = inflight_reads_.find(key);
+      if (it != inflight_reads_.end()) it->second->Retire(episode);
+    }
+    for (const auto& f : fanout) {
+      f->ok = read_ok &&
+              CopyFollower(f->dst,
+                           static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
+                           f->length);
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      episode->done = true;
+      episode->cv.notify_all();
     }
   }
 
@@ -570,9 +563,8 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
 
   // Pass 1 — resolve sizes and mark every servable key in flight under ONE lock
   // acquisition (the per-key path pays two per key).
-  std::vector<size_t> todo;   // I lead (or independently read) these
+  std::vector<size_t> todo;   // I lead these
   std::vector<size_t> waits;  // I follow these; a leader will fill my buffer
-  std::vector<bool> is_leader(keys.size(), false);
   // Per-request handle on the episode we lead or follow.  Held as a shared_ptr
   // so it stays valid even after the slot moves on to a new leader.
   std::vector<std::shared_ptr<ReadEpisode>> episodes(keys.size());
@@ -617,29 +609,23 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
         ++dup;
         if (prior > max_concurrent) max_concurrent = prior;
       }
-      if (!slot->episode) {
-        // First in: this request owns the device read and the fan-out.
-        slot->episode = std::make_shared<ReadEpisode>();
-        slot->episode->offset = wants[i].offset;
-        slot->episode->length = wants[i].length;
-        episodes[i] = slot->episode;
-        is_leader[i] = true;
-        todo.push_back(i);
-      } else if (single_flight_ && !slot->episode->sealed &&
-                 slot->episode->Covers(wants[i].offset, wants[i].length)) {
-        // Merge window open and the leader reads our bytes: hand it our buffer
-        // and wait on its episode.
+      episodes[i] = single_flight_ ? slot->Joinable(wants[i].offset, wants[i].length) : nullptr;
+      if (episodes[i]) {
+        // A leader mid-read covers our bytes: hand it our buffer and wait on it.
         my_targets[i] = std::make_shared<FollowerTarget>();
         my_targets[i]->dst = dsts[i];
         my_targets[i]->offset = wants[i].offset;
         my_targets[i]->length = wants[i].length;
-        slot->episode->followers.push_back(my_targets[i]);
-        episodes[i] = slot->episode;
+        episodes[i]->followers.push_back(my_targets[i]);
         waits.push_back(i);
         ++merged;
       } else {
-        // Missed the window, the leader reads other bytes, or single flight is
-        // off: read it ourselves.  Always correct, just not merged.
+        // Lead even beside another extent's leader, so the next reader of these
+        // bytes has one to join.
+        episodes[i] = std::make_shared<ReadEpisode>();
+        episodes[i]->offset = wants[i].offset;
+        episodes[i]->length = wants[i].length;
+        slot->episodes.push_back(episodes[i]);
         todo.push_back(i);
       }
     }
@@ -706,17 +692,16 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
   const auto t_fanout = ssdperf::Now();
   for (size_t j = 0; j < todo.size(); ++j) {
     const size_t i = todo[j];
-    if (!is_leader[i]) continue;  // independent read: nobody is waiting on it
     const auto& ep = episodes[i];
     std::vector<std::shared_ptr<FollowerTarget>> fanout;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      ep->sealed = true;  // late arrivals now go independent instead of waiting
+      ep->sealed = true;  // late arrivals now lead their own read instead of waiting
       fanout.swap(ep->followers);
       // Retire the episode so the next arrival starts a fresh one rather than
       // attaching to a read that is already past its snapshot.
       auto it = inflight_reads_.find(keys[i]);
-      if (it != inflight_reads_.end() && it->second->episode == ep) it->second->episode.reset();
+      if (it != inflight_reads_.end()) it->second->Retire(ep);
     }
     // Deliver outside the lock: holding mutex_ across a page-sized memcpy would
     // stall every other read/evict here.

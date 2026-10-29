@@ -70,6 +70,7 @@ class StandaloneProcessClient : public IUMBPClient {
                                    const std::vector<std::vector<size_t>>& dst_offsets) override;
   std::vector<bool> BatchExists(const std::vector<std::string>& keys) const override;
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
+  size_t BatchPrefetch(const std::vector<std::string>& keys) override;
 
   bool Clear() override;
   bool Flush() override;

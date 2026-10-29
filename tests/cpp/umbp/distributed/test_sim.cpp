@@ -35,6 +35,7 @@
 
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/pool_client.h"
+#include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/sim/sim.h"
@@ -167,6 +168,39 @@ class SimTest : public ::testing::Test {
 // Exercise the same API contract embedded and through the standalone IPC boundary.
 class SimApiTest : public SimTest, public ::testing::WithParamInterface<bool> {};
 INSTANTIATE_TEST_SUITE_P(EmbeddedAndStandalone, SimApiTest, ::testing::Bool());
+
+TEST_F(SimTest, PlatformPreservesRegionSplittingAndNumaPlacement) {
+  auto platform = MakePoolPlatform(Config().sim);
+  PoolClientConfig config;
+  BackendInstanceConfig dram;
+  dram.tier = TierType::DRAM;
+  dram.dram.buffer_sizes = {4 * kPage, 4 * kPage};
+  dram.dram.max_mr_bytes = 2 * kPage;
+  dram.dram.numa_nodes = {1, 3};
+  auto engines = platform->CreateTransferEngine(config, {dram});
+  auto backend = platform->CreateBackend(dram, kPage, config);
+  ASSERT_NE(backend, nullptr);
+  ASSERT_TRUE(backend->Init(engines.transfer.get()));
+  ASSERT_EQ(backend->BufferCount(), 4u);
+  EXPECT_EQ(backend->Capacity().total_bytes, 8 * kPage);
+  for (uint32_t i = 0; i < backend->BufferCount(); ++i)
+    EXPECT_EQ(backend->BufferRef(i).size, 2 * kPage);
+
+  const auto source = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(2 * kPage)), 2 * kPage);
+  for (uint32_t buffer : {2u, 3u, 0u}) {
+    const auto key = std::to_string(buffer);
+    const int numa = buffer >= 2 ? 3 : -1;
+    const auto slot = backend->BatchAllocate({AllocateRequest{key, 2 * kPage, numa}}).front();
+    ASSERT_EQ(slot.outcome, AllocateOutcome::kSuccessAllocated);
+    ASSERT_EQ(slot.pages.size(), 2u);
+    ASSERT_EQ(slot.pages.front().buffer_index, buffer);
+    // Both source and tier are PROT_NONE; a payload access would fault.
+    ASSERT_TRUE(engines.transfer->Transfer(
+        {{source, 0, backend->BufferRef(buffer), 0, 2 * kPage, 0}}, nullptr));
+    ASSERT_TRUE(backend->BatchCommit({{slot.slot_id, key}}).front().success);
+    EXPECT_TRUE(backend->Contains(key));
+  }
+}
 
 TEST_P(SimApiTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   auto config = Config();

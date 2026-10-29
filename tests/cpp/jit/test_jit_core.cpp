@@ -30,13 +30,17 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "mori/jit/v2/compiler.hpp"
+#include "mori/jit/v2/plan_api.hpp"
 #include "mori/jit/v2/render.hpp"
 #include "mori/jit/v2/toolchain.hpp"
 #include "mori/jit/v2/util.hpp"
@@ -214,6 +218,77 @@ TEST(Geometry, ValidityRejectsWhatTheKernelCannotRun) {
   c = ok;
   c.warpPerBlock = 64;  // 64 * 64 > 1024 threads
   EXPECT_FALSE(EpCfgIsValid(c));
+}
+
+// --------------------------------------------------------------------------
+// Sizes a caller allocates. Pinned to what hip_backend's Python mirrors computed
+// before C++ owned them: a change here moves an arena region or the staging.
+// --------------------------------------------------------------------------
+
+namespace {
+// hidden 7168, topk 8, 128 tokens per rank, bf16 combine, wave32 (gfx1250).
+EpCfg PushCfg(int worldSize, bool fp8, bool f32Scale) {
+  EpCfg c;
+  c.worldSize = worldSize;
+  c.waveSize = 32;
+  c.combineFp4 = !fp8;
+  c.combineFp8 = fp8;
+  c.combineFp4F32Scale = f32Scale;
+  return c;
+}
+}  // namespace
+
+TEST(Sizes, StagingMatchesThePinnedLayout) {
+  EpCfg c;
+  c.worldSize = 8;
+  c.maxRecv = 4096;
+  c.scaleBytes = 224;
+  EXPECT_EQ(EpStagingTotalBytes(c), 12746752u);
+  c.scaleBytes = 0;
+  EXPECT_EQ(EpStagingTotalBytes(c), 4358144u);
+  c.worldSize = 32;
+  c.scaleBytes = 224;
+  EXPECT_EQ(EpStagingTotalBytes(c), 50987008u);
+  c.worldSize = 1;
+  c.maxRecv = 7;
+  c.scaleBytes = 0;
+  EXPECT_EQ(EpStagingTotalBytes(c), 5248u);
+}
+
+TEST(Sizes, PushWireRowsAndLanding) {
+  EXPECT_EQ(EpCombinePushWireBytes(PushCfg(8, false, false)), 3840);  // 3584 + 224 scales
+  EXPECT_EQ(EpCombinePushWireBytes(PushCfg(8, false, true)), 3840);   // f32 per 128
+  EXPECT_EQ(EpCombinePushWireBytes(PushCfg(8, true, false)), 7424);   // 7168 + 224
+  EXPECT_EQ(EpCombinePushLandRows(PushCfg(8, false, false)), 128 * 8);
+  EXPECT_EQ(EpCombinePushLandRows(PushCfg(4, false, false)), 128 * 4);  // min(ws, topk)
+  EXPECT_EQ(EpCombinePushLandOff(PushCfg(8, false, false)), 8u * 128 * 7168 * 2);
+}
+
+TEST(Sizes, OutTokCarriesTheLandingAndTheRowFlags) {
+  EpCfg pull;
+  EXPECT_EQ(EpRegionOutTokBytes(pull), 14680064u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(8, false, false)), 18620416u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(8, true, false)), 22290432u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(4, false, false)), 9310208u);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(2, false, false)), 4653056u);  // < 4 ranks: no flags
+  // No overlapped reduce, so no flags; the Python mirror reserved them anyway.
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(8, false, true)), 18620416u - 1024 * 8);
+  EXPECT_EQ(EpRegionOutTokBytes(PushCfg(64, false, false)), 121380864u - 1024 * 8);
+}
+
+TEST(Sizes, RegionsFollowTheRecvCapacity) {
+  EpCfg c;  // ws 8, 128 tok/rank -> 1024 slots, topk 8
+  c.scaleBytes = 224;
+  EXPECT_EQ(EpRegionTokOffBytes(c), 4u);
+  EXPECT_EQ(EpRegionRecvNumBytes(c), 2u * 8 * 4);
+  EXPECT_EQ(EpRegionRecvToSrcBytes(c), 1024u * 4);
+  EXPECT_EQ(EpRegionOutIdxBytes(c), 1024u * 8 * 4);
+  EXPECT_EQ(EpRegionOutWtsBytes(c), 1024u * 8 * 4);
+  EXPECT_EQ(EpRegionDispOutBytes(c), 1024u * 7168 * 2);
+  EXPECT_EQ(EpRegionXdbBytes(c), 8u * 8);
+  EXPECT_EQ(EpRegionOutScalesBytes(c), 1024u * 256);  // padded to 128 B
+  c.scaleBytes = 0;
+  EXPECT_EQ(EpRegionOutScalesBytes(c), 0u);
 }
 
 TEST(Sha256, KnownVectors) {
@@ -627,3 +702,61 @@ TEST(AsyncLLMode, HostCfgAndRequestFieldCountsMatchTheirVisitors) {
   EXPECT_EQ(FieldCount<EpInterNodeRequest>(), requestFields);
 }
 #endif
+
+// --------------------------------------------------------------------------
+// describe: a plan's info for a request, without compiling it.
+// --------------------------------------------------------------------------
+
+namespace {
+std::map<std::string, std::string> ParseInfo(const std::string& text) {
+  std::map<std::string, std::string> kv;
+  std::istringstream in(text);
+  for (std::string line; std::getline(in, line);) {
+    const auto eq = line.find('=');
+    if (eq != std::string::npos) kv[line.substr(0, eq)] = line.substr(eq + 1);
+  }
+  return kv;
+}
+
+std::string DescribePlan(const char* kernel, std::vector<std::pair<const char*, long long>> req) {
+  std::vector<const char*> names;
+  std::vector<long long> values;
+  for (const auto& [n, v] : req) {
+    names.push_back(n);
+    values.push_back(v);
+  }
+  const auto* vt = mori::jit::v2::FindPlan(kernel);
+  EXPECT_NE(vt, nullptr) << kernel;
+  return vt->describe(FieldBag(names.data(), values.data(), static_cast<int>(names.size())));
+}
+}  // namespace
+
+TEST(Describe, ReportsTheSizesWithoutCompiling) {
+  // The toolchain has no hipcc, so anything that compiled would fail here.
+  ToolchainOverride guard(FakeToolchain("gfx1250", "ionic"));
+  auto d = ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}));
+  EpCfg c;
+  c.scaleBytes = 224;
+  EXPECT_EQ(d["stagingBytes"], std::to_string(EpStagingTotalBytes(c)));
+  EXPECT_EQ(d["scaleStride"], "256");
+  EXPECT_EQ(d["region.dispOut"], std::to_string(EpRegionDispOutBytes(c)));
+  EXPECT_EQ(d["region.outTok"], "0");  // combine's
+  EXPECT_EQ(d["cacheDir"], "");
+
+  auto k = ParseInfo(DescribePlan("ep_combine", {{"combineFp4", 1}}));
+  EXPECT_EQ(k["region.dispOut"], "0");  // dispatch's
+  EXPECT_EQ(k["region.outTok"], std::to_string(EpRegionOutTokBytes(PushCfg(8, false, false))));
+  EXPECT_EQ(k["pushWireBytes"], "3840");
+  EXPECT_EQ(k["gridX"], k["blockNum"]);
+}
+
+TEST(Describe, StagingIsZeroWhereTheDispatchDoesNotStage) {
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {}))["stagingBytes"], "0");
+}
+
+TEST(Describe, FailsWhereCreateWould) {
+  // The push combine is gfx125x only; RenderSource rejects it, compiled or not.
+  ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
+  EXPECT_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}), std::runtime_error);
+}

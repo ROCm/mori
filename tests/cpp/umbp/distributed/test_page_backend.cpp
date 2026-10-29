@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef __linux__
 #include <linux/filter.h>
@@ -126,6 +127,42 @@ TEST(PageBackend, NumaBindingAndPreferredAllocationAgree) {
 #endif
 }
 
+// Placement only: the buffers need not actually be bound (not strict), so this runs on a
+// single-node host too.
+std::unique_ptr<PageBackend> MakeTwoNodeBackend() {
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {64 * 4096, 64 * 4096};
+  cfg.numa_nodes = {0, 1};
+  cfg.numa_strict = false;
+  auto backend = std::make_unique<PageBackend>(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  return backend->Init(nullptr) ? std::move(backend) : nullptr;
+}
+
+TEST(PageBackend, NumaWithoutHintFillsBuffersEvenly) {
+  auto backend = MakeTwoNodeBackend();
+  ASSERT_NE(backend, nullptr);
+  std::vector<uint32_t> buffers;
+  for (int i = 0; i < 4; ++i) {
+    auto r =
+        backend->BatchAllocate({AllocateRequest{"k" + std::to_string(i), 16 * 4096, -1}}).front();
+    ASSERT_EQ(r.outcome, AllocateOutcome::kSuccessAllocated);
+    for (const auto& page : r.pages) EXPECT_EQ(page.buffer_index, r.pages.front().buffer_index);
+    buffers.push_back(r.pages.front().buffer_index);
+  }
+  EXPECT_EQ(buffers, (std::vector<uint32_t>{0, 1, 0, 1}));
+}
+
+TEST(PageBackend, NumaHintStillWinsOverAnEvenFill) {
+  auto backend = MakeTwoNodeBackend();
+  ASSERT_NE(backend, nullptr);
+  for (int i = 0; i < 3; ++i) {
+    auto r =
+        backend->BatchAllocate({AllocateRequest{"k" + std::to_string(i), 16 * 4096, 0}}).front();
+    ASSERT_EQ(r.outcome, AllocateOutcome::kSuccessAllocated);
+    for (const auto& page : r.pages) EXPECT_EQ(page.buffer_index, 0u);
+  }
+}
+
 TEST(PageBackend, NumaRejectsMismatchedLayoutBeforeAllocating) {
   HostPageMemorySource::Options opts;
   opts.numa_nodes = {0, 1};
@@ -183,6 +220,125 @@ TEST(PageBackend, NumaBindingFailureFollowsExplicitStrictFlag) {
 #else
   GTEST_SKIP() << "requires Linux seccomp";
 #endif
+}
+
+// Records every registration, so a test can see how a buffer was split.
+class RecordingRegistrar final : public MemoryRegistrar {
+ public:
+  TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
+                             int device) override {
+    regions.push_back({base, size});
+    return TransferRef::HostBytes(base, size, loc, device);
+  }
+  void Deregister(const TransferRef&) override { ++deregistrations; }
+
+  std::vector<std::pair<void*, size_t>> regions;
+  int deregistrations = 0;
+};
+
+// 4 KiB-backed, at most 8 pages per registration: the 20-page buffer becomes
+// 8 + 8 + 4.
+TEST(PageBackend, LargeBufferRegistersAsSeveralRegions) {
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {20 * 4096};
+  cfg.max_mr_bytes = 8 * 4096;
+  PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  RecordingRegistrar registrar;
+  ASSERT_TRUE(backend.Init(&registrar));
+
+  ASSERT_EQ(registrar.regions.size(), 3u);
+  auto* base = static_cast<char*>(registrar.regions[0].first);
+  const std::vector<size_t> sizes = {8 * 4096, 8 * 4096, 4 * 4096};
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    EXPECT_EQ(registrar.regions[i].first, base + 8 * 4096 * i);
+    EXPECT_EQ(registrar.regions[i].second, sizes[i]);
+    EXPECT_EQ(backend.BufferRef(i).host_ptr, registrar.regions[i].first);
+  }
+  EXPECT_EQ(backend.BufferCount(), 3u);
+  EXPECT_EQ(backend.Capacity().total_bytes, 20u * 4096);
+
+  // A value larger than one region spans regions and still commits.
+  auto all = backend.BatchAllocate({AllocateRequest{"all", 20 * 4096, -1}}).front();
+  ASSERT_EQ(all.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(all.pages.size(), 20u);
+  uint64_t committed = 0;
+  EXPECT_TRUE(backend.Commit(all.slot_id, "all", committed));
+
+  backend.Shutdown();
+  EXPECT_EQ(registrar.deregistrations, 3);
+}
+
+// An allocator page that does not divide the backing page: regions are whole
+// multiples of both (lcm(4096, 3000) = 1536000 bytes), so each starts on a
+// backing page and no allocator page straddles two registrations.
+TEST(PageBackend, RegionsEndOnBackingAndAllocatorPages) {
+  constexpr uint64_t kOddPage = 3000;
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {2500 * kOddPage};  // mapped as 7503872 bytes of 4 KiB pages
+  cfg.max_mr_bytes = 3500000;            // -> 2 x 1536000 = 3072000
+  PageBackend backend(TierType::DRAM, kOddPage, cfg, std::chrono::seconds(30));
+  RecordingRegistrar registrar;
+  ASSERT_TRUE(backend.Init(&registrar));
+
+  ASSERT_EQ(registrar.regions.size(), 3u);
+  auto* base = static_cast<char*>(registrar.regions[0].first);
+  const std::vector<size_t> sizes = {3072000, 3072000, 1359872};
+  for (size_t i = 0; i < sizes.size(); ++i) {
+    EXPECT_EQ(registrar.regions[i].first, base + 3072000 * i);
+    EXPECT_EQ(registrar.regions[i].second, sizes[i]);
+  }
+  // The mapping's slack past the request stays usable, as without a split.
+  EXPECT_EQ(backend.Capacity().total_bytes, 2501 * kOddPage);
+}
+
+// 0 turns the limit off, and a limit below one page still registers whole pages.
+TEST(PageBackend, MaxMrBytesZeroOrTinyLimit) {
+  {
+    PageBackend::OwnershipConfig cfg;
+    cfg.buffer_sizes = {20 * 4096};
+    cfg.max_mr_bytes = 0;
+    PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+    RecordingRegistrar registrar;
+    ASSERT_TRUE(backend.Init(&registrar));
+    ASSERT_EQ(registrar.regions.size(), 1u);
+    EXPECT_EQ(registrar.regions[0].second, 20u * 4096);
+  }
+  {
+    PageBackend::OwnershipConfig cfg;
+    cfg.buffer_sizes = {3 * 4096};
+    cfg.max_mr_bytes = 1;
+    PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+    RecordingRegistrar registrar;
+    ASSERT_TRUE(backend.Init(&registrar));
+    ASSERT_EQ(registrar.regions.size(), 3u);
+    for (const auto& region : registrar.regions) EXPECT_EQ(region.second, 4096u);
+  }
+}
+
+// Regions of one buffer stay on its NUMA node, and a node-preferring request
+// takes a region of that node that holds it whole before scattering.
+TEST(PageBackend, SplitRegionsShareTheirNumaPreference) {
+  PageBackend::OwnershipConfig cfg;
+  cfg.buffer_sizes = {20 * 4096};
+  cfg.numa_nodes = {0};
+  cfg.max_mr_bytes = 8 * 4096;
+  PageBackend backend(TierType::DRAM, 4096, cfg, std::chrono::seconds(30));
+  ASSERT_TRUE(backend.Init(nullptr));
+  ASSERT_EQ(backend.BufferCount(), 3u);
+
+  auto first = backend.BatchAllocate({AllocateRequest{"first", 6 * 4096, 0}}).front();
+  ASSERT_EQ(first.outcome, AllocateOutcome::kSuccessAllocated);
+  for (const auto& page : first.pages) EXPECT_EQ(page.buffer_index, 0u);
+
+  // Region 0 has 2 pages left: the next 4 go whole to region 1.
+  auto second = backend.BatchAllocate({AllocateRequest{"second", 4 * 4096, 0}}).front();
+  ASSERT_EQ(second.outcome, AllocateOutcome::kSuccessAllocated);
+  for (const auto& page : second.pages) EXPECT_EQ(page.buffer_index, 1u);
+
+  // No region holds 10 pages: they come from all three.
+  auto rest = backend.BatchAllocate({AllocateRequest{"rest", 10 * 4096, 0}}).front();
+  ASSERT_EQ(rest.outcome, AllocateOutcome::kSuccessAllocated);
+  EXPECT_EQ(rest.pages.size(), 10u);
 }
 
 TEST(PageBackend, CommitMakesKeyResolvable) {

@@ -14,7 +14,7 @@ for bin in tests/cpp/cco/test_*; do
     test_lsa_memcheck|test_gda_barrier|test_gda_counter|test_gda_multi_context|test_gda_signal_ut|test_gda_thread_aggregate|test_gda_put|test_gda_get) continue ;;
     # SDMA tests need MORI_ENABLE_SDMA=1 to build queues (else they self-SKIP);
     # run separately in CI with that env set, so skip them in this default sweep.
-    test_sdma_put|test_sdma_get|test_sdma_put_mt|test_sdma_block|test_sdma_edge) continue ;;
+    test_sdma_put|test_sdma_get|test_sdma_put_mt|test_sdma_block|test_sdma_edge|test_sdma_put2d|test_sdma_put2d_shapes|test_sdma_wait_broadcast) continue ;;
     # Takes --n_processes/--n_local_devices/--visible_devices instead of a
     # bare positional nranks arg, and (like its SDMA siblings above) needs
     # MORI_ENABLE_SDMA=1 to build queues

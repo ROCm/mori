@@ -16,6 +16,7 @@ service UMBPStandalone {
   rpc Exists(KeyRequest) returns (BoolResponse);
   rpc BatchExists(BatchKeysRequest) returns (BatchBoolResponse);
   rpc BatchExistsConsecutive(BatchKeysRequest) returns (CountResponse);
+  rpc BatchPrefetch(BatchKeysRequest) returns (CountResponse);
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);

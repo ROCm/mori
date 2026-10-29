@@ -84,6 +84,19 @@ class SdmaFlags:
     SAME_QUEUE = 1 << 4
 
 
+class SdmaCmp:
+    """C++ ``ccoSdmaCmp``: the comparison of an engine-side wait
+    (``Sdma.post_wait_mem``), applied to ``(*flag & mask)`` against ``value``."""
+
+    ALWAYS = 0
+    LT = 1
+    LE = 2
+    EQ = 3
+    NE = 4
+    GE = 5
+    GT = 6
+
+
 def sdma_flags(
     coop,
     *,
@@ -220,6 +233,40 @@ for _op in ("put", "get"):
             tag=_tag,
         )
 
+# SDMA 2D put/get: (devComm, peer, dstWin, dstOff, dstPitch, srcWin, srcOff,
+# srcPitch, widthBytes, height, qid, flags).
+_sdma_xfer2d_args = [
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+]
+for _op in ("put", "get"):
+    for _tag in (
+        "thread",
+        "warp",
+        "block",
+        "thread_ns",
+        "warp_ns",
+        "block_ns",
+    ):
+        _add(
+            f"sdma_{_op}2d_{_tag}",
+            f"cco_sdma_{_op}2d__{_tag}",
+            _sdma_xfer2d_args,
+            _I32,
+            family=f"sdma_{_op}2d",
+            tag=_tag,
+        )
+
 for _tag in COOP_TAGS:
     _add(
         f"sdma_quiet_{_tag}",
@@ -279,6 +326,39 @@ _add(
     pure=True,
     family="sdma_signal_slot",
 )
+
+# Engine-side wait and broadcast. `flags` is the SdmaFlags subset the C++ call
+# takes: AGGREGATE for the waits; AGGREGATE | LOCAL_SIGNAL | REMOTE_SIGNAL for
+# the broadcast. value / mask / expected are 32-bit quantities in a uint64.
+for _tag in COOP_TAGS:
+    # (devComm, peer, qid, win, off, value, cmp, mask, flags)
+    _add(
+        f"sdma_post_wait_mem_{_tag}",
+        f"cco_sdma_post_wait_mem__{_tag}",
+        [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _I32],
+        _I32,
+        family="sdma_post_wait_mem",
+        tag=_tag,
+    )
+    # (devComm, peer, qid, srcLsaRank, sigQid, expected, flags)
+    _add(
+        f"sdma_post_wait_signal_{_tag}",
+        f"cco_sdma_post_wait_signal__{_tag}",
+        [_U64, _I32, _I32, _I32, _I32, _U64, _I32],
+        _I32,
+        family="sdma_post_wait_signal",
+        tag=_tag,
+    )
+    # (devComm, peer, dstWin, dstOff, peer2, dstWin2, dstOff2, srcWin, srcOff,
+    #  nbytes, qid, flags)
+    _add(
+        f"sdma_put_broadcast_{_tag}",
+        f"cco_sdma_put_broadcast__{_tag}",
+        [_U64, _I32, _U64, _U64, _I32, _U64, _U64, _U64, _U64, _U64, _I32, _I32],
+        _I32,
+        family="sdma_put_broadcast",
+        tag=_tag,
+    )
 
 # GDA data path.
 _gda_put_args = [
@@ -389,6 +469,7 @@ __all__ = [
     "ThreadMode",
     "SdmaOptFlags",
     "SdmaFlags",
+    "SdmaCmp",
     "sdma_flags",
     "sdma_signals",
     "SIGNAL_TAG",

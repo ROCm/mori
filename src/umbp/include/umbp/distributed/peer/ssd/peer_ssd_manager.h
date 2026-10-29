@@ -21,6 +21,7 @@
 // SOFTWARE.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -310,10 +311,20 @@ class PeerSsdManager {
   };
 
   struct InflightRead {
-    int refs = 0;  // leader + followers + independents holding this key
-    // Non-null exactly while a leader is mid-read; the leader clears it on
-    // completion so the next arrival starts a fresh episode.
-    std::shared_ptr<ReadEpisode> episode;
+    int refs = 0;  // leaders + followers holding this key
+    // One per leader mid-read, so ranged readers of different extents each lead
+    // one; a leader removes its own on completion.
+    std::vector<std::shared_ptr<ReadEpisode>> episodes;
+
+    std::shared_ptr<ReadEpisode> Joinable(uint64_t offset, uint64_t length) const {
+      for (const auto& e : episodes) {
+        if (!e->sealed && e->Covers(offset, length)) return e;
+      }
+      return nullptr;
+    }
+    void Retire(const std::shared_ptr<ReadEpisode>& e) {
+      episodes.erase(std::remove(episodes.begin(), episodes.end(), e), episodes.end());
+    }
   };
 
   // Read priority + eviction coordination (all guarded by mutex_):

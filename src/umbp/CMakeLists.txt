@@ -176,7 +176,11 @@ find_package(gRPC CONFIG QUIET)
 
 # This branch wires distributed PoolClient support directly into umbp_common, so
 # gRPC + Protobuf are a required build dependency here.
-if(TARGET gRPC::grpc++)
+# UMBP only opens insecure channels, so gRPC's unsecure flavor is enough, and it
+# brings no TLS library into the process (or into the published wheel).
+if(TARGET gRPC::grpc++_unsecure)
+  set(_GRPCPP_LIB gRPC::grpc++_unsecure)
+elseif(TARGET gRPC::grpc++)
   set(_GRPCPP_LIB gRPC::grpc++)
 elseif(TARGET grpc++)
   set(_GRPCPP_LIB grpc++)
