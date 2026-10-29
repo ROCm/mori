@@ -56,6 +56,8 @@ inline constexpr uint16_t kXgmiOnlyFallbackPlaceholderPort = 1;
 }  // namespace internal
 
 void ValidateRdmaTransferConfig(const RdmaBackendConfig& config);
+// Applies the MORI_IO_* env overrides to beConfig, then validates the result.
+RdmaBackendConfig ResolveRdmaBackendConfig(const RdmaBackendConfig& beConfig);
 bool UsesInlineOnly(const RdmaBackendConfig& config);
 int ResolveRequestedNics(const RdmaBackendConfig& config, const TopoKey& local,
                          const TopoKey& remote);
