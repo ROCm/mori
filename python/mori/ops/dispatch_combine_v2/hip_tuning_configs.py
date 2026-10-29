@@ -339,13 +339,16 @@ _LL128_TABLE: dict = {
     "none": {
         "gfx1250": {
             (4, 7168, 6, None): {
-                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16))
+                "bf16": dict(max_tok=64, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=64, dispatch=(64, 8), combine=(64, 16)),
             },
             (8, 7168, 6, None): {
-                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))
+                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
             },
             (16, 7168, 6, None): {
-                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16))
+                "bf16": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
+                "fp8": dict(max_tok=16, dispatch=(64, 16), combine=(64, 16)),
             },
         },
     },

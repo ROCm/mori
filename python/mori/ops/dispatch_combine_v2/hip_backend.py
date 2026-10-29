@@ -315,15 +315,13 @@ def ll128_layout(cfg):
     """
     if cfg.is_internode or cfg.async_ll:
         return None
+    if cfg.quant_type == "none" and cfg.combine_dtype is not torch.bfloat16:
+        return None
     if cfg.is_fp4:
         dt = "fp4"
     elif cfg.dispatch_dtype in _FP8_TUNING_DTYPES:
         dt = "fp8"
-    elif (
-        cfg.dispatch_dtype is torch.bfloat16
-        and cfg.combine_dtype is torch.bfloat16
-        and cfg.quant_type == "none"
-    ):
+    elif cfg.dispatch_dtype is torch.bfloat16 and cfg.quant_type == "none":
         dt = "bf16"
     else:
         return None

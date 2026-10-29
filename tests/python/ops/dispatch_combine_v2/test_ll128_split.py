@@ -56,18 +56,20 @@ HIDDEN = 7168
 TOPK = 6
 EPR = int(os.environ.get("EPR", 8))
 M = int(os.environ.get("M", 512))
-QUANTS = os.environ.get("QUANTS", "none,fp8_blockwise,fp4_blockwise").split(",")
-ROUNDS = int(os.environ.get("ROUNDS", 2))
-_DISP = {
-    "none": torch.bfloat16,
-    "fp8_blockwise": torch.float8_e4m3fn,
-    "fp4_blockwise": torch.float4_e2m1fn_x2,
+_CASES = {
+    "none": ("none", torch.bfloat16, 0, 1),
+    "none_fp8": ("none", torch.float8_e4m3fn, HIDDEN // 128, 4),
+    "fp8_blockwise": ("fp8_blockwise", torch.float8_e4m3fn, HIDDEN // 32, 1),
+    "fp4_blockwise": ("fp4_blockwise", torch.float4_e2m1fn_x2, HIDDEN // 32, 1),
 }
+QUANTS = os.environ.get("QUANTS", ",".join(_CASES)).split(",")
+ROUNDS = int(os.environ.get("ROUNDS", 2))
+_SCALE_DTYPE = {1: torch.uint8, 4: torch.float32}
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
-def make_cfg(q, rank, world):
-    dt = _DISP[q]
+def make_cfg(case, rank, world):
+    q, dt, scale_dim, scale_size = _CASES[case]
     bf16 = dt is torch.bfloat16
     return EpDispatchCombineConfig(
         rank=rank,
@@ -79,8 +81,8 @@ def make_cfg(q, rank, world):
         data_type=torch.bfloat16,
         dispatch_data_type=None if bf16 else dt,
         combine_data_type=None if bf16 else torch.bfloat16,
-        scale_dim=0 if bf16 else HIDDEN // 32,
-        scale_type_size=1,
+        scale_dim=scale_dim,
+        scale_type_size=scale_size,
         kernel_backend="hip",
         quant_type=q,
     )
@@ -106,7 +108,9 @@ def make_inputs(cfg, i, src, n):
     w = torch.rand(n, TOPK, generator=g) + 0.5
     s = None
     if cfg.scale_dim:
-        s = torch.randint(0, 256, (n, cfg.scale_dim), generator=g, dtype=torch.uint8)
+        width = cfg.scale_dim * cfg.scale_type_size
+        s = torch.randint(0, 256, (n, width), generator=g, dtype=torch.uint8)
+        s = s.view(_SCALE_DTYPE[cfg.scale_type_size])
     return x, idx, w, s
 
 
@@ -124,7 +128,7 @@ def expert(recv, lut):
     return recv.to(torch.bfloat16)
 
 
-def run(cfg, comm, dev, lut, lim, sizes, args):
+def run(case, cfg, comm, dev, lut, lim, sizes, args):
     rank, world = cfg.rank, cfg.world_size
     push = cfg.quant_type != "none"
     op = EpDispatchCombineOp(cfg, comm)
@@ -254,7 +258,7 @@ def run(cfg, comm, dev, lut, lim, sizes, args):
         failures += int(bad.item() != 0)
         if rank == 0:
             verdict = "PASS" if bad.item() == 0 else "FAIL"
-            print(f"# LL128SPLIT[{cfg.quant_type}] {name}: {verdict}", flush=True)
+            print(f"# LL128SPLIT[{case}] {name}: {verdict}", flush=True)
     return failures
 
 
@@ -283,7 +287,7 @@ def main():
             )
             for i, n in enumerate(sizes)
         ]
-        plans.append((cfg, lim, sizes, args))
+        plans.append((q, cfg, lim, sizes, args))
         if rank == 0:
             print(f"# LL128SPLIT[{q}] EP{world} M={M} max_tok={lim} sizes={sizes}")
     torch.cuda.synchronize()
@@ -294,8 +298,8 @@ def main():
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
     failures = 0
-    for cfg, lim, sizes, args in plans:
-        failures += run(cfg, comm, dev, lut, lim, sizes, args)
+    for q, cfg, lim, sizes, args in plans:
+        failures += run(q, cfg, comm, dev, lut, lim, sizes, args)
 
     if rank == 0:
         print(f"# total ll128 split failures: {failures}", flush=True)

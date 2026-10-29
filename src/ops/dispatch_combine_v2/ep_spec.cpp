@@ -84,12 +84,14 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
 
   if (req.ll128) {
     const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
-    const bool bf16 = !req.combineFp4 && !req.combineFp8 && req.dtype == EpDType::Bf16;
+    const bool bf16 = !req.combineFp4 && !req.combineFp8 &&
+                      (req.dtype == EpDType::Bf16 || (isDispatch && req.dtype == EpDType::Fp8));
     if (arch.rfind("gfx125", 0) != 0 || !(pushE8m0 || bf16) || req.maxTokPerRank > 512 ||
         c.waveSize != 32 || c.blockNum > (isDispatch ? 128 : 256)) {
       throw std::runtime_error(
           "mori v2 ep: ll128 needs gfx125x, the fp4 / fp8 push combine with e8m0 scales or a bf16 "
-          "op, at most 512 tokens a rank, wave32, and at most 128 dispatch / 256 combine blocks");
+          "combine with a bf16 / fp8 dispatch, at most 512 tokens a rank, wave32, and at most 128 "
+          "dispatch / 256 combine blocks");
     }
     c.ll128 = true;
   }
