@@ -27,6 +27,11 @@ Only DRAM/HBM backends are supported; SSD is rejected. Embedded mode defaults to
 metadata via C++ `RegisterMemory`; real pointers use existing classification.
 Virtual HBM needs no GPU, but normal build dependencies, including HIP, still apply.
 
+SSD simulation is follow-up work: virtual file capacity and file↔host/GPU transfer
+models must retain `SsdBackend` placement, eviction and staging behavior. Its actual
+POSIX/GDS paths need separate calibration; this version rejects SSD rather than
+substituting a DRAM model.
+
 ### Standalone / CI
 
 Run one server per node; its capacity, page size, LRU and policies apply to all ranks:

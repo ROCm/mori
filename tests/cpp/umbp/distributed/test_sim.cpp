@@ -22,7 +22,9 @@
 
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
+#include <grpcpp/grpcpp.h>
 #include <gtest/gtest.h>
+#include <hip/hip_runtime.h>
 #include <unistd.h>
 
 #include <filesystem>
@@ -35,8 +37,10 @@
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/sim/sim.h"
+#include "umbp/standalone/ipc.h"
 #include "umbp/standalone/standalone_server.h"
 #include "umbp/umbp_client.h"
+#include "umbp_standalone.grpc.pb.h"
 
 namespace mori::umbp {
 namespace {
@@ -227,6 +231,53 @@ TEST_F(SimTest, StandaloneRejectsMismatchedModes) {
   }
 }
 
+TEST_F(SimTest, StandaloneRegistrationRejectsWrongKindsAndVirtualFdHandoffs) {
+  for (bool sim : {false, true}) {
+    auto config = Config();
+    config.sim.enabled = sim;
+    const auto address = RankConfig().standalone_process->address;
+    standalone::StandaloneServer server(config, address);
+    ASSERT_TRUE(server.Start());
+    auto stub = ::umbp::UMBPStandalone::NewStub(
+        grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+    HostMemAllocator allocator;
+    HostBufferOptions options;
+    options.backing = HostBufferBacking::kAnonymousShm;
+    options.prefault = false;
+    auto memory = allocator.Alloc(kPage, options);
+    ASSERT_TRUE(memory.valid());
+    const auto ptr = reinterpret_cast<uintptr_t>(memory.ptr);
+    const auto shm = HostMemAllocator::LookupShmAllocation(ptr, kPage);
+    ASSERT_TRUE(shm);
+    std::string error;
+    const auto status =
+        standalone::SendFdRegistration(standalone::DeriveFdSocketPath(address), shm->fd, "rank",
+                                       ptr, memory.mapped_size, 1000, &error);
+    EXPECT_EQ(status, sim ? -1 : 0) << error;
+
+    ::umbp::RegisterMemoryRequest request;
+    request.set_client_id("rank");
+    request.set_worker_base(ptr);
+    request.set_size(kPage);
+    request.set_device_id(-1);
+    auto register_kind = [&](::umbp::MemoryKind kind) {
+      request.set_kind(kind);
+      grpc::ClientContext context;
+      ::umbp::BoolResponse response;
+      EXPECT_TRUE(stub->RegisterMemory(&context, request, &response).ok());
+      return response.ok();
+    };
+    EXPECT_FALSE(register_kind(sim ? ::umbp::MEMORY_KIND_HOST_SHM : ::umbp::MEMORY_KIND_VIRTUAL));
+    if (sim) EXPECT_FALSE(register_kind(::umbp::MEMORY_KIND_GPU_IPC));
+    EXPECT_TRUE(register_kind(sim ? ::umbp::MEMORY_KIND_VIRTUAL : ::umbp::MEMORY_KIND_HOST_SHM));
+    if (sim) {
+      request.set_ipc_handle("invalid");
+      EXPECT_FALSE(register_kind(::umbp::MEMORY_KIND_VIRTUAL));
+    }
+    allocator.Free(memory);
+  }
+}
+
 TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
   // A 1 MiB copy needs 80 ms alone, while four copies share a 4x faster channel.
   Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
@@ -330,6 +381,36 @@ TEST_F(SimTest, MissingPathAbortsReservationAndDefaultModeStillCopies) {
   EXPECT_EQ(dst, src);
 }
 
+TEST_F(SimTest, DefaultGpuPointerClassificationKeepsRealAndSimCopies) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "needs a GPU";
+  ASSERT_EQ(hipSetDevice(0), hipSuccess);
+  void* raw = nullptr;
+  ASSERT_EQ(hipMalloc(&raw, kPage), hipSuccess);
+  std::unique_ptr<char, decltype(&hipFree)> buffer(static_cast<char*>(raw), hipFree);
+  std::vector<char> expected(kPage, 'x'), actual(kPage);
+  ASSERT_EQ(hipMemcpy(raw, expected.data(), kPage, hipMemcpyHostToDevice), hipSuccess);
+  auto config = Config();
+  config.sim.enabled = false;
+  auto client = CreateUMBPClient(config);
+  const auto ptr = reinterpret_cast<uintptr_t>(raw);
+  ASSERT_TRUE(client->RegisterMemory(ptr, kPage));  // Existing two-argument API.
+  ASSERT_TRUE(client->Put("gpu", ptr, kPage));
+  ASSERT_EQ(hipMemset(raw, 0, kPage), hipSuccess);
+  ASSERT_TRUE(client->Get("gpu", ptr, kPage));
+  ASSERT_EQ(hipMemcpy(actual.data(), raw, kPage, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(actual, expected);
+  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+      "gpu_cpu":{"channel":"link","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
+  for (bool standalone : {false, true}) {
+    auto simulated = Client(Config(), standalone);
+    if (standalone) ASSERT_TRUE(simulated->RegisterMemory(ptr, kPage));
+    // Embedded callers may omit registration; standalone keeps its existing requirement.
+    EXPECT_TRUE(simulated->Put("gpu", ptr, kPage));
+    EXPECT_TRUE(simulated->Get("gpu", ptr, kPage));
+  }
+}
+
 std::string Packed(const PeerDirectory& engine) {
   const auto bytes = engine.PackedLocalEngineDesc();
   return {bytes.begin(), bytes.end()};
@@ -380,6 +461,8 @@ class SimClusterTest : public SimTest {
   void SetUp() override {
     SimTest::SetUp();
     Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+      "cpu_gpu":{"channel":"link","latency_ns":0,"bandwidth_bytes_per_second":1e10},
+      "gpu_cpu":{"channel":"link","latency_ns":0,"bandwidth_bytes_per_second":1e10},
       "remote_read":{"channel":"nic","latency_ns":1000000,"bandwidth_bytes_per_second":4096000},
       "remote_write":{"channel":"nic","latency_ns":1000000,"bandwidth_bytes_per_second":4096000}})");
     MasterServerConfig config;
@@ -481,15 +564,21 @@ TEST_P(SimClusterApiTest, RemoteRangedIoRequiresScratch) {
   EXPECT_FALSE(owner->Exists("offload"));
 }
 
-TEST_F(SimClusterTest, RemoteRecacheAndEvictionKeepRealMetadata) {
+class SimRecacheTest : public SimClusterTest, public ::testing::WithParamInterface<MemLoc> {};
+INSTANTIATE_TEST_SUITE_P(CpuAndGpuCallers, SimRecacheTest,
+                         ::testing::Values(MemLoc::CPU, MemLoc::GPU));
+
+TEST_P(SimRecacheTest, RemoteRecacheAndEvictionKeepRealMetadata) {
   auto owner = Pool("owner", false);
   auto* payload = reinterpret_cast<void*>(ptr_);
   ASSERT_TRUE(owner->Put("cached", payload, kPage));
   ASSERT_TRUE(owner->Put("evicted", payload, kPage));
   owner->Master().FlushHeartbeat();
   auto reader = Pool("reader", true);
+  ASSERT_TRUE(
+      reader->RegisterMemory(payload, 64 * kPage, GetParam(), GetParam() == MemLoc::GPU ? 0 : -1));
   ASSERT_TRUE(Await([&] { return reader->Exists("cached"); }));
-  ASSERT_TRUE(reader->Get("cached", payload, kPage));
+  ASSERT_TRUE(reader->Get("cached", reinterpret_cast<void*>(ptr_ + kPage), kPage));
   auto* backend = reader->Backends().Get(TierType::DRAM);
   ASSERT_TRUE(Await([&] { return backend->Contains("cached"); }));
   EXPECT_EQ(owner->Backends().Get(TierType::DRAM)->Evict({"evicted"}).front().bytes_freed, kPage);

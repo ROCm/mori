@@ -464,6 +464,45 @@ class KeyHandleStats {
 }  // namespace
 
 class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
+  class MemoryImporter {
+   public:
+    virtual ~MemoryImporter() = default;
+    virtual void Register(Impl& server, const ::umbp::RegisterMemoryRequest& request,
+                          ::umbp::BoolResponse* response) = 0;
+    virtual bool RegisterFd(Impl& server, int fd, const FdRegistrationMessage& msg) = 0;
+  };
+
+  class RealMemoryImporter final : public MemoryImporter {
+   public:
+    void Register(Impl& server, const ::umbp::RegisterMemoryRequest& request,
+                  ::umbp::BoolResponse* response) override {
+      if (request.kind() == ::umbp::MEMORY_KIND_GPU_IPC)
+        server.RegisterGpuIpc(request, response);
+      else if (request.kind() == ::umbp::MEMORY_KIND_HOST_SHM)
+        server.ConfirmHostRegistration(request, response);
+      else
+        SetBool(response, false, "real server requires HOST_SHM or GPU_IPC memory");
+    }
+    bool RegisterFd(Impl& server, int fd, const FdRegistrationMessage& msg) override {
+      return server.RegisterRealFd(fd, msg);
+    }
+  };
+
+  class VirtualMemoryImporter final : public MemoryImporter {
+   public:
+    void Register(Impl& server, const ::umbp::RegisterMemoryRequest& request,
+                  ::umbp::BoolResponse* response) override {
+      if (request.kind() == ::umbp::MEMORY_KIND_VIRTUAL)
+        server.RegisterVirtualMemory(request, response);
+      else
+        SetBool(response, false, "sim server requires VIRTUAL memory");
+    }
+    bool RegisterFd(Impl&, int fd, const FdRegistrationMessage&) override {
+      close(fd);
+      return false;
+    }
+  };
+
  public:
   // `config` must already be normalized (see NormalizeBackendConfig) — the
   // constructor hands it straight to CreateUMBPClient.
@@ -479,7 +518,12 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
         concurrent_backend_(shared_reads_ && client_ != nullptr &&
                             client_->GetDeploymentMode() == UMBPDeploymentMode::Distributed),
         address_(std::move(address)),
-        fd_socket_path_(DeriveFdSocketPath(address_)) {}
+        fd_socket_path_(DeriveFdSocketPath(address_)) {
+    if (backend_config_.sim.enabled)
+      memory_importer_ = std::make_unique<VirtualMemoryImporter>();
+    else
+      memory_importer_ = std::make_unique<RealMemoryImporter>();
+  }
 
   ~Impl() override { Shutdown(); }
 
@@ -872,28 +916,8 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       SetBool(response, false, "server is shutting down");
       return grpc::Status::OK;
     }
-    if (request->simulation() != backend_config_.sim.enabled) {
-      SetBool(response, false, "client/server sim mode mismatch");
-      return grpc::Status::OK;
-    }
     std::lock_guard<std::mutex> lifecycle_lock(external_identity_lifecycle_mu_);
-    if (request->simulation()) {
-      RegisterSimMemory(*request, response);
-    } else if (request->kind() == ::umbp::MEMORY_KIND_GPU_IPC) {
-      RegisterGpuIpc(*request, response);
-    } else {
-      bool ok = false;
-      {
-        std::shared_lock<std::shared_mutex> lock(memory_mu_);
-        auto it = memory_.find(request->client_id());
-        if (it != memory_.end()) {
-          ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
-            return mem.worker_base == request->worker_base() && mem.size >= request->size();
-          });
-        }
-      }
-      SetBool(response, ok, ok ? "" : "fd handoff registration was not found");
-    }
+    memory_importer_->Register(*this, *request, response);
     if (response->ok() && !EnsureExternalIdentity(*request)) {
       MORI_UMBP_WARN(
           "[StandaloneServer] external-KV identity registration failed for client_id={} "
@@ -995,7 +1019,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
  private:
-  enum class MemoryKind { kHostShm, kGpuIpc, kSim };
+  enum class MemoryKind { kHostShm, kGpuIpc, kVirtual };
 
   struct RegisteredMemory {
     void* base = nullptr;
@@ -1221,10 +1245,10 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
   }
 
   bool RegisterFd(int fd, const FdRegistrationMessage& msg) {
-    if (backend_config_.sim.enabled) {
-      close(fd);
-      return false;
-    }
+    return memory_importer_->RegisterFd(*this, fd, msg);
+  }
+
+  bool RegisterRealFd(int fd, const FdRegistrationMessage& msg) {
     void* mapped =
         mmap(nullptr, static_cast<size_t>(msg.size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
@@ -1282,13 +1306,29 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     return old;
   }
 
-  void RegisterSimMemory(const ::umbp::RegisterMemoryRequest& request,
-                         ::umbp::BoolResponse* response) {
-    const bool gpu = request.kind() == ::umbp::MEMORY_KIND_GPU_IPC;
+  void ConfirmHostRegistration(const ::umbp::RegisterMemoryRequest& request,
+                               ::umbp::BoolResponse* response) {
+    bool ok = false;
+    {
+      std::shared_lock<std::shared_mutex> lock(memory_mu_);
+      auto it = memory_.find(request.client_id());
+      if (it != memory_.end()) {
+        ok = std::any_of(it->second.begin(), it->second.end(), [&](const RegisteredMemory& mem) {
+          return mem.kind == MemoryKind::kHostShm && mem.worker_base == request.worker_base() &&
+                 mem.size >= request.size();
+        });
+      }
+    }
+    SetBool(response, ok, ok ? "" : "fd handoff registration was not found");
+  }
+
+  void RegisterVirtualMemory(const ::umbp::RegisterMemoryRequest& request,
+                             ::umbp::BoolResponse* response) {
+    const bool gpu = request.device_id() >= 0;
     if (request.client_id().empty() || request.worker_base() == 0 || request.size() == 0 ||
         request.size() > std::numeric_limits<uintptr_t>::max() - request.worker_base() ||
-        (!gpu && request.kind() != ::umbp::MEMORY_KIND_HOST_SHM) ||
-        (gpu && request.device_id() < 0)) {
+        request.device_id() < -1 || !request.ipc_handle().empty() || request.ipc_offset() != 0 ||
+        request.alloc_base() != 0) {
       SetBool(response, false, "invalid simulated memory registration");
       return;
     }
@@ -1310,7 +1350,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     entry.base = buffer.ptr;
     entry.worker_base = request.worker_base();
     entry.size = request.size();
-    entry.kind = MemoryKind::kSim;
+    entry.kind = MemoryKind::kVirtual;
     entry.client_id = request.client_id();
     auto old = InsertOrReplaceRegion(request.client_id(), entry);
     if (old) ReleaseRegisteredMemory(*old);
@@ -1654,6 +1694,7 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
 
   UMBPConfig backend_config_;
   std::unique_ptr<IUMBPClient> client_;
+  std::unique_ptr<MemoryImporter> memory_importer_;
   const bool shared_reads_;
   // A distributed backend on a non-SSD medium synchronizes concurrent puts,
   // gets and lookups itself -- it is driven that way by an embedded client's

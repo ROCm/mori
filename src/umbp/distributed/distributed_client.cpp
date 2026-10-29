@@ -30,11 +30,11 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/config.h"
 #include "umbp/distributed/config.h"
-#include "umbp/sim/sim.h"
 
 namespace mori::umbp {
 
-DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config) {
+DistributedClient::DistributedClient(const UMBPConfig& config)
+    : config_(config), platform_(MakePoolPlatform(config.sim)) {
   if (!config.distributed.has_value()) {
     throw std::runtime_error("DistributedClient requires UMBPConfig::distributed to be set");
   }
@@ -96,7 +96,6 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // Zero-sized is the default and means "this deployment does not do ranged
   // I/O": no arena, no registration, and SupportsRangedIO() reports false, so
   // a client that never issues ranged operations stops paying for the arena.
-  HostMemAllocator allocator;
   HostBufferOptions scratch_opts;
   if (dc.ranged_scratch_use_hugepages) {
     scratch_opts.backing = HostBufferBacking::kAnonymousHugetlb;
@@ -105,18 +104,14 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   // Two separate arenas — GET and PUT — each of ranged_scratch_size, so the two
   // directions never share a buffer or a lock and can run concurrently.
   if (dc.ranged_scratch_size > 0) {
-    auto allocate = [&] {
-      return config.sim.enabled ? AllocateSimMemory(dc.ranged_scratch_size)
-                                : allocator.Alloc(dc.ranged_scratch_size, scratch_opts);
-    };
-    ranged_get_scratch_handle_ = allocate();
-    ranged_put_scratch_handle_ = allocate();
+    ranged_get_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
+    ranged_put_scratch_handle_ = platform_->AllocateHost(dc.ranged_scratch_size, scratch_opts);
     if (!ranged_get_scratch_handle_.valid() || !ranged_put_scratch_handle_.valid()) {
       // HostBufferHandle is not RAII and the destructor/Close() won't run when a
       // constructor throws, so free whatever did allocate before bailing out
       // (Free() is a no-op on an invalid handle).
-      allocator.Free(ranged_get_scratch_handle_);
-      allocator.Free(ranged_put_scratch_handle_);
+      platform_->FreeHost(ranged_get_scratch_handle_);
+      platform_->FreeHost(ranged_put_scratch_handle_);
       throw std::runtime_error("DistributedClient: memory allocation failed for ranged scratch");
     }
     // Hugepages fall back to 4 KiB silently, so log what was actually mapped.
@@ -139,19 +134,17 @@ DistributedClient::DistributedClient(const UMBPConfig& config) : config_(config)
   pc_config.ranged_put_scratch_buffer = ranged_put_scratch_;
   pc_config.ranged_put_scratch_size = ranged_put_scratch_size_;
   pc_config.copy_pipeline = config_.copy_pipeline;
-  pc_config.sim = config_.sim;
 
   auto release_scratch = [this] {
-    HostMemAllocator cleanup;
-    cleanup.Free(ranged_get_scratch_handle_);
-    cleanup.Free(ranged_put_scratch_handle_);
+    platform_->FreeHost(ranged_get_scratch_handle_);
+    platform_->FreeHost(ranged_put_scratch_handle_);
     ranged_get_scratch_ = nullptr;
     ranged_get_scratch_size_ = 0;
     ranged_put_scratch_ = nullptr;
     ranged_put_scratch_size_ = 0;
   };
 
-  pool_client_ = std::make_unique<PoolClient>(std::move(pc_config));
+  pool_client_ = std::make_unique<PoolClient>(std::move(pc_config), platform_);
   if (!pool_client_->Init()) {
     pool_client_.reset();
     release_scratch();
@@ -431,9 +424,8 @@ void DistributedClient::Close() {
   // Only after Shutdown has deregistered the regions — the arenas are
   // caller-owned and PoolClient holds a memory region over each until then.
   if (ranged_get_scratch_ || ranged_put_scratch_) {
-    HostMemAllocator allocator;
-    allocator.Free(ranged_get_scratch_handle_);
-    allocator.Free(ranged_put_scratch_handle_);
+    platform_->FreeHost(ranged_get_scratch_handle_);
+    platform_->FreeHost(ranged_put_scratch_handle_);
     ranged_get_scratch_ = nullptr;
     ranged_get_scratch_size_ = 0;
     ranged_put_scratch_ = nullptr;

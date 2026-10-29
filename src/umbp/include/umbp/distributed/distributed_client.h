@@ -114,6 +114,7 @@ class DistributedClient : public IUMBPClient {
 
  private:
   UMBPConfig config_;
+  std::shared_ptr<PoolPlatform> platform_;
   // The only buffers this class still allocates. Phase 2b moved medium pools
   // into the backends, but the ranged scratch arenas are not a medium: they are
   // client-side staging regions for objects fetched from, or assembled for,

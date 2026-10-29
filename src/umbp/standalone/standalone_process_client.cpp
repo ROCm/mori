@@ -199,11 +199,89 @@ class ScopedBootstrapLock {
 
 }  // namespace
 
+class StandaloneProcessClient::MemoryExporter {
+ public:
+  virtual ~MemoryExporter() = default;
+  virtual bool Register(StandaloneProcessClient& client, uintptr_t ptr, size_t size,
+                        mori::io::MemoryLocationType loc, int device) = 0;
+};
+
+class StandaloneProcessClient::RealMemoryExporter final : public MemoryExporter {
+ public:
+  bool Register(StandaloneProcessClient& client, uintptr_t ptr, size_t size,
+                mori::io::MemoryLocationType loc, int device) override {
+    // Classification is authoritative, and `loc`/`device` only fill in what it
+    // cannot know.  Two callers have to work here: ours, which states the
+    // location explicitly, and a connector written against the two-argument
+    // upstream API, which does not.  Trusting the pointer over the argument
+    // means a caller who leaves `loc` at its CPU default cannot silently get a
+    // device buffer registered as host memory — the failure that would then show
+    // up as a memcpy from device memory, far from here.
+    PointerLocation location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
+    if (loc == mori::io::MemoryLocationType::GPU && !location.IsDevice()) {
+      MORI_UMBP_ERROR(
+          "[StandaloneProcessClient] RegisterMemory: caller declared GPU for ptr=0x{:x} but it is "
+          "not device memory",
+          ptr);
+      return false;
+    }
+    // A device ordinal from the caller is honoured when classification could not
+    // supply one (hipPointerGetAttributes reports -1 for some allocations).
+    if (location.IsDevice() && location.device_id < 0) location.device_id = device;
+
+    if (location.IsDevice()) return client.RegisterDeviceMemory(ptr, size, location.device_id);
+    return client.RegisterHostShmMemory(ptr, size);
+  }
+};
+
+class StandaloneProcessClient::VirtualMemoryExporter final : public MemoryExporter {
+ public:
+  bool Register(StandaloneProcessClient& client, uintptr_t ptr, size_t size,
+                mori::io::MemoryLocationType loc, int device) override {
+    // Explicit GPU metadata also supports virtual callers without a HIP device.
+    if (loc == mori::io::MemoryLocationType::CPU) {
+      const auto location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
+      if (location.IsDevice()) {
+        loc = mori::io::MemoryLocationType::GPU;
+        if (location.device_id >= 0) device = location.device_id;
+      }
+    }
+    if (ptr == 0 || size == 0 || size > std::numeric_limits<uintptr_t>::max() - ptr ||
+        (loc != mori::io::MemoryLocationType::CPU && loc != mori::io::MemoryLocationType::GPU) ||
+        (loc == mori::io::MemoryLocationType::GPU && device < 0))
+      return false;
+    ::umbp::RegisterMemoryRequest req;
+    req.set_client_id(client.ClientId());
+    req.set_worker_base(ptr);
+    req.set_size(size);
+    req.set_kind(::umbp::MEMORY_KIND_VIRTUAL);
+    req.set_device_id(loc == mori::io::MemoryLocationType::GPU ? device : -1);
+    req.set_worker_node_id(client.standalone_config_.worker_node_id);
+    req.set_worker_node_address(client.standalone_config_.worker_node_address);
+    for (const auto& tag : client.standalone_config_.tags) req.add_tags(tag);
+    grpc::ClientContext ctx;
+    ::umbp::BoolResponse resp;
+    if (!client.stub_->RegisterMemory(&ctx, req, &resp).ok() || !resp.ok()) return false;
+    std::lock_guard<std::mutex> lock(client.registration_mu_);
+    const auto at = std::find_if(client.regions_.begin(), client.regions_.end(),
+                                 [&](const auto& region) { return region.base == ptr; });
+    if (at == client.regions_.end())
+      client.regions_.push_back({ptr, size, RegionKind::kVirtual});
+    else
+      at->size = size;
+    return true;
+  }
+};
+
 StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : config_(config) {
   if (!config_.standalone_process.has_value()) {
     throw std::runtime_error("StandaloneProcessClient requires UMBPConfig::standalone_process");
   }
   standalone_config_ = config_.standalone_process.value();
+  if (config_.sim.enabled)
+    memory_exporter_ = std::make_unique<VirtualMemoryExporter>();
+  else
+    memory_exporter_ = std::make_unique<RealMemoryExporter>();
   std::string error_message;
   if (!config_.Validate(&error_message)) {
     throw std::runtime_error("invalid UMBP config: " + error_message);
@@ -712,68 +790,7 @@ bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;
-  if (config_.sim.enabled) {
-    // Explicit GPU metadata also supports virtual callers without a HIP device.
-    if (loc == mori::io::MemoryLocationType::CPU) {
-      const auto location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
-      if (location.IsDevice()) {
-        loc = mori::io::MemoryLocationType::GPU;
-        if (location.device_id >= 0) device = location.device_id;
-      }
-    }
-    return call.Result(RegisterSimMemory(ptr, size, loc, device));
-  }
-
-  // Classification is authoritative, and `loc`/`device` only fill in what it
-  // cannot know.  Two callers have to work here: ours, which states the
-  // location explicitly, and a connector written against the two-argument
-  // upstream API, which does not.  Trusting the pointer over the argument
-  // means a caller who leaves `loc` at its CPU default cannot silently get a
-  // device buffer registered as host memory — the failure that would then show
-  // up as a memcpy from device memory, far from here.
-  PointerLocation location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
-  if (loc == mori::io::MemoryLocationType::GPU && !location.IsDevice()) {
-    MORI_UMBP_ERROR(
-        "[StandaloneProcessClient] RegisterMemory: caller declared GPU for ptr=0x{:x} but it is "
-        "not device memory",
-        ptr);
-    return false;
-  }
-  // A device ordinal from the caller is honoured when classification could not
-  // supply one (hipPointerGetAttributes reports -1 for some allocations).
-  if (location.IsDevice() && location.device_id < 0) location.device_id = device;
-
-  if (location.IsDevice()) return call.Result(RegisterDeviceMemory(ptr, size, location.device_id));
-  return call.Result(RegisterHostShmMemory(ptr, size));
-}
-
-bool StandaloneProcessClient::RegisterSimMemory(uintptr_t ptr, size_t size,
-                                                mori::io::MemoryLocationType loc, int device) {
-  if (ptr == 0 || size == 0 || size > std::numeric_limits<uintptr_t>::max() - ptr ||
-      (loc != mori::io::MemoryLocationType::CPU && loc != mori::io::MemoryLocationType::GPU))
-    return false;
-  ::umbp::RegisterMemoryRequest req;
-  req.set_client_id(ClientId());
-  req.set_worker_base(ptr);
-  req.set_size(size);
-  req.set_simulation(true);
-  req.set_kind(loc == mori::io::MemoryLocationType::GPU ? ::umbp::MEMORY_KIND_GPU_IPC
-                                                        : ::umbp::MEMORY_KIND_HOST_SHM);
-  req.set_device_id(device);
-  req.set_worker_node_id(standalone_config_.worker_node_id);
-  req.set_worker_node_address(standalone_config_.worker_node_address);
-  for (const auto& tag : standalone_config_.tags) req.add_tags(tag);
-  grpc::ClientContext ctx;
-  ::umbp::BoolResponse resp;
-  if (!stub_->RegisterMemory(&ctx, req, &resp).ok() || !resp.ok()) return false;
-  std::lock_guard<std::mutex> lock(registration_mu_);
-  const auto at = std::find_if(regions_.begin(), regions_.end(),
-                               [&](const auto& region) { return region.base == ptr; });
-  if (at == regions_.end())
-    regions_.push_back({ptr, size, RegionKind::kSim});
-  else
-    at->size = size;
-  return true;
+  return call.Result(memory_exporter_->Register(*this, ptr, size, loc, device));
 }
 
 bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
