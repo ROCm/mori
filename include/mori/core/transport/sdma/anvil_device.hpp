@@ -107,6 +107,48 @@ CreateCopy2DPacket(void* srcBuf, uint32_t srcPitch, void* dstBuf, uint32_t dstPi
 }
 #endif  // !__gfx1250__
 
+__device__ __forceinline__ SDMA_PKT_COPY_BROADCAST
+CreateCopyBroadcastPacket(void* srcBuf, void* dstBuf1, void* dstBuf2, long long int packetSize) {
+  SDMA_PKT_COPY_BROADCAST packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_COPY;
+  packet.HEADER_UNION.sub_op = SDMA_SUBOP_COPY_LINEAR;
+  packet.HEADER_UNION.broadcast = 1;
+
+  packet.COUNT_UNION.count = (uint32_t)(packetSize - 1);
+  packet.SRC_ADDR_LO = (uint32_t)(uintptr_t)srcBuf;
+  packet.SRC_ADDR_HI = (uint32_t)((uintptr_t)srcBuf >> 32);
+  packet.DST1_ADDR_LO = (uint32_t)(uintptr_t)dstBuf1;
+  packet.DST1_ADDR_HI = (uint32_t)((uintptr_t)dstBuf1 >> 32);
+  packet.DST2_ADDR_LO = (uint32_t)(uintptr_t)dstBuf2;
+  packet.DST2_ADDR_HI = (uint32_t)((uintptr_t)dstBuf2 >> 32);
+
+  return packet;
+}
+
+// func: 0 always, 1 <, 2 <=, 3 ==, 4 !=, 5 >=, 6 >. Compares (*addr & mask) against value.
+// retry_count 0xFFF polls forever. The engine stalls the queue until the condition holds.
+__device__ __forceinline__ SDMA_PKT_POLL_REGMEM CreatePollMemPacket(HSAuint64* addr, uint32_t value,
+                                                                    uint32_t mask = 0xFFFFFFFF,
+                                                                    uint32_t func = 3,
+                                                                    uint32_t interval = 10,
+                                                                    uint32_t retryCount = 0xFFF) {
+  SDMA_PKT_POLL_REGMEM packet = {};
+
+  packet.HEADER_UNION.op = SDMA_OP_POLL_REGMEM;
+  packet.HEADER_UNION.mem_poll = 1;
+  packet.HEADER_UNION.func = func;
+
+  packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)addr);
+  packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)addr >> 32);
+  packet.VALUE_UNION.value = value;
+  packet.MASK_UNION.mask = mask;
+  packet.DW5_UNION.interval = interval;
+  packet.DW5_UNION.retry_count = retryCount;
+
+  return packet;
+}
+
 __device__ __forceinline__ SDMA_PKT_ATOMIC CreateAtomicIncPacket(HSAuint64* signal) {
   SDMA_PKT_ATOMIC packet = {};
 
@@ -312,6 +354,26 @@ __device__ __forceinline__ void put2d(SdmaQueueDeviceHandle& handle, void* dst, 
   handle.submitPacket(base, pendingWptr);
 }
 #endif  // !__gfx1250__
+
+__device__ __forceinline__ void putBroadcast(SdmaQueueDeviceHandle& handle, void* dst1, void* dst2,
+                                             void* src, size_t size) {
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_COPY_BROADCAST), offset);
+  auto packet = CreateCopyBroadcastPacket(src, dst1, dst2, size);
+  uint64_t pendingWptr = base;
+  handle.placePacket(packet, pendingWptr, offset);
+  handle.submitPacket(base, pendingWptr);
+}
+
+__device__ __forceinline__ void waitOnMem(SdmaQueueDeviceHandle& handle, void* addr, uint32_t value,
+                                          uint32_t mask = 0xFFFFFFFF, uint32_t func = 3) {
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_POLL_REGMEM), offset);
+  auto packet = CreatePollMemPacket(reinterpret_cast<HSAuint64*>(addr), value, mask, func);
+  uint64_t pendingWptr = base;
+  handle.placePacket(packet, pendingWptr, offset);
+  handle.submitPacket(base, pendingWptr);
+}
 
 __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, void* signal) {
   uint64_t offset;

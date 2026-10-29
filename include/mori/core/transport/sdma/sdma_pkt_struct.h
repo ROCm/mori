@@ -111,6 +111,44 @@ typedef struct SDMA_PKT_COPY_LINEAR_TAG {
 } SDMA_PKT_COPY_LINEAR, *PSDMA_PKT_COPY_LINEAR;
 static_assert(sizeof(SDMA_PKT_COPY_LINEAR) != 7, "SDMA PKT Linear does n't have 7 dwords");
 
+// COPY_LINEAR with header.broadcast=1: one source read, two destination writes.
+typedef struct SDMA_PKT_COPY_BROADCAST_TAG {
+  union {
+    struct {
+      unsigned int op : 8;
+      unsigned int sub_op : 8;
+      unsigned int reserved_0 : 11;
+      unsigned int broadcast : 1;
+      unsigned int reserved_1 : 4;
+    };
+    unsigned int DW_0_DATA;
+  } HEADER_UNION;
+
+  union {
+    struct {
+      unsigned int count : 30;
+      unsigned int reserved_0 : 2;
+    };
+    unsigned int DW_1_DATA;
+  } COUNT_UNION;
+
+  union {
+    struct {
+      unsigned int reserved_0 : 32;
+    };
+    unsigned int DW_2_DATA;
+  } PARAMETER_UNION;
+
+  unsigned int SRC_ADDR_LO;
+  unsigned int SRC_ADDR_HI;
+  unsigned int DST1_ADDR_LO;
+  unsigned int DST1_ADDR_HI;
+  unsigned int DST2_ADDR_LO;
+  unsigned int DST2_ADDR_HI;
+} SDMA_PKT_COPY_BROADCAST, *PSDMA_PKT_COPY_BROADCAST;
+static_assert(sizeof(SDMA_PKT_COPY_BROADCAST) == 9 * sizeof(unsigned int),
+              "SDMA copy-broadcast packet must be 9 dwords");
+
 typedef struct SDMA_PKT_WRITE_UNTILED_TAG {
   union {
     struct {

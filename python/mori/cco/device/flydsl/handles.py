@@ -54,6 +54,7 @@ from mori.cco.device.ops import (
     DATA_PATH_TAG as _TC_TAG,
     SIGNAL_TAG as _SIG_TAG,
     CoopScope,
+    SdmaCmp,
     SignalOp,
     ThreadMode,
     sdma_flags,
@@ -594,6 +595,128 @@ class Sdma:
             coop,
             signal,
             aggregate,
+        )
+
+    # post_wait_mem / post_wait_signal / put_broadcast mirror ccoSdma's, with its
+    # template arguments as compile-time keywords (coop, aggregate, and for the
+    # broadcast local_signal / remote_signal). They post from ONE issuer: thread
+    # scope serializes the active lanes, warp/block scope lets the leader post.
+    # They trap on gfx12.5, whose packet layouts are not validated.
+
+    def post_wait_mem(
+        self,
+        peer,
+        qid,
+        win,
+        offset,
+        value,
+        *,
+        cmp=SdmaCmp.EQ,
+        mask=0xFFFFFFFF,
+        coop=CoopScope.THREAD,
+        aggregate=False,
+    ):
+        """Park queue ``(peer, qid)`` until ``(*flag & mask) <cmp> value`` holds,
+        with ``flag`` at ``win[offset:]`` on THIS GPU. The copy engine does the
+        polling, so no CU spins and none has to be there when the flag flips;
+        everything posted to the queue afterwards (puts, signals) runs once it
+        holds. Only the low 32 bits of ``value`` and ``mask`` are compared.
+
+        The queue stays blocked until the condition holds (no timeout), and a full
+        ring spins the poster, so give a waiting queue its own ``qid``.
+        ``aggregate=True`` skips the doorbell: ``post_wait_mem`` + ``put`` (both
+        aggregate) + ``commit`` is one doorbell for the pair."""
+        coop = _const(coop, "coop")
+        raw.SDMA_POST_WAIT_MEM[_COOP_TAG[coop]](
+            self.dev_comm,
+            peer,
+            qid,
+            _win(win),
+            offset,
+            value,
+            _const(cmp, "cmp"),
+            mask,
+            sdma_flags(coop, aggregate=_const(aggregate, "aggregate")),
+        )
+
+    def post_wait_signal(
+        self,
+        peer,
+        qid,
+        src_lsa_rank,
+        sig_qid,
+        expected,
+        *,
+        coop=CoopScope.THREAD,
+        aggregate=False,
+    ):
+        """``post_wait_mem`` on our own ``signal_slot(src_lsa_rank, sig_qid)``:
+        run what follows on ``(peer, qid)`` once that counter reaches ``expected``
+        (a running total, as for ``wait_signal``), with the engine waiting. The
+        engine compares 32 bits, so ``expected`` must stay below 2**32; a larger
+        value releases early."""
+        coop = _const(coop, "coop")
+        raw.SDMA_POST_WAIT_SIGNAL[_COOP_TAG[coop]](
+            self.dev_comm,
+            peer,
+            qid,
+            src_lsa_rank,
+            sig_qid,
+            expected,
+            sdma_flags(coop, aggregate=_const(aggregate, "aggregate")),
+        )
+
+    def put_broadcast(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        peer2,
+        dst_win2,
+        dst_off2,
+        src_win,
+        src_off,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        local_signal=False,
+        remote_signal=False,
+        aggregate=False,
+    ):
+        """Local ``src_win[src_off:]`` -> ``peer``'s ``dst_win[dst_off:]`` AND
+        ``peer2``'s ``dst_win2[dst_off2:]`` in one COPY packet (``peer2`` may be
+        our own LSA rank). ``peer`` also selects the queue, ``(peer, qid)``.
+
+        Unlike ``put``, no signal is the default. ``local_signal`` is one trailing
+        ATOMIC into our own ``signal_slot(<our rank>, qid)``; ``remote_signal``
+        one into each distinct destination peer other than ourselves. A signal
+        slot counts per (source rank, ``qid``), not per physical queue, so a
+        per-queue waiter can be released by a broadcast's signal early: use a
+        ``qid`` of its own if you wait on one queue's completion.
+
+        Not a speedup for fan-out: with a remote destination one engine does not
+        overlap the two writes, and two ``put``s are faster. It only wins when
+        both destinations are local."""
+        coop = _const(coop, "coop")
+        raw.SDMA_PUT_BROADCAST[_COOP_TAG[coop]](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            peer2,
+            _win(dst_win2),
+            dst_off2,
+            _win(src_win),
+            src_off,
+            nbytes,
+            qid,
+            sdma_flags(
+                coop,
+                local_signal=_const(local_signal, "local_signal"),
+                remote_signal=_const(remote_signal, "remote_signal"),
+                aggregate=_const(aggregate, "aggregate"),
+            ),
         )
 
     def commit(self, peer, qid=0, *, coop=CoopScope.THREAD):
