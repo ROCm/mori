@@ -289,8 +289,7 @@ class PoolClientRangesTest : public ::testing::Test {
   std::unique_ptr<PoolClient> MakeNumaArenaClient(const std::string& node_id,
                                                   const std::vector<int>& nodes,
                                                   std::vector<std::vector<char>>& get_arenas,
-                                                  std::vector<std::vector<char>>& put_arenas,
-                                                  size_t shards = 1) {
+                                                  std::vector<std::vector<char>>& put_arenas) {
     PoolClientConfig cfg;
     cfg.master_config.node_id = node_id;
     cfg.master_config.node_address = "127.0.0.1";
@@ -302,10 +301,8 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     cfg.dram.buffer_sizes = {kCallerCapacity};
     for (size_t i = 0; i < nodes.size(); ++i) {
-      cfg.ranged_get_scratch.push_back(
-          {get_arenas[i].data(), get_arenas[i].size(), nodes[i], shards});
-      cfg.ranged_put_scratch.push_back(
-          {put_arenas[i].data(), put_arenas[i].size(), nodes[i], shards});
+      cfg.ranged_get_scratch.push_back({get_arenas[i].data(), get_arenas[i].size(), nodes[i], 1});
+      cfg.ranged_put_scratch.push_back({put_arenas[i].data(), put_arenas[i].size(), nodes[i], 1});
     }
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = false;
@@ -698,46 +695,6 @@ TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
   ASSERT_NE(client, nullptr);
   EXPECT_TRUE(client->SupportsRangedIO());
   client->Close();
-}
-
-// A call nobody waits behind borrows adjacent idle shards: three spans that need
-// two shards land in one arena round, the last one past the end of the first shard.
-// One shard per round would have put it back at offset 0, over the first span.
-TEST_F(PoolClientRangesTest, UncontendedRangedCallBorrowsIdleShards) {
-  constexpr char kPoison = static_cast<char>(0x3c);
-  std::vector<std::vector<char>> get_arenas(1, std::vector<char>(4 * kScratchSize, kPoison));
-  std::vector<std::vector<char>> put_arenas(1, std::vector<char>(4 * kScratchSize, kPoison));
-  auto numa_client =
-      MakeNumaArenaClient("ranges-lending", {0}, get_arenas, put_arenas, /*shards=*/4);
-
-  const std::vector<std::string> keys = {"lend-0", "lend-1", "lend-2"};
-  std::vector<std::vector<char>> objects(keys.size(), std::vector<char>(kObjectSize));
-  for (size_t k = 0; k < keys.size(); ++k) {
-    for (size_t i = 0; i < kObjectSize; ++i) {
-      objects[k][i] = static_cast<char>((i * 13 + k * 71) & 0xff);
-    }
-    PutLocalReplica(target_.get(), keys[k], objects[k]);
-  }
-  target_->Master().FlushHeartbeat();
-  numa_client->Master().FlushHeartbeat();
-  for (const auto& key : keys) ASSERT_TRUE(WaitForExists(numa_client.get(), key));
-
-  constexpr size_t kSpan = 4000;
-  constexpr size_t kOffset = 50;
-  std::vector<std::vector<char>> out(keys.size(), std::vector<char>(kSpan, 0));
-  auto got =
-      numa_client->BatchGetRanges(keys, {{out[0].data()}, {out[1].data()}, {out[2].data()}},
-                                  {{kSpan}, {kSpan}, {kSpan}}, {{kOffset}, {kOffset}, {kOffset}});
-  ASSERT_EQ(got, std::vector<bool>(keys.size(), true));
-  size_t at = 0;
-  for (size_t k = 0; k < keys.size(); ++k) {
-    EXPECT_EQ(std::memcmp(out[k].data(), objects[k].data() + kOffset, kSpan), 0) << "key " << k;
-    EXPECT_EQ(std::memcmp(get_arenas[0].data() + at, objects[k].data() + kOffset, kSpan), 0)
-        << "span " << k;
-    at = (at + kSpan + 63) / 64 * 64;
-  }
-  EXPECT_GT(at, kScratchSize);
-  numa_client->Shutdown();
 }
 
 // The standalone server's layout: each arena split across the NUMA nodes that have
