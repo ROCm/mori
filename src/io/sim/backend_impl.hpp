@@ -58,8 +58,14 @@ struct LinkProfile {
   std::chrono::nanoseconds latency{0};
   std::chrono::nanoseconds perSegment{0};
   std::chrono::nanoseconds perOp{0};  // link occupancy per transfer call
-  bool calibrated{false};             // from a catalog entry
-  std::string source;                 // the entry, or why there is none
+  // false (default): perOp and perSegment occupy the link, after the bytes (additive).
+  // true: they are the caller's cost of posting the work requests -- batch_write waits them on the
+  // calling thread (per-thread debt, slept off in >= 200 us steps) -- while the link (bytes /
+  // bandwidth only, reserved from the start of the call) runs concurrently, so a transfer takes
+  // max(post, wire) + latency.
+  bool postOnHost{false};
+  bool calibrated{false};  // from a catalog entry
+  std::string source;      // the entry, or why there is none
   // The RDMA config a catalog entry was measured with; -1 when the entry does not say.
   int measuredQpPerTransfer{-1};
   int measuredNumWorkerThreads{-1};

@@ -199,6 +199,14 @@ A transfer of `n` segments and `b` bytes holds its link for
 `b / bandwidth + n * per_segment + per_op` and completes `latency` after that. Each engine has
 one link per direction, and transfers queue on it in order.
 
+On hardware the per-segment and per-op costs are mostly CPU time: the calling thread builds and
+posts the work requests inside `batch_write`, while the NIC moves the bytes of earlier requests.
+An entry with `post_on_host: 1` models that. The calling thread pays `n * per_segment + per_op`
+(it sleeps once its unpaid post time passes 200 us, so short calls return at once and the time is
+exact in aggregate), the link carries only `b / bandwidth`, and the transfer completes at
+`max(post, wire) + latency`. Use it when the time between a caller's `batch_write` calls matters,
+for example a prefill engine that posts KV chunks between forward passes.
+
 | Setting | Description |
 |---------|-------------|
 | `MORI_IO_SIM_ENABLE` | `1` to simulate. |
@@ -206,7 +214,7 @@ one link per direction, and transfers queue on it in order.
 | `MORI_IO_SIM_GPU` | The GPU whose catalog entry times XGMI, for example `mi355x`. |
 | `MORI_IO_SIM_NIC` | The NIC whose catalog entries time RDMA and TCP, for example `pollara400`. |
 | `MORI_IO_SIM_CATALOG` | Catalog file(s) to read, comma-separated. An entry replaces an earlier one for the same backend and GPU or NIC. |
-| `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value. |
+| `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US,POST_ON_HOST}` | Override one value. |
 | `MORI_IO_SIM_TIME_SCALE` | Divide every delay by this factor. |
 | `MORI_NODE_ID` | Node identity for XGMI's same-node check, to simulate several nodes on one host. |
 
