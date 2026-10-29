@@ -546,10 +546,59 @@ perftest_has_rocm_dmabuf() {
     grep -q -- '--use_rocm_dmabuf' <<<"$help"
 }
 
-# probe_gpu_mem_mode <dev> <hip_id>
+# mori_dmabuf_reg_preferred
+#   True when MORI_ENABLE_DMABUF_REG makes MORI try dma-buf before ibv_reg_mr
+#   for GPU memory. Parsed the way MORI parses it (env::IsEnvVarEnabled): unset,
+#   empty, 0, false, off and no are off; anything else is on.
+mori_dmabuf_reg_preferred() {
+    local v="${MORI_ENABLE_DMABUF_REG:-}"
+    [[ -n "$v" ]] || return 1
+    case "${v,,}" in 0|false|off|no) return 1 ;; esac
+    return 0
+}
+
+# gpu_reg_order
+#   The order every GPU-memory test tries the registration paths in: MORI's
+#   (RegisterRdmaMemoryRegionAuto), so each test exercises the path MORI would
+#   end up on. ibv_reg_mr (peer_mem) first and dma-buf as the fallback, or the
+#   other way round with MORI_ENABLE_DMABUF_REG set.
+gpu_reg_order() {
+    if mori_dmabuf_reg_preferred; then echo "dma-buf peer_mem"; else echo "peer_mem dma-buf"; fi
+}
+
+# gpu_loopback_ok <variant> <dev> <hip_id> <gid> <port> [host]
+#   One tiny ib_write loopback with both ends on GPU memory registered via
+#   <variant>, on this host or, with a host, entirely on that host (one ssh
+#   session runs both ends, so it proves that host's registration path).
+gpu_loopback_ok() {
+    local variant="$1" dev="$2" gpu="$3" gid="$4" port="$5" host="${6:-}" extra=""
+    [[ "$variant" == "dma-buf" ]] && extra=" --use_rocm_dmabuf"
+    local args="-d $dev -p $port -x $gid -s 4096 -n 5 --use_rocm=$gpu$extra"
+    if [[ -z "$host" || "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        local sp rc=0
+        timeout "$MESH_SRV_TIMEOUT" $MESH_CLI_BIN $args &>/dev/null &
+        sp=$!
+        sleep "$MESH_SRV_WAIT_LOCAL"
+        timeout "$MESH_CLI_TIMEOUT" $MESH_CLI_BIN $args localhost &>/dev/null || rc=$?
+        kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+        (( rc == 0 ))
+    else
+        "${SSH_PREFIX[@]}" ssh $SSH_OPTS "$SSH_USER@$host" \
+            "timeout $MESH_SRV_TIMEOUT $MESH_SRV_BIN $args >/dev/null 2>&1 & sp=\$!;
+             sleep $MESH_SRV_WAIT_LOCAL;
+             timeout $MESH_CLI_TIMEOUT $MESH_SRV_BIN $args localhost >/dev/null 2>&1; rc=\$?;
+             kill \$sp 2>/dev/null; wait \$sp 2>/dev/null; exit \$rc" &>/dev/null
+    fi
+}
+
+# probe_gpu_mem_mode <dev> <hip_id> [<peer> <peer_dev> <peer_hip_id>]
 #   Works out how perftest can actually reach GPU memory, by trying it rather
-#   than inferring it, and sets MESH_GPU_MODE / MESH_GPU_DMABUF. Returns 1 if
-#   neither path works.
+#   than inferring it, and sets MESH_GPU_MODE / MESH_GPU_DMABUF. Tries the
+#   paths in gpu_reg_order and takes the first that works on this host and,
+#   when a peer is given, on the peer too: the GPU meshes put GPU memory on
+#   both ends, so a path only one side has (peer_mem needs a kernel
+#   peer-memory client a heterogeneous peer may lack) would fail every pair.
+#   Returns 1 if no path works on both.
 #
 #   --use_rocm alone does hipMalloc + ordinary ibv_reg_mr, which needs a
 #   peer-memory client in the kernel; --use_rocm_dmabuf registers via
@@ -562,37 +611,19 @@ perftest_has_rocm_dmabuf() {
 #   Sets globals rather than echoing: a $(...) capture would run this in a
 #   subshell and throw the result away.
 probe_gpu_mem_mode() {
-    local dev="$1" gpu="$2" gid port=$(( IB_PORT + 900 )) variant
-    local prefer="${3:-peer_mem}"   # which registration path to try first
+    local dev="$1" gpu="$2" peer="${3:-}" pdev="${4:-}" pgpu="${5:-}"
+    local gid pgid="" port=$(( IB_PORT + 900 )) variant
     MESH_GPU_MODE=""; MESH_GPU_DMABUF=""
     gid=$(gid_index "$dev" "")
-    # This loopback proves a mode on THIS host only. peer_mem needs a kernel
-    # peer-memory client that a heterogeneous peer may lack, so a local pass
-    # does not generalize; dma-buf registers via ibv_reg_dmabuf_mr with no such
-    # client and is symmetric. When a peer is in play we therefore try dma-buf
-    # first (prefer="dma-buf"): picking a locally-proven peer_mem the remote
-    # cannot use would flag every otherwise-valid GPU pair as a failure.
-    local order="peer_mem dma-buf"
-    [[ "$prefer" == "dma-buf" ]] && order="dma-buf peer_mem"
-    for variant in $order; do
-        local extra=""
-        if [[ "$variant" == "dma-buf" ]]; then
-            [[ -n "$MESH_GPU_DMABUF_OK" ]] || continue
-            extra=" --use_rocm_dmabuf"
-        fi
-        local args="-d $dev -p $port -x $gid -s 4096 -n 5 --use_rocm=$gpu$extra"
-        local sp rc=0
-        timeout "$MESH_SRV_TIMEOUT" $MESH_CLI_BIN $args &>/dev/null &
-        sp=$!
-        sleep "$MESH_SRV_WAIT_LOCAL"
-        timeout "$MESH_CLI_TIMEOUT" $MESH_CLI_BIN $args localhost &>/dev/null || rc=$?
-        kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+    [[ -n "$peer" ]] && pgid=$(gid_index "$pdev" "$peer")
+    for variant in $(gpu_reg_order); do
+        [[ "$variant" == "dma-buf" && -z "$MESH_GPU_DMABUF_OK" ]] && continue
         port=$(( port + 1 ))
-        if (( rc == 0 )); then
-            MESH_GPU_MODE="$variant"
-            [[ "$variant" == "dma-buf" ]] && MESH_GPU_DMABUF=1
-            return 0
-        fi
+        gpu_loopback_ok "$variant" "$dev" "$gpu" "$gid" "$port" || continue
+        [[ -z "$peer" ]] || gpu_loopback_ok "$variant" "$pdev" "$pgpu" "$pgid" "$port" "$peer" || continue
+        MESH_GPU_MODE="$variant"
+        [[ "$variant" == "dma-buf" ]] && MESH_GPU_DMABUF=1
+        return 0
     done
     return 1
 }
@@ -637,6 +668,7 @@ MESH_GPU_READY=""        # non-empty => GPU memory is *available* (capability + 
 MESH_GPU_DMABUF_OK=""    # non-empty => binary was built with --enable-rocm-dmabuf
 MESH_GPU_DMABUF=""       # non-empty => reach GPU memory via dma-buf, not peer_mem
 MESH_GPU_MODE=""         # "peer_mem" | "dma-buf", as proven by probe_gpu_mem_mode
+MESH_GPU_PEER_PROVEN=""  # non-empty => MESH_GPU_MODE was also proven on the peer
 declare -A MESH_RGPU=()  # row/client  ib_dev -> HIP id
 declare -A MESH_CGPU=()  # col/server  ib_dev -> HIP id
 
@@ -671,7 +703,7 @@ mesh_gpu_off() {
 mesh_prepare() {
     local tool="$1" peer="${2:-}" want_gpu="${3:-true}"
     MESH_CLI_BIN=""; MESH_SRV_BIN=""; MESH_GPU_READY=""
-    MESH_GPU_DMABUF_OK=""; MESH_GPU_DMABUF=""; MESH_GPU_MODE=""
+    MESH_GPU_DMABUF_OK=""; MESH_GPU_DMABUF=""; MESH_GPU_MODE=""; MESH_GPU_PEER_PROVEN=""
     MESH_RGPU=(); MESH_CGPU=()
     mesh_gpu_off
 
@@ -725,7 +757,7 @@ mesh_prepare() {
         MESH_RGPU=(); return 0
     fi
 
-    # How to reach GPU memory: peer_mem if it works, dma-buf otherwise.
+    # How to reach GPU memory: the first path in gpu_reg_order that works.
     perftest_has_rocm_dmabuf "$MESH_CLI_BIN" && MESH_GPU_DMABUF_OK=1
     if [[ -n "$peer" && -n "$MESH_GPU_DMABUF_OK" ]] && \
        ! perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$peer"; then
@@ -744,29 +776,35 @@ mesh_prepare() {
         log_warn "none of the tested NICs has a paired GPU -- skipping the GPU-memory pass"
         MESH_RGPU=(); MESH_CGPU=(); return 0
     fi
-    # Against a peer, prefer the symmetric dma-buf path when both ends support
-    # it: a local peer_mem pass says nothing about whether the remote can use
-    # it (see probe_gpu_mem_mode). Solo runs keep the peer_mem-first default.
-    local gpu_mode_pref="peer_mem"
-    [[ -n "$peer" && -n "$MESH_GPU_DMABUF_OK" ]] && gpu_mode_pref="dma-buf"
+    # Against a peer, prove the path there too, on the NIC of the same name (the
+    # rail partner on a rail-aligned fabric): a path only this host has would
+    # fail every pair. Without that NIC the proof is this host's alone.
+    local rdev="" rgpu=""
+    if [[ -n "$peer" ]]; then
+        if [[ -n "${MESH_CGPU[$pdev]:-}" ]]; then
+            rdev="$pdev"; rgpu="${MESH_CGPU[$pdev]}"; MESH_GPU_PEER_PROVEN=1
+        else
+            log_warn "$peer has no $pdev with a paired GPU -- GPU registration path proven on this host only"
+        fi
+    fi
     mesh_gpu_on                 # probe under the GPU timeout budget (HIP init)
-    if ! probe_gpu_mem_mode "$pdev" "$pgpu" "$gpu_mode_pref"; then
+    if ! probe_gpu_mem_mode "$pdev" "$pgpu" ${rdev:+"$peer" "$rdev" "$rgpu"}; then
         mesh_gpu_off
         # A ROCm-capable perftest and a paired GPU are both present, so this is
         # not a missing prerequisite we can skip past: the GPUDirect path this
         # check exists to validate is genuinely unusable. Fail rather than warn,
         # or `mori check` goes green on a host where GPU transfers cannot run.
         if [[ -n "$MESH_GPU_DMABUF_OK" ]]; then
-            log_fail "GPU memory unreachable via peer_mem or dma-buf -- GPUDirect RDMA unusable"
+            log_fail "GPU memory unreachable via peer_mem or dma-buf${rdev:+ on both this host and $peer} -- GPUDirect RDMA unusable"
         else
-            log_fail "GPU memory unreachable via peer_mem, and this perftest has no dma-buf support"
+            log_fail "GPU memory unreachable via peer_mem${rdev:+ on both this host and $peer}, and this perftest has no dma-buf support"
             log_warn "  rebuild perftest with --enable-rocm-dmabuf"
         fi
         MESH_RGPU=(); MESH_CGPU=(); return 0
     fi
     mesh_gpu_off
-    if [[ "$MESH_GPU_MODE" == "dma-buf" ]]; then
-        log_warn "peer_mem unavailable -- using dma-buf (ibv_reg_dmabuf_mr) for GPU memory"
+    if [[ "$MESH_GPU_MODE" == "dma-buf" ]] && ! mori_dmabuf_reg_preferred; then
+        log_warn "peer_mem unavailable${rdev:+ on this host or $peer} -- using dma-buf (ibv_reg_dmabuf_mr) for GPU memory, as MORI would"
     fi
     MESH_GPU_READY=1
     return 0
@@ -963,9 +1001,10 @@ gpu_mesh_check() {
             log_ok "$label GPU memory: all $gated pair(s) reachable on GPU memory"
         else
             log_fail "$label GPU memory: $bad/$gated pair(s) reachable on host memory but not on GPU -- GPUDirect RDMA problem"
-            # The mode was proven by a loopback on THIS host only, so a peer
-            # missing the same registration path looks identical from here.
-            [[ -n "$peer" && "$MESH_GPU_MODE" == "peer_mem" ]] && \
+            # When the peer could not be probed, the mode was proven by a
+            # loopback on THIS host only, so a peer missing the same
+            # registration path looks identical from here.
+            [[ -n "$peer" && -z "$MESH_GPU_PEER_PROVEN" ]] && \
                 log_warn "  $MESH_GPU_MODE was proven on this host only; a peer without it fails the same way"
         fi
     fi
@@ -1623,10 +1662,12 @@ check_inter_node_bw() {
 }
 
 # check_atomic
-#   ib_atomic_bw per rail with the responder's buffer in GPU memory via dma-buf,
-#   the path MORI's atomic signalling (IBGDA, MORI-EP) takes. The write meshes
-#   cannot stand in for it: on an AINIC KVM guest below AINIC_KVM_MIN_VER every
-#   rail passes ib_write_bw on GPU memory and fails every atomic into it.
+#   ib_atomic_bw per rail with the responder's buffer in GPU memory, registered
+#   the way MORI registers it (ibv_reg_mr or dma-buf, probed per rail in MORI's
+#   order) -- the path MORI's atomic signalling (IBGDA, MORI-EP) takes. The
+#   write meshes cannot stand in for it: on an AINIC KVM guest below
+#   AINIC_KVM_MIN_VER every rail passes ib_write_bw on GPU memory and fails
+#   every atomic into its dma-buf memory.
 #
 #   With a peer, the rails are the rail-aligned pairs the inter-node BW step
 #   proved on host memory, with the server on the peer. Without one, each local
@@ -1635,11 +1676,11 @@ check_inter_node_bw() {
 #   Only the server side uses GPU memory. The atomic executes at the responder,
 #   so that is where the GPU buffer belongs; keeping the client on host memory
 #   stops a client-side registration problem from being blamed on atomics. A
-#   host-memory pass runs first, so a GPU-only failure points at the dma-buf
+#   host-memory pass runs first, so a GPU-only failure points at the GPU
 #   target rather than atomics as a whole. Each pass repeats ATOMIC_RUNS times:
 #   the AINIC failure is QP-slot dependent and a single run can miss it.
 check_atomic() {
-    step "RDMA atomic check (ib_atomic_bw, responder on GPU memory via dma-buf)"
+    step "RDMA atomic check (ib_atomic_bw, responder on GPU memory)"
 
     local shost srv_host="" where noun
     local -a AR=() AC=()
@@ -1693,7 +1734,7 @@ check_atomic() {
     # IB_PORT): a hung atomic leaves its server running until its own timeout,
     # and on a peer killing the local ssh does not stop it, so reusing the port
     # in the next run would connect to that stale server.
-    local MESH_PARALLEL=1 port0=$(( IB_PORT + 3000 )) pblock=0
+    local probe_parallel=$MESH_PARALLEL MESH_PARALLEL=1 port0=$(( IB_PORT + 3000 )) pblock=0
     local IB_PORT=$port0
     local i run
     MESH_RGPU=(); MESH_CGPU=(); MESH_GPU_DMABUF=""
@@ -1714,13 +1755,18 @@ check_atomic() {
         done
     done
 
-    # GPU memory on the server side only, and only via dma-buf: that is the
-    # registration MORI uses on AINIC, and peer_mem is not on offer in a guest.
-    local gpu_ok=""
+    # GPU memory on the server side only, registered the way MORI registers it
+    # (gpu_reg_order). On an AINIC guest ibv_reg_mr cannot pin GPU memory, so
+    # MORI's atomics land in dma-buf memory there; on bare metal with a
+    # peer-memory client they land in ibv_reg_mr memory, and a dma-buf-only pass
+    # would fail every rail on a host where dma-buf registration is broken but
+    # MORI runs fine.
+    local gpu_ok="" wcli="" wsrv="" m dmabuf_missing=""
+    local -a gmodes=()
     if [[ "$USE_GPU_MEM" != "true" ]]; then
         log_skip "--no-gpu-mem: GPU-memory atomic pass skipped"
-    elif ! perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$srv_host"; then
-        log_warn "ib_atomic_bw on ${srv_host:-this host} lacks --use_rocm_dmabuf -- GPU-memory atomic pass skipped"
+    elif ! perftest_has_rocm "$MESH_SRV_BIN" "$srv_host"; then
+        log_warn "ib_atomic_bw on ${srv_host:-this host} lacks ROCm support -- GPU-memory atomic pass skipped"
         perftest_hint
     else
         # Same KFD-vs-HIP ordinal reasoning as mesh_prepare; only matters when
@@ -1729,41 +1775,99 @@ check_atomic() {
             log_warn "clearing HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES for the GPU-memory pass (KFD ordinals must match HIP's)"
             unset HIP_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
         fi
-        if build_gpu_map MESH_CGPU "$srv_host"; then
+        # The registration probe below is a write, so it needs ib_write_bw too.
+        wcli=$(resolve_perftest ib_write_bw); wsrv="$wcli"
+        [[ -n "$srv_host" && -n "$wcli" ]] && wsrv=$(resolve_perftest ib_write_bw "$srv_host")
+        if [[ -n "$wsrv" ]] && perftest_has_rocm "$wsrv" "$srv_host"; then
+            for m in $(gpu_reg_order); do
+                if [[ "$m" == "peer_mem" ]]; then
+                    gmodes+=("$m")
+                elif perftest_has_rocm_dmabuf "$MESH_SRV_BIN" "$srv_host" && \
+                     perftest_has_rocm_dmabuf "$wsrv" "$srv_host"; then
+                    gmodes+=("$m")
+                else
+                    dmabuf_missing=1
+                fi
+            done
+        fi
+        if [[ -z "$wcli" || -z "$wsrv" ]]; then
+            log_warn "ib_write_bw not found${srv_host:+ on $srv_host} -- cannot tell how MORI would register GPU memory, GPU-memory atomic pass skipped"
+            perftest_hint
+        elif (( ${#gmodes[@]} == 0 )); then
+            log_warn "ib_write_bw on ${srv_host:-this host} lacks ROCm support -- GPU-memory atomic pass skipped"
+            perftest_hint
+        elif build_gpu_map MESH_CGPU "$srv_host"; then
             gpu_ok=1
         else
             log_warn "no GPUs found via KFD topology on ${srv_host:-this host} -- GPU-memory atomic pass skipped"
         fi
     fi
 
-    # GPU memory: only the rails host memory reached at least once (a rail with
-    # no path at all says nothing about GPU memory), and a rail leaves the gate
-    # at its first failure -- one failed atomic is the verdict, and every
-    # further run on it would only burn a timeout.
-    local -A GPASS=() GVAL=() GFAILRUN=() SGPU=()
+    # The registration MORI would end up with on each rail: the first mode, in
+    # MORI's order, that an ib_write_bw into that rail's GPU succeeds with. A
+    # write rather than an atomic, since an atomic probe would fail on exactly
+    # the rails this step exists to catch, and they would be skipped instead of
+    # reported. Reachability only, so the rails run side by side, as in
+    # gpu_mesh_check's Phase A. Only rails host memory reached at least once: a
+    # rail with no path at all says nothing about GPU memory.
+    local -A GMODE=() SGPU=()
     if [[ -n "$gpu_ok" ]]; then
         for (( i=0; i<n; i++ )); do SGPU[$i]="${MESH_CGPU[${AC[$i]}]:-?}"; done
+        local -A PGATE=()
+        for (( i=0; i<n; i++ )); do [[ -n "${HGATE[$i,$i]:-}" ]] && PGATE[$i,$i]=1; done
+        local abin_cli="$MESH_CLI_BIN" abin_srv="$MESH_SRV_BIN"
+        MESH_CLI_BIN="$wcli"; MESH_SRV_BIN="$wsrv"; MESH_PARALLEL=$probe_parallel
+        mesh_gpu_on
+        for m in "${gmodes[@]}"; do
+            (( ${#PGATE[@]} > 0 )) || break
+            MESH_GPU_DMABUF=""; [[ "$m" == "dma-buf" ]] && MESH_GPU_DMABUF=1
+            IB_PORT=$(( port0 + pblock * 4 * n * n )); pblock=$(( pblock + 1 ))
+            local -A PCELL=()
+            mesh_execute PCELL ib_write_bw "$shost" false 5 AGL AGR AR AC true PGATE
+            for (( i=0; i<n; i++ )); do
+                [[ -n "${PGATE[$i,$i]:-}" && "${PCELL[$i,$i]:-x}" =~ ^[0-9.]+$ ]] || continue
+                GMODE[$i]="$m"; unset "PGATE[$i,$i]"
+            done
+        done
+        mesh_gpu_off
+        MESH_CLI_BIN="$abin_cli"; MESH_SRV_BIN="$abin_srv"; MESH_PARALLEL=1
+        MESH_GPU_DMABUF=""
+    fi
+
+    # GPU memory: each rail in the mode the probe found, one mesh_execute per
+    # mode since that is a per-call setting. A rail leaves the gate at its first
+    # failure -- one failed atomic is the verdict, and every further run on it
+    # would only burn a timeout.
+    local -A GPASS=() GVAL=() GFAILRUN=()
+    if [[ -n "$gpu_ok" ]]; then
         local -A GGATE=()
-        for (( i=0; i<n; i++ )); do [[ -n "${HGATE[$i,$i]:-}" ]] && GGATE[$i,$i]=1; done
-        MESH_GPU_DMABUF=1
+        for (( i=0; i<n; i++ )); do [[ -n "${GMODE[$i]:-}" ]] && GGATE[$i,$i]=1; done
         # The full GPU budget even though the client is on host memory: perftest
         # accepts the connection before it allocates and registers its buffer,
-        # so the server's HIP init and dma-buf registration run inside the
-        # client's timeout. A rail leaves the gate at its first failure, so a
-        # broken host pays this timeout once per rail, not once per run.
+        # so the server's HIP init and registration run inside the client's
+        # timeout. A rail leaves the gate at its first failure, so a broken host
+        # pays this timeout once per rail, not once per run.
         mesh_gpu_on
         for (( run=0; run<ATOMIC_RUNS; run++ )); do
             (( ${#GGATE[@]} > 0 )) || break
-            IB_PORT=$(( port0 + pblock * 4 * n * n )); pblock=$(( pblock + 1 ))
-            local -A GCELL=()
-            mesh_execute GCELL ib_atomic_bw "$shost" false "" AGL AGR AR AC true GGATE
-            for (( i=0; i<n; i++ )); do
-                [[ -n "${GGATE[$i,$i]:-}" ]] || continue
-                if [[ "${GCELL[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
-                    GPASS[$i]=$(( ${GPASS[$i]:-0} + 1 )); GVAL[$i]="${GCELL[$i,$i]}"
-                else
-                    GFAILRUN[$i]=$(( run + 1 )); unset "GGATE[$i,$i]"
-                fi
+            for m in "${gmodes[@]}"; do
+                local -A MGATE=()
+                for (( i=0; i<n; i++ )); do
+                    [[ -n "${GGATE[$i,$i]:-}" && "${GMODE[$i]:-}" == "$m" ]] && MGATE[$i,$i]=1
+                done
+                (( ${#MGATE[@]} > 0 )) || continue
+                MESH_GPU_DMABUF=""; [[ "$m" == "dma-buf" ]] && MESH_GPU_DMABUF=1
+                IB_PORT=$(( port0 + pblock * 4 * n * n )); pblock=$(( pblock + 1 ))
+                local -A GCELL=()
+                mesh_execute GCELL ib_atomic_bw "$shost" false "" AGL AGR AR AC true MGATE
+                for (( i=0; i<n; i++ )); do
+                    [[ -n "${MGATE[$i,$i]:-}" ]] || continue
+                    if [[ "${GCELL[$i,$i]:-x}" =~ ^[0-9.]+$ ]]; then
+                        GPASS[$i]=$(( ${GPASS[$i]:-0} + 1 )); GVAL[$i]="${GCELL[$i,$i]}"
+                    else
+                        GFAILRUN[$i]=$(( run + 1 )); unset "GGATE[$i,$i]"
+                    fi
+                done
             done
         done
         mesh_gpu_off
@@ -1772,7 +1876,7 @@ check_atomic() {
 
     # No bandwidth threshold: 8-byte atomics measure op latency, not the fabric,
     # and loopback numbers are not comparable to inter-node ones. Pass/fail only.
-    local hdead=0 hflaky=0 gfail=0 gpass=0 hp line
+    local hdead=0 hflaky=0 gfail=0 gpass=0 gskip=0 hp line
     for (( i=0; i<n; i++ )); do
         hp=${HPASS[$i]:-0}
         line=$(printf "  %-12s <-> %-12s :" "${AR[$i]}" "${AC[$i]}")
@@ -1787,12 +1891,15 @@ check_atomic() {
         fi
         if [[ -z "$gpu_ok" ]]; then
             :
+        elif [[ -z "${GMODE[$i]:-}" ]]; then
+            gskip=$(( gskip + 1 ))
+            line+=" | gpu ${SGPU[$i]} not registrable via $(IFS=/; echo "${gmodes[*]}"), skipped"
         elif [[ -n "${GFAILRUN[$i]:-}" ]]; then
             gfail=$(( gfail + 1 ))
-            line+=" | gpu ${SGPU[$i]} dma-buf FAILED on run ${GFAILRUN[$i]}/$ATOMIC_RUNS"
+            line+=" | gpu ${SGPU[$i]} ${GMODE[$i]} FAILED on run ${GFAILRUN[$i]}/$ATOMIC_RUNS"
         else
             gpass=$(( gpass + 1 ))
-            line+=" | gpu ${SGPU[$i]} dma-buf ${GVAL[$i]} Gbps"
+            line+=" | gpu ${SGPU[$i]} ${GMODE[$i]} ${GVAL[$i]} Gbps"
         fi
         echo "$line"
     done
@@ -1802,9 +1909,16 @@ check_atomic() {
     # MORI-EP hangs on the first atomic that does not complete.
     (( hflaky )) && log_fail "$where: $hflaky/$n $noun(s) failed some host-memory runs -- RDMA atomics are unreliable there"
     if [[ -n "$gpu_ok" ]]; then
-        (( gfail )) && log_fail "$where: $gfail/$(( n - hdead )) $noun(s) failed into GPU dma-buf memory"
-        (( gfail == 0 && hdead + hflaky == 0 && gpass > 0 )) && \
-            log_ok "$where: all $gpass $noun(s) passed on host and GPU dma-buf memory ($ATOMIC_RUNS runs each)"
+        # Not an atomics verdict: MORI cannot register GPU memory there either,
+        # which is a GPUDirect problem, not an atomics one.
+        if (( gskip )); then
+            log_warn "$where: $gskip/$(( n - hdead )) $noun(s) could not register GPU memory via $(IFS=/; echo "${gmodes[*]}") -- GPU-memory atomic pass skipped there"
+            [[ -n "$dmabuf_missing" ]] && \
+                log_warn "  ib_atomic_bw/ib_write_bw lack --use_rocm_dmabuf, so the dma-buf fallback MORI would use was not tried"
+        fi
+        (( gfail )) && log_fail "$where: $gfail/$(( n - hdead )) $noun(s) failed into GPU memory"
+        (( gfail + gskip == 0 && hdead + hflaky == 0 && gpass > 0 )) && \
+            log_ok "$where: all $gpass $noun(s) passed on host and GPU memory ($ATOMIC_RUNS runs each)"
     elif (( hdead + hflaky == 0 )); then
         log_ok "$where: all $n $noun(s) passed on host memory ($ATOMIC_RUNS runs each; GPU-memory pass not run)"
     fi
