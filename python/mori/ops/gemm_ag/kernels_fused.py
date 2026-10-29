@@ -25,17 +25,19 @@ The GEMM is ``gemm_ar``'s. This operation differs in *where C goes*, not in how
 it is computed, so the pipeline, the MFMA schedule, the C-store ladder and the
 block-scale handling are imported from there rather than duplicated.
 
-Three C destinations exist for this op:
+Two C destinations exist for this op:
 
 ===============  ==========================================  ==================
 destination      address of element ``(row, col)``            used by
 ===============  ==========================================  ==================
 ``local``        ``row*N + col``, a plain tensor              ``gemm-only``
-``window``       ``row*N + col`` in my own ``recv`` slot      ``split-*``,
+``window``       ``row*N + col`` in my own ``recv`` slot      ``split-sdma``,
                                                               ``fused-sdma``
-``peers``        ``row*N + col`` in *every* rank's slot       ``fused-lsa``
-                 for me
 ===============  ==========================================  ==================
+
+The transport is SDMA only. The LSA transports -- a copy kernel storing into
+or loading from the peers, and the epilogue storing every tile into every
+peer -- were measured and removed; see the README.
 
 ## Why this is a smaller file than gemm_a2a's
 
@@ -49,12 +51,9 @@ destination slab *is* ``[M, N]``, so the store column is the global column and
 and its ``oob = c_rows * c_cols`` already landing exactly one past the slab.
 
 What replaces it is the one thing an all-gather has that the other two do not:
-the collective is a **broadcast**, so a single tile goes to every peer. On the
-fused-LSA path the epilogue is given ``world`` buffer descriptors rather than
-one (``peer_rsrcs``, added to ``gemm_ar``'s ``_SwapABStoreC`` for this), so the
-scale loads, the fp32->bf16 convert and the permlane shuffle happen once and
-only the 16-byte store repeats. Building ``world`` separate store objects would
-have repeated all of it and priced the epilogue instead of the transfer.
+the collective is a **broadcast**, so a single tile goes to every peer -- and
+the copy engine pushes the rank's own slab unchanged, so the epilogue writes it
+once, into this rank's own ``recv`` slot.
 
 ## Chunking, and why the counter has one index
 
@@ -72,11 +71,9 @@ which is exactly what chunked pushing wants.
 
 ## Publication
 
-The peer stores are made by every block, so every block must publish them. The
-split path gets this for free from the copy kernel's own fence; here the
-producer is the GEMM and the barrier kernel that follows is one block, hence one
-XCD's L2 out of eight. ``gemm_ar``'s Direct LSA path found that out the hard way
-and the tail below is the same remedy: ``wait_barrier(0)`` then a system fence.
+The copy engine reads this rank's own memory, so the epilogue only has to make
+a chunk's stores visible before electing its put: ``wait_barrier(0)`` and then
+the ``fence`` selected below.
 """
 
 # NOTE: no `from __future__ import annotations` here, deliberately, and
@@ -136,11 +133,6 @@ from .layout import (  # noqa: F401
 )
 
 BLOCK_K = 128
-
-
-def direct_lsa_probe(transport: str) -> bool:
-    """``transport == "lsa"``, named so the validation above reads as a claim."""
-    return transport == "lsa"
 
 
 class _UncachedPeerStoreC(_PermlaneStoreC):
@@ -223,29 +215,23 @@ def compile_fused_gemm_ag(
     quant: str = "ptpc",
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
-    transport: str = "lsa",
     fuse: bool = True,
     chunks: int = 1,
     sdma_queues: int = 1,
     post: str = "lanes",
     peer_uncached: bool = False,
-    direct_fence: str = "leader",
     emit_put: bool = True,
     fence: str = "leader",
 ):
-    """The GEMM with its C stored into every rank's window, or into its own.
+    """The GEMM with its C stored into this rank's own window slot.
 
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``. ``C`` is not written on either path -- it is still passed
     because the shared ``StoreC`` builds a descriptor from it -- and a cross-rank
     barrier still has to follow the launch before ``recv`` may be read.
 
-    ``transport="lsa"`` (``fused-lsa``) stores each tile into all ``world``
-    windows from the epilogue; there is no collective kernel afterwards, only
-    ``build_lsa_barrier``.
-
-    ``transport="sdma"`` stores each tile once, into this rank's own ``recv``
-    slot, and posts a copy-engine put per peer as each chunk of rows completes.
+    Each tile is stored once, into this rank's own ``recv`` slot, and the
+    epilogue posts a copy-engine put per peer as each chunk of rows completes.
     With ``fuse=False`` it stores and does nothing else, which is the GEMM half
     of ``split-sdma`` -- and unlike ``gemm_a2a``'s unfused staging GEMM it is
     *not* a different address map from ``gemm-only``, only a different base
@@ -265,36 +251,16 @@ def compile_fused_gemm_ag(
     shape becomes when it is transplanted onto a broadcast. The serial form is
     kept only so the difference stays a measurement.
 
-    ``peer_uncached`` sends the epilogue's C stores with ``sc0|sc1``. It means
-    two different things on the two transports, and both matter:
-
-    * On ``"lsa"`` it is a *performance* knob for the peer stores. Off by
-      default to match ``gemm_a2a``'s fused path (cached stores plus the
-      ``direct_fence`` release), worth turning on for the reasons
-      ``kernels_lsa`` gives: these are 16 bytes per lane and 64 contiguous per
-      row, so the partial-line hazard that stopped ``gemm_ar`` using it does not
-      apply, and cached peer stores measured 58% of line rate against 94% for
-      the copy engines.
-    * On ``"sdma"`` with ``fuse=False`` it is a *correctness* requirement for
-      one caller: the split **pull** baseline. There the store is local, and a
-      cached one leaves C dirty in this rank's L2 where a peer reading over
-      xGMI never sees it. Nothing downstream can repair that -- see
-      ``build_lsa_ag``'s docstring. For the copy-engine paths, which read this
-      rank's own memory, leave it off: it would only make that read miss.
+    ``peer_uncached`` sends the epilogue's C stores with ``sc0|sc1``. The store
+    is local and the copy engine reads it, so this is a publication choice
+    rather than a correctness one: with ``fence="release"`` it is the measured
+    ``sc_release`` configuration of the fused path.
 
     There is no ``rotated``/``n_stripe`` pair. See the module docstring: those
     exist in ``gemm_a2a`` to keep every destination's link busy when a tile
     belongs to exactly one of them, and a broadcast has no such thing.
     """
     cfg.validate()
-    if transport not in ("lsa", "sdma"):
-        raise ValueError(f"transport must be lsa or sdma, got {transport!r}")
-    if transport == "lsa" and not fuse:
-        raise ValueError(
-            "fuse=False is only meaningful with transport='sdma', where it gives "
-            "the window-writing GEMM for the split path; an unfused LSA GEMM is "
-            "just compile_gemm_local"
-        )
     if post not in ("lanes", "serial"):
         raise ValueError(f"post must be lanes or serial, got {post!r}")
     if post == "lanes" and chunks > 1 and sdma_queues < chunks:
@@ -307,8 +273,6 @@ def compile_fused_gemm_ag(
         )
     if fence not in ("none", "leader", "all", "release"):
         raise ValueError(f"invalid producer fence: {fence!r}")
-    if direct_fence not in ("leader", "all"):
-        raise ValueError(f"direct_fence must be leader or all, got {direct_fence!r}")
     if quant not in ("ptpc", "blockscale", "mxfp8"):
         raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
     if (BLOCK_M, BLOCK_N) != (cfg.block_m, cfg.block_n):
@@ -343,9 +307,8 @@ def compile_fused_gemm_ag(
     my_recv_slot = cfg.recv_slot_off(rank)
     slab_bytes = cfg.slab_bytes
     counter_off, lock_off = cfg.counter_off, cfg.lock_off
-    direct_lsa = transport == "lsa"
     _StoreC = _UncachedPeerStoreC if peer_uncached else _PermlaneStoreC
-    if not direct_lsa and cfg.counter_chunks != chunks:
+    if cfg.counter_chunks != chunks:
         raise ValueError(
             f"chunks={chunks} disagrees with the config's counter_chunks="
             f"{cfg.counter_chunks}; the counter region is sized from the "
@@ -373,12 +336,12 @@ def compile_fused_gemm_ag(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
     _kname = (
-        f"mori_ag_{transport if fuse else 'win'}_8w_"
+        f"mori_ag_{'sdma' if fuse else 'win'}_8w_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_"
         f"{'B' if blockscale else ('X' if mxfp8 else 'P')}"
         f"x{xcd_swizzle}c{chunks}q{sdma_queues}{post[0]}"
         f"{'U' if peer_uncached else 'C'}"
-        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_r{rank}"
+        f"{fence[0]}{'p' if emit_put else 'x'}_r{rank}"
     )
 
     @fx.struct
@@ -484,33 +447,14 @@ def compile_fused_gemm_ag(
         # the index has to be rebased while the B scale is not; nothing is
         # rebased here, so `_PermlaneStoreC` is used as it comes.
         #
-        # LSA writes the slab into *every* rank's window, this one included --
-        # the collective is a broadcast, so `peer_rsrcs` holds `world`
-        # descriptors and the epilogue's convert and shuffle are done once for
-        # all of them. SDMA writes it once, into this rank's own recv slot, and
-        # the copy engine pushes that slab unchanged. (`peer_rsrc` is then a
-        # misnomer on the SDMA path: it is a local resource, reached through
-        # `lsa_ptr(rank, ...)`. Renaming it in gemm_ar to suit this op would be
-        # the tail wagging the dog.)
-        if const_expr(direct_lsa):
-            # Rotated by rank so the eight ranks do not all issue their first
-            # store at the same partner. Unlike gemm_a2a's rotation this is
-            # about store *issue order* within a tile, not about which tile goes
-            # where -- every tile goes everywhere.
-            peer_rsrcs = [
-                create_buffer_resource_from_addr(
-                    wave_uniform_i64(w_pre.lsa_ptr((rank + j) % ws, my_recv_slot)),
-                    num_records_bytes=slab_bytes,
-                )
-                for j in range(ws)
-            ]
-        else:
-            peer_rsrcs = [
-                create_buffer_resource_from_addr(
-                    wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
-                    num_records_bytes=slab_bytes,
-                )
-            ]
+        # It goes to this rank's own recv slot, and the copy engine pushes that
+        # slab unchanged. (`peer_rsrc` is a misnomer here: it is a local
+        # resource, reached through `lsa_ptr(rank, ...)`. Renaming it in gemm_ar
+        # to suit this op would be the tail wagging the dog.)
+        own_slot = create_buffer_resource_from_addr(
+            wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
+            num_records_bytes=slab_bytes,
+        )
         store_c = _StoreC(
             A_scale,
             B_scale,
@@ -520,7 +464,7 @@ def compile_fused_gemm_ag(
             mfma.idx,
             N_TILES_A,
             N_TILES_B,
-            peer_rsrcs=peer_rsrcs,
+            peer_rsrc=own_slot,
             elem_base=fx.Int32(0),
         )
 
@@ -749,176 +693,159 @@ def compile_fused_gemm_ag(
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
         # ---- end pinned copy ----
 
-        if const_expr(direct_lsa):
-            # Publish the peer stores from the blocks that made them. The barrier
-            # kernel that follows is one block, hence one XCD's L2 out of eight;
-            # the other seven would keep their peer-homed lines dirty and the
-            # barrier's system-scope atomic would overtake them.
+        # Retire this block's stores into the window slot, agree block-wide
+        # that they are retired, then publish them -- but only when this
+        # kernel is the thing that publishes.
+        #
+        # The fence is a *whole-L2* writeback issued by every lane of every
+        # block, so block k redundantly writes back every tile blocks
+        # 1..k-1 already wrote. At 1152 blocks that is quadratic and it is
+        # the single most expensive line in this epilogue: gating it on
+        # `fuse` is what took the unfused staging GEMM from 458 to ~320us,
+        # level with the plain one.
+        #
+        # With `fuse=False` nothing is published here at all -- the separate
+        # scatter kernel issues the puts and does its own ordering -- so the
+        # fence has no one to release to. With `fuse=True` it is not
+        # optional: gemm_ar measured dropping it as still validating on 2
+        # ranks while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the
+        # copy engine reads some tiles stale.
+        wait_barrier(0)
+        if const_expr(fuse and fence == "all"):
+            raw_cco.cco_system_fence(fx.Int32(0))
+        elif const_expr(fuse and fence == "leader"):
+            # One wave per block, not every lane. Every lane costs a whole-L2
+            # writeback each, and at M=16384 there are 9216 blocks: the
+            # epilogue's bookkeeping measured 2358us against a 2798us GEMM,
+            # with the PUT itself worth 0.8us of that. Same mistake as the
+            # unfused path's unconditional fence; this is the second place it
+            # was written.
             #
-            # One wave per block, not every lane. That is legal *because* the
-            # barrier pair above is closed: wait_barrier(0) means every wave's
-            # stores have retired into this CU's L2, so one wave writing it back
-            # covers all eight. gemm_ar carries the same reasoning and the same
-            # default, and measured the leader form as incorrect only before its
-            # barrier pair was fixed. Every-lane costs a whole-L2 writeback per
-            # lane, which is the same shape of mistake as the unfused staging
-            # GEMM's unconditional fence.
-            wait_barrier(0)
-            raw_cco.cco_system_fence(fx.Int32(1 if direct_fence == "leader" else 0))
-        else:
-            # Retire this block's stores into the staging slab, agree block-wide
-            # that they are retired, then publish them -- but only when this
-            # kernel is the thing that publishes.
-            #
-            # The fence is a *whole-L2* writeback issued by every lane of every
-            # block, so block k redundantly writes back every tile blocks
-            # 1..k-1 already wrote. At 1152 blocks that is quadratic and it is
-            # the single most expensive line in this epilogue: gating it on
-            # `fuse` is what took the unfused staging GEMM from 458 to ~320us,
-            # level with the plain one.
-            #
-            # With `fuse=False` nothing is published here at all -- the separate
-            # scatter kernel issues the puts and does its own ordering -- so the
-            # fence has no one to release to. With `fuse=True` it is not
-            # optional: gemm_ar measured dropping it as still validating on 2
-            # ranks while taking relL2 from 2.35e-3 to 3.76e-3 on 8, i.e. the
-            # copy engine reads some tiles stale.
-            wait_barrier(0)
-            if const_expr(fuse and fence == "all"):
-                raw_cco.cco_system_fence(fx.Int32(0))
-            elif const_expr(fuse and fence == "leader"):
-                # One wave per block, not every lane. Every lane costs a whole-L2
-                # writeback each, and at M=16384 there are 9216 blocks: the
-                # epilogue's bookkeeping measured 2358us against a 2798us GEMM,
-                # with the PUT itself worth 0.8us of that. Same mistake as the
-                # unfused path's unconditional fence and the direct-LSA tail's
-                # every-lane one; this is the third place it was written.
-                #
-                # Legal for the same reason the direct-LSA tail's is: the
-                # half-wave barrier pair is closed above, so wait_barrier(0)
-                # really does mean every wave's stores have retired into this
-                # CU's L2 and one wave writing it back covers all eight.
-                raw_cco.cco_system_fence(fx.Int32(1))
-            elif const_expr(fuse and fence == "release"):
-                if fx.thread_idx.x == fx.Int32(0):
-                    _llvm.fence(_llvm.AtomicOrdering.release, syncscope="")
-            # "none": gemm_ar's own default here. Its stores go through the
-            # same L2 the copy engine reads, and it measured the fence as
-            # unnecessary on that path -- but it also measured dropping it as
-            # taking relL2 from 2.35e-3 to 3.76e-3 on 8 ranks, so it stays
-            # selectable rather than assumed.
+            # Legal because the half-wave barrier pair is closed above, so
+            # wait_barrier(0) really does mean every wave's stores have
+            # retired into this CU's L2 and one wave writing it back covers
+            # all eight.
+            raw_cco.cco_system_fence(fx.Int32(1))
+        elif const_expr(fuse and fence == "release"):
+            if fx.thread_idx.x == fx.Int32(0):
+                _llvm.fence(_llvm.AtomicOrdering.release, syncscope="")
+        # "none": gemm_ar's own default here. Its stores go through the
+        # same L2 the copy engine reads, and it measured the fence as
+        # unnecessary on that path -- but it also measured dropping it as
+        # taking relL2 from 2.35e-3 to 3.76e-3 on 8 ranks, so it stays
+        # selectable rather than assumed.
 
-            # Both bases are rank-local and constant-offset, so they are the same
-            # for every thread. Taking them here rather than inside the `if` also
-            # keeps the window out of the branch's captured state, which has to
-            # be single MLIR values -- see CachedWindow.
-            ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
-            lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
-            sdma = cco.DevComm(dev_comm).sdma()
-            # Block-uniform, so every lane can compute it.
-            chunk = block_m // fx.Int32(m_tiles_per_chunk)
-            off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
-            # Lane j owns destination (rank+1+j) and counter slot (chunk, j).
-            # `post="serial"` uses one lane and one slot.
-            #
-            # This is the shape of gemm_a2a's counter, and adopting it is what
-            # makes the posting concurrent. The obvious layout for a broadcast
-            # is *one* counter per chunk -- a chunk completing arms every
-            # destination at once, so why count world-1 times? Because the
-            # thread that wins a single counter then has to tell world-2 other
-            # lanes that it won, and a broadcast through LDS costs a barrier
-            # and a copy atom for one dword. With a counter per (chunk, lane),
-            # every block increments all world-1 of them in one instruction,
-            # they cross the threshold together, and each lane learns from
-            # *its own* atomic that its block won. No broadcast, no barrier.
-            #
-            # Cost of the change: world-1 atomics per block on world-1 distinct
-            # addresses, which is one instruction's worth of lanes rather than
-            # world-1 instructions, and world*chunks counter dwords in the
-            # window instead of chunks.
-            lanes = ws - 1 if post == "lanes" else 1
-            if fx.thread_idx.x < fx.Int32(lanes) and const_expr(fuse):
-                j = fx.thread_idx.x
-                slot = chunk * fx.Int32(ws) + j
-                ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
-                # acq_rel, matching gemm_ar's default rather than
-                # _compat's "monotonic": the election has to order
-                # against the stores the fence above published.
-                seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
-                # Monotonic: the counters are never reset, so "last tile of this
-                # chunk, this epoch" is a modulo test rather than a compare --
-                # the same property that makes graph replay behave like a fresh
-                # launch.
-                if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
-                    if const_expr(fuse and emit_put):
-                        if const_expr(post == "lanes"):
-                            # world-1 packets issued at once instead of one
-                            # thread issuing them back to back, which measured
-                            # 39-55us at 8 ranks and --chunks 4: 28 packets at
-                            # SDMA's ~2us each, a constant gemm_ar's layout
-                            # states and which this reproduced independently by
-                            # being flat across payloads differing 8x.
-                            #
-                            # Self is excluded by construction: lane j maps to
-                            # rank+1+j, which never lands on rank. The +rank
-                            # rotation keeps the ranks from all posting to the
-                            # same peer first.
-                            d = (fx.Int32(rank + 1) + j) % fx.Int32(ws)
+        # Both bases are rank-local and constant-offset, so they are the same
+        # for every thread. Taking them here rather than inside the `if` also
+        # keeps the window out of the branch's captured state, which has to
+        # be single MLIR values -- see CachedWindow.
+        ctr_base = fx.Int64(w_pre.lsa_ptr(rank, counter_off))
+        lock_base = fx.Int64(w_pre.lsa_ptr(rank, lock_off))
+        sdma = cco.DevComm(dev_comm).sdma()
+        # Block-uniform, so every lane can compute it.
+        chunk = block_m // fx.Int32(m_tiles_per_chunk)
+        off = fx.Int64(chunk) * fx.Int64(chunk_bytes)
+        # Lane j owns destination (rank+1+j) and counter slot (chunk, j).
+        # `post="serial"` uses one lane and one slot.
+        #
+        # This is the shape of gemm_a2a's counter, and adopting it is what
+        # makes the posting concurrent. The obvious layout for a broadcast
+        # is *one* counter per chunk -- a chunk completing arms every
+        # destination at once, so why count world-1 times? Because the
+        # thread that wins a single counter then has to tell world-2 other
+        # lanes that it won, and a broadcast through LDS costs a barrier
+        # and a copy atom for one dword. With a counter per (chunk, lane),
+        # every block increments all world-1 of them in one instruction,
+        # they cross the threshold together, and each lane learns from
+        # *its own* atomic that its block won. No broadcast, no barrier.
+        #
+        # Cost of the change: world-1 atomics per block on world-1 distinct
+        # addresses, which is one instruction's worth of lanes rather than
+        # world-1 instructions, and world*chunks counter dwords in the
+        # window instead of chunks.
+        lanes = ws - 1 if post == "lanes" else 1
+        if fx.thread_idx.x < fx.Int32(lanes) and const_expr(fuse):
+            j = fx.thread_idx.x
+            slot = chunk * fx.Int32(ws) + j
+            ctr = signal_ptr(ctr_base + fx.Int64(slot) * fx.Int64(4))
+            # acq_rel, matching gemm_ar's default rather than
+            # _compat's "monotonic": the election has to order
+            # against the stores the fence above published.
+            seq = fx.Int32(atomic_add_u32(ctr, 1, ordering="acq_rel")) + fx.Int32(1)
+            # Monotonic: the counters are never reset, so "last tile of this
+            # chunk, this epoch" is a modulo test rather than a compare --
+            # the same property that makes graph replay behave like a fresh
+            # launch.
+            if seq % fx.Int32(tiles_per_chunk) == fx.Int32(0):
+                if const_expr(fuse and emit_put):
+                    if const_expr(post == "lanes"):
+                        # world-1 packets issued at once instead of one
+                        # thread issuing them back to back, which measured
+                        # 39-55us at 8 ranks and --chunks 4: 28 packets at
+                        # SDMA's ~2us each, a constant gemm_ar's layout
+                        # states and which this reproduced independently by
+                        # being flat across payloads differing 8x.
+                        #
+                        # Self is excluded by construction: lane j maps to
+                        # rank+1+j, which never lands on rank. The +rank
+                        # rotation keeps the ranks from all posting to the
+                        # same peer first.
+                        d = (fx.Int32(rank + 1) + j) % fx.Int32(ws)
+                        sdma.put(
+                            d,
+                            win,
+                            fx.Int64(my_recv_slot) + off,
+                            win,
+                            # Source and destination are the same offset:
+                            # recv is indexed by source, and a broadcast has
+                            # one source. gemm_a2a reads out of staging
+                            # here, at an offset that depends on `dest`.
+                            fx.Int64(my_recv_slot) + off,
+                            fx.Int64(chunk_bytes),
+                            # Keyed by **chunk**, not by destination. Queues
+                            # are per (source, destination) pair, so every
+                            # peer already has its own and this index only
+                            # disambiguates among queues *to one peer* --
+                            # which is exactly the collision that remains:
+                            # two chunks of the same destination elected at
+                            # nearly the same moment. Separating them by
+                            # queue is what lets this path drop the submit
+                            # lock, and dropping it is not optional here:
+                            # world-1 lanes retire in lockstep, so two waves
+                            # each holding part of a lock set and spinning
+                            # for the rest could never reach their release.
+                            # Hence the sdma_queues >= chunks check above.
+                            chunk % fx.Int32(sdma_queues),
+                            coop=cco.CoopScope.THREAD,
+                            signal=False,
+                        )
+                    else:
+                        # The original: one thread issues all world-1
+                        # packets back to back, under one submit lock. Kept
+                        # selectable so the change above stays a measured
+                        # difference rather than an asserted one. Safe with
+                        # a single lock because a single thread takes it.
+                        lock = signal_ptr(lock_base)
+                        if const_expr(chunks > 1):
+                            _acquire_peer_lock(lock)
+                        for jj in range_constexpr(ws - 1):
+                            dd = (rank + 1 + jj) % ws
                             sdma.put(
-                                d,
+                                fx.Int32(dd),
                                 win,
                                 fx.Int64(my_recv_slot) + off,
                                 win,
-                                # Source and destination are the same offset:
-                                # recv is indexed by source, and a broadcast has
-                                # one source. gemm_a2a reads out of staging
-                                # here, at an offset that depends on `dest`.
                                 fx.Int64(my_recv_slot) + off,
                                 fx.Int64(chunk_bytes),
-                                # Keyed by **chunk**, not by destination. Queues
-                                # are per (source, destination) pair, so every
-                                # peer already has its own and this index only
-                                # disambiguates among queues *to one peer* --
-                                # which is exactly the collision that remains:
-                                # two chunks of the same destination elected at
-                                # nearly the same moment. Separating them by
-                                # queue is what lets this path drop the submit
-                                # lock, and dropping it is not optional here:
-                                # world-1 lanes retire in lockstep, so two waves
-                                # each holding part of a lock set and spinning
-                                # for the rest could never reach their release.
-                                # Hence the sdma_queues >= chunks check above.
-                                chunk % fx.Int32(sdma_queues),
+                                fx.Int32(dd % sdma_queues),
                                 coop=cco.CoopScope.THREAD,
                                 signal=False,
                             )
-                        else:
-                            # The original: one thread issues all world-1
-                            # packets back to back, under one submit lock. Kept
-                            # selectable so the change above stays a measured
-                            # difference rather than an asserted one. Safe with
-                            # a single lock because a single thread takes it.
-                            lock = signal_ptr(lock_base)
-                            if const_expr(chunks > 1):
-                                _acquire_peer_lock(lock)
-                            for jj in range_constexpr(ws - 1):
-                                dd = (rank + 1 + jj) % ws
-                                sdma.put(
-                                    fx.Int32(dd),
-                                    win,
-                                    fx.Int64(my_recv_slot) + off,
-                                    win,
-                                    fx.Int64(my_recv_slot) + off,
-                                    fx.Int64(chunk_bytes),
-                                    fx.Int32(dd % sdma_queues),
-                                    coop=cco.CoopScope.THREAD,
-                                    signal=False,
-                                )
-                            if const_expr(chunks > 1):
-                                atomic_store_u32(lock, 0)
-            # gcnasm closes its ChunkFused epilogue with a barrier here; its
-            # README lists removing it as a rejected experiment that deadlocked.
-            fgpu.barrier()
+                        if const_expr(chunks > 1):
+                            atomic_store_u32(lock, 0)
+        # gcnasm closes its ChunkFused epilogue with a barrier here; its
+        # README lists removing it as a rejected experiment that deadlocked.
+        fgpu.barrier()
 
     @flyc.jit
     def launch(
@@ -953,4 +880,4 @@ def compile_fused_gemm_ag(
     return launch
 
 
-__all__ = ["compile_fused_gemm_ag", "compile_gemm_local", "direct_lsa_probe"]
+__all__ = ["compile_fused_gemm_ag", "compile_gemm_local"]

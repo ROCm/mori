@@ -57,9 +57,6 @@ Bytes sent per rank are `(world_size-1) * M * N * elem_bytes`.
 | `gemm-only` | GEMM into a plain tensor |
 | `gemm-to-window` | GEMM into the local receive slot |
 | `split-rccl` | GEMM, then RCCL `all_gather_into_tensor` |
-| `split-lsa-push` | GEMM, then a kernel stores C into peers |
-| `split-lsa-pull` | GEMM publishes C, then a kernel reads peer slabs |
-| `fused-lsa` | GEMM epilogue stores each tile into every peer |
 | `split-sdma` | GEMM, then SDMA gather and completion barrier |
 | `fused-sdma` | GEMM epilogue submits completed M chunks; a drain finishes AG |
 
@@ -67,13 +64,26 @@ The SDMA modes submit kernels on one stream. SDMA can still overlap a fused
 producer's later computation. The separate M-chunk pipeline uses two streams;
 its `serial` control retains those streams but disables compute/transfer overlap.
 
+**The transport is SDMA only.** Three LSA modes -- `split-lsa-push` (a copy
+kernel storing C into the peers), `split-lsa-pull` (one loading the peers' C)
+and `fused-lsa` (the epilogue storing every tile into every peer) -- were
+measured and removed, as `gemm_a2a` did with its own. Their rows stay in the
+dated tables below, marked *removed*. In short: at the Pro shape the best LSA
+path was 4.6% behind split SDMA (372.2 against 355.9 µs) and fused LSA 16-19%
+behind; LSA was ahead only on the smallest payload measured, Flash N=512 at
+M=2048, by 3% (126.4 against 130.5 µs), and within 2% behind on the other
+M=2048 shapes. A fused LSA epilogue writes `world` copies of every tile from
+inside the GEMM and slows the GEMM with it, and cached peer stores reached
+58% of line rate where the copy engines reach 94% (`gemm_a2a`). Keeping two
+transports doubled the test matrix for a few percent at one small shape. The
+removed kernels are in this branch's history.
+
 ## Interfaces and constraints
 
 | Source | Entry points |
 |---|---|
 | [_gemm_a16w16_8wave.py](_gemm_a16w16_8wave.py) | `compile_bf16_gemm_ag`, including local split-K partials |
 | [kernels_fused.py](kernels_fused.py) | FP8 `compile_fused_gemm_ag` and `compile_gemm_local` |
-| [kernels_lsa.py](kernels_lsa.py) | LSA push/pull and barriers |
 | [kernels_sdma.py](kernels_sdma.py) | `build_sdma_phases` and `build_sdma_chunk_post` |
 | [layout.py](layout.py) | `ag_config`, window offsets and counter layout |
 
@@ -237,10 +247,10 @@ and final cross-rank synchronization. Native Torch + RCCL takes **407.4 µs**.
 | Mode | `256x256`, µs | `128x128`, µs |
 |---|---:|---:|
 | GEMM + RCCL | 472.0 | 414.8 |
-| GEMM + LSA push | 438.7 | 372.2 |
-| GEMM + LSA pull | 443.8 | 399.2 |
-| Fused LSA, cached stores | 466.9 | 413.7 |
-| Fused LSA, uncached stores | 467.2 | 422.6 |
+| GEMM + LSA push *(removed)* | 438.7 | 372.2 |
+| GEMM + LSA pull *(removed)* | 443.8 | 399.2 |
+| Fused LSA, cached stores *(removed)* | 466.9 | 413.7 |
+| Fused LSA, uncached stores *(removed)* | 467.2 | 422.6 |
 | **GEMM + SDMA** | **421.8** | **355.9** |
 | Fused SDMA, 1 chunk | 422.5 | 360.6 |
 | Fused SDMA, 2 chunks | 433.5 | 372.1 |
@@ -277,9 +287,9 @@ Times are µs.
 |---|---:|---:|---:|
 | GEMM only | 57.3 | 96.3 | 86.3 |
 | GEMM + RCCL | 231.8 | 266.9 | 266.0 |
-| GEMM + LSA push | 212.6 | 248.3 | 244.2 |
-| GEMM + LSA pull | 217.0 | 251.0 | 248.8 |
-| Fused LSA | 265.8 | 328.1 | 292.4 |
+| GEMM + LSA push *(removed)* | 212.6 | 248.3 | 244.2 |
+| GEMM + LSA pull *(removed)* | 217.0 | 251.0 | 248.8 |
+| Fused LSA *(removed)* | 265.8 | 328.1 | 292.4 |
 | GEMM + SDMA | 212.5 | 245.4 | 242.2 |
 | Fused SDMA, 1 chunk | 223.6 | 259.1 | 250.7 |
 
@@ -313,9 +323,9 @@ includes those steps.
 |---|---:|---:|
 | Native Torch + RCCL | 153.5 | 273.4 |
 | MORI GEMM + RCCL | 173.1 | 282.2 |
-| MORI GEMM + LSA push | **126.4** | 206.5 |
-| MORI GEMM + LSA pull | 138.0 | 220.1 |
-| Fused LSA, uncached | 128.4 | 221.2 |
+| MORI GEMM + LSA push *(removed)* | **126.4** | 206.5 |
+| MORI GEMM + LSA pull *(removed)* | 138.0 | 220.1 |
+| Fused LSA, uncached *(removed)* | 128.4 | 221.2 |
 | MORI GEMM + SDMA | 130.5 | 203.2 |
 | Fused SDMA, 1 chunk | 129.7 | **202.8** |
 | Fused SDMA, 4 chunks | 157.7 | 236.0 |
@@ -401,10 +411,8 @@ The repaired implementation depends on three distinct ordering contracts:
    the last tile's reads. Preserve the staggered-wave closing barrier.
    The asymmetric tile's partial wait is bounded by `min(2A+B, A+2B)`, where
    A/B count G2S load instructions per subtile.
-2. **Peer publication and initial state.** BF16 pull uses a descriptor from
-   the caller's C pointer, `sc0|sc1` stores and a system fence from every
-   producer lane. Initialize the entire window, including arrival flags and
-   counters, before first use; counters remain monotonic across replays.
+2. **Initial state.** Initialize the entire window, including arrival flags
+   and counters, before first use; counters remain monotonic across replays.
 3. **SDMA completion.** Fused producers may submit different chunks on
    different queues. Drain every relevant queue before publishing arrival.
    Joining the submission stream only establishes that PUTs were submitted.
@@ -413,8 +421,7 @@ Coverage includes the CPU [LDS dependency model](../../../../tests/python/cco/te
 the [SDMA completion model](../../../../tests/python/cco/test_gemm_ag_sdma_drain.py),
 and [GPU numerical/replay tests](../../../../tests/python/cco/test_gemm_ag.py).
 Numerical tests use exact small-integer CPU references, changed inputs and
-poisoned buffers; pull tests also exercise delayed producers and dirty initial
-flags. The direct split-K interfaces are checked per partial plane.
+poisoned buffers. The direct split-K interfaces are checked per partial plane.
 
 Benchmark commands and options are maintained in the
 [benchmark README](../../../../benchmark/cco/flydsl/gemm_ag/README.md).

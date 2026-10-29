@@ -43,12 +43,15 @@ deliberate: the two must use the same queue map and the same barrier slots, and
 a second copy of that would be a second thing to keep in step.
 
 Protocol is gcnasm's, ``gemm_ar``'s and ``gemm_a2a``'s: **no per-PUT signal**,
-drain on the sender, then an LSA atomic to publish arrival. A trailing
+drain on the sender, then an atomic store into the peer's window to publish
+arrival. A trailing
 signal packet costs about what a copy packet does and nothing here polls it.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl.expr import const_expr
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
@@ -57,12 +60,38 @@ import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
 from ..gemm_ar._compat import (
+    i32_type,
     local_load_u32,
     local_store_u32,
+    signal_load_u32,
     signal_ptr,
     signal_store_u32,
 )
-from .kernels_lsa import _spin_until
+
+
+def _spin_until(rsrc, flag):
+    """Block until the u32 at ``rsrc`` reaches ``flag`` (unsigned compare).
+
+    Unsigned so a wrapped counter still terminates; ``>=`` so an increment can
+    never be missed. Same construction as ``gemm_ar.kernels_lsa._spin_until``
+    and ``gemm_a2a``'s -- duplicated rather than imported because those modules
+    are other collectives and importing a private helper across ops to save nine
+    lines would tie this file's correctness to an unrelated one's refactors.
+    """
+    i32 = i32_type()
+    first = signal_load_u32(rsrc)
+    first_v = first.ir_value() if hasattr(first, "ir_value") else first
+    loop = scf.WhileOp([i32], [first_v])
+    cond = ir.Block.create_at_start(loop.before, [i32])
+    body = ir.Block.create_at_start(loop.after, [i32])
+    with ir.InsertionPoint(cond):
+        cur = fx.Int32(cond.arguments[0])
+        should_wait = fx.Uint32(cur) < fx.Uint32(flag)
+        scf.ConditionOp(should_wait.ir_value(), [cond.arguments[0]])
+    with ir.InsertionPoint(body):
+        nxt = signal_load_u32(rsrc)
+        scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
+
 
 #: One wave is enough: the kernel issues at most ``world_size`` puts and then
 #: polls. gemm_ar and gemm_a2a use the same number for the same reason.
@@ -125,9 +154,9 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
         wants single ones. Inlining it raises ``Cannot extract IR values from
         CachedWindow``.
 
-        Slot map is ``rank*4`` within ``start_off``, which is block 0's row of
-        the ``(bid*MAX_WORLD + rank)*4`` map the LSA kernels use -- these kernels
-        are one block, so the two agree.
+        Slot map is ``rank*4`` within ``start_off``: block 0's row of the
+        layout's ``(bid*MAX_WORLD + rank)*4`` signal map, since these kernels
+        are one block.
         """
         peer_arr = fx.Int64(w.lsa_ptr(tid, start_off))
         signal_store_u32(signal_ptr(peer_arr + fx.Int64(rank * 4)), flag)

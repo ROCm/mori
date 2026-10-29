@@ -334,7 +334,10 @@ The port was not kept; it validated on both GEMMs before it was dropped.
 
 ## Reproduction and scope
 
-Use `bench_gemm_ag.py` for single-stream transports and
+The LSA modes (`split-lsa-push`, `split-lsa-pull`, `fused-lsa`) that several
+studies above compare against have since been removed from the operator and
+the benchmark; reproducing those rows needs this branch's history before the
+removal. Use `bench_gemm_ag.py` for single-stream transports and
 `bench_gemm_ag_pipeline.py` for two-stream MORI, split-K and Torch backends;
 see the [command reference](../../../../benchmark/cco/flydsl/gemm_ag/README.md).
 The retained interfaces include local `split_k=2/4/8` partials,

@@ -61,8 +61,7 @@ they are the whole of this file's difference from ``gemm_a2a/layout.py``:
    decide per destination. (The counter region is still ``world`` wide per
    chunk, but for a different reason: see ``counter_set_bytes``.)
 3. **The copy is flat on both sides.** Source index and destination index are
-   equal. ``gemm_a2a``'s LSA kernel reads strided and writes compact; this one
-   does neither.
+   equal, so one copy-engine put per peer moves the whole slab.
 
 The price is on the wire: a rank sends ``(world-1) * M * N * elem_bytes``
 bytes, which is ``world`` times what the all-to-all sends at the same shape and
@@ -90,7 +89,7 @@ K_MAX_BLOCKS = 80  # signal slot rows
 THREADS = 512
 MAX_WORLD = 8  # the signal array fixes peer fan-out at 8
 SIGNAL_ALIGN = 128  # alignas(128) on each control region
-PACK_BYTES = 16  # the 16B pack the copy kernels index in
+PACK_BYTES = 16  # the 16B a lane of the GEMM epilogue stores
 
 # The fp8 GEMM this op is built on (``gemm_ar/_gemm_a8w8_8wave.py``) is compiled
 # for one tile shape. BLOCK_N is not a tuning knob: the epilogue's permlane lane
@@ -114,14 +113,6 @@ MXFP8_BLOCK_M = 256
 
 #: The ue8m0 group, on both operands: A is 1x32, B is 32x32.
 MXFP8_BLOCK = 32
-
-# Grid cap for the LSA copy kernel. Same reasoning as gemm_ar's and gemm_a2a's
-# LSA_BLOCK_CAP -- these stores go over xGMI and over-subscribing the request
-# queues costs time rather than saving it -- but the number is deliberately not
-# shared: each was measured on a different access pattern, and this op's is the
-# one pattern where a single load feeds world-1 stores. Until it is measured
-# here it is a starting point.
-LSA_BLOCK_CAP = 24
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -157,7 +148,6 @@ class AgConfig:
     block_n: int = DEFAULT_BLOCK_N
     threads: int = THREADS
     max_blocks: int = K_MAX_BLOCKS
-    block_cap: int = LSA_BLOCK_CAP
     #: Sub-slices this rank's slab is pushed in, for the fused GEMM. 1 means
     #: "one put per destination at the end"; more lets the first rows leave
     #: while the GEMM is still computing the later ones. Chunking is along
@@ -186,10 +176,6 @@ class AgConfig:
     #: identical, so a region only ever aliases *itself*. Sizes stay ``m``-based:
     #: this moves where things are, not how much is moved. 0 means "same as m".
     capacity_m: int = 0
-    #: Override the computed grid for the copy kernel. Only ``max_blocks`` bounds
-    #: it for correctness (the signal array has one row per block), so raising
-    #: this past that needs ``max_blocks`` raised too.
-    force_blocks: int | None = None
 
     # --- basic sizes -------------------------------------------------------
 
@@ -250,17 +236,6 @@ class AgConfig:
     def _check_rank(self, r: int) -> None:
         if not 0 <= r < self.world_size:
             raise IndexError(f"rank {r} outside [0, {self.world_size})")
-
-    # --- launch geometry ---------------------------------------------------
-
-    @property
-    def copy_blocks(self) -> int:
-        """Grid for the standalone LSA copy kernel."""
-        if self.force_blocks is not None:
-            return self.force_blocks
-        # One block per (peer, slice) with at least one slice each; the cap is
-        # what actually binds on any real shape.
-        return max(self.world_size, min(self.block_cap, self.world_size * 4))
 
     # --- symmetric window layout: [ signal | counters | locks | recv ] ------
 
@@ -396,7 +371,7 @@ class AgConfig:
         if self.elem_bytes not in (2, 4):
             raise ValueError(
                 f"elem_bytes must be 2 (bf16) or 4 (fp32), got {self.elem_bytes}: "
-                f"the copy kernels move whole {PACK_BYTES}-byte packs and index "
+                f"the epilogue stores whole {PACK_BYTES}-byte packs and indexes "
                 f"them in elements, which needs elem_bytes to divide {PACK_BYTES}"
             )
         for name, value, granule in (
@@ -471,15 +446,7 @@ class AgConfig:
         if self.slab_bytes % PACK_BYTES:
             raise ValueError(
                 f"a slab is {self.slab_bytes}B and must be a multiple of "
-                f"{PACK_BYTES} so the copy kernels can move whole packs"
-            )
-        if (
-            self.force_blocks is not None
-            and not 1 <= self.force_blocks <= self.max_blocks
-        ):
-            raise ValueError(
-                f"force_blocks={self.force_blocks} outside [1, {self.max_blocks}]; "
-                f"the signal array has one row per block, so raise max_blocks too"
+                f"{PACK_BYTES} so the epilogue's 16-byte stores stay inside it"
             )
 
 
@@ -518,7 +485,6 @@ __all__ = [
     "DEFAULT_BLOCK_N",
     "MXFP8_BLOCK",
     "MXFP8_BLOCK_M",
-    "LSA_BLOCK_CAP",
     "MAX_WORLD",
     "PACK_BYTES",
     "THREADS",

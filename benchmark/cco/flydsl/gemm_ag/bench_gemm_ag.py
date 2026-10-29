@@ -24,9 +24,6 @@
     gemm-only       the GEMM alone into a plain tensor, to size the ceiling
     gemm-to-window  the same kernel, writing this rank's recv slot instead
     split-rccl      gemm-only(); then torch's all_gather_into_tensor
-    split-lsa-push  gemm-to-window(); then LSA stores into every peer
-    split-lsa-pull  gemm-to-window(); then LSA loads from every peer
-    fused-lsa       C stored straight into every peer from the epilogue
     split-sdma      gemm-to-window(); then one copy-engine push per peer
     fused-sdma      C into my own slot, pushed per chunk from the epilogue
 
@@ -40,10 +37,11 @@ is seeded identically on every rank and A is not -- get that wrong and each rank
 validates happily against its own wrong reference.
 
 ``split-rccl`` is the baseline the fusion is claimed against: a plain GEMM into
-a normal tensor followed by the collective a model would actually call. The two
-``split-lsa-*`` modes and ``split-sdma`` are the same decomposition over mori's
-own transports, and the ``fused-*`` pair is what absorbs the transfer into the
-epilogue.
+a normal tensor followed by the collective a model would actually call.
+``split-sdma`` is the same decomposition over mori's copy engines, and
+``fused-sdma`` absorbs the transfer into the epilogue. The LSA transports
+(``split-lsa-push``/``-pull``, ``fused-lsa``) were measured and removed; see the
+operator's README.
 
 Note there is no ``gemm-staging``. ``bench_gemm_a2a`` needs one because its
 split path's GEMM writes a different address map from ``gemm-only``'s, so
@@ -53,7 +51,7 @@ C pointer, which is what ``gemm-to-window`` measures -- and that mode validates,
 unlike its all-to-all namesake, because writing ``[M, N]`` into this rank's recv
 slot is exactly half the answer rather than none of it.
 
-    torchrun --nproc_per_node=8 bench_gemm_ag.py --mode split-lsa-pull \\
+    MORI_ENABLE_SDMA=1 torchrun --nproc_per_node=8 bench_gemm_ag.py --mode split-sdma \\
       -m 2048 --out-dim 2048 -k 7168 --warmup 10 --iters 30
 """
 
@@ -80,8 +78,6 @@ from mori.tensor_utils import from_gpu_ptr
 from mori.ops.gemm_ar import preshuffle_a_scale
 from mori.ops.gemm_ag import (
     ag_config,
-    build_lsa_ag,
-    build_lsa_barrier,
     build_sdma_phases,
     counter_chunks,
     preshuffle_b,
@@ -101,9 +97,6 @@ MODES = (
     "gemm-only",
     "gemm-to-window",
     "split-rccl",
-    "split-lsa-push",
-    "split-lsa-pull",
-    "fused-lsa",
     "split-sdma",
     "fused-sdma",
 )
@@ -115,11 +108,8 @@ NOT_YET = ()
 #: call that would then be aliasing part of its own output.
 WINDOW_C = (
     "gemm-to-window",
-    "split-lsa-push",
-    "split-lsa-pull",
     "split-sdma",
     "fused-sdma",
-    "fused-lsa",
 )
 
 #: fp8 block-scale group size along K. Fixed by the model's quantiser and by the
@@ -420,7 +410,6 @@ def run(args) -> int:
         block_m=args.block_m,
         block_n=args.block_n,
         counter_chunks=chunks,
-        force_blocks=args.copy_blocks or None,
     )
     a, b, sa, sb = _operands(rank, args)
     # The bf16 GEMM reads a plain row-major [N, K]; the preshuffle is the fp8
@@ -434,9 +423,9 @@ def run(args) -> int:
     with Communicator.init(world_size, rank, uid, per_rank_vmm=vmm) as comm:
         mem = comm.alloc_mem(cfg.window_bytes)
         win = comm.register_window(mem.ptr, mem.size)
-        # Allocation does not initialize memory. In particular, stale positive
-        # start flags can satisfy pull's first entry barrier before a peer has
-        # finished its GEMM. Initialize control state as well as the payload.
+        # Allocation does not initialize memory. Stale positive flags would
+        # satisfy the SDMA phase's arrival barrier early, so initialize the
+        # control state as well as the payload.
         from_gpu_ptr(mem.ptr, (cfg.window_bytes,), torch.uint8).zero_()
         recv = from_gpu_ptr(
             mem.ptr + cfg.recv_off, (world_size * args.m, args.n), out_t
@@ -459,13 +448,7 @@ def run(args) -> int:
             reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
-        fused = args.mode in ("fused-lsa", "fused-sdma")
-        # The pull baseline is not free to pick its GEMM. A pull reads a peer's
-        # HBM, and an ordinary cached C store leaves the line dirty in the
-        # producer's own L2 where that read never reaches -- so the GEMM has to
-        # publish with sc0|sc1. See build_lsa_ag's docstring; the symptom
-        # without it is a relL2 that depends on the quantisation.
-        pull_gemm = args.mode == "split-lsa-pull"
+        fused = args.mode == "fused-sdma"
         if args.torch_gemm:
             gemm = None
         elif bf16_in:
@@ -481,18 +464,16 @@ def run(args) -> int:
                 out_dtype=args.out_dtype,
                 waves_per_eu=args.waves_per_eu,
                 xcd_swizzle=args.xcd_swizzle if not fused else 0,
-                transport="lsa" if args.mode == "fused-lsa" else "sdma",
                 wait_policy=args.wait_policy,
                 fuse=fused,
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
                 post=args.post,
-                peer_uncached=(pull_gemm or (args.peer_uncached and fused)),
-                direct_fence=args.direct_fence,
+                peer_uncached=args.peer_uncached and fused,
                 emit_put=not args.no_put,
                 fence=args.fence,
             )
-        elif fused or pull_gemm or (needs_sdma and args.split_gemm == "epilogue"):
+        elif fused or (needs_sdma and args.split_gemm == "epilogue"):
             # One builder for the fused path and, optionally, for its split
             # baseline: with fuse=False it runs the same kernel minus the
             # election and the put, so the pair differs in exactly one thing.
@@ -504,13 +485,11 @@ def run(args) -> int:
                 BLOCK_N=args.block_n,
                 quant=args.quant,
                 waves_per_eu=args.waves_per_eu,
-                transport="lsa" if args.mode == "fused-lsa" else "sdma",
                 fuse=fused,
                 chunks=chunks,
                 sdma_queues=args.sdma_queues,
                 post=args.post,
-                peer_uncached=(pull_gemm or (args.peer_uncached and fused)),
-                direct_fence=args.direct_fence,
+                peer_uncached=args.peer_uncached and fused,
                 emit_put=not args.no_put,
                 fence=args.fence,
             )
@@ -560,25 +539,6 @@ def run(args) -> int:
         else:
             sa_arg, sb_arg = sa, sb
 
-        # Same kernel, same bytes over the fabric, same barrier. Only which end
-        # drives the transfer differs -- that is the one variable this pair
-        # isolates, and it is the question all-gather raises and the other two
-        # collectives do not.
-        copy = (
-            build_lsa_ag(
-                cfg,
-                rank,
-                direction="pull" if args.mode == "split-lsa-pull" else "push",
-                uncached=args.lsa_uncached,
-                unroll=args.push_unroll,
-            )
-            if args.mode in ("split-lsa-push", "split-lsa-pull")
-            else None
-        )
-        # fused-lsa has no collective kernel -- the epilogue already wrote into
-        # the peers -- but it still needs the agreement that every peer
-        # *finished*, or a rank reads a slab a peer is still writing.
-        barrier = build_lsa_barrier(cfg, rank) if args.mode == "fused-lsa" else None
         parts = (
             build_sdma_phases(cfg, rank, queues=args.sdma_queues)
             if needs_sdma
@@ -620,10 +580,6 @@ def run(args) -> int:
         def once():
             stream = fx.Stream(torch.cuda.current_stream())
             call_gemm(stream)
-            if copy is not None:
-                copy(dc.ptr, win.handle, stream=stream)
-            if barrier is not None:
-                barrier(dc.ptr, win.handle, stream=stream)
             if rccl:
                 # Same bytes, same GEMM as gemm-only: only the transport
                 # differs. all_gather_into_tensor concatenates the inputs along
@@ -717,7 +673,7 @@ def run(args) -> int:
         # kernel timed here -- 27us of clock ramp, enough to take split-sdma
         # from a real 81% of line rate to an apparent 94%.
         phase_us = {}
-        if args.phase_split and (copy is not None or parts is not None or rccl):
+        if args.phase_split and (parts is not None or rccl):
 
             def _gemm_only():
                 call_gemm(fx.Stream(torch.cuda.current_stream()))
@@ -765,7 +721,7 @@ def run(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=MODES + NOT_YET, default="split-lsa-pull")
+    p.add_argument("--mode", choices=MODES + NOT_YET, default="split-sdma")
     p.add_argument("-m", type=int, default=2048)
     # Not `-n`: torchrun takes --nproc_per_node and abbreviation matching makes
     # a bare `-n` ambiguous against it.
@@ -810,28 +766,15 @@ def build_parser() -> argparse.ArgumentParser:
         "(epilogue), which makes split-sdma and fused-sdma differ in exactly "
         "one thing at the cost of no longer being gemm-only's kernel",
     )
-    p.add_argument("--direct-fence", choices=("leader", "all"), default="leader")
     p.add_argument(
         "--fence", choices=("none", "leader", "all", "release"), default="leader"
-    )
-    p.add_argument("--copy-blocks", type=int, default=0)
-    p.add_argument(
-        "--lsa-uncached", action=argparse.BooleanOptionalAction, default=True
     )
     p.add_argument(
         "--peer-uncached",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="sc0|sc1 on fused-lsa's peer stores; the split copy kernel's own "
-        "default is the opposite (--lsa-uncached), so the pair is worth "
-        "sweeping together",
-    )
-    p.add_argument(
-        "--push-unroll",
-        type=int,
-        default=4,
-        help="packs a split-lsa-push thread keeps in flight; ignored on pull, "
-        "which has world-1 independent loads already",
+        help="sc0|sc1 on fused-sdma's C stores into this rank's recv slot; with "
+        "--fence release this is the measured sc_release configuration",
     )
     p.add_argument(
         "--post",

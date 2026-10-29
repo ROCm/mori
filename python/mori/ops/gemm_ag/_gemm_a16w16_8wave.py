@@ -409,10 +409,10 @@ class AgStoreC:
     * It builds A-scale and B-scale descriptors unconditionally, and a bf16
       GEMM has no scales to describe.
 
-    ``peer_rsrcs`` is the broadcast list ``fused-lsa`` needs: one tile goes to
-    every rank, and doing that through ``world`` separate store objects would
-    repeat the convert and the shuffle with it. ``elem_base`` rebases the flat
-    index when the descriptor is a slab rather than the whole ``[M, N]``.
+    ``peer_rsrc`` is the fused path's destination, this rank's ``recv`` slot,
+    stored through a raw buffer descriptor so the cache policy can be set;
+    without it the store goes through the C tensor. ``elem_base`` rebases the
+    flat index when the descriptor is a slab rather than the whole ``[M, N]``.
     """
 
     def __init__(
@@ -425,7 +425,7 @@ class AgStoreC:
         n_tiles_b,
         *,
         out_dtype="bf16",
-        peer_rsrcs=None,
+        peer_rsrc=None,
         elem_base=None,
         peer_uncached=False,
     ):
@@ -439,11 +439,11 @@ class AgStoreC:
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.lane_id = fx.thread_idx.x % 64
-        self.peer_rsrcs = () if peer_rsrcs is None else tuple(peer_rsrcs)
+        self.peer_rsrc = peer_rsrc
         self.elem_base = fx.Int32(0) if elem_base is None else elem_base
         self.cache_modifier = CM_SC0_SC1 if peer_uncached else CM_CACHED
 
-        if not self.peer_rsrcs:
+        if self.peer_rsrc is None:
             # Local path: a copy atom through the C tensor, as gemm_ar does.
             # Sized from the *real* element width, which is the thing StoreC
             # gets wrong for fp32.
@@ -463,16 +463,13 @@ class AgStoreC:
 
     def _emit(self, value, idx):
         """One 16-byte store of ``value`` at flat element index ``idx``."""
-        if self.peer_rsrcs:
-            # A single resource is one iteration and emits what an unlooped
-            # store would; the plural exists for fused-lsa's broadcast.
-            for rsrc in self.peer_rsrcs:
-                buffer_store(
-                    value,
-                    rsrc,
-                    fx.Int32(idx) - self.elem_base,
-                    cache_modifier=self.cache_modifier,
-                )
+        if self.peer_rsrc is not None:
+            buffer_store(
+                value,
+                self.peer_rsrc,
+                fx.Int32(idx) - self.elem_base,
+                cache_modifier=self.cache_modifier,
+            )
         else:
             fx.memref_store_vec(value, self.reg_out)
             fx.copy(
@@ -601,14 +598,12 @@ def compile_bf16_gemm_ag(
     out_dtype: str = "bf16",
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
-    transport: str = "sdma",
     wait_policy: str = "tuned",
     fuse: bool = False,
     chunks: int = 1,
     sdma_queues: int = 1,
     post: str = "lanes",
     peer_uncached: bool = False,
-    direct_fence: str = "leader",
     emit_put: bool = True,
     fence: str = "leader",
     split_k: int = 1,
@@ -622,17 +617,11 @@ def compile_bf16_gemm_ag(
 
     ``fuse=False`` emits the identical kernel minus the epilogue tail and writes
     C wherever the caller points it -- a plain tensor for ``gemm-only``, this
-    rank's ``recv`` slot for ``gemm-to-window`` and the split transports. That
+    rank's ``recv`` slot for ``gemm-to-window`` and ``split-sdma``. That
     is the same discipline ``gemm_ar.compile_fused_gemm_scatter`` uses and for
     the same reason: the split baseline and the fused kernel then differ in
     exactly one thing. ``dev_comm`` and ``win`` are unread on that path but stay
     in the signature so the launch path does not change either.
-
-    With ``fuse=False, peer_uncached=True``, C is a pull source: store it
-    through a descriptor with ``sc0|sc1``, drain those stores, and issue a
-    system fence from every producer lane before the kernel returns. The
-    following pull kernel can then publish arrival and read peer HBM. This
-    also works with a plain C tensor and null CCO handles.
 
     ``split_k=2/4/8`` partitions K across the grid's second dimension and
     writes FP32 partials to contiguous ``[split_k, M, N]`` storage. A and B
@@ -649,8 +638,8 @@ def compile_bf16_gemm_ag(
     rewriter only lowers ``if`` inside a ``@flyc.kernel`` function's own AST, so
     the election and the barriers cannot move into a helper. What differs
     between them is the mainloop and the store; the transport logic -- release
-    fence, per-(chunk, lane) counter, lane-parallel put, ``peer_rsrcs``
-    broadcast -- is meant to be identical, and any fix to one belongs in both.
+    fence, per-(chunk, lane) counter, lane-parallel put -- is meant to be
+    identical, and any fix to one belongs in both.
 
     Validate ``fuse=False`` before trusting anything fused: a wrong LDS swizzle
     or a wrong ``E_K`` unroll produces a wrong C, and every fused mode validates
@@ -668,20 +657,15 @@ def compile_bf16_gemm_ag(
         raise ValueError(
             f"wait_policy must be tuned, safe or conservative, got {wait_policy!r}"
         )
-    if transport not in ("lsa", "sdma"):
-        raise ValueError(f"transport must be lsa or sdma, got {transport!r}")
+    if peer_uncached and not fuse:
+        raise ValueError(
+            "peer_uncached selects the fused path's publication; the unfused "
+            "GEMM's C is read by nothing that needs it"
+        )
     if post not in ("lanes", "serial"):
         raise ValueError(f"post must be lanes or serial, got {post!r}")
     if fence not in ("none", "leader", "all", "release"):
         raise ValueError(f"invalid producer fence: {fence!r}")
-    if direct_fence not in ("leader", "all"):
-        raise ValueError(f"direct_fence must be leader or all, got {direct_fence!r}")
-    if transport == "lsa" and not fuse:
-        raise ValueError(
-            "fuse=False is only meaningful with transport='sdma', where it gives "
-            "the window-writing GEMM for the split paths; an unfused LSA GEMM "
-            "writes nowhere in particular"
-        )
     if fuse and post == "lanes" and chunks > 1 and sdma_queues < chunks:
         raise ValueError(
             f"post='lanes' with chunks={chunks} needs sdma_queues >= {chunks}, "
@@ -709,8 +693,7 @@ def compile_bf16_gemm_ag(
     my_recv_slot = cfg.recv_slot_off(rank)
     slab_bytes = cfg.slab_bytes
     counter_off, lock_off = cfg.counter_off, cfg.lock_off
-    direct_lsa = transport == "lsa"
-    if fuse and not direct_lsa and cfg.counter_chunks != chunks:
+    if fuse and cfg.counter_chunks != chunks:
         raise ValueError(
             f"chunks={chunks} disagrees with the config's counter_chunks="
             f"{cfg.counter_chunks}"
@@ -751,12 +734,12 @@ def compile_bf16_gemm_ag(
     )
 
     _kname = (
-        f"mori_ag_bf16_{transport if fuse else 'plain'}_8w_sync2_pub2_"
+        f"mori_ag_bf16_{'sdma' if fuse else 'plain'}_8w_sync2_pub2_"
         f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
         f"{'F32' if out_dtype == 'fp32' else 'B16'}_{waves_per_eu}x{xcd_swizzle}"
         f"_c{chunks}q{sdma_queues}{post[0]}{'U' if peer_uncached else 'C'}"
         f"w{wait_policy[0]}"
-        f"{direct_fence[0]}{fence[0]}{'p' if emit_put else 'x'}_k{K}_sk{split_k}_r{rank}"
+        f"{fence[0]}{'p' if emit_put else 'x'}_k{K}_sk{split_k}_r{rank}"
     )
 
     @fx.struct
@@ -833,42 +816,16 @@ def compile_bf16_gemm_ag(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, BF16_IR_t, wave_id)
         a_s2r = S2RLoaderBf16(wave_m, N_TILES_A)
         b_s2r = S2RLoaderBf16(wave_n, N_TILES_B)
-        # Where C goes. On the fused-LSA path the collective is a *broadcast*,
-        # so the store is handed `world` descriptors and does the convert and
-        # (for bf16) the shuffle once for all of them. Everywhere else it is a
-        # single destination; the pull producer needs an explicit descriptor
-        # for its C tensor so it can set the system-scope cache policy.
-        if const_expr(fuse and direct_lsa):
-            # Broadcast: `world` descriptors, so the convert and (for bf16) the
-            # shuffle happen once and only the 16-byte store repeats.
-            rsrcs = [
-                create_buffer_resource_from_addr(
-                    wave_uniform_i64(w_pre.lsa_ptr((rank + j) % ws, my_recv_slot)),
-                    num_records_bytes=slab_bytes,
-                )
-                for j in range(ws)
-            ]
-        elif const_expr(fuse):
-            # The fused output is anchored to this rank's registered recv
-            # slot. SDMA reads that slot, independently of the caller's C view.
-            rsrcs = [
-                create_buffer_resource_from_addr(
-                    wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
-                    num_records_bytes=slab_bytes,
-                )
-            ]
-        elif const_expr(peer_uncached):
-            # Publish the caller's C, which need not be a CCO window. Copy
-            # atoms cannot express sc0|sc1. slab_bytes includes the output
-            # element width, so an FP32 descriptor covers the entire slab.
-            rsrcs = [
-                create_buffer_resource_from_addr(
-                    wave_uniform_i64(fx.ptrtoint(fx.get_iter(C))),
-                    num_records_bytes=slab_bytes,
-                )
-            ]
+        # Where C goes. The fused output is anchored to this rank's registered
+        # recv slot, which SDMA reads independently of the caller's C view;
+        # everywhere else the store goes through C.
+        if const_expr(fuse):
+            own_slot = create_buffer_resource_from_addr(
+                wave_uniform_i64(w_pre.lsa_ptr(rank, my_recv_slot)),
+                num_records_bytes=slab_bytes,
+            )
         else:
-            rsrcs = None
+            own_slot = None
         store_c = AgStoreC(
             C,
             c_m * split_k,
@@ -877,7 +834,7 @@ def compile_bf16_gemm_ag(
             N_TILES_A,
             N_TILES_B,
             out_dtype=out_dtype,
-            peer_rsrcs=rsrcs,
+            peer_rsrc=own_slot,
             peer_uncached=peer_uncached,
         )
 
@@ -1015,21 +972,7 @@ def compile_bf16_gemm_ag(
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
         # ---- producer publication and the all-gather epilogue ----
-        if const_expr(not fuse and peer_uncached):
-            # Complete the sc0|sc1 stores, then explicitly release C at
-            # system scope before the next kernel signals peers. The CCO
-            # fence with leaderOnly=1 orders only thread 0's writes; every
-            # lane here is a producer. A consumer fence cannot replace this.
-            wait_barrier(0)
-            raw_cco.cco_system_fence(fx.Int32(0))
-        elif const_expr(fuse and direct_lsa):
-            # Publish the peer stores from the blocks that made them. The
-            # barrier kernel that follows is one block, hence one XCD's L2 out
-            # of eight; the other seven would keep their peer-homed lines dirty
-            # and the barrier's system-scope atomic would overtake them.
-            wait_barrier(0)
-            raw_cco.cco_system_fence(fx.Int32(1 if direct_fence == "leader" else 0))
-        elif const_expr(fuse):
+        if const_expr(fuse):
             # Retire this block's stores into its own recv slot, then publish
             # them for the copy engine to read.
             wait_barrier(0)

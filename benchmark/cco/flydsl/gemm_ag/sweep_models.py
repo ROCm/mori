@@ -83,15 +83,12 @@ MS = [512, 1024, 2048, 4096]
 SHAPES = {f"{name}@M{m}": dict(m=m, **cfg) for m in MS for name, cfg in MODELS.items()}
 
 # split-rccl is the baseline the fusion is claimed against -- the collective a
-# model would actually call. gemm-only sizes the ceiling. The rest are the
-# transports, each in its split and fused form, which is the comparison the
-# whole operator exists to make.
+# model would actually call. gemm-only sizes the ceiling. The rest are the SDMA
+# transport in its split and fused form, which is the comparison the whole
+# operator exists to make.
 CONFIGS = [
     ("gemm-only", []),
     ("split-rccl", []),
-    ("split-lsa-push", []),
-    ("split-lsa-pull", []),
-    ("fused-lsa", []),
     ("split-sdma", []),
     ("fused-sdma", ["--chunks", "4"]),
 ]

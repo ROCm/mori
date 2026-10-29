@@ -21,18 +21,10 @@
 # SOFTWARE.
 """Sweep gemm+all_gather's knobs at one shape.
 
-``sweep_models.py`` asks "which transport, across shapes"; this asks "which
-setting of one transport, at one shape". The two questions this one exists for
-are the ones all-gather raises and the other two collectives do not:
-
-* **push or pull.** A broadcast can be driven from either end. The split pair
-  differs in nothing else -- same bytes, same barrier, same GEMM -- so the gap
-  between them is the direction and only the direction. ``gemm_ar``'s own
-  gather leg found pull worth 5.6-10.5% over an SDMA push, and pull is also
-  where a future low-precision wire would put its dequantize.
-* **how much chunking costs.** Chunked pushing is what the fused path buys with
-  its bookkeeping, so the ``--chunks`` ladder prices both halves of that trade
-  at once.
+``sweep_models.py`` asks "how the paths compare, across shapes"; this asks
+"which setting of the SDMA path, at one shape" -- chiefly **how much chunking
+costs**. Chunked pushing is what the fused path buys with its bookkeeping, so
+the ``--chunks`` ladder prices both halves of that trade at once.
 
 One process per cell: a mori window and its SDMA queues are per-process, and a
 stale counter set from one configuration electing on another's leftovers is a
@@ -157,29 +149,6 @@ def main():
         ("gemm-only", []),
         ("gemm-to-window", []),
         ("split-rccl", []),
-        # Direction, at the copy kernel's own defaults. One variable.
-        ("split-lsa-push", []),
-        ("split-lsa-pull", []),
-        # Does the push loop's latency actually need hiding? unroll=1 is the
-        # shape gemm_a2a's copy kernel has, where world independent loads
-        # supplied the parallelism; a broadcast push has one load, so this
-        # prices what replacing that costs.
-        ("split-lsa-push", ["--push-unroll", "1"]),
-        ("split-lsa-push", ["--push-unroll", "8"]),
-        # sc0|sc1 versus letting the fabric-crossing access sit in L2.
-        ("split-lsa-push", ["--no-lsa-uncached"]),
-        ("split-lsa-pull", ["--no-lsa-uncached"]),
-        # Grid for the copy kernel. LSA_BLOCK_CAP is inherited from an
-        # all-reduce's access pattern and has never been measured on this one.
-        ("split-lsa-pull", ["--copy-blocks", "8"]),
-        ("split-lsa-pull", ["--copy-blocks", "48"]),
-        # The fused LSA epilogue, and its two publication knobs.
-        ("fused-lsa", []),
-        ("fused-lsa", ["--peer-uncached"]),
-        ("fused-lsa", ["--direct-fence", "all"]),
-        # What the epilogue's bookkeeping costs with nothing transferred. The
-        # answer is only interesting next to the line above it.
-        ("fused-lsa", ["--no-put"]),
         # SDMA, split and fused, with the chunk ladder.
         ("split-sdma", []),
         ("split-sdma", ["--split-gemm", "epilogue"]),
