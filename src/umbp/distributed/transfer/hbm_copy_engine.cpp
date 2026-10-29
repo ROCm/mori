@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -78,6 +79,12 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 // ---------------------------------------------------------------------------
 
 constexpr size_t kGatherFragmentThreshold = 128ULL << 10;
+
+// Staging each prewarmed stream starts with.  A long prefix read across every
+// layer reaches 8192 fragments; a bigger batch regrows its stream's staging.
+constexpr size_t kPrewarmGatherFragments = 8192;
+// Large enough that hipMemcpy uses a copy engine rather than a CPU write.
+constexpr size_t kPrewarmCopyBytes = 4ULL << 20;
 
 // Mirrors device_gather.hip's kVectorBytes.  Used ONLY to report, in debug
 // mode, whether a segment would take the kernel's uint4 fast path or fall to
@@ -271,8 +278,10 @@ void LogPlanGeometry(const char* path, size_t plan_index, const TransferPlan& pl
 // ~6.4 MiB of device memory for its kernarg pool.  Kept per thread, they leaked
 // until the GPU was full and stream creation failed (which HIP 7.2 turns into a
 // segfault).  A device's pool grows only to its peak number of concurrent
-// gathers.  Never destroyed: worker threads can still be copying during static
-// teardown.
+// gathers, or, once a cap is set, to the cap: past it a gather waits for a
+// stream instead of creating one, because creating one allocates device
+// memory, and with the GPU full that can stall for seconds.  Never destroyed:
+// worker threads can still be copying during static teardown.
 class GatherStreamPool {
  public:
   static GatherStreamPool& Instance() {
@@ -280,21 +289,31 @@ class GatherStreamPool {
     return *pool;
   }
 
+  // Streams per device; 0, the default, means no cap.
+  void SetCap(size_t cap) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cap_ = cap;
+  }
+
   // The current device must already be `device_id`.  nullptr if no stream is
   // free and a new one cannot be created.
   hipStream_t Acquire(int device_id) {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto& idle = idle_[device_id];
-      if (!idle.empty()) {
-        hipStream_t stream = idle.back();
-        idle.pop_back();
+      std::unique_lock<std::mutex> lock(mutex_);
+      Device& device = devices_[device_id];
+      device.returned.wait(lock,
+                           [&] { return !device.idle.empty() || cap_ == 0 || device.live < cap_; });
+      if (!device.idle.empty()) {
+        hipStream_t stream = device.idle.back();
+        device.idle.pop_back();
         return stream;
       }
+      ++device.live;
     }
     hipStream_t stream = nullptr;
     if (hipStreamCreateWithFlags(&stream, hipStreamNonBlocking) != hipSuccess) {
       (void)hipGetLastError();
+      Discard(device_id);
       return nullptr;
     }
     created_.fetch_add(1, std::memory_order_relaxed);
@@ -303,14 +322,30 @@ class GatherStreamPool {
 
   void Release(int device_id, hipStream_t stream) {
     std::lock_guard<std::mutex> lock(mutex_);
-    idle_[device_id].push_back(stream);
+    Device& device = devices_[device_id];
+    device.idle.push_back(stream);
+    device.returned.notify_one();
+  }
+
+  // For an acquired stream that will not be released.
+  void Discard(int device_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Device& device = devices_[device_id];
+    --device.live;
+    device.returned.notify_one();
   }
 
   uint64_t Created() const { return created_.load(std::memory_order_relaxed); }
 
  private:
+  struct Device {
+    std::vector<hipStream_t> idle;
+    size_t live = 0;  // created and not discarded
+    std::condition_variable returned;
+  };
   std::mutex mutex_;
-  std::map<int, std::vector<hipStream_t>> idle_;
+  std::map<int, Device> devices_;
+  size_t cap_ = 0;
   std::atomic<uint64_t> created_{0};
 };
 
@@ -428,6 +463,61 @@ void* HbmCopyEngine::HostRegionDeviceAddress(const void* ptr, size_t size, int d
 }
 
 uint64_t HbmCopyEngine::GatherStreamsCreated() { return GatherStreamPool::Instance().Created(); }
+
+void HbmCopyEngine::Prewarm(size_t gather_streams_per_device) {
+  if (gather_streams_per_device == 0) return;
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess) {
+    (void)hipGetLastError();
+    return;
+  }
+  // The null stream is warmed either way: with the kernel off, every copy
+  // takes the hipMemcpy fallback.
+  const bool gather = !GatherDisabled().load(std::memory_order_relaxed) && DeviceGatherEnabled();
+  int previous_device = 0;
+  (void)hipGetDevice(&previous_device);
+  if (gather) GatherStreamPool::Instance().SetCap(gather_streams_per_device);
+  size_t warmed = 0;
+  for (int device_id = 0; device_id < devices; ++device_id) {
+    if (hipSetDevice(device_id) != hipSuccess) {
+      (void)hipGetLastError();
+      continue;
+    }
+    // All of a device's streams are held until the null stream's copies are
+    // done, so that each upload and each of those copies is given a copy engine
+    // of its own: with the pool capped, these are the engines a copy can ever
+    // be given, and their queues are the only SDMA queues created.
+    std::vector<hipStream_t> streams;
+    for (size_t i = 0; gather && i < gather_streams_per_device; ++i) {
+      hipStream_t stream = GatherStreamPool::Instance().Acquire(device_id);
+      if (stream == nullptr) break;
+      streams.push_back(stream);
+      (void)PrewarmDeviceGather(device_id, stream, kPrewarmGatherFragments);
+    }
+    void* host_bytes = nullptr;
+    void* device_bytes = nullptr;
+    if (hipHostMalloc(&host_bytes, kPrewarmCopyBytes, hipHostMallocDefault) == hipSuccess &&
+        hipMalloc(&device_bytes, kPrewarmCopyBytes) == hipSuccess) {
+      // The hipMemcpy fallback runs on the null stream.
+      (void)hipMemcpy(device_bytes, host_bytes, kPrewarmCopyBytes, hipMemcpyHostToDevice);
+      (void)hipMemcpy(host_bytes, device_bytes, kPrewarmCopyBytes, hipMemcpyDeviceToHost);
+    }
+    for (hipStream_t stream : streams) {
+      if (hipStreamSynchronize(stream) == hipSuccess) {
+        GatherStreamPool::Instance().Release(device_id, stream);
+        ++warmed;
+      } else {
+        (void)hipGetLastError();
+        GatherStreamPool::Instance().Discard(device_id);
+      }
+    }
+    if (device_bytes != nullptr) (void)hipFree(device_bytes);
+    if (host_bytes != nullptr) (void)hipHostFree(host_bytes);
+    (void)hipGetLastError();
+  }
+  (void)hipSetDevice(previous_device);
+  MORI_UMBP_INFO("[HbmCopyEngine] prewarmed {} gather streams on {} devices", warmed, devices);
+}
 
 // Run the gather kernel over every eligible segment in the batch, and report
 // which plans it completed.
@@ -610,6 +700,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       // later, and every caller still has the fallback.  The stream is dropped
       // rather than returned to the pool.
       (void)hipGetLastError();
+      GatherStreamPool::Instance().Discard(device_id);
       GatherDisabled().store(true, std::memory_order_relaxed);
       MORI_UMBP_ERROR("[HbmCopyEngine] gather sync dev={} failed: {}", device_id,
                       hipGetErrorString(sync));

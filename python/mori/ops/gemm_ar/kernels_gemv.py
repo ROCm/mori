@@ -209,6 +209,7 @@ def compile_mxfp8_gemv(
     rows: int = 16,
     tokens: int = 32,
     ksplit: bool = True,
+    valid_tokens: int = 0,
 ):
     """A skinny mxfp8 matmul: ``out[M, N] = X[M, K] @ W[N, K].T``, M <= ``m_max``.
 
@@ -229,8 +230,10 @@ def compile_mxfp8_gemv(
         raise ValueError(f"rows/tokens must be 16 or 32, got {rows}/{tokens}")
     if tokens < m_max:
         raise ValueError(f"tokens={tokens} cannot cover m_max={m_max}")
-    if waves not in (4, 8, 16):
-        raise ValueError(f"waves must be 4, 8 or 16, got {waves}")
+    if waves not in (4, 5, 8, 10, 16):
+        raise ValueError(f"unsupported waves={waves}")
+    if valid_tokens and not (0 < valid_tokens <= tokens and ksplit):
+        raise ValueError("valid_tokens requires ksplit and must fit tokens")
 
     AT = rows // TILE
     BT = tokens // TILE
@@ -248,12 +251,13 @@ def compile_mxfp8_gemv(
     #: Output columns one workgroup covers.
     WG_ROWS = rows if ksplit else rows * waves
     RED_WAVES = waves if ksplit else 1
-    RED_FLOATS = RED_WAVES * AT * BT * TILE * TILE
+    RED_TOKENS = valid_tokens or tokens
+    RED_SLOTS = rows * RED_TOKENS
+    RED_FLOATS = RED_WAVES * RED_SLOTS
     BLOCK = waves * 64
-
     _kname = (
         f"mori_mxfp8_gemv_n{n}k{k}_w{waves}s{steps}r{rows}t{tokens}"
-        f"{'_ks' if ksplit else ''}"
+        f"{'_ks' if ksplit else ''}{f'_valid{valid_tokens}' if valid_tokens else ''}"
     )
 
     @fx.struct
@@ -405,9 +409,24 @@ def compile_mxfp8_gemv(
                             + (g * fx.Int32(4) + fx.Int32(r)) * fx.Int32(TILE)
                             + lane_row
                         )
-                        fx.ptr_store(
-                            vec[r].ir_value(), fx.add_offset(lds.red.ptr, slot)
-                        )
+                        if const_expr(valid_tokens > 0):
+                            token = lane_row + fx.Int32(b * TILE)
+                            compact_slot = (
+                                wave * fx.Int32(RED_SLOTS)
+                                + token * fx.Int32(rows)
+                                + fx.Int32(t * TILE)
+                                + g * fx.Int32(4)
+                                + fx.Int32(r)
+                            )
+                            if token < fx.Int32(RED_TOKENS):
+                                fx.ptr_store(
+                                    vec[r].ir_value(),
+                                    fx.add_offset(lds.red.ptr, compact_slot),
+                                )
+                        else:
+                            fx.ptr_store(
+                                vec[r].ir_value(), fx.add_offset(lds.red.ptr, slot)
+                            )
             fx.barrier()
             # A fixed wave order, so repeated calls sum identically and a row
             # stays batch-invariant.
@@ -416,7 +435,7 @@ def compile_mxfp8_gemv(
             # the LDS index and drop the surplus threads at the store. Without
             # the clamp they read past `red` and write a live output element
             # with whatever came back.
-            slots = AT * BT * 256
+            slots = RED_SLOTS
             per_thread = ceildiv(slots, BLOCK)
             for e in range_constexpr(per_thread):
                 flat = fx.thread_idx.x + fx.Int32(e * BLOCK)
@@ -429,15 +448,23 @@ def compile_mxfp8_gemv(
                     )
                     v = fx.Float32(v) if not hasattr(v, "to") else v
                     total = v if total is None else total + v
-                tb = flat // fx.Int32(256)
-                t_i = tb // fx.Int32(BT)
-                b_i = tb % fx.Int32(BT)
-                i = (flat % fx.Int32(256)) // fx.Int32(TILE)
-                j = flat % fx.Int32(TILE)
-                col = arith.select(
-                    in_lds, (tile + t_i) * fx.Int32(TILE) + i, fx.Int32(0x7FFFFFF0)
-                )
-                tok = j + b_i * fx.Int32(TILE)
+                if const_expr(valid_tokens > 0):
+                    tok = flat // fx.Int32(rows)
+                    col = arith.select(
+                        in_lds,
+                        tile * fx.Int32(TILE) + flat % fx.Int32(rows),
+                        fx.Int32(0x7FFFFFF0),
+                    )
+                else:
+                    tb = flat // fx.Int32(256)
+                    t_i = tb // fx.Int32(BT)
+                    b_i = tb % fx.Int32(BT)
+                    i = (flat % fx.Int32(256)) // fx.Int32(TILE)
+                    j = flat % fx.Int32(TILE)
+                    col = arith.select(
+                        in_lds, (tile + t_i) * fx.Int32(TILE) + i, fx.Int32(0x7FFFFFF0)
+                    )
+                    tok = j + b_i * fx.Int32(TILE)
                 store(total.to(fx.BFloat16), tok, col)
         else:
             for t in range_constexpr(AT):

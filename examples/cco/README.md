@@ -21,6 +21,7 @@ examples/cco/
 | `python/07_flydsl_sdma` | py | FlyDSL SDMA put/get over the copy engine |
 | `python/08_torch_symm_import` | py | import a `torch.symm_mem` tensor into the flat LSA space, no copy |
 | `python/09_torch_symm_lsa_all2all` | py | mori's own torch symm-mem backend + Triton `lsa_ptr` all-to-all |
+| `python/10_flydsl_sdma_allgather_async` | py | FlyDSL SDMA all-gather split into `start_async` / `wait_async`, overlapped with a GEMM |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -49,13 +50,13 @@ Then install the two extra runtime deps the examples need (not pulled in by
 `pip install .`):
 
 ```bash
-pip install mpi4py "flydsl==0.2.2"
+pip install mpi4py "flydsl==0.4.0"
 ```
 
 - `mpi4py` — every example bootstraps the cco `UniqueId` over MPI.
-- `flydsl==0.2.2` — required by the Python **FlyDSL** examples (03–06). Pinned to
-  the FlyDSL ABI the device bitcode targets. (Also available as the optional
-  extra `pip install amd_mori[flydsl]`.) Not needed for `01`, `02`, or the C++
+- `flydsl` — required by the Python **FlyDSL** examples (03–08). 0.4.0 is what CI
+  and aiter use; 0.2.x and 0.3.x work too. (Also available as the optional extra
+  `pip install amd_mori[flydsl]`.) Not needed for `01`, `02`, `09`, or the C++
   examples.
 
 After `pip install .` you do **not** need `PYTHONPATH` / `LD_LIBRARY_PATH` /
@@ -80,6 +81,13 @@ export MORI_CCO_GDA_CONN=full          # required for GDA on a single node (03/0
 mpirun --allow-run-as-root -n 2 python3 examples/cco/python/01_barrier/main.py
 mpirun --allow-run-as-root -n 2 python3 examples/cco/python/03_flydsl_put/main.py
 # ... 02, 04, 05, 06 likewise
+```
+
+Example 10 bootstraps with `torchrun` instead of MPI and needs SDMA:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/10_flydsl_sdma_allgather_async/main.py
 ```
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one

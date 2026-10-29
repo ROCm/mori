@@ -199,6 +199,12 @@ struct ResolvedEntry {
 
   // kLocal only: the published bytes stay put while any copy of this lives.
   std::shared_ptr<const void> hold;
+
+  // Nonzero covered_size: `pages` tile only object bytes [covered_offset,
+  // covered_offset + covered_size), so readers subtract covered_offset first.
+  // `size` stays the object's.  In-process only; not carried on the wire.
+  uint64_t covered_offset = 0;
+  uint64_t covered_size = 0;
 };
 
 inline ResolveOutcome EffectiveResolveOutcome(const ResolvedEntry& entry) {
@@ -358,9 +364,13 @@ class MediumBackend : public MetricSource {
   // serve a remote reader, and callers that only test `found`, leave it off.
   // Every declaration of this method repeats the same default deliberately --
   // a default argument on a virtual binds statically, so they must not drift.
+  //
+  // `extents` (parallel to `keys`, or null): what each in-process reader will
+  // touch.  A medium may then publish only that window (covered_offset/size).
   virtual std::vector<ResolvedEntry> BatchResolve(
       const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
-      ResolveReader reader = ResolveReader::kRemote) = 0;
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) = 0;
 
   // Acquire a peer-local migration pin and resolve the key without changing or
   // cancelling normal RPC read leases. The caller must release a successful

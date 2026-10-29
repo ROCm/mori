@@ -188,4 +188,30 @@ bool LaunchDeviceGather(const DeviceGatherFragment* fragments, size_t count, int
   return true;
 }
 
+bool PrewarmDeviceGather(int device_id, hipStream_t stream, size_t capacity) {
+  DescriptorStaging* staging = StagingFor(stream, device_id, capacity);
+  if (staging == nullptr) return false;
+
+  const size_t bytes = staging->capacity * sizeof(DeviceGatherFragment);
+  std::memset(staging->host, 0, bytes);
+  hipError_t status =
+      hipMemcpyAsync(staging->device, staging->host, bytes, hipMemcpyHostToDevice, stream);
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DeviceGather] prewarm descriptor upload failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    (void)hipGetLastError();
+    return false;
+  }
+  // One zero-byte fragment: loads the kernel on this device, copies nothing.
+  hipLaunchKernelGGL(GatherFragmentsKernel, dim3(1), dim3(kThreadsPerBlock), 0, stream,
+                     staging->device, 1u);
+  status = hipGetLastError();
+  if (status != hipSuccess) {
+    MORI_UMBP_ERROR("[DeviceGather] prewarm kernel launch failed on device {}: {}", device_id,
+                    hipGetErrorString(status));
+    return false;
+  }
+  return true;
+}
+
 }  // namespace mori::umbp

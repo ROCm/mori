@@ -56,6 +56,8 @@ from mori.cco.device.ops import (
     CoopScope,
     SignalOp,
     ThreadMode,
+    sdma_flags,
+    sdma_signals,
 )
 
 from . import _bindings as raw
@@ -314,38 +316,14 @@ class Gda:
 class Sdma:
     dev_comm: fx.Int64
 
-    def _xfer(
-        self,
-        op,
-        peer,
-        dst_win,
-        dst_off,
-        src_win,
-        src_off,
-        nbytes,
-        qid,
-        coop,
-        signal,
-        aggregate,
-    ):
-        # coop/signal are compile-time. "_ns" (no-signal) only drops the trailing
-        # ATOMIC; quiet()/quietQueue() drain the queue's read pointer and work on
-        # it either way (cco.hpp:1707). aggregate skips the doorbell — call commit().
-        tag = _COOP_TAG[_const(coop, "coop")]
-        if not signal:
-            tag += "_ns"
-        flags = 1 if aggregate else 0
-        raw.SDMA_XFER[f"{op}__{tag}"](
-            self.dev_comm,
-            peer,
-            _win(dst_win),
-            dst_off,
-            _win(src_win),
-            src_off,
-            nbytes,
-            qid,
-            flags,
-        )
+    # put / get / put_ptr / get_ptr mirror ccoSdma's, and their keywords its
+    # template arguments: coop, local_signal, remote_signal, aggregate,
+    # signal_per_copy, same_queue -- all compile-time constants. A signal is a
+    # trailing ATOMIC bumping signal_slot(<sender lsa rank>, qid): ours for
+    # local_signal, the peer's for remote_signal. Completion is quiet() /
+    # quiet_queue() either way; aggregate skips the doorbell (call commit()).
+    # put / get also take `signal`, the older name of local_signal; a call that
+    # names no signal keeps their old default, a local one.
 
     def put(
         self,
@@ -358,21 +336,27 @@ class Sdma:
         qid,
         *,
         coop=CoopScope.THREAD,
-        signal=True,
+        signal=None,
+        local_signal=None,
+        remote_signal=None,
         aggregate=False,
+        signal_per_copy=False,
+        same_queue=False,
     ):
-        self._xfer(
-            "put",
+        """Local ``src_win[src_off:]`` -> ``peer``'s ``dst_win[dst_off:]``."""
+        local_signal, remote_signal = sdma_signals(signal, local_signal, remote_signal)
+        self.put_ptr(
             peer,
-            dst_win,
-            dst_off,
-            src_win,
-            src_off,
+            raw.cco_lsa_ptr(_win(dst_win), peer, dst_off),
+            raw.cco_local_ptr(_win(src_win), src_off),
             nbytes,
             qid,
-            coop,
-            signal,
-            aggregate,
+            coop=coop,
+            local_signal=local_signal,
+            remote_signal=remote_signal,
+            aggregate=aggregate,
+            signal_per_copy=signal_per_copy,
+            same_queue=same_queue,
         )
 
     def get(
@@ -386,17 +370,226 @@ class Sdma:
         qid,
         *,
         coop=CoopScope.THREAD,
+        signal=None,
+        local_signal=None,
+        remote_signal=None,
+        aggregate=False,
+        signal_per_copy=False,
+        same_queue=False,
+    ):
+        """``peer``'s ``src_win[src_off:]`` -> local ``dst_win[dst_off:]``."""
+        local_signal, remote_signal = sdma_signals(signal, local_signal, remote_signal)
+        self.get_ptr(
+            peer,
+            raw.cco_local_ptr(_win(dst_win), dst_off),
+            raw.cco_lsa_ptr(_win(src_win), peer, src_off),
+            nbytes,
+            qid,
+            coop=coop,
+            local_signal=local_signal,
+            remote_signal=remote_signal,
+            aggregate=aggregate,
+            signal_per_copy=signal_per_copy,
+            same_queue=same_queue,
+        )
+
+    def put_ptr(
+        self,
+        peer,
+        dst_ptr,
+        src_ptr,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        local_signal=False,
+        remote_signal=False,
+        aggregate=False,
+        signal_per_copy=False,
+        same_queue=False,
+    ):
+        """put() on resolved addresses: ``dst_ptr`` is ``peer``'s memory as mapped
+        here (``Window.lsa_ptr``), ``src_ptr`` ours. Neither is checked."""
+        self._ptr(
+            raw.SDMA_PUT_PTR,
+            peer,
+            dst_ptr,
+            src_ptr,
+            nbytes,
+            qid,
+            coop,
+            local_signal,
+            remote_signal,
+            aggregate,
+            signal_per_copy,
+            same_queue,
+        )
+
+    def get_ptr(
+        self,
+        peer,
+        dst_ptr,
+        src_ptr,
+        nbytes,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        local_signal=False,
+        remote_signal=False,
+        aggregate=False,
+        signal_per_copy=False,
+        same_queue=False,
+    ):
+        """get() on resolved addresses: ``dst_ptr`` ours, ``src_ptr`` ``peer``'s
+        memory as mapped here. Neither is checked."""
+        self._ptr(
+            raw.SDMA_GET_PTR,
+            peer,
+            dst_ptr,
+            src_ptr,
+            nbytes,
+            qid,
+            coop,
+            local_signal,
+            remote_signal,
+            aggregate,
+            signal_per_copy,
+            same_queue,
+        )
+
+    def _ptr(
+        self,
+        table,
+        peer,
+        dst_ptr,
+        src_ptr,
+        nbytes,
+        qid,
+        coop,
+        local_signal,
+        remote_signal,
+        aggregate,
+        signal_per_copy,
+        same_queue,
+    ):
+        coop = _const(coop, "coop")
+        flags = sdma_flags(
+            coop,
+            local_signal=_const(local_signal, "local_signal"),
+            remote_signal=_const(remote_signal, "remote_signal"),
+            aggregate=_const(aggregate, "aggregate"),
+            signal_per_copy=_const(signal_per_copy, "signal_per_copy"),
+            same_queue=_const(same_queue, "same_queue"),
+        )
+        table[_COOP_TAG[coop]](
+            self.dev_comm, peer, dst_ptr, src_ptr, nbytes, qid, flags
+        )
+
+    def _xfer2d(
+        self,
+        op,
+        peer,
+        dst_win,
+        dst_off,
+        dst_pitch,
+        src_win,
+        src_off,
+        src_pitch,
+        width_bytes,
+        height,
+        qid,
+        coop,
+        signal,
+        aggregate,
+    ):
+        tag = _COOP_TAG[_const(coop, "coop")]
+        if not signal:
+            tag += "_ns"
+        flags = 1 if aggregate else 0
+        raw.SDMA_XFER2D[f"{op}2d__{tag}"](
+            self.dev_comm,
+            peer,
+            _win(dst_win),
+            dst_off,
+            dst_pitch,
+            _win(src_win),
+            src_off,
+            src_pitch,
+            width_bytes,
+            height,
+            qid,
+            flags,
+        )
+
+    def put2d(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        dst_pitch,
+        src_win,
+        src_off,
+        src_pitch,
+        width_bytes,
+        height,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
         signal=True,
         aggregate=False,
     ):
-        self._xfer(
+        """One rectangle, ``height`` rows of ``width_bytes``, in a single packet.
+
+        Offsets locate the rectangle's first byte, pitches are the two buffers'
+        row strides in bytes. At THREAD coop, lanes targeting the same
+        (peer, qid) go out as one batch with one signal.
+        """
+        self._xfer2d(
+            "put",
+            peer,
+            dst_win,
+            dst_off,
+            dst_pitch,
+            src_win,
+            src_off,
+            src_pitch,
+            width_bytes,
+            height,
+            qid,
+            coop,
+            signal,
+            aggregate,
+        )
+
+    def get2d(
+        self,
+        peer,
+        dst_win,
+        dst_off,
+        dst_pitch,
+        src_win,
+        src_off,
+        src_pitch,
+        width_bytes,
+        height,
+        qid,
+        *,
+        coop=CoopScope.THREAD,
+        signal=True,
+        aggregate=False,
+    ):
+        """Peer -> local counterpart of :meth:`put2d`."""
+        self._xfer2d(
             "get",
             peer,
             dst_win,
             dst_off,
+            dst_pitch,
             src_win,
             src_off,
-            nbytes,
+            src_pitch,
+            width_bytes,
+            height,
             qid,
             coop,
             signal,
@@ -414,6 +607,18 @@ class Sdma:
     def quiet_queue(self, peer, qid):
         """Wait on a single (peer, queueId) queue only."""
         raw.cco_sdma_quiet_queue(self.dev_comm, peer, qid)
+
+    def wait_signal(self, src_lsa_rank, qid, expected):
+        """Spin until signal_slot(src_lsa_rank, qid) reaches ``expected`` (a
+        running total the caller keeps; the counter is never reset)."""
+        raw.cco_sdma_wait_signal(self.dev_comm, src_lsa_rank, qid, expected)
+
+    def signal_slot(self, src_lsa_rank, qid):
+        """Address of our uint64 counter that ``src_lsa_rank``'s signalling
+        puts/gets on ``qid`` increment; 0 when out of range. The SDMA engine
+        writes it: poll it with a system-scope atomic load, acquire if you then
+        read the data it covers."""
+        return raw.cco_sdma_signal_slot(self.dev_comm, src_lsa_rank, qid)
 
 
 @cco_struct

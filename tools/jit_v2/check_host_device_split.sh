@@ -66,7 +66,7 @@ done
 # literal is fine -- that is the renderer emitting the include for the DEVICE TU,
 # which is exactly how it is supposed to get there.
 DEVICE_ONLY_HEADERS=("ep_intranode_kernel.hpp" "ep_intranode_1250x.hpp"
-                     "ep_internode_kernel.hpp")
+                     "ep_internode_kernel.hpp" "ep_asyncll_kernel.hpp")
 pattern=$(printf '|%s' "${DEVICE_ONLY_HEADERS[@]}")
 pattern=${pattern:1}
 # Only HOST sources are candidates -- a device header may include another one

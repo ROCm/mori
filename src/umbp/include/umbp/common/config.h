@@ -57,12 +57,17 @@ enum class UMBPDurabilityMode : int {
   Relaxed = 1,
 };
 
+// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) translates only
+// the first 2^18 page entries of a memory region and silently aliases the rest,
+// which with 2 MiB pages is 512 GiB.  On 4 KiB pages the safe value is 1 GiB.
+inline constexpr uint64_t kDefaultDramMaxMrBytes = 512ULL << 30;
+
 struct UMBPDramConfig {
   size_t capacity_bytes = 4ULL * 1024 * 1024 * 1024;
   bool use_shared_memory = false;
   std::string shm_name = "/umbp_dram";
-  double high_watermark = 0.9;
-  double low_watermark = 0.7;
+  double high_watermark = 0.95;
+  double low_watermark = 0.9;
 
   // Host memory options (ignored when use_shared_memory=true).
   bool use_hugepages = false;
@@ -71,6 +76,9 @@ struct UMBPDramConfig {
   bool prefault = true;
   bool numa_strict = false;
   int prefault_threads = 0;  // 0 = automatic (up to 16), 1 = serial.
+  // Largest piece of a host buffer registered with the NIC as one memory
+  // region; a bigger buffer is registered in pieces.  0 = no limit.
+  size_t max_mr_bytes = kDefaultDramMaxMrBytes;
 };
 
 struct UMBPIoConfig {
@@ -336,6 +344,12 @@ struct UMBPDistributedConfig {
   // stops paying for an arena it does not use.
   size_t ranged_scratch_size = 0;
 
+  // Back both ranged scratch arenas with hugetlbfs pages.  Each arena is one
+  // NIC memory region, so hugepages cut its translation entries, which NICs
+  // cap per region.  Falls back to 4 KiB pages when no hugetlb pages are free.
+  bool ranged_scratch_use_hugepages = false;
+  size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.
   int ssd_staging_buffer_slots = 0;
@@ -408,6 +422,11 @@ struct UMBPDistributedConfig {
   // Maximum block size (bytes) eligible for local re-cache under SIZE policy.
   // 0 means unlimited (no size gate). Default 16 MB.
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
+
+  // DRAM held by BatchPrefetch copies of local SSD-resident keys; past it the
+  // oldest copies are dropped. Pulls from peers are ordinary residents. 0 turns
+  // prefetch off.
+  size_t prefetch_budget_bytes = 16ULL << 30;
 
   // Page size used by Master's PageBitmapAllocator for this node's medium.
   // Reported via RegisterClient.  Forwarded to PoolClientConfig::dram_page_size
@@ -685,6 +704,7 @@ struct UMBPConfig {
     cfg.dram.use_hugepages =
         getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
     cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
+    cfg.dram.max_mr_bytes = getenv_size("UMBP_DRAM_MAX_MR_BYTES", cfg.dram.max_mr_bytes);
     // Blank counts as unset, like -1: launch scripts often export VAR=${X:-}.
     if (const char* nodes = std::getenv("UMBP_DRAM_NUMA_NODE");
         nodes != nullptr && std::string(nodes).find_first_not_of(" \t\r\n") != std::string::npos) {

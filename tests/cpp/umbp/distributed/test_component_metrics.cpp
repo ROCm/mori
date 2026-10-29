@@ -233,10 +233,11 @@ class ScriptedResolveBackend : public MockBackend {
 
   std::map<std::string, ResolveOutcome> outcomes;
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override {
-    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
+    auto out = MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     for (size_t i = 0; i < keys.size() && i < out.size(); ++i) {
       auto it = outcomes.find(keys[i]);
       if (it == outcomes.end()) continue;
@@ -320,6 +321,15 @@ TEST_F(InstrumentedBackendMetrics, MetricsAreGenericOverBackends) {
 
   EXPECT_DOUBLE_EQ(Ops("evict", "ok"), 1.0);
   EXPECT_DOUBLE_EQ(Bytes("evict"), 2048.0);
+}
+
+TEST_F(InstrumentedBackendMetrics, RangedResolveCountsTheSliceNotTheObject) {
+  PutKey("k", 8192);
+  const std::vector<ObjectExtent> slices = {{1024, 512}};
+  backend_->BatchResolve({"k"}, false, false, ResolveReader::kLocal, &slices);
+  backend_->BatchResolve({"k"}, false);
+  Publish();
+  EXPECT_DOUBLE_EQ(Bytes("resolve"), 512.0 + 8192.0);
 }
 
 TEST_F(InstrumentedBackendMetrics, LabelsCarryTheMediumSoOnePanelShowsThemAll) {

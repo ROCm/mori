@@ -67,6 +67,51 @@ Dispatch and combine kernels for MoE expert parallelism.
 
 See :doc:`MORI-EP Guide <../MORI-EP-GUIDE>` for full API reference.
 
+AsyncLL v2 SDMA overlap
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The HIP backend of ``mori.ops.dispatch_combine_v2`` supports
+``async_ll=True, async_ll_transport="sdma"``. Run independent computation
+between ``dispatch_send()`` and ``dispatch_recv()``, and between
+``combine_send()`` and ``combine_recv()``. Receive data and counts are ready
+after the corresponding receive phase completes on the stream.
+
+On a single gfx1250 node, the send phase now posts each payload followed by
+its ready notification on the same SDMA queue. The receive phase still waits
+for outgoing copies before the source buffers can be reused. Zero-token peers
+also exchange notifications. The redundant dispatch receive-count reset is
+omitted because the receive copy writes the total, including zero.
+
+These options are read once when an op is constructed:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Environment variable
+     - Default and effect
+   * - ``MORI_ASYNCLL_EARLY_NOTIFY``
+     - ``1`` on single-node gfx1250 SDMA; ``0`` elsewhere. Posts notifications
+       in the send phase. Other architectures can opt in with ``1``.
+   * - ``MORI_ASYNCLL_SKIP_RESET``
+     - No longer has an effect. It skipped the host-side ``total_recv`` reset
+       before each dispatch; that reset has been removed for every kernel
+       family (the dispatch kernels now produce the count themselves), and
+       AsyncLL's receive copy always assigned it. Still accepted, so existing
+       settings do not fail.
+   * - ``MORI_ASYNCLL_FUSED_RECV``
+     - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
+       per CTA waits, then an acquire and CTA barrier release the copy waves.
+
+All three variables accept ``0`` or ``1``. Skipping the reset or fusing receive
+requires early notification. Set all three to ``0`` for the legacy sequence.
+LSA and multi-node ops retain their existing protocol and ignore these SDMA
+options. The resolved notification mode is part of every native Plan's
+configuration and generated source, so different ops can coexist without
+changing the protocol of an already constructed Plan.
+
+The default targets single-node gfx1250 overlap. Receive fusion remains opt-in
+because its additional benefit depends on the token count and compute window.
+
 MORI Shmem (Symmetric Memory)
 -------------------------------
 

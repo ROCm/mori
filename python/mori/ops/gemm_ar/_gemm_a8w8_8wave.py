@@ -132,11 +132,33 @@ def pack_i32x4_i32x8(lo, hi):
 
 
 def wait_barrier(count):
+    """``s_waitcnt vmcnt(count)`` then ``s_barrier``.
+
+    The VM wait constrains only the requests *this* wave issued; the barrier is
+    the workgroup rendezvous. A bare ``s_barrier`` is neither -- it drains
+    nothing, so it cannot stand in for a completion wait.
+    """
     _llvm.inline_asm(
         res=None,
         operands_=[],
         asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
         constraints="",
+        has_side_effects=True,
+    )
+
+
+def read_done_barrier():
+    """``s_waitcnt lgkmcnt(0)`` then ``s_barrier``: LDS reads done before refill.
+
+    LDS reads retire under LGKM, which the VM waits in this pipeline say nothing
+    about. The memory clobber keeps the compiler from sinking a DS read past
+    the barrier.
+    """
+    _llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="s_waitcnt lgkmcnt(0)\ns_barrier",
+        constraints="~{memory}",
         has_side_effects=True,
     )
 

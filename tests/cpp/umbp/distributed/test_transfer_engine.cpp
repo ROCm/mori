@@ -348,6 +348,64 @@ TEST(HbmCopyEngine, GatherStreamsOutliveTheirThreads) {
   (void)hipFree(device);
 }
 
+TEST(HbmCopyEngine, GathersRunOnPrewarmedStreams) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) GTEST_SKIP() << "no GPU";
+  if (!DeviceGatherEnabled()) GTEST_SKIP() << "gather kernel disabled";
+
+  constexpr size_t kBytes = 1 << 20;
+  constexpr size_t kFragment = 4096;
+  constexpr size_t kPrewarmed = 3;
+  AlignedBuffer host(kBytes);
+  for (size_t i = 0; i < kBytes; ++i) host.data()[i] = static_cast<char>(i * 37 + 3);
+  HbmCopyEngine engine;
+  engine.AddHostGatherRegion(host.data(), host.size());
+  void* device = nullptr;
+  ASSERT_EQ(hipMalloc(&device, kBytes), hipSuccess);
+  ASSERT_EQ(hipMemset(device, 0, kBytes), hipSuccess);
+  const auto src = TransferRef::HostBytes(host.data(), host.size());
+  const auto dst = TransferRef::HostBytes(device, kBytes, mori::io::MemoryLocationType::GPU, 0);
+
+  const uint64_t streams_before = HbmCopyEngine::GatherStreamsCreated();
+  HbmCopyEngine::Prewarm(kPrewarmed);
+  const uint64_t streams_prewarmed = HbmCopyEngine::GatherStreamsCreated();
+  EXPECT_LE(streams_prewarmed - streams_before, kPrewarmed * devices);
+
+  // Twice as many gathers in flight on device 0 as were prewarmed there: the
+  // extra ones wait for a stream rather than create one.
+  constexpr size_t kGathers = 2 * kPrewarmed;
+  const uint64_t launches_before = DeviceGatherLaunchCount();
+  std::vector<std::thread> threads;
+  for (size_t t = 0; t < kGathers; ++t) {
+    threads.emplace_back([&, t] {
+      const uint64_t first = t * 2 * kFragment;
+      const uint64_t second = kBytes / 2 + first;
+      auto planned = engine.Plan({MakeItem(src, first, dst, first, kFragment, 1),
+                                  MakeItem(src, second, dst, second, kFragment, 2)});
+      std::vector<TransferFailure> failures;
+      if (auto handle = engine.Submit(std::move(planned.plans))) handle->Wait(&failures);
+      EXPECT_TRUE(failures.empty());
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  if (DeviceGatherLaunchCount() == launches_before) {
+    (void)hipFree(device);
+    GTEST_SKIP() << "host region not gatherable on this device";
+  }
+  EXPECT_EQ(DeviceGatherLaunchCount(), launches_before + kGathers);
+  EXPECT_EQ(HbmCopyEngine::GatherStreamsCreated(), streams_prewarmed);
+
+  std::vector<char> copied(kBytes);
+  ASSERT_EQ(hipMemcpy(copied.data(), device, kBytes, hipMemcpyDeviceToHost), hipSuccess);
+  for (size_t t = 0; t < kGathers; ++t) {
+    for (const size_t offset : {t * 2 * kFragment, kBytes / 2 + t * 2 * kFragment}) {
+      EXPECT_EQ(std::memcmp(copied.data() + offset, host.data() + offset, kFragment), 0)
+          << "thread " << t << " offset " << offset;
+    }
+  }
+  (void)hipFree(device);
+}
+
 // ---------------------------------------------------------------------------
 //  MoriIoEngine (planning only: the engine is never Init()ed)
 // ---------------------------------------------------------------------------

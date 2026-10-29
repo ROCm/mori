@@ -160,6 +160,7 @@ void RegisterMoriUmbp(py::module_& m) {
           "Deprecated: use numa_nodes. Setting this property replaces the node list.")
       .def_readwrite("numa_strict", &UMBPDramConfig::numa_strict)
       .def_readwrite("prefault_threads", &UMBPDramConfig::prefault_threads)
+      .def_readwrite("max_mr_bytes", &UMBPDramConfig::max_mr_bytes)
       .def_readwrite("prefault", &UMBPDramConfig::prefault);
 
   py::class_<UMBPIoConfig>(m, "UMBPIoConfig")
@@ -262,6 +263,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
+      .def_readwrite("ranged_scratch_use_hugepages",
+                     &UMBPDistributedConfig::ranged_scratch_use_hugepages)
+      .def_readwrite("ranged_scratch_hugepage_size",
+                     &UMBPDistributedConfig::ranged_scratch_hugepage_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("ssd_staging_use_hugepages", &UMBPDistributedConfig::ssd_staging_use_hugepages)
       .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
@@ -329,6 +334,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_prefetch", &IUMBPClient::BatchPrefetch, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())

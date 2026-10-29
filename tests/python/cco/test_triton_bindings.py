@@ -50,12 +50,48 @@ def invalid_constexpr_axis_kernel(
         cco.Gda.get(dev_comm, 0, window, 0, window, 0, 8, thread_mode=99)
     elif axis == 2:
         cco.Gda.signal(dev_comm, 0, signal_op=99)
-    else:
+    elif axis == 3:
         cco.Sdma.quiet(dev_comm, 0, coop=-1)
+    else:
+        cco.Sdma.put_ptr(
+            dev_comm, 0, window, window, 8, coop=cco.CoopScope.WARP, same_queue=True
+        )
+
+
+@triton.jit
+def sdma_constant_flags_kernel(dev_comm, dst, src):
+    cco.Sdma.put_ptr(dev_comm, 1, dst, src, 4096, 0, remote_signal=True)
+
+
+@triton.jit
+def sdma_runtime_flags_kernel(dev_comm, dst, src, flags):
+    cco.sdma_put_ptr_thread(dev_comm, 1, dst, src, 4096, 0, flags)
+
+
+def test_sdma_constant_flags_fold_to_one_instantiation():
+    # The handles pass SdmaFlags as a constant so the wrapper's dispatch over
+    # every instantiation compiles away; a runtime `flags` keeps all of them.
+    if not _sdma_enabled():
+        pytest.skip("MORI was not built with BUILD_CCO_SDMA=ON")
+
+    def instructions(kernel, *args):
+        compiled = kernel.warmup(
+            *args, grid=(1,), extern_libs=cco.get_extern_libs(), num_warps=1
+        )
+        return sum(
+            1
+            for line in compiled.asm["amdgcn"].splitlines()
+            if line.startswith("\t") and not line.lstrip().startswith((".", ";"))
+        )
+
+    handle = (1 << 40) + 3
+    constant = instructions(sdma_constant_flags_kernel, handle, handle, handle)
+    runtime = instructions(sdma_runtime_flags_kernel, handle, handle, handle, 12345)
+    assert constant * 4 < runtime, (constant, runtime)
 
 
 def test_all_cco_device_symbols_are_exported_to_triton():
-    assert len(CCO_DEVICE_FUNCTIONS) == 70
+    assert len(CCO_DEVICE_FUNCTIONS) == 92
     assert set(CCO_DEVICE_FUNCTIONS).issubset(cco.__all__)
     for name in CCO_DEVICE_FUNCTIONS:
         assert callable(getattr(cco, name))
@@ -76,7 +112,17 @@ def test_triton_facades_match_flydsl_handle_names():
         "flush",
         "flush_peer",
     } <= set(vars(cco.Gda))
-    assert {"put", "get", "commit", "quiet", "quiet_queue"} <= set(vars(cco.Sdma))
+    assert {
+        "put",
+        "get",
+        "commit",
+        "quiet",
+        "quiet_queue",
+        "put_ptr",
+        "get_ptr",
+        "wait_signal",
+        "signal_slot",
+    } <= set(vars(cco.Sdma))
 
 
 @pytest.mark.parametrize(
@@ -86,6 +132,7 @@ def test_triton_facades_match_flydsl_handle_names():
         (1, "GDA thread_mode must be"),
         (2, "GDA signal requires"),
         (3, "SDMA coop must be"),
+        (4, "SDMA same_queue requires"),
     ],
 )
 def test_triton_facades_reject_invalid_constexpr_axes(axis, error):
@@ -126,9 +173,15 @@ def test_cov5_bitcode_contains_every_enabled_wrapper_symbol():
         if _sdma_enabled() or not meta["family"].startswith("sdma_")
     }
     assert expected <= defined
+    # And the other way: a wrapper nobody registered is unreachable from
+    # FlyDSL and Triton, so it must not ship silently.
+    unregistered = {symbol for symbol in defined if symbol.startswith("cco_")} - {
+        meta["symbol"] for meta in CCO_DEVICE_FUNCTIONS.values()
+    }
+    assert unregistered == set(), f"not in CCO_DEVICE_FUNCTIONS: {sorted(unregistered)}"
 
 
-def test_cov5_bitcode_return_types_match_the_declared_abi():
+def test_cov5_bitcode_signatures_match_the_declared_abi():
     bitcode = find_cco_bitcode(cov=5)
     cfg = detect_build_config()
     llvm_dis = Path(cfg.opt).with_name("llvm-dis")
@@ -142,15 +195,20 @@ def test_cov5_bitcode_return_types_match_the_declared_abi():
         text=True,
     )
     pattern = re.compile(
-        r"^\s*define\b.*?\b(?P<ret>void|i\d+)\s+" r"@(?P<symbol>[A-Za-z0-9_.$-]+)\("
+        r"^\s*define\b[^@]*?\b(?P<ret>void|i\d+)\s+"
+        r"@(?P<symbol>[A-Za-z0-9_.$-]+)\((?P<args>[^)]*)\)"
     )
     definitions = {
-        match.group("symbol"): match.group("ret")
+        match.group("symbol"): (
+            match.group("ret"),
+            [arg.split()[0] for arg in match.group("args").split(",") if arg.strip()],
+        )
         for line in result.stdout.splitlines()
         if (match := pattern.match(line))
     }
+    llvm_type = {"int32": "i32", "uint64": "i64"}
     expected = {
-        symbol: "i32" if meta["ret"] == "int32" else "i64"
+        symbol: (llvm_type[meta["ret"]], [llvm_type[arg] for arg in meta["args"]])
         for symbol, (_, meta) in CCO_DEVICE_FUNCTIONS_BY_SYMBOL.items()
         if _sdma_enabled() or not meta["family"].startswith("sdma_")
     }
@@ -167,29 +225,7 @@ def test_flydsl_and_triton_share_the_same_scalar_abi():
     pytest.importorskip("flydsl")
     from mori.cco.device.flydsl import _bindings
 
-    externs = [
-        *_bindings.PUT.values(),
-        *_bindings.PUT_VALUE.values(),
-        *_bindings.GET.values(),
-        *_bindings.SIGNAL.values(),
-        *_bindings.WAIT_SIGNAL.values(),
-        *_bindings.FLUSH.values(),
-        *_bindings.FLUSH_PEER.values(),
-        *_bindings.SDMA_XFER.values(),
-        *_bindings.SDMA_QUIET.values(),
-        *_bindings.SDMA_COMMIT.values(),
-        _bindings.cco_sdma_quiet_queue,
-        _bindings.cco_lsa_ptr,
-        _bindings.cco_lsa_win_base,
-        _bindings.cco_lsa_stride,
-        _bindings.cco_system_fence,
-        _bindings.cco_devcomm_rank,
-        _bindings.cco_devcomm_world_size,
-        _bindings.cco_devcomm_lsa_rank,
-        _bindings.cco_devcomm_lsa_size,
-        _bindings.cco_gda_read_signal,
-        _bindings.cco_gda_reset_signal,
-    ]
+    externs = list(_bindings.ALL.values())
     by_symbol = {extern._symbol: extern for extern in externs}
     assert set(by_symbol) == {meta["symbol"] for meta in CCO_DEVICE_FUNCTIONS.values()}
     for meta in CCO_DEVICE_FUNCTIONS.values():

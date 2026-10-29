@@ -26,6 +26,8 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
 | Triton extern wrappers | `python/mori/ir/triton/cco/ops.py` |
 | OO API (`DevComm/Window/Gda`) + enums (`CoopScope/SignalOp/ThreadMode`) | `python/mori/cco/device/flydsl/handles.py` |
 | `_ffi` factory + `cco_struct` (handle keeps methods across `if`/`for`) | `flydsl/_internal.py` |
+| Buffer load/store with a cache policy that holds on every FlyDSL version | `flydsl/buffer.py` |
+| u32 signal-slot accessors (peer flags, rank-private epochs) | `flydsl/signals.py` |
 | How the `.bc` is located at runtime | `python/mori/cco/device/bitcode.py` (`find_cco_bitcode`) |
 | How the `.bc` is built (JIT, per arch+NIC+cov) | `bitcode.py::_jit_compile` (reuses `mori.jit`) |
 | How to prebuild the `.bc` manually | `tools/build_cco_bitcode.sh` |
@@ -65,6 +67,13 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   (`buffer_load`/`buffer_store`); cco does NOT move the data. See examples 04/05.
 - **GDA** (RDMA): opaque network ops, so they ARE exposed as device ops —
   `gda.put / put_value / get / signal / wait_signal / flush`. See examples 03/06.
+- **SDMA** (intra-node copy engine): `sdma.put / get` (window + offset) and
+  `put_ptr / get_ptr` (resolved addresses) mirror `ccoSdma`'s, with its template
+  arguments as compile-time keywords (`coop`, `local_signal`, `remote_signal`,
+  `aggregate` + `commit`, `signal_per_copy`, `same_queue`). A signal bumps
+  `signal_slot(<sender lsa rank>, qid)` -- ours for `local_signal`, the peer's
+  for `remote_signal` -- which `wait_signal` polls; `quiet / quiet_queue` drain
+  regardless. See example 07.
 
 ## Build & run
 
@@ -73,7 +82,7 @@ then install MORI and the example runtime deps:
 
 ```bash
 pip install .                          # builds + co-locates all libmori_*.so
-pip install mpi4py "flydsl==0.2.2"     # mpi4py: bootstrap; flydsl: the device bindings
+pip install mpi4py "flydsl==0.4.0"     # mpi4py: bootstrap; flydsl: the device bindings
 ```
 
 After `pip install .` no `PYTHONPATH` / `LD_LIBRARY_PATH` / `MORI_CCO_BC` is
@@ -113,18 +122,30 @@ torchrun --standalone --nproc_per_node=2 \
 
 ## Adding a new device op (the path)
 
-1. Add the `extern "C"` wrapper in `cco_device_wrapper.cpp`. For a templated op,
-   define it with the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros so every valid
-   combination is monomorphized into a tagged symbol (no runtime dispatch). JIT
-   re-compiles automatically — the cache key includes the wrapper source hash.
-2. Add the scalar signature once to `CCO_DEVICE_FUNCTIONS` in `ops.py`.
-   Triton exports it automatically; `_bindings.py` builds FlyDSL FFI objects
-   from the same entry.
-3. Expose it as a FlyDSL method on `DevComm` / `Window` / `Gda` in `handles.py`, picking
-   the symbol from the compile-time `coop`/`thread_mode`/`signal_op` constants.
+1. Add the `extern "C"` wrapper in `cco_device_wrapper.cpp`, as a call to the
+   public device API (`ccoGda` / `ccoSdma` / ...), not its internals. Template
+   axes cross the scalar FFI one of two ways, both with no runtime cost:
+   - a tag in the symbol name (`cco_<op>__<tag>`), one symbol per value: the GDA
+     ops via the `CCO_TC_LIST` / `CCO_COOP_LIST` X-macros, the SDMA coop scope;
+   - a `flags` argument the wrapper dispatches on (`SdmaWithFlags` for
+     `cco_sdma_{put,get}_ptr__<coop>`). The wrapper is inlined, so a
+     compile-time constant `flags` folds to one instantiation; the Python
+     handles always pass one. Prefer this for an axis with many combinations.
+   SDMA wrappers go inside `#if BUILD_CCO_SDMA`. JIT re-compiles automatically —
+   the cache key includes the wrapper source and the cco headers.
+2. Add the scalar signature once to `CCO_DEVICE_FUNCTIONS` in `ops.py`. Give an
+   SDMA op a `family` starting with `sdma_`: the bitcode tests use it to skip
+   the op when BUILD_CCO_SDMA is off (the `#if` above is what drops the symbol).
+   Triton exports the entry and FlyDSL binds it (`_bindings.ALL`) automatically.
+3. Expose it as a method in both `flydsl/handles.py` and
+   `mori/ir/triton/cco/handles.py`, with the keywords of the C++ template
+   arguments, and add the method name to
+   `test_triton_facades_match_flydsl_handle_names`.
 
-`tests/python/cco/test_triton_bindings.py` verifies metadata, FlyDSL FFI, and
-the symbols defined in the cov5 bitcode remain synchronized.
+`tests/python/cco/test_triton_bindings.py` checks that the cov5 bitcode defines
+exactly the registered symbols (no more, no fewer) with the registered argument
+and return types, and that FlyDSL binds the same set. It does not check step 3
+beyond the method names.
 
 ## Examples
 

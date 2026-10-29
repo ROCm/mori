@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "umbp/distributed/range_map.h"
@@ -198,6 +199,37 @@ TEST(RangeMapTest, EmitRefusalAbortsTheWalk) {
                                            });
   EXPECT_FALSE(ok);
   EXPECT_EQ(calls, 2u);
+}
+
+// A staged window (design-ssd-ranged-io.md D1): ranges inside it are rebased
+// onto its start and walk its pages; any other range is refused, untouched.
+TEST(RangeMapTest, RangeInsideTheWindowIsRebasedToTheWindowStart) {
+  size_t offset = 12288 + 100;
+  ASSERT_TRUE(
+      RebaseRangeOntoWindow(/*window_offset=*/12288, /*window_size=*/2 * kPage, &offset, 500));
+  EXPECT_EQ(offset, 100u);
+  bool ok = false;
+  const auto frags = Collect(PageRun(2, /*first_page=*/7), kPage, 2 * kPage, offset, 500, &ok);
+  EXPECT_TRUE(ok);
+  ASSERT_EQ(frags.size(), 1u);
+  EXPECT_EQ(frags[0], (Fragment{0, 7 * kPage + 100, 500, 0}));
+
+  size_t exact = 8192;  // a range filling the window exactly
+  ASSERT_TRUE(RebaseRangeOntoWindow(8192, 3 * kPage, &exact, 3 * kPage));
+  EXPECT_EQ(exact, 0u);
+}
+
+TEST(RangeMapTest, RangeOutsideTheWindowIsRejectedAndLeftUntouched) {
+  const uint64_t lo = 4 * kPage;
+  const uint64_t size = 2 * kPage;
+  // Before, past the end, wholly after, and straddling the start.
+  const std::vector<std::pair<size_t, size_t>> ranges = {
+      {lo - 1, 10}, {lo + size - 9, 10}, {lo + size + kPage, 1}, {lo - 100, 200}};
+  for (const auto& [offset, length] : ranges) {
+    size_t moved = offset;
+    EXPECT_FALSE(RebaseRangeOntoWindow(lo, size, &moved, length)) << offset;
+    EXPECT_EQ(moved, offset) << "a refused range must not be half-rebased";
+  }
 }
 
 }  // namespace

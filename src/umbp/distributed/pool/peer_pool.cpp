@@ -279,6 +279,14 @@ void PeerPool::FinishTransitionLocked(const TransitionJob& job,
                                       const TierTransitionResult& result) {
   migrating_keys_.erase(job.key);
   if (migrating_keys_.empty()) transition_idle_cv_.notify_all();
+  // Before the outcome: a failed move may still have read and written.
+  auto* source = backends_ == nullptr ? nullptr : backends_->Get(job.source_backend_id);
+  if (source != nullptr && result.bytes_read != 0) {
+    transition_metrics_.read_bytes[TierTypeName(source->Tier())] += result.bytes_read;
+  }
+  for (const auto& [tier, bytes] : result.bytes_written) {
+    transition_metrics_.write_bytes[TierTypeName(tier)] += bytes;
+  }
   if (!result.success) {
     ++transition_metrics_.failed;
     if (job.kind == TierTransitionKind::kPromotion) ++transition_metrics_.promote_failed;
@@ -357,6 +365,99 @@ void PeerPool::PromoteForRead(const std::vector<std::string>& keys,
     FinishTransitionLocked(jobs[j], results[j]);
     if (results[j].success) (*preferred)[at[j]] = results[j].target_backend_id;
   }
+}
+
+// A copy, not a promotion: it only has to outlive the read it was made for, so
+// the budget can drop it without demoting anything.
+size_t PeerPool::Prefetch(const std::vector<std::string>& keys, uint64_t budget_bytes) {
+  if (budget_bytes == 0 || keys.empty()) return 0;
+  size_t copied = 0;
+  std::vector<PrefetchedCopy> victims;
+  {
+    std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+    std::vector<TransitionJob> jobs;
+    std::vector<std::vector<uint32_t>> targets;
+    {
+      std::lock_guard<std::mutex> lock(operation_mutex_);
+      if (tier_graph_ == nullptr || backends_ == nullptr) return 0;
+      for (const auto& key : keys) {
+        const auto placement = placements_.find(key);
+        if (placement == placements_.end()) continue;
+        const uint32_t source_id = placement->second;
+        auto* source = backends_->Get(source_id);
+        const auto tier = tier_graph_->TierIndexForBackendId(source_id);
+        if (source == nullptr || source->Tier() != TierType::SSD || !tier.has_value()) continue;
+        // DRAM in the key's own tier first (weighted), then in the tiers above it.
+        auto order = tier_graph_->WeightedMemberOrder(*tier, key);
+        const auto upper = tier_graph_->PromoteTargetOrder(*tier, key);
+        order.insert(order.end(), upper.begin(), upper.end());
+        std::vector<uint32_t> dram;
+        for (uint32_t id : order) {
+          auto* member = backends_->Get(id);
+          if (member != nullptr && member->Tier() == TierType::DRAM) dram.push_back(id);
+        }
+        if (dram.empty() || !migrating_keys_.insert(key).second) continue;
+        ++transition_metrics_.attempted;
+        jobs.push_back(TransitionJob{TierTransitionKind::kPromotion, key, source_id, *tier});
+        targets.push_back(std::move(dram));
+      }
+    }
+    if (jobs.empty()) return 0;
+
+    // Several at once, so one request's keys keep every drive busy.
+    constexpr int kPrefetchThreads = 8;
+    std::vector<TierTransitionResult> results(jobs.size());
+    ParallelFor(jobs.size(), kPrefetchThreads, [&](size_t j) {
+      results[j] = transition_executor_.Execute(jobs[j].key, jobs[j].source_backend_id, targets[j],
+                                                /*remove_source=*/false);
+    });
+
+    std::lock_guard<std::mutex> lock(operation_mutex_);
+    for (size_t j = 0; j < jobs.size(); ++j) {
+      FinishTransitionLocked(jobs[j], results[j]);
+      if (!results[j].success) continue;
+      ++copied;
+      prefetched_.push_back(PrefetchedCopy{jobs[j].key, results[j].target_backend_id,
+                                           jobs[j].source_backend_id, results[j].bytes_moved});
+      prefetched_bytes_ += results[j].bytes_moved;
+    }
+    while (prefetched_bytes_ > budget_bytes && !prefetched_.empty()) {
+      PrefetchedCopy oldest = std::move(prefetched_.front());
+      prefetched_.pop_front();
+      prefetched_bytes_ -= std::min(prefetched_bytes_, oldest.bytes);
+      // Never the key's last copy.
+      auto* source = backends_->Get(oldest.source_id);
+      if (source == nullptr || !source->Contains(oldest.key)) continue;
+      // Back on the source, so a tier with offload_to drops the copy instead of demoting it.
+      auto placement = placements_.find(oldest.key);
+      if (placement != placements_.end() && placement->second == oldest.copy_id) {
+        placement->second = oldest.source_id;
+      }
+      victims.push_back(std::move(oldest));
+    }
+  }
+  if (victims.empty()) return copied;
+  // Evict takes the lifecycle lock itself.
+  std::vector<PoolEvictRequest> requests;
+  requests.reserve(victims.size());
+  for (const auto& victim : victims) {
+    requests.push_back(PoolEvictRequest{victim.key, TierType::UNKNOWN, victim.copy_id});
+  }
+  const auto results = Evict(requests, PoolEvictMode::kReclaim);
+  // A copy still being read frees nothing: keep counting it, oldest first.
+  std::lock_guard<std::mutex> lock(operation_mutex_);
+  for (size_t i = victims.size(); i-- > 0;) {
+    if (i < results.size() && results[i].outcome == PoolEvictOutcome::kFreed) continue;
+    auto* copy = backends_->Get(victims[i].copy_id);
+    if (copy == nullptr || !copy->Contains(victims[i].key)) continue;
+    auto placement = placements_.find(victims[i].key);
+    if (placement != placements_.end() && placement->second == victims[i].source_id) {
+      placement->second = victims[i].copy_id;
+    }
+    prefetched_bytes_ += victims[i].bytes;
+    prefetched_.push_front(std::move(victims[i]));
+  }
+  return copied;
 }
 
 TierTransitionResult PeerPool::RunTransition(std::unique_lock<std::mutex>& lock,
@@ -580,7 +681,9 @@ std::vector<PoolAllocateResult> PeerPool::BatchAllocate(
 
 std::vector<PoolCommitResult> PeerPool::BatchCommit(
     const std::vector<PoolCommitRequest>& requests) {
-  std::lock_guard<std::mutex> operation_lock(operation_mutex_);
+  // Backend commits run without operation_mutex_; this keeps ClearLocal out meanwhile.
+  std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+  std::unique_lock<std::mutex> operation_lock(operation_mutex_);
   std::vector<PoolCommitResult> out(requests.size());
   if (backends_ == nullptr) return out;
 
@@ -614,38 +717,48 @@ std::vector<PoolCommitResult> PeerPool::BatchCommit(
       release_pending(requests[i].slot);
       continue;
     }
+    // Claimed: a second commit of this slot finds nothing, and the key stays
+    // reserved so racing puts see it in flight. No expiry: a hung commit pins it.
     accepted_slots.insert(slot_key);
+    pending_slots_.erase(slot);
+    pending->second.expires_at = std::chrono::steady_clock::time_point::max();
     by_backend[requests[i].slot.backend_id].push_back(i);
   }
 
+  // Unlocked: an SSD commit is the device write, and every lookup and read
+  // needs this lock.
+  operation_lock.unlock();
+  std::map<uint32_t, std::vector<CommitResult>> results;
   for (const auto& [backend_id, indices] : by_backend) {
     auto* backend = backends_->Get(backend_id);
-    if (backend == nullptr) {
-      for (size_t index : indices) release_pending(requests[index].slot);
-      continue;
-    }
-
+    if (backend == nullptr) continue;
     std::vector<CommitRequest> backend_requests;
     backend_requests.reserve(indices.size());
     for (size_t index : indices) {
       backend_requests.push_back(
           CommitRequest{requests[index].slot.local_slot_id, requests[index].key});
     }
+    results[backend_id] = backend->BatchCommit(backend_requests);
+  }
+  operation_lock.lock();
 
-    auto results = backend->BatchCommit(backend_requests);
+  for (const auto& [backend_id, indices] : by_backend) {
+    const auto& backend_results = results[backend_id];
     for (size_t i = 0; i < indices.size(); ++i) {
-      const size_t index = indices[i];
-      if (i >= results.size()) {
-        release_pending(requests[index].slot);
-        continue;
+      const PoolCommitRequest& request = requests[indices[i]];
+      if (i < backend_results.size()) {
+        out[indices[i]].backend_id = backend_id;
+        out[indices[i]].commit = backend_results[i];
+        if (backend_results[i].success) {
+          placements_[request.key] = backend_id;
+          TouchLocked(request.key);
+        }
       }
-      out[index].backend_id = backend_id;
-      out[index].commit = results[i];
-      if (results[i].success) {
-        placements_[requests[index].key] = backend_id;
-        TouchLocked(requests[index].key);
+      auto pending = pending_keys_.find(request.key);
+      if (pending != pending_keys_.end() && pending->second.backend_id == backend_id &&
+          pending->second.local_slot_id == request.slot.local_slot_id) {
+        pending_keys_.erase(pending);
       }
-      release_pending(requests[index].slot);
     }
   }
   MaybeEnqueueWatermarkOffloadLocked();
@@ -694,7 +807,9 @@ std::vector<bool> PeerPool::BatchAbort(const std::vector<PoolSlotRef>& slots) {
 
 std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::string>& keys,
                                                       bool include_descs, bool allow_file_refs,
-                                                      ResolveReader reader) {
+                                                      ResolveReader reader,
+                                                      const std::vector<ObjectExtent>* extents) {
+  if (extents != nullptr && extents->size() != keys.size()) extents = nullptr;
   // A remote reader discards a response holding any kBusy key; a local one
   // reads its hits and comes back for the busy keys.
   const bool busy_discards = reader == ResolveReader::kRemote;
@@ -733,7 +848,8 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     }
   }
   if (direct_backend != nullptr) {
-    auto resolved = direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader);
+    auto resolved =
+        direct_backend->BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
     bool batch_busy = false;
     bool all_found = resolved.size() == keys.size();
     std::vector<bool> failed_but_owned(keys.size(), false);
@@ -792,13 +908,18 @@ std::vector<PoolResolvedEntry> PeerPool::BatchResolve(const std::vector<std::str
     bool identity = indices.size() == keys.size();
     for (size_t i = 0; identity && i < indices.size(); ++i) identity = indices[i] == i;
     std::vector<std::string> backend_keys;
+    std::vector<ObjectExtent> backend_extents;
     if (!identity) backend_keys.reserve(indices.size());
+    if (!identity && extents != nullptr) backend_extents.reserve(indices.size());
     for (size_t index : indices) {
       attempted[index] |= static_cast<uint16_t>(1u << backend_id);
       if (!identity) backend_keys.push_back(keys[index]);
+      if (!identity && extents != nullptr) backend_extents.push_back((*extents)[index]);
     }
+    const std::vector<ObjectExtent>* sub_extents =
+        extents == nullptr ? nullptr : (identity ? extents : &backend_extents);
     auto results = backend->BatchResolve(identity ? keys : backend_keys, include_descs,
-                                         allow_file_refs, reader);
+                                         allow_file_refs, reader, sub_extents);
     for (size_t i = 0; i < indices.size() && i < results.size(); ++i) {
       const size_t index = indices[i];
       const ResolveOutcome outcome = EffectiveResolveOutcome(results[i]);
@@ -1405,6 +1526,8 @@ void PeerPool::ClearLocal() {
   last_access_.clear();
   access_order_.clear();
   promote_hit_counts_.clear();
+  prefetched_.clear();
+  prefetched_bytes_ = 0;
   ++clear_epoch_;
 }
 

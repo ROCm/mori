@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -211,10 +212,13 @@ class BusyResolveBackend final : public MockBackend {
  public:
   explicit BusyResolveBackend(TierType tier) : MockBackend(tier) {}
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override {
-    if (!busy_) return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
+    if (!busy_) {
+      return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
+    }
     std::vector<ResolvedEntry> results(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
       if (Contains(keys[i])) results[i].outcome = ResolveOutcome::kBusy;
@@ -275,9 +279,10 @@ class BlockingResolveBackend final : public MockBackend {
  public:
   explicit BlockingResolveBackend(TierType tier) : MockBackend(tier) {}
 
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override {
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       entered_ = true;
@@ -287,7 +292,7 @@ class BlockingResolveBackend final : public MockBackend {
       std::unique_lock<std::mutex> lock(mutex_);
       cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
     }
-    return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader);
+    return MockBackend::BatchResolve(keys, include_descs, allow_file_refs, reader, extents);
   }
 
   bool WaitUntilEntered() {
@@ -300,6 +305,39 @@ class BlockingResolveBackend final : public MockBackend {
       std::lock_guard<std::mutex> lock(mutex_);
       released_ = true;
     }
+    cv_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool entered_ = false;
+  bool released_ = false;
+};
+
+// Parks one backend commit, the step where an SSD medium writes the device.
+class BlockingCommitBackend final : public MockBackend {
+ public:
+  explicit BlockingCommitBackend(TierType tier) : MockBackend(tier) {}
+
+  std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& entries) override {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      entered_ = true;
+      cv_.notify_all();
+      cv_.wait_for(lock, std::chrono::seconds(5), [this] { return released_; });
+    }
+    return MockBackend::BatchCommit(entries);
+  }
+
+  bool WaitUntilEntered() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, std::chrono::seconds(5), [this] { return entered_; });
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
     cv_.notify_all();
   }
 
@@ -1026,6 +1064,40 @@ TEST(PeerPool, SlowResolveDoesNotBlockUnrelatedPreferredBackend) {
   EXPECT_EQ(slow_resolve.get().size(), 1u);
 }
 
+TEST(PeerPool, SlowCommitDoesNotBlockLookupsOrReads) {
+  BackendRegistry registry;
+  auto slow = std::make_unique<BlockingCommitBackend>(TierType::DRAM);
+  auto* blocking = slow.get();
+  ASSERT_TRUE(registry.Register("slow", std::move(slow)));
+  ASSERT_TRUE(registry.Register("fast", std::make_unique<MockBackend>(TierType::DRAM)));
+  PeerPool pool(&registry, MakeSingleBackendPolicy());
+  CommitKey(&pool, "fast-key", "fast");
+
+  auto allocation = pool.BatchAllocate({PutRequest("slow-key", "slow")}).front();
+  ASSERT_EQ(allocation.allocation.outcome, AllocateOutcome::kSuccessAllocated);
+  auto commit = std::async(std::launch::async, [&] {
+    return pool.BatchCommit(
+        {PoolCommitRequest{{allocation.backend_id, allocation.allocation.slot_id}, "slow-key"}});
+  });
+  ASSERT_TRUE(blocking->WaitUntilEntered());
+
+  auto lookups = std::async(std::launch::async, [&] {
+    return std::make_tuple(pool.BatchContains({"fast-key"}), pool.BatchResolve({"fast-key"}, false),
+                           pool.BatchAllocate({PutRequest("slow-key", "slow")}).front());
+  });
+  const auto status = lookups.wait_for(std::chrono::seconds(2));
+  blocking->Release();
+
+  EXPECT_EQ(status, std::future_status::ready);
+  const auto [contains, resolved, second_put] = lookups.get();
+  EXPECT_TRUE(contains.front());
+  EXPECT_TRUE(resolved.front().resolved.found);
+  EXPECT_TRUE(second_put.in_flight);  // the committing key stays reserved
+  EXPECT_TRUE(commit.get().front().commit.success);
+  EXPECT_EQ(pool.PlacementBackend("slow-key"),
+            std::optional<uint32_t>{registry.BackendId(registry.Get("slow"))});
+}
+
 TEST(PeerPool, ResolveMissDoesNotEraseConcurrentCommit) {
   BackendRegistry registry;
   auto slow = std::make_unique<BlockingResolveBackend>(TierType::SSD);
@@ -1102,6 +1174,11 @@ TEST(PeerPool, ReadPromotesColdKeyWithoutDeletingSource) {
 
   EXPECT_TRUE(WaitForKey(&registry, "hot", "promote"));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));
+  pool.ClearLocal();  // drains the in-flight copy
+  // Only the source is charged the read, not the target's post-write pin.
+  const TierTransitionMetrics moves = pool.TransitionMetrics();
+  EXPECT_EQ(moves.read_bytes, (std::map<std::string, uint64_t>{{"SSD", 64}}));
+  EXPECT_EQ(moves.write_bytes, (std::map<std::string, uint64_t>{{"DRAM", 64}}));
 }
 
 // The on_hits trigger, which is what made promote_trigger a key-value policy
@@ -1210,6 +1287,108 @@ TEST(PeerPool, ReadPromotesAboveHighWatermarkAndServesFromHotTier) {
   ASSERT_TRUE(read.resolved.found);
   EXPECT_EQ(read.backend_id, registry.BackendId(registry.Get("hot")));
   EXPECT_TRUE(registry.Get("cold")->Contains("promote"));  // copy mode keeps the source
+}
+
+TEST(PeerPool, PrefetchCopiesSsdKeysIntoDramWithinBudget) {
+  constexpr uint64_t kPageSize = 64;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  LogicalTierConfig kv;
+  kv.members = {{"dram", 1}, {"ssd", 1}};
+  auto compiled = LogicalTierGraph::Compile({kv}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  const std::optional<uint32_t> dram = registry.BackendId(registry.Get("dram"));
+  const std::optional<uint32_t> ssd = registry.BackendId(registry.Get("ssd"));
+  CommitKey(&pool, "a", "ssd");
+  CommitKey(&pool, "b", "ssd");
+
+  EXPECT_EQ(pool.Prefetch({"a"}, kPageSize), 1u);
+  EXPECT_EQ(pool.PlacementBackend("a"), dram);
+  EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
+  EXPECT_EQ(pool.Prefetch({"a"}, kPageSize), 0u);  // already in DRAM
+
+  // A one-key budget: b's copy pushes a back to its SSD copy.
+  EXPECT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
+  EXPECT_EQ(pool.PlacementBackend("b"), dram);
+  EXPECT_FALSE(registry.Get("dram")->Contains("a"));
+  EXPECT_EQ(pool.PlacementBackend("a"), ssd);
+  EXPECT_TRUE(pool.BatchResolve({"a"}, false).front().resolved.found);
+}
+
+TEST(PeerPool, PrefetchBudgetRetriesACopyThatWasBeingRead) {
+  constexpr uint64_t kPageSize = 64;
+  constexpr auto kLease = std::chrono::milliseconds(300);
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "dram", TierType::DRAM, kPageSize, 4, kLease);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  LogicalTierConfig kv;
+  kv.members = {{"dram", 1}, {"ssd", 1}};
+  auto compiled = LogicalTierGraph::Compile({kv}, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  for (const char* key : {"a", "b", "c"}) CommitKey(&pool, key, "ssd");
+
+  ASSERT_EQ(pool.Prefetch({"a"}, kPageSize), 1u);
+  ASSERT_TRUE(registry.Get("dram")->BatchResolve({"a"}, false).front().found);
+  ASSERT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
+  EXPECT_TRUE(registry.Get("dram")->Contains("a")) << "the lease did not hold the copy";
+  EXPECT_EQ(pool.PlacementBackend("a"), registry.BackendId(registry.Get("dram")));
+
+  std::this_thread::sleep_for(kLease + std::chrono::milliseconds(50));
+  ASSERT_EQ(pool.Prefetch({"c"}, kPageSize), 1u);
+  EXPECT_FALSE(registry.Get("dram")->Contains("a"));
+  EXPECT_TRUE(registry.Get("ssd")->Contains("a"));
+}
+
+TEST(PeerPool, PrefetchCopiesIntoAnUpperTierAndDropsWithoutDemoting) {
+  constexpr uint64_t kPageSize = 64;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "cold", TierType::SSD, kPageSize, 4);
+  auto compiled = LogicalTierGraph::Compile(HotColdTiers(PoolOffloadTrigger::kOnEvict), registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitKey(&pool, "a", "cold");
+  CommitKey(&pool, "b", "cold");
+
+  ASSERT_EQ(pool.Prefetch({"a"}, kPageSize), 1u);
+  EXPECT_EQ(pool.PlacementBackend("a"), registry.BackendId(registry.Get("hot")));
+  EXPECT_TRUE(registry.Get("cold")->Contains("a"));
+
+  // Past the budget a's copy is dropped at once, not queued for demotion.
+  ASSERT_EQ(pool.Prefetch({"b"}, kPageSize), 1u);
+  EXPECT_FALSE(registry.Get("hot")->Contains("a"));
+  EXPECT_EQ(pool.PlacementBackend("a"), registry.BackendId(registry.Get("cold")));
+}
+
+TEST(PeerPool, PrefetchPrefersDramInTheKeysOwnTier) {
+  // A system page, so 'near' really has one page (smaller buffers round up).
+  constexpr uint64_t kPageSize = 4096;
+  LocalCopyEngine engine;
+  BackendRegistry registry;
+  RegisterPageBackend(&registry, &engine, "hot", TierType::DRAM, kPageSize, 4);
+  RegisterPageBackend(&registry, &engine, "near", TierType::DRAM, kPageSize, 1);
+  RegisterPageBackend(&registry, &engine, "ssd", TierType::SSD, kPageSize, 4);
+  auto tiers = HotColdTiers(PoolOffloadTrigger::kOnEvict);
+  tiers[1].members = {{"near", 1}, {"ssd", 1}};
+  auto compiled = LogicalTierGraph::Compile(tiers, registry);
+  ASSERT_TRUE(compiled.ok()) << compiled.error;
+  PeerPool pool(&registry, MakeTieredPlacementPolicy(compiled.graph), &engine);
+  CommitKey(&pool, "a", "ssd");
+  CommitKey(&pool, "b", "ssd");
+
+  ASSERT_EQ(pool.Prefetch({"a", "b"}, 2 * kPageSize), 2u);
+  // One page in 'near', so one of them falls back to the tier above.
+  const auto near = registry.BackendId(registry.Get("near"));
+  const auto hot = registry.BackendId(registry.Get("hot"));
+  const auto a = pool.PlacementBackend("a");
+  const auto b = pool.PlacementBackend("b");
+  EXPECT_TRUE((a == near && b == hot) || (a == hot && b == near));
 }
 
 // ---- Local watermark eviction (frees through Evict(), as above) ----

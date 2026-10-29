@@ -342,8 +342,12 @@ def resolve_schedule(cfg) -> tuple[ScheduleEntry, ...]:
     resolves the tables and overrides, then includes the family crossover in the
     schedule. Loading and selection never depend on the declared token capacity;
     that includes the combine load-first choice, which comes from each bucket's
-    rule (combine_load_first).
+    rule (combine_load_first). AsyncLL is one entry: it compiles a single
+    geometry, and its specs derive every pass's grid themselves.
     """
+    if getattr(cfg, "async_ll", False):
+        spec = KernelConfig("asyncll", cfg.dispatch_block_num, cfg.warp_num_per_block)
+        return (ScheduleEntry(None, spec, spec),)
     if not cfg.is_internode:
         rows = cfg.schedule or (
             (

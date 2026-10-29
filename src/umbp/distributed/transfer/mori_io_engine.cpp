@@ -151,6 +151,10 @@ bool MoriIoEngine::Init() {
   rdma_cfg.qpPerTransfer = 4;
   rdma_cfg.enableTransferChunking = true;
   rdma_cfg.numNicsPerTransfer = 4;
+  // Completion is read from the initiator's own CQ and peers never call
+  // PopInboundTransferStatus, so a notification SEND per transfer would only cost
+  // an SQ slot here, an RQ slot on the peer and a notifPool entry it never frees.
+  rdma_cfg.enableNotification = false;
   // UMBP only sets the config defaults above.  All RDMA knobs (qpPerTransfer /
   // postBatchSize / numWorkerThreads / pollCqMode / chunking / numNics / ...)
   // are overridable via MORI_IO_* env in the RDMA backend ctor, shared by every
