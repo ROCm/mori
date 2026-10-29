@@ -44,6 +44,8 @@ namespace {
 using MemoryLocation = mori::io::MemoryLocationType;
 
 int PathIndex(const TransferRef& src, const TransferRef& dst) {
+  if (src.IsFile()) return dst.loc == MemoryLocation::GPU ? 8 : 6;
+  if (dst.IsFile()) return src.loc == MemoryLocation::GPU ? -1 : 7;
   if (!src.HasHostPtr()) return 4;
   if (!dst.HasHostPtr()) return 5;
   return (src.loc == MemoryLocation::GPU ? 2 : 0) + (dst.loc == MemoryLocation::GPU ? 1 : 0);
@@ -80,11 +82,16 @@ class SimPlanBuilder final : public TransferPlanBuilder {
   SimPlanBuilder(const SimTransferEngine& engine, std::unique_ptr<TransferPlanBuilder> remote)
       : engine_(engine),
         remote_(std::move(remote)),
+        files_(MakeFilePlanBuilder(engine)),
         local_(MakePairPlanBuilder(engine, [](TransferPlan* plan, const TransferItem& item) {
           AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
         })) {}
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
+    if (item.src.IsFile() || item.dst.IsFile()) {
+      files_->Add(item);
+      return;
+    }
     if (!engine_.CanHandle(item.src, item.dst) || !ItemInBounds(item)) {
       rejected_.push_back(item.tag);
       return;
@@ -93,6 +100,10 @@ class SimPlanBuilder final : public TransferPlanBuilder {
   }
   TransferPlanSet Finish() override {
     auto out = local_->Finish();
+    auto files = files_->Finish();
+    for (auto& plan : files.plans) out.plans.push_back(std::move(plan));
+    out.rejected_tags.insert(out.rejected_tags.end(), files.rejected_tags.begin(),
+                             files.rejected_tags.end());
     auto remote = remote_->Finish();
     for (auto& plan : remote.plans) out.plans.push_back(std::move(plan));
     out.rejected_tags.insert(out.rejected_tags.end(), remote.rejected_tags.begin(),
@@ -103,7 +114,7 @@ class SimPlanBuilder final : public TransferPlanBuilder {
 
  private:
   const SimTransferEngine& engine_;
-  std::unique_ptr<TransferPlanBuilder> remote_, local_;
+  std::unique_ptr<TransferPlanBuilder> remote_, files_, local_;
   std::vector<size_t> rejected_;
 };
 
@@ -195,8 +206,9 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
   using Value = google::protobuf::Value;
   const auto& id = Field(profile, "id", Value::kStringValue).string_value();
   const auto& paths = Field(profile, "paths", Value::kStructValue).struct_value();
-  const std::array<std::string, 6> names = {"cpu_cpu", "cpu_gpu",     "gpu_cpu",
-                                            "gpu_gpu", "remote_read", "remote_write"};
+  const std::array<std::string, kModelCount> names = {"cpu_cpu",  "cpu_gpu",     "gpu_cpu",
+                                                      "gpu_gpu",  "remote_read", "remote_write",
+                                                      "file_cpu", "cpu_file",    "file_gpu"};
   if (id.empty() || paths.fields().empty() || profile.fields().size() != 2) {
     throw std::invalid_argument("UMBP sim profile requires id and nonempty paths only");
   }
@@ -243,6 +255,11 @@ bool SimTransferEngine::CanHandle(const TransferRef& src, const TransferRef& dst
     return ref.kind == TransferRef::Kind::Memory && ref.HasHostPtr() &&
            (ref.loc == MemoryLocation::CPU || ref.loc == MemoryLocation::GPU);
   };
+  if (src.kind == TransferRef::Kind::File || dst.kind == TransferRef::Kind::File) {
+    const bool read = src.IsFile() && local(dst);
+    const bool write = dst.IsFile() && local(src) && src.loc == MemoryLocation::CPU;
+    return (read || write) && paths_[PathIndex(src, dst)].has_value();
+  }
   if (local(src) && local(dst)) return paths_[PathIndex(src, dst)].has_value();
   if (local(src) == local(dst)) return false;
   const auto& remote = local(src) ? dst : src;
@@ -262,7 +279,7 @@ bool SimTransferEngine::CanHandle(const TransferRef& src, const TransferRef& dst
 }
 
 std::unique_ptr<TransferPlanBuilder> SimTransferEngine::CreatePlanBuilder(size_t) const {
-  if (!paths_[4] && !paths_[5]) {
+  if (!paths_[4] && !paths_[5] && !paths_[6] && !paths_[7] && !paths_[8]) {
     return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {
       AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
     });
@@ -271,33 +288,59 @@ std::unique_ptr<TransferPlanBuilder> SimTransferEngine::CreatePlanBuilder(size_t
       *this, MakeRdmaPlanBuilder(engine_key_, bounce_ref_.size, bounce_ref_));
 }
 
+TransferRef SimTransferEngine::RegisterFile(int fd, uint64_t offset, uint64_t size) {
+  if (fd < 0) return {};
+  return TransferRef::File(
+      fd, offset, size,
+      paths_[8] ? reinterpret_cast<void*>(static_cast<uintptr_t>(fd) + 1) : nullptr);
+}
+
 std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
     const std::vector<TransferPlan>& plans, Clock::time_point submitted, bool serial_cpu) {
   // Profiles measure submit-to-completion; model calculation consumes that same budget.
-  std::array<long double, 6> bytes{};
-  std::array<size_t, 6> copies{};
+  Bytes bytes{};
+  Copies copies{};
   for (const auto& plan : plans) {
-    const auto expected = plan.src.HasHostPtr() ? (plan.dst.HasHostPtr() ? TransferDirection::kLocal
-                                                                         : TransferDirection::kPush)
-                                                : TransferDirection::kPull;
+    const bool file = plan.src.IsFile() || plan.dst.IsFile();
+    const auto expected =
+        file ? TransferDirection::kLocal
+        : plan.src.HasHostPtr()
+            ? (plan.dst.HasHostPtr() ? TransferDirection::kLocal : TransferDirection::kPush)
+            : TransferDirection::kPull;
     if (!CanHandle(plan.src, plan.dst) || plan.dir != expected || plan.uses_bounce ||
         plan.sizes.size() != plan.src_offsets.size() ||
         plan.sizes.size() != plan.dst_offsets.size()) {
       return std::nullopt;
     }
     for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      if (!RangeFits(plan.src_offsets[i], plan.sizes[i], plan.src.size) ||
+      if ((PathIndex(plan.src, plan.dst) != 8 &&
+           !RangeFits(plan.src_offsets[i], plan.sizes[i], plan.src.size)) ||
           !RangeFits(plan.dst_offsets[i], plan.sizes[i], plan.dst.size))
         return std::nullopt;
+      if (file) {
+        const auto& ref = plan.src.IsFile() ? plan.src : plan.dst;
+        const uint64_t offset = plan.src.IsFile() ? plan.src_offsets[i] : plan.dst_offsets[i];
+        constexpr uint64_t max_offset = std::numeric_limits<int64_t>::max();
+        if (ref.file_offset > max_offset || offset > max_offset - ref.file_offset ||
+            plan.sizes[i] > max_offset - ref.file_offset - offset ||
+            (PathIndex(plan.src, plan.dst) == 8 && !ref.gds_handle))
+          return std::nullopt;
+      }
       bytes[PathIndex(plan.src, plan.dst)] += plan.sizes[i];
       if (plan.sizes[i] != 0) ++copies[PathIndex(plan.src, plan.dst)];
     }
   }
+  return ReserveCosts(bytes, copies, submitted, serial_cpu);
+}
+
+std::optional<SimTransferEngine::Reservation> SimTransferEngine::ReserveCosts(
+    const Bytes& bytes, const Copies& copies, Clock::time_point submitted, bool serial_cpu) {
   // Charge fixed latency once per path in this submit batch, independent of page fragmentation.
-  std::array<long double, 6> service_ns{}, local_service_ns{};
+  Bytes service_ns{}, local_service_ns{};
   long double private_ns = 0, local_private_ns = 0;
   for (size_t i = 0; i < bytes.size(); ++i) {
     if (bytes[i] == 0) continue;
+    if (!paths_[i]) return std::nullopt;
     const auto& path = *paths_[i];
     // One submit may fan out internally; independent submits (e.g. BatchPut keys)
     // can overlap, but all reserve service on the same aggregate-bandwidth channel.
@@ -311,9 +354,9 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
     const auto duration = latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads);
     private_ns = std::max(private_ns, duration);
     service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
-    if (i < 4) {
+    if (i < 4 || i >= 6) {
       local_private_ns = std::max(local_private_ns, duration);
-      local_service_ns[path.channel] = service_ns[path.channel];
+      local_service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
     }
   }
   auto deadline = [](Clock::time_point start, long double ns) -> std::optional<Clock::time_point> {
@@ -345,6 +388,21 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
   }
   available_ = next;  // Commit only after every deadline has passed overflow validation.
   return Reservation{*finish, *local_finish};
+}
+
+bool SimTransferEngine::SimulateStorage(bool read, uint64_t size, size_t operations) {
+  const auto started = Clock::now();
+  if (size == 0) return true;
+  if (operations == 0) return false;
+  Bytes bytes{};
+  Copies copies{};
+  const size_t path = read ? 6 : 7;
+  bytes[path] = size;
+  copies[path] = operations;
+  const auto reservation = ReserveCosts(bytes, copies, started);
+  if (!reservation) return false;
+  WaitUntil(reservation->finish);
+  return true;
 }
 
 std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPlan> plans) {

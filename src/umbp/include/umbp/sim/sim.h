@@ -64,10 +64,13 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
   const char* Name() const override { return "SimTransferEngine"; }
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                              int device) override;
+  TransferRef RegisterFile(int fd, uint64_t offset, uint64_t size) override;
   void Deregister(const TransferRef&) override {}
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
+  // Virtual SSD payload I/O; metadata work remains in the existing SSD controllers.
+  bool SimulateStorage(bool read, uint64_t bytes, size_t operations = 1);
 
   std::vector<uint8_t> PackedLocalEngineDesc() const override;
   bool EnsureRemoteEngine(const std::string& node_id, const std::string& packed) override;
@@ -95,10 +98,15 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
   };
   std::optional<Reservation> Reserve(const std::vector<TransferPlan>& plans,
                                      Clock::time_point submitted, bool serial_cpu = false);
-  // Four local memory paths, remote_read, remote_write; channels may be shared.
-  std::array<std::optional<Path>, 6> paths_;
+  static constexpr size_t kModelCount = 9;
+  using Bytes = std::array<long double, kModelCount>;
+  using Copies = std::array<size_t, kModelCount>;
+  std::optional<Reservation> ReserveCosts(const Bytes& bytes, const Copies& copies,
+                                          Clock::time_point submitted, bool serial_cpu = false);
+  // Six memory/network paths and file CPU read/write, GPU read.
+  std::array<std::optional<Path>, kModelCount> paths_;
   std::mutex mutex_;
-  std::array<Clock::time_point, 6> available_{};
+  std::array<Clock::time_point, kModelCount> available_{};
   std::string engine_key_;
   std::atomic<uint32_t> next_memory_id_{1};
   struct RemoteNode {

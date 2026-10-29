@@ -22,15 +22,20 @@ client.get_into_ptr(key, ptr, nbytes)
 With `UMBPConfig.from_environment()`, the equivalent settings are `UMBP_SIM_ENABLE=1`,
 `UMBP_SIM_PROFILE=/path/to/profile.json` and `UMBP_SIM_TRACE=/tmp/umbp-worker-0.jsonl`.
 Existing APIs and return types remain available. Use a separate trace file per client/run.
-Only DRAM/HBM backends are supported; SSD is rejected. Embedded mode defaults to DRAM;
+DRAM, HBM and file-backed SSD tiers are supported. Embedded mode defaults to DRAM;
+select SSD through the existing backend policy or distributed medium configuration;
 `ssd.enabled` alone does not select SSD. Virtual GPU callers require location/device
 metadata via C++ `RegisterMemory`; real pointers use existing classification.
 Virtual HBM needs no GPU, but normal build dependencies, including HIP, still apply.
 
-SSD simulation is follow-up work: virtual file capacity and file↔host/GPU transfer
-models must retain `SsdBackend` placement, eviction and staging behavior. Its actual
-POSIX/GDS paths need separate calibration; this version rejects SSD rather than
-substituting a DRAM model.
+SSD uses the existing `SsdBackend`, `PeerSsdManager`, segment index and multi-drive
+placement. Its files and staging payloads are virtual: `storage_dir` identifies
+shards but no directories/files are created. Capacity includes record headers,
+4 KiB padding and dead records; deleting a key frees disk capacity when its whole
+segment becomes reclaimable. Commit/abort, LRU, staging limits, read leases and
+single-flight reads keep their normal behavior. Simulation starts with an empty
+tier and does not restore persisted data. SPDK backends are outside this file-tier
+implementation.
 
 ### Standalone / CI
 
@@ -52,7 +57,8 @@ Rank timings include IPC and server work; **do not add server trace times to ran
 ## Profile and model
 
 [sim_profile.json](../examples/umbp/sim_profile.json) contains illustrative, uncalibrated
-estimates for `cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`, `remote_read` and `remote_write`.
+estimates for `cpu_cpu`, `cpu_gpu`, `gpu_cpu`, `gpu_gpu`, `remote_read`, `remote_write`,
+`file_cpu`, `cpu_file` and `file_gpu`.
 Copy it and adjust the coefficients for your platform.
 Each path names its source/destination memory type, except the remote paths, which use
 the initiator's read/write direction. Configure every path your workload uses; a missing
@@ -60,7 +66,18 @@ path rejects the transfer. Unused paths may be omitted.
 
 This first version uses manually supplied parameters. Automatic calibration belongs in
 a follow-up PR covering the actual engines (`LocalCopyEngine`, `HbmCopyEngine` and
-`MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers.
+`MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers. SSD coefficients
+also need measurements of the actual configured storage path.
+
+For staged SSD load/offload, `file_cpu` / `cpu_file` describe storage-path cost;
+normal CPU/GPU/network transfers add their own costs. Fit those SSD coefficients
+to `SSDTier` device I/O plus its skipped payload work (record building, CRC, bounce
+copies and the configured durability mode), excluding control and external
+GPU/RDMA copies that the simulator already counts. Local direct file transfers use
+the same coefficients for `PosixEngine`, so workloads mixing both storage paths
+need separate validation. `file_gpu` models the opt-in GDS read path
+(`UMBP_ENABLE_GDS=1`); GPU offload remains GPU→DRAM→SSD, matching the real engines.
+The example SSD values are estimates, not calibration results.
 
 | Field | Meaning |
 | --- | --- |
@@ -115,6 +132,7 @@ ending before trace serialization; whole-API timing also includes trace output.
 Workers/timers use wall time; background work counts when it delays an API/channel.
 
 - Queues belong to one backend client/server, shared by its ranks. Remote-NIC aggregation, switch congestion and dynamic fair sharing are not modeled.
+- Mixed transfer paths on different channels may overlap in the model; real inline engines can serialize them. Validate mixed-tier batches separately.
 - Real control RPC failures remain possible; modeled payload-transfer failures are not synthesized. Same-host peers measure that host's RPC cost.
 - Scheduling/control overhead limits short-operation accuracy. Profiles depend on platform, concurrency and workload.
 - Virtual addresses and page/key metadata consume resources. Framework buffers, external copies and model execution remain real; use trace/dummy execution, not generated-token correctness checks.

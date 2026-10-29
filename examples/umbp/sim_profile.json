@@ -30,6 +30,21 @@
       "channel": "network-link",
       "latency_ns": 10000,
       "bandwidth_bytes_per_second": 25000000000
+    },
+    "file_cpu": {
+      "channel": "ssd-device",
+      "latency_ns": 50000,
+      "bandwidth_bytes_per_second": 3000000000
+    },
+    "cpu_file": {
+      "channel": "ssd-device",
+      "latency_ns": 80000,
+      "bandwidth_bytes_per_second": 3000000000
+    },
+    "file_gpu": {
+      "channel": "ssd-device",
+      "latency_ns": 60000,
+      "bandwidth_bytes_per_second": 3000000000
     }
   }
 }

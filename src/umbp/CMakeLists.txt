@@ -392,6 +392,7 @@ add_library(
   distributed/peer/backend/instrumented_backend.cpp
   sim/sim.cpp
   sim/sim_pool_platform.cpp
+  sim/ssd.cpp
   sim/peer.cpp
   sim/trace.cpp
   distributed/transfer/transfer_engine.cpp

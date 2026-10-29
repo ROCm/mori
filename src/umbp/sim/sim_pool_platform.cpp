@@ -26,6 +26,7 @@
 #include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/composite_transfer_engine.h"
 #include "umbp/sim/sim.h"
+#include "umbp/sim/ssd.h"
 
 namespace mori::umbp {
 namespace {
@@ -36,19 +37,34 @@ class SimPoolPlatform final : public PoolPlatform {
   Engines CreateTransferEngine(const PoolClientConfig& config,
                                const std::vector<BackendInstanceConfig>& backends) override {
     for (const auto& backend : backends) {
-      if (backend.tier != TierType::DRAM && backend.tier != TierType::HBM)
-        throw std::invalid_argument("UMBP sim supports only DRAM/HBM storage");
+      if (backend.tier != TierType::DRAM && backend.tier != TierType::HBM &&
+          backend.tier != TierType::SSD)
+        throw std::invalid_argument("UMBP sim supports only DRAM/HBM/SSD storage");
     }
     auto engine = std::make_unique<SimTransferEngine>(
         config_.profile_path, config.master_config.node_id, config.staging_buffer_size);
     auto* peers = engine.get();
+    sim_engine_ = peers;
     auto composite = std::make_unique<CompositeTransferEngine>();
     composite->AddEngine(std::move(engine));
     return {std::move(composite), peers};
   }
   std::unique_ptr<MediumBackend> CreateBackend(const BackendInstanceConfig& config,
                                                uint64_t page_size,
-                                               const PoolClientConfig&) override {
+                                               const PoolClientConfig& pool_config) override {
+    if (config.tier == TierType::SSD) {
+      SsdBackend::Config ssd;
+      ssd.page_size = page_size;
+      ssd.staging_pages = SsdStagingPages(config.ssd_staging_buffer_slots,
+                                          config.ssd.ssd.capacity_bytes, page_size);
+      ssd.staging_use_hugepages = pool_config.ssd_staging_use_hugepages;
+      ssd.staging_hugepage_size = pool_config.ssd_staging_hugepage_size;
+      ssd.ssd = config.ssd;
+      ssd.ssd.enabled = true;
+      ssd.read_lease_ttl =
+          GetEnvMilliseconds("UMBP_SSD_READ_LEASE_MS", std::chrono::milliseconds(3000), 1);
+      return MakeSimSsdBackend(std::move(ssd), *sim_engine_);
+    }
     const bool hbm = config.tier == TierType::HBM;
     if (!hbm && config.tier != TierType::DRAM) return nullptr;
     auto source = std::make_unique<SimPageMemorySource>(
@@ -76,6 +92,7 @@ class SimPoolPlatform final : public PoolPlatform {
 
  private:
   UMBPSimConfig config_;
+  SimTransferEngine* sim_engine_ = nullptr;
 };
 
 }  // namespace

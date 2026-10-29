@@ -29,9 +29,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstring>
-#include <map>
 #include <string>
-#include <tuple>
 #include <utility>
 
 #include "mori/utils/mori_log.hpp"
@@ -176,42 +174,8 @@ bool PosixEngine::CanHandle(const TransferRef& src, const TransferRef& dst) cons
   return (src.IsFile() && IsHostCpu(dst)) || (IsHostCpu(src) && dst.IsFile());
 }
 
-namespace {
-
-// Pairs by (memory buffer, file range, direction): a file endpoint has no
-// host_ptr, so PairPlanBuilder's key would merge different files.
-class PosixPlanBuilder final : public TransferPlanBuilder {
- public:
-  explicit PosixPlanBuilder(const PosixEngine& engine) : engine_(engine) {}
-
-  void Add(const TransferItem& item) override {
-    if (item.size == 0) return;
-    if (!engine_.CanHandle(item.src, item.dst) || !ItemInBounds(item)) {
-      out_.rejected_tags.push_back(item.tag);
-      return;
-    }
-    const bool write = item.dst.IsFile();
-    const TransferRef& file = write ? item.dst : item.src;
-    const void* mem = write ? item.src.host_ptr : item.dst.host_ptr;
-    auto [it, fresh] = plan_of_.emplace(std::make_tuple(mem, file.file_fd, file.file_offset, write),
-                                        out_.plans.size());
-    if (fresh) out_.plans.push_back(PlanBetween(item, TransferDirection::kLocal));
-    AppendSegment(&out_.plans[it->second], item.src_offset, item.dst_offset, item.size, item.tag);
-  }
-
-  TransferPlanSet Finish() override { return std::move(out_); }
-
- private:
-  const PosixEngine& engine_;
-  TransferPlanSet out_;
-  std::map<std::tuple<const void*, int, uint64_t, bool>, size_t> plan_of_;
-};
-
-}  // namespace
-
-std::unique_ptr<TransferPlanBuilder> PosixEngine::CreatePlanBuilder(
-    size_t /*expected_items*/) const {
-  return std::make_unique<PosixPlanBuilder>(*this);
+std::unique_ptr<TransferPlanBuilder> PosixEngine::CreatePlanBuilder(size_t expected_items) const {
+  return MakeFilePlanBuilder(*this, expected_items);
 }
 
 std::unique_ptr<TransferHandle> PosixEngine::Submit(std::vector<TransferPlan> plans) {

@@ -67,8 +67,10 @@ class PeerSsdManager {
  public:
   explicit PeerSsdManager(const PeerSsdConfig& cfg);
 
-  // Test-only: inject a fake backend.
-  explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true);
+  // Inject storage and follower copies while retaining the ownership/read protocol.
+  using FanoutCopy = std::function<bool(void*, const void*, size_t)>;
+  explicit PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight = true,
+                          FanoutCopy fanout_copy = {});
 
   ~PeerSsdManager();
 
@@ -252,6 +254,8 @@ class PeerSsdManager {
 
   mutable std::mutex mutex_;
   std::unique_ptr<TierBackend> backend_;  // null when cfg.enabled == false
+  FanoutCopy fanout_copy_;
+  bool CopyFollower(void* dst, const void* src, size_t size) noexcept;
 
   // key -> {size, lru position}.  The authoritative owned-location map.
   std::unordered_map<std::string, OwnedEntry> owned_;

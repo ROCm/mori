@@ -27,7 +27,9 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -82,6 +84,53 @@ inline void AppendSegment(TransferPlan* plan, size_t src_off, size_t dst_off, si
     plan->sizes.push_back(size);
   }
   if (plan->tags.empty() || plan->tags.back() != tag) plan->tags.push_back(tag);
+}
+
+// File CPU I/O groups by memory/file range; GDS keeps one plan per GPU destination.
+template <typename Engine>
+class FilePlanBuilder final : public TransferPlanBuilder {
+ public:
+  FilePlanBuilder(const Engine& engine, size_t expected_items) : engine_(engine) {
+    out_.plans.reserve(expected_items);
+  }
+  void Add(const TransferItem& item) override {
+    if (item.size == 0) return;
+    const bool gpu = item.dst.loc == mori::io::MemoryLocationType::GPU;
+    if (!engine_.CanHandle(item.src, item.dst) ||
+        !(gpu ? RangeFits(item.dst_offset, item.size, item.dst.size) : ItemInBounds(item))) {
+      out_.rejected_tags.push_back(item.tag);
+      return;
+    }
+    if (gpu) {
+      auto plan = PlanBetween(item, TransferDirection::kLocal);
+      AppendSegment(&plan, item.src_offset, item.dst_offset, item.size, item.tag);
+      out_.plans.push_back(std::move(plan));
+      return;
+    }
+    const bool write = item.dst.IsFile();
+    const auto& file = write ? item.dst : item.src;
+    const auto* mem = write ? item.src.host_ptr : item.dst.host_ptr;
+    auto [it, fresh] = plan_of_.emplace(std::make_tuple(mem, file.file_fd, file.file_offset, write),
+                                        out_.plans.size());
+    if (fresh) out_.plans.push_back(PlanBetween(item, TransferDirection::kLocal));
+    auto& plan = out_.plans[it->second];
+    // Each item was checked against its own view; retain the widest valid view.
+    plan.src.size = std::max(plan.src.size, item.src.size);
+    plan.dst.size = std::max(plan.dst.size, item.dst.size);
+    AppendSegment(&plan, item.src_offset, item.dst_offset, item.size, item.tag);
+  }
+  TransferPlanSet Finish() override { return std::move(out_); }
+
+ private:
+  const Engine& engine_;
+  TransferPlanSet out_;
+  std::map<std::tuple<const void*, int, uint64_t, bool>, size_t> plan_of_;
+};
+
+template <typename Engine>
+std::unique_ptr<TransferPlanBuilder> MakeFilePlanBuilder(const Engine& engine,
+                                                         size_t expected_items = 0) {
+  return std::make_unique<FilePlanBuilder<Engine>>(engine, expected_items);
 }
 
 // Builder for engines with one plan per (src, dst) buffer pair.  Admits what
