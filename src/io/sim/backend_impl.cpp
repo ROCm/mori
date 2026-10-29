@@ -195,9 +195,6 @@ std::string BackendTypeName(BackendType type) {
 
 namespace {
 
-// From src/io/sim/catalog.yaml.
-#include "mori_io_sim_catalog.inc"
-
 const std::set<std::string> kCatalogKeys = {"backend", "gpu", "nic", "bandwidth_gbps", "latency_us",
                                             "per_segment_ns", "per_op_us", "qp_per_transfer",
                                             "num_worker_threads",
@@ -261,8 +258,6 @@ void AddToCatalog(Catalog& catalog, const std::vector<yaml::FlatMap>& entries,
 
 Catalog LoadCatalog() {
   Catalog catalog;
-  std::istringstream builtin(kBuiltinCatalog);
-  AddToCatalog(catalog, yaml::ParseFlatList(builtin, "built-in catalog"), "built-in catalog");
   std::stringstream paths(mori::env::GetString("MORI_IO_SIM_CATALOG").value_or(""));
   for (std::string path; std::getline(paths, path, ',');) {
     if (!path.empty()) AddToCatalog(catalog, yaml::LoadFlatList(path), path);
@@ -313,7 +308,7 @@ LinkProfile LoadLinkProfile(BackendType type) {
       known |= HardwareKey(item.first.first) == key && item.first.second == hardware;
     }
     if (!known) {
-      throw std::runtime_error(var + "=" + hardware + " is not in the catalog, which has " +
+      throw std::runtime_error(var + "=" + hardware + " is not in MORI_IO_SIM_CATALOG, which has " +
                                KnownHardware(catalog, key));
     }
     out.source = "uncalibrated defaults: the catalog has no " + backend + " entry for " + key +

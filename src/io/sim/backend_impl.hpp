@@ -66,9 +66,9 @@ struct LinkProfile {
 };
 
 // The catalog entry for MORI_IO_SIM_GPU (XGMI) or MORI_IO_SIM_NIC (RDMA, TCP), else uncalibrated
-// guesses, then the per-value MORI_IO_SIM_<BACKEND>_* variables. The catalog is
-// src/io/sim/catalog.yaml plus each file in MORI_IO_SIM_CATALOG (comma-separated); a later entry
-// for the same backend and hardware replaces an earlier one.
+// guesses, then the per-value MORI_IO_SIM_<BACKEND>_* variables. The catalog is read from the
+// files in MORI_IO_SIM_CATALOG (comma-separated); a later entry for the same backend and
+// hardware replaces an earlier one.
 LinkProfile LoadLinkProfile(BackendType type);
 // The profile a backend of this type would get now, for tools: bw_gbps, latency_us,
 // per_segment_ns, per_op_us.

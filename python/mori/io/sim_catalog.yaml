@@ -1,6 +1,6 @@
 # MORI-IO simulation catalog: link timing for each GPU (XGMI) and each NIC (RDMA, TCP).
-# MORI_IO_SIM_GPU and MORI_IO_SIM_NIC pick the entries by name. This file is compiled into
-# libmori_io; MORI_IO_SIM_CATALOG adds entries from files of your own.
+# Read at run time from the files in MORI_IO_SIM_CATALOG; MORI_IO_SIM_GPU and MORI_IO_SIM_NIC
+# pick the entries by name. This file ships in the wheel as mori/io/sim_catalog.yaml.
 #
 # To add hardware, add an entry with its measured numbers. RDMA numbers also depend on the
 # QP and worker counts they were measured with.

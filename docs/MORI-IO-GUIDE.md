@@ -205,15 +205,16 @@ one link per direction, and transfers queue on it in order.
 | `MORI_IO_SIM_BACKEND` | `tcp` or `xgmi`: simulate an RDMA request as that backend. TCP exists only in simulation. |
 | `MORI_IO_SIM_GPU` | The GPU whose catalog entry times XGMI, for example `mi355x`. |
 | `MORI_IO_SIM_NIC` | The NIC whose catalog entries time RDMA and TCP, for example `pollara400`. |
-| `MORI_IO_SIM_CATALOG` | Catalog file(s) of your own, comma-separated, read after the built-in one. An entry replaces an earlier one for the same backend and GPU or NIC. |
+| `MORI_IO_SIM_CATALOG` | Catalog file(s) to read, comma-separated. An entry replaces an earlier one for the same backend and GPU or NIC. |
 | `MORI_IO_SIM_<RDMA\|TCP\|XGMI>_{BW_GBPS,LATENCY_US,SEGMENT_NS,OP_US}` | Override one value. |
 | `MORI_IO_SIM_TIME_SCALE` | Divide every delay by this factor. |
 | `MORI_NODE_ID` | Node identity for XGMI's same-node check, to simulate several nodes on one host. |
 
-The timing of each backend comes from a catalog of measured hardware,
-[`src/io/sim/catalog.yaml`](https://github.com/ROCm/mori/blob/main/src/io/sim/catalog.yaml),
-which is compiled into the library. XGMI entries are per GPU and RDMA and TCP entries per NIC,
-since the numbers change with each generation:
+The timing of each backend comes from a catalog of measured hardware, a flat YAML file read
+when a simulated backend is created. The wheel ships one as `mori/io/sim_catalog.yaml`
+([source](https://github.com/ROCm/mori/blob/main/python/mori/io/sim_catalog.yaml)). XGMI
+entries are per GPU and RDMA and TCP entries per NIC, since the numbers change with each
+generation:
 
 ```yaml
 - backend: xgmi
@@ -235,14 +236,19 @@ since the numbers change with each generation:
   hardware: "AMD Pensando Pollara 400, 400GbE"
 ```
 
-`MORI_IO_SIM_GPU=mi355x MORI_IO_SIM_NIC=pollara400` selects these. A name the catalog does not
-have is an error that lists the names it has. Without a selection, or for a backend the
+```bash
+export MORI_IO_SIM_CATALOG=$(python -c "import mori.io, os; print(os.path.join(os.path.dirname(mori.io.__file__), 'sim_catalog.yaml'))")
+export MORI_IO_SIM_GPU=mi355x MORI_IO_SIM_NIC=pollara400
+```
+
+selects these. A name the catalog does not have is an error that lists the names it has.
+Without a selection, or for a backend the
 selected hardware has no entry for (TCP above), uncalibrated guesses are used and a warning is
 logged.
 
 RDMA timing depends on the config, so an engine whose `qp_per_transfer` or
 `num_worker_threads` differ from the entry's logs a warning. To time other hardware or another
-config, put an entry with its measured numbers in a file passed with `MORI_IO_SIM_CATALOG`. The
+config, add an entry with its measured numbers to a catalog file of your own. The
 model does not cap a single transfer's bandwidth: without `enable_transfer_chunking`, one RDMA
 transfer alone reaches only about half the link, which the simulator does not reproduce.
 

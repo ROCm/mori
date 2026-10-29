@@ -31,6 +31,7 @@ import time
 
 import pytest
 
+import mori.io
 from mori.cpp import io_sim_profile
 from mori.io import (
     BackendType,
@@ -60,7 +61,14 @@ PROFILES = {
 @pytest.fixture(autouse=True)
 def sim_env(monkeypatch):
     monkeypatch.setenv("MORI_IO_SIM_ENABLE", "1")
-    for k in ("MORI_NODE_ID", "MORI_IO_SIM_BACKEND", "MORI_IO_SIM_TIME_SCALE"):
+    for k in (
+        "MORI_NODE_ID",
+        "MORI_IO_SIM_BACKEND",
+        "MORI_IO_SIM_TIME_SCALE",
+        "MORI_IO_SIM_CATALOG",
+        "MORI_IO_SIM_GPU",
+        "MORI_IO_SIM_NIC",
+    ):
         monkeypatch.delenv(k, raising=False)
     for backend, profile in PROFILES.items():
         for k, v in profile.items():
@@ -371,18 +379,32 @@ def test_bad_catalog_is_rejected(sim_env, tmp_path, text, error):
         make_engine("pf")
 
 
+SHIPPED_CATALOG = os.path.join(os.path.dirname(mori.io.__file__), "sim_catalog.yaml")
+
+
 def test_unknown_hardware_lists_the_catalog(sim_env):
+    sim_env.setenv("MORI_IO_SIM_CATALOG", SHIPPED_CATALOG)
     sim_env.setenv("MORI_IO_SIM_NIC", "nosuchnic")
     with pytest.raises(
         RuntimeError,
-        match="MORI_IO_SIM_NIC=nosuchnic is not in the catalog, "
+        match="MORI_IO_SIM_NIC=nosuchnic is not in MORI_IO_SIM_CATALOG, "
         "which has .*pollara400",
     ):
         make_engine("pf")
 
 
-def test_built_in_catalog(sim_env, tmp_path):
+def test_hardware_needs_a_catalog(sim_env):
+    sim_env.setenv("MORI_IO_SIM_NIC", "pollara400")
+    with pytest.raises(
+        RuntimeError,
+        match="MORI_IO_SIM_NIC=pollara400 is not in MORI_IO_SIM_CATALOG, which has none",
+    ):
+        make_engine("pf")
+
+
+def test_shipped_catalog(sim_env, tmp_path):
     use_catalog(sim_env, tmp_path)
+    sim_env.setenv("MORI_IO_SIM_CATALOG", SHIPPED_CATALOG)
     sim_env.setenv("MORI_IO_SIM_GPU", "mi355x")
     sim_env.setenv("MORI_IO_SIM_NIC", "pollara400")
     assert io_sim_profile(BackendType.XGMI)["bw_gbps"] == 61.4
