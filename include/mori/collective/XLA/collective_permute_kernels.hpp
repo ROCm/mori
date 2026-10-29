@@ -158,6 +158,42 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
   }
 }
 
+// Grid-strided copy of nSeg segments of `bytes` each, segment j going from
+// srcOf(j) to dstOf(j). Peer-outer / grid-strided-inner: each segment's base is
+// hoisted and every address is base + idx*16 (shift-add, no per-element divide),
+// so the NumVecs independent b128 loads issue back-to-back for maximum memory-level
+// parallelism across the long XGMI read latency (mirrors PullReduceShard). Loads
+// are system scope (sources are peers' buffers); stores use StoreScope.
+template <int NumVecs, StreamScope StoreScope = ESystemScope>
+__device__ __forceinline__ void PullCopySegments(
+                  const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, size_t bytes) {
+  using Vec = TVecType<VecBytes>;
+  const size_t n = bytes / VecBytes;  // whole 16B units per segment
+  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
+  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    size_t u = gtid;
+    for (; u + (NumVecs - 1) * gstride < n; u += NumVecs * gstride) {
+      Vec v[NumVecs];
+#pragma unroll
+      for (int m = 0; m < NumVecs; m++) {
+        v[m] = StreamLoad<ESystemScope>(src + (u + m * gstride) * VecBytes);
+      }
+#pragma unroll
+      for (int m = 0; m < NumVecs; m++) {
+        StreamStore<StoreScope>(dst + (u + m * gstride) * VecBytes, v[m]);
+      }
+    }
+    for (; u < n; u += gstride) {
+      StreamStore<StoreScope>(
+          dst + u * VecBytes, StreamLoad<ESystemScope>(src + u * VecBytes));
+    }
+    // Byte tail for the final < 16B (only non-empty when bytes % 16 != 0).
+    for (size_t i = n * VecBytes + gtid; i < bytes; i += gstride) {
+      StreamStore<StoreScope, 1>(dst + i, StreamLoad<ESystemScope, 1>(src + i));
+    }
+}
+
 // Multi-block, SDMA-free collective-permute (one destination): every PE reads
 // srcPe's sendBuf straight over XGMI into its own recvBuf. Same arguments as
 // CollectivePermutePushKernel. It shares the same permuteCtr buffer and uses
@@ -224,7 +260,7 @@ CollectivePermutePullKernel(int npes, int dstPe, int srcPe, cco::ccoWindow_t hea
     const auto* src = PeerPtr(static_cast<const uint8_t*>(sendBuf), srcPe, me, stride4G);
     auto* dst = static_cast<uint8_t*>(recvBuf);
     if (src != dst) {
-      PullCopySegments<NumVecs>(1, numBytes, [=](int) { return src; }, [=](int) { return dst; });
+      PullCopySegments<NumVecs>(src, dst, numBytes);
     }
   }
 

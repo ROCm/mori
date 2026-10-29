@@ -600,27 +600,36 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
 
 // One barrier round on a symmetric uint64[npes] `arrived` array: post `value`
 // into slot myPe of every PE's copy, then wait (local loads only) until every
-// slot of my copy has reached it. Executed by ONE full wave (npes <= warpSize)
-// per calling block. With LeaderOnly, only block 0 posts and every calling
-// block just waits, so a whole grid can gate on one arrival per PE.
+// slot of my copy has reached it. Called by the WHOLE block (no external warp
+// guard). Higher wavefronts return immediately; within warp 0 the post/wait is
+// gated to `threadIdx.x < npes`, so only lanes 0..npes-1 participate (npes <=
+// warpSize, 1D blocks => threadIdx.x == lane id there). The system-scope fences
+// run on warp 0 only. There is no __syncthreads() here, so the early-returning
+// threads cannot hang.
+// With LeaderOnly, only block 0 posts and every calling block just waits, so a
+// whole grid can gate on one arrival per PE.
 // `value` must be identical on every PE for a given round and strictly increase
 // across rounds on the same array; `>=` then tolerates a fast peer that already
 // posted a later round.
 template <bool LeaderOnly = false>
 __device__ __forceinline__ void GenBarrier(uint64_t* arrived, uint64_t value, int myPe,
                                            int npes, int32_t stride4G) {
-  const int lane = __lane_id();
-  const bool active = lane < npes;
+  // Called by the whole block, but only warp 0 does the barrier: higher
+  // wavefronts return at once so they issue none of the system-scope fences
+  // below (npes <= warpSize, so every participant lives in warp 0).
+  if (threadIdx.x >= warpSize) return;
+  const int peer = threadIdx.x;
+  const bool active = peer < npes;
   if (!LeaderOnly || blockIdx.x == 0) {
     // One system release orders the caller's prior stores ahead of every arrival.
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
     if (active) {
-      auto* dst = PeerPtr(&arrived[myPe], lane, myPe, stride4G);
+      auto* dst = PeerPtr(&arrived[myPe], peer, myPe, stride4G);
       AtomicStore<ESystemScope>(dst, value);
     }
   }
   while (active) {
-    const uint64_t v = AtomicLoad<ESystemScope>(&arrived[lane]);
+    const uint64_t v = AtomicLoad<ESystemScope>(&arrived[peer]);
     if (v >= value) break;
     __builtin_amdgcn_s_sleep(1);
   }
@@ -664,116 +673,6 @@ __device__ __forceinline__ bool LastBlockOut(uint32_t* groupCtr) {
     last = atomicInc(&groupCtr[kArrivalIdx], gridDim.x - 1) == gridDim.x - 1;
   }
   return BroadcastLane0(last) != 0;
-}
-
-// Grid-strided copy of nSeg segments of `bytes` each, segment j going from
-// srcOf(j) to dstOf(j). Peer-outer / grid-strided-inner: each segment's base is
-// hoisted and every address is base + idx*16 (shift-add, no per-element divide),
-// so the NumVecs independent b128 loads issue back-to-back for maximum memory-level
-// parallelism across the long XGMI read latency (mirrors PullReduceShard). Loads
-// are system scope (sources are peers' buffers); stores use StoreScope.
-template <int NumVecs, StreamScope StoreScope = ESystemScope, class SrcFn, class DstFn>
-__device__ __forceinline__ void PullCopySegments(int nSeg, size_t bytes, SrcFn srcOf,
-                                                 DstFn dstOf) {
-  using Vec = TVecType<VecBytes>;
-  const size_t n = bytes / VecBytes;  // whole 16B units per segment
-  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
-  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-
-  for (int seg = 0; seg < nSeg; ++seg) {
-    const uint8_t* __restrict__ src = srcOf(seg);
-    uint8_t* __restrict__ dst = dstOf(seg);
-    size_t u = gtid;
-    for (; u + (NumVecs - 1) * gstride < n; u += NumVecs * gstride) {
-      Vec v[NumVecs];
-#pragma unroll
-      for (int m = 0; m < NumVecs; m++) {
-        v[m] = StreamLoad<ESystemScope>(src + (u + m * gstride) * VecBytes);
-      }
-#pragma unroll
-      for (int m = 0; m < NumVecs; m++) {
-        StreamStore<StoreScope>(dst + (u + m * gstride) * VecBytes, v[m]);
-      }
-    }
-    for (; u < n; u += gstride) {
-      StreamStore<StoreScope>(
-          dst + u * VecBytes, StreamLoad<ESystemScope>(src + u * VecBytes));
-    }
-    // Byte tail for the final < 16B (only non-empty when bytes % 16 != 0).
-    for (size_t i = n * VecBytes + gtid; i < bytes; i += gstride) {
-      StreamStore<StoreScope, 1>(dst + i, StreamLoad<ESystemScope, 1>(src + i));
-    }
-  }
-}
-
-// Peer-interleaved pull copy. Unlike PullCopySegments (peer-outer: the whole grid
-// drains one peer before the next, so only one XGMI read link is busy at a time),
-// this issues NumVecs b128 loads spread across all NPES peers at once -- V =
-// NumVecs/NPES units per peer -- so NPES read links run concurrently and pull
-// bandwidth scales past a single link. NPES is a compile-time constant so the
-// peer bases live in SGPRs and the AA[] batch is statically indexed; requires
-// NPES to divide NumVecs. srcOf(j)/dstOf(j) return peer j's chunk base (src = a
-// peer pointer, dst = a local slot), both indexed by the same unit offset.
-// Loads are system scope (sources are peers' buffers); stores use StoreScope.
-template <int NPES, int NumVecs, StreamScope StoreScope = ESystemScope,
-          class SrcFn, class DstFn>
-__device__ __forceinline__ void PullCopyInterleaved(size_t bytes, SrcFn srcOf, DstFn dstOf) {
-  static_assert(NumVecs % NPES == 0, "NPES must divide NumVecs");
-  constexpr int V = NumVecs / NPES;  // units in flight per peer
-  using Vec = TVecType<VecBytes>;
-  const size_t n = bytes / VecBytes;  // whole 16B units per peer chunk
-  const size_t gstride = static_cast<size_t>(blockDim.x) * gridDim.x;
-  const size_t gtid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-
-  // Hoist the per-peer bases once (uniform across the block -> SGPRs).
-  const uint8_t* __restrict__ src[NPES];
-  uint8_t* __restrict__ dst[NPES];
-#pragma unroll
-  for (int j = 0; j < NPES; j++) {
-    src[j] = srcOf(j);
-    dst[j] = dstOf(j);
-  }
-
-  // Main batch: each thread holds V units for every peer => NumVecs loads in
-  // flight across NPES links before any store. Advance by V*gstride per step.
-  const size_t step = static_cast<size_t>(V) * gstride;
-  size_t u0 = gtid;
-  for (; u0 + (V - 1) * gstride < n; u0 += step) {
-    Vec aa[NumVecs];
-#pragma unroll
-    for (int j = 0; j < NPES; j++) {
-#pragma unroll
-      for (int i = 0; i < V; i++) {
-        aa[j * V + i] =
-            StreamLoad<ESystemScope>(src[j] + (u0 + i * gstride) * VecBytes);
-      }
-    }
-#pragma unroll
-    for (int j = 0; j < NPES; j++) {
-#pragma unroll
-      for (int i = 0; i < V; i++) {
-        StreamStore<StoreScope>(dst[j] + (u0 + i * gstride) * VecBytes,
-                                                aa[j * V + i]);
-      }
-    }
-  }
-  // Remainder units (still interleaved across peers to keep links busy).
-  for (size_t u = u0; u < n; u += gstride) {
-#pragma unroll
-    for (int j = 0; j < NPES; j++) {
-      StreamStore<StoreScope>(
-          dst[j] + u * VecBytes,
-          StreamLoad<ESystemScope>(src[j] + u * VecBytes));
-    }
-  }
-  // Byte tail for a final < 16B per peer (empty when bytes % 16 == 0).
-  for (size_t i = n * VecBytes + gtid; i < bytes; i += gstride) {
-#pragma unroll
-    for (int j = 0; j < NPES; j++) {
-      StreamStore<StoreScope, 1>(dst[j] + i, 
-        StreamLoad<ESystemScope, 1>(src[j] + i));
-    }
-  }
 }
 
 #endif  // __HIPCC__ || __HIP__

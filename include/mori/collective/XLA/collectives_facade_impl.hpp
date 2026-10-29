@@ -338,7 +338,7 @@ hipError_t CollectivesFacade::RunAllGather(const void* input, void* output, size
     // kPullCopyVecs), so all NPES XGMI read links run concurrently. The gate
     // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
-      AllGatherPullKernelN<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
+      AllGatherPullKernel<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
           myPe_, nPes_, state_.heapWin, input, output, chunkBytes, state_.groupCtr,
           barrierCtr_);
       return hipGetLastError();
@@ -376,7 +376,7 @@ hipError_t CollectivesFacade::RunAllToAll(const AddressVector& addrs, size_t chu
     // kPullCopyVecs), so all NPES XGMI read links run concurrently. The gate
     // above guarantees nPes_ is 2/4/8, so DispatchNpes never hits its default.
     return detail::DispatchNpes(nPes_, [&](auto NPES_c) {
-      AllToAllPullKernelN<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
+      AllToAllPullKernel<decltype(NPES_c)::value, kPullCopyVecs><<<blocks, kPullThreads, 0, stream>>>(
           myPe_, nPes_, state_.heapWin, state_.pinnedPairs, chunkBytes, state_.groupCtr,
           barrierCtr_);
       return hipGetLastError();

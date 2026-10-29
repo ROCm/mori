@@ -374,9 +374,7 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     // are done reducing what we sent them: gate our writes into their staging
     // until every PE has entered this launch.
     int stride4G = heapWin->stride4G;
-    if (threadIdx.x < warpSize) {
-      GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
-    }
+    GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -456,7 +454,7 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
   const uint32_t stride4G = heapWin->stride4G;
   // In block 0's first wave every lane loads this before lane myPe posts.
   const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
-  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
+  GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
   __syncthreads();
 
   // System scope: the caller hands output to a remote reader after the kernel,
@@ -470,9 +468,7 @@ ReduceScatterPullKernel(int myPe, cco::ccoWindow_t heapWin,
 
   // A block counts in only once all its waves are done reading peer inputs.
   __syncthreads();
-  if (threadIdx.x < warpSize) {
-    if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
-  }
+  if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
 }
 
 } // namespace collective
