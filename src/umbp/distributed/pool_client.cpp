@@ -639,12 +639,6 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
   return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
 }
 
-// A client read asks for a file ref only for device memory, which GdsEngine
-// reads in place; (file, host) is PosixEngine's, used by tier migrations.
-bool DestinationIsDevice(void* ptr, uint64_t size) {
-  return ClassifiedUserBytes(ptr, size).loc == mori::io::MemoryLocationType::GPU;
-}
-
 // Read-side range validity: inside the object and non-overlapping.  Weaker than
 // RangesTileObject, which the write side needs — a read may take any subset of
 // an object, but a write must account for every byte it commits.
@@ -2966,7 +2960,10 @@ std::vector<size_t> PoolClient::ServeLocalGetPart(const std::vector<std::string>
   std::vector<size_t> later;
   ResolveLocalBatch(
       keys, indices, &holders, &resolutions,
-      [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); }, &later);
+      [&](size_t i) {
+        return LocalUserBytes(dsts[i], sizes[i]).loc == mori::io::MemoryLocationType::GPU;
+      },
+      &later);
   std::vector<char> is_later(later.empty() ? 0 : keys.size(), 0);
   for (size_t i : later) is_later[i] = 1;
 
@@ -2998,7 +2995,7 @@ std::vector<size_t> PoolClient::ServeLocalGetPart(const std::vector<std::string>
       // let the planner pick GdsEngine.
       TransferItem item;
       item.src = resolved.file_ref;
-      item.dst = ClassifiedUserBytes(dsts[i], sizes[i]);
+      item.dst = LocalUserBytes(dsts[i], sizes[i]);
       item.size = sizes[i];
       items.push_back(std::move(item));
     } else if (!BuildLocalPageTransfers(holder, resolved.pages, resolved.page_size, dsts[i],
@@ -3481,7 +3478,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
             // from a file ref, so require all of them.
             const std::vector<void*>& key_dsts = dsts[i];
             for (size_t r = 0; r < key_dsts.size(); ++r) {
-              if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+              if (LocalUserBytes(key_dsts[r], sizes[i][r]).loc != mori::io::MemoryLocationType::GPU)
+                return false;
             }
             return !key_dsts.empty();
           },
