@@ -460,6 +460,97 @@ jobs:
                 chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
           fi
 
+  # Gate for "does mori still build and run on ROCm 7.14", the release before
+  # the 10.0 the other jobs run on. Kept to the EP intranode test on one runner:
+  # the rest of the intranode suite is ROCm-version agnostic.
+  intranode-test-rocm714:
+    name: mori intranode test (ROCm 7.14, MI355X_AINIC)
+    needs: build
+    runs-on: [self-hosted, MI355X-AINIC-PIT-G17]
+    env:
+      BASE_IMAGE: rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0
+      IMAGE: rocm/mori:ci-rocm714
+      CONTAINER: mori_ci_rocm714_${{ github.run_id }}
+      MORI_RDMA_DEVICES: rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+      MORI_RDMA_SL: 3
+      MORI_RDMA_TC: 104
+      # Pinned for the same reason as intranode-test's socket_ifname, see above.
+      MORI_SOCKET_IFNAME: eno0
+      NCCL_SOCKET_IFNAME: eno0
+    timeout-minutes: 60
+    steps:
+      - name: Fix workspace permissions
+        run: |
+          WS="${GITHUB_WORKSPACE}"
+          if [ -d "$WS" ]; then
+            $CT run --rm -v "$WS:$WS" "$BASE_IMAGE" \
+              chown -R $(id -u):$(id -g) "$WS" 2>/dev/null || true
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          # A re-run (run_attempt > 1) checks out the PR merged with the current
+          # main; otherwise it would reuse the merge commit of the first attempt.
+          ref: ${{ github.event_name == 'pull_request' && github.run_attempt > 1 && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
+
+      # ROCm 7.14 ships in a different apt repo than 10.x, hence the ROCM_APT_* args.
+      - name: Build CI image
+        run: |
+          $CT build --network=host \
+            --build-arg BASE_IMAGE=$BASE_IMAGE \
+            --build-arg ROCM_APT_VERSION=7.14 \
+            --build-arg ROCM_APT_GPG=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg \
+            --build-arg ROCM_APT_LIST="https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" \
+            -t $IMAGE -f docker/Dockerfile.dev .
+
+      - name: Start container
+        run: |
+          $CT rm -f $CONTAINER 2>/dev/null || true
+          CONTAINER_RUNTIME=$CT ./docker/ci_run.sh --name $CONTAINER \
+            -e MORI_RDMA_DEVICES=$MORI_RDMA_DEVICES \
+            -e MORI_RDMA_SL=$MORI_RDMA_SL \
+            -e MORI_RDMA_TC=$MORI_RDMA_TC \
+            -e MORI_SOCKET_IFNAME=$MORI_SOCKET_IFNAME \
+            -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME \
+            -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE \
+            -w $GITHUB_WORKSPACE \
+            $IMAGE sleep infinity
+          $CT exec $CONTAINER \
+            git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Report ROCm version
+        run: |
+          $CT exec $CONTAINER bash -c "
+            ls -d /opt/rocm/core-* && /opt/rocm/bin/hipconfig --version && echo
+          "
+
+      # The same build as intranode-test's, so a ROCm 10-only API anywhere in it
+      # fails to compile here.
+      - name: Install mori
+        run: |
+          $CT exec $CONTAINER bash -c \
+            "cd $GITHUB_WORKSPACE && BUILD_BENCHMARK=ON BUILD_CCO_SDMA=ON BUILD_EXAMPLES=ON pip install ."
+
+      - name: Verify installation
+        run: $CT exec $CONTAINER bash -c "cd $GITHUB_WORKSPACE && python tools/verify_install.py"
+
+      - name: MORI-EP (intranode)
+        run: |
+          $CT exec -e PYTHONPATH=$GITHUB_WORKSPACE $CONTAINER bash -c "
+            cd $GITHUB_WORKSPACE && timeout 360 pytest tests/python/ops/test_dispatch_combine_intranode.py -v
+          "
+
+      - name: Cleanup
+        if: always()
+        run: |
+          $CT rm -f $CONTAINER || true
+          if $CT image inspect $IMAGE &>/dev/null; then
+            $CT run --rm -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE $IMAGE \
+                chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE 2>/dev/null || true
+          fi
+
   jax-intranode-test:
     name: mori JAX intranode test (${{ matrix.platform }})
     needs: build
