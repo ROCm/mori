@@ -144,9 +144,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     // Gate on every PE entering this launch: staging is shared with the other
     // push collectives, so a peer may finish before my previous launch is done
     // with it. Lane 0 enters after its stores above, in program order.
-    if (threadIdx.x < warpSize) {
-      GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
-    }
+    GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -198,7 +196,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
 
   // Whether this block's count released b=1, so it owes the generation bump and
   // the completion wait for BOTH broadcasts. Only meaningful in thread 0.
-  bool ownsTail = false;
+  uint32_t ownsTail = 0;
   const uint32_t lstride = FORCE_SGPR(gridDim.x * blockDim.x);  // loop-invariant
 
   for (uint32_t s = 0; s < S; s++) {
@@ -232,7 +230,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
       // count releases the pre-posted copy with no further step. System scope:
       // the SDMA engine must observe the RMW.
       if (threadIdx.x == 0) {
-        const uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
+        uint32_t old = __hip_atomic_fetch_add(cco::impl::global(bcastFlag(b)), 1u,
                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         if (b == 1) {
           ownsTail = (old + 1 == AtomicLoad<EAgentScope>(&groupCtr[kBcastTargetIdx]));
@@ -252,7 +250,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   //
   // No acquire closes the kernel -- no thread here reads the slices peers DMA'd
   // into output, and whoever consumes them acquires at its own kernel boundary.
-  if (threadIdx.x < warpSize && BroadcastLane0(static_cast<uint32_t>(ownsTail))) {
+  if (threadIdx.x < warpSize && BroadcastLane0(ownsTail)) {
     WaitArrived(arrived, kBcastArrived + 1, pushGen, myPe, npes, /*skipSelf=*/true);
     if (S > 1) {
       WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
@@ -321,7 +319,7 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
 
   // In block 0's first wave every lane loads this before lane myPe posts.
   const uint64_t gen = AtomicLoad<EAgentScope>(&arrived[myPe]) & ~1ULL;
-  if (threadIdx.x < warpSize) GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
+  GenBarrier<true>(arrived, gen + 1, myPe, NPES, stride4G);
   __syncthreads();
 
   // Each finished position goes to my own slot and to all NPES-1 peers' copies
@@ -343,9 +341,7 @@ AllReducePullKernel(int myPe, cco::ccoWindow_t heapWin,
   // before its block counts in (the barrier release fence only covers the last).
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");   // system-scope release only
   __syncthreads();
-  if (threadIdx.x < warpSize) {
-    if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
-  }
+  if (LastBlockOut(groupCtr)) GenBarrier(arrived, gen + 2, myPe, NPES, stride4G);
 }
 } // namespace collective
 } // namespace mori
