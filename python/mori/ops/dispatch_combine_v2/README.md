@@ -65,6 +65,15 @@ serialize, so a rank makes one per destination per call instead of one per block
 The blocks meet in a few hundred bytes of a `__device__` array in the dispatch
 kernel's own module, so neither the arena nor the caller allocates anything for it.
 
+At 8 ranks or fewer there is no RMW. `tok_off` also holds, from byte 256, a count
+table of a word per source and destination: the last block of a rank stores its
+total for p into p's word of its own row in the table of every higher-numbered
+rank, and each block takes as its first slot on p the sum of the totals the
+lower-numbered ranks stored into its own table. p's rows then run in source rank
+order, the same on every call, and no block waits on a fabric round trip. A rank
+clears its table at the end of the call; a lower rank stores the next call's row
+only after the combine between the two calls.
+
 A call small enough to give every block at most 8 warp work units (512 tokens on
 the default 64 × 16 geometry at top-k 6) is spread over all the blocks instead of
 filling the low half: block b takes units [8b, 8b + 8) on its first 8 warps. Where

@@ -370,6 +370,9 @@ __device__ __forceinline__ __attribute__((address_space(1))) T* EpUniG(T* p) {
 }
 
 constexpr unsigned long long kEpStageOff = 512;
+// The gfx125x dispatch's count table in the slot allocator's region: a word per source row and
+// destination column.
+constexpr unsigned long long kEpCntOff = 256;
 constexpr int kEpStageRegionTok = 512;
 __device__ unsigned _llTmo;
 __device__ unsigned _llSeq[256];
@@ -1132,8 +1135,19 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // this rank included, into the rank's total for p and keeps its offset in it; the last of
   // those blocks to arrive reserves the total with one RMW on p's slot word and publishes the
   // base with the call number in one word.
+  //
+  // With kCntX there is no RMW: the last of them stores the total + 1 into p's word of this
+  // rank's row in the count table of every higher rank, and lane p of each block takes as its
+  // base the sum of the totals the lower ranks stored into its own table, so p's rows run in
+  // source rank order and no block waits on a fabric round trip or on the other blocks. A call
+  // without tokens has no last block, so block 0 stores its zeros: a higher rank waits on them.
+  constexpr bool kCntX = npes <= 8 && !kDPin;
   static_assert(npes <= WS, "one lane per destination");
   static_assert(kCfg.maxTokPerRank < (1 << 20), "a destination's total is kept in 20 bits");
+  static_assert(!kCntX || kEpCntOff + 4ull * npes * npes <= kEpStageOff,
+                "the count table sits below the LL128 stage");
+  static_assert(!kCntX || kEpCntOff + 4ull * npes * npes <= EpRegionTokOff1250xBytes(kCfg),
+                "the count table fits in the region the dispatch plan reports");
   if (warpId == (_ldsMeta ? warpNum - 1 : 0)) {
     constexpr int R = __ATOMIC_RELAXED;
     constexpr int A = __HIP_MEMORY_SCOPE_AGENT;
@@ -1154,7 +1168,37 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
     const index_t loc = (index_t)(old & 0xfffffu);
     const bool last = joins && (old >> 20) == nHold - 1u;
     index_t base = 0;
-    if (_ls) {
+    if constexpr (kCntX) {
+      const bool sends = last || (dest && nHold == 0u && blockIdx.x == 0);
+      if (sends) {
+        const unsigned v = (unsigned)(loc + n) + 1u;
+        for (int q = myPe + 1; q < npes; ++q)
+          __hip_atomic_store(EpPeer<unsigned>(win, q, args.offTokOff + kEpCntOff) + myPe * npes + p,
+                             v, R, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (last) __hip_atomic_store(cnt, 0u, R, A);
+      }
+      if (n > 0 || sends) {
+        unsigned* const tbl = EpLocal<unsigned>(win, args.offTokOff + kEpCntOff) + p;
+        unsigned w[npes];
+#pragma unroll
+        for (int s = 0; s < npes; ++s) {
+          const unsigned x = __hip_atomic_load(tbl + s * npes, R, __HIP_MEMORY_SCOPE_SYSTEM);
+          w[s] = (s < myPe) ? x : 1u;
+        }
+#pragma unroll
+        for (int s = 0; s < npes; ++s) {
+          while (w[s] == 0u) {
+            __builtin_amdgcn_s_sleep(1);
+            w[s] = __hip_atomic_load(tbl + s * npes, R, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          base += (index_t)(w[s] - 1u);
+        }
+      }
+      if (last) {
+        __hip_atomic_store(pub, ((unsigned long long)resSeq << 32) | (unsigned)base, R, A);
+        if (loc + n > 0) keepBase(p, base);
+      }
+    } else if (_ls) {
       if (_blkMapNeeded) __builtin_trap();
       if (last) __hip_atomic_store(cnt, 0u, R, A);
       _lsLast = last;
@@ -1169,7 +1213,7 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
     }
     // The blocks holding tokens wait here for the last of them, so they must all be
     // resident at once.
-    if (!_ls && n > 0 && !last) {
+    if (!kCntX && !_ls && n > 0 && !last) {
       unsigned long long w = __hip_atomic_load(pub, R, A);
       while ((unsigned)(w >> 32) != resSeq) {
         __builtin_amdgcn_s_sleep(1);
@@ -2822,6 +2866,13 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       args.destPeTokenCounter[npes + p] = dl;
       args.destPeTokenCounter[p] = 0;
+    }
+    // Every block took its base before drawing a ticket, and a lower rank stores the next
+    // call's row only after the combine between the two calls.
+    if constexpr (kCntX) {
+      unsigned* const tbl = EpLocal<unsigned>(win, args.offTokOff + kEpCntOff);
+      for (int i = laneId; i < myPe * npes; i += WS)
+        __hip_atomic_store(tbl + i, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
     __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if (laneId == 0) *EpResSeq<npes>() = resSeq;

@@ -545,6 +545,11 @@ constexpr int EpLl128LandRowBytes(const EpCfg& c) {
   return ((data + 119) / 120 + 7) / 8 * 1024;
 }
 constexpr size_t EpRegionTokOffBytes(const EpCfg&) { return 4; }
+// The gfx125x dispatch's: at 8 ranks or fewer the region also holds, from byte 256, a count
+// table of a word per source and destination.
+constexpr size_t EpRegionTokOff1250xBytes(const EpCfg& c) {
+  return c.worldSize <= 8 ? 256 + 4 * (size_t)c.worldSize * c.worldSize : EpRegionTokOffBytes(c);
+}
 // Two words per source: the count, and the push combine's landing offset.
 constexpr size_t EpRegionRecvNumBytes(const EpCfg& c) { return 8 * (size_t)c.worldSize; }
 constexpr size_t EpRegionRecvToSrcBytes(const EpCfg& c) { return (size_t)EpMaxRecv(c) * 4; }

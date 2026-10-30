@@ -291,12 +291,14 @@ def test_every_arena_region_is_reported_in_args_order():
 
 
 def _reference_regions(
-    ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave
+    ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave, gfx125x
 ):
     """hip_backend._regions as it was before the plans reported sizes.
 
-    The one deliberate change: the push combine's row flags are only reserved
-    where the overlapped reduce can run (EpCombinePushOvlAny).
+    The deliberate changes: the push combine's row flags are only reserved
+    where the overlapped reduce can run (EpCombinePushOvlAny), and the gfx125x
+    dispatch of up to 8 ranks keeps a count table, a word per source and
+    destination, from byte 256 of tok_off.
     """
     cap = ws * max_tok
     out_tok = cap * comb_tok
@@ -308,7 +310,7 @@ def _reference_regions(
         if push != "fp4b" and 4 <= ws <= wave:
             out_tok += rows * 8
     regions = [
-        ("tok_off", 4),
+        ("tok_off", 256 + 4 * ws * ws if gfx125x and ws <= 8 else 4),
         ("recv_num", 2 * ws * 4),
         ("recv_to_src_token", cap * 4),
         ("out_idx", cap * topk * 4),
@@ -370,6 +372,7 @@ def test_arena_regions_match_the_layout_the_op_used_to_build(
         scale,
         push,
         d["waveSize"],
+        bool(d["sharedBytes"]),
     )
     assert cb.arena_regions(d, c, region_names=_REGIONS) == want
 

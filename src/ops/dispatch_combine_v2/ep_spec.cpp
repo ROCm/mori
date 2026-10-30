@@ -213,8 +213,11 @@ std::string EpKv(const char* key, size_t value) {
 // regions the other kernel's Cfg sizes.
 std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
   const bool disp = kind == EpKernelKind::Dispatch;
-  return EpKv("region.tokOff", disp && c.ll128 ? EpLl128StageBytes(c) : EpRegionTokOffBytes(c)) +
-         EpKv("region.recvNum", EpRegionRecvNumBytes(c)) +
+  const size_t tokOff = !disp            ? EpRegionTokOffBytes(c)
+                        : c.ll128        ? EpLl128StageBytes(c)
+                        : EpArchIs1250() ? EpRegionTokOff1250xBytes(c)
+                                         : EpRegionTokOffBytes(c);
+  return EpKv("region.tokOff", tokOff) + EpKv("region.recvNum", EpRegionRecvNumBytes(c)) +
          EpKv("region.recvToSrc", EpRegionRecvToSrcBytes(c)) +
          EpKv("region.outIdx", EpRegionOutIdxBytes(c)) +
          EpKv("region.outWts", EpRegionOutWtsBytes(c)) +
