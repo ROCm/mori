@@ -209,9 +209,9 @@ class PoolClient {
   // and keys on peers are pulled into this node's medium in the background.
   size_t BatchPrefetch(const std::vector<std::string>& keys);
 
-  // Recency hint for keys held on this node (IUMBPClient::BatchTouch); returns
-  // the copies touched on this node's media.  Never contacts the master or
-  // another peer.
+  // Recency hint (IUMBPClient::BatchTouch); returns the copies touched on this
+  // node's media.  In the master eviction modes the keys also join the local
+  // reads reported to the master.  Never contacts another peer.
   size_t BatchTouch(const std::vector<std::string>& keys);
 
   MasterClient& Master();

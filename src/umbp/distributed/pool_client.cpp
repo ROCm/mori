@@ -5110,6 +5110,11 @@ std::vector<bool> PoolClient::BatchExists(const std::vector<std::string>& keys) 
 
 size_t PoolClient::BatchTouch(const std::vector<std::string>& keys) {
   if (!initialized_ || keys.empty() || default_pool_ == nullptr) return 0;
+  // In the master eviction modes victims follow the master's recency, which
+  // hears of uses only through these reports.
+  if (master_client_ != nullptr && master_client_->ReportsLocalReads()) {
+    master_client_->NoteLocalReads(keys);
+  }
   return default_pool_->BatchTouch(keys);
 }
 
