@@ -810,7 +810,6 @@ TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
   Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,
       "bandwidth_bytes_per_second":[13107200,26214400,39321600,52428800]}})");
   constexpr size_t bytes = 1 << 20;
-  if (LocalCopyThreads(4 * bytes, 4) < 4) GTEST_SKIP() << "requires four copy threads";
   SimTransferEngine engine(Config().sim.profile_path);
   const auto ptr = Buffer(4 * bytes);
   std::vector<TransferItem> items;
@@ -850,8 +849,9 @@ TEST_F(SimTest, ParallelCopiesKeepSingleStreamFloorAndSharedCapacity) {
   ASSERT_EQ(client->BatchPut(keys, ptrs, sizes), std::vector<bool>(4, true));
   start = Clock::now();
   EXPECT_EQ(client->BatchGet(keys, ptrs, sizes), std::vector<bool>(4, true));
-  EXPECT_GE(Clock::now() - start, 80ms);
-  EXPECT_LT(Clock::now() - start, 250ms);
+  const auto expected = 320ms / LocalCopyThreads(4 * bytes, 4);
+  EXPECT_GE(Clock::now() - start, expected);
+  EXPECT_LT(Clock::now() - start, expected + 170ms);
 }
 
 TEST_F(SimTest, ModelCountsBytesOnceAndUsesCoalescedCopyCosts) {

@@ -309,12 +309,8 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
                                path.copy_latency_ns.size() != 1))) {
       throw std::invalid_argument("UMBP sim profile: invalid coefficients for " + name);
     }
-    const size_t threads = name == "cpu_cpu"
-                               ? std::max(LocalCopyThreadLimit("UMBP_DRAM_COPY_THREADS"),
-                                          LocalCopyThreadLimit("UMBP_DRAM_WRITE_THREADS"))
-                               : 1;
-    path.capacity = *std::max_element(
-        path.bandwidth.begin(), path.bandwidth.begin() + std::min(threads, path.bandwidth.size()));
+    // Thread limits apply per call; independent callers share the measured aggregate capacity.
+    path.capacity = *std::max_element(path.bandwidth.begin(), path.bandwidth.end());
     path.cpu_threads = static_cast<size_t>(cpu_threads);
     paths_[at - names.begin()] = std::move(path);
   }

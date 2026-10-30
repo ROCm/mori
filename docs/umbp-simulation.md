@@ -101,8 +101,8 @@ The example SSD values are estimates, not calibration results.
 
 `cpu_cpu` coefficients may be arrays indexed by copy threads minus one, clamped to the last
 entry; other paths use scalars. Existing thread selection/thresholds still apply.
-Channel capacity is the maximum configured bandwidth up to the larger configured
-copy/write thread limit; set those limits before creating the client.
+Channel capacity is the maximum measured bandwidth; independent callers can use
+more cores than one call's copy/write thread limit. Each call retains its thread curve.
 
 ```text
 size_term = log2(max(1, bytes / copies / 4096))
