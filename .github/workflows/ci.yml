@@ -44,8 +44,6 @@ jobs:
         include:
           - platform: MI355X_AINIC
             runner: [self-hosted, MI355X-AINIC-PIT-G17]
-          - platform: MI300X_MLX
-            runner: [self-hosted, 300_mlx_p19_29]
     timeout-minutes: 180
     steps:
       - name: Fix workspace permissions
@@ -86,26 +84,23 @@ jobs:
           $CT exec $CONTAINER test -x build/examples/collectives_benchmark_rs_timing
           rm -rf $LOG_DIR
 
-      # Temporary (push timing investigation): is all-reduce push limited by the
-      # SDMA engines or by xGMI? Pure-copy references at the same byte counts as
-      # one all-reduce leg (all-gather / all-to-all, SDMA push vs CU pull), plus
-      # all-reduce pull and the all-reduce push baseline (S=2, 128 blocks).
-      # Normal binary only.
-      - name: SDMA vs xGMI ceiling probe (256M, 1G)
+      # Temporary (push timing investigation): all-gather push vs ring
+      # collective-permute push, with the same bytes per SDMA engine. All-gather
+      # sends size/8 elems to each peer (one queue per peer, all in parallel);
+      # permute sends its whole per-rank buffer to one peer over one queue, so
+      # permute size = all-gather size / 8 (32/64/128/256 MB per engine, bf16).
+      - name: all_gather push vs collective_permute push (same bytes per engine)
         if: ${{ !cancelled() && steps.build.outcome == 'success' && env.TIMING_ONLY == 'true' }}
         run: |
           fail=0
           run() {
-            $CT exec -e DTYPES="bf16" -e OPS=sum -e SIZES="268435456 1073741824" \
+            $CT exec -e DTYPES="bf16" -e OPS=sum -e WARMUP=3 -e ITERS=10 \
               -e RUN_TIMEOUT=180 "$@" || fail=1
           }
-          for mode in push pull; do
-            run $CONTAINER bash $BENCH --coll all_gather --mode $mode
-            run $CONTAINER bash $BENCH --coll all_to_all --mode $mode
-          done
-          run $CONTAINER bash $BENCH --coll all_reduce --mode pull
-          run -e MORI_CCL_MAX_NBLOCKS=128 -e LABEL="nb128 " \
-            $CONTAINER bash $BENCH --coll all_reduce --mode push --logS 1
+          run -e SIZES="134217728 268435456 536870912 1073741824" \
+            $CONTAINER bash $BENCH --coll all_gather --mode push
+          run -e SIZES="16777216 33554432 67108864 134217728" \
+            $CONTAINER bash $BENCH --coll collective_permute --mode push
           exit $fail
 
       # Each group runs even if an earlier one failed, so one broken kernel does
