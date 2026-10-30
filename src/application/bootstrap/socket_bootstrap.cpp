@@ -101,8 +101,7 @@ void SocketBootstrapNetwork::Initialize() {
 }
 
 void SocketBootstrapNetwork::Finalize() {
-  if (!initialized_) return;
-
+  // Not gated on initialized_: a failed Initialize() leaves these open too.
   CloseSocket(listen_socket_);
   CloseSocket(ring_send_socket_);
   CloseSocket(ring_recv_socket_);
@@ -753,6 +752,7 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
     if (!ListenSocket(root_listen_socket)) {
       MORI_APP_ERROR("Root: failed to bind PhoneHome socket on {} (errno={})",
                      AddressToString(root_addr), errno);
+      CloseSocket(root_listen_socket);
       return false;
     }
 
@@ -922,31 +922,31 @@ bool SocketBootstrapNetwork::PhoneHomeProtocol() {
 }
 
 bool SocketBootstrapNetwork::SendMessage(int peer, int tag, const void* data, size_t size) {
+  // Same retry pattern as the ring connect: a fresh socket per attempt, and a
+  // failed attempt closes its socket before the next one.
+  constexpr int kRetryDelayMs = 200;
+  const int kMaxRetries = std::max(1, BootstrapTimeoutMs() / kRetryDelayMs);
   Socket sock;
-  if (!InitializeSocket(sock)) {
-    return false;
-  }
-
-  // Retry ConnectSocket with back-off bounded by the shared bootstrap
-  // timeout budget, matching the ring-connect retry pattern above.
-  {
-    constexpr int kRetryDelayMs = 200;
-    const int kMaxRetries = std::max(1, BootstrapTimeoutMs() / kRetryDelayMs);
-    bool connected = false;
-    for (int retry = 0; retry < kMaxRetries; retry++) {
-      if (ConnectSocket(sock, peer_addresses_[peer])) {
-        connected = true;
-        break;
-      }
-      CloseSocket(sock);
-      if (retry + 1 < kMaxRetries) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
-      }
-      if (!InitializeSocket(sock)) return false;
-      MORI_APP_TRACE("SendMessage: rank {} retrying connect to peer {} ({}/{})", localRank, peer,
-                     retry + 1, kMaxRetries);
+  bool connected = false;
+  for (int retry = 0; retry < kMaxRetries; retry++) {
+    if (retry > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
     }
-    if (!connected) return false;
+    if (!InitializeSocket(sock)) {
+      return false;
+    }
+    if (ConnectSocket(sock, peer_addresses_[peer])) {
+      connected = true;
+      break;
+    }
+    CloseSocket(sock);
+    MORI_APP_TRACE("SendMessage: rank {} retrying connect to peer {} ({}/{})", localRank, peer,
+                   retry + 1, kMaxRetries);
+  }
+  if (!connected) {
+    MORI_APP_ERROR("SendMessage: rank {} failed to connect to peer {} after {} retries", localRank,
+                   peer, kMaxRetries);
+    return false;
   }
 
   // Send header: rank, tag, size

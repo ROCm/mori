@@ -116,8 +116,9 @@ cdef extern from "mori/cco/cco.hpp" namespace "mori::cco":
         ccoSdmaContext sdma
 
     int ccoGetUniqueId(ccoUniqueId* uniqueId) nogil
+    # Bootstrap failures throw; without except + they std::terminate the process.
     int ccoCommCreate(const ccoUniqueId& uniqueId, int nRanks, int rank,
-                      size_t perRankVmmSize, ccoComm** outComm) nogil
+                      size_t perRankVmmSize, ccoComm** outComm) except + nogil
     int ccoCommDestroy(ccoComm* comm) nogil
     int ccoMemAlloc(ccoComm* comm, size_t size, void** outPtr) nogil
     int ccoMemImport(ccoComm* comm, void* externalPtr, size_t size, void** outPtr) nogil
