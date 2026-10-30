@@ -341,17 +341,9 @@ class ep_context_t {
     return ep_device_workspace_t{d_device_workspace_, device_workspace_layout_};
   }
 
-  // Debug/test/introspection helpers. They synchronize and issue explicit
-  // D2H copies, so production dispatch/combine paths must not call them.
-  void copy_dest_token_counts_to_host(int32_t* host_counts, hipStream_t stream = 0) const;
-
-  // Dispatch recv per-rank counts + total live in device workspace.  Host
-  // debug/tests must use the explicit copy helpers below.
-  void copy_dispatch_recv_counts_to_host(int32_t* host_counts, hipStream_t stream = 0) const;
+  // Synchronizes and issues an explicit D2H copy, so production
+  // dispatch/combine paths must not call it.
   int32_t copy_recv_count_to_host(hipStream_t stream = 0) const;
-  void copy_token_route_metadata_to_host(int32_t* host_producer_ranks,
-                                         int32_t* host_dispatch_recv_slots,
-                                         hipStream_t stream = 0) const;
 
   // Host-side stream synchronization wrapper.
   void stream_sync(hipStream_t stream);

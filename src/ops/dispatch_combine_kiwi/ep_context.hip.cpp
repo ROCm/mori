@@ -531,40 +531,12 @@ void ep_all2all_callback(internal::ep_cmd_desc_all2all_t desc) {
 
 void ep_context_t::all2all_callback(internal::ep_cmd_desc_all2all_t desc) { all2all_->start(desc); }
 
-void ep_context_t::copy_dest_token_counts_to_host(int32_t* host_counts, hipStream_t stream) const {
-  HIP_CHECK(hipMemcpyAsync(host_counts, device_workspace().dispatch_dest_token_counts_snapshot(),
-                           cfg_.world_size * sizeof(int32_t), hipMemcpyDeviceToHost, stream));
-  HIP_CHECK(hipStreamSynchronize(stream));
-}
-
-void ep_context_t::copy_dispatch_recv_counts_to_host(int32_t* host_counts,
-                                                     hipStream_t stream) const {
-  HIP_CHECK(hipMemcpyAsync(host_counts, device_workspace().dispatch_recv_counts(),
-                           (cfg_.world_size + 1) * sizeof(int32_t), hipMemcpyDeviceToHost, stream));
-  HIP_CHECK(hipStreamSynchronize(stream));
-}
-
 int32_t ep_context_t::copy_recv_count_to_host(hipStream_t stream) const {
   int32_t host_count = 0;
   HIP_CHECK(hipMemcpyAsync(&host_count, device_workspace().recv_count(), sizeof(int32_t),
                            hipMemcpyDeviceToHost, stream));
   HIP_CHECK(hipStreamSynchronize(stream));
   return host_count;
-}
-
-void ep_context_t::copy_token_route_metadata_to_host(int32_t* host_producer_ranks,
-                                                     int32_t* host_dispatch_recv_slots,
-                                                     hipStream_t stream) const {
-  if (host_producer_ranks != nullptr) {
-    HIP_CHECK(hipMemcpyAsync(host_producer_ranks, device_workspace().token_to_producer_rank(),
-                             cfg_.token_to_producer_rank_size(), hipMemcpyDeviceToHost, stream));
-  }
-  if (host_dispatch_recv_slots != nullptr) {
-    HIP_CHECK(
-        hipMemcpyAsync(host_dispatch_recv_slots, device_workspace().token_to_dispatch_recv_slot(),
-                       cfg_.token_to_dispatch_recv_slot_size(), hipMemcpyDeviceToHost, stream));
-  }
-  HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 // ---------------------------------------------------------------------------
