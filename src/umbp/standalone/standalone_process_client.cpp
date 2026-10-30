@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -719,6 +720,14 @@ size_t StandaloneProcessClient::BatchTouch(const std::vector<std::string>& keys)
   ::umbp::CountResponse resp;
   // A server built before BatchTouch answers UNIMPLEMENTED: nothing touched.
   const grpc::Status status = stub_->BatchTouch(&ctx, req, &resp);
+  if (status.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+    static std::once_flag warned;
+    std::call_once(warned, [this] {
+      MORI_UMBP_WARN(
+          "[StandaloneProcessClient] server {} predates BatchTouch; touches move nothing",
+          address_);
+    });
+  }
   return status.ok() ? static_cast<size_t>(resp.count()) : 0;
 }
 
