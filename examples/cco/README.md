@@ -24,6 +24,7 @@ examples/cco/
 | `python/10_flydsl_sdma_allgather_async` | py | FlyDSL SDMA all-gather split into `start_async` / `wait_async`, overlapped with a GEMM |
 | `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `main.py` its test and benchmark against aiter (needs aiter) |
 | `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
+| `python/12_flydsl_sdma_allgather_engine_wait` | py | In-place all-gather over run-time regions; the recommended `post_wait_mem_put_ptr` use: read each peer's READY once, plain put if it is there, else the copy engine (not a CU) waits for it |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -119,6 +120,16 @@ output exactly (relL2 0) at every size (`--no-aligned-pair` for 8192 and up):
 
 Below ~2048 the fixed costs of the extra plan kernel and of the combine outweigh
 what the copy engine saves, and aiter's P2P scatter wins.
+
+Example 12 also uses `torchrun` and SDMA. Its start kernel reads each peer's READY
+once and posts a plain put when it is already set, `post_wait_mem_put_ptr` (the
+copy engine waits) when it is not; `--mode cu` spins a CU on READY instead, and
+`--skew-us` makes the last rank late:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/12_flydsl_sdma_allgather_engine_wait/main.py --skew-us 200
+```
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one
 node; LSA examples (02, 04, 05) ignore it. Each example prints `SUCCESS` on pass.

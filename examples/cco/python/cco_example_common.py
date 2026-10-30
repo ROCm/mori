@@ -77,3 +77,61 @@ def read(dev_ptr: int, count: int, ctype=ctypes.c_uint64):
     arr = (ctype * count)()
     _copy(arr, ctypes.c_void_p(dev_ptr), ctypes.sizeof(arr), _D2H)
     return arr
+
+
+# ── FlyDSL device helpers shared by the SDMA all-gather examples (10, 12) ──
+# Imported lazily: the host helpers above must not need flydsl.
+
+
+def load_u32_system(ptr):
+    """System-scope load, as ``waitSignal`` does for the engine-written counter."""
+    from flydsl._mlir.dialects import llvm
+    from mori.cco.device.flydsl.signals import i32_type
+
+    return llvm.load(
+        i32_type(),
+        ptr,
+        alignment=4,
+        ordering=llvm.AtomicOrdering.monotonic,
+        syncscope="",
+    )
+
+
+def spin_until(ptr, flag, load=None):
+    """Block until the u32 at ``ptr`` has reached ``flag`` (default load:
+    ``signal_load_u32``).
+
+    The test is a signed difference, so a counter that wraps past 2**32 still
+    compares correctly, as long as the two stay less than 2**31 apart. A plain
+    unsigned ``<`` would let a wait pass at the wrap: 0xFFFFFFFF < 0 is false.
+    """
+    import flydsl.expr as fx
+    from flydsl._mlir import ir
+    from flydsl._mlir.dialects import scf
+    from mori.cco.device.flydsl.signals import i32_type, signal_load_u32
+
+    load = load or signal_load_u32
+    first = load(ptr)
+    first_v = first.ir_value() if hasattr(first, "ir_value") else first
+    i32 = i32_type()
+    loop = scf.WhileOp([i32], [first_v])
+    cond = ir.Block.create_at_start(loop.before, [i32])
+    body = ir.Block.create_at_start(loop.after, [i32])
+    with ir.InsertionPoint(cond):
+        cur = fx.Int32(cond.arguments[0])
+        scf.ConditionOp(
+            ((cur - fx.Int32(flag)) < fx.Int32(0)).ir_value(), [cond.arguments[0]]
+        )
+    with ir.InsertionPoint(body):
+        nxt = load(ptr)
+        scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
+
+
+def next_epoch(w, rank, epoch_off, slot):
+    """``epoch[slot] + 1`` (the u32 array at ``epoch_off`` in my window ``w``)
+    and the pointer to store it back through."""
+    import flydsl.expr as fx
+    from mori.cco.device.flydsl.signals import local_load_u32, signal_ptr
+
+    ptr = signal_ptr(fx.Int64(w.lsa_ptr(rank, epoch_off + 4 * slot)))
+    return fx.Int32(local_load_u32(ptr)) + fx.Int32(1), ptr
