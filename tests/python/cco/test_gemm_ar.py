@@ -417,21 +417,24 @@ def test_blockscale_lands_at_the_fp8_floor(m, n, k):
     assert rel < 3e-3, f"blockscale relL2 {rel:.3e} against the fp32 reference"
 
 
+@pytest.mark.parametrize("scale_prefetch", [None, True])
 @pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
 @pytest.mark.parametrize(
     "m,n,k",
     # K=256, 640 and 1280 put the raw path's last scale chunk at 2, 1 and 2 of
     # its 4 K steps: one chunk only, then the prologue's two, then one refilled
-    # in the loop.
+    # in the loop. K=256 has no main-loop step for the prefetch, only the peeled
+    # ones; K=8192 is past SCALE_PREFETCH_MIN_K, so the default turns it on.
     [
         (1024, 512, 256),
         (1024, 512, 512),
         (1024, 512, 640),
         (2048, 5120, 1280),
         (2048, 5120, 2048),
+        (512, 512, 8192),
     ],
 )
-def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant):
+def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant, scale_prefetch):
     """``quant="mxfp8"`` -- DeepSeek-V4.1-Flash's quantisation -- against fp32.
 
     32-wide ue8m0 on both sides, which is the scaled MFMA's own operand format:
@@ -444,7 +447,10 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant):
     same floor as the other two quantisations. A wrong lane mapping does not
     land near the floor: it misses by the ratio of two random powers of two.
 
-    ``n=5120, k=2048`` is ``wo_b`` per rank at TP4 on V4.1-Flash.
+    ``n=5120, k=2048`` is ``wo_b`` per rank at TP4 on V4.1-Flash. ``k=256``
+    runs no main-loop step at all, only the two peeled ones; ``k=8192`` is above
+    the K where ``scale_prefetch`` turns on by default, and ``True`` forces it
+    everywhere.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires a GPU")
@@ -479,6 +485,25 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant):
     rn = ref.norm()
 
     cfg = layout.ArConfig(world_size=2, m=m, n=n)
+    if quant == "mxfp8_raw" and scale_prefetch:
+        # Its scales come from LDS slots refilled every four steps, so a read
+        # one step ahead could cross into a chunk not yet staged.
+        with pytest.raises(ValueError, match="mxfp8_raw"):
+            compile_fused_gemm_scatter(
+                cfg,
+                0,
+                K=k,
+                BLOCK_M=256,
+                BLOCK_N=256,
+                b_preshuffled=True,
+                fuse=False,
+                swap_ab=True,
+                permlane=True,
+                lane_transpose=True,
+                quant=quant,
+                scale_prefetch=scale_prefetch,
+            )
+        return
     gemm = compile_fused_gemm_scatter(
         cfg,
         0,
@@ -491,6 +516,7 @@ def test_mxfp8_lands_at_the_fp8_floor(m, n, k, quant):
         permlane=True,
         lane_transpose=True,
         quant=quant,
+        scale_prefetch=scale_prefetch,
     )
     if quant == "mxfp8_raw":
         # The quantiser's own row-major bytes, staged through LDS.

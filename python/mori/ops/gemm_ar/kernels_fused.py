@@ -916,6 +916,11 @@ class _PeerDirectStoreC(StoreC):
 
 BLOCK_K = 128
 
+#: K at and above which ``quant="mxfp8"`` loads its scales one K step ahead by
+#: default (``scale_prefetch``). Below it the extra live registers cost more
+#: than the unblocked wait saves on most measured shapes.
+SCALE_PREFETCH_MIN_K = 4096
+
 
 def compile_fused_gemm_scatter(
     cfg,
@@ -944,6 +949,7 @@ def compile_fused_gemm_scatter(
     atomic_order: str = "acq_rel",
     chunk_bands: int = 0,
     relaxed_rows: bool = False,
+    scale_prefetch: bool | None = None,
 ):
     """Compile the GEMM, with (``fuse=True``) or without the scatter epilogue.
 
@@ -985,6 +991,16 @@ def compile_fused_gemm_scatter(
     28 spread over all eight and 2 over only two -- and 2 is the fast one. And
     it is not chunk-completion timing, or ``fused-sdma`` would prefer
     chunk-major, which it does not.
+
+    ``scale_prefetch`` loads the mxfp8 scales of K step ``k+1`` at the top of
+    step ``k`` instead of step ``k+1``. Loaded where they are consumed, the
+    scale ``buffer_load``s sit behind the step's tile prefetches, and the
+    ``s_waitcnt vmcnt`` the first MFMA needs for them retires those prefetches
+    too: the pipeline loses about half a step of latency hiding every step.
+    One step earlier the wait becomes ``vmcnt(17..20)`` and no longer blocks,
+    but six more VGPRs stay live, and at short K the kernel spills more. So it
+    is on by default only for ``quant="mxfp8"`` at ``K >= 4096``, where it
+    measured faster or level on every shape tried (README); ``None`` picks that.
 
     Returns ``launch(A, B_T, C, A_scale, B_scale, c_m, c_n, dev_comm, win,
     stream=...)``.
@@ -1051,6 +1067,13 @@ def compile_fused_gemm_scatter(
     mxfp8_pack = quant == "mxfp8"
     mxfp8_raw = quant == "mxfp8_raw"
     mxfp8 = quant in ("mxfp8", "mxfp8_unpacked", "mxfp8_raw") or mxfp8_row
+    if scale_prefetch is None:
+        scale_prefetch = mxfp8_pack and K >= SCALE_PREFETCH_MIN_K
+    if scale_prefetch and mxfp8_raw:
+        # mxfp8_raw reads its scales from LDS slots refilled every CHUNK steps;
+        # reading a step ahead would cross a chunk before its copy has landed.
+        raise ValueError("scale_prefetch is for global scale loads, not mxfp8_raw")
+    scale_prefetch = bool(scale_prefetch) and mxfp8
     if (blockscale or mxfp8) and not swap_ab:
         raise ValueError(
             f"--quant {quant} needs --swap-ab: the unswapped epilogue "
@@ -1218,7 +1241,7 @@ def compile_fused_gemm_scatter(
 
     _kname = (
         f"mori_fused_{(transport if fuse else 'split')}_8w_"
-        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}"
+        f"{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_k{K}_{_kname_tag}{'f' if scale_prefetch else ''}"
         f"{'p' if emit_put else 'x'}{atomic_order[0]}_r{rank}"
     )
 
@@ -1524,6 +1547,9 @@ def compile_fused_gemm_scatter(
 
         wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
 
+        sc_next = None
+        if const_expr(scale_prefetch):
+            sc_next = msk.step(base_row_pre, base_col_pre, 0, LDS_BLOCK_M, LDS_BLOCK_N)
         for k in range_constexpr(K_ITERS - 2):
             if blockscale:
                 (c00_frag, c01_frag, c10_frag, c11_frag), prev_scales = bsk.rescale_for(
@@ -1537,7 +1563,12 @@ def compile_fused_gemm_scatter(
                     lds_block_m=LDS_BLOCK_M,
                 )
             msa0 = msa1 = msb0 = msb1 = None
-            if mxfp8:
+            if const_expr(scale_prefetch):
+                msa0, msa1, msb0, msb1 = sc_next
+                sc_next = msk.step(
+                    base_row_pre, base_col_pre, k + 1, LDS_BLOCK_M, LDS_BLOCK_N
+                )
+            elif mxfp8:
                 msa0, msa1, msb0, msb1 = msk.step(
                     base_row_pre, base_col_pre, k, LDS_BLOCK_M, LDS_BLOCK_N
                 )
@@ -1599,7 +1630,12 @@ def compile_fused_gemm_scatter(
                 lds_block_m=LDS_BLOCK_M,
             )
         msa0 = msa1 = msb0 = msb1 = None
-        if mxfp8:
+        if const_expr(scale_prefetch):
+            msa0, msa1, msb0, msb1 = sc_next
+            sc_next = msk.step(
+                base_row_pre, base_col_pre, K_ITERS - 1, LDS_BLOCK_M, LDS_BLOCK_N
+            )
+        elif mxfp8:
             msa0, msa1, msb0, msb1 = msk.step(
                 base_row_pre, base_col_pre, K_ITERS - 2, LDS_BLOCK_M, LDS_BLOCK_N
             )
@@ -1648,7 +1684,9 @@ def compile_fused_gemm_scatter(
                 lds_block_m=LDS_BLOCK_M,
             )
         msa0 = msa1 = msb0 = msb1 = None
-        if mxfp8:
+        if const_expr(scale_prefetch):
+            msa0, msa1, msb0, msb1 = sc_next
+        elif mxfp8:
             msa0, msa1, msb0, msb1 = msk.step(
                 base_row_pre, base_col_pre, K_ITERS - 1, LDS_BLOCK_M, LDS_BLOCK_N
             )

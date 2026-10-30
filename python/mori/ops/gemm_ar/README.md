@@ -509,6 +509,50 @@ the permutation stays inside the 64 bytes one program already owns, so it is
 address arithmetic rather than traffic, and measures slightly *faster* than the
 stock kernel.
 
+**At long K the scales are loaded one K step ahead.** At the same 256x256 tile
+the mxfp8 GEMM measured 15-20% slower than ptpc, and none of that is the scaled
+MFMA: with constant scales instead of loaded ones it runs at ptpc's speed (899
+vs 905us at 16384x10240x8192). The cost is where the scale loads sit. They are
+issued at the top of a K step, after the previous step's tile prefetches, and
+the first MFMA waits for them with `s_waitcnt vmcnt(3)` -- which, because vmcnt
+retires in issue order, also waits for those prefetches. Every step loses about
+half a step of latency hiding. Issued one step earlier, the wait becomes
+`vmcnt(17..20)` and stops blocking; loading them two steps earlier gains nothing
+more.
+
+It is not free: six more VGPRs are live, in a kernel already at 256. So
+`scale_prefetch` is on by default only for `quant="mxfp8"` at
+`K >= SCALE_PREFETCH_MIN_K` (4096). GEMM only, 256x256, MI355X, FlyDSL 0.4.0,
+CUDA-graph timed with B rotated past the LLC, median of two to three
+interleaved rounds, relL2 1.66e-3 throughout:
+
+| M x N x K | | off | on | |
+|---|---|---:|---:|---:|
+| 1024 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 49.6 | 44.4 | **-10.4%** |
+| 4096 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 95.9 | 90.3 | **-5.8%** |
+| 8192 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 151.5 | 146.8 | **-3.1%** |
+| 16384 x 5120 x 4096 | V4.1-Flash `wo_b`, TP2 | 274.9 | 265.2 | **-3.5%** |
+| 8192 x 7168 x 4096 | | 204.3 | 201.7 | -1.2% |
+| 8192 x 5120 x 8192 | V4.1-Flash `wo_b`, TP1 | 281.5 | 271.4 | **-3.6%** |
+| 16384 x 5120 x 8192 | V4.1-Flash `wo_b`, TP1 | 546.1 | 504.0 | **-7.7%** |
+| 4096 x 10240 x 8192 | | 282.8 | 267.6 | **-5.4%** |
+| 16384 x 10240 x 8192 | | 1099.5 | 989.2 | **-10.0%** |
+| 2048 x 18432 x 16384 | | 590.1 | 527.7 | **-10.6%** |
+| 8192 x 18432 x 16384 | | 1939.0 | 1835.8 | **-5.3%** |
+
+Below 4096 it is shape-dependent rather than a win. Forced on, V4.1-Flash's
+TP2 `wq_b` (16384 x 1280) is 0-5% slower from M=1024 to 8192 and level at
+16384, and the 256x256 shapes at K = 512 and 1280-2048 measured 1-8% slower;
+it was faster at K = 256, 640 and 1792 and on the 256x128 tile. 8192x7168x4096
+is the one shape at the threshold that does not gain, and it is level hot
+(+0.9%). `scale_prefetch=True/False` overrides the default.
+
+This and `"mxfp8_raw"` below take the same `vmcnt` coupling apart two ways:
+prefetch keeps the scales in global memory and issues their loads a step
+earlier, `"mxfp8_raw"` moves them into LDS. They do not combine: a raw-mode
+read one step ahead could cross into an LDS chunk not yet staged, so
+`scale_prefetch=True` with `"mxfp8_raw"` is refused.
+
 **Row-major scales through LDS (`quant="mxfp8_raw"`) beat both, cold and at
 large M** (the table below has where they do not). The packed
 layout fixes the addresses but still reads from global once per K step, and that
