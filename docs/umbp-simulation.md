@@ -64,10 +64,11 @@ Each path names its source/destination memory type, except the remote paths, whi
 the initiator's read/write direction. Configure every path your workload uses; a missing
 path rejects the transfer. Unused paths may be omitted.
 
-This first version uses manually supplied parameters. Automatic calibration belongs in
-a follow-up PR covering the actual engines (`LocalCopyEngine`, `HbmCopyEngine` and
-`MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers. SSD coefficients
-also need measurements of the actual configured storage path.
+Profiles may use manual estimates or the optional [engine calibration tools](umbp-calibration.md).
+Those tools measure `LocalCopyEngine`, `HbmCopyEngine`, `MoriIoEngine`, `PosixEngine`,
+`GdsEngine` and `SSDTier`, and merge
+measured coefficients with explicitly reported estimates for unmeasured paths.
+Select the paths and SSD settings used by your deployment when calibrating.
 
 For staged SSD load/offload, optional `file_cpu_staged` / `cpu_file_staged` describe storage-path cost;
 normal CPU/GPU/network transfers add their own costs. Fit those SSD coefficients
