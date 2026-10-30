@@ -1368,7 +1368,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 raise ValueError(f"{name} must be '0' or '1', got {value!r}")
             return value == "1"
 
-        early = flag("MORI_ASYNCLL_EARLY_NOTIFY", arch == "gfx1250")
+        # On by default where it has been measured to win: gfx1250, and gfx950
+        # (MI355X), where it beat legacy at every token count, most with two
+        # overlapping streams.
+        early = flag("MORI_ASYNCLL_EARLY_NOTIFY", arch in ("gfx950", "gfx1250"))
         fused = flag("MORI_ASYNCLL_FUSED_RECV", False)
         skip_reset = flag("MORI_ASYNCLL_SKIP_RESET", early)
         if (fused or skip_reset) and not early:

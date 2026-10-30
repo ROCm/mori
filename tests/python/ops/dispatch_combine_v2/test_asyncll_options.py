@@ -84,10 +84,17 @@ class AsyncLLOptionsTest(unittest.TestCase):
         self.assertEqual((mode, skip), (0, False))
         self.assertIn("dispatch_recvtransfer", seq["dispatch_recv"])
 
-    def test_other_architectures_require_explicit_opt_in(self):
-        self.assertEqual(self.resolve({}, arch="gfx950")[:2], (0, False))
+    def test_gfx950_defaults_to_early_notification(self):
+        self.assertEqual(self.resolve({}, arch="gfx950")[:2], (1, True))
         self.assertEqual(
-            self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "1"}, arch="gfx950")[:2],
+            self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "0"}, arch="gfx950")[:2],
+            (0, False),
+        )
+
+    def test_other_architectures_require_explicit_opt_in(self):
+        self.assertEqual(self.resolve({}, arch="gfx942")[:2], (0, False))
+        self.assertEqual(
+            self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "1"}, arch="gfx942")[:2],
             (1, True),
         )
 
