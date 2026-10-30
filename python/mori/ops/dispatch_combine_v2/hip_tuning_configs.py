@@ -165,6 +165,10 @@ _DISPATCH_TABLE: dict = {
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((2048, 64, 16), (None, 128, 16)),
+            # bf16 keeps 64 blocks at every token count, leaving the rest of the CUs to the
+            # co-resident GEMM. Standalone, 128x16 past 2048 is 1.5-2% faster: dispatch+combine
+            # 424.2 / 811.4 us against 430.8 / 827.4 at 4096 / 8192 tokens a rank.
+            "bf16": ((None, 64, 16),),
             "fp4": (
                 (1024, 64, 16),
                 (1536, 64, 24),
