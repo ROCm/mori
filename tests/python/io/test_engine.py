@@ -25,6 +25,7 @@ import os
 import time
 from contextlib import contextmanager
 import torch
+import torch.multiprocessing as mp
 from mori.io import (
     IOEngineConfig,
     BackendType,
@@ -45,6 +46,8 @@ def create_connected_engine_pair(
     post_batch_size,
     num_worker_threads,
     enable_notification=True,
+    max_send_wr=0,
+    **rdma_config,
 ):
     config = IOEngineConfig(
         host="127.0.0.1",
@@ -58,7 +61,10 @@ def create_connected_engine_pair(
         post_batch_size=post_batch_size,
         num_worker_threads=num_worker_threads,
         enable_notification=enable_notification,
+        **rdma_config,
     )
+    if max_send_wr:
+        config.max_send_wr = max_send_wr
     with temporary_env("MORI_DISABLE_AUTO_XGMI", "1"):
         initiator.create_backend(BackendType.RDMA, config)
         target.create_backend(BackendType.RDMA, config)
@@ -689,6 +695,110 @@ def test_successful_writes_always_have_inbound_notification_under_pressure():
                 )
 
         assert torch.equal(initiator_tensor.cpu(), target_tensor.cpu())
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_batch_beyond_sq_depth_with_small_post_batch_size():
+    """A QP's unsignaled WRs never keep its next batch out of the SQ.
+
+    With 16 SQ slots and post_batch_size=3, the sixth batch of an 18-WR transfer used to
+    wait on the 15 unsignaled WRs posted ahead of it until the SQ backoff ran out, fail,
+    and leave their depth reserved for good.
+    """
+    initiator, target = create_connected_engine_pair(
+        "sq_small_batches",
+        qp_per_transfer=1,
+        post_batch_size=3,
+        num_worker_threads=1,
+        enable_notification=False,
+        max_send_wr=16,
+    )
+    # The gaps keep the segments from merging into fewer WRs.
+    seg, stride, count = 4096, 8192, 18
+    initiator_tensor, target_tensor, initiator_mem, target_mem = alloc_and_register_mem(
+        (initiator, target), [count * stride]
+    )
+    sess = initiator.create_session(initiator_mem, target_mem)
+    offsets = [i * stride for i in range(count)]
+    for _ in range(3):
+        status = sess.batch_write(
+            offsets, offsets, [seg] * count, sess.allocate_transfer_uid()
+        )
+        wait_status(status)
+        assert status.Succeeded(), status.Message()
+    for off in offsets:
+        assert torch.equal(
+            initiator_tensor[off : off + seg].cpu(),
+            target_tensor[off : off + seg].cpu(),
+        )
+
+
+def _sq_full_mid_transfer_worker(result_queue):
+    # The SQ backoff timeout is read once per process, so it is set here, before any post.
+    os.environ["MORI_IO_SQ_BACKOFF_TIMEOUT_US"] = "1"
+    try:
+        initiator, target = create_connected_engine_pair(
+            "sq_full_mid_transfer",
+            qp_per_transfer=4,
+            post_batch_size=-1,
+            num_worker_threads=1,
+            enable_notification=False,
+            max_send_wr=16,
+            enable_transfer_chunking=True,
+            chunk_bytes=1 << 20,
+        )
+        mib = 1 << 20
+        _, _, initiator_mem, target_mem = alloc_and_register_mem(
+            (initiator, target), [128 * mib]
+        )
+        sess = initiator.create_session(initiator_mem, target_mem)
+
+        def write(nbytes, offset=0):
+            return sess.write(offset, offset, nbytes, sess.allocate_transfer_uid())
+
+        # A 32 MiB write holds 8 slots per QP; a 64 MiB one posted right behind it takes
+        # the rest, then runs out of SQ depth before the first one completes.
+        for _ in range(20):
+            first, second = write(32 * mib), write(64 * mib, 64 * mib)
+            wait_status(first)
+            wait_status(second)
+            if second.Failed():
+                break
+        else:
+            result_queue.put(("skip", "no write ran out of SQ depth partway"))
+            return
+        time.sleep(0.5)
+        # Idle again: what fit before must still fit (64 MiB is 16 WRs on each QP).
+        failures = []
+        for nbytes in [64 * mib] * 3 + [mib] * 8:
+            status = write(nbytes)
+            wait_status(status)
+            if not status.Succeeded():
+                failures.append(status.Message())
+        result_queue.put(("done", failures))
+    except Exception as e:
+        result_queue.put(("error", repr(e)))
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires 2 GPUs")
+def test_sq_full_partway_through_a_write_releases_the_wrs_it_posted():
+    """Running out of SQ depth partway through a write does not strand the WRs it posted.
+
+    A chunked write signals only its last WR on each QP. The ones it had already posted
+    when a later chunk could not reserve SQ depth got no CQE, so their depth was never
+    released: a write that fit before then failed, and soon every QP of the session
+    reported SQ full while idle.
+    """
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_sq_full_mid_transfer_worker, args=(result_queue,))
+    proc.start()
+    kind, detail = result_queue.get(timeout=120)
+    proc.join(timeout=60)
+    if kind == "skip":
+        pytest.skip(detail)
+    assert kind == "done", detail
+    assert not detail, detail
 
 
 def test_no_backend():
