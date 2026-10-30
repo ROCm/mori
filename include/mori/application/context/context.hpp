@@ -94,7 +94,7 @@ class Context {
   const PeerCapabilities& GetPeerCapabilities(int destRank) const { return peerCaps[destRank]; }
   const std::vector<PeerCapabilities>& GetAllPeerCapabilities() const { return peerCaps; }
 
-  // KFD topology node id (== HSA_AGENT_INFO_NODE) of a peer's GPU. This is a
+  // KFD sysfs node id of a peer's GPU (see anvil::AnvilLib::connect). This is a
   // process-independent, host-global identity: it does not depend on
   // HIP_VISIBLE_DEVICES, so it is the correct key for wiring SDMA queues to a
   // peer even when the peer GPU is not in this process's HIP device list.

@@ -213,9 +213,23 @@ DistributedClient::~DistributedClient() { Close(); }
 // Core KV Operations
 // ---------------------------------------------------------------------------
 
+void DistributedClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
+  std::unique_lock lock(op_mutex_);
+  if (closed_ || closing_) throw std::logic_error("client is closed");
+  pool_client_->ConfigureKvIndexer(config);
+  kv_metadata_provider_ = config.metadata_provider;
+}
+
+KvMetadataPin DistributedClient::RegisterKvBlock(const KvBlockMetadata& block) {
+  std::shared_lock lock(op_mutex_);
+  if (closed_ || closing_) throw std::logic_error("client is closed");
+  return pool_client_->RegisterKvBlock(block);
+}
+
 bool DistributedClient::Put(const std::string& key, uintptr_t src, size_t size) {
   SimCall call(sim_trace_.get(), "put", 1, size);
   if (closing_) return false;
+  auto metadata = PrepareKvMetadata({key});
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
   return call.Result(pool_client_->Put(key, reinterpret_cast<const void*>(src), size));
@@ -246,6 +260,7 @@ std::vector<bool> DistributedClient::BatchPut(const std::vector<std::string>& ke
                                               const std::vector<size_t>& sizes) {
   SimCall call(sim_trace_.get(), "batch_put", keys.size(), sizes);
   if (closing_) return std::vector<bool>(keys.size(), false);
+  auto metadata = PrepareKvMetadata(keys);
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
 
@@ -265,6 +280,7 @@ std::vector<bool> DistributedClient::BatchPutWithDepth(const std::vector<std::st
   // master-as-advisor design master no longer tracks per-key depth.
   // Forward to the depth-less BatchPut and silently drop the hint.
   if (closing_) return std::vector<bool>(keys.size(), false);
+  auto metadata = PrepareKvMetadata(keys);
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
   std::vector<const void*> src_ptrs(srcs.size());
@@ -311,6 +327,7 @@ std::vector<bool> DistributedClient::BatchPutRanges(
     const std::vector<std::vector<size_t>>& dst_offsets) {
   SimCall call(sim_trace_.get(), "batch_put_ranges", keys.size(), sizes);
   if (closing_) return std::vector<bool>(keys.size(), false);
+  auto metadata = PrepareKvMetadata(keys);
   std::shared_lock lk(op_mutex_);
   if (closed_ || !pool_client_) return std::vector<bool>(keys.size(), false);
   std::vector<std::vector<const void*>> src_ptrs(srcs.size());
@@ -411,10 +428,9 @@ bool DistributedClient::Flush() {
   if (closing_) return call.Result(true);
   std::shared_lock lk(op_mutex_);
   if (closed_ || !pool_client_) return call.Result(true);
-  // Nothing to flush to on a node with no master; the local media are already
-  // authoritative for everything they hold.
+  // Indexer reporting is independent of whether this node has a master.
   if (pool_client_->HasMaster()) pool_client_->Master().FlushHeartbeat();
-  return call.Result(true);
+  return call.Result(pool_client_->FlushKvIndexer());
 }
 
 void DistributedClient::Close() {

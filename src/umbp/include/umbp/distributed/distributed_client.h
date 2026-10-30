@@ -47,6 +47,8 @@ class DistributedClient : public IUMBPClient {
  public:
   explicit DistributedClient(const UMBPConfig& config);
   ~DistributedClient() override;
+  void ConfigureKvIndexer(const KvIndexerConfig& config) override;
+  KvMetadataPin RegisterKvBlock(const KvBlockMetadata& block) override;
 
   // ---- IUMBPClient interface ----
   bool Put(const std::string& key, uintptr_t src, size_t size) override;

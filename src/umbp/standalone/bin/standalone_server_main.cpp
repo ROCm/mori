@@ -271,6 +271,18 @@ bool ApplyDistributedBackendConfigFromEnv(mori::umbp::UMBPConfig* config,
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Backend and GPU initialization create threads. They must inherit the mask
+  // so SIGTERM reaches the waiter and shutdown can withdraw Indexer residency.
+  sigset_t signal_set;
+  sigemptyset(&signal_set);
+  sigaddset(&signal_set, SIGINT);
+  sigaddset(&signal_set, SIGTERM);
+  const int block_rc = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
+  if (block_rc != 0) {
+    MORI_UMBP_ERROR("[StandaloneServer] failed to block signals: {}", std::strerror(block_rc));
+    return 1;
+  }
+
   mori::umbp::RaiseOpenFileLimit();
   mori::umbp::UMBPConfig config = mori::umbp::UMBPConfig::FromEnvironment();
   config.role = mori::umbp::UMBPRole::Standalone;
@@ -312,17 +324,6 @@ int main(int argc, char** argv) {
     server = std::make_unique<mori::umbp::standalone::StandaloneServer>(config, address);
   } catch (const std::exception& exc) {
     MORI_UMBP_ERROR("[StandaloneServer] backend initialization failed: {}", exc.what());
-    return 1;
-  }
-
-  sigset_t signal_set;
-  sigemptyset(&signal_set);
-  sigaddset(&signal_set, SIGINT);
-  sigaddset(&signal_set, SIGTERM);
-
-  const int block_rc = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
-  if (block_rc != 0) {
-    MORI_UMBP_ERROR("[StandaloneServer] failed to block signals: {}", std::strerror(block_rc));
     return 1;
   }
 

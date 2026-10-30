@@ -98,6 +98,8 @@ _load_umbp()
 
 from mori.cpp import (  # noqa: E402
     CacheRemoteAdmission,
+    KvBlockMetadata,
+    KvIndexerConfig,
     UMBPClient,
     UMBPConfig,
     UMBPSimConfig,
@@ -125,6 +127,8 @@ from mori.cpp import (  # noqa: E402
 
 __all__ = [
     "CacheRemoteAdmission",
+    "KvBlockMetadata",
+    "KvIndexerConfig",
     "UMBPClient",
     "UMBPConfig",
     "UMBPSimConfig",

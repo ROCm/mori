@@ -20,6 +20,7 @@ service UMBPStandalone {
 
   rpc Clear(Empty) returns (BoolResponse);
   rpc Flush(Empty) returns (BoolResponse);
+  rpc ConfigureKvIndexer(StandaloneKvIndexerConfig) returns (BoolResponse);
   rpc RegisterMemory(RegisterMemoryRequest) returns (BoolResponse);
   rpc DeregisterMemory(DeregisterMemoryRequest) returns (Empty);
 
@@ -33,6 +34,25 @@ service UMBPStandalone {
 
 message Empty {}
 
+message StandaloneKvIndexerConfig {
+  string endpoint = 1;
+  uint32 timeout_ms = 2;
+  string dram_pool_id = 3;
+  optional uint32 repair_interval_ms = 4;
+}
+
+message StandaloneKvComponent {
+  uint32 component = 1;
+  repeated string keys = 2;
+}
+
+message StandaloneKvBlock {
+  sfixed64 hash = 1;
+  optional sfixed64 parent = 2;
+  uint32 block_size = 3;
+  repeated StandaloneKvComponent components = 4;
+}
+
 message PingResponse {
   bool ready = 1;
   StandaloneBackendMode deployment_mode = 2;
@@ -43,6 +63,7 @@ message PingResponse {
 message BoolResponse {
   bool ok = 1;
   string error = 2;
+  bool supports_kv_metadata = 3; // ConfigureKvIndexer capability handshake.
 }
 
 enum StandaloneBackendMode {
@@ -89,6 +110,7 @@ message BatchDataRequest {
   // Parallel to shm_offsets: region_bases[i] is the worker VA base of the
   // region shm_offsets[i] is relative to. Empty means single-region / legacy.
   repeated uint64 region_bases = 5;
+  repeated StandaloneKvBlock kv_blocks = 6; // Put only; validated before writing.
 }
 
 message BatchRangeDataRequest {
@@ -116,6 +138,7 @@ message BatchRangeDataRequest {
   // can never bind to a key list other than the one it was minted for.
   uint64 key_handle = 9;
   uint64 key_fingerprint = 10;
+  repeated StandaloneKvBlock kv_blocks = 11; // Put only.
 }
 
 message BatchDataWithDepthRequest {
@@ -125,6 +148,7 @@ message BatchDataWithDepthRequest {
   repeated uint64 sizes = 4;
   repeated int32 depths = 5;
   repeated uint64 region_bases = 6;
+  repeated StandaloneKvBlock kv_blocks = 7;
 }
 
 message BatchBoolResponse {

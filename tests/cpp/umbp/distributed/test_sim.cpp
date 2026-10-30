@@ -251,6 +251,52 @@ TEST_P(SimApiTest, PublicApisNeverAccessPayloadAndRecordOutcomes) {
   EXPECT_TRUE(saw_put && saw_partial);
 }
 
+TEST_P(SimApiTest, IndexerMetadataPreservesScalarTraceAndFlushFailure) {
+  auto config = Config();
+  auto client = Client(config, GetParam());
+  bool invalid = true;
+  size_t callbacks = 0;
+  client->ConfigureKvIndexer(
+      {"127.0.0.1:1", "sim-pool", 10, [&](const auto& keys) {
+         ++callbacks;
+         return std::vector<KvBlockMetadata>{
+             {42, invalid ? std::optional<int64_t>(42) : std::nullopt, 16, {{1, keys}}}};
+       }});
+  const auto ptr = Buffer(kPage);
+  ASSERT_TRUE(client->RegisterMemory(ptr, kPage));
+  EXPECT_THROW(client->Put("key", ptr, kPage), std::invalid_argument);
+  EXPECT_FALSE(client->Exists("key"));
+  invalid = false;
+  EXPECT_TRUE(client->Put("key", ptr, kPage));
+  EXPECT_TRUE(client->Exists("key"));
+  EXPECT_EQ(callbacks, 2u);
+  EXPECT_FALSE(client->Flush());  // Indexer failure must survive the sim trace wrapper.
+  client->Close();
+
+  std::ifstream trace(config.sim.trace_path);
+  std::string line;
+  size_t puts = 0, failures = 0, flushes = 0;
+  while (std::getline(trace, line)) {
+    google::protobuf::Struct record;
+    ASSERT_TRUE(google::protobuf::util::JsonStringToMessage(line, &record).ok());
+    const auto& f = record.fields();
+    const auto& api = f.at("api").string_value();
+    EXPECT_NE(api, "batch_put");  // Scalar metadata forwarding must not add a second trace.
+    if (api == "put") {
+      ++puts;
+      failures += f.at("exception").bool_value();
+      EXPECT_EQ(f.at("result_count").number_value(), f.at("exception").bool_value() ? -1 : 1);
+    }
+    if (api == "flush") {
+      ++flushes;
+      EXPECT_EQ(f.at("result_count").number_value(), 0);
+    }
+  }
+  EXPECT_EQ(puts, 2u);
+  EXPECT_EQ(failures, 1u);
+  EXPECT_EQ(flushes, 1u);
+}
+
 TEST_P(SimApiTest, VirtualGpuCallerLoadsAndOffloadsWithoutDevice) {
   for (auto medium : {UMBPMedium::DRAM, UMBPMedium::HBM}) {
     Profile(

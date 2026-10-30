@@ -59,6 +59,7 @@ class WorkloadTraceRecorder;
 
 class PeerServiceServer;
 class PeerPool;
+class KvIndexerReporter;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -126,6 +127,11 @@ class PoolClient {
                       int device = -1, MemoryRegistration mode = MemoryRegistration::kPinned);
 
   void DeregisterMemory(void* ptr);
+
+  // Optional Indexer reporting, configured once at the storage owner.
+  void ConfigureKvIndexer(const KvIndexerConfig& config);
+  KvMetadataPin RegisterKvBlock(const KvBlockMetadata& block);
+  bool FlushKvIndexer();
 
   // Hot paths.  Both retry up to `max_route_retries` times when the
   // chosen peer reports ENOSPC (Put) or unknown-key (Get); each retry
@@ -347,6 +353,7 @@ class PoolClient {
   // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
   // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
+  std::shared_ptr<KvIndexerReporter> kv_indexer_;
 
   // The implicit default logical pool. It borrows registry_, owns placement
   // state and policy, and is the dispatch surface for local and peer RPC paths.

@@ -72,6 +72,8 @@ class StandaloneProcessClient : public IUMBPClient {
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
   size_t BatchPrefetch(const std::vector<std::string>& keys) override;
 
+  void ConfigureKvIndexer(const KvIndexerConfig& config) override;
+
   bool Clear() override;
   bool Flush() override;
   void Close() override;
@@ -99,6 +101,9 @@ class StandaloneProcessClient : public IUMBPClient {
       const std::vector<std::string>& hashes) override;
 
  private:
+  std::vector<bool> BatchPutImpl(const std::vector<std::string>& keys,
+                                 const std::vector<uintptr_t>& srcs,
+                                 const std::vector<size_t>& sizes);
   // Resolves `ptr` against the registered host regions. On success writes the
   // region-relative `offset` and the matched region's worker VA `region_base`.
   bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset, uint64_t* region_base) const;

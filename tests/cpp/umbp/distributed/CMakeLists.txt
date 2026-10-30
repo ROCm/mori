@@ -14,6 +14,10 @@
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
+add_executable(test_kv_indexer_reporter test_kv_indexer_reporter.cpp)
+target_link_libraries(test_kv_indexer_reporter PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_kv_indexer_reporter PRIVATE cxx_std_17)
+add_test(NAME umbp_kv_indexer_reporter COMMAND test_kv_indexer_reporter)
 # The flavor src/umbp/CMakeLists.txt picks: umbp_common brings that one in, and a
 # test linking the other as well would load two copies of gRPC. Its gRPC targets
 # are not visible from this directory, hence the second find_package.
