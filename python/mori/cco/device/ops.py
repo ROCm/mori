@@ -359,6 +359,16 @@ for _tag in COOP_TAGS:
         family="sdma_put_broadcast",
         tag=_tag,
     )
+# ccoSdma::postWaitMemPutPtr: wait + copy + signals in one reservation, one
+# doorbell. (devComm, peer, qid, win, off, value, cmp, mask, dst, src, nbytes, flags)
+_add(
+    "sdma_post_wait_mem_put_ptr_thread",
+    "cco_sdma_post_wait_mem_put_ptr__thread",
+    [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _U64, _U64, _U64, _I32],
+    _I32,
+    family="sdma_post_wait_mem_put_ptr",
+    tag="thread",
+)
 
 # GDA data path.
 _gda_put_args = [
