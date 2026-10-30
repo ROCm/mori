@@ -1,11 +1,11 @@
 # Tested base images (the apt ROCm install below must match the base's ROCm
 # version: the base's rocm_sdk wheels warn on every import of a mori built
 # against another one, and a different major stacks two ROCm installs):
-#   rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0  (default)
-#   rocm/pytorch:rocm10.1.0_ubuntu22.04_py3.10_pytorch_release_2.14.0
+#   rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.12.0  (default)
+#   rocm/pytorch:rocm10.1.0_ubuntu22.04_py3.10_pytorch_release_2.12.0
 #   rocm/jax:rocm10.1.0_ubuntu24.04_py3.12_jax_release_0.10.2         (JAX CI)
 #   rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.12.0  (ROCM_APT_* below)
-ARG BASE_IMAGE=rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
+ARG BASE_IMAGE=rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.12.0
 FROM ${BASE_IMAGE}
 
 # Space-separated gfx targets to pull ROCm device packages for. The CCO CI

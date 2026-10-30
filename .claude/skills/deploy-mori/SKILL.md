@@ -52,7 +52,7 @@ done
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-Default image: `rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0`
+Default image: `rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.12.0`
 (use unless the user specifies another) — same base the CI workflows build on.
 
 ```bash
