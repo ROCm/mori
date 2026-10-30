@@ -1379,6 +1379,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # Must match EpInterNodeCfg::asyncLlMode: legacy, early, fused CTA wait.
         return (2 if fused else int(early)), skip_reset
 
+    @staticmethod
+    def _asyncll_fused_recv_ctas(mode):
+        # Grid ceiling for the fused receive copies; 0 lets the native factory
+        # pick half the device. Only a tuning override: the default exists so
+        # that fusion cannot starve another stream's sends into a deadlock.
+        name = "MORI_ASYNCLL_FUSED_RECV_CTAS"
+        value = os.environ.get(name, "0")
+        try:
+            ctas = int(value)
+        except ValueError:
+            ctas = -1
+        if ctas < 0:
+            raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        return ctas if mode == 2 else 0
+
     @classmethod
     def _asyncll_seq(cls, cfg, mode=0):
         lsa = cfg.async_ll_transport == "lsa"
@@ -1416,6 +1431,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # geometry table supplies grids directly.
         request["mpCount"] = self._multi_processor_count
         request["asyncLlMode"] = self._asyncll_mode
+        request["asyncLlFusedRecvCtas"] = self._asyncll_fused_ctas
         return request
 
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
@@ -1435,6 +1451,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # KernelSet.self_resets_counters with it), and AsyncLL's RecvCopy
         # always assigned the count. Still parsed so existing settings validate.
         self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
+        self._asyncll_fused_ctas = self._asyncll_fused_recv_ctas(self._asyncll_mode)
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         for group, names in sequences.items():
             for name in names:

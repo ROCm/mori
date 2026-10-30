@@ -101,9 +101,12 @@ These options are read once when an op is constructed:
    * - ``MORI_ASYNCLL_FUSED_RECV``
      - ``0``. Set ``1`` to fold receive waits into the copy passes. One wave
        per CTA waits, then an acquire and CTA barrier release the copy waves.
+   * - ``MORI_ASYNCLL_FUSED_RECV_CTAS``
+     - ``0``, meaning half the device's compute units. Grid ceiling for the
+       fused receive copies; ignored unless ``MORI_ASYNCLL_FUSED_RECV=1``.
 
-All three variables accept ``0`` or ``1``. Skipping the reset or fusing receive
-requires early notification. Set all three to ``0`` for the legacy sequence.
+The first three variables accept ``0`` or ``1``. Skipping the reset or fusing
+receive requires early notification. Set all three to ``0`` for the legacy sequence.
 LSA and multi-node ops retain their existing protocol and ignore these SDMA
 options. The resolved notification mode is part of every native Plan's
 configuration and generated source, so different ops can coexist without
@@ -111,6 +114,15 @@ changing the protocol of an already constructed Plan.
 
 The default targets single-node gfx1250 overlap. Receive fusion remains opt-in
 because its additional benefit depends on the token count and compute window.
+
+Receive fusion is a single-stream optimisation. A fused receive copy waits for
+its peers inside every CTA, so its whole grid stays resident for the wait. When
+two micro-batches overlap on two streams (two-batch overlap), that grid can
+crowd out the send pass the other stream must run before any peer's wait can
+end, and the ranks deadlock. The grid ceiling makes this unlikely but cannot
+rule it out if the other stream occupies most of the device. On MI355X, two
+streams gained nothing from fusion over early notification, so dual-stream
+callers should use early notification alone.
 
 MORI Shmem (Symmetric Memory)
 -------------------------------

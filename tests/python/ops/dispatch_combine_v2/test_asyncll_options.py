@@ -91,6 +91,26 @@ class AsyncLLOptionsTest(unittest.TestCase):
             (1, True),
         )
 
+    def test_fused_receive_grid_ceiling_reaches_only_the_fused_mode(self):
+        resolve = EpDispatchCombineOpHip._asyncll_fused_recv_ctas
+        for env, mode, expected in [
+            ({}, 2, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 2, 64),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 1, 0),
+            ({"MORI_ASYNCLL_FUSED_RECV_CTAS": "64"}, 0, 0),
+        ]:
+            with (
+                self.subTest(env=env, mode=mode),
+                patch.dict(os.environ, env, clear=True),
+            ):
+                self.assertEqual(resolve(mode), expected)
+        for value in ("-1", "half"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                with patch.dict(
+                    os.environ, {"MORI_ASYNCLL_FUSED_RECV_CTAS": value}, clear=True
+                ):
+                    resolve(2)
+
     def test_reject_inconsistent_or_invalid_options(self):
         for option in ("MORI_ASYNCLL_FUSED_RECV", "MORI_ASYNCLL_SKIP_RESET"):
             with self.subTest(option=option), self.assertRaises(ValueError):

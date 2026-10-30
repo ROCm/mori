@@ -78,6 +78,12 @@ struct EpInterNodeCfg {
   // cross-compiling.
   int mpCount{64};
   int waveSize{64};
+  // Grid ceiling for the fused receive copies (asyncLlMode 2), resolved by
+  // MakeEpInterNodeCfg; 0 everywhere else. A fused copy waits for its peers
+  // inside every CTA, so its whole grid stays resident for the wait. Spanning
+  // the device, that can leave no room for the send pass another stream must
+  // run before any peer's wait can end -- a cross-rank deadlock.
+  int asyncLlFusedRecvCtas{0};
 };
 
 template <typename Self, typename Visit>
@@ -91,11 +97,12 @@ inline void VisitFields(Self& cfg, const EpInterNodeCfg& defaults, Visit&& visit
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
   MORI_FIELD(waveSize);
+  MORI_FIELD(asyncLlFusedRecvCtas);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeCfg, 8, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
+    EpInterNodeCfg, 9, "added an EpInterNodeCfg field -- update VisitFields(EpInterNodeCfg) too");
 
 // The whole Cfg as text, for the plan's `info` and for logs. NOT the source
 // text: RenderSource renders the kernel specialisation (and AsyncLL mode), not
@@ -183,6 +190,8 @@ struct EpInterNodeRequest {
   int warpPerBlock = 0;
   int rdmaBlockNum = 0;
   int mpCount = 0;
+  // asyncLlMode 2 only; 0 = half the device (mpCount / 2).
+  int asyncLlFusedRecvCtas = 0;
 };
 
 template <typename Self, typename Visit>
@@ -206,11 +215,12 @@ inline void VisitFields(Self& request, const EpInterNodeRequest& defaults, Visit
   MORI_FIELD(warpPerBlock);
   MORI_FIELD(rdmaBlockNum);
   MORI_FIELD(mpCount);
+  MORI_FIELD(asyncLlFusedRecvCtas);
 #undef MORI_FIELD
 }
 
 MORI_JIT_ASSERT_FIELD_COUNT(
-    EpInterNodeRequest, 18,
+    EpInterNodeRequest, 19,
     "added an EpInterNodeRequest field -- update VisitFields(EpInterNodeRequest) too");
 
 std::string EpInterNodeRequestSchema();
