@@ -879,6 +879,7 @@ size_t PageBackend::Touch(const std::vector<std::string>& keys) {
     auto it = owned_.find(key);
     if (it != owned_.end()) held.emplace_back(&key, &it->second);
   }
+  if (held.empty()) return 0;
   std::lock_guard<std::mutex> lru_lock(lru_mutex_);
   for (auto& [key, slot] : held) TouchLruLocked(*key, *slot);
   return held.size();
