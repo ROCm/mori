@@ -181,6 +181,23 @@ _DISPATCH_TABLE: dict = {
             None: ((None, 64, 16),),
             "fp4": ((4095, 64, 16), (None, 128, 16)),
         },
+        # EP4, hidden 2048, topk 8, 64 experts a rank (Qwen3.5-35B-A3B at DP4 + EP4), 2026-10-30.
+        # bench_ep.py, graph, ITERS=200, mean of 3 alternating rounds (spread <= 1.3 us). The
+        # 64x16 default costs bf16 up to 9% to 512 tokens a rank and 19-46% past it; fp4 12-26% to
+        # 1024 and about 2x past it, and on 64x16 fp4 is slower than bf16 at 192-256 and 2048-4096
+        # tokens. bf16 and fp4 take the same schedule; fp8 and other expert counts are unswept.
+        # Dispatch us:
+        #   ct     32x8   64x8  64x16  128x8  256x8     (bf16 | fp4)
+        #   64     24.4   24.5   26.6   24.4   24.4  |  21.3   21.1   23.8   21.0   20.9
+        #   256    25.3   25.1   25.3   25.0   25.0  |  21.6   21.5   26.8   21.5   21.5
+        #   512    31.4   26.3   26.9   26.0   26.0  |  31.5   21.9   26.0   21.7   21.7
+        #   1024   41.2   32.5   34.7   29.1   28.8  |  41.0   31.8   26.6   22.9   22.7
+        #   2048   64.2   43.6   51.8   38.3   35.5  |  67.6   41.6   52.7   32.4   25.7
+        #   4096  112.6   68.4   64.9   54.5   50.9  | 119.4   68.9   68.3   43.1   34.5
+        (4, 2048, 8, 64): {
+            "bf16": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+            "fp4": ((256, 32, 8), (512, 64, 8), (1024, 128, 8), (None, 256, 8)),
+        },
     },
 }
 
@@ -211,6 +228,8 @@ _COMBINE_TABLE: dict = {
         # The single-shot default, listed so the EP8 and EP16 dispatch schedules have a combine half.
         (8, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
+        # The same for the EP4 hidden-2048 dispatch schedule (combine unswept there).
+        (4, 2048, 8, 64): ((None, 64, 8),),
     },
 }
 
