@@ -641,6 +641,9 @@ class _Plan(NamedTuple):
     #: The unresolved phase table, kept for :meth:`GemmAllReduceOp.self_test`,
     #: which needs the standalone ``scatter`` that ``fused_order`` omits.
     parts: dict
+    #: ``parts["fused_rs_order"]`` resolved the same way, or None where the
+    #: wire has no reduce-scatter-only tail (the fp8 gather).
+    rs_tail: tuple | None = None
 
 
 class GemmAllReduceOp:
@@ -961,9 +964,15 @@ class GemmAllReduceOp:
         # Pinned launchers on the hot path; `parts` keeps the raw ones, which is
         # what self_test uses (it runs a different order, once).
         tail = tuple(_PinnedLaunch(parts[name]) for name in parts["fused_order"])
+        rs_order = parts.get("fused_rs_order")
         hit = _Plan(
             gemm=_PinnedLaunch(gemm),
             tail=tail,
+            rs_tail=(
+                tuple(_PinnedLaunch(parts[name]) for name in rs_order)
+                if rs_order
+                else None
+            ),
             parts=parts,
             input=from_gpu_ptr(
                 self.mem.ptr + (cfg.output_off if cfg.fp8_scatter else cfg.input_off),
@@ -1213,9 +1222,39 @@ class GemmAllReduceOp:
             phase(self.dev_comm.ptr, self.win.handle, stream=stream)
         return plan.output
 
-    def _call_bf16(self, a, b, m: int, logical_m: int | None) -> torch.Tensor:
+    def reduce_scatter(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        logical_m: int | None = None,
+    ) -> torch.Tensor:
+        """The fused GEMM + reduce-scatter, with no all-gather: this rank's
+        reduced ``[M / world_size, N]`` row slice, a view of the window.
+
+        Rank ``r`` owns padded rows ``[r * M / world_size, (r + 1) * M /
+        world_size)`` -- the band its peers' epilogues push to it -- so a caller
+        whose row split differs (``tensor_split`` of a ragged M) lays each
+        rank's rows at the start of that band and slices the result. BF16 only
+        for now. Same aliasing rule as ``__call__``: the next call overwrites it.
+        """
+        if self.quant != BF16_QUANT:
+            raise NotImplementedError("reduce_scatter is implemented for quant='bf16'")
+        m = a.shape[0]
+        self._row_plan(m, logical_m)
+        self._check_operands(a, b, None, None, m)
+        out = self._call_bf16(a, b, m, logical_m, reduce_scatter=True)
+        rows = m // self.world_size
+        return out[self.rank * rows : (self.rank + 1) * rows]
+
+    def _call_bf16(
+        self, a, b, m: int, logical_m: int | None, reduce_scatter: bool = False
+    ) -> torch.Tensor:
         """``__call__`` for ``quant='bf16'``: int16 operand views, no scales."""
         plan = self._compiled(m, logical_m)
+        tail = plan.rs_tail if reduce_scatter else plan.tail
+        if tail is None:
+            raise NotImplementedError("this wire has no reduce-scatter-only tail")
         if self._no_scale is None:
             # The BF16 launch keeps the fp8 signature; its scale slots are unread.
             self._no_scale = torch.zeros(1, dtype=torch.int32, device=a.device)
@@ -1232,7 +1271,7 @@ class GemmAllReduceOp:
             self.win.handle,
             stream=stream,
         )
-        for phase in plan.tail:
+        for phase in tail:
             phase(self.dev_comm.ptr, self.win.handle, stream=stream)
         return plan.output
 
