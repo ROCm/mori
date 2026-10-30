@@ -140,11 +140,13 @@ class IUMBPClient {
   /// Tell the store these objects were just used without being read from it
   /// -- the caller served them from a faster cache of its own -- so its local
   /// eviction counts them as recently used.  Only recency moves: no read, no
-  /// lease, and keys not stored are skipped.  Only the media of the caller's
-  /// node see it: keys a pool placed on another node, and eviction the master
-  /// ranks, are unaffected.  Returns the copies touched, one per medium that
-  /// holds a key and keeps an eviction order (the SSD tier keeps none); a store
-  /// that keeps no eviction order (or an older server) returns 0.
+  /// lease, and keys not stored are skipped.  The caller's node moves them in
+  /// its own media; in the master eviction modes they also reach the master's
+  /// ranking, wherever they are placed.  Under local eviction (the default),
+  /// keys a pool placed on another node are unaffected.  Returns the copies
+  /// touched on the caller's node, one per medium that holds a key and keeps an
+  /// eviction order (the SSD tier keeps none); a store that keeps no eviction
+  /// order (or an older server) returns 0.
   virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
 
   // ---- Lifecycle ----
