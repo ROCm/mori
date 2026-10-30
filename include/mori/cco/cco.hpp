@@ -1281,10 +1281,12 @@ typedef struct CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12_TAG {
 static_assert(sizeof(CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12) == 13 * sizeof(uint32_t),
               "SDMA gfx12 rect copy packet must be exactly 13 dwords");
 
-// POLL_REGMEM and COPY_BROADCAST use the gfx9 layouts (validated on gfx950).
-// gfx12.5 lays both out differently, so ccoSdma::putBroadcast / postWaitMem /
-// postWaitSignal trap there (device side, so multi-arch builds still compile)
-// rather than post a misread packet.
+// POLL_REGMEM and COPY_BROADCAST use the gfx9 layouts (validated on gfx950), and
+// the same ones on gfx12.5 (validated on gfx1250): ROCr's sdma_registers.h has one
+// struct for each on every arch, unlike the 2D rect packet above, which did get a
+// new layout. The only gfx12.5 addition is POLL_REGMEM's `scope` field in DW5
+// (previously reserved), which ccoSdmaWritePoll sets as ROCr's BuildPollCommand
+// does -- under CCO_SDMA_SCOPE_FIELDS, like the COPY and ATOMIC packets.
 //
 // POLL_REGMEM parks the queue until (*addr & mask) <func> value holds.
 typedef struct CCO_SDMA_PKT_POLL_REGMEM_TAG {
@@ -1308,7 +1310,8 @@ typedef struct CCO_SDMA_PKT_POLL_REGMEM_TAG {
     struct {
       unsigned int interval : 16;
       unsigned int retry_count : 12;
-      unsigned int reserved_0 : 4;
+      unsigned int scope : 2;  // gfx12.5+; reserved (0) on gfx9
+      unsigned int reserved_0 : 2;
     };
     unsigned int DW_5_DATA;
   } DW5_UNION;
@@ -1779,6 +1782,9 @@ inline __device__ void ccoSdmaWritePoll(uint32_t* queueBuf, uint64_t at, const v
   pkt.MASK = mask;
   pkt.DW5_UNION.interval = CCO_SDMA_POLL_INTERVAL;
   pkt.DW5_UNION.retry_count = CCO_SDMA_POLL_RETRY_FOREVER;
+#ifdef CCO_SDMA_SCOPE_FIELDS
+  pkt.DW5_UNION.scope = CCO_SDMA_MEMORY_SCOPE_SYS;
+#endif
   const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
   auto dst = impl::global(ccoSdmaUnitAt(queueBuf, at));
   dst->vec[0] = ccoUint4{p[0], p[1], p[2], p[3]};
@@ -2731,8 +2737,7 @@ struct ccoSdma {
   // destination and also selects the queue, (peer, queueId); `peer2` is the
   // second and may be our own LSA rank. Template arguments as put(), except
   // there is no SignalPerCopy and no lane grouping: thread scope posts one
-  // active lane at a time, warp/block scope lets the leader post. Not supported
-  // on gfx12.5, where it traps.
+  // active lane at a time, warp/block scope lets the leader post.
   //   localSignal:  one trailing ATOMIC into our own signalBuf[myLsaRank*n+q].
   //   remoteSignal: one ATOMIC into each destination peer's pool at the same
   //                 index, skipping ourselves and a repeated peer.
@@ -2755,10 +2760,6 @@ struct ccoSdma {
                   "ccoSdma::putBroadcast supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::putBroadcast: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     const ccoSdmaContext& s = comm.sdma;
     void* dst1 = ccoGetLsaPeerPtr(dstWin, peer, dstOffset);
     void* dst2 = ccoGetLsaPeerPtr(dstWin2, peer2, dstOffset2);
@@ -2778,7 +2779,7 @@ struct ccoSdma {
   // the pair. Caveats: the queue is blocked until the condition holds, so
   // anything else posted to it waits too, and a flag that never arrives parks it
   // for good. A full ring spins the poster until the wait clears. Thread scope
-  // posts one active lane at a time. Not supported on gfx12.5, where it traps.
+  // posts one active lane at a time.
   template <typename Coop = ccoCoopThread, uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void postWaitMem(int peer, int queueId, ccoWindow_t win, size_t offset,
                                      uint32_t value, ccoSdmaCmp cmp = ccoSdmaCmpEq,
@@ -2788,10 +2789,6 @@ struct ccoSdma {
                   "ccoSdma::postWaitMem supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::postWaitMem: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     ccoSdmaDispatchWait<Coop, optFlags>(comm.sdma, peer, queueId, ccoGetLocalPtr(win, offset),
                                         value, mask, static_cast<uint32_t>(cmp));
   }
@@ -2812,7 +2809,7 @@ struct ccoSdma {
   // (CCO_SDMA_MAX_COPY_BYTES, ~1 GiB) takes the composed path, one lane's wait
   // and chunks at a time. With Independent lanes on one queue, lanes whose copy
   // exceeds the cap post first (one at a time), then the rest, so chain order
-  // is not lane order. Traps on gfx12.5.
+  // is not lane order.
   template <bool localSignal = false, bool remoteSignal = false,
             uint32_t optFlags = ccoSdmaOptFlagsDefault>
   __device__ inline void postWaitMemPutPtr(int peer, int queueId, ccoWindow_t win, size_t offset,
@@ -2820,10 +2817,6 @@ struct ccoSdma {
                                            void* src, size_t bytes) {
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::postWaitMemPutPtr: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     ccoSdmaWaitPutThread<localSignal, remoteSignal, optFlags>(
         comm.sdma, peer, queueId, ccoGetLocalPtr(win, offset), value, mask,
         static_cast<uint32_t>(cmp), dst, src, bytes, static_cast<uint32_t>(comm.lsaRank),
@@ -2844,10 +2837,6 @@ struct ccoSdma {
                   "ccoSdma::postWaitSignal supports ccoCoopThread, ccoCoopWarp, or ccoCoopBlock");
     static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
                   "ccoSdma::postWaitSignal: only ccoSdmaOptFlagsAggregate is supported");
-#ifdef CCO_SDMA_SCOPE_FIELDS
-    __builtin_trap();  // gfx12.5 packet layout not validated
-    return;
-#endif
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     if (sigQueueId < 0 || static_cast<uint32_t>(sigQueueId) >= n) return;

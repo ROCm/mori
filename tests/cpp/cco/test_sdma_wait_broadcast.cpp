@@ -37,6 +37,8 @@
 //      on one queue; both destinations must hold every slice.
 //   D  broadcast ring wrap: enough 3-unit broadcasts that one is placed on the
 //      last unit of the ring, which must be padded rather than split.
+//   G  postWaitMemPutPtr: a wait, a copy and a signal in one run, held behind a flag
+//      like B (thread scope, Default and Aggregate).
 
 #include "cco_test_harness.hpp"
 
@@ -100,6 +102,21 @@ __global__ void PostWaitPutKernel(ccoWindowDevice* sendWin, ccoWindowDevice* rec
   sdma.put<Coop, false, true, Flags>(next, reinterpret_cast<ccoWindow_t>(recvWin), 0,
                                      reinterpret_cast<ccoWindow_t>(sendWin), 0, bytes, qid);
   if constexpr (Flags & ccoSdmaOptFlagsAggregate) sdma.commit<Coop>(next, qid);
+}
+
+// Part G: postWaitMemPutPtr holds a copy and its remote signal behind the flag.
+template <uint32_t Flags>
+__global__ void PostWaitPutPtrKernel(ccoWindowDevice* sendWin, ccoWindowDevice* recvWin,
+                                     ccoWindowDevice* flagWin, size_t bytes, int qid,
+                                     ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoSdma sdma{devComm};
+  const int next = (devComm.lsaRank + 1) % devComm.lsaSize;
+  sdma.postWaitMemPutPtr<false, true, Flags>(
+      next, qid, reinterpret_cast<ccoWindow_t>(flagWin), 0, 1u, ccoSdmaCmpEq, 0xFFFFFFFFu,
+      ccoGetLsaPeerPtr(reinterpret_cast<ccoWindow_t>(recvWin), next, 0),
+      ccoGetLocalPtr(reinterpret_cast<ccoWindow_t>(sendWin), 0), bytes);
+  if constexpr (Flags & ccoSdmaOptFlagsAggregate) sdma.commit<ccoCoopThread>(next, qid);
 }
 
 __global__ void WaitIncomingKernel(int qid, uint64_t expected, ccoDevComm devComm) {
@@ -239,17 +256,8 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     return 1;
   }
 
-  // putBroadcast/postWait* compile for gfx12.5 but trap there (packet layout not validated).
-  hipDeviceProp_t prop;
-  HIP_CHECK(hipGetDeviceProperties(&prop, rank % numDevices));
-  const bool isGfx125 = strstr(prop.gcnArchName, "gfx125") != nullptr;
-
   bool ok = true;
-  if (isGfx125) {
-    printf("[rank %d] SKIP — %s: SDMA wait/broadcast packet layout not validated\n", rank,
-           prop.gcnArchName);
-    fflush(stdout);
-  } else if (devComm.sdma.sdmaNumQueue < static_cast<uint32_t>(NUM_QUEUES)) {
+  if (devComm.sdma.sdmaNumQueue < static_cast<uint32_t>(NUM_QUEUES)) {
     printf("[rank %d] SKIP — %u SDMA queues (set MORI_ENABLE_SDMA=1)\n", rank,
            devComm.sdma.sdmaNumQueue);
     fflush(stdout);
@@ -348,7 +356,11 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       constexpr uint32_t Flags = decltype(flags)::value;
       resetRecv();
       ccoBarrierAll(comm);
-      sigR1[q]++;
+      // Baseline rather than A's per-queue totals, so B holds at any rank count.
+      uint64_t sigBefore = 0;
+      HIP_CHECK(hipMemcpy(&sigBefore, devComm.sdma.signalBuf + prev * devComm.sdma.sdmaNumQueue + q,
+                          8, hipMemcpyDeviceToHost));
+      ccoBarrierAll(comm);
       PostWaitPutKernel<Coop, Flags>
           <<<1, BlockFor<Coop>(), 0, stream>>>(sendWin, recvWin, flagWin, BUF_BYTES, q, devComm);
       HIP_CHECK(hipStreamSynchronize(stream));  // posted; the CU is out of the picture now
@@ -357,11 +369,11 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       uint64_t sig = 0;
       HIP_CHECK(hipMemcpy(&sig, devComm.sdma.signalBuf + prev * devComm.sdma.sdmaNumQueue + q, 8,
                           hipMemcpyDeviceToHost));
-      const bool held = untouched(recvBuf, BUF_BYTES) && sig == sigR1[q] - 1;
+      const bool held = untouched(recvBuf, BUF_BYTES) && sig == sigBefore;
       ccoBarrierAll(comm);
       const uint32_t one = 1;
       HIP_CHECK(hipMemcpy(flagBuf, &one, 4, hipMemcpyHostToDevice));
-      WaitIncomingKernel<<<1, 1, 0, stream>>>(q, sigR1[q], devComm);
+      WaitIncomingKernel<<<1, 1, 0, stream>>>(q, sigBefore + 1, devComm);
       HIP_CHECK(hipStreamSynchronize(stream));
       ccoBarrierAll(comm);
       const bool landed = matches(recvBuf, BUF_BYTES, prev, "waited put");
@@ -383,11 +395,15 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     /* ---- C ---- */
     resetRecv();
     ccoBarrierAll(comm);
-    // Queues 6 and 7 were already signalled by part A, so wait for one more on each.
-    sigR1[6]++;
-    sigR1[7]++;
-    RelayKernel<<<1, 1, 0, stream>>>(sendWin, recvWin, fwdWin, BUF_BYTES, 6, 7, sigR1[6], sigR1[7],
-                                     devComm);
+    // Queues 6 and 7 were already signalled by part A: wait for one more on each.
+    uint64_t base6 = 0, base7 = 0;  // baselines, as in B
+    HIP_CHECK(hipMemcpy(&base6, devComm.sdma.signalBuf + prev * devComm.sdma.sdmaNumQueue + 6, 8,
+                        hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(&base7, devComm.sdma.signalBuf + prev * devComm.sdma.sdmaNumQueue + 7, 8,
+                        hipMemcpyDeviceToHost));
+    ccoBarrierAll(comm);
+    RelayKernel<<<1, 1, 0, stream>>>(sendWin, recvWin, fwdWin, BUF_BYTES, 6, 7, base6 + 1,
+                                     base7 + 1, devComm);
     HIP_CHECK(hipStreamSynchronize(stream));
     ccoBarrierAll(comm);
     const bool okC = matches(recvBuf, BUF_BYTES, prev, "relay hop") &&
@@ -419,6 +435,42 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
     ccoBarrierAll(comm);
     const bool okE = matches(recvBuf, BUF_BYTES, prev, "multi-lane wait");
 
+    /* ---- G ---- */
+    int gPass = 0, gTotal = 0;
+    auto runWaitPtr = [&](auto flags, int q) {
+      constexpr uint32_t Flags = decltype(flags)::value;
+      resetRecv();
+      ccoBarrierAll(comm);
+      uint64_t sigBefore = 0;
+      HIP_CHECK(hipMemcpy(&sigBefore, devComm.sdma.signalBuf + prev * devComm.sdma.sdmaNumQueue + q,
+                          8, hipMemcpyDeviceToHost));
+      ccoBarrierAll(comm);
+      PostWaitPutPtrKernel<Flags>
+          <<<1, 1, 0, stream>>>(sendWin, recvWin, flagWin, BUF_BYTES, q, devComm);
+      HIP_CHECK(hipStreamSynchronize(stream));  // posted; the CU is out of the picture now
+      ccoBarrierAll(comm);
+      usleep(100 * 1000);
+      uint64_t sig = 0;
+      HIP_CHECK(hipMemcpy(&sig, devComm.sdma.signalBuf + prev * devComm.sdma.sdmaNumQueue + q, 8,
+                          hipMemcpyDeviceToHost));
+      const bool held = untouched(recvBuf, BUF_BYTES) && sig == sigBefore;
+      ccoBarrierAll(comm);
+      const uint32_t one = 1;
+      HIP_CHECK(hipMemcpy(flagBuf, &one, 4, hipMemcpyHostToDevice));
+      WaitIncomingKernel<<<1, 1, 0, stream>>>(q, sigBefore + 1, devComm);
+      HIP_CHECK(hipStreamSynchronize(stream));
+      ccoBarrierAll(comm);
+      const bool landed = matches(recvBuf, BUF_BYTES, prev, "waitMemPutPtr");
+      gTotal++;
+      gPass += held && landed;
+      if (!(held && landed))
+        fprintf(stderr, "[rank %d] G FAIL agg=%d held=%d landed=%d\n", rank,
+                (int)(Flags & ccoSdmaOptFlagsAggregate), held, landed);
+    };
+    runWaitPtr(Def{}, 5);
+    runWaitPtr(Agg{}, 6);
+    const bool okG = gPass == gTotal;
+
     /* ---- F ---- */
     resetRecv();
     ccoBarrierAll(comm);
@@ -438,14 +490,15 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       }
     }
 
-    ok = okA && okB && okC && okD && okE && okF;
+    ok = okA && okB && okC && okD && okE && okF && okG;
     HIP_CHECK(hipStreamDestroy(stream));
     printf(
         "[rank %d] A(broadcast)=%s(%d/%d) B(waitMem)=%s(%d/%d) C(relay)=%s "
-        "D(wrap, %u straddles)=%s E(multi-lane wait)=%s F(multi-lane bcast)=%s %s\n",
+        "D(wrap, %u straddles)=%s E(multi-lane wait)=%s F(multi-lane bcast)=%s "
+        "G(waitMemPutPtr)=%s(%d/%d) %s\n",
         rank, okA ? "PASS" : "FAIL", aPass, aTotal, okB ? "PASS" : "FAIL", bPass, bTotal,
         okC ? "PASS" : "FAIL", straddles, okD ? "PASS" : "FAIL", okE ? "PASS" : "FAIL",
-        okF ? "PASS" : "FAIL", ok ? "PASSED" : "FAILED");
+        okF ? "PASS" : "FAIL", okG ? "PASS" : "FAIL", gPass, gTotal, ok ? "PASSED" : "FAILED");
     fflush(stdout);
   }
 
