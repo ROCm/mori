@@ -103,8 +103,12 @@ requires_gpus = pytest.mark.skipif(
 )
 
 
-@requires_gpus
-def test_every_mode_is_exact_to_the_fp8_floor_back_to_back():
+WORKER = Path(__file__).with_name("a2a_gemm_worker.py")
+
+
+def _torchrun(script, *args, timeout=1800):
+    """Run ``script`` on every GPU; return its ``RESULT_JSON`` lines. A hang is
+    a failure, and the timeout is what turns it into one."""
     env = os.environ.copy()
     env.setdefault("MORI_SOCKET_IFNAME", "lo")
     env.setdefault("MORI_ENABLE_SDMA", "1")
@@ -116,43 +120,40 @@ def test_every_mode_is_exact_to_the_fp8_floor_back_to_back():
             "torch.distributed.run",
             "--standalone",
             f"--nproc_per_node={world}",
-            str(BENCH),
-            "-m",
-            "512",
-            "-n",
-            "1024",
-            "-k",
-            str(world * 256),
-            "--chunks",
-            "1",
-            "2",
-            "--wait",
-            "segment",
-            "tile",
-            "--acquire",
-            "none",
-            "--warmup",
-            "2",
-            "--iters",
-            "3",
-            "--min-seconds",
-            "0",
-            "--back-to-back",
-            "8",
-        ],  # fmt: skip
+            str(script),
+            *args,
+        ],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
-        timeout=1800,
+        timeout=timeout,
     )
     out = result.stdout + result.stderr
-    rows = [
+    assert result.returncode == 0, out[-4000:]
+    return world, [
         json.loads(ln.removeprefix("RESULT_JSON "))
         for ln in out.splitlines()
         if ln.startswith("RESULT_JSON ")
     ]
-    assert result.returncode == 0, out[-4000:]
+
+
+@requires_gpus
+@pytest.mark.parametrize("acquire", ["inv", "none"])
+def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(acquire):
+    world, rows = _torchrun(
+        BENCH,
+        "-m", "512",
+        "-n", "1024",
+        "-k", str(min(8, torch.cuda.device_count()) * 256),
+        "--chunks", "1", "2",
+        "--wait", "segment", "tile",
+        "--acquire", acquire,
+        "--warmup", "2",
+        "--iters", "3",
+        "--min-seconds", "0",
+        "--back-to-back", "8",
+    )  # fmt: skip
     seen = {(r["mode"], r["chunks"], r["wait"]) for r in rows}
     assert seen == {
         ("gemm-only", None, None),
@@ -162,3 +163,18 @@ def test_every_mode_is_exact_to_the_fp8_floor_back_to_back():
     }, seen
     for r in rows:
         assert r["validated"] and r["rel_l2"] < 3e-3, r
+
+
+@requires_gpus
+@pytest.mark.parametrize("wait", ["segment", "tile"])
+@pytest.mark.parametrize("case", ["wrap", "mixed"])
+def test_band_counts_survive_the_wrap_and_a_change_of_chunks(case, wait):
+    """``wrap``: signal counters preset just below 2^32, so the bands of the
+    fourth call carry them across -- an unsigned compare against an offset
+    target spins forever there. ``mixed``: one arm, then calls alternating
+    c4 and c2 -- a target counted as ``epoch * chunks`` reads early or hangs."""
+    _, rows = _torchrun(WORKER, "--case", case, "--wait", wait, timeout=900)
+    (rec,) = rows
+    for verdicts in rec["ranks"]:
+        assert len(verdicts) == 6, verdicts
+        assert all(v["ok"] for v in verdicts), verdicts

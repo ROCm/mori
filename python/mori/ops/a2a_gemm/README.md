@@ -46,9 +46,15 @@ addressing changes in the GEMM (row stride `k_shard`, a base per segment); the
    counts are compared against: nobody may refill a peer's `recv` while that
    peer still reads it.
 
-The signal counters are never reset, so `build_phases()["arm"]` snapshots them
-into the window once, before the first call; a band has landed when its source's
-counter reaches `snapshot + (epoch - 1) * chunks + band + 1`.
+The signal counters are never reset, so the op counts from a snapshot of them:
+`build_phases()["arm"]` takes it before the first call, and every call's closing
+barrier takes it again -- after every band of that call has landed, before any
+peer can post the next call's. A band has landed when its source's counter
+reaches `snapshot + band + 1`, compared as `(int32)(cur - target) >= 0` so it
+holds across the counter's wrap at 2^32, and a call's chunk count is its own.
+The counters belong to the communicator: the (source, queue) slot this op waits
+on must carry nothing else, so a second user of the communicator needs its own
+queue.
 
 **ptpc, with a scale over all heads.** The A scale is one fp32 per token over
 the whole K, so it is computed before quantization from the row maxima gathered

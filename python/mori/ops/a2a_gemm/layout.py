@@ -51,10 +51,10 @@ Control area, all u32 and 128-byte aligned:
   below is compared against ``epoch + 1``, so nothing is ever reset and a CUDA
   graph replays like a fresh launch.
 * ``sig_base[src]`` -- the low 32 bits of the copy engine's signal counter for
-  ``src`` when the window was armed (``build_phases()["arm"]``). Every band
-  ``src`` pushes here bumps that counter by one, after its bytes, on the same
-  queue; the counter is never reset, so a band's arrival is "counter reaches
-  ``sig_base + (epoch - 1) * chunks + band + 1``".
+  ``src``, taken by ``build_phases()["arm"]`` before the first call and again
+  by every call's closing barrier. Every band ``src`` pushes here bumps that
+  counter by one, after its bytes, on the same queue, so a band's arrival is
+  "counter reaches ``sig_base + band + 1``", compared modulo 2^32.
 * ``bar[2][src]`` -- two cross-rank barriers per call, written by ``src``. The
   split path needs both (before the GEMM: everything landed; after it: nobody
   still reads a slot the next call refills); the fused path only the second.

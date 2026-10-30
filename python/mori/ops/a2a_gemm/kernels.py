@@ -44,7 +44,13 @@ Three launchers, all over the window ``layout.A2aGemmConfig`` describes:
     ``arm`` (snapshot the signal counters into ``sig_base``: once, before the
     first call), ``push`` (the poster as its own one-block kernel) and the two
     cross-rank barriers. ``barrier1`` (bump) closes every call: nobody may
-    refill a peer's ``recv`` while that peer still reads it.
+    refill a peer's ``recv`` while that peer still reads it, and it re-takes the
+    snapshot for the next call, so a call's chunk count is its own.
+
+The signal counters belong to the communicator: the slot for (``src``, this
+rank's queue) must carry nothing but this op's bands -- another op posting
+remote signals to this rank on that queue between two calls would move the
+count under it. Give a second user of the communicator another queue.
 
 Waiting per K segment rather than per tile is what lets a tile start before
 anything has arrived: its own segment is ``1/world`` of its K. The wait sits
@@ -60,6 +66,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import scf
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import gpu as fgpu
 from flydsl.expr.typing import Int64
@@ -67,7 +74,8 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
-from ..gemm_ar._compat import (
+from mori.cco.device.flydsl.signals import (
+    i32_type,
     local_load_u32,
     local_store_u32,
     signal_load_u32,
@@ -85,7 +93,6 @@ from ..gemm_ar._gemm_a8w8_8wave import (
     wait_barrier,
 )
 from ..gemm_ar.kernels_fused import _LaneTransposeStoreC, _SwappedMfma
-from ..gemm_ar.kernels_lsa import _spin_until
 from .layout import BLOCK_K, MAX_CHUNKS, MAX_WORLD
 
 #: Wave width; the push kernel and the barriers use one wave, a lane per peer.
@@ -162,11 +169,43 @@ def _post_slab(sdma, win, rank, cfg, peer, queue, *, quiet=True):
         sdma.quiet_queue(peer, queue)
 
 
-def _band_target(base, stride, rank, cfg, src, ep, chunk):
-    """The count of ``src``'s signal counter that means ``chunk`` has landed."""
+def _spin_reach(rsrc, target):
+    """Block until the u32 counter at ``rsrc`` has reached ``target``.
+
+    Compared as ``(int32)(cur - target) < 0``, so it holds across the counter's
+    wrap at 2^32. The copy engines' signal counters are never reset and
+    ``target`` is offset from wherever they stood when last snapshotted, so a
+    plain unsigned ``cur < target`` (``gemm_ar``'s ``_spin_until``) spins forever
+    once ``target`` sits just below 2^32 and the counter has already wrapped.
+    """
+    i32 = i32_type()
+    first = signal_load_u32(rsrc)
+    first_v = first.ir_value() if hasattr(first, "ir_value") else first
+    loop = scf.WhileOp([i32], [first_v])
+    cond = ir.Block.create_at_start(loop.before, [i32])
+    body = ir.Block.create_at_start(loop.after, [i32])
+    with ir.InsertionPoint(cond):
+        cur = fx.Int32(cond.arguments[0])
+        behind = (cur - fx.Int32(target)) < fx.Int32(0)
+        scf.ConditionOp(behind.ir_value(), [cond.arguments[0]])
+    with ir.InsertionPoint(body):
+        nxt = signal_load_u32(rsrc)
+        scf.YieldOp([nxt.ir_value() if hasattr(nxt, "ir_value") else nxt])
+
+
+def _snapshot(sdma, base, stride, rank, cfg, src, qid):
+    """``sig_base[src]`` = where ``src``'s signal counter stands now."""
+    now = signal_load_u32(signal_ptr(sdma.signal_slot(src, qid)))
+    slot = _lsa(base, stride, rank, cfg.sig_base_off) + fx.Int64(src) * fx.Int64(4)
+    local_store_u32(signal_ptr(slot), now)
+
+
+def _band_target(base, stride, rank, cfg, src, chunk):
+    """The count of ``src``'s signal counter that means ``chunk`` has landed:
+    ``sig_base`` was taken by the previous call's ``barrier1`` (or ``arm``), when
+    every band of that call had landed and none of this call's could have."""
     sig_base = signal_ptr(_lsa(base, stride, rank, cfg.sig_base_slot_off(src)))
-    done = (ep - fx.Int32(1)) * fx.Int32(cfg.chunks) + chunk + fx.Int32(1)
-    return fx.Int32(local_load_u32(sig_base)) + done
+    return fx.Int32(local_load_u32(sig_base)) + chunk + fx.Int32(1)
 
 
 def _realtime():
@@ -183,24 +222,22 @@ def _stamp(base_i64, slot):
     _llvm_d.store(_realtime().ir_value(), signal_ptr(addr), alignment=8, volatile_=True)
 
 
-def _observe_bands(sdma, base, stride, rank, cfg, peer, ep, qid, stamps):
+def _observe_bands(sdma, base, stride, rank, cfg, peer, qid, stamps):
     """Diagnostic: lane ``peer`` stamps when each of ``peer``'s bands lands here."""
     sig_base = signal_ptr(
         _lsa(base, stride, rank, cfg.sig_base_off) + fx.Int64(peer) * fx.Int64(4)
     )
-    first = fx.Int32(local_load_u32(sig_base)) + (ep - fx.Int32(1)) * fx.Int32(
-        cfg.chunks
-    )
+    first = fx.Int32(local_load_u32(sig_base))
     slot = signal_ptr(sdma.signal_slot(peer, qid))
     for c in range_constexpr(cfg.chunks):
-        _spin_until(slot, first + fx.Int32(c + 1))
+        _spin_reach(slot, first + fx.Int32(c + 1))
         _stamp(stamps, fx.Int32(3) + peer * fx.Int32(MAX_CHUNKS) + fx.Int32(c))
 
 
-def _wait_band(sdma, base, stride, rank, cfg, src, ep, chunk, qid):
+def _wait_band(sdma, base, stride, rank, cfg, src, chunk, qid):
     """Spin until ``src``'s band ``chunk`` of this call has landed here."""
-    target = _band_target(base, stride, rank, cfg, src, ep, chunk)
-    _spin_until(signal_ptr(sdma.signal_slot(fx.Int32(src), qid)), target)
+    target = _band_target(base, stride, rank, cfg, src, chunk)
+    _spin_reach(signal_ptr(sdma.signal_slot(fx.Int32(src), qid)), target)
 
 
 def compile_a2a_gemm(
@@ -318,7 +355,6 @@ def compile_a2a_gemm(
         wbase, wstride = w_pre.base, w_pre.stride
 
         if const_expr(fuse):
-            ep, _ = _epoch_now(wbase, wstride, rank, cfg)
             # Built outside the branch: a runtime `if` captures its free values,
             # and those have to be single MLIR values.
             sdma = cco.DevComm(dev_comm).sdma()
@@ -352,7 +388,7 @@ def compile_a2a_gemm(
                             if tid == fx.Int32((rank + 1) % ws):
                                 _stamp(stamps, 1)
                             _observe_bands(
-                                sdma, wbase, wstride, rank, cfg, tid, ep, qid, stamps
+                                sdma, wbase, wstride, rank, cfg, tid, qid, stamps
                             )
             # Block 0 takes the last tile, which waits for the last band
             # regardless. Its quiet waits until after that tile: draining first
@@ -375,7 +411,6 @@ def compile_a2a_gemm(
                             rank,
                             cfg,
                             (rank + j) % ws,
-                            ep,
                             chunk,
                             qid,
                         )
@@ -387,7 +422,7 @@ def compile_a2a_gemm(
         def wait_segment(j):
             """Every wave, before its first A load of step ``j``'s segment."""
             if const_expr(waits_before(j)):
-                _wait_band(sdma, wbase, wstride, rank, cfg, _src(j), ep, chunk, qid)
+                _wait_band(sdma, wbase, wstride, rank, cfg, _src(j), chunk, qid)
                 # Acquire: the bytes were written by a peer's copy engine, and
                 # this CU may still hold the previous call's lines.
                 _acquire(acquire)
@@ -590,14 +625,13 @@ def build_phases(cfg, rank: int, *, sdma_queues: int = 1):
     stream=)``.
 
     ``arm`` snapshots the copy engine's signal counters into ``sig_base``; run it
-    once on every rank, with the epoch at zero and no push in flight, then a
-    host barrier, before the first call -- and never again while the epoch
-    counts on from it.
+    once on every rank, with no push in flight, then a host barrier, before the
+    first call.
 
     ``push`` is the fused kernel's poster as a kernel of its own, for the split
     path; it returns once every band it sent has landed. ``barrier0`` is the
     split path's "everything landed here" point; ``barrier1`` closes every call
-    on both paths and advances the epoch.
+    on both paths, re-takes the snapshot, and advances the epoch.
     """
     cfg.validate()
     ws = cfg.world_size
@@ -617,14 +651,10 @@ def build_phases(cfg, rank: int, *, sdma_queues: int = 1):
         w = cco.CachedWindow(win)
         wbase, wstride = w.base, w.stride
         sdma = cco.DevComm(dev_comm).sdma()
+        qid = fx.Int32(rank % sdma_queues)
         if tid < ws:
             if tid != rank:
-                qid = fx.Int32(rank % sdma_queues)
-                now = signal_load_u32(signal_ptr(sdma.signal_slot(tid, qid)))
-                slot = _lsa(wbase, wstride, rank, cfg.sig_base_off) + fx.Int64(
-                    tid
-                ) * fx.Int64(4)
-                local_store_u32(signal_ptr(slot), now)
+                _snapshot(sdma, wbase, wstride, rank, cfg, tid, qid)
 
     def _barrier(which: int, bump: bool):
         @flyc.kernel(known_block_size=[PUSH_THREADS, 1, 1])
@@ -634,12 +664,22 @@ def build_phases(cfg, rank: int, *, sdma_queues: int = 1):
             wbase, wstride = w.base, w.stride
             ep, epoch_rsrc = _epoch_now(wbase, wstride, rank, cfg)
             my_bar = _lsa(wbase, wstride, rank, cfg.bar_off + which * MAX_WORLD * 4)
+            sdma = cco.DevComm(dev_comm).sdma()
+            qid = fx.Int32(rank % sdma_queues)
             if tid < ws:
                 if tid != rank:
+                    if const_expr(bump):
+                        # Re-arm before telling src this call is over: every
+                        # band of it has landed (the GEMM, or barrier0, waited
+                        # for them all), and src cannot post the next call's
+                        # until it has seen the arrival below. So the next
+                        # call's targets are counted from here, whatever chunk
+                        # count this call -- or anything else -- used.
+                        _snapshot(sdma, wbase, wstride, rank, cfg, tid, qid)
                     raw_cco.cco_system_fence(fx.Int32(0))
                     peer_slot = _lsa(wbase, wstride, tid, cfg.bar_slot_off(which, rank))
                     signal_store_u32(signal_ptr(peer_slot), ep)
-                    _spin_until(signal_ptr(my_bar + fx.Int64(tid) * fx.Int64(4)), ep)
+                    _spin_reach(signal_ptr(my_bar + fx.Int64(tid) * fx.Int64(4)), ep)
             fgpu.barrier()
             if const_expr(bump):
                 if tid == fx.Int32(0):
