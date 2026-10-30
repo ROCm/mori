@@ -1223,6 +1223,19 @@ std::vector<EvictionHint> SSDTier::EvictionOrder(size_t max_keys) {
   return out;
 }
 
+size_t SSDTier::Touch(const std::vector<std::string>& keys) {
+  if (IsReadOnlyShared()) return 0;  // the owner keeps the order a follower would move
+  size_t touched = 0;
+  std::lock_guard<std::mutex> lock(mu_);
+  for (const auto& key : keys) {
+    // TouchLRU records any key it is given, so only held ones may reach it.
+    if (index_.FindKey(key) == nullptr) continue;
+    index_.TouchLRU(key);
+    ++touched;
+  }
+  return touched;
+}
+
 void SSDTier::Clear() {
   {
     std::lock_guard<std::mutex> lock(mu_);

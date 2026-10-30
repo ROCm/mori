@@ -104,6 +104,8 @@ class SSDTier : public TierBackend {
   std::string GetLRUKey() const override;
   std::vector<std::string> GetLRUCandidates(size_t max_candidates) const override;
   std::vector<EvictionHint> EvictionOrder(size_t max_keys) override;
+  // Stamps each held key and its segment as just accessed, as a read does.
+  size_t Touch(const std::vector<std::string>& keys) override;
   void SetRetiredFileHook(std::function<void(int fd)> on_close,
                           std::chrono::milliseconds grace) override;
 

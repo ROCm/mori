@@ -354,6 +354,23 @@ std::vector<EvictionOffer> PeerSsdManager::EvictionCandidates(size_t max_count) 
   return candidates;
 }
 
+size_t PeerSsdManager::Touch(const std::vector<std::string>& keys) {
+  std::vector<std::string> held;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (backend_ == nullptr) return 0;
+    held.reserve(keys.size());
+    for (const auto& key : keys) {
+      if (evicting_.count(key) != 0 || owned_.find(key) == owned_.end()) continue;
+      TouchLocked(key);
+      held.push_back(key);
+    }
+  }
+  // The tier takes its own lock; like a read, reach it outside mutex_.
+  if (!held.empty()) backend_->Touch(held);
+  return held.size();
+}
+
 // ---------------------------------------------------------------------------
 //  Clear (drop metadata + wipe physical bytes)
 // ---------------------------------------------------------------------------
