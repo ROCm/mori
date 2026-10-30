@@ -676,6 +676,18 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     const unsigned wtw = pick(4 * topk + 4 * k);
     const int e = laneId < topk ? (int)idw : -1;
     if (__ballot(e >= 0 && e / kEpr == myPe) == 0ull) continue;
+    // The units past the first kRB are loaded before the slot is taken: their latency hides behind
+    // the slot's atomic and the stores of the first kRB units.
+    constexpr bool kRx2 = kUnits > kRB && kUnits <= 2 * kRB;
+    uint4 v2[kRx2 ? kUnits - kRB : 1];
+    if constexpr (kRx2) {
+#pragma unroll
+      for (int i = 0; i < kUnits - kRB; ++i) {
+        const char* const p = row + (size_t)(kRB + i) * kUnitB + laneId * 16;
+        const _mori_v4i x = __builtin_nontemporal_load(reinterpret_cast<const _mori_v4i*>(p));
+        v2[i] = make_uint4((unsigned)x.x, (unsigned)x.y, (unsigned)x.z, (unsigned)x.w);
+      }
+    }
     int slot = 0;
     if (laneId == 0)
       slot = (int)__hip_atomic_fetch_add(slotCtr, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -688,7 +700,21 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     }
     if (laneId == 0) EpLocal<int>(wr, args.offRecvToSrc)[slot] = (int)EpSrcTokIndex<kCfg>(s, t);
     for (int c0 = 0; c0 < kUnits; c0 += kRB) {
-      if (c0 > 0 && !poll(row, c0)) {
+      bool pre = false;
+      if constexpr (kRx2) {
+        if (c0 == kRB) {
+          bool b2 = false;
+#pragma unroll
+          for (int i = 0; i < kUnits - kRB; ++i)
+            if (lp == 7 && ((((unsigned long long)v2[i].w) << 32) | v2[i].z) != flag) b2 = true;
+          pre = __ballot(b2) == 0ull;
+          if (pre) {
+#pragma unroll
+            for (int i = 0; i < kUnits - kRB; ++i) v[i] = v2[i];
+          }
+        }
+      }
+      if (c0 > 0 && !pre && !poll(row, c0)) {
         tmo(2, s, t);
         break;
       }
@@ -4856,48 +4882,63 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
   int* const rSrc = args.recvToSrc;
   int* const rIdx = args.recvIdx;
-  for (int it = wv; it < nRecv * kParts; it += nWaves) {
-    const int j = it / kParts, q = it - j * kParts;
-    const int st = EpUniG(rSrc)[j];
-    int e = -1;
-    if (laneId < topk) e = EpUniG(rIdx)[(size_t)j * topk + laneId];
-    const unsigned char* const row = src + (size_t)j * kTokB;
-    uint4 w[kUPart];
+  // A wave reads kPushB of its items before it sends any: an item's stores wait on its loads.
+  constexpr int kPushB = 4;
+  const int nItems = nRecv * kParts;
+  for (int it0 = wv; it0 < nItems; it0 += kPushB * nWaves) {
+    int st[kPushB], e[kPushB], qb[kPushB];
+    uint4 w[kPushB][kUPart];
 #pragma unroll
-    for (int i = 0; i < kUPart; ++i) {
-      const int c = q * kUPart + i;
-      w[i] = make_uint4(0u, 0u, (unsigned)flag, (unsigned)(flag >> 32));
-      if (c >= kUnits) continue;
-      if (lp < 7) {
-        if (offOf(c) < kMainB) w[i] = *reinterpret_cast<const uint4*>(row + offOf(c));
-      } else if (tailOf(c) < kTokB) {
-        const uint2 x = *reinterpret_cast<const uint2*>(row + tailOf(c));
-        w[i].x = x.x;
-        w[i].y = x.y;
-      } else if constexpr (kCfg.useWeights) {
-        const int p = c * kLinesU + lg - kTailLines;
-        if (p >= 0 && p < kWtPairs) {
-          const float* const wt = EpLocal<float>(wr, args.offOutWts) + (size_t)j * topk + 2 * p;
-          w[i].x = __float_as_uint(wt[0]);
-          w[i].y = 2 * p + 1 < topk ? __float_as_uint(wt[1]) : 0u;
+    for (int b = 0; b < kPushB; ++b) {
+      const int it = it0 + b * nWaves;
+      st[b] = -1;
+      e[b] = -1;
+      qb[b] = 0;
+      if (it >= nItems) continue;
+      const int j = it / kParts, q = it - j * kParts;
+      qb[b] = q;
+      st[b] = EpUniG(rSrc)[j];
+      if (laneId < topk) e[b] = EpUniG(rIdx)[(size_t)j * topk + laneId];
+      const unsigned char* const row = src + (size_t)j * kTokB;
+#pragma unroll
+      for (int i = 0; i < kUPart; ++i) {
+        const int c = q * kUPart + i;
+        w[b][i] = make_uint4(0u, 0u, (unsigned)flag, (unsigned)(flag >> 32));
+        if (c >= kUnits) continue;
+        if (lp < 7) {
+          if (offOf(c) < kMainB) w[b][i] = *reinterpret_cast<const uint4*>(row + offOf(c));
+        } else if (tailOf(c) < kTokB) {
+          const uint2 x = *reinterpret_cast<const uint2*>(row + tailOf(c));
+          w[b][i].x = x.x;
+          w[b][i].y = x.y;
+        } else if constexpr (kCfg.useWeights) {
+          const int p = c * kLinesU + lg - kTailLines;
+          if (p >= 0 && p < kWtPairs) {
+            const float* const wt = EpLocal<float>(wr, args.offOutWts) + (size_t)j * topk + 2 * p;
+            w[b][i].x = __float_as_uint(wt[0]);
+            w[b][i].y = 2 * p + 1 < topk ? __float_as_uint(wt[1]) : 0u;
+          }
         }
       }
     }
     asm volatile("" ::: "memory");
-    if (st < 0 || st >= npes * kCfg.maxTokPerRank) continue;
-    const int s = st / kCfg.maxTokPerRank, t = st - s * kCfg.maxTokPerRank;
-    const unsigned qr = (unsigned)e / (unsigned)kEpr;
-    const int rq = (e >= 0 && qr < (unsigned)npes) ? (int)qr : -1;
-    const unsigned long long fm = firsts(rq);
-    const unsigned long long me = fm & __ballot(rq == myPe);
-    if (!me) continue;
-    const int k = __popcll(fm & (me - 1ull));
-    const auto dg = EpUniG(reinterpret_cast<uint4*>(EpPeer<char>(wr, s, args.offOutTok) + kLandOff +
-                                                    ((size_t)t * kRows + k) * kLlRowB));
 #pragma unroll
-    for (int i = 0; i < kUPart; ++i) {
-      const int c = q * kUPart + i;
-      if (c < kUnits) dg[c * (kUnitB / 16) + laneId] = w[i];
+    for (int b = 0; b < kPushB; ++b) {
+      if (st[b] < 0 || st[b] >= npes * kCfg.maxTokPerRank) continue;
+      const int s = st[b] / kCfg.maxTokPerRank, t = st[b] - s * kCfg.maxTokPerRank;
+      const unsigned qr = (unsigned)e[b] / (unsigned)kEpr;
+      const int rq = (e[b] >= 0 && qr < (unsigned)npes) ? (int)qr : -1;
+      const unsigned long long fm = firsts(rq);
+      const unsigned long long me = fm & __ballot(rq == myPe);
+      if (!me) continue;
+      const int k = __popcll(fm & (me - 1ull));
+      const auto dg = EpUniG(reinterpret_cast<uint4*>(EpPeer<char>(wr, s, args.offOutTok) +
+                                                      kLandOff + ((size_t)t * kRows + k) * kLlRowB));
+#pragma unroll
+      for (int i = 0; i < kUPart; ++i) {
+        const int c = qb[b] * kUPart + i;
+        if (c < kUnits) dg[c * (kUnitB / 16) + laneId] = w[b][i];
+      }
     }
   }
 
