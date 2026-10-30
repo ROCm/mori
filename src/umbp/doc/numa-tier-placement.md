@@ -71,10 +71,14 @@ leaves all bitmaps unchanged. HBM and SSD backends ignore the hint.
 
 A host buffer larger than `UMBP_DRAM_MAX_MR_BYTES` (default 512 GiB) is
 registered with the NIC as several memory regions of at most that size, in
-whole backing and allocator pages. AMD Pensando AINIC translates only the first
-2^18 page entries of a memory region and silently aliases the rest, so the
-limit must not exceed 2^18 backing pages: 512 GiB with 2 MiB pages, 1 GiB with
-4 KiB pages. `0` registers each buffer whole. Each region is its own buffer on
+whole backing and allocator pages. AMD Pensando AINIC firmware before
+1.117.5-a-190 translates only the first 2^18 page entries of a memory region
+and silently aliases the rest, so the limit must not exceed 2^18 backing
+pages: 512 GiB with 2 MiB pages, 1 GiB with 4 KiB pages. On such a host the
+DRAM tier and the ranged scratch warn at startup about a region with more,
+counted from the pages that actually back it, since a hugepage request that
+fell back to 4 KiB pages has 512 times the entries; the warning names the
+firmware. `0` registers each buffer whole. Each region is its own buffer on
 the same node; a node preference takes the first of that node's regions that
 holds the request.
 
@@ -110,6 +114,22 @@ tier on one node keeps its order.
 Each side of an RDMA transfer picks its NICs from the node of its own memory, so
 the object then travels between NICs on the same node at both ends when the
 reader is the GPU that wrote it.
+
+## Ranged I/O
+
+A remote ranged GET or PUT stages through a host arena, and every GPU on a node
+shares the standalone server's. In one piece, the arena sits on whichever node
+first touch placed it, so its NUMA node picks the NICs of every rank's RDMA leg
+and half the GPUs copy across sockets. The standalone server therefore lays each
+arena out by NUMA node (`UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA`): the configured
+bytes are split evenly over the nodes that have GPUs, each part is bound to its
+node and registered on its own, and is cut into one shard per GPU on it unless
+`UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS` sets the arena's total. A call stages
+through a shard on its caller buffer's node, or that node's whole part when it
+needs more than a shard. Memory is the same as one arena per direction. Each
+part is one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the
+AINIC limit above, or back the arenas with hugepages
+(`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`).
 
 ## Measured effect
 

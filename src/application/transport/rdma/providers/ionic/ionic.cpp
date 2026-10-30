@@ -39,6 +39,7 @@
 #include <tuple>
 
 #include "mori/application/transport/rdma/providers/ionic/ionic_dv.h"
+#include "mori/application/transport/rdma/providers/ionic/ionic_fw_version.hpp"
 #include "mori/application/utils/check.hpp"
 #include "mori/application/utils/math.hpp"
 #include "mori/core/transport/rdma/providers/ionic/ionic_fw.h"
@@ -53,35 +54,7 @@ namespace application {
 
 namespace {
 
-using FwVersion = std::tuple<int, int, int, int>;
-constexpr FwVersion kCcqeMinFwVersion{1, 117, 5, 58};
-
-// Parse "1.117.5-a-58" or "1.117.5-a58" into (1,117,5,58).
-std::optional<FwVersion> ParseIonicFwVersion(const char* fw_ver) {
-  int major, minor, patch, build;
-  char tag;
-  if (sscanf(fw_ver, "%d.%d.%d-%c-%d", &major, &minor, &patch, &tag, &build) == 5 ||
-      sscanf(fw_ver, "%d.%d.%d-%c%d", &major, &minor, &patch, &tag, &build) == 5) {
-    return FwVersion{major, minor, patch, build};
-  }
-  return std::nullopt;
-}
-
-std::optional<FwVersion> ReadIonicFwVersion(const char* dev_name) {
-  char path[256];
-  snprintf(path, sizeof(path), "/sys/class/infiniband/%s/fw_ver", dev_name);
-
-  FILE* f = fopen(path, "r");
-  if (!f) return std::nullopt;
-
-  char buf[64] = {};
-  fgets(buf, sizeof(buf), f);
-  fclose(f);
-
-  // Strip trailing newline.
-  buf[strcspn(buf, "\n")] = '\0';
-  return ParseIonicFwVersion(buf);
-}
+constexpr IonicFwVersion kCcqeMinFwVersion{1, 117, 5, 58};
 
 bool IsCcqeSupported(ibv_context* context) {
   const char* disable_ccqe = std::getenv("MORI_DISABLE_IONIC_CCQE");

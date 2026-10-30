@@ -272,16 +272,45 @@ class PoolClientRangesTest : public ::testing::Test {
     // test hands it a size rather than a buffer.
     cfg.dram.buffer_sizes = {dram_capacity};
     // Separate GET and PUT arenas so remote ranged get/put run concurrently.
-    cfg.ranged_get_scratch_buffer = get_scratch.data();
-    cfg.ranged_get_scratch_size = get_scratch.size();
-    cfg.ranged_put_scratch_buffer = put_scratch.data();
-    cfg.ranged_put_scratch_size = put_scratch.size();
+    cfg.ranged_get_scratch = {{get_scratch.data(), get_scratch.size()}};
+    cfg.ranged_put_scratch = {{put_scratch.data(), put_scratch.size()}};
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = locality_prefetch;
     auto client = std::make_unique<PoolClient>(std::move(cfg));
     EXPECT_TRUE(client->Init());
     EXPECT_TRUE(client->RegisterMemory(get_scratch.data(), get_scratch.size()));
     EXPECT_TRUE(client->RegisterMemory(put_scratch.data(), put_scratch.size()));
+    return client;
+  }
+
+  // MakeClient with its arenas laid out by NUMA node instead: one GET and one PUT
+  // buffer per entry of `nodes`, in that order, and no locality prefetch, so every
+  // read of a remote key goes through an arena.
+  std::unique_ptr<PoolClient> MakeNumaArenaClient(const std::string& node_id,
+                                                  const std::vector<int>& nodes,
+                                                  std::vector<std::vector<char>>& get_arenas,
+                                                  std::vector<std::vector<char>>& put_arenas) {
+    PoolClientConfig cfg;
+    cfg.master_config.node_id = node_id;
+    cfg.master_config.node_address = "127.0.0.1";
+    cfg.master_config.master_address = master_address_;
+    cfg.io_engine.host = "0.0.0.0";
+    cfg.io_engine.port = 0;
+    cfg.auto_peer_service_port = true;
+    cfg.dram_page_size = kPageSize;
+    cfg.staging_buffer_size = 1024;
+    cfg.dram.buffer_sizes = {kCallerCapacity};
+    for (size_t i = 0; i < nodes.size(); ++i) {
+      cfg.ranged_get_scratch.push_back({get_arenas[i].data(), get_arenas[i].size(), nodes[i], 1});
+      cfg.ranged_put_scratch.push_back({put_arenas[i].data(), put_arenas[i].size(), nodes[i], 1});
+    }
+    cfg.cache_remote_fetches = false;
+    cfg.ranged_locality_prefetch = false;
+    auto client = std::make_unique<PoolClient>(std::move(cfg));
+    EXPECT_TRUE(client->Init());
+    for (auto* arenas : {&get_arenas, &put_arenas}) {
+      for (auto& arena : *arenas) EXPECT_TRUE(client->RegisterMemory(arena.data(), arena.size()));
+    }
     return client;
   }
 
@@ -379,10 +408,8 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     tiered_get_scratch_.resize(kScratchSize);
     tiered_put_scratch_.resize(kScratchSize);
-    cfg.ranged_get_scratch_buffer = tiered_get_scratch_.data();
-    cfg.ranged_get_scratch_size = tiered_get_scratch_.size();
-    cfg.ranged_put_scratch_buffer = tiered_put_scratch_.data();
-    cfg.ranged_put_scratch_size = tiered_put_scratch_.size();
+    cfg.ranged_get_scratch = {{tiered_get_scratch_.data(), tiered_get_scratch_.size()}};
+    cfg.ranged_put_scratch = {{tiered_put_scratch_.data(), tiered_put_scratch_.size()}};
     cfg.cache_remote_fetches = false;
 
     BackendInstanceConfig cold;
@@ -670,6 +697,29 @@ TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
   client->Close();
 }
 
+// The standalone server's layout: each arena split across the NUMA nodes that have
+// GPUs, one shard per GPU, and a remote ranged read round-trips through it.
+TEST_F(PoolClientRangesTest, DistributedScratchLaidOutByNumaNode) {
+  auto config = DistributedConfig("ranges-numa-layout", 16 * kObjectSize);
+  config.distributed->ranged_scratch_numa_layout = true;
+  auto client = CreateUMBPClient(config);
+  ASSERT_NE(client, nullptr);
+  EXPECT_TRUE(client->SupportsRangedIO());
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 7 + 5) & 0xff);
+  const std::string key = "numa-layout-remote";
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(client.get(), key));
+  std::vector<char> out(4000, 0);
+  ASSERT_EQ(client->BatchGetRanges({key}, {{reinterpret_cast<uintptr_t>(out.data())}},
+                                   {{out.size()}}, {{100}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(out.data(), object.data() + 100, out.size()), 0);
+  client->Close();
+}
+
 TEST_F(PoolClientRangesTest, StaleSelfLocationIsExcludedBeforeRemoteFetch) {
   const std::string key = "range-stale-self";
   std::vector<char> stale_object(kObjectSize, 0x11);
@@ -810,6 +860,77 @@ TEST_F(PoolClientRangesTest, SplitRemotePutThenGetRoundTrips) {
   for (size_t k = 0; k < kKeys; ++k) {
     EXPECT_EQ(std::memcmp(out[k].data(), objects[k].data(), kObjectSize), 0) << "key=" << keys[k];
   }
+}
+
+// Arenas laid out by NUMA node: a remote ranged call stages through the arena on
+// its caller buffer's node -- a GPU's for device memory -- and a caller whose node
+// is unknown through the first arena.
+TEST_F(PoolClientRangesTest, NumaGroupedArenasStageOnTheCallersNode) {
+  int devices = 0;
+  if (hipGetDeviceCount(&devices) != hipSuccess || devices < 1) GTEST_SKIP() << "no GPU";
+  int first_node = -1;
+  int last_node = -1;
+  mori::application::detail::GpuLocalCpuList(0, first_node);
+  mori::application::detail::GpuLocalCpuList(devices - 1, last_node);
+  if (first_node < 0 || last_node < 0 || first_node == last_node) {
+    GTEST_SKIP() << "needs GPUs on two NUMA nodes";
+  }
+  constexpr char kPoison = static_cast<char>(0x6b);
+  const auto poisoned = [&](const std::vector<char>& v) {
+    return std::all_of(v.begin(), v.end(), [&](char c) { return c == kPoison; });
+  };
+  std::vector<std::vector<char>> get_arenas(2, std::vector<char>(kScratchSize, kPoison));
+  std::vector<std::vector<char>> put_arenas(2, std::vector<char>(kScratchSize, kPoison));
+  auto numa_client =
+      MakeNumaArenaClient("ranges-numa_client", {first_node, last_node}, get_arenas, put_arenas);
+
+  std::vector<char> object(kObjectSize);
+  for (size_t i = 0; i < kObjectSize; ++i) object[i] = static_cast<char>((i * 31 + 3) & 0xff);
+  const std::string key = "numa-numa_client";
+  PutLocalReplica(target_.get(), key, object);
+  target_->Master().FlushHeartbeat();
+  numa_client->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitForExists(numa_client.get(), key));
+
+  int previous = 0;
+  ASSERT_EQ(hipGetDevice(&previous), hipSuccess);
+  ASSERT_EQ(hipSetDevice(devices - 1), hipSuccess);
+  void* gpu = nullptr;
+  const hipError_t malloc_rc = hipMalloc(&gpu, kObjectSize);
+  ASSERT_EQ(hipSetDevice(previous), hipSuccess);
+  ASSERT_EQ(malloc_rc, hipSuccess);
+  struct Release {
+    void* ptr;
+    ~Release() { (void)hipFree(ptr); }
+  } release{gpu};
+
+  // A span, not the whole object, so the read cannot bypass the arena.
+  constexpr size_t kOffset = 100;
+  constexpr size_t kSpan = 4000;
+  ASSERT_EQ(numa_client->BatchGetRanges({key}, {{gpu}}, {{kSpan}}, {{kOffset}}),
+            std::vector<bool>({true}));
+  std::vector<char> actual(kSpan);
+  ASSERT_EQ(hipMemcpy(actual.data(), gpu, kSpan, hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(std::memcmp(actual.data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_EQ(std::memcmp(get_arenas[1].data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_TRUE(poisoned(get_arenas[0]));
+
+  std::fill(get_arenas[1].begin(), get_arenas[1].end(), kPoison);
+  std::vector<char> host(kSpan, 0);
+  ASSERT_EQ(numa_client->BatchGetRanges({key}, {{host.data()}}, {{kSpan}}, {{kOffset}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(host.data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_EQ(std::memcmp(get_arenas[0].data(), object.data() + kOffset, kSpan), 0);
+  EXPECT_TRUE(poisoned(get_arenas[1]));
+
+  // A write from the last GPU assembles its object in that node's PUT arena.
+  ASSERT_EQ(hipMemcpy(gpu, object.data(), kObjectSize, hipMemcpyHostToDevice), hipSuccess);
+  const std::string put_key = "numa-numa_client-put";
+  ASSERT_EQ(numa_client->BatchPutRanges({put_key}, {kObjectSize}, {{gpu}}, {{kObjectSize}}, {{0}}),
+            std::vector<bool>({true}));
+  EXPECT_EQ(std::memcmp(put_arenas[1].data(), object.data(), kObjectSize), 0);
+  EXPECT_TRUE(poisoned(put_arenas[0]));
+  numa_client->Shutdown();
 }
 
 // One object too big for the WHOLE arena must not decide arena sizing for its
