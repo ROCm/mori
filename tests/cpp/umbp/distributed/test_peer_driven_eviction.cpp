@@ -106,6 +106,39 @@ class PeerDrivenEvictionTest : public ::testing::Test {
     }
   }
 
+  // Puts keys 0..count-1 and waits until the master knows every one.
+  bool PutKeysTheMasterKnows(int count) {
+    PutKeys(0, count);
+    std::vector<std::string> keys;
+    for (int i = 0; i < count; ++i) keys.push_back(Key(i));
+    client_->Master().FlushHeartbeat();
+    return WaitFor(
+        [&] {
+          std::vector<bool> found;
+          return client_->Master().BatchLookup(keys, &found).ok() &&
+                 std::all_of(found.begin(), found.end(), [](bool f) { return f; });
+        },
+        std::chrono::seconds(5));
+  }
+
+  // Whether the master comes to rank `used` the hottest of the `count` keys it
+  // knows; it hears of uses served here only through the heartbeat.
+  bool MasterRanksLast(std::vector<std::string> used, size_t count) {
+    std::sort(used.begin(), used.end());
+    return WaitFor(
+        [&] {
+          client_->Master().FlushHeartbeat();
+          auto ranked =
+              client_->Master().GetEvictionCandidates(TierType::DRAM, "", count * kPage, 0);
+          if (!ranked.has_value() || ranked->size() != count) return false;
+          std::vector<std::string> last;
+          for (size_t i = count - used.size(); i < count; ++i) last.push_back((*ranked)[i].key);
+          std::sort(last.begin(), last.end());
+          return last == used;
+        },
+        std::chrono::seconds(5));
+  }
+
   MediumBackend* Dram() { return client_->Backends().Get(TierType::DRAM); }
 
   std::unique_ptr<MasterServer> master_;
@@ -119,35 +152,14 @@ TEST_F(PeerDrivenEvictionTest, MasterRankedNodeEvictsTheMastersVictims) {
   ASSERT_TRUE(node->Master().PeerDrivenEviction());
 
   // Just under the watermark, and known to the master.
-  PutKeys(0, 14);
-  std::vector<std::string> known;
-  for (int i = 0; i < 14; ++i) known.push_back(Key(i));
-  node->Master().FlushHeartbeat();
-  ASSERT_TRUE(WaitFor(
-      [&] {
-        std::vector<bool> found;
-        return node->Master().BatchLookup(known, &found).ok() &&
-               std::all_of(found.begin(), found.end(), [](bool f) { return f; });
-      },
-      std::chrono::seconds(5)));
+  ASSERT_TRUE(PutKeysTheMasterKnows(14));
 
   // Local reads, which the master sees only through the heartbeat, must move
   // these keys behind every other in its ranking.
   const std::vector<std::string> read = {Key(0), Key(1), Key(2)};
   std::vector<char> buf(kPage);
   for (const auto& key : read) ASSERT_TRUE(node->Get(key, buf.data(), buf.size())) << key;
-  ASSERT_TRUE(WaitFor(
-      [&] {
-        node->Master().FlushHeartbeat();
-        auto ranked = node->Master().GetEvictionCandidates(TierType::DRAM, "", 14 * kPage, 0);
-        if (!ranked.has_value() || ranked->size() != 14) return false;
-        std::vector<std::string> last;
-        for (size_t i = 11; i < 14; ++i) last.push_back((*ranked)[i].key);
-        std::sort(last.begin(), last.end());
-        return last == read;
-      },
-      std::chrono::seconds(5)))
-      << "local reads did not reach the master's ranking";
+  ASSERT_TRUE(MasterRanksLast(read, 14)) << "local reads did not reach the master's ranking";
 
   PutKeys(14, 1);  // 15 of 16 pages
   ASSERT_TRUE(
@@ -158,46 +170,36 @@ TEST_F(PeerDrivenEvictionTest, MasterRankedNodeEvictsTheMastersVictims) {
   for (const auto& key : read) EXPECT_TRUE(Dram()->Contains(key)) << key;
 }
 
-TEST_F(PeerDrivenEvictionTest, MasterRankedNodeKeepsTheKeysItTouched) {
-  auto* node = Start(/*master_supports=*/true, PeerEvictionMode::kMasterRanked);
-  ASSERT_NE(node, nullptr);
-  ASSERT_TRUE(node->Master().PeerDrivenEviction());
-
-  PutKeys(0, 14);
-  std::vector<std::string> known;
-  for (int i = 0; i < 14; ++i) known.push_back(Key(i));
-  node->Master().FlushHeartbeat();
-  ASSERT_TRUE(WaitFor(
-      [&] {
-        std::vector<bool> found;
-        return node->Master().BatchLookup(known, &found).ok() &&
-               std::all_of(found.begin(), found.end(), [](bool f) { return f; });
-      },
-      std::chrono::seconds(5)));
-
+TEST_F(PeerDrivenEvictionTest, TouchedKeysReachTheMastersRanking) {
   // Used from the caller's own cache, so never read here: only the touch can
   // move them behind every other key in the master's ranking.
   const std::vector<std::string> touched = {Key(0), Key(1), Key(2)};
-  EXPECT_EQ(node->BatchTouch(touched), touched.size());
-  ASSERT_TRUE(WaitFor(
-      [&] {
-        node->Master().FlushHeartbeat();
-        auto ranked = node->Master().GetEvictionCandidates(TierType::DRAM, "", 14 * kPage, 0);
-        if (!ranked.has_value() || ranked->size() != 14) return false;
-        std::vector<std::string> last;
-        for (size_t i = 11; i < 14; ++i) last.push_back((*ranked)[i].key);
-        std::sort(last.begin(), last.end());
-        return last == touched;
-      },
-      std::chrono::seconds(5)))
-      << "touched keys did not reach the master's ranking";
+  for (const auto mode : {PeerEvictionMode::kMasterRanked, PeerEvictionMode::kMaster}) {
+    SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode));
+    auto* node = Start(/*master_supports=*/true, mode);
+    ASSERT_NE(node, nullptr);
+    ASSERT_TRUE(node->Master().ReportsLocalReads());
+    ASSERT_TRUE(PutKeysTheMasterKnows(14));
 
-  PutKeys(14, 1);  // 15 of 16 pages
-  ASSERT_TRUE(
-      WaitFor([&] { return Dram()->OwnedKeyCount() <= kPages / 2; }, std::chrono::seconds(3)))
-      << "the node did not evict for itself";
-  EXPECT_EQ(node->LocalEvictionStats().master_keys, 7u) << "victims did not come from the master";
-  for (const auto& key : touched) EXPECT_TRUE(Dram()->Contains(key)) << key;
+    // master mode leaves DRAM to the master's rounds and keeps no order of its
+    // own there, so nothing moves on the node.
+    const bool self_evicting = mode == PeerEvictionMode::kMasterRanked;
+    EXPECT_EQ(node->BatchTouch(touched), self_evicting ? touched.size() : 0u);
+    ASSERT_TRUE(MasterRanksLast(touched, 14)) << "touched keys did not reach the master's ranking";
+
+    if (self_evicting) {
+      ASSERT_TRUE(node->Master().PeerDrivenEviction());
+      PutKeys(14, 1);  // 15 of 16 pages
+      ASSERT_TRUE(
+          WaitFor([&] { return Dram()->OwnedKeyCount() <= kPages / 2; }, std::chrono::seconds(3)))
+          << "the node did not evict for itself";
+      EXPECT_EQ(Dram()->OwnedKeyCount(), kPages / 2);
+      EXPECT_EQ(node->LocalEvictionStats().master_keys, 7u)
+          << "victims did not come from the master";
+      for (const auto& key : touched) EXPECT_TRUE(Dram()->Contains(key)) << key;
+    }
+    Stop();
+  }
 }
 
 TEST_F(PeerDrivenEvictionTest, EvictsLocallyUnlessTheModeIsMaster) {

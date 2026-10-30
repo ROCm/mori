@@ -1245,10 +1245,11 @@ TEST(PageBackendAutoFlush, FullSyncSnapshotClearsOutbox) {
 
 namespace {
 
-// Ordered, with a 1 ms read lease so a read does not keep a key out of
-// EvictionCandidates for the rest of the test.
-std::unique_ptr<PageBackend> MakeOrderedBackend() {
-  auto backend = MakeAllocator(std::chrono::milliseconds{5000}, std::chrono::milliseconds{1});
+// Ordered, with a read lease long enough that a key leased by mistake would be
+// missing from EvictionCandidates.
+std::unique_ptr<PageBackend> MakeOrderedBackend(
+    std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500}) {
+  auto backend = MakeAllocator(std::chrono::milliseconds{5000}, read_lease_ttl);
   backend->TrackEvictionOrder();
   return backend;
 }
@@ -1279,8 +1280,18 @@ TEST(PageBackendTouch, MovesRecencyWithoutALease) {
   EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"b", "c", "a"}));
 }
 
-TEST(PageBackendTouch, ExistsProbesLeaveTheOrderAlone) {
+TEST(PageBackendTouch, MovesKeysInTheOrderGiven) {
   auto backend = MakeOrderedBackend();
+  PutKey(*backend, "a");
+  PutKey(*backend, "b");
+  PutKey(*backend, "c");
+  EXPECT_EQ(backend->Touch({"b", "a"}), 2u);
+  EXPECT_EQ(OfferedOrder(*backend), (std::vector<std::string>{"c", "b", "a"}));
+}
+
+TEST(PageBackendTouch, ExistsProbesLeaveTheOrderAlone) {
+  // A 1 ms lease, so the key read below is offered again after the sleep.
+  auto backend = MakeOrderedBackend(std::chrono::milliseconds{1});
   PutKey(*backend, "a");
   PutKey(*backend, "b");
   PutKey(*backend, "c");
