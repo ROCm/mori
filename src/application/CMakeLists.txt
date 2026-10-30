@@ -10,9 +10,10 @@ if(WITH_MPI)
 endif()
 find_package(hsa-runtime64 REQUIRED)
 
-# ROCm 7.14's hsakmtTargets.cmake leaks its build machine into
+# The hsakmtTargets.cmake of ROCm 7.14 and 10.x leaks its build machine into
 # hsakmt::hsakmt's INTERFACE_LINK_LIBRARIES; undone here and after
-# find_package(hsakmt) below (both no-ops on 7.2.4, which is clean).
+# find_package(hsakmt) below (both no-ops on 7.2.4, which is clean, and the
+# second one on 10.1).
 #
 # It links the imported target `numa::numa` but never defines it, so
 # find_package(hsakmt) would fail at generate time: "The link interface of

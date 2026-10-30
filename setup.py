@@ -418,6 +418,9 @@ def _write_cco_build_flags(root_dir: Path, *, sdma: bool) -> None:
 
 
 _ROCM_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)(?:\.\d+)?\b")
+_ROCM_VERSION_HEADER_RE = re.compile(
+    r"^\s*#\s*define\s+ROCM_VERSION_(MAJOR|MINOR|PATCH)\s+(\d+)", re.MULTILINE
+)
 
 
 def _detect_rocm_build_version() -> tuple[str | None, str | None]:
@@ -428,9 +431,28 @@ def _detect_rocm_build_version() -> tuple[str | None, str | None]:
     ).resolve()
     candidates: list[str] = []
 
+    # The ROCm release version, which is what rocm_sdk.__version__ reports.
+    # hipconfig reports HIP's own version, and that stopped tracking the release
+    # in ROCm 10.0 (it ships HIP 7.15), so it is only a last resort.
+    try:
+        header = (rocm_path / "include" / "rocm-core" / "rocm_version.h").read_text(
+            encoding="utf-8"
+        )
+    except OSError:
+        pass
+    else:
+        fields = dict(_ROCM_VERSION_HEADER_RE.findall(header))
+        if "MAJOR" in fields and "MINOR" in fields:
+            candidates.append(
+                ".".join(fields[k] for k in ("MAJOR", "MINOR", "PATCH") if k in fields)
+            )
+
+    # .info/ sits at the root of the classic layout and under core/ in the
+    # multi-arch (7.14+) one.
     for version_file in (
         rocm_path / ".info" / "version",
         rocm_path / ".info" / "version-dev",
+        rocm_path / "core" / ".info" / "version",
     ):
         try:
             candidates.append(version_file.read_text(encoding="utf-8"))
