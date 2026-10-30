@@ -5489,8 +5489,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
 
       bool _pullDone = false;
       if constexpr (_cPullType) {
-        // Folds _n elements of each live row of the tile set at _cT, rows _rowStride apart, into
-        // outPtr + _off.
+        // Folds _n elements of each live row of the tile set at _cT, the live rows packed in source
+        // order _rowStride apart, into outPtr + _off.
         auto _cFold = [&](const TokT* _cT, size_t _off, int _n, int _rowStride, int _nRed) {
 #define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
           __threadfence_block();
@@ -5509,18 +5509,18 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
           constexpr bool _cFoldMix =
               std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
-          [[maybe_unused]] int _zRow[_cRedSrcMax];
+          // The live rows are packed in order: row j sits at the count of live rows before it. A
+          // dead row reads row 0, the first live one, and is weighted 0.
+          int _zRow[_cRedSrcMax];
           [[maybe_unused]] float _zMul[_cRedSrcMax];
-          if constexpr (_cFoldMix) {
-            int _z0 = 0;
-#pragma unroll
-            for (int _j = _cRedSrcMax - 1; _j >= 0; --_j)
-              if (_j < _nRed && !_CROW_DEAD(_j)) _z0 = _j;
+          {
+            int _zs = 0;
 #pragma unroll
             for (int _j = 0; _j < _cRedSrcMax; ++_j) {
               const bool _live = (_j < _nRed) && !_CROW_DEAD(_j);
-              _zRow[_j] = _live ? _j : _z0;
+              _zRow[_j] = _live ? _zs : 0;
               _zMul[_j] = _live ? 1.0f : 0.0f;
+              _zs += _live ? 1 : 0;
             }
           }
           for (int _e = laneId * _cV; _e < _nv; _e += WS * _cV) {
@@ -5552,9 +5552,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                 for (int _j = 0; _j < _cRedSrcMax; ++_j) _cFoldRow(_j, _svR[_j], _zMul[_j]);
               } else {
 #pragma unroll
-                for (int _j = 0; _j < _cRedSrcMax; ++_j) {
-                  _svR[_j] = _CROW_AT((_j < _nRed) ? _j : 0);
-                }
+                for (int _j = 0; _j < _cRedSrcMax; ++_j) _svR[_j] = _CROW_AT(_zRow[_j]);
 #pragma unroll
                 for (int _j = 0; _j < _cRedSrcMax; ++_j) {
                   if (_j >= _nRed || _CROW_DEAD(_j)) continue;
@@ -5562,9 +5560,11 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                 }
               }
             } else {
+              int _zs = 0;
               for (int _j = 0; _j < _nRed; ++_j) {
                 if (_CROW_DEAD(_j)) continue;
-                _cFoldRow(_j, _CROW_AT(_j), 1.0f);
+                _cFoldRow(_j, _CROW_AT(_zs), 1.0f);
+                ++_zs;
               }
             }
 #undef _CROW_AT
@@ -5589,9 +5589,11 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           }
           for (int _e = _nv + laneId; _e < _n; _e += WS) {
             float _acc = 0.0f;
+            int _zs = 0;
             for (int _j = 0; _j < _nRed; ++_j) {
               if (_CROW_DEAD(_j)) continue;
-              _acc += (float)_cT[(size_t)_j * _rowStride + _e];
+              _acc += (float)_cT[(size_t)_zs * _rowStride + _e];
+              ++_zs;
             }
             outPtr[_off + _e] = T(_acc);
           }
@@ -5616,20 +5618,23 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                 (int)(_cPullOk && (int)validAccumCount <= _cPullSrcMax &&
                       _cPipeTileElems >= _cPullRowElems && _cRedEnd <= globalWarpNum &&
                       hiddenDimSize > 2 * (size_t)_cPipeTileElems)) != 0;
+        const int _nSrc = (int)validAccumCount;
+        int _cLive = 0;
+        for (int _j = 0; _j < _nSrc; ++_j) _cLive += (srcPtrs[_j] != nullptr) ? 1 : 0;
+        _cLive = __builtin_amdgcn_readfirstlane(_cLive);
         if (_cPipe) {
-          const int _nSrc = (int)validAccumCount;
           const int _cTile = _cPipeTileElems;
-          int _cLive = 0;
-          for (int _j = 0; _j < _nSrc; ++_j) _cLive += (srcPtrs[_j] != nullptr) ? 1 : 0;
-          _cLive = __builtin_amdgcn_readfirstlane(_cLive);
+          const size_t _cSet = (size_t)_cLive * _cTile;
           auto _cIssue = [&](size_t _o, int _b) {
             int _m = (int)(hiddenDimSize - _o);
             if (_m > _cTile) _m = _cTile;
             const gfx1250_TDM_GROUP1 _pgN = TdmShape<TokT>(_m);
-            TokT* const _dst = _cPullTiles + (size_t)_b * _cPullSrcMax * _cTile;
+            TokT* const _dst = _cPullTiles + (size_t)_b * _cSet;
+            int _s = 0;
             for (int _j = 0; _j < _nSrc; ++_j) {
               if (srcPtrs[_j] == nullptr) continue;
-              TdmIssueLoad<TokT>(_dst + (size_t)_j * _cTile, srcPtrs[_j] + _o, _pgN);
+              TdmIssueLoad<TokT>(_dst + (size_t)_s * _cTile, srcPtrs[_j] + _o, _pgN);
+              ++_s;
             }
           };
           int _cBuf = 0;
@@ -5665,27 +5670,37 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             } else {
               __builtin_amdgcn_s_wait_tensorcnt(0);
             }
-            _cFold(_cPullTiles + (size_t)_cBuf * _cPullSrcMax * _cTile, _off, _n, _cTile, _nSrc);
+            _cFold(_cPullTiles + (size_t)_cBuf * _cSet, _off, _n, _cTile, _nSrc);
             _cBuf ^= 1;
           }
           _pullDone = true;
         } else if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
-          const int _nSrc = (int)validAccumCount;
-          for (size_t _off = 0; _off < hiddenDimSize; _off += _cPullTileElems) {
+          // The slots of the ranks this item does not reach lengthen the rows of those it does:
+          // the fewest chunks that fit the warp's slots, split evenly at the fold's stride.
+          const int _cCap = (_cPullSrcMax * _cPullWarpElems / (_cLive > 0 ? _cLive : 1)) /
+                            _cPullFoldElems * _cPullFoldElems;
+          int _cTile = _cPullTileElems;
+          if (_cCap >= _cPullFoldElems) {
+            const int _k = ((int)hiddenDimSize + _cCap - 1) / _cCap;
+            _cTile = (((int)hiddenDimSize + _k - 1) / _k + _cPullFoldElems - 1) /
+                     _cPullFoldElems * _cPullFoldElems;
+          }
+          for (size_t _off = 0; _off < hiddenDimSize; _off += _cTile) {
             int _n = (int)(hiddenDimSize - _off);
-            if (_n > _cPullTileElems) _n = _cPullTileElems;
+            if (_n > _cTile) _n = _cTile;
             if ((size_t)_n * sizeof(TokT) < 128) {
               _cFoldPeers(_off, _n, _nSrc);
               break;
             }
             const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
+            int _s = 0;
             for (int _j = 0; _j < _nSrc; ++_j) {
               if (srcPtrs[_j] == nullptr) continue;
-              TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off,
-                                 _pg1);
+              TdmIssueLoad<TokT>(_cPullTiles + (size_t)_s * _cTile, srcPtrs[_j] + _off, _pg1);
+              ++_s;
             }
             __builtin_amdgcn_s_wait_tensorcnt(0);
-            _cFold(_cPullTiles, _off, _n, _cPullTileElems, _nSrc);
+            _cFold(_cPullTiles, _off, _n, _cTile, _nSrc);
           }
           _pullDone = true;
         }
