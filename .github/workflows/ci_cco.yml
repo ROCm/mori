@@ -87,6 +87,16 @@ jobs:
             timeout 120 python -m pytest -v \
               tests/python/ops/dispatch_combine_v2/test_internode_regions.py"
 
+      - name: Check arch detection, tuning keys and AsyncLL options
+        run: |
+          # No GPU needed: arch-string matching, the ASIC-revision table keys and their
+          # CU fit, the per-target macro guard, and the AsyncLL defaults per arch.
+          $CT exec $CONTAINER bash -c "\
+            cd $GITHUB_WORKSPACE && \
+            timeout 120 python -m pytest -v \
+              tests/python/ops/dispatch_combine_v2/test_gfx1250_strict_arch.py \
+              tests/python/ops/dispatch_combine_v2/test_asyncll_options.py"
+
       - name: Run CCO unit tests (fork mode, 4 ranks)
         run: |
           # MORI_CCO_SKIP_GDA_FULL=1: the MI355X-AINIC runner has no intranode

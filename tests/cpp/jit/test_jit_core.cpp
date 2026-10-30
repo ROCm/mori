@@ -760,3 +760,28 @@ TEST(Describe, FailsWhereCreateWould) {
   ToolchainOverride guard(FakeToolchain("gfx942", "mlx5"));
   EXPECT_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}), std::runtime_error);
 }
+
+// --------------------------------------------------------------------------
+// gfx1250-strict is a gfx125x target of its own.
+// --------------------------------------------------------------------------
+
+TEST(Gfx1250Strict, RoutesLikeGfx1250) {
+  EXPECT_EQ(mori::jit::v2::WaveSizeForArch("gfx1250-strict"), 32);
+  ToolchainOverride guard(FakeToolchain("gfx1250-strict", "ionic"));
+  const EpCfg cfg;
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::RenderSource(cfg).find("ep_intranode_1250x.hpp"),
+            std::string::npos);
+  EXPECT_NE(mori::ops::v2::EpDispatchSpec::EntryName(cfg).find("_tdm"), std::string::npos);
+  EpCfg c;
+  c.scaleBytes = 224;
+  EXPECT_EQ(ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}))["stagingBytes"],
+            std::to_string(EpStagingTotalBytes(c)));
+  EXPECT_NO_THROW(DescribePlan("ep_combine", {{"combineFp4", 1}}));
+}
+
+TEST(Gfx1250Strict, HasItsOwnCacheEntries) {
+  EXPECT_EQ(fs::path(CacheDirWith("gfx1250-strict", "ionic")).parent_path().filename(),
+            "gfx1250-strict_ionic");
+  EXPECT_NE(fs::path(CacheDirWith("gfx1250-strict", "ionic")).filename(),
+            fs::path(CacheDirWith("gfx1250", "ionic")).filename());
+}

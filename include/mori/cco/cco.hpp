@@ -128,7 +128,12 @@ __device__ inline T* global(T* ptr) {
  * width — so add any further wave32 arch to CCO_WAVE32 below. Masks are uint64_t
  * either way; on wave32 only the low half is populated.
  * ──────────────────────────────────────────────────────────────────────────── */
-#if defined(__gfx1250__)
+// gfx125x family, incl. gfx1250-strict (no __gfx1250__). Mirrors MORI_GFX125X in
+// mori/core/arch.hpp; kept here since this header includes no other mori header.
+#if defined(__gfx1250__) || defined(__gfx1251__) || defined(__gfx1250_strict__)
+#define CCO_GFX125X 1
+#endif
+#if defined(CCO_GFX125X)
 #define CCO_WAVE32 1
 #endif
 #ifdef CCO_WAVE32
@@ -1044,7 +1049,7 @@ constexpr size_t CCO_SDMA_MAX_COPY_BYTES = 0x3fffffe0ull;
 // gfx12.5+ reads cache scope and temporal hints out of bits gfx9 leaves reserved,
 // gated by the header's npd bit. ROCr picks the same split (BlitSdmaV6 vs V4);
 // gfx9 wants them zero for peak xGMI bandwidth.
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 #define CCO_SDMA_SCOPE_FIELDS 1
 #endif
 
@@ -1357,7 +1362,7 @@ constexpr bool CCO_SDMA_BREAK_ON_RETRIES = false;
 // s_waitcnt intrinsic; gfx9 keeps it because a release fence there also writes
 // back L2, which the uncached ring does not need.
 __device__ __forceinline__ void ccoSdmaPublishStores() {
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
 #else
   __builtin_amdgcn_s_waitcnt(0);
@@ -1403,7 +1408,7 @@ __device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint6
   return packet;
 }
 
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 using ccoSdmaCopy2DPacket = CCO_SDMA_PKT_COPY_LINEAR_RECT_GFX12;
 
 // Largest element (log2 bytes, at most 16B) dividing the width, both pitches and
@@ -1688,7 +1693,7 @@ inline __device__ void ccoSdmaWriteAtomic(uint32_t* queueBuf, uint64_t at, HSAui
 // packet can never straddle the ring end, which a multi-unit packet at an
 // arbitrary unit could. A run reserves one slot less a unit of slack for that
 // alignment; whatever the alignment leaves over is NOP-filled after the run.
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 constexpr uint64_t CCO_SDMA_2D_SLOT = 2 * CCO_SDMA_UNIT;
 #else
 constexpr uint64_t CCO_SDMA_2D_SLOT = 4 * CCO_SDMA_UNIT;
@@ -1732,7 +1737,7 @@ inline __device__ void ccoSdmaWriteCopy2D(uint32_t* queueBuf, uint64_t at, const
   }
 }
 
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
 // The most one gfx12 packet carries: 64Ki elements per row, and 64Ki rows -- 16Ki
 // once the pitch needs the slice field. Pieces of these sizes keep the element.
 __device__ __forceinline__ void ccoSdma2DPieceLimits(const ccoSdmaRect& r, uint32_t& maxW,
@@ -2304,7 +2309,7 @@ __device__ inline void ccoSdmaDispatchPut2D(const ccoSdmaContext& s, int peer, u
   if constexpr (localSignal) localTarget = s.signalBuf + slot;
   if constexpr (remoteSignal) remoteTarget = s.peerSignalPtrs[peer] + slot;
   const uint32_t queueKey = static_cast<uint32_t>(peer) * n + static_cast<uint32_t>(queueId);
-#if defined(__gfx1250__)
+#if defined(CCO_GFX125X)
   // Past one packet's extents: split. Every lane posts its last piece in one
   // converged call, so a batch still carries one signal.
   uint32_t maxW, maxH;
