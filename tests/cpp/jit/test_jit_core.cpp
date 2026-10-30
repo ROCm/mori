@@ -541,6 +541,49 @@ TEST(AsyncLLMode, FactoryRejectsInvalidAndIncompatibleModes) {
                                      EpInterNodeFamily::AsyncLL));
 }
 
+TEST(AsyncLLMode, FusedReceiveGridIsCappedAtHalfTheDeviceByDefault) {
+  const auto kinds = {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy};
+  // Only the fused mode resolves a ceiling, and only its receive copies use it.
+  for (int mode : {0, 1}) {
+    const auto cfg = AsyncLLCfgForMode(mode);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, 0);
+    for (const auto kind : kinds) {
+      EXPECT_EQ(EpAsyncLLGeometry(cfg, kind).gridX, static_cast<unsigned>(cfg.mpCount));
+    }
+  }
+  const auto fused = AsyncLLCfgForMode(2);
+  EXPECT_EQ(fused.asyncLlFusedRecvCtas, fused.mpCount / 2);
+  for (const auto kind : kinds) {
+    EXPECT_EQ(EpAsyncLLGeometry(fused, kind).gridX, static_cast<unsigned>(fused.mpCount / 2));
+  }
+  EXPECT_EQ(EpAsyncLLGeometry(fused, EpAsyncLLKernel::CombineSendCopy).gridX,
+            static_cast<unsigned>(fused.mpCount));
+
+  // An explicit ceiling is aligned down to worldSize and never widens the grid.
+  EpInterNodeRequest request;
+  request.worldSize = 4;
+  request.gpuPerNode = 4;
+  request.asyncLlMode = 2;
+  for (const auto& [ctas, grid] : std::vector<std::pair<int, int>>{{10, 8}, {1, 4}, {1000, 64}}) {
+    request.asyncLlFusedRecvCtas = ctas;
+    const auto cfg = MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                        EpInterNodeFamily::AsyncLL);
+    EXPECT_EQ(cfg.asyncLlFusedRecvCtas, ctas);
+    EXPECT_EQ(EpAsyncLLGeometry(cfg, EpAsyncLLKernel::DispatchRecvCopy).gridX,
+              static_cast<unsigned>(grid));
+  }
+
+  request.asyncLlFusedRecvCtas = -1;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+  request.asyncLlMode = 1;
+  request.asyncLlFusedRecvCtas = 16;
+  EXPECT_THROW(MakeEpInterNodeCfg("gfx1250", request, EpInterNodeKernel::Dispatch,
+                                  EpInterNodeFamily::AsyncLL),
+               std::runtime_error);
+}
+
 TEST(AsyncLLMode, ReceiveEntryAndDefinesUseThePlanMode) {
   for (const auto kind : {EpAsyncLLKernel::DispatchRecvCopy, EpAsyncLLKernel::CombineRecvCopy}) {
     const std::string stem = kind == EpAsyncLLKernel::DispatchRecvCopy ? "EpDispatchAsyncLLRecvCopy"

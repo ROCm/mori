@@ -25,6 +25,7 @@
 
 #include "mori/ops/dispatch_combine_v2/ep_internode_spec.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -128,6 +129,20 @@ EpInterNodeCfg MakeEpInterNodeCfg(const std::string& arch, const EpInterNodeRequ
   }
   if (cfg.asyncLlMode != 0 && cfg.kernelCfg.worldSize != cfg.kernelCfg.gpuPerNode) {
     throw std::runtime_error("mori ep v2: asyncLlMode > 0 requires a single-node SDMA plan");
+  }
+  if (request.asyncLlFusedRecvCtas < 0) {
+    throw std::runtime_error("mori ep v2: asyncLlFusedRecvCtas must be >= 0");
+  }
+  if (request.asyncLlFusedRecvCtas != 0 && cfg.asyncLlMode != 2) {
+    throw std::runtime_error(
+        "mori ep v2: asyncLlFusedRecvCtas only applies to asyncLlMode 2 (fused receive)");
+  }
+  // Half the device by default. On MI355X it keeps most of fusion's
+  // single-stream gain and removed the deadlock measured against a second
+  // stream's sends; a stream that fills most of the device can still starve it.
+  if (cfg.asyncLlMode == 2) {
+    cfg.asyncLlFusedRecvCtas = request.asyncLlFusedRecvCtas > 0 ? request.asyncLlFusedRecvCtas
+                                                                : std::max(cfg.mpCount / 2, 1);
   }
 
   // Caught here rather than by hipModuleLaunchKernel, which reports it as a
