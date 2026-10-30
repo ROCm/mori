@@ -1154,6 +1154,33 @@ jobs:
             done
           done
 
+      - name: MORI-EP internode stress_accuracy (every round verified)
+        run: |
+          # stress only surfaces hangs and faults; stress_accuracy checks every round's dispatch
+          # and combine results, so it catches the nodeRecvTokenNum and DispatchSync races in
+          # internode_v1. 1024 tokens with 200 us jitter is where an unfixed build failed
+          # (round 1110 on 2x8 MI355X); 20k rounds take about 50 s per kernel.
+          SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
+          SA_ENV="-e MORI_INTERNODE_TIMEOUT=600 -e MORI_STRESS_ROUNDS=20000 -e MORI_STRESS_JITTER=200"
+          PORT=29150
+          for KERNEL in v1 v1_ll; do
+            echo "=== stress_accuracy kernel=$KERNEL max-tokens=1024 rounds=20000 jitter=200us port=$PORT ==="
+            NODE2_CMD=(
+              $CT exec $SA_ENV $CONTAINER bash $SCRIPT
+              --rank 1 --master-addr $NODE1_HOST --master-port $PORT
+              --ifname $NODE2_IFNAME
+              --cmd stress_accuracy --kernel-type $KERNEL --max-tokens 1024
+            )
+            ssh $SSH_OPTS -p $NODE2_PORT $(whoami)@$NODE2_HOST "${NODE2_CMD[*]}" &
+            $CT exec $SA_ENV $CONTAINER bash $SCRIPT \
+              --rank 0 --master-addr $NODE1_HOST --master-port $PORT \
+              --ifname $NODE1_IFNAME \
+              --cmd stress_accuracy --kernel-type $KERNEL --max-tokens 1024
+            wait
+            sleep 1
+            PORT=$((PORT + 1))
+          done
+
       - name: MORI-EP internode rail-only (MORI_ENABLE_RAIL_ONLY)
         run: |
           # Same v1/v1_ll path with cross-rail QPs never created. Guards the claim
