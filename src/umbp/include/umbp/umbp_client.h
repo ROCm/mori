@@ -137,16 +137,16 @@ class IUMBPClient {
   /// background. Returns the keys copied or queued; 0 where unsupported.
   virtual size_t BatchPrefetch(const std::vector<std::string>& /*keys*/) { return 0; }
 
-  /// Tell the store these objects were just used without being read from it
-  /// -- the caller served them from a faster cache of its own -- so its local
-  /// eviction counts them as recently used.  Only recency moves: no read, no
-  /// lease, and keys not stored are skipped.  The caller's node moves them in
-  /// its own media; in the master eviction modes they also reach the master's
-  /// ranking, wherever they are placed.  Under local eviction (the default),
-  /// keys a pool placed on another node are unaffected.  Returns the copies
-  /// touched on the caller's node, one per medium that holds a key and keeps an
-  /// eviction order (the SSD tier keeps none); a store that keeps no eviction
-  /// order (or an older server) returns 0.
+  /// Recency hint for objects the caller served from a faster cache of its
+  /// own, so never read here: counted as just used, as a read would be, but
+  /// nothing is read or leased, and keys not stored are skipped.  This node's
+  /// paged media move them in the order given, the last ending up the most
+  /// recent; SSD copies keep their place.  In the master eviction modes the
+  /// master also hears of them, wherever they are placed, on the next
+  /// heartbeat, unordered; otherwise copies on other nodes are unaffected.
+  /// Returns the copies moved on this node, a duplicate key counted each
+  /// time: 0 where no medium here moves them (SSD, or DRAM in the `master`
+  /// mode), or from an older server.
   virtual size_t BatchTouch(const std::vector<std::string>& /*keys*/) { return 0; }
 
   // ---- Lifecycle ----

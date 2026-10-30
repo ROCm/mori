@@ -321,8 +321,10 @@ class MediumBackend : public MetricSource {
 
   // Count these keys as just used, for a caller that used them without reading
   // them here (it served them from a faster cache of its own).  Recency is the
-  // only thing that moves: no lease, no read.  Returns how many are held here;
-  // a medium that keeps no order holds them for nothing and returns 0.
+  // only thing that moves: no lease, no read.  Keys move in the order given, so
+  // the last is the most recent.  Returns how many are held here, a duplicate
+  // counted each time; a medium that does not implement it (SsdBackend today)
+  // keeps its order and returns 0.
   virtual size_t Touch(const std::vector<std::string>& /*keys*/) { return 0; }
 
   // ---- observability ----
