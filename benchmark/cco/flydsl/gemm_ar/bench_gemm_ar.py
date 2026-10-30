@@ -110,6 +110,7 @@ from mori.ops.gemm_ar import (
     preshuffle_a_scale,
     preshuffle_b,
 )
+from mori.ops.gemm_ar.kernels_fused_bf16 import compile_fused_gemm_scatter_bf16
 from mori.tensor_utils import from_gpu_ptr
 from mori.ops.gemm_ar.op import _PinnedLaunch
 
@@ -175,6 +176,11 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
     (1.66e-3); the other three give 0.17-0.32.
     """
     g = torch.Generator(device="cuda").manual_seed(1234 + rank)
+    if quant == "bf16":
+        # Kimi-K3's o_proj / shared experts: BF16 weights, no scales at all.
+        a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+        b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
+        return a, b, None, None
     a = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     b = (torch.randn(n, k, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
     if quant == "ptpc":
@@ -212,6 +218,8 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
 def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
     """One rank's fp32 GEMM reference, matching ``make_operands``' quantisation."""
     af, bf = a.float(), b.float()
+    if quant == "bf16":
+        return af @ bf.T
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
     if quant in ("mxfp8", "mxfp8_raw"):
@@ -293,6 +301,8 @@ def run(args) -> int:
     # kernel already runs at ~254 with zero spill, so the tile has to halve.
     if not args.block_m:
         args.block_m = 128 if args.quant == "blockscale" else 256
+    if args.quant == "bf16" and args.mode == "fused-lsa":
+        raise ValueError("--quant bf16 supports gemm-only, split-sdma, fused-sdma, split-lsa")
     direct_lsa = args.mode == "fused-lsa"
     fused = args.mode in ("fused-sdma", "fused-lsa")
     # fused-lsa still uses the SDMA reduce/gather tail, so it wants queues too.
@@ -351,7 +361,8 @@ def run(args) -> int:
     cfg.validate()
 
     a, b, sa, sb = make_operands(rank, args.m, args.n, args.k, args.quant)
-    b_shuf = preshuffle_b(b)
+    # The BF16 GEMM reads a plain row-major [N, K] B; only fp8's is preshuffled.
+    b_shuf = b if args.quant == "bf16" else preshuffle_b(b)
 
     vmm = max(4 * cfg.window_bytes + VMM_SLACK, VMM_SLACK)
     result = None
@@ -379,37 +390,57 @@ def run(args) -> int:
             reqs.sdma_queue_count = args.sdma_queues
         dc = comm.create_dev_comm(reqs)
 
-        gemm = compile_fused_gemm_scatter(
-            cfg,
-            rank,
-            K=args.k,
-            BLOCK_M=args.block_m,
-            BLOCK_N=args.block_n,
-            b_preshuffled=True,
-            quant=args.quant,
-            sdma_queues=args.sdma_queues,
-            waves_per_eu=args.waves_per_eu,
-            xcd_swizzle=args.xcd_swizzle,
-            fuse=fused,
-            transport="lsa" if direct_lsa else "sdma",
-            swap_ab=args.swap_ab,
-            store_probe=args.store_probe,
-            permlane=args.permlane,
-            lane_transpose=args.lane_transpose,
-            hoist_scales=args.hoist_scales,
-            peer_uncached=args.peer_uncached,
-            direct_fence=args.direct_fence,
-            rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
-            n_stripe=args.n_stripe or None,
-            emit_put=not args.no_put,
-            atomic_order=args.atomic,
-            chunk_bands=args.chunk_bands,
-            relaxed_rows=args.relaxed_rows,
-        )
+        if args.quant == "bf16":
+            gemm = compile_fused_gemm_scatter_bf16(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                sdma_queues=args.sdma_queues,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                fuse=fused,
+                rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
+                n_stripe=args.n_stripe or None,
+                emit_put=not args.no_put,
+                atomic_order=args.atomic,
+            )
+        else:
+            gemm = compile_fused_gemm_scatter(
+                cfg,
+                rank,
+                K=args.k,
+                BLOCK_M=args.block_m,
+                BLOCK_N=args.block_n,
+                b_preshuffled=True,
+                quant=args.quant,
+                sdma_queues=args.sdma_queues,
+                waves_per_eu=args.waves_per_eu,
+                xcd_swizzle=args.xcd_swizzle,
+                fuse=fused,
+                transport="lsa" if direct_lsa else "sdma",
+                swap_ab=args.swap_ab,
+                store_probe=args.store_probe,
+                permlane=args.permlane,
+                lane_transpose=args.lane_transpose,
+                hoist_scales=args.hoist_scales,
+                peer_uncached=args.peer_uncached,
+                direct_fence=args.direct_fence,
+                rotated=None if args.tile_order == "auto" else args.tile_order == "rotated",
+                n_stripe=args.n_stripe or None,
+                emit_put=not args.no_put,
+                atomic_order=args.atomic,
+                chunk_bands=args.chunk_bands,
+                relaxed_rows=args.relaxed_rows,
+            )
         if not args.raw_jit:
             gemm = _PinnedLaunch(gemm)
-        a_i8 = a.contiguous().view(torch.int8).view(-1)
-        b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
+        # The BF16 kernel takes int16 views (an int8 one would describe twice
+        # as many bf16 elements as exist); fp8 takes int8.
+        op_view = torch.int16 if args.quant == "bf16" else torch.int8
+        a_i8 = a.contiguous().view(op_view).view(-1)
+        b_i8 = b_shuf.contiguous().view(op_view).view(-1)
         c_flat = c.view(-1)
 
         # The kernel indexes both scale buffers linearly, so hand it the
@@ -418,7 +449,10 @@ def run(args) -> int:
         # consumes), so its physical order is sa.t(); passing the 2-D
         # non-contiguous view through DLPack would give the kernel the wrong
         # strides.
-        if args.quant == "blockscale":
+        if args.quant == "bf16":
+            # Accepted and unread by the BF16 kernel; it keeps the fp8 signature.
+            sa_arg = sb_arg = torch.zeros(1, dtype=torch.int32, device="cuda")
+        elif args.quant == "blockscale":
             sa_arg = sa.t().reshape(-1).contiguous()
             sb_arg = sb.reshape(-1).contiguous()
         elif args.quant == "mxfp8":
@@ -631,7 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-k", type=int, default=1024)
     p.add_argument(
         "--quant",
-        choices=("ptpc", "blockscale", "mxfp8", "mxfp8_raw"),
+        choices=("ptpc", "blockscale", "mxfp8", "mxfp8_raw", "bf16"),
         default="ptpc",
         help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
         "or the model's 1x128 / 128x128 block scale. blockscale applies the "

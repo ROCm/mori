@@ -1236,6 +1236,14 @@ def build_sdma_phases(
     #: The same sequence for the fused GEMM, which issued the scatter's puts from
     #: its own epilogue and only has to drain them.
     phases["fused_order"] = ("drain",) + tail
+    if not cfg.fp8_gather and not fuse_reduce_push:
+        # Reduce-scatter only: each rank keeps its reduced slice and nothing is
+        # gathered. The gather's barrier is still needed on its own -- it is
+        # what stops the next call's epilogue puts landing in a peer's recv
+        # slot while that peer is still reducing this call's -- so it runs as a
+        # push kernel with no puts on the gather's signal row.
+        phases["rs_barrier"] = _phase(_push_kernel(end_off), 1, PUSH_THREADS)
+        phases["fused_rs_order"] = ("drain", "reduce", "rs_barrier")
     return phases
 
 

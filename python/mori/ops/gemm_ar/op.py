@@ -31,7 +31,9 @@ import torch
 from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
 from mori.tensor_utils import from_gpu_ptr
 
+from ._gemm_a16w16_8wave import BLOCK_K as BF16_BLOCK_K
 from .kernels_fused import BLOCK_K, compile_fused_gemm_scatter
+from .kernels_fused_bf16 import compile_fused_gemm_scatter_bf16
 from .kernels_sdma import build_sdma_phases
 from .layout import GATHER_TRANSPORTS, WIRE_DTYPES, ArConfig
 
@@ -68,13 +70,17 @@ MXFP8_BLOCK = 32
 #:                   which the kernel stages through LDS. Needs no host
 #:                   shuffle; faster cold and at large M, can be a few percent
 #:                   slower hot at small M or short K.
+#: ``"bf16"``        not quantised: BF16 A and a row-major (not preshuffled)
+#:                   BF16 B, no scales. For layers the checkpoint keeps in BF16,
+#:                   e.g. Kimi-K3's attention o_proj (kernels_fused_bf16.py).
 #:
 #: They differ in more than a group size: the mxfp8 forms need BLOCK_M=256 (see
 #: MXFP8_BLOCK_M); ``"mxfp8"`` takes its A scale through ``preshuffle_a_scale``
 #: as int32 and ``"mxfp8_raw"`` takes uint8, where blockscale takes fp32. All
 #: are checked, not assumed.
 MXFP8_QUANTS = ("mxfp8", "mxfp8_raw")
-QUANTS = ("blockscale",) + MXFP8_QUANTS
+BF16_QUANT = "bf16"
+QUANTS = ("blockscale",) + MXFP8_QUANTS + (BF16_QUANT,)
 
 
 #: mxfp8's BLOCK_M is not a preference. The kernel packs a lane's four M tiles
@@ -87,7 +93,14 @@ QUANTS = ("blockscale",) + MXFP8_QUANTS
 MXFP8_BLOCK_M = 256
 
 
+#: The BF16 mainloop has no second accumulator, so the template's 256x256 fits;
+#: 128 is also built (it doubles the grid at small M).
+BF16_BLOCK_MS = (128, 256)
+
+
 def _default_block_m(quant: str) -> int:
+    if quant == BF16_QUANT:
+        return 256
     return MXFP8_BLOCK_M if quant in MXFP8_QUANTS else DEFAULT_BLOCK_M
 
 
@@ -99,6 +112,8 @@ def _quant_tile_constraint(quant: str, block_m: int) -> str | None:
             f"the packed A scale puts a lane's four M tiles in one dword, which "
             f"is four tiles only at BLOCK_M//64 == 4"
         )
+    if quant == BF16_QUANT and block_m not in BF16_BLOCK_MS:
+        return f"quant='bf16' requires block_m in {BF16_BLOCK_MS}, got {block_m}"
     return None
 
 
@@ -292,6 +307,15 @@ def _gemm_constraints(
     n: int, k: int, block_n: int, quant: str = "blockscale"
 ) -> str | None:
     """Why the GEMM cannot take this shape, or None. See :func:`supports`."""
+    if quant == BF16_QUANT:
+        # No scale groups; K is the BF16 mainloop's BLOCK_K, two of them at least.
+        if k % BF16_BLOCK_K or k < 2 * BF16_BLOCK_K:
+            return (
+                f"K={k} must be a multiple of {BF16_BLOCK_K} and >= {2 * BF16_BLOCK_K}"
+            )
+        if n % block_n:
+            return f"N={n} must be a multiple of block_n={block_n}"
+        return None
     # K % 128 holds for both, for different reasons: it is blockscale's group,
     # and it is the scaled MFMA's K step.
     if k % SCALE_BLOCK_K:
@@ -617,10 +641,13 @@ class _Plan(NamedTuple):
     #: The unresolved phase table, kept for :meth:`GemmAllReduceOp.self_test`,
     #: which needs the standalone ``scatter`` that ``fused_order`` omits.
     parts: dict
+    #: ``parts["fused_rs_order"]`` resolved the same way, or None where the
+    #: wire has no reduce-scatter-only tail (the fp8 gather).
+    rs_tail: tuple | None = None
 
 
 class GemmAllReduceOp:
-    """Fused fp8 block-scale GEMM + all-reduce over cco SDMA.
+    """Fused GEMM + all-reduce over cco SDMA: fp8 (blockscale / mxfp8) or BF16.
 
     Owns the symmetric window and a per-M kernel cache; one instance serves one
     ``(n, k)`` weight shape and any ``M`` up to ``m_max``.
@@ -654,6 +681,7 @@ class GemmAllReduceOp:
         self.mem = self.win = self.dev_comm = None
         self._cache: dict[_RowPlan, _Plan] = {}
         self._pad_in: torch.Tensor | None = None
+        self._no_scale: torch.Tensor | None = None
 
         if quant not in QUANTS:
             raise ValueError(f"quant={quant!r} is not one of {sorted(QUANTS)}")
@@ -665,6 +693,8 @@ class GemmAllReduceOp:
         why = _quant_tile_constraint(quant, block_m)
         if why is not None:
             raise ValueError(why)
+        if quant == BF16_QUANT and scatter_dtype != "bf16":
+            raise ValueError("quant='bf16' supports only the bf16 scatter wire")
         if scatter_dtype not in WIRE_DTYPES:
             raise ValueError(
                 f"scatter_dtype={scatter_dtype!r} is not one of {WIRE_DTYPES}"
@@ -895,25 +925,38 @@ class GemmAllReduceOp:
         if hit is not None:
             return hit
         cfg = self._make_cfg(m, logical_m)
-        gemm = compile_fused_gemm_scatter(
-            cfg,
-            self.rank,
-            K=self.k,
-            BLOCK_M=self.block_m,
-            BLOCK_N=self.block_n,
-            b_preshuffled=True,
-            fuse=True,
-            transport="sdma",
-            quant=self.quant,
-            chunk_bands=row_plan.chunk_bands,
-            relaxed_rows=row_plan.relaxed_rows,
-            sdma_queues=self.sdma_queues,
-            # The three C-store stages are off by default in
-            # compile_fused_gemm_scatter, and blockscale requires swap_ab.
-            swap_ab=True,
-            permlane=True,
-            lane_transpose=True,
-        )
+        if self.quant == BF16_QUANT:
+            # The default fused-SDMA shape only; _Schedule fits no chunk_bands /
+            # relaxed_rows plan for bf16, so the row plan never asks for them.
+            gemm = compile_fused_gemm_scatter_bf16(
+                cfg,
+                self.rank,
+                K=self.k,
+                BLOCK_M=self.block_m,
+                BLOCK_N=self.block_n,
+                sdma_queues=self.sdma_queues,
+                fuse=True,
+            )
+        else:
+            gemm = compile_fused_gemm_scatter(
+                cfg,
+                self.rank,
+                K=self.k,
+                BLOCK_M=self.block_m,
+                BLOCK_N=self.block_n,
+                b_preshuffled=True,
+                fuse=True,
+                transport="sdma",
+                quant=self.quant,
+                chunk_bands=row_plan.chunk_bands,
+                relaxed_rows=row_plan.relaxed_rows,
+                sdma_queues=self.sdma_queues,
+                # The three C-store stages are off by default in
+                # compile_fused_gemm_scatter, and blockscale requires swap_ab.
+                swap_ab=True,
+                permlane=True,
+                lane_transpose=True,
+            )
         parts = build_sdma_phases(cfg, self.rank, queues=self.sdma_queues)
         # fused_order rather than a literal list: the fp8 wire inserts a
         # quantise and a dequantise around the gather, and a hardcoded
@@ -921,9 +964,15 @@ class GemmAllReduceOp:
         # Pinned launchers on the hot path; `parts` keeps the raw ones, which is
         # what self_test uses (it runs a different order, once).
         tail = tuple(_PinnedLaunch(parts[name]) for name in parts["fused_order"])
+        rs_order = parts.get("fused_rs_order")
         hit = _Plan(
             gemm=_PinnedLaunch(gemm),
             tail=tail,
+            rs_tail=(
+                tuple(_PinnedLaunch(parts[name]) for name in rs_order)
+                if rs_order
+                else None
+            ),
             parts=parts,
             input=from_gpu_ptr(
                 self.mem.ptr + (cfg.output_off if cfg.fp8_scatter else cfg.input_off),
@@ -1092,8 +1141,8 @@ class GemmAllReduceOp:
         self,
         a_fp8: torch.Tensor,
         b_preshuffled: torch.Tensor,
-        a_scale: torch.Tensor,
-        b_scale: torch.Tensor,
+        a_scale: torch.Tensor | None = None,
+        b_scale: torch.Tensor | None = None,
         *,
         logical_m: int | None = None,
     ) -> torch.Tensor:
@@ -1125,6 +1174,11 @@ class GemmAllReduceOp:
             ue8m0 bytes as the quantiser emits them: uint8, row major, 2-D or
             flat.
 
+        ``bf16``
+            ``a_fp8`` is BF16 ``[M, K]`` and ``b_preshuffled`` the BF16 weight
+            as the checkpoint stores it, ``[N, K]`` row major -- *not* through
+            :func:`preshuffle_b`. No scales; pass None.
+
         ``logical_m`` is the original row count before padding. Pass it when
         using the fitted schedule so chunk selection matches padded_m().
         The result still includes padding; slice it to logical_m if needed.
@@ -1137,6 +1191,8 @@ class GemmAllReduceOp:
         m = a_fp8.shape[0]
         self._row_plan(m, logical_m)
         self._check_operands(a_fp8, b_preshuffled, a_scale, b_scale, m)
+        if self.quant == BF16_QUANT:
+            return self._call_bf16(a_fp8, b_preshuffled, m, logical_m)
         if self.quant == "mxfp8_raw":
             a_scale = _flatten_mxfp8_raw_scale(
                 "a_scale", a_scale, m, self.k // MXFP8_BLOCK
@@ -1166,6 +1222,59 @@ class GemmAllReduceOp:
             phase(self.dev_comm.ptr, self.win.handle, stream=stream)
         return plan.output
 
+    def reduce_scatter(
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        logical_m: int | None = None,
+    ) -> torch.Tensor:
+        """The fused GEMM + reduce-scatter, with no all-gather: this rank's
+        reduced ``[M / world_size, N]`` row slice, a view of the window.
+
+        Rank ``r`` owns padded rows ``[r * M / world_size, (r + 1) * M /
+        world_size)`` -- the band its peers' epilogues push to it -- so a caller
+        whose row split differs (``tensor_split`` of a ragged M) lays each
+        rank's rows at the start of that band and slices the result. BF16 only
+        for now. Same aliasing rule as ``__call__``: the next call overwrites it.
+        """
+        if self.quant != BF16_QUANT:
+            raise NotImplementedError("reduce_scatter is implemented for quant='bf16'")
+        m = a.shape[0]
+        self._row_plan(m, logical_m)
+        self._check_operands(a, b, None, None, m)
+        out = self._call_bf16(a, b, m, logical_m, reduce_scatter=True)
+        rows = m // self.world_size
+        return out[self.rank * rows : (self.rank + 1) * rows]
+
+    def _call_bf16(
+        self, a, b, m: int, logical_m: int | None, reduce_scatter: bool = False
+    ) -> torch.Tensor:
+        """``__call__`` for ``quant='bf16'``: int16 operand views, no scales."""
+        plan = self._compiled(m, logical_m)
+        tail = plan.rs_tail if reduce_scatter else plan.tail
+        if tail is None:
+            raise NotImplementedError("this wire has no reduce-scatter-only tail")
+        if self._no_scale is None:
+            # The BF16 launch keeps the fp8 signature; its scale slots are unread.
+            self._no_scale = torch.zeros(1, dtype=torch.int32, device=a.device)
+        stream = fx.Stream(torch.cuda.current_stream())
+        plan.gemm(
+            a.contiguous().view(torch.int16).view(-1),
+            b.contiguous().view(torch.int16).view(-1),
+            plan.input.view(-1),
+            self._no_scale,
+            self._no_scale,
+            m,
+            self.n,
+            self.dev_comm.ptr,
+            self.win.handle,
+            stream=stream,
+        )
+        for phase in tail:
+            phase(self.dev_comm.ptr, self.win.handle, stream=stream)
+        return plan.output
+
     def _check_operands(self, a_fp8, b_preshuffled, a_scale, b_scale, m: int) -> None:
         """Reject what the launch boundary would otherwise reinterpret as bytes.
 
@@ -1176,6 +1285,24 @@ class GemmAllReduceOp:
         """
         if self.mem is None:
             raise RuntimeError("this GemmAllReduceOp has been closed")
+        if self.quant == BF16_QUANT:
+            # Reinterpreted as int16 at the launch, so anything but bf16 of the
+            # right shape would run and return finite nonsense.
+            for name, t, shape in (
+                ("a", a_fp8, (m, self.k)),
+                ("b", b_preshuffled, (self.n, self.k)),
+            ):
+                if t.dim() != 2 or tuple(t.shape) != shape:
+                    raise ValueError(f"{name} must be {shape}, got {tuple(t.shape)}")
+                if t.dtype != torch.bfloat16:
+                    raise ValueError(
+                        f"quant='bf16' needs {name} in bfloat16, got {t.dtype}"
+                    )
+                if t.device.type != "cuda":
+                    raise ValueError(f"{name} must be on a GPU, got {t.device}")
+            if a_scale is not None or b_scale is not None:
+                raise ValueError("quant='bf16' takes no scales; pass None")
+            return
         kb = self.k // SCALE_BLOCK_K
         for name, t, shape in (
             ("a_fp8", a_fp8, (m, self.k)),
