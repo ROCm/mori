@@ -174,8 +174,8 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         self.total_recv = torch.zeros(1, dtype=torch.int32, device=device)
         self.combine_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         # Per-block xdb flag counters for the gather combine entry barrier: one
-        # i64 per block, fixed at xdb_flag_slots (== CU count, the max combine
-        # block_num). Every block owns a private counter and block 0 fills the
+        # i64 per block, fixed at xdb_flag_slots (combine block_num is clamped
+        # to it, see tuning_configs._MAX_COMBINE_BLOCKS). Every block owns a private counter and block 0 fills the
         # unused tail so all stay in lockstep across calls with different block_num.
         self.cross_device_flag = torch.ones(
             xdb_flag_slots, dtype=torch.int64, device=device
