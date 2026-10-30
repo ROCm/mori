@@ -23,6 +23,7 @@
 
 // Shared pieces for TransferPlanBuilders; the rules are on TransferPlanBuilder.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -131,6 +132,40 @@ template <typename Engine>
 std::unique_ptr<TransferPlanBuilder> MakeFilePlanBuilder(const Engine& engine,
                                                          size_t expected_items = 0) {
   return std::make_unique<FilePlanBuilder<Engine>>(engine, expected_items);
+}
+
+// Real and simulated GPU copies share the registration boundaries and gather cutoff.
+inline bool GatherShapeEligible(size_t fragments, size_t bytes) {
+  return fragments >= 2 && bytes / fragments < (128ULL << 10);
+}
+
+// Merges adjacent ranges, but a segment never crosses a host registration piece.
+inline void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t piece) {
+  const bool host_is_src = item.src.loc != mori::io::MemoryLocationType::GPU;
+  const bool host_is_dst = !host_is_src && item.dst.loc != mori::io::MemoryLocationType::GPU;
+  const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
+                              : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
+                                            : 0;
+  const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
+    return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
+  };
+  size_t so = static_cast<size_t>(item.src_offset);
+  size_t dof = static_cast<size_t>(item.dst_offset);
+  size_t remaining = static_cast<size_t>(item.size);
+  while (remaining > 0) {
+    size_t sz = remaining;
+    if (host_base != 0) {
+      const uintptr_t host = host_base + (host_is_src ? so : dof);
+      sz = std::min<size_t>(sz, piece - host % piece);
+    }
+    const bool same_piece =
+        host_base == 0 || plan->sizes.empty() ||
+        host_piece(plan->src_offsets.back(), plan->dst_offsets.back()) == host_piece(so, dof);
+    AppendSegment(plan, so, dof, sz, item.tag, same_piece);
+    so += sz;
+    dof += sz;
+    remaining -= sz;
+  }
 }
 
 // Builder for engines with one plan per (src, dst) buffer pair.  Admits what

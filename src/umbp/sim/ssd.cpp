@@ -22,6 +22,7 @@
 #include "umbp/sim/ssd.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <limits>
 #include <numeric>
@@ -85,7 +86,7 @@ class SimSsdTier final : public TierBackend {
       if (EnsureActive(total, &retired)) {
         for (size_t i = 0; i < keys.size(); ++i) {
           Pending pending;
-          if (!Prepare(keys[i], sizes[i], &pending)) continue;
+          if (!Prepare(keys[i], sizes[i], &pending, cfg_.verify_crc)) continue;
           bytes += pending.write.meta.disk_bytes;
           writes.push_back(std::move(pending));
           positions.push_back(i);
@@ -94,7 +95,8 @@ class SimSsdTier final : public TierBackend {
     }
     Retire(retired);
     if (writes.empty()) return out;
-    const bool ok = engine_.SimulateStorage(false, bytes, writes.size());
+    const bool ok = engine_.SimulateStorage(false, bytes, writes.size(), true,
+                                            std::max(cfg_.tier_io_threads, 1));
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!ok)
@@ -141,8 +143,8 @@ class SimSsdTier final : public TierBackend {
     std::vector<bool> out(keys.size(), false);
     if (!RangeBatchShapeValid(keys.size(), dsts, sizes, offsets)) return out;
     std::vector<uint64_t> pinned;
-    uint64_t bytes = 0;
-    size_t operations = 0;
+    std::array<uint64_t, 2> bytes{};
+    std::array<size_t, 2> operations{};
     {
       std::lock_guard<std::mutex> lock(mutex_);
       for (size_t i = 0; i < keys.size(); ++i) {
@@ -177,15 +179,19 @@ class SimSsdTier final : public TierBackend {
           ++runs;
           start = end;
         }
-        if (!valid || !AddBytes(key_bytes, &bytes)) continue;
-        operations += runs;
+        // Reserved direct writes carry no checksum; ranged reads skip CRC too.
+        const bool staged = cfg_.verify_crc && require_full && meta->crc_valid;
+        if (!valid || !AddBytes(key_bytes, &bytes[staged])) continue;
+        operations[staged] += runs;
         index_.PinSegment(meta->segment_id);
         pinned.push_back(meta->segment_id);
         out[i] = true;
       }
     }
     if (pinned.empty()) return out;
-    const bool ok = engine_.SimulateStorage(true, bytes, operations);
+    bool ok = true;
+    for (size_t i = 0; i < bytes.size(); ++i)
+      if (bytes[i]) ok = engine_.SimulateStorage(true, bytes[i], operations[i], i != 0) && ok;
     std::vector<int> retired;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -269,7 +275,7 @@ class SimSsdTier final : public TierBackend {
     }
     Retire(retired);
     if (!prepared) return std::nullopt;
-    const bool ok = engine_.SimulateStorage(false, segment::PrefixBytes(key.size()));
+    const bool ok = engine_.SimulateStorage(false, segment::PrefixBytes(key.size()), 1, false);
     std::optional<RecordReservation> out;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -296,7 +302,8 @@ class SimSsdTier final : public TierBackend {
       pending = std::move(it->second);
       pending_.erase(it);
     }
-    const bool ok = engine_.SimulateStorage(false, segment::PrefixBytes(key.size()));
+    const bool ok = engine_.SimulateStorage(false, segment::PrefixBytes(key.size()), 1,
+                                            cfg_.durability.mode == UMBPDurabilityMode::Strict);
     std::vector<int> retired;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -356,11 +363,11 @@ class SimSsdTier final : public TierBackend {
     Reclaim(old, retired);
     return true;
   }
-  bool Prepare(const std::string& key, size_t size, Pending* pending) {
+  bool Prepare(const std::string& key, size_t size, Pending* pending, bool crc_valid = false) {
     const auto [used, capacity] = index_.Capacity();
     if (segment::RecordBytes(key.size(), size) > capacity - used) return false;
     auto* seg = index_.FindSegment(index_.active_segment_id());
-    if (!seg || !index_.PrepareWrite(key, size, key.size(), 0, seg, &pending->write, false))
+    if (!seg || !index_.PrepareWrite(key, size, key.size(), 0, seg, &pending->write, crc_valid))
       return false;
     last_generation_ = pending->write.meta.generation;
     pending->location = Location(pending->write.meta);

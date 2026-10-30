@@ -31,27 +31,48 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <thread>
 
 #include "mori/utils/mori_log.hpp"
+#include "umbp/common/device_gather.h"
+#include "umbp/common/host_registration.h"
+#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/distributed/transfer/plan_builder.h"
+#include "umbp/local/tiers/segment/segment_format.h"
 
 namespace mori::umbp {
 namespace {
 using MemoryLocation = mori::io::MemoryLocationType;
 
 int PathIndex(const TransferRef& src, const TransferRef& dst) {
-  if (src.IsFile()) return dst.loc == MemoryLocation::GPU ? 8 : 6;
-  if (dst.IsFile()) return src.loc == MemoryLocation::GPU ? -1 : 7;
+  if (src.IsFile()) return dst.loc == MemoryLocation::GPU ? 12 : 10;
+  if (dst.IsFile()) return src.loc == MemoryLocation::GPU ? -1 : 11;
   if (!src.HasHostPtr()) return 4;
   if (!dst.HasHostPtr()) return 5;
   return (src.loc == MemoryLocation::GPU ? 2 : 0) + (dst.loc == MemoryLocation::GPU ? 1 : 0);
 }
 
+void AppendLocal(TransferPlan* plan, const TransferItem& item) {
+  const int path = PathIndex(item.src, item.dst);
+  if (path == 1 || path == 2)
+    AppendWithinHostPieces(plan, item, HostRegistrationChunkBytes());
+  else
+    AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
+}
+
 using Clock = std::chrono::steady_clock;
+
+std::optional<Clock::time_point> Deadline(Clock::time_point start, long double ns) {
+  const auto remaining =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - start)
+          .count();
+  if (!std::isfinite(ns) || ns < 0 || std::ceil(ns) >= remaining) return std::nullopt;
+  return start + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns)));
+}
 
 void WaitUntil(Clock::time_point finish) {
   constexpr auto spin_tail = std::chrono::microseconds{100};
@@ -83,9 +104,7 @@ class SimPlanBuilder final : public TransferPlanBuilder {
       : engine_(engine),
         remote_(std::move(remote)),
         files_(MakeFilePlanBuilder(engine)),
-        local_(MakePairPlanBuilder(engine, [](TransferPlan* plan, const TransferItem& item) {
-          AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
-        })) {}
+        local_(MakePairPlanBuilder(engine, AppendLocal)) {}
   void Add(const TransferItem& item) override {
     if (item.size == 0) return;
     if (item.src.IsFile() || item.dst.IsFile()) {
@@ -207,9 +226,11 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
   using Value = google::protobuf::Value;
   const auto& id = Field(profile, "id", Value::kStringValue).string_value();
   const auto& paths = Field(profile, "paths", Value::kStructValue).struct_value();
-  const std::array<std::string, kModelCount> names = {"cpu_cpu",  "cpu_gpu",     "gpu_cpu",
-                                                      "gpu_gpu",  "remote_read", "remote_write",
-                                                      "file_cpu", "cpu_file",    "file_gpu"};
+  const std::array<std::string, kModelCount> names = {
+      "cpu_cpu",        "cpu_gpu",         "gpu_cpu",         "gpu_gpu",
+      "remote_read",    "remote_write",    "cpu_staging",     "cpu_staging_read",
+      "cpu_gpu_gather", "gpu_cpu_gather",  "file_cpu",        "cpu_file",
+      "file_gpu",       "file_cpu_staged", "cpu_file_staged", "file_cpu_staged_no_crc"};
   if (id.empty() || paths.fields().empty() || profile.fields().size() != 2) {
     throw std::invalid_argument("UMBP sim profile requires id and nonempty paths only");
   }
@@ -224,12 +245,66 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
     const size_t channel_id =
         std::find(channels.begin(), channels.end(), channel) - channels.begin();
     if (channel_id == channels.size()) channels.push_back(channel);
-    Path path{channel_id, Curve(object, "latency_ns", false),
+    const bool registration = object.fields().count("registration_latency_ns");
+    const double registration_ns =
+        registration ? Field(object, "registration_latency_ns", Value::kNumberValue).number_value()
+                     : 0;
+    const bool logarithmic = object.fields().count("log_size_latency_ns");
+    const double log_ns =
+        logarithmic ? Field(object, "log_size_latency_ns", Value::kNumberValue).number_value() : 0;
+    const bool batch_logarithmic = object.fields().count("batch_log_size_latency_ns");
+    const double batch_log_ns =
+        batch_logarithmic
+            ? Field(object, "batch_log_size_latency_ns", Value::kNumberValue).number_value()
+            : 0;
+    const size_t index = at - names.begin();
+    const bool serial = object.fields().count("serialize_latency");
+    const bool serialize_latency =
+        serial && Field(object, "serialize_latency", Value::kBoolValue).bool_value();
+    const bool cpu = object.fields().count("cpu_bandwidth_bytes_per_second");
+    const double cpu_bandwidth =
+        cpu ? Field(object, "cpu_bandwidth_bytes_per_second", Value::kNumberValue).number_value()
+            : 0;
+    const bool cpu_limit = object.fields().count("cpu_threads");
+    const double cpu_threads =
+        cpu_limit ? Field(object, "cpu_threads", Value::kNumberValue).number_value() : 4;
+    const bool launch = object.fields().count("cpu_launch_latency_ns");
+    const double cpu_launch =
+        launch ? Field(object, "cpu_launch_latency_ns", Value::kNumberValue).number_value() : 0;
+    const bool cleanup = object.fields().count("cpu_cleanup_bandwidth_bytes_per_second");
+    const double cpu_cleanup =
+        cleanup ? Field(object, "cpu_cleanup_bandwidth_bytes_per_second", Value::kNumberValue)
+                      .number_value()
+                : 0;
+    Path path{channel_id,
+              Curve(object, "latency_ns", false),
               Curve(object, "bandwidth_bytes_per_second", true),
               object.fields().count("copy_latency_ns") ? Curve(object, "copy_latency_ns", false)
                                                        : std::vector<double>{0},
-              0};
-    if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") || channel.empty() ||
+              0,
+              registration_ns,
+              log_ns,
+              batch_log_ns,
+              serialize_latency,
+              cpu_bandwidth,
+              0,
+              cpu_launch,
+              cpu_cleanup};
+    if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") + registration +
+                                      logarithmic + batch_logarithmic + serial + cpu + cpu_limit +
+                                      launch + cleanup ||
+        ((cpu || cpu_limit || launch || cleanup) && index != 14) ||
+        ((cpu_limit || launch || cleanup) && !cpu) ||
+        (cpu && (!std::isfinite(cpu_bandwidth) || cpu_bandwidth <= 0)) ||
+        !std::isfinite(cpu_launch) || cpu_launch < 0 ||
+        (cleanup && (!std::isfinite(cpu_cleanup) || cpu_cleanup <= 0)) ||
+        !std::isfinite(cpu_threads) || cpu_threads < 1 ||
+        cpu_threads > std::numeric_limits<int>::max() || std::floor(cpu_threads) != cpu_threads ||
+        (registration && name != "file_gpu") || !std::isfinite(registration_ns) ||
+        ((logarithmic || batch_logarithmic || serial) && index != 10 && index != 12 &&
+         index != 13 && index != 15) ||
+        !std::isfinite(log_ns) || log_ns < 0 || !std::isfinite(batch_log_ns) || batch_log_ns < 0 ||
+        registration_ns < 0 || channel.empty() ||
         (name != "cpu_cpu" && (path.latency_ns.size() != 1 || path.bandwidth.size() != 1 ||
                                path.copy_latency_ns.size() != 1))) {
       throw std::invalid_argument("UMBP sim profile: invalid coefficients for " + name);
@@ -240,6 +315,7 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
                                : 1;
     path.capacity = *std::max_element(
         path.bandwidth.begin(), path.bandwidth.begin() + std::min(threads, path.bandwidth.size()));
+    path.cpu_threads = static_cast<size_t>(cpu_threads);
     paths_[at - names.begin()] = std::move(path);
   }
   if (bounce_bytes > 0 && (paths_[4] || paths_[5])) {
@@ -280,10 +356,8 @@ bool SimTransferEngine::CanHandle(const TransferRef& src, const TransferRef& dst
 }
 
 std::unique_ptr<TransferPlanBuilder> SimTransferEngine::CreatePlanBuilder(size_t) const {
-  if (!paths_[4] && !paths_[5] && !paths_[6] && !paths_[7] && !paths_[8]) {
-    return MakePairPlanBuilder(*this, [](TransferPlan* plan, const TransferItem& item) {
-      AppendSegment(plan, item.src_offset, item.dst_offset, item.size, item.tag);
-    });
+  if (!paths_[4] && !paths_[5] && !paths_[10] && !paths_[11] && !paths_[12]) {
+    return MakePairPlanBuilder(*this, AppendLocal);
   }
   return std::make_unique<SimPlanBuilder>(
       *this, MakeRdmaPlanBuilder(engine_key_, bounce_ref_.size, bounce_ref_));
@@ -291,16 +365,57 @@ std::unique_ptr<TransferPlanBuilder> SimTransferEngine::CreatePlanBuilder(size_t
 
 TransferRef SimTransferEngine::RegisterFile(int fd, uint64_t offset, uint64_t size) {
   if (fd < 0) return {};
-  return TransferRef::File(
-      fd, offset, size,
-      paths_[8] ? reinterpret_cast<void*>(static_cast<uintptr_t>(fd) + 1) : nullptr);
+  if (!paths_[12]) return TransferRef::File(fd, offset, size);
+  std::lock_guard<std::mutex> lock(file_mutex_);
+  auto& refs = file_refs_[fd];
+  if (refs == 0) {
+    const auto started = Clock::now();
+    const auto ns = std::ceil(paths_[12]->registration_latency_ns);
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - started)
+            .count();
+    if (ns >= remaining) {
+      file_refs_.erase(fd);
+      return {};
+    }
+    WaitUntil(started + std::chrono::nanoseconds(static_cast<int64_t>(ns)));
+  }
+  ++refs;
+  return TransferRef::File(fd, offset, size,
+                           reinterpret_cast<void*>(static_cast<uintptr_t>(fd) + 1));
+}
+
+void SimTransferEngine::Deregister(const TransferRef& ref) {
+  if (!ref.IsFile() || !ref.gds_handle) return;
+  std::lock_guard<std::mutex> lock(file_mutex_);
+  auto it = file_refs_.find(ref.file_fd);
+  if (it != file_refs_.end() && --it->second == 0) file_refs_.erase(it);
+}
+
+void SimTransferEngine::AddHostGatherRegion(void* base, size_t size) {
+  if (!base || size == 0 || !HostRegistrationEnabled()) return;
+  std::lock_guard<std::mutex> lock(gather_mutex_);
+  gather_regions_.emplace_back(reinterpret_cast<uintptr_t>(base), size);
+}
+
+void SimTransferEngine::ClearHostGatherRegions() {
+  std::lock_guard<std::mutex> lock(gather_mutex_);
+  gather_regions_.clear();
 }
 
 std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
-    const std::vector<TransferPlan>& plans, Clock::time_point submitted, bool serial_cpu) {
+    const std::vector<TransferPlan>& plans, Clock::time_point submitted) {
   // Profiles measure submit-to-completion; model calculation consumes that same budget.
   Bytes bytes{};
   Copies copies{};
+  struct GatherBucket {
+    Bytes bytes{};
+    Copies copies{};
+  };
+  std::map<int, GatherBucket> gather;
+  const bool has_gather = paths_[8] || paths_[9];
+  std::unique_lock<std::mutex> gather_lock(gather_mutex_, std::defer_lock);
+  if (has_gather) gather_lock.lock();
   for (const auto& plan : plans) {
     const bool file = plan.src.IsFile() || plan.dst.IsFile();
     const auto expected =
@@ -313,9 +428,15 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
         plan.sizes.size() != plan.dst_offsets.size()) {
       return std::nullopt;
     }
+    const size_t path = PathIndex(plan.src, plan.dst);
+    bool eligible = has_gather && (path == 1 || path == 2) && DeviceGatherEnabled();
+    const auto& host = path == 1 ? plan.src : plan.dst;
+    const int device = path == 1 ? plan.dst.device : plan.src.device;
+    eligible = eligible && device >= 0;
+    long double plan_bytes = 0;
+    size_t plan_copies = 0;
     for (size_t i = 0; i < plan.sizes.size(); ++i) {
-      if ((PathIndex(plan.src, plan.dst) != 8 &&
-           !RangeFits(plan.src_offsets[i], plan.sizes[i], plan.src.size)) ||
+      if ((path != 12 && !RangeFits(plan.src_offsets[i], plan.sizes[i], plan.src.size)) ||
           !RangeFits(plan.dst_offsets[i], plan.sizes[i], plan.dst.size))
         return std::nullopt;
       if (file) {
@@ -324,21 +445,155 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
         constexpr uint64_t max_offset = std::numeric_limits<int64_t>::max();
         if (ref.file_offset > max_offset || offset > max_offset - ref.file_offset ||
             plan.sizes[i] > max_offset - ref.file_offset - offset ||
-            (PathIndex(plan.src, plan.dst) == 8 && !ref.gds_handle))
+            (path == 12 && !ref.gds_handle))
           return std::nullopt;
       }
-      bytes[PathIndex(plan.src, plan.dst)] += plan.sizes[i];
-      if (plan.sizes[i] != 0) ++copies[PathIndex(plan.src, plan.dst)];
+      plan_bytes += plan.sizes[i];
+      if (plan.sizes[i] != 0) ++plan_copies;
+      if (eligible) {
+        const size_t offset = path == 1 ? plan.src_offsets[i] : plan.dst_offsets[i];
+        const auto base = reinterpret_cast<uintptr_t>(host.host_ptr);
+        eligible =
+            offset <= std::numeric_limits<uintptr_t>::max() - base &&
+            std::any_of(gather_regions_.begin(), gather_regions_.end(), [&](const auto& r) {
+              const auto address = base + offset;
+              return address >= r.first && RangeFits(address - r.first, plan.sizes[i], r.second);
+            });
+      }
+    }
+    bytes[path] += plan_bytes;
+    copies[path] += plan_copies;
+    if (eligible) {
+      gather[device].bytes[path] += plan_bytes;
+      gather[device].copies[path] += plan_copies;
     }
   }
-  return ReserveCosts(bytes, copies, submitted, serial_cpu);
+  // Real HBM gathers eligible plans per device, including both H2D and D2H.
+  for (const auto& [device, bucket] : gather) {
+    const auto total_bytes = bucket.bytes[1] + bucket.bytes[2];
+    const size_t total_copies = bucket.copies[1] + bucket.copies[2];
+    if (total_bytes > std::numeric_limits<size_t>::max() ||
+        !GatherShapeEligible(total_copies, static_cast<size_t>(total_bytes)))
+      continue;
+    for (size_t path : {1, 2}) {
+      const size_t variant = path + 7;
+      if (!paths_[variant]) continue;  // Old profiles retain their original curve.
+      bytes[path] -= bucket.bytes[path];
+      copies[path] -= bucket.copies[path];
+      bytes[variant] += bucket.bytes[path];
+      copies[variant] += bucket.copies[path];
+    }
+  }
+  if (gather_lock.owns_lock()) gather_lock.unlock();
+  // hipFileRead is synchronous per copy; only pure GDS batches share byte service.
+  if (bytes[12] > 0 && !paths_[12]->serialize_latency &&
+      std::count_if(bytes.begin(), bytes.end(), [](auto n) { return n > 0; }) == 1) {
+    if (!SimulateGds(plans, bytes[12], copies[12], submitted)) return std::nullopt;
+    const auto completed = Clock::now();
+    return Reservation{completed, completed};
+  }
+  return ReserveCosts(bytes, copies, submitted);
+}
+
+void SimTransferEngine::AdvanceGds(Clock::time_point now) {
+  long double elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(now - gds_updated_).count();
+  while (elapsed > 0 && !gds_work_.empty()) {
+    const auto first = *std::min_element(gds_work_.begin(), gds_work_.end(), [](auto a, auto b) {
+      return a->remaining_ns < b->remaining_ns;
+    });
+    const auto step = std::min(elapsed, first->remaining_ns * gds_work_.size());
+    for (auto* work : gds_work_)
+      work->remaining_ns = std::max(0.0L, work->remaining_ns - step / gds_work_.size());
+    elapsed -= step;
+    gds_work_.erase(std::remove_if(gds_work_.begin(), gds_work_.end(),
+                                   [](auto* work) {
+                                     if (work->remaining_ns > 1e-6L) return false;
+                                     work->done = true;
+                                     return true;
+                                   }),
+                    gds_work_.end());
+  }
+  gds_updated_ = now;
+}
+
+bool SimTransferEngine::WaitGds(long double service_ns) {
+  GdsWork work{service_ns};
+  std::unique_lock<std::mutex> lock(mutex_);
+  const auto channel = paths_[12]->channel;
+  for (;;) {
+    const auto now = Clock::now();
+    AdvanceGds(now);
+    if (available_[channel] <= now) break;  // Ordinary same-channel reservations precede us.
+    const auto ready = available_[channel];
+    lock.unlock();
+    WaitUntil(ready);
+    lock.lock();
+  }
+  auto total_ns = service_ns;
+  for (auto* active : gds_work_) total_ns += active->remaining_ns;
+  if (!Deadline(Clock::now(), total_ns)) return false;
+  gds_work_.push_back(&work);
+  auto remove = [&] {
+    gds_work_.erase(std::remove(gds_work_.begin(), gds_work_.end(), &work), gds_work_.end());
+  };
+  try {
+    while (!work.done) {
+      const auto now = Clock::now();
+      AdvanceGds(now);
+      if (work.done) break;
+      const auto first = *std::min_element(gds_work_.begin(), gds_work_.end(), [](auto a, auto b) {
+        return a->remaining_ns < b->remaining_ns;
+      });
+      const auto finish = Deadline(now, first->remaining_ns * gds_work_.size());
+      if (!finish) {
+        remove();
+        return false;
+      }
+      lock.unlock();
+      WaitUntil(*finish);
+      lock.lock();  // A new reader may have delayed this deadline; always recheck work.
+    }
+  } catch (...) {
+    if (!lock.owns_lock()) lock.lock();
+    AdvanceGds(Clock::now());
+    remove();
+    throw;
+  }
+  return true;
+}
+
+bool SimTransferEngine::SimulateGds(const std::vector<TransferPlan>& plans, long double bytes,
+                                    size_t copies, Clock::time_point submitted) {
+  const auto& path = *paths_[12];
+  const auto log = std::log2(std::max(1.0L, bytes / copies / segment::kRecordAlign));
+  const auto fixed = path.latency_ns[0] + path.batch_log_size_latency_ns * log;
+  const auto latency = path.copy_latency_ns[0] + path.log_size_latency_ns * log;
+  const auto begin = Deadline(submitted, fixed);
+  if (!begin || !Deadline(submitted, fixed + copies * latency + bytes * 1e9L / path.capacity))
+    return false;
+  WaitUntil(*begin);
+  auto started = *begin;
+  for (const auto& plan : plans) {
+    for (auto size : plan.sizes) {
+      if (size == 0) continue;
+      const auto ready = Deadline(started, latency);
+      if (!ready) return false;
+      WaitUntil(*ready);
+      if (!WaitGds(size * 1e9L / path.capacity)) return false;
+      started = Clock::now();  // Next hipFileRead cannot start before this copy completes.
+    }
+  }
+  return true;
 }
 
 std::optional<SimTransferEngine::Reservation> SimTransferEngine::ReserveCosts(
-    const Bytes& bytes, const Copies& copies, Clock::time_point submitted, bool serial_cpu) {
+    const Bytes& bytes, const Copies& copies, Clock::time_point submitted, bool serial_cpu,
+    long double completion_ns) {
   // Charge fixed latency once per path in this submit batch, independent of page fragmentation.
-  Bytes service_ns{}, local_service_ns{};
+  Bytes service_ns{}, local_service_ns{}, post_ns{};
   long double private_ns = 0, local_private_ns = 0;
+  const bool ssd_write = bytes[11] != 0 || bytes[14] != 0;
   for (size_t i = 0; i < bytes.size(); ++i) {
     if (bytes[i] == 0) continue;
     if (!paths_[i]) return std::nullopt;
@@ -350,57 +605,111 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::ReserveCosts(
                                                      bytes[i], std::numeric_limits<size_t>::max())),
                                                  copies[i])
                               : 1;
-    const auto latency =
-        AtThreads(path.latency_ns, threads) + copies[i] * AtThreads(path.copy_latency_ns, threads);
+    const auto latency_ns = [&](const Path& curve) {
+      return AtThreads(curve.latency_ns, threads) +
+             copies[i] * AtThreads(curve.copy_latency_ns, threads) +
+             (curve.log_size_latency_ns == 0 && curve.batch_log_size_latency_ns == 0
+                  ? 0
+                  : (copies[i] * curve.log_size_latency_ns + curve.batch_log_size_latency_ns) *
+                        std::log2(std::max(1.0L, bytes[i] / copies[i] / segment::kRecordAlign)));
+    };
+    const auto latency = latency_ns(path);
     const auto duration = latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads);
     private_ns = std::max(private_ns, duration);
-    service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
+    // Independent SSD readers overlap latency; mixed read/write batches stay serial.
+    auto service =
+        (!ssd_write && !path.serialize_latency && (i == 10 || i == 12 || i == 13 || i == 15)
+             ? 0
+             : latency) +
+        bytes[i] * 1e9L / path.capacity;
+    // Native SSD I/O is serialized; checksum work runs afterward without the I/O lock.
+    if (i == 13 && !ssd_write && path.serialize_latency && paths_[15] &&
+        paths_[15]->serialize_latency && paths_[15]->channel == path.channel) {
+      const auto& no_crc = *paths_[15];
+      const auto io_ns = latency_ns(no_crc) + bytes[i] * 1e9L / no_crc.capacity;
+      service = std::min(service, io_ns);  // Fitted curves may cross; never charge negative CRC.
+      post_ns[path.channel] += duration - service;
+    }
+    service_ns[path.channel] += service;
     if (i < 4 || i >= 6) {
       local_private_ns = std::max(local_private_ns, duration);
-      local_service_ns[path.channel] += latency + bytes[i] * 1e9L / path.capacity;
+      local_service_ns[path.channel] += service;
     }
   }
-  auto deadline = [](Clock::time_point start, long double ns) -> std::optional<Clock::time_point> {
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - start)
-            .count();
-    if (!std::isfinite(ns) || std::ceil(ns) >= remaining) return std::nullopt;
-    return start + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns)));
-  };
-  auto finish = deadline(submitted, private_ns);
-  auto local_finish = deadline(submitted, local_private_ns);
+  auto finish = Deadline(submitted, private_ns);
+  auto local_finish = Deadline(submitted, local_private_ns);
   if (!finish || !local_finish) return std::nullopt;
   std::lock_guard<std::mutex> lock(mutex_);
   auto next = available_;
+  if (paths_[12] && service_ns[paths_[12]->channel] > 0 && !gds_work_.empty()) {
+    const auto now = Clock::now();
+    AdvanceGds(now);
+    long double remaining = 0;
+    for (auto* work : gds_work_) remaining += work->remaining_ns;
+    const auto drained = Deadline(now, remaining);
+    if (!drained) return std::nullopt;
+    next[paths_[12]->channel] = std::max(next[paths_[12]->channel], *drained);
+  }
   for (size_t i = 0; i < service_ns.size(); ++i) {
     if (service_ns[i] == 0) continue;
     const auto start = std::max(submitted, next[i]);
-    const auto end = deadline(start, service_ns[i]);
+    const auto end = Deadline(start, service_ns[i]);
     if (!end) return std::nullopt;
     // Local paths precede remote paths on a shared channel, but only the local
     // prefix must finish inline. Reserve the entire batch atomically below.
     if (local_service_ns[i] > 0) {
-      const auto local_end = deadline(start, local_service_ns[i]);
+      const auto local_end = Deadline(start, local_service_ns[i] + post_ns[i]);
       if (!local_end) return std::nullopt;
       local_finish = std::max(*local_finish, *local_end);
     }
-    next[i] = *end;
-    finish = std::max(*finish, *end);
+    const auto completed = Deadline(start, service_ns[i] + post_ns[i]);
+    if (!completed) return std::nullopt;
+    next[i] = *end;  // Other I/O may start while this caller verifies its checksum.
+    finish = std::max(*finish, *completed);
   }
-  available_ = next;  // Commit only after every deadline has passed overflow validation.
+  finish = Deadline(*finish, completion_ns);
+  local_finish = Deadline(*local_finish, completion_ns);
+  if (!finish || !local_finish) return std::nullopt;
+  available_ = next;  // Completion cleanup does not occupy the I/O queue.
   return Reservation{*finish, *local_finish};
 }
 
-bool SimTransferEngine::SimulateStorage(bool read, uint64_t size, size_t operations) {
-  const auto started = Clock::now();
+bool SimTransferEngine::SimulateStorage(bool read, uint64_t size, size_t operations, bool staged,
+                                        size_t cpu_threads) {
+  auto started = Clock::now();
   if (size == 0) return true;
   if (operations == 0) return false;
   Bytes bytes{};
   Copies copies{};
-  const size_t path = read ? 6 : 7;
+  const size_t base = read ? 10 : 11;
+  const size_t variant = read ? (staged ? 13 : 15) : 14;
+  const size_t fallback = read ? 13 : 14;
+  const size_t path = (staged || read) && paths_[variant] ? variant
+                      : paths_[base]                      ? base
+                                                          : fallback;
+  if (!paths_[path]) return false;
+  long double cleanup_ns = 0;
+  if (!read && staged && paths_[path]->cpu_bandwidth > 0) {
+    if (cpu_threads == 0) return false;
+    const int thread_limit = static_cast<int>(std::min(cpu_threads, paths_[path]->cpu_threads));
+    const auto workers =
+        std::min(operations, static_cast<size_t>(EffectiveParallelThreads(thread_limit)));
+    const auto& cpu = *paths_[path];
+    const auto records = 1 + (operations - 1) / workers;
+    const auto ns =
+        records * (size / static_cast<long double>(operations)) * 1e9L / cpu.cpu_bandwidth +
+        (workers - 1) * cpu.cpu_launch_latency_ns;
+    if (cpu.cpu_cleanup_bandwidth > 0) cleanup_ns = size * 1e9L / cpu.cpu_cleanup_bandwidth;
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - started)
+            .count();
+    if (!std::isfinite(ns + cleanup_ns) || std::ceil(ns + cleanup_ns) >= remaining) return false;
+    WaitUntil(started + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns))));
+    started = Clock::now();  // Record building precedes the serialized SSD I/O queue.
+  }
   bytes[path] = size;
   copies[path] = operations;
-  const auto reservation = ReserveCosts(bytes, copies, started);
+  const auto reservation = ReserveCosts(bytes, copies, started, false, cleanup_ns);
   if (!reservation) return false;
   WaitUntil(reservation->finish);
   return true;
@@ -424,31 +733,33 @@ std::unique_ptr<TransferHandle> SimTransferEngine::Submit(std::vector<TransferPl
   if (!reservation) return nullptr;
   WaitUntil(reservation->local_finish);
   auto handle = std::make_unique<SimHandle>(reservation->finish);
-  auto reserve_and_wait = [&](const std::vector<TransferPlan>& plans, bool serial_cpu = false) {
-    const auto next = Reserve(plans, Clock::now(), serial_cpu);
-    if (next) WaitUntil(next->finish);
-    return next.has_value();
-  };
   // Reuse mori-io's submit-direct-first, inline-staging ordering. No payload access.
   for (auto& plan : bounced) {
     std::lock_guard<std::mutex> lock(bounce_mutex_);
-    std::vector<TransferItem> copies;
     const bool push = plan.dir == TransferDirection::kPush;
-    for (const auto& copy : plan.bounce_copies) {
-      const auto caller = TransferRef::HostBytes(copy.host, copy.size);
-      copies.push_back(
-          push ? TransferItem{caller, 0, bounce_ref_, copy.bounce_offset, copy.size, 0}
-               : TransferItem{bounce_ref_, copy.bounce_offset, caller, 0, copy.size, 0});
-    }
     plan.uses_bounce = false;
     auto stage = [&] {
-      auto planned = Plan(copies);
-      if (!planned.rejected_tags.empty()) return false;
+      const auto started = Clock::now();
+      Bytes bytes{};
+      Copies copies{};
+      const size_t path = !push && paths_[7] ? 7 : paths_[6] ? 6 : 0;
+      for (const auto& copy : plan.bounce_copies) {
+        if (!copy.host || !RangeFits(copy.bounce_offset, copy.size, bounce_ref_.size)) return false;
+        bytes[path] += copy.size;
+        if (copy.size != 0) ++copies[path];
+      }
       // MoriIoEngine stages with serial memcpy calls, without CPU fan-out.
-      return reserve_and_wait(planned.plans, true);
+      const auto next = ReserveCosts(bytes, copies, started, true);
+      if (next) WaitUntil(next->finish);
+      return next.has_value();
     };
-    bool ok = !copies.empty() && (!push || stage());
-    if (ok) ok = reserve_and_wait({plan});
+    bool ok = !plan.bounce_copies.empty() && (!push || stage());
+    if (ok) {
+      const auto started = Clock::now();
+      const auto next = Reserve({plan}, started);
+      if (next) WaitUntil(next->finish);
+      ok = next.has_value();
+    }
     if (ok && !push) ok = stage();
     if (!ok) {
       TransferFailure failure;

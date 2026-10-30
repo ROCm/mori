@@ -27,12 +27,18 @@
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <thread>
+#include <tuple>
 
+#include "umbp/common/device_gather.h"
+#include "umbp/common/host_registration.h"
+#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/pool_platform.h"
@@ -400,6 +406,273 @@ TEST_F(SimTest, FilePathsPreserveGroupingBoundsAndRejectGpuWrites) {
                                nullptr));  // GDS reads require a registered handle.
 }
 
+TEST_F(SimTest, SsdPayloadCurveIsOptionalAndSeparateFromDirectIo) {
+  SsdProfile();
+  SimTransferEngine legacy(Config().sim.profile_path);
+  EXPECT_TRUE(legacy.SimulateStorage(true, kPage));
+  Profile(R"({"file_cpu_staged":{"channel":"disk","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine staged(Config().sim.profile_path);
+  EXPECT_TRUE(staged.SimulateStorage(true, kPage));
+  EXPECT_TRUE(staged.SimulateStorage(true, kPage, 1, false));  // Legacy staged-only estimate.
+  EXPECT_FALSE(
+      staged.CanHandle(TransferRef::File(1, 0, kPage),
+                       TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage)));
+  EXPECT_FALSE(staged.SimulateStorage(false, kPage));
+  Profile(R"({"file_cpu_staged":{"channel":"disk","latency_ns":50000000,
+      "bandwidth_bytes_per_second":1e12},
+      "file_cpu_staged_no_crc":{"channel":"disk","latency_ns":0,
+      "log_size_latency_ns":20000000,"batch_log_size_latency_ns":5000000,
+      "bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine variants(Config().sim.profile_path);
+  auto start = Clock::now();
+  EXPECT_TRUE(variants.SimulateStorage(true, 2 * kPage, 1, false));
+  EXPECT_GE(Clock::now() - start, 25ms);
+  EXPECT_LT(Clock::now() - start, 40ms);
+  start = Clock::now();
+  EXPECT_TRUE(variants.SimulateStorage(true, 4 * kPage, 2, false));
+  EXPECT_GE(Clock::now() - start, 45ms);  // Batch latency is charged once, not per I/O.
+  EXPECT_LT(Clock::now() - start, 60ms);
+  start = Clock::now();
+  EXPECT_TRUE(variants.SimulateStorage(true, 2 * kPage));
+  EXPECT_GE(Clock::now() - start, 50ms);
+}
+
+TEST_F(SimTest, DisabledSsdChecksumsUseTheNoCrcCurve) {
+  Profile(R"({"cpu_file_staged":{"channel":"disk","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12},
+      "file_cpu_staged_no_crc":{"channel":"disk","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  auto config = SsdConfig();
+  config.ssd.ssd.verify_crc = false;
+  auto backend = MakeSimSsdBackend(config, engine);
+  ASSERT_TRUE(backend->Init(&engine));
+  const auto slot = backend->BatchAllocate({AllocateRequest{"no-crc", kPage, -1, true}}).front();
+  ASSERT_TRUE(slot.file_ref.IsFile());
+  ASSERT_TRUE(backend->BatchCommit({{slot.slot_id, "no-crc"}}).front().success);
+  EXPECT_TRUE(backend->BatchResolve({"no-crc"}, false, false, ResolveReader::kLocal).front().found);
+}
+
+TEST_F(SimTest, GdsSingleCallerKeepsBatchCopyAndLogCosts) {
+  Profile(R"({"file_gpu":{"channel":"disk","latency_ns":20000000,
+    "copy_latency_ns":15000000,"log_size_latency_ns":8000000,
+    "batch_log_size_latency_ns":10000000,"bandwidth_bytes_per_second":512000}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  const auto file = engine.RegisterFile(1, 0, 4 * kPage);
+  const auto gpu =
+      TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(4 * kPage)), 4 * kPage, MemLoc::GPU, 0);
+  const auto started = Clock::now();
+  ASSERT_TRUE(engine.Transfer(
+      {{file, 0, gpu, 0, 2 * kPage, 0}, {file, 2 * kPage, gpu, 2 * kPage, 2 * kPage, 1}}, nullptr));
+  // 30ms batch + 2 * 23ms private copy + 32ms byte service, all inline.
+  EXPECT_GE(Clock::now() - started, 105ms);
+  EXPECT_LT(Clock::now() - started, 150ms);
+}
+
+TEST_F(SimTest, GdsNewReaderDelaysActiveCompletionAndRejectsOverflow) {
+  Profile(R"({"file_gpu":{"channel":"disk","latency_ns":0,
+    "bandwidth_bytes_per_second":20480}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  const auto file = engine.RegisterFile(1, 0, kPage);
+  const auto gpu =
+      TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage, MemLoc::GPU, 0);
+  std::promise<Clock::time_point> entered;
+  auto first = std::async(std::launch::async, [&] {
+    entered.set_value(Clock::now());
+    return engine.Transfer({{file, 0, gpu, 0, kPage, 0}}, nullptr);
+  });
+  const auto started = entered.get_future().get();
+  std::this_thread::sleep_for(50ms);
+  const auto huge = static_cast<size_t>(std::numeric_limits<int64_t>::max());
+  EXPECT_FALSE(
+      engine.Transfer({{engine.RegisterFile(2, 0, huge), 0,
+                        TransferRef::HostBytes(gpu.host_ptr, huge, MemLoc::GPU, 0), 0, huge, 1}},
+                      nullptr));
+  auto second = std::async(std::launch::async,
+                           [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 2}}, nullptr); });
+  EXPECT_EQ(first.wait_for(230ms), std::future_status::timeout);
+  EXPECT_TRUE(first.get());
+  EXPECT_GE(Clock::now() - started, 310ms);  // First now finishes near 350ms, not 200ms.
+  EXPECT_TRUE(second.get());
+  EXPECT_LT(Clock::now() - started, 550ms);
+}
+
+TEST_F(SimTest, GdsAndOrdinarySameChannelReservationsDoNotOverlap) {
+  Profile(R"({"file_gpu":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":20480},
+    "cpu_file":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":20480}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  const auto file = engine.RegisterFile(1, 0, kPage);
+  const auto gpu =
+      TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage, MemLoc::GPU, 0);
+  std::promise<Clock::time_point> entered;
+  auto first = std::async(std::launch::async, [&] {
+    entered.set_value(Clock::now());
+    return engine.Transfer({{file, 0, gpu, 0, kPage, 0}}, nullptr);
+  });
+  const auto started = entered.get_future().get();
+  std::this_thread::sleep_for(50ms);
+  auto write = std::async(std::launch::async,
+                          [&] { return engine.SimulateStorage(false, kPage, 1, false); });
+  std::this_thread::sleep_for(20ms);
+  auto later = std::async(std::launch::async,
+                          [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 1}}, nullptr); });
+  EXPECT_EQ(write.wait_for(250ms), std::future_status::timeout);
+  EXPECT_TRUE(first.get());
+  EXPECT_TRUE(write.get());
+  EXPECT_GE(Clock::now() - started, 350ms);
+  EXPECT_TRUE(later.get());
+  EXPECT_GE(Clock::now() - started, 550ms);  // 200ms GDS, 200ms write, then 200ms GDS.
+  EXPECT_LT(Clock::now() - started, 900ms);
+}
+
+TEST_F(SimTest, NativeSsdQueuesIoAndKeepsChecksumWorkPrivate) {
+  Profile(R"({"file_cpu_staged":{"channel":"disk","latency_ns":200000000,
+      "bandwidth_bytes_per_second":1e12,"serialize_latency":true},
+      "file_cpu_staged_no_crc":{"channel":"disk","latency_ns":80000000,
+      "bandwidth_bytes_per_second":1e12,"serialize_latency":true}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  std::promise<void> start;
+  const auto gate = start.get_future().share();
+  std::atomic<int> ready{0};
+  auto read = [&] {
+    ++ready;
+    gate.wait();
+    return engine.SimulateStorage(true, kPage);
+  };
+  auto first = std::async(std::launch::async, read);
+  auto second = std::async(std::launch::async, read);
+  const bool both_ready = Await([&] { return ready == 2; });
+  const auto submitted = Clock::now();
+  start.set_value();
+  ASSERT_TRUE(both_ready);
+  EXPECT_TRUE(first.get());
+  EXPECT_TRUE(second.get());
+  // Two 80 ms I/Os queue; the last caller then pays its private 120 ms checksum.
+  EXPECT_GE(Clock::now() - submitted, 240ms);
+  EXPECT_LT(Clock::now() - submitted, 360ms);
+}
+
+TEST_F(SimTest, SsdReadLatencyOverlapsButBandwidthAndWritesQueue) {
+  for (const auto [read, bandwidth, serial] :
+       {std::tuple{true, false, false}, std::tuple{true, true, false},
+        std::tuple{false, false, false}, std::tuple{true, false, true}}) {
+    const auto curve = std::string(R"({"channel":"disk","latency_ns":)") +
+                       (bandwidth ? "0" : "100000000") + R"(,"bandwidth_bytes_per_second":)" +
+                       (bandwidth ? "40960" : "1e12") + "}";
+    const auto read_curve =
+        serial ? curve.substr(0, curve.size() - 1) + ",\"serialize_latency\":true}" : curve;
+    Profile("{\"file_cpu\":" + read_curve + ",\"cpu_file\":" + curve + "}");
+    SimTransferEngine engine(Config().sim.profile_path);
+    std::promise<void> start;
+    const auto gate = start.get_future().share();
+    std::vector<std::future<bool>> pending;
+    for (int i = 0; i < 4; ++i)
+      pending.push_back(std::async(std::launch::async, [&] {
+        gate.wait();
+        return engine.SimulateStorage(read, kPage, 1, false);
+      }));
+    const auto submitted = Clock::now();
+    start.set_value();
+    for (auto& call : pending) EXPECT_TRUE(call.get());
+    if (read && !bandwidth && !serial) {
+      EXPECT_GE(Clock::now() - submitted, 100ms);
+      EXPECT_LT(Clock::now() - submitted, 300ms);
+    } else {
+      EXPECT_GE(Clock::now() - submitted, 400ms);
+    }
+  }
+  SimTransferEngine mixed(Config().sim.profile_path);
+  const auto host = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage);
+  const auto file = TransferRef::File(1, 0, kPage);
+  const auto start = Clock::now();
+  EXPECT_TRUE(
+      mixed.Transfer({{file, 0, host, 0, kPage, 0}, {host, 0, file, 0, kPage, 1}}, nullptr));
+  EXPECT_GE(Clock::now() - start, 200ms);
+}
+
+TEST_F(SimTest, SsdWriteCpuPreparationPrecedesAndOverlapsTheIoQueue) {
+  Profile(R"({"cpu_file_staged":{"channel":"disk","latency_ns":100000000,
+      "bandwidth_bytes_per_second":1e12,"cpu_bandwidth_bytes_per_second":40960,
+      "cpu_threads":4,"cpu_launch_latency_ns":10000000}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  std::promise<void> start;
+  const auto gate = start.get_future().share();
+  std::vector<std::future<bool>> pending;
+  for (int i = 0; i < 4; ++i)
+    pending.push_back(std::async(std::launch::async, [&] {
+      gate.wait();
+      return engine.SimulateStorage(false, kPage);
+    }));
+  const auto submitted = Clock::now();
+  start.set_value();
+  for (auto& call : pending) EXPECT_TRUE(call.get());
+  EXPECT_GE(Clock::now() - submitted, 500ms);  // CPU 100ms overlaps, then four I/O 100ms.
+  EXPECT_LT(Clock::now() - submitted, 700ms);  // Serializing CPU too would take 800ms.
+  for (int threads : {4, 2}) {
+    const int workers = EffectiveParallelThreads(threads);
+    const auto expected = 100ms + 100ms * (1 + 3 / workers) + 10ms * (workers - 1);
+    const auto begun = Clock::now();
+    EXPECT_TRUE(engine.SimulateStorage(false, 4 * kPage, 4, true, threads));
+    EXPECT_GE(Clock::now() - begun, expected);
+    EXPECT_LT(Clock::now() - begun, expected + 100ms);
+  }
+  const int workers = EffectiveParallelThreads(2);
+  const auto expected = 100ms + 100ms * (1 + 2 / workers) + 10ms * (workers - 1);
+  const auto begun = Clock::now();
+  EXPECT_TRUE(engine.SimulateStorage(false, 3 * kPage, 3, true, 2));
+  EXPECT_GE(Clock::now() - begun, expected);  // Whole records cannot divide evenly across workers.
+  EXPECT_LT(Clock::now() - begun, expected + 100ms);
+}
+
+TEST_F(SimTest, SsdCleanupCompletesAfterIoWithoutHoldingItsQueue) {
+  Profile(R"({"cpu_file_staged":{"channel":"disk","latency_ns":100000000,
+      "bandwidth_bytes_per_second":1e12,"cpu_bandwidth_bytes_per_second":1e12,
+      "cpu_cleanup_bandwidth_bytes_per_second":40960}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  std::promise<void> start;
+  const auto gate = start.get_future().share();
+  auto write = [&] {
+    gate.wait();
+    return engine.SimulateStorage(false, kPage);
+  };
+  auto first = std::async(std::launch::async, write);
+  auto second = std::async(std::launch::async, write);
+  const auto begun = Clock::now();
+  start.set_value();
+  EXPECT_TRUE(first.get());
+  EXPECT_TRUE(second.get());
+  EXPECT_GE(Clock::now() - begun, 260ms);
+  EXPECT_LT(Clock::now() - begun, 360ms);  // Two I/O 100ms plus the last private cleanup 100ms.
+  for (const auto* invalid :
+       {"\"cpu_launch_latency_ns\":-1", "\"cpu_cleanup_bandwidth_bytes_per_second\":0"}) {
+    Profile(std::string(R"({"cpu_file_staged":{"channel":"disk","latency_ns":0,
+        "bandwidth_bytes_per_second":1e12,"cpu_bandwidth_bytes_per_second":1e12,)") +
+            invalid + "}}");
+    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  }
+}
+
+TEST_F(SimTest, GdsRegistrationCostEndsWithTheLastReference) {
+  Profile(R"({"file_gpu":{"channel":"disk","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12,"registration_latency_ns":100000000}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  const auto first_start = Clock::now();
+  auto first = engine.RegisterFile(1, 0, kPage);
+  EXPECT_GE(Clock::now() - first_start, 100ms);
+  const auto cached_start = Clock::now();
+  auto second = engine.RegisterFile(1, kPage, kPage);
+  engine.Deregister(first);
+  auto third = engine.RegisterFile(1, 0, kPage);
+  EXPECT_EQ(first.gds_handle, third.gds_handle);
+  EXPECT_LT(Clock::now() - cached_start, 100ms);
+  engine.Deregister(second);
+  engine.Deregister(third);
+  const auto next_start = Clock::now();
+  EXPECT_TRUE(engine.RegisterFile(1, 0, kPage).gds_handle);
+  EXPECT_GE(Clock::now() - next_start, 100ms);
+}
+
 TEST_F(SimTest, SsdSingleFlightCopyFailureWakesWholeAndRangeFollowers) {
   // No cpu_cpu model: the leader reads successfully, but simulated follower
   // fan-out fails without accessing its PROT_NONE staging pages.
@@ -597,6 +870,39 @@ TEST_F(SimTest, ModelCountsBytesOnceAndUsesCoalescedCopyCosts) {
       {{ref, 0, ref, 0, kPage, 0}, {ref, 2 * kPage, ref, 2 * kPage, kPage, 1}}, nullptr));
   EXPECT_GE(Clock::now() - start, 140ms);  // Same bytes and fixed cost, one extra copy.
   EXPECT_LT(Clock::now() - start, 170ms);
+}
+
+TEST_F(SimTest, GatherModelRequiresRegisteredHostAndEligibleDeviceBatch) {
+  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":30000000,"bandwidth_bytes_per_second":1e12},
+    "cpu_gpu_gather":{"channel":"link","latency_ns":5000000,"bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  constexpr size_t bytes = 256 << 10;
+  const auto host = Buffer(2 * bytes), gpu = Buffer(2 * bytes);
+  auto item = [&](size_t offset, size_t size, int device = 0) {
+    return TransferItem{
+        TransferRef::HostBytes(reinterpret_cast<void*>(host + offset), size),
+        0,
+        TransferRef::HostBytes(reinterpret_cast<void*>(gpu + offset), size, MemLoc::GPU, device),
+        0,
+        size,
+        offset};
+  };
+  auto run = [&](std::vector<TransferItem> items, bool gather) {
+    const auto start = Clock::now();
+    ASSERT_TRUE(engine.Transfer(items, nullptr));
+    if (gather)
+      EXPECT_LT(Clock::now() - start, 20ms);
+    else
+      EXPECT_GE(Clock::now() - start, 30ms);
+  };
+  run({item(0, kPage), item(kPage, kPage)}, false);
+  engine.AddHostGatherRegion(reinterpret_cast<void*>(host), 2 * bytes);
+  run({item(0, kPage), item(kPage, kPage)}, DeviceGatherEnabled() && HostRegistrationEnabled());
+  run({item(0, kPage)}, false);                         // One fragment takes memcpy.
+  run({item(0, kPage), item(kPage, kPage, 1)}, false);  // One fragment per device.
+  run({item(0, 128 << 10), item(128 << 10, 128 << 10)}, false);
+  engine.ClearHostGatherRegions();
+  run({item(0, kPage), item(kPage, kPage)}, false);
 }
 
 TEST_F(SimTest, ReusesCapacityLeasesAndProductionReaper) {
@@ -951,6 +1257,26 @@ TEST_F(SimTest, BounceCopiesUseSerialCpuBandwidth) {
   ASSERT_TRUE(caller.Transfer(items, nullptr));
   EXPECT_GE(Clock::now() - start, 100ms);  // CPU staging is serial even with four copy threads.
   EXPECT_TRUE(caller.Transfer({{remote, 0, local, 0, bytes, 0}}, nullptr));
+}
+
+TEST_F(SimTest, CalibratedStagingUsesItsOwnCopyCost) {
+  Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+    "cpu_staging":{"channel":"host","latency_ns":20000000,"bandwidth_bytes_per_second":1e12},
+    "cpu_staging_read":{"channel":"host","latency_ns":40000000,"bandwidth_bytes_per_second":1e12},
+    "remote_read":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+    "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine caller(Config().sim.profile_path, "caller", kPage);
+  SimTransferEngine owner(Config().sim.profile_path, "owner");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
+  auto* buffer = reinterpret_cast<void*>(Buffer(kPage));
+  auto local = TransferRef::HostBytes(buffer, kPage);
+  auto remote = TransferRef::Remote(owner.RegisterMemory(buffer, kPage, MemLoc::CPU, -1).mem);
+  const auto start = Clock::now();
+  ASSERT_TRUE(caller.Transfer({{local, 0, remote, 0, kPage, 0}}, nullptr));
+  EXPECT_GE(Clock::now() - start, 20ms);
+  const auto read_start = Clock::now();
+  ASSERT_TRUE(caller.Transfer({{remote, 0, local, 0, kPage, 0}}, nullptr));
+  EXPECT_GE(Clock::now() - read_start, 40ms);
 }
 
 }  // namespace

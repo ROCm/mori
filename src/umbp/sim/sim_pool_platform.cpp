@@ -92,6 +92,13 @@ class SimPoolPlatform final : public PoolPlatform {
     return AllocateSimMemory(size);
   }
   void FreeHost(HostBufferHandle& buffer) override { HostMemAllocator().Free(buffer); }
+  void AddHostGatherRegion(void* ptr, size_t size) override {
+    if (sim_engine_) sim_engine_->AddHostGatherRegion(ptr, size);
+  }
+  void ClearHostGatherRegions() override {
+    if (sim_engine_) sim_engine_->ClearHostGatherRegions();
+    sim_engine_ = nullptr;
+  }
 
  private:
   UMBPSimConfig config_;

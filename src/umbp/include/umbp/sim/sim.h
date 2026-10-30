@@ -65,12 +65,15 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
   TransferRef RegisterMemory(void* base, size_t size, mori::io::MemoryLocationType loc,
                              int device) override;
   TransferRef RegisterFile(int fd, uint64_t offset, uint64_t size) override;
-  void Deregister(const TransferRef&) override {}
+  void Deregister(const TransferRef& ref) override;
   bool CanHandle(const TransferRef& src, const TransferRef& dst) const override;
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
   // Virtual SSD payload I/O; metadata work remains in the existing SSD controllers.
-  bool SimulateStorage(bool read, uint64_t bytes, size_t operations = 1);
+  bool SimulateStorage(bool read, uint64_t bytes, size_t operations = 1, bool staged = true,
+                       size_t cpu_threads = 4);
+  void AddHostGatherRegion(void* base, size_t size);
+  void ClearHostGatherRegions();
 
   std::vector<uint8_t> PackedLocalEngineDesc() const override;
   bool EnsureRemoteEngine(const std::string& node_id, const std::string& packed) override;
@@ -91,22 +94,45 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
     std::vector<double> bandwidth;
     std::vector<double> copy_latency_ns;
     double capacity;
+    double registration_latency_ns;
+    double log_size_latency_ns;
+    double batch_log_size_latency_ns;
+    bool serialize_latency;
+    double cpu_bandwidth;
+    size_t cpu_threads;
+    double cpu_launch_latency_ns;
+    double cpu_cleanup_bandwidth;
   };
   struct Reservation {
     Clock::time_point finish;
     Clock::time_point local_finish;
   };
   std::optional<Reservation> Reserve(const std::vector<TransferPlan>& plans,
-                                     Clock::time_point submitted, bool serial_cpu = false);
-  static constexpr size_t kModelCount = 9;
+                                     Clock::time_point submitted);
+  static constexpr size_t kModelCount = 16;
   using Bytes = std::array<long double, kModelCount>;
   using Copies = std::array<size_t, kModelCount>;
   std::optional<Reservation> ReserveCosts(const Bytes& bytes, const Copies& copies,
-                                          Clock::time_point submitted, bool serial_cpu = false);
-  // Six memory/network paths and file CPU read/write, GPU read.
+                                          Clock::time_point submitted, bool serial_cpu = false,
+                                          long double completion_ns = 0);
+  void AdvanceGds(Clock::time_point now);  // mutex_ held; work is full-bandwidth nanoseconds.
+  bool WaitGds(long double service_ns);
+  bool SimulateGds(const std::vector<TransferPlan>& plans, long double bytes, size_t copies,
+                   Clock::time_point submitted);
+  // Six transfer paths, staging read/write, host-device gather and file paths.
   std::array<std::optional<Path>, kModelCount> paths_;
+  std::mutex file_mutex_;
+  std::unordered_map<int, size_t> file_refs_;
   std::mutex mutex_;
   std::array<Clock::time_point, kModelCount> available_{};
+  struct GdsWork {
+    long double remaining_ns;
+    bool done = false;
+  };
+  std::vector<GdsWork*> gds_work_;
+  Clock::time_point gds_updated_{};
+  std::mutex gather_mutex_;
+  std::vector<std::pair<uintptr_t, size_t>> gather_regions_;
   std::string engine_key_;
   std::atomic<uint32_t> next_memory_id_{1};
   struct RemoteNode {

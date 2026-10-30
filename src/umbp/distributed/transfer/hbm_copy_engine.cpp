@@ -78,8 +78,6 @@ inline hipMemcpyKind KindFor(const TransferRef& src, const TransferRef& dst) {
 //  common/ (upstream 93f2998a).
 // ---------------------------------------------------------------------------
 
-constexpr size_t kGatherFragmentThreshold = 128ULL << 10;
-
 // Staging each prewarmed stream starts with.  A long prefix read across every
 // layer reaches 8192 fragments; a bigger batch regrows its stream's staging.
 constexpr size_t kPrewarmGatherFragments = 8192;
@@ -403,37 +401,6 @@ bool HbmCopyEngine::CanHandle(const TransferRef& src, const TransferRef& dst) co
   return IsGpu(src) || IsGpu(dst);
 }
 
-namespace {
-// Merges adjacent ranges, but a segment never crosses a host registration piece.
-void AppendWithinHostPieces(TransferPlan* plan, const TransferItem& item, size_t piece) {
-  const bool host_is_src = !IsGpu(item.src);
-  const bool host_is_dst = !host_is_src && !IsGpu(item.dst);
-  const uintptr_t host_base = host_is_src   ? reinterpret_cast<uintptr_t>(item.src.host_ptr)
-                              : host_is_dst ? reinterpret_cast<uintptr_t>(item.dst.host_ptr)
-                                            : 0;
-  const auto host_piece = [&](size_t src_offset, size_t dst_offset) {
-    return (host_base + (host_is_src ? src_offset : dst_offset)) / piece;
-  };
-  size_t so = static_cast<size_t>(item.src_offset);
-  size_t dof = static_cast<size_t>(item.dst_offset);
-  size_t remaining = static_cast<size_t>(item.size);
-  while (remaining > 0) {
-    size_t sz = remaining;
-    if (host_base != 0) {
-      const uintptr_t host = host_base + (host_is_src ? so : dof);
-      sz = std::min<size_t>(sz, piece - host % piece);
-    }
-    const bool same_piece =
-        host_base == 0 || plan->sizes.empty() ||
-        host_piece(plan->src_offsets.back(), plan->dst_offsets.back()) == host_piece(so, dof);
-    AppendSegment(plan, so, dof, sz, item.tag, same_piece);
-    so += sz;
-    dof += sz;
-    remaining -= sz;
-  }
-}
-}  // namespace
-
 std::unique_ptr<TransferPlanBuilder> HbmCopyEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
   const size_t piece = HostRegistrationChunkBytes();
@@ -670,7 +637,7 @@ std::vector<char> HbmCopyEngine::GatherEligiblePlans(const std::vector<TransferP
       note_bucket(GatherSkip::kTooFewFragments);
       continue;
     }
-    if (bucket.total_bytes / bucket.fragments.size() >= kGatherFragmentThreshold) {
+    if (!GatherShapeEligible(bucket.fragments.size(), bucket.total_bytes)) {
       note_bucket(GatherSkip::kFragmentAtOrAboveThreshold);
       continue;
     }

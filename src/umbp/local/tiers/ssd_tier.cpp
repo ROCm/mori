@@ -146,13 +146,7 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
   DisposeSegments(&doomed);
 }
 
-int SSDTier::TierThreads() const {
-  int t = ssd_config_.tier_io_threads;
-  if (t < 1) t = 1;
-  const unsigned hc = std::thread::hardware_concurrency();
-  if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
-  return t;
-}
+int SSDTier::TierThreads() const { return EffectiveParallelThreads(ssd_config_.tier_io_threads); }
 
 int SSDTier::SegmentOpenFlags() const { return direct_io_ ? O_DIRECT : 0; }
 

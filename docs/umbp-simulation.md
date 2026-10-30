@@ -69,14 +69,19 @@ a follow-up PR covering the actual engines (`LocalCopyEngine`, `HbmCopyEngine` a
 `MoriIoEngine`), with reusable profiles for CPU, GPU and RDMA transfers. SSD coefficients
 also need measurements of the actual configured storage path.
 
-For staged SSD load/offload, `file_cpu` / `cpu_file` describe storage-path cost;
+For staged SSD load/offload, optional `file_cpu_staged` / `cpu_file_staged` describe storage-path cost;
 normal CPU/GPU/network transfers add their own costs. Fit those SSD coefficients
 to `SSDTier` device I/O plus its skipped payload work (record building, CRC, bounce
 copies and the configured durability mode), excluding control and external
 GPU/RDMA copies that the simulator already counts. Local direct file transfers use
-the same coefficients for `PosixEngine`, so workloads mixing both storage paths
-need separate validation. `file_gpu` models the opt-in GDS read path
+`file_cpu` / `cpu_file`; profiles without staged variants fall back to those curves.
+`file_gpu` models the opt-in GDS read path
 (`UMBP_ENABLE_GDS=1`); GPU offload remains GPU→DRAM→SSD, matching the real engines.
+Checksum-bearing whole reads use `file_cpu_staged`. Checksum-free records and
+partial reads prefer `file_cpu_staged_no_crc`, which models the same SSDTier I/O
+backend without CRC work. Older profiles fall back to `file_cpu`, then the staged
+curve for these reads; whole reads fall back to `file_cpu`.
+With CRC disabled, calibrate the staged profile with the same setting.
 The example SSD values are estimates, not calibration results.
 
 | Field | Meaning |
@@ -84,7 +89,15 @@ The example SSD values are estimates, not calibration results.
 | `channel` | Same names share a service queue within one backend client/server. |
 | `latency_ns` | Nonnegative fixed cost per submitted batch/path. |
 | `copy_latency_ns` | Nonnegative cost per coalesced copy; default 0. |
+| `registration_latency_ns` | Optional nonnegative first-FD cost for `file_gpu`; default 0. |
+| `log_size_latency_ns` | Optional nonnegative SSD read cost per copy × `log2(max(1, mean copy bytes / 4096))`; default 0. |
+| `batch_log_size_latency_ns` | Optional nonnegative SSD read cost per batch × the same size term; default 0. |
+| `serialize_latency` | Optional SSD read flag to queue latency as well as bytes, for mutually exclusive I/O batches; default false. |
 | `bandwidth_bytes_per_second` | Positive effective bandwidth. |
+| `cpu_bandwidth_bytes_per_second` | Optional positive staged-write record-preparation bandwidth; default no separate CPU stage. |
+| `cpu_threads` | Optional positive staged-write CPU worker cap; default 4. |
+| `cpu_launch_latency_ns` | Optional nonnegative cost per additional preparation worker; default 0. |
+| `cpu_cleanup_bandwidth_bytes_per_second` | Optional positive record-buffer release bandwidth after I/O; default no separate cleanup cost. |
 
 `cpu_cpu` coefficients may be arrays indexed by copy threads minus one, clamped to the last
 entry; other paths use scalars. Existing thread selection/thresholds still apply.
@@ -92,7 +105,9 @@ Channel capacity is the maximum configured bandwidth up to the larger configured
 copy/write thread limit; set those limits before creating the client.
 
 ```text
+size_term = log2(max(1, bytes / copies / 4096))
 overhead = latency_ns[p] + copies * copy_latency_ns[p]
+         + size_term * (copies * log_size_latency_ns + batch_log_size_latency_ns)
 private_ns = overhead + bytes * 1e9 / bandwidth[p]
 service_ns = overhead + bytes * 1e9 / channel_capacity
 channel_available = max(submitted, channel_available) + service_ns
@@ -100,6 +115,29 @@ finish = max(submitted + private_ns, channel_available)
 ```
 
 Shared paths sum service costs; zero bytes add no delay and missing paths abort normally.
+For independent SSD reads, `service_ns` includes only the byte cost so request
+latency can overlap, unless `serialize_latency` is true. Writes and mixed read/write
+submits retain the full service cost.
+
+Pure `file_gpu` submits with `serialize_latency=false` share channel capacity among
+active synchronous copies. Copy/log latency stays private; fixed batch/log latency
+is paid once, using the same five coefficients. Ordinary reservations on that
+channel form a barrier; mixed submits retain the formulas above. File registration
+timing is unchanged.
+
+Native CRC reads with a matching serialized no-CRC curve on the same channel
+queue the smaller of the two costs as I/O, then finish the remaining CRC cost
+outside that queue. Missing or incompatible curves retain full serialization.
+
+For `cpu_file_staged`, let `k = min(copies, cpu_threads, effective tier_io_threads)`.
+Preparation takes `ceil(copies / k) * (bytes / copies) * 1e9 / cpu_bandwidth_bytes_per_second`
+plus `(k - 1) * cpu_launch_latency_ns` before entering the SSD service queue.
+This assumes equal record sizes. Cleanup takes
+`bytes * 1e9 / cpu_cleanup_bandwidth_bytes_per_second` after I/O without holding
+its queue. Record building and cleanup can overlap across callers. Old profiles
+retain their combined write curve. The CPU model assumes independent workers and
+does not model shared memory bandwidth or thread contention between callers.
+The effective tier worker count retains the real SSD tier's hardware thread limit.
 
 ## Cross-peer sharing
 
@@ -107,14 +145,14 @@ For share, keep normal Master/peer configuration, distinct node IDs and reachabl
 addresses/ports. Use a dedicated Master, enable sim on **every peer**, and configure
 `remote_read`/`remote_write` from the initiator's perspective. Separate channel names
 allow independent directions. Fit target-link **Submit+Wait**, not API totals or ping
-RTT when replacing estimates with measurements. GPU/network coefficients are not calibrated
-by this PR.
+RTT when replacing estimates with measurements. The example GPU/network coefficients
+remain uncalibrated; use the separate calibration workflow for platform measurements.
 Local copies finish in Submit; registered remote copies finish in Wait. Unregistered
 CPU callers retain RDMA bounce geometry and serial staging inside Submit. Ranged
 scratch and re-cache payloads are virtual; a re-cached replica can serve other peers.
-Staging shares the single-thread `cpu_cpu` coefficients with local copies. The model
-does not distinguish memcpy staging from non-temporal local copies; validate staged
-timings separately.
+Staging uses optional scalar `cpu_staging` / `cpu_staging_read` coefficients calibrated
+from MoriIo's serial copyin/copyout geometry. Reads fall back to `cpu_staging`, then
+the single-thread `cpu_cpu` estimate. Validate staged timings separately from local copies.
 Sim/real engines reject each other's handshake. Distributed ranged I/O still needs scratch.
 Remote GPU callers retain real registration restrictions; standalone GPU IPC is local-copy-only.
 
