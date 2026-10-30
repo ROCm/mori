@@ -510,8 +510,8 @@ std::vector<bool> SSDTier::BatchWrite(const std::vector<std::string>& keys,
   }
 
   // Stage timers for the [SsdPerf/tier] PUT breakdown (no-ops unless
-  // UMBP_SSD_TIMING is set).  `prepare` covers the CRC + record memcpy done
-  // under mu_, which is the stage that blocks concurrent reads on this drive.
+  // UMBP_SSD_TIMING is set). `build` covers lock-free CRC + record assembly;
+  // `reserve` covers metadata work under mu_.
   const auto t_begin = ssdperf::Now();
   double build_ms = 0.0, lock_ms = 0.0, reserve_ms = 0.0, io_ms = 0.0, sync_ms = 0.0;
 
