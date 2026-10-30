@@ -38,7 +38,6 @@
 #include "mori/utils/mori_log.hpp"
 #include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
-#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
 #include "umbp/distributed/transfer/mori_io_engine.h"
 #include "umbp/distributed/transfer/plan_builder.h"
@@ -261,21 +260,6 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
     const bool serial = object.fields().count("serialize_latency");
     const bool serialize_latency =
         serial && Field(object, "serialize_latency", Value::kBoolValue).bool_value();
-    const bool cpu = object.fields().count("cpu_bandwidth_bytes_per_second");
-    const double cpu_bandwidth =
-        cpu ? Field(object, "cpu_bandwidth_bytes_per_second", Value::kNumberValue).number_value()
-            : 0;
-    const bool cpu_limit = object.fields().count("cpu_threads");
-    const double cpu_threads =
-        cpu_limit ? Field(object, "cpu_threads", Value::kNumberValue).number_value() : 4;
-    const bool launch = object.fields().count("cpu_launch_latency_ns");
-    const double cpu_launch =
-        launch ? Field(object, "cpu_launch_latency_ns", Value::kNumberValue).number_value() : 0;
-    const bool cleanup = object.fields().count("cpu_cleanup_bandwidth_bytes_per_second");
-    const double cpu_cleanup =
-        cleanup ? Field(object, "cpu_cleanup_bandwidth_bytes_per_second", Value::kNumberValue)
-                      .number_value()
-                : 0;
     Path path{channel_id,
               Curve(object, "latency_ns", false),
               Curve(object, "bandwidth_bytes_per_second", true),
@@ -285,21 +269,9 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
               registration_ns,
               log_ns,
               batch_log_ns,
-              serialize_latency,
-              cpu_bandwidth,
-              0,
-              cpu_launch,
-              cpu_cleanup};
+              serialize_latency};
     if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") + registration +
-                                      logarithmic + batch_logarithmic + serial + cpu + cpu_limit +
-                                      launch + cleanup ||
-        ((cpu || cpu_limit || launch || cleanup) && index != 14) ||
-        ((cpu_limit || launch || cleanup) && !cpu) ||
-        (cpu && (!std::isfinite(cpu_bandwidth) || cpu_bandwidth <= 0)) ||
-        !std::isfinite(cpu_launch) || cpu_launch < 0 ||
-        (cleanup && (!std::isfinite(cpu_cleanup) || cpu_cleanup <= 0)) ||
-        !std::isfinite(cpu_threads) || cpu_threads < 1 ||
-        cpu_threads > std::numeric_limits<int>::max() || std::floor(cpu_threads) != cpu_threads ||
+                                      logarithmic + batch_logarithmic + serial ||
         (registration && name != "file_gpu") || !std::isfinite(registration_ns) ||
         ((logarithmic || batch_logarithmic || serial) && index != 10 && index != 12 &&
          index != 13 && index != 15) ||
@@ -311,7 +283,6 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
     }
     // Thread limits apply per call; independent callers share the measured aggregate capacity.
     path.capacity = *std::max_element(path.bandwidth.begin(), path.bandwidth.end());
-    path.cpu_threads = static_cast<size_t>(cpu_threads);
     paths_[at - names.begin()] = std::move(path);
   }
   if (bounce_bytes > 0 && (paths_[4] || paths_[5])) {
@@ -584,8 +555,7 @@ bool SimTransferEngine::SimulateGds(const std::vector<TransferPlan>& plans, long
 }
 
 std::optional<SimTransferEngine::Reservation> SimTransferEngine::ReserveCosts(
-    const Bytes& bytes, const Copies& copies, Clock::time_point submitted, bool serial_cpu,
-    long double completion_ns) {
+    const Bytes& bytes, const Copies& copies, Clock::time_point submitted, bool serial_cpu) {
   // Charge fixed latency once per path in this submit batch, independent of page fragmentation.
   Bytes service_ns{}, local_service_ns{}, post_ns{};
   long double private_ns = 0, local_private_ns = 0;
@@ -663,16 +633,12 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::ReserveCosts(
     next[i] = *end;  // Other I/O may start while this caller verifies its checksum.
     finish = std::max(*finish, *completed);
   }
-  finish = Deadline(*finish, completion_ns);
-  local_finish = Deadline(*local_finish, completion_ns);
-  if (!finish || !local_finish) return std::nullopt;
-  available_ = next;  // Completion cleanup does not occupy the I/O queue.
+  available_ = next;  // Commit only after every deadline passed overflow validation.
   return Reservation{*finish, *local_finish};
 }
 
-bool SimTransferEngine::SimulateStorage(bool read, uint64_t size, size_t operations, bool staged,
-                                        size_t cpu_threads) {
-  auto started = Clock::now();
+bool SimTransferEngine::SimulateStorage(bool read, uint64_t size, size_t operations, bool staged) {
+  const auto started = Clock::now();
   if (size == 0) return true;
   if (operations == 0) return false;
   Bytes bytes{};
@@ -683,29 +649,9 @@ bool SimTransferEngine::SimulateStorage(bool read, uint64_t size, size_t operati
   const size_t path = (staged || read) && paths_[variant] ? variant
                       : paths_[base]                      ? base
                                                           : fallback;
-  if (!paths_[path]) return false;
-  long double cleanup_ns = 0;
-  if (!read && staged && paths_[path]->cpu_bandwidth > 0) {
-    if (cpu_threads == 0) return false;
-    const int thread_limit = static_cast<int>(std::min(cpu_threads, paths_[path]->cpu_threads));
-    const auto workers =
-        std::min(operations, static_cast<size_t>(EffectiveParallelThreads(thread_limit)));
-    const auto& cpu = *paths_[path];
-    const auto records = 1 + (operations - 1) / workers;
-    const auto ns =
-        records * (size / static_cast<long double>(operations)) * 1e9L / cpu.cpu_bandwidth +
-        (workers - 1) * cpu.cpu_launch_latency_ns;
-    if (cpu.cpu_cleanup_bandwidth > 0) cleanup_ns = size * 1e9L / cpu.cpu_cleanup_bandwidth;
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::time_point::max() - started)
-            .count();
-    if (!std::isfinite(ns + cleanup_ns) || std::ceil(ns + cleanup_ns) >= remaining) return false;
-    WaitUntil(started + std::chrono::nanoseconds(static_cast<int64_t>(std::ceil(ns))));
-    started = Clock::now();  // Record building precedes the serialized SSD I/O queue.
-  }
   bytes[path] = size;
   copies[path] = operations;
-  const auto reservation = ReserveCosts(bytes, copies, started, false, cleanup_ns);
+  const auto reservation = ReserveCosts(bytes, copies, started);
   if (!reservation) return false;
   WaitUntil(reservation->finish);
   return true;

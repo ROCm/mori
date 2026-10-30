@@ -95,8 +95,7 @@ class SimSsdTier final : public TierBackend {
     }
     Retire(retired);
     if (writes.empty()) return out;
-    const bool ok = engine_.SimulateStorage(false, bytes, writes.size(), true,
-                                            std::max(cfg_.tier_io_threads, 1));
+    const bool ok = engine_.SimulateStorage(false, bytes, writes.size());
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!ok)

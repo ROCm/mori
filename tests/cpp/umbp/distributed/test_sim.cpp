@@ -38,7 +38,6 @@
 
 #include "umbp/common/device_gather.h"
 #include "umbp/common/host_registration.h"
-#include "umbp/common/parallel_for.h"
 #include "umbp/distributed/master/master_server.h"
 #include "umbp/distributed/pool_client.h"
 #include "umbp/distributed/pool_platform.h"
@@ -589,68 +588,6 @@ TEST_F(SimTest, SsdReadLatencyOverlapsButBandwidthAndWritesQueue) {
   EXPECT_TRUE(
       mixed.Transfer({{file, 0, host, 0, kPage, 0}, {host, 0, file, 0, kPage, 1}}, nullptr));
   EXPECT_GE(Clock::now() - start, 200ms);
-}
-
-TEST_F(SimTest, SsdWriteCpuPreparationPrecedesAndOverlapsTheIoQueue) {
-  Profile(R"({"cpu_file_staged":{"channel":"disk","latency_ns":100000000,
-      "bandwidth_bytes_per_second":1e12,"cpu_bandwidth_bytes_per_second":40960,
-      "cpu_threads":4,"cpu_launch_latency_ns":10000000}})");
-  SimTransferEngine engine(Config().sim.profile_path);
-  std::promise<void> start;
-  const auto gate = start.get_future().share();
-  std::vector<std::future<bool>> pending;
-  for (int i = 0; i < 4; ++i)
-    pending.push_back(std::async(std::launch::async, [&] {
-      gate.wait();
-      return engine.SimulateStorage(false, kPage);
-    }));
-  const auto submitted = Clock::now();
-  start.set_value();
-  for (auto& call : pending) EXPECT_TRUE(call.get());
-  EXPECT_GE(Clock::now() - submitted, 500ms);  // CPU 100ms overlaps, then four I/O 100ms.
-  EXPECT_LT(Clock::now() - submitted, 700ms);  // Serializing CPU too would take 800ms.
-  for (int threads : {4, 2}) {
-    const int workers = EffectiveParallelThreads(threads);
-    const auto expected = 100ms + 100ms * (1 + 3 / workers) + 10ms * (workers - 1);
-    const auto begun = Clock::now();
-    EXPECT_TRUE(engine.SimulateStorage(false, 4 * kPage, 4, true, threads));
-    EXPECT_GE(Clock::now() - begun, expected);
-    EXPECT_LT(Clock::now() - begun, expected + 100ms);
-  }
-  const int workers = EffectiveParallelThreads(2);
-  const auto expected = 100ms + 100ms * (1 + 2 / workers) + 10ms * (workers - 1);
-  const auto begun = Clock::now();
-  EXPECT_TRUE(engine.SimulateStorage(false, 3 * kPage, 3, true, 2));
-  EXPECT_GE(Clock::now() - begun, expected);  // Whole records cannot divide evenly across workers.
-  EXPECT_LT(Clock::now() - begun, expected + 100ms);
-}
-
-TEST_F(SimTest, SsdCleanupCompletesAfterIoWithoutHoldingItsQueue) {
-  Profile(R"({"cpu_file_staged":{"channel":"disk","latency_ns":100000000,
-      "bandwidth_bytes_per_second":1e12,"cpu_bandwidth_bytes_per_second":1e12,
-      "cpu_cleanup_bandwidth_bytes_per_second":40960}})");
-  SimTransferEngine engine(Config().sim.profile_path);
-  std::promise<void> start;
-  const auto gate = start.get_future().share();
-  auto write = [&] {
-    gate.wait();
-    return engine.SimulateStorage(false, kPage);
-  };
-  auto first = std::async(std::launch::async, write);
-  auto second = std::async(std::launch::async, write);
-  const auto begun = Clock::now();
-  start.set_value();
-  EXPECT_TRUE(first.get());
-  EXPECT_TRUE(second.get());
-  EXPECT_GE(Clock::now() - begun, 260ms);
-  EXPECT_LT(Clock::now() - begun, 360ms);  // Two I/O 100ms plus the last private cleanup 100ms.
-  for (const auto* invalid :
-       {"\"cpu_launch_latency_ns\":-1", "\"cpu_cleanup_bandwidth_bytes_per_second\":0"}) {
-    Profile(std::string(R"({"cpu_file_staged":{"channel":"disk","latency_ns":0,
-        "bandwidth_bytes_per_second":1e12,"cpu_bandwidth_bytes_per_second":1e12,)") +
-            invalid + "}}");
-    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
-  }
 }
 
 TEST_F(SimTest, GdsRegistrationCostEndsWithTheLastReference) {

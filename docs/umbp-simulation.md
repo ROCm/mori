@@ -94,10 +94,6 @@ The example SSD values are estimates, not calibration results.
 | `batch_log_size_latency_ns` | Optional nonnegative SSD read cost per batch × the same size term; default 0. |
 | `serialize_latency` | Optional SSD read flag to queue latency as well as bytes, for mutually exclusive I/O batches; default false. |
 | `bandwidth_bytes_per_second` | Positive effective bandwidth. |
-| `cpu_bandwidth_bytes_per_second` | Optional positive staged-write record-preparation bandwidth; default no separate CPU stage. |
-| `cpu_threads` | Optional positive staged-write CPU worker cap; default 4. |
-| `cpu_launch_latency_ns` | Optional nonnegative cost per additional preparation worker; default 0. |
-| `cpu_cleanup_bandwidth_bytes_per_second` | Optional positive record-buffer release bandwidth after I/O; default no separate cleanup cost. |
 
 `cpu_cpu` coefficients may be arrays indexed by copy threads minus one, clamped to the last
 entry; other paths use scalars. Existing thread selection/thresholds still apply.
@@ -129,15 +125,10 @@ Native CRC reads with a matching serialized no-CRC curve on the same channel
 queue the smaller of the two costs as I/O, then finish the remaining CRC cost
 outside that queue. Missing or incompatible curves retain full serialization.
 
-For `cpu_file_staged`, let `k = min(copies, cpu_threads, effective tier_io_threads)`.
-Preparation takes `ceil(copies / k) * (bytes / copies) * 1e9 / cpu_bandwidth_bytes_per_second`
-plus `(k - 1) * cpu_launch_latency_ns` before entering the SSD service queue.
-This assumes equal record sizes. Cleanup takes
-`bytes * 1e9 / cpu_cleanup_bandwidth_bytes_per_second` after I/O without holding
-its queue. Record building and cleanup can overlap across callers. Old profiles
-retain their combined write curve. The CPU model assumes independent workers and
-does not model shared memory bandwidth or thread contention between callers.
-The effective tier worker count retains the real SSD tier's hardware thread limit.
+`cpu_file_staged` uses the complete payload curve: record preparation, I/O,
+durability and record-buffer cleanup are included in its measured total cost.
+The basic model reserves that combined cost on the SSD channel; it does not model
+preparation or cleanup overlap between callers separately.
 
 ## Cross-peer sharing
 

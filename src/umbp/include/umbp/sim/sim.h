@@ -70,8 +70,7 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
   std::unique_ptr<TransferPlanBuilder> CreatePlanBuilder(size_t expected_items = 0) const override;
   std::unique_ptr<TransferHandle> Submit(std::vector<TransferPlan> plans) override;
   // Virtual SSD payload I/O; metadata work remains in the existing SSD controllers.
-  bool SimulateStorage(bool read, uint64_t bytes, size_t operations = 1, bool staged = true,
-                       size_t cpu_threads = 4);
+  bool SimulateStorage(bool read, uint64_t bytes, size_t operations = 1, bool staged = true);
   void AddHostGatherRegion(void* base, size_t size);
   void ClearHostGatherRegions();
 
@@ -98,10 +97,6 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
     double log_size_latency_ns;
     double batch_log_size_latency_ns;
     bool serialize_latency;
-    double cpu_bandwidth;
-    size_t cpu_threads;
-    double cpu_launch_latency_ns;
-    double cpu_cleanup_bandwidth;
   };
   struct Reservation {
     Clock::time_point finish;
@@ -113,8 +108,7 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
   using Bytes = std::array<long double, kModelCount>;
   using Copies = std::array<size_t, kModelCount>;
   std::optional<Reservation> ReserveCosts(const Bytes& bytes, const Copies& copies,
-                                          Clock::time_point submitted, bool serial_cpu = false,
-                                          long double completion_ns = 0);
+                                          Clock::time_point submitted, bool serial_cpu = false);
   void AdvanceGds(Clock::time_point now);  // mutex_ held; work is full-bandwidth nanoseconds.
   bool WaitGds(long double service_ns);
   bool SimulateGds(const std::vector<TransferPlan>& plans, long double bytes, size_t copies,
