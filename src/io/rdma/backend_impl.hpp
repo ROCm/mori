@@ -29,8 +29,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "mori/application/topology/topology.hpp"
@@ -133,8 +135,9 @@ class RdmaManager {
   void RecordPeerUnreachable(const EpPair& ep, const char* statusText);
   // Records any other error completion: the QP is in ERR, but no event is raised.
   void RecordQpFailed(const EpPair& ep);
-  // Name of an available device; availDevices is fixed, so this takes no lock.
+  // Name and port of an available device; availDevices is fixed, so these take no lock.
   std::string DeviceName(int devId) const;
+  uint32_t DevicePort(int devId) const;
   // Session admission only: never reject part-way through posting a transfer.
   bool RejectIfPortDown(const EpPairVec& eps, TransferStatus* status);
 
@@ -427,6 +430,8 @@ class RdmaBackend : public Backend {
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,
                                                const TopoKeyPair& topo);
+  // Tells RAS which NICs a session from GPU memory uses, once per GPU and NIC.
+  void ReportNicsToRas(const MemoryDesc& local, const EpPairVec& eps);
 
  private:
   EngineKey myEngKey;
@@ -451,6 +456,9 @@ class RdmaBackend : public Backend {
   // Failed QPs stay allocated, so QPs that fail again soon after being replaced, as on a
   // path that stays down, are replaced at a growing interval. Guarded by connBuildMapMu_.
   std::unordered_map<ConnBuildKey, QpReplacementPacing, ConnBuildKeyHash> qpReplacementPacing_;
+  // (GPU, NIC) pairs reported to RAS. Guarded by rasReportMu_.
+  std::set<std::pair<int, int>> rasReportedNics_;
+  std::mutex rasReportMu_;
 };
 
 }  // namespace io

@@ -37,6 +37,7 @@
 
 #include "mori/io/env.hpp"
 #include "mori/io/logging.hpp"
+#include "mori/ras/ras.hpp"
 #include "src/io/rdma/async_event_monitor.hpp"
 #include "src/io/rdma/protocol.hpp"
 #include "src/io/rdma/verbs_ops.hpp"
@@ -672,6 +673,11 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
 std::string RdmaManager::DeviceName(int devId) const {
   if (devId < 0 || devId >= static_cast<int>(availDevices.size())) return {};
   return availDevices[devId].first->Name();
+}
+
+uint32_t RdmaManager::DevicePort(int devId) const {
+  if (devId < 0 || devId >= static_cast<int>(availDevices.size())) return 0;
+  return availDevices[devId].second;
 }
 
 bool RdmaManager::PopPeerFailure(PeerFailureEvent* out) { return peerFailures_.Pop(out); }
@@ -2021,6 +2027,32 @@ void RdmaBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remot
 
   sess = RdmaBackendSession(config, std::move(localMrPerEp), std::move(remoteMrPerEp), epSet,
                             executor.get(), rdma.get(), local.loc);
+  if (local.loc == MemoryLocationType::GPU) ReportNicsToRas(local, epSet);
+}
+
+void RdmaBackend::ReportNicsToRas(const MemoryDesc& local, const EpPairVec& eps) {
+  ras::RasRuntime* rt = ras::RasRuntime::Get();
+  if (rt == nullptr) return;
+  std::vector<int> fresh;
+  {
+    std::lock_guard<std::mutex> lock(rasReportMu_);
+    for (const auto& ep : eps) {
+      if (rasReportedNics_.insert({local.deviceId, ep.ldevId}).second) fresh.push_back(ep.ldevId);
+    }
+  }
+  if (fresh.empty()) return;
+  ras::EngineGpuAttached ev{myEngKey, local.deviceId, local.deviceBusId, {}};
+  for (int devId : fresh) {
+    ras::NicAttachment nic;
+    nic.device = rdma->DeviceName(devId);
+    nic.port = rdma->DevicePort(devId);
+    ev.nics.push_back(std::move(nic));
+  }
+  if (!rt->Enqueue(std::move(ev))) {
+    // Dropped: the next session from this GPU reports these NICs again.
+    std::lock_guard<std::mutex> lock(rasReportMu_);
+    for (int devId : fresh) rasReportedNics_.erase({local.deviceId, devId});
+  }
 }
 
 bool RdmaBackend::PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,

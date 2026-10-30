@@ -89,6 +89,28 @@ using EngineKey = std::string;
 using DescBlob = std::vector<uint8_t>;
 using BackendDescBlobMap = std::unordered_map<BackendType, DescBlob>;
 
+// The RAS runtime of the engine's process (include/mori/ras/ras.hpp): its peer listener, the
+// token a connecting runtime must present, and its runtime UUID. Empty when the engine has no
+// RAS, because RAS is built out, disabled, or failed to start; peers then don't link to it.
+//
+// It is EngineDesc's last field, not an entry in backendDescs: RAS isn't a backend, and
+// MSGPACK_DEFINE arrays only grow at the end, so an older decoder ignores it and this decoder
+// leaves it empty when an older EngineDesc lacks it.
+struct RasDesc {
+  std::string host;
+  uint16_t port{0};
+  std::string token;
+  uint64_t uuidHi{0};
+  uint64_t uuidLo{0};
+
+  bool operator==(const RasDesc& rhs) const noexcept {
+    return host == rhs.host && port == rhs.port && token == rhs.token && uuidHi == rhs.uuidHi &&
+           uuidLo == rhs.uuidLo;
+  }
+
+  MSGPACK_DEFINE(host, port, token, uuidHi, uuidLo);
+};
+
 struct EngineDesc {
   EngineKey key;
   std::string nodeId;
@@ -99,15 +121,16 @@ struct EngineDesc {
   // Backend-supplied descriptor blobs, captured by IOEngine after each backend
   // is created. Opaque bytes (see DescBlob) — e.g. OFI stores its addr_name.
   BackendDescBlobMap backendDescs;
+  RasDesc ras;
 
   bool operator==(const EngineDesc& rhs) const noexcept {
     return (key == rhs.key) && (nodeId == rhs.nodeId) && (hostname == rhs.hostname) &&
            (host == rhs.host) && (port == rhs.port) && (pid == rhs.pid) &&
-           (backendDescs == rhs.backendDescs);
+           (backendDescs == rhs.backendDescs) && (ras == rhs.ras);
   }
 
   // Append-only: new fields MUST go at the end to preserve wire compatibility.
-  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs);
+  MSGPACK_DEFINE(key, nodeId, hostname, host, port, pid, backendDescs, ras);
 };
 
 using MemoryUniqueId = uint32_t;
