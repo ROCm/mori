@@ -71,6 +71,8 @@ class StandaloneProcessClient : public IUMBPClient {
   size_t BatchExistsConsecutive(const std::vector<std::string>& keys) const override;
   size_t BatchPrefetch(const std::vector<std::string>& keys) override;
 
+  void ConfigureKvIndexer(const KvIndexerConfig& config) override;
+
   bool Clear() override;
   bool Flush() override;
   void Close() override;

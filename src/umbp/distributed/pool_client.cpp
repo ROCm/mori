@@ -52,6 +52,7 @@
 #include "umbp/common/parallel_for.h"
 #include "umbp/common/range_utils.h"
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
+#include "umbp/distributed/indexer/kv_indexer_reporter.h"
 #include "umbp/distributed/master/master_metrics.h"
 #include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
@@ -1335,6 +1336,12 @@ void PoolClient::Shutdown() {
   if (!initialized_) return;
   initialized_ = false;
 
+  if (kv_indexer_) {
+    for (auto* backend : registry_.All()) backend->SetChangeHook({});
+    kv_indexer_->Stop();
+    kv_indexer_.reset();
+  }
+
   // Stop the async re-cache worker first: it calls ExecuteLocalPut (which uses
   // the registry + master_client_), so it must be joined before those are torn
   // down below.
@@ -1410,6 +1417,42 @@ void PoolClient::Shutdown() {
   metric_sink_ = nullptr;
   master_client_.reset();
 }
+
+void PoolClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
+  if (!initialized_) throw std::logic_error("pool must be initialized before configuring Indexer");
+  if (kv_indexer_) {
+    if (kv_indexer_->MatchesPool(config)) return;
+    throw std::logic_error("owner already has a different Indexer configuration");
+  }
+  if (registry_.Get(TierType::DRAM) == nullptr)
+    throw std::invalid_argument("KV Indexer reporting requires a local DRAM backend");
+  kv_indexer_ = std::make_shared<KvIndexerReporter>(
+      config,
+      [this](const std::string& key) {
+        for (const auto* backend : registry_.All())
+          if (backend->Tier() == TierType::DRAM && backend->Contains(key)) return true;
+        return false;
+      },
+      [this](const std::string& key) {
+        for (const auto* backend : registry_.All())
+          if (backend->Contains(key)) return true;
+        return false;
+      });
+  std::weak_ptr<KvIndexerReporter> weak = kv_indexer_;
+  for (auto* backend : registry_.All()) {
+    backend->SetChangeHook([weak](const auto& keys) {
+      if (auto reporter = weak.lock()) reporter->Notify(keys);
+    });
+  }
+  kv_indexer_->Notify();
+}
+
+KvMetadataPin PoolClient::RegisterKvBlock(const KvBlockMetadata& block) {
+  if (!kv_indexer_) throw std::logic_error("configure KV Indexer before registering metadata");
+  return kv_indexer_->Register(block);
+}
+
+bool PoolClient::FlushKvIndexer() { return !kv_indexer_ || kv_indexer_->Sync(); }
 
 bool PoolClient::Clear() {
   // Vacuously done: nothing has been initialized so there is no state to

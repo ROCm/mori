@@ -620,6 +620,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
+    std::vector<KvMetadataPin> metadata;
+    auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
+    if (!metadata_status.ok()) return metadata_status;
     FillResults(client_->BatchPut(keys, ptrs, sizes), response);
     return grpc::Status::OK;
   }
@@ -668,6 +671,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
             static_cast<size_t>(request->object_offsets(static_cast<int>(cursor))));
       }
     }
+    std::vector<KvMetadataPin> metadata;
+    auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
+    if (!metadata_status.ok()) return metadata_status;
     FillResults(client_->BatchPutRanges(keys, object_sizes, ptrs, sizes, offsets), response);
     return grpc::Status::OK;
   }
@@ -706,6 +712,9 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
       FillFalse(request->keys_size(), response);
       return grpc::Status::OK;
     }
+    std::vector<KvMetadataPin> metadata;
+    auto metadata_status = PrepareKvMetadata(request->kv_blocks(), metadata);
+    if (!metadata_status.ok()) return metadata_status;
     FillResults(client_->BatchPutWithDepth(keys, ptrs, sizes, depths), response);
     return grpc::Status::OK;
   }
@@ -840,6 +849,49 @@ class StandaloneServer::Impl final : public ::umbp::UMBPStandalone::Service {
     }
     response->set_count(client_->BatchExistsConsecutive(keys));
     return grpc::Status::OK;
+  }
+
+  grpc::Status ConfigureKvIndexer(grpc::ServerContext*,
+                                  const ::umbp::StandaloneKvIndexerConfig* request,
+                                  ::umbp::BoolResponse* response) override {
+    std::unique_lock<std::shared_mutex> lock(client_mu_);
+    if (shutdown_) return {grpc::StatusCode::UNAVAILABLE, "server is shutting down"};
+    try {
+      KvIndexerConfig config{
+          request->endpoint(), request->dram_pool_id(), request->timeout_ms(), {}};
+      if (request->has_repair_interval_ms())
+        config.repair_interval_ms = request->repair_interval_ms();
+      client_->ConfigureKvIndexer(config);
+      response->set_supports_kv_metadata(true);
+      SetBool(response, true);
+    } catch (const std::exception& error) {
+      SetBool(response, false, error.what());
+    }
+    return grpc::Status::OK;
+  }
+
+  KvMetadataPin RegisterKvMetadata(const ::umbp::StandaloneKvBlock& request) {
+    KvBlockMetadata block{request.hash(), std::nullopt, request.block_size(), {}};
+    if (request.has_parent()) block.parent = request.parent();
+    for (const auto& component : request.components()) {
+      if (!block.component_keys
+               .emplace(component.component(),
+                        std::vector<std::string>(component.keys().begin(), component.keys().end()))
+               .second)
+        throw std::invalid_argument("duplicate KV component");
+    }
+    return client_->RegisterKvBlock(block);
+  }
+
+  grpc::Status PrepareKvMetadata(
+      const google::protobuf::RepeatedPtrField<::umbp::StandaloneKvBlock>& blocks,
+      std::vector<KvMetadataPin>& pins) {
+    try {
+      for (const auto& block : blocks) pins.push_back(RegisterKvMetadata(block));
+      return grpc::Status::OK;
+    } catch (const std::exception& error) {
+      return {grpc::StatusCode::INVALID_ARGUMENT, error.what()};
+    }
   }
 
   grpc::Status BatchPrefetch(grpc::ServerContext*, const ::umbp::BatchKeysRequest* request,
