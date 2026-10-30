@@ -5097,8 +5097,14 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           : (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
              _cPullRowElems) *
                 _cPullRowElems;
+  // The pipelined pass keeps two sets of a warp's rows in the same slots, so its tile is half a
+  // slot, rounded down to the fold's stride.
+  const int _cPipeTileElems =
+      (int)(_cPullSlotBytes / 2 / sizeof(TokT)) / _cPullFoldElems * _cPullFoldElems;
+  const int _cPullWarpElems =
+      (2 * _cPipeTileElems > _cPullTileElems) ? 2 * _cPipeTileElems : _cPullTileElems;
   const size_t _cPullLdsNeed =
-      _cPullPtrBytes + (size_t)warpNum * _cPullSrcMax * _cPullTileElems * sizeof(TokT);
+      _cPullPtrBytes + (size_t)warpNum * _cPullSrcMax * _cPullWarpElems * sizeof(TokT);
   const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems) &&
                         (_cPullTileElems >= _cPullRowElems) &&
                         (_cPullLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET);
@@ -5108,7 +5114,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
     const size_t _cPullBase =
         (((size_t)_cPullPtrArrays * warpNum * topk * sizeof(void*)) + 127) & ~(size_t)127;
     _cPullTiles = reinterpret_cast<TokT*>(sharedMem + _cPullBase) +
-                  (size_t)warpId * _cPullSrcMax * _cPullTileElems;
+                  (size_t)warpId * _cPullSrcMax * _cPullWarpElems;
   }
   const int _cRedEnd = (int)(args.numTokens * mwIter.warpsPerItem);
 
@@ -5418,24 +5424,195 @@ __device__ void EpCombine1250xBody(EpArgs args) {
 
       bool _pullDone = false;
       if constexpr (_cPullType) {
-        if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
+        // Folds _n elements of each live row of the tile set at _cT, rows _rowStride apart, into
+        // outPtr + _off.
+        auto _cFold = [&](const TokT* _cT, size_t _off, int _n, int _rowStride, int _nRed) {
+#define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
+          __threadfence_block();
+          // Rows up to this count are loaded together before folding; past it each row's LDS
+          // read is waited on alone, so it must cover every source a token can have.
+          constexpr int _cSrcMaxC = (npes < topk) ? npes : topk;
+          constexpr int _cRedSrcMax = (_cSrcMaxC > 4) ? _cSrcMaxC : 4;
+          constexpr int _cOutVB = 16;
+          constexpr int _cV = _cOutVB / (int)sizeof(T);
+          constexpr int _cVB = _cV * (int)sizeof(TokT);
+          using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
+          using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
+          const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
+                               ((hiddenDimOffset % (size_t)_cV) == 0) &&
+                               ((_rowStride % _cV) == 0);
+          const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
+          constexpr bool _cFoldMix =
+              std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
+          [[maybe_unused]] int _zRow[_cRedSrcMax];
+          [[maybe_unused]] float _zMul[_cRedSrcMax];
+          if constexpr (_cFoldMix) {
+            int _z0 = 0;
+#pragma unroll
+            for (int _j = _cRedSrcMax - 1; _j >= 0; --_j)
+              if (_j < _nRed && !_CROW_DEAD(_j)) _z0 = _j;
+#pragma unroll
+            for (int _j = 0; _j < _cRedSrcMax; ++_j) {
+              const bool _live = (_j < _nRed) && !_CROW_DEAD(_j);
+              _zRow[_j] = _live ? _j : _z0;
+              _zMul[_j] = _live ? 1.0f : 0.0f;
+            }
+          }
+          for (int _e = laneId * _cV; _e < _nv; _e += WS * _cV) {
+            float _a[_cV];
+#pragma unroll
+            for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
+            auto _cFoldRow = [&](int _j, const _CVecT& _sv, float _cMul) {
+              if constexpr (_cFoldMix) {
+                const uint32_t* _sd = reinterpret_cast<const uint32_t*>(&_sv);
+#pragma unroll
+                for (int _k = 0; _k < _cV / 2; ++_k) {
+                  _a[2 * _k] = MoriFmaMixBf16M<false>(_sd[_k], _cMul, _a[2 * _k]);
+                  _a[2 * _k + 1] = MoriFmaMixBf16M<true>(_sd[_k], _cMul, _a[2 * _k + 1]);
+                }
+              } else {
+                (void)_cMul;
+#pragma unroll
+                for (int _k = 0; _k < _cV; ++_k)
+                  _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
+              }
+            };
+#define _CROW_AT(_j) (*reinterpret_cast<const _CVecT*>(_cT + (size_t)(_j) * _rowStride + _e))
+            if (_nRed <= _cRedSrcMax) {
+              _CVecT _svR[_cRedSrcMax];
+              if constexpr (_cFoldMix) {
+#pragma unroll
+                for (int _j = 0; _j < _cRedSrcMax; ++_j) _svR[_j] = _CROW_AT(_zRow[_j]);
+#pragma unroll
+                for (int _j = 0; _j < _cRedSrcMax; ++_j) _cFoldRow(_j, _svR[_j], _zMul[_j]);
+              } else {
+#pragma unroll
+                for (int _j = 0; _j < _cRedSrcMax; ++_j) {
+                  _svR[_j] = _CROW_AT((_j < _nRed) ? _j : 0);
+                }
+#pragma unroll
+                for (int _j = 0; _j < _cRedSrcMax; ++_j) {
+                  if (_j >= _nRed || _CROW_DEAD(_j)) continue;
+                  _cFoldRow(_j, _svR[_j], 1.0f);
+                }
+              }
+            } else {
+              for (int _j = 0; _j < _nRed; ++_j) {
+                if (_CROW_DEAD(_j)) continue;
+                _cFoldRow(_j, _CROW_AT(_j), 1.0f);
+              }
+            }
+#undef _CROW_AT
+            union {
+              _COutVecT _ov;
+              T _oe[_cV];
+              uint32_t _op[_cOutVB / 4];
+            };
+            constexpr bool _cCvtPk = std::is_same_v<T, hip_bfloat16> && ((_cV % 2) == 0) &&
+                                     ((_cOutVB / 4) == (_cV / 2));
+            if constexpr (_cCvtPk) {
+#pragma unroll
+              for (int _k = 0; _k < _cV / 2; ++_k)
+                _op[_k] = MoriPackTo2<T>(_a[2 * _k], _a[2 * _k + 1]);
+            } else {
+#pragma unroll
+              for (int _k = 0; _k < _cV; ++_k) _oe[_k] = T(_a[_k]);
+            }
+            static_assert(_cOutVB == 16, "the b128 store is written for the 16 B output vector");
+            __builtin_nontemporal_store(*reinterpret_cast<const _mori_v4i*>(&_ov),
+                                        reinterpret_cast<_mori_v4i*>(outPtr + _off + _e));
+          }
+          for (int _e = _nv + laneId; _e < _n; _e += WS) {
+            float _acc = 0.0f;
+            for (int _j = 0; _j < _nRed; ++_j) {
+              if (_CROW_DEAD(_j)) continue;
+              _acc += (float)_cT[(size_t)_j * _rowStride + _e];
+            }
+            outPtr[_off + _e] = T(_acc);
+          }
+#undef _CROW_DEAD
+        };
+        // A chunk shorter than one TDM row is summed straight from peer memory.
+        auto _cFoldPeers = [&](size_t _off, int _n, int _nSrc) {
+          for (int _e = laneId; _e < _n; _e += WS) {
+            float _acc = 0.0f;
+            for (int _j = 0; _j < _nSrc; ++_j) {
+              if (srcPtrs[_j] == nullptr) continue;
+              _acc += (float)(srcPtrs[_j][_off + _e]);
+            }
+            outPtr[_off + _e] = T(_acc);
+          }
+        };
+        // Overlap only where a warp holds a single item longer than both sets of rows together:
+        // the next chunk's rows load into one set while the other is folded. Shorter items, and
+        // warps that walk several items, are faster as one set of full-size chunks.
+        const bool _cPipe =
+            __builtin_amdgcn_readfirstlane(
+                (int)(_cPullOk && (int)validAccumCount <= _cPullSrcMax &&
+                      _cPipeTileElems >= _cPullRowElems && _cRedEnd <= globalWarpNum &&
+                      hiddenDimSize > 2 * (size_t)_cPipeTileElems)) != 0;
+        if (_cPipe) {
+          const int _nSrc = (int)validAccumCount;
+          const int _cTile = _cPipeTileElems;
+          int _cLive = 0;
+          for (int _j = 0; _j < _nSrc; ++_j) _cLive += (srcPtrs[_j] != nullptr) ? 1 : 0;
+          _cLive = __builtin_amdgcn_readfirstlane(_cLive);
+          auto _cIssue = [&](size_t _o, int _b) {
+            int _m = (int)(hiddenDimSize - _o);
+            if (_m > _cTile) _m = _cTile;
+            const gfx1250_TDM_GROUP1 _pgN = TdmShape<TokT>(_m);
+            TokT* const _dst = _cPullTiles + (size_t)_b * _cPullSrcMax * _cTile;
+            for (int _j = 0; _j < _nSrc; ++_j) {
+              if (srcPtrs[_j] == nullptr) continue;
+              TdmIssueLoad<TokT>(_dst + (size_t)_j * _cTile, srcPtrs[_j] + _o, _pgN);
+            }
+          };
+          int _cBuf = 0;
+          _cIssue(0, 0);
+          for (size_t _off = 0; _off < hiddenDimSize; _off += _cTile) {
+            int _n = (int)(hiddenDimSize - _off);
+            if (_n > _cTile) _n = _cTile;
+            if ((size_t)_n * sizeof(TokT) < 128) {
+              _cFoldPeers(_off, _n, _nSrc);
+              break;
+            }
+            const size_t _offN = _off + (size_t)_cTile;
+            const bool _more =
+                __builtin_amdgcn_readfirstlane(
+                    (int)(_offN < hiddenDimSize &&
+                          (hiddenDimSize - _offN) * sizeof(TokT) >= 128)) != 0;
+            if (_more) {
+              // The set being refilled was last read by the previous chunk's fold.
+              asm volatile("s_wait_dscnt 0x0" ::: "memory");
+              _cIssue(_offN, _cBuf ^ 1);
+              // Only the loads just issued may still be in flight.
+              switch (_cLive) {
+                case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
+                case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
+                case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
+                case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
+                case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
+                case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
+                case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
+                case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
+                default: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+              }
+            } else {
+              __builtin_amdgcn_s_wait_tensorcnt(0);
+            }
+            _cFold(_cPullTiles + (size_t)_cBuf * _cPullSrcMax * _cTile, _off, _n, _cTile, _nSrc);
+            _cBuf ^= 1;
+          }
+          _pullDone = true;
+        } else if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
           const int _nSrc = (int)validAccumCount;
           for (size_t _off = 0; _off < hiddenDimSize; _off += _cPullTileElems) {
             int _n = (int)(hiddenDimSize - _off);
             if (_n > _cPullTileElems) _n = _cPullTileElems;
             if ((size_t)_n * sizeof(TokT) < 128) {
-              for (int _e = laneId; _e < _n; _e += WS) {
-                float _acc = 0.0f;
-                for (int _j = 0; _j < _nSrc; ++_j) {
-                  if (srcPtrs[_j] == nullptr) continue;
-                  _acc += (float)(srcPtrs[_j][_off + _e]);
-                }
-                outPtr[_off + _e] = T(_acc);
-              }
+              _cFoldPeers(_off, _n, _nSrc);
               break;
             }
-            const int _rowCnt = _nSrc;
-            const int _rowStride = _cPullTileElems;
             const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
             for (int _j = 0; _j < _nSrc; ++_j) {
               if (srcPtrs[_j] == nullptr) continue;
@@ -5443,112 +5620,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                                  _pg1);
             }
             __builtin_amdgcn_s_wait_tensorcnt(0);
-            const int _nRed = _rowCnt;
-#define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
-            __threadfence_block();
-            // Rows up to this count are loaded together before folding; past it each row's LDS
-            // read is waited on alone, so it must cover every source a token can have.
-            constexpr int _cSrcMaxC = (npes < topk) ? npes : topk;
-            constexpr int _cRedSrcMax = (_cSrcMaxC > 4) ? _cSrcMaxC : 4;
-            constexpr int _cOutVB = 16;
-            constexpr int _cV = _cOutVB / (int)sizeof(T);
-            constexpr int _cVB = _cV * (int)sizeof(TokT);
-            using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
-            using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
-            const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
-                                 ((hiddenDimOffset % (size_t)_cV) == 0) &&
-                                 ((_rowStride % _cV) == 0);
-            const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
-            constexpr bool _cFoldMix =
-                std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
-            [[maybe_unused]] int _zRow[_cRedSrcMax];
-            [[maybe_unused]] float _zMul[_cRedSrcMax];
-            if constexpr (_cFoldMix) {
-              int _z0 = 0;
-#pragma unroll
-              for (int _j = _cRedSrcMax - 1; _j >= 0; --_j)
-                if (_j < _nRed && !_CROW_DEAD(_j)) _z0 = _j;
-#pragma unroll
-              for (int _j = 0; _j < _cRedSrcMax; ++_j) {
-                const bool _live = (_j < _nRed) && !_CROW_DEAD(_j);
-                _zRow[_j] = _live ? _j : _z0;
-                _zMul[_j] = _live ? 1.0f : 0.0f;
-              }
-            }
-            for (int _e = laneId * _cV; _e < _nv; _e += WS * _cV) {
-              float _a[_cV];
-#pragma unroll
-              for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
-              auto _cFoldRow = [&](int _j, const _CVecT& _sv, float _cMul) {
-                if constexpr (_cFoldMix) {
-                  const uint32_t* _sd = reinterpret_cast<const uint32_t*>(&_sv);
-#pragma unroll
-                  for (int _k = 0; _k < _cV / 2; ++_k) {
-                    _a[2 * _k] = MoriFmaMixBf16M<false>(_sd[_k], _cMul, _a[2 * _k]);
-                    _a[2 * _k + 1] = MoriFmaMixBf16M<true>(_sd[_k], _cMul, _a[2 * _k + 1]);
-                  }
-                } else {
-                  (void)_cMul;
-#pragma unroll
-                  for (int _k = 0; _k < _cV; ++_k)
-                    _a[_k] += (float)(reinterpret_cast<const TokT*>(&_sv)[_k]);
-                }
-              };
-#define _CROW_AT(_j) \
-  (*reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)(_j) * _rowStride + _e))
-              if (_nRed <= _cRedSrcMax) {
-                _CVecT _svR[_cRedSrcMax];
-                if constexpr (_cFoldMix) {
-#pragma unroll
-                  for (int _j = 0; _j < _cRedSrcMax; ++_j) _svR[_j] = _CROW_AT(_zRow[_j]);
-#pragma unroll
-                  for (int _j = 0; _j < _cRedSrcMax; ++_j) _cFoldRow(_j, _svR[_j], _zMul[_j]);
-                } else {
-#pragma unroll
-                  for (int _j = 0; _j < _cRedSrcMax; ++_j) {
-                    _svR[_j] = _CROW_AT((_j < _nRed) ? _j : 0);
-                  }
-#pragma unroll
-                  for (int _j = 0; _j < _cRedSrcMax; ++_j) {
-                    if (_j >= _nRed || _CROW_DEAD(_j)) continue;
-                    _cFoldRow(_j, _svR[_j], 1.0f);
-                  }
-                }
-              } else {
-                for (int _j = 0; _j < _nRed; ++_j) {
-                  if (_CROW_DEAD(_j)) continue;
-                  _cFoldRow(_j, _CROW_AT(_j), 1.0f);
-                }
-              }
-#undef _CROW_AT
-              union {
-                _COutVecT _ov;
-                T _oe[_cV];
-                uint32_t _op[_cOutVB / 4];
-              };
-              constexpr bool _cCvtPk = std::is_same_v<T, hip_bfloat16> && ((_cV % 2) == 0) &&
-                                       ((_cOutVB / 4) == (_cV / 2));
-              if constexpr (_cCvtPk) {
-#pragma unroll
-                for (int _k = 0; _k < _cV / 2; ++_k)
-                  _op[_k] = MoriPackTo2<T>(_a[2 * _k], _a[2 * _k + 1]);
-              } else {
-#pragma unroll
-                for (int _k = 0; _k < _cV; ++_k) _oe[_k] = T(_a[_k]);
-              }
-              static_assert(_cOutVB == 16, "the b128 store is written for the 16 B output vector");
-              __builtin_nontemporal_store(*reinterpret_cast<const _mori_v4i*>(&_ov),
-                                          reinterpret_cast<_mori_v4i*>(outPtr + _off + _e));
-            }
-            for (int _e = _nv + laneId; _e < _n; _e += WS) {
-              float _acc = 0.0f;
-              for (int _j = 0; _j < _nRed; ++_j) {
-                if (_CROW_DEAD(_j)) continue;
-                _acc += (float)_cPullTiles[(size_t)_j * _rowStride + _e];
-              }
-              outPtr[_off + _e] = T(_acc);
-            }
-#undef _CROW_DEAD
+            _cFold(_cPullTiles, _off, _n, _cPullTileElems, _nSrc);
           }
           _pullDone = true;
         }
