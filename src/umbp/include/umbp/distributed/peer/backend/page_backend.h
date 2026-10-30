@@ -314,7 +314,7 @@ class PageBackend : public MediumBackend {
   void SetEventPublishing(bool enabled) override;
 
   // ==================== Eviction ordering ====================
-  // An LRU of owned keys (Commit inserts, Resolve renews), kept only after
+  // An LRU of owned keys (Commit inserts, Resolve and Touch renew), kept only after
   // TrackEvictionOrder().  Candidates skip what Evict() would refuse.
   void TrackEvictionOrder() override;
   std::vector<EvictionOffer> EvictionCandidates(size_t max_count) override;
@@ -521,7 +521,7 @@ class PageBackend : public MediumBackend {
   std::vector<DeferredFree> deferred_frees_;
 
   // ---- eviction order (see TrackEvictionOrder) ----
-  // Front = most recently committed/resolved, back = eviction candidate.
+  // Front = most recently committed, resolved or touched; back = eviction candidate.
   // Empty and unmaintained until track_eviction_order_.
   std::list<std::string> lru_;
   // Guards lru_ and the per-slot lru_it/in_lru fields.  Separate from mutex_
