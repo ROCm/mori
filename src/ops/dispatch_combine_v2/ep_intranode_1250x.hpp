@@ -2893,6 +2893,20 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
       args.xdbFlag[b] = phase + 1;
   }
 
+  // Without the grid rendezvous, a small world's blocks each poll the peers' arrival flags
+  // themselves rather than wait for block 0 to forward them. A wide world keeps the forwarding:
+  // there npes lanes of every block would poll the same npes flags.
+  if constexpr (npes <= 8) {
+    if (!needGridRendezvous) {
+      if (thdId < npes) {
+        unsigned long long* slot = EpLocal<unsigned long long>(win, args.offXdb) + thdId;
+        while (__hip_atomic_load(slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < phase)
+          __builtin_amdgcn_s_sleep(MORI_COMB_BARSLEEP);
+      }
+      __syncthreads();
+      return;
+    }
+  }
   unsigned int* fanLines = reinterpret_cast<unsigned int*>(args.combineBarrierFan);
   const unsigned int fanEpoch = static_cast<unsigned int>(phase);
   if (blockIdx.x == 0) {
