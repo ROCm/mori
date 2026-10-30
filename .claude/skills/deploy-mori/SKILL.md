@@ -52,7 +52,7 @@ done
 ## Step 1: Start the Docker container
 
 Use the container name from the user's args if provided; ask if not.
-Default image: `rocm/pytorch:rocm10.0_ubuntu24.04_py3.11_pytorch_release_2.13.0`
+Default image: `rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0`
 (use unless the user specifies another) — same base the CI workflows build on.
 
 ```bash
@@ -439,7 +439,8 @@ configure time with
 `does not contain the HIP runtime CMake package ... hip-lang-config.cmake`.
 
 Install the release in the image's tag — mixing them makes every `import mori`
-warn that it was built against another ROCm. For ROCm 10.0:
+warn that it was built against another ROCm. For ROCm 10.1 (an Ubuntu 22.04
+image takes `ubuntu2204` in the repo URL):
 
 ```bash
 sudo docker exec $CONTAINER_NAME bash -c '
@@ -452,7 +453,7 @@ wget -qO - https://stable.repo.amd.com/rocm/gpg/packages.gpg \
 echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" \
   > /etc/apt/sources.list.d/amdrocm.list
 apt-get update
-apt-get install -y --no-install-recommends amdrocm-core-dev10.0-gfx942 amdrocm-core-dev10.0-gfx950
+apt-get install -y --no-install-recommends amdrocm-core-dev10.1-gfx942 amdrocm-core-dev10.1-gfx950
 cat /opt/rocm/core/.info/version
 '
 ```
