@@ -158,6 +158,48 @@ TEST_F(PeerDrivenEvictionTest, MasterRankedNodeEvictsTheMastersVictims) {
   for (const auto& key : read) EXPECT_TRUE(Dram()->Contains(key)) << key;
 }
 
+TEST_F(PeerDrivenEvictionTest, MasterRankedNodeKeepsTheKeysItTouched) {
+  auto* node = Start(/*master_supports=*/true, PeerEvictionMode::kMasterRanked);
+  ASSERT_NE(node, nullptr);
+  ASSERT_TRUE(node->Master().PeerDrivenEviction());
+
+  PutKeys(0, 14);
+  std::vector<std::string> known;
+  for (int i = 0; i < 14; ++i) known.push_back(Key(i));
+  node->Master().FlushHeartbeat();
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        std::vector<bool> found;
+        return node->Master().BatchLookup(known, &found).ok() &&
+               std::all_of(found.begin(), found.end(), [](bool f) { return f; });
+      },
+      std::chrono::seconds(5)));
+
+  // Used from the caller's own cache, so never read here: only the touch can
+  // move them behind every other key in the master's ranking.
+  const std::vector<std::string> touched = {Key(0), Key(1), Key(2)};
+  EXPECT_EQ(node->BatchTouch(touched), touched.size());
+  ASSERT_TRUE(WaitFor(
+      [&] {
+        node->Master().FlushHeartbeat();
+        auto ranked = node->Master().GetEvictionCandidates(TierType::DRAM, "", 14 * kPage, 0);
+        if (!ranked.has_value() || ranked->size() != 14) return false;
+        std::vector<std::string> last;
+        for (size_t i = 11; i < 14; ++i) last.push_back((*ranked)[i].key);
+        std::sort(last.begin(), last.end());
+        return last == touched;
+      },
+      std::chrono::seconds(5)))
+      << "touched keys did not reach the master's ranking";
+
+  PutKeys(14, 1);  // 15 of 16 pages
+  ASSERT_TRUE(
+      WaitFor([&] { return Dram()->OwnedKeyCount() <= kPages / 2; }, std::chrono::seconds(3)))
+      << "the node did not evict for itself";
+  EXPECT_EQ(node->LocalEvictionStats().master_keys, 7u) << "victims did not come from the master";
+  for (const auto& key : touched) EXPECT_TRUE(Dram()->Contains(key)) << key;
+}
+
 TEST_F(PeerDrivenEvictionTest, EvictsLocallyUnlessTheModeIsMaster) {
   struct Case {
     bool master_supports;
