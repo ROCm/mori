@@ -1936,6 +1936,61 @@ inline __device__ void ccoSdmaPutGrouped(ccoSdmaQueueDeviceHandle* shared, void*
   }
 }
 
+// Publish a reservation [base, pendingWptr) on the lane's own queue, every
+// active lane of the wave at once, each on a queue no other active lane uses.
+// Call it from all active lanes (it ballots).
+//
+// Reserving in parallel is fine; what is not is running submitPacket in
+// parallel. Its spin is divergent, so without independent thread scheduling
+// the stores after it -- committedWptr among them -- wait for every lane of the
+// wave to leave the loop. The wave then holds one un-published reservation per
+// lane that it can only publish all at once, and two waves posting to the same
+// queues deadlock whenever their reservations interleave: if wave A reserved
+// first on queue i and wave B first on queue j, A's lane j waits for B to
+// commit on j while B's lane i waits for A to commit on i.
+//
+// So release the publishes one at a time instead: each pass, whichever lanes
+// already own the head of their chain publish and drop out, the rest come back
+// next pass. The head of a queue's chain is by definition unblocked, so some
+// lane always makes progress and no lane's publish can be held hostage by a
+// sibling's wait.
+__device__ inline void ccoSdmaPublishInChainOrder(const ccoSdmaQueueDeviceHandle& handle,
+                                                  uint64_t base, uint64_t pendingWptr) {
+  const unsigned myLane = impl::waveLaneId();
+  // Uniform loop: `left` is a ballot result, identical in every lane.
+  uint64_t left = impl::waveBallot(true);
+  [[maybe_unused]] int retries = 0;
+  while (left) {
+    const bool ready = ((left >> myLane) & 1ull) &&
+                       __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
+                                         __HIP_MEMORY_SCOPE_AGENT) == base;
+    const uint64_t go = impl::waveBallot(ready);
+    if (ready) {
+      // Same publish order as submitPacket: packet dwords, then wptr and the
+      // doorbell, then committedWptr to hand the chain to the next reserver.
+      ccoSdmaPublishStores();
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      __hip_atomic_store(impl::global(handle.wptr), pendingWptr, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(impl::global(handle.doorbell), pendingWptr, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_SYSTEM);
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      __hip_atomic_store(impl::global(handle.committedWptr), pendingWptr, __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+    left &= ~go;
+    if (left) {
+      __builtin_amdgcn_s_sleep(1);
+      if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
+        if (retries++ == CCO_SDMA_MAX_RETRIES) {
+          __builtin_trap();  // multi-queue publish: retry limit exceeded
+          break;
+        }
+      }
+    }
+  }
+}
+
 // Thread scope: every calling lane posts its own copy on its own `qId`. Lanes on
 // distinct queues post independently; lanes sharing one are grouped, the leader
 // making a single reservation and ringing for all of them.
@@ -2021,21 +2076,8 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
 
   const uint64_t mine = impl::waveMatchAny(queueKey, keyBits);
   if (!impl::waveBallot(__builtin_popcountll(mine) > 1)) {
-    // Every lane on its own queue. Reserving in parallel is fine; what is not is
-    // running submitPacket in parallel, the way a plain postSolo here would.
-    // Its spin is divergent, so without independent thread scheduling the stores
-    // after it -- committedWptr among them -- wait for every lane of the wave to
-    // leave the loop. The wave then holds nActive un-published reservations that
-    // it can only publish all at once, and two waves posting to the same queues
-    // deadlock whenever their reservations interleave: if wave A reserved first
-    // on queue i and wave B first on queue j, A's lane j waits for B to commit on
-    // j while B's lane i waits for A to commit on i.
-    //
-    // So keep the parallel reserve and release the publishes one at a time
-    // instead: each pass, whichever lanes already own the head of their chain
-    // publish and drop out, the rest come back next pass. The head of a queue's
-    // chain is by definition unblocked, so some lane always makes progress and
-    // no lane's publish can be held hostage by a sibling's wait.
+    // Every lane on its own queue: reserve and fill in parallel, then publish
+    // in chain order (see ccoSdmaPublishInChainOrder for why not submitPacket).
     ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
     const uint64_t bytes = ccoSdmaGroupBytes<localSignal, remoteSignal, kPerCopy>(1);
     const uint64_t base = handle.ReserveSlot(bytes, shared);
@@ -2048,40 +2090,7 @@ inline __device__ void ccoSdmaPutThread(void* srcBuf, void* dstBuf, size_t copy_
       ccoSdmaPublishStores();
       return;
     }
-    const uint64_t pendingWptr = base + bytes;
-    const unsigned myLane = impl::waveLaneId();
-    // Uniform loop: `left` is a ballot result, identical in every lane.
-    uint64_t left = impl::waveBallot(true);
-    [[maybe_unused]] int retries = 0;
-    while (left) {
-      const bool ready = ((left >> myLane) & 1ull) &&
-                         __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
-                                           __HIP_MEMORY_SCOPE_AGENT) == base;
-      const uint64_t go = impl::waveBallot(ready);
-      if (ready) {
-        // Same publish order as submitPacket: packet dwords, then wptr and the
-        // doorbell, then committedWptr to hand the chain to the next reserver.
-        ccoSdmaPublishStores();
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        __hip_atomic_store(impl::global(handle.wptr), pendingWptr, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-        __hip_atomic_store(impl::global(handle.doorbell), pendingWptr, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_SYSTEM);
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        __hip_atomic_store(impl::global(handle.committedWptr), pendingWptr, __ATOMIC_RELAXED,
-                           __HIP_MEMORY_SCOPE_AGENT);
-      }
-      left &= ~go;
-      if (left) {
-        __builtin_amdgcn_s_sleep(1);
-        if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
-          if (retries++ == CCO_SDMA_MAX_RETRIES) {
-            __builtin_trap();  // multi-queue publish: retry limit exceeded
-            break;
-          }
-        }
-      }
-    }
+    ccoSdmaPublishInChainOrder(handle, base, base + bytes);
     return;
   }
 
@@ -2435,6 +2444,89 @@ __device__ inline void ccoSdmaDispatchBroadcast(const ccoSdmaContext& s, int pee
   });
 }
 
+// postWaitMemPutPtr's run: [POLL_REGMEM][COPY, or NOP if bytes == 0][local
+// signal]?[remote signal]?, 2-4 ring units per lane. Every packet is one unit,
+// so none straddles the ring end and no slack unit is needed. Each lane
+// reserves its whole run with one ReserveSlot and rings it with one doorbell.
+// Lanes on distinct queues post in parallel (publishing in chain order, as
+// ccoSdmaPutThread); lanes on a shared queue post in turn. A copy over
+// CCO_SDMA_MAX_COPY_BYTES falls back to the composed wait + chunked put +
+// commit, posted lane by lane. `bytes == 0` with no signal is a no-op.
+template <bool localSignal, bool remoteSignal, uint32_t optFlags>
+__device__ inline void ccoSdmaWaitPutThread(const ccoSdmaContext& s, int peer, int queueId,
+                                            const void* flag, uint32_t value, uint32_t mask,
+                                            uint32_t func, void* dst, void* src, size_t bytes,
+                                            uint32_t myLsaRank, uint32_t lsaSize) {
+  const uint32_t n = s.sdmaNumQueue;
+  if (queueId < 0 || static_cast<uint32_t>(queueId) >= n) return;
+  if constexpr (!localSignal && !remoteSignal) {
+    if (bytes == 0) return;  // nothing to gate: do not park the queue for nothing
+  }
+  constexpr bool kRing = !(optFlags & ccoSdmaOptFlagsAggregate);
+  constexpr uint64_t kBytes = CCO_SDMA_UNIT * (2 + ccoSdmaSignalUnits<localSignal, remoteSignal>());
+  if (__builtin_expect(bytes > CCO_SDMA_MAX_COPY_BYTES, 0)) {
+    // One lane at a time, its wait and all its chunks together: posting every
+    // lane's wait first would hold lane A's copy behind lane B's flag on a
+    // shared queue.
+    ccoSdmaPostAsIssuer<ccoCoopThread>([&] {
+      ccoSdmaDispatchWait<ccoCoopThread, ccoSdmaOptFlagsAggregate>(s, peer, queueId, flag, value,
+                                                                   mask, func);
+      ccoSdmaDispatchChunked<ccoCoopThread, localSignal, remoteSignal,
+                             optFlags | ccoSdmaOptFlagsAggregate, ccoSdmaThreadIndependent>(
+          s, peer, n, dst, src, bytes, queueId, myLsaRank, lsaSize);
+      if constexpr (kRing) {
+        ccoSdmaCommitThread(s.deviceHandles + peer * n, n, static_cast<uint32_t>(queueId));
+      }
+    });
+    return;
+  }
+  const uint32_t slot = myLsaRank * n + static_cast<uint32_t>(queueId);
+  HSAuint64* localTarget = localSignal ? s.signalBuf + slot : nullptr;
+  HSAuint64* remoteTarget = remoteSignal ? s.peerSignalPtrs[peer] + slot : nullptr;
+  ccoSdmaQueueDeviceHandle* shared = *impl::global(s.deviceHandles + peer * n + queueId);
+  auto fill = [&](ccoSdmaQueueDeviceHandle& handle, uint64_t base) {
+    ccoSdmaWritePoll(handle.queueBuf, base, flag, value, mask, func);
+    if (bytes != 0) {
+      ccoSdmaWriteCopy(handle.queueBuf, base + CCO_SDMA_UNIT, src, dst, bytes);
+    } else {
+      ccoSdmaWriteNop(handle.queueBuf, base + CCO_SDMA_UNIT);
+    }
+    ccoSdmaWriteSignals<localSignal, remoteSignal>(handle.queueBuf, base + 2 * CCO_SDMA_UNIT,
+                                                   localTarget, remoteTarget);
+  };
+  auto postAlone = [&]() {
+    ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
+    const uint64_t base = handle.ReserveSlot(kBytes, shared);
+    fill(handle, base);
+    if constexpr (kRing) {
+      handle.submitPacket(base, base + kBytes);
+    } else {
+      ccoSdmaPublishStores();
+    }
+  };
+  const uint64_t active = impl::waveBallot(true);
+  if (__builtin_popcountll(active) == 1) {
+    postAlone();
+    return;
+  }
+  const uint32_t queueKey = static_cast<uint32_t>(peer) * n + static_cast<uint32_t>(queueId);
+  const uint32_t span = lsaSize * n;
+  const uint32_t keyBits = span > 1 ? (32u - static_cast<uint32_t>(__builtin_clz(span - 1))) : 1u;
+  const uint64_t mine = impl::waveMatchAny(queueKey, keyBits);
+  if (impl::waveBallot(__builtin_popcountll(mine) > 1)) {
+    ccoSdmaPostAsIssuer<ccoCoopThread>(postAlone);  // some lanes share a queue
+    return;
+  }
+  ccoSdmaQueueDeviceHandle handle = *impl::global(shared);
+  const uint64_t base = handle.ReserveSlot(kBytes, shared);
+  fill(handle, base);
+  if constexpr (!kRing) {
+    ccoSdmaPublishStores();
+    return;
+  }
+  ccoSdmaPublishInChainOrder(handle, base, base + kBytes);
+}
+
 struct ccoSdma {
   ccoDevComm const& comm;
 
@@ -2702,6 +2794,40 @@ struct ccoSdma {
 #endif
     ccoSdmaDispatchWait<Coop, optFlags>(comm.sdma, peer, queueId, ccoGetLocalPtr(win, offset),
                                         value, mask, static_cast<uint32_t>(cmp));
+  }
+
+  // postWaitMemPutPtr: postWaitMem + putPtr on queue (peer, queueId) in one
+  // reservation and one doorbell; same result as postWaitMem<Aggregate> +
+  // putPtr<Aggregate> + commit. The engine polls: the kernel can exit right
+  // after posting. The copy of `bytes` from `src` (ours) to `dst` (peer's memory as
+  // mapped here) and its signals run once `(*(win + offset) & mask) <cmp> value`
+  // holds; the flag is on THIS GPU and only its low 32 bits are compared (use
+  // Eq on a per-call epoch: the engine compares unsigned). `bytes == 0` posts
+  // the wait and signals only, and nothing at all without a signal (like put,
+  // it returns: there is nothing to gate). Aggregate leaves the doorbell for
+  // commit(). The queue is blocked until the condition holds: give it its own
+  // queueId.
+  // Thread scope: every active lane posts its own; distinct queues in
+  // parallel, a shared queue in turn. A copy over one packet
+  // (CCO_SDMA_MAX_COPY_BYTES, ~1 GiB) takes the composed path, one lane's wait
+  // and chunks at a time. With Independent lanes on one queue, lanes whose copy
+  // exceeds the cap post first (one at a time), then the rest, so chain order
+  // is not lane order. Traps on gfx12.5.
+  template <bool localSignal = false, bool remoteSignal = false,
+            uint32_t optFlags = ccoSdmaOptFlagsDefault>
+  __device__ inline void postWaitMemPutPtr(int peer, int queueId, ccoWindow_t win, size_t offset,
+                                           uint32_t value, ccoSdmaCmp cmp, uint32_t mask, void* dst,
+                                           void* src, size_t bytes) {
+    static_assert((optFlags & ~static_cast<uint32_t>(ccoSdmaOptFlagsAggregate)) == 0,
+                  "ccoSdma::postWaitMemPutPtr: only ccoSdmaOptFlagsAggregate is supported");
+#ifdef CCO_SDMA_SCOPE_FIELDS
+    __builtin_trap();  // gfx12.5 packet layout not validated
+    return;
+#endif
+    ccoSdmaWaitPutThread<localSignal, remoteSignal, optFlags>(
+        comm.sdma, peer, queueId, ccoGetLocalPtr(win, offset), value, mask,
+        static_cast<uint32_t>(cmp), dst, src, bytes, static_cast<uint32_t>(comm.lsaRank),
+        static_cast<uint32_t>(comm.lsaSize));
   }
 
   // postWaitSignal: postWaitMem on our own signalBuf[srcRank*n+sigQueueId], i.e.
