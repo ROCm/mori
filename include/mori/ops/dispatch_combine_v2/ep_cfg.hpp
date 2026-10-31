@@ -151,8 +151,6 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
-  // Read by no kernel. aiter's mega_moe still passes tok_off_peers, and the binding
-  // rejects a launch argument the schema lacks; drop it once aiter stops.
   int* const* tokOffPeers = nullptr;
   void* stagingBase = nullptr;  // gfx1250 dispatch staging (EpStagingTotalBytes)
   int* recvToSrc = nullptr;
@@ -254,12 +252,6 @@ struct EpCfg {
   // combineFp4's push combine with an MXFP8 wire: e4m3 plus one e8m0 scale per 32
   // elements. Exclusive with combineFp4 (MakeEpCfg).
   bool combineFp8 = false;
-  // Set for every gfx125x dispatch (MakeEpCfg), and that kernel requires it: the blocks of a
-  // rank add up their tokens for each destination in the state EpResStateBytes lays out, and
-  // the last of them to arrive reserves the total with one RMW on the destination's slot
-  // allocator word: one RMW per call for each pair of ranks, since the RMWs on one word
-  // serialize in the cco window. No other kernel reads it; off is free for the same reason
-  // as scaleBytes.
   bool aggReserve = false;
   int callTokMax = 0;
   bool ll128 = false;
@@ -545,8 +537,6 @@ constexpr int EpLl128LandRowBytes(const EpCfg& c) {
   return ((data + 119) / 120 + 7) / 8 * 1024;
 }
 constexpr size_t EpRegionTokOffBytes(const EpCfg&) { return 4; }
-// The gfx125x dispatch's: at 8 ranks or fewer the region also holds, from byte 256, a count
-// table of a word per source and destination.
 constexpr size_t EpRegionTokOff1250xBytes(const EpCfg& c) {
   return c.worldSize <= 8 ? 256 + 4 * (size_t)c.worldSize * c.worldSize : EpRegionTokOffBytes(c);
 }

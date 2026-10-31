@@ -165,9 +165,6 @@ _DISPATCH_TABLE: dict = {
         #   5120   149.4         161.0
         (8, 7168, 6, None): {
             None: ((2048, 64, 16), (None, 128, 16)),
-            # bf16 keeps 64 blocks at every token count, leaving the rest of the CUs to the
-            # co-resident GEMM. Standalone, 128x16 past 2048 is 1.5-2% faster: dispatch+combine
-            # 424.2 / 811.4 us against 430.8 / 827.4 at 4096 / 8192 tokens a rank.
             "bf16": ((None, 64, 16),),
             "fp4": (
                 (1024, 64, 16),
@@ -368,11 +365,6 @@ def ll128(
     experts_per_rank=None,
     quant_type="none",
 ):
-    """The LL128 plan geometry for an op of this shape, dispatch dtype and capacity:
-    {"dispatch": (block, warp), "combine": (block, warp)} when both kernels take LL128,
-    {"combine": (block, warp)} when only the combine does, the first with "max_tok": n when
-    only the calls of at most n tokens a rank take it, or None when the op keeps the
-    schedule."""
     per_shape = _LL128_TABLE.get(quant_type, {}).get(_device_key(), {})
     entry = _bucket_key(per_shape, world_size, hidden_dim, topk, experts_per_rank)
     plan = entry.get(dtype) if entry else None

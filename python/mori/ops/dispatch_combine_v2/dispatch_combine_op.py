@@ -686,10 +686,7 @@ class EpDispatchRoutingHandle:
     the serving path (dispatch -> experts -> combine) free of allocations. A caller
     that holds several handles at once (one per MoE layer, then the backward in
     reverse) passes dispatch(..., snapshot=True): the handle then owns its dest map
-    and count, and combine / replay with it stay correct after later dispatches. On a
-    gfx1250 LL128 op it also owns copies of its reverse map and forwarded ids (recv_maps),
-    taken after the dispatch: that combine sends each received row back from them, not
-    from the dest map.
+    and count, and combine / replay with it stay correct after later dispatches.
 
     Either way only the routing is the handle's. What dispatch delivered into the
     arena (recv tokens, weights, indices, scales, and the reverse map below until
@@ -781,9 +778,6 @@ class EpDispatchCombineOp:
     _async_pending_dispatch_map = None
     _async_pending_combine = None
 
-    # True where a dispatch takes its receive slots off total_recv counting from 0 and only
-    # a combine of the op's own count clears it (hip, gfx1250 LL128): a snapshot dispatch
-    # then zeroes the op's count once its handle has the copy.
     _snapshot_zeroes_count = False
 
     # -- registration / selection -----------------------------------------
@@ -923,8 +917,7 @@ class EpDispatchCombineOp:
         """((disp_block, disp_warp), (comb_block, comb_warp)) for a runtime token
         count via the per-token schedule; falls back to the single-shot specs
         otherwise. Clamped to variants that were actually built, so the hot path
-        can never trigger a compile. `snapshot`: the call's handle owns its routing
-        (dispatch(snapshot=True)), which a backend may pick other plans for."""
+        can never trigger a compile."""
         schedule = self.cfg.schedule
         disp_spec = comb_spec = None
         if schedule:
@@ -997,15 +990,9 @@ class EpDispatchCombineOp:
         return cache
 
     def _snapshot_recv_views(self, disp_spec):
-        """What a snapshot handle must copy out of the arena because this backend's combine
-        reads it back, as (recv_to_src, recv_idx) views, copied once the dispatch has written
-        them; None when the combine routes from the dest map and the count alone."""
         return None
 
     def _reverse_source(self, disp_spec):
-        """The arena view a dispatch through disp_spec leaves its reverse map in, and the
-        function that re-encodes it as src_rank * max_num_inp_token_per_rank + src_tok, or
-        None when it already is."""
         # A live arena view: the reverse map is cloned lazily on first access,
         # which must happen after the caller's post-dispatch barrier (see
         # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
@@ -1044,10 +1031,8 @@ class EpDispatchCombineOp:
         .clone() because combine stages into a separate out_tok buffer.
 
         snapshot=: with return_routing=True, give the handle its own dest map
-        (the kernel writes it directly, no copy) and its own copy of total_recv --
-        on an LL128 op also its own reverse map and forwarded ids, written by the
-        kernel next to the arena's -- so it outlives later return_routing
-        dispatches on this op. The total_recv returned is that copy. Without it the
+        (the kernel writes it directly, no copy) and its own copy of total_recv,
+        so it outlives later return_routing dispatches on this op. Without it the
         handle is valid only until the next one; see EpDispatchRoutingHandle.
         Intranode gather combine without StdMoE only: the internode and scatter
         combines also read routing state the op keeps in the arena, and StdMoE's
@@ -1060,10 +1045,6 @@ class EpDispatchCombineOp:
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
-
-        On a gfx1250 LL128 plan a dispatch without snapshot= has to be followed by
-        its combine before the next dispatch: the dispatch counts its receive slots
-        up from total_recv, and only that combine clears it (leaving it at 0).
         """
         with self._asyncll_call("dispatch"):
             return self._dispatch_impl(

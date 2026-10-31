@@ -330,8 +330,7 @@ def main():
         dist.barrier()
 
     def check_dispatch(op, total, routing):
-        """Every received row -- payload, scale row, ids and weights -- must equal,
-        BYTE FOR BYTE, the source row it claims.
+        """Every received row must equal, BYTE FOR BYTE, the source row it claims.
 
         dispatch only transports -- "mori does no quantizing here: fp8/fp4 payloads
         arrive already packed" (hip_backend.py) -- so the bytes that land must be

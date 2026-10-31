@@ -19,29 +19,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""LL128 calls next to the schedule's on one op (hip backend, gfx1250 intranode).
-
-An op whose capacity is past the LL128 table's max_tok (hip_backend.ll128_layout) runs its
-calls of at most max_tok tokens a rank on LL128 plans with regions of their own, and the
-rest on the schedule's. One sequence of call sizes crosses max_tok both ways, and runs
-
-- synced, a barrier after every dispatch and combine: each call takes the plans its size
-  says, delivers every source row, id, weight and scale row to the slot its reverse map
-  names (src_rank * M + src_tok on both plans), and a bf16 combine returns U * x;
-- back to back, eager and then replaying one graph a call size;
-- as snapshot handles, two dispatches before both combines, for each pairing of the sides,
-  a barrier after every call as test_routing_snapshot.py has: a peer's next schedule
-  dispatch writes into this rank's receive rows, and its next schedule combine restages
-  the rows this rank reads. Gather ops only: every push-quant op scatters, and dispatch
-  rejects snapshot=True there.
-
-Every combine of the last two equals the synced one bit for bit. The expert is the identity
-on the received rows (fp8 / fp4 decoded to bf16), so a combine row is U copies of one row,
-U the token's distinct destination ranks.
-
-    torchrun --standalone --nproc_per_node=4 test_ll128_split.py
-    QUANTS=fp4_blockwise M=1024 torchrun --standalone --nproc_per_node=8 test_ll128_split.py
-"""
 import os
 import sys
 
@@ -94,7 +71,6 @@ def call_sizes(lim):
 
 
 def make_inputs(cfg, i, src, n):
-    """Call i's tokens, ids, weights and scale rows on rank src, the same wherever made."""
     g = torch.Generator().manual_seed(7919 * i + src)
     dt = cfg.dispatch_dtype
     if dt is torch.float4_e2m1fn_x2:
@@ -119,7 +95,6 @@ def copy_of(t):
 
 
 def expert(recv, lut):
-    """The identity on the received rows, as the bf16 rows combine takes."""
     if recv.dtype is torch.bfloat16:
         return recv
     if recv.dtype is torch.float4_e2m1fn_x2:
@@ -269,8 +244,6 @@ def main():
     dev = torch.device("cuda", torch.cuda.current_device())
     lut = torch.tensor(_E2M1 + [-v for v in _E2M1], dtype=torch.bfloat16, device=dev)
 
-    # Inputs before the communicator: comm_create leaves a HIP error latched that
-    # the next torch GPU call would report (see test_ep_backend_parity.py).
     plans = []
     for q in QUANTS:
         cfg = make_cfg(q, rank, world)

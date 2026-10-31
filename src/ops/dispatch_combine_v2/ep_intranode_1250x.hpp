@@ -237,7 +237,6 @@ __device__ __forceinline__ size_t EpScaleRow(index_t b, index_t s) {
   return (size_t)((unsigned)b & (unsigned)(EpScaleWrap(kCfg) - 1)) + (size_t)(s - b);
 }
 
-// The dispatch slot allocator word of PE `pe`: the window's offTokOff.
 __device__ __forceinline__ index_t* EpTokOff(const EpArgs& args, int pe) {
   return EpPeer<index_t>(EpWinC{args.window}, pe, args.offTokOff);
 }
@@ -370,8 +369,6 @@ __device__ __forceinline__ __attribute__((address_space(1))) T* EpUniG(T* p) {
 }
 
 constexpr unsigned long long kEpStageOff = 512;
-// The gfx125x dispatch's count table in the slot allocator's region: a word per source row and
-// destination column.
 constexpr unsigned long long kEpCntOff = 256;
 constexpr int kEpStageRegionTok = 512;
 __device__ unsigned _llTmo;
@@ -676,8 +673,6 @@ __device__ __forceinline__ void EpDispatchLl1250x(const EpArgs& args) {
     const unsigned wtw = pick(4 * topk + 4 * k);
     const int e = laneId < topk ? (int)idw : -1;
     if (__ballot(e >= 0 && e / kEpr == myPe) == 0ull) continue;
-    // The units past the first kRB are loaded before the slot is taken: their latency hides behind
-    // the slot's atomic and the stores of the first kRB units.
     constexpr bool kRx2 = kUnits > kRB && kUnits <= 2 * kRB;
     uint4 v2[kRx2 ? kUnits - kRB : 1];
     if constexpr (kRx2) {
@@ -1147,9 +1142,9 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   const int _bmPerTok = topk * 4 + topk * 4 + 4;
   const int _bmTileB = (int)(hiddenDim * sizeof(T));
   const bool _blkMapNeeded = !((_bmPerTok > 0) && (((_bmTileB - 384) / _bmPerTok) > 0));
-  // The call number this call publishes under. A plain load on purpose: every thread runs it,
-  // and an atomic load would queue the whole grid on one address; the previous call's store is
-  // visible across the kernel boundary.
+  // Cfg.aggReserve: the call number this call publishes under. A plain load on purpose:
+  // every thread runs it, and an atomic load would queue the whole grid on one
+  // address; the previous call's store is visible across the kernel boundary.
   const unsigned resSeq = *EpResSeq<npes>() + 1u;
   // p's base for this rank's rows, for the push combine's landing offset that the signal to p
   // carries. An RMW like the send counts beside it, so the highest ticket sees it as it sees them.
@@ -1161,12 +1156,6 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   // this rank included, into the rank's total for p and keeps its offset in it; the last of
   // those blocks to arrive reserves the total with one RMW on p's slot word and publishes the
   // base with the call number in one word.
-  //
-  // With kCntX there is no RMW: the last of them stores the total + 1 into p's word of this
-  // rank's row in the count table of every higher rank, and lane p of each block takes as its
-  // base the sum of the totals the lower ranks stored into its own table, so p's rows run in
-  // source rank order and no block waits on a fabric round trip or on the other blocks. A call
-  // without tokens has no last block, so block 0 stores its zeros: a higher rank waits on them.
   constexpr bool kCntX = npes <= 8 && !kDPin;
   static_assert(npes <= WS, "one lane per destination");
   static_assert(kCfg.maxTokPerRank < (1 << 20), "a destination's total is kept in 20 bits");
@@ -2893,8 +2882,6 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       args.destPeTokenCounter[npes + p] = dl;
       args.destPeTokenCounter[p] = 0;
     }
-    // Every block took its base before drawing a ticket, and a lower rank stores the next
-    // call's row only after the combine between the two calls.
     if constexpr (kCntX) {
       unsigned* const tbl = EpLocal<unsigned>(win, args.offTokOff + kEpCntOff);
       for (int i = laneId; i < myPe * npes; i += WS)
@@ -2970,9 +2957,6 @@ __device__ __forceinline__ void EpCrossDeviceBarrier1250x(EpArgs args, bool need
       args.xdbFlag[b] = phase + 1;
   }
 
-  // Without the grid rendezvous, a small world's blocks each poll the peers' arrival flags
-  // themselves rather than wait for block 0 to forward them. A wide world keeps the forwarding:
-  // there npes lanes of every block would poll the same npes flags.
   if constexpr (npes <= 8) {
     if (!needGridRendezvous) {
       if (thdId < npes) {
@@ -4882,7 +4866,6 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
   const unsigned char* const src = reinterpret_cast<const unsigned char*>(args.inpTokenBuf);
   int* const rSrc = args.recvToSrc;
   int* const rIdx = args.recvIdx;
-  // A wave reads kPushB of its items before it sends any: an item's stores wait on its loads.
   constexpr int kPushB = 4;
   const int nItems = nRecv * kParts;
   for (int it0 = wv; it0 < nItems; it0 += kPushB * nWaves) {
@@ -5203,8 +5186,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           : (((int)((hiddenDim + _cPullChunks - 1) / _cPullChunks) + _cPullRowElems - 1) /
              _cPullRowElems) *
                 _cPullRowElems;
-  // The pipelined pass keeps two sets of a warp's rows in the same slots, so its tile is half a
-  // slot, rounded down to the fold's stride.
   const int _cPipeTileElems =
       (int)(_cPullSlotBytes / 2 / sizeof(TokT)) / _cPullFoldElems * _cPullFoldElems;
   const int _cPullWarpElems =
@@ -5530,8 +5511,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
 
       bool _pullDone = false;
       if constexpr (_cPullType) {
-        // Folds _n elements of each live row of the tile set at _cT, the live rows packed in source
-        // order _rowStride apart, into outPtr + _off.
         auto _cFold = [&](const TokT* _cT, size_t _off, int _n, int _rowStride, int _nRed) {
 #define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
           __threadfence_block();
@@ -5549,8 +5528,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
           constexpr bool _cFoldMix =
               std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
-          // The live rows are packed in order: row j sits at the count of live rows before it. A
-          // dead row reads row 0, the first live one, and is weighted 0.
           int _zRow[_cRedSrcMax];
           [[maybe_unused]] float _zMul[_cRedSrcMax];
           {
@@ -5639,7 +5616,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           }
 #undef _CROW_DEAD
         };
-        // A chunk shorter than one TDM row is summed straight from peer memory.
         auto _cFoldPeers = [&](size_t _off, int _n, int _nSrc) {
           for (int _e = laneId; _e < _n; _e += WS) {
             float _acc = 0.0f;
@@ -5650,9 +5626,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             outPtr[_off + _e] = T(_acc);
           }
         };
-        // Overlap only where a warp holds a single item longer than both sets of rows together:
-        // the next chunk's rows load into one set while the other is folded. Shorter items, and
-        // warps that walk several items, are faster as one set of full-size chunks.
         const bool _cPipe =
             __builtin_amdgcn_readfirstlane((int)(_cPullOk && (int)validAccumCount <= _cPullSrcMax &&
                                                  _cPipeTileElems >= _cPullRowElems &&
@@ -5691,10 +5664,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                                    (int)(_offN < hiddenDimSize &&
                                          (hiddenDimSize - _offN) * sizeof(TokT) >= 128)) != 0;
             if (_more) {
-              // The set being refilled was last read by the previous chunk's fold.
               asm volatile("s_wait_dscnt 0x0" ::: "memory");
               _cIssue(_offN, _cBuf ^ 1);
-              // Only the loads just issued may still be in flight.
               switch (_cLive) {
                 case 1:
                   __builtin_amdgcn_s_wait_tensorcnt(1);
@@ -5732,8 +5703,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           }
           _pullDone = true;
         } else if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
-          // The slots of the ranks this item does not reach lengthen the rows of those it does:
-          // the fewest chunks that fit the warp's slots, split evenly at the fold's stride.
           const int _cCap = (_cPullSrcMax * _cPullWarpElems / (_cLive > 0 ? _cLive : 1)) /
                             _cPullFoldElems * _cPullFoldElems;
           int _cTile = _cPullTileElems;

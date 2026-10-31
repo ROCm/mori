@@ -55,8 +55,6 @@ struct EpRequest {
   bool combineFp4 = false;
   bool combineFp4F32Scale = false;
   bool combineFp8 = false;
-  // Read by nothing. aiter's mega_moe still passes tok_off_ext, and the binding rejects a
-  // request field the schema lacks; drop it once aiter stops.
   bool tokOffExt = false;
   int callTokMax = 0;
   bool ll128 = false;

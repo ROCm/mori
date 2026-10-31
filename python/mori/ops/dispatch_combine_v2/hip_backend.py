@@ -268,17 +268,6 @@ def push_land_rows(cfg) -> int:
 
 
 def ll128_layout(cfg):
-    """How an intranode op of this config takes LL128, or None when it does not:
-    {"dispatch": (block, warp), "combine": (block, warp), "max_tok": n, "region_names": {...}},
-    without "dispatch" when only the combine takes it.
-
-    A call takes the LL128 plans when it has at most n tokens on every rank, and its combine
-    takes them with it. They are built for n tokens a rank, max_recv world_size * n, and bind
-    region_names. Below the op's capacity they run next to the schedule's plans, which keep
-    the larger calls, and on a push-quant op the snapshot dispatches too.
-    None for an AsyncLL op: its kernel set holds AsyncLL's plans only, so there is no LL128
-    plan for _pick to return.
-    """
     if cfg.is_internode or cfg.async_ll:
         return None
     if cfg.quant_type == "none" and cfg.combine_dtype is not torch.bfloat16:
@@ -310,13 +299,6 @@ def ll128_layout(cfg):
 
 
 class TokOffExt:
-    """Allocates nothing; aiter's mega_moe still asks wanted(), builds one and passes
-    ``peers`` to dispatch.
-
-    The slot allocator word is always the cco window's tok_off, and no kernel reads
-    EpArgs.tokOffPeers. Remove this once aiter stops importing it.
-    """
-
     peers = None
 
     @staticmethod
@@ -455,9 +437,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # returns (EpFp4LandTo; dispatch writes it, combine reads it).
         self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
         self.total_recv = torch.zeros(1, **i32)
-        # A split op's LL128 calls count on their own int: the schedule's dispatch stores its
-        # total and leaves it there, while the LL128 dispatch adds from 0 and its combine clears.
-        # total_recv is whichever of the two the last dispatch used.
         self._recv = self.total_recv
         self._ll_recv = torch.zeros(1, **i32) if self._ll128_split is not None else None
         self._snapshot_zeroes_count = self._ll128_split is not None or (
@@ -796,10 +775,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
 
     def _snapshot_recv_views(self, disp_spec):
-        """(recv_to_src, recv_idx) int32 views of the arena, for a snapshot handle of an LL128
-        dispatch to copy: its combines read each slot's source and ids through
-        EpArgs::recvToSrc / recvIdx, which the LL128 dispatch writes here from this rank.
-        None when the combine is not LL128."""
         if disp_spec == _LL_SPEC:
             names, cap = ("ll_recv_to_src_token", "ll_out_idx"), self._ll_recv_cap
         else:
@@ -839,9 +814,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return rev // n * self.cfg.max_num_inp_token_per_rank + rev % n
 
     def _pick(self, num_tokens, snapshot=False):
-        """The LL128 plans for a call of at most max_tok tokens, except a snapshot one on a
-        push-quant op: that LL128 combine reads the slot map from the arena, not the handle.
-        """
         split = self._ll128_split
         if (
             split is not None
@@ -1892,7 +1864,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return internode if self.cfg.is_internode else intranode
 
     def _recv_region(self, name):
-        """The region the last dispatch delivered `name` to, and its rows."""
         if self._ll_last:
             return "ll_" + name, self._ll_recv_cap
         return self._region(name), self._recv_cap
@@ -1991,16 +1962,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 
     def _dispatch_caps(self, cfg, spec):
-        """The call sizes to build `spec`'s dispatch for, ascending: the edge of each
-        schedule bucket that picks it, and the plan's capacity for the open bucket and
-        for the last one, which _pick also gives the counts past every edge. A gfx125x
-        dispatch compiles the code sized to one call out of its bound
-        (EpCfg::callTokMax), so a small bucket does not carry the large one's paths
-        (EP16 fp4 512 tokens, 64x16). Elsewhere the bound is not read: one plan.
-        Below 16 ranks there is one plan too: EP8 fp4 64x16 sized to 1024 leaves out
-        kPlainMeta and kRowPre and dispatched 1 / 64 tokens 0.2-0.5 / 0.1-0.3 us slower
-        than sized to the plan (3 alternating rounds, ab_1012_065929_2397421); no EP4
-        or EP8 bucket measured faster."""
         cap = int(cfg.max_num_inp_token_per_rank)
         if (
             not self._is1250
@@ -2077,7 +2038,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 )
             own = total_recv is self._recv or total_recv is self._ll_recv
             if clears and not own:
-                # The LL128 combine clears the count it reads; a snapshot handle combines again.
                 total_recv = total_recv.clone()
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,

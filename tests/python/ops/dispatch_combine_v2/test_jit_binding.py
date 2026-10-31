@@ -293,13 +293,7 @@ def test_every_arena_region_is_reported_in_args_order():
 def _reference_regions(
     ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave, gfx125x
 ):
-    """hip_backend._regions as it was before the plans reported sizes.
-
-    The deliberate changes: the push combine's row flags are only reserved
-    where the overlapped reduce can run (EpCombinePushOvlAny), and the gfx125x
-    dispatch of up to 8 ranks keeps a count table, a word per source and
-    destination, from byte 256 of tok_off.
-    """
+    """hip_backend._regions as it was before the plans reported sizes."""
     cap = ws * max_tok
     out_tok = cap * comb_tok
     if push:

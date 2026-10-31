@@ -289,7 +289,7 @@ TEST(Sizes, RegionsFollowTheRecvCapacity) {
   EpCfg c;  // ws 8, 128 tok/rank -> 1024 slots, topk 8
   c.scaleBytes = 224;
   EXPECT_EQ(EpRegionTokOffBytes(c), 4u);
-  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 256u + 8 * 8 * 4);  // the count table
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 256u + 8 * 8 * 4);
   EXPECT_EQ(EpRegionRecvNumBytes(c), 2u * 8 * 4);
   EXPECT_EQ(EpRegionRecvToSrcBytes(c), 1024u * 4);
   EXPECT_EQ(EpRegionOutIdxBytes(c), 1024u * 8 * 4);
@@ -300,7 +300,7 @@ TEST(Sizes, RegionsFollowTheRecvCapacity) {
   c.scaleBytes = 0;
   EXPECT_EQ(EpRegionOutScalesBytes(c), 0u);
   c.worldSize = 16;
-  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 4u);  // no count table past 8 ranks
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 4u);
 }
 
 TEST(Sha256, KnownVectors) {
