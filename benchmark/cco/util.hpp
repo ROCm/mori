@@ -48,7 +48,7 @@ enum class PutScope { kThread, kWarp, kBlock, kThreadAgg };
 
 // How an SDMA op waits for local completion (latency kernels). Named after the
 // API the kernel calls; both give the same sender-side guarantee at different cost.
-//   kQuiet  — quietQueue(): wait for the engine's read pointer to pass our wptr.
+//   kQuiet  — quietQueue(): wait until the engine has run past our wptr.
 //   kSignal — put carries a trailing ATOMIC into our own signalBuf slot, then
 //             waitSignal() polls it.
 enum class SdmaComp { kQuiet, kSignal };

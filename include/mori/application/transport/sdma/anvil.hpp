@@ -56,6 +56,7 @@ class SdmaQueue {
  private:
   uint64_t* cachedWptr_;
   uint64_t* committedWptr_;
+  uint64_t* retiredWptr_;
   void* queueBuffer_;
   HsaQueueResource queue_;
   SdmaQueueDeviceHandle* deviceHandle_;

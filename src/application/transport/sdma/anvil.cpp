@@ -257,9 +257,12 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
       hipExtMallocWithFlags((void**)&cachedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
   CHECK_HIP_ERROR(
       hipExtMallocWithFlags((void**)&committedWptr_, sizeof(uint64_t), hipDeviceMallocUncached));
+  CHECK_HIP_ERROR(
+      hipExtMallocWithFlags((void**)&retiredWptr_, 2 * sizeof(uint64_t), hipDeviceMallocUncached));
 
   uint64_t cachedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
   uint64_t committedWptr = (uint64_t)*(queue_.Queue_write_ptr_aql);
+  uint64_t retiredWptr[2] = {committedWptr, committedWptr};
   SdmaQueueDeviceHandle handle = {
       .queueBuf = static_cast<uint32_t*>(queueBuffer_),
       .rptr = queue_.Queue_read_ptr_aql,
@@ -268,6 +271,7 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
       .cachedWptr = cachedWptr_,
       .committedWptr = committedWptr_,
       .cachedHwReadIndex = (uint64_t)*(queue_.Queue_read_ptr_aql),
+      .retiredWptr = retiredWptr_,
   };
 
   CHECK_HIP_ERROR(
@@ -275,6 +279,7 @@ SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
   CHECK_HIP_ERROR(
       hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
+  CHECK_HIP_ERROR(hipMemcpy(retiredWptr_, retiredWptr, sizeof(retiredWptr), hipMemcpyHostToDevice));
 }
 
 SdmaQueue::~SdmaQueue() {
@@ -282,6 +287,7 @@ SdmaQueue::~SdmaQueue() {
   CHECK_HIP_ERROR(hipFree(deviceHandle_));
   CHECK_HIP_ERROR(hipFree(cachedWptr_));
   CHECK_HIP_ERROR(hipFree(committedWptr_));
+  CHECK_HIP_ERROR(hipFree(retiredWptr_));
   CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
   CHECK_HSAKMT_SUCCESS(hsaKmtFreeMemory(queueBuffer_, SDMA_QUEUE_SIZE), "Failed");
 }
