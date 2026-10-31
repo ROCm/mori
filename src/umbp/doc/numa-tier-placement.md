@@ -122,13 +122,13 @@ shares the standalone server's. In one piece, the arena sits on whichever node
 first touch placed it, so its NUMA node picks the NICs of every rank's RDMA leg
 and half the GPUs copy across sockets. The standalone server therefore lays each
 arena out by NUMA node (`UMBP_DISTRIBUTED_RANGED_SCRATCH_NUMA`): the configured
-bytes are split evenly over the nodes that have GPUs, each part is bound to its
-node and registered on its own, and is cut into one shard per GPU on it unless
-`UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS` sets the arena's total. A call stages
-through a shard on its caller buffer's node, or that node's whole part when it
-needs more than a shard. Memory is the same as one arena per direction. Each
-part is one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the
-AINIC limit above, or back the arenas with hugepages
+bytes are split evenly over the nodes that have GPUs, and each part is bound to
+its node and registered on its own. A call stages through a slice of the part on
+its caller buffer's node: all it needs when it is alone, otherwise an equal
+share among the calls using the part, but never less than one GPU's share of it
+or its largest unit. Memory is the same as one arena per direction. Each part is
+one NIC memory region, so on 4 KiB pages keep a part within 1 GiB, the AINIC
+limit above, or back the arenas with hugepages
 (`UMBP_DISTRIBUTED_RANGED_SCRATCH_USE_HUGEPAGES`).
 
 ## Measured effect

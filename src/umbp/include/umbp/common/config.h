@@ -352,11 +352,10 @@ struct UMBPDistributedConfig {
   size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
 
   // Lay each ranged scratch arena out by NUMA node: its bytes split evenly over
-  // the nodes that have GPUs, each part bound to its node and cut into shards,
-  // one per GPU unless UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS sets the arena's
-  // total, so a remote ranged call stages on its GPU's node.  For a client that
-  // many GPUs share, as the standalone server's is; an in-process client serves
-  // one GPU and keeps one arena.
+  // the nodes that have GPUs, each part bound to its node, so a remote ranged
+  // call stages on its GPU's node.  For a client that many GPUs share, as the
+  // standalone server's is; an in-process client serves one GPU and keeps one
+  // arena.
   bool ranged_scratch_numa_layout = false;
 
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);

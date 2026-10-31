@@ -21,7 +21,6 @@
 // SOFTWARE.
 #include "umbp/distributed/distributed_client.h"
 
-#include <algorithm>
 #include <map>
 #include <mutex>
 #include <set>
@@ -432,9 +431,7 @@ void DistributedClient::AllocateRangedScratch(const UMBPDistributedConfig& dc) {
 }
 
 bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBufferOptions& base) {
-  // An equal part of the bytes per node that has GPUs.  The shards are counted
-  // over the whole arena, as they are for one arena, so a shard is
-  // bytes / shards either way; unset, there is one per GPU.
+  // An equal part of the bytes per node that has GPUs.
   const auto gpus = GpuNumaNodes();
   std::set<int> nodes;
   for (const auto& [device, node] : gpus) nodes.insert(node);
@@ -448,14 +445,6 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
         "[DistributedClient] ranged scratch: {} B is too small for {} NUMA nodes, so one arena",
         bytes, nodes.size());
     return false;
-  }
-  const size_t asked = RangedScratchShardsFromEnv();
-  const size_t shards = std::max<size_t>(1, (asked > 0 ? asked : gpus.size()) / nodes.size());
-  if (asked > 0 && shards * nodes.size() != asked) {
-    MORI_UMBP_WARN(
-        "[DistributedClient] ranged scratch: UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS={} is not a "
-        "multiple of the {} NUMA nodes with GPUs, so {} shards",
-        asked, nodes.size(), shards * nodes.size());
   }
 
   HostMemAllocator allocator;
@@ -474,16 +463,16 @@ bool DistributedClient::LayOutRangedScratchByNuma(size_t bytes, const HostBuffer
         FreeRangedScratch();
         return false;
       }
-      arenas->push_back({handle.ptr, part, node, shards});
+      arenas->push_back({handle.ptr, part, node});
       ranged_scratch_handles_.push_back(handle);
     }
-    layout += (layout.empty() ? "node " : ", node ") + std::to_string(node) + ": " +
-              std::to_string(shards) + " x " + std::to_string((part / shards) >> 10) + " KiB";
+    layout += (layout.empty() ? "" : ", ") + std::to_string(node);
   }
   const HostBufferHandle& first = ranged_scratch_handles_.front();
   MORI_UMBP_INFO(
-      "[DistributedClient] ranged scratch: 2 arenas x {} KiB by NUMA node ({}), {} KiB pages ({})",
-      (part * nodes.size()) >> 10, layout, first.actual_alignment >> 10,
+      "[DistributedClient] ranged scratch: 2 arenas x {} KiB by NUMA node ({} KiB on each of "
+      "nodes {}), {} KiB pages ({})",
+      (part * nodes.size()) >> 10, part >> 10, layout, first.actual_alignment >> 10,
       first.actual_backing == HostBufferBacking::kAnonymousHugetlb ? "hugetlb" : "anonymous");
   return true;
 }
