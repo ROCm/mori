@@ -301,8 +301,8 @@ class PoolClientRangesTest : public ::testing::Test {
     cfg.staging_buffer_size = 1024;
     cfg.dram.buffer_sizes = {kCallerCapacity};
     for (size_t i = 0; i < nodes.size(); ++i) {
-      cfg.ranged_get_scratch.push_back({get_arenas[i].data(), get_arenas[i].size(), nodes[i], 1});
-      cfg.ranged_put_scratch.push_back({put_arenas[i].data(), put_arenas[i].size(), nodes[i], 1});
+      cfg.ranged_get_scratch.push_back({get_arenas[i].data(), get_arenas[i].size(), nodes[i]});
+      cfg.ranged_put_scratch.push_back({put_arenas[i].data(), put_arenas[i].size(), nodes[i]});
     }
     cfg.cache_remote_fetches = false;
     cfg.ranged_locality_prefetch = false;
@@ -698,7 +698,7 @@ TEST_F(PoolClientRangesTest, DistributedScratchHugepageRequestFallsBack) {
 }
 
 // The standalone server's layout: each arena split across the NUMA nodes that have
-// GPUs, one shard per GPU, and a remote ranged read round-trips through it.
+// GPUs, and a remote ranged read round-trips through it.
 TEST_F(PoolClientRangesTest, DistributedScratchLaidOutByNumaNode) {
   auto config = DistributedConfig("ranges-numa-layout", 16 * kObjectSize);
   config.distributed->ranged_scratch_numa_layout = true;
@@ -933,20 +933,13 @@ TEST_F(PoolClientRangesTest, NumaGroupedArenasStageOnTheCallersNode) {
   numa_client->Shutdown();
 }
 
-// One object too big for the WHOLE arena must not decide arena sizing for its
-// batch-mates.  Sharding sizes a call against one shard and falls back to the
-// whole arena exclusively for anything that needs more; asking that question as
-// a batch-wide maximum let the oversized key answer it -- it fails the "fits the
-// full arena" half, exclusivity is switched off for everyone, and a batch-mate
-// that needed the full arena is then rejected at shard size although it was
-// servable before sharding existed.
-//
-// Only bites at shards > 1 (UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS); at the
-// default of 1 the shard IS the arena and this passes either way.
-TEST_F(PoolClientRangesTest, OversizedObjectDoesNotVetoArenaFallbackForItsBatch) {
+// One object too big for the WHOLE arena fails alone: it must not decide the
+// slice its batch-mates get, and a batch-mate that needs the whole arena is
+// still served.
+TEST_F(PoolClientRangesTest, AnObjectBiggerThanTheArenaFailsAlone) {
   const size_t arena = caller_put_scratch_.size();
   const std::string too_big = "veto-too-big";      // > the whole arena: fails either way
-  const std::string needs_all = "veto-needs-all";  // > one shard, <= the arena
+  const std::string needs_all = "veto-needs-all";  // exactly the arena
   std::vector<char> big(arena + kPageSize);
   std::vector<char> fits(arena);
   for (size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>((i * 31 + 7) & 0xff);
