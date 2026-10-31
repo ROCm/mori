@@ -521,7 +521,7 @@ ibv_devinfo | head -20
 sudo docker exec $CONTAINER_NAME bash -c "mori check"
 ```
 
-`mori check` validates the RDMA stack in 6 steps (vendor-specific variants,
+`mori check` validates the RDMA stack in these steps (vendor-specific variants,
 same intent):
 
 1. **firmware & driver** — versions consistent. Firmware that is not
@@ -529,17 +529,36 @@ same intent):
    undetectable) **warns** rather than fails: the host-proxy backend
    (`MORI_ENABLE_HOST_PROXY=1`) does cross-node RDMA without IBGDA, so only
    IBGDA needs the minimum.
+   **AINIC without a usable `nicctl`** — it needs root, and inside a VM it sees
+   no card — falls back to sysfs: firmware from `/sys/class/infiniband/*/fw_ver`,
+   driver from `/sys/module/ionic`, both unprivileged. sudo is the default:
+   `nicctl` runs directly as root, else via passwordless sudo, else it asks for
+   the sudo password once when there is a terminal (Ctrl-D declines). Only when
+   none of that works does it go rootless, skipping the QoS/DCQCN steps with the
+   reason (SL/TC then stay 0) instead of aborting the run.
+   **In a KVM guest** the firmware also **warns** below `1.117.5-a-230`, where
+   RDMA atomics into GPU (dma-buf) memory fail while writes still work.
 2. **QoS / SL / TC** — PFC + lossless TC; selects SL/TC for MORI
 3. **DCQCN** — congestion control enabled on all RoCE devices
 4. **intra-node bandwidth** — `ib_write_bw` full mesh, host memory
    (needs `perftest`)
 5. **inter-node bandwidth** — `ib_write_bw` to a peer: `mori check <peer_ip>`
-6. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
+6. **RDMA atomics** — `ib_atomic_bw` per rail, the server (responder) on GPU
+   memory via `--use_rocm_dmabuf`, the client on host memory. With a peer it runs
+   over the rail-aligned pairs from step 5; without one, each local NIC loops
+   back to itself. A host-memory pass runs first, and each pass repeats
+   `MORI_CHECK_ATOMIC_RUNS` times (default 3), because the AINIC failure depends
+   on the QP slot a run lands on. Any failed run **fails** the check: MORI-EP
+   signals with atomics by default and hangs (`MORI_EP_DISABLE_RDMA_ATOMICS=1`
+   switches InterNodeV1/V1LL to write-based signalling).
+7. **inter-node latency** — `ib_write_lat` to a peer: same peer IP
 
-Steps 5/6 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+Steps 5/7 are skipped without a peer IP — run from both nodes to test cross-node connectivity.
+The `ib_write_bw` meshes cannot stand in for step 6: a host can pass every write
+on GPU memory and fail every atomic into it.
 
-**GPU memory.** Only **Step 5 (inter-node bandwidth)** runs a GPU-memory pass;
-Steps 4 and 6 are host-memory only. Step 5 first runs the host-memory mesh
+**GPU memory.** **Step 5 (inter-node bandwidth)** and **Step 6 (atomics,
+responder side only)** run a GPU-memory pass; Steps 4 and 7 are host-memory only. Step 5 first runs the host-memory mesh
 (reachability across all NIC pairs), then a GPU pass (`--use_rocm`, each NIC on
 its PCIe-closest GPU) over the pairs host memory proved reachable, and finally a
 **serial pass over the rail-aligned pairs** (`local[i]` ↔ `remote[i]`) for the
