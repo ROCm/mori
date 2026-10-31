@@ -531,6 +531,11 @@ void EpDispatchCombineHandle::InitializeOrderMapBuf() {
 
   size_t maxNumInterNodeToken = static_cast<size_t>(config.worldSize) / config.gpuPerNode *
                                 config.MaxNumTokensToSendPerRank() * config.numExpertPerToken;
+  // On gfx1250 the intranode combine barrier (CrossDeviceBarrierIntraNode_1250x) also uses this
+  // buffer as per-block fan-out lines (gridDim.x * MORI_COMB_BARSPREAD uint32). The token-based
+  // size above can be much smaller (8 entries at 1 token per rank, top-k 8, 8 GPUs), and the
+  // barrier then writes past the end of the allocation. Reserve room for 4096 blocks x 16 lines.
+  maxNumInterNodeToken = std::max(maxNumInterNodeToken, static_cast<size_t>(4096) * 16);
   HIP_RUNTIME_CHECK(hipMalloc(&interNodeDispDestTokIdMap, maxNumInterNodeToken * sizeof(index_t)));
   HIP_RUNTIME_CHECK(
       hipMemset(interNodeDispDestTokIdMap, 0, maxNumInterNodeToken * sizeof(index_t)));

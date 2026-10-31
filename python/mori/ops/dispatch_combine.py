@@ -1541,6 +1541,16 @@ class EpDispatchCombineOp:
             is_intranode_combine=True,
             is_push_transport=is_push,
         )
+        if is_push and _is_gfx125x():
+            # The PUSH combine's TDM tiles need about warp_per_block * hidden_dim * elem bytes of LDS,
+            # which can exceed the gfx1250 budget (e.g. 16 warps at hidden 7168 with 4-byte tiles).
+            # Halve warp_per_block until it fits (16 -> 8 in that case) instead of raising.
+            while actual_wpb > 1:
+                try:
+                    self._combine_shared_mem(actual_wpb)
+                    break
+                except ValueError:
+                    actual_wpb //= 2
         self._cached_combine_launch = (actual_bn, actual_rbn, actual_wpb)
         stream = _current_stream()
         self._combine_dtype = input.dtype

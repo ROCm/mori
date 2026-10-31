@@ -186,7 +186,12 @@ __device__ inline void ComputeTokenRoute(EpDispatchCombineArgs<T>& args, int tok
 
   if (laneId < numRanks && expertSlotForMe >= 0) {
     didAlloc = 1;
-    warpSlot = atomicAdd(dispTokOffset, 1);
+    // System scope: on gfx1250 the owning GPU may cache this symmetric counter in its L2 while
+    // peers update it at the memory side, so an agent-scope atomicAdd races with the peers' atomics
+    // and loses updates (duplicate slots, payload mismatch, then a hang). Same scope as the 1250x
+    // dispatch uses.
+    warpSlot = __hip_atomic_fetch_add(dispTokOffset, (index_t)1, __ATOMIC_RELAXED,
+                                      __HIP_MEMORY_SCOPE_SYSTEM);
     assert(warpSlot < config.MaxNumTokensToRecv() &&
            "Total recv token overflow: increase maxTotalRecvTokens");
   }
@@ -450,7 +455,9 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
     }
 
     if (laneId == 0) {
-      args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+      // Peers update this counter with system-scope atomics; reset it at the same scope.
+      __hip_atomic_store(args.dispTokOffsetMemObj->template GetAs<index_t*>(), (index_t)0,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     }
   }
 
