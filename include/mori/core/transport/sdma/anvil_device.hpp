@@ -324,6 +324,8 @@ struct SdmaQueueDeviceHandle {
   uint64_t* committedWptr;
   // local variables
   uint64_t cachedHwReadIndex;
+  // cco quiet: [0] end of the last drain packet the engine ran, [1] last posted.
+  uint64_t* retiredWptr;
 };
 
 struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle {};

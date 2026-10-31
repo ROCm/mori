@@ -364,7 +364,7 @@ struct ccoSdmaContext {
   // signalBuf: local pool indexed by SENDER src: signalBuf[srcLsaRank * n + qId].
   // Written by a put's trailing ATOMIC (localSignal → own pool; remoteSignal →
   // peer's pool via peerSignalPtrs). Polled by waitSignal. Not used by quiet
-  // (quiet drains via rptr/wptr).
+  // (quiet drains via retiredWptr, see ccoSdmaDrainQueues).
   uint64_t* signalBuf;        // [lsaSize * sdmaNumQueue], local
   uint64_t** peerSignalPtrs;  // [lsaSize], peer signalBuf base via IPC
 };
@@ -1385,7 +1385,8 @@ __device__ __forceinline__ CCO_SDMA_PKT_COPY_LINEAR ccoCreateCopyPacket(void* sr
   return copy_packet;
 }
 
-__device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint64* signal) {
+__device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint64* signal,
+                                                                        uint64_t value = 1) {
   CCO_SDMA_PKT_ATOMIC packet = {};
 
   packet.HEADER_UNION.op = CCO_SDMA_OP_ATOMIC;
@@ -1397,8 +1398,8 @@ __device__ __forceinline__ CCO_SDMA_PKT_ATOMIC ccoCreateAtomicIncPacket(HSAuint6
   packet.ADDR_LO_UNION.addr_31_0 = (uint32_t)((uintptr_t)signal);
   packet.ADDR_HI_UNION.addr_63_32 = (uint32_t)((uintptr_t)signal >> 32);
 
-  packet.SRC_DATA_LO_UNION.src_data_31_0 = 0x1;
-  packet.SRC_DATA_HI_UNION.src_data_63_32 = 0x0;
+  packet.SRC_DATA_LO_UNION.src_data_31_0 = (uint32_t)value;
+  packet.SRC_DATA_HI_UNION.src_data_63_32 = (uint32_t)(value >> 32);
 
   return packet;
 }
@@ -1564,6 +1565,8 @@ struct ccoSdmaQueueDeviceHandle {
   uint64_t* committedWptr;
   // local variables
   uint64_t cachedHwReadIndex;
+  // [0] end of the last drain packet the engine ran, [1] of the last one posted.
+  uint64_t* retiredWptr;
 };
 
 // Helper function to force global memory access for the pointer to the queue handle.
@@ -2217,28 +2220,315 @@ inline __device__ void ccoSdmaCommitBlock(ccoSdmaQueueDeviceHandle** deviceHandl
 /* ---------------------------------------------------------------------------------------------- */
 /*                                         Completion Queue                                       */
 /* ---------------------------------------------------------------------------------------------- */
-// Local completion: wait until the engine has consumed everything the CU
-// published on this queue (rptr >= committedWptr). Independent of signals, so it
-// works whatever a put's signal targets (local / peer / none).
-inline __device__ void ccoSdmaDrainQueue(ccoSdmaQueueDeviceHandle& handle) {
-  // Mask the ownership bit: a commit may hold it right now, and target is a
-  // snapshot taken outside the loop below -- keeping the bit would leave rptr
-  // chasing a value near 2^63 forever. The masked value is the last published
-  // position, which is exactly what drain has to wait for.
-  uint64_t target = __hip_atomic_load(impl::global(handle.committedWptr), __ATOMIC_RELAXED,
-                                      __HIP_MEMORY_SCOPE_AGENT) &
-                    ~CCO_SDMA_RINGING;
-  // Aggregate puts that were never commit()ed sit past committedWptr, so this
-  // would return without them having been rung.
+// quiet / quietQueue: wait until the engine has run everything published on a
+// queue (committedWptr at entry), whatever the puts signal.
+// - The read pointer is host memory (libhsakmt) and polling it slows every kernel
+//   on the GPU, so drain posts an ATOMIC ADD64 packet that brings retiredWptr[0],
+//   a device word, to the packet's end, and polls that word instead.
+// - The engine runs a queue in order: the word reaching the target means drained.
+// - If another issuer holds a reservation (cachedWptr != committedWptr), drain
+//   neither rings nor waits for it, and compares the read pointer instead.
+// - Drain takes the doorbell (RINGING bit) and hands it back by compare-and-swap,
+//   never a store: a store can move committedWptr back and hang a later put.
+// - A waiting kernel must stay <= 16 VGPRs (more slows a co-running GEMM ~55%).
+enum ccoSdmaDrainStep : uint32_t {
+  ccoSdmaDrainRetry = 0,   // busy, ringing or full: try again later
+  ccoSdmaDrainPosted = 1,  // a drain packet past the target is in the ring
+  ccoSdmaDrainDone = 2,    // nothing left to wait for
+};
+
+// A handle field that never changes after setup, through the scalar cache.
+template <typename T>
+__device__ __forceinline__ T ccoSdmaHandleField(T const* field) {
+  return *reinterpret_cast<const __attribute__((address_space(4))) T*>(
+      reinterpret_cast<uintptr_t>(field));
+}
+
+// a >= b for ring positions, without a 64-bit VALU compare (VGPRs).
+__device__ __forceinline__ bool ccoSdmaReached(uint64_t a, uint64_t b) {
+  return ((a - b) >> 63) == 0;
+}
+
+__device__ __forceinline__ uint64_t ccoSdmaLoad(uint64_t* p, int scope) {
+  return __hip_atomic_load(impl::global(p), __ATOMIC_RELAXED, scope);
+}
+
+__device__ __forceinline__ uint64_t ccoSdmaLoadUniform(uint64_t* p, int scope) {
+  return impl::waveBcastFirstLane(ccoSdmaLoad(p, scope));
+}
+
+// Post a drain packet behind `target` if the queue is free. Single lane.
+inline __device__ ccoSdmaDrainStep ccoSdmaTryPostDrain(ccoSdmaQueueDeviceHandle* h,
+                                                       uint64_t target) {
+  uint64_t* const cachedWptr = ccoSdmaHandleField(&h->cachedWptr);
+  uint64_t* const committedWptr = ccoSdmaHandleField(&h->committedWptr);
+  HSAuint64* const rptr = ccoSdmaHandleField(&h->rptr);
+  const uint64_t c = ccoSdmaLoadUniform(committedWptr, __HIP_MEMORY_SCOPE_AGENT);
+  if (c & CCO_SDMA_RINGING) return ccoSdmaDrainRetry;
+  if (ccoSdmaLoadUniform(cachedWptr, __HIP_MEMORY_SCOPE_AGENT) != c) {  // reserved
+    return ccoSdmaReached(ccoSdmaLoadUniform(rptr, __HIP_MEMORY_SCOPE_SYSTEM), target)
+               ? ccoSdmaDrainDone
+               : ccoSdmaDrainRetry;
+  }
+  uint64_t seen = c;
+  if (!__hip_atomic_compare_exchange_strong(impl::global(committedWptr), &seen,
+                                            c | CCO_SDMA_RINGING, __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+    return ccoSdmaDrainRetry;
+  }
+  const uint64_t end = c + CCO_SDMA_UNIT;
+  uint64_t readIndex = ccoSdmaLoadUniform(&h->cachedHwReadIndex, __HIP_MEMORY_SCOPE_AGENT);
+  if (!ccoSdmaReached(readIndex + CCO_SDMA_QUEUE_SIZE, end + 1)) {  // CanWriteUpto
+    readIndex = ccoSdmaLoadUniform(rptr, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(impl::global(&h->cachedHwReadIndex), readIndex, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_AGENT);
+  }
+  seen = c;
+  if (!ccoSdmaReached(readIndex + CCO_SDMA_QUEUE_SIZE, end + 1) ||
+      !__hip_atomic_compare_exchange_strong(impl::global(cachedWptr), &seen, end, __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+    // No room, or a put reserved at c meanwhile: hand the doorbell back by CAS.
+    uint64_t mine = c | CCO_SDMA_RINGING;
+    __hip_atomic_compare_exchange_strong(impl::global(committedWptr), &mine, c, __ATOMIC_RELAXED,
+                                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return ccoSdmaDrainRetry;
+  }
+  uint64_t* const retired = ccoSdmaHandleField(&h->retiredWptr);
+  // retiredWptr[1] is written only under the doorbell, so adding end - [1] lands [0] on end.
+  const CCO_SDMA_PKT_ATOMIC pkt = ccoCreateAtomicIncPacket(
+      retired, end - ccoSdmaLoadUniform(retired + 1, __HIP_MEMORY_SCOPE_AGENT));
+  const uint32_t* p = reinterpret_cast<const uint32_t*>(&pkt);
+  uint32_t* dst =
+      reinterpret_cast<uint32_t*>(impl::global(ccoSdmaUnitAt(ccoSdmaHandleField(&h->queueBuf), c)));
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    // One dword at a time through one VGPR (VGPR budget).
+    uint32_t v = __builtin_amdgcn_readfirstlane(p[i]);
+#if defined(__OPTIMIZE__)  // -O0 cannot keep it in an SGPR
+    asm volatile("" : "+s"(v));
+#endif
+    dst[i] = v;
+  }
+  __hip_atomic_store(impl::global(retired + 1), end, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  ccoSdmaPublishStores();  // same publish order as ccoSdmaRingQueueDbr
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  __hip_atomic_store(impl::global(ccoSdmaHandleField(&h->wptr)), end, __ATOMIC_RELAXED,
+                     __HIP_MEMORY_SCOPE_AGENT);
+  __hip_atomic_store(impl::global(ccoSdmaHandleField(&h->doorbell)), end, __ATOMIC_RELAXED,
+                     __HIP_MEMORY_SCOPE_SYSTEM);
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  __hip_atomic_store(impl::global(committedWptr), end, __ATOMIC_RELAXED,
+                     __HIP_MEMORY_SCOPE_AGENT);  // release
+  return ccoSdmaDrainPosted;
+}
+
+// One queue, single lane. Pass 0: try once. Pass 1 (queues pass 0 left busy):
+// retry until posted or done. Pass 2: wait for the newest drain packet.
+inline __device__ ccoSdmaDrainStep ccoSdmaDrainPass(ccoSdmaQueueDeviceHandle* h, int pass) {
+  uint64_t* const retired = ccoSdmaHandleField(&h->retiredWptr);
+  if (pass == 2) {
+    const uint64_t last = ccoSdmaLoadUniform(retired + 1, __HIP_MEMORY_SCOPE_AGENT);
+    while (!ccoSdmaReached(ccoSdmaLoadUniform(retired, __HIP_MEMORY_SCOPE_SYSTEM), last)) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+    return ccoSdmaDrainDone;
+  }
+  uint64_t* const committedWptr = ccoSdmaHandleField(&h->committedWptr);
+  const uint64_t c = ccoSdmaLoadUniform(committedWptr, __HIP_MEMORY_SCOPE_AGENT);
+  const uint64_t target = c & ~CCO_SDMA_RINGING;
   if constexpr (CCO_SDMA_BREAK_ON_RETRIES) {
-    if (__hip_atomic_load(impl::global(handle.cachedWptr), __ATOMIC_RELAXED,
-                          __HIP_MEMORY_SCOPE_AGENT) > target) {
+    // Trap on un-commit()ed Aggregate puts (cachedWptr past committedWptr); a posting
+    // drain is not mistaken for one because it moves committedWptr.
+    if (ccoSdmaLoadUniform(ccoSdmaHandleField(&h->cachedWptr), __HIP_MEMORY_SCOPE_AGENT) > target &&
+        ccoSdmaLoadUniform(committedWptr, __HIP_MEMORY_SCOPE_AGENT) == target) {
       __builtin_trap();  // un-committed Aggregate puts: call commit() first
     }
   }
-  while (__hip_atomic_load(impl::global(handle.rptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) <
-         target) {
+  for (;;) {
+    if (ccoSdmaReached(ccoSdmaLoadUniform(retired, __HIP_MEMORY_SCOPE_SYSTEM), target)) {
+      return ccoSdmaDrainDone;
+    }
+    const ccoSdmaDrainStep step =
+        ccoSdmaReached(ccoSdmaLoadUniform(retired + 1, __HIP_MEMORY_SCOPE_AGENT), target)
+            ? ccoSdmaDrainPosted
+            : ccoSdmaTryPostDrain(h, target);
+    if (step != ccoSdmaDrainRetry || pass == 0) return step;
     __builtin_amdgcn_s_sleep(1);
+  }
+}
+
+// One read of the read pointer (cheap; only polling it is costly): an idle
+// queue is done without a drain packet. `device`: try retiredWptr first.
+inline __device__ bool ccoSdmaDrained(ccoSdmaQueueDeviceHandle* h, bool device = false) {
+  const ccoSdmaQueueDeviceHandle* g = impl::global(h);
+  uint64_t* const committedWptr = impl::global(g->committedWptr);
+  HSAuint64* const rptr = impl::global(g->rptr);
+  const uint64_t target = ccoSdmaLoad(committedWptr, __HIP_MEMORY_SCOPE_AGENT) & ~CCO_SDMA_RINGING;
+  if (device) {
+    asm volatile("" : "+v"(h));  // opaque: the field load stays here, not in VGPRs
+    if (ccoSdmaReached(ccoSdmaLoad(impl::global(h)->retiredWptr, __HIP_MEMORY_SCOPE_SYSTEM),
+                       target))
+      return true;
+  }
+  return ccoSdmaReached(ccoSdmaLoad(rptr, __HIP_MEMORY_SCOPE_SYSTEM), target);
+}
+
+// ccoSdmaTryPostDrain's reservation, per lane. True: the doorbell and the unit
+// at c are ours, and ccoSdmaPostDrainLane must follow without waiting.
+__device__ __forceinline__ bool ccoSdmaReserveDrainLane(ccoSdmaQueueDeviceHandle* g, uint64_t c) {
+  uint64_t seen = c;
+  if (!__hip_atomic_compare_exchange_strong(impl::global(g->committedWptr), &seen,
+                                            c | CCO_SDMA_RINGING, __ATOMIC_RELAXED,
+                                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT))
+    return false;
+  uint64_t ri = ccoSdmaLoad(&g->cachedHwReadIndex, __HIP_MEMORY_SCOPE_AGENT);
+  if (!ccoSdmaReached(ri + CCO_SDMA_QUEUE_SIZE, c + CCO_SDMA_UNIT + 1)) {  // CanWriteUpto
+    ri = ccoSdmaLoad(g->rptr, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(&g->cachedHwReadIndex, ri, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
+  seen = c;
+  if (ccoSdmaReached(ri + CCO_SDMA_QUEUE_SIZE, c + CCO_SDMA_UNIT + 1) &&
+      __hip_atomic_compare_exchange_strong(impl::global(g->cachedWptr), &seen, c + CCO_SDMA_UNIT,
+                                           __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_AGENT))
+    return true;
+  seen = c | CCO_SDMA_RINGING;  // hand the doorbell back by CAS, as above
+  __hip_atomic_compare_exchange_strong(impl::global(g->committedWptr), &seen, c, __ATOMIC_RELAXED,
+                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  return false;
+}
+
+// ccoSdmaTryPostDrain's packet and publish, per lane.
+__device__ __forceinline__ void ccoSdmaPostDrainLane(ccoSdmaQueueDeviceHandle* g, uint64_t c) {
+  uint64_t* const retired = impl::global(g->retiredWptr);
+  const uint64_t end = c + CCO_SDMA_UNIT;
+  const CCO_SDMA_PKT_ATOMIC pkt =
+      ccoCreateAtomicIncPacket(retired, end - ccoSdmaLoad(retired + 1, __HIP_MEMORY_SCOPE_AGENT));
+  const uint32_t* const p = reinterpret_cast<const uint32_t*>(&pkt);
+  uint32_t* const dst =
+      reinterpret_cast<uint32_t*>(impl::global(ccoSdmaUnitAt(impl::global(g->queueBuf), c)));
+#pragma unroll
+  for (int k = 1; k <= 8; ++k) {
+    const int i = k % 8;
+    uint32_t v = p[i];
+    if (i == 0 || i >= 5) {  // constant: from an SGPR at the store
+      v = __builtin_amdgcn_readfirstlane(v);
+#if defined(__OPTIMIZE__)
+      asm volatile("" : "+s"(v));
+#endif
+    }
+    dst[i] = v;
+  }
+  __hip_atomic_store(retired + 1, end, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  asm volatile("" ::: "memory");  // reload the handle fields below
+  ccoSdmaPublishStores();         // same publish order as ccoSdmaRingQueueDbr
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  __hip_atomic_store(impl::global(g->wptr), end, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  __hip_atomic_store(impl::global(g->doorbell), end, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+  __hip_atomic_store(impl::global(g->committedWptr), end, __ATOMIC_RELAXED,
+                     __HIP_MEMORY_SCOPE_AGENT);  // release
+}
+
+// Each calling lane drains its own queue h, all lanes at once (ccoSdmaDrainPass
+// per lane). Only h and the target stay live across the loop (VGPR budget).
+inline __device__ void ccoSdmaDrainLanes(ccoSdmaQueueDeviceHandle* h) {
+  ccoSdmaQueueDeviceHandle* const g = impl::global(h);
+  uint64_t target;
+  {
+    uint64_t* const committedWptr = impl::global(g->committedWptr);
+    HSAuint64* const rptr = impl::global(g->rptr);
+    target = ccoSdmaLoad(committedWptr, __HIP_MEMORY_SCOPE_AGENT) & ~CCO_SDMA_RINGING;
+    if (ccoSdmaReached(ccoSdmaLoad(rptr, __HIP_MEMORY_SCOPE_SYSTEM), target)) return;
+    if (CCO_SDMA_BREAK_ON_RETRIES &&  // as in ccoSdmaDrainPass
+        ccoSdmaLoad(g->cachedWptr, __HIP_MEMORY_SCOPE_AGENT) > target &&
+        ccoSdmaLoad(committedWptr, __HIP_MEMORY_SCOPE_AGENT) == target)
+      __builtin_trap();  // un-committed Aggregate puts: call commit() first
+  }
+  for (uint32_t round = 0;;) {
+    // Winners leave with the whole wave and post at once: a doorbell holder
+    // parked at a divergent exit would block whoever waits behind it.
+    bool won = false;
+    uint64_t c;
+    for (;; ++round, __builtin_amdgcn_s_sleep(1)) {
+      asm volatile("" ::: "memory");  // reload the handle fields (VGPRs)
+      if (ccoSdmaReached(ccoSdmaLoad(g->retiredWptr, __HIP_MEMORY_SCOPE_SYSTEM), target)) return;
+      c = ccoSdmaLoad(g->committedWptr, __HIP_MEMORY_SCOPE_AGENT);
+      if (ccoSdmaReached(ccoSdmaLoad(g->retiredWptr + 1, __HIP_MEMORY_SCOPE_AGENT), target)) {
+        // A drain packet covers us. A few looks at rptr too, which can come first.
+        if (round < 6 && ccoSdmaReached(ccoSdmaLoad(g->rptr, __HIP_MEMORY_SCOPE_SYSTEM), target))
+          return;
+      } else if (ccoSdmaLoad(g->cachedWptr, __HIP_MEMORY_SCOPE_AGENT) != (c & ~CCO_SDMA_RINGING)) {
+        // Another issuer's reservation: only rptr can end the wait, but polling
+        // host memory slows every kernel on the GPU, so look every 16th pass.
+        if (round % 16 == 0 &&
+            ccoSdmaReached(ccoSdmaLoad(g->rptr, __HIP_MEMORY_SCOPE_SYSTEM), target))
+          return;
+      } else if (!(c & CCO_SDMA_RINGING)) {
+        won = ccoSdmaReserveDrainLane(g, c);
+      }
+      if (impl::waveBallot(won)) break;
+    }
+    if (won) ccoSdmaPostDrainLane(g, c);
+  }
+}
+
+// Drain queues row[0, count) of every calling lane. Each lane first looks at its
+// queues itself; if every lane is left with at most one busy queue, the lanes
+// drain those in parallel, otherwise the lowest lane posts on all the busy ones,
+// then waits. Queues from the 32nd on are never skipped.
+inline __device__ void ccoSdmaDrainQueues(ccoSdmaQueueDeviceHandle* const* row, uint32_t count) {
+  uint32_t busy = ~0u;
+#pragma unroll 1
+  for (uint32_t i = 0; i < count && i < 32; ++i)
+    if (ccoSdmaDrained(*impl::global(row + i), true)) busy &= ~(1u << i);
+  const bool many = count > 32;
+  if (count < 32) busy &= (1u << count) - 1;
+  if (!impl::waveBallot(busy != 0 || many)) return;
+  if (!impl::waveBallot((busy & (busy - 1)) != 0 || many)) {
+    if (busy) ccoSdmaDrainLanes(*impl::global(row + __builtin_ctz(busy)));
+    return;
+  }
+  const unsigned me = impl::waveLaneId();
+  uint64_t lanes = impl::waveBallot(true);
+  const int leader = __builtin_ctzll(lanes);
+  uint32_t q = 0;
+  while (lanes) {
+    uint64_t retry = 0, posted = 0;
+#pragma unroll 1
+    for (int pass = 0; pass < 3; ++pass) {
+      uint64_t l = lanes;
+      uint32_t i = q;
+      for (uint32_t j = 0; l && j < 64;) {
+        const int lane = __builtin_ctzll(l);
+        const uint32_t n = __builtin_amdgcn_readlane(count, lane);
+        if (i < n) {
+          const uint64_t bit = 1ull << j++;
+          const bool skip = i < 32 && !((__builtin_amdgcn_readlane(busy, lane) >> i) & 1);
+          if (!skip && (pass == 0 || ((pass == 1 ? retry : posted) & bit))) {
+            const uint64_t r = reinterpret_cast<uint64_t>(row);
+            const uint32_t lo = __builtin_amdgcn_readlane(static_cast<uint32_t>(r), lane);
+            const uint32_t hi = __builtin_amdgcn_readlane(static_cast<uint32_t>(r >> 32), lane);
+            ccoSdmaQueueDeviceHandle* const h = ccoSdmaHandleField(
+                reinterpret_cast<ccoSdmaQueueDeviceHandle* const*>((uint64_t{hi} << 32) | lo) + i);
+            uint32_t step = 0;
+            if (me == static_cast<unsigned>(leader)) step = ccoSdmaDrainPass(h, pass);
+            step = __builtin_amdgcn_readlane(step, leader);
+            if (step == ccoSdmaDrainRetry) retry |= bit;
+            if (step == ccoSdmaDrainPosted) posted |= bit;
+          }
+          ++i;
+        }
+        if (i >= n) {
+          i = 0;
+          l &= l - 1;
+        }
+      }
+      if (pass == 2) {
+        lanes = l;
+        q = i;
+      }
+    }
   }
 }
 
@@ -2655,8 +2945,8 @@ struct ccoSdma {
         s, peer, s.sdmaNumQueue, rect, queueId, static_cast<uint32_t>(comm.lsaRank));
   }
 
-  // quiet: wait until every queue toward `peer` has drained. warp/block take one
-  // queue per lane so the reads overlap; thread scope walks them.
+  // quiet: wait until every queue toward `peer` has drained. warp/block drain one
+  // queue per lane, all at once; thread scope too when each lane has at most one busy queue.
   template <typename Coop = ccoCoopThread>
   __device__ inline void quiet(int peer) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
@@ -2665,10 +2955,15 @@ struct ccoSdma {
     const ccoSdmaContext& s = comm.sdma;
     const uint32_t n = s.sdmaNumQueue;
     Coop coop{};
-    for (uint32_t q = static_cast<uint32_t>(coop.thread_rank()); q < n;
-         q += static_cast<uint32_t>(coop.size())) {
-      ccoSdmaQueueDeviceHandle handle = ccoSdmaLoadQueueHandle(s.deviceHandles + peer * n + q);
-      ccoSdmaDrainQueue(handle);
+    ccoSdmaQueueDeviceHandle* const* row = s.deviceHandles + peer * n;
+    const uint32_t rank = coop.thread_rank();
+    if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+      ccoSdmaDrainQueues(row, n);
+    } else if (std::is_same_v<Coop, ccoCoopWarp> || n <= static_cast<uint32_t>(coop.size())) {
+      // One queue per lane, all lanes at once (sdmaNumQueue <= 8 <= warp size).
+      if (rank < n) ccoSdmaDrainLanes(*impl::global(row + rank));
+    } else if (impl::waveLaneId() == 0) {
+      ccoSdmaDrainQueues(row, n);  // a block smaller than n is a single wave
     }
     coop.sync();  // completion visible to the whole group before returning
   }
@@ -2685,9 +2980,7 @@ struct ccoSdma {
     const uint32_t n = s.sdmaNumQueue;
     Coop coop{};
     if (queueId >= 0 && static_cast<uint32_t>(queueId) < n && coop.thread_rank() == 0) {
-      ccoSdmaQueueDeviceHandle handle =
-          ccoSdmaLoadQueueHandle(s.deviceHandles + peer * n + queueId);
-      ccoSdmaDrainQueue(handle);
+      ccoSdmaDrainLanes(*impl::global(s.deviceHandles + peer * n + queueId));
     }
     coop.sync();
   }

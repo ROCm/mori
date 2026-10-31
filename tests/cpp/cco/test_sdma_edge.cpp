@@ -20,7 +20,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// test: cco sdma edge cases — three behaviors not covered by the put/get tests:
+// test: cco sdma edge cases not covered by the put/get tests:
 //
 //   1. Ring-buffer wraparound, uniform slot size. Post WRAP_ITERS puts on a
 //      single queue so the cumulative command bytes far exceed
@@ -37,6 +37,8 @@
 //      leaves the write pointer on offsets that are not a multiple of the largest
 //      slot — the case where a slot can reach past the ring end. Phase 1 cannot
 //      catch it: same-size puts keep the offset slot-aligned forever.
+//   5. quiet racing puts: quiet's drain packets race other puts' reservations.
+//      A lost committedWptr update hangs a later put, so the phase has a deadline.
 //
 // Requires MORI_ENABLE_SDMA=1; otherwise the comm has no SDMA queues and SKIPs.
 
@@ -50,6 +52,8 @@ static const int WRAP_ITERS = 8192;  // ~60B/put*8192 ≈ 480KB > 256KB queue �
 // laps, enough to land one on the last slot before the ring end.
 static const int MIXWRAP_ROUNDS = 8192;
 static const float ZERO_MARKER = 7.0f;  // recv preset; must survive a 0-byte put untouched
+static const int STRESS_ITERS = 2048;
+static const int STRESS_DEADLINE_MS = 30000;
 
 // 1. wraparound: thread p issues WRAP_ITERS identical puts on peer p's queue 0,
 //    then a single quiet(p) drains all of them. Last-writer-wins; all writes are
@@ -98,6 +102,30 @@ __global__ void SdmaMixWrapKernel(mori::cco::ccoWindowDevice* sendWin,
     sdma.put<ccoCoopThread, false, false>(p, dst, dstOff, src, srcOff, perPair, 0);
     sdma.put<ccoCoopThread, true, false>(p, dst, dstOff, src, srcOff, perPair, 0);
     sdma.put<ccoCoopThread, true, true>(p, dst, dstOff, src, srcOff, perPair, 0);
+  }
+  sdma.quiet(p);
+}
+
+// 5. stress: thread p puts to peer p, block b on queue (b / 6) % sdmaNumQueue; one
+//    block in six quiets after each put, the rest sleep irregular gaps. Both the
+//    queue spread and the gaps are needed to catch a plain-store doorbell hand-back.
+__global__ void SdmaQuietStressKernel(mori::cco::ccoWindowDevice* sendWin,
+                                      mori::cco::ccoWindowDevice* recvWin, size_t count,
+                                      mori::cco::ccoDevComm devComm) {
+  using namespace mori::cco;
+  ccoSdma sdma{devComm};
+  int p = threadIdx.x;
+  if (p >= devComm.lsaSize || p == devComm.rank) return;
+  size_t perPair = count * sizeof(float);
+  int q = (blockIdx.x / 6) % static_cast<int>(devComm.sdma.sdmaNumQueue);
+  for (int it = 0; it < STRESS_ITERS; it++) {
+    sdma.put(p, reinterpret_cast<ccoWindow_t>(recvWin), devComm.rank * perPair,
+             reinterpret_cast<ccoWindow_t>(sendWin), p * perPair, perPair, q);
+    if (blockIdx.x % 6 == 1) {
+      sdma.quiet(p);
+    } else {
+      for (int k = (it * 7 + blockIdx.x) % 11; k > 0; k--) __builtin_amdgcn_s_sleep(127);
+    }
   }
   sdma.quiet(p);
 }
@@ -313,11 +341,24 @@ int run_test(int rank, int nranks, const mori::cco::ccoUniqueId& uid) {
       }
     }
 
+    // ── phase 5: stress, quiet racing puts (the check is that the kernel ends) ──
+    mori::cco::ccoBarrierAll(comm);
+    SdmaQuietStressKernel<<<64, 64, 0, stream>>>(sendWin, recvWin, COUNT, devComm);
+    int waited = 0;
+    for (; hipStreamQuery(stream) != hipSuccess && waited < STRESS_DEADLINE_MS; waited += 10)
+      usleep(10 * 1000);
+    mori::cco::ccoBarrierAll(comm);
+    if (waited >= STRESS_DEADLINE_MS) {
+      printf("[rank %d] stress=FAIL: kernel still running after %d ms\n", rank, waited);
+      fflush(stdout);
+      _exit(1);  // a hung kernel cannot be cancelled
+    }
+
     ok = ok_wrap && ok_zero && ok_tiny && ok_mixwrap;
     HIP_CHECK(hipStreamDestroy(stream));
-    printf("[rank %d] wrap=%s zero=%s tiny=%s mixwrap=%s %s\n", rank, ok_wrap ? "PASS" : "FAIL",
-           ok_zero ? "PASS" : "FAIL", ok_tiny ? "PASS" : "FAIL", ok_mixwrap ? "PASS" : "FAIL",
-           ok ? "PASSED" : "FAILED");
+    printf("[rank %d] wrap=%s zero=%s tiny=%s mixwrap=%s stress=PASS %s\n", rank,
+           ok_wrap ? "PASS" : "FAIL", ok_zero ? "PASS" : "FAIL", ok_tiny ? "PASS" : "FAIL",
+           ok_mixwrap ? "PASS" : "FAIL", ok ? "PASSED" : "FAILED");
     fflush(stdout);
   }
 

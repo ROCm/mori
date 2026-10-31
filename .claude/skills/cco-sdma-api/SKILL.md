@@ -198,10 +198,8 @@ call syncs the group before returning, so the completion is visible to everyone.
 | `quiet<Coop>(peer)` | you used several queues | one queue per lane at warp/block scope; each idle queue still costs one uncached read |
 | `localSignal` + `waitSignal` | you want the last ~0.1–0.6 µs, or partial completion | you maintain `expected` |
 
-`waitSignal` is slightly faster than `quiet` at every size (0.24 µs at 8B, 0.62
-at 64KB) because the signal slot is ordinary device memory while the
-queue read pointer is not. `quiet` needs no bookkeeping — prefer it unless the
-difference matters.
+`waitSignal` is slightly faster than `quiet`, which posts and waits on a drain
+packet. `quiet` needs no bookkeeping — prefer it unless the difference matters.
 
 Do not reuse a source buffer before the op completes.
 

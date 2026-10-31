@@ -246,8 +246,8 @@ def build_sdma_phases(
     (``anvil.cpp:237``).
 
     ``signal`` selects ``put``'s trailing local ATOMIC. It is off by default:
-    ``quiet``/``quietQueue`` drain the queue's read pointer and are documented as
-    "independent of the signals" (``include/mori/cco/cco.hpp:1707``), and nothing
+    ``quiet``/``quietQueue`` drain the queue itself and are documented as
+    "independent of the signals" (``ccoSdma::quiet`` in ``include/mori/cco/cco.hpp``), and nothing
     here polls a signal, so the packet would be pure overhead. Exposed because
     FlyDSL's own ``Sdma._xfer`` docstring claims the opposite -- that a no-signal
     put "cannot be drained by quiet" -- and that claim is worth being able to
