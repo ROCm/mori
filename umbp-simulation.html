@@ -1,0 +1,756 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>UMBP storage and transfer simulation &mdash; MORI development (2f965883) documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=9d9266da"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="MORI-VIZ (Visualizer)" href="PROFILER.html" />
+    <link rel="prev" title="MORI UMBP Single-Node Smoke Test" href="MORI-UMBP-SINGLE-NODE-GUIDE.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search"  style="background: #C00000" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            MORI
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Install MORI</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#installation">Installation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#validate-the-environment">Validate the environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#install">Install</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#from-pypi-stable-release">From PyPI (stable release)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#nightly-pre-built-tested-daily">Nightly (pre-built, tested daily)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="installation.html#from-source">From source</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="installation.html#verify-installation">Verify installation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#optional-flydsl-integration">Optional FlyDSL integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#next-steps">Next steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart.html">Quickstart</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#runnable-checks">Runnable checks</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#api-sketches">API sketches</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ep-dispatch-and-combine">MORI-EP: Dispatch and Combine</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-io-point-to-point-transfers">MORI-IO: Point-to-Point Transfers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-shmem-symmetric-memory">MORI Shmem: Symmetric Memory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#mori-ir-device-bitcode-for-gpu-kernels">MORI-IR: Device Bitcode for GPU Kernels</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#profiling-with-mori-viz">Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="ep_backends.html">Choosing an EP API and backend</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#epv2-configuration-and-lifecycle">EPv2 configuration and lifecycle</a></li>
+<li class="toctree-l2"><a class="reference internal" href="ep_backends.html#validation-before-tuning">Validation before tuning</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-GUIDE.html">MORI-EP User Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#kernel-types">1. Kernel Types</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#configuration">2. Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineconfig">EpDispatchCombineConfig</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#operator-api">3. Operator API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#epdispatchcombineop">EpDispatchCombineOp</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch">dispatch()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine">combine()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#split-dispatch-combine-send-recv">Split dispatch/combine (send + recv)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reset">reset()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-dispatch-src-token-pos">get_dispatch_src_token_pos()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#get-registered-combine-input-buffer">get_registered_combine_input_buffer()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#standard-moe-compatibility-deepep">4. Standard MoE Compatibility (DeepEP)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#dispatch-standard-moe">dispatch_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#combine-standard-moe">combine_standard_moe()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-dispatch-output">convert_dispatch_output()</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#convert-combine-input">convert_combine_input()</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#initialization">5. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#launch-configuration">6. Launch Configuration</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#manual-mode-default">Manual Mode (Default)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#auto-mode">Auto Mode</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#complete-example">7. Complete Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#environment-variables">8. Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#benchmarking">9. Benchmarking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node">Intra-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node">Inter-node</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#reference-performance-deepseek-v3-config">Reference Performance (DeepSeek V3 config)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning">10. Tuning</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-config-files">Tuning Config Files</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#intra-node-tuning">Intra-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#inter-node-tuning">Inter-node Tuning</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-GUIDE.html#tuning-on-a-new-gpu-platform">Tuning on a New GPU Platform</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#profiling-with-mori-viz">11. Profiling with MORI-VIZ</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#framework-integration">12. Framework Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#build-options">Build Options</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-SHMEM-GUIDE.html">MORI Shmem Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-memory">Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#processing-element-pe">Processing Element (PE)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#symmetric-heap">Symmetric Heap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization">2. Initialization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-1-pytorch-process-group-recommended">Method 1: PyTorch Process Group (Recommended)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-2-unique-id-no-pytorch-distributed">Method 2: Unique ID (No PyTorch Distributed)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#method-3-mpi-communicator-c-mpi-environments">Method 3: MPI Communicator (C++ / MPI environments)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-comparison">Initialization Comparison</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#finalization">Finalization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#query-apis">3. Query APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#memory-management">4. Memory Management</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#allocating-symmetric-memory">Allocating Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#freeing-symmetric-memory">Freeing Symmetric Memory</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#registering-existing-buffers">Registering Existing Buffers</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#p2p-address-translation">5. P2P Address Translation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#synchronization">6. Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#hip-module-init-triton-integration">7. HIP Module Init (Triton Integration)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#initialization-flags">8. Initialization Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#rail-only-connections">Rail-only connections</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-SHMEM-GUIDE.html#source-files">Source Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-CCO-GUIDE.html">MORI CCO Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#quick-reference">Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#concepts">1. Concepts</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#communicator-ccocomm">Communicator (<code class="docutils literal notranslate"><span class="pre">ccoComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#symmetric-memory-and-windows">Symmetric memory and windows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator-ccodevcomm">Device communicator (<code class="docutils literal notranslate"><span class="pre">ccoDevComm</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-CCO-GUIDE.html#teams">Teams</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#initialization">2. Initialization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#memory-and-windows">3. Memory and Windows</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-communicator">4. Device Communicator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#host-barrier">5. Host Barrier</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#device-side-programming">6. Device-Side Programming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#c-api">8. C++ API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-CCO-GUIDE.html#environment-variables">9. Environment Variables</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IR-GUIDE.html">MORI-IR Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#host-side-python-api">1. Host-Side Python API</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-framework-agnostic"><code class="docutils literal notranslate"><span class="pre">mori.ir</span></code> (framework-agnostic)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#mori-ir-triton-triton-specific-reference-backend"><code class="docutils literal notranslate"><span class="pre">mori.ir.triton</span></code> (Triton-specific reference backend)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-bitcode">2. Device Bitcode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#device-functions">3. Device Functions</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#query">Query</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#point-to-point">Point-to-Point</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-thread-warp-block">PutNbi (Thread / Warp / Block)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#putnbi-with-signal">PutNbi with Signal</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#immediate-put">Immediate Put</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#atomics">Atomics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#wait">Wait</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IR-GUIDE.html#synchronization">Synchronization</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-triton">4. Integration Example: Triton</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#integration-example-raw-bitcode-no-framework">5. Integration Example: Raw Bitcode (no framework)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#bitcode-jit-compilation">6. Bitcode JIT Compilation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#examples">7. Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#testing">8. Testing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IR-GUIDE.html#known-limitations">Known Limitations</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-GUIDE.html">MORI-IO Introduction</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#design-concepts">Design &amp; Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#workflow">Workflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#architecture">Architecture</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#python-api-quick-reference">Python API Quick Reference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#example-basic-read-write">Example: Basic Read/Write</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#environment-configuration">Environment &amp; Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#simulation-mode">Simulation Mode</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#profiling-mori-io-with-roctx-markers">Profiling MORI-IO with ROCTX Markers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-GUIDE.html#source-files">Source Files</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-GUIDE.html#nic-fault-injection-test-builds">NIC fault injection (test builds)</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html">MORI UMBP Single-Node Smoke Test</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#configuration-inputs">Configuration Inputs</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#script-constants">Script constants</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#runtime-environment-variables">Runtime environment variables</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#launch-steps">Launch Steps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#core-dumps">Core Dumps</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-SINGLE-NODE-GUIDE.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">UMBP storage and transfer simulation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#enable">Enable</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#standalone-ci">Standalone / CI</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#profile-and-model">Profile and model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#cross-peer-sharing">Cross-peer sharing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#timing-and-limits">Timing and limits</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="PROFILER.html">MORI-VIZ (Visualizer)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#instrumentation">Instrumentation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#include-headers">1. Include Headers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#define-profiler-context">2. Define Profiler Context</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#add-trace-points">3. Add Trace Points</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#build-code-generation">Build &amp; Code Generation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#enabling-the-profiler">Enabling the Profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#code-generation">Code Generation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#python-analysis">Python Analysis</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#device-side-elapsed-time-measurement">Device-side Elapsed Time Measurement</a></li>
+<li class="toctree-l3"><a class="reference internal" href="PROFILER.html#viewing-the-trace">Viewing the Trace</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="PROFILER.html#best-practices">Best Practices</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Benchmarks</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI-EP-BENCHMARK.html">MORI-EP Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#intra-node">Intra-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-intranode-kernels">Profiling intranode kernels</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-EP-BENCHMARK.html#inter-node">Inter-node</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nic-selection">NIC Selection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#bandwidth-computation">Bandwidth Computation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#rdma-bandwidth">RDMA bandwidth</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="MORI-EP-BENCHMARK.html#algo-bw-vs-physical-bw">Algo BW vs Physical BW</a></li>
+</ul>
+</li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#nvl-xgmi-bandwidth">NVL / XGMI bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#why-deepep-and-mori-rdma-token-counts-are-equivalent">Why DeepEP and Mori RDMA token counts are equivalent</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#combine">Combine</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#reference-print-bw-values-py">Reference: <code class="docutils literal notranslate"><span class="pre">print_bw_values.py</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#profiling-internode-kernels">Profiling Internode Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-EP-BENCHMARK.html#analyzing-traces-with-analyze-ep-kernel-trace-py">Analyzing traces with <code class="docutils literal notranslate"><span class="pre">analyze_ep_kernel_trace.py</span></code></a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html">MORI GEMM + All-Reduce Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#summary">Summary</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#running-the-benchmark">Running the benchmark</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#modes-and-quantisation">Modes and quantisation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-fp8-wire-s-knobs">The fp8 wire’s knobs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#the-gemm-on-its-own">The GEMM on its own</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#measurement-discipline">Measurement discipline</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-GEMM-AR-BENCHMARK.html#reproducing-the-end-to-end-numbers">Reproducing the end-to-end numbers</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-IO-BENCHMARK.html">MORI-IO Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#which-benchmark-to-use">Which benchmark to use</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#c-benchmark-default-nixlbench-matching">C++ Benchmark (default, nixlbench-matching)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#build">Build</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#run-two-nodes">Run (two nodes)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#sweep-modes">Sweep modes</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#differences-from-the-python-flags">Differences from the Python flags</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#python-benchmark">Python Benchmark</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#fabric-cross-node-scale-up-ualink-super-node">Fabric (cross-node scale-up UALink super-node)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-arguments">Benchmark Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-read">Results: Thor2 RDMA Read</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-thor2-rdma-write">Results: Thor2 RDMA Write</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#message-size-sweep">Message Size Sweep</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#batch-size-sweep">Batch Size Sweep</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#results-cx7-rdma-batch-size-1">Results: CX7 RDMA (Batch Size = 1)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#write">Write</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#read">Read</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-IO-BENCHMARK.html#benchmark-tuning-guide">Benchmark Tuning Guide</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#recommended-starting-config">Recommended starting config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-help">Parameters that help</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#the-merged-wr-size-limit">The merged-WR size limit</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#parameters-that-usually-do-not-help-or-can-hurt">Parameters that usually do not help (or can hurt)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-IO-BENCHMARK.html#host-cpu-vs-gpu-memory">Host (CPU) vs GPU memory</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html">MORI UMBP PD Disaggregation Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#table-of-contents">Table of Contents</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology">Topology</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-1-start-docker-on-all-nodes">Step 1 — Start Docker on all nodes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-2-start-grafana-and-prometheus">Step 2 — Start Grafana and Prometheus</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-3-build-mori-on-all-nodes">Step 3 — Build mori on all nodes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-4-create-launcher-scripts">Step 4 — Create launcher scripts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-5-kill-stale-processes-and-launch-prefill">Step 5 — Kill stale processes and launch prefill</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-6-wait-for-all-prefills-ready">Step 6 — Wait for ALL prefills ready</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-7-launch-decode-and-benchmark">Step 7 — Launch decode and benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-8-monitor-decode-and-benchmark">Step 8 — Monitor decode and benchmark</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#step-9-show-results">Step 9 — Show results</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#teardown">Teardown</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#environment-variable-reference">Environment Variable Reference</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#topology-this-guide-s-wrapper-variables">Topology (this guide’s wrapper variables)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#umbp-mori-consumed-by-run-pd-disagg-bench-dp8ep8-sh">UMBP / mori (consumed by <code class="docutils literal notranslate"><span class="pre">run_pd_disagg_bench_dp8ep8.sh</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI-UMBP-PD-BENCHMARK.html#troubleshooting">Troubleshooting</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html">UMBP Distributed Tier-Management Benchmark</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#build">Build</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#run-generate-and-replay">Run, generate, and replay</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#json-backend-and-tier-policy">JSON backend and tier policy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#synthetic-profiles">Synthetic profiles</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#trace-contract">Trace contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="UMBP-TIER-MANAGEMENT-BENCHMARK.html#results">Results</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="rdma_bandwidth_utilization.html">RDMA Bandwidth Utilization in Dispatch/Combine Kernels</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#kernel-execution-path">Kernel Execution Path</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#what-rdma-actually-transfers">What RDMA Actually Transfers</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#dispatch-send-dispatchinternodesend-dispatchinternodellsend">Dispatch send (<code class="docutils literal notranslate"><span class="pre">DispatchInterNodeSend</span></code> / <code class="docutils literal notranslate"><span class="pre">DispatchInterNodeLLSend</span></code>)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#combine-send-combineinternodetyped-combineinternodelltyped">Combine send (<code class="docutils literal notranslate"><span class="pre">CombineInterNodeTyped</span></code> / <code class="docutils literal notranslate"><span class="pre">CombineInterNodeLLTyped</span></code>)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#theoretical-peak-vs-observed-throughput">Theoretical Peak vs. Observed Throughput</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#computing-theoretical-peak">Computing theoretical peak</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#understanding-the-receive-side-timing">Understanding the receive-side timing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#how-to-check-rdma-bandwidth-from-the-trace">How to Check RDMA Bandwidth from the Trace</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-1-collect-a-profiler-trace">Step 1: Collect a profiler trace</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-2-read-key-durations-from-the-text-summary">Step 2: Read key durations from the text summary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-3-compute-observed-rdma-bandwidth">Step 3: Compute observed RDMA bandwidth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#step-4-interpret-results">Step 4: Interpret results</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#key-tuning-parameters-that-affect-rdma-utilization">Key Tuning Parameters That Affect RDMA Utilization</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="rdma_bandwidth_utilization.html#v1-vs-v1-ll-low-latency-tradeoff">v1 vs. v1_ll (low-latency) tradeoff</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#sanity-checks-from-hardware-counters-optional">Sanity Checks from Hardware Counters (optional)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="rdma_bandwidth_utilization.html#summary">Summary</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Developer Guides</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="MORI_IR_INTEGRATION.html">Mori IR Integration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html">MORI JIT Compilation Framework</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#architecture-overview">Architecture Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#packaging-how-wheel-installs-support-jit">Packaging: How Wheel Installs Support JIT</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#compilation-split-host-cxx-vs-device-jit">Compilation Split: Host CXX vs Device JIT</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-cxx-at-pip-install-time">What compiles as CXX (at <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code> time)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-compiles-as-hip-runtime-jit-only">What compiles as HIP (runtime JIT only)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#template-args-vs-raw-args">Template Args vs Raw Args</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#what-gets-jit-compiled">What Gets JIT-Compiled</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-launch-flow">Kernel Launch Flow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#hip-driver-api-python-ctypes">HIP Driver API (Python ctypes)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#triton-integration">Triton Integration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#cache-structure">Cache Structure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#environment-variables">Environment Variables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#testing">Testing</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#docker-environment">Docker Environment</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#non-editable-install-wheel">1. Non-Editable Install (Wheel)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#editable-install-development">2. Editable Install (Development)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#pre-compile-all-kernels">3. Pre-compile All Kernels</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-jit-configuration">4. Verify JIT Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#verify-compilation-separation">5. Verify Compilation Separation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-correctness">6. Dispatch/Combine Correctness</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#dispatch-combine-benchmark">7. Dispatch/Combine Benchmark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#shmem-api">8. Shmem API</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#id1">9. Triton Integration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#full-clean-slate-test">10. Full Clean-Slate Test</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#kernel-source-files">Kernel Source Files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#adding-a-new-kernel">Adding a New Kernel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#host-device-nic-macro-separation">Host/Device NIC Macro Separation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_ARCHITECTURE.html#rocm-version-compatibility">ROCm Version Compatibility</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html">MORI JIT v2</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id1">1. 核心不变量</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id2">2. 分层</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#kernel">3. 一个 kernel 的三件套</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#cfg-c-20-structural-nttp">3.1 Cfg 作为单一模板参数（C++20 structural NTTP）</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id3">3.2 字段列表的完整性是承重的</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id4">3.3 生成的源码</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id5">3.4 缓存</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#host-device-host-hipcc">3.5 host/device 常量只有一份，且 host 不需要 hipcc</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id6">3.6 环境变量</a></li>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dtype">3.7 dtype 是传输属性，不是算术属性</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#op">4. op 层</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id7">5. 两个后端共用一个 op</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#dispatch-combine">5.1 几何调优表：每个后端一份，dispatch 和 combine 再分开</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#python">6. Python 绑定</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id8">7. 几个有证据的决定</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id9">8. 性能</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id10">9. 移植来源与覆盖范围</a></li>
+<li class="toctree-l2"><a class="reference internal" href="MORI_JIT_V2_DESIGN.html#id11">10. 测试</a></li>
+</ul>
+</li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api/communication.html">Communication APIs</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ep-expert-parallelism">MORI-EP (Expert Parallelism)</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/communication.html#asyncll-v2-sdma-overlap">AsyncLL v2 SDMA overlap</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-shmem-symmetric-memory">MORI Shmem (Symmetric Memory)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-io-point-to-point-i-o">MORI-IO (Point-to-Point I/O)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/communication.html#mori-ir-device-bitcode-integration">MORI-IR (Device Bitcode Integration)</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/profiler.html">MORI-VIZ Kernel Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#usage">Usage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#export-to-perfetto">export_to_perfetto</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/profiler.html#c-profiler-apis">C++ Profiler APIs</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api/umbp.html">UMBP Master Client</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#starting-the-master-server">Starting the Master Server</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbptiertype">UMBPTierType</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvnodematch">UMBPExternalKvNodeMatch</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpmasterclient">UMBPMasterClient</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#cache-hit-tracking">Cache Hit Tracking</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#finding-hot-kv-blocks-the-typical-workflow">Finding hot KV blocks (the typical workflow)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="api/umbp.html#lifetime-cumulative-not-a-rate">Lifetime cumulative — not a rate</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#umbpexternalkvhitcountentry">UMBPExternalKvHitCountEntry</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#usage-examples">Usage Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api/umbp.html#end-to-end-example">End-to-End Example</a></li>
+</ul>
+</li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu"  style="background: #C00000" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">MORI</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">UMBP storage and transfer simulation</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/umbp-simulation.md.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="umbp-storage-and-transfer-simulation">
+<h1>UMBP storage and transfer simulation<a class="headerlink" href="#umbp-storage-and-transfer-simulation" title="Link to this heading"></a></h1>
+<p>Simulation keeps allocation, placement, commit/abort, lookup, LRU, leases, events,
+tier policies and control RPCs. Payload storage/transfers are virtual; sim is off by default.</p>
+<section id="enable">
+<h2>Enable<a class="headerlink" href="#enable" title="Link to this heading"></a></h2>
+<p>Keep existing capacities, policies and framework buffers; add the sim settings:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mori.umbp</span><span class="w"> </span><span class="kn">import</span> <span class="n">UMBPClient</span><span class="p">,</span> <span class="n">UMBPConfig</span>
+
+<span class="n">config</span> <span class="o">=</span> <span class="n">UMBPConfig</span><span class="o">.</span><span class="n">from_environment</span><span class="p">()</span>
+<span class="n">config</span><span class="o">.</span><span class="n">sim</span><span class="o">.</span><span class="n">enabled</span> <span class="o">=</span> <span class="kc">True</span>
+<span class="n">config</span><span class="o">.</span><span class="n">sim</span><span class="o">.</span><span class="n">profile_path</span> <span class="o">=</span> <span class="s2">"/path/to/profile.json"</span>
+<span class="n">config</span><span class="o">.</span><span class="n">sim</span><span class="o">.</span><span class="n">trace_path</span> <span class="o">=</span> <span class="s2">"/tmp/umbp-worker-0.jsonl"</span>
+<span class="n">client</span> <span class="o">=</span> <span class="n">UMBPClient</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+<span class="n">client</span><span class="o">.</span><span class="n">put_from_ptr</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+<span class="n">client</span><span class="o">.</span><span class="n">get_into_ptr</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">ptr</span><span class="p">,</span> <span class="n">nbytes</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>With <code class="docutils literal notranslate"><span class="pre">UMBPConfig.from_environment()</span></code>, the equivalent settings are <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_ENABLE=1</span></code>,
+<code class="docutils literal notranslate"><span class="pre">UMBP_SIM_PROFILE=/path/to/profile.json</span></code> and <code class="docutils literal notranslate"><span class="pre">UMBP_SIM_TRACE=/tmp/umbp-worker-0.jsonl</span></code>.
+Existing APIs and return types remain available. Use a separate trace file per client/run.
+DRAM, HBM and file-backed SSD tiers are supported. Embedded mode defaults to DRAM;
+select SSD through the existing backend policy or distributed medium configuration;
+<code class="docutils literal notranslate"><span class="pre">ssd.enabled</span></code> alone does not select SSD. Virtual GPU callers require location/device
+metadata via C++ <code class="docutils literal notranslate"><span class="pre">RegisterMemory</span></code>; unregistered real pointers use existing classification.
+Virtual HBM needs no GPU, but normal build dependencies, including HIP, still apply.</p>
+<p>SSD uses the existing <code class="docutils literal notranslate"><span class="pre">SsdBackend</span></code>, <code class="docutils literal notranslate"><span class="pre">PeerSsdManager</span></code>, segment index and multi-drive
+placement. Its files and staging payloads are virtual: <code class="docutils literal notranslate"><span class="pre">storage_dir</span></code> identifies
+shards but no directories/files are created. Capacity includes record headers,
+4 KiB padding and dead records; deleting a key frees disk capacity when its whole
+segment becomes reclaimable. Commit/abort, LRU, staging limits, read leases and
+single-flight reads keep their normal behavior. Simulation starts with an empty
+tier and does not restore persisted data. SPDK backends are outside this file-tier
+implementation.</p>
+<section id="standalone-ci">
+<h3>Standalone / CI<a class="headerlink" href="#standalone-ci" title="Link to this heading"></a></h3>
+<p>Run one server per node; its capacity, page size, LRU and policies apply to all ranks:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_SIM_ENABLE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">UMBP_SIM_PROFILE</span><span class="o">=</span>/path/to/profile.json
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_SIM_TRACE</span><span class="o">=</span>/tmp/umbp-server.jsonl
+umbp_standalone_server<span class="w"> </span>unix:/tmp/umbp.sock
+</pre></div>
+</div>
+<p>Ranks keep their <code class="docutils literal notranslate"><span class="pre">standalone_process</span></code> config and socket, enable <code class="docutils literal notranslate"><span class="pre">config.sim.enabled</span></code>,
+and use distinct trace files. Forwarding ranks need no profile. For <code class="docutils literal notranslate"><span class="pre">auto_start=True</span></code>,
+set the profile in the client; the server receives it and uses trace suffix <code class="docutils literal notranslate"><span class="pre">.server</span></code>.
+Both sides need the updated build and matching sim mode. Range checks remain active;
+closing a rank releases registrations while other ranks retain the shared KV tier.
+Rank timings include IPC and server work; <strong>do not add server trace times to rank times</strong>.</p>
+</section>
+</section>
+<section id="profile-and-model">
+<h2>Profile and model<a class="headerlink" href="#profile-and-model" title="Link to this heading"></a></h2>
+<p><a class="reference download internal" download="" href="_downloads/66cefce8f45ba1c56436ce199ae01101/sim_profile.json"><span class="xref download myst">sim_profile.json</span></a> contains illustrative, uncalibrated
+estimates for <code class="docutils literal notranslate"><span class="pre">cpu_cpu</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_gpu</span></code>, <code class="docutils literal notranslate"><span class="pre">gpu_cpu</span></code>, <code class="docutils literal notranslate"><span class="pre">gpu_gpu</span></code>, <code class="docutils literal notranslate"><span class="pre">remote_read</span></code>, <code class="docutils literal notranslate"><span class="pre">remote_write</span></code>,
+<code class="docutils literal notranslate"><span class="pre">file_cpu</span></code>, <code class="docutils literal notranslate"><span class="pre">cpu_file</span></code> and <code class="docutils literal notranslate"><span class="pre">file_gpu</span></code>.
+Copy it and adjust the coefficients for your platform.
+Each path names its source/destination memory type, except the remote paths, which use
+the initiator’s read/write direction. Configure every path your workload uses; a missing
+path rejects the transfer. Unused paths may be omitted.</p>
+<p>This first version uses manually supplied parameters. Automatic calibration belongs in
+a follow-up PR covering the actual engines (<code class="docutils literal notranslate"><span class="pre">LocalCopyEngine</span></code>, <code class="docutils literal notranslate"><span class="pre">HbmCopyEngine</span></code> and
+<code class="docutils literal notranslate"><span class="pre">MoriIoEngine</span></code>), with reusable profiles for CPU, GPU and RDMA transfers. SSD coefficients
+also need measurements of the actual configured storage path.</p>
+<p>For staged SSD load/offload, optional <code class="docutils literal notranslate"><span class="pre">file_cpu_staged</span></code> / <code class="docutils literal notranslate"><span class="pre">cpu_file_staged</span></code> describe storage-path cost;
+normal CPU/GPU/network transfers add their own costs. Fit those SSD coefficients
+to <code class="docutils literal notranslate"><span class="pre">SSDTier</span></code> device I/O plus its skipped payload work (record building, CRC, bounce
+copies and the configured durability mode), excluding control and external
+GPU/RDMA copies that the simulator already counts. Local direct file transfers use
+<code class="docutils literal notranslate"><span class="pre">file_cpu</span></code> / <code class="docutils literal notranslate"><span class="pre">cpu_file</span></code>; profiles without staged variants fall back to those curves.
+<code class="docutils literal notranslate"><span class="pre">file_gpu</span></code> models the opt-in GDS read path
+(<code class="docutils literal notranslate"><span class="pre">UMBP_ENABLE_GDS=1</span></code>); GPU offload remains GPU→DRAM→SSD, matching the real engines.
+Checksum-bearing whole reads use <code class="docutils literal notranslate"><span class="pre">file_cpu_staged</span></code>. Checksum-free records and
+partial reads prefer <code class="docutils literal notranslate"><span class="pre">file_cpu_staged_no_crc</span></code>, which models the same SSDTier I/O
+backend without CRC work. Older profiles fall back to <code class="docutils literal notranslate"><span class="pre">file_cpu</span></code>, then the staged
+curve for these reads; whole reads fall back to <code class="docutils literal notranslate"><span class="pre">file_cpu</span></code>.
+With CRC disabled, calibrate the staged profile with the same setting.
+The example SSD values are estimates, not calibration results.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">channel</span></code></p></td>
+<td><p>Same names share a service queue within one backend client/server.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">latency_ns</span></code></p></td>
+<td><p>Nonnegative fixed cost per submitted batch/path.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">copy_latency_ns</span></code></p></td>
+<td><p>Nonnegative cost per coalesced copy; default 0.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">registration_latency_ns</span></code></p></td>
+<td><p>Optional nonnegative first-FD cost for <code class="docutils literal notranslate"><span class="pre">file_gpu</span></code>; default 0.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">log_size_latency_ns</span></code></p></td>
+<td><p>Optional nonnegative SSD read cost per copy × <code class="docutils literal notranslate"><span class="pre">log2(max(1,</span> <span class="pre">mean</span> <span class="pre">copy</span> <span class="pre">bytes</span> <span class="pre">/</span> <span class="pre">4096))</span></code>; default 0.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">batch_log_size_latency_ns</span></code></p></td>
+<td><p>Optional nonnegative SSD read cost per batch × the same size term; default 0.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">serialize_latency</span></code></p></td>
+<td><p>Optional SSD read flag to queue latency as well as bytes, for mutually exclusive I/O batches; default false.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bandwidth_bytes_per_second</span></code></p></td>
+<td><p>Positive effective bandwidth.</p></td>
+</tr>
+</tbody>
+</table>
+<p><code class="docutils literal notranslate"><span class="pre">cpu_cpu</span></code> coefficients may be arrays indexed by copy threads minus one, clamped to the last
+entry; other paths use scalars. Existing thread selection/thresholds still apply.
+Channel capacity is the maximum measured bandwidth; independent callers can use
+more cores than one call’s copy/write thread limit. Each call retains its thread curve.</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>size_term = log2(max(1, bytes / copies / 4096))
+overhead = latency_ns[p] + copies * copy_latency_ns[p]
+         + size_term * (copies * log_size_latency_ns + batch_log_size_latency_ns)
+private_ns = overhead + bytes * 1e9 / bandwidth[p]
+service_ns = overhead + bytes * 1e9 / channel_capacity
+channel_available = max(submitted, channel_available) + service_ns
+finish = max(submitted + private_ns, channel_available)
+</pre></div>
+</div>
+<p>Shared paths sum service costs; zero bytes add no delay and missing paths abort normally.
+For independent SSD reads, <code class="docutils literal notranslate"><span class="pre">service_ns</span></code> includes only the byte cost so request
+latency can overlap, unless <code class="docutils literal notranslate"><span class="pre">serialize_latency</span></code> is true. Writes and mixed read/write
+submits retain the full service cost.</p>
+<p>Pure <code class="docutils literal notranslate"><span class="pre">file_gpu</span></code> submits with <code class="docutils literal notranslate"><span class="pre">serialize_latency=false</span></code> share channel capacity among
+active synchronous copies. Copy/log latency stays private; fixed batch/log latency
+is paid once, using the same five coefficients. Ordinary reservations on that
+channel form a barrier; mixed submits retain the formulas above. File registration
+timing is unchanged.</p>
+<p>Native CRC reads with a matching serialized no-CRC curve on the same channel
+queue the smaller of the two costs as I/O, then finish the remaining CRC cost
+outside that queue. Missing or incompatible curves retain full serialization.</p>
+<p><code class="docutils literal notranslate"><span class="pre">cpu_file_staged</span></code> uses the complete payload curve: record preparation, I/O,
+durability and record-buffer cleanup are included in its measured total cost.
+The basic model reserves that combined cost on the SSD channel; it does not model
+preparation or cleanup overlap between callers separately.</p>
+</section>
+<section id="cross-peer-sharing">
+<h2>Cross-peer sharing<a class="headerlink" href="#cross-peer-sharing" title="Link to this heading"></a></h2>
+<p>For share, keep normal Master/peer configuration, distinct node IDs and reachable
+addresses/ports. Use a dedicated Master, enable sim on <strong>every peer</strong>, and configure
+<code class="docutils literal notranslate"><span class="pre">remote_read</span></code>/<code class="docutils literal notranslate"><span class="pre">remote_write</span></code> from the initiator’s perspective. Separate channel names
+allow independent directions. Fit target-link <strong>Submit+Wait</strong>, not API totals or ping
+RTT when replacing estimates with measurements. The example GPU/network coefficients
+remain uncalibrated; use the separate calibration workflow for platform measurements.
+Local copies finish in Submit; registered remote copies finish in Wait. Unregistered
+CPU callers retain RDMA bounce geometry and serial staging inside Submit. Ranged
+scratch and re-cache payloads are virtual; a re-cached replica can serve other peers.
+Staging uses optional scalar <code class="docutils literal notranslate"><span class="pre">cpu_staging</span></code> / <code class="docutils literal notranslate"><span class="pre">cpu_staging_read</span></code> coefficients calibrated
+from MoriIo’s serial copyin/copyout geometry. Reads fall back to <code class="docutils literal notranslate"><span class="pre">cpu_staging</span></code>, then
+the single-thread <code class="docutils literal notranslate"><span class="pre">cpu_cpu</span></code> estimate. Validate staged timings separately from local copies.
+Sim/real engines reject each other’s handshake. Distributed ranged I/O still needs scratch.
+Remote GPU callers retain real registration restrictions; standalone GPU IPC is local-copy-only.</p>
+</section>
+<section id="timing-and-limits">
+<h2>Timing and limits<a class="headerlink" href="#timing-and-limits" title="Link to this heading"></a></h2>
+<p>JSONL fields are <code class="docutils literal notranslate"><span class="pre">api</span></code>, <code class="docutils literal notranslate"><span class="pre">key_count</span></code>, requested <code class="docutils literal notranslate"><span class="pre">bytes</span></code> (range bytes for ranged calls),
+monotonic <code class="docutils literal notranslate"><span class="pre">start_ns</span></code>/<code class="docutils literal notranslate"><span class="pre">elapsed_ns</span></code>, <code class="docutils literal notranslate"><span class="pre">result_count</span></code> and <code class="docutils literal notranslate"><span class="pre">exception</span></code>. Results count successes/
+matches; void calls and exceptions use -1. Records cover scalar/batch/depth/ranged
+put/get, existence, register/deregister, clear, flush and close. Completion order may
+differ. Files append and flush on flush/close/destruction; an empty path uses INFO
+logging, and disabling INFO skips formatting.</p>
+<p><code class="docutils literal notranslate"><span class="pre">elapsed_ns</span></code> includes real control code, RPC/locks, queueing and modeled transfers,
+ending before trace serialization; whole-API timing also includes trace output.
+Workers/timers use wall time; background work counts when it delays an API/channel.</p>
+<ul class="simple">
+<li><p>Queues belong to one backend client/server, shared by its ranks. Remote-NIC aggregation, switch congestion and dynamic fair sharing are not modeled.</p></li>
+<li><p>Mixed transfer paths on different channels may overlap in the model; real inline engines can serialize them. Validate mixed-tier batches separately.</p></li>
+<li><p>Real control RPC failures remain possible; modeled payload-transfer failures are not synthesized. Same-host peers measure that host’s RPC cost.</p></li>
+<li><p>Scheduling/control overhead limits short-operation accuracy. Profiles depend on platform, concurrency and workload.</p></li>
+<li><p>Virtual addresses and page/key metadata consume resources. Framework buffers, external copies and model execution remain real; use trace/dummy execution, not generated-token correctness checks.</p></li>
+<li><p>GPU/network accuracy and full SGLang performance validation require separate work.</p></li>
+</ul>
+<p>Build <code class="docutils literal notranslate"><span class="pre">test_umbp_sim</span></code> and run <code class="docutils literal notranslate"><span class="pre">ctest</span> <span class="pre">-R</span> <span class="pre">'^umbp_sim$'</span></code>; these functional tests need no GPUs.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="MORI-UMBP-SINGLE-NODE-GUIDE.html" class="btn btn-neutral float-left" title="MORI UMBP Single-Node Smoke Test" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="PROFILER.html" class="btn btn-neutral float-right" title="MORI-VIZ (Visualizer)" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, AMD.
+      <span class="lastupdated">Last updated on 2026-10-31.
+      </span></p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

@@ -1,0 +1,50 @@
+{
+  "id": "example-estimates-not-calibrated",
+  "paths": {
+    "cpu_cpu": {
+      "channel": "host-memory",
+      "latency_ns": 2000,
+      "bandwidth_bytes_per_second": 40000000000
+    },
+    "cpu_gpu": {
+      "channel": "host-device-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "gpu_cpu": {
+      "channel": "host-device-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "gpu_gpu": {
+      "channel": "device-memory",
+      "latency_ns": 5000,
+      "bandwidth_bytes_per_second": 1000000000000
+    },
+    "remote_read": {
+      "channel": "network-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "remote_write": {
+      "channel": "network-link",
+      "latency_ns": 10000,
+      "bandwidth_bytes_per_second": 25000000000
+    },
+    "file_cpu": {
+      "channel": "ssd-device",
+      "latency_ns": 50000,
+      "bandwidth_bytes_per_second": 3000000000
+    },
+    "cpu_file": {
+      "channel": "ssd-device",
+      "latency_ns": 80000,
+      "bandwidth_bytes_per_second": 3000000000
+    },
+    "file_gpu": {
+      "channel": "ssd-device",
+      "latency_ns": 60000,
+      "bandwidth_bytes_per_second": 3000000000
+    }
+  }
+}
