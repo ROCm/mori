@@ -993,11 +993,6 @@ class EpDispatchCombineOp:
         return None
 
     def _reverse_source(self, disp_spec):
-        # A live arena view: the reverse map is cloned lazily on first access,
-        # which must happen after the caller's post-dispatch barrier (see
-        # EpDispatchRoutingHandle). Built once -- the pointer and the shape are
-        # fixed for the op's lifetime, and rebuilding it per dispatch is pure
-        # host cost on a path where the host already paces the GPU.
         reverse = getattr(self, "_reverse_view", None)
         if reverse is None:
             reverse = from_gpu_ptr(
@@ -1150,9 +1145,6 @@ class EpDispatchCombineOp:
             self._async_pending_dispatch_input = input
             self._async_pending_dispatch_map = dest_map
 
-        # A copy rather than a buffer handed to the kernel: total_recv is
-        # also read through the op (local_expert_count, StdMoE convert), so
-        # the kernel keeps writing the op's.
         count = self.total_recv.clone() if snapshot else self.total_recv
         if snapshot and self._snapshot_zeroes_count:
             self.total_recv.zero_()

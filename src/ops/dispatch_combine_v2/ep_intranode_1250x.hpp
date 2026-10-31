@@ -1152,10 +1152,6 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
     __hip_atomic_exchange(&args.destPeTokenCounter[npes + p], base, __ATOMIC_RELAXED,
                           __HIP_MEMORY_SCOPE_AGENT);
   };
-  // In each block holding tokens lane p of warp 0 adds the block's count for destination p,
-  // this rank included, into the rank's total for p and keeps its offset in it; the last of
-  // those blocks to arrive reserves the total with one RMW on p's slot word and publishes the
-  // base with the call number in one word.
   constexpr bool kCntX = npes <= 8 && !kDPin;
   static_assert(npes <= WS, "one lane per destination");
   static_assert(kCfg.maxTokPerRank < (1 << 20), "a destination's total is kept in 20 bits");
@@ -1171,10 +1167,8 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
     unsigned* cnt = EpResCnt<npes>(dest ? p : 0);
     unsigned long long* pub = EpResPub<npes>(dest ? p : 0);
     const index_t n = dest ? s_N[p] : 0;
-    // Only the blocks holding tokens meet: a call of fewer units than blocks waits on those.
     const unsigned nHold = (unsigned)EpTokBlocks<kCfg>(_tokChunk, (int)args.numTokens, _etpi);
     const bool joins = dest && blockIdx.x < nHold;
-    // Tokens outside [0, nHold) would take slots past the total reserved.
     if (n > 0 && !joins) __builtin_trap();
     if (dest && _blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
     if (n > 0) atomicAdd(&args.destPeTokenCounter[p], n);
@@ -1226,8 +1220,6 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
       __hip_atomic_store(pub, ((unsigned long long)resSeq << 32) | (unsigned)base, R, A);
       if (tot > 0) keepBase(p, base);
     }
-    // The blocks holding tokens wait here for the last of them, so they must all be
-    // resident at once.
     if (!kCntX && !_ls && n > 0 && !last) {
       unsigned long long w = __hip_atomic_load(pub, R, A);
       while ((unsigned)(w >> 32) != resSeq) {
@@ -2856,9 +2848,6 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
                            __HIP_MEMORY_SCOPE_AGENT);
       }
     }
-    // The signal to p carries in its high word where p's rows from this rank go in this
-    // rank's push combine landing: after the rows to every destination below p, so a row at
-    // slot s of p lands at s + dl and the runs tile [0, the rows this rank sent).
     const int p = laneId;
     index_t n = 0, base = 0;
     if (p < npes) {
@@ -2897,7 +2886,6 @@ __attribute__((always_inline)) __device__ void EpDispatch1250xBody(EpArgs args) 
   if (isFirstArriver) {
     index_t myRecv = 0;
     for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
-      // Only the count is cleared: the landing offset in the high word stays for the combine.
       unsigned long long* signal = reinterpret_cast<unsigned long long*>(recvTokenNums) + srcPe;
       unsigned long long got;
       do {
@@ -5514,8 +5502,6 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         auto _cFold = [&](const TokT* _cT, size_t _off, int _n, int _rowStride, int _nRed) {
 #define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
           __threadfence_block();
-          // Rows up to this count are loaded together before folding; past it each row's LDS
-          // read is waited on alone, so it must cover every source a token can have.
           constexpr int _cSrcMaxC = (npes < topk) ? npes : topk;
           constexpr int _cRedSrcMax = (_cSrcMaxC > 4) ? _cSrcMaxC : 4;
           constexpr int _cOutVB = 16;
