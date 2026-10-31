@@ -78,6 +78,10 @@ list(
   topology/system.cpp
   transport/rdma/proxy/proxy_thread.cpp)
 
+if(ENABLE_KFD_PIN_FIX)
+  list(APPEND MORI_APP_SOURCES transport/rdma/kfd_pin_accounting.cpp)
+endif()
+
 # libibverbs is loaded at runtime via dlopen (see ibv_shim.cpp), not linked. The
 # shim is built as an object library with hidden visibility so every mori shared
 # object that touches the verbs API embeds its own private copy and never
@@ -107,6 +111,9 @@ target_include_directories(mori_application_objs PUBLIC ${CMAKE_SOURCE_DIR}/incl
 set_target_properties(mori_application_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(mori_application_objs PUBLIC hip::host dl mori_logging
                                                    ${HSA_RUNTIME_LIB} hsakmt::hsakmt)
+if(ENABLE_KFD_PIN_FIX)
+  target_compile_definitions(mori_application_objs PRIVATE MORI_KFD_PIN_FIX)
+endif()
 if(WITH_MPI)
   target_compile_definitions(mori_application_objs PUBLIC MORI_WITH_MPI)
   target_link_libraries(mori_application_objs PUBLIC MPI::MPI_CXX)
