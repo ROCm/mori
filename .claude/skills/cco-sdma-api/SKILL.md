@@ -316,9 +316,7 @@ unpack on the receiver.
 
 ## Engine-side wait and broadcast
 
-Two more packets, both gfx9 layouts validated on gfx950. On gfx12.5 they compile
-but trap when called, until the layouts are checked there; a multi-arch build
-still builds, and the caller must not reach them on gfx12.5.
+Two more packets, with the gfx9 layouts. Validated on gfx950 and gfx1250.
 
 Unlike `put`, these post from a **single issuer** and do no lane grouping: thread
 scope posts one active lane at a time (several lanes are serialized, so they may
@@ -425,7 +423,6 @@ a NOP, so the packet is never split across the ring end.
 | wrong data with several lanes per wave | `ccoSdmaThreadSameQueue` set while lanes target different queues |
 | receiver sees a signal but stale data | signal fired on a different queue than the copy |
 | a queue stops moving after `postWaitMem` | the flag never reached the value, or it points at another GPU's memory — `win`/`offset` must be local |
-| `putBroadcast`/`postWait*` trap | gfx12.5 build: those packet layouts are not validated there |
 | `postWaitSignal` releases too early | `expected` is 2^32 or more and was truncated to 32 bits |
 
 Build with `-DMORI_CCO_SDMA_DEBUG` when any of these appear: it turns the
