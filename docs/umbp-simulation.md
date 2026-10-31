@@ -95,6 +95,7 @@ The example SSD values are estimates, not calibration results.
 | `batch_log_size_latency_ns` | Optional nonnegative SSD read cost per batch × the same size term; default 0. |
 | `serialize_latency` | Optional SSD read flag to queue latency as well as bytes, for mutually exclusive I/O batches; default false. |
 | `bandwidth_bytes_per_second` | Positive effective bandwidth. |
+| `size_knee_bytes`, `large_size_ns_per_byte` | Optional paired scalar fields for `cpu_staging` / `cpu_staging_read`: a positive byte threshold and nonnegative additional ns/byte above it. Omitted fields add no cost. |
 
 `cpu_cpu` coefficients may be arrays indexed by copy threads minus one, clamped to the last
 entry; other paths use scalars. Existing thread selection/thresholds still apply.

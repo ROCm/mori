@@ -74,6 +74,44 @@ def test_fit_recovers_model_without_validation_leakage():
     )
 
 
+@pytest.mark.parametrize("path", ["cpu_staging", "cpu_staging_read"])
+@pytest.mark.parametrize("extra", [0, 0.03])
+def test_staging_knee_uses_only_identifiable_training_sizes(path, extra):
+    knee = 8 * 1048576
+    rows = [
+        dict(
+            phase="train",
+            mode="real",
+            path=path,
+            effective_threads=1,
+            block_bytes=block,
+            batch=batch,
+            elapsed_ns=500
+            + 80 * batch
+            + block * batch / 80
+            + max(0, block * batch - knee) * extra,
+        )
+        for block in (4096, 65536, 1048576, 4194304, 8388608, 16777216)
+        for batch in (1, 2, 4, 8)
+    ]
+    rows += [dict(row, phase="engine", elapsed_ns=1e12) for row in rows]
+    rows += [dict(row, phase="train", mode="sim", elapsed_ns=1e12) for row in rows]
+    rows += [
+        dict(row, phase="train", mode="real", concurrency=4, elapsed_ns=1e12)
+        for row in rows
+    ]
+    curve = calibrate.fit_paths(rows, [1], {})[path]
+    assert curve["latency_ns"] == pytest.approx(500)
+    assert curve["copy_latency_ns"] == pytest.approx(80)
+    assert curve["bandwidth_bytes_per_second"] == pytest.approx(80e9)
+    if extra:
+        assert curve["size_knee_bytes"] == knee
+        assert curve["large_size_ns_per_byte"] == pytest.approx(extra)
+    else:
+        assert "size_knee_bytes" not in curve
+        assert "large_size_ns_per_byte" not in curve
+
+
 def test_unresolved_byte_cost_keeps_the_measured_copy_latency():
     # Small measurement drift can make the unconstrained byte coefficient negative.
     # The constrained fit must retain per-copy cost instead of dropping that model.
@@ -303,7 +341,9 @@ def test_comparison_keeps_direct_staged_and_memory_paths_separate():
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-@pytest.mark.parametrize("path", ["cpu_cpu", "cpu_gpu", "file_cpu", "file_cpu_staged"])
+@pytest.mark.parametrize(
+    "path", ["cpu_cpu", "cpu_gpu", "file_cpu", "file_cpu_staged", "remote_read"]
+)
 def test_custom_grids_reach_probe_and_keep_validation_independent(
     tmp_path, monkeypatch, overlap, path
 ):
@@ -315,6 +355,26 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
     argv = ["calibrate", "--probe", str(probe), "--output", str(output)]
     argv += "--cpus 0,1,2,3 --threads 1 --concurrency 1 --rounds 1 --max-mib 1".split()
     argv += ["--paths", path]
+    remote = path.startswith("remote_")
+    if remote:
+        argv += [
+            "--max-mib",
+            "128",
+            "--remote-probe",
+            str(probe),
+            "--local-address",
+            "10.0.0.1",
+            "--remote-address",
+            "10.0.0.2",
+            "--remote-command",
+            "ssh owner probe",
+        ]
+
+        def start_owner(command, **kwargs):
+            assert "--max-mib 128" in command[-1]
+            return SimpleNamespace(wait=lambda **_: 0, poll=lambda: 0)
+
+        monkeypatch.setattr(calibrate.subprocess, "Popen", start_owner)
     if "file" in path:
         argv += ["--ssd-dir", str(tmp_path), "--ssd-read-prefill-mib", "256"]
     argv += ["--train-block-bytes", *map(str, train), "--train-batches", "1", "8", "32"]
@@ -330,15 +390,15 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
     phases = set()
 
     def run(command, **kwargs):
-        phase = command[command.index(str(probe)) + 1]
-        selected_path = command[command.index("--path") + 1]
+        phase = command[command.index(str(probe)) + (5 if remote else 1)]
+        selected_path = path if remote else command[command.index("--path") + 1]
         assert command[2] == ("0" if path == "cpu_cpu" else "0,1,2,3")
         phases.add(phase)
         blocks = train if phase == "train" else validation
         batches = [1, 8, 32] if phase == "train" else [1, 4]
         assert command[command.index("--block-bytes") + 1] == ",".join(map(str, blocks))
         assert command[command.index("--batches") + 1] == ",".join(map(str, batches))
-        assert command[command.index("--max-mib") + 1] == "1"
+        assert command[command.index("--max-mib") + 1] == ("128" if remote else "1")
         if "file" in path:
             assert command[command.index("--ssd-dir") + 1] == str(tmp_path)
             assert command[command.index("--ssd-durability") + 1] == "strict"
@@ -370,7 +430,9 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
     else:
         calibrate.main()
         assert phases == (
-            {"train", "engine"} if path == "file_cpu" else {"train", "engine", "api"}
+            {"train", "engine"}
+            if path == "file_cpu" or remote
+            else {"train", "engine", "api"}
         )
         report = json.loads((output / "report.json").read_text())
         assert report["workloads"]["validation"]["block-bytes"] == validation

@@ -96,6 +96,8 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
     double registration_latency_ns;
     double log_size_latency_ns;
     double batch_log_size_latency_ns;
+    double size_knee_bytes;
+    double large_size_ns_per_byte;
     bool serialize_latency;
   };
   struct Reservation {

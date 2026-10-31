@@ -49,9 +49,10 @@ inline std::vector<size_t> Sizes(const std::string& text) {
   std::istringstream input(text);
   std::string item;
   std::vector<size_t> out;
-  while (std::getline(input, item, ',')) out.push_back(Positive(item));
-  std::sort(out.begin(), out.end());
-  out.erase(std::unique(out.begin(), out.end()), out.end());
+  while (std::getline(input, item, ',')) {
+    const auto value = Positive(item);
+    if (std::find(out.begin(), out.end(), value) == out.end()) out.push_back(value);
+  }
   return out;
 }
 

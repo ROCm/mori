@@ -2,8 +2,8 @@
 
 Build the optional probes and run real-engine training followed by independent
 real/sim validation. Generated profiles work with the [UMBP simulator](umbp-simulation.md).
-The calibration PR depends on the simulator PR; use the updated build for the
-optional gather, directional staging and SSD payload models.
+Use the updated build for the optional gather, directional staging and SSD
+payload models.
 
 ```bash
 cmake --build build --target umbp_sim_probe umbp_sim_remote_probe -j 8
@@ -45,6 +45,14 @@ registration, planning, control handshake, eight warmups and payload checks are 
 transfer timers; transfer timing is Submit+Wait. API timings include the real API control
 work and trace output to `/dev/null`. The fit never includes API/control overhead twice.
 Remote API/control timing can be measured separately through the simulator API trace.
+`gpu_gpu` measures the engine's host return boundary. Its HIP copy fallback has no
+additional device synchronization; a small return time or zero fitted byte cost
+does not identify GPU copy throughput or subsequent device-drain time.
+
+Bounce-buffer copy curves can fit a second slope after an aggregate byte threshold:
+`max(0, bytes - size_knee_bytes) * large_size_ns_per_byte`. This accounts for slower
+large DRAM copies. Both fields are selected only from real single-caller training,
+with identifiable sizes on both sides; unchanged slopes keep the original linear model.
 
 SSD sampling requires an explicit writable `--ssd-dir` on the device being calibrated,
 not NFS or tmpfs. The probe creates and removes only its own temporary child directory.
@@ -94,8 +102,8 @@ cached registrations retain their ordinary bookkeeping cost. The optional
 - `--train-block-bytes`, `--train-batches`, `--validation-block-bytes` and
   `--validation-batches` replace the default grids. All entries must be positive;
   sampled training/validation overlap is rejected.
-- `--max-mib` defaults to 256 aggregate payload MiB across callers. Remote probes cap
-  the arena at 64 MiB and include their 64-byte gaps in the capacity check.
+- `--max-mib` defaults to a 256 MiB workload footprint across callers. SSD probes
+  include record padding and remote probes include their 64-byte gaps.
 - `--threads` selects CPU copy-thread curves; GPU/network/staging fits are scalar.
   `--concurrency` defaults to 1/2/4 and affects validation only. Callers share one engine
   with disjoint buffers; independent process/rank contention is not fitted.
@@ -104,6 +112,9 @@ cached registrations retain their ordinary bookkeeping cost. The optional
   and cache conditions consistent when reusing a profile. Both modes honor `--max-mib`;
   small reused buffers can stay in CPU cache and overestimate DRAM bandwidth for KV
   staging. Use the default `cold` for data displaced from cache between operations.
+  This controls the caller's source, not all internal buffers: API offload copies
+  into staging before SSD record preparation, which can warm that stage's source.
+  Direct engine and API cache conditions can therefore still differ.
 
 Only real, single-caller training samples fit nonnegative fixed overhead, cost per
 actual copy/segment and effective bandwidth. CPU thread counts interpolate in time/byte.
@@ -127,10 +138,14 @@ GPU training separates gather from memcpy by observing actual kernel launches.
 Sim selects the optional gather curve using registered host ranges, per-device
 segment geometry and the production cutoff; missing variants fall back to the base curve.
 Direct RDMA trains network paths; its actual bounce buffers train staging in each direction.
+Both probes honor the explicit `--max-mib` limit; remote sampling has no hidden 64 MiB cap.
 Staging samples run after the timed wire pair so extra calibration traffic does
 not warm the following network sample. Read bounce and destination ranges are
 cleared before RDMA refresh, keeping payload validation independent of earlier copies.
 Held-out staged transfers verify the combined model without fitting network costs twice.
+Concurrent direct RDMA uses a serialized channel approximation; real QPs can share
+bandwidth differently, especially for large transfers. Check concurrent validation
+before reusing single-caller parameters.
 Old profiles can omit `cpu_staging_read`: reads fall back to `cpu_staging`, then
 the serial `cpu_cpu` curve. Each stage includes model calculation in its time budget.
 

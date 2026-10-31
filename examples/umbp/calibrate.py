@@ -71,8 +71,30 @@ TRANSFER_PATHS = (
 )
 
 
-def fit_profile(records, threads, *, log_size=False):
+def fit_nonnegative(x, y):
+    weights = 1 / np.maximum(y, 1000)
+    best = None
+    # Enumerate nonnegative active sets, without an optimizer dependency.
+    for active in itertools.product([False, True], repeat=x.shape[1]):
+        if not any(active):
+            continue
+        active = list(active)
+        coef = np.zeros(x.shape[1])
+        coef[active] = np.linalg.lstsq(
+            x[:, active] * weights[:, None], y * weights, rcond=None
+        )[0]
+        if not np.all(np.isfinite(coef) & (coef >= 0)):
+            continue
+        error = np.sum(((x @ coef - y) * weights) ** 2)
+        if best is None or error < best[0]:
+            best = (error, coef)
+    return best
+
+
+def fit_profile(records, threads, *, log_size=False, staging=False):
     """Fit only real training transfers; control-path time is never added twice."""
+    if staging and (threads != [1] or log_size):
+        raise ValueError("staging calibration requires one scalar copy curve")
     groups = defaultdict(list)
     for row in records:
         if (
@@ -87,7 +109,9 @@ def fit_profile(records, threads, *, log_size=False):
                 row.get("segments", row["batch"]),
             )
             groups[key].append(row["elapsed_ns"])
+    width = 3 + 2 * log_size
     curves = {}
+    stage_curve = {}
     for p in threads:
         cases = [
             (b, n, statistics.median(v)) for (t, b, n), v in groups.items() if t == p
@@ -100,7 +124,6 @@ def fit_profile(records, threads, *, log_size=False):
             or np.linalg.matrix_rank(x) < 3
         ):
             raise ValueError(f"insufficient or invalid training data for {p} threads")
-        weights = 1 / np.maximum(y, 1000)
         columns = list(range(3))
         if log_size:
             logs = np.array([np.log2(max(1, b / n / 4096)) for b, n, _ in cases])
@@ -111,29 +134,33 @@ def fit_profile(records, threads, *, log_size=False):
                 if np.linalg.matrix_rank(candidate) == candidate.shape[1]:
                     columns.append(column)
                     x = candidate
-        best = None
-        # Enumerate nonnegative active sets, without an optimizer dependency.
-        for active in itertools.product([False, True], repeat=x.shape[1]):
-            if not any(active):
-                continue
-            active = list(active)
-            coef = np.zeros(x.shape[1])
-            coef[active] = np.linalg.lstsq(
-                x[:, active] * weights[:, None], y * weights, rcond=None
-            )[0]
-            if not np.all(np.isfinite(coef) & (coef >= 0)):
-                continue
-            error = np.sum(((x @ coef - y) * weights) ** 2)
-            if best is None or error < best[0]:
-                best = (error, coef)
+        best = fit_nonnegative(x, y)
         if best is None:
             raise ValueError(f"no valid fit for {p} threads")
-        curves[p] = np.zeros(5 if log_size else 3)
-        curves[p][columns] = best[1]
+        if staging:
+            # Identify a cache-to-DRAM slope change only from real TRAIN sizes.
+            # Two distinct sizes on each side and full rank prevent unidentifiable knees.
+            for knee in sorted({b for b, _, _ in cases})[2:-2]:
+                features = np.column_stack((x, np.maximum(0, x[:, 1] - knee / 1048576)))
+                if np.linalg.matrix_rank(features) != features.shape[1]:
+                    continue
+                candidate = fit_nonnegative(features, y)
+                if (
+                    candidate is not None
+                    and candidate[1][-1] > 0
+                    and candidate[0] < best[0] - 1e-6
+                ):
+                    best = candidate
+                    stage_curve = {
+                        "size_knee_bytes": knee,
+                        "large_size_ns_per_byte": candidate[1][-1] / 1048576,
+                    }
+        curves[p] = np.zeros(width)
+        curves[p][columns] = best[1][: len(columns)]
     # Interpolate unmeasured thread counts in time/byte, without extrapolating.
     values = [
         np.interp(range(1, max(threads) + 1), threads, [curves[p][i] for p in threads])
-        for i in range(5 if log_size else 3)
+        for i in range(width)
     ]
     curve = {
         "channel": "host-memory",
@@ -153,7 +180,7 @@ def fit_profile(records, threads, *, log_size=False):
         ):
             if np.any(value > 0):
                 curve[name] = value.tolist()
-    return curve
+    return {**curve, **stage_curve}
 
 
 def fit_paths(records, threads, base, *, ssd_io="posix"):
@@ -173,6 +200,7 @@ def fit_paths(records, threads, base, *, ssd_io="posix"):
             threads if name == "cpu_cpu" else [1],
             log_size=name
             in ("file_cpu", "file_gpu", "file_cpu_staged", "file_cpu_staged_no_crc"),
+            staging=name in ("cpu_staging", "cpu_staging_read"),
         )
         base_name = name.removesuffix("_no_crc")
         fallback = (
@@ -447,7 +475,7 @@ def main():
                 "--concurrency",
                 str(c),
                 "--max-mib",
-                str(min(args.max_mib, 64)),
+                str(args.max_mib),
             ]
             if staged:
                 command.append("--staged")

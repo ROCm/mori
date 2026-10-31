@@ -1262,5 +1262,38 @@ TEST_F(SimTest, CalibratedStagingUsesItsOwnCopyCost) {
   EXPECT_GE(Clock::now() - read_start, 40ms);
 }
 
+TEST_F(SimTest, StagingSizeKneeChargesOnlyBytesAboveTheKnee) {
+  const std::string curve = R"({"channel":"host","latency_ns":0,
+    "bandwidth_bytes_per_second":1e12,"size_knee_bytes":4096,"large_size_ns_per_byte":20000})";
+  Profile("{\"cpu_staging\":" + curve + ",\"cpu_staging_read\":" + curve +
+          R"(,"remote_read":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+    "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine caller(Config().sim.profile_path, "caller", 2 * kPage);
+  SimTransferEngine owner(Config().sim.profile_path, "owner");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
+  auto* buffer = reinterpret_cast<void*>(Buffer(2 * kPage));
+  auto local = TransferRef::HostBytes(buffer, 2 * kPage);
+  auto remote = TransferRef::Remote(owner.RegisterMemory(buffer, 2 * kPage, MemLoc::CPU, -1).mem);
+  for (bool read : {false, true}) {
+    for (size_t bytes : {kPage / 2, kPage, 2 * kPage}) {
+      const auto start = Clock::now();
+      ASSERT_TRUE(caller.Transfer({{read ? remote : local, 0, read ? local : remote, 0, bytes, 0}},
+                                  nullptr));
+      if (bytes <= kPage)
+        EXPECT_LT(Clock::now() - start, 40ms);
+      else
+        EXPECT_GE(Clock::now() - start, 80ms);
+    }
+  }
+  for (const auto& fields : {"\"size_knee_bytes\":4096", "\"large_size_ns_per_byte\":1",
+                             "\"size_knee_bytes\":0,\"large_size_ns_per_byte\":1",
+                             "\"size_knee_bytes\":4096,\"large_size_ns_per_byte\":-1"}) {
+    Profile(std::string(R"({"cpu_staging":{"channel":"host","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12,)") +
+            fields + "}}");
+    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  }
+}
+
 }  // namespace
 }  // namespace mori::umbp

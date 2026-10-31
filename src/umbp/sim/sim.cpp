@@ -257,6 +257,12 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
             ? Field(object, "batch_log_size_latency_ns", Value::kNumberValue).number_value()
             : 0;
     const size_t index = at - names.begin();
+    const bool knee = object.fields().count("size_knee_bytes");
+    const bool large = object.fields().count("large_size_ns_per_byte");
+    const double knee_bytes =
+        knee ? Field(object, "size_knee_bytes", Value::kNumberValue).number_value() : 0;
+    const double large_ns =
+        large ? Field(object, "large_size_ns_per_byte", Value::kNumberValue).number_value() : 0;
     const bool serial = object.fields().count("serialize_latency");
     const bool serialize_latency =
         serial && Field(object, "serialize_latency", Value::kBoolValue).bool_value();
@@ -269,9 +275,13 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
               registration_ns,
               log_ns,
               batch_log_ns,
+              knee_bytes,
+              large_ns,
               serialize_latency};
     if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") + registration +
-                                      logarithmic + batch_logarithmic + serial ||
+                                      logarithmic + batch_logarithmic + serial + knee + large ||
+        knee != large || (knee && (index != 6 && index != 7)) || !std::isfinite(knee_bytes) ||
+        (knee && knee_bytes <= 0) || !std::isfinite(large_ns) || large_ns < 0 ||
         (registration && name != "file_gpu") || !std::isfinite(registration_ns) ||
         ((logarithmic || batch_logarithmic || serial) && index != 10 && index != 12 &&
          index != 13 && index != 15) ||
@@ -580,14 +590,16 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::ReserveCosts(
                         std::log2(std::max(1.0L, bytes[i] / copies[i] / segment::kRecordAlign)));
     };
     const auto latency = latency_ns(path);
-    const auto duration = latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads);
+    const auto large_ns =
+        std::max(0.0L, bytes[i] - path.size_knee_bytes) * path.large_size_ns_per_byte;
+    const auto duration = latency + bytes[i] * 1e9L / AtThreads(path.bandwidth, threads) + large_ns;
     private_ns = std::max(private_ns, duration);
     // Independent SSD readers overlap latency; mixed read/write batches stay serial.
     auto service =
         (!ssd_write && !path.serialize_latency && (i == 10 || i == 12 || i == 13 || i == 15)
              ? 0
              : latency) +
-        bytes[i] * 1e9L / path.capacity;
+        bytes[i] * 1e9L / path.capacity + large_ns;
     // Native SSD I/O is serialized; checksum work runs afterward without the I/O lock.
     if (i == 13 && !ssd_write && path.serialize_latency && paths_[15] &&
         paths_[15]->serialize_latency && paths_[15]->channel == path.channel) {
