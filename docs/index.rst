@@ -22,6 +22,7 @@ MORI Documentation
    MORI-IO-GUIDE
    MORI-UMBP-SINGLE-NODE-GUIDE
    umbp-simulation
+   umbp-calibration
    PROFILER
 
 .. toctree::

@@ -545,7 +545,8 @@ TEST_F(SimTest, GdsNewReaderDelaysActiveCompletionAndRejectsOverflow) {
 
 TEST_F(SimTest, GdsAndOrdinarySameChannelReservationsDoNotOverlap) {
   Profile(R"({"file_gpu":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":20480},
-    "cpu_file":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":20480}})");
+    "cpu_gpu":{"channel":"disk","latency_ns":0,"bandwidth_bytes_per_second":20480,
+    "interleave_copies":true}})");
   SimTransferEngine engine(Config().sim.profile_path);
   const auto file = engine.RegisterFile(1, 0, kPage);
   const auto gpu =
@@ -557,8 +558,9 @@ TEST_F(SimTest, GdsAndOrdinarySameChannelReservationsDoNotOverlap) {
   });
   const auto started = entered.get_future().get();
   std::this_thread::sleep_for(50ms);
+  const auto host = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage);
   auto write = std::async(std::launch::async,
-                          [&] { return engine.SimulateStorage(false, kPage, 1, false); });
+                          [&] { return engine.Transfer({{host, 0, gpu, 0, kPage, 0}}, nullptr); });
   std::this_thread::sleep_for(20ms);
   auto later = std::async(std::launch::async,
                           [&] { return engine.Transfer({{file, 0, gpu, 0, kPage, 1}}, nullptr); });
@@ -856,7 +858,8 @@ TEST_F(SimTest, ModelCountsBytesOnceAndUsesCoalescedCopyCosts) {
 }
 
 TEST_F(SimTest, GatherModelRequiresRegisteredHostAndEligibleDeviceBatch) {
-  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":30000000,"bandwidth_bytes_per_second":1e12},
+  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":30000000,"bandwidth_bytes_per_second":1e12,
+    "interleave_copies":true},
     "cpu_gpu_gather":{"channel":"link","latency_ns":5000000,"bandwidth_bytes_per_second":1e12}})");
   SimTransferEngine engine(Config().sim.profile_path);
   constexpr size_t bytes = 256 << 10;
@@ -886,6 +889,82 @@ TEST_F(SimTest, GatherModelRequiresRegisteredHostAndEligibleDeviceBatch) {
   run({item(0, 128 << 10), item(128 << 10, 128 << 10)}, false);
   engine.ClearHostGatherRegions();
   run({item(0, kPage), item(kPage, kPage)}, false);
+}
+
+TEST_F(SimTest, GpuInterleavingRequiresAnOptionalGpuBoolean) {
+  for (const auto& field : {"", ",\"interleave_copies\":false", ",\"interleave_copies\":true"}) {
+    Profile(std::string(R"({"cpu_gpu":{"channel":"link","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12)") +
+            field + "}}");
+    EXPECT_NO_THROW(SimTransferEngine(Config().sim.profile_path));
+  }
+  for (const auto& value : {"1", "null", "\"true\"", "[true]"}) {
+    Profile(std::string(R"({"cpu_gpu":{"channel":"link","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12,"interleave_copies":)") +
+            value + "}}");
+    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  }
+  for (const auto& path : {"cpu_cpu", "gpu_gpu", "cpu_gpu_gather", "remote_read", "file_gpu"}) {
+    Profile(std::string("{\"") + path + R"(":{"channel":"link","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12,"interleave_copies":false}})");
+    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  }
+}
+
+TEST_F(SimTest, GpuInterleavingCountsNonzeroCopiesAndValidatesTheWholeInput) {
+  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":40000000,"copy_latency_ns":20000000,
+    "bandwidth_bytes_per_second":409600,"interleave_copies":true}})");
+  SimTransferEngine engine(Config().sim.profile_path);
+  TransferPlan plan;
+  plan.dir = TransferDirection::kLocal;
+  plan.src = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(2 * kPage)), 2 * kPage);
+  plan.dst =
+      TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(2 * kPage)), 2 * kPage, MemLoc::GPU, 0);
+  plan.sizes = {kPage, 0, kPage};
+  plan.src_offsets = plan.dst_offsets = {0, 0, kPage};
+  auto invalid = plan;
+  invalid.src_offsets.back() = 2 * kPage;
+  auto started = Clock::now();
+  EXPECT_EQ(engine.Submit({invalid}), nullptr);
+  auto huge = plan;
+  huge.src.size = huge.dst.size = std::numeric_limits<uint64_t>::max();
+  huge.sizes = {huge.src.size};
+  huge.src_offsets = huge.dst_offsets = {0};
+  EXPECT_EQ(engine.Submit({huge}), nullptr);
+  EXPECT_LT(Clock::now() - started, 20ms);
+  started = Clock::now();
+  ASSERT_NE(engine.Submit({plan}), nullptr);
+  EXPECT_GE(Clock::now() - started, 100ms);  // Fixed once, two copies, two pages.
+  EXPECT_LT(Clock::now() - started, 130ms);
+}
+
+TEST_F(SimTest, GpuInterleavingLetsOtherCallersRunBetweenFallbackCopies) {
+  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":0,"copy_latency_ns":40000000,
+    "bandwidth_bytes_per_second":1e12,"interleave_copies":true}})");
+  for (bool registered : {false, true}) {
+    SimTransferEngine engine(Config().sim.profile_path);
+    TransferPlan plan;
+    plan.dir = TransferDirection::kLocal;
+    plan.src = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage);
+    plan.dst =
+        TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage, MemLoc::GPU, 0);
+    plan.sizes.assign(4, kPage);
+    plan.src_offsets = plan.dst_offsets = {0, 0, 0, 0};
+    if (registered) engine.AddHostGatherRegion(plan.src.host_ptr, kPage);
+    auto first =
+        std::async(std::launch::async, [&, plan] { return engine.Submit({plan}) != nullptr; });
+    std::this_thread::sleep_for(20ms);
+    plan.sizes.resize(1);
+    plan.src_offsets = plan.dst_offsets = {0};
+    auto second =
+        std::async(std::launch::async, [&, plan] { return engine.Submit({plan}) != nullptr; });
+    const bool gathered = registered && DeviceGatherEnabled() && HostRegistrationEnabled();
+    EXPECT_EQ(second.wait_for(110ms),
+              gathered ? std::future_status::timeout : std::future_status::ready);
+    EXPECT_EQ(first.wait_for(0ms), std::future_status::timeout);
+    EXPECT_TRUE(second.get());
+    EXPECT_TRUE(first.get());
+  }
 }
 
 TEST_F(SimTest, ReusesCapacityLeasesAndProductionReaper) {
@@ -1260,6 +1339,39 @@ TEST_F(SimTest, CalibratedStagingUsesItsOwnCopyCost) {
   const auto read_start = Clock::now();
   ASSERT_TRUE(caller.Transfer({{remote, 0, local, 0, kPage, 0}}, nullptr));
   EXPECT_GE(Clock::now() - read_start, 40ms);
+}
+
+TEST_F(SimTest, StagingSizeKneeChargesOnlyBytesAboveTheKnee) {
+  const std::string curve = R"({"channel":"host","latency_ns":0,
+    "bandwidth_bytes_per_second":1e12,"size_knee_bytes":4096,"large_size_ns_per_byte":20000})";
+  Profile("{\"cpu_staging\":" + curve + ",\"cpu_staging_read\":" + curve +
+          R"(,"remote_read":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12},
+    "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
+  SimTransferEngine caller(Config().sim.profile_path, "caller", 2 * kPage);
+  SimTransferEngine owner(Config().sim.profile_path, "owner");
+  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
+  auto* buffer = reinterpret_cast<void*>(Buffer(2 * kPage));
+  auto local = TransferRef::HostBytes(buffer, 2 * kPage);
+  auto remote = TransferRef::Remote(owner.RegisterMemory(buffer, 2 * kPage, MemLoc::CPU, -1).mem);
+  for (bool read : {false, true}) {
+    for (size_t bytes : {kPage / 2, kPage, 2 * kPage}) {
+      const auto start = Clock::now();
+      ASSERT_TRUE(caller.Transfer({{read ? remote : local, 0, read ? local : remote, 0, bytes, 0}},
+                                  nullptr));
+      if (bytes <= kPage)
+        EXPECT_LT(Clock::now() - start, 40ms);
+      else
+        EXPECT_GE(Clock::now() - start, 80ms);
+    }
+  }
+  for (const auto& fields : {"\"size_knee_bytes\":4096", "\"large_size_ns_per_byte\":1",
+                             "\"size_knee_bytes\":0,\"large_size_ns_per_byte\":1",
+                             "\"size_knee_bytes\":4096,\"large_size_ns_per_byte\":-1"}) {
+    Profile(std::string(R"({"cpu_staging":{"channel":"host","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12,)") +
+            fields + "}}");
+    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
+  }
 }
 
 }  // namespace
