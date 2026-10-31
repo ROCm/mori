@@ -85,19 +85,6 @@ std::unordered_map<int, int> GpuNumaNodes() {
   return nodes;
 }
 
-size_t RangedScratchShardsFromEnv() {
-  static const size_t n = [] {
-    size_t shards = 0;
-    if (const char* value = std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS")) {
-      char* end = nullptr;
-      const unsigned long long parsed = std::strtoull(value, &end, 10);
-      if (end != value && *end == '\0' && parsed > 0) shards = static_cast<size_t>(parsed);
-    }
-    return std::min<size_t>(shards, 64);
-  }();
-  return n;
-}
-
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -285,6 +272,9 @@ struct RangedPhases {
   size_t rmt_bounce = 0;
   size_t scat_items = 0;  // no plan count: getting one costs a second Plan()
                           // pass, inside the very phase being measured
+  // The scratch slice a remote call leased, and the arena rounds it took in it.
+  size_t slice_bytes = 0;
+  size_t rounds = 0;
   size_t local_keys = 0;
   size_t remote_keys = 0;
   double bytes = 0.0;
@@ -395,6 +385,9 @@ class RangedStats {
     t.rmt_plans += p.rmt_plans;
     t.rmt_bounce += p.rmt_bounce;
     t.scat_items += p.scat_items;
+    t.leased += p.slice_bytes > 0 ? 1 : 0;
+    t.slice_bytes += p.slice_bytes;
+    t.rounds += p.rounds;
 
     // Per-component totals, keyed by object size (one call = one pool).  The
     // sample key is stored once per (op, size) so the log proves the
@@ -436,6 +429,7 @@ class RangedStats {
     uint64_t calls = 0;
     uint64_t items = 0;
     uint64_t rmt_items = 0, rmt_plans = 0, rmt_bounce = 0, scat_items = 0;
+    uint64_t leased = 0, slice_bytes = 0, rounds = 0;  // over calls that leased a slice
     double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
            rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0, rmt_bld_post = 0,
@@ -456,7 +450,8 @@ class RangedStats {
     auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
     MORI_UMBP_INFO(
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
-        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl bounce={:.2f} scat_items={:.0f} | "
+        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl bounce={:.2f} scat_items={:.0f} "
+        "slice={:.1f}MiB rounds={:.2f} | "
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
@@ -467,9 +462,11 @@ class RangedStats {
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
         static_cast<double>(t.items) / t.calls, static_cast<double>(t.rmt_items) / t.calls,
         static_cast<double>(t.rmt_plans) / t.calls, static_cast<double>(t.rmt_bounce) / t.calls,
-        static_cast<double>(t.scat_items) / t.calls, share(t.resolve), share(t.classify),
-        share(t.build), share(t.validate), share(t.commit), share(t.route), share(t.xfer),
-        share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
+        static_cast<double>(t.scat_items) / t.calls,
+        t.leased > 0 ? static_cast<double>(t.slice_bytes) / t.leased / (1024.0 * 1024) : 0.0,
+        t.leased > 0 ? static_cast<double>(t.rounds) / t.leased : 0.0, share(t.resolve),
+        share(t.classify), share(t.build), share(t.validate), share(t.commit), share(t.route),
+        share(t.xfer), share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
         share(t.remote), share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items),
         share(t.rmt_bld_plan), share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode),
         share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium),
@@ -722,16 +719,6 @@ bool RangesAreDisjointAndInBounds(size_t object_size, const std::vector<size_t>&
   }
   return true;
 }
-
-// Scratch-arena slice alignment.  Objects are packed back-to-back into the
-// arena; 64 B keeps each slice on a cache line so two concurrently-filled
-// slices never share one.
-constexpr size_t kRangedScratchAlignment = 64;
-
-// How many shards each ranged scratch arena is cut into.  1 is the historical
-// single-arena behaviour; 8 is one shard per rank of a TP8 node, which is what
-// the single arena mutex was serializing.
-size_t RangedScratchShards() { return std::max<size_t>(RangedScratchShardsFromEnv(), 1); }
 
 bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
   if (!out || alignment == 0) return false;
@@ -1181,24 +1168,38 @@ bool PoolClient::Init() {
     }
   }
 
-  // Registration above covers the whole buffer; the shards below are slices of
-  // it, so cutting them needs no further registration.
-  const auto make_arenas = [](const std::vector<PoolClientConfig::RangedScratchArena>& configured,
-                              const char* direction,
-                              std::vector<std::unique_ptr<ScratchArena>>* out) {
+  // Registration above covers the whole buffer; a slice of it needs no further
+  // registration.  An arena is for one call per GPU that stages through it: its
+  // node's GPUs when it is placed by node, else every GPU.
+  std::unordered_map<int, int> gpus = gpu_to_numa_;
+  if (gpus.empty() &&
+      (!config_.ranged_get_scratch.empty() || !config_.ranged_put_scratch.empty())) {
+    gpus = GpuNumaNodes();
+  }
+  const auto make_arenas = [&](const std::vector<PoolClientConfig::RangedScratchArena>& configured,
+                               const char* direction,
+                               std::vector<std::unique_ptr<ScratchArena>>* out) {
     out->clear();
     for (const auto& c : configured) {
       if (c.buffer == nullptr || c.size == 0) continue;
-      auto arena = std::make_unique<ScratchArena>();
-      arena->Reset(c.buffer, c.size, c.shards > 0 ? c.shards : RangedScratchShards(), c.numa_node);
-      MORI_UMBP_INFO("[PoolClient] ranged {} scratch{}: {}B in {}B shards", direction,
-                     c.numa_node >= 0 ? " on NUMA node " + std::to_string(c.numa_node) : "", c.size,
-                     arena->ShardBytes());
-      out->push_back(std::move(arena));
+      size_t callers = 0;
+      for (const auto& [device, node] : gpus) {
+        if (c.numa_node < 0 || node == c.numa_node) ++callers;
+      }
+      callers = std::max<size_t>(callers, 2);
+      out->push_back(std::make_unique<ScratchArena>(c.buffer, c.size, c.numa_node, callers));
+      MORI_UMBP_INFO("[PoolClient] ranged {} scratch{}: {}B for {} callers", direction,
+                     c.numa_node >= 0 ? " on NUMA node " + std::to_string(c.numa_node) : "",
+                     out->back()->Bytes(), callers);
     }
   };
   make_arenas(config_.ranged_get_scratch, "get", &ranged_get_scratch_);
   make_arenas(config_.ranged_put_scratch, "put", &ranged_put_scratch_);
+  if (std::getenv("UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS") != nullptr) {
+    MORI_UMBP_WARN(
+        "[PoolClient] UMBP_DISTRIBUTED_RANGED_SCRATCH_SHARDS is no longer used: concurrent "
+        "ranged calls share an arena by size");
+  }
   // The switches that decide how much of a ranged call is even reachable, said
   // once at startup so a run can assert which configuration it got.  An arm
   // that silently ran a different one is the failure mode that still produces
@@ -1606,7 +1607,7 @@ int PoolClient::SourceNumaHint(const void* src, size_t size) const {
   return -1;
 }
 
-PoolClient::ScratchArena* PoolClient::RangedArenaFor(bool get, const void* caller_buffer) {
+ScratchArena* PoolClient::RangedArenaFor(bool get, const void* caller_buffer) {
   const auto& arenas = get ? ranged_get_scratch_ : ranged_put_scratch_;
   if (arenas.empty()) return nullptr;
   if (arenas.size() > 1 && caller_buffer != nullptr) {
@@ -3397,103 +3398,6 @@ std::vector<PoolClient::ObjectRange> MakeWriteRanges(const std::vector<const voi
 
 }  // namespace
 
-void PoolClient::ScratchArena::Reset(void* base, size_t bytes, size_t shards, int numa_node) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  bases_.clear();
-  busy_.clear();
-  shard_bytes_ = 0;
-  base_ = nullptr;
-  bytes_ = 0;
-  numa_node_ = numa_node;
-  if (base == nullptr || bytes == 0 || shards == 0) return;
-  base_ = static_cast<char*>(base);
-  bytes_ = bytes;
-
-  // Shards are cut on kRangedScratchAlignment so a slice never starts mid-cache
-  // line, and a count that would leave a shard smaller than one alignment unit
-  // collapses back to a single arena rather than producing unusable slivers.
-  size_t shard = (bytes / shards) & ~(kRangedScratchAlignment - 1);
-  if (shard == 0) {
-    shard = bytes;
-    shards = 1;
-  }
-  shard_bytes_ = shard;
-  bases_.reserve(shards);
-  busy_.assign(shards, 0);
-  for (size_t i = 0; i < shards; ++i) bases_.push_back(static_cast<char*>(base) + i * shard);
-}
-
-PoolClient::ScratchArena::Lease PoolClient::ScratchArena::Acquire() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  if (bases_.empty()) return Lease{};
-  // Uncontended: nothing is queued, so nobody can be jumped.
-  if (waiters_.empty()) {
-    for (size_t i = 0; i < busy_.size(); ++i) {
-      if (busy_[i] == 0) {
-        busy_[i] = 1;
-        return Lease{this, i, 1, bases_[i]};
-      }
-    }
-  }
-  size_t index = bases_.size();
-  const uint64_t ticket = next_ticket_++;
-  waiters_.emplace_back(ticket, false);
-  cv_.wait(lock, [&] {
-    for (const auto& [t, exclusive] : waiters_) {
-      if (t >= ticket) break;
-      if (exclusive) return false;  // an exclusive waiter got here first
-    }
-    for (size_t i = 0; i < busy_.size(); ++i) {
-      if (busy_[i] == 0) {
-        index = i;
-        return true;
-      }
-    }
-    return false;
-  });
-  Forget(ticket);
-  busy_[index] = 1;
-  return Lease{this, index, 1, bases_[index]};
-}
-
-PoolClient::ScratchArena::Lease PoolClient::ScratchArena::AcquireAll() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  if (bases_.empty()) return Lease{};
-  // Queue first, so later arrivals stop being admitted and the shards held by
-  // earlier ones can drain.  Waiting to be the OLDEST waiter -- not merely the
-  // oldest exclusive one -- is what stops a stream of exclusives from stepping
-  // over a shard waiter that was already queued.
-  const uint64_t ticket = next_ticket_++;
-  waiters_.emplace_back(ticket, true);
-  cv_.wait(lock, [&] {
-    return waiters_.front().first == ticket &&
-           std::all_of(busy_.begin(), busy_.end(), [](uint8_t b) { return b == 0; });
-  });
-  Forget(ticket);
-  std::fill(busy_.begin(), busy_.end(), 1);
-  return Lease{this, 0, busy_.size(), bases_[0]};
-}
-
-void PoolClient::ScratchArena::Forget(uint64_t ticket) {
-  for (auto it = waiters_.begin(); it != waiters_.end(); ++it) {
-    if (it->first == ticket) {
-      waiters_.erase(it);
-      return;
-    }
-  }
-}
-
-void PoolClient::ScratchArena::Release(size_t index, size_t count) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (index >= busy_.size()) return;
-    const size_t end = std::min(busy_.size(), index + count);
-    for (size_t i = index; i < end; ++i) busy_[i] = 0;
-  }
-  // notify_all: waking one waiter may wake the wrong kind.
-  cv_.notify_all();
-}
-
 // The route-first arm of BatchGetRanges: one BatchRouteGet over EVERY key,
 // issued before anything is served.
 //
@@ -3783,8 +3687,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
   // fit in one arena round by the same factor.
   //
   // GET has its own arena, so it overlaps a concurrent remote PUT (which uses
-  // the separate PUT arena).  Sizing below is against ONE SHARD, not the whole
-  // buffer: a unit that fits the buffer but not a shard would never get a slice.
+  // the separate PUT arena).
   const void* caller_buffer = nullptr;
   for (size_t index : missed) {
     if (!dsts[index].empty()) {
@@ -3793,45 +3696,19 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     }
   }
   ScratchArena* const arena = RangedArenaFor(/*get=*/true, caller_buffer);
-  char* const scratch_all = arena != nullptr ? arena->Base() : nullptr;
-  if (scratch_all == nullptr || arena->ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, arena->Bytes()).has_value()) {
+  if (arena == nullptr || arena->Bytes() == 0 ||
+      !FindRegisteredMemory(arena->Base(), arena->Bytes()).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: ranged scratch is absent or not registered");
     return results;
   }
-  // Sharding must not change WHAT a call can do, only how many calls overlap.
-  // A shard-sized arena breaks two things, so either sends the call down the
-  // exclusive whole-arena path:
-  //   * a span wider than a shard is unservable, though it was servable before;
-  //   * a key whose spans total more than a shard gets SPLIT across units, and a
-  //     split unit is never holds_whole_object -- silently losing the
-  //     whole-object medium bypass and the locality install.
-  //
-  // Asked PER KEY and OR'd, never as a batch-wide maximum.  A key too big for
-  // even the full arena is no better off exclusive, so it must not answer for
-  // the others: taking the max let one such key veto exclusivity for a
-  // batch-mate that needed it and would have fitted.
-  const size_t shard_bytes = arena->ShardBytes();
-  const size_t full_bytes = arena->Bytes();
-  bool exclusive_arena = false;
-  for (size_t index : missed) {
-    size_t key_total = 0;
-    size_t widest_span = 0;
-    for (size_t span_bytes : sizes[index]) {
-      widest_span = std::max(widest_span, span_bytes);
-      key_total += span_bytes;
-    }
-    const bool span_needs_full = widest_span > shard_bytes && widest_span <= full_bytes;
-    const bool total_needs_full = key_total > shard_bytes && key_total <= full_bytes;
-    if (span_needs_full || total_needs_full) {
-      exclusive_arena = true;
-      break;
-    }
-  }
-  const size_t scratch_size = exclusive_arena ? full_bytes : shard_bytes;
+  // Units are cut at the arena's size, and the call's slice holds its largest
+  // unit: only a span wider than the arena is unservable, and a key that fits
+  // the arena stays one unit -- a split unit is never holds_whole_object, which
+  // would lose the whole-object medium bypass and the locality install.
+  const size_t scratch_size = arena->Bytes();
 
   // Routing is a master RPC that never touches the arena, so it runs before a
-  // shard is taken rather than holding every other arena user behind it.
+  // slice is taken rather than holding every other arena user behind it.
   std::vector<std::string> route_keys;
   route_keys.reserve(missed.size());
   for (size_t index : missed) route_keys.push_back(keys[index]);
@@ -3947,21 +3824,35 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     return results;
   }
 
-  // Only arena users wait, and only for a free SHARD; the local hits above were
-  // fully concurrent, and so were the routing RPC and the slot-served units.
+  // Only arena users wait, and only for a slice; the local hits above were fully
+  // concurrent, and so were the routing RPC and the slot-served units.  The
+  // slice holds the largest unit, and every unit if the arena can spare it.
+  size_t largest_unit = 0;
+  size_t all_units = 0;
+  for (const auto& unit : units) {
+    largest_unit = std::max(largest_unit, unit.bytes);
+    all_units += unit.bytes + ScratchArena::kAlignment;
+  }
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease = exclusive_arena ? arena->AcquireAll() : arena->Acquire();
+    scratch_lease = arena->Acquire(largest_unit, all_units);
   }
   char* const scratch_base = scratch_lease.base();
-  // The arena described ONCE, by its registered base.  Plans key on (src base,
+  const size_t slice_bytes = scratch_lease.size();
+  if (slice_bytes < largest_unit) {
+    MORI_UMBP_ERROR("[PoolClient] BatchGetRanges: a {}B scratch slice cannot hold a {}B unit",
+                    slice_bytes, largest_unit);
+    return results;
+  }
+  if (dbg != nullptr) dbg->slice_bytes = slice_bytes;
+  // The slice described ONCE, by its registered base.  Plans key on (src base,
   // dst base), so a per-unit slice ref made every unit x destination pair its
   // own single-segment plan (~8k of them for a layer-wise load).
-  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
+  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, slice_bytes);
 
   // Pack as many units into the arena as fit, fetch that group, then repeat.
-  // Units are 64 B apart so two concurrently-filled slices never share a cache
+  // Units are 64 B apart so two concurrently-filled units never share a cache
   // line; spans WITHIN a unit are exactly packed, which is what lets a group of
   // adjacent layer ranges coalesce into a single wire segment.
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
@@ -3990,16 +3881,17 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     size_t end = pos;
     for (; end < units.size(); ++end) {
       size_t aligned = 0;
-      if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          aligned > scratch_size - units[end].bytes) {
+      if (!AlignUpChecked(cursor, ScratchArena::kAlignment, &aligned) ||
+          aligned > slice_bytes - units[end].bytes) {
         break;
       }
       scratch_offsets.push_back(aligned);
       cursor = aligned + units[end].bytes;
     }
-    // Unit sizing already caps every unit at scratch_size, so the first one
-    // always fits and this loop always advances.
+    // The slice holds the largest unit, so the first one always fits and this
+    // loop always advances.
     const size_t count = end - pos;
+    if (dbg != nullptr) ++dbg->rounds;
 
     PhaseTimer sub_timer(dbg ? &dbg->rmt_sub : nullptr);
     std::vector<std::string> sub_keys;
@@ -4233,7 +4125,6 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   // A key routed to another node has to be one contiguous object on the wire,
   // so this is the one direction that needs the arena.  PUT has its own arena,
   // so it overlaps a concurrent remote GET (which uses the separate GET arena).
-  // Sizing is against ONE SHARD; see the GET path for why.
   const void* caller_buffer = nullptr;
   for (size_t r : remote) {
     if (!srcs[valid[r]].empty()) {
@@ -4242,37 +4133,34 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     }
   }
   ScratchArena* const arena = RangedArenaFor(/*get=*/false, caller_buffer);
-  char* const scratch_all = arena != nullptr ? arena->Base() : nullptr;
-  if (scratch_all == nullptr || arena->ShardBytes() == 0 ||
-      !FindRegisteredMemory(scratch_all, arena->Bytes()).has_value()) {
+  if (arena == nullptr || arena->Bytes() == 0 ||
+      !FindRegisteredMemory(arena->Base(), arena->Bytes()).has_value()) {
     MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: ranged scratch is absent or not registered");
     return results;
   }
-  // A put stages the WHOLE object and never splits one, so object size is the
-  // only thing a shard can make unservable.  Per key and OR'd, for the reason
-  // the get path spells out: a batch-wide max lets an object too big for the
-  // whole arena veto exclusivity for one that needed it, and that one then gets
-  // rejected at shard size though it was servable before sharding existed.
-  const size_t put_shard_bytes = arena->ShardBytes();
-  const size_t put_full_bytes = arena->Bytes();
-  bool exclusive_arena = false;
+  // A put stages each object whole, so the slice holds the largest one that fits
+  // the arena -- one that does not fails alone below -- and every one if the
+  // arena can spare it.
+  const size_t scratch_size = arena->Bytes();
+  size_t largest_object = 0;
+  size_t all_objects = 0;
   for (size_t r : remote) {
     const size_t object_size = object_sizes[valid[r]];
-    if (object_size > put_shard_bytes && object_size <= put_full_bytes) {
-      exclusive_arena = true;
-      break;
-    }
+    if (object_size > scratch_size) continue;
+    largest_object = std::max(largest_object, object_size);
+    all_objects += object_size + ScratchArena::kAlignment;
   }
-  const size_t scratch_size = exclusive_arena ? put_full_bytes : put_shard_bytes;
   ScratchArena::Lease scratch_lease;
   {
     PhaseTimer lock_timer(dbg ? &dbg->lock : nullptr);
-    scratch_lease = exclusive_arena ? arena->AcquireAll() : arena->Acquire();
+    scratch_lease = arena->Acquire(largest_object, all_objects);
   }
   char* const scratch_base = scratch_lease.base();
-  // The arena named once, by its registered base -- the read side's reason
+  const size_t slice_bytes = scratch_lease.size();
+  if (dbg != nullptr) dbg->slice_bytes = slice_bytes;
+  // The slice named once, by its registered base -- the read side's reason
   // (see BatchGetRanges) applies unchanged to the assemble side.
-  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, scratch_size);
+  const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, slice_bytes);
 
   PhaseTimer remote_timer(dbg ? &dbg->remote : nullptr);
   size_t pos = 0;
@@ -4283,8 +4171,8 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     for (; end < remote.size(); ++end) {
       const size_t object_size = object_sizes[valid[remote[end]]];
       size_t aligned = 0;
-      if (!AlignUpChecked(cursor, kRangedScratchAlignment, &aligned) ||
-          object_size > scratch_size || aligned > scratch_size - object_size) {
+      if (!AlignUpChecked(cursor, ScratchArena::kAlignment, &aligned) ||
+          object_size > slice_bytes || aligned > slice_bytes - object_size) {
         break;
       }
       scratch_offsets.push_back(aligned);
@@ -4300,6 +4188,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     }
 
     const size_t count = end - pos;
+    if (dbg != nullptr) ++dbg->rounds;
     std::vector<std::string> sub_keys;
     std::vector<const void*> sub_srcs;
     std::vector<size_t> sub_sizes;
@@ -4355,14 +4244,14 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     for (size_t j = 0; j < count; ++j) {
       const size_t route_index = remote[pos + j];
       const size_t original = valid[route_index];
-      void* slice = scratch_base + scratch_offsets[j];
+      void* staged = scratch_base + scratch_offsets[j];
       if (assembled.count(j) == 0 || assembly_failed.count(j) != 0) {
         MORI_UMBP_ERROR("[PoolClient] BatchPutRanges: assembly failed for key='{}'",
                         keys[original]);
         continue;
       }
       sub_keys.push_back(keys[original]);
-      sub_srcs.push_back(slice);
+      sub_srcs.push_back(staged);
       sub_sizes.push_back(object_sizes[original]);
       sub_numa.push_back(srcs[original].empty()
                              ? -1

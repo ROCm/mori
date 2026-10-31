@@ -211,6 +211,11 @@ target_link_libraries(test_umbp_page_bitmap_allocator PRIVATE umbp_common
 add_test(NAME umbp_page_bitmap_allocator
          COMMAND test_umbp_page_bitmap_allocator)
 
+# ScratchArena (how concurrent ranged calls share a scratch buffer).
+add_executable(test_umbp_scratch_arena test_scratch_arena.cpp)
+target_link_libraries(test_umbp_scratch_arena PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_scratch_arena COMMAND test_umbp_scratch_arena)
+
 # --------------------------------------------------------------------------
 # Integration tests (stand up in-process servers; gRPC + RDMA data path).
 # Registered as CTest cases under the "integration" label.

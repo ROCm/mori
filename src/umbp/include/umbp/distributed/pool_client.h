@@ -45,6 +45,7 @@
 #include "umbp/distributed/metrics/activity_summary.h"
 #include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/scratch_arena.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
 #include "umbp_peer.grpc.pb.h"
@@ -691,105 +692,13 @@ class PoolClient {
   // that misses locally would queue another pull of bytes already in flight.
   std::unordered_set<std::string> prefetch_inflight_;
 
-  // One caller-owned ranged scratch buffer, split into equal shards that are
-  // leased independently.  Only the remote half of a ranged operation takes a
-  // shard — keys served by this node's own medium never touch an arena and stay
-  // fully concurrent.
-  //
-  // Separate GET and PUT arenas, so a remote ranged GET and a remote ranged PUT
-  // run concurrently — the load/offload overlap sglang's direct linker wants.
-  //
-  // Why shards and not one lock: every rank on a node shares one standalone
-  // server process, hence one PoolClient and one arena.  With a single mutex TP8
-  // made 7 of 8 remote ranged GETs wait, measured at 84–87% of call time (`lock=`
-  // in the UMBP_RANGED_CALL_DEBUG summary).  Shards split the SAME allocation, so
-  // a larger count means smaller shards and more arena rounds per call — raise
-  // UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES alongside it.
-  class ScratchArena {
-   public:
-    // Non-owning: the buffer belongs to the caller (DistributedClient).  A shard
-    // count of 0 or 1 keeps the original single-arena behaviour.
-    void Reset(void* base, size_t bytes, size_t shards, int numa_node = -1);
-    size_t ShardBytes() const { return shard_bytes_; }
-    char* Base() const { return base_; }
-    size_t Bytes() const { return bytes_; }
-    // The node the buffer was placed on; -1 when it was not placed by node.
-    int NumaNode() const { return numa_node_; }
-
-    // Holds a shard for its lifetime and gives it back on destruction, so every
-    // early exit out of an arena loop releases it.
-    class Lease {
-     public:
-      Lease() = default;
-      Lease(ScratchArena* owner, size_t index, size_t count, char* base)
-          : owner_(owner), index_(index), count_(count), base_(base) {}
-      Lease(const Lease&) = delete;
-      Lease& operator=(const Lease&) = delete;
-      Lease(Lease&& other) noexcept { *this = std::move(other); }
-      Lease& operator=(Lease&& other) noexcept {
-        if (this != &other) {
-          if (owner_ != nullptr) owner_->Release(index_, count_);
-          owner_ = other.owner_;
-          index_ = other.index_;
-          count_ = other.count_;
-          base_ = other.base_;
-          other.owner_ = nullptr;
-          other.base_ = nullptr;
-        }
-        return *this;
-      }
-      ~Lease() {
-        if (owner_ != nullptr) owner_->Release(index_, count_);
-      }
-      char* base() const { return base_; }
-
-     private:
-      ScratchArena* owner_ = nullptr;
-      size_t index_ = 0;
-      size_t count_ = 0;
-      char* base_ = nullptr;
-    };
-
-    // Blocks until a shard is free, and until no AcquireAll is queued.  Empty
-    // lease if Reset never got a usable buffer; the caller rejects that upstream.
-    Lease Acquire();
-
-    // Blocks until EVERY shard is free, then leases the whole buffer.  Sharding
-    // must not shrink what a call can serve, so a call needing more than a shard
-    // takes the arena exclusively rather than failing.
-    Lease AcquireAll();
-
-   private:
-    void Release(size_t index, size_t count);
-    // Drop an admitted waiter from the arrival queue.
-    void Forget(uint64_t ticket);
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    // One arrival-ordered queue of everything not yet admitted, which is what
-    // makes both directions starvation-free:
-    //   * a shard waiter enters once no EXCLUSIVE waiter arrived ahead of it
-    //     and a shard is free -- so consecutive shard waiters still run
-    //     concurrently, which is the whole point of sharding;
-    //   * an exclusive waiter enters once it is the oldest waiter of EITHER
-    //     kind and every shard is free.
-    // Each is then blocked only by arrivals older than itself, and those are
-    // finite, so neither side can be passed over indefinitely.  Recording only
-    // one of the two kinds gets this wrong in whichever direction is left
-    // invisible.  An uncontended Acquire never touches the queue.
-    uint64_t next_ticket_ = 0;
-    std::deque<std::pair<uint64_t, bool>> waiters_;  // (ticket, is_exclusive)
-    std::vector<char*> bases_;
-    // Not vector<bool>: this is written under the mutex and read by index, and
-    // the proxy-reference specialisation buys nothing at these sizes.
-    std::vector<uint8_t> busy_;
-    size_t shard_bytes_ = 0;
-    char* base_ = nullptr;
-    size_t bytes_ = 0;
-    int numa_node_ = -1;
-  };
-
-  // PoolClientConfig::ranged_{get,put}_scratch, held by pointer because an
+  // The ranged scratch arenas (PoolClientConfig::ranged_{get,put}_scratch).  Only
+  // the remote half of a ranged operation leases a slice -- keys served by this
+  // node's own medium never touch an arena and stay fully concurrent.  GET and
+  // PUT have arenas of their own, so a remote ranged GET and a remote ranged PUT
+  // run concurrently -- the load/offload overlap sglang's direct linker wants.
+  // Every rank of a node shares one standalone server, hence these arenas; see
+  // ScratchArena for how concurrent calls share one.  Held by pointer because an
   // arena owns a mutex.
   std::vector<std::unique_ptr<ScratchArena>> ranged_get_scratch_;
   std::vector<std::unique_ptr<ScratchArena>> ranged_put_scratch_;
