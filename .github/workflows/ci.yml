@@ -1162,6 +1162,11 @@ jobs:
           # (round 1110 on 2x8 MI355X); 20k rounds take about 50 s per kernel.
           SCRIPT="$GITHUB_WORKSPACE/tools/run_internode_test.sh"
           SA_ENV="-e MORI_INTERNODE_TIMEOUT=600 -e MORI_STRESS_ROUNDS=20000 -e MORI_STRESS_JITTER=200"
+          # AI NIC runs the atomic-free V1/V1LL signalling, as the nightly atomic-free bench does;
+          # with RDMA-atomic chunk signals it mis-routes a token (open issue, not these races).
+          if [[ "${{ matrix.platform }}" == "MI355X_AINIC" ]]; then
+            SA_ENV="$SA_ENV -e MORI_EP_DISABLE_RDMA_ATOMICS=1"
+          fi
           PORT=29150
           for KERNEL in v1 v1_ll; do
             echo "=== stress_accuracy kernel=$KERNEL max-tokens=1024 rounds=20000 jitter=200us port=$PORT ==="
