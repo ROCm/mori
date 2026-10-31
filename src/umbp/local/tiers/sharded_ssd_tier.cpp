@@ -323,6 +323,19 @@ std::vector<EvictionHint> ShardedSsdTier::EvictionOrder(size_t max_keys) {
   return out;
 }
 
+size_t ShardedSsdTier::Touch(const std::vector<std::string>& keys) {
+  std::vector<std::vector<std::string>> by_shard(shards_.size());
+  for (const auto& key : keys) {
+    const int shard = ShardOf(key);
+    if (shard >= 0) by_shard[shard].push_back(key);
+  }
+  size_t touched = 0;
+  for (size_t i = 0; i < shards_.size(); ++i) {
+    if (!by_shard[i].empty()) touched += shards_[i]->Touch(by_shard[i]);
+  }
+  return touched;
+}
+
 void ShardedSsdTier::SetRetiredFileHook(std::function<void(int fd)> on_close,
                                         std::chrono::milliseconds grace) {
   for (auto& s : shards_) s->SetRetiredFileHook(on_close, grace);

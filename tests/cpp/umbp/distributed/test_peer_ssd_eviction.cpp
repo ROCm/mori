@@ -161,6 +161,64 @@ Harness MakeHarness(size_t capacity) {
   return Harness{raw, std::make_unique<PeerSsdManager>(std::move(be))};
 }
 
+// A tier that orders its own eviction, records the touches it gets, and can
+// hold an eviction while it is under way.
+class OrderingBackend : public FakeBackend {
+ public:
+  using FakeBackend::FakeBackend;
+
+  TierCapabilities Capabilities() const override {
+    TierCapabilities caps = FakeBackend::Capabilities();
+    caps.orders_eviction = true;
+    return caps;
+  }
+
+  size_t Touch(const std::vector<std::string>& keys) override {
+    std::lock_guard<std::mutex> lk(touch_mu_);
+    touched_.insert(touched_.end(), keys.begin(), keys.end());
+    return keys.size();
+  }
+
+  bool Evict(const std::string& key) override {
+    {
+      std::unique_lock<std::mutex> lk(evict_mu_);
+      ++evicts_started_;
+      evict_started_cv_.notify_all();
+      evict_cv_.wait(lk, [this] { return !evict_blocked_; });
+    }
+    return FakeBackend::Evict(key);
+  }
+
+  std::vector<std::string> touched() const {
+    std::lock_guard<std::mutex> lk(touch_mu_);
+    return touched_;
+  }
+  void BlockEvicts() {
+    std::lock_guard<std::mutex> lk(evict_mu_);
+    evict_blocked_ = true;
+  }
+  void UnblockEvicts() {
+    {
+      std::lock_guard<std::mutex> lk(evict_mu_);
+      evict_blocked_ = false;
+    }
+    evict_cv_.notify_all();
+  }
+  void WaitEvictStarted() {
+    std::unique_lock<std::mutex> lk(evict_mu_);
+    evict_started_cv_.wait(lk, [this] { return evicts_started_ > 0; });
+  }
+
+ private:
+  mutable std::mutex touch_mu_;
+  std::vector<std::string> touched_;
+  std::mutex evict_mu_;
+  std::condition_variable evict_cv_;
+  std::condition_variable evict_started_cv_;
+  bool evict_blocked_ = false;
+  int evicts_started_ = 0;
+};
+
 int CountKind(const std::vector<KvEvent>& events, KvEvent::Kind kind) {
   int n = 0;
   for (const auto& e : events) {
@@ -189,6 +247,44 @@ TEST(PeerSsdEviction, WriteAndPrepareReadRefreshLru) {
   EXPECT_EQ(candidates.front().bytes, 4u);
   EXPECT_EQ(h.mgr->EvictionCandidates(100).size(), 3u);
   EXPECT_TRUE(h.mgr->Exists("B")) << "asking for candidates freed one";
+}
+
+TEST(PeerSsdEviction, TouchRefreshesLruAsAReadDoes) {
+  auto h = MakeHarness(/*capacity=*/1'000'000);
+  ASSERT_TRUE(Put(*h.mgr, "A", "aaaa"));
+  ASSERT_TRUE(Put(*h.mgr, "B", "bbbb"));
+  ASSERT_TRUE(Put(*h.mgr, "C", "cccc"));
+
+  // LRU is A, B, C; touching A makes B the coldest without reading anything.
+  EXPECT_EQ(h.mgr->Touch({"A", "missing"}), 1u);
+  EXPECT_EQ(h.mgr->Touch({}), 0u);
+  auto candidates = h.mgr->EvictionCandidates(/*max_count=*/1);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_EQ(candidates.front().key, "B");
+  EXPECT_EQ(h.mgr->EvictionCandidates(100).size(), 3u) << "a touch stored the unknown key";
+}
+
+TEST(PeerSsdEviction, TouchReachesATierThatOrdersItsOwnEviction) {
+  auto backend = std::make_unique<OrderingBackend>(/*capacity=*/1'000'000);
+  OrderingBackend* tier = backend.get();
+  PeerSsdManager mgr(std::move(backend));
+  ASSERT_TRUE(mgr.OrdersEviction());
+  ASSERT_TRUE(Put(mgr, "A", "aaaa"));
+  ASSERT_TRUE(Put(mgr, "B", "bbbb"));
+
+  EXPECT_EQ(mgr.Touch({"A", "missing", "B"}), 2u);
+  EXPECT_EQ(tier->touched(), (std::vector<std::string>{"A", "B"}))
+      << "only held keys reach the tier";
+
+  // A key whose eviction is under way is no longer held.
+  tier->BlockEvicts();
+  std::thread evictor([&] { EXPECT_TRUE(mgr.Evict("A")); });
+  tier->WaitEvictStarted();
+  EXPECT_EQ(mgr.Touch({"A", "B"}), 1u);
+  tier->UnblockEvicts();
+  evictor.join();
+  EXPECT_EQ(tier->touched(), (std::vector<std::string>{"A", "B", "B"}));
+  EXPECT_EQ(mgr.Touch({"A"}), 0u);
 }
 
 TEST(PeerSsdEviction, WritesNeverEvict) {

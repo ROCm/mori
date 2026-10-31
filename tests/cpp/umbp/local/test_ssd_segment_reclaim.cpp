@@ -240,6 +240,37 @@ TEST_F(SegmentReclaimTest, InPlaceReadCountsAsAnAccess) {
   EXPECT_EQ(tier->EvictionOrder(1).front().key, Key(16));
 }
 
+// A caller's recency hint (BatchTouch) moves a key as a read does: its segment
+// becomes the most recently accessed, and within it the key goes last.
+TEST_F(SegmentReclaimTest, TouchCountsAsAnAccess) {
+  auto tier = MakeTier();
+  for (int i = 0; i < 48; ++i) ASSERT_TRUE(Write(*tier, i));  // segments 0..2, 2 active
+  EXPECT_EQ(tier->Touch({Key(3), "missing"}), 1u);
+  EXPECT_EQ(tier->Touch({}), 0u);
+
+  const auto order = tier->EvictionOrder(48);
+  ASSERT_EQ(order.size(), 48u);
+  std::vector<std::string> expected;
+  for (int i = 16; i < 32; ++i) expected.push_back(Key(i));  // segment 1, now the coldest
+  for (int i = 0; i < 16; ++i) {
+    if (i != 3) expected.push_back(Key(i));
+  }
+  expected.push_back(Key(3));
+  for (int i = 32; i < 48; ++i) expected.push_back(Key(i));  // the active segment
+  std::vector<std::string> keys;
+  for (const auto& hint : order) keys.push_back(hint.key);
+  EXPECT_EQ(keys, expected);
+  for (const auto& key : tier->GetLRUCandidates(100)) {
+    EXPECT_NE(key, "missing") << "touching an unknown key must not record it";
+  }
+
+  // A follower leaves the order to the tier that owns the directory.
+  SSDTier follower(dir_.string(), 8 * kMiB, Config(8 * kMiB, 1 * kMiB),
+                   SSDAccessMode::ReadOnlyShared);
+  EXPECT_EQ(follower.Touch({Key(16)}), 0u);
+  EXPECT_EQ(tier->EvictionOrder(1).front().key, Key(16));
+}
+
 // A batch reports each key: one that does not fit fails alone, and is not
 // left looking stored.  Before, a key refused for space came back `true`.
 TEST_F(SegmentReclaimTest, BatchWriteReportsKeysThatDidNotFit) {
@@ -401,6 +432,41 @@ TEST_F(SegmentReclaimTest, ShardedOrderStartsWithTheFullestDrive) {
   EXPECT_LE(SegmentFiles(d0) + SegmentFiles(d1), 12u);
 }
 
+TEST_F(SegmentReclaimTest, ShardedTouchReachesTheShardHoldingEachKey) {
+  std::vector<std::unique_ptr<TierBackend>> shards;
+  for (const char* name : {"d0", "d1"}) {
+    const fs::path d = dir_ / name;
+    fs::create_directories(d);
+    auto cfg = Config(8 * kMiB, 1 * kMiB);
+    cfg.storage_dir = d.string();
+    shards.push_back(std::make_unique<SSDTier>(d.string(), 8 * kMiB, cfg));
+  }
+  ShardedSsdTier tier(std::move(shards));
+  size_t per_shard[2] = {0, 0};
+  for (int i = 0; i < 96; ++i) {
+    const auto v = ValueFor(i);
+    ASSERT_TRUE(tier.Write(Key(i), v.data(), v.size())) << i;
+    ++per_shard[tier.ShardOf(Key(i))];
+  }
+  // Two sealed segments on each drive, so a touch can change which goes first.
+  ASSERT_GT(per_shard[0], 2 * kPerSegment);
+  ASSERT_GT(per_shard[1], 2 * kPerSegment);
+
+  auto coldest = [&](int shard) {
+    for (const auto& hint : tier.EvictionOrder(96)) {
+      if (tier.ShardOf(hint.key) == shard) return hint.key;
+    }
+    return std::string();
+  };
+  const std::string cold0 = coldest(0);
+  const std::string cold1 = coldest(1);
+  ASSERT_FALSE(cold0.empty());
+  ASSERT_FALSE(cold1.empty());
+  EXPECT_EQ(tier.Touch({cold0, "missing", cold1}), 2u);
+  EXPECT_NE(coldest(0), cold0);
+  EXPECT_NE(coldest(1), cold1);
+}
+
 // Reads hold the segment they read from.  Readers, an evictor and a writer
 // race while segments are created and deleted under them; with checksums off,
 // a read served from a closed-and-reused fd would come back `true` with some
@@ -450,6 +516,56 @@ TEST_F(SegmentReclaimTest, ReadsNeverSeeAnotherSegmentsBytes) {
   EXPECT_GT(good_reads.load(), 0u);
   EXPECT_GT(tier->SpaceStats().files_deleted, 10u) << "the test did not churn segments";
   EXPECT_LE(tier->Capacity().first, 8 * kMiB);
+}
+
+// Touches race a writer that evicts as it goes and a reader, over live and
+// just-evicted keys: no read may see another record, and the recency list may
+// only ever hold keys the tier has.
+TEST_F(SegmentReclaimTest, TouchesRaceReadsEvictionsAndWrites) {
+  auto tier = MakeTier(8 * kMiB, 256 * kKiB, /*verify_crc=*/false);  // 4 records a segment
+  std::atomic<int> written{0};
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> touched{0};
+  std::atomic<uint64_t> good_reads{0};
+  std::atomic<uint64_t> bad_reads{0};
+
+  std::thread writer([&] {
+    for (int i = 0; !stop.load(); ++i) {
+      if (!Write(*tier, i)) continue;
+      written.store(i + 1);
+      if (i >= 24) tier->Evict(Key(i - 24));  // keep ~24 live, segments churn
+    }
+  });
+  std::thread toucher([&] {
+    while (!stop.load()) {
+      const int hi = written.load();
+      std::vector<std::string> keys;
+      for (int i = std::max(0, hi - 40); i < hi; ++i) keys.push_back(Key(i));
+      touched.fetch_add(tier->Touch(keys));
+    }
+  });
+  std::thread reader([&] {
+    std::vector<char> buf(kValue);
+    while (!stop.load()) {
+      const int hi = written.load();
+      if (hi == 0) continue;
+      if (!tier->ReadIntoPtr(Key(hi - 1), reinterpret_cast<uintptr_t>(buf.data()), buf.size())) {
+        continue;
+      }
+      (buf == ValueFor(hi - 1) ? good_reads : bad_reads).fetch_add(1);
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  stop.store(true);
+  writer.join();
+  toucher.join();
+  reader.join();
+
+  EXPECT_EQ(bad_reads.load(), 0u);
+  EXPECT_GT(good_reads.load(), 0u);
+  EXPECT_GT(touched.load(), 0u);
+  EXPECT_GT(tier->SpaceStats().files_deleted, 10u) << "the test did not churn segments";
+  for (const auto& key : tier->GetLRUCandidates(1000)) EXPECT_TRUE(tier->Exists(key)) << key;
 }
 
 }  // namespace
