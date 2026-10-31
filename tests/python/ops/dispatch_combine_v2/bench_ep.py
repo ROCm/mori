@@ -275,6 +275,13 @@ def main():
         .sum(1)
     )
 
+    def gather_all(t):
+        parts = [torch.empty_like(t.cpu()) for _ in range(world)]
+        dist.all_gather(parts, t.cpu().contiguous())
+        return torch.stack(parts)
+
+    all_idx, all_wts = gather_all(idx), gather_all(wts)
+
     obj = [cco.Communicator.get_unique_id() if rank == 0 else None]
     dist.broadcast_object_list(obj, src=0)
     # Sized for bf16, the widest, and for one arena per backend.
@@ -338,8 +345,10 @@ def main():
         reverse map says a slot came from. That determinism is what makes this
         possible; before the seed was configurable it was not.
         """
-        if not CHECK or total == 0:
+        if not CHECK:
             return 0
+        if total == 0:
+            print(f"[EMPTY] rank {rank} received no token", flush=True)
         tis = routing.disp_tok_id_to_src_tok_id_local[:total].cpu()
         src_pe, src_tok = (tis // M).to(torch.int64), (tis % M).to(torch.int64)
         got = op.recv_tokens()[:total].cpu().view(torch.uint8)
@@ -354,15 +363,74 @@ def main():
                 constant=CONST_VAL,
             ).view(torch.uint8)
             bad += int((got[sel] != ref[src_tok[sel]]).any(dim=1).sum())
-        n = torch.tensor([bad])
+        sbad = sctl = 0
+        if SCALE_DIM:
+            sc_n_i32 = (SCALE_DIM + 3) // 4
+            gs = op.recv_scales()[:total].cpu().contiguous().view(torch.uint8)
+            gs = gs[:, :SCALE_DIM]
+
+            def sref(tok):
+                v = (tok + src_pe * 100003).to(torch.int32).view(-1, 1)
+                return v.repeat(1, sc_n_i32).view(torch.uint8)[:, :SCALE_DIM]
+
+            sbad = int((gs != sref(src_tok)).any(dim=1).sum())
+            sctl = int((gs != sref(src_tok + 1)).any(dim=1).sum())
+        inr = (src_pe >= 0) & (src_pe < world)
+        pe_c = torch.where(inr, src_pe, torch.zeros_like(src_pe))
+        got_i = op.recv_indices()[:total].cpu()
+        got_w = op.recv_weights()[:total].cpu()
+        ibad = int(((got_i != all_idx[pe_c, src_tok]).any(dim=1) | ~inr).sum())
+        wbad = int(((got_w != all_wts[pe_c, src_tok]).any(dim=1) | ~inr).sum())
+        pe_n = (pe_c + 1) % world
+        mctl = int(
+            (
+                (got_i != all_idx[pe_n, src_tok]).any(dim=1)
+                | (got_w != all_wts[pe_n, src_tok]).any(dim=1)
+            ).sum()
+        )
+        n = torch.tensor(
+            [bad, sbad, sctl, total if SCALE_DIM else 0, ibad, wbad, mctl, total]
+        )
         dist.all_reduce(n)
-        if rank == 0 and n.item():
+        if rank == 0 and n[0].item():
             print(
                 f"  [{op.backend_name}] DISPATCH BYTE MISMATCH: "
-                f"{int(n.item())} rows across {world} ranks",
+                f"{int(n[0])} rows across {world} ranks",
                 flush=True,
             )
-        return int(n.item())
+        mt_ok = int(n[4]) == 0 and int(n[5]) == 0 and int(n[6]) == int(n[7])
+        if rank == 0:
+            print(
+                f"  [{op.backend_name}] METACHECK rows={int(n[7])} idx_bad={int(n[4])} "
+                f"wts_bad={int(n[5])} ctl={int(n[6])} ok={int(mt_ok)}",
+                flush=True,
+            )
+            if not mt_ok:
+                print(
+                    f"  [{op.backend_name}] DISPATCH BYTE MISMATCH (ids / weights): "
+                    f"{int(n[4])} / {int(n[5])} rows across {world} ranks, control "
+                    f"{int(n[6])} of {int(n[7])}",
+                    flush=True,
+                )
+        sc_ok = int(n[1]) == 0 and int(n[2]) == int(n[3])
+        if rank == 0 and SCALE_DIM:
+            print(
+                f"  [{op.backend_name}] SCALECHECK rows={int(n[3])} bad={int(n[1])} "
+                f"ctl={int(n[2])} ok={int(sc_ok)}",
+                flush=True,
+            )
+            if not sc_ok:
+                print(
+                    f"  [{op.backend_name}] DISPATCH BYTE MISMATCH (scales): "
+                    f"{int(n[1])} rows across {world} ranks, control {int(n[2])} "
+                    f"of {int(n[3])}",
+                    flush=True,
+                )
+        return (
+            int(n[0])
+            + (0 if sc_ok else max(1, int(n[1])))
+            + (0 if mt_ok else max(1, int(n[4]) + int(n[5])))
+        )
 
     def bf16_payload(pe):
         return _data.make_payload(
@@ -528,7 +596,9 @@ def main():
             buf = op.combine_in_view().clone()[:total]
         else:
             buf = stage
-        out, _ = op.combine(buf, routing=r)
+        out, outw = op.combine(
+            buf, weights=w_ if checked and not _PUSH else None, routing=r
+        )
         lockstep()
         if dispatch_bad:
             return total, buf, False, True
@@ -563,7 +633,23 @@ def main():
                 f"[{int(U[:ct].min())},{int(U[:ct].max())}])",
                 flush=True,
             )
-        return total, buf, bad.item() == 0, True
+        w_ref = wts[:ct].float().cpu()
+        ew = U[:ct].view(ct, 1).float() * w_ref
+        gw = outw.float().cpu()
+        wbad = int((~torch.isclose(gw, ew, rtol=1e-6, atol=1e-7)).any(dim=1).sum())
+        wctl = int(
+            (~torch.isclose(gw, ew + w_ref, rtol=1e-6, atol=1e-7)).any(dim=1).sum()
+        )
+        nw = torch.tensor([wbad, wctl, ct])
+        dist.all_reduce(nw)
+        wt_ok = int(nw[0]) == 0 and int(nw[1]) == int(nw[2])
+        if rank == 0:
+            print(
+                f"  [{op.backend_name}] WTSCHECK rows={int(nw[2])} bad={int(nw[0])} "
+                f"ctl={int(nw[1])} ok={int(wt_ok)}",
+                flush=True,
+            )
+        return total, buf, bad.item() == 0 and wt_ok, True
 
     def time_pairs(mode, one_pair, capture, split_legs):
         """ITERS (dispatch, combine) pairs; mean us per leg.

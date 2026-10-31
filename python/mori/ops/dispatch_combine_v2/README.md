@@ -56,8 +56,8 @@ lazily, only when selected, so the package imports without FlyDSL installed.
 
 ## gfx125x dispatch: slot reservation
 
-Where the slot allocator word lives in the cco window, which is the default, the
-blocks of a rank reserve their slots together: each block adds its token count for
+The slot allocator word lives in the cco window, and the blocks of a rank
+reserve their slots together: each block adds its token count for
 every destination, this rank included, into the rank's total for it, and the last
 block to arrive reserves the total with one RMW on that destination's word and
 publishes the first slot to the others. In the window the RMWs on one word
@@ -65,10 +65,14 @@ serialize, so a rank makes one per destination per call instead of one per block
 The blocks meet in a few hundred bytes of a `__device__` array in the dispatch
 kernel's own module, so neither the arena nor the caller allocates anything for it.
 
-`MORI_EP_TOKOFF_EXT=1` (default off) moves the word of a single-host EP into a separate
-allocation (`TokOffExt` in `hip_backend.py`), and there every block reserves its
-own slots. An EP spanning hosts always keeps the word in the window, since its
-ranks cannot open each other's hipIpc handles.
+At 8 ranks or fewer there is no RMW. `tok_off` also holds, from byte 256, a count
+table of a word per source and destination: the last block of a rank stores its
+total for p into p's word of its own row in the table of every higher-numbered
+rank, and each block takes as its first slot on p the sum of the totals the
+lower-numbered ranks stored into its own table. p's rows then run in source rank
+order, the same on every call, and no block waits on a fabric round trip. A rank
+clears its table at the end of the call; a lower rank stores the next call's row
+only after the combine between the two calls.
 
 A call small enough to give every block at most 8 warp work units (512 tokens on
 the default 64 × 16 geometry at top-k 6) is spread over all the blocks instead of
@@ -106,6 +110,7 @@ Tests/bench live under `tests/python/ops/dispatch_combine_v2/`:
 | `test_op.py` | EP8 op-layer test (gather/scatter, quant, StdMoE, recv-cap, scales, LEC, reset, replay). `MORI_V2_KERNEL_BACKEND=hip` runs it against the HIP kernels. `RAGGED=1` gives the ranks different token counts, two of them none; `NOSELF=1` routes no token to its own rank |
 | `test_ep_backend_parity.py` | runs both backends in one process on the same input and compares element for element |
 | `test_routing_snapshot.py` | `dispatch(..., snapshot=True)` handles outlive later dispatches: combine (twice) and replay with an older handle, both backends. `torchrun --standalone --nproc_per_node=2` |
+| `test_ll128_split.py` | an op past the LL128 table's `max_tok` runs small calls on its LL128 plans and the rest on the schedule's: one call sequence crossing `max_tok` both ways, synced (delivery, reverse map, bf16 sum), back to back eager and graph-replayed, and as snapshot handles, each combine equal to the synced one bit for bit. hip, gfx1250. `torchrun --standalone --nproc_per_node=4` |
 | `test_jit_binding.py` | JIT plan binding: schemas, request/args round-trip, cache behaviour. No GPU peers needed |
 | `test_graph_capture.py` | captures dispatch → identity expert → combine as one HIP graph and replays it |
 | `test_asym_dtype.py` | asymmetric dtype legs (fp8/fp4 dispatch + bf16 combine) |

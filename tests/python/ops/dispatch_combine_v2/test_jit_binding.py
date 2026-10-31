@@ -291,13 +291,9 @@ def test_every_arena_region_is_reported_in_args_order():
 
 
 def _reference_regions(
-    ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave
+    ws, hidden, max_tok, topk, disp_tok, comb_tok, scale, push, wave, gfx125x
 ):
-    """hip_backend._regions as it was before the plans reported sizes.
-
-    The one deliberate change: the push combine's row flags are only reserved
-    where the overlapped reduce can run (EpCombinePushOvlAny).
-    """
+    """hip_backend._regions as it was before the plans reported sizes."""
     cap = ws * max_tok
     out_tok = cap * comb_tok
     if push:
@@ -308,7 +304,7 @@ def _reference_regions(
         if push != "fp4b" and 4 <= ws <= wave:
             out_tok += rows * 8
     regions = [
-        ("tok_off", 4),
+        ("tok_off", 256 + 4 * ws * ws if gfx125x and ws <= 8 else 4),
         ("recv_num", 2 * ws * 4),
         ("recv_to_src_token", cap * 4),
         ("out_idx", cap * topk * 4),
@@ -370,6 +366,7 @@ def test_arena_regions_match_the_layout_the_op_used_to_build(
         scale,
         push,
         d["waveSize"],
+        bool(d["sharedBytes"]),
     )
     assert cb.arena_regions(d, c, region_names=_REGIONS) == want
 
@@ -381,7 +378,7 @@ def test_staging_bytes_come_from_the_kernel_layout():
         world_size=8, max_tok_per_rank=512, max_recv=4096, scale_bytes=224
     )
     # Only the gfx125x dispatch stages.
-    want = 12746752 if d["sharedBytes"] else 0
+    want = 6455296 if d["sharedBytes"] else 0
     assert d["stagingBytes"] == ep_staging_bytes(8, 4096, 224) == want
 
 
@@ -517,13 +514,6 @@ def test_agg_reserve_is_the_default_and_takes_no_argument():
     assert "resState" not in cb.EpDispatchPlan._arg_names
 
 
-def test_per_block_reservation_follows_the_slot_word():
-    # The slot word outside the cco window: every block reserves its own.
-    p = _plan(tok_off_ext=1)
-    assert not p.info.get("aggReserve")
-    p.close()
-
-
 # --------------------------------------------------------------------------
 # The gfx1250 dispatch staging buffer: the caller sizes it, so the size has to
 # be the one the kernel lays out
@@ -541,9 +531,10 @@ def test_staging_bytes_matches_the_device_layout():
 
     if not cb.EpDispatchPlan.describe()["sharedBytes"]:
         pytest.skip("only the gfx125x dispatch stages")
-    assert ep_staging_bytes(8, 4096, 224) == 12746752
+    assert ep_staging_bytes(8, 4096, 224) == 6455296
     assert ep_staging_bytes(8, 4096, 0) == 4358144
-    assert ep_staging_bytes(32, 4096, 224) == 50987008
+    assert ep_staging_bytes(32, 4096, 224) == 19529728
+    assert ep_staging_bytes(2, 600, 224, 300) == 690944
     # max_recv not a multiple of 32 is the only shape among realistic configs
     # where a sub-array size is not already a multiple of 128, so it is the only
     # case that exercises the mirror's rounding at all.
@@ -559,7 +550,7 @@ def test_staging_bytes_resolves_max_recv_the_way_the_kernel_does():
 
     assert ep_staging_bytes(8, 0, 224, 512) == ep_staging_bytes(8, 8 * 512, 224)
     # A resolved cap wins over the fallback, as EpMaxRecv's ternary does.
-    assert ep_staging_bytes(8, 4096, 224, 1) == ep_staging_bytes(8, 4096, 224)
+    assert ep_staging_bytes(8, 4096, 0, 1) == ep_staging_bytes(8, 4096, 0)
     # Neither spelling given is the case that used to return a short buffer in
     # silence; there is no size to compute, so it cannot be a return value.
     with pytest.raises(ValueError, match="max_tok_per_rank"):

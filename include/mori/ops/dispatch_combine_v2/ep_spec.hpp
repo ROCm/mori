@@ -56,6 +56,9 @@ struct EpRequest {
   bool combineFp4F32Scale = false;
   bool combineFp8 = false;
   bool tokOffExt = false;
+  int callTokMax = 0;
+  bool ll128 = false;
+  bool ll128CombineOnly = false;
 };
 
 template <typename Self, typename Visit>
@@ -76,10 +79,13 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(combineFp4F32Scale);
   MORI_FIELD(combineFp8);
   MORI_FIELD(tokOffExt);
+  MORI_FIELD(callTokMax);
+  MORI_FIELD(ll128);
+  MORI_FIELD(ll128CombineOnly);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 15,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 18,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

@@ -163,6 +163,8 @@ def _staging_key(info: dict) -> tuple:
         recv,
         info["scaleBytes"],
         info["maxTokPerRank"],
+        bool(info["aggReserve"]),
+        info["callTokMax"],
     )
 
 
