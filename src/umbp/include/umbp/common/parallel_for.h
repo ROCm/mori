@@ -29,6 +29,14 @@
 
 namespace mori::umbp {
 
+inline int EffectiveParallelThreads(int threads) {
+  threads = std::max(threads, 1);
+  const unsigned hardware_threads = std::thread::hardware_concurrency();
+  if (hardware_threads > 0 && static_cast<unsigned>(threads) > hardware_threads)
+    threads = static_cast<int>(hardware_threads);
+  return threads;
+}
+
 // Run fn(i) for i in [0, n), on up to `threads` workers, work-stealing so an
 // uneven index cost cannot strand a worker.  Each index runs exactly once, so
 // fn may write result[i] without locking.  The caller's thread takes part and

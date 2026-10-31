@@ -85,8 +85,21 @@ PeerSsdManager::PeerSsdManager(const PeerSsdConfig& cfg) {
                            "' (expected one of: file, spdk, spdk_proxy)");
 }
 
-PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight)
-    : backend_(std::move(backend)), single_flight_(single_flight) {}
+PeerSsdManager::PeerSsdManager(std::unique_ptr<TierBackend> backend, bool single_flight,
+                               FanoutCopy fanout_copy)
+    : backend_(std::move(backend)),
+      fanout_copy_(std::move(fanout_copy)),
+      single_flight_(single_flight) {}
+
+bool PeerSsdManager::CopyFollower(void* dst, const void* src, size_t size) noexcept {
+  try {
+    if (fanout_copy_) return fanout_copy_(dst, src, size);
+    std::memcpy(dst, src, size);
+    return true;
+  } catch (...) {
+    return false;  // Publish copy failure too, so followers always wake up.
+  }
+}
 
 PeerSsdManager::~PeerSsdManager() = default;
 
@@ -483,11 +496,10 @@ SsdReadOutcome PeerSsdManager::PrepareRead(const std::string& key, void* staging
       if (it != inflight_reads_.end()) it->second->Retire(episode);
     }
     for (const auto& f : fanout) {
-      f->ok = read_ok;
-      if (read_ok) {
-        std::memcpy(f->dst, static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
-                    f->length);
-      }
+      f->ok = read_ok &&
+              CopyFollower(f->dst,
+                           static_cast<const char*>(staging_ptr) + (f->offset - episode->offset),
+                           f->length);
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -694,9 +706,10 @@ std::vector<SsdReadOutcome> PeerSsdManager::PrepareReadBatch(
     // Deliver outside the lock: holding mutex_ across a page-sized memcpy would
     // stall every other read/evict here.
     for (const auto& f : fanout) {
-      f->ok = ok[j];
-      if (!ok[j]) continue;
-      std::memcpy(f->dst, static_cast<const char*>(dsts[i]) + (f->offset - ep->offset), f->length);
+      f->ok = ok[j] &&
+              CopyFollower(f->dst, static_cast<const char*>(dsts[i]) + (f->offset - ep->offset),
+                           f->length);
+      if (!f->ok) continue;
       fanout_bytes += f->length;
       ++fanout_count;
     }

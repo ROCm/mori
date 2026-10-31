@@ -146,13 +146,7 @@ SSDTier::SSDTier(const std::string& dir, size_t capacity, const UMBPSsdConfig& s
   DisposeSegments(&doomed);
 }
 
-int SSDTier::TierThreads() const {
-  int t = ssd_config_.tier_io_threads;
-  if (t < 1) t = 1;
-  const unsigned hc = std::thread::hardware_concurrency();
-  if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
-  return t;
-}
+int SSDTier::TierThreads() const { return EffectiveParallelThreads(ssd_config_.tier_io_threads); }
 
 int SSDTier::SegmentOpenFlags() const { return direct_io_ ? O_DIRECT : 0; }
 
@@ -516,8 +510,8 @@ std::vector<bool> SSDTier::BatchWrite(const std::vector<std::string>& keys,
   }
 
   // Stage timers for the [SsdPerf/tier] PUT breakdown (no-ops unless
-  // UMBP_SSD_TIMING is set).  `prepare` covers the CRC + record memcpy done
-  // under mu_, which is the stage that blocks concurrent reads on this drive.
+  // UMBP_SSD_TIMING is set). `build` covers lock-free CRC + record assembly;
+  // `reserve` covers metadata work under mu_.
   const auto t_begin = ssdperf::Now();
   double build_ms = 0.0, lock_ms = 0.0, reserve_ms = 0.0, io_ms = 0.0, sync_ms = 0.0;
 

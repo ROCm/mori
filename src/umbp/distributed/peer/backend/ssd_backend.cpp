@@ -42,7 +42,11 @@ uint32_t SizeToPages(uint64_t size, uint64_t page_size) {
 }
 }  // namespace
 
-SsdBackend::SsdBackend(Config cfg) : cfg_(std::move(cfg)) {
+SsdBackend::SsdBackend(Config cfg) : SsdBackend(std::move(cfg), nullptr, nullptr) {}
+
+SsdBackend::SsdBackend(Config cfg, std::unique_ptr<PeerSsdManager> manager,
+                       std::unique_ptr<PageMemorySource> staging_source)
+    : cfg_(std::move(cfg)), ssd_(std::move(manager)), staging_source_(std::move(staging_source)) {
   if (cfg_.page_size == 0) {
     throw std::invalid_argument("SsdBackend: page_size must be > 0");
   }
@@ -53,7 +57,7 @@ SsdBackend::SsdBackend(Config cfg) : cfg_(std::move(cfg)) {
       cfg_.page_size > std::numeric_limits<size_t>::max() / cfg_.staging_pages) {
     throw std::invalid_argument("SsdBackend: staging arena size overflows");
   }
-  ssd_ = std::make_unique<PeerSsdManager>(cfg_.ssd);
+  if (!ssd_) ssd_ = std::make_unique<PeerSsdManager>(cfg_.ssd);
 }
 
 SsdBackend::~SsdBackend() {
@@ -102,7 +106,7 @@ bool SsdBackend::Init(MemoryRegistrar* registrar) {
   HostPageMemorySource::Options staging_opts;
   staging_opts.use_hugepages = cfg_.staging_use_hugepages;
   staging_opts.hugepage_size = cfg_.staging_hugepage_size;
-  staging_source_ = std::make_unique<HostPageMemorySource>(staging_opts);
+  if (!staging_source_) staging_source_ = std::make_unique<HostPageMemorySource>(staging_opts);
 
   std::vector<PageMemorySource::Buffer> buffers;
   if (!staging_source_->Allocate({staging_size_}, &buffers) || buffers.empty()) {

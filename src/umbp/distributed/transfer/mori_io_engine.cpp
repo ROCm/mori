@@ -491,7 +491,13 @@ class MoriIoPlanBuilder final : public TransferPlanBuilder {
 
 std::unique_ptr<TransferPlanBuilder> MoriIoEngine::CreatePlanBuilder(
     size_t /*expected_items*/) const {
-  return std::make_unique<MoriIoPlanBuilder>(local_engine_key_, bounce_size_, bounce_ref_);
+  return MakeRdmaPlanBuilder(local_engine_key_, bounce_size_, bounce_ref_);
+}
+
+std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
+                                                         uint64_t bounce_size,
+                                                         const TransferRef& bounce_ref) {
+  return std::make_unique<MoriIoPlanBuilder>(local_key, bounce_size, bounce_ref);
 }
 
 // ---------------------------------------------------------------------------

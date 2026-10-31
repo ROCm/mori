@@ -314,8 +314,10 @@ int main(int argc, char** argv) {
   // the background, would slow each queue creation here to about a second.
   // 8 covers the peak number of concurrent gathers per GPU under TP8 serving;
   // 0 turns the prewarm off.
-  mori::umbp::HbmCopyEngine::Prewarm(
-      mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
+  if (!config.sim.enabled) {
+    mori::umbp::HbmCopyEngine::Prewarm(
+        mori::umbp::GetEnvUint32("UMBP_HBM_GATHER_PREWARM_STREAMS", 8));
+  }
 
   std::unique_ptr<mori::umbp::standalone::StandaloneServer> server;
   try {

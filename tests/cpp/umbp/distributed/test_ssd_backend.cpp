@@ -884,7 +884,8 @@ TEST(SsdBackendGds, ResolvePublishesFileRefAndReadsIntoDeviceMemory) {
   ASSERT_EQ(1u, commit.size());
   ASSERT_TRUE(commit[0].success);
 
-  auto resolved = backend.BatchResolve({"k/gds"}, /*include_descs=*/false);
+  auto resolved = backend.BatchResolve({"k/gds"}, /*include_descs=*/false,
+                                       /*allow_file_refs=*/true, ResolveReader::kLocal);
   ASSERT_EQ(1u, resolved.size());
   ASSERT_TRUE(resolved[0].found);
   if (!resolved[0].file_ref.IsFile()) {

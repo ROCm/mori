@@ -38,16 +38,6 @@ namespace {
 // deterministic, which unit tests rely on.
 constexpr size_t kSyncThresholdBytes = 2ull << 30;
 
-bool RegistrationEnabled() {
-  static const bool enabled = [] {
-    const char* value = std::getenv("UMBP_DRAM_HOST_REGISTER");
-    if (value == nullptr) return true;
-    const std::string text(value);
-    return text != "0" && text != "off" && text != "false";
-  }();
-  return enabled;
-}
-
 bool HasDevice() {
   int count = 0;
   if (hipGetDeviceCount(&count) != hipSuccess) {
@@ -58,6 +48,16 @@ bool HasDevice() {
 }
 
 }  // namespace
+
+bool HostRegistrationEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("UMBP_DRAM_HOST_REGISTER");
+    if (value == nullptr) return true;
+    const std::string text(value);
+    return text != "0" && text != "off" && text != "false";
+  }();
+  return enabled;
+}
 
 size_t HostRegistrationChunkBytes() {
   static const size_t bytes = [] {
@@ -79,7 +79,7 @@ size_t HostRegistrationChunkBytes() {
 
 HostTierRegistration::HostTierRegistration(void* base, size_t bytes)
     : base_(static_cast<char*>(base)), bytes_(bytes), piece_bytes_(HostRegistrationChunkBytes()) {
-  if (base_ == nullptr || bytes_ == 0 || !RegistrationEnabled() || !HasDevice()) {
+  if (base_ == nullptr || bytes_ == 0 || !HostRegistrationEnabled() || !HasDevice()) {
     bytes_ = 0;
     return;
   }

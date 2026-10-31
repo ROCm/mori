@@ -34,6 +34,7 @@
 #include <string>
 #include <vector>
 
+#include "umbp/sim/trace.h"
 #include "umbp/umbp_client.h"
 #include "umbp_standalone.grpc.pb.h"
 
@@ -100,6 +101,9 @@ class StandaloneProcessClient : public IUMBPClient {
       const std::vector<std::string>& hashes) override;
 
  private:
+  std::vector<bool> BatchPutImpl(const std::vector<std::string>& keys,
+                                 const std::vector<uintptr_t>& srcs,
+                                 const std::vector<size_t>& sizes);
   // Resolves `ptr` against the registered host regions. On success writes the
   // region-relative `offset` and the matched region's worker VA `region_base`.
   bool OffsetFor(uintptr_t ptr, size_t size, uint64_t* offset, uint64_t* region_base) const;
@@ -116,12 +120,18 @@ class StandaloneProcessClient : public IUMBPClient {
   bool RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id);
   bool RegisterHostShmMemory(uintptr_t ptr, size_t size);
 
+  class MemoryExporter;
+  class RealMemoryExporter;
+  class VirtualMemoryExporter;
+
   UMBPConfig config_;
+  std::unique_ptr<SimTrace> sim_trace_;
   UMBPStandaloneProcessConfig standalone_config_;
   std::string address_;
   std::string fd_socket_path_;
   std::shared_ptr<::grpc::ChannelInterface> channel_;
   std::unique_ptr<::umbp::UMBPStandalone::Stub> stub_;
+  std::unique_ptr<MemoryExporter> memory_exporter_;
 
   mutable std::shared_mutex op_mutex_;
   std::atomic<bool> closing_{false};
@@ -129,7 +139,7 @@ class StandaloneProcessClient : public IUMBPClient {
   UMBPDeploymentMode backend_mode_ = UMBPDeploymentMode::StandaloneProcess;
   bool supports_ranged_io_ = false;
 
-  enum class RegionKind { kHostShm, kGpuIpc };
+  enum class RegionKind { kHostShm, kGpuIpc, kVirtual };
 
   // A hybrid worker can register several non-contiguous host or GPU regions.
   // `base` is the worker VA used as region_base in data requests.

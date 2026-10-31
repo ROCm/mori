@@ -80,6 +80,8 @@ class SsdBackend : public MediumBackend {
   };
 
   explicit SsdBackend(Config cfg);
+  SsdBackend(Config cfg, std::unique_ptr<PeerSsdManager> manager,
+             std::unique_ptr<PageMemorySource> staging_source);
   ~SsdBackend() override;
 
   SsdBackend(const SsdBackend&) = delete;
