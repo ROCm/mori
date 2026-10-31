@@ -272,6 +272,9 @@ struct RangedPhases {
   size_t rmt_bounce = 0;
   size_t scat_items = 0;  // no plan count: getting one costs a second Plan()
                           // pass, inside the very phase being measured
+  // The scratch slice a remote call leased, and the arena rounds it took in it.
+  size_t slice_bytes = 0;
+  size_t rounds = 0;
   size_t local_keys = 0;
   size_t remote_keys = 0;
   double bytes = 0.0;
@@ -382,6 +385,9 @@ class RangedStats {
     t.rmt_plans += p.rmt_plans;
     t.rmt_bounce += p.rmt_bounce;
     t.scat_items += p.scat_items;
+    t.leased += p.slice_bytes > 0 ? 1 : 0;
+    t.slice_bytes += p.slice_bytes;
+    t.rounds += p.rounds;
 
     // Per-component totals, keyed by object size (one call = one pool).  The
     // sample key is stored once per (op, size) so the log proves the
@@ -423,6 +429,7 @@ class RangedStats {
     uint64_t calls = 0;
     uint64_t items = 0;
     uint64_t rmt_items = 0, rmt_plans = 0, rmt_bounce = 0, scat_items = 0;
+    uint64_t leased = 0, slice_bytes = 0, rounds = 0;  // over calls that leased a slice
     double total = 0, resolve = 0, classify = 0, build = 0, validate = 0, commit = 0, route = 0,
            xfer = 0, xfer_plan = 0, xfer_submit = 0, xfer_wait = 0, lock = 0, remote = 0,
            rmt_resolve = 0, rmt_build = 0, rmt_bld_items = 0, rmt_bld_plan = 0, rmt_bld_post = 0,
@@ -443,7 +450,8 @@ class RangedStats {
     auto share = [&](double v) { return t.total > 0 ? 100.0 * v / t.total : 0.0; };
     MORI_UMBP_INFO(
         "[RangedCall][dbg] SUMMARY {} calls={} total={:.3f}s mean_call={:.1f}us bytes={:.2f}GiB "
-        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl bounce={:.2f} scat_items={:.0f} | "
+        "items_per_call={:.0f} rmt_items={:.0f}/{:.0f}pl bounce={:.2f} scat_items={:.0f} "
+        "slice={:.1f}MiB rounds={:.2f} | "
         "resolve={:.1f}% classify={:.1f}% build={:.1f}% validate={:.1f}% "
         "commit={:.1f}% route={:.1f}% xfer={:.1f}%(plan={:.1f}% submit={:.1f}% wait={:.1f}%) "
         "lock={:.1f}% remote={:.1f}%(rslv={:.1f}% bld={:.1f}%[it={:.1f}% pl={:.1f}% "
@@ -454,9 +462,11 @@ class RangedStats {
         name, t.calls, t.total, 1e6 * t.total / t.calls, t.bytes / (1024.0 * 1024 * 1024),
         static_cast<double>(t.items) / t.calls, static_cast<double>(t.rmt_items) / t.calls,
         static_cast<double>(t.rmt_plans) / t.calls, static_cast<double>(t.rmt_bounce) / t.calls,
-        static_cast<double>(t.scat_items) / t.calls, share(t.resolve), share(t.classify),
-        share(t.build), share(t.validate), share(t.commit), share(t.route), share(t.xfer),
-        share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
+        static_cast<double>(t.scat_items) / t.calls,
+        t.leased > 0 ? static_cast<double>(t.slice_bytes) / t.leased / (1024.0 * 1024) : 0.0,
+        t.leased > 0 ? static_cast<double>(t.rounds) / t.leased : 0.0, share(t.resolve),
+        share(t.classify), share(t.build), share(t.validate), share(t.commit), share(t.route),
+        share(t.xfer), share(t.xfer_plan), share(t.xfer_submit), share(t.xfer_wait), share(t.lock),
         share(t.remote), share(t.rmt_resolve), share(t.rmt_build), share(t.rmt_bld_items),
         share(t.rmt_bld_plan), share(t.rmt_bld_post), share(t.rmt_peer), share(t.rmt_decode),
         share(t.rmt_sub), share(t.rmt_items_build), share(t.rmt_final), share(t.rmt_medium),
@@ -3835,6 +3845,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
                     slice_bytes, largest_unit);
     return results;
   }
+  if (dbg != nullptr) dbg->slice_bytes = slice_bytes;
   // The slice described ONCE, by its registered base.  Plans key on (src base,
   // dst base), so a per-unit slice ref made every unit x destination pair its
   // own single-segment plan (~8k of them for a layer-wise load).
@@ -3880,6 +3891,7 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
     // The slice holds the largest unit, so the first one always fits and this
     // loop always advances.
     const size_t count = end - pos;
+    if (dbg != nullptr) ++dbg->rounds;
 
     PhaseTimer sub_timer(dbg ? &dbg->rmt_sub : nullptr);
     std::vector<std::string> sub_keys;
@@ -4145,6 +4157,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
   }
   char* const scratch_base = scratch_lease.base();
   const size_t slice_bytes = scratch_lease.size();
+  if (dbg != nullptr) dbg->slice_bytes = slice_bytes;
   // The slice named once, by its registered base -- the read side's reason
   // (see BatchGetRanges) applies unchanged to the assemble side.
   const auto [arena_ref, arena_base] = UserBufferRef(scratch_base, slice_bytes);
@@ -4175,6 +4188,7 @@ std::vector<bool> PoolClient::BatchPutRanges(const std::vector<std::string>& key
     }
 
     const size_t count = end - pos;
+    if (dbg != nullptr) ++dbg->rounds;
     std::vector<std::string> sub_keys;
     std::vector<const void*> sub_srcs;
     std::vector<size_t> sub_sizes;
