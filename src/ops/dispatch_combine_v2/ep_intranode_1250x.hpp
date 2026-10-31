@@ -4932,8 +4932,8 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
       const unsigned long long me = fm & __ballot(rq == myPe);
       if (!me) continue;
       const int k = __popcll(fm & (me - 1ull));
-      const auto dg = EpUniG(reinterpret_cast<uint4*>(EpPeer<char>(wr, s, args.offOutTok) +
-                                                      kLandOff + ((size_t)t * kRows + k) * kLlRowB));
+      const auto dg = EpUniG(reinterpret_cast<uint4*>(
+          EpPeer<char>(wr, s, args.offOutTok) + kLandOff + ((size_t)t * kRows + k) * kLlRowB));
 #pragma unroll
       for (int i = 0; i < kUPart; ++i) {
         const int c = qb[b] * kUPart + i;
@@ -5545,8 +5545,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
           using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
           const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
-                               ((hiddenDimOffset % (size_t)_cV) == 0) &&
-                               ((_rowStride % _cV) == 0);
+                               ((hiddenDimOffset % (size_t)_cV) == 0) && ((_rowStride % _cV) == 0);
           const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
           constexpr bool _cFoldMix =
               std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
@@ -5614,8 +5613,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
               T _oe[_cV];
               uint32_t _op[_cOutVB / 4];
             };
-            constexpr bool _cCvtPk = std::is_same_v<T, hip_bfloat16> && ((_cV % 2) == 0) &&
-                                     ((_cOutVB / 4) == (_cV / 2));
+            constexpr bool _cCvtPk =
+                std::is_same_v<T, hip_bfloat16> && ((_cV % 2) == 0) && ((_cOutVB / 4) == (_cV / 2));
             if constexpr (_cCvtPk) {
 #pragma unroll
               for (int _k = 0; _k < _cV / 2; ++_k)
@@ -5655,10 +5654,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         // the next chunk's rows load into one set while the other is folded. Shorter items, and
         // warps that walk several items, are faster as one set of full-size chunks.
         const bool _cPipe =
-            __builtin_amdgcn_readfirstlane(
-                (int)(_cPullOk && (int)validAccumCount <= _cPullSrcMax &&
-                      _cPipeTileElems >= _cPullRowElems && _cRedEnd <= globalWarpNum &&
-                      hiddenDimSize > 2 * (size_t)_cPipeTileElems)) != 0;
+            __builtin_amdgcn_readfirstlane((int)(_cPullOk && (int)validAccumCount <= _cPullSrcMax &&
+                                                 _cPipeTileElems >= _cPullRowElems &&
+                                                 _cRedEnd <= globalWarpNum &&
+                                                 hiddenDimSize > 2 * (size_t)_cPipeTileElems)) != 0;
         const int _nSrc = (int)validAccumCount;
         int _cLive = 0;
         for (int _j = 0; _j < _nSrc; ++_j) _cLive += (srcPtrs[_j] != nullptr) ? 1 : 0;
@@ -5688,25 +5687,42 @@ __device__ void EpCombine1250xBody(EpArgs args) {
               break;
             }
             const size_t _offN = _off + (size_t)_cTile;
-            const bool _more =
-                __builtin_amdgcn_readfirstlane(
-                    (int)(_offN < hiddenDimSize &&
-                          (hiddenDimSize - _offN) * sizeof(TokT) >= 128)) != 0;
+            const bool _more = __builtin_amdgcn_readfirstlane(
+                                   (int)(_offN < hiddenDimSize &&
+                                         (hiddenDimSize - _offN) * sizeof(TokT) >= 128)) != 0;
             if (_more) {
               // The set being refilled was last read by the previous chunk's fold.
               asm volatile("s_wait_dscnt 0x0" ::: "memory");
               _cIssue(_offN, _cBuf ^ 1);
               // Only the loads just issued may still be in flight.
               switch (_cLive) {
-                case 1: __builtin_amdgcn_s_wait_tensorcnt(1); break;
-                case 2: __builtin_amdgcn_s_wait_tensorcnt(2); break;
-                case 3: __builtin_amdgcn_s_wait_tensorcnt(3); break;
-                case 4: __builtin_amdgcn_s_wait_tensorcnt(4); break;
-                case 5: __builtin_amdgcn_s_wait_tensorcnt(5); break;
-                case 6: __builtin_amdgcn_s_wait_tensorcnt(6); break;
-                case 7: __builtin_amdgcn_s_wait_tensorcnt(7); break;
-                case 8: __builtin_amdgcn_s_wait_tensorcnt(8); break;
-                default: __builtin_amdgcn_s_wait_tensorcnt(0); break;
+                case 1:
+                  __builtin_amdgcn_s_wait_tensorcnt(1);
+                  break;
+                case 2:
+                  __builtin_amdgcn_s_wait_tensorcnt(2);
+                  break;
+                case 3:
+                  __builtin_amdgcn_s_wait_tensorcnt(3);
+                  break;
+                case 4:
+                  __builtin_amdgcn_s_wait_tensorcnt(4);
+                  break;
+                case 5:
+                  __builtin_amdgcn_s_wait_tensorcnt(5);
+                  break;
+                case 6:
+                  __builtin_amdgcn_s_wait_tensorcnt(6);
+                  break;
+                case 7:
+                  __builtin_amdgcn_s_wait_tensorcnt(7);
+                  break;
+                case 8:
+                  __builtin_amdgcn_s_wait_tensorcnt(8);
+                  break;
+                default:
+                  __builtin_amdgcn_s_wait_tensorcnt(0);
+                  break;
               }
             } else {
               __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -5723,8 +5739,8 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           int _cTile = _cPullTileElems;
           if (_cCap >= _cPullFoldElems) {
             const int _k = ((int)hiddenDimSize + _cCap - 1) / _cCap;
-            _cTile = (((int)hiddenDimSize + _k - 1) / _k + _cPullFoldElems - 1) /
-                     _cPullFoldElems * _cPullFoldElems;
+            _cTile = (((int)hiddenDimSize + _k - 1) / _k + _cPullFoldElems - 1) / _cPullFoldElems *
+                     _cPullFoldElems;
           }
           for (size_t _off = 0; _off < hiddenDimSize; _off += _cTile) {
             int _n = (int)(hiddenDimSize - _off);
