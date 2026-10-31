@@ -310,13 +310,18 @@ def ll128_layout(cfg):
 
 
 class TokOffExt:
-    """Allocates nothing; aiter's mega_moe still builds one and passes ``peers`` to dispatch.
+    """Allocates nothing; aiter's mega_moe still asks wanted(), builds one and passes
+    ``peers`` to dispatch.
 
     The slot allocator word is always the cco window's tok_off, and no kernel reads
     EpArgs.tokOffPeers. Remove this once aiter stops importing it.
     """
 
     peers = None
+
+    @staticmethod
+    def wanted(world=1) -> bool:
+        return False
 
     def __init__(self, rank=0, world=1, dev=None):
         pass
