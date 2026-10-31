@@ -35,7 +35,6 @@
 #include <limits>
 #include <map>
 #include <msgpack.hpp>
-#include <new>
 #include <numeric>
 #include <string>
 #include <string_view>
@@ -54,22 +53,12 @@
 #include "umbp/distributed/benchmark/workload_trace_recorder.h"
 #include "umbp/distributed/indexer/kv_indexer_reporter.h"
 #include "umbp/distributed/master/master_metrics.h"
-#include "umbp/distributed/peer/backend/hbm_backend.h"
 #include "umbp/distributed/peer/backend/instrumented_backend.h"
-#include "umbp/distributed/peer/backend/page_backend.h"
-#include "umbp/distributed/peer/backend/ssd_backend.h"
 #include "umbp/distributed/peer/batch_resolve_codec.h"
 #include "umbp/distributed/peer/peer_service.h"
 #include "umbp/distributed/pool/peer_pool.h"
 #include "umbp/distributed/range_map.h"
-#include "umbp/distributed/transfer/composite_transfer_engine.h"
-#include "umbp/distributed/transfer/hbm_copy_engine.h"
 #include "umbp/distributed/transfer/local_copy_engine.h"
-#include "umbp/distributed/transfer/mori_io_engine.h"
-#include "umbp/distributed/transfer/posix_engine.h"
-#ifdef UMBP_ENABLE_GDS
-#include "umbp/distributed/transfer/gds_engine.h"
-#endif
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -594,25 +583,6 @@ class ScopedBatchBandwidth {
 //  Page / size math
 // ---------------------------------------------------------------------------
 
-// --- Cross-key parallelism for the self-target (local) paths. --------------
-// In distributed mode 1 key == 1 page (master page_size == KV block size), so
-// a self-target Put/Get copies one ~MiB-scale block per key.  The parallelism
-// that pays is therefore ACROSS the many keys of one BatchPut/BatchGet
-// (different threads -> different keys), not within one key's pages.  The
-// per-key copy itself lives in LocalCopyEngine since Phase 6.  Threads via
-// UMBP_DRAM_{READ,WRITE}_THREADS (same envs as local mode's DRAMTier).
-inline int LocalCopyThreads(const char* env_name) {
-  int t = 4;
-  if (const char* e = std::getenv(env_name)) {
-    int x = std::atoi(e);
-    if (x >= 1) t = x;
-  }
-  unsigned hc = std::thread::hardware_concurrency();
-  if (hc > 0 && t > static_cast<int>(hc)) t = static_cast<int>(hc);
-  if (t < 1) t = 1;
-  return t;
-}
-
 inline std::chrono::milliseconds ResolveBusyRetryTimeout() {
   uint64_t ms = 30000;
   if (const char* value = std::getenv("UMBP_RESOLVE_BUSY_TIMEOUT_MS")) {
@@ -670,12 +640,6 @@ TransferRef ClassifiedUserBytes(void* ptr, uint64_t size) {
   return TransferRef::HostBytes(ptr, size, mori::io::MemoryLocationType::GPU, location.device_id);
 }
 
-// A client read asks for a file ref only for device memory, which GdsEngine
-// reads in place; (file, host) is PosixEngine's, used by tier migrations.
-bool DestinationIsDevice(void* ptr, uint64_t size) {
-  return ClassifiedUserBytes(ptr, size).loc == mori::io::MemoryLocationType::GPU;
-}
-
 // Read-side range validity: inside the object and non-overlapping.  Weaker than
 // RangesTileObject, which the write side needs — a read may take any subset of
 // an object, but a write must account for every byte it commits.
@@ -731,30 +695,6 @@ bool AlignUpChecked(size_t value, size_t alignment, size_t* out) {
   if (value > std::numeric_limits<size_t>::max() - add) return false;
   *out = value + add;
   return true;
-}
-
-// ---------------------------------------------------------------------------
-//  Lease env knobs
-// ---------------------------------------------------------------------------
-
-// Peer-side DRAM/HBM read lease: how long a single Resolve protects its key's
-// pages from concurrent local Evict, covering one RDMA read.  Only needs to
-// exceed one DRAM RDMA round trip (sub-ms), so 500 ms is already ~100x margin;
-// exposed so operators can tighten it under eviction pressure.
-std::chrono::milliseconds DramReadLeaseTtl() {
-  static const auto v = GetEnvMilliseconds("UMBP_DRAM_READ_LEASE_MS",
-                                           std::chrono::milliseconds(500), /*min_allowed=*/1);
-  return v;
-}
-
-// The SSD equivalent, which is a different number for a different reason: it has
-// to cover an SSD read plus the RDMA, not just the RDMA. It is also the window a
-// staging page stays claimed, so it sets this backend's read concurrency against
-// a fixed arena -- shortening it frees pages and costs read coalescing.
-std::chrono::milliseconds SsdReadLeaseTtl() {
-  static const auto v = GetEnvMilliseconds("UMBP_SSD_READ_LEASE_MS",
-                                           std::chrono::milliseconds(3000), /*min_allowed=*/1);
-  return v;
 }
 
 // ---------------------------------------------------------------------------
@@ -839,46 +779,6 @@ std::vector<BackendInstanceConfig> EffectiveBackendConfigs(const PoolClientConfi
   return {std::move(legacy)};
 }
 
-std::unique_ptr<MediumBackend> MakeConfiguredBackend(const BackendInstanceConfig& config,
-                                                     uint64_t page_size, bool staging_use_hugepages,
-                                                     uint64_t staging_hugepage_size) {
-  switch (config.tier) {
-    case TierType::DRAM: {
-      PageBackend::OwnershipConfig ownership;
-      ownership.buffer_sizes = config.dram.buffer_sizes;
-      ownership.use_hugepages = config.dram.use_hugepages;
-      ownership.hugepage_size = config.dram.hugepage_size;
-      ownership.numa_nodes = config.dram.numa_nodes;
-      ownership.prefault = config.dram.prefault;
-      ownership.numa_strict = config.dram.numa_strict;
-      ownership.prefault_threads = config.dram.prefault_threads;
-      ownership.max_mr_bytes = config.dram.max_mr_bytes;
-      return MakePageBackend(TierType::DRAM, page_size, std::move(ownership),
-                             /*pending_ttl=*/std::chrono::milliseconds{30000},
-                             /*read_lease_ttl=*/DramReadLeaseTtl());
-    }
-    case TierType::HBM:
-      return MakeHbmBackend(page_size, config.hbm.device, config.hbm.buffer_sizes,
-                            /*pending_ttl=*/std::chrono::milliseconds{30000},
-                            /*read_lease_ttl=*/DramReadLeaseTtl());
-    case TierType::SSD: {
-      SsdBackend::Config ssd_cfg;
-      ssd_cfg.page_size = page_size;
-      ssd_cfg.staging_pages = SsdStagingPages(config.ssd_staging_buffer_slots,
-                                              config.ssd.ssd.capacity_bytes, page_size);
-      ssd_cfg.staging_use_hugepages = staging_use_hugepages;
-      ssd_cfg.staging_hugepage_size = staging_hugepage_size;
-      ssd_cfg.ssd = config.ssd;
-      ssd_cfg.ssd.enabled = true;
-      ssd_cfg.read_lease_ttl = SsdReadLeaseTtl();
-      return MakeSsdBackend(std::move(ssd_cfg));
-    }
-    case TierType::UNKNOWN:
-      return nullptr;
-  }
-  return nullptr;
-}
-
 std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
     const PoolClientConfig& config, const std::vector<BackendInstanceConfig>& backends,
     const BackendRegistry& registry, std::shared_ptr<const LogicalTierGraph>* tier_graph) {
@@ -923,7 +823,9 @@ std::unique_ptr<PoolPolicy> MakeConfiguredPoolPolicy(
 //  Lifecycle
 // ---------------------------------------------------------------------------
 
-PoolClient::PoolClient(PoolClientConfig config) : config_(std::move(config)) {}
+PoolClient::PoolClient(PoolClientConfig config, std::shared_ptr<PoolPlatform> platform)
+    : config_(std::move(config)),
+      platform_(platform ? std::move(platform) : MakePoolPlatform(config_.sim)) {}
 PoolClient::~PoolClient() { Shutdown(); }
 
 bool PoolClient::Init() {
@@ -953,6 +855,7 @@ bool PoolClient::Init() {
     }
   }
 
+  auto backend_configs = EffectiveBackendConfigs(config_);
   // No address, no master.  Everything below -- backends, transfer engine, peer
   // service -- is built either way; only routing, registration and the
   // heartbeat are skipped.  That is what lets one binary be a single node or a
@@ -963,65 +866,25 @@ bool PoolClient::Init() {
     MORI_UMBP_INFO("[PoolClient] no master configured; running single-node");
   }
 
-  // The one byte-moving path (design doc §4).  Order is preference order:
-  // a pair both of whose endpoints are host-addressable never reaches the wire.
-  //
-  // This is the composition root, and the only place any concrete engine is
-  // named — the same rule Phase 5 applies to backends.  Everything downstream
-  // holds TransferEngine / MemoryRegistrar / PeerDirectory.
-  auto composite = std::make_unique<CompositeTransferEngine>();
-  composite->AddEngine(std::make_unique<LocalCopyEngine>());
-  // Both-local pairs with a GPU endpoint.  Disjoint from LocalCopyEngine (which
-  // requires both sides CPU) and from MoriIoEngine (which requires exactly one
-  // side remote), so this is registration order as documentation, not as a
-  // tie-break — but it must come before the wire engine on principle, since an
-  // HBM pair that reached mori-io would be refused rather than served slowly.
-  auto hbm = std::make_unique<HbmCopyEngine>();
-  // Kept as a raw observer so the live medium's host buffers can be declared
-  // kernel-addressable once it has allocated them, below.  This is the one
-  // engine-specific reference PoolClient holds, and it carries no data-plane
-  // call: everything that moves bytes still goes through transfer_engine_.
-  hbm_engine_ = hbm.get();
-  composite->AddEngine(std::move(hbm));
-  // (file, host memory): SSD migrations to and from DRAM pages, no staging.
-  composite->AddEngine(std::make_unique<PosixEngine>());
-#ifdef UMBP_ENABLE_GDS
-  // The file->GPU engine for SsdBackend's FileRefs.  It claims only (file,
-  // device) pairs, which no memory engine touches, so registration order is
-  // documentation.  Compiled in when the build found the hipfile headers, and
-  // registered only when libhipfile actually dlopen's on this host.
-  if (GdsEngine::Available()) {
-    composite->AddEngine(std::make_unique<GdsEngine>());
-  } else {
-    MORI_UMBP_INFO("[PoolClient] libhipfile unavailable — SSD reads stay host-staged");
+  try {
+    auto engines = platform_->CreateTransferEngine(config_, backend_configs);
+    transfer_engine_ = std::move(engines.transfer);
+    peer_directory_ = engines.peers;
+  } catch (const std::exception& e) {
+    MORI_UMBP_ERROR("[PoolClient] transfer platform init failed: {}", e.what());
   }
-#endif
-  if (!config_.io_engine.host.empty()) {
-    mori::io::IOEngineConfig io_cfg;
-    io_cfg.host = config_.io_engine.host;
-    io_cfg.port = config_.io_engine.port;
-    auto rdma = std::make_unique<MoriIoEngine>(config_.master_config.node_id, io_cfg,
-                                               config_.staging_buffer_size);
-    if (!rdma->Init()) {
-      MORI_UMBP_ERROR("[PoolClient] MoriIoEngine init failed on {}:{}", config_.io_engine.host,
-                      config_.io_engine.port);
-      Shutdown();
-      return false;
-    }
-    peer_directory_ = rdma.get();
-    composite->AddEngine(std::move(rdma));
+  if (!transfer_engine_) {
+    Shutdown();
+    return false;
   }
-  transfer_engine_ = std::move(composite);
 
   // Peer-side backend instances.  The legacy single-medium selector is
   // synthesized into one entry here; topology-aware callers may
   // supply several named instances, including several of the same TierType.
-  // This composition root remains the only place concrete backend factories
-  // are named. The configured PoolPolicy below owns placement among them.
+  // The platform supplies storage; PoolPolicy owns placement among instances.
   const uint64_t page_size =
       config_.dram_page_size > 0 ? config_.dram_page_size : 2ULL * 1024 * 1024;
 
-  auto backend_configs = EffectiveBackendConfigs(config_);
   if (backend_configs.empty()) {
     MORI_UMBP_ERROR("[PoolClient] no backend instances configured");
     Shutdown();
@@ -1054,9 +917,7 @@ bool PoolClient::Init() {
       Shutdown();
       return false;
     }
-    auto backend =
-        MakeConfiguredBackend(backend_config, page_size, config_.ssd_staging_use_hugepages,
-                              config_.ssd_staging_hugepage_size);
+    auto backend = platform_->CreateBackend(backend_config, page_size, config_);
     if (backend == nullptr) {
       MORI_UMBP_ERROR("[PoolClient] backend '{}' has unknown medium {}", backend_config.name,
                       static_cast<int>(backend_config.tier));
@@ -1147,26 +1008,24 @@ bool PoolClient::Init() {
   // for.  Registration is best-effort and asynchronous for large pools, so
   // until it lands the engine just takes hipMemcpy — no ordering requirement
   // here beyond the buffers existing.
-  if (hbm_engine_ != nullptr) {
-    for (auto* live : registry_.All()) {
-      if (live == nullptr) continue;
-      for (uint32_t i = 0; i < live->BufferCount(); ++i) {
-        const TransferRef ref = live->BufferRef(i);
-        // Only host buffers: a device-resident medium is already addressable
-        // from a kernel, and hipHostRegister on it would fail.
-        if (ref.HasHostPtr() && ref.loc == mori::io::MemoryLocationType::CPU) {
-          hbm_engine_->AddHostGatherRegion(ref.host_ptr, ref.size);
-        }
+  for (auto* live : registry_.All()) {
+    if (live == nullptr) continue;
+    for (uint32_t i = 0; i < live->BufferCount(); ++i) {
+      const TransferRef ref = live->BufferRef(i);
+      // Only host buffers: a device-resident medium is already addressable
+      // from a kernel, and hipHostRegister on it would fail.
+      if (ref.HasHostPtr() && ref.loc == mori::io::MemoryLocationType::CPU) {
+        platform_->AddHostGatherRegion(ref.host_ptr, ref.size);
       }
     }
-    if (config_.ranged_get_scratch_buffer != nullptr && config_.ranged_get_scratch_size > 0) {
-      hbm_engine_->AddHostGatherRegion(config_.ranged_get_scratch_buffer,
-                                       config_.ranged_get_scratch_size);
-    }
-    if (config_.ranged_put_scratch_buffer != nullptr && config_.ranged_put_scratch_size > 0) {
-      hbm_engine_->AddHostGatherRegion(config_.ranged_put_scratch_buffer,
-                                       config_.ranged_put_scratch_size);
-    }
+  }
+  if (config_.ranged_get_scratch_buffer != nullptr && config_.ranged_get_scratch_size > 0) {
+    platform_->AddHostGatherRegion(config_.ranged_get_scratch_buffer,
+                                   config_.ranged_get_scratch_size);
+  }
+  if (config_.ranged_put_scratch_buffer != nullptr && config_.ranged_put_scratch_size > 0) {
+    platform_->AddHostGatherRegion(config_.ranged_put_scratch_buffer,
+                                   config_.ranged_put_scratch_size);
   }
 
   // Registration above covers the whole buffer; the shards below are slices of
@@ -1390,7 +1249,7 @@ void PoolClient::Shutdown() {
   // hipHostUnregister the gather regions before their backing memory goes
   // away: the medium's buffers die with the registry below, and the scratch
   // arena is caller-owned and freed after Shutdown returns.
-  if (hbm_engine_ != nullptr) hbm_engine_->ClearHostGatherRegions();
+  platform_->ClearHostGatherRegions();
 
   // Every backend deregisters its memory through transfer_engine_ inside its
   // own destructor — this MUST run before transfer_engine_ is torn down below.
@@ -1408,7 +1267,6 @@ void PoolClient::Shutdown() {
     registered_regions_.clear();
   }
   peer_directory_ = nullptr;
-  hbm_engine_ = nullptr;
   transfer_engine_.reset();
 
   // Drop the sink before the object it may point at. In the master-backed
@@ -1622,6 +1480,11 @@ std::pair<TransferRef, uint64_t> PoolClient::UserBufferRef(void* ptr, size_t siz
   return {ClassifiedUserBytes(ptr, size), 0};
 }
 
+TransferRef PoolClient::LocalUserBytes(void* ptr, size_t size) const {
+  const auto registered = FindRegisteredMemory(ptr, size);
+  return platform_->LocalUserBytes(ptr, size, registered ? registered->first : TransferRef{});
+}
+
 int PoolClient::SourceNumaHint(const void* src, size_t size) const {
   const int gpu_node = PreferredNumaNodeFor(const_cast<void*>(src), size);
   if (gpu_node >= 0) return gpu_node;
@@ -1661,7 +1524,8 @@ bool PoolClient::BuildLocalPageTransfers(MediumBackend* backend,
   // Classified, not assumed host: this is the self-target path, where a device
   // user buffer paired with a host DRAM page must reach HbmCopyEngine rather
   // than LocalCopyEngine.  One classification per batch, not per page.
-  const TransferRef user_ref = ClassifiedUserBytes(user, size);
+  // Keep a per-key view so whole-object copy parallelism stays unchanged.
+  const auto user_ref = LocalUserBytes(user, size);
   items->reserve(pages.size());
   for (size_t i = 0; i < pages.size(); ++i) {
     TransferRef buf = backend->BufferRef(pages[i].buffer_index);
@@ -2222,13 +2086,21 @@ void PoolClient::MaybeReCacheAfterRemote(const std::string& key, const void* src
   // serialize unrelated Get finalizers behind this memcpy.
   ReCacheJob job;
   job.key = key;
-  job.bytes = std::unique_ptr<char[]>(new (std::nothrow) char[size]);
+  HostBufferOptions options;
+  options.prefault = false;  // The copy immediately writes every byte.
+  auto buffer = platform_->AllocateHost(size, options);
+  job.bytes = decltype(job.bytes)(static_cast<char*>(buffer.ptr), {platform_, buffer});
   if (!job.bytes) {
     recache_stats_.alloc_failed.fetch_add(1, std::memory_order_relaxed);
     return;
   }
   job.size = size;
-  HostCopyBlock(job.bytes.get(), src, size);
+  const auto ref = LocalUserBytes(const_cast<void*>(src), size);
+  if (!transfer_engine_->Transfer(
+          {{ref, 0, TransferRef::HostBytes(job.bytes.get(), size), 0, size, 0}}, nullptr)) {
+    recache_stats_.install_failed.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
 
   // Enqueue for asynchronous install. The actual DRAM Allocate + copy +
   // Commit→KvEvent::ADD publish is performed by ReCacheWorkerLoop OFF the Get
@@ -2627,7 +2499,7 @@ void PoolClient::ExecuteBatchPutPlan(const BatchPutPlan& plan,
       MORI_UMBP_ERROR("[PoolClient] Local Put requested but no default pool is initialized");
       return;
     }
-    const int nthr = LocalCopyThreads("UMBP_DRAM_WRITE_THREADS");
+    const int nthr = LocalCopyThreadLimit("UMBP_DRAM_WRITE_THREADS");
     const auto t0 = std::chrono::steady_clock::now();
 
     std::vector<PoolPlacementRequest> asks;
@@ -3151,7 +3023,10 @@ std::vector<size_t> PoolClient::ServeLocalGetPart(const std::vector<std::string>
   std::vector<size_t> later;
   ResolveLocalBatch(
       keys, indices, &holders, &resolutions,
-      [&](size_t i) { return DestinationIsDevice(dsts[i], sizes[i]); }, &later);
+      [&](size_t i) {
+        return LocalUserBytes(dsts[i], sizes[i]).loc == mori::io::MemoryLocationType::GPU;
+      },
+      &later);
   std::vector<char> is_later(later.empty() ? 0 : keys.size(), 0);
   for (size_t i : later) is_later[i] = 1;
 
@@ -3183,7 +3058,7 @@ std::vector<size_t> PoolClient::ServeLocalGetPart(const std::vector<std::string>
       // let the planner pick GdsEngine.
       TransferItem item;
       item.src = resolved.file_ref;
-      item.dst = ClassifiedUserBytes(dsts[i], sizes[i]);
+      item.dst = LocalUserBytes(dsts[i], sizes[i]);
       item.size = sizes[i];
       items.push_back(std::move(item));
     } else if (!BuildLocalPageTransfers(holder, resolved.pages, resolved.page_size, dsts[i],
@@ -3666,7 +3541,8 @@ std::vector<bool> PoolClient::BatchGetRanges(const std::vector<std::string>& key
             // from a file ref, so require all of them.
             const std::vector<void*>& key_dsts = dsts[i];
             for (size_t r = 0; r < key_dsts.size(); ++r) {
-              if (!DestinationIsDevice(key_dsts[r], sizes[i][r])) return false;
+              if (LocalUserBytes(key_dsts[r], sizes[i][r]).loc != mori::io::MemoryLocationType::GPU)
+                return false;
             }
             return !key_dsts.empty();
           },

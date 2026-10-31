@@ -128,23 +128,23 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size, OwnershipConfig owne
                   std::make_unique<HostPageMemorySource>(HostPageMemorySource::Options{
                       ownership.use_hugepages, ownership.hugepage_size, ownership.numa_nodes,
                       ownership.prefault, ownership.numa_strict, ownership.prefault_threads}),
-                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval) {
-  buffer_numa_nodes_ = NormalizeNumaNodes(std::move(ownership.numa_nodes));
-  max_mr_bytes_ = ownership.max_mr_bytes;
-}
+                  ownership.buffer_sizes, pending_ttl, read_lease_ttl, reaper_interval,
+                  ownership.max_mr_bytes, ownership.numa_nodes) {}
 
 PageBackend::PageBackend(TierType tier, uint64_t page_size,
                          std::unique_ptr<PageMemorySource> source,
                          std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
                          std::chrono::milliseconds read_lease_ttl,
-                         std::chrono::milliseconds reaper_interval)
+                         std::chrono::milliseconds reaper_interval, uint64_t max_mr_bytes,
+                         std::vector<int> numa_nodes)
     : tier_(tier),
       page_size_(page_size),
       pending_ttl_(pending_ttl),
       read_lease_ttl_(read_lease_ttl),
       reaper_interval_(reaper_interval),
       source_(std::move(source)),
-      source_buffer_sizes_(std::move(buffer_sizes)) {
+      source_buffer_sizes_(std::move(buffer_sizes)),
+      max_mr_bytes_(max_mr_bytes) {
   if (page_size == 0) {
     throw std::invalid_argument("PageBackend: page_size must be > 0");
   }
@@ -155,6 +155,7 @@ PageBackend::PageBackend(TierType tier, uint64_t page_size,
   // runs for the TierConfig constructor too, where there is no source.
   buffer_loc_ = source_->LocationType();
   buffer_device_ = source_->Device();
+  buffer_numa_nodes_ = NormalizeNumaNodes(std::move(numa_nodes));
   // Not yet configured — allocator_ stays null until Init() self-allocates.
 }
 

@@ -410,6 +410,11 @@ add_library(
   distributed/peer/backend/hbm_backend.cpp
   distributed/peer/backend/ssd_backend.cpp
   distributed/peer/backend/instrumented_backend.cpp
+  sim/sim.cpp
+  sim/sim_pool_platform.cpp
+  sim/ssd.cpp
+  sim/peer.cpp
+  sim/trace.cpp
   distributed/transfer/transfer_engine.cpp
   distributed/transfer/mori_io_engine.cpp
   distributed/transfer/local_copy_engine.cpp
@@ -423,6 +428,7 @@ add_library(
   distributed/pool/peer_pool.cpp
   distributed/peer/peer_service.cpp
   distributed/pool_client.cpp
+  distributed/pool_platform.cpp
   distributed/distributed_client.cpp
   standalone/external_kv_identity_client.cpp
   standalone/ipc.cpp

@@ -156,6 +156,15 @@ TEST(Render, EveryScalarFieldReachesTheText) {
   c = base;
   c.useWeights = false;
   differs(c, "useWeights");
+  c = base;
+  c.callTokMax = 64;
+  differs(c, "callTokMax");
+  c = base;
+  c.ll128 = true;
+  differs(c, "ll128");
+  c = base;
+  c.ll128CombineOnly = true;
+  differs(c, "ll128CombineOnly");
 }
 
 TEST(Geometry, BlockThreadsIsWarpsTimesWave) {
@@ -280,6 +289,7 @@ TEST(Sizes, RegionsFollowTheRecvCapacity) {
   EpCfg c;  // ws 8, 128 tok/rank -> 1024 slots, topk 8
   c.scaleBytes = 224;
   EXPECT_EQ(EpRegionTokOffBytes(c), 4u);
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 256u + 8 * 8 * 4);
   EXPECT_EQ(EpRegionRecvNumBytes(c), 2u * 8 * 4);
   EXPECT_EQ(EpRegionRecvToSrcBytes(c), 1024u * 4);
   EXPECT_EQ(EpRegionOutIdxBytes(c), 1024u * 8 * 4);
@@ -289,6 +299,8 @@ TEST(Sizes, RegionsFollowTheRecvCapacity) {
   EXPECT_EQ(EpRegionOutScalesBytes(c), 1024u * 256);  // padded to 128 B
   c.scaleBytes = 0;
   EXPECT_EQ(EpRegionOutScalesBytes(c), 0u);
+  c.worldSize = 16;
+  EXPECT_EQ(EpRegionTokOff1250xBytes(c), 4u);
 }
 
 TEST(Sha256, KnownVectors) {
@@ -737,6 +749,7 @@ TEST(Describe, ReportsTheSizesWithoutCompiling) {
   auto d = ParseInfo(DescribePlan("ep_dispatch", {{"scaleBytes", 224}}));
   EpCfg c;
   c.scaleBytes = 224;
+  c.aggReserve = true;
   EXPECT_EQ(d["stagingBytes"], std::to_string(EpStagingTotalBytes(c)));
   EXPECT_EQ(d["scaleStride"], "256");
   EXPECT_EQ(d["region.dispOut"], std::to_string(EpRegionDispOutBytes(c)));
