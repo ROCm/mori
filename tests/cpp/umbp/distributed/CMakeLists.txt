@@ -141,6 +141,10 @@ add_test(NAME umbp_tags_real_master
 # Unit tests (pure logic; no gRPC / RDMA).  Linked against umbp_common only.
 # --------------------------------------------------------------------------
 
+add_executable(test_umbp_restore_scheduler test_restore_scheduler.cpp)
+target_link_libraries(test_umbp_restore_scheduler PRIVATE umbp_common gtest_main)
+add_test(NAME umbp_restore_scheduler COMMAND test_umbp_restore_scheduler)
+
 add_executable(test_umbp_types test_types.cpp)
 target_link_libraries(test_umbp_types PRIVATE umbp_common gtest_main)
 add_test(NAME umbp_types COMMAND test_umbp_types)
