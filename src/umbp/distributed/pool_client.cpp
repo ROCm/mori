@@ -1401,6 +1401,17 @@ bool PoolClient::RegisterMemory(void* ptr, size_t size, mori::io::MemoryLocation
     MORI_UMBP_ERROR("[PoolClient] RegisterMemory: invalid args ptr={}, size={}", ptr, size);
     return false;
   }
+  // Registered as host memory, a device buffer would be moved by whichever
+  // NICs host memory gets rather than the one beside its GPU.  Only with an
+  // ordinal: a GPU region without one has no NIC to match.
+  if (loc == mori::io::MemoryLocationType::CPU) {
+    const PointerLocation location = DetectPointerLocation(ptr);
+    const int ordinal = location.device_id >= 0 ? location.device_id : device;
+    if (location.IsDevice() && ordinal >= 0) {
+      loc = mori::io::MemoryLocationType::GPU;
+      device = ordinal;
+    }
+  }
   std::unique_lock<std::shared_mutex> lock(registered_mem_mutex_);
   const auto at = std::lower_bound(
       registered_regions_.begin(), registered_regions_.end(), ptr,

@@ -120,7 +120,8 @@ class PoolClient {
   // Record a caller-owned region.  The descriptor is cached and looked up by
   // (ptr, size) on the Put/Get hot paths; `loc`/`device` describe the caller's
   // allocation (CPU, or a GPU ordinal) so the transfer layer routes to
-  // HbmCopyEngine instead of assuming host memory.
+  // HbmCopyEngine instead of assuming host memory.  Device memory passed with
+  // the CPU default -- the two-argument form -- is registered as what it is.
   //
   // kPinned also hands the region to the IO engine for zero-copy RDMA.
   // kLocalCopyOnly skips that, for a region that is only ever a local copy
