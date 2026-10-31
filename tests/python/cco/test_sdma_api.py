@@ -1103,6 +1103,76 @@ def _worker_put_broadcast(rank, world_size, uid_path, coop_name, results_path):
         f.write(err or "")
 
 
+_STALE_RPTR_SRC = r"""
+#include "mori/cco/cco.hpp"
+using namespace mori::cco;
+extern "C" __global__ void put(ccoDevComm* dc, int peer, ccoWindow_t w, void** host) {
+  ccoSdma sdma{*dc};
+  sdma.put<ccoCoopThread, true>(peer, w, 0, w, 0, 256);
+  sdma.waitSignal(dc->lsaRank, 0, 1);  // the copy has run; retiredWptr has not moved, so quiet must post a drain
+  host[0] = dc->sdma.deviceHandles[peer * dc->sdma.sdmaNumQueue]->rptr;
+}
+extern "C" __global__ void quiet(ccoDevComm* dc, int peer, void** host) {
+  ccoSdma{*dc}.quiet(peer);
+  host[1] = host;
+}
+extern "C" __global__ void quietQueue(ccoDevComm* dc, int peer, void** host) {
+  ccoSdma{*dc}.quietQueue(peer, 0);
+  host[1] = host;
+}
+"""
+
+
+def _worker_quiet_stale_rptr(rank, world_size, uid_path, quiet, results_path):
+    """#877: quiet must not poll the queue's read pointer (host memory): make it
+    stale while the queue is idle, and a quiet that polls it never returns."""
+    err = None
+    try:
+        import ctypes
+        import subprocess
+        import time
+
+        from mori.cco import CCODevCommRequirements, GDA_CONNECTION_NONE
+        from mori.jit.config import detect_build_config, get_mori_source_root
+        from mori.jit.hip_driver import HipModule
+
+        comm = _init_comm(rank, world_size, uid_path)
+        win = comm.register_window(comm.alloc_mem(NBYTES).ptr, NBYTES)
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.sdma_queue_count = 1
+        dc = comm.create_dev_comm(reqs)
+        cfg, tmp = detect_build_config(), tempfile.mkdtemp()
+        src, co = os.path.join(tmp, "k.hip"), os.path.join(tmp, "k.co")
+        with open(src, "w") as f:
+            f.write(_STALE_RPTR_SRC)
+        inc = os.path.join(str(get_mori_source_root()), "include")
+        subprocess.check_call(
+            [cfg.hipcc, "--genco", f"--offload-arch={cfg.arch}", "-DBUILD_CCO_SDMA=1"]
+            + ["-I", inc, src, "-o", co]
+        )
+        fn, nxt = HipModule(co).get_function, (rank + 1) % world_size
+        host = torch.zeros(2, dtype=torch.int64, pin_memory=True)
+        fn("put").launch((1,), (1,), 0, 0, dc.ptr, nxt, win.handle, host.data_ptr())
+        torch.cuda.synchronize()
+        time.sleep(0.05)  # let the engine's read-pointer write-back land
+        rptr = ctypes.c_uint64.from_address(int(host[0]))
+        true_rptr = rptr.value
+        rptr.value = true_rptr - 32
+        fn(quiet).launch((1,), (1,), 0, 0, dc.ptr, nxt, host.data_ptr())
+        time.sleep(1.0)
+        returned = host[1].item() != 0
+        rptr.value = max(rptr.value, true_rptr)  # lets a quiet that polls it finish
+        torch.cuda.synchronize()
+        comm.barrier()
+        assert returned, f"rank {rank}: {quiet} waited on a stale read pointer"
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 def _signal_snapshot_kernel(flyc, fx, Int64, cco, slots, snap_off, me):
     """A kernel that copies the low 32 bits of each ``(src_rank, qid)`` signal
     slot into ``win[snap_off + 4 * i]``, so the host can check exact counts."""
@@ -1769,6 +1839,12 @@ def test_sdma_post_wait_mem(coop_name):
 def test_sdma_post_wait_signal_relay(world_size):
     """post_wait_signal forwards a hop's data once its remote signal lands."""
     _run(_worker_post_wait_signal, world_size=world_size, coop_name="THREAD")
+
+
+@pytest.mark.parametrize("api", ["quiet", "quietQueue"])
+def test_sdma_quiet_ignores_host_rptr(api):
+    # _run passes the API name through its coop_name slot
+    _run(_worker_quiet_stale_rptr, world_size=2, coop_name=api)
 
 
 @pytest.mark.parametrize("coop_name", ["THREAD", "WARP"])
