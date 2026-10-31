@@ -90,6 +90,7 @@ The example SSD values are estimates, not calibration results.
 | `channel` | Same names share a service queue within one backend client/server. |
 | `latency_ns` | Nonnegative fixed cost per submitted batch/path. |
 | `copy_latency_ns` | Nonnegative cost per coalesced copy; default 0. |
+| `interleave_copies` | Optional `cpu_gpu` / `gpu_cpu` flag to wait per copy in pure same-device fallback batches, letting concurrent callers interleave; default false. Gather and mixed batches keep batch scheduling. |
 | `registration_latency_ns` | Optional nonnegative first-FD cost for `file_gpu`; default 0. |
 | `log_size_latency_ns` | Optional nonnegative SSD read cost per copy × `log2(max(1, mean copy bytes / 4096))`; default 0. |
 | `batch_log_size_latency_ns` | Optional nonnegative SSD read cost per batch × the same size term; default 0. |

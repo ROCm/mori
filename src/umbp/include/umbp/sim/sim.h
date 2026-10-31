@@ -99,6 +99,7 @@ class SimTransferEngine final : public TransferEngine, public PeerDirectory {
     double size_knee_bytes;
     double large_size_ns_per_byte;
     bool serialize_latency;
+    bool interleave_copies;
   };
   struct Reservation {
     Clock::time_point finish;

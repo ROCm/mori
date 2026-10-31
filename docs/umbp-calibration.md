@@ -137,6 +137,8 @@ cost instead of dropping that model because of a slightly negative noisy size sl
 GPU training separates gather from memcpy by observing actual kernel launches.
 Sim selects the optional gather curve using registered host ranges, per-device
 segment geometry and the production cutoff; missing variants fall back to the base curve.
+Measured base `cpu_gpu` / `gpu_cpu` curves set `interleave_copies=true` to model
+HbmCopyEngine's blocking per-copy fallback. Older profiles keep batch scheduling.
 Direct RDMA trains network paths; its actual bounce buffers train staging in each direction.
 Both probes honor the explicit `--max-mib` limit; remote sampling has no hidden 64 MiB cap.
 Staging samples run after the timed wire pair so extra calibration traffic does

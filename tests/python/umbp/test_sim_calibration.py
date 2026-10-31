@@ -130,6 +130,25 @@ def test_unresolved_byte_cost_keeps_the_measured_copy_latency():
     json.dumps(curve, allow_nan=False)
 
 
+def test_gpu_interleaving_only_enables_measured_non_gather_paths():
+    names = ("cpu_gpu", "gpu_cpu", "cpu_gpu_gather", "gpu_cpu_gather")
+    rows = [
+        dict(row, path=name)
+        for row in measurements()
+        if row["effective_threads"] == 1
+        for name in names
+    ]
+    curves = calibrate.fit_paths(rows, [1], {})
+    for name in names:
+        assert curves[name].get("interleave_copies", False) == (
+            name in ("cpu_gpu", "gpu_cpu")
+        )
+    base = {"cpu_gpu": {"channel": "unmeasured"}}
+    assert (
+        calibrate.fit_paths(measurements(), [1, 4], base)["cpu_gpu"] == base["cpu_gpu"]
+    )
+
+
 def test_file_registration_is_fitted_separately_and_uses_only_training():
     rows = [
         dict(row, path="file_gpu")

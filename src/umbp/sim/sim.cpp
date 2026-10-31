@@ -266,6 +266,9 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
     const bool serial = object.fields().count("serialize_latency");
     const bool serialize_latency =
         serial && Field(object, "serialize_latency", Value::kBoolValue).bool_value();
+    const bool interleave = object.fields().count("interleave_copies");
+    const bool interleave_copies =
+        interleave && Field(object, "interleave_copies", Value::kBoolValue).bool_value();
     Path path{channel_id,
               Curve(object, "latency_ns", false),
               Curve(object, "bandwidth_bytes_per_second", true),
@@ -277,10 +280,13 @@ SimTransferEngine::SimTransferEngine(const std::string& profile_path, std::strin
               batch_log_ns,
               knee_bytes,
               large_ns,
-              serialize_latency};
+              serialize_latency,
+              interleave_copies};
     if (object.fields().size() != 3 + object.fields().count("copy_latency_ns") + registration +
-                                      logarithmic + batch_logarithmic + serial + knee + large ||
-        knee != large || (knee && (index != 6 && index != 7)) || !std::isfinite(knee_bytes) ||
+                                      logarithmic + batch_logarithmic + serial + knee + large +
+                                      interleave ||
+        (interleave && index != 1 && index != 2) || knee != large ||
+        (knee && (index != 6 && index != 7)) || !std::isfinite(knee_bytes) ||
         (knee && knee_bytes <= 0) || !std::isfinite(large_ns) || large_ns < 0 ||
         (registration && name != "file_gpu") || !std::isfinite(registration_ns) ||
         ((logarithmic || batch_logarithmic || serial) && index != 10 && index != 12 &&
@@ -390,7 +396,8 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
     Copies copies{};
   };
   std::map<int, GatherBucket> gather;
-  const bool has_gather = paths_[8] || paths_[9];
+  const bool has_gather = paths_[8] || paths_[9] || (paths_[1] && paths_[1]->interleave_copies) ||
+                          (paths_[2] && paths_[2]->interleave_copies);
   std::unique_lock<std::mutex> gather_lock(gather_mutex_, std::defer_lock);
   if (has_gather) gather_lock.lock();
   for (const auto& plan : plans) {
@@ -446,12 +453,14 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
     }
   }
   // Real HBM gathers eligible plans per device, including both H2D and D2H.
+  bool eligible_gather = false;
   for (const auto& [device, bucket] : gather) {
     const auto total_bytes = bucket.bytes[1] + bucket.bytes[2];
     const size_t total_copies = bucket.copies[1] + bucket.copies[2];
     if (total_bytes > std::numeric_limits<size_t>::max() ||
         !GatherShapeEligible(total_copies, static_cast<size_t>(total_bytes)))
       continue;
+    eligible_gather = true;
     for (size_t path : {1, 2}) {
       const size_t variant = path + 7;
       if (!paths_[variant]) continue;  // Old profiles retain their original curve.
@@ -462,6 +471,46 @@ std::optional<SimTransferEngine::Reservation> SimTransferEngine::Reserve(
     }
   }
   if (gather_lock.owns_lock()) gather_lock.unlock();
+  // HBM fallback submits and waits per copy; interleave independent callers likewise.
+  const size_t gpu_path = bytes[1] > 0 ? 1 : 2;
+  if (!eligible_gather && bytes[gpu_path] > 0 && paths_[gpu_path]->interleave_copies &&
+      std::count_if(bytes.begin(), bytes.end(), [](auto n) { return n > 0; }) == 1) {
+    const auto& path = *paths_[gpu_path];
+    const auto gpu_device = [&](const TransferPlan& plan) {
+      return gpu_path == 1 ? plan.dst.device : plan.src.device;
+    };
+    const int device = gpu_device(plans.front());
+    const bool one_device =
+        device >= 0 && std::all_of(plans.begin(), plans.end(), [&](const auto& p) {
+          return PathIndex(p.src, p.dst) == static_cast<int>(gpu_path) && gpu_device(p) == device;
+        });
+    if (one_device && !(paths_[12] && paths_[12]->channel == path.channel)) {
+      // Validate the complete input budget before making any channel reservation.
+      const auto full_ns = path.latency_ns[0] + copies[gpu_path] * path.copy_latency_ns[0] +
+                           bytes[gpu_path] * 1e9L / path.bandwidth[0];
+      if (!Deadline(submitted, full_ns)) return std::nullopt;
+      auto previous = submitted;
+      bool first = true;
+      for (const auto& plan : plans) {
+        for (const auto size : plan.sizes) {
+          if (size == 0) continue;
+          const auto latency = path.copy_latency_ns[0] + (first ? path.latency_ns[0] : 0);
+          std::optional<Clock::time_point> finish;
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto start = std::max(previous, available_[path.channel]);
+            finish = Deadline(start, latency + size * 1e9L / path.capacity);
+            if (!finish) return std::nullopt;
+            available_[path.channel] = *finish;
+          }
+          WaitUntil(*finish);
+          previous = *finish;  // Model work consumes the initial submit budget.
+          first = false;
+        }
+      }
+      return Reservation{previous, previous};
+    }
+  }
   // hipFileRead is synchronous per copy; only pure GDS batches share byte service.
   if (bytes[12] > 0 && !paths_[12]->serialize_latency &&
       std::count_if(bytes.begin(), bytes.end(), [](auto n) { return n > 0; }) == 1) {

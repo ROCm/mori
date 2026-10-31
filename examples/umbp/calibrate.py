@@ -202,6 +202,8 @@ def fit_paths(records, threads, base, *, ssd_io="posix"):
             in ("file_cpu", "file_gpu", "file_cpu_staged", "file_cpu_staged_no_crc"),
             staging=name in ("cpu_staging", "cpu_staging_read"),
         )
+        if name in ("cpu_gpu", "gpu_cpu"):
+            curve["interleave_copies"] = True
         base_name = name.removesuffix("_no_crc")
         fallback = (
             base.get("cpu_staging", base.get("cpu_cpu", {}))
