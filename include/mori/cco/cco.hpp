@@ -2657,6 +2657,9 @@ struct ccoSdma {
 
   // quiet: wait until every queue toward `peer` has drained. warp/block take one
   // queue per lane so the reads overlap; thread scope walks them.
+  // quiet/quietQueue poll the engine's read pointer, which libhsakmt puts in host
+  // memory, so kernels running alongside slow down while they wait (#877). For a
+  // long wait that overlaps compute, put with localSignal and use waitSignal.
   template <typename Coop = ccoCoopThread>
   __device__ inline void quiet(int peer) {
     static_assert(std::is_same_v<Coop, ccoCoopThread> || std::is_same_v<Coop, ccoCoopWarp> ||
@@ -2861,7 +2864,8 @@ struct ccoSdma {
                                         0xFFFFFFFFu, ccoSdmaCmpGe);
   }
 
-  // commit: ring the doorbell for Aggregate-posted ops, then drain with quiet().
+  // commit: ring the doorbell for Aggregate-posted ops. It does not wait; use
+  // quiet()/quietQueue() or the ops' signals for completion.
   // thread rings `queueId`; warp/block ring every queue.
   template <typename Coop = ccoCoopThread>
   __device__ inline void commit(int peer, int queueId = 0) {

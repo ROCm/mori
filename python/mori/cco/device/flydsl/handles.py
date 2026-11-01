@@ -775,7 +775,9 @@ class Sdma:
         raw.SDMA_COMMIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer, qid)
 
     def quiet(self, peer, *, coop=CoopScope.THREAD):
-        """Wait for all outstanding SDMA ops to `peer` across every queue."""
+        """Wait for all outstanding SDMA ops to `peer` across every queue. Polls host
+        memory; for a long wait that overlaps compute prefer local_signal + wait_signal.
+        """
         raw.SDMA_QUIET[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, peer)
 
     def quiet_queue(self, peer, qid):
