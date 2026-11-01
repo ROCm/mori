@@ -31,12 +31,14 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "umbp/local/tiers/segment/segment_format.h"
@@ -326,6 +328,51 @@ TEST_P(SsdTierRangesTest, RangedReadIgnoresRecordChecksum) {
             std::vector<bool>({true}));
   ExpectSlice(slice, object, 2000);
 }
+
+// Concurrent batches on separate io_uring read rings each get their own bytes.
+TEST_P(SsdTierRangesTest, ConcurrentBatchesOnReadRings) {
+  const std::string dir = MakeDir(GetParam() ? "rings_direct" : "rings_buffered");
+  auto cfg = BaseConfig(dir, GetParam());
+  cfg.io.backend = UMBPIoBackend::IoUring;
+  cfg.io.read_rings = 4;
+  SSDTier tier(dir, cfg.capacity_bytes, cfg);
+  SKIP_IF_DIRECT_UNAVAILABLE(tier, GetParam());
+
+  constexpr int kKeys = 8;
+  std::vector<std::vector<char>> objects;
+  for (int k = 0; k < kKeys; ++k) {
+    objects.push_back(PatternedValue(64 * 1024, k));
+    ASSERT_TRUE(tier.Write("k" + std::to_string(k), objects[k].data(), objects[k].size()));
+  }
+  std::vector<std::thread> threads;
+  std::atomic<int> bad{0};
+  for (int t = 0; t < 8; ++t) {
+    threads.emplace_back([&, t] {
+      for (int iter = 0; iter < 50; ++iter) {
+        std::vector<std::string> keys;
+        std::vector<std::vector<char>> outs(kKeys, std::vector<char>(3000));
+        std::vector<std::vector<uintptr_t>> ptrs;
+        std::vector<std::vector<size_t>> sizes, offsets;
+        for (int k = 0; k < kKeys; ++k) {
+          keys.push_back("k" + std::to_string(k));
+          ptrs.push_back({Ptr(outs[k])});
+          sizes.push_back({3000});
+          offsets.push_back({static_cast<size_t>((t * 997 + iter * 131) % 60000)});
+        }
+        const auto ok = tier.ReadBatchRangesIntoPtr(keys, ptrs, sizes, offsets);
+        for (int k = 0; k < kKeys; ++k) {
+          if (!ok[k] ||
+              !std::equal(outs[k].begin(), outs[k].end(), objects[k].begin() + offsets[k][0])) {
+            ++bad;
+          }
+        }
+      }
+    });
+  }
+  for (auto& th : threads) th.join();
+  EXPECT_EQ(bad.load(), 0);
+}
+
 // The tree connector loads straight into GPU buffers, so the tier has to accept
 // a device destination.  read() cannot write one, which is why these have to
 // bounce through host memory -- a regression here shows up as a silent miss
