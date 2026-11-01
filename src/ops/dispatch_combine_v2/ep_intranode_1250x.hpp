@@ -3182,6 +3182,10 @@ template <EpCfg kCfg>
 constexpr int EpFp4Rows() {
   return EpCombinePushRows(kCfg);
 }
+template <EpCfg kCfg>
+constexpr bool EpFp4RowsLeave() {
+  return EpFp4Rows<kCfg>() <= 8;
+}
 // The landing holds every row this rank's tokens get back: the rows from one destination are one
 // run, after the rows from every destination below it (the dispatch signal's high word), so the
 // runs tile at most this many.
@@ -3879,7 +3883,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
     for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
-      if (j >= __popcll(mask)) break;
+      if (j >= __popcll(mask)) {
+        if constexpr (EpFp4RowsLeave<kCfg>()) break;
+        continue;
+      }
       const float s = on[j] * __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
       EpFp4Accum<kCfg>(acc, pk[j], s);
     }
@@ -3913,7 +3920,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       unsigned sb[kRows];
 #pragma unroll
       for (int j = 0; j < kRows; ++j) {
-        if (j >= nr) break;
+        if (j >= nr) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         const char* const row = sharedMem + tileOff + (size_t)j * kWireB;
         pk[j] = EpFp4LoadLane<kCfg>(row, g);
         if constexpr (W::kF32Scale)
@@ -3926,7 +3936,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
       for (int j = 0; j < kRows; ++j) {
-        if (j >= nr) break;
+        if (j >= nr) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         const float s = __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
         EpFp4Accum<kCfg>(acc, pk[j], s);
       }
@@ -3950,7 +3963,10 @@ __device__ __forceinline__ void EpFp4ReduceItem(const EpArgs& args, const EpFp4I
       unsigned sb[kRows];
 #pragma unroll
       for (int j = 0; j < kRows; ++j) {
-        if (j >= nRow) break;
+        if (j >= nRow) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         const char* const row = sharedMem + tileOff + (size_t)(j < nRow ? j : 0) * kWireB;
         pk[j] = EpFp4LoadLane<kCfg>(row, g);
         if constexpr (W::kF32Scale)
@@ -4152,7 +4168,10 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
         unsigned sb[kRows];
 #pragma unroll
         for (int j = 0; j < kRows; ++j) {
-          if (j >= nr) break;
+          if (j >= nr) {
+            if constexpr (EpFp4RowsLeave<kCfg>()) break;
+            continue;
+          }
           const int s = s0 + j < kRingL ? s0 + j : s0 + j - kRingL;
           const char* const row = sub + (size_t)s * kWireB;
           pk[j] = EpFp4LoadLane<kCfg>(row, g);
@@ -4167,7 +4186,10 @@ __device__ __forceinline__ void EpFp4ReduceWs(const EpArgs& args) {
         for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
         for (int j = 0; j < kRows; ++j) {
-          if (j >= nr) break;
+          if (j >= nr) {
+            if constexpr (EpFp4RowsLeave<kCfg>()) break;
+            continue;
+          }
           const float s = __uint_as_float(W::kF32Scale ? sb[j] : sb[j] << 23);
           EpFp4Accum<kCfg>(acc, pk[j], s);
         }
@@ -4250,7 +4272,10 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
     unsigned sb[kRows];
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
-      if (j >= nr) break;
+      if (j >= nr) {
+        if constexpr (EpFp4RowsLeave<kCfg>()) break;
+        continue;
+      }
       EpGU64* const q = (EpGU64*)(r.rp[j] + (size_t)g * W::kLaneB);
 #pragma unroll
       for (int k = 0; k < W::kLaneB / 16; ++k) {
@@ -4270,7 +4295,10 @@ __device__ __forceinline__ void EpFp4OvlToken(const EpArgs& args, const EpFp4Ite
     for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
 #pragma unroll
     for (int j = 0; j < kRows; ++j) {
-      if (j >= nr) break;
+      if (j >= nr) {
+        if constexpr (EpFp4RowsLeave<kCfg>()) break;
+        continue;
+      }
       EpFp4Accum<kCfg>(acc, pk[j], __uint_as_float(sb[j] << 23));
     }
     uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
@@ -4640,7 +4668,10 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
       }
 #pragma unroll
       for (int b = 0; b < kRows; ++b) {
-        if (b >= nRow) break;
+        if (b >= nRow) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         unsigned char* const d = tile + (size_t)b * kWireB;
 #pragma unroll
         for (int k = 0; k < kPSm; ++k) {
@@ -4659,7 +4690,10 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
         unsigned sb[kRows];
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
-          if (r >= nRow) break;
+          if (r >= nRow) {
+            if constexpr (EpFp4RowsLeave<kCfg>()) break;
+            continue;
+          }
           const char* const row = reinterpret_cast<const char*>(tile) + (size_t)r * kWireB;
           pk[r] = EpFp4LoadLane<kCfg>(row, g);
           sb[r] = (unsigned char)row[kPayB + g * 32 / kQGroup];
@@ -4669,7 +4703,10 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
         for (int i = 0; i < 32; ++i) acc[i] = 0.0f;
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
-          if (r >= nRow) break;
+          if (r >= nRow) {
+            if constexpr (EpFp4RowsLeave<kCfg>()) break;
+            continue;
+          }
           EpFp4Accum<kCfg>(acc, pk[r], __uint_as_float(sb[r] << 23));
         }
         uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
@@ -4752,7 +4789,10 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
       unsigned sb[kRows];
 #pragma unroll
       for (int r = 0; r < kRows; ++r) {
-        if (r >= nRow) break;
+        if (r >= nRow) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         const char* const row = reinterpret_cast<const char*>(tile) + (size_t)r * kWireB;
         pk[r] = EpFp4LoadLane<kCfg>(row, g);
         sb[r] = (unsigned char)row[kPayB + g * 32 / kQGroup];
@@ -4762,7 +4802,10 @@ __device__ __forceinline__ void EpCombineLl1250x(const EpArgs& args) {
       for (int i = 0; i < 32; ++i) acc[i] = 0.0f;
 #pragma unroll
       for (int r = 0; r < kRows; ++r) {
-        if (r >= nRow) break;
+        if (r >= nRow) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         EpFp4Accum<kCfg>(acc, pk[r], __uint_as_float(sb[r] << 23));
       }
       uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
@@ -4986,7 +5029,10 @@ __device__ __forceinline__ void EpCombineLlBf16_1250x(const EpArgs& args) {
       for (int x = 0; x < 8; ++x) acc[x] = 0.0f;
 #pragma unroll
       for (int b = 0; b < kRows; ++b) {
-        if (b >= nRow) break;
+        if (b >= nRow) {
+          if constexpr (EpFp4RowsLeave<kCfg>()) break;
+          continue;
+        }
         const unsigned wd[4] = {v[b][i].x, v[b][i].y, v[b][i].z, v[b][i].w};
 #pragma unroll
         for (int x = 0; x < 4; ++x) {
