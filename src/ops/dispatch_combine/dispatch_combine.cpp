@@ -165,6 +165,22 @@ EpDispatchCombineHandle::EpDispatchCombineHandle(EpDispatchCombineConfig config_
         " (InterNode v0 / AsyncLL) sends cross-node RDMA to arbitrary PEs, which have no QP in "
         "rail-only mode. Use InterNodeV1 or InterNodeV1LL, or unset MORI_ENABLE_RAIL_ONLY.");
   }
+  // The cross-node kernels (InterNode v0, InterNodeV1/V1LL, AsyncLL) move data with the shmem RDMA
+  // API, which takes the remote address and rkey from SymmMemObj::peerPtrs / peerRkeys. The CCO
+  // backend's MallocSymm only fills p2pPeerPtrs (LSA peers) and leaves those RDMA fields null, so
+  // the first cross-node put reads a null pointer on the GPU (memory access fault at address 0).
+  // Fail at construction instead.
+  if (useCcoComm && config.worldSize > config.gpuPerNode &&
+      (config.kernelType == KernelType::InterNode || config.kernelType == KernelType::InterNodeV1 ||
+       config.kernelType == KernelType::InterNodeV1LL ||
+       config.kernelType == KernelType::AsyncLL)) {
+    throw std::runtime_error(
+        "kernelType=" + std::to_string(static_cast<int>(config.kernelType)) +
+        " sends cross-node RDMA through the shmem API, but this handle uses the CCO backend "
+        "(MORI_EP_COMM=cco, the default on gfx125x), whose symmetric buffers are not registered "
+        "for RDMA. Use the EPv2 internode path, or MORI_EP_COMM=shmem on archs where the shmem "
+        "backend supports intra-node P2P.");
+  }
   disableRdmaAtomics = env::IsEnvVarEnabled(kDisableRdmaAtomicsEnv);
   if (disableRdmaAtomics) {
     // InterNode v0 still signals with RDMA atomics, which hang on NICs that do not execute
