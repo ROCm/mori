@@ -1071,12 +1071,15 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
   const auto t_io = ssdperf::Now();
   std::vector<char> run_ok(runs.size(), 0);
   uint64_t io_bytes = 0;
+  double io_wait_ms = 0.0;  // queued behind other batches on this drive's io_mu_
 
   auto read_one = [&](size_t j) {
     const auto& run = runs[j];
     IoStatus status;
     if (needs_io_lock) {
+      const auto t_wait = ssdperf::Now();
       std::lock_guard<std::mutex> io_lock(io_mu_);
+      io_wait_ms += ssdperf::MsSince(t_wait);
       status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
     } else {
       status = io_driver_->ReadAt(run.fd, run.io_dst, run.io_size, run.io_offset);
@@ -1091,7 +1094,9 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
 
     IoStatus status;
     if (needs_io_lock) {
+      const auto t_wait = ssdperf::Now();
       std::lock_guard<std::mutex> io_lock(io_mu_);
+      io_wait_ms += ssdperf::MsSince(t_wait);
       status = io_driver_->ReadBatch(ops);
     } else {
       status = io_driver_->ReadBatch(ops);
@@ -1148,11 +1153,11 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
     MORI_UMBP_INFO(
         "[SsdPerf/tier] RANGED_GET dir={} keys={} located={} runs={} served_bytes={} "
         "read_bytes={} total_ms={:.3f} GB_s={:.2f} | mu_wait={:.3f}ms plan={:.3f}ms ({:.0f}%) "
-        "dev_read={:.3f}ms ({:.0f}%) bounce_copy={:.3f}ms ({:.0f}%) | dev_GB_s={:.2f} "
-        "amplification={:.2f}x batched={}",
+        "dev_read={:.3f}ms ({:.0f}%) io_wait={:.3f}ms bounce_copy={:.3f}ms ({:.0f}%) | "
+        "dev_GB_s={:.2f} amplification={:.2f}x batched={}",
         dir_, keys.size(), located.size(), runs.size(), served_bytes, io_bytes, total_ms,
         ssdperf::GbPerSec(served_bytes, total_ms), lock_ms, plan_ms,
-        ssdperf::Pct(plan_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), copy_ms,
+        ssdperf::Pct(plan_ms, total_ms), io_ms, ssdperf::Pct(io_ms, total_ms), io_wait_ms, copy_ms,
         ssdperf::Pct(copy_ms, total_ms), ssdperf::GbPerSec(io_bytes, io_ms),
         served_bytes ? static_cast<double>(io_bytes) / static_cast<double>(served_bytes) : 0.0,
         use_batch);
