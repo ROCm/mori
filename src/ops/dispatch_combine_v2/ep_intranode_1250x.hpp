@@ -5482,7 +5482,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       T* outPtr = reinterpret_cast<T*>(args.outTokenBuf) + tokenId * hiddenDim + hiddenDimOffset;
 
       int validAccumCount = topk;
-      if (npes <= 4) {
+      if (npes <= 4 || npes < topk) {
         int isValid = 0;
         TokT* myTokPtr = nullptr;
         if (laneId < topk) {
