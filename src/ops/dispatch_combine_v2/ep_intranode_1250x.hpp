@@ -3406,6 +3406,16 @@ constexpr bool EpFp4Ovl() {
          (kCfg.worldSize >= 8 ? (kCfg.warpPerBlock == 16 || kCfg.warpPerBlock == 24)
                               : kCfg.warpPerBlock == 24);
 }
+template <EpCfg kCfg>
+constexpr bool EpFp4Ovl4() {
+  if constexpr (EpFp4Ovl<kCfg>() && kCfg.worldSize < 8 && !kCfg.cardCombine)
+    return !EpFp4Wire<kCfg>::kBf16;
+  return false;
+}
+__device__ __forceinline__ int EpFp4Ovl4Role(const int warpId) {
+  const int quad = warpId >> 2;
+  return quad == 1 || quad == 4 ? warpId ^ 20 : warpId;
+}
 // A token lands one row per distinct destination rank of its top-k experts.
 template <EpCfg kCfg>
 constexpr int EpFp4Rows() {
@@ -3504,9 +3514,10 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   // kSegMin rows a block, fewer warps quantizing costs more than the merged stores save, and the
   // per-warp runs below take over.
   constexpr bool kOvlp = EpFp4Ovl<kCfg>();
+  constexpr bool kOvl4 = EpFp4Ovl4<kCfg>();
   constexpr int kSegK =
       (kOvlp || (kCfg.worldSize >= 8 && (kCfg.warpPerBlock == 8 || kCfg.warpPerBlock == 16)))
-          ? (W::kBf16 && kCfg.cardCombine ? 2 : 6)
+          ? (W::kBf16 && kCfg.cardCombine ? 2 : (kOvl4 ? (W::kFp8 ? 5 : 8) : 6))
           : 0;
   // The overlapped path sends with half the block, four of them store waves: a 24-warp block runs
   // a second producer on every SIMD -- a producer is bound by its own dependent chains and LDS
@@ -3535,7 +3546,8 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
   static_assert(!W::kBf16 || (kOvlp && kSeg), "the bf16 wire runs only the overlapped split send");
 
   const int laneId = threadIdx.x & (WS - 1);
-  const int warpId = __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS));
+  const int warpId = kOvl4 ? EpFp4Ovl4Role(__builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS)))
+                           : __builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS));
   const unsigned long long win = args.window;
   extern __shared__ char sharedMem[];
 
@@ -3991,6 +4003,67 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           return true;
         }
       };
+      if constexpr (kOvl4) {
+        using QV = std::conditional_t<W::kFp8, EpU32x2, unsigned>;
+        const int nRows = rEnd - rb;
+        if (warpId < nRows) loadRow(rowOf(rb + warpId));
+        for (int r = warpId; r < nRows; r += kSegP) {
+          const int c = r / kSegK;
+          const int slot = c % kSegNb;
+          __builtin_amdgcn_s_wait_tensorcnt(0);
+          const uint4* const l = reinterpret_cast<const uint4*>(stg);
+          uint4 xs[kLd];
+#pragma unroll
+          for (int k = 0; k < kLd; ++k) xs[k] = l[k * WS + laneId];
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
+          if (r + kSegP < nRows) loadRow(rowOf(rb + r + kSegP));
+          QV qv[kLd];
+          unsigned qs[kLd];
+#pragma unroll
+          for (int i = 0; i < kLd; ++i) {
+            const unsigned amax = grpAmax(xs[i]);
+            if constexpr (W::kFp8) {
+              const int e8 = (((int)(amax & 0x7FFFu) + 0x1F) >> 7) - 8;
+              const int se = (e8 < 1 ? 1 : e8) - 127;
+              const float sc = __uint_as_float((unsigned)(127 + se) << 23);
+              qv[i] = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(
+                  __builtin_bit_cast(EpBf16x8, xs[i]), sc);
+              qs[i] = (unsigned)(se + 127);
+            } else {
+              const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
+              const int se = (e8 < 1 ? 1 : e8) - 127;
+              const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
+              qv[i] = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(
+                  __builtin_bit_cast(EpBf16x8, xs[i]), sc);
+              qs[i] = (unsigned)(se + 127);
+            }
+            asm volatile("" : "+v"(qv[i]), "+v"(qs[i]));
+          }
+          if (c >= kSegNb) {
+            unsigned spin = 0;
+            while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                       fre + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) !=
+                   c - kSegNb + 1) {
+              __builtin_amdgcn_s_sleep(1);
+              if (++spin > kSpinMax) __builtin_trap();
+            }
+          }
+          unsigned char* const d = ringB + ((size_t)slot * kSegK + (size_t)(r % kSegK)) * kWireB;
+#pragma unroll
+          for (int i = 0; i < kLd; ++i) {
+            const int u = i * WS + laneId;
+            if constexpr (W::kFp8)
+              *reinterpret_cast<QV*>(d + (size_t)u * 8) = qv[i];
+            else
+              *reinterpret_cast<QV*>(d + (size_t)u * 4) = qv[i];
+            qscale(d, i, (unsigned char)qs[i]);
+          }
+          asm volatile("s_wait_dscnt 0x0" ::: "memory");
+          if (laneId == 0)
+            __hip_atomic_fetch_add(rdy + slot, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        }
+        return;
+      }
       [[maybe_unused]] bool sibNext = false;
       if (warpId < nCh) {
         loadRow(rowOf(rb + warpId * kSegK));
@@ -4081,6 +4154,11 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
             __hip_atomic_store(f, ovlEp, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
           }
         }
+        if constexpr (kOvl4) {
+          if (laneId == 0)
+            __hip_atomic_store(rdy + ch % kSegNb, 0, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_WORKGROUP);
+        }
         if (laneId == 0)
           __hip_atomic_store(fre + ch % kSegNb, ch + 1, __ATOMIC_RELAXED,
                              __HIP_MEMORY_SCOPE_WORKGROUP);
@@ -4097,8 +4175,14 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           }
         }
         unsigned spin = 0;
-        while (__builtin_amdgcn_readfirstlane(__hip_atomic_load(
-                   rdy + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) != c + 1) {
+        while (kOvl4 ? (c >= kSegNb && __builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                                           fre + slot, __ATOMIC_RELAXED,
+                                           __HIP_MEMORY_SCOPE_WORKGROUP)) != c - kSegNb + 1) ||
+                           __builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                               rdy + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) !=
+                               min(kSegK, rEnd - (rb + c * kSegK))
+                     : __builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                           rdy + slot, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) != c + 1) {
           if (head < x) {
             retire();
           } else {
@@ -4885,6 +4969,134 @@ __device__ __forceinline__ unsigned EpFp4OvlRound(const EpArgs& args, const unsi
     }
   }
   return in;
+}
+
+template <EpCfg kCfg, typename T>
+__device__ __forceinline__ void EpFp4OvlTokenTile(const EpArgs& args, const EpFp4Item<kCfg>& r,
+                                                  const int t, unsigned char* const tile) {
+  using W = EpFp4Wire<kCfg>;
+  constexpr int WS = kCfg.waveSize;
+  constexpr int kRows = EpFp4Rows<kCfg>();
+  constexpr int kPass = kCfg.hiddenDim / (32 * WS);
+  const int laneId = threadIdx.x & (WS - 1);
+  const int nr = __builtin_amdgcn_readfirstlane(__popcll(r.mask));
+  unsigned char* const orow =
+      reinterpret_cast<unsigned char*>(args.outTokenBuf) + (size_t)t * W::kTokB;
+#pragma unroll
+  for (int j = 0; j < kRows; ++j) {
+    if (j >= nr) break;
+    const unsigned long long a = (unsigned long long)r.rp[j];
+    const unsigned long long u =
+        ((unsigned long long)(unsigned)__builtin_amdgcn_readfirstlane((int)(a >> 32)) << 32) |
+        (unsigned long long)(unsigned)__builtin_amdgcn_readfirstlane((int)a);
+    TdmIssueLoad<int>(reinterpret_cast<int*>(tile + (size_t)j * W::kWireB),
+                      reinterpret_cast<const int*>(u), TdmShape<int>((int)(W::kWireB / 4)));
+  }
+  __builtin_amdgcn_s_wait_tensorcnt(0);
+#pragma unroll 1
+  for (int p = 0; p < kPass; ++p) {
+    const int g = p * WS + laneId;
+    EpFp4Lane<kCfg> pk[kRows];
+    unsigned sb[kRows];
+#pragma unroll
+    for (int j = 0; j < kRows; ++j) {
+      if (j >= nr) break;
+      const unsigned char* const row = tile + (size_t)j * W::kWireB;
+      const uint4* const s = reinterpret_cast<const uint4*>(row + (size_t)g * W::kLaneB);
+#pragma unroll
+      for (int k = 0; k < W::kLaneB / 16; ++k) pk[j].v[k] = s[k];
+      const unsigned sw = *reinterpret_cast<const unsigned*>(row + W::kPayB + (g & -4));
+      sb[j] = (sw >> ((g & 3) * 8)) & 0xFFu;
+    }
+    float acc[32];
+#pragma unroll
+    for (int k = 0; k < 32; ++k) acc[k] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kRows; ++j) {
+      if (j >= nr) break;
+      EpFp4Accum<kCfg>(acc, pk[j], __uint_as_float(sb[j] << 23));
+    }
+    uint4* const o = reinterpret_cast<uint4*>(orow + (size_t)g * 64);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      unsigned wo[4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e)
+        wo[e] = MoriPackTo2<T>(acc[i * 8 + 2 * e], acc[i * 8 + 2 * e + 1]);
+      o[i] = make_uint4(wo[0], wo[1], wo[2], wo[3]);
+    }
+  }
+}
+
+template <EpCfg kCfg, typename T>
+__device__ __forceinline__ bool EpFp4OvlClaim(const EpArgs& args, const unsigned long long ep,
+                                              const int nw, unsigned* const pendB, const int from,
+                                              unsigned char* const tile) {
+  constexpr int kR = kCfg.warpPerBlock / 2;
+  constexpr int kMaxRecv = EpMaxRecv(kCfg);
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+  EpGU64* const flags = (EpGU64*)(reinterpret_cast<unsigned long long*>(
+      EpLocal<unsigned char>(args.window, args.offOutTok) + EpFp4FlagOff<kCfg>()));
+  const unsigned long long* const slots = EpLocal<unsigned long long>(args.window, args.offXdb);
+  for (int k = 0; k < kR; ++k) {
+    const int v = (from + k) % kR;
+    for (;;) {
+      const unsigned pend = __builtin_amdgcn_readfirstlane(
+          __hip_atomic_load(pendB + v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP));
+      if (!pend) break;
+      const int i = __ffs((int)pend) - 1;
+      unsigned old = 0;
+      if (laneId == 0)
+        old = __hip_atomic_fetch_and(pendB + v, ~(1u << i), __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_WORKGROUP);
+      if ((((unsigned)__shfl((int)old, 0) >> i) & 1u) == 0) continue;
+      const int t = (int)blockIdx.x * kR + v + i * nw;
+      const EpFp4Item<kCfg> r = EpFp4ReducePrep<kCfg, 1>(args, t);
+      const bool mine = ((r.mask >> laneId) & 1ull) != 0;
+      unsigned spin = 0;
+      for (;;) {
+        const unsigned long long done =
+            __ballot(laneId < kCfg.worldSize && __hip_atomic_load(slots + laneId, __ATOMIC_RELAXED,
+                                                                  __HIP_MEMORY_SCOPE_SYSTEM) >= ep);
+        const bool ok =
+            !mine || ((done >> (r.flat / kMaxRecv)) & 1ull) != 0 ||
+            __hip_atomic_load(flags + r.lrow, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == ep;
+        if (__all(ok)) break;
+        if (++spin > (1u << 22)) break;
+        __builtin_amdgcn_s_sleep(4);
+      }
+      if (tile)
+        EpFp4OvlTokenTile<kCfg, T>(args, r, t, tile);
+      else
+        EpFp4OvlToken<kCfg, T>(args, r, t);
+      return true;
+    }
+  }
+  return false;
+}
+
+template <EpCfg kCfg, typename T>
+__device__ __forceinline__ void EpFp4OvlPool(const EpArgs& args, const unsigned long long ep,
+                                             const int nw, const bool sender) {
+  extern __shared__ char sharedMem[];
+  constexpr int kR = kCfg.warpPerBlock / 2;
+  constexpr int kTileB = EpFp4Rows<kCfg>() * (int)EpFp4Wire<kCfg>::kWireB;
+  constexpr int kTiles = (int)(EpFp4PendOff<kCfg>() / kTileB);
+  unsigned* const pendB = reinterpret_cast<unsigned*>(sharedMem + EpFp4PendOff<kCfg>());
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+  const int wave = (int)(threadIdx.x / kCfg.waveSize);
+  if (sender) {
+    if (laneId == 0)
+      __hip_atomic_fetch_add(pendB + kR, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+  }
+  unsigned char* const tile =
+      wave < kTiles ? reinterpret_cast<unsigned char*>(sharedMem) + (size_t)wave * kTileB : nullptr;
+  for (;;) {
+    const bool sent = __builtin_amdgcn_readfirstlane(__hip_atomic_load(
+                          pendB + kR, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP)) ==
+                      (unsigned)(kCfg.warpPerBlock - kR);
+    if (!EpFp4OvlClaim<kCfg, T>(args, ep, nw, pendB, wave % kR, sent ? tile : nullptr)) break;
+  }
 }
 
 template <EpCfg kCfg, typename T>
@@ -5803,7 +6015,7 @@ __device__ void EpCombine1250xBody(EpArgs args) {
 
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (WS - 1);
-  const int warpId = thdId / WS;
+  const int warpId = EpFp4Ovl4<kCfg>() ? EpFp4Ovl4Role(thdId / WS) : thdId / WS;
   const int warpNum = kCfg.warpPerBlock;
   const int globalWarpId = blockIdx.x * warpNum + warpId;
   const int globalWarpNum = (int)gridDim.x * warpNum;
@@ -5836,18 +6048,34 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       split = args.numTokens * (kCfg.hiddenDim / (32 * WS)) <= nw * kEpCardSplitUnits;
       nU = split ? args.numTokens * (kCfg.hiddenDim / (32 * WS)) : args.numTokens;
     }
-    if (warpId >= kOvlW && laneId == 0) {
+    [[maybe_unused]] const bool pool = EpFp4Ovl4<kCfg>() && args.numTokens <= 32 * nw;
+    if constexpr (EpFp4Ovl4<kCfg>()) {
+      if (pool && warpId == 0 && laneId == 0) pend0[kOvlR] = 0;
+    }
+    if ((EpFp4Ovl4<kCfg>() ? (pool ? warpId < kOvlR : warpId >= kOvlW) : warpId >= kOvlW) &&
+        laneId == 0) {
       unsigned m = 0;
       for (int i = 0; i < 32; ++i)
         if (w0 + i * nw < (kCfg.cardCombine ? nU : args.numTokens)) m |= 1u << i;
       *pend0 = m;
     }
     EpFp4CombineSend<kCfg, T>(args);
-    if (warpId < kOvlW) {
-      EpFp4OvlArrive<kCfg>(args, phase, kOvlW);
-      EpFp4OvlHelp<kCfg, T>(args, phase, w0, nw, pend0, split);
+    if constexpr (EpFp4Ovl4<kCfg>()) {
+      if (warpId < kOvlW) EpFp4OvlArrive<kCfg>(args, phase, kOvlW);
+      if (pool) {
+        EpFp4OvlPool<kCfg, T>(args, phase, nw, warpId < kOvlW);
+      } else if (warpId < kOvlW) {
+        EpFp4OvlHelp<kCfg, T>(args, phase, w0, nw, pend0, split);
+      } else {
+        EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0, split);
+      }
     } else {
-      EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0, split);
+      if (warpId < kOvlW) {
+        EpFp4OvlArrive<kCfg>(args, phase, kOvlW);
+        EpFp4OvlHelp<kCfg, T>(args, phase, w0, nw, pend0, split);
+      } else {
+        EpFp4ReduceOvl<kCfg, T>(args, phase, w0, nw, pend0, split);
+      }
     }
     EpFp4OvlWait<kCfg>(args, phase);
     __builtin_amdgcn_s_wait_tensorcnt(0);
