@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +40,16 @@ namespace mori::umbp {
 std::unique_ptr<TransferPlanBuilder> MakeRdmaPlanBuilder(const std::string& local_key,
                                                          uint64_t bounce_size,
                                                          const TransferRef& bounce_ref);
+
+// AINIC firmware before 1.117.5-a-190 translates only the first 2^18 page
+// entries of a memory region, and a remote access past them silently lands
+// 2^18 pages lower.  Warns, naming `what`, this host's AINIC firmware and
+// `remedy`, when a region of `bytes` on `page_size` pages has more entries than
+// that and an AINIC here runs such firmware.  `page_size` is what actually
+// backs the region: a hugepage request that fell back to 4 KiB pages has 512
+// times the entries.  0 skips the check.
+void WarnIfNicRegionAliases(std::string_view what, uint64_t bytes, uint64_t page_size,
+                            std::string_view remedy);
 
 // The mori-io (RDMA) implementation of TransferEngine, and the only place in
 // UMBP that names mori::io::IOEngine.
