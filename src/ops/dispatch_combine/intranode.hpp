@@ -567,7 +567,42 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
                    warpId * config.numExpertPerToken;
   }
 
-  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
+  // Mirror of the if constexpr chain at the accumulate below: which helper ends up running is what
+  // decides whether a tile-aligned slice is worth asking for. Both vectorized helpers lose their
+  // vectorization when the natural slice hiddenDim / warpsPerItem is not a whole tile.
+  constexpr bool kReduceUsesAccumLF =
+      !UseFp8BlockwiseQuant &&
+      !(!std::is_same_v<T, TokT> && std::is_same_v<TokT, core::CombineInternalFp8>);
+  constexpr bool kReduceUsesFp4Vec8 = UseFp4Combine && (Vec8Top8BlockElems != 0);
+
+  // WarpAccumLF<T, 16> consumes WARP_ACCUM_UNROLL * warpSize * (16 / sizeof(T)) elements per
+  // vector iteration and pushes the remainder through a scalar per-element loop. The natural
+  // slice hiddenDim / warpsPerItem rarely lands on a whole tile: at hidden 5120 with warpsPerItem
+  // 6 it is 854, which against the WARP_ACCUM_UNROLL=2 bf16 tile of 1024 is under one tile, so
+  // numIters is 0 and the entire reduce runs scalar. Ask for whole tiles instead, sized from the
+  // accumulator's own formula rather than hardcoded so it follows WARP_ACCUM_UNROLL. 5120 is an
+  // exact multiple of either tile, so every warp gets fully vectorized work, and warpsPerItem
+  // dropping 6 -> 5 also brings 224 tokens/rank back inside a single 1280-warp grid pass.
+  //
+  // The packed-FP4 vec8 dequant has the same cliff with a different tile. It covers 8 elements per
+  // lane per step (one 4-byte packed load), so warpSize * 8 per warp step, and the segment helper
+  // is only reached when both the slice offset and its size are multiples of 8 -- 854 is neither,
+  // so the misaligned-segment scalar fallback would take every slice. Whole steps satisfy that by
+  // construction, and since the vec8 kernels are only selected when hiddenDim % 512 == 0, every
+  // slice including the last comes out a whole number of steps. The FP8 blockwise vec8 path is a
+  // separate helper carrying its own alignment rules, so it keeps the default granularity.
+  //
+  // Asked for unconditionally, and deliberately as a compile-time value. Coarsening the slice does
+  // cost grid occupancy at very small token counts -- 16 tokens/rank pays about 2us on the bf16
+  // path -- but gating it on a runtime token-count test is worse than the thing it avoids: a
+  // granularity the compiler cannot constant-fold keeps MultiWarpIter's `if (dimGranularity > 1)`
+  // branch and its extra 64-bit divide live, which cost 1.5us on EVERY shape -- including the ones
+  // the gate then declined to change.
+  const size_t reduceDimGran =
+      kReduceUsesAccumLF ? static_cast<size_t>(WARP_ACCUM_UNROLL) * warpSize * (16 / sizeof(T))
+                         : (kReduceUsesFp4Vec8 ? static_cast<size_t>(warpSize) * 8 : size_t{1});
+
+  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim, reduceDimGran);
 
   assert(config.numExpertPerToken < warpSize);
   for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {

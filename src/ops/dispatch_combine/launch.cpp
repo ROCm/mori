@@ -573,25 +573,29 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
           throw std::runtime_error(
               "Blockwise combine quant requires internal combine scaleDim > 0");
         }
-        // Pick the AccumNum=8/9 + VecBytes=8 specialization when (no weights, hidden_dim % 512 ==
-        // 0, top-k in {8,9}, EP > 4) and block_elems matches a registered symbol. top-k==9 covers
-        // shared-expert fusion (8 routed + 1 fused shared). The FP4 variants share the exact launch
-        // config as FP8; only the in-kernel codec differs. Keep in sync with the Python launch path
-        // in dispatch_combine.py -- except on transport, where they already differ: that path picks
-        // PULL on gfx125x while every name built here is _nop2p, i.e. PUSH.
+        // Pick the AccumNum + VecBytes=8 specialization when (no weights, hidden_dim % 512 == 0,
+        // top-k has a registered AccumNum, EP > 4) and block_elems matches a registered symbol.
+        // The FP4 variants share the exact launch config as FP8; only the in-kernel codec differs.
+        // Keep in sync with the Python launch path in dispatch_combine.py -- except on transport,
+        // where they already differ: that path picks PULL on gfx125x while every name built here
+        // is _nop2p, i.e. PUSH.
         const int block_elems = (args.config.hiddenDim + fp8ScaleDim - 1) / fp8ScaleDim;
-        const bool baseVec8Top8Eligible =
-            !hasWeights && (args.config.hiddenDim % 512 == 0) &&
-            (args.config.numExpertPerToken == 8 || args.config.numExpertPerToken == 9) &&
-            args.config.worldSize > 4;
-        const bool top9 = (args.config.numExpertPerToken == 9);
+        // Registered AccumNum variants, per codec: top-8 is the unsuffixed name and the others
+        // carry their count. top-9 covers shared-expert fusion (8 routed + 1 fused shared); FP4
+        // also carries top-6 for models routing 6 experts, which would otherwise fall off the
+        // vectorized dequant.
+        const int topk = args.config.numExpertPerToken;
+        const bool accumRegistered = (topk == 8) || (topk == 9) || (isFp4 && topk == 6);
+        const bool baseVec8Top8Eligible = !hasWeights && (args.config.hiddenDim % 512 == 0) &&
+                                          accumRegistered && args.config.worldSize > 4;
+        const std::string topkSuffix = (topk == 8) ? "" : ("_top" + std::to_string(topk));
         const std::string codec = isFp4 ? "fp4_blockwise" : "fp8_blockwise";
         const std::string prefix = "EpCombineIntraNodeKernel_bf16_nop2p_";
         std::string kernel_name = prefix + codec;
         bool useVec8Top8 = false;
         if (baseVec8Top8Eligible && (block_elems == 128 || block_elems == 256)) {
           kernel_name = prefix + codec + "_noweight_block" + std::to_string(block_elems) + "_vec8" +
-                        (top9 ? "_top9" : "");
+                        topkSuffix;
           useVec8Top8 = true;
         }
         int fp8_blockwise_smem = combine_shared_mem(wpb, handle.config.numExpertPerToken,
