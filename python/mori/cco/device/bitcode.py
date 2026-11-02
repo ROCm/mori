@@ -136,7 +136,11 @@ def _jit_compile(cov: int) -> str | None:
                 _hipcc_device_bc(
                     cfg, wrapper, include_dirs, raw, cov=cov, extra_defines=sdma_define
                 )
-                _strip_lifetime_intrinsics(cfg, raw, bc_path)
+                # Waiters take bc_path as soon as it exists, and opt creates its
+                # output before writing it: build aside, then rename into place.
+                tmp_bc = cache_dir / f".{_BC_FILENAME}.{os.getpid()}.tmp"
+                _strip_lifetime_intrinsics(cfg, raw, tmp_bc)
+                os.replace(tmp_bc, bc_path)
         return str(bc_path)
     except Exception:
         return None

@@ -277,3 +277,37 @@ def test_flydsl_and_triton_share_the_same_scalar_abi():
         extern = by_symbol[meta["symbol"]]
         assert extern._args == meta["args"]
         assert extern._ret == meta["ret"]
+
+
+def test_cco_bitcode_cache_key_follows_ccqe(monkeypatch, tmp_path):
+    """-DIONIC_CCQE changes the bitcode, so each mode gets its own cache dir."""
+    from types import SimpleNamespace
+
+    import mori.jit.cache as jit_cache
+    import mori.jit.config as jit_config
+    import mori.jit.core as jit_core
+    from mori.cco.device import bitcode
+
+    repo = Path(__file__).resolve().parents[3]
+    monkeypatch.setattr(jit_config, "get_mori_source_root", lambda: repo)
+    monkeypatch.setattr(
+        jit_config, "detect_build_config", lambda: SimpleNamespace(arch="gfx950")
+    )
+    monkeypatch.setattr(jit_config, "detect_nic_type", lambda: "ionic")
+    monkeypatch.setattr(bitcode, "_sdma_enabled", lambda: False)
+    keys = []
+
+    def fake_cache_dir(arch, paths, nic, profiler=False, *, cov=None, ccqe=False):
+        keys.append(ccqe)
+        cache_dir = tmp_path / f"{arch}_{nic}_cov{cov}_ccqe{int(ccqe)}"
+        cache_dir.mkdir(exist_ok=True)
+        (cache_dir / bitcode._BC_FILENAME).write_bytes(b"")  # cached: nothing compiles
+        return cache_dir
+
+    monkeypatch.setattr(jit_cache, "get_cache_dir", fake_cache_dir)
+    paths = []
+    for ccqe in (True, False):
+        monkeypatch.setattr(jit_core, "is_ccqe_enabled", lambda on=ccqe: on)
+        paths.append(bitcode._jit_compile(6))
+    assert keys == [True, False]
+    assert None not in paths and paths[0] != paths[1]
