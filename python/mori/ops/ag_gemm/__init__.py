@@ -30,11 +30,21 @@ import importlib
 from .layout import MAX_CHUNKS, MAX_WORLD, AgGemmConfig
 
 _LAZY = {
+    "AgGemmOp": "op",
+    "supports": "op",
     "compile_ag_gemm": "kernels",
     "build_phases": "kernels",
 }
 
-__all__ = ["AgGemmConfig", "MAX_CHUNKS", "MAX_WORLD", "build_phases", "compile_ag_gemm"]
+__all__ = [
+    "AgGemmConfig",
+    "AgGemmOp",
+    "MAX_CHUNKS",
+    "MAX_WORLD",
+    "build_phases",
+    "compile_ag_gemm",
+    "supports",
+]
 
 
 def __getattr__(name: str):

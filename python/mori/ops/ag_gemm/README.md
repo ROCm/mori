@@ -12,6 +12,51 @@ as the band of rows it needs has landed. It is the AMD counterpart of
 vllm-project/vllm#54151 (Kimi-K3 AG-GEMM), which overlaps the same thing with a
 ring of `cuMemcpyDtoDAsync` and one GEMM launch per shard.
 
+## Using it
+
+`AgGemmOp` is the public entry point (`op.py`). Needs `MORI_ENABLE_SDMA=1` and
+a mori built with `BUILD_CCO_SDMA=ON` (the default); the constructor refuses a
+communicator without SDMA queues, and `self_test()` checks that the puts move
+bytes.
+
+```python
+from mori.cco import Communicator
+from mori.ops.ag_gemm import AgGemmOp
+from mori.ops.gemm_ar import preshuffle_b
+
+N, K, M_MAX = 6400, 7168, 4096        # per rank: weight shard rows, hidden, tokens
+vmm = 2 * AgGemmOp.window_bytes_for(world, k=K, m_max=M_MAX) + (256 << 20)
+with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
+    with AgGemmOp(comm, n=N, k=K, m_max=M_MAX) as op:
+        op.self_test()                                  # collective
+        b_shuffled = preshuffle_b(b_fp8)                 # [N, K], once per weight
+
+        m = op.padded_m(x.shape[0])                      # same m on every rank
+        a_fp8, a_scale = quantize_per_token(op.pad_rows(x, m))
+        c = op(a_fp8, b_shuffled, a_scale, b_scale)      # [world*m, N] bf16
+        # rows [s*m, s*m + valid_s) are source s's tokens; padding rows are zero
+```
+
+- **Operands.** `a_fp8` is this rank's `[M, K]` fp8 e4m3fn tokens and
+  `a_scale` their `[M]` fp32 per-token scale; `b_shuffled` this rank's `[N, K]`
+  weight shard through `preshuffle_b` and `b_scale` its `[N]` fp32 per-channel
+  scale. Anything the launch would reinterpret as bytes -- a wrong dtype, shape
+  or M -- raises `ValueError`.
+- **M** must be the same on every rank and a multiple of 256: pad with
+  `padded_m()` / `pad_rows()` before quantising. One instance serves any such M
+  up to `m_max`, in any order, and compiles each M once.
+- **Zero copy.** `op.local_rows(m)` returns this rank's slot in the window,
+  `([m, K] fp8, [m] fp32)`. Quantise into it and pass those tensors, and the
+  call skips copying them in.
+- **The result** is the op's own buffer, overwritten by the next call; pass
+  `out=` (a contiguous `[world*M, N]` bf16 tensor) or clone to keep it.
+- **Collective contract.** Every rank constructs the op and calls it the same
+  number of times, with the same M, in the same order: each call ends in a
+  cross-rank barrier.
+- `mode="split"` runs push, barrier, the same GEMM: the baseline, and a
+  fallback. `chunks=` caps the row bands per peer (default 4, rounded down to
+  a divisor of the row tiles).
+
 ## How it works
 
 The window holds the gathered operand, `recv [world][m_local][K]` fp8 plus its
@@ -107,7 +152,7 @@ MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=
   benchmark/cco/flydsl/ag_gemm/bench_ag_gemm.py --mode fused-sdma --chunks 4 \
   -m 4096 -N 6400 -k 7168 --back-to-back 8
 
-MORI_ENABLE_SDMA=1 pytest -q tests/python/cco/test_ag_gemm.py
+MORI_ENABLE_SDMA=1 pytest -q tests/python/cco/test_ag_gemm.py tests/python/cco/test_ag_gemm_op.py
 ```
 
 `--back-to-back R` adds R calls with no host sync between them, each with its
@@ -116,5 +161,5 @@ every one. That is the test that fails when the closing barrier is removed.
 
 ## Not done yet
 
-blockscale / mxfp8 (the A-scale push), N that is not a multiple of 256, a public
-op wrapper with `self_test`, c8 and beyond, and a model integration.
+blockscale / mxfp8 (the A-scale push), N that is not a multiple of 256, c8 and
+beyond, and a model integration.
