@@ -54,7 +54,7 @@ dispatch at T ≤ 64. The dispatch also drains the completions its own bucket's
 combine left on QPs it did not send on, so a dispatch count below the combine's
 can be slower than either count alone: the two are chosen as a pair.
 MI308X inter-node rules set the count per bucket and phase (1, 2 or 4), except
-the FP4 dispatch and FP8 combine rows. Every MI300X inter-node rule sets one
+the FP8 combine rows. Every MI300X inter-node rule sets one
 (1, 2, 4 or 8); MI355X rules set none.
 
 `InterNodeV2` combine rules may set `combine_load_first` to 1 (empty means 0).
@@ -69,10 +69,9 @@ other tables may not set it. Current settings:
   256/8 bf16 H7168 at T4–512, T2048 and T4096; 256/8 bf16 H6144 at T4–128 and
   T2048; 256/6 bf16 H7168 at T64–128; 384/6 bf16 H7168 at T64–256; 384/6
   bf16 H5120, re-tuned with its geometry, at T4–256, T2048 and T4096.
-  272/9 had no previous table; its whole-table A/B was against the defaults
-  and the 256/8 rules, and it is on for bf16 H7168 at T8, T256, T512 and T2048.
-  896/16 likewise, A/B against the defaults: on for bf16 H3584 at T16, T32 and
-  T4096.
+  272/9 and 896/16, re-tuned on the kernel with the topk-9/16 combine gather
+  fixed: on for 272/9 bf16 H7168 at T4–256, T1024 and T2048, and for 896/16
+  bf16 H3584 at T16, T32, T256 and T512.
   Off elsewhere.
 - MI300X: on for T64–128 in 256/8 bf16 H7168 and H6144 and 384/6 bf16 H7168.
   Off elsewhere.
@@ -109,8 +108,7 @@ Each GPU model has IntraNodeV2 (EP8), InterNodeV2 (EP16) and InterNodeV2LL
 (EP16) tables, and every shape in a table has both phases. Not every shape is
 in every table, and not every dtype appears in every shape; see the files.
 Token ceilings are 64–4096, plus 4–32 for MI308X inter-node 256/8, 272/9,
-896/16 and 384/6 at hidden 5120 (InterNodeV2LL 384/6: 4–16, so T32 uses the
-T64 rule).
+896/16 and 384/6 at hidden 5120.
 
 The model behind each shape:
 
@@ -152,14 +150,17 @@ Metrics are only comparable between rows measured under the same conditions.
 - **QP count.** Inter-node latency depends heavily on the active count
   (`active_qps`, above) and on the allocation (`num_qp_per_pe`) on MI308X:
   QP64 adds about 270 µs per phase at T ≤ 512. MI308X inter-node rows were
-  measured with an allocation of 8 and each rule's own count, except FP4
-  dispatch and FP8 combine rows, which keep earlier two-QP measurements.
+  measured with an allocation of 8 and each rule's own count, except FP8
+  combine rows, which keep earlier two-QP measurements.
 - **Protocol.** Uniform routing, `scale_dim=0`, capacity equal to the token
   count, `quant_type="none"`. The 264/9 and 272/9 rows use replica routing
   (`--routing replica`): eight distinct routed experts drawn uniformly, plus
-  the token's own rank's replica. Timing uses 3 passes × (20 warmup + 30 timed
-  rounds), dropping the first timed round of each pass. A measurement is
-  accepted only after correctness checks, and only if each phase has
+  the token's own rank's replica. FP8 and FP4 dispatch rows are measured with
+  the bucket's BF16 combine rule. For FP4 the combine reduces the decoded
+  payload, decoded between the two timed phases where FP8 is cast to BF16.
+  Timing uses 3 passes × (20 warmup + 30 timed rounds), dropping the first
+  timed round of each pass. A measurement is accepted only after correctness
+  checks, and only if each phase has
   mean/median ≤ 1.10 and max/median ≤ 5, and the per-pass D+C means vary by
   ≤ 1.20×.
 - **MI300X EP8 256/6, 264/9 and 384/6 at H5120.** Tuned with the harness
@@ -170,6 +171,10 @@ Metrics are only comparable between rows measured under the same conditions.
   MI300X. A winner was kept only if it won the majority of its rechecks; the three
   that did not were put back to the default and re-measured. Their metrics are not
   comparable with rows measured under the protocol above.
+- **Kernel.** The MI308X 264/9, 272/9 InterNodeV2, 896/16 and FP4 dispatch
+  rows were re-tuned and measured on the kernel with the topk-9/16 combine
+  gather and the 3584 B copy tail fixed (`device_primitives.hpp`). The 272/9
+  InterNodeV2LL rows predate the fix, which moves them by under 0.5%.
 - **Metrics.** `avg_latency_us` is the mean over all retained samples.
   Bandwidths are grand means of per-rank, per-round `bytes / time`, not
   `bytes / mean latency`. `bandwidth_gbps` is XGMI for intra-node rows, RDMA for
@@ -188,9 +193,9 @@ it.
   `active_qps` changes the drain of every bucket in the op, so accept a new
   count only from a whole-table A/B, not from the single-bucket sweep.
 - Never copy rows from another GPU model or another shape. A missing row is
-  safer than a borrowed one: on MI308X the 256/8 rules, copied whole to 264/9
-  and 272/9, are up to a third slower than the defaults in some buckets
-  (InterNodeV2 T64 and T512, IntraNodeV2 T4096).
+  safer than a borrowed one: on MI308X, before the topk-9 combine fix, the
+  256/8 rules copied whole to 264/9 and 272/9 were up to a third slower than
+  the defaults in some buckets (InterNodeV2 T64 and T512, IntraNodeV2 T4096).
 - Store the geometry that actually ran: keep `block_num` within the CU count.
 - `--cmd tuning` measures candidates with load-first off and rewrites the whole
   rule, so re-saving a combine rule clears `combine_load_first`. Re-measure with
