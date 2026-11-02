@@ -95,14 +95,14 @@ def _worker_imports():
     )
 
 
-def _init_comm(rank, world_size, uid_path):
+def _init_comm(rank, world_size, uid_path, per_rank_vmm=128 * 1024 * 1024):
     """Common setup: set device, load shared UniqueId, create Communicator."""
     from mori.cco import Communicator, UniqueId
 
     torch.cuda.set_device(rank)
     with open(uid_path, "rb") as f:
         uid = UniqueId.from_bytes(f.read())
-    comm = Communicator.init(world_size, rank, uid, per_rank_vmm=128 * 1024 * 1024)
+    comm = Communicator.init(world_size, rank, uid, per_rank_vmm=per_rank_vmm)
     return comm
 
 
@@ -805,6 +805,876 @@ def _worker_put2d(rank, world_size, uid_path, coop_name, results_path):
         f.write(err or "")
 
 
+def _worker_post_wait_mem(rank, world_size, uid_path, coop_name, results_path):
+    """post_wait_mem parks a queue on a local flag: the put posted behind it must
+    not move until the host raises the flag, and must all arrive afterwards.
+
+    The kernel returns right after posting, so nothing but the copy engine is
+    waiting. ``coop_name`` is the scope of the wait; the put is one thread's."""
+    err = None
+    try:
+        import time
+
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        coop = getattr(cco.CoopScope, coop_name)
+        comm = _init_comm(rank, world_size, uid_path)
+        # Window layout: [ send | recv (world_size slots) | flag ]
+        send_off = 0
+        recv_off = NBYTES
+        flag_off = recv_off + world_size * NBYTES
+        win_bytes = flag_off + 4096
+        qid = 1  # a waiting queue gets its own queue
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+        gate_single = coop == cco.CoopScope.THREAD
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def post_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            # THREAD posts from one lane; WARP needs the whole wave to enter.
+            active = fx.thread_idx.x == 0 if gate_single else fx.thread_idx.x < 64
+            if active:
+                sdma.post_wait_mem(nxt, qid, w, flag_off, 1, coop=coop)
+            if fx.thread_idx.x == 0:
+                sdma.put(
+                    nxt,
+                    w,
+                    recv_off + me * NBYTES,
+                    w,
+                    send_off,
+                    NBYTES,
+                    qid,
+                    signal=False,
+                )
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def quiet_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                sdma.quiet(nxt)
+
+        @flyc.jit
+        def post(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            post_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        @flyc.jit
+        def drain(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            quiet_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        post(dc.ptr, win.handle)
+        sync()  # the kernel is done; only the engine is parked now
+        comm.barrier()
+
+        time.sleep(0.5)
+        got = read(win.local_ptr + recv_off + prv * NBYTES, NUM_ELEMS, u32)
+        if any(got[i] != 0 for i in range(NUM_ELEMS)):
+            raise AssertionError(
+                f"rank {me}: data from rank {prv} arrived before its flag was raised"
+            )
+        comm.barrier()
+
+        fill(win.local_ptr + flag_off, [1], u32)  # release our own queue
+        drain(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        got = read(win.local_ptr + recv_off + prv * NBYTES, NUM_ELEMS, u32)
+        for i in range(NUM_ELEMS):
+            if got[i] != prv * 1000 + i:
+                raise AssertionError(
+                    f"rank {me} recv[{prv}][{i}]={got[i]} expected {prv * 1000 + i}"
+                )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+def _worker_post_wait_signal(rank, world_size, uid_path, coop_name, results_path):
+    """Engine-side relay: each rank forwards what it received from prev on to
+    next once prev's signal lands, with no CU in the forwarding path.
+
+    Queue 1 carries the hop (remote_signal bumps next's slot[me, 1]); queue 2
+    waits on our slot[prev, 1] with post_wait_signal, then forwards the hop's data."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        # Window layout: [ send | recv (world_size slots) | fwd (world_size slots) ]
+        send_off = 0
+        recv_off = NBYTES
+        fwd_off = recv_off + world_size * NBYTES
+        win_bytes = fwd_off + world_size * NBYTES
+        hop_q, relay_q = 1, 2
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def relay_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                # Park the relay queue until prev's hop has landed here...
+                sdma.post_wait_signal(nxt, relay_q, prv, hop_q, 1)
+                # ...then forward it.
+                sdma.put(
+                    nxt,
+                    w,
+                    fwd_off + me * NBYTES,
+                    w,
+                    recv_off + prv * NBYTES,
+                    NBYTES,
+                    relay_q,
+                    signal=False,
+                )
+                # The hop: our data to next, signalling its slot[me, hop_q].
+                sdma.put(
+                    nxt,
+                    w,
+                    recv_off + me * NBYTES,
+                    w,
+                    send_off,
+                    NBYTES,
+                    hop_q,
+                    local_signal=False,
+                    remote_signal=True,
+                )
+                sdma.quiet(nxt)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            relay_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        # fwd slot [prv] holds what prv received from prv's own prev.
+        origin = (prv - 1) % world_size
+        for what, off, src in (
+            ("hop", recv_off + prv * NBYTES, prv),
+            ("relay", fwd_off + prv * NBYTES, origin),
+        ):
+            got = read(win.local_ptr + off, NUM_ELEMS, u32)
+            for i in range(NUM_ELEMS):
+                if got[i] != src * 1000 + i:
+                    raise AssertionError(
+                        f"rank {me} {what}[{i}]={got[i]} expected {src * 1000 + i}"
+                    )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+def _worker_put_broadcast(rank, world_size, uid_path, coop_name, results_path):
+    """put_broadcast: one source lands in next's slot and in our own local copy
+    from a single packet; both signals arrive."""
+    err = None
+    try:
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        coop = getattr(cco.CoopScope, coop_name)
+        comm = _init_comm(rank, world_size, uid_path)
+        # Window layout: [ send | recv (world_size slots) | local copy ]
+        send_off = 0
+        recv_off = NBYTES
+        local_off = recv_off + world_size * NBYTES
+        win_bytes = local_off + NBYTES
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr + send_off, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+        gate_single = coop == cco.CoopScope.THREAD
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def bcast_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            active = fx.thread_idx.x == 0 if gate_single else fx.thread_idx.x < 64
+            if active:
+                sdma.put_broadcast(
+                    nxt,
+                    w,
+                    recv_off + me * NBYTES,
+                    me,
+                    w,
+                    local_off,
+                    w,
+                    send_off,
+                    NBYTES,
+                    0,
+                    coop=coop,
+                    local_signal=True,
+                    remote_signal=True,
+                )
+                # Ours (local signal) and prv's (its remote signal to us).
+                sdma.wait_signal(me, 0, 1)
+                sdma.wait_signal(prv, 0, 1)
+                sdma.quiet(nxt, coop=coop)
+
+        @flyc.jit
+        def run(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            bcast_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        run(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+
+        for what, off, src in (
+            ("remote", recv_off + prv * NBYTES, prv),
+            ("local", local_off, me),
+        ):
+            got = read(win.local_ptr + off, NUM_ELEMS, u32)
+            for i in range(NUM_ELEMS):
+                if got[i] != src * 1000 + i:
+                    raise AssertionError(
+                        f"rank {me} {what}[{i}]={got[i]} expected {src * 1000 + i}"
+                    )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+def _signal_snapshot_kernel(flyc, fx, Int64, cco, slots, snap_off, me):
+    """A kernel that copies the low 32 bits of each ``(src_rank, qid)`` signal
+    slot into ``win[snap_off + 4 * i]``, so the host can check exact counts."""
+    from mori.cco.device.flydsl.signals import (
+        local_store_u32,
+        signal_load_u32,
+        signal_ptr,
+    )
+
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    def snapshot_kernel(dev_comm: Int64, w: Int64):
+        sdma = cco.DevComm(dev_comm).sdma()
+        window = cco.Window(w)
+        if fx.thread_idx.x == 0:
+            for i, (src, qid) in enumerate(slots):
+                v = signal_load_u32(signal_ptr(fx.Int64(sdma.signal_slot(src, qid))))
+                local_store_u32(
+                    signal_ptr(fx.Int64(window.lsa_ptr(me, snap_off + 4 * i))), v
+                )
+
+    @flyc.jit
+    def snapshot(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+        snapshot_kernel(dev_comm, w).launch(
+            grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+        )
+
+    return snapshot
+
+
+def _worker_post_wait_mem_put(rank, world_size, uid_path, variant, results_path):
+    """post_wait_mem_put_ptr holds each copy and its signals until its flag is
+    raised, then delivers each exactly once; the posting kernel exits at once.
+
+    One lane: ``plain`` rings, ``aggregate`` leaves the doorbell to ``commit``,
+    ``zero_bytes`` posts wait + signals only. Four lanes: ``distinct`` (lane l
+    on queue l behind flag l, released one at a time) and ``shared`` (one queue
+    and one flag: the serialized path); ``aggregate_distinct`` and
+    ``aggregate_shared`` are the same with the doorbell left to ``commit``."""
+    err = None
+    try:
+        import time
+
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+
+        lanes = 1 if variant in ("plain", "aggregate", "zero_bytes") else 4
+        distinct = variant.endswith("distinct")
+        aggregate = variant.startswith("aggregate")
+        nbytes = 0 if variant == "zero_bytes" else NBYTES
+        # distinct posts <remote only>, the other variants <local + remote>.
+        local = not distinct
+        # distinct: lane l -> queue l, flag l. Otherwise every lane -> queue 1, flag 0.
+        q_stride, q_base = (1, 0) if distinct else (0, 1)
+        queues = list(range(lanes)) if distinct else [1]
+
+        comm = _init_comm(rank, world_size, uid_path)
+        # Window layout: [ send (lanes) | recv (world_size x lanes) | flags | snapshot ]
+        send_off = 0
+        recv_off = lanes * NBYTES
+        flag_off = recv_off + world_size * lanes * NBYTES
+        snap_off = flag_off + 256
+        win_bytes = snap_off + 256
+
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+
+        def value(src, lane, i):
+            return src * 10000 + lane * 1000 + i
+
+        for lane in range(lanes):
+            fill(
+                win.local_ptr + send_off + lane * NBYTES,
+                [value(rank, lane, i) for i in range(NUM_ELEMS)],
+                u32,
+            )
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 8
+        dc = comm.create_dev_comm(reqs)
+
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def post_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            window = cco.Window(w)
+            tid = fx.thread_idx.x
+            lane_bytes = fx.Int64(tid) * fx.Int64(NBYTES)
+            dst = fx.Int64(window.lsa_ptr(nxt, recv_off + me * lanes * NBYTES))
+            src = fx.Int64(window.lsa_ptr(me, send_off))
+            q = fx.Int32(tid) * fx.Int32(q_stride) + fx.Int32(q_base)
+            flag = fx.Int64(flag_off) + fx.Int64(tid) * fx.Int64(4 * q_stride)
+            if tid < lanes:
+                sdma.post_wait_mem_put_ptr(
+                    nxt,
+                    q,
+                    w,
+                    flag,
+                    1,
+                    dst + lane_bytes,
+                    src + lane_bytes,
+                    nbytes,
+                    local_signal=local,
+                    remote_signal=True,
+                    aggregate=aggregate,
+                )
+                if aggregate:
+                    if distinct:
+                        sdma.commit(nxt, q)  # each lane rings its own queue
+                    elif tid == 0:
+                        sdma.commit(nxt, q_base)  # one ring for the shared queue
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def quiet_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            if fx.thread_idx.x == 0:
+                sdma.quiet(nxt)
+
+        @flyc.jit
+        def post(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            post_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        @flyc.jit
+        def drain(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            quiet_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        # Local signals of our puts (if posted), then remote signals of prv's puts.
+        slots = [(me, q) for q in queues] if local else []
+        slots += [(prv, q) for q in queues]
+        snapshot = _signal_snapshot_kernel(flyc, fx, Int64, cco, slots, snap_off, me)
+
+        def check(landed):
+            got = read(
+                win.local_ptr + recv_off + prv * lanes * NBYTES,
+                lanes * NUM_ELEMS,
+                u32,
+            )
+            for lane in range(lanes):
+                for i in range(NUM_ELEMS):
+                    exp = value(prv, lane, i) if lane in landed and nbytes else 0
+                    if got[lane * NUM_ELEMS + i] != exp:
+                        raise AssertionError(
+                            f"rank {me} lane {lane} recv[{i}]="
+                            f"{got[lane * NUM_ELEMS + i]} expected {exp} "
+                            f"(landed lanes {sorted(landed)})"
+                        )
+            snapshot(dc.ptr, win.handle)
+            sync()
+            counts = list(read(win.local_ptr + snap_off, len(slots), u32))
+            if distinct:
+                want = [1 if q in landed else 0 for q in queues]
+            else:
+                want = [len(landed)] * 2
+            if counts != want:
+                raise AssertionError(
+                    f"rank {me}: signals per queue {counts}, "
+                    f"expected {want} (landed lanes {sorted(landed)})"
+                )
+
+        comm.barrier()
+        post(dc.ptr, win.handle)
+        sync()  # the kernel is done; only the engine is parked now
+        comm.barrier()
+        time.sleep(0.5)
+        check(set())
+        comm.barrier()
+
+        if distinct:
+            # Release lane 2 alone: only its copy may move.
+            fill(win.local_ptr + flag_off + 4 * 2, [1], u32)
+            time.sleep(0.5)
+            comm.barrier()
+            check({2})
+            comm.barrier()
+        fill(win.local_ptr + flag_off, [1] * lanes, u32)
+        drain(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+        check(set(range(lanes)))
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+# (cmp, mask, value, flag that must hold the copy, flag that must release it).
+# The holding flag passes the compare if the mask is ignored, so a mask that is
+# not applied releases the copy early.
+_CMP_CASES = {
+    "ge_mask": ("GE", 0x00FF0000, 0x00030000, 0xFF02FFFF, 0x00050000),
+    "ne_mask": ("NE", 0x0000FFFF, 0x1234, 0xABCD1234, 0xABCD1235),
+}
+
+
+def _worker_post_wait_mem_put_cmp(rank, world_size, uid_path, variant, results_path):
+    """A non-EQ compare under a partial mask: the copy is held while
+    ``(flag & mask) <cmp> value`` is false, although the unmasked flag would
+    pass, and runs once it holds."""
+    err = None
+    try:
+        import time
+
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+        cmp_name, mask, value, hold, release = _CMP_CASES[variant]
+        cmp = getattr(cco.SdmaCmp, cmp_name)
+        QID = 1
+
+        comm = _init_comm(rank, world_size, uid_path)
+        # Window layout: [ send | recv | flag | snapshot ]
+        send_off, recv_off = 0, NBYTES
+        flag_off = 2 * NBYTES
+        snap_off = flag_off + 256
+        win_bytes = snap_off + 256
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+        fill(win.local_ptr + flag_off, [hold], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 2
+        dc = comm.create_dev_comm(reqs)
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def post_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            window = cco.Window(w)
+            dst = fx.Int64(window.lsa_ptr(nxt, recv_off))
+            src = fx.Int64(window.lsa_ptr(me, send_off))
+            if fx.thread_idx.x == 0:
+                sdma.post_wait_mem_put_ptr(
+                    nxt,
+                    QID,
+                    w,
+                    flag_off,
+                    value,
+                    dst,
+                    src,
+                    NBYTES,
+                    cmp=cmp,
+                    mask=mask,
+                    local_signal=True,
+                    remote_signal=True,
+                )
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def quiet_kernel(dev_comm: Int64, w: Int64):
+            if fx.thread_idx.x == 0:
+                cco.DevComm(dev_comm).sdma().quiet(nxt)
+
+        @flyc.jit
+        def post(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            post_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        @flyc.jit
+        def drain(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            quiet_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        slots = [(me, QID), (prv, QID)]
+        snapshot = _signal_snapshot_kernel(flyc, fx, Int64, cco, slots, snap_off, me)
+
+        def check(landed):
+            got = list(read(win.local_ptr + recv_off, NUM_ELEMS, u32))
+            exp = [prv * 1000 + i if landed else 0 for i in range(NUM_ELEMS)]
+            snapshot(dc.ptr, win.handle)
+            sync()
+            counts = list(read(win.local_ptr + snap_off, 2, u32))
+            want = [int(landed)] * 2
+            if got != exp or counts != want:
+                raise AssertionError(
+                    f"rank {me} {variant} flag {'released' if landed else 'held'}:"
+                    f" recv[:4]={got[:4]} expected {exp[:4]}, signals {counts}"
+                    f" expected {want}"
+                )
+
+        comm.barrier()
+        post(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+        time.sleep(0.5)
+        try:
+            check(False)
+        finally:
+            comm.barrier()
+            fill(win.local_ptr + flag_off, [release], u32)
+            drain(dc.ptr, win.handle)
+            sync()
+            comm.barrier()
+        check(True)
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+def _worker_post_wait_mem_put_nothing(
+    rank, world_size, uid_path, variant, results_path
+):
+    """``nbytes == 0`` with no signal posts nothing: a put posted behind it on
+    the same queue lands although the flag is never raised."""
+    err = None
+    try:
+        import time
+
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, zero, read = mods["sync"], mods["fill"], mods["zero"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+        QID = 1
+
+        comm = _init_comm(rank, world_size, uid_path)
+        send_off, recv_off, flag_off = 0, NBYTES, 2 * NBYTES
+        win_bytes = flag_off + 256
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        zero(win.local_ptr, win_bytes)
+        fill(win.local_ptr, [rank * 1000 + i for i in range(NUM_ELEMS)], u32)
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 2
+        dc = comm.create_dev_comm(reqs)
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def post_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            window = cco.Window(w)
+            dst = fx.Int64(window.lsa_ptr(nxt, recv_off))
+            src = fx.Int64(window.lsa_ptr(me, send_off))
+            if fx.thread_idx.x == 0:
+                # Flag stays 0, so a posted wait would park the queue for good.
+                sdma.post_wait_mem_put_ptr(nxt, QID, w, flag_off, 1, dst, src, 0)
+                sdma.put_ptr(nxt, dst, src, NBYTES, QID)
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def quiet_kernel(dev_comm: Int64, w: Int64):
+            if fx.thread_idx.x == 0:
+                cco.DevComm(dev_comm).sdma().quiet(nxt)
+
+        @flyc.jit
+        def post(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            post_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        @flyc.jit
+        def drain(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            quiet_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        comm.barrier()
+        post(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+        time.sleep(0.5)
+        got = list(read(win.local_ptr + recv_off, NUM_ELEMS, u32))
+        comm.barrier()
+        # Unpark a queue the old behaviour would have left waiting, then drain.
+        fill(win.local_ptr + flag_off, [1], u32)
+        drain(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+        exp = [prv * 1000 + i for i in range(NUM_ELEMS)]
+        if got != exp:
+            raise AssertionError(
+                f"rank {me}: put behind an empty wait+put did not land with the flag"
+                f" low: recv[:4]={got[:4]} expected {exp[:4]}"
+            )
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
+# CCO_SDMA_MAX_COPY_BYTES (cco.hpp): one COPY_LINEAR packet's limit.
+_SDMA_MAX_COPY_BYTES = 0x3FFFFFE0
+_OVERSIZE_BYTES = _SDMA_MAX_COPY_BYTES + 4096  # two chunks per lane
+
+
+def _worker_post_wait_mem_put_oversize(
+    rank, world_size, uid_path, variant, results_path
+):
+    """Copies over CCO_SDMA_MAX_COPY_BYTES take the composed fallback (wait +
+    chunked put + commit), one lane at a time. Two lanes on ONE queue behind two
+    flags: raising the first-posted lane's flag moves its whole copy (both
+    chunks) and its signals, and nothing of the other lane's."""
+    err = None
+    try:
+        import time
+
+        from mori.tensor_utils import from_gpu_ptr
+
+        mods = _worker_imports()
+        flyc, fx, Int64, cco = mods["flyc"], mods["fx"], mods["Int64"], mods["cco"]
+        sync, fill, read = mods["sync"], mods["fill"], mods["read"]
+        u32 = mods["ctypes"].c_uint32
+        CCODevCommRequirements = mods["CCODevCommRequirements"]
+        GDA_CONNECTION_NONE = mods["GDA_CONNECTION_NONE"]
+        LANES, QID, NB = 2, 1, _OVERSIZE_BYTES
+
+        # Window layout: [ send (LANES x NB) | recv (LANES x NB) | flags | snapshot ]
+        send_off, recv_off = 0, LANES * NB
+        flag_off = 2 * LANES * NB
+        snap_off = flag_off + 256
+        win_bytes = snap_off + 256
+        comm = _init_comm(
+            rank, world_size, uid_path, per_rank_vmm=win_bytes + (1 << 30)
+        )
+        mem = comm.alloc_mem(win_bytes)
+        win = comm.register_window(mem.ptr, mem.size)
+        ints = NB // 4
+        whole = from_gpu_ptr(win.local_ptr, (win_bytes // 4,), torch.int32)
+        whole.zero_()
+
+        def pattern(src, lane):
+            x = torch.arange(ints, device="cuda", dtype=torch.int32)
+            return x * 7 + src * 1000003 + lane * 7919
+
+        def region(off, lane):
+            return whole[(off + lane * NB) // 4 : (off + (lane + 1) * NB) // 4]
+
+        for lane in range(LANES):
+            region(send_off, lane).copy_(pattern(rank, lane))
+        torch.cuda.synchronize()
+
+        reqs = CCODevCommRequirements()
+        reqs.gda_connection_type = GDA_CONNECTION_NONE
+        reqs.gda_signal_count = 0
+        reqs.gda_counter_count = 0
+        reqs.sdma_queue_count = 2
+        dc = comm.create_dev_comm(reqs)
+        me = rank
+        nxt, prv = (me + 1) % world_size, (me - 1) % world_size
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def post_kernel(dev_comm: Int64, w: Int64):
+            sdma = cco.DevComm(dev_comm).sdma()
+            window = cco.Window(w)
+            tid = fx.thread_idx.x
+            lane_bytes = fx.Int64(tid) * fx.Int64(NB)
+            dst = fx.Int64(window.lsa_ptr(nxt, recv_off)) + lane_bytes
+            src = fx.Int64(window.lsa_ptr(me, send_off)) + lane_bytes
+            flag = fx.Int64(flag_off) + fx.Int64(tid) * fx.Int64(4)
+            if tid < LANES:
+                sdma.post_wait_mem_put_ptr(
+                    nxt,
+                    QID,
+                    w,
+                    flag,
+                    1,
+                    dst,
+                    src,
+                    NB,
+                    local_signal=True,
+                    remote_signal=True,
+                )
+
+        @flyc.kernel(known_block_size=[THREADS, 1, 1])
+        def quiet_kernel(dev_comm: Int64, w: Int64):
+            if fx.thread_idx.x == 0:
+                cco.DevComm(dev_comm).sdma().quiet(nxt)
+
+        @flyc.jit
+        def post(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            post_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        @flyc.jit
+        def drain(dev_comm: Int64, w: Int64, stream=fx.Stream(None)):
+            quiet_kernel(dev_comm, w).launch(
+                grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+            )
+
+        slots = [(me, QID), (prv, QID)]
+        snapshot = _signal_snapshot_kernel(flyc, fx, Int64, cco, slots, snap_off, me)
+
+        def state():
+            """(lanes whose block landed whole, lanes with any byte landed, signals)."""
+            whole_lanes, touched = set(), set()
+            for lane in range(LANES):
+                got = region(recv_off, lane)
+                if torch.equal(got, pattern(prv, lane)):
+                    whole_lanes.add(lane)
+                if bool(torch.count_nonzero(got)):
+                    touched.add(lane)
+            snapshot(dc.ptr, win.handle)
+            sync()
+            return whole_lanes, touched, list(read(win.local_ptr + snap_off, 2, u32))
+
+        def expect(landed, what):
+            deadline = time.monotonic() + 30.0
+            while True:
+                whole_lanes, touched, counts = state()
+                ok = whole_lanes == landed and touched == landed
+                ok = ok and counts == [len(landed)] * 2
+                if ok or time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+            if not ok:
+                raise AssertionError(
+                    f"rank {me} {what}: whole {sorted(whole_lanes)} touched"
+                    f" {sorted(touched)} signals {counts}, expected lanes"
+                    f" {sorted(landed)} and signals {[len(landed)] * 2}"
+                )
+
+        def raise_flags(lanes):
+            for lane in lanes:
+                fill(win.local_ptr + flag_off + 4 * lane, [1], u32)
+
+        comm.barrier()
+        post(dc.ptr, win.handle)
+        sync()
+        comm.barrier()
+        time.sleep(0.5)
+        try:
+            expect(set(), "both flags low")
+            comm.barrier()
+            # Lane 0 posted first. Only its flag: its copy must not wait for lane 1's.
+            raise_flags([0])
+            expect({0}, "lane 0's flag raised")
+            comm.barrier()
+        finally:
+            raise_flags(range(LANES))  # never leave a queue parked
+            drain(dc.ptr, win.handle)
+            sync()
+            comm.barrier()
+        expect({0, 1}, "both flags raised")
+        comm.destroy()
+    except Exception:
+        err = traceback.format_exc()
+    with open(results_path % rank, "w") as f:
+        f.write(err or "")
+
+
 # ── spawn harness ──────────────────────────────────────────────────────────
 
 
@@ -887,3 +1757,58 @@ def test_sdma_put_aggregate():
 def test_sdma_put2d(coop_name, world_size):
     """put2d moves exactly the rect; THREAD batches 64 one-row rects in one run."""
     _run(_worker_put2d, world_size=world_size, coop_name=coop_name)
+
+
+@pytest.mark.parametrize("coop_name", ["THREAD", "WARP"])
+def test_sdma_post_wait_mem(coop_name):
+    """An engine-side wait holds the put behind it until the flag is raised."""
+    _run(_worker_post_wait_mem, world_size=2, coop_name=coop_name)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_sdma_post_wait_signal_relay(world_size):
+    """post_wait_signal forwards a hop's data once its remote signal lands."""
+    _run(_worker_post_wait_signal, world_size=world_size, coop_name="THREAD")
+
+
+@pytest.mark.parametrize("coop_name", ["THREAD", "WARP"])
+def test_sdma_put_broadcast(coop_name):
+    """put_broadcast writes both destinations from one packet, with both signals."""
+    _run(_worker_put_broadcast, world_size=2, coop_name=coop_name)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("variant", ["plain", "aggregate", "zero_bytes"])
+def test_sdma_post_wait_mem_put_ptr(variant, world_size):
+    """The fused wait + put holds the copy and its signals until the flag is raised."""
+    _run(_worker_post_wait_mem_put, world_size=world_size, coop_name=variant)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize(
+    "layout", ["distinct", "shared", "aggregate_distinct", "aggregate_shared"]
+)
+def test_sdma_post_wait_mem_put_ptr_lanes(layout, world_size):
+    """Lanes on distinct queues wait independently; lanes on one queue in order."""
+    _run(_worker_post_wait_mem_put, world_size=world_size, coop_name=layout)
+
+
+@pytest.mark.parametrize("variant", sorted(_CMP_CASES))
+def test_sdma_post_wait_mem_put_ptr_cmp_mask(variant):
+    """A non-EQ compare under a partial mask gates the copy on the masked bits."""
+    _run(_worker_post_wait_mem_put_cmp, world_size=2, coop_name=variant)
+
+
+def test_sdma_post_wait_mem_put_ptr_nothing_to_post():
+    """nbytes == 0 without signals posts no wait: the queue is not parked."""
+    _run(_worker_post_wait_mem_put_nothing, world_size=2, coop_name="zero_nosignal")
+
+
+def test_sdma_post_wait_mem_put_ptr_oversize_shared_queue():
+    """Over CCO_SDMA_MAX_COPY_BYTES: two lanes on one queue, each copy gated only
+    by its own flag (wait and chunks posted lane by lane). ~4.3 GiB per GPU."""
+    need = 4 * _OVERSIZE_BYTES + (2 << 30)
+    for i in range(min(2, _num_gpus())):
+        if torch.cuda.get_device_properties(i).total_memory < need:
+            pytest.skip(f"needs {need >> 30} GiB per GPU")
+    _run(_worker_post_wait_mem_put_oversize, world_size=2, coop_name="shared_queue")

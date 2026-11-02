@@ -45,8 +45,10 @@
 #include "umbp/distributed/metrics/activity_summary.h"
 #include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -57,7 +59,7 @@ class WorkloadTraceRecorder;
 
 class PeerServiceServer;
 class PeerPool;
-class HbmCopyEngine;
+class KvIndexerReporter;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -87,7 +89,7 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
 // allocator outbox is shipped to master via the heartbeat thread.
 class PoolClient {
  public:
-  explicit PoolClient(PoolClientConfig config);
+  explicit PoolClient(PoolClientConfig config, std::shared_ptr<PoolPlatform> platform = nullptr);
   ~PoolClient();
 
   PoolClient(const PoolClient&) = delete;
@@ -125,6 +127,11 @@ class PoolClient {
                       int device = -1, MemoryRegistration mode = MemoryRegistration::kPinned);
 
   void DeregisterMemory(void* ptr);
+
+  // Optional Indexer reporting, configured once at the storage owner.
+  void ConfigureKvIndexer(const KvIndexerConfig& config);
+  KvMetadataPin RegisterKvBlock(const KvBlockMetadata& block);
+  bool FlushKvIndexer();
 
   // Hot paths.  Both retry up to `max_route_retries` times when the
   // chosen peer reports ENOSPC (Put) or unknown-key (Get); each retry
@@ -257,6 +264,7 @@ class PoolClient {
 
  private:
   PoolClientConfig config_;
+  std::shared_ptr<PoolPlatform> platform_;
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
@@ -345,6 +353,7 @@ class PoolClient {
   // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
   // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
+  std::shared_ptr<KvIndexerReporter> kv_indexer_;
 
   // The implicit default logical pool. It borrows registry_, owns placement
   // state and policy, and is the dispatch surface for local and peer RPC paths.
@@ -369,9 +378,6 @@ class PoolClient {
   // transport configured, in which case only local transfers are servicable.
   std::unique_ptr<TransferEngine> transfer_engine_;
   PeerDirectory* peer_directory_ = nullptr;
-  // Observer into transfer_engine_'s composite, used only to declare which
-  // host regions the gather kernel may dereference.  Not a second data path.
-  HbmCopyEngine* hbm_engine_ = nullptr;
 
   // Lazy peer connections (one per remote node).  Purely control plane since
   // Phase 6: the peer's engine desc and buffer descriptors moved into
@@ -401,6 +407,7 @@ class PoolClient {
   // offset triple, because whether a transfer needs staging is the transfer
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
+  TransferRef LocalUserBytes(void* ptr, size_t size) const;
   int PreferredNumaNodeFor(void* ptr, size_t size) const;
   // The NUMA node a write's source lives on: its GPU's, or the node its registered
   // host region was placed on; -1 when unknown.
@@ -656,8 +663,15 @@ class PoolClient {
   //   bytes == nullptr  -> pull the object from `route` first
   //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
+    struct BufferDeleter {
+      std::shared_ptr<PoolPlatform> platform;
+      HostBufferHandle buffer;
+      void operator()(char*) {
+        if (platform) platform->FreeHost(buffer);
+      }
+    };
     std::string key;
-    std::unique_ptr<char[]> bytes;
+    std::unique_ptr<char[], BufferDeleter> bytes{nullptr, BufferDeleter{}};
     size_t size = 0;
     std::optional<RouteGetResult> route;
   };

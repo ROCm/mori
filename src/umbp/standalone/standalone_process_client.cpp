@@ -53,6 +53,22 @@ namespace {
 
 std::atomic<uint64_t> g_client_counter{0};
 
+void EncodeKvBlock(const KvBlockMetadata& block, ::umbp::StandaloneKvBlock* request) {
+  request->set_hash(block.hash);
+  if (block.parent) request->set_parent(*block.parent);
+  request->set_block_size(block.block_size);
+  for (const auto& [bit, keys] : block.component_keys) {
+    auto* component = request->add_components();
+    component->set_component(bit);
+    for (const auto& key : keys) component->add_keys(key);
+  }
+}
+
+void CheckKvMetadataStatus(const grpc::Status& status) {
+  if (status.error_code() == grpc::StatusCode::INVALID_ARGUMENT)
+    throw std::invalid_argument(status.error_message());
+}
+
 // Travels with a ranged get that names its keys by handle, so the server can
 // check the handle still stands for the list the caller means. It is a check,
 // not the lookup: both sides also hold the keys themselves and the client side
@@ -126,6 +142,11 @@ void SetEnv(const char* name, double value) { setenv(name, std::to_string(value)
 void ExportServerEnv(const UMBPConfig& config, const std::string& address) {
   SetEnv("UMBP_STANDALONE_ADDRESS", address);
   SetEnv("UMBP_ROLE", "standalone");
+  SetEnv("UMBP_SIM_ENABLE", config.sim.enabled);
+  setenv("UMBP_SIM_PROFILE", config.sim.profile_path.c_str(), 1);
+  const std::string server_trace =
+      config.sim.trace_path.empty() ? "" : config.sim.trace_path + ".server";
+  setenv("UMBP_SIM_TRACE", server_trace.c_str(), 1);
   SetEnv("UMBP_DRAM_CAPACITY", config.dram.capacity_bytes);
   SetEnv("UMBP_DRAM_USE_HUGEPAGES", config.dram.use_hugepages);
   SetEnv("UMBP_DRAM_HUGEPAGE_SIZE", config.dram.hugepage_size);
@@ -195,11 +216,89 @@ class ScopedBootstrapLock {
 
 }  // namespace
 
+class StandaloneProcessClient::MemoryExporter {
+ public:
+  virtual ~MemoryExporter() = default;
+  virtual bool Register(StandaloneProcessClient& client, uintptr_t ptr, size_t size,
+                        mori::io::MemoryLocationType loc, int device) = 0;
+};
+
+class StandaloneProcessClient::RealMemoryExporter final : public MemoryExporter {
+ public:
+  bool Register(StandaloneProcessClient& client, uintptr_t ptr, size_t size,
+                mori::io::MemoryLocationType loc, int device) override {
+    // Classification is authoritative, and `loc`/`device` only fill in what it
+    // cannot know.  Two callers have to work here: ours, which states the
+    // location explicitly, and a connector written against the two-argument
+    // upstream API, which does not.  Trusting the pointer over the argument
+    // means a caller who leaves `loc` at its CPU default cannot silently get a
+    // device buffer registered as host memory — the failure that would then show
+    // up as a memcpy from device memory, far from here.
+    PointerLocation location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
+    if (loc == mori::io::MemoryLocationType::GPU && !location.IsDevice()) {
+      MORI_UMBP_ERROR(
+          "[StandaloneProcessClient] RegisterMemory: caller declared GPU for ptr=0x{:x} but it is "
+          "not device memory",
+          ptr);
+      return false;
+    }
+    // A device ordinal from the caller is honoured when classification could not
+    // supply one (hipPointerGetAttributes reports -1 for some allocations).
+    if (location.IsDevice() && location.device_id < 0) location.device_id = device;
+
+    if (location.IsDevice()) return client.RegisterDeviceMemory(ptr, size, location.device_id);
+    return client.RegisterHostShmMemory(ptr, size);
+  }
+};
+
+class StandaloneProcessClient::VirtualMemoryExporter final : public MemoryExporter {
+ public:
+  bool Register(StandaloneProcessClient& client, uintptr_t ptr, size_t size,
+                mori::io::MemoryLocationType loc, int device) override {
+    // Explicit GPU metadata also supports virtual callers without a HIP device.
+    if (loc == mori::io::MemoryLocationType::CPU) {
+      const auto location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
+      if (location.IsDevice()) {
+        loc = mori::io::MemoryLocationType::GPU;
+        if (location.device_id >= 0) device = location.device_id;
+      }
+    }
+    if (ptr == 0 || size == 0 || size > std::numeric_limits<uintptr_t>::max() - ptr ||
+        (loc != mori::io::MemoryLocationType::CPU && loc != mori::io::MemoryLocationType::GPU) ||
+        (loc == mori::io::MemoryLocationType::GPU && device < 0))
+      return false;
+    ::umbp::RegisterMemoryRequest req;
+    req.set_client_id(client.ClientId());
+    req.set_worker_base(ptr);
+    req.set_size(size);
+    req.set_kind(::umbp::MEMORY_KIND_VIRTUAL);
+    req.set_device_id(loc == mori::io::MemoryLocationType::GPU ? device : -1);
+    req.set_worker_node_id(client.standalone_config_.worker_node_id);
+    req.set_worker_node_address(client.standalone_config_.worker_node_address);
+    for (const auto& tag : client.standalone_config_.tags) req.add_tags(tag);
+    grpc::ClientContext ctx;
+    ::umbp::BoolResponse resp;
+    if (!client.stub_->RegisterMemory(&ctx, req, &resp).ok() || !resp.ok()) return false;
+    std::lock_guard<std::mutex> lock(client.registration_mu_);
+    const auto at = std::find_if(client.regions_.begin(), client.regions_.end(),
+                                 [&](const auto& region) { return region.base == ptr; });
+    if (at == client.regions_.end())
+      client.regions_.push_back({ptr, size, RegionKind::kVirtual});
+    else
+      at->size = size;
+    return true;
+  }
+};
+
 StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : config_(config) {
   if (!config_.standalone_process.has_value()) {
     throw std::runtime_error("StandaloneProcessClient requires UMBPConfig::standalone_process");
   }
   standalone_config_ = config_.standalone_process.value();
+  if (config_.sim.enabled)
+    memory_exporter_ = std::make_unique<VirtualMemoryExporter>();
+  else
+    memory_exporter_ = std::make_unique<RealMemoryExporter>();
   std::string error_message;
   if (!config_.Validate(&error_message)) {
     throw std::runtime_error("invalid UMBP config: " + error_message);
@@ -215,6 +314,7 @@ StandaloneProcessClient::StandaloneProcessClient(const UMBPConfig& config) : con
   if (!WaitReady(standalone_config_.startup_timeout_ms)) {
     throw std::runtime_error("StandaloneProcessClient: server is not ready at " + address_);
   }
+  if (config_.sim.enabled) sim_trace_ = std::make_unique<SimTrace>(config_.sim.trace_path);
 
   MORI_UMBP_INFO("[StandaloneProcessClient] connected address={} fd_socket={}", address_,
                  fd_socket_path_);
@@ -240,6 +340,8 @@ bool StandaloneProcessClient::WaitReady(int timeout_ms) {
     ::umbp::PingResponse resp;
     grpc::Status status = stub_->Ping(&ctx, req, &resp);
     if (status.ok() && resp.ready()) {
+      if (resp.simulation() != config_.sim.enabled)
+        throw std::runtime_error("StandaloneProcessClient: client/server sim mode mismatch");
       backend_mode_ = BackendModeFromProto(resp.deployment_mode());
       supports_ranged_io_ = resp.supports_ranged_io();
       return true;
@@ -299,6 +401,11 @@ bool StandaloneProcessClient::OffsetForLocked(uintptr_t ptr, size_t size, uint64
 }
 
 bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t size) {
+  SimCall call(sim_trace_.get(), "put", 1, size);
+  if (kv_metadata_provider_) {
+    const auto result = BatchPutImpl({key}, {src}, {size});
+    return call.Result(!result.empty() && result.front());
+  }
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
@@ -314,10 +421,11 @@ bool StandaloneProcessClient::Put(const std::string& key, uintptr_t src, size_t 
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Put(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  return call.Result(status.ok() && resp.ok());
 }
 
 bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t size) {
+  SimCall call(sim_trace_.get(), "get", 1, size);
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
@@ -333,10 +441,11 @@ bool StandaloneProcessClient::Get(const std::string& key, uintptr_t dst, size_t 
   req.set_region_base(region_base);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Get(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  return call.Result(status.ok() && resp.ok());
 }
 
 bool StandaloneProcessClient::Exists(const std::string& key) const {
+  SimCall call(sim_trace_.get(), "exists", 1, 0);
   if (closing_) return false;
   std::shared_lock lk(op_mutex_);
   if (closed_) return false;
@@ -345,18 +454,28 @@ bool StandaloneProcessClient::Exists(const std::string& key) const {
   req.set_key(key);
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Exists(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  return call.Result(status.ok() && resp.ok());
 }
 
 std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::string>& keys,
                                                     const std::vector<uintptr_t>& srcs,
                                                     const std::vector<size_t>& sizes) {
+  SimCall call(sim_trace_.get(), "batch_put", keys.size(), sizes);
+  return call.Result(BatchPutImpl(keys, srcs, sizes));
+}
+
+std::vector<bool> StandaloneProcessClient::BatchPutImpl(const std::vector<std::string>& keys,
+                                                        const std::vector<uintptr_t>& srcs,
+                                                        const std::vector<size_t>& sizes) {
   if (closing_) return std::vector<bool>(keys.size(), false);
+  ::umbp::BatchDataRequest req;
+  if (kv_metadata_provider_)
+    for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
   std::shared_lock lk(op_mutex_);
+  if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
   if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) {
     return std::vector<bool>(keys.size(), false);
   }
-  ::umbp::BatchDataRequest req;
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
     uint64_t offset = 0;
@@ -372,6 +491,7 @@ std::vector<bool> StandaloneProcessClient::BatchPut(const std::vector<std::strin
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPut(&ctx, req, &resp);
+  CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
@@ -382,12 +502,16 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
                                                              const std::vector<uintptr_t>& srcs,
                                                              const std::vector<size_t>& sizes,
                                                              const std::vector<int>& depths) {
+  SimCall call(sim_trace_.get(), "batch_put_with_depth", keys.size(), sizes);
   if (closing_) return std::vector<bool>(keys.size(), false);
+  ::umbp::BatchDataWithDepthRequest req;
+  if (kv_metadata_provider_)
+    for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
   std::shared_lock lk(op_mutex_);
+  if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
   if (closed_ || keys.size() != srcs.size() || keys.size() != sizes.size()) {
     return std::vector<bool>(keys.size(), false);
   }
-  ::umbp::BatchDataWithDepthRequest req;
   req.set_client_id(ClientId());
   for (size_t i = 0; i < keys.size(); ++i) {
     uint64_t offset = 0;
@@ -404,15 +528,17 @@ std::vector<bool> StandaloneProcessClient::BatchPutWithDepth(const std::vector<s
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
   grpc::Status status = stub_->BatchPutWithDepth(&ctx, req, &resp);
+  CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
-  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+  return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
 }
 
 std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::string>& keys,
                                                     const std::vector<uintptr_t>& dsts,
                                                     const std::vector<size_t>& sizes) {
+  SimCall call(sim_trace_.get(), "batch_get", keys.size(), sizes);
   if (closing_) return std::vector<bool>(keys.size(), false);
   std::shared_lock lk(op_mutex_);
   if (closed_ || keys.size() != dsts.size() || keys.size() != sizes.size()) {
@@ -437,7 +563,7 @@ std::vector<bool> StandaloneProcessClient::BatchGet(const std::vector<std::strin
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
-  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+  return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
 }
 
 uint64_t StandaloneProcessClient::LookupKeyHandle(const std::vector<std::string>& keys,
@@ -519,6 +645,7 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     const std::vector<std::string>& keys, const std::vector<std::vector<uintptr_t>>& dsts,
     const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& src_offsets) {
+  SimCall call(sim_trace_.get(), "batch_get_ranges", keys.size(), sizes);
   std::vector<bool> failed(keys.size(), false);
   if (closing_) return failed;
   std::shared_lock lk(op_mutex_);
@@ -574,7 +701,7 @@ std::vector<bool> StandaloneProcessClient::BatchGetRanges(
     }
     if (resp.ok_size() != static_cast<int>(keys.size())) return failed;
     RememberKeyHandle(keys, resp.key_handle(), fingerprint);
-    return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+    return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
   }
   return failed;
 }
@@ -583,15 +710,19 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
     const std::vector<std::string>& keys, const std::vector<size_t>& object_sizes,
     const std::vector<std::vector<uintptr_t>>& srcs, const std::vector<std::vector<size_t>>& sizes,
     const std::vector<std::vector<size_t>>& dst_offsets) {
+  SimCall call(sim_trace_.get(), "batch_put_ranges", keys.size(), sizes);
   std::vector<bool> failed(keys.size(), false);
   if (closing_) return failed;
+  ::umbp::BatchRangeDataRequest req;
+  if (kv_metadata_provider_)
+    for (const auto& block : kv_metadata_provider_(keys)) EncodeKvBlock(block, req.add_kv_blocks());
   std::shared_lock lk(op_mutex_);
+  if ((closed_ || closing_) && req.kv_blocks_size()) throw std::logic_error("client is closed");
   if (closed_ || object_sizes.size() != keys.size() ||
       !RangeBatchShapeValid(keys.size(), srcs, sizes, dst_offsets)) {
     return failed;
   }
 
-  ::umbp::BatchRangeDataRequest req;
   req.set_client_id(ClientId());
   {
     std::lock_guard<std::mutex> registration_lock(registration_mu_);
@@ -615,11 +746,13 @@ std::vector<bool> StandaloneProcessClient::BatchPutRanges(
   grpc::ClientContext ctx;
   ::umbp::BatchBoolResponse resp;
   const grpc::Status status = stub_->BatchPutRanges(&ctx, req, &resp);
+  CheckKvMetadataStatus(status);
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) return failed;
-  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+  return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
 }
 
 std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::string>& keys) const {
+  SimCall call(sim_trace_.get(), "batch_exists", keys.size(), 0);
   if (closing_) return std::vector<bool>(keys.size(), false);
   std::shared_lock lk(op_mutex_);
   if (closed_) return std::vector<bool>(keys.size(), false);
@@ -631,10 +764,11 @@ std::vector<bool> StandaloneProcessClient::BatchExists(const std::vector<std::st
   if (!status.ok() || resp.ok_size() != static_cast<int>(keys.size())) {
     return std::vector<bool>(keys.size(), false);
   }
-  return std::vector<bool>(resp.ok().begin(), resp.ok().end());
+  return call.Result(std::vector<bool>(resp.ok().begin(), resp.ok().end()));
 }
 
 size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::string>& keys) const {
+  SimCall call(sim_trace_.get(), "batch_exists_consecutive", keys.size(), 0);
   if (closing_) return 0;
   std::shared_lock lk(op_mutex_);
   if (closed_) return 0;
@@ -643,7 +777,26 @@ size_t StandaloneProcessClient::BatchExistsConsecutive(const std::vector<std::st
   for (const auto& key : keys) req.add_keys(key);
   ::umbp::CountResponse resp;
   grpc::Status status = stub_->BatchExistsConsecutive(&ctx, req, &resp);
-  return status.ok() ? static_cast<size_t>(resp.count()) : 0;
+  return call.Result(status.ok() ? static_cast<size_t>(resp.count()) : 0);
+}
+
+void StandaloneProcessClient::ConfigureKvIndexer(const KvIndexerConfig& config) {
+  std::shared_lock lock(op_mutex_);
+  if (closed_ || closing_) throw std::logic_error("client is closed");
+  ::umbp::StandaloneKvIndexerConfig request;
+  request.set_endpoint(config.endpoint);
+  request.set_timeout_ms(config.timeout_ms);
+  request.set_dram_pool_id(config.dram_pool_id);
+  request.set_repair_interval_ms(config.repair_interval_ms);
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  ::umbp::BoolResponse response;
+  auto status = stub_->ConfigureKvIndexer(&context, request, &response);
+  if (!status.ok()) throw std::runtime_error(status.error_message());
+  if (!response.ok()) throw std::invalid_argument(response.error());
+  if (!response.supports_kv_metadata())
+    throw std::runtime_error("standalone owner requires an upgrade for batched KV metadata");
+  kv_metadata_provider_ = config.metadata_provider;
 }
 
 size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& keys) {
@@ -659,28 +812,31 @@ size_t StandaloneProcessClient::BatchPrefetch(const std::vector<std::string>& ke
 }
 
 bool StandaloneProcessClient::Clear() {
-  if (closing_) return true;
+  SimCall call(sim_trace_.get(), "clear", 0, 0);
+  if (closing_) return call.Result(true);
   std::unique_lock lk(op_mutex_);
-  if (closed_) return true;
+  if (closed_) return call.Result(true);
   grpc::ClientContext ctx;
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Clear(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  return call.Result(status.ok() && resp.ok());
 }
 
 bool StandaloneProcessClient::Flush() {
-  if (closing_) return true;
+  SimCall call(sim_trace_.get(), "flush", 0, 0);
+  if (closing_) return call.Result(true);
   std::shared_lock lk(op_mutex_);
-  if (closed_) return true;
+  if (closed_) return call.Result(true);
   grpc::ClientContext ctx;
   ::umbp::Empty req;
   ::umbp::BoolResponse resp;
   grpc::Status status = stub_->Flush(&ctx, req, &resp);
-  return status.ok() && resp.ok();
+  return call.Result(status.ok() && resp.ok());
 }
 
 void StandaloneProcessClient::Close() {
+  SimCall call(sim_trace_.get(), "close", 0, 0, -1);
   closing_ = true;
   std::unique_lock lk(op_mutex_);
   if (closed_) return;
@@ -700,31 +856,11 @@ void StandaloneProcessClient::Close() {
 bool StandaloneProcessClient::RegisterMemory(uintptr_t ptr, size_t size,
                                              mori::io::MemoryLocationType loc, int device,
                                              MemoryRegistration /*mode*/) {
+  SimCall call(sim_trace_.get(), "register_memory", 0, size);
   if (closing_) return false;
   std::unique_lock lk(op_mutex_);
   if (closed_) return false;
-
-  // Classification is authoritative, and `loc`/`device` only fill in what it
-  // cannot know.  Two callers have to work here: ours, which states the
-  // location explicitly, and a connector written against the two-argument
-  // upstream API, which does not.  Trusting the pointer over the argument
-  // means a caller who leaves `loc` at its CPU default cannot silently get a
-  // device buffer registered as host memory — the failure that would then show
-  // up as a memcpy from device memory, far from here.
-  PointerLocation location = DetectPointerLocation(reinterpret_cast<void*>(ptr));
-  if (loc == mori::io::MemoryLocationType::GPU && !location.IsDevice()) {
-    MORI_UMBP_ERROR(
-        "[StandaloneProcessClient] RegisterMemory: caller declared GPU for ptr=0x{:x} but it is "
-        "not device memory",
-        ptr);
-    return false;
-  }
-  // A device ordinal from the caller is honoured when classification could not
-  // supply one (hipPointerGetAttributes reports -1 for some allocations).
-  if (location.IsDevice() && location.device_id < 0) location.device_id = device;
-
-  if (location.IsDevice()) return RegisterDeviceMemory(ptr, size, location.device_id);
-  return RegisterHostShmMemory(ptr, size);
+  return call.Result(memory_exporter_->Register(*this, ptr, size, loc, device));
 }
 
 bool StandaloneProcessClient::RegisterDeviceMemory(uintptr_t ptr, size_t size, int device_id) {
@@ -890,6 +1026,7 @@ void StandaloneProcessClient::DeregisterMemoryLocked() {
 }
 
 void StandaloneProcessClient::DeregisterMemory(uintptr_t /*ptr*/) {
+  SimCall call(sim_trace_.get(), "deregister_memory", 0, 0, -1);
   if (closing_) return;
   std::unique_lock lk(op_mutex_);
   if (closed_) return;

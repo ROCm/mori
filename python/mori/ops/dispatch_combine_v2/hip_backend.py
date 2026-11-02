@@ -50,6 +50,7 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -65,8 +66,8 @@ from .symm_arena import SymmArena
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
 # after its own EpArgs fields (offTokOff -> "tokOff"); the region names match the
 # FlyDSL op's, and so do the sizes EXCEPT out_scales -- this backend pads the row,
-# FlyDSL does not. A plan binds offsets, never sizes, so an arena sized for the
-# wrong one is overrun silently: size it from scale_stride_bytes().
+# FlyDSL does not. The sizes come from the plans (region.<stem> in their info,
+# EpRegion* in ep_cfg.hpp): size an arena with ep_plans.arena_regions().
 _REGIONS = {
     "tokOff": "tok_off",
     "recvNum": "recv_num",
@@ -78,6 +79,19 @@ _REGIONS = {
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
 }
+
+_LL_REGIONS = dict(
+    _REGIONS,
+    recvNum="ll_recv_num",
+    recvToSrc="ll_recv_to_src_token",
+    outIdx="ll_out_idx",
+    outWts="ll_out_wts",
+    dispOut="ll_disp_out",
+    outTok="ll_out_tok",
+    outScales="ll_out_scales",
+)
+
+_LL_SPEC = ("ll128",)
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
 # for it, and advertising it here would alias onto another one. Dispatch only copies,
@@ -165,22 +179,23 @@ def _raw_stream(device_index: int) -> int:
 
 
 def scale_stride_bytes(scale_bytes: int) -> int:
-    """What a DESTINATION scale row is laid down at: EpScaleStride in ep_cfg.hpp.
+    """What a DESTINATION scale row is laid down at (EpScaleStride in ep_cfg.hpp).
 
     Anything addressing the region itself strides by this; recv_scales() hides it.
-    Mirrored from the C++ because sizing happens before any kernel exists.
+    For callers sizing without a plan: the plan's own info["scaleStride"], asked
+    of describe().
     """
     if scale_bytes <= 0:
         return 0
-    return (scale_bytes + _SCALE_ALIGN - 1) // _SCALE_ALIGN * _SCALE_ALIGN
+    return _dispatch_info(scale_bytes=int(scale_bytes))["scaleStride"]
 
 
 def ep_staging_bytes(
     world_size: int, max_recv: int, scale_bytes: int, max_tok_per_rank: int = 0
 ) -> int:
-    """Total bytes for the gfx1250 dispatch staging buffer.
-
-    Mirrors EpStagingTotalBytes in ep_cfg.hpp.
+    """Bytes of the dispatch staging buffer (EpStagingTotalBytes in ep_cfg.hpp): the
+    plan's info["stagingBytes"], asked of describe(). 0 where the dispatch does not
+    stage (anything but gfx125x).
 
     ``max_recv`` is EpCfg.maxRecv, where 0 is not a cap of zero but "ask
     EpMaxRecv", which answers world_size * max_tok_per_rank -- and that is the
@@ -196,181 +211,108 @@ def ep_staging_bytes(
             "no max_tok_per_rank was given, so the receive cap is unknown. Pass "
             "max_tok_per_rank, or pass an already-resolved cap as max_recv."
         )
-    pool = world_size * recv
-    max_topk = 16
-    max_blocks = 512
+    return _dispatch_info(
+        world_size=int(world_size),
+        max_recv=int(recv),
+        max_tok_per_rank=int(max_tok_per_rank or recv // world_size),
+        scale_bytes=int(scale_bytes),
+    )["stagingBytes"]
 
-    def a128(x):
-        return (x + 127) & ~127
 
-    off = a128(pool * max_topk * 4)  # stgIdx
-    off = a128(off + pool * max_topk * 4)  # stgWt
-    off = a128(off + pool * 4)  # stgSrc
-    off = a128(off + max_blocks * world_size * 4)  # blkBase
-    off = a128(off + max_blocks * world_size * 4)  # blkCount
-    if scale_bytes > 0:
-        s_stride = scale_stride_bytes(scale_bytes)
-        off = a128(off + world_size * recv * s_stride)
-    return off
+@functools.lru_cache(maxsize=None)
+def _dispatch_info_cached(fields: tuple) -> dict:
+    return cb.EpDispatchPlan.describe(**dict(fields))
+
+
+def _dispatch_info(**fields) -> dict:
+    return _dispatch_info_cached(tuple(sorted(fields.items())))
+
+
+@functools.lru_cache(maxsize=None)
+def _combine_info_cached(fields: tuple) -> dict:
+    return cb.EpCombinePlan.describe(**dict(fields))
 
 
 # Must match EpXdbFlagSlots in include/mori/ops/dispatch_combine_v2/ep_cfg.hpp.
 _XDB_FLAG_SLOTS = 256
 
-_PUSH_SLOT_ALIGN = 128
 PUSH_QGROUP = {"fp4_blockwise": 32, "fp4_blockwise_fp32": 128, "fp8_blockwise": 32}
-_PUSH_SCALE_BYTES = {"fp4_blockwise": 1, "fp4_blockwise_fp32": 4, "fp8_blockwise": 1}
-_PUSH_ELEM_BITS = {"fp4_blockwise": 4, "fp4_blockwise_fp32": 4, "fp8_blockwise": 8}
+# The combine request fields each push quant type turns on.
+_PUSH_REQUEST = {
+    "fp4_blockwise": (("combine_fp4", 1),),
+    "fp4_blockwise_fp32": (("combine_fp4", 1), ("combine_fp4_f32_scale", 1)),
+    "fp8_blockwise": (("combine_fp8", 1),),
+}
 
 
 def push_wire_nbytes(cfg) -> int:
-    h = cfg.hidden_dim
-    q = cfg.quant_type
-    wire = h * _PUSH_ELEM_BITS[q] // 8 + h // PUSH_QGROUP[q] * _PUSH_SCALE_BYTES[q]
-    return (wire + _PUSH_SLOT_ALIGN - 1) // _PUSH_SLOT_ALIGN * _PUSH_SLOT_ALIGN
+    """Bytes of one landed row of the push combine (EpCombinePushWireBytes): the
+    plan's info["pushWireBytes"], asked of describe(). Reads cfg.hidden_dim and
+    cfg.quant_type; the push combine, and so this, is gfx125x only."""
+    fields = (("hidden_dim", int(cfg.hidden_dim)), *_PUSH_REQUEST[cfg.quant_type])
+    return _combine_info_cached(tuple(sorted(fields)))["pushWireBytes"]
 
 
 def push_land_rows(cfg) -> int:
-    """EpFp4LandRows: a token gets back one row per distinct destination rank, fp4 or fp8."""
-    return cfg.max_num_inp_token_per_rank * min(
-        cfg.world_size, cfg.num_experts_per_token
+    """Landing rows of the push combine, one per token and destination rank
+    (EpCombinePushLandRows): the plan's info["pushLandRows"], asked of describe().
+    Reads cfg.max_num_inp_token_per_rank, cfg.world_size and
+    cfg.num_experts_per_token; gfx125x only, as the push combine is."""
+    fields = (
+        ("world_size", int(cfg.world_size)),
+        ("max_tok_per_rank", int(cfg.max_num_inp_token_per_rank)),
+        ("num_expert_per_token", int(cfg.num_experts_per_token)),
+        *_PUSH_REQUEST["fp4_blockwise"],
     )
+    return _combine_info_cached(tuple(sorted(fields)))["pushLandRows"]
+
+
+def ll128_layout(cfg):
+    if cfg.is_internode or cfg.async_ll:
+        return None
+    if cfg.quant_type == "none" and cfg.combine_dtype is not torch.bfloat16:
+        return None
+    if cfg.is_fp4:
+        dt = "fp4"
+    elif cfg.dispatch_dtype in _FP8_TUNING_DTYPES:
+        dt = "fp8"
+    elif cfg.dispatch_dtype is torch.bfloat16 and cfg.quant_type == "none":
+        dt = "bf16"
+    else:
+        return None
+    from .hip_tuning_configs import ll128
+
+    geom = ll128(
+        cfg.world_size,
+        cfg.hidden_dim,
+        cfg.num_experts_per_token,
+        dt,
+        cfg.max_num_inp_token_per_rank,
+        experts_per_rank=cfg.num_experts_per_rank,
+        quant_type=cfg.quant_type,
+    )
+    if geom is None:
+        return None
+    cap = cfg.max_num_inp_token_per_rank
+    n = geom.get("max_tok", cap)
+    return dict(geom, max_tok=n, region_names=_LL_REGIONS if n < cap else _REGIONS)
 
 
 class TokOffExt:
-    """Dispatch's slot allocator word outside the cco window (single-host gfx1250 EP, opt-in: MORI_EP_TOKOFF_EXT=1).
-
-    One int per rank in hipExtMallocWithFlags(hipDeviceMallocUncached) memory,
-    opened on every peer by IPC handle. ``peers`` is the device array of
-    world_size pointers the kernel indexes by PE (EpArgs.tokOffPeers). The
-    window's hipMemCreate mapping serializes returning SYSTEM RMWs from several
-    GPUs on one int; this allocation does not.
-
-    PROTOTYPE: the 64-byte handles are exchanged over torch.distributed, which
-    the caller must have initialised.
-    """
-
-    _BYTES = 4096
-    _UNCACHED = 0x3  # hipDeviceMallocUncached
-    _LAZY_PEER = 0x1  # hipIpcMemLazyEnablePeerAccess
+    peers = None
 
     @staticmethod
-    def wanted(world) -> bool:
-        """MORI_EP_TOKOFF_EXT=1 (default off), and every rank on this host.
+    def wanted(world=1) -> bool:
+        return False
 
-        The peers' words are opened by hipIpc handle, which no other host can open;
-        an EP spanning hosts keeps the word in the cco window, which is mapped across
-        them. Collective over the default process group, like the constructor.
-        """
-        v = os.environ.get("MORI_EP_TOKOFF_EXT", "").strip().lower()
-        if v not in ("1", "true", "yes", "on"):
-            return False
-        import socket
-
-        import torch.distributed as dist
-
-        if not (dist.is_available() and dist.is_initialized()):
-            return True  # the constructor reports the missing process group
-        # The kernel's boot id, not the hostname: containers on one host each have
-        # a hostname of their own.
-        try:
-            with open("/proc/sys/kernel/random/boot_id") as f:
-                host = f.read().strip()
-        except OSError:
-            host = socket.gethostname()
-        hosts = [None] * world
-        dist.all_gather_object(hosts, host)
-        return len(set(hosts)) == 1
-
-    def __init__(self, rank, world, dev):
-        import ctypes
-
-        import torch.distributed as dist
-
-        from mori.jit.hip_driver import _get_hip_lib
-
-        if not (dist.is_available() and dist.is_initialized()):
-            raise RuntimeError(
-                "tokoff-ext exchanges IPC handles over torch.distributed; "
-                "initialise a process group first"
-            )
-
-        class _Handle(ctypes.Structure):
-            _fields_ = [("reserved", ctypes.c_char * 64)]
-
-        hip = _get_hip_lib()
-        vp = ctypes.c_void_p
-        hip.hipExtMallocWithFlags.argtypes = [
-            ctypes.POINTER(vp),
-            ctypes.c_size_t,
-            ctypes.c_uint,
-        ]
-        hip.hipMemset.argtypes = [vp, ctypes.c_int, ctypes.c_size_t]
-        hip.hipIpcGetMemHandle.argtypes = [ctypes.POINTER(_Handle), vp]
-        hip.hipIpcOpenMemHandle.argtypes = [ctypes.POINTER(vp), _Handle, ctypes.c_uint]
-        hip.hipIpcCloseMemHandle.argtypes = [vp]
-        hip.hipFree.argtypes = [vp]
-        self._hip, self._dev, self._mine, self._opened = hip, dev, None, []
-
-        def chk(err, what):
-            if err != 0:
-                raise RuntimeError(
-                    f"MORI_EP_TOKOFF_EXT: {what} returned hipError {err}"
-                )
-
-        with torch.cuda.device(dev):
-            mine = vp()
-            chk(
-                hip.hipExtMallocWithFlags(
-                    ctypes.byref(mine), self._BYTES, self._UNCACHED
-                ),
-                "hipExtMallocWithFlags",
-            )
-            self._mine = mine.value
-            chk(hip.hipMemset(self._mine, 0, self._BYTES), "hipMemset")
-            chk(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
-            handle = _Handle()
-            chk(
-                hip.hipIpcGetMemHandle(ctypes.byref(handle), self._mine),
-                "hipIpcGetMemHandle",
-            )
-            # string_at, not .reserved: a c_char array field reads back cut at the first NUL.
-            raw = ctypes.string_at(ctypes.addressof(handle), 64)
-            handles = [None] * world
-            dist.all_gather_object(handles, raw)
-            ptrs = []
-            for pe in range(world):
-                if pe == rank:
-                    ptrs.append(self._mine)
-                    continue
-                peer = vp()
-                err = hip.hipIpcOpenMemHandle(
-                    ctypes.byref(peer),
-                    _Handle.from_buffer_copy(handles[pe]),
-                    self._LAZY_PEER,
-                )
-                # Lazy peer setup can leave hipErrorPeerAccessAlreadyEnabled sticky
-                # even on success (see ccoDevCommCreate); consume it.
-                hip.hipGetLastError()
-                chk(err, f"hipIpcOpenMemHandle(pe {pe})")
-                ptrs.append(peer.value)
-                self._opened.append(peer.value)
-            self.peers = torch.tensor(ptrs, dtype=torch.int64, device=dev)
-        dist.barrier()
+    def __init__(self, rank=0, world=1, dev=None):
+        pass
 
     def zero(self):
-        """Collective, like the op's reset(): every rank zeroes its own word."""
-        with torch.cuda.device(self._dev):
-            self._hip.hipMemset(self._mine, 0, 4)
-            self._hip.hipDeviceSynchronize()
+        pass
 
     def close(self):
-        for p in self._opened:
-            self._hip.hipIpcCloseMemHandle(p)
-        self._opened = []
-        if self._mine is not None:
-            self._hip.hipFree(self._mine)
-            self._mine = None
+        pass
 
 
 class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
@@ -401,6 +343,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
+        lay = ll128_layout(cfg) if self._is1250 else None
+        split = lay is not None and lay["max_tok"] < cfg.max_num_inp_token_per_rank
+        self._ll128_geom = None if split else lay
+        self._ll128_split = lay if split else None
+        self._ll_recv_cap = cfg.world_size * lay["max_tok"] if split else 0
+        self._ll_last = False
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -409,6 +357,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             KernelSet(dispatch={}, combine={}, unsupported=self._unsupported(cfg))
         )
 
+        if self._ll128_geom is not None and cfg.schedule:
+            comb_b, comb_w = self._ll128_geom["combine"]
+            if "dispatch" in self._ll128_geom:
+                disp_b, disp_w = self._ll128_geom["dispatch"]
+                cfg.schedule = ((None, disp_b, disp_w, comb_b, comb_w),)
+            else:
+                cfg.schedule = tuple(
+                    (e, db, dw, comb_b, comb_w) for (e, db, dw, _, _) in cfg.schedule
+                )
+        self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
+        # What each intranode plan will report, per variant -- its arena regions,
+        # staging, push landing -- asked before any of them is built.
+        self._disp_infos, self._comb_infos = self._describe(cfg)
         self.arena = SymmArena(comm, self._regions(cfg))
         try:
             self._build(cfg, comm)
@@ -438,7 +399,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         dev = self.dev
         self.arena.zero()
 
-        self._dispatch_specs, self._combine_specs = self._specs_from(cfg)
         # The internode passes need a device communicator, and it has to exist
         # before the kernels are bound: the plans take it by value.
         # AsyncLL needs one on a single node too -- ccoSdma hangs off the device
@@ -449,28 +409,16 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
-        # Decided before the kernels are built: how the dispatch plans reserve slots
-        # follows where the slot allocator word lives (see TokOffExt below).
-        self._tokoff_wanted = (
-            not cfg.is_internode
-            and not cfg.async_ll
-            and self._is1250
-            and TokOffExt.wanted(cfg.world_size)
-        )
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
         # because dispatch plans bind the pointer at construction time.
         self.dispatch_staging = None
-        if self._is1250 and not cfg.is_internode:
-            raw_scale = self._scale_i32(cfg) * 4
-            stg_bytes = ep_staging_bytes(
-                cfg.world_size, cfg.effective_max_recv, raw_scale
+        stg_bytes = max((i["stagingBytes"] for i in self._disp_infos), default=0)
+        if stg_bytes > 0:
+            self.dispatch_staging = torch.zeros(
+                stg_bytes, dtype=torch.uint8, device=dev
             )
-            if stg_bytes > 0:
-                self.dispatch_staging = torch.zeros(
-                    stg_bytes, dtype=torch.uint8, device=dev
-                )
 
         self._kernels = self._build_kernels(cfg, self.arena)
 
@@ -488,19 +436,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # dispatch signal on, the push combine's landing offset of the rows it
         # returns (EpFp4LandTo; dispatch writes it, combine reads it).
         self.dest_pe_counter = torch.zeros(2 * cfg.world_size, **i32)
-        # Dispatch's slot allocator word lives in IPC-shared hipExtMallocWithFlags
-        # memory instead of the cco window (see TokOffExt): the cco-window slot
-        # atomic serializes on newer fw/KMD stacks. gfx1250 intranode only -- the
-        # only kernel that reads tokOffPeers. Opt-in for a single-host EP with
-        # MORI_EP_TOKOFF_EXT=1; otherwise, and always for an EP spanning hosts, the
-        # word stays in the cco window (tokOffPeers stays None -> kernel EpTokOff
-        # falls back to the VMM hipMemCreate window).
-        self._tokoff_ext = None
-        self.tok_off_peers = None
-        if self._tokoff_wanted:
-            self._tokoff_ext = TokOffExt(cfg.rank, cfg.world_size, dev)
-            self.tok_off_peers = self._tokoff_ext.peers
         self.total_recv = torch.zeros(1, **i32)
+        self._recv = self.total_recv
+        self._ll_recv = torch.zeros(1, **i32) if self._ll128_split is not None else None
+        self._snapshot_zeroes_count = self._ll128_split is not None or (
+            self._ll128_geom is not None and "dispatch" in self._ll128_geom
+        )
         self.dispatch_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(1, dtype=torch.uint32, device=dev)
         # Monotone epoch. Starts at 1 so the zeroed barrier slots cannot alias
@@ -699,6 +640,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             torch.zeros(cfg.effective_max_recv, **i32) if cfg.async_ll else None
         )
         self.total_recv = torch.zeros(1, **i32)
+        self._recv, self._ll_recv = self.total_recv, None
         self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.inter_blocks_barrier = torch.zeros(4, dtype=torch.uint32, device=dev)
@@ -804,17 +746,82 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         unchanged. The internode kernel lays its rows down packed
         (`destTokId * ScaleBytes`, ScaleBytes = scaleDim * scaleTypeSize) and
         internode_regions sizes out_scales that way, so there it is the row itself.
-        Use the module-level function when there is no op yet (sizing an arena)."""
+        Before there is an op, EpDispatchPlan.describe(...)["scaleStride"]."""
         # AsyncLL stages scales the same packed way the internode kernels do
         # (destTokId * ScaleBytes), so it reads the row unchanged too.
         if self.cfg.is_internode or self.cfg.async_ll:
             return self._scale_row_bytes()
-        return scale_stride_bytes(self._scale_row_bytes())
+        return self._disp_infos[0]["scaleStride"]
 
-    @classmethod
-    def _scale_stride_i32(cls, cfg) -> int:
-        """Dwords per DESTINATION scale row, 0 when the transport is off."""
-        return scale_stride_bytes(cls._scale_i32(cfg) * 4) // 4
+    def _describe(self, cfg):
+        """(dispatch infos, combine infos): every intranode variant, asked of
+        describe(), which compiles nothing. Empty on the internode and AsyncLL
+        paths, whose regions come from their own formulas."""
+        if cfg.is_internode or cfg.async_ll:
+            return (), ()
+        disp, comb = self._plan_requests(cfg)
+        return (
+            tuple(
+                cb.EpDispatchPlan.describe(
+                    **disp, block_num=b, warp_per_block=w, call_tok_max=cap
+                )
+                for b, w in self._dispatch_specs
+                for cap in self._dispatch_caps(cfg, (b, w))
+            ),
+            tuple(
+                cb.EpCombinePlan.describe(**comb, block_num=b, warp_per_block=w)
+                for b, w in self._combine_specs
+            ),
+        )
+
+    def _snapshot_recv_views(self, disp_spec):
+        if disp_spec == _LL_SPEC:
+            names, cap = ("ll_recv_to_src_token", "ll_out_idx"), self._ll_recv_cap
+        else:
+            geom = self._ll128_geom
+            if geom is None:
+                return None
+            if "dispatch" not in geom:
+                raise ValueError(
+                    "snapshot=True on an op whose LL128 combine runs behind the schedule's "
+                    "dispatch: that combine reads the slot map peers write into the arena, "
+                    "which the next dispatch overwrites"
+                )
+            names, cap = ("recv_to_src_token", "out_idx"), self._recv_cap
+        return (
+            from_gpu_ptr(self.arena.local_ptr(names[0]), (cap,), torch.int32),
+            from_gpu_ptr(
+                self.arena.local_ptr(names[1]),
+                (cap * self.cfg.num_experts_per_token,),
+                torch.int32,
+            ),
+        )
+
+    def _reverse_source(self, disp_spec):
+        if disp_spec != _LL_SPEC:
+            return super()._reverse_source(disp_spec)
+        view = self._views.get("ll_reverse")
+        if view is None:
+            view = self._views["ll_reverse"] = from_gpu_ptr(
+                self.arena.local_ptr("ll_recv_to_src_token"),
+                (self._ll_recv_cap,),
+                torch.int32,
+            )
+        return view, self._ll_reencode
+
+    def _ll_reencode(self, rev):
+        n = self._ll128_split["max_tok"]
+        return rev // n * self.cfg.max_num_inp_token_per_rank + rev % n
+
+    def _pick(self, num_tokens, snapshot=False):
+        split = self._ll128_split
+        if (
+            split is not None
+            and num_tokens <= split["max_tok"]
+            and not (snapshot and self.cfg.quant_type in _PUSH_QUANT_TYPES)
+        ):
+            return _LL_SPEC, _LL_SPEC
+        return super()._pick(num_tokens)
 
     def _regions(self, cfg):
         if cfg.async_ll:
@@ -827,42 +834,28 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # risk (a wrong formula corrupts a neighbour). test_internode_regions
             # compares every entry against what v1 allocates for the same config.
             return internode_regions(cfg)
-        # token_nbytes / combine_token_nbytes rather than elem*hidden: they are the
-        # only forms that are right for fp4, where 2 values share a byte.
-        cap = cfg.effective_max_recv
-        topk = cfg.num_experts_per_token
-        out_tok = cap * cfg.combine_token_nbytes
-        if cfg.quant_type in _PUSH_QUANT_TYPES:
-            land_rows = push_land_rows(cfg)
-            out_tok += land_rows * push_wire_nbytes(cfg)
-            # Row flags of the overlapped combine (EpFp4Ovl in ep_intranode_1250x.hpp),
-            # which runs from four ranks up.
-            if cfg.world_size >= 4:
-                out_tok += land_rows * 8
-        regions = [
-            ("tok_off", 4),
-            # gfx1250 with the aggregated reservation: one 8-byte signal a source, its
-            # recv count + 1 and in the high word the push combine's landing offset of
-            # that source's rows here. Otherwise 4-byte count signals in the first half.
-            ("recv_num", 2 * cfg.world_size * 4),
-            ("recv_to_src_token", cap * 4),
-            ("out_idx", cap * topk * 4),
-            ("out_wts", cap * topk * 4),
-            ("disp_out", cap * cfg.token_nbytes),
-            ("out_tok", out_tok),
-            ("cross_device_barrier", cfg.world_size * 8),
-        ]
-        if self._scale_i32(cfg):
-            # Sized by the DESTINATION stride, which is the caller's row padded to
-            # 128 B: the kernel lays the rows down at that pitch, so an arena sized
-            # for the unpadded row would be overrun by the last tokens.
-            # Padded rows only land aligned if the region does; that is another
-            # file's constant, and lowering it reads as a perf regression.
+        # Sized by the plans themselves (EpRegion* in ep_cfg.hpp), every variant
+        # asked, so the arena covers each one.
+        regions = cb.arena_regions(
+            *self._disp_infos, *self._comb_infos, region_names=_REGIONS
+        )
+        ll = self._ll128_requests(cfg)
+        if ll is not None:
+            sizes = dict(regions)
+            for name, n in cb.arena_regions(
+                cb.EpDispatchPlan.describe(**ll[0]),
+                cb.EpCombinePlan.describe(**ll[1]),
+                region_names=self._ll128_split["region_names"],
+            ):
+                sizes[name] = max(sizes.get(name, 0), n)
+            regions = list(sizes.items())
+        if any(name == "out_scales" for name, _ in regions):
+            # The kernel lays scale rows down at a 128 B pitch, which only lands
+            # aligned if the region does; that is another file's constant.
             assert SymmArena._ALIGN % _SCALE_ALIGN == 0, (
                 f"SymmArena._ALIGN={SymmArena._ALIGN} does not keep scale regions "
                 f"{_SCALE_ALIGN} B-aligned; the padding in EpScaleStride buys nothing"
             )
-            regions.append(("out_scales", cap * self._scale_stride_i32(cfg) * 4))
         return regions
 
     def _asyncll_unsupported(self, cfg) -> tuple[str, ...]:
@@ -912,6 +905,68 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "async_ll_transport='lsa', which needs no engine)"
             )
         return tuple(bad)
+
+    def _plan_requests(self, cfg):
+        """(dispatch, combine) request fields every plan of this op shares."""
+        common = dict(
+            world_size=cfg.world_size,
+            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
+            num_expert_per_rank=cfg.num_experts_per_rank,
+            num_expert_per_token=cfg.num_experts_per_token,
+            max_recv=cfg.effective_max_recv,
+            use_weights=True,
+        )
+        # The two legs are separate Plans, so each carries its own dtype and its own
+        # element count -- which is what makes an asymmetric config (fp8/fp4 in,
+        # bf16 out) just two ordinary kernels. hiddenDim is "elements of THIS leg's
+        # dtype", so fp4 halves it: 2 e2m1 live in one transported byte.
+        disp = dict(
+            common,
+            hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
+            dtype=cfg.dispatch_dtype,
+            # Dword-padded: the kernel copies the row as dwords, and EpCfgIsValid
+            # rejects a Cfg whose row is not a whole number of them.
+            scale_bytes=self._scale_i32(cfg) * 4,
+        )
+        comb = dict(common, hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
+        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
+            comb["combine_fp4"] = True
+        if cfg.quant_type == "fp4_blockwise_fp32":
+            comb["combine_fp4_f32_scale"] = True
+        if cfg.quant_type == "fp8_blockwise":
+            comb["combine_fp8"] = True
+        geom = self._ll128_geom
+        if geom is not None and "dispatch" in geom:
+            disp.update(
+                ll128=True,
+                combine_fp4=comb.get("combine_fp4", False),
+                combine_fp8=comb.get("combine_fp8", False),
+            )
+            comb["ll128"] = True
+        elif geom is not None:
+            comb["ll128_combine_only"] = True
+        return disp, comb
+
+    def _ll128_requests(self, cfg):
+        split = self._ll128_split
+        if split is None:
+            return None
+        n = split["max_tok"]
+        disp, comb = self._plan_requests(cfg)
+        ll = dict(max_tok_per_rank=n, max_recv=cfg.world_size * n, ll128=True)
+        (disp_b, disp_w), (comb_b, comb_w) = split["dispatch"], split["combine"]
+        return (
+            dict(
+                disp,
+                **ll,
+                combine_fp4=comb.get("combine_fp4", False),
+                combine_fp8=comb.get("combine_fp8", False),
+                call_tok_max=n,
+                block_num=disp_b,
+                warp_per_block=disp_w,
+            ),
+            dict(comb, **ll, block_num=comb_b, warp_per_block=comb_w),
+        )
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
@@ -964,15 +1019,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # The C++ validator rejects a shrunk cap: the recv capacity is also the
         # flat-index stride, so an overflow re-encodes to the next peer instead
         # of merely overrunning the region.
-        # The push combine's landing offsets ride the aggregated reservation's
-        # dispatch signal, which TokOffExt turns off.
-        if cfg.quant_type in _PUSH_QUANT_TYPES and getattr(
-            self, "_tokoff_wanted", False
-        ):
-            bad.append(
-                f"quant_type={cfg.quant_type!r} needs the aggregated dispatch "
-                "reservation, which MORI_EP_TOKOFF_EXT=1 turns off"
-            )
         worst = cfg.world_size * cfg.max_num_inp_token_per_rank
         if cfg.effective_max_recv < worst:
             bad.append(
@@ -1716,56 +1762,47 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # slow and misleading.
             return KernelSet(dispatch={}, combine={}, unsupported=bad)
 
-        common = dict(
-            world_size=cfg.world_size,
-            max_tok_per_rank=cfg.max_num_inp_token_per_rank,
-            num_expert_per_rank=cfg.num_experts_per_rank,
-            num_expert_per_token=cfg.num_experts_per_token,
-            max_recv=cfg.effective_max_recv,
-            use_weights=True,
-            arena=arena,
-            region_names=_REGIONS,
-        )
-        # The two legs are separate Plans, so each carries its own dtype and its own
-        # element count -- which is what makes an asymmetric config (fp8/fp4 in,
-        # bf16 out) just two ordinary kernels. hiddenDim is "elements of THIS leg's
-        # dtype", so fp4 halves it: 2 e2m1 live in one transported byte.
-        disp_cfg = dict(
-            hidden_dim=cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
-            dtype=cfg.dispatch_dtype,
-            # Dword-padded: the kernel copies the row as dwords, and EpCfgIsValid
-            # rejects a Cfg whose row is not a whole number of them.
-            scale_bytes=self._scale_i32(cfg) * 4,
-        )
-        comb_cfg = dict(hidden_dim=cfg.hidden_dim, dtype=cfg.combine_dtype)
-        if cfg.quant_type in ("fp4_blockwise", "fp4_blockwise_fp32"):
-            comb_cfg["combine_fp4"] = True
-        if cfg.quant_type == "fp4_blockwise_fp32":
-            comb_cfg["combine_fp4_f32_scale"] = True
-        if cfg.quant_type == "fp8_blockwise":
-            comb_cfg["combine_fp8"] = True
+        disp_req, comb_req = self._plan_requests(cfg)
+        bound = dict(arena=arena, region_names=_REGIONS)
         # One plan per (block, warp) the schedule can select. Compilation happens
         # here and only here, so _pick never touches the compiler.
         dispatch, combine = {}, {}
         self._plans = []
-        # The RMWs on one slot word serialize in the cco window, so there a rank's
-        # blocks add up their tokens and reserve once per destination; in TokOffExt's
-        # allocation every block reserves its own.
-        ext = int(getattr(self, "_tokoff_wanted", False))
         for b, w in self._dispatch_specs:
-            plan = cb.EpDispatchPlan(
-                **common, **disp_cfg, block_num=b, warp_per_block=w, tok_off_ext=ext
-            )
-            plan.bind(rank=cfg.rank)
-            if self.dispatch_staging is not None:
-                plan.bind(staging_base=self.dispatch_staging.data_ptr())
-            self._plans.append(plan)
-            dispatch[(b, w)] = self._wrap_dispatch(plan)
+            sized = []
+            for cap in self._dispatch_caps(cfg, (b, w)):
+                plan = cb.EpDispatchPlan(
+                    **disp_req,
+                    **bound,
+                    block_num=b,
+                    warp_per_block=w,
+                    call_tok_max=cap,
+                )
+                plan.bind(rank=cfg.rank)
+                if self.dispatch_staging is not None:
+                    plan.bind(staging_base=self.dispatch_staging)
+                self._plans.append(plan)
+                sized.append((cap, plan))
+            dispatch[(b, w)] = self._wrap_dispatch(sized)
         for b, w in self._combine_specs:
-            plan = cb.EpCombinePlan(**common, **comb_cfg, block_num=b, warp_per_block=w)
+            plan = cb.EpCombinePlan(**comb_req, **bound, block_num=b, warp_per_block=w)
             plan.bind(rank=cfg.rank)
             self._plans.append(plan)
             combine[(b, w)] = self._wrap_combine(plan)
+        ll = self._ll128_requests(cfg)
+        if ll is not None:
+            ll_bound = dict(arena=arena, region_names=self._ll128_split["region_names"])
+            plan = cb.EpDispatchPlan(**ll[0], **ll_bound)
+            plan.bind(rank=cfg.rank)
+            if self.dispatch_staging is not None:
+                plan.bind(staging_base=self.dispatch_staging)
+            self._plans.append(plan)
+            n = self._ll128_split["max_tok"]
+            dispatch[_LL_SPEC] = self._wrap_dispatch([(n, plan)], ll=True)
+            plan = cb.EpCombinePlan(**ll[1], **ll_bound)
+            plan.bind(rank=cfg.rank)
+            self._plans.append(plan)
+            combine[_LL_SPEC] = self._wrap_combine(plan, ll=True)
 
         return KernelSet(
             dispatch=dispatch,
@@ -1779,17 +1816,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
         )
 
+    def reset(self):
+        super().reset()
+        self._recv.zero_()
+        if self._ll_recv is not None:
+            self._ll_recv.zero_()
+
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
             plan.close()
         # After the plans: they carry staging_base by value, so nothing may still be
         # able to launch when the tensor behind it goes.
         self.dispatch_staging = None
-        ext = getattr(self, "_tokoff_ext", None)
-        if ext is not None:
-            self._tokoff_ext = None
-            self.tok_off_peers = None
-            ext.close()
         # After the plans: they embed the ccoDevComm by value and their kernels
         # dereference its QPs. The static args cache the host struct's address, so
         # it goes too -- nothing may re-read it once the handle is gone.
@@ -1825,18 +1863,23 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self._ASYNCLL_VIEW_REGION.get(name, internode)
         return internode if self.cfg.is_internode else intranode
 
+    def _recv_region(self, name):
+        if self._ll_last:
+            return "ll_" + name, self._ll_recv_cap
+        return self._region(name), self._recv_cap
+
     def recv_tokens(self):
-        view = self._views.get("recv_tokens")
+        key = "ll_recv_tokens" if self._ll_last else "recv_tokens"
+        view = self._views.get(key)
         if view is not None:
             return view
         # fp4 packs 2 e2m1 per element of the torch dtype -> last dim is hidden/2.
         cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
+        region, rows = self._recv_region("disp_out")
         view = from_gpu_ptr(
-            self.arena.local_ptr(self._region("disp_out")),
-            (self._recv_cap, cols),
-            self.cfg.dispatch_dtype,
+            self.arena.local_ptr(region), (rows, cols), self.cfg.dispatch_dtype
         )
-        self._views["recv_tokens"] = view
+        self._views[key] = view
         return view
 
     def combine_in_view(self):
@@ -1851,25 +1894,29 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_weights(self):
-        view = self._views.get("recv_weights")
+        key = "ll_recv_weights" if self._ll_last else "recv_weights"
+        view = self._views.get(key)
         if view is None:
+            region, rows = self._recv_region("out_wts")
             view = from_gpu_ptr(
-                self.arena.local_ptr(self._region("out_wts")),
-                (self._recv_cap, self.cfg.num_experts_per_token),
+                self.arena.local_ptr(region),
+                (rows, self.cfg.num_experts_per_token),
                 torch.float32,
             )
-            self._views["recv_weights"] = view
+            self._views[key] = view
         return view
 
     def recv_indices(self):
-        view = self._views.get("recv_indices")
+        key = "ll_recv_indices" if self._ll_last else "recv_indices"
+        view = self._views.get(key)
         if view is None:
+            region, rows = self._recv_region("out_idx")
             view = from_gpu_ptr(
-                self.arena.local_ptr(self._region("out_idx")),
-                (self._recv_cap, self.cfg.num_experts_per_token),
+                self.arena.local_ptr(region),
+                (rows, self.cfg.num_experts_per_token),
                 torch.int32,
             )
-            self._views["recv_indices"] = view
+            self._views[key] = view
         return view
 
     def recv_scales(self):
@@ -1881,20 +1928,22 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         path, packed on the internode one. Anything reading the region by pointer
         needs that pitch, not this shape.
         """
-        view = self._views.get("recv_scales")
+        key = "ll_recv_scales" if self._ll_last else "recv_scales"
+        view = self._views.get(key)
         if view is not None:
             return view
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
         stride_i32 = self.scale_stride_bytes() // 4
+        region, n = self._recv_region("out_scales")
         rows = from_gpu_ptr(
-            self.arena.local_ptr(self._region("out_scales")),
-            (self._recv_cap, stride_i32),
+            self.arena.local_ptr(region),
+            (n, stride_i32),
             torch.int32,
         )
         view = rows[:, :n_i32]
-        self._views["recv_scales"] = view
+        self._views[key] = view
         return view
 
     def local_expert_count(self):
@@ -1912,8 +1961,41 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     # -- kernel adapters: the ctypes plan -> the base's named convention --
 
-    def _wrap_dispatch(self, plan):
-        def run(*, input, indices, weights, scales, dest_map, num_tokens):
+    def _dispatch_caps(self, cfg, spec):
+        cap = int(cfg.max_num_inp_token_per_rank)
+        if (
+            not self._is1250
+            or not cfg.schedule
+            or cfg.world_size < 16
+            or (self._ll128_geom is not None and "dispatch" in self._ll128_geom)
+        ):
+            return [cap]
+        caps = {
+            cap if edge is None else min(int(edge), cap)
+            for (edge, db, dw, _, _) in cfg.schedule
+            if (db, dw) == spec
+        }
+        if not caps or (cfg.schedule[-1][1], cfg.schedule[-1][2]) == spec:
+            caps.add(cap)
+        return sorted(caps)
+
+    def _wrap_dispatch(self, sized, ll=False):
+        def run(
+            *,
+            input,
+            indices,
+            weights,
+            scales,
+            dest_map,
+            num_tokens,
+        ):
+            plan = next((p for c, p in sized if num_tokens <= c), None)
+            if plan is None:
+                raise ValueError(
+                    f"dispatch of {num_tokens} tokens is past this variant's largest "
+                    f"call size {sized[-1][0]}"
+                )
+            count = self._ll_recv if ll else self._recv
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 token_indices=indices,
@@ -1922,24 +2004,41 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 scales_buf=scales,
                 disp_dest_tok_id_map=dest_map,
                 dest_pe_token_counter=self.dest_pe_counter,
-                # None -> 0 -> the window's offTokOff (MORI_EP_TOKOFF_EXT off)
-                tok_off_peers=getattr(self, "tok_off_peers", None),
-                total_recv_token_num=self.total_recv,
+                total_recv_token_num=count,
                 grid_barrier=self.dispatch_barrier,
                 num_tokens=num_tokens,
             )
+            self.total_recv = count
+            self._ll_last = ll
 
         return run
 
-    def _wrap_combine(self, plan):
+    def _wrap_combine(self, plan, ll=False):
         push = self.cfg.quant_type in _PUSH_QUANT_TYPES
+        src_ptr = self.arena.local_ptr(
+            "ll_recv_to_src_token" if ll else "recv_to_src_token"
+        )
+        idx_ptr = self.arena.local_ptr("ll_out_idx" if ll else "out_idx")
+        clears = ll or self._ll128_geom is not None
 
-        def run(*, input, dest_map, total_recv, num_tokens, want_weights=False):
+        def run(
+            *,
+            input,
+            dest_map,
+            total_recv,
+            num_tokens,
+            want_weights=False,
+            recv_to_src=None,
+            recv_idx=None,
+        ):
             if want_weights and push:
                 raise NotImplementedError(
                     f"quant_type={self.cfg.quant_type!r} folds no weights; call combine "
                     "with weights=None"
                 )
+            own = total_recv is self._recv or total_recv is self._ll_recv
+            if clears and not own:
+                total_recv = total_recv.clone()
             plan.launch(
                 stream=torch.cuda.current_stream().cuda_stream,
                 inp_token_buf=input,
@@ -1952,6 +2051,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 grid_barrier=self.combine_barrier,
                 xdb_flag=self.cross_device_flag,
                 combine_barrier_fan=self.combine_barrier_fan,  # None on non-gfx1250 -> 0
+                recv_to_src=src_ptr if recv_to_src is None else recv_to_src.data_ptr(),
+                recv_idx=idx_ptr if recv_idx is None else recv_idx.data_ptr(),
                 num_tokens=num_tokens,
             )
 
@@ -1964,10 +2065,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             )
         view = self._views.get("push_landing")
         if view is None:
+            info = next((i for i in self._comb_infos if "pushLandRows" in i), None)
+            if info is None:
+                raise RuntimeError(
+                    f"no landing rows: none of this op's {len(self._comb_infos)} "
+                    "combine plans reports a push landing (info['pushLandRows'])"
+                )
             view = from_gpu_ptr(
-                self.arena.local_ptr("out_tok")
-                + self._recv_cap * self.cfg.combine_token_nbytes,
-                (push_land_rows(self.cfg), push_wire_nbytes(self.cfg)),
+                self.arena.local_ptr("out_tok") + info["pushLandOff"],
+                (info["pushLandRows"], info["pushWireBytes"]),
                 torch.uint8,
             )
             self._views["push_landing"] = view

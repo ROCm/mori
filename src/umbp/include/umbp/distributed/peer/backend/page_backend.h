@@ -225,10 +225,12 @@ class PageBackend : public MediumBackend {
   // This is the one Init() actually works against; the OwnershipConfig overload
   // funnels into it, so DRAM and HBM share a single allocation/registration
   // path rather than two that must be kept in step.
+  // NUMA labels steer the allocator; the source owns physical binding.
   PageBackend(TierType tier, uint64_t page_size, std::unique_ptr<PageMemorySource> source,
               std::vector<uint64_t> buffer_sizes, std::chrono::milliseconds pending_ttl,
               std::chrono::milliseconds read_lease_ttl = std::chrono::milliseconds{500},
-              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200});
+              std::chrono::milliseconds reaper_interval = std::chrono::milliseconds{200},
+              uint64_t max_mr_bytes = kDefaultDramMaxMrBytes, std::vector<int> numa_nodes = {});
 
   ~PageBackend() override;
 
