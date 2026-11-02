@@ -19,17 +19,18 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Shared checkout selection and graph timing for GEMM + AG benchmarks."""
+"""Shared graph timing for GEMM + AG benchmarks.
 
-from pathlib import Path
+Deliberately does not put the checkout's ``python/`` on ``sys.path``: that
+shadows the installed package, and from a non-editable install -- what CI
+builds -- the source tree has no compiled ``mori.cco.cco``, so every benchmark
+process died on import. Use the installed mori, or set ``PYTHONPATH``.
+"""
+
 import statistics
-import sys
 
 import torch
 import torch.distributed as dist
-
-ROOT = Path(__file__).resolve().parents[4]
-sys.path.insert(0, str(ROOT / "python"))
 
 
 def positive_int(value):

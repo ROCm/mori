@@ -10,13 +10,16 @@ below use FP32 accumulation, output and communication.
 
 ## Environment
 
-Run from the repository root, using its installed Python environment:
+Run from the repository root, with mori installed (`pip install .`, or `-e`
+for an editable checkout):
 
 ```bash
-export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 export MORI_ENABLE_SDMA=1
 export MORI_SOCKET_IFNAME=lo
 ```
+
+Do not point `PYTHONPATH` at the checkout's `python/` over a regular install:
+the source tree has no compiled `mori.cco.cco` and every import fails.
 
 The SDMA modes also need a mori built with `BUILD_CCO_SDMA=ON`, the default
 since #710. It is a build flag: exporting it when running does nothing.
