@@ -244,11 +244,14 @@ struct ccoGda {
   __device__ inline void flush(int peer, Coop coop = Coop{});
 
   // flushAsync: snapshot this peer's QP progress and return a request handle
-  // that wait() can later be used to wait on individually.
+  // that wait() can later be used to wait on individually. It rings up to the
+  // snapshot, so it may wait for posts on the QP still writing their WQEs; only
+  // the CQ drain is left to wait(). The request is valid in the coop leader.
   template <ccoTeamMode TeamMode = CCO_TEAM_WORLD, typename Coop = ccoCoopThread>
   __device__ inline void flushAsync(int peer, ccoGdaRequest_t* outRequest, Coop coop = Coop{});
 
-  // wait: block on a request handle previously returned by flushAsync.
+  // wait: block on a request handle previously returned by flushAsync, called
+  // with the same coop (the leader's request is the one waited on).
   template <typename Coop = ccoCoopWarp>
   __device__ inline void wait(ccoGdaRequest_t& request, Coop coop = Coop{});
 };
@@ -559,9 +562,11 @@ __device__ inline static uint32_t warpAggregateBnxtPsn(core::WorkQueueHandle* wq
 // this", which quietUntil's MSN cap and the SQ space check rely on. The sweep
 // only crosses a slot whose mark carries that slot's own index, so it never rings
 // for a WQE that is reserved but not yet written -- the bug that removed the old
-// deferred doorbell (#625). A mark left from an earlier lap of the ring carries
-// an index sqWqeNum lower, and a never-written mark has count 0, so neither
-// matches.
+// deferred doorbell (#625). Every post rewrites the tag at its first slot -- its
+// mark, or count 0 on the fast path -- so where a post starts the tag is at most
+// a lap old and carries an index sqWqeNum lower; a never-written one has count 0.
+// Neither matches. (Without the fast-path write, a mark could outlive 2^32 WQEs
+// of fast-path posts and match its index again.)
 
 __device__ inline static uint64_t readyTag(uint32_t base, uint32_t count) {
   return (static_cast<uint64_t>(base) << 32) | count;
@@ -633,7 +638,11 @@ __device__ inline static bool tryLockDoorbell(core::WorkQueueHandle* wq) {
 // coherent (agent-scope atomic) store, so waiting for it to complete is enough;
 // a release here would also write back L2.
 __device__ inline static void unlockDoorbell(core::WorkQueueHandle* wq) {
+#if defined(__GFX12__)
+  __asm__ volatile("s_wait_storecnt 0x0" ::: "memory");  // gfx12 has no s_waitcnt
+#else
   __builtin_amdgcn_s_waitcnt(0);
+#endif
   __hip_atomic_store(&wq->postSendLock, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
@@ -736,6 +745,9 @@ __device__ inline static void submitWqes(core::RdmaEndpointDevice* ep, uint32_t 
   core::WorkQueueHandle* wq = &ep->wqHandle;
   if constexpr (!DeferDoorbell) {
     if (__hip_atomic_load(&wq->dbTouchIdx, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) == base) {
+      // Retire this slot's old mark (see "Doorbell coalescing"); count 0 never matches.
+      __hip_atomic_store(&wq->readyMarks[base & (wq->sqWqeNum - 1)].tag, readyTag(base, 0),
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       __threadfence_system();  // our WQEs, before the doorbell
       ringAndPublish<PrvdType>(ep, base, base + count, dbrVal);
       return;
@@ -1256,14 +1268,14 @@ __device__ inline void ccoGda<PrvdType>::put(int peer, ccoWindow_t dstWin, size_
       signalOpArg = remoteAction.value;
     }
 
-    // Only mixed-peer thread scope needs per-peer grouping; ThreadAggregate and
+    // Only mixed-QP thread scope needs per-QP grouping; ThreadAggregate and
     // CoopWarp/CoopBlock are a single group.
     if constexpr (ThreadMode == ccoGdaThreadIndependent && std::is_same_v<Coop, ccoCoopThread>) {
-      // Group active lanes by peer: each peer reserves contiguously + one doorbell.
+      // Group active lanes by QP (peer and context): each reserves contiguously.
       bool needTurn = true;
       for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
-        if (peer != __shfl(peer, lead)) continue;
+        if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
         impl::putImpl<PrvdType, kDefer>(ep, qpn, localAddr, srcLkey, remoteAddr, dstRkey, bytes,
                                         hasSignal, signalRaddr, signalRkey, signalOp, signalOpArg);
@@ -1330,12 +1342,12 @@ __device__ inline void ccoGda<PrvdType>::putValue(int peer, ccoWindow_t dstWin, 
       signalOpArg = remoteAction.value;
     }
 
-    // Only mixed-peer thread scope needs per-peer grouping; else a single group.
+    // Only mixed-QP thread scope needs per-QP grouping; else a single group.
     if constexpr (ThreadMode == ccoGdaThreadIndependent && std::is_same_v<Coop, ccoCoopThread>) {
       bool needTurn = true;
       for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
-        if (peer != __shfl(peer, lead)) continue;
+        if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
         impl::putValueImpl<PrvdType, T, kDefer>(ep, qpn, remoteAddr, dstRkey, value, hasSignal,
                                                 signalRaddr, signalRkey, signalOp, signalOpArg);
@@ -1379,12 +1391,12 @@ __device__ inline void ccoGda<PrvdType>::get(int peer, ccoWindow_t remoteWin, si
     core::RdmaEndpointDevice* ep = &ibgda->endpoints[qpIdx];
     uint32_t qpn = ep->qpn;
 
-    // Only mixed-peer thread scope needs per-peer grouping; else a single group.
+    // Only mixed-QP thread scope needs per-QP grouping; else a single group.
     if constexpr (ThreadMode == ccoGdaThreadIndependent && std::is_same_v<Coop, ccoCoopThread>) {
       bool needTurn = true;
       for (uint64_t turns = __ballot(needTurn); turns != 0; turns = __ballot(needTurn)) {
         int lead = __ffsll(static_cast<unsigned long long>(turns)) - 1;
-        if (peer != __shfl(peer, lead)) continue;
+        if (qpIdx != __shfl(qpIdx, lead)) continue;
         needTurn = false;
         impl::getImpl<PrvdType, kDefer>(ep, qpn, localAddr, localLkey, remoteAddr, remoteRkey,
                                         bytes);
@@ -1511,11 +1523,7 @@ __device__ inline void ccoGda<PrvdType>::flushAsync(int peer, ccoGdaRequest_t* o
 template <core::ProviderType PrvdType>
 template <typename Coop>
 __device__ inline void ccoGda<PrvdType>::wait(ccoGdaRequest_t& request, Coop coop) {
-  static_assert(!std::is_same_v<Coop, ccoCoopThread>,
-                "wait() requires at least ccoCoopWarp, for consistency with flush(). "
-                "The pollCqLock hazard no longer applies here — the body is a pure poll and "
-                "quietUntil groups active lanes by CQ — so this one is relaxable if a "
-                "per-thread caller ever needs it.");
+  // ccoCoopThread: each lane waits on its own request (quietUntil groups lanes by CQ).
   coop.sync();
   if (coop.thread_rank() == 0) {
     ccoIbgdaContext* ibgda = reinterpret_cast<ccoIbgdaContext*>(_gdaHandle);
