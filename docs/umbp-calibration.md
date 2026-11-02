@@ -58,6 +58,8 @@ SSD sampling requires an explicit writable `--ssd-dir` on the device being calib
 not NFS or tmpfs. The probe creates and removes only its own temporary child directory.
 `--ssd-io posix|io_uring`, `--ssd-durability relaxed|strict` and `--ssd-no-crc`
 select the real tier configuration; durability defaults to `strict`, matching UMBP.
+With CRC disabled, staged-read measurements use `file_cpu_staged_no_crc` so training
+and validation select the same no-CRC curve; an unmeasured CRC curve remains an estimate.
 The probe defaults to `posix`, whereas UMBP defaults to `io_uring`; select the same
 backend as the deployment when calibrating staged I/O. Unavailable `io_uring` fails
 explicitly, including when a container's seccomp policy blocks it.

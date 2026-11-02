@@ -109,7 +109,7 @@ def fit_profile(records, threads, *, log_size=False, staging=False):
                 row.get("segments", row["batch"]),
             )
             groups[key].append(row["elapsed_ns"])
-    width = 3 + 2 * log_size
+    width = 5 if log_size else 3
     curves = {}
     stage_curve = {}
     for p in threads:
@@ -224,9 +224,8 @@ def fit_paths(records, threads, base, *, ssd_io="posix"):
             }
         registrations = [
             row["elapsed_ns"]
-            for row in records
-            if row.get("path") == name
-            and row.get("api") == "register"
+            for row in selected
+            if row.get("api") == "register"
             and row["phase"] == "train"
             and row["mode"] == "real"
             and row.get("concurrency", 1) == 1
@@ -430,7 +429,8 @@ def main():
         if remote
         else None
     )
-    base_paths = json.loads(args.base_profile.read_text())["paths"]
+    base_profile = args.base_profile.read_bytes()
+    base_paths = json.loads(base_profile)["paths"]
     env = dict(
         os.environ, MORI_UMBP_LOG_LEVEL="warn", UMBP_HBM_GATHER_PREWARM_STREAMS="0"
     )
@@ -655,9 +655,7 @@ def main():
         report = {
             "profile_id": profile["id"],
             "profile_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
-            "base_profile_sha256": hashlib.sha256(
-                args.base_profile.read_bytes()
-            ).hexdigest(),
+            "base_profile_sha256": hashlib.sha256(base_profile).hexdigest(),
             "path_sources": {
                 p: "measured" if p in measured_paths else "estimate"
                 for p in profile["paths"]

@@ -21,6 +21,7 @@
 # SOFTWARE.
 """Check calibration math without a UMBP build or performance assertions in CI."""
 
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -361,17 +362,33 @@ def test_comparison_keeps_direct_staged_and_memory_paths_separate():
 
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize(
-    "path", ["cpu_cpu", "cpu_gpu", "file_cpu", "file_cpu_staged", "remote_read"]
+    "path,no_crc",
+    [
+        ("cpu_cpu", False),
+        ("cpu_gpu", False),
+        ("file_cpu", False),
+        ("file_cpu_staged", False),
+        ("file_cpu_staged", True),
+        ("remote_read", False),
+    ],
 )
 def test_custom_grids_reach_probe_and_keep_validation_independent(
-    tmp_path, monkeypatch, overlap, path
+    tmp_path, monkeypatch, overlap, path, no_crc
 ):
     probe = tmp_path / "probe"
     probe.touch()
     output = tmp_path / "output"
+    base = Path(calibrate.__file__).with_name("sim_profile.json").read_bytes()
+    if no_crc:
+        estimates = json.loads(base)
+        estimates["paths"][path] = estimates["paths"]["file_cpu"]
+        base = json.dumps(estimates).encode()
+    base_profile = tmp_path / "base-profile.json"
+    base_profile.write_bytes(base)
     train = [4096, 65536, 1048576]
     validation = [4096] if overlap else [8192, 131072]
     argv = ["calibrate", "--probe", str(probe), "--output", str(output)]
+    argv += ["--base-profile", str(base_profile)]
     argv += "--cpus 0,1,2,3 --threads 1 --concurrency 1 --rounds 1 --max-mib 1".split()
     argv += ["--paths", path]
     remote = path.startswith("remote_")
@@ -396,6 +413,8 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
         monkeypatch.setattr(calibrate.subprocess, "Popen", start_owner)
     if "file" in path:
         argv += ["--ssd-dir", str(tmp_path), "--ssd-read-prefill-mib", "256"]
+    if no_crc:
+        argv.append("--ssd-no-crc")
     argv += ["--train-block-bytes", *map(str, train), "--train-batches", "1", "8", "32"]
     argv += [
         "--validation-block-bytes",
@@ -409,8 +428,12 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
     phases = set()
 
     def run(command, **kwargs):
+        # Provenance must describe the loaded base, not a later version of the file.
+        base_profile.write_text("changed during sampling")
         phase = command[command.index(str(probe)) + (5 if remote else 1)]
         selected_path = path if remote else command[command.index("--path") + 1]
+        if selected_path == "file_cpu_staged" and "--ssd-no-crc" in command:
+            selected_path += "_no_crc"
         assert command[2] == ("0" if path == "cpu_cpu" else "0,1,2,3")
         phases.add(phase)
         blocks = train if phase == "train" else validation
@@ -419,6 +442,7 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
         assert command[command.index("--batches") + 1] == ",".join(map(str, batches))
         assert command[command.index("--max-mib") + 1] == ("128" if remote else "1")
         if "file" in path:
+            assert ("--ssd-no-crc" in command) == no_crc
             assert command[command.index("--ssd-dir") + 1] == str(tmp_path)
             assert command[command.index("--ssd-durability") + 1] == "strict"
             assert command[command.index("--ssd-api-settle-ms") + 1] == "0"
@@ -454,6 +478,7 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
             else {"train", "engine", "api"}
         )
         report = json.loads((output / "report.json").read_text())
+        assert report["base_profile_sha256"] == hashlib.sha256(base).hexdigest()
         assert report["workloads"]["validation"]["block-bytes"] == validation
         assert {r["block_bytes"] for r in report["comparisons"]} == set(validation)
         if path.endswith("_staged"):
@@ -462,10 +487,18 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
             assert report["ssd"]["tier_io_threads"] == 4
             profile = json.loads((output / "profile.json").read_text())
             assert "file_cpu_staged_no_crc" in profile["paths"]
-            assert not any(
-                r["path"].endswith("_no_crc") and r["phase"] == "api"
-                for r in report["comparisons"]
+            assert (
+                any(
+                    r["path"].endswith("_no_crc") and r["phase"] == "api"
+                    for r in report["comparisons"]
+                )
+                == no_crc
             )
+            if no_crc:
+                assert profile["paths"][path] == estimates["paths"][path]
+                assert report["path_sources"][path] == "estimate"
+                assert report["path_sources"][path + "_no_crc"] == "measured"
+                assert all(r["path"] == path + "_no_crc" for r in report["comparisons"])
             assert {
                 r["caller_gpu"] for r in report["comparisons"] if r["phase"] == "api"
             } == {0, 1}

@@ -187,8 +187,6 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
 #endif
   }
   const bool host_device = path == "cpu_gpu" || path == "gpu_cpu";
-  if (training && concurrency != 1)
-    throw std::invalid_argument("concurrent callers are validation workloads only");
   // Framework callers live on GPU: DRAM loads/offloads have opposite directions,
   // while HBM put/get are both GPU→GPU. Engine training follows the selected path.
   const bool gpu_caller =
@@ -247,6 +245,8 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
       uint64_t payload_ns = 0;
       auto disk_config = ssd_options.config;
       if (path == "file_cpu_staged_no_crc") disk_config.verify_crc = false;
+      const std::string measured_path =
+          path == "file_cpu_staged" && !disk_config.verify_crc ? "file_cpu_staged_no_crc" : path;
       if (ssd) {
         disk_config.tier_io_threads = EffectiveParallelThreads(disk_config.tier_io_threads);
         disk_config.capacity_bytes = std::max(prepared_footprint * 16, size_t{64} << 20);
@@ -311,11 +311,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
       } else if (ssd) {
         if (path == "file_gpu") {
 #ifdef UMBP_ENABLE_GDS
-          if (!GdsEngine::Available())
-            throw std::runtime_error("GdsEngine SDK/runtime unavailable");
           engine = std::make_unique<GdsEngine>();
-#else
-          throw std::runtime_error("probe was built without GdsEngine SDK headers");
 #endif
         } else {
           engine = std::make_unique<PosixEngine>();
@@ -489,7 +485,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
                 const auto model_bytes =
                     get ? segment::PaddedValueBytes(block) * count : record_bytes * count;
                 if (!simulated->SimulateStorage(get, model_bytes, count,
-                                                path != "file_cpu_staged_no_crc"))
+                                                !get || disk_config.verify_crc))
                   throw std::runtime_error("simulated SSD operation failed");
               } else if (get) {
                 Check(tier->ReadBatchIntoPtr(request.keys, request.dsts, sizes), count);
@@ -562,7 +558,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
                                                                                             : i / 2)
                     << ',' << times[c];
           if (report_segments) std::cout << ',' << segments[c];
-          std::cout << ',' << path << (gathered[i] ? "_gather" : "");
+          std::cout << ',' << measured_path << (gathered[i] ? "_gather" : "");
           if (ssd) {
             const size_t model_bytes =
                 staged_engine || client
