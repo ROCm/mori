@@ -71,12 +71,40 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   const bool isDispatch = kind == EpKernelKind::Dispatch;
   // Only the gfx125x dispatch body implements it; everywhere else the Cfg, and so
   // the rendered source and its cache key, stays exactly what it was without it.
-  c.aggReserve = isDispatch && !req.tokOffExt && arch.rfind("gfx125", 0) == 0;
+  c.aggReserve = isDispatch && arch.rfind("gfx125", 0) == 0;
+  c.callTokMax = isDispatch && arch.rfind("gfx125", 0) == 0 && req.callTokMax > 0 &&
+                         req.callTokMax < req.maxTokPerRank
+                     ? req.callTokMax
+                     : 0;
   c.blockNum = 64;
   c.warpPerBlock = isDispatch ? 16 : 8;
 
   if (req.blockNum > 0) c.blockNum = req.blockNum;
   if (req.warpPerBlock > 0) c.warpPerBlock = req.warpPerBlock;
+
+  if (req.ll128) {
+    const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
+    const bool bf16 = !req.combineFp4 && !req.combineFp8 &&
+                      (req.dtype == EpDType::Bf16 || (isDispatch && req.dtype == EpDType::Fp8));
+    if (arch.rfind("gfx125", 0) != 0 || !(pushE8m0 || bf16) || req.maxTokPerRank > 512 ||
+        c.waveSize != 32 || c.blockNum > (isDispatch ? 128 : 256)) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128 needs gfx125x, the fp4 / fp8 push combine with e8m0 scales or a bf16 "
+          "combine with a bf16 / fp8 dispatch, at most 512 tokens a rank, wave32, and at most 128 "
+          "dispatch / 256 combine blocks");
+    }
+    c.ll128 = true;
+  }
+  if (req.ll128CombineOnly && !isDispatch) {
+    const bool pushE8m0 = req.combineFp8 || (req.combineFp4 && !req.combineFp4F32Scale);
+    if (req.ll128 || arch.rfind("gfx125", 0) != 0 || !pushE8m0 || c.waveSize != 32 ||
+        c.blockNum > 256) {
+      throw std::runtime_error(
+          "mori v2 ep: ll128CombineOnly needs gfx125x, the fp4 / fp8 push combine with e8m0 "
+          "scales, wave32, at most 256 combine blocks, and no ll128");
+    }
+    c.ll128CombineOnly = true;
+  }
 
   // The byte types are transport-only. Dispatch copies its payload untouched,
   // but combine sums across sources, so a byte type there would compile and
@@ -151,13 +179,9 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
   // text, same sha256, same cache entry.
   std::string scaleDefs;
   if (cfg.scaleBytes > 0) {
-    // ROWS is the per-peer stride: the staging is indexed peer*ROWS + destTokId, so
-    // it has to be the peer's full receive capacity and not the smaller per-peer
-    // share of the idx/wt pool. BYTES is the caller's row, STRIDE what we lay it
-    // down at: staging reads one and writes the other.
     scaleDefs = "#define MORI_EP_SCALE_BYTES " + std::to_string(cfg.scaleBytes) +
                 "\n#define MORI_EP_SCALE_STRIDE " + std::to_string(EpScaleStride(cfg)) +
-                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpMaxRecv(cfg)) + "\n";
+                "\n#define MORI_EP_SCALE_ROWS " + std::to_string(EpScaleRows(cfg)) + "\n";
   }
   std::string worldDef = "#define MORI_EP_WORLD_SIZE " + std::to_string(cfg.worldSize) + "\n" +
                          "#define MORI_EP_MAX_RECV " + std::to_string(EpMaxRecv(cfg)) + "\n";
@@ -189,8 +213,11 @@ std::string EpKv(const char* key, size_t value) {
 // regions the other kernel's Cfg sizes.
 std::string EpRegionInfo(const EpCfg& c, EpKernelKind kind) {
   const bool disp = kind == EpKernelKind::Dispatch;
-  return EpKv("region.tokOff", EpRegionTokOffBytes(c)) +
-         EpKv("region.recvNum", EpRegionRecvNumBytes(c)) +
+  const size_t tokOff = !disp            ? EpRegionTokOffBytes(c)
+                        : c.ll128        ? EpLl128StageBytes(c)
+                        : EpArchIs1250() ? EpRegionTokOff1250xBytes(c)
+                                         : EpRegionTokOffBytes(c);
+  return EpKv("region.tokOff", tokOff) + EpKv("region.recvNum", EpRegionRecvNumBytes(c)) +
          EpKv("region.recvToSrc", EpRegionRecvToSrcBytes(c)) +
          EpKv("region.outIdx", EpRegionOutIdxBytes(c)) +
          EpKv("region.outWts", EpRegionOutWtsBytes(c)) +

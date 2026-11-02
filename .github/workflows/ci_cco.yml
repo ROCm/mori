@@ -103,7 +103,7 @@ jobs:
             cd $GITHUB_WORKSPACE && \
             for t in test_sdma_put test_sdma_get test_sdma_put_mt test_sdma_block test_sdma_edge \
                      test_sdma_signal test_sdma_warp_issue test_sdma_put2d \
-                     test_sdma_put2d_shapes; do \
+                     test_sdma_put2d_shapes test_sdma_wait_broadcast; do \
               echo \"=== \$t ===\" && \
               out=\$(timeout 240 ./build/tests/cpp/cco/\$t 8 2>&1) || { echo \"\$out\"; exit 1; }; \
               echo \"\$out\"; \
@@ -218,6 +218,18 @@ jobs:
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_op.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_gemm_ar_schedule.py \
               $GITHUB_WORKSPACE/tests/python/cco/test_flydsl_ar.py"
+
+      - name: Run CCO GEMM+A2A numerics and the recv-reuse race (8 ranks)
+        run: |
+          # From /tmp for the same packaging reason as above. test_gemm_a2a.py
+          # is the layout on the CPU; test_gemm_a2a_op.py runs the wrapper on 8
+          # ranks, including the race the recv-reuse credit exists for and its
+          # negative control with the credit off.
+          $CT exec -e MORI_ENABLE_SDMA=1 -e MORI_SOCKET_IFNAME=lo $CONTAINER bash -c "\
+            cd /tmp && python -c 'import mori.ops.gemm_a2a as g; print(g.GemmA2AOp)' && \
+            timeout 1800 python -m pytest -v \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a.py \
+              $GITHUB_WORKSPACE/tests/python/cco/test_gemm_a2a_op.py"
 
       - name: Run CCO GEMM+AR benchmark (8 ranks, accuracy-gated)
         run: |

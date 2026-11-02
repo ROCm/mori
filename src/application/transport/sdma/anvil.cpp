@@ -146,50 +146,85 @@ std::tuple<uint32_t, uint32_t, bool> locIdAndDomainForNode(int node) {
   return std::tuple{locId, domain, true};
 }
 
-// hsa_iterate_agents (SetUp) enumerates ALL physical GPU agents in HSA order,
-// which is NOT filtered by HIP_VISIBLE_DEVICES. The srcDeviceId/deviceId that the
-// collective passes in is a HIP device ORDINAL (indexes only visible devices).
-// When the two diverge (e.g. HIP_VISIBLE_DEVICES=4,5,6,7) indexing gpuAgents_ by
-// the raw HIP ordinal selects the WRONG physical GPU -> the SDMA queue is created
-// on the wrong KFD node while the compute kernel runs on the intended GPU ->
-// "Memory access fault by GPU node-N". Match HIP ordinal -> HSA agent by PCI BDF
-// so the selection is correct in all cases. In the common HIP_VISIBLE_DEVICES=
-// 0..N-1 case this resolves to the identity map (BDF matches at the same index)
-// so the default path is behavior-identical.
-hsa_agent_t gpuAgentForHipDevice(int hipDeviceId) {
-  static std::mutex mapMutex;
-  static std::unordered_map<int, int> hipToAgent;
-  std::lock_guard<std::mutex> lock(mapMutex);
-  auto it = hipToAgent.find(hipDeviceId);
-  if (it != hipToAgent.end()) return gpuAgents_[it->second];
+// "name value" pairs of a KFD sysfs properties file. Empty if the file is missing,
+// or if KFD refuses the read (EPERM) because it belongs to a GPU the device cgroup
+// keeps from this process.
+std::unordered_map<std::string, uint64_t> readKfdProperties(std::istream& in) {
+  std::unordered_map<std::string, uint64_t> props;
+  std::string key, val;
+  while (in >> key >> val) props[key] = std::strtoull(val.c_str(), nullptr, 0);
+  return props;
+}
 
-  // BDF of the HIP device, parsed from its "domain:bus:device.function" string.
-  uint32_t hipBdf = getBusId(hipDeviceId);
-  // HSA_AMD_AGENT_INFO_BDFID exposes only the 16-bit bus/device/function, not the
-  // PCI domain, so on a multi-segment machine two GPUs can share the same 16-bit
-  // BDF. Only trust the match when it is UNIQUE; otherwise keep the identity
-  // fallback rather than risk selecting the wrong agent. domain is parsed but
-  // cannot be matched against the HSA side.
-  int match = hipDeviceId;  // identity fallback (also correct when HIP and HSA order align)
-  int nMatch = 0, firstMatch = -1;
-  for (size_t a = 0; a < gpuAgents_.size(); ++a) {
-    uint32_t bdfid = 0;
-    if (hsa_agent_get_info(gpuAgents_[a], (hsa_agent_info_t)HSA_AMD_AGENT_INFO_BDFID, &bdfid) !=
-        HSA_STATUS_SUCCESS)
-      continue;
-    if ((bdfid & 0xFFFF) == (hipBdf & 0xFFFF)) {
-      ++nMatch;
-      if (firstMatch < 0) firstMatch = static_cast<int>(a);
+std::unordered_map<std::string, uint64_t> readKfdProperties(const std::string& path) {
+  std::ifstream f(path);
+  return readKfdProperties(f);
+}
+
+std::string kfdNodePath(int node) {
+  return "/sys/class/kfd/kfd/topology/nodes/" + std::to_string(node);
+}
+
+uint64_t kfdNodeProperty(int node, const char* name) {
+  auto props = readKfdProperties(kfdNodePath(node) + "/properties");
+  auto it = props.find(name);
+  return it == props.end() ? 0 : it->second;
+}
+
+// gpu_id has its own file, not a properties line; 0 for a CPU node.
+uint64_t kfdGpuId(int node) {
+  std::ifstream f(kfdNodePath(node) + "/gpu_id");
+  uint64_t id = 0;
+  f >> id;
+  return id;
+}
+
+struct KfdLink {
+  int nodeTo;
+  uint32_t recSdmaEngIdMask;
+};
+
+// io_links then p2p_links, as libhsakmt lists them, in sysfs node ids. A node's
+// own io_links stay readable even to GPUs this process cannot open, which
+// libhsakmt drops. A link KFD gates on such a GPU (a p2p link carries the peer's
+// device) reads as EPERM and is skipped, as libhsakmt skips it.
+std::vector<KfdLink> kfdLinks(int node) {
+  std::vector<KfdLink> links;
+  for (const char* dir : {"io_links", "p2p_links"}) {
+    for (int i = 0;; ++i) {
+      std::ifstream f(kfdNodePath(node) + "/" + dir + "/" + std::to_string(i) + "/properties");
+      if (!f.is_open()) break;
+      auto props = readKfdProperties(f);
+      if (props.empty()) continue;
+      links.push_back({static_cast<int>(props["node_to"]),
+                       static_cast<uint32_t>(props["recommended_sdma_engine_id_mask"])});
     }
   }
-  if (nMatch == 1) match = firstMatch;
-  hipToAgent[hipDeviceId] = match;
-  return gpuAgents_[match];
+  return links;
+}
+
+// libhsakmt numbers only the nodes this process can open, 0..NumNodes-1, so in a
+// container given some of the host's GPUs its ids are not the sysfs ones. Match
+// the GPU by gpu_id.
+uint32_t hsakmtNodeForKfdNode(int node) {
+  const uint64_t gpuId = kfdGpuId(node);
+  HsaSystemProperties sys{};
+  if (gpuId != 0 && hsaKmtAcquireSystemProperties(&sys) == HSAKMT_STATUS_SUCCESS) {
+    for (uint32_t n = 0; n < sys.NumNodes; ++n) {
+      HsaNodeProperties props{};
+      if (hsaKmtGetNodeProperties(n, &props) == HSAKMT_STATUS_SUCCESS && props.KFDGpuID == gpuId)
+        return n;
+    }
+  }
+  // Exit like a failed hsaKmt call in SdmaQueue: shmem would catch an exception
+  // and blame the network, and cco cannot propagate one into Python.
+  MORI_APP_ERROR("SDMA: no libhsakmt node has the gpu_id of KFD node {}", node);
+  exit(EXIT_FAILURE);
 }
 
 }  // namespace
 
-SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
+SdmaQueue::SdmaQueue(uint32_t hsakmtNodeId, uint32_t engineId) {
   // Allocate SDMA queue buffer on device side, requires ExecuteAccess
   HsaMemFlags memFlags = {};
   memFlags.ui32.NonPaged = 1;
@@ -199,10 +234,10 @@ SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
   memFlags.ui32.ExecuteAccess = 1;
   memFlags.ui32.Uncached = 1;
 
-  // std::cout << "Allocating SDMA Queue Buffer for device: " << localNodeId << std::endl <<
+  // std::cout << "Allocating SDMA Queue Buffer for device: " << hsakmtNodeId << std::endl <<
   // std::flush;
 
-  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(localNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
+  CHECK_HSAKMT_SUCCESS(hsaKmtAllocMemory(hsakmtNodeId, SDMA_QUEUE_SIZE, memFlags, &queueBuffer_),
                        "Failed");
   CHECK_HSAKMT_SUCCESS(hsaKmtMapMemoryToGPU(queueBuffer_, SDMA_QUEUE_SIZE, NULL), "Failed");
 
@@ -211,7 +246,7 @@ SdmaQueue::SdmaQueue(uint32_t localNodeId, uint32_t engineId) {
   memset(&queue_, 0, sizeof(HsaQueueResource));
 
   CHECK_HSAKMT_SUCCESS(
-      hsaKmtCreateQueueExt(localNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
+      hsaKmtCreateQueueExt(hsakmtNodeId, HSA_QUEUE_SDMA_BY_ENG_ID, 100, HSA_QUEUE_PRIORITY_MAXIMUM,
                            engineId, queueBuffer_, SDMA_QUEUE_SIZE, nullptr, &queue_),
       "Failed");
 
@@ -286,11 +321,12 @@ void AnvilLib::init() {
   });
 }
 
-// Map a HIP device ordinal to its KFD node id.
+// Map a HIP device ordinal to its KFD node id, the id connect() takes.
 /*static*/ uint32_t AnvilLib::nodeForHipDevice(int hipDev) {
-  uint32_t nodeId = 0;
-  CHECK_HSA_ERROR(hsa_agent_get_info(gpuAgentForHipDevice(hipDev), HSA_AGENT_INFO_NODE, &nodeId));
-  return nodeId;
+  int node = kfdNodeIdForHipDevice(hipDev);
+  if (node < 0)
+    throw std::runtime_error("SDMA: no KFD node for HIP device " + std::to_string(hipDev));
+  return static_cast<uint32_t>(node);
 }
 
 // Resolve the KFD topology node id of the given HIP device WITHOUT initializing HSA.
@@ -378,28 +414,19 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
   // hardware queues (getSdmaQueue only ever indexes the first numChannels) and
   // eventually exhaust the per-engine queue slots.
   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
-  for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
-    uint32_t engineId = engines[c % numEngines];
-    channels.emplace_back(std::make_unique<SdmaQueue>(srcNode, engineId));
+  if (static_cast<int>(channels.size()) < numChannels) {
+    const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
+    for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
+      uint32_t engineId = engines[c % numEngines];
+      channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
+    }
   }
   return true;
 }
 
 uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
-  }
-
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
-  for (const auto& link : links) {
-    if (link.NodeTo == dstNode) {
-      return link.RecSdmaEngIdMask;
-    }
+  for (const auto& link : kfdLinks(srcNode)) {
+    if (link.nodeTo == dstNode) return link.recSdmaEngIdMask;
   }
   return 0;
 }
@@ -407,55 +434,33 @@ uint32_t AnvilLib::getRecommendedEngineMask(int srcNode, int dstNode) {
 // Engines KFD recommends for this GPU's link to a CPU node, i.e. the general
 // (non-xGMI) ones. Zero if the node reports no such link.
 uint32_t AnvilLib::getHostLinkEngineMask(int srcNode) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
-  }
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
-  for (const auto& link : links) {
-    HsaNodeProperties to{};
-    if (hsaKmtGetNodeProperties(link.NodeTo, &to) != HSAKMT_STATUS_SUCCESS) continue;
-    if (to.NumFComputeCores != 0) continue;  // GPU node, not the host
-    if (link.RecSdmaEngIdMask) return link.RecSdmaEngIdMask;
+  for (const auto& link : kfdLinks(srcNode)) {
+    // A GPU, or a node KFD will not show us (only a GPU is ever hidden): not the host.
+    auto to = readKfdProperties(kfdNodePath(link.nodeTo) + "/properties");
+    if (to.empty() || to["simd_count"] != 0) continue;
+    if (link.recSdmaEngIdMask) return link.recSdmaEngIdMask;
   }
   return 0;
 }
 
 uint32_t AnvilLib::getAnyLinkEngineMask(int srcNode) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(srcNode, &props) != HSAKMT_STATUS_SUCCESS || props.NumIOLinks == 0) {
-    return 0;
-  }
-  std::vector<HsaIoLinkProperties> links(props.NumIOLinks);
-  if (hsaKmtGetNodeIoLinkProperties(srcNode, props.NumIOLinks, links.data()) !=
-      HSAKMT_STATUS_SUCCESS) {
-    return 0;
-  }
   uint32_t mask = 0;
-  for (const auto& link : links) mask |= link.RecSdmaEngIdMask;
+  for (const auto& link : kfdLinks(srcNode)) mask |= link.recSdmaEngIdMask;
   return mask;
 }
 
 // gfx12.5+ (gfx1250): the only arch whose loopback channels are spread over
 // engines. See connect() for why.
 bool AnvilLib::isGfx1250(int node) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(node, &props) != HSAKMT_STATUS_SUCCESS) return false;
-  return props.EngineId.ui32.Major == 12 && props.EngineId.ui32.Minor == 5;
+  // libhsakmt's EngineId: major = v / 10000 % 100, minor = v / 100 % 100.
+  const uint64_t v = kfdNodeProperty(node, "gfx_target_version");
+  return v / 10000 % 100 == 12 && v / 100 % 100 == 5;
 }
 
 // MI308X (PCI device_id 0x74A2) is a 4-XCD harvest of the 8-XCD MI300X. Both are
 // gfx942, so EngineId cannot tell them apart; match the PCI device id instead.
 // See connect() for why its odd SDMA engine ids must be avoided.
-bool AnvilLib::isMi308x(int node) {
-  HsaNodeProperties props{};
-  if (hsaKmtGetNodeProperties(node, &props) != HSAKMT_STATUS_SUCCESS) return false;
-  return props.DeviceId == 0x74A2;
-}
+bool AnvilLib::isMi308x(int node) { return kfdNodeProperty(node, "device_id") == 0x74A2; }
 
 SdmaQueue* AnvilLib::getSdmaQueue(int srcNode, int dstNode, int idx) {
   std::lock_guard<std::mutex> lock(channels_mutex_);
@@ -479,6 +484,10 @@ AnvilLib& AnvilLib::getInstance() {
 
 int AnvilLib::getOamId(int node) {
   auto [locId, domain, valid] = locIdAndDomainForNode(node);
+  if (valid && locId == ~0u) {
+    throw std::runtime_error("SDMA: cannot read KFD node " + std::to_string(node) +
+                             " (a GPU this process cannot open) to find its xGMI id");
+  }
   uint32_t bus = (locId >> 8) & 0xFF, dev = (locId >> 3) & 0x1F, func = locId & 0x7;
 
   char fpath[128];

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -70,6 +71,15 @@ enum class UMBPDeploymentMode : int {
 class IUMBPClient {
  public:
   virtual ~IUMBPClient() = default;
+
+  /// Opt in once per storage owner; RPCs run asynchronously after DRAM changes.
+  virtual void ConfigureKvIndexer(const KvIndexerConfig&) {
+    throw std::logic_error("KV Indexer reporting is unsupported by this client");
+  }
+  /// Supply canonical metadata; hold the returned pin through the write.
+  virtual KvMetadataPin RegisterKvBlock(const KvBlockMetadata&) {
+    throw std::logic_error("KV Indexer metadata is unsupported by this client");
+  }
 
   // ---- Core KV Operations ----
 
@@ -134,10 +144,12 @@ class IUMBPClient {
   /// closed, otherwise only after the underlying convergence (e.g. a
   /// distributed full-sync) has been acknowledged.  Returns false only
   /// when a synchronous convergence attempt actually failed; callers
-  /// should treat that as incomplete.
+  /// should treat that as incomplete. Indexer withdrawal is asynchronous;
+  /// call Flush() to await its current snapshot.
   virtual bool Clear() = 0;
 
-  /// Persist all pending write-back data.
+  /// Persist pending data and synchronize Indexer residency when configured.
+  /// Returns false on a synchronous Indexer failure; background retries continue.
   virtual bool Flush() = 0;
 
   /// Graceful one-time shutdown.  Flushes pending data, stops background
@@ -231,6 +243,15 @@ class IUMBPClient {
       const std::vector<std::string>& /*hashes*/) {
     return {};
   }
+
+ protected:
+  std::vector<KvMetadataPin> PrepareKvMetadata(const std::vector<std::string>& keys) {
+    std::vector<KvMetadataPin> pins;
+    if (kv_metadata_provider_)
+      for (const auto& block : kv_metadata_provider_(keys)) pins.push_back(RegisterKvBlock(block));
+    return pins;
+  }
+  decltype(KvIndexerConfig::metadata_provider) kv_metadata_provider_;
 };
 
 /// Fill in an embedded (in-process, no master, no networking) distributed
