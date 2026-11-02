@@ -57,7 +57,7 @@ from mori.cco import GDA_CONNECTION_NONE, CCODevCommRequirements
 from mori.tensor_utils import from_gpu_ptr
 
 from ..gemm_ar.op import FP8_DTYPES, MIN_K, _PinnedLaunch
-from .kernels import BLOCK_K, build_phases, compile_ag_gemm
+from .kernels import BLOCK_K, N_GRANULE, build_phases, compile_ag_gemm
 from .layout import AgGemmConfig
 
 MODES = ("fused", "split")
@@ -447,8 +447,9 @@ def shape_constraint(n: int, k: int) -> str | None:
             f"k={k} is below the minimum {MIN_K}: the mainloop prefetches a "
             f"second K block and runs two tail steps"
         )
-    if n < 1 or n % BLOCK_N:
-        return f"n={n} must be a positive multiple of {BLOCK_N}"
+    if n < 1 or n % N_GRANULE:
+        # Not BLOCK_N: the last column tile may be partial (see kernels.py).
+        return f"n={n} must be a positive multiple of {N_GRANULE}"
     return None
 
 

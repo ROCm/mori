@@ -83,6 +83,8 @@ from ..gemm_ar.kernels_lsa import _spin_until
 from .layout import MAX_CHUNKS, MAX_WORLD
 
 BLOCK_K = 128
+#: N granule: preshuffle_b's band of 16 weight rows.
+N_GRANULE = 16
 #: Wave width; the push kernel and the barrier use one wave, a lane per peer.
 PUSH_THREADS = 64
 
@@ -176,8 +178,14 @@ def compile_ag_gemm(
     K = cfg.k
     BLOCK_M = cfg.block_m
     M = cfg.m
-    if N % BLOCK_N:
-        raise ValueError(f"N={N} must be a multiple of BLOCK_N={BLOCK_N}")
+    # N need not fill the last column tile. Its columns past N read zeros --
+    # B and its scale go through buffer descriptors sized to the tensors, which
+    # return 0 out of range -- and their stores are dropped by the store's own
+    # `col + 7 < c_cols` test. What N does have to be is a whole number of
+    # preshuffle_b's 16-row bands, which also keeps every 8-column store group
+    # and 4-column scale load entirely on one side of N.
+    if N < 1 or N % N_GRANULE:
+        raise ValueError(f"N={N} must be a positive multiple of {N_GRANULE}")
     if BLOCK_N != 256:
         raise ValueError(
             "the lane-transpose store pairs exactly two N-tiles: BLOCK_N=256"
@@ -195,7 +203,7 @@ def compile_ag_gemm(
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
-    nb = N // BLOCK_N
+    nb = (N + BLOCK_N - 1) // BLOCK_N
     mt_local = cfg.m_tiles_local
     mtpc = cfg.m_tiles_per_chunk
     local_tiles = mt_local * nb
@@ -546,4 +554,4 @@ def build_phases(cfg, rank: int, *, sdma_queues: int = 1):
     }
 
 
-__all__ = ["compile_ag_gemm", "build_phases", "BLOCK_K"]
+__all__ = ["compile_ag_gemm", "build_phases", "BLOCK_K", "N_GRANULE"]

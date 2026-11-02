@@ -67,19 +67,19 @@ def tokens(rank: int, m: int, salt: int, valid: int | None = None):
     return a, sa
 
 
-def weight(rank: int):
+def weight(rank: int, n: int = N):
     """Rank ``rank``'s column shard: a different weight on every rank."""
     g = torch.Generator(device="cuda").manual_seed(5000 + rank)
-    b = (torch.randn(N, K, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
-    sb = torch.rand(N, generator=g, device="cuda") * 0.01 + 0.01
+    b = (torch.randn(n, K, generator=g, device="cuda") / 8).to(torch.float8_e4m3fn)
+    sb = torch.rand(n, generator=g, device="cuda") * 0.01 + 0.01
     return b, sb
 
 
-def reference(world, rank, m, salt, valid=None):
+def reference(world, rank, m, salt, valid=None, n=N):
     parts = [tokens(s, m, salt, valid) for s in range(world)]
     a = torch.cat([p[0] for p in parts]).float()
     sa = torch.cat([p[1] for p in parts])
-    b, sb = weight(rank)
+    b, sb = weight(rank, n)
     return (a @ b.float().T) * sa[:, None] * sb[None, :]
 
 
@@ -241,6 +241,26 @@ def case_operand_checks(op, rank):
     emit(rank, case="operand_checks", **refused)
 
 
+def case_ragged_n(comm, rank, world):
+    """A partial last column tile: 4 whole tiles and 144 columns."""
+    n, m = 1168, 512
+    a, sa = tokens(rank, m, salt=50)
+    b, sb = weight(rank, n)
+    bs = preshuffle_b(b)
+    ref = reference(world, rank, m, 50, n=n)
+    with AgGemmOp(comm, n=n, k=K, m_max=m) as op:
+        fused = op(a, bs, sa, sb).clone()
+    with AgGemmOp(comm, n=n, k=K, m_max=m, mode="split") as op:
+        split = op(a, bs, sa, sb).clone()
+    emit(
+        rank,
+        case="ragged_n",
+        fused_rel_l2=worst(rel(fused, ref)),
+        split_rel_l2=worst(rel(split, ref)),
+        equal=worst(bool(torch.equal(fused, split)), all),
+    )
+
+
 def case_close(comm, rank):
     op = AgGemmOp(comm, n=N, k=K, m_max=512)
     op.close()
@@ -265,6 +285,7 @@ def main() -> int:
             case_back_to_back(op, rank, world)
             case_operand_checks(op, rank)
             case_split_matches_fused(comm, op, rank, world)
+        case_ragged_n(comm, rank, world)
         case_close(comm, rank)
     dist.barrier()
     return 0

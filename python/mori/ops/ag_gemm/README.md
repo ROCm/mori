@@ -24,7 +24,7 @@ from mori.cco import Communicator
 from mori.ops.ag_gemm import AgGemmOp
 from mori.ops.gemm_ar import preshuffle_b
 
-N, K, M_MAX = 6400, 7168, 4096        # per rank: weight shard rows, hidden, tokens
+N, K, M_MAX = 6288, 7168, 4096        # per rank: weight shard rows, hidden, tokens
 vmm = 2 * AgGemmOp.window_bytes_for(world, k=K, m_max=M_MAX) + (256 << 20)
 with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
     with AgGemmOp(comm, n=N, k=K, m_max=M_MAX) as op:
@@ -42,6 +42,10 @@ with Communicator.init(world, rank, uid, per_rank_vmm=vmm) as comm:
   weight shard through `preshuffle_b` and `b_scale` its `[N]` fp32 per-channel
   scale. Anything the launch would reinterpret as bytes -- a wrong dtype, shape
   or M -- raises `ValueError`.
+- **N** is any multiple of 16 (`preshuffle_b`'s weight band). The last column
+  tile may be partial: past N it reads zeros and its stores are dropped, so a
+  shard like Kimi-K3's 6288 or 3648 goes in as is, with no padded weight and no
+  slicing of the result.
 - **M** must be the same on every rank and a multiple of 256: pad with
   `padded_m()` / `pad_rows()` before quantising. One instance serves any such M
   up to `m_max`, in any order, and compiles each M once.
@@ -96,8 +100,9 @@ is strided, and need a push of their own.
 ## Measured
 
 Kimi-K3's column-parallel projections at TP8: K=7168, N per rank 6288 (KDA)
-and 3648 (MLA), rounded up to 6400 and 3840 because the store needs whole
-256-column tiles. fp8 ptpc in, bf16 out, 256x256 tile. 8x MI355X, ROCm 7.14,
+and 3648 (MLA). These tables were taken when N still had to be a whole number
+of 256-column tiles, so they run the padded 6400 and 3840; the real shards are
+measured [below](#unpadded-n). fp8 ptpc in, bf16 out, 256x256 tile. 8x MI355X, ROCm 7.14,
 PyTorch 2.12, FlyDSL 0.3.4.1; graph replay, median of 51 after 20 warmups, max
 over ranks; median of 2 interleaved rounds, every run on an idle box (spread
 <= 1% except one 4.4% cell). All 92 runs validated at the fp8 floor
@@ -145,6 +150,25 @@ c4 needs `m_local` to be four 256-row tiles, so it starts at global M=8192.
   1.06-1.47x MLA -- on different hardware, precision and GEMM, so only the
   ratios compare, not the times.
 
+### Unpadded N
+
+The same fused c4 runs at Kimi-K3's real shards and at the padded widths the
+tables above use, 2 interleaved rounds, all validated. Times in us.
+
+| global M | KDA 6288 | padded 6400 | MLA 3648 | padded 3840 |
+|---:|---:|---:|---:|---:|
+| 8192 | 374.8 | 373.3 | 271.6 | 283.3 |
+| 32768 | 1300.3 | 1295.5 | 881.7 | 884.9 |
+
+**No faster, and it should not be.** The partial last tile still computes all
+256 columns -- the ones past N read zeros and their stores are dropped -- so
+`ceil(6288/256)` and `6400/256` are the same 25 tiles of work. MLA at global
+M=8192 is 4% quicker, plausibly from the B it no longer reads; the other three
+cells are within noise. What unpadded N buys is the interface: no padded copy of
+the weight, and a contiguous `[world*M, 6288]` result rather than a slice of a
+`[world*M, 6400]` one, which the next layer would usually have to copy -- 0.4 GB
+at global M=32768.
+
 ## Running it
 
 ```bash
@@ -161,5 +185,4 @@ every one. That is the test that fails when the closing barrier is removed.
 
 ## Not done yet
 
-blockscale / mxfp8 (the A-scale push), N that is not a multiple of 256, c8 and
-beyond, and a model integration.
+blockscale / mxfp8 (the A-scale push), c8 and beyond, and a model integration.

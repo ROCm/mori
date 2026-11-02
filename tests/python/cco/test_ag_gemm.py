@@ -147,6 +147,33 @@ def test_every_mode_is_exact_to_the_fp8_floor_back_to_back(mode):
 
 
 @requires_gpus
+@pytest.mark.parametrize(
+    "mode",
+    [["--mode", "fused-sdma", "--chunks", "2"], ["--mode", "split-sdma"]],
+    ids=["fused", "split"],
+)
+def test_a_partial_last_column_tile_back_to_back(mode):
+    """N=1168: four whole column tiles and 144 columns, masked in the store."""
+    r = _run_bench(
+        *mode,
+        "-m",
+        "512",
+        "-N",
+        "1168",
+        "-k",
+        "1024",
+        "--warmup",
+        "2",
+        "--iters",
+        "3",
+        "--back-to-back",
+        "4",
+    )
+    assert r["validated"], r
+    assert r["rel_l2"] < 3e-3, r
+
+
+@requires_gpus
 def test_gemm_only_matches_the_same_reference():
     """The compute floor the others are measured against has to be right too."""
     r = _run_bench("--mode", "gemm-only", *SMALL)

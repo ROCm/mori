@@ -49,15 +49,17 @@ _QUEUE_EXHAUSTED = "anvil.cpp"
 
 @pytest.mark.parametrize(
     "n,k",
-    [(6400, 7168), (3840, 7168), (1024, 256)],
+    # 6288 and 3648 are Kimi-K3's KDA and MLA shards at TP8: a partial last
+    # column tile, which the kernel masks rather than the caller padding.
+    [(6400, 7168), (6288, 7168), (3648, 7168), (1040, 256)],
 )
-def test_supports_takes_whole_tiles(n, k):
+def test_supports_takes_any_n_in_whole_weight_bands(n, k):
     assert supports(n, k, 8) and shape_constraint(n, k) is None
 
 
 @pytest.mark.parametrize(
     "n,k",
-    [(6288, 7168), (1024, 128), (1024, 200), (0, 1024)],
+    [(6280, 7168), (1024, 128), (1024, 200), (0, 1024)],
 )
 def test_supports_rejects_what_the_kernel_cannot_build(n, k):
     assert not supports(n, k, 8) and shape_constraint(n, k) is not None
@@ -185,3 +187,13 @@ def test_operands_the_launch_would_misread_are_refused(cases):
 @requires_gpus
 def test_close_releases_and_is_idempotent(cases):
     assert cases["close"]["refused_after_close"], cases["close"]
+
+
+@requires_gpus
+def test_a_partial_last_column_tile_is_masked_not_padded(cases):
+    """N=1168 is four whole column tiles and 144 columns: the last tile reads
+    zeros past N and drops its stores there, in both modes."""
+    r = cases["ragged_n"]
+    assert r["fused_rel_l2"] < FP8_FLOOR, r
+    assert r["split_rel_l2"] < FP8_FLOOR, r
+    assert r["equal"], r
