@@ -47,8 +47,11 @@
 //     ib = independent+block    at = aggregate+thread
 //   signal/wait/flush — coop-only tag: thread / warp / block.
 //   put/put_value/signal also carry a remote-action tag: none / inc / add.
+//   GDA put/put_value/get/signal/flush_peer/flush_async take a trailing `flags`
+//   word for the team and ccoGdaOptFlags (GdaWithFlags).
 //   SDMA put/get on resolved addresses — coop tag only; their other axes ride
-//   in a `flags` argument (SdmaWithFlags), constant-folded once inlined.
+//   in a `flags` argument (SdmaWithFlags). Either `flags` constant-folds once
+//   the wrapper is inlined.
 //   Side-effect-only wrappers return int status 0 rather than void. Triton's
 //   extern_elementwise requires a concrete return element type; FlyDSL ignores
 //   the status.
@@ -69,6 +72,10 @@ inline __device__ const ccoDevComm* AsDevComm(uint64_t h) {
 }
 inline __device__ ccoWindow_t AsWindow(uint64_t h) { return reinterpret_cast<ccoWindow_t>(h); }
 inline __device__ ccoGdaSignal_t AsSig(int id) { return static_cast<ccoGdaSignal_t>(id); }
+
+// A template argument chosen at run time by the *WithFlags dispatchers below.
+template <typename T, T v>
+using Const = std::integral_constant<T, v>;
 }  // namespace
 
 // Inlined into the kernel after link (thin forwarder, like a header-only call).
@@ -267,9 +274,6 @@ constexpr int kSdmaFlagRemoteSignal = 1 << 3;
 constexpr int kSdmaFlagSameQueue = 1 << 4;
 constexpr int kSdmaFlagAll =
     kSdmaFlagOptMask | kSdmaFlagLocalSignal | kSdmaFlagRemoteSignal | kSdmaFlagSameQueue;
-
-template <typename T, T v>
-using Const = std::integral_constant<T, v>;
 
 // Calls fn(localSignal, remoteSignal, optFlags, threadMode), each a
 // std::integral_constant, for the instantiation `flags` names.
@@ -495,15 +499,64 @@ CCO_DEV int cco_devcomm_world_size(uint64_t dc) { return AsDevComm(dc)->worldSiz
 CCO_DEV int cco_devcomm_lsa_rank(uint64_t dc) { return AsDevComm(dc)->lsaRank; }
 CCO_DEV int cco_devcomm_lsa_size(uint64_t dc) { return AsDevComm(dc)->lsaSize; }
 
+// ── GDA `flags` ──
+// The GDA data path, signal and per-peer completion take a trailing `flags` word
+// carrying the template axes their symbol name does not: the team `peer` is
+// numbered in, and ccoGdaOptFlags. Mirrored by GdaFlags in ops.py. As for SDMA,
+// the wrappers are inlined into the caller's kernel, so a compile-time constant
+// `flags` folds the dispatch to one instantiation. Unknown bits trap, as does
+// an opt flag the op does not take.
+namespace {
+// Bits 0-7 are ccoGdaOptFlags; bit 8 selects CCO_TEAM_GDA (peer is an index in
+// the GDA team -- the node index on a RAIL connection) over CCO_TEAM_WORLD.
+constexpr int kGdaFlagTeamGda = 1 << 8;
+
+// Calls fn(team, optFlags), each a std::integral_constant, for the
+// instantiation `flags` names. `OptMask` is the ccoGdaOptFlags the op accepts.
+template <uint32_t OptMask, typename Fn>
+inline __device__ void GdaWithFlags(int flags, Fn&& fn) {
+  if (flags & ~(kGdaFlagTeamGda | static_cast<int>(OptMask))) __builtin_trap();  // unknown flag
+  auto withOpt = [&](auto team) {
+    if constexpr ((OptMask & ccoGdaOptFlagsDeferDoorbell) != 0) {
+      if (flags & ccoGdaOptFlagsDeferDoorbell) {
+        fn(team, Const<uint32_t, ccoGdaOptFlagsDeferDoorbell>{});
+        return;
+      }
+    }
+    fn(team, Const<uint32_t, ccoGdaOptFlagsDefault>{});
+  };
+  if (flags & kGdaFlagTeamGda) {
+    withOpt(Const<ccoTeamMode, CCO_TEAM_GDA>{});
+  } else {
+    withOpt(Const<ccoTeamMode, CCO_TEAM_WORLD>{});
+  }
+}
+
+// A flushAsync request in one scalar: qpIdx in the high half, postIdx (a 32-bit
+// serial) in the low half.
+inline __device__ uint64_t PackRequest(const ccoGdaRequest_t& req) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(req.qpIdx)) << 32) |
+         static_cast<uint32_t>(req.postIdx);
+}
+inline __device__ ccoGdaRequest_t UnpackRequest(uint64_t packed) {
+  ccoGdaRequest_t req{};
+  req.qpIdx = static_cast<int>(packed >> 32);
+  req.postIdx = static_cast<uint32_t>(packed);
+  return req;
+}
+}  // namespace
+
 // ── GDA put: cco_gda_put__<tc>__<sig> ──
-#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                                      \
-  CCO_DEV int cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,       \
-                                          uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n, \
-                                          int sid, uint64_t sv) {                            \
-    Gda gda{*AsDevComm(dc), ctx};                                                            \
-    gda.put<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG,   \
-                                COOP{});                                                     \
-    return 0;                                                                                \
+#define CCO_DEF_PUT(TAG, TM, COOP, SIG)                                                       \
+  CCO_DEV int cco_gda_put__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,        \
+                                          uint64_t dO, uint64_t sW, uint64_t sO, uint64_t n,  \
+                                          int sid, uint64_t sv, int flags) {                  \
+    Gda gda{*AsDevComm(dc), ctx};                                                             \
+    GdaWithFlags<kCcoGdaSupportedOptFlags>(flags, [&](auto team, auto opt) {                  \
+      gda.put<decltype(team)::value, TM, decltype(CCO_RA_##SIG), COOP, decltype(opt)::value>( \
+          peer, AsWindow(dW), dO, AsWindow(sW), sO, n, CCO_RA_##SIG, COOP{});                 \
+    });                                                                                       \
+    return 0;                                                                                 \
   }
 #define CCO_DEF_PUT_SIGS(TAG, TM, COOP) \
   CCO_DEF_PUT(TAG, TM, COOP, none)      \
@@ -514,13 +567,16 @@ CCO_TC_LIST(CCO_DEF_PUT_SIGS)
 #undef CCO_DEF_PUT
 
 // ── GDA put_value: cco_gda_put_value__<tc>__<sig> ──
-#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                     \
-  CCO_DEV int cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW, \
-                                                uint64_t dO, uint64_t value, int sid,        \
-                                                uint64_t sv) {                               \
-    Gda gda{*AsDevComm(dc), ctx};                                                            \
-    gda.putValue<CCO_TEAM_WORLD, TM>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});   \
-    return 0;                                                                                \
+#define CCO_DEF_PUTV(TAG, TM, COOP, SIG)                                                           \
+  CCO_DEV int cco_gda_put_value__##TAG##__##SIG(uint64_t dc, int ctx, int peer, uint64_t dW,       \
+                                                uint64_t dO, uint64_t value, int sid, uint64_t sv, \
+                                                int flags) {                                       \
+    Gda gda{*AsDevComm(dc), ctx};                                                                  \
+    GdaWithFlags<kCcoGdaSupportedOptFlags>(flags, [&](auto team, auto opt) {                       \
+      gda.putValue<decltype(team)::value, TM, uint64_t, decltype(CCO_RA_##SIG), COOP,              \
+                   decltype(opt)::value>(peer, AsWindow(dW), dO, value, CCO_RA_##SIG, COOP{});     \
+    });                                                                                            \
+    return 0;                                                                                      \
   }
 #define CCO_DEF_PUTV_SIGS(TAG, TM, COOP) \
   CCO_DEF_PUTV(TAG, TM, COOP, none)      \
@@ -531,23 +587,29 @@ CCO_TC_LIST(CCO_DEF_PUTV_SIGS)
 #undef CCO_DEF_PUTV
 
 // ── GDA get (no remote action): cco_gda_get__<tc> ──
-#define CCO_DEF_GET(TAG, TM, COOP)                                                         \
-  CCO_DEV int cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO, \
-                                 uint64_t lW, uint64_t lO, uint64_t n) {                   \
-    Gda gda{*AsDevComm(dc), ctx};                                                          \
-    gda.get<CCO_TEAM_WORLD, TM>(peer, AsWindow(rW), rO, AsWindow(lW), lO, n, COOP{});      \
-    return 0;                                                                              \
+#define CCO_DEF_GET(TAG, TM, COOP)                                                                 \
+  CCO_DEV int cco_gda_get__##TAG(uint64_t dc, int ctx, int peer, uint64_t rW, uint64_t rO,         \
+                                 uint64_t lW, uint64_t lO, uint64_t n, int flags) {                \
+    Gda gda{*AsDevComm(dc), ctx};                                                                  \
+    GdaWithFlags<kCcoGdaSupportedOptFlags>(flags, [&](auto team, auto opt) {                       \
+      gda.get<decltype(team)::value, TM, COOP, decltype(opt)::value>(peer, AsWindow(rW), rO,       \
+                                                                     AsWindow(lW), lO, n, COOP{}); \
+    });                                                                                            \
+    return 0;                                                                                      \
   }
 CCO_TC_LIST(CCO_DEF_GET)
 #undef CCO_DEF_GET
 
 // ── GDA signal (inc/add only): cco_gda_signal__<coop>__<sig> ──
-#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                \
-  CCO_DEV int cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, \
-                                             uint64_t sv) {                           \
-    Gda gda{*AsDevComm(dc), ctx};                                                     \
-    gda.signal<CCO_TEAM_WORLD>(peer, CCO_RA_##SIG, COOP{});                           \
-    return 0;                                                                         \
+// A signal always rings, so `flags` carries only the team.
+#define CCO_DEF_SIGNAL(TAG, COOP, SIG)                                                             \
+  CCO_DEV int cco_gda_signal__##TAG##__##SIG(uint64_t dc, int ctx, int peer, int sid, uint64_t sv, \
+                                             int flags) {                                          \
+    Gda gda{*AsDevComm(dc), ctx};                                                                  \
+    GdaWithFlags<ccoGdaOptFlagsDefault>(flags, [&](auto team, auto) {                              \
+      gda.signal<decltype(team)::value>(peer, CCO_RA_##SIG, COOP{});                               \
+    });                                                                                            \
+    return 0;                                                                                      \
   }
 #define CCO_DEF_SIGNAL_SIGS(TAG, COOP) \
   CCO_DEF_SIGNAL(TAG, COOP, inc)       \
@@ -580,17 +642,48 @@ CCO_COOP_LIST(CCO_DEF_WAIT)
 #undef CCO_DEF_WAIT
 
 // ── GDA completion (>= warp): cco_gda_flush__<coop> / cco_gda_flush_peer__<coop> ──
-#define CCO_DEF_FLUSH(TAG, COOP)                                          \
-  CCO_DEV int cco_gda_flush__##TAG(uint64_t dc, int ctx) {                \
-    Gda gda{*AsDevComm(dc), ctx};                                         \
-    gda.flush(COOP{});                                                    \
-    return 0;                                                             \
-  }                                                                       \
-  CCO_DEV int cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer) { \
-    Gda gda{*AsDevComm(dc), ctx};                                         \
-    gda.flush(peer, COOP{});                                              \
-    return 0;                                                             \
+// flush_peer's `flags` carries only the team.
+#define CCO_DEF_FLUSH(TAG, COOP)                                                          \
+  CCO_DEV int cco_gda_flush__##TAG(uint64_t dc, int ctx) {                                \
+    Gda gda{*AsDevComm(dc), ctx};                                                         \
+    gda.flush(COOP{});                                                                    \
+    return 0;                                                                             \
+  }                                                                                       \
+  CCO_DEV int cco_gda_flush_peer__##TAG(uint64_t dc, int ctx, int peer, int flags) {      \
+    Gda gda{*AsDevComm(dc), ctx};                                                         \
+    GdaWithFlags<ccoGdaOptFlagsDefault>(                                                  \
+        flags, [&](auto team, auto) { gda.flush<decltype(team)::value>(peer, COOP{}); }); \
+    return 0;                                                                             \
   }
 CCO_DEF_FLUSH(warp, ccoCoopWarp)
 CCO_DEF_FLUSH(block, ccoCoopBlock)
 #undef CCO_DEF_FLUSH
+
+// ── GDA split completion: cco_gda_flush_async__<coop> / cco_gda_wait__<coop> ──
+// flush_async rings `peer`'s QP up to its current reservation (deferred posts
+// included) and returns a request; wait polls the CQ until that request has
+// completed. Work can go between them. The request is one uint64 (PackRequest)
+// and is only meaningful to wait() with the same dev_comm. wait needs >= warp,
+// like flush.
+#define CCO_DEF_FLUSH_ASYNC(TAG, COOP)                                                     \
+  CCO_DEV uint64_t cco_gda_flush_async__##TAG(uint64_t dc, int ctx, int peer, int flags) { \
+    Gda gda{*AsDevComm(dc), ctx};                                                          \
+    ccoGdaRequest_t req{};                                                                 \
+    GdaWithFlags<ccoGdaOptFlagsDefault>(flags, [&](auto team, auto) {                      \
+      gda.flushAsync<decltype(team)::value>(peer, &req, COOP{});                           \
+    });                                                                                    \
+    return PackRequest(req);                                                               \
+  }
+CCO_COOP_LIST(CCO_DEF_FLUSH_ASYNC)
+#undef CCO_DEF_FLUSH_ASYNC
+
+#define CCO_DEF_WAIT_REQUEST(TAG, COOP)                                     \
+  CCO_DEV int cco_gda_wait__##TAG(uint64_t dc, int ctx, uint64_t request) { \
+    Gda gda{*AsDevComm(dc), ctx};                                           \
+    ccoGdaRequest_t req = UnpackRequest(request);                           \
+    gda.wait(req, COOP{});                                                  \
+    return 0;                                                               \
+  }
+CCO_DEF_WAIT_REQUEST(warp, ccoCoopWarp)
+CCO_DEF_WAIT_REQUEST(block, ccoCoopBlock)
+#undef CCO_DEF_WAIT_REQUEST

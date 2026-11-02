@@ -572,6 +572,55 @@ def gda_signal_variant_kernel(
 
 
 @triton.jit
+def gda_defer_kernel(
+    dev_comm,
+    window,
+    peer: tl.constexpr,
+    dst_off: tl.constexpr,
+    src_off: tl.constexpr,
+    nbytes: tl.constexpr,
+    chunks: tl.constexpr,
+    team: tl.constexpr,
+    signal_id: tl.constexpr,
+):
+    # Deferred puts ring nothing; flush_async rings for all of them at once and
+    # wait drains the CQ. The signal is an ordinary post behind them on the QP.
+    chunk: tl.constexpr = nbytes // chunks
+    qp = tl.program_id(
+        0
+    )  # a runtime QP context, as a kernel spreading chunks would pick
+    for c in tl.static_range(chunks):
+        cco.Gda.put(
+            dev_comm,
+            peer,
+            window,
+            dst_off + c * chunk,
+            window,
+            src_off + c * chunk,
+            chunk,
+            ctx=qp,
+            coop=cco.CoopScope.BLOCK,
+            team=team,
+            defer_doorbell=True,
+        )
+    request = cco.Gda.flush_async(
+        dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team
+    )
+    cco.Gda.wait(dev_comm, request, coop=cco.CoopScope.BLOCK)
+    cco.Gda.signal(
+        dev_comm,
+        peer,
+        signal_op=cco.SignalOp.INC,
+        signal_id=signal_id,
+        ctx=qp,
+        coop=cco.CoopScope.BLOCK,
+        team=team,
+    )
+    cco.Gda.flush_peer(dev_comm, peer, ctx=qp, coop=cco.CoopScope.BLOCK, team=team)
+    cco.Gda.wait_signal(dev_comm, signal_id, 1, coop=cco.CoopScope.BLOCK)
+
+
+@triton.jit
 def gda_reset_signal_kernel(
     dev_comm,
     signal_id: tl.constexpr,
@@ -960,6 +1009,30 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
     torch.cuda.synchronize()
     comm.barrier()
     assert read_u64(win.local_ptr + GDA_VALUE_OFF) == source + 0xCC00
+
+    # Deferred doorbell + flush_async / wait, with peer numbered in each team. On
+    # a FULL connection the GDA team is the world, so both reach the same peer.
+    for team in (cco.Team.WORLD, cco.Team.GDA):
+        zero(win.local_ptr + GDA_RECV_OFF, 2 * NBYTES)
+        comm.barrier()
+        gda_defer_kernel[(1,)](
+            dc.ptr,
+            win.handle,
+            peer=peer,
+            dst_off=dst_off,
+            src_off=SEND_OFF,
+            nbytes=NBYTES,
+            chunks=4,
+            team=team,
+            signal_id=1,
+            extern_libs=extern_libs,
+            num_warps=1,
+        )
+        torch.cuda.synchronize()
+        comm.barrier()
+        check_payload(
+            win, GDA_RECV_OFF + source * NBYTES, source, f"GDA deferred put team={team}"
+        )
     print(f"[rank {rank}] GDA PASS", flush=True)
 
 

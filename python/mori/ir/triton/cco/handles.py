@@ -32,9 +32,11 @@ import triton.language as tl
 
 from mori.cco.device.ops import (
     CoopScope,
+    GdaFlags,
     SdmaFlags,
     SdmaOptFlags,
     SignalOp,
+    Team,
     ThreadMode,
 )
 
@@ -53,6 +55,15 @@ _FLAG_SIGNAL_PER_COPY = tl.constexpr(SdmaFlags.SIGNAL_PER_COPY)
 _FLAG_LOCAL_SIGNAL = tl.constexpr(SdmaFlags.LOCAL_SIGNAL)
 _FLAG_REMOTE_SIGNAL = tl.constexpr(SdmaFlags.REMOTE_SIGNAL)
 _FLAG_SAME_QUEUE = tl.constexpr(SdmaFlags.SAME_QUEUE)
+_TEAM_WORLD = tl.constexpr(Team.WORLD)
+_TEAM_GDA = tl.constexpr(Team.GDA)
+_GDA_FLAG_DEFER_DOORBELL = tl.constexpr(GdaFlags.DEFER_DOORBELL)
+_GDA_FLAG_TEAM_GDA = tl.constexpr(GdaFlags.TEAM_GDA)
+
+# GDA ops take `team` (how `peer` is numbered: Team.WORLD or Team.GDA) and, for
+# put / put_value / get, `defer_doorbell` -- both tl.constexpr, folded into a
+# constant GdaFlags word so the wrapper's dispatch compiles away. `ctx`, the QP
+# context, may be a runtime value on every op that posts to or flushes a QP.
 
 
 @triton.jit
@@ -64,12 +75,14 @@ def _gda_put(
     src_win,
     src_off,
     nbytes,
-    ctx: tl.constexpr = 0,
+    ctx=0,
     signal_op: tl.constexpr = _SIGNAL_NONE,
     signal_id=0,
     signal_val=0,
     coop: tl.constexpr = _COOP_THREAD,
     thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+    defer_doorbell: tl.constexpr = False,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -88,6 +101,13 @@ def _gda_put(
     tl.static_assert(
         thread_mode == _THREAD_INDEPENDENT or coop == _COOP_THREAD,
         "GDA aggregate thread mode requires thread cooperative scope",
+    )
+    tl.static_assert(
+        team == _TEAM_WORLD or team == _TEAM_GDA,
+        "GDA team must be Team.WORLD or Team.GDA",
+    )
+    flags: tl.constexpr = (_GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0) | (
+        _GDA_FLAG_DEFER_DOORBELL if defer_doorbell else 0
     )
     if thread_mode == _THREAD_AGGREGATE:
         if signal_op == _SIGNAL_NONE:
@@ -102,6 +122,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_at_inc(
@@ -115,6 +136,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         else:
             raw.gda_put_at_add(
@@ -128,6 +150,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
     elif coop == _COOP_THREAD:
         if signal_op == _SIGNAL_NONE:
@@ -142,6 +165,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_it_inc(
@@ -155,6 +179,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         else:
             raw.gda_put_it_add(
@@ -168,6 +193,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
     elif coop == _COOP_WARP:
         if signal_op == _SIGNAL_NONE:
@@ -182,6 +208,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_iw_inc(
@@ -195,6 +222,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         else:
             raw.gda_put_iw_add(
@@ -208,6 +236,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
     else:
         if signal_op == _SIGNAL_NONE:
@@ -222,6 +251,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_ib_inc(
@@ -235,6 +265,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
         else:
             raw.gda_put_ib_add(
@@ -248,6 +279,7 @@ def _gda_put(
                 nbytes,
                 signal_id,
                 signal_val,
+                flags,
             )
 
 
@@ -258,12 +290,14 @@ def _gda_put_value(
     dst_win,
     dst_off,
     value,
-    ctx: tl.constexpr = 0,
+    ctx=0,
     signal_op: tl.constexpr = _SIGNAL_NONE,
     signal_id=0,
     signal_val=0,
     coop: tl.constexpr = _COOP_THREAD,
     thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+    defer_doorbell: tl.constexpr = False,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -283,57 +317,160 @@ def _gda_put_value(
         thread_mode == _THREAD_INDEPENDENT or coop == _COOP_THREAD,
         "GDA aggregate thread mode requires thread cooperative scope",
     )
+    tl.static_assert(
+        team == _TEAM_WORLD or team == _TEAM_GDA,
+        "GDA team must be Team.WORLD or Team.GDA",
+    )
+    flags: tl.constexpr = (_GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0) | (
+        _GDA_FLAG_DEFER_DOORBELL if defer_doorbell else 0
+    )
     if thread_mode == _THREAD_AGGREGATE:
         if signal_op == _SIGNAL_NONE:
             raw.gda_put_value_at_none(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_value_at_inc(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         else:
             raw.gda_put_value_at_add(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
     elif coop == _COOP_THREAD:
         if signal_op == _SIGNAL_NONE:
             raw.gda_put_value_it_none(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_value_it_inc(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         else:
             raw.gda_put_value_it_add(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
     elif coop == _COOP_WARP:
         if signal_op == _SIGNAL_NONE:
             raw.gda_put_value_iw_none(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_value_iw_inc(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         else:
             raw.gda_put_value_iw_add(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
     else:
         if signal_op == _SIGNAL_NONE:
             raw.gda_put_value_ib_none(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         elif signal_op == _SIGNAL_INC:
             raw.gda_put_value_ib_inc(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
         else:
             raw.gda_put_value_ib_add(
-                dev_comm, ctx, peer, dst_win, dst_off, value, signal_id, signal_val
+                dev_comm,
+                ctx,
+                peer,
+                dst_win,
+                dst_off,
+                value,
+                signal_id,
+                signal_val,
+                flags,
             )
 
 
@@ -346,9 +483,11 @@ def _gda_get(
     local_win,
     local_off,
     nbytes,
-    ctx: tl.constexpr = 0,
+    ctx=0,
     coop: tl.constexpr = _COOP_THREAD,
     thread_mode: tl.constexpr = _THREAD_INDEPENDENT,
+    team: tl.constexpr = _TEAM_WORLD,
+    defer_doorbell: tl.constexpr = False,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -362,21 +501,60 @@ def _gda_get(
         thread_mode == _THREAD_INDEPENDENT or coop == _COOP_THREAD,
         "GDA aggregate thread mode requires thread cooperative scope",
     )
+    tl.static_assert(
+        team == _TEAM_WORLD or team == _TEAM_GDA,
+        "GDA team must be Team.WORLD or Team.GDA",
+    )
+    flags: tl.constexpr = (_GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0) | (
+        _GDA_FLAG_DEFER_DOORBELL if defer_doorbell else 0
+    )
     if thread_mode == _THREAD_AGGREGATE:
         raw.gda_get_at(
-            dev_comm, ctx, peer, remote_win, remote_off, local_win, local_off, nbytes
+            dev_comm,
+            ctx,
+            peer,
+            remote_win,
+            remote_off,
+            local_win,
+            local_off,
+            nbytes,
+            flags,
         )
     elif coop == _COOP_THREAD:
         raw.gda_get_it(
-            dev_comm, ctx, peer, remote_win, remote_off, local_win, local_off, nbytes
+            dev_comm,
+            ctx,
+            peer,
+            remote_win,
+            remote_off,
+            local_win,
+            local_off,
+            nbytes,
+            flags,
         )
     elif coop == _COOP_WARP:
         raw.gda_get_iw(
-            dev_comm, ctx, peer, remote_win, remote_off, local_win, local_off, nbytes
+            dev_comm,
+            ctx,
+            peer,
+            remote_win,
+            remote_off,
+            local_win,
+            local_off,
+            nbytes,
+            flags,
         )
     else:
         raw.gda_get_ib(
-            dev_comm, ctx, peer, remote_win, remote_off, local_win, local_off, nbytes
+            dev_comm,
+            ctx,
+            peer,
+            remote_win,
+            remote_off,
+            local_win,
+            local_off,
+            nbytes,
+            flags,
         )
 
 
@@ -384,11 +562,12 @@ def _gda_get(
 def _gda_signal(
     dev_comm,
     peer,
-    ctx: tl.constexpr = 0,
+    ctx=0,
     signal_op: tl.constexpr = _SIGNAL_INC,
     signal_id=0,
     signal_val=0,
     coop: tl.constexpr = _COOP_THREAD,
+    team: tl.constexpr = _TEAM_WORLD,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
@@ -398,21 +577,26 @@ def _gda_signal(
         signal_op == _SIGNAL_INC or signal_op == _SIGNAL_ADD,
         "GDA signal requires SignalOp.INC or ADD",
     )
+    tl.static_assert(
+        team == _TEAM_WORLD or team == _TEAM_GDA,
+        "GDA team must be Team.WORLD or Team.GDA",
+    )
+    flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if coop == _COOP_THREAD:
         if signal_op == _SIGNAL_INC:
-            raw.gda_signal_thread_inc(dev_comm, ctx, peer, signal_id, signal_val)
+            raw.gda_signal_thread_inc(dev_comm, ctx, peer, signal_id, signal_val, flags)
         else:
-            raw.gda_signal_thread_add(dev_comm, ctx, peer, signal_id, signal_val)
+            raw.gda_signal_thread_add(dev_comm, ctx, peer, signal_id, signal_val, flags)
     elif coop == _COOP_WARP:
         if signal_op == _SIGNAL_INC:
-            raw.gda_signal_warp_inc(dev_comm, ctx, peer, signal_id, signal_val)
+            raw.gda_signal_warp_inc(dev_comm, ctx, peer, signal_id, signal_val, flags)
         else:
-            raw.gda_signal_warp_add(dev_comm, ctx, peer, signal_id, signal_val)
+            raw.gda_signal_warp_add(dev_comm, ctx, peer, signal_id, signal_val, flags)
     else:
         if signal_op == _SIGNAL_INC:
-            raw.gda_signal_block_inc(dev_comm, ctx, peer, signal_id, signal_val)
+            raw.gda_signal_block_inc(dev_comm, ctx, peer, signal_id, signal_val, flags)
         else:
-            raw.gda_signal_block_add(dev_comm, ctx, peer, signal_id, signal_val)
+            raw.gda_signal_block_add(dev_comm, ctx, peer, signal_id, signal_val, flags)
 
 
 @triton.jit
@@ -458,7 +642,7 @@ def _gda_wait_signal(
 @triton.jit
 def _gda_flush(
     dev_comm,
-    ctx: tl.constexpr = 0,
+    ctx=0,
     coop: tl.constexpr = _COOP_WARP,
 ):
     tl.static_assert(
@@ -475,17 +659,68 @@ def _gda_flush(
 def _gda_flush_peer(
     dev_comm,
     peer,
-    ctx: tl.constexpr = 0,
+    ctx=0,
     coop: tl.constexpr = _COOP_WARP,
+    team: tl.constexpr = _TEAM_WORLD,
 ):
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
     )
+    tl.static_assert(
+        team == _TEAM_WORLD or team == _TEAM_GDA,
+        "GDA team must be Team.WORLD or Team.GDA",
+    )
+    flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
     if coop == _COOP_BLOCK:
-        raw.gda_flush_peer_block(dev_comm, ctx, peer)
+        raw.gda_flush_peer_block(dev_comm, ctx, peer, flags)
     else:
-        raw.gda_flush_peer_warp(dev_comm, ctx, peer)
+        raw.gda_flush_peer_warp(dev_comm, ctx, peer, flags)
+
+
+@triton.jit
+def _gda_flush_async(
+    dev_comm,
+    peer,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
+    team: tl.constexpr = _TEAM_WORLD,
+):
+    """Ring ``peer``'s QP up to its current reservation, deferred posts
+    included, and return a request (uint64) for ``wait``."""
+    tl.static_assert(
+        coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
+        "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
+    )
+    tl.static_assert(
+        team == _TEAM_WORLD or team == _TEAM_GDA,
+        "GDA team must be Team.WORLD or Team.GDA",
+    )
+    flags: tl.constexpr = _GDA_FLAG_TEAM_GDA if team == _TEAM_GDA else 0
+    if coop == _COOP_THREAD:
+        return raw.gda_flush_async_thread(dev_comm, ctx, peer, flags)
+    elif coop == _COOP_WARP:
+        return raw.gda_flush_async_warp(dev_comm, ctx, peer, flags)
+    else:
+        return raw.gda_flush_async_block(dev_comm, ctx, peer, flags)
+
+
+@triton.jit
+def _gda_wait(
+    dev_comm,
+    request,
+    ctx: tl.constexpr = 0,
+    coop: tl.constexpr = _COOP_WARP,
+):
+    """Poll the CQ until a ``flush_async`` request has completed."""
+    tl.static_assert(
+        coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
+        "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
+    )
+    if coop == _COOP_BLOCK:
+        raw.gda_wait_block(dev_comm, ctx, request)
+    else:
+        raw.gda_wait_warp(dev_comm, ctx, request)
 
 
 # put / get / put_ptr / get_ptr mirror ccoSdma's, and their keywords its template
@@ -764,6 +999,8 @@ class Gda:
     wait_signal = staticmethod(_gda_wait_signal)
     flush = staticmethod(_gda_flush)
     flush_peer = staticmethod(_gda_flush_peer)
+    flush_async = staticmethod(_gda_flush_async)
+    wait = staticmethod(_gda_wait)
 
 
 class Sdma:
@@ -788,6 +1025,8 @@ __all__ = [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "Team",
+    "GdaFlags",
     "SdmaOptFlags",
     "SdmaFlags",
 ]

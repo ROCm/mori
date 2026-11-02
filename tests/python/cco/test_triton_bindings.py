@@ -90,8 +90,51 @@ def test_sdma_constant_flags_fold_to_one_instantiation():
     assert constant * 4 < runtime, (constant, runtime)
 
 
+@triton.jit
+def gda_constant_flags_kernel(dev_comm, win):
+    cco.Gda.put(
+        dev_comm,
+        1,
+        win,
+        0,
+        win,
+        0,
+        4096,
+        coop=cco.CoopScope.WARP,
+        team=cco.Team.GDA,
+        defer_doorbell=True,
+    )
+
+
+@triton.jit
+def gda_runtime_flags_kernel(dev_comm, win, flags):
+    cco.gda_put_iw_none(dev_comm, 0, 1, win, 0, win, 0, 4096, 0, 0, flags)
+
+
+def test_gda_constant_flags_fold_to_one_instantiation():
+    # Same contract as SDMA's: a constant GdaFlags word folds the wrapper's
+    # dispatch over (team, defer) away; a runtime one keeps every branch. The
+    # four instantiations share most of their code (team only changes the peer
+    # translation, defer only the last step of the post), so the runtime kernel
+    # is ~1.8x the constant one on MI308X rather than SDMA's order of magnitude.
+    def instructions(kernel, *args):
+        compiled = kernel.warmup(
+            *args, grid=(1,), extern_libs=cco.get_extern_libs(), num_warps=1
+        )
+        return sum(
+            1
+            for line in compiled.asm["amdgcn"].splitlines()
+            if line.startswith("\t") and not line.lstrip().startswith((".", ";"))
+        )
+
+    handle = (1 << 40) + 3
+    constant = instructions(gda_constant_flags_kernel, handle, handle)
+    runtime = instructions(gda_runtime_flags_kernel, handle, handle, 12345)
+    assert constant * 3 < runtime * 2, (constant, runtime)
+
+
 def test_all_cco_device_symbols_are_exported_to_triton():
-    assert len(CCO_DEVICE_FUNCTIONS) == 102
+    assert len(CCO_DEVICE_FUNCTIONS) == 107
     assert set(CCO_DEVICE_FUNCTIONS).issubset(cco.__all__)
     for name in CCO_DEVICE_FUNCTIONS:
         assert callable(getattr(cco, name))
@@ -111,6 +154,8 @@ def test_triton_facades_match_flydsl_handle_names():
         "wait_signal",
         "flush",
         "flush_peer",
+        "flush_async",
+        "wait",
     } <= set(vars(cco.Gda))
     assert {
         "put",

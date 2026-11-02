@@ -56,7 +56,9 @@ from mori.cco.device.ops import (
     CoopScope,
     SdmaCmp,
     SignalOp,
+    Team,
     ThreadMode,
+    gda_flags,
     sdma_flags,
     sdma_signals,
 )
@@ -87,6 +89,14 @@ def _tc(coop, thread_mode):
             "cco: ThreadMode.AGGREGATE requires coop=CoopScope.THREAD "
             "(cco coalesces the warp's lanes itself)."
         )
+
+
+def _gda_flags(team, defer_doorbell=False):
+    """GdaFlags for one op; both axes pick the instantiation, so both are constant."""
+    return gda_flags(
+        team=_const(team, "team"),
+        defer_doorbell=_const(defer_doorbell, "defer_doorbell"),
+    )
 
 
 def _flush_tag(coop):
@@ -189,10 +199,24 @@ class Gda:
 
     ``ctx`` is a compile-time (Constexpr) field, so the handle carries a single
     IR value (dev_comm) and flows cleanly through scf.if / scf.for.
+
+    ``team`` says how ``peer`` is numbered: ``Team.WORLD`` (a world rank, the
+    default) or ``Team.GDA`` (an index in the GDA team -- the node index on a
+    RAIL connection). ``defer_doorbell=True`` on put / put_value / get writes
+    the WQEs without ringing the doorbell; the next non-deferred post, signal,
+    flush, flush_async or counter on the same QP rings for them.
+
+    Every op that posts to or flushes a QP also takes ``ctx``, the context for that one call,
+    which may be a runtime ``Int32`` (e.g. to spread chunks over contexts). It
+    defaults to the handle's own, which stays compile-time so the handle remains
+    a single IR value across scf.if / scf.for.
     """
 
     dev_comm: fx.Int64
     ctx: fx.Constexpr
+
+    def _ctx(self, ctx):
+        return self.ctx if ctx is None else ctx
 
     # ── data path ──
     def put(
@@ -209,13 +233,16 @@ class Gda:
         signal_val=0,
         coop=CoopScope.THREAD,
         thread_mode=ThreadMode.INDEPENDENT,
+        team=Team.WORLD,
+        defer_doorbell=False,
+        ctx=None,
     ):
         sym = raw.PUT[
             f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"
         ]
         sym(
             self.dev_comm,
-            self.ctx,
+            self._ctx(ctx),
             peer,
             _win(dst_win),
             dst_off,
@@ -224,6 +251,7 @@ class Gda:
             nbytes,
             signal_id,
             signal_val,
+            _gda_flags(team, defer_doorbell),
         )
 
     def put_value(
@@ -238,19 +266,23 @@ class Gda:
         signal_val=0,
         coop=CoopScope.THREAD,
         thread_mode=ThreadMode.INDEPENDENT,
+        team=Team.WORLD,
+        defer_doorbell=False,
+        ctx=None,
     ):
         sym = raw.PUT_VALUE[
             f"{_tc(coop, thread_mode)}__{_SIG_TAG[_const(signal_op, 'signal_op')]}"
         ]
         sym(
             self.dev_comm,
-            self.ctx,
+            self._ctx(ctx),
             peer,
             _win(dst_win),
             dst_off,
             value,
             signal_id,
             signal_val,
+            _gda_flags(team, defer_doorbell),
         )
 
     def get(
@@ -264,16 +296,20 @@ class Gda:
         *,
         coop=CoopScope.THREAD,
         thread_mode=ThreadMode.INDEPENDENT,
+        team=Team.WORLD,
+        defer_doorbell=False,
+        ctx=None,
     ):
         raw.GET[_tc(coop, thread_mode)](
             self.dev_comm,
-            self.ctx,
+            self._ctx(ctx),
             peer,
             _win(remote_win),
             remote_off,
             _win(local_win),
             local_off,
             nbytes,
+            _gda_flags(team, defer_doorbell),
         )
 
     # ── signal ──
@@ -285,13 +321,15 @@ class Gda:
         signal_id=0,
         signal_val=0,
         coop=CoopScope.THREAD,
+        team=Team.WORLD,
+        ctx=None,
     ):
         _const(signal_op, "signal_op")
         _const(coop, "coop")
         if signal_op == SignalOp.NONE:
             raise ValueError("cco: signal() requires signal_op INC or ADD")
         raw.SIGNAL[f"{_COOP_TAG[coop]}__{_SIG_TAG[signal_op]}"](
-            self.dev_comm, self.ctx, peer, signal_id, signal_val
+            self.dev_comm, self._ctx(ctx), peer, signal_id, signal_val, _gda_flags(team)
         )
 
     def read_signal(self, signal_id, bits=64):
@@ -306,11 +344,26 @@ class Gda:
         )
 
     # ── completion (>= warp; THREAD coop maps to warp) ──
-    def flush(self, *, coop=CoopScope.WARP):
-        raw.FLUSH[_flush_tag(coop)](self.dev_comm, self.ctx)
+    def flush(self, *, coop=CoopScope.WARP, ctx=None):
+        raw.FLUSH[_flush_tag(coop)](self.dev_comm, self._ctx(ctx))
 
-    def flush_peer(self, peer, *, coop=CoopScope.WARP):
-        raw.FLUSH_PEER[_flush_tag(coop)](self.dev_comm, self.ctx, peer)
+    def flush_peer(self, peer, *, coop=CoopScope.WARP, team=Team.WORLD, ctx=None):
+        raw.FLUSH_PEER[_flush_tag(coop)](
+            self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
+        )
+
+    def flush_async(self, peer, *, coop=CoopScope.THREAD, team=Team.WORLD, ctx=None):
+        """Ring ``peer``'s QP up to its current reservation, deferred posts
+        included, and return a request (a uint64) for :meth:`wait`. Work can go
+        between the two."""
+        return raw.FLUSH_ASYNC[_COOP_TAG[_const(coop, "coop")]](
+            self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
+        )
+
+    def wait(self, request, *, coop=CoopScope.WARP):
+        """Poll the CQ until the request :meth:`flush_async` returned has
+        completed (>= warp; THREAD maps to warp, as for flush)."""
+        raw.WAIT[_flush_tag(coop)](self.dev_comm, self.ctx, request)
 
 
 @cco_struct

@@ -33,6 +33,10 @@ are compile-time constants, so the kernel emits one direct call with no runtime
 dispatch. One distinct signal id per combo (so no reset needed): rank 1 waits on
 it (proving the signal/op arrived) and the host validates the delivered payload.
 
+Then, for each team (WORLD, GDA), the payload goes as DEFER_CHUNKS deferred
+puts that ring nothing, released by one flush_async + wait, followed by a plain
+signal -- the batch-then-release pattern of a fused MoE combine.
+
     mpirun -n 2 python main.py     (one node, FULL connection)
 """
 
@@ -70,6 +74,8 @@ MODES = [
     ("aggr_thread", cco.CoopScope.THREAD, cco.ThreadMode.AGGREGATE),
 ]
 SIGNALS = [("inc", cco.SignalOp.INC, 1), ("add", cco.SignalOp.ADD, ADD_VAL)]
+DEFER_CHUNKS = 8
+TEAMS = [("world", cco.Team.WORLD), ("gda", cco.Team.GDA)]
 
 
 def _make_put_kernel(coop, thread_mode, signal_op):
@@ -138,6 +144,56 @@ def _make_put_kernel(coop, thread_mode, signal_op):
     return run
 
 
+def _make_defer_kernel(team):
+    """DEFER_CHUNKS deferred block puts, one flush_async + wait, then a signal."""
+    chunk = NBYTES // DEFER_CHUNKS
+
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    def defer_kernel(dev_comm: Int64, send_win: Int64, recv_win: Int64, sig_id: Int32):
+        gda = cco.DevComm(dev_comm).gda(0)
+        # The QP context may be chosen at run time per call, as a kernel that
+        # spreads chunks over contexts would; here every call uses this block's.
+        qp = fx.Int32(fx.block_idx.x)
+        for c in range(DEFER_CHUNKS):  # unrolled at trace time
+            gda.put(
+                DST_RANK,
+                recv_win,
+                c * chunk,
+                send_win,
+                c * chunk,
+                chunk,
+                coop=cco.CoopScope.BLOCK,
+                team=team,
+                defer_doorbell=True,
+                ctx=qp,
+            )
+        request = gda.flush_async(DST_RANK, coop=cco.CoopScope.BLOCK, team=team, ctx=qp)
+        gda.wait(request, coop=cco.CoopScope.BLOCK)
+        gda.signal(
+            DST_RANK,
+            signal_op=cco.SignalOp.INC,
+            signal_id=sig_id,
+            coop=cco.CoopScope.BLOCK,
+            team=team,
+            ctx=qp,
+        )
+        gda.flush_peer(DST_RANK, coop=cco.CoopScope.BLOCK, team=team, ctx=qp)
+
+    @flyc.jit
+    def run(
+        dev_comm: Int64,
+        send_win: Int64,
+        recv_win: Int64,
+        sig_id: Int32,
+        stream=fx.Stream(None),
+    ):
+        defer_kernel(dev_comm, send_win, recv_win, sig_id).launch(
+            grid=(1, 1, 1), block=[THREADS, 1, 1], stream=stream
+        )
+
+    return run
+
+
 @flyc.kernel(known_block_size=[THREADS, 1, 1])
 def wait_kernel(dev_comm: Int64, sig_id: Int32, least: Int64):
     if fx.thread_idx.x == 0:
@@ -170,6 +226,7 @@ def main() -> int:
         for mname, coop, tm in MODES
         for sname, sig_op, _ in SIGNALS
     }
+    defer_runners = {tname: _make_defer_kernel(team) for tname, team in TEAMS}
     failures = 0
 
     with Communicator.init(nranks, rank, uid, per_rank_vmm=PER_RANK_VMM) as comm:
@@ -220,9 +277,36 @@ def main() -> int:
                     failures += 0 if ok else 1
                 sig_id += 1
 
+        for tname, _ in TEAMS:
+            pattern = (sig_id + 1) * 1000
+            if rank == 0:
+                fill(send_win.local_ptr, [pattern] * NUM_ELEMS)
+            else:
+                zero(recv_win.local_ptr, NBYTES)
+            comm.barrier()
+            if rank == 0:
+                defer_runners[tname](dc.ptr, send_win.handle, recv_win.handle, sig_id)
+            else:
+                run_wait(dc.ptr, sig_id, 1)
+            sync()
+            comm.barrier()
+            if rank == DST_RANK:
+                host = read(recv_win.local_ptr, NUM_ELEMS)
+                # One element per chunk: every deferred put must have landed.
+                step = NUM_ELEMS // DEFER_CHUNKS
+                ok = all(host[c * step] == pattern for c in range(DEFER_CHUNKS))
+                ok = ok and host[NUM_ELEMS - 1] == pattern
+                print(
+                    f"[deferred team={tname:5}] {'PASS' if ok else 'FAIL'} "
+                    f"({DEFER_CHUNKS} deferred puts, flush_async + wait)",
+                    flush=True,
+                )
+                failures += 0 if ok else 1
+            sig_id += 1
+
     total = mpi.allreduce(failures, op=MPI.SUM)
     if rank == 0:
-        n = len(MODES) * len(SIGNALS)
+        n = len(MODES) * len(SIGNALS) + len(TEAMS)
         print(
             (
                 f"SUCCESS ({n}/{n} template combos)"

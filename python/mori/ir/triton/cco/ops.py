@@ -37,7 +37,9 @@ from triton.language import core
 from mori.cco.device.ops import (
     CCO_DEVICE_FUNCTIONS,
     CoopScope,
+    GdaFlags,
     SignalOp,
+    Team,
     ThreadMode,
     SdmaOptFlags,
     SdmaFlags,
@@ -130,6 +132,8 @@ __all__ = list(_all_ops) + [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "Team",
+    "GdaFlags",
     "SdmaOptFlags",
     "SdmaFlags",
 ]

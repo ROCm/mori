@@ -62,6 +62,39 @@ class ThreadMode:
     AGGREGATE = 1
 
 
+class Team:
+    """C++ ``ccoTeamMode``: how a GDA op numbers ``peer``. ``WORLD`` is a world
+    rank; ``GDA`` an index in the DevComm's GDA team, i.e. the node index on a
+    ``GDA_CONNECTION_RAIL`` connection."""
+
+    WORLD = 0
+    GDA = 2
+
+
+class GdaFlags:
+    """The trailing ``flags`` word of the GDA wrappers (put, put_value, get,
+    signal, flush_peer, flush_async): the template axes their symbol name does
+    not carry. Bits 0-7 are C++ ``ccoGdaOptFlags``. Pass a compile-time constant:
+    the wrapper is inlined and its dispatch on ``flags`` then folds to one
+    instantiation."""
+
+    # ccoGdaOptFlagsDeferDoorbell: write the WQEs but do not ring the doorbell;
+    # the next non-deferred post, signal, flush, flush_async or counter on the
+    # QP rings for them. put / put_value / get only.
+    DEFER_DOORBELL = 1 << 1
+    # peer is numbered in Team.GDA rather than Team.WORLD.
+    TEAM_GDA = 1 << 8
+
+
+def gda_flags(*, team=Team.WORLD, defer_doorbell=False):
+    """:class:`GdaFlags` for one GDA op; the arguments are C++'s template ones."""
+    if team not in (Team.WORLD, Team.GDA):
+        raise ValueError("cco: GDA team must be Team.WORLD or Team.GDA")
+    return (GdaFlags.TEAM_GDA if team == Team.GDA else 0) | (
+        GdaFlags.DEFER_DOORBELL if defer_doorbell else 0
+    )
+
+
 class SdmaOptFlags:
     """C++ ``ccoSdmaOptFlags``. The window put/get wrappers (``cco_sdma_put__<tag>``
     and friends) honour AGGREGATE only; :class:`SdmaFlags` carries both."""
@@ -370,7 +403,8 @@ _add(
     tag="thread",
 )
 
-# GDA data path.
+# GDA data path. Every op that takes a peer ends in a GdaFlags word.
+# (devComm, ctx, peer, dstWin, dstOff, srcWin, srcOff, nbytes, sigId, sigVal, flags)
 _gda_put_args = [
     _U64,
     _I32,
@@ -382,9 +416,12 @@ _gda_put_args = [
     _U64,
     _I32,
     _U64,
+    _I32,
 ]
-_gda_put_value_args = [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64]
-_gda_get_args = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64]
+# (devComm, ctx, peer, dstWin, dstOff, value, sigId, sigVal, flags)
+_gda_put_value_args = [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _I32]
+# (devComm, ctx, peer, remoteWin, remoteOff, localWin, localOff, nbytes, flags)
+_gda_get_args = [_U64, _I32, _I32, _U64, _U64, _U64, _U64, _U64, _I32]
 
 for _tc in GDA_DATA_TAGS:
     for _sig in GDA_SIGNAL_TAGS:
@@ -420,7 +457,7 @@ for _coop in COOP_TAGS:
         _add(
             f"gda_signal_{_coop}_{_sig}",
             f"cco_gda_signal__{_tag}",
-            [_U64, _I32, _I32, _I32, _U64],
+            [_U64, _I32, _I32, _I32, _U64, _I32],
             _I32,
             family="gda_signal",
             tag=_tag,
@@ -461,9 +498,29 @@ for _coop in ("warp", "block"):
     _add(
         f"gda_flush_peer_{_coop}",
         f"cco_gda_flush_peer__{_coop}",
-        [_U64, _I32, _I32],
+        [_U64, _I32, _I32, _I32],
         _I32,
         family="gda_flush_peer",
+        tag=_coop,
+    )
+    # (devComm, ctx, request) -> 0
+    _add(
+        f"gda_wait_{_coop}",
+        f"cco_gda_wait__{_coop}",
+        [_U64, _I32, _U64],
+        _I32,
+        family="gda_wait",
+        tag=_coop,
+    )
+
+# (devComm, ctx, peer, flags) -> request, for gda_wait_<coop>
+for _coop in COOP_TAGS:
+    _add(
+        f"gda_flush_async_{_coop}",
+        f"cco_gda_flush_async__{_coop}",
+        [_U64, _I32, _I32, _I32],
+        _U64,
+        family="gda_flush_async",
         tag=_coop,
     )
 
@@ -477,6 +534,9 @@ __all__ = [
     "CoopScope",
     "SignalOp",
     "ThreadMode",
+    "Team",
+    "GdaFlags",
+    "gda_flags",
     "SdmaOptFlags",
     "SdmaFlags",
     "SdmaCmp",
