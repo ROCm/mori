@@ -206,8 +206,8 @@ TEST(LocalOffloadEnvTest, InvalidValuesFailInitialization) {
 }
 
 INSTANTIATE_TEST_SUITE_P(PutApis, LocalOffloadTest, ::testing::Bool(),
-                        [](const ::testing::TestParamInfo<bool>& info) {
-                          return info.param ? "Ranges" : "Contiguous";
-                        });
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return info.param ? "Ranges" : "Contiguous";
+                         });
 }  // namespace
 }  // namespace mori::umbp
