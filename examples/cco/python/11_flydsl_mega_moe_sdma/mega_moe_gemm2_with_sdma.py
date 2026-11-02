@@ -29,7 +29,7 @@ Stage2 normally scatters every GEMM2 row straight into the origin rank's
 ``comb_inp``. Here the rows go to a local send buffer ``S`` grouped by origin
 rank, so one contiguous run per peer can be moved by a copy engine::
 
-    S = [ origin rank 0: rows... | origin rank 1: rows... | ... ]   (cap rows each)
+    S = [ origin rank 0: rows... | origin rank 1: rows... | ... ]   (exact counts, packed)
 
 Within a rank's run rows are in sorted-row order, i.e. expert-major, so a prefix
 of every run is finished as soon as the first experts are. That is what lets the
@@ -63,16 +63,19 @@ from running into a slow one. ``counter`` is the call number; only the combine
 kernel advances it, after every reader of it has run.
 
 A row's *landing row* is its row index counted from the start of ``S``: ``S`` rows
-are ``[0, npes*cap)`` and ``R`` rows ``[npes*cap, 2*npes*cap)``. My own run never
-travels; it is read from ``S`` in place.
+are ``[0, send_rows)`` and ``R`` rows ``[send_rows, send_rows + recv_rows)``. My own run
+never travels; it is read from ``S`` in place.
 
-``cap`` is the rows reserved for ONE (src, dst) pair, not the whole token-slot
-space: a sender writes into the peer's ``R`` at a statically known offset with
-no handshake, so the reservation has to be per pair. Sizing it at the worst case
-(every token of a peer routing all of top-k here) costs ``npes`` times the
-window and put bs=8192 over the 4 GiB buffer-resource range; the real counts sit
-at ``slot_cap/npes``, so ``row_slack`` reserves that share with headroom and the
-plan kernel refuses to place a row past it.
+The layout is exact. aiter's prepare all-gathers every rank's per-expert route counts
+(``bigcnt``), so the plan kernel knows how many rows every rank sends every other
+before anything moves: my run for ``d`` starts at ``send_base[d]`` (the rows I send
+lower-numbered ranks) and lands in ``d``'s ``R`` at ``land_off[d]`` (the rows
+lower-numbered ranks other than ``d`` send ``d``) -- no per-pair reservation and no
+handshake. ``R`` holds what one rank gets back, at most ``max_tok * topk`` rows, so it
+never overflows. ``S`` holds what one rank sends -- everything it received in the
+dispatch, which skewed routing can make several times the even share -- and is sized
+``send_slack`` times ``max_tok * topk`` (capped by the buffer-resource range). The plan
+kernel never places a row past it.
 
 Rows are transported as fp8 with one e8m0 scale per 32 values, laid out as
 aiter's P2P scatter lays them out -- payload then scales, inline -- so one
@@ -144,7 +147,7 @@ CDONE_STRIDE = 32
 #: Rows per lane per loop trip when a comm wave pushes inv entries to a peer.
 PUSH_U = 8
 
-#: ``out_row`` of a valid row past the per-pair reservation, under the P2P fallback:
+#: ``out_row`` of a valid row past the end of ``S``, under the P2P fallback:
 #: GEMM2 writes it straight into the origin rank's ``comb_inp[slot]``.
 OUT_ROW_P2P = -2
 #: ``inv`` of a slot whose row is in this rank's ``comb_inp`` (the P2P fallback).
@@ -172,13 +175,10 @@ class ArenaLayout:
     """Byte offsets inside the cco window; identical on every rank."""
 
     npes: int
-    cap: int
+    send_rows: int
+    recv_rows: int
     row_bytes: int
     slot_cap: int
-
-    @property
-    def n_rows(self):
-        return self.npes * self.cap
 
     @property
     def off_s(self):
@@ -186,11 +186,11 @@ class ArenaLayout:
 
     @property
     def off_r(self):
-        return self.off_s + self.n_rows * self.row_bytes
+        return self.off_s + self.send_rows * self.row_bytes
 
     @property
     def off_inv(self):
-        return self.off_r + self.n_rows * self.row_bytes
+        return self.off_r + self.recv_rows * self.row_bytes
 
     @property
     def off_sig(self):
@@ -214,7 +214,7 @@ class ArenaLayout:
 
     def check(self):
         # The reduce addresses S and R through one 32-bit buffer-resource offset.
-        if 2 * self.n_rows * self.row_bytes >= 1 << 32:
+        if self.off_inv >= 1 << 32:
             raise ValueError("S+R exceed the 4 GiB buffer-resource range")
 
 
@@ -228,9 +228,21 @@ def sdma_wait_consumed(w, peer, phase, *, layout, rank):
 
 
 def sdma_put_run(
-    sdma, win, peer, queue, *, layout, rank, lo, hi, cco, remote_signal=False
+    sdma,
+    win,
+    peer,
+    queue,
+    *,
+    layout,
+    send_base,
+    land_off,
+    lo,
+    hi,
+    cco,
+    remote_signal=False,
 ):
-    """Ship rows ``[lo, hi)`` of my run for ``peer``.
+    """Ship rows ``[lo, hi)`` of my run for ``peer`` (``S`` row ``send_base`` on) to
+    ``peer``'s ``R`` row ``land_off`` on.
 
     No local signal: a put that names none keeps cco's old default, a trailing
     ATOMIC into our own signal pool, and nothing here waits on it -- completion
@@ -247,14 +259,13 @@ def sdma_put_run(
     ``recommended_sdma_engine_id_mask``), so they do not: splitting a 1.44 MB run
     in two measured 3% slower, rotating whole runs across two channels 2%.
     """
-    rb, cap = layout.row_bytes, layout.cap
+    rb = layout.row_bytes
     sdma.put(
         peer,
         win,
-        fx.Int64(layout.off_r + rank * cap * rb) + fx.Int64(lo) * fx.Int64(rb),
+        fx.Int64(layout.off_r) + (fx.Int64(land_off) + fx.Int64(lo)) * fx.Int64(rb),
         win,
-        fx.Int64(layout.off_s)
-        + (fx.Int64(peer) * fx.Int64(cap) + fx.Int64(lo)) * fx.Int64(rb),
+        fx.Int64(layout.off_s) + (fx.Int64(send_base) + fx.Int64(lo)) * fx.Int64(rb),
         fx.Int64(hi - lo) * fx.Int64(rb),
         queue,
         coop=cco.CoopScope.THREAD,
@@ -411,14 +422,29 @@ def tree_barrier(bar_addr, nblocks, tid, bid):
 
 
 def build_rank_sort_plan(
-    *, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank, p2p_fallback=False
+    *,
+    SBM,
+    topk,
+    log2_max_tok,
+    recv_cap,
+    npes,
+    rank,
+    epr,
+    total_segments,
+    send_rows,
+    p2p_fallback=False,
 ):
     """Kernel 1: give every valid sorted row a stable index in its rank's run.
 
+    * offsets: from aiter's gathered route counts ``bigcnt[src][segment]`` (per expert,
+              then one group column per rank for the dispatch's fanout pair), per pe:
+              ``n_send`` (rows I send it), ``send_base`` (rows I send lower pes),
+              ``land_off`` (rows lower ranks other than pe send it) and ``avail``
+              (rows of its run that fit in ``S``)
     * count:  ``tile_cnt[tile][pe]`` = rows of the sort tile bound for ``pe``
     * prefix: ``tile_base[tile][pe]`` = rows for ``pe`` in earlier tiles (so the
               rows of a tile range are contiguous in the run), ``cursor[pe]`` = total
-    * assign: ``out_row = pe*cap + tile_base + (earlier rows of this tile for pe)``,
+    * assign: ``out_row = send_base[pe] + tile_base + (earlier rows of this tile for pe)``,
               and ``idx_send[out_row] = origin_lid*topk + k``. Rows bound for this rank
               also get their ``inv`` entry here; the other ranks' entries are pushed by
               the GEMM2 kernel's comm waves, off this kernel's critical path
@@ -435,15 +461,16 @@ def build_rank_sort_plan(
     Before it writes anything the kernel waits until every peer has consumed the
     previous call: that is what guarantees this rank's own outbound puts have
     finished reading ``S`` (rewritten by the GEMM2 that follows).
-    ``tile_base`` is clamped to ``cap``, so a chunk that crosses the per-pair
-    reservation is cut at it instead of shipping the next peer's rows.
+    ``tile_base`` is clamped to ``avail``, so a chunk never ships past the end of ``S``.
+    ``cursor`` = [rows in the run | send_base | land_off | avail] per pe, then a counter
+    of pes whose counted rows differ from the gathered ones (must stay 0).
 
     Count and assign each run one block per tile with one thread per row: a row
     is decoded once, a wave ballot per pe gives the rows of the wave bound for it,
     and the per-wave counts go through a few LDS words. A row's rank among the
     earlier rows for its pe is then a popcount, not a walk over the tile.
 
-    A row past ``cap`` is counted in ``arg_over``. Without ``p2p_fallback`` it is
+    A row past ``avail`` is counted in ``arg_over``. Without ``p2p_fallback`` it is
     dropped (the host must check the counter); with it, it gets ``OUT_ROW_P2P`` and
     GEMM2 writes it into the origin rank's ``comb_inp`` instead.
     """
@@ -460,19 +487,26 @@ def build_rank_sort_plan(
     # LDS words: per-wave per-pe counts | per-thread partial sums | the tile's prefix.
     OFF_PART = WAVES * npes
     OFF_PREF = OFF_PART + BLOCK
-    lds_bytes = (OFF_PREF + npes) * 4
+    # Per pe, for the whole kernel: rows I send it, my run's base in S, rows that fit.
+    OFF_NSEND = OFF_PREF + npes
+    OFF_SBASE = OFF_NSEND + npes
+    OFF_AVAIL = OFF_SBASE + npes
+    OFF_LAND = OFF_AVAIL + npes
+    lds_bytes = (OFF_LAND + npes) * 4
 
     @fx.struct
     class PlanShared:
         buf: fx.Array[Int8, lds_bytes, 16]
 
     # fmt: off
-    @flyc.kernel(name=f"mega_rank_sort_plan_sbm{SBM}_k{topk}_p{npes}_c{cap}_f{int(p2p_fallback)}",
+    @flyc.kernel(name=f"mega_rank_sort_plan_sbm{SBM}_k{topk}_p{npes}_s{send_rows}"
+                      f"_e{epr}x{total_segments}_f{int(p2p_fallback)}_r{rank}",
                  known_block_size=[BLOCK, 1, 1])
     def plan(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
         arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_inv: fx.Int64, arg_cdone: fx.Int64,
         arg_bar: fx.Int64, arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
+        arg_bigcnt: fx.Int64, arg_pair_cfg: fx.Int64, arg_parity: fx.Int64,
         i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32):
     # fmt: on
         tid = fx.thread_idx.x
@@ -512,6 +546,53 @@ def build_rank_sort_plan(
         for g in range(gid, i32_cdone_n, stride):
             cdone[g] = fx.Int32(0)
 
+        # Exact offsets from the gathered route counts. Thread pe reads bigcnt row pe
+        # (the routes pe dispatched) and, per rank s, the rows pe sent s: s's expert
+        # counts plus, for the fanout pair the dispatch picked at s this call, one row per
+        # pair member for every token sent once as a group (bigcnt column TE + s).
+        # Rows I send pe = the rows pe sent me; they land in pe's R after the rows of
+        # the ranks below me other than pe itself.
+        cursor_buf = ptr_buf_tensor(arg_cursor, fx.Int32)
+        bc = ptr_buf_tensor(arg_bigcnt, fx.Int32)
+        parity = fx.Int32(comm_ops.load_i32_system(arg_parity, fx.Int32(0)))
+        if tid < fx.Int32(npes):
+            row = tid * fx.Int32(total_segments)
+            n_send = fx.Int32(0)
+            below = fx.Int32(0)
+            for dst in range_constexpr(npes):
+                if const_expr(dst <= rank):
+                    rows = fx.Int32(0)
+                    for e in range(fx.Int32(dst * epr), fx.Int32(dst * epr + epr), fx.Int32(1)):
+                        rows = rows + fx.Int32(bc[row + e])
+                    packed = fx.Int32(
+                        comm_ops.load_i32_system(arg_pair_cfg, parity * fx.Int32(npes) + fx.Int32(dst))
+                    )
+                    enabled = (packed & fx.Int32(1 << 16)) != fx.Int32(0)
+                    same = (packed & fx.Int32(0xFF)) == ((packed >> fx.Int32(8)) & fx.Int32(0xFF))
+                    members = enabled.select(same.select(fx.Int32(1), fx.Int32(2)), fx.Int32(0))
+                    rows = rows + members * fx.Int32(bc[row + fx.Int32(total_segments - npes + dst)])
+                    if const_expr(dst == rank):
+                        n_send = rows
+                    else:
+                        below = below + (tid != fx.Int32(dst)).select(rows, fx.Int32(0))
+            fx.ptr_store(n_send, lw(fx.Int32(OFF_NSEND) + tid))
+            fx.ptr_store(below, lw(fx.Int32(OFF_LAND) + tid))
+        fx.barrier()
+        if tid == fx.Int32(0):
+            sbase = fx.Int32(0)
+            for p in range_constexpr(npes):
+                n_p = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_NSEND + p))))
+                room = fx.Int32(send_rows) - sbase
+                room = (room > fx.Int32(0)).select(room, fx.Int32(0))
+                fx.ptr_store(sbase, lw(fx.Int32(OFF_SBASE + p)))
+                fx.ptr_store((n_p < room).select(n_p, room), lw(fx.Int32(OFF_AVAIL + p)))
+                sbase = sbase + n_p
+        fx.barrier()
+        if (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
+            cursor_buf[fx.Int32(npes) + tid] = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_SBASE) + tid)))
+            cursor_buf[fx.Int32(2 * npes) + tid] = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_LAND) + tid)))
+            cursor_buf[fx.Int32(3 * npes) + tid] = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_AVAIL) + tid)))
+
         lane = tid % fx.Int32(WAVE)
         wave = tid // fx.Int32(WAVE)
         row_ok = tid < fx.Int32(SBM)
@@ -548,7 +629,9 @@ def build_rank_sort_plan(
         # No rows at all: the loop below never runs, so say so explicitly.
         if (tiles == fx.Int32(0)) & (bid == fx.Int32(0)) & (tid < fx.Int32(npes)):
             tile_base[tid] = fx.Int32(0)
-            ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = fx.Int32(0)
+            cursor_buf[tid] = fx.Int32(0)
+            if fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_NSEND) + tid))) != fx.Int32(0):
+                comm_ops.atomic_add_agent(fx.Int64(arg_cursor) + fx.Int64(16 * npes), fx.Int32(1))
 
         idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
         inv_buf = ptr_buf_tensor(arg_inv, fx.Int32)
@@ -567,15 +650,20 @@ def build_rank_sort_plan(
                 for k in range_constexpr(GROUPS):
                     pre = pre + fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PART + k * npes) + tid)))
                 fx.ptr_store(pre, lw(fx.Int32(OFF_PREF) + tid))
-                tile_base[tile * fx.Int32(npes) + tid] = (pre < fx.Int32(cap)).select(
-                    pre, fx.Int32(cap)
-                )
+                avail = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_AVAIL) + tid)))
+                tile_base[tile * fx.Int32(npes) + tid] = (pre < avail).select(pre, avail)
                 # The extra row holds the totals the comm waves read as a chunk's end.
                 if tile == tiles - fx.Int32(1):
                     total = pre + tile_cnt[tile * fx.Int32(npes) + tid]
-                    capped = (total < fx.Int32(cap)).select(total, fx.Int32(cap))
+                    capped = (total < avail).select(total, avail)
                     tile_base[tiles * fx.Int32(npes) + tid] = capped
-                    ptr_buf_tensor(arg_cursor, fx.Int32)[tid] = capped
+                    cursor_buf[tid] = capped
+                    # The rows counted here must be the ones the gathered counts promised
+                    # (the peers placed my rows in their R from those).
+                    if total != fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_NSEND) + tid))):
+                        comm_ops.atomic_add_agent(
+                            fx.Int64(arg_cursor) + fx.Int64(16 * npes), fx.Int32(1)
+                        )
             fx.barrier()
 
             valid, dest_pe, dest_lid, s, masks = tile_masks(tile)
@@ -595,16 +683,15 @@ def build_rank_sort_plan(
                     )
                 excl = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PREF) + dest_pe)))
                 place = excl + within
-                # Past the per-pair reservation there is no room for this row in
-                # the run. Never write into the next peer's run: count it, and
-                # either drop it (the host asserts on the count) or hand it to
-                # GEMM2's direct P2P path.
-                if place >= fx.Int32(cap):
+                # Past the end of S there is no room for this row. Never write into
+                # the next peer's run: count it, and either drop it (the host asserts
+                # on the count) or hand it to GEMM2's direct P2P path.
+                if place >= fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_AVAIL) + dest_pe))):
                     if const_expr(p2p_fallback):
                         out_buf[g] = fx.Int32(OUT_ROW_P2P)
                     comm_ops.atomic_add_agent(arg_over, fx.Int32(1))
                 else:
-                    out_row = dest_pe * fx.Int32(cap) + place
+                    out_row = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_SBASE) + dest_pe))) + place
                     out_buf[g] = out_row
                     slot = dest_lid * fx.Int32(topk) + s
                     idx_buf[out_row] = slot
@@ -618,11 +705,12 @@ def build_rank_sort_plan(
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
         arg_out_row: fx.Int64, arg_idx: fx.Int64, arg_inv: fx.Int64, arg_cdone: fx.Int64,
         arg_bar: fx.Int64, arg_over: fx.Int64, arg_done: fx.Int64, arg_counter: fx.Int64,
+        arg_bigcnt: fx.Int64, arg_pair_cfg: fx.Int64, arg_parity: fx.Int64,
         i32_nblocks: fx.Int32, i32_cdone_n: fx.Int32, stream: fx.Stream):
     # fmt: on
         plan(arg_stids, arg_trb, arg_num_valid, arg_tile_cnt, arg_tile_base, arg_cursor,
              arg_out_row, arg_idx, arg_inv, arg_cdone, arg_bar, arg_over, arg_done, arg_counter,
-             i32_nblocks, i32_cdone_n).launch(
+             arg_bigcnt, arg_pair_cfg, arg_parity, i32_nblocks, i32_cdone_n).launch(
             grid=(i32_nblocks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch
@@ -673,7 +761,7 @@ class CommSpec:
     #: ``sdma_finish_peer``. "remote" needs the signal to ride
     #: the channel the data went out on, which ``queues`` already guarantees.
     signal_mode: str = "remote"
-    #: Rows past the reservation go to the origin rank's ``comb_inp`` (fp8 rows,
+    #: Rows past the end of S go to the origin rank's ``comb_inp`` (fp8 rows,
     #: aiter's P2P layout) instead of being dropped; needs the fields below.
     p2p_fallback: bool = False
     topk: int = 0
@@ -1247,14 +1335,23 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                 tile_base_buf = ptr_buf_tensor(arg_tile_base, fx.Int32)
                 idx_buf = ptr_buf_tensor(arg_idx, fx.Int32)
 
+                def run_offsets(peer):
+                    """The plan's exact offsets: my run's base in S and where it lands in
+                    ``peer``'s R (wave-uniform)."""
+                    run0 = fx.Int32(rocdl.readfirstlane(T.i32, cursor_buf[fx.Int32(npes) + peer]))
+                    land_run0 = fx.Int32(
+                        rocdl.readfirstlane(T.i32, cursor_buf[fx.Int32(2 * npes) + peer])
+                    )
+                    return run0, land_run0
+
                 def push_inv(peer):
                     """Fill ``peer``'s inv for the rows I send it: slot -> where the row lands
-                    there (its R rows follow its S rows, my run starts at rank * cap). All 64
-                    lanes work, PUSH_U rows each per trip, so that many idx loads are in
-                    flight before their stores."""
+                    there (its R rows follow its S rows). All 64 lanes work, PUSH_U rows each
+                    per trip, so that many idx loads are in flight before their stores."""
                     cnt = cursor_buf[peer]
+                    run0, land_run0 = run_offsets(peer)
                     inv_peer = fx.Int64(w.lsa_ptr(peer, lay.off_inv))
-                    land0 = fx.Int32(npes * lay.cap + rank * lay.cap)
+                    land0 = fx.Int32(lay.send_rows) + land_run0
                     for base in range(fx.Int32(0), cnt, fx.Int32(64 * PUSH_U)):
                         ok, js, slots = [], [], []
                         for u in range_constexpr(PUSH_U):
@@ -1263,7 +1360,7 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                             ok.append(in_run)
                             js.append(j)
                             slots.append(
-                                idx_buf[peer * fx.Int32(lay.cap) + in_run.select(j, fx.Int32(0))]
+                                idx_buf[run0 + in_run.select(j, fx.Int32(0))]
                             )
                         for u in range_constexpr(PUSH_U):
                             if ok[u]:
@@ -1283,6 +1380,11 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                         push_inv(peer)
                 rocdl.s_waitcnt(vmcnt=0)
 
+                # Read once, outside every runtime branch (a peer past npes reads pe 0's).
+                run_offs = [
+                    run_offsets((peer < fx.Int32(npes)).select(peer, fx.Int32(0)))
+                    for peer in my_peers
+                ]
                 total_tiles = (cumsum0 + fx.Int32(SBM - 1)) // fx.Int32(SBM)
                 n_chunks = (total_tiles + fx.Int32(CT - 1)) // fx.Int32(CT)
                 last = n_chunks - fx.Int32(1)
@@ -1303,7 +1405,7 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                     t0 = ci * fx.Int32(CT)
                     t1 = t0 + fx.Int32(CT)
                     t1 = (t1 < total_tiles).select(t1, total_tiles)
-                    for peer in my_peers:
+                    for peer, (run0, land_run0) in zip(my_peers, run_offs):
                         if sends_to(peer):
                             lo = tile_base_buf[t0 * fx.Int32(npes) + peer]
                             hi = tile_base_buf[t1 * fx.Int32(npes) + peer]
@@ -1312,15 +1414,15 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                                     if const_expr(sig_on_put):
                                         if ci == last:
                                             sdma_put_run(sdma, arg_win, peer, queue_of(peer),
-                                                         layout=lay, rank=rank, lo=lo, hi=hi,
+                                                         layout=lay, send_base=run0, land_off=land_run0, lo=lo, hi=hi,
                                                          cco=cco, remote_signal=True)
                                         else:
                                             sdma_put_run(sdma, arg_win, peer, queue_of(peer),
-                                                         layout=lay, rank=rank, lo=lo, hi=hi,
+                                                         layout=lay, send_base=run0, land_off=land_run0, lo=lo, hi=hi,
                                                          cco=cco)
                                     else:
                                         sdma_put_run(sdma, arg_win, peer, queue_of(peer),
-                                                     layout=lay, rank=rank, lo=lo, hi=hi, cco=cco)
+                                                     layout=lay, send_base=run0, land_off=land_run0, lo=lo, hi=hi, cco=cco)
                 for peer in my_peers:
                     if sends_to(peer):
                         if is_lane0:
@@ -1456,7 +1558,7 @@ def build_combine(
       C. the last block to finish publishes ``done`` to every peer and advances ``counter``.
 
     ``p2p_fallback``: a slot whose ``inv`` is ``INV_P2P`` is read from this rank's
-    ``comb_inp[slot]`` (``arg_comb_inp``), where GEMM2 put a row past the reservation.
+    ``comb_inp[slot]`` (``arg_comb_inp``), where GEMM2 put a row past the end of ``S``.
     """
     import mori.cco.device.flydsl as cco
 
@@ -1469,13 +1571,13 @@ def build_combine(
         raise ValueError(f"fp8_blockwise_1x32 needs hidden % 32 == 0, got {hidden}")
     if p2p_fallback and not quant_fp8:
         raise ValueError("the P2P fallback reads aiter's fp8 comb_inp rows: needs fp8_blockwise_1x32")
-    npes, cap = layout.npes, layout.cap
+    npes = layout.npes
     units = hidden // 8
     chunks = (units + BLOCK - 1) // BLOCK
     row_bytes = layout.row_bytes
 
     # fmt: off
-    @flyc.kernel(name=f"mega_combine_p{npes}_c{cap}_h{hidden}_k{topk}_{quant}_{signal_mode}"
+    @flyc.kernel(name=f"mega_combine_p{npes}_s{layout.send_rows}r{layout.recv_rows}_h{hidden}_k{topk}_{quant}_{signal_mode}"
                  f"_f{int(p2p_fallback)}_r{rank}", known_block_size=[BLOCK, 1, 1])
     def combine(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64, arg_comb_inp: fx.Int64,
         arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
@@ -1572,7 +1674,7 @@ def build_combine(
                             )
                             acc = acc + fx.Vector(raw).to(fx.Float32) * keep
                     if const_expr(p2p_fallback):
-                        # Rare: rows past the per-pair reservation, in comb_inp[slot]. The
+                        # Rare: rows past the end of S, in comb_inp[slot]. The
                         # slots are the same for the whole block, so this branch is uniform.
                         direct = [slots[k] == fx.Int32(INV_P2P) for k in range_constexpr(topk)]
                         any_direct = direct[0]
@@ -1658,10 +1760,12 @@ class MegaMoESdma:
     persistent GEMM2 of ``gemm2_8wave.py`` (workgroup 0 is the comm workgroup), which
     needs fp8 transport, ``remote`` signalling and one queue. Switch with ``set_gemm2``.
 
-    With fp8 transport (and aiter's comb_inp in the same fp8 format) a row past the
-    per-pair reservation takes the P2P fallback -- GEMM2 writes it into the origin
-    rank's ``comb_inp`` -- instead of being dropped; ``take_overflow_rows`` reports how
-    many did. With bf16 transport such rows are dropped and ``check_overflow`` raises.
+    The send/landing layout is exact (from aiter's gathered route counts); ``S`` is
+    ``send_slack`` times ``max_tok * topk`` rows, capped by the 32-bit buffer-resource
+    range. With fp8 transport (and aiter's comb_inp in the same fp8 format) a row past
+    the end of ``S`` takes the P2P fallback -- GEMM2 writes it into the origin rank's
+    ``comb_inp`` -- instead of being dropped; ``take_overflow_rows`` reports how many
+    did. With bf16 transport such rows are dropped and ``check_overflow`` raises.
 
     Needs ``MORI_ENABLE_SDMA=1`` and a mori built with SDMA.
     """
@@ -1672,7 +1776,7 @@ class MegaMoESdma:
         queues=8,
         chunk_tiles=4,
         comm_wgs=None,
-        row_slack=1.5,
+        send_slack=4.0,
         signal_mode="quiet",
         quant="none",
         gemm2="aiter",
@@ -1694,17 +1798,11 @@ class MegaMoESdma:
         # Token-slot space: one entry per (token, k). This is what idx values and
         # ``inv`` are indexed by.
         self.slot_cap = self.max_tok * self.topk
-        # Row space: how many rows one rank reserves for ONE peer, in both the
-        # send buffer and the peer's landing buffer. A sender writes into the
-        # peer's landing buffer at a statically known offset, with no handshake,
-        # so this has to be reserved per (src, dst) pair rather than packed. The
-        # worst case is slot_cap (every token of the peer routing all of top-k
-        # here), but the real counts sit at slot_cap/npes -- 4012..4221 against
-        # an even share of 4096, measured at bs=4096 -- so reserve that share
-        # times ``row_slack`` and have the plan kernel refuse to write past it.
-        # Reserving the worst case instead costs npes times the window and is
-        # what put bs=8192 over the 4 GiB buffer-resource range.
-        self.row_slack = row_slack
+        # Row space. R holds what one rank gets back -- at most its own routes, so
+        # slot_cap rows and never more. S holds what it sends -- everything it
+        # received, several times the even share under skewed routing -- so it is
+        # send_slack * slot_cap rows, capped so S + R fit a 32-bit buffer offset.
+        self.send_slack = send_slack
         if signal_mode not in ("quiet", "remote"):
             raise ValueError(
                 f"signal_mode must be quiet or remote, got {signal_mode!r}"
@@ -1716,8 +1814,6 @@ class MegaMoESdma:
                 "it would not cover"
             )
         self.signal_mode = signal_mode
-        share = -(-self.slot_cap // self.npes)
-        self.cap = -(-int(share * row_slack) // 128) * 128
         self.quant = quant
         # fp8 rows carry their e8m0 block scales inline, so one contiguous SDMA
         # put still ships a whole row.
@@ -1726,8 +1822,19 @@ class MegaMoESdma:
             if quant == "fp8_blockwise_1x32"
             else self.hidden * 2
         )
-        self.layout = ArenaLayout(self.npes, self.cap, row_bytes, self.slot_cap)
+        recv_rows = _align(self.slot_cap)
+        fit = ((1 << 31) - 1 - recv_rows * row_bytes) // row_bytes // _ALIGN * _ALIGN
+        send_rows = min(_align(int(self.slot_cap * send_slack)), fit)
+        if send_rows < _ALIGN:
+            raise ValueError(f"max_tok={self.max_tok} leaves no room for the send buffer")
+        self.layout = ArenaLayout(self.npes, send_rows, recv_rows, row_bytes, self.slot_cap)
         self.layout.check()
+        # The exact layout reads aiter's gathered route counts and fanout pairs.
+        self.epr = moe.epr
+        ws = moe._s1_dispatch_workspace
+        self.bigcnt = ws["bigcnt"]
+        self.pair_cfg = ws["fanout_pair_config"]
+        self.total_segments = self.bigcnt.numel() // self.npes
         # The fallback writes rows in aiter's comb_inp layout, which is the fp8 row
         # only if every bucket of the operator scatters fp8 rows.
         self.p2p_fallback = quant == "fp8_blockwise_1x32" and all(
@@ -1740,7 +1847,12 @@ class MegaMoESdma:
         uid = Communicator.get_unique_id() if self.rank == 0 else None
         holder = [uid]
         dist.broadcast_object_list(holder, src=0)
-        self.comm = Communicator.init(self.npes, self.rank, holder[0])
+        self.comm = Communicator.init(
+            self.npes,
+            self.rank,
+            holder[0],
+            per_rank_vmm=max(Communicator.DEFAULT_PER_RANK_VMM, _align(lay.total_bytes) + (256 << 20)),
+        )
         self.mem = self.comm.alloc_mem(lay.total_bytes)
         self.win = self.comm.register_window(self.mem.ptr, self.mem.size)
         _torch_view(self.mem.ptr, lay.total_bytes, torch.uint8).zero_()
@@ -1760,7 +1872,8 @@ class MegaMoESdma:
         self.out_row = torch.full((nvm + 4 * 128,), -1, **i32)
         self.tile_cnt = torch.zeros(max_tiles * self.npes, **i32)
         self.tile_base = torch.zeros((max_tiles + 1) * self.npes, **i32)
-        self.cursor = torch.zeros(self.npes, **i32)
+        # [run rows | send_base | land_off | avail] per pe, then the count-mismatch counter.
+        self.cursor = torch.zeros(4 * self.npes + 1, **i32)
         # One completion counter per chunk, each on its own cache line; the plan
         # kernel zeroes the prefix a launch can touch.
         self.cdone_stride = CDONE_STRIDE
@@ -1770,7 +1883,7 @@ class MegaMoESdma:
             torch.cuda.get_device_properties(dev).multi_processor_count * BAR_STRIDE,
             **i32,
         )
-        # Rows the per-pair reservation had no room for; must stay 0.
+        # Rows past the end of S (sent through the fallback, or dropped without it).
         self.overflow = torch.zeros(1, **i32)
         self.combine_fin = torch.zeros(1, **i32)
         # In the window, so a sender can fill it: -1 means "no row for this slot"; the
@@ -1781,7 +1894,7 @@ class MegaMoESdma:
         )
         self.inv.fill_(-1)
         # The plan's per-row slot, read back by the comm waves that push the peers' inv.
-        self.idx_send = torch.zeros(self.npes * self.cap, **i32)
+        self.idx_send = torch.zeros(lay.send_rows, **i32)
         self.out = torch.empty(
             self.max_tok * self.hidden, dtype=torch.bfloat16, device=dev
         )
@@ -1833,8 +1946,10 @@ class MegaMoESdma:
                 log2_max_tok=self.max_tok.bit_length() - 1,
                 recv_cap=int(self.moe.max_recv),
                 npes=self.npes,
-                cap=self.cap,
                 rank=self.rank,
+                epr=self.epr,
+                total_segments=self.total_segments,
+                send_rows=self.layout.send_rows,
                 p2p_fallback=self.p2p_fallback,
             )
         return self._plans[sbm]
@@ -1854,8 +1969,8 @@ class MegaMoESdma:
                 why.append("aiter's comb_inp in fp8 rows (the P2P fallback)")
             if self.moe.model_dim % 256 or self.moe.inter_dim % 256:
                 why.append("model_dim and inter_dim multiples of 256")
-            if 2 * lay.n_rows * lay.row_bytes >= 1 << 31:
-                why.append("S+R under 2 GiB (lower row_slack)")
+            if lay.off_inv >= 1 << 31:
+                why.append("S+R under 2 GiB (lower send_slack)")
             if why:
                 raise ValueError("gemm2='8wave' needs " + ", ".join(why))
         self.gemm2 = gemm2
@@ -1894,6 +2009,9 @@ class MegaMoESdma:
             fx.Int64(self.overflow.data_ptr()),
             fx.Int64(self.mem.ptr + lay.off_done),
             fx.Int64(self.mem.ptr + lay.off_counter),
+            fx.Int64(self.bigcnt.data_ptr()),
+            fx.Int64(self.pair_cfg.data_ptr()),
+            fx.Int64(self.moe._s1_epoch_parity.data_ptr()),
             fx.Int32(self.nblocks),
             fx.Int32(self._cdone_used()),
             s_fx,
@@ -1933,7 +2051,7 @@ class MegaMoESdma:
             inter_dim=inv["inter_dim"],
             experts=inv["experts"],
             rank=inv["rank"],
-            send_nbytes=int(lay.n_rows * lay.row_bytes),
+            send_nbytes=int(lay.send_rows * lay.row_bytes),
             BM=stage2.block_m,
             SBM=config.stage1.sort_block_m,
             HIDDEN_MAX=inv["HIDDEN_MAX"],
@@ -2051,28 +2169,33 @@ class MegaMoESdma:
         return self.out[: run_tokens * self.hidden].view(run_tokens, self.hidden)
 
     def take_overflow_rows(self):
-        """Rows past the per-pair reservation since the last call (syncs the device):
-        sent through the P2P fallback, or dropped without it."""
+        """Rows past the end of ``S`` since the last call (syncs the device): sent through
+        the P2P fallback, or dropped without it. Raises if a plan found its row counts
+        differ from aiter's gathered ones (the exact layout would then be wrong)."""
         import torch
 
         torch.cuda.synchronize()
         rows = int(self.overflow.item())
         self.overflow.zero_()
+        bad = int(self.cursor[4 * self.npes].item())
+        if bad:
+            raise RuntimeError(
+                f"rank {self.rank}: {bad} per-rank row counts differ from the gathered route counts"
+            )
         return rows
 
     def check_overflow(self):
         """Raise if the plan dropped rows since the last check (syncs the device).
 
-        Without the P2P fallback (bf16 transport) a row that does not fit its peer's
-        per-pair reservation is dropped, so the output is silently wrong unless the
-        host looks at this counter. With it nothing is dropped and this only resets
-        the counter.
+        Without the P2P fallback (bf16 transport) a row past the end of ``S`` is
+        dropped, so the output is silently wrong unless the host looks at this
+        counter. With it nothing is dropped and this only resets the counter.
         """
         dropped = self.take_overflow_rows()
         if dropped and not self.p2p_fallback:
             raise RuntimeError(
-                f"rank {self.rank}: {dropped} rows did not fit the per-pair reservation "
-                f"(cap={self.cap} rows, row_slack={self.row_slack}); raise row_slack"
+                f"rank {self.rank}: {dropped} rows did not fit the send buffer "
+                f"({self.layout.send_rows} rows, send_slack={self.send_slack}); raise send_slack"
             )
 
     def _wait_peers_consumed(self, timeout_s=30.0):

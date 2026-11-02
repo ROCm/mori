@@ -138,12 +138,18 @@ The 8-wave GEMM2 against the default one, same harness (aiter `f0b96f49e`, mori
 It helps most where GEMM2 is largest (v4_pro, `inter_dim` 3072); the same kernel
 is aiter's opt-in `MegaMoEV2(stage2_sdma=True)` path (ROCm/aiter#7196).
 
-With fp8 transport a row past the per-pair reservation (`--row-slack`) is not
-dropped: the plan marks it and GEMM2 writes it into the origin rank's `comb_inp`
-in aiter's own P2P layout, so skewed routing stays exact (`test --hot-bias 1.0`
-passes with either GEMM2). It is slow, though -- 15 ms against aiter's 4.35 ms at
-v4_pro bs=4096 with that skew -- so size `--row-slack` for the routing you expect.
-With bf16 transport (`--quant none`) such rows are still dropped and `test` fails.
+The send/landing layout is exact: the plan kernel reads aiter's all-gathered
+route counts, so every rank's run starts and lands at its real offset and nothing
+is reserved per rank pair. The landing buffer holds at most a rank's own routes and
+never overflows; the send buffer is `--send-slack` (default 4) times the even
+share, capped by the 32-bit buffer-resource range. With fp8 transport a row past
+it is not dropped: the plan marks it and GEMM2 writes it into the origin rank's
+`comb_inp` in aiter's own P2P layout, so skewed routing stays exact. That path is
+slow, but only a rank receiving more than `--send-slack` times the average takes
+it: with `test --hot-bias 1.0` (v4_pro, bs=4096) stage2+combine is 5.3 ms
+(`--gemm2 aiter`) / 4.6 ms (`8wave`) against aiter's 4.35 ms, where a per-pair
+reservation took 15 ms. With bf16 transport (`--quant none`) such rows are still
+dropped and `test` fails.
 
 Example 12 also uses `torchrun` and SDMA. Its start kernel reads each peer's READY
 once and posts a plain put when it is already set, `post_wait_mem_put_ptr` (the

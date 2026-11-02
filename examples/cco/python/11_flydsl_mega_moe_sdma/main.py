@@ -34,7 +34,7 @@ The SDMA path is ``mega_moe_gemm2_with_sdma.MegaMoESdma`` (the op and its three 
 kernel, GEMM2 with comm waves, and a combine kernel -- all in
 ``mega_moe_gemm2_with_sdma.py``). ``--gemm2 8wave`` swaps the GEMM2 for the 8-wave
 256x256 persistent kernel of ``gemm2_8wave.py`` (same plan, window and combine). With
-fp8 transport a row past the per-pair reservation is not dropped: GEMM2 writes it into
+fp8 transport a row past the end of the send buffer is not dropped: GEMM2 writes it into
 the origin rank's ``comb_inp`` (aiter's own P2P layout). This file is the
 harness around aiter's ``MegaMoEV2``: it runs aiter once for stage1/dispatch and the
 reference output, then redoes stage2 + transfer + reduce on the same state.
@@ -204,14 +204,14 @@ def _make_sdma(moe, args, chunk_tiles, gemm2="aiter"):
         queues=args.queues,
         chunk_tiles=chunk_tiles,
         quant=args.quant,
-        row_slack=args.row_slack,
+        send_slack=args.send_slack,
         signal_mode=args.signal_mode,
         gemm2=gemm2,
     )
 
 
 def _overflow_rows(sc):
-    """Rows past the per-pair reservation since the last call, summed over ranks."""
+    """Rows past the end of the send buffer since the last call, summed over ranks."""
     t = torch.tensor([sc.take_overflow_rows()], dtype=torch.int64)
     dist.all_reduce(t)
     return int(t.item())
@@ -382,11 +382,11 @@ def run_test(args, rank, world, device):
         ok = False
     if not ok:
         failures.append("sdma")
-    # With the P2P fallback (fp8) rows past the reservation are still delivered;
+    # With the P2P fallback (fp8) rows past the end of S are still delivered;
     # without it (bf16) they are dropped, which is a failure.
     overflow = _overflow_rows(sc)
     if overflow and not sc.p2p_fallback:
-        failures.append(f"overflow ({overflow} rows dropped; raise --row-slack)")
+        failures.append(f"overflow ({overflow} rows dropped; raise --send-slack)")
         ok = False
     if rank == 0:
         print(
@@ -516,7 +516,13 @@ def _parse_args():
         "slower: KFD recommends a single engine per peer link here, so "
         "extra channels share it and only add descriptors.",
     )
-    common.add_argument("--row-slack", type=float, default=1.5)
+    common.add_argument(
+        "--send-slack",
+        type=float,
+        default=4.0,
+        help="send-buffer rows as a multiple of max_tok * topk (capped by the 32-bit "
+        "buffer-resource range); rows past it take the P2P fallback (fp8) or are dropped",
+    )
     common.add_argument(
         "--signal-mode",
         choices=("quiet", "remote"),
