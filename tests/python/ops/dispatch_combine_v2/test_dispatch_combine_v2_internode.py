@@ -1831,7 +1831,7 @@ def _tune(cfg, dist_handle, device, args, comm):
     rng = torch.Generator(device=device)
     rng.manual_seed(4242 + dist_handle.rank)
     inp, idx, wts, sc = _generate_round(
-        rng, cfg, args.max_tokens, device, cfg.dispatch_dtype
+        rng, cfg, args.max_tokens, device, cfg.dispatch_dtype, args.routing
     )
     convert = (
         (lambda tensor: tensor.to(cfg.combine_dtype))

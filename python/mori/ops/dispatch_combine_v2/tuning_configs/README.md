@@ -163,18 +163,21 @@ Metrics are only comparable between rows measured under the same conditions.
   checks, and only if each phase has
   mean/median ≤ 1.10 and max/median ≤ 5, and the per-pass D+C means vary by
   ≤ 1.20×.
-- **MI300X EP8 256/6, 264/9 and 384/6 at H5120.** Tuned with the harness
-  sweep (`--cmd tuning --tuning-save`, quick scope, the harness's default
-  `scale_dim` of 32), not with the protocol above: 3 paired reps per candidate
-  against the default geometry, then a non-default winner rechecked against the
-  default with 7 paired reps, once on the tuning node and up to twice on a second
-  MI300X. A winner was kept only if it won the majority of its rechecks; the three
-  that did not were put back to the default and re-measured. Their metrics are not
-  comparable with rows measured under the protocol above.
+- **MI300X EP8.** Every rule was re-tuned and measured with the protocol above
+  on one MI300X, each rank pinned to four physical cores on its GPU's NUMA
+  node. Unpinned, the T ≤ 128 cells settle per run into a regime up to 1.5×
+  slower, which more rounds do not average out. Each phase was screened over
+  blocks 8–304 × warps 4, 8 and 16 against the previous table, two rounds,
+  and a bucket took the new rules only where they were ≥1% faster (D+C summed
+  over the dispatch dtypes) in every round of a whole-table A/B and again in
+  a confirming one. The JIT cache must be warm before timing: a cell measured
+  right after its kernels compile starts from idle-dropped clocks and reads up
+  to 40% slow at T64.
 - **Kernel.** The MI308X 264/9, 272/9 InterNodeV2, 896/16 and FP4 dispatch
-  rows were re-tuned and measured on the kernel with the topk-9/16 combine
-  gather and the 3584 B copy tail fixed (`device_primitives.hpp`). The 272/9
-  InterNodeV2LL rows predate the fix, which moves them by under 0.5%.
+  rows, and every MI300X EP8 row, were re-tuned and measured on the kernel
+  with the topk-9/16 combine gather and the 3584 B copy tail fixed
+  (`device_primitives.hpp`). The 272/9 InterNodeV2LL rows predate the fix,
+  which moves them by under 0.5%.
 - **Metrics.** `avg_latency_us` is the mean over all retained samples.
   Bandwidths are grand means of per-rank, per-round `bytes / time`, not
   `bytes / mean latency`. `bandwidth_gbps` is XGMI for intra-node rows, RDMA for
