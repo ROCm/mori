@@ -907,6 +907,22 @@ def test_gda(comm, dc, win, rank, world_size, extern_libs):
                 extern_libs=extern_libs,
                 num_warps=1,
             )
+    # Flagged put, flush_async and wait, and a runtime ctx, for both teams.
+    for team in (cco.Team.WORLD, cco.Team.GDA):
+        gda_defer_kernel.warmup(
+            dc.ptr,
+            win.handle,
+            peer=peer,
+            dst_off=dst_off,
+            src_off=SEND_OFF,
+            nbytes=NBYTES,
+            chunks=4,
+            team=team,
+            signal_id=1,
+            grid=(1,),
+            extern_libs=extern_libs,
+            num_warps=1,
+        )
 
     if _env_enabled("MORI_CCO_TRITON_GDA_COMPILE_ONLY"):
         print(f"[rank {rank}] GDA compile-only PASS", flush=True)
