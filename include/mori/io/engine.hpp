@@ -117,9 +117,9 @@ class IOEngine {
   // so a peer that noticed its connection die cannot quietly rebuild it and land
   // writes it still had queued. Call it once nothing the peer has in flight can reach
   // buffers that were handed out. Returns whether the peer was fenced.
-  // A peer whose reconnects were refused meanwhile backs off before trying again; it
-  // can drop its dead sessions and reconnect at once by fencing and unfencing this
-  // engine on its side.
+  // The peer is told, so it rebuilds on its next transfer instead of pacing the
+  // replacement of the QPs the fence killed (up to 60 s after repeated fences). That is
+  // best effort and waits at most the control-plane timeout for an unreachable peer.
   bool UnfenceRemoteEngine(const EngineKey& remote);
   // Wait for all statuses with failure-wins precedence. Empty input succeeds.
   StatusCode WaitAll(const std::vector<TransferStatus*>& statuses, int timeoutMs = -1);

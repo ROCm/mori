@@ -774,6 +774,18 @@ bool XgmiBackend::IsSameNodeEngine(const EngineKey& engineKey) const {
   return remoteEngine.hostname == myHostname;
 }
 
+FenceResult XgmiBackend::FenceRemoteEngine(const EngineKey& remote) {
+  // XGMI cannot reach a peer on another node, so it has nothing to report for one.
+  if (remote == myEngKey || !IsSameNodeEngine(remote)) return FenceResult{};
+  FenceResult result;
+  result.supported = true;
+  result.endpointsFailed = 1;
+  result.message = "peer " + remote +
+                   " is on this node and can still write over XGMI: the IPC mapping it holds "
+                   "cannot be revoked";
+  return result;
+}
+
 void XgmiBackend::RegisterRemoteEngine(const EngineDesc& desc) {
   std::lock_guard<std::mutex> lock(remoteEnginesMu);
   remoteEngines[desc.key] = desc;

@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -297,6 +298,15 @@ class ControlPlaneServer {
   // Endpoint management
   void BuildRdmaConn(EngineKey, TopoKeyPair, int nicRank);
 
+  // Tells `ekey` this engine has unfenced it. Best effort: an unreachable peer is only
+  // logged, after at most the control-plane timeout.
+  void NotifyUnfenced(const EngineKey& ekey) noexcept;
+  // Called with the sender's key when a peer reports it has unfenced this engine. Set
+  // before Start().
+  void SetUnfencedHandler(std::function<void(const EngineKey&)> handler) {
+    onUnfenced = std::move(handler);
+  }
+
   // MemoryRegion management
   void RegisterMemory(MemoryDesc&);
   void DeregisterMemory(const MemoryDesc&);
@@ -328,6 +338,7 @@ class ControlPlaneServer {
   NotifManager* notif{nullptr};
   std::unordered_map<EngineKey, EngineDesc> engines;
   std::unordered_map<MemoryUniqueId, MemoryDesc> mems;
+  std::function<void(const EngineKey&)> onUnfenced;
 };
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -451,6 +462,9 @@ class RdmaBackend : public Backend {
   // Records a replacement of failed QPs to `key` and returns how long the next one waits;
   // with `enforce`, throws QpReplacementBackoff instead while the last one says to wait.
   std::chrono::milliseconds PaceQpReplacement(const ConnBuildKey& key, bool enforce);
+  // `remote` unfenced this engine: the QP failures toward it were its fence, so replacing
+  // them need not wait out the pacing or a pending retry.
+  void ForgetQpReplacementBackoff(const EngineKey& remote);
   RdmaBackendSession* GetOrCreateSessionCached(const MemoryDesc& local, const MemoryDesc& remote);
   void InvalidateSessionsForMemory(MemoryUniqueId id);
   std::shared_ptr<std::mutex> GetConnBuildLock(const EngineKey& remoteEngineKey,

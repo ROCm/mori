@@ -38,6 +38,11 @@ namespace io {
 enum class MessageType : uint8_t {
   RegEndpoint = 0,
   AskMemoryRegion = 1,
+  // Reply to RegEndpoint from an engine that has fenced the sender. No body.
+  Fenced = 2,
+  // From an engine that has just unfenced the receiver: the receiver's QP failures toward it
+  // were the fence, not the path, so it may rebuild without waiting out its backoff.
+  Unfenced = 3,
 };
 
 struct MessageHeader {
@@ -63,6 +68,11 @@ struct MessageAskMemoryRegion {
   MSGPACK_DEFINE(ekey, devId, id, mr);
 };
 
+struct MessageUnfenced {
+  EngineKey ekey;  // the engine that lifted its fence
+  MSGPACK_DEFINE(ekey);
+};
+
 struct MessageBuildConn {
   EngineKey key;
   MSGPACK_DEFINE(key);
@@ -73,6 +83,13 @@ inline constexpr size_t kMaxControlMessageBytes = 1 << 20;
 class ProtocolError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
+};
+
+// A connection was refused because one side has fenced the other (IOEngine::FenceRemoteEngine).
+// That is deliberate and says nothing about the network path.
+class PeerFencedError : public ProtocolError {
+ public:
+  using ProtocolError::ProtocolError;
 };
 
 const char* MessageTypeName(MessageType type);
@@ -91,6 +108,10 @@ class Protocol {
 
   MessageRegEndpoint ReadMessageRegEndpoint(size_t len);
   void WriteMessageRegEndpoint(const MessageRegEndpoint&);
+  void WriteMessageFenced();
+
+  MessageUnfenced ReadMessageUnfenced(size_t len);
+  void WriteMessageUnfenced(const MessageUnfenced&);
 
   MessageAskMemoryRegion ReadMessageAskMemoryRegion(size_t len);
   void WriteMessageAskMemoryRegion(const MessageAskMemoryRegion&);

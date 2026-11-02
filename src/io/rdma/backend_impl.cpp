@@ -644,8 +644,8 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   // Checked under the same lock FenceRemoteEngine takes, so a handshake already in
   // flight cannot slip an endpoint in behind the fence.
   if (fencedPeers_.count(remoteKey) != 0) {
-    throw std::runtime_error("engine " + remoteKey +
-                             " is fenced; connections are refused until it is unfenced");
+    throw PeerFencedError("engine " + remoteKey +
+                          " is fenced; connections are refused until it is unfenced");
   }
 
   // Before the transition below, which can itself raise a fatal event.
@@ -1373,6 +1373,10 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   Protocol p(tcph);
   p.WriteMessageRegEndpoint({myEngKey, topo, devId, lep.handle, rank, devId});
   MessageHeader hdr = p.ReadMessageHeader();
+  if (hdr.type == MessageType::Fenced) {
+    throw PeerFencedError("BuildRdmaConn: engine " + ekey +
+                          " has fenced this engine and refuses connections until it unfences it");
+  }
   ExpectMessage(hdr, MessageType::RegEndpoint, "BuildRdmaConn reply from " + ekey);
   MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
 
@@ -1382,6 +1386,28 @@ void ControlPlaneServer::BuildRdmaConn(EngineKey ekey, TopoKeyPair topo, int nic
   notif->RegisterEndpoint(ert);
   MORI_IO_INFO("Built RdmaConn for engine {} with topo local({},{}) remote({},{})", ekey,
                topo.local.deviceId, topo.local.loc, topo.remote.deviceId, topo.remote.loc);
+}
+
+void ControlPlaneServer::NotifyUnfenced(const EngineKey& ekey) noexcept {
+  try {
+    std::string host;
+    int port = 0;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      auto it = engines.find(ekey);
+      if (it == engines.end()) return;
+      host = it->second.host;
+      port = it->second.port;
+    }
+    application::TCPEndpointHandle tcph = ctx->Connect(host, port);
+    TcpEndpointGuard tcpGuard(ctx.get(), tcph);
+    Protocol(tcph).WriteMessageUnfenced({myEngKey});
+  } catch (const std::exception& e) {
+    MORI_IO_WARN("Could not tell engine {} it was unfenced ({}); it reconnects once its QP "
+                 "replacement backoff expires",
+                 ekey, e.what());
+  } catch (...) {
+  }
 }
 
 void ControlPlaneServer::RegisterMemory(MemoryDesc& desc) {
@@ -1449,10 +1475,12 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
       MessageRegEndpoint msg = p.ReadMessageRegEndpoint(hdr.len);
       int rdevId = msg.devId;
 
-      // A fenced peer gets no connection: dropping the handshake makes its connect
-      // fail, which is how it learns it was cut off. Nothing is built for it.
+      // A fenced peer gets no connection, and is told why: a refusal it can tell apart
+      // from a failing path does not push its QP replacement into a long backoff.
       if (rdma->IsPeerFenced(msg.ekey)) {
-        throw ProtocolError("RegEndpoint refused: engine " + msg.ekey + " is fenced");
+        MORI_IO_DEBUG("RegEndpoint refused: engine {} is fenced", msg.ekey);
+        p.WriteMessageFenced();
+        break;
       }
 
       // Rail affinity: if the sender provided a valid railId, use the same
@@ -1483,13 +1511,25 @@ void ControlPlaneServer::HandleControlPlaneProtocol(int fd) {
 
       application::RdmaEndpoint lep = rdma->CreateEndpoint(devId);
       PendingEndpointGuard pendingEndpoint(rdma, devId, lep);
-      EndpointId eid =
-          rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
+      EndpointId eid;
+      try {
+        eid = rdma->ConnectEndpoint(msg.ekey, devId, lep, rdevId, msg.eph, msg.topo, weight);
+      } catch (const PeerFencedError&) {
+        // Fenced after the check above; the guard destroys the endpoint.
+        p.WriteMessageFenced();
+        break;
+      }
       pendingEndpoint.Commit();
       auto ert = rdma->GetEndpointRuntime(eid);
       notif->RegisterEndpoint(ert);
       p.WriteMessageRegEndpoint(
           MessageRegEndpoint{myEngKey, msg.topo, devId, lep.handle, 0, devId});
+      break;
+    }
+    case MessageType::Unfenced: {
+      MessageUnfenced msg = p.ReadMessageUnfenced(hdr.len);
+      MORI_IO_INFO("Engine {} unfenced this engine", msg.ekey);
+      if (onUnfenced) onUnfenced(msg.ekey);
       break;
     }
     case MessageType::AskMemoryRegion: {
@@ -1850,6 +1890,7 @@ RdmaBackend::RdmaBackend(EngineKey k, const IOEngineConfig& engConfig,
 
   server.reset(new ControlPlaneServer(myEngKey, engConfig.host, engConfig.port, config, rdma.get(),
                                       notif.get()));
+  server->SetUnfencedHandler([this](const EngineKey& remote) { ForgetQpReplacementBackoff(remote); });
   server->Start();
 
   if (config.qpPerTransfer == 1 && rdma->HasIonicDevice()) {
@@ -1940,6 +1981,8 @@ BackendSession* RdmaBackend::CreateSession(const MemoryDesc& local, const Memory
 
 namespace {
 constexpr std::chrono::milliseconds kReplaceRetryInterval{1000};
+// How often a fenced engine asks to be let back in. Each try is one refused handshake.
+constexpr std::chrono::milliseconds kFencedRetryInterval{200};
 constexpr std::chrono::milliseconds kMinQpReplacementInterval{1000};
 constexpr std::chrono::milliseconds kMaxQpReplacementInterval{60000};
 
@@ -2139,7 +2182,24 @@ FenceResult RdmaBackend::FenceRemoteEngine(const EngineKey& remote) {
 }
 
 bool RdmaBackend::UnfenceRemoteEngine(const EngineKey& remote) {
-  return rdma && rdma->UnfenceRemoteEngine(remote);
+  if (!rdma || !rdma->UnfenceRemoteEngine(remote)) return false;
+  // The peer's QPs died because of the fence, and it paces their replacement as if its path
+  // were failing, up to a minute after repeated fences. Telling it lets it rebuild now.
+  server->NotifyUnfenced(remote);
+  return true;
+}
+
+void RdmaBackend::ForgetQpReplacementBackoff(const EngineKey& remote) {
+  {
+    std::lock_guard<std::mutex> guard(connBuildMapMu_);
+    for (auto it = qpReplacementPacing_.begin(); it != qpReplacementPacing_.end();) {
+      it = it->first.remoteEngineKey == remote ? qpReplacementPacing_.erase(it) : std::next(it);
+    }
+  }
+  std::lock_guard<std::mutex> lock(sessionCacheMu);
+  for (auto it = replaceRetryAt.begin(); it != replaceRetryAt.end();) {
+    it = it->first.remoteEngineKey == remote ? replaceRetryAt.erase(it) : std::next(it);
+  }
 }
 
 RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& local,
@@ -2167,19 +2227,33 @@ RdmaBackendSession* RdmaBackend::GetOrCreateSessionCached(const MemoryDesc& loca
     CreateSession(local, remote, *newSess, /*paceQpReplacement=*/failed != nullptr);
   } catch (const std::exception& e) {
     if (failed == nullptr) throw;
+    const bool fenced = dynamic_cast<const PeerFencedError*>(&e) != nullptr;
+    if (fenced) {
+      // The peer cut this engine off on purpose, which says nothing about the path. Forget
+      // the replacement pacing, so getting back in once it unfences does not wait it out.
+      std::lock_guard<std::mutex> guard(connBuildMapMu_);
+      qpReplacementPacing_.erase(connKey);
+    }
     std::lock_guard<std::mutex> lock(sessionCacheMu);
     auto it = sessionCache.find(key);
     if (it == sessionCache.end()) throw;
     if (it->second.get() == failed) {
-      // The peer may be gone, or the path keeps failing. Keep the failed session: a
-      // transfer on it ends with an error status, which callers handle, while an
-      // exception would escape them.
+      // The peer may be gone, the path keeps failing, or the peer fenced us. Keep the
+      // failed session: a transfer on it ends with an error status, which callers
+      // handle, while an exception would escape them.
       const auto now = std::chrono::steady_clock::now();
       const auto* backoff = dynamic_cast<const QpReplacementBackoff*>(&e);
-      const auto retryAt = backoff != nullptr ? backoff->retryAt : now + kReplaceRetryInterval;
-      MORI_IO_WARN(
-          "Cannot replace a failed session to engine {}, retrying in {} ms: {}", remote.engineKey,
-          std::chrono::duration_cast<std::chrono::milliseconds>(retryAt - now).count(), e.what());
+      const auto retryAt = backoff != nullptr ? backoff->retryAt
+                           : fenced           ? now + kFencedRetryInterval
+                                              : now + kReplaceRetryInterval;
+      const auto waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(retryAt - now);
+      if (fenced) {
+        MORI_IO_DEBUG("Engine {} has fenced us, asking again in {} ms", remote.engineKey,
+                      waitMs.count());
+      } else {
+        MORI_IO_WARN("Cannot replace a failed session to engine {}, retrying in {} ms: {}",
+                     remote.engineKey, waitMs.count(), e.what());
+      }
       replaceRetryAt[connKey] = retryAt;
     }
     return it->second.get();

@@ -94,6 +94,9 @@ class XgmiBackend : public Backend {
   BackendSession* CreateSession(const MemoryDesc& local, const MemoryDesc& remote) override;
   bool PopInboundTransferStatus(EngineKey remote, TransferUniqueId id,
                                 TransferStatus* status) override;
+  // Cannot fence: a same-node peer writes through its own IPC mapping of our memory, which
+  // HIP gives the exporter no way to revoke. Reports such a peer as not cut off.
+  FenceResult FenceRemoteEngine(const EngineKey& remote) override;
   bool CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const override;
 
   bool IsP2PAccessible(int srcDevice, int dstDevice) const;
