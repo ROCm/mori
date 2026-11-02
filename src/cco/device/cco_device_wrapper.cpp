@@ -40,16 +40,20 @@
 //   * Provider is fixed at build time via CCO_GDA_BUILD_PROVIDER (NIC macro), so
 //     only one ccoGda<P> specialization is built (same model as the C++ kernels).
 //
-// Symbol tags (must stay in sync with python/.../_bindings.py):
-//   data path (put/put_value/get) — (ThreadMode,Coop) tag, since aggregate is
+// Symbol tags (registered in python/mori/cco/device/ops.py):
+//   GDA data path (put/put_value/get) — (ThreadMode,Coop) tag, since aggregate is
 //   only valid with thread coop (static_assert in cco_scale_out.hpp):
 //     it = independent+thread   iw = independent+warp
 //     ib = independent+block    at = aggregate+thread
 //   signal/wait/flush — coop-only tag: thread / warp / block.
 //   put/put_value/signal also carry a remote-action tag: none / inc / add.
+//   SDMA put/get on resolved addresses — coop tag only; their other axes ride
+//   in a `flags` argument (SdmaWithFlags), constant-folded once inlined.
 //   Side-effect-only wrappers return int status 0 rather than void. Triton's
 //   extern_elementwise requires a concrete return element type; FlyDSL ignores
 //   the status.
+
+#include <type_traits>
 
 #include "mori/cco/cco_scale_out.hpp"
 
@@ -100,6 +104,11 @@ CCO_DEV uint64_t cco_lsa_ptr(uint64_t window, int peer, uint64_t offset) {
   ccoWindowDevice* w = AsWindow(window);
   uint64_t stride = static_cast<uint64_t>(w->stride4G) << 32;
   return reinterpret_cast<uint64_t>(w->winBase) + static_cast<uint64_t>(peer) * stride + offset;
+}
+
+// Our own VA inside the window (ccoGetLocalPtr): cco_lsa_ptr at our LSA rank.
+CCO_DEV uint64_t cco_local_ptr(uint64_t window, uint64_t offset) {
+  return reinterpret_cast<uint64_t>(ccoGetLocalPtr(AsWindow(window), offset));
 }
 
 // ── LSA window geometry ───────────────────────────────────────────────────────
@@ -177,6 +186,42 @@ CCO_DEF_SDMA_XFER(get, block_ns, ccoCoopBlock, false)
 
 #undef CCO_DEF_SDMA_XFER
 
+// 2D put/get: same tags; dP/sP are row pitches in bytes, w (bytes) x h (rows)
+// the rect. They cross the FFI as int32 (the scalar types the bindings declare).
+#define CCO_DEF_SDMA_XFER2D(OP, TAG, COOP, SIG)                                                 \
+  CCO_DEV int cco_sdma_##OP##2d__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO, int dP, \
+                                       uint64_t sW, uint64_t sO, int sP, int w, int h, int qid, \
+                                       int flags) {                                             \
+    Sdma sdma{*AsDevComm(dc)};                                                                  \
+    const uint32_t dPitch = static_cast<uint32_t>(dP), sPitch = static_cast<uint32_t>(sP);      \
+    const uint32_t width = static_cast<uint32_t>(w), height = static_cast<uint32_t>(h);         \
+    if (static_cast<uint32_t>(flags) & ccoSdmaOptFlagsAggregate) {                              \
+      sdma.OP##2d < COOP, SIG, false,                                                           \
+          ccoSdmaOptFlagsAggregate >                                                            \
+              (peer, AsWindow(dW), dO, dPitch, AsWindow(sW), sO, sPitch, width, height, qid);   \
+    } else {                                                                                    \
+      sdma.OP##2d < COOP, SIG, false,                                                           \
+          ccoSdmaOptFlagsDefault >                                                              \
+              (peer, AsWindow(dW), dO, dPitch, AsWindow(sW), sO, sPitch, width, height, qid);   \
+    }                                                                                           \
+    return 0;                                                                                   \
+  }
+
+CCO_DEF_SDMA_XFER2D(put, thread, ccoCoopThread, true)
+CCO_DEF_SDMA_XFER2D(put, warp, ccoCoopWarp, true)
+CCO_DEF_SDMA_XFER2D(put, block, ccoCoopBlock, true)
+CCO_DEF_SDMA_XFER2D(put, thread_ns, ccoCoopThread, false)
+CCO_DEF_SDMA_XFER2D(put, warp_ns, ccoCoopWarp, false)
+CCO_DEF_SDMA_XFER2D(put, block_ns, ccoCoopBlock, false)
+CCO_DEF_SDMA_XFER2D(get, thread, ccoCoopThread, true)
+CCO_DEF_SDMA_XFER2D(get, warp, ccoCoopWarp, true)
+CCO_DEF_SDMA_XFER2D(get, block, ccoCoopBlock, true)
+CCO_DEF_SDMA_XFER2D(get, thread_ns, ccoCoopThread, false)
+CCO_DEF_SDMA_XFER2D(get, warp_ns, ccoCoopWarp, false)
+CCO_DEF_SDMA_XFER2D(get, block_ns, ccoCoopBlock, false)
+
+#undef CCO_DEF_SDMA_XFER2D
+
 // ── SDMA quiet: cco_sdma_quiet__<coop> (wait for outstanding ops to peer) ──
 #define CCO_DEF_SDMA_QUIET(TAG, COOP)                        \
   CCO_DEV int cco_sdma_quiet__##TAG(uint64_t dc, int peer) { \
@@ -208,21 +253,239 @@ CCO_DEF_SDMA_COMMIT(warp, ccoCoopWarp)
 CCO_DEF_SDMA_COMMIT(block, ccoCoopBlock)
 #undef CCO_DEF_SDMA_COMMIT
 
-CCO_DEV int cco_sdma_put_ptr_rsig__thread(uint64_t dc, int peer, uint64_t dst, uint64_t src,
-                                          uint64_t n, int qid) {
-  const ccoDevComm& comm = *AsDevComm(dc);
-  const ccoSdmaContext& s = comm.sdma;
-  ccoSdmaDispatchChunked<ccoCoopThread, false, true, ccoSdmaOptFlagsDefault,
-                         ccoSdmaThreadIndependent>(
-      s, peer, s.sdmaNumQueue, reinterpret_cast<void*>(dst), reinterpret_cast<void*>(src), n, qid,
-      static_cast<uint32_t>(comm.lsaRank), static_cast<uint32_t>(comm.lsaSize));
+// ── SDMA put/get on resolved addresses: cco_sdma_{put,get}_ptr__<coop> ──
+// ccoSdma::putPtr / getPtr with every remaining template axis carried in
+// `flags` (below). The wrappers are inlined into the caller's kernel, so a
+// compile-time constant `flags` folds the dispatch down to the one
+// instantiation; only a runtime `flags` pays for the branches. Unknown bits, and
+// SAME_QUEUE off thread scope, trap. Mirrored by SdmaFlags in ops.py.
+namespace {
+// Bits 0-1 are ccoSdmaOptFlags itself.
+constexpr int kSdmaFlagOptMask = ccoSdmaOptFlagsAggregate | ccoSdmaOptFlagsSignalPerCopy;
+constexpr int kSdmaFlagLocalSignal = 1 << 2;
+constexpr int kSdmaFlagRemoteSignal = 1 << 3;
+constexpr int kSdmaFlagSameQueue = 1 << 4;
+constexpr int kSdmaFlagAll =
+    kSdmaFlagOptMask | kSdmaFlagLocalSignal | kSdmaFlagRemoteSignal | kSdmaFlagSameQueue;
+
+template <typename T, T v>
+using Const = std::integral_constant<T, v>;
+
+// Calls fn(localSignal, remoteSignal, optFlags, threadMode), each a
+// std::integral_constant, for the instantiation `flags` names.
+template <typename Coop, typename Fn>
+inline __device__ void SdmaWithFlags(int flags, Fn&& fn) {
+  if (flags & ~kSdmaFlagAll) __builtin_trap();  // unknown SdmaFlags bit
+  auto withMode = [&](auto local, auto remote, auto opt) {
+    if (flags & kSdmaFlagSameQueue) {
+      if constexpr (std::is_same_v<Coop, ccoCoopThread>) {
+        fn(local, remote, opt, Const<ccoSdmaThreadMode, ccoSdmaThreadSameQueue>{});
+      } else {
+        __builtin_trap();  // SAME_QUEUE needs thread scope
+      }
+    } else {
+      fn(local, remote, opt, Const<ccoSdmaThreadMode, ccoSdmaThreadIndependent>{});
+    }
+  };
+  auto withOpt = [&](auto local, auto remote) {
+    switch (flags & kSdmaFlagOptMask) {
+      case 0:
+        withMode(local, remote, Const<uint32_t, 0>{});
+        break;
+      case 1:
+        withMode(local, remote, Const<uint32_t, 1>{});
+        break;
+      case 2:
+        withMode(local, remote, Const<uint32_t, 2>{});
+        break;
+      default:
+        withMode(local, remote, Const<uint32_t, 3>{});
+        break;
+    }
+  };
+  auto withRemote = [&](auto local) {
+    if (flags & kSdmaFlagRemoteSignal) {
+      withOpt(local, std::true_type{});
+    } else {
+      withOpt(local, std::false_type{});
+    }
+  };
+  if (flags & kSdmaFlagLocalSignal) {
+    withRemote(std::true_type{});
+  } else {
+    withRemote(std::false_type{});
+  }
+}
+}  // namespace
+
+#define CCO_DEF_SDMA_PTR(OP, CPP_OP, TAG, COOP)                                                \
+  CCO_DEV int cco_sdma_##OP##_ptr__##TAG(uint64_t dc, int peer, uint64_t dst, uint64_t src,    \
+                                         uint64_t n, int qid, int flags) {                     \
+    Sdma sdma{*AsDevComm(dc)};                                                                 \
+    void* d = reinterpret_cast<void*>(dst);                                                    \
+    void* s = reinterpret_cast<void*>(src);                                                    \
+    SdmaWithFlags<COOP>(flags, [&](auto local, auto remote, auto opt, auto mode) {             \
+      sdma.CPP_OP<COOP, decltype(local)::value, decltype(remote)::value, decltype(opt)::value, \
+                  decltype(mode)::value>(peer, d, s, n, qid);                                  \
+    });                                                                                        \
+    return 0;                                                                                  \
+  }
+CCO_DEF_SDMA_PTR(put, putPtr, thread, ccoCoopThread)
+CCO_DEF_SDMA_PTR(put, putPtr, warp, ccoCoopWarp)
+CCO_DEF_SDMA_PTR(put, putPtr, block, ccoCoopBlock)
+CCO_DEF_SDMA_PTR(get, getPtr, thread, ccoCoopThread)
+CCO_DEF_SDMA_PTR(get, getPtr, warp, ccoCoopWarp)
+CCO_DEF_SDMA_PTR(get, getPtr, block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_PTR
+
+// Poll our signal counter for (src lsa rank, qid) until it reaches `expected`
+// (ccoSdma::waitSignal; returns at once for an out-of-range qid).
+CCO_DEV int cco_sdma_wait_signal(uint64_t dc, int src, int qid, uint64_t expected) {
+  Sdma sdma{*AsDevComm(dc)};
+  sdma.waitSignal(src, qid, expected);
   return 0;
 }
 
+// ── SDMA put on raw addresses, signalling the peer only ──
+// Kept for existing callers; cco_sdma_put_ptr__thread with REMOTE_SIGNAL is the
+// same instantiation.
+// `dst` is the peer's address as mapped here (cco_lsa_ptr), `src` a local one;
+// neither is checked. The trailing ATOMIC bumps the peer's
+// cco_sdma_signal_slot(dc, <my lsa rank>, qid), not ours.
+CCO_DEV int cco_sdma_put_ptr_rsig__thread(uint64_t dc, int peer, uint64_t dst, uint64_t src,
+                                          uint64_t n, int qid) {
+  Sdma sdma{*AsDevComm(dc)};
+  sdma.putPtr<ccoCoopThread, false, true>(peer, reinterpret_cast<void*>(dst),
+                                          reinterpret_cast<void*>(src), n, qid);
+  return 0;
+}
+
+// Address of our signal counter for (src lsa rank, qid); 0 when out of range.
 CCO_DEV uint64_t cco_sdma_signal_slot(uint64_t dc, int src, int qid) {
-  const ccoSdmaContext& s = AsDevComm(dc)->sdma;
-  return reinterpret_cast<uint64_t>(s.signalBuf + static_cast<uint32_t>(src) * s.sdmaNumQueue +
-                                    static_cast<uint32_t>(qid));
+  Sdma sdma{*AsDevComm(dc)};
+  return reinterpret_cast<uint64_t>(sdma.signalSlot(src, qid));
+}
+
+// ── SDMA engine-side wait and broadcast ──
+// cco_sdma_{post_wait_mem,post_wait_signal,put_broadcast}__<coop>:
+// ccoSdma::postWaitMem / postWaitSignal / putBroadcast. They take only the
+// Aggregate opt flag (the broadcast also the two signals), so `flags` is the
+// SdmaFlags subset below; any other bit traps. A compile-time constant `flags`
+// folds to one instantiation once inlined, as for cco_sdma_put_ptr__<coop>.
+// On gfx12.5 these trap when reached (the packet layouts are not validated).
+namespace {
+template <typename Fn>
+inline __device__ void SdmaWaitWithFlags(int flags, Fn&& fn) {
+  if (flags & ~static_cast<int>(ccoSdmaOptFlagsAggregate)) __builtin_trap();  // unknown flag
+  if (flags & ccoSdmaOptFlagsAggregate) {
+    fn(Const<uint32_t, ccoSdmaOptFlagsAggregate>{});
+  } else {
+    fn(Const<uint32_t, ccoSdmaOptFlagsDefault>{});
+  }
+}
+
+// Calls fn(localSignal, remoteSignal, optFlags) for the instantiation `flags` names.
+template <typename Fn>
+inline __device__ void SdmaBroadcastWithFlags(int flags, Fn&& fn) {
+  constexpr int kAll = ccoSdmaOptFlagsAggregate | kSdmaFlagLocalSignal | kSdmaFlagRemoteSignal;
+  if (flags & ~kAll) __builtin_trap();  // unknown flag, or one putBroadcast has no template for
+  auto withOpt = [&](auto local, auto remote) {
+    if (flags & ccoSdmaOptFlagsAggregate) {
+      fn(local, remote, Const<uint32_t, ccoSdmaOptFlagsAggregate>{});
+    } else {
+      fn(local, remote, Const<uint32_t, ccoSdmaOptFlagsDefault>{});
+    }
+  };
+  auto withRemote = [&](auto local) {
+    if (flags & kSdmaFlagRemoteSignal) {
+      withOpt(local, std::true_type{});
+    } else {
+      withOpt(local, std::false_type{});
+    }
+  };
+  if (flags & kSdmaFlagLocalSignal) {
+    withRemote(std::true_type{});
+  } else {
+    withRemote(std::false_type{});
+  }
+}
+}  // namespace
+
+// Park queue (peer, qid) until (*(win + off) & mask) <cmp> value. `win`/`off`
+// address memory on THIS GPU; value and mask are the low 32 bits of the
+// arguments. `cmp` is ccoSdmaCmp (0 Always .. 6 Gt); anything else traps.
+#define CCO_DEF_SDMA_POST_WAIT_MEM(TAG, COOP)                                                     \
+  CCO_DEV int cco_sdma_post_wait_mem__##TAG(uint64_t dc, int peer, int qid, uint64_t win,         \
+                                            uint64_t off, uint64_t value, int cmp, uint64_t mask, \
+                                            int flags) {                                          \
+    Sdma sdma{*AsDevComm(dc)};                                                                    \
+    if (static_cast<uint32_t>(cmp) > static_cast<uint32_t>(ccoSdmaCmpGt)) __builtin_trap();       \
+    SdmaWaitWithFlags(flags, [&](auto opt) {                                                      \
+      sdma.postWaitMem<COOP, decltype(opt)::value>(                                               \
+          peer, qid, AsWindow(win), off, static_cast<uint32_t>(value),                            \
+          static_cast<ccoSdmaCmp>(cmp), static_cast<uint32_t>(mask));                             \
+    });                                                                                           \
+    return 0;                                                                                     \
+  }
+CCO_DEF_SDMA_POST_WAIT_MEM(thread, ccoCoopThread)
+CCO_DEF_SDMA_POST_WAIT_MEM(warp, ccoCoopWarp)
+CCO_DEF_SDMA_POST_WAIT_MEM(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_POST_WAIT_MEM
+
+// Park queue (peer, qid) until our signal slot (src lsa rank, sig_qid) holds
+// `expected` or more. The engine compares 32 bits: `expected` must stay below 2^32.
+#define CCO_DEF_SDMA_POST_WAIT_SIGNAL(TAG, COOP)                                           \
+  CCO_DEV int cco_sdma_post_wait_signal__##TAG(uint64_t dc, int peer, int qid, int src,    \
+                                               int sigQid, uint64_t expected, int flags) { \
+    Sdma sdma{*AsDevComm(dc)};                                                             \
+    SdmaWaitWithFlags(flags, [&](auto opt) {                                               \
+      sdma.postWaitSignal<COOP, decltype(opt)::value>(peer, qid, src, sigQid, expected);   \
+    });                                                                                    \
+    return 0;                                                                              \
+  }
+CCO_DEF_SDMA_POST_WAIT_SIGNAL(thread, ccoCoopThread)
+CCO_DEF_SDMA_POST_WAIT_SIGNAL(warp, ccoCoopWarp)
+CCO_DEF_SDMA_POST_WAIT_SIGNAL(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_POST_WAIT_SIGNAL
+
+// One local src -> two destinations in one COPY packet. (peer, dW, dO) is the
+// first destination and selects the queue; (peer2, dW2, dO2) the second.
+#define CCO_DEF_SDMA_PUT_BROADCAST(TAG, COOP)                                                    \
+  CCO_DEV int cco_sdma_put_broadcast__##TAG(uint64_t dc, int peer, uint64_t dW, uint64_t dO,     \
+                                            int peer2, uint64_t dW2, uint64_t dO2, uint64_t sW,  \
+                                            uint64_t sO, uint64_t n, int qid, int flags) {       \
+    Sdma sdma{*AsDevComm(dc)};                                                                   \
+    SdmaBroadcastWithFlags(flags, [&](auto local, auto remote, auto opt) {                       \
+      sdma.putBroadcast<COOP, decltype(local)::value, decltype(remote)::value,                   \
+                        decltype(opt)::value>(peer, AsWindow(dW), dO, peer2, AsWindow(dW2), dO2, \
+                                              AsWindow(sW), sO, n, qid);                         \
+    });                                                                                          \
+    return 0;                                                                                    \
+  }
+CCO_DEF_SDMA_PUT_BROADCAST(thread, ccoCoopThread)
+CCO_DEF_SDMA_PUT_BROADCAST(warp, ccoCoopWarp)
+CCO_DEF_SDMA_PUT_BROADCAST(block, ccoCoopBlock)
+#undef CCO_DEF_SDMA_PUT_BROADCAST
+
+// Fused wait + put: ccoSdma::postWaitMemPutPtr (POLL_REGMEM, COPY and its
+// signals in one reservation, one doorbell). Thread scope only. `flags`:
+// LOCAL_SIGNAL / REMOTE_SIGNAL / AGGREGATE; other bits trap, as does a bad cmp.
+CCO_DEV int cco_sdma_post_wait_mem_put_ptr__thread(uint64_t dc, int peer, int qid, uint64_t win,
+                                                   uint64_t off, uint64_t value, int cmp,
+                                                   uint64_t mask, uint64_t dst, uint64_t src,
+                                                   uint64_t n, int flags) {
+  Sdma sdma{*AsDevComm(dc)};
+  if (static_cast<uint32_t>(cmp) > static_cast<uint32_t>(ccoSdmaCmpGt)) __builtin_trap();
+  const auto w = AsWindow(win);
+  void* d = reinterpret_cast<void*>(dst);
+  void* s = reinterpret_cast<void*>(src);
+  const auto c = static_cast<ccoSdmaCmp>(cmp);
+  const auto v = static_cast<uint32_t>(value), m = static_cast<uint32_t>(mask);
+  SdmaBroadcastWithFlags(flags, [&](auto local, auto remote, auto opt) {
+    sdma.postWaitMemPutPtr<decltype(local)::value, decltype(remote)::value, decltype(opt)::value>(
+        peer, qid, w, off, v, c, m, d, s, n);
+  });
+  return 0;
 }
 #endif  // BUILD_CCO_SDMA
 

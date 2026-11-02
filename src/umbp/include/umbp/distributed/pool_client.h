@@ -45,8 +45,10 @@
 #include "umbp/distributed/metrics/activity_summary.h"
 #include "umbp/distributed/metrics/component_metrics.h"
 #include "umbp/distributed/peer/backend/medium_backend.h"
+#include "umbp/distributed/pool_platform.h"
 #include "umbp/distributed/transfer/transfer_engine.h"
 #include "umbp/distributed/types.h"
+#include "umbp/local/host_mem_allocator.h"
 #include "umbp_peer.grpc.pb.h"
 
 namespace mori::umbp {
@@ -57,7 +59,7 @@ class WorkloadTraceRecorder;
 
 class PeerServiceServer;
 class PeerPool;
-class HbmCopyEngine;
+class KvIndexerReporter;
 
 // Short name for log output. Generic FAILED maps to "FAILED" — the
 // detailed reason for that case lives in the peer's allocator log.
@@ -73,6 +75,8 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
       return "FAILED";
     case ::umbp::ALLOCATE_SLOT_OUTCOME_FAILED_NO_SPACE:
       return "NO_SPACE";
+    case ::umbp::ALLOCATE_SLOT_OUTCOME_IN_FLIGHT:
+      return "IN_FLIGHT";
     default:
       return "UNKNOWN";
   }
@@ -85,7 +89,7 @@ inline const char* OutcomeName(::umbp::AllocateSlotOutcome o) {
 // allocator outbox is shipped to master via the heartbeat thread.
 class PoolClient {
  public:
-  explicit PoolClient(PoolClientConfig config);
+  explicit PoolClient(PoolClientConfig config, std::shared_ptr<PoolPlatform> platform = nullptr);
   ~PoolClient();
 
   PoolClient(const PoolClient&) = delete;
@@ -123,6 +127,11 @@ class PoolClient {
                       int device = -1, MemoryRegistration mode = MemoryRegistration::kPinned);
 
   void DeregisterMemory(void* ptr);
+
+  // Optional Indexer reporting, configured once at the storage owner.
+  void ConfigureKvIndexer(const KvIndexerConfig& config);
+  KvMetadataPin RegisterKvBlock(const KvBlockMetadata& block);
+  bool FlushKvIndexer();
 
   // Hot paths.  Both retry up to `max_route_retries` times when the
   // chosen peer reports ENOSPC (Put) or unknown-key (Get); each retry
@@ -197,6 +206,9 @@ class PoolClient {
   // whether master surfaced any replica.  No RDMA, no lease bump.
   bool Exists(const std::string& key);
   std::vector<bool> BatchExists(const std::vector<std::string>& keys);
+  // Ahead of a read: local SSD keys are copied into DRAM (PeerPool::Prefetch),
+  // and keys on peers are pulled into this node's medium in the background.
+  size_t BatchPrefetch(const std::vector<std::string>& keys);
 
   MasterClient& Master();
 
@@ -252,6 +264,7 @@ class PoolClient {
 
  private:
   PoolClientConfig config_;
+  std::shared_ptr<PoolPlatform> platform_;
   std::atomic<bool> initialized_{false};
 
   // Sample every instrumented component on this node — each registered storage
@@ -340,6 +353,7 @@ class PoolClient {
   // MasterClient borrows it for heartbeat aggregation; default_pool_ borrows it
   // for logical placement and peer/local dispatch.
   BackendRegistry registry_;
+  std::shared_ptr<KvIndexerReporter> kv_indexer_;
 
   // The implicit default logical pool. It borrows registry_, owns placement
   // state and policy, and is the dispatch surface for local and peer RPC paths.
@@ -364,9 +378,6 @@ class PoolClient {
   // transport configured, in which case only local transfers are servicable.
   std::unique_ptr<TransferEngine> transfer_engine_;
   PeerDirectory* peer_directory_ = nullptr;
-  // Observer into transfer_engine_'s composite, used only to declare which
-  // host regions the gather kernel may dereference.  Not a second data path.
-  HbmCopyEngine* hbm_engine_ = nullptr;
 
   // Lazy peer connections (one per remote node).  Purely control plane since
   // Phase 6: the peer's engine desc and buffer descriptors moved into
@@ -396,7 +407,11 @@ class PoolClient {
   // offset triple, because whether a transfer needs staging is the transfer
   // layer's decision, not the client's.
   std::pair<TransferRef, uint64_t> UserBufferRef(void* ptr, size_t size) const;
+  TransferRef LocalUserBytes(void* ptr, size_t size) const;
   int PreferredNumaNodeFor(void* ptr, size_t size) const;
+  // The NUMA node a write's source lives on: its GPU's, or the node its registered
+  // host region was placed on; -1 when unknown.
+  int SourceNumaHint(const void* src, size_t size) const;
   std::unordered_map<int, int> gpu_to_numa_;
 
   // Zero-copy registered memory regions, kept sorted by `base`.
@@ -451,12 +466,15 @@ class PoolClient {
   // Each hit's bytes stay put while its resolutions[i].hold lives.  `busy`
   // receives the candidates a staged medium left for a later call while
   // serving others; without it, or when nothing was served, they are misses.
+  // `extents` (parallel to `keys`, or null) lets a staging medium publish only
+  // what each reader touches (ResolvedEntry::covered_offset / covered_size).
   void ResolveLocalBatch(const std::vector<std::string>& keys,
                          const std::vector<size_t>& candidates,
                          std::vector<MediumBackend*>* holders,
                          std::vector<ResolvedEntry>* resolutions,
                          const std::function<bool(size_t)>& dst_is_device = {},
-                         std::vector<size_t>* busy = nullptr);
+                         std::vector<size_t>* busy = nullptr,
+                         const std::vector<ObjectExtent>* extents = nullptr);
 
   // One TransferItem per page between a caller buffer and `backend`'s own
   // buffers.  `to_backend` is Put (user -> pages), false is Get (pages -> user).
@@ -607,6 +625,9 @@ class PoolClient {
   // blocks, the read that scheduled it.
   void MaybePrefetchWholeObject(const std::string& key, size_t object_size,
                                 const RouteGetResult& route);
+  // Queues the pull with no admission check; false if not queued.
+  bool QueueWholeObjectPull(const std::string& key, size_t object_size,
+                            const RouteGetResult& route);
   // The other half of the same decision: the arena slice already holds the
   // whole object (the caller's ranges tiled it in order), so locality costs one
   // local copy instead of a second trip to the peer.  Synchronous because the
@@ -642,8 +663,15 @@ class PoolClient {
   //   bytes == nullptr  -> pull the object from `route` first
   //                        (MaybePrefetchWholeObject)
   struct ReCacheJob {
+    struct BufferDeleter {
+      std::shared_ptr<PoolPlatform> platform;
+      HostBufferHandle buffer;
+      void operator()(char*) {
+        if (platform) platform->FreeHost(buffer);
+      }
+    };
     std::string key;
-    std::unique_ptr<char[]> bytes;
+    std::unique_ptr<char[], BufferDeleter> bytes{nullptr, BufferDeleter{}};
     size_t size = 0;
     std::optional<RouteGetResult> route;
   };
@@ -796,6 +824,9 @@ class PoolClient {
     const void* src;
     size_t size;
     RoutePutResult route;
+    // The writer's NUMA node when `src` is a staging copy; -1 lets the slot
+    // request derive it from `src`.
+    int numa_hint = -1;
   };
   // One byte range of a stored object, named by the caller.
   struct ByteSpan {
@@ -859,7 +890,8 @@ class PoolClient {
                                         const std::vector<const void*>& srcs,
                                         const std::vector<size_t>& sizes,
                                         const std::vector<std::optional<RoutePutResult>>& routes,
-                                        std::vector<PutEntryOutcome>* results);
+                                        std::vector<PutEntryOutcome>* results,
+                                        const std::vector<int>* numa_hints = nullptr);
   // Execute a BatchPutPlan.  Zero-copy submits all peers (not waited), runs the
   // deferred local puts in that window, then waits all + commits; staging runs
   // per peer serially.  Writes per-key outcomes into *results.

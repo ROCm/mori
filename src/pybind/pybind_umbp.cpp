@@ -19,6 +19,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+#include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -38,6 +39,7 @@ namespace py = pybind11;
 
 namespace mori {
 using namespace umbp;
+
 void RegisterMoriUmbp(py::module_& m) {
   py::enum_<HostBufferBacking>(m, "UMBPHostBufferBacking")
       .value("Anonymous", HostBufferBacking::kAnonymous)
@@ -160,6 +162,7 @@ void RegisterMoriUmbp(py::module_& m) {
           "Deprecated: use numa_nodes. Setting this property replaces the node list.")
       .def_readwrite("numa_strict", &UMBPDramConfig::numa_strict)
       .def_readwrite("prefault_threads", &UMBPDramConfig::prefault_threads)
+      .def_readwrite("max_mr_bytes", &UMBPDramConfig::max_mr_bytes)
       .def_readwrite("prefault", &UMBPDramConfig::prefault);
 
   py::class_<UMBPIoConfig>(m, "UMBPIoConfig")
@@ -262,6 +265,10 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("io_engine", &UMBPDistributedConfig::io_engine)
       .def_readwrite("staging_buffer_size", &UMBPDistributedConfig::staging_buffer_size)
       .def_readwrite("ranged_scratch_size", &UMBPDistributedConfig::ranged_scratch_size)
+      .def_readwrite("ranged_scratch_use_hugepages",
+                     &UMBPDistributedConfig::ranged_scratch_use_hugepages)
+      .def_readwrite("ranged_scratch_hugepage_size",
+                     &UMBPDistributedConfig::ranged_scratch_hugepage_size)
       .def_readwrite("ssd_staging_buffer_slots", &UMBPDistributedConfig::ssd_staging_buffer_slots)
       .def_readwrite("ssd_staging_use_hugepages", &UMBPDistributedConfig::ssd_staging_use_hugepages)
       .def_readwrite("ssd_staging_hugepage_size", &UMBPDistributedConfig::ssd_staging_hugepage_size)
@@ -288,13 +295,48 @@ void RegisterMoriUmbp(py::module_& m) {
       .def_readwrite("worker_node_address", &UMBPStandaloneProcessConfig::worker_node_address)
       .def_readwrite("tags", &UMBPStandaloneProcessConfig::tags);
 
+  py::class_<UMBPSimConfig>(m, "UMBPSimConfig")
+      .def(py::init<>())
+      .def_readwrite("enabled", &UMBPSimConfig::enabled)
+      .def_readwrite("profile_path", &UMBPSimConfig::profile_path)
+      .def_readwrite("trace_path", &UMBPSimConfig::trace_path);
+
+  py::class_<KvIndexerConfig>(m, "KvIndexerConfig")
+      .def(py::init([](const std::string& endpoint, const std::string& pool_id,
+                       py::function provider, uint32_t timeout, uint32_t repair_interval) {
+             // A bound method must not keep its owner (and that owner's client) alive.
+             if (py::hasattr(provider, "__self__") && py::hasattr(provider, "__func__")) {
+               auto weak = py::module_::import("weakref").attr("WeakMethod")(provider);
+               provider = py::cpp_function([weak](const std::vector<std::string>& keys) {
+                 auto method = weak();
+                 if (method.is_none())
+                   throw std::runtime_error("metadata provider owner was released");
+                 return method(keys).cast<std::vector<KvBlockMetadata>>();
+               });
+             }
+             return KvIndexerConfig{endpoint, pool_id, timeout,
+                                    provider.cast<decltype(KvIndexerConfig::metadata_provider)>(),
+                                    repair_interval};
+           }),
+           py::arg("endpoint"), py::arg("dram_pool_id"), py::arg("metadata_provider").none(false),
+           py::arg("timeout_ms") = 2000, py::arg("repair_interval_ms") = 30000);
+  py::class_<KvBlockMetadata>(m, "KvBlockMetadata")
+      .def(py::init([](int64_t hash, std::optional<int64_t> parent, uint32_t size,
+                       const std::map<uint32_t, std::vector<std::string>>& keys) {
+             return KvBlockMetadata{hash, parent, size, keys};
+           }),
+           py::arg("hash"), py::arg("parent_hash"), py::arg("block_size"),
+           py::arg("component_keys"));
+
   py::class_<UMBPConfig>(m, "UMBPConfig")
       .def(py::init<>())
       .def_static("from_environment", &UMBPConfig::FromEnvironment)
+      .def_readwrite("sim", &UMBPConfig::sim)
       .def_readwrite("dram", &UMBPConfig::dram)
       .def_readwrite("ssd", &UMBPConfig::ssd)
       .def_readwrite("eviction", &UMBPConfig::eviction)
       .def_readwrite("copy_pipeline", &UMBPConfig::copy_pipeline)
+      .def_readwrite("kv_indexer", &UMBPConfig::kv_indexer)
       .def_readwrite("role", &UMBPConfig::role)
       .def_readwrite("follower_mode", &UMBPConfig::follower_mode)
       .def_readwrite("force_ssd_copy_on_write", &UMBPConfig::force_ssd_copy_on_write)
@@ -307,7 +349,7 @@ void RegisterMoriUmbp(py::module_& m) {
       .def(py::init([](const UMBPConfig& cfg) { return CreateUMBPClient(cfg); }),
            py::arg("config") = UMBPConfig{})
       // All I/O-path methods release the GIL: they block on RDMA, SSD, or gRPC
-      // and never call back into Python, so releasing is always safe.
+      // Python metadata providers reacquire it through pybind11/functional.h.
       .def("put_from_ptr", &IUMBPClient::Put, py::arg("key"), py::arg("src"), py::arg("size"),
            py::call_guard<py::gil_scoped_release>())
       .def("get_into_ptr", &IUMBPClient::Get, py::arg("key"), py::arg("dst"), py::arg("size"),
@@ -329,6 +371,8 @@ void RegisterMoriUmbp(py::module_& m) {
       .def("batch_exists", &IUMBPClient::BatchExists, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("batch_exists_consecutive", &IUMBPClient::BatchExistsConsecutive, py::arg("keys"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("batch_prefetch", &IUMBPClient::BatchPrefetch, py::arg("keys"),
            py::call_guard<py::gil_scoped_release>())
       .def("clear", &IUMBPClient::Clear, py::call_guard<py::gil_scoped_release>())
       .def("flush", &IUMBPClient::Flush, py::call_guard<py::gil_scoped_release>())

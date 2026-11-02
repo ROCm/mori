@@ -391,6 +391,11 @@ static const char* dtype_suffix(hipDataType dtype) {
   }
 }
 
+// Only the InterNodeV1/V1LL dispatch and combine kernels have an "_atomicfree" variant.
+static const char* AtomicFreeSuffix(const EpDispatchCombineHandle& handle) {
+  return handle.disableRdmaAtomics ? "_atomicfree" : "";
+}
+
 static int dispatch_shared_mem(const EpDispatchCombineConfig& cfg, int wpb) {
   return (cfg.worldSize * wpb + cfg.numExpertPerRank * wpb + cfg.numExpertPerRank) *
          static_cast<int>(sizeof(index_t));
@@ -462,6 +467,7 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
   }
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
+  const char* af = AtomicFreeSuffix(handle);
   auto& reg = KernelRegistry::Instance();
 
   switch (handle.config.kernelType) {
@@ -479,14 +485,14 @@ void LaunchDispatch(EpDispatchCombineHandle& handle, void* input, void* weights,
     case KernelType::InterNodeV1:
       reg.Launch(std::string("EpDispatchCopyToStaging_") + sfx, handle.multiProcessorCount, block_x,
                  0, stream, &args, args_size);
-      reg.Launch(std::string("EpDispatchInterNodeV1Kernel_") + sfx, bn, block_x, smem, stream,
+      reg.Launch(std::string("EpDispatchInterNodeV1Kernel_") + sfx + af, bn, block_x, smem, stream,
                  &args, args_size);
       break;
     case KernelType::InterNodeV1LL:
       reg.Launch(std::string("EpDispatchCopyToStaging_") + sfx, handle.multiProcessorCount, block_x,
                  0, stream, &args, args_size);
-      reg.Launch(std::string("EpDispatchInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
-                 stream, &args, args_size);
+      reg.Launch(std::string("EpDispatchInterNodeV1KernelLowLatency_") + sfx + af, bn, block_x,
+                 smem, stream, &args, args_size);
       break;
     case KernelType::AsyncLL: {
       int mp = handle.multiProcessorCount;
@@ -541,6 +547,7 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
                                 /*use_weight_ptrs=*/true);
   size_t args_size = sizeof(EpDispatchCombineArgsRaw);
   const char* sfx = dtype_suffix(dtype);
+  const char* af = AtomicFreeSuffix(handle);
   auto& reg = KernelRegistry::Instance();
   int mp = handle.multiProcessorCount;
 
@@ -607,15 +614,15 @@ void LaunchCombine(EpDispatchCombineHandle& handle, void* input, void* weights, 
       reg.Launch(std::string("EpCombineSync_") + sfx, mp, block_x, 0, stream, &args, args_size);
       reg.Launch(std::string("EpCombineSyncBarrier_") + sfx, 1, WARP_SIZE, 0, stream, &args,
                  args_size);
-      reg.Launch(std::string("EpCombineInterNodeV1Kernel_") + sfx, bn, block_x, smem, stream, &args,
-                 args_size);
+      reg.Launch(std::string("EpCombineInterNodeV1Kernel_") + sfx + af, bn, block_x, smem, stream,
+                 &args, args_size);
       reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
       break;
     case KernelType::InterNodeV1LL:
       reg.Launch(std::string("EpCombineSync_") + sfx, mp, block_x, 0, stream, &args, args_size);
       reg.Launch(std::string("EpCombineSyncBarrier_") + sfx, 1, WARP_SIZE, 0, stream, &args,
                  args_size);
-      reg.Launch(std::string("EpCombineInterNodeV1KernelLowLatency_") + sfx, bn, block_x, smem,
+      reg.Launch(std::string("EpCombineInterNodeV1KernelLowLatency_") + sfx + af, bn, block_x, smem,
                  stream, &args, args_size);
       reg.Launch(std::string("EpCombineAll_") + sfx, mp, block_x, smem, stream, &args, args_size);
       break;

@@ -153,6 +153,7 @@ class IOEngine {
   };
 
   Backend* SelectBackend(const MemoryDesc& local, const MemoryDesc& remote);
+  void CreateSimBackend(BackendType requested, const BackendConfig& beConfig);
   bool SupportsXgmiBackendByP2P() const;
   void EnsureXgmiBackendCreatedIfSupported();
   void CaptureBackendDesc(BackendType type);

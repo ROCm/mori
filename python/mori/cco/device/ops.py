@@ -63,10 +63,70 @@ class ThreadMode:
 
 
 class SdmaOptFlags:
-    """Runtime SDMA option bits accepted by the C wrapper."""
+    """C++ ``ccoSdmaOptFlags``. The window put/get wrappers (``cco_sdma_put__<tag>``
+    and friends) honour AGGREGATE only; :class:`SdmaFlags` carries both."""
 
     DEFAULT = 0
     AGGREGATE = 1
+    SIGNAL_PER_COPY = 2
+
+
+class SdmaFlags:
+    """The ``flags`` word of ``cco_sdma_{put,get}_ptr__<coop>``: every template axis
+    of ``ccoSdma::putPtr`` / ``getPtr`` besides Coop. Bits 0-1 are
+    :class:`SdmaOptFlags`. Pass a compile-time constant: the wrapper is inlined
+    and its dispatch on ``flags`` then folds to one instantiation."""
+
+    AGGREGATE = SdmaOptFlags.AGGREGATE
+    SIGNAL_PER_COPY = SdmaOptFlags.SIGNAL_PER_COPY
+    LOCAL_SIGNAL = 1 << 2
+    REMOTE_SIGNAL = 1 << 3
+    SAME_QUEUE = 1 << 4
+
+
+class SdmaCmp:
+    """C++ ``ccoSdmaCmp``: the comparison of an engine-side wait
+    (``Sdma.post_wait_mem``), applied to ``(*flag & mask)`` against ``value``."""
+
+    ALWAYS = 0
+    LT = 1
+    LE = 2
+    EQ = 3
+    NE = 4
+    GE = 5
+    GT = 6
+
+
+def sdma_flags(
+    coop,
+    *,
+    local_signal=False,
+    remote_signal=False,
+    aggregate=False,
+    signal_per_copy=False,
+    same_queue=False,
+):
+    """:class:`SdmaFlags` for one put/get; the arguments are C++'s template ones."""
+    if same_queue and coop != CoopScope.THREAD:
+        raise ValueError("cco: same_queue requires CoopScope.THREAD")
+    return (
+        (SdmaFlags.LOCAL_SIGNAL if local_signal else 0)
+        | (SdmaFlags.REMOTE_SIGNAL if remote_signal else 0)
+        | (SdmaFlags.AGGREGATE if aggregate else 0)
+        | (SdmaFlags.SIGNAL_PER_COPY if signal_per_copy else 0)
+        | (SdmaFlags.SAME_QUEUE if same_queue else 0)
+    )
+
+
+def sdma_signals(signal, local_signal, remote_signal):
+    """(local_signal, remote_signal) of a window put/get. ``signal`` is the old
+    name of ``local_signal``; a call naming neither signal keeps the old
+    default, a local one."""
+    if signal is not None and local_signal is not None:
+        raise TypeError("cco: pass signal or local_signal, not both")
+    if local_signal is None:
+        local_signal = signal if signal is not None else remote_signal is None
+    return bool(local_signal), bool(remote_signal)
 
 
 SIGNAL_TAG = {
@@ -131,6 +191,7 @@ _add(
 # lgkmcnt). See cco_lsa_win_base in the device wrapper.
 _add("lsa_win_base", "cco_lsa_win_base", [_U64], _U64, pure=True, family="lsa")
 _add("lsa_stride", "cco_lsa_stride", [_U64], _U64, pure=True, family="lsa")
+_add("local_ptr", "cco_local_ptr", [_U64, _U64], _U64, pure=True, family="lsa")
 
 # Benchmark-only publication primitive. It is not a cooperative barrier:
 # leaderOnly=1 fences thread 0 only, so producers must synchronize first and
@@ -172,6 +233,40 @@ for _op in ("put", "get"):
             tag=_tag,
         )
 
+# SDMA 2D put/get: (devComm, peer, dstWin, dstOff, dstPitch, srcWin, srcOff,
+# srcPitch, widthBytes, height, qid, flags).
+_sdma_xfer2d_args = [
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _U64,
+    _U64,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+    _I32,
+]
+for _op in ("put", "get"):
+    for _tag in (
+        "thread",
+        "warp",
+        "block",
+        "thread_ns",
+        "warp_ns",
+        "block_ns",
+    ):
+        _add(
+            f"sdma_{_op}2d_{_tag}",
+            f"cco_sdma_{_op}2d__{_tag}",
+            _sdma_xfer2d_args,
+            _I32,
+            family=f"sdma_{_op}2d",
+            tag=_tag,
+        )
+
 for _tag in COOP_TAGS:
     _add(
         f"sdma_quiet_{_tag}",
@@ -195,6 +290,84 @@ _add(
     [_U64, _I32, _I32],
     _I32,
     family="sdma_quiet_queue",
+)
+# ccoSdma::putPtr / getPtr; the last argument is SdmaFlags.
+for _op in ("put", "get"):
+    for _tag in COOP_TAGS:
+        _add(
+            f"sdma_{_op}_ptr_{_tag}",
+            f"cco_sdma_{_op}_ptr__{_tag}",
+            [_U64, _I32, _U64, _U64, _U64, _I32, _I32],
+            _I32,
+            family=f"sdma_{_op}_ptr",
+            tag=_tag,
+        )
+_add(
+    "sdma_wait_signal",
+    "cco_sdma_wait_signal",
+    [_U64, _I32, _I32, _U64],
+    _I32,
+    family="sdma_wait_signal",
+)
+# Older spelling of sdma_put_ptr_thread with SdmaFlags.REMOTE_SIGNAL.
+_add(
+    "sdma_put_ptr_rsig_thread",
+    "cco_sdma_put_ptr_rsig__thread",
+    [_U64, _I32, _U64, _U64, _U64, _I32],
+    _I32,
+    family="sdma_put_ptr_rsig",
+    tag="thread",
+)
+_add(
+    "sdma_signal_slot",
+    "cco_sdma_signal_slot",
+    [_U64, _I32, _I32],
+    _U64,
+    pure=True,
+    family="sdma_signal_slot",
+)
+
+# Engine-side wait and broadcast. `flags` is the SdmaFlags subset the C++ call
+# takes: AGGREGATE for the waits; AGGREGATE | LOCAL_SIGNAL | REMOTE_SIGNAL for
+# the broadcast. value / mask / expected are 32-bit quantities in a uint64.
+for _tag in COOP_TAGS:
+    # (devComm, peer, qid, win, off, value, cmp, mask, flags)
+    _add(
+        f"sdma_post_wait_mem_{_tag}",
+        f"cco_sdma_post_wait_mem__{_tag}",
+        [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _I32],
+        _I32,
+        family="sdma_post_wait_mem",
+        tag=_tag,
+    )
+    # (devComm, peer, qid, srcLsaRank, sigQid, expected, flags)
+    _add(
+        f"sdma_post_wait_signal_{_tag}",
+        f"cco_sdma_post_wait_signal__{_tag}",
+        [_U64, _I32, _I32, _I32, _I32, _U64, _I32],
+        _I32,
+        family="sdma_post_wait_signal",
+        tag=_tag,
+    )
+    # (devComm, peer, dstWin, dstOff, peer2, dstWin2, dstOff2, srcWin, srcOff,
+    #  nbytes, qid, flags)
+    _add(
+        f"sdma_put_broadcast_{_tag}",
+        f"cco_sdma_put_broadcast__{_tag}",
+        [_U64, _I32, _U64, _U64, _I32, _U64, _U64, _U64, _U64, _U64, _I32, _I32],
+        _I32,
+        family="sdma_put_broadcast",
+        tag=_tag,
+    )
+# ccoSdma::postWaitMemPutPtr: wait + copy + signals in one reservation, one
+# doorbell. (devComm, peer, qid, win, off, value, cmp, mask, dst, src, nbytes, flags)
+_add(
+    "sdma_post_wait_mem_put_ptr_thread",
+    "cco_sdma_post_wait_mem_put_ptr__thread",
+    [_U64, _I32, _I32, _U64, _U64, _U64, _I32, _U64, _U64, _U64, _U64, _I32],
+    _I32,
+    family="sdma_post_wait_mem_put_ptr",
+    tag="thread",
 )
 
 # GDA data path.
@@ -305,6 +478,10 @@ __all__ = [
     "SignalOp",
     "ThreadMode",
     "SdmaOptFlags",
+    "SdmaFlags",
+    "SdmaCmp",
+    "sdma_flags",
+    "sdma_signals",
     "SIGNAL_TAG",
     "COOP_TAG",
     "DATA_PATH_TAG",

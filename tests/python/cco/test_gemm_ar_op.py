@@ -417,12 +417,14 @@ requires_two_gpus = pytest.mark.skipif(
 requires_gpu = pytest.mark.skipif(torch.cuda.device_count() < 1, reason="needs a GPU")
 
 
-def _mxfp8_gemm_rel_l2(n: int, k: int, m: int, pad: bool = False) -> float:
+def _mxfp8_gemm_rel_l2(
+    n: int, k: int, m: int, pad: bool = False, quant: str = "mxfp8"
+) -> float:
     """One standalone GEMM against an fp32 reference built from the same bytes."""
     from mori.ops.gemm_ar import Mxfp8GemmOp, preshuffle_a_scale, preshuffle_b
 
     g = torch.Generator(device="cuda").manual_seed(11)
-    op = Mxfp8GemmOp(n=n, k=k)
+    op = Mxfp8GemmOp(n=n, k=k, quant=quant)
     m_pad = op.padded_m(m) if pad else m
     a_bf16 = (torch.randn(m, k, generator=g, device="cuda") / 8).to(torch.bfloat16)
     a_in = op.pad_rows(a_bf16, m_pad) if m_pad != m else a_bf16
@@ -434,9 +436,11 @@ def _mxfp8_gemm_rel_l2(n: int, k: int, m: int, pad: bool = False) -> float:
     eb = torch.randint(
         120, 123, (n // 32, k // 32), generator=g, device="cuda", dtype=torch.int32
     )
-    got = op(
-        a, preshuffle_b(b), preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
-    )[:m]
+    if quant == "mxfp8_raw":
+        sa, sb = ea.to(torch.uint8), eb.to(torch.uint8)
+    else:
+        sa, sb = preshuffle_a_scale(ea), eb.t().reshape(-1).contiguous()
+    got = op(a, preshuffle_b(b), sa, sb)[:m]
 
     sav, sbv = torch.exp2(ea.float() - 127.0), torch.exp2(eb.float() - 127.0)
     af, bf = a.float(), b.float()
@@ -455,17 +459,35 @@ def _mxfp8_gemm_rel_l2(n: int, k: int, m: int, pad: bool = False) -> float:
 
 
 @requires_gpu
+@pytest.mark.parametrize("quant", ["mxfp8", "mxfp8_raw"])
 @pytest.mark.parametrize("n,k,label", [(8192, 1280, "wq_b"), (5120, 2048, "wo_b")])
-@pytest.mark.parametrize("m", [64, 192, 1024])
-def test_standalone_mxfp8_gemm(n, k, label, m):
+@pytest.mark.parametrize("m", [64, 192, 1024, 4096])
+def test_standalone_mxfp8_gemm(n, k, label, m, quant):
     """``Mxfp8GemmOp`` at DeepSeek-V4.1-Flash's two attention shapes.
 
     Single process on purpose: this op has no communicator and no symmetric
     window, which is the whole reason it exists -- a ColumnParallelLinear like
     wq_b has no all-reduce to fuse with. M=192 is not a multiple of BLOCK_M and
     still has to be exact: the grid is ceildiv and the tail block masks.
+    M=4096 is past the crossover, so it runs the 256-wide N tile where the
+    others run the 128-wide one.
     """
-    assert _mxfp8_gemm_rel_l2(n, k, m) < FP8_FLOOR
+    assert _mxfp8_gemm_rel_l2(n, k, m, quant=quant) < FP8_FLOOR
+
+
+@requires_gpu
+@pytest.mark.parametrize("m", [1, 100, 1000])
+def test_standalone_mxfp8_raw_takes_any_m(m):
+    """``"mxfp8_raw"`` has no packed scale group, so M goes in unpadded.
+
+    The scale rows past M read as zero (the buffer descriptor is the tensor's
+    extent) and the tail block masks its stores, so nothing past M is read from
+    the caller or written to it.
+    """
+    from mori.ops.gemm_ar import Mxfp8GemmOp
+
+    assert Mxfp8GemmOp(n=5120, k=2048, quant="mxfp8_raw").padded_m(m) == m
+    assert _mxfp8_gemm_rel_l2(5120, 2048, m, quant="mxfp8_raw") < FP8_FLOOR
 
 
 @requires_gpu
@@ -671,6 +693,19 @@ def test_mxfp8_quant_runs_end_to_end(worker_results):
     than failing, which is why the check is numerical.
     """
     r = _case(worker_results, "mxfp8")
+    assert r["rel_l2"] < FP8_FLOOR, r
+
+
+@requires_two_gpus
+def test_mxfp8_raw_quant_runs_end_to_end(worker_results):
+    """``quant="mxfp8_raw"`` through the public op, with row-major uint8 scales.
+
+    The kernel stages these through LDS rather than reading them from global,
+    and the fused path compiles a different epilogue from the standalone GEMM
+    the kernel-layer tests run, so this is the one check that the staging and
+    the scatter coexist.
+    """
+    r = _case(worker_results, "mxfp8_raw")
     assert r["rel_l2"] < FP8_FLOOR, r
 
 

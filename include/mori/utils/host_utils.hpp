@@ -21,6 +21,8 @@
 // SOFTWARE.
 #pragma once
 
+#include <sys/resource.h>
+
 #include <cctype>
 #include <fstream>
 #include <string>
@@ -50,6 +52,15 @@ inline std::string ResolveNodeId(const std::string& hostname) {
   std::string bootId = ReadKernelBootId();
   if (!bootId.empty()) return bootId;
   return hostname;
+}
+
+// The soft RLIMIT_MEMLOCK as log text: "unlimited", "<n> KiB", or "unknown" when
+// it cannot be read. RDMA memory registration pins pages against this limit.
+inline std::string MemlockLimitString() {
+  rlimit memlock{};
+  if (getrlimit(RLIMIT_MEMLOCK, &memlock) != 0) return "unknown";
+  if (memlock.rlim_cur == RLIM_INFINITY) return "unlimited";
+  return std::to_string(memlock.rlim_cur >> 10) + " KiB";
 }
 
 }  // namespace mori

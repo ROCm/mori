@@ -40,6 +40,8 @@ const unsigned int SDMA_OP_ATOMIC = 10;
 const unsigned int SDMA_OP_CONST_FILL = 11;
 
 const unsigned int SDMA_SUBOP_COPY_LINEAR = 0;
+// 32-bit-field 2D copy (rocm-xio: SDMA_PKT_LINEAR_LARGE_SUB_WINDOW_COPY).
+const unsigned int SDMA_SUBOP_COPY_LINEAR_LARGE_SUB_WINDOW = 36;
 
 const unsigned int SDMA_SUBOP_WRITE_LINEAR = 0;
 const unsigned int SDMA_ATOMIC_ADD64 = 47;
@@ -108,6 +110,44 @@ typedef struct SDMA_PKT_COPY_LINEAR_TAG {
   } DST_ADDR_HI_UNION;
 } SDMA_PKT_COPY_LINEAR, *PSDMA_PKT_COPY_LINEAR;
 static_assert(sizeof(SDMA_PKT_COPY_LINEAR) != 7, "SDMA PKT Linear does n't have 7 dwords");
+
+// COPY_LINEAR with header.broadcast=1: one source read, two destination writes.
+typedef struct SDMA_PKT_COPY_BROADCAST_TAG {
+  union {
+    struct {
+      unsigned int op : 8;
+      unsigned int sub_op : 8;
+      unsigned int reserved_0 : 11;
+      unsigned int broadcast : 1;
+      unsigned int reserved_1 : 4;
+    };
+    unsigned int DW_0_DATA;
+  } HEADER_UNION;
+
+  union {
+    struct {
+      unsigned int count : 30;
+      unsigned int reserved_0 : 2;
+    };
+    unsigned int DW_1_DATA;
+  } COUNT_UNION;
+
+  union {
+    struct {
+      unsigned int reserved_0 : 32;
+    };
+    unsigned int DW_2_DATA;
+  } PARAMETER_UNION;
+
+  unsigned int SRC_ADDR_LO;
+  unsigned int SRC_ADDR_HI;
+  unsigned int DST1_ADDR_LO;
+  unsigned int DST1_ADDR_HI;
+  unsigned int DST2_ADDR_LO;
+  unsigned int DST2_ADDR_HI;
+} SDMA_PKT_COPY_BROADCAST, *PSDMA_PKT_COPY_BROADCAST;
+static_assert(sizeof(SDMA_PKT_COPY_BROADCAST) == 9 * sizeof(unsigned int),
+              "SDMA copy-broadcast packet must be 9 dwords");
 
 typedef struct SDMA_PKT_WRITE_UNTILED_TAG {
   union {
@@ -402,3 +442,39 @@ typedef struct SDMA_PKT_ATOMIC_TAG {
     unsigned int DW_7_DATA;
   } LOOP_UNION;
 } SDMA_PKT_ATOMIC;
+
+// Copy a rectangle of rect_y rows x rect_x bytes between two pitched buffers.
+// x, pitch and rect_x are bytes; y and rect_y rows. Pitch and rect fields are
+// stored minus one; slice pitch 0 and rect_z 0 make it 2D.
+typedef struct SDMA_PKT_COPY_LARGE_SUB_WINDOW_TAG {
+  union {
+    struct {
+      unsigned int op : 8;
+      unsigned int sub_op : 8;
+      unsigned int reserved_0 : 16;
+    };
+    unsigned int DW_0_DATA;
+  } HEADER_UNION;
+
+  unsigned int src_addr_31_0;
+  unsigned int src_addr_63_32;
+  unsigned int src_x;
+  unsigned int src_y;
+  unsigned int src_z;
+  unsigned int src_pitch;
+  unsigned int src_slice_pitch_31_0;
+  unsigned int src_slice_pitch_47_32;  // high 16 bits reserved
+  unsigned int dst_addr_31_0;
+  unsigned int dst_addr_63_32;
+  unsigned int dst_x;
+  unsigned int dst_y;
+  unsigned int dst_z;
+  unsigned int dst_pitch;
+  unsigned int dst_slice_pitch_31_0;
+  unsigned int dst_slice_pitch_47_32;  // high 16 bits reserved
+  unsigned int rect_x;
+  unsigned int rect_y;
+  unsigned int rect_z;
+} SDMA_PKT_COPY_LARGE_SUB_WINDOW;
+static_assert(sizeof(SDMA_PKT_COPY_LARGE_SUB_WINDOW) == 20 * sizeof(unsigned int),
+              "SDMA large sub-window copy packet must be 20 dwords");

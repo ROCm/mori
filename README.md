@@ -2,6 +2,7 @@
 
 ## News
 
+- **[2026/10]** 🔥 MoRI UMBP Empowers AMD Instinct™ MI355X GPU to Demonstrate Token-per-Dollar TCO Leadership on the Public AgentX Leaderboard ([blog](https://www.amd.com/en/developer/resources/technical-articles/2026/mori-umbp-empowers-amd-instinct-gpus.html)).
 - **[2026/07]** 🔥 MORI powers Kimi's agentic AI serving solution with UMBP, co-designed by AMD and Moonshot AI for AMD Instinct™ GPUs ([blog](https://www.amd.com/en/developer/resources/technical-articles/2026/rebuilding-agentic-ai-for-amd-gpu.html)).
 - **[2026/05]** 🔥 MORI powers SGLang on AMD Instinct™ MI355X achieves competitive TCO for large-scale DeepSeek disaggregated inference ([blog](https://www.lmsys.org/blog/2026-05-28-mori/)).
 - **[2026/05]** 🔥 MORI becomes the primary EP communication library for AMD platforms in Alibaba RTP-LLM ([MORI-EP PR](https://github.com/alibaba/rtp-llm/pull/977)).
@@ -193,6 +194,7 @@ GPU Direct RDMA READ, pairwise, 128 consecutive transfers, 1 GPU, MI300X + Thor2
 ### Prerequisites
 
 - ROCm >= 6.4 (hipcc needed at runtime for JIT kernel compilation, not at install time)
+  - On RHEL/Rocky/AlmaLinux also install `gcc-c++`: that JIT needs the C++ standard headers, which ROCm's RPMs do not pull in. Without them every kernel compile fails with `Could not find standard C++ header 'cmath'`.
 - System packages (required for `pip install`; not bundled in wheels). On Debian/Ubuntu install at least:
   - `libibverbs-dev`, `ibverbs-utils`
   See [docker/Dockerfile.dev](https://github.com/ROCm/mori/blob/main/docker/Dockerfile.dev) for the full apt list used in CI/dev images.

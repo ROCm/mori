@@ -24,6 +24,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -57,12 +60,17 @@ enum class UMBPDurabilityMode : int {
   Relaxed = 1,
 };
 
+// Default UMBP_DRAM_MAX_MR_BYTES.  AMD Pensando AINIC (ionic) translates only
+// the first 2^18 page entries of a memory region and silently aliases the rest,
+// which with 2 MiB pages is 512 GiB.  On 4 KiB pages the safe value is 1 GiB.
+inline constexpr uint64_t kDefaultDramMaxMrBytes = 512ULL << 30;
+
 struct UMBPDramConfig {
   size_t capacity_bytes = 4ULL * 1024 * 1024 * 1024;
   bool use_shared_memory = false;
   std::string shm_name = "/umbp_dram";
-  double high_watermark = 0.9;
-  double low_watermark = 0.7;
+  double high_watermark = 0.95;
+  double low_watermark = 0.9;
 
   // Host memory options (ignored when use_shared_memory=true).
   bool use_hugepages = false;
@@ -71,6 +79,9 @@ struct UMBPDramConfig {
   bool prefault = true;
   bool numa_strict = false;
   int prefault_threads = 0;  // 0 = automatic (up to 16), 1 = serial.
+  // Largest piece of a host buffer registered with the NIC as one memory
+  // region; a bigger buffer is registered in pieces.  0 = no limit.
+  size_t max_mr_bytes = kDefaultDramMaxMrBytes;
 };
 
 struct UMBPIoConfig {
@@ -336,6 +347,12 @@ struct UMBPDistributedConfig {
   // stops paying for an arena it does not use.
   size_t ranged_scratch_size = 0;
 
+  // Back both ranged scratch arenas with hugetlbfs pages.  Each arena is one
+  // NIC memory region, so hugepages cut its translation entries, which NICs
+  // cap per region.  Falls back to 4 KiB pages when no hugetlb pages are free.
+  bool ranged_scratch_use_hugepages = false;
+  size_t ranged_scratch_hugepage_size = 2ULL * 1024 * 1024;  // 2 MiB
+
   // SSD staging arena in pages (env UMBP_DISTRIBUTED_SSD_STAGING_BUFFER_SLOTS);
   // 0 = 4 GiB capped at the SSD tier.
   int ssd_staging_buffer_slots = 0;
@@ -409,6 +426,11 @@ struct UMBPDistributedConfig {
   // 0 means unlimited (no size gate). Default 16 MB.
   size_t admission_max_block_bytes = 16ULL * 1024 * 1024;
 
+  // DRAM held by BatchPrefetch copies of local SSD-resident keys; past it the
+  // oldest copies are dropped. Pulls from peers are ordinary residents. 0 turns
+  // prefetch off.
+  size_t prefetch_budget_bytes = 16ULL << 30;
+
   // Page size used by Master's PageBitmapAllocator for this node's medium.
   // Reported via RegisterClient.  Forwarded to PoolClientConfig::dram_page_size
   // by DistributedClient unmodified.  (Named for DRAM because the wire field
@@ -466,11 +488,38 @@ struct UMBPStandaloneProcessConfig {
   std::vector<std::string> tags;
 };
 
+struct UMBPSimConfig {
+  bool enabled = false;
+  std::string profile_path;
+  std::string trace_path;  // Optional JSONL output; empty uses the UMBP INFO logger.
+};
+
+struct KvBlockMetadata {
+  int64_t hash = 0;
+  std::optional<int64_t> parent;
+  uint32_t block_size = 0;  // Token count.
+  // Every physical object needed for each FULL=1/SWA=2/MAMBA=4 component.
+  std::map<uint32_t, std::vector<std::string>> component_keys;
+};
+
+// Keep canonical metadata alive from registration until its write completes.
+using KvMetadataPin = std::shared_ptr<const KvBlockMetadata>;
+
+struct KvIndexerConfig {
+  std::string endpoint, dram_pool_id;
+  uint32_t timeout_ms = 2000;
+  // Called before each write with its physical keys; empty means no blocks to track.
+  std::function<std::vector<KvBlockMetadata>(const std::vector<std::string>&)> metadata_provider;
+  uint32_t repair_interval_ms = 30000;
+};
+
 struct UMBPConfig {
   UMBPDramConfig dram;
   UMBPSsdConfig ssd;
   UMBPEvictionConfig eviction;
   UMBPCopyPipelineConfig copy_pipeline;
+  // Unset disables Indexer reporting; configure once per storage owner.
+  std::optional<KvIndexerConfig> kv_indexer;
 
   // Compatibility only.  These selected the shared-SSD leader/follower
   // behaviour of the local storage manager, which is gone: a shared pool is a
@@ -500,8 +549,14 @@ struct UMBPConfig {
   // Unset values preserve the existing deployment-specific defaults.
   std::string backend_policy_path;
   std::optional<uint64_t> page_size;
+  UMBPSimConfig sim;
 
   bool ValidateStorageConfig(std::string* error_message = nullptr) const {
+    if (sim.enabled && sim.profile_path.empty() &&
+        (!standalone_process.has_value() || standalone_process->auto_start)) {
+      if (error_message) *error_message = "sim backend requires profile_path";
+      return false;
+    }
     if (page_size.has_value() && *page_size == 0) {
       if (error_message) *error_message = "page_size must be > 0 when supplied";
       return false;
@@ -648,6 +703,10 @@ struct UMBPConfig {
       return v ? std::atof(v) : def;
     };
 
+    cfg.sim.enabled = getenv_int("UMBP_SIM_ENABLE", 0) != 0;
+    cfg.sim.profile_path = getenv_str("UMBP_SIM_PROFILE", "");
+    cfg.sim.trace_path = getenv_str("UMBP_SIM_TRACE", "");
+
     cfg.dram.capacity_bytes = getenv_size("UMBP_DRAM_CAPACITY", cfg.dram.capacity_bytes);
     cfg.ssd.enabled = getenv_int("UMBP_SSD_ENABLED", cfg.ssd.enabled ? 1 : 0) != 0;
     cfg.ssd.storage_dir = getenv_str("UMBP_SSD_DIR", cfg.ssd.storage_dir);
@@ -685,6 +744,7 @@ struct UMBPConfig {
     cfg.dram.use_hugepages =
         getenv_int("UMBP_DRAM_USE_HUGEPAGES", cfg.dram.use_hugepages ? 1 : 0) != 0;
     cfg.dram.hugepage_size = getenv_size("UMBP_DRAM_HUGEPAGE_SIZE", cfg.dram.hugepage_size);
+    cfg.dram.max_mr_bytes = getenv_size("UMBP_DRAM_MAX_MR_BYTES", cfg.dram.max_mr_bytes);
     // Blank counts as unset, like -1: launch scripts often export VAR=${X:-}.
     if (const char* nodes = std::getenv("UMBP_DRAM_NUMA_NODE");
         nodes != nullptr && std::string(nodes).find_first_not_of(" \t\r\n") != std::string::npos) {

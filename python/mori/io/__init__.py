@@ -40,6 +40,7 @@ from mori.cpp import (
     XgmiBackendConfig,
     FabricBackendConfig,
     OfiBackendConfig,
+    TcpBackendConfig,
     fabric_alloc,
     fabric_free,
     set_log_level,

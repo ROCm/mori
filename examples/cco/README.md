@@ -21,6 +21,10 @@ examples/cco/
 | `python/07_flydsl_sdma` | py | FlyDSL SDMA put/get over the copy engine |
 | `python/08_torch_symm_import` | py | import a `torch.symm_mem` tensor into the flat LSA space, no copy |
 | `python/09_torch_symm_lsa_all2all` | py | mori's own torch symm-mem backend + Triton `lsa_ptr` all-to-all |
+| `python/10_flydsl_sdma_allgather_async` | py | FlyDSL SDMA all-gather split into `start_async` / `wait_async`, overlapped with a GEMM |
+| `python/11_flydsl_mega_moe_sdma` | py | MegaMoE stage2 + combine (gfx950) with the transfer done by SDMA: GEMM2 writes a rank-sorted send buffer and comm waves (one per peer) inside the GEMM kernel `put` it; `mega_moe_gemm2_with_sdma.py` is the op and its kernels, `main.py` its test and benchmark against aiter (needs aiter) |
+| `python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py` | py | what one cco SDMA channel moves, with no GEMM in the way |
+| `python/12_flydsl_sdma_allgather_engine_wait` | py | In-place all-gather over run-time regions; the recommended `post_wait_mem_put_ptr` use: read each peer's READY once, plain put if it is there, else the copy engine (not a CU) waits for it |
 | `ir/test_triton_cco.py` | py | Triton DevComm queries and LSA/SDMA/GDA device APIs |
 | `cpp/01_lsa_put.cpp` | c++ | intra-node LSA put (includes only `cco.hpp`) |
 | `cpp/02_gda_put.cpp` | c++ | GPU-initiated RDMA put + signal/wait (includes only `cco_scale_out.hpp`) |
@@ -49,13 +53,13 @@ Then install the two extra runtime deps the examples need (not pulled in by
 `pip install .`):
 
 ```bash
-pip install mpi4py "flydsl==0.2.2"
+pip install mpi4py "flydsl==0.4.0"
 ```
 
 - `mpi4py` — every example bootstraps the cco `UniqueId` over MPI.
-- `flydsl==0.2.2` — required by the Python **FlyDSL** examples (03–06). Pinned to
-  the FlyDSL ABI the device bitcode targets. (Also available as the optional
-  extra `pip install amd_mori[flydsl]`.) Not needed for `01`, `02`, or the C++
+- `flydsl` — required by the Python **FlyDSL** examples (03–08). 0.4.0 is what CI
+  and aiter use; 0.2.x and 0.3.x work too. (Also available as the optional extra
+  `pip install amd_mori[flydsl]`.) Not needed for `01`, `02`, `09`, or the C++
   examples.
 
 After `pip install .` you do **not** need `PYTHONPATH` / `LD_LIBRARY_PATH` /
@@ -80,6 +84,51 @@ export MORI_CCO_GDA_CONN=full          # required for GDA on a single node (03/0
 mpirun --allow-run-as-root -n 2 python3 examples/cco/python/01_barrier/main.py
 mpirun --allow-run-as-root -n 2 python3 examples/cco/python/03_flydsl_put/main.py
 # ... 02, 04, 05, 06 likewise
+```
+
+Example 10 bootstraps with `torchrun` instead of MPI and needs SDMA:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/10_flydsl_sdma_allgather_async/main.py
+```
+
+Example 11 also uses `torchrun` and SDMA, and additionally needs aiter (it reuses
+`MegaMoEV2` for the reference and the GEMM2 mainloop) on a gfx950 node with 8 GPUs:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py test --network glm52 --bs 4096
+
+# latency vs aiter's MegaMoEV2 (mori.shmem P2P scatter), sweeping token counts
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/main.py bench --network glm52 \
+  --bs-list 128,512,2048,4096,8192,16384 --no-aligned-pair
+
+# what one SDMA channel actually moves, to size the above against the hardware
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/11_flydsl_mega_moe_sdma/sdma_bandwidth.py
+```
+
+It is worth it only at large per-rank batches. `stage2+combine` against aiter,
+eager, fp8 transport, `--chunk-tiles 16`, glm52 on 8x MI355, matching aiter's
+output exactly (relL2 0) at every size (`--no-aligned-pair` for 8192 and up):
+
+| tokens/rank | 128 | 512 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|
+| vs aiter | 0.71x | 0.78x | 1.01x | **1.12x** | **1.23x** | **1.35x** |
+
+Below ~2048 the fixed costs of the extra plan kernel and of the combine outweigh
+what the copy engine saves, and aiter's P2P scatter wins.
+
+Example 12 also uses `torchrun` and SDMA. Its start kernel reads each peer's READY
+once and posts a plain put when it is already set, `post_wait_mem_put_ptr` (the
+copy engine waits) when it is not; `--mode cu` spins a CU on READY instead, and
+`--skew-us` makes the last rank late:
+
+```bash
+MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 \
+  examples/cco/python/12_flydsl_sdma_allgather_engine_wait/main.py --skew-us 200
 ```
 
 `MORI_CCO_GDA_CONN=full` is required for GDA (03, 06) when both ranks share one

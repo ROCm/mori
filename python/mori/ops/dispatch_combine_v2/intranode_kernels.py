@@ -555,8 +555,9 @@ def _accum_funcs_int(hidden_elem_size, fp8_direct_cast=False):
 
 
 # Fixed size of the per-block xdb flag counter array for the gather combine entry
-# barrier: one i64 per block. 256 == the CU count (the max combine block_num), so
-# block_num never exceeds it. Deliberately a hard-coded compile-time constant.
+# barrier: one i64 per block. combine block_num must not exceed it: the untuned
+# fallback clamps to tuning_configs._MAX_COMBINE_BLOCKS, which must equal this.
+# Deliberately a hard-coded compile-time constant.
 xdb_flag_slots = 256
 
 

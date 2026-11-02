@@ -111,6 +111,7 @@ from mori.ops.gemm_ar import (
     preshuffle_b,
 )
 from mori.tensor_utils import from_gpu_ptr
+from mori.ops.gemm_ar.op import _PinnedLaunch
 
 VMM_SLACK = 512 * 1024 * 1024
 MODES = ("gemm-only", "split-sdma", "fused-sdma", "fused-lsa", "split-lsa")
@@ -184,7 +185,7 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
             torch.rand(n, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
         )
         return a, b, sa, sb
-    if quant == "mxfp8":
+    if quant in ("mxfp8", "mxfp8_raw"):
         # DeepSeek-V4.1-Flash's dense form: A per-32-K, B per-32x32, both ue8m0.
         # Scales stay as exponent bytes all the way to the MFMA, which is what
         # the instruction's scale operand reads.
@@ -193,7 +194,9 @@ def make_operands(rank: int, m: int, n: int, k: int, quant: str = "ptpc"):
         sb = _ue8m0_bytes((n // MXFP8_BK, kb), g)
         return a, b, sa.contiguous(), sb.contiguous()
     if quant != "blockscale":
-        raise ValueError(f"quant must be ptpc, blockscale or mxfp8, got {quant!r}")
+        raise ValueError(
+            f"quant must be ptpc, blockscale, mxfp8 or mxfp8_raw, got {quant!r}"
+        )
     kb = k // SCALE_BK
     sa = (
         torch.rand(m, kb, generator=g, device="cuda", dtype=torch.float32) * 0.01 + 0.01
@@ -211,7 +214,7 @@ def reference_partial(a, b, sa, sb, quant: str) -> torch.Tensor:
     af, bf = a.float(), b.float()
     if quant == "ptpc":
         return (af @ bf.T) * sa[:, None] * sb[None, :]
-    if quant == "mxfp8":
+    if quant in ("mxfp8", "mxfp8_raw"):
         sav, sbv = _ue8m0_value(sa), _ue8m0_value(sb)
         out = torch.zeros(a.shape[0], b.shape[0], device=a.device, dtype=torch.float32)
         for i in range(a.shape[1] // MXFP8_BK):
@@ -283,6 +286,8 @@ def run(args) -> int:
             "gather_dtype); use split-sdma or fused-sdma for --gather-dtype fp8"
         )
     local_rank, rank, world_size, uid = _setup_distributed()
+    if args.scatter_dtype == "fp8" and args.mode != "fused-sdma":
+        raise ValueError("FP8 scatter experiment is wired only through fused-sdma")
     # blockscale keeps a second fp32 accumulator for the per-K-block promotion,
     # which doubles the accumulator VGPRs; 256x256 needs 256 of them and the
     # kernel already runs at ~254 with zero spill, so the tile has to halve.
@@ -321,7 +326,10 @@ def run(args) -> int:
     # when sweeping.
     DEFAULT_CHUNKS = 8
     chunks = args.chunks if args.chunks else DEFAULT_CHUNKS
-    if fused:
+    if args.chunk_bands:
+        bands = (args.m // world_size + args.block_m - 1) // args.block_m
+        chunks = (bands + args.chunk_bands - 1) // args.chunk_bands
+    elif fused:
         # Fall back rather than fail: chunks has to divide the M-tiles per
         # destination, which at small M can be fewer than 8.
         m_tiles_per_peer = max(
@@ -338,6 +346,7 @@ def run(args) -> int:
         gather_dtype=args.gather_dtype,
         gather_transport=args.gather_transport,
         gather_bands=args.gather_bands,
+        scatter_dtype=args.scatter_dtype,
     )
     cfg.validate()
 
@@ -354,7 +363,11 @@ def run(args) -> int:
         # C *is* the all-reduce's input region: the GEMM writes its partial
         # straight into the symmetric window, which is the whole host-side change
         # the SDMA fusion needs.
-        c = from_gpu_ptr(mem.ptr + cfg.input_off, (args.m, args.n), torch.bfloat16)
+        c = from_gpu_ptr(
+            mem.ptr + (cfg.output_off if cfg.fp8_scatter else cfg.input_off),
+            (args.m, args.n),
+            torch.bfloat16,
+        )
         out = from_gpu_ptr(mem.ptr + cfg.output_off, (args.m, args.n), torch.bfloat16)
         torch.cuda.synchronize()
 
@@ -390,7 +403,11 @@ def run(args) -> int:
             n_stripe=args.n_stripe or None,
             emit_put=not args.no_put,
             atomic_order=args.atomic,
+            chunk_bands=args.chunk_bands,
+            relaxed_rows=args.relaxed_rows,
         )
+        if not args.raw_jit:
+            gemm = _PinnedLaunch(gemm)
         a_i8 = a.contiguous().view(torch.int8).view(-1)
         b_i8 = b_shuf.contiguous().view(torch.int8).view(-1)
         c_flat = c.view(-1)
@@ -416,6 +433,10 @@ def run(args) -> int:
             # already a broadcast and there is nothing to pack.
             sa_arg = preshuffle_a_scale(sa)
             sb_arg = sb.to(torch.int32).t().reshape(-1).contiguous()
+        elif args.quant == "mxfp8_raw":
+            # The quantiser's own row-major bytes; the kernel stages them
+            # through LDS.
+            sa_arg, sb_arg = sa.reshape(-1), sb.reshape(-1)
         else:
             sa_arg, sb_arg = sa, sb
 
@@ -444,6 +465,9 @@ def run(args) -> int:
                 fuse_reduce_push=args.fuse_reduce_push,
                 publish=args.publish,
             )
+            if not args.raw_jit:
+                for phase in set(parts["order"]) | set(parts["fused_order"]):
+                    parts[phase] = _PinnedLaunch(parts[phase])
         if args.mode == "split-lsa":
             lsa_ar, _ = build_lsa_ar(cfg, rank)
 
@@ -517,7 +541,7 @@ def run(args) -> int:
             # has to clear that, and is two-sided -- below 4e-2 says the kernel
             # is right (a broken one lands near 0.9), above 5e-3 says the fp8
             # wire was actually taken and not silently skipped.
-            if cfg.fp8_gather:
+            if cfg.fp8_gather or cfg.fp8_scatter:
                 validated = 5e-3 < rel_l2 < 4e-2
             else:
                 validated = rel_l2 < 3e-3
@@ -550,6 +574,8 @@ def run(args) -> int:
                 "block_m": args.block_m,
                 "block_n": args.block_n,
                 "chunks": chunks if fused else None,
+                "chunk_bands": args.chunk_bands,
+                "relaxed_rows": args.relaxed_rows,
                 "tile_order": args.tile_order,
                 "swap_ab": args.swap_ab,
                 "permlane": args.permlane,
@@ -559,6 +585,7 @@ def run(args) -> int:
                 # fp8/lsa and an fp8/sdma run both say mode="fused-sdma", and a
                 # record separated from its command line cannot say which ran.
                 "gather_dtype": args.gather_dtype,
+                "scatter_dtype": args.scatter_dtype,
                 "gather_transport": args.gather_transport,
                 "fuse_quantize": args.fuse_quantize,
                 "fuse_reduce_push": args.fuse_reduce_push,
@@ -604,7 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-k", type=int, default=1024)
     p.add_argument(
         "--quant",
-        choices=("ptpc", "blockscale", "mxfp8"),
+        choices=("ptpc", "blockscale", "mxfp8", "mxfp8_raw"),
         default="ptpc",
         help="a8w8 per-token/per-channel (the aiter 8wave kernel's native form) "
         "or the model's 1x128 / 128x128 block scale. blockscale applies the "
@@ -618,6 +645,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="0 = 256 for --quant ptpc, 128 for --quant blockscale",
     )
     p.add_argument("--block-n", type=int, default=256)
+    p.add_argument(
+        "--chunk-bands",
+        type=int,
+        default=0,
+        help="experimental fixed bands per PUT, allowing a short final chunk",
+    )
+    p.add_argument("--relaxed-rows", action="store_true")
     p.add_argument("--waves-per-eu", type=int, default=2)
     p.add_argument("--xcd-swizzle", type=int, default=0)
     p.add_argument(
@@ -769,6 +803,10 @@ def build_parser() -> argparse.ArgumentParser:
         "relL2 ~2.1e-2 against a bf16 wire that is exact.",
     )
     p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--scatter-dtype", choices=("bf16", "fp8"), default="bf16")
+    p.add_argument(
+        "--raw-jit", action="store_true", help="debug the unpinned JIT call path"
+    )
     p.add_argument("--iters", type=int, default=51)
     p.add_argument("--eager", action="store_true")
     p.add_argument("--skip-validation", action="store_true")

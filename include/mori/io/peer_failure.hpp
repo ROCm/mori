@@ -119,11 +119,18 @@ class PeerFailureTracker {
   // Records a failure, or clears one on recovery. Repeats fold into the first.
   void Report(const PeerFailureReport& report);
 
+  // Marks a QP dead after an error completion put it in ERR, without queuing an
+  // event: the transfer that hit the error already reports it. Kept apart from
+  // Report's records, so a later Report for the same QP still queues its event.
+  void MarkQpFailed(const QpKey& qp);
+
   // Takes the oldest pending failure. False when none is pending.
   bool Pop(PeerFailureEvent* out);
 
   // False once this QP, or the port, CQ or device it uses, has been seen to fail.
   bool IsQpAlive(const QpKey& qp) const;
+  // Port down is temporary; replacing its QP cannot repair the port.
+  bool NeedsQpReplacement(const QpKey& qp) const;
 
   // Number of failures dropped because the pending queue was full.
   uint64_t Dropped() const;
@@ -182,10 +189,12 @@ class PeerFailureTracker {
 
   // Appends to the queue, dropping and counting on overflow. Caller holds mu_.
   void Enqueue(PeerFailureEvent event);
+  bool NeedsQpReplacementLocked(const QpKey& qp) const;
 
   mutable std::mutex mu_;
   std::unordered_map<QpKey, QpOwner, QpKeyHash> qpOwners_;
   std::unordered_set<QpKey, QpKeyHash> failedQps_;
+  std::unordered_set<QpKey, QpKeyHash> erroredQps_;
   std::unordered_set<PortKey, PortKeyHash> failedPorts_;
   std::unordered_set<CqKey, CqKeyHash> failedCqs_;
   std::unordered_set<std::string> failedDevices_;

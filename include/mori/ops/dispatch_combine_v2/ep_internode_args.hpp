@@ -215,6 +215,18 @@ __device__ inline int NullFlatTokenIndex(const EpInterNodeDeviceCfg& config) {
 __device__ inline int SendBufSlotOffset(const EpInterNodeDeviceCfg& config, int pe, int slotId) {
   return pe * config.MaxNumTokensToSendPerRank() + slotId;
 }
+__device__ inline int PeFromSendBufSlotOffset(const EpInterNodeDeviceCfg& config, int flatIdx) {
+  return flatIdx / config.MaxNumTokensToSendPerRank();
+}
+__device__ inline int SlotIdFromSendBufSlotOffset(const EpInterNodeDeviceCfg& config, int flatIdx) {
+  return flatIdx % config.MaxNumTokensToSendPerRank();
+}
+// One past the last real slot: the "already sent to this PE" sentinel the AsyncLL
+// dedup writes into dispDestTokIdMap. Decodes to pe == worldSize, which every
+// reader tests for, so it must use the SAME stride as the encoder above.
+__device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) {
+  return config.worldSize * config.MaxNumTokensToSendPerRank();
+}
 
 // ---------------------------------------------------------------------------
 // The by-value kernel argument.
@@ -246,6 +258,8 @@ __device__ inline int SendBufSlotOffset(const EpInterNodeDeviceCfg& config, int 
   X(offCrossDeviceBarrier, "u64")        \
   X(offChunkFlag, "u64")                 \
   X(offOutScales, "u64")                 \
+  X(offSendCount, "u64")                 \
+  X(offCombineStaging, "u64")            \
   X(rank, "i32")                         \
   X(lsaBase, "i32")                      \
   X(rdmaBlockNum, "i32")                 \
@@ -264,7 +278,8 @@ __device__ inline int SendBufSlotOffset(const EpInterNodeDeviceCfg& config, int 
   X(totalRecvTokenNum, "p")              \
   X(dispatchGridBarrier, "p")            \
   X(interNodeBlocksBarrier, "p")         \
-  X(crossDeviceBarrierFlag, "p")
+  X(crossDeviceBarrierFlag, "p")         \
+  X(dispReceiverIdxMap, "p")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -294,6 +309,17 @@ struct EpInterNodeArgs {
   // Only read when config.scaleDim > 0; the arena does not carry the region
   // otherwise, so this stays 0 and nothing dereferences it.
   uint64_t offOutScales{0};
+  // AsyncLL only. One u64 per destination PE, holding `tokenNum + 1` for the
+  // transfer that is about to go out. It exists because ccoSdma moves window to
+  // window and has no immediate form: v1 published the same number with
+  // ShmemPutUint64ImmNbiThread, which carries its payload in the WQE, while an
+  // SDMA copy needs a real source address. Left 0 by the other kernel families,
+  // whose arenas do not carry the region.
+  uint64_t offSendCount{0};
+  // AsyncLL only: combine's send staging, separate from offStaging so that
+  // writing it cannot race dispatch's in-flight transfer reading the other one.
+  // See asyncll_regions for why the two phases do not share.
+  uint64_t offCombineStaging{0};
 
   // Which world rank this is. Runtime, not Cfg, for the reason EpArgs gives:
   // as a compiled-in constant every rank on a node builds its own copy of an
@@ -331,6 +357,10 @@ struct EpInterNodeArgs {
   uint32_t* dispatchGridBarrier{nullptr};
   uint32_t* interNodeBlocksBarrier{nullptr};
   uint64_t* crossDeviceBarrierFlag{nullptr};
+  // AsyncLL only: recv slot -> the send-buffer slot offset it arrived in, so
+  // combine's send leg can put each result back where dispatch took it from.
+  // v1 calls this dispReceiverIdxMap and keeps it in plain device memory too.
+  ep_index_t* dispReceiverIdxMap{nullptr};
 
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
@@ -357,7 +387,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 37,
+static_assert(detail::kEpInterNodeArgsFieldCount == 40,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
@@ -375,8 +405,8 @@ static_assert(detail::EpInterNodeArgsOffsetsAscend(),
 // state. Nothing else catches it -- both layouts have the SAME sizeof, so the
 // binding's size check passes, and the ascending-offset assert above is about
 // the fields, not about what follows them.
-static_assert(offsetof(EpInterNodeArgs, crossDeviceBarrierFlag) +
-                      sizeof(EpInterNodeArgs::crossDeviceBarrierFlag) ==
+static_assert(offsetof(EpInterNodeArgs, dispReceiverIdxMap) +
+                      sizeof(EpInterNodeArgs::dispReceiverIdxMap) ==
                   sizeof(EpInterNodeArgs),
               "EpInterNodeArgs has tail padding -- the binding would place devComm before "
               "C++ does. Keep an 8-byte member last (update the name here if it changes)");

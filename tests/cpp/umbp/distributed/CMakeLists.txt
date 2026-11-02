@@ -14,7 +14,17 @@
 # --------------------------------------------------------------------------
 
 find_library(_TEST_PROTOBUF_LIB NAMES protobuf libprotobuf REQUIRED)
-if(TARGET gRPC::grpc++)
+add_executable(test_kv_indexer_reporter test_kv_indexer_reporter.cpp)
+target_link_libraries(test_kv_indexer_reporter PRIVATE umbp_common GTest::gtest_main)
+target_compile_features(test_kv_indexer_reporter PRIVATE cxx_std_17)
+add_test(NAME umbp_kv_indexer_reporter COMMAND test_kv_indexer_reporter)
+# The flavor src/umbp/CMakeLists.txt picks: umbp_common brings that one in, and a
+# test linking the other as well would load two copies of gRPC. Its gRPC targets
+# are not visible from this directory, hence the second find_package.
+find_package(gRPC CONFIG QUIET)
+if(TARGET gRPC::grpc++_unsecure)
+  set(_TEST_GRPCPP_LIB gRPC::grpc++_unsecure)
+elseif(TARGET gRPC::grpc++)
   set(_TEST_GRPCPP_LIB gRPC::grpc++)
 elseif(TARGET grpc++)
   set(_TEST_GRPCPP_LIB grpc++)
@@ -539,7 +549,7 @@ add_test(NAME test_hbm_backend COMMAND test_hbm_backend)
 add_executable(test_ssd_backend test_ssd_backend.cpp)
 target_link_libraries(test_ssd_backend PRIVATE umbp_common GTest::gtest_main)
 target_compile_features(test_ssd_backend PRIVATE cxx_std_17)
-add_test(NAME test_ssd_backend COMMAND test_ssd_backend)
+add_test(NAME umbp_ssd_backend COMMAND test_ssd_backend)
 
 # test_peer_service_dispatch — PeerServiceServer dispatch through
 # BackendRegistry: tier compatibility, named same-tier instances, the
@@ -575,7 +585,7 @@ add_executable(test_peer_ssd_single_flight test_peer_ssd_single_flight.cpp)
 target_link_libraries(test_peer_ssd_single_flight PRIVATE umbp_common
                                                           GTest::gtest_main)
 target_compile_features(test_peer_ssd_single_flight PRIVATE cxx_std_17)
-add_test(NAME test_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
+add_test(NAME umbp_peer_ssd_single_flight COMMAND test_peer_ssd_single_flight)
 
 # test_peer_ssd_eviction — LRU + watermark eviction + in-flight guard
 add_executable(test_peer_ssd_eviction test_peer_ssd_eviction.cpp)
@@ -680,3 +690,12 @@ endif()
 target_link_libraries(
   bench_umbp_gds_ssd_get
   PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
+
+# Virtual storage and modeled transfers through the production control plane; no GPU needed.
+add_executable(test_umbp_sim test_sim.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_link_options(test_umbp_sim PRIVATE -Wl,--no-as-needed)
+endif()
+target_link_libraries(test_umbp_sim PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB}
+                                           ${_TEST_GRPCPP_LIB} GTest::gtest_main)
+add_test(NAME umbp_sim COMMAND test_umbp_sim)

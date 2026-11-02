@@ -88,7 +88,13 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<KvEvent> SnapshotOwnedKeysForFullSync() override {
     return inner_->SnapshotOwnedKeysForFullSync();
   }
-  void ClearLocal() override { inner_->ClearLocal(); }
+  void ClearLocal() override {
+    inner_->ClearLocal();
+    NotifyChange();
+  }
+  void SetChangeHook(ChangeHook callback) override {
+    std::atomic_store(&change_hook_, std::make_shared<const ChangeHook>(std::move(callback)));
+  }
   void ClearFullSyncAcked() override { inner_->ClearFullSyncAcked(); }
   bool IsClearFullSyncPending() const override { return inner_->IsClearFullSyncPending(); }
   void SetEventPublishing(bool enabled) override { inner_->SetEventPublishing(enabled); }
@@ -115,9 +121,10 @@ class InstrumentedBackend final : public MediumBackend {
   std::vector<AllocateResult> BatchAllocate(const std::vector<AllocateRequest>& reqs) override;
   std::vector<CommitResult> BatchCommit(const std::vector<CommitRequest>& reqs) override;
   std::vector<bool> BatchAbort(const std::vector<uint64_t>& slot_ids) override;
-  std::vector<ResolvedEntry> BatchResolve(const std::vector<std::string>& keys, bool include_descs,
-                                          bool allow_file_refs = false,
-                                          ResolveReader reader = ResolveReader::kRemote) override;
+  std::vector<ResolvedEntry> BatchResolve(
+      const std::vector<std::string>& keys, bool include_descs, bool allow_file_refs = false,
+      ResolveReader reader = ResolveReader::kRemote,
+      const std::vector<ObjectExtent>* extents = nullptr) override;
   std::vector<EvictResult> Evict(const std::vector<std::string>& keys) override;
 
   // ---- bootstrap / local endpoints: pass-through ----
@@ -131,6 +138,12 @@ class InstrumentedBackend final : public MediumBackend {
   }
 
  private:
+  void NotifyChange(const std::vector<std::string>& keys = {}) {
+    auto callback = std::atomic_load(&change_hook_);
+    if (callback && *callback) (*callback)(keys);
+  }
+  std::shared_ptr<const ChangeHook> change_hook_;
+
   // One op's accumulators.  Relaxed atomics: these are read once per metrics
   // tick from another thread and are never correctness state, so ordering
   // against the data plane buys nothing.
