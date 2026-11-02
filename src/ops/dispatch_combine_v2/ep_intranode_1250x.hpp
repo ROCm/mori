@@ -5229,6 +5229,10 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   const bool _cPullOk = _cPullType && ((int)hiddenDim >= _cPullRowElems) &&
                         (_cPullTileElems >= _cPullRowElems) &&
                         (_cPullLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET);
+  if (_cPullOk && mwIter.warpsPerItem > (int)hiddenDim / _cPullRowElems) {
+    mwIter.warpsPerItem = (int)hiddenDim / _cPullRowElems;
+    mwIter.dimPerWarp = (hiddenDim + mwIter.warpsPerItem - 1) / mwIter.warpsPerItem;
+  }
   TokT* _cPullTiles = nullptr;
   if constexpr (_cPullType) {
     constexpr int _cPullPtrArrays = 1 + (kCfg.useWeights ? 1 : 0);
