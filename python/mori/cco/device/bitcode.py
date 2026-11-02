@@ -89,6 +89,7 @@ def _jit_compile(cov: int) -> str | None:
             _collect_include_dirs,
             _hipcc_device_bc,
             _strip_lifetime_intrinsics,
+            is_ccqe_enabled,
         )
 
         mori_root = get_mori_source_root()
@@ -109,7 +110,12 @@ def _jit_compile(cov: int) -> str | None:
             mori_root / "include" / "mori" / "cco",
             mori_root / "include" / "mori" / "core",
         ]
-        cache_dir = get_cache_dir(cfg.arch, source_paths, nic, cov=cov)
+        # _hipcc_device_bc adds -DIONIC_CCQE when the ionic CQs are collapsed, which
+        # changes the GDA CQ poll; a bitcode cached under the other mode would
+        # misread completions and hang. So the mode is part of the key.
+        cache_dir = get_cache_dir(
+            cfg.arch, source_paths, nic, cov=cov, ccqe=is_ccqe_enabled()
+        )
         if sdma_on:
             cache_dir = cache_dir / "sdma"
             cache_dir.mkdir(parents=True, exist_ok=True)
