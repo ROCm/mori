@@ -200,9 +200,11 @@ struct EpDispatchCombineConfig {
   // multiplying by token counts (e.g. tokenId * HiddenDimSz() is size_t * size_t).
   inline __host__ __device__ size_t HiddenDimSz() const { return (size_t)hiddenDim; }
 
+  // Padded to 16 B so every staging slot starts on a vector boundary.
   inline __host__ __device__ size_t XferBytesPerToken(size_t tokenTypeSize) const {
-    return HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
-           ScaleBytes();
+    size_t bytes = HiddenBytes(tokenTypeSize) + IndexBytes() + WeightBytes() + SrcTokenIdBytes() +
+                   ScaleBytes();
+    return (bytes + 15) & ~size_t{15};
   }
   inline __host__ __device__ size_t MaxXferBytesPerToken() const {
     return XferBytesPerToken(maxTokenTypeSize);

@@ -771,7 +771,9 @@ __device__ void EpDispatchCopyToStaging_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_SPAN(profiler, Slot::EpDispatchCopyToStaging);
   if (args.curRankNumToken == 0) return;
 
-  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim);
+  // 16 B slices keep every warp's piece on the vector path
+  MultiWarpIter mwIter(globalWarpNum, args.curRankNumToken, hiddenDim,
+                       std::max<size_t>(1, 16 / sizeof(T)));
 
   // First copy to staging buffer
   for (int i = globalWarpId; i < (args.curRankNumToken * mwIter.warpsPerItem); i += globalWarpNum) {
