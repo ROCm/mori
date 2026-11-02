@@ -560,10 +560,10 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   // (null+0xf8 in libamdhip64) instead of returning hipErrorInvalidValue on
   // memory HIP tracks but did not map through hipMemMap: pinned host memory
   // (hipHostMalloc, hipHostRegister) and hipMalloc. hipMalloc has exported
-  // through HSA above, but pinned host memory gets here whenever ibv_reg_mr
-  // failed on it (or MORI_ENABLE_DMABUF_REG=1), and the process dies in HIP
-  // before the registration error below is logged. Fixed upstream in
-  // ROCM-23527 (rocm-systems 6693769fa7, HIP 7.14).
+  // through HSA above; pinned host memory passed to RegisterRdmaMemoryRegionAuto
+  // gets here, and the process dies in HIP before the registration error below
+  // is logged. Host memory therefore registers through RegisterRdmaMemoryRegion.
+  // Fixed upstream in ROCM-23527 (rocm-systems 6693769fa7, HIP 7.14).
   hipMemGenericAllocationHandle_t handle;
   if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
     hipError_t exportErr =

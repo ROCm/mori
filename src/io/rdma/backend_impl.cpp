@@ -416,7 +416,12 @@ application::RdmaMemoryRegion RdmaManager::RegisterLocalMemory(int devId, const 
   std::unique_lock<std::shared_mutex> lock(mu);
   MemoryKey key{devId, desc.id};
   application::RdmaDeviceContext* devCtx = GetOrCreateDeviceContext(devId);
-  mTable[key] = devCtx->RegisterRdmaMemoryRegionAuto(reinterpret_cast<void*>(desc.data), desc.size);
+  void* ptr = reinterpret_cast<void*>(desc.data);
+  // Host memory has no dma-buf exporter, so the dma-buf leg of the Auto path
+  // can only fail on it.
+  mTable[key] = desc.loc == MemoryLocationType::CPU
+                    ? devCtx->RegisterRdmaMemoryRegion(ptr, desc.size)
+                    : devCtx->RegisterRdmaMemoryRegionAuto(ptr, desc.size);
   return mTable[key];
 }
 
@@ -873,7 +878,7 @@ void NotifManager::RegisterEndpoint(const std::shared_ptr<EndpointRuntime>& rt) 
       posix_memalign(reinterpret_cast<void**>(&buf), PAGESIZE,
                      static_cast<size_t>(config.notifPerQp) * sizeof(NotifMessage)));
   application::RdmaMemoryRegion mr =
-      devCtx->RegisterRdmaMemoryRegionAuto(buf, config.notifPerQp * sizeof(NotifMessage));
+      devCtx->RegisterRdmaMemoryRegion(buf, config.notifPerQp * sizeof(NotifMessage));
 
   auto notifIt = notifCtxById_.insert({rt->id, {mr, buf}}).first;
   // Publish the (rehash-stable, node-based map) context pointer so the poll loop
