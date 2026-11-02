@@ -78,15 +78,16 @@ def _detected_arch():
 
 def _device_keys():
     """Table keys to try, most specific first. KFD reports gfx1250 for every ASIC
-    revision and either code target, so revision 0 is told apart by its revision (a
-    gfx1250-strict target implies it). It uses its own rows when it has them.
+    revision and either code target, so the parts that can run gfx1250-strict are
+    told apart by their revision (0), or by running it; whichever code they run, they
+    use the gfx1250-strict rows when there is one.
     """
     key = _device_key()
     if key != "gfx1250":
         return (key,)
     rev = _gpu.asic_revision()
     if rev == 0 or (rev is None and _detected_arch() == "gfx1250-strict"):
-        return ("gfx1250-rev0", "gfx1250")
+        return ("gfx1250-strict", "gfx1250")
     return (key,)
 
 
@@ -232,12 +233,12 @@ _DISPATCH_TABLE: dict = {
             "fp4": ((4095, 64, 16), (None, 128, 16)),
         },
     },
-    # gfx1250 at ASIC revision 0 (gfx1250 or gfx1250-strict code), EP4, hidden 7168.
-    # Dispatch and combine hold one block per CU (LDS) while a block waits for the
-    # whole grid, and this part has fewer CUs than the 256-block gfx1250 rows assume,
-    # so those would hang on it.
+    # Parts that can run gfx1250-strict (ASIC revision 0), either code target, EP4,
+    # hidden 7168. Dispatch and combine hold one block per CU (LDS) while a block waits
+    # for the whole grid, and these parts have fewer CUs than the 256-block gfx1250
+    # rows assume, so those would hang on them.
     # Graph-timed, median of 3 rounds; within 3% the smaller geometry wins.
-    "gfx1250-rev0": {
+    "gfx1250-strict": {
         (4, 7168, 8, None): {
             None: ((1024, 64, 16), (4096, 64, 8), (None, 64, 16)),
             "fp8": ((256, 64, 8), (1024, 64, 16), (1536, 64, 24), (None, 64, 32)),
@@ -303,8 +304,8 @@ _COMBINE_TABLE: dict = {
         (8, 7168, 6, None): ((None, 64, 8),),
         (16, 7168, 6, None): ((None, 64, 8),),
     },
-    # ASIC revision 0, as its dispatch rows.
-    "gfx1250-rev0": {
+    # The gfx1250-strict parts, as their dispatch rows.
+    "gfx1250-strict": {
         (4, 7168, 8, None): ((64, 64, 4), (None, 64, 8)),
         (4, 7168, 9, None): ((256, 64, 4), (4096, 64, 8), (None, 64, 4)),
         (4, 7168, 6, None): ((256, 64, 4), (None, 64, 8)),
@@ -357,8 +358,8 @@ _COMBINE_PUSH_TABLE: dict = {
                 (None, 128, 24),
             ),
         },
-        # ASIC revision 0, EP4. No 24-warp geometry: several times slower on this part.
-        "gfx1250-rev0": {
+        # gfx1250-strict parts, EP4. No 24-warp geometry: several times slower there.
+        "gfx1250-strict": {
             (4, 7168, 6, None): ((256, 64, 8), (1024, 64, 16), (None, 128, 8)),
             (4, 7168, 9, None): (
                 (512, 64, 8),
@@ -374,7 +375,7 @@ _COMBINE_PUSH_TABLE: dict = {
         "gfx1250": {
             (4, 7168, 6, None): ((128, 64, 8), (None, 64, 16)),
         },
-        "gfx1250-rev0": {
+        "gfx1250-strict": {
             (4, 7168, 6, None): (
                 (512, 64, 8),
                 (1024, 64, 16),
@@ -402,8 +403,8 @@ _COMBINE_PUSH_TABLE: dict = {
                 (None, 64, 16),
             ),
         },
-        # ASIC revision 0, EP4: no 24-warp geometry, as above.
-        "gfx1250-rev0": {
+        # gfx1250-strict parts, EP4: no 24-warp geometry, as above.
+        "gfx1250-strict": {
             (4, 7168, 6, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
             (4, 7168, 9, None): ((256, 64, 8), (1536, 64, 16), (None, 128, 16)),
         },

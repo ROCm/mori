@@ -99,8 +99,8 @@ class TuningKeyTest(unittest.TestCase):
             return tc._device_keys()
 
     def test_rev0_tries_its_own_key_first(self):
-        self.assertEqual(self.keys(self.REV0), ("gfx1250-rev0", "gfx1250"))
-        self.assertEqual(self.keys(self.REV0_STRICT), ("gfx1250-rev0", "gfx1250"))
+        self.assertEqual(self.keys(self.REV0), ("gfx1250-strict", "gfx1250"))
+        self.assertEqual(self.keys(self.REV0_STRICT), ("gfx1250-strict", "gfx1250"))
         self.assertEqual(self.keys(self.REV1), ("gfx1250",))
 
     def lookup(self, dev, tables, shape=SHAPE, cus=0, **kw):
@@ -109,21 +109,21 @@ class TuningKeyTest(unittest.TestCase):
             return tc.lookup(*shape, **kw)
 
     def test_rev0_falls_back_to_gfx1250_rows(self):
-        shape = (8, 7168, 6)  # no gfx1250-rev0 row
+        shape = (8, 7168, 6)  # no gfx1250-strict row
         rev0 = self.lookup(self.REV0, {}, shape)
         self.assertEqual(rev0, self.lookup(self.REV1, {}, shape))
         self.assertIsNotNone(rev0["schedule"])
 
     def test_rev0_row_wins(self):
-        row = {"gfx1250-rev0": {self.SHAPE + (None,): {None: ((None, 32, 4),)}}}
+        row = {"gfx1250-strict": {self.SHAPE + (None,): {None: ((None, 32, 4),)}}}
         schedule = self.lookup(self.REV0, row)["schedule"]
         self.assertEqual({(b[1], b[2]) for b in schedule}, {(32, 4)})
 
     @staticmethod
     def rev0_widest_grid():
-        rows = [tc._COMBINE_TABLE["gfx1250-rev0"]]
-        rows += list(tc._DISPATCH_TABLE["gfx1250-rev0"].values())
-        rows += [t["gfx1250-rev0"] for t in tc._COMBINE_PUSH_TABLE.values()]
+        rows = [tc._COMBINE_TABLE["gfx1250-strict"]]
+        rows += list(tc._DISPATCH_TABLE["gfx1250-strict"].values())
+        rows += [t["gfx1250-strict"] for t in tc._COMBINE_PUSH_TABLE.values()]
         return max(b for row in rows for bs in row.values() for _, b, _ in bs)
 
     def test_rev0_rows_stay_below_the_gfx1250_grids(self):
@@ -144,10 +144,10 @@ class TuningKeyTest(unittest.TestCase):
         cap = self.rev0_widest_grid()
         shapes = set()
         for table in (tc._DISPATCH_TABLE, tc._COMBINE_TABLE):
-            for dev in ("gfx1250", "gfx1250-rev0"):
+            for dev in ("gfx1250", "gfx1250-strict"):
                 shapes |= set(table.get(dev, {}))
         for quant in tc._COMBINE_PUSH_TABLE.values():
-            for dev in ("gfx1250", "gfx1250-rev0"):
+            for dev in ("gfx1250", "gfx1250-strict"):
                 shapes |= set(quant.get(dev, {}))
         quants = ["none", *tc._COMBINE_PUSH_TABLE]
         for world, hidden, topk, epr in sorted(shapes, key=str):
