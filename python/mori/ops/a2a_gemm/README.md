@@ -209,6 +209,48 @@ fill per tile, and 256 KiB of partials per tile written and read back -- 512
 MiB at `m_local=8192`, where it costs 40-70us. The own segment it moves forward
 is 1/8 of the GEMM, which bounds what it can save.
 
+### What bounds it, and three more things that did not help
+
+Re-measured on 2026-11-02 (crsuse2, ROCm 10 image, FlyDSL 0.4.0), 70B shape,
+P=8, `c8`, with the timeline's per-tile waves and two controls:
+
+| m_local | `gemm-only` | `nopost` | band interval | fused (`tile`) |
+|---:|---:|---:|---:|---:|
+| 4096 | 182 | 170-178 | 14.5 us | 252 |
+| 8192 | 355 | 338-353 | 23 us | 434 |
+
+`nopost` is the fused kernel with neither the posts nor the waits: the kernel
+itself costs nothing over `gemm-only`. The band interval is the same with and
+without the waits, so, as above, the copy engines are not slowed by the GEMM.
+
+**The gap is the first wave's data at the link's rate.** Fused time is close to
+"the last band the first wave needs, plus two tiles": at `m_local=4096` the
+first wave needs bands 0-3, half the rows, which land at about 23 + 3 x 14.5 =
+66 us, and 66 + 2 x 87 = 240 us against 252 measured. A 512 KiB band every
+14.5 us is ~36 GB/s per link; on an idle GPU the same exchange moves ~47 GB/s
+per link in one band and ~33 GB/s in eight, so most of what chunking costs is
+a fixed per-band overhead.
+
+Tried and dropped, all at P=8 on the 70B shape:
+
+* **Uneven bands** (small first, e.g. 1,1,2,4,8 row tiles): the first band
+  lands earlier (~21 us instead of 24), but the first wave still needs half
+  the bytes. Best case -1.3% (249.6 against 252.8 us, `m_local=4096`); none
+  at 8192.
+* **`BLOCK_M=128`**: the first wave covers a quarter of the rows and its
+  bands land by ~35 us, yet the gap stays ~72 us: the GEMM is 15% slower
+  (209 against 182 us) and its tiles another ~18% slower with the transfer
+  running (47.5 to 56 us). Fused 280.9 against 252.8.
+* **Two or four copy-engine queues per (source, destination) pair**, bands
+  round-robin over them: slower in every cell (4096: 251.8 / 256.3 / 266.2 us
+  for 1 / 2 / 4 queues; 8192: 431.9 / 437.6 / 472.5), and on an idle GPU
+  eight bands take 120-130 / 126-145 / 135-154 us. The per-band cost is not one
+  queue serializing its signal behind its copy.
+
+Inside this kernel the bound holds: what is left is to have the bytes on the
+wire before the GEMM starts -- posting from the producer of A (attention's
+epilogue under Ulysses) rather than from block 0.
+
 ## Running it
 
 ```bash
@@ -231,7 +273,7 @@ every one.
 
 ## Not done yet
 
-A schedule that keeps the first wave busy at P=8 (see above); a public op
+Posting before the GEMM at P=8, from attention's epilogue (see above); a public op
 wrapper with `self_test` and a per-M tile/chunk choice; blockscale
 and mxfp8; N that is not a multiple of 256; fp8 head shards quantized against a
 per-shard scale (the scale has to be global, see above); a model integration.

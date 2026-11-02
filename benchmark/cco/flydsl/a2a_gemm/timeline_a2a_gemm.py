@@ -27,6 +27,8 @@ stamps its start and end. Variants:
 
     idle      grid=1: block 0 alone (post, observe, its one tile) -- the
               transfer with nothing else on the GPU
+    nopost    the full grid, no posting and no waits: the fused kernel's
+              GEMM alone, to price its structure against gemm-only
     nowait    the full grid, no waits: the transfer under the GEMM
     tile      the real kernel, waiting once per tile
     segment   the real kernel, waiting per K segment
@@ -63,7 +65,7 @@ from mori.ops.a2a_gemm.layout import MAX_CHUNKS
 from mori.ops.gemm_ar import preshuffle_b
 from mori.tensor_utils import from_gpu_ptr
 
-VARIANTS = ("idle", "nowait", "tile", "segment")
+VARIANTS = ("idle", "nopost", "nowait", "tile", "segment")
 
 
 def _median(values):
@@ -77,10 +79,11 @@ def _decode(raw, cfg, rank, world, tiles):
     def us(v):
         return (v - t0) / 100.0 if v else None
 
-    bands = [
-        max(us(raw[3 + s * MAX_CHUNKS + c]) for s in range(world) if s != rank)
-        for c in range(cfg.chunks)
-    ]
+    bands = []
+    for c in range(cfg.chunks):
+        seen = [us(raw[3 + s * MAX_CHUNKS + c]) for s in range(world) if s != rank]
+        seen = [v for v in seen if v is not None]
+        bands.append(max(seen) if seen else None)
     spans = [
         (us(raw[cfg.STAMP_FIXED + 2 * i]), us(raw[cfg.STAMP_FIXED + 2 * i + 1]))
         for i in range(tiles)
@@ -93,7 +96,29 @@ def _decode(raw, cfg, rank, world, tiles):
         "tile_end": max(b for _, b in spans) if spans else None,
         "last_tile_start": max(a for a, _ in spans) if spans else None,
         "tile_us": statistics.median(b - a for a, b in spans) if spans else None,
+        "spans": [
+            (us(raw[cfg.STAMP_FIXED + 2 * i]), us(raw[cfg.STAMP_FIXED + 2 * i + 1]))
+            for i in range(tiles)
+        ],
     }
+
+
+def _waves(spans, cus):
+    """Start/end quantiles per wave of ``cus`` tiles, ordered by start time."""
+    done = sorted((a, b) for a, b in spans if a is not None and b is not None)
+    out = []
+    for w in range(0, len(done), cus):
+        wave = done[w : w + cus]
+        starts = [a for a, _ in wave]
+        q = lambda xs, f: round(xs[min(len(xs) - 1, int(f * len(xs)))], 1)  # noqa: E731
+        out.append(
+            {
+                "start_p0/50/100": (q(starts, 0), q(starts, 0.5), q(starts, 1.0)),
+                "end_max": round(max(b for _, b in wave), 1),
+                "dur_p50": round(statistics.median(b - a for a, b in wave), 1),
+            }
+        )
+    return out
 
 
 def main():
@@ -102,6 +127,8 @@ def main():
     ap.add_argument("-k", type=int, default=8192)
     ap.add_argument("-n", type=int, default=8192)
     ap.add_argument("--chunks", type=int, nargs="+", default=[1, 8])
+    ap.add_argument("--block-m", type=int, default=256)
+    ap.add_argument("--cus", type=int, default=256, help="tiles per wave")
     ap.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--out", default="")
@@ -115,7 +142,8 @@ def main():
     uid = UniqueId.from_bytes(payload[0])
 
     cfgs = [
-        A2aGemmConfig(world, args.m, args.k, 256, c, timeline=True) for c in args.chunks
+        A2aGemmConfig(world, args.m, args.k, args.block_m, c, timeline=True)
+        for c in args.chunks
     ]
     cap = max(c.window_bytes for c in cfgs)
     comm = Communicator.init(world, rank, uid, per_rank_vmm=2 * cap + (512 << 20))
@@ -160,7 +188,8 @@ def main():
                 cfg,
                 rank,
                 N=args.n,
-                wait="none" if variant in ("idle", "nowait") else variant,
+                wait="none" if variant in ("idle", "nowait", "nopost") else variant,
+                _post=variant != "nopost",
                 acquire="none",
                 _timeline=True,
                 _grid=1 if variant == "idle" else 0,
@@ -190,6 +219,16 @@ def main():
                 key: _median(r[key] for r in runs)
                 for key in ("posted", "quiet", "tile_end", "last_tile_start", "tile_us")
             }
+            # Per-tile medians over the iterations, then the waves they form.
+            per_tile = [
+                (
+                    _median(r["spans"][i][0] for r in runs),
+                    _median(r["spans"][i][1] for r in runs),
+                )
+                for i in range(tiles)
+            ]
+            mine["spans"] = per_tile
+            mine["waves"] = _waves(per_tile, args.cus)
             mine["band_landed"] = [
                 _median(r["band_landed"][c] for r in runs) for c in range(cfg.chunks)
             ]
@@ -198,15 +237,18 @@ def main():
             if rank == 0:
                 row = dict(
                     world=world, m=args.m, n=args.n, k=args.k,
-                    chunks=cfg.chunks, variant=variant, ranks=gathered,
+                    chunks=cfg.chunks, block_m=cfg.block_m, variant=variant,
+                    ranks=gathered,
                 )  # fmt: skip
                 results.append(row)
                 print(
-                    f"c{cfg.chunks} {variant:8s} "
+                    f"c{cfg.chunks} bm{cfg.block_m} {variant:8s} "
                     f"last band landed {[g['band_landed'][-1] for g in gathered]} "
                     f"| tiles end {[g['tile_end'] for g in gathered]}",
                     flush=True,
                 )
+                for w, wv in enumerate(gathered[0]["waves"]):
+                    print(f"   rank 0 wave {w}: {wv}", flush=True)
                 print(
                     f"   rank 0: bands landed {gathered[0]['band_landed']}, "
                     f"tile {gathered[0]['tile_us']}us, "
