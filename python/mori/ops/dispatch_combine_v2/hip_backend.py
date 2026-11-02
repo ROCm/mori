@@ -50,7 +50,9 @@ FlyDSL is not installed.
 
 from __future__ import annotations
 
+import collections
 import functools
+import itertools
 import os
 
 import torch
@@ -140,6 +142,10 @@ def _geometry_from_env(name):
 # MI308X out the same way (AnvilLib::isMi308x, DID 0x74A2). Capping all of gfx942
 # would have held MI300X and MI325X, which have the full set, to three as well.
 _ASYNCLL_SDMA_QUEUE_CAP = {"mi308x": 3}
+
+# The SDMA queue offset (args.sdmaQueueOffset) the next AsyncLL op built on each
+# device takes. See _build.
+_ASYNCLL_QUEUE_OFFSET = collections.defaultdict(itertools.count)
 
 
 def _asyncll_sdma_queues(model, gpu_per_node: int) -> int:
@@ -409,6 +415,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             if (cfg.is_internode or cfg.async_ll)
             else None
         )
+        # Which of each peer's SDMA queues this op posts to (QueueForPe adds this
+        # to the destination PE). The queues are process-wide per GPU pair, so two
+        # ops whose calls interleave -- TBO's two micro-batches -- otherwise share
+        # one per peer, and each recv's drain also waits for the other op's
+        # transfers. Ops on a device take consecutive offsets; with more ops than
+        # queues they fold, which is slower but still correct.
+        self._sdma_queue_offset = 0
+        if cfg.async_ll and self._dev_comm is not None:
+            n = self._dev_comm.sdma_num_queue
+            if n > 1:
+                counter = _ASYNCLL_QUEUE_OFFSET[self._device_index]
+                self._sdma_queue_offset = next(counter) % n
 
         # gfx1250 dispatch staging: one dynamically-allocated buffer shared by
         # all dispatch schedule variants.  Must be set before _build_kernels
@@ -1149,6 +1167,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ),
             rank=self.cfg.rank,
             lsaBase=self.lsa_base,
+            sdmaQueueOffset=self._sdma_queue_offset,
             dispDestTokIdMap=0,  # per-launch: the base passes token_dest_map or routing_dest_map
             interNodeDispDestTokIdMap=ptr(self.inter_disp_dest_tok_id_map),
             interNodeDispSendMap=ptr(self.inter_disp_send_map),

@@ -265,6 +265,7 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(rdmaBlockNum, "i32")                 \
   X(replayMode, "i32")                   \
   X(curRankNumToken, "i32")              \
+  X(sdmaQueueOffset, "i32")              \
   X(tokenIndices, "p")                   \
   X(inpTokenBuf, "p")                    \
   X(weightsBuf, "p")                     \
@@ -332,6 +333,12 @@ struct EpInterNodeArgs {
   // the binding computes.
   int32_t replayMode{0};
   int32_t curRankNumToken{0};
+  // AsyncLL/SDMA only: added to the destination PE when picking that peer's SDMA
+  // queue (asyncll::QueueForPe). Each op in a process gets its own value, so two
+  // ops whose calls interleave -- TBO's two micro-batches -- post to different
+  // queues, and a recv's local-completion drain waits only for its own op's
+  // copies. It takes the 4-byte alignment gap before the pointers: no field moves.
+  int32_t sdmaQueueOffset{0};
 
   ep_index_t* tokenIndices{nullptr};
   // void*, like the intranode EpArgs: callers cast at the use site. Keeping it
@@ -387,7 +394,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 40,
+static_assert(detail::kEpInterNodeArgsFieldCount == 41,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
