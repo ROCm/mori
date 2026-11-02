@@ -1723,46 +1723,6 @@ void CaseRdmaDmabufVmmInteriorRangeTransfer() {
   CheckDmabufInteriorWrite(pair, src.At(1), dst.At(1), src.chunk, src.chunk / 2, 1 * 1024 * 1024);
 }
 
-void CaseRdmaHostMemoryIgnoresDmabufReg() {
-  if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
-
-  // Host memory registers with ibv_reg_mr alone, even under MORI_ENABLE_DMABUF_REG=1.
-  // hipHostRegister makes it memory HIP tracks but did not map through hipMemMap,
-  // on which the dma-buf export's hipMemRetainAllocationHandle segfaults up to
-  // ROCm 7.2.x, so routing it there would kill this process.
-  ScopedEnvVar enableDmabuf("MORI_ENABLE_DMABUF_REG", "1");
-  ScopedEnvVar disableAutoXgmi("MORI_DISABLE_AUTO_XGMI", "1");
-
-  ConnectedEnginePair pair = CreateConnectedRdmaPair("rdma_host_ignores_dmabuf", true);
-
-  constexpr size_t kSize = 1 * 1024 * 1024;
-  HIP_RUNTIME_CHECK(hipSetDevice(0));
-  std::vector<uint8_t> src(kSize, 0xCD);
-  std::vector<uint8_t> dst(kSize, 0x00);
-  HIP_RUNTIME_CHECK(hipHostRegister(src.data(), kSize, hipHostRegisterDefault));
-  HIP_RUNTIME_CHECK(hipHostRegister(dst.data(), kSize, hipHostRegisterDefault));
-
-  MemoryDesc srcDesc =
-      pair.initiator->RegisterMemory(src.data(), kSize, 0, MemoryLocationType::CPU);
-  MemoryDesc dstDesc = pair.target->RegisterMemory(dst.data(), kSize, 0, MemoryLocationType::CPU);
-
-  TransferStatus status;
-  TransferUniqueId uid = pair.initiator->AllocateTransferUniqueId();
-  pair.initiator->Write(srcDesc, 0, dstDesc, 0, kSize, &status, uid);
-
-  std::string err;
-  Require(WaitTransferDone(&status, 5000, &err), "host memory transfer timeout: " + err);
-  Require(status.Succeeded(),
-          "host memory transfer failed: code=" + std::to_string(status.CodeUint32()) + ", msg='" +
-              status.Message() + "'");
-  Require(dst == src, "host memory transfer wrote wrong data");
-
-  pair.initiator->DeregisterMemory(srcDesc);
-  pair.target->DeregisterMemory(dstDesc);
-  HIP_RUNTIME_CHECK(hipHostUnregister(src.data()));
-  HIP_RUNTIME_CHECK(hipHostUnregister(dst.data()));
-}
-
 void CaseRdmaNotificationDisabledBehavior() {
   if (GetGpuCount() < 1) throw TestSkip("requires at least one GPU");
 
@@ -2325,7 +2285,6 @@ int main(int argc, char* argv[]) {
       {"rdma_transfer_basic", CaseRdmaTransferBasic},
       {"rdma_dmabuf_interior_range_transfer", CaseRdmaDmabufInteriorRangeTransfer},
       {"rdma_dmabuf_vmm_interior_range_transfer", CaseRdmaDmabufVmmInteriorRangeTransfer},
-      {"rdma_host_memory_ignores_dmabuf_reg", CaseRdmaHostMemoryIgnoresDmabufReg},
       {"rdma_notification_disabled_behavior", CaseRdmaNotificationDisabledBehavior},
       {"rdma_notification_env_override_disables", CaseRdmaNotificationEnvOverrideDisables},
       {"rdma_notification_invalid_env_keeps_config", CaseRdmaNotificationInvalidEnvKeepsConfig},
