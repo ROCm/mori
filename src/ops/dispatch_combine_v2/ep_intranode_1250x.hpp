@@ -3412,6 +3412,12 @@ constexpr bool EpFp4Ovl4() {
     return !EpFp4Wire<kCfg>::kBf16;
   return false;
 }
+// The role index of a wave in the four-rank overlapped push, whose roles 0-7 produce, 8-11 store
+// and 12-23 reduce. While a wave has remote stores in flight, the global loads of the waves eight
+// below and eight above it in the block are held back. Swapping quads 1 and 4 keeps the store
+// waves on 8-11 and makes their neighbors at that distance (0-3, 16-19) producers, whose loads
+// are TDM loads issued a row ahead; the reducers, which wait on each of their loads, run on 4-7,
+// 12-15 and 20-23.
 __device__ __forceinline__ int EpFp4Ovl4Role(const int warpId) {
   const int quad = warpId >> 2;
   return quad == 1 || quad == 4 ? warpId ^ 20 : warpId;
@@ -3544,6 +3550,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                 "Cfg.cardCombine needs the overlapped split send (EpCardCombineOk)");
   static_assert(EpFp4PermMax >= EpCardCombineRowsMax, "the host bounds a block's rows by this");
   static_assert(!W::kBf16 || (kOvlp && kSeg), "the bf16 wire runs only the overlapped split send");
+  static_assert(!kOvl4 || kSegL == 1,
+                "the row-by-row producers leave cpe unset: their store waves must read each row's "
+                "destination from the map, as they do with one chunk in flight (kKeep)");
 
   const int laneId = threadIdx.x & (WS - 1);
   const int warpId = kOvl4 ? EpFp4Ovl4Role(__builtin_amdgcn_readfirstlane((int)(threadIdx.x / WS)))
@@ -3567,27 +3576,37 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
     const unsigned a2 = (unsigned)__builtin_amdgcn_update_dpp(0, (int)amax, 0x4e, 0xf, 0xf, false);
     return amax > a2 ? amax : a2;
   };
-  // Writes a group's payload and returns its scale byte. The e8m0 scale is the smallest power of
-  // two that brings the group's amax within the format's largest value: 6 for e2m1, 448 for e4m3.
-  auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
-    const int u = i * WS + laneId;
+  using QV = std::conditional_t<W::kFp8, EpU32x2, unsigned>;
+  // Quantizes a group: returns its payload and sets s to its scale byte. The e8m0 scale is the
+  // smallest power of two that brings the group's amax within the format's largest value: 6 for
+  // e2m1, 448 for e4m3.
+  auto qgrpReg = [&](const uint4 x, unsigned& s) -> QV {
     const unsigned amax = grpAmax(x);
     if constexpr (W::kFp8) {
       const int e8 = (((int)(amax & 0x7FFFu) + 0x1F) >> 7) - 8;
       const int se = (e8 < 1 ? 1 : e8) - 127;
       const float sc = __uint_as_float((unsigned)(127 + se) << 23);
-      *reinterpret_cast<EpU32x2*>(d + (size_t)u * 8) =
-          __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
-      return (unsigned char)(se + 127);
+      const QV q = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
+      s = (unsigned)(se + 127);
+      return q;
     } else {
       const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
       const int se = (e8 < 1 ? 1 : e8) - 127;
       const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
-      const unsigned q =
+      const QV q =
           (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(__builtin_bit_cast(EpBf16x8, x), sc);
-      *reinterpret_cast<unsigned*>(d + (size_t)u * 4) = q;
-      return (unsigned char)(se + 127);
+      s = (unsigned)(se + 127);
+      return q;
     }
+  };
+  auto qput = [&](unsigned char* const d, const int i, const QV q) {
+    *reinterpret_cast<QV*>(d + (size_t)(i * WS + laneId) * sizeof(QV)) = q;
+  };
+  // Writes a group's payload and returns its scale byte.
+  auto qgrp = [&](unsigned char* const d, const int i, const uint4 x) {
+    unsigned s;
+    qput(d, i, qgrpReg(x, s));
+    return (unsigned char)s;
   };
   auto qscale = [&](unsigned char* const d, const int i, const unsigned char s) {
     d[kPayB + i * (WS / 4) + (laneId >> 2)] = s;
@@ -3762,6 +3781,9 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
                       (size_t)EpCombine1250xLdsBudget,
                   "the split send's ring, staging rows and flags must fit the LDS budget");
     // Slot flags hold chunk + 1: rdy once the chunk is quantized, fre once its stores are done.
+    // Under kOvl4 each producer writes single rows, and rdy counts the rows in the slot instead:
+    // producers add to it, and a store wave trusts it, only once fre shows the slot's previous
+    // chunk retired, so retire() must zero rdy before it advances fre.
     [[maybe_unused]] const unsigned long long ovlEp = kOvlp ? args.xdbFlag[blockIdx.x] : 0ull;
     constexpr int kPermMax = EpFp4PermMax;
     constexpr size_t kPermOff = (size_t)EpCombine1250xLdsBudget - (size_t)kPermMax * 2;
@@ -4004,7 +4026,6 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
         }
       };
       if constexpr (kOvl4) {
-        using QV = std::conditional_t<W::kFp8, EpU32x2, unsigned>;
         const int nRows = rEnd - rb;
         if (warpId < nRows) loadRow(rowOf(rb + warpId));
         for (int r = warpId; r < nRows; r += kSegP) {
@@ -4021,22 +4042,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           unsigned qs[kLd];
 #pragma unroll
           for (int i = 0; i < kLd; ++i) {
-            const unsigned amax = grpAmax(xs[i]);
-            if constexpr (W::kFp8) {
-              const int e8 = (((int)(amax & 0x7FFFu) + 0x1F) >> 7) - 8;
-              const int se = (e8 < 1 ? 1 : e8) - 127;
-              const float sc = __uint_as_float((unsigned)(127 + se) << 23);
-              qv[i] = __builtin_amdgcn_cvt_scalef32_pk8_fp8_bf16(
-                  __builtin_bit_cast(EpBf16x8, xs[i]), sc);
-              qs[i] = (unsigned)(se + 127);
-            } else {
-              const int e8 = (((int)(amax & 0x7FFFu) + 0x3F) >> 7) - 2;
-              const int se = (e8 < 1 ? 1 : e8) - 127;
-              const float sc = __uint_as_float((unsigned)(127 + (se < -126 ? -126 : se)) << 23);
-              qv[i] = (unsigned)__builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(
-                  __builtin_bit_cast(EpBf16x8, xs[i]), sc);
-              qs[i] = (unsigned)(se + 127);
-            }
+            qv[i] = qgrpReg(xs[i], qs[i]);
             asm volatile("" : "+v"(qv[i]), "+v"(qs[i]));
           }
           if (c >= kSegNb) {
@@ -4051,11 +4057,7 @@ __device__ __forceinline__ void EpFp4CombineSend(const EpArgs& args) {
           unsigned char* const d = ringB + ((size_t)slot * kSegK + (size_t)(r % kSegK)) * kWireB;
 #pragma unroll
           for (int i = 0; i < kLd; ++i) {
-            const int u = i * WS + laneId;
-            if constexpr (W::kFp8)
-              *reinterpret_cast<QV*>(d + (size_t)u * 8) = qv[i];
-            else
-              *reinterpret_cast<QV*>(d + (size_t)u * 4) = qv[i];
+            qput(d, i, qv[i]);
             qscale(d, i, (unsigned char)qs[i]);
           }
           asm volatile("s_wait_dscnt 0x0" ::: "memory");
@@ -5053,6 +5055,8 @@ __device__ __forceinline__ bool EpFp4OvlClaim(const EpArgs& args, const unsigned
       const int t = (int)blockIdx.x * kR + v + i * nw;
       const EpFp4Item<kCfg> r = EpFp4ReducePrep<kCfg, 1>(args, t);
       const bool mine = ((r.mask >> laneId) & 1ull) != 0;
+      // A row is ready once it lands or once its sender has finished sending. Reducing without the
+      // missing rows would write a wrong output, so a stall this long fails the launch.
       unsigned spin = 0;
       for (;;) {
         const unsigned long long done =
@@ -5062,7 +5066,7 @@ __device__ __forceinline__ bool EpFp4OvlClaim(const EpArgs& args, const unsigned
             !mine || ((done >> (r.flat / kMaxRecv)) & 1ull) != 0 ||
             __hip_atomic_load(flags + r.lrow, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) == ep;
         if (__all(ok)) break;
-        if (++spin > (1u << 22)) break;
+        if (++spin > (1u << 24)) __builtin_trap();
         __builtin_amdgcn_s_sleep(4);
       }
       if (tile)
@@ -5110,6 +5114,7 @@ __device__ __forceinline__ void EpFp4ReduceOvl(const EpArgs& args, const unsigne
     unsigned pend = 0;
     for (int i = 0; i < 32; ++i)
       if (base + i * nw < (kCfg.cardCombine ? nU : args.numTokens)) pend |= 1u << i;
+    // Tokens left unreduced would keep stale outputs, so a stall this long fails the launch.
     unsigned spin = 0;
     while (pend) {
       const unsigned in = EpFp4OvlRound<kCfg, T>(args, ep, base, nw, pend, take, false, split);
@@ -5118,7 +5123,7 @@ __device__ __forceinline__ void EpFp4ReduceOvl(const EpArgs& args, const unsigne
         pend &= __builtin_amdgcn_readfirstlane(
             __hip_atomic_load(take, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP));
       if (!in) {
-        if (++spin > (1u << 22)) break;
+        if (++spin > (1u << 24)) __builtin_trap();
         __builtin_amdgcn_s_sleep(4);
       }
     }
@@ -5135,6 +5140,7 @@ __device__ __forceinline__ void EpFp4OvlHelp(const EpArgs& args, const unsigned 
         __hip_atomic_load(pend0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP));
     if (!pend) return;
     if (!EpFp4OvlRound<kCfg, T>(args, ep, w0, nw, pend, pend0, true, split)) {
+      // The tokens a helper leaves stay in its paired reducing warp's pending set.
       if (++spin > (1u << 22)) return;
       __builtin_amdgcn_s_sleep(4);
     }
