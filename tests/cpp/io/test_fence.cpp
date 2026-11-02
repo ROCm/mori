@@ -39,7 +39,8 @@
 //   5. initiator reconnect a fenced peer is refused in both directions until unfenced
 //   6. live producer       a fenced peer that kept running is refused, then rebuilds
 //                          and writes again once unfenced
-//   7. peer restart        a restarted peer with the same key reconnects and writes
+//   7. peer restart        a peer restarted under the same key while fenced is refused,
+//                          and writes once unfenced
 //
 // Every case runs over host memory and, when a GPU is visible, again over device
 // memory, so the NIC is also shown to stop writing into VRAM.
@@ -383,26 +384,31 @@ void TestLiveProducerRebuildsAfterFence(Rig& rig) {
   CHECK(dst.AllEqual(0x00), "a refused write must not land");
 
   // Once the receiver lets it back in, its writes notice the dead connection, rebuild
-  // through the normal handshake, and land. Its rebuild while fenced was refused, so
-  // the next one may first wait out the replacement backoff.
+  // through the normal handshake, and land. Its rebuild while fenced was refused with a
+  // Fenced reply, so it asks again shortly instead of backing off.
   CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
   CHECK(WriteEventually(rig.producer.get(), src, dst, kRebuildBudgetMs),
         "an unfenced producer that kept running must be able to write again");
   CHECK(dst.AllEqual(0x77), "the write over the rebuilt connection must land");
 }
 
-void TestRestartedPeerReconnects(Rig& rig) {
+void TestRestartedPeerRefusedUntilUnfenced(Rig& rig) {
   Buffer dst(rig.receiver.get(), 0x00);
 
-  // `producer` was fenced and its old process is gone; a restarted one comes back
-  // under the same key with a new address and fresh QPs.
+  // `producer` dies while fenced, and a restarted one comes back under the same key with
+  // a new address and fresh QPs. The fence is on the key, so it stays out until unfenced.
+  CHECK(rig.receiver->FenceRemoteEngine(kProducer).Ok(), "fence must succeed");
   rig.producer.reset();
   rig.producer = CreateEngine(kProducer);
   Link(rig.producer.get(), rig.receiver.get());
 
   Buffer src(rig.producer.get(), 0xF6);
+  CHECK(WriteRefused(rig.producer.get(), src, dst), "a peer restarted while fenced must be refused");
+  CHECK(dst.AllEqual(0x00), "a refused write must not land");
+
+  CHECK(rig.receiver->UnfenceRemoteEngine(kProducer), "producer must have been fenced");
   CHECK(WriteAndWait(rig.producer.get(), src, dst),
-        "a restarted peer must be able to write after having been fenced");
+        "a restarted peer must be able to write once unfenced");
   CHECK(dst.AllEqual(0xF6), "the restarted peer's write must land");
 }
 
@@ -434,7 +440,8 @@ int main() {
        TestInitiatorReconnectsAfterFence},
       {"6. live producer: refused while fenced, rebuilds once unfenced",
        TestLiveProducerRebuildsAfterFence},
-      {"7. restarted peer with the same key reconnects", TestRestartedPeerReconnects},
+      {"7. peer restarted while fenced is refused until unfenced",
+       TestRestartedPeerRefusedUntilUnfenced},
   };
 
   int passed = 0;
