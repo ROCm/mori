@@ -468,10 +468,7 @@ void DistributedClient::Close() {
 bool DistributedClient::IsDistributed() const { return true; }
 
 bool DistributedClient::SupportsRangedIO() const {
-  // Ranged I/O needs a PUT arena and either a GET arena or direct pool GET.  They are purely a
-  // remote-path resource -- remote gets are staged in them, remote puts assembled in them -- and
-  // they default to zero, so a deployment that never issues ranged I/O allocates and registers
-  // nothing.
+  // Remote ranged PUT needs an arena; GET uses its own arena or direct pool pages.
   //
   // Deliberately NOT gated on the medium.  SSD used to be excluded here on the
   // reasoning that its bytes are not addressable by the transfer layer, but

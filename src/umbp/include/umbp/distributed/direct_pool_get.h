@@ -49,7 +49,6 @@ class DirectPoolGetCache {
     std::condition_variable changed;
     bool fetching = false;
     bool failed = false;
-    bool publish = true;
     std::vector<Interval> ready;  // sorted, disjoint, coalesced
     std::chrono::steady_clock::time_point touched;
 
@@ -61,7 +60,7 @@ class DirectPoolGetCache {
       // Last reader has completed its copy before releasing this reference.
       // Commit may deduplicate and free this allocation immediately.
       try {
-        if (publish && Complete()) {
+        if (Complete()) {
           const auto committed = backend->BatchCommit({{slot.slot_id, key}});
           if (!committed.empty() && committed.front().success) return;
         }
@@ -74,8 +73,7 @@ class DirectPoolGetCache {
         // Backend cleanup is best effort; do not terminate during unwinding.
       }
     }
-    std::vector<Interval> Missing(std::vector<Interval> wanted) const {
-      Normalize(&wanted);
+    std::vector<Interval> Missing(const std::vector<Interval>& wanted) const {
       std::vector<Interval> missing;
       for (const auto& range : wanted) {
         size_t cursor = range.first;
@@ -126,19 +124,16 @@ class DirectPoolGetCache {
     const size_t needed = pages * page_size;
     if (bytes_ > budget_ - needed) PruneLocked(true);
     if (bytes_ > budget_ - needed) return {};  // all remaining slots have readers
-    auto allocate = [&] {
-      AllocateRequest request{key, size};
-      request.local_lifetime = true;
-      return backend->BatchAllocate({request});
-    };
     // Establish ownership before allocating a slot that has no reaper deadline.
     auto entry = std::make_shared<Entry>();
     entry->backend = backend;
     entry->key = key;
-    auto slots = allocate();
+    AllocateRequest request{key, size};
+    request.local_lifetime = true;
+    auto slots = backend->BatchAllocate({request});
     if (!slots.empty() && slots[0].outcome == AllocateOutcome::kFailedNoSpace) {
       PruneLocked(true);  // discard idle partial replicas before failing
-      slots = allocate();
+      slots = backend->BatchAllocate({request});
     }
     if (slots.empty() || slots[0].outcome != AllocateOutcome::kSuccessAllocated) return {};
     entry->slot = std::move(slots[0]);
@@ -159,7 +154,7 @@ class DirectPoolGetCache {
   // Called after front-end reads have drained, before backend Clear/Shutdown.
   void Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto& [key, entry] : entries_) entry->publish = false;
+    for (auto& [key, entry] : entries_) entry->failed = true;
     entries_.clear();
     bytes_ = 0;
   }

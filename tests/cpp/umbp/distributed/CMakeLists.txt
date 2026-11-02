@@ -326,15 +326,8 @@ target_link_libraries(
           gtest_main)
 add_test(NAME umbp_pool_client_ranges COMMAND test_umbp_pool_client_ranges)
 
-# Direct pool GET uses host RAM for the wire and the real page/range/scatter path.
 add_executable(test_umbp_direct_pool_get test_direct_pool_get.cpp)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_link_options(test_umbp_direct_pool_get PRIVATE -Wl,--no-as-needed)
-endif()
-target_link_libraries(
-  test_umbp_direct_pool_get
-  PRIVATE umbp_core umbp_common ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB}
-          gtest_main)
+target_link_libraries(test_umbp_direct_pool_get PRIVATE umbp_common GTest::gtest_main)
 add_test(NAME umbp_direct_pool_get COMMAND test_umbp_direct_pool_get)
 
 # test_umbp_ssd_ranged_io — ranged multi-buffer I/O on an SSD-medium node

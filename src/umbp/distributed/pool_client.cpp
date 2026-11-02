@@ -4337,7 +4337,7 @@ void PoolClient::ServeRangesFromDirectPool(
   using Interval = DirectPoolGetCache::Interval;
   struct Work {
     size_t original;
-    size_t route_index;
+    const RouteGetResult* route;
     std::shared_ptr<Entry> entry;
     std::vector<Interval> wanted;
     std::vector<Interval> missing;
@@ -4386,10 +4386,11 @@ void PoolClient::ServeRangesFromDirectPool(
       }
       Work w{};
       w.original = i;
-      w.route_index = r;
+      w.route = &*routes[r];
       w.entry = std::move(entry);
       for (size_t j = 0; j < sizes[i].size(); ++j)
         w.wanted.emplace_back(offsets[i][j], offsets[i][j] + sizes[i][j]);
+      Entry::Normalize(&w.wanted);
       round_bytes += w.entry->slot.pages.size() * w.entry->slot.page_size;
       work.push_back(std::move(w));
     }
@@ -4408,9 +4409,7 @@ void PoolClient::ServeRangesFromDirectPool(
     }};
     for (;;) {
       BatchGetPlan plan;
-      std::vector<size_t> owners;
       std::shared_ptr<Entry> waiting;
-      bool remaining = false;
       for (size_t j = 0; j < work.size(); ++j) {
         auto& w = work[j];
         if (w.done) continue;
@@ -4424,7 +4423,6 @@ void PoolClient::ServeRangesFromDirectPool(
           w.done = w.ok = true;
           continue;
         }
-        remaining = true;
         if (w.entry->fetching) {
           waiting = w.entry;
           continue;
@@ -4445,12 +4443,11 @@ void PoolClient::ServeRangesFromDirectPool(
         item.dst_backend = backend;
         item.dst_pages = &w.entry->slot.pages;
         item.dst_page_size = w.entry->slot.page_size;
-        item.route = *routes[w.route_index];
+        item.route = *w.route;
         plan.remote_groups[item.route.node_id].push_back(std::move(item));
-        owners.push_back(j);
       }
-      if (!remaining) break;
-      if (!owners.empty()) {
+      if (plan.remote_groups.empty() && !waiting) break;
+      if (!plan.remote_groups.empty()) {
         std::vector<bool> fetched(work.size(), false);
         // Always submit owned work BEFORE waiting on another call's entries.
         // Opposite key ordering across TP ranks otherwise creates a cycle.
@@ -4458,8 +4455,9 @@ void PoolClient::ServeRangesFromDirectPool(
           fetch(plan, &fetched);
         else
           ExecuteRemoteBatchGetPlan(plan, &fetched, /*recache_remote=*/false);
-        for (size_t j : owners) {
+        for (size_t j = 0; j < work.size(); ++j) {
           auto& w = work[j];
+          if (!w.owner) continue;
           {
             std::lock_guard<std::mutex> lock(w.entry->mutex);
             if (fetched[j]) {
@@ -4480,26 +4478,24 @@ void PoolClient::ServeRangesFromDirectPool(
     // A single batch scatter for all ready entries, retaining their shared
     // allocation references until the engine's Wait completes.
     std::vector<TransferItem> copies;
-    std::vector<size_t> built;
     for (size_t j = 0; j < work.size(); ++j) {
       auto& w = work[j];
       if (!w.ok) continue;
       std::vector<ObjectRange> ranges;
       FillReadRanges(dsts[w.original], sizes[w.original], offsets[w.original], &ranges);
       const size_t before = copies.size();
-      if (BuildLocalRangeTransfers(backend, w.entry->slot.pages, w.entry->slot.page_size,
-                                   w.entry->slot.size, ranges, false, j, &copies)) {
-        built.push_back(j);
-      } else {
+      if (!BuildLocalRangeTransfers(backend, w.entry->slot.pages, w.entry->slot.page_size,
+                                    w.entry->slot.size, ranges, false, j, &copies)) {
         copies.resize(before);
+        w.ok = false;
       }
     }
     std::vector<size_t> failed;
     if (!copies.empty()) {
       const bool ok = transfer_engine_->Transfer(copies, &failed);
       const std::unordered_set<size_t> bad(failed.begin(), failed.end());
-      for (size_t j : built)
-        (*results)[work[j].original] = bad.count(j) == 0 && (ok || !failed.empty());
+      for (size_t j = 0; j < work.size(); ++j)
+        if (work[j].ok) (*results)[work[j].original] = bad.count(j) == 0 && (ok || !failed.empty());
     }
     // No entry is published until all concurrent copy-outs drop their refs.
     work.clear();
