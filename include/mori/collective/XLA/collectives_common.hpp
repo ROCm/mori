@@ -416,47 +416,41 @@ inline __device__ SdmaCollectiveHandle *GetSharedHandle(cco::ccoSdmaQueueDeviceH
 // Fused SDMA "push" scatter shared by the push collectives (reduce-scatter and
 // all-gather). Four consecutive lanes write one fused 64B copy+signal via
 // WriteFusedPacket (one b128 store each). nWork = npes*4; a peer never straddles
-// a warp (warpSize % 4 == 0). sub==0 snapshots the queue handle once, then for
-// each slice s: reserves 64B, the four lanes write, sub==0 rings that packet.
-// Same-lane sequential doorbells; distinct peers are distinct queues, so several
-// sub==0 lanes in one warp do not share a commit chain. No LDS / syncthreads.
-// Occupancy (rptr) stays; the local cachedHwReadIndex is reused across s and
-// written back once if it moved.
+// a warp (warpSize % 4 == 0). sub==0 snapshots the queue handle once and
+// reserves every packet of the peer at once ([POLL] + S slices, 64B each), then
+// rings two doorbells: the first covers [POLL] + slice 0 so the engine starts as
+// early as possible, the second slices 1..S-1 (none at S==1). Every packet is
+// 64B and the ring a 64B multiple, so the reservation may span the ring end but
+// no packet straddles it: each packet wraps its own offset. Same-lane sequential
+// doorbells; distinct peers are distinct queues, so several sub==0 lanes in one
+// warp do not share a commit chain. No LDS / syncthreads. Occupancy (rptr)
+// stays; the local cachedHwReadIndex is written back once if it moved.
 //
 // Each shard is split into S = 1<<logS slices. Slice s is an SDMA copy from
 // p.src + s*sliceBytes to p.dst + s*sliceBytes, followed by an atomic swap
 // storing `value` into p.sigBase[s]. sigBase is the peer's copy of MY row of the
 // symmetric arrived array (PeerPtr(&arrived[myPe*kArrivedStride + slotBase])),
-// so the swap lands in a slot only I write on that peer. Completion is observed
-// on the receive side (WaitArrived) -- fire-and-forget, no local quiet, no
-// cross-PE barrier.
+// so the swap lands in a slot only I write on that peer. The receiver observes
+// completion locally (WaitArrived); the sender learns its copy is done -- the
+// engine has finished reading src -- by polling that same remote slot
+// (WaitDelivered).
+//
+// A peer with a non-null `gate` gets a POLL_REGMEM (*gate == gateValue) ahead of
+// slice 0, in the same reservation and first doorbell, so the engine -- not the GPU --
+// holds the copies back until the peer has entered the launch. The compare is
+// equality on one dword, so the gate value must not be overtaken while polled.
 //
 // The caller describes each peer's copy with peerOf(peer) -> ScatterPeer
 // (warp-uniform at peer granularity). dst and sigBase are peer addresses,
-// usually built with PeerPtr. Examples:
-//   reduce-scatter: active=peer!=myPe, src=input+peer*chunkElems, dst slot packs
-//                   staging densely (slot = myPe<peer?myPe:myPe-1). Self folded in
-//                   by the reduce.
-//   all-gather:     active=true, src=input (single shard to everyone incl. self),
-//                   dst = output[myPe] (constant).
-//   all-to-all:     active=true, src=srcPtrs[peer], dst = dstPtrs[myPe] (constant).
-//
-// src/dst MUST reference the symmetric static heap (ShmemMalloc) so the
-// address-based SDMA put can translate local->peer.
-// ---------------------------------------------------------------------------
-// elems is the DESTINATION shard's element count, so each peer's copy can be a
-// different length: the all-reduce push path uses 16B-aligned variable shards,
-// while the uniform callers (all-gather / all-to-all / collective-permute /
-// reduce-scatter push) pass a constant. The slice geometry is recomputed per peer
-// from that length. Callers must pick logS small enough that every active shard
-// yields sliceLen >= vecSize (no empty slices), since the receiver still waits on
-// all S slices; the reduce facades clamp logS by the smallest shard.
+// usually built with PeerPtr. 
 struct ScatterPeer {
   bool active;         // issue this peer's copy
   size_t elems;        // destination shard length, in ElemBytes units
   const uint8_t* src;  // local source base (pre-slice)
   uint8_t* dst;        // peer's destination base (pre-slice)
   uint64_t* sigBase;   // peer's copy of my arrived row; slice s signals sigBase[s]
+  const uint32_t* gate = nullptr;  // local flag the engine polls before slice 0
+  uint32_t gateValue = 0;          // released when *gate == gateValue
 };
 
 template <uint64_t ElemBytes = 1, class PeerFn>
@@ -494,28 +488,51 @@ __device__ __forceinline__ void StartSdmaScatter(cco::ccoSdmaContext sdma, int n
     }
     queueBuf = BroadcastQuad(queueBuf);
 
-    for (int s = 0; s < S; s++) {
-      uint64_t pktBase = 0;
-      if (active && sub == 0) {
-        pktBase = handle.ReserveSingleProducer(kSDMACopySignalPkt);
-      }
-      pktBase = BroadcastQuad(pktBase);
+    // One reservation for [POLL][slice 0 .. S-1]; slice s sits at slot gated+s.
+    const uint64_t gated = (active && p.gate != nullptr) ? 1 : 0;
+    const uint64_t totalBytes = (gated + S) * kSDMACopySignalPkt,
+                   headBytes = (gated + 1) * kSDMACopySignalPkt;
+    uint64_t pktBase = 0;
+    if (active && sub == 0) {
+      pktBase = handle.ReserveSingleProducer(totalBytes);
+    }
+    pktBase = BroadcastQuad(pktBase);
 
+    // Doorbell 1: the POLL and slice 0 alone, so the engine fetches them (and
+    // parks on the poll) while the remaining slices are still being written.
+    if (active) {
+      if (gated) {
+        WritePollPacket(sub, p.gate, p.gateValue,
+            queueBuf + SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t));
+      }
+      const uint64_t pos = pktBase + gated * kSDMACopySignalPkt;
+      const size_t sz = S == 1 ? lastBytes : sliceBytes;
+      WriteFusedPacket(sub, p.src, p.dst, sz, p.sigBase, value,
+        queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
+    }
+    cco::ccoSdmaPublishStores();
+    __builtin_amdgcn_wave_barrier();
+    if (active && sub == 0) {
+      handle.submitPacket(pktBase, pktBase + headBytes);
+    }
+
+    // Doorbell 2: slices 1..S-1. It starts where doorbell 1 ended and this lane
+    // is the queue's only producer, so the commit chain is already ours.
+    if (S > 1) {
       if (active) {
-        auto* srcp = p.src + s * sliceBytes;
-        auto* dstp = p.dst + s * sliceBytes;
-        const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
-        const uint64_t* sig = p.sigBase + s;
-        const uint64_t ringDw =
-            SdmaCollectiveHandle::WrapIntoRing(pktBase) / sizeof(uint32_t);
-        WriteFusedPacket(sub, srcp, dstp, sz, sig, value, queueBuf + ringDw);
+        const auto *psrc = p.src + sliceBytes;
+        auto *pdst = p.dst + sliceBytes;
+        for (int s = 1; s < S; s++, psrc += sliceBytes, pdst += sliceBytes) {
+          const uint64_t pos = pktBase + (gated + s) * kSDMACopySignalPkt;
+          const size_t sz = (s == S - 1) ? lastBytes : sliceBytes;
+          WriteFusedPacket(sub, psrc, pdst, sz, p.sigBase + s, value,
+            queueBuf + SdmaCollectiveHandle::WrapIntoRing(pos) / sizeof(uint32_t));
+        }
       }
-
       cco::ccoSdmaPublishStores();
       __builtin_amdgcn_wave_barrier();
-
       if (active && sub == 0) {
-        handle.submitPacket(pktBase, pktBase + kSDMACopySignalPkt);
+        handle.submitPacket(pktBase + headBytes, pktBase + totalBytes);
       }
     }
 
@@ -597,10 +614,12 @@ __device__ __forceinline__ void SdmaPostPerPeer(cco::ccoSdmaContext sdma, int np
 // Slot p of every PE's copy is written only by PE p, so my own slot doubles as
 // the launch generation: between launches it is always even, and gen = slot & ~1.
 // Every launch advances it by exactly 2 whatever the collective -- push kernels
-// post gen+2 in one entry round, pull kernels post gen+1 at entry and gen+2 at
-// exit -- so as long as every PE issues the same sequence of collectives on this
-// communicator, every PE posts the same value in every round. This is why the
-// array must not be shared with a communicator over a different PE range.
+// post gen+1 at entry (PostArrival: no GPU wait, the peers' SDMA engines poll
+// for it) and store gen+2 into their own slot at the tail, pull kernels post
+// gen+1 at entry and gen+2 at exit -- so as long as every PE issues the same
+// sequence of collectives on this communicator, every PE posts the same value in
+// every round. This is why the array must not be shared with a communicator
+// over a different PE range.
 //
 // Arriving posts the value into slot myPe of every PE's copy (plain one-way
 // stores, no remote RMW), then waits on local loads only, until every slot of my
@@ -666,6 +685,64 @@ __device__ __forceinline__ void WaitArrived(const uint64_t* arrived, int slot, u
     const uint64_t v = AtomicLoad<ESystemScope>(addr);
     if (v >= gen) break;
     __builtin_amdgcn_s_sleep(1);
+  }
+}
+
+// Post half of GenBarrier, for the push kernels: post `value` into slot myPe of
+// every PE's copy and return without waiting. Each peer's SDMA engine waits for
+// it instead, through the POLL_REGMEM gate ahead of its copies to me (see
+// ScatterPeer::gate), so the GPU never blocks at entry. Called by the whole
+// block; only warp 0 posts.
+__device__ __forceinline__ void PostArrival(uint64_t* barrierCtr, uint64_t value, int myPe,
+                                            int npes, uint32_t stride4G) {
+  if (threadIdx.x >= warpSize) return;
+  // Orders the caller's prior stores ahead of every arrival.
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+  const int peer = threadIdx.x;
+  if (peer < npes) {
+    AtomicStore<ESystemScope>(PeerPtr(&barrierCtr[myPe], peer, myPe, stride4G), value);
+  }
+}
+
+// The low dword of my local copy of peer's gen-barrier slot, which only `peer`
+// writes: the POLL_REGMEM gate for my copies to it. Equality never misses:
+// the peer posts again only after this launch, which needs my gated copy.
+__device__ __forceinline__ const uint32_t* BarrierGate(const uint64_t* barrierCtr, int peer) {
+  return reinterpret_cast<const uint32_t*>(&barrierCtr[peer]);
+}
+
+// Sender-side completion: waits until completion slot `slot` of MY row in every
+// active peer's copy of `arrived` has reached `gen` (remote loads over XGMI).
+// The swap that writes it trails my copy on the same in-order queue, so this
+// proves the copy landed and the engine is done reading my source. Polling a
+// queue's last signal covers every earlier packet on it. Executed by ONE full
+// wave: lane q polls peer q.
+template <class ActiveFn>
+__device__ __forceinline__ void WaitDelivered(const uint64_t* arrived, int slot, uint64_t gen,
+                                              int myPe, int npes, uint32_t stride4G,
+                                              ActiveFn active) {
+  const int lane = __lane_id();
+  if (lane >= npes || !active(lane)) return;
+  const uint64_t* addr = PeerPtr(arrived + myPe * kArrivedStride + slot, lane, myPe, stride4G);
+  while (AtomicLoad<ESystemScope>(addr) < gen) {
+    __builtin_amdgcn_s_sleep(1);
+  }
+}
+
+// WaitArrived (every row, self included) and WaitDelivered (every peer but
+// self, whose arrival is the same signal) in one loop, for the kernels whose
+// single block does both: lane q polls q's signal in my copy and mine in q's.
+__device__ __forceinline__ void WaitArrivedAndDelivered(const uint64_t* arrived, int slot,
+                                                        uint64_t gen, int myPe, int npes,
+                                                        uint32_t stride4G) {
+  const int lane = __lane_id();
+  bool in = lane < npes, out = in && lane != myPe;
+  const uint64_t* inAddr = arrived + lane * kArrivedStride + slot;
+  const uint64_t* outAddr = PeerPtr(arrived + myPe * kArrivedStride + slot, lane, myPe, stride4G);
+  while (in || out) {
+    if (in) in = AtomicLoad<ESystemScope>(inAddr) < gen;
+    if (out) out = AtomicLoad<ESystemScope>(outAddr) < gen;
+    if (in || out) __builtin_amdgcn_s_sleep(1);
   }
 }
 

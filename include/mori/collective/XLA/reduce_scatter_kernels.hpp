@@ -125,8 +125,9 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 //                   [kArrivalIdx] elects the last block (atomicInc wraps it back
 //                   to 0) to advance the push generation
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags of this communicator
-//                   (GenBarrier in block 0, before Phase 1), so
-//                   back-to-back launches need no host barrier
+//                   (PostArrival in block 0; each peer's queue polls for it
+//                   before Phase 1's copies), so back-to-back launches need no
+//                   host barrier
 //   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
 //
 // Each shard is split into S slices. A sender issues S separate SDMA copies; copy
@@ -139,18 +140,22 @@ __device__ __forceinline__ void ReduceVecGroup(const T* __restrict__ input,
 // waits are satisfied in the order they are performed and each slice's reduce
 // overlaps the still-in-flight transfer of the later slices (pipelining). The
 // last block to finish the loop advances the generation for the next launch.
+// Block 0 also waits until its last slice has landed at every peer, so the
+// kernel never retires while its SDMA still reads input.
 //
 // There is no block-to-slice mapping, so gridDim.x is unconstrained. All-reduce
 // loops the same per-slice reduce and appends its pipelined per-slice broadcast to
 // each iteration (see all_reduce_kernels.hpp).
 //
 // Phase 1: block 0, four consecutive lanes per peer (nWork = npes*4). sub==0
-// snapshots that peer's queue handle, then for each slice s reserves 64B, the
-// four lanes write the fused copy+signal, and sub==0 rings that packet. One
-// leader per queue (peers map to distinct queues) so the commit chain cannot
-// deadlock; occupancy (rptr) is still checked, with cachedHwReadIndex kept local
-// across s and written back once if it moved. Wrap/NOP pad is gone: packets are
-// 64B and the ring is a 64B multiple.
+// snapshots that peer's queue handle and reserves all of its packets at once:
+// the POLL_REGMEM entry gate on that peer's arrival, then one fused copy+signal
+// per slice, each written by the four lanes. sub==0 rings the gate + slice 0
+// first, so the engine starts as early as possible, then slices 1..S-1 with a
+// second doorbell. One leader per queue (peers map to distinct queues) so the
+// commit chain cannot deadlock; occupancy (rptr) is still checked, with
+// cachedHwReadIndex kept local and written back once if it moved. Wrap/NOP pad
+// is gone: packets are 64B and the ring is a 64B multiple.
 //
 // input/staging/output MUST live in the symmetric static heap (ShmemMalloc) so
 // the address-based SDMA put can translate local->peer (offset from heapBaseAddr);
@@ -368,13 +373,13 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
   // Every block reads the launch generation before counting in; only the last
   // block out advances it, after every block has counted in.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
+  const uint32_t stride4G = heapWin->stride4G;
   // Phase 1: scatter the input to the staging buffer
   if (blockIdx.x == 0) {
     // Finishing the previous launch only proves peers SENT to us, not that they
-    // are done reducing what we sent them: gate our writes into their staging
-    // until every PE has entered this launch.
-    int stride4G = heapWin->stride4G;
-    GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    // are done reducing what we sent them: each peer's queue polls for its
+    // arrival in this launch before writing into its staging.
+    PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -389,7 +394,8 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
           return ScatterPeer{
               peer != myPe, chunkElems,
               reinterpret_cast<const uint8_t*>(input + peer * chunkElems),
-              reinterpret_cast<uint8_t*>(stagingP), arrivedP};
+              reinterpret_cast<uint8_t*>(stagingP), arrivedP,
+              BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
         });
   }
   
@@ -406,6 +412,13 @@ ReduceScatterPushKernel(int myPe, int npes, int logS, T* __restrict__ output,
     detail::WaitAndReduceSlice<NumVecs, ReduceOp>(arrived, pushGen, s, myPe,
                                                  npes, input, staging, output, sOfs, sCnt,
                                                  chunkElems, chunkElems, lstride);
+  }
+
+  // Block 0 issued the copies: it returns only once its last slice has landed
+  // at every peer, so "kernel done" means input is reusable.
+  if (blockIdx.x == 0 && threadIdx.x < warpSize) {
+    WaitDelivered(arrived, static_cast<int>(S - 1), pushGen, myPe, npes, stride4G,
+                  [=](int peer) { return peer != myPe; });
   }
 
   // === Gen bump: the last block of the grid advances the push generation =======
