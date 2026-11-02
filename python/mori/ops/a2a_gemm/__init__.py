@@ -32,15 +32,21 @@ from .layout import BLOCK_K, MAX_CHUNKS, MAX_WORLD, A2aGemmConfig
 _LAZY = {
     "compile_a2a_gemm": "kernels",
     "build_phases": "kernels",
+    "A2aGemmOp": "op",
+    "default_chunks": "op",
+    "default_wait": "op",
 }
 
 __all__ = [
     "A2aGemmConfig",
+    "A2aGemmOp",
     "BLOCK_K",
     "MAX_CHUNKS",
     "MAX_WORLD",
     "build_phases",
     "compile_a2a_gemm",
+    "default_chunks",
+    "default_wait",
 ]
 
 

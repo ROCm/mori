@@ -251,6 +251,39 @@ Inside this kernel the bound holds: what is left is to have the bytes on the
 wire before the GEMM starts -- posting from the producer of A (attention's
 epilogue under Ulysses) rather than from block 0.
 
+## Using it
+
+```python
+from mori.ops.a2a_gemm import A2aGemmOp
+from mori.ops.gemm_ar import preshuffle_b
+
+op = A2aGemmOp(comm, n=N, k=K, m_max=max_tokens_per_rank)  # mode="fused"
+op.self_test()                       # raises if the copy engines move nothing
+b = preshuffle_b(w_o)                # [N, K] fp8, the same on every rank
+
+m = op.padded_m(tokens_per_rank)
+a = op.send_buffer(m)                # [world*m, K/world] fp8, in the window
+quantize_attention_output_into(a)    # or pass any [world*m, K/world] fp8 tensor
+c = op(a, b, a_scale, b_scale)       # [m, N] bf16; a_scale [m], b_scale [N]
+```
+
+One instance serves one weight shape and every `M` up to `m_max`, with a plan
+(and a compile) per `M`. Bands per call and the wait mode default per `M` from
+the tables above (`default_chunks`, `default_wait`): P=4 one band per 2048
+rows; P=8 one band at 2048, then one per 1024 rows, with `wait="tile"` from
+4096. `chunks=` and `wait=` override them. `mode="split"` is push, barrier,
+GEMM, barrier over the same window. `C` belongs to the op and the next call
+with the same `M` overwrites it; `send` may be refilled as soon as a call is
+on the stream, since the closing barrier holds every rank until every GEMM
+has finished reading. The op captures into a CUDA graph and replays like a
+fresh call. `acquire` defaults to `"inv"`; the tables use `"none"`, which
+relies on cco's default uncached window.
+
+Through the op (defaults, `acquire="none"`, graph replay, input written into
+`send_buffer`), the 70B shape at P=8 measured 136.6 / 262.0 / 430.9 us fused
+and 149.7 / 290.1 / 557.4 us split at `m_local` 2048 / 4096 / 8192 -- the best
+fused cells of the table above to within 1.3%.
+
 ## Running it
 
 ```bash
@@ -261,7 +294,8 @@ HIP_VISIBLE_DEVICES=0,1,2,3 MORI_SOCKET_IFNAME=lo MORI_ENABLE_SDMA=1 \
   -n 6144 -k 6144 --chunks 1 2 4 8 --wait segment tile --acquire none \
   --rounds 3 --out m3.jsonl
 
-MORI_ENABLE_SDMA=1 pytest -q tests/python/cco/test_a2a_gemm.py
+MORI_ENABLE_SDMA=1 pytest -q tests/python/cco/test_a2a_gemm.py \
+  tests/python/cco/test_a2a_gemm_op.py
 ```
 
 `timeline_a2a_gemm.py` produces the timeline above. `--wait none` and
@@ -273,7 +307,7 @@ every one.
 
 ## Not done yet
 
-Posting before the GEMM at P=8, from attention's epilogue (see above); a public op
-wrapper with `self_test` and a per-M tile/chunk choice; blockscale
+Posting before the GEMM at P=8, from attention's epilogue (see above); a per-M
+tile choice (the op always uses 256x256); blockscale
 and mxfp8; N that is not a multiple of 256; fp8 head shards quantized against a
 per-shard scale (the scale has to be global, see above); a model integration.
