@@ -50,9 +50,11 @@ namespace collective {
 //
 // Phase 1: SDMA scatters each chunk into every peer's recv slot (self included),
 // each copy trailed by an atomic swap storing the push generation into slot 0 of my row
-// of the receiver's `arrived`. Phase 2: the first wave waits until every row
-// (self included) reached the generation, then an acquire fence makes the peer
-// SDMA writes visible. No Phase 3. Finally thread 0 advances the generation.
+// of the receiver's `arrived`; each peer's copy is held back by a POLL_REGMEM
+// until that peer has entered. Phase 2: the first wave waits until every row
+// (self included) reached the generation and my row reached it at every peer,
+// then an acquire fence makes the peer SDMA writes visible. No Phase 3. Finally
+// thread 0 advances the generation.
 //
 // blockDim.x must be >= npes for the fast-path packet build; launch <<<1, 256>>>
 // with npes <= 8 (SDMA fast path).
@@ -64,9 +66,9 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
   const uint32_t stride4G = heapWin->stride4G;
   // Every lane of the first wave reads my slot before lane myPe posts.
   const uint64_t pushGen = LoadPushGen(barrierCtr, myPe);
-  // A peer finishing its previous launch only proves our chunk reached it; gate
-  // our writes into its recv slot until every PE entered this one.
-  GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+  // A peer finishing its previous launch only proves our chunk reached it; each
+  // peer's queue polls for its arrival in this launch before writing its recv slot.
+  PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
   __syncthreads();
 
   // Phase 1: push each send slot p to peer p's recv slot for sender myPe (self
@@ -85,12 +87,15 @@ __global__ void AllToAllPushKernel(int myPe, int npes, const AddressPair* __rest
                                      peer, myPe, stride4G);
         return ScatterPeer{true, chunkBytes,
                            reinterpret_cast<const uint8_t*>(pairs[peer].source),
-                           dstP, sigP};
+                           dstP, sigP,
+                           peer != myPe ? BarrierGate(barrierCtr, peer) : nullptr,
+                           static_cast<uint32_t>(pushGen - 1)};
       });
 
-  // === Phase 2: wait until all npes senders (self-copy included) signalled. ===
+  // === Phase 2: wait until all npes senders (self-copy included) signalled, ===
+  // and until my chunks landed at every peer, so the sources are reusable on return.
   if (threadIdx.x < warpSize) {
-    WaitArrived(arrived, /*slot=*/0, pushGen, myPe, npes, /*skipSelf=*/false);
+    WaitArrivedAndDelivered(arrived, /*slot=*/0, pushGen, myPe, npes, stride4G);
   }
   __syncthreads();
   // System-scope ACQUIRE: recv slots were written by peers' SDMA over XGMI.

@@ -59,15 +59,17 @@ namespace collective {
 // pair synchronize, so PEs that do not launch this kernel are never waited on.
 // Each side counts the permutes it shares with its partner: whenever I send to
 // dstPe, dstPe receives from me, so my k-th send pairs with its k-th receive.
-// The receiver posts its count k into its source's kReadyFlag[myPe]; the sender
-// waits until its destination's slot reaches its own count k. The slot only
-// grows, so nothing is consumed or cleared.
+// The receiver posts its count k into its source's kReadyFlag[myPe]; the
+// sender's SDMA queue polls (POLL_REGMEM) until its destination's slot equals its
+// own count k before copying, so the GPU never waits. The slot only grows, so
+// nothing is consumed or cleared.
 // Phase 1: SDMA pushes sendBuf into dstPe's recvBuf (self included when
 // dstPe == myPe), trailed by an atomic swap storing my send count k into my
 // kArrivedFlag slot of the receiver's permuteCtr.
 // Phase 2: if srcPe >= 0, thread 0 waits until srcPe's slot reaches my receive
-// count k, then an acquire fence makes the peer SDMA write visible. The slot only
-// grows, so nothing is reset.
+// count k, then an acquire fence makes the peer SDMA write visible. If I send to
+// a peer, thread 0 then polls my slot in its copy until it reaches my send count,
+// so sendBuf is reusable on return. The slots only grow, so nothing is reset.
 //
 // A self-permute (dstPe == srcPe == myPe) counts in permuteNum[myPe] and
 // permuteNum[kCCLMaxPeers+myPe] too, so the self send and self receive stay paired;
@@ -95,14 +97,14 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
 
   // dstPe reaching count k proves it has entered this launch, so by its stream
   // order its previous kernel (of any collective) is done with recvBuf. Without
-  // it, my copy could overwrite recvBuf before dstPe consumed it. Every PE posts
-  // before waiting, so a ring cannot deadlock. A self-send needs no handshake:
-  // stream order covers it.
+  // it, my copy could overwrite recvBuf before dstPe consumed it. The GPU does
+  // not wait for it: my queue to dstPe polls the slot (POLL_REGMEM) ahead of the
+  // copy. A self-send needs no handshake: stream order covers it.
   //
   // No fences: the post only says "I have entered", and everything before it in
-  // my stream is ordered by the kernel boundary; after the wait nothing reads
-  // data dstPe wrote. `>=` cannot miss: dstPe posts k+1 for me only after my
-  // k-th copy lands, which needs this wait to pass first.
+  // my stream is ordered by the kernel boundary. The equality poll cannot miss:
+  // dstPe posts k+1 for me only after my k-th copy lands, which needs the poll
+  // to pass first.
   if (threadIdx.x == 0) {
     if (srcPe >= 0) {
       const uint64_t k = ++permuteNum[kCCLMaxPeers + srcPe];
@@ -114,16 +116,11 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
       }
     }
     if (dstPe >= 0) {
-      const uint64_t k = ++permuteNum[dstPe];
-      sendK = k;
-      if (dstPe != myLsa) {
-        while (AtomicLoad<ESystemScope>(permSlot(kReadyFlag, dstPe)) < k) {
-          __builtin_amdgcn_s_sleep(1);
-        }
-      }
+      sendK = ++permuteNum[dstPe];
     }
   }
   __syncthreads();
+  const bool sendsRemote = dstPe >= 0 && dstPe != myLsa;
 
   // recvBuf's byte offset within the heap window is identical on every rank
   // (symmetric layout), so my local recvBuf pointer maps to peer p's copy by the
@@ -138,7 +135,10 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
                                      peer, myLsa, stride4G);
         return ScatterPeer{
             peer == dstPe, numBytes, reinterpret_cast<const uint8_t*>(sendBuf),
-            dstP, sigP};
+            dstP, sigP,
+            sendsRemote ? reinterpret_cast<const uint32_t*>(permSlot(kReadyFlag, dstPe))
+                        : nullptr,
+            static_cast<uint32_t>(sendK)};
       });
 
   if (srcPe >= 0) {
@@ -151,6 +151,16 @@ __global__ void CollectivePermutePushKernel(int npes, int dstPe, int srcPe,
     __syncthreads();
     // System-scope ACQUIRE: recvBuf was written by srcPe's SDMA over XGMI.
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+  }
+
+  // Sender-side completion, also when nothing is received: my swap into dstPe's
+  // kArrivedFlag[myLsa] trails the copy, so seeing sendK there means the engine
+  // is done reading sendBuf. A self-send is covered by the receive wait above.
+  if (sendsRemote && threadIdx.x == 0) {
+    const uint64_t* addr = PeerPtr(permSlot(kArrivedFlag, myLsa), dstPe, myLsa, stride4G);
+    while (AtomicLoad<ESystemScope>(addr) < sendK) {
+      __builtin_amdgcn_s_sleep(1);
+    }
   }
 }
 

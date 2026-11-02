@@ -62,7 +62,8 @@ namespace collective {
 //                   reset). [kBcastTargetIdx]: this launch's b=1 release target,
 //                   which elects the tail owner.
 //   barrierCtr    : symmetric-heap uint64[npes] gen-barrier flags of this communicator
-//                   (GenBarrier in block 0, before Phase 1)
+//                   (PostArrival in block 0; each peer's queue polls for it
+//                   before Phase 1's copies)
 //   arrived       : symmetric-heap SDMA completion slots (see kArrivedStride)
 //
 // Phase 1-3 are the reduce-scatter push algorithm: block 0 SDMA-scatters each
@@ -94,9 +95,9 @@ namespace collective {
 // They are never reset: the queue polls for == (value Phase 1 read + gridDim.x),
 // exact modulo 2^32. A reset could not be ordered after the engine's last poll
 // sample, and an equality poll that misses its value hangs. The counter cannot
-// overshoot its target while polled: the next launch's adds need peers' next
-// scatters, which follow the entry barrier, which follows this launch's b=1
-// (and, in queue order, b=0) landing at every peer.
+// overshoot its target while polled: the next launch's adds come from my next
+// kernel, which starts only after this launch's tail owner saw b=1 (and, in
+// queue order, b=0) land at every peer, so my engine is past both polls.
 // kBcastArrived / kBcastFlagIdx / kBcastTargetIdx are defined in
 // collectives_common.hpp.
 
@@ -141,10 +142,11 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     }
 
     uint32_t stride4G = heapWin->stride4G;
-    // Gate on every PE entering this launch: staging is shared with the other
-    // push collectives, so a peer may finish before my previous launch is done
-    // with it. Lane 0 enters after its stores above, in program order.
-    GenBarrier(barrierCtr, pushGen - 1, myPe, npes, stride4G);
+    // Each peer's queue polls for that peer's arrival in this launch before
+    // writing into its staging: staging is shared with the other push
+    // collectives, so a peer may finish before my previous launch is done with
+    // it. Lane 0 posts after its stores above, in program order.
+    PostArrival(barrierCtr, pushGen - 1, myPe, npes, stride4G);
     __syncthreads();
     // reduce-scatter: per-peer source slice (stride=chunkElems), dst=staging,
     // no self-copy (self is folded in by the Phase-3 reduce reading local input).
@@ -162,7 +164,7 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
                                        arrived + myPe * kArrivedStride, peer, myPe, stride4G);
           return ScatterPeer{
               peer != myPe, len, reinterpret_cast<const uint8_t*>(input + peer * strideElems),
-              dstP, sigP};
+              dstP, sigP, BarrierGate(barrierCtr, peer), static_cast<uint32_t>(pushGen - 1)};
         });
 
     // Pre-post both broadcasts behind the scatter, each parked on its counter
@@ -248,6 +250,10 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
   // "kernel done" means every peer's shard has landed in output. Each peer's
   // queue carries b=0 ahead of b=1, so b=0 is normally complete by then.
   //
+  // It also waits until MY b=1 has landed at every peer. b=1 is the last packet
+  // on each of my queues, so this covers the scatter and b=0 too: on return my
+  // SDMA no longer reads input or output[myPe].
+  //
   // No acquire closes the kernel -- no thread here reads the slices peers DMA'd
   // into output, and whoever consumes them acquires at its own kernel boundary.
   if (threadIdx.x < warpSize && BroadcastLane0(ownsTail)) {
@@ -255,6 +261,8 @@ AllReducePushKernel(int myPe, int npes, int logS, const T* __restrict__ input,
     if (S > 1) {
       WaitArrived(arrived, kBcastArrived, pushGen, myPe, npes, /*skipSelf=*/true);
     }
+    WaitDelivered(arrived, kBcastArrived + 1, pushGen, myPe, npes, heapWin->stride4G,
+                  [=](int peer) { return peer != myPe; });
     if (threadIdx.x == 0) {
       AtomicStore<ESystemScope>(&barrierCtr[myPe], pushGen);
     }
