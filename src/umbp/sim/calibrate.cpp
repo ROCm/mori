@@ -62,7 +62,6 @@ namespace {
 using namespace mori::umbp;
 using namespace mori::umbp::calibration;
 using MemLoc = mori::io::MemoryLocationType;
-using Clock = std::chrono::steady_clock;
 
 struct SsdOptions {
   std::string dir;
@@ -242,6 +241,12 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
       std::unique_ptr<SSDTier> tier;
       std::unique_ptr<TransferEngine> engine;
       std::unique_ptr<IUMBPClient> client;
+      auto register_memory = [&](char* ptr, size_t size, bool gpu) {
+        if (!client->RegisterMemory(reinterpret_cast<uintptr_t>(ptr), size,
+                                    gpu ? MemLoc::GPU : MemLoc::CPU, gpu ? device : -1,
+                                    MemoryRegistration::kLocalCopyOnly))
+          throw std::runtime_error("UMBP calibration registration failed");
+      };
       uint64_t payload_ns = 0;
       auto disk_config = ssd_options.config;
       if (path == "file_cpu_staged_no_crc") disk_config.verify_crc = false;
@@ -294,13 +299,8 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
           config.distributed->hbm.capacity_bytes = config.dram.capacity_bytes;
         }
         client = CreateUMBPClient(config);
-        if (!client->RegisterMemory(reinterpret_cast<uintptr_t>(src.get()), total,
-                                    src_gpu ? MemLoc::GPU : MemLoc::CPU, src_gpu ? device : -1,
-                                    MemoryRegistration::kLocalCopyOnly) ||
-            !client->RegisterMemory(reinterpret_cast<uintptr_t>(dst.get()), total,
-                                    dst_gpu ? MemLoc::GPU : MemLoc::CPU, dst_gpu ? device : -1,
-                                    MemoryRegistration::kLocalCopyOnly))
-          throw std::runtime_error("UMBP calibration registration failed");
+        register_memory(src.get(), total, src_gpu);
+        register_memory(dst.get(), total, dst_gpu);
       } else if (sim) {
         auto simulated = std::make_unique<SimTransferEngine>(profile);
         if (host_device && !src_gpu) simulated->AddHostGatherRegion(src.get(), HostBytes(total));
@@ -365,9 +365,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
         if (prefill_bytes) {
           filler = Allocate(prefill_chunk, false, sim);
           const auto address = reinterpret_cast<uintptr_t>(filler.get());
-          if (client && !client->RegisterMemory(address, prefill_chunk, MemLoc::CPU, -1,
-                                                MemoryRegistration::kLocalCopyOnly))
-            throw std::runtime_error("SSD prefill registration failed");
+          if (client) register_memory(filler.get(), prefill_chunk, false);
           for (size_t offset = 0; offset < prefill_bytes;) {
             const size_t size = std::min(prefill_chunk, prefill_bytes - offset);
             const std::vector<std::string> keys{"fill-" + std::to_string(offset / prefill_chunk)};
@@ -420,9 +418,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
               const auto started = Clock::now();
               file =
                   engine->RegisterFile(location.fd, location.value_offset, location.readable_size);
-              const auto ns =
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started)
-                      .count();
+              const auto ns = Elapsed(started);
               if (first) registration_times.push_back(ns);
             } else {
               file = TransferRef::File(location.fd, location.value_offset, location.readable_size);
@@ -449,9 +445,6 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
           for (const auto& plan : geometry.plans) segments[c] += plan.sizes.size();
         }
       }
-      auto elapsed = [](Clock::time_point start) {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
-      };
       std::vector<std::pair<bool, std::vector<int64_t>>> measurements;
       std::vector<std::vector<int64_t>> wall_measurements;
       std::vector<bool> gathered;
@@ -466,7 +459,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
         if (cold && !sim && !src_gpu && !read_file) FlushSource(src.get(), total);
         for (bool get : {false, true}) {
           if (retained_read && !get) continue;
-          if (staged_engine ? get != read_file : engine && get) continue;
+          if (!client && get != (staged_engine && read_file)) continue;
           if (client && read_file && get)
             std::this_thread::sleep_for(std::chrono::milliseconds(ssd_options.api_settle_ms));
           // One training caller makes the real launch counter unambiguous. Sample
@@ -492,7 +485,7 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
               } else {
                 Check(tier->BatchWrite(request.keys, request.src_data, sizes), count);
               }
-              wall[c] = elapsed(start);
+              wall[c] = Elapsed(start);
               if (training && payload_ns == 0)
                 throw std::runtime_error("SSD payload observer missing (oversized batch?)");
               return training ? static_cast<int64_t>(payload_ns) : wall[c];
@@ -500,14 +493,8 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
             if (engine) {
               auto plan = engine->Plan(request.items);
               if (!plan.rejected_tags.empty()) throw std::runtime_error("rejected transfer");
-              const auto start = Clock::now();
-              auto handle = engine->Submit(std::move(plan.plans));
-              if (!handle) throw std::runtime_error("UMBP calibration transfer failed");
-              std::vector<TransferFailure> failures;
-              handle->Wait(&failures);
-              const auto ns = elapsed(start);
+              const auto ns = Transfer(*engine, std::move(plan.plans));
               wall[c] = ns;
-              if (!failures.empty()) throw std::runtime_error("UMBP calibration copy failed");
               if (ssd && !read_file && !sim)
                 for (size_t k = 0; k < count; ++k)
                   if (!tier->CommitRecord(request.keys[k], request.records[k]))
@@ -517,12 +504,12 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
             const auto start = Clock::now();
             const auto result = get ? client->BatchGet(request.keys, request.dsts, sizes)
                                     : client->BatchPut(request.keys, request.srcs, sizes);
-            const auto ns = elapsed(start);
+            const auto ns = Elapsed(start);
             wall[c] = ns;
             Check(result, count);
             return ns;
           });
-          if (i >= 0 && (engine || staged_engine || path == "cpu_cpu" || path == "gpu_gpu" ||
+          if (i >= 0 && (!client || path == "cpu_cpu" || path == "gpu_gpu" ||
                          get == (ssd ? read_file : path == "cpu_gpu"))) {
             measurements.emplace_back(get, std::move(times));
             wall_measurements.push_back(std::move(wall));
@@ -549,14 +536,9 @@ void Measure(const std::string& phase, bool cold, int samples, const std::string
         for (size_t c = 0; c < times.size(); ++c) {
           std::cout << block << ',' << count << ','
                     << (path == "cpu_cpu" ? LocalCopyThreads(bytes, count) : 1) << ','
-                    << concurrency << ','
-                    << (engine || staged_engine ? "transfer"
-                        : get                   ? "get"
-                                                : "put")
-                    << ','
-                    << (engine || staged_engine || (path != "cpu_cpu" && path != "gpu_gpu") ? i
-                                                                                            : i / 2)
-                    << ',' << times[c];
+                    << concurrency << ',' << (client ? (get ? "get" : "put") : "transfer") << ','
+                    << (client && (path == "cpu_cpu" || path == "gpu_gpu") ? i / 2 : i) << ','
+                    << times[c];
           if (report_segments) std::cout << ',' << segments[c];
           std::cout << ',' << measured_path << (gathered[i] ? "_gather" : "");
           if (ssd) {
@@ -584,13 +566,8 @@ int main(int argc, char** argv) {
          std::string(argv[1]) != "api") ||
         (std::string(argv[2]) != "cold" && std::string(argv[2]) != "reuse"))
       throw std::invalid_argument(
-          "usage: umbp_sim_probe train|engine|api cold|reuse samples [profile] "
-          "[--path cpu_cpu|cpu_gpu|gpu_cpu|gpu_gpu|file_cpu|cpu_file|file_gpu|"
-          "file_cpu_staged|file_cpu_staged_no_crc|cpu_file_staged] [--device 0] "
-          "[--concurrency 1|2|4] [--max-mib 256] [--block-bytes B,...] [--batches N,...] "
-          "[--ssd-dir DIR] [--ssd-io posix|io_uring] [--ssd-durability relaxed|strict] "
-          "[--ssd-settle-ms 10] [--ssd-api-settle-ms 0] [--ssd-read-prefill-mib 0] "
-          "[--ssd-no-crc] [--gpu-caller]");
+          "usage: umbp_sim_probe train|engine|api cold|reuse samples [profile] [options]\n"
+          "Options: see docs/umbp-calibration.md");
     std::string profile, path = "cpu_cpu";
     int device = 0;
     size_t concurrency = 1, max_mib = 256;
@@ -607,13 +584,11 @@ int main(int argc, char** argv) {
       } else if (arg == "--ssd-dir" && i + 1 < argc) {
         ssd.dir = argv[++i];
       } else if (arg == "--ssd-read-prefill-mib" && i + 1 < argc) {
-        const std::string value = argv[++i];
-        ssd.read_prefill_mib = value == "0" ? 0 : Positive(value);
+        ssd.read_prefill_mib = Positive(argv[++i], true);
         if (ssd.read_prefill_mib > std::numeric_limits<size_t>::max() >> 20)
           throw std::invalid_argument("SSD prefill size is too large");
       } else if ((arg == "--ssd-settle-ms" || arg == "--ssd-api-settle-ms") && i + 1 < argc) {
-        const std::string value = argv[++i];
-        const auto delay = value == "0" ? 0 : Positive(value);
+        const auto delay = Positive(argv[++i], true);
         if (delay > std::numeric_limits<int>::max())
           throw std::invalid_argument("SSD settle delay is too large");
         (arg == "--ssd-settle-ms" ? ssd.settle_ms : ssd.api_settle_ms) = static_cast<int>(delay);
@@ -633,12 +608,10 @@ int main(int argc, char** argv) {
       } else if (arg == "--gpu-caller") {
         ssd.gpu_caller = true;
       } else if (arg == "--device" && i + 1 < argc) {
-        const std::string value = argv[++i];
-        size_t parsed = 0;
-        device = std::stoi(value, &parsed);
-        if (value.empty() || value.front() < '0' || value.front() > '9' || device < 0 ||
-            parsed != value.size())
+        const auto ordinal = Positive(argv[++i], true);
+        if (ordinal > std::numeric_limits<int>::max())
           throw std::invalid_argument("--device must be a nonnegative GPU ordinal");
+        device = static_cast<int>(ordinal);
       } else if (profile.empty() && arg.rfind("--", 0) != 0) {
         profile = arg;
       } else {

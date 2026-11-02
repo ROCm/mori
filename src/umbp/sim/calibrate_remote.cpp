@@ -42,7 +42,6 @@
 namespace {
 using namespace mori::umbp;
 using namespace mori::umbp::calibration;
-using Clock = std::chrono::steady_clock;
 
 void Check(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
@@ -190,9 +189,6 @@ void Measure(bool owner, const std::string& ip, const std::string& remote_ip, ui
   std::cout << "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns,"
                "path,staged,segments,gap\n";
   size_t cases = 0;
-  auto elapsed = [](Clock::time_point start) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
-  };
   for (size_t block : blocks)
     for (size_t count : batches) {
       Check(block >= sizeof(uint64_t), "blocks must contain at least eight bytes");
@@ -249,22 +245,15 @@ void Measure(bool owner, const std::string& ip, const std::string& remote_ip, ui
                       << '\n';
         };
         for (bool get : {false, true}) {
-          size_t segments = 0;
-          const auto geometry = engine->Plan(get ? reads[0] : writes[0]);
-          for (const auto& plan : geometry.plans) segments += plan.sizes.size();
+          std::vector<size_t> segments(concurrency, 0);
           const auto times = Concurrent(concurrency, [&](size_t c) {
             auto plan = engine->Plan(get ? reads[c] : writes[c]);
             Check(plan.rejected_tags.empty(), "rejected RDMA plan");
-            const auto start = Clock::now();
-            auto handle = engine->Submit(std::move(plan.plans));
-            Check(bool(handle), "RDMA submit failed");
-            std::vector<TransferFailure> failures;
-            handle->Wait(&failures);
-            const auto ns = elapsed(start);
-            Check(failures.empty(), "RDMA transfer failed");
-            return ns;
+            for (const auto& p : plan.plans) segments[c] += p.sizes.size();
+            return Transfer(*engine, std::move(plan.plans));
           });
-          for (auto ns : times) output(ns, get ? "remote_read" : "remote_write", staged, segments);
+          for (size_t c = 0; c < concurrency; ++c)
+            output(times[c], get ? "remote_read" : "remote_write", staged, segments[c]);
         }
         if (!sim)
           for (size_t c = 0; c < concurrency; ++c)
@@ -290,11 +279,7 @@ void Measure(bool owner, const std::string& ip, const std::string& remote_ip, ui
                 plan.uses_bounce = false;
                 plan.bounce_copies.clear();
               }
-              auto handle = engine->Submit(std::move(wire));
-              Check(bool(handle), "staging RDMA submit failed");
-              std::vector<TransferFailure> failures;
-              handle->Wait(&failures);
-              Check(failures.empty(), "staging RDMA transfer failed");
+              Transfer(*engine, std::move(wire));
             }
             // Match RunBouncePlanInline's direction, buffer and serial memcpy geometry.
             const auto start = Clock::now();
@@ -304,7 +289,7 @@ void Measure(bool owner, const std::string& ip, const std::string& remote_ip, ui
                     static_cast<char*>((get ? plan.dst : plan.src).host_ptr) + copy.bounce_offset;
                 std::memcpy(get ? copy.host : bounce, get ? bounce : copy.host, copy.size);
               }
-            const auto ns = elapsed(start);
+            const auto ns = Elapsed(start);
             for (const auto& plan : staging)
               for (const auto& copy : plan.bounce_copies) {
                 auto* bounce =
@@ -333,8 +318,7 @@ int main(int argc, char** argv) {
         argc >= 7 && (std::string(argv[1]) == "owner" || std::string(argv[1]) == "caller") &&
             (std::string(argv[5]) == "train" || std::string(argv[5]) == "engine"),
         "usage: umbp_sim_remote_probe owner|caller LOCAL_IPV4 OWNER_IPV4 PORT train|engine samples "
-        "[profile] [--concurrency 1|2|4] [--max-mib 64] [--block-bytes B,...] [--batches N,...] "
-        "[--gap-bytes 64] [--staged]");
+        "[profile] [options]\nOptions: see docs/umbp-calibration.md");
     const auto port = Positive(argv[4]), samples = Positive(argv[6]);
     const bool training = std::string(argv[5]) == "train";
     size_t concurrency = 1, max_mib = 64, gap = 64;
@@ -349,7 +333,7 @@ int main(int argc, char** argv) {
                i + 1 < argc) {
         const std::string value = argv[++i];
         if (arg == "--gap-bytes")
-          gap = value == "0" ? 0 : Positive(value);
+          gap = Positive(value, true);
         else
           (arg == "--concurrency" ? concurrency : max_mib) = Positive(value);
       } else if ((arg == "--block-bytes" || arg == "--batches") && i + 1 < argc) {

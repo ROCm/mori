@@ -71,6 +71,14 @@ TRANSFER_PATHS = (
 )
 
 
+def is_training(row):
+    return (
+        row["phase"] == "train"
+        and row["mode"] == "real"
+        and row.get("concurrency", 1) == 1
+    )
+
+
 def fit_nonnegative(x, y):
     weights = 1 / np.maximum(y, 1000)
     best = None
@@ -97,12 +105,7 @@ def fit_profile(records, threads, *, log_size=False, staging=False):
         raise ValueError("staging calibration requires one scalar copy curve")
     groups = defaultdict(list)
     for row in records:
-        if (
-            row["phase"] == "train"
-            and row["mode"] == "real"
-            and row.get("concurrency", 1) == 1
-            and row.get("api") != "register"
-        ):
+        if is_training(row) and row.get("api") != "register":
             key = (
                 row["effective_threads"],
                 row.get("model_bytes", row["block_bytes"] * row["batch"]),
@@ -186,15 +189,11 @@ def fit_profile(records, threads, *, log_size=False, staging=False):
 def fit_paths(records, threads, base, *, ssd_io="posix"):
     """Keep unmeasured estimates; fit each engine path without mixing implementations."""
     paths = dict(base)
-    measured = {
-        row.get("path", "cpu_cpu")
-        for row in records
-        if row["phase"] == "train"
-        and row["mode"] == "real"
-        and row.get("concurrency", 1) == 1
-    }
-    for name in sorted(measured):
-        selected = [row for row in records if row.get("path", "cpu_cpu") == name]
+    training = defaultdict(list)
+    for row in records:
+        if is_training(row):
+            training[row.get("path", "cpu_cpu")].append(row)
+    for name, selected in sorted(training.items()):
         curve = fit_profile(
             selected,
             threads if name == "cpu_cpu" else [1],
@@ -204,31 +203,26 @@ def fit_paths(records, threads, base, *, ssd_io="posix"):
         )
         if name in ("cpu_gpu", "gpu_cpu"):
             curve["interleave_copies"] = True
-        base_name = name.removesuffix("_no_crc")
-        fallback = (
-            base.get("cpu_staging", base.get("cpu_cpu", {}))
+        base_name = (
+            "cpu_staging"
             if name.startswith("cpu_staging")
-            else base.get(
-                base_name,
-                base.get(
-                    base_name.removesuffix("_gather").removesuffix("_staged"),
-                    {},
-                ),
-            )
+            else name.removesuffix("_no_crc")
         )
-        curve["channel"] = base.get(name, fallback).get("channel", CHANNELS[name])
+        fallback_name = (
+            "cpu_cpu"
+            if name.startswith("cpu_staging")
+            else base_name.removesuffix("_gather").removesuffix("_staged")
+        )
+        curve["channel"] = base.get(
+            name, base.get(base_name, base.get(fallback_name, {}))
+        ).get("channel", CHANNELS[name])
         if name != "cpu_cpu":
             curve = {
                 key: value[0] if isinstance(value, list) else value
                 for key, value in curve.items()
             }
         registrations = [
-            row["elapsed_ns"]
-            for row in selected
-            if row.get("api") == "register"
-            and row["phase"] == "train"
-            and row["mode"] == "real"
-            and row.get("concurrency", 1) == 1
+            row["elapsed_ns"] for row in selected if row.get("api") == "register"
         ]
         if registrations:
             curve["registration_latency_ns"] = statistics.median(registrations)
@@ -452,21 +446,13 @@ def main():
             f"{path} {phase} {mode}: round {round_id + 1}, {p} threads, {c} callers, staged={staged}",
             flush=True,
         )
-        command = [
+        taskset = [
             "taskset",
             "-c",
             ",".join(map(str, cpus[: p * c] if path == "cpu_cpu" else cpus)),
-            str(probe),
-            phase,
-            args.cache,
-            str(args.samples),
-            "--concurrency",
-            str(c),
-            "--max-mib",
-            str(args.max_mib),
         ]
         if path == "remote":
-            command[3:] = [
+            command = [
                 str(remote_probe),
                 "caller",
                 args.local_address,
@@ -474,36 +460,37 @@ def main():
                 str(args.port),
                 phase,
                 str(args.samples),
-                "--concurrency",
-                str(c),
-                "--max-mib",
-                str(args.max_mib),
             ]
             if staged:
                 command.append("--staged")
         else:
-            command.extend(["--path", path, "--device", str(args.device)])
+            command = [
+                str(probe),
+                phase,
+                args.cache,
+                str(args.samples),
+                "--path",
+                path,
+                "--device",
+                str(args.device),
+            ]
             if "file" in path:
-                command.extend(
-                    [
-                        "--ssd-dir",
-                        str(args.ssd_dir),
-                        "--ssd-io",
-                        args.ssd_io,
-                        "--ssd-durability",
-                        args.ssd_durability,
-                        "--ssd-settle-ms",
-                        str(args.ssd_settle_ms),
-                        "--ssd-api-settle-ms",
-                        str(args.ssd_api_settle_ms),
-                        "--ssd-read-prefill-mib",
-                        str(args.ssd_read_prefill_mib),
-                    ]
-                )
+                for option in (
+                    "ssd-dir",
+                    "ssd-io",
+                    "ssd-durability",
+                    "ssd-settle-ms",
+                    "ssd-api-settle-ms",
+                    "ssd-read-prefill-mib",
+                ):
+                    command.extend(
+                        [f"--{option}", str(getattr(args, option.replace("-", "_")))]
+                    )
                 if args.ssd_no_crc:
                     command.append("--ssd-no-crc")
                 if caller_gpu:
                     command.append("--gpu-caller")
+        command.extend(["--concurrency", str(c), "--max-mib", str(args.max_mib)])
         for option, values in workloads[
             "train" if phase == "train" else "validation"
         ].items():
@@ -518,12 +505,10 @@ def main():
         with (args.output / "owner.log").open("a") as log:
             try:
                 if path == "remote":
-                    owner_args = ["owner", args.remote_address, *command[6:]]
+                    owner_args = ["owner", args.remote_address, *command[3:]]
                     owner = subprocess.Popen(
                         [
-                            "taskset",
-                            "-c",
-                            ",".join(map(str, cpus)),
+                            *taskset,
                             "sh",
                             "-c",
                             args.remote_command + " " + shlex.join(owner_args),
@@ -534,7 +519,7 @@ def main():
                         env=process_env,
                     )
                 result = subprocess.run(
-                    command,
+                    [*taskset, *command],
                     text=True,
                     stdout=subprocess.PIPE,
                     check=True,
@@ -593,6 +578,7 @@ def main():
         and "file_cpu_staged_no_crc" not in local_paths
     ):
         local_paths.append("file_cpu_staged_no_crc")
+
     for r in range(args.rounds):
         for path in local_paths:
             for p in threads if path == "cpu_cpu" else [1]:

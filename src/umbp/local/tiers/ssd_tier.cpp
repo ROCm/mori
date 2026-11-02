@@ -1169,9 +1169,6 @@ std::vector<bool> SSDTier::ReadBatchRangesIntoPtr(
         use_batch);
   }
 
-  if (payload_timing_observer_ && ssdperf::Enabled())
-    payload_timing_observer_(static_cast<uint64_t>((io_ms + copy_ms) * 1e6));
-
   return results;
 }
 

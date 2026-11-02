@@ -118,7 +118,7 @@ class SSDTier : public TierBackend {
   bool native_async_io() const { return io_driver_->Capabilities().native_async; }
 
   // Calibration only: set before I/O with UMBP_SSD_TIMING=1. Reports batch
-  // complete payload work (including buffer cleanup), excluding index, metadata locks and planning.
+  // BatchWrite/ReadBatchIntoPtr payload work, including cleanup but excluding index/locks/planning.
   // Write batches must fit segment_size(), without the per-key fallback.
   void SetPayloadTimingObserver(std::function<void(uint64_t)> observer) {
     payload_timing_observer_ = std::move(observer);

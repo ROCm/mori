@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -33,12 +34,32 @@
 #include <thread>
 #include <vector>
 
+#include "umbp/distributed/transfer/transfer_engine.h"
+
 namespace mori::umbp::calibration {
 
-inline size_t Positive(const std::string& text) {
+using Clock = std::chrono::steady_clock;
+
+inline int64_t Elapsed(Clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
+}
+
+// Planning stays outside timing; completion checks stay after the measured interval.
+inline int64_t Transfer(TransferEngine& engine, std::vector<TransferPlan> plans) {
+  const auto start = Clock::now();
+  auto handle = engine.Submit(std::move(plans));
+  if (!handle) throw std::runtime_error("calibration transfer submit failed");
+  std::vector<TransferFailure> failures;
+  handle->Wait(&failures);
+  const auto ns = Elapsed(start);
+  if (!failures.empty()) throw std::runtime_error("calibration transfer failed");
+  return ns;
+}
+
+inline size_t Positive(const std::string& text, bool allow_zero = false) {
   size_t parsed = 0;
   const auto value = std::stoull(text, &parsed);
-  if (text.empty() || text.front() < '0' || text.front() > '9' || value == 0 ||
+  if (text.empty() || text.front() < '0' || text.front() > '9' || (!allow_zero && value == 0) ||
       parsed != text.size() || value > std::numeric_limits<size_t>::max())
     throw std::invalid_argument("expected a positive integer");
   return static_cast<size_t>(value);
