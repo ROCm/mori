@@ -560,10 +560,8 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   // (null+0xf8 in libamdhip64) instead of returning hipErrorInvalidValue on
   // memory HIP tracks but did not map through hipMemMap: pinned host memory
   // (hipHostMalloc, hipHostRegister) and hipMalloc. hipMalloc has exported
-  // through HSA above; pinned host memory passed to RegisterRdmaMemoryRegionAuto
-  // gets here, and the process dies in HIP before the registration error below
-  // is logged. Host memory therefore registers through RegisterRdmaMemoryRegion.
-  // Fixed upstream in ROCM-23527 (rocm-systems 6693769fa7, HIP 7.14).
+  // through HSA above, and RegisterRdmaMemoryRegionAuto keeps pinned host memory
+  // off this path. Fixed upstream in ROCM-23527 (rocm-systems 6693769fa7, HIP 7.14).
   hipMemGenericAllocationHandle_t handle;
   if (hipMemRetainAllocationHandle(&handle, ptr) == hipSuccess) {
     hipError_t exportErr =
@@ -598,9 +596,24 @@ int TryExportDmabufFd(void* ptr, size_t size, uint64_t* offset) {
   return fd;
 }
 
+// True only when HIP reports host memory: plain (unregistered) or pinned with
+// hipHostRegister / hipHostMalloc. The pointer is asked rather than the caller,
+// whose label can be wrong (a GPU buffer registered with a default CPU location).
+static bool IsHostMemory(void* ptr) {
+  hipPointerAttribute_t attr{};
+  if (hipPointerGetAttributes(&attr, ptr) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return attr.type == hipMemoryTypeHost || attr.type == hipMemoryTypeUnregistered;
+}
+
 application::RdmaMemoryRegion RdmaDeviceContext::RegisterRdmaMemoryRegionAuto(void* ptr,
                                                                               size_t size,
                                                                               int accessFlag) {
+  // Host memory has no dma-buf exporter, so the dma-buf leg can only fail on it.
+  if (IsHostMemory(ptr)) return RegisterRdmaMemoryRegion(ptr, size, accessFlag);
+
   int effectiveAccessFlag = MaybeAddRelaxedOrderingFlag(accessFlag);
 
   auto makeHandle = [&](ibv_mr* mr) {
