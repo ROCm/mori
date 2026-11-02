@@ -287,4 +287,20 @@ def lookup(world_size, hidden_dim, topk, dtype="fp8"):
     entry = dev_table.get((world_size, hidden_dim, topk))
     if entry:
         base["schedule"] = entry.get(dtype) or entry.get("fp8") or base["schedule"]
-    return base
+    return _fit_cus(base)
+
+
+def _fit_cus(t):
+    """Blocks capped at the CU count: the gfx1250 rows assume 256 CUs and a grid
+    that is co-resident one block a CU."""
+    cu = _cu_count()
+    if cu <= 0:
+        return t
+    t["dispatch_block_num"] = min(t["dispatch_block_num"], cu)
+    t["combine_block_num"] = min(t["combine_block_num"], cu)
+    if t["schedule"]:
+        t["schedule"] = tuple(
+            (edge, min(db, cu), dw, min(cb, cu), cw)
+            for edge, db, dw, cb, cw in t["schedule"]
+        )
+    return t

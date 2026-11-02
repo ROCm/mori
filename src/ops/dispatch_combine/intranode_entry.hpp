@@ -33,11 +33,12 @@
 // a quantizing one gets the portable body even on gfx125x, because the TDM body has nothing to
 // offer it (see the comment at the combine entry).
 
+#include "mori/core/arch.hpp"
 #include "src/ops/dispatch_combine/intranode.hpp"
 
 // Not standalone: written against MAX_GPUS_PER_NODE and the barrier in intranode.hpp, hence the
 // include order here.
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_GFX125X)
 #include "src/ops/dispatch_combine/intranode_1250x.hpp"
 #endif
 
@@ -46,7 +47,7 @@ namespace moe {
 
 template <typename T, bool EnableStdMoE = false>
 __device__ __forceinline__ void EpDispatchIntraNodeKernel_entry(EpDispatchCombineArgs<T> args) {
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_GFX125X)
   EpDispatchIntraNodeKernel_1250x_body<T, EnableStdMoE>(args);
 #else
   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
@@ -57,7 +58,7 @@ template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
           int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8, bool UseFp4Combine = false>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_entry(EpDispatchCombineArgs<T> args) {
-#if defined(__gfx1250__) || defined(__gfx1251__)
+#if defined(MORI_GFX125X)
   // Only the unquantized combine takes the TDM body, and the TDM body is written for that case
   // alone -- it does not take the quantization parameters at all. Vec8Top8BlockElems /
   // Vec8AccumNum only tune the scalar dequant chain, so they are not passed on either.

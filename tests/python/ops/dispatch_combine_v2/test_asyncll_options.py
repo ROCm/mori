@@ -84,6 +84,13 @@ class AsyncLLOptionsTest(unittest.TestCase):
         self.assertEqual((mode, skip), (0, False))
         self.assertIn("dispatch_recvtransfer", seq["dispatch_recv"])
 
+    def test_gfx1250_strict_matches_gfx1250(self):
+        for env in ({}, {"MORI_ASYNCLL_FUSED_RECV": "1"}):
+            with self.subTest(env=env):
+                self.assertEqual(
+                    self.resolve(env, arch="gfx1250-strict"), self.resolve(env)
+                )
+
     def test_other_architectures_require_explicit_opt_in(self):
         self.assertEqual(self.resolve({}, arch="gfx950")[:2], (0, False))
         self.assertEqual(

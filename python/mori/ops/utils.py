@@ -47,11 +47,8 @@ _ARCH_TO_MODEL = {
 
 
 @functools.lru_cache(maxsize=1)
-def topology():
-    """(cu_count, gfx_target_version, device_id) of the first GPU node from KFD
-    sysfs. gfx_target_version is e.g. 90402 (gfx942), 90500 (gfx950); device_id
-    is the PCI DID (e.g. 0x74a2 = MI308X). Homogeneous host assumed. Returns
-    (0, 0, 0) if sysfs is unavailable (no KFD mounted)."""
+def _first_gpu_node():
+    """KFD sysfs properties of the first GPU node, or {} without KFD."""
     for props in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*/properties")):
         try:
             vals = {}
@@ -60,18 +57,34 @@ def topology():
                     parts = line.split()
                     if len(parts) == 2:
                         vals[parts[0]] = int(parts[1])
-            simd = vals.get("simd_count", 0)
-            if simd <= 0:  # CPU / non-GPU node
-                continue
-            spc = vals.get("simd_per_cu", 0) or 1
-            return (
-                simd // spc,
-                vals.get("gfx_target_version", 0),
-                vals.get("device_id", 0),
-            )
+            if vals.get("simd_count", 0) > 0:  # skip CPU / non-GPU nodes
+                return vals
         except Exception:
             continue
-    return 0, 0, 0
+    return {}
+
+
+def topology():
+    """(cu_count, gfx_target_version, device_id) of the first GPU node from KFD
+    sysfs. gfx_target_version is e.g. 90402 (gfx942), 90500 (gfx950); device_id
+    is the PCI DID (e.g. 0x74a2 = MI308X). Homogeneous host assumed. Returns
+    (0, 0, 0) if sysfs is unavailable (no KFD mounted)."""
+    vals = _first_gpu_node()
+    if not vals:
+        return 0, 0, 0
+    spc = vals.get("simd_per_cu", 0) or 1
+    return (
+        vals["simd_count"] // spc,
+        vals.get("gfx_target_version", 0),
+        vals.get("device_id", 0),
+    )
+
+
+def asic_revision():
+    """The first GPU's ASIC revision, or None without KFD. KFD capability bits 25:22,
+    what HIP reports as hipDeviceAttributeAsicRevision."""
+    cap = _first_gpu_node().get("capability")
+    return None if cap is None else (cap >> 22) & 0xF
 
 
 def cu_count():
