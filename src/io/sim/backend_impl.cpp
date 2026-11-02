@@ -455,6 +455,11 @@ void SimBackend::BatchReadWrite(const MemoryDesc& localDest, const SizeVec& loca
 
 BackendSession* SimBackend::CreateSession(const MemoryDesc& local, const MemoryDesc& remote) {
   if (HasControlPlane()) {
+    // RdmaBackend raises the same way when it would have to build a connection.
+    if (IsFenced(remote.engineKey)) {
+      throw std::runtime_error("SimBackend::CreateSession: engine " + remote.engineKey +
+                               " is fenced; connections are refused until it is unfenced");
+    }
     auto peer = GetPeer(remote.engineKey);
     if (!peer) {
       throw std::runtime_error("SimBackend::CreateSession: remote engine " + remote.engineKey +
@@ -482,6 +487,58 @@ bool SimBackend::PopPeerFailure(PeerFailureEvent* out) {
   *out = std::move(failures_.front());
   failures_.pop_front();
   return true;
+}
+
+FenceResult SimBackend::FenceRemoteEngine(const EngineKey& remote) {
+  if (!HasControlPlane()) {
+    // As XgmiBackend: a same-node peer keeps a path this engine cannot cut.
+    if (remote == self_.key || !IsSameNode(remote)) return FenceResult{};
+    FenceResult result;
+    result.supported = true;
+    result.endpointsFailed = 1;
+    result.message = "peer " + remote + " is on this node and can still write over XGMI";
+    return result;
+  }
+  FenceResult result;
+  result.supported = true;
+  {
+    std::lock_guard<std::mutex> lock(peersMu_);
+    fencedPeers_.insert(remote);
+  }
+  // The peer's connections into our control plane carry its notifications, so cutting them is
+  // what moving its QPs to Error is for RdmaBackend. The server thread drops them on EOF.
+  {
+    std::lock_guard<std::mutex> lock(serverConnKeysMu_);
+    for (const auto& [fd, key] : serverConnKeys_) {
+      if (key == remote && shutdown(fd, SHUT_RDWR) == 0) ++result.endpointsFenced;
+    }
+  }
+  // Our own connection to the peer, and transfers still in flight on it.
+  if (auto peer = GetPeer(remote)) {
+    std::lock_guard<std::mutex> lock(peer->mu);
+    peer->fenceEpoch.fetch_add(1);
+    result.transfersFailed = peer->inFlight.load();
+    if (peer->ep.has_value()) {
+      ctx_->CloseEndpointNoThrow(*peer->ep);
+      peer->ep.reset();
+      ++result.endpointsFenced;
+    }
+    peer->verifiedMems.clear();
+  }
+  MORI_IO_INFO("SimBackend({}) fenced engine {}: {} connection(s), {} transfer(s) in flight",
+               sim::BackendTypeName(type_), remote, result.endpointsFenced,
+               result.transfersFailed);
+  return result;
+}
+
+bool SimBackend::UnfenceRemoteEngine(const EngineKey& remote) {
+  std::lock_guard<std::mutex> lock(peersMu_);
+  return fencedPeers_.erase(remote) != 0;
+}
+
+bool SimBackend::IsFenced(const EngineKey& remote) const {
+  std::lock_guard<std::mutex> lock(peersMu_);
+  return fencedPeers_.count(remote) != 0;
 }
 
 bool SimBackend::CanHandle(const MemoryDesc& local, const MemoryDesc& remote) const {
@@ -601,11 +658,21 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
   }
 
   std::shared_ptr<Peer> peer;
+  uint64_t fenceEpoch = 0;
   if (HasControlPlane()) {
     peer = GetPeer(remote.engineKey);
     if (!peer) {
       status->Update(StatusCode::ERR_BAD_STATE,
                      "remote engine " + remote.engineKey + " is not registered");
+      return;
+    }
+    // Read the epoch before checking the fence, which bumps it after marking the peer fenced:
+    // a transfer that slips past the check still carries the old epoch and fails on completion.
+    fenceEpoch = peer->fenceEpoch.load();
+    if (IsFenced(remote.engineKey)) {
+      status->Update(StatusCode::ERR_RDMA_OP, "remote engine " + remote.engineKey +
+                                                  " is fenced; transfers are refused until it "
+                                                  "is unfenced");
       return;
     }
     EnsurePeerReady(peer, remote);
@@ -618,9 +685,10 @@ void SimBackend::Submit(const MemoryDesc& local, const SizeVec& localOffsets,
 
   status->SetCode(StatusCode::IN_PROGRESS);
   auto deadline = ReserveLink(isRead, bytes, sizes.size());
+  if (peer) peer->inFlight.fetch_add(1);
   {
     std::lock_guard<std::mutex> lock(timerMu_);
-    timerQ_.push(Completion{deadline, timerSeq_++, status, id, std::move(peer)});
+    timerQ_.push(Completion{deadline, timerSeq_++, status, id, std::move(peer), fenceEpoch});
   }
   timerCv_.notify_one();
   MORI_IO_TRACE("SimBackend({}) transfer {} {} {} bytes in {} segments to {}",
@@ -668,6 +736,13 @@ void SimBackend::Complete(Completion& c) {
     std::string err;
     {
       std::lock_guard<std::mutex> lock(c.peer->mu);
+      c.peer->inFlight.fetch_sub(1);
+      // Fenced after this transfer was submitted: its connection was cut, but the peer is fine.
+      if (c.peer->fenceEpoch.load() != c.fenceEpoch) {
+        c.status->Update(StatusCode::ERR_RDMA_OP, "peer " + c.peer->desc.key +
+                                                      " was fenced; its connection was shut down");
+        return;
+      }
       if (c.peer->dead.load()) {
         err = "peer marked unreachable";
       } else if (PeerSocketClosedLocked(*c.peer)) {
@@ -713,11 +788,24 @@ void SimBackend::ServerLoop() {
       if (!HandleServerMessage(fd)) DropServerConn(fd);
     }
   }
+  {
+    std::lock_guard<std::mutex> lock(serverConnKeysMu_);
+    serverConnKeys_.clear();
+  }
   for (auto& [fd, ep] : serverConns_) ctx_->CloseEndpointNoThrow(ep);
   serverConns_.clear();
 }
 
 bool SimBackend::HandleServerMessage(int fd) {
+  // Remembers whose connection this is, so a fence can cut it, and refuses a fenced engine:
+  // nothing it sends is acted on, as a fenced peer's QP delivers nothing in RdmaBackend.
+  auto admit = [&](const EngineKey& sender) {
+    {
+      std::lock_guard<std::mutex> lock(serverConnKeysMu_);
+      serverConnKeys_[fd] = sender;
+    }
+    if (IsFenced(sender)) throw std::runtime_error("engine " + sender + " is fenced");
+  };
   try {
     // Drain every message already buffered so notification bursts cost one wakeup.
     char b;
@@ -726,6 +814,7 @@ bool SimBackend::HandleServerMessage(int fd) {
       switch (type) {
         case SimMsgType::AskMemory: {
           auto req = UnpackSimMsg<SimAskMemory>(body);
+          admit(req.asker);
           SimAskMemoryReply reply{req.id, false, 0};
           {
             std::lock_guard<std::mutex> lock(memsMu_);
@@ -740,6 +829,7 @@ bool SimBackend::HandleServerMessage(int fd) {
         }
         case SimMsgType::Notif: {
           auto msg = UnpackSimMsg<SimNotif>(body);
+          admit(msg.sender);
           std::lock_guard<std::mutex> lock(notifMu_);
           auto& pool = notifPool_[msg.sender];
           auto it = pool.try_emplace(msg.id, msg.totalNum).first;
@@ -764,6 +854,11 @@ bool SimBackend::HandleServerMessage(int fd) {
 }
 
 void SimBackend::DropServerConn(int fd) noexcept {
+  {
+    // Before the close, so a fence never shuts down a reused fd number.
+    std::lock_guard<std::mutex> lock(serverConnKeysMu_);
+    serverConnKeys_.erase(fd);
+  }
   epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
   serverConns_.erase(fd);
   ctx_->CloseEndpointNoThrow(fd);

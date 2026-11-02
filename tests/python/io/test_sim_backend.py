@@ -300,6 +300,46 @@ def test_peer_death_fails_transfers_and_reports():
     assert st.Failed()
 
 
+def test_fence_cuts_peer_until_unfenced():
+    a, b = make_engine("pf"), make_engine("dc")
+    connect(a, b)
+    a_key = a.get_engine_desc().key
+    a_mem, b_mem = gpu_mem(a, 1 << 30), gpu_mem(b, 1 << 30)
+    uid, st = write(a, a_mem, b_mem, [MiB])
+    assert a.wait_all([st]) == StatusCode.SUCCESS
+    assert pop_inbound(b, a_key, uid) is not None
+
+    # b's own write toward a is still on the link when b fences a.
+    _, in_flight = write(b, b_mem, a_mem, [512 * MiB])
+    result = b.fence_remote_engine(a_key)
+    assert result.ok and result.supported, result.message
+    assert result.endpoints_fenced >= 2  # a's connection into b, and b's own to a
+    assert result.transfers_failed == 1
+    assert b.wait_all([in_flight]) == StatusCode.ERR_RDMA_OP
+    assert "fenced" in in_flight.Message()
+
+    # Nothing a sends lands, and b cannot reach a either.
+    uid, st = write(a, a_mem, b_mem, [64 * MiB])
+    assert a.wait_all([st]) == StatusCode.ERR_RDMA_OP
+    assert pop_inbound(b, a_key, uid, timeout_s=0.05) is None
+    _, st = write(b, b_mem, a_mem, [MiB])
+    assert st.Code() == StatusCode.ERR_RDMA_OP
+    with pytest.raises(RuntimeError, match="fenced"):
+        b.create_session(b_mem, a_mem)
+
+    assert b.unfence_remote_engine(a_key)
+    assert not b.unfence_remote_engine(a_key)
+    _, st = write(b, b_mem, a_mem, [MiB])
+    assert b.wait_all([st]) == StatusCode.SUCCESS, st.Message()
+
+
+def test_fence_unsupported_without_a_network_backend():
+    # XGMI has no connection a fence could cut, so it must never report the peer as cut off.
+    a = make_engine("pf", backend=BackendType.XGMI)
+    result = a.fence_remote_engine("anyone")
+    assert not result.supported and not result.ok
+
+
 def use_catalog(sim_env, tmp_path, *texts):
     """Catalog files in order, with the fixture's per-value variables cleared."""
     for backend, profile in PROFILES.items():
