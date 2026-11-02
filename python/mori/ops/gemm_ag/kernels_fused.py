@@ -125,6 +125,8 @@ from ..gemm_ar.kernels_fused import (
     _PermlaneStoreC,
     _SwappedMfma,
 )
+from ._credit import call_epoch, lsa, post_credit, wait_credit
+from .kernels_sdma import _spin_until
 from .layout import (  # noqa: F401
     DEFAULT_BLOCK_M,
     DEFAULT_BLOCK_N,
@@ -222,6 +224,7 @@ def compile_fused_gemm_ag(
     peer_uncached: bool = False,
     emit_put: bool = True,
     fence: str = "leader",
+    war_credit: bool = True,
 ):
     """The GEMM with its C stored into this rank's own window slot.
 
@@ -255,6 +258,11 @@ def compile_fused_gemm_ag(
     is local and the copy engine reads it, so this is a publication choice
     rather than a correctness one: with ``fence="release"`` it is the measured
     ``sc_release`` configuration of the fused path.
+
+    ``war_credit`` (fused only) posts this rank's credit to every peer at kernel
+    entry and has each put wait for its destination's, so a push never lands in
+    a recv its owner is still reading (see ``_credit``). Off only to show what
+    it prevents.
 
     There is no ``rotated``/``n_stripe`` pair. See the module docstring: those
     exist in ``gemm_a2a`` to keep every destination's link busy when a tile
@@ -307,6 +315,10 @@ def compile_fused_gemm_ag(
     my_recv_slot = cfg.recv_slot_off(rank)
     slab_bytes = cfg.slab_bytes
     counter_off, lock_off = cfg.counter_off, cfg.lock_off
+    credit_off, flag_off = cfg.credit_off, cfg.flag_off
+    # The fused path pushes into the peers' recv from here, so it carries the
+    # recv-reuse credit (see _credit); the unfused GEMM pushes nothing.
+    credit = war_credit and fuse
     _StoreC = _UncachedPeerStoreC if peer_uncached else _PermlaneStoreC
     if cfg.counter_chunks != chunks:
         raise ValueError(
@@ -341,7 +353,8 @@ def compile_fused_gemm_ag(
         f"{'B' if blockscale else ('X' if mxfp8 else 'P')}"
         f"x{xcd_swizzle}c{chunks}q{sdma_queues}{post[0]}"
         f"{'U' if peer_uncached else 'C'}"
-        f"{fence[0]}{'p' if emit_put else 'x'}_r{rank}"
+        f"{fence[0]}{'p' if emit_put else 'x'}"
+        f"{'' if credit or not fuse else '_nc'}_r{rank}"
     )
 
     @fx.struct
@@ -434,6 +447,19 @@ def compile_fused_gemm_ag(
         # and gives 0.58 here.
         mfma = _SwappedMfma(Mfma16x16x128(N_TILES_B, N_TILES_A, opsel_b_per_tile=mxfp8))
         w_pre = cco.CachedWindow(win)
+        # Bases out here: the credit helpers run inside runtime `if`s.
+        wbase, wstride = w_pre.base, w_pre.stride
+        call_e = my_credits = None
+        if const_expr(credit):
+            call_e = call_epoch(wbase, wstride, rank, flag_off)
+            my_credits = lsa(wbase, wstride, rank, credit_off)
+            # Block 0's first world lanes, before any GEMM work: block 0 is in
+            # the first wave, so a peer waiting on this never waits on a block
+            # that has not been scheduled.
+            if fx.block_idx.x == 0:
+                ctid = fx.thread_idx.x
+                if ctid < fx.Int32(ws) and ctid != fx.Int32(rank):
+                    post_credit(wbase, wstride, rank, ctid, credit_off, call_e)
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
@@ -791,6 +817,8 @@ def compile_fused_gemm_ag(
                         # rotation keeps the ranks from all posting to the
                         # same peer first.
                         d = (fx.Int32(rank + 1) + j) % fx.Int32(ws)
+                        if const_expr(credit):
+                            wait_credit(my_credits, d, call_e, _spin_until)
                         sdma.put(
                             d,
                             win,
@@ -825,6 +853,15 @@ def compile_fused_gemm_ag(
                         # selectable so the change above stays a measured
                         # difference rather than an asserted one. Safe with
                         # a single lock because a single thread takes it.
+                        if const_expr(credit):
+                            # Before the lock, so a wait never holds it.
+                            for jj in range_constexpr(ws - 1):
+                                wait_credit(
+                                    my_credits,
+                                    fx.Int32((rank + 1 + jj) % ws),
+                                    call_e,
+                                    _spin_until,
+                                )
                         lock = signal_ptr(lock_base)
                         if const_expr(chunks > 1):
                             _acquire_peer_lock(lock)

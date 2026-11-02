@@ -237,7 +237,7 @@ class AgConfig:
         if not 0 <= r < self.world_size:
             raise IndexError(f"rank {r} outside [0, {self.world_size})")
 
-    # --- symmetric window layout: [ signal | counters | locks | recv ] ------
+    # --- symmetric window layout: [ signal | counters | locks | credits | recv ]
 
     @property
     def start_off(self) -> int:
@@ -319,9 +319,24 @@ class AgConfig:
         return _align_up(self.world_size * 4, SIGNAL_ALIGN)
 
     @property
-    def signal_bytes(self) -> int:
-        """Everything before the payload: barriers, counters, locks."""
+    def credit_off(self) -> int:
+        """One u32 per source rank: the call that source has started.
+
+        Source ``s`` writes ``e`` into slot ``s`` of every peer's window when it
+        starts call ``e``, and waits for slot ``d`` of its own to reach ``e``
+        before pushing to ``d``. See ``_credit``. Shared across shapes: it
+        counts calls, not tiles.
+        """
         return self.lock_off + self.lock_bytes
+
+    @property
+    def credit_bytes(self) -> int:
+        return _align_up(self.world_size * 4, SIGNAL_ALIGN)
+
+    @property
+    def signal_bytes(self) -> int:
+        """Everything before the payload: barriers, counters, locks, credits."""
+        return self.credit_off + self.credit_bytes
 
     @property
     def recv_off(self) -> int:

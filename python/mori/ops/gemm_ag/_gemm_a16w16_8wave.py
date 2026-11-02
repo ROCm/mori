@@ -157,6 +157,8 @@ from ..gemm_ar.kernels_fused import (
     _permlane16_swap,
     _SwappedMfma,
 )
+from ._credit import call_epoch, lsa, post_credit, wait_credit
+from .kernels_sdma import _spin_until
 
 #: The template's ``B_K``. Not a tuning knob: it sets ``E_K = B_K / W_K``, and
 #: the mainloop below issues exactly ``E_K`` MFMAs per accumulator per step.
@@ -606,6 +608,7 @@ def compile_bf16_gemm_ag(
     peer_uncached: bool = False,
     emit_put: bool = True,
     fence: str = "leader",
+    war_credit: bool = True,
     split_k: int = 1,
 ):
     """The bf16 GEMM, with or without the all-gather fused into its epilogue.
@@ -638,8 +641,9 @@ def compile_bf16_gemm_ag(
     rewriter only lowers ``if`` inside a ``@flyc.kernel`` function's own AST, so
     the election and the barriers cannot move into a helper. What differs
     between them is the mainloop and the store; the transport logic -- release
-    fence, per-(chunk, lane) counter, lane-parallel put -- is meant to be
-    identical, and any fix to one belongs in both.
+    fence, per-(chunk, lane) counter, lane-parallel put, recv-reuse credit
+    (``war_credit``, see ``_credit``) -- is meant to be identical, and any fix
+    to one belongs in both.
 
     Validate ``fuse=False`` before trusting anything fused: a wrong LDS swizzle
     or a wrong ``E_K`` unroll produces a wrong C, and every fused mode validates
@@ -693,6 +697,10 @@ def compile_bf16_gemm_ag(
     my_recv_slot = cfg.recv_slot_off(rank)
     slab_bytes = cfg.slab_bytes
     counter_off, lock_off = cfg.counter_off, cfg.lock_off
+    credit_off, flag_off = cfg.credit_off, cfg.flag_off
+    # The fused path pushes into the peers' recv from here, so it carries the
+    # recv-reuse credit (see _credit); the unfused GEMM pushes nothing.
+    credit = war_credit and fuse
     if fuse and cfg.counter_chunks != chunks:
         raise ValueError(
             f"chunks={chunks} disagrees with the config's counter_chunks="
@@ -739,7 +747,8 @@ def compile_bf16_gemm_ag(
         f"{'F32' if out_dtype == 'fp32' else 'B16'}_{waves_per_eu}x{xcd_swizzle}"
         f"_c{chunks}q{sdma_queues}{post[0]}{'U' if peer_uncached else 'C'}"
         f"w{wait_policy[0]}"
-        f"{fence[0]}{'p' if emit_put else 'x'}_k{K}_sk{split_k}_r{rank}"
+        f"{fence[0]}{'p' if emit_put else 'x'}_k{K}_sk{split_k}"
+        f"{'' if credit or not fuse else '_nc'}_r{rank}"
     )
 
     @fx.struct
@@ -765,6 +774,19 @@ def compile_bf16_gemm_ag(
     ):
         n_blocks = ceildiv(c_n, BLOCK_N)
         w_pre = cco.CachedWindow(win)
+        # Bases out here: the credit helpers run inside runtime `if`s.
+        wbase, wstride = w_pre.base, w_pre.stride
+        call_e = my_credits = None
+        if const_expr(credit):
+            call_e = call_epoch(wbase, wstride, rank, flag_off)
+            my_credits = lsa(wbase, wstride, rank, credit_off)
+            # Block 0's first world lanes, before any GEMM work: block 0 is in
+            # the first wave, so a peer waiting on this never waits on a block
+            # that has not been scheduled.
+            if fx.block_idx.x == 0:
+                ctid = fx.thread_idx.x
+                if ctid < fx.Int32(ws) and ctid != fx.Int32(rank):
+                    post_credit(wbase, wstride, rank, ctid, credit_off, call_e)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_cur0 = lds.A_lds_cur_0
@@ -1007,6 +1029,8 @@ def compile_bf16_gemm_ag(
                     if const_expr(emit_put):
                         if const_expr(post == "lanes"):
                             d = (fx.Int32(rank + 1) + j) % fx.Int32(ws)
+                            if const_expr(credit):
+                                wait_credit(my_credits, d, call_e, _spin_until)
                             sdma.put(
                                 d,
                                 win,
@@ -1019,6 +1043,15 @@ def compile_bf16_gemm_ag(
                                 signal=False,
                             )
                         else:
+                            if const_expr(credit):
+                                # Before the lock, so a wait never holds it.
+                                for jj in range_constexpr(ws - 1):
+                                    wait_credit(
+                                        my_credits,
+                                        fx.Int32((rank + 1 + jj) % ws),
+                                        call_e,
+                                        _spin_until,
+                                    )
                             lock = signal_ptr(lock_base)
                             if const_expr(chunks > 1):
                                 _acquire_peer_lock(lock)
@@ -1074,9 +1107,9 @@ def compile_bf16_gemm_ag(
 #: faster GEMM (Pro M=4096: 112.5 against 116.4 us) and the faster fused
 #: path (Flash M=16384: 1265.7 against 1298.1 us). The smaller tiles were held
 #: back until the two missing LDS ordering edges behind their old intermittent
-#: failures were fixed (now covered by test_gemm_ag_pipeline.py) and they had
-#: broader coverage: every tile is validated by test_bf16_gemm_pipeline_numerics
-#: and, on 8 ranks, by test_every_tile_validates_split_and_fused.
+#: failures were fixed (now covered by the LDS model in test_gemm_ag.py) and they
+#: had broader coverage: every tile is validated by test_bf16_gemm_pipeline_numerics
+#: and, on 8 ranks, by test_gemm_ag_op.py's bf16_tiles case.
 TILE_CANDIDATES = ((256, 256), (128, 256), (256, 128), (128, 128))
 
 #: CUs on the part this was tuned on (MI355X). The grid heuristic wants the

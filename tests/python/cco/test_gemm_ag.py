@@ -19,21 +19,30 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""Numerics and layout math for ``mori.ops.gemm_ag``.
+"""Everything about ``mori.ops.gemm_ag`` that needs no process group.
 
-The layout half is pure arithmetic and needs no GPU, which is the point: the
-all-gather's index map is where a mistake is invisible at runtime -- wrong data
-still arrives, in the wrong place, and only a value check finds it.
+* the window layout and the tile / chunk pickers -- pure arithmetic;
+* two models that execute the real kernel bodies: the bf16 pipeline's LDS
+  happens-before edges, and the SDMA phases' completion and credit order;
+* the benchmark's validation contract;
+* the single-GPU GEMM numerics against exact small-integer references;
+* the benchmark's two baselines on 8 ranks.
 
-The multi-rank half spawns the benchmark and checks the modes agree.
+``GemmAgOp`` on several ranks -- every precision, mode, tile and race -- is
+``test_gemm_ag_op.py``, from one spawn.
 """
 
+import ast
+from dataclasses import dataclass
+from functools import lru_cache
+import importlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -288,27 +297,6 @@ def test_pick_tile_matches_the_measured_best():
     assert bf16gemm.pick_chunks(384, 2048, (128, 128), cus=8) == 3
 
 
-@pytest.mark.parametrize("bm,bn", [(128, 128), (128, 256), (256, 128), (256, 256)])
-@pytest.mark.parametrize("mode", ["split-sdma", "fused-sdma"])
-def test_every_tile_validates_split_and_fused(bm, bn, mode):
-    """Every tile pick_tile may now choose, on 8 ranks, with chunking on.
-
-    The smaller tiles were kept out of the defaults until the LDS ordering
-    fix had coverage beyond one tile. This is that coverage in CI: BF16 in,
-    FP32 out, the received buffer validated per source rank.
-    """
-    if torch.cuda.device_count() < 8:
-        pytest.skip("requires 8 GPUs")
-    pytest.importorskip("flydsl")
-    extra = ["--in-dtype", "bf16", "--out-dtype", "fp32"]
-    extra += ["--block-m", str(bm), "--block-n", str(bn)]
-    if mode == "fused-sdma":
-        extra += ["--chunks", "2", "--peer-uncached", "--fence", "release"]
-    record = _run_bench(8, mode, 4096, 2048, 7168, tuple(extra))
-    assert record["validated"] is True, record
-    assert record["rel_l2"] < 1e-5, record
-
-
 def test_bf16_tile_constants_match_the_template():
     """``<512, 256, 256, 64>`` from gemm_a16w16_quad_subtile_kernel.cc."""
     tc = bf16gemm.tile_constants(256, 256)
@@ -400,7 +388,7 @@ def test_counter_chunks_reports_the_shape_rather_than_dividing_by_zero():
 
 
 # --------------------------------------------------------------------------
-# multi-rank: the modes agree
+# the benchmark's own baselines, on 8 ranks
 # --------------------------------------------------------------------------
 
 
@@ -463,66 +451,6 @@ def _spawn_bench(world_size, mode, m, n, k, extra=(), last=False):
     ]
     assert len(records) == 1, output
     return records[0]
-
-
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "gemm-only",
-        "gemm-to-window",
-        "split-rccl",
-        "split-sdma",
-        "fused-sdma",
-    ],
-)
-@pytest.mark.parametrize("quant", ["ptpc", "blockscale", "mxfp8"])
-def test_every_mode_validates_under_every_quant(mode, quant):
-    """All five paths must land on the same all-gathered result.
-
-    Parametrised over the quantisation as well as the mode, and that is not
-    thoroughness for its own sake: a since-removed LSA pull path shipped without
-    the producer's release fence and validated at 1.66e-3 under ptpc while
-    giving 2.05e-1 under blockscale. The blockscale GEMM is 96us against ptpc's
-    57, so the rank skew is wider and any race window with it. Spot-checking
-    the default quantisation would have passed.
-
-    ``mxfp8`` is here for the mirror-image reason: it forces ``BLOCK_M=256`` for
-    the packed A scale, and getting the MFMA's ``opsel`` wrong leaves
-    ``gemm-only`` correct -- it is gemm_ar's own kernel -- while every fused
-    path reads byte 0 for all four tiles.
-    """
-    if torch.cuda.device_count() < 8:
-        pytest.skip("requires 8 GPUs")
-    pytest.importorskip("flydsl")
-    extra = ("--quant", quant)
-    record = _run_bench(8, mode, 2048, 2048, 7168, extra)
-    assert record["validated"] is True, record
-    assert record["rel_l2"] < 3e-3, record
-    assert record["us"] > 0
-
-
-def test_fused_sdma_is_deterministic_across_chunk_counts():
-    """Repeat the chunked epilogue: a race here is intermittent, not absent.
-
-    gemm_ar shipped two real races behind a one-shot check that passed
-    repeatedly -- a shared SDMA queue when a destination has more than one
-    chunk, and a counter atomic that had lost its acquire half. The same tail is
-    reused here, with the election moved from (dest, chunk) to chunk and a
-    single submit lock in place of one per destination, so it has to be shown
-    clean rather than assumed to be.
-    """
-    if torch.cuda.device_count() < 8:
-        pytest.skip("requires 8 GPUs")
-    pytest.importorskip("flydsl")
-    seen = []
-    for chunks in ("1", "2", "4", "8"):
-        record = _run_bench(8, "fused-sdma", 2048, 2048, 7168, ("--chunks", chunks))
-        seen.append(record["rel_l2"])
-    assert all(v == pytest.approx(seen[0], rel=1e-6) for v in seen), (
-        f"fused all-gather is not deterministic across chunk counts: {seen}. "
-        "That is an ordering bug in the epilogue, not numerical noise."
-    )
-    assert all(v < 3e-3 for v in seen), seen
 
 
 @pytest.mark.parametrize(
@@ -691,3 +619,411 @@ def test_split_k_partials_and_changed_input_graph(bm, bn, splits, k):
         torch.cuda.synchronize()
         assert torch.equal(partials.cpu(), expected)
         assert torch.equal(partials.sum(dim=0).cpu(), ah @ bh.T)
+
+@pytest.mark.parametrize("mode", ["gemm-only", "split-rccl"])
+def test_the_benchmark_baselines_validate(mode):
+    """The two baselines only the benchmark has -- the GEMM alone, and it
+    followed by RCCL's all-gather. Every op mode is covered by
+    test_gemm_ag_op.py; this keeps the benchmark itself honest."""
+    if torch.cuda.device_count() < 8:
+        pytest.skip("requires 8 GPUs")
+    pytest.importorskip("flydsl")
+    record = _run_bench(8, mode, 2048, 2048, 7168)
+    assert record["validated"] is True, record
+    assert record["rel_l2"] < 3e-3, record
+
+
+# --------------------------------------------------------------------------
+# bf16 pipeline: LDS happens-before (no GPU)
+#
+# Check the BF16 pipeline's happens-before edges without a GPU.
+#
+# Execute the actual kernel's scheduling statements with tracing loaders. Memory
+# operations may complete as late as their first required wait. Barrier ordinals,
+# not source locations, determine inter-wave ordering: wave_m=1 starts one
+# barrier behind wave_m=0. This catches races that a hot numerical run can hide.
+# The model assumes FIFO completion of G2S loads, as the vmcnt arithmetic does.
+# It does not model instruction latency or replace ISA/numerical validation.
+# --------------------------------------------------------------------------
+
+
+BF16_KERNEL = (
+    Path(__file__).resolve().parents[3]
+    / "python/mori/ops/gemm_ag/_gemm_a16w16_8wave.py"
+)
+
+
+@dataclass(frozen=True)
+class Position:
+    wave: int
+    phase: int
+    order: int
+
+    def before(self, other):
+        return self.phase < other.phase or (
+            self.wave == other.wave and self.order < other.order
+        )
+
+
+@dataclass
+class Access:
+    buffer: str
+    tile: int
+    rows: range
+    issued: Position
+    done: Position | None = None
+
+
+class Wave:
+    def __init__(self, wave, bm, bn):
+        self.wave = wave
+        self.bm, self.bn = bm, bn
+        self.phase = self.order = 0
+        self.writes = []
+        self.reads = []
+        self.generations = {}
+
+    def position(self):
+        self.order += 1
+        return Position(self.wave, self.phase, self.order)
+
+    def barrier(self):
+        self.phase += 1
+
+    def wait_vm(self, count):
+        pos = self.position()
+        for write in self.writes[: len(self.writes) - count if count else None]:
+            if write.done is None:
+                write.done = pos
+        self.barrier()
+
+    def wait_lds(self):
+        pos = self.position()
+        for read in self.reads:
+            if read.done is None:
+                read.done = pos
+
+    def write(self, buffer, offset):
+        rows = (self.bm if buffer[0] == "a" else self.bn) // 2
+        for step in range(rows // 64):
+            start = self.wave * 8 + step * 64
+            self.writes.append(
+                Access(buffer, offset // 64, range(start, start + 8), self.position())
+            )
+
+    def read(self, buffer):
+        if buffer[0] == "a":
+            size, part = self.bm // 4, self.wave // 4
+        else:
+            size, part = self.bn // 8, self.wave % 4
+        tile = self.generations.get(buffer, int(buffer[1]))
+        self.generations[buffer] = tile + 2
+        read = Access(
+            buffer, tile, range(part * size, (part + 1) * size), self.position()
+        )
+        self.reads.append(read)
+        return read
+
+    def mma(self, a, b, c, set_prio=True):
+        # LLVM must wait for the operand registers before their first use.
+        pos = self.position()
+        for read in (a, b):
+            if read.done is None:
+                read.done = pos
+        if set_prio:
+            self.barrier()
+        return c
+
+
+def trace_pipeline(source, bm, bn, k_iters, policy):
+    tree = ast.parse(source)
+    factory = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "compile_bf16_gemm_ag"
+    )
+    kernel = next(
+        n
+        for n in factory.body
+        if isinstance(n, ast.FunctionDef) and n.name == "kernel_gemm"
+    )
+    # Extract the real prologue, mainloop, tail, and closing half-wave barrier.
+    start = next(
+        i for i, n in enumerate(kernel.body) if ast.unparse(n).startswith("b_g2s.load(")
+    )
+    end = next(
+        i
+        for i, n in enumerate(kernel.body)
+        if ast.unparse(n).startswith("store_c.store(")
+    )
+    code = compile(ast.Module(kernel.body[start:end], []), str(BF16_KERNEL), "exec")
+    main_wait = next(
+        n
+        for n in factory.body
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "_MAIN_WAIT"
+    )
+    wait_code = compile(ast.Module([main_wait], []), str(BF16_KERNEL), "exec")
+    waves = []
+    for wave_id in range(8):
+        wave = Wave(wave_id, bm, bn)
+        env = dict(
+            K_ITERS=k_iters,
+            split_k=1,
+            const_expr=lambda value: value,
+            BLOCK_K=64,
+            B_K_STEP=64,
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            N_TILES_A=bm // 64,
+            N_TILES_B=bn // 128,
+            LDS_BLOCK_M=bm // 2,
+            LDS_BLOCK_N=bn // 2,
+            N_LDS_STEPS_A=bm // 128,
+            N_LDS_STEPS_B=bn // 128,
+            A0_gl_offset=0,
+            A1_gl_offset=0,
+            B0_gl_offset=0,
+            B1_gl_offset=0,
+            wave_m=wave_id // 4,
+            wave_n=wave_id % 4,
+            block_m=0,
+            block_n=0,
+            c00_frag=None,
+            c01_frag=None,
+            c10_frag=None,
+            c11_frag=None,
+            range_constexpr=range,
+            wait_policy=policy,
+            a_cur0="a00",
+            a_cur1="a01",
+            a_next0="a10",
+            a_next1="a11",
+            b_cur0="b00",
+            b_cur1="b01",
+            b_next0="b10",
+            b_next1="b11",
+            a_g2s=SimpleNamespace(load=wave.write),
+            b_g2s=SimpleNamespace(load=wave.write),
+            a_s2r=SimpleNamespace(load=wave.read),
+            b_s2r=SimpleNamespace(load=wave.read),
+            mfma=SimpleNamespace(call=wave.mma),
+            rocdl=SimpleNamespace(s_barrier=wave.barrier, s_setprio=lambda _: None),
+            _wait_lds_reads=wave.wait_lds,
+            wait_barrier=wave.wait_vm,
+            _wb=lambda count, wave=wave: wave.wait_vm(
+                0 if policy == "conservative" else count
+            ),
+        )
+        exec(wait_code, env)  # noqa: S102 - trace trusted local kernel source
+        exec(code, env)  # noqa: S102 - trace trusted local kernel source
+        waves.append(wave)
+    assert len({w.phase for w in waves}) == 1, "unbalanced half-wave barriers"
+    return waves
+
+
+def hazards(waves):
+    writers = {}
+    readers = {}
+    for wave in waves:
+        for access in wave.writes:
+            for row in access.rows:
+                key = access.buffer, access.tile, row
+                assert key not in writers, f"multiple writers: {key}"
+                writers[key] = access
+        for access in wave.reads:
+            for row in access.rows:
+                readers.setdefault((access.buffer, access.tile, row), []).append(access)
+    errors = set()
+    for key, reads in readers.items():
+        writer = writers[key]
+        overwrite = writers.get((key[0], key[1] + 2, key[2]))
+        for read in reads:
+            if writer.done is None or not writer.done.before(read.issued):
+                errors.add(f"RAW {key[0]} k={key[1]}")
+            if overwrite and (
+                read.done is None or not read.done.before(overwrite.issued)
+            ):
+                errors.add(f"WAR {key[0]} k={key[1]}")
+    return sorted(errors)
+
+
+@pytest.mark.parametrize("bm,bn", [(128, 128), (128, 256), (256, 128), (256, 256)])
+@pytest.mark.parametrize("k_iters", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("policy", ["tuned", "safe", "conservative"])
+def test_bf16_pipeline_orders_lds_accesses(bm, bn, k_iters, policy):
+    assert not hazards(trace_pipeline(BF16_KERNEL.read_text(), bm, bn, k_iters, policy))
+
+
+def test_model_detects_missing_b0_read_completion():
+    # Mutation control: removing the wait must expose the original WAR even
+    # with correct vmcnt thresholds and all barriers still in place.
+    source = BF16_KERNEL.read_text().replace("            _wait_lds_reads()\n", "")
+    errors = hazards(trace_pipeline(source, 128, 256, 4, "tuned"))
+    assert any(e.startswith("WAR b") for e in errors), errors
+
+
+def test_model_detects_late_tail_wait():
+    # Move the drain back after a0's final S2R, as in the broken tail.
+    source = BF16_KERNEL.read_text()
+    start = source.index("        # Step k = K_ITERS - 2")
+    head, tail = source[:start], source[start:]
+    tail = tail.replace("        wait_barrier(0)\n", "        rocdl.s_barrier()\n", 1)
+    penultimate, final = tail.split("        # Step k = K_ITERS - 1", 1)
+    final = final.replace(
+        "        a0_frag = a_s2r.load(a_cur0)\n        rocdl.s_barrier()",
+        "        a0_frag = a_s2r.load(a_cur0)\n        wait_barrier(0)",
+        1,
+    )
+    tail = penultimate + "        # Step k = K_ITERS - 1" + final
+    errors = hazards(trace_pipeline(head + tail, 128, 256, 4, "tuned"))
+    assert any(e.startswith(("RAW b", "RAW a")) for e in errors), errors
+
+
+def test_model_detects_permissive_asymmetric_wait():
+    source = BF16_KERNEL.read_text()
+    source = source.replace(
+        "else min(\n            2 * N_LDS_STEPS_A + N_LDS_STEPS_B,\n"
+        "            N_LDS_STEPS_A + 2 * N_LDS_STEPS_B,\n        )",
+        "else 2 * N_LDS_STEPS_A + N_LDS_STEPS_B",
+    )
+    errors = hazards(trace_pipeline(source, 256, 128, 4, "tuned"))
+    assert any(e.startswith("RAW a") for e in errors), errors
+
+# --------------------------------------------------------------------------
+# SDMA phases: completion and credit order (no GPU)
+#
+# Check that an SDMA completion publication covers every submitted queue.
+#
+# Execute the real kernel body against a queue-state model. This checks the
+# publication contract; it does not simulate GPU scheduling or DMA latency.
+# --------------------------------------------------------------------------
+
+
+SDMA_KERNEL = Path(__file__).resolve().parents[3] / "python/mori/ops/gemm_ag/kernels_sdma.py"
+
+
+@lru_cache(maxsize=1)
+def drain_body():
+    tree = ast.parse(SDMA_KERNEL.read_text())
+    factory = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "build_sdma_phases"
+    )
+    builder = next(
+        n
+        for n in factory.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_push_kernel"
+    )
+    kernel = next(
+        n for n in builder.body if isinstance(n, ast.FunctionDef) and n.name == "push"
+    )
+    return compile(ast.Module(kernel.body, []), str(SDMA_KERNEL), "exec")
+
+
+@pytest.mark.parametrize("queues", [1, 2, 4, 8])
+@pytest.mark.parametrize("pushes", [False, True])
+@pytest.mark.parametrize("rank", [0, 3, 7])
+def test_arrival_covers_all_submitted_queues_and_puts_wait_for_credit(
+    queues, pushes, rank
+):
+    world = 8
+    # The split kernel submits one queue per peer. A chunked fused producer
+    # can leave work in every queue, with no ordering between those queues.
+    pending = {
+        peer: set() if pushes or peer == rank else set(range(queues))
+        for peer in range(world)
+    }
+    published = set()
+    credited = set()
+
+    class Sdma:
+        def put(self, peer, src_win, src_off, dst_win, dst_off, size, qid, **kwargs):
+            # The recv-reuse credit: a push into a peer's recv only after that
+            # peer has started this call.
+            assert peer in credited, f"put to peer {peer} before its credit"
+            pending[peer].add(qid)
+
+        def quiet_queue(self, peer, qid):
+            pending[peer].discard(qid)
+
+        def quiet(self, peer, **kwargs):
+            pending[peer].clear()
+
+    sdma = Sdma()
+
+    def publish(window, flag, peer):
+        assert not pending[
+            peer
+        ], f"arrival for peer {peer} preceded queues {sorted(pending[peer])}"
+        published.add(peer)
+
+    for tid in range(world):
+        env = dict(
+            dev_comm=0,
+            win=0,
+            rank=rank,
+            ws=world,
+            queues=queues,
+            pushes=pushes,
+            my_recv_slot=0,
+            slab_bytes=16 << 20,
+            signal=False,
+            fx=SimpleNamespace(thread_idx=SimpleNamespace(x=tid), Int32=int, Int64=int),
+            cco=SimpleNamespace(
+                CachedWindow=lambda _: SimpleNamespace(base=0, stride=0),
+                DevComm=lambda _: SimpleNamespace(sdma=lambda: sdma),
+                CoopScope=SimpleNamespace(THREAD=0),
+            ),
+            const_expr=bool,
+            _next_flag=lambda _: (1, None),
+            raw_cco=SimpleNamespace(cco_system_fence=lambda _: None),
+            _signal_and_wait=publish,
+            fgpu=SimpleNamespace(barrier=lambda: None),
+            local_store_u32=lambda *args: None,
+            war_credit=True,
+            credit_off=0,
+            lsa=lambda *args: 0,
+            post_credit=lambda *args: None,
+            wait_credit=lambda base, peer, epoch, spin: credited.add(peer),
+            _spin_until=None,
+        )
+        exec(drain_body(), env)  # noqa: S102 - execute trusted local kernel source
+    assert published == set(range(world))
+
+# --------------------------------------------------------------------------
+# the benchmark's validation contract (no GPU)
+#
+# Numerical validation contracts for GEMM + all-gather benchmarks.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bench(monkeypatch):
+    pytest.importorskip("flydsl")
+    path = Path(__file__).resolve().parents[3] / "benchmark/cco/flydsl/gemm_ag"
+    monkeypatch.syspath_prepend(str(path))
+    module = importlib.import_module("bench_gemm_ag")
+    monkeypatch.setattr(
+        module,
+        "_operands",
+        lambda rank, args: (torch.eye(2) * (rank + 1), torch.eye(2), None, None),
+    )
+    monkeypatch.setattr(module, "_reference", lambda a, b, sa, sb, args: a @ b.T)
+    return module
+
+
+def test_recv_validation_rejects_a_nonfinite_peer(bench):
+    args = SimpleNamespace(m=2, tolerance=1e-5)
+    recv = torch.cat([torch.eye(2), 2 * torch.eye(2)])
+    assert bench._validate_recv(recv, args, 0, 2)[1]
+    recv[2, 0] = float("nan")
+    error, valid = bench._validate_recv(recv, args, 0, 2)
+    assert not valid and error == float("inf")
+
+
+def test_recv_validation_checks_changed_input_sign(bench):
+    args = SimpleNamespace(m=2, tolerance=1e-5)
+    recv = -torch.cat([torch.eye(2), 2 * torch.eye(2)])
+    assert bench._validate_recv(recv, args, 0, 2, sign=-1)[1]
+    assert not bench._validate_recv(recv, args, 0, 2, sign=1)[1]

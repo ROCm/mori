@@ -20,8 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# Fused fp8 GEMM + all-gather over cco. See README.md for the design and the
-# measurements.
+# Fused GEMM + all-gather over cco; GemmAgOp (op.py) is the public entry point.
+# See README.md for the design and the measurements.
 #
 # The GEMM itself is `gemm_ar`'s: this op differs in where C goes, not in how it
 # is computed, so `_gemm_a8w8_8wave.py`, `_compat.py` and `_shuffle.py` are
@@ -39,6 +39,8 @@ from .layout import AgConfig, MAX_WORLD, ag_config, counter_chunks
 from ..gemm_ar import preshuffle_b
 
 _LAZY = {
+    "GemmAgOp": "op",
+    "supports": "op",
     "compile_bf16_gemm_ag": "_gemm_a16w16_8wave",
     "build_sdma_phases": "kernels_sdma",
     "build_sdma_chunk_post": "kernels_sdma",
@@ -48,6 +50,7 @@ _LAZY = {
 
 __all__ = [
     "AgConfig",
+    "GemmAgOp",
     "MAX_WORLD",
     "ag_config",
     "build_sdma_phases",
@@ -57,6 +60,7 @@ __all__ = [
     "compile_gemm_local",
     "counter_chunks",
     "preshuffle_b",
+    "supports",
 ]
 
 

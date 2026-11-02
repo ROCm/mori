@@ -59,6 +59,7 @@ from flydsl.expr.typing import Int64
 import mori.cco.device.flydsl as cco
 from mori.cco.device.flydsl import _bindings as raw_cco
 
+from ._credit import lsa, post_credit, wait_credit
 from ..gemm_ar._compat import (
     i32_type,
     local_load_u32,
@@ -98,7 +99,9 @@ def _spin_until(rsrc, flag):
 PUSH_THREADS = 64
 
 
-def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
+def build_sdma_phases(
+    cfg, rank: int, *, queues: int = 1, signal: bool = False, war_credit: bool = True
+):
     """Compile the push phases for ``cfg`` on ``rank``.
 
     Returns ``{"gather", "drain"}``, each a launcher taking
@@ -126,6 +129,11 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
     ``quiet_queue`` drains the queue's read pointer independently of signals and
     nothing here polls one, so the packet would be pure overhead.
 
+    ``war_credit`` makes ``gather`` post this rank's credit to each peer and
+    wait for the peer's before pushing into its recv (see ``_credit``). The
+    fused path posts and waits in the GEMM instead, so ``drain`` has none. Off
+    only to show what the credit prevents.
+
     Note what is *not* a parameter, unlike ``gemm_a2a``'s builder: there is no
     ``cfg.staged`` check, because there is nothing to stage.
     """
@@ -134,7 +142,7 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
         raise ValueError(f"queues must be >= 1, got {queues}")
 
     ws = cfg.world_size
-    start_off, flag_off = cfg.start_off, cfg.flag_off
+    start_off, flag_off, credit_off = cfg.start_off, cfg.flag_off, cfg.credit_off
     slab_bytes = cfg.slab_bytes
     # My slot in *every* window, my own included -- the source and the
     # destination are the same offset. That is what indexing ``recv`` by source
@@ -171,8 +179,16 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
             sdma = cco.DevComm(dev_comm).sdma()
 
             flag, flag_rsrc = _next_flag(w)
+            # Bases out here: the credit helpers run inside the `if`s below.
+            wbase, wstride = w.base, w.stride
+            my_credits = lsa(wbase, wstride, rank, credit_off)
             if tid < ws:
                 if tid != rank:
+                    if const_expr(pushes and war_credit):
+                        # `flag` is this call's number, the value
+                        # _credit.call_epoch derives in the fused GEMM.
+                        post_credit(wbase, wstride, rank, tid, credit_off, flag)
+                        wait_credit(my_credits, tid, flag, _spin_until)
                     if const_expr(pushes):
                         # Lane `tid` owns peer `tid` and queue `tid`: distinct
                         # queues per lane, so the posts do not serialise on one
@@ -216,7 +232,10 @@ def build_sdma_phases(cfg, rank: int, *, queues: int = 1, signal: bool = False):
         return run
 
     return {
-        "gather": _push_kernel(True, f"mori_ag_sdma_gather_r{rank}_q{queues}"),
+        "gather": _push_kernel(
+            True,
+            f"mori_ag_sdma_gather_r{rank}_q{queues}{'' if war_credit else '_nc'}",
+        ),
         "drain": _push_kernel(False, f"mori_ag_sdma_drain_allq_r{rank}_q{queues}"),
     }
 
