@@ -144,6 +144,12 @@ CDONE_STRIDE = 32
 #: Rows per lane per loop trip when a comm wave pushes inv entries to a peer.
 PUSH_U = 8
 
+#: ``out_row`` of a valid row past the per-pair reservation, under the P2P fallback:
+#: GEMM2 writes it straight into the origin rank's ``comb_inp[slot]``.
+OUT_ROW_P2P = -2
+#: ``inv`` of a slot whose row is in this rank's ``comb_inp`` (the P2P fallback).
+INV_P2P = -2
+
 
 BLOCK = 256
 WAVE = 64
@@ -324,6 +330,30 @@ def sdma_finish_peer(
     )
 
 
+def sdma_signal_peer(sdma, win, peer, queue, *, layout, rank, cco):
+    """A 4-byte put that only carries the completion signal (``remote`` mode, for a
+    peer whose last chunk was empty)."""
+    sdma.put(
+        peer,
+        win,
+        fx.Int64(layout.off_sig + rank * 4),
+        win,
+        fx.Int64(layout.off_sig + peer * 4),
+        fx.Int64(4),
+        queue,
+        coop=cco.CoopScope.THREAD,
+        remote_signal=True,
+    )
+
+
+def publish_flag(w, peer, phase, *, layout, rank):
+    """``flags[rank]`` on ``peer`` = call number (``remote`` mode: the data itself is
+    covered by the SDMA signal)."""
+    comm_ops.store_i32_global_system_release(
+        fx.Int64(w.lsa_ptr(peer, layout.off_flags)) + fx.Int64(rank * 4), phase
+    )
+
+
 # --- Kernel 1: rank sort plan --------------------------------------------------
 
 
@@ -380,7 +410,9 @@ def tree_barrier(bar_addr, nblocks, tid, bid):
     fx.barrier()
 
 
-def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
+def build_rank_sort_plan(
+    *, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank, p2p_fallback=False
+):
     """Kernel 1: give every valid sorted row a stable index in its rank's run.
 
     * count:  ``tile_cnt[tile][pe]`` = rows of the sort tile bound for ``pe``
@@ -410,6 +442,10 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
     is decoded once, a wave ballot per pe gives the rows of the wave bound for it,
     and the per-wave counts go through a few LDS words. A row's rank among the
     earlier rows for its pe is then a popcount, not a walk over the tile.
+
+    A row past ``cap`` is counted in ``arg_over``. Without ``p2p_fallback`` it is
+    dropped (the host must check the counter); with it, it gets ``OUT_ROW_P2P`` and
+    GEMM2 writes it into the origin rank's ``comb_inp`` instead.
     """
     dec = dict(log2_max_tok=log2_max_tok, recv_cap=recv_cap, topk=topk, npes=npes)
 
@@ -431,7 +467,7 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
         buf: fx.Array[Int8, lds_bytes, 16]
 
     # fmt: off
-    @flyc.kernel(name=f"mega_rank_sort_plan_sbm{SBM}_k{topk}_p{npes}_c{cap}",
+    @flyc.kernel(name=f"mega_rank_sort_plan_sbm{SBM}_k{topk}_p{npes}_c{cap}_f{int(p2p_fallback)}",
                  known_block_size=[BLOCK, 1, 1])
     def plan(arg_stids: fx.Int64, arg_trb: fx.Int64, arg_num_valid: fx.Int64,
         arg_tile_cnt: fx.Int64, arg_tile_base: fx.Int64, arg_cursor: fx.Int64,
@@ -559,10 +595,13 @@ def build_rank_sort_plan(*, SBM, topk, log2_max_tok, recv_cap, npes, cap, rank):
                     )
                 excl = fx.Int32(fx.ptr_load(lw(fx.Int32(OFF_PREF) + dest_pe)))
                 place = excl + within
-                # Past the per-pair reservation there is nowhere to put this
-                # row. Drop it rather than write into the next peer's run,
-                # and leave a mark the host can assert on.
+                # Past the per-pair reservation there is no room for this row in
+                # the run. Never write into the next peer's run: count it, and
+                # either drop it (the host asserts on the count) or hand it to
+                # GEMM2's direct P2P path.
                 if place >= fx.Int32(cap):
+                    if const_expr(p2p_fallback):
+                        out_buf[g] = fx.Int32(OUT_ROW_P2P)
                     comm_ops.atomic_add_agent(arg_over, fx.Int32(1))
                 else:
                     out_row = dest_pe * fx.Int32(cap) + place
@@ -634,14 +673,107 @@ class CommSpec:
     #: ``sdma_finish_peer``. "remote" needs the signal to ride
     #: the channel the data went out on, which ``queues`` already guarantees.
     signal_mode: str = "remote"
+    #: Rows past the reservation go to the origin rank's ``comb_inp`` (fp8 rows,
+    #: aiter's P2P layout) instead of being dropped; needs the fields below.
+    p2p_fallback: bool = False
+    topk: int = 0
+    max_tok: int = 0
+    #: Bytes of one rank's ``comb_inp``: the bound of the direct stores.
+    comb_bytes: int = 0
+
+
+@comm_ops.traced
+def _direct_row(
+    fb,
+    out_row,
+    row_byte_off,
+    payload,
+    e8m0,
+    active,
+    is_leader,
+    lane,
+    col,
+    n_block_idx,
+    *,
+    N_OUT,
+    BN,
+    row_nbytes,
+    group_lanes,
+    store_cm,
+):
+    """P2P fallback: if ``out_row`` is ``OUT_ROW_P2P``, store this lane's part of the row
+    into ``comb_inp[slot]`` of its origin rank, as aiter's Stage2 does, and point that
+    rank's ``inv[slot]`` at it. ``out_row`` is wave-uniform, so the branch is too."""
+    import mori.cco.device.flydsl as cco
+
+    if fx.Int32(out_row) == fx.Int32(OUT_ROW_P2P):
+        comm = fb["comm"]
+        lay, rank = comm.layout, comm.rank
+        p = fx.Int32(
+            rocdl.readfirstlane(
+                T.i32,
+                fx.ptr_load(
+                    lds_typed_ptr(
+                        fx.Int32(fb["lds_src_off"]) + row_byte_off, T.i32, align=4
+                    )
+                ).ir_value(),
+            )
+        )
+        t = p & fx.Int32(0x00FFFFFF)
+        s = p.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+        dest_pe = t >> fx.Int32(comm.max_tok.bit_length() - 1)
+        slot = (t & fx.Int32(comm.max_tok - 1)) * fx.Int32(comm.topk) + s
+        peer = fx.Int64(
+            rocdl.readfirstlane(
+                T.i64, global_typed_ptr(fb["arg_p2p"], T.i64, align=8)[dest_pe]
+            )
+        )
+        w = cco.Window(fb["arg_win"])
+        # Like the comm waves: not before the origin rank has read the last call's
+        # comb_inp and inv (its combine publishes done[] to this rank).
+        if dest_pe != fx.Int32(rank):
+            rsrc_counter = create_buffer_resource_from_addr(
+                fx.Int64(w.lsa_ptr(rank, lay.off_counter))
+            )
+            phase = fx.Int32(
+                buffer_load(rsrc_counter, 0, vec_width=1, dtype=T.i32)
+            ) + fx.Int32(1)
+            sdma_wait_consumed(w, dest_pe, phase, layout=lay, rank=rank)
+        # Written through like S, so the unit's s_waitcnt before it publishes its chunk
+        # is the release.
+        bound = fx.Int32(comm.comb_bytes)
+        buf = create_buffer_resource_from_addr(peer, num_records_bytes=comm.comb_bytes)
+        base = slot * fx.Int32(row_nbytes)
+        off = active.select(base + n_block_idx * fx.Int32(BN) + col, bound)
+        buffer_store(payload, buf, off, cache_modifier=store_cm, offset_is_bytes=True)
+        s_off = (active & is_leader).select(
+            base
+            + fx.Int32(N_OUT)
+            + n_block_idx * fx.Int32(BN // 32)
+            + lane // fx.Int32(group_lanes),
+            bound,
+        )
+        buffer_store(
+            e8m0.to(fx.Int8), buf, s_off, cache_modifier=store_cm, offset_is_bytes=True
+        )
+        if (n_block_idx == fx.Int32(0)) & (lane == fx.Int32(0)):
+            comm_ops.store_i32_global_system_monotonic(
+                fx.Int64(w.lsa_ptr(dest_pe, lay.off_inv))
+                + fx.Int64(slot) * fx.Int64(4),
+                fx.Int32(INV_P2P),
+            )
 
 
 # fmt: off
 def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *, N_OUT, BM, BN,
     send_nbytes, lds_outrow_off, lds_weight_off, g2_bf16_lds=False, scatter_vec=8, store_cm=0,
-    quant="none"):
+    quant="none", fallback=None):
 # fmt: on
-    """CShuffle one GEMM2 tile into weighted BF16 rows and store them at their send-buffer index."""
+    """CShuffle one GEMM2 tile into weighted BF16 rows and store them at their send-buffer index.
+
+    ``fallback`` (fp8 only): the P2P fallback's operands; a row whose ``out_row`` is
+    ``OUT_ROW_P2P`` is stored into its origin rank's ``comb_inp`` (``_direct_row``).
+    """
     kMChunks = BM // 16
     numAccN = (BN // 4) // 16
     wave_n = BN // 4
@@ -802,6 +934,10 @@ def local_sort_epilog(lds_acc_base, accm, n_block_idx, wave, lane, send_base, *,
                 e8m0.to(fx.Int8), output_buf, scale_off,
                 cache_modifier=store_cm, offset_is_bytes=True,
             )
+            if fallback is not None:
+                _direct_row(fallback, out_row, row_byte_off, payload, e8m0, active, is_leader,
+                            lane, col, n_block_idx, N_OUT=N_OUT, BN=BN, row_nbytes=row_nbytes,
+                            group_lanes=group_lanes, store_cm=store_cm)
         else:
             off = valid.select(
                 row_base + n_block_idx * fx.Int32(BN * 2) + col * fx.Int32(2),
@@ -864,6 +1000,9 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
     # per unit (``buffer_wbl2`` on gfx950): measured 2.4x on the GEMM2 kernel.
     # See mori/ops/gemm_ar/_compat.py for the encoding, and why sc1 is 16 not 4.
     STORE_CM = 1 | 16 if fuse else 0
+    fallback = fuse and comm.p2p_fallback
+    if fallback and quant != "fp8_blockwise_1x32":
+        raise ValueError("the P2P fallback writes aiter's fp8 comb_inp rows: needs quant=fp8_blockwise_1x32")
     N_OUT = model_dim
     g2_bhoist, g2_ascale_pf, g2_spart, g2_group_num, g2_m01, _g2_bf16_lds = _resolve_g2_knobs(
         g2_bhoist, g2_ascale_pf, g2_spart, False, False
@@ -874,7 +1013,9 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
     compute_lds_bytes = _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds)
     lds_outrow_off = compute_lds_bytes
     lds_weight_off = lds_outrow_off + BM * 4
-    lds_bytes = lds_weight_off + BM * 4
+    # The P2P fallback also needs each row's srcmap word (origin rank and slot).
+    lds_src_off = lds_weight_off + BM * 4
+    lds_bytes = lds_src_off + (BM * 4 if fallback else 0)
     if lds_bytes > 160 * 1024:
         raise ValueError(f"Stage2 LDS use {lds_bytes} exceeds 160 KiB")
     _expert_offset = rank * experts
@@ -892,7 +1033,7 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
         f"_bf16lds{int(g2_bf16_lds)}_sv{scatter_vec}_{quant}"
         + (
             f"_fuse{comm.chunk_tiles}q{comm.queues}w{comm.comm_wgs}"
-            f"sm{comm.signal_mode[0]}r{comm.rank}"
+            f"sm{comm.signal_mode[0]}r{comm.rank}f{int(comm.p2p_fallback)}"
             if fuse
             else ""
         )
@@ -904,8 +1045,9 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64,
         arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_send: fx.Int64, arg_out_row: fx.Int64,
         arg_dev_comm: fx.Int64, arg_win: fx.Int64, arg_cdone: fx.Int64, arg_tile_base: fx.Int64,
-        arg_cursor: fx.Int64, arg_idx: fx.Int64, i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32,
-        i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32):
+        arg_cursor: fx.Int64, arg_idx: fx.Int64, arg_stids: fx.Int64, arg_p2p: fx.Int64,
+        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32,
+        i32_npad: fx.Int32):
     # fmt: on
         tx_i32 = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -920,6 +1062,12 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
         trb_buf = ptr_buf_tensor(arg_trb, fx.Int32)
         sweights_buf = ptr_buf_tensor(arg_sweights, fx.Float32)
         outrow_buf = ptr_buf_tensor(arg_out_row, fx.Int32)
+        stids_buf = ptr_buf_tensor(arg_stids, fx.Int32)
+        fb = (
+            dict(comm=comm, lds_src_off=lds_src_off, arg_p2p=arg_p2p, arg_win=arg_win)
+            if fallback
+            else None
+        )
 
         def issue_all_a_loads(m_row0):
             for slot in range_constexpr(kStages):
@@ -950,6 +1098,15 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
                         align=4,
                     ),
                 )
+                if const_expr(fallback):
+                    fx.ptr_store(
+                        stids_buf[sorted_pos],
+                        lds_typed_ptr(
+                            fx.Int32(lds_src_off) + tx_i32 * fx.Int32(4),
+                            T.i32,
+                            align=4,
+                        ),
+                    )
             # fmt: off
             accm_vecs, m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
                 arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
@@ -960,7 +1117,7 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
             local_sort_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, send_base,
                 N_OUT=N_OUT, BM=BM, BN=BN, send_nbytes=send_nbytes, lds_outrow_off=lds_outrow_off,
                 lds_weight_off=lds_weight_off, g2_bf16_lds=g2_bf16_lds, scatter_vec=scatter_vec,
-                store_cm=STORE_CM, quant=quant)
+                store_cm=STORE_CM, quant=quant, fallback=fb)
             # fmt: on
 
         def run_one(unit_bx, m_block_idx):
@@ -1202,7 +1359,8 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_max_expert_tiles: fx.Int64,
         arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_send: fx.Int64, arg_out_row: fx.Int64,
         arg_dev_comm: fx.Int64, arg_win: fx.Int64, arg_cdone: fx.Int64, arg_tile_base: fx.Int64,
-        arg_cursor: fx.Int64, arg_idx: fx.Int64, i32_max_m_blocks: fx.Int32, i32_grid_blocks: fx.Int32,
+        arg_cursor: fx.Int64, arg_idx: fx.Int64, arg_stids: fx.Int64, arg_p2p: fx.Int64,
+        i32_max_m_blocks: fx.Int32, i32_grid_blocks: fx.Int32,
         i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_kpad: fx.Int32, i32_npad: fx.Int32,
         stream: fx.Stream):
     # fmt: on
@@ -1211,7 +1369,8 @@ def compile_moe_gemm2_with_sdma(*, model_dim: int, inter_dim: int, experts: int,
         kernel_with_sdma(
             arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_max_expert_tiles,
             arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win, arg_cdone,
-            arg_tile_base, arg_cursor, arg_idx, i32_max_m_blocks, i32_inter, i32_hidden, i32_kpad, i32_npad,
+            arg_tile_base, arg_cursor, arg_idx, arg_stids, arg_p2p, i32_max_m_blocks, i32_inter, i32_hidden,
+            i32_kpad, i32_npad,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch
@@ -1223,7 +1382,8 @@ _LAUNCH_CACHE = {}
 # fmt: off
 def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
     arg_max_expert_tiles, arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win,
-    arg_cdone, arg_tile_base, arg_cursor, arg_idx, row_capacity, i32_inter, i32_hidden, stream, *,
+    arg_cdone, arg_tile_base, arg_cursor, arg_idx, arg_stids, arg_p2p, row_capacity, i32_inter,
+    i32_hidden, stream, *,
     model_dim, inter_dim, experts, rank, send_nbytes, BM, SBM, HIDDEN_MAX, INTER_MAX, cu_num,
     BN=256, BK=256, use_nt=True, g2_bhoist=True, g2_ascale_pf=True, g2_spart=402, persist=False,
     persist_cu=0, persist_strided=False, g2_bf16_lds=False, skew_cu=0, scatter_vec=8, comm=None,
@@ -1256,7 +1416,8 @@ def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
     run_args = (
         arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
         arg_max_expert_tiles, arg_sweights, arg_trb, arg_send, arg_out_row, arg_dev_comm, arg_win,
-        arg_cdone, arg_tile_base, arg_cursor, arg_idx, fx.Int32(max_m_blocks), fx.Int32(grid_blocks),
+        arg_cdone, arg_tile_base, arg_cursor, arg_idx, arg_stids, arg_p2p, fx.Int32(max_m_blocks),
+        fx.Int32(grid_blocks),
         fx.Int32(i32_inter), fx.Int32(i32_hidden), fx.Int32(0), fx.Int32(0), stream,
     )
     if launch is None:
@@ -1281,7 +1442,9 @@ def run_moe_gemm2_with_sdma(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, ar
 
 # --- Kernel 3: combine --------------------------------------------------------
 
-def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remote"):
+def build_combine(
+    *, layout, rank, hidden, topk, quant="none", signal_mode="remote", p2p_fallback=False
+):
     """Kernel 3: finish the transfer and reduce.
 
     One launch, in phases:
@@ -1291,6 +1454,9 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
          ``inv`` entry is reset to -1 once read, so it starts clean next call and nothing
          has to refill it; slots no route filled stay -1 and contribute zero;
       C. the last block to finish publishes ``done`` to every peer and advances ``counter``.
+
+    ``p2p_fallback``: a slot whose ``inv`` is ``INV_P2P`` is read from this rank's
+    ``comb_inp[slot]`` (``arg_comb_inp``), where GEMM2 put a row past the reservation.
     """
     import mori.cco.device.flydsl as cco
 
@@ -1301,6 +1467,8 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
         raise ValueError(f"unsupported quant={quant!r}")
     if quant_fp8 and hidden % 32:
         raise ValueError(f"fp8_blockwise_1x32 needs hidden % 32 == 0, got {hidden}")
+    if p2p_fallback and not quant_fp8:
+        raise ValueError("the P2P fallback reads aiter's fp8 comb_inp rows: needs fp8_blockwise_1x32")
     npes, cap = layout.npes, layout.cap
     units = hidden // 8
     chunks = (units + BLOCK - 1) // BLOCK
@@ -1308,8 +1476,8 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
 
     # fmt: off
     @flyc.kernel(name=f"mega_combine_p{npes}_c{cap}_h{hidden}_k{topk}_{quant}_{signal_mode}"
-                 f"_r{rank}", known_block_size=[BLOCK, 1, 1])
-    def combine(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64,
+                 f"_f{int(p2p_fallback)}_r{rank}", known_block_size=[BLOCK, 1, 1])
+    def combine(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64, arg_comb_inp: fx.Int64,
         arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
         i32_nblocks: fx.Int32, i32_tokens: fx.Int32):
     # fmt: on
@@ -1351,9 +1519,38 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
             # than electing a leader and broadcasting.
             rows = ptr_buf_tensor(s_base, fx.Int32, unit_elems=2)
             scales = ptr_buf_tensor(s_base, fx.Int8)
+            if const_expr(p2p_fallback):
+                c_base = _uniform_i64(arg_comb_inp)
+                c_rows = ptr_buf_tensor(c_base, fx.Int32, unit_elems=2)
+                c_scales = ptr_buf_tensor(c_base, fx.Int8)
         else:
             rows = ptr_buf_tensor(s_base, fx.BFloat16, unit_elems=8)
         out = ptr_buf_tensor(arg_out, fx.BFloat16, unit_elems=8)
+        v2f32 = T.vec(2, T.f32)
+
+        def fp8_row(rows_t, scales_t, row0, u):
+            """8 dequantised values of unit ``u`` of the fp8 row at byte ``row0``, and
+            their block scale."""
+            raw = fx.Vector(
+                buf_copy_load(
+                    rows_t, (row0 + u * fx.Int32(8)) // fx.Int32(8),
+                    fx.Int32, unit_elems=2,
+                )
+            )
+            sc = scales_t[row0 + fx.Int32(hidden) + u // fx.Int32(4)]
+            scale = (
+                fx.Uint8(sc).to(fx.Uint32).bitcast(fx.Int32)
+                << fx.Int32(23)
+            ).bitcast(fx.Float32)
+            parts = []
+            for word in range_constexpr(2):
+                lo = cvt_pk_f32_fp8(res=v2f32, src=raw[word], word_sel=False)
+                hi = cvt_pk_f32_fp8(res=v2f32, src=raw[word], word_sel=True)
+                parts.append(lo.shuffle(hi, [0, 1, 2, 3]))
+            vals = fx.Vector(parts[0]).shuffle(
+                fx.Vector(parts[1]), [0, 1, 2, 3, 4, 5, 6, 7]
+            )
+            return fx.Vector(vals), scale
         for tok in range(bid, i32_tokens, i32_nblocks):
             slots = []
             for k in range_constexpr(topk):
@@ -1367,33 +1564,28 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
                         safe = ok.select(slots[k], fx.Int32(0))
                         keep = ok.select(fx.Float32(1.0), fx.Float32(0.0))
                         if const_expr(quant_fp8):
-                            row0 = safe * fx.Int32(row_bytes)
-                            raw = fx.Vector(
-                                buf_copy_load(
-                                    rows, (row0 + u * fx.Int32(8)) // fx.Int32(8),
-                                    fx.Int32, unit_elems=2,
-                                )
-                            )
-                            sc = scales[row0 + fx.Int32(hidden) + u // fx.Int32(4)]
-                            scale = (
-                                fx.Uint8(sc).to(fx.Uint32).bitcast(fx.Int32)
-                                << fx.Int32(23)
-                            ).bitcast(fx.Float32)
-                            v2f32 = T.vec(2, T.f32)
-                            parts = []
-                            for word in range_constexpr(2):
-                                lo = cvt_pk_f32_fp8(res=v2f32, src=raw[word], word_sel=False)
-                                hi = cvt_pk_f32_fp8(res=v2f32, src=raw[word], word_sel=True)
-                                parts.append(lo.shuffle(hi, [0, 1, 2, 3]))
-                            vals = fx.Vector(parts[0]).shuffle(
-                                fx.Vector(parts[1]), [0, 1, 2, 3, 4, 5, 6, 7]
-                            )
-                            acc = acc + fx.Vector(vals) * (scale * keep)
+                            vals, scale = fp8_row(rows, scales, safe * fx.Int32(row_bytes), u)
+                            acc = acc + vals * (scale * keep)
                         else:
                             raw = buf_copy_load(
                                 rows, safe * fx.Int32(units) + u, fx.BFloat16, unit_elems=8
                             )
                             acc = acc + fx.Vector(raw).to(fx.Float32) * keep
+                    if const_expr(p2p_fallback):
+                        # Rare: rows past the per-pair reservation, in comb_inp[slot]. The
+                        # slots are the same for the whole block, so this branch is uniform.
+                        direct = [slots[k] == fx.Int32(INV_P2P) for k in range_constexpr(topk)]
+                        any_direct = direct[0]
+                        for k in range_constexpr(1, topk):
+                            any_direct = any_direct | direct[k]
+                        if any_direct:
+                            for k in range_constexpr(topk):
+                                slot = direct[k].select(
+                                    tok * fx.Int32(topk) + fx.Int32(k), fx.Int32(0)
+                                )
+                                pvals, pscale = fp8_row(c_rows, c_scales, slot * fx.Int32(row_bytes), u)
+                                keep = direct[k].select(fx.Float32(1.0), fx.Float32(0.0))
+                                acc = acc + pvals * (pscale * keep)
                     buf_copy_store(
                         out, tok * fx.Int32(units) + u, acc.to(fx.BFloat16), fx.BFloat16, unit_elems=8
                     )
@@ -1420,11 +1612,11 @@ def build_combine(*, layout, rank, hidden, topk, quant="none", signal_mode="remo
 
     # fmt: off
     @flyc.jit
-    def launch(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64,
+    def launch(win: fx.Int64, arg_inv: fx.Int64, arg_out: fx.Int64, arg_comb_inp: fx.Int64,
         arg_fin: fx.Int64, arg_dev_comm: fx.Int64,
         i32_nblocks: fx.Int32, i32_tokens: fx.Int32, stream: fx.Stream):
     # fmt: on
-        combine(win, arg_inv, arg_out, arg_fin, arg_dev_comm,
+        combine(win, arg_inv, arg_out, arg_comb_inp, arg_fin, arg_dev_comm,
                 i32_nblocks, i32_tokens).launch(
             grid=(i32_nblocks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
@@ -1461,6 +1653,16 @@ class MegaMoESdma:
     ``chunk_tiles`` is how many sort tiles make one shipped chunk; ``comm_wgs`` the number
     of comm workgroups (4 waves each, one wave per peer by default).
 
+    ``gemm2`` picks the GEMM2 kernel: ``"aiter"`` is aiter's GEMM2 main loop with
+    ``comm_wgs`` leading comm workgroups; ``"8wave"`` is the 8-wave 256x256
+    persistent GEMM2 of ``gemm2_8wave.py`` (workgroup 0 is the comm workgroup), which
+    needs fp8 transport, ``remote`` signalling and one queue. Switch with ``set_gemm2``.
+
+    With fp8 transport (and aiter's comb_inp in the same fp8 format) a row past the
+    per-pair reservation takes the P2P fallback -- GEMM2 writes it into the origin
+    rank's ``comb_inp`` -- instead of being dropped; ``take_overflow_rows`` reports how
+    many did. With bf16 transport such rows are dropped and ``check_overflow`` raises.
+
     Needs ``MORI_ENABLE_SDMA=1`` and a mori built with SDMA.
     """
 
@@ -1473,6 +1675,7 @@ class MegaMoESdma:
         row_slack=1.5,
         signal_mode="quiet",
         quant="none",
+        gemm2="aiter",
     ):
         import torch
         import torch.distributed as dist
@@ -1525,6 +1728,12 @@ class MegaMoESdma:
         )
         self.layout = ArenaLayout(self.npes, self.cap, row_bytes, self.slot_cap)
         self.layout.check()
+        # The fallback writes rows in aiter's comb_inp layout, which is the fp8 row
+        # only if every bucket of the operator scatters fp8 rows.
+        self.p2p_fallback = quant == "fp8_blockwise_1x32" and all(
+            e.config.p2p_quant == "fp8_blockwise_1x32" for e in moe._bundle_plan.entries
+        )
+        self.comb_bytes = self.slot_cap * row_bytes
         dev = torch.device("cuda", self.rank)
         lay = self.layout
 
@@ -1594,8 +1803,13 @@ class MegaMoESdma:
             chunk_tiles=chunk_tiles,
             comm_wgs=comm_wgs,
             signal_mode=signal_mode,
+            p2p_fallback=self.p2p_fallback,
+            topk=self.topk,
+            max_tok=self.max_tok,
+            comb_bytes=self.comb_bytes,
         )
         self._plans = {}
+        self._gemm2_8w = {}
         self._combine = build_combine(
             layout=lay,
             rank=self.rank,
@@ -1603,7 +1817,9 @@ class MegaMoESdma:
             topk=self.topk,
             quant=quant,
             signal_mode=signal_mode,
+            p2p_fallback=self.p2p_fallback,
         )
+        self.set_gemm2(gemm2)
 
     def _plan_for(self, sbm):
         if sbm < MIN_SBM:
@@ -1619,8 +1835,30 @@ class MegaMoESdma:
                 npes=self.npes,
                 cap=self.cap,
                 rank=self.rank,
+                p2p_fallback=self.p2p_fallback,
             )
         return self._plans[sbm]
+
+    def set_gemm2(self, gemm2):
+        """Pick the GEMM2 kernel, ``"aiter"`` or ``"8wave"`` (see the class docstring)."""
+        if gemm2 not in ("aiter", "8wave"):
+            raise ValueError(f"gemm2 must be aiter or 8wave, got {gemm2!r}")
+        if gemm2 == "8wave":
+            spec, lay = self.comm_spec, self.layout
+            why = []
+            if self.quant != "fp8_blockwise_1x32":
+                why.append("fp8_blockwise_1x32 transport")
+            if spec.signal_mode != "remote" or spec.queues != 1:
+                why.append("signal_mode='remote' with queues=1")
+            if not self.p2p_fallback:
+                why.append("aiter's comb_inp in fp8 rows (the P2P fallback)")
+            if self.moe.model_dim % 256 or self.moe.inter_dim % 256:
+                why.append("model_dim and inter_dim multiples of 256")
+            if 2 * lay.n_rows * lay.row_bytes >= 1 << 31:
+                why.append("S+R under 2 GiB (lower row_slack)")
+            if why:
+                raise ValueError("gemm2='8wave' needs " + ", ".join(why))
+        self.gemm2 = gemm2
 
     def set_chunk_tiles(self, chunk_tiles):
         """Change the shipped chunk size; only the gemm2 kernel is (re)compiled."""
@@ -1685,6 +1923,8 @@ class MegaMoESdma:
             fx.Int64(self.tile_base.data_ptr()),
             fx.Int64(self.cursor.data_ptr()),
             fx.Int64(self.idx_send.data_ptr()),
+            fx.Int64(op.srcmap_em.data_ptr()),
+            moe.comb_op._fx_p2p_comb_inp,
             moe._s1_nvm,
             moe._g2v2_inter,
             moe._g2v2_hidden,
@@ -1720,6 +1960,57 @@ class MegaMoESdma:
             quant=self.quant,
         )
 
+    def _launch_gemm2_8wave(self, config, s_fx):
+        import flydsl.expr as fx
+        import torch
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+        from gemm2_8wave import compile_gemm2_8wave_sdma
+
+        moe, op, lay = self.moe, self.moe._s1_op, self.layout
+        sbm = int(config.stage1.sort_block_m)
+        ct = self.comm_spec.chunk_tiles
+        key = (sbm, ct)
+        if key not in self._gemm2_8w:
+            self._gemm2_8w[key] = compile_gemm2_8wave_sdma(
+                K=moe.inter_dim,
+                N=moe.model_dim,
+                experts=moe.epr,
+                topk=self.topk,
+                npes=self.npes,
+                max_tok=self.max_tok,
+                recv_cap=int(moe.max_recv),
+                SBM=sbm,
+                rank=self.rank,
+                layout=lay,
+                chunk_tiles=ct,
+                grid_ctas=self.nblocks,
+                comb_bytes=self.comb_bytes,
+            )
+        nvm = int(moe._s1_nvm)
+        _run_compiled(
+            self._gemm2_8w[key],
+            moe._s1_out.view(torch.uint8).view(-1),
+            moe.w2.view(torch.uint8).view(-1),
+            moe._s1_osd.view(-1),
+            moe.w2_scale.view(torch.uint8).view(-1),
+            (nvm + 255) // 256 * 256,
+            fx.Int64(moe._s1_dispatch_workspace["expert_tile_end"].data_ptr()),
+            fx.Int64(op.srcmap_em.data_ptr()),
+            fx.Int64(op.wts_em.data_ptr()),
+            fx.Int64(op.tile_row_base.data_ptr()),
+            moe.comb_op._fx_p2p_comb_inp,
+            fx.Int64(op.num_valid.data_ptr()),
+            fx.Int64(self.out_row.data_ptr()),
+            fx.Int64(self.mem.ptr + lay.off_s),
+            fx.Int64(self.dev_comm.ptr),
+            fx.Int64(self.win.handle),
+            fx.Int64(self.cdone.data_ptr()),
+            fx.Int64(self.tile_base.data_ptr()),
+            fx.Int64(self.cursor.data_ptr()),
+            fx.Int64(self.idx_send.data_ptr()),
+            s_fx,
+        )
+
     def run(self, run_tokens, config=None, profile=None):
         """Three kernel launches. ``profile``: a list that receives ``(stage, cuda_event)`` marks."""
         import flydsl.expr as fx
@@ -1739,13 +2030,17 @@ class MegaMoESdma:
         mark("start")
         self._launch_plan(config, s_fx)
         mark("plan")
-        self._launch_gemm2(config, s_fx)
+        if self.gemm2 == "8wave":
+            self._launch_gemm2_8wave(config, s_fx)
+        else:
+            self._launch_gemm2(config, s_fx)
         mark("gemm2+sdma")
         _run_compiled(
             self._combine,
             fx.Int64(self.win.handle),
             fx.Int64(self.inv.data_ptr()),
             fx.Int64(self.out.data_ptr()),
+            fx.Int64(moe.comb_op.shmem_comb_inp_tok.data_ptr()),
             fx.Int64(self.combine_fin.data_ptr()),
             fx.Int64(self.dev_comm.ptr),
             fx.Int32(self.comb_blocks),
@@ -1755,18 +2050,26 @@ class MegaMoESdma:
         mark("combine")
         return self.out[: run_tokens * self.hidden].view(run_tokens, self.hidden)
 
-    def check_overflow(self):
-        """Raise if the plan dropped rows since the last check (syncs the device).
-
-        A row that does not fit its peer's per-pair reservation is dropped, so
-        the output is silently wrong unless the host looks at this counter.
-        """
+    def take_overflow_rows(self):
+        """Rows past the per-pair reservation since the last call (syncs the device):
+        sent through the P2P fallback, or dropped without it."""
         import torch
 
         torch.cuda.synchronize()
-        dropped = int(self.overflow.item())
+        rows = int(self.overflow.item())
         self.overflow.zero_()
-        if dropped:
+        return rows
+
+    def check_overflow(self):
+        """Raise if the plan dropped rows since the last check (syncs the device).
+
+        Without the P2P fallback (bf16 transport) a row that does not fit its peer's
+        per-pair reservation is dropped, so the output is silently wrong unless the
+        host looks at this counter. With it nothing is dropped and this only resets
+        the counter.
+        """
+        dropped = self.take_overflow_rows()
+        if dropped and not self.p2p_fallback:
             raise RuntimeError(
                 f"rank {self.rank}: {dropped} rows did not fit the per-pair reservation "
                 f"(cap={self.cap} rows, row_slack={self.row_slack}); raise row_slack"

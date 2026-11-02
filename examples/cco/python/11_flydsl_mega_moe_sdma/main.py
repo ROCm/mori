@@ -32,7 +32,10 @@ not occupy CUs:
 
 The SDMA path is ``mega_moe_gemm2_with_sdma.MegaMoESdma`` (the op and its three kernels -- a plan
 kernel, GEMM2 with comm waves, and a combine kernel -- all in
-``mega_moe_gemm2_with_sdma.py``). This file is the
+``mega_moe_gemm2_with_sdma.py``). ``--gemm2 8wave`` swaps the GEMM2 for the 8-wave
+256x256 persistent kernel of ``gemm2_8wave.py`` (same plan, window and combine). With
+fp8 transport a row past the per-pair reservation is not dropped: GEMM2 writes it into
+the origin rank's ``comb_inp`` (aiter's own P2P layout). This file is the
 harness around aiter's ``MegaMoEV2``: it runs aiter once for stage1/dispatch and the
 reference output, then redoes stage2 + transfer + reduce on the same state.
 
@@ -44,7 +47,7 @@ Needs aiter (MegaMoEV2 and the GEMM2 mainloop), FlyDSL, and mori built with SDMA
 
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 main.py test --bs 4096
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 main.py bench \\
-        --bs-list 128,1024,4096,8192
+        --bs-list 128,1024,4096,8192 --gemm2 aiter,8wave
 
 ``bench`` times eager launches, which is what prefill does; ``--graph`` times CUDA
 Graph replays with the two-graph slope used by ``bench_ep.py`` instead.
@@ -195,7 +198,7 @@ def _reference(moe, x, wts, ids, no_aligned_pair):
     return ref, config
 
 
-def _make_sdma(moe, args, chunk_tiles):
+def _make_sdma(moe, args, chunk_tiles, gemm2="aiter"):
     return MegaMoESdma(
         moe,
         queues=args.queues,
@@ -203,7 +206,15 @@ def _make_sdma(moe, args, chunk_tiles):
         quant=args.quant,
         row_slack=args.row_slack,
         signal_mode=args.signal_mode,
+        gemm2=gemm2,
     )
+
+
+def _overflow_rows(sc):
+    """Rows past the per-pair reservation since the last call, summed over ranks."""
+    t = torch.tensor([sc.take_overflow_rows()], dtype=torch.int64)
+    dist.all_reduce(t)
+    return int(t.item())
 
 
 # --- Timing ---------------------------------------------------------------------------
@@ -346,7 +357,7 @@ def run_test(args, rank, world, device):
         )
     ref_ms = _time(lambda: moe._run_stage2(args.bs, None, True, config), args.iters)[0]
 
-    sc = _make_sdma(moe, args, args.chunk_tiles)
+    sc = _make_sdma(moe, args, args.chunk_tiles, args.gemm2)
     worst = 0.0
     mismatched = 0
     # Repeated calls with no host sync between them also exercise the epoch counter,
@@ -371,14 +382,16 @@ def run_test(args, rank, world, device):
         ok = False
     if not ok:
         failures.append("sdma")
-    try:
-        sc.check_overflow()
-    except RuntimeError as e:
-        failures.append(f"overflow ({e})")
+    # With the P2P fallback (fp8) rows past the reservation are still delivered;
+    # without it (bf16) they are dropped, which is a failure.
+    overflow = _overflow_rows(sc)
+    if overflow and not sc.p2p_fallback:
+        failures.append(f"overflow ({overflow} rows dropped; raise --row-slack)")
         ok = False
     if rank == 0:
         print(
-            f"relL2={worst:.3e} mismatched_rows={mismatched} "
+            f"gemm2={args.gemm2} relL2={worst:.3e} mismatched_rows={mismatched} "
+            f"p2p_overflow_rows={overflow} "
             f"{'PASS' if ok else 'FAIL'} "
             f"time={ms_per:.4f}ms (reference stage2+combine {ref_ms:.4f}ms)",
             flush=True,
@@ -396,6 +409,7 @@ def run_test(args, rank, world, device):
 def run_bench(args, rank, world, device):
     batch_sizes = [int(v) for v in args.bs_list.split(",")]
     chunk_list = [int(v) for v in args.chunk_tiles.split(",")]
+    gemm2_list = args.gemm2.split(",")
     graph = args.graph
     rows = []  # (bs, label, s2_mean, s2_max, relL2)
 
@@ -412,7 +426,7 @@ def run_bench(args, rank, world, device):
     )
     # One operator and one MegaMoESdma for every token count: building more would
     # re-create symmetric heaps and SDMA queues.
-    sc = _make_sdma(moe, args, chunk_list[0])
+    sc = _make_sdma(moe, args, chunk_list[0], gemm2_list[0])
 
     for bs in batch_sizes:
         x, wts, ids = (
@@ -447,9 +461,10 @@ def run_bench(args, rank, world, device):
                 flush=True,
             )
 
-        for ct in chunk_list:
+        for g2, ct in [(g2, ct) for g2 in gemm2_list for ct in chunk_list]:
+            sc.set_gemm2(g2)
             sc.set_chunk_tiles(ct)
-            label = f"SDMA 3-kernel CT={ct}"
+            label = f"SDMA {g2} GEMM2 CT={ct}"
             out = sc.run(bs, config).clone()
             torch.cuda.synchronize()
             rel = _rel_l2(out, ref)
@@ -459,7 +474,7 @@ def run_bench(args, rank, world, device):
             if rank == 0:
                 parts = "  ".join(f"{k}={v:.3f}" for k, v in br.items())
                 print(
-                    f"  {label:<22} stage2+combine {n_s2[0]:9.4f} / {n_s2[1]:9.4f} ms  "
+                    f"  {label:<26} stage2+combine {n_s2[0]:9.4f} / {n_s2[1]:9.4f} ms  "
                     f"relL2={rel:.2e}",
                     flush=True,
                 )
@@ -515,6 +530,13 @@ def _parse_args():
         "same config. It is picked only at bucket 8192, where MegaMoESdma "
         "has no equivalent -- and measured 1.5%% slower than without it on "
         "uniform routing anyway.",
+    )
+    common.add_argument(
+        "--gemm2",
+        default="aiter",
+        help="GEMM2 kernel: aiter (aiter's GEMM2 main loop with comm workgroups) or "
+        "8wave (8-wave 256x256 persistent GEMM2; fp8, remote, one queue). bench takes "
+        "a list, e.g. aiter,8wave",
     )
     common.add_argument(
         "--quant",
