@@ -139,6 +139,7 @@ class DistributedClient : public IUMBPClient {
   // which is the one place the distinction changes an answer rather than just
   // a code path.
   bool local_only_ = false;
+  bool direct_pool_get_ = false;
   std::unique_ptr<SimTrace> sim_trace_;
   std::unique_ptr<PoolClient> pool_client_;
   std::atomic<bool> closing_{false};
