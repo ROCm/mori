@@ -691,6 +691,10 @@ target_link_libraries(
   bench_umbp_gds_ssd_get
   PRIVATE umbp_core umbp_common hip::host ${_TEST_PROTOBUF_LIB} ${_TEST_GRPCPP_LIB})
 
+add_executable(test_umbp_local_offload test_local_offload.cpp)
+target_link_libraries(test_umbp_local_offload PRIVATE umbp_common GTest::gtest_main)
+add_test(NAME umbp_local_offload COMMAND test_umbp_local_offload)
+
 # Virtual storage and modeled transfers through the production control plane; no GPU needed.
 add_executable(test_umbp_sim test_sim.cpp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
