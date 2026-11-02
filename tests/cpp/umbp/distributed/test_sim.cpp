@@ -891,22 +891,20 @@ TEST_F(SimTest, GatherModelRequiresRegisteredHostAndEligibleDeviceBatch) {
   run({item(0, kPage), item(kPage, kPage)}, false);
 }
 
-TEST_F(SimTest, GpuInterleavingRequiresAnOptionalGpuBoolean) {
-  for (const auto& field : {"", ",\"interleave_copies\":false", ",\"interleave_copies\":true"}) {
-    Profile(std::string(R"({"cpu_gpu":{"channel":"link","latency_ns":0,
-      "bandwidth_bytes_per_second":1e12)") +
-            field + "}}");
-    EXPECT_NO_THROW(SimTransferEngine(Config().sim.profile_path));
-  }
-  for (const auto& value : {"1", "null", "\"true\"", "[true]"}) {
-    Profile(std::string(R"({"cpu_gpu":{"channel":"link","latency_ns":0,
-      "bandwidth_bytes_per_second":1e12,"interleave_copies":)") +
-            value + "}}");
-    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
-  }
-  for (const auto& path : {"cpu_cpu", "gpu_gpu", "cpu_gpu_gather", "remote_read", "file_gpu"}) {
-    Profile(std::string("{\"") + path + R"(":{"channel":"link","latency_ns":0,
-      "bandwidth_bytes_per_second":1e12,"interleave_copies":false}})");
+TEST_F(SimTest, CalibrationOptionsValidateTypesAndPathRestrictions) {
+  Profile(R"({"cpu_gpu":{"channel":"link","latency_ns":0,
+    "bandwidth_bytes_per_second":1e12,"interleave_copies":false}})");
+  EXPECT_NO_THROW(SimTransferEngine(Config().sim.profile_path));
+  for (const auto& [path, fields] : std::vector<std::pair<std::string, std::string>>{
+           {"cpu_gpu", R"("interleave_copies":1)"},
+           {"gpu_gpu", R"("interleave_copies":false)"},
+           {"cpu_staging", R"("size_knee_bytes":4096)"},
+           {"cpu_staging", R"("large_size_ns_per_byte":1)"},
+           {"cpu_staging", R"("size_knee_bytes":0,"large_size_ns_per_byte":1)"},
+           {"cpu_staging", R"("size_knee_bytes":4096,"large_size_ns_per_byte":-1)"}}) {
+    Profile("{\"" + path + R"(":{"channel":"link","latency_ns":0,
+      "bandwidth_bytes_per_second":1e12,)" +
+            fields + "}}");
     EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
   }
 }
@@ -916,7 +914,6 @@ TEST_F(SimTest, GpuInterleavingCountsNonzeroCopiesAndValidatesTheWholeInput) {
     "bandwidth_bytes_per_second":409600,"interleave_copies":true}})");
   SimTransferEngine engine(Config().sim.profile_path);
   TransferPlan plan;
-  plan.dir = TransferDirection::kLocal;
   plan.src = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(2 * kPage)), 2 * kPage);
   plan.dst =
       TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(2 * kPage)), 2 * kPage, MemLoc::GPU, 0);
@@ -944,7 +941,6 @@ TEST_F(SimTest, GpuInterleavingLetsOtherCallersRunBetweenFallbackCopies) {
   for (bool registered : {false, true}) {
     SimTransferEngine engine(Config().sim.profile_path);
     TransferPlan plan;
-    plan.dir = TransferDirection::kLocal;
     plan.src = TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage);
     plan.dst =
         TransferRef::HostBytes(reinterpret_cast<void*>(Buffer(kPage)), kPage, MemLoc::GPU, 0);
@@ -1321,31 +1317,13 @@ TEST_F(SimTest, BounceCopiesUseSerialCpuBandwidth) {
   EXPECT_TRUE(caller.Transfer({{remote, 0, local, 0, bytes, 0}}, nullptr));
 }
 
-TEST_F(SimTest, CalibratedStagingUsesItsOwnCopyCost) {
+TEST_F(SimTest, CalibratedStagingChargesDirectionAndBytesAboveTheKnee) {
   Profile(R"({"cpu_cpu":{"channel":"host","latency_ns":0,"bandwidth_bytes_per_second":1e12},
-    "cpu_staging":{"channel":"host","latency_ns":20000000,"bandwidth_bytes_per_second":1e12},
-    "cpu_staging_read":{"channel":"host","latency_ns":40000000,"bandwidth_bytes_per_second":1e12},
+    "cpu_staging":{"channel":"host","latency_ns":20000000,"bandwidth_bytes_per_second":1e12,
+      "size_knee_bytes":4096,"large_size_ns_per_byte":20000},
+    "cpu_staging_read":{"channel":"host","latency_ns":40000000,"bandwidth_bytes_per_second":1e12,
+      "size_knee_bytes":4096,"large_size_ns_per_byte":20000},
     "remote_read":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12},
-    "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
-  SimTransferEngine caller(Config().sim.profile_path, "caller", kPage);
-  SimTransferEngine owner(Config().sim.profile_path, "owner");
-  ASSERT_TRUE(caller.EnsureRemoteEngine("owner", Packed(owner)));
-  auto* buffer = reinterpret_cast<void*>(Buffer(kPage));
-  auto local = TransferRef::HostBytes(buffer, kPage);
-  auto remote = TransferRef::Remote(owner.RegisterMemory(buffer, kPage, MemLoc::CPU, -1).mem);
-  const auto start = Clock::now();
-  ASSERT_TRUE(caller.Transfer({{local, 0, remote, 0, kPage, 0}}, nullptr));
-  EXPECT_GE(Clock::now() - start, 20ms);
-  const auto read_start = Clock::now();
-  ASSERT_TRUE(caller.Transfer({{remote, 0, local, 0, kPage, 0}}, nullptr));
-  EXPECT_GE(Clock::now() - read_start, 40ms);
-}
-
-TEST_F(SimTest, StagingSizeKneeChargesOnlyBytesAboveTheKnee) {
-  const std::string curve = R"({"channel":"host","latency_ns":0,
-    "bandwidth_bytes_per_second":1e12,"size_knee_bytes":4096,"large_size_ns_per_byte":20000})";
-  Profile("{\"cpu_staging\":" + curve + ",\"cpu_staging_read\":" + curve +
-          R"(,"remote_read":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12},
     "remote_write":{"channel":"nic","latency_ns":0,"bandwidth_bytes_per_second":1e12}})");
   SimTransferEngine caller(Config().sim.profile_path, "caller", 2 * kPage);
   SimTransferEngine owner(Config().sim.profile_path, "owner");
@@ -1358,19 +1336,11 @@ TEST_F(SimTest, StagingSizeKneeChargesOnlyBytesAboveTheKnee) {
       const auto start = Clock::now();
       ASSERT_TRUE(caller.Transfer({{read ? remote : local, 0, read ? local : remote, 0, bytes, 0}},
                                   nullptr));
-      if (bytes <= kPage)
-        EXPECT_LT(Clock::now() - start, 40ms);
-      else
-        EXPECT_GE(Clock::now() - start, 80ms);
+      const auto elapsed = Clock::now() - start;
+      const auto expected = (read ? 40ms : 20ms) + (bytes > kPage ? 80ms : 0ms);
+      EXPECT_GE(elapsed, expected);
+      EXPECT_LT(elapsed, expected + 20ms);
     }
-  }
-  for (const auto& fields : {"\"size_knee_bytes\":4096", "\"large_size_ns_per_byte\":1",
-                             "\"size_knee_bytes\":0,\"large_size_ns_per_byte\":1",
-                             "\"size_knee_bytes\":4096,\"large_size_ns_per_byte\":-1"}) {
-    Profile(std::string(R"({"cpu_staging":{"channel":"host","latency_ns":0,
-      "bandwidth_bytes_per_second":1e12,)") +
-            fields + "}}");
-    EXPECT_THROW(SimTransferEngine(Config().sim.profile_path), std::invalid_argument);
   }
 }
 

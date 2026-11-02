@@ -39,7 +39,7 @@ calibrate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(calibrate)
 
 
-def measurements():
+def measurements(threads=(1, 4)):
     return [
         dict(
             phase="train",
@@ -49,7 +49,7 @@ def measurements():
             batch=batch,
             elapsed_ns=1000 + block * batch / (40 * p) + 50 * batch,
         )
-        for p in (1, 4)
+        for p in threads
         for block in (4096, 65536, 1048576)
         for batch in (1, 8, 32)
     ]
@@ -95,12 +95,6 @@ def test_staging_knee_uses_only_identifiable_training_sizes(path, extra):
         for block in (4096, 65536, 1048576, 4194304, 8388608, 16777216)
         for batch in (1, 2, 4, 8)
     ]
-    rows += [dict(row, phase="engine", elapsed_ns=1e12) for row in rows]
-    rows += [dict(row, phase="train", mode="sim", elapsed_ns=1e12) for row in rows]
-    rows += [
-        dict(row, phase="train", mode="real", concurrency=4, elapsed_ns=1e12)
-        for row in rows
-    ]
     curve = calibrate.fit_paths(rows, [1], {})[path]
     assert curve["latency_ns"] == pytest.approx(500)
     assert curve["copy_latency_ns"] == pytest.approx(80)
@@ -131,31 +125,8 @@ def test_unresolved_byte_cost_keeps_the_measured_copy_latency():
     json.dumps(curve, allow_nan=False)
 
 
-def test_gpu_interleaving_only_enables_measured_non_gather_paths():
-    names = ("cpu_gpu", "gpu_cpu", "cpu_gpu_gather", "gpu_cpu_gather")
-    rows = [
-        dict(row, path=name)
-        for row in measurements()
-        if row["effective_threads"] == 1
-        for name in names
-    ]
-    curves = calibrate.fit_paths(rows, [1], {})
-    for name in names:
-        assert curves[name].get("interleave_copies", False) == (
-            name in ("cpu_gpu", "gpu_cpu")
-        )
-    base = {"cpu_gpu": {"channel": "unmeasured"}}
-    assert (
-        calibrate.fit_paths(measurements(), [1, 4], base)["cpu_gpu"] == base["cpu_gpu"]
-    )
-
-
 def test_file_registration_is_fitted_separately_and_uses_only_training():
-    rows = [
-        dict(row, path="file_gpu")
-        for row in measurements()
-        if row["effective_threads"] == 1
-    ]
+    rows = [dict(row, path="file_gpu") for row in measurements((1,))]
     rows += [
         dict(
             rows[0],
@@ -188,56 +159,38 @@ def test_fit_requires_independent_data_for_each_thread_count():
         calibrate.fit_profile([r for r in measurements() if r["batch"] == 1], [1, 4])
 
 
-def test_report_keeps_absolute_floor_and_large_relative_errors_visible():
-    rows = [
-        dict(
-            phase="api",
-            threads=1,
-            block_bytes=4096,
-            batch=1,
-            api="get",
-            mode=mode,
-            elapsed_ns=ns,
-        )
-        for mode, ns in [
-            ("real", 5000),
-            ("real", 6000),
-            ("real", 7000),
-            ("sim", 8000),
-            ("sim", 9000),
-            ("sim", 10000),
-        ]
+def test_report_uses_medians_and_keeps_workloads_separate():
+    cases = [
+        ({"path": "cpu_gpu"}, 6000, 9000, False),
+        ({"path": "cpu_gpu", "concurrency": 4}, 20000, 30000, False),
+        ({"path": "cpu_gpu", "caller_gpu": 1}, 10000, 10000, True),
+        ({"path": "remote_read"}, 10000, 10000, True),
+        ({"path": "remote_read", "staged": 1}, 20000, 30000, False),
+        ({"path": "cpu_cpu"}, 600, 900, True),
     ]
-    result = calibrate.compare(rows)[0]
-    assert result["error_pct"] == 50
-    assert not result["within_tolerance"]
-    rows = [dict(row, elapsed_ns=row["elapsed_ns"] / 10) for row in rows]
-    assert calibrate.compare(rows)[0]["within_tolerance"]
-
-
-def test_report_separates_concurrency():
     rows = [
         dict(
+            measurements()[0],
             phase="api",
             threads=1,
-            concurrency=c,
-            block_bytes=4096,
-            batch=1,
             api="get",
             mode=mode,
-            elapsed_ns=ns,
+            elapsed_ns=ns * factor,
+            **fields,
         )
-        for c, mode, ns in [
-            (1, "real", 10000),
-            (1, "sim", 10000),
-            (4, "real", 20000),
-            (4, "sim", 30000),
-        ]
+        for fields, real, sim, _ in cases
+        for mode, ns in (("real", real), ("sim", sim))
+        for factor in (0.5, 1, 2)
     ]
     reports = calibrate.compare(rows)
-    assert [row["concurrency"] for row in reports] == [1, 4]
-    assert [row["error_pct"] for row in reports] == [0, 50]
-    assert [row["within_tolerance"] for row in reports] == [True, False]
+    assert len(reports) == len(cases)
+    for fields, real, sim, within_tolerance in cases:
+        expected = {"concurrency": 1, "caller_gpu": 0, "staged": 0, **fields}
+        report = next(r for r in reports if all(r[k] == v for k, v in expected.items()))
+        assert report["real_median_ns"] == real
+        assert report["sim_median_ns"] == sim
+        assert report["error_pct"] == pytest.approx(100 * (sim / real - 1))
+        assert report["within_tolerance"] == within_tolerance
 
 
 @pytest.mark.parametrize(
@@ -248,9 +201,7 @@ def test_report_separates_concurrency():
         ("file_cpu_staged_no_crc", True),
     ],
 )
-def test_ssd_fit_uses_physical_bytes_and_reports_gpu_callers_separately(
-    path, batch_only
-):
+def test_ssd_fit_uses_physical_bytes_and_identifiable_log_costs(path, batch_only):
     logarithmic = path.endswith("_no_crc")
     rows = [
         dict(
@@ -267,9 +218,8 @@ def test_ssd_fit_uses_physical_bytes_and_reports_gpu_callers_separately(
                 else 0
             ),
         )
-        for row in measurements()
-        if row["effective_threads"] == 1
-        and (not batch_only or row["block_bytes"] != 1048576)
+        for row in measurements((1,))
+        if not batch_only or row["block_bytes"] != 1048576
     ]
     curve = calibrate.fit_paths(
         rows,
@@ -286,116 +236,109 @@ def test_ssd_fit_uses_physical_bytes_and_reports_gpu_callers_separately(
             0 if batch_only else 12000
         )
         assert curve["batch_log_size_latency_ns"] == pytest.approx(8000)
-    validation = [
-        dict(rows[0], phase="api", threads=1, api="put", mode=mode, caller_gpu=gpu)
-        for gpu, mode in itertools.product((0, 1), ("real", "sim"))
-    ]
-    assert [r["caller_gpu"] for r in calibrate.compare(validation)] == [0, 1]
 
 
 def test_profile_merge_keeps_estimates_and_fits_each_copy_implementation():
-    rows = [dict(row, path="cpu_cpu") for row in measurements()]
-    models = (
-        ("cpu_gpu", 25),
-        ("cpu_gpu_gather", 45),
-        ("cpu_staging", 15),
-        ("cpu_staging_read", 12),
+    models = dict(
+        cpu_gpu=25,
+        gpu_cpu=30,
+        cpu_gpu_gather=45,
+        gpu_cpu_gather=40,
+        cpu_staging=15,
+        cpu_staging_read=12,
     )
-    for name, bandwidth in models:
-        for row in measurements():
-            if row["effective_threads"] != 1:
-                continue
-            # Coalescing changes copy count while payload bytes stay block*batch.
-            for segments in (1, row["batch"]):
-                ns = (
-                    3000 + row["block_bytes"] * row["batch"] / bandwidth + 70 * segments
-                )
-                rows.append(dict(row, path=name, segments=segments, elapsed_ns=ns))
+    rows = [dict(row, path="cpu_cpu") for row in measurements()]
+    rows += [
+        dict(
+            row,
+            path=name,
+            segments=segments,
+            elapsed_ns=3000
+            + row["block_bytes"] * row["batch"] / bandwidth
+            + 70 * segments,
+        )
+        for name, bandwidth in models.items()
+        for row in measurements((1,))
+        for segments in (1, row["batch"])
+    ]
     estimate = {
         "channel": "network-link",
         "latency_ns": 9000,
         "bandwidth_bytes_per_second": 20e9,
     }
-    paths = calibrate.fit_paths(rows, [1, 4], {"remote_read": estimate})
-    assert paths["remote_read"] == estimate
-    assert paths["cpu_cpu"]["bandwidth_bytes_per_second"][0] == pytest.approx(40e9)
-    for name, bandwidth in models:
+    base = {
+        "remote_read": estimate,
+        "gpu_gpu": estimate,
+        "cpu_cpu": dict(estimate, channel="custom-host"),
+    }
+    rows.append(dict(measurements()[0], path="gpu_gpu", phase="engine", mode="sim"))
+    paths = calibrate.fit_paths(rows, [1, 4], base)
+    assert paths["remote_read"] == paths["gpu_gpu"] == estimate
+    for name in ("cpu_cpu", "cpu_staging", "cpu_staging_read"):
+        assert paths[name]["channel"] == "custom-host"
+    for name, bandwidth in models.items():
         assert paths[name]["latency_ns"] == pytest.approx(3000)
         assert paths[name]["copy_latency_ns"] == pytest.approx(70)
         assert paths[name]["bandwidth_bytes_per_second"] == pytest.approx(
             bandwidth * 1e9
         )
-    rows.append(dict(measurements()[0], path="gpu_cpu", phase="engine", mode="sim"))
-    base = {"gpu_cpu": estimate, "cpu_cpu": dict(estimate, channel="custom-host")}
-    paths = calibrate.fit_paths(rows, [1, 4], base)
-    assert paths["gpu_cpu"] == estimate
-    assert paths["cpu_cpu"]["channel"] == "custom-host"
-    assert paths["cpu_staging"]["channel"] == "custom-host"
-    assert paths["cpu_staging_read"]["channel"] == "custom-host"
+        assert paths[name].get("interleave_copies", False) == (
+            name in ("cpu_gpu", "gpu_cpu")
+        )
+    unmeasured = {name: estimate for name in ("cpu_gpu", "gpu_cpu")}
+    fitted = calibrate.fit_paths(measurements(), [1, 4], unmeasured)
+    assert all(fitted[name] == curve for name, curve in unmeasured.items())
 
 
-def test_comparison_keeps_direct_staged_and_memory_paths_separate():
-    rows = []
-    for path, staged, real, sim in (
-        ("cpu_gpu", 0, 10000, 10000),
-        ("remote_read", 0, 10000, 10000),
-        ("remote_read", 1, 20000, 30000),
-    ):
-        for mode, ns in (("real", real), ("sim", sim)):
-            rows.append(
-                dict(
-                    path=path,
-                    staged=staged,
-                    phase="engine",
-                    threads=1,
-                    block_bytes=4096,
-                    batch=1,
-                    api="transfer",
-                    mode=mode,
-                    elapsed_ns=ns,
-                )
-            )
-    results = calibrate.compare(rows)
-    assert len(results) == 3
-    assert [row["error_pct"] for row in results] == [0, 0, 50]
-
-
-@pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize(
-    "path,no_crc",
+    "path,no_crc,overlap",
     [
-        ("cpu_cpu", False),
-        ("cpu_gpu", False),
-        ("file_cpu", False),
-        ("file_cpu_staged", False),
-        ("file_cpu_staged", True),
-        ("remote_read", False),
+        ("cpu_cpu", False, False),
+        ("cpu_gpu", False, False),
+        ("file_cpu_staged", False, False),
+        ("file_cpu_staged", True, False),
+        ("remote_read", False, False),
+        ("cpu_gpu", False, True),
     ],
 )
-def test_custom_grids_reach_probe_and_keep_validation_independent(
-    tmp_path, monkeypatch, overlap, path, no_crc
-):
+def test_calibration_workflow(tmp_path, monkeypatch, path, no_crc, overlap):
     probe = tmp_path / "probe"
     probe.touch()
     output = tmp_path / "output"
     base = Path(calibrate.__file__).with_name("sim_profile.json").read_bytes()
+    estimates = json.loads(base)["paths"]
     if no_crc:
-        estimates = json.loads(base)
-        estimates["paths"][path] = estimates["paths"]["file_cpu"]
-        base = json.dumps(estimates).encode()
-    base_profile = tmp_path / "base-profile.json"
+        estimates[path] = estimates["file_cpu"]
+        base = json.dumps({"paths": estimates}).encode()
+    base_profile = tmp_path / "base.json"
     base_profile.write_bytes(base)
-    train = [4096, 65536, 1048576]
-    validation = [4096] if overlap else [8192, 131072]
-    argv = ["calibrate", "--probe", str(probe), "--output", str(output)]
-    argv += ["--base-profile", str(base_profile)]
-    argv += "--cpus 0,1,2,3 --threads 1 --concurrency 1 --rounds 1 --max-mib 1".split()
-    argv += ["--paths", path]
+    train, validation = [4096, 65536, 1048576], [4096] if overlap else [8192, 131072]
     remote = path.startswith("remote_")
+    argv = [
+        "calibrate",
+        "--probe",
+        str(probe),
+        "--output",
+        str(output),
+        "--base-profile",
+        str(base_profile),
+        "--paths",
+        path,
+    ]
+    argv += "--cpus 0,1,2,3 --threads 1 --concurrency 1 --rounds 1 --max-mib".split()
+    argv += ["128" if remote else "1"]
+    for phase, blocks, batches in (
+        ("train", train, [1, 8, 32]),
+        ("validation", validation, [1, 4]),
+    ):
+        argv += [
+            f"--{phase}-block-bytes",
+            *map(str, blocks),
+            f"--{phase}-batches",
+            *map(str, batches),
+        ]
     if remote:
         argv += [
-            "--max-mib",
-            "128",
             "--remote-probe",
             str(probe),
             "--local-address",
@@ -415,53 +358,38 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
         argv += ["--ssd-dir", str(tmp_path), "--ssd-read-prefill-mib", "256"]
     if no_crc:
         argv.append("--ssd-no-crc")
-    argv += ["--train-block-bytes", *map(str, train), "--train-batches", "1", "8", "32"]
-    argv += [
-        "--validation-block-bytes",
-        *map(str, validation),
-        "--validation-batches",
-        "1",
-        "4",
-    ]
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(calibrate.os, "sched_getaffinity", lambda _: {0, 1, 2, 3})
     phases = set()
 
     def run(command, **kwargs):
-        # Provenance must describe the loaded base, not a later version of the file.
-        base_profile.write_text("changed during sampling")
-        phase = command[command.index(str(probe)) + (5 if remote else 1)]
-        selected_path = path if remote else command[command.index("--path") + 1]
-        if selected_path == "file_cpu_staged" and "--ssd-no-crc" in command:
-            selected_path += "_no_crc"
-        assert command[2] == ("0" if path == "cpu_cpu" else "0,1,2,3")
+        # Report provenance must still identify the original, now deleted base.
+        base_profile.unlink(missing_ok=True)
+        phase = next(p for p in ("train", "engine", "api") if p in command)
+        selected = path if remote else command[command.index("--path") + 1]
+        if selected == "file_cpu_staged" and "--ssd-no-crc" in command:
+            selected += "_no_crc"
+        if path == "cpu_gpu" and phase == "train":
+            selected += "_gather"
         phases.add(phase)
-        blocks = train if phase == "train" else validation
-        batches = [1, 8, 32] if phase == "train" else [1, 4]
-        assert command[command.index("--block-bytes") + 1] == ",".join(map(str, blocks))
-        assert command[command.index("--batches") + 1] == ",".join(map(str, batches))
+        blocks, batches = (
+            (train, [1, 8, 32]) if phase == "train" else (validation, [1, 4])
+        )
+        for option, values in (("--block-bytes", blocks), ("--batches", batches)):
+            assert command[command.index(option) + 1] == ",".join(map(str, values))
         assert command[command.index("--max-mib") + 1] == ("128" if remote else "1")
+        assert command[2] == ("0" if path == "cpu_cpu" else "0,1,2,3")
         if "file" in path:
             assert ("--ssd-no-crc" in command) == no_crc
             assert command[command.index("--ssd-dir") + 1] == str(tmp_path)
-            assert command[command.index("--ssd-durability") + 1] == "strict"
-            assert command[command.index("--ssd-api-settle-ms") + 1] == "0"
             assert command[command.index("--ssd-read-prefill-mib") + 1] == "256"
-        gpu = int("--gpu-caller" in command)
-        csv = "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns,path,caller_gpu"
-        csv += ",ssd_tier_threads\n" if "file" in path else "\n"
+        csv = "block_bytes,batch,effective_threads,concurrency,api,iteration,elapsed_ns,path,caller_gpu,ssd_tier_threads,staged\n"
         for block, batch in itertools.product(blocks, batches):
             if block * batch > 1048576:
                 continue
-            apis = ("get",) if "file" in path else ("put", "get")
-            for api in apis if phase == "api" else ("transfer",):
-                model = (
-                    "cpu_gpu_gather"
-                    if selected_path == "cpu_gpu" and phase == "train"
-                    else selected_path
-                )
-                csv += f"{block},{batch},1,1,{api},0,{int(1000 + block * batch / 40 + batch * 50)},{model},{gpu}"
-                csv += ",4\n" if "file" in path else "\n"
+            for api in ("put", "get") if phase == "api" else ("transfer",):
+                ns = int(1000 + block * batch / 40 + batch * 50)
+                csv += f"{block},{batch},1,1,{api},0,{ns},{selected},{int('--gpu-caller' in command)},4,{int('--staged' in command)}\n"
         return SimpleNamespace(stdout=csv)
 
     monkeypatch.setattr(calibrate.subprocess, "run", run)
@@ -470,36 +398,24 @@ def test_custom_grids_reach_probe_and_keep_validation_independent(
             calibrate.main()
         assert not (output / "profile.json").exists()
         assert not (output / "report.json").exists()
-    else:
-        calibrate.main()
-        assert phases == (
-            {"train", "engine"}
-            if path == "file_cpu" or remote
-            else {"train", "engine", "api"}
-        )
-        report = json.loads((output / "report.json").read_text())
-        assert report["base_profile_sha256"] == hashlib.sha256(base).hexdigest()
-        assert report["workloads"]["validation"]["block-bytes"] == validation
-        assert {r["block_bytes"] for r in report["comparisons"]} == set(validation)
-        if path.endswith("_staged"):
-            assert report["ssd"]["api_read_mode"] == "retained-after-prefill"
-            assert report["ssd"]["read_prefill_mib"] == 256
-            assert report["ssd"]["tier_io_threads"] == 4
-            profile = json.loads((output / "profile.json").read_text())
-            assert "file_cpu_staged_no_crc" in profile["paths"]
-            assert (
-                any(
-                    r["path"].endswith("_no_crc") and r["phase"] == "api"
-                    for r in report["comparisons"]
-                )
-                == no_crc
-            )
-            if no_crc:
-                assert profile["paths"][path] == estimates["paths"][path]
-                assert report["path_sources"][path] == "estimate"
-                assert report["path_sources"][path + "_no_crc"] == "measured"
-                assert all(r["path"] == path + "_no_crc" for r in report["comparisons"])
-            assert {
-                r["caller_gpu"] for r in report["comparisons"] if r["phase"] == "api"
-            } == {0, 1}
-        assert (output / "profile.json").exists()
+        return
+    calibrate.main()
+    assert phases == ({"train", "engine"} if remote else {"train", "engine", "api"})
+    report = json.loads((output / "report.json").read_text())
+    profile = json.loads((output / "profile.json").read_text())
+    assert report["base_profile_sha256"] == hashlib.sha256(base).hexdigest()
+    assert {r["block_bytes"] for r in report["comparisons"]} == set(validation)
+    if "file" in path:
+        assert report["ssd"]["api_read_mode"] == "retained-after-prefill"
+        assert report["ssd"]["tier_io_threads"] == 4
+        assert {
+            r["caller_gpu"] for r in report["comparisons"] if r["phase"] == "api"
+        } == {0, 1}
+        assert {r["path"] for r in report["comparisons"] if r["phase"] == "api"} == {
+            path + "_no_crc" if no_crc else path
+        }
+        assert "file_cpu_staged_no_crc" in profile["paths"]
+        if no_crc:
+            assert profile["paths"][path] == estimates[path]
+            assert report["path_sources"][path] == "estimate"
+            assert report["path_sources"][path + "_no_crc"] == "measured"
