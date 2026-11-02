@@ -73,7 +73,9 @@ CCO_DEVICE_FUNCTIONS (one scalar ABI table)
   the GDA team, i.e. the node index on a RAIL connection) and, on put /
   put_value / get, `defer_doorbell` (post without ringing; the next
   non-deferred post, signal, flush or flush_async on the QP rings for it).
-  `flush_async` returns a request for `wait`, so work can go between them.
+  `flush_async` returns a request for `wait`, so work can go between them;
+  call `wait` with the same coop (with `BLOCK` only thread 0 holds the request).
+  Per-call `ctx=` picks the QP context; with coop `THREAD` it may differ per lane.
   See examples 03/06.
 - **SDMA** (intra-node copy engine): `sdma.put / get` (window + offset) and
   `put_ptr / get_ptr` (resolved addresses) mirror `ccoSdma`'s, with its template

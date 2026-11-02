@@ -355,15 +355,16 @@ class Gda:
     def flush_async(self, peer, *, coop=CoopScope.THREAD, team=Team.WORLD, ctx=None):
         """Ring ``peer``'s QP up to its current reservation, deferred posts
         included, and return a request (a uint64) for :meth:`wait`. Work can go
-        between the two."""
+        between the two. Every lane gets the request for THREAD and WARP; for
+        BLOCK only thread 0 does, so wait with BLOCK too."""
         return raw.FLUSH_ASYNC[_COOP_TAG[_const(coop, "coop")]](
             self.dev_comm, self._ctx(ctx), peer, _gda_flags(team)
         )
 
-    def wait(self, request, *, coop=CoopScope.WARP):
+    def wait(self, request, *, coop=CoopScope.THREAD):
         """Poll the CQ until the request :meth:`flush_async` returned has
-        completed (>= warp; THREAD maps to warp, as for flush)."""
-        raw.WAIT[_flush_tag(coop)](self.dev_comm, self.ctx, request)
+        completed. THREAD: each lane waits on its own request."""
+        raw.WAIT[_COOP_TAG[_const(coop, "coop")]](self.dev_comm, self.ctx, request)
 
 
 @cco_struct

@@ -503,15 +503,6 @@ for _coop in ("warp", "block"):
         family="gda_flush_peer",
         tag=_coop,
     )
-    # (devComm, ctx, request) -> 0
-    _add(
-        f"gda_wait_{_coop}",
-        f"cco_gda_wait__{_coop}",
-        [_U64, _I32, _U64],
-        _I32,
-        family="gda_wait",
-        tag=_coop,
-    )
 
 # (devComm, ctx, peer, flags) -> request, for gda_wait_<coop>
 for _coop in COOP_TAGS:
@@ -521,6 +512,15 @@ for _coop in COOP_TAGS:
         [_U64, _I32, _I32, _I32],
         _U64,
         family="gda_flush_async",
+        tag=_coop,
+    )
+    # (devComm, ctx, request) -> 0
+    _add(
+        f"gda_wait_{_coop}",
+        f"cco_gda_wait__{_coop}",
+        [_U64, _I32, _U64],
+        _I32,
+        family="gda_wait",
         tag=_coop,
     )
 

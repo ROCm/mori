@@ -687,7 +687,9 @@ def _gda_flush_async(
     team: tl.constexpr = _TEAM_WORLD,
 ):
     """Ring ``peer``'s QP up to its current reservation, deferred posts
-    included, and return a request (uint64) for ``wait``."""
+    included, and return a request (uint64) for ``wait``. Every lane gets the
+    request for THREAD and WARP; for BLOCK only thread 0 does, so wait with
+    BLOCK too."""
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
@@ -709,18 +711,21 @@ def _gda_flush_async(
 def _gda_wait(
     dev_comm,
     request,
-    ctx: tl.constexpr = 0,
-    coop: tl.constexpr = _COOP_WARP,
+    ctx=0,
+    coop: tl.constexpr = _COOP_THREAD,
 ):
-    """Poll the CQ until a ``flush_async`` request has completed."""
+    """Poll the CQ until a ``flush_async`` request has completed. THREAD: each
+    lane waits on its own request."""
     tl.static_assert(
         coop == _COOP_THREAD or coop == _COOP_WARP or coop == _COOP_BLOCK,
         "GDA coop must be CoopScope.THREAD, WARP, or BLOCK",
     )
-    if coop == _COOP_BLOCK:
-        raw.gda_wait_block(dev_comm, ctx, request)
-    else:
+    if coop == _COOP_THREAD:
+        raw.gda_wait_thread(dev_comm, ctx, request)
+    elif coop == _COOP_WARP:
         raw.gda_wait_warp(dev_comm, ctx, request)
+    else:
+        raw.gda_wait_block(dev_comm, ctx, request)
 
 
 # put / get / put_ptr / get_ptr mirror ccoSdma's, and their keywords its template

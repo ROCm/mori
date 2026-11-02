@@ -90,7 +90,7 @@ WAIT_SIGNAL = {c: _binding(f"gda_wait_signal_{c}") for c in COOP_TAGS}
 FLUSH = {c: _binding(f"gda_flush_{c}") for c in ("warp", "block")}
 FLUSH_PEER = {c: _binding(f"gda_flush_peer_{c}") for c in ("warp", "block")}
 FLUSH_ASYNC = {c: _binding(f"gda_flush_async_{c}") for c in COOP_TAGS}
-WAIT = {c: _binding(f"gda_wait_{c}") for c in ("warp", "block")}
+WAIT = {c: _binding(f"gda_wait_{c}") for c in COOP_TAGS}
 
 # ── SDMA ──
 

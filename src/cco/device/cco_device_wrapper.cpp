@@ -663,8 +663,9 @@ CCO_DEF_FLUSH(block, ccoCoopBlock)
 // flush_async rings `peer`'s QP up to its current reservation (deferred posts
 // included) and returns a request; wait polls the CQ until that request has
 // completed. Work can go between them. The request is one uint64 (PackRequest)
-// and is only meaningful to wait() with the same dev_comm. wait needs >= warp,
-// like flush.
+// and is only meaningful to wait() with the same dev_comm. Every lane holds it
+// for thread and warp scope; for block scope only thread 0 does, so wait with
+// block scope too.
 #define CCO_DEF_FLUSH_ASYNC(TAG, COOP)                                                     \
   CCO_DEV uint64_t cco_gda_flush_async__##TAG(uint64_t dc, int ctx, int peer, int flags) { \
     Gda gda{*AsDevComm(dc), ctx};                                                          \
@@ -672,7 +673,9 @@ CCO_DEF_FLUSH(block, ccoCoopBlock)
     GdaWithFlags<ccoGdaOptFlagsDefault>(flags, [&](auto team, auto) {                      \
       gda.flushAsync<decltype(team)::value>(peer, &req, COOP{});                           \
     });                                                                                    \
-    return PackRequest(req);                                                               \
+    uint64_t packed = PackRequest(req);                                                    \
+    if constexpr (std::is_same_v<COOP, ccoCoopWarp>) packed = __shfl(packed, 0);           \
+    return packed;                                                                         \
   }
 CCO_COOP_LIST(CCO_DEF_FLUSH_ASYNC)
 #undef CCO_DEF_FLUSH_ASYNC
@@ -684,6 +687,5 @@ CCO_COOP_LIST(CCO_DEF_FLUSH_ASYNC)
     gda.wait(req, COOP{});                                                  \
     return 0;                                                               \
   }
-CCO_DEF_WAIT_REQUEST(warp, ccoCoopWarp)
-CCO_DEF_WAIT_REQUEST(block, ccoCoopBlock)
+CCO_COOP_LIST(CCO_DEF_WAIT_REQUEST)
 #undef CCO_DEF_WAIT_REQUEST
