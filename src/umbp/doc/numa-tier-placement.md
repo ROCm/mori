@@ -35,6 +35,12 @@ claim strict placement on a system that cannot bind memory. A successful BIND
 still restricts physical pages to the selected node even when STRICT is zero;
 STRICT controls error handling, not whether that policy can spill on a fault.
 
+In a container, `mbind` needs `CAP_SYS_NICE`: under Docker's default seccomp
+profile it fails with `EPERM`. Run with `--cap-add SYS_NICE`, `--security-opt
+seccomp=unconfined` or `--privileged`. Without one of them a DRAM tier handles
+the failure as the table above says, and the standalone server's ranged
+scratch, which requires its binding, falls back to one arena per direction.
+
 With `UMBP_DRAM_USE_HUGEPAGES=1`, reserve huge pages per node, not only in
 total. The hugetlb reservation made at `mmap` time is global, but a fault under
 BIND takes pages only from the bound node, so a node whose own pool is short
