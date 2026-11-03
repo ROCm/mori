@@ -649,13 +649,7 @@ EndpointId RdmaManager::ConnectEndpoint(EngineKey remoteKey, int devId,
   deviceCtxs[devId]->ConnectEndpoint(local.handle, remote);
   RemoteEngineMeta& meta = remotes[remoteKey];
   auto epConfig = GetRdmaEndpointConfig(devId);
-  EpPair ep{weight,
-            devId,
-            rdevId,
-            remoteKey,
-            local,
-            remote,
-            std::make_shared<std::atomic<int>>(0),
+  EpPair ep{weight, devId, rdevId, remoteKey, local, remote, std::make_shared<std::atomic<int>>(0),
             // Admission stops short of the send queue's size; completion markers use the rest.
             static_cast<int>(epConfig.maxMsgsNum) > 2 * kCompletionMarkerSlots
                 ? static_cast<int>(epConfig.maxMsgsNum) - kCompletionMarkerSlots
