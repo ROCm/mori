@@ -623,7 +623,12 @@ class EpDispatchCombineTestCase:
 
             if sentinel_pattern is not None and n > 0:
                 k = self.config.num_experts_per_token
-                if sentinel_pattern == "every_other":
+                if sentinel_pattern == "unrouted_token":
+                    # Padding-style token: every top-k routing id is -1, while
+                    # the remaining tokens keep the selected routing.
+                    indices[0, :] = -1
+                    sentinel_slots = []
+                elif sentinel_pattern == "every_other":
                     sentinel_slots = list(range(1, k, 2))
                 elif sentinel_pattern == "first_only":
                     sentinel_slots = list(range(1, k))

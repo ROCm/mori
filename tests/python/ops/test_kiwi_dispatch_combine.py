@@ -123,3 +123,69 @@ def test_dispatch_combine(
         )
 
     assert_worker_results(torch_dist_process_manager, world_size)
+
+
+def _test_dispatch_combine_unrouted_token(
+    rank,
+    world_size,
+    rcomp_backend,
+):
+    # A fully unrouted token contributes nothing, so combine must write a zero
+    # row. The output buffer is allocated once with torch.empty and reused, so
+    # first fill it with a routed combine and then check that the same row is
+    # overwritten rather than left holding the previous result.
+    num_tokens = 4
+    data_type = torch.bfloat16
+    hidden_dim = 128
+    config = dispatch_combine_kiwi.EpDispatchCombineKiwiConfig(
+        data_type=data_type,
+        rank=rank,
+        world_size=world_size,
+        hidden_dim=hidden_dim,
+        scale_dim=0,
+        scale_type_size=4,
+        max_num_inp_token_per_rank=num_tokens,
+        num_experts_per_rank=4,
+        num_experts_per_token=8,
+        max_token_type_size=2,
+    )
+    op = dispatch_combine_kiwi.EpDispatchCombineKiwiOp(
+        config, rcomp_backend=rcomp_backend
+    )
+    test_case = EpDispatchCombineTestCase(config)
+    token_counts = [num_tokens] * world_size
+    routed = test_case.gen_test_data(
+        routing="round_robin", num_token_override=token_counts
+    )
+    test_case.run_test_once(op, routed)
+
+    unrouted = test_case.gen_test_data(
+        routing="round_robin",
+        num_token_override=token_counts,
+        sentinel_pattern="unrouted_token",
+    )
+    indices = unrouted[1][rank]
+    assert torch.all(indices[0] == -1)
+    assert torch.any(indices[1:] >= 0)
+    test_case.run_test_once(op, unrouted)
+    del op
+    dist.barrier()
+
+
+@pytest.mark.parametrize("world_size", (8,))
+@pytest.mark.parametrize("rcomp_backend", ("rdma-only", "hybrid"))
+def test_dispatch_combine_unrouted_token(
+    torch_dist_process_manager,
+    world_size,
+    rcomp_backend,
+):
+    """A token whose top-k routing ids are all -1 combines to a zero row."""
+    for _ in range(world_size):
+        torch_dist_process_manager.task_queue.put(
+            (
+                _test_dispatch_combine_unrouted_token,
+                [world_size, rcomp_backend],
+            )
+        )
+
+    assert_worker_results(torch_dist_process_manager, world_size)
